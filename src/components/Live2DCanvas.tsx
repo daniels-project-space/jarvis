@@ -27,11 +27,11 @@ export default function Live2DCanvas({ speakUrl }: { speakUrl?: string | null })
       if (!model) return;
       const iw = model.internalModel.width;
       const ih = model.internalModel.height;
-      const s = Math.min(parent.clientWidth / iw, parent.clientHeight / ih) * 1.35;
+      const s = Math.min(parent.clientWidth / iw, parent.clientHeight / ih) * 0.92;
       model.scale.set(s);
-      model.anchor.set(0.5, 1);
+      model.anchor.set(0.5, 0.5);
       model.x = parent.clientWidth / 2;
-      model.y = parent.clientHeight;
+      model.y = parent.clientHeight / 2;
     }
 
     Live2DModel.from("/models/hiyori/Hiyori.model3.json")
