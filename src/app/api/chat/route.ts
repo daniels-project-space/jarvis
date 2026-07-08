@@ -4,7 +4,7 @@ import { streamText, stepCountIs, tool, type ModelMessage } from "ai";
 import { z } from "zod";
 import { ConvexHttpClient } from "convex/browser";
 import { api } from "../../../../convex/_generated/api";
-import { getAnthropic, JARVIS_MODEL } from "../../../lib/ai";
+import { getModel } from "../../../lib/ai";
 import { remember, recall } from "../../../lib/memory";
 
 export const runtime = "nodejs";
@@ -40,7 +40,7 @@ export async function POST(req: Request) {
     // best-effort history
   }
 
-  const model = (await getAnthropic())(JARVIS_MODEL);
+  const model = await getModel();
 
   const tools = {
     recallMemory: tool({
@@ -85,6 +85,14 @@ Today's date is ${new Date().toISOString().slice(0, 10)}.`;
           tools,
           maxOutputTokens: 1200,
           stopWhen: stepCountIs(6),
+          onError: ({ error }) => {
+            const m = error instanceof Error ? error.message : String(error);
+            try {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: m })}\n\n`));
+            } catch {
+              /* controller may be closed */
+            }
+          },
           onFinish: async ({ text }) => {
             finalText = text;
             try {
