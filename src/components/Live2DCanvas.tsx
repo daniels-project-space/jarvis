@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useRef } from "react";
 import { Application, Ticker } from "pixi.js";
-import { Live2DModel } from "pixi-live2d-display-lipsyncpatch";
+import { Live2DModel } from "pixi-live2d-display-lipsyncpatch/cubism4";
 
 // The fork drives its own updates via the shared ticker.
 Live2DModel.registerTicker(Ticker);
