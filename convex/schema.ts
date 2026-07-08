@@ -17,6 +17,14 @@ export default defineSchema({
     .index("by_kind", ["kind"])
     .index("by_createdAt", ["createdAt"]),
 
+  // Conversation history per thread (survives reloads).
+  chat: defineTable({
+    threadId: v.string(),
+    role: v.string(), // "user" | "assistant"
+    content: v.string(),
+    createdAt: v.number(),
+  }).index("by_thread", ["threadId", "createdAt"]),
+
   // Snapshot of project / cloud-stack state so JARVIS can answer "state of my apps".
   projectState: defineTable({
     slug: v.string(),

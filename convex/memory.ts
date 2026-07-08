@@ -1,0 +1,57 @@
+import { mutation, query } from "./_generated/server";
+import { v } from "convex/values";
+
+// Write a memory row. Full/long bodies live in R2 (r2Key); this row is the
+// reactive index + a short/distilled body for quick recall.
+export const write = mutation({
+  args: {
+    kind: v.string(), // "daily" | "knowledge" | "weekly" | "fact" | "project"
+    title: v.string(),
+    body: v.string(),
+    tags: v.optional(v.array(v.string())),
+    r2Key: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    const now = Date.now();
+    return await ctx.db.insert("memory", {
+      kind: a.kind,
+      title: a.title,
+      body: a.body,
+      tags: a.tags ?? [],
+      r2Key: a.r2Key,
+      createdAt: now,
+      updatedAt: now,
+    });
+  },
+});
+
+export const recent = query({
+  args: { kind: v.optional(v.string()), limit: v.optional(v.number()) },
+  handler: async (ctx, a) => {
+    const lim = a.limit ?? 20;
+    if (a.kind) {
+      const kind = a.kind;
+      return await ctx.db
+        .query("memory")
+        .withIndex("by_kind", (q) => q.eq("kind", kind))
+        .order("desc")
+        .take(lim);
+    }
+    return await ctx.db.query("memory").withIndex("by_createdAt").order("desc").take(lim);
+  },
+});
+
+// Naive substring search (personal scale). Swap for a vector/FTS index later.
+export const search = query({
+  args: { q: v.string(), limit: v.optional(v.number()) },
+  handler: async (ctx, a) => {
+    const lim = a.limit ?? 20;
+    const needle = a.q.toLowerCase();
+    const rows = await ctx.db.query("memory").withIndex("by_createdAt").order("desc").take(400);
+    return rows
+      .filter((r) =>
+        `${r.title} ${r.body} ${(r.tags ?? []).join(" ")}`.toLowerCase().includes(needle),
+      )
+      .slice(0, lim);
+  },
+});
