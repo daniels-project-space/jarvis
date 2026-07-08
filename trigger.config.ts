@@ -7,7 +7,7 @@ import { additionalPackages, aptGet } from "@trigger.dev/build/extensions/core";
 // Set TRIGGER_PROJECT_REF_JARVIS once the `jarvis-jobs` project is created in
 // the Trigger.dev dashboard, then `npx trigger.dev deploy`.
 export default defineConfig({
-  project: process.env.TRIGGER_PROJECT_REF_JARVIS ?? "proj_PENDING_jarvis_jobs",
+  project: process.env.TRIGGER_PROJECT_REF_JARVIS ?? "proj_wjwbdgeipgpddvrazxnp",
   runtime: "node",
   logLevel: "log",
   dirs: ["./src/trigger"],

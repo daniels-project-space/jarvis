@@ -1,6 +1,33 @@
 import { schedules } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { createRequire } from "node:module";
+
+const nodeRequire = createRequire(import.meta.url);
+
+// The `claude` binary isn't on PATH in the Trigger image — resolve it from the
+// installed @anthropic-ai/claude-code package (mirrors remote-work-hub).
+function resolveClaudeBin(): string | null {
+  try {
+    const pkgJson = nodeRequire.resolve("@anthropic-ai/claude-code/package.json");
+    const pkgDir = dirname(pkgJson);
+    const nodeModules = dirname(dirname(pkgDir));
+    const candidates = [join(nodeModules, ".bin", "claude")];
+    try {
+      const pkg = JSON.parse(readFileSync(pkgJson, "utf8")) as {
+        bin?: string | Record<string, string>;
+      };
+      const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.claude;
+      if (rel) candidates.push(join(pkgDir, rel));
+    } catch {
+      /* ignore */
+    }
+    return candidates.find((c) => existsSync(c)) ?? null;
+  } catch {
+    return null;
+  }
+}
 
 // Subscription brain: each chat turn runs the real `claude` CLI HEADLESS on
 // Daniel's Max subscription (CLAUDE_CODE_OAUTH_TOKEN from the vault, ANTHROPIC_API_KEY
@@ -9,7 +36,6 @@ import { mkdirSync } from "node:fs";
 
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
-const VAULT_URL = process.env.VAULT_URL ?? "https://fantastic-roadrunner-485.convex.cloud";
 const RUN_BUDGET_MS = 50_000;
 const POLL_MS = 2000;
 const IDLE_EXITS = 3;
@@ -30,20 +56,12 @@ async function convexQuery(path: string, args: unknown) {
   });
   return (await r.json()).value;
 }
-async function vaultSecret(service: string, keyName: string): Promise<string> {
-  const r = await fetch(`${VAULT_URL}/api/query`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path: "secrets:listByService", args: { service }, format: "json" }),
-  });
-  const rows = ((await r.json()).value ?? []) as Array<{ keyName: string; value: string }>;
-  return rows.find((x) => x.keyName === keyName)?.value ?? "";
-}
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 type Turn = { finalText: string; sessionId: string | null; code: number | null; stderr: string };
 
 function runTurn(
+  bin: string,
   env: NodeJS.ProcessEnv,
   assistantId: string,
   userText: string,
@@ -75,7 +93,7 @@ function runTurn(
     "--dangerously-skip-permissions",
   ];
   return new Promise((resolve) => {
-    const p = spawn("claude", args, { env, stdio: ["ignore", "pipe", "pipe"] });
+    const p = spawn(bin, args, { env, stdio: ["ignore", "pipe", "pipe"] });
     let buf = "",
       finalText = "",
       pending = "",
@@ -128,16 +146,16 @@ export const chatDispatcher = schedules.task({
   cron: "*/1 * * * *",
   maxDuration: 3300,
   run: async () => {
-    const token =
-      (await vaultSecret("jarvis", "CLAUDE_CODE_OAUTH_TOKEN")) ||
-      (await vaultSecret("anthropic", "CLAUDE_CODE_OAUTH_TOKEN"));
+    // CLAUDE_CODE_OAUTH_TOKEN is injected by the Trigger project env (Max sub).
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       HOME: "/tmp/claude-home",
       ANTHROPIC_API_KEY: "",
-      CLAUDE_CODE_OAUTH_TOKEN: token,
     };
     mkdirSync("/tmp/claude-home", { recursive: true });
+
+    const bin = resolveClaudeBin();
+    if (!bin) return { processed: 0, error: "claude binary not found" };
 
     const started = Date.now();
     let processed = 0,
@@ -156,7 +174,7 @@ export const chatDispatcher = schedules.task({
         const memoryContext = Array.isArray(mem)
           ? mem.map((m: any) => `- [${m.kind}] ${m.title}: ${m.body}`).join("\n").slice(0, 2000)
           : "";
-        const turn = await runTurn(env, claim.assistantId, claim.userText, claim.history, memoryContext);
+        const turn = await runTurn(bin, env, claim.assistantId, claim.userText, claim.history, memoryContext);
         const finalText =
           turn.finalText.trim() ||
           (turn.code === 0

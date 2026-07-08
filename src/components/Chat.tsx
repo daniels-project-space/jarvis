@@ -1,70 +1,29 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
+import { useQuery, useMutation } from "convex/react";
+import { api } from "../../convex/_generated/api";
 
-type Msg = { role: "user" | "assistant"; content: string };
+const THREAD = "main";
+
+type Msg = { _id: string; role: string; text: string; status: string };
 
 export default function Chat() {
-  const [messages, setMessages] = useState<Msg[]>([]);
+  const messages = (useQuery(api.chatQueue.listMessages, { threadId: THREAD }) ?? []) as Msg[];
+  const send = useMutation(api.chatQueue.sendMessage);
   const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages.length, messages[messages.length - 1]?.text]);
 
-  async function send() {
+  const busy = messages.some((m) => m.role === "assistant" && m.status === "streaming");
+
+  async function submit() {
     const text = input.trim();
     if (!text || busy) return;
     setInput("");
-    setMessages((m) => [...m, { role: "user", content: text }, { role: "assistant", content: "" }]);
-    setBusy(true);
-    try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: text }),
-      });
-      const reader = res.body!.getReader();
-      const dec = new TextDecoder();
-      let buf = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        const parts = buf.split("\n\n");
-        buf = parts.pop() ?? "";
-        for (const line of parts) {
-          const d = line.replace(/^data: /, "").trim();
-          if (!d || d === "[DONE]") continue;
-          try {
-            const j = JSON.parse(d);
-            if (j.text)
-              setMessages((m) => {
-                const c = [...m];
-                c[c.length - 1] = { role: "assistant", content: c[c.length - 1].content + j.text };
-                return c;
-              });
-            if (j.error)
-              setMessages((m) => {
-                const c = [...m];
-                c[c.length - 1] = { role: "assistant", content: `⚠️ ${j.error}` };
-                return c;
-              });
-          } catch {
-            /* ignore partial */
-          }
-        }
-      }
-    } catch {
-      setMessages((m) => {
-        const c = [...m];
-        c[c.length - 1] = { role: "assistant", content: "⚠️ connection error" };
-        return c;
-      });
-    } finally {
-      setBusy(false);
-    }
+    await send({ threadId: THREAD, text });
   }
 
   return (
@@ -72,11 +31,11 @@ export default function Chat() {
       <div className="flex-1 space-y-3 overflow-y-auto p-4">
         {messages.length === 0 && (
           <p className="mt-8 text-center text-sm text-neutral-600">
-            Speak, sir. I remember what you tell me.
+            Speak, sir. Running on your subscription — I remember what you tell me.
           </p>
         )}
-        {messages.map((m, i) => (
-          <div key={i} className={m.role === "user" ? "text-right" : "text-left"}>
+        {messages.map((m) => (
+          <div key={m._id} className={m.role === "user" ? "text-right" : "text-left"}>
             <span
               className={`inline-block max-w-[85%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm ${
                 m.role === "user"
@@ -84,7 +43,7 @@ export default function Chat() {
                   : "bg-neutral-800/80 text-neutral-200"
               }`}
             >
-              {m.content || (busy ? "…" : "")}
+              {m.text || (m.status === "streaming" ? "…" : "")}
             </span>
           </div>
         ))}
@@ -94,12 +53,12 @@ export default function Chat() {
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && send()}
-          placeholder="Ask JARVIS…"
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          placeholder={busy ? "JARVIS is thinking…" : "Ask JARVIS…"}
           className="flex-1 rounded-xl bg-neutral-950 px-4 py-2 text-sm text-neutral-100 outline-none ring-1 ring-neutral-800 focus:ring-emerald-600"
         />
         <button
-          onClick={send}
+          onClick={submit}
           disabled={busy}
           className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
         >
