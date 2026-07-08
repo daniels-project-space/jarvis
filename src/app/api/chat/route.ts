@@ -83,7 +83,7 @@ Today's date is ${new Date().toISOString().slice(0, 10)}.`;
           system,
           messages: [...history, { role: "user", content: message }],
           tools,
-          maxOutputTokens: 1200,
+          maxOutputTokens: 700,
           stopWhen: stepCountIs(6),
           onError: ({ error }) => {
             const m = error instanceof Error ? error.message : String(error);
