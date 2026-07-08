@@ -141,6 +141,53 @@ function runTurn(
   });
 }
 
+// Stage 0 capture: a cheap Haiku pass extracts durable facts from the turn and
+// persists them (decoupled from the conversation = far more reliable than
+// in-turn tool calls; the mem0 / Letta sleep-time pattern).
+async function extractAndSave(
+  bin: string,
+  env: NodeJS.ProcessEnv,
+  userText: string,
+  assistantText: string,
+): Promise<number> {
+  const prompt =
+    "From the exchange below, extract ONLY durable facts, preferences, decisions, or tasks worth " +
+    "remembering long-term about Daniel or his projects. Output STRICT JSON: an array of " +
+    '{"kind","title","body","tags"} where kind is one of fact|preference|decision|task|project. ' +
+    "Output [] if nothing is worth remembering. No prose, JSON only.\n\n" +
+    `User: ${userText}\nAssistant: ${assistantText}`;
+  const out = await new Promise<string>((resolve) => {
+    const p = spawn(bin, ["-p", prompt, "--model", "haiku", "--dangerously-skip-permissions"], {
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let o = "";
+    p.stdout.on("data", (d) => (o += d.toString()));
+    p.on("close", () => resolve(o));
+    p.on("error", () => resolve(""));
+  });
+  const m = out.match(/\[[\s\S]*\]/);
+  if (!m) return 0;
+  let items: any[] = [];
+  try {
+    items = JSON.parse(m[0]);
+  } catch {
+    return 0;
+  }
+  let n = 0;
+  for (const it of (Array.isArray(items) ? items : []).slice(0, 8)) {
+    if (!it?.title || !it?.body) continue;
+    await convexMutation("memory:write", {
+      kind: String(it.kind || "fact"),
+      title: String(it.title).slice(0, 120),
+      body: String(it.body).slice(0, 1200),
+      tags: Array.isArray(it.tags) ? it.tags.map(String).slice(0, 6) : [],
+    }).catch(() => {});
+    n++;
+  }
+  return n;
+}
+
 export const chatDispatcher = schedules.task({
   id: "jarvis-chat-dispatcher",
   cron: "*/1 * * * *",
@@ -170,7 +217,9 @@ export const chatDispatcher = schedules.task({
       }
       idle = 0;
       try {
-        const mem: any = await convexQuery("memory:recent", { limit: 8 }).catch(() => []);
+        let mem: any = await convexQuery("memory:search", { q: claim.userText, limit: 8 }).catch(() => []);
+        if (!Array.isArray(mem) || mem.length === 0)
+          mem = await convexQuery("memory:recent", { limit: 8 }).catch(() => []);
         const memoryContext = Array.isArray(mem)
           ? mem.map((m: any) => `- [${m.kind}] ${m.title}: ${m.body}`).join("\n").slice(0, 2000)
           : "";
@@ -187,6 +236,9 @@ export const chatDispatcher = schedules.task({
           finalText,
           claudeSessionId: turn.sessionId ?? undefined,
         });
+        // Stage 0: capture durable memory from this turn (after reply is delivered).
+        if (turn.finalText.trim())
+          await extractAndSave(bin, env, claim.userText, turn.finalText).catch(() => {});
         processed += 1;
       } catch (e: any) {
         await convexMutation("chatQueue:finalize", {
