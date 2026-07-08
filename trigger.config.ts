@@ -1,19 +1,24 @@
 import { defineConfig } from "@trigger.dev/sdk/v3";
+import { additionalPackages, aptGet } from "@trigger.dev/build/extensions/core";
 
-// ⚠️ SETUP: the `jarvis-jobs` Trigger.dev project must be created in the Trigger.dev
-// dashboard (the CLI cannot create projects — only login/init/deploy). Once created:
-//   1. copy its project ref (proj_...) and a prod secret key,
-//   2. store both in the project-hub vault under service `trigger`, scopes:["jarvis"]
-//      (e.g. TRIGGER_PROJECT_REF_JARVIS, TRIGGER_SECRET_KEY_JARVIS),
-//   3. set TRIGGER_PROJECT_REF_JARVIS in the environment and run `npx trigger.dev deploy`.
+// jarvis-jobs — runs Claude Code HEADLESS on Daniel's Max subscription
+// (CLAUDE_CODE_OAUTH_TOKEN pulled from the project-hub vault at runtime;
+// ANTHROPIC_API_KEY blanked → never the metered API). Mirrors remote-work-hub.
+// Set TRIGGER_PROJECT_REF_JARVIS once the `jarvis-jobs` project is created in
+// the Trigger.dev dashboard, then `npx trigger.dev deploy`.
 export default defineConfig({
   project: process.env.TRIGGER_PROJECT_REF_JARVIS ?? "proj_PENDING_jarvis_jobs",
   runtime: "node",
   logLevel: "log",
-  maxDuration: 3600,
-  retries: {
-    enabledInDev: true,
-    default: { maxAttempts: 3, minTimeoutInMs: 1000, maxTimeoutInMs: 10000, factor: 2, randomize: true },
-  },
   dirs: ["./src/trigger"],
+  maxDuration: 3600,
+  build: {
+    // Claude Code reads its bundled binary from disk — keep it out of the
+    // esbuild bundle; Trigger installs it fresh (correct Linux binary).
+    external: ["@anthropic-ai/claude-code"],
+    extensions: [
+      additionalPackages({ packages: ["@anthropic-ai/claude-code@latest"] }),
+      aptGet({ packages: ["git", "ca-certificates"] }),
+    ],
+  },
 });

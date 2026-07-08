@@ -25,6 +25,26 @@ export default defineSchema({
     createdAt: v.number(),
   }).index("by_thread", ["threadId", "createdAt"]),
 
+  // Queue transport for the subscription brain: UI writes a pending user row;
+  // the Trigger dispatcher claims it, opens a streaming assistant row, streams
+  // Claude Code deltas in, finalizes. UI subscribes reactively.
+  chatMessages: defineTable({
+    threadId: v.string(),
+    role: v.string(), // "user" | "assistant"
+    text: v.string(),
+    status: v.string(), // "pending" | "streaming" | "done" | "error"
+    createdAt: v.number(),
+  })
+    .index("by_thread", ["threadId", "createdAt"])
+    .index("by_status", ["status", "createdAt"]),
+
+  chatSessions: defineTable({
+    threadId: v.string(),
+    status: v.string(), // "idle" | "working"
+    claudeSessionId: v.optional(v.string()),
+    lastActiveAt: v.number(),
+  }).index("by_thread", ["threadId"]),
+
   // Snapshot of project / cloud-stack state so JARVIS can answer "state of my apps".
   projectState: defineTable({
     slug: v.string(),

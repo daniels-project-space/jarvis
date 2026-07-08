@@ -9,6 +9,7 @@
  */
 
 import type * as chat from "../chat.js";
+import type * as chatQueue from "../chatQueue.js";
 import type * as memory from "../memory.js";
 
 import type {
@@ -19,6 +20,7 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   chat: typeof chat;
+  chatQueue: typeof chatQueue;
   memory: typeof memory;
 }>;
 
