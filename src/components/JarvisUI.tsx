@@ -10,6 +10,11 @@ type Msg = { _id: string; role: string; text: string; status: string };
 export default function JarvisUI() {
   const messages = (useQuery(api.chatQueue.listMessages, { threadId: THREAD }) ?? []) as Msg[];
   const send = useMutation(api.chatQueue.sendMessage);
+  const panel = useQuery(api.ui.getPanel, {}) as
+    | { type: string; value: string; title?: string }
+    | null
+    | undefined;
+  const clearPanel = useMutation(api.ui.clearPanel);
   const [input, setInput] = useState("");
   const [speaking, setSpeaking] = useState(false);
   const [listening, setListening] = useState(false);
@@ -78,10 +83,49 @@ export default function JarvisUI() {
   return (
     <div className="mx-auto grid w-full max-w-6xl flex-1 gap-4 p-4 md:grid-cols-2">
       <div className="relative min-h-[45vh] overflow-hidden rounded-2xl border border-neutral-800 bg-gradient-to-b from-neutral-950 to-black">
-        <Orb speaking={speaking} />
-        <div className="pointer-events-none absolute bottom-3 left-0 right-0 text-center text-xs tracking-widest text-neutral-500">
-          {status}
-        </div>
+        {panel ? (
+          <div className="flex h-full flex-col">
+            <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-2">
+              <span className="truncate text-xs text-neutral-400">{panel.title ?? panel.type}</span>
+              <button
+                onClick={() => clearPanel({})}
+                className="rounded bg-neutral-800/80 px-2 py-0.5 text-xs text-neutral-300 hover:bg-neutral-700"
+              >
+                ✕ orb
+              </button>
+            </div>
+            {panel.type === "url" ? (
+              <div className="flex flex-1 flex-col">
+                <iframe
+                  src={panel.value}
+                  className="w-full flex-1 bg-white"
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+                />
+                <a
+                  href={panel.value}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="p-2 text-center text-xs text-emerald-400"
+                >
+                  open ↗ (blank = the site blocks embedding)
+                </a>
+              </div>
+            ) : panel.type === "image" ? (
+              <img src={panel.value} alt={panel.title ?? ""} className="min-h-0 flex-1 object-contain" />
+            ) : (
+              <pre className="flex-1 overflow-auto whitespace-pre-wrap p-4 text-sm text-neutral-200">
+                {panel.value}
+              </pre>
+            )}
+          </div>
+        ) : (
+          <>
+            <Orb speaking={speaking} />
+            <div className="pointer-events-none absolute bottom-3 left-0 right-0 text-center text-xs tracking-widest text-neutral-500">
+              {status}
+            </div>
+          </>
+        )}
       </div>
       <div className="flex h-[70vh] flex-col overflow-hidden rounded-2xl border border-neutral-800 bg-neutral-900/50">
         <div className="flex-1 space-y-3 overflow-y-auto p-4">

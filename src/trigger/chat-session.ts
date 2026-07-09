@@ -78,6 +78,10 @@ function runTurn(
     `background or on a repo), run this bash, then tell him it's dispatched and you'll report back when done: ` +
     `curl -s -X POST '${CONVEX_URL}/api/mutation' -H 'content-type: application/json' ` +
     `-d '{"path":"jobs:enqueue","args":{"task":"<clear, self-contained task>","repo":"<owner/repo or empty string>"}}'\n` +
+    `To SHOW Daniel something on screen (pull up a website, open a document/notes, display an image) when he ` +
+    `asks you to show/pull up/open something, run: curl -s -X POST '${CONVEX_URL}/api/mutation' ` +
+    `-H 'content-type: application/json' -d '{"path":"ui:setPanel","args":{"type":"url","value":"https://…","title":"<label>"}}' ` +
+    `(type can be "url", "markdown" for text/notes, or "image").\n` +
     "Answer the user's question directly, using the memory and cloud-stack facts above when relevant. " +
     "NEVER narrate your process or mention 'context', 'memory', or 'tool calls' — just give the answer itself.";
   const convo = history.length

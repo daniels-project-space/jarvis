@@ -63,4 +63,14 @@ export default defineSchema({
     result: v.optional(v.string()),
     createdAt: v.number(),
   }).index("by_status", ["status", "createdAt"]),
+
+  // "Show me" panel — the brain sets what to display (site / doc / image); the UI
+  // reactively shows it in place of the orb. Single row keyed "panel".
+  ui: defineTable({
+    key: v.string(),
+    type: v.string(), // "url" | "markdown" | "image"
+    value: v.string(),
+    title: v.optional(v.string()),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
 });

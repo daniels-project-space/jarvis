@@ -13,6 +13,7 @@ import type * as chatQueue from "../chatQueue.js";
 import type * as jobs from "../jobs.js";
 import type * as memory from "../memory.js";
 import type * as projectState from "../projectState.js";
+import type * as ui from "../ui.js";
 
 import type {
   ApiFromModules,
@@ -26,6 +27,7 @@ declare const fullApi: ApiFromModules<{
   jobs: typeof jobs;
   memory: typeof memory;
   projectState: typeof projectState;
+  ui: typeof ui;
 }>;
 
 /**
