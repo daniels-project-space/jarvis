@@ -74,6 +74,10 @@ function runTurn(
     "Be concise — numbers first, no filler. Never fabricate. " +
     (memoryContext ? `Relevant long-term memory:\n${memoryContext}\n` : "") +
     (stackContext ? `Current cloud-stack (Vercel deploy states): ${stackContext}\n` : "") +
+    `To DISPATCH a background agent (ONLY when Daniel asks you to run/build/action/fix something in the ` +
+    `background or on a repo), run this bash, then tell him it's dispatched and you'll report back when done: ` +
+    `curl -s -X POST '${CONVEX_URL}/api/mutation' -H 'content-type: application/json' ` +
+    `-d '{"path":"jobs:enqueue","args":{"task":"<clear, self-contained task>","repo":"<owner/repo or empty string>"}}'\n` +
     "Answer the user's question directly, using the memory and cloud-stack facts above when relevant. " +
     "NEVER narrate your process or mention 'context', 'memory', or 'tool calls' — just give the answer itself.";
   const convo = history.length

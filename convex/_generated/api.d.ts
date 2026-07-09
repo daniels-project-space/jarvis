@@ -10,6 +10,7 @@
 
 import type * as chat from "../chat.js";
 import type * as chatQueue from "../chatQueue.js";
+import type * as jobs from "../jobs.js";
 import type * as memory from "../memory.js";
 import type * as projectState from "../projectState.js";
 
@@ -22,6 +23,7 @@ import type {
 declare const fullApi: ApiFromModules<{
   chat: typeof chat;
   chatQueue: typeof chatQueue;
+  jobs: typeof jobs;
   memory: typeof memory;
   projectState: typeof projectState;
 }>;

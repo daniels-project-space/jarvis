@@ -53,4 +53,14 @@ export default defineSchema({
     data: v.optional(v.any()),
     updatedAt: v.number(),
   }).index("by_slug", ["slug"]),
+
+  // Background agent jobs: brain enqueues, agent-runner Trigger task executes
+  // (Claude Code / Opus, optional repo clone+push) and reports back into chat.
+  jobs: defineTable({
+    repo: v.optional(v.string()),
+    task: v.string(),
+    status: v.string(), // pending | running | done | error
+    result: v.optional(v.string()),
+    createdAt: v.number(),
+  }).index("by_status", ["status", "createdAt"]),
 });

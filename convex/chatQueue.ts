@@ -133,3 +133,17 @@ export const finalize = mutation({
     }
   },
 });
+
+// Post an assistant message directly (used by the agent-runner to report back).
+export const postAssistant = mutation({
+  args: { threadId: v.string(), text: v.string() },
+  handler: async (ctx, a) => {
+    await ctx.db.insert("chatMessages", {
+      threadId: a.threadId,
+      role: "assistant",
+      text: a.text,
+      status: "done",
+      createdAt: Date.now(),
+    });
+  },
+});
