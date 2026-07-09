@@ -2,11 +2,12 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 
 export const enqueue = mutation({
-  args: { task: v.string(), repo: v.optional(v.string()) },
+  args: { task: v.string(), repo: v.optional(v.string()), readonly: v.optional(v.boolean()) },
   handler: async (ctx, a) => {
     return await ctx.db.insert("jobs", {
       task: a.task,
       repo: a.repo,
+      readonly: a.readonly,
       status: "pending",
       createdAt: Date.now(),
     });
@@ -22,7 +23,7 @@ export const claimNext = mutation({
       .first();
     if (!j) return null;
     await ctx.db.patch(j._id, { status: "running" });
-    return { jobId: j._id, task: j.task, repo: j.repo ?? null };
+    return { jobId: j._id, task: j.task, repo: j.repo ?? null, readonly: j.readonly ?? false };
   },
 });
 

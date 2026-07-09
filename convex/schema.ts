@@ -61,6 +61,7 @@ export default defineSchema({
     task: v.string(),
     status: v.string(), // pending | running | done | error
     result: v.optional(v.string()),
+    readonly: v.optional(v.boolean()), // if true, runner never commits/pushes
     createdAt: v.number(),
   }).index("by_status", ["status", "createdAt"]),
 

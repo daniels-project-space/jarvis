@@ -119,7 +119,7 @@ export const agentRunner = schedules.task({
         const result = await runClaude(bin, cwd, env, `${context}\n\nTask: ${job.task}`);
 
         let pushNote = "";
-        if (repoDir && token) {
+        if (repoDir && token && !job.readonly) {
           await sh("git", ["-C", repoDir, "add", "-A"], env);
           await sh("git", ["-C", repoDir, "commit", "-m", "jarvis agent changes"], env);
           const push = await sh(
