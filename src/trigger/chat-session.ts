@@ -74,7 +74,8 @@ function runTurn(
     "Be concise — numbers first, no filler. Never fabricate. " +
     (memoryContext ? `Relevant long-term memory:\n${memoryContext}\n` : "") +
     (stackContext ? `Current cloud-stack (Vercel deploy states): ${stackContext}\n` : "") +
-    "Answer the user directly.";
+    "Answer the user's question directly, using the memory and cloud-stack facts above when relevant. " +
+    "NEVER narrate your process or mention 'context', 'memory', or 'tool calls' — just give the answer itself.";
   const convo = history.length
     ? "Recent conversation:\n" +
       history.map((h) => `${h.role === "user" ? "User" : "You"}: ${h.text}`).join("\n") +
