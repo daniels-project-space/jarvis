@@ -67,11 +67,13 @@ function runTurn(
   userText: string,
   history: { role: string; text: string }[],
   memoryContext: string,
+  stackContext: string,
 ): Promise<Turn> {
   const preamble =
     "You are JARVIS, Daniel's dry, impeccably-polite British-butler personal ops assistant. " +
     "Be concise — numbers first, no filler. Never fabricate. " +
     (memoryContext ? `Relevant long-term memory:\n${memoryContext}\n` : "") +
+    (stackContext ? `Current cloud-stack (Vercel deploy states): ${stackContext}\n` : "") +
     "Answer the user directly.";
   const convo = history.length
     ? "Recent conversation:\n" +
@@ -223,7 +225,20 @@ export const chatDispatcher = schedules.task({
         const memoryContext = Array.isArray(mem)
           ? mem.map((m: any) => `- [${m.kind}] ${m.title}: ${m.body}`).join("\n").slice(0, 2000)
           : "";
-        const turn = await runTurn(bin, env, claim.assistantId, claim.userText, claim.history, memoryContext);
+        const stack: any = await convexQuery("projectState:list", {}).catch(() => []);
+        const stackContext =
+          Array.isArray(stack) && stack.length
+            ? stack.map((s: any) => `${s.slug}=${s.status}`).join(", ").slice(0, 1200)
+            : "";
+        const turn = await runTurn(
+          bin,
+          env,
+          claim.assistantId,
+          claim.userText,
+          claim.history,
+          memoryContext,
+          stackContext,
+        );
         const finalText =
           turn.finalText.trim() ||
           (turn.code === 0
