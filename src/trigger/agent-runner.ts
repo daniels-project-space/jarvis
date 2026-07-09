@@ -109,6 +109,8 @@ export const agentRunner = schedules.task({
           if (existsSync(join(dir, ".git"))) {
             cwd = dir;
             repoDir = dir;
+            await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
+            await sh("git", ["-C", dir, "config", "user.name", "JARVIS"], env);
             context =
               `Your working directory IS the git repo ${job.repo} (cloned). Make the changes and commit ` +
               "them (git -C . commit -am '...') but do NOT push — the runner pushes for you.";
@@ -120,14 +122,20 @@ export const agentRunner = schedules.task({
 
         let pushNote = "";
         if (repoDir && token && !job.readonly) {
+          const pushUrl = `https://x-access-token:${token}@github.com/${job.repo}.git`;
           await sh("git", ["-C", repoDir, "add", "-A"], env);
-          await sh("git", ["-C", repoDir, "commit", "-m", "jarvis agent changes"], env);
-          const push = await sh(
-            "git",
-            ["-C", repoDir, "push", `https://x-access-token:${token}@github.com/${job.repo}.git`, "HEAD"],
-            env,
-          );
-          pushNote = push.code === 0 && !/up-to-date/i.test(push.out) ? " · pushed" : "";
+          const commit = await sh("git", ["-C", repoDir, "commit", "-m", "fix: jarvis agent"], env);
+          if (/nothing to commit/i.test(commit.out)) {
+            pushNote = " · no changes made";
+          } else {
+            let push = await sh("git", ["-C", repoDir, "push", pushUrl, "HEAD"], env);
+            if (/shallow update not allowed/i.test(push.out)) {
+              await sh("git", ["-C", repoDir, "fetch", "--unshallow"], env);
+              push = await sh("git", ["-C", repoDir, "push", pushUrl, "HEAD"], env);
+            }
+            pushNote =
+              push.code === 0 ? " · pushed ✅" : ` · push FAILED: ${push.out.slice(-140).replace(/\s+/g, " ")}`;
+          }
         }
 
         await convexMutation("jobs:finalize", { jobId: job.jobId, status: "done", result: result.slice(0, 4000) });
