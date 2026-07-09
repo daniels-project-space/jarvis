@@ -60,6 +60,14 @@ function runClaude(bin: string, cwd: string, env: NodeJS.ProcessEnv, prompt: str
     );
     let buf = "";
     let finalText = "";
+    const to = setTimeout(() => {
+      try {
+        p.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      resolve(finalText || "(agent timed out)");
+    }, 420_000);
     p.stdout.on("data", (d) => {
       buf += d.toString();
       let nl: number;
@@ -76,15 +84,21 @@ function runClaude(bin: string, cwd: string, env: NodeJS.ProcessEnv, prompt: str
         if (ev.type === "result" && typeof ev.result === "string") finalText = ev.result;
       }
     });
-    p.on("close", () => resolve(finalText || "(no output)"));
-    p.on("error", (e) => resolve("error: " + e.message));
+    p.on("close", () => {
+      clearTimeout(to);
+      resolve(finalText || "(no output)");
+    });
+    p.on("error", (e) => {
+      clearTimeout(to);
+      resolve("error: " + e.message);
+    });
   });
 }
 
 export const agentRunner = schedules.task({
   id: "jarvis-agent-runner",
   cron: "*/2 * * * *",
-  maxDuration: 3300,
+  maxDuration: 900,
   run: async () => {
     const bin = resolveClaudeBin();
     if (!bin) return { processed: 0, error: "no claude binary" };
