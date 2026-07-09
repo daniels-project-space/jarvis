@@ -16,6 +16,21 @@ async function convexMutation(path: string, args: unknown) {
     body: JSON.stringify({ path, args, format: "json" }),
   }).catch(() => {});
 }
+async function convexQuery(path: string, args: unknown) {
+  try {
+    return (
+      await (
+        await fetch(`${CONVEX_URL}/api/query`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ path, args, format: "json" }),
+        })
+      ).json()
+    ).value;
+  } catch {
+    return null;
+  }
+}
 async function vaultService(service: string): Promise<Record<string, string>> {
   const r = await fetch(`${VAULT_URL}/api/query`, {
     method: "POST",
@@ -33,14 +48,19 @@ export const stackPoller = schedules.task({
   run: async () => {
     const token = (await vaultService("vercel")).VERCEL_TOKEN;
     if (!token) return { polled: 0, error: "no vercel token" };
+    const prior: any[] = (await convexQuery("projectState:list", {})) ?? [];
+    const priorStatus = new Map<string, string>(prior.map((s: any) => [s.slug, s.status]));
     const H = { authorization: `Bearer ${token}` };
     const res = await fetch(`https://api.vercel.com/v9/projects?teamId=${VERCEL_TEAM}&limit=100`, { headers: H });
     const projects: any[] = (await res.json()).projects ?? [];
     let polled = 0;
+    const newlyBroken: string[] = [];
     for (const p of projects) {
       const prod = p.targets?.production;
       const status = prod?.readyState ?? "no-deploy";
       const alias = (prod?.alias ?? []).find((a: string) => !a.includes("-danielmabro")) ?? (prod?.alias ?? [])[0];
+      const old = priorStatus.get(p.name);
+      if (status === "ERROR" && old && old !== "ERROR") newlyBroken.push(p.name);
       await convexMutation("projectState:upsert", {
         slug: p.name,
         status,
@@ -49,6 +69,13 @@ export const stackPoller = schedules.task({
       });
       polled++;
     }
-    return { polled };
+    // Proactive alert: JARVIS pings unprompted when a deploy newly breaks.
+    if (newlyBroken.length) {
+      await convexMutation("chatQueue:postAssistant", {
+        threadId: "main",
+        text: `⚠️ Heads up, sir — a deploy just failed: ${newlyBroken.join(", ")}. Shall I dispatch an agent to investigate?`,
+      });
+    }
+    return { polled, newlyBroken };
   },
 });
