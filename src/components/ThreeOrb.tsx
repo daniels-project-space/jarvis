@@ -7,10 +7,10 @@ import { useEffect, useRef } from "react";
 type State = "idle" | "listening" | "thinking" | "speaking";
 
 const PAL: Record<State, { a: string; b: string; accent: string; bloom: number; amp: number }> = {
-  idle: { a: "#18a0ff", b: "#0a3aa8", accent: "#5cf0ff", bloom: 0.52, amp: 0.16 },
-  listening: { a: "#00e0ff", b: "#0077ff", accent: "#a0f8ff", bloom: 0.62, amp: 0.28 },
-  thinking: { a: "#9a6cff", b: "#5a2fd8", accent: "#d0b0ff", bloom: 0.66, amp: 0.28 },
-  speaking: { a: "#00ffc8", b: "#00a2ff", accent: "#eafff8", bloom: 0.85, amp: 0.4 },
+  idle: { a: "#18a0ff", b: "#0a3aa8", accent: "#5cf0ff", bloom: 0.45, amp: 0.16 },
+  listening: { a: "#00e0ff", b: "#0077ff", accent: "#a0f8ff", bloom: 0.5, amp: 0.28 },
+  thinking: { a: "#9a6cff", b: "#5a2fd8", accent: "#d0b0ff", bloom: 0.5, amp: 0.28 },
+  speaking: { a: "#00ffc8", b: "#00a2ff", accent: "#33ffcc", bloom: 0.58, amp: 0.4 },
 };
 
 const VERT = /* glsl */ `
@@ -66,10 +66,10 @@ void main(){
   vec3 V = normalize(cameraPosition - vWorldPos);
   float fres = pow(1.0 - max(dot(N,V),0.0), 2.5);
   vec3 col = mix(uColorA, uColorB, fres);
-  col = mix(col, uColorAccent, smoothstep(0.15,0.5,vDisp) * (0.5 + uTreble));
-  float intensity = 0.42 + fres*1.7 + uLevel*0.7;
+  col = mix(col, uColorAccent, smoothstep(0.15,0.5,vDisp) * (0.3 + uTreble*0.5));
+  float intensity = 0.25 + fres*1.6 + uLevel*0.22;
   col *= intensity;
-  col += uColorA * (0.1 + 0.15*uLevel);
+  col += uColorA * (0.04 + 0.06*uLevel);
   gl_FragColor = vec4(col, 1.0);
 }`;
 
@@ -116,7 +116,7 @@ export default function ThreeOrb({
 
       const scene = new THREE.Scene();
       const camera = new THREE.PerspectiveCamera(50, w() / h(), 0.1, 100);
-      camera.position.z = 3.2;
+      camera.position.z = 4.3;
 
       const p0 = PAL[stateRef.current];
       const uniforms = {
@@ -165,7 +165,7 @@ export default function ThreeOrb({
         map: dot,
         color: lin("#7fe4ff"),
         transparent: true,
-        opacity: 0.6,
+        opacity: 0.45,
         blending: THREE.AdditiveBlending,
         depthWrite: false,
         sizeAttenuation: true,
@@ -179,7 +179,7 @@ export default function ThreeOrb({
       );
       composer.setPixelRatio(Math.min(window.devicePixelRatio || 1, prCap));
       composer.addPass(new RenderPass(scene, camera));
-      const bloom = new UnrealBloomPass(new THREE.Vector2(w(), h()), p0.bloom, 0.55, 0.2);
+      const bloom = new UnrealBloomPass(new THREE.Vector2(w(), h()), p0.bloom, 0.6, 0.7);
       composer.addPass(bloom);
       composer.addPass(new OutputPass());
 
@@ -202,7 +202,8 @@ export default function ThreeOrb({
         uniforms.uTime.value = t;
 
         // audio energy → bands (single-value amplitude synthesised into bands)
-        const raw = energyRef?.current ?? 0;
+        const dbg = (window as any).__orbE;
+        const raw = typeof dbg === "number" ? dbg : (energyRef?.current ?? 0);
         level += (raw - level) * (raw > level ? 0.5 : 0.12);
         const idle = 0.05 + 0.035 * Math.sin(t * 1.2);
         const lvl = raw < 0.02 ? Math.max(level, idle) : level;
@@ -212,7 +213,8 @@ export default function ThreeOrb({
         uniforms.uTreble.value = lvl * 0.45 + 0.015 * (0.5 + 0.5 * Math.sin(t * 6.0));
 
         // state palette lerp
-        const pal = PAL[stateRef.current];
+        const dbgS = (window as any).__orbState as State | undefined;
+        const pal = PAL[dbgS ?? stateRef.current];
         tgtA.copy(new THREE.Color(pal.a).convertSRGBToLinear());
         tgtB.copy(new THREE.Color(pal.b).convertSRGBToLinear());
         tgtAcc.copy(new THREE.Color(pal.accent).convertSRGBToLinear());
@@ -221,7 +223,8 @@ export default function ThreeOrb({
         uniforms.uColorAccent.value.lerp(tgtAcc, 0.06);
         pm.color.lerp(tgtA, 0.04);
         uniforms.uAmp.value += (pal.amp - uniforms.uAmp.value) * 0.05;
-        bloom.strength += (pal.bloom + lvl * 0.5 - bloom.strength) * 0.05;
+        const bright = Math.min(lvl, 0.65);
+        bloom.strength += (pal.bloom + bright * 0.12 - bloom.strength) * 0.05;
 
         orb.rotation.y += 0.0016;
         halo.rotation.y += 0.0006 + lvl * 0.004;
