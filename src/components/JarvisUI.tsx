@@ -180,12 +180,12 @@ export default function JarvisUI() {
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && submit(input)}
             placeholder={busy ? "JARVIS is thinking…" : "Ask JARVIS…"}
-            className="flex-1 rounded-xl bg-neutral-950 px-4 py-2 text-sm text-neutral-100 outline-none ring-1 ring-neutral-800 focus:ring-emerald-600"
+            className="min-w-0 flex-1 rounded-xl bg-neutral-950 px-4 py-2 text-sm text-neutral-100 outline-none ring-1 ring-neutral-800 focus:ring-emerald-600"
           />
           <button
             onClick={() => submit(input)}
             disabled={busy}
-            className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+            className="shrink-0 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
           >
             Send
           </button>
