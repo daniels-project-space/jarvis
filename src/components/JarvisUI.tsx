@@ -632,12 +632,33 @@ export default function JarvisUI() {
         body: JSON.stringify({ signature: sig, message: msg }),
       }).catch(() => {});
     };
+    // A ChunkLoadError means this tab is holding HTML from a PREVIOUS deploy:
+    // its hashed dynamic-import chunks (wakeword/tts/realtime/push/three…) were
+    // replaced on the CDN by Vercel's auto-deploy, so the lazy fetch 404s. It's
+    // not a bug in any module — reload ONCE to pull the fresh chunks. Guarded by
+    // a timestamp so a genuinely-missing chunk can't loop forever.
+    const isChunkError = (v: unknown) => {
+      const s = String((v as { name?: string; message?: string })?.name ?? "") +
+        " " + String((v as { message?: string })?.message ?? v ?? "");
+      return /ChunkLoadError|Loading chunk [\w-]+ failed|Failed to load chunk/i.test(s);
+    };
+    const recoverStaleChunks = () => {
+      try {
+        const last = Number(sessionStorage.getItem("jarvis-chunk-reload") || 0);
+        if (Date.now() - last < 10000) return; // just reloaded and it still fails — don't loop
+        sessionStorage.setItem("jarvis-chunk-reload", String(Date.now()));
+      } catch { /* sessionStorage unavailable — fall through to a single reload */ }
+      window.location.reload();
+    };
     const onErr = (e: ErrorEvent) => {
+      if (isChunkError(e.error ?? e.message)) { recoverStaleChunks(); return; } // stale post-deploy chunk
       if (e.message === "Script error." || !e.message) return; // cross-origin iframe noise, unactionable
       report(`client:${String(e.message).slice(0, 80)}`, `${e.message} @ ${e.filename}:${e.lineno}`);
     };
-    const onRej = (e: PromiseRejectionEvent) =>
+    const onRej = (e: PromiseRejectionEvent) => {
+      if (isChunkError(e.reason)) { recoverStaleChunks(); return; } // stale post-deploy chunk
       report(`client:rejection:${String(e.reason).slice(0, 80)}`, `Unhandled rejection: ${String(e.reason).slice(0, 400)}`);
+    };
     window.addEventListener("error", onErr);
     window.addEventListener("unhandledrejection", onRej);
     return () => {
