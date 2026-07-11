@@ -1,13 +1,15 @@
 import { schedules } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
-import { mkdirSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { sendPush } from "./push-send";
+import { INFRA_MAP } from "../lib/persona";
 
 // Slice D — dispatch. Claims background jobs (enqueued by the brain), runs a
 // Claude Code / Opus agent on them (optionally cloning a repo, committing +
-// pushing changes), and reports the result back into the chat. Subscription auth.
+// pushing changes, optionally with MCP servers attached), then WEAVES the result
+// into conversation as one natural spoken line + a findings row (never a dump).
 
 const nodeRequire = createRequire(import.meta.url);
 const CONVEX_URL =
@@ -63,6 +65,78 @@ function pickAgentModel(task: string): string {
   return "sonnet";
 }
 
+const VAULT_URL = "https://fantastic-roadrunner-485.convex.cloud";
+async function vaultService(service: string): Promise<Record<string, string>> {
+  try {
+    const r = await fetch(`${VAULT_URL}/api/query`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: "secrets:listByService", args: { service }, format: "json" }),
+    });
+    const rows = ((await r.json()).value ?? []) as { keyName: string; value: string }[];
+    return Object.fromEntries(rows.map((s) => [s.keyName, s.value]));
+  } catch {
+    return {};
+  }
+}
+
+// MCP servers the brain can attach on demand. Browserbase = hosted browsers
+// (no local Chromium in the Trigger image); context7 = live library docs.
+async function buildMcpConfig(names: string[]): Promise<string | null> {
+  const servers: Record<string, unknown> = {};
+  for (const n of names) {
+    if (["playwright", "browser", "browserbase"].includes(n)) {
+      const bb = await vaultService("browserbase");
+      if (bb.BROWSERBASE_API_KEY)
+        servers["browserbase"] = {
+          command: "npx",
+          args: ["-y", "@browserbasehq/mcp-server-browserbase"],
+          env: { BROWSERBASE_API_KEY: bb.BROWSERBASE_API_KEY, BROWSERBASE_PROJECT_ID: bb.BROWSERBASE_PROJECT_ID ?? "" },
+        };
+    }
+    if (n === "context7") servers["context7"] = { command: "npx", args: ["-y", "@upstash/context7-mcp"] };
+  }
+  if (!Object.keys(servers).length) return null;
+  const path = "/tmp/mcp.json";
+  writeFileSync(path, JSON.stringify({ mcpServers: servers }));
+  return path;
+}
+
+// One casual spoken sentence for the chat (the weave) — never the raw dump.
+async function weaveLine(bin: string, env: NodeJS.ProcessEnv, task: string, result: string): Promise<string> {
+  const prompt =
+    "You are JARVIS, Daniel's British AI companion. A background agent you dispatched just finished. " +
+    "Write EXACTLY ONE short casual spoken sentence (max 25 words) telling Daniel the key outcome, like a colleague " +
+    "leaning over mid-conversation. No markdown, no emoji, no preamble. If it failed, say so honestly in one sentence.\n\n" +
+    `The task was: ${task.slice(0, 300)}\nThe result:\n${result.slice(0, 2500)}`;
+  const out = await new Promise<string>((resolve) => {
+    const p = spawn(bin, ["-p", prompt, "--model", "haiku", "--dangerously-skip-permissions"], {
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let o = "";
+    const to = setTimeout(() => {
+      try {
+        p.kill("SIGKILL");
+      } catch {
+        /* gone */
+      }
+      resolve(o);
+    }, 60_000);
+    p.stdout.on("data", (d) => (o += d.toString()));
+    p.on("close", () => {
+      clearTimeout(to);
+      resolve(o);
+    });
+    p.on("error", () => {
+      clearTimeout(to);
+      resolve("");
+    });
+  });
+  const line = out.trim().replace(/\s+/g, " ").replace(/[*#`_]/g, "");
+  return line.length > 4 && line.length < 400 ? line : "";
+}
+
 function runClaude(
   bin: string,
   cwd: string,
@@ -70,13 +144,21 @@ function runClaude(
   prompt: string,
   model: string,
   onProgress?: (s: string) => void,
+  mcpConfig?: string | null,
 ): Promise<string> {
   return new Promise((resolve) => {
-    const p = spawn(
-      bin,
-      ["-p", prompt, "--model", model, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"],
-      { cwd, env, stdio: ["ignore", "pipe", "pipe"] },
-    );
+    const args = [
+      "-p",
+      prompt,
+      "--model",
+      model,
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--dangerously-skip-permissions",
+    ];
+    if (mcpConfig) args.push("--mcp-config", mcpConfig);
+    const p = spawn(bin, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     let buf = "";
     let finalText = "";
     let latest = "starting up…";
@@ -168,8 +250,22 @@ export const agentRunner = schedules.task({
     const bin = resolveClaudeBin();
     if (!bin) return { processed: 0, error: "no claude binary" };
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: "/tmp/claude-home", ANTHROPIC_API_KEY: "" };
-    mkdirSync("/tmp/claude-home", { recursive: true });
+    mkdirSync("/tmp/claude-home/.claude", { recursive: true });
     const token = process.env.GITHUB_TOKEN ?? "";
+
+    // Standing briefing every agent reads (global CLAUDE.md in the runner HOME):
+    // Daniel's infra map + vault access + repo/deploy conventions = real project access.
+    writeFileSync(
+      "/tmp/claude-home/.claude/CLAUDE.md",
+      `# You are a JARVIS background agent working for Daniel.\n\n${INFRA_MAP}\n\n` +
+        `## Secrets vault (use freely when a task needs API keys)\n` +
+        `curl -s -X POST '${VAULT_URL}/api/query' -H 'content-type: application/json' -d '{"path":"secrets:listByService","args":{"service":"<service>"},"format":"json"}'\n` +
+        `List all services: same call with path "secrets:summary" and args {}.\n\n` +
+        `## Conventions\n- Cloning any Daniel repo: use env GITHUB_TOKEN as x-access-token basic auth.\n` +
+        `- Web research: use your WebSearch/WebFetch tools directly.\n` +
+        `- Never invent results. If something is inaccessible, say so plainly in your final answer.\n` +
+        `- Final answer style: plain text, the key outcome first, under 300 words.\n`,
+    );
 
     let processed = 0;
     const started = Date.now();
@@ -202,15 +298,28 @@ export const agentRunner = schedules.task({
           }
         }
         const model = typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task);
-        const result = await runClaude(bin, cwd, env, `${context}\n\nTask: ${job.task}`, model, (line) => {
-          void convexMutation("jobs:updateProgress", { jobId: job.jobId, progress: line });
-        });
+        const mcpConfig = Array.isArray(job.mcp) && job.mcp.length ? await buildMcpConfig(job.mcp) : null;
+        const result = await runClaude(
+          bin,
+          cwd,
+          env,
+          `${context}\n\nTask: ${job.task}`,
+          model,
+          (line) => {
+            void convexMutation("jobs:updateProgress", { jobId: job.jobId, progress: line });
+          },
+          mcpConfig,
+        );
 
         let pushNote = "";
         if (repoDir && token && !job.readonly) {
           const pushUrl = `https://x-access-token:${token}@github.com/${repo}.git`;
           await sh("git", ["-C", repoDir, "add", "-A"], env);
-          const commit = await sh("git", ["-C", repoDir, "commit", "-m", "fix: jarvis agent"], env);
+          const commit = await sh(
+            "git",
+            ["-C", repoDir, "commit", "-m", `chore: jarvis agent — ${job.task.slice(0, 60).replace(/"/g, "'")}`],
+            env,
+          );
           if (/nothing to commit/i.test(commit.out)) {
             pushNote = " · no changes made";
           } else {
@@ -226,18 +335,21 @@ export const agentRunner = schedules.task({
 
         const status = cloneFailed ? "error" : "done";
         await convexMutation("jobs:finalize", { jobId: job.jobId, status, result: result.slice(0, 4000) });
-        const head = cloneFailed
-          ? `⚠️ Couldn't reach ${repo} — check the repo name or my access. Best I can tell you:`
-          : `✅ Agent finished${repo ? ` on ${repo}` : ""}${pushNote}:`;
-        await convexMutation("chatQueue:postAssistant", {
-          threadId: "main",
-          text: `${head}\n${result.slice(0, 700)}`,
+
+        // Weave, don't dump: one natural spoken line into chat + the full detail
+        // as a finding the brain can pull up ("show me what it found").
+        const spoken =
+          (await weaveLine(bin, env, job.task, `${result}${pushNote}`)) ||
+          (cloneFailed
+            ? `Couldn't get into ${repo}, sir — the repo name or access looks wrong.`
+            : `That background job's done${pushNote.includes("pushed") ? " and the change is live" : ""}.`);
+        await convexMutation("findings:add", {
+          source: job.task,
+          spoken,
+          detail: result.slice(0, 8000) + (pushNote ? `\n\n(${pushNote.trim()})` : ""),
         });
-        await sendPush(
-          cloneFailed ? `⚠️ Couldn't reach ${repo}` : `✅ Agent finished${repo ? ` on ${repo}` : ""}`,
-          result.slice(0, 140),
-          "/",
-        );
+        await convexMutation("chatQueue:postAssistant", { threadId: "main", text: spoken });
+        await sendPush("JARVIS", spoken.slice(0, 140), "/");
         processed += 1;
       } catch (e: any) {
         await convexMutation("jobs:finalize", { jobId: job.jobId, status: "error", result: String(e?.message ?? e) });

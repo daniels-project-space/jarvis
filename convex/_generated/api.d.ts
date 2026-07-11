@@ -11,6 +11,7 @@
 import type * as business from "../business.js";
 import type * as chat from "../chat.js";
 import type * as chatQueue from "../chatQueue.js";
+import type * as findings from "../findings.js";
 import type * as jobs from "../jobs.js";
 import type * as memory from "../memory.js";
 import type * as projectState from "../projectState.js";
@@ -27,6 +28,7 @@ declare const fullApi: ApiFromModules<{
   business: typeof business;
   chat: typeof chat;
   chatQueue: typeof chatQueue;
+  findings: typeof findings;
   jobs: typeof jobs;
   memory: typeof memory;
   projectState: typeof projectState;

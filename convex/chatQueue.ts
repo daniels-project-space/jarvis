@@ -57,6 +57,56 @@ export const sessionState = query({
   },
 });
 
+// Fast-lane turn: the /api/chat route (Groq reflex brain) handles the turn
+// itself, so the user row is inserted already-done (the cron dispatcher only
+// claims "pending" rows) and a streaming assistant row is opened for it.
+export const openTurn = mutation({
+  args: { threadId: v.optional(v.string()), userText: v.string() },
+  handler: async (ctx, a) => {
+    const threadId = a.threadId ?? "main";
+    await ensureSession(ctx, threadId);
+    const all = await ctx.db
+      .query("chatMessages")
+      .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
+      .collect();
+    const history = all
+      .filter((m: any) => m.status === "done" && m.text)
+      .sort((x: any, y: any) => x.createdAt - y.createdAt)
+      .slice(-16)
+      .map((m: any) => ({ role: m.role, text: m.text }));
+    await ctx.db.insert("chatMessages", {
+      threadId,
+      role: "user",
+      text: a.userText,
+      status: "done",
+      createdAt: Date.now(),
+    });
+    const assistantId = await ctx.db.insert("chatMessages", {
+      threadId,
+      role: "assistant",
+      text: "",
+      status: "streaming",
+      createdAt: Date.now(),
+    });
+    return { assistantId, history };
+  },
+});
+
+// Mirror a finished live-voice exchange into history (both sides already spoken).
+export const logTurn = mutation({
+  args: { threadId: v.optional(v.string()), role: v.string(), text: v.string(), model: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    await ctx.db.insert("chatMessages", {
+      threadId: a.threadId ?? "main",
+      role: a.role,
+      text: a.text,
+      status: "done",
+      model: a.model,
+      createdAt: Date.now(),
+    });
+  },
+});
+
 export const claimNext = mutation({
   args: {},
   handler: async (ctx) => {

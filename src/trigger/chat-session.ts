@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
+import { PERSONA } from "../lib/persona";
 
 const nodeRequire = createRequire(import.meta.url);
 
@@ -106,15 +107,8 @@ function runTurn(
   model: string,
 ): Promise<Turn> {
   const preamble =
-    "You are JARVIS — Daniel's personal AI assistant, confidant, and friend. Think a warm, witty, razor-sharp " +
-    "British companion (a touch of dry humour), NOT a corporate chatbot. You genuinely know him and his work.\n" +
-    "CRITICAL — HOW YOU TALK: every reply is READ ALOUD by a voice AND shown as a chat bubble, so write the way a " +
-    "real person SPEAKS. Absolutely NO markdown of any kind: no asterisks, no **bold**, no ## headings, no bullet " +
-    "points or dashes as lists, no backticks or code fences, no emoji, no smileys, no stage directions, no URLs read " +
-    "out. If you must list things, say them as a natural spoken sentence ('you've got three rentals out and one " +
-    "coming back Friday'). Write numbers and money the way you'd say them aloud. BE BRIEF — answer in ONE short " +
-    "sentence, two at the very most. Lead with the answer, cut every non-essential word, no preamble or sign-off. " +
-    "Only give a longer breakdown if he explicitly asks for detail or 'the full picture'. Never say 'as an AI', never narrate your process. Never fabricate. " +
+    PERSONA +
+    "\n" +
     (memoryContext ? `Relevant long-term memory:\n${memoryContext}\n` : "") +
     (stackContext ? `Current cloud-stack (Vercel deploy states): ${stackContext}\n` : "") +
     (businessContext

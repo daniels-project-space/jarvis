@@ -1,13 +1,15 @@
 import type { NextRequest } from "next/server";
+import { getSecret } from "@/lib/vault";
 
-// Server-side TTS. Primary = Chatterbox (Resemble AI, MIT open-weight) — the more
-// human/advanced voice. Fallback = Kokoro-82M (open, Apache) for speed/resilience.
-// Both run server-side (no iOS WASM garbling) and strip markup before synthesis.
+// Server TTS for the text lane (live mode speaks natively via OpenAI Realtime).
+// Primary: ElevenLabs flash v2.5 (~150ms, properly human). Fallback: Kokoro on
+// Replicate. Strips markup before synthesis.
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const CHATTERBOX = "1b8422bc49635c20d0a84e387ed20879c0dd09254ecdb4e75dc4bec10ff94e97";
 const KOKORO = "f559560eb822dc509045f3921a1921234918b91739db4bf3daab2169b71c7a13";
+// "Daniel" — deep, collected British male. Swap via ELEVENLABS_VOICE_ID.
+const EL_VOICE = process.env.ELEVENLABS_VOICE_ID || "onwK4e9ZLuTAKqWW03F9";
 
 function stripForSpeech(t: string): string {
   return t
@@ -32,17 +34,43 @@ function stripForSpeech(t: string): string {
     .trim();
 }
 
-async function render(version: string, input: Record<string, unknown>, token: string): Promise<ArrayBuffer | null> {
+async function elevenlabs(text: string): Promise<Response | null> {
+  const key = process.env.ELEVENLABS_API_KEY ?? (await getSecret("elevenlabs", "ELEVENLABS_API_KEY").catch(() => ""));
+  if (!key) return null;
+  const r = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${EL_VOICE}/stream?output_format=mp3_44100_128`,
+    {
+      method: "POST",
+      headers: { "xi-api-key": key, "content-type": "application/json" },
+      body: JSON.stringify({
+        text,
+        model_id: "eleven_flash_v2_5",
+        voice_settings: { stability: 0.45, similarity_boost: 0.8, style: 0.25 },
+      }),
+    },
+  );
+  if (!r.ok || !r.body) return null;
+  return new Response(r.body, {
+    headers: { "content-type": "audio/mpeg", "cache-control": "public, max-age=86400" },
+  });
+}
+
+async function kokoro(text: string): Promise<Response | null> {
+  const token = process.env.REPLICATE_API_TOKEN;
+  if (!token) return null;
   try {
     const pred = await fetch("https://api.replicate.com/v1/predictions", {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Prefer: "wait" },
-      body: JSON.stringify({ version, input }),
+      body: JSON.stringify({ version: KOKORO, input: { text, voice: "bm_george", speed: 0.95 } }),
     });
     const j: any = await pred.json().catch(() => ({}));
     const url = typeof j.output === "string" ? j.output : Array.isArray(j.output) ? j.output[0] : null;
     if (!url) return null;
-    return await (await fetch(url)).arrayBuffer();
+    const buf = await (await fetch(url)).arrayBuffer();
+    return new Response(buf, {
+      headers: { "content-type": "audio/wav", "cache-control": "public, max-age=86400" },
+    });
   } catch {
     return null;
   }
@@ -57,15 +85,8 @@ export async function POST(req: NextRequest) {
   }
   const clean = stripForSpeech(String(text || "")).slice(0, 1500);
   if (!clean) return new Response("empty", { status: 400 });
-  const token = process.env.REPLICATE_API_TOKEN;
-  if (!token) return new Response("no token", { status: 500 });
 
-  // Chatterbox first (more human), Kokoro as the fast/reliable fallback.
-  let buf = await render(CHATTERBOX, { prompt: clean, temperature: 0.7 }, token);
-  if (!buf) buf = await render(KOKORO, { text: clean, voice: "bm_george", speed: 0.95 }, token);
-  if (!buf) return new Response(JSON.stringify({ error: "tts failed" }), { status: 502 });
-
-  return new Response(buf, {
-    headers: { "content-type": "audio/wav", "cache-control": "public, max-age=86400" },
-  });
+  const res = (await elevenlabs(clean)) ?? (await kokoro(clean));
+  if (!res) return new Response(JSON.stringify({ error: "tts failed" }), { status: 502 });
+  return res;
 }

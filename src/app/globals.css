@@ -1,26 +1,157 @@
 @import "tailwindcss";
 
+/* JARVIS cockpit tokens — cyan is JARVIS's voice, amber is Daniel's. */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --void: #05070d;
+  --abyss: #0b1220;
+  --glass: rgba(13, 22, 38, 0.55);
+  --line: rgba(92, 232, 255, 0.14);
+  --cyan: #5ce8ff;
+  --cyan-dim: rgba(92, 232, 255, 0.55);
+  --ice: #dbe9f7;
+  --slate: #6d7f99;
+  --amber: #ffb454;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
+  --color-void: var(--void);
+  --color-abyss: var(--abyss);
+  --color-cyan: var(--cyan);
+  --color-ice: var(--ice);
+  --color-slate: var(--slate);
+  --color-amber: var(--amber);
+  --font-display: var(--font-chakra);
+  --font-sans: var(--font-sora);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html,
+body {
+  height: 100%;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background:
+    radial-gradient(1200px 800px at 70% -10%, rgba(30, 58, 110, 0.25), transparent 60%),
+    radial-gradient(900px 600px at 10% 110%, rgba(20, 40, 80, 0.2), transparent 55%),
+    var(--void);
+  color: var(--ice);
+  font-family: var(--font-sora), system-ui, sans-serif;
+  overflow-x: hidden;
+}
+
+/* faint instrument grid behind everything */
+.hud-grid {
+  background-image:
+    linear-gradient(var(--line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line) 1px, transparent 1px);
+  background-size: 72px 72px;
+  mask-image: radial-gradient(ellipse 90% 80% at 50% 40%, black 30%, transparent 75%);
+  opacity: 0.35;
+}
+
+.glass {
+  background: var(--glass);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--line);
+}
+
+.hud-label {
+  font-family: var(--font-chakra), sans-serif;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  font-size: 10px;
+  color: var(--slate);
+}
+
+/* corner brackets around the stage */
+.brackets::before,
+.brackets::after,
+.brackets > .bk::before,
+.brackets > .bk::after {
+  content: "";
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  border-color: var(--cyan-dim);
+  border-style: solid;
+  opacity: 0;
+  animation: bk-in 0.9s ease 0.3s forwards;
+}
+.brackets::before { top: 10px; left: 10px; border-width: 2px 0 0 2px; }
+.brackets::after { top: 10px; right: 10px; border-width: 2px 2px 0 0; }
+.brackets > .bk::before { bottom: 10px; left: 10px; border-width: 0 0 2px 2px; }
+.brackets > .bk::after { bottom: 10px; right: 10px; border-width: 0 2px 2px 0; }
+@keyframes bk-in {
+  from { opacity: 0; transform: scale(1.15); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+/* the viewport materializing — JARVIS projecting a screen */
+.materialize {
+  animation: mat-in 0.45s cubic-bezier(0.2, 0.9, 0.25, 1) forwards;
+  box-shadow:
+    0 0 0 1px rgba(92, 232, 255, 0.25),
+    0 0 42px rgba(92, 232, 255, 0.12),
+    0 24px 80px rgba(0, 0, 0, 0.55);
+}
+@keyframes mat-in {
+  0% { opacity: 0; clip-path: inset(46% 2% 46% 2%); }
+  55% { opacity: 1; clip-path: inset(0 0 0 0); }
+  100% { opacity: 1; clip-path: inset(0 0 0 0); }
+}
+.materialize::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(180deg, transparent 0%, rgba(92, 232, 255, 0.08) 50%, transparent 100%);
+  background-size: 100% 220%;
+  animation: scan 1.1s ease 1;
+}
+@keyframes scan {
+  from { background-position: 0 -120%; }
+  to { background-position: 0 120%; }
+}
+
+/* chat bubbles rise in */
+.rise {
+  animation: rise-in 0.35s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* status dot breathing */
+.breathe {
+  animation: breathe 2.6s ease-in-out infinite;
+}
+@keyframes breathe {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+/* live ring sweep around the stage while live mode is on */
+.live-ring {
+  background: conic-gradient(from 0deg, transparent 0deg, rgba(92, 232, 255, 0.5) 40deg, transparent 90deg);
+  animation: sweep 3.2s linear infinite;
+  mask: radial-gradient(closest-side, transparent 97%, black 98%);
+}
+@keyframes sweep {
+  to { transform: rotate(360deg); }
+}
+
+.scrollbar-thin::-webkit-scrollbar { width: 4px; }
+.scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(92, 232, 255, 0.2); border-radius: 4px; }
+.scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+
+@media (prefers-reduced-motion: reduce) {
+  .materialize, .materialize::after, .rise, .breathe, .live-ring,
+  .brackets::before, .brackets::after, .brackets > .bk::before, .brackets > .bk::after {
+    animation: none !important;
+    opacity: 1;
+    clip-path: none;
+  }
 }

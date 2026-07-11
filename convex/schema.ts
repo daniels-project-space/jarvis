@@ -64,6 +64,7 @@ export default defineSchema({
     result: v.optional(v.string()),
     readonly: v.optional(v.boolean()), // if true, runner never commits/pushes
     model: v.optional(v.string()), // optional model override (haiku|sonnet|opus)
+    mcp: v.optional(v.array(v.string())), // MCP servers to attach (playwright, context7)
     progress: v.optional(v.string()), // live activity line the runner streams
     startedAt: v.optional(v.number()),
     createdAt: v.number(),
@@ -96,6 +97,17 @@ export default defineSchema({
     data: v.optional(v.any()), // structured payload for future UI
     updatedAt: v.number(),
   }).index("by_domain", ["domain"]),
+
+  // Background-agent findings waiting to be woven into conversation. The runner
+  // writes a short spoken line + full detail; the brain speaks the line naturally
+  // and can push the detail to the panel on request. status: fresh -> woven.
+  findings: defineTable({
+    source: v.string(), // task description that produced it
+    spoken: v.string(), // one natural sentence JARVIS can say
+    detail: v.string(), // full result, panel-able
+    status: v.string(), // "fresh" | "woven"
+    createdAt: v.number(),
+  }).index("by_status", ["status", "createdAt"]),
 
   // Proactive insights the insight engine generates + surfaces (chat/notification).
   insights: defineTable({

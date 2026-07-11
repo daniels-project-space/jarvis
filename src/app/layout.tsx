@@ -1,10 +1,17 @@
-import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import type { Metadata, Viewport } from "next";
+import { Chakra_Petch, Sora, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import Providers from "./providers";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
+const chakra = Chakra_Petch({
+  variable: "--font-chakra",
+  weight: ["400", "600", "700"],
+  subsets: ["latin"],
+});
+
+const sora = Sora({
+  variable: "--font-sora",
+  weight: ["400", "500", "600"],
   subsets: ["latin"],
 });
 
@@ -15,7 +22,11 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "JARVIS",
-  description: "Daniel's personal ops assistant",
+  description: "Daniel's personal AI",
+};
+
+export const viewport: Viewport = {
+  themeColor: "#05070d",
 };
 
 export default function RootLayout({
@@ -24,11 +35,9 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html
-      lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-    >
-      <body className="min-h-full flex flex-col">
+    <html lang="en" className={`${chakra.variable} ${sora.variable} ${geistMono.variable} h-full antialiased`}>
+      <body className="flex min-h-full flex-col">
+        <div className="hud-grid pointer-events-none fixed inset-0" aria-hidden />
         <Providers>{children}</Providers>
       </body>
     </html>

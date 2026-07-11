@@ -5,71 +5,131 @@ import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
 
 const THREAD = "main";
-type Msg = { _id: string; role: string; text: string; status: string; model?: string };
+type Msg = { _id: string; role: string; text: string; status: string; model?: string; createdAt: number };
 type Job = { _id: string; task: string; model?: string; status: string; progress?: string; startedAt: number };
+type Caption = { who: "you" | "jarvis"; text: string } | null;
+
+function Clock() {
+  const [now, setNow] = useState("");
+  useEffect(() => {
+    const f = () =>
+      setNow(new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
+    f();
+    const t = setInterval(f, 1000);
+    return () => clearInterval(t);
+  }, []);
+  return <span className="font-mono text-xs tabular-nums text-slate">{now}</span>;
+}
 
 function ModelBadge({ model }: { model?: string | null }) {
   if (!model) return null;
   const c =
     model === "opus"
-      ? "bg-purple-500/25 text-purple-200"
+      ? "text-purple-300"
       : model === "haiku"
-        ? "bg-slate-500/25 text-slate-300"
-        : "bg-sky-500/25 text-sky-200";
-  return <span className={`rounded px-1 py-px text-[9px] font-medium uppercase tracking-wide ${c}`}>{model}</span>;
+        ? "text-slate"
+        : model === "live"
+          ? "text-cyan"
+          : "text-sky-300";
+  return <span className={`hud-label !text-[9px] ${c}`}>{model}</span>;
 }
 
 function AgentLiveView({ job, now, onClose }: { job: Job; now: number; onClose: () => void }) {
   const elapsed = Math.max(0, Math.floor((now - job.startedAt) / 1000));
   const pct = job.status === "running" ? Math.min(95, 6 + Math.round((elapsed / 180) * 90)) : 6;
   return (
-    <div className="flex h-full flex-col p-4 pt-11">
+    <div className="materialize glass relative flex h-full flex-col rounded-2xl p-4 pt-11">
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2 text-xs text-neutral-400">
+        <div className="flex items-center gap-2">
           <ModelBadge model={job.model} />
-          <span>{job.status === "running" ? "working" : "queued"} · {elapsed}s</span>
+          <span className="hud-label">{job.status === "running" ? "working" : "queued"} · {elapsed}s</span>
         </div>
-        <button onClick={onClose} className="rounded bg-neutral-800 px-2 py-0.5 text-xs text-neutral-300 hover:bg-neutral-700">
-          ✕ orb
+        <button onClick={onClose} className="hud-label rounded px-2 py-1 hover:text-cyan">
+          close
         </button>
       </div>
-      <div className="mt-3 text-sm text-neutral-200">{job.task}</div>
-      <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-neutral-800">
+      <div className="mt-3 text-sm text-ice">{job.task}</div>
+      <div className="mt-3 h-px w-full overflow-hidden rounded-full bg-white/10">
         <div
-          className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-cyan-400 transition-all duration-1000"
+          className="h-full bg-gradient-to-r from-cyan to-sky-400 transition-all duration-1000"
           style={{ width: `${pct}%` }}
         />
       </div>
-      <div className="mt-4 flex-1 overflow-auto rounded-xl border border-neutral-800 bg-black/40 p-3 font-mono text-xs leading-relaxed text-emerald-300/90">
-        <span className="mr-1 text-emerald-500">›</span>
+      <div className="mt-4 flex-1 overflow-auto rounded-xl bg-black/40 p-3 font-mono text-xs leading-relaxed text-cyan/90">
+        <span className="mr-1 opacity-60">›</span>
         {job.progress || "starting up…"}
-        <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-emerald-400/70 align-middle" />
+        <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-cyan/70 align-middle" />
       </div>
+    </div>
+  );
+}
+
+function Viewport({
+  panel,
+  onClose,
+}: {
+  panel: { type: string; value: string; title?: string };
+  onClose: () => void;
+}) {
+  return (
+    <div className="materialize glass relative flex h-full flex-col overflow-hidden rounded-2xl">
+      <div className="flex items-center justify-between border-b border-white/5 px-3 py-2">
+        <span className="hud-label truncate !text-cyan-dim">{panel.title ?? panel.type}</span>
+        <button onClick={onClose} className="hud-label rounded px-2 py-1 hover:text-cyan">
+          close
+        </button>
+      </div>
+      {panel.type === "url" || panel.type === "video" ? (
+        <div className="flex min-h-0 flex-1 flex-col">
+          <iframe
+            src={panel.value}
+            className={`w-full flex-1 ${panel.type === "video" ? "bg-black" : "bg-white"}`}
+            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-presentation"
+            allow="autoplay; encrypted-media; picture-in-picture"
+          />
+          {panel.type === "url" && (
+            <a href={panel.value} target="_blank" rel="noreferrer" className="p-2 text-center text-xs text-cyan/80">
+              open in a tab ↗ (blank means the site blocks embedding)
+            </a>
+          )}
+        </div>
+      ) : panel.type === "image" ? (
+        <img src={panel.value} alt={panel.title ?? ""} className="min-h-0 flex-1 object-contain" />
+      ) : panel.type === "code" ? (
+        <pre className="scrollbar-thin min-h-0 flex-1 overflow-auto whitespace-pre p-4 font-mono text-xs leading-relaxed text-cyan/90">
+          {panel.value}
+        </pre>
+      ) : (
+        <pre className="scrollbar-thin min-h-0 flex-1 overflow-auto whitespace-pre-wrap p-4 text-sm leading-relaxed text-ice">
+          {panel.value}
+        </pre>
+      )}
     </div>
   );
 }
 
 export default function JarvisUI() {
   const messages = (useQuery(api.chatQueue.listMessages, { threadId: THREAD }) ?? []) as Msg[];
-  const send = useMutation(api.chatQueue.sendMessage);
-  const panel = useQuery(api.ui.getPanel, {}) as
-    | { type: string; value: string; title?: string }
-    | null
-    | undefined;
+  const panel = useQuery(api.ui.getPanel, {}) as { type: string; value: string; title?: string } | null | undefined;
   const clearPanel = useMutation(api.ui.clearPanel);
+  const logTurn = useMutation(api.chatQueue.logTurn);
   const saveSub = useMutation(api.push.saveSub);
+  const activeJobs = (useQuery(api.jobs.active, {}) ?? []) as Job[];
+
   const [input, setInput] = useState("");
   const [speaking, setSpeaking] = useState(false);
-  const [listening, setListening] = useState(false);
-  const endRef = useRef<HTMLDivElement>(null);
-  const lastSpokenId = useRef<string | null>(null);
-  const recRef = useRef<any>(null);
-  const energyRef = useRef(0);
-  const speakingRef = useRef(false);
-  const [live, setLive] = useState(false);
-  const activeJobs = (useQuery(api.jobs.active, {}) ?? []) as Job[];
+  const [sending, setSending] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [live, setLive] = useState<"off" | "connecting" | "live">("off");
+  const [caption, setCaption] = useState<Caption>(null);
   const [agentView, setAgentView] = useState<string | null>(null);
   const [nowTs, setNowTs] = useState(0);
+
+  const endRef = useRef<HTMLDivElement>(null);
+  const lastSpokenId = useRef<string | null>(null);
+  const energyRef = useRef(0);
+  const recRef = useRef<MediaRecorder | null>(null);
+  const liveRef = useRef(false);
 
   useEffect(() => {
     if (!activeJobs.length) return;
@@ -79,35 +139,39 @@ export default function JarvisUI() {
   }, [activeJobs.length]);
 
   const shownJob = activeJobs.find((j) => j._id === agentView) ?? null;
-  const busy = messages.some((m) => m.role === "assistant" && m.status === "streaming");
+  const busy = sending || messages.some((m) => m.role === "assistant" && m.status === "streaming");
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length, messages[messages.length - 1]?.text]);
+  }, [messages.length, messages[messages.length - 1]?.text, caption?.text]);
 
   useEffect(() => {
     import("../lib/push").then((m) => m.registerSW());
   }, []);
 
-  // Speak the newest finalized assistant message via open-source Kokoro TTS
-  // (in-browser, en-GB butler voice), driving the orb from live audio amplitude.
+  // Speak new finalized assistant messages (text lane). Live-lane rows were
+  // already spoken by the realtime session; while live is on, nudge the live
+  // session to voice out-of-band lines (agent findings) instead of local TTS.
   useEffect(() => {
     const last = [...messages].reverse().find((m) => m.role === "assistant" && m.status === "done" && m.text);
     if (!last || last._id === lastSpokenId.current) return;
+    if (lastSpokenId.current === null) {
+      lastSpokenId.current = last._id; // don't re-speak history on page load
+      return;
+    }
     lastSpokenId.current = last._id;
+    if (last.model === "live") return;
+    if (liveRef.current) {
+      import("../lib/realtime").then((m) => m.nudgeLive(last.text));
+      return;
+    }
     (async () => {
       const { speak } = await import("../lib/tts");
       await speak(
         last.text,
         (e) => (energyRef.current = e),
-        () => {
-          setSpeaking(true);
-          speakingRef.current = true;
-        },
-        () => {
-          setSpeaking(false);
-          speakingRef.current = false;
-        },
+        () => setSpeaking(true),
+        () => setSpeaking(false),
       );
     })();
   }, [messages]);
@@ -115,167 +179,134 @@ export default function JarvisUI() {
   async function submit(text: string) {
     const t = text.trim();
     if (!t) return;
-    import("../lib/tts").then((m) => m.warm()); // gesture-warm audio + model
+    import("../lib/tts").then((m) => m.warm());
     setInput("");
-    await send({ threadId: THREAD, text: t });
+    setSending(true);
+    try {
+      await fetch("/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ threadId: THREAD, text: t }),
+      });
+    } catch {
+      /* Convex reactivity shows whatever landed; cron lane is the safety net */
+    }
+    setSending(false);
+  }
+
+  function stopTalking() {
+    import("../lib/tts").then((m) => m.stopSpeaking());
+    if (liveRef.current) import("../lib/realtime").then((m) => m.interruptLive());
+    setSpeaking(false);
   }
 
   async function toggleLive() {
-    if (live) {
-      (await import("../lib/livevoice")).stopLiveVoice();
-      setLive(false);
-      setListening(false);
+    const rt = await import("../lib/realtime");
+    if (liveRef.current || live !== "off") {
+      rt.stopLive();
+      liveRef.current = false;
+      setLive("off");
+      setCaption(null);
       return;
     }
-    // Ask for the mic FIRST, synchronously inside this tap — the browser only
-    // shows its permission prompt when getUserMedia runs within a user gesture
-    // (doing dynamic imports first drops the gesture and blocks the prompt).
-    if (!navigator.mediaDevices?.getUserMedia) {
-      alert("This browser can't do live voice. On iPhone, open JARVIS in Safari.");
+    import("../lib/tts").then((m) => m.stopSpeaking());
+    await rt.startLive({
+      onState: (s, detail) => {
+        if (s === "live") {
+          liveRef.current = true;
+          setLive("live");
+        } else if (s === "connecting") setLive("connecting");
+        else {
+          liveRef.current = false;
+          setLive("off");
+          setCaption(null);
+          if (s === "error") alert(`Live mode couldn't start: ${detail ?? "unknown error"}`);
+        }
+      },
+      onCaption: (who, text, done) => setCaption(done ? null : { who, text }),
+      onTurnDone: (role, text) => {
+        void logTurn({ threadId: THREAD, role, text, model: role === "assistant" ? "live" : undefined });
+      },
+      onEnergy: (e) => (energyRef.current = e),
+    });
+  }
+
+  // One-shot voice input: record → Groq Whisper → send. Works on iOS too.
+  async function toggleMic() {
+    if (recording) {
+      recRef.current?.stop();
       return;
     }
     let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    } catch {
-      alert(
-        "JARVIS needs microphone access for live voice. Please tap Allow — if you already blocked it, enable the mic for this site in your browser settings (iPhone: Settings → Safari → Microphone, or the ‘aA’ menu in the address bar).",
-      );
-      return;
-    }
-    setLive(true);
-    import("../lib/tts").then((m) => m.warm());
-    try {
-      const m = await import("../lib/livevoice");
-      await m.startLiveVoice({
-        stream,
-        onTranscript: (t) => submit(t),
-        onState: (s) => setListening(s === "listening"),
-        isSpeaking: () => speakingRef.current,
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
       });
     } catch {
+      alert("JARVIS needs the microphone — allow it in your browser settings.");
+      return;
+    }
+    import("../lib/tts").then((m) => m.warm());
+    const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
+    const rec = new MediaRecorder(stream, { mimeType: mime });
+    const chunks: Blob[] = [];
+    rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+    rec.onstop = async () => {
       stream.getTracks().forEach((t) => t.stop());
-      setLive(false);
-      alert("Couldn't start live voice. Please reload and try again.");
-    }
-  }
-
-  function toggleMic() {
-    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SR) {
-      alert("Speech recognition needs Chrome/Edge.");
-      return;
-    }
-    if (listening) {
-      recRef.current?.stop();
-      return;
-    }
-    const rec = new SR();
-    rec.lang = "en-GB";
-    rec.interimResults = false;
-    rec.maxAlternatives = 1;
-    rec.onresult = (e: any) => submit(e.results[0][0].transcript);
-    rec.onend = () => setListening(false);
-    rec.onerror = () => setListening(false);
+      setRecording(false);
+      const blob = new Blob(chunks, { type: mime });
+      if (blob.size < 2000) return;
+      try {
+        const r = await fetch("/api/stt", { method: "POST", headers: { "content-type": mime }, body: blob });
+        const { text } = await r.json();
+        if (text?.trim()) void submit(text.trim());
+      } catch {
+        /* ignore */
+      }
+    };
     recRef.current = rec;
-    setListening(true);
+    setRecording(true);
     rec.start();
+    setTimeout(() => rec.state === "recording" && rec.stop(), 20_000);
   }
 
-  const status = speaking ? "speaking…" : busy ? "thinking…" : listening ? "listening…" : "online";
-  const orbState = speaking ? "speaking" : busy ? "thinking" : listening ? "listening" : "idle";
+  const status =
+    live === "connecting"
+      ? "connecting"
+      : live === "live"
+        ? "live"
+        : speaking
+          ? "speaking"
+          : busy
+            ? "thinking"
+            : recording
+              ? "listening"
+              : "online";
+  const orbState =
+    speaking || (live === "live" && caption?.who === "jarvis")
+      ? "speaking"
+      : busy
+        ? "thinking"
+        : recording || live === "live"
+          ? "listening"
+          : "idle";
 
   return (
-    <div className="mx-auto grid w-full max-w-6xl flex-1 gap-4 p-4 md:grid-cols-2">
-      <div className="relative min-h-[45vh] overflow-hidden rounded-2xl border border-neutral-800 bg-gradient-to-b from-neutral-950 to-black">
-        {activeJobs.length > 0 && (
-          <div className="absolute left-2 right-2 top-2 z-10 flex flex-wrap gap-1.5">
-            {activeJobs.map((j) => (
-              <button
-                key={j._id}
-                onClick={() => setAgentView(agentView === j._id ? null : j._id)}
-                className={`flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] ${agentView === j._id ? "border-emerald-500 bg-emerald-500/20 text-emerald-200" : "border-neutral-700 bg-neutral-900/80 text-neutral-300 hover:bg-neutral-800"}`}
-              >
-                <span className="relative flex h-1.5 w-1.5">
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
-                  <span className="inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                </span>
-                <ModelBadge model={j.model} />
-                <span className="max-w-[120px] truncate">{j.task}</span>
-              </button>
-            ))}
-          </div>
-        )}
-        {panel ? (
-          <div className="flex h-full flex-col">
-            <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-2">
-              <span className="truncate text-xs text-neutral-400">{panel.title ?? panel.type}</span>
-              <button
-                onClick={() => clearPanel({})}
-                className="rounded bg-neutral-800/80 px-2 py-0.5 text-xs text-neutral-300 hover:bg-neutral-700"
-              >
-                ✕ orb
-              </button>
-            </div>
-            {panel.type === "url" ? (
-              <div className="flex flex-1 flex-col">
-                <iframe
-                  src={panel.value}
-                  className="w-full flex-1 bg-white"
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
-                />
-                <a
-                  href={panel.value}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="p-2 text-center text-xs text-emerald-400"
-                >
-                  open ↗ (blank = the site blocks embedding)
-                </a>
-              </div>
-            ) : panel.type === "image" ? (
-              <img src={panel.value} alt={panel.title ?? ""} className="min-h-0 flex-1 object-contain" />
-            ) : (
-              <pre className="flex-1 overflow-auto whitespace-pre-wrap p-4 text-sm text-neutral-200">
-                {panel.value}
-              </pre>
-            )}
-          </div>
-        ) : shownJob ? (
-          <AgentLiveView job={shownJob} now={nowTs} onClose={() => setAgentView(null)} />
-        ) : (
-          <>
-            <ThreeOrb state={orbState} energyRef={energyRef} />
-            <div className="pointer-events-none absolute bottom-3 left-0 right-0 text-center text-xs tracking-widest text-neutral-500">
-              {status}
-            </div>
-          </>
-        )}
-      </div>
-      <div className="flex h-[70vh] flex-col overflow-hidden rounded-2xl border border-neutral-800 bg-neutral-900/50">
-        <div className="flex-1 space-y-3 overflow-y-auto p-4">
-          {messages.length === 0 && (
-            <p className="mt-8 text-center text-sm text-neutral-600">Speak or type, sir.</p>
-          )}
-          {messages.map((m) => (
-            <div key={m._id} className={m.role === "user" ? "text-right" : "text-left"}>
-              <span
-                className={`inline-block max-w-[85%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm ${
-                  m.role === "user" ? "bg-emerald-500/15 text-emerald-100" : "bg-neutral-800/80 text-neutral-200"
-                }`}
-              >
-                {m.text || (m.status === "streaming" ? "…" : "")}
-              </span>
-              {m.role === "assistant" && m.model && (
-                <div className="mt-0.5 pl-1 text-[9px] uppercase tracking-wider text-neutral-600">
-                  handled by {m.model}
-                </div>
-              )}
-            </div>
-          ))}
-          <div ref={endRef} />
+    <div className="flex min-h-screen flex-col">
+      {/* top HUD strip */}
+      <header className="flex items-center justify-between px-5 pb-2 pt-4">
+        <div className="flex items-baseline gap-3">
+          <h1 className="font-display text-xl font-bold tracking-[0.42em] text-cyan" style={{ fontFamily: "var(--font-chakra)" }}>
+            JARVIS
+          </h1>
+          <span className="hud-label hidden sm:inline">personal ai · online</span>
         </div>
-        <div className="flex gap-2 border-t border-neutral-800 p-3">
+        <div className="flex items-center gap-4">
+          <span className="flex items-center gap-1.5">
+            <span className={`h-1.5 w-1.5 rounded-full ${live === "live" ? "bg-cyan" : "bg-emerald-400"} breathe`} />
+            <span className="hud-label">{status}</span>
+          </span>
+          <Clock />
           <button
             onClick={async () => {
               const r = await (await import("../lib/push")).subscribePush(saveSub);
@@ -283,46 +314,149 @@ export default function JarvisUI() {
                 r === "subscribed"
                   ? "Notifications on — JARVIS will ping this device."
                   : r === "unsupported"
-                    ? "On iPhone: Share → Add to Home Screen, then open JARVIS from that icon to enable push."
+                    ? "On iPhone: Share → Add to Home Screen, then open JARVIS from that icon."
                     : r === "denied"
-                      ? "Notifications are blocked in your browser settings."
+                      ? "Notifications are blocked in browser settings."
                       : "Push isn't available here.",
               );
             }}
-            title="enable phone notifications"
-            className="rounded-xl bg-neutral-800 px-3 text-sm text-neutral-300 hover:bg-neutral-700"
+            title="notifications"
+            className="hud-label rounded px-1 hover:text-cyan"
           >
-            🔔
+            ping
           </button>
-          <button
-            onClick={toggleLive}
-            title="always-on live conversation"
-            className={`flex shrink-0 items-center gap-1 rounded-xl px-3 text-sm ${live ? "bg-emerald-600 text-white" : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"}`}
-          >
-            {live && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white" />}
-            {live ? "live" : "live"}
-          </button>
-          <button
-            onClick={toggleMic}
-            title="voice input (one-shot)"
-            className={`rounded-xl px-3 text-sm ${listening ? "bg-red-600 text-white" : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"}`}
-          >
-            {listening ? "◉" : "🎙"}
-          </button>
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && submit(input)}
-            placeholder={busy ? "JARVIS is thinking…" : "Ask JARVIS…"}
-            className="min-w-0 flex-1 rounded-xl bg-neutral-950 px-4 py-2 text-sm text-neutral-100 outline-none ring-1 ring-neutral-800 focus:ring-emerald-600"
-          />
-          <button
-            onClick={() => submit(input)}
-            disabled={busy}
-            className="shrink-0 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
-          >
-            Send
-          </button>
+        </div>
+      </header>
+
+      <div className="mx-auto grid w-full max-w-7xl flex-1 gap-4 p-4 pt-2 md:grid-cols-[1.15fr_1fr]">
+        {/* the stage: orb / viewport / agent view */}
+        <div className="brackets relative min-h-[42vh] md:min-h-[70vh]">
+          <span className="bk" />
+          {live === "live" && <div className="live-ring pointer-events-none absolute inset-2 rounded-full opacity-60" />}
+          {activeJobs.length > 0 && (
+            <div className="absolute left-4 right-4 top-4 z-10 flex flex-wrap gap-1.5">
+              {activeJobs.map((j) => (
+                <button
+                  key={j._id}
+                  onClick={() => setAgentView(agentView === j._id ? null : j._id)}
+                  className={`glass flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] transition ${
+                    agentView === j._id ? "!border-cyan/60 text-cyan" : "text-slate hover:text-ice"
+                  }`}
+                >
+                  <span className="relative flex h-1.5 w-1.5">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-cyan opacity-60" />
+                    <span className="inline-flex h-1.5 w-1.5 rounded-full bg-cyan" />
+                  </span>
+                  <ModelBadge model={j.model} />
+                  <span className="max-w-[130px] truncate">{j.task}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {panel ? (
+            <div className="absolute inset-0 z-20 p-1">
+              <Viewport panel={panel} onClose={() => clearPanel({})} />
+            </div>
+          ) : shownJob ? (
+            <div className="absolute inset-0 z-20 p-1">
+              <AgentLiveView job={shownJob} now={nowTs} onClose={() => setAgentView(null)} />
+            </div>
+          ) : null}
+          <ThreeOrb state={orbState} energyRef={energyRef} />
+          {/* live captions */}
+          {caption && (
+            <div className="pointer-events-none absolute bottom-10 left-0 right-0 px-8 text-center">
+              <span
+                className={`inline-block max-w-full rounded-xl px-3 py-1.5 text-sm leading-snug ${
+                  caption.who === "you" ? "text-amber" : "text-cyan"
+                }`}
+                style={{ textShadow: "0 2px 18px rgba(0,0,0,0.9)" }}
+              >
+                {caption.text}
+              </span>
+            </div>
+          )}
+          <div className="pointer-events-none absolute bottom-3 left-0 right-0 text-center">
+            <span className="hud-label">{status}</span>
+          </div>
+        </div>
+
+        {/* conversation column */}
+        <div className="glass flex h-[52vh] flex-col overflow-hidden rounded-2xl md:h-[76vh]">
+          <div className="scrollbar-thin flex-1 space-y-3 overflow-y-auto p-4">
+            {messages.length === 0 && (
+              <p className="mt-10 text-center text-sm text-slate">Say the word, sir.</p>
+            )}
+            {messages.slice(-80).map((m) => (
+              <div key={m._id} className={`rise ${m.role === "user" ? "text-right" : "text-left"}`}>
+                <span
+                  className={`inline-block max-w-[88%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm leading-relaxed ${
+                    m.role === "user"
+                      ? "bg-amber/10 text-amber [text-shadow:none]"
+                      : "bg-cyan/[0.07] text-ice"
+                  }`}
+                >
+                  {m.text || (m.status === "streaming" ? "…" : "")}
+                </span>
+                {m.role === "assistant" && m.model && (
+                  <div className="mt-0.5 pl-1">
+                    <ModelBadge model={m.model} />
+                  </div>
+                )}
+              </div>
+            ))}
+            <div ref={endRef} />
+          </div>
+
+          {/* composer */}
+          <div className="flex items-stretch gap-2 border-t border-white/5 p-3">
+            <button
+              onClick={toggleLive}
+              title="live conversation"
+              className={`flex shrink-0 items-center gap-1.5 rounded-xl px-3 text-sm transition ${
+                live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "glass text-slate hover:text-ice"
+              }`}
+            >
+              {live === "connecting" ? (
+                <span className="h-1.5 w-1.5 animate-ping rounded-full bg-cyan" />
+              ) : live === "live" ? (
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan" />
+              ) : null}
+              live
+            </button>
+            <button
+              onClick={toggleMic}
+              title="voice input"
+              className={`shrink-0 rounded-xl px-3 text-sm transition ${
+                recording ? "bg-amber/20 text-amber ring-1 ring-amber/50" : "glass text-slate hover:text-ice"
+              }`}
+            >
+              {recording ? "■ done" : "mic"}
+            </button>
+            {(speaking || (live === "live" && caption?.who === "jarvis")) && (
+              <button
+                onClick={stopTalking}
+                title="stop talking"
+                className="shrink-0 rounded-xl bg-red-500/15 px-3 text-sm text-red-300 ring-1 ring-red-500/40"
+              >
+                hush
+              </button>
+            )}
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit(input)}
+              placeholder={busy ? "thinking…" : "Talk to me…"}
+              className="min-w-0 flex-1 rounded-xl bg-black/30 px-4 py-2.5 text-sm text-ice outline-none ring-1 ring-white/10 transition focus:ring-cyan/50"
+            />
+            <button
+              onClick={() => submit(input)}
+              disabled={busy}
+              className="shrink-0 rounded-xl bg-cyan/15 px-4 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40"
+            >
+              send
+            </button>
+          </div>
         </div>
       </div>
     </div>

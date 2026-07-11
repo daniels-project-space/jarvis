@@ -1,11 +1,14 @@
 "use client";
-// Client voice: fetches server-rendered Kokoro fp32 audio from /api/tts and plays
-// it through WebAudio, driving the orb from live amplitude. No in-browser model →
-// no iOS WASM garbling. stopSpeaking() enables barge-in in the always-on loop.
+// Text-lane voice: fetches ElevenLabs/Kokoro audio from /api/tts and plays it
+// through WebAudio with a sentence queue, driving the orb from live amplitude.
+// stopSpeaking() halts playback instantly (stop button / barge-in).
 
 let audioCtx: AudioContext | null = null;
 let unlocked = false;
 let currentSrc: AudioBufferSourceNode | null = null;
+let queue: string[] = [];
+let draining = false;
+let generation = 0; // bumped on stop — cancels queued sentences
 
 function ctx(): AudioContext {
   if (!audioCtx) audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
@@ -31,6 +34,8 @@ export async function warm() {
 }
 
 export function stopSpeaking() {
+  generation++;
+  queue = [];
   try {
     currentSrc?.stop();
   } catch {
@@ -39,24 +44,30 @@ export function stopSpeaking() {
   currentSrc = null;
 }
 
-export async function speak(
-  text: string,
-  onEnergy: (e: number) => void,
-  onStart?: () => void,
-  onEnd?: () => void,
-): Promise<void> {
-  try {
-    const r = await fetch("/api/tts", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
-    if (!r.ok) throw new Error("tts " + r.status);
-    const arr = await r.arrayBuffer();
-    const c = ctx();
-    await c.resume();
-    const decoded = await c.decodeAudioData(arr);
-    stopSpeaking();
+export function isSpeaking() {
+  return draining || currentSrc !== null;
+}
+
+// Split text into speakable chunks (sentence boundaries, abbreviation-safe).
+export function sentences(text: string): string[] {
+  const out: string[] = [];
+  let buf = "";
+  for (const part of text.split(/(?<=[.!?])\s+(?=[A-Z0-9£"'])/)) {
+    buf = buf ? `${buf} ${part}` : part;
+    if (buf.length >= 24) {
+      out.push(buf);
+      buf = "";
+    }
+  }
+  if (buf.trim()) out.push(buf);
+  return out;
+}
+
+async function playBuffer(arr: ArrayBuffer, onEnergy: (e: number) => void): Promise<void> {
+  const c = ctx();
+  await c.resume();
+  const decoded = await c.decodeAudioData(arr);
+  return new Promise((resolve) => {
     const src = c.createBufferSource();
     src.buffer = decoded;
     const analyser = c.createAnalyser();
@@ -81,14 +92,53 @@ export async function speak(
       playing = false;
       onEnergy(0);
       if (currentSrc === src) currentSrc = null;
-      onEnd?.();
+      resolve();
     };
-    onStart?.();
     src.start();
     tick();
-  } catch (e) {
-    console.error("tts failed", e);
-    onEnergy(0);
-    onEnd?.();
+  });
+}
+
+async function fetchAudio(text: string): Promise<ArrayBuffer | null> {
+  try {
+    const r = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!r.ok) return null;
+    return await r.arrayBuffer();
+  } catch {
+    return null;
   }
+}
+
+// Queue sentences and drain sequentially, prefetching the next while speaking.
+export async function speak(
+  text: string,
+  onEnergy: (e: number) => void,
+  onStart?: () => void,
+  onEnd?: () => void,
+): Promise<void> {
+  queue.push(...sentences(text));
+  if (draining) return;
+  draining = true;
+  const gen = generation;
+  onStart?.();
+  try {
+    let pending: Promise<ArrayBuffer | null> | null = null;
+    while ((queue.length || pending) && gen === generation) {
+      const cur = pending ?? (queue.length ? fetchAudio(queue.shift()!) : null);
+      pending = queue.length ? fetchAudio(queue.shift()!) : null; // prefetch next while current plays
+      if (!cur) break;
+      const buf = await cur;
+      if (gen !== generation) break;
+      if (buf) await playBuffer(buf, onEnergy);
+    }
+  } catch {
+    /* audio errors are non-fatal */
+  }
+  draining = false;
+  onEnergy(0);
+  onEnd?.();
 }

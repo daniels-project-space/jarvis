@@ -7,6 +7,7 @@ export const enqueue = mutation({
     repo: v.optional(v.string()),
     readonly: v.optional(v.boolean()),
     model: v.optional(v.string()),
+    mcp: v.optional(v.array(v.string())),
   },
   handler: async (ctx, a) => {
     return await ctx.db.insert("jobs", {
@@ -14,6 +15,7 @@ export const enqueue = mutation({
       repo: a.repo,
       readonly: a.readonly,
       model: a.model,
+      mcp: a.mcp,
       status: "pending",
       createdAt: Date.now(),
     });
@@ -35,6 +37,7 @@ export const claimNext = mutation({
       repo: j.repo ?? null,
       readonly: j.readonly ?? false,
       model: j.model ?? null,
+      mcp: j.mcp ?? [],
     };
   },
 });
