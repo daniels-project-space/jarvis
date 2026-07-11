@@ -160,6 +160,12 @@ export async function startLive(h: LiveHandlers) {
     session = new RealtimeSession(agent, { transport, model: tk.model || "gpt-realtime-mini" });
 
     const mirrored = new Set<string>();
+    // Foreign-script transcription junk (whisper noise-hallucination) never
+    // reaches captions or the chat log — Daniel speaks English.
+    const isGarbage = (t: string) => {
+      const latin = (t.match(/[a-zA-Z0-9\s.,!?'"£$%()@:;/-]/g) ?? []).length;
+      return t.length > 0 && latin / t.length < 0.7;
+    };
     session.on("history_updated", (history: any[]) => {
       for (const item of history) {
         if (item?.type !== "message") continue;
@@ -169,6 +175,7 @@ export async function startLive(h: LiveHandlers) {
           .join(" ")
           .trim();
         if (!text || text.startsWith(NUDGE.slice(0, 20))) continue; // internal nudges stay invisible
+        if (role === "user" && isGarbage(text)) continue;
         const done = item.status === "completed";
         h.onCaption(role === "user" ? "you" : "jarvis", text, done);
         if (done && !mirrored.has(item.itemId)) {

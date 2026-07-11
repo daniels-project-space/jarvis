@@ -25,6 +25,8 @@ export async function POST(req: NextRequest) {
   form.append("file", new Blob([new Uint8Array(inBuf)], { type: mime }), `speech.${ext}`);
   form.append("model", "whisper-large-v3-turbo");
   form.append("language", "en");
+  form.append("temperature", "0");
+  form.append("prompt", "Daniel, a British English speaker, talking to his assistant.");
   form.append("response_format", "json");
 
   const r = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
@@ -36,7 +38,12 @@ export async function POST(req: NextRequest) {
     return new Response(JSON.stringify({ error: `groq ${r.status}` }), { status: 502 });
   }
   const j: any = await r.json();
-  return new Response(JSON.stringify({ text: (j.text ?? "").trim() }), {
+  let text = String(j.text ?? "").trim();
+  // Whisper hallucinates foreign-script junk on noise — an English speaker's
+  // real words are overwhelmingly Latin. Drop garbage instead of sending it.
+  const latin = (text.match(/[a-zA-Z0-9\s.,!?'"£$%()@:;/-]/g) ?? []).length;
+  if (text && latin / text.length < 0.7) text = "";
+  return new Response(JSON.stringify({ text }), {
     headers: { "content-type": "application/json" },
   });
 }

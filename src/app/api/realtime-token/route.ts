@@ -75,7 +75,13 @@ export async function POST(req: NextRequest) {
         instructions,
         audio: {
           input: {
-            transcription: { model: "whisper-1", language: "en" }, // English-only recognition
+            // gpt-4o-transcribe + language pin + English prompt: whisper-1 was
+            // hallucinating foreign-language transcripts on noise/accent.
+            transcription: {
+              model: "gpt-4o-transcribe",
+              language: "en",
+              prompt: "Daniel, a British English speaker, talking to his assistant about projects, rentals, videos, business.",
+            },
             turn_detection: { type: "semantic_vad", eagerness: "medium" },
           },
           output: { voice: process.env.REALTIME_VOICE || "ballad" },
