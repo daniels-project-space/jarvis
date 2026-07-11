@@ -37,17 +37,18 @@ export async function POST(req: NextRequest) {
   ]);
 
   // Recent conversation + everything recently shown, so "pull up that video
-  // from earlier again" actually means something to a fresh session.
-  const rows = (Array.isArray(msgs) ? msgs : []).filter((m: any) => m.status === "done").slice(-20);
-  const historyLines: string[] = [];
+  // from earlier again" actually means something to a fresh session. Cards are
+  // rare, so scan a much wider window for them than for dialogue.
+  const done = (Array.isArray(msgs) ? msgs : []).filter((m: any) => m.status === "done");
   const shown: string[] = [];
-  for (const m of rows) {
-    if (m.attachment) {
+  for (const m of done.slice(-120)) {
+    if (m.attachment)
       shown.push(`- "${m.attachment.title ?? m.attachment.type}" (${m.attachment.type}): ${String(m.attachment.value).slice(0, 160)}`);
-      historyLines.push(`You showed on screen: ${m.attachment.title ?? m.attachment.type}`);
-    } else if (m.text) {
-      historyLines.push(`${m.role === "user" ? "Daniel" : "You"}: ${String(m.text).slice(0, 220)}`);
-    }
+  }
+  const historyLines: string[] = [];
+  for (const m of done.slice(-20)) {
+    if (m.attachment) historyLines.push(`You showed on screen: ${m.attachment.title ?? m.attachment.type}`);
+    else if (m.text) historyLines.push(`${m.role === "user" ? "Daniel" : "You"}: ${String(m.text).slice(0, 220)}`);
   }
   const historyBlock = historyLines.length
     ? `\n\nRecent conversation (continue it naturally — this already happened):\n${historyLines.slice(-16).join("\n")}`
