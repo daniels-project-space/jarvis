@@ -444,7 +444,7 @@ async function rentalAvailability(args: any): Promise<string> {
 
 async function rentalStats(): Promise<string> {
   const [stats, earners, util, series] = await Promise.all([
-    rentalQuery("dashboard:getStatsDrawerData", { accountSlug: "db", _bypassMv: true }),
+    rentalQuery("dashboard:getStatsDrawerData", { accountSlug: null, _bypassMv: true }), // null = every account combined
     rentalQuery("mv/top_earners:getRanking", {}),
     rentalQuery("mv/utilization:get", {}),
     rentalQuery("mv/earnings_by_period:get", { granularity: "monthly", months: 6 }),
