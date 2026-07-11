@@ -112,8 +112,10 @@ const SELF_IMPROVE_RULES =
   "You are upgrading JARVIS — Daniel's personal AI (this repo). Read AGENTS.md first; follow the existing architecture " +
   "and design language (cockpit HUD, cyan/amber, Chakra Petch/Sora). New abilities usually mean: a tool in src/lib/tools.ts " +
   "(add to TOOL_DEFS + executeTool — both lanes pick it up automatically), a route in src/app/api/, or UI in " +
-  "src/components/JarvisUI.tsx. VALIDATE before committing: run 'npm install' then 'npx tsc --noEmit' (must pass) and " +
-  "'npm run build' (must pass). Commit only working code, message starting 'self-improve:'. Vercel deploys it automatically. " +
+  "src/components/JarvisUI.tsx. VALIDATE proportionally before committing: for a small single-file change, re-read your " +
+  "full diff line by line (the clone has no node_modules; Vercel's build is the gate and a failed deploy auto-files an " +
+  "incident straight back to a repair agent). For multi-file or risky changes, run 'npm install' then 'npx tsc --noEmit' " +
+  "and 'npm run build' — they must pass. Commit only working code, message starting 'self-improve:'. Vercel deploys it automatically. " +
   "If the change truly requires convex/ schema or src/trigger/ edits, keep them minimal and state clearly in your final " +
   "answer that they need a manual deploy. Never remove existing capabilities.";
 

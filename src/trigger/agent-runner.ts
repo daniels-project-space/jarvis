@@ -178,7 +178,7 @@ function runClaude(
         /* already gone */
       }
       resolve(finalText || "(agent timed out)");
-    }, 600_000); // self-repair/improve jobs run npm install + tsc + build inside the turn
+    }, 900_000); // self-repair/improve jobs may run npm install + tsc + build inside the turn
     p.stdout.on("data", (d) => {
       buf += d.toString();
       let nl: number;
@@ -255,7 +255,7 @@ export function repairPrompt(inc: { source: string; message: string; signature: 
     `Incident (source: ${inc.source}, seen ${inc.count}x): ${inc.message}\n\n` +
     `Method, in order: 1) REPRODUCE — hit the live endpoints (e.g. curl https://jarvis-orcin-six.vercel.app/api/...) ` +
     `or read the failing path until you can explain the error. 2) Trace to the underlying cause in the code of ${repo}. ` +
-    `3) Apply the MINIMAL correct fix. 4) VALIDATE: run "npx tsc --noEmit" and it must pass; if you changed app code run "npm install" then "npm run build" and it must pass. ` +
+    `3) Apply the MINIMAL correct fix. 4) VALIDATE proportionally: for a small single-file change, re-read your full diff line by line instead of building (the clone has no node_modules; Vercel's build is the gate and a failed deploy auto-files an incident straight back to you). For multi-file or risky changes, run "npm install" then "npx tsc --noEmit" and "npm run build" — they must pass. ` +
     `5) Commit ONLY working code with a message starting "self-repair:". ` +
     `If the true fix needs convex/ or src/trigger/ redeploy (you cannot deploy those), still commit and SAY SO plainly. ` +
     `If you cannot find the root cause, do NOT guess-edit — say exactly what you ruled out and what you suspect.`
@@ -265,7 +265,7 @@ export function repairPrompt(inc: { source: string; message: string; signature: 
 export const agentRunner = schedules.task({
   id: "jarvis-agent-runner",
   cron: "*/2 * * * *",
-  maxDuration: 900,
+  maxDuration: 1800,
   run: async () => {
     const bin = resolveClaudeBin();
     if (!bin) return { processed: 0, error: "no claude binary" };
