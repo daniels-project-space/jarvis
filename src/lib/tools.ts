@@ -81,6 +81,11 @@ export const TOOL_DEFS = [
     parameters: { type: "object", properties: {} },
   },
   {
+    name: "current_time",
+    description: "The current date and time in Daniel's timezone (Europe/London). Use whenever you need to know the date, day of week, or time right now.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
     name: "self_repair",
     description:
       "Something is BROKEN (in JARVIS itself or any of Daniel's apps): file it and dispatch a repair engineer immediately to reproduce it, trace the root cause and fix it. Use whenever Daniel reports a malfunction or you notice a tool/feature failing repeatedly. Tell him one casual line that you're on it.",
@@ -336,6 +341,20 @@ export async function executeTool(name: string, args: any): Promise<string> {
         ? "\nRecent findings: " + recent.map((r: any) => r.spoken).join(" | ")
         : "";
       return a + f;
+    }
+    case "current_time": {
+      const now = new Date();
+      const formatted = new Intl.DateTimeFormat("en-GB", {
+        timeZone: "Europe/London",
+        weekday: "long",
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+        hour12: true,
+      }).format(now);
+      return formatted;
     }
     default:
       return `Unknown tool ${name}.`;
