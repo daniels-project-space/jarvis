@@ -1,4 +1,5 @@
 import { schedules } from "@trigger.dev/sdk/v3";
+import { sendPush } from "./push-send";
 
 // Slice C — awareness. Polls the cloud stack (Vercel deploy health across all of
 // Daniel's apps) and writes a snapshot to Convex `projectState`, which the brain
@@ -75,6 +76,7 @@ export const stackPoller = schedules.task({
         threadId: "main",
         text: `⚠️ Heads up, sir — a deploy just failed: ${newlyBroken.join(", ")}. Shall I dispatch an agent to investigate?`,
       });
+      await sendPush("⚠️ Deploy failed", `${newlyBroken.join(", ")} — tap to open JARVIS.`, "/");
     }
     return { polled, newlyBroken };
   },

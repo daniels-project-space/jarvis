@@ -2,7 +2,13 @@
 import { useEffect, useRef } from "react";
 
 // Reactive arc-reactor orb — idle breathe, lively pulse while speaking.
-export default function Orb({ speaking }: { speaking: boolean }) {
+export default function Orb({
+  speaking,
+  energyRef,
+}: {
+  speaking: boolean;
+  energyRef?: { current: number };
+}) {
   const ref = useRef<HTMLCanvasElement>(null);
   const speakingRef = useRef(speaking);
   useEffect(() => {
@@ -36,10 +42,14 @@ export default function Orb({ speaking }: { speaking: boolean }) {
       const R = Math.min(w, h) * 0.24;
       const hue = 158;
 
-      const target = speakingRef.current
-        ? 0.5 + 0.5 * Math.abs(Math.sin(t * 8.7) * Math.sin(t * 5.1))
-        : 0.14 + 0.06 * Math.sin(t * 1.2);
-      energy += (target - energy) * 0.15;
+      const ext = energyRef?.current ?? 0;
+      const target =
+        ext > 0.03
+          ? Math.min(1, ext)
+          : speakingRef.current
+            ? 0.45 + 0.45 * Math.abs(Math.sin(t * 8.7) * Math.sin(t * 5.1))
+            : 0.14 + 0.06 * Math.sin(t * 1.2);
+      energy += (target - energy) * (ext > 0.03 ? 0.4 : 0.15);
 
       ctx.clearRect(0, 0, w, h);
 

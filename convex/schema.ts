@@ -74,4 +74,11 @@ export default defineSchema({
     title: v.optional(v.string()),
     updatedAt: v.number(),
   }).index("by_key", ["key"]),
+
+  // Web-push subscriptions (per device) — JARVIS pings the phone even when closed.
+  pushSubs: defineTable({
+    endpoint: v.string(),
+    keys: v.object({ p256dh: v.string(), auth: v.string() }),
+    createdAt: v.number(),
+  }).index("by_endpoint", ["endpoint"]),
 });

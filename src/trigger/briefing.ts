@@ -1,4 +1,5 @@
 import { schedules } from "@trigger.dev/sdk/v3";
+import { sendPush } from "./push-send";
 
 // Slice F — proactive morning briefing. Composes a rundown from the cloud-stack
 // snapshot + recent background jobs and posts it into the chat unprompted.
@@ -48,6 +49,7 @@ export const morningBriefing = schedules.task({
       `${live}/${stack.length} deploys healthy${doneJobs ? ` · ${doneJobs} background job${doneJobs > 1 ? "s" : ""} completed` : ""}.`,
     ];
     await convexMutation("chatQueue:postAssistant", { threadId: "main", text: lines.join("\n") });
+    await sendPush("☀️ Morning briefing", lines.slice(1).join(" "), "/");
     return { posted: true, broken };
   },
 });

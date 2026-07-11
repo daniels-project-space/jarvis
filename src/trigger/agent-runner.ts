@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
+import { sendPush } from "./push-send";
 
 // Slice D — dispatch. Claims background jobs (enqueued by the brain), runs a
 // Claude Code / Opus agent on them (optionally cloning a repo, committing +
@@ -157,6 +158,7 @@ export const agentRunner = schedules.task({
           threadId: "main",
           text: `✅ Agent finished${job.repo ? ` on ${job.repo}` : ""}${pushNote}:\n${result.slice(0, 700)}`,
         });
+        await sendPush(`✅ Agent finished${job.repo ? ` on ${job.repo}` : ""}`, result.slice(0, 140), "/");
         processed += 1;
       } catch (e: any) {
         await convexMutation("jobs:finalize", { jobId: job.jobId, status: "error", result: String(e?.message ?? e) });

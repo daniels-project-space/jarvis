@@ -60,6 +60,25 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 type Turn = { finalText: string; sessionId: string | null; code: number | null; stderr: string };
 
+// Intelligent model routing: cheap Haiku for chat/lookups, Opus for real work.
+function pickModel(text: string): string {
+  const t = text.toLowerCase().trim();
+  if (
+    /\b(fix|debug|refactor|implement|build|architect|design|migrate|optimi[sz]e|investigate|analy[sz]e|root cause|plan|code|deploy|dispatch|run an agent)\b/.test(
+      t,
+    ) ||
+    /\brepo\b|codebase/.test(t)
+  )
+    return "opus";
+  if (
+    t.length <= 60 &&
+    /^(hi|hey|hello|yo|thanks|thank you|ok|okay|sup|morning|evening|good (morning|evening|day)|what'?s up|how are you)\b/.test(t)
+  )
+    return "haiku";
+  if (t.length <= 50) return "haiku";
+  return "sonnet";
+}
+
 function runTurn(
   bin: string,
   env: NodeJS.ProcessEnv,
@@ -68,6 +87,7 @@ function runTurn(
   history: { role: string; text: string }[],
   memoryContext: string,
   stackContext: string,
+  model: string,
 ): Promise<Turn> {
   const preamble =
     "You are JARVIS, Daniel's dry, impeccably-polite British-butler personal ops assistant. " +
@@ -96,7 +116,7 @@ function runTurn(
     "--append-system-prompt",
     preamble,
     "--model",
-    "opus",
+    model,
     "--output-format",
     "stream-json",
     "--verbose",
@@ -247,6 +267,7 @@ export const chatDispatcher = schedules.task({
           claim.history,
           memoryContext,
           stackContext,
+          pickModel(claim.userText),
         );
         const finalText =
           turn.finalText.trim() ||

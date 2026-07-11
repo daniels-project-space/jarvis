@@ -15,12 +15,14 @@ export default function JarvisUI() {
     | null
     | undefined;
   const clearPanel = useMutation(api.ui.clearPanel);
+  const saveSub = useMutation(api.push.saveSub);
   const [input, setInput] = useState("");
   const [speaking, setSpeaking] = useState(false);
   const [listening, setListening] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
   const lastSpokenId = useRef<string | null>(null);
   const recRef = useRef<any>(null);
+  const energyRef = useRef(0);
 
   const busy = messages.some((m) => m.role === "assistant" && m.status === "streaming");
 
@@ -28,30 +30,31 @@ export default function JarvisUI() {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages.length, messages[messages.length - 1]?.text]);
 
-  // Speak the newest finalized assistant message once (browser TTS, British voice).
+  useEffect(() => {
+    import("../lib/push").then((m) => m.registerSW());
+  }, []);
+
+  // Speak the newest finalized assistant message via open-source Kokoro TTS
+  // (in-browser, en-GB butler voice), driving the orb from live audio amplitude.
   useEffect(() => {
     const last = [...messages].reverse().find((m) => m.role === "assistant" && m.status === "done" && m.text);
     if (!last || last._id === lastSpokenId.current) return;
     lastSpokenId.current = last._id;
-    if (typeof window === "undefined" || !window.speechSynthesis) return;
-    const u = new SpeechSynthesisUtterance(last.text);
-    const voices = window.speechSynthesis.getVoices();
-    const gb =
-      voices.find((v) => /en-GB/.test(v.lang) && /male|daniel|arthur|george|uk/i.test(v.name)) ||
-      voices.find((v) => /en-GB/.test(v.lang));
-    if (gb) u.voice = gb;
-    u.rate = 1.02;
-    u.pitch = 0.9;
-    u.onstart = () => setSpeaking(true);
-    u.onend = () => setSpeaking(false);
-    u.onerror = () => setSpeaking(false);
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(u);
+    (async () => {
+      const { speak } = await import("../lib/kokoro");
+      await speak(
+        last.text,
+        (e) => (energyRef.current = e),
+        () => setSpeaking(true),
+        () => setSpeaking(false),
+      );
+    })();
   }, [messages]);
 
   async function submit(text: string) {
     const t = text.trim();
     if (!t) return;
+    import("../lib/kokoro").then((m) => m.warm()); // gesture-warm audio + model
     setInput("");
     await send({ threadId: THREAD, text: t });
   }
@@ -120,7 +123,7 @@ export default function JarvisUI() {
           </div>
         ) : (
           <>
-            <Orb speaking={speaking} />
+            <Orb speaking={speaking} energyRef={energyRef} />
             <div className="pointer-events-none absolute bottom-3 left-0 right-0 text-center text-xs tracking-widest text-neutral-500">
               {status}
             </div>
@@ -146,6 +149,24 @@ export default function JarvisUI() {
           <div ref={endRef} />
         </div>
         <div className="flex gap-2 border-t border-neutral-800 p-3">
+          <button
+            onClick={async () => {
+              const r = await (await import("../lib/push")).subscribePush(saveSub);
+              alert(
+                r === "subscribed"
+                  ? "Notifications on — JARVIS will ping this device."
+                  : r === "unsupported"
+                    ? "On iPhone: Share → Add to Home Screen, then open JARVIS from that icon to enable push."
+                    : r === "denied"
+                      ? "Notifications are blocked in your browser settings."
+                      : "Push isn't available here.",
+              );
+            }}
+            title="enable phone notifications"
+            className="rounded-xl bg-neutral-800 px-3 text-sm text-neutral-300 hover:bg-neutral-700"
+          >
+            🔔
+          </button>
           <button
             onClick={toggleMic}
             title="voice input"

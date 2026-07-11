@@ -15,7 +15,7 @@ export default defineConfig({
   build: {
     // Claude Code reads its bundled binary from disk — keep it out of the
     // esbuild bundle; Trigger installs it fresh (correct Linux binary).
-    external: ["@anthropic-ai/claude-code"],
+    external: ["@anthropic-ai/claude-code", "web-push"],
     extensions: [
       additionalPackages({ packages: ["@anthropic-ai/claude-code@latest"] }),
       aptGet({ packages: ["git", "ca-certificates"] }),
