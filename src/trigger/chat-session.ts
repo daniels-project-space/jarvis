@@ -299,7 +299,8 @@ export const chatDispatcher = schedules.task({
           : "";
         const insLines =
           Array.isArray(ins) && ins.length
-            ? "Insights you've noticed recently:\n" + ins.map((i: any) => `- ${i.text}`).join("\n")
+            ? "Background observations you've made (these are NOT his to-do items):\n" +
+              ins.map((i: any) => `- ${i.text}`).join("\n")
             : "";
         const now = Date.now();
         const openTodos = Array.isArray(todos) ? todos.filter((t: any) => !t.done) : [];
@@ -324,10 +325,16 @@ export const chatDispatcher = schedules.task({
           Array.isArray(widgets) && widgets.length
             ? `Dashboard widgets: ${widgets.filter((w: any) => w.enabled !== false).map((w: any) => w.type).join(", ")}.`
             : "";
-        const hubLines = ["Daniel's personal hub —", todoLine, calLine, wealthLine, widgetLine]
+        const hubLines = [
+          "Daniel's personal hub (his ACTUAL to-do list and calendar live here — use these exact items when he asks about tasks or schedule):",
+          todoLine,
+          calLine,
+          wealthLine,
+          widgetLine,
+        ]
           .filter(Boolean)
           .join("\n");
-        const businessContext = [bizLines, insLines, hubLines].filter(Boolean).join("\n").slice(0, 2600);
+        const businessContext = [hubLines, bizLines, insLines].filter(Boolean).join("\n").slice(0, 2600);
         const model = pickModel(claim.userText);
         const turn = await runTurn(
           bin,
