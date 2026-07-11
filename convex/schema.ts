@@ -33,7 +33,12 @@ export default defineSchema({
     role: v.string(), // "user" | "assistant"
     text: v.string(),
     status: v.string(), // "pending" | "streaming" | "done" | "error"
-    model: v.optional(v.string()), // which tier answered (haiku|sonnet|opus)
+    model: v.optional(v.string()), // which tier answered (haiku|sonnet|opus|flash|live)
+    // Persistent media card: everything JARVIS shows also lands in the stream
+    // so Daniel can always get back to it later.
+    attachment: v.optional(
+      v.object({ type: v.string(), value: v.string(), title: v.optional(v.string()) }),
+    ),
     createdAt: v.number(),
   })
     .index("by_thread", ["threadId", "createdAt"])

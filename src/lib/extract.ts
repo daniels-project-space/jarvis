@@ -1,5 +1,6 @@
 import "server-only";
 import { convexMutation } from "./context";
+import { vaultWrite } from "./obsidian";
 
 // Post-turn memory capture — decoupled from the reply (the sleep-time pattern).
 // Used by /api/chat after every text turn and /api/extract after live turns.
@@ -38,6 +39,7 @@ export async function extractMemory(key: string, userText: string, assistantText
         body: String(it.body).slice(0, 1200),
         tags: [],
       });
+      await vaultWrite(String(it.kind), String(it.title), String(it.body)); // real-time Obsidian
       n++;
     }
     return n;

@@ -210,9 +210,16 @@ export async function executeTool(name: string, args: any): Promise<string> {
       let { kind, value, title } = args as { kind: string; value: string; title?: string };
       if (kind === "video") {
         const id = YT_ID(value);
-        if (id) value = `https://www.youtube.com/embed/${id}?autoplay=1`;
+        if (id) value = `https://www.youtube.com/embed/${id}`;
       }
       await convexMutation("ui:setPanel", { type: kind, value: String(value), title: title ? String(title) : undefined });
+      // Everything shown also lands in the stream as a persistent card.
+      await convexMutation("chatQueue:postCard", {
+        threadId: "main",
+        type: kind,
+        value: String(value).slice(0, 4000),
+        title: title ? String(title) : undefined,
+      }).catch(() => {});
       return "On screen now.";
     }
     case "hide":
@@ -226,14 +233,17 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await youtubeTranscript(String(args.video));
     case "read_url":
       return await readUrl(String(args.url));
-    case "remember":
+    case "remember": {
       await convexMutation("memory:write", {
         kind: String(args.kind ?? "fact"),
         title: String(args.title).slice(0, 120),
         body: String(args.body).slice(0, 1200),
         tags: Array.isArray(args.tags) ? args.tags.map(String).slice(0, 6) : [],
       });
+      const { vaultWrite } = await import("./obsidian");
+      await vaultWrite(String(args.kind ?? "fact"), String(args.title), String(args.body));
       return "Saved to memory.";
+    }
     case "memory_search": {
       const rows = await convexQuery("memory:search", { q: String(args.query), limit: 8 });
       return Array.isArray(rows) && rows.length

@@ -220,8 +220,13 @@ function runClaude(
 
 // Bare project names silently fail to clone — resolve them to full owner/repo.
 const REPO_ALIASES: Record<string, string> = {
-  "project-hub": "daniels-project-space/project-hub-app",
-  "project-hub-app": "daniels-project-space/project-hub-app",
+  "project-hub": "daniels-project-space/project-hub",
+  "project-hub-app": "daniels-project-space/project-hub",
+  hub: "daniels-project-space/project-hub",
+  "remote-work-hub": "daniels-project-space/remote-work-hub",
+  "media-engine": "daniels-project-space/media-engine",
+  "app-factory-v2": "daniels-project-space/app-factory-v2",
+  "db-cinema-v2": "daniels-project-space/db-cinema-v2",
   "rental-manager-v2": "daniels-project-space/rental-manager-v2",
   rmv2: "daniels-project-space/rental-manager-v2",
   "music-house": "daniels-project-space/music-house",

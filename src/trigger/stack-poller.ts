@@ -54,6 +54,26 @@ export const stackPoller = schedules.task({
     const H = { authorization: `Bearer ${token}` };
     const res = await fetch(`https://api.vercel.com/v9/projects?teamId=${VERCEL_TEAM}&limit=100`, { headers: H });
     const projects: any[] = (await res.json()).projects ?? [];
+    // "What's new" awareness: latest commit per app repo so JARVIS knows what
+    // changed across the dashboard, not just whether deploys are green.
+    const gh = process.env.GITHUB_TOKEN ?? "";
+    async function latestCommit(repo: string): Promise<string> {
+      if (!gh) return "";
+      try {
+        const r = await fetch(`https://api.github.com/repos/daniels-project-space/${repo}/commits?per_page=1`, {
+          headers: { Authorization: `Bearer ${gh}`, Accept: "application/vnd.github+json" },
+        });
+        if (!r.ok) return "";
+        const c = (await r.json())[0];
+        const when = new Date(c.commit.author.date);
+        const hrs = Math.max(0, Math.round((Date.now() - when.getTime()) / 3_600_000));
+        const msg = String(c.commit.message).split("\n")[0].slice(0, 80);
+        return `latest change ${hrs < 1 ? "under an hour" : hrs < 48 ? `${hrs}h` : `${Math.round(hrs / 24)}d`} ago: "${msg}"`;
+      } catch {
+        return "";
+      }
+    }
+
     let polled = 0;
     const newlyBroken: string[] = [];
     for (const p of projects) {
@@ -62,11 +82,12 @@ export const stackPoller = schedules.task({
       const alias = (prod?.alias ?? []).find((a: string) => !a.includes("-danielmabro")) ?? (prod?.alias ?? [])[0];
       const old = priorStatus.get(p.name);
       if (status === "ERROR" && old && old !== "ERROR") newlyBroken.push(p.name);
+      const recent = await latestCommit(p.name);
       await convexMutation("projectState:upsert", {
         slug: p.name,
         status,
-        summary: `Vercel: ${status}${alias ? ` · ${alias}` : ""}`,
-        data: { vercel: status, url: alias ? `https://${alias}` : null, framework: p.framework ?? null },
+        summary: `Vercel: ${status}${alias ? ` · ${alias}` : ""}${recent ? ` · ${recent}` : ""}`,
+        data: { vercel: status, url: alias ? `https://${alias}` : null, framework: p.framework ?? null, recent },
       });
       polled++;
     }

@@ -199,3 +199,36 @@ export const postAssistant = mutation({
     });
   },
 });
+
+// Drop a persistent media card into the stream (everything shown stays findable).
+export const postCard = mutation({
+  args: {
+    threadId: v.optional(v.string()),
+    type: v.string(),
+    value: v.string(),
+    title: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    await ctx.db.insert("chatMessages", {
+      threadId: a.threadId ?? "main",
+      role: "assistant",
+      text: "",
+      status: "done",
+      attachment: { type: a.type, value: a.value, title: a.title },
+      createdAt: Date.now(),
+    });
+  },
+});
+
+// Wipe a thread (fresh start after maintenance/testing).
+export const clearThread = mutation({
+  args: { threadId: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    const rows = await ctx.db
+      .query("chatMessages")
+      .withIndex("by_thread", (q: any) => q.eq("threadId", a.threadId ?? "main"))
+      .collect();
+    for (const r of rows) await ctx.db.delete(r._id);
+    return rows.length;
+  },
+});

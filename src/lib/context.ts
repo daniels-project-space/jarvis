@@ -69,7 +69,13 @@ export async function buildContext(userText?: string): Promise<{ block: string; 
   if (wealth && typeof wealth.currentTotalGBP === "number")
     lines.push(`Net worth: about £${Math.round(wealth.currentTotalGBP).toLocaleString("en-GB")}.`);
   if (Array.isArray(stack) && stack.length)
-    lines.push("Cloud stack: " + stack.map((s: any) => `${s.slug}=${s.status}`).join(", "));
+    lines.push(
+      "Cloud stack (with what changed recently): " +
+        stack
+          .map((s: any) => `${s.slug}=${s.status}${s.data?.recent ? ` — ${s.data.recent}` : ""}`)
+          .join("; ")
+          .slice(0, 1800),
+    );
   if (Array.isArray(jobs) && jobs.length)
     lines.push("Agents working right now: " + jobs.map((j: any) => `"${j.task.slice(0, 80)}" (${j.status})`).join("; "));
   if (Array.isArray(findings) && findings.length)

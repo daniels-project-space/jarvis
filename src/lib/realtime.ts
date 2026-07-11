@@ -17,6 +17,7 @@ export type LiveHandlers = {
 let session: RealtimeSession | null = null;
 let audioEl: HTMLAudioElement | null = null;
 let energyRaf = 0;
+let energyCtx: AudioContext | null = null;
 
 async function clientTools() {
   const defs: { name: string; description: string; parameters: any }[] = await (await fetch("/api/tools")).json();
@@ -39,29 +40,44 @@ async function clientTools() {
   );
 }
 
+// Analysis-only tap on the remote stream for the orb. CRITICAL: never route the
+// element through WebAudio (createMediaElementSource) — that double-plays the
+// audio ("two voices") and breaks browser echo cancellation, which kills
+// barge-in because the session hears itself instead of Daniel. The element
+// keeps playing natively; we read amplitude from a parallel stream source
+// that is NOT connected to the destination.
 function hookEnergy(el: HTMLAudioElement, onEnergy: (e: number) => void) {
-  try {
-    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-    const src = ctx.createMediaElementSource(el);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 256;
-    src.connect(analyser);
-    analyser.connect(ctx.destination);
-    const data = new Uint8Array(analyser.frequencyBinCount);
-    const tick = () => {
-      analyser.getByteTimeDomainData(data);
-      let sum = 0;
-      for (const v of data) {
-        const n = (v - 128) / 128;
-        sum += n * n;
-      }
-      onEnergy(Math.min(1, Math.sqrt(sum / data.length) * 3));
-      energyRaf = requestAnimationFrame(tick);
-    };
-    tick();
-  } catch {
-    /* orb just won't pulse */
-  }
+  const arm = () => {
+    if (!session) return; // live ended before audio arrived
+    const stream = el.srcObject as MediaStream | null;
+    if (!stream || !stream.getAudioTracks().length) {
+      energyRaf = requestAnimationFrame(arm);
+      return;
+    }
+    try {
+      energyCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      void energyCtx.resume();
+      const src = energyCtx.createMediaStreamSource(stream);
+      const analyser = energyCtx.createAnalyser();
+      analyser.fftSize = 256;
+      src.connect(analyser); // analysis only — no destination
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      const tick = () => {
+        analyser.getByteTimeDomainData(data);
+        let sum = 0;
+        for (const v of data) {
+          const n = (v - 128) / 128;
+          sum += n * n;
+        }
+        onEnergy(Math.min(1, Math.sqrt(sum / data.length) * 3));
+        energyRaf = requestAnimationFrame(tick);
+      };
+      tick();
+    } catch {
+      /* orb just won't pulse */
+    }
+  };
+  arm();
 }
 
 export function isLive() {
@@ -86,8 +102,10 @@ export function nudgeLive(text: string) {
   }
 }
 
+let starting = false;
 export async function startLive(h: LiveHandlers) {
-  if (session) return;
+  if (session || starting) return; // double-tap = one session, never two voices
+  starting = true;
   h.onState("connecting");
   try {
     const tk = await (await fetch("/api/realtime-token", { method: "POST" })).json();
@@ -131,8 +149,10 @@ export async function startLive(h: LiveHandlers) {
 
     await session.connect({ apiKey: tk.token });
     hookEnergy(audioEl, h.onEnergy);
+    starting = false;
     h.onState("live");
   } catch (e: any) {
+    starting = false;
     stopLive();
     h.onState("error", String(e?.message ?? e));
   }
@@ -146,7 +166,19 @@ export function stopLive() {
   }
   session = null;
   cancelAnimationFrame(energyRaf);
+  try {
+    void energyCtx?.close();
+  } catch {
+    /* ignore */
+  }
+  energyCtx = null;
   if (audioEl) {
+    try {
+      audioEl.pause();
+      audioEl.srcObject = null;
+    } catch {
+      /* ignore */
+    }
     audioEl.remove();
     audioEl = null;
   }

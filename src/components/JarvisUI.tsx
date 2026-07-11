@@ -5,9 +5,53 @@ import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
 
 const THREAD = "main";
-type Msg = { _id: string; role: string; text: string; status: string; model?: string; createdAt: number };
+type Attachment = { type: string; value: string; title?: string };
+type Msg = {
+  _id: string;
+  role: string;
+  text: string;
+  status: string;
+  model?: string;
+  attachment?: Attachment;
+  createdAt: number;
+};
 type Job = { _id: string; task: string; model?: string; status: string; progress?: string; startedAt: number };
 type Caption = { who: "you" | "jarvis"; text: string } | null;
+
+const ytId = (s: string) => {
+  const m = String(s).match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([\w-]{11})/);
+  return m ? m[1] : null;
+};
+
+// Persistent media card in the stream — click to put it back on the big screen.
+function MediaCard({ a, onShow }: { a: Attachment; onShow: (a: Attachment) => void }) {
+  const id = a.type === "video" ? ytId(a.value) : null;
+  const ext = id ? `https://www.youtube.com/watch?v=${id}` : a.value;
+  return (
+    <span className="glass inline-flex max-w-[88%] items-center gap-2 overflow-hidden rounded-xl p-1.5 pr-2 text-left">
+      <button onClick={() => onShow(a)} className="flex min-w-0 items-center gap-2" title="show on screen">
+        {id ? (
+          <img src={`https://img.youtube.com/vi/${id}/mqdefault.jpg`} alt="" className="h-12 w-20 shrink-0 rounded-lg object-cover" />
+        ) : a.type === "image" ? (
+          <img src={a.value} alt="" className="h-12 w-20 shrink-0 rounded-lg object-cover" />
+        ) : (
+          <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-cyan/10 text-lg">
+            {a.type === "url" ? "🌐" : a.type === "code" ? "‹›" : "📄"}
+          </span>
+        )}
+        <span className="min-w-0">
+          <span className="block truncate text-xs text-ice">{a.title || a.value}</span>
+          <span className="hud-label !text-[8px] !text-cyan-dim">{a.type} · tap to view</span>
+        </span>
+      </button>
+      {(a.type === "url" || a.type === "video" || a.type === "image") && (
+        <a href={ext} target="_blank" rel="noreferrer" className="shrink-0 text-xs text-slate hover:text-cyan" title="open in tab">
+          ↗
+        </a>
+      )}
+    </span>
+  );
+}
 
 function Clock() {
   const [now, setNow] = useState("");
@@ -67,17 +111,24 @@ function AgentLiveView({ job, now, onClose }: { job: Job; now: number; onClose: 
 function Viewport({
   panel,
   onClose,
+  onMinimize,
 }: {
   panel: { type: string; value: string; title?: string };
   onClose: () => void;
+  onMinimize: () => void;
 }) {
   return (
     <div className="materialize glass relative flex h-full flex-col overflow-hidden rounded-2xl">
       <div className="flex items-center justify-between border-b border-white/5 px-3 py-2">
         <span className="hud-label truncate !text-cyan-dim">{panel.title ?? panel.type}</span>
-        <button onClick={onClose} className="hud-label rounded px-2 py-1 hover:text-cyan">
-          close
-        </button>
+        <span className="flex shrink-0 gap-1">
+          <button onClick={onMinimize} className="hud-label rounded px-2 py-1 hover:text-cyan" title="fold away, keep handy">
+            ▾ orb
+          </button>
+          <button onClick={onClose} className="hud-label rounded px-2 py-1 hover:text-cyan">
+            close
+          </button>
+        </span>
       </div>
       {panel.type === "url" || panel.type === "video" ? (
         <div className="flex min-h-0 flex-1 flex-col">
@@ -110,8 +161,12 @@ function Viewport({
 
 export default function JarvisUI() {
   const messages = (useQuery(api.chatQueue.listMessages, { threadId: THREAD }) ?? []) as Msg[];
-  const panel = useQuery(api.ui.getPanel, {}) as { type: string; value: string; title?: string } | null | undefined;
+  const panel = useQuery(api.ui.getPanel, {}) as
+    | { type: string; value: string; title?: string; updatedAt: number }
+    | null
+    | undefined;
   const clearPanel = useMutation(api.ui.clearPanel);
+  const setPanel = useMutation(api.ui.setPanel);
   const logTurn = useMutation(api.chatQueue.logTurn);
   const saveSub = useMutation(api.push.saveSub);
   const activeJobs = (useQuery(api.jobs.active, {}) ?? []) as Job[];
@@ -124,6 +179,16 @@ export default function JarvisUI() {
   const [caption, setCaption] = useState<Caption>(null);
   const [agentView, setAgentView] = useState<string | null>(null);
   const [nowTs, setNowTs] = useState(0);
+  // Viewport minimize: keep talking and the panel folds into a pill; the orb
+  // comes back. Fresh panel content pops it open again.
+  const [panelMin, setPanelMin] = useState(false);
+  const lastPanelAt = useRef(0);
+  useEffect(() => {
+    if (panel && panel.updatedAt !== lastPanelAt.current) {
+      lastPanelAt.current = panel.updatedAt;
+      setPanelMin(false);
+    }
+  }, [panel]);
 
   const endRef = useRef<HTMLDivElement>(null);
   const lastSpokenId = useRef<string | null>(null);
@@ -182,6 +247,7 @@ export default function JarvisUI() {
     if (!t) return;
     import("../lib/tts").then((m) => m.warm());
     setInput("");
+    if (panel) setPanelMin(true); // new message → viewport folds away, orb returns
     setSending(true);
     try {
       await fetch("/api/chat", {
@@ -227,6 +293,7 @@ export default function JarvisUI() {
       onCaption: (who, text, done) => setCaption(done ? null : { who, text }),
       onTurnDone: (role, text) => {
         void logTurn({ threadId: THREAD, role, text, model: role === "assistant" ? "live" : undefined });
+        if (role === "user") setPanelMin((min) => min || lastPanelAt.current < Date.now() - 8000);
         if (role === "user") lastLiveUser.current = text;
         else if (lastLiveUser.current) {
           void fetch("/api/extract", {
@@ -343,8 +410,18 @@ export default function JarvisUI() {
         <div className="brackets relative min-h-[42vh] md:min-h-[70vh]">
           <span className="bk" />
           {live === "live" && <div className="live-ring pointer-events-none absolute inset-2 rounded-full opacity-60" />}
-          {activeJobs.length > 0 && (
+          {(activeJobs.length > 0 || (panel && panelMin)) && (
             <div className="absolute left-4 right-4 top-4 z-10 flex flex-wrap gap-1.5">
+              {panel && panelMin && (
+                <button
+                  onClick={() => setPanelMin(false)}
+                  className="glass flex items-center gap-1.5 rounded-full !border-cyan/40 px-2.5 py-1 text-[10px] text-cyan transition hover:!border-cyan/70"
+                  title="reopen"
+                >
+                  <span>▸</span>
+                  <span className="max-w-[160px] truncate">{panel.title ?? panel.type}</span>
+                </button>
+              )}
               {activeJobs.map((j) => (
                 <button
                   key={j._id}
@@ -363,9 +440,9 @@ export default function JarvisUI() {
               ))}
             </div>
           )}
-          {panel ? (
+          {panel && !panelMin ? (
             <div className="absolute inset-0 z-20 p-1">
-              <Viewport panel={panel} onClose={() => clearPanel({})} />
+              <Viewport panel={panel} onClose={() => clearPanel({})} onMinimize={() => setPanelMin(true)} />
             </div>
           ) : shownJob ? (
             <div className="absolute inset-0 z-20 p-1">
@@ -399,15 +476,25 @@ export default function JarvisUI() {
             )}
             {messages.slice(-80).map((m) => (
               <div key={m._id} className={`rise ${m.role === "user" ? "text-right" : "text-left"}`}>
-                <span
-                  className={`inline-block max-w-[88%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm leading-relaxed ${
-                    m.role === "user"
-                      ? "bg-amber/10 text-amber [text-shadow:none]"
-                      : "bg-cyan/[0.07] text-ice"
-                  }`}
-                >
-                  {m.text || (m.status === "streaming" ? "…" : "")}
-                </span>
+                {m.attachment ? (
+                  <MediaCard
+                    a={m.attachment}
+                    onShow={(a) => {
+                      setPanelMin(false);
+                      void setPanel({ type: a.type, value: a.value, title: a.title });
+                    }}
+                  />
+                ) : (
+                  <span
+                    className={`inline-block max-w-[88%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm leading-relaxed ${
+                      m.role === "user"
+                        ? "bg-amber/10 text-amber [text-shadow:none]"
+                        : "bg-cyan/[0.07] text-ice"
+                    }`}
+                  >
+                    {m.text || (m.status === "streaming" ? "…" : "")}
+                  </span>
+                )}
                 {m.role === "assistant" && m.model && (
                   <div className="mt-0.5 pl-1">
                     <ModelBadge model={m.model} />
