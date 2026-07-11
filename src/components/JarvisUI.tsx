@@ -42,15 +42,33 @@ function mdToHtml(src: string): string {
   const esc = src.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   return esc
     .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer" class="text-cyan underline decoration-cyan/40 hover:decoration-cyan">$1</a>')
-    .replace(/^## (.+)$/gm, '<div class="mb-2 mt-1 text-base font-semibold text-ice">$1</div>')
+    .replace(/^###? (.+)$/gm, '<div class="mb-2 mt-1 text-base font-semibold text-ice">$1</div>')
+    .replace(/^(\d+)\. (.*)$/gm, '<span class="text-cyan/70">$1.</span> $2')
+    .replace(/^[-•] (.*)$/gm, '<span class="text-cyan/70">›</span> $1')
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/\n/g, "<br/>");
 }
+
+const WIDGET_ICON: Record<string, string> = {
+  weather: "🌤",
+  stats: "📊",
+  market: "📈",
+  timer: "⏱",
+  briefing: "📋",
+};
 
 // Persistent media card in the stream — click to put it back on the big screen.
 function MediaCard({ a, onShow }: { a: Attachment; onShow: (a: Attachment) => void }) {
   const id = a.type === "video" ? ytId(a.value) : null;
   const ext = id ? `https://www.youtube.com/watch?v=${id}` : a.value;
+  let widgetKind = "";
+  if (a.type === "widget") {
+    try {
+      widgetKind = JSON.parse(a.value)?.kind ?? "";
+    } catch {
+      /* generic icon */
+    }
+  }
   return (
     <span className="glass card-lift inline-flex max-w-[88%] items-center gap-2 overflow-hidden rounded-xl p-1.5 pr-2 text-left">
       <button onClick={() => onShow(a)} className="flex min-w-0 items-center gap-2" title="show on screen">
@@ -60,7 +78,7 @@ function MediaCard({ a, onShow }: { a: Attachment; onShow: (a: Attachment) => vo
           <img src={a.value} alt="" className="h-12 w-20 shrink-0 rounded-lg object-cover" />
         ) : (
           <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-cyan/10 text-lg">
-            {a.type === "url" ? "🌐" : a.type === "code" ? "‹›" : "📄"}
+            {a.type === "widget" ? WIDGET_ICON[widgetKind] ?? "🧩" : a.type === "url" || a.type === "site" ? "🌐" : a.type === "code" ? "‹›" : "📄"}
           </span>
         )}
         <span className="min-w-0">
@@ -155,13 +173,117 @@ function CountUp({ value, prefix = "", suffix = "" }: { value: number; prefix?: 
   );
 }
 
-// Native widget panels (weather + stats now; more kinds arrive via self_improve).
+// Live countdown ring — chimes and glows when done.
+function TimerWidget({ w }: { w: any }) {
+  const [left, setLeft] = useState(() => Math.max(0, w.until - Date.now()));
+  const chimed = useRef(false);
+  useEffect(() => {
+    const t = setInterval(() => {
+      const l = Math.max(0, w.until - Date.now());
+      setLeft(l);
+      if (l === 0 && !chimed.current) {
+        chimed.current = true;
+        import("../lib/wakeword").then((m) => {
+          m.chime();
+          setTimeout(m.chime, 500);
+          setTimeout(m.chime, 1000);
+        });
+      }
+    }, 250);
+    return () => clearInterval(t);
+  }, [w.until]);
+  const total = Math.max(1, w.total ?? 1);
+  const p = Math.min(1, Math.max(0, left / total));
+  const R = 84;
+  const C = 2 * Math.PI * R;
+  const mm = Math.floor(left / 60000);
+  const ss = Math.floor((left % 60000) / 1000);
+  return (
+    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 p-6">
+      <div className="hud-label">{w.label}</div>
+      <div className={`relative ${left === 0 ? "animate-pulse" : ""}`}>
+        <svg width="200" height="200" viewBox="0 0 200 200">
+          <circle cx="100" cy="100" r={R} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="8" />
+          <circle
+            cx="100" cy="100" r={R} fill="none"
+            stroke="var(--cyan)" strokeWidth="8" strokeLinecap="round"
+            strokeDasharray={C} strokeDashoffset={C * (1 - p)}
+            transform="rotate(-90 100 100)"
+            style={{ transition: "stroke-dashoffset 0.25s linear" }}
+          />
+        </svg>
+        <div className="absolute inset-0 flex items-center justify-center font-mono text-4xl tabular-nums text-ice">
+          {left === 0 ? "done" : `${mm}:${String(ss).padStart(2, "0")}`}
+        </div>
+      </div>
+      {left === 0 && <div className="text-sm text-cyan">Time, sir.</div>}
+    </div>
+  );
+}
+
+// Native widget panels (weather/stats/market/timer/briefing; more via self_improve).
 function WidgetView({ value }: { value: string }) {
   let w: any = null;
   try {
     w = JSON.parse(value);
   } catch {
     /* fall through */
+  }
+  if (w?.kind === "timer") return <TimerWidget w={w} />;
+  if (w?.kind === "market") {
+    return (
+      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6">
+        <div className="hud-label">markets</div>
+        <div className="grid w-full max-w-xl grid-cols-2 gap-3 md:grid-cols-3">
+          {(w.rows ?? []).map((r: any, i: number) => (
+            <div key={i} className="glass rounded-xl px-3 py-4 text-center">
+              <div className="hud-label !text-[9px]">{r.label}</div>
+              <div className="mt-1 text-xl font-semibold text-ice">
+                {r.unit}
+                {Number(r.price).toLocaleString("en-GB")}
+              </div>
+              <div className={`mt-0.5 text-xs ${r.change >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                {r.change >= 0 ? "▲" : "▼"} {Math.abs(r.change)}% 24h
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+  if (w?.kind === "briefing") {
+    return (
+      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-lg font-semibold text-ice">{w.date}</div>
+            {w.wealth != null && <div className="text-xs text-slate">net worth ≈ £{Number(w.wealth).toLocaleString("en-GB")}</div>}
+          </div>
+          {w.weather && (
+            <div className="glass flex items-center gap-2 rounded-xl px-3 py-2">
+              <span className="text-3xl">{w.weather.icon}</span>
+              <span className="text-xl text-ice">{w.weather.temp}°</span>
+              <span className="text-xs text-slate">{w.weather.desc} · {w.weather.place}</span>
+            </div>
+          )}
+        </div>
+        <div className="mt-4 grid gap-3 md:grid-cols-2">
+          {(w.sections ?? []).map((s: any, i: number) => (
+            <div key={i} className="glass rounded-xl p-3">
+              <div className="hud-label mb-2">{s.title}</div>
+              <ul className="space-y-1">
+                {(s.lines ?? []).map((l: string, j: number) => (
+                  <li key={j} className="flex gap-2 text-sm text-ice">
+                    <span className="text-cyan/60">›</span>
+                    <span className="min-w-0 flex-1">{l}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
   }
   if (w?.kind === "stats") {
     const maxS = Math.max(1, ...(w.series ?? []).map((s: any) => s.value));

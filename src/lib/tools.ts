@@ -136,6 +136,36 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "market",
+    description:
+      "Live prices as a visual widget: crypto (bitcoin/ethereum/solana/any CoinGecko id) and stocks/commodities via ticker symbols (AAPL, TSLA, GC=F gold, ^GSPC S&P). Use for any price/market question.",
+    parameters: {
+      type: "object",
+      properties: {
+        coins: { type: "array", items: { type: "string" }, description: "CoinGecko ids, default [bitcoin, ethereum, solana]" },
+        symbols: { type: "array", items: { type: "string" }, description: "Yahoo tickers, e.g. [GC=F, AAPL]; default [GC=F]" },
+      },
+    },
+  },
+  {
+    name: "timer",
+    description: "Set a visual countdown timer on Daniel's screen (live ring, chimes when done). Use when he asks for a timer/reminder in minutes.",
+    parameters: {
+      type: "object",
+      properties: {
+        minutes: { type: "number", description: "duration in minutes" },
+        label: { type: "string", description: "what it's for, e.g. 'pasta'" },
+      },
+      required: ["minutes"],
+    },
+  },
+  {
+    name: "briefing",
+    description:
+      "Daniel's full morning/evening briefing as one visual widget: weather, today's rentals (pickups/returns), open to-dos, next calendar events, net worth, live markets. Use for 'brief me / morning update / what's my day look like'.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
     name: "clear_chat",
     description: "Wipe the current chat's history. Use when Daniel asks to clear/delete the chat — this IS the action, never dispatch an agent for it.",
     parameters: { type: "object", properties: {} },
@@ -453,7 +483,7 @@ async function rentalStats(): Promise<string> {
   const m = stats.monthly ?? {};
   const act = stats.active ?? {};
   const short = (s: string) => String(s || "").split(/[|,]/)[0].split(/\s+/).slice(0, 4).join(" ");
-  const widget = {
+  const widget: Record<string, any> = {
     kind: "stats",
     title: "Rental business",
     kpis: [
@@ -474,7 +504,7 @@ async function rentalStats(): Promise<string> {
     })),
     barsLabel: "top earners (30d) £",
   };
-  await convexMutation("ui:setPanel", { type: "widget", value: JSON.stringify(widget), title: "rental business" });
+  await showWidget(widget, "rental business");
   const bestMonth = widget.series.reduce((a: any, b: any) => (b.value > (a?.value ?? 0) ? b : a), null);
   return (
     `This month £${widget.kpis[0].value}, ${widget.kpis[1].value} active, ${widget.kpis[2].value} upcoming, fleet ${widget.kpis[3].value}% used.` +
@@ -492,45 +522,197 @@ const WMO: Record<number, [string, string]> = {
   85: ["🌨", "snow showers"], 86: ["🌨", "snow showers"], 95: ["⛈", "thunderstorm"], 96: ["⛈", "thunderstorm + hail"], 99: ["⛈", "thunderstorm + hail"],
 };
 
+// Show a widget AND drop a recallable card in the stream (tap = re-show later).
+async function showWidget(widget: Record<string, unknown>, title: string) {
+  const json = JSON.stringify(widget);
+  await convexMutation("ui:setPanel", { type: "widget", value: json, title });
+  if (json.length < 3900)
+    await convexMutation("chatQueue:postCard", { threadId: await activeThread(), type: "widget", value: json, title }).catch(
+      () => {},
+    );
+}
+
+async function fetchWeatherData(place: string): Promise<any | null> {
+  const geo: any = await (
+    await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(place)}&count=1&language=en`)
+  ).json();
+  const g = geo?.results?.[0];
+  if (!g) return null;
+  const f: any = await (
+    await fetch(
+      `https://api.open-meteo.com/v1/forecast?latitude=${g.latitude}&longitude=${g.longitude}` +
+        `&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m` +
+        `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=6`,
+    )
+  ).json();
+  const cur = f?.current;
+  if (!cur) return null;
+  const [icon, desc] = WMO[cur.weather_code] ?? ["🌡", "weather"];
+  return {
+    kind: "weather",
+    place: `${g.name}${g.country_code ? ", " + g.country_code : ""}`,
+    icon,
+    desc,
+    temp: Math.round(cur.temperature_2m),
+    feels: Math.round(cur.apparent_temperature),
+    wind: Math.round(cur.wind_speed_10m),
+    humidity: cur.relative_humidity_2m,
+    days: (f.daily?.time ?? []).map((d: string, i: number) => ({
+      day: new Date(d).toLocaleDateString("en-GB", { weekday: "short" }),
+      icon: (WMO[f.daily.weather_code[i]] ?? ["🌡"])[0],
+      max: Math.round(f.daily.temperature_2m_max[i]),
+      min: Math.round(f.daily.temperature_2m_min[i]),
+      rain: f.daily.precipitation_probability_max?.[i] ?? 0,
+    })),
+  };
+}
+
 async function weatherWidget(args: any): Promise<string> {
   const place = String(args.location ?? "London").trim() || "London";
   try {
-    const geo: any = await (
-      await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(place)}&count=1&language=en`)
-    ).json();
-    const g = geo?.results?.[0];
-    if (!g) return `Couldn't find a place called ${place}.`;
-    const f: any = await (
-      await fetch(
-        `https://api.open-meteo.com/v1/forecast?latitude=${g.latitude}&longitude=${g.longitude}` +
-          `&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m` +
-          `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=6`,
-      )
-    ).json();
-    const cur = f?.current;
-    if (!cur) return "Weather service is unavailable right now.";
-    const [icon, desc] = WMO[cur.weather_code] ?? ["🌡", "weather"];
-    const widget = {
-      kind: "weather",
-      place: `${g.name}${g.country_code ? ", " + g.country_code : ""}`,
-      icon,
-      desc,
-      temp: Math.round(cur.temperature_2m),
-      feels: Math.round(cur.apparent_temperature),
-      wind: Math.round(cur.wind_speed_10m),
-      humidity: cur.relative_humidity_2m,
-      days: (f.daily?.time ?? []).map((d: string, i: number) => ({
-        day: new Date(d).toLocaleDateString("en-GB", { weekday: "short" }),
-        icon: (WMO[f.daily.weather_code[i]] ?? ["🌡"])[0],
-        max: Math.round(f.daily.temperature_2m_max[i]),
-        min: Math.round(f.daily.temperature_2m_min[i]),
-        rain: f.daily.precipitation_probability_max?.[i] ?? 0,
-      })),
-    };
-    await convexMutation("ui:setPanel", { type: "widget", value: JSON.stringify(widget), title: `weather · ${widget.place}` });
-    return `${widget.place}: ${widget.temp}°C, ${desc}, feels like ${widget.feels}°, wind ${widget.wind} km/h. (Widget is on Daniel's screen.)`;
+    const w = await fetchWeatherData(place);
+    if (!w) return `Couldn't find weather for ${place}.`;
+    await showWidget(w, `weather · ${w.place}`);
+    return `${w.place}: ${w.temp}°C, ${w.desc}, feels like ${w.feels}°, wind ${w.wind} km/h. (Widget is on Daniel's screen.)`;
   } catch (e: any) {
     return `Weather lookup failed: ${e?.message ?? e}`;
+  }
+}
+
+async function fetchMarketData(coins: string[], symbols: string[]): Promise<any[]> {
+  const rows: any[] = [];
+  try {
+    if (coins.length) {
+      const cg: any = await (
+        await fetch(
+          `https://api.coingecko.com/api/v3/simple/price?ids=${coins.map(encodeURIComponent).join(",")}&vs_currencies=gbp&include_24hr_change=true`,
+        )
+      ).json();
+      for (const id of coins) {
+        const c = cg?.[id];
+        if (c?.gbp != null)
+          rows.push({ label: id.replace(/-/g, " "), price: c.gbp, change: Math.round((c.gbp_24h_change ?? 0) * 100) / 100, unit: "£" });
+      }
+    }
+  } catch {
+    /* partial data is fine */
+  }
+  for (const sym of symbols.slice(0, 5)) {
+    try {
+      const y: any = await (
+        await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=1h`, {
+          headers: { "user-agent": "Mozilla/5.0" },
+        })
+      ).json();
+      const meta = y?.chart?.result?.[0]?.meta;
+      if (meta?.regularMarketPrice != null) {
+        const prev = meta.chartPreviousClose || meta.regularMarketPrice;
+        const names: Record<string, string> = { "GC=F": "gold", "^GSPC": "S&P 500", "^IXIC": "nasdaq", "BTC-USD": "bitcoin $" };
+        rows.push({
+          label: names[sym] ?? sym,
+          price: meta.regularMarketPrice,
+          change: Math.round(((meta.regularMarketPrice - prev) / prev) * 10000) / 100,
+          unit: meta.currency === "GBP" ? "£" : meta.currency === "USD" ? "$" : "",
+        });
+      }
+    } catch {
+      /* skip symbol */
+    }
+  }
+  return rows;
+}
+
+async function marketWidget(args: any): Promise<string> {
+  const coins = Array.isArray(args.coins) && args.coins.length ? args.coins.map(String) : ["bitcoin", "ethereum", "solana"];
+  const symbols = Array.isArray(args.symbols) && args.symbols.length ? args.symbols.map(String) : ["GC=F"];
+  const rows = await fetchMarketData(coins, symbols);
+  if (!rows.length) return "Market data is unavailable right now.";
+  await showWidget({ kind: "market", title: "Markets", rows, at: new Date().toISOString() }, "markets");
+  return (
+    rows.map((r) => `${r.label}: ${r.unit}${r.price.toLocaleString("en-GB")} (${r.change >= 0 ? "+" : ""}${r.change}%)`).join(", ") +
+    ". (Widget is on Daniel's screen.)"
+  );
+}
+
+async function timerWidget(args: any): Promise<string> {
+  const minutes = Math.min(Math.max(Number(args.minutes) || 0, 0.1), 24 * 60);
+  if (!minutes) return "How long, sir?";
+  const label = String(args.label ?? "timer").slice(0, 60);
+  const until = Date.now() + Math.round(minutes * 60_000);
+  await showWidget({ kind: "timer", label, until, total: Math.round(minutes * 60_000) }, `⏱ ${label}`);
+  return `Timer set — ${minutes} minute${minutes === 1 ? "" : "s"} for ${label}. It'll chime on screen when done.`;
+}
+
+async function briefingWidget(): Promise<string> {
+  const today = new Date().toISOString().slice(0, 10);
+  const [w, strip, todos, events, wealth, markets] = await Promise.all([
+    fetchWeatherData("London").catch(() => null),
+    rentalQuery("calendar:getCalendarStrip", { accountSlug: null, startDate: today, days: 2 }),
+    q_hub("todos:list"),
+    q_hub("events:list"),
+    q_hub("wealth:getWealth"),
+    fetchMarketData(["bitcoin", "ethereum"], ["GC=F"]).catch(() => []),
+  ]);
+  const short = (s: string) => String(s || "").split(/[|,]/)[0].split(/\s+/).slice(0, 4).join(" ");
+  const day0 = Array.isArray(strip) ? strip[0] : null;
+  const rentalLines: string[] = [];
+  if (day0) {
+    rentalLines.push(`${(day0.away ?? []).length} out`);
+    for (const p of (day0.pickups ?? []).slice(0, 4)) rentalLines.push(`pickup: ${short(p.items?.[0]?.name ?? p.imageAlt)}${p.pickupTime ? " " + p.pickupTime : ""}`);
+    for (const r of (day0.returns ?? []).slice(0, 4)) rentalLines.push(`return: ${short(r.items?.[0]?.name ?? r.imageAlt)}`);
+  }
+  const openTodos = (Array.isArray(todos) ? todos : []).filter((t: any) => !t.done);
+  const now = Date.now();
+  const upcoming = (Array.isArray(events) ? events : [])
+    .filter((e: any) => (e.start ?? 0) >= now)
+    .sort((a: any, b: any) => a.start - b.start)
+    .slice(0, 3);
+  const widget = {
+    kind: "briefing",
+    date: new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" }),
+    weather: w ? { icon: w.icon, temp: w.temp, desc: w.desc, place: w.place } : null,
+    wealth: wealth && typeof wealth.currentTotalGBP === "number" ? Math.round(wealth.currentTotalGBP) : null,
+    sections: [
+      { title: "rentals today", lines: rentalLines.length ? rentalLines : ["nothing scheduled"] },
+      {
+        title: `to-dos (${openTodos.length} open)`,
+        lines: openTodos.slice(0, 5).map((t: any) => String(t.text).slice(0, 60)),
+      },
+      {
+        title: "coming up",
+        lines: upcoming.length
+          ? upcoming.map((e: any) => `${e.title} — ${new Date(e.start).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}`)
+          : ["nothing on the calendar"],
+      },
+      {
+        title: "markets",
+        lines: (markets ?? []).map((r: any) => `${r.label}: ${r.unit}${r.price.toLocaleString("en-GB")} (${r.change >= 0 ? "+" : ""}${r.change}%)`),
+      },
+    ],
+  };
+  await showWidget(widget, `briefing · ${today}`);
+  const spoken = [
+    w ? `${w.temp} degrees and ${w.desc}` : "",
+    day0 ? `${(day0.pickups ?? []).length} pickups and ${(day0.returns ?? []).length} returns today` : "",
+    `${openTodos.length} to-dos open`,
+    widget.wealth ? `net worth about £${widget.wealth.toLocaleString("en-GB")}` : "",
+  ]
+    .filter(Boolean)
+    .join(", ");
+  return `Briefing on screen. Summary: ${spoken}. (Speak two short sentences max.)`;
+}
+
+// project-hub reads (todos/calendar/wealth live there)
+async function q_hub(path: string): Promise<any> {
+  try {
+    const r = await fetch("https://fantastic-roadrunner-485.convex.cloud/api/query", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path, args: {}, format: "json" }),
+    });
+    return (await r.json()).value;
+  } catch {
+    return null;
   }
 }
 
@@ -591,6 +773,12 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await rentalStats();
     case "weather":
       return await weatherWidget(args);
+    case "market":
+      return await marketWidget(args);
+    case "timer":
+      return await timerWidget(args);
+    case "briefing":
+      return await briefingWidget();
     case "clear_chat": {
       const t = await activeThread();
       const n = await convexMutation("chatQueue:clearThread", { threadId: t });
