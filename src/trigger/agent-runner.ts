@@ -358,13 +358,18 @@ export const agentRunner = schedules.task({
         let pushNote = "";
         if (repoDir && token && !job.readonly) {
           const pushUrl = `https://x-access-token:${token}@github.com/${repo}.git`;
+          // Sweep up any uncommitted leftovers (agents usually commit themselves).
           await sh("git", ["-C", repoDir, "add", "-A"], env);
-          const commit = await sh(
+          await sh(
             "git",
             ["-C", repoDir, "commit", "-m", `chore: jarvis agent — ${job.task.slice(0, 60).replace(/"/g, "'")}`],
             env,
           );
-          if (/nothing to commit/i.test(commit.out)) {
+          // ALWAYS push when HEAD moved — the agent may have committed on its
+          // own; only pushing after a runner-side commit stranded agent commits.
+          const local = (await sh("git", ["-C", repoDir, "rev-parse", "HEAD"], env)).out.trim();
+          const remote = (await sh("git", ["-C", repoDir, "ls-remote", pushUrl, "HEAD"], env)).out.split(/\s/)[0]?.trim();
+          if (local && remote && local === remote) {
             pushNote = " · no changes made";
           } else {
             let push = await sh("git", ["-C", repoDir, "push", pushUrl, "HEAD"], env);
