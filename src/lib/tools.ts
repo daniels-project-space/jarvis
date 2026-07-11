@@ -9,7 +9,7 @@ export const TOOL_DEFS = [
   {
     name: "dispatch_agent",
     description:
-      "Launch a background Claude Code agent for real work: research a topic, watch/analyse a YouTube video, fix or build something in a repo, dig through code. It has web access, all of Daniel's repos, and the secrets vault. Returns immediately; the result gets woven into conversation when ready (a few minutes).",
+      "Launch a background Claude Code agent for work that genuinely needs minutes: deep research across sources, fixing or building something in a repo, digging through code. It has web access, all of Daniel's repos, and the secrets vault. Returns immediately; the result gets woven into conversation when ready (a few minutes). Do NOT dispatch for quick lookups you can do yourself right now (youtube_search, youtube_transcript, web_search, read_url), and never re-dispatch a topic a fresh agent finding already covers.",
     parameters: {
       type: "object",
       properties: {
