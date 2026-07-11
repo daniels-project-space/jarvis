@@ -228,7 +228,10 @@ export default function JarvisUI() {
         body: JSON.stringify({ signature: sig, message: msg }),
       }).catch(() => {});
     };
-    const onErr = (e: ErrorEvent) => report(`client:${String(e.message).slice(0, 80)}`, `${e.message} @ ${e.filename}:${e.lineno}`);
+    const onErr = (e: ErrorEvent) => {
+      if (e.message === "Script error." || !e.message) return; // cross-origin iframe noise, unactionable
+      report(`client:${String(e.message).slice(0, 80)}`, `${e.message} @ ${e.filename}:${e.lineno}`);
+    };
     const onRej = (e: PromiseRejectionEvent) =>
       report(`client:rejection:${String(e.reason).slice(0, 80)}`, `Unhandled rejection: ${String(e.reason).slice(0, 400)}`);
     window.addEventListener("error", onErr);

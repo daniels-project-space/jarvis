@@ -60,6 +60,33 @@ export const list = query({
   },
 });
 
+// Reaper: a Trigger run killed at maxDuration strands its job as "running"
+// forever. Requeue stale ones (15+ min); give up honestly after 2h total.
+export const reapStale = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const running = await ctx.db
+      .query("jobs")
+      .withIndex("by_status", (q: any) => q.eq("status", "running"))
+      .collect();
+    const now = Date.now();
+    const requeued: string[] = [];
+    const abandoned: string[] = [];
+    for (const j of running) {
+      const startedAt = j.startedAt ?? j.createdAt;
+      if (now - startedAt < 15 * 60 * 1000) continue;
+      if (now - j.createdAt > 2 * 60 * 60 * 1000) {
+        await ctx.db.patch(j._id, { status: "error", result: "abandoned: runner died repeatedly" });
+        abandoned.push(j.task.slice(0, 80));
+      } else {
+        await ctx.db.patch(j._id, { status: "pending", startedAt: undefined, progress: "requeued after a stalled run" });
+        requeued.push(j.task.slice(0, 80));
+      }
+    }
+    return { requeued, abandoned };
+  },
+});
+
 // Live activity line the agent-runner streams as it works.
 export const updateProgress = mutation({
   args: { jobId: v.id("jobs"), progress: v.string() },

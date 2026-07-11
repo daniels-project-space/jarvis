@@ -273,6 +273,12 @@ export const agentRunner = schedules.task({
     // Self-healing sweep: open incidents become root-cause repair jobs (attempt-
     // capped); exhausted ones escalate to Daniel instead of looping forever.
     try {
+      const reaped: any = await convexMutation("jobs:reapStale", {});
+      for (const t of reaped?.abandoned ?? [])
+        await convexMutation("chatQueue:postAssistant", {
+          threadId: "main",
+          text: `I have to be honest, sir — the background job "${t}" kept dying on me and I've stopped retrying it.`,
+        }).catch(() => {});
       const healer: any = await convexMutation("incidents:claimForRepair", { limit: 2, maxAttempts: 2 });
       for (const inc of healer?.claims ?? []) {
         const repo = inc.app && inc.app !== "jarvis" ? inc.app : "jarvis";
@@ -313,7 +319,10 @@ export const agentRunner = schedules.task({
 
     let processed = 0;
     const started = Date.now();
-    while (Date.now() - started < 220_000) {
+    // Claim window must leave room for a full 600s agent run inside the 900s
+    // task ceiling — a run killed at maxDuration strands its job (reaper fixes,
+    // but don't cause it).
+    while (Date.now() - started < 120_000) {
       const job: any = await convexMutation("jobs:claimNext", {});
       if (!job) break;
       try {
