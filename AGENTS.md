@@ -14,4 +14,12 @@ Two-lane brain, one personality (`src/lib/persona.ts`):
 - **Memory** — Convex `memory` table (fast recall, injected per turn) + post-turn extraction in `/api/chat`; consolidated every 6h into the git-backed Obsidian vault `daniels-project-space/jarvis-memory` (`src/trigger/memory-vault.ts`).
 - **Screen** — `ui:setPanel` (types: url | video | image | code | markdown) drives the materializing viewport in `JarvisUI.tsx`; both the brain (`show` tool) and agents can set it.
 
+- **Self-maintenance** — the brain's `self_repair` tool (and automatic incident reports from routes, the client, and the stack poller into the Convex `incidents` table) dispatch root-cause repair agents via the healer sweep in `agent-runner.ts` (attempt-capped at 2, then escalates to Daniel). `self_improve` dispatches an engineer on this repo to add capabilities/UI; Vercel auto-deploys validated commits.
+
+## Self-modification checklist (for agents editing this repo)
+1. New ability = tool in `src/lib/tools.ts` (TOOL_DEFS + executeTool — both lanes pick it up), route in `src/app/api/`, or UI in `src/components/JarvisUI.tsx`. Keep the design language (cockpit HUD, cyan/amber, Chakra Petch/Sora).
+2. Validate before committing: `npm install`, then `npx tsc --noEmit` and `npm run build` must both pass. Never commit broken code.
+3. `convex/` and `src/trigger/` changes do NOT deploy from here (need VPS `npx convex dev --once` / `npx trigger.dev deploy`) — avoid when possible, otherwise say so plainly in your final answer.
+4. Never remove existing capabilities; commit messages start `self-repair:` or `self-improve:`.
+
 Deploy: push to main → Vercel. `npx convex deploy` for convex/. `npx trigger.dev deploy` for src/trigger/ (project `jarvis-jobs`, needs `TRIGGER_ACCESS_TOKEN`). Env on Vercel: GROQ_API_KEY, OPENAI_API_KEY, ELEVENLABS_API_KEY, SERPAPI_KEY, REPLICATE_API_TOKEN, NEXT_PUBLIC_CONVEX_URL (+ VAPID keys for push). Anything missing is pulled from the secrets vault at runtime (`src/lib/vault.ts`).

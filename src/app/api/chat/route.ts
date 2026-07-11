@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { PERSONA, INFRA_MAP } from "@/lib/persona";
-import { buildContext, convexMutation } from "@/lib/context";
+import { buildContext, convexMutation, reportIncident } from "@/lib/context";
 import { extractMemory } from "@/lib/extract";
 import { TOOL_DEFS, executeTool } from "@/lib/tools";
 import { getSecret } from "@/lib/vault";
@@ -110,6 +110,7 @@ export async function POST(req: NextRequest) {
     await extractMemory(key, text, final);
     return Response.json({ ok: true, text: final, tools: used });
   } catch (e: any) {
+    await reportIncident("api/chat", `chat:${String(e?.message ?? e).slice(0, 80)}`, String(e?.message ?? e));
     // Let the Trigger cron dispatcher pick this up instead of dropping the turn:
     // mark the streaming row as an apology, re-queue the user text as pending.
     await convexMutation("chatQueue:finalize", {

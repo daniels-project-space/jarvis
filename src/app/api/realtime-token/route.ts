@@ -14,7 +14,7 @@ export async function POST() {
   if (!key) return Response.json({ error: "no openai key" }, { status: 500 });
 
   const ctx = await buildContext();
-  const instructions = `${PERSONA}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${ctx.block}\n\nCurrent date: ${new Date().toDateString()}. This is a live voice conversation — replies of one or two short sentences, always.`;
+  const instructions = `${PERSONA}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${ctx.block}\n\nCurrent date: ${new Date().toDateString()}. This is a live voice conversation — replies of one or two short sentences, always. Daniel speaks English: treat everything you hear as English and reply ONLY in English, whatever it sounds like.`;
 
   const r = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
     method: "POST",
@@ -25,7 +25,10 @@ export async function POST() {
         model: process.env.REALTIME_MODEL || "gpt-realtime-mini",
         instructions,
         audio: {
-          input: { transcription: { model: "whisper-1" }, turn_detection: { type: "semantic_vad", eagerness: "medium" } },
+          input: {
+            transcription: { model: "whisper-1", language: "en" }, // English-only recognition
+            turn_detection: { type: "semantic_vad", eagerness: "medium" },
+          },
           output: { voice: process.env.REALTIME_VOICE || "ballad" },
         },
         tools: TOOL_DEFS.map((t) => ({ type: "function", ...t })),

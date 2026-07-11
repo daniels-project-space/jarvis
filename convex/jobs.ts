@@ -8,6 +8,7 @@ export const enqueue = mutation({
     readonly: v.optional(v.boolean()),
     model: v.optional(v.string()),
     mcp: v.optional(v.array(v.string())),
+    incidentId: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     return await ctx.db.insert("jobs", {
@@ -16,6 +17,7 @@ export const enqueue = mutation({
       readonly: a.readonly,
       model: a.model,
       mcp: a.mcp,
+      incidentId: a.incidentId,
       status: "pending",
       createdAt: Date.now(),
     });
@@ -38,6 +40,7 @@ export const claimNext = mutation({
       readonly: j.readonly ?? false,
       model: j.model ?? null,
       mcp: j.mcp ?? [],
+      incidentId: j.incidentId ?? null,
     };
   },
 });

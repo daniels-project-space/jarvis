@@ -70,6 +70,7 @@ export default defineSchema({
     readonly: v.optional(v.boolean()), // if true, runner never commits/pushes
     model: v.optional(v.string()), // optional model override (haiku|sonnet|opus)
     mcp: v.optional(v.array(v.string())), // MCP servers to attach (playwright, context7)
+    incidentId: v.optional(v.string()), // set on self-repair jobs → resolves the incident on success
     progress: v.optional(v.string()), // live activity line the runner streams
     startedAt: v.optional(v.number()),
     createdAt: v.number(),
@@ -113,6 +114,23 @@ export default defineSchema({
     status: v.string(), // "fresh" | "woven"
     createdAt: v.number(),
   }).index("by_status", ["status", "createdAt"]),
+
+  // Self-healing: anything that breaks (client errors, route failures, dead
+  // deploys, brain-reported malfunctions) lands here; the healer turns open
+  // incidents into root-cause repair jobs with attempt caps.
+  incidents: defineTable({
+    source: v.string(), // "client" | "api/chat" | "api/tools" | "stack-poller" | "agent-runner" | "brain"
+    app: v.optional(v.string()), // affected repo/app (default jarvis)
+    signature: v.string(), // dedup key
+    message: v.string(),
+    count: v.number(),
+    status: v.string(), // "open" | "dispatched" | "resolved" | "needs-daniel"
+    attempts: v.number(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_status", ["status", "updatedAt"])
+    .index("by_signature", ["signature"]),
 
   // Proactive insights the insight engine generates + surfaces (chat/notification).
   insights: defineTable({

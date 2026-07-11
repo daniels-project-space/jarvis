@@ -33,6 +33,16 @@ export async function convexMutation(path: string, args: unknown): Promise<any> 
 
 export const convexQuery = (path: string, args: unknown = {}) => q(CONVEX_URL, path, args);
 
+// Self-healing hook: anything server-side that breaks files an incident; the
+// healer (agent-runner) turns open incidents into root-cause repair agents.
+export async function reportIncident(source: string, signature: string, message: string, app?: string) {
+  try {
+    await convexMutation("incidents:report", { source, signature, message, app });
+  } catch {
+    /* never let telemetry break the caller */
+  }
+}
+
 export async function buildContext(userText?: string): Promise<{ block: string; freshFindingIds: string[] }> {
   const [memHit, memRecent, biz, stack, todos, events, wealth, jobs, findings] = await Promise.all([
     userText ? q(CONVEX_URL, "memory:search", { q: userText, limit: 8 }) : null,

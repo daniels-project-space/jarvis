@@ -247,6 +247,21 @@ function resolveRepo(name: string): string {
   return `daniels-project-space/${n}`; // default org
 }
 
+// Root-cause repair briefing for self-healing jobs.
+export function repairPrompt(inc: { source: string; message: string; signature: string; count: number; attempts: number }, repo: string): string {
+  return (
+    `SELF-REPAIR (attempt ${inc.attempts}): something in Daniel's system is broken — trace the ROOT CAUSE and fix it. ` +
+    `Never paper over symptoms.\n\n` +
+    `Incident (source: ${inc.source}, seen ${inc.count}x): ${inc.message}\n\n` +
+    `Method, in order: 1) REPRODUCE — hit the live endpoints (e.g. curl https://jarvis-orcin-six.vercel.app/api/...) ` +
+    `or read the failing path until you can explain the error. 2) Trace to the underlying cause in the code of ${repo}. ` +
+    `3) Apply the MINIMAL correct fix. 4) VALIDATE: run "npx tsc --noEmit" and it must pass; if you changed app code run "npm install" then "npm run build" and it must pass. ` +
+    `5) Commit ONLY working code with a message starting "self-repair:". ` +
+    `If the true fix needs convex/ or src/trigger/ redeploy (you cannot deploy those), still commit and SAY SO plainly. ` +
+    `If you cannot find the root cause, do NOT guess-edit — say exactly what you ruled out and what you suspect.`
+  );
+}
+
 export const agentRunner = schedules.task({
   id: "jarvis-agent-runner",
   cron: "*/2 * * * *",
@@ -254,6 +269,30 @@ export const agentRunner = schedules.task({
   run: async () => {
     const bin = resolveClaudeBin();
     if (!bin) return { processed: 0, error: "no claude binary" };
+
+    // Self-healing sweep: open incidents become root-cause repair jobs (attempt-
+    // capped); exhausted ones escalate to Daniel instead of looping forever.
+    try {
+      const healer: any = await convexMutation("incidents:claimForRepair", { limit: 2, maxAttempts: 2 });
+      for (const inc of healer?.claims ?? []) {
+        const repo = inc.app && inc.app !== "jarvis" ? inc.app : "jarvis";
+        await convexMutation("jobs:enqueue", {
+          task: repairPrompt(inc, repo),
+          repo,
+          model: "opus",
+          incidentId: String(inc.id),
+        });
+      }
+      for (const esc of healer?.escalations ?? []) {
+        await convexMutation("chatQueue:postAssistant", {
+          threadId: "main",
+          text: `Sir, I've had two goes at fixing "${String(esc.message).slice(0, 120)}" and it's still misbehaving — this one needs your eyes.`,
+        });
+        await sendPush("JARVIS needs you", String(esc.message).slice(0, 120), "/");
+      }
+    } catch {
+      /* healer must never block normal jobs */
+    }
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: "/tmp/claude-home", ANTHROPIC_API_KEY: "" };
     mkdirSync("/tmp/claude-home/.claude", { recursive: true });
     const token = process.env.GITHUB_TOKEN ?? "";
@@ -340,6 +379,15 @@ export const agentRunner = schedules.task({
 
         const status = cloneFailed ? "error" : "done";
         await convexMutation("jobs:finalize", { jobId: job.jobId, status, result: result.slice(0, 4000) });
+        // Self-repair bookkeeping: success resolves the incident; failure reopens
+        // it so the healer retries (attempt cap prevents loops).
+        if (job.incidentId) {
+          const fixed = !cloneFailed && !/push FAILED/.test(pushNote);
+          await convexMutation("incidents:setStatus", {
+            id: job.incidentId,
+            status: fixed ? "resolved" : "open",
+          }).catch(() => {});
+        }
 
         // Weave, don't dump: one natural spoken line into chat + the full detail
         // as a finding the brain can pull up ("show me what it found").
@@ -358,6 +406,8 @@ export const agentRunner = schedules.task({
         processed += 1;
       } catch (e: any) {
         await convexMutation("jobs:finalize", { jobId: job.jobId, status: "error", result: String(e?.message ?? e) });
+        if (job.incidentId)
+          await convexMutation("incidents:setStatus", { id: job.incidentId, status: "open" }).catch(() => {});
         await convexMutation("chatQueue:postAssistant", {
           threadId: "main",
           text: `⚠️ Agent failed: ${String(e?.message ?? e).slice(0, 300)}`,

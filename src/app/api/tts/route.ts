@@ -1,4 +1,5 @@
 import type { NextRequest } from "next/server";
+import { reportIncident } from "@/lib/context";
 import { getSecret } from "@/lib/vault";
 
 // Server TTS for the text lane (live mode speaks natively via OpenAI Realtime).
@@ -87,6 +88,9 @@ export async function POST(req: NextRequest) {
   if (!clean) return new Response("empty", { status: 400 });
 
   const res = (await elevenlabs(clean)) ?? (await kokoro(clean));
-  if (!res) return new Response(JSON.stringify({ error: "tts failed" }), { status: 502 });
+  if (!res) {
+    await reportIncident("api/tts", "tts:all-providers-failed", "Both ElevenLabs and Kokoro TTS failed to produce audio.");
+    return new Response(JSON.stringify({ error: "tts failed" }), { status: 502 });
+  }
   return res;
 }

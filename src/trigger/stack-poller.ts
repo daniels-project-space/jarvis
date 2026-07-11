@@ -91,13 +91,21 @@ export const stackPoller = schedules.task({
       });
       polled++;
     }
-    // Proactive alert: JARVIS pings unprompted when a deploy newly breaks.
+    // Self-healing: a newly-broken deploy files an incident (the healer
+    // dispatches a root-cause repair agent within ~2 min) and tells Daniel.
     if (newlyBroken.length) {
+      for (const app of newlyBroken)
+        await convexMutation("incidents:report", {
+          source: "stack-poller",
+          app,
+          signature: `deploy-failed:${app}`,
+          message: `Vercel production deploy for ${app} is in ERROR state.`,
+        });
       await convexMutation("chatQueue:postAssistant", {
         threadId: "main",
-        text: `⚠️ Heads up, sir — a deploy just failed: ${newlyBroken.join(", ")}. Shall I dispatch an agent to investigate?`,
+        text: `Heads up, sir — ${newlyBroken.join(" and ")} just failed to deploy. I'm sending an engineer in to trace it and fix it now.`,
       });
-      await sendPush("⚠️ Deploy failed", `${newlyBroken.join(", ")} — tap to open JARVIS.`, "/");
+      await sendPush("⚠️ Deploy failed", `${newlyBroken.join(", ")} — repair agent dispatched.`, "/");
     }
     return { polled, newlyBroken };
   },

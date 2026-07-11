@@ -215,6 +215,30 @@ export default function JarvisUI() {
     import("../lib/push").then((m) => m.registerSW());
   }, []);
 
+  // Self-healing: uncaught client errors feed the incident pipeline (max 3
+  // distinct per session so an error storm can't spam it).
+  useEffect(() => {
+    const seen = new Set<string>();
+    const report = (sig: string, msg: string) => {
+      if (seen.size >= 3 || seen.has(sig)) return;
+      seen.add(sig);
+      void fetch("/api/incident", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ signature: sig, message: msg }),
+      }).catch(() => {});
+    };
+    const onErr = (e: ErrorEvent) => report(`client:${String(e.message).slice(0, 80)}`, `${e.message} @ ${e.filename}:${e.lineno}`);
+    const onRej = (e: PromiseRejectionEvent) =>
+      report(`client:rejection:${String(e.reason).slice(0, 80)}`, `Unhandled rejection: ${String(e.reason).slice(0, 400)}`);
+    window.addEventListener("error", onErr);
+    window.addEventListener("unhandledrejection", onRej);
+    return () => {
+      window.removeEventListener("error", onErr);
+      window.removeEventListener("unhandledrejection", onRej);
+    };
+  }, []);
+
   // Speak new finalized assistant messages (text lane). Live-lane rows were
   // already spoken by the realtime session; while live is on, nudge the live
   // session to voice out-of-band lines (agent findings) instead of local TTS.

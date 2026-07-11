@@ -80,7 +80,42 @@ export const TOOL_DEFS = [
     description: "What background agents are doing right now + latest findings.",
     parameters: { type: "object", properties: {} },
   },
+  {
+    name: "self_repair",
+    description:
+      "Something is BROKEN (in JARVIS itself or any of Daniel's apps): file it and dispatch a repair engineer immediately to reproduce it, trace the root cause and fix it. Use whenever Daniel reports a malfunction or you notice a tool/feature failing repeatedly. Tell him one casual line that you're on it.",
+    parameters: {
+      type: "object",
+      properties: {
+        problem: { type: "string", description: "What's broken, with every detail Daniel gave (exact behaviour, when it happens)" },
+        app: { type: "string", description: "Affected app/repo if it's not JARVIS itself (e.g. music-house)" },
+      },
+      required: ["problem"],
+    },
+  },
+  {
+    name: "self_improve",
+    description:
+      "Upgrade JARVIS himself: add a new tool/capability, improve the UI or design, extend behaviour. Dispatches an engineer on the jarvis repo; validated changes go live automatically within ~5 minutes. Use when Daniel asks for an ability you don't have, or you keep missing one.",
+    parameters: {
+      type: "object",
+      properties: {
+        request: { type: "string", description: "The capability or improvement, specific and self-contained" },
+      },
+      required: ["request"],
+    },
+  },
 ];
+
+// Self-modification briefing — how an engineer safely upgrades JARVIS itself.
+const SELF_IMPROVE_RULES =
+  "You are upgrading JARVIS — Daniel's personal AI (this repo). Read AGENTS.md first; follow the existing architecture " +
+  "and design language (cockpit HUD, cyan/amber, Chakra Petch/Sora). New abilities usually mean: a tool in src/lib/tools.ts " +
+  "(add to TOOL_DEFS + executeTool — both lanes pick it up automatically), a route in src/app/api/, or UI in " +
+  "src/components/JarvisUI.tsx. VALIDATE before committing: run 'npm install' then 'npx tsc --noEmit' (must pass) and " +
+  "'npm run build' (must pass). Commit only working code, message starting 'self-improve:'. Vercel deploys it automatically. " +
+  "If the change truly requires convex/ schema or src/trigger/ edits, keep them minimal and state clearly in your final " +
+  "answer that they need a manual deploy. Never remove existing capabilities.";
 
 const YT_ID = (s: string) => {
   const m = String(s).match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([\w-]{11})/) ?? String(s).match(/^([\w-]{11})$/);
@@ -255,6 +290,40 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return Array.isArray(rows) && rows.length
         ? rows.map((m: any) => `[${m.kind}] ${m.title}: ${m.body}`).join("\n")
         : "Nothing in memory for that.";
+    }
+    case "self_repair": {
+      const problem = String(args.problem ?? "").slice(0, 1200);
+      if (!problem) return "Tell me what's broken first.";
+      const app = args.app ? String(args.app) : undefined;
+      const incidentId = await convexMutation("incidents:report", {
+        source: "brain",
+        app,
+        signature: `brain:${problem.slice(0, 100)}`,
+        message: problem,
+      });
+      // Dispatch immediately — don't wait for the healer sweep.
+      await convexMutation("incidents:setStatus", { id: incidentId, status: "dispatched" }).catch(() => {});
+      await convexMutation("jobs:enqueue", {
+        task:
+          `SELF-REPAIR: trace the ROOT CAUSE and fix it — never paper over symptoms. Daniel reports: ${problem}\n` +
+          `Method: 1) REPRODUCE (hit live endpoints, read the failing path). 2) Trace to the underlying cause. ` +
+          `3) Minimal correct fix. 4) VALIDATE: 'npm install' + 'npx tsc --noEmit' must pass; 'npm run build' must pass for app code. ` +
+          `5) Commit only working code ("self-repair: ..."). If it needs convex/ or src/trigger/ redeploy, commit and say so plainly.`,
+        repo: app ?? "jarvis",
+        model: "opus",
+        incidentId: String(incidentId),
+      });
+      return "Repair engineer dispatched — it'll trace the root cause and the fix goes live automatically. Result gets woven in here.";
+    }
+    case "self_improve": {
+      const request = String(args.request ?? "").slice(0, 1500);
+      if (!request) return "Tell me what ability to build first.";
+      await convexMutation("jobs:enqueue", {
+        task: `${SELF_IMPROVE_RULES}\n\nThe upgrade Daniel wants: ${request}`,
+        repo: "jarvis",
+        model: "opus",
+      });
+      return "Upgrade engineer dispatched on my own code — validated changes deploy automatically in a few minutes.";
     }
     case "agent_status": {
       const [active, recent] = await Promise.all([convexQuery("jobs:active", {}), convexQuery("findings:recent", { limit: 4 })]);
