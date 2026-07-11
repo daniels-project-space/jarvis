@@ -7,10 +7,10 @@ import { useEffect, useRef } from "react";
 type State = "idle" | "listening" | "thinking" | "speaking";
 
 const PAL: Record<State, { a: string; b: string; accent: string; bloom: number; amp: number }> = {
-  idle: { a: "#0a84ff", b: "#0044aa", accent: "#38e8ff", bloom: 0.75, amp: 0.2 },
-  listening: { a: "#00e0ff", b: "#0077ff", accent: "#a0f8ff", bloom: 1.0, amp: 0.3 },
-  thinking: { a: "#8a5cff", b: "#5a2fd8", accent: "#c9a8ff", bloom: 1.1, amp: 0.28 },
-  speaking: { a: "#00ffc8", b: "#00a2ff", accent: "#eafff8", bloom: 1.35, amp: 0.42 },
+  idle: { a: "#18a0ff", b: "#0a3aa8", accent: "#5cf0ff", bloom: 0.52, amp: 0.16 },
+  listening: { a: "#00e0ff", b: "#0077ff", accent: "#a0f8ff", bloom: 0.62, amp: 0.28 },
+  thinking: { a: "#9a6cff", b: "#5a2fd8", accent: "#d0b0ff", bloom: 0.66, amp: 0.28 },
+  speaking: { a: "#00ffc8", b: "#00a2ff", accent: "#eafff8", bloom: 0.85, amp: 0.4 },
 };
 
 const VERT = /* glsl */ `
@@ -67,9 +67,9 @@ void main(){
   float fres = pow(1.0 - max(dot(N,V),0.0), 2.5);
   vec3 col = mix(uColorA, uColorB, fres);
   col = mix(col, uColorAccent, smoothstep(0.15,0.5,vDisp) * (0.5 + uTreble));
-  float intensity = 0.7 + fres*1.8 + uLevel*1.2;
+  float intensity = 0.42 + fres*1.7 + uLevel*0.7;
   col *= intensity;
-  col += uColorA * (0.15 + 0.25*uLevel);
+  col += uColorA * (0.1 + 0.15*uLevel);
   gl_FragColor = vec4(col, 1.0);
 }`;
 
@@ -111,7 +111,7 @@ export default function ThreeOrb({
       renderer.setSize(w(), h());
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
-      renderer.toneMappingExposure = 1.0;
+      renderer.toneMappingExposure = 0.95;
       mount.appendChild(renderer.domElement);
 
       const scene = new THREE.Scene();
@@ -149,13 +149,26 @@ export default function ThreeOrb({
       }
       const pg = new THREE.BufferGeometry();
       pg.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      // soft round sprite (radial gradient) so particles read as glowing dust, not squares
+      const cvs = document.createElement("canvas");
+      cvs.width = cvs.height = 64;
+      const g2 = cvs.getContext("2d")!;
+      const grad = g2.createRadialGradient(32, 32, 0, 32, 32, 32);
+      grad.addColorStop(0, "rgba(255,255,255,1)");
+      grad.addColorStop(0.4, "rgba(255,255,255,0.5)");
+      grad.addColorStop(1, "rgba(255,255,255,0)");
+      g2.fillStyle = grad;
+      g2.fillRect(0, 0, 64, 64);
+      const dot = new THREE.CanvasTexture(cvs);
       const pm = new THREE.PointsMaterial({
-        size: 0.03,
-        color: lin("#4fd8ff"),
+        size: 0.045,
+        map: dot,
+        color: lin("#7fe4ff"),
         transparent: true,
-        opacity: 0.9,
+        opacity: 0.6,
         blending: THREE.AdditiveBlending,
         depthWrite: false,
+        sizeAttenuation: true,
       });
       const halo = new THREE.Points(pg, pm);
       scene.add(halo);
@@ -166,7 +179,7 @@ export default function ThreeOrb({
       );
       composer.setPixelRatio(Math.min(window.devicePixelRatio || 1, prCap));
       composer.addPass(new RenderPass(scene, camera));
-      const bloom = new UnrealBloomPass(new THREE.Vector2(w(), h()), p0.bloom, 0.6, 0.15);
+      const bloom = new UnrealBloomPass(new THREE.Vector2(w(), h()), p0.bloom, 0.55, 0.2);
       composer.addPass(bloom);
       composer.addPass(new OutputPass());
 
@@ -212,7 +225,7 @@ export default function ThreeOrb({
 
         orb.rotation.y += 0.0016;
         halo.rotation.y += 0.0006 + lvl * 0.004;
-        pm.size = 0.03 + uniforms.uTreble.value * 0.05;
+        pm.size = 0.045 + uniforms.uTreble.value * 0.04;
 
         camera.position.x = Math.sin(t * 0.15) * 0.35;
         camera.position.y = Math.cos(t * 0.11) * 0.22;
