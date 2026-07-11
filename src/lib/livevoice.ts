@@ -41,6 +41,7 @@ export function isLiveVoiceOn() {
 }
 
 export async function startLiveVoice(opts: {
+  stream?: MediaStream;
   onTranscript: (text: string) => void;
   onState: (s: "listening" | "thinking" | "off") => void;
   isSpeaking: () => boolean;
@@ -49,6 +50,7 @@ export async function startLiveVoice(opts: {
   await warm();
   const { MicVAD } = await import("@ricky0123/vad-web");
   vad = await MicVAD.new({
+    ...(opts.stream ? { stream: opts.stream } : {}),
     // pin the onnxruntime wasm to 1.17.0 — newer builds OOM on iOS Safari
     onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/",
     baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@latest/dist/",

@@ -121,23 +121,42 @@ export default function JarvisUI() {
   }
 
   async function toggleLive() {
-    const m = await import("../lib/livevoice");
     if (live) {
-      m.stopLiveVoice();
+      (await import("../lib/livevoice")).stopLiveVoice();
       setLive(false);
       setListening(false);
       return;
     }
-    setLive(true);
+    // Ask for the mic FIRST, synchronously inside this tap — the browser only
+    // shows its permission prompt when getUserMedia runs within a user gesture
+    // (doing dynamic imports first drops the gesture and blocks the prompt).
+    if (!navigator.mediaDevices?.getUserMedia) {
+      alert("This browser can't do live voice. On iPhone, open JARVIS in Safari.");
+      return;
+    }
+    let stream: MediaStream;
     try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      alert(
+        "JARVIS needs microphone access for live voice. Please tap Allow — if you already blocked it, enable the mic for this site in your browser settings (iPhone: Settings → Safari → Microphone, or the ‘aA’ menu in the address bar).",
+      );
+      return;
+    }
+    setLive(true);
+    import("../lib/tts").then((m) => m.warm());
+    try {
+      const m = await import("../lib/livevoice");
       await m.startLiveVoice({
+        stream,
         onTranscript: (t) => submit(t),
         onState: (s) => setListening(s === "listening"),
         isSpeaking: () => speakingRef.current,
       });
     } catch {
+      stream.getTracks().forEach((t) => t.stop());
       setLive(false);
-      alert("Couldn't start live voice — allow microphone access and try again.");
+      alert("Couldn't start live voice. Please reload and try again.");
     }
   }
 

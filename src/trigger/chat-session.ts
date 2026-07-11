@@ -56,6 +56,21 @@ async function convexQuery(path: string, args: unknown) {
   });
   return (await r.json()).value;
 }
+// project-hub lives on a different Convex deployment (Daniel's dashboard: to-dos,
+// calendar, net worth, widgets, settings). Read-only awareness for the brain.
+const HUB_URL = "https://fantastic-roadrunner-485.convex.cloud";
+async function hubQuery(path: string) {
+  try {
+    const r = await fetch(`${HUB_URL}/api/query`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path, args: {}, format: "json" }),
+    });
+    return (await r.json()).value;
+  } catch {
+    return null;
+  }
+}
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 type Turn = { finalText: string; sessionId: string | null; code: number | null; stderr: string };
@@ -97,12 +112,13 @@ function runTurn(
     "real person SPEAKS. Absolutely NO markdown of any kind: no asterisks, no **bold**, no ## headings, no bullet " +
     "points or dashes as lists, no backticks or code fences, no emoji, no smileys, no stage directions, no URLs read " +
     "out. If you must list things, say them as a natural spoken sentence ('you've got three rentals out and one " +
-    "coming back Friday'). Write numbers and money the way you'd say them aloud. Keep it concise, natural, and human — " +
-    "one to four sentences unless he asks for depth. Never say 'as an AI', never narrate your process. Never fabricate. " +
+    "coming back Friday'). Write numbers and money the way you'd say them aloud. BE BRIEF — answer in ONE short " +
+    "sentence, two at the very most. Lead with the answer, cut every non-essential word, no preamble or sign-off. " +
+    "Only give a longer breakdown if he explicitly asks for detail or 'the full picture'. Never say 'as an AI', never narrate your process. Never fabricate. " +
     (memoryContext ? `Relevant long-term memory:\n${memoryContext}\n` : "") +
     (stackContext ? `Current cloud-stack (Vercel deploy states): ${stackContext}\n` : "") +
     (businessContext
-      ? `Live business metrics — when Daniel asks how things are doing (rentals, items, music, money), speak naturally from these real numbers, don't recite them like a table:\n${businessContext}\n`
+      ? `What you know about Daniel right now — his businesses (rentals, items, music), his to-do list, his calendar, his net worth and dashboard. When he asks about his tasks, schedule, money, or how things are doing, answer briefly and naturally from these real facts, never recite them like a table:\n${businessContext}\n`
       : "") +
     `To DISPATCH a background agent (ONLY when Daniel asks you to run/build/action/fix something in the ` +
     `background or on a repo), run this bash, then tell him it's dispatched and you'll report back when done: ` +
@@ -272,6 +288,12 @@ export const chatDispatcher = schedules.task({
             : "";
         const biz: any = await convexQuery("business:list", {}).catch(() => []);
         const ins: any = await convexQuery("business:recentInsights", { limit: 5 }).catch(() => []);
+        const [todos, events, wealth, widgets] = await Promise.all([
+          hubQuery("todos:list"),
+          hubQuery("events:list"),
+          hubQuery("wealth:getWealth"),
+          hubQuery("widgets:list"),
+        ]);
         const bizLines = Array.isArray(biz)
           ? biz.map((b: any) => `${b.headline}${b.detail ? " " + b.detail : ""}`).join("\n")
           : "";
@@ -279,7 +301,33 @@ export const chatDispatcher = schedules.task({
           Array.isArray(ins) && ins.length
             ? "Insights you've noticed recently:\n" + ins.map((i: any) => `- ${i.text}`).join("\n")
             : "";
-        const businessContext = [bizLines, insLines].filter(Boolean).join("\n").slice(0, 1800);
+        const now = Date.now();
+        const openTodos = Array.isArray(todos) ? todos.filter((t: any) => !t.done) : [];
+        const todoLine = openTodos.length
+          ? `To-do list (${openTodos.length} open): ${openTodos.slice(0, 10).map((t: any) => t.text).join("; ")}`
+          : "To-do list is clear.";
+        const upcoming = Array.isArray(events)
+          ? events
+              .filter((e: any) => (e.start ?? 0) >= now)
+              .sort((a: any, b: any) => a.start - b.start)
+              .slice(0, 5)
+          : [];
+        const calLine = upcoming.length
+          ? "Calendar coming up: " +
+            upcoming.map((e: any) => `${e.title} on ${new Date(e.start).toDateString()}`).join("; ")
+          : "Nothing on the calendar coming up.";
+        const wealthLine =
+          wealth && typeof wealth.currentTotalGBP === "number"
+            ? `Net worth is about £${Math.round(wealth.currentTotalGBP).toLocaleString("en-GB")}.`
+            : "";
+        const widgetLine =
+          Array.isArray(widgets) && widgets.length
+            ? `Dashboard widgets: ${widgets.filter((w: any) => w.enabled !== false).map((w: any) => w.type).join(", ")}.`
+            : "";
+        const hubLines = ["Daniel's personal hub —", todoLine, calLine, wealthLine, widgetLine]
+          .filter(Boolean)
+          .join("\n");
+        const businessContext = [bizLines, insLines, hubLines].filter(Boolean).join("\n").slice(0, 2600);
         const model = pickModel(claim.userText);
         const turn = await runTurn(
           bin,

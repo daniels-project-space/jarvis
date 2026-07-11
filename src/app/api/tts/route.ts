@@ -1,14 +1,14 @@
 import type { NextRequest } from "next/server";
 
-// Server-side TTS: Kokoro-82M fp32 (open model) via Replicate. Runs espeak-ng
-// phonemization in a real Linux env — fixes the iOS-Safari WASM garbling that
-// made in-browser kokoro-js speak gibberish. Returns clean WAV to the client.
+// Server-side TTS. Primary = Chatterbox (Resemble AI, MIT open-weight) — the more
+// human/advanced voice. Fallback = Kokoro-82M (open, Apache) for speed/resilience.
+// Both run server-side (no iOS WASM garbling) and strip markup before synthesis.
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const VERSION = "f559560eb822dc509045f3921a1921234918b91739db4bf3daab2169b71c7a13";
+const CHATTERBOX = "1b8422bc49635c20d0a84e387ed20879c0dd09254ecdb4e75dc4bec10ff94e97";
+const KOKORO = "f559560eb822dc509045f3921a1921234918b91739db4bf3daab2169b71c7a13";
 
-// Strip everything a human wouldn't say aloud, so the voice never reads markup.
 function stripForSpeech(t: string): string {
   return t
     .replace(/```[\s\S]*?```/g, " ")
@@ -32,6 +32,22 @@ function stripForSpeech(t: string): string {
     .trim();
 }
 
+async function render(version: string, input: Record<string, unknown>, token: string): Promise<ArrayBuffer | null> {
+  try {
+    const pred = await fetch("https://api.replicate.com/v1/predictions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Prefer: "wait" },
+      body: JSON.stringify({ version, input }),
+    });
+    const j: any = await pred.json().catch(() => ({}));
+    const url = typeof j.output === "string" ? j.output : Array.isArray(j.output) ? j.output[0] : null;
+    if (!url) return null;
+    return await (await fetch(url)).arrayBuffer();
+  } catch {
+    return null;
+  }
+}
+
 export async function POST(req: NextRequest) {
   let text = "";
   try {
@@ -44,21 +60,11 @@ export async function POST(req: NextRequest) {
   const token = process.env.REPLICATE_API_TOKEN;
   if (!token) return new Response("no token", { status: 500 });
 
-  const pred = await fetch("https://api.replicate.com/v1/predictions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      Prefer: "wait",
-    },
-    body: JSON.stringify({ version: VERSION, input: { text: clean, voice: "bm_george", speed: 0.93 } }),
-  });
-  const j: any = await pred.json().catch(() => ({}));
-  const url = typeof j.output === "string" ? j.output : Array.isArray(j.output) ? j.output[0] : null;
-  if (!url) return new Response(JSON.stringify({ error: j.error ?? "no audio" }), { status: 502 });
+  // Chatterbox first (more human), Kokoro as the fast/reliable fallback.
+  let buf = await render(CHATTERBOX, { prompt: clean, temperature: 0.7 }, token);
+  if (!buf) buf = await render(KOKORO, { text: clean, voice: "bm_george", speed: 0.95 }, token);
+  if (!buf) return new Response(JSON.stringify({ error: "tts failed" }), { status: 502 });
 
-  const audio = await fetch(url);
-  const buf = await audio.arrayBuffer();
   return new Response(buf, {
     headers: { "content-type": "audio/wav", "cache-control": "public, max-age=86400" },
   });

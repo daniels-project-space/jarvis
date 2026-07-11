@@ -1,6 +1,6 @@
 import { schedules } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
-import { mkdirSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { sendPush } from "./push-send";
@@ -136,6 +136,30 @@ function runClaude(
   });
 }
 
+// Bare project names silently fail to clone — resolve them to full owner/repo.
+const REPO_ALIASES: Record<string, string> = {
+  "project-hub": "daniels-project-space/project-hub-app",
+  "project-hub-app": "daniels-project-space/project-hub-app",
+  "rental-manager-v2": "daniels-project-space/rental-manager-v2",
+  rmv2: "daniels-project-space/rental-manager-v2",
+  "music-house": "daniels-project-space/music-house",
+  "youtube-studio-ai": "daniels-project-space/youtube-studio-ai",
+  "finance-engine-v2": "daniels-project-space/finance-engine-v2",
+  "dropship-ai": "daniels-project-space/dropship-ai",
+  jarvis: "daniels-project-space/jarvis",
+  "jarvis-memory": "daniels-project-space/jarvis-memory",
+};
+function resolveRepo(name: string): string {
+  const n = String(name || "")
+    .trim()
+    .replace(/\.git$/, "");
+  if (!n) return "";
+  const alias = REPO_ALIASES[n.toLowerCase()];
+  if (alias) return alias;
+  if (n.includes("/")) return n;
+  return `daniels-project-space/${n}`; // default org
+}
+
 export const agentRunner = schedules.task({
   id: "jarvis-agent-runner",
   cron: "*/2 * * * *",
@@ -157,9 +181,12 @@ export const agentRunner = schedules.task({
         mkdirSync(cwd, { recursive: true });
         let context = "You cannot edit files this run — answer/act from knowledge.";
         let repoDir: string | null = null;
-        if (job.repo && token) {
-          const dir = `/tmp/work/${String(job.repo).replace(/[^a-zA-Z0-9]/g, "_")}`;
-          const url = `https://x-access-token:${token}@github.com/${job.repo}.git`;
+        const repo = resolveRepo(job.repo);
+        let cloneFailed = false;
+        if (repo && token) {
+          const dir = `/tmp/work/${repo.replace(/[^a-zA-Z0-9]/g, "_")}`;
+          rmSync(dir, { recursive: true, force: true });
+          const url = `https://x-access-token:${token}@github.com/${repo}.git`;
           await sh("git", ["clone", "--depth", "1", url, dir], env);
           if (existsSync(join(dir, ".git"))) {
             cwd = dir;
@@ -167,10 +194,11 @@ export const agentRunner = schedules.task({
             await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
             await sh("git", ["-C", dir, "config", "user.name", "JARVIS"], env);
             context =
-              `Your working directory IS the git repo ${job.repo} (cloned). Make the changes and commit ` +
-              "them (git -C . commit -am '...') but do NOT push — the runner pushes for you.";
+              `Your working directory IS the git repo ${repo} (freshly cloned). Actually DO the task by editing files, ` +
+              "then commit (git -C . commit -am '...'); do NOT push — the runner pushes. Skip npm install / builds unless truly essential to the task.";
           } else {
-            context = `Repo ${job.repo} could not be cloned; work from knowledge, no file edits.`;
+            cloneFailed = true;
+            context = `The repo ${repo} could NOT be cloned (wrong name or no access). Do NOT pretend you edited anything — state plainly that you couldn't access it, and give the best guidance you can from knowledge.`;
           }
         }
         const model = typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task);
@@ -180,7 +208,7 @@ export const agentRunner = schedules.task({
 
         let pushNote = "";
         if (repoDir && token && !job.readonly) {
-          const pushUrl = `https://x-access-token:${token}@github.com/${job.repo}.git`;
+          const pushUrl = `https://x-access-token:${token}@github.com/${repo}.git`;
           await sh("git", ["-C", repoDir, "add", "-A"], env);
           const commit = await sh("git", ["-C", repoDir, "commit", "-m", "fix: jarvis agent"], env);
           if (/nothing to commit/i.test(commit.out)) {
@@ -196,12 +224,20 @@ export const agentRunner = schedules.task({
           }
         }
 
-        await convexMutation("jobs:finalize", { jobId: job.jobId, status: "done", result: result.slice(0, 4000) });
+        const status = cloneFailed ? "error" : "done";
+        await convexMutation("jobs:finalize", { jobId: job.jobId, status, result: result.slice(0, 4000) });
+        const head = cloneFailed
+          ? `⚠️ Couldn't reach ${repo} — check the repo name or my access. Best I can tell you:`
+          : `✅ Agent finished${repo ? ` on ${repo}` : ""}${pushNote}:`;
         await convexMutation("chatQueue:postAssistant", {
           threadId: "main",
-          text: `✅ Agent finished${job.repo ? ` on ${job.repo}` : ""}${pushNote}:\n${result.slice(0, 700)}`,
+          text: `${head}\n${result.slice(0, 700)}`,
         });
-        await sendPush(`✅ Agent finished${job.repo ? ` on ${job.repo}` : ""}`, result.slice(0, 140), "/");
+        await sendPush(
+          cloneFailed ? `⚠️ Couldn't reach ${repo}` : `✅ Agent finished${repo ? ` on ${repo}` : ""}`,
+          result.slice(0, 140),
+          "/",
+        );
         processed += 1;
       } catch (e: any) {
         await convexMutation("jobs:finalize", { jobId: job.jobId, status: "error", result: String(e?.message ?? e) });
