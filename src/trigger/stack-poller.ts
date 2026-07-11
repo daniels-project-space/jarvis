@@ -42,6 +42,21 @@ async function vaultService(service: string): Promise<Record<string, string>> {
   return Object.fromEntries(rows.map((x) => [x.keyName, x.value]));
 }
 
+
+async function chatThread(): Promise<string> {
+  try {
+    const r = await fetch(`${CONVEX_URL}/api/query`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: "ui:getActiveThread", args: {}, format: "json" }),
+    });
+    const t = (await r.json()).value;
+    return typeof t === "string" && t ? t : "main";
+  } catch {
+    return "main";
+  }
+}
+
 export const stackPoller = schedules.task({
   id: "jarvis-stack-poller",
   cron: "*/15 * * * *",
@@ -102,7 +117,7 @@ export const stackPoller = schedules.task({
           message: `Vercel production deploy for ${app} is in ERROR state.`,
         });
       await convexMutation("chatQueue:postAssistant", {
-        threadId: "main",
+        threadId: await chatThread(),
         text: `Heads up, sir — ${newlyBroken.join(" and ")} just failed to deploy. I'm sending an engineer in to trace it and fix it now.`,
       });
       await sendPush("⚠️ Deploy failed", `${newlyBroken.join(", ")} — repair agent dispatched.`, "/");

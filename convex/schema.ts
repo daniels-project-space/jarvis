@@ -71,6 +71,7 @@ export default defineSchema({
     model: v.optional(v.string()), // optional model override (haiku|sonnet|opus)
     mcp: v.optional(v.array(v.string())), // MCP servers to attach (playwright, context7)
     incidentId: v.optional(v.string()), // set on self-repair jobs → resolves the incident on success
+    retried: v.optional(v.boolean()), // failed once already — no second retry
     progress: v.optional(v.string()), // live activity line the runner streams
     startedAt: v.optional(v.number()),
     createdAt: v.number(),

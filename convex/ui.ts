@@ -66,3 +66,47 @@ export const getLiveOn = query({
   args: {},
   handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "liveOn")).first(),
 });
+
+// Chats: one active thread (UI + brain + agent weaves all follow it) plus a
+// small registry so Daniel can hop back to earlier conversations.
+export const setActiveThread = mutation({
+  args: { thread: v.string(), title: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    const cur = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "activeThread")).first();
+    const doc = { key: "activeThread", type: "thread", value: a.thread, updatedAt: Date.now() };
+    if (cur) await ctx.db.patch(cur._id, doc);
+    else await ctx.db.insert("ui", doc);
+    const reg = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "threads")).first();
+    let list: { id: string; title: string; at: number }[] = [];
+    try {
+      list = reg ? JSON.parse(reg.value) : [];
+    } catch {
+      list = [];
+    }
+    if (!list.find((t) => t.id === a.thread))
+      list.unshift({ id: a.thread, title: a.title ?? new Date().toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }), at: Date.now() });
+    const doc2 = { key: "threads", type: "thread", value: JSON.stringify(list.slice(0, 12)), updatedAt: Date.now() };
+    if (reg) await ctx.db.patch(reg._id, doc2);
+    else await ctx.db.insert("ui", doc2);
+  },
+});
+
+export const getActiveThread = query({
+  args: {},
+  handler: async (ctx) => {
+    const r = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "activeThread")).first();
+    return r?.value ?? "main";
+  },
+});
+
+export const getThreads = query({
+  args: {},
+  handler: async (ctx) => {
+    const r = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "threads")).first();
+    try {
+      return r ? JSON.parse(r.value) : [];
+    } catch {
+      return [];
+    }
+  },
+});

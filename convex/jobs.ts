@@ -9,6 +9,7 @@ export const enqueue = mutation({
     model: v.optional(v.string()),
     mcp: v.optional(v.array(v.string())),
     incidentId: v.optional(v.string()),
+    retried: v.optional(v.boolean()),
   },
   handler: async (ctx, a) => {
     return await ctx.db.insert("jobs", {
@@ -18,6 +19,7 @@ export const enqueue = mutation({
       model: a.model,
       mcp: a.mcp,
       incidentId: a.incidentId,
+      retried: a.retried,
       status: "pending",
       createdAt: Date.now(),
     });
@@ -41,6 +43,7 @@ export const claimNext = mutation({
       model: j.model ?? null,
       mcp: j.mcp ?? [],
       incidentId: j.incidentId ?? null,
+      retried: j.retried ?? false,
     };
   },
 });

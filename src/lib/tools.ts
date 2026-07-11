@@ -97,6 +97,36 @@ export const TOOL_DEFS = [
     parameters: { type: "object", properties: {} },
   },
   {
+    name: "rentals_calendar",
+    description:
+      "Daniel's ACTUAL rental calendar from the rental manager: what's out, being picked up, or returned on each day. Use for any question about rentals/bookings/schedule. Shows the full calendar on screen; speak the short answer.",
+    parameters: {
+      type: "object",
+      properties: {
+        start_date: { type: "string", description: "YYYY-MM-DD, default today" },
+        days: { type: "number", description: "how many days ahead, default 7, max 30" },
+      },
+    },
+  },
+  {
+    name: "weather",
+    description: "Current weather + 5-day forecast, shown as a visual widget on Daniel's screen. Use for any weather question.",
+    parameters: {
+      type: "object",
+      properties: { location: { type: "string", description: "city/place, default London" } },
+    },
+  },
+  {
+    name: "clear_chat",
+    description: "Wipe the current chat's history. Use when Daniel asks to clear/delete the chat — this IS the action, never dispatch an agent for it.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "new_chat",
+    description: "Open a fresh chat thread (old one stays in history). Use when Daniel asks for a new chat/conversation.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
     name: "current_time",
     description: "The current date and time in Daniel's timezone (Europe/London). Use whenever you need to know the date, day of week, or time right now.",
     parameters: { type: "object", properties: {} },
@@ -334,6 +364,98 @@ async function readUrl(url: string): Promise<string> {
   }
 }
 
+const RENTAL_URL = "https://hearty-oyster-600.convex.cloud";
+async function rentalQuery(path: string, args: unknown): Promise<any> {
+  try {
+    const r = await fetch(`${RENTAL_URL}/api/query`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path, args, format: "json" }),
+    });
+    return (await r.json()).value;
+  } catch {
+    return null;
+  }
+}
+
+async function rentalsCalendar(args: any): Promise<string> {
+  const start = /^\d{4}-\d{2}-\d{2}$/.test(String(args.start_date ?? "")) ? String(args.start_date) : new Date().toISOString().slice(0, 10);
+  const days = Math.min(Math.max(Number(args.days) || 7, 1), 30);
+  const strip: any[] = await rentalQuery("calendar:getCalendarStrip", { accountSlug: null, startDate: start, days });
+  if (!Array.isArray(strip)) return "Couldn't reach the rental calendar right now.";
+  const spoken: string[] = [];
+  const md: string[] = [`## Rental calendar · ${start} +${days}d`, ""];
+  const short = (s: string) => String(s || "").split(/[|,]/)[0].split(/\s+/).slice(0, 4).join(" ");
+  for (const day of strip) {
+    const date = day.date ?? day.day ?? "";
+    const away = (day.away ?? []).length;
+    const pickups = (day.pickups ?? []).map((p: any) => short(p.items?.[0]?.name ?? p.imageAlt ?? "item"));
+    const returns = (day.returns ?? []).map((p: any) => short(p.items?.[0]?.name ?? p.imageAlt ?? "item"));
+    if (away || pickups.length || returns.length) {
+      md.push(`**${date}** — ${away} out${pickups.length ? ` · pickup: ${pickups.join(", ")}` : ""}${returns.length ? ` · return: ${returns.join(", ")}` : ""}`);
+      spoken.push(`${date}: ${away} out${pickups.length ? `, ${pickups.length} pickup` : ""}${returns.length ? `, ${returns.length} return` : ""}`);
+    } else md.push(`**${date}** — clear`);
+  }
+  await showResultsPanel(`rentals · ${start}`, md.join("\n"));
+  return (spoken.length ? spoken.join("\n") : `No rental activity between ${start} and +${days} days.`) + "\n(Full calendar is on Daniel's screen.)";
+}
+
+const WMO: Record<number, [string, string]> = {
+  0: ["☀️", "clear"], 1: ["🌤", "mostly clear"], 2: ["⛅", "partly cloudy"], 3: ["☁️", "overcast"],
+  45: ["🌫", "fog"], 48: ["🌫", "rime fog"], 51: ["🌦", "light drizzle"], 53: ["🌦", "drizzle"], 55: ["🌧", "heavy drizzle"],
+  61: ["🌦", "light rain"], 63: ["🌧", "rain"], 65: ["🌧", "heavy rain"], 66: ["🌧", "freezing rain"], 67: ["🌧", "freezing rain"],
+  71: ["🌨", "light snow"], 73: ["🌨", "snow"], 75: ["❄️", "heavy snow"], 77: ["❄️", "snow grains"],
+  80: ["🌦", "light showers"], 81: ["🌧", "showers"], 82: ["⛈", "violent showers"],
+  85: ["🌨", "snow showers"], 86: ["🌨", "snow showers"], 95: ["⛈", "thunderstorm"], 96: ["⛈", "thunderstorm + hail"], 99: ["⛈", "thunderstorm + hail"],
+};
+
+async function weatherWidget(args: any): Promise<string> {
+  const place = String(args.location ?? "London").trim() || "London";
+  try {
+    const geo: any = await (
+      await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(place)}&count=1&language=en`)
+    ).json();
+    const g = geo?.results?.[0];
+    if (!g) return `Couldn't find a place called ${place}.`;
+    const f: any = await (
+      await fetch(
+        `https://api.open-meteo.com/v1/forecast?latitude=${g.latitude}&longitude=${g.longitude}` +
+          `&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m` +
+          `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=6`,
+      )
+    ).json();
+    const cur = f?.current;
+    if (!cur) return "Weather service is unavailable right now.";
+    const [icon, desc] = WMO[cur.weather_code] ?? ["🌡", "weather"];
+    const widget = {
+      kind: "weather",
+      place: `${g.name}${g.country_code ? ", " + g.country_code : ""}`,
+      icon,
+      desc,
+      temp: Math.round(cur.temperature_2m),
+      feels: Math.round(cur.apparent_temperature),
+      wind: Math.round(cur.wind_speed_10m),
+      humidity: cur.relative_humidity_2m,
+      days: (f.daily?.time ?? []).map((d: string, i: number) => ({
+        day: new Date(d).toLocaleDateString("en-GB", { weekday: "short" }),
+        icon: (WMO[f.daily.weather_code[i]] ?? ["🌡"])[0],
+        max: Math.round(f.daily.temperature_2m_max[i]),
+        min: Math.round(f.daily.temperature_2m_min[i]),
+        rain: f.daily.precipitation_probability_max?.[i] ?? 0,
+      })),
+    };
+    await convexMutation("ui:setPanel", { type: "widget", value: JSON.stringify(widget), title: `weather · ${widget.place}` });
+    return `${widget.place}: ${widget.temp}°C, ${desc}, feels like ${widget.feels}°, wind ${widget.wind} km/h. (Widget is on Daniel's screen.)`;
+  } catch (e: any) {
+    return `Weather lookup failed: ${e?.message ?? e}`;
+  }
+}
+
+async function activeThread(): Promise<string> {
+  const t = await convexQuery("ui:getActiveThread", {});
+  return typeof t === "string" && t ? t : "main";
+}
+
 export async function executeTool(name: string, args: any): Promise<string> {
   switch (name) {
     case "dispatch_agent": {
@@ -364,7 +486,7 @@ export async function executeTool(name: string, args: any): Promise<string> {
       await convexMutation("ui:setPanel", { type: kind, value: String(value), title: title ? String(title) : undefined });
       // Everything shown also lands in the stream as a persistent card.
       await convexMutation("chatQueue:postCard", {
-        threadId: "main",
+        threadId: await activeThread(),
         type: kind,
         value: String(value).slice(0, 4000),
         title: title ? String(title) : undefined,
@@ -378,6 +500,20 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await webSearch(String(args.query));
     case "flight_search":
       return await flightSearch(args);
+    case "rentals_calendar":
+      return await rentalsCalendar(args);
+    case "weather":
+      return await weatherWidget(args);
+    case "clear_chat": {
+      const t = await activeThread();
+      const n = await convexMutation("chatQueue:clearThread", { threadId: t });
+      return `Chat cleared (${n ?? 0} messages gone).`;
+    }
+    case "new_chat": {
+      const id = `t${Date.now().toString(36)}`;
+      await convexMutation("ui:setActiveThread", { thread: id });
+      return "Fresh chat opened — the old one is saved in history.";
+    }
     case "youtube_search":
       return await youtubeSearch(String(args.query));
     case "youtube_transcript":

@@ -13,6 +13,7 @@ export type LiveHandlers = {
   onTurnDone: (role: "user" | "assistant", text: string) => void;
   onEnergy: (e: number) => void;
   onExitRequest?: () => void; // Daniel said "turn off live mode" — model calls exit_live_mode
+  clientId?: string; // cross-device live lock identity
 };
 
 let session: RealtimeSession | null = null;
@@ -121,7 +122,12 @@ export async function startLive(h: LiveHandlers) {
   starting = true;
   h.onState("connecting");
   try {
-    const tk = await (await fetch("/api/realtime-token", { method: "POST" })).json();
+    const res = await fetch("/api/realtime-token", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client: h.clientId ?? "" }),
+    });
+    const tk = await res.json();
     if (!tk.token) throw new Error(tk.error ?? "no token");
 
     audioEl = document.createElement("audio");

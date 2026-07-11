@@ -4,7 +4,6 @@ import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
 
-const THREAD = "main";
 type Attachment = { type: string; value: string; title?: string };
 type Msg = {
   _id: string;
@@ -133,6 +132,45 @@ function AgentLiveView({ job, now, onClose }: { job: Job; now: number; onClose: 
   );
 }
 
+// Native widget panels (weather now; more kinds arrive via self_improve).
+function WidgetView({ value }: { value: string }) {
+  let w: any = null;
+  try {
+    w = JSON.parse(value);
+  } catch {
+    /* fall through */
+  }
+  if (w?.kind === "weather") {
+    return (
+      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-5 p-6">
+        <div className="hud-label">{w.place}</div>
+        <div className="flex items-center gap-5">
+          <span className="text-7xl">{w.icon}</span>
+          <div>
+            <div className="text-6xl font-semibold text-ice">{w.temp}°</div>
+            <div className="mt-1 text-sm text-slate">
+              {w.desc} · feels {w.feels}° · wind {w.wind} km/h · humidity {w.humidity}%
+            </div>
+          </div>
+        </div>
+        <div className="mt-2 flex flex-wrap justify-center gap-2">
+          {(w.days ?? []).map((d: any, i: number) => (
+            <div key={i} className="glass flex w-[86px] flex-col items-center gap-1 rounded-xl px-2 py-3">
+              <span className="hud-label">{d.day}</span>
+              <span className="text-2xl">{d.icon}</span>
+              <span className="text-sm text-ice">
+                {d.max}° <span className="text-slate">{d.min}°</span>
+              </span>
+              <span className="text-[10px] text-cyan/70">{d.rain}% rain</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+  return <pre className="scrollbar-thin min-h-0 flex-1 overflow-auto whitespace-pre-wrap p-4 text-sm text-ice">{value}</pre>;
+}
+
 // Scrollable full-page screenshot dressed as a browser — the "embed" that
 // works on every site (real iframes are blocked nearly everywhere).
 function SiteView({ url }: { url: string }) {
@@ -206,6 +244,8 @@ function Viewport({
       </div>
       {panel.type === "site" ? (
         <SiteView url={panel.value} />
+      ) : panel.type === "widget" ? (
+        <WidgetView value={panel.value} />
       ) : panel.type === "url" || panel.type === "video" ? (
         <div className="flex min-h-0 flex-1 flex-col">
           <iframe
@@ -232,7 +272,15 @@ function Viewport({
 }
 
 export default function JarvisUI() {
-  const messages = (useQuery(api.chatQueue.listMessages, { threadId: THREAD }) ?? []) as Msg[];
+  const thread = (useQuery(api.ui.getActiveThread, {}) ?? "main") as string;
+  const threads = (useQuery(api.ui.getThreads, {}) ?? []) as { id: string; title: string; at: number }[];
+  const setActiveThread = useMutation(api.ui.setActiveThread);
+  const clearThread = useMutation(api.chatQueue.clearThread);
+  const threadRef = useRef("main");
+  useEffect(() => {
+    threadRef.current = thread;
+  }, [thread]);
+  const messages = (useQuery(api.chatQueue.listMessages, { threadId: thread }) ?? []) as Msg[];
   const panel = useQuery(api.ui.getPanel, {}) as
     | { type: string; value: string; title?: string; updatedAt: number }
     | null
@@ -457,7 +505,7 @@ export default function JarvisUI() {
       await fetch("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ threadId: THREAD, text: t }),
+        body: JSON.stringify({ threadId: threadRef.current, text: t }),
       });
     } catch {
       /* Convex reactivity shows whatever landed; cron lane is the safety net */
@@ -528,7 +576,7 @@ export default function JarvisUI() {
       },
       onCaption: (who, text, done) => setCaption(done ? null : { who, text }),
       onTurnDone: (role, text) => {
-        void logTurn({ threadId: THREAD, role, text, model: role === "assistant" ? "live" : undefined });
+        void logTurn({ threadId: threadRef.current, role, text, model: role === "assistant" ? "live" : undefined });
         if (role === "user") {
           void claimVoice({ client: me.current });
           if (!panelFullRef.current) setPanelMin((min) => min || lastPanelAt.current < Date.now() - 8000);
@@ -544,6 +592,7 @@ export default function JarvisUI() {
         }
       },
       onEnergy: (e) => (energyRef.current = e),
+      clientId: me.current,
     });
   }
 
@@ -723,6 +772,37 @@ export default function JarvisUI() {
 
         {/* conversation column */}
         <div className="glass flex h-[52vh] flex-col overflow-hidden rounded-2xl md:h-[76vh]">
+          <div className="flex items-center gap-2 border-b border-white/5 px-3 py-1.5">
+            <select
+              value={thread}
+              onChange={(e) => void setActiveThread({ thread: e.target.value })}
+              className="hud-label min-w-0 flex-1 cursor-pointer truncate rounded bg-transparent py-0.5 outline-none hover:text-cyan"
+              title="chat history"
+            >
+              {!threads.find((t) => t.id === thread) && <option value={thread}>{thread === "main" ? "main chat" : thread}</option>}
+              {threads.map((t) => (
+                <option key={t.id} value={t.id} className="bg-abyss text-ice">
+                  {t.id === "main" ? "main chat" : t.title}
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={() => void setActiveThread({ thread: `t${Date.now().toString(36)}` })}
+              className="hud-label rounded px-1.5 py-0.5 hover:text-cyan"
+              title="start a fresh chat (this one stays in history)"
+            >
+              + new
+            </button>
+            <button
+              onClick={() => {
+                if (confirm("Clear this chat's messages for good?")) void clearThread({ threadId: thread });
+              }}
+              className="hud-label rounded px-1.5 py-0.5 hover:text-red-300"
+              title="wipe this chat"
+            >
+              clear
+            </button>
+          </div>
           <div className="scrollbar-thin flex-1 space-y-3 overflow-y-auto p-4">
             {messages.length === 0 && (
               <p className="mt-10 text-center text-sm text-slate">Say the word, sir.</p>

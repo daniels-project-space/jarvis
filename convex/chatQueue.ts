@@ -70,10 +70,14 @@ export const openTurn = mutation({
       .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
       .collect();
     const history = all
-      .filter((m: any) => m.status === "done" && m.text)
+      .filter((m: any) => m.status === "done" && (m.text || m.attachment))
       .sort((x: any, y: any) => x.createdAt - y.createdAt)
       .slice(-16)
-      .map((m: any) => ({ role: m.role, text: m.text }));
+      .map((m: any) => ({
+        role: m.role,
+        // cards surface as context so "that video from earlier" resolves
+        text: m.text || (m.attachment ? `[showed on screen: ${m.attachment.title ?? m.attachment.type} — ${m.attachment.value}]` : ""),
+      }));
     await ctx.db.insert("chatMessages", {
       threadId,
       role: "user",

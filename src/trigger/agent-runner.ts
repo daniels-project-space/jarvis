@@ -44,6 +44,26 @@ async function convexMutation(path: string, args: unknown) {
     ).json()
   ).value;
 }
+async function convexQuery(path: string, args: unknown) {
+  try {
+    return (
+      await (
+        await fetch(`${CONVEX_URL}/api/query`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ path, args, format: "json" }),
+        })
+      ).json()
+    ).value;
+  } catch {
+    return null;
+  }
+}
+// Weaves land wherever Daniel is actually chatting.
+async function chatThread(): Promise<string> {
+  const t = await convexQuery("ui:getActiveThread", {});
+  return typeof t === "string" && t ? t : "main";
+}
 function sh(cmd: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number | null; out: string }> {
   return new Promise((res) => {
     const p = spawn(cmd, args, { env, stdio: ["ignore", "pipe", "pipe"] });
@@ -276,7 +296,7 @@ export const agentRunner = schedules.task({
       const reaped: any = await convexMutation("jobs:reapStale", {});
       for (const t of reaped?.abandoned ?? [])
         await convexMutation("chatQueue:postAssistant", {
-          threadId: "main",
+          threadId: await chatThread(),
           text: `I have to be honest, sir — the background job "${t}" kept dying on me and I've stopped retrying it.`,
         }).catch(() => {});
       const healer: any = await convexMutation("incidents:claimForRepair", { limit: 2, maxAttempts: 2 });
@@ -291,7 +311,7 @@ export const agentRunner = schedules.task({
       }
       for (const esc of healer?.escalations ?? []) {
         await convexMutation("chatQueue:postAssistant", {
-          threadId: "main",
+          threadId: await chatThread(),
           text: `Sir, I've had two goes at fixing "${String(esc.message).slice(0, 120)}" and it's still misbehaving — this one needs your eyes.`,
         });
         await sendPush("JARVIS needs you", String(esc.message).slice(0, 120), "/");
@@ -403,6 +423,27 @@ export const agentRunner = schedules.task({
           }).catch(() => {});
         }
 
+        // Failed or timed-out work retries ONCE with explicit instructions to
+        // try differently — then reports honestly instead of going quiet.
+        const failedRun = cloneFailed || result === "(agent timed out)" || /^error:/.test(result);
+        if (failedRun && !job.retried && !cloneFailed) {
+          await convexMutation("jobs:enqueue", {
+            task:
+              `PREVIOUS ATTEMPT FAILED (${result.slice(0, 200)}). Try a DIFFERENT approach this time — different tools, ` +
+              `smaller steps, or state plainly what's impossible and why.\n\nOriginal task: ${job.task}`,
+            repo: job.repo ?? undefined,
+            model: job.model ?? undefined,
+            incidentId: job.incidentId ?? undefined,
+            retried: true,
+          });
+          await convexMutation("chatQueue:postAssistant", {
+            threadId: await chatThread(),
+            text: "That one hit a snag, sir — retrying it a different way now.",
+          });
+          processed += 1;
+          continue;
+        }
+
         // Weave, don't dump: one natural spoken line into chat + the full detail
         // as a finding the brain can pull up ("show me what it found").
         const spoken =
@@ -415,7 +456,7 @@ export const agentRunner = schedules.task({
           spoken,
           detail: result.slice(0, 8000) + (pushNote ? `\n\n(${pushNote.trim()})` : ""),
         });
-        await convexMutation("chatQueue:postAssistant", { threadId: "main", text: spoken });
+        await convexMutation("chatQueue:postAssistant", { threadId: await chatThread(), text: spoken });
         await sendPush("JARVIS", spoken.slice(0, 140), "/");
         processed += 1;
       } catch (e: any) {
@@ -423,7 +464,7 @@ export const agentRunner = schedules.task({
         if (job.incidentId)
           await convexMutation("incidents:setStatus", { id: job.incidentId, status: "open" }).catch(() => {});
         await convexMutation("chatQueue:postAssistant", {
-          threadId: "main",
+          threadId: await chatThread(),
           text: `⚠️ Agent failed: ${String(e?.message ?? e).slice(0, 300)}`,
         }).catch(() => {});
       }

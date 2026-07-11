@@ -79,6 +79,21 @@ function ask(bin: string, env: NodeJS.ProcessEnv, prompt: string): Promise<strin
   });
 }
 
+
+async function chatThread(): Promise<string> {
+  try {
+    const r = await fetch(`${CONVEX}/api/query`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: "ui:getActiveThread", args: {}, format: "json" }),
+    });
+    const t = (await r.json()).value;
+    return typeof t === "string" && t ? t : "main";
+  } catch {
+    return "main";
+  }
+}
+
 export const insightEngine = schedules.task({
   id: "jarvis-insight-engine",
   cron: "0 8,14,20 * * *", // 3x/day
@@ -129,7 +144,7 @@ export const insightEngine = schedules.task({
     // Surface the single most important fresh insight proactively (chat + phone).
     const top = kept.find((i) => i.severity === "warning") ?? kept.find((i) => i.severity === "opportunity") ?? kept[0];
     if (top) {
-      await m("chatQueue:postAssistant", { threadId: "main", text: `A thought, sir — ${top.text}` });
+      await m("chatQueue:postAssistant", { threadId: await chatThread(), text: `A thought, sir — ${top.text}` });
       await sendPush("JARVIS — a thought", String(top.text).slice(0, 140), "/");
     }
     return { insights: kept.length };
