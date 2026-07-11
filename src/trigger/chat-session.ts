@@ -97,7 +97,8 @@ function runTurn(
     `To DISPATCH a background agent (ONLY when Daniel asks you to run/build/action/fix something in the ` +
     `background or on a repo), run this bash, then tell him it's dispatched and you'll report back when done: ` +
     `curl -s -X POST '${CONVEX_URL}/api/mutation' -H 'content-type: application/json' ` +
-    `-d '{"path":"jobs:enqueue","args":{"task":"<clear, self-contained task>","repo":"<owner/repo or empty string>"}}'\n` +
+    `-d '{"path":"jobs:enqueue","args":{"task":"<clear, self-contained task>","repo":"<owner/repo or empty string>","model":"<haiku|sonnet|opus>"}}'. ` +
+    `Choose model by difficulty: opus for architecture/multi-file/debugging, sonnet for normal edits, haiku for trivial lookups (omit to auto-route).\n` +
     `To SHOW Daniel something on screen (pull up a website, open a document/notes, display an image) when he ` +
     `asks you to show/pull up/open something, run: curl -s -X POST '${CONVEX_URL}/api/mutation' ` +
     `-H 'content-type: application/json' -d '{"path":"ui:setPanel","args":{"type":"url","value":"https://…","title":"<label>"}}' ` +

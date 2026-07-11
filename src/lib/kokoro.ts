@@ -5,14 +5,34 @@
 let ttsPromise: Promise<any> | null = null;
 let audioCtx: AudioContext | null = null;
 
+async function loadWith(device: "webgpu" | "wasm") {
+  const { KokoroTTS } = await import("kokoro-js");
+  return KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-v1.0-ONNX", {
+    dtype: "q8",
+    device,
+  });
+}
+
 async function getTTS() {
   if (!ttsPromise) {
-    const { KokoroTTS } = await import("kokoro-js");
-    const device = typeof navigator !== "undefined" && (navigator as any).gpu ? "webgpu" : "wasm";
-    ttsPromise = KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-v1.0-ONNX", {
-      dtype: "q8",
-      device,
-    }).catch((e: unknown) => {
+    // Prefer WebGPU when the adapter actually resolves; otherwise fall back to
+    // WASM. `navigator.gpu` can exist on desktop Chrome yet fail to grant an
+    // adapter (no flag / headless), so probe rather than trust the flag alone.
+    ttsPromise = (async () => {
+      let device: "webgpu" | "wasm" = "wasm";
+      try {
+        const gpu = typeof navigator !== "undefined" ? (navigator as any).gpu : null;
+        if (gpu && (await gpu.requestAdapter())) device = "webgpu";
+      } catch {
+        device = "wasm";
+      }
+      try {
+        return await loadWith(device);
+      } catch (e) {
+        if (device === "webgpu") return await loadWith("wasm"); // adapter lied — retry on WASM
+        throw e;
+      }
+    })().catch((e: unknown) => {
       ttsPromise = null;
       throw e;
     });

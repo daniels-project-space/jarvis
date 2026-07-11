@@ -62,6 +62,7 @@ export default defineSchema({
     status: v.string(), // pending | running | done | error
     result: v.optional(v.string()),
     readonly: v.optional(v.boolean()), // if true, runner never commits/pushes
+    model: v.optional(v.string()), // optional model override (haiku|sonnet|opus)
     createdAt: v.number(),
   }).index("by_status", ["status", "createdAt"]),
 

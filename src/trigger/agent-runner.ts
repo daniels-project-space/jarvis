@@ -52,11 +52,28 @@ function sh(cmd: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code
     p.on("error", () => res({ code: -1, out: o }));
   });
 }
-function runClaude(bin: string, cwd: string, env: NodeJS.ProcessEnv, prompt: string): Promise<string> {
+// Sub-agent model routing: match the brain's economy — Opus only for real
+// engineering, Sonnet for the middle, Haiku for trivial lookups/one-liners.
+function pickAgentModel(task: string): string {
+  const t = task.toLowerCase();
+  if (/\b(architect|design|refactor|migrate|debug|root cause|complex|multi-file|rewrite|optimi[sz]e)\b/.test(t))
+    return "opus";
+  if (t.length < 80 && /\b(check|list|read|look up|status|find|grep|what is|summari[sz]e)\b/.test(t))
+    return "haiku";
+  return "sonnet";
+}
+
+function runClaude(
+  bin: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  prompt: string,
+  model: string,
+): Promise<string> {
   return new Promise((resolve) => {
     const p = spawn(
       bin,
-      ["-p", prompt, "--model", "opus", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"],
+      ["-p", prompt, "--model", model, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"],
       { cwd, env, stdio: ["ignore", "pipe", "pipe"] },
     );
     let buf = "";
@@ -133,7 +150,8 @@ export const agentRunner = schedules.task({
             context = `Repo ${job.repo} could not be cloned; work from knowledge, no file edits.`;
           }
         }
-        const result = await runClaude(bin, cwd, env, `${context}\n\nTask: ${job.task}`);
+        const model = typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task);
+        const result = await runClaude(bin, cwd, env, `${context}\n\nTask: ${job.task}`, model);
 
         let pushNote = "";
         if (repoDir && token && !job.readonly) {
