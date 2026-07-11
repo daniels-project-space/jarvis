@@ -65,6 +65,8 @@ export default function JarvisUI() {
   const lastSpokenId = useRef<string | null>(null);
   const recRef = useRef<any>(null);
   const energyRef = useRef(0);
+  const speakingRef = useRef(false);
+  const [live, setLive] = useState(false);
   const activeJobs = (useQuery(api.jobs.active, {}) ?? []) as Job[];
   const [agentView, setAgentView] = useState<string | null>(null);
   const [nowTs, setNowTs] = useState(0);
@@ -98,8 +100,14 @@ export default function JarvisUI() {
       await speak(
         last.text,
         (e) => (energyRef.current = e),
-        () => setSpeaking(true),
-        () => setSpeaking(false),
+        () => {
+          setSpeaking(true);
+          speakingRef.current = true;
+        },
+        () => {
+          setSpeaking(false);
+          speakingRef.current = false;
+        },
       );
     })();
   }, [messages]);
@@ -110,6 +118,27 @@ export default function JarvisUI() {
     import("../lib/tts").then((m) => m.warm()); // gesture-warm audio + model
     setInput("");
     await send({ threadId: THREAD, text: t });
+  }
+
+  async function toggleLive() {
+    const m = await import("../lib/livevoice");
+    if (live) {
+      m.stopLiveVoice();
+      setLive(false);
+      setListening(false);
+      return;
+    }
+    setLive(true);
+    try {
+      await m.startLiveVoice({
+        onTranscript: (t) => submit(t),
+        onState: (s) => setListening(s === "listening"),
+        isSpeaking: () => speakingRef.current,
+      });
+    } catch {
+      setLive(false);
+      alert("Couldn't start live voice — allow microphone access and try again.");
+    }
   }
 
   function toggleMic() {
@@ -247,8 +276,16 @@ export default function JarvisUI() {
             🔔
           </button>
           <button
+            onClick={toggleLive}
+            title="always-on live conversation"
+            className={`flex shrink-0 items-center gap-1 rounded-xl px-3 text-sm ${live ? "bg-emerald-600 text-white" : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"}`}
+          >
+            {live && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white" />}
+            {live ? "live" : "live"}
+          </button>
+          <button
             onClick={toggleMic}
-            title="voice input"
+            title="voice input (one-shot)"
             className={`rounded-xl px-3 text-sm ${listening ? "bg-red-600 text-white" : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"}`}
           >
             {listening ? "◉" : "🎙"}
