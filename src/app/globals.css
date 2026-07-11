@@ -1,13 +1,13 @@
 @import "tailwindcss";
 
-/* JARVIS cockpit tokens — cyan is JARVIS's voice, amber is Daniel's. */
+/* JARVIS cockpit tokens — green is JARVIS's voice, amber is Daniel's. */
 :root {
   --void: #05070d;
   --abyss: #0b1220;
   --glass: rgba(13, 22, 38, 0.55);
-  --line: rgba(92, 232, 255, 0.14);
-  --cyan: #5ce8ff;
-  --cyan-dim: rgba(92, 232, 255, 0.55);
+  --line: rgba(0, 255, 136, 0.14);
+  --cyan: #00ff88;
+  --cyan-dim: rgba(0, 255, 136, 0.55);
   --ice: #dbe9f7;
   --slate: #6d7f99;
   --amber: #ffb454;
@@ -92,8 +92,8 @@ body {
 .materialize {
   animation: mat-in 0.45s cubic-bezier(0.2, 0.9, 0.25, 1) forwards;
   box-shadow:
-    0 0 0 1px rgba(92, 232, 255, 0.25),
-    0 0 42px rgba(92, 232, 255, 0.12),
+    0 0 0 1px rgba(0, 255, 136, 0.25),
+    0 0 42px rgba(0, 255, 136, 0.12),
     0 24px 80px rgba(0, 0, 0, 0.55);
 }
 @keyframes mat-in {
@@ -106,7 +106,7 @@ body {
   position: absolute;
   inset: 0;
   pointer-events: none;
-  background: linear-gradient(180deg, transparent 0%, rgba(92, 232, 255, 0.08) 50%, transparent 100%);
+  background: linear-gradient(180deg, transparent 0%, rgba(0, 255, 136, 0.08) 50%, transparent 100%);
   background-size: 100% 220%;
   animation: scan 1.1s ease 1;
 }
@@ -135,7 +135,7 @@ body {
 
 /* live ring sweep around the stage while live mode is on */
 .live-ring {
-  background: conic-gradient(from 0deg, transparent 0deg, rgba(92, 232, 255, 0.5) 40deg, transparent 90deg);
+  background: conic-gradient(from 0deg, transparent 0deg, rgba(0, 255, 136, 0.5) 40deg, transparent 90deg);
   animation: sweep 3.2s linear infinite;
   mask: radial-gradient(closest-side, transparent 97%, black 98%);
 }
@@ -144,7 +144,7 @@ body {
 }
 
 .scrollbar-thin::-webkit-scrollbar { width: 4px; }
-.scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(92, 232, 255, 0.2); border-radius: 4px; }
+.scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(0, 255, 136, 0.2); border-radius: 4px; }
 .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
 
 @media (prefers-reduced-motion: reduce) {

@@ -7,10 +7,10 @@ import { useEffect, useRef } from "react";
 type State = "idle" | "listening" | "thinking" | "speaking";
 
 const PAL: Record<State, { a: string; b: string; accent: string; bloom: number; amp: number }> = {
-  idle: { a: "#FFD700", b: "#FF9500", accent: "#FFED4E", bloom: 0.45, amp: 0.16 },
-  listening: { a: "#FFED4E", b: "#FFD700", accent: "#FFFF99", bloom: 0.5, amp: 0.28 },
-  thinking: { a: "#FFA500", b: "#FF8C00", accent: "#FFD700", bloom: 0.5, amp: 0.28 },
-  speaking: { a: "#FFD700", b: "#FFA500", accent: "#FFFF99", bloom: 0.58, amp: 0.4 },
+  idle: { a: "#00ff88", b: "#00dd77", accent: "#00ffaa", bloom: 0.45, amp: 0.16 },
+  listening: { a: "#00ffaa", b: "#00ff88", accent: "#00ffcc", bloom: 0.5, amp: 0.28 },
+  thinking: { a: "#00ff88", b: "#00dd77", accent: "#00ff99", bloom: 0.5, amp: 0.28 },
+  speaking: { a: "#00ff88", b: "#00ff77", accent: "#00ffcc", bloom: 0.58, amp: 0.4 },
 };
 
 const VERT = /* glsl */ `
@@ -163,7 +163,7 @@ export default function ThreeOrb({
       const pm = new THREE.PointsMaterial({
         size: 0.045,
         map: dot,
-        color: lin("#FFD700"),
+        color: lin("#00ff88"),
         transparent: true,
         opacity: 0.45,
         blending: THREE.AdditiveBlending,

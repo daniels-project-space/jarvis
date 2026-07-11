@@ -40,7 +40,7 @@ export default function Orb({
       const cx = w / 2;
       const cy = h / 2;
       const R = Math.min(w, h) * 0.24;
-      const hue = 158;
+      const hue = 130;
 
       const ext = energyRef?.current ?? 0;
       const target =
