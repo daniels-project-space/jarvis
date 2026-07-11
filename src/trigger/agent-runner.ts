@@ -178,7 +178,7 @@ function runClaude(
         /* already gone */
       }
       resolve(finalText || "(agent timed out)");
-    }, 420_000);
+    }, 600_000); // self-repair/improve jobs run npm install + tsc + build inside the turn
     p.stdout.on("data", (d) => {
       buf += d.toString();
       let nl: number;
