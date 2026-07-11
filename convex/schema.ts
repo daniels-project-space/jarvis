@@ -82,4 +82,26 @@ export default defineSchema({
     keys: v.object({ p256dh: v.string(), auth: v.string() }),
     createdAt: v.number(),
   }).index("by_endpoint", ["endpoint"]),
+
+  // Live business intelligence: pollers pull real metrics (rentals, per-item
+  // earnings, YouTube, music sales, wealth) into per-domain snapshots the brain
+  // injects so JARVIS naturally knows how everything is doing. The "web of intel".
+  businessState: defineTable({
+    domain: v.string(), // "rental" | "youtube" | "music" | "wealth" | "ads"
+    headline: v.string(), // one-line spoken summary
+    detail: v.optional(v.string()), // richer detail for when asked
+    data: v.optional(v.any()), // structured payload for future UI
+    updatedAt: v.number(),
+  }).index("by_domain", ["domain"]),
+
+  // Proactive insights the insight engine generates + surfaces (chat/notification).
+  insights: defineTable({
+    domain: v.string(),
+    text: v.string(),
+    severity: v.string(), // "info" | "opportunity" | "warning"
+    surfaced: v.boolean(),
+    createdAt: v.number(),
+  })
+    .index("by_surfaced", ["surfaced", "createdAt"])
+    .index("by_domain", ["domain", "createdAt"]),
 });

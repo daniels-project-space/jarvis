@@ -1,0 +1,6 @@
+{
+  "version": 3,
+  "sources": ["../../../../../src/trigger/hello.ts"],
+  "mappings": ";;;;;;;;;;;;;;AAAA;AAKO,IAAM,QAAQ,KAAK;AAAA,EACxB,IAAI;AAAA,EACJ,KAAK,8BAAO,YAA+B;AACzC,WAAO,EAAE,UAAU,kBAAkB,SAAS,QAAQ,KAAK,KAAK,KAAI,oBAAI,KAAK,GAAE,YAAY,EAAE;AAAA,EAC/F,GAFK;AAGP,CAAC;",
+  "names": []
+}

@@ -87,6 +87,7 @@ function runTurn(
   history: { role: string; text: string }[],
   memoryContext: string,
   stackContext: string,
+  businessContext: string,
   model: string,
 ): Promise<Turn> {
   const preamble =
@@ -100,6 +101,9 @@ function runTurn(
     "one to four sentences unless he asks for depth. Never say 'as an AI', never narrate your process. Never fabricate. " +
     (memoryContext ? `Relevant long-term memory:\n${memoryContext}\n` : "") +
     (stackContext ? `Current cloud-stack (Vercel deploy states): ${stackContext}\n` : "") +
+    (businessContext
+      ? `Live business metrics — when Daniel asks how things are doing (rentals, items, music, money), speak naturally from these real numbers, don't recite them like a table:\n${businessContext}\n`
+      : "") +
     `To DISPATCH a background agent (ONLY when Daniel asks you to run/build/action/fix something in the ` +
     `background or on a repo), run this bash, then tell him it's dispatched and you'll report back when done: ` +
     `curl -s -X POST '${CONVEX_URL}/api/mutation' -H 'content-type: application/json' ` +
@@ -266,6 +270,11 @@ export const chatDispatcher = schedules.task({
           Array.isArray(stack) && stack.length
             ? stack.map((s: any) => `${s.slug}=${s.status}`).join(", ").slice(0, 1200)
             : "";
+        const biz: any = await convexQuery("business:list", {}).catch(() => []);
+        const businessContext =
+          Array.isArray(biz) && biz.length
+            ? biz.map((b: any) => `${b.headline}${b.detail ? " " + b.detail : ""}`).join("\n").slice(0, 1600)
+            : "";
         const turn = await runTurn(
           bin,
           env,
@@ -274,6 +283,7 @@ export const chatDispatcher = schedules.task({
           claim.history,
           memoryContext,
           stackContext,
+          businessContext,
           pickModel(claim.userText),
         );
         const finalText =
