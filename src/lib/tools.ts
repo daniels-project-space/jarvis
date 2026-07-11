@@ -207,10 +207,16 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return "Agent dispatched. It'll report back here in a few minutes — keep the conversation going.";
     }
     case "show": {
-      let { kind, value, title } = args as { kind: string; value: string; title?: string };
-      if (kind === "video") {
-        const id = YT_ID(value);
-        if (id) value = `https://www.youtube.com/embed/${id}`;
+      let { kind, value, title } = args as { kind?: string; value: string; title?: string };
+      value = String(value ?? "").trim();
+      if (!value) return "Nothing to show — give me a url, image, code or text.";
+      // Models omit/confuse `kind` — infer and normalize so it always renders.
+      const id = YT_ID(value);
+      if (id) {
+        kind = "video";
+        value = `https://www.youtube.com/embed/${id}`;
+      } else if (!kind || !["url", "video", "image", "code", "markdown"].includes(kind)) {
+        kind = /\.(png|jpe?g|gif|webp|svg)(\?|$)/i.test(value) ? "image" : /^https?:\/\//i.test(value) ? "url" : "markdown";
       }
       await convexMutation("ui:setPanel", { type: kind, value: String(value), title: title ? String(title) : undefined });
       // Everything shown also lands in the stream as a persistent card.
