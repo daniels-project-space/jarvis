@@ -7,10 +7,10 @@ import { useEffect, useRef } from "react";
 type State = "idle" | "listening" | "thinking" | "speaking";
 
 const PAL: Record<State, { a: string; b: string; accent: string; bloom: number; amp: number }> = {
-  idle: { a: "#18a0ff", b: "#0a3aa8", accent: "#5cf0ff", bloom: 0.45, amp: 0.16 },
-  listening: { a: "#00e0ff", b: "#0077ff", accent: "#a0f8ff", bloom: 0.5, amp: 0.28 },
-  thinking: { a: "#9a6cff", b: "#5a2fd8", accent: "#d0b0ff", bloom: 0.5, amp: 0.28 },
-  speaking: { a: "#00ffc8", b: "#00a2ff", accent: "#33ffcc", bloom: 0.58, amp: 0.4 },
+  idle: { a: "#FFD700", b: "#FF9500", accent: "#FFED4E", bloom: 0.45, amp: 0.16 },
+  listening: { a: "#FFED4E", b: "#FFD700", accent: "#FFFF99", bloom: 0.5, amp: 0.28 },
+  thinking: { a: "#FFA500", b: "#FF8C00", accent: "#FFD700", bloom: 0.5, amp: 0.28 },
+  speaking: { a: "#FFD700", b: "#FFA500", accent: "#FFFF99", bloom: 0.58, amp: 0.4 },
 };
 
 const VERT = /* glsl */ `
@@ -163,7 +163,7 @@ export default function ThreeOrb({
       const pm = new THREE.PointsMaterial({
         size: 0.045,
         map: dot,
-        color: lin("#7fe4ff"),
+        color: lin("#FFD700"),
         transparent: true,
         opacity: 0.45,
         blending: THREE.AdditiveBlending,

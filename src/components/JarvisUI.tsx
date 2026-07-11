@@ -406,7 +406,7 @@ export default function JarvisUI() {
       {/* top HUD strip */}
       <header className="flex items-center justify-between px-5 pb-2 pt-4">
         <div className="flex items-baseline gap-3">
-          <h1 className="font-display text-xl font-bold tracking-[0.42em] text-cyan" style={{ fontFamily: "var(--font-chakra)" }}>
+          <h1 className="font-display text-xl font-bold tracking-[0.42em] text-yellow-400" style={{ fontFamily: "var(--font-chakra)" }}>
             JARVIS
           </h1>
           <span className="hud-label hidden sm:inline">personal ai · online</span>
