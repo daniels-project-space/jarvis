@@ -97,6 +97,25 @@ export const TOOL_DEFS = [
     parameters: { type: "object", properties: {} },
   },
   {
+    name: "rental_availability",
+    description:
+      "Is a specific piece of rental gear free? Searches Daniel's inventory by name (fx3, a7siii, 24-70 gm...) and returns per-item availability: free today, next free date, upcoming bookings. Use for ANY 'is X available / when is X free / do I have X' question.",
+    parameters: {
+      type: "object",
+      properties: {
+        item: { type: "string", description: "gear name or fragment, e.g. 'fx3' or '24-70'" },
+        days: { type: "number", description: "horizon in days, default 21" },
+      },
+      required: ["item"],
+    },
+  },
+  {
+    name: "rental_stats",
+    description:
+      "Daniel's rental business dashboard as a visual widget: monthly revenue chart, this month's earnings, active/upcoming rentals, fleet utilisation, top earners. Use for 'how's the rental business / revenue / best items' questions.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
     name: "rentals_calendar",
     description:
       "Daniel's ACTUAL rental calendar from the rental manager: what's out, being picked up, or returned on each day. Use for any question about rentals/bookings/schedule. Shows the full calendar on screen; speak the short answer.",
@@ -400,6 +419,70 @@ async function rentalsCalendar(args: any): Promise<string> {
   return (spoken.length ? spoken.join("\n") : `No rental activity between ${start} and +${days} days.`) + "\n(Full calendar is on Daniel's screen.)";
 }
 
+async function rentalAvailability(args: any): Promise<string> {
+  const item = String(args.item ?? "").trim();
+  if (!item) return "Which item, sir?";
+  const days = Math.min(Math.max(Number(args.days) || 21, 1), 60);
+  const v = await rentalQuery("calendar:getItemAvailabilityForChat", { query: item, horizonDays: days, accountSlug: null });
+  if (!v || typeof v !== "object") return "Couldn't reach the rental system right now.";
+  if (!v.match_count) return `No gear matching "${item}" in the inventory.`;
+  const lines: string[] = [];
+  const md: string[] = [`## Availability · ${item}`, ""];
+  for (const it of (v.items ?? []).slice(0, 6)) {
+    const state = it.free_today
+      ? `${it.free_units_today}/${it.qty} free today`
+      : `booked out — next free ${it.next_free_date ?? "unknown"}`;
+    lines.push(`${it.name}: ${state}`);
+    md.push(`**${it.name}** (${it.kind}, qty ${it.qty}) — ${state}`);
+    for (const b of (it.upcoming_bookings ?? []).slice(0, 4))
+      md.push(`   - out ${b.pickup} → ${b.return ?? b.return_date ?? "?"} (${b.account ?? ""})`);
+    md.push("");
+  }
+  await showResultsPanel(`availability · ${item}`, md.join("\n"));
+  return lines.join("\n") + "\n(Details are on Daniel's screen.)";
+}
+
+async function rentalStats(): Promise<string> {
+  const [stats, earners, util, series] = await Promise.all([
+    rentalQuery("dashboard:getStatsDrawerData", { accountSlug: "db", _bypassMv: true }),
+    rentalQuery("mv/top_earners:getRanking", {}),
+    rentalQuery("mv/utilization:get", {}),
+    rentalQuery("mv/earnings_by_period:get", { granularity: "monthly", months: 6 }),
+  ]);
+  if (!stats) return "Couldn't reach the rental dashboard right now.";
+  const m = stats.monthly ?? {};
+  const act = stats.active ?? {};
+  const short = (s: string) => String(s || "").split(/[|,]/)[0].split(/\s+/).slice(0, 4).join(" ");
+  const widget = {
+    kind: "stats",
+    title: "Rental business",
+    kpis: [
+      { label: "this month", value: Math.round(m.current_earnings ?? 0), prefix: "£" },
+      { label: "active now", value: act.ongoing_count ?? 0 },
+      { label: "upcoming", value: act.upcoming_count ?? 0 },
+      { label: "fleet in use", value: Math.round(util?.fleetUtilizationPct ?? 0), suffix: "%" },
+    ],
+    series: (Array.isArray(series) ? series : []).map((p: any) => ({
+      label: String(p.period).slice(2),
+      value: Math.round(p.revenue ?? 0),
+    })),
+    seriesLabel: "monthly revenue £",
+    bars: (Array.isArray(earners) ? earners : []).slice(0, 5).map((e: any) => ({
+      label: short(e.itemName),
+      value: Math.round(e.net30dGbp ?? 0),
+      note: `${e.rentalCount} rentals`,
+    })),
+    barsLabel: "top earners (30d) £",
+  };
+  await convexMutation("ui:setPanel", { type: "widget", value: JSON.stringify(widget), title: "rental business" });
+  const bestMonth = widget.series.reduce((a: any, b: any) => (b.value > (a?.value ?? 0) ? b : a), null);
+  return (
+    `This month £${widget.kpis[0].value}, ${widget.kpis[1].value} active, ${widget.kpis[2].value} upcoming, fleet ${widget.kpis[3].value}% used.` +
+    (bestMonth ? ` Best recent month: ${bestMonth.label} at £${bestMonth.value}.` : "") +
+    " (Full dashboard widget is on Daniel's screen — speak one highlight only.)"
+  );
+}
+
 const WMO: Record<number, [string, string]> = {
   0: ["☀️", "clear"], 1: ["🌤", "mostly clear"], 2: ["⛅", "partly cloudy"], 3: ["☁️", "overcast"],
   45: ["🌫", "fog"], 48: ["🌫", "rime fog"], 51: ["🌦", "light drizzle"], 53: ["🌦", "drizzle"], 55: ["🌧", "heavy drizzle"],
@@ -502,6 +585,10 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await flightSearch(args);
     case "rentals_calendar":
       return await rentalsCalendar(args);
+    case "rental_availability":
+      return await rentalAvailability(args);
+    case "rental_stats":
+      return await rentalStats();
     case "weather":
       return await weatherWidget(args);
     case "clear_chat": {

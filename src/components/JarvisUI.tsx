@@ -52,7 +52,7 @@ function MediaCard({ a, onShow }: { a: Attachment; onShow: (a: Attachment) => vo
   const id = a.type === "video" ? ytId(a.value) : null;
   const ext = id ? `https://www.youtube.com/watch?v=${id}` : a.value;
   return (
-    <span className="glass inline-flex max-w-[88%] items-center gap-2 overflow-hidden rounded-xl p-1.5 pr-2 text-left">
+    <span className="glass card-lift inline-flex max-w-[88%] items-center gap-2 overflow-hidden rounded-xl p-1.5 pr-2 text-left">
       <button onClick={() => onShow(a)} className="flex min-w-0 items-center gap-2" title="show on screen">
         {id ? (
           <img src={`https://img.youtube.com/vi/${id}/mqdefault.jpg`} alt="" className="h-12 w-20 shrink-0 rounded-lg object-cover" />
@@ -132,13 +132,87 @@ function AgentLiveView({ job, now, onClose }: { job: Job; now: number; onClose: 
   );
 }
 
-// Native widget panels (weather now; more kinds arrive via self_improve).
+// Animated count-up for KPI tiles.
+function CountUp({ value, prefix = "", suffix = "" }: { value: number; prefix?: string; suffix?: string }) {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const t0 = performance.now();
+    let raf = 0;
+    const tick = (t: number) => {
+      const p = Math.min(1, (t - t0) / 900);
+      setN(Math.round(value * (1 - Math.pow(1 - p, 3))));
+      if (p < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [value]);
+  return (
+    <span>
+      {prefix}
+      {n.toLocaleString("en-GB")}
+      {suffix}
+    </span>
+  );
+}
+
+// Native widget panels (weather + stats now; more kinds arrive via self_improve).
 function WidgetView({ value }: { value: string }) {
   let w: any = null;
   try {
     w = JSON.parse(value);
   } catch {
     /* fall through */
+  }
+  if (w?.kind === "stats") {
+    const maxS = Math.max(1, ...(w.series ?? []).map((s: any) => s.value));
+    const maxB = Math.max(1, ...(w.bars ?? []).map((b: any) => b.value));
+    return (
+      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+          {(w.kpis ?? []).map((k: any, i: number) => (
+            <div key={i} className="glass rounded-xl px-3 py-4 text-center">
+              <div className="text-2xl font-semibold text-ice md:text-3xl">
+                <CountUp value={k.value} prefix={k.prefix ?? ""} suffix={k.suffix ?? ""} />
+              </div>
+              <div className="hud-label mt-1">{k.label}</div>
+            </div>
+          ))}
+        </div>
+        {(w.series ?? []).length > 0 && (
+          <div className="mt-5">
+            <div className="hud-label mb-2">{w.seriesLabel ?? "trend"}</div>
+            <div className="flex h-28 items-end gap-2">
+              {w.series.map((s: any, i: number) => (
+                <div key={i} className="flex min-w-0 flex-1 flex-col items-center gap-1">
+                  <span className="text-[10px] text-cyan/80">{s.value.toLocaleString("en-GB")}</span>
+                  <div
+                    className="w-full rounded-t bg-gradient-to-t from-cyan/25 to-cyan/70 transition-all duration-700"
+                    style={{ height: `${Math.max(4, (s.value / maxS) * 80)}px` }}
+                  />
+                  <span className="hud-label !text-[8px]">{s.label}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {(w.bars ?? []).length > 0 && (
+          <div className="mt-5 space-y-2">
+            <div className="hud-label mb-2">{w.barsLabel ?? "ranking"}</div>
+            {w.bars.map((b: any, i: number) => (
+              <div key={i}>
+                <div className="flex justify-between text-xs">
+                  <span className="truncate text-ice">{b.label}</span>
+                  <span className="shrink-0 pl-2 text-cyan">£{b.value.toLocaleString("en-GB")} <span className="text-slate">· {b.note}</span></span>
+                </div>
+                <div className="mt-0.5 h-1.5 overflow-hidden rounded-full bg-white/5">
+                  <div className="h-full rounded-full bg-gradient-to-r from-cyan/40 to-cyan transition-all duration-700" style={{ width: `${(b.value / maxB) * 100}%` }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
   }
   if (w?.kind === "weather") {
     return (
@@ -825,7 +899,16 @@ export default function JarvisUI() {
                         : "bg-cyan/[0.07] text-ice"
                     }`}
                   >
-                    {m.text || (m.status === "streaming" ? "…" : "")}
+                    {m.text ||
+                      (m.status === "streaming" ? (
+                        <span className="typing-dots inline-flex gap-1">
+                          <span />
+                          <span />
+                          <span />
+                        </span>
+                      ) : (
+                        ""
+                      ))}
                   </span>
                 )}
                 {m.role === "assistant" && m.model && (
