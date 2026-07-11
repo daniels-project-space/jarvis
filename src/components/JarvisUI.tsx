@@ -228,9 +228,13 @@ export default function JarvisUI() {
     lastSpokenId.current = last._id;
     if (last.model === "live") return;
     if (liveRef.current) {
-      import("../lib/realtime").then((m) => m.nudgeLive(last.text));
+      // Only voice true background events (agent weaves, insights — untagged rows).
+      // Model-tagged rows are replies to someone's typed message and were
+      // already delivered where they were asked.
+      if (!last.model) import("../lib/realtime").then((m) => m.nudgeLive(last.text));
       return;
     }
+    if (document.hidden) return; // background tabs stay silent — one voice, ever
     (async () => {
       const { speak } = await import("../lib/tts");
       await speak(
@@ -248,6 +252,11 @@ export default function JarvisUI() {
     import("../lib/tts").then((m) => m.warm());
     setInput("");
     if (panel) setPanelMin(true); // new message → viewport folds away, orb returns
+    if (liveRef.current) {
+      // Live session is the single brain while it's on — no parallel text answer.
+      const rt = await import("../lib/realtime");
+      if (rt.sendLiveText(t)) return;
+    }
     setSending(true);
     try {
       await fetch("/api/chat", {

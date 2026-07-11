@@ -102,6 +102,18 @@ export function nudgeLive(text: string) {
   }
 }
 
+// Typed input while live is on goes INTO the live session — one brain, one
+// voice, instead of a parallel text-lane answer being re-spoken as a paraphrase.
+export function sendLiveText(text: string): boolean {
+  if (!session) return false;
+  try {
+    session.sendMessage(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 let starting = false;
 export async function startLive(h: LiveHandlers) {
   if (session || starting) return; // double-tap = one session, never two voices
