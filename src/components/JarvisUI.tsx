@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
-import Orb from "./Orb";
+import ThreeOrb from "./ThreeOrb";
 
 const THREAD = "main";
 type Msg = { _id: string; role: string; text: string; status: string };
@@ -82,6 +82,7 @@ export default function JarvisUI() {
   }
 
   const status = speaking ? "speaking…" : busy ? "thinking…" : listening ? "listening…" : "online";
+  const orbState = speaking ? "speaking" : busy ? "thinking" : listening ? "listening" : "idle";
 
   return (
     <div className="mx-auto grid w-full max-w-6xl flex-1 gap-4 p-4 md:grid-cols-2">
@@ -123,7 +124,7 @@ export default function JarvisUI() {
           </div>
         ) : (
           <>
-            <Orb speaking={speaking} energyRef={energyRef} />
+            <ThreeOrb state={orbState} energyRef={energyRef} />
             <div className="pointer-events-none absolute bottom-3 left-0 right-0 text-center text-xs tracking-widest text-neutral-500">
               {status}
             </div>
