@@ -23,6 +23,31 @@ const ytId = (s: string) => {
   return m ? m[1] : null;
 };
 
+// One speaking tab per Daniel — everyone else stays quiet (voice election).
+function clientId(): string {
+  try {
+    let id = sessionStorage.getItem("jarvis_client");
+    if (!id) {
+      id = Math.random().toString(36).slice(2, 10);
+      sessionStorage.setItem("jarvis_client", id);
+    }
+    return id;
+  } catch {
+    return "anon";
+  }
+}
+
+// Minimal, safe markdown for result panels: escape everything, then linkify
+// [title](url) + headers + bold. No raw HTML ever passes through.
+function mdToHtml(src: string): string {
+  const esc = src.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return esc
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer" class="text-cyan underline decoration-cyan/40 hover:decoration-cyan">$1</a>')
+    .replace(/^## (.+)$/gm, '<div class="mb-2 mt-1 text-base font-semibold text-ice">$1</div>')
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\n/g, "<br/>");
+}
+
 // Persistent media card in the stream — click to put it back on the big screen.
 function MediaCard({ a, onShow }: { a: Attachment; onShow: (a: Attachment) => void }) {
   const id = a.type === "video" ? ytId(a.value) : null;
@@ -108,20 +133,69 @@ function AgentLiveView({ job, now, onClose }: { job: Job; now: number; onClose: 
   );
 }
 
+// Scrollable full-page screenshot dressed as a browser — the "embed" that
+// works on every site (real iframes are blocked nearly everywhere).
+function SiteView({ url }: { url: string }) {
+  const [state, setState] = useState<"loading" | "ok" | "fail">("loading");
+  return (
+    <div className="flex min-h-0 flex-1 flex-col bg-[#0d1526]">
+      <div className="flex items-center gap-2 border-b border-white/5 px-3 py-1.5">
+        <span className="flex gap-1">
+          <span className="h-2 w-2 rounded-full bg-red-400/60" />
+          <span className="h-2 w-2 rounded-full bg-amber/60" />
+          <span className="h-2 w-2 rounded-full bg-emerald-400/60" />
+        </span>
+        <a href={url} target="_blank" rel="noreferrer" className="min-w-0 flex-1 truncate rounded bg-black/30 px-2 py-0.5 font-mono text-[10px] text-slate hover:text-cyan" title="open live site">
+          {url}
+        </a>
+      </div>
+      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto">
+        {state === "loading" && (
+          <div className="flex h-full items-center justify-center gap-2 p-10 text-xs text-slate">
+            <span className="h-2 w-2 animate-ping rounded-full bg-cyan" /> capturing the page…
+          </div>
+        )}
+        {state === "fail" && (
+          <div className="p-10 text-center text-sm text-slate">
+            Couldn&apos;t capture that page.{" "}
+            <a href={url} target="_blank" rel="noreferrer" className="text-cyan underline">
+              Open it in a tab ↗
+            </a>
+          </div>
+        )}
+        <img
+          src={`/api/snap?url=${encodeURIComponent(url)}`}
+          alt=""
+          className={`w-full ${state === "ok" ? "" : "hidden"}`}
+          onLoad={() => setState("ok")}
+          onError={() => setState("fail")}
+        />
+      </div>
+    </div>
+  );
+}
+
 function Viewport({
   panel,
   onClose,
   onMinimize,
+  full,
+  onToggleFull,
 }: {
   panel: { type: string; value: string; title?: string };
   onClose: () => void;
   onMinimize: () => void;
+  full: boolean;
+  onToggleFull: () => void;
 }) {
   return (
     <div className="materialize glass relative flex h-full flex-col overflow-hidden rounded-2xl">
       <div className="flex items-center justify-between border-b border-white/5 px-3 py-2">
         <span className="hud-label truncate !text-cyan-dim">{panel.title ?? panel.type}</span>
         <span className="flex shrink-0 gap-1">
+          <button onClick={onToggleFull} className="hud-label rounded px-2 py-1 hover:text-cyan" title={full ? "shrink" : "full screen"}>
+            {full ? "◱ shrink" : "⛶ expand"}
+          </button>
           <button onClick={onMinimize} className="hud-label rounded px-2 py-1 hover:text-cyan" title="fold away, keep handy">
             ▾ orb
           </button>
@@ -130,7 +204,9 @@ function Viewport({
           </button>
         </span>
       </div>
-      {panel.type === "url" || panel.type === "video" ? (
+      {panel.type === "site" ? (
+        <SiteView url={panel.value} />
+      ) : panel.type === "url" || panel.type === "video" ? (
         <div className="flex min-h-0 flex-1 flex-col">
           <iframe
             src={panel.value}
@@ -138,11 +214,6 @@ function Viewport({
             sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-presentation"
             allow="autoplay; encrypted-media; picture-in-picture"
           />
-          {panel.type === "url" && (
-            <a href={panel.value} target="_blank" rel="noreferrer" className="p-2 text-center text-xs text-cyan/80">
-              open in a tab ↗ (blank means the site blocks embedding)
-            </a>
-          )}
         </div>
       ) : panel.type === "image" ? (
         <img src={panel.value} alt={panel.title ?? ""} className="min-h-0 flex-1 object-contain" />
@@ -151,9 +222,10 @@ function Viewport({
           {panel.value}
         </pre>
       ) : (
-        <pre className="scrollbar-thin min-h-0 flex-1 overflow-auto whitespace-pre-wrap p-4 text-sm leading-relaxed text-ice">
-          {panel.value}
-        </pre>
+        <div
+          className="scrollbar-thin min-h-0 flex-1 overflow-auto p-4 text-sm leading-relaxed text-ice"
+          dangerouslySetInnerHTML={{ __html: mdToHtml(panel.value) }}
+        />
       )}
     </div>
   );
@@ -169,6 +241,8 @@ export default function JarvisUI() {
   const setPanel = useMutation(api.ui.setPanel);
   const logTurn = useMutation(api.chatQueue.logTurn);
   const saveSub = useMutation(api.push.saveSub);
+  const claimVoice = useMutation(api.ui.claimVoice);
+  const voiceRow = useQuery(api.ui.getVoice, {}) as { value: string; updatedAt: number } | null | undefined;
   const activeJobs = (useQuery(api.jobs.active, {}) ?? []) as Job[];
 
   const [input, setInput] = useState("");
@@ -196,6 +270,65 @@ export default function JarvisUI() {
   const recRef = useRef<MediaRecorder | null>(null);
   const liveRef = useRef(false);
   const lastLiveUser = useRef<string | null>(null);
+  const me = useRef("");
+  const voiceRef = useRef<{ value: string; updatedAt: number } | null>(null);
+  const lastSent = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
+  const [wake, setWake] = useState(false);
+  const [panelFull, setPanelFull] = useState(false);
+  const panelFullRef = useRef(false);
+  useEffect(() => {
+    panelFullRef.current = panelFull;
+  }, [panelFull]);
+
+  // Standby wake word: "hey jarvis" / "jarvis" starts live mode, Siri-style.
+  const rearmWake = () => {
+    if (localStorage.getItem("jarvis_wake") !== "1") return;
+    import("../lib/wakeword").then((m) => {
+      if (!m.wakeSupported()) return;
+      m.startWake(() => {
+        setWake(false);
+        m.chime();
+        void toggleLive(true);
+      });
+      setWake(true);
+    });
+  };
+  function toggleWake() {
+    import("../lib/wakeword").then((m) => {
+      if (!m.wakeSupported()) {
+        alert("Wake word needs Chrome/Edge/Safari speech recognition.");
+        return;
+      }
+      if (wake) {
+        localStorage.setItem("jarvis_wake", "0");
+        m.stopWake();
+        setWake(false);
+      } else {
+        localStorage.setItem("jarvis_wake", "1");
+        rearmWake();
+      }
+    });
+  }
+  useEffect(() => {
+    rearmWake(); // resume standby across reloads if Daniel left it on
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    me.current = clientId();
+  }, []);
+  useEffect(() => {
+    voiceRef.current = voiceRow ?? null;
+  }, [voiceRow]);
+  // I speak only if I own the voice (or nobody fresh does — then I claim it).
+  function mayISpeak(): boolean {
+    const v = voiceRef.current;
+    if (!v || Date.now() - v.updatedAt > 3 * 60 * 1000) {
+      void claimVoice({ client: me.current });
+      return true;
+    }
+    return v.value === me.current;
+  }
 
   useEffect(() => {
     if (!activeJobs.length) return;
@@ -253,7 +386,8 @@ export default function JarvisUI() {
       return;
     }
     lastSpokenId.current = last._id;
-    if (last.model === "live") return;
+    if (last.model === "live" || !last.text) return;
+    if (!mayISpeak()) return; // another tab/device owns the voice
     if (liveRef.current) {
       // Only voice true background events (agent weaves, insights — untagged rows).
       // Model-tagged rows are replies to someone's typed message and were
@@ -276,9 +410,13 @@ export default function JarvisUI() {
   async function submit(text: string) {
     const t = text.trim();
     if (!t) return;
+    // double-tap / Enter+click within 2.5s = one send, not two
+    if (t === lastSent.current.text && Date.now() - lastSent.current.ts < 2500) return;
+    lastSent.current = { text: t, ts: Date.now() };
+    void claimVoice({ client: me.current });
     import("../lib/tts").then((m) => m.warm());
     setInput("");
-    if (panel) setPanelMin(true); // new message → viewport folds away, orb returns
+    if (panel && !panelFull) setPanelMin(true); // new message → viewport folds away, orb returns
     if (liveRef.current) {
       // Live session is the single brain while it's on — no parallel text answer.
       const rt = await import("../lib/realtime");
@@ -303,16 +441,21 @@ export default function JarvisUI() {
     setSpeaking(false);
   }
 
-  async function toggleLive() {
+  async function toggleLive(forceStart = false) {
     const rt = await import("../lib/realtime");
-    if (liveRef.current || live !== "off") {
+    if (!forceStart && (liveRef.current || live !== "off")) {
       rt.stopLive();
       liveRef.current = false;
       setLive("off");
       setCaption(null);
+      rearmWake();
       return;
     }
+    if (liveRef.current) return;
+    void claimVoice({ client: me.current });
     import("../lib/tts").then((m) => m.stopSpeaking());
+    const { stopWake } = await import("../lib/wakeword");
+    stopWake(); // wake listener and live mic can't share nicely
     await rt.startLive({
       onState: (s, detail) => {
         if (s === "live") {
@@ -323,14 +466,24 @@ export default function JarvisUI() {
           liveRef.current = false;
           setLive("off");
           setCaption(null);
+          rearmWake();
           if (s === "error") alert(`Live mode couldn't start: ${detail ?? "unknown error"}`);
         }
+      },
+      onExitRequest: () => {
+        liveRef.current = false;
+        setLive("off");
+        setCaption(null);
+        rearmWake();
       },
       onCaption: (who, text, done) => setCaption(done ? null : { who, text }),
       onTurnDone: (role, text) => {
         void logTurn({ threadId: THREAD, role, text, model: role === "assistant" ? "live" : undefined });
-        if (role === "user") setPanelMin((min) => min || lastPanelAt.current < Date.now() - 8000);
-        if (role === "user") lastLiveUser.current = text;
+        if (role === "user") {
+          void claimVoice({ client: me.current });
+          if (!panelFullRef.current) setPanelMin((min) => min || lastPanelAt.current < Date.now() - 8000);
+          lastLiveUser.current = text;
+        }
         else if (lastLiveUser.current) {
           void fetch("/api/extract", {
             method: "POST",
@@ -350,6 +503,7 @@ export default function JarvisUI() {
       recRef.current?.stop();
       return;
     }
+    void claimVoice({ client: me.current });
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
@@ -419,6 +573,13 @@ export default function JarvisUI() {
             <span className={`h-1.5 w-1.5 rounded-full ${live === "live" ? "bg-cyan" : "bg-emerald-400"} breathe`} />
             <span className="hud-label">{status}</span>
           </span>
+          <button
+            onClick={toggleWake}
+            title={wake ? "standby on — say 'hey Jarvis'" : "enable wake word"}
+            className={`hud-label rounded px-1 transition ${wake ? "!text-cyan" : "hover:text-cyan"}`}
+          >
+            {wake ? "◉ hey jarvis" : "wake"}
+          </button>
           <Clock />
           <button
             onClick={async () => {
@@ -476,9 +637,15 @@ export default function JarvisUI() {
               ))}
             </div>
           )}
-          {panel && !panelMin ? (
+          {panel && !panelMin && !panelFull ? (
             <div className="absolute inset-0 z-20 p-1">
-              <Viewport panel={panel} onClose={() => clearPanel({})} onMinimize={() => setPanelMin(true)} />
+              <Viewport
+                panel={panel}
+                onClose={() => clearPanel({})}
+                onMinimize={() => setPanelMin(true)}
+                full={false}
+                onToggleFull={() => setPanelFull(true)}
+              />
             </div>
           ) : shownJob ? (
             <div className="absolute inset-0 z-20 p-1">
@@ -510,7 +677,7 @@ export default function JarvisUI() {
             {messages.length === 0 && (
               <p className="mt-10 text-center text-sm text-slate">Say the word, sir.</p>
             )}
-            {messages.slice(-80).map((m) => (
+            {messages.slice(-80).filter((m) => m.text || m.attachment || m.status === "streaming").map((m) => (
               <div key={m._id} className={`rise ${m.role === "user" ? "text-right" : "text-left"}`}>
                 {m.attachment ? (
                   <MediaCard
@@ -544,7 +711,7 @@ export default function JarvisUI() {
           {/* composer */}
           <div className="flex items-stretch gap-2 border-t border-white/5 p-3">
             <button
-              onClick={toggleLive}
+              onClick={() => void toggleLive()}
               title="live conversation"
               className={`flex shrink-0 items-center gap-1.5 rounded-xl px-3 text-sm transition ${
                 live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "glass text-slate hover:text-ice"
@@ -592,6 +759,53 @@ export default function JarvisUI() {
           </div>
         </div>
       </div>
+
+      {/* full-screen viewport — keeps a floating composer so Daniel can still talk */}
+      {panel && panelFull && (
+        <div className="fixed inset-0 z-50 flex flex-col bg-black/80 p-3 backdrop-blur-sm md:p-6">
+          <div className="min-h-0 flex-1">
+            <Viewport
+              panel={panel}
+              onClose={() => {
+                setPanelFull(false);
+                void clearPanel({});
+              }}
+              onMinimize={() => {
+                setPanelFull(false);
+                setPanelMin(true);
+              }}
+              full
+              onToggleFull={() => setPanelFull(false)}
+            />
+          </div>
+          <div className="mx-auto mt-3 flex w-full max-w-2xl gap-2">
+            {(speaking || (live === "live" && caption?.who === "jarvis")) && (
+              <button onClick={stopTalking} className="shrink-0 rounded-xl bg-red-500/15 px-3 text-sm text-red-300 ring-1 ring-red-500/40">
+                hush
+              </button>
+            )}
+            {live === "live" && caption ? (
+              <span className={`glass min-w-0 flex-1 truncate rounded-xl px-4 py-2.5 text-sm ${caption.who === "you" ? "text-amber" : "text-cyan"}`}>
+                {caption.text}
+              </span>
+            ) : (
+              <input
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && submit(input)}
+                placeholder="Talk to me…"
+                className="glass min-w-0 flex-1 rounded-xl px-4 py-2.5 text-sm text-ice outline-none focus:ring-1 focus:ring-cyan/50"
+              />
+            )}
+            <button
+              onClick={() => submit(input)}
+              className="shrink-0 rounded-xl bg-cyan/15 px-4 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40"
+            >
+              send
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

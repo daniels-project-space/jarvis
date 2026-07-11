@@ -15,7 +15,7 @@ export const TOOL_DEFS = [
       properties: {
         task: { type: "string", description: "Clear, self-contained task including all context the agent needs (URLs, video IDs, what to find out)" },
         repo: { type: "string", description: "owner/repo or short name if the task is about a specific repo, else omit" },
-        model: { type: "string", enum: ["haiku", "sonnet", "opus"], description: "opus for hard engineering, sonnet default, haiku for trivial lookups" },
+        model: { type: "string", enum: ["haiku", "sonnet", "opus"], description: "sonnet for research/summaries/normal code (DEFAULT — fast), opus ONLY for hard multi-file engineering, haiku for trivial lookups" },
         mcp: { type: "array", items: { type: "string", enum: ["playwright", "context7"] }, description: "Optional MCP servers: playwright for live browser automation, context7 for library docs" },
       },
       required: ["task"],
@@ -38,8 +38,24 @@ export const TOOL_DEFS = [
   { name: "hide", description: "Clear the screen panel.", parameters: { type: "object", properties: {} } },
   {
     name: "web_search",
-    description: "Quick web search (top results with snippets). For deeper digging, dispatch_agent instead.",
+    description:
+      "Fast web search — the full result list automatically appears on Daniel's screen; you speak the one-line takeaway. Use this (not dispatch_agent) for anything findable in one search: prices, hotels, news, facts.",
     parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+  },
+  {
+    name: "flight_search",
+    description:
+      "Live flight search (Google Flights) — full results with prices/times appear on Daniel's screen instantly; speak only the best option. Use this for ANY flight question, never dispatch_agent.",
+    parameters: {
+      type: "object",
+      properties: {
+        from: { type: "string", description: "departure IATA airport code, e.g. LHR or LON" },
+        to: { type: "string", description: "arrival IATA code, e.g. DPS for Bali" },
+        depart_date: { type: "string", description: "YYYY-MM-DD" },
+        return_date: { type: "string", description: "YYYY-MM-DD, omit for one-way" },
+      },
+      required: ["from", "to", "depart_date"],
+    },
   },
   {
     name: "youtube_search",
@@ -139,6 +155,13 @@ async function serpapi(params: Record<string, string>): Promise<any> {
 }
 
 async function youtubeSearch(query: string): Promise<string> {
+  const showList = async (vids: { id: string; title: string; channel: string; length: string }[]) => {
+    const md = [`## YouTube · ${query}`, ""];
+    vids.forEach((v, i) =>
+      md.push(`${i + 1}. [${v.title}](https://www.youtube.com/watch?v=${v.id})`, `   ${v.channel} · ${v.length}`, ""),
+    );
+    await showResultsPanel(`youtube · ${query.slice(0, 36)}`, md.join("\n"));
+  };
   // Free path: scrape ytInitialData from the results page.
   try {
     const r = await fetch(`https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`, {
@@ -161,10 +184,14 @@ async function youtubeSearch(query: string): Promise<string> {
         } else for (const k of Object.keys(o)) walk(o[k]);
       };
       walk(JSON.parse(m[1]));
-      if (vids.length)
-        return vids
-          .map((v) => `${v.title} — ${v.channel} (${v.length}) https://www.youtube.com/watch?v=${v.id} [id:${v.id}]`)
-          .join("\n");
+      if (vids.length) {
+        await showList(vids);
+        return (
+          vids
+            .map((v) => `${v.title} — ${v.channel} (${v.length}) https://www.youtube.com/watch?v=${v.id} [id:${v.id}]`)
+            .join("\n") + "\n(The list is on Daniel's screen — offer to play one.)"
+        );
+      }
     }
   } catch {
     /* fall through */
@@ -172,7 +199,18 @@ async function youtubeSearch(query: string): Promise<string> {
   const j = await serpapi({ engine: "youtube", search_query: query });
   const vids = (j?.video_results ?? []).slice(0, 6);
   if (!vids.length) return "No results found.";
-  return vids.map((v: any) => `${v.title} — ${v.channel?.name ?? ""} (${v.length ?? ""}) ${v.link}`).join("\n");
+  await showList(
+    vids.map((v: any) => ({
+      id: YT_ID(v.link) ?? "",
+      title: v.title,
+      channel: v.channel?.name ?? "",
+      length: v.length ?? "",
+    })),
+  );
+  return (
+    vids.map((v: any) => `${v.title} — ${v.channel?.name ?? ""} (${v.length ?? ""}) ${v.link}`).join("\n") +
+    "\n(The list is on Daniel's screen — offer to play one.)"
+  );
 }
 
 async function youtubeTranscript(video: string): Promise<string> {
@@ -210,14 +248,66 @@ async function youtubeTranscript(video: string): Promise<string> {
   }
 }
 
+// Searches always land on Daniel's screen as a full result list, not just in
+// the model's head — he asked for multiple visible results every time.
+async function showResultsPanel(title: string, md: string) {
+  await convexMutation("ui:setPanel", { type: "markdown", value: md.slice(0, 7000), title }).catch(() => {});
+}
+
 async function webSearch(query: string): Promise<string> {
-  const j = await serpapi({ engine: "google", q: query, num: "6" });
+  const j = await serpapi({ engine: "google", q: query, num: "8" });
   if (!j) return "Search unavailable right now.";
   const parts: string[] = [];
-  if (j.answer_box?.answer) parts.push(`Answer: ${j.answer_box.answer}`);
-  if (j.answer_box?.snippet) parts.push(`Answer: ${j.answer_box.snippet}`);
-  for (const r of (j.organic_results ?? []).slice(0, 6)) parts.push(`${r.title} — ${r.snippet ?? ""} (${r.link})`);
-  return parts.join("\n") || "No results.";
+  const md: string[] = [`## ${query}`, ""];
+  if (j.answer_box?.answer || j.answer_box?.snippet) {
+    const a = j.answer_box.answer ?? j.answer_box.snippet;
+    parts.push(`Answer: ${a}`);
+    md.push(`**${a}**`, "");
+  }
+  let n = 0;
+  for (const r of (j.organic_results ?? []).slice(0, 8)) {
+    n++;
+    parts.push(`${r.title} — ${r.snippet ?? ""} (${r.link})`);
+    md.push(`${n}. [${r.title}](${r.link})`, `   ${r.snippet ?? ""}`, "");
+  }
+  await showResultsPanel(`search · ${query.slice(0, 40)}`, md.join("\n"));
+  return (parts.join("\n") || "No results.") + "\n(The full result list is on Daniel's screen.)";
+}
+
+async function flightSearch(args: any): Promise<string> {
+  const params: Record<string, string> = {
+    engine: "google_flights",
+    departure_id: String(args.from ?? "").toUpperCase(),
+    arrival_id: String(args.to ?? "").toUpperCase(),
+    outbound_date: String(args.depart_date ?? ""),
+    currency: "GBP",
+    hl: "en",
+  };
+  if (args.return_date) params.return_date = String(args.return_date);
+  else params.type = "2"; // one-way
+  const j = await serpapi(params);
+  if (!j) return "Flight search unavailable right now.";
+  if (j.error) return `Flight search said: ${String(j.error).slice(0, 200)}`;
+  const flights = [...(j.best_flights ?? []), ...(j.other_flights ?? [])].slice(0, 8);
+  if (!flights.length) return "No flights found for those airports/dates.";
+  const lines: string[] = [];
+  const md: string[] = [`## Flights ${params.departure_id} → ${params.arrival_id} · ${params.outbound_date}${args.return_date ? " – " + args.return_date : ""}`, ""];
+  let n = 0;
+  for (const f of flights) {
+    n++;
+    const legs = f.flights ?? [];
+    const airlines = [...new Set(legs.map((l: any) => l.airline))].join(" + ");
+    const stops = legs.length - 1;
+    const dur = Math.round((f.total_duration ?? 0) / 60 * 10) / 10;
+    const price = f.price ? `£${f.price}` : "?";
+    lines.push(`${airlines}: ${price}, ${dur}h, ${stops === 0 ? "direct" : `${stops} stop${stops > 1 ? "s" : ""}`}`);
+    md.push(`${n}. **${airlines}** — ${price} · ${dur}h · ${stops === 0 ? "direct" : `${stops} stop${stops > 1 ? "s" : ""}`}`);
+    for (const l of legs) md.push(`   - ${l.departure_airport?.id} ${l.departure_airport?.time?.slice(-5) ?? ""} → ${l.arrival_airport?.id} ${l.arrival_airport?.time?.slice(-5) ?? ""} (${l.flight_number ?? ""})`);
+    md.push("");
+  }
+  if (j.search_metadata?.google_flights_url) md.push(`[Open in Google Flights](${j.search_metadata.google_flights_url})`);
+  await showResultsPanel(`flights · ${params.departure_id}→${params.arrival_id}`, md.join("\n"));
+  return lines.slice(0, 5).join("\n") + "\n(Full list with times is on Daniel's screen — speak only the best one or two.)";
 }
 
 async function readUrl(url: string): Promise<string> {
@@ -257,8 +347,29 @@ export async function executeTool(name: string, args: any): Promise<string> {
       if (id) {
         kind = "video";
         value = `https://www.youtube.com/embed/${id}`;
-      } else if (!kind || !["url", "video", "image", "code", "markdown"].includes(kind)) {
+      } else if (!kind || !["url", "video", "image", "code", "markdown", "site"].includes(kind)) {
         kind = /\.(png|jpe?g|gif|webp|svg)(\?|$)/i.test(value) ? "image" : /^https?:\/\//i.test(value) ? "url" : "markdown";
+      }
+      // Nearly every real site blocks iframes — check, and fall back to the
+      // screenshot-based "site" viewport that looks embedded and scrolls.
+      if (kind === "url") {
+        kind = "site";
+        try {
+          const ctl = new AbortController();
+          const t = setTimeout(() => ctl.abort(), 6000);
+          const r = await fetch(value, {
+            signal: ctl.signal,
+            redirect: "follow",
+            headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126" },
+          });
+          clearTimeout(t);
+          const xfo = (r.headers.get("x-frame-options") ?? "").toLowerCase();
+          const csp = (r.headers.get("content-security-policy") ?? "").toLowerCase();
+          const blocked = xfo.includes("deny") || xfo.includes("sameorigin") || csp.includes("frame-ancestors");
+          if (!blocked) kind = "url"; // genuinely embeddable — use the real thing
+        } catch {
+          /* unreachable/odd site → screenshot mode */
+        }
       }
       await convexMutation("ui:setPanel", { type: kind, value: String(value), title: title ? String(title) : undefined });
       // Everything shown also lands in the stream as a persistent card.
@@ -275,6 +386,8 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return "Cleared.";
     case "web_search":
       return await webSearch(String(args.query));
+    case "flight_search":
+      return await flightSearch(args);
     case "youtube_search":
       return await youtubeSearch(String(args.query));
     case "youtube_transcript":

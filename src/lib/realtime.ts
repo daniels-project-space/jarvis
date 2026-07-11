@@ -12,6 +12,7 @@ export type LiveHandlers = {
   onCaption: (who: "you" | "jarvis", text: string, done: boolean) => void;
   onTurnDone: (role: "user" | "assistant", text: string) => void;
   onEnergy: (e: number) => void;
+  onExitRequest?: () => void; // Daniel said "turn off live mode" — model calls exit_live_mode
 };
 
 let session: RealtimeSession | null = null;
@@ -128,12 +129,27 @@ export async function startLive(h: LiveHandlers) {
     document.body.appendChild(audioEl);
     const transport = new OpenAIRealtimeWebRTC({ audioElement: audioEl });
 
+    const exitTool = tool({
+      name: "exit_live_mode",
+      description:
+        "End the live voice conversation. Call when Daniel says to turn off live mode, stop listening, go quiet, go to sleep, or that he's done talking.",
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      parameters: { type: "object", properties: {}, required: [], additionalProperties: false } as any,
+      strict: false,
+      execute: async () => {
+        setTimeout(() => {
+          stopLive();
+          h.onExitRequest?.();
+        }, 1800); // let the goodbye line finish speaking first
+        return "Say one short goodbye line — the session ends right after.";
+      },
+    });
     const agent = new RealtimeAgent({
       name: "JARVIS",
       // Instructions + persona + context are baked into the minted session
       // server-side; keep the client agent instruction-free so it doesn't clobber them.
       instructions: "",
-      tools: await clientTools(),
+      tools: [...(await clientTools()), exitTool],
     });
     session = new RealtimeSession(agent, { transport, model: tk.model || "gpt-realtime-mini" });
 

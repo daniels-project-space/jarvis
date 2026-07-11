@@ -14,7 +14,7 @@ export async function POST() {
   if (!key) return Response.json({ error: "no openai key" }, { status: 500 });
 
   const ctx = await buildContext();
-  const instructions = `${PERSONA}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${ctx.block}\n\nCurrent date: ${new Date().toDateString()}. This is a live voice conversation — replies of one or two short sentences, always. Daniel speaks English: treat everything you hear as English and reply ONLY in English, whatever it sounds like.`;
+  const instructions = `${PERSONA}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${ctx.block}\n\nCurrent date: ${new Date().toDateString()}. This is a live voice conversation — replies of one or two short sentences, always. Daniel speaks English: treat everything you hear as English and reply ONLY in English, whatever it sounds like. When he says to turn off live mode, stop listening, or go quiet: say one short goodbye and call exit_live_mode.`;
 
   const r = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
     method: "POST",

@@ -111,13 +111,14 @@ export async function POST(req: NextRequest) {
     return Response.json({ ok: true, text: final, tools: used });
   } catch (e: any) {
     await reportIncident("api/chat", `chat:${String(e?.message ?? e).slice(0, 80)}`, String(e?.message ?? e));
-    // Let the Trigger cron dispatcher pick this up instead of dropping the turn:
-    // mark the streaming row as an apology, re-queue the user text as pending.
+    // Hand the turn to the Trigger cron dispatcher SILENTLY (an empty error row
+    // is hidden by the UI) — an apology bubble here meant Daniel got two spoken
+    // answers for one question.
     await convexMutation("chatQueue:finalize", {
       messageId: assistantId,
       threadId,
-      status: "done",
-      finalText: "One second, sir — taking the scenic route on that one.",
+      status: "error",
+      finalText: "",
     }).catch(() => {});
     await convexMutation("chatQueue:sendMessage", { threadId, text }).catch(() => {});
     return Response.json({ ok: false, fallback: true, error: String(e?.message ?? e) }, { status: 200 });

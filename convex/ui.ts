@@ -23,3 +23,21 @@ export const getPanel = query({
   args: {},
   handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first(),
 });
+
+// Voice election: exactly ONE open tab/device speaks assistant lines out loud
+// (the one Daniel last interacted with, or the live-mode tab). Everyone else
+// stays silent — this is what kills the "two voices" problem for good.
+export const claimVoice = mutation({
+  args: { client: v.string() },
+  handler: async (ctx, a) => {
+    const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "voice")).first();
+    const doc = { key: "voice", type: "voice", value: a.client, updatedAt: Date.now() };
+    if (ex) await ctx.db.patch(ex._id, doc);
+    else await ctx.db.insert("ui", doc);
+  },
+});
+
+export const getVoice = query({
+  args: {},
+  handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "voice")).first(),
+});
