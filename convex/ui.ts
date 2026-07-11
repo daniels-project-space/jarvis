@@ -41,3 +41,28 @@ export const getVoice = query({
   args: {},
   handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "voice")).first(),
 });
+
+// Global live-mode lock: at most ONE live session across all of Daniel's
+// devices, and while it's fresh no tab anywhere plays local TTS. The live
+// voice is the only possible speaker — two voices become impossible.
+export const setLiveOn = mutation({
+  args: { client: v.string(), on: v.boolean() },
+  handler: async (ctx, a) => {
+    const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "liveOn")).first();
+    if (!a.on) {
+      if (ex && ex.value === a.client) await ctx.db.delete(ex._id);
+      return true;
+    }
+    // refuse a second live session while another client's lock is fresh
+    if (ex && ex.value !== a.client && Date.now() - ex.updatedAt < 45_000) return false;
+    const doc = { key: "liveOn", type: "flag", value: a.client, updatedAt: Date.now() };
+    if (ex) await ctx.db.patch(ex._id, doc);
+    else await ctx.db.insert("ui", doc);
+    return true;
+  },
+});
+
+export const getLiveOn = query({
+  args: {},
+  handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "liveOn")).first(),
+});

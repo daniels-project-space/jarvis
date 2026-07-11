@@ -242,7 +242,9 @@ export default function JarvisUI() {
   const logTurn = useMutation(api.chatQueue.logTurn);
   const saveSub = useMutation(api.push.saveSub);
   const claimVoice = useMutation(api.ui.claimVoice);
+  const setLiveOn = useMutation(api.ui.setLiveOn);
   const voiceRow = useQuery(api.ui.getVoice, {}) as { value: string; updatedAt: number } | null | undefined;
+  const liveOnRow = useQuery(api.ui.getLiveOn, {}) as { value: string; updatedAt: number } | null | undefined;
   const activeJobs = (useQuery(api.jobs.active, {}) ?? []) as Job[];
 
   const [input, setInput] = useState("");
@@ -311,6 +313,15 @@ export default function JarvisUI() {
   }
   useEffect(() => {
     rearmWake(); // resume standby across reloads if Daniel left it on
+    // release the live lock instantly if the tab closes mid-session
+    const bye = () => {
+      if (!liveRef.current) return;
+      const url = `${process.env.NEXT_PUBLIC_CONVEX_URL}/api/mutation`;
+      const body = JSON.stringify({ path: "ui:setLiveOn", args: { client: me.current, on: false }, format: "json" });
+      navigator.sendBeacon?.(url, new Blob([body], { type: "application/json" }));
+    };
+    window.addEventListener("pagehide", bye);
+    return () => window.removeEventListener("pagehide", bye);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -320,6 +331,22 @@ export default function JarvisUI() {
   useEffect(() => {
     voiceRef.current = voiceRow ?? null;
   }, [voiceRow]);
+  const liveOnRef = useRef<{ value: string; updatedAt: number } | null>(null);
+  useEffect(() => {
+    liveOnRef.current = liveOnRow ?? null;
+  }, [liveOnRow]);
+  // A fresh live session anywhere = local TTS is forbidden everywhere.
+  const liveAnywhere = () => {
+    const l = liveOnRef.current;
+    return !!l && Date.now() - l.updatedAt < 45_000;
+  };
+  // The instant a live session starts anywhere, cut any local speech mid-word.
+  useEffect(() => {
+    if (liveOnRow && Date.now() - liveOnRow.updatedAt < 45_000 && !liveRef.current) {
+      import("../lib/tts").then((m) => m.stopSpeaking());
+      setSpeaking(false);
+    }
+  }, [liveOnRow]);
   // I speak only if I own the voice (or nobody fresh does — then I claim it).
   function mayISpeak(): boolean {
     const v = voiceRef.current;
@@ -387,7 +414,6 @@ export default function JarvisUI() {
     }
     lastSpokenId.current = last._id;
     if (last.model === "live" || !last.text) return;
-    if (!mayISpeak()) return; // another tab/device owns the voice
     if (liveRef.current) {
       // Only voice true background events (agent weaves, insights — untagged rows).
       // Model-tagged rows are replies to someone's typed message and were
@@ -395,6 +421,10 @@ export default function JarvisUI() {
       if (!last.model) import("../lib/realtime").then((m) => m.nudgeLive(last.text));
       return;
     }
+    // HARD RULE: while a live session exists on ANY device, nothing else may
+    // produce speech — the live voice is the only speaker in the house.
+    if (liveAnywhere()) return;
+    if (!mayISpeak()) return; // another tab/device owns the voice
     if (document.hidden) return; // background tabs stay silent — one voice, ever
     (async () => {
       const { speak } = await import("../lib/tts");
@@ -441,6 +471,13 @@ export default function JarvisUI() {
     setSpeaking(false);
   }
 
+  const liveBeat = useRef<ReturnType<typeof setInterval> | null>(null);
+  function releaseLive() {
+    if (liveBeat.current) clearInterval(liveBeat.current);
+    liveBeat.current = null;
+    void setLiveOn({ client: me.current, on: false }).catch(() => {});
+  }
+
   async function toggleLive(forceStart = false) {
     const rt = await import("../lib/realtime");
     if (!forceStart && (liveRef.current || live !== "off")) {
@@ -448,10 +485,18 @@ export default function JarvisUI() {
       liveRef.current = false;
       setLive("off");
       setCaption(null);
+      releaseLive();
       rearmWake();
       return;
     }
     if (liveRef.current) return;
+    // One live session TOTAL, across every device — the lock refuses seconds.
+    const got = await setLiveOn({ client: me.current, on: true }).catch(() => true);
+    if (got === false) {
+      alert("Live mode is already running on another device — turn it off there first.");
+      rearmWake();
+      return;
+    }
     void claimVoice({ client: me.current });
     import("../lib/tts").then((m) => m.stopSpeaking());
     const { stopWake } = await import("../lib/wakeword");
@@ -461,11 +506,15 @@ export default function JarvisUI() {
         if (s === "live") {
           liveRef.current = true;
           setLive("live");
+          // keep the cross-device lock fresh for as long as we're live
+          if (liveBeat.current) clearInterval(liveBeat.current);
+          liveBeat.current = setInterval(() => void setLiveOn({ client: me.current, on: true }).catch(() => {}), 20_000);
         } else if (s === "connecting") setLive("connecting");
         else {
           liveRef.current = false;
           setLive("off");
           setCaption(null);
+          releaseLive();
           rearmWake();
           if (s === "error") alert(`Live mode couldn't start: ${detail ?? "unknown error"}`);
         }
@@ -474,6 +523,7 @@ export default function JarvisUI() {
         liveRef.current = false;
         setLive("off");
         setCaption(null);
+        releaseLive();
         rearmWake();
       },
       onCaption: (who, text, done) => setCaption(done ? null : { who, text }),
