@@ -1,6 +1,7 @@
 import type { NextRequest } from "next/server";
 import { PERSONA, INFRA_MAP } from "@/lib/persona";
 import { buildContext, convexMutation } from "@/lib/context";
+import { extractMemory } from "@/lib/extract";
 import { TOOL_DEFS, executeTool } from "@/lib/tools";
 import { getSecret } from "@/lib/vault";
 
@@ -28,40 +29,6 @@ async function groq(key: string, body: Record<string, unknown>): Promise<any> {
   throw new Error(`groq failed — ${lastErr}`);
 }
 
-// Post-turn memory capture on the cheapest fast model — decoupled from the reply.
-async function extractMemory(key: string, userText: string, assistantText: string) {
-  try {
-    const j = await fetch(GROQ_URL, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "llama-3.1-8b-instant",
-        max_tokens: 400,
-        messages: [
-          {
-            role: "user",
-            content:
-              'Extract ONLY durable facts, preferences, or decisions worth remembering long-term about Daniel or his projects from this exchange. STRICT JSON array of {"kind","title","body"} (kind: fact|preference|decision|project). [] if nothing durable.\n\n' +
-              `User: ${userText}\nAssistant: ${assistantText}`,
-          },
-        ],
-      }),
-    }).then((r) => r.json());
-    const m = String(j.choices?.[0]?.message?.content ?? "").match(/\[[\s\S]*\]/);
-    if (!m) return;
-    for (const it of JSON.parse(m[0]).slice(0, 4)) {
-      if (!it?.title || !it?.body) continue;
-      await convexMutation("memory:write", {
-        kind: String(it.kind ?? "fact"),
-        title: String(it.title).slice(0, 120),
-        body: String(it.body).slice(0, 1200),
-        tags: [],
-      });
-    }
-  } catch {
-    /* memory capture is best-effort */
-  }
-}
 
 export async function POST(req: NextRequest) {
   let text = "",

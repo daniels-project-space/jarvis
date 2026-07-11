@@ -130,6 +130,7 @@ export default function JarvisUI() {
   const energyRef = useRef(0);
   const recRef = useRef<MediaRecorder | null>(null);
   const liveRef = useRef(false);
+  const lastLiveUser = useRef<string | null>(null);
 
   useEffect(() => {
     if (!activeJobs.length) return;
@@ -226,6 +227,15 @@ export default function JarvisUI() {
       onCaption: (who, text, done) => setCaption(done ? null : { who, text }),
       onTurnDone: (role, text) => {
         void logTurn({ threadId: THREAD, role, text, model: role === "assistant" ? "live" : undefined });
+        if (role === "user") lastLiveUser.current = text;
+        else if (lastLiveUser.current) {
+          void fetch("/api/extract", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ user: lastLiveUser.current, assistant: text }),
+          });
+          lastLiveUser.current = null;
+        }
       },
       onEnergy: (e) => (energyRef.current = e),
     });
