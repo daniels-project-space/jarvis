@@ -275,6 +275,7 @@ export const chatDispatcher = schedules.task({
           Array.isArray(biz) && biz.length
             ? biz.map((b: any) => `${b.headline}${b.detail ? " " + b.detail : ""}`).join("\n").slice(0, 1600)
             : "";
+        const model = pickModel(claim.userText);
         const turn = await runTurn(
           bin,
           env,
@@ -284,7 +285,7 @@ export const chatDispatcher = schedules.task({
           memoryContext,
           stackContext,
           businessContext,
-          pickModel(claim.userText),
+          model,
         );
         const finalText =
           turn.finalText.trim() ||
@@ -297,6 +298,7 @@ export const chatDispatcher = schedules.task({
           status: turn.finalText.trim() ? "done" : "error",
           finalText,
           claudeSessionId: turn.sessionId ?? undefined,
+          model,
         });
         // Stage 0: capture durable memory from this turn (after reply is delivered).
         if (turn.finalText.trim())

@@ -33,6 +33,7 @@ export default defineSchema({
     role: v.string(), // "user" | "assistant"
     text: v.string(),
     status: v.string(), // "pending" | "streaming" | "done" | "error"
+    model: v.optional(v.string()), // which tier answered (haiku|sonnet|opus)
     createdAt: v.number(),
   })
     .index("by_thread", ["threadId", "createdAt"])
@@ -63,6 +64,8 @@ export default defineSchema({
     result: v.optional(v.string()),
     readonly: v.optional(v.boolean()), // if true, runner never commits/pushes
     model: v.optional(v.string()), // optional model override (haiku|sonnet|opus)
+    progress: v.optional(v.string()), // live activity line the runner streams
+    startedAt: v.optional(v.number()),
     createdAt: v.number(),
   }).index("by_status", ["status", "createdAt"]),
 

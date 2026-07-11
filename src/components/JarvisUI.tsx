@@ -5,7 +5,49 @@ import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
 
 const THREAD = "main";
-type Msg = { _id: string; role: string; text: string; status: string };
+type Msg = { _id: string; role: string; text: string; status: string; model?: string };
+type Job = { _id: string; task: string; model?: string; status: string; progress?: string; startedAt: number };
+
+function ModelBadge({ model }: { model?: string | null }) {
+  if (!model) return null;
+  const c =
+    model === "opus"
+      ? "bg-purple-500/25 text-purple-200"
+      : model === "haiku"
+        ? "bg-slate-500/25 text-slate-300"
+        : "bg-sky-500/25 text-sky-200";
+  return <span className={`rounded px-1 py-px text-[9px] font-medium uppercase tracking-wide ${c}`}>{model}</span>;
+}
+
+function AgentLiveView({ job, now, onClose }: { job: Job; now: number; onClose: () => void }) {
+  const elapsed = Math.max(0, Math.floor((now - job.startedAt) / 1000));
+  const pct = job.status === "running" ? Math.min(95, 6 + Math.round((elapsed / 180) * 90)) : 6;
+  return (
+    <div className="flex h-full flex-col p-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 text-xs text-neutral-400">
+          <ModelBadge model={job.model} />
+          <span>{job.status === "running" ? "working" : "queued"} · {elapsed}s</span>
+        </div>
+        <button onClick={onClose} className="rounded bg-neutral-800 px-2 py-0.5 text-xs text-neutral-300 hover:bg-neutral-700">
+          ✕ orb
+        </button>
+      </div>
+      <div className="mt-3 text-sm text-neutral-200">{job.task}</div>
+      <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-neutral-800">
+        <div
+          className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-cyan-400 transition-all duration-1000"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <div className="mt-4 flex-1 overflow-auto rounded-xl border border-neutral-800 bg-black/40 p-3 font-mono text-xs leading-relaxed text-emerald-300/90">
+        <span className="mr-1 text-emerald-500">›</span>
+        {job.progress || "starting up…"}
+        <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-emerald-400/70 align-middle" />
+      </div>
+    </div>
+  );
+}
 
 export default function JarvisUI() {
   const messages = (useQuery(api.chatQueue.listMessages, { threadId: THREAD }) ?? []) as Msg[];
@@ -23,7 +65,18 @@ export default function JarvisUI() {
   const lastSpokenId = useRef<string | null>(null);
   const recRef = useRef<any>(null);
   const energyRef = useRef(0);
+  const activeJobs = (useQuery(api.jobs.active, {}) ?? []) as Job[];
+  const [agentView, setAgentView] = useState<string | null>(null);
+  const [nowTs, setNowTs] = useState(0);
 
+  useEffect(() => {
+    if (!activeJobs.length) return;
+    setNowTs(Date.now());
+    const t = setInterval(() => setNowTs(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [activeJobs.length]);
+
+  const shownJob = activeJobs.find((j) => j._id === agentView) ?? null;
   const busy = messages.some((m) => m.role === "assistant" && m.status === "streaming");
 
   useEffect(() => {
@@ -87,6 +140,24 @@ export default function JarvisUI() {
   return (
     <div className="mx-auto grid w-full max-w-6xl flex-1 gap-4 p-4 md:grid-cols-2">
       <div className="relative min-h-[45vh] overflow-hidden rounded-2xl border border-neutral-800 bg-gradient-to-b from-neutral-950 to-black">
+        {activeJobs.length > 0 && (
+          <div className="absolute left-2 right-2 top-2 z-10 flex flex-wrap gap-1.5">
+            {activeJobs.map((j) => (
+              <button
+                key={j._id}
+                onClick={() => setAgentView(agentView === j._id ? null : j._id)}
+                className={`flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] ${agentView === j._id ? "border-emerald-500 bg-emerald-500/20 text-emerald-200" : "border-neutral-700 bg-neutral-900/80 text-neutral-300 hover:bg-neutral-800"}`}
+              >
+                <span className="relative flex h-1.5 w-1.5">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                  <span className="inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                </span>
+                <ModelBadge model={j.model} />
+                <span className="max-w-[120px] truncate">{j.task}</span>
+              </button>
+            ))}
+          </div>
+        )}
         {panel ? (
           <div className="flex h-full flex-col">
             <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-2">
@@ -122,6 +193,8 @@ export default function JarvisUI() {
               </pre>
             )}
           </div>
+        ) : shownJob ? (
+          <AgentLiveView job={shownJob} now={nowTs} onClose={() => setAgentView(null)} />
         ) : (
           <>
             <ThreeOrb state={orbState} energyRef={energyRef} />
@@ -145,6 +218,11 @@ export default function JarvisUI() {
               >
                 {m.text || (m.status === "streaming" ? "…" : "")}
               </span>
+              {m.role === "assistant" && m.model && (
+                <div className="mt-0.5 pl-1 text-[9px] uppercase tracking-wider text-neutral-600">
+                  handled by {m.model}
+                </div>
+              )}
             </div>
           ))}
           <div ref={endRef} />

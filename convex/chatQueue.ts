@@ -117,10 +117,12 @@ export const finalize = mutation({
     status: v.union(v.literal("done"), v.literal("error")),
     finalText: v.optional(v.string()),
     claudeSessionId: v.optional(v.string()),
+    model: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     const patch: Record<string, unknown> = { status: a.status };
     if (a.finalText !== undefined) patch.text = a.finalText;
+    if (a.model) patch.model = a.model;
     await ctx.db.patch(a.messageId, patch);
     const s = await ctx.db
       .query("chatSessions")

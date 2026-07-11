@@ -69,6 +69,7 @@ function runClaude(
   env: NodeJS.ProcessEnv,
   prompt: string,
   model: string,
+  onProgress?: (s: string) => void,
 ): Promise<string> {
   return new Promise((resolve) => {
     const p = spawn(
@@ -78,6 +79,16 @@ function runClaude(
     );
     let buf = "";
     let finalText = "";
+    let latest = "starting up…";
+    let dirty = false;
+    const timer = onProgress
+      ? setInterval(() => {
+          if (dirty) {
+            dirty = false;
+            onProgress(latest);
+          }
+        }, 1500)
+      : null;
     const to = setTimeout(() => {
       try {
         p.kill("SIGKILL");
@@ -99,15 +110,27 @@ function runClaude(
         } catch {
           continue;
         }
-        if (ev.type === "result" && typeof ev.result === "string") finalText = ev.result;
+        if (ev.type === "assistant" && ev.message?.content) {
+          for (const b of ev.message.content) {
+            if (b.type === "tool_use") {
+              latest = `Using ${b.name}${b.input?.command ? ": " + String(b.input.command).slice(0, 80) : b.input?.file_path ? ": " + b.input.file_path : ""}`;
+              dirty = true;
+            } else if (b.type === "text" && b.text?.trim()) {
+              latest = b.text.trim().replace(/\s+/g, " ").slice(-160);
+              dirty = true;
+            }
+          }
+        } else if (ev.type === "result" && typeof ev.result === "string") finalText = ev.result;
       }
     });
     p.on("close", () => {
       clearTimeout(to);
+      if (timer) clearInterval(timer);
       resolve(finalText || "(no output)");
     });
     p.on("error", (e) => {
       clearTimeout(to);
+      if (timer) clearInterval(timer);
       resolve("error: " + e.message);
     });
   });
@@ -151,7 +174,9 @@ export const agentRunner = schedules.task({
           }
         }
         const model = typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task);
-        const result = await runClaude(bin, cwd, env, `${context}\n\nTask: ${job.task}`, model);
+        const result = await runClaude(bin, cwd, env, `${context}\n\nTask: ${job.task}`, model, (line) => {
+          void convexMutation("jobs:updateProgress", { jobId: job.jobId, progress: line });
+        });
 
         let pushNote = "";
         if (repoDir && token && !job.readonly) {
