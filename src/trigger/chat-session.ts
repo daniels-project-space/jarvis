@@ -271,10 +271,15 @@ export const chatDispatcher = schedules.task({
             ? stack.map((s: any) => `${s.slug}=${s.status}`).join(", ").slice(0, 1200)
             : "";
         const biz: any = await convexQuery("business:list", {}).catch(() => []);
-        const businessContext =
-          Array.isArray(biz) && biz.length
-            ? biz.map((b: any) => `${b.headline}${b.detail ? " " + b.detail : ""}`).join("\n").slice(0, 1600)
+        const ins: any = await convexQuery("business:recentInsights", { limit: 5 }).catch(() => []);
+        const bizLines = Array.isArray(biz)
+          ? biz.map((b: any) => `${b.headline}${b.detail ? " " + b.detail : ""}`).join("\n")
+          : "";
+        const insLines =
+          Array.isArray(ins) && ins.length
+            ? "Insights you've noticed recently:\n" + ins.map((i: any) => `- ${i.text}`).join("\n")
             : "";
+        const businessContext = [bizLines, insLines].filter(Boolean).join("\n").slice(0, 1800);
         const model = pickModel(claim.userText);
         const turn = await runTurn(
           bin,

@@ -7,6 +7,7 @@ import { schedules } from "@trigger.dev/sdk/v3";
 const JARVIS = "https://tangible-goose-318.convex.cloud";
 const RENTAL = "https://hearty-oyster-600.convex.cloud";
 const MUSIC = "https://determined-aardvark-936.convex.cloud";
+const YOUTUBE = "https://astute-camel-689.convex.cloud";
 
 async function convexQuery(url: string, path: string, args: unknown) {
   try {
@@ -98,12 +99,49 @@ async function pollMusic() {
   });
 }
 
+async function pollYouTube() {
+  // Channels table may be unpopulated (rebuild early-stage) — light up automatically
+  // once a channel is linked; until then, be honest rather than fabricate.
+  let ov: any = null;
+  for (const owner of ["o", "default", "owner_test", ""]) {
+    const r: any = await convexQuery(YOUTUBE, "analytics:overview", { ownerId: owner });
+    if (r && (r.channelCount ?? 0) > 0) {
+      ov = r;
+      break;
+    }
+  }
+  if (ov) {
+    const headline =
+      `YouTube: ${ov.channelCount} channel${ov.channelCount === 1 ? "" : "s"}, ` +
+      `${(ov.totalSubscribers ?? 0).toLocaleString("en-GB")} subscribers, ` +
+      `${(ov.totalViews ?? 0).toLocaleString("en-GB")} total views.`;
+    await jarvisMutation("business:upsert", { domain: "youtube", headline, data: ov });
+  } else {
+    await jarvisMutation("business:upsert", {
+      domain: "youtube",
+      headline:
+        "No YouTube channel is linked yet, so I can't see views or subscribers. Link one and I'll start tracking it.",
+      data: { channels: 0 },
+    });
+  }
+}
+
+async function pollAds() {
+  // No ad platform is connected in the vault (no Google Ads / Meta). State it plainly.
+  await jarvisMutation("business:upsert", {
+    domain: "ads",
+    headline:
+      "No ad accounts are connected yet, so there's no ad performance to report. Wire up Google Ads or Meta and I'll watch it for you.",
+    data: { connected: false },
+  });
+}
+
 export const businessPoller = schedules.task({
   id: "jarvis-business-poller",
   cron: "*/30 * * * *",
   maxDuration: 120,
   run: async () => {
-    await Promise.all([pollRental(), pollMusic()]);
-    return { polled: ["rental", "music"] };
+    await Promise.all([pollRental(), pollMusic(), pollYouTube(), pollAds()]);
+    return { polled: ["rental", "music", "youtube", "ads"] };
   },
 });

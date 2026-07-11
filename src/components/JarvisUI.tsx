@@ -23,7 +23,7 @@ function AgentLiveView({ job, now, onClose }: { job: Job; now: number; onClose: 
   const elapsed = Math.max(0, Math.floor((now - job.startedAt) / 1000));
   const pct = job.status === "running" ? Math.min(95, 6 + Math.round((elapsed / 180) * 90)) : 6;
   return (
-    <div className="flex h-full flex-col p-4">
+    <div className="flex h-full flex-col p-4 pt-11">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2 text-xs text-neutral-400">
           <ModelBadge model={job.model} />
