@@ -274,11 +274,18 @@ async function webSearch(query: string): Promise<string> {
   return (parts.join("\n") || "No results.") + "\n(The full result list is on Daniel's screen.)";
 }
 
+// Google Flights rejects metro codes — map them to the main airport.
+const METRO: Record<string, string> = {
+  LON: "LHR", NYC: "JFK", PAR: "CDG", TYO: "NRT", MIL: "MXP", ROM: "FCO",
+  STO: "ARN", MOW: "SVO", BER: "BER", CHI: "ORD", WAS: "IAD", SAO: "GRU", BUE: "EZE",
+};
+
 async function flightSearch(args: any): Promise<string> {
+  const fix = (c: string) => METRO[c] ?? c;
   const params: Record<string, string> = {
     engine: "google_flights",
-    departure_id: String(args.from ?? "").toUpperCase(),
-    arrival_id: String(args.to ?? "").toUpperCase(),
+    departure_id: fix(String(args.from ?? "").toUpperCase().trim()),
+    arrival_id: fix(String(args.to ?? "").toUpperCase().trim()),
     outbound_date: String(args.depart_date ?? ""),
     currency: "GBP",
     hl: "en",
@@ -287,7 +294,7 @@ async function flightSearch(args: any): Promise<string> {
   else params.type = "2"; // one-way
   const j = await serpapi(params);
   if (!j) return "Flight search unavailable right now.";
-  if (j.error) return `Flight search said: ${String(j.error).slice(0, 200)}`;
+  if (j.error) return `Flight search said: ${String(j.error).slice(0, 200)} (tip: use specific airport codes like LHR, not city codes)`;
   const flights = [...(j.best_flights ?? []), ...(j.other_flights ?? [])].slice(0, 8);
   if (!flights.length) return "No flights found for those airports/dates.";
   const lines: string[] = [];
@@ -350,27 +357,10 @@ export async function executeTool(name: string, args: any): Promise<string> {
       } else if (!kind || !["url", "video", "image", "code", "markdown", "site"].includes(kind)) {
         kind = /\.(png|jpe?g|gif|webp|svg)(\?|$)/i.test(value) ? "image" : /^https?:\/\//i.test(value) ? "url" : "markdown";
       }
-      // Nearly every real site blocks iframes — check, and fall back to the
-      // screenshot-based "site" viewport that looks embedded and scrolls.
-      if (kind === "url") {
-        kind = "site";
-        try {
-          const ctl = new AbortController();
-          const t = setTimeout(() => ctl.abort(), 6000);
-          const r = await fetch(value, {
-            signal: ctl.signal,
-            redirect: "follow",
-            headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126" },
-          });
-          clearTimeout(t);
-          const xfo = (r.headers.get("x-frame-options") ?? "").toLowerCase();
-          const csp = (r.headers.get("content-security-policy") ?? "").toLowerCase();
-          const blocked = xfo.includes("deny") || xfo.includes("sameorigin") || csp.includes("frame-ancestors");
-          if (!blocked) kind = "url"; // genuinely embeddable — use the real thing
-        } catch {
-          /* unreachable/odd site → screenshot mode */
-        }
-      }
+      // Real sites block iframes almost universally (headers, CSP variants, JS
+      // frame-busting) — websites always get the screenshot "site" viewport,
+      // which looks embedded and scrolls. Only YouTube keeps a real iframe.
+      if (kind === "url") kind = "site";
       await convexMutation("ui:setPanel", { type: kind, value: String(value), title: title ? String(title) : undefined });
       // Everything shown also lands in the stream as a persistent card.
       await convexMutation("chatQueue:postCard", {
