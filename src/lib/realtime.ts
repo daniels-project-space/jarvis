@@ -105,7 +105,7 @@ export async function startLive(h: LiveHandlers) {
       instructions: "",
       tools: await clientTools(),
     });
-    session = new RealtimeSession(agent, { transport });
+    session = new RealtimeSession(agent, { transport, model: tk.model || "gpt-realtime-mini" });
 
     const mirrored = new Set<string>();
     session.on("history_updated", (history: any[]) => {
