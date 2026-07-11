@@ -41,7 +41,7 @@ export default function JarvisUI() {
     if (!last || last._id === lastSpokenId.current) return;
     lastSpokenId.current = last._id;
     (async () => {
-      const { speak } = await import("../lib/kokoro");
+      const { speak } = await import("../lib/tts");
       await speak(
         last.text,
         (e) => (energyRef.current = e),
@@ -54,7 +54,7 @@ export default function JarvisUI() {
   async function submit(text: string) {
     const t = text.trim();
     if (!t) return;
-    import("../lib/kokoro").then((m) => m.warm()); // gesture-warm audio + model
+    import("../lib/tts").then((m) => m.warm()); // gesture-warm audio + model
     setInput("");
     await send({ threadId: THREAD, text: t });
   }
