@@ -117,6 +117,24 @@ export const getActiveThread = query({
   },
 });
 
+// Housekeeping: drop dead threads from the registry (test/empty chats).
+export const pruneThreads = mutation({
+  args: { ids: v.array(v.string()) },
+  handler: async (ctx, a) => {
+    const reg = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "threads")).first();
+    if (!reg) return 0;
+    let list: { id: string }[] = [];
+    try {
+      list = JSON.parse(reg.value);
+    } catch {
+      return 0;
+    }
+    const keep = list.filter((t) => !a.ids.includes(t.id));
+    await ctx.db.patch(reg._id, { value: JSON.stringify(keep), updatedAt: Date.now() });
+    return list.length - keep.length;
+  },
+});
+
 export const getThreads = query({
   args: {},
   handler: async (ctx) => {

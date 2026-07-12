@@ -535,8 +535,9 @@ function VideoDock({
     };
   }, [stageRef]);
   if (!rect) return null;
+  // PiP pins inside the stage's bottom-right corner — never over the chat.
   const style: React.CSSProperties = pip
-    ? { top: window.innerHeight - 292, left: window.innerWidth - 372, width: 356, height: 240 }
+    ? { top: Math.max(8, rect.t + rect.h - 252), left: Math.max(8, rect.l + rect.w - 372), width: 356, height: 240 }
     : { top: rect.t + 4, left: rect.l + 4, width: rect.w - 8, height: rect.h - 8 };
   return (
     <div className="glass fixed z-40 flex flex-col overflow-hidden rounded-2xl shadow-2xl transition-all duration-500 ease-in-out" style={style}>
