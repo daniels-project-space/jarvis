@@ -51,7 +51,7 @@ function groqToolDef(t: { name: string; description?: string; parameters?: any }
         ...t,
         parameters: {
           ...p,
-          properties: { _noop: { type: "string", description: "unused — pass an empty string" } },
+          properties: { _noop: { type: ["string", "null"], description: "unused — pass an empty string" } },
         },
       },
     };
@@ -89,6 +89,8 @@ const SLOW_LINES: Record<string, string> = {
   plan_my_day: "Assembling your day — one moment.",
   briefing: "Pulling your briefing together — one moment.",
   orchestrate: "Spinning up the fleet now.",
+  trip_finalize: "Locking it in — building the itinerary now.",
+  create_pdf: "Drafting the document now.",
   news_today: "Grabbing today's front pages.",
 };
 
@@ -158,7 +160,9 @@ export async function POST(req: NextRequest) {
           const line = msg.tool_calls.map((tc: any) => SLOW_LINES[tc.function.name]).find(Boolean);
           if (line) {
             interimSaid = true;
-            await convexMutation("chatQueue:postAssistant", { threadId, text: line }).catch(() => {});
+            // Ephemeral voice line — NOT a chat row (a row inserted mid-turn
+            // sorts after the answer placeholder and silences the answer).
+            await convexMutation("ui:say", { text: line }).catch(() => {});
           }
         }
         for (const tc of msg.tool_calls) {

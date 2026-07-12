@@ -402,6 +402,15 @@ export function FeedView({ value }: { value: string }) {
   const [page, setPage] = useState(0);
   const setPanel = useMutation(api.ui.setPanel);
 
+  // fresh content = fresh presentation (state survives panel swaps otherwise:
+  // a second search used to open on a stale page/grid)
+  const label = w?.label;
+  useEffect(() => {
+    setPhase("hero");
+    setIdx(0);
+    setPage(0);
+  }, [label]);
+
   // hero presentation: each story holds ~4.2s, fades to the next, then the grid
   useEffect(() => {
     if (phase !== "hero") return;
@@ -425,24 +434,25 @@ export function FeedView({ value }: { value: string }) {
   if (w.mode === "videos") {
     const per = 3;
     const pages = Math.max(1, Math.ceil(items.length / per));
-    const slice = items.slice(page * per, page * per + per);
+    const cur = Math.min(page, pages - 1);
+    const slice = items.slice(cur * per, cur * per + per);
     return (
       <div className="flex min-h-0 flex-1 flex-col p-4">
         <div className="mb-3 flex items-center justify-between">
           <span className="hud-label">{items.length} videos</span>
           <div className="flex items-center gap-2">
-            <button disabled={page === 0} onClick={() => setPage((p) => p - 1)} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">
+            <button disabled={cur === 0} onClick={() => setPage(Math.max(0, cur - 1))} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">
               &lsaquo; prev
             </button>
-            <span className="hud-label">{page + 1}/{pages}</span>
-            <button disabled={page >= pages - 1} onClick={() => setPage((p) => p + 1)} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">
+            <span className="hud-label">{cur + 1}/{pages}</span>
+            <button disabled={cur >= pages - 1} onClick={() => setPage(Math.min(pages - 1, cur + 1))} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">
               next &rsaquo;
             </button>
           </div>
         </div>
         <div className="grid flex-1 grid-cols-1 content-center gap-4 md:grid-cols-3">
           {slice.map((it, i) => {
-            const n = page * per + i + 1;
+            const n = cur * per + i + 1;
             return (
               <button key={n} onClick={() => open(it)} className="tile rise group text-left" style={{ animationDelay: `${i * 90}ms` }}>
                 <div className="relative">
@@ -521,7 +531,7 @@ export function FeedView({ value }: { value: string }) {
 
 /* ---------------------------------- shopping frames ---------------------------------- */
 
-type ShopItem = { image: string; title: string; price: string; merchant: string; delivery?: string; rating?: number; url?: string };
+type ShopItem = { image: string; title: string; price: string; merchant: string; delivery?: string; rating?: number; reviews?: number; url?: string };
 
 // Three products per page, each presented cut-out style on its own lit frame.
 export function ShopView({ value }: { value: string }) {
@@ -532,28 +542,31 @@ export function ShopView({ value }: { value: string }) {
     /* noop */
   }
   const [page, setPage] = useState(0);
+  const label = w?.label;
+  useEffect(() => setPage(0), [label]);
   if (!w?.items?.length) return <div className="flex flex-1 items-center justify-center text-sm text-slate">nothing found</div>;
   const per = 3;
   const pages = Math.max(1, Math.ceil(w.items.length / per));
-  const slice = w.items.slice(page * per, page * per + per);
+  const cur = Math.min(page, pages - 1);
+  const slice = w.items.slice(cur * per, cur * per + per);
   return (
     <div className="flex min-h-0 flex-1 flex-col p-4">
       <div className="mb-3 flex items-center justify-between">
         <span className="hud-label">{w.items.length} picks</span>
         <div className="flex items-center gap-2">
-          <button disabled={page === 0} onClick={() => setPage((p) => p - 1)} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">
+          <button disabled={cur === 0} onClick={() => setPage(Math.max(0, cur - 1))} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">
             &lsaquo; prev
           </button>
-          <span className="hud-label">{page + 1}/{pages}</span>
-          <button disabled={page >= pages - 1} onClick={() => setPage((p) => p + 1)} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">
+          <span className="hud-label">{cur + 1}/{pages}</span>
+          <button disabled={cur >= pages - 1} onClick={() => setPage(Math.min(pages - 1, cur + 1))} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">
             next &rsaquo;
           </button>
         </div>
       </div>
       <div className="grid flex-1 grid-cols-1 content-center gap-5 md:grid-cols-3">
         {slice.map((it, i) => {
-          const n = page * per + i + 1;
-          const fast = it.delivery && /free|next|tomorrow|1 day|24 h/i.test(it.delivery);
+          const n = cur * per + i + 1;
+          const fast = it.delivery && /same.day|next.day|tomorrow|\b1 day|\b1-2 day|24 ?h/i.test(it.delivery);
           return (
             <div key={n} className="tile rise flex flex-col" style={{ animationDelay: `${i * 90}ms` }}>
               <div className="relative m-3 mb-0 grid h-44 place-items-center rounded-xl bg-[radial-gradient(circle_at_50%_88%,rgba(0,255,136,0.12),transparent_62%),linear-gradient(180deg,rgba(255,255,255,0.05),rgba(255,255,255,0.015))] ring-1 ring-white/10">
@@ -572,7 +585,7 @@ export function ShopView({ value }: { value: string }) {
                 </div>
                 <div className="mt-0.5 flex items-center gap-2 text-[10px] text-slate">
                   {it.delivery && <span className="truncate">{it.delivery}</span>}
-                  {it.rating != null && <span className="shrink-0 text-amber">&#9733; {it.rating}</span>}
+                  {it.rating != null && <span className="shrink-0 text-amber">&#9733; {it.rating}{it.reviews ? ` (${it.reviews.toLocaleString("en-GB")})` : ""}</span>}
                 </div>
                 <div className="mt-auto pt-2.5">
                   {it.url && (

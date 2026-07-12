@@ -1903,22 +1903,26 @@ async function shopSearch(args: any): Promise<string> {
   if (!key) return "Shopping search unavailable.";
   const qs = new URLSearchParams({ engine: "google_shopping", q: query, gl: "uk", hl: "en", num: "20", api_key: key });
   const j: any = await (await fetch(`https://serpapi.com/search.json?${qs}`, { signal: AbortSignal.timeout(10000) })).json();
+  if (j?.error) return `Shopping search failed: ${String(j.error).slice(0, 120)}`;
+  const FAST = /same.day|next.day|tomorrow|\b1 day|\b1-2 day|24 ?h/i;
   let items = (j?.shopping_results ?? [])
     .filter((r: any) => r.thumbnail && r.extracted_price)
     .map((r: any) => ({
       image: String(r.thumbnail),
       title: String(r.title).slice(0, 90),
-      price: `£${r.extracted_price}`,
+      priceNum: Number(r.extracted_price),
+      price: String(r.price ?? `£${r.extracted_price}`).slice(0, 14),
       merchant: String(r.source ?? "").slice(0, 30),
       delivery: String(r.delivery ?? "").slice(0, 40),
       rating: r.rating,
+      reviews: r.reviews,
       url: String(r.product_link ?? r.link ?? ""),
     }));
   const cap = Number(args.max_price_gbp) || 0;
-  if (cap) items = items.filter((i: any) => parseFloat(String(i.price).replace("£", "")) <= cap);
-  // fast delivery floats up
-  items.sort((a: any, b: any) => (/free|tomorrow|1 day|next day/i.test(b.delivery) ? 1 : 0) - (/free|tomorrow|1 day|next day/i.test(a.delivery) ? 1 : 0));
-  items = items.slice(0, 12);
+  if (cap) items = items.filter((i: any) => i.priceNum <= cap);
+  // genuinely fast delivery floats up ("free delivery on £120+" is not fast)
+  items.sort((a: any, b: any) => (FAST.test(b.delivery) ? 1 : 0) - (FAST.test(a.delivery) ? 1 : 0));
+  items = items.slice(0, 12).map(({ priceNum, ...i }: any) => i);
   if (!items.length) return `Nothing solid for "${query}" — refine the search terms.`;
   await showWidget({ kind: "shop", label: query, items }, `shopping · ${query.slice(0, 30)}`);
   return (

@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
@@ -616,6 +616,8 @@ export default function JarvisUI() {
     | { type: string; value: string; title?: string; updatedAt: number }
     | null
     | undefined;
+  const sayRow = useQuery(api.ui.getSay, {}) as { value: string; updatedAt: number } | null | undefined;
+  const stagePanelSize = useMemo(() => (panel ? panelSize(panel) : ""), [panel]);
   const clearPanel = useMutation(api.ui.clearPanel);
   const setPanel = useMutation(api.ui.setPanel);
   const logTurn = useMutation(api.chatQueue.logTurn);
@@ -969,6 +971,31 @@ export default function JarvisUI() {
       window.removeEventListener("unhandledrejection", onRej);
     };
   }, []);
+
+  // Ephemeral progress lines (ui:say): voiced once, never in the transcript.
+  const lastSayAt = useRef<number>(-1);
+  useEffect(() => {
+    if (sayRow === undefined) return;
+    const at = sayRow?.updatedAt ?? 0;
+    if (lastSayAt.current === -1) {
+      lastSayAt.current = at; // mount: never replay an old line
+      return;
+    }
+    if (!sayRow?.value || at === lastSayAt.current) return;
+    lastSayAt.current = at;
+    if (Date.now() - at > 15_000) return; // stale
+    if (liveRef.current || liveAnywhere() || !mayISpeak() || document.hidden) return;
+    (async () => {
+      const { speak } = await import("../lib/tts");
+      await speak(
+        sayRow.value,
+        (e) => (energyRef.current = e),
+        () => setSpeaking(true),
+        () => setSpeaking(false),
+      );
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sayRow]);
 
   // Speak new finalized assistant messages (text lane). Live-lane rows were
   // already spoken by the realtime session; while live is on, nudge the live
@@ -1373,8 +1400,8 @@ export default function JarvisUI() {
             </div>
           )}
           {panel && panel.type !== "video" && !panelMin && !panelFull ? (
-            <div className={`absolute inset-0 z-20 flex items-center p-1 ${panelSize(panel) !== "h-full w-full" ? "justify-center md:justify-start md:pl-8" : "justify-center"}`}>
-              <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${panelSize(panel)}`}>
+            <div className={`absolute inset-0 z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-8" : "justify-center"}`}>
+              <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${stagePanelSize}`}>
                 <Viewport
                   panel={panel}
                   onClose={() => clearPanel({})}
@@ -1393,7 +1420,7 @@ export default function JarvisUI() {
           <div
             className={`h-full w-full transition-all duration-[900ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
               panel && !panelMin && !panelFull
-                ? panel.type !== "video" && panelSize(panel) !== "h-full w-full"
+                ? panel.type !== "video" && stagePanelSize !== "h-full w-full"
                   ? "opacity-[0.14] md:translate-x-[36%] md:scale-[0.38] md:opacity-95"
                   : "opacity-[0.12]"
                 : "opacity-100"

@@ -99,6 +99,24 @@ export const setMood = mutation({
     else await ctx.db.insert("ui", doc);
   },
 });
+// One ephemeral spoken line ("out shopping, give me a few seconds") — the
+// client voices it once and it never appears in the transcript. Using a chat
+// row for this broke speech ordering: the interim row outlived the answer row
+// in createdAt order, so the answer was never spoken.
+export const say = mutation({
+  args: { text: v.string() },
+  handler: async (ctx, a) => {
+    const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "say")).first();
+    const doc = { key: "say", type: "say", value: a.text, updatedAt: Date.now() };
+    if (ex) await ctx.db.patch(ex._id, doc);
+    else await ctx.db.insert("ui", doc);
+  },
+});
+export const getSay = query({
+  args: {},
+  handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "say")).first(),
+});
+
 export const getMood = query({
   args: {},
   handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "mood")).first(),
