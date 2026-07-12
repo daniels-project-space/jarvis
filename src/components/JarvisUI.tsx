@@ -868,6 +868,12 @@ export default function JarvisUI() {
     const onErr = (e: ErrorEvent) => {
       if (isChunkError(e.error ?? e.message)) { recoverStaleChunks(); return; } // stale post-deploy chunk
       if (e.message === "Script error." || !e.message) return; // cross-origin iframe noise, unactionable
+      // Benign browser warning, not an app fault: fired as a window error event
+      // whenever a ResizeObserver callback schedules layout that triggers another
+      // resize in the same frame (our PiP overlay + orb observers do this by
+      // design). The spec guarantees the pending notifications are delivered on
+      // the next frame — nothing to fix, so keep it out of the incident pipeline.
+      if (/^ResizeObserver loop /i.test(e.message)) return;
       report(`client:${String(e.message).slice(0, 80)}`, `${e.message} @ ${e.filename}:${e.lineno}`);
     };
     const onRej = (e: PromiseRejectionEvent) => {
