@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
+import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView } from "./Views";
 
 type Attachment = { type: string; value: string; title?: string };
 type Msg = {
@@ -55,6 +56,7 @@ const WIDGET_ICON: Record<string, string> = {
   market: "📈",
   timer: "⏱",
   briefing: "📋",
+  calendar: "📅",
 };
 
 // Persistent media card in the stream — click to put it back on the big screen.
@@ -78,7 +80,17 @@ function MediaCard({ a, onShow }: { a: Attachment; onShow: (a: Attachment) => vo
           <img src={a.value} alt="" className="h-12 w-20 shrink-0 rounded-lg object-cover" />
         ) : (
           <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-cyan/10 text-lg">
-            {a.type === "widget" ? WIDGET_ICON[widgetKind] ?? "🧩" : a.type === "url" || a.type === "site" ? "🌐" : a.type === "code" ? "‹›" : "📄"}
+            {a.type === "widget"
+              ? WIDGET_ICON[widgetKind] ?? "🧩"
+              : a.type === "url" || a.type === "site"
+                ? "🌐"
+                : a.type === "code"
+                  ? "‹›"
+                  : a.type === "pdf"
+                    ? "📕"
+                    : a.type === "canvas"
+                      ? "🕸"
+                      : "📄"}
           </span>
         )}
         <span className="min-w-0">
@@ -230,6 +242,7 @@ function WidgetView({ value }: { value: string }) {
     /* fall through */
   }
   if (w?.kind === "timer") return <TimerWidget w={w} />;
+  if (w?.kind === "calendar") return <CalendarView value={value} />;
   if (w?.kind === "market") {
     return (
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6">
@@ -442,6 +455,14 @@ function Viewport({
         <SiteView url={panel.value} />
       ) : panel.type === "widget" ? (
         <WidgetView value={panel.value} />
+      ) : panel.type === "canvas" ? (
+        <CanvasView value={panel.value} />
+      ) : panel.type === "launch" ? (
+        <LaunchView value={panel.value} />
+      ) : panel.type === "pdf" ? (
+        <PdfView url={panel.value} title={panel.title} />
+      ) : panel.type === "creations" ? (
+        <CreationsView value={panel.value} />
       ) : panel.type === "url" || panel.type === "video" ? (
         <div className="flex min-h-0 flex-1 flex-col">
           <iframe
@@ -507,7 +528,19 @@ export default function JarvisUI() {
     if (panel && panel.updatedAt !== lastPanelAt.current) {
       lastPanelAt.current = panel.updatedAt;
       setPanelMin(false);
+      // Content-first moments (briefing, calendar, maps, library, documents,
+      // launches): the chat steps aside on its own — expand it back any time.
+      let focus = ["canvas", "creations", "pdf", "launch"].includes(panel.type);
+      if (panel.type === "widget") {
+        try {
+          focus = ["briefing", "calendar", "stats"].includes(JSON.parse(panel.value)?.kind);
+        } catch {
+          /* not json */
+        }
+      }
+      if (focus && chatModeRef.current === "full") setChatMode("bar", false);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [panel]);
 
   const endRef = useRef<HTMLDivElement>(null);
@@ -525,6 +558,31 @@ export default function JarvisUI() {
   useEffect(() => {
     panelFullRef.current = panelFull;
   }, [panelFull]);
+
+  // Chat presence: full column ↔ floating type bar ↔ hidden ("zen"). Zen keeps
+  // JARVIS always listening (wake word forced on) with no chrome in the way.
+  const [chatMode, setChatModeRaw] = useState<"full" | "bar" | "off">("full");
+  const chatModeRef = useRef<"full" | "bar" | "off">("full");
+  const setChatMode = (m: "full" | "bar" | "off", persist = true) => {
+    chatModeRef.current = m;
+    setChatModeRaw(m);
+    if (persist) {
+      try {
+        localStorage.setItem("jarvis_chat_mode", m);
+      } catch {
+        /* private mode */
+      }
+    }
+  };
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("jarvis_chat_mode");
+      if (saved === "bar" || saved === "off" || saved === "full") setChatMode(saved, false);
+    } catch {
+      /* private mode */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Standby wake word: "hey jarvis" / "jarvis" starts live mode, Siri-style.
   const rearmWake = () => {
@@ -555,6 +613,28 @@ export default function JarvisUI() {
       }
     });
   }
+  // Zen mode = always listening: the wake word is forced on while chat is
+  // hidden, regardless of the manual wake toggle.
+  useEffect(() => {
+    if (chatMode !== "off") return;
+    import("../lib/wakeword").then((m) => {
+      if (!m.wakeSupported() || liveRef.current) return;
+      m.startWake(() => {
+        setWake(false);
+        m.chime();
+        void toggleLive(true);
+      });
+      setWake(true);
+    });
+    return () => {
+      if (localStorage.getItem("jarvis_wake") !== "1") {
+        import("../lib/wakeword").then((m) => m.stopWake());
+        setWake(false);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatMode]);
+
   useEffect(() => {
     rearmWake(); // resume standby across reloads if Daniel left it on
     // release the live lock instantly if the tab closes mid-session
@@ -711,7 +791,9 @@ export default function JarvisUI() {
     void claimVoice({ client: me.current });
     import("../lib/tts").then((m) => m.warm());
     setInput("");
-    if (panel && !panelFull) setPanelMin(true); // new message → viewport folds away, orb returns
+    // new message → viewport folds away, orb returns (only in full chat — in
+    // bar/zen the content IS the point, keep it up)
+    if (panel && !panelFull && chatModeRef.current === "full") setPanelMin(true);
     if (liveRef.current) {
       // Live session is the single brain while it's on — no parallel text answer.
       const rt = await import("../lib/realtime");
@@ -918,9 +1000,13 @@ export default function JarvisUI() {
         </div>
       </header>
 
-      <div className="mx-auto grid w-full max-w-7xl flex-1 gap-4 p-4 pt-2 md:grid-cols-[1.15fr_1fr]">
+      <div
+        className={`mx-auto w-full max-w-[1720px] flex-1 gap-4 p-4 pt-2 ${
+          chatMode === "full" ? "grid md:grid-cols-[1.6fr_0.95fr]" : `flex flex-col ${chatMode === "bar" ? "pb-24" : ""}`
+        }`}
+      >
         {/* the stage: orb / viewport / agent view */}
-        <div className="brackets relative min-h-[42vh] md:min-h-[70vh]">
+        <div className={`brackets relative ${chatMode === "full" ? "min-h-[46vh] md:min-h-[72vh]" : "min-h-[58vh] flex-1 md:min-h-[78vh]"}`}>
           <span className="bk" />
           {live === "live" && <div className="live-ring pointer-events-none absolute inset-2 rounded-full opacity-60" />}
           {(activeJobs.length > 0 || (panel && panelMin)) && (
@@ -988,7 +1074,8 @@ export default function JarvisUI() {
         </div>
 
         {/* conversation column */}
-        <div className="glass flex h-[52vh] flex-col overflow-hidden rounded-2xl md:h-[76vh]">
+        {chatMode === "full" && (
+        <div className="glass flex h-[52vh] flex-col overflow-hidden rounded-2xl md:h-[78vh]">
           <div className="flex items-center gap-2 border-b border-white/5 px-3 py-1.5">
             <select
               value={thread}
@@ -1018,6 +1105,20 @@ export default function JarvisUI() {
               title="wipe this chat"
             >
               clear
+            </button>
+            <button
+              onClick={() => setChatMode("bar")}
+              className="hud-label rounded px-1.5 py-0.5 hover:text-cyan"
+              title="minimize chat to a type bar — more room for the screen"
+            >
+              ▁ bar
+            </button>
+            <button
+              onClick={() => setChatMode("off")}
+              className="hud-label rounded px-1.5 py-0.5 hover:text-cyan"
+              title="hide chat completely — JARVIS keeps listening (say 'hey jarvis')"
+            >
+              ✕
             </button>
           </div>
           <div className="scrollbar-thin flex-1 space-y-3 overflow-y-auto p-4">
@@ -1114,7 +1215,90 @@ export default function JarvisUI() {
             </button>
           </div>
         </div>
+        )}
       </div>
+
+      {/* bar mode: chat collapsed to a floating type bar — the screen gets the room */}
+      {chatMode === "bar" && !panelFull && (
+        <div className="fixed inset-x-0 bottom-3 z-40 mx-auto w-[min(94vw,780px)]">
+          {(() => {
+            const lastReply = [...messages].reverse().find((m) => m.role === "assistant" && m.status === "done" && m.text);
+            return lastReply ? (
+              <button
+                onClick={() => setChatMode("full")}
+                className="mx-auto mb-1.5 block max-w-[92%] truncate rounded-full bg-black/50 px-4 py-1 text-xs text-cyan/90 backdrop-blur-md hover:text-cyan"
+                title="expand chat"
+              >
+                {lastReply.text}
+              </button>
+            ) : null;
+          })()}
+          <div className="glass flex items-stretch gap-2 rounded-2xl p-2 shadow-2xl">
+            <button
+              onClick={() => setChatMode("full")}
+              title="expand chat"
+              className="hud-label shrink-0 rounded-xl px-2 hover:text-cyan"
+            >
+              ▲
+            </button>
+            <button
+              onClick={() => void toggleLive()}
+              title="live conversation"
+              className={`flex shrink-0 items-center gap-1.5 rounded-xl px-2.5 text-sm transition ${
+                live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "text-slate hover:text-ice"
+              }`}
+            >
+              {live === "connecting" ? <span className="h-1.5 w-1.5 animate-ping rounded-full bg-cyan" /> : live === "live" ? <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan" /> : null}
+              live
+            </button>
+            <button
+              onClick={toggleMic}
+              title="voice input"
+              className={`shrink-0 rounded-xl px-2.5 text-sm transition ${recording ? "bg-amber/20 text-amber ring-1 ring-amber/50" : "text-slate hover:text-ice"}`}
+            >
+              {recording ? "■" : "mic"}
+            </button>
+            {(speaking || (live === "live" && caption?.who === "jarvis")) && (
+              <button onClick={stopTalking} title="stop talking" className="shrink-0 rounded-xl bg-red-500/15 px-2.5 text-sm text-red-300 ring-1 ring-red-500/40">
+                hush
+              </button>
+            )}
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit(input)}
+              placeholder={busy ? "thinking…" : "Talk to me…"}
+              className="min-w-0 flex-1 rounded-xl bg-black/30 px-4 py-2 text-sm text-ice outline-none ring-1 ring-white/10 transition focus:ring-cyan/50"
+            />
+            <button
+              onClick={() => submit(input)}
+              disabled={busy}
+              className="shrink-0 rounded-xl bg-cyan/15 px-3.5 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40"
+            >
+              send
+            </button>
+            <button
+              onClick={() => setChatMode("off")}
+              title="hide completely — JARVIS keeps listening"
+              className="hud-label shrink-0 rounded-xl px-2 hover:text-cyan"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* zen mode: no chat at all — JARVIS is always listening */}
+      {chatMode === "off" && !panelFull && (
+        <button
+          onClick={() => setChatMode("bar")}
+          className="glass fixed bottom-4 right-4 z-40 flex items-center gap-2 rounded-full px-3.5 py-2 text-xs text-slate transition hover:text-ice"
+          title="bring the chat back"
+        >
+          <span className={`h-1.5 w-1.5 rounded-full ${live === "live" ? "bg-cyan animate-pulse" : wake ? "bg-cyan breathe" : "bg-slate"}`} />
+          {live === "live" ? "live" : wake ? "listening — say “hey jarvis”" : "tap to chat"}
+        </button>
+      )}
 
       {/* full-screen viewport — keeps a floating composer so Daniel can still talk */}
       {panel && panelFull && (

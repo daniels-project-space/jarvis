@@ -1,6 +1,7 @@
 import "server-only";
 import { convexMutation, convexQuery } from "./context";
 import { getSecret } from "./vault";
+import { r2Put, r2StoreFromUrl } from "./r2";
 
 // JARVIS's tool belt — one definition list (OpenAI function schema) executed
 // server-side by /api/chat (Groq loop) and /api/tools (realtime client bridge).
@@ -164,6 +165,202 @@ export const TOOL_DEFS = [
     description:
       "Daniel's full morning/evening briefing as one visual widget: weather, today's rentals (pickups/returns), open to-dos, next calendar events, net worth, live markets. Use for 'brief me / morning update / what's my day look like'.",
     parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "todo_add",
+    description:
+      "ACTUALLY add an item to Daniel's real to-do list on the project hub (the widget on his dashboard). Use for ANY 'add to my list / remind me to / put X on my todos'. Never claim a to-do was added without calling this.",
+    parameters: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "the to-do text, short and actionable" },
+        due_date: { type: "string", description: "YYYY-MM-DD if he gave a deadline" },
+        tags: { type: "array", items: { type: "string" } },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    name: "todo_done",
+    description: "Mark one of Daniel's hub to-dos as done. Pass a few words from the item's text.",
+    parameters: { type: "object", properties: { match: { type: "string" } }, required: ["match"] },
+  },
+  {
+    name: "todo_remove",
+    description: "Delete a to-do from Daniel's hub list entirely. Pass a few words from the item's text.",
+    parameters: { type: "object", properties: { match: { type: "string" } }, required: ["match"] },
+  },
+  {
+    name: "calendar_add",
+    description:
+      "ACTUALLY add an event to Daniel's real calendar on the project hub. Use for ANY 'put X in my calendar / schedule / I have a meeting'. Never claim an event was added without calling this. Times are Europe/London.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        date: { type: "string", description: "YYYY-MM-DD" },
+        time: { type: "string", description: "HH:MM 24h; omit for an all-day event" },
+        end_time: { type: "string", description: "HH:MM if he gave one" },
+        location: { type: "string" },
+        notes: { type: "string" },
+      },
+      required: ["title", "date"],
+    },
+  },
+  {
+    name: "calendar_remove",
+    description: "Delete an event from Daniel's hub calendar. Pass a few words from its title.",
+    parameters: { type: "object", properties: { match: { type: "string" } }, required: ["match"] },
+  },
+  {
+    name: "calendar_view",
+    description:
+      "Show Daniel's calendar as a beautiful visual widget: his hub events PLUS rental pickups/returns merged, as a day plan, week, or month view. Use for 'what's my day/week/month look like', 'show my calendar', 'what's on Friday'.",
+    parameters: {
+      type: "object",
+      properties: {
+        view: { type: "string", enum: ["day", "week", "month"], description: "default week" },
+        date: { type: "string", description: "YYYY-MM-DD anchor, default today" },
+      },
+    },
+  },
+  {
+    name: "open_app",
+    description:
+      "Launch one of Daniel's own apps on screen with a one-tap open button (rental manager, project hub, music house, youtube studio, media engine, remote work hub, app factory, jarvis...). Use for ANY 'open/launch/pull up <app>'.",
+    parameters: {
+      type: "object",
+      properties: { app: { type: "string", description: "app name as Daniel said it, e.g. 'rental manager'" } },
+      required: ["app"],
+    },
+  },
+  {
+    name: "research",
+    description:
+      "Verified research: runs SEVERAL searches, reads the top source, and cross-checks results before answering — slower than web_search but grounded. Use whenever the fact actually matters (specs, compatibility, prices to act on, medical/legal, anything Daniel will rely on) or when he says 'make sure / double check'.",
+    parameters: {
+      type: "object",
+      properties: {
+        question: { type: "string", description: "the thing to establish, self-contained" },
+        queries: { type: "array", items: { type: "string" }, description: "2-3 different search angles; auto-generated if omitted" },
+      },
+      required: ["question"],
+    },
+  },
+  {
+    name: "deliberate",
+    description:
+      "Deep reasoning pass for genuinely hard calls: design decisions, creative direction, architecture, naming, strategy, anything with real trade-offs. Sends the problem (with your context) to a slow, strong reasoning model and returns a considered recommendation you deliver as your own view. Use BEFORE answering complicated design/creative questions instead of winging it.",
+    parameters: {
+      type: "object",
+      properties: {
+        question: { type: "string", description: "the decision/problem, fully self-contained" },
+        context: { type: "string", description: "everything relevant Daniel said + constraints" },
+      },
+      required: ["question"],
+    },
+  },
+  {
+    name: "create_image",
+    description:
+      "Generate an image (Z-Image Turbo, ~8s, photoreal-capable) and show it on screen. It's stored permanently in the creations library. Use for 'make/generate/draw me an image/picture/logo/concept'.",
+    parameters: {
+      type: "object",
+      properties: {
+        prompt: { type: "string", description: "detailed visual prompt, English" },
+        size: { type: "string", enum: ["1024*1024", "1280*720", "720*1280", "1152*864"], description: "default 1024*1024" },
+        title: { type: "string", description: "short name for the library" },
+      },
+      required: ["prompt"],
+    },
+  },
+  {
+    name: "store_image",
+    description: "Save any image URL permanently into Daniel's creations library (re-hosted on his own storage).",
+    parameters: {
+      type: "object",
+      properties: { url: { type: "string" }, title: { type: "string" } },
+      required: ["url"],
+    },
+  },
+  {
+    name: "create_pdf",
+    description:
+      "Create a clean, downloadable PDF from markdown content (briefs, plans, quotes, letters, checklists) — shows on screen with a download link and is saved in the creations library.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        markdown: { type: "string", description: "the full document content as markdown (#/##/### headings, bullets, numbered lists)" },
+      },
+      required: ["title", "markdown"],
+    },
+  },
+  {
+    name: "mind_map",
+    description:
+      "Create or LIVE-EDIT a visual mind map / diagram on Daniel's screen while you talk: bubbles (nodes), connectors (edges), colours, links, images, even little tables. Saved automatically in the creations library. action=create starts fresh; update edits the one on screen (upserts nodes by id, adds edges, removes by id); show re-opens a saved one by title.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["create", "update", "show"] },
+        title: { type: "string", description: "map title (create/show)" },
+        nodes: {
+          type: "array",
+          description: "nodes to add/update; id is a short slug; parent links it into the tree layout",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              label: { type: "string" },
+              detail: { type: "string", description: "one-line sub-text" },
+              parent: { type: "string", description: "id of the node this hangs off" },
+              color: { type: "string", description: "green|amber|blue|pink|slate, default green" },
+              url: { type: "string", description: "makes the node a clickable link" },
+              image: { type: "string", description: "image url shown inside the node" },
+              rows: { type: "array", items: { type: "array", items: { type: "string" } }, description: "table rows for a table node" },
+            },
+            required: ["id", "label"],
+          },
+        },
+        edges: {
+          type: "array",
+          description: "extra cross-connections beyond parent links",
+          items: {
+            type: "object",
+            properties: { from: { type: "string" }, to: { type: "string" }, label: { type: "string" } },
+            required: ["from", "to"],
+          },
+        },
+        remove: { type: "array", items: { type: "string" }, description: "node ids to remove (update only)" },
+      },
+      required: ["action"],
+    },
+  },
+  {
+    name: "chart",
+    description:
+      "Draw a data chart/dashboard on screen (KPI tiles, bar trend series, ranked bars) from numbers you provide, and save it in the creations library. Use when Daniel wants data visualised.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        kpis: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" }, prefix: { type: "string" }, suffix: { type: "string" } }, required: ["label", "value"] } },
+        series: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" } }, required: ["label", "value"] } },
+        series_label: { type: "string" },
+        bars: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" }, note: { type: "string" } }, required: ["label", "value"] } },
+        bars_label: { type: "string" },
+      },
+      required: ["title"],
+    },
+  },
+  {
+    name: "creations_list",
+    description: "Open Daniel's creations library on screen — everything you've made (mind maps, charts, images, PDFs). Use for 'show my/your creations, where's that image/pdf/map'.",
+    parameters: {
+      type: "object",
+      properties: { kind: { type: "string", enum: ["canvas", "chart", "image", "pdf", "doc"], description: "filter, optional" } },
+    },
   },
   {
     name: "clear_chat",
@@ -703,17 +900,468 @@ async function briefingWidget(): Promise<string> {
 }
 
 // project-hub reads (todos/calendar/wealth live there)
-async function q_hub(path: string): Promise<any> {
+const HUB_URL = "https://fantastic-roadrunner-485.convex.cloud";
+async function q_hub(path: string, args: unknown = {}): Promise<any> {
   try {
-    const r = await fetch("https://fantastic-roadrunner-485.convex.cloud/api/query", {
+    const r = await fetch(`${HUB_URL}/api/query`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ path, args: {}, format: "json" }),
+      body: JSON.stringify({ path, args, format: "json" }),
     });
     return (await r.json()).value;
   } catch {
     return null;
   }
+}
+// project-hub WRITES — the missing half that made "added to your list, sir" a
+// lie: JARVIS could only read the hub. These actually mutate the dashboard.
+async function m_hub(path: string, args: unknown): Promise<any> {
+  const r = await fetch(`${HUB_URL}/api/mutation`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, args, format: "json" }),
+  });
+  const j = await r.json();
+  if (j.status === "error") throw new Error(j.errorMessage ?? `${path} failed`);
+  return j.value;
+}
+
+// "2026-07-14" + "15:30" in Europe/London → epoch ms (DST-correct).
+function londonMs(date: string, time?: string): number {
+  const [y, mo, d] = date.split("-").map(Number);
+  const [h, mi] = (time ?? "09:00").split(":").map(Number);
+  const guess = Date.UTC(y, mo - 1, d, h, mi);
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/London",
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(guess).map((p) => [p.type, p.value]));
+  const asLondon = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +(parts.hour === "24" ? 0 : parts.hour), +parts.minute);
+  return guess - (asLondon - guess);
+}
+const londonDateStr = (ms: number) =>
+  new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/London", year: "numeric", month: "2-digit", day: "2-digit" }).format(ms);
+const londonTimeStr = (ms: number) =>
+  new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/London", hour: "2-digit", minute: "2-digit", hour12: false }).format(ms);
+
+async function todoAdd(args: any): Promise<string> {
+  const text = String(args.text ?? "").trim();
+  if (!text) return "What should the to-do say?";
+  await m_hub("todos:add", {
+    text: text.slice(0, 200),
+    dueDate: /^\d{4}-\d{2}-\d{2}$/.test(String(args.due_date ?? "")) ? londonMs(String(args.due_date), "12:00") : undefined,
+    tags: Array.isArray(args.tags) ? args.tags.map(String).slice(0, 4) : ["jarvis"],
+  });
+  const open = ((await q_hub("todos:list")) ?? []).filter((t: any) => !t.done).length;
+  return `Done — "${text}" is now on the hub to-do list (${open} open). Confirm it casually in one line.`;
+}
+
+async function matchTodo(match: string): Promise<{ hit: any | null; note: string }> {
+  const todos: any[] = (await q_hub("todos:list")) ?? [];
+  const open = todos.filter((t: any) => !t.done);
+  const m = match.toLowerCase().trim();
+  const hits = open.filter((t: any) => String(t.text).toLowerCase().includes(m));
+  if (hits.length === 1) return { hit: hits[0], note: "" };
+  if (hits.length === 0)
+    return { hit: null, note: `No open to-do matches "${match}". Open items: ${open.slice(0, 8).map((t: any) => `"${t.text}"`).join(", ") || "none"}.` };
+  return { hit: null, note: `Several match "${match}": ${hits.slice(0, 5).map((t: any) => `"${t.text}"`).join(", ")} — ask Daniel which one.` };
+}
+
+async function todoDone(args: any): Promise<string> {
+  const { hit, note } = await matchTodo(String(args.match ?? ""));
+  if (!hit) return note;
+  await m_hub("todos:update", { id: hit._id, done: true });
+  return `Ticked off: "${hit.text}".`;
+}
+
+async function todoRemove(args: any): Promise<string> {
+  const { hit, note } = await matchTodo(String(args.match ?? ""));
+  if (!hit) return note;
+  await m_hub("todos:remove", { id: hit._id });
+  return `Removed from the list: "${hit.text}".`;
+}
+
+async function calendarAdd(args: any): Promise<string> {
+  const title = String(args.title ?? "").trim();
+  const date = String(args.date ?? "");
+  if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return "I need a title and a date (YYYY-MM-DD).";
+  const allDay = !args.time;
+  const start = londonMs(date, args.time ? String(args.time) : "09:00");
+  const end = args.end_time ? londonMs(date, String(args.end_time)) : undefined;
+  await m_hub("events:create", {
+    title: title.slice(0, 140),
+    start,
+    end,
+    allDay,
+    color: "brass",
+    location: args.location ? String(args.location).slice(0, 140) : undefined,
+    notes: args.notes ? String(args.notes).slice(0, 500) : undefined,
+  });
+  return `In the calendar: "${title}" on ${date}${args.time ? ` at ${args.time}` : " (all day)"}. It'll show in briefings too. Confirm casually in one line.`;
+}
+
+async function calendarRemove(args: any): Promise<string> {
+  const events: any[] = (await q_hub("events:list")) ?? [];
+  const m = String(args.match ?? "").toLowerCase().trim();
+  const hits = events.filter((e: any) => String(e.title).toLowerCase().includes(m));
+  if (hits.length === 0) return `No event matches "${args.match}".`;
+  if (hits.length > 1)
+    return `Several events match: ${hits.slice(0, 5).map((e: any) => `"${e.title}" (${londonDateStr(e.start)})`).join(", ")} — ask which.`;
+  await m_hub("events:remove", { id: hits[0]._id });
+  return `Deleted "${hits[0].title}" from the calendar.`;
+}
+
+// The frosted-glass calendar widget: hub events + rental pickups/returns in
+// one day / week / month view.
+async function calendarView(args: any): Promise<string> {
+  const view = ["day", "week", "month"].includes(String(args.view)) ? String(args.view) : "week";
+  const anchor = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date ?? "")) ? String(args.date) : londonDateStr(Date.now());
+  const anchorMs = londonMs(anchor, "12:00");
+  const DAY = 86_400_000;
+  let startMs: number, count: number;
+  if (view === "day") {
+    startMs = anchorMs;
+    count = 1;
+  } else if (view === "week") {
+    const dow = (new Date(anchorMs).getUTCDay() + 6) % 7; // Monday = 0 (close enough at noon London)
+    startMs = anchorMs - dow * DAY;
+    count = 7;
+  } else {
+    const [y, mo] = anchor.split("-").map(Number);
+    const first = londonMs(`${y}-${String(mo).padStart(2, "0")}-01`, "12:00");
+    const dow = (new Date(first).getUTCDay() + 6) % 7;
+    startMs = first - dow * DAY;
+    const daysInMonth = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+    count = Math.ceil((dow + daysInMonth) / 7) * 7;
+  }
+  const stripStart = londonDateStr(startMs);
+  const [events, strip] = await Promise.all([
+    q_hub("events:list"),
+    rentalQuery("calendar:getCalendarStrip", { accountSlug: null, startDate: stripStart, days: Math.min(count, 30) }),
+  ]);
+  const byDate: Record<string, any[]> = {};
+  for (const e of Array.isArray(events) ? events : []) {
+    const d = londonDateStr(e.start);
+    (byDate[d] ??= []).push({
+      title: String(e.title).slice(0, 60),
+      time: e.allDay ? "" : londonTimeStr(e.start),
+      kind: "event",
+      location: e.location ? String(e.location).slice(0, 40) : undefined,
+    });
+  }
+  const short = (s: string) => String(s || "").split(/[|,]/)[0].split(/\s+/).slice(0, 3).join(" ");
+  for (const day of Array.isArray(strip) ? strip : []) {
+    const d = day.date ?? day.day ?? "";
+    for (const p of day.pickups ?? []) (byDate[d] ??= []).push({ title: `↑ ${short(p.items?.[0]?.name ?? p.imageAlt ?? "pickup")}`, time: p.pickupTime ?? "", kind: "pickup" });
+    for (const r of day.returns ?? []) (byDate[d] ??= []).push({ title: `↓ ${short(r.items?.[0]?.name ?? r.imageAlt ?? "return")}`, time: "", kind: "return" });
+    if ((day.away ?? []).length) (byDate[d] ??= []).push({ title: `${(day.away ?? []).length} out`, time: "", kind: "away" });
+  }
+  const anchorMonth = anchor.slice(0, 7);
+  const days = Array.from({ length: count }, (_, i) => {
+    const ms = startMs + i * DAY;
+    const date = londonDateStr(ms);
+    return {
+      date,
+      dow: new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/London", weekday: "short" }).format(ms),
+      inMonth: view !== "month" || date.slice(0, 7) === anchorMonth,
+      today: date === londonDateStr(Date.now()),
+      events: (byDate[date] ?? []).sort((a, b) => String(a.time).localeCompare(String(b.time))).slice(0, view === "month" ? 3 : 12),
+      more: Math.max(0, (byDate[date] ?? []).length - (view === "month" ? 3 : 12)),
+    };
+  });
+  const label =
+    view === "day"
+      ? new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/London", weekday: "long", day: "numeric", month: "long" }).format(anchorMs)
+      : view === "week"
+        ? `Week of ${new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/London", day: "numeric", month: "short" }).format(startMs)}`
+        : new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/London", month: "long", year: "numeric" }).format(anchorMs);
+  await showWidget({ kind: "calendar", view, anchor, label, days }, `calendar · ${label}`);
+  const busyDays = days.filter((d) => d.events.length);
+  const spokenBits = busyDays.slice(0, 4).map((d) => `${d.dow} ${d.date.slice(8)}: ${d.events.slice(0, 3).map((e: any) => e.title).join(", ")}`);
+  return (
+    `Calendar (${label}) is on screen.` +
+    (spokenBits.length ? ` Highlights — ${spokenBits.join("; ")}.` : " Nothing scheduled.") +
+    " (Speak one short sentence only.)"
+  );
+}
+
+// Daniel's own apps — "open the rental manager" should actually open it.
+const APPS: { name: string; url: string; aliases: string[] }[] = [
+  { name: "Rental Manager", url: "https://rental-manager-v2-nu.vercel.app", aliases: ["rental manager", "rentals app", "rmv2", "rental-manager", "hygglo dashboard"] },
+  { name: "Project Hub", url: "https://project-hub-olive-pi.vercel.app", aliases: ["project hub", "the hub", "dashboard", "project-hub"] },
+  { name: "Music House", url: "https://music-house-nine.vercel.app", aliases: ["music house", "music-house", "music app"] },
+  { name: "YouTube Studio AI", url: "https://youtube-studio-ai.vercel.app", aliases: ["youtube studio", "ysa", "youtube app", "video factory"] },
+  { name: "Remote Work Hub", url: "https://remote-work-hub-sepia.vercel.app", aliases: ["remote work hub", "rwh", "work hub", "agents hub"] },
+  { name: "Media Engine", url: "https://media-engine-seven.vercel.app", aliases: ["media engine", "media-engine"] },
+  { name: "App Factory", url: "https://app-factory-v2.vercel.app", aliases: ["app factory", "factory", "app-factory"] },
+  { name: "JARVIS", url: "https://jarvis-orcin-six.vercel.app", aliases: ["jarvis", "yourself", "your ui"] },
+];
+
+async function openApp(args: any): Promise<string> {
+  const want = String(args.app ?? "").toLowerCase().trim();
+  const app =
+    APPS.find((a) => a.aliases.some((al) => want.includes(al) || al.includes(want))) ??
+    APPS.find((a) => a.name.toLowerCase().includes(want));
+  if (!app)
+    return `I don't have a live URL for "${args.app}". Apps I can open: ${APPS.map((a) => a.name).join(", ")}.`;
+  await convexMutation("ui:setPanel", { type: "launch", value: JSON.stringify({ name: app.name, url: app.url }), title: `launch · ${app.name}` });
+  await convexMutation("chatQueue:postCard", { threadId: await activeThread(), type: "url", value: app.url, title: `open ${app.name} ↗` }).catch(() => {});
+  return `${app.name} is on screen with a one-tap open button (it also auto-opens in a new tab if the browser allows). URL: ${app.url}`;
+}
+
+// Verified research: several search angles + the top source read, so the answer
+// isn't whatever the first result happened to say.
+async function researchTool(args: any): Promise<string> {
+  const question = String(args.question ?? "").trim();
+  if (!question) return "What do you want me to establish?";
+  const queries: string[] = (Array.isArray(args.queries) && args.queries.length
+    ? args.queries.map(String)
+    : [question, `${question} explained details`, `${question} reddit OR forum experience`]
+  ).slice(0, 3);
+  const results = await Promise.all(queries.map((q) => serpapi({ engine: "google", q, num: "6" })));
+  const md: string[] = [`## Research · ${question}`, ""];
+  const forModel: string[] = [];
+  let firstLink = "";
+  results.forEach((j, i) => {
+    if (!j) return;
+    md.push(`### Angle ${i + 1}: ${queries[i]}`);
+    if (j.answer_box?.answer || j.answer_box?.snippet) {
+      const a = j.answer_box.answer ?? j.answer_box.snippet;
+      md.push(`**Answer box:** ${a}`, "");
+      forModel.push(`[angle ${i + 1} answer box] ${a}`);
+    }
+    for (const r of (j.organic_results ?? []).slice(0, 4)) {
+      if (!firstLink && r.link) firstLink = r.link;
+      md.push(`- [${r.title}](${r.link}) — ${r.snippet ?? ""}`);
+      forModel.push(`[${new URL(r.link ?? "https://x.x").hostname}] ${r.title}: ${r.snippet ?? ""}`);
+    }
+    md.push("");
+  });
+  let pageExcerpt = "";
+  if (firstLink) {
+    pageExcerpt = (await readUrl(firstLink)).slice(0, 5000);
+    md.push(`### Read: ${firstLink}`, pageExcerpt.slice(0, 1200) + "…");
+  }
+  await showResultsPanel(`research · ${question.slice(0, 36)}`, md.join("\n"));
+  return (
+    `MULTI-SOURCE RESULTS (cross-check before answering — if sources disagree, say so and go with the best-supported one, naming it):\n` +
+    forModel.join("\n").slice(0, 5000) +
+    (pageExcerpt ? `\n\nTOP SOURCE FULL TEXT (${firstLink}):\n${pageExcerpt.slice(0, 3500)}` : "") +
+    "\n(The full sourced breakdown is on Daniel's screen.)"
+  );
+}
+
+// Hard calls get a slow, strong reasoning model instead of a reflex answer.
+async function deliberateTool(args: any): Promise<string> {
+  const question = String(args.question ?? "").trim();
+  if (!question) return "What's the decision?";
+  const key = process.env.OPENAI_API_KEY ?? (await getSecret("openai", "OPENAI_API_KEY").catch(() => ""));
+  if (!key) return "Deep reasoning is unavailable (no OpenAI key).";
+  const prompt =
+    `You are the deep-reasoning core of JARVIS, advising Daniel (a solo builder/designer who ships fast and values taste).\n` +
+    `Think hard about the problem, weigh the real trade-offs, then give:\n` +
+    `1) A clear recommendation (one line).\n2) The 2-4 decisive reasons.\n3) What would change your mind.\n` +
+    `Be concrete and opinionated; no fence-sitting.\n\nPROBLEM: ${question}\n\nCONTEXT:\n${String(args.context ?? "").slice(0, 3000)}`;
+  for (const model of ["gpt-5.1", "gpt-5", "o4-mini"]) {
+    try {
+      const r = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" },
+        body: JSON.stringify({ model, input: prompt, reasoning: { effort: "high" }, max_output_tokens: 2000 }),
+        signal: AbortSignal.timeout(75_000),
+      });
+      if (!r.ok) continue;
+      const j: any = await r.json();
+      const text =
+        j.output_text ??
+        (Array.isArray(j.output)
+          ? j.output
+              .flatMap((o: any) => (Array.isArray(o.content) ? o.content : []))
+              .filter((c: any) => c.type === "output_text")
+              .map((c: any) => c.text)
+              .join("\n")
+          : "");
+      if (text && text.trim()) {
+        await showResultsPanel(`deliberation · ${question.slice(0, 36)}`, `## ${question}\n\n${text}`);
+        return `CONSIDERED ANALYSIS (deliver the recommendation as your own view, in your voice, short — full version is on his screen):\n${text.slice(0, 4000)}`;
+      }
+    } catch {
+      /* try next model */
+    }
+  }
+  return "The reasoning pass failed — answer from your own judgement and say it wasn't double-checked.";
+}
+
+// Z-Image Turbo via Novita — generated art is re-homed to R2 (provider URLs
+// die in 48h) and saved in the creations library.
+async function createImage(args: any): Promise<string> {
+  const prompt = String(args.prompt ?? "").trim();
+  if (!prompt) return "Describe the image first.";
+  const key = process.env.NOVITA_API_KEY ?? (await getSecret("novita", "NOVITA_API_KEY").catch(() => ""));
+  if (!key) return "Image generation is unavailable (no Novita key in the vault).";
+  const size = ["1024*1024", "1280*720", "720*1280", "1152*864"].includes(String(args.size)) ? String(args.size) : "1024*1024";
+  const submit = await fetch("https://api.novita.ai/v3/async/z-image-turbo", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" },
+    body: JSON.stringify({ prompt: prompt.slice(0, 1800), size }),
+  });
+  if (!submit.ok) return `Image generation failed to start: ${submit.status} ${(await submit.text()).slice(0, 120)}`;
+  const { task_id } = await submit.json();
+  if (!task_id) return "Image generation failed to start (no task id).";
+  let imageUrl = "";
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const poll: any = await (
+      await fetch(`https://api.novita.ai/v3/async/task-result?task_id=${task_id}`, {
+        headers: { Authorization: `Bearer ${key}` },
+      })
+    ).json();
+    const status = poll?.task?.status;
+    if (status === "TASK_STATUS_SUCCEED") {
+      imageUrl = poll?.images?.[0]?.image_url ?? "";
+      break;
+    }
+    if (status === "TASK_STATUS_FAILED") return `Image generation failed: ${poll?.task?.reason ?? "unknown reason"}`;
+  }
+  if (!imageUrl) return "Image generation timed out after 30s — try again.";
+  const title = String(args.title ?? prompt.slice(0, 60));
+  let finalUrl = imageUrl;
+  try {
+    finalUrl = (await r2StoreFromUrl(title, imageUrl)).url;
+  } catch {
+    /* fall back to the (48h) provider url rather than failing the whole thing */
+  }
+  await convexMutation("creations:create", { kind: "image", title, url: finalUrl, thumb: finalUrl, data: prompt }).catch(() => {});
+  await convexMutation("ui:setPanel", { type: "image", value: finalUrl, title });
+  await convexMutation("chatQueue:postCard", { threadId: await activeThread(), type: "image", value: finalUrl, title }).catch(() => {});
+  return `Image generated and on screen (saved to the creations library). URL: ${finalUrl}`;
+}
+
+async function storeImage(args: any): Promise<string> {
+  const url = String(args.url ?? "").trim();
+  if (!/^https?:\/\//.test(url)) return "Give me a valid image URL.";
+  const title = String(args.title ?? "stored image").slice(0, 80);
+  try {
+    const { url: stored } = await r2StoreFromUrl(title, url);
+    await convexMutation("creations:create", { kind: "image", title, url: stored, thumb: stored }).catch(() => {});
+    await convexMutation("chatQueue:postCard", { threadId: await activeThread(), type: "image", value: stored, title }).catch(() => {});
+    return `Stored permanently in the creations library: ${stored}`;
+  } catch (e: any) {
+    return `Couldn't store that image: ${e?.message ?? e}`;
+  }
+}
+
+async function createPdf(args: any): Promise<string> {
+  const title = String(args.title ?? "").trim() || "Document";
+  const md = String(args.markdown ?? "").trim();
+  if (!md) return "Give me the document content first.";
+  try {
+    const { markdownToPdf } = await import("./pdf");
+    const bytes = await markdownToPdf(title, md.slice(0, 30_000));
+    const url = await r2Put(title, bytes, "application/pdf");
+    await convexMutation("creations:create", { kind: "pdf", title, url, data: md.slice(0, 20_000) }).catch(() => {});
+    await convexMutation("ui:setPanel", { type: "pdf", value: url, title });
+    await convexMutation("chatQueue:postCard", { threadId: await activeThread(), type: "pdf", value: url, title: `${title}.pdf` }).catch(() => {});
+    return `PDF ready and on screen — download link: ${url} (also saved in the creations library).`;
+  } catch (e: any) {
+    return `PDF creation failed: ${e?.message ?? e}`;
+  }
+}
+
+// Live mind map: create/update re-render on Daniel's screen as you talk.
+async function mindMap(args: any): Promise<string> {
+  const action = ["create", "update", "show"].includes(String(args.action)) ? String(args.action) : "create";
+  const cleanNodes = (Array.isArray(args.nodes) ? args.nodes : [])
+    .filter((n: any) => n?.id && n?.label)
+    .slice(0, 60)
+    .map((n: any) => ({
+      id: String(n.id).slice(0, 40),
+      label: String(n.label).slice(0, 60),
+      detail: n.detail ? String(n.detail).slice(0, 90) : undefined,
+      parent: n.parent ? String(n.parent).slice(0, 40) : undefined,
+      color: ["green", "amber", "blue", "pink", "slate"].includes(n.color) ? n.color : undefined,
+      url: n.url && /^https?:\/\//.test(String(n.url)) ? String(n.url).slice(0, 300) : undefined,
+      image: n.image && /^https?:\/\//.test(String(n.image)) ? String(n.image).slice(0, 300) : undefined,
+      rows: Array.isArray(n.rows) ? n.rows.slice(0, 6).map((r: any) => (Array.isArray(r) ? r.slice(0, 4).map(String) : [String(r)])) : undefined,
+    }));
+  const cleanEdges = (Array.isArray(args.edges) ? args.edges : [])
+    .filter((e: any) => e?.from && e?.to)
+    .slice(0, 80)
+    .map((e: any) => ({ from: String(e.from), to: String(e.to), label: e.label ? String(e.label).slice(0, 30) : undefined }));
+
+  if (action === "create") {
+    const title = String(args.title ?? "Mind map").slice(0, 80);
+    if (!cleanNodes.length) return "Give me at least one node.";
+    const doc = { title, nodes: cleanNodes, edges: cleanEdges };
+    const id = await convexMutation("creations:create", { kind: "canvas", title, data: JSON.stringify(doc) });
+    await convexMutation("ui:setPanel", { type: "canvas", value: JSON.stringify({ ...doc, creationId: String(id) }), title: `map · ${title}` });
+    return `Mind map "${title}" is live on screen (${cleanNodes.length} nodes). Keep talking — use mind_map update to add/change/remove as the conversation flows.`;
+  }
+
+  const existing: any = await convexQuery("creations:latest", { kind: "canvas", titleMatch: args.title ? String(args.title) : undefined });
+  if (!existing?.data) return action === "show" ? "No saved mind map found — create one first." : "There's no mind map to update — use action=create.";
+  let doc: any;
+  try {
+    doc = JSON.parse(existing.data);
+  } catch {
+    return "The saved map is corrupted — create a fresh one.";
+  }
+
+  if (action === "update") {
+    const byId: Record<string, any> = Object.fromEntries((doc.nodes ?? []).map((n: any) => [n.id, n]));
+    for (const n of cleanNodes) byId[n.id] = { ...byId[n.id], ...n };
+    for (const rid of Array.isArray(args.remove) ? args.remove.map(String) : []) delete byId[rid];
+    doc.nodes = Object.values(byId).slice(0, 80);
+    const keep = new Set(doc.nodes.map((n: any) => n.id));
+    doc.edges = [...(doc.edges ?? []), ...cleanEdges]
+      .filter((e: any) => keep.has(e.from) && keep.has(e.to))
+      .filter((e: any, i: number, a: any[]) => a.findIndex((x) => x.from === e.from && x.to === e.to) === i)
+      .slice(0, 100);
+    if (args.title) doc.title = String(args.title).slice(0, 80);
+    await convexMutation("creations:update", { id: existing._id, title: doc.title, data: JSON.stringify(doc) });
+  }
+  await convexMutation("ui:setPanel", {
+    type: "canvas",
+    value: JSON.stringify({ ...doc, creationId: String(existing._id) }),
+    title: `map · ${doc.title}`,
+  });
+  return action === "update"
+    ? `Map updated live (${doc.nodes.length} nodes now).`
+    : `Mind map "${doc.title}" is back on screen.`;
+}
+
+async function chartTool(args: any): Promise<string> {
+  const title = String(args.title ?? "Chart").slice(0, 80);
+  const widget: Record<string, any> = {
+    kind: "stats",
+    title,
+    kpis: (Array.isArray(args.kpis) ? args.kpis : []).slice(0, 6).map((k: any) => ({
+      label: String(k.label).slice(0, 24),
+      value: Number(k.value) || 0,
+      prefix: k.prefix ? String(k.prefix) : undefined,
+      suffix: k.suffix ? String(k.suffix) : undefined,
+    })),
+    series: (Array.isArray(args.series) ? args.series : []).slice(0, 14).map((s: any) => ({ label: String(s.label).slice(0, 12), value: Number(s.value) || 0 })),
+    seriesLabel: args.series_label ? String(args.series_label) : undefined,
+    bars: (Array.isArray(args.bars) ? args.bars : []).slice(0, 8).map((b: any) => ({ label: String(b.label).slice(0, 32), value: Number(b.value) || 0, note: b.note ? String(b.note) : "" })),
+    barsLabel: args.bars_label ? String(args.bars_label) : undefined,
+  };
+  if (!widget.kpis.length && !widget.series.length && !widget.bars.length) return "Give me some numbers to chart (kpis, series or bars).";
+  await showWidget(widget, title);
+  await convexMutation("creations:create", { kind: "chart", title, data: JSON.stringify(widget) }).catch(() => {});
+  return `Chart "${title}" is on screen and saved in the creations library. Speak one takeaway.`;
+}
+
+async function creationsList(args: any): Promise<string> {
+  const kind = ["canvas", "chart", "image", "pdf", "doc"].includes(String(args.kind)) ? String(args.kind) : undefined;
+  const rows: any[] = (await convexQuery("creations:list", { kind, limit: 30 })) ?? [];
+  await convexMutation("ui:setPanel", { type: "creations", value: JSON.stringify({ kind: kind ?? null }), title: "creations library" });
+  if (!rows.length) return "The creations library is empty so far — everything I make from now on lands there.";
+  return (
+    `Creations library is on screen (${rows.length} items). Latest: ` +
+    rows.slice(0, 6).map((r) => `${r.kind} "${r.title}"`).join(", ") +
+    "."
+  );
 }
 
 async function activeThread(): Promise<string> {
@@ -779,6 +1427,36 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await timerWidget(args);
     case "briefing":
       return await briefingWidget();
+    case "todo_add":
+      return await todoAdd(args);
+    case "todo_done":
+      return await todoDone(args);
+    case "todo_remove":
+      return await todoRemove(args);
+    case "calendar_add":
+      return await calendarAdd(args);
+    case "calendar_remove":
+      return await calendarRemove(args);
+    case "calendar_view":
+      return await calendarView(args);
+    case "open_app":
+      return await openApp(args);
+    case "research":
+      return await researchTool(args);
+    case "deliberate":
+      return await deliberateTool(args);
+    case "create_image":
+      return await createImage(args);
+    case "store_image":
+      return await storeImage(args);
+    case "create_pdf":
+      return await createPdf(args);
+    case "mind_map":
+      return await mindMap(args);
+    case "chart":
+      return await chartTool(args);
+    case "creations_list":
+      return await creationsList(args);
     case "clear_chat": {
       const t = await activeThread();
       const n = await convexMutation("chatQueue:clearThread", { threadId: t });
