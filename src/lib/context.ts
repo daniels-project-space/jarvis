@@ -44,7 +44,7 @@ export async function reportIncident(source: string, signature: string, message:
 }
 
 export async function buildContext(userText?: string): Promise<{ block: string; freshFindingIds: string[] }> {
-  const [memHit, memRecent, biz, stack, todos, events, wealth, jobs, findings] = await Promise.all([
+  const [memHit, memRecent, biz, stack, todos, events, wealth, jobs, findings, trip] = await Promise.all([
     userText ? q(CONVEX_URL, "memory:search", { q: userText, limit: 8 }) : null,
     q(CONVEX_URL, "memory:recent", { limit: 6 }),
     q(CONVEX_URL, "business:list", {}),
@@ -54,6 +54,7 @@ export async function buildContext(userText?: string): Promise<{ block: string; 
     q(HUB_URL, "wealth:getWealth"),
     q(CONVEX_URL, "jobs:active", {}),
     q(CONVEX_URL, "findings:fresh", {}),
+    q(CONVEX_URL, "creations:latest", { kind: "trip" }),
   ]);
 
   const mem = [...(Array.isArray(memHit) ? memHit : []), ...(Array.isArray(memRecent) ? memRecent : [])]
@@ -88,6 +89,23 @@ export async function buildContext(userText?: string): Promise<{ block: string; 
     );
   if (Array.isArray(jobs) && jobs.length)
     lines.push("Agents working right now: " + jobs.map((j: any) => `"${j.task.slice(0, 80)}" (${j.status})`).join("; "));
+  // Current trip: answer questions and lock choices from THIS doc via
+  // trip_update — never re-run trip_plan for a trip that's already in flight.
+  if (trip?.data && Date.now() - (trip.updatedAt ?? 0) < 14 * 86_400_000) {
+    try {
+      const t = JSON.parse(trip.data);
+      lines.push(
+        `TRIP IN PROGRESS (${t.status}): ${t.title}, budget £${t.budgetGbp}, total so far £${t.totals?.total ?? "?"}. ` +
+          `Locked: flight ${t.locked?.flight ? `${t.locked.flight.airline} £${t.locked.flight.priceGbp}pp` : "—"}, ` +
+          `stay ${t.locked?.stay ? `${t.locked.stay.name} £${t.locked.stay.totalGbp} total` : "—"}, ` +
+          `activities: ${(t.locked?.activities ?? []).join(", ") || "—"}` +
+          (t.transfer ? `, airport transfer ${t.transfer.durationText}` : "") +
+          `. Use trip_update (lock/show/toggle) or trip_finalize on THIS trip; only call trip_plan for a NEW destination or dates.`,
+      );
+    } catch {
+      /* stale doc */
+    }
+  }
   if (Array.isArray(findings) && findings.length)
     lines.push(
       "FRESH AGENT FINDINGS — weave the relevant one into your reply naturally (one casual sentence, offer detail on screen), don't recite:\n" +
