@@ -86,6 +86,7 @@ function Globe({
       ll2v(center.lat + (lat - center.lat) * spread, center.lng + (lng - center.lng) * spread, r);
 
     const KIND_COLOR: Record<string, number> = { stay: 0x00ff88, activity: 0x5cc8ff, airport: 0xffb454 };
+    const bornAt = new Map<string, number>();
     const markerGroup = new THREE.Group();
     scene.add(markerGroup);
     const dots: { mesh: THREE.Mesh; m: Marker }[] = [];
@@ -100,7 +101,11 @@ function Globe({
           new THREE.MeshBasicMaterial({ color: m.locked ? 0xffffff : KIND_COLOR[m.kind], transparent: true, opacity: isSel || m.locked ? 1 : 0.85 }),
         );
         dot.position.copy(place(m.lat, m.lng, R + 1.2));
-        (dot as any).userData = m;
+        // pop-in: new markers scale up over ~400ms (tick lerps them in)
+        const born = bornAt.get(m.key) ?? performance.now();
+        bornAt.set(m.key, born);
+        (dot as any).userData = { ...m, born };
+        dot.scale.setScalar(0.001);
         markerGroup.add(dot);
         dots.push({ mesh: dot, m });
         // stalk
@@ -218,6 +223,12 @@ function Globe({
     const tick = () => {
       if (disposed) return;
       grid.rotation.y += 0.0004;
+      const now = performance.now();
+      for (const d of dots) {
+        const born = (d.mesh as any).userData?.born ?? now;
+        const s = Math.min(1, (now - born) / 400);
+        d.mesh.scale.setScalar(0.2 + 0.8 * (1 - Math.pow(1 - s, 3)));
+      }
       renderer.render(scene, camera);
       raf = requestAnimationFrame(tick);
     };
@@ -278,6 +289,7 @@ export default function TripView({ value }: { value: string }) {
   const [minRating, setMinRating] = useState<number>(0);
   const [freeCancel, setFreeCancel] = useState(false);
   const [amenity, setAmenity] = useState("");
+  const [sortBy, setSortBy] = useState<"value" | "price" | "rating">("value");
   const [busy, setBusy] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -316,13 +328,21 @@ export default function TripView({ value }: { value: string }) {
     setBusy("");
   };
 
-  const stays = (doc.stays ?? []).filter(
-    (s: any) =>
-      (!maxNight || (s.priceGbp ?? 9e9) <= maxNight) &&
-      (!minRating || (s.rating ?? 0) >= minRating) &&
-      (!freeCancel || s.freeCancellation) &&
-      (!amenity || (s.amenities ?? []).join(" ").toLowerCase().includes(amenity.toLowerCase())),
-  );
+  const stays = (doc.stays ?? [])
+    .filter(
+      (s: any) =>
+        (!maxNight || (s.priceGbp ?? 9e9) <= maxNight) &&
+        (!minRating || (s.rating ?? 0) >= minRating) &&
+        (!freeCancel || s.freeCancellation) &&
+        (!amenity || (s.amenities ?? []).join(" ").toLowerCase().includes(amenity.toLowerCase())),
+    )
+    .sort((a: any, b: any) =>
+      sortBy === "price"
+        ? (a.priceGbp ?? 9e9) - (b.priceGbp ?? 9e9)
+        : sortBy === "rating"
+          ? (b.rating ?? 0) - (a.rating ?? 0)
+          : ((b.rating ?? 3) ** 2 / (b.priceGbp ?? 200)) - ((a.rating ?? 3) ** 2 / (a.priceGbp ?? 200)),
+    );
   const totals = doc.totals ?? { total: 0, flights: 0, stay: 0, activitiesEst: 0 };
   const over = totals.total > doc.budgetGbp;
 
@@ -389,7 +409,7 @@ export default function TripView({ value }: { value: string }) {
           {busy && <span className="ml-auto text-[10px] text-cyan animate-pulse">{busy}…</span>}
         </div>
 
-        <div ref={listRef} className="scrollbar-thin min-h-0 flex-1 space-y-2 overflow-auto p-2.5">
+        <div ref={listRef} key={tab} className="rise scrollbar-thin min-h-0 flex-1 space-y-2 overflow-auto p-2.5">
           {tab === "stays" && (
             <>
               <div className="flex flex-wrap items-center gap-2 pb-1 text-[10px] text-slate">
@@ -418,6 +438,11 @@ export default function TripView({ value }: { value: string }) {
                   placeholder="amenity: pool…"
                   className="w-24 rounded bg-black/30 px-1.5 py-0.5 text-ice outline-none ring-1 ring-white/10"
                 />
+                <select value={sortBy} onChange={(e) => setSortBy(e.target.value as never)} className="ml-auto rounded bg-black/30 px-1.5 py-0.5 text-ice outline-none ring-1 ring-white/10">
+                  <option value="value">best value</option>
+                  <option value="price">cheapest</option>
+                  <option value="rating">top rated</option>
+                </select>
               </div>
               {stays.map((s: any) => {
                 const locked = doc.locked?.stay?.name === s.name;

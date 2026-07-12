@@ -114,6 +114,33 @@ function MediaCard({ a, onShow }: { a: Attachment; onShow: (a: Attachment) => vo
   );
 }
 
+// Content-aware stage sizing: small things present as centered cards, dense
+// things take the whole stage — the overlay reshuffles itself per content.
+function panelSize(panel: { type: string; value: string }): string {
+  let kind = panel.type;
+  if (kind === "widget") {
+    try {
+      kind = "w:" + (JSON.parse(panel.value)?.kind ?? "");
+    } catch {
+      /* raw */
+    }
+  }
+  switch (kind) {
+    case "launch":
+      return "w-[min(560px,94%)] h-[400px]";
+    case "w:timer":
+      return "w-[min(500px,94%)] h-[460px]";
+    case "w:weather":
+      return "w-[min(780px,96%)] h-[min(600px,96%)]";
+    case "w:market":
+      return "w-[min(880px,96%)] h-[min(500px,90%)]";
+    case "image":
+      return "w-[min(1100px,97%)] h-[min(760px,97%)]";
+    default:
+      return "h-full w-full";
+  }
+}
+
 function Clock() {
   const [now, setNow] = useState("");
   useEffect(() => {
@@ -1208,11 +1235,10 @@ export default function JarvisUI() {
         </div>
       </header>
 
-      <div
-        className={`mx-auto flex w-full max-w-[1720px] flex-1 flex-col gap-4 p-4 pt-2 md:flex-row ${chatMode === "bar" ? "pb-24" : ""}`}
-      >
-        {/* the stage: orb / viewport / agent view — expands live as chat collapses */}
-        <div ref={stageRef} className="brackets relative min-h-[52vh] flex-1 transition-all duration-500 md:min-h-[76vh]">
+      <div className={`relative mx-auto flex w-full max-w-[1720px] flex-1 flex-col p-4 pt-2 ${chatMode === "bar" ? "pb-24" : ""}`}>
+        {/* the stage is ALWAYS full-bleed; the chat floats over it and slides
+            away on pure transforms — compositor-only, 120fps-smooth */}
+        <div ref={stageRef} className="brackets relative min-h-[52vh] flex-1 md:min-h-[80vh]">
           <span className="bk" />
           {live === "live" && <div className="live-ring pointer-events-none absolute inset-2 rounded-full opacity-60" />}
           {(activeJobs.length > 0 || (panel && panelMin)) && (
@@ -1246,14 +1272,16 @@ export default function JarvisUI() {
             </div>
           )}
           {panel && panel.type !== "video" && !panelMin && !panelFull ? (
-            <div className="absolute inset-0 z-20 p-1">
-              <Viewport
-                panel={panel}
-                onClose={() => clearPanel({})}
-                onMinimize={() => setPanelMin(true)}
-                full={false}
-                onToggleFull={() => setPanelFull(true)}
-              />
+            <div className="absolute inset-0 z-20 flex items-center justify-center p-1">
+              <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${panelSize(panel)}`}>
+                <Viewport
+                  panel={panel}
+                  onClose={() => clearPanel({})}
+                  onMinimize={() => setPanelMin(true)}
+                  full={false}
+                  onToggleFull={() => setPanelFull(true)}
+                />
+              </div>
             </div>
           ) : shownJob ? (
             <div className="absolute inset-0 z-20 p-1">
@@ -1290,13 +1318,14 @@ export default function JarvisUI() {
           </div>
         </div>
 
-        {/* conversation column — animates closed instead of vanishing */}
+        {/* conversation panel — floats over the stage's right edge and slides
+            away on a pure transform (no layout work = every frame cheap) */}
         <div
-          className={`shrink-0 overflow-hidden transition-all duration-500 ease-in-out ${
-            chatMode === "full" ? "max-h-[52vh] w-full opacity-100 md:max-h-none md:w-[400px]" : "max-h-0 w-full opacity-0 md:w-0"
+          className={`absolute bottom-2 right-4 top-2 z-30 w-[min(400px,92vw)] will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+            chatMode === "full" ? "translate-x-0 opacity-100" : "pointer-events-none translate-x-[calc(100%+32px)] opacity-0"
           }`}
         >
-        <div className="glass flex h-[52vh] w-full flex-col overflow-hidden rounded-2xl md:h-[78vh] md:w-[400px]">
+        <div className="glass flex h-full w-full flex-col overflow-hidden rounded-2xl">
           <div className="flex items-center gap-2 border-b border-white/5 px-3 py-1.5">
             <button
               onClick={() => setDrawerOpen(true)}
@@ -1311,16 +1340,9 @@ export default function JarvisUI() {
             <button
               onClick={() => setChatMode("bar")}
               className="hud-label rounded px-1.5 py-0.5 hover:text-cyan"
-              title="minimize chat to a type bar — more room for the screen"
+              title="tuck the chat away (▤ in the header brings it back)"
             >
-              ▁ bar
-            </button>
-            <button
-              onClick={() => setChatMode("off")}
-              className="hud-label rounded px-1.5 py-0.5 hover:text-cyan"
-              title="hide chat completely — JARVIS keeps listening (say 'hey jarvis')"
-            >
-              ✕
+              ▁
             </button>
           </div>
           <div className="scrollbar-thin flex-1 space-y-3 overflow-y-auto p-4">
@@ -1498,8 +1520,12 @@ export default function JarvisUI() {
       </div>
 
       {/* bar mode: chat collapsed to a floating type bar — the screen gets the room */}
-      {chatMode === "bar" && !panelFull && (
-        <div className="fixed inset-x-0 bottom-3 z-40 mx-auto w-[min(94vw,780px)]">
+      {!panelFull && (
+        <div
+          className={`fixed inset-x-0 bottom-3 z-40 mx-auto w-[min(94vw,780px)] will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+            chatMode === "bar" ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-28 opacity-0"
+          }`}
+        >
           {(() => {
             const lastReply = [...messages].reverse().find((m) => m.role === "assistant" && m.status === "done" && m.text);
             return lastReply ? (
@@ -1556,28 +1582,21 @@ export default function JarvisUI() {
             >
               send
             </button>
-            <button
-              onClick={() => setChatMode("off")}
-              title="hide completely — JARVIS keeps listening"
-              className="hud-label shrink-0 rounded-xl px-2 hover:text-cyan"
-            >
-              ✕
-            </button>
           </div>
         </div>
       )}
 
       {/* zen mode: no chat at all — JARVIS is always listening */}
-      {chatMode === "off" && !panelFull && (
-        <button
-          onClick={() => setChatMode("bar")}
-          className="glass fixed bottom-4 right-4 z-40 flex items-center gap-2 rounded-full px-3.5 py-2 text-xs text-slate transition hover:text-ice"
-          title="bring the chat back"
-        >
-          <span className={`h-1.5 w-1.5 rounded-full ${live === "live" ? "bg-cyan animate-pulse" : wake ? "bg-cyan breathe" : "bg-slate"}`} />
-          {live === "live" ? "live" : wake ? "listening — say “hey jarvis”" : "tap to chat"}
-        </button>
-      )}
+      <button
+        onClick={() => setChatMode("bar")}
+        className={`glass fixed bottom-4 right-4 z-40 flex items-center gap-2 rounded-full px-3.5 py-2 text-xs text-slate will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] hover:text-ice ${
+          chatMode === "off" && !panelFull ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-20 opacity-0"
+        }`}
+        title="bring the chat back"
+      >
+        <span className={`h-1.5 w-1.5 rounded-full ${live === "live" ? "bg-cyan animate-pulse" : wake ? "bg-cyan breathe" : "bg-slate"}`} />
+        {live === "live" ? "live" : wake ? "listening — say “hey jarvis”" : "tap to chat"}
+      </button>
 
       {/* full-screen viewport — keeps a floating composer so Daniel can still talk */}
       {panel && panelFull && (
