@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
+import ThreeOrbClassic from "./ThreeOrbClassic";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView } from "./Views";
 import TripView from "./TripView";
 
@@ -642,6 +643,26 @@ export default function JarvisUI() {
     panelFullRef.current = panelFull;
   }, [panelFull]);
 
+  // Orb style: the ethanplusai particle-network orb (default) vs the classic
+  // icosphere — toggle in the header, remembered per device.
+  const [orbStyle, setOrbStyle] = useState<"particles" | "classic">("particles");
+  useEffect(() => {
+    try {
+      if (localStorage.getItem("jarvis_orb") === "classic") setOrbStyle("classic");
+    } catch {
+      /* private mode */
+    }
+  }, []);
+  const toggleOrbStyle = () => {
+    const next = orbStyle === "particles" ? "classic" : "particles";
+    setOrbStyle(next);
+    try {
+      localStorage.setItem("jarvis_orb", next);
+    } catch {
+      /* private mode */
+    }
+  };
+
   // Chat history drawer + intelligent video handling (16:9 stage / PiP corner)
   const [drawerOpen, setDrawerOpen] = useState(false);
   const stageRef = useRef<HTMLDivElement>(null);
@@ -1109,6 +1130,13 @@ export default function JarvisUI() {
           >
             {chatMode === "full" ? "▤ chat" : chatMode === "bar" ? "▁ bar" : "◌ zen"}
           </button>
+          <button
+            onClick={toggleOrbStyle}
+            title={orbStyle === "particles" ? "switch to the classic orb" : "switch to the particle-network orb"}
+            className="hud-label rounded px-1 transition hover:text-cyan"
+          >
+            ◍ orb
+          </button>
           <Clock />
           <button
             onClick={async () => {
@@ -1189,7 +1217,11 @@ export default function JarvisUI() {
               panel && !panelMin && !panelFull ? "opacity-[0.14]" : "opacity-100"
             }`}
           >
-            <ThreeOrb state={orbState} energyRef={energyRef} />
+            {orbStyle === "particles" ? (
+              <ThreeOrb state={orbState} energyRef={energyRef} />
+            ) : (
+              <ThreeOrbClassic state={orbState} energyRef={energyRef} />
+            )}
           </div>
           {/* live captions */}
           {caption && (

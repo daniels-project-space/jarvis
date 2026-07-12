@@ -1,261 +1,315 @@
 "use client";
 import { useEffect, useRef } from "react";
+import * as THREE from "three";
 
-// Premium audio-reactive orb: a high-poly icosphere displaced by GLSL simplex
-// noise, fresnel rim + emissive core, UnrealBloom glow, particle halo, camera
-// drift, and per-state colour palettes. Driven by live voice amplitude.
-type State = "idle" | "listening" | "thinking" | "speaking";
+// Particle-network orb — adapted from ethanplusai/jarvis (frontend/src/orb.ts),
+// free for personal use: https://github.com/ethanplusai/jarvis
+// Floating particles with line connections between nearby ones; lines fade with
+// state, transition tumble on state change, speaking pulls particles denser,
+// electrons travel the connections while thinking.
+// Adapted here: container-sized + transparent background, driven by energyRef
+// (0..1 voice amplitude) instead of an AnalyserNode, JARVIS green palette.
+// The previous orb is preserved as ThreeOrbClassic.tsx (header ◍ toggle).
 
-const PAL: Record<State, { a: string; b: string; accent: string; bloom: number; amp: number }> = {
-  idle: { a: "#00ff88", b: "#00dd77", accent: "#00ffaa", bloom: 0.45, amp: 0.16 },
-  listening: { a: "#00ffaa", b: "#00ff88", accent: "#00ffcc", bloom: 0.5, amp: 0.28 },
-  thinking: { a: "#00ff88", b: "#00dd77", accent: "#00ff99", bloom: 0.5, amp: 0.28 },
-  speaking: { a: "#00ff88", b: "#00ff77", accent: "#00ffcc", bloom: 0.58, amp: 0.4 },
-};
+type OrbState = "idle" | "listening" | "thinking" | "speaking";
 
-const VERT = /* glsl */ `
-uniform float uTime, uBass, uMid, uTreble, uLevel, uAmp, uFreq;
-varying vec3 vNormal; varying vec3 vWorldPos; varying float vDisp;
-vec3 mod289(vec3 x){ return x - floor(x*(1.0/289.0))*289.0; }
-vec4 mod289(vec4 x){ return x - floor(x*(1.0/289.0))*289.0; }
-vec4 permute(vec4 x){ return mod289(((x*34.0)+1.0)*x); }
-vec4 taylorInvSqrt(vec4 r){ return 1.79284291400159 - 0.85373472095314*r; }
-float snoise(vec3 v){
-  const vec2 C = vec2(1.0/6.0, 1.0/3.0); const vec4 D = vec4(0.0,0.5,1.0,2.0);
-  vec3 i = floor(v + dot(v, C.yyy)); vec3 x0 = v - i + dot(i, C.xxx);
-  vec3 g = step(x0.yzx, x0.xyz); vec3 l = 1.0 - g;
-  vec3 i1 = min(g.xyz, l.zxy); vec3 i2 = max(g.xyz, l.zxy);
-  vec3 x1 = x0 - i1 + C.xxx; vec3 x2 = x0 - i2 + C.yyy; vec3 x3 = x0 - D.yyy;
-  i = mod289(i);
-  vec4 p = permute(permute(permute(i.z + vec4(0.0,i1.z,i2.z,1.0)) + i.y + vec4(0.0,i1.y,i2.y,1.0)) + i.x + vec4(0.0,i1.x,i2.x,1.0));
-  float n_ = 0.142857142857; vec3 ns = n_*D.wyz - D.xzx;
-  vec4 j = p - 49.0*floor(p*ns.z*ns.z); vec4 x_ = floor(j*ns.z); vec4 y_ = floor(j - 7.0*x_);
-  vec4 x = x_*ns.x + ns.yyyy; vec4 y = y_*ns.x + ns.yyyy; vec4 h = 1.0 - abs(x) - abs(y);
-  vec4 b0 = vec4(x.xy, y.xy); vec4 b1 = vec4(x.zw, y.zw);
-  vec4 s0 = floor(b0)*2.0 + 1.0; vec4 s1 = floor(b1)*2.0 + 1.0; vec4 sh = -step(h, vec4(0.0));
-  vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy; vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
-  vec3 p0 = vec3(a0.xy,h.x); vec3 p1 = vec3(a0.zw,h.y); vec3 p2 = vec3(a1.xy,h.z); vec3 p3 = vec3(a1.zw,h.w);
-  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
-  p0*=norm.x; p1*=norm.y; p2*=norm.z; p3*=norm.w;
-  vec4 m = max(0.6 - vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)), 0.0); m = m*m;
-  return 42.0 * dot(m*m, vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
-}
-float fbm(vec3 p){ float f=0.0, amp=0.5; for(int i=0;i<4;i++){ f+=amp*snoise(p); p*=2.0; amp*=0.5; } return f; }
-void main(){
-  vNormal = normal;
-  float amp = uAmp * (1.0 + uBass*2.2 + uLevel*0.8);
-  float freq = uFreq * (1.0 + uMid*0.6);
-  float t = uTime * (0.35 + uTreble*0.9);
-  vec3 np = position*freq + vec3(0.0,0.0,t);
-  float base = fbm(np);
-  float ripple = snoise(position*(freq*3.0) + t*2.0) * (uTreble*0.35);
-  float disp = base*amp + ripple;
-  vec3 displaced = position + normal*disp;
-  vDisp = disp;
-  vec4 wp = modelMatrix * vec4(displaced,1.0);
-  vWorldPos = wp.xyz;
-  gl_Position = projectionMatrix * viewMatrix * wp;
-}`;
-
-const FRAG = /* glsl */ `
-uniform vec3 uColorA; uniform vec3 uColorB; uniform vec3 uColorAccent;
-uniform float uTreble, uLevel;
-varying vec3 vNormal; varying vec3 vWorldPos; varying float vDisp;
-void main(){
-  vec3 N = normalize(vNormal);
-  vec3 V = normalize(cameraPosition - vWorldPos);
-  float fres = pow(1.0 - max(dot(N,V),0.0), 2.5);
-  vec3 col = mix(uColorA, uColorB, fres);
-  col = mix(col, uColorAccent, smoothstep(0.15,0.5,vDisp) * (0.3 + uTreble*0.5));
-  float intensity = 0.25 + fres*1.6 + uLevel*0.22;
-  col *= intensity;
-  col += uColorA * (0.04 + 0.06*uLevel);
-  gl_FragColor = vec4(col, 1.0);
-}`;
+const BASE = 0x00ff88; // Daniel's green — do not revert
+const THINK = 0x6effc4;
+const SPEAK = 0x3cf0a4;
 
 export default function ThreeOrb({
   state = "idle",
   energyRef,
 }: {
-  state?: State;
+  state?: OrbState;
   energyRef?: { current: number };
 }) {
   const mountRef = useRef<HTMLDivElement>(null);
-  const stateRef = useRef<State>(state);
+  const stateRef = useRef<OrbState>(state);
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
 
   useEffect(() => {
-    const mount = mountRef.current!;
-    let raf = 0;
-    let disposed = false;
-    let cleanup = () => {};
+    const mount = mountRef.current;
+    if (!mount) return;
+    let destroyed = false;
+    const N = 2000;
+    const W = () => mount.clientWidth || 1;
+    const H = () => mount.clientHeight || 1;
 
-    (async () => {
-      const THREE = await import("three");
-      const { EffectComposer } = await import("three/addons/postprocessing/EffectComposer.js");
-      const { RenderPass } = await import("three/addons/postprocessing/RenderPass.js");
-      const { UnrealBloomPass } = await import("three/addons/postprocessing/UnrealBloomPass.js");
-      const { OutputPass } = await import("three/addons/postprocessing/OutputPass.js");
-      if (disposed) return;
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
+    renderer.setSize(W(), H());
+    renderer.setClearColor(0x000000, 0);
+    mount.appendChild(renderer.domElement);
 
-      const lin = (hex: string) => new THREE.Color(hex).convertSRGBToLinear();
-      const w = () => mount.clientWidth || 1;
-      const h = () => mount.clientHeight || 1;
-      const mobile = Math.min(window.innerWidth, window.innerHeight) < 768;
-      const prCap = mobile ? 1.5 : 2;
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, W() / H(), 1, 1000);
+    camera.position.z = 80;
 
-      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, prCap));
-      renderer.setSize(w(), h());
-      renderer.outputColorSpace = THREE.SRGBColorSpace;
-      renderer.toneMapping = THREE.ACESFilmicToneMapping;
-      renderer.toneMappingExposure = 0.95;
-      mount.appendChild(renderer.domElement);
+    // ── Particles ──
+    const geo = new THREE.BufferGeometry();
+    const pos = new Float32Array(N * 3);
+    const vel = new Float32Array(N * 3);
+    const phase = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos(2 * Math.random() - 1);
+      const r = Math.pow(Math.random(), 0.5) * 25;
+      pos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+      pos[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+      pos[i * 3 + 2] = r * Math.cos(phi);
+      phase[i] = Math.random() * 1000;
+    }
+    geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    const mat = new THREE.PointsMaterial({
+      color: BASE, size: 0.4, transparent: true, opacity: 0.6,
+      sizeAttenuation: true, blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    const points = new THREE.Points(geo, mat);
+    scene.add(points);
 
-      const scene = new THREE.Scene();
-      const camera = new THREE.PerspectiveCamera(50, w() / h(), 0.1, 100);
-      camera.position.z = 4.3;
+    // ── Connection lines ──
+    const MAX_LINES = 8000;
+    const linePos = new Float32Array(MAX_LINES * 6);
+    const lineGeo = new THREE.BufferGeometry();
+    lineGeo.setAttribute("position", new THREE.BufferAttribute(linePos, 3));
+    lineGeo.setDrawRange(0, 0);
+    const lineMat = new THREE.LineBasicMaterial({
+      color: BASE, transparent: true, opacity: 0.0,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    const lines = new THREE.LineSegments(lineGeo, lineMat);
+    scene.add(lines);
 
-      const p0 = PAL[stateRef.current];
-      const uniforms = {
-        uTime: { value: 0 },
-        uBass: { value: 0 },
-        uMid: { value: 0 },
-        uTreble: { value: 0 },
-        uLevel: { value: 0 },
-        uAmp: { value: p0.amp },
-        uFreq: { value: 1.6 },
-        uColorA: { value: lin(p0.a) },
-        uColorB: { value: lin(p0.b) },
-        uColorAccent: { value: lin(p0.accent) },
-      };
-      const geo = new THREE.IcosahedronGeometry(1, mobile ? 14 : 24);
-      const material = new THREE.ShaderMaterial({ uniforms, vertexShader: VERT, fragmentShader: FRAG });
-      const orb = new THREE.Mesh(geo, material);
-      scene.add(orb);
+    // ── Electrons — bright dots travelling along connections while thinking ──
+    const MAX_ELECTRONS = 200;
+    const electronGeo = new THREE.BufferGeometry();
+    const electronPos = new Float32Array(MAX_ELECTRONS * 3);
+    electronGeo.setAttribute("position", new THREE.BufferAttribute(electronPos, 3));
+    electronGeo.setDrawRange(0, 0);
+    const electronMat = new THREE.PointsMaterial({
+      color: 0xffffff, size: 0.8, transparent: true, opacity: 1.0,
+      sizeAttenuation: true, blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    const electrons = new THREE.Points(electronGeo, electronMat);
+    scene.add(electrons);
 
-      // particle halo (additive → glowing nebula through bloom)
-      const N = mobile ? 700 : 1400;
-      const pos = new Float32Array(N * 3);
-      for (let i = 0; i < N; i++) {
-        const r = 1.5 + Math.random() * 1.6;
-        const th = Math.acos(2 * Math.random() - 1);
-        const ph = Math.random() * Math.PI * 2;
-        pos[i * 3] = r * Math.sin(th) * Math.cos(ph);
-        pos[i * 3 + 1] = r * Math.sin(th) * Math.sin(ph);
-        pos[i * 3 + 2] = r * Math.cos(th);
+    type Electron = { sx: number; sy: number; sz: number; ex: number; ey: number; ez: number; t: number; speed: number };
+    const activeElectrons: Electron[] = [];
+    let electronSpawnRate = 0;
+    let targetElectronRate = 0;
+    let lastElectronSpawn = 0;
+    let activeConnections: { x1: number; y1: number; z1: number; x2: number; y2: number; z2: number }[] = [];
+
+    // ── State ──
+    let targetRadius = 25, currentRadius = 25;
+    let targetSpeed = 0.3, currentSpeed = 0.3;
+    let targetBright = 0.6, currentBright = 0.6;
+    let targetSize = 0.4, currentSize = 0.4;
+    let lineAmount = 0, targetLineAmount = 0;
+    const lineDistance = 8;
+    let spinX = 0, spinY = 0, spinZ = 0;
+    let transitionEnergy = 0;
+    let lastState: OrbState = "idle";
+    let cloudZ = 0, cloudZVel = 0;
+    let smoothEnergy = 0;
+
+    const clock = new THREE.Clock();
+
+    function animate() {
+      if (destroyed) return;
+      requestAnimationFrame(animate);
+      const t = clock.getElapsedTime();
+      const st = stateRef.current;
+
+      switch (st) {
+        case "idle":
+          targetRadius = 28; targetSpeed = 0.2; targetBright = 0.5; targetSize = 0.35;
+          targetLineAmount = 0.15; targetElectronRate = 0; break;
+        case "listening":
+          targetRadius = 22; targetSpeed = 0.3; targetBright = 0.65; targetSize = 0.4;
+          targetLineAmount = 0.4; targetElectronRate = 0; break;
+        case "thinking":
+          targetRadius = 16; targetSpeed = 0.5; targetBright = 0.7; targetSize = 0.3;
+          targetLineAmount = 1.0; targetElectronRate = 0.015; break;
+        case "speaking":
+          targetRadius = 18; targetSpeed = 0.2; targetBright = 0.7; targetSize = 0.4;
+          targetLineAmount = 0.8; targetElectronRate = 0; break;
       }
-      const pg = new THREE.BufferGeometry();
-      pg.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-      // soft round sprite (radial gradient) so particles read as glowing dust, not squares
-      const cvs = document.createElement("canvas");
-      cvs.width = cvs.height = 64;
-      const g2 = cvs.getContext("2d")!;
-      const grad = g2.createRadialGradient(32, 32, 0, 32, 32, 32);
-      grad.addColorStop(0, "rgba(255,255,255,1)");
-      grad.addColorStop(0.4, "rgba(255,255,255,0.5)");
-      grad.addColorStop(1, "rgba(255,255,255,0)");
-      g2.fillStyle = grad;
-      g2.fillRect(0, 0, 64, 64);
-      const dot = new THREE.CanvasTexture(cvs);
-      const pm = new THREE.PointsMaterial({
-        size: 0.045,
-        map: dot,
-        color: lin("#00ff88"),
-        transparent: true,
-        opacity: 0.45,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-        sizeAttenuation: true,
-      });
-      const halo = new THREE.Points(pg, pm);
-      scene.add(halo);
 
-      const composer = new EffectComposer(
-        renderer,
-        new THREE.WebGLRenderTarget(w(), h(), { type: THREE.HalfFloatType, samples: 2 }),
-      );
-      composer.setPixelRatio(Math.min(window.devicePixelRatio || 1, prCap));
-      composer.addPass(new RenderPass(scene, camera));
-      const bloom = new UnrealBloomPass(new THREE.Vector2(w(), h()), p0.bloom, 0.6, 0.7);
-      composer.addPass(bloom);
-      composer.addPass(new OutputPass());
+      currentRadius += (targetRadius - currentRadius) * 0.02;
+      currentSpeed += (targetSpeed - currentSpeed) * 0.02;
+      currentBright += (targetBright - currentBright) * 0.02;
+      currentSize += (targetSize - currentSize) * 0.02;
+      lineAmount += (targetLineAmount - lineAmount) * 0.02;
+      electronSpawnRate += (targetElectronRate - electronSpawnRate) * 0.02;
 
-      const clock = new THREE.Clock();
-      let level = 0;
-      const tgtA = new THREE.Color(),
-        tgtB = new THREE.Color(),
-        tgtAcc = new THREE.Color();
+      if (st !== lastState) { transitionEnergy = 1.0; lastState = st; }
+      transitionEnergy *= 0.985;
+      if (transitionEnergy > 0.05) {
+        spinX += transitionEnergy * 0.012 * Math.sin(t * 1.7);
+        spinY += transitionEnergy * 0.015;
+        spinZ += transitionEnergy * 0.008 * Math.cos(t * 1.3);
+      }
 
-      const onResize = () => {
-        renderer.setSize(w(), h());
-        composer.setSize(w(), h());
-        camera.aspect = w() / h();
-        camera.updateProjectionMatrix();
-      };
-      window.addEventListener("resize", onResize);
+      // our live voice-amplitude signal stands in for the upstream AnalyserNode
+      const raw = Math.max(0, Math.min(1, energyRef?.current ?? 0));
+      smoothEnergy += (raw - smoothEnergy) * 0.25;
+      const bass = smoothEnergy;
+      const mid = smoothEnergy * 0.8;
 
-      const animate = () => {
-        const t = clock.getElapsedTime();
-        uniforms.uTime.value = t;
+      let zTarget = Math.sin(t * 0.12) * 8;
+      if (st === "thinking") zTarget = Math.sin(t * 0.3) * 15 + Math.sin(t * 0.9) * 6;
+      else if (st === "speaking") zTarget = Math.sin(t * 0.15) * 6 - bass * 10;
+      cloudZVel += (zTarget - cloudZ) * 0.008;
+      cloudZVel *= 0.94;
+      cloudZ += cloudZVel;
 
-        // audio energy → bands (single-value amplitude synthesised into bands)
-        const dbg = (window as any).__orbE;
-        const raw = typeof dbg === "number" ? dbg : (energyRef?.current ?? 0);
-        level += (raw - level) * (raw > level ? 0.5 : 0.12);
-        const idle = 0.05 + 0.035 * Math.sin(t * 1.2);
-        const lvl = raw < 0.02 ? Math.max(level, idle) : level;
-        uniforms.uLevel.value = lvl;
-        uniforms.uBass.value = lvl * 0.95;
-        uniforms.uMid.value = lvl * 0.65;
-        uniforms.uTreble.value = lvl * 0.45 + 0.015 * (0.5 + 0.5 * Math.sin(t * 6.0));
+      points.rotation.set(spinX, spinY, spinZ);
+      points.position.z = cloudZ;
+      lines.rotation.set(spinX, spinY, spinZ);
+      lines.position.z = cloudZ;
 
-        // state palette lerp
-        const dbgS = (window as any).__orbState as State | undefined;
-        const pal = PAL[dbgS ?? stateRef.current];
-        tgtA.copy(new THREE.Color(pal.a).convertSRGBToLinear());
-        tgtB.copy(new THREE.Color(pal.b).convertSRGBToLinear());
-        tgtAcc.copy(new THREE.Color(pal.accent).convertSRGBToLinear());
-        uniforms.uColorA.value.lerp(tgtA, 0.06);
-        uniforms.uColorB.value.lerp(tgtB, 0.06);
-        uniforms.uColorAccent.value.lerp(tgtAcc, 0.06);
-        pm.color.lerp(tgtA, 0.04);
-        uniforms.uAmp.value += (pal.amp - uniforms.uAmp.value) * 0.05;
-        const bright = Math.min(lvl, 0.65);
-        bloom.strength += (pal.bloom + bright * 0.12 - bloom.strength) * 0.05;
+      const p = geo.getAttribute("position") as THREE.BufferAttribute;
+      const a = p.array as Float32Array;
+      for (let i = 0; i < N; i++) {
+        const i3 = i * 3;
+        const x = a[i3], y = a[i3 + 1], z = a[i3 + 2];
+        const px = phase[i];
+        vel[i3] += Math.sin(t * 0.05 + px) * 0.001 * currentSpeed;
+        vel[i3 + 1] += Math.cos(t * 0.06 + px * 1.3) * 0.001 * currentSpeed;
+        vel[i3 + 2] += Math.sin(t * 0.055 + px * 0.7) * 0.001 * currentSpeed;
+        vel[i3] += Math.sin(t * 0.02 + px * 2.1 + y * 0.1) * 0.0008 * currentSpeed;
+        vel[i3 + 1] += Math.cos(t * 0.025 + px * 1.7 + z * 0.1) * 0.0008 * currentSpeed;
+        vel[i3 + 2] += Math.sin(t * 0.022 + px * 0.9 + x * 0.1) * 0.0008 * currentSpeed;
+        const dist = Math.sqrt(x * x + y * y + z * z) || 0.01;
+        const pull = Math.max(0, dist - currentRadius) * 0.002 + 0.0003;
+        vel[i3] -= (x / dist) * pull;
+        vel[i3 + 1] -= (y / dist) * pull;
+        vel[i3 + 2] -= (z / dist) * pull;
+        if (bass > 0.05) {
+          vel[i3] += (x / dist) * bass * 0.02;
+          vel[i3 + 1] += (y / dist) * bass * 0.02;
+          vel[i3 + 2] += (z / dist) * bass * 0.02;
+        }
+        if (st === "speaking" && mid > 0.1) {
+          const pulse = Math.sin(t * 8 + px);
+          vel[i3] += (x / dist) * mid * 0.012 * pulse;
+          vel[i3 + 1] += (y / dist) * mid * 0.012 * pulse;
+        }
+        vel[i3] *= 0.992; vel[i3 + 1] *= 0.992; vel[i3 + 2] *= 0.992;
+        a[i3] += vel[i3]; a[i3 + 1] += vel[i3 + 1]; a[i3 + 2] += vel[i3 + 2];
+      }
+      p.needsUpdate = true;
 
-        orb.rotation.y += 0.0016;
-        halo.rotation.y += 0.0006 + lvl * 0.004;
-        pm.size = 0.045 + uniforms.uTreble.value * 0.04;
+      if (lineAmount > 0.01) {
+        const lp = lineGeo.getAttribute("position") as THREE.BufferAttribute;
+        const la = lp.array as Float32Array;
+        let lineCount = 0;
+        const maxDist = lineDistance * (1 + bass * 0.5);
+        const maxDistSq = maxDist * maxDist;
+        const step = Math.max(1, Math.floor(N / 600));
+        for (let i = 0; i < N && lineCount < MAX_LINES; i += step) {
+          const i3 = i * 3;
+          const x1 = a[i3], y1 = a[i3 + 1], z1 = a[i3 + 2];
+          for (let j = i + step; j < N && lineCount < MAX_LINES; j += step) {
+            const j3 = j * 3;
+            const dx = a[j3] - x1, dy = a[j3 + 1] - y1, dz = a[j3 + 2] - z1;
+            if (dx * dx + dy * dy + dz * dz < maxDistSq) {
+              const idx = lineCount * 6;
+              la[idx] = x1; la[idx + 1] = y1; la[idx + 2] = z1;
+              la[idx + 3] = a[j3]; la[idx + 4] = a[j3 + 1]; la[idx + 5] = a[j3 + 2];
+              lineCount++;
+            }
+          }
+        }
+        lineGeo.setDrawRange(0, lineCount * 2);
+        lp.needsUpdate = true;
+        lineMat.opacity = lineAmount * 0.12;
+        activeConnections = [];
+        for (let c = 0; c < Math.min(lineCount, 500); c++) {
+          const ci = c * 6;
+          activeConnections.push({
+            x1: la[ci], y1: la[ci + 1], z1: la[ci + 2],
+            x2: la[ci + 3], y2: la[ci + 4], z2: la[ci + 5],
+          });
+        }
+      } else {
+        lineGeo.setDrawRange(0, 0);
+        activeConnections = [];
+      }
 
-        camera.position.x = Math.sin(t * 0.15) * 0.35;
-        camera.position.y = Math.cos(t * 0.11) * 0.22;
-        camera.lookAt(0, 0, 0);
+      if (activeConnections.length > 0 && electronSpawnRate > 0.005) {
+        if (activeElectrons.length < 3 && t - lastElectronSpawn > 1.0) {
+          const conn = activeConnections[Math.floor(Math.random() * activeConnections.length)];
+          activeElectrons.push({
+            sx: conn.x1, sy: conn.y1, sz: conn.z1,
+            ex: conn.x2, ey: conn.y2, ez: conn.z2,
+            t: 0,
+            speed: 0.003 + Math.random() * 0.003,
+          });
+          lastElectronSpawn = t;
+        }
+      }
+      const ep = electronGeo.getAttribute("position") as THREE.BufferAttribute;
+      const ea = ep.array as Float32Array;
+      let aliveCount = 0;
+      for (let e = activeElectrons.length - 1; e >= 0; e--) {
+        const el = activeElectrons[e];
+        el.t += el.speed;
+        if (el.t >= 1) {
+          activeElectrons.splice(e, 1);
+          continue;
+        }
+        const ei = aliveCount * 3;
+        ea[ei] = el.sx + (el.ex - el.sx) * el.t;
+        ea[ei + 1] = el.sy + (el.ey - el.sy) * el.t;
+        ea[ei + 2] = el.sz + (el.ez - el.sz) * el.t;
+        aliveCount++;
+      }
+      electronGeo.setDrawRange(0, aliveCount);
+      ep.needsUpdate = true;
+      electrons.rotation.set(spinX, spinY, spinZ);
+      electrons.position.z = cloudZ;
 
-        composer.render();
-        raf = requestAnimationFrame(animate);
-      };
-      animate();
+      mat.opacity = currentBright + bass * 0.08;
+      mat.size = currentSize + bass * 0.05;
+      if (st === "thinking") { mat.color.lerp(new THREE.Color(THINK), 0.015); lineMat.color.lerp(new THREE.Color(THINK), 0.015); }
+      else if (st === "speaking") { mat.color.lerp(new THREE.Color(SPEAK), 0.015); lineMat.color.lerp(new THREE.Color(SPEAK), 0.015); }
+      else { mat.color.lerp(new THREE.Color(BASE), 0.015); lineMat.color.lerp(new THREE.Color(BASE), 0.015); }
 
-      cleanup = () => {
-        cancelAnimationFrame(raf);
-        window.removeEventListener("resize", onResize);
-        geo.dispose();
-        material.dispose();
-        pg.dispose();
-        pm.dispose();
-        composer.dispose?.();
-        renderer.dispose();
-        if (renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
-      };
-    })();
+      camera.position.x = Math.sin(t * 0.02) * 5;
+      camera.position.y = Math.cos(t * 0.03) * 3;
+      camera.lookAt(0, 0, cloudZ * 0.2);
+      renderer.render(scene, camera);
+    }
+
+    const onResize = () => {
+      camera.aspect = W() / H();
+      camera.updateProjectionMatrix();
+      renderer.setSize(W(), H());
+    };
+    window.addEventListener("resize", onResize);
+    const ro = new ResizeObserver(onResize);
+    ro.observe(mount);
+    animate();
 
     return () => {
-      disposed = true;
-      cleanup();
+      destroyed = true;
+      window.removeEventListener("resize", onResize);
+      ro.disconnect();
+      renderer.dispose();
+      geo.dispose();
+      lineGeo.dispose();
+      electronGeo.dispose();
+      mat.dispose();
+      lineMat.dispose();
+      electronMat.dispose();
+      if (renderer.domElement.parentElement === mount) mount.removeChild(renderer.domElement);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return <div ref={mountRef} className="h-full w-full" />;
