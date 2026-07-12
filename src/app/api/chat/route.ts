@@ -45,11 +45,15 @@ export async function POST(req: NextRequest) {
   const key = process.env.GROQ_API_KEY ?? (await getSecret("groq", "GROQ_API_KEY").catch(() => ""));
   if (!key) return Response.json({ error: "no groq key" }, { status: 500 });
 
-  const [{ assistantId, history }, ctx] = await Promise.all([
+  const [{ assistantId, userId, history }, ctx] = await Promise.all([
     convexMutation("chatQueue:openTurn", { threadId, userText: text }),
     buildContext(text),
   ]);
 
+  // Once the answer is finalized it is DELIVERED — nothing after that point may
+  // overwrite it or re-queue the question (that's exactly how Daniel used to get
+  // a cut-off bubble plus a second, reworded answer minutes later).
+  let delivered = false;
   try {
     const messages: any[] = [
       {
@@ -64,6 +68,14 @@ export async function POST(req: NextRequest) {
     ];
     const tools = TOOL_DEFS.map((t) => ({ type: "function", function: t }));
 
+    // Hard questions get real thinking; chit-chat stays instant. Design,
+    // creative and multi-constraint asks are exactly where low effort showed.
+    const complex =
+      text.length > 220 ||
+      /\b(design|architect|creative|brainstorm|compare|trade-?offs?|should i|which (one|is better)|pros and cons|strategy|plan out|name (it|the)|decide|recommend)\b/i.test(
+        text,
+      );
+
     let final = "";
     const used: string[] = [];
     for (let round = 0; round < 6; round++) {
@@ -72,8 +84,8 @@ export async function POST(req: NextRequest) {
         tools,
         tool_choice: "auto",
         temperature: 0.7,
-        max_tokens: 700,
-        reasoning_effort: "low",
+        max_tokens: complex ? 1100 : 700,
+        reasoning_effort: complex ? "high" : "low",
       });
       const msg = j.choices?.[0]?.message;
       if (!msg) throw new Error("groq returned no message");
@@ -104,23 +116,29 @@ export async function POST(req: NextRequest) {
       finalText: final,
       model: "flash",
     });
+    delivered = true;
+    // Post-delivery housekeeping is strictly best-effort: a failure here must
+    // NEVER reach the catch block (it used to wipe the answer + double-reply).
     if (ctx.freshFindingIds.length)
       await convexMutation("findings:markWoven", { ids: ctx.freshFindingIds }).catch(() => {});
-    // fire-and-forget memory capture (await keeps serverless alive but it's quick)
-    await extractMemory(key, text, final);
+    await extractMemory(key, text, final).catch(() => 0);
     return Response.json({ ok: true, text: final, tools: used });
   } catch (e: any) {
     await reportIncident("api/chat", `chat:${String(e?.message ?? e).slice(0, 80)}`, String(e?.message ?? e));
-    // Hand the turn to the Trigger cron dispatcher SILENTLY (an empty error row
-    // is hidden by the UI) — an apology bubble here meant Daniel got two spoken
-    // answers for one question.
+    if (delivered) {
+      // The answer already landed — swallow the housekeeping error entirely.
+      return Response.json({ ok: true });
+    }
+    // Hand the turn to the Trigger cron dispatcher SILENTLY: hide the dead
+    // assistant row and flip the ORIGINAL user row back to pending (re-inserting
+    // the text made Daniel's message appear twice and got him two answers).
     await convexMutation("chatQueue:finalize", {
       messageId: assistantId,
       threadId,
       status: "error",
       finalText: "",
     }).catch(() => {});
-    await convexMutation("chatQueue:sendMessage", { threadId, text }).catch(() => {});
+    if (userId) await convexMutation("chatQueue:requeueUser", { userId }).catch(() => {});
     return Response.json({ ok: false, fallback: true, error: String(e?.message ?? e) }, { status: 200 });
   }
 }

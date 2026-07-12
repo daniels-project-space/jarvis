@@ -133,6 +133,21 @@ export default defineSchema({
     .index("by_status", ["status", "updatedAt"])
     .index("by_signature", ["signature"]),
 
+  // Everything JARVIS creates (mind maps, charts, images, PDFs, docs) lives
+  // here — his atelier. `data` is the editable source (JSON/markdown); `url`
+  // points at the stored artifact in R2 when there is one.
+  creations: defineTable({
+    kind: v.string(), // "canvas" | "chart" | "image" | "pdf" | "doc"
+    title: v.string(),
+    data: v.optional(v.string()), // JSON (canvas/chart) or markdown (doc)
+    url: v.optional(v.string()), // R2 public url (image/pdf)
+    thumb: v.optional(v.string()), // small preview url if any
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_kind", ["kind", "updatedAt"])
+    .index("by_updatedAt", ["updatedAt"]),
+
   // Proactive insights the insight engine generates + surfaces (chat/notification).
   insights: defineTable({
     domain: v.string(),

@@ -78,7 +78,7 @@ export const openTurn = mutation({
         // cards surface as context so "that video from earlier" resolves
         text: m.text || (m.attachment ? `[showed on screen: ${m.attachment.title ?? m.attachment.type} — ${m.attachment.value}]` : ""),
       }));
-    await ctx.db.insert("chatMessages", {
+    const userId = await ctx.db.insert("chatMessages", {
       threadId,
       role: "user",
       text: a.userText,
@@ -92,7 +92,39 @@ export const openTurn = mutation({
       status: "streaming",
       createdAt: Date.now(),
     });
-    return { assistantId, history };
+    return { assistantId, userId, history };
+  },
+});
+
+// Fast-lane failure path: flip the ORIGINAL user row back to pending so the
+// cron dispatcher answers it. Re-inserting the text (the old fallback) showed
+// Daniel his own message twice — this keeps exactly one user bubble.
+export const requeueUser = mutation({
+  args: { userId: v.id("chatMessages") },
+  handler: async (ctx, a) => {
+    const m = await ctx.db.get(a.userId);
+    if (m && m.role === "user") await ctx.db.patch(a.userId, { status: "pending" });
+  },
+});
+
+// Assistant rows stuck "streaming" (a route killed mid-run) freeze the UI's
+// busy state forever. Sweep them into hidden error rows.
+export const reapStuck = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const rows = await ctx.db
+      .query("chatMessages")
+      .withIndex("by_status", (q: any) => q.eq("status", "streaming"))
+      .collect();
+    let n = 0;
+    const cutoff = Date.now() - 5 * 60 * 1000;
+    for (const r of rows) {
+      if (r.createdAt < cutoff) {
+        await ctx.db.patch(r._id, { status: "error", text: "" });
+        n++;
+      }
+    }
+    return n;
   },
 });
 

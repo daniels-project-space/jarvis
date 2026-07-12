@@ -122,13 +122,16 @@ async function buildMcpConfig(names: string[]): Promise<string | null> {
   return path;
 }
 
-// One casual spoken sentence for the chat (the weave) — never the raw dump.
+// The weave: a short spoken report that CONTAINS the answer — Daniel complained
+// that "it's done, sir" told him nothing after he sent an agent off to research.
 async function weaveLine(bin: string, env: NodeJS.ProcessEnv, task: string, result: string): Promise<string> {
   const prompt =
     "You are JARVIS, Daniel's British AI companion. A background agent you dispatched just finished. " +
-    "Write EXACTLY ONE short casual spoken sentence (max 25 words) telling Daniel the key outcome, like a colleague " +
-    "leaning over mid-conversation. No markdown, no emoji, no preamble. If it failed, say so honestly in one sentence.\n\n" +
-    `The task was: ${task.slice(0, 300)}\nThe result:\n${result.slice(0, 2500)}`;
+    "Report back like a colleague leaning over: 1-3 short spoken sentences (max 60 words) that DELIVER THE ACTUAL " +
+    "ANSWER — the concrete findings, numbers, names or recommendation — not just that the work happened. " +
+    "End by mentioning the full detail is on his screen. No markdown, no emoji, no preamble. " +
+    "If it failed, say what failed honestly in one sentence.\n\n" +
+    `The task was: ${task.slice(0, 300)}\nThe result:\n${result.slice(0, 3500)}`;
   const out = await new Promise<string>((resolve) => {
     const p = spawn(bin, ["-p", prompt, "--model", "haiku", "--dangerously-skip-permissions"], {
       env,
@@ -293,6 +296,7 @@ export const agentRunner = schedules.task({
     // Self-healing sweep: open incidents become root-cause repair jobs (attempt-
     // capped); exhausted ones escalate to Daniel instead of looping forever.
     try {
+      await convexMutation("chatQueue:reapStuck", {}).catch(() => {}); // unstick frozen typing bubbles
       const reaped: any = await convexMutation("jobs:reapStale", {});
       for (const t of reaped?.abandoned ?? [])
         await convexMutation("chatQueue:postAssistant", {
@@ -456,7 +460,24 @@ export const agentRunner = schedules.task({
           spoken,
           detail: result.slice(0, 8000) + (pushNote ? `\n\n(${pushNote.trim()})` : ""),
         });
-        await convexMutation("chatQueue:postAssistant", { threadId: await chatThread(), text: spoken });
+        const weaveThread = await chatThread();
+        await convexMutation("chatQueue:postAssistant", { threadId: weaveThread, text: spoken });
+        // The full answer lands as a tappable card in the stream AND on the big
+        // screen — "reporting back" means Daniel can actually read the findings.
+        if (result && result.length > 40 && !cloneFailed) {
+          const title = `finding · ${job.task.slice(0, 44).replace(/\s+/g, " ")}`;
+          await convexMutation("chatQueue:postCard", {
+            threadId: weaveThread,
+            type: "markdown",
+            value: result.slice(0, 3900),
+            title,
+          }).catch(() => {});
+          await convexMutation("ui:setPanel", {
+            type: "markdown",
+            value: result.slice(0, 7000),
+            title,
+          }).catch(() => {});
+        }
         await sendPush("JARVIS", spoken.slice(0, 140), "/");
         processed += 1;
       } catch (e: any) {
