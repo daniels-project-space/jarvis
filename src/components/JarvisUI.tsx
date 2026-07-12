@@ -1552,7 +1552,7 @@ export default function JarvisUI() {
 
       {/* finished-work popups — bottom-left stack, click to read the breakdown */}
       {popups.length > 0 && !panelFull && (
-        <div className="fixed bottom-4 left-4 z-40 flex w-[min(340px,88vw)] flex-col-reverse gap-2">
+        <div className="fixed bottom-20 left-4 z-40 flex w-[min(340px,88vw)] flex-col-reverse gap-2 md:bottom-4">
           {popups.map((f) => (
             <div key={f._id} className="rise glass overflow-hidden rounded-xl !border-cyan/25 shadow-2xl">
               <button onClick={() => setExpandedFinding(f._id)} className="block w-full p-3 text-left transition hover:bg-white/[0.03]">
