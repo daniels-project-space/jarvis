@@ -167,7 +167,7 @@ export function itemToOps(doc: BoardDoc, item: any): any[] {
       fillStyle: kind === "note" ? "hachure" : "solid",
       roundness: shape === "rectangle" ? { type: 3 } : undefined,
       link,
-      label: text ? { text, fontSize: 17, strokeColor: "#e8f4ff" } : undefined,
+      label: text ? { text, fontSize: 17, strokeColor: "#1b2733" } : undefined,
     }),
   ];
 }
