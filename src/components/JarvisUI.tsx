@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
-import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView } from "./Views";
+import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView } from "./Views";
 import TripView from "./TripView";
 
 type Attachment = { type: string; value: string; title?: string };
@@ -58,6 +58,7 @@ const WIDGET_ICON: Record<string, string> = {
   timer: "⏱",
   briefing: "📋",
   calendar: "📅",
+  candles: "📈",
 };
 
 // Persistent media card in the stream — click to put it back on the big screen.
@@ -246,6 +247,7 @@ function WidgetView({ value }: { value: string }) {
   }
   if (w?.kind === "timer") return <TimerWidget w={w} />;
   if (w?.kind === "calendar") return <CalendarView value={value} />;
+  if (w?.kind === "candles") return <CandlesView w={w} />;
   if (w?.kind === "market") {
     return (
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6">

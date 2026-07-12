@@ -355,6 +355,33 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "price_chart",
+    description:
+      "REAL price chart on screen: candlesticks with 20/50/200 moving averages, volume, RSI and auto-detected support/resistance — always in USD/USDT. Crypto (btc, eth, sol…), stocks (AAPL, TSLA), indices (S&P, Nasdaq, VIX), gold/oil/DXY. Use for ANY 'show me the chart / how's X looking' — never describe a chart without showing it.",
+    parameters: {
+      type: "object",
+      properties: {
+        asset: { type: "string", description: "e.g. 'btc', 'ethereum', 'AAPL', 's&p', 'gold'" },
+        interval: { type: "string", enum: ["1h", "4h", "1d", "1w"], description: "default 1d" },
+      },
+      required: ["asset"],
+    },
+  },
+  {
+    name: "market_analysis",
+    description:
+      "Full professional read of an asset RIGHT NOW: regime, key levels, chart patterns with measured targets, Elliott-wave count with invalidation, Wyckoff accumulation/distribution phase, volume + funding/open-interest/fear-greed (crypto) or VIX regime (stocks), fresh news — then a direct verdict with entries, stops, targets. Annotated chart + full write-up land on screen. Use when Daniel asks to analyse / should-I-buy / what's happening with any asset. Takes ~20s — say you're running it.",
+    parameters: {
+      type: "object",
+      properties: {
+        asset: { type: "string" },
+        interval: { type: "string", enum: ["4h", "1d", "1w"], description: "analysis anchor timeframe, default 1d" },
+        question: { type: "string", description: "Daniel's specific angle, e.g. 'thinking of adding at 60k'" },
+      },
+      required: ["asset"],
+    },
+  },
+  {
     name: "trip_plan",
     description:
       "Full travel scout — ONE call searches real flights (Google Flights), real hotels with amenities/total prices (Google Hotels), and top activities (Google Places) in parallel, then opens the interactive globe trip planner on screen. BUDGET IS REQUIRED: if Daniel hasn't given one, ASK HIM FIRST instead of calling this. Use for any 'plan a trip / find me a holiday / getaway to X'.",
@@ -830,15 +857,16 @@ async function fetchMarketData(coins: string[], symbols: string[]): Promise<any[
   const rows: any[] = [];
   try {
     if (coins.length) {
+      // USD always — Daniel doesn't want crypto quoted in pounds
       const cg: any = await (
         await fetch(
-          `https://api.coingecko.com/api/v3/simple/price?ids=${coins.map(encodeURIComponent).join(",")}&vs_currencies=gbp&include_24hr_change=true`,
+          `https://api.coingecko.com/api/v3/simple/price?ids=${coins.map(encodeURIComponent).join(",")}&vs_currencies=usd&include_24hr_change=true`,
         )
       ).json();
       for (const id of coins) {
         const c = cg?.[id];
-        if (c?.gbp != null)
-          rows.push({ label: id.replace(/-/g, " "), price: c.gbp, change: Math.round((c.gbp_24h_change ?? 0) * 100) / 100, unit: "£" });
+        if (c?.usd != null)
+          rows.push({ label: id.replace(/-/g, " "), price: c.usd, change: Math.round((c.usd_24h_change ?? 0) * 100) / 100, unit: "$" });
       }
     }
   } catch {
@@ -1452,6 +1480,113 @@ async function chartTool(args: any): Promise<string> {
   return `Chart "${title}" is on screen and saved in the creations library. Speak one takeaway.`;
 }
 
+// ── Markets: real charts + the analyst brain ────────────────────────────────
+async function priceChartTool(args: any): Promise<string> {
+  const { resolveAsset, fetchCandles, keyLevels, chartWidget } = await import("./markets");
+  const a = resolveAsset(String(args.asset ?? ""));
+  if (!a) return `Couldn't resolve "${args.asset}" to a chartable asset.`;
+  const interval = ["1h", "4h", "1d", "1w"].includes(String(args.interval)) ? String(args.interval) : "1d";
+  const candles = await fetchCandles(a, interval);
+  if (candles.length < 30) return `No chart data for ${a.label} on ${interval}.`;
+  const levels = keyLevels(candles);
+  const w = chartWidget(a, interval, candles, levels);
+  await convexMutation("ui:setPanel", { type: "widget", value: JSON.stringify(w), title: `${a.label} · ${interval}` });
+  const closes = candles.map((c) => c.c);
+  const last = closes[closes.length - 1];
+  const s50 = w.sma50[w.sma50.length - 1];
+  const s200 = w.sma200[w.sma200.length - 1];
+  const r = w.rsi[w.rsi.length - 1];
+  return (
+    `${a.label} chart (${interval}, ${w.unit}) is on screen. Last ${last.toLocaleString("en-US")} (${w.changePct >= 0 ? "+" : ""}${w.changePct}% last bar), ` +
+    `${s50 ? `${last > s50 ? "above" : "below"} the 50-SMA, ` : ""}${s200 ? `${last > s200 ? "above" : "below"} the 200-SMA, ` : ""}RSI ${r ?? "n/a"}. ` +
+    `Levels: ${levels.map((l) => `${l.kind[0] === "s" ? "S" : "R"} ${l.price.toLocaleString("en-US")}`).join(", ")}. Speak one short line; offer market_analysis for the full read.`
+  );
+}
+
+async function marketAnalysisTool(args: any): Promise<string> {
+  const { resolveAsset, fetchCandles, keyLevels, chartWidget, fetchVix, fetchCryptoFlows, fetchNews, sma, rsi, ANALYST_SYSTEM } =
+    await import("./markets");
+  const a = resolveAsset(String(args.asset ?? ""));
+  if (!a) return `Couldn't resolve "${args.asset}" to an asset.`;
+  const interval = ["4h", "1d", "1w"].includes(String(args.interval)) ? String(args.interval) : "1d";
+  const serp = process.env.SERPAPI_KEY ?? (await getSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
+
+  const [daily, weekly, vix, flows, news] = await Promise.all([
+    fetchCandles(a, interval, 300),
+    fetchCandles(a, "1w", 200),
+    a.kind === "crypto" ? Promise.resolve(null) : fetchVix(),
+    a.kind === "crypto" && a.binance ? fetchCryptoFlows(a.binance) : Promise.resolve(""),
+    serp ? fetchNews(`${a.label} ${a.kind === "crypto" ? "crypto" : a.kind}`, serp) : Promise.resolve("news unavailable"),
+  ]);
+  if (daily.length < 50) return `Not enough data to analyse ${a.label}.`;
+
+  const levels = keyLevels(daily);
+  const closes = daily.map((c) => c.c);
+  const last = closes[closes.length - 1];
+  const s20 = sma(closes, 20), s50 = sma(closes, 50), s200 = sma(closes, 200);
+  const rr = rsi(closes);
+  const fmtBars = (cs: any[], n: number) =>
+    cs.slice(-n).map((c) => `${new Date(c.t).toISOString().slice(0, 10)} O${c.o} H${c.h} L${c.l} C${c.c} V${Math.round(c.v)}`).join("\n");
+
+  const dossier =
+    `ASSET: ${a.label} (${a.kind}, quoted in ${a.binance ? "USDT" : "USD"}) — anchor timeframe ${interval}\n` +
+    `ASSET CALIBRATION: ${a.profile}\n\n` +
+    `PRICE NOW: ${last} | SMA20 ${s20[s20.length - 1]?.toFixed(2)} | SMA50 ${s50[s50.length - 1]?.toFixed(2)} | SMA200 ${s200[s200.length - 1]?.toFixed(2)} | RSI14 ${rr[rr.length - 1]?.toFixed(1)}\n` +
+    `KEY LEVELS (auto-clustered pivots): ${levels.map((l) => `${l.kind} ${l.price} (${l.touches} touches)`).join("; ")}\n` +
+    (vix ? `VIX: ${vix.value} — ${vix.regime}\n` : "") +
+    (flows ? `CRYPTO FLOWS: ${flows}\n` : "") +
+    `\nRECENT ${interval.toUpperCase()} BARS (last 90):\n${fmtBars(daily, 90)}\n` +
+    `\nWEEKLY BARS for the big count (last 60):\n${fmtBars(weekly, 60)}\n` +
+    `\nNEWS:\n${news}\n` +
+    (args.question ? `\nDANIEL'S QUESTION: ${String(args.question)}\n` : "");
+
+  const key = process.env.OPENAI_API_KEY ?? (await getSecret("openai", "OPENAI_API_KEY").catch(() => ""));
+  if (!key) return "Analysis core unavailable (no OpenAI key).";
+  let analysis = "";
+  for (const model of ["gpt-5.1", "gpt-5", "o4-mini"]) {
+    try {
+      const r = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          model,
+          instructions: ANALYST_SYSTEM,
+          input: dossier,
+          reasoning: { effort: "high" },
+          max_output_tokens: 3000,
+        }),
+        signal: AbortSignal.timeout(80_000),
+      });
+      if (!r.ok) continue;
+      const j: any = await r.json();
+      analysis =
+        j.output_text ??
+        (Array.isArray(j.output)
+          ? j.output.flatMap((o: any) => (Array.isArray(o.content) ? o.content : [])).filter((c: any) => c.type === "output_text").map((c: any) => c.text).join("\n")
+          : "");
+      if (analysis.trim()) break;
+    } catch {
+      /* next model */
+    }
+  }
+  if (!analysis.trim()) return "The analysis pass failed — show the chart with price_chart and reason from the summary instead.";
+
+  // annotated chart on the big screen + the full write-up as a tappable card
+  const verdictLine = (analysis.match(/## Verdict[\s\S]*?\n([^\n#].{20,240})/i)?.[1] ?? "").trim();
+  const w = chartWidget(a, interval, daily, levels, [verdictLine].filter(Boolean));
+  await convexMutation("ui:setPanel", { type: "widget", value: JSON.stringify(w), title: `${a.label} · analysis` });
+  await convexMutation("chatQueue:postCard", {
+    threadId: await activeThread(),
+    type: "markdown",
+    value: `# ${a.label} — full analysis (${interval})\n\n${analysis}`.slice(0, 3900),
+    title: `analysis · ${a.label}`,
+  }).catch(() => {});
+  return (
+    `FULL ANALYSIS (annotated chart is on screen; complete write-up posted as a card — deliver the verdict as your own read, short and direct):\n` +
+    analysis.slice(0, 4500)
+  );
+}
+
 // ── Travel planner: one scout call fans out to the hub's proven providers ──
 async function tripPlanTool(args: any): Promise<string> {
   const destination = String(args.destination ?? "").trim();
@@ -1682,6 +1817,10 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await mindMap(args);
     case "chart":
       return await chartTool(args);
+    case "price_chart":
+      return await priceChartTool(args);
+    case "market_analysis":
+      return await marketAnalysisTool(args);
     case "trip_plan":
       return await tripPlanTool(args);
     case "trip_update":

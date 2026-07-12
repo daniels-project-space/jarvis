@@ -125,6 +125,197 @@ export function CalendarView({ value }: { value: string }) {
   );
 }
 
+/* ---------------------------------- candles (real chart) ---------------------------------- */
+
+type CandleRow = [number, number, number, number, number, number]; // t o h l c v
+type CandlesWidget = {
+  asset: string;
+  interval: string;
+  unit: string;
+  last: number;
+  changePct: number;
+  candles: CandleRow[];
+  sma20: (number | null)[];
+  sma50: (number | null)[];
+  sma200: (number | null)[];
+  rsi: (number | null)[];
+  levels: { price: number; kind: string; touches: number }[];
+  notes?: string[];
+};
+
+const fmtP = (n: number) =>
+  n >= 1000 ? n.toLocaleString("en-US", { maximumFractionDigits: 0 }) : n.toLocaleString("en-US", { maximumFractionDigits: n >= 10 ? 2 : 4 });
+
+export function CandlesView({ w }: { w: CandlesWidget }) {
+  const [hover, setHover] = useState<number | null>(null);
+  const W = 960;
+  const H = 540;
+  const padR = 74;
+  const priceH = 340;
+  const volH = 70;
+  const rsiH = 70;
+  const topPad = 14;
+  const n = w.candles.length;
+  const xs = (i: number) => ((W - padR) * (i + 0.5)) / n;
+  const bw = Math.max(1.5, ((W - padR) / n) * 0.62);
+
+  const { lo, hi } = useMemo(() => {
+    let lo = Infinity,
+      hi = -Infinity;
+    for (const c of w.candles) {
+      lo = Math.min(lo, c[3]);
+      hi = Math.max(hi, c[2]);
+    }
+    for (const l of w.levels) {
+      lo = Math.min(lo, l.price);
+      hi = Math.max(hi, l.price);
+    }
+    const pad = (hi - lo) * 0.06;
+    return { lo: lo - pad, hi: hi + pad };
+  }, [w]);
+  const ys = (p: number) => topPad + priceH - ((p - lo) / (hi - lo)) * priceH;
+  const maxV = useMemo(() => Math.max(1, ...w.candles.map((c) => c[5])), [w]);
+  const volY = topPad + priceH + 26;
+  const rsiY = volY + volH + 24;
+
+  const maPath = (arr: (number | null)[]) => {
+    let d = "";
+    arr.forEach((v, i) => {
+      if (v == null) return;
+      d += `${d ? "L" : "M"}${xs(i).toFixed(1)},${ys(v).toFixed(1)}`;
+    });
+    return d;
+  };
+  const rsiPath = useMemo(() => {
+    let d = "";
+    w.rsi.forEach((v, i) => {
+      if (v == null) return;
+      d += `${d ? "L" : "M"}${xs(i).toFixed(1)},${(rsiY + rsiH - (v / 100) * rsiH).toFixed(1)}`;
+    });
+    return d;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [w]);
+
+  const hc = hover != null ? w.candles[hover] : null;
+  const dateFmt = (t: number) =>
+    new Date(t).toLocaleDateString("en-GB", { day: "2-digit", month: "short", ...(w.interval === "1h" || w.interval === "4h" ? { hour: "2-digit", minute: "2-digit" } : {}) });
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b border-white/5 px-3 py-2">
+        <span className="text-sm font-semibold text-ice">{w.asset}</span>
+        <span className="hud-label !text-[9px]">{w.interval} · {w.unit}</span>
+        <span className="font-mono text-sm text-ice">${fmtP(w.last)}</span>
+        <span className={`text-xs ${w.changePct >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+          {w.changePct >= 0 ? "▲" : "▼"} {Math.abs(w.changePct)}%
+        </span>
+        <span className="ml-auto flex gap-2 text-[9px] uppercase tracking-widest">
+          <span className="text-amber">— 20</span>
+          <span className="text-sky-300">— 50</span>
+          <span className="text-pink-400">— 200</span>
+        </span>
+      </div>
+      {w.notes && w.notes[0] && <div className="border-b border-white/5 px-3 py-1 text-[11px] italic text-cyan/80">{w.notes[0]}</div>}
+      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto">
+        <svg
+          viewBox={`0 0 ${W} ${H}`}
+          className="block h-full w-full"
+          preserveAspectRatio="none"
+          onMouseMove={(e) => {
+            const r = (e.target as SVGElement).closest("svg")!.getBoundingClientRect();
+            const i = Math.floor(((e.clientX - r.left) / r.width) * W / ((W - padR) / n));
+            setHover(i >= 0 && i < n ? i : null);
+          }}
+          onMouseLeave={() => setHover(null)}
+        >
+          {/* grid + price axis */}
+          {[0, 0.25, 0.5, 0.75, 1].map((f) => {
+            const p = lo + (hi - lo) * f;
+            return (
+              <g key={f}>
+                <line x1={0} x2={W - padR} y1={ys(p)} y2={ys(p)} stroke="rgba(255,255,255,0.05)" />
+                <text x={W - padR + 6} y={ys(p) + 3} fontSize="10" fill="#6d7f99" fontFamily="monospace">
+                  {fmtP(p)}
+                </text>
+              </g>
+            );
+          })}
+          {/* levels */}
+          {w.levels.map((l, i) => (
+            <g key={i}>
+              <line
+                x1={0}
+                x2={W - padR}
+                y1={ys(l.price)}
+                y2={ys(l.price)}
+                stroke={l.kind === "support" ? "rgba(0,255,136,0.45)" : "rgba(255,84,112,0.45)"}
+                strokeDasharray="6 5"
+                strokeWidth="1.2"
+              />
+              <text x={4} y={ys(l.price) - 3} fontSize="9" fill={l.kind === "support" ? "#00ff88" : "#ff5470"} opacity="0.9">
+                {l.kind[0].toUpperCase()} {fmtP(l.price)} ×{l.touches}
+              </text>
+            </g>
+          ))}
+          {/* candles */}
+          {w.candles.map((c, i) => {
+            const up = c[4] >= c[1];
+            const col = up ? "#00e589" : "#ff5470";
+            return (
+              <g key={i} opacity={hover === null || hover === i ? 1 : 0.75}>
+                <line x1={xs(i)} x2={xs(i)} y1={ys(c[2])} y2={ys(c[3])} stroke={col} strokeWidth="1" />
+                <rect
+                  x={xs(i) - bw / 2}
+                  y={ys(Math.max(c[1], c[4]))}
+                  width={bw}
+                  height={Math.max(1, Math.abs(ys(c[1]) - ys(c[4])))}
+                  fill={up ? col : col}
+                  opacity={up ? 0.95 : 0.9}
+                />
+              </g>
+            );
+          })}
+          {/* MAs */}
+          <path d={maPath(w.sma20)} fill="none" stroke="#ffb454" strokeWidth="1.4" opacity="0.9" />
+          <path d={maPath(w.sma50)} fill="none" stroke="#5cc8ff" strokeWidth="1.4" opacity="0.9" />
+          <path d={maPath(w.sma200)} fill="none" stroke="#ff7ad9" strokeWidth="1.6" opacity="0.9" />
+          {/* volume */}
+          <text x={2} y={volY - 6} fontSize="9" fill="#6d7f99" letterSpacing="2">VOLUME</text>
+          {w.candles.map((c, i) => (
+            <rect
+              key={i}
+              x={xs(i) - bw / 2}
+              y={volY + volH - (c[5] / maxV) * volH}
+              width={bw}
+              height={(c[5] / maxV) * volH}
+              fill={c[4] >= c[1] ? "rgba(0,229,137,0.5)" : "rgba(255,84,112,0.5)"}
+            />
+          ))}
+          {/* RSI */}
+          <text x={2} y={rsiY - 6} fontSize="9" fill="#6d7f99" letterSpacing="2">RSI 14</text>
+          {[30, 50, 70].map((g) => (
+            <g key={g}>
+              <line x1={0} x2={W - padR} y1={rsiY + rsiH - (g / 100) * rsiH} y2={rsiY + rsiH - (g / 100) * rsiH} stroke={g === 50 ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.1)"} strokeDasharray={g === 50 ? "2 4" : "4 4"} />
+              <text x={W - padR + 6} y={rsiY + rsiH - (g / 100) * rsiH + 3} fontSize="9" fill="#6d7f99" fontFamily="monospace">{g}</text>
+            </g>
+          ))}
+          <path d={rsiPath} fill="none" stroke="#00ff88" strokeWidth="1.3" opacity="0.85" />
+          {/* crosshair + tooltip */}
+          {hc && (
+            <g>
+              <line x1={xs(hover!)} x2={xs(hover!)} y1={topPad} y2={rsiY + rsiH} stroke="rgba(255,255,255,0.25)" strokeDasharray="3 3" />
+              <rect x={Math.min(xs(hover!) + 8, W - 258)} y={topPad + 2} width={250} height={17} rx={4} fill="rgba(5,10,18,0.92)" stroke="rgba(0,255,136,0.25)" />
+              <text x={Math.min(xs(hover!) + 14, W - 252)} y={topPad + 14} fontSize="10" fill="#dbe9f7" fontFamily="monospace">
+                {dateFmt(hc[0])}  O {fmtP(hc[1])}  H {fmtP(hc[2])}  L {fmtP(hc[3])}  C {fmtP(hc[4])}
+              </text>
+            </g>
+          )}
+        </svg>
+      </div>
+    </div>
+  );
+}
+
 /* ---------------------------------- mind map ---------------------------------- */
 
 type CNode = {
