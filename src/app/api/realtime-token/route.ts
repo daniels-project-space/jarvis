@@ -113,5 +113,16 @@ export async function POST(req: NextRequest) {
   const j = await r.json();
   if (ctx.freshFindingIds.length)
     await convexMutation("findings:markWoven", { ids: ctx.freshFindingIds }).catch(() => {});
-  return Response.json({ token: j.value, model: process.env.REALTIME_MODEL || "gpt-realtime-2.1", client });
+  // The client MUST re-apply instructions + audio config after connect: the
+  // agents SDK sends a session.update built from the client agent + SDK
+  // defaults, clobbering everything minted here (empty instructions wiped the
+  // whole persona; transcription fell back to gpt-4o-mini; noise reduction
+  // nulled). The token response carries the real config for the client to own.
+  return Response.json({
+    token: j.value,
+    model: process.env.REALTIME_MODEL || "gpt-realtime-2.1",
+    client,
+    instructions,
+    voice: process.env.REALTIME_VOICE || "ballad",
+  });
 }

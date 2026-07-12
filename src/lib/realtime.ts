@@ -5,6 +5,7 @@
 // finished turns are mirrored into Convex history.
 
 import { RealtimeAgent, RealtimeSession, tool, OpenAIRealtimeWebRTC } from "@openai/agents-realtime";
+import { STT_PROMPT } from "./sttvocab";
 import { extractFunctionCalls, sanitizeAssistantText, isToolGarbage } from "./sanitize";
 
 export type LiveState = "connecting" | "live" | "off" | "error";
@@ -161,12 +162,28 @@ export async function startLive(h: LiveHandlers) {
     });
     const agent = new RealtimeAgent({
       name: "JARVIS",
-      // Instructions + persona + context are baked into the minted session
-      // server-side; keep the client agent instruction-free so it doesn't clobber them.
-      instructions: "",
+      // THE CLIENT OWNS THE CONFIG. The SDK's connect sends a session.update
+      // built from this agent + SDK defaults, CLOBBERING whatever the server
+      // minted — an empty string here silently wiped the entire persona for
+      // weeks (and transcription fell back to gpt-4o-mini, noise reduction to
+      // null). Everything critical must be set right here.
+      instructions: String(tk.instructions ?? ""),
       tools: [...(await clientTools()), exitTool],
     });
-    session = new RealtimeSession(agent, { transport, model: tk.model || "gpt-realtime-2.1" });
+    session = new RealtimeSession(agent, {
+      transport,
+      model: tk.model || "gpt-realtime-2.1",
+      config: {
+        audio: {
+          input: {
+            transcription: { model: "gpt-4o-transcribe", language: "en", prompt: STT_PROMPT },
+            turnDetection: { type: "semantic_vad", eagerness: "medium" },
+            noiseReduction: { type: "near_field" },
+          },
+          output: { voice: tk.voice || "ballad" },
+        },
+      },
+    });
 
     const mirrored = new Set<string>();
     // Foreign-script transcription junk (whisper noise-hallucination) never
