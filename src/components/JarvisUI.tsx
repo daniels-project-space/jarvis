@@ -1054,7 +1054,14 @@ export default function JarvisUI() {
               <AgentLiveView job={shownJob} now={nowTs} onClose={() => setAgentView(null)} />
             </div>
           ) : null}
-          <ThreeOrb state={orbState} energyRef={energyRef} />
+          {/* the orb steps back while a panel is up — content stays readable */}
+          <div
+            className={`h-full w-full transition-opacity duration-700 ${
+              panel && !panelMin && !panelFull ? "opacity-[0.14]" : "opacity-100"
+            }`}
+          >
+            <ThreeOrb state={orbState} energyRef={energyRef} />
+          </div>
           {/* live captions */}
           {caption && (
             <div className="pointer-events-none absolute bottom-10 left-0 right-0 px-8 text-center">
