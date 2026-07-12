@@ -429,7 +429,7 @@ export function FeedView({ value }: { value: string }) {
     return (
       <div className="flex min-h-0 flex-1 flex-col p-4">
         <div className="mb-3 flex items-center justify-between">
-          <span className="hud-label">{w.label}</span>
+          <span className="hud-label">{items.length} videos</span>
           <div className="flex items-center gap-2">
             <button disabled={page === 0} onClick={() => setPage((p) => p - 1)} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">
               &lsaquo; prev
@@ -539,7 +539,7 @@ export function ShopView({ value }: { value: string }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col p-4">
       <div className="mb-3 flex items-center justify-between">
-        <span className="hud-label">shopping &middot; {w.label}</span>
+        <span className="hud-label">{w.items.length} picks</span>
         <div className="flex items-center gap-2">
           <button disabled={page === 0} onClick={() => setPage((p) => p - 1)} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">
             &lsaquo; prev
@@ -582,7 +582,7 @@ export function ShopView({ value }: { value: string }) {
                       rel="noopener noreferrer"
                       className="block rounded-lg bg-cyan/10 py-1.5 text-center text-xs text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/20"
                     >
-                      view / buy &nearr;
+                      view / buy {"↗"}
                     </a>
                   )}
                 </div>
