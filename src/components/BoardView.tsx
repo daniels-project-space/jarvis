@@ -137,7 +137,9 @@ export default function BoardView({ value }: { value: string }) {
         }}
         initialData={{
           elements: initialLoaded.current ? undefined : doc.elements ?? [],
-          appState: { viewBackgroundColor: "#0a1018", currentItemFontFamily: 1 },
+          // NOTE: dark theme applies an invert filter — give it a LIGHT canvas
+          // colour so the rendered result is the dark cockpit tone.
+          appState: { viewBackgroundColor: "#eef4fb", currentItemFontFamily: 1 },
           scrollToContent: true,
         }}
         onChange={() => {
