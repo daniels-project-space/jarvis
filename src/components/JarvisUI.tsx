@@ -1691,7 +1691,7 @@ export default function JarvisUI() {
 
       {/* finished-work popups — bottom-left stack, click to read the breakdown */}
       {popups.length > 0 && !panelFull && (
-        <div className="fixed bottom-[116px] left-3 z-40 flex w-[min(280px,calc(100vw-104px))] flex-col-reverse gap-1.5 md:bottom-4 md:left-4 md:w-[min(340px,60vw)]">
+        <div className={`fixed bottom-[116px] left-3 z-40 flex w-[min(280px,calc(100vw-104px))] flex-col-reverse gap-1.5 md:bottom-4 md:left-4 md:w-[min(340px,60vw)] ${chatMode === "full" ? "max-md:hidden" : ""}`}>
           {popups.map((f, i) => (
             <div key={f._id} className={`rise glass overflow-hidden rounded-xl !border-cyan/25 shadow-2xl ${i >= 2 ? "hidden md:block" : ""}`}>
               <button onClick={() => setExpandedFinding(f._id)} className="block w-full p-2.5 text-left transition hover:bg-white/[0.03]">
@@ -1816,7 +1816,10 @@ export default function JarvisUI() {
           }`}
         >
           {(() => {
-            const lastReply = [...messages].reverse().find((m) => m.role === "assistant" && m.status === "done" && m.text);
+            const lastReply = [...messages]
+              .reverse()
+              .map((m) => (m.role === "assistant" && m.text && isToolGarbage(m.text) ? { ...m, text: sanitizeAssistantText(m.text) } : m))
+              .find((m) => m.role === "assistant" && m.status === "done" && m.text);
             return lastReply ? (
               <button
                 onClick={() => setChatMode("full")}
