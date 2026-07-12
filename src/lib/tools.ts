@@ -1543,7 +1543,14 @@ async function marketAnalysisTool(args: any): Promise<string> {
   const key = process.env.OPENAI_API_KEY ?? (await getSecret("openai", "OPENAI_API_KEY").catch(() => ""));
   if (!key) return "Analysis core unavailable (no OpenAI key).";
   let analysis = "";
-  for (const model of ["gpt-5.1", "gpt-5", "o4-mini"]) {
+  let lastErr = "";
+  // max_output_tokens INCLUDES reasoning tokens on the Responses API — a tight
+  // budget gets fully consumed by thinking and returns zero visible text.
+  const attempts: [string, string, number][] = [
+    ["gpt-5.1", "medium", 75_000],
+    ["gpt-5-mini", "medium", 35_000],
+  ];
+  for (const [model, effort, timeout] of attempts) {
     try {
       const r = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
@@ -1552,12 +1559,15 @@ async function marketAnalysisTool(args: any): Promise<string> {
           model,
           instructions: ANALYST_SYSTEM,
           input: dossier,
-          reasoning: { effort: "high" },
-          max_output_tokens: 3000,
+          reasoning: { effort },
+          max_output_tokens: 8000,
         }),
-        signal: AbortSignal.timeout(80_000),
+        signal: AbortSignal.timeout(timeout),
       });
-      if (!r.ok) continue;
+      if (!r.ok) {
+        lastErr = `${model}: ${r.status} ${(await r.text()).slice(0, 120)}`;
+        continue;
+      }
       const j: any = await r.json();
       analysis =
         j.output_text ??
@@ -1565,11 +1575,13 @@ async function marketAnalysisTool(args: any): Promise<string> {
           ? j.output.flatMap((o: any) => (Array.isArray(o.content) ? o.content : [])).filter((c: any) => c.type === "output_text").map((c: any) => c.text).join("\n")
           : "");
       if (analysis.trim()) break;
-    } catch {
-      /* next model */
+      lastErr = `${model}: empty text (status ${j.status ?? "?"}${j.incomplete_details?.reason ? ", " + j.incomplete_details.reason : ""})`;
+    } catch (e: any) {
+      lastErr = `${model}: ${String(e?.message ?? e).slice(0, 80)}`;
     }
   }
-  if (!analysis.trim()) return "The analysis pass failed — show the chart with price_chart and reason from the summary instead.";
+  if (!analysis.trim())
+    return `The analysis pass failed (${lastErr}) — show the chart with price_chart and reason from the summary instead.`;
 
   // annotated chart on the big screen + the full write-up as a tappable card
   const verdictLine = (analysis.match(/## Verdict[\s\S]*?\n([^\n#].{20,240})/i)?.[1] ?? "").trim();
