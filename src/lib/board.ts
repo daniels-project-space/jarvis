@@ -125,7 +125,7 @@ export function itemToOps(doc: BoardDoc, item: any): any[] {
             backgroundColor: ri === 0 ? c : "transparent",
             fillStyle: "solid",
             roughness: 0,
-            label: { text: String(cell).slice(0, 40), fontSize: 15, strokeColor: ri === 0 ? "#0b1220" : "#dbe9f7" },
+            label: { text: String(cell).slice(0, 40), fontSize: 15, strokeColor: ri === 0 ? "#eef4fb" : "#1b2733" },
           }),
         ),
       ),
