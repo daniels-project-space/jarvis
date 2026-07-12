@@ -16,17 +16,20 @@ const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const MODELS = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"];
 
 async function groq(key: string, body: Record<string, unknown>): Promise<any> {
-  let lastErr = "";
+  const errs: string[] = [];
   for (const model of MODELS) {
+    const payload: Record<string, unknown> = { ...body, model };
+    // llama has no reasoning knob — sending it 400s the whole fallback lane
+    if (!model.startsWith("openai/")) delete payload.reasoning_effort;
     const r = await fetch(GROQ_URL, {
       method: "POST",
       headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" },
-      body: JSON.stringify({ ...body, model }),
+      body: JSON.stringify(payload),
     });
     if (r.ok) return await r.json();
-    lastErr = `${model}: ${r.status} ${(await r.text()).slice(0, 200)}`;
+    errs.push(`${model}: ${r.status} ${(await r.text()).slice(0, 200)}`);
   }
-  throw new Error(`groq failed — ${lastErr}`);
+  throw new Error(`groq failed — ${errs.join(" | ")}`);
 }
 
 
