@@ -51,9 +51,11 @@ export async function r2Put(name: string, body: Uint8Array | ArrayBuffer | strin
             : "bin";
   const key = `creations/${new Date().toISOString().slice(0, 7)}/${slug(name)}-${Date.now().toString(36)}.${ext}`;
   const payload = typeof body === "string" ? new TextEncoder().encode(body) : body instanceof ArrayBuffer ? new Uint8Array(body) : body;
+  // Vercel's fetch streams buffered bodies chunked (no Content-Length) and R2
+  // answers 411 — set the length explicitly.
   const r = await aws.fetch(`${endpoint}/${BUCKET}/${key}`, {
     method: "PUT",
-    headers: { "content-type": contentType },
+    headers: { "content-type": contentType, "content-length": String(payload.byteLength) },
     body: payload as unknown as BodyInit,
   });
   if (!r.ok) throw new Error(`R2 upload failed: ${r.status} ${(await r.text()).slice(0, 150)}`);

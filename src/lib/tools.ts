@@ -956,26 +956,30 @@ async function todoAdd(args: any): Promise<string> {
   return `Done — "${text}" is now on the hub to-do list (${open} open). Confirm it casually in one line.`;
 }
 
-async function matchTodo(match: string): Promise<{ hit: any | null; note: string }> {
+async function matchTodo(match: string, includeDone: boolean): Promise<{ hit: any | null; note: string }> {
   const todos: any[] = (await q_hub("todos:list")) ?? [];
-  const open = todos.filter((t: any) => !t.done);
+  const pool = includeDone ? todos : todos.filter((t: any) => !t.done);
   const m = match.toLowerCase().trim();
-  const hits = open.filter((t: any) => String(t.text).toLowerCase().includes(m));
+  const hits = pool.filter((t: any) => String(t.text).toLowerCase().includes(m));
   if (hits.length === 1) return { hit: hits[0], note: "" };
   if (hits.length === 0)
-    return { hit: null, note: `No open to-do matches "${match}". Open items: ${open.slice(0, 8).map((t: any) => `"${t.text}"`).join(", ") || "none"}.` };
-  return { hit: null, note: `Several match "${match}": ${hits.slice(0, 5).map((t: any) => `"${t.text}"`).join(", ")} — ask Daniel which one.` };
+    return {
+      hit: null,
+      note: `TOOL FAILED — nothing changed. No to-do matches "${match}". Tell Daniel honestly. Items: ${pool.slice(0, 8).map((t: any) => `"${t.text}"`).join(", ") || "none"}.`,
+    };
+  return { hit: null, note: `TOOL DID NOTHING — several match "${match}": ${hits.slice(0, 5).map((t: any) => `"${t.text}"`).join(", ")} — ask Daniel which one.` };
 }
 
 async function todoDone(args: any): Promise<string> {
-  const { hit, note } = await matchTodo(String(args.match ?? ""));
+  const { hit, note } = await matchTodo(String(args.match ?? ""), false);
   if (!hit) return note;
   await m_hub("todos:update", { id: hit._id, done: true });
   return `Ticked off: "${hit.text}".`;
 }
 
 async function todoRemove(args: any): Promise<string> {
-  const { hit, note } = await matchTodo(String(args.match ?? ""));
+  // removal must also find already-done items, not just open ones
+  const { hit, note } = await matchTodo(String(args.match ?? ""), true);
   if (!hit) return note;
   await m_hub("todos:remove", { id: hit._id });
   return `Removed from the list: "${hit.text}".`;
@@ -1228,8 +1232,14 @@ async function createImage(args: any): Promise<string> {
   let finalUrl = imageUrl;
   try {
     finalUrl = (await r2StoreFromUrl(title, imageUrl)).url;
-  } catch {
-    /* fall back to the (48h) provider url rather than failing the whole thing */
+  } catch (e: any) {
+    // fall back to the (48h) provider url — but surface the breakage so the
+    // healer fixes it instead of it rotting silently
+    await convexMutation("incidents:report", {
+      source: "tools",
+      signature: "r2:create-image-store",
+      message: `R2 re-home of generated image failed: ${String(e?.message ?? e).slice(0, 200)}`,
+    }).catch(() => {});
   }
   await convexMutation("creations:create", { kind: "image", title, url: finalUrl, thumb: finalUrl, data: prompt }).catch(() => {});
   await convexMutation("ui:setPanel", { type: "image", value: finalUrl, title });
