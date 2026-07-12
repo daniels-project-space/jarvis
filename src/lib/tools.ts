@@ -548,6 +548,19 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "draft",
+    description:
+      "LIVE WRITING DESK: put a text draft (email, message, post, script, caption...) on screen as a clean document. Use for ANY 'help me write / draft / reword X'. Call again with the FULL revised text after each change Daniel asks for — the document updates live so you two can discuss it. Never paste the draft into chat; it lives on the panel. Same title = same document.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "short stable name, e.g. 'Email to Hygglo support'" },
+        content: { type: "string", description: "the complete current draft text (markdown ok) — full replacement each call" },
+      },
+      required: ["title", "content"],
+    },
+  },
+  {
     name: "shop_search",
     description:
       "SHOPPING CONCIERGE: find real products for Daniel (UK — pounds, UK retailers, fast delivery prioritised) with prices, merchant links and product images cut out onto presentation frames — shows THREE at a time. Use for any 'find/buy me X' (gifts, clothes, gear). After showing: ask which fits or what to change, refine with another search, and when he picks one OFFER to run the checkout agent (dispatch_agent with mcp:[\"browserbase\"] task: add the exact product to cart on the merchant site and return the checkout/payment link).",
@@ -1198,6 +1211,21 @@ TODOS: ${open.slice(0, 20).map((t: any) => JSON.stringify(String(t.text).slice(0
   if (!picked.length) picked = open.slice(0, 5).map((t: any) => ({ text: String(t.text).slice(0, 90), why: "" }));
   const now = Date.now();
   const upcoming = (Array.isArray(events) ? events : []).filter((e: any) => (e.start ?? 0) >= now).sort((a: any, b: any) => a.start - b.start).slice(0, 4);
+  // crypto rows carry a real sparkline (last ~40h of closes off binance.vision)
+  const CRYPTO_PAIR: Record<string, string> = { BTC: "BTCUSDT", ETH: "ETHUSDT", SOL: "SOLUSDT", BNB: "BNBUSDT", XRP: "XRPUSDT", DOGE: "DOGEUSDT" };
+  const sparks: Record<string, number[]> = {};
+  await Promise.all(
+    (markets ?? []).map(async (r: any) => {
+      const pair = CRYPTO_PAIR[String(r.label).toUpperCase()];
+      if (!pair) return;
+      try {
+        const k: any = await (
+          await fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${pair}&interval=1h&limit=40`, { signal: AbortSignal.timeout(4000) })
+        ).json();
+        if (Array.isArray(k)) sparks[r.label] = k.map((c: any) => Number(c[4]));
+      } catch { /* tile renders without spark */ }
+    }),
+  );
   const widget = {
     kind: "briefing2",
     date: new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" }),
@@ -1210,7 +1238,7 @@ TODOS: ${open.slice(0, 20).map((t: any) => JSON.stringify(String(t.text).slice(0
       title: String(e.title).slice(0, 60),
       when: new Date(e.start).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" }) + (e.allDay ? "" : " " + londonTimeStr(e.start)),
     })),
-    markets: (markets ?? []).map((r: any) => ({ label: r.label, price: r.price, change: r.change, unit: r.unit })),
+    markets: (markets ?? []).map((r: any) => ({ label: r.label, price: r.price, change: r.change, unit: r.unit, spark: sparks[r.label] })),
   };
   await showWidget(widget, `briefing · ${today}`);
   return (
@@ -1926,10 +1954,25 @@ async function shopSearch(args: any): Promise<string> {
   if (!items.length) return `Nothing solid for "${query}" — refine the search terms.`;
   await showWidget({ kind: "shop", label: query, items }, `shopping · ${query.slice(0, 30)}`);
   return (
-    `SHOP FRAMES on screen (numbered, three per page — he pages with the on-screen arrows). Top picks: ` +
-    items.slice(0, 3).map((i: any, n: number) => `${n + 1}. ${i.title} — ${i.price} at ${i.merchant}${i.delivery ? " (" + i.delivery + ")" : ""}`).join(" | ") +
-    ` — ask Daniel which fits or what to change. If he picks one: offer the checkout agent (dispatch_agent, mcp browserbase, task: open the merchant page, add EXACTLY that item to the cart, fill the order details, proceed to checkout and return the payment-page link - NEVER pay).`
+    `SHOP FRAMES on screen, numbered 1-${items.length} (three per page, arrows to page). FULL LIST: ` +
+    items.map((i: any, n: number) => `${n + 1}. ${i.title} — ${i.price} at ${i.merchant}`).join(" | ") +
+    ` — ask Daniel which fits or what to change. If he says "more like number N": read item N's title above, pull out its defining attributes (brand/style/colour/cut) and run a fresh shop_search built from them — tell him what you noticed about N. If he picks one: offer the checkout agent (dispatch_agent, mcp browserbase, task: open the merchant page, add EXACTLY that item to the cart, fill the order details, proceed to checkout and return the payment-page link - NEVER pay).`
   );
+}
+
+// Live writing desk: one creations row per draft title, panel re-renders on
+// every revision so Daniel watches the text change as they talk about it.
+async function draftDoc(args: any): Promise<string> {
+  const title = String(args.title ?? "Draft").slice(0, 80);
+  const content = String(args.content ?? "");
+  if (!content.trim()) return "TOOL DID NOTHING: no content passed.";
+  const existing: any = await convexQuery("creations:latest", { kind: "doc", titleMatch: title.toLowerCase() }).catch(() => null);
+  let id = existing?._id ?? null;
+  if (id) await convexMutation("creations:update", { id, title, data: content });
+  else id = await convexMutation("creations:create", { kind: "doc", title, data: content });
+  await convexMutation("ui:setPanel", { type: "doc", value: JSON.stringify({ creationId: id }), title: `draft · ${title}` });
+  const words = content.trim().split(/\s+/).length;
+  return `Draft "${title}" is on screen (${words} words) and updates LIVE. Discuss it in one or two short sentences — don't read it out. To revise, call draft again with the same title and the full new text.`;
 }
 
 // Day planner (mined from ethanplusai/jarvis planner.py, web-adapted): real
@@ -2465,6 +2508,8 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await memoryMapTool(args);
     case "shop_search":
       return await shopSearch(args);
+    case "draft":
+      return await draftDoc(args);
     case "todo_list": {
       const todos: any[] = (await q_hub("todos:list")) ?? [];
       const open = todos.filter((t: any) => !t.done).slice(0, 24);

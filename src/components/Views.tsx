@@ -201,9 +201,26 @@ export function Briefing2View({ value }: { value: string }) {
     const [h, m] = String(hhmm).split(":").map(Number);
     return Math.max(0, Math.min(100, (((h || 12) + (m || 0) / 60 - 7) / 15) * 100));
   };
+  // Clustered movements used to stack on top of each other: place each card in
+  // the first of four vertical slots with >=14% of horizontal clearance.
+  const marks = [...(w.rentals ?? [])]
+    .map((r: any) => ({ ...r, pct: toPct(r.time) }))
+    .sort((a: any, b: any) => a.pct - b.pct);
+  const slotLast = [-99, -99, -99, -99];
+  const SLOT_TOP = ["-56px", "20px", "-116px", "78px"];
+  for (const m of marks) {
+    let best = 0, bestGap = -Infinity;
+    for (let sl = 0; sl < 4; sl++) {
+      const gap = m.pct - slotLast[sl];
+      if (gap >= 14) { best = sl; bestGap = Infinity; break; }
+      if (gap > bestGap) { bestGap = gap; best = sl; }
+    }
+    slotLast[best] = m.pct;
+    m.slot = best;
+  }
   return (
     <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
-      <div className="mx-auto max-w-4xl space-y-4">
+      <div className="mx-auto max-w-6xl space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <div className="text-2xl font-semibold text-ice">{w.date}</div>
@@ -230,19 +247,19 @@ export function Briefing2View({ value }: { value: string }) {
         </div>
 
         <div className="tile rise p-4 pb-2">
-          <div className="hud-label mb-14">rentals today · {w.awayCount} out</div>
-          <div className="relative mx-2 mb-14 h-1 rounded-full bg-white/10">
+          <div className="hud-label mb-[132px]">rentals today · {w.awayCount} out</div>
+          <div className="relative mx-2 mb-[128px] h-1 rounded-full bg-gradient-to-r from-white/5 via-white/15 to-white/5">
             {["07", "10", "13", "16", "19", "22"].map((h, i) => (
               <span key={h} className="absolute top-3 -translate-x-1/2 text-[9px] text-slate/70" style={{ left: `${(i / 5) * 100}%` }}>
                 {h}:00
               </span>
             ))}
-            {(w.rentals ?? []).map((r: any, i: number) => (
-              <div
-                key={i}
-                className="absolute -translate-x-1/2"
-                style={{ left: `${toPct(r.time)}%`, top: i % 2 === 0 ? "-54px" : "18px" }}
-              >
+            {marks.map((r: any, i: number) => (
+              <div key={i} className="absolute -translate-x-1/2" style={{ left: `${r.pct}%`, top: SLOT_TOP[r.slot ?? 0] }}>
+                <span
+                  className={`absolute left-1/2 h-2 w-2 -translate-x-1/2 rounded-full ${r.kind === "pickup" ? "bg-amber" : "bg-sky-400"}`}
+                  style={(r.slot ?? 0) % 2 === 0 ? { bottom: "-14px" } : { top: "-14px" }}
+                />
                 <div className={`tile w-max max-w-[150px] px-2.5 py-1.5 text-center ${r.kind === "pickup" ? "!border-amber/40" : ""}`}>
                   <div className={`text-[9px] font-semibold uppercase tracking-widest ${r.kind === "pickup" ? "text-amber" : "text-sky-300"}`}>
                     {r.kind} · {r.time}
@@ -251,7 +268,7 @@ export function Briefing2View({ value }: { value: string }) {
                 </div>
               </div>
             ))}
-            {!(w.rentals ?? []).length && <div className="absolute inset-x-0 -top-8 text-center text-xs text-slate">no movements today</div>}
+            {!marks.length && <div className="absolute inset-x-0 -top-8 text-center text-xs text-slate">no movements today</div>}
           </div>
         </div>
 
@@ -294,19 +311,33 @@ export function Briefing2View({ value }: { value: string }) {
                 <div className="text-xs text-slate">calendar clear</div>
               )}
             </div>
-            <div className="grid grid-cols-3 gap-2">
-              {(w.markets ?? []).map((r: any, i: number) => (
-                <div key={i} className="tile rise px-2 py-3 text-center" style={{ animationDelay: `${160 + i * 50}ms` }}>
-                  <div className="hud-label !text-[8px]">{r.label}</div>
-                  <div className="mt-0.5 text-sm font-semibold text-ice">
-                    {r.unit}
-                    {Number(r.price).toLocaleString("en-US")}
+            <div className="grid grid-cols-2 gap-2 xl:grid-cols-3">
+              {(w.markets ?? []).map((r: any, i: number) => {
+                const sp: number[] = Array.isArray(r.spark) ? r.spark : [];
+                const min = Math.min(...sp), max = Math.max(...sp);
+                const pts = sp.map((v, j) => `${(j / (sp.length - 1)) * 100},${27 - ((v - min) / (max - min || 1)) * 24}`).join(" ");
+                const up = r.change >= 0;
+                return (
+                  <div key={i} className="tile rise px-3 py-3" style={{ animationDelay: `${160 + i * 50}ms` }}>
+                    <div className="flex items-baseline justify-between">
+                      <span className="hud-label !text-[9px]">{r.label}</span>
+                      <span className={`text-[10px] ${up ? "text-emerald-400" : "text-red-400"}`}>
+                        {up ? "▲" : "▼"} {Math.abs(r.change)}%
+                      </span>
+                    </div>
+                    <div className="mt-0.5 text-base font-semibold text-ice">
+                      {r.unit}
+                      {Number(r.price).toLocaleString("en-US")}
+                    </div>
+                    {sp.length > 1 && (
+                      <svg viewBox="0 0 100 28" preserveAspectRatio="none" className="mt-1.5 h-8 w-full">
+                        <polyline points={`0,28 ${pts} 100,28`} fill={up ? "rgba(52,211,153,0.12)" : "rgba(248,113,113,0.12)"} stroke="none" />
+                        <polyline points={pts} fill="none" stroke={up ? "#34d399" : "#f87171"} strokeWidth="1.6" vectorEffect="non-scaling-stroke" />
+                      </svg>
+                    )}
                   </div>
-                  <div className={`text-[10px] ${r.change >= 0 ? "text-emerald-400" : "text-red-400"}`}>
-                    {r.change >= 0 ? "▲" : "▼"} {Math.abs(r.change)}%
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </div>
@@ -463,9 +494,9 @@ export function FeedView({ value }: { value: string }) {
                     <span className="grid h-12 w-12 place-items-center rounded-full bg-cyan/90 pl-0.5 text-xl text-black">&#9654;</span>
                   </span>
                 </div>
-                <div className="p-3">
-                  <div className="line-clamp-2 text-sm leading-snug text-ice">{it.title}</div>
-                  {it.subtitle && <div className="mt-1 truncate text-[10px] text-slate">{it.subtitle}</div>}
+                <div className="p-3.5">
+                  <div className="line-clamp-2 text-[15px] font-medium leading-snug text-ice">{it.title}</div>
+                  {it.subtitle && <div className="mt-1 truncate text-[11px] text-slate">{it.subtitle}</div>}
                 </div>
               </button>
             );
@@ -529,6 +560,68 @@ export function FeedView({ value }: { value: string }) {
   );
 }
 
+/* ---------------------------------- live writing desk ---------------------------------- */
+
+// Paper-styled markdown: dark ink on paper, no raw HTML passes through.
+function mdPaper(src: string): string {
+  const esc = src.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return esc
+    .replace(/^### (.+)$/gm, '<div class="mb-1 mt-4 text-[15px] font-semibold">$1</div>')
+    .replace(/^## (.+)$/gm, '<div class="mb-1.5 mt-5 text-lg font-semibold">$1</div>')
+    .replace(/^# (.+)$/gm, '<div class="mb-2 mt-2 text-xl font-bold">$1</div>')
+    .replace(/^[-•] (.*)$/gm, '<span class="text-neutral-400">&bull;</span> $1')
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
+    .replace(/\n/g, "<br/>");
+}
+
+// A draft JARVIS is writing WITH Daniel: renders the creations doc reactively,
+// flashes softly when a revision lands so edits are visible live.
+export function DocView({ value }: { value: string }) {
+  let creationId = "";
+  try {
+    creationId = JSON.parse(value)?.creationId ?? "";
+  } catch {
+    /* noop */
+  }
+  const doc = useQuery(api.creations.get, creationId ? ({ id: creationId } as any) : "skip") as any;
+  const [flash, setFlash] = useState(false);
+  const prev = useRef<string>("");
+  useEffect(() => {
+    const cur = String(doc?.data ?? "");
+    if (prev.current && cur && cur !== prev.current) {
+      setFlash(true);
+      const t = setTimeout(() => setFlash(false), 1200);
+      prev.current = cur;
+      return () => clearTimeout(t);
+    }
+    prev.current = cur;
+  }, [doc?.data]);
+  if (!doc) return <div className="flex flex-1 items-center justify-center text-sm text-slate">opening the draft…</div>;
+  const text = String(doc.data ?? "");
+  const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+  return (
+    <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-4 md:p-6">
+      <div
+        className={`mx-auto max-w-2xl rounded-lg bg-[#f6f4ec] p-7 shadow-[0_24px_70px_rgba(0,0,0,0.6)] transition-all duration-500 md:p-10 ${
+          flash ? "ring-4 ring-cyan/60" : "ring-1 ring-black/20"
+        }`}
+      >
+        <div className="mb-6 flex items-baseline justify-between gap-3 border-b border-black/10 pb-3">
+          <div className="min-w-0 truncate text-lg font-semibold text-neutral-800">{doc.title}</div>
+          <div className="shrink-0 text-[10px] uppercase tracking-[0.2em] text-neutral-400">
+            {flash ? <span className="text-emerald-600">✎ updating…</span> : `${words} words · live`}
+          </div>
+        </div>
+        <div
+          className="font-serif text-[15px] leading-[1.8] text-neutral-800 md:text-base"
+          dangerouslySetInnerHTML={{ __html: mdPaper(text) }}
+        />
+      </div>
+    </div>
+  );
+}
+
 /* ---------------------------------- shopping frames ---------------------------------- */
 
 type ShopItem = { image: string; title: string; price: string; merchant: string; delivery?: string; rating?: number; reviews?: number; url?: string };
@@ -568,10 +661,12 @@ export function ShopView({ value }: { value: string }) {
           const n = cur * per + i + 1;
           const fast = it.delivery && /same.day|next.day|tomorrow|\b1 day|\b1-2 day|24 ?h/i.test(it.delivery);
           return (
-            <div key={n} className="tile rise flex flex-col" style={{ animationDelay: `${i * 90}ms` }}>
-              <div className="relative m-3 mb-0 grid h-44 place-items-center rounded-xl bg-[radial-gradient(circle_at_50%_88%,rgba(0,255,136,0.12),transparent_62%),linear-gradient(180deg,rgba(255,255,255,0.05),rgba(255,255,255,0.015))] ring-1 ring-white/10">
+            <div key={n} className="tile rise group flex flex-col" style={{ animationDelay: `${i * 90}ms` }}>
+              <div className="relative m-3 mb-0 grid h-56 place-items-center overflow-hidden rounded-xl bg-[radial-gradient(circle_at_50%_92%,rgba(0,255,136,0.16),transparent_58%),linear-gradient(180deg,rgba(255,255,255,0.06),rgba(255,255,255,0.01))] ring-1 ring-white/10">
+                <span className="pointer-events-none absolute inset-x-6 top-0 h-px bg-gradient-to-r from-transparent via-white/40 to-transparent" />
+                <span className="pointer-events-none absolute inset-x-10 bottom-2 h-3 rounded-[100%] bg-black/50 blur-md" />
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={it.image} alt="" className="max-h-36 max-w-[85%] object-contain drop-shadow-[0_16px_22px_rgba(0,0,0,0.6)]" />
+                <img src={it.image} alt="" className="max-h-44 max-w-[85%] object-contain drop-shadow-[0_18px_26px_rgba(0,0,0,0.65)] transition-transform duration-300 group-hover:scale-[1.04]" />
                 <span className="absolute left-2 top-2 grid h-7 w-7 place-items-center rounded-full bg-black/75 font-mono text-xs text-cyan ring-1 ring-cyan/50">{n}</span>
                 {fast && (
                   <span className="absolute right-2 top-2 rounded-full bg-cyan/15 px-2 py-0.5 text-[9px] uppercase tracking-wider text-cyan ring-1 ring-cyan/40">fast</span>
@@ -580,7 +675,7 @@ export function ShopView({ value }: { value: string }) {
               <div className="flex flex-1 flex-col p-3">
                 <div className="line-clamp-2 text-[13px] leading-snug text-ice">{it.title}</div>
                 <div className="mt-1.5 flex items-baseline gap-2">
-                  <span className="text-lg font-semibold text-cyan">{it.price}</span>
+                  <span className="text-xl font-semibold tracking-tight text-cyan">{it.price}</span>
                   <span className="min-w-0 truncate text-[10px] text-slate">{it.merchant}</span>
                 </div>
                 <div className="mt-0.5 flex items-center gap-2 text-[10px] text-slate">
@@ -1184,6 +1279,7 @@ export function CreationsView({ value }: { value: string }) {
     else if (r.kind === "canvas" && r.data) void setPanel({ type: "canvas", value: r.data, title: `map · ${r.title}` });
     else if (r.kind === "board") void setPanel({ type: "board", value: JSON.stringify({ creationId: r._id }), title: `board · ${r.title}` });
     else if (r.kind === "trip") void setPanel({ type: "trip", value: JSON.stringify({ creationId: r._id }), title: `trip · ${r.title}` });
+    else if (r.kind === "doc") void setPanel({ type: "doc", value: JSON.stringify({ creationId: r._id }), title: `draft · ${r.title}` });
     else if (r.kind === "chart" && r.data) void setPanel({ type: "widget", value: r.data, title: r.title });
     else if (r.data) void setPanel({ type: "markdown", value: r.data, title: r.title });
   };

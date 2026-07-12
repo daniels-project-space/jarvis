@@ -4,7 +4,7 @@ import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
-import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView } from "./Views";
+import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView , DocView } from "./Views";
 import TripView from "./TripView";
 import BoardView from "./BoardView";
 
@@ -64,6 +64,8 @@ const WIDGET_ICON: Record<string, string> = {
   calendar: "📅",
   candles: "📈",
   videos: "📺",
+  shop: "🛍",
+  doc: "📝",
 };
 
 // Persistent media card in the stream — click to put it back on the big screen.
@@ -133,22 +135,24 @@ function panelSize(panel: { type: string; value: string }): string {
     case "w:timer":
       return "w-[min(500px,94%)] h-[460px]";
     case "w:weather":
-      return "w-[min(940px,86%)] h-[min(660px,92%)]";
+      return "w-[min(880px,80%)] h-[min(640px,90%)]";
     case "w:market":
-      return "w-[min(1020px,86%)] h-[min(560px,90%)]";
+      return "w-[min(960px,80%)] h-[min(540px,88%)]";
     case "image":
       return "w-[min(1100px,97%)] h-[min(760px,97%)]";
     case "w:candles":
       return "w-[min(1360px,98%)] h-[min(780px,96%)]";
     case "w:stats":
-      return "w-[min(1160px,87%)] h-[min(700px,93%)]";
+      return "w-[min(1080px,81%)] h-[min(680px,92%)]";
     case "w:videos":
     case "w:feed":
-      return "w-[min(1420px,87%)] h-[min(760px,93%)]";
+      return "w-[min(1340px,82%)] h-[min(740px,92%)]";
     case "w:shop":
-      return "w-[min(1420px,87%)] h-[min(690px,93%)]";
+      return "w-[min(1340px,82%)] h-[min(700px,92%)]";
     case "markdown":
       return "w-[min(980px,97%)] h-full";
+    case "doc":
+      return "w-[min(880px,80%)] h-[min(800px,94%)]";
     default:
       return "h-full w-full";
   }
@@ -298,7 +302,21 @@ function OrbitBubble({
   const isImg = b.type === "image";
   const GLYPH: Record<string, string> = { trip: "🌍", board: "🎨", canvas: "🕸", pdf: "📕", fleet: "🚀", site: "🌐", url: "🌐" };
   return (
-    <button
+    <div
+      className={`bob group relative ${dx === 0 ? "transition-all duration-300" : ""}`}
+      style={{ animationDelay: `${delay}s`, transform: dx ? `translateX(${dx}px)` : undefined, opacity: dx ? Math.max(0.15, 1 - Math.abs(dx) / 90) : undefined }}
+    >
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          onDismiss();
+        }}
+        className="absolute -right-0.5 -top-0.5 z-10 grid h-5 w-5 place-items-center rounded-full bg-black/85 text-[9px] text-slate ring-1 ring-white/25 transition hover:text-red-300 hover:ring-red-400/50"
+        title="close"
+      >
+        ✕
+      </button>
+      <button
       onPointerDown={(e) => {
         startX.current = e.clientX;
         dragging.current = false;
@@ -325,9 +343,9 @@ function OrbitBubble({
       onClick={() => {
         if (!dragging.current) onOpen();
       }}
-      className={`bob glass group relative h-16 w-16 overflow-hidden rounded-full !border-cyan/30 shadow-xl hover:scale-125 hover:!border-cyan/70 ${dx === 0 ? "transition-all duration-300" : ""}`}
-      style={{ animationDelay: `${delay}s`, transform: dx ? `translateX(${dx}px)` : undefined, opacity: dx ? Math.max(0.15, 1 - Math.abs(dx) / 90) : undefined, touchAction: "pan-y" }}
-      title={`${b.title ?? b.type} — drag left to dismiss`}
+      className="glass relative block h-16 w-16 overflow-hidden rounded-full !border-cyan/30 shadow-xl transition-transform duration-300 hover:scale-110 hover:!border-cyan/70"
+      style={{ touchAction: "pan-y" }}
+      title={`${b.title ?? b.type} — drag away or ✕ to dismiss`}
     >
       {yt ? (
         // eslint-disable-next-line @next/next/no-img-element
@@ -350,7 +368,8 @@ function OrbitBubble({
       <span className="pointer-events-none absolute inset-x-0 bottom-0 truncate bg-black/70 px-1 py-0.5 text-center text-[8px] text-ice opacity-0 transition group-hover:opacity-100">
         {b.title ?? b.type}
       </span>
-    </button>
+      </button>
+    </div>
   );
 }
 
@@ -570,6 +589,8 @@ function Viewport({
         <CanvasView value={panel.value} />
       ) : panel.type === "trip" ? (
         <TripView value={panel.value} />
+      ) : panel.type === "doc" ? (
+        <DocView value={panel.value} />
       ) : panel.type === "launch" ? (
         <LaunchView value={panel.value} />
       ) : panel.type === "pdf" ? (
@@ -743,7 +764,7 @@ export default function JarvisUI() {
       const prev = prevPanelRef.current;
       if (prev && (prev.title ?? prev.type) !== (panel.title ?? panel.type)) {
         setBubbles((bs) =>
-          [{ type: prev.type, value: prev.value, title: prev.title }, ...bs.filter((b) => (b.title ?? b.type) !== (prev.title ?? prev.type))].slice(0, 3),
+          [{ type: prev.type, value: prev.value, title: prev.title }, ...bs.filter((b) => (b.title ?? b.type) !== (prev.title ?? prev.type))].slice(0, 6),
         );
       }
       prevPanelRef.current = { type: panel.type, value: panel.value, title: panel.title, updatedAt: panel.updatedAt };
@@ -1461,7 +1482,7 @@ export default function JarvisUI() {
           {live === "live" && <div className="live-ring pointer-events-none absolute inset-2 rounded-full opacity-60" />}
           {/* orbit bubbles — demoted panels bobbing beside the orb */}
           {bubbles.length > 0 && (
-            <div className="absolute right-3 top-1/2 z-30 flex -translate-y-1/2 flex-col gap-4 md:right-4">
+            <div className="absolute left-1.5 top-1/2 z-30 flex max-h-full -translate-y-1/2 flex-col gap-3 md:left-2.5">
               {bubbles.map((b, i) => (
                 <OrbitBubble
                   key={(b.title ?? b.type) + i}
@@ -1490,7 +1511,7 @@ export default function JarvisUI() {
             </div>
           )}
           {panel && panel.type !== "video" && !panelMin && !panelFull ? (
-            <div className={`absolute inset-0 z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-8" : "justify-center"}`}>
+            <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-24" : "justify-center"}`}>
               <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${stagePanelSize}`}>
                 <Viewport
                   panel={panel}
@@ -1511,7 +1532,7 @@ export default function JarvisUI() {
             className={`h-full w-full transition-all duration-[900ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
               panel && !panelMin && !panelFull
                 ? panel.type !== "video" && stagePanelSize !== "h-full w-full"
-                  ? "opacity-[0.14] md:translate-x-[39%] md:scale-[0.52] md:opacity-95"
+                  ? "opacity-[0.14] md:translate-x-[41%] md:scale-[0.62] md:opacity-95"
                   : "opacity-[0.12]"
                 : "opacity-100"
             }`}
