@@ -852,7 +852,11 @@ export default function JarvisUI() {
   const busy = sending || messages.some((m) => m.role === "assistant" && m.status === "streaming");
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    // scroll the message CONTAINER only — scrollIntoView reaches into the
+    // (possibly translated-off-screen) chat panel and drags the whole PAGE
+    // down with it on phones
+    const box = endRef.current?.parentElement;
+    if (box) box.scrollTo({ top: box.scrollHeight, behavior: "smooth" });
   }, [messages.length, messages[messages.length - 1]?.text, caption?.text]);
 
   useEffect(() => {
@@ -1259,7 +1263,7 @@ export default function JarvisUI() {
         </div>
       )}
 
-      <div className={`relative mx-auto flex w-full max-w-[1720px] flex-1 flex-col overflow-x-clip p-4 pt-2 ${chatMode === "bar" ? "pb-24" : ""}`}>
+      <div className={`relative mx-auto flex w-full max-w-[1720px] flex-1 flex-col overflow-clip p-4 pt-2 ${chatMode === "bar" ? "pb-24" : ""}`}>
         {/* the stage is ALWAYS full-bleed; the chat floats over it and slides
             away on pure transforms — compositor-only, 120fps-smooth */}
         <div ref={stageRef} className="brackets relative min-h-[52vh] flex-1 md:min-h-[80vh]">

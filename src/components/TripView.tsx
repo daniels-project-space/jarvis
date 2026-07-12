@@ -354,7 +354,7 @@ export default function TripView({ value }: { value: string }) {
                         </span>
                       </div>
                       <div className="mt-0.5 text-[11px] text-slate">
-                        ★{s.rating ?? "?"} {s.hotelClass ? "· " + "⭑".repeat(s.hotelClass) : ""} {s.propertyType ? `· ${s.propertyType}` : ""} {s.freeCancellation ? "· free cancellation" : ""}
+                        ★{s.rating ? Math.round(s.rating * 10) / 10 : "?"} {s.hotelClass ? "· " + "⭑".repeat(s.hotelClass) : ""} {s.propertyType ? `· ${s.propertyType}` : ""} {s.freeCancellation ? "· free cancellation" : ""}
                       </div>
                       <div className="mt-1 flex flex-wrap gap-1">
                         {(s.amenities ?? []).map((a: string) => (
@@ -439,7 +439,7 @@ export default function TripView({ value }: { value: string }) {
                   )}
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-[13px] font-semibold text-ice">{a.name}</div>
-                    <div className="text-[11px] text-slate">★{a.rating ?? "?"} ({(a.ratings ?? 0).toLocaleString("en-GB")} reviews)</div>
+                    <div className="text-[11px] text-slate">★{a.rating ? Math.round(a.rating * 10) / 10 : "?"} ({(a.ratings ?? 0).toLocaleString("en-GB")} reviews)</div>
                     {a.address && <div className="truncate text-[10px] text-slate/70">{a.address}</div>}
                     <div className="mt-1 flex gap-2">
                       <a href={a.mapsLink} target="_blank" rel="noreferrer" className="rounded-lg bg-white/5 px-2 py-1 text-[11px] text-ice ring-1 ring-white/10 transition hover:text-cyan">
