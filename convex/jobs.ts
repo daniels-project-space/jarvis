@@ -10,6 +10,8 @@ export const enqueue = mutation({
     mcp: v.optional(v.array(v.string())),
     incidentId: v.optional(v.string()),
     retried: v.optional(v.boolean()),
+    missionId: v.optional(v.string()),
+    label: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     return await ctx.db.insert("jobs", {
@@ -20,6 +22,8 @@ export const enqueue = mutation({
       mcp: a.mcp,
       incidentId: a.incidentId,
       retried: a.retried,
+      missionId: a.missionId,
+      label: a.label,
       status: "pending",
       createdAt: Date.now(),
     });
@@ -44,6 +48,7 @@ export const claimNext = mutation({
       mcp: j.mcp ?? [],
       incidentId: j.incidentId ?? null,
       retried: j.retried ?? false,
+      missionId: j.missionId ?? null,
     };
   },
 });
@@ -115,6 +120,8 @@ export const active = query({
       .map((j: any) => ({
         _id: j._id,
         task: j.task,
+        label: j.label ?? null,
+        missionId: j.missionId ?? null,
         repo: j.repo ?? null,
         model: j.model ?? null,
         status: j.status,

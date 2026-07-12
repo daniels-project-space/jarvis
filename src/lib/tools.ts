@@ -23,6 +23,33 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "orchestrate",
+    description:
+      "Spawn a FLEET of parallel background agents on one mission — for big asks that decompose into independent workstreams (multi-angle research, building several pieces, auditing multiple repos, competitive analysis). YOU decompose the goal into 2-6 self-contained agent tasks; they run in parallel, the fleet view shows live progress, and when the last one lands the results are synthesized into ONE report back to Daniel. For single simple tasks use dispatch_agent instead.",
+    parameters: {
+      type: "object",
+      properties: {
+        mission: { type: "string", description: "the overall goal in one sentence" },
+        agents: {
+          type: "array",
+          description: "2-6 independent workstreams",
+          items: {
+            type: "object",
+            properties: {
+              label: { type: "string", description: "3-5 word fleet-view label" },
+              task: { type: "string", description: "fully self-contained task incl. all context (agents start blank)" },
+              repo: { type: "string", description: "owner/repo if it works on code" },
+              model: { type: "string", enum: ["haiku", "sonnet", "opus"] },
+              template: { type: "string", enum: ["research_report", "bug_fix", "feature_add", "refactor", "landing_page", "api_integration"], description: "method scaffold to enforce" },
+            },
+            required: ["label", "task"],
+          },
+        },
+      },
+      required: ["mission", "agents"],
+    },
+  },
+  {
     name: "show",
     description:
       "Put something on Daniel's screen while you talk: a webpage, YouTube video, image, code, or notes. Use this for ANYTHING visual or detailed instead of reading it out. For videos, set play=true when he asked to PLAY/watch it (it autoplays); videos render 16:9 and shrink to picture-in-picture when he keeps talking.",
@@ -482,6 +509,18 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "plan_my_day",
+    description:
+      "Build Daniel a PRIORITISED, time-blocked plan for the day: combines his open to-dos, calendar events, rental pickups/returns and deadlines into a realistic schedule with reasoning. Shows the plan on screen; offer to write the blocks into his calendar. Use for 'plan my day / what should I focus on / structure my day'.",
+    parameters: {
+      type: "object",
+      properties: {
+        focus: { type: "string", description: "anything Daniel said he wants prioritised today" },
+        date: { type: "string", description: "YYYY-MM-DD, default today" },
+      },
+    },
+  },
+  {
     name: "clear_chat",
     description: "Wipe the current chat's history. Use when Daniel asks to clear/delete the chat — this IS the action, never dispatch an agent for it.",
     parameters: { type: "object", properties: {} },
@@ -534,6 +573,24 @@ const SELF_IMPROVE_RULES =
   "and 'npm run build' — they must pass. Commit only working code, message starting 'self-improve:'. Vercel deploys it automatically. " +
   "If the change truly requires convex/ schema or src/trigger/ edits, keep them minimal and state clearly in your final " +
   "answer that they need a manual deploy. Never remove existing capabilities.";
+
+// Method scaffolds appended to fleet/agent tasks (adapted from the
+// ethanplusai/jarvis prompt-template library) — they raise output quality by
+// enforcing a working method per task type.
+const TASK_TEMPLATES: Record<string, string> = {
+  research_report:
+    "\n\nMETHOD (research): search MULTIPLE independent sources; cite URLs for every claim; clearly separate facts from opinion; compare alternatives in a table when they exist; end with concrete, actionable recommendations. Never settle for the first result.",
+  bug_fix:
+    "\n\nMETHOD (bug fix): 1) REPRODUCE the bug first and state how. 2) Trace the ROOT CAUSE — never paper over symptoms. 3) Minimal correct fix. 4) Validate proportionally (single-file: line-by-line diff review; multi-file: npx tsc --noEmit + build). 5) Commit only working code ('fix: ...').",
+  feature_add:
+    "\n\nMETHOD (feature): read the surrounding code style first and match it; smallest coherent implementation; wire it end-to-end (no dead UI); validate with tsc/build; commit 'feat: ...' and state exactly what was added and where.",
+  refactor:
+    "\n\nMETHOD (refactor): behaviour must be IDENTICAL after — list the invariants first; prefer deletion over abstraction; keep commits mechanical and reviewable; validate with tsc/build; state LOC delta.",
+  landing_page:
+    "\n\nMETHOD (landing page): distinctive visual direction (no template-y defaults), real copy (no lorem), responsive, one clear call-to-action; validate the build passes; describe the design choices in one paragraph.",
+  api_integration:
+    "\n\nMETHOD (API integration): read the API docs first and cite the endpoints used; handle auth via the secrets vault; graceful failure paths (timeouts, rate limits); prove it works with a real request/response transcript in your answer.",
+};
 
 const YT_ID = (s: string) => {
   const m = String(s).match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([\w-]{11})/) ?? String(s).match(/^([\w-]{11})$/);
@@ -1528,6 +1585,61 @@ async function chartTool(args: any): Promise<string> {
   return `Chart "${title}" is on screen and saved in the creations library. Speak one takeaway.`;
 }
 
+// Day planner (mined from ethanplusai/jarvis planner.py, web-adapted): real
+// commitments + open to-dos → a reasoned, time-blocked schedule.
+async function planMyDay(args: any): Promise<string> {
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date ?? "")) ? String(args.date) : londonDateStr(Date.now());
+  const [todos, events, strip] = await Promise.all([
+    q_hub("todos:list"),
+    q_hub("events:list"),
+    rentalQuery("calendar:getCalendarStrip", { accountSlug: null, startDate: date, days: 1 }),
+  ]);
+  const open = (Array.isArray(todos) ? todos : []).filter((t: any) => !t.done);
+  const dayEvents = (Array.isArray(events) ? events : []).filter((e: any) => londonDateStr(e.start) === date);
+  const day0 = Array.isArray(strip) ? strip[0] : null;
+  const short = (s: string) => String(s || "").split(/[|,]/)[0].split(/\s+/).slice(0, 4).join(" ");
+  const facts =
+    `DATE: ${date} (now ${londonTimeStr(Date.now())} London)\n` +
+    `FIXED EVENTS: ${dayEvents.map((e: any) => `${e.allDay ? "all-day" : londonTimeStr(e.start)} ${e.title}`).join("; ") || "none"}\n` +
+    `RENTALS TODAY: ${day0 ? [...(day0.pickups ?? []).map((p: any) => `pickup ${short(p.items?.[0]?.name ?? "")}${p.pickupTime ? " " + p.pickupTime : ""}`), ...(day0.returns ?? []).map((r: any) => `return ${short(r.items?.[0]?.name ?? "")}`)].join("; ") || "none" : "unknown"}\n` +
+    `OPEN TO-DOS (${open.length}): ${open.slice(0, 18).map((t: any) => `"${String(t.text).slice(0, 70)}"${t.dueDate ? ` (due ${londonDateStr(t.dueDate)})` : ""}${t.priority ? ` [p${t.priority}]` : ""}`).join("; ")}\n` +
+    (args.focus ? `DANIEL WANTS PRIORITISED: ${String(args.focus).slice(0, 300)}\n` : "");
+  const key = process.env.OPENAI_API_KEY ?? (await getSecret("openai", "OPENAI_API_KEY").catch(() => ""));
+  if (!key) return "Planner core unavailable.";
+  let plan = "";
+  try {
+    const r = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.1",
+        instructions:
+          "You are JARVIS planning Daniel's day. He's a solo builder running rental + content businesses; deep-work blocks matter more than busywork. " +
+          "Produce markdown: '## Today's plan' then time blocks (HH:MM–HH:MM — thing, one-line why), respecting fixed events/rentals, batching errands, " +
+          "max 3 meaningful priorities, realistic breaks, and an honest '## Skip today' list for the to-dos that shouldn't happen. Under 300 words.",
+        input: facts,
+        reasoning: { effort: "medium" },
+        max_output_tokens: 5000,
+      }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (r.ok) {
+      const j: any = await r.json();
+      plan =
+        j.output_text ??
+        (Array.isArray(j.output)
+          ? j.output.flatMap((o: any) => (Array.isArray(o.content) ? o.content : [])).filter((c: any) => c.type === "output_text").map((c: any) => c.text).join("\n")
+          : "");
+    }
+  } catch {
+    /* fall through */
+  }
+  if (!plan.trim()) return "The planner pass failed — build a quick plan yourself from the briefing data.";
+  await showResultsPanel(`plan · ${date}`, plan);
+  await convexMutation("chatQueue:postCard", { threadId: await activeThread(), type: "markdown", value: plan.slice(0, 3900), title: `day plan · ${date}` }).catch(() => {});
+  return `PLAN READY (on screen + card). Speak the top priority and first block only, then offer to write the blocks into his calendar (calendar_add per block if he says yes):\n${plan.slice(0, 2500)}`;
+}
+
 // "Open it filled in": travel sites accept everything as URL parameters — the
 // page loads with Daniel's dates, destination and party already applied.
 async function openTravelSite(args: any): Promise<string> {
@@ -1861,6 +1973,25 @@ export async function executeTool(name: string, args: any): Promise<string> {
       });
       return "Agent dispatched. It'll report back here in a few minutes — keep the conversation going.";
     }
+    case "orchestrate": {
+      const mission = String(args.mission ?? "").trim();
+      const agents = (Array.isArray(args.agents) ? args.agents : []).filter((a: any) => a?.task && a?.label).slice(0, 6);
+      if (!mission || agents.length < 2)
+        return "A fleet needs a mission and at least 2 independent agent tasks — for one task use dispatch_agent.";
+      const missionId = await convexMutation("missions:create", { goal: mission, agentCount: agents.length });
+      for (const a of agents) {
+        const scaffold = TASK_TEMPLATES[String(a.template ?? "")] ?? "";
+        await convexMutation("jobs:enqueue", {
+          task: `${String(a.task).slice(0, 2000)}${scaffold}\n\n(You are one agent of a ${agents.length}-agent fleet on the mission: "${mission}". Do ONLY your workstream.)`,
+          repo: a.repo ? String(a.repo) : undefined,
+          model: ["haiku", "sonnet", "opus"].includes(a.model) ? String(a.model) : undefined,
+          missionId: String(missionId),
+          label: String(a.label).slice(0, 60),
+        });
+      }
+      await convexMutation("ui:setPanel", { type: "fleet", value: JSON.stringify({ missionId: String(missionId) }), title: `mission · ${mission.slice(0, 44)}` }).catch(() => {});
+      return `Fleet of ${agents.length} dispatched on "${mission}" (${agents.map((a: any) => a.label).join(", ")}). Live fleet view is on screen; the synthesized report lands here when the last agent finishes. Tell Daniel in one casual line.`;
+    }
     case "show": {
       let { kind, value, title } = args as { kind?: string; value: string; title?: string };
       value = String(value ?? "").trim();
@@ -1964,6 +2095,8 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await tripFinalizeTool(args);
     case "creations_list":
       return await creationsList(args);
+    case "plan_my_day":
+      return await planMyDay(args);
     case "clear_chat": {
       const t = await activeThread();
       const n = await convexMutation("chatQueue:clearThread", { threadId: t });
@@ -2032,14 +2165,24 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return "Upgrade engineer dispatched on my own code — validated changes deploy automatically in a few minutes.";
     }
     case "agent_status": {
-      const [active, recent] = await Promise.all([convexQuery("jobs:active", {}), convexQuery("findings:recent", { limit: 4 })]);
+      const [active, recent, missions] = await Promise.all([
+        convexQuery("jobs:active", {}),
+        convexQuery("findings:recent", { limit: 4 }),
+        convexQuery("missions:active", {}).catch(() => []),
+      ]);
+      const m = Array.isArray(missions) && missions.length
+        ? "Missions: " +
+          missions
+            .map((x: any) => `"${x.goal.slice(0, 60)}" [${x.status}] ${x.jobs.filter((j: any) => j.status === "done").length}/${x.jobs.length} agents done`)
+            .join("; ") + "\n"
+        : "";
       const a = Array.isArray(active) && active.length
-        ? "Running: " + active.map((j: any) => `"${j.task.slice(0, 90)}" — ${j.progress || j.status}`).join("; ")
+        ? "Running: " + active.map((j: any) => `"${(j.label ?? j.task).slice(0, 70)}" — ${j.progress || j.status}`).join("; ")
         : "No agents running.";
       const f = Array.isArray(recent) && recent.length
         ? "\nRecent findings: " + recent.map((r: any) => r.spoken).join(" | ")
         : "";
-      return a + f;
+      return m + a + f;
     }
     case "current_time": {
       const now = new Date();

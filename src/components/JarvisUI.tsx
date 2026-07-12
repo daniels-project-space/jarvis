@@ -4,7 +4,7 @@ import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
 import ThreeOrbClassic from "./ThreeOrbClassic";
-import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView } from "./Views";
+import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView } from "./Views";
 import TripView from "./TripView";
 
 type Attachment = { type: string; value: string; title?: string };
@@ -473,6 +473,8 @@ function Viewport({
         <PdfView url={panel.value} title={panel.title} />
       ) : panel.type === "creations" ? (
         <CreationsView value={panel.value} />
+      ) : panel.type === "fleet" ? (
+        <FleetView value={panel.value} />
       ) : panel.type === "url" || panel.type === "video" ? (
         <div className="flex min-h-0 flex-1 flex-col">
           <iframe
@@ -614,7 +616,7 @@ export default function JarvisUI() {
       if (panel.type === "video") setVideoPip(false); // fresh video opens big, 16:9
       // Content-first moments (briefing, calendar, maps, library, documents,
       // launches): the chat steps aside on its own — expand it back any time.
-      let focus = ["canvas", "creations", "pdf", "launch", "trip"].includes(panel.type);
+      let focus = ["canvas", "creations", "pdf", "launch", "trip", "fleet", "board"].includes(panel.type);
       if (panel.type === "widget") {
         try {
           focus = ["briefing", "calendar", "stats"].includes(JSON.parse(panel.value)?.kind);
@@ -1038,6 +1040,44 @@ export default function JarvisUI() {
     });
   }
 
+  // Screen sight: share a screen/window for ONE frame — JARVIS reads it and
+  // answers about what's actually in front of Daniel.
+  const [seeing, setSeeing] = useState(false);
+  async function lookAtScreen() {
+    if (seeing) return;
+    setSeeing(true);
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 5 } });
+      const track = stream.getVideoTracks()[0];
+      const video = document.createElement("video");
+      video.srcObject = stream;
+      await video.play();
+      await new Promise((r) => setTimeout(r, 350)); // let the first real frame land
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.min(1920, video.videoWidth || 1280);
+      canvas.height = Math.round(canvas.width * ((video.videoHeight || 720) / (video.videoWidth || 1280)));
+      canvas.getContext("2d")!.drawImage(video, 0, 0, canvas.width, canvas.height);
+      track.stop();
+      stream.getTracks().forEach((t) => t.stop());
+      const image = canvas.toDataURL("image/jpeg", 0.8);
+      const q = input.trim();
+      const r = await fetch("/api/see", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ image, question: q }),
+      });
+      const { description } = await r.json();
+      if (description) {
+        void submit(
+          `(I'm sharing my screen with you. It shows: ${description})${q ? `\n\nMy question: ${q}` : "\n\nTell me what you make of it and help with what I'm looking at."}`,
+        );
+      }
+    } catch {
+      /* user cancelled the picker */
+    }
+    setSeeing(false);
+  }
+
   // One-shot voice input: record → STT → send. Works on iOS too.
   async function toggleMic() {
     if (recording) {
@@ -1348,6 +1388,13 @@ export default function JarvisUI() {
               }`}
             >
               {recording ? "■ done" : "mic"}
+            </button>
+            <button
+              onClick={() => void lookAtScreen()}
+              title="show JARVIS your screen (one frame)"
+              className={`shrink-0 rounded-xl px-3 text-sm transition ${seeing ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50 animate-pulse" : "glass text-slate hover:text-ice"}`}
+            >
+              👁
             </button>
             {(speaking || (live === "live" && caption?.who === "jarvis")) && (
               <button

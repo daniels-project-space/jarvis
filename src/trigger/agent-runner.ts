@@ -325,6 +325,7 @@ export const agentRunner = schedules.task({
     }
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: "/tmp/claude-home", ANTHROPIC_API_KEY: "" };
     mkdirSync("/tmp/claude-home/.claude", { recursive: true });
+    mkdirSync("/tmp/work", { recursive: true });
     const token = process.env.GITHUB_TOKEN ?? "";
 
     // Standing briefing every agent reads (global CLAUDE.md in the runner HOME):
@@ -343,21 +344,21 @@ export const agentRunner = schedules.task({
 
     let processed = 0;
     const started = Date.now();
-    // Claim window must leave room for a full 600s agent run inside the 900s
-    // task ceiling — a run killed at maxDuration strands its job (reaper fixes,
-    // but don't cause it).
-    while (Date.now() - started < 120_000) {
-      const job: any = await convexMutation("jobs:claimNext", {});
-      if (!job) break;
+
+    // One agent's full lifecycle: clone, run, push, finalize, report. Mission
+    // jobs stay quiet individually — the fleet reports ONCE when the last
+    // agent lands (synthesis below).
+    const processJob = async (job: any): Promise<void> => {
       try {
-        let cwd = "/tmp/work/scratch";
+        let cwd = `/tmp/work/scratch-${String(job.jobId).slice(-6)}`;
         mkdirSync(cwd, { recursive: true });
         let context = "You cannot edit files this run — answer/act from knowledge.";
         let repoDir: string | null = null;
         const repo = resolveRepo(job.repo);
         let cloneFailed = false;
         if (repo && token) {
-          const dir = `/tmp/work/${repo.replace(/[^a-zA-Z0-9]/g, "_")}`;
+          // per-job clone dir — concurrent fleet agents must not share checkouts
+          const dir = `/tmp/work/${repo.replace(/[^a-zA-Z0-9]/g, "_")}_${String(job.jobId).slice(-6)}`;
           rmSync(dir, { recursive: true, force: true });
           const url = `https://x-access-token:${token}@github.com/${repo}.git`;
           await sh("git", ["clone", "--depth", "1", url, dir], env);
@@ -438,14 +439,28 @@ export const agentRunner = schedules.task({
             repo: job.repo ?? undefined,
             model: job.model ?? undefined,
             incidentId: job.incidentId ?? undefined,
+            missionId: job.missionId ?? undefined,
+            label: job.label ?? undefined,
             retried: true,
           });
-          await convexMutation("chatQueue:postAssistant", {
-            threadId: await chatThread(),
-            text: "That one hit a snag, sir — retrying it a different way now.",
-          });
-          processed += 1;
-          continue;
+          if (!job.missionId)
+            await convexMutation("chatQueue:postAssistant", {
+              threadId: await chatThread(),
+              text: "That one hit a snag, sir — retrying it a different way now.",
+            });
+          return;
+        }
+
+        if (job.missionId) {
+          // Fleet agents stay quiet individually — findings recorded, and the
+          // LAST agent to land triggers ONE synthesized mission report.
+          await convexMutation("findings:add", {
+            source: job.task,
+            spoken: `Fleet update: "${job.label ?? job.task.slice(0, 40)}" is done.`,
+            detail: result.slice(0, 8000),
+          }).catch(() => {});
+          await maybeSynthesizeMission(job.missionId);
+          return;
         }
 
         // Weave, don't dump: one natural spoken line into chat + the full detail
@@ -479,17 +494,79 @@ export const agentRunner = schedules.task({
           }).catch(() => {});
         }
         await sendPush("JARVIS", spoken.slice(0, 140), "/");
-        processed += 1;
       } catch (e: any) {
         await convexMutation("jobs:finalize", { jobId: job.jobId, status: "error", result: String(e?.message ?? e) });
         if (job.incidentId)
           await convexMutation("incidents:setStatus", { id: job.incidentId, status: "open" }).catch(() => {});
-        await convexMutation("chatQueue:postAssistant", {
-          threadId: await chatThread(),
-          text: `⚠️ Agent failed: ${String(e?.message ?? e).slice(0, 300)}`,
-        }).catch(() => {});
+        if (job.missionId) await maybeSynthesizeMission(job.missionId).catch(() => {});
+        else
+          await convexMutation("chatQueue:postAssistant", {
+            threadId: await chatThread(),
+            text: `⚠️ Agent failed: ${String(e?.message ?? e).slice(0, 300)}`,
+          }).catch(() => {});
       }
+    };
+
+    // When the LAST fleet agent lands, merge everything into one report.
+    // missions:checkComplete is atomic — exactly one runner wins the synthesis.
+    const maybeSynthesizeMission = async (missionId: string): Promise<void> => {
+      const synth: any = await convexMutation("missions:checkComplete", { id: missionId }).catch(() => null);
+      if (!synth) return;
+      const failedAll = synth.results.every((r: any) => r.status === "error");
+      const body = synth.results
+        .map((r: any) => `### ${r.label} [${r.status}]\n${r.result || "(no output)"}`)
+        .join("\n\n");
+      const merged = await runClaude(
+        bin,
+        "/tmp/work",
+        env,
+        `You are JARVIS's mission synthesizer. A fleet of agents just finished parallel work on ONE mission. ` +
+          `Merge their results into a single coherent markdown report: start with "## Mission" and a 2-sentence outcome, ` +
+          `then "## Findings" (the substance, deduplicated, agent labels only where they add clarity), then "## Next moves" ` +
+          `(concrete recommended actions). Be direct; flag agents that failed. Under 500 words.\n\n` +
+          `MISSION: ${synth.goal}\n\nAGENT RESULTS:\n${body.slice(0, 24000)}`,
+        "sonnet",
+      );
+      const report = merged && !/^error:/.test(merged) && merged !== "(no output)" ? merged : `## Mission\n${synth.goal}\n\n${body.slice(0, 6000)}`;
+      await convexMutation("missions:finish", { id: missionId, summary: report.slice(0, 4000), failed: failedAll });
+      const thread = await chatThread();
+      const spoken =
+        (await weaveLine(bin, env, `MISSION: ${synth.goal}`, report)) ||
+        (failedAll ? "The fleet came back empty-handed, sir — mission report is on your screen." : "Mission complete, sir — the fleet's full report is on your screen.");
+      await convexMutation("chatQueue:postAssistant", { threadId: thread, text: spoken });
+      await convexMutation("chatQueue:postCard", {
+        threadId: thread,
+        type: "markdown",
+        value: report.slice(0, 3900),
+        title: `mission · ${synth.goal.slice(0, 44)}`,
+      }).catch(() => {});
+      await convexMutation("ui:setPanel", { type: "markdown", value: report.slice(0, 7000), title: `mission · ${synth.goal.slice(0, 44)}` }).catch(() => {});
+      await sendPush("JARVIS — mission complete", synth.goal.slice(0, 120), "/");
+    };
+
+    // Claim window must leave room for a full agent run inside the task
+    // ceiling. Fleet missions run CONCURRENTLY (cap 3 — each agent is a full
+    // claude process; the box has headroom for three).
+    const CONCURRENCY = 3;
+    const inFlight = new Set<Promise<void>>();
+    while (Date.now() - started < 120_000) {
+      if (inFlight.size >= CONCURRENCY) {
+        await Promise.race(inFlight);
+        continue;
+      }
+      const job: any = await convexMutation("jobs:claimNext", {});
+      if (!job) {
+        if (inFlight.size === 0) break;
+        await Promise.race(inFlight);
+        continue;
+      }
+      processed += 1;
+      let p: Promise<void>;
+      // eslint-disable-next-line prefer-const
+      p = processJob(job).finally(() => inFlight.delete(p));
+      inFlight.add(p);
     }
+    await Promise.all([...inFlight]);
     return { processed };
   },
 });

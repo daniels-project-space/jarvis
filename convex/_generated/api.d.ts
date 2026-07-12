@@ -16,6 +16,7 @@ import type * as findings from "../findings.js";
 import type * as incidents from "../incidents.js";
 import type * as jobs from "../jobs.js";
 import type * as memory from "../memory.js";
+import type * as missions from "../missions.js";
 import type * as projectState from "../projectState.js";
 import type * as push from "../push.js";
 import type * as ui from "../ui.js";
@@ -35,6 +36,7 @@ declare const fullApi: ApiFromModules<{
   incidents: typeof incidents;
   jobs: typeof jobs;
   memory: typeof memory;
+  missions: typeof missions;
   projectState: typeof projectState;
   push: typeof push;
   ui: typeof ui;

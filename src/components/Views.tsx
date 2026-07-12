@@ -125,6 +125,77 @@ export function CalendarView({ value }: { value: string }) {
   );
 }
 
+/* ---------------------------------- fleet / mission control ---------------------------------- */
+
+const JOB_DOT: Record<string, string> = {
+  pending: "bg-slate/60",
+  running: "bg-cyan animate-pulse",
+  done: "bg-emerald-400",
+  error: "bg-red-400",
+};
+
+export function FleetView({ value }: { value: string }) {
+  let missionId = "";
+  try {
+    missionId = JSON.parse(value)?.missionId ?? "";
+  } catch {
+    /* noop */
+  }
+  const missions = (useQuery(api.missions.active, {}) ?? []) as any[];
+  const m = missions.find((x) => x._id === missionId) ?? missions[0];
+  if (!m)
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-slate">
+        No fleet in flight right now.
+      </div>
+    );
+  const done = m.jobs.filter((j: any) => j.status === "done").length;
+  const glass = "rounded-xl border border-white/10 bg-white/[0.045] backdrop-blur-xl";
+  return (
+    <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
+      <div className="mx-auto max-w-2xl">
+        <div className="text-center">
+          <div className="hud-label mb-1">mission</div>
+          <div className="text-lg font-semibold leading-snug text-ice">{m.goal}</div>
+          <div className="mt-2 flex items-center justify-center gap-2">
+            <span className={`h-2 w-2 rounded-full ${m.status === "running" ? "bg-cyan animate-pulse" : m.status === "synthesizing" ? "bg-amber animate-pulse" : m.status === "done" ? "bg-emerald-400" : "bg-red-400"}`} />
+            <span className="hud-label">
+              {m.status === "synthesizing" ? "synthesizing report" : m.status} · {done}/{m.jobs.length} agents done
+            </span>
+          </div>
+          <div className="mx-auto mt-3 h-1.5 w-64 overflow-hidden rounded-full bg-white/5">
+            <div
+              className="h-full rounded-full bg-gradient-to-r from-cyan/50 to-cyan transition-all duration-700"
+              style={{ width: `${m.status === "done" ? 100 : Math.round((done / Math.max(1, m.jobs.length)) * 92)}%` }}
+            />
+          </div>
+        </div>
+        <div className="mt-5 space-y-2">
+          {m.jobs.map((j: any) => (
+            <div key={j._id} className={`${glass} flex items-center gap-3 p-3`}>
+              <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${JOB_DOT[j.status] ?? "bg-slate"}`} />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm text-ice">{j.label}</div>
+                {j.status === "running" && j.progress && (
+                  <div className="mt-0.5 truncate font-mono text-[10px] text-cyan/80">› {j.progress}</div>
+                )}
+              </div>
+              {j.model && <span className="hud-label shrink-0 !text-[9px]">{j.model}</span>}
+              <span className="hud-label shrink-0 !text-[9px]">{j.status}</span>
+            </div>
+          ))}
+        </div>
+        {m.summary && (
+          <div className={`${glass} mt-4 p-4`}>
+            <div className="hud-label mb-2">mission report</div>
+            <div className="whitespace-pre-wrap text-sm leading-relaxed text-ice">{m.summary}</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ---------------------------------- video selection list ---------------------------------- */
 
 export function VideoListView({ value }: { value: string }) {

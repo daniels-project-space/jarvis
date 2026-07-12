@@ -72,9 +72,25 @@ export default defineSchema({
     mcp: v.optional(v.array(v.string())), // MCP servers to attach (playwright, context7)
     incidentId: v.optional(v.string()), // set on self-repair jobs → resolves the incident on success
     retried: v.optional(v.boolean()), // failed once already — no second retry
+    missionId: v.optional(v.string()), // part of an orchestrated fleet
+    label: v.optional(v.string()), // short fleet-view label ("pricing research")
     progress: v.optional(v.string()), // live activity line the runner streams
     startedAt: v.optional(v.number()),
     createdAt: v.number(),
+  })
+    .index("by_status", ["status", "createdAt"])
+    .index("by_mission", ["missionId"]),
+
+  // Orchestrated agent fleets: one mission = a decomposed goal running as
+  // parallel jobs; when the last one lands, a synthesis pass merges the
+  // results into ONE coherent report back to Daniel.
+  missions: defineTable({
+    goal: v.string(),
+    status: v.string(), // running | synthesizing | done | failed
+    agentCount: v.number(),
+    summary: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
   }).index("by_status", ["status", "createdAt"]),
 
   // "Show me" panel — the brain sets what to display (site / doc / image); the UI
