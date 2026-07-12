@@ -17,15 +17,18 @@ export type BoardDoc = {
   imageUrls: Record<string, string>;
 };
 
+// Excalidraw's own pastel palette — designed to survive the dark-theme invert
+// filter, and reads like real sticky notes in a sketchbook.
 const COLORS: Record<string, string> = {
-  green: "#0fbf7f",
-  amber: "#f5a623",
-  blue: "#4a9eed",
-  pink: "#e64980",
-  purple: "#9775fa",
-  slate: "#697586",
-  yellow: "#f7d154",
+  green: "#b2f2bb",
+  amber: "#ffd8a8",
+  blue: "#a5d8ff",
+  pink: "#fcc2d7",
+  purple: "#d0bfff",
+  slate: "#dee2e6",
+  yellow: "#ffec99",
 };
+const INK = "#1e1e1e"; // sticky-note ink
 const color = (c?: string) => COLORS[String(c ?? "")] ?? COLORS.green;
 
 // Film/worldbuilding template — the spatial layout Daniel described: character
@@ -125,7 +128,7 @@ export function itemToOps(doc: BoardDoc, item: any): any[] {
             backgroundColor: ri === 0 ? c : "transparent",
             fillStyle: "solid",
             roughness: 0,
-            label: { text: String(cell).slice(0, 40), fontSize: 15, strokeColor: ri === 0 ? "#eef4fb" : "#1b2733" },
+            label: { text: String(cell).slice(0, 40), fontSize: 15, strokeColor: INK },
           }),
         ),
       ),
@@ -134,7 +137,7 @@ export function itemToOps(doc: BoardDoc, item: any): any[] {
   }
   if (kind === "text") {
     const p = place(doc, item.zone, item.x, item.y, 500, 60);
-    return [skel({ type: "text", x: p.x, y: p.y, text, fontSize: item.big ? 34 : 20, strokeColor: c, link })];
+    return [skel({ type: "text", x: p.x, y: p.y, text, fontSize: item.big ? 34 : 20, strokeColor: INK, link })];
   }
   if (kind === "arrow") {
     const p = place(doc, item.zone, item.x, item.y, 300, 80);
@@ -162,12 +165,12 @@ export function itemToOps(doc: BoardDoc, item: any): any[] {
       y: p.y,
       width: w,
       height: h,
-      strokeColor: c,
+      strokeColor: INK,
       backgroundColor: kind === "note" ? c : "transparent",
-      fillStyle: kind === "note" ? "hachure" : "solid",
+      fillStyle: "solid",
       roundness: shape === "rectangle" ? { type: 3 } : undefined,
       link,
-      label: text ? { text, fontSize: 17, strokeColor: "#1b2733" } : undefined,
+      label: text ? { text, fontSize: 17, strokeColor: INK } : undefined,
     }),
   ];
 }

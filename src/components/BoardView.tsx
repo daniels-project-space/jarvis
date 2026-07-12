@@ -96,6 +96,32 @@ export default function BoardView({ value }: { value: string }) {
       if (!ops.length) return;
       const skeletons: any[] = [];
       for (const op of ops) {
+        // edit/delete existing items by fuzzy text match — "fix what I asked"
+        if (op.kind === "edit" || op.kind === "delete") {
+          const q = String(op.match ?? "").toLowerCase();
+          const els = ex.getSceneElements();
+          const hitIds = new Set<string>();
+          for (const el of els) {
+            const t = String((el as any).text ?? "").toLowerCase();
+            if (q && t && t.includes(q)) {
+              hitIds.add(el.id);
+              if ((el as any).containerId) hitIds.add((el as any).containerId);
+            }
+          }
+          if (hitIds.size) {
+            if (op.kind === "delete") {
+              ex.updateScene({ elements: els.filter((el: any) => !hitIds.has(el.id) && !hitIds.has(el.containerId)) });
+            } else if (op.text) {
+              ex.updateScene({
+                elements: els.map((el: any) =>
+                  hitIds.has(el.id) && el.type === "text" ? { ...el, text: op.text, originalText: op.text, version: (el.version ?? 0) + 1 } : el,
+                ),
+              });
+            }
+          }
+          appliedTs.current = Math.max(appliedTs.current, op.ts ?? 0);
+          continue;
+        }
         if (op.kind === "skeleton") skeletons.push(op.skel);
         else if (op.kind === "image" && op.url) {
           const fileId = fileIdFor(op.url);
@@ -108,11 +134,13 @@ export default function BoardView({ value }: { value: string }) {
         }
         appliedTs.current = Math.max(appliedTs.current, op.ts ?? 0);
       }
-      if (cancelled || !skeletons.length) return;
-      const fresh = convertToExcalidrawElements(skeletons, { regenerateIds: true });
-      ex.updateScene({ elements: [...ex.getSceneElements(), ...fresh] });
-      ex.scrollToContent(fresh, { fitToViewport: false, animate: true });
-      void persist();
+      if (cancelled) return;
+      if (skeletons.length) {
+        const fresh = convertToExcalidrawElements(skeletons, { regenerateIds: true });
+        ex.updateScene({ elements: [...ex.getSceneElements(), ...fresh] });
+        ex.scrollToContent(fresh, { fitToViewport: false, animate: true });
+      }
+      void persist(); // also clears applied edit/delete ops from the queue
     })();
     return () => {
       cancelled = true;

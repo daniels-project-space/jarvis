@@ -2,7 +2,7 @@ import JarvisUI from "@/components/JarvisUI";
 
 export default function Home() {
   return (
-    <main className="relative z-10 flex min-h-screen flex-col">
+    <main className="relative z-10 flex h-dvh flex-col overflow-hidden">
       <JarvisUI />
     </main>
   );

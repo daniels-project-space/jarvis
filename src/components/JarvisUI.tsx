@@ -4,7 +4,7 @@ import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
 import ThreeOrbClassic from "./ThreeOrbClassic";
-import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView } from "./Views";
+import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView } from "./Views";
 import TripView from "./TripView";
 import BoardView from "./BoardView";
 
@@ -136,6 +136,15 @@ function panelSize(panel: { type: string; value: string }): string {
       return "w-[min(880px,96%)] h-[min(500px,90%)]";
     case "image":
       return "w-[min(1100px,97%)] h-[min(760px,97%)]";
+    case "w:candles":
+      return "w-[min(1360px,98%)] h-[min(780px,96%)]";
+    case "w:stats":
+      return "w-[min(1000px,97%)] h-[min(640px,94%)]";
+    case "w:videos":
+    case "w:feed":
+      return "h-full w-full";
+    case "markdown":
+      return "w-[min(980px,97%)] h-full";
     default:
       return "h-full w-full";
   }
@@ -279,6 +288,7 @@ function WidgetView({ value }: { value: string }) {
   if (w?.kind === "calendar") return <CalendarView value={value} />;
   if (w?.kind === "candles") return <CandlesView w={w} />;
   if (w?.kind === "videos") return <VideoListView value={value} />;
+  if (w?.kind === "feed") return <FeedView value={value} />;
   if (w?.kind === "market") {
     return (
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6">
@@ -385,34 +395,7 @@ function WidgetView({ value }: { value: string }) {
       </div>
     );
   }
-  if (w?.kind === "weather") {
-    return (
-      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-5 p-6">
-        <div className="hud-label">{w.place}</div>
-        <div className="flex items-center gap-5">
-          <span className="text-7xl">{w.icon}</span>
-          <div>
-            <div className="text-6xl font-semibold text-ice">{w.temp}°</div>
-            <div className="mt-1 text-sm text-slate">
-              {w.desc} · feels {w.feels}° · wind {w.wind} km/h · humidity {w.humidity}%
-            </div>
-          </div>
-        </div>
-        <div className="mt-2 flex flex-wrap justify-center gap-2">
-          {(w.days ?? []).map((d: any, i: number) => (
-            <div key={i} className="glass flex w-[86px] flex-col items-center gap-1 rounded-xl px-2 py-3">
-              <span className="hud-label">{d.day}</span>
-              <span className="text-2xl">{d.icon}</span>
-              <span className="text-sm text-ice">
-                {d.max}° <span className="text-slate">{d.min}°</span>
-              </span>
-              <span className="text-[10px] text-cyan/70">{d.rain}% rain</span>
-            </div>
-          ))}
-        </div>
-      </div>
-    );
-  }
+  if (w?.kind === "weather") return <WeatherView w={w} />;
   return <pre className="scrollbar-thin min-h-0 flex-1 overflow-auto whitespace-pre-wrap p-4 text-sm text-ice">{value}</pre>;
 }
 
@@ -648,6 +631,14 @@ export default function JarvisUI() {
       // to the bar (weather used to hide BEHIND the chat sheet on phones while
       // JARVIS claimed it was "on screen"). Expand the chat back any time.
       if (chatModeRef.current === "full") setChatMode("bar", false);
+      // previous panel → orbit bubble (still one tap away, out of the way)
+      const prev = prevPanelRef.current;
+      if (prev && (prev.title ?? prev.type) !== (panel.title ?? panel.type)) {
+        setBubbles((bs) =>
+          [{ type: prev.type, value: prev.value, title: prev.title }, ...bs.filter((b) => (b.title ?? b.type) !== (prev.title ?? prev.type))].slice(0, 3),
+        );
+      }
+      prevPanelRef.current = { type: panel.type, value: panel.value, title: panel.title, updatedAt: panel.updatedAt };
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [panel]);
@@ -687,6 +678,20 @@ export default function JarvisUI() {
       /* private mode */
     }
   };
+
+  // Orb mood: the brain sets a tone colour; the orb drifts into it slowly.
+  const moodRow = useQuery(api.ui.getMood, {}) as { value: string; updatedAt: number } | null | undefined;
+  const MOOD_COLORS: Record<string, string> = {
+    calm: "#00ff88", focused: "#4a9eed", dreamy: "#9775fa", warm: "#ffb454",
+    serious: "#8fa3bd", alert: "#ff5470", excited: "#ff7ad9",
+  };
+  const moodColor =
+    moodRow && Date.now() - moodRow.updatedAt < 20 * 60 * 1000 ? MOOD_COLORS[moodRow.value] ?? undefined : undefined;
+
+  // Orbit bubbles: when a new panel takes the stage, the previous one shrinks
+  // into a bobbing bubble beside the orb — tap to bring it back.
+  const [bubbles, setBubbles] = useState<{ type: string; value: string; title?: string }[]>([]);
+  const prevPanelRef = useRef<{ type: string; value: string; title?: string; updatedAt: number } | null>(null);
 
   // Chat history drawer + intelligent video handling (16:9 stage / PiP corner)
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -1175,7 +1180,7 @@ export default function JarvisUI() {
           : "idle";
 
   return (
-    <div className="flex min-h-screen flex-col">
+    <div className="flex h-dvh flex-col overflow-hidden">
       {/* top HUD strip */}
       <header className="flex items-center justify-between px-5 pb-2 pt-4">
         <div className="flex items-baseline gap-3">
@@ -1266,9 +1271,45 @@ export default function JarvisUI() {
       <div className={`relative mx-auto flex w-full max-w-[1720px] flex-1 flex-col overflow-clip p-4 pt-2 ${chatMode === "bar" ? "pb-24" : ""}`}>
         {/* the stage is ALWAYS full-bleed; the chat floats over it and slides
             away on pure transforms — compositor-only, 120fps-smooth */}
-        <div ref={stageRef} className="brackets relative min-h-[52vh] flex-1 md:min-h-[80vh]">
+        <div ref={stageRef} className={`brackets relative min-h-0 flex-1 transition-[margin] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${chatMode === "full" ? "md:mr-[416px]" : ""}`}>
           <span className="bk" />
           {live === "live" && <div className="live-ring pointer-events-none absolute inset-2 rounded-full opacity-60" />}
+          {/* orbit bubbles — demoted panels bobbing beside the orb */}
+          {bubbles.length > 0 && (
+            <div className="absolute left-4 top-1/2 z-10 flex -translate-y-1/2 flex-col gap-4">
+              {bubbles.map((b, i) => {
+                const yt = b.type === "video" ? (b.value.match(/embed\/([\w-]{11})/)?.[1] ?? null) : null;
+                const isImg = b.type === "image";
+                return (
+                  <button
+                    key={(b.title ?? b.type) + i}
+                    onClick={() => {
+                      setBubbles((bs) => bs.filter((_, j) => j !== i));
+                      void setPanel({ type: b.type, value: b.value, title: b.title });
+                    }}
+                    className="bob glass group relative h-16 w-16 overflow-hidden rounded-full !border-cyan/30 shadow-xl transition-transform duration-300 hover:scale-125 hover:!border-cyan/70"
+                    style={{ animationDelay: `${i * 1.4}s` }}
+                    title={b.title ?? b.type}
+                  >
+                    {yt ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={`https://img.youtube.com/vi/${yt}/mqdefault.jpg`} alt="" className="h-full w-full object-cover" />
+                    ) : isImg ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={b.value} alt="" className="h-full w-full object-cover" />
+                    ) : (
+                      <span className="grid h-full w-full place-items-center text-xl">
+                        {b.type === "widget" ? "📊" : b.type === "trip" ? "🌍" : b.type === "board" ? "🎨" : b.type === "canvas" ? "🕸" : b.type === "pdf" ? "📕" : "📄"}
+                      </span>
+                    )}
+                    <span className="pointer-events-none absolute inset-x-0 bottom-0 truncate bg-black/70 px-1 py-0.5 text-center text-[8px] text-ice opacity-0 transition group-hover:opacity-100">
+                      {b.title ?? b.type}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
           {panel && panelMin && (
             <div className="absolute left-4 top-4 z-10">
               <button
@@ -1305,7 +1346,7 @@ export default function JarvisUI() {
             }`}
           >
             {orbStyle === "particles" ? (
-              <ThreeOrb state={orbState} energyRef={energyRef} />
+              <ThreeOrb state={orbState} energyRef={energyRef} moodColor={moodColor} />
             ) : (
               <ThreeOrbClassic state={orbState} energyRef={energyRef} />
             )}

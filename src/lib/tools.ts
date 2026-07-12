@@ -357,11 +357,12 @@ export const TOOL_DEFS = [
   {
     name: "board",
     description:
-      "JARVIS's INFINITE CANVAS — a real freeform board (Excalidraw) you build and edit LIVE while talking: sticky notes, shapes, text, tables, arrows, clickable links (Spotify, references), and rendered images placed anywhere or into named ZONES. create with template 'film' gives a worldbuilding layout (characters / locations / moodboard / storyboard / playlist / notes zones). Use for brainstorming, film/script development, moodboards, project planning — ANY visual thinking. To add a rendered picture: create_image first, then board add an image item with its URL into the right zone. Ask Daniel questions as you build (characters? tone? locations?) and keep adding as answers come. Daniel can drag/edit everything by hand too.",
+      "JARVIS's INFINITE CANVAS — a real freeform board (Excalidraw) you build and edit LIVE while talking: sticky notes, shapes, text, tables, arrows, clickable links (Spotify, references), and rendered images placed anywhere or into named ZONES. create with template 'film' gives a worldbuilding layout (characters / locations / moodboard / storyboard / playlist / notes zones). Use for brainstorming, film/script development, moodboards, project planning — ANY visual thinking. GROUNDING RULE: the board mirrors what DANIEL says and approves — never invent names, plot points or details he didn't confirm; PROPOSE out loud first, add after he agrees. update rewrites an existing item (match its text); remove deletes it — when he asks to change something, change THAT item, don't add a duplicate. To add a rendered picture: create_image first, then board add an image item with its URL into the right zone. Ask Daniel questions as you build (characters? tone? locations?) and keep adding as answers come. Daniel can drag/edit everything by hand too.",
     parameters: {
       type: "object",
       properties: {
-        action: { type: "string", enum: ["create", "add", "show"] },
+        action: { type: "string", enum: ["create", "add", "update", "remove", "show"] },
+        match: { type: "string", description: "update/remove: a few words from the EXISTING item's text" },
         title: { type: "string", description: "board title (create/show)" },
         template: { type: "string", enum: ["film", "blank"], description: "create only, default blank" },
         project: { type: "string", description: "project slug this board belongs to (memory filing), e.g. 'island-script'" },
@@ -558,6 +559,58 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "orb_mood",
+    description:
+      "Shift the orb's colour to match the conversation's tone — it fades slowly into the new colour and stays a while. Use when the mood genuinely changes: calm (green, default), focused (blue, work/markets), dreamy (purple, creative), warm (amber, personal/friendly), serious (steel, hard talks/money decisions), alert (red, problems), excited (pink, wins/big ideas).",
+    parameters: {
+      type: "object",
+      properties: { mood: { type: "string", enum: ["calm", "focused", "dreamy", "warm", "serious", "alert", "excited"] } },
+      required: ["mood"],
+    },
+  },
+  {
+    name: "news_today",
+    description:
+      "Today's news as a CINEMATIC visual feed: full-screen story cards with images that fade through, then a browsable grid. Use for 'news of the day / what's happening / news about X'. Speak a 2-line digest while it plays.",
+    parameters: {
+      type: "object",
+      properties: { topic: { type: "string", description: "optional focus, e.g. 'AI', 'markets', 'Portugal'" } },
+    },
+  },
+  {
+    name: "music_search",
+    description:
+      "Find music on Spotify and present it as a visual feed with album art — tap opens Spotify. Use for 'find that song / music for the playlist / something like X'.",
+    parameters: {
+      type: "object",
+      properties: { query: { type: "string", description: "song/artist/vibe" } },
+      required: ["query"],
+    },
+  },
+  {
+    name: "transport_route",
+    description:
+      "Show a LIVE interactive Google Map with directions between two places (transit/driving/walking) — routes, times and options, embedded on screen. Use for 'how do I get from X to Y', airport transfers, trip transport questions.",
+    parameters: {
+      type: "object",
+      properties: {
+        from: { type: "string", description: "origin place/address" },
+        to: { type: "string", description: "destination place/address" },
+        mode: { type: "string", enum: ["transit", "driving", "walking", "bicycling"], description: "default transit" },
+      },
+      required: ["from", "to"],
+    },
+  },
+  {
+    name: "memory_map",
+    description:
+      "Show Daniel's memory as a visual node tree on screen (his Obsidian vault mind: projects, decisions, facts, preferences clustered and linked). Use for 'show me your memory / what do you remember / memory map'.",
+    parameters: {
+      type: "object",
+      properties: { query: { type: "string", description: "optional focus filter" } },
+    },
+  },
+  {
     name: "clear_chat",
     description: "Wipe the current chat's history. Use when Daniel asks to clear/delete the chat — this IS the action, never dispatch an agent for it.",
     parameters: { type: "object", properties: {} },
@@ -649,9 +702,15 @@ async function youtubeSearch(query: string): Promise<string> {
   const showList = async (vids: { id: string; title: string; channel: string; length: string }[]) => {
     await showWidget(
       {
-        kind: "videos",
-        query,
-        items: vids.map((v) => ({ id: v.id, title: v.title.slice(0, 80), channel: v.channel.slice(0, 40), length: v.length })),
+        kind: "feed",
+        mode: "videos",
+        label: `youtube · ${query.slice(0, 36)}`,
+        items: vids.map((v) => ({
+          image: `https://img.youtube.com/vi/${v.id}/hqdefault.jpg`,
+          title: v.title.slice(0, 100),
+          subtitle: `${v.channel.slice(0, 40)} · ${v.length}`,
+          video_id: v.id,
+        })),
       },
       `youtube · ${query.slice(0, 36)}`,
     );
@@ -958,7 +1017,8 @@ async function fetchWeatherData(place: string): Promise<any | null> {
     await fetch(
       `https://api.open-meteo.com/v1/forecast?latitude=${g.latitude}&longitude=${g.longitude}` +
         `&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m` +
-        `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=6`,
+        `&hourly=temperature_2m,weather_code,precipitation_probability&forecast_hours=12` +
+        `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=8`,
     )
   ).json();
   const cur = f?.current;
@@ -966,6 +1026,14 @@ async function fetchWeatherData(place: string): Promise<any | null> {
   const [icon, desc] = WMO[cur.weather_code] ?? ["🌡", "weather"];
   return {
     kind: "weather",
+    lat: g.latitude,
+    lng: g.longitude,
+    hours: (f.hourly?.time ?? []).map((h: string, i: number) => ({
+      h: h.slice(11, 16),
+      t: Math.round(f.hourly.temperature_2m[i]),
+      icon: (WMO[f.hourly.weather_code[i]] ?? ["🌡"])[0],
+      rain: f.hourly.precipitation_probability?.[i] ?? 0,
+    })),
     place: `${g.name}${g.country_code ? ", " + g.country_code : ""}`,
     icon,
     desc,
@@ -1519,6 +1587,18 @@ async function boardTool(args: any): Promise<string> {
     await saveBoardDoc(b.id, b.doc, true);
     return `Board "${b.doc.title}" is back on screen. Zones: ${Object.keys(b.doc.zones).join(", ")}.`;
   }
+  if (action === "update" || action === "remove") {
+    const match = String(args.match ?? "").trim();
+    if (!match) return "Which item? Give me a few words from its text (match).";
+    b.doc.pendingOps.push({
+      ts: Date.now(),
+      kind: action === "remove" ? "delete" : "edit",
+      match,
+      text: args.items?.[0]?.text ? String(args.items[0].text).slice(0, 600) : args.text ? String(args.text).slice(0, 600) : undefined,
+    });
+    await saveBoardDoc(b.id, b.doc, true);
+    return `${action === "remove" ? "Removing" : "Rewriting"} the item matching "${match}" — applied live on the board.`;
+  }
   if (action === "add") {
     const items = (Array.isArray(args.items) ? args.items : []).slice(0, 20);
     if (!items.length) return "Give me items to add.";
@@ -1659,6 +1739,111 @@ async function chartTool(args: any): Promise<string> {
   await showWidget(widget, title);
   await convexMutation("creations:create", { kind: "chart", title, data: JSON.stringify(widget) }).catch(() => {});
   return `Chart "${title}" is on screen and saved in the creations library. Speak one takeaway.`;
+}
+
+// News as a cinematic feed: hero cards with images fading through, then a grid.
+async function newsToday(args: any): Promise<string> {
+  const key = process.env.SERPAPI_KEY ?? (await getSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
+  if (!key) return "News unavailable (no search key).";
+  const topic = args.topic ? String(args.topic).trim() : "";
+  const qs = new URLSearchParams({ engine: "google_news", gl: "us", hl: "en", api_key: key });
+  if (topic) qs.set("q", topic);
+  else qs.set("topic_token", "CAAqJggKIiBDQkFTRWdvSUwyMHZNRFZxYUdjU0FtVnVHZ0pWVXlnQVAB"); // top stories
+  const j: any = await (await fetch(`https://serpapi.com/search.json?${qs}`, { signal: AbortSignal.timeout(9000) })).json();
+  const raw: any[] = (j?.news_results ?? []).flatMap((n: any) => (n.stories ? n.stories : [n]));
+  const items = raw
+    .filter((n: any) => n.thumbnail && n.title)
+    .slice(0, 12)
+    .map((n: any) => ({
+      image: String(n.thumbnail),
+      title: String(n.title).slice(0, 140),
+      subtitle: `${n.source?.name ?? ""}${n.date ? " · " + n.date : ""}`,
+      url: String(n.link ?? ""),
+    }));
+  if (!items.length) return "No picture-worthy stories found right now.";
+  await showWidget({ kind: "feed", mode: "news", label: topic ? `news · ${topic}` : "news of the day", items }, `news · ${topic || "today"}`);
+  return (
+    `NEWS FEED is playing on screen (hero cards, then the grid). Headlines: ` +
+    items.slice(0, 6).map((i) => i.title).join(" | ") +
+    ` — speak a natural 2-line digest of the most important 2-3, with your read on them.`
+  );
+}
+
+// Spotify search → visual feed with album art (client-credentials flow).
+let spotifyToken: { value: string; until: number } | null = null;
+async function musicSearch(args: any): Promise<string> {
+  const query = String(args.query ?? "").trim();
+  if (!query) return "What music?";
+  try {
+    if (!spotifyToken || spotifyToken.until < Date.now()) {
+      const creds = await (await import("./vault")).getServiceSecrets("spotify");
+      const id = creds.SPOTIFY_CLIENT_ID ?? creds.CLIENT_ID;
+      const secret = creds.SPOTIFY_CLIENT_SECRET ?? creds.CLIENT_SECRET;
+      if (!id || !secret) return "Spotify credentials missing from the vault.";
+      const r = await fetch("https://accounts.spotify.com/api/token", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", Authorization: `Basic ${Buffer.from(`${id}:${secret}`).toString("base64")}` },
+        body: "grant_type=client_credentials",
+      });
+      const tj: any = await r.json();
+      if (!tj.access_token) return `Spotify auth failed: ${JSON.stringify(tj).slice(0, 120)}`;
+      spotifyToken = { value: tj.access_token, until: Date.now() + (tj.expires_in - 60) * 1000 };
+    }
+    const sr: any = await (
+      await fetch(`https://api.spotify.com/v1/search?type=track&limit=10&q=${encodeURIComponent(query)}`, {
+        headers: { Authorization: `Bearer ${spotifyToken.value}` },
+      })
+    ).json();
+    const items = (sr?.tracks?.items ?? []).map((t: any) => ({
+      image: t.album?.images?.[0]?.url ?? "",
+      title: String(t.name).slice(0, 80),
+      subtitle: `${t.artists?.map((a: any) => a.name).join(", ")} · ${t.album?.name ?? ""}`.slice(0, 90),
+      url: t.external_urls?.spotify ?? "",
+    })).filter((i: any) => i.image);
+    if (!items.length) return `Nothing on Spotify for "${query}".`;
+    await showWidget({ kind: "feed", mode: "music", label: `music · ${query}`, items }, `music · ${query.slice(0, 30)}`);
+    return `MUSIC FEED on screen (album art, tap opens Spotify): ${items.slice(0, 5).map((i: any) => `${i.title} — ${i.subtitle.split("·")[0]}`).join(" | ")}. Speak your pick and why.`;
+  } catch (e: any) {
+    return `Spotify search failed: ${e?.message ?? e}`;
+  }
+}
+
+// Live Google Maps directions embedded on screen.
+async function transportRoute(args: any): Promise<string> {
+  const from = String(args.from ?? "").trim();
+  const to = String(args.to ?? "").trim();
+  if (!from || !to) return "From where to where?";
+  const mode = ["transit", "driving", "walking", "bicycling"].includes(String(args.mode)) ? String(args.mode) : "transit";
+  const key = await getSecret("google", "GOOGLE_PLACES_API_KEY").catch(() => "");
+  if (!key) return "Maps key unavailable.";
+  const url = `https://www.google.com/maps/embed/v1/directions?key=${key}&origin=${encodeURIComponent(from)}&destination=${encodeURIComponent(to)}&mode=${mode}`;
+  await convexMutation("ui:setPanel", { type: "url", value: url, title: `route · ${from.slice(0, 20)} → ${to.slice(0, 20)}` });
+  await convexMutation("chatQueue:postCard", {
+    threadId: await activeThread(),
+    type: "url",
+    value: `https://www.google.com/maps/dir/${encodeURIComponent(from)}/${encodeURIComponent(to)}`,
+    title: `route ${from.slice(0, 18)} → ${to.slice(0, 18)} ↗`,
+  }).catch(() => {});
+  return `Live ${mode} directions ${from} → ${to} are on screen (interactive map — he can pan and switch routes). Speak the gist if you know it; the map has the times.`;
+}
+
+// The Obsidian mind, visualised: memory rows clustered by kind on the canvas.
+async function memoryMapTool(args: any): Promise<string> {
+  const q = args.query ? String(args.query) : "";
+  const rows: any[] = q
+    ? ((await convexQuery("memory:search", { q, limit: 30 })) ?? [])
+    : ((await convexQuery("memory:recent", { limit: 36 })) ?? []);
+  if (!rows.length) return "Memory came back empty for that.";
+  const kinds = [...new Set(rows.map((m: any) => String(m.kind)))];
+  const nodes: any[] = [{ id: "mind", label: q ? `memory · ${q}` : "JARVIS memory", color: "green" }];
+  const edges: any[] = [];
+  for (const k of kinds) nodes.push({ id: `k-${k}`, label: k.toUpperCase(), parent: "mind", color: "amber" });
+  rows.slice(0, 34).forEach((m: any, i: number) => {
+    nodes.push({ id: `m${i}`, label: String(m.title).slice(0, 46), detail: String(m.body).slice(0, 80), parent: `k-${String(m.kind)}`, color: "blue" });
+  });
+  const doc = { title: q ? `Memory · ${q}` : "Memory map", nodes, edges };
+  await convexMutation("ui:setPanel", { type: "canvas", value: JSON.stringify(doc), title: doc.title });
+  return `Memory tree is on screen: ${rows.length} memories across ${kinds.join(", ")}. The full vault lives in Obsidian (jarvis-memory repo).`;
 }
 
 // Day planner (mined from ethanplusai/jarvis planner.py, web-adapted): real
@@ -2179,6 +2364,19 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await tripFinalizeTool(args);
     case "creations_list":
       return await creationsList(args);
+    case "orb_mood": {
+      const mood = ["calm", "focused", "dreamy", "warm", "serious", "alert", "excited"].includes(String(args.mood)) ? String(args.mood) : "calm";
+      await convexMutation("ui:setMood", { mood });
+      return `Mood set: ${mood}. (Say nothing about it — it just happens.)`;
+    }
+    case "news_today":
+      return await newsToday(args);
+    case "music_search":
+      return await musicSearch(args);
+    case "transport_route":
+      return await transportRoute(args);
+    case "memory_map":
+      return await memoryMapTool(args);
     case "plan_my_day":
       return await planMyDay(args);
     case "clear_chat": {

@@ -96,7 +96,7 @@ export async function POST(req: NextRequest) {
     // creative and multi-constraint asks are exactly where low effort showed.
     const complex =
       text.length > 220 ||
-      /\b(design|architect|creative|brainstorm|compare|trade-?offs?|should i|which (one|is better)|pros and cons|strategy|plan out|name (it|the)|decide|recommend)\b/i.test(
+      /\b(design|architect|creative|brainstorm|compare|trade-?offs?|should i|which (one|is better)|pros and cons|strategy|plan out|name (it|the)|decide|recommend|story|script|character|feel(ing)?|worried|advice|honest|feedback|idea)\b/i.test(
         text,
       );
 

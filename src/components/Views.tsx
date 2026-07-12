@@ -125,6 +125,163 @@ export function CalendarView({ value }: { value: string }) {
   );
 }
 
+/* ---------------------------------- weather (day · week · live map) ---------------------------------- */
+
+export function WeatherView({ w }: { w: any }) {
+  const [showMap, setShowMap] = useState(false);
+  if (showMap && w.lat != null)
+    return (
+      <div className="relative min-h-0 flex-1">
+        <iframe
+          src={`https://embed.windy.com/embed2.html?lat=${w.lat}&lon=${w.lng}&detailLat=${w.lat}&detailLon=${w.lng}&zoom=8&level=surface&overlay=rain&menu=&message=true&marker=true&type=map&metricWind=km%2Fh&metricTemp=%C2%B0C`}
+          className="h-full w-full"
+          title="live weather map"
+        />
+        <button onClick={() => setShowMap(false)} className="absolute right-3 top-3 rounded-full bg-black/70 px-3 py-1 text-[11px] text-ice backdrop-blur hover:text-cyan">
+          ← forecast
+        </button>
+      </div>
+    );
+  return (
+    <div className="scrollbar-thin flex min-h-0 flex-1 flex-col items-center justify-center gap-4 overflow-auto p-5">
+      <div className="flex w-full items-center justify-between">
+        <span className="hud-label">{w.place}</span>
+        {w.lat != null && (
+          <button onClick={() => setShowMap(true)} className="hud-label rounded px-1.5 !text-cyan hover:bg-cyan/10">
+            🗺 live map
+          </button>
+        )}
+      </div>
+      <div className="flex items-center gap-5">
+        <span className="text-7xl">{w.icon}</span>
+        <div>
+          <div className="text-6xl font-semibold text-ice">{w.temp}°</div>
+          <div className="mt-1 text-sm text-slate">
+            {w.desc} · feels {w.feels}° · wind {w.wind} km/h · humidity {w.humidity}%
+          </div>
+        </div>
+      </div>
+      {(w.hours ?? []).length > 0 && (
+        <div className="w-full">
+          <div className="hud-label mb-1.5">today</div>
+          <div className="scrollbar-thin flex gap-1.5 overflow-x-auto pb-1">
+            {w.hours.map((h: any, i: number) => (
+              <div key={i} className="glass flex w-[64px] shrink-0 flex-col items-center gap-0.5 rounded-lg px-1 py-2">
+                <span className="text-[10px] text-slate">{h.h}</span>
+                <span className="text-lg">{h.icon}</span>
+                <span className="text-xs text-ice">{h.t}°</span>
+                <span className="text-[9px] text-cyan/70">{h.rain}%</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      <div className="w-full">
+        <div className="hud-label mb-1.5">the week</div>
+        <div className="flex flex-wrap gap-2">
+          {(w.days ?? []).map((d: any, i: number) => (
+            <div key={i} className="glass flex min-w-[82px] flex-1 flex-col items-center gap-1 rounded-xl px-2 py-3">
+              <span className="hud-label">{d.day}</span>
+              <span className="text-2xl">{d.icon}</span>
+              <span className="text-sm text-ice">
+                {d.max}° <span className="text-slate">{d.min}°</span>
+              </span>
+              <span className="text-[10px] text-cyan/70">{d.rain}% rain</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------- cinematic feed (news / music / videos) ---------------------------------- */
+
+type FeedItem = { image: string; title: string; subtitle?: string; url?: string; video_id?: string };
+
+export function FeedView({ value }: { value: string }) {
+  let w: { mode: string; label: string; items: FeedItem[] } | null = null;
+  try {
+    w = JSON.parse(value);
+  } catch {
+    /* noop */
+  }
+  const items = useMemo(() => w?.items ?? [], [w?.items]);
+  const [phase, setPhase] = useState<"hero" | "grid">("hero");
+  const [idx, setIdx] = useState(0);
+  const setPanel = useMutation(api.ui.setPanel);
+
+  // hero presentation: each story holds ~4.2s, fades to the next, then the grid
+  useEffect(() => {
+    if (phase !== "hero") return;
+    if (idx >= Math.min(items.length, 4) - 1) {
+      const t = setTimeout(() => setPhase("grid"), 4500);
+      return () => clearTimeout(t);
+    }
+    const t = setTimeout(() => setIdx((i) => i + 1), 4200);
+    return () => clearTimeout(t);
+  }, [phase, idx, items.length]);
+
+  if (!w || !items.length) return <div className="flex flex-1 items-center justify-center text-sm text-slate">nothing to show</div>;
+
+  const open = (it: FeedItem) => {
+    if (it.video_id) void setPanel({ type: "video", value: `https://www.youtube.com/embed/${it.video_id}?enablejsapi=1&rel=0&autoplay=1`, title: it.title });
+    else if (it.url) window.open(it.url, "_blank", "noopener");
+  };
+
+  if (phase === "hero") {
+    return (
+      <div className="relative min-h-0 flex-1 cursor-pointer overflow-hidden" onClick={() => setPhase("grid")} title="tap to browse all">
+        {items.slice(0, 4).map((it, i) => (
+          <div
+            key={i}
+            className="absolute inset-0 transition-opacity duration-1000 ease-in-out"
+            style={{ opacity: i === idx ? 1 : 0 }}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={it.image} alt="" className="h-full w-full object-cover" />
+            <div className="absolute inset-0 bg-gradient-to-t from-black/95 via-black/30 to-black/20" />
+            <div className={`absolute bottom-0 left-0 right-0 p-6 transition-transform duration-1000 ${i === idx ? "translate-y-0" : "translate-y-3"}`}>
+              <div className="hud-label mb-1 !text-cyan">{w!.label} · {i + 1}/{Math.min(items.length, 4)}</div>
+              <div className="max-w-3xl text-xl font-semibold leading-snug text-white md:text-3xl">{it.title}</div>
+              {it.subtitle && <div className="mt-1.5 text-sm text-white/70">{it.subtitle}</div>}
+            </div>
+          </div>
+        ))}
+        <div className="absolute right-4 top-4 rounded-full bg-black/50 px-3 py-1 text-[10px] uppercase tracking-widest text-white/70 backdrop-blur">
+          tap to browse
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="hud-label">{w.label}</span>
+        <button onClick={() => { setIdx(0); setPhase("hero"); }} className="hud-label rounded px-1.5 hover:text-cyan">▶ replay</button>
+      </div>
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-4">
+        {items.map((it, i) => (
+          <button key={i} onClick={() => open(it)} className="card-lift glass rise overflow-hidden rounded-xl text-left" style={{ animationDelay: `${i * 45}ms` }}>
+            <div className="relative">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={it.image} alt="" className={`w-full object-cover ${w!.mode === "music" ? "aspect-square" : "aspect-video"}`} />
+              {w!.mode === "music" && (
+                <span className="absolute bottom-1.5 right-1.5 grid h-8 w-8 place-items-center rounded-full bg-[#1DB954] pl-0.5 text-sm text-black">▶</span>
+              )}
+            </div>
+            <div className="p-2.5">
+              <div className="line-clamp-2 text-[13px] leading-snug text-ice">{it.title}</div>
+              {it.subtitle && <div className="mt-1 truncate text-[10px] text-slate">{it.subtitle}</div>}
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /* ---------------------------------- fleet / mission control ---------------------------------- */
 
 const JOB_DOT: Record<string, string> = {
@@ -335,7 +492,7 @@ export function CandlesView({ w }: { w: CandlesWidget }) {
         <svg
           viewBox={`0 0 ${W} ${H}`}
           className="block h-full w-full"
-          preserveAspectRatio="none"
+          preserveAspectRatio="xMidYMid meet"
           onMouseMove={(e) => {
             const r = (e.target as SVGElement).closest("svg")!.getBoundingClientRect();
             const i = Math.floor(((e.clientX - r.left) / r.width) * W / ((W - padR) / n));

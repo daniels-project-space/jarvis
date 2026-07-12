@@ -20,10 +20,16 @@ const SPEAK = 0x3cf0a4;
 export default function ThreeOrb({
   state = "idle",
   energyRef,
+  moodColor,
 }: {
   state?: OrbState;
   energyRef?: { current: number };
+  moodColor?: string;
 }) {
+  const moodRef = useRef<string | undefined>(moodColor);
+  useEffect(() => {
+    moodRef.current = moodColor;
+  }, [moodColor]);
   const mountRef = useRef<HTMLDivElement>(null);
   const stateRef = useRef<OrbState>(state);
   useEffect(() => {
@@ -276,9 +282,15 @@ export default function ThreeOrb({
 
       mat.opacity = currentBright + bass * 0.08;
       mat.size = currentSize + bass * 0.05;
-      if (st === "thinking") { mat.color.lerp(new THREE.Color(THINK), 0.015); lineMat.color.lerp(new THREE.Color(THINK), 0.015); }
-      else if (st === "speaking") { mat.color.lerp(new THREE.Color(SPEAK), 0.015); lineMat.color.lerp(new THREE.Color(SPEAK), 0.015); }
-      else { mat.color.lerp(new THREE.Color(BASE), 0.015); lineMat.color.lerp(new THREE.Color(BASE), 0.015); }
+      // mood-aware palette: the whole orb drifts slowly into the conversation's
+      // colour and holds it; states tint from that base
+      const moodBase = new THREE.Color(moodRef.current ?? "#00ff88");
+      const target =
+        st === "thinking" ? moodBase.clone().lerp(new THREE.Color("#ffffff"), 0.3)
+        : st === "speaking" ? moodBase.clone().lerp(new THREE.Color("#ffffff"), 0.15)
+        : moodBase;
+      mat.color.lerp(target, 0.006);
+      lineMat.color.lerp(target, 0.006);
 
       camera.position.x = Math.sin(t * 0.02) * 5;
       camera.position.y = Math.cos(t * 0.03) * 3;

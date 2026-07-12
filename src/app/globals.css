@@ -185,6 +185,13 @@ body {
   }
 }
 
+/* orbit bubbles: demoted panels gently bob beside the orb */
+@keyframes bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-9px); }
+}
+.bob { animation: bob 5.5s ease-in-out infinite; }
+
 @media (prefers-reduced-motion: reduce) {
   .materialize, .materialize::after, .rise, .breathe, .live-ring,
   .brackets::before, .brackets::after, .brackets > .bk::before, .brackets > .bk::after {
