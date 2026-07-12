@@ -26,11 +26,13 @@ type Marker = { key: string; lat: number; lng: number; kind: "stay" | "activity"
 function Globe({
   center,
   markers,
+  links,
   selected,
   onSelect,
 }: {
   center: { lat: number; lng: number };
   markers: Marker[];
+  links: { a: string; b: string }[];
   selected: string | null;
   onSelect: (key: string) => void;
 }) {
@@ -39,6 +41,8 @@ function Globe({
   stateRef.current = { onSelect, selected };
   const markersRef = useRef(markers);
   markersRef.current = markers;
+  const linksRef = useRef(links);
+  linksRef.current = links;
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -114,6 +118,28 @@ function Globe({
           ring.lookAt(0, 0, 0);
           markerGroup.add(ring);
         }
+      }
+      // connecting nodes: lifted arcs between locked plan points (airport →
+      // hotel → activities) — the plan literally wires itself up on the globe
+      const byKey = new Map(markersRef.current.map((m) => [m.key, m]));
+      for (const l of linksRef.current) {
+        const A = byKey.get(l.a);
+        const B = byKey.get(l.b);
+        if (!A || !B) continue;
+        const pa = place(A.lat, A.lng, R + 1.2);
+        const pb = place(B.lat, B.lng, R + 1.2);
+        const pts: THREE.Vector3[] = [];
+        for (let i = 0; i <= 24; i++) {
+          const t = i / 24;
+          const p = pa.clone().lerp(pb, t).normalize().multiplyScalar(R + 1.2 + Math.sin(Math.PI * t) * 5);
+          pts.push(p);
+        }
+        markerGroup.add(
+          new THREE.Line(
+            new THREE.BufferGeometry().setFromPoints(pts),
+            new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.65 }),
+          ),
+        );
       }
     };
     buildMarkers();
@@ -267,6 +293,16 @@ export default function TripView({ value }: { value: string }) {
     return ms;
   }, [doc]);
 
+  // locked plan → connecting nodes on the globe (airport → hotel → activities)
+  const links = useMemo(() => {
+    if (!doc) return [] as { a: string; b: string }[];
+    const out: { a: string; b: string }[] = [];
+    const stayKey = doc.locked?.stay?.name ? `stay:${doc.locked.stay.name}` : null;
+    if (stayKey && doc.airport?.lat) out.push({ a: "airport", b: stayKey });
+    for (const an of doc.locked?.activities ?? []) if (stayKey) out.push({ a: stayKey, b: `act:${an}` });
+    return out;
+  }, [doc]);
+
   if (!doc)
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-slate">
@@ -305,7 +341,7 @@ export default function TripView({ value }: { value: string }) {
     <div className="flex min-h-0 flex-1 flex-col md:flex-row">
       {/* globe side */}
       <div className="relative h-[34vh] shrink-0 border-b border-white/5 md:h-auto md:w-[42%] md:border-b-0 md:border-r">
-        <Globe center={doc.center} markers={markers} selected={selected} onSelect={onGlobeSelect} />
+        <Globe center={doc.center} markers={markers} links={links} selected={selected} onSelect={onGlobeSelect} />
         <div className="pointer-events-none absolute left-3 top-3">
           <div className="text-sm font-semibold text-ice">{doc.destination}</div>
           <div className="hud-label !text-[9px]">

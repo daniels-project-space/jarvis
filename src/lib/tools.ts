@@ -411,6 +411,19 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "trip_open",
+    description:
+      "Spawn the trip globe THE MOMENT a destination comes up in conversation — it appears immediately, centred on the place, and fills in live (flights, stays, activities, connections) as the planning talk continues. Call this first, then ask about budget/dates, then trip_plan.",
+    parameters: {
+      type: "object",
+      properties: {
+        destination: { type: "string", description: "city/region, e.g. 'Lisbon'" },
+        dest_iata: { type: "string", description: "airport code if known, e.g. LIS" },
+      },
+      required: ["destination"],
+    },
+  },
+  {
     name: "trip_plan",
     description:
       "Full travel scout — ONE call searches real flights (Google Flights), real hotels with amenities/total prices (Google Hotels), and top activities (Google Places) in parallel, then opens the interactive globe trip planner on screen. BUDGET IS REQUIRED: if Daniel hasn't given one, ASK HIM FIRST instead of calling this. Use for any 'plan a trip / find me a holiday / getaway to X'.",
@@ -537,12 +550,17 @@ async function serpapi(params: Record<string, string>): Promise<any> {
 }
 
 async function youtubeSearch(query: string): Promise<string> {
+  // Videos arrive as a tappable THUMBNAIL selection list — nothing autoplays;
+  // Daniel picks one (or says "play the second one").
   const showList = async (vids: { id: string; title: string; channel: string; length: string }[]) => {
-    const md = [`## YouTube · ${query}`, ""];
-    vids.forEach((v, i) =>
-      md.push(`${i + 1}. [${v.title}](https://www.youtube.com/watch?v=${v.id})`, `   ${v.channel} · ${v.length}`, ""),
+    await showWidget(
+      {
+        kind: "videos",
+        query,
+        items: vids.map((v) => ({ id: v.id, title: v.title.slice(0, 80), channel: v.channel.slice(0, 40), length: v.length })),
+      },
+      `youtube · ${query.slice(0, 36)}`,
     );
-    await showResultsPanel(`youtube · ${query.slice(0, 36)}`, md.join("\n"));
   };
   // Free path: scrape ytInitialData from the results page.
   try {
@@ -570,8 +588,9 @@ async function youtubeSearch(query: string): Promise<string> {
         await showList(vids);
         return (
           vids
-            .map((v) => `${v.title} — ${v.channel} (${v.length}) https://www.youtube.com/watch?v=${v.id} [id:${v.id}]`)
-            .join("\n") + "\n(The list is on Daniel's screen — offer to play one.)"
+            .map((v, i) => `${i + 1}. ${v.title} — ${v.channel} (${v.length}) [id:${v.id}]`)
+            .join("\n") +
+          "\n(Thumbnail list is on Daniel's screen, ready to tap — NOTHING is playing. If he asks to play one, use show with the video id and play:true.)"
         );
       }
     }
@@ -590,8 +609,8 @@ async function youtubeSearch(query: string): Promise<string> {
     })),
   );
   return (
-    vids.map((v: any) => `${v.title} — ${v.channel?.name ?? ""} (${v.length ?? ""}) ${v.link}`).join("\n") +
-    "\n(The list is on Daniel's screen — offer to play one.)"
+    vids.map((v: any, i: number) => `${i + 1}. ${v.title} — ${v.channel?.name ?? ""} (${v.length ?? ""}) [id:${YT_ID(v.link) ?? ""}]`).join("\n") +
+    "\n(Thumbnail list is on Daniel's screen, ready to tap — NOTHING is playing. If he asks to play one, use show with the video id and play:true.)"
   );
 }
 
@@ -1692,7 +1711,12 @@ async function tripPlanTool(args: any): Promise<string> {
   const budget = Number(args.budget_total_gbp) || 0;
   if (budget <= 0)
     return "BUDGET MISSING — do NOT search yet. Ask Daniel one short question: what's the total budget for this trip?";
-  const { scoutTrip } = await import("./travel");
+  const { scoutTrip, latestTrip } = await import("./travel");
+  // If the globe is already open for this destination, populate THAT doc live
+  // instead of spawning a duplicate.
+  let reuseId: string | undefined;
+  const existing = await latestTrip();
+  if (existing && existing.doc.destination.toLowerCase().trim() === destination.toLowerCase().trim()) reuseId = existing.id;
   const { doc } = await scoutTrip({
     destination,
     destIata,
@@ -1704,6 +1728,7 @@ async function tripPlanTool(args: any): Promise<string> {
     vibe: args.vibe ? String(args.vibe) : undefined,
     maxPricePerNight: Number(args.max_price_per_night) || undefined,
     vacationRentals: !!args.vacation_rentals,
+    reuseId,
   });
   const f = doc.flights[0];
   const cheapStay = doc.stays[0];
@@ -1924,6 +1949,13 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await priceChartTool(args);
     case "market_analysis":
       return await marketAnalysisTool(args);
+    case "trip_open": {
+      const { openTrip } = await import("./travel");
+      const destination = String(args.destination ?? "").trim();
+      if (!destination) return "Which destination?";
+      const { doc } = await openTrip({ destination, destIata: args.dest_iata ? String(args.dest_iata) : undefined });
+      return `Globe is up, centred on ${destination}${doc.airport ? ` (${doc.airport.name} marked)` : ""} — it fills in live as you plan. Now get budget + dates from Daniel, then trip_plan populates it.`;
+    }
     case "trip_plan":
       return await tripPlanTool(args);
     case "trip_update":

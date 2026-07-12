@@ -77,8 +77,23 @@ export default function Embed() {
     });
   };
   useEffect(() => {
-    if (localStorage.getItem("jarvis_embed_wake") !== "0") armWake();
+    // Listen ONLY while this tab is actually visible — a background hub tab
+    // mishearing speech (even JARVIS's own voice from another window) used to
+    // silently start a live session and cut TTS everywhere via the live lock.
+    const sync = () => {
+      import("../../lib/wakeword").then((m) => {
+        if (document.visibilityState === "visible" && localStorage.getItem("jarvis_embed_wake") !== "0") {
+          if (!m.wakeActive() && !liveRef.current) armWake();
+        } else if (!liveRef.current) {
+          m.stopWake();
+          setWakeState(false);
+        }
+      });
+    };
+    sync();
+    document.addEventListener("visibilitychange", sync);
     return () => {
+      document.removeEventListener("visibilitychange", sync);
       import("../../lib/wakeword").then((m) => m.stopWake());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -185,6 +200,7 @@ export default function Embed() {
       recRef.current?.stop();
       return;
     }
+    import("../../lib/tts").then((m) => m.stopSpeaking()); // barge-in
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
@@ -204,7 +220,10 @@ export default function Embed() {
       try {
         const r = await fetch("/api/stt", { method: "POST", headers: { "content-type": mime }, body: blob });
         const { text } = await r.json();
-        if (text?.trim()) void submit(text.trim());
+        if (text?.trim()) {
+          const { isEchoOfTts } = await import("../../lib/tts");
+          if (!isEchoOfTts(text)) void submit(text.trim());
+        }
       } catch {
         /* ignore */
       }

@@ -5,6 +5,13 @@
 
 let rec: any = null;
 let wanted = false;
+let suppressed = false;
+
+// Self-trigger gate: while JARVIS speaks (tts.ts sets this), wake matches are
+// ignored — his own voice saying "jarvis" must never wake him.
+export function setSuppressed(on: boolean) {
+  suppressed = on;
+}
 
 export function wakeSupported(): boolean {
   return typeof window !== "undefined" && !!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
@@ -22,6 +29,7 @@ export function startWake(onWake: () => void, onState?: (listening: boolean) => 
     r.continuous = true;
     r.interimResults = true;
     r.onresult = (e: any) => {
+      if (suppressed) return; // JARVIS is talking — that's him, not Daniel
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const text = String(e.results[i][0].transcript || "").toLowerCase();
         if (/\b(hey\s+)?jarvis\b/.test(text)) {

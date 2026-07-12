@@ -154,6 +154,45 @@ export function tripTotals(doc: TripDoc): TripDoc["totals"] {
   return { flights: Math.round(flights), stay: Math.round(stay), activitiesEst, total: Math.round(flights + stay + activitiesEst) };
 }
 
+// Spawn the globe the moment trip talk starts: a skeleton trip doc centred on
+// the destination (city geocode + airport marker), populated live by trip_plan.
+export async function openTrip(a: { destination: string; destIata?: string }): Promise<{ id: string; doc: TripDoc }> {
+  let center = { lat: 41.39, lng: 2.17 };
+  try {
+    const g: any = await (
+      await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(a.destination)}&count=1&language=en`, {
+        signal: AbortSignal.timeout(6000),
+      })
+    ).json();
+    if (g?.results?.[0]) center = { lat: g.results[0].latitude, lng: g.results[0].longitude };
+  } catch {
+    /* keep default */
+  }
+  const destIata = a.destIata ? fixIata(a.destIata) : "";
+  const airport = destIata ? await findAirport(destIata, a.destination) : undefined;
+  const doc: TripDoc = {
+    kind: "trip",
+    title: `${a.destination} · planning`,
+    destination: a.destination,
+    destIata,
+    origin: "LHR",
+    departDate: "",
+    returnDate: "",
+    adults: 2,
+    budgetGbp: 0,
+    status: "scouting",
+    center,
+    airport,
+    flights: [],
+    stays: [],
+    activities: [],
+    locked: { activities: [] },
+  };
+  const id = await convexMutation("creations:create", { kind: "trip", title: doc.title, data: JSON.stringify(doc) });
+  await convexMutation("ui:setPanel", { type: "trip", value: JSON.stringify({ creationId: String(id) }), title: `trip · ${a.destination}` });
+  return { id: String(id), doc };
+}
+
 // The orchestrated scout — every provider in parallel, one trip doc out.
 export async function scoutTrip(a: {
   destination: string;
@@ -166,6 +205,7 @@ export async function scoutTrip(a: {
   vibe?: string;
   maxPricePerNight?: number;
   vacationRentals?: boolean;
+  reuseId?: string; // populate the already-open globe instead of spawning a new doc
 }): Promise<{ id: string; doc: TripDoc }> {
   const nights = Math.max(1, Math.round((Date.parse(a.returnDate) - Date.parse(a.departDate)) / 86_400_000));
   // Budget shaping: stays get ~45% of total budget unless caller overrides.
@@ -224,20 +264,33 @@ export async function scoutTrip(a: {
   };
   doc.totals = tripTotals(doc);
 
-  const id = await convexMutation("creations:create", {
-    kind: "trip",
-    title: doc.title,
-    data: JSON.stringify(doc),
-    thumb: stays[0]?.thumb ?? activities[0]?.photo,
-  });
-  await convexMutation("ui:setPanel", { type: "trip", value: JSON.stringify({ creationId: String(id) }), title: `trip · ${doc.title}` });
+  let id: string;
+  if (a.reuseId) {
+    id = a.reuseId; // the globe is already up — it fills in live (reactive panel)
+    await convexMutation("creations:update", {
+      id,
+      title: doc.title,
+      data: JSON.stringify(doc),
+      thumb: stays[0]?.thumb ?? activities[0]?.photo,
+    });
+  } else {
+    id = String(
+      await convexMutation("creations:create", {
+        kind: "trip",
+        title: doc.title,
+        data: JSON.stringify(doc),
+        thumb: stays[0]?.thumb ?? activities[0]?.photo,
+      }),
+    );
+  }
+  await convexMutation("ui:setPanel", { type: "trip", value: JSON.stringify({ creationId: id }), title: `trip · ${doc.title}` });
   await convexMutation("chatQueue:postCard", {
     threadId: (await convexQuery("ui:getActiveThread", {})) || "main",
     type: "trip",
-    value: JSON.stringify({ creationId: String(id) }),
+    value: JSON.stringify({ creationId: id }),
     title: `trip · ${doc.title}`,
   }).catch(() => {});
-  return { id: String(id), doc };
+  return { id, doc };
 }
 
 export async function latestTrip(): Promise<{ id: string; doc: TripDoc } | null> {

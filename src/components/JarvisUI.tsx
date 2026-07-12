@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
-import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView } from "./Views";
+import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView } from "./Views";
 import TripView from "./TripView";
 
 type Attachment = { type: string; value: string; title?: string };
@@ -59,6 +59,7 @@ const WIDGET_ICON: Record<string, string> = {
   briefing: "📋",
   calendar: "📅",
   candles: "📈",
+  videos: "📺",
 };
 
 // Persistent media card in the stream — click to put it back on the big screen.
@@ -248,6 +249,7 @@ function WidgetView({ value }: { value: string }) {
   if (w?.kind === "timer") return <TimerWidget w={w} />;
   if (w?.kind === "calendar") return <CalendarView value={value} />;
   if (w?.kind === "candles") return <CandlesView w={w} />;
+  if (w?.kind === "videos") return <VideoListView value={value} />;
   if (w?.kind === "market") {
     return (
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6">
@@ -1009,12 +1011,16 @@ export default function JarvisUI() {
     });
   }
 
-  // One-shot voice input: record → Groq Whisper → send. Works on iOS too.
+  // One-shot voice input: record → STT → send. Works on iOS too.
   async function toggleMic() {
     if (recording) {
       recRef.current?.stop();
       return;
     }
+    // barge-in: JARVIS shuts up the moment Daniel reaches for the mic, so the
+    // recording can't capture his voice as input
+    import("../lib/tts").then((m) => m.stopSpeaking());
+    setSpeaking(false);
     void claimVoice({ client: me.current });
     let stream: MediaStream;
     try {
@@ -1038,7 +1044,11 @@ export default function JarvisUI() {
       try {
         const r = await fetch("/api/stt", { method: "POST", headers: { "content-type": mime }, body: blob });
         const { text } = await r.json();
-        if (text?.trim()) void submit(text.trim());
+        if (text?.trim()) {
+          const { isEchoOfTts } = await import("../lib/tts");
+          if (isEchoOfTts(text)) return; // that was JARVIS's own voice leaking in
+          void submit(text.trim());
+        }
       } catch {
         /* ignore */
       }

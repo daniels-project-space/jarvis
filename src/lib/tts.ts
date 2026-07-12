@@ -10,6 +10,34 @@ let queue: string[] = [];
 let draining = false;
 let generation = 0; // bumped on stop — cancels queued sentences
 
+// ── self-trigger protection ─────────────────────────────────────────────────
+// WebAudio output escapes the browser's echo canceller on some platforms, so
+// the mic can hear JARVIS talk. Industry-standard fix: gate input detectors
+// while speaking AND drop transcripts that match what was just said.
+type Recent = { text: string; until: number };
+let recentUtterances: Recent[] = [];
+const norm = (s: string) =>
+  s.toLowerCase().replace(/[^a-z0-9\s']/g, " ").split(/\s+/).filter((w) => w.length > 1);
+function trackUtterance(text: string, durMs: number) {
+  const now = Date.now();
+  recentUtterances = recentUtterances.filter((r) => r.until > now);
+  recentUtterances.push({ text, until: now + durMs + 5000 });
+}
+// True when `input` is (mostly) an echo of something JARVIS spoke recently.
+export function isEchoOfTts(input: string): boolean {
+  const now = Date.now();
+  recentUtterances = recentUtterances.filter((r) => r.until > now);
+  const inTok = norm(input);
+  if (inTok.length < 3) return false; // short commands ("stop", "yes") always pass
+  for (const r of recentUtterances) {
+    const spoken = new Set(norm(r.text));
+    if (!spoken.size) continue;
+    const hits = inTok.filter((t) => spoken.has(t)).length;
+    if (hits / inTok.length >= 0.65) return true;
+  }
+  return false;
+}
+
 function ctx(): AudioContext {
   if (!audioCtx) audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
   return audioCtx;
@@ -63,10 +91,11 @@ export function sentences(text: string): string[] {
   return out;
 }
 
-async function playBuffer(arr: ArrayBuffer, onEnergy: (e: number) => void): Promise<void> {
+async function playBuffer(arr: ArrayBuffer, onEnergy: (e: number) => void, spokenText?: string): Promise<void> {
   const c = ctx();
   await c.resume();
   const decoded = await c.decodeAudioData(arr);
+  if (spokenText) trackUtterance(spokenText, decoded.duration * 1000);
   return new Promise((resolve) => {
     const src = c.createBufferSource();
     src.buffer = decoded;
@@ -125,20 +154,29 @@ export async function speak(
   draining = true;
   const gen = generation;
   onStart?.();
-  try {
-    let pending: Promise<ArrayBuffer | null> | null = null;
-    while ((queue.length || pending) && gen === generation) {
-      const cur = pending ?? (queue.length ? fetchAudio(queue.shift()!) : null);
-      pending = queue.length ? fetchAudio(queue.shift()!) : null; // prefetch next while current plays
-      if (!cur) break;
+  trackUtterance(text, Math.min(90_000, text.length * 70)); // whole-utterance echo window
+  // gate the wake-word detector for the whole utterance (+tail) — the mic must
+  // never treat JARVIS's own voice as a trigger
+  import("./wakeword").then((m) => m.setSuppressed?.(true)).catch(() => {});
+  let pendingText = "";
+  let pending: Promise<ArrayBuffer | null> | null = null;
+  while ((queue.length || pending) && gen === generation) {
+    const curText = pending ? pendingText : queue[0] ?? "";
+    const cur = pending ?? (queue.length ? fetchAudio(queue.shift()!) : null);
+    pendingText = queue[0] ?? "";
+    pending = queue.length ? fetchAudio(queue.shift()!) : null; // prefetch next while current plays
+    if (!cur) break;
+    try {
       const buf = await cur;
       if (gen !== generation) break;
-      if (buf) await playBuffer(buf, onEnergy);
+      if (buf) await playBuffer(buf, onEnergy, curText);
+    } catch {
+      // ONE bad audio chunk (decode hiccup, truncated stream) must not kill the
+      // rest of the read-out — skip the sentence and carry on
     }
-  } catch {
-    /* audio errors are non-fatal */
   }
   draining = false;
   onEnergy(0);
+  setTimeout(() => import("./wakeword").then((m) => m.setSuppressed?.(false)).catch(() => {}), 900);
   onEnd?.();
 }

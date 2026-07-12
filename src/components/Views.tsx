@@ -125,6 +125,50 @@ export function CalendarView({ value }: { value: string }) {
   );
 }
 
+/* ---------------------------------- video selection list ---------------------------------- */
+
+export function VideoListView({ value }: { value: string }) {
+  let w: { query: string; items: { id: string; title: string; channel: string; length: string }[] } | null = null;
+  try {
+    w = JSON.parse(value);
+  } catch {
+    /* noop */
+  }
+  const setPanel = useMutation(api.ui.setPanel);
+  if (!w) return <pre className="p-4 text-sm text-ice">{value}</pre>;
+  return (
+    <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3">
+      <div className="hud-label mb-2">youtube · {w.query}</div>
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
+        {w.items.map((v) => (
+          <button
+            key={v.id}
+            onClick={() =>
+              // tap = load it READY to watch (paused) — nothing autoplays
+              void setPanel({ type: "video", value: `https://www.youtube.com/embed/${v.id}?enablejsapi=1&rel=0`, title: v.title })
+            }
+            className="card-lift glass group overflow-hidden rounded-xl text-left"
+            title={v.title}
+          >
+            <div className="relative">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={`https://img.youtube.com/vi/${v.id}/mqdefault.jpg`} alt="" className="aspect-video w-full object-cover" />
+              <span className="absolute bottom-1.5 right-1.5 rounded bg-black/80 px-1.5 py-0.5 font-mono text-[10px] text-ice">{v.length}</span>
+              <span className="absolute inset-0 grid place-items-center opacity-0 transition group-hover:opacity-100">
+                <span className="grid h-11 w-11 place-items-center rounded-full bg-cyan/90 pl-0.5 text-lg text-black">▶</span>
+              </span>
+            </div>
+            <div className="p-2">
+              <div className="line-clamp-2 text-xs leading-snug text-ice">{v.title}</div>
+              <div className="hud-label mt-1 !text-[8px]">{v.channel}</div>
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /* ---------------------------------- candles (real chart) ---------------------------------- */
 
 type CandleRow = [number, number, number, number, number, number]; // t o h l c v
