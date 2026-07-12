@@ -99,7 +99,7 @@ export async function buildContext(userText?: string): Promise<{ block: string; 
           `Locked: flight ${t.locked?.flight ? `${t.locked.flight.airline} £${t.locked.flight.priceGbp}pp` : "—"}, ` +
           `stay ${t.locked?.stay ? `${t.locked.stay.name} £${t.locked.stay.totalGbp} total` : "—"}, ` +
           `activities: ${(t.locked?.activities ?? []).join(", ") || "—"}` +
-          (t.transfer ? `, airport transfer ${t.transfer.durationText}` : "") +
+          (t.transfer ? `, airport transfer ${t.transfer.durationText} (${t.transfer.distanceText}, by ${t.transfer.mode})` : "") +
           `. Use trip_update (lock/show/toggle) or trip_finalize on THIS trip; only call trip_plan for a NEW destination or dates.`,
       );
     } catch {
