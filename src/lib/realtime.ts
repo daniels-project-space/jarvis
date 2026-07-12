@@ -183,13 +183,27 @@ export async function startLive(h: LiveHandlers) {
           // intended call (run it for real) and keep the junk out of
           // captions, history and the next session's prompt.
           if (done && !mirrored.has(item.itemId)) {
+            let executed = 0;
             for (const c of extractFunctionCalls(text)) {
               if (c.name === "show" && !c.args?.value) continue; // malformed — don't set a junk panel
+              executed++;
               void fetch("/api/tools", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify({ name: c.name, args: c.args }),
               }).catch(() => {});
+            }
+            // Nothing recoverable: the model believes it showed something but
+            // the screen is untouched. Tell it so it calls the REAL tool.
+            if (!executed && /<function/i.test(text)) {
+              try {
+                session?.sendMessage(
+                  NUDGE +
+                    "Your last attempt did NOT reach the screen — nothing is showing. Call the actual tool now (properly, as a function call) to display it.",
+                );
+              } catch {
+                /* ignore */
+              }
             }
           }
           text = sanitizeAssistantText(text);

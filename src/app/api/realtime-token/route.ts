@@ -62,7 +62,7 @@ export async function POST(req: NextRequest) {
     ? `\n\nRecent conversation (continue it naturally — this already happened):\n${historyLines.slice(-16).join("\n")}`
     : "";
   const shownBlock = shown.length
-    ? `\n\nRecently shown items — re-show any of these with the show tool when he says "again"/"from earlier":\n${shown.slice(-8).join("\n")}`
+    ? `\n\nItems shown EARLIER (NOT currently visible — the stage clears constantly). If Daniel asks about any of these, or asks to see anything, CALL THE TOOL AGAIN — re-showing is free and expected:\n${shown.slice(-8).join("\n")}`
     : "";
 
   const instructions =
@@ -71,7 +71,8 @@ export async function POST(req: NextRequest) {
     `Daniel speaks English: treat everything you hear as English and reply ONLY in English, whatever it sounds like. ` +
     `When he says to turn off live mode, stop listening, or go quiet: say one short goodbye and call exit_live_mode. ` +
     `ECHO GUARD: if what you hear is a repetition or paraphrase of something YOU just said (your own voice leaking back), stay completely silent — never answer yourself. ` +
-    `TOOLS ARE REAL FUNCTIONS: to show or do anything you MUST call the tool — NEVER type function syntax, tool names, JSON or brackets into a reply, and never read JSON, code or tool results aloud; speak a short human summary instead. If Daniel closes something on screen, it stays closed — never re-show it unless he asks again.`;
+    `TOOLS ARE REAL FUNCTIONS: to show or do anything you MUST call the tool — NEVER type function syntax, tool names, JSON or brackets into a reply, and never read JSON, code or tool results aloud; speak a short human summary instead. If Daniel closes something on screen, it stays closed — never re-show it unless he asks again. ` +
+    `NEVER claim something is on screen unless a tool call SUCCEEDED in THIS turn — earlier turns don't count, the stage tucks panels away whenever Daniel speaks. When he asks for anything visual, call the tool again even if you showed it before. If a tool fails, say so plainly instead of pretending.`;
 
   const r = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
     method: "POST",

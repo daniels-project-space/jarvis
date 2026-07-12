@@ -750,7 +750,7 @@ export default function JarvisUI() {
     if (panel && panel.updatedAt !== lastPanelAt.current) {
       lastPanelAt.current = panel.updatedAt;
       const cp = closedPanelRef.current;
-      if (cp && cp.key === `${panel.title ?? ""}|${panel.value.slice(0, 160)}` && Date.now() - cp.ts < 30_000) {
+      if (cp && cp.key === `${panel.title ?? ""}|${panel.value.slice(0, 160)}` && Date.now() - cp.ts < 12_000) {
         void clearPanel({});
         return;
       }
@@ -1268,7 +1268,7 @@ export default function JarvisUI() {
         if (role === "user") {
           void claimVoice({ client: me.current });
           if (panelTypeRef.current === "video") setVideoPip(true); // talking over a video → mini player
-          else if (!panelFullRef.current) setPanelMin((min) => min || lastPanelAt.current < Date.now() - 8000);
+          else if (!panelFullRef.current) setPanelMin((min) => min || lastPanelAt.current < Date.now() - 30_000);
           lastLiveUser.current = text;
         }
         else if (lastLiveUser.current) {

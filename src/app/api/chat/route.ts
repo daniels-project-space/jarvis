@@ -95,6 +95,17 @@ const SLOW_LINES: Record<string, string> = {
   news_today: "Grabbing today's front pages.",
 };
 
+// Tools that actually put something on the stage — used to catch the model
+// CLAIMING "it's on your screen" in a turn where none of these ran.
+const SCREEN_TOOLS = new Set([
+  "show", "hide", "weather", "price_chart", "market_analysis", "markets", "youtube_search",
+  "shop_search", "news_today", "briefing", "todo_list", "net_worth", "calendar_view",
+  "trip_open", "trip_plan", "trip_update", "trip_finalize", "mind_map", "board", "draft",
+  "music_search", "memory_map", "transport_route", "open_app", "create_image", "create_pdf",
+  "timer", "orchestrate", "creations",
+]);
+const SCREEN_CLAIM = /\bon (?:your|the) screen\b|\bup on screen\b|\bpulled (?:it |that |them )?up\b|\bshowing (?:you |it |them )?(?:now|here)\b|\bhave a look\b|\btake a look\b/i;
+
 export async function POST(req: NextRequest) {
   let text = "",
     threadId = "main";
@@ -182,6 +193,24 @@ export async function POST(req: NextRequest) {
         continue;
       }
       final = String(msg.content ?? "").trim();
+      // Honesty guardrail: "it's on your screen" with no screen tool run this
+      // turn = the exact "he says he showed it but nothing opened" bug. Give
+      // the model ONE corrective round to actually call the tool (or rephrase).
+      if (
+        final &&
+        round < 5 &&
+        SCREEN_CLAIM.test(final) &&
+        !used.some((u) => SCREEN_TOOLS.has(u))
+      ) {
+        messages.push({ role: "assistant", content: final });
+        messages.push({
+          role: "system",
+          content:
+            "You claimed something is on Daniel's screen, but you did not call any screen tool this turn — NOTHING is showing. Call the right tool NOW to actually display it, then answer briefly. (Things shown in earlier turns are no longer on screen.)",
+        });
+        final = "";
+        continue;
+      }
       break;
     }
     if (final && isToolGarbage(final)) final = sanitizeAssistantText(final) || "Done — it's on your screen.";
