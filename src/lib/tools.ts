@@ -1299,13 +1299,49 @@ async function mindMap(args: any): Promise<string> {
     .slice(0, 80)
     .map((e: any) => ({ from: String(e.from), to: String(e.to), label: e.label ? String(e.label).slice(0, 30) : undefined }));
 
+  // Models refer to nodes loosely ("rental-expansion" for id "rental") — match
+  // refs against real ids AND labels so parents/edges never silently detach.
+  const resolveId = (ref: string | undefined, pool: { id: string; label: string }[]): string | undefined => {
+    if (!ref) return undefined;
+    const r = ref.toLowerCase().trim();
+    const rs = r.replace(/[^a-z0-9]+/g, "-");
+    const exact = pool.find((n) => n.id.toLowerCase() === r || n.id.toLowerCase() === rs);
+    if (exact) return exact.id;
+    const byLabel =
+      pool.find((n) => n.label.toLowerCase() === r) ??
+      pool.find(
+        (n) =>
+          n.label.toLowerCase().includes(r) ||
+          r.includes(n.label.toLowerCase()) ||
+          n.id.toLowerCase().includes(rs) ||
+          rs.includes(n.id.toLowerCase()),
+      );
+    return byLabel?.id;
+  };
+  const resolveRefs = (nodes: any[], edges: any[]) => {
+    const pool = nodes.map((n: any) => ({ id: n.id, label: n.label }));
+    for (const n of nodes) if (n.parent) n.parent = resolveId(n.parent, pool.filter((p) => p.id !== n.id)) ?? n.parent;
+    let dropped = 0;
+    const good = edges.filter((e: any) => {
+      e.from = resolveId(e.from, pool) ?? "";
+      e.to = resolveId(e.to, pool) ?? "";
+      if (!e.from || !e.to || e.from === e.to) {
+        dropped++;
+        return false;
+      }
+      return true;
+    });
+    return { good, dropped };
+  };
+
   if (action === "create") {
     const title = String(args.title ?? "Mind map").slice(0, 80);
     if (!cleanNodes.length) return "Give me at least one node.";
-    const doc = { title, nodes: cleanNodes, edges: cleanEdges };
+    const { good } = resolveRefs(cleanNodes, cleanEdges);
+    const doc = { title, nodes: cleanNodes, edges: good };
     const id = await convexMutation("creations:create", { kind: "canvas", title, data: JSON.stringify(doc) });
     await convexMutation("ui:setPanel", { type: "canvas", value: JSON.stringify({ ...doc, creationId: String(id) }), title: `map · ${title}` });
-    return `Mind map "${title}" is live on screen (${cleanNodes.length} nodes). Keep talking — use mind_map update to add/change/remove as the conversation flows.`;
+    return `Mind map "${title}" is live on screen. Node ids: ${cleanNodes.map((n: any) => n.id).join(", ")}. Keep talking — use mind_map update (these exact ids) to add/change/remove as the conversation flows.`;
   }
 
   const existing: any = await convexQuery("creations:latest", { kind: "canvas", titleMatch: args.title ? String(args.title) : undefined });
@@ -1317,14 +1353,18 @@ async function mindMap(args: any): Promise<string> {
     return "The saved map is corrupted — create a fresh one.";
   }
 
+  let droppedEdges = 0;
   if (action === "update") {
     const byId: Record<string, any> = Object.fromEntries((doc.nodes ?? []).map((n: any) => [n.id, n]));
     for (const n of cleanNodes) byId[n.id] = { ...byId[n.id], ...n };
-    for (const rid of Array.isArray(args.remove) ? args.remove.map(String) : []) delete byId[rid];
+    for (const rid of Array.isArray(args.remove) ? args.remove.map(String) : []) {
+      const real = resolveId(String(rid), Object.values(byId).map((n: any) => ({ id: n.id, label: n.label })));
+      if (real) delete byId[real];
+    }
     doc.nodes = Object.values(byId).slice(0, 80);
-    const keep = new Set(doc.nodes.map((n: any) => n.id));
-    doc.edges = [...(doc.edges ?? []), ...cleanEdges]
-      .filter((e: any) => keep.has(e.from) && keep.has(e.to))
+    const { good, dropped } = resolveRefs(doc.nodes, [...(doc.edges ?? []), ...cleanEdges]);
+    droppedEdges = dropped;
+    doc.edges = good
       .filter((e: any, i: number, a: any[]) => a.findIndex((x) => x.from === e.from && x.to === e.to) === i)
       .slice(0, 100);
     if (args.title) doc.title = String(args.title).slice(0, 80);
@@ -1336,8 +1376,8 @@ async function mindMap(args: any): Promise<string> {
     title: `map · ${doc.title}`,
   });
   return action === "update"
-    ? `Map updated live (${doc.nodes.length} nodes now).`
-    : `Mind map "${doc.title}" is back on screen.`;
+    ? `Map updated live (${doc.nodes.length} nodes). Node ids: ${doc.nodes.map((n: any) => n.id).join(", ")}.${droppedEdges ? ` ${droppedEdges} connection(s) referenced unknown nodes and were skipped — use the ids listed.` : ""}`
+    : `Mind map "${doc.title}" is back on screen. Node ids: ${doc.nodes.map((n: any) => n.id).join(", ")}.`;
 }
 
 async function chartTool(args: any): Promise<string> {
