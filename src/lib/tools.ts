@@ -25,15 +25,44 @@ export const TOOL_DEFS = [
   {
     name: "show",
     description:
-      "Put something on Daniel's screen while you talk: a webpage, YouTube video, image, code, or notes. Use this for ANYTHING visual or detailed instead of reading it out.",
+      "Put something on Daniel's screen while you talk: a webpage, YouTube video, image, code, or notes. Use this for ANYTHING visual or detailed instead of reading it out. For videos, set play=true when he asked to PLAY/watch it (it autoplays); videos render 16:9 and shrink to picture-in-picture when he keeps talking.",
     parameters: {
       type: "object",
       properties: {
         kind: { type: "string", enum: ["url", "video", "image", "code", "markdown"] },
         value: { type: "string", description: "url / YouTube link or ID / image url / code text / markdown text" },
         title: { type: "string", description: "Short label shown above the panel" },
+        play: { type: "boolean", description: "video only: start playback immediately" },
       },
       required: ["kind", "value"],
+    },
+  },
+  {
+    name: "video_control",
+    description:
+      "Control the video currently on Daniel's screen (or in the picture-in-picture pill): play, pause, or close it. Use for 'play it / pause / stop / close the video / get rid of the mini player'.",
+    parameters: {
+      type: "object",
+      properties: { action: { type: "string", enum: ["play", "pause", "close"] } },
+      required: ["action"],
+    },
+  },
+  {
+    name: "open_travel_site",
+    description:
+      "Open a travel site ALREADY FILLED IN with Daniel's dates, destination and party (via deep-link parameters) — Booking.com, Airbnb, Google Flights or Skyscanner. If a trip is in progress, missing fields auto-fill from it. Use when he says 'open it on booking / put that into airbnb / bring up the flights page'.",
+    parameters: {
+      type: "object",
+      properties: {
+        site: { type: "string", enum: ["booking", "airbnb", "google_flights", "skyscanner"] },
+        destination: { type: "string", description: "city or hotel name" },
+        origin_iata: { type: "string", description: "flights only" },
+        dest_iata: { type: "string", description: "flights only" },
+        checkin: { type: "string", description: "YYYY-MM-DD" },
+        checkout: { type: "string", description: "YYYY-MM-DD" },
+        adults: { type: "number" },
+      },
+      required: ["site"],
     },
   },
   { name: "hide", description: "Clear the screen panel.", parameters: { type: "object", properties: {} } },
@@ -1480,6 +1509,59 @@ async function chartTool(args: any): Promise<string> {
   return `Chart "${title}" is on screen and saved in the creations library. Speak one takeaway.`;
 }
 
+// "Open it filled in": travel sites accept everything as URL parameters — the
+// page loads with Daniel's dates, destination and party already applied.
+async function openTravelSite(args: any): Promise<string> {
+  const site = String(args.site ?? "");
+  // Missing fields auto-fill from the trip in progress.
+  let trip: any = null;
+  try {
+    const { latestTrip } = await import("./travel");
+    trip = (await latestTrip())?.doc ?? null;
+  } catch {
+    /* no trip — fine */
+  }
+  const destination = String(args.destination ?? trip?.locked?.stay?.name ?? trip?.destination ?? "").trim();
+  const checkin = /^\d{4}-\d{2}-\d{2}$/.test(String(args.checkin ?? "")) ? String(args.checkin) : trip?.departDate ?? "";
+  const checkout = /^\d{4}-\d{2}-\d{2}$/.test(String(args.checkout ?? "")) ? String(args.checkout) : trip?.returnDate ?? "";
+  const adults = Math.max(1, Number(args.adults) || trip?.adults || 2);
+  const oIata = String(args.origin_iata ?? trip?.origin ?? "LHR").toUpperCase();
+  const dIata = String(args.dest_iata ?? trip?.destIata ?? "").toUpperCase();
+
+  let url = "";
+  let name = "";
+  if (site === "booking") {
+    if (!destination) return "Which destination or hotel for Booking.com?";
+    const p = new URLSearchParams({ ss: destination, group_adults: String(adults) });
+    if (checkin) p.set("checkin", checkin);
+    if (checkout) p.set("checkout", checkout);
+    url = `https://www.booking.com/searchresults.html?${p.toString()}&nflt=fc%3D2`;
+    name = "Booking.com";
+  } else if (site === "airbnb") {
+    if (!destination) return "Which destination for Airbnb?";
+    const p = new URLSearchParams({ adults: String(adults) });
+    if (checkin) p.set("checkin", checkin);
+    if (checkout) p.set("checkout", checkout);
+    url = `https://www.airbnb.com/s/${encodeURIComponent(destination)}/homes?${p.toString()}`;
+    name = "Airbnb";
+  } else if (site === "google_flights") {
+    if (!dIata) return "Which destination airport for Google Flights?";
+    url = `https://www.google.com/travel/flights?q=${encodeURIComponent(
+      `Flights from ${oIata} to ${dIata} on ${checkin}${checkout ? ` through ${checkout}` : ""} for ${adults} adults`,
+    )}`;
+    name = "Google Flights";
+  } else if (site === "skyscanner") {
+    if (!dIata) return "Which destination airport for Skyscanner?";
+    const d = (s: string) => s.replaceAll("-", "").slice(2); // YYMMDD
+    url = `https://www.skyscanner.net/transport/flights/${oIata.toLowerCase()}/${dIata.toLowerCase()}/${checkin ? d(checkin) : ""}${checkout ? "/" + d(checkout) : ""}/?adults=${adults}`;
+    name = "Skyscanner";
+  } else return "Which site — booking, airbnb, google_flights or skyscanner?";
+
+  await convexMutation("ui:setPanel", { type: "launch", value: JSON.stringify({ name, url }), title: `launch · ${name}` });
+  await convexMutation("chatQueue:postCard", { threadId: await activeThread(), type: "url", value: url, title: `${name} — prefilled ↗` }).catch(() => {});
+  return `${name} is opening PRE-FILLED: ${destination || `${oIata}→${dIata}`}${checkin ? `, ${checkin}` : ""}${checkout ? ` → ${checkout}` : ""}, ${adults} adults. One tap if the popup was blocked.`;
+}
+
 // ── Markets: real charts + the analyst brain ────────────────────────────────
 async function priceChartTool(args: any): Promise<string> {
   const { resolveAsset, fetchCandles, keyLevels, chartWidget } = await import("./markets");
@@ -1762,7 +1844,8 @@ export async function executeTool(name: string, args: any): Promise<string> {
       const id = YT_ID(value);
       if (id) {
         kind = "video";
-        value = `https://www.youtube.com/embed/${id}`;
+        // jsapi enabled so video_control can drive it; autoplay when he asked to play
+        value = `https://www.youtube.com/embed/${id}?enablejsapi=1&rel=0${args.play ? "&autoplay=1" : ""}`;
       } else if (!kind || !["url", "video", "image", "code", "markdown", "site"].includes(kind)) {
         kind = /\.(png|jpe?g|gif|webp|svg)(\?|$)/i.test(value) ? "image" : /^https?:\/\//i.test(value) ? "url" : "markdown";
       }
@@ -1783,6 +1866,14 @@ export async function executeTool(name: string, args: any): Promise<string> {
     case "hide":
       await convexMutation("ui:clearPanel", {});
       return "Cleared.";
+    case "video_control": {
+      const action = ["play", "pause", "close"].includes(String(args.action)) ? String(args.action) : "";
+      if (!action) return "play, pause or close?";
+      await convexMutation("ui:setVideoCmd", { cmd: action });
+      return action === "close" ? "Video closed." : `Video ${action === "play" ? "playing" : "paused"}.`;
+    }
+    case "open_travel_site":
+      return await openTravelSite(args);
     case "web_search":
       return await webSearch(String(args.query));
     case "flight_search":

@@ -67,6 +67,24 @@ export const getLiveOn = query({
   handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "liveOn")).first(),
 });
 
+// Video remote control: the brain writes a command ("play" | "pause" | "close"),
+// the client relays it into the YouTube iframe via the JS API. updatedAt is the
+// nonce — the client acts once per fresh command.
+export const setVideoCmd = mutation({
+  args: { cmd: v.string() },
+  handler: async (ctx, a) => {
+    const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "videoCmd")).first();
+    const doc = { key: "videoCmd", type: "cmd", value: a.cmd, updatedAt: Date.now() };
+    if (ex) await ctx.db.patch(ex._id, doc);
+    else await ctx.db.insert("ui", doc);
+  },
+});
+
+export const getVideoCmd = query({
+  args: {},
+  handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "videoCmd")).first(),
+});
+
 // Chats: one active thread (UI + brain + agent weaves all follow it) plus a
 // small registry so Daniel can hop back to earlier conversations.
 export const setActiveThread = mutation({

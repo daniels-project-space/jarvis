@@ -47,16 +47,18 @@ export default function Embed() {
     me.current = clientId();
   }, []);
 
-  // Tell the host page how big to draw us.
-  const size = (expanded: boolean) => {
+  // Tell the host page how big to draw us / when to summon or dismiss us.
+  const post = (msg: Record<string, unknown>) => {
     try {
-      window.parent?.postMessage({ jarvis: "size", h: expanded ? 384 : 72 }, "*");
+      window.parent?.postMessage(msg, "*");
     } catch {
       /* not framed */
     }
   };
+  const size = (expanded: boolean) => post({ jarvis: "size", h: expanded ? 384 : 72 });
   useEffect(() => {
     size(open || live !== "off" || lines.length > 0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, live, lines.length]);
 
   const push = (l: Line) => setLines((p) => [...p.slice(-7), l]);
@@ -68,6 +70,7 @@ export default function Embed() {
       m.startWake(() => {
         setWakeState(false);
         m.chime();
+        post({ jarvis: "wake" }); // summon the widget on the host page
         void startLiveMode();
       });
       setWakeState(true);
@@ -227,7 +230,15 @@ export default function Embed() {
             <a href="/" target="_blank" rel="noreferrer" className="hud-label rounded px-1 hover:text-cyan" title="open full JARVIS">
               ↗
             </a>
-            <button onClick={() => { setLines([]); setOpen(false); }} className="hud-label rounded px-1 hover:text-cyan" title="collapse">
+            <button
+              onClick={() => {
+                setLines([]);
+                setOpen(false);
+                post({ jarvis: "hide" }); // tuck away — wake word keeps listening
+              }}
+              className="hud-label rounded px-1 hover:text-cyan"
+              title="hide (say 'hey jarvis' to bring me back)"
+            >
               ▾
             </button>
           </span>

@@ -495,6 +495,77 @@ function Viewport({
   );
 }
 
+// The video window: ONE iframe that never remounts (playback survives), whose
+// geometry morphs between "fill the stage, 16:9" and "picture-in-picture pill"
+// with a smooth animated transition.
+function VideoDock({
+  panel,
+  pip,
+  setPip,
+  onClose,
+  stageRef,
+  iframeRef,
+}: {
+  panel: { value: string; title?: string };
+  pip: boolean;
+  setPip: (v: boolean) => void;
+  onClose: () => void;
+  stageRef: React.RefObject<HTMLDivElement | null>;
+  iframeRef: React.MutableRefObject<HTMLIFrameElement | null>;
+}) {
+  const [rect, setRect] = useState<{ t: number; l: number; w: number; h: number } | null>(null);
+  useEffect(() => {
+    const upd = () => {
+      const el = stageRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      setRect((p) => (p && Math.abs(p.t - r.top) < 1 && Math.abs(p.l - r.left) < 1 && Math.abs(p.w - r.width) < 1 && Math.abs(p.h - r.height) < 1 ? p : { t: r.top, l: r.left, w: r.width, h: r.height }));
+    };
+    upd();
+    const ro = new ResizeObserver(upd);
+    if (stageRef.current) ro.observe(stageRef.current);
+    window.addEventListener("resize", upd);
+    window.addEventListener("scroll", upd, true);
+    const iv = setInterval(upd, 300); // track the chat-collapse animation
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", upd);
+      window.removeEventListener("scroll", upd, true);
+      clearInterval(iv);
+    };
+  }, [stageRef]);
+  if (!rect) return null;
+  const style: React.CSSProperties = pip
+    ? { top: window.innerHeight - 292, left: window.innerWidth - 372, width: 356, height: 240 }
+    : { top: rect.t + 4, left: rect.l + 4, width: rect.w - 8, height: rect.h - 8 };
+  return (
+    <div className="glass fixed z-40 flex flex-col overflow-hidden rounded-2xl shadow-2xl transition-all duration-500 ease-in-out" style={style}>
+      <div className="flex items-center justify-between border-b border-white/5 px-3 py-1.5">
+        <span className="hud-label truncate !text-cyan-dim">{panel.title ?? "video"}</span>
+        <span className="flex shrink-0 gap-1">
+          <button onClick={() => setPip(!pip)} className="hud-label rounded px-2 py-0.5 hover:text-cyan" title={pip ? "back to the big screen" : "shrink to mini player"}>
+            {pip ? "⛶ big" : "▾ mini"}
+          </button>
+          <button onClick={onClose} className="hud-label rounded px-2 py-0.5 hover:text-red-300" title="close video">
+            ✕
+          </button>
+        </span>
+      </div>
+      <div className="flex min-h-0 flex-1 items-center justify-center bg-black">
+        <iframe
+          ref={iframeRef}
+          src={panel.value}
+          className="block"
+          style={{ aspectRatio: "16/9", height: "100%", width: "auto", maxWidth: "100%" }}
+          sandbox="allow-scripts allow-same-origin allow-presentation allow-popups"
+          allow="autoplay; encrypted-media; picture-in-picture"
+          allowFullScreen
+        />
+      </div>
+    </div>
+  );
+}
+
 export default function JarvisUI() {
   const thread = (useQuery(api.ui.getActiveThread, {}) ?? "main") as string;
   const threads = (useQuery(api.ui.getThreads, {}) ?? []) as { id: string; title: string; at: number }[];
@@ -532,9 +603,11 @@ export default function JarvisUI() {
   const [panelMin, setPanelMin] = useState(false);
   const lastPanelAt = useRef(0);
   useEffect(() => {
+    panelTypeRef.current = panel?.type ?? null;
     if (panel && panel.updatedAt !== lastPanelAt.current) {
       lastPanelAt.current = panel.updatedAt;
       setPanelMin(false);
+      if (panel.type === "video") setVideoPip(false); // fresh video opens big, 16:9
       // Content-first moments (briefing, calendar, maps, library, documents,
       // launches): the chat steps aside on its own — expand it back any time.
       let focus = ["canvas", "creations", "pdf", "launch", "trip"].includes(panel.type);
@@ -565,6 +638,37 @@ export default function JarvisUI() {
   useEffect(() => {
     panelFullRef.current = panelFull;
   }, [panelFull]);
+
+  // Chat history drawer + intelligent video handling (16:9 stage / PiP corner)
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const [videoPip, setVideoPip] = useState(false);
+  const panelTypeRef = useRef<string | null>(null);
+  const videoIframeRef = useRef<HTMLIFrameElement | null>(null);
+  const videoCmd = useQuery(api.ui.getVideoCmd, {}) as { value: string; updatedAt: number } | null | undefined;
+  const lastVideoCmd = useRef(-1);
+  // The brain's video remote: relay play/pause into the YouTube iframe, close kills it.
+  useEffect(() => {
+    if (!videoCmd) return;
+    if (lastVideoCmd.current === -1) {
+      lastVideoCmd.current = videoCmd.updatedAt; // stale command from before load
+      return;
+    }
+    if (videoCmd.updatedAt === lastVideoCmd.current) return;
+    lastVideoCmd.current = videoCmd.updatedAt;
+    if (videoCmd.value === "close") {
+      setVideoPip(false);
+      void clearPanel({});
+      return;
+    }
+    const f = videoIframeRef.current;
+    if (f?.contentWindow) {
+      const func = videoCmd.value === "play" ? "playVideo" : "pauseVideo";
+      f.contentWindow.postMessage(JSON.stringify({ event: "listening", id: "jarvis" }), "*");
+      f.contentWindow.postMessage(JSON.stringify({ event: "command", func, args: [] }), "*");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoCmd]);
 
   // Chat presence: full column ↔ floating type bar ↔ hidden ("zen"). Zen keeps
   // JARVIS always listening (wake word forced on) with no chrome in the way.
@@ -798,9 +902,10 @@ export default function JarvisUI() {
     void claimVoice({ client: me.current });
     import("../lib/tts").then((m) => m.warm());
     setInput("");
-    // new message → viewport folds away, orb returns (only in full chat — in
-    // bar/zen the content IS the point, keep it up)
-    if (panel && !panelFull && chatModeRef.current === "full") setPanelMin(true);
+    // new message: a playing video shrinks to picture-in-picture (keeps
+    // playing); other panels fold away in full-chat mode only
+    if (panel?.type === "video") setVideoPip(true);
+    else if (panel && !panelFull && chatModeRef.current === "full") setPanelMin(true);
     if (liveRef.current) {
       // Live session is the single brain while it's on — no parallel text answer.
       const rt = await import("../lib/realtime");
@@ -885,7 +990,8 @@ export default function JarvisUI() {
         void logTurn({ threadId: threadRef.current, role, text, model: role === "assistant" ? "live" : undefined });
         if (role === "user") {
           void claimVoice({ client: me.current });
-          if (!panelFullRef.current) setPanelMin((min) => min || lastPanelAt.current < Date.now() - 8000);
+          if (panelTypeRef.current === "video") setVideoPip(true); // talking over a video → mini player
+          else if (!panelFullRef.current) setPanelMin((min) => min || lastPanelAt.current < Date.now() - 8000);
           lastLiveUser.current = text;
         }
         else if (lastLiveUser.current) {
@@ -985,6 +1091,13 @@ export default function JarvisUI() {
           >
             {wake ? "◉ hey jarvis" : "wake"}
           </button>
+          <button
+            onClick={() => setChatMode(chatMode === "full" ? "bar" : chatMode === "bar" ? "off" : "full")}
+            title="chat layout — full column / type bar / hidden (always listening)"
+            className="hud-label rounded px-1 transition hover:text-cyan"
+          >
+            {chatMode === "full" ? "▤ chat" : chatMode === "bar" ? "▁ bar" : "◌ zen"}
+          </button>
           <Clock />
           <button
             onClick={async () => {
@@ -1008,12 +1121,10 @@ export default function JarvisUI() {
       </header>
 
       <div
-        className={`mx-auto w-full max-w-[1720px] flex-1 gap-4 p-4 pt-2 ${
-          chatMode === "full" ? "grid md:grid-cols-[1.6fr_0.95fr]" : `flex flex-col ${chatMode === "bar" ? "pb-24" : ""}`
-        }`}
+        className={`mx-auto flex w-full max-w-[1720px] flex-1 flex-col gap-4 p-4 pt-2 md:flex-row ${chatMode === "bar" ? "pb-24" : ""}`}
       >
-        {/* the stage: orb / viewport / agent view */}
-        <div className={`brackets relative ${chatMode === "full" ? "min-h-[46vh] md:min-h-[72vh]" : "min-h-[58vh] flex-1 md:min-h-[78vh]"}`}>
+        {/* the stage: orb / viewport / agent view — expands live as chat collapses */}
+        <div ref={stageRef} className="brackets relative min-h-[52vh] flex-1 transition-all duration-500 md:min-h-[76vh]">
           <span className="bk" />
           {live === "live" && <div className="live-ring pointer-events-none absolute inset-2 rounded-full opacity-60" />}
           {(activeJobs.length > 0 || (panel && panelMin)) && (
@@ -1046,7 +1157,7 @@ export default function JarvisUI() {
               ))}
             </div>
           )}
-          {panel && !panelMin && !panelFull ? (
+          {panel && panel.type !== "video" && !panelMin && !panelFull ? (
             <div className="absolute inset-0 z-20 p-1">
               <Viewport
                 panel={panel}
@@ -1087,39 +1198,24 @@ export default function JarvisUI() {
           </div>
         </div>
 
-        {/* conversation column */}
-        {chatMode === "full" && (
-        <div className="glass flex h-[52vh] flex-col overflow-hidden rounded-2xl md:h-[78vh]">
+        {/* conversation column — animates closed instead of vanishing */}
+        <div
+          className={`shrink-0 overflow-hidden transition-all duration-500 ease-in-out ${
+            chatMode === "full" ? "max-h-[52vh] w-full opacity-100 md:max-h-none md:w-[400px]" : "max-h-0 w-full opacity-0 md:w-0"
+          }`}
+        >
+        <div className="glass flex h-[52vh] w-full flex-col overflow-hidden rounded-2xl md:h-[78vh] md:w-[400px]">
           <div className="flex items-center gap-2 border-b border-white/5 px-3 py-1.5">
-            <select
-              value={thread}
-              onChange={(e) => void setActiveThread({ thread: e.target.value })}
-              className="hud-label min-w-0 flex-1 cursor-pointer truncate rounded bg-transparent py-0.5 outline-none hover:text-cyan"
+            <button
+              onClick={() => setDrawerOpen(true)}
+              className="hud-label rounded px-1.5 py-0.5 hover:text-cyan"
               title="chat history"
             >
-              {!threads.find((t) => t.id === thread) && <option value={thread}>{thread === "main" ? "main chat" : thread}</option>}
-              {threads.map((t) => (
-                <option key={t.id} value={t.id} className="bg-abyss text-ice">
-                  {t.id === "main" ? "main chat" : t.title}
-                </option>
-              ))}
-            </select>
-            <button
-              onClick={() => void setActiveThread({ thread: `t${Date.now().toString(36)}` })}
-              className="hud-label rounded px-1.5 py-0.5 hover:text-cyan"
-              title="start a fresh chat (this one stays in history)"
-            >
-              + new
+              ☰
             </button>
-            <button
-              onClick={() => {
-                if (confirm("Clear this chat's messages for good?")) void clearThread({ threadId: thread });
-              }}
-              className="hud-label rounded px-1.5 py-0.5 hover:text-red-300"
-              title="wipe this chat"
-            >
-              clear
-            </button>
+            <span className="hud-label min-w-0 flex-1 truncate">
+              {thread === "main" ? "main chat" : threads.find((t) => t.id === thread)?.title ?? thread}
+            </span>
             <button
               onClick={() => setChatMode("bar")}
               className="hud-label rounded px-1.5 py-0.5 hover:text-cyan"
@@ -1229,7 +1325,77 @@ export default function JarvisUI() {
             </button>
           </div>
         </div>
-        )}
+        </div>
+      </div>
+
+      {/* the video window — never remounts, morphs stage ↔ picture-in-picture */}
+      {panel && panel.type === "video" && !panelMin && (
+        <VideoDock
+          panel={panel}
+          pip={videoPip}
+          setPip={setVideoPip}
+          onClose={() => {
+            setVideoPip(false);
+            void clearPanel({});
+          }}
+          stageRef={stageRef}
+          iframeRef={videoIframeRef}
+        />
+      )}
+
+      {/* threads drawer — chat history in a slide-out */}
+      <div
+        className={`fixed inset-0 z-50 transition-opacity duration-300 ${drawerOpen ? "opacity-100" : "pointer-events-none opacity-0"}`}
+        onClick={() => setDrawerOpen(false)}
+      >
+        <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className={`glass absolute left-0 top-0 flex h-full w-[300px] flex-col rounded-r-2xl transition-transform duration-300 ease-out ${
+            drawerOpen ? "translate-x-0" : "-translate-x-full"
+          }`}
+        >
+          <div className="flex items-center justify-between border-b border-white/5 px-4 py-3">
+            <span className="hud-label !text-cyan">chats</span>
+            <button onClick={() => setDrawerOpen(false)} className="hud-label rounded px-1.5 hover:text-cyan">✕</button>
+          </div>
+          <div className="scrollbar-thin min-h-0 flex-1 space-y-1 overflow-y-auto p-2">
+            {[{ id: "main", title: "main chat", at: 0 }, ...threads.filter((t) => t.id !== "main")].map((t) => (
+              <button
+                key={t.id}
+                onClick={() => {
+                  void setActiveThread({ thread: t.id });
+                  setDrawerOpen(false);
+                }}
+                className={`block w-full truncate rounded-lg px-3 py-2 text-left text-sm transition ${
+                  thread === t.id ? "bg-cyan/10 text-cyan ring-1 ring-cyan/30" : "text-ice hover:bg-white/5"
+                }`}
+              >
+                {t.title || t.id}
+              </button>
+            ))}
+          </div>
+          <div className="flex gap-2 border-t border-white/5 p-3">
+            <button
+              onClick={() => {
+                void setActiveThread({ thread: `t${Date.now().toString(36)}` });
+                setDrawerOpen(false);
+              }}
+              className="flex-1 rounded-xl bg-cyan/15 px-3 py-2 text-xs font-medium text-cyan ring-1 ring-cyan/40 hover:bg-cyan/25"
+            >
+              + new chat
+            </button>
+            <button
+              onClick={() => {
+                if (confirm("Clear this chat's messages for good?")) void clearThread({ threadId: thread });
+                setDrawerOpen(false);
+              }}
+              className="rounded-xl bg-red-500/10 px-3 py-2 text-xs text-red-300 ring-1 ring-red-500/30 hover:bg-red-500/20"
+            >
+              clear
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* bar mode: chat collapsed to a floating type bar — the screen gets the room */}
