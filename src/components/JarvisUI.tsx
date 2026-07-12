@@ -133,20 +133,20 @@ function panelSize(panel: { type: string; value: string }): string {
     case "w:timer":
       return "w-[min(500px,94%)] h-[460px]";
     case "w:weather":
-      return "w-[min(780px,96%)] h-[min(600px,96%)]";
+      return "w-[min(940px,86%)] h-[min(660px,92%)]";
     case "w:market":
-      return "w-[min(880px,96%)] h-[min(500px,90%)]";
+      return "w-[min(1020px,86%)] h-[min(560px,90%)]";
     case "image":
       return "w-[min(1100px,97%)] h-[min(760px,97%)]";
     case "w:candles":
       return "w-[min(1360px,98%)] h-[min(780px,96%)]";
     case "w:stats":
-      return "w-[min(1000px,97%)] h-[min(640px,94%)]";
+      return "w-[min(1160px,87%)] h-[min(700px,93%)]";
     case "w:videos":
     case "w:feed":
-      return "w-[min(1180px,94%)] h-[min(660px,90%)]";
+      return "w-[min(1420px,87%)] h-[min(760px,93%)]";
     case "w:shop":
-      return "w-[min(1240px,96%)] h-[min(600px,90%)]";
+      return "w-[min(1420px,87%)] h-[min(690px,93%)]";
     case "markdown":
       return "w-[min(980px,97%)] h-full";
     default:
@@ -308,12 +308,12 @@ function OrbitBubble({
         if (startX.current == null) return;
         const d = e.clientX - startX.current;
         if (Math.abs(d) > 6) dragging.current = true;
-        setDx(Math.min(0, d));
+        setDx(d);
       }}
       onPointerUp={() => {
         if (startX.current == null) return;
         startX.current = null;
-        if (dx < -52) onDismiss();
+        if (Math.abs(dx) > 52) onDismiss();
         else setDx(0);
         setTimeout(() => (dragging.current = false), 0);
       }}
@@ -326,7 +326,7 @@ function OrbitBubble({
         if (!dragging.current) onOpen();
       }}
       className={`bob glass group relative h-16 w-16 overflow-hidden rounded-full !border-cyan/30 shadow-xl hover:scale-125 hover:!border-cyan/70 ${dx === 0 ? "transition-all duration-300" : ""}`}
-      style={{ animationDelay: `${delay}s`, transform: dx ? `translateX(${dx}px)` : undefined, opacity: dx ? Math.max(0.15, 1 + dx / 90) : undefined, touchAction: "pan-y" }}
+      style={{ animationDelay: `${delay}s`, transform: dx ? `translateX(${dx}px)` : undefined, opacity: dx ? Math.max(0.15, 1 - Math.abs(dx) / 90) : undefined, touchAction: "pan-y" }}
       title={`${b.title ?? b.type} — drag left to dismiss`}
     >
       {yt ? (
@@ -1461,7 +1461,7 @@ export default function JarvisUI() {
           {live === "live" && <div className="live-ring pointer-events-none absolute inset-2 rounded-full opacity-60" />}
           {/* orbit bubbles — demoted panels bobbing beside the orb */}
           {bubbles.length > 0 && (
-            <div className="absolute left-4 top-1/2 z-10 flex -translate-y-1/2 flex-col gap-4">
+            <div className="absolute right-3 top-1/2 z-30 flex -translate-y-1/2 flex-col gap-4 md:right-4">
               {bubbles.map((b, i) => (
                 <OrbitBubble
                   key={(b.title ?? b.type) + i}
@@ -1511,7 +1511,7 @@ export default function JarvisUI() {
             className={`h-full w-full transition-all duration-[900ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
               panel && !panelMin && !panelFull
                 ? panel.type !== "video" && stagePanelSize !== "h-full w-full"
-                  ? "opacity-[0.14] md:translate-x-[36%] md:scale-[0.38] md:opacity-95"
+                  ? "opacity-[0.14] md:translate-x-[39%] md:scale-[0.52] md:opacity-95"
                   : "opacity-[0.12]"
                 : "opacity-100"
             }`}
