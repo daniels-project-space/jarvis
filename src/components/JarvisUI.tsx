@@ -3,8 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
-import ThreeOrbClassic from "./ThreeOrbClassic";
-import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView } from "./Views";
+import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View } from "./Views";
 import TripView from "./TripView";
 import BoardView from "./BoardView";
 
@@ -59,6 +58,8 @@ const WIDGET_ICON: Record<string, string> = {
   market: "📈",
   timer: "⏱",
   briefing: "📋",
+  briefing2: "📋",
+  todos: "☑",
   calendar: "📅",
   candles: "📈",
   videos: "📺",
@@ -289,6 +290,8 @@ function WidgetView({ value }: { value: string }) {
   if (w?.kind === "candles") return <CandlesView w={w} />;
   if (w?.kind === "videos") return <VideoListView value={value} />;
   if (w?.kind === "feed") return <FeedView value={value} />;
+  if (w?.kind === "todos") return <TodosView value={value} />;
+  if (w?.kind === "briefing2") return <Briefing2View value={value} />;
   if (w?.kind === "market") {
     return (
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6">
@@ -645,6 +648,24 @@ export default function JarvisUI() {
 
   const endRef = useRef<HTMLDivElement>(null);
   const lastSpokenId = useRef<string | null>(null);
+  const lastSpokenText = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
+  const nudgeQueue = useRef<string[]>([]);
+  const captionRef = useRef<Caption>(null);
+  const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flushNudges = () => {
+    if (flushTimer.current) return;
+    flushTimer.current = setTimeout(() => {
+      flushTimer.current = null;
+      if (!liveRef.current) return;
+      if (captionRef.current) {
+        flushNudges(); // someone's mid-sentence — check again shortly
+        return;
+      }
+      const text = nudgeQueue.current.shift();
+      if (text) import("../lib/realtime").then((m) => m.nudgeLive(text));
+      if (nudgeQueue.current.length) flushNudges();
+    }, 1800);
+  };
   const energyRef = useRef(0);
   const recRef = useRef<MediaRecorder | null>(null);
   const liveRef = useRef(false);
@@ -659,24 +680,37 @@ export default function JarvisUI() {
     panelFullRef.current = panelFull;
   }, [panelFull]);
 
-  // Orb style: the ethanplusai particle-network orb (default) vs the classic
-  // icosphere — toggle in the header, remembered per device.
-  const [orbStyle, setOrbStyle] = useState<"particles" | "classic">("particles");
-  useEffect(() => {
+
+  // Finished background work → bottom popup cards (stack of 3, click to expand
+  // into the distilled breakdown, auto-gone after 5 hours, dismissable).
+  const findingsRecent = (useQuery(api.findings.recent, { limit: 8 }) ?? []) as {
+    _id: string;
+    spoken: string;
+    detail: string;
+    source: string;
+    createdAt: number;
+  }[];
+  const [dismissed, setDismissed] = useState<Set<string>>(() => {
     try {
-      if (localStorage.getItem("jarvis_orb") === "classic") setOrbStyle("classic");
+      return new Set(JSON.parse(localStorage.getItem("jarvis_dismissed") ?? "[]"));
     } catch {
-      /* private mode */
+      return new Set();
     }
-  }, []);
-  const toggleOrbStyle = () => {
-    const next = orbStyle === "particles" ? "classic" : "particles";
-    setOrbStyle(next);
-    try {
-      localStorage.setItem("jarvis_orb", next);
-    } catch {
-      /* private mode */
-    }
+  });
+  const [expandedFinding, setExpandedFinding] = useState<string | null>(null);
+  const popups = findingsRecent
+    .filter((f) => Date.now() - f.createdAt < 5 * 60 * 60 * 1000 && !dismissed.has(f._id) && f.spoken)
+    .slice(0, 3);
+  const dismissFinding = (id: string) => {
+    setDismissed((d) => {
+      const nd = new Set(d);
+      nd.add(id);
+      try {
+        localStorage.setItem("jarvis_dismissed", JSON.stringify([...nd].slice(-60)));
+      } catch { /* private mode */ }
+      return nd;
+    });
+    if (expandedFinding === id) setExpandedFinding(null);
   };
 
   // Orb mood: the brain sets a tone colour; the orb drifts into it slowly.
@@ -934,11 +968,16 @@ export default function JarvisUI() {
     }
     lastSpokenId.current = last._id;
     if (last.model === "live" || !last.text) return;
+    // never say the exact same thing twice in a row (root of "sends results twice")
+    if (last.text === lastSpokenText.current.text && Date.now() - lastSpokenText.current.ts < 20_000) return;
+    lastSpokenText.current = { text: last.text, ts: Date.now() };
     if (liveRef.current) {
-      // Only voice true background events (agent weaves, insights — untagged rows).
-      // Model-tagged rows are replies to someone's typed message and were
-      // already delivered where they were asked.
-      if (!last.model) import("../lib/realtime").then((m) => m.nudgeLive(last.text));
+      // Background weaves NEVER interrupt: queue them and deliver only once the
+      // current exchange finishes (caption clear), woven at the end of the talk.
+      if (!last.model) {
+        nudgeQueue.current.push(last.text);
+        flushNudges();
+      }
       return;
     }
     // HARD RULE: while a live session exists on ANY device, nothing else may
@@ -1049,7 +1088,11 @@ export default function JarvisUI() {
         releaseLive();
         rearmWake();
       },
-      onCaption: (who, text, done) => setCaption(done ? null : { who, text }),
+      onCaption: (who, text, done) => {
+        const c = done ? null : { who, text } as Caption;
+        captionRef.current = c;
+        setCaption(c);
+      },
       onTurnDone: (role, text) => {
         void logTurn({ threadId: threadRef.current, role, text, model: role === "assistant" ? "live" : undefined });
         if (role === "user") {
@@ -1208,13 +1251,6 @@ export default function JarvisUI() {
           >
             {chatMode === "full" ? "▤ chat" : chatMode === "bar" ? "▁ bar" : "◌ zen"}
           </button>
-          <button
-            onClick={toggleOrbStyle}
-            title={orbStyle === "particles" ? "switch to the classic orb" : "switch to the particle-network orb"}
-            className="hud-label rounded px-1 transition hover:text-cyan"
-          >
-            ◍ orb
-          </button>
           <Clock />
           <button
             onClick={async () => {
@@ -1345,17 +1381,13 @@ export default function JarvisUI() {
               panel && !panelMin && !panelFull ? "opacity-[0.14]" : "opacity-100"
             }`}
           >
-            {orbStyle === "particles" ? (
-              <ThreeOrb state={orbState} energyRef={energyRef} moodColor={moodColor} />
-            ) : (
-              <ThreeOrbClassic state={orbState} energyRef={energyRef} />
-            )}
+            <ThreeOrb state={orbState} energyRef={energyRef} moodColor={moodColor} />
           </div>
           {/* live captions */}
           {caption && (
-            <div className="pointer-events-none absolute bottom-10 left-0 right-0 px-8 text-center">
+            <div className="pointer-events-none absolute inset-x-0 bottom-[18%] flex justify-center px-8 text-center">
               <span
-                className={`inline-block max-w-full rounded-xl px-3 py-1.5 text-sm leading-snug ${
+                className={`inline-block max-w-[820px] rounded-2xl px-5 py-2.5 text-lg font-medium leading-snug md:text-2xl ${
                   caption.who === "you" ? "text-amber" : "text-cyan"
                 }`}
                 style={{ textShadow: "0 2px 18px rgba(0,0,0,0.9)" }}
@@ -1516,6 +1548,53 @@ export default function JarvisUI() {
           stageRef={stageRef}
           iframeRef={videoIframeRef}
         />
+      )}
+
+      {/* finished-work popups — bottom-left stack, click to read the breakdown */}
+      {popups.length > 0 && !panelFull && (
+        <div className="fixed bottom-4 left-4 z-40 flex w-[min(340px,88vw)] flex-col-reverse gap-2">
+          {popups.map((f) => (
+            <div key={f._id} className="rise glass overflow-hidden rounded-xl !border-cyan/25 shadow-2xl">
+              <button onClick={() => setExpandedFinding(f._id)} className="block w-full p-3 text-left transition hover:bg-white/[0.03]">
+                <div className="mb-1 flex items-center gap-1.5">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                  <span className="hud-label !text-[8px]">while you were away</span>
+                </div>
+                <div className="line-clamp-2 text-xs leading-snug text-ice">{f.spoken}</div>
+              </button>
+              <button
+                onClick={() => dismissFinding(f._id)}
+                className="absolute right-1.5 top-1.5 rounded px-1 text-[10px] text-slate hover:text-red-300"
+                title="dismiss"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      {expandedFinding && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={() => setExpandedFinding(null)}>
+          {(() => {
+            const f = findingsRecent.find((x) => x._id === expandedFinding);
+            if (!f) return null;
+            return (
+              <div onClick={(e) => e.stopPropagation()} className="glass max-h-[80vh] w-[min(720px,94vw)] overflow-hidden rounded-2xl !border-cyan/30">
+                <div className="flex items-center justify-between border-b border-white/5 px-5 py-3">
+                  <span className="hud-label !text-cyan">work done while you were away</span>
+                  <span className="flex gap-2">
+                    <button onClick={() => dismissFinding(f._id)} className="hud-label rounded px-1.5 hover:text-red-300">dismiss</button>
+                    <button onClick={() => setExpandedFinding(null)} className="hud-label rounded px-1.5 hover:text-cyan">close</button>
+                  </span>
+                </div>
+                <div className="scrollbar-thin max-h-[65vh] overflow-y-auto p-5">
+                  <p className="mb-4 text-lg font-medium leading-relaxed text-ice">{f.spoken}</p>
+                  <div className="whitespace-pre-wrap text-[15px] leading-relaxed text-ice/85">{f.detail}</div>
+                </div>
+              </div>
+            );
+          })()}
+        </div>
       )}
 
       {/* threads drawer — chat history in a slide-out */}

@@ -125,6 +125,196 @@ export function CalendarView({ value }: { value: string }) {
   );
 }
 
+/* ---------------------------------- tickable to-dos ---------------------------------- */
+
+export function TodosView({ value }: { value: string }) {
+  let w: { label: string; items: { text: string; due?: string | null; tags?: string[]; why?: string }[] } | null = null;
+  try {
+    w = JSON.parse(value);
+  } catch {
+    /* noop */
+  }
+  const [ticked, setTicked] = useState<Set<string>>(new Set());
+  if (!w) return <pre className="p-4 text-sm text-ice">{value}</pre>;
+  const tick = (text: string) => {
+    setTicked((t) => new Set(t).add(text));
+    void fetch("/api/tools", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "todo_done", args: { match: text.slice(0, 60) } }),
+    });
+  };
+  return (
+    <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-4">
+      <div className="hud-label mb-3">{w.label}</div>
+      <div className="mx-auto max-w-2xl space-y-2">
+        {w.items.map((t, i) => {
+          const done = ticked.has(t.text);
+          return (
+            <div key={i} className="tile rise flex items-start gap-3 p-3" style={{ animationDelay: `${i * 40}ms` }}>
+              <button
+                onClick={() => !done && tick(t.text)}
+                className={`mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-lg border transition-all duration-300 ${
+                  done ? "border-cyan bg-cyan text-black" : "border-white/20 hover:border-cyan/60"
+                }`}
+              >
+                {done ? "✓" : ""}
+              </button>
+              <div className="min-w-0 flex-1">
+                <div className={`text-[15px] leading-snug transition-all duration-300 ${done ? "text-slate line-through" : "text-ice"}`}>{t.text}</div>
+                <div className="mt-0.5 flex gap-2 text-[10px] text-slate">
+                  {t.why && <span className="text-cyan/80">{t.why}</span>}
+                  {t.due && <span>due {t.due}</span>}
+                  {(t.tags ?? []).map((g) => (
+                    <span key={g} className="rounded bg-white/5 px-1">{g}</span>
+                  ))}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------- briefing 2.0 ---------------------------------- */
+
+export function Briefing2View({ value }: { value: string }) {
+  let w: any = null;
+  try {
+    w = JSON.parse(value);
+  } catch {
+    /* noop */
+  }
+  const [ticked, setTicked] = useState<Set<string>>(new Set());
+  if (!w) return <pre className="p-4 text-sm text-ice">{value}</pre>;
+  const tick = (text: string) => {
+    setTicked((t) => new Set(t).add(text));
+    void fetch("/api/tools", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "todo_done", args: { match: text.slice(0, 60) } }),
+    });
+  };
+  const toPct = (hhmm: string) => {
+    const [h, m] = String(hhmm).split(":").map(Number);
+    return Math.max(0, Math.min(100, (((h || 12) + (m || 0) / 60 - 7) / 15) * 100));
+  };
+  return (
+    <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
+      <div className="mx-auto max-w-4xl space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-2xl font-semibold text-ice">{w.date}</div>
+            {w.wealth != null && <div className="text-xs text-slate">net worth ≈ £{Number(w.wealth).toLocaleString("en-GB")}</div>}
+          </div>
+          {w.weather && (
+            <div className="tile flex items-center gap-3 px-4 py-2.5">
+              <span className="text-4xl">{w.weather.icon}</span>
+              <div>
+                <div className="text-2xl font-semibold text-ice">{w.weather.temp}°</div>
+                <div className="text-[10px] text-slate">{w.weather.desc}</div>
+              </div>
+              <div className="ml-2 hidden gap-1 sm:flex">
+                {(w.weather.hours ?? []).map((h: any, i: number) => (
+                  <div key={i} className="flex flex-col items-center px-1 text-[9px] text-slate">
+                    <span>{h.h}</span>
+                    <span className="text-sm">{h.icon}</span>
+                    <span className="text-ice">{h.t}°</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="tile rise p-4 pb-2">
+          <div className="hud-label mb-14">rentals today · {w.awayCount} out</div>
+          <div className="relative mx-2 mb-14 h-1 rounded-full bg-white/10">
+            {["07", "10", "13", "16", "19", "22"].map((h, i) => (
+              <span key={h} className="absolute top-3 -translate-x-1/2 text-[9px] text-slate/70" style={{ left: `${(i / 5) * 100}%` }}>
+                {h}:00
+              </span>
+            ))}
+            {(w.rentals ?? []).map((r: any, i: number) => (
+              <div
+                key={i}
+                className="absolute -translate-x-1/2"
+                style={{ left: `${toPct(r.time)}%`, top: i % 2 === 0 ? "-54px" : "18px" }}
+              >
+                <div className={`tile w-max max-w-[150px] px-2.5 py-1.5 text-center ${r.kind === "pickup" ? "!border-amber/40" : ""}`}>
+                  <div className={`text-[9px] font-semibold uppercase tracking-widest ${r.kind === "pickup" ? "text-amber" : "text-sky-300"}`}>
+                    {r.kind} · {r.time}
+                  </div>
+                  <div className="truncate text-[11px] text-ice">{r.name}</div>
+                </div>
+              </div>
+            ))}
+            {!(w.rentals ?? []).length && <div className="absolute inset-x-0 -top-8 text-center text-xs text-slate">no movements today</div>}
+          </div>
+        </div>
+
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="tile rise p-4" style={{ animationDelay: "60ms" }}>
+            <div className="hud-label mb-2">picked for today</div>
+            <div className="space-y-2">
+              {(w.todos ?? []).map((t: any, i: number) => {
+                const done = ticked.has(t.text);
+                return (
+                  <div key={i} className="flex items-start gap-2.5">
+                    <button
+                      onClick={() => !done && tick(t.text)}
+                      className={`mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-md border text-xs transition-all ${
+                        done ? "border-cyan bg-cyan text-black" : "border-white/20 hover:border-cyan/60"
+                      }`}
+                    >
+                      {done ? "✓" : ""}
+                    </button>
+                    <div className="min-w-0">
+                      <div className={`text-[13px] leading-snug ${done ? "text-slate line-through" : "text-ice"}`}>{t.text}</div>
+                      {t.why && <div className="text-[10px] text-cyan/70">{t.why}</div>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="space-y-4">
+            <div className="tile rise p-4" style={{ animationDelay: "120ms" }}>
+              <div className="hud-label mb-2">coming up</div>
+              {(w.calendar ?? []).length ? (
+                (w.calendar ?? []).map((e: any, i: number) => (
+                  <div key={i} className="flex items-baseline justify-between gap-2 py-1 text-[13px]">
+                    <span className="truncate text-ice">{e.title}</span>
+                    <span className="shrink-0 text-[11px] text-cyan/80">{e.when}</span>
+                  </div>
+                ))
+              ) : (
+                <div className="text-xs text-slate">calendar clear</div>
+              )}
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              {(w.markets ?? []).map((r: any, i: number) => (
+                <div key={i} className="tile rise px-2 py-3 text-center" style={{ animationDelay: `${160 + i * 50}ms` }}>
+                  <div className="hud-label !text-[8px]">{r.label}</div>
+                  <div className="mt-0.5 text-sm font-semibold text-ice">
+                    {r.unit}
+                    {Number(r.price).toLocaleString("en-US")}
+                  </div>
+                  <div className={`text-[10px] ${r.change >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                    {r.change >= 0 ? "▲" : "▼"} {Math.abs(r.change)}%
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ---------------------------------- weather (day · week · live map) ---------------------------------- */
 
 export function WeatherView({ w }: { w: any }) {

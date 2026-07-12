@@ -547,6 +547,16 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "todo_list",
+    description: "Pull up Daniel's ACTUAL to-do list from the hub as a tickable widget on screen — he can check items off right there. Use for 'show my todos / what's on my list'.",
+    parameters: { type: "object", properties: { _noop: { type: "string" } } },
+  },
+  {
+    name: "net_worth",
+    description: "Daniel's net worth as a visual dashboard: total, cashflow, expenses, rental income, and the full asset breakdown by category as charts. Use for 'net worth / how's my money / portfolio'.",
+    parameters: { type: "object", properties: { _noop: { type: "string" } } },
+  },
+  {
     name: "plan_my_day",
     description:
       "Build Daniel a PRIORITISED, time-blocked plan for the day: combines his open to-dos, calendar events, rental pickups/returns and deadlines into a realistic schedule with reasoning. Shows the plan on screen; offer to write the blocks into his calendar. Use for 'plan my day / what should I focus on / structure my day'.",
@@ -1130,61 +1140,69 @@ async function timerWidget(args: any): Promise<string> {
 
 async function briefingWidget(): Promise<string> {
   const today = new Date().toISOString().slice(0, 10);
-  const [w, strip, todos, events, wealth, markets] = await Promise.all([
+  const [w, strip, todos, events, wealth, markets, mem] = await Promise.all([
     fetchWeatherData("London").catch(() => null),
-    rentalQuery("calendar:getCalendarStrip", { accountSlug: null, startDate: today, days: 2 }),
+    rentalQuery("calendar:getCalendarStrip", { accountSlug: null, startDate: today, days: 1 }),
     q_hub("todos:list"),
     q_hub("events:list"),
     q_hub("wealth:getWealth"),
     fetchMarketData(["bitcoin", "ethereum"], ["GC=F"]).catch(() => []),
+    convexQuery("memory:recent", { limit: 8 }).catch(() => []),
   ]);
-  const short = (s: string) => String(s || "").split(/[|,]/)[0].split(/\s+/).slice(0, 4).join(" ");
+  const short = (x: string) => String(x || "").split(/[|,]/)[0].split(/\s+/).slice(0, 4).join(" ");
   const day0 = Array.isArray(strip) ? strip[0] : null;
-  const rentalLines: string[] = [];
-  if (day0) {
-    rentalLines.push(`${(day0.away ?? []).length} out`);
-    for (const p of (day0.pickups ?? []).slice(0, 4)) rentalLines.push(`pickup: ${short(p.items?.[0]?.name ?? p.imageAlt)}${p.pickupTime ? " " + p.pickupTime : ""}`);
-    for (const r of (day0.returns ?? []).slice(0, 4)) rentalLines.push(`return: ${short(r.items?.[0]?.name ?? r.imageAlt)}`);
-  }
-  const openTodos = (Array.isArray(todos) ? todos : []).filter((t: any) => !t.done);
+  // rentals as a TIMELINE: markers with times + cards
+  const rentalMarks: { time: string; kind: string; name: string }[] = [];
+  for (const pck of day0?.pickups ?? []) rentalMarks.push({ time: pck.pickupTime || "12:00", kind: "pickup", name: short(pck.items?.[0]?.name ?? pck.imageAlt ?? "item") });
+  for (const r of day0?.returns ?? []) rentalMarks.push({ time: r.returnTime || "18:00", kind: "return", name: short(r.items?.[0]?.name ?? r.imageAlt ?? "item") });
+  const open = (Array.isArray(todos) ? todos : []).filter((t: any) => !t.done);
+  // DAY-RELEVANT todo pick: fast model pass with his context (memory + time)
+  let picked: { text: string; why: string }[] = [];
+  try {
+    const gk = process.env.GROQ_API_KEY ?? (await getSecret("groq", "GROQ_API_KEY").catch(() => ""));
+    const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${gk}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "llama-3.3-70b-versatile",
+        temperature: 0,
+        max_tokens: 400,
+        response_format: { type: "json_object" },
+        messages: [{ role: "user", content:
+          `It is ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London", weekday: "long", hour: "2-digit", minute: "2-digit" })} in London where Daniel is. ` +
+          `His fixed commitments today: ${rentalMarks.map((m) => m.kind + " " + m.name + " " + m.time).join("; ") || "none"}. ` +
+          `Recent context about him: ${(Array.isArray(mem) ? mem : []).map((x: any) => x.title).join("; ").slice(0, 500)}. ` +
+          `From his open to-dos below, pick the 4-6 genuinely DOABLE TODAY given the time left and his context; for each give a 5-word why. ` +
+          `STRICT JSON {"picks":[{"text":"<exact todo text>","why":"..."}]}.
+TODOS: ${open.slice(0, 20).map((t: any) => JSON.stringify(String(t.text).slice(0, 90))).join(", ")}` }],
+      }),
+      signal: AbortSignal.timeout(12_000),
+    });
+    const pj: any = await resp.json();
+    picked = (JSON.parse(pj.choices?.[0]?.message?.content ?? "{}").picks ?? []).slice(0, 6);
+  } catch { /* fall back below */ }
+  if (!picked.length) picked = open.slice(0, 5).map((t: any) => ({ text: String(t.text).slice(0, 90), why: "" }));
   const now = Date.now();
-  const upcoming = (Array.isArray(events) ? events : [])
-    .filter((e: any) => (e.start ?? 0) >= now)
-    .sort((a: any, b: any) => a.start - b.start)
-    .slice(0, 3);
+  const upcoming = (Array.isArray(events) ? events : []).filter((e: any) => (e.start ?? 0) >= now).sort((a: any, b: any) => a.start - b.start).slice(0, 4);
   const widget = {
-    kind: "briefing",
+    kind: "briefing2",
     date: new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" }),
-    weather: w ? { icon: w.icon, temp: w.temp, desc: w.desc, place: w.place } : null,
-    wealth: wealth && typeof wealth.currentTotalGBP === "number" ? Math.round(wealth.currentTotalGBP) : null,
-    sections: [
-      { title: "rentals today", lines: rentalLines.length ? rentalLines : ["nothing scheduled"] },
-      {
-        title: `to-dos (${openTodos.length} open)`,
-        lines: openTodos.slice(0, 5).map((t: any) => String(t.text).slice(0, 60)),
-      },
-      {
-        title: "coming up",
-        lines: upcoming.length
-          ? upcoming.map((e: any) => `${e.title} — ${new Date(e.start).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}`)
-          : ["nothing on the calendar"],
-      },
-      {
-        title: "markets",
-        lines: (markets ?? []).map((r: any) => `${r.label}: ${r.unit}${r.price.toLocaleString("en-GB")} (${r.change >= 0 ? "+" : ""}${r.change}%)`),
-      },
-    ],
+    weather: w ? { icon: w.icon, temp: w.temp, desc: w.desc, hours: (w.hours ?? []).slice(0, 8) } : null,
+    wealth: wealth?.currentTotalGBP ? Math.round(wealth.currentTotalGBP) : null,
+    rentals: rentalMarks.sort((a, b) => a.time.localeCompare(b.time)),
+    awayCount: (day0?.away ?? []).length,
+    todos: picked,
+    calendar: upcoming.map((e: any) => ({
+      title: String(e.title).slice(0, 60),
+      when: new Date(e.start).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" }) + (e.allDay ? "" : " " + londonTimeStr(e.start)),
+    })),
+    markets: (markets ?? []).map((r: any) => ({ label: r.label, price: r.price, change: r.change, unit: r.unit })),
   };
   await showWidget(widget, `briefing · ${today}`);
-  const spoken = [
-    w ? `${w.temp} degrees and ${w.desc}` : "",
-    day0 ? `${(day0.pickups ?? []).length} pickups and ${(day0.returns ?? []).length} returns today` : "",
-    `${openTodos.length} to-dos open`,
-    widget.wealth ? `net worth about £${widget.wealth.toLocaleString("en-GB")}` : "",
-  ]
-    .filter(Boolean)
-    .join(", ");
-  return `Briefing on screen. Summary: ${spoken}. (Speak two short sentences max.)`;
+  return (
+    `Briefing 2.0 on screen (rentals timeline, tickable day-picks, calendar, markets). ` +
+    `Spoken summary material: ${w ? w.temp + "° " + w.desc : ""}; ${rentalMarks.length} rental movements; top pick: ${picked[0]?.text ?? "none"}. Speak two short sentences max.`
+  );
 }
 
 // project-hub reads (todos/calendar/wealth live there)
@@ -2393,6 +2411,48 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await transportRoute(args);
     case "memory_map":
       return await memoryMapTool(args);
+    case "todo_list": {
+      const todos: any[] = (await q_hub("todos:list")) ?? [];
+      const open = todos.filter((t: any) => !t.done).slice(0, 24);
+      await showWidget(
+        {
+          kind: "todos",
+          label: `to-dos · ${open.length} open`,
+          items: open.map((t: any) => ({
+            text: String(t.text).slice(0, 120),
+            due: t.dueDate ? londonDateStr(t.dueDate) : null,
+            tags: (t.tags ?? []).slice(0, 3),
+          })),
+        },
+        "to-do list",
+      );
+      return `Tickable to-do list is on screen (${open.length} open). Speak one line — maybe which one you'd tackle first.`;
+    }
+    case "net_worth": {
+      const w: any = await q_hub("wealth:getWealth");
+      if (!w) return "Couldn't reach the wealth data.";
+      const cats = Object.entries(w.byCategory ?? {}).map(([k, v]: [string, any]) => ({
+        label: k,
+        value: Math.round((v.assets ?? []).reduce((a: number, x: any) => a + (x.lastValueGBP ?? 0), 0)),
+        note: `${(v.assets ?? []).length} assets`,
+      })).filter((c) => c.value > 0).sort((a, b) => b.value - a.value).slice(0, 8);
+      await showWidget(
+        {
+          kind: "stats",
+          title: "Net worth",
+          kpis: [
+            { label: "net worth", value: Math.round(w.currentTotalGBP ?? 0), prefix: "£" },
+            { label: "cashflow /mo", value: Math.round(w.netCashflowGbp ?? 0), prefix: "£" },
+            { label: "expenses /mo", value: Math.round(w.expensesMonthlyGbp ?? 0), prefix: "£" },
+            { label: "rental (mo)", value: Math.round(w.confirmedRentalGbp ?? 0), prefix: "£" },
+          ],
+          bars: cats,
+          barsLabel: "by category £",
+        },
+        "net worth",
+      );
+      return `Net worth dashboard on screen: £${Math.round(w.currentTotalGBP ?? 0).toLocaleString("en-GB")} across ${w.assetCount} assets, top category ${cats[0]?.label}. One-line takeaway only.`;
+    }
     case "plan_my_day":
       return await planMyDay(args);
     case "clear_chat": {

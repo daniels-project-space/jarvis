@@ -454,22 +454,25 @@ export const agentRunner = schedules.task({
         if (job.missionId) {
           // Fleet agents stay quiet individually — findings recorded, and the
           // LAST agent to land triggers ONE synthesized mission report.
-          await convexMutation("findings:add", {
+          const fleetFid = await convexMutation("findings:add", {
             source: job.task,
             spoken: `Fleet update: "${job.label ?? job.task.slice(0, 40)}" is done.`,
             detail: result.slice(0, 8000),
-          }).catch(() => {});
+          }).catch(() => null);
+          if (fleetFid) await convexMutation("findings:markWoven", { ids: [fleetFid] }).catch(() => {});
           await maybeSynthesizeMission(job.missionId);
           return;
         }
 
         // Weave, don't dump: one natural spoken line into chat + the full detail
         // as a finding the brain can pull up ("show me what it found").
+        const needsDaniel = /(need (your|daniel)|which (one|option)|please (confirm|choose|decide)|waiting on (you|daniel)|\?\s*$)/i.test(result.slice(-400));
         const spoken =
-          (await weaveLine(bin, env, job.task, `${result}${pushNote}`)) ||
+          (needsDaniel ? "Quick one when you have a second, sir — " : "") +
+          ((await weaveLine(bin, env, job.task, `${result}${pushNote}`)) ||
           (cloneFailed
             ? `Couldn't get into ${repo}, sir — the repo name or access looks wrong.`
-            : `That background job's done${pushNote.includes("pushed") ? " and the change is live" : ""}.`);
+            : `That background job's done${pushNote.includes("pushed") ? " and the change is live" : ""}.`));
         const findingId = await convexMutation("findings:add", {
           source: job.task,
           spoken,
@@ -491,11 +494,8 @@ export const agentRunner = schedules.task({
             value: result.slice(0, 3900),
             title,
           }).catch(() => {});
-          await convexMutation("ui:setPanel", {
-            type: "markdown",
-            value: result.slice(0, 7000),
-            title,
-          }).catch(() => {});
+          // NOTE: deliberately NO ui:setPanel here — background work must never
+          // steal the overlay mid-conversation; the card + bottom popup carry it.
         }
         await sendPush("JARVIS", spoken.slice(0, 140), "/");
       } catch (e: any) {
@@ -544,7 +544,6 @@ export const agentRunner = schedules.task({
         value: report.slice(0, 3900),
         title: `mission · ${synth.goal.slice(0, 44)}`,
       }).catch(() => {});
-      await convexMutation("ui:setPanel", { type: "markdown", value: report.slice(0, 7000), title: `mission · ${synth.goal.slice(0, 44)}` }).catch(() => {});
       await sendPush("JARVIS — mission complete", synth.goal.slice(0, 120), "/");
     };
 
