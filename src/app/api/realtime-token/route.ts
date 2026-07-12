@@ -113,5 +113,5 @@ export async function POST(req: NextRequest) {
   const j = await r.json();
   if (ctx.freshFindingIds.length)
     await convexMutation("findings:markWoven", { ids: ctx.freshFindingIds }).catch(() => {});
-  return Response.json({ token: j.value, model: process.env.REALTIME_MODEL || "gpt-realtime", client });
+  return Response.json({ token: j.value, model: process.env.REALTIME_MODEL || "gpt-realtime-2.1", client });
 }
