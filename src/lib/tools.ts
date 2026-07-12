@@ -1782,18 +1782,34 @@ async function musicSearch(args: any): Promise<string> {
       if (!id || !secret) return "Spotify credentials missing from the vault.";
       const r = await fetch("https://accounts.spotify.com/api/token", {
         method: "POST",
-        headers: { "content-type": "application/x-www-form-urlencoded", Authorization: `Basic ${Buffer.from(`${id}:${secret}`).toString("base64")}` },
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          Authorization: `Basic ${Buffer.from(`${id}:${secret}`).toString("base64")}`,
+          "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        },
         body: "grant_type=client_credentials",
       });
-      const tj: any = await r.json();
+      const tokenBody = await r.text();
+      let tj: any = {};
+      try {
+        tj = JSON.parse(tokenBody);
+      } catch {
+        return `Spotify token endpoint answered non-JSON (${r.status}): ${tokenBody.slice(0, 140)}`;
+      }
       if (!tj.access_token) return `Spotify auth failed: ${JSON.stringify(tj).slice(0, 120)}`;
       spotifyToken = { value: tj.access_token, until: Date.now() + (tj.expires_in - 60) * 1000 };
     }
-    const sr: any = await (
-      await fetch(`https://api.spotify.com/v1/search?type=track&limit=10&q=${encodeURIComponent(query)}`, {
-        headers: { Authorization: `Bearer ${spotifyToken.value}` },
-      })
-    ).json();
+    const searchRes = await fetch(`https://api.spotify.com/v1/search?type=track&limit=10&q=${encodeURIComponent(query)}`, {
+      headers: { Authorization: `Bearer ${spotifyToken.value}`, "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+    });
+    const searchBody = await searchRes.text();
+    let sr: any = {};
+    try {
+      sr = JSON.parse(searchBody);
+    } catch {
+      spotifyToken = null; // maybe a stale/garbled token — refetch next time
+      return `Spotify search answered non-JSON (${searchRes.status}): ${searchBody.slice(0, 140)}`;
+    }
     const items = (sr?.tracks?.items ?? []).map((t: any) => ({
       image: t.album?.images?.[0]?.url ?? "",
       title: String(t.name).slice(0, 80),
