@@ -61,9 +61,10 @@ export const memoryVault = schedules.task({
     await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
     await sh("git", ["-C", dir, "config", "user.name", "JARVIS"], env);
 
-    const mem: any[] = (await q("memory:recent", { limit: 25 })) ?? [];
+    const mem: any[] = (await q("memory:recent", { limit: 60 })) ?? [];
     const ins: any[] = (await q("business:recentInsights", { limit: 10 })) ?? [];
     const biz: any[] = (await q("business:list", {})) ?? [];
+    const stack: any[] = (await q("projectState:list", {})) ?? [];
     const date = new Date().toISOString().slice(0, 10);
     for (const f of ["60-logs", "70-metrics", "20-projects", "30-decisions", "80-facts", "00-MOCs"])
       mkdirSync(join(dir, f), { recursive: true });
@@ -96,6 +97,26 @@ export const memoryVault = schedules.task({
           clean(rental.detail || ""),
           "",
           "Project: [[rental-manager]] · [[index]]",
+        ].join("\n"),
+      );
+    }
+
+    // living project-state notes: JARVIS keeps himself current on every app
+    // (status + what changed lately) — refreshed on every consolidation run.
+    for (const s of stack) {
+      const sl = slug(s.slug);
+      if (!sl) continue;
+      writeFileSync(
+        join(dir, "20-projects", `${sl}-state.md`),
+        [
+          `---\ntype: project-state\nproject: ${sl}\nstatus: ${clean(s.status)}\nupdated: ${date}\n---`,
+          `# ${clean(s.slug)} — current state`,
+          "",
+          `Status: **${clean(s.status)}**`,
+          clean(s.summary || ""),
+          s.data?.recent ? `\nRecently changed: ${clean(String(s.data.recent)).slice(0, 600)}` : "",
+          "",
+          `Links: [[index]] · [[${sl}]]`,
         ].join("\n"),
       );
     }
