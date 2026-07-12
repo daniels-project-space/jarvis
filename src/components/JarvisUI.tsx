@@ -1893,10 +1893,7 @@ export default function JarvisUI() {
           <div className="min-h-0 flex-1">
             <Viewport
               panel={panel}
-              onClose={() => {
-                setPanelFull(false);
-                void clearPanel({});
-              }}
+              onClose={closeStage}
               onMinimize={() => {
                 setPanelFull(false);
                 setPanelMin(true);
