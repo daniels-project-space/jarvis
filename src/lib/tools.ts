@@ -1212,11 +1212,11 @@ TODOS: ${open.slice(0, 20).map((t: any) => JSON.stringify(String(t.text).slice(0
   const now = Date.now();
   const upcoming = (Array.isArray(events) ? events : []).filter((e: any) => (e.start ?? 0) >= now).sort((a: any, b: any) => a.start - b.start).slice(0, 4);
   // crypto rows carry a real sparkline (last ~40h of closes off binance.vision)
-  const CRYPTO_PAIR: Record<string, string> = { BTC: "BTCUSDT", ETH: "ETHUSDT", SOL: "SOLUSDT", BNB: "BNBUSDT", XRP: "XRPUSDT", DOGE: "DOGEUSDT" };
+  const CRYPTO_PAIR: Record<string, string> = { BTC: "BTCUSDT", BITCOIN: "BTCUSDT", ETH: "ETHUSDT", ETHEREUM: "ETHUSDT", SOL: "SOLUSDT", SOLANA: "SOLUSDT", BNB: "BNBUSDT", BINANCECOIN: "BNBUSDT", XRP: "XRPUSDT", RIPPLE: "XRPUSDT", DOGE: "DOGEUSDT", DOGECOIN: "DOGEUSDT" };
   const sparks: Record<string, number[]> = {};
   await Promise.all(
     (markets ?? []).map(async (r: any) => {
-      const pair = CRYPTO_PAIR[String(r.label).toUpperCase()];
+      const pair = CRYPTO_PAIR[String(r.label).toUpperCase().replace(/\s+/g, "")];
       if (!pair) return;
       try {
         const k: any = await (
