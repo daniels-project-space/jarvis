@@ -166,7 +166,7 @@ export async function startLive(h: LiveHandlers) {
       instructions: "",
       tools: [...(await clientTools()), exitTool],
     });
-    session = new RealtimeSession(agent, { transport, model: tk.model || "gpt-realtime-mini" });
+    session = new RealtimeSession(agent, { transport, model: tk.model || "gpt-realtime-2.1" });
 
     const mirrored = new Set<string>();
     // Foreign-script transcription junk (whisper noise-hallucination) never

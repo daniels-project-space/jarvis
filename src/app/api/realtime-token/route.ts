@@ -81,7 +81,7 @@ export async function POST(req: NextRequest) {
       session: {
         type: "realtime",
         // full gpt-realtime: mini kept claiming actions without calling tools
-        model: process.env.REALTIME_MODEL || "gpt-realtime",
+        model: process.env.REALTIME_MODEL || "gpt-realtime-2.1",
         instructions,
         audio: {
           input: {
