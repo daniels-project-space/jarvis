@@ -44,7 +44,7 @@ export async function reportIncident(source: string, signature: string, message:
 }
 
 export async function buildContext(userText?: string): Promise<{ block: string; freshFindingIds: string[] }> {
-  const [memHit, memRecent, biz, stack, todos, events, wealth, jobs, findings, trip] = await Promise.all([
+  const [memHit, memRecent, biz, stack, todos, events, wealth, jobs, findings, trip, draft] = await Promise.all([
     userText ? q(CONVEX_URL, "memory:search", { q: userText, limit: 8 }) : null,
     q(CONVEX_URL, "memory:recent", { limit: 6 }),
     q(CONVEX_URL, "business:list", {}),
@@ -55,6 +55,7 @@ export async function buildContext(userText?: string): Promise<{ block: string; 
     q(CONVEX_URL, "jobs:active", {}),
     q(CONVEX_URL, "findings:fresh", {}),
     q(CONVEX_URL, "creations:latest", { kind: "trip" }),
+    q(CONVEX_URL, "creations:latest", { kind: "doc" }),
   ]);
 
   const mem = [...(Array.isArray(memHit) ? memHit : []), ...(Array.isArray(memRecent) ? memRecent : [])]
@@ -105,6 +106,13 @@ export async function buildContext(userText?: string): Promise<{ block: string; 
     } catch {
       /* stale doc */
     }
+  }
+  // Active draft: "make it longer / warmer / add X" refers to THIS text —
+  // the model must revise via the draft tool with the FULL updated content.
+  if (draft?.data && Date.now() - (draft.updatedAt ?? 0) < 2 * 3600_000) {
+    lines.push(
+      `ACTIVE DRAFT "${draft.title}" (on the writing desk — edit requests like "make it longer/shorter/warmer" mean THIS text; revise by calling draft with title "${draft.title}" and the COMPLETE updated text, never weather/other tools):\n---\n${String(draft.data).slice(0, 2500)}\n---`,
+    );
   }
   if (Array.isArray(findings) && findings.length)
     lines.push(

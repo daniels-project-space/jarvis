@@ -206,7 +206,7 @@ export async function POST(req: NextRequest) {
         messages.push({
           role: "system",
           content:
-            "You claimed something is on Daniel's screen, but you did not call any screen tool this turn — NOTHING is showing. Call the right tool NOW to actually display it, then answer briefly. (Things shown in earlier turns are no longer on screen.)",
+            "You claimed something is on Daniel's screen, but you did not call any screen tool this turn — NOTHING is showing. Call the tool that shows THE THING YOU CLAIMED (draft with the full updated text if you were writing/editing; weather for weather; price_chart for markets; youtube_search for videos...). NEVER open something unrelated to his request. Then answer briefly.",
         });
         final = "";
         continue;

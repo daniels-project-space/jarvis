@@ -118,6 +118,7 @@ export function sendLiveText(text: string): boolean {
 }
 
 let starting = false;
+let micStream: MediaStream | null = null;
 export async function startLive(h: LiveHandlers) {
   if (session || starting) return; // double-tap = one session, never two voices
   starting = true;
@@ -134,7 +135,14 @@ export async function startLive(h: LiveHandlers) {
     audioEl = document.createElement("audio");
     audioEl.autoplay = true;
     document.body.appendChild(audioEl);
-    const transport = new OpenAIRealtimeWebRTC({ audioElement: audioEl });
+    // Own mic stream with echo cancellation FORCED on: on phones the speaker
+    // leaks into the mic, semantic VAD reads JARVIS's own voice as Daniel
+    // barging in and cancels speech mid-sentence (and the echo guard then
+    // makes the model go silent). AEC at the source kills the loop.
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    const transport = new OpenAIRealtimeWebRTC({ audioElement: audioEl, mediaStream: micStream });
 
     const exitTool = tool({
       name: "exit_live_mode",
@@ -193,18 +201,10 @@ export async function startLive(h: LiveHandlers) {
                 body: JSON.stringify({ name: c.name, args: c.args }),
               }).catch(() => {});
             }
-            // Nothing recoverable: the model believes it showed something but
-            // the screen is untouched. Tell it so it calls the REAL tool.
-            if (!executed && /<function/i.test(text)) {
-              try {
-                session?.sendMessage(
-                  NUDGE +
-                    "Your last attempt did NOT reach the screen — nothing is showing. Call the actual tool now (properly, as a function call) to display it.",
-                );
-              } catch {
-                /* ignore */
-              }
-            }
+            // Nothing recoverable: swallow silently. (An immediate corrective
+            // sendMessage here triggered a NEW response mid-flow and could
+            // cascade into the session cutting off its own speech.)
+            void executed;
           }
           text = sanitizeAssistantText(text);
           if (!text) {
@@ -241,6 +241,12 @@ export function stopLive() {
     /* ignore */
   }
   session = null;
+  try {
+    micStream?.getTracks().forEach((t) => t.stop());
+  } catch {
+    /* ignore */
+  }
+  micStream = null;
   cancelAnimationFrame(energyRaf);
   try {
     void energyCtx?.close();

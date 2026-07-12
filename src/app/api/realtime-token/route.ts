@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { PERSONA, INFRA_MAP } from "@/lib/persona";
+import { PERSONA } from "@/lib/persona";
 import { buildContext, convexMutation, convexQuery } from "@/lib/context";
 import { TOOL_DEFS } from "@/lib/tools";
 import { getSecret } from "@/lib/vault";
@@ -42,7 +42,7 @@ export async function POST(req: NextRequest) {
   // rare, so scan a much wider window for them than for dialogue.
   const done = (Array.isArray(msgs) ? msgs : []).filter((m: any) => m.status === "done");
   const shown: string[] = [];
-  for (const m of done.slice(-120)) {
+  for (const m of done.slice(-60)) {
     if (m.attachment) {
       // Titles and URLs only — raw widget JSON in the prompt taught the model
       // to parrot JSON blobs into its spoken replies.
@@ -56,17 +56,17 @@ export async function POST(req: NextRequest) {
   for (const m of done.slice(-20)) {
     if (m.attachment) historyLines.push(`You showed on screen: ${m.attachment.title ?? m.attachment.type}`);
     else if (m.text && !/<function|\{"kind"\s*:|\[showed on screen:/i.test(m.text))
-      historyLines.push(`${m.role === "user" ? "Daniel" : "You"}: ${String(m.text).slice(0, 220)}`);
+      historyLines.push(`${m.role === "user" ? "Daniel" : "You"}: ${String(m.text).slice(0, 150)}`);
   }
   const historyBlock = historyLines.length
-    ? `\n\nRecent conversation (continue it naturally — this already happened):\n${historyLines.slice(-16).join("\n")}`
+    ? `\n\nRecent conversation (continue it naturally — this already happened):\n${historyLines.slice(-10).join("\n")}`
     : "";
   const shownBlock = shown.length
-    ? `\n\nItems shown EARLIER (NOT currently visible — the stage clears constantly). If Daniel asks about any of these, or asks to see anything, CALL THE TOOL AGAIN — re-showing is free and expected:\n${shown.slice(-8).join("\n")}`
+    ? `\n\nItems shown EARLIER — NOT currently visible. Re-show ONE only when Daniel explicitly asks to see THAT item again; never re-show on your own:\n${shown.slice(-5).join("\n")}`
     : "";
 
   const instructions =
-    `${PERSONA}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${ctx.block}${historyBlock}${shownBlock}\n\n` +
+    `${PERSONA}\n\nWhat you know right now:\n${ctx.block}${historyBlock}${shownBlock}\n\n` +
     `Current date: ${new Date().toDateString()}. This is a live voice conversation — replies of one or two short sentences, always. ` +
     `Daniel speaks English: treat everything you hear as English and reply ONLY in English, whatever it sounds like. ` +
     `When he says to turn off live mode, stop listening, or go quiet: say one short goodbye and call exit_live_mode. ` +
