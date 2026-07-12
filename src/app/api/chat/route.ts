@@ -15,6 +15,27 @@ export const maxDuration = 120;
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const MODELS = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"];
 
+// Groq's gpt-oss tool-call grammar chokes on parameterless functions (empty
+// `properties: {}`): it emits garbage argument JSON like `{"}"` and 400s the
+// turn with `tool_use_failed`. Give any such tool one harmless optional field
+// so the schema is non-empty; executeTool ignores unknown args, so this is inert.
+function groqToolDef(t: { name: string; description?: string; parameters?: any }) {
+  const p = t.parameters;
+  if (p?.type === "object" && p.properties && Object.keys(p.properties).length === 0) {
+    return {
+      type: "function",
+      function: {
+        ...t,
+        parameters: {
+          ...p,
+          properties: { _noop: { type: "string", description: "unused — pass an empty string" } },
+        },
+      },
+    };
+  }
+  return { type: "function", function: t };
+}
+
 async function groq(key: string, body: Record<string, unknown>): Promise<any> {
   const errs: string[] = [];
   for (const model of MODELS) {
@@ -69,7 +90,7 @@ export async function POST(req: NextRequest) {
       })),
       { role: "user", content: text },
     ];
-    const tools = TOOL_DEFS.map((t) => ({ type: "function", function: t }));
+    const tools = TOOL_DEFS.map(groqToolDef);
 
     // Hard questions get real thinking; chit-chat stays instant. Design,
     // creative and multi-constraint asks are exactly where low effort showed.
