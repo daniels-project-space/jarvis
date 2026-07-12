@@ -84,6 +84,32 @@ export const update = mutation({
   },
 });
 
+// Board persistence with op-queue merge: the client saves its full element
+// state but must NOT clobber ops the brain queued while it was drawing —
+// ops newer than appliedUpTo survive the save.
+export const boardSave = mutation({
+  args: {
+    id: v.id("creations"),
+    elements: v.string(), // JSON array of full excalidraw elements
+    imageUrls: v.string(), // JSON map fileId -> public url
+    appliedUpTo: v.number(),
+  },
+  handler: async (ctx, a) => {
+    const row = await ctx.db.get(a.id);
+    if (!row?.data) return;
+    let data: any;
+    try {
+      data = JSON.parse(row.data);
+    } catch {
+      return;
+    }
+    data.elements = JSON.parse(a.elements);
+    data.imageUrls = JSON.parse(a.imageUrls);
+    data.pendingOps = (data.pendingOps ?? []).filter((op: any) => (op.ts ?? 0) > a.appliedUpTo);
+    await ctx.db.patch(a.id, { data: JSON.stringify(data), updatedAt: Date.now() });
+  },
+});
+
 export const remove = mutation({
   args: { id: v.id("creations") },
   handler: async (ctx, a) => {

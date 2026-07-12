@@ -131,7 +131,8 @@ export const TOOL_DEFS = [
   },
   {
     name: "remember",
-    description: "Save a durable fact/preference/decision to long-term memory.",
+    description:
+      "Save a durable fact/preference/decision to long-term memory. Pass project when it belongs to a specific project (a script, a build, a board) — it files into that project's own Obsidian folder so you can always talk about it later.",
     parameters: {
       type: "object",
       properties: {
@@ -139,6 +140,7 @@ export const TOOL_DEFS = [
         title: { type: "string" },
         body: { type: "string" },
         tags: { type: "array", items: { type: "string" } },
+        project: { type: "string", description: "project slug, e.g. 'island-script'" },
       },
       required: ["kind", "title", "body"],
     },
@@ -350,6 +352,40 @@ export const TOOL_DEFS = [
         markdown: { type: "string", description: "the full document content as markdown (#/##/### headings, bullets, numbered lists)" },
       },
       required: ["title", "markdown"],
+    },
+  },
+  {
+    name: "board",
+    description:
+      "JARVIS's INFINITE CANVAS — a real freeform board (Excalidraw) you build and edit LIVE while talking: sticky notes, shapes, text, tables, arrows, clickable links (Spotify, references), and rendered images placed anywhere or into named ZONES. create with template 'film' gives a worldbuilding layout (characters / locations / moodboard / storyboard / playlist / notes zones). Use for brainstorming, film/script development, moodboards, project planning — ANY visual thinking. To add a rendered picture: create_image first, then board add an image item with its URL into the right zone. Ask Daniel questions as you build (characters? tone? locations?) and keep adding as answers come. Daniel can drag/edit everything by hand too.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["create", "add", "show"] },
+        title: { type: "string", description: "board title (create/show)" },
+        template: { type: "string", enum: ["film", "blank"], description: "create only, default blank" },
+        project: { type: "string", description: "project slug this board belongs to (memory filing), e.g. 'island-script'" },
+        items: {
+          type: "array",
+          description: "add only — high-level items; JARVIS places them (zone grid) unless x/y given",
+          items: {
+            type: "object",
+            properties: {
+              kind: { type: "string", enum: ["note", "text", "rectangle", "ellipse", "diamond", "arrow", "image", "table"] },
+              text: { type: "string", description: "label/content" },
+              zone: { type: "string", description: "named zone to place into (e.g. characters, moodboard)" },
+              color: { type: "string", enum: ["green", "amber", "blue", "pink", "purple", "slate", "yellow"] },
+              url: { type: "string", description: "makes it a clickable link (Spotify track, reference…)" },
+              image_url: { type: "string", description: "kind=image: the picture URL (from create_image or the web)" },
+              rows: { type: "array", items: { type: "array", items: { type: "string" } }, description: "kind=table: rows, first row = header" },
+              x: { type: "number" }, y: { type: "number" }, w: { type: "number" }, h: { type: "number" },
+              big: { type: "boolean", description: "kind=text: heading size" },
+            },
+            required: ["kind"],
+          },
+        },
+      },
+      required: ["action"],
     },
   },
   {
@@ -1461,6 +1497,45 @@ async function createPdf(args: any): Promise<string> {
   }
 }
 
+// The infinite canvas: high-level items → excalidraw ops the open board
+// applies live (see src/lib/board.ts + BoardView).
+async function boardTool(args: any): Promise<string> {
+  const { createBoard, loadBoard, saveBoardDoc, itemToOps } = await import("./board");
+  const action = String(args.action ?? "");
+  if (action === "create") {
+    const title = String(args.title ?? "Board").slice(0, 80);
+    const template = ["film", "blank"].includes(String(args.template)) ? String(args.template) : "blank";
+    const { doc } = await createBoard(title, template, args.project ? String(args.project) : undefined);
+    return (
+      `Board "${title}" is live on screen (zones: ${Object.keys(doc.zones).join(", ")}). ` +
+      `Add items with board/add into those zones as the conversation flows — and ASK Daniel the next good question about the project. ` +
+      `For pictures: create_image first, then add {kind:"image", image_url, zone}.`
+    );
+  }
+  const b = await loadBoard(args.title ? String(args.title) : undefined);
+  if (!b) return action === "show" ? "No board found — create one first." : "No board to add to — board/create first.";
+  if (action === "show") {
+    await saveBoardDoc(b.id, b.doc, true);
+    return `Board "${b.doc.title}" is back on screen. Zones: ${Object.keys(b.doc.zones).join(", ")}.`;
+  }
+  if (action === "add") {
+    const items = (Array.isArray(args.items) ? args.items : []).slice(0, 20);
+    if (!items.length) return "Give me items to add.";
+    let added = 0;
+    for (const item of items) {
+      try {
+        b.doc.pendingOps.push(...itemToOps(b.doc, item));
+        added++;
+      } catch {
+        /* skip malformed item */
+      }
+    }
+    await saveBoardDoc(b.id, b.doc, true);
+    return `${added} item(s) placed on "${b.doc.title}" — they appear live. Zones: ${Object.keys(b.doc.zones).join(", ")}. Keep building or ask Daniel what's next.`;
+  }
+  return "board actions: create, add, show.";
+}
+
 // Live mind map: create/update re-render on Daniel's screen as you talk.
 async function mindMap(args: any): Promise<string> {
   const action = ["create", "update", "show"].includes(String(args.action)) ? String(args.action) : "create";
@@ -2072,6 +2147,8 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await storeImage(args);
     case "create_pdf":
       return await createPdf(args);
+    case "board":
+      return await boardTool(args);
     case "mind_map":
       return await mindMap(args);
     case "chart":
@@ -2114,15 +2191,16 @@ export async function executeTool(name: string, args: any): Promise<string> {
     case "read_url":
       return await readUrl(String(args.url));
     case "remember": {
+      const project = args.project ? String(args.project).slice(0, 50) : undefined;
       await convexMutation("memory:write", {
         kind: String(args.kind ?? "fact"),
         title: String(args.title).slice(0, 120),
         body: String(args.body).slice(0, 1200),
-        tags: Array.isArray(args.tags) ? args.tags.map(String).slice(0, 6) : [],
+        tags: [...(Array.isArray(args.tags) ? args.tags.map(String) : []), ...(project ? [project] : [])].slice(0, 6),
       });
       const { vaultWrite } = await import("./obsidian");
-      await vaultWrite(String(args.kind ?? "fact"), String(args.title), String(args.body));
-      return "Saved to memory.";
+      await vaultWrite(String(args.kind ?? "fact"), String(args.title), String(args.body), project);
+      return project ? `Saved to memory (filed under project ${project}).` : "Saved to memory.";
     }
     case "memory_search": {
       const rows = await convexQuery("memory:search", { q: String(args.query), limit: 8 });

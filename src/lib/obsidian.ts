@@ -22,11 +22,13 @@ const slug = (s: string) =>
     .replace(/^-|-$/g, "")
     .slice(0, 50);
 
-export async function vaultWrite(kind: string, title: string, body: string): Promise<boolean> {
+export async function vaultWrite(kind: string, title: string, body: string, project?: string): Promise<boolean> {
   const token = process.env.GITHUB_TOKEN;
   const s = slug(title);
   if (!token || !s) return false;
-  const folder = FOLDER[kind] ?? "80-facts";
+  // project-scoped notes live under the project's own folder — the vault
+  // carries each project (characters, decisions, world details) forever
+  const folder = project ? `20-projects/${slug(project)}` : FOLDER[kind] ?? "80-facts";
   const path = `${folder}/${s}.md`;
   const date = new Date().toISOString().slice(0, 10);
   const md = [

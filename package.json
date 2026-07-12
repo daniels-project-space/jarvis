@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@excalidraw/excalidraw": "^0.18.1",
     "@openai/agents-realtime": "^0.13.2",
     "@trigger.dev/build": "^4.5.1",
     "@trigger.dev/sdk": "^4.5.1",

@@ -674,7 +674,7 @@ export function PdfView({ url, title }: { url: string; title?: string }) {
 
 /* ---------------------------------- creations library ---------------------------------- */
 
-const KIND_ICON: Record<string, string> = { canvas: "🕸", chart: "📊", image: "🖼", pdf: "📕", doc: "📄" };
+const KIND_ICON: Record<string, string> = { canvas: "🕸", board: "🎨", chart: "📊", image: "🖼", pdf: "📕", doc: "📄", trip: "🌍" };
 
 export function CreationsView({ value }: { value: string }) {
   let filter: { kind: string | null } = { kind: null };
@@ -699,6 +699,8 @@ export function CreationsView({ value }: { value: string }) {
     if (r.kind === "image" && r.url) void setPanel({ type: "image", value: r.url, title: r.title });
     else if (r.kind === "pdf" && r.url) void setPanel({ type: "pdf", value: r.url, title: r.title });
     else if (r.kind === "canvas" && r.data) void setPanel({ type: "canvas", value: r.data, title: `map · ${r.title}` });
+    else if (r.kind === "board") void setPanel({ type: "board", value: JSON.stringify({ creationId: r._id }), title: `board · ${r.title}` });
+    else if (r.kind === "trip") void setPanel({ type: "trip", value: JSON.stringify({ creationId: r._id }), title: `trip · ${r.title}` });
     else if (r.kind === "chart" && r.data) void setPanel({ type: "widget", value: r.data, title: r.title });
     else if (r.data) void setPanel({ type: "markdown", value: r.data, title: r.title });
   };

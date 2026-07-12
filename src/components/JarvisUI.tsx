@@ -6,6 +6,7 @@ import ThreeOrb from "./ThreeOrb";
 import ThreeOrbClassic from "./ThreeOrbClassic";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView } from "./Views";
 import TripView from "./TripView";
+import BoardView from "./BoardView";
 
 type Attachment = { type: string; value: string; title?: string };
 type Msg = {
@@ -475,6 +476,8 @@ function Viewport({
         <CreationsView value={panel.value} />
       ) : panel.type === "fleet" ? (
         <FleetView value={panel.value} />
+      ) : panel.type === "board" ? (
+        <BoardView value={panel.value} />
       ) : panel.type === "url" || panel.type === "video" ? (
         <div className="flex min-h-0 flex-1 flex-col">
           <iframe
