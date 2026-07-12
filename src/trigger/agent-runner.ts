@@ -470,11 +470,15 @@ export const agentRunner = schedules.task({
           (cloneFailed
             ? `Couldn't get into ${repo}, sir — the repo name or access looks wrong.`
             : `That background job's done${pushNote.includes("pushed") ? " and the change is live" : ""}.`);
-        await convexMutation("findings:add", {
+        const findingId = await convexMutation("findings:add", {
           source: job.task,
           spoken,
           detail: result.slice(0, 8000) + (pushNote ? `\n\n(${pushNote.trim()})` : ""),
         });
+        // The runner is about to DELIVER this itself (spoken line + card) — mark
+        // it woven now, or the brain re-announces the same finding on Daniel's
+        // next message ("telling me its findings twice").
+        if (findingId) await convexMutation("findings:markWoven", { ids: [findingId] }).catch(() => {});
         const weaveThread = await chatThread();
         await convexMutation("chatQueue:postAssistant", { threadId: weaveThread, text: spoken });
         // The full answer lands as a tappable card in the stream AND on the big

@@ -500,6 +500,7 @@ export const TOOL_DEFS = [
         return_date: { type: "string", description: "YYYY-MM-DD" },
         adults: { type: "number", description: "travellers, default 2" },
         budget_total_gbp: { type: "number", description: "TOTAL trip budget in GBP — required; ask Daniel if he didn't say" },
+        include_flights: { type: "boolean", description: "REQUIRED decision: does he want flights scouted? If he hasn't said, ASK ('flights too? from where?') before calling" },
         vibe: { type: "string", description: "what he's after: beach, food, nightlife, culture, hiking…" },
         max_price_per_night: { type: "number", description: "hotel ceiling per night if he stated one (else derived from budget)" },
         vacation_rentals: { type: "boolean", description: "apartments/homes instead of hotels" },
@@ -1898,6 +1899,11 @@ async function tripPlanTool(args: any): Promise<string> {
   const budget = Number(args.budget_total_gbp) || 0;
   if (budget <= 0)
     return "BUDGET MISSING — do NOT search yet. Ask Daniel one short question: what's the total budget for this trip?";
+  // Flights are never assumed: he might drive, train it, or already have them.
+  if (args.include_flights === undefined && !args.origin_iata)
+    return "FLIGHTS UNDECIDED — do NOT search yet. Ask Daniel one short question: should I include flights, and from which airport?";
+  if (args.include_flights === true && !args.origin_iata)
+    return "ORIGIN MISSING — ask Daniel which airport he's flying from.";
   const { scoutTrip, latestTrip } = await import("./travel");
   // If the globe is already open for this destination, populate THAT doc live
   // instead of spawning a duplicate.
@@ -1915,6 +1921,7 @@ async function tripPlanTool(args: any): Promise<string> {
     vibe: args.vibe ? String(args.vibe) : undefined,
     maxPricePerNight: Number(args.max_price_per_night) || undefined,
     vacationRentals: !!args.vacation_rentals,
+    includeFlights: args.include_flights !== false,
     reuseId,
   });
   const f = doc.flights[0];

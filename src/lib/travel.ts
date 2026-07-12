@@ -205,6 +205,7 @@ export async function scoutTrip(a: {
   vibe?: string;
   maxPricePerNight?: number;
   vacationRentals?: boolean;
+  includeFlights?: boolean; // Daniel doesn't always fly — never assume
   reuseId?: string; // populate the already-open globe instead of spawning a new doc
 }): Promise<{ id: string; doc: TripDoc }> {
   const nights = Math.max(1, Math.round((Date.parse(a.returnDate) - Date.parse(a.departDate)) / 86_400_000));
@@ -214,13 +215,15 @@ export async function scoutTrip(a: {
   const destIata = fixIata(a.destIata);
 
   const [flightsRes, staysRes, activities, airport] = await Promise.all([
-    hubAction("travelActions:searchFlights", {
-      origin,
-      destination: destIata,
-      outboundDate: a.departDate,
-      returnDate: a.returnDate,
-      adults: a.adults,
-    }).catch(() => ({ available: false, options: [] })),
+    a.includeFlights === false
+      ? Promise.resolve({ available: false, options: [] })
+      : hubAction("travelActions:searchFlights", {
+          origin,
+          destination: destIata,
+          outboundDate: a.departDate,
+          returnDate: a.returnDate,
+          adults: a.adults,
+        }).catch(() => ({ available: false, options: [] })),
     hubAction("travelActions:searchStays", {
       query: `${a.destination} hotels`,
       checkIn: a.departDate,

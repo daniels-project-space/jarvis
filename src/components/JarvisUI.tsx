@@ -644,17 +644,10 @@ export default function JarvisUI() {
       lastPanelAt.current = panel.updatedAt;
       setPanelMin(false);
       if (panel.type === "video") setVideoPip(false); // fresh video opens big, 16:9
-      // Content-first moments (briefing, calendar, maps, library, documents,
-      // launches): the chat steps aside on its own — expand it back any time.
-      let focus = ["canvas", "creations", "pdf", "launch", "trip", "fleet", "board"].includes(panel.type);
-      if (panel.type === "widget") {
-        try {
-          focus = ["briefing", "calendar", "stats"].includes(JSON.parse(panel.value)?.kind);
-        } catch {
-          /* not json */
-        }
-      }
-      if (focus && chatModeRef.current === "full") setChatMode("bar", false);
+      // ANYTHING freshly shown takes the screen: the chat always steps aside
+      // to the bar (weather used to hide BEHIND the chat sheet on phones while
+      // JARVIS claimed it was "on screen"). Expand the chat back any time.
+      if (chatModeRef.current === "full") setChatMode("bar", false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [panel]);
@@ -1235,40 +1228,53 @@ export default function JarvisUI() {
         </div>
       </header>
 
+      {/* ALWAYS-VISIBLE activity layer: whenever JARVIS is thinking or agents
+          are working, the pills sit right under the header on every screen —
+          you can see him working and keep talking. */}
+      {(busy || activeJobs.length > 0) && (
+        <div className="pointer-events-none fixed left-1/2 top-11 z-50 flex max-w-[96vw] -translate-x-1/2 flex-wrap items-center justify-center gap-1.5">
+          {busy && (
+            <span className="glass flex items-center gap-1.5 rounded-full !border-cyan/50 px-3 py-1 text-[11px] text-cyan shadow-lg">
+              <span className="typing-dots inline-flex gap-1"><span /><span /><span /></span>
+              thinking
+            </span>
+          )}
+          {activeJobs.slice(0, 5).map((j) => (
+            <button
+              key={j._id}
+              onClick={() => setAgentView(agentView === j._id ? null : j._id)}
+              className={`glass pointer-events-auto flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] shadow-lg transition ${
+                agentView === j._id ? "!border-cyan/60 text-cyan" : "text-ice hover:text-cyan"
+              }`}
+              title={j.task}
+            >
+              <span className="relative flex h-1.5 w-1.5">
+                <span className={`absolute inline-flex h-full w-full rounded-full ${j.status === "running" ? "animate-ping bg-cyan opacity-60" : "bg-amber opacity-60"}`} />
+                <span className={`inline-flex h-1.5 w-1.5 rounded-full ${j.status === "running" ? "bg-cyan" : "bg-amber"}`} />
+              </span>
+              <span className="max-w-[150px] truncate">{(j as { label?: string }).label ?? j.task}</span>
+            </button>
+          ))}
+          {activeJobs.length > 5 && <span className="glass rounded-full px-2 py-1 text-[10px] text-slate">+{activeJobs.length - 5}</span>}
+        </div>
+      )}
+
       <div className={`relative mx-auto flex w-full max-w-[1720px] flex-1 flex-col overflow-x-clip p-4 pt-2 ${chatMode === "bar" ? "pb-24" : ""}`}>
         {/* the stage is ALWAYS full-bleed; the chat floats over it and slides
             away on pure transforms — compositor-only, 120fps-smooth */}
         <div ref={stageRef} className="brackets relative min-h-[52vh] flex-1 md:min-h-[80vh]">
           <span className="bk" />
           {live === "live" && <div className="live-ring pointer-events-none absolute inset-2 rounded-full opacity-60" />}
-          {(activeJobs.length > 0 || (panel && panelMin)) && (
-            <div className="absolute left-4 right-4 top-4 z-10 flex flex-wrap gap-1.5">
-              {panel && panelMin && (
-                <button
-                  onClick={() => setPanelMin(false)}
-                  className="glass flex items-center gap-1.5 rounded-full !border-cyan/40 px-2.5 py-1 text-[10px] text-cyan transition hover:!border-cyan/70"
-                  title="reopen"
-                >
-                  <span>▸</span>
-                  <span className="max-w-[160px] truncate">{panel.title ?? panel.type}</span>
-                </button>
-              )}
-              {activeJobs.map((j) => (
-                <button
-                  key={j._id}
-                  onClick={() => setAgentView(agentView === j._id ? null : j._id)}
-                  className={`glass flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] transition ${
-                    agentView === j._id ? "!border-cyan/60 text-cyan" : "text-slate hover:text-ice"
-                  }`}
-                >
-                  <span className="relative flex h-1.5 w-1.5">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-cyan opacity-60" />
-                    <span className="inline-flex h-1.5 w-1.5 rounded-full bg-cyan" />
-                  </span>
-                  <ModelBadge model={j.model} />
-                  <span className="max-w-[130px] truncate">{j.task}</span>
-                </button>
-              ))}
+          {panel && panelMin && (
+            <div className="absolute left-4 top-4 z-10">
+              <button
+                onClick={() => setPanelMin(false)}
+                className="glass flex items-center gap-1.5 rounded-full !border-cyan/40 px-2.5 py-1 text-[10px] text-cyan transition hover:!border-cyan/70"
+                title="reopen"
+              >
+                <span>▸</span>
+                <span className="max-w-[160px] truncate">{panel.title ?? panel.type}</span>
+              </button>
             </div>
           )}
           {panel && panel.type !== "video" && !panelMin && !panelFull ? (
@@ -1364,7 +1370,7 @@ export default function JarvisUI() {
                   />
                 ) : (
                   <span
-                    className={`inline-block max-w-[88%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm leading-relaxed ${
+                    className={`inline-block max-w-[88%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-[15px] leading-relaxed md:text-sm ${
                       m.role === "user"
                         ? "bg-amber/10 text-amber [text-shadow:none]"
                         : "bg-cyan/[0.07] text-ice"
