@@ -94,6 +94,10 @@ export async function POST(req: NextRequest) {
               prompt: STT_PROMPT,
             },
             turn_detection: { type: "semantic_vad", eagerness: "medium" },
+            // handheld-mic noise profile: cuts ambient noise BEFORE the VAD,
+            // so breaths/room noise stop registering as barge-ins that cancel
+            // JARVIS mid-sentence (phones were worst)
+            noise_reduction: { type: "near_field" },
           },
           output: { voice: process.env.REALTIME_VOICE || "ballad" },
         },

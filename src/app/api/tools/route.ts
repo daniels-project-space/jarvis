@@ -2,8 +2,27 @@ import type { NextRequest } from "next/server";
 import { reportIncident } from "@/lib/context";
 import { TOOL_DEFS, executeTool } from "@/lib/tools";
 
-// The realtime client fetches tool definitions here to register them on the session.
-export async function GET() {
+// The realtime client fetches tool definitions here to register them on the
+// session. ?live=1 returns a SLIMMED belt: paragraph-long descriptions and
+// background-ops tools made every voice turn reprocess a huge prompt — that
+// was most of live mode's response lag.
+const LIVE_EXCLUDE = new Set(["self_repair", "self_improve", "deliberate", "memory_map"]);
+export async function GET(req: NextRequest) {
+  if (new URL(req.url).searchParams.get("live")) {
+    const slim = TOOL_DEFS.filter((t) => !LIVE_EXCLUDE.has(t.name)).map((t) => {
+      // first sentence (or two, if the first is very short) carries the intent;
+      // the persona carries the routing rules
+      const d = String(t.description ?? "");
+      let cut = d.indexOf(". ");
+      if (cut !== -1 && cut < 60) {
+        const second = d.indexOf(". ", cut + 2);
+        if (second !== -1) cut = second;
+      }
+      const short = cut === -1 ? d.slice(0, 240) : d.slice(0, Math.min(cut + 1, 300));
+      return { ...t, description: short };
+    });
+    return Response.json(slim);
+  }
   return Response.json(TOOL_DEFS);
 }
 

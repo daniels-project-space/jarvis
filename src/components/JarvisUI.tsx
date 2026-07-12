@@ -1546,18 +1546,24 @@ export default function JarvisUI() {
           </div>
           {/* live captions */}
           {caption && (
-            <div className="pointer-events-none absolute inset-x-0 bottom-[18%] flex justify-center px-8 text-center">
+            <div
+              className={`pointer-events-none absolute inset-x-0 z-30 flex justify-center px-8 text-center ${
+                panel && !panelMin ? "bottom-1" : "bottom-[18%]"
+              }`}
+            >
               <span
-                className={`inline-block max-w-[820px] rounded-2xl px-5 py-2.5 text-lg font-medium leading-snug md:text-2xl ${
-                  caption.who === "you" ? "text-amber" : "text-cyan"
-                }`}
+                className={`inline-block rounded-2xl font-medium leading-snug ${
+                  panel && !panelMin
+                    ? "max-w-[720px] bg-black/60 px-3 py-1 text-xs backdrop-blur-sm md:text-sm"
+                    : "max-w-[820px] px-5 py-2.5 text-lg md:text-2xl"
+                } ${caption.who === "you" ? "text-amber" : "text-cyan"}`}
                 style={{ textShadow: "0 2px 18px rgba(0,0,0,0.9)" }}
               >
                 {caption.text}
               </span>
             </div>
           )}
-          <div className="pointer-events-none absolute bottom-3 left-0 right-0 text-center">
+          <div className={`pointer-events-none absolute bottom-3 left-0 right-0 text-center ${panel && !panelMin ? "hidden" : ""}`}>
             <span className="hud-label">{status}</span>
           </div>
         </div>
@@ -1846,7 +1852,8 @@ export default function JarvisUI() {
               .reverse()
               .map((m) => (m.role === "assistant" && m.text && isToolGarbage(m.text) ? { ...m, text: sanitizeAssistantText(m.text) } : m))
               .find((m) => m.role === "assistant" && m.status === "done" && m.text);
-            return lastReply ? (
+            // an active overlay owns the stage — the ticker would float on top of it
+            return lastReply && !(panel && !panelMin) ? (
               <button
                 onClick={() => setChatMode("full")}
                 className="mx-auto mb-1.5 block max-w-[92%] truncate rounded-full bg-black/50 px-4 py-1 text-xs text-cyan/90 backdrop-blur-md hover:text-cyan"

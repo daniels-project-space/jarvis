@@ -23,7 +23,7 @@ let energyRaf = 0;
 let energyCtx: AudioContext | null = null;
 
 async function clientTools() {
-  const defs: { name: string; description: string; parameters: any }[] = await (await fetch("/api/tools")).json();
+  const defs: { name: string; description: string; parameters: any }[] = await (await fetch("/api/tools?live=1")).json();
   return defs.map((d) =>
     tool({
       name: d.name,
