@@ -113,6 +113,7 @@ export default function Embed() {
 
   async function startLiveMode() {
     if (liveRef.current) return;
+    import("../../lib/tts").then((m) => m.stopSpeaking()); // wake barge-in cuts any read-out
     const got = await setLiveOn({ client: me.current, on: true }).catch(() => true);
     if (got === false) return; // another device is live — stay quiet
     const rt = await import("../../lib/realtime");

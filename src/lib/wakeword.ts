@@ -5,12 +5,22 @@
 
 let rec: any = null;
 let wanted = false;
-let suppressed = false;
+let suppressed = false; // hard gate: JARVIS is literally saying "jarvis" right now
+let softGuard = false; // JARVIS is speaking: only a short, bare "hey jarvis" gets through
 
-// Self-trigger gate: while JARVIS speaks (tts.ts sets this), wake matches are
-// ignored — his own voice saying "jarvis" must never wake him.
-export function setSuppressed(on: boolean) {
-  suppressed = on;
+// Self-trigger gate with barge-in: while JARVIS speaks, long recognized speech
+// is his own voice (ignored) — but Daniel snapping "hey jarvis" still
+// interrupts, unless the utterance itself contains the word "jarvis".
+export function setSuppressed(on: boolean, hard = false) {
+  if (!on) {
+    suppressed = false;
+    softGuard = false;
+  } else if (hard) {
+    suppressed = true;
+    softGuard = true;
+  } else {
+    softGuard = true;
+  }
 }
 
 export function wakeSupported(): boolean {
@@ -29,10 +39,13 @@ export function startWake(onWake: () => void, onState?: (listening: boolean) => 
     r.continuous = true;
     r.interimResults = true;
     r.onresult = (e: any) => {
-      if (suppressed) return; // JARVIS is talking — that's him, not Daniel
+      if (suppressed) return; // JARVIS is saying "jarvis" himself — never self-wake
       for (let i = e.resultIndex; i < e.results.length; i++) {
-        const text = String(e.results[i][0].transcript || "").toLowerCase();
+        const text = String(e.results[i][0].transcript || "").toLowerCase().trim();
         if (/\b(hey\s+)?jarvis\b/.test(text)) {
+          // while he's speaking, only a short bare wake phrase counts as Daniel
+          // interrupting — longer speech is JARVIS's own voice leaking in
+          if (softGuard && text.split(/\s+/).length > 4) continue;
           stopWake();
           onWake();
           return;

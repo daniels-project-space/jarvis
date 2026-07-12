@@ -155,9 +155,10 @@ export async function speak(
   const gen = generation;
   onStart?.();
   trackUtterance(text, Math.min(90_000, text.length * 70)); // whole-utterance echo window
-  // gate the wake-word detector for the whole utterance (+tail) — the mic must
-  // never treat JARVIS's own voice as a trigger
-  import("./wakeword").then((m) => m.setSuppressed?.(true)).catch(() => {});
+  // Gate the wake detector while speaking: HARD if the reply itself contains
+  // "jarvis" (would self-wake), SOFT otherwise — so Daniel saying a bare
+  // "hey jarvis" still barges in and shuts him up.
+  import("./wakeword").then((m) => m.setSuppressed?.(true, /jarvis/i.test(text))).catch(() => {});
   let pendingText = "";
   let pending: Promise<ArrayBuffer | null> | null = null;
   while ((queue.length || pending) && gen === generation) {
