@@ -173,6 +173,18 @@ body {
 .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(0, 255, 136, 0.2); border-radius: 4px; }
 .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
 
+/* Phones: iOS zooms the whole page toward any input under 16px — that zoom is
+   the "camera dragging off to the side" when sending. 16px kills it. Also make
+   absolutely sure nothing creates sideways scroll. */
+@media (max-width: 768px) {
+  input, select, textarea {
+    font-size: 16px !important;
+  }
+  html, body {
+    overflow-x: clip;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .materialize, .materialize::after, .rise, .breathe, .live-ring,
   .brackets::before, .brackets::after, .brackets > .bk::before, .brackets > .bk::after {

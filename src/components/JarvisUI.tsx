@@ -572,7 +572,7 @@ function VideoDock({
   if (!rect) return null;
   // PiP pins inside the stage's bottom-right corner — never over the chat.
   const style: React.CSSProperties = pip
-    ? { top: Math.max(8, rect.t + rect.h - 252), left: Math.max(8, rect.l + rect.w - 372), width: 356, height: 240 }
+    ? (() => { const w = Math.min(356, window.innerWidth - 24); return { top: Math.max(8, rect.t + rect.h - 252), left: Math.max(8, rect.l + rect.w - w - 16), width: w, height: Math.round((w * 9) / 16) + 40 }; })()
     : { top: rect.t + 4, left: rect.l + 4, width: rect.w - 8, height: rect.h - 8 };
   return (
     <div className="glass fixed z-40 flex flex-col overflow-hidden rounded-2xl shadow-2xl transition-all duration-500 ease-in-out" style={style}>
@@ -1235,7 +1235,7 @@ export default function JarvisUI() {
         </div>
       </header>
 
-      <div className={`relative mx-auto flex w-full max-w-[1720px] flex-1 flex-col p-4 pt-2 ${chatMode === "bar" ? "pb-24" : ""}`}>
+      <div className={`relative mx-auto flex w-full max-w-[1720px] flex-1 flex-col overflow-x-clip p-4 pt-2 ${chatMode === "bar" ? "pb-24" : ""}`}>
         {/* the stage is ALWAYS full-bleed; the chat floats over it and slides
             away on pure transforms — compositor-only, 120fps-smooth */}
         <div ref={stageRef} className="brackets relative min-h-[52vh] flex-1 md:min-h-[80vh]">
@@ -1318,11 +1318,14 @@ export default function JarvisUI() {
           </div>
         </div>
 
-        {/* conversation panel — floats over the stage's right edge and slides
-            away on a pure transform (no layout work = every frame cheap) */}
+        {/* conversation panel — on PHONES it's a bottom sheet (orb stays visible
+            above it, keyboard pushes it up naturally); on desktop it floats over
+            the stage's right edge. Both slide on pure transforms. */}
         <div
-          className={`absolute bottom-2 right-4 top-2 z-30 w-[min(400px,92vw)] will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
-            chatMode === "full" ? "translate-x-0 opacity-100" : "pointer-events-none translate-x-[calc(100%+32px)] opacity-0"
+          className={`absolute inset-x-1 bottom-1 top-[34dvh] z-30 will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] md:inset-x-auto md:bottom-2 md:right-4 md:top-2 md:w-[min(400px,45vw)] ${
+            chatMode === "full"
+              ? "translate-x-0 translate-y-0 opacity-100"
+              : "pointer-events-none translate-y-[calc(100%+24px)] opacity-0 md:translate-x-[calc(100%+32px)] md:translate-y-0"
           }`}
         >
         <div className="glass flex h-full w-full flex-col overflow-hidden rounded-2xl">
