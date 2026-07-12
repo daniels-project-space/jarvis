@@ -10,7 +10,7 @@ export async function GET() {
 // Tool bridge for the realtime voice session: the browser receives function
 // calls from OpenAI Realtime and executes them here.
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 120; // market_analysis / trip scouts can run 60-90s
 
 export async function POST(req: NextRequest) {
   let toolName = "unknown";
