@@ -3,6 +3,7 @@ import { PERSONA, INFRA_MAP } from "@/lib/persona";
 import { buildContext, convexMutation, convexQuery } from "@/lib/context";
 import { TOOL_DEFS } from "@/lib/tools";
 import { getSecret } from "@/lib/vault";
+import { STT_PROMPT } from "@/lib/sttvocab";
 
 // Live mode: mint an ephemeral OpenAI Realtime client secret with JARVIS's
 // persona, fresh context, recent conversation AND the live-session lock baked
@@ -80,7 +81,8 @@ export async function POST(req: NextRequest) {
             transcription: {
               model: "gpt-4o-transcribe",
               language: "en",
-              prompt: "Daniel, a British English speaker, talking to his assistant about projects, rentals, videos, business.",
+              // vocabulary-primed: proper nouns (apps, gear, providers) come out right
+              prompt: STT_PROMPT,
             },
             turn_detection: { type: "semantic_vad", eagerness: "medium" },
           },

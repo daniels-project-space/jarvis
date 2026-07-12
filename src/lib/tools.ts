@@ -355,6 +355,56 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "trip_plan",
+    description:
+      "Full travel scout — ONE call searches real flights (Google Flights), real hotels with amenities/total prices (Google Hotels), and top activities (Google Places) in parallel, then opens the interactive globe trip planner on screen. BUDGET IS REQUIRED: if Daniel hasn't given one, ASK HIM FIRST instead of calling this. Use for any 'plan a trip / find me a holiday / getaway to X'.",
+    parameters: {
+      type: "object",
+      properties: {
+        destination: { type: "string", description: "city/region, e.g. 'Barcelona'" },
+        dest_iata: { type: "string", description: "destination airport IATA, e.g. BCN" },
+        origin_iata: { type: "string", description: "departure airport IATA, default LHR" },
+        depart_date: { type: "string", description: "YYYY-MM-DD" },
+        return_date: { type: "string", description: "YYYY-MM-DD" },
+        adults: { type: "number", description: "travellers, default 2" },
+        budget_total_gbp: { type: "number", description: "TOTAL trip budget in GBP — required; ask Daniel if he didn't say" },
+        vibe: { type: "string", description: "what he's after: beach, food, nightlife, culture, hiking…" },
+        max_price_per_night: { type: "number", description: "hotel ceiling per night if he stated one (else derived from budget)" },
+        vacation_rentals: { type: "boolean", description: "apartments/homes instead of hotels" },
+      },
+      required: ["destination", "dest_iata", "depart_date", "return_date"],
+    },
+  },
+  {
+    name: "trip_update",
+    description:
+      "Edit the current trip live: lock in a flight or hotel (lock_stay computes the real airport transfer from the hotel's location), add/remove activities, change the budget, or re-search hotels with different limits. The globe panel updates instantly.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["lock_flight", "lock_stay", "toggle_activity", "set_budget", "rescout_stays", "show"] },
+        flight_index: { type: "number", description: "which flight from the list (1-based) for lock_flight" },
+        stay: { type: "string", description: "hotel name (or fragment) for lock_stay" },
+        activity: { type: "string", description: "activity name (or fragment) for toggle_activity" },
+        budget_total_gbp: { type: "number" },
+        max_price_per_night: { type: "number", description: "for rescout_stays" },
+        vacation_rentals: { type: "boolean", description: "for rescout_stays" },
+      },
+      required: ["action"],
+    },
+  },
+  {
+    name: "trip_finalize",
+    description:
+      "Lock the plan in: builds the day-by-day itinerary (flight, airport transfer with real drive time, check-in, activities), writes every item into Daniel's calendar, and saves the whole trip as an interactive connected-node map in the creations library. Call when Daniel says 'book it in / lock it / finalize the plan'.",
+    parameters: {
+      type: "object",
+      properties: {
+        add_to_calendar: { type: "boolean", description: "default true" },
+      },
+    },
+  },
+  {
     name: "creations_list",
     description: "Open Daniel's creations library on screen — everything you've made (mind maps, charts, images, PDFs). Use for 'show my/your creations, where's that image/pdf/map'.",
     parameters: {
@@ -1402,6 +1452,133 @@ async function chartTool(args: any): Promise<string> {
   return `Chart "${title}" is on screen and saved in the creations library. Speak one takeaway.`;
 }
 
+// ── Travel planner: one scout call fans out to the hub's proven providers ──
+async function tripPlanTool(args: any): Promise<string> {
+  const destination = String(args.destination ?? "").trim();
+  const destIata = String(args.dest_iata ?? "").trim();
+  const depart = String(args.depart_date ?? "");
+  const ret = String(args.return_date ?? "");
+  if (!destination || !destIata || !/^\d{4}-\d{2}-\d{2}$/.test(depart) || !/^\d{4}-\d{2}-\d{2}$/.test(ret))
+    return "I need destination, its airport code, and both dates (YYYY-MM-DD).";
+  const budget = Number(args.budget_total_gbp) || 0;
+  if (budget <= 0)
+    return "BUDGET MISSING — do NOT search yet. Ask Daniel one short question: what's the total budget for this trip?";
+  const { scoutTrip } = await import("./travel");
+  const { doc } = await scoutTrip({
+    destination,
+    destIata,
+    origin: String(args.origin_iata ?? "LHR"),
+    departDate: depart,
+    returnDate: ret,
+    adults: Math.max(1, Number(args.adults) || 2),
+    budgetGbp: budget,
+    vibe: args.vibe ? String(args.vibe) : undefined,
+    maxPricePerNight: Number(args.max_price_per_night) || undefined,
+    vacationRentals: !!args.vacation_rentals,
+  });
+  const f = doc.flights[0];
+  const cheapStay = doc.stays[0];
+  return (
+    `Trip planner is live on the globe screen. Found: ${doc.flights.length} flights (best ${f ? `${f.airline} £${f.priceGbp}pp, ${f.stops === 0 ? "direct" : f.stops + " stop"}` : "none"}), ` +
+    `${doc.stays.length} stays within budget (e.g. ${cheapStay ? `${cheapStay.name} ★${cheapStay.rating} £${cheapStay.totalGbp} total` : "none"}), ` +
+    `${doc.activities.length} activities (top: ${doc.activities.slice(0, 3).map((a) => a.name).join(", ")}). ` +
+    `Budget £${budget}. Speak TWO short sentences with the single best flight + stay combo, then ask what he wants to lock in. ` +
+    `Use trip_update to lock choices (hotel names: ${doc.stays.slice(0, 6).map((s) => s.name).join(" | ")}).`
+  );
+}
+
+async function tripUpdateTool(args: any): Promise<string> {
+  const { latestTrip, saveTrip, computeTransfer, hubAction } = await import("./travel");
+  const t = await latestTrip();
+  if (!t) return "No trip on the go — run trip_plan first.";
+  const { doc } = t;
+  const action = String(args.action ?? "");
+  if (action === "show") {
+    await saveTrip(t.id, doc);
+    return `Trip "${doc.title}" is back on the globe screen.`;
+  }
+  if (action === "lock_flight") {
+    const i = Math.max(1, Number(args.flight_index) || 1) - 1;
+    if (!doc.flights[i]) return `Only ${doc.flights.length} flights on the list.`;
+    doc.locked.flight = doc.flights[i];
+    await saveTrip(t.id, doc);
+    const f = doc.locked.flight;
+    return `Flight locked: ${f.airline} £${f.priceGbp}pp, ${f.departTime} → ${f.arriveTime}. Running total £${doc.totals?.total}.`;
+  }
+  if (action === "lock_stay") {
+    const q = String(args.stay ?? "").toLowerCase().trim();
+    const hit = doc.stays.find((s) => s.name.toLowerCase().includes(q));
+    if (!hit)
+      return `No stay matches "${args.stay}". Options: ${doc.stays.slice(0, 8).map((s) => s.name).join(" | ")}.`;
+    doc.locked.stay = hit;
+    doc.transfer = await computeTransfer(doc);
+    await saveTrip(t.id, doc);
+    return (
+      `Locked ${hit.name} (★${hit.rating ?? "?"}, £${hit.totalGbp ?? "?"} total, ${(hit.amenities ?? []).join(", ")}).` +
+      (doc.transfer ? ` Airport transfer from the hotel: ${doc.transfer.durationText}, ${doc.transfer.distanceText} by car.` : "") +
+      ` Running total £${doc.totals?.total} of £${doc.budgetGbp}.`
+    );
+  }
+  if (action === "toggle_activity") {
+    const q = String(args.activity ?? "").toLowerCase().trim();
+    const hit = doc.activities.find((a) => a.name.toLowerCase().includes(q));
+    if (!hit) return `No activity matches "${args.activity}". Have: ${doc.activities.map((a) => a.name).slice(0, 10).join(" | ")}.`;
+    const idx = doc.locked.activities.indexOf(hit.name);
+    if (idx >= 0) doc.locked.activities.splice(idx, 1);
+    else doc.locked.activities.push(hit.name);
+    await saveTrip(t.id, doc);
+    return `${idx >= 0 ? "Removed" : "Added"} ${hit.name}${idx >= 0 ? " from" : " to"} the plan (${doc.locked.activities.length} activities picked).`;
+  }
+  if (action === "set_budget") {
+    const b = Number(args.budget_total_gbp) || 0;
+    if (b <= 0) return "Give me the new total budget in pounds.";
+    doc.budgetGbp = b;
+    await saveTrip(t.id, doc);
+    return `Budget set to £${b}. Currently at £${doc.totals?.total}.`;
+  }
+  if (action === "rescout_stays") {
+    const res = await hubAction("travelActions:searchStays", {
+      query: `${doc.destination} hotels`,
+      checkIn: doc.departDate,
+      checkOut: doc.returnDate,
+      adults: doc.adults,
+      maxPricePerNight: Number(args.max_price_per_night) || undefined,
+      vacationRentals: !!args.vacation_rentals,
+    }).catch(() => ({ options: [] }));
+    const stays = (res.options ?? []).filter((s: any) => s.lat && s.lng).slice(0, 24);
+    if (!stays.length) return "That search came back empty — loosen the limits.";
+    doc.stays = stays;
+    await saveTrip(t.id, doc);
+    return `Re-scouted: ${stays.length} ${args.vacation_rentals ? "rentals" : "hotels"} now on the globe (top: ${stays.slice(0, 4).map((s: any) => `${s.name} £${s.totalGbp ?? s.priceGbp}`).join(", ")}).`;
+  }
+  return "Unknown trip action.";
+}
+
+async function tripFinalizeTool(args: any): Promise<string> {
+  const { latestTrip, saveTrip, computeTransfer, buildItinerary, tripToCalendar, tripToMindmap } = await import("./travel");
+  const t = await latestTrip();
+  if (!t) return "No trip to finalize — run trip_plan first.";
+  const { doc } = t;
+  if (!doc.locked.flight && doc.flights[0]) doc.locked.flight = doc.flights[0];
+  if (!doc.locked.stay) return "Lock a hotel first (trip_update lock_stay) — the itinerary and transfer hang off it.";
+  if (!doc.transfer) doc.transfer = await computeTransfer(doc);
+  doc.itinerary = buildItinerary(doc);
+  doc.status = "planned";
+  await saveTrip(t.id, doc);
+  let calNote = "";
+  if (args.add_to_calendar !== false) {
+    const n = await tripToCalendar(doc, t.id).catch(() => 0);
+    calNote = ` ${n} items written to the calendar (they'll show in briefings).`;
+  }
+  const mapId = await tripToMindmap(doc, t.id).catch(() => "");
+  return (
+    `Trip locked in: ${doc.itinerary?.length} days planned, total ≈ £${doc.totals?.total} of £${doc.budgetGbp}.` +
+    calNote +
+    (mapId ? ` Interactive trip map saved to the creations library.` : "") +
+    ` The full plan is on screen. Speak one short confident summary.`
+  );
+}
+
 async function creationsList(args: any): Promise<string> {
   const kind = ["canvas", "chart", "image", "pdf", "doc"].includes(String(args.kind)) ? String(args.kind) : undefined;
   const rows: any[] = (await convexQuery("creations:list", { kind, limit: 30 })) ?? [];
@@ -1505,6 +1682,12 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await mindMap(args);
     case "chart":
       return await chartTool(args);
+    case "trip_plan":
+      return await tripPlanTool(args);
+    case "trip_update":
+      return await tripUpdateTool(args);
+    case "trip_finalize":
+      return await tripFinalizeTool(args);
     case "creations_list":
       return await creationsList(args);
     case "clear_chat": {

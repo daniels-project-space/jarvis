@@ -4,6 +4,7 @@ import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView } from "./Views";
+import TripView from "./TripView";
 
 type Attachment = { type: string; value: string; title?: string };
 type Msg = {
@@ -90,7 +91,9 @@ function MediaCard({ a, onShow }: { a: Attachment; onShow: (a: Attachment) => vo
                     ? "📕"
                     : a.type === "canvas"
                       ? "🕸"
-                      : "📄"}
+                      : a.type === "trip"
+                        ? "🌍"
+                        : "📄"}
           </span>
         )}
         <span className="min-w-0">
@@ -457,6 +460,8 @@ function Viewport({
         <WidgetView value={panel.value} />
       ) : panel.type === "canvas" ? (
         <CanvasView value={panel.value} />
+      ) : panel.type === "trip" ? (
+        <TripView value={panel.value} />
       ) : panel.type === "launch" ? (
         <LaunchView value={panel.value} />
       ) : panel.type === "pdf" ? (
@@ -530,7 +535,7 @@ export default function JarvisUI() {
       setPanelMin(false);
       // Content-first moments (briefing, calendar, maps, library, documents,
       // launches): the chat steps aside on its own — expand it back any time.
-      let focus = ["canvas", "creations", "pdf", "launch"].includes(panel.type);
+      let focus = ["canvas", "creations", "pdf", "launch", "trip"].includes(panel.type);
       if (panel.type === "widget") {
         try {
           focus = ["briefing", "calendar", "stats"].includes(JSON.parse(panel.value)?.kind);
