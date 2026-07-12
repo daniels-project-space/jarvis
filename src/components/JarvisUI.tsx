@@ -1529,15 +1529,20 @@ export default function JarvisUI() {
           ) : null}
           {/* the orb steps back while a panel is up — content stays readable */}
           <div
-            className={`h-full w-full transition-all duration-[900ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
+            className={`h-full w-full transition-opacity duration-700 ${
               panel && !panelMin && !panelFull
                 ? panel.type !== "video" && stagePanelSize !== "h-full w-full"
-                  ? "opacity-[0.14] md:translate-x-[41%] md:scale-[0.62] md:opacity-95"
+                  ? "opacity-[0.14] md:opacity-100"
                   : "opacity-[0.12]"
                 : "opacity-100"
             }`}
           >
-            <ThreeOrb state={orbState} energyRef={energyRef} moodColor={moodColor} />
+            <ThreeOrb
+              state={orbState}
+              energyRef={energyRef}
+              moodColor={moodColor}
+              aside={!!panel && !panelMin && panel.type !== "video" && (panelFull || stagePanelSize !== "h-full w-full")}
+            />
           </div>
           {/* live captions */}
           {caption && (
@@ -1913,7 +1918,7 @@ export default function JarvisUI() {
 
       {/* full-screen viewport — keeps a floating composer so Daniel can still talk */}
       {panel && panelFull && (
-        <div className="fixed inset-0 z-50 flex flex-col bg-black/80 p-3 backdrop-blur-sm md:p-6">
+        <div className="fixed inset-y-0 left-0 right-0 z-50 flex flex-col bg-black/80 p-3 backdrop-blur-sm md:right-[236px] md:p-6 md:pr-3">
           <div className="min-h-0 flex-1">
             <Viewport
               panel={panel}

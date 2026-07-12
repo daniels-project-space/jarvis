@@ -21,15 +21,25 @@ export default function ThreeOrb({
   state = "idle",
   energyRef,
   moodColor,
+  aside = false,
 }: {
   state?: OrbState;
   energyRef?: { current: number };
   moodColor?: string;
+  // true while an overlay owns the stage: the orb drifts into the free right
+  // strip and shrinks — done in WORLD space inside the render loop (a CSS
+  // transform on the full-bleed canvas got clipped by the stage bounds and
+  // could stick until reload).
+  aside?: boolean;
 }) {
   const moodRef = useRef<string | undefined>(moodColor);
   useEffect(() => {
     moodRef.current = moodColor;
   }, [moodColor]);
+  const asideRef = useRef(aside);
+  useEffect(() => {
+    asideRef.current = aside;
+  }, [aside]);
   const mountRef = useRef<HTMLDivElement>(null);
   const stateRef = useRef<OrbState>(state);
   useEffect(() => {
@@ -121,6 +131,7 @@ export default function ThreeOrb({
     let lastState: OrbState = "idle";
     let cloudZ = 0, cloudZVel = 0;
     let smoothEnergy = 0;
+    let asideAmt = 0; // 0 = centre stage, 1 = tucked into the right strip
 
     const clock = new THREE.Clock();
 
@@ -173,10 +184,19 @@ export default function ThreeOrb({
       cloudZVel *= 0.94;
       cloudZ += cloudZVel;
 
+      // glide toward/away from the side strip (desktop only — phones dim instead)
+      const wantAside = asideRef.current && W() >= 768 ? 1 : 0;
+      asideAmt += (wantAside - asideAmt) * 0.045;
+      const halfW = Math.tan((45 * Math.PI) / 360) * 80 * (W() / H());
+      const offsetX = halfW * 0.72 * asideAmt;
+      const shrink = 1 - 0.5 * asideAmt;
+
       points.rotation.set(spinX, spinY, spinZ);
-      points.position.z = cloudZ;
+      points.position.set(offsetX, 0, cloudZ);
+      points.scale.setScalar(shrink);
       lines.rotation.set(spinX, spinY, spinZ);
-      lines.position.z = cloudZ;
+      lines.position.set(offsetX, 0, cloudZ);
+      lines.scale.setScalar(shrink);
 
       const p = geo.getAttribute("position") as THREE.BufferAttribute;
       const a = p.array as Float32Array;
@@ -278,10 +298,11 @@ export default function ThreeOrb({
       electronGeo.setDrawRange(0, aliveCount);
       ep.needsUpdate = true;
       electrons.rotation.set(spinX, spinY, spinZ);
-      electrons.position.z = cloudZ;
+      electrons.position.set(offsetX, 0, cloudZ);
+      electrons.scale.setScalar(shrink);
 
       mat.opacity = currentBright + bass * 0.08;
-      mat.size = currentSize + bass * 0.05;
+      mat.size = (currentSize + bass * 0.05) * shrink;
       // mood-aware palette: the whole orb drifts slowly into the conversation's
       // colour and holds it; states tint from that base
       const moodBase = new THREE.Color(moodRef.current ?? "#00ff88");
