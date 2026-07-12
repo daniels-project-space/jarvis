@@ -43,13 +43,20 @@ export async function POST(req: NextRequest) {
   const done = (Array.isArray(msgs) ? msgs : []).filter((m: any) => m.status === "done");
   const shown: string[] = [];
   for (const m of done.slice(-120)) {
-    if (m.attachment)
-      shown.push(`- "${m.attachment.title ?? m.attachment.type}" (${m.attachment.type}): ${String(m.attachment.value).slice(0, 160)}`);
+    if (m.attachment) {
+      // Titles and URLs only — raw widget JSON in the prompt taught the model
+      // to parrot JSON blobs into its spoken replies.
+      const val = String(m.attachment.value);
+      shown.push(
+        `- "${m.attachment.title ?? m.attachment.type}" (${m.attachment.type})${/^https?:/.test(val) ? `: ${val.slice(0, 120)}` : ""}`,
+      );
+    }
   }
   const historyLines: string[] = [];
   for (const m of done.slice(-20)) {
     if (m.attachment) historyLines.push(`You showed on screen: ${m.attachment.title ?? m.attachment.type}`);
-    else if (m.text) historyLines.push(`${m.role === "user" ? "Daniel" : "You"}: ${String(m.text).slice(0, 220)}`);
+    else if (m.text && !/<function|\{"kind"\s*:|\[showed on screen:/i.test(m.text))
+      historyLines.push(`${m.role === "user" ? "Daniel" : "You"}: ${String(m.text).slice(0, 220)}`);
   }
   const historyBlock = historyLines.length
     ? `\n\nRecent conversation (continue it naturally — this already happened):\n${historyLines.slice(-16).join("\n")}`
@@ -63,7 +70,8 @@ export async function POST(req: NextRequest) {
     `Current date: ${new Date().toDateString()}. This is a live voice conversation — replies of one or two short sentences, always. ` +
     `Daniel speaks English: treat everything you hear as English and reply ONLY in English, whatever it sounds like. ` +
     `When he says to turn off live mode, stop listening, or go quiet: say one short goodbye and call exit_live_mode. ` +
-    `ECHO GUARD: if what you hear is a repetition or paraphrase of something YOU just said (your own voice leaking back), stay completely silent — never answer yourself.`;
+    `ECHO GUARD: if what you hear is a repetition or paraphrase of something YOU just said (your own voice leaking back), stay completely silent — never answer yourself. ` +
+    `TOOLS ARE REAL FUNCTIONS: to show or do anything you MUST call the tool — NEVER type function syntax, tool names, JSON or brackets into a reply, and never read JSON, code or tool results aloud; speak a short human summary instead. If Daniel closes something on screen, it stays closed — never re-show it unless he asks again.`;
 
   const r = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
     method: "POST",

@@ -130,6 +130,8 @@ export default defineSchema({
     detail: v.string(), // full result, panel-able
     status: v.string(), // "fresh" | "woven"
     createdAt: v.number(),
+    bullets: v.optional(v.array(v.string())), // distilled card breakdown
+    important: v.optional(v.boolean()), // relevance gate for popup cards
   }).index("by_status", ["status", "createdAt"]),
 
   // Self-healing: anything that breaks (client errors, route failures, dead

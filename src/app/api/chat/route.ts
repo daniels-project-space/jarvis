@@ -1,4 +1,5 @@
 import type { NextRequest } from "next/server";
+import { isToolGarbage, sanitizeAssistantText } from "@/lib/sanitize";
 import { PERSONA, INFRA_MAP } from "@/lib/persona";
 import { buildContext, convexMutation, reportIncident } from "@/lib/context";
 import { extractMemory } from "@/lib/extract";
@@ -124,10 +125,12 @@ export async function POST(req: NextRequest) {
         role: "system",
         content: `${PERSONA}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${ctx.block}\n\nCurrent date: ${new Date().toDateString()}. Use tools freely — search, show things on screen, dispatch agents — but keep every spoken reply short and human.`,
       },
-      ...history.map((h: { role: string; text: string }) => ({
-        role: h.role === "user" ? "user" : "assistant",
-        content: h.text,
-      })),
+      ...history
+        .filter((h: { role: string; text: string }) => !(h.role !== "user" && isToolGarbage(h.text)))
+        .map((h: { role: string; text: string }) => ({
+          role: h.role === "user" ? "user" : "assistant",
+          content: h.text,
+        })),
       { role: "user", content: text },
     ];
     const tools = TOOL_DEFS.map(groqToolDef);
@@ -181,6 +184,7 @@ export async function POST(req: NextRequest) {
       final = String(msg.content ?? "").trim();
       break;
     }
+    if (final && isToolGarbage(final)) final = sanitizeAssistantText(final) || "Done — it's on your screen.";
     if (!final) final = "Sorry — lost my train of thought there. Say that again?";
 
     await convexMutation("chatQueue:finalize", {

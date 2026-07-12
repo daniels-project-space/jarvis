@@ -33,6 +33,20 @@ export const recent = query({
   },
 });
 
+export const get = query({
+  args: { id: v.id("findings") },
+  handler: async (ctx, a) => ctx.db.get(a.id),
+});
+
+// Card intelligence cache: /api/distill screens each finding once (worth
+// showing at all?) and stores the short bullet breakdown.
+export const distill = mutation({
+  args: { id: v.id("findings"), bullets: v.array(v.string()), important: v.boolean() },
+  handler: async (ctx, a) => {
+    await ctx.db.patch(a.id, { bullets: a.bullets, important: a.important });
+  },
+});
+
 export const markWoven = mutation({
   args: { ids: v.array(v.id("findings")) },
   handler: async (ctx, a) => {

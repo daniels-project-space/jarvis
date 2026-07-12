@@ -5,6 +5,7 @@
 // finished turns are mirrored into Convex history.
 
 import { RealtimeAgent, RealtimeSession, tool, OpenAIRealtimeWebRTC } from "@openai/agents-realtime";
+import { extractFunctionCalls, sanitizeAssistantText, isToolGarbage } from "./sanitize";
 
 export type LiveState = "connecting" | "live" | "off" | "error";
 export type LiveHandlers = {
@@ -170,13 +171,33 @@ export async function startLive(h: LiveHandlers) {
       for (const item of history) {
         if (item?.type !== "message") continue;
         const role = item.role === "user" ? "user" : "assistant";
-        const text = (item.content ?? [])
+        let text = (item.content ?? [])
           .map((c: any) => c?.transcript ?? c?.text ?? "")
           .join(" ")
           .trim();
         if (!text || text.startsWith(NUDGE.slice(0, 20))) continue; // internal nudges stay invisible
         if (role === "user" && isGarbage(text)) continue;
         const done = item.status === "completed";
+        if (role === "assistant" && isToolGarbage(text)) {
+          // The model wrote tool syntax / tool JSON as text. Recover the
+          // intended call (run it for real) and keep the junk out of
+          // captions, history and the next session's prompt.
+          if (done && !mirrored.has(item.itemId)) {
+            for (const c of extractFunctionCalls(text)) {
+              if (c.name === "show" && !c.args?.value) continue; // malformed — don't set a junk panel
+              void fetch("/api/tools", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ name: c.name, args: c.args }),
+              }).catch(() => {});
+            }
+          }
+          text = sanitizeAssistantText(text);
+          if (!text) {
+            if (done) mirrored.add(item.itemId);
+            continue;
+          }
+        }
         h.onCaption(role === "user" ? "you" : "jarvis", text, done);
         if (done && !mirrored.has(item.itemId)) {
           mirrored.add(item.itemId);

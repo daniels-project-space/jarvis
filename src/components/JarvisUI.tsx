@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
+import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView } from "./Views";
 import TripView from "./TripView";
 import BoardView from "./BoardView";
@@ -276,6 +277,80 @@ function TimerWidget({ w }: { w: any }) {
       </div>
       {left === 0 && <div className="text-sm text-cyan">Time, sir.</div>}
     </div>
+  );
+}
+
+// A demoted panel bobbing beside the orb: real mini preview inside (scaled
+// live widget / thumbnail / titled chip — never a bare glyph), tap to restore,
+// drag left off-screen to dismiss (mobile-friendly).
+function OrbitBubble({
+  b, delay, onOpen, onDismiss,
+}: {
+  b: { type: string; value: string; title?: string };
+  delay: number;
+  onOpen: () => void;
+  onDismiss: () => void;
+}) {
+  const [dx, setDx] = useState(0);
+  const startX = useRef<number | null>(null);
+  const dragging = useRef(false);
+  const yt = b.type === "video" ? (b.value.match(/embed\/([\w-]{11})/)?.[1] ?? null) : null;
+  const isImg = b.type === "image";
+  const GLYPH: Record<string, string> = { trip: "🌍", board: "🎨", canvas: "🕸", pdf: "📕", fleet: "🚀", site: "🌐", url: "🌐" };
+  return (
+    <button
+      onPointerDown={(e) => {
+        startX.current = e.clientX;
+        dragging.current = false;
+        (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+      }}
+      onPointerMove={(e) => {
+        if (startX.current == null) return;
+        const d = e.clientX - startX.current;
+        if (Math.abs(d) > 6) dragging.current = true;
+        setDx(Math.min(0, d));
+      }}
+      onPointerUp={() => {
+        if (startX.current == null) return;
+        startX.current = null;
+        if (dx < -52) onDismiss();
+        else setDx(0);
+        setTimeout(() => (dragging.current = false), 0);
+      }}
+      onPointerCancel={() => {
+        startX.current = null;
+        setDx(0);
+        dragging.current = false;
+      }}
+      onClick={() => {
+        if (!dragging.current) onOpen();
+      }}
+      className={`bob glass group relative h-16 w-16 overflow-hidden rounded-full !border-cyan/30 shadow-xl hover:scale-125 hover:!border-cyan/70 ${dx === 0 ? "transition-all duration-300" : ""}`}
+      style={{ animationDelay: `${delay}s`, transform: dx ? `translateX(${dx}px)` : undefined, opacity: dx ? Math.max(0.15, 1 + dx / 90) : undefined, touchAction: "pan-y" }}
+      title={`${b.title ?? b.type} — drag left to dismiss`}
+    >
+      {yt ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={`https://img.youtube.com/vi/${yt}/mqdefault.jpg`} alt="" className="h-full w-full object-cover" />
+      ) : isImg ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={b.value} alt="" className="h-full w-full object-cover" />
+      ) : b.type === "widget" ? (
+        <span className="pointer-events-none absolute left-1/2 top-1/2 block h-[240px] w-[240px] origin-center -translate-x-1/2 -translate-y-1/2 scale-[0.27] overflow-hidden rounded-2xl bg-[#0b1220]">
+          <span className="flex h-full w-full flex-col">
+            <WidgetView value={b.value} />
+          </span>
+        </span>
+      ) : (
+        <span className="flex h-full w-full flex-col items-center justify-center gap-0.5 bg-gradient-to-br from-[#152238] to-[#0a1220] px-1.5 text-center">
+          <span className="text-sm leading-none">{GLYPH[b.type] ?? "📄"}</span>
+          <span className="line-clamp-2 max-w-full text-[7px] leading-tight text-ice/90">{b.title ?? b.type}</span>
+        </span>
+      )}
+      <span className="pointer-events-none absolute inset-x-0 bottom-0 truncate bg-black/70 px-1 py-0.5 text-center text-[8px] text-ice opacity-0 transition group-hover:opacity-100">
+        {b.title ?? b.type}
+      </span>
+    </button>
   );
 }
 
@@ -640,10 +715,24 @@ export default function JarvisUI() {
   // comes back. Fresh panel content pops it open again.
   const [panelMin, setPanelMin] = useState(false);
   const lastPanelAt = useRef(0);
+  // Daniel closed it = it stays closed. If the exact same panel content comes
+  // back within 30s of an explicit close (a live-session loop re-showing the
+  // bikini search, say), kill it server-side instead of displaying it.
+  const closedPanelRef = useRef<{ key: string; ts: number } | null>(null);
+  const closeStage = () => {
+    if (panel) closedPanelRef.current = { key: `${panel.title ?? ""}|${panel.value.slice(0, 160)}`, ts: Date.now() };
+    setPanelFull(false);
+    void clearPanel({});
+  };
   useEffect(() => {
     panelTypeRef.current = panel?.type ?? null;
     if (panel && panel.updatedAt !== lastPanelAt.current) {
       lastPanelAt.current = panel.updatedAt;
+      const cp = closedPanelRef.current;
+      if (cp && cp.key === `${panel.title ?? ""}|${panel.value.slice(0, 160)}` && Date.now() - cp.ts < 30_000) {
+        void clearPanel({});
+        return;
+      }
       setPanelMin(false);
       if (panel.type === "video") setVideoPip(false); // fresh video opens big, 16:9
       // ANYTHING freshly shown takes the screen: the chat always steps aside
@@ -705,6 +794,8 @@ export default function JarvisUI() {
     detail: string;
     source: string;
     createdAt: number;
+    bullets?: string[];
+    important?: boolean;
   }[];
   const [dismissed, setDismissed] = useState<Set<string>>(() => {
     try {
@@ -714,9 +805,25 @@ export default function JarvisUI() {
     }
   });
   const [expandedFinding, setExpandedFinding] = useState<string | null>(null);
+  // Only findings the distiller judged worth an interruption become cards —
+  // internal plumbing and dev chatter stay out of Daniel's face.
   const popups = findingsRecent
-    .filter((f) => Date.now() - f.createdAt < 5 * 60 * 60 * 1000 && !dismissed.has(f._id) && f.spoken)
+    .filter((f) => Date.now() - f.createdAt < 5 * 60 * 60 * 1000 && !dismissed.has(f._id) && f.spoken && f.important === true)
     .slice(0, 3);
+  const distillTried = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const next = findingsRecent.find(
+      (f) => Date.now() - f.createdAt < 5 * 60 * 60 * 1000 && !dismissed.has(f._id) && f.important === undefined && !distillTried.current.has(f._id),
+    );
+    if (!next) return;
+    distillTried.current.add(next._id);
+    void fetch("/api/distill", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: next._id }),
+    }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [findingsRecent]);
   const dismissFinding = (id: string) => {
     setDismissed((d) => {
       const nd = new Set(d);
@@ -1009,6 +1116,7 @@ export default function JarvisUI() {
     }
     lastSpokenId.current = last._id;
     if (last.model === "live" || !last.text) return;
+    if (isToolGarbage(last.text) && !sanitizeAssistantText(last.text)) return;
     // never say the exact same thing twice in a row (root of "sends results twice")
     if (last.text === lastSpokenText.current.text && Date.now() - lastSpokenText.current.ts < 20_000) return;
     lastSpokenText.current = { text: last.text, ts: Date.now() };
@@ -1354,37 +1462,19 @@ export default function JarvisUI() {
           {/* orbit bubbles — demoted panels bobbing beside the orb */}
           {bubbles.length > 0 && (
             <div className="absolute left-4 top-1/2 z-10 flex -translate-y-1/2 flex-col gap-4">
-              {bubbles.map((b, i) => {
-                const yt = b.type === "video" ? (b.value.match(/embed\/([\w-]{11})/)?.[1] ?? null) : null;
-                const isImg = b.type === "image";
-                return (
-                  <button
-                    key={(b.title ?? b.type) + i}
-                    onClick={() => {
-                      setBubbles((bs) => bs.filter((_, j) => j !== i));
-                      void setPanel({ type: b.type, value: b.value, title: b.title });
-                    }}
-                    className="bob glass group relative h-16 w-16 overflow-hidden rounded-full !border-cyan/30 shadow-xl transition-transform duration-300 hover:scale-125 hover:!border-cyan/70"
-                    style={{ animationDelay: `${i * 1.4}s` }}
-                    title={b.title ?? b.type}
-                  >
-                    {yt ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img src={`https://img.youtube.com/vi/${yt}/mqdefault.jpg`} alt="" className="h-full w-full object-cover" />
-                    ) : isImg ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img src={b.value} alt="" className="h-full w-full object-cover" />
-                    ) : (
-                      <span className="grid h-full w-full place-items-center text-xl">
-                        {b.type === "widget" ? "📊" : b.type === "trip" ? "🌍" : b.type === "board" ? "🎨" : b.type === "canvas" ? "🕸" : b.type === "pdf" ? "📕" : "📄"}
-                      </span>
-                    )}
-                    <span className="pointer-events-none absolute inset-x-0 bottom-0 truncate bg-black/70 px-1 py-0.5 text-center text-[8px] text-ice opacity-0 transition group-hover:opacity-100">
-                      {b.title ?? b.type}
-                    </span>
-                  </button>
-                );
-              })}
+              {bubbles.map((b, i) => (
+                <OrbitBubble
+                  key={(b.title ?? b.type) + i}
+                  b={b}
+                  delay={i * 1.4}
+                  onOpen={() => {
+                    closedPanelRef.current = null; // explicit restore is never a resurrection
+                    setBubbles((bs) => bs.filter((_, j) => j !== i));
+                    void setPanel({ type: b.type, value: b.value, title: b.title });
+                  }}
+                  onDismiss={() => setBubbles((bs) => bs.filter((_, j) => j !== i))}
+                />
+              ))}
             </div>
           )}
           {panel && panelMin && (
@@ -1404,7 +1494,7 @@ export default function JarvisUI() {
               <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${stagePanelSize}`}>
                 <Viewport
                   panel={panel}
-                  onClose={() => clearPanel({})}
+                  onClose={closeStage}
                   onMinimize={() => setPanelMin(true)}
                   full={false}
                   onToggleFull={() => setPanelFull(true)}
@@ -1480,7 +1570,11 @@ export default function JarvisUI() {
             {messages.length === 0 && (
               <p className="mt-10 text-center text-sm text-slate">Say the word, sir.</p>
             )}
-            {messages.slice(-80).filter((m) => m.text || m.attachment || m.status === "streaming").map((m) => (
+            {messages
+              .slice(-80)
+              .map((m) => (m.role === "assistant" && m.text && isToolGarbage(m.text) ? { ...m, text: sanitizeAssistantText(m.text) } : m))
+              .filter((m) => m.text || m.attachment || m.status === "streaming")
+              .map((m) => (
               <div key={m._id} className={`rise ${m.role === "user" ? "text-right" : "text-left"}`}>
                 {m.attachment ? (
                   <MediaCard
@@ -1597,10 +1691,10 @@ export default function JarvisUI() {
 
       {/* finished-work popups — bottom-left stack, click to read the breakdown */}
       {popups.length > 0 && !panelFull && (
-        <div className="fixed bottom-20 left-4 z-40 flex w-[min(340px,88vw)] flex-col-reverse gap-2 md:bottom-4">
-          {popups.map((f) => (
-            <div key={f._id} className="rise glass overflow-hidden rounded-xl !border-cyan/25 shadow-2xl">
-              <button onClick={() => setExpandedFinding(f._id)} className="block w-full p-3 text-left transition hover:bg-white/[0.03]">
+        <div className="fixed bottom-[116px] left-3 z-40 flex w-[min(280px,calc(100vw-104px))] flex-col-reverse gap-1.5 md:bottom-4 md:left-4 md:w-[min(340px,60vw)]">
+          {popups.map((f, i) => (
+            <div key={f._id} className={`rise glass overflow-hidden rounded-xl !border-cyan/25 shadow-2xl ${i >= 2 ? "hidden md:block" : ""}`}>
+              <button onClick={() => setExpandedFinding(f._id)} className="block w-full p-2.5 text-left transition hover:bg-white/[0.03]">
                 <div className="mb-1 flex items-center gap-1.5">
                   <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
                   <span className="hud-label !text-[8px]">while you were away</span>
@@ -1634,7 +1728,24 @@ export default function JarvisUI() {
                 </div>
                 <div className="scrollbar-thin max-h-[65vh] overflow-y-auto p-5">
                   <p className="mb-4 text-lg font-medium leading-relaxed text-ice">{f.spoken}</p>
-                  <div className="whitespace-pre-wrap text-[15px] leading-relaxed text-ice/85">{f.detail}</div>
+                  {f.bullets?.length ? (
+                    <>
+                      <ul className="space-y-2.5">
+                        {f.bullets.map((b, j) => (
+                          <li key={j} className="flex gap-2.5 text-[15px] leading-relaxed text-ice/90">
+                            <span className="mt-0.5 text-cyan/70">›</span>
+                            <span className="min-w-0 flex-1">{b}</span>
+                          </li>
+                        ))}
+                      </ul>
+                      <details className="mt-5">
+                        <summary className="hud-label cursor-pointer select-none hover:text-cyan">full log</summary>
+                        <div className="mt-2 whitespace-pre-wrap text-[13px] leading-relaxed text-ice/60">{f.detail}</div>
+                      </details>
+                    </>
+                  ) : (
+                    <div className="whitespace-pre-wrap text-[15px] leading-relaxed text-ice/85">{f.detail}</div>
+                  )}
                 </div>
               </div>
             );
