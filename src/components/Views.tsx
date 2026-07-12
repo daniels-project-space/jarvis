@@ -399,6 +399,7 @@ export function FeedView({ value }: { value: string }) {
   const items = useMemo(() => w?.items ?? [], [w?.items]);
   const [phase, setPhase] = useState<"hero" | "grid">("hero");
   const [idx, setIdx] = useState(0);
+  const [page, setPage] = useState(0);
   const setPanel = useMutation(api.ui.setPanel);
 
   // hero presentation: each story holds ~4.2s, fades to the next, then the grid
@@ -418,6 +419,51 @@ export function FeedView({ value }: { value: string }) {
     if (it.video_id) void setPanel({ type: "video", value: `https://www.youtube.com/embed/${it.video_id}?enablejsapi=1&rel=0&autoplay=1`, title: it.title });
     else if (it.url) window.open(it.url, "_blank", "noopener");
   };
+
+  // Videos present as a numbered triptych — three framed picks per page, so
+  // Daniel can say "play the second one" without squinting at a grid.
+  if (w.mode === "videos") {
+    const per = 3;
+    const pages = Math.max(1, Math.ceil(items.length / per));
+    const slice = items.slice(page * per, page * per + per);
+    return (
+      <div className="flex min-h-0 flex-1 flex-col p-4">
+        <div className="mb-3 flex items-center justify-between">
+          <span className="hud-label">{w.label}</span>
+          <div className="flex items-center gap-2">
+            <button disabled={page === 0} onClick={() => setPage((p) => p - 1)} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">
+              &lsaquo; prev
+            </button>
+            <span className="hud-label">{page + 1}/{pages}</span>
+            <button disabled={page >= pages - 1} onClick={() => setPage((p) => p + 1)} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">
+              next &rsaquo;
+            </button>
+          </div>
+        </div>
+        <div className="grid flex-1 grid-cols-1 content-center gap-4 md:grid-cols-3">
+          {slice.map((it, i) => {
+            const n = page * per + i + 1;
+            return (
+              <button key={n} onClick={() => open(it)} className="tile rise group text-left" style={{ animationDelay: `${i * 90}ms` }}>
+                <div className="relative">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src={it.image} alt="" className="aspect-video w-full rounded-t-[13px] object-cover" />
+                  <span className="absolute left-2 top-2 grid h-8 w-8 place-items-center rounded-full bg-black/75 font-mono text-sm text-cyan ring-1 ring-cyan/50">{n}</span>
+                  <span className="absolute inset-0 grid place-items-center opacity-0 transition group-hover:opacity-100">
+                    <span className="grid h-12 w-12 place-items-center rounded-full bg-cyan/90 pl-0.5 text-xl text-black">&#9654;</span>
+                  </span>
+                </div>
+                <div className="p-3">
+                  <div className="line-clamp-2 text-sm leading-snug text-ice">{it.title}</div>
+                  {it.subtitle && <div className="mt-1 truncate text-[10px] text-slate">{it.subtitle}</div>}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
 
   if (phase === "hero") {
     return (
@@ -457,6 +503,7 @@ export function FeedView({ value }: { value: string }) {
             <div className="relative">
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img src={it.image} alt="" className={`w-full object-cover ${w!.mode === "music" ? "aspect-square" : "aspect-video"}`} />
+              <span className="absolute left-1.5 top-1.5 rounded bg-black/70 px-1.5 py-0.5 font-mono text-[10px] text-cyan">{i + 1}</span>
               {w!.mode === "music" && (
                 <span className="absolute bottom-1.5 right-1.5 grid h-8 w-8 place-items-center rounded-full bg-[#1DB954] pl-0.5 text-sm text-black">▶</span>
               )}
@@ -467,6 +514,82 @@ export function FeedView({ value }: { value: string }) {
             </div>
           </button>
         ))}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------- shopping frames ---------------------------------- */
+
+type ShopItem = { image: string; title: string; price: string; merchant: string; delivery?: string; rating?: number; url?: string };
+
+// Three products per page, each presented cut-out style on its own lit frame.
+export function ShopView({ value }: { value: string }) {
+  let w: { label: string; items: ShopItem[] } | null = null;
+  try {
+    w = JSON.parse(value);
+  } catch {
+    /* noop */
+  }
+  const [page, setPage] = useState(0);
+  if (!w?.items?.length) return <div className="flex flex-1 items-center justify-center text-sm text-slate">nothing found</div>;
+  const per = 3;
+  const pages = Math.max(1, Math.ceil(w.items.length / per));
+  const slice = w.items.slice(page * per, page * per + per);
+  return (
+    <div className="flex min-h-0 flex-1 flex-col p-4">
+      <div className="mb-3 flex items-center justify-between">
+        <span className="hud-label">shopping &middot; {w.label}</span>
+        <div className="flex items-center gap-2">
+          <button disabled={page === 0} onClick={() => setPage((p) => p - 1)} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">
+            &lsaquo; prev
+          </button>
+          <span className="hud-label">{page + 1}/{pages}</span>
+          <button disabled={page >= pages - 1} onClick={() => setPage((p) => p + 1)} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">
+            next &rsaquo;
+          </button>
+        </div>
+      </div>
+      <div className="grid flex-1 grid-cols-1 content-center gap-5 md:grid-cols-3">
+        {slice.map((it, i) => {
+          const n = page * per + i + 1;
+          const fast = it.delivery && /free|next|tomorrow|1 day|24 h/i.test(it.delivery);
+          return (
+            <div key={n} className="tile rise flex flex-col" style={{ animationDelay: `${i * 90}ms` }}>
+              <div className="relative m-3 mb-0 grid h-44 place-items-center rounded-xl bg-[radial-gradient(circle_at_50%_88%,rgba(0,255,136,0.12),transparent_62%),linear-gradient(180deg,rgba(255,255,255,0.05),rgba(255,255,255,0.015))] ring-1 ring-white/10">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={it.image} alt="" className="max-h-36 max-w-[85%] object-contain drop-shadow-[0_16px_22px_rgba(0,0,0,0.6)]" />
+                <span className="absolute left-2 top-2 grid h-7 w-7 place-items-center rounded-full bg-black/75 font-mono text-xs text-cyan ring-1 ring-cyan/50">{n}</span>
+                {fast && (
+                  <span className="absolute right-2 top-2 rounded-full bg-cyan/15 px-2 py-0.5 text-[9px] uppercase tracking-wider text-cyan ring-1 ring-cyan/40">fast</span>
+                )}
+              </div>
+              <div className="flex flex-1 flex-col p-3">
+                <div className="line-clamp-2 text-[13px] leading-snug text-ice">{it.title}</div>
+                <div className="mt-1.5 flex items-baseline gap-2">
+                  <span className="text-lg font-semibold text-cyan">{it.price}</span>
+                  <span className="min-w-0 truncate text-[10px] text-slate">{it.merchant}</span>
+                </div>
+                <div className="mt-0.5 flex items-center gap-2 text-[10px] text-slate">
+                  {it.delivery && <span className="truncate">{it.delivery}</span>}
+                  {it.rating != null && <span className="shrink-0 text-amber">&#9733; {it.rating}</span>}
+                </div>
+                <div className="mt-auto pt-2.5">
+                  {it.url && (
+                    <a
+                      href={it.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="block rounded-lg bg-cyan/10 py-1.5 text-center text-xs text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/20"
+                    >
+                      view / buy &nearr;
+                    </a>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
-import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View } from "./Views";
+import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView } from "./Views";
 import TripView from "./TripView";
 import BoardView from "./BoardView";
 
@@ -143,7 +143,9 @@ function panelSize(panel: { type: string; value: string }): string {
       return "w-[min(1000px,97%)] h-[min(640px,94%)]";
     case "w:videos":
     case "w:feed":
-      return "h-full w-full";
+      return "w-[min(1180px,94%)] h-[min(660px,90%)]";
+    case "w:shop":
+      return "w-[min(1240px,96%)] h-[min(600px,90%)]";
     case "markdown":
       return "w-[min(980px,97%)] h-full";
     default:
@@ -292,6 +294,7 @@ function WidgetView({ value }: { value: string }) {
   if (w?.kind === "feed") return <FeedView value={value} />;
   if (w?.kind === "todos") return <TodosView value={value} />;
   if (w?.kind === "briefing2") return <Briefing2View value={value} />;
+  if (w?.kind === "shop") return <ShopView value={value} />;
   if (w?.kind === "market") {
     return (
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6">
@@ -399,6 +402,17 @@ function WidgetView({ value }: { value: string }) {
     );
   }
   if (w?.kind === "weather") return <WeatherView w={w} />;
+  if (w) {
+    // Unknown kind = this bundle predates the widget (or a bad payload).
+    // NEVER dump raw JSON at Daniel — that is the "collapsed to code" bug.
+    return (
+      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 p-8 text-center">
+        <span className="text-2xl">{"\u2726"}</span>
+        <div className="text-sm text-ice">This view just shipped &mdash; one refresh and it renders properly.</div>
+        <button onClick={() => window.location.reload()} className="mt-1 rounded-lg bg-cyan/10 px-3 py-1.5 text-xs text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/20">refresh</button>
+      </div>
+    );
+  }
   return <pre className="scrollbar-thin min-h-0 flex-1 overflow-auto whitespace-pre-wrap p-4 text-sm text-ice">{value}</pre>;
 }
 
@@ -1359,7 +1373,7 @@ export default function JarvisUI() {
             </div>
           )}
           {panel && panel.type !== "video" && !panelMin && !panelFull ? (
-            <div className="absolute inset-0 z-20 flex items-center justify-center p-1">
+            <div className={`absolute inset-0 z-20 flex items-center p-1 ${panelSize(panel) !== "h-full w-full" ? "justify-center md:justify-start md:pl-8" : "justify-center"}`}>
               <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${panelSize(panel)}`}>
                 <Viewport
                   panel={panel}
@@ -1377,8 +1391,12 @@ export default function JarvisUI() {
           ) : null}
           {/* the orb steps back while a panel is up — content stays readable */}
           <div
-            className={`h-full w-full transition-opacity duration-700 ${
-              panel && !panelMin && !panelFull ? "opacity-[0.14]" : "opacity-100"
+            className={`h-full w-full transition-all duration-[900ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
+              panel && !panelMin && !panelFull
+                ? panel.type !== "video" && panelSize(panel) !== "h-full w-full"
+                  ? "opacity-[0.14] md:translate-x-[36%] md:scale-[0.38] md:opacity-95"
+                  : "opacity-[0.12]"
+                : "opacity-100"
             }`}
           >
             <ThreeOrb state={orbState} energyRef={energyRef} moodColor={moodColor} />

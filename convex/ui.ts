@@ -91,6 +91,9 @@ export const setMood = mutation({
   args: { mood: v.string() },
   handler: async (ctx, a) => {
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "mood")).first();
+    // Mood is a slow ring, not a strobe: colour shifts hold for at least four
+    // minutes unless something is genuinely urgent.
+    if (ex && ex.value !== a.mood && a.mood !== "alert" && Date.now() - (ex.updatedAt ?? 0) < 4 * 60_000) return;
     const doc = { key: "mood", type: "mood", value: a.mood, updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
     else await ctx.db.insert("ui", doc);

@@ -116,7 +116,8 @@ export const TOOL_DEFS = [
   },
   {
     name: "youtube_search",
-    description: "Find YouTube videos by description/topic — returns titles, channels, links, video IDs.",
+    description:
+      "THE tool for anything YouTube: 'X youtube', 'videos of/by X', a creator/channel name, 'watch something about X'. NEVER answer a video ask with web_search — this puts the numbered video lineup on Daniel's screen (three per page). Returns titles, channels, links, video IDs.",
     parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
   },
   {
@@ -221,7 +222,7 @@ export const TOOL_DEFS = [
   {
     name: "briefing",
     description:
-      "Daniel's full morning/evening briefing as one visual widget: weather, today's rentals (pickups/returns), open to-dos, next calendar events, net worth, live markets. Use for 'brief me / morning update / what's my day look like'.",
+      "Daniel's full morning/evening briefing as one visual widget: weather, today's rentals (pickups/returns), open to-dos, next calendar events, net worth, live markets. Use for 'brief me / morning update / what's my day look like'. NEVER for trips or travel — trip_open owns those.",
     parameters: { type: "object", properties: {} },
   },
   {
@@ -477,7 +478,7 @@ export const TOOL_DEFS = [
   {
     name: "trip_open",
     description:
-      "Spawn the trip globe THE MOMENT a destination comes up in conversation — it appears immediately, centred on the place, and fills in live (flights, stays, activities, connections) as the planning talk continues. Call this first, then ask about budget/dates, then trip_plan.",
+      "GLOBE FIRST: call this the INSTANT a trip/holiday/destination comes up, before saying anything or asking any question. Spawn the trip globe THE MOMENT a destination comes up in conversation — it appears immediately, centred on the place, and fills in live (flights, stays, activities, connections) as the planning talk continues. Call this first, then ask about budget/dates, then trip_plan.",
     parameters: {
       type: "object",
       properties: {
@@ -547,6 +548,19 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "shop_search",
+    description:
+      "SHOPPING CONCIERGE: find real products for Daniel (UK — pounds, UK retailers, fast delivery prioritised) with prices, merchant links and product images cut out onto presentation frames — shows THREE at a time. Use for any 'find/buy me X' (gifts, clothes, gear). After showing: ask which fits or what to change, refine with another search, and when he picks one OFFER to run the checkout agent (dispatch_agent with mcp:[\"browserbase\"] task: add the exact product to cart on the merchant site and return the checkout/payment link).",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "specific product search, e.g. 'women's red bikini high waist'" },
+        max_price_gbp: { type: "number" },
+      },
+      required: ["query"],
+    },
+  },
+  {
     name: "todo_list",
     description: "Pull up Daniel's ACTUAL to-do list from the hub as a tickable widget on screen — he can check items off right there. Use for 'show my todos / what's on my list'.",
     parameters: { type: "object", properties: { _noop: { type: "string" } } },
@@ -571,7 +585,7 @@ export const TOOL_DEFS = [
   {
     name: "orb_mood",
     description:
-      "Shift the orb's colour to match the conversation's tone — it fades slowly into the new colour and stays a while. Use when the mood genuinely changes: calm (green, default), focused (blue, work/markets), dreamy (purple, creative), warm (amber, personal/friendly), serious (steel, hard talks/money decisions), alert (red, problems), excited (pink, wins/big ideas).",
+      "Slow mood ring — shift ONLY on a genuine sustained change of register (server ignores changes within 4 minutes). Shift the orb's colour to match the conversation's tone — it fades slowly into the new colour and stays a while. Use when the mood genuinely changes: calm (green, default), focused (blue, work/markets), dreamy (purple, creative), warm (amber, personal/friendly), serious (steel, hard talks/money decisions), alert (red, problems), excited (pink, wins/big ideas).",
     parameters: {
       type: "object",
       properties: { mood: { type: "string", enum: ["calm", "focused", "dreamy", "warm", "serious", "alert", "excited"] } },
@@ -1880,6 +1894,40 @@ async function memoryMapTool(args: any): Promise<string> {
   return `Memory tree is on screen: ${rows.length} memories across ${kinds.join(", ")}. The full vault lives in Obsidian (jarvis-memory repo).`;
 }
 
+// Shopping concierge: Google Shopping (UK) -> product cards with cutout-style
+// images on frames, three at a time.
+async function shopSearch(args: any): Promise<string> {
+  const query = String(args.query ?? "").trim();
+  if (!query) return "What am I finding?";
+  const key = process.env.SERPAPI_KEY ?? (await getSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
+  if (!key) return "Shopping search unavailable.";
+  const qs = new URLSearchParams({ engine: "google_shopping", q: query, gl: "uk", hl: "en", num: "20", api_key: key });
+  const j: any = await (await fetch(`https://serpapi.com/search.json?${qs}`, { signal: AbortSignal.timeout(10000) })).json();
+  let items = (j?.shopping_results ?? [])
+    .filter((r: any) => r.thumbnail && r.extracted_price)
+    .map((r: any) => ({
+      image: String(r.thumbnail),
+      title: String(r.title).slice(0, 90),
+      price: `£${r.extracted_price}`,
+      merchant: String(r.source ?? "").slice(0, 30),
+      delivery: String(r.delivery ?? "").slice(0, 40),
+      rating: r.rating,
+      url: String(r.product_link ?? r.link ?? ""),
+    }));
+  const cap = Number(args.max_price_gbp) || 0;
+  if (cap) items = items.filter((i: any) => parseFloat(String(i.price).replace("£", "")) <= cap);
+  // fast delivery floats up
+  items.sort((a: any, b: any) => (/free|tomorrow|1 day|next day/i.test(b.delivery) ? 1 : 0) - (/free|tomorrow|1 day|next day/i.test(a.delivery) ? 1 : 0));
+  items = items.slice(0, 12);
+  if (!items.length) return `Nothing solid for "${query}" — refine the search terms.`;
+  await showWidget({ kind: "shop", label: query, items }, `shopping · ${query.slice(0, 30)}`);
+  return (
+    `SHOP FRAMES on screen (numbered, three per page — he pages with the on-screen arrows). Top picks: ` +
+    items.slice(0, 3).map((i: any, n: number) => `${n + 1}. ${i.title} — ${i.price} at ${i.merchant}${i.delivery ? " (" + i.delivery + ")" : ""}`).join(" | ") +
+    ` — ask Daniel which fits or what to change. If he picks one: offer the checkout agent (dispatch_agent, mcp browserbase, task: open the merchant page, add EXACTLY that item to the cart, fill the order details, proceed to checkout and return the payment-page link - NEVER pay).`
+  );
+}
+
 // Day planner (mined from ethanplusai/jarvis planner.py, web-adapted): real
 // commitments + open to-dos → a reasoned, time-blocked schedule.
 async function planMyDay(args: any): Promise<string> {
@@ -2411,6 +2459,8 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await transportRoute(args);
     case "memory_map":
       return await memoryMapTool(args);
+    case "shop_search":
+      return await shopSearch(args);
     case "todo_list": {
       const todos: any[] = (await q_hub("todos:list")) ?? [];
       const open = todos.filter((t: any) => !t.done).slice(0, 24);

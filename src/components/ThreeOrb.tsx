@@ -289,8 +289,8 @@ export default function ThreeOrb({
         st === "thinking" ? moodBase.clone().lerp(new THREE.Color("#ffffff"), 0.3)
         : st === "speaking" ? moodBase.clone().lerp(new THREE.Color("#ffffff"), 0.15)
         : moodBase;
-      mat.color.lerp(target, 0.006);
-      lineMat.color.lerp(target, 0.006);
+      mat.color.lerp(target, 0.0018);
+      lineMat.color.lerp(target, 0.0018);
 
       camera.position.x = Math.sin(t * 0.02) * 5;
       camera.position.y = Math.cos(t * 0.03) * 3;

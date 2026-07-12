@@ -77,6 +77,21 @@ async function groq(key: string, body: Record<string, unknown>): Promise<any> {
 }
 
 
+// Audible progress: these tools take seconds — Daniel hears a short line the
+// moment work starts instead of silence (the client speaks finalized rows).
+const SLOW_LINES: Record<string, string> = {
+  market_analysis: "Give me twenty seconds — pulling the chart and running the full read.",
+  trip_plan: "On it — pricing real flights and stays now. The globe will fill in as I go.",
+  research: "Digging into that properly — a few seconds.",
+  deliberate: "Let me actually think this one through. Moment.",
+  create_image: "Painting that now — a few seconds.",
+  shop_search: "Out shopping — give me a few seconds.",
+  plan_my_day: "Assembling your day — one moment.",
+  briefing: "Pulling your briefing together — one moment.",
+  orchestrate: "Spinning up the fleet now.",
+  news_today: "Grabbing today's front pages.",
+};
+
 export async function POST(req: NextRequest) {
   let text = "",
     threadId = "main";
@@ -124,6 +139,7 @@ export async function POST(req: NextRequest) {
       );
 
     let final = "";
+    let interimSaid = false;
     const used: string[] = [];
     for (let round = 0; round < 6; round++) {
       const j = await groq(key, {
@@ -138,6 +154,13 @@ export async function POST(req: NextRequest) {
       if (!msg) throw new Error("groq returned no message");
       if (msg.tool_calls?.length) {
         messages.push(msg);
+        if (!interimSaid) {
+          const line = msg.tool_calls.map((tc: any) => SLOW_LINES[tc.function.name]).find(Boolean);
+          if (line) {
+            interimSaid = true;
+            await convexMutation("chatQueue:postAssistant", { threadId, text: line }).catch(() => {});
+          }
+        }
         for (const tc of msg.tool_calls) {
           let args: any = {};
           try {
