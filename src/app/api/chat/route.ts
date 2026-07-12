@@ -15,6 +15,29 @@ export const maxDuration = 120;
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const MODELS = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"];
 
+// Groq strictly validates the model's *generated* tool call against the schema
+// we send. Models routinely emit `null` for optional params they don't fill
+// (e.g. `max_price_per_night: null`), which 400s the turn with
+// `did not match schema: expected number, but got null` even though executeTool
+// coerces null away harmlessly. Widen every non-required property to also accept
+// null so those calls validate. (enum props get null appended too, or `null`
+// would still fail the enum constraint.)
+function allowNullOnOptional(p: any) {
+  if (p?.type !== "object" || !p.properties) return p;
+  const required: string[] = Array.isArray(p.required) ? p.required : [];
+  const properties: Record<string, any> = {};
+  for (const [key, raw] of Object.entries(p.properties)) {
+    const prop: any = { ...(raw as any) };
+    if (!required.includes(key)) {
+      if (typeof prop.type === "string") prop.type = [prop.type, "null"];
+      else if (Array.isArray(prop.type) && !prop.type.includes("null")) prop.type = [...prop.type, "null"];
+      if (Array.isArray(prop.enum) && !prop.enum.includes(null)) prop.enum = [...prop.enum, null];
+    }
+    properties[key] = prop;
+  }
+  return { ...p, properties };
+}
+
 // Groq's gpt-oss tool-call grammar chokes on parameterless functions (empty
 // `properties: {}`): it emits garbage argument JSON like `{"}"` and 400s the
 // turn with `tool_use_failed`. Give any such tool one harmless optional field
@@ -33,7 +56,7 @@ function groqToolDef(t: { name: string; description?: string; parameters?: any }
       },
     };
   }
-  return { type: "function", function: t };
+  return { type: "function", function: { ...t, parameters: allowNullOnOptional(p) } };
 }
 
 async function groq(key: string, body: Record<string, unknown>): Promise<any> {
