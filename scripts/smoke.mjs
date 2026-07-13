@@ -105,9 +105,14 @@ await test("draft revises in place (writing desk)", async () => {
 });
 
 await test("voice election is atomic (CAS)", async () => {
+  // The invariant: once ANY client holds a fresh voice claim, a DIFFERENT
+  // fresh client cannot steal it. (Asserting the first always wins is wrong —
+  // a real open session may legitimately hold the voice.)
   const a = await cv("mutation", "ui:electVoice", { client: "smoke-a" });
   const b = await cv("mutation", "ui:electVoice", { client: "smoke-b" });
-  assert(a === true && b === false, `a=${a} b=${b}`);
+  const aAgain = await cv("mutation", "ui:electVoice", { client: "smoke-a" });
+  assert(b === false, `smoke-b stole a fresh claim (a=${a} b=${b})`);
+  if (a === true) assert(aAgain === true, `owner smoke-a lost its own fresh claim (aAgain=${aAgain})`);
 });
 
 await test("no duplicate answers per question (smoke thread)", async () => {
