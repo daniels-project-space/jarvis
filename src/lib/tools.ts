@@ -916,8 +916,41 @@ const METRO: Record<string, string> = {
   STO: "ARN", MOW: "SVO", BER: "BER", CHI: "ORD", WAS: "IAD", SAO: "GRU", BUE: "EZE",
 };
 
+// FREE flights via Travelpayouts/Aviasales (cached real fares + bookable link,
+// no cost). Used when the token is in the vault (service "travelpayouts",
+// TRAVELPAYOUTS_TOKEN); falls through to SerpAPI otherwise.
+async function travelpayoutsFlights(from: string, to: string, departDate: string, returnDate?: string): Promise<string | null> {
+  const creds = await getServiceSecrets("travelpayouts").catch(() => ({}) as Record<string, string>);
+  const token = creds.TRAVELPAYOUTS_TOKEN ?? process.env.TRAVELPAYOUTS_TOKEN;
+  if (!token) return null;
+  try {
+    const qs = new URLSearchParams({ origin: from, destination: to, departure_at: departDate.slice(0, 7), currency: "gbp", sorting: "price", limit: "10", token });
+    if (!returnDate) qs.set("one_way", "true");
+    const j: any = await (await fetch(`https://api.travelpayouts.com/aviasales/v3/prices_for_dates?${qs}`, { signal: AbortSignal.timeout(9000) })).json();
+    const rows: any[] = (j?.data ?? []).slice(0, 8);
+    if (!rows.length) return null;
+    const md: string[] = [`## Flights ${from} → ${to} · ${departDate}`, "", "_Cached fares from Aviasales — tap to see live availability._", ""];
+    const lines: string[] = [];
+    rows.forEach((f, i) => {
+      const price = `£${Math.round(f.price)}`;
+      const stops = f.transfers === 0 ? "direct" : `${f.transfers} stop${f.transfers > 1 ? "s" : ""}`;
+      const dep = String(f.departure_at ?? "").slice(0, 16).replace("T", " ");
+      lines.push(`${f.airline} ${f.flight_number ?? ""}: ${price}, ${stops}`);
+      md.push(`${i + 1}. **${f.airline} ${f.flight_number ?? ""}** — ${price} · ${stops} · departs ${dep}${f.link ? ` · [book](https://www.aviasales.com${f.link})` : ""}`);
+    });
+    await showResultsPanel(`flights · ${from}→${to}`, md.join("\n"));
+    return lines.slice(0, 5).join("\n") + "\n(Flight options on Daniel's screen — speak just the best one or two. These are cached fares, live availability on tap.)";
+  } catch {
+    return null;
+  }
+}
+
 async function flightSearch(args: any): Promise<string> {
   const fix = (c: string) => METRO[c] ?? c;
+  const tpFrom = fix(String(args.from ?? "").toUpperCase().trim());
+  const tpTo = fix(String(args.to ?? "").toUpperCase().trim());
+  const tp = await travelpayoutsFlights(tpFrom, tpTo, String(args.depart_date ?? ""), args.return_date ? String(args.return_date) : undefined);
+  if (tp) return tp;
   const params: Record<string, string> = {
     engine: "google_flights",
     departure_id: fix(String(args.from ?? "").toUpperCase().trim()),
