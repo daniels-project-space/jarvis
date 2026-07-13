@@ -183,6 +183,38 @@ function ModelBadge({ model }: { model?: string | null }) {
   return <span className={`hud-label !text-[9px] ${c}`}>{model}</span>;
 }
 
+// Ambient arc-reactor HUD ring — concentric SVG rings (a segmented outer ring,
+// a counter-rotating scanner, radial ticks) framing the orb when the stage is
+// clear. Subtle by default; brightens when JARVIS is engaged.
+function ReactorRing({ active }: { active: boolean }) {
+  const ticks = useMemo(
+    () =>
+      Array.from({ length: 60 }, (_, i) => {
+        const a = (i / 60) * Math.PI * 2;
+        const r1 = 232, r2 = i % 5 === 0 ? 214 : 223;
+        return { x1: 250 + r1 * Math.cos(a), y1: 250 + r1 * Math.sin(a), x2: 250 + r2 * Math.cos(a), y2: 250 + r2 * Math.sin(a), major: i % 5 === 0 };
+      }),
+    [],
+  );
+  return (
+    <div className={`pointer-events-none absolute inset-0 grid place-items-center transition-opacity duration-1000 ${active ? "opacity-[0.5]" : "opacity-[0.22]"}`}>
+      <svg viewBox="0 0 500 500" className="h-[min(78vmin,720px)] w-[min(78vmin,720px)]" style={{ filter: "drop-shadow(0 0 8px rgba(0,255,136,0.35))" }}>
+        <g fill="none" stroke="var(--cyan)">
+          <circle cx="250" cy="250" r="244" strokeWidth="1" strokeOpacity="0.25" strokeDasharray="40 20" style={{ transformOrigin: "center", animation: "reactor-slow 46s linear infinite" }} />
+          <circle cx="250" cy="250" r="200" strokeWidth="1.5" strokeOpacity="0.18" />
+          <path d="M250 62 A188 188 0 0 1 438 250" strokeWidth="2" strokeOpacity="0.7" strokeLinecap="round" style={{ transformOrigin: "center", animation: "reactor-fast 8s linear infinite reverse" }} />
+          <g strokeOpacity="0.35">
+            {ticks.map((t, i) => (
+              <line key={i} x1={t.x1} y1={t.y1} x2={t.x2} y2={t.y2} strokeWidth={t.major ? 1.6 : 0.8} strokeOpacity={t.major ? 0.5 : 0.28} />
+            ))}
+          </g>
+          <circle cx="250" cy="250" r="170" strokeWidth="1" strokeOpacity="0.12" strokeDasharray="2 8" style={{ transformOrigin: "center", animation: "reactor-slow 30s linear infinite reverse" }} />
+        </g>
+      </svg>
+    </div>
+  );
+}
+
 // The agent's actual CLI session, streamed: tool calls and thoughts scroll in
 // live (auto-follows unless Daniel scrolled up to read something).
 function LiveSessionLog({ job }: { job: Job }) {
@@ -1701,6 +1733,9 @@ export default function JarvisUI() {
               <AgentLiveView job={shownJob} now={nowTs} onClose={() => setAgentView(null)} />
             </div>
           ) : null}
+          {/* arc-reactor HUD ring — ambient Iron-Man frame behind the orb when
+              the stage is clear (ported concept from JARVIS-MARK5's SVG HUD) */}
+          {!(panel && !panelMin) && <ReactorRing active={live === "live" || orbState === "thinking" || orbState === "listening"} />}
           {/* the orb steps back while a panel is up — content stays readable */}
           <div
             className={`h-full w-full transition-opacity duration-700 ${

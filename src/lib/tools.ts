@@ -948,8 +948,24 @@ async function flightSearch(args: any): Promise<string> {
 }
 
 async function readUrl(url: string): Promise<string> {
+  // Prefer Jina's reader (r.jina.ai) — clean article markdown, handles JS-heavy
+  // pages far better than raw HTML stripping (mined from JARVIS-MARK5's
+  // website-assistant). Fall back to raw fetch if it's unavailable.
   try {
-    const r = await fetch(url, { headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }, redirect: "follow" });
+    const clean = url.replace(/^https?:\/\//, "");
+    const jr = await fetch(`https://r.jina.ai/https://${clean}`, {
+      headers: { "user-agent": "Mozilla/5.0", "x-return-format": "markdown" },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (jr.ok) {
+      const md = (await jr.text()).trim();
+      if (md.length > 200) return md.slice(0, 9000);
+    }
+  } catch {
+    /* fall through to raw */
+  }
+  try {
+    const r = await fetch(url, { headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }, redirect: "follow", signal: AbortSignal.timeout(15000) });
     const html = await r.text();
     const text = html
       .replace(/<script[\s\S]*?<\/script>/gi, " ")
