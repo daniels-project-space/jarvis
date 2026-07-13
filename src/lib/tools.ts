@@ -1693,7 +1693,11 @@ async function researchTool(args: any): Promise<string> {
 // model (reasoning_effort knob) but on Groq's near-instant inference: ~3-10s vs
 // the 30-75s OpenAI Responses calls that made JARVIS "think forever". Returns ""
 // on any failure so the caller can fall back to OpenAI.
-async function groqReason(system: string, input: string, effort: "low" | "medium" | "high" = "high", maxTokens = 2400): Promise<string> {
+// NOTE effort: "high" makes gpt-oss burn the ENTIRE max_tokens budget on hidden
+// reasoning and return EMPTY content (finish_reason "length") — verified. "medium"
+// returns a full rich answer in ~4s. Keep this at medium unless you also raise
+// max_tokens well above the expected reasoning cost.
+async function groqReason(system: string, input: string, effort: "low" | "medium" | "high" = "medium", maxTokens = 2400): Promise<string> {
   const gk = process.env.GROQ_API_KEY ?? (await getSecret("groq", "GROQ_API_KEY").catch(() => ""));
   if (!gk) return "";
   try {
@@ -1758,7 +1762,7 @@ async function deliberateTool(args: any): Promise<string> {
     `1) A clear recommendation (one line).\n2) The 2-4 decisive reasons.\n3) What would change your mind.\n` +
     `Be concrete and opinionated; no fence-sitting.`;
   const input = `PROBLEM: ${question}\n\nCONTEXT:\n${String(args.context ?? "").slice(0, 3000)}`;
-  const text = (await groqReason(system, input, "high", 2200)) || (await openaiReason(system, input, "high", 28_000));
+  const text = (await groqReason(system, input, "medium", 3000)) || (await openaiReason(system, input, "high", 28_000));
   if (text) {
     await showResultsPanel(`deliberation · ${question.slice(0, 36)}`, `## ${question}\n\n${text}`);
     return `CONSIDERED ANALYSIS (deliver the recommendation as your own view, in your voice, short — full version is on his screen):\n${text.slice(0, 4000)}`;
@@ -2427,7 +2431,7 @@ async function marketAnalysisTool(args: any): Promise<string> {
 
   // Fast+free reasoning on Groq first (~5-10s), OpenAI gpt-5.1 as a tight-timeout
   // deep fallback. This replaced a 75s+ gpt-5.1 call that made it hang forever.
-  const analysis = (await groqReason(ANALYST_SYSTEM, dossier, "high", 4000)) || (await openaiReason(ANALYST_SYSTEM, dossier, "medium", 30_000));
+  const analysis = (await groqReason(ANALYST_SYSTEM, dossier, "medium", 5000)) || (await openaiReason(ANALYST_SYSTEM, dossier, "medium", 30_000));
   if (!analysis.trim())
     return `The analysis pass failed — show the chart with price_chart and reason from the summary instead.`;
 
