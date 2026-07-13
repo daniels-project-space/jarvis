@@ -102,7 +102,7 @@ export const TOOL_DEFS = [
   {
     name: "flight_search",
     description:
-      "Live flight search (Google Flights) — full results with prices/times appear on Daniel's screen instantly; speak only the best option. Use this for ANY flight question, never dispatch_agent.",
+      "Live flight search (Google Flights) — full results with prices/times appear on Daniel's screen instantly; speak only the best option. Use for standalone flight questions OUTSIDE trip planning (trips: trip_plan owns flights), never dispatch_agent.",
     parameters: {
       type: "object",
       properties: {
@@ -393,7 +393,7 @@ export const TOOL_DEFS = [
   {
     name: "mind_map",
     description:
-      "Create or LIVE-EDIT a visual mind map / diagram on Daniel's screen while you talk: bubbles (nodes), connectors (edges), colours, links, images, even little tables. Saved automatically in the creations library. action=create starts fresh; update edits the one on screen (upserts nodes by id, adds edges, removes by id); show re-opens a saved one by title.",
+      "QUICK node-and-edge diagram (concept maps, structures, relationships) — for rich creative workspaces (moodboards, tables, images, film planning) use board instead. Live-editable on screen while you talk. Saved automatically in the creations library. action=create starts fresh; update edits the one on screen (upserts nodes by id, adds edges, removes by id); show re-opens a saved one by title.",
     parameters: {
       type: "object",
       properties: {
@@ -546,6 +546,12 @@ export const TOOL_DEFS = [
       type: "object",
       properties: { kind: { type: "string", enum: ["canvas", "chart", "image", "pdf", "doc"], description: "filter, optional" } },
     },
+  },
+  {
+    name: "hide",
+    description:
+      "Close the current on-screen overlay/panel. Call when Daniel says to close/hide it, or when the conversation has clearly moved on from what's showing.",
+    parameters: { type: "object", properties: {} },
   },
   {
     name: "draft",
