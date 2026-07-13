@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { PERSONA } from "@/lib/persona";
+import { PERSONA, CAPABILITIES, REMEMBER } from "@/lib/persona";
 import { buildContext, convexMutation, convexQuery } from "@/lib/context";
 import { getSecret } from "@/lib/vault";
 import { STT_PROMPT } from "@/lib/sttvocab";
@@ -65,7 +65,7 @@ export async function POST(req: NextRequest) {
     : "";
 
   const instructions =
-    `${PERSONA}\n\nWhat you know right now:\n${ctx.block}${historyBlock}${shownBlock}\n\n` +
+    `${PERSONA}\n\n${CAPABILITIES}\n\nWhat you know right now:\n${ctx.block}${historyBlock}${shownBlock}\n\n${REMEMBER}\n\n` +
     `Current date: ${new Date().toDateString()}. This is a live voice conversation — replies of one or two short sentences, always. ` +
     `Daniel speaks English: treat everything you hear as English and reply ONLY in English, whatever it sounds like. ` +
     `When he says to turn off live mode, stop listening, or go quiet: say one short goodbye and call exit_live_mode. ` +

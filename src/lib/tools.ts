@@ -1214,9 +1214,29 @@ async function timerWidget(args: any): Promise<string> {
   return `Timer set — ${minutes} minute${minutes === 1 ? "" : "s"} for ${label}. It'll chime on screen when done.`;
 }
 
+// Two crypto sparklines (BTC/ETH last ~40h) — fetched in parallel with
+// everything else so they never add serial latency to the briefing.
+async function cryptoSparks(): Promise<Record<string, number[]>> {
+  const pairs: Record<string, string> = { BTC: "BTCUSDT", ETH: "ETHUSDT" };
+  const out: Record<string, number[]> = {};
+  await Promise.all(
+    Object.entries(pairs).map(async ([label, pair]) => {
+      try {
+        const k: any = await (
+          await fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${pair}&interval=1h&limit=40`, { signal: AbortSignal.timeout(3500) })
+        ).json();
+        if (Array.isArray(k)) out[label] = k.map((c: any) => Number(c[4]));
+      } catch {
+        /* tile renders without spark */
+      }
+    }),
+  );
+  return out;
+}
+
 async function briefingWidget(): Promise<string> {
   const today = new Date().toISOString().slice(0, 10);
-  const [w, strip, todos, events, wealth, markets, mem] = await Promise.all([
+  const [w, strip, todos, events, wealth, markets, mem, sparks] = await Promise.all([
     fetchWeatherData("London").catch(() => null),
     rentalQuery("calendar:getCalendarStrip", { accountSlug: null, startDate: today, days: 1 }),
     q_hub("todos:list"),
@@ -1224,6 +1244,7 @@ async function briefingWidget(): Promise<string> {
     q_hub("wealth:getWealth"),
     fetchMarketData(["bitcoin", "ethereum"], ["GC=F"]).catch(() => []),
     convexQuery("memory:recent", { limit: 8 }).catch(() => []),
+    cryptoSparks(),
   ]);
   const short = (x: string) => String(x || "").split(/[|,]/)[0].split(/\s+/).slice(0, 4).join(" ");
   const day0 = Array.isArray(strip) ? strip[0] : null;
@@ -1260,21 +1281,6 @@ TODOS: ${open.slice(0, 20).map((t: any) => JSON.stringify(String(t.text).slice(0
   if (!picked.length) picked = open.slice(0, 5).map((t: any) => ({ text: String(t.text).slice(0, 90), why: "" }));
   const now = Date.now();
   const upcoming = (Array.isArray(events) ? events : []).filter((e: any) => (e.start ?? 0) >= now).sort((a: any, b: any) => a.start - b.start).slice(0, 4);
-  // crypto rows carry a real sparkline (last ~40h of closes off binance.vision)
-  const CRYPTO_PAIR: Record<string, string> = { BTC: "BTCUSDT", BITCOIN: "BTCUSDT", ETH: "ETHUSDT", ETHEREUM: "ETHUSDT", SOL: "SOLUSDT", SOLANA: "SOLUSDT", BNB: "BNBUSDT", BINANCECOIN: "BNBUSDT", XRP: "XRPUSDT", RIPPLE: "XRPUSDT", DOGE: "DOGEUSDT", DOGECOIN: "DOGEUSDT" };
-  const sparks: Record<string, number[]> = {};
-  await Promise.all(
-    (markets ?? []).map(async (r: any) => {
-      const pair = CRYPTO_PAIR[String(r.label).toUpperCase().replace(/\s+/g, "")];
-      if (!pair) return;
-      try {
-        const k: any = await (
-          await fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${pair}&interval=1h&limit=40`, { signal: AbortSignal.timeout(4000) })
-        ).json();
-        if (Array.isArray(k)) sparks[r.label] = k.map((c: any) => Number(c[4]));
-      } catch { /* tile renders without spark */ }
-    }),
-  );
   const widget = {
     kind: "briefing2",
     date: new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" }),

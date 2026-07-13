@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { isToolGarbage, sanitizeAssistantText } from "@/lib/sanitize";
-import { PERSONA, INFRA_MAP } from "@/lib/persona";
+import { PERSONA, CAPABILITIES, REMEMBER, INFRA_MAP } from "@/lib/persona";
 import { buildContext, convexMutation, reportIncident } from "@/lib/context";
 import { extractMemory } from "@/lib/extract";
 import { TOOL_DEFS, executeTool } from "@/lib/tools";
@@ -222,7 +222,7 @@ export async function POST(req: NextRequest) {
     const messages: any[] = [
       {
         role: "system",
-        content: `${PERSONA}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${ctx.block}\n\nCurrent date: ${new Date().toDateString()}. Use tools freely — search, show things on screen, dispatch agents — but keep every spoken reply short and human.`,
+        content: `${PERSONA}\n\n${CAPABILITIES}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${ctx.block}\n\nCurrent date: ${new Date().toDateString()}.\n\n${REMEMBER}`,
       },
       ...history
         .filter(
