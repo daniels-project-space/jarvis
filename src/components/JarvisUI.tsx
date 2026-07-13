@@ -1060,9 +1060,16 @@ export default function JarvisUI() {
   const setMoodMut = useMutation(api.ui.setMood);
   const [prefs, setPrefs] = useState({ voice: "free", tts: "free", reduceMotion: false });
   useEffect(() => {
+    // one-time revert: the browser "fast" voice was a regression Daniel hated —
+    // migrate anyone still stuck on it back to Kokoro ("free"). Guarded so a
+    // deliberate re-pick of "fast" later still sticks.
+    if (!localStorage.getItem("jarvis_tts_revert1")) {
+      if (localStorage.getItem("jarvis_tts") === "fast") localStorage.setItem("jarvis_tts", "free");
+      localStorage.setItem("jarvis_tts_revert1", "1");
+    }
     setPrefs({
       voice: localStorage.getItem("jarvis_voice") || "free",
-      tts: localStorage.getItem("jarvis_tts") || "fast",
+      tts: localStorage.getItem("jarvis_tts") || "free",
       reduceMotion: localStorage.getItem("jarvis_reduce_motion") === "1",
     });
   }, []);
@@ -1917,7 +1924,7 @@ export default function JarvisUI() {
             </div>
           )}
           {panel && panel.type !== "video" && !panelMin && !panelFull ? (
-            <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-24" : "justify-center"}`}>
+            <div className="absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center justify-center p-1">
               <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${stagePanelSize}`}>
                 <Viewport
                   panel={panel}
@@ -1935,45 +1942,25 @@ export default function JarvisUI() {
           ) : null}
           {/* arc-reactor HUD ring — always mounted, eases with the orb: follows
               it aside for a compact overlay, fully out for a full-bleed one */}
+          {/* orb + ring live ONLY on the clear stage — when an overlay is up
+              they fade fully out (the screen belongs to the overlay) */}
           <ReactorRing
             active={live === "live" || orbState === "thinking" || orbState === "listening"}
-            aside={!!panel && !panelMin && panel.type !== "video" && (panelFull || stagePanelSize !== "h-full w-full")}
-            hidden={!!panel && !panelMin && (panel.type === "video" || (!panelFull && stagePanelSize === "h-full w-full"))}
+            aside={false}
+            hidden={!!panel && !panelMin}
             color={moodColor}
           />
-          {/* the orb steps back while a panel is up — content stays readable */}
-          <div
-            className={`h-full w-full transition-opacity duration-700 ${
-              panel && !panelMin && !panelFull
-                ? panel.type !== "video" && stagePanelSize !== "h-full w-full"
-                  ? "opacity-[0.14] md:opacity-100"
-                  : "opacity-[0.12]"
-                : "opacity-100"
-            }`}
-          >
-            <ThreeOrb
-              state={orbState}
-              energyRef={energyRef}
-              moodColor={moodColor}
-              aside={!!panel && !panelMin && panel.type !== "video" && (panelFull || stagePanelSize !== "h-full w-full")}
-            />
+          <div className={`h-full w-full transition-opacity duration-500 ${panel && !panelMin ? "pointer-events-none opacity-0" : "opacity-100"}`}>
+            <ThreeOrb state={orbState} energyRef={energyRef} moodColor={moodColor} aside={false} />
           </div>
-          {/* live captions — the spoken words bloom in just under the orb, big
-              and centred (when a compact overlay is up they drop to a small
-              bottom strip so they don't cover it) */}
-          {caption && (
-            <div
-              className={`pointer-events-none absolute inset-x-0 z-30 flex justify-center px-6 text-center ${
-                panel && !panelMin ? "top-[6%]" : "top-[57%] md:top-[58%]"
-              }`}
-            >
+          {/* THE ONE caption — spoken words, under the orb, one contained field
+              that auto-sizes and clamps long text; hidden entirely while an
+              overlay owns the screen */}
+          {caption && !(panel && !panelMin) && (
+            <div className="pointer-events-none absolute inset-x-0 top-[55%] z-30 flex justify-center px-6">
               <span
                 key={caption.text}
-                className={`cap-bloom inline-block leading-snug ${
-                  panel && !panelMin
-                    ? "max-w-[720px] rounded-2xl bg-black/55 px-3 py-1 text-xs font-medium backdrop-blur-sm md:text-sm"
-                    : "max-w-[880px] text-2xl font-semibold tracking-tight md:text-[2rem] lg:text-[2.4rem]"
-                } ${caption.who === "you" ? "text-amber" : "text-ice"}`}
+                className={`cap-bloom line-clamp-4 max-w-[min(880px,90%)] overflow-hidden text-center text-2xl font-semibold leading-snug tracking-tight md:text-[2rem] lg:text-[2.2rem] ${caption.who === "you" ? "text-amber" : "text-ice"}`}
                 style={{ textShadow: "0 2px 24px rgba(0,0,0,0.85), 0 0 40px rgba(0,255,136,0.12)" }}
               >
                 {caption.text}
@@ -2268,22 +2255,6 @@ export default function JarvisUI() {
             chatMode === "bar" ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-28 opacity-0"
           }`}
         >
-          {(() => {
-            const lastReply = [...messages]
-              .reverse()
-              .map((m) => (m.role === "assistant" && m.text && isToolGarbage(m.text) ? { ...m, text: sanitizeAssistantText(m.text) } : m))
-              .find((m) => m.role === "assistant" && m.status === "done" && m.text);
-            // an active overlay owns the stage — the ticker would float on top of it
-            return lastReply && !(panel && !panelMin) ? (
-              <button
-                onClick={() => setChatMode("full")}
-                className="mx-auto mb-1.5 block max-w-[92%] truncate rounded-full bg-black/50 px-4 py-1 text-xs text-cyan/90 backdrop-blur-md hover:text-cyan"
-                title="expand chat"
-              >
-                {lastReply.text}
-              </button>
-            ) : null;
-          })()}
           <div className="glass flex items-stretch gap-2 rounded-2xl p-2 shadow-2xl">
             <button
               onClick={() => setChatMode("full")}

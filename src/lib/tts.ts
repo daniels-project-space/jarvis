@@ -222,7 +222,7 @@ export async function speak(
   // FAST PATH (default): instant on-device speech, zero network round-trip.
   // Kokoro on Replicate cold-starts for many seconds — this is why JARVIS
   // "took too long to talk". Hosted providers stay available in options.
-  const provider = typeof localStorage !== "undefined" ? localStorage.getItem("jarvis_tts") || "fast" : "fast";
+  const provider = typeof localStorage !== "undefined" ? localStorage.getItem("jarvis_tts") || "free" : "free";
   if (provider === "fast" && typeof window !== "undefined" && window.speechSynthesis) {
     if (draining) {
       if (/jarvis/i.test(text)) import("./wakeword").then((m) => m.setSuppressed?.(true, true)).catch(() => {});
