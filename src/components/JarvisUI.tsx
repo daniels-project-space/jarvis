@@ -1978,8 +1978,7 @@ export default function JarvisUI() {
             <div className="pointer-events-none absolute inset-x-0 top-[55%] z-30 flex justify-center px-6">
               <span
                 key={caption.text}
-                className={`cap-bloom line-clamp-4 max-w-[min(880px,90%)] overflow-hidden text-center text-2xl font-semibold leading-snug tracking-tight md:text-[2rem] lg:text-[2.2rem] ${caption.who === "you" ? "text-amber" : "text-ice"}`}
-                style={{ textShadow: "0 2px 24px rgba(0,0,0,0.85), 0 0 40px rgba(0,255,136,0.12)" }}
+                className={`cap-bloom line-clamp-4 max-w-[min(820px,88%)] overflow-hidden text-center text-xl font-semibold leading-snug tracking-tight md:text-[1.7rem] lg:text-[1.95rem] ${caption.who === "you" ? "text-amber" : "text-ice"}`}
               >
                 {caption.text}
               </span>
