@@ -1689,43 +1689,79 @@ async function researchTool(args: any): Promise<string> {
   );
 }
 
-// Hard calls get a slow, strong reasoning model instead of a reflex answer.
-async function deliberateTool(args: any): Promise<string> {
-  const question = String(args.question ?? "").trim();
-  if (!question) return "What's the decision?";
+// Fast, FREE reasoning pass on Groq's gpt-oss-120b. This is a genuine reasoning
+// model (reasoning_effort knob) but on Groq's near-instant inference: ~3-10s vs
+// the 30-75s OpenAI Responses calls that made JARVIS "think forever". Returns ""
+// on any failure so the caller can fall back to OpenAI.
+async function groqReason(system: string, input: string, effort: "low" | "medium" | "high" = "high", maxTokens = 2400): Promise<string> {
+  const gk = process.env.GROQ_API_KEY ?? (await getSecret("groq", "GROQ_API_KEY").catch(() => ""));
+  if (!gk) return "";
+  try {
+    const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${gk}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "openai/gpt-oss-120b",
+        reasoning_effort: effort,
+        temperature: 0.4,
+        max_tokens: maxTokens,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: input },
+        ],
+      }),
+      signal: AbortSignal.timeout(28_000),
+    });
+    if (!r.ok) return "";
+    const j: any = await r.json();
+    return String(j.choices?.[0]?.message?.content ?? "").trim();
+  } catch {
+    return "";
+  }
+}
+
+// OpenAI Responses reasoning — the deep fallback. Tight timeout so it fails fast
+// to the caller's own judgement rather than hanging.
+async function openaiReason(system: string, input: string, effort: "low" | "medium" | "high", timeoutMs: number): Promise<string> {
   const key = process.env.OPENAI_API_KEY ?? (await getSecret("openai", "OPENAI_API_KEY").catch(() => ""));
-  if (!key) return "Deep reasoning is unavailable (no OpenAI key).";
-  const prompt =
-    `You are the deep-reasoning core of JARVIS, advising Daniel (a solo builder/designer who ships fast and values taste).\n` +
-    `Think hard about the problem, weigh the real trade-offs, then give:\n` +
-    `1) A clear recommendation (one line).\n2) The 2-4 decisive reasons.\n3) What would change your mind.\n` +
-    `Be concrete and opinionated; no fence-sitting.\n\nPROBLEM: ${question}\n\nCONTEXT:\n${String(args.context ?? "").slice(0, 3000)}`;
-  for (const model of ["gpt-5.1", "gpt-5", "o4-mini"]) {
+  if (!key) return "";
+  for (const model of ["gpt-5.1", "gpt-5-mini"]) {
     try {
       const r = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" },
-        body: JSON.stringify({ model, input: prompt, reasoning: { effort: "high" }, max_output_tokens: 2000 }),
-        signal: AbortSignal.timeout(75_000),
+        body: JSON.stringify({ model, instructions: system, input, reasoning: { effort }, max_output_tokens: 8000 }),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (!r.ok) continue;
       const j: any = await r.json();
       const text =
         j.output_text ??
         (Array.isArray(j.output)
-          ? j.output
-              .flatMap((o: any) => (Array.isArray(o.content) ? o.content : []))
-              .filter((c: any) => c.type === "output_text")
-              .map((c: any) => c.text)
-              .join("\n")
+          ? j.output.flatMap((o: any) => (Array.isArray(o.content) ? o.content : [])).filter((c: any) => c.type === "output_text").map((c: any) => c.text).join("\n")
           : "");
-      if (text && text.trim()) {
-        await showResultsPanel(`deliberation · ${question.slice(0, 36)}`, `## ${question}\n\n${text}`);
-        return `CONSIDERED ANALYSIS (deliver the recommendation as your own view, in your voice, short — full version is on his screen):\n${text.slice(0, 4000)}`;
-      }
+      if (text && text.trim()) return text.trim();
     } catch {
-      /* try next model */
+      /* next model */
     }
+  }
+  return "";
+}
+
+// Hard calls get a real reasoning pass — fast+free on Groq first, OpenAI fallback.
+async function deliberateTool(args: any): Promise<string> {
+  const question = String(args.question ?? "").trim();
+  if (!question) return "What's the decision?";
+  const system =
+    `You are the deep-reasoning core of JARVIS, advising Daniel (a solo builder/designer who ships fast and values taste).\n` +
+    `Think hard about the problem, weigh the real trade-offs, then give:\n` +
+    `1) A clear recommendation (one line).\n2) The 2-4 decisive reasons.\n3) What would change your mind.\n` +
+    `Be concrete and opinionated; no fence-sitting.`;
+  const input = `PROBLEM: ${question}\n\nCONTEXT:\n${String(args.context ?? "").slice(0, 3000)}`;
+  const text = (await groqReason(system, input, "high", 2200)) || (await openaiReason(system, input, "high", 28_000));
+  if (text) {
+    await showResultsPanel(`deliberation · ${question.slice(0, 36)}`, `## ${question}\n\n${text}`);
+    return `CONSIDERED ANALYSIS (deliver the recommendation as your own view, in your voice, short — full version is on his screen):\n${text.slice(0, 4000)}`;
   }
   return "The reasoning pass failed — answer from your own judgement and say it wasn't double-checked.";
 }
@@ -2389,48 +2425,11 @@ async function marketAnalysisTool(args: any): Promise<string> {
     `\nNEWS:\n${news}\n` +
     (args.question ? `\nDANIEL'S QUESTION: ${String(args.question)}\n` : "");
 
-  const key = process.env.OPENAI_API_KEY ?? (await getSecret("openai", "OPENAI_API_KEY").catch(() => ""));
-  if (!key) return "Analysis core unavailable (no OpenAI key).";
-  let analysis = "";
-  let lastErr = "";
-  // max_output_tokens INCLUDES reasoning tokens on the Responses API — a tight
-  // budget gets fully consumed by thinking and returns zero visible text.
-  const attempts: [string, string, number][] = [
-    ["gpt-5.1", "medium", 75_000],
-    ["gpt-5-mini", "medium", 35_000],
-  ];
-  for (const [model, effort, timeout] of attempts) {
-    try {
-      const r = await fetch("https://api.openai.com/v1/responses", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" },
-        body: JSON.stringify({
-          model,
-          instructions: ANALYST_SYSTEM,
-          input: dossier,
-          reasoning: { effort },
-          max_output_tokens: 8000,
-        }),
-        signal: AbortSignal.timeout(timeout),
-      });
-      if (!r.ok) {
-        lastErr = `${model}: ${r.status} ${(await r.text()).slice(0, 120)}`;
-        continue;
-      }
-      const j: any = await r.json();
-      analysis =
-        j.output_text ??
-        (Array.isArray(j.output)
-          ? j.output.flatMap((o: any) => (Array.isArray(o.content) ? o.content : [])).filter((c: any) => c.type === "output_text").map((c: any) => c.text).join("\n")
-          : "");
-      if (analysis.trim()) break;
-      lastErr = `${model}: empty text (status ${j.status ?? "?"}${j.incomplete_details?.reason ? ", " + j.incomplete_details.reason : ""})`;
-    } catch (e: any) {
-      lastErr = `${model}: ${String(e?.message ?? e).slice(0, 80)}`;
-    }
-  }
+  // Fast+free reasoning on Groq first (~5-10s), OpenAI gpt-5.1 as a tight-timeout
+  // deep fallback. This replaced a 75s+ gpt-5.1 call that made it hang forever.
+  const analysis = (await groqReason(ANALYST_SYSTEM, dossier, "high", 4000)) || (await openaiReason(ANALYST_SYSTEM, dossier, "medium", 30_000));
   if (!analysis.trim())
-    return `The analysis pass failed (${lastErr}) — show the chart with price_chart and reason from the summary instead.`;
+    return `The analysis pass failed — show the chart with price_chart and reason from the summary instead.`;
 
   // annotated chart on the big screen + the full write-up as a tappable card
   const verdictLine = (analysis.match(/## Verdict[\s\S]*?\n([^\n#].{20,240})/i)?.[1] ?? "").trim();

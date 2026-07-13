@@ -19,7 +19,7 @@ type Msg = {
   createdAt: number;
 };
 type Job = { _id: string; task: string; model?: string; status: string; progress?: string; log?: string; startedAt: number };
-type Caption = { who: "you" | "jarvis"; text: string } | null;
+type Caption = { who: "you" | "jarvis"; text: string; exiting?: boolean } | null;
 
 const ytId = (s: string) => {
   const m = String(s).match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([\w-]{11})/);
@@ -918,6 +918,18 @@ export default function JarvisUI() {
   const [recording, setRecording] = useState(false);
   const [live, setLive] = useState<"off" | "connecting" | "live">("off");
   const [caption, setCaption] = useState<Caption>(null);
+  // Soft dismiss: mark the caption `exiting` so it fades out slowly (CSS), then
+  // unmount after the fade. A fresh caption cancels a pending fade.
+  const captionExitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fadeCaption = (onlyText?: string) => {
+    if (captionExitTimer.current) clearTimeout(captionExitTimer.current);
+    setCaption((c) => (c && (!onlyText || c.text === onlyText) ? { ...c, exiting: true } : c));
+    captionExitTimer.current = setTimeout(() => setCaption((c) => (c?.exiting ? null : c)), 1200);
+  };
+  const showCaption = (c: Caption) => {
+    if (captionExitTimer.current) clearTimeout(captionExitTimer.current);
+    setCaption(c);
+  };
   const [agentView, setAgentView] = useState<string | null>(null);
   const [nowTs, setNowTs] = useState(0);
   // Viewport minimize: keep talking and the panel folds into a pill; the orb
@@ -1442,11 +1454,11 @@ export default function JarvisUI() {
           setSpeaking(true);
           // the spoken words bloom under the orb for TYPED turns too, not just
           // live voice — this is the caption overlay Daniel wasn't seeing
-          setCaption({ who: "jarvis", text: spokenText });
+          showCaption({ who: "jarvis", text: spokenText });
         },
         () => {
           setSpeaking(false);
-          setCaption((c) => (c && c.who === "jarvis" && c.text === spokenText ? null : c));
+          fadeCaption(spokenText); // slow, graceful fade after he finishes speaking
         },
       );
       // free-voice conversation: keep the loop going until Daniel goes quiet
@@ -1556,9 +1568,14 @@ export default function JarvisUI() {
         rearmWake();
       },
       onCaption: (who, text, done) => {
-        const c = done ? null : { who, text } as Caption;
-        captionRef.current = c;
-        setCaption(c);
+        if (done) {
+          captionRef.current = null;
+          fadeCaption(); // let the last line linger and fade, not snap away
+        } else {
+          const c = { who, text } as Caption;
+          captionRef.current = c;
+          showCaption(c);
+        }
       },
       onTurnDone: (role, text) => {
         void logTurn({ threadId: threadRef.current, role, text, model: role === "assistant" ? "live" : undefined });
@@ -1992,7 +2009,7 @@ export default function JarvisUI() {
             <div className="pointer-events-none absolute inset-x-0 top-[55%] z-30 flex justify-center px-6">
               <span
                 key={caption.text}
-                className={`cap-bloom line-clamp-4 max-w-[min(820px,88%)] overflow-hidden text-center text-xl font-semibold leading-snug tracking-tight md:text-[1.7rem] lg:text-[1.95rem] ${caption.who === "you" ? "text-amber" : "text-ice"}`}
+                className={`${caption.exiting ? "cap-fade-out" : "cap-bloom"} line-clamp-4 max-w-[min(820px,88%)] overflow-hidden text-center text-xl font-semibold leading-snug tracking-tight md:text-[1.7rem] lg:text-[1.95rem] ${caption.who === "you" ? "text-amber" : "text-ice"}`}
               >
                 {caption.text}
               </span>

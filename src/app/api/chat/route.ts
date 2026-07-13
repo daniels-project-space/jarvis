@@ -254,13 +254,20 @@ export async function POST(req: NextRequest) {
     ];
     const tools = TOOL_DEFS.map(groqToolDef);
 
-    // Hard questions get real thinking; chit-chat stays instant. Design,
-    // creative and multi-constraint asks are exactly where low effort showed.
+    // TWO-TIER BRAIN. Tier 1 is Groq's gpt-oss-120b: free, and near-instant —
+    // it answers everything BASIC (chit-chat, searches, shows, quick tool calls)
+    // in ~1s. Tier 2 escalates to Claude's higher intelligence ONLY for genuinely
+    // hard turns: sonnet for most, opus for the very hardest. The deep reasoning
+    // tools (deliberate, market_analysis) do the heavy lifting either way and now
+    // run fast on Groq too, so even a Tier-1 turn can go deep without hanging.
     const complex =
-      text.length > 220 ||
-      /\b(design|architect|creative|brainstorm|compare|trade-?offs?|should i|which (one|is better)|pros and cons|strategy|plan out|name (it|the)|decide|recommend|story|script|character|feel(ing)?|worried|advice|honest|feedback|idea)\b/i.test(
+      text.length > 240 ||
+      /\b(design|architect|creative|brainstorm|compare|trade-?offs?|should i|which (one|is better)|pros and cons|strateg|plan out|name (it|the)|decide|recommend|story|script|character|feel(ing)?|worried|advice|honest|feedback|analy[sz]|assess|evaluate|critique|deep dive)\b/i.test(
         text,
       );
+    const veryComplex =
+      text.length > 600 ||
+      /\b(think (really |very )?hard|think deeply|thorough(ly)?|from first principles|deep dive)\b/i.test(text);
 
     let final = "";
     let interimSaid = false;
@@ -269,22 +276,14 @@ export async function POST(req: NextRequest) {
     let brain = "flash";
     const claudeProgress = { toolsRan: 0 };
     const anthKey = process.env.ANTHROPIC_AUTH_TOKEN ?? (await getSecret("anthropic", "ANTHROPIC_AUTH_TOKEN").catch(() => ""));
-    if (anthKey) {
-      // Intelligent tier switch: haiku for quick conversational turns, sonnet
-      // for anything doing real work, opus for the genuinely hard stuff.
-      const ACTION =
-        /(show|find|search|plan|make|create|draft|write|analy[sz]|check|open|play|buy|book|add|remove|remind|schedule|trip|weather|chart|news|shop|video|email|fix|build|deploy|research|look)/i;
-      const claudeModel = complex
-        ? "claude-opus-4-8"
-        : text.length < 60 && !ACTION.test(text)
-          ? "claude-haiku-4-5-20251001"
-          : "claude-sonnet-5";
+    if (anthKey && (complex || veryComplex)) {
+      const claudeModel = veryComplex ? "claude-opus-4-8" : "claude-sonnet-5";
       try {
         const r = await runClaude(anthKey, messages, claudeModel, claudeProgress, staticSys, dynamicSys);
         final = r.final;
         used.push(...r.used);
         screenTouched = r.screenTouched;
-        brain = claudeModel.includes("opus") ? "opus" : claudeModel.includes("sonnet") ? "sonnet" : "haiku";
+        brain = claudeModel.includes("opus") ? "opus" : "sonnet";
       } catch {
         // Groq picks the turn up below — UNLESS Claude already ran tools
         // (re-running them would double todos/panels/agents); then we go
