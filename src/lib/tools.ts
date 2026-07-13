@@ -92,7 +92,7 @@ export const TOOL_DEFS = [
       required: ["site"],
     },
   },
-  { name: "hide", description: "Clear the screen panel.", parameters: { type: "object", properties: {} } },
+  { name: "hide", description: "Close the current on-screen overlay/panel — call when Daniel says close/hide it, or when the conversation has clearly moved on from what's showing.", parameters: { type: "object", properties: {} } },
   {
     name: "web_search",
     description:
@@ -546,12 +546,6 @@ export const TOOL_DEFS = [
       type: "object",
       properties: { kind: { type: "string", enum: ["canvas", "chart", "image", "pdf", "doc"], description: "filter, optional" } },
     },
-  },
-  {
-    name: "hide",
-    description:
-      "Close the current on-screen overlay/panel. Call when Daniel says to close/hide it, or when the conversation has clearly moved on from what's showing.",
-    parameters: { type: "object", properties: {} },
   },
   {
     name: "draft",
