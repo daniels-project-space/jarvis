@@ -301,9 +301,59 @@ export async function searchNews(query: string | null, gl = "us"): Promise<NewsR
     image: String(n.thumbnail ?? ""),
   }));
   if (serpNews.length) return serpNews;
-  // FREE keyless fallback: Google News RSS. No image field, so a WordPress
-  // mShots screenshot of the article stands in for the hero image.
+  // FREE keyless fallbacks. For the day's headlines, UK publisher feeds carry
+  // real editorial photos (media:content) — a proper cinematic feed. Topic
+  // searches use Google News RSS (broad, but gradient cards, no images).
+  if (!query) {
+    const pub = await publisherNews();
+    if (pub.length >= 4) return pub;
+  }
   return await googleNewsRss(query, gl);
+}
+
+// UK publisher RSS with real images (Guardian + BBC world), merged.
+async function publisherNews(): Promise<NewsResult[]> {
+  const feeds = [
+    { url: "https://www.theguardian.com/uk/rss", source: "The Guardian" },
+    { url: "https://feeds.bbci.co.uk/news/world/rss.xml", source: "BBC News" },
+    { url: "https://www.theguardian.com/world/rss", source: "The Guardian" },
+  ];
+  const dec = (s: string) =>
+    s.replace(/<!\[CDATA\[|\]\]>/g, "").replace(/&amp;/g, "&").replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim();
+  const all: NewsResult[] = [];
+  await Promise.all(
+    feeds.map(async (f) => {
+      try {
+        const r = await fetch(f.url, { headers: { "user-agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(8000) });
+        if (!r.ok) return;
+        const xml = await r.text();
+        for (const it of xml.split("<item>").slice(1, 9)) {
+          const title = dec((it.match(/<title>([\s\S]*?)<\/title>/) || [, ""])[1]);
+          const link = dec((it.match(/<(?:link|guid[^>]*)>([\s\S]*?)<\/(?:link|guid)>/) || [, ""])[1]);
+          const pub = (it.match(/<pubDate>([\s\S]*?)<\/pubDate>/) || [, ""])[1].trim();
+          // largest media:content / media:thumbnail image
+          let img = "";
+          let bestW = 0;
+          for (const mm of it.matchAll(/<media:(?:content|thumbnail)[^>]*url="([^"]+)"[^>]*(?:width="(\d+)")?/g)) {
+            const wd = Number(mm[2] || 0);
+            if (!img || wd >= bestW) {
+              img = mm[1].replace(/&amp;/g, "&");
+              bestW = wd;
+            }
+          }
+          if (title && link) all.push({ title: title.slice(0, 140), link, source: f.source, date: pub ? new Date(pub).toLocaleDateString("en-GB", { day: "numeric", month: "short" }) : "", image: img });
+        }
+      } catch {
+        /* skip feed */
+      }
+    }),
+  );
+  // images first, dedupe by title
+  const seen = new Set<string>();
+  return all
+    .filter((n) => (seen.has(n.title) ? false : (seen.add(n.title), true)))
+    .sort((a, b) => (b.image ? 1 : 0) - (a.image ? 1 : 0))
+    .slice(0, 12);
 }
 
 async function googleNewsRss(query: string | null, gl = "us"): Promise<NewsResult[]> {
