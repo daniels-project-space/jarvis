@@ -1,6 +1,6 @@
 import "server-only";
 import { convexMutation, convexQuery } from "./context";
-import { getSecret } from "./vault";
+import { getSecret, getServiceSecrets } from "./vault";
 import { r2Put, r2StoreFromUrl } from "./r2";
 
 // JARVIS's tool belt — one definition list (OpenAI function schema) executed
