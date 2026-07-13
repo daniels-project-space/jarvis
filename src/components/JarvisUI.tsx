@@ -737,8 +737,8 @@ function Viewport({
   onToggleFull: () => void;
 }) {
   return (
-    <div className="materialize glass relative flex h-full flex-col overflow-hidden rounded-2xl">
-      <div className="flex items-center justify-between border-b border-white/5 px-3 py-2">
+    <div className="materialize frost-shell relative flex h-full flex-col overflow-hidden rounded-2xl">
+      <div className="flex items-center justify-between border-b border-white/8 px-3 py-2">
         <span className="hud-label truncate !text-cyan-dim">{panel.title ?? panel.type}</span>
         <span className="flex shrink-0 gap-1">
           <button onClick={onToggleFull} className="hud-label rounded px-2 py-1 hover:text-cyan" title={full ? "shrink" : "full screen"}>
