@@ -1346,6 +1346,48 @@ export default function JarvisUI() {
   // Screen sight: share a screen/window for ONE frame — JARVIS reads it and
   // answers about what's actually in front of Daniel.
   const [seeing, setSeeing] = useState(false);
+  // Camera sight (ported from GauravSingh9356/J.A.R.V.I.S live-OCR idea, upgraded
+  // to full scene+text understanding): point the phone/webcam at anything —
+  // a document, a label, a whiteboard, a product — and JARVIS reads it.
+  const [camSeeing, setCamSeeing] = useState(false);
+  async function lookAtCamera() {
+    if (camSeeing) return;
+    setCamSeeing(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 } },
+        audio: false,
+      });
+      const video = document.createElement("video");
+      video.srcObject = stream;
+      video.setAttribute("playsinline", "true");
+      await video.play();
+      await new Promise((r) => setTimeout(r, 500)); // autofocus + first frame
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.min(1920, video.videoWidth || 1280);
+      canvas.height = Math.round(canvas.width * ((video.videoHeight || 720) / (video.videoWidth || 1280)));
+      canvas.getContext("2d")!.drawImage(video, 0, 0, canvas.width, canvas.height);
+      stream.getTracks().forEach((t) => t.stop());
+      const image = canvas.toDataURL("image/jpeg", 0.82);
+      const q = input.trim();
+      const r = await fetch("/api/see", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ image, question: q, mode: "camera" }),
+      });
+      const { description } = await r.json();
+      if (description) {
+        setInput("");
+        void submit(
+          `(I just pointed my camera at something. It shows: ${description})${q ? `\n\nMy question: ${q}` : "\n\nTell me what this is and anything useful about it."}`,
+        );
+      }
+    } catch {
+      /* no camera / cancelled */
+    }
+    setCamSeeing(false);
+  }
+
   async function lookAtScreen() {
     if (seeing) return;
     setSeeing(true);
@@ -1809,6 +1851,13 @@ export default function JarvisUI() {
               className={`shrink-0 rounded-xl px-3 text-sm transition ${seeing ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50 animate-pulse" : "glass text-slate hover:text-ice"}`}
             >
               👁
+            </button>
+            <button
+              onClick={() => void lookAtCamera()}
+              title="point your camera at something — JARVIS reads it"
+              className={`shrink-0 rounded-xl px-3 text-sm transition ${camSeeing ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50 animate-pulse" : "glass text-slate hover:text-ice"}`}
+            >
+              📷
             </button>
             {(speaking || (live === "live" && caption?.who === "jarvis")) && (
               <button

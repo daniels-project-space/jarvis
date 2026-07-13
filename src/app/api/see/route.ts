@@ -16,6 +16,7 @@ export async function POST(req: NextRequest) {
     const b = await req.json();
     image = String(b.image ?? ""); // data:image/jpeg;base64,...
     question = String(b.question ?? "").slice(0, 400);
+    var mode = String(b.mode ?? "screen");
   } catch {
     return Response.json({ error: "bad request" }, { status: 400 });
   }
@@ -34,10 +35,15 @@ export async function POST(req: NextRequest) {
             {
               type: "text",
               text:
-                "This is Daniel's shared screen. Describe what's on it densely and usefully for an assistant about to help him: " +
-                "the app/site, the specific content (titles, code, errors, numbers, form fields), and anything that looks like the thing he needs help with. " +
-                (question ? `He asked: "${question}" — focus on what's relevant to that.` : "") +
-                " Under 180 words, no preamble.",
+                mode === "camera"
+                  ? "Daniel just pointed his camera at something in the real world. Identify it and read ALL legible text verbatim (labels, documents, signs, screens, packaging, handwriting, serial/model numbers, prices). " +
+                    "Then say concisely what it is and anything useful about it. " +
+                    (question ? `He asked: "${question}" — focus on that.` : "") +
+                    " Under 180 words, no preamble."
+                  : "This is Daniel's shared screen. Describe what's on it densely and usefully for an assistant about to help him: " +
+                    "the app/site, the specific content (titles, code, errors, numbers, form fields), and anything that looks like the thing he needs help with. " +
+                    (question ? `He asked: "${question}" — focus on what's relevant to that.` : "") +
+                    " Under 180 words, no preamble.",
             },
             { type: "image_url", image_url: { url: image, detail: "high" } },
           ],

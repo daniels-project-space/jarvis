@@ -100,6 +100,23 @@ async function vaultService(service: string): Promise<Record<string, string>> {
   }
 }
 
+// Cheapest live price for a product (UK) — self-contained so the price-watch
+// cron never has to import the server-only tools module.
+async function cheapestPrice(query: string): Promise<{ priceNum: number } | null> {
+  const key = process.env.SERPAPI_KEY || (await vaultService("serpapi")).SERPAPI_KEY;
+  if (!key) return null;
+  const qs = new URLSearchParams({ engine: "google_shopping", q: query, gl: "uk", hl: "en", num: "20", api_key: key });
+  try {
+    const j: any = await (await fetch(`https://serpapi.com/search.json?${qs}`, { signal: AbortSignal.timeout(10000) })).json();
+    const rows = (j?.shopping_results ?? []).filter((r: any) => r.extracted_price);
+    if (!rows.length) return null;
+    rows.sort((a: any, b: any) => Number(a.extracted_price) - Number(b.extracted_price));
+    return { priceNum: Number(rows[0].extracted_price) };
+  } catch {
+    return null;
+  }
+}
+
 // MCP servers the brain can attach on demand. Browserbase = hosted browsers
 // (no local Chromium in the Trigger image); context7 = live library docs.
 async function buildMcpConfig(names: string[]): Promise<string | null> {
@@ -396,6 +413,29 @@ export const agentRunner = schedules.task({
       }
     } catch {
       /* reminders must never block jobs either */
+    }
+    // Price watches: re-price a few due products, ping on a meaningful drop.
+    try {
+      const watches: any[] = (await convexQuery("watches:due", {})) ?? [];
+      for (const w of watches) {
+        const now = await cheapestPrice(w.query).catch(() => null);
+        if (!now) {
+          await convexMutation("watches:touch", { id: w._id }).catch(() => {});
+          continue;
+        }
+        const prev = Number(w.lastGbp) || 0;
+        const target = Number(w.targetGbp) || 0;
+        const hitTarget = target > 0 && now.priceNum <= target;
+        const bigDrop = prev > 0 && now.priceNum <= prev * 0.93; // >=7% cheaper
+        if (hitTarget || bigDrop) {
+          const line = `💸 Price drop, sir — "${w.query}" is now £${now.priceNum}${prev ? ` (was £${prev})` : ""}${target ? `, under your £${target}` : ""}.`;
+          await convexMutation("chatQueue:postAssistant", { threadId: await chatThread(), text: line }).catch(() => {});
+          await sendPush("💸 Price drop", `${w.query} → £${now.priceNum}`, "/").catch(() => {});
+        }
+        await convexMutation("watches:record", { id: w._id, lastGbp: now.priceNum }).catch(() => {});
+      }
+    } catch {
+      /* watches never block jobs */
     }
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: "/tmp/claude-home", ANTHROPIC_API_KEY: "" };
     mkdirSync("/tmp/claude-home/.claude", { recursive: true });

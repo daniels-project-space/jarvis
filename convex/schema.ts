@@ -62,6 +62,16 @@ export default defineSchema({
 
   // Background agent jobs: brain enqueues, agent-runner Trigger task executes
   // (Claude Code / Opus, optional repo clone+push) and reports back into chat.
+  // Price watches — the cron re-prices and pings when a product drops.
+  watches: defineTable({
+    query: v.string(),
+    targetGbp: v.optional(v.number()),
+    lastGbp: v.optional(v.number()),
+    status: v.string(), // active | cancelled
+    checkedAt: v.optional(v.number()),
+    createdAt: v.number(),
+  }).index("by_status", ["status"]),
+
   // Timed reminders — delivered by the agent-runner cron as push + weave.
   reminders: defineTable({
     text: v.string(),

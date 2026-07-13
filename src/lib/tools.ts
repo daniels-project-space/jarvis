@@ -580,6 +580,24 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "price_watch",
+    description:
+      "Watch a product's price and ping Daniel when it drops (checks every few hours, alerts on a meaningful fall or below his target). Use for 'let me know if X gets cheaper', 'watch the price of Y', 'tell me when the RTX 5090 drops below £1500'.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "the specific product to track" },
+        target_gbp: { type: "number", description: "optional: alert when it falls below this price" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "watch_cancel",
+    description: "Stop watching a product's price ('stop watching the headphones').",
+    parameters: { type: "object", properties: { match: { type: "string" } }, required: ["match"] },
+  },
+  {
     name: "shop_search",
     description:
       "SHOPPING CONCIERGE: find real products for Daniel (UK — pounds, UK retailers, fast delivery prioritised) with prices, merchant links and product images cut out onto presentation frames — shows THREE at a time. Use for any 'find/buy me X' (gifts, clothes, gear). After showing: ask which fits or what to change, refine with another search, and when he picks one OFFER to run the checkout agent (dispatch_agent with mcp:[\"browserbase\"] task: add the exact product to cart on the merchant site and return the checkout/payment link).",
@@ -1947,6 +1965,20 @@ async function memoryMapTool(args: any): Promise<string> {
 
 // Shopping concierge: Google Shopping (UK) -> product cards with cutout-style
 // images on frames, three at a time.
+// Cheapest live price for a product query (UK) — shared by shop_search and the
+// price-watch cron. Returns the best match or null.
+export async function cheapestPrice(query: string): Promise<{ priceNum: number; title: string; url: string } | null> {
+  const key = process.env.SERPAPI_KEY ?? (await getSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
+  if (!key) return null;
+  const qs = new URLSearchParams({ engine: "google_shopping", q: query, gl: "uk", hl: "en", num: "20", api_key: key });
+  const j: any = await (await fetch(`https://serpapi.com/search.json?${qs}`, { signal: AbortSignal.timeout(10000) }).catch(() => null))?.json?.() ?? {};
+  const rows = (j?.shopping_results ?? []).filter((r: any) => r.extracted_price);
+  if (!rows.length) return null;
+  rows.sort((a: any, b: any) => Number(a.extracted_price) - Number(b.extracted_price));
+  const r = rows[0];
+  return { priceNum: Number(r.extracted_price), title: String(r.title ?? query).slice(0, 90), url: String(r.product_link ?? r.link ?? "") };
+}
+
 async function shopSearch(args: any): Promise<string> {
   const query = String(args.query ?? "").trim();
   if (!query) return "What am I finding?";
@@ -2545,6 +2577,20 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await transportRoute(args);
     case "memory_map":
       return await memoryMapTool(args);
+    case "price_watch": {
+      const q = String(args.query ?? "").trim();
+      if (!q) return "TOOL DID NOTHING: what should I watch?";
+      const now = await cheapestPrice(q).catch(() => null);
+      await convexMutation("watches:add", { query: q, targetGbp: Number(args.target_gbp) || undefined, lastGbp: now?.priceNum });
+      const tgt = Number(args.target_gbp) || 0;
+      return now
+        ? `Watching "${q}" — cheapest right now is £${now.priceNum}${tgt ? `, I'll ping you if it drops below £${tgt}` : ", I'll ping you if it drops"}. Confirm briefly.`
+        : `Watching "${q}"${tgt ? ` for a drop below £${tgt}` : ""} — couldn't get a price this second but I'll keep checking. Confirm briefly.`;
+    }
+    case "watch_cancel": {
+      const hit = await convexMutation("watches:cancel", { match: String(args.match ?? "") });
+      return hit ? `Stopped watching "${hit}".` : "TOOL DID NOTHING: no active watch matches that.";
+    }
     case "shop_search":
       return await shopSearch(args);
     case "draft":
