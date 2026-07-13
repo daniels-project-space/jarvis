@@ -130,10 +130,11 @@ async function playBuffer(arr: ArrayBuffer, onEnergy: (e: number) => void, spoke
 
 async function fetchAudio(text: string): Promise<ArrayBuffer | null> {
   try {
+    const provider = typeof localStorage !== "undefined" ? localStorage.getItem("jarvis_tts") || undefined : undefined;
     const r = await fetch("/api/tts", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, provider }),
     });
     if (!r.ok) return null;
     return await r.arrayBuffer();

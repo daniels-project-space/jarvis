@@ -186,7 +186,95 @@ function ModelBadge({ model }: { model?: string | null }) {
 // Ambient arc-reactor HUD ring — concentric SVG rings (a segmented outer ring,
 // a counter-rotating scanner, radial ticks) framing the orb when the stage is
 // clear. Subtle by default; brightens when JARVIS is engaged.
-function ReactorRing({ active }: { active: boolean }) {
+// Options panel — a frosted-glass sheet dropping from the top right. Voice lane,
+// speaking voice, motion, and a manual mood override.
+const OPTION_MOODS: { k: string; c: string }[] = [
+  { k: "calm", c: "#00ff88" }, { k: "focused", c: "#4a9eed" }, { k: "dreamy", c: "#9775fa" },
+  { k: "warm", c: "#ffb454" }, { k: "tender", c: "#ff9ec4" }, { k: "playful", c: "#ff7ad9" },
+  { k: "curious", c: "#33e0d0" }, { k: "serious", c: "#8fa3bd" }, { k: "excited", c: "#ff5470" },
+];
+function OptionsPanel({
+  prefs, setPref, live, onClose, onToggleLive, onMood, onClearMood,
+}: {
+  prefs: { voice: string; tts: string; reduceMotion: boolean };
+  setPref: (k: "voice" | "tts" | "reduceMotion", v: string | boolean) => void;
+  live: string;
+  onClose: () => void;
+  onToggleLive: () => void;
+  onMood: (m: string) => void;
+  onClearMood: () => void;
+}) {
+  const Row = ({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) => (
+    <div className="flex items-center justify-between gap-4 py-2.5">
+      <div className="min-w-0">
+        <div className="text-[13px] text-ice">{label}</div>
+        {hint && <div className="text-[10px] leading-tight text-slate">{hint}</div>}
+      </div>
+      <div className="shrink-0">{children}</div>
+    </div>
+  );
+  const Seg = ({ opts, val, on }: { opts: [string, string][]; val: string; on: (v: string) => void }) => (
+    <div className="flex overflow-hidden rounded-lg border border-white/10 bg-black/30 text-[11px]">
+      {opts.map(([v, lbl]) => (
+        <button key={v} onClick={() => on(v)} className={`px-2.5 py-1 transition ${val === v ? "bg-cyan/20 text-cyan" : "text-slate hover:text-ice"}`}>
+          {lbl}
+        </button>
+      ))}
+    </div>
+  );
+  return (
+    <>
+      <div className="fixed inset-0 z-[55]" onClick={onClose} />
+      <div className="absolute right-3 top-14 z-[56] w-[min(340px,92vw)] rounded-2xl border border-white/12 bg-[rgba(14,22,38,0.72)] p-4 shadow-2xl backdrop-blur-2xl md:right-5">
+        <div className="mb-1 flex items-center justify-between">
+          <span className="hud-label !text-cyan">options</span>
+          <button onClick={onClose} className="hud-label hover:text-cyan">close</button>
+        </div>
+        <div className="divide-y divide-white/5">
+          <Row label="Voice" hint="how 'hey Jarvis' talks back">
+            <Seg opts={[["free", "Free"], ["realtime", "Live"]]} val={prefs.voice} on={(v) => setPref("voice", v)} />
+          </Row>
+          <Row label="Speaking voice" hint="free Kokoro or premium ElevenLabs">
+            <Seg opts={[["free", "Kokoro"], ["elevenlabs", "Eleven"]]} val={prefs.tts} on={(v) => setPref("tts", v)} />
+          </Row>
+          <Row label="Live conversation" hint={live !== "off" ? "on now" : "start a realtime voice session"}>
+            <button onClick={onToggleLive} className={`rounded-lg px-3 py-1 text-[11px] transition ${live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>
+              {live === "connecting" ? "…" : live !== "off" ? "stop" : "start"}
+            </button>
+          </Row>
+          <Row label="Reduce motion" hint="calmer orb + fewer animations">
+            <button onClick={() => setPref("reduceMotion", !prefs.reduceMotion)} className={`h-5 w-9 rounded-full p-0.5 transition ${prefs.reduceMotion ? "bg-cyan/60" : "bg-white/15"}`}>
+              <span className={`block h-4 w-4 rounded-full bg-white transition-transform ${prefs.reduceMotion ? "translate-x-4" : ""}`} />
+            </button>
+          </Row>
+          <div className="py-2.5">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-[13px] text-ice">Orb mood</span>
+              <button onClick={onClearMood} className="text-[10px] text-slate hover:text-cyan">auto</button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {OPTION_MOODS.map((m) => (
+                <button
+                  key={m.k}
+                  onClick={() => onMood(m.k)}
+                  title={m.k}
+                  className="h-6 w-6 rounded-full ring-1 ring-white/20 transition hover:scale-110 hover:ring-white/50"
+                  style={{ background: m.c, boxShadow: `0 0 10px ${m.c}66` }}
+                />
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// Ambient arc-reactor ring. Stays mounted and eases WITH the orb: when the orb
+// glides aside for an overlay, the ring shrinks toward it and fades; when the
+// orb returns to centre, the ring blooms back. Never unmounts (that was the
+// abrupt pop). `active` brightens it while JARVIS is engaged.
+function ReactorRing({ active, aside, hidden }: { active: boolean; aside: boolean; hidden: boolean }) {
   const ticks = useMemo(
     () =>
       Array.from({ length: 60 }, (_, i) => {
@@ -196,8 +284,12 @@ function ReactorRing({ active }: { active: boolean }) {
       }),
     [],
   );
+  const opacity = hidden ? 0 : aside ? 0.1 : active ? 0.5 : 0.22;
   return (
-    <div className={`pointer-events-none absolute inset-0 grid place-items-center transition-opacity duration-1000 ${active ? "opacity-[0.5]" : "opacity-[0.22]"}`}>
+    <div
+      className="pointer-events-none absolute inset-0 grid place-items-center transition-all duration-[900ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
+      style={{ opacity, transform: aside ? "translateX(41%) scale(0.62)" : "translateX(0) scale(1)" }}
+    >
       <svg viewBox="0 0 500 500" className="h-[min(78vmin,720px)] w-[min(78vmin,720px)]" style={{ filter: "drop-shadow(0 0 8px rgba(0,255,136,0.35))" }}>
         <g fill="none" stroke="var(--cyan)">
           <circle cx="250" cy="250" r="244" strokeWidth="1" strokeOpacity="0.25" strokeDasharray="40 20" style={{ transformOrigin: "center", animation: "reactor-slow 46s linear infinite" }} />
@@ -931,6 +1023,23 @@ export default function JarvisUI() {
   const [bubbles, setBubbles] = useState<{ type: string; value: string; title?: string }[]>([]);
   const prevPanelRef = useRef<{ type: string; value: string; title?: string; updatedAt: number } | null>(null);
 
+  // Options panel + persisted preferences (voice lane, TTS voice, wake, motion)
+  const [optionsOpen, setOptionsOpen] = useState(false);
+  const setMoodMut = useMutation(api.ui.setMood);
+  const [prefs, setPrefs] = useState({ voice: "free", tts: "free", reduceMotion: false });
+  useEffect(() => {
+    setPrefs({
+      voice: localStorage.getItem("jarvis_voice") || "free",
+      tts: localStorage.getItem("jarvis_tts") || "free",
+      reduceMotion: localStorage.getItem("jarvis_reduce_motion") === "1",
+    });
+  }, []);
+  const setPref = (k: "voice" | "tts" | "reduceMotion", v: string | boolean) => {
+    setPrefs((p) => ({ ...p, [k]: v }));
+    const key = k === "voice" ? "jarvis_voice" : k === "tts" ? "jarvis_tts" : "jarvis_reduce_motion";
+    localStorage.setItem(key, typeof v === "boolean" ? (v ? "1" : "0") : String(v));
+  };
+
   // Chat history drawer + intelligent video handling (16:9 stage / PiP corner)
   const [drawerOpen, setDrawerOpen] = useState(false);
   const stageRef = useRef<HTMLDivElement>(null);
@@ -1646,8 +1755,26 @@ export default function JarvisUI() {
           >
             ping
           </button>
+          <button
+            onClick={() => setOptionsOpen((o) => !o)}
+            title="options"
+            className={`rounded px-1 text-sm transition ${optionsOpen ? "text-cyan" : "text-slate hover:text-cyan"}`}
+          >
+            <span className="inline-block transition-transform duration-500" style={{ transform: optionsOpen ? "rotate(90deg)" : "none" }}>⚙</span>
+          </button>
         </div>
       </header>
+      {optionsOpen && (
+        <OptionsPanel
+          prefs={prefs}
+          setPref={setPref}
+          live={live}
+          onClose={() => setOptionsOpen(false)}
+          onToggleLive={() => void toggleLive()}
+          onMood={(m) => void setMoodMut({ mood: m })}
+          onClearMood={() => void setMoodMut({ mood: "calm" })}
+        />
+      )}
 
       {/* ALWAYS-VISIBLE activity layer: whenever JARVIS is thinking or agents
           are working, the pills sit right under the header on every screen —
@@ -1733,9 +1860,13 @@ export default function JarvisUI() {
               <AgentLiveView job={shownJob} now={nowTs} onClose={() => setAgentView(null)} />
             </div>
           ) : null}
-          {/* arc-reactor HUD ring — ambient Iron-Man frame behind the orb when
-              the stage is clear (ported concept from JARVIS-MARK5's SVG HUD) */}
-          {!(panel && !panelMin) && <ReactorRing active={live === "live" || orbState === "thinking" || orbState === "listening"} />}
+          {/* arc-reactor HUD ring — always mounted, eases with the orb: follows
+              it aside for a compact overlay, fully out for a full-bleed one */}
+          <ReactorRing
+            active={live === "live" || orbState === "thinking" || orbState === "listening"}
+            aside={!!panel && !panelMin && panel.type !== "video" && (panelFull || stagePanelSize !== "h-full w-full")}
+            hidden={!!panel && !panelMin && (panel.type === "video" || (!panelFull && stagePanelSize === "h-full w-full"))}
+          />
           {/* the orb steps back while a panel is up — content stays readable */}
           <div
             className={`h-full w-full transition-opacity duration-700 ${

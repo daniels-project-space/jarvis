@@ -79,18 +79,22 @@ async function kokoro(text: string): Promise<Response | null> {
 
 export async function POST(req: NextRequest) {
   let text = "";
+  let provider = "";
   try {
-    ({ text } = await req.json());
+    const b = await req.json();
+    text = b.text;
+    provider = String(b.provider ?? "");
   } catch {
     return new Response("bad request", { status: 400 });
   }
   const clean = stripForSpeech(String(text || "")).slice(0, 1500);
   if (!clean) return new Response("empty", { status: 400 });
 
-  // Daniel wants the FREE voice by default; TTS_PROVIDER=elevenlabs flips back
-  // (ElevenLabs is faster but paid per character).
+  // Client preference (options panel) wins, else the env default. Free Kokoro
+  // by default; ElevenLabs is premium/paid per character.
+  const want = provider || process.env.TTS_PROVIDER || "kokoro";
   const res =
-    (process.env.TTS_PROVIDER ?? "kokoro") === "elevenlabs"
+    want === "elevenlabs"
       ? ((await elevenlabs(clean)) ?? (await kokoro(clean)))
       : ((await kokoro(clean)) ?? (await elevenlabs(clean)));
   if (!res) {
