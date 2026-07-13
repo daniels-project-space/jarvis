@@ -18,7 +18,7 @@ type Msg = {
   attachment?: Attachment;
   createdAt: number;
 };
-type Job = { _id: string; task: string; model?: string; status: string; progress?: string; startedAt: number };
+type Job = { _id: string; task: string; model?: string; status: string; progress?: string; log?: string; startedAt: number };
 type Caption = { who: "you" | "jarvis"; text: string } | null;
 
 const ytId = (s: string) => {
@@ -183,6 +183,37 @@ function ModelBadge({ model }: { model?: string | null }) {
   return <span className={`hud-label !text-[9px] ${c}`}>{model}</span>;
 }
 
+// The agent's actual CLI session, streamed: tool calls and thoughts scroll in
+// live (auto-follows unless Daniel scrolled up to read something).
+function LiveSessionLog({ job }: { job: Job }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const pinned = useRef(true);
+  useEffect(() => {
+    const el = ref.current;
+    if (el && pinned.current) el.scrollTop = el.scrollHeight;
+  }, [job.log, job.progress]);
+  return (
+    <div
+      ref={ref}
+      onScroll={() => {
+        const el = ref.current;
+        if (el) pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+      }}
+      className="scrollbar-thin mt-4 flex-1 overflow-auto rounded-xl bg-black/40 p-3 font-mono text-xs leading-relaxed text-cyan/90"
+    >
+      {job.log ? (
+        <pre className="whitespace-pre-wrap break-words">{job.log}</pre>
+      ) : (
+        <>
+          <span className="mr-1 opacity-60">›</span>
+          {job.progress || "starting up…"}
+        </>
+      )}
+      {job.status === "running" && <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-cyan/70 align-middle" />}
+    </div>
+  );
+}
+
 function AgentLiveView({ job, now, onClose }: { job: Job; now: number; onClose: () => void }) {
   const elapsed = Math.max(0, Math.floor((now - job.startedAt) / 1000));
   const pct = job.status === "running" ? Math.min(95, 6 + Math.round((elapsed / 180) * 90)) : 6;
@@ -204,11 +235,7 @@ function AgentLiveView({ job, now, onClose }: { job: Job; now: number; onClose: 
           style={{ width: `${pct}%` }}
         />
       </div>
-      <div className="mt-4 flex-1 overflow-auto rounded-xl bg-black/40 p-3 font-mono text-xs leading-relaxed text-cyan/90">
-        <span className="mr-1 opacity-60">›</span>
-        {job.progress || "starting up…"}
-        <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-cyan/70 align-middle" />
-      </div>
+      <LiveSessionLog job={job} />
     </div>
   );
 }

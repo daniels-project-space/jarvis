@@ -75,6 +75,7 @@ export default defineSchema({
     missionId: v.optional(v.string()), // part of an orchestrated fleet
     label: v.optional(v.string()), // short fleet-view label ("pricing research")
     progress: v.optional(v.string()), // live activity line the runner streams
+    log: v.optional(v.string()), // rolling CLI session transcript tail (pill live view)
     startedAt: v.optional(v.number()),
     createdAt: v.number(),
   })

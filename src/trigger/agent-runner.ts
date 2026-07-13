@@ -160,13 +160,63 @@ async function weaveLine(bin: string, env: NodeJS.ProcessEnv, task: string, resu
   return line.length > 4 && line.length < 400 ? line : "";
 }
 
+// JARVIS checks its agents: a fast haiku pass over every finished job — did
+// the work actually get done, is anything off, or did the agent stop on a
+// question JARVIS can answer itself (then it auto-continues the session)?
+async function verifyWork(
+  bin: string,
+  env: NodeJS.ProcessEnv,
+  task: string,
+  result: string,
+): Promise<{ verdict: "pass" | "concerns" | "needs_input"; note: string; answer: string } | null> {
+  const prompt =
+    "You are JARVIS quickly verifying a background agent's finished work. Reply with ONLY minified JSON: " +
+    '{"verdict":"pass"|"concerns"|"needs_input","note":"<one short sentence>","answer":"<only for needs_input: your answer/decision if YOU can make it from context, else empty>"} ' +
+    "verdict rules: pass = work matches the task and looks complete; concerns = done but something specific looks wrong/unfinished (say what in note); " +
+    "needs_input = the agent stopped on a question or decision. If that question is answerable with common sense or the task's own context, fill answer so the run can continue autonomously; leave answer empty only when Daniel genuinely must decide (money, accounts, personal preferences).\n\n" +
+    `Task: ${task.slice(0, 800)}\n\nAgent result:\n${result.slice(0, 4000)}`;
+  const out = await new Promise<string>((resolve) => {
+    const p = spawn(bin, ["-p", prompt, "--model", "haiku", "--dangerously-skip-permissions"], {
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let o = "";
+    const to = setTimeout(() => {
+      try {
+        p.kill("SIGKILL");
+      } catch {
+        /* gone */
+      }
+      resolve(o);
+    }, 60_000);
+    p.stdout.on("data", (d) => (o += d.toString()));
+    p.on("close", () => {
+      clearTimeout(to);
+      resolve(o);
+    });
+    p.on("error", () => {
+      clearTimeout(to);
+      resolve("");
+    });
+  });
+  try {
+    const m = out.match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    const j = JSON.parse(m[0]);
+    if (!["pass", "concerns", "needs_input"].includes(j.verdict)) return null;
+    return { verdict: j.verdict, note: String(j.note ?? "").slice(0, 240), answer: String(j.answer ?? "").slice(0, 500) };
+  } catch {
+    return null;
+  }
+}
+
 function runClaude(
   bin: string,
   cwd: string,
   env: NodeJS.ProcessEnv,
   prompt: string,
   model: string,
-  onProgress?: (s: string) => void,
+  onProgress?: (s: string, log?: string) => void,
   mcpConfig?: string | null,
 ): Promise<string> {
   return new Promise((resolve) => {
@@ -186,11 +236,19 @@ function runClaude(
     let finalText = "";
     let latest = "starting up…";
     let dirty = false;
+    // full session transcript tail — streamed into the job row so the pill's
+    // live view shows the agent actually working, not one opaque line
+    const logLines: string[] = [];
+    const pushLog = (line: string) => {
+      logLines.push(line);
+      if (logLines.length > 120) logLines.shift();
+      dirty = true;
+    };
     const timer = onProgress
       ? setInterval(() => {
           if (dirty) {
             dirty = false;
-            onProgress(latest);
+            onProgress(latest, logLines.join("\n").slice(-7000));
           }
         }, 1500)
       : null;
@@ -219,10 +277,10 @@ function runClaude(
           for (const b of ev.message.content) {
             if (b.type === "tool_use") {
               latest = `Using ${b.name}${b.input?.command ? ": " + String(b.input.command).slice(0, 80) : b.input?.file_path ? ": " + b.input.file_path : ""}`;
-              dirty = true;
+              pushLog(`▸ ${b.name}${b.input?.command ? "  $ " + String(b.input.command).slice(0, 140) : b.input?.file_path ? "  " + String(b.input.file_path).slice(0, 140) : ""}`);
             } else if (b.type === "text" && b.text?.trim()) {
               latest = b.text.trim().replace(/\s+/g, " ").slice(-160);
-              dirty = true;
+              pushLog(b.text.trim().slice(0, 400));
             }
           }
         } else if (ev.type === "result" && typeof ev.result === "string") finalText = ev.result;
@@ -383,8 +441,8 @@ export const agentRunner = schedules.task({
           env,
           `${context}\n\nTask: ${job.task}`,
           model,
-          (line) => {
-            void convexMutation("jobs:updateProgress", { jobId: job.jobId, progress: line });
+          (line, log) => {
+            void convexMutation("jobs:updateProgress", { jobId: job.jobId, progress: line, log });
           },
           mcpConfig,
         );
@@ -467,16 +525,42 @@ export const agentRunner = schedules.task({
         // Weave, don't dump: one natural spoken line into chat + the full detail
         // as a finding the brain can pull up ("show me what it found").
         const needsDaniel = /(need (your|daniel)|which (one|option)|please (confirm|choose|decide)|waiting on (you|daniel)|\?\s*$)/i.test(result.slice(-400));
-        const spoken =
-          (needsDaniel ? "Quick one when you have a second, sir — " : "") +
-          ((await weaveLine(bin, env, job.task, `${result}${pushNote}`)) ||
-          (cloneFailed
-            ? `Couldn't get into ${repo}, sir — the repo name or access looks wrong.`
-            : `That background job's done${pushNote.includes("pushed") ? " and the change is live" : ""}.`));
+        // JARVIS verifies every finished job before reporting (pass / concerns /
+        // stopped-on-a-question). Questions JARVIS can answer itself trigger an
+        // autonomous continuation instead of bothering Daniel.
+        const verify = cloneFailed ? null : await verifyWork(bin, env, job.task, result).catch(() => null);
+        let continued = false;
+        if (verify?.verdict === "needs_input" && verify.answer && !/^CONTINUATION/.test(job.task)) {
+          await convexMutation("jobs:enqueue", {
+            task:
+              `CONTINUATION of a prior agent run.\nOriginal task: ${job.task.slice(0, 1200)}\n` +
+              `The previous run stopped on: ${verify.note}\nJARVIS's decision: ${verify.answer}\n` +
+              `Continue from the prior result below and FINISH the work.\nPrior result:\n${result.slice(0, 4000)}`,
+            repo: job.repo || undefined,
+            readonly: job.readonly || undefined,
+            model: typeof job.model === "string" && job.model ? job.model : undefined,
+            mcp: Array.isArray(job.mcp) && job.mcp.length ? job.mcp : undefined,
+            label: `${(job.label ?? job.task.slice(0, 30)) as string} ↻`,
+          }).catch(() => {});
+          continued = true;
+        }
+        const mustAsk = !continued && (verify?.verdict === "needs_input" || needsDaniel);
+        let spoken = continued
+          ? `One of my agents hit a question mid-run — I made the call (${verify!.answer.slice(0, 90)}) and sent it back to finish.`
+          : (mustAsk ? "Quick one when you have a second, sir — " : "") +
+            ((await weaveLine(bin, env, job.task, `${result}${pushNote}`)) ||
+              (cloneFailed
+                ? `Couldn't get into ${repo}, sir — the repo name or access looks wrong.`
+                : `That background job's done${pushNote.includes("pushed") ? " and the change is live" : ""}.`));
+        if (!continued && verify?.verdict === "concerns" && verify.note) spoken += ` One thing I noticed checking it: ${verify.note}`;
+        else if (!continued && verify?.verdict === "pass" && !mustAsk) spoken += " Checked it — looks solid.";
         const findingId = await convexMutation("findings:add", {
           source: job.task,
           spoken,
-          detail: result.slice(0, 8000) + (pushNote ? `\n\n(${pushNote.trim()})` : ""),
+          detail:
+            (verify ? `[JARVIS verify: ${verify.verdict}${verify.note ? " — " + verify.note : ""}]\n\n` : "") +
+            result.slice(0, 8000) +
+            (pushNote ? `\n\n(${pushNote.trim()})` : ""),
         });
         // The runner is about to DELIVER this itself (spoken line + card) — mark
         // it woven now, or the brain re-announces the same finding on Daniel's

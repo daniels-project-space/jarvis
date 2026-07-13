@@ -95,11 +95,13 @@ export const reapStale = mutation({
   },
 });
 
-// Live activity line the agent-runner streams as it works.
+// Live activity line + rolling session transcript the agent-runner streams.
 export const updateProgress = mutation({
-  args: { jobId: v.id("jobs"), progress: v.string() },
+  args: { jobId: v.id("jobs"), progress: v.string(), log: v.optional(v.string()) },
   handler: async (ctx, a) => {
-    await ctx.db.patch(a.jobId, { progress: a.progress.slice(0, 400) });
+    const patch: Record<string, unknown> = { progress: a.progress.slice(0, 400) };
+    if (a.log !== undefined) patch.log = a.log.slice(-7000);
+    await ctx.db.patch(a.jobId, patch);
   },
 });
 

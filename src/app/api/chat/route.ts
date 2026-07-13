@@ -118,7 +118,7 @@ const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 async function runClaude(
   key: string,
   oaiMessages: any[],
-  complex: boolean,
+  model: string,
   progress: { toolsRan: number },
 ): Promise<{ final: string; used: string[]; screenTouched: boolean }> {
   const system = String(oaiMessages[0]?.content ?? "");
@@ -128,7 +128,7 @@ async function runClaude(
     description: t.description ?? "",
     input_schema: t.parameters ?? { type: "object", properties: {} },
   }));
-  const model = complex ? "claude-opus-4-8" : "claude-haiku-4-5-20251001";
+  const maxTokens = model.includes("opus") ? 1600 : model.includes("sonnet") ? 1100 : 700;
   const used: string[] = [];
   let screenTouched = false;
   let interimSaid = false;
@@ -141,7 +141,7 @@ async function runClaude(
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
       },
-      body: JSON.stringify({ model, system, messages: msgs, tools, max_tokens: complex ? 1600 : 800, temperature: 0.7 }),
+      body: JSON.stringify({ model, system, messages: msgs, tools, max_tokens: maxTokens, temperature: 0.7 }),
       signal: AbortSignal.timeout(90_000),
     });
     if (!r.ok) throw new Error(`anthropic ${r.status}: ${(await r.text()).slice(0, 160)}`);
@@ -253,12 +253,21 @@ export async function POST(req: NextRequest) {
     const claudeProgress = { toolsRan: 0 };
     const anthKey = process.env.ANTHROPIC_AUTH_TOKEN ?? (await getSecret("anthropic", "ANTHROPIC_AUTH_TOKEN").catch(() => ""));
     if (anthKey) {
+      // Intelligent tier switch: haiku for quick conversational turns, sonnet
+      // for anything doing real work, opus for the genuinely hard stuff.
+      const ACTION =
+        /(show|find|search|plan|make|create|draft|write|analy[sz]|check|open|play|buy|book|add|remove|remind|schedule|trip|weather|chart|news|shop|video|email|fix|build|deploy|research|look)/i;
+      const claudeModel = complex
+        ? "claude-opus-4-8"
+        : text.length < 60 && !ACTION.test(text)
+          ? "claude-haiku-4-5-20251001"
+          : "claude-sonnet-5";
       try {
-        const r = await runClaude(anthKey, messages, complex, claudeProgress);
+        const r = await runClaude(anthKey, messages, claudeModel, claudeProgress);
         final = r.final;
         used.push(...r.used);
         screenTouched = r.screenTouched;
-        brain = complex ? "opus" : "haiku";
+        brain = claudeModel.includes("opus") ? "opus" : claudeModel.includes("sonnet") ? "sonnet" : "haiku";
       } catch {
         // Groq picks the turn up below — UNLESS Claude already ran tools
         // (re-running them would double todos/panels/agents); then we go
