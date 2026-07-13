@@ -65,6 +65,30 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "show_ranking",
+    description:
+      "Put a RANKED LIST of named things on Daniel's screen as portrait tiles — a photo, rank number and name for each (worst leaders in history, best sci-fi films, richest people, tallest mountains, greatest strikers, biggest companies…). ALWAYS reach for this instead of reading a ranked / top-N / 'best|worst X' list aloud: pass the items ALREADY in rank order and I fetch each portrait automatically. Then speak only a one-line topper, never the whole list.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "e.g. 'Worst leaders in history'" },
+        items: {
+          type: "array",
+          description: "already in rank order (1 = top of the list); 3–8 items",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string", description: "the entity — a real, searchable proper name (person / place / film / thing)" },
+              note: { type: "string", description: "optional ≤6-word tag, e.g. 'USSR · ~20M deaths' or '1972 · Coppola'" },
+            },
+            required: ["name"],
+          },
+        },
+      },
+      required: ["title", "items"],
+    },
+  },
+  {
     name: "video_control",
     description:
       "Control the video currently on Daniel's screen (or in the picture-in-picture pill): play, pause, or close it. Use for 'play it / pause / stop / close the video / get rid of the mini player'.",
@@ -1139,6 +1163,52 @@ const WMO: Record<number, [string, string]> = {
   80: ["🌦", "light showers"], 81: ["🌧", "showers"], 82: ["⛈", "violent showers"],
   85: ["🌨", "snow showers"], 86: ["🌨", "snow showers"], 95: ["⛈", "thunderstorm"], 96: ["⛈", "thunderstorm + hail"], 99: ["⛈", "thunderstorm + hail"],
 };
+
+// Portrait + one-line blurb for a named entity — Wikipedia REST summary
+// (keyless, redirects resolve, CORS-open, works for people/places/films/things).
+async function wikiPortrait(name: string): Promise<{ img: string; blurb: string; url: string }> {
+  const title = encodeURIComponent(name.trim().replace(/\s+/g, "_"));
+  try {
+    const r = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${title}`, {
+      headers: { accept: "application/json", "user-agent": "jarvis/1.0 (daniel personal ai)" },
+      signal: AbortSignal.timeout(6000),
+    });
+    if (r.ok) {
+      const j: any = await r.json();
+      const img = j?.thumbnail?.source ?? j?.originalimage?.source ?? "";
+      return { img: String(img), blurb: String(j?.extract ?? "").trim(), url: String(j?.content_urls?.desktop?.page ?? "") };
+    }
+  } catch {
+    /* fall through to empty portrait — the tile renders an initial instead */
+  }
+  return { img: "", blurb: "", url: "" };
+}
+
+// A ranked list of named things → portrait-tile overlay. Items arrive already
+// in rank order; each portrait is fetched in parallel.
+async function showRanking(args: any): Promise<string> {
+  const title = String(args.title ?? "Ranking").slice(0, 80).trim() || "Ranking";
+  const raw = (Array.isArray(args.items) ? args.items : [])
+    .map((it: any) => (typeof it === "string" ? { name: it } : it))
+    .filter((it: any) => it && String(it?.name ?? "").trim())
+    .slice(0, 8);
+  if (raw.length < 2) return "TOOL DID NOTHING: give me at least two ranked items, each with a name.";
+  const portraits = await Promise.all(raw.map((it: any) => wikiPortrait(String(it.name))));
+  const items = raw.map((it: any, i: number) => ({
+    rank: i + 1,
+    name: String(it.name).slice(0, 60),
+    note: it.note
+      ? String(it.note).slice(0, 48)
+      : portraits[i].blurb
+        ? portraits[i].blurb.split(/[.;]/)[0].slice(0, 48)
+        : "",
+    img: portraits[i].img,
+    url: portraits[i].url,
+  }));
+  await showWidget({ kind: "ranking", title, items }, title.toLowerCase());
+  const withImg = items.filter((x: { img: string }) => x.img).length;
+  return `On screen: ${items.length} portrait tiles for "${title}", ranked (${withImg} with photos). Speak ONE topper line only — who/what tops it and the single reason — never read the whole list.`;
+}
 
 // Show a widget AND drop a recallable card in the stream (tap = re-show later).
 async function showWidget(widget: Record<string, unknown>, title: string) {
@@ -2591,6 +2661,8 @@ export async function executeTool(name: string, args: any): Promise<string> {
       }).catch(() => {});
       return "On screen now.";
     }
+    case "show_ranking":
+      return await showRanking(args);
     case "hide":
       await convexMutation("ui:clearPanel", {});
       return "Cleared.";

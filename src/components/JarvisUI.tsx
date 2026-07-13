@@ -4,7 +4,7 @@ import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
-import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView } from "./Views";
+import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
 import TripView from "./TripView";
 import BoardView from "./BoardView";
 
@@ -66,6 +66,7 @@ const WIDGET_ICON: Record<string, string> = {
   videos: "📺",
   shop: "🛍",
   doc: "📝",
+  ranking: "🏆",
 };
 
 // Persistent media card in the stream — click to put it back on the big screen.
@@ -153,6 +154,8 @@ function panelSize(panel: { type: string; value: string }): string {
       return "w-[min(1340px,84%)] h-[min(720px,92%)]";
     case "w:places":
       return "w-[min(1200px,90%)] h-[min(760px,94%)]";
+    case "w:ranking":
+      return "w-[min(1180px,88%)] h-[min(780px,94%)]";
     case "w:calc":
       return "w-[min(560px,94%)] h-[min(360px,80%)]";
     case "markdown":
@@ -571,6 +574,7 @@ function WidgetView({ value }: { value: string }) {
   if (w?.kind === "shop") return <ShopView value={value} />;
   if (w?.kind === "webresults") return <WebResultsView value={value} />;
   if (w?.kind === "places") return <PlacesView value={value} />;
+  if (w?.kind === "ranking") return <RankingView value={value} />;
   if (w?.kind === "calc") return <CalcView w={w} />;
   if (w?.kind === "market") {
     return (
@@ -1445,10 +1449,12 @@ export default function JarvisUI() {
     void claimVoice({ client: me.current });
     import("../lib/tts").then((m) => m.warm());
     setInput("");
-    // new message: a playing video shrinks to picture-in-picture (keeps
-    // playing); other panels fold away in full-chat mode only
+    // new message = new topic: a playing video shrinks to picture-in-picture
+    // (keeps playing); ANY other overlay disengages (folds to a bubble) so it
+    // doesn't linger on a topic switch — a relevant answer re-materialises its
+    // own panel, which auto-restores.
     if (panel?.type === "video") setVideoPip(true);
-    else if (panel && !panelFull && chatModeRef.current === "full") setPanelMin(true);
+    else if (panel && !panelFull) setPanelMin(true);
     if (liveRef.current) {
       // Live session is the single brain while it's on — no parallel text answer.
       const rt = await import("../lib/realtime");
@@ -1785,6 +1791,14 @@ export default function JarvisUI() {
           ? "listening"
           : "idle";
 
+  // How the stage shares with an overlay:
+  //  • compactAside — a sized widget (weather/shop/places/ranking/…): the panel
+  //    takes the left, the orb SHRINKS INTO THE RIGHT CORNER (still visible).
+  //  • fullBleed — a page/video/full panel: it owns everything, orb+ring gone.
+  const overlayUp = !!panel && !panelMin;
+  const fullBleed = overlayUp && (panelFull || panel!.type === "video" || stagePanelSize === "h-full w-full");
+  const compactAside = overlayUp && !fullBleed && panel!.type !== "video";
+
   return (
     <div className="flex h-dvh flex-col overflow-hidden">
       {/* top HUD strip */}
@@ -1924,7 +1938,7 @@ export default function JarvisUI() {
             </div>
           )}
           {panel && panel.type !== "video" && !panelMin && !panelFull ? (
-            <div className="absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center justify-center p-1">
+            <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-24" : "justify-center"}`}>
               <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${stagePanelSize}`}>
                 <Viewport
                   panel={panel}
@@ -1940,18 +1954,22 @@ export default function JarvisUI() {
               <AgentLiveView job={shownJob} now={nowTs} onClose={() => setAgentView(null)} />
             </div>
           ) : null}
-          {/* arc-reactor HUD ring — always mounted, eases with the orb: follows
-              it aside for a compact overlay, fully out for a full-bleed one */}
-          {/* orb + ring live ONLY on the clear stage — when an overlay is up
-              they fade fully out (the screen belongs to the overlay) */}
+          {/* arc-reactor HUD ring + orb — for a compact overlay they glide into
+              the right corner (orb stays visible, small); a full-bleed panel
+              hides them entirely. On phones there's no room for a corner, so a
+              compact overlay hides them too (md:opacity-100 brings them back). */}
           <ReactorRing
             active={live === "live" || orbState === "thinking" || orbState === "listening"}
-            aside={false}
-            hidden={!!panel && !panelMin}
+            aside={compactAside}
+            hidden={fullBleed}
             color={moodColor}
           />
-          <div className={`h-full w-full transition-opacity duration-500 ${panel && !panelMin ? "pointer-events-none opacity-0" : "opacity-100"}`}>
-            <ThreeOrb state={orbState} energyRef={energyRef} moodColor={moodColor} aside={false} />
+          <div
+            className={`h-full w-full transition-opacity duration-500 ${
+              fullBleed ? "pointer-events-none opacity-0" : compactAside ? "pointer-events-none opacity-0 md:opacity-100" : "opacity-100"
+            }`}
+          >
+            <ThreeOrb state={orbState} energyRef={energyRef} moodColor={moodColor} aside={compactAside} />
           </div>
           {/* THE ONE caption — spoken words, under the orb, one contained field
               that auto-sizes and clamps long text; hidden entirely while an

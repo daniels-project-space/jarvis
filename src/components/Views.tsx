@@ -897,6 +897,56 @@ export function ShopView({ value }: { value: string }) {
   );
 }
 
+/* ---------------------------------- ranked portrait tiles ---------------------------------- */
+
+type RankItem = { rank: number; name: string; note?: string; img?: string; url?: string };
+
+export function RankingView({ value }: { value: string }) {
+  let w: { title?: string; items?: RankItem[] } | null = null;
+  try {
+    w = JSON.parse(value);
+  } catch {
+    /* noop */
+  }
+  const items = w?.items ?? [];
+  if (!items.length) return <div className="flex flex-1 items-center justify-center text-sm text-slate">nothing to rank</div>;
+  // 3–5 across depending on count so tiles stay portrait, never stretched
+  const cols = items.length <= 3 ? "sm:grid-cols-3" : items.length === 4 ? "sm:grid-cols-2 md:grid-cols-4" : "sm:grid-cols-3 md:grid-cols-5";
+  return (
+    <div className="flex min-h-0 flex-1 flex-col p-4 md:p-5">
+      <div className="mb-3 flex items-center gap-2">
+        <span className="hud-label shrink-0">{items.length} ranked</span>
+        {w?.title && <span className="min-w-0 truncate text-sm font-semibold text-ice">{w.title}</span>}
+      </div>
+      <div className={`grid flex-1 grid-cols-2 content-center gap-3 md:gap-4 ${cols}`}>
+        {items.map((it, i) => (
+          <div key={it.rank} className="tile rise group flex flex-col overflow-hidden" style={{ animationDelay: `${i * 80}ms` }}>
+            <div className="relative aspect-[3/4] overflow-hidden bg-[radial-gradient(circle_at_50%_28%,rgba(0,255,136,0.15),transparent_62%),linear-gradient(180deg,rgba(255,255,255,0.05),rgba(255,255,255,0.01))]">
+              {it.img ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={it.img} alt={it.name} className="h-full w-full object-cover object-top transition-transform duration-500 group-hover:scale-[1.05]" />
+              ) : (
+                <div className="grid h-full w-full place-items-center text-4xl font-bold text-cyan/60">{it.name.slice(0, 1).toUpperCase()}</div>
+              )}
+              <span className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/85 to-transparent" />
+              <span className="absolute left-2 top-2 grid h-7 w-7 place-items-center rounded-full bg-black/75 font-mono text-sm text-cyan ring-1 ring-cyan/50">{it.rank}</span>
+            </div>
+            <div className="flex flex-1 flex-col p-2.5">
+              <div className="line-clamp-2 text-[13px] font-semibold leading-tight text-ice">{it.name}</div>
+              {it.note && <div className="mt-1 line-clamp-2 text-[10px] leading-snug text-slate">{it.note}</div>}
+              {it.url && (
+                <a href={it.url} target="_blank" rel="noopener noreferrer" className="mt-auto pt-2 text-[10px] text-cyan/80 transition hover:text-cyan">
+                  wiki ↗
+                </a>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /* ---------------------------------- fleet / mission control ---------------------------------- */
 
 const JOB_DOT: Record<string, string> = {
