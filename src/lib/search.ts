@@ -138,8 +138,66 @@ async function ddgHtml(query: string, num: number): Promise<WebOut> {
   }
 }
 
-// ---- shopping (UK) ----
+// eBay Browse API — FREE (5,000 calls/day, no card), real UK listings with
+// price/link/image. Primary shopping provider when the keyset is in the vault
+// (service "ebay": EBAY_CLIENT_ID + EBAY_CLIENT_SECRET). App token cached ~2h.
+let ebayTok: { value: string; until: number } | null = null;
+async function ebayToken(): Promise<string> {
+  if (ebayTok && ebayTok.until > Date.now()) return ebayTok.value;
+  const c = await getServiceSecrets("ebay").catch(() => ({}) as Record<string, string>);
+  const id = c.EBAY_CLIENT_ID ?? process.env.EBAY_CLIENT_ID;
+  const secret = c.EBAY_CLIENT_SECRET ?? process.env.EBAY_CLIENT_SECRET;
+  if (!id || !secret) return "";
+  try {
+    const r = await fetch("https://api.ebay.com/identity/v1/oauth2/token", {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${id}:${secret}`).toString("base64")}`,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: "grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope",
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) return "";
+    const j = await r.json();
+    ebayTok = { value: j.access_token, until: Date.now() + (j.expires_in ?? 7200) * 1000 - 120_000 };
+    return ebayTok.value;
+  } catch {
+    return "";
+  }
+}
+async function ebayShopping(query: string): Promise<ShopResult[]> {
+  const tok = await ebayToken();
+  if (!tok) return [];
+  try {
+    const r = await fetch(`https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodeURIComponent(query)}&limit=20&filter=buyingOptions:{FIXED_PRICE}`, {
+      headers: { Authorization: `Bearer ${tok}`, "X-EBAY-C-MARKETPLACE-ID": "EBAY_GB" },
+      signal: AbortSignal.timeout(9000),
+    });
+    if (!r.ok) return [];
+    const j = await r.json();
+    return (j.itemSummaries ?? [])
+      .filter((it: any) => it.price?.value && (it.image?.imageUrl || it.thumbnailImages?.[0]?.imageUrl))
+      .map((it: any) => ({
+        title: String(it.title ?? "").slice(0, 90),
+        price: `£${Number(it.price.value).toFixed(2)}`,
+        priceNum: Number(it.price.value),
+        source: "eBay",
+        link: String(it.itemWebUrl ?? ""),
+        image: String(it.image?.imageUrl ?? it.thumbnailImages?.[0]?.imageUrl ?? ""),
+        rating: undefined,
+        reviews: undefined,
+        delivery: it.shippingOptions?.[0]?.shippingCost?.value === "0.00" ? "Free delivery" : undefined,
+      }));
+  } catch {
+    return [];
+  }
+}
+
+// ---- shopping (UK): eBay (free) → Serper → SerpAPI ----
 export async function searchShopping(query: string, gl = "uk"): Promise<ShopResult[]> {
+  const e = await ebayShopping(query);
+  if (e.length) return e;
   const s = await serper("shopping", { q: query, gl: gl === "uk" ? "gb" : gl, hl: "en" });
   if (s?.shopping) {
     return (s.shopping as any[])
@@ -219,7 +277,9 @@ export async function searchVideos(query: string): Promise<VideoResult[]> {
 }
 
 // Which provider is live (for status/debug).
-export async function activeSearchProvider(): Promise<"serper" | "serpapi" | "none"> {
+export async function activeSearchProvider(): Promise<"ebay" | "serper" | "serpapi" | "none"> {
+  const c = await getServiceSecrets("ebay").catch(() => ({}) as Record<string, string>);
+  if ((c.EBAY_CLIENT_ID ?? process.env.EBAY_CLIENT_ID) && (c.EBAY_CLIENT_SECRET ?? process.env.EBAY_CLIENT_SECRET)) return "ebay";
   if (await serperKey()) return "serper";
   const sk = process.env.SERPAPI_KEY ?? (await getSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
   return sk ? "serpapi" : "none";

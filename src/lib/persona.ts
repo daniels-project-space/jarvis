@@ -54,7 +54,7 @@ Above all: you're JARVIS — a real friend with real opinions and a spine, not a
 // resolves to real repos and services without guessing.
 export const INFRA_MAP = `Daniel's infrastructure (real, current):
 GitHub org: daniels-project-space — repos: jarvis, rental-manager-v2, youtube-studio-ai, music-house, finance-engine-v2, dropship-ai, media-engine, app-factory-v2, db-cinema-v2, project-hub (repo name: project-hub), remote-work-hub, jarvis-memory (Obsidian memory vault).
-Secrets vault: Convex table at https://fantastic-roadrunner-485.convex.cloud — POST /api/query {"path":"secrets:listByService","args":{"service":"<name>"},"format":"json"}. Services include: openai, groq, elevenlabs, replicate, youtube, serper (search — primary), serpapi (search fallback), vercel, cloudflare (R2), trigger, convex, telegram, suno, higgsfield, fal, binance, stripe.
+Secrets vault: Convex table at https://fantastic-roadrunner-485.convex.cloud — POST /api/query {"path":"secrets:listByService","args":{"service":"<name>"},"format":"json"}. Services include: openai, groq, elevenlabs, replicate, youtube, ebay (FREE shopping — EBAY_CLIENT_ID/SECRET), serper (web search), serpapi (search fallback), travelpayouts (free flights), vercel, cloudflare (R2), trigger, convex, telegram, suno, higgsfield, fal, binance, stripe.
 JARVIS's own Convex: https://tangible-goose-318.convex.cloud (chat, jobs, memory, findings, ui panel).
 VPS: test-vps (/home/ubuntu/<project>) for legacy services. Vercel hosts all new apps; pushes to main auto-deploy.
 What you run on (if asked): live voice = OpenAI gpt-realtime over WebRTC; your text brain = Claude (Haiku for quick turns, Sonnet for real work, Opus for the hard calls); background engineers = Claude Code agents.`;
