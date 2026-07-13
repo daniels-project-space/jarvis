@@ -360,8 +360,13 @@ export async function searchVideos(query: string): Promise<VideoResult[]> {
   }));
 }
 
-// Which provider is live (for status/debug).
-export async function activeSearchProvider(): Promise<"kelkoo" | "ebay" | "serper" | "serpapi" | "none"> {
-  // Kelkoo (via Jina) is keyless and always available — shopping is never truly offline.
+// Which provider is live (for status/debug). Serper/SerpAPI are the keyed web
+// providers, tried in that order; when neither key is present the keyless
+// fallbacks (DDG for web, Kelkoo via Jina for shopping) keep search alive, so we
+// report "kelkoo" as that floor rather than "none" — search is never offline.
+export async function activeSearchProvider(): Promise<"serper" | "serpapi" | "kelkoo" | "none"> {
+  if (await serperKey()) return "serper";
+  const serp = process.env.SERPAPI_KEY ?? (await getSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
+  if (serp) return "serpapi";
   return "kelkoo";
 }

@@ -201,7 +201,9 @@ await test("a search provider is configured", async () => {
   const r = await fetch(`${BASE}/api/search-status`);
   const { provider } = await r.json();
   console.log(`      search provider: ${provider}`);
-  assert(provider === "serper" || provider === "serpapi", `no search provider live (${provider})`);
+  // serper/serpapi are the keyed web providers; kelkoo/ebay are the keyless
+  // floor (DDG web + Kelkoo shopping via Jina) — all count as a live provider.
+  assert(["serper", "serpapi", "kelkoo", "ebay"].includes(provider), `no search provider live (${provider})`);
 });
 
 await test("read_url returns real content (jina reader)", async () => {
