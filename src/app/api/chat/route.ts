@@ -101,7 +101,7 @@ const SLOW_LINES: Record<string, string> = {
 // Tools that actually put something on the stage — used to catch the model
 // CLAIMING "it's on your screen" in a turn where none of these ran.
 const SCREEN_TOOLS = new Set([
-  "show", "hide", "weather", "price_chart", "market_analysis", "market", "youtube_search",
+  "show", "show_ranking", "rank_focus", "hide", "weather", "price_chart", "market_analysis", "market", "youtube_search",
   "shop_search", "news_today", "briefing", "todo_list", "net_worth", "calendar_view",
   "trip_open", "trip_plan", "trip_update", "trip_finalize", "mind_map", "board", "draft",
   "music_search", "memory_map", "transport_route", "open_app", "create_image", "create_pdf",

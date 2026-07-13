@@ -302,6 +302,13 @@ body {
   }
 }
 
+/* a focused tile (rank_focus) breathes a slow cyan glow so the eye lands on it */
+.tile-pulse { animation: tile-pulse 2.1s ease-in-out infinite; }
+@keyframes tile-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0, 231, 255, 0.0), 0 0 18px rgba(0, 231, 255, 0.18); }
+  50% { box-shadow: 0 0 0 4px rgba(0, 231, 255, 0.14), 0 0 34px rgba(0, 231, 255, 0.42); }
+}
+
 /* orbit bubbles: demoted panels gently bob beside the orb */
 @keyframes bob {
   0%, 100% { transform: translateY(0); }

@@ -311,29 +311,39 @@ export function Briefing2View({ value }: { value: string }) {
                 <div className="text-xs text-slate">calendar clear</div>
               )}
             </div>
-            <div className="grid grid-cols-2 gap-2 xl:grid-cols-3">
+            <div className="hud-label mb-1">markets</div>
+            <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
               {(w.markets ?? []).map((r: any, i: number) => {
                 const sp: number[] = Array.isArray(r.spark) ? r.spark : [];
                 const min = Math.min(...sp), max = Math.max(...sp);
-                const pts = sp.map((v, j) => `${(j / (sp.length - 1)) * 100},${27 - ((v - min) / (max - min || 1)) * 24}`).join(" ");
+                // taller chart — the graph is always expanded in the briefing
+                const pts = sp.map((v, j) => `${(j / (sp.length - 1)) * 100},${47 - ((v - min) / (max - min || 1)) * 42}`).join(" ");
                 const up = r.change >= 0;
                 return (
-                  <div key={i} className="tile rise px-3 py-3" style={{ animationDelay: `${160 + i * 50}ms` }}>
+                  <div key={i} className="tile rise flex flex-col px-3.5 py-3" style={{ animationDelay: `${160 + i * 50}ms` }}>
                     <div className="flex items-baseline justify-between">
-                      <span className="hud-label !text-[9px]">{r.label}</span>
-                      <span className={`text-[10px] ${up ? "text-emerald-400" : "text-red-400"}`}>
+                      <span className="hud-label !text-[10px]">{r.label}</span>
+                      <span className={`text-[11px] ${up ? "text-emerald-400" : "text-red-400"}`}>
                         {up ? "▲" : "▼"} {Math.abs(r.change)}%
                       </span>
                     </div>
-                    <div className="mt-0.5 text-base font-semibold text-ice">
+                    <div className="mt-0.5 text-lg font-semibold text-ice">
                       {r.unit}
                       {Number(r.price).toLocaleString("en-US")}
                     </div>
-                    {sp.length > 1 && (
-                      <svg viewBox="0 0 100 28" preserveAspectRatio="none" className="mt-1.5 h-8 w-full">
-                        <polyline points={`0,28 ${pts} 100,28`} fill={up ? "rgba(52,211,153,0.12)" : "rgba(248,113,113,0.12)"} stroke="none" />
-                        <polyline points={pts} fill="none" stroke={up ? "#34d399" : "#f87171"} strokeWidth="1.6" vectorEffect="non-scaling-stroke" />
+                    {sp.length > 1 ? (
+                      <svg viewBox="0 0 100 48" preserveAspectRatio="none" className="mt-2 h-20 w-full">
+                        <defs>
+                          <linearGradient id={`spk${i}`} x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor={up ? "rgba(52,211,153,0.28)" : "rgba(248,113,113,0.28)"} />
+                            <stop offset="100%" stopColor="rgba(0,0,0,0)" />
+                          </linearGradient>
+                        </defs>
+                        <polyline points={`0,48 ${pts} 100,48`} fill={`url(#spk${i})`} stroke="none" />
+                        <polyline points={pts} fill="none" stroke={up ? "#34d399" : "#f87171"} strokeWidth="1.8" vectorEffect="non-scaling-stroke" />
                       </svg>
+                    ) : (
+                      <div className="mt-2 flex h-20 items-center justify-center text-[10px] text-slate/60">no chart data</div>
                     )}
                   </div>
                 );
@@ -899,16 +909,22 @@ export function ShopView({ value }: { value: string }) {
 
 /* ---------------------------------- ranked portrait tiles ---------------------------------- */
 
-type RankItem = { rank: number; name: string; note?: string; img?: string; url?: string };
+type RankItem = { rank: number; name: string; note?: string; bio?: string; img?: string; url?: string };
 
 export function RankingView({ value }: { value: string }) {
-  let w: { title?: string; items?: RankItem[] } | null = null;
+  let w: { title?: string; items?: RankItem[]; highlight?: number } | null = null;
   try {
     w = JSON.parse(value);
   } catch {
     /* noop */
   }
   const items = w?.items ?? [];
+  const highlight = w?.highlight ?? 0;
+  const focusRef = useRef<HTMLDivElement | null>(null);
+  // when a tile is focused (rank_focus), scroll it into view
+  useEffect(() => {
+    if (highlight && focusRef.current) focusRef.current.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+  }, [highlight]);
   if (!items.length) return <div className="flex flex-1 items-center justify-center text-sm text-slate">nothing to rank</div>;
   // 3–5 across depending on count so tiles stay portrait, never stretched
   const cols = items.length <= 3 ? "sm:grid-cols-3" : items.length === 4 ? "sm:grid-cols-2 md:grid-cols-4" : "sm:grid-cols-3 md:grid-cols-5";
@@ -918,30 +934,42 @@ export function RankingView({ value }: { value: string }) {
         <span className="hud-label shrink-0">{items.length} ranked</span>
         {w?.title && <span className="min-w-0 truncate text-sm font-semibold text-ice">{w.title}</span>}
       </div>
-      <div className={`grid flex-1 grid-cols-2 content-center gap-3 md:gap-4 ${cols}`}>
-        {items.map((it, i) => (
-          <div key={it.rank} className="tile rise group flex flex-col overflow-hidden" style={{ animationDelay: `${i * 80}ms` }}>
-            <div className="relative aspect-[3/4] overflow-hidden bg-[radial-gradient(circle_at_50%_28%,rgba(0,255,136,0.15),transparent_62%),linear-gradient(180deg,rgba(255,255,255,0.05),rgba(255,255,255,0.01))]">
-              {it.img ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img src={it.img} alt={it.name} className="h-full w-full object-cover object-top transition-transform duration-500 group-hover:scale-[1.05]" />
-              ) : (
-                <div className="grid h-full w-full place-items-center text-4xl font-bold text-cyan/60">{it.name.slice(0, 1).toUpperCase()}</div>
-              )}
-              <span className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/85 to-transparent" />
-              <span className="absolute left-2 top-2 grid h-7 w-7 place-items-center rounded-full bg-black/75 font-mono text-sm text-cyan ring-1 ring-cyan/50">{it.rank}</span>
+      <div className={`scrollbar-thin grid min-h-0 flex-1 grid-cols-2 content-center gap-3 overflow-y-auto md:gap-4 ${cols}`}>
+        {items.map((it, i) => {
+          const focused = highlight === it.rank;
+          return (
+            <div
+              key={it.rank}
+              ref={focused ? focusRef : undefined}
+              className={`tile rise group flex flex-col overflow-hidden transition-all duration-500 ${
+                focused ? "tile-pulse !border-cyan/70 ring-2 ring-cyan/60" : highlight ? "opacity-60" : ""
+              }`}
+              style={{ animationDelay: `${i * 80}ms` }}
+            >
+              <div className="relative aspect-[3/4] overflow-hidden bg-[radial-gradient(circle_at_50%_28%,rgba(0,255,136,0.15),transparent_62%),linear-gradient(180deg,rgba(255,255,255,0.05),rgba(255,255,255,0.01))]">
+                {it.img ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={it.img} alt={it.name} className="h-full w-full object-cover object-top transition-transform duration-500 group-hover:scale-[1.05]" />
+                ) : (
+                  <div className="grid h-full w-full place-items-center text-4xl font-bold text-cyan/60">{it.name.slice(0, 1).toUpperCase()}</div>
+                )}
+                <span className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/85 to-transparent" />
+                <span className={`absolute left-2 top-2 grid h-7 w-7 place-items-center rounded-full font-mono text-sm ring-1 ${focused ? "bg-cyan text-black ring-cyan" : "bg-black/75 text-cyan ring-cyan/50"}`}>{it.rank}</span>
+              </div>
+              <div className="flex flex-1 flex-col p-2.5">
+                <div className="line-clamp-2 text-[13px] font-semibold leading-tight text-ice">{it.name}</div>
+                {it.note && <div className="mt-1 line-clamp-1 text-[10px] font-medium uppercase tracking-wide text-cyan/70">{it.note}</div>}
+                {/* small bio always sits under the image; expands when focused */}
+                {it.bio && <div className={`mt-1 text-[10px] leading-snug text-slate ${focused ? "" : "line-clamp-2"}`}>{it.bio}</div>}
+                {it.url && (
+                  <a href={it.url} target="_blank" rel="noopener noreferrer" className="mt-auto pt-2 text-[10px] text-cyan/80 transition hover:text-cyan">
+                    wiki ↗
+                  </a>
+                )}
+              </div>
             </div>
-            <div className="flex flex-1 flex-col p-2.5">
-              <div className="line-clamp-2 text-[13px] font-semibold leading-tight text-ice">{it.name}</div>
-              {it.note && <div className="mt-1 line-clamp-2 text-[10px] leading-snug text-slate">{it.note}</div>}
-              {it.url && (
-                <a href={it.url} target="_blank" rel="noopener noreferrer" className="mt-auto pt-2 text-[10px] text-cyan/80 transition hover:text-cyan">
-                  wiki ↗
-                </a>
-              )}
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );

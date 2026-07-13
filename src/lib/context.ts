@@ -44,7 +44,7 @@ export async function reportIncident(source: string, signature: string, message:
 }
 
 export async function buildContext(userText?: string): Promise<{ block: string; freshFindingIds: string[] }> {
-  const [memHit, memRecent, biz, stack, todos, events, wealth, jobs, findings, trip, draft, location] = await Promise.all([
+  const [memHit, memRecent, biz, stack, todos, events, wealth, jobs, findings, trip, draft, location, panel] = await Promise.all([
     userText ? q(CONVEX_URL, "memory:search", { q: userText, limit: 8 }) : null,
     q(CONVEX_URL, "memory:recent", { limit: 6 }),
     q(CONVEX_URL, "business:list", {}),
@@ -57,6 +57,7 @@ export async function buildContext(userText?: string): Promise<{ block: string; 
     q(CONVEX_URL, "creations:latest", { kind: "trip" }),
     q(CONVEX_URL, "creations:latest", { kind: "doc" }),
     q(CONVEX_URL, "ui:getLocation", {}),
+    q(CONVEX_URL, "ui:getPanel", {}),
   ]);
 
   const mem = [...(Array.isArray(memHit) ? memHit : []), ...(Array.isArray(memRecent) ? memRecent : [])]
@@ -122,6 +123,28 @@ export async function buildContext(userText?: string): Promise<{ block: string; 
       "FRESH AGENT FINDINGS — weave the relevant one into your reply naturally (one casual sentence, offer detail on screen), don't recite:\n" +
         findings.map((f: any) => `- ${f.spoken}`).join("\n"),
     );
+
+  // WHAT'S ON SCREEN right now — so follow-ups can be answered ABOUT it (highlight
+  // a tile, extend a bio, keep it up) instead of rebuilding or wrongly closing it.
+  if ((panel as any)?.type) {
+    const p: any = panel;
+    let desc = `ON SCREEN NOW: "${p.title ?? p.type}" (${p.type}). If Daniel's next message is about THIS, keep it up and act on it — never rebuild or hide it.`;
+    if (p.type === "widget") {
+      try {
+        const wd = JSON.parse(p.value);
+        if (wd?.kind === "ranking" && Array.isArray(wd.items)) {
+          desc =
+            `ON SCREEN NOW: a ranking overlay "${wd.title ?? ""}" — ${wd.items.map((it: any) => `#${it.rank} ${it.name}`).join(", ")}. ` +
+            `If he asks about one of these (by number, name, position, or "him/that one"), call rank_focus with its number (and a richer bio if you know one) to highlight+expand it — do NOT rebuild the list or open anything else.`;
+        } else {
+          desc = `ON SCREEN NOW: a ${wd?.kind ?? "widget"} overlay${wd?.title ? ` "${wd.title}"` : ""}. If his next message is about it, act on it; don't needlessly replace it.`;
+        }
+      } catch {
+        /* keep generic desc */
+      }
+    }
+    lines.push(desc);
+  }
 
   return {
     block: lines.join("\n\n").slice(0, 6000),

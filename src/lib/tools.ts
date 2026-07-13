@@ -89,6 +89,19 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "rank_focus",
+    description:
+      "Highlight ONE tile in the ranking/portrait overlay ALREADY on screen — it pulses and its bio expands. Use the MOMENT Daniel asks about a specific one ('tell me about number 3', 'who's the second', 'more on him', 'the last guy'). Pass the rank number. Optionally pass a richer `bio` (1-2 sentences) to fill that tile. Then speak about just that one. This is how ranking overlays get explored without rebuilding them.",
+    parameters: {
+      type: "object",
+      properties: {
+        index: { type: "number", description: "the rank number to highlight (1 = top of the list)" },
+        bio: { type: "string", description: "optional: a richer 1-2 sentence bio to show under that tile" },
+      },
+      required: ["index"],
+    },
+  },
+  {
     name: "video_control",
     description:
       "Control the video currently on Daniel's screen (or in the picture-in-picture pill): play, pause, or close it. Use for 'play it / pause / stop / close the video / get rid of the mini player'.",
@@ -1202,12 +1215,32 @@ async function showRanking(args: any): Promise<string> {
       : portraits[i].blurb
         ? portraits[i].blurb.split(/[.;]/)[0].slice(0, 48)
         : "",
+    // a short bio always sits under the tile; the fuller one shows when focused
+    bio: portraits[i].blurb ? portraits[i].blurb.slice(0, 320) : "",
     img: portraits[i].img,
     url: portraits[i].url,
   }));
   await showWidget({ kind: "ranking", title, items }, title.toLowerCase());
   const withImg = items.filter((x: { img: string }) => x.img).length;
-  return `On screen: ${items.length} portrait tiles for "${title}", ranked (${withImg} with photos). Speak ONE topper line only — who/what tops it and the single reason — never read the whole list.`;
+  return `On screen: ${items.length} portrait tiles for "${title}", ranked (${withImg} with photos). Speak ONE topper line only — who/what tops it and the single reason — never read the whole list. If he asks about a specific one, call rank_focus to highlight it.`;
+}
+
+// Focus/extend a ranking overlay that's already up: pulse tile N and expand its
+// bio, without rebuilding the whole thing. Relevance-aware follow-ups land here.
+async function rankFocus(args: any): Promise<string> {
+  const idx = Math.round(Number(args.index));
+  if (!idx || idx < 1) return "TOOL DID NOTHING: which number should I highlight?";
+  const panel: any = await convexQuery("ui:getPanel", {}).catch(() => null);
+  if (!panel || panel.type !== "widget") return "TOOL DID NOTHING: there's no ranking overlay on screen to focus.";
+  let w: any;
+  try { w = JSON.parse(panel.value); } catch { return "TOOL DID NOTHING: couldn't read the overlay."; }
+  if (w?.kind !== "ranking" || !Array.isArray(w.items)) return "TOOL DID NOTHING: the overlay on screen isn't a ranking.";
+  const item = w.items.find((it: any) => it.rank === idx);
+  if (!item) return `TOOL DID NOTHING: there's no number ${idx} on screen (it has ${w.items.length}).`;
+  w.highlight = idx;
+  if (args.bio) item.bio = String(args.bio).slice(0, 400);
+  await convexMutation("ui:setPanel", { type: "widget", value: JSON.stringify(w), title: panel.title });
+  return `Highlighted #${idx} (${item.name}) — it's pulsing with its bio expanded. Speak about ${item.name} now, a line or two.`;
 }
 
 // Show a widget AND drop a recallable card in the stream (tap = re-show later).
@@ -2666,6 +2699,8 @@ export async function executeTool(name: string, args: any): Promise<string> {
     }
     case "show_ranking":
       return await showRanking(args);
+    case "rank_focus":
+      return await rankFocus(args);
     case "hide":
       await convexMutation("ui:clearPanel", {});
       return "Cleared.";

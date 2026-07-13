@@ -885,6 +885,57 @@ function VideoDock({
   );
 }
 
+// Is this new message a FOLLOW-UP about what's already on screen (so the overlay
+// should stay), or a genuine topic switch (so it should step aside)? Errs toward
+// keeping the overlay — the brain replaces or hides it if the topic really moved.
+function isFollowUp(msg: string, p: { title?: string }): boolean {
+  const m = ` ${msg.toLowerCase()} `;
+  if (/\b(number|no\.?|#|box|option|item|pic|picture|photo)\s*(one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\b/.test(m)) return true;
+  if (/\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|top|bottom|next|previous)\b/.test(m)) return true;
+  if (/\b(that|this|these|those|it|its|they|them|their|there|him|his|her|hers|he|she)\b/.test(m)) return true;
+  if (/\b(more|expand|tell me|who (is|are|was)|what about|whats?|why|how come|and the|bio|details?|explain|zoom|go on|about the?)\b/.test(m)) return true;
+  const words = String(p.title ?? "").toLowerCase().split(/\W+/).filter((w) => w.length > 3);
+  return words.some((w) => m.includes(w));
+}
+
+// The spoken caption. Short text just shows; a long reply that overflows the
+// field scrolls top→bottom over the narration's estimated duration (teleprompter),
+// so Daniel can read along with the voice instead of it clipping.
+function SpokenCaption({ caption }: { caption: { who: "you" | "jarvis"; text: string; exiting?: boolean } }) {
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = boxRef.current;
+    if (!el || caption.exiting) return;
+    el.scrollTop = 0;
+    const overflow = el.scrollHeight - el.clientHeight;
+    if (overflow <= 4) return; // fits — no scroll
+    // pace to the narration: ~2.7 spoken words/sec, with a lead-in and tail so it
+    // doesn't start or finish jammed against an edge
+    const words = caption.text.trim().split(/\s+/).length;
+    const durMs = Math.max(1800, (words / 2.7) * 1000);
+    const lead = 550, tail = 800;
+    let raf = 0, start = 0;
+    const step = (ts: number) => {
+      if (!start) start = ts;
+      const t = ts - start;
+      const p = Math.min(1, Math.max(0, (t - lead) / Math.max(1, durMs - lead - tail)));
+      el.scrollTop = overflow * p;
+      if (t < durMs) raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [caption.text, caption.exiting]);
+  return (
+    <div
+      ref={boxRef}
+      key={caption.text}
+      className={`${caption.exiting ? "cap-fade-out" : "cap-bloom"} max-h-[26vh] max-w-[min(820px,88%)] overflow-hidden text-center text-xl font-semibold leading-snug tracking-tight md:text-[1.7rem] lg:text-[1.95rem] ${caption.who === "you" ? "text-amber" : "text-ice"}`}
+    >
+      {caption.text}
+    </div>
+  );
+}
+
 export default function JarvisUI() {
   const thread = (useQuery(api.ui.getActiveThread, {}) ?? "main") as string;
   const threads = (useQuery(api.ui.getThreads, {}) ?? []) as { id: string; title: string; at: number }[];
@@ -1475,12 +1526,12 @@ export default function JarvisUI() {
     void claimVoice({ client: me.current });
     import("../lib/tts").then((m) => m.warm());
     setInput("");
-    // new message = new topic: a playing video shrinks to picture-in-picture
-    // (keeps playing); ANY other overlay disengages (folds to a bubble) so it
-    // doesn't linger on a topic switch — a relevant answer re-materialises its
-    // own panel, which auto-restores.
+    // a playing video shrinks to picture-in-picture (keeps playing). Other
+    // overlays step aside ONLY on a genuine topic switch — a follow-up about
+    // what's on screen ("more on number 3", "who's the second") keeps it up so
+    // the brain can highlight/extend it (relevance awareness).
     if (panel?.type === "video") setVideoPip(true);
-    else if (panel && !panelFull) setPanelMin(true);
+    else if (panel && !panelFull && !isFollowUp(t, panel)) setPanelMin(true);
     if (liveRef.current) {
       // Live session is the single brain while it's on — no parallel text answer.
       const rt = await import("../lib/realtime");
@@ -2002,17 +2053,12 @@ export default function JarvisUI() {
           >
             <ThreeOrb state={orbState} energyRef={energyRef} moodColor={moodColor} aside={compactAside} />
           </div>
-          {/* THE ONE caption — spoken words, under the orb, one contained field
-              that auto-sizes and clamps long text; hidden entirely while an
-              overlay owns the screen */}
+          {/* THE ONE caption — spoken words, under the orb. Short text sits in a
+              contained field; a long reply scrolls through like a teleprompter,
+              paced to the narration. Hidden while an overlay owns the screen. */}
           {caption && !(panel && !panelMin) && (
-            <div className="pointer-events-none absolute inset-x-0 top-[55%] z-30 flex justify-center px-6">
-              <span
-                key={caption.text}
-                className={`${caption.exiting ? "cap-fade-out" : "cap-bloom"} line-clamp-4 max-w-[min(820px,88%)] overflow-hidden text-center text-xl font-semibold leading-snug tracking-tight md:text-[1.7rem] lg:text-[1.95rem] ${caption.who === "you" ? "text-amber" : "text-ice"}`}
-              >
-                {caption.text}
-              </span>
+            <div className="pointer-events-none absolute inset-x-0 top-[52%] z-30 flex justify-center px-6">
+              <SpokenCaption caption={caption} />
             </div>
           )}
         </div>
