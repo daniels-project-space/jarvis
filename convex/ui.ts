@@ -103,12 +103,12 @@ export const getVideoCmd = query({
 // Orb mood: the brain shifts the orb's colour to match the conversation's
 // tone; the client lerps toward it slowly and falls back to green when stale.
 export const setMood = mutation({
-  args: { mood: v.string() },
+  args: { mood: v.string(), manual: v.optional(v.boolean()) },
   handler: async (ctx, a) => {
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "mood")).first();
-    // Mood is alive but not a strobe: a genuine shift holds ~45s before the next
-    // (the orb still lerps there slowly, so rapid re-sets just retarget gently).
-    if (ex && ex.value !== a.mood && a.mood !== "alert" && Date.now() - (ex.updatedAt ?? 0) < 45_000) return;
+    // Mood is alive but not a strobe: a genuine model shift holds ~45s before
+    // the next. Daniel's MANUAL picks (options panel) always take instantly.
+    if (!a.manual && ex && ex.value !== a.mood && a.mood !== "alert" && Date.now() - (ex.updatedAt ?? 0) < 45_000) return;
     const doc = { key: "mood", type: "mood", value: a.mood, updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
     else await ctx.db.insert("ui", doc);

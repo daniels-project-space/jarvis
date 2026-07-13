@@ -292,7 +292,7 @@ function OptionsPanel({
 // glides aside for an overlay, the ring shrinks toward it and fades; when the
 // orb returns to centre, the ring blooms back. Never unmounts (that was the
 // abrupt pop). `active` brightens it while JARVIS is engaged.
-function ReactorRing({ active, aside, hidden }: { active: boolean; aside: boolean; hidden: boolean }) {
+function ReactorRing({ active, aside, hidden, color }: { active: boolean; aside: boolean; hidden: boolean; color?: string }) {
   const ticks = useMemo(
     () =>
       Array.from({ length: 60 }, (_, i) => {
@@ -303,13 +303,15 @@ function ReactorRing({ active, aside, hidden }: { active: boolean; aside: boolea
     [],
   );
   const opacity = hidden ? 0 : aside ? 0.1 : active ? 0.5 : 0.22;
+  // the ring reads as part of the orb — same mood colour, glowing together
+  const c = color || "#00ff88";
   return (
     <div
       className="pointer-events-none absolute inset-0 grid place-items-center transition-all duration-[900ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
       style={{ opacity, transform: aside ? "translateX(41%) scale(0.62)" : "translateX(0) scale(1)" }}
     >
-      <svg viewBox="0 0 500 500" className="h-[min(78vmin,720px)] w-[min(78vmin,720px)]" style={{ filter: "drop-shadow(0 0 8px rgba(0,255,136,0.35))" }}>
-        <g fill="none" stroke="var(--cyan)">
+      <svg viewBox="0 0 500 500" className="h-[min(78vmin,720px)] w-[min(78vmin,720px)]" style={{ filter: `drop-shadow(0 0 10px ${c}66)`, transition: "filter 1.2s ease" }}>
+        <g fill="none" stroke={c} style={{ transition: "stroke 1.2s ease" }}>
           <circle cx="250" cy="250" r="244" strokeWidth="1" strokeOpacity="0.25" strokeDasharray="40 20" style={{ transformOrigin: "center", animation: "reactor-slow 46s linear infinite" }} />
           <circle cx="250" cy="250" r="200" strokeWidth="1.5" strokeOpacity="0.18" />
           <path d="M250 62 A188 188 0 0 1 438 250" strokeWidth="2" strokeOpacity="0.7" strokeLinecap="round" style={{ transformOrigin: "center", animation: "reactor-fast 8s linear infinite reverse" }} />
@@ -1364,14 +1366,23 @@ export default function JarvisUI() {
     // produce speech — the live voice is the only speaker in the house.
     if (liveAnywhere()) return;
     if (document.hidden) return; // background tabs stay silent — one voice, ever
+    const spokenText = isToolGarbage(last.text) ? sanitizeAssistantText(last.text) : last.text;
     (async () => {
       if (!(await ensureVoice())) return; // another tab/device owns the voice
       const { speak } = await import("../lib/tts");
       await speak(
         last.text,
         (e) => (energyRef.current = e),
-        () => setSpeaking(true),
-        () => setSpeaking(false),
+        () => {
+          setSpeaking(true);
+          // the spoken words bloom under the orb for TYPED turns too, not just
+          // live voice — this is the caption overlay Daniel wasn't seeing
+          setCaption({ who: "jarvis", text: spokenText });
+        },
+        () => {
+          setSpeaking(false);
+          setCaption((c) => (c && c.who === "jarvis" && c.text === spokenText ? null : c));
+        },
       );
       // free-voice conversation: keep the loop going until Daniel goes quiet
       if (freeLoop.current && voiceMode() === "free" && !liveRef.current) setTimeout(() => void freeVoiceTurn(), 300);
@@ -1791,8 +1802,8 @@ export default function JarvisUI() {
           live={live}
           onClose={() => setOptionsOpen(false)}
           onToggleLive={() => void toggleLive()}
-          onMood={(m) => void setMoodMut({ mood: m })}
-          onClearMood={() => void setMoodMut({ mood: "calm" })}
+          onMood={(m) => void setMoodMut({ mood: m, manual: true })}
+          onClearMood={() => void setMoodMut({ mood: "calm", manual: true })}
         />
       )}
 
@@ -1886,6 +1897,7 @@ export default function JarvisUI() {
             active={live === "live" || orbState === "thinking" || orbState === "listening"}
             aside={!!panel && !panelMin && panel.type !== "video" && (panelFull || stagePanelSize !== "h-full w-full")}
             hidden={!!panel && !panelMin && (panel.type === "video" || (!panelFull && stagePanelSize === "h-full w-full"))}
+            color={moodColor}
           />
           {/* the orb steps back while a panel is up — content stays readable */}
           <div
