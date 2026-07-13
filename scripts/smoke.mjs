@@ -14,6 +14,10 @@ const CV = (process.env.CONVEX ?? "https://tangible-goose-318.convex.cloud") + "
 const THREAD = "smoke";
 
 const results = [];
+// External-quota / rate-limit failures are billing, not bugs — mark SKIP so
+// they never spam the self-repair pipeline. (SerpAPI "run out of searches",
+// Anthropic 429, etc.)
+const EXTERNAL = /run out of searches|rate.?limit|quota|429|credit balance|insufficient|payment required|402/i;
 async function test(name, fn) {
   const t0 = Date.now();
   try {
@@ -21,8 +25,14 @@ async function test(name, fn) {
     results.push({ name, ok: true, ms: Date.now() - t0 });
     console.log(`PASS  ${name} (${Date.now() - t0}ms)`);
   } catch (e) {
-    results.push({ name, ok: false, ms: Date.now() - t0, err: String(e?.message ?? e).slice(0, 300) });
-    console.log(`FAIL  ${name}: ${e?.message ?? e}`);
+    const msg = String(e?.message ?? e);
+    if (EXTERNAL.test(msg)) {
+      results.push({ name, ok: true, skipped: true, ms: Date.now() - t0 });
+      console.log(`SKIP  ${name}: external quota/limit — ${msg.slice(0, 80)}`);
+      return;
+    }
+    results.push({ name, ok: false, ms: Date.now() - t0, err: msg.slice(0, 300) });
+    console.log(`FAIL  ${name}: ${msg}`);
   }
 }
 const assert = (cond, msg) => {
@@ -173,7 +183,8 @@ await cv("mutation", "chatQueue:clearThread", { threadId: THREAD }).catch(() => 
 await cv("mutation", "ui:clearPanel", {}).catch(() => {});
 
 const failed = results.filter((r) => !r.ok);
-console.log(`\n${results.length - failed.length}/${results.length} passed`);
+const skipped = results.filter((r) => r.skipped).length;
+console.log(`\n${results.length - failed.length - skipped}/${results.length} passed${skipped ? `, ${skipped} skipped (external limits)` : ""}`);
 if (failed.length) {
   const msg = failed.map((f) => `${f.name}: ${f.err}`).join(" | ").slice(0, 900);
   await fetch(`${CV}/mutation`, {
