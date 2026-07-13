@@ -62,6 +62,14 @@ export default defineSchema({
 
   // Background agent jobs: brain enqueues, agent-runner Trigger task executes
   // (Claude Code / Opus, optional repo clone+push) and reports back into chat.
+  // Timed reminders — delivered by the agent-runner cron as push + weave.
+  reminders: defineTable({
+    text: v.string(),
+    at: v.number(), // epoch ms when it should fire
+    status: v.string(), // pending | delivering | done | cancelled
+    createdAt: v.number(),
+  }).index("by_status", ["status", "at"]),
+
   jobs: defineTable({
     repo: v.optional(v.string()),
     task: v.string(),

@@ -226,6 +226,25 @@ export const TOOL_DEFS = [
     parameters: { type: "object", properties: {} },
   },
   {
+    name: "remind_at",
+    description:
+      "Set a TIMED reminder that fires at a specific moment (push notification + JARVIS says it aloud): 'remind me at 7pm to call mum', 'in 20 minutes check the oven'. Compute the exact time yourself and pass at_iso (Europe/London local intent). For list items without a time, use todo_add instead. Never claim a reminder is set without calling this.",
+    parameters: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "what to remind, e.g. 'call mum'" },
+        at_iso: { type: "string", description: "ISO 8601 datetime with offset, e.g. 2026-07-13T19:00:00+01:00" },
+        in_minutes: { type: "number", description: "alternative: minutes from now" },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    name: "reminder_cancel",
+    description: "Cancel a pending timed reminder by matching its text ('cancel the mum reminder').",
+    parameters: { type: "object", properties: { match: { type: "string" } }, required: ["match"] },
+  },
+  {
     name: "todo_add",
     description:
       "ACTUALLY add an item to Daniel's real to-do list on the project hub (the widget on his dashboard). Use for ANY 'add to my list / remind me to / put X on my todos'. Never claim a to-do was added without calling this.",
@@ -2448,6 +2467,22 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await timerWidget(args);
     case "briefing":
       return await briefingWidget();
+    case "remind_at": {
+      const rtext = String(args.text ?? "").trim();
+      if (!rtext) return "TOOL DID NOTHING: no reminder text.";
+      let at = 0;
+      if (args.in_minutes && Number(args.in_minutes) > 0) at = Date.now() + Number(args.in_minutes) * 60_000;
+      else if (args.at_iso) at = Date.parse(String(args.at_iso));
+      if (!at || Number.isNaN(at)) return "TOOL DID NOTHING: pass at_iso (ISO datetime) or in_minutes.";
+      if (at < Date.now() - 60_000) return "TOOL DID NOTHING: that time is in the past — recompute at_iso.";
+      await convexMutation("reminders:add", { text: rtext, at });
+      const when = new Date(at).toLocaleString("en-GB", { weekday: "short", hour: "2-digit", minute: "2-digit", timeZone: "Europe/London" });
+      return `Reminder set: "${rtext}" at ${when} (delivery within ~2 min of the mark — push + spoken). Confirm to Daniel in a few words.`;
+    }
+    case "reminder_cancel": {
+      const hit = await convexMutation("reminders:cancel", { match: String(args.match ?? "") });
+      return hit ? `Cancelled: "${hit}".` : "TOOL DID NOTHING: no pending reminder matches that.";
+    }
     case "todo_add":
       return await todoAdd(args);
     case "todo_done":

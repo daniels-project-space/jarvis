@@ -381,6 +381,22 @@ export const agentRunner = schedules.task({
     } catch {
       /* healer must never block normal jobs */
     }
+    // Timed reminders: deliver anything due as a push + a spoken weave.
+    try {
+      const due: any[] = (await convexMutation("reminders:due", {})) ?? [];
+      for (const r of due) {
+        const mins = Math.round((Date.now() - r.at) / 60000);
+        const late = mins > 4 ? ` (set for ${new Date(r.at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/London" })})` : "";
+        await convexMutation("chatQueue:postAssistant", {
+          threadId: await chatThread(),
+          text: `⏰ Reminder, sir — ${r.text}${late}`,
+        }).catch(() => {});
+        await sendPush("⏰ JARVIS reminder", String(r.text).slice(0, 140), "/").catch(() => {});
+        await convexMutation("reminders:complete", { id: r._id }).catch(() => {});
+      }
+    } catch {
+      /* reminders must never block jobs either */
+    }
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: "/tmp/claude-home", ANTHROPIC_API_KEY: "" };
     mkdirSync("/tmp/claude-home/.claude", { recursive: true });
     mkdirSync("/tmp/work", { recursive: true });
