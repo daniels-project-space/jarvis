@@ -43,8 +43,33 @@ function ctx(): AudioContext {
   return audioCtx;
 }
 
+// Boot the server TTS model early. Kokoro cold-starts on Replicate (~4s vs ~1.5s
+// warm); firing a tiny synth the moment Daniel sends/taps mic boots the container
+// IN PARALLEL with the LLM turn, so the real read-out lands warm. Throttled — a
+// live conversation keeps it warm on its own, so this only bites the first turn
+// after an idle gap.
+let lastPrewarm = 0;
+export function prewarmTts() {
+  const now = Date.now();
+  if (now - lastPrewarm < 45_000) return;
+  lastPrewarm = now;
+  try {
+    const provider = typeof localStorage !== "undefined" ? localStorage.getItem("jarvis_tts") || "free" : "free";
+    if (provider === "fast") return; // browser voice has no server to warm
+    fetch("/api/tts", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: ".", provider }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch {
+    /* ignore */
+  }
+}
+
 // Call on a user gesture (send/mic tap) to unlock autoplay on iOS.
 export async function warm() {
+  prewarmTts();
   try {
     // preload speech voices (getVoices is async on first load) so the fast
     // path has its British voice ready instantly

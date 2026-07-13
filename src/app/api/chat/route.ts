@@ -120,8 +120,20 @@ async function runClaude(
   oaiMessages: any[],
   model: string,
   progress: { toolsRan: number },
+  staticSys?: string,
+  dynamicSys?: string,
 ): Promise<{ final: string; used: string[]; screenTouched: boolean }> {
-  const system = String(oaiMessages[0]?.content ?? "");
+  // Prompt caching: the big STATIC prefix (persona + capabilities + infra + all
+  // tool schemas) is identical every turn, so we cache it — Anthropic reuses it
+  // for ~5 min, slashing time-to-first-token and cost. Only the small dynamic
+  // block (live context + date) is processed fresh. Falls back to a plain string
+  // if the caller didn't split it.
+  const system: any = staticSys
+    ? [
+        { type: "text", text: staticSys, cache_control: { type: "ephemeral" } },
+        ...(dynamicSys ? [{ type: "text", text: dynamicSys }] : []),
+      ]
+    : String(oaiMessages[0]?.content ?? "");
   const msgs: any[] = oaiMessages.slice(1).map((m: any) => ({ role: m.role === "user" ? "user" : "assistant", content: String(m.content) }));
   const tools = TOOL_DEFS.map((t) => ({
     name: t.name,
@@ -221,10 +233,13 @@ export async function POST(req: NextRequest) {
   // a cut-off bubble plus a second, reworded answer minutes later).
   let delivered = false;
   try {
+    // Split so the Claude lane can cache the static half (see runClaude).
+    const staticSys = `${PERSONA}\n\n${CAPABILITIES}\n\n${INFRA_MAP}`;
+    const dynamicSys = `What you know right now:\n${ctx.block}\n\nCurrent date: ${new Date().toDateString()}.\n\n${REMEMBER}`;
     const messages: any[] = [
       {
         role: "system",
-        content: `${PERSONA}\n\n${CAPABILITIES}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${ctx.block}\n\nCurrent date: ${new Date().toDateString()}.\n\n${REMEMBER}`,
+        content: `${staticSys}\n\n${dynamicSys}`,
       },
       ...history
         .filter(
@@ -265,7 +280,7 @@ export async function POST(req: NextRequest) {
           ? "claude-haiku-4-5-20251001"
           : "claude-sonnet-5";
       try {
-        const r = await runClaude(anthKey, messages, claudeModel, claudeProgress);
+        const r = await runClaude(anthKey, messages, claudeModel, claudeProgress, staticSys, dynamicSys);
         final = r.final;
         used.push(...r.used);
         screenTouched = r.screenTouched;
