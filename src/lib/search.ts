@@ -93,32 +93,44 @@ export async function searchWeb(query: string, num = 8, gl = "us"): Promise<WebO
   return await ddgHtml(query, num);
 }
 
+// Keyless web search that works from serverless: DuckDuckGo blocks datacenter
+// IPs directly, so we fetch its results page THROUGH Jina's reader (r.jina.ai
+// fetches from its own infra, unblocked, and returns markdown). We parse the
+// "## [title](ddg-redirect)" result headings and decode the real target,
+// skipping sponsored (Bing/y.js) links.
 async function ddgHtml(query: string, num: number): Promise<WebOut> {
   try {
-    const r = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
-      headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "accept-language": "en" },
-      signal: AbortSignal.timeout(10000),
+    const r = await fetch(`https://r.jina.ai/https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
+      headers: { "user-agent": "Mozilla/5.0", "x-return-format": "markdown", "accept-language": "en" },
+      signal: AbortSignal.timeout(15000),
     });
     if (!r.ok) return null;
-    const html = await r.text();
+    const md = await r.text();
     const results: WebResult[] = [];
-    const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-    const strip = (s: string) =>
-      s
-        .replace(/<[^>]+>/g, "")
-        .replace(/&amp;/g, "&")
-        .replace(/&#x27;|&#39;/g, "'")
-        .replace(/&quot;/g, '"')
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/\s+/g, " ")
-        .trim();
+    const seen = new Set<string>();
+    const re = /#{2,3}\s+\[([^\]]+)\]\((https:\/\/duckduckgo\.com\/l\/\?uddg=[^)\s]+)\)/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(html)) && results.length < num) {
-      let link = m[1];
-      const dd = link.match(/uddg=([^&]+)/);
-      if (dd) link = decodeURIComponent(dd[1]);
-      results.push({ title: strip(m[2]), link, snippet: strip(m[3]) });
+    while ((m = re.exec(md)) && results.length < num) {
+      const enc = m[2].match(/uddg=([^&]+)/);
+      if (!enc) continue;
+      let link: string;
+      try {
+        link = decodeURIComponent(enc[1]);
+      } catch {
+        continue;
+      }
+      if (/duckduckgo\.com\/y\.js|ad_domain=|bing\.com\/aclick/i.test(link)) continue; // ads
+      if (seen.has(link)) continue;
+      seen.add(link);
+      const title = m[1].replace(/\*+/g, " ").replace(/\s+/g, " ").trim();
+      // snippet: the longest bracketed text between this heading and the next
+      const block = md.slice(m.index, md.indexOf("\n## ", m.index + 3) === -1 ? undefined : md.indexOf("\n## ", m.index + 3));
+      let snippet = "";
+      for (const sm of block.matchAll(/\[([^\]]{25,300})\]\(https:\/\/duckduckgo\.com\/l\//g)) {
+        const t = sm[1].replace(/\*+/g, " ").replace(/!\[[^\]]*\]/g, "").replace(/\s+/g, " ").trim();
+        if (t.length > snippet.length && t !== title) snippet = t;
+      }
+      results.push({ title, link, snippet: snippet.slice(0, 300) });
     }
     return results.length ? { results } : null;
   } catch {
