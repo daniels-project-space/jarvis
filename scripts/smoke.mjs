@@ -161,7 +161,7 @@ await test("realtime token mints (or is legitimately locked)", async () => {
   const j = await r.json();
   if (r.status === 409) return; // someone is genuinely live — fine
   assert(j.token, `no token: ${j.error}`);
-  assert((j.instructions ?? "").includes("You are JARVIS"), "instructions missing from token");
+  assert(/JARVIS/.test(j.instructions ?? "") && (j.instructions ?? "").length > 2000, "persona instructions missing from token");
   await cv("mutation", "ui:setLiveOn", { client: "smoke", on: false }).catch(() => {});
 });
 
