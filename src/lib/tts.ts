@@ -46,6 +46,15 @@ function ctx(): AudioContext {
 // Call on a user gesture (send/mic tap) to unlock autoplay on iOS.
 export async function warm() {
   try {
+    // preload speech voices (getVoices is async on first load) so the fast
+    // path has its British voice ready instantly
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      window.speechSynthesis.getVoices();
+      window.speechSynthesis.onvoiceschanged = () => {
+        cachedVoice = null;
+        window.speechSynthesis.getVoices();
+      };
+    }
     const c = ctx();
     await c.resume();
     if (!unlocked) {
@@ -70,6 +79,65 @@ export function stopSpeaking() {
     /* already stopped */
   }
   currentSrc = null;
+  try {
+    window.speechSynthesis?.cancel();
+  } catch {
+    /* ignore */
+  }
+}
+
+// Instant on-device voice (Web Speech API): ZERO network latency — this is the
+// "fast" path. Picks the best British male voice available, drives the orb with
+// a synthetic amplitude, and honours barge-in via generation.
+let cachedVoice: SpeechSynthesisVoice | null = null;
+function pickVoice(): SpeechSynthesisVoice | null {
+  if (cachedVoice) return cachedVoice;
+  const vs = window.speechSynthesis?.getVoices?.() ?? [];
+  if (!vs.length) return null;
+  const pref = [
+    /Google UK English Male/i, /en-GB.*(Ryan|George|Daniel|Arthur)/i, /Daniel/i, /(George|Arthur).*en-?GB/i,
+    /Microsoft (Ryan|George|Thomas)/i, /en-GB/i, /British/i, /Google US English/i,
+  ];
+  for (const p of pref) {
+    const v = vs.find((x) => p.test(`${x.name} ${x.lang}`));
+    if (v) return (cachedVoice = v);
+  }
+  return (cachedVoice = vs.find((x) => /^en/i.test(x.lang)) ?? vs[0] ?? null);
+}
+function speakBrowser(text: string, onEnergy: (e: number) => void, onStart?: () => void, onEnd?: () => void): Promise<void> {
+  return new Promise((resolve) => {
+    const synth = window.speechSynthesis;
+    if (!synth) return resolve();
+    const gen = generation;
+    const u = new SpeechSynthesisUtterance(text);
+    const v = pickVoice();
+    if (v) u.voice = v;
+    u.lang = v?.lang || "en-GB";
+    u.rate = 1.04;
+    u.pitch = 1.0;
+    let energyTimer: ReturnType<typeof setInterval> | null = null;
+    let t0 = 0;
+    u.onstart = () => {
+      onStart?.();
+      t0 = performance.now();
+      // synthetic mouth-movement amplitude for the orb (no real analyser here)
+      energyTimer = setInterval(() => {
+        if (gen !== generation) return;
+        const e = 0.28 + 0.32 * Math.abs(Math.sin((performance.now() - t0) / 130)) * (0.6 + 0.4 * Math.random());
+        onEnergy(Math.min(1, e));
+      }, 60);
+    };
+    const done = () => {
+      if (energyTimer) clearInterval(energyTimer);
+      onEnergy(0);
+      onEnd?.();
+      resolve();
+    };
+    u.onend = done;
+    u.onerror = done;
+    if (gen !== generation) return resolve();
+    synth.speak(u);
+  });
 }
 
 export function isSpeaking() {
@@ -150,8 +218,31 @@ export async function speak(
   onStart?: () => void,
   onEnd?: () => void,
 ): Promise<void> {
-  queue.push(...sentences(text));
   trackUtterance(text, Math.min(90_000, text.length * 70)); // whole-utterance echo window (appended text too)
+  // FAST PATH (default): instant on-device speech, zero network round-trip.
+  // Kokoro on Replicate cold-starts for many seconds — this is why JARVIS
+  // "took too long to talk". Hosted providers stay available in options.
+  const provider = typeof localStorage !== "undefined" ? localStorage.getItem("jarvis_tts") || "fast" : "fast";
+  if (provider === "fast" && typeof window !== "undefined" && window.speechSynthesis) {
+    if (draining) {
+      if (/jarvis/i.test(text)) import("./wakeword").then((m) => m.setSuppressed?.(true, true)).catch(() => {});
+      queue.push(...sentences(text));
+      return;
+    }
+    draining = true;
+    const fgen = generation;
+    import("./wakeword").then((m) => m.setSuppressed?.(true, /jarvis/i.test(text))).catch(() => {});
+    await speakBrowser(text, onEnergy, onStart, onEnd);
+    // drain any sentences appended mid-speech (barge-in bumps generation)
+    while (queue.length && generation === fgen) {
+      const next = queue.shift()!;
+      await speakBrowser(next, onEnergy);
+    }
+    draining = false;
+    setTimeout(() => import("./wakeword").then((m) => m.setSuppressed?.(false)).catch(() => {}), 700);
+    return;
+  }
+  queue.push(...sentences(text));
   if (draining) {
     // the first caller's drain loop speaks this text — but if it contains
     // "jarvis", escalate the wake gate to HARD or the readout self-wakes

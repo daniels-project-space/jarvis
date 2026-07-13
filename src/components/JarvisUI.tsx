@@ -256,8 +256,8 @@ function OptionsPanel({
           <Row label="Voice" hint="how 'hey Jarvis' talks back">
             <Seg opts={[["free", "Free"], ["realtime", "Live"]]} val={prefs.voice} on={(v) => setPref("voice", v)} />
           </Row>
-          <Row label="Speaking voice" hint="free Kokoro or premium ElevenLabs">
-            <Seg opts={[["free", "Kokoro"], ["elevenlabs", "Eleven"]]} val={prefs.tts} on={(v) => setPref("tts", v)} />
+          <Row label="Speaking voice" hint="Fast = instant on-device · Kokoro/Eleven = richer, slower">
+            <Seg opts={[["fast", "Fast"], ["free", "Kokoro"], ["elevenlabs", "Eleven"]]} val={prefs.tts} on={(v) => setPref("tts", v)} />
           </Row>
           <Row label="Live conversation" hint={live !== "off" ? "on now" : "start a realtime voice session"}>
             <button onClick={onToggleLive} className={`rounded-lg px-3 py-1 text-[11px] transition ${live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>
@@ -1062,7 +1062,7 @@ export default function JarvisUI() {
   useEffect(() => {
     setPrefs({
       voice: localStorage.getItem("jarvis_voice") || "free",
-      tts: localStorage.getItem("jarvis_tts") || "free",
+      tts: localStorage.getItem("jarvis_tts") || "fast",
       reduceMotion: localStorage.getItem("jarvis_reduce_motion") === "1",
     });
   }, []);
