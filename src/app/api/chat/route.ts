@@ -128,7 +128,9 @@ async function runClaude(
     description: t.description ?? "",
     input_schema: t.parameters ?? { type: "object", properties: {} },
   }));
-  const maxTokens = model.includes("opus") ? 1600 : model.includes("sonnet") ? 1100 : 700;
+  // tighter budgets = faster to finish speaking (persona wants 1-2 sentences
+  // spoken anyway; the detail goes on screen, not into a long spoken reply)
+  const maxTokens = model.includes("opus") ? 1200 : model.includes("sonnet") ? 700 : 320;
   const used: string[] = [];
   let screenTouched = false;
   let interimSaid = false;
