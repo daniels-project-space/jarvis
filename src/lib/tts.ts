@@ -150,11 +150,16 @@ export async function speak(
   onEnd?: () => void,
 ): Promise<void> {
   queue.push(...sentences(text));
-  if (draining) return;
+  trackUtterance(text, Math.min(90_000, text.length * 70)); // whole-utterance echo window (appended text too)
+  if (draining) {
+    // the first caller's drain loop speaks this text — but if it contains
+    // "jarvis", escalate the wake gate to HARD or the readout self-wakes
+    if (/jarvis/i.test(text)) import("./wakeword").then((m) => m.setSuppressed?.(true, true)).catch(() => {});
+    return;
+  }
   draining = true;
   const gen = generation;
   onStart?.();
-  trackUtterance(text, Math.min(90_000, text.length * 70)); // whole-utterance echo window
   // Gate the wake detector while speaking: HARD if the reply itself contains
   // "jarvis" (would self-wake), SOFT otherwise — so Daniel saying a bare
   // "hey jarvis" still barges in and shuts him up.

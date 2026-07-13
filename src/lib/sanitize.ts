@@ -31,7 +31,7 @@ export function sanitizeAssistantText(text: string): string {
   t = t.replace(/\{"kind"\s*:[\s\S]*$/g, " "); // raw widget JSON blob to end (before the bracket line, or it leaves "}]" residue)
   t = t.replace(/[\w".,:[\]{}\-]*"(?:days|hours|items)"\s*:\s*\[[\s\S]*$/g, " "); // JSON tails
   t = t.replace(/\[showed on screen:[\s\S]*?(\]|$)/gi, " "); // parroted history lines
-  return t.replace(/\s{2,}/g, " ").trim();
+  return t.replace(/[ \t]{2,}/g, " ").trim(); // spaces only — newlines survive
 }
 
 // True when the row is pure tool-garbage a human should never see.

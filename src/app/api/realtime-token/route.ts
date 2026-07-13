@@ -1,7 +1,6 @@
 import type { NextRequest } from "next/server";
 import { PERSONA } from "@/lib/persona";
 import { buildContext, convexMutation, convexQuery } from "@/lib/context";
-import { TOOL_DEFS } from "@/lib/tools";
 import { getSecret } from "@/lib/vault";
 import { STT_PROMPT } from "@/lib/sttvocab";
 
@@ -101,7 +100,6 @@ export async function POST(req: NextRequest) {
           },
           output: { voice: process.env.REALTIME_VOICE || "ballad" },
         },
-        tools: TOOL_DEFS.map((t) => ({ type: "function", ...t })),
       },
     }),
   });

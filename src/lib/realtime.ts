@@ -192,6 +192,25 @@ export async function startLive(h: LiveHandlers) {
       const latin = (t.match(/[a-zA-Z0-9\s.,!?'"£$%()@:;/-]/g) ?? []).length;
       return t.length > 0 && latin / t.length < 0.7;
     };
+    // Residual echo: when AEC leaks JARVIS's own voice back through the mic,
+    // the VAD hears a "user turn" that is really the assistant's last sentence
+    // and the model ANSWERS ITSELF (= "says things twice"). Detect the overlap,
+    // cancel the duplicate response and delete the echo item from the session.
+    const recentAssistant: { text: string; ts: number }[] = [];
+    const tokenOverlap = (a: string, b: string) => {
+      const tok = (x: string) =>
+        new Set(x.toLowerCase().replace(/[^a-z0-9\s']/g, " ").split(/\s+/).filter((w) => w.length > 2));
+      const A = tok(a), B = tok(b);
+      if (A.size < 4) return 0; // "yes" / "okay" must never be treated as echo
+      let hit = 0;
+      for (const w of A) if (B.has(w)) hit++;
+      return hit / A.size;
+    };
+    const echoHandled = new Set<string>();
+    const isSelfEcho = (t: string) => {
+      const now = Date.now();
+      return recentAssistant.some((r) => now - r.ts < 30_000 && tokenOverlap(t, r.text) >= 0.65);
+    };
     session.on("history_updated", (history: any[]) => {
       for (const item of history) {
         if (item?.type !== "message") continue;
@@ -202,6 +221,17 @@ export async function startLive(h: LiveHandlers) {
           .trim();
         if (!text || text.startsWith(NUDGE.slice(0, 20))) continue; // internal nudges stay invisible
         if (role === "user" && isGarbage(text)) continue;
+        if (role === "user" && !echoHandled.has(item.itemId) && isSelfEcho(text)) {
+          echoHandled.add(item.itemId);
+          try {
+            session?.interrupt(); // stop the model answering its own voice
+            transport.sendEvent({ type: "conversation.item.delete", item_id: item.itemId });
+          } catch {
+            /* ignore */
+          }
+          continue;
+        }
+        if (role === "user" && echoHandled.has(item.itemId)) continue;
         const done = item.status === "completed";
         if (role === "assistant" && isToolGarbage(text)) {
           // The model wrote tool syntax / tool JSON as text. Recover the
@@ -232,6 +262,10 @@ export async function startLive(h: LiveHandlers) {
         h.onCaption(role === "user" ? "you" : "jarvis", text, done);
         if (done && !mirrored.has(item.itemId)) {
           mirrored.add(item.itemId);
+          if (role === "assistant") {
+            recentAssistant.push({ text, ts: Date.now() });
+            if (recentAssistant.length > 5) recentAssistant.shift();
+          }
           h.onTurnDone(role, text);
         }
       }

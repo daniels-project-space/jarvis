@@ -6,7 +6,9 @@ import { TOOL_DEFS, executeTool } from "@/lib/tools";
 // session. ?live=1 returns a SLIMMED belt: paragraph-long descriptions and
 // background-ops tools made every voice turn reprocess a huge prompt — that
 // was most of live mode's response lag.
-const LIVE_EXCLUDE = new Set(["self_repair", "self_improve", "deliberate", "memory_map"]);
+// persona explicitly routes to deliberate/memory_map — excluding them made
+// the live model call functions that didn't exist; only true internals stay out
+const LIVE_EXCLUDE = new Set(["self_repair", "self_improve"]);
 export async function GET(req: NextRequest) {
   if (new URL(req.url).searchParams.get("live")) {
     const slim = TOOL_DEFS.filter((t) => !LIVE_EXCLUDE.has(t.name)).map((t) => {

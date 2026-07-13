@@ -842,7 +842,9 @@ async function youtubeTranscript(video: string): Promise<string> {
 // Searches always land on Daniel's screen as a full result list, not just in
 // the model's head — he asked for multiple visible results every time.
 async function showResultsPanel(title: string, md: string) {
-  await convexMutation("ui:setPanel", { type: "markdown", value: md.slice(0, 7000), title }).catch(() => {});
+  // no catch: if the panel write fails the tool must FAIL — seven callers
+  // tell the model "it's on his screen" based on this succeeding
+  await convexMutation("ui:setPanel", { type: "markdown", value: md.slice(0, 7000), title });
 }
 
 async function webSearch(query: string): Promise<string> {
@@ -1157,8 +1159,9 @@ async function marketWidget(args: any): Promise<string> {
 }
 
 async function timerWidget(args: any): Promise<string> {
-  const minutes = Math.min(Math.max(Number(args.minutes) || 0, 0.1), 24 * 60);
-  if (!minutes) return "How long, sir?";
+  const raw = Number(args.minutes);
+  if (!raw || raw <= 0) return "How long, sir?";
+  const minutes = Math.min(raw, 24 * 60);
   const label = String(args.label ?? "timer").slice(0, 60);
   const until = Date.now() + Math.round(minutes * 60_000);
   await showWidget({ kind: "timer", label, until, total: Math.round(minutes * 60_000) }, `⏱ ${label}`);
@@ -1450,6 +1453,7 @@ const APPS: { name: string; url: string; aliases: string[] }[] = [
 ];
 
 async function openApp(args: any): Promise<string> {
+  if (!String(args.app ?? "").trim()) return "Which app, sir?";
   const want = String(args.app ?? "").toLowerCase().trim();
   const app =
     APPS.find((a) => a.aliases.some((al) => want.includes(al) || al.includes(want))) ??

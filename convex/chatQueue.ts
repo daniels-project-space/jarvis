@@ -76,7 +76,7 @@ export const openTurn = mutation({
       .map((m: any) => ({
         role: m.role,
         // cards surface as context so "that video from earlier" resolves
-        text: m.text || (m.attachment ? `[showed on screen: ${m.attachment.title ?? m.attachment.type} — ${m.attachment.value}]` : ""),
+        text: m.text || (m.attachment ? `[showed on screen: ${m.attachment.title ?? m.attachment.type}]` : ""),
       }));
     const userId = await ctx.db.insert("chatMessages", {
       threadId,
@@ -103,7 +103,17 @@ export const requeueUser = mutation({
   args: { userId: v.id("chatMessages") },
   handler: async (ctx, a) => {
     const m = await ctx.db.get(a.userId);
-    if (m && m.role === "user") await ctx.db.patch(a.userId, { status: "pending" });
+    if (!m || m.role !== "user") return;
+    // Already answered (finalize applied but its response got lost in transit)?
+    // Requeueing would produce a duplicate reply from the cron lane.
+    const rows = await ctx.db
+      .query("chatMessages")
+      .withIndex("by_thread", (q: any) => q.eq("threadId", m.threadId))
+      .collect();
+    const answered = rows.some(
+      (r: any) => r.role === "assistant" && r.status === "done" && r.text && r.createdAt >= m.createdAt,
+    );
+    if (!answered) await ctx.db.patch(a.userId, { status: "pending" });
   },
 });
 
@@ -206,6 +216,11 @@ export const finalize = mutation({
     model: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
+    // Transport ambiguity guard: if a finalize APPLIED but its HTTP response
+    // was lost, the route's catch used to wipe the delivered answer and
+    // requeue — Daniel then heard a second, reworded reply minutes later.
+    const ex = await ctx.db.get(a.messageId);
+    if (ex?.status === "done" && a.status === "error") return;
     const patch: Record<string, unknown> = { status: a.status };
     if (a.finalText !== undefined) patch.text = a.finalText;
     if (a.model) patch.model = a.model;

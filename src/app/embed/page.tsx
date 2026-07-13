@@ -35,6 +35,12 @@ export default function Embed() {
   const recRef = useRef<MediaRecorder | null>(null);
   const claimVoice = useMutation(api.ui.claimVoice);
   const setLiveOn = useMutation(api.ui.setLiveOn);
+  const liveBeat = useRef<ReturnType<typeof setInterval> | null>(null);
+  const voiceRow = useQuery(api.ui.getVoice, {}) as { value: string; updatedAt: number } | null | undefined;
+  const voiceRowRef = useRef<{ value: string; updatedAt: number } | null>(null);
+  useEffect(() => {
+    voiceRowRef.current = voiceRow ?? null;
+  }, [voiceRow]);
   const logTurn = useMutation(api.chatQueue.logTurn);
   const liveOnRow = useQuery(api.ui.getLiveOn, {}) as { value: string; updatedAt: number } | null | undefined;
   const liveOnRef = useRef<typeof liveOnRow>(null);
@@ -115,7 +121,11 @@ export default function Embed() {
     if (liveRef.current) return;
     import("../../lib/tts").then((m) => m.stopSpeaking()); // wake barge-in cuts any read-out
     const got = await setLiveOn({ client: me.current, on: true }).catch(() => true);
-    if (got === false) return; // another device is live — stay quiet
+    if (got === false) return; // another device is live — stay quiet (and NO heartbeat)
+    // heartbeat, or the lock goes stale in 45s and a second device can start a
+    // parallel live session (feedback loop) — main app already does this
+    if (liveBeat.current) clearInterval(liveBeat.current);
+    liveBeat.current = setInterval(() => void setLiveOn({ client: me.current, on: true }).catch(() => {}), 20_000);
     const rt = await import("../../lib/realtime");
     const { stopWake } = await import("../../lib/wakeword");
     stopWake();
@@ -129,6 +139,8 @@ export default function Embed() {
         else {
           liveRef.current = false;
           setLive("off");
+          if (liveBeat.current) clearInterval(liveBeat.current);
+          liveBeat.current = null;
           void setLiveOn({ client: me.current, on: false }).catch(() => {});
           if (localStorage.getItem("jarvis_embed_wake") !== "0") armWake();
         }
@@ -136,6 +148,8 @@ export default function Embed() {
       onExitRequest: () => {
         liveRef.current = false;
         setLive("off");
+        if (liveBeat.current) clearInterval(liveBeat.current);
+        liveBeat.current = null;
         void setLiveOn({ client: me.current, on: false }).catch(() => {});
         if (localStorage.getItem("jarvis_embed_wake") !== "0") armWake();
       },
@@ -154,6 +168,10 @@ export default function Embed() {
   }
 
   async function stopLiveMode() {
+    if (liveBeat.current) {
+      clearInterval(liveBeat.current);
+      liveBeat.current = null;
+    }
     const rt = await import("../../lib/realtime");
     rt.stopLive();
     liveRef.current = false;
@@ -183,7 +201,9 @@ export default function Embed() {
       const reply = String(j.text ?? "");
       if (reply) {
         push({ who: "jarvis", text: reply });
-        if (!liveAnywhere() && !document.hidden) {
+        const vr = voiceRowRef.current;
+        const owned = !vr || vr.value === me.current || Date.now() - vr.updatedAt > 3 * 60 * 1000;
+        if (owned && !liveAnywhere() && !document.hidden) {
           const { speak } = await import("../../lib/tts");
           void speak(reply, () => {}, () => {}, () => {});
         }

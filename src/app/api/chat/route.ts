@@ -23,13 +23,16 @@ const MODELS = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"];
 // coerces null away harmlessly. Widen every non-required property to also accept
 // null so those calls validate. (enum props get null appended too, or `null`
 // would still fail the enum constraint.)
-function allowNullOnOptional(p: any) {
-  if (p?.type !== "object" || !p.properties) return p;
+function allowNullOnOptional(p: any): any {
+  if (!p || typeof p !== "object") return p;
+  if (p.type === "array" && p.items) return { ...p, items: allowNullOnOptional(p.items) };
+  if (p.type !== "object" || !p.properties) return p;
   const required: string[] = Array.isArray(p.required) ? p.required : [];
   const properties: Record<string, any> = {};
   for (const [key, raw] of Object.entries(p.properties)) {
-    const prop: any = { ...(raw as any) };
+    let prop: any = allowNullOnOptional({ ...(raw as any) }); // nested objects/arrays too
     if (!required.includes(key)) {
+      prop = { ...prop };
       if (typeof prop.type === "string") prop.type = [prop.type, "null"];
       else if (Array.isArray(prop.type) && !prop.type.includes("null")) prop.type = [...prop.type, "null"];
       if (Array.isArray(prop.enum) && !prop.enum.includes(null)) prop.enum = [...prop.enum, null];
@@ -98,11 +101,13 @@ const SLOW_LINES: Record<string, string> = {
 // Tools that actually put something on the stage — used to catch the model
 // CLAIMING "it's on your screen" in a turn where none of these ran.
 const SCREEN_TOOLS = new Set([
-  "show", "hide", "weather", "price_chart", "market_analysis", "markets", "youtube_search",
+  "show", "hide", "weather", "price_chart", "market_analysis", "market", "youtube_search",
   "shop_search", "news_today", "briefing", "todo_list", "net_worth", "calendar_view",
   "trip_open", "trip_plan", "trip_update", "trip_finalize", "mind_map", "board", "draft",
   "music_search", "memory_map", "transport_route", "open_app", "create_image", "create_pdf",
-  "timer", "orchestrate", "creations",
+  "timer", "orchestrate", "creations_list", "chart", "web_search", "flight_search",
+  "research", "deliberate", "plan_my_day", "rentals_calendar", "rental_availability",
+  "rental_stats", "open_travel_site", "video_control",
 ]);
 const SCREEN_CLAIM = /\bon (?:your|the) screen\b|\bup on screen\b|\bpulled (?:it |that |them )?up\b|\bshowing (?:you |it |them )?(?:now|here)\b|\bhave a look\b|\btake a look\b/i;
 
@@ -137,7 +142,10 @@ export async function POST(req: NextRequest) {
         content: `${PERSONA}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${ctx.block}\n\nCurrent date: ${new Date().toDateString()}. Use tools freely — search, show things on screen, dispatch agents — but keep every spoken reply short and human.`,
       },
       ...history
-        .filter((h: { role: string; text: string }) => !(h.role !== "user" && isToolGarbage(h.text)))
+        .filter(
+          (h: { role: string; text: string }) =>
+            !(h.role !== "user" && isToolGarbage(h.text) && !/^\[showed on screen: [^{]*\]$/.test(h.text)),
+        )
         .map((h: { role: string; text: string }) => ({
           role: h.role === "user" ? "user" : "assistant",
           content: h.text,
@@ -156,6 +164,7 @@ export async function POST(req: NextRequest) {
 
     let final = "";
     let interimSaid = false;
+    let screenTouched = false; // a screen tool ran AND did not error this turn
     const used: string[] = [];
     for (let round = 0; round < 6; round++) {
       const j = await groq(key, {
@@ -170,13 +179,19 @@ export async function POST(req: NextRequest) {
       if (!msg) throw new Error("groq returned no message");
       if (msg.tool_calls?.length) {
         messages.push(msg);
+        let sayTimer: ReturnType<typeof setTimeout> | null = null;
+        let sayFired = false;
         if (!interimSaid) {
           const line = msg.tool_calls.map((tc: any) => SLOW_LINES[tc.function.name]).find(Boolean);
           if (line) {
             interimSaid = true;
-            // Ephemeral voice line — NOT a chat row (a row inserted mid-turn
-            // sorts after the answer placeholder and silences the answer).
-            await convexMutation("ui:say", { text: line }).catch(() => {});
+            // Speak only if the work is genuinely still running after 1.2s —
+            // instant validation bounces ("what's the budget?") used to get
+            // "pricing flights now…" announced for work that never started.
+            sayTimer = setTimeout(() => {
+              sayFired = true;
+              void convexMutation("ui:say", { text: line }).catch(() => {});
+            }, 1200);
           }
         }
         for (const tc of msg.tool_calls) {
@@ -188,7 +203,12 @@ export async function POST(req: NextRequest) {
           }
           used.push(tc.function.name);
           const result = await executeTool(tc.function.name, args).catch((e) => `Tool error: ${e?.message ?? e}`);
+          if (SCREEN_TOOLS.has(tc.function.name) && !/^Tool (error|failed)/i.test(result)) screenTouched = true;
           messages.push({ role: "tool", tool_call_id: tc.id, content: result.slice(0, 12000) });
+        }
+        if (sayTimer) {
+          clearTimeout(sayTimer);
+          if (!sayFired) interimSaid = false; // fast round — a later slow round may still speak
         }
         continue;
       }
@@ -196,12 +216,7 @@ export async function POST(req: NextRequest) {
       // Honesty guardrail: "it's on your screen" with no screen tool run this
       // turn = the exact "he says he showed it but nothing opened" bug. Give
       // the model ONE corrective round to actually call the tool (or rephrase).
-      if (
-        final &&
-        round < 5 &&
-        SCREEN_CLAIM.test(final) &&
-        !used.some((u) => SCREEN_TOOLS.has(u))
-      ) {
+      if (final && round < 5 && SCREEN_CLAIM.test(final) && !screenTouched) {
         messages.push({ role: "assistant", content: final });
         messages.push({
           role: "system",
@@ -213,7 +228,19 @@ export async function POST(req: NextRequest) {
       }
       break;
     }
-    if (final && isToolGarbage(final)) final = sanitizeAssistantText(final) || "Done — it's on your screen.";
+    if (final && isToolGarbage(final) && !final.includes("```"))
+      final = sanitizeAssistantText(final) || "Sorry — I mangled that reply. Ask me once more?";
+    if (!final) {
+      // round budget exhausted mid-toolwork: the side effects already happened,
+      // so ask for a summary rather than apologising and inviting a re-ask
+      // (which used to double todos/agents/panels)
+      const j = await groq(key, {
+        messages: [...messages, { role: "system", content: "Answer Daniel now in one or two short sentences summarising what you just did. Do not call tools." }],
+        temperature: 0.6,
+        max_tokens: 300,
+      }).catch(() => null);
+      final = String(j?.choices?.[0]?.message?.content ?? "").trim();
+    }
     if (!final) final = "Sorry — lost my train of thought there. Say that again?";
 
     await convexMutation("chatQueue:finalize", {

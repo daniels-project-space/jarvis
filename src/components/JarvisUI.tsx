@@ -719,6 +719,7 @@ export default function JarvisUI() {
   const logTurn = useMutation(api.chatQueue.logTurn);
   const saveSub = useMutation(api.push.saveSub);
   const claimVoice = useMutation(api.ui.claimVoice);
+  const electVoice = useMutation(api.ui.electVoice);
   const setLiveOn = useMutation(api.ui.setLiveOn);
   const voiceRow = useQuery(api.ui.getVoice, {}) as { value: string; updatedAt: number } | null | undefined;
   const liveOnRow = useQuery(api.ui.getLiveOn, {}) as { value: string; updatedAt: number } | null | undefined;
@@ -880,14 +881,18 @@ export default function JarvisUI() {
   const videoCmd = useQuery(api.ui.getVideoCmd, {}) as { value: string; updatedAt: number } | null | undefined;
   const lastVideoCmd = useRef(-1);
   // The brain's video remote: relay play/pause into the YouTube iframe, close kills it.
+  const videoMountTs = useRef(Date.now());
   useEffect(() => {
     if (!videoCmd) return;
     if (lastVideoCmd.current === -1) {
-      lastVideoCmd.current = videoCmd.updatedAt; // stale command from before load
-      return;
+      lastVideoCmd.current = videoCmd.updatedAt;
+      // only ignore commands issued BEFORE this page existed — the first-ever
+      // command used to be swallowed as "stale" and "pause" needed saying twice
+      if (videoCmd.updatedAt <= videoMountTs.current) return;
+    } else {
+      if (videoCmd.updatedAt === lastVideoCmd.current) return;
+      lastVideoCmd.current = videoCmd.updatedAt;
     }
-    if (videoCmd.updatedAt === lastVideoCmd.current) return;
-    lastVideoCmd.current = videoCmd.updatedAt;
     if (videoCmd.value === "close") {
       setVideoPip(false);
       void clearPanel({});
@@ -1014,14 +1019,17 @@ export default function JarvisUI() {
       setSpeaking(false);
     }
   }, [liveOnRow]);
-  // I speak only if I own the voice (or nobody fresh does — then I claim it).
-  function mayISpeak(): boolean {
+  // I speak only if I own the voice; when the row is stale, ELECT atomically —
+  // two visible tabs used to both optimistically claim and voice the same
+  // sentence in stereo.
+  async function ensureVoice(): Promise<boolean> {
     const v = voiceRef.current;
-    if (!v || Date.now() - v.updatedAt > 3 * 60 * 1000) {
-      void claimVoice({ client: me.current });
-      return true;
+    if (v && Date.now() - v.updatedAt <= 3 * 60 * 1000) return v.value === me.current;
+    try {
+      return (await electVoice({ client: me.current })) !== false;
+    } catch {
+      return true; // convex hiccup: better one voice too many than silence
     }
-    return v.value === me.current;
   }
 
   useEffect(() => {
@@ -1112,8 +1120,9 @@ export default function JarvisUI() {
     if (!sayRow?.value || at === lastSayAt.current) return;
     lastSayAt.current = at;
     if (Date.now() - at > 15_000) return; // stale
-    if (liveRef.current || liveAnywhere() || !mayISpeak() || document.hidden) return;
+    if (liveRef.current || liveAnywhere() || document.hidden) return;
     (async () => {
+      if (!(await ensureVoice())) return;
       const { speak } = await import("../lib/tts");
       await speak(
         sayRow.value,
@@ -1128,8 +1137,15 @@ export default function JarvisUI() {
   // Speak new finalized assistant messages (text lane). Live-lane rows were
   // already spoken by the realtime session; while live is on, nudge the live
   // session to voice out-of-band lines (agent findings) instead of local TTS.
+  const lastSpokenThread = useRef<string>("");
   useEffect(() => {
     const last = [...messages].reverse().find((m) => m.role === "assistant" && m.status === "done" && m.text);
+    // hopping threads must never re-voice that thread's old last reply
+    if (lastSpokenThread.current !== thread) {
+      lastSpokenThread.current = thread;
+      lastSpokenId.current = last?._id ?? null;
+      return;
+    }
     if (!last || last._id === lastSpokenId.current) return;
     if (lastSpokenId.current === null) {
       lastSpokenId.current = last._id; // don't re-speak history on page load
@@ -1153,9 +1169,9 @@ export default function JarvisUI() {
     // HARD RULE: while a live session exists on ANY device, nothing else may
     // produce speech — the live voice is the only speaker in the house.
     if (liveAnywhere()) return;
-    if (!mayISpeak()) return; // another tab/device owns the voice
     if (document.hidden) return; // background tabs stay silent — one voice, ever
     (async () => {
+      if (!(await ensureVoice())) return; // another tab/device owns the voice
       const { speak } = await import("../lib/tts");
       await speak(
         last.text,
@@ -1207,6 +1223,13 @@ export default function JarvisUI() {
   function releaseLive() {
     if (liveBeat.current) clearInterval(liveBeat.current);
     liveBeat.current = null;
+    // stale queued weaves used to be re-announced by the NEXT session (whose
+    // prompt already contains them) — and a stale caption ref made its first
+    // nudge spin on "someone's mid-sentence"
+    nudgeQueue.current = [];
+    if (flushTimer.current) clearTimeout(flushTimer.current);
+    flushTimer.current = null;
+    captionRef.current = null;
     void setLiveOn({ client: me.current, on: false }).catch(() => {});
   }
 
@@ -1225,7 +1248,7 @@ export default function JarvisUI() {
     // One live session TOTAL, across every device — the lock refuses seconds.
     const got = await setLiveOn({ client: me.current, on: true }).catch(() => true);
     if (got === false) {
-      alert("Live mode is already running on another device — turn it off there first.");
+      console.warn("live: another device holds the session"); // never a blocking alert
       rearmWake();
       return;
     }

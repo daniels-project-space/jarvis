@@ -37,6 +37,21 @@ export const claimVoice = mutation({
   },
 });
 
+// Passive election for background speech (weaves, say-lines): first caller
+// wins atomically; a fresh claim by another client is respected. User-action
+// claims (typing, mic) keep using claimVoice, which always wins.
+export const electVoice = mutation({
+  args: { client: v.string() },
+  handler: async (ctx, a) => {
+    const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "voice")).first();
+    if (ex && ex.value !== a.client && Date.now() - ex.updatedAt <= 3 * 60 * 1000) return false;
+    const doc = { key: "voice", type: "voice", value: a.client, updatedAt: Date.now() };
+    if (ex) await ctx.db.patch(ex._id, doc);
+    else await ctx.db.insert("ui", doc);
+    return true;
+  },
+});
+
 export const getVoice = query({
   args: {},
   handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "voice")).first(),
