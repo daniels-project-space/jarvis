@@ -700,6 +700,19 @@ export const TOOL_DEFS = [
     parameters: { type: "object", properties: {} },
   },
   {
+    name: "calculate",
+    description:
+      "Work out a calculation and show it BIG on screen. Use for any maths, unit/currency conversion, percentages, splits, tips, 'what's X% of Y', 'A times B'. Pass a plain arithmetic expression (js-style: + - * / %, parentheses, and sqrt/round/abs/min/max/pow). Include a short label of what it is.",
+    parameters: {
+      type: "object",
+      properties: {
+        expression: { type: "string", description: "e.g. '18% of 240' → '0.18*240', or '(1200/3)*2'" },
+        label: { type: "string", description: "what this works out, e.g. 'tip on £240'" },
+      },
+      required: ["expression"],
+    },
+  },
+  {
     name: "self_repair",
     description:
       "Something is BROKEN (in JARVIS itself or any of Daniel's apps): file it and dispatch a repair engineer immediately to reproduce it, trace the root cause and fix it. Use whenever Daniel reports a malfunction or you notice a tool/feature failing repeatedly. Tell him one casual line that you're on it.",
@@ -879,22 +892,22 @@ async function showResultsPanel(title: string, md: string) {
 
 async function webSearch(query: string): Promise<string> {
   const { searchWeb } = await import("./search");
-  const j = await searchWeb(query, 8);
+  const j = await searchWeb(query, 9);
   if (!j) return "Search unavailable right now.";
-  const parts: string[] = [];
-  const md: string[] = [`## ${query}`, ""];
-  if (j.answer) {
-    parts.push(`Answer: ${j.answer}`);
-    md.push(`**${j.answer}**`, "");
-  }
-  let n = 0;
-  for (const r of j.results.slice(0, 8)) {
-    n++;
-    parts.push(`${r.title} — ${r.snippet} (${r.link})`);
-    md.push(`${n}. [${r.title}](${r.link})`, `   ${r.snippet}`, "");
-  }
-  await showResultsPanel(`search · ${query.slice(0, 40)}`, md.join("\n"));
-  return (parts.join("\n") || "No results.") + "\n(The full result list is on Daniel's screen.)";
+  const dom = (u: string) => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return ""; } };
+  // Visual result cards: a live page thumbnail (WordPress mShots, free) with a
+  // favicon fallback, shown three at a time in framed tiles.
+  const items = j.results.slice(0, 9).map((r) => ({
+    title: r.title,
+    url: r.link,
+    snippet: r.snippet,
+    domain: dom(r.link),
+    image: `https://s.wordpress.com/mshots/v1/${encodeURIComponent(r.link)}?w=640`,
+    favicon: `https://www.google.com/s2/favicons?domain=${dom(r.link)}&sz=128`,
+  }));
+  await showWidget({ kind: "webresults", query, answer: j.answer ?? "", items }, `search · ${query.slice(0, 36)}`);
+  const parts = [j.answer ? `Answer: ${j.answer}` : "", ...j.results.slice(0, 6).map((r) => `${r.title} — ${r.snippet} (${r.link})`)].filter(Boolean);
+  return (parts.join("\n") || "No results.") + "\n(Result cards with page thumbnails are on Daniel's screen, three at a time — speak just the best takeaway.)";
 }
 
 // Google Flights rejects metro codes — map them to the main airport.
@@ -2732,6 +2745,28 @@ export async function executeTool(name: string, args: any): Promise<string> {
         ? "\nRecent findings: " + recent.map((r: any) => r.spoken).join(" | ")
         : "";
       return m + a + f;
+    }
+    case "calculate": {
+      const raw = String(args.expression ?? "").trim();
+      if (!raw) return "TOOL DID NOTHING: no expression.";
+      // Safe evaluator: whitelist arithmetic + a few Math fns, reject anything else.
+      const expr = raw
+        .replace(/\bpi\b/gi, "Math.PI").replace(/\be\b/g, "Math.E")
+        .replace(/\b(sqrt|round|abs|min|max|pow|floor|ceil|log|sin|cos|tan)\s*\(/gi, (_m, f) => `Math.${f.toLowerCase()}(`)
+        .replace(/×/g, "*").replace(/÷/g, "/").replace(/[£$€,]/g, "");
+      if (!/^[\d\s+\-*/%.()MathPIEsqrtoundabsminxpowfilcegltn]*$/.test(expr))
+        return "TOOL DID NOTHING: that expression has characters I won't evaluate — simplify it to plain arithmetic.";
+      let result: number;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+        result = Function(`"use strict"; return (${expr});`)() as number;
+      } catch {
+        return "TOOL DID NOTHING: couldn't parse that calculation.";
+      }
+      if (typeof result !== "number" || !Number.isFinite(result)) return "That doesn't come out to a finite number.";
+      const pretty = Number.isInteger(result) ? result.toLocaleString("en-GB") : result.toLocaleString("en-GB", { maximumFractionDigits: 6 });
+      await showWidget({ kind: "calc", label: String(args.label ?? "").slice(0, 60), expression: raw, result: pretty }, `= ${pretty}`);
+      return `Calculation on screen: ${raw} = ${pretty}. Say the answer in one short line.`;
     }
     case "current_time": {
       const now = new Date();

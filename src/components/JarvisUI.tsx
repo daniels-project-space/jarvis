@@ -4,7 +4,7 @@ import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
-import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView , DocView } from "./Views";
+import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView } from "./Views";
 import TripView from "./TripView";
 import BoardView from "./BoardView";
 
@@ -149,6 +149,10 @@ function panelSize(panel: { type: string; value: string }): string {
       return "w-[min(1340px,82%)] h-[min(740px,92%)]";
     case "w:shop":
       return "w-[min(1340px,82%)] h-[min(700px,92%)]";
+    case "w:webresults":
+      return "w-[min(1340px,84%)] h-[min(720px,92%)]";
+    case "w:calc":
+      return "w-[min(560px,94%)] h-[min(360px,80%)]";
     case "markdown":
       return "w-[min(980px,97%)] h-full";
     case "doc":
@@ -186,6 +190,20 @@ function ModelBadge({ model }: { model?: string | null }) {
 // Ambient arc-reactor HUD ring — concentric SVG rings (a segmented outer ring,
 // a counter-rotating scanner, radial ticks) framing the orb when the stage is
 // clear. Subtle by default; brightens when JARVIS is engaged.
+// A calculation, shown big: the expression small on top, the answer huge.
+function CalcView({ w }: { w: any }) {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
+      {w.label && <div className="hud-label !text-cyan">{w.label}</div>}
+      <div className="font-mono text-lg text-slate">{w.expression}</div>
+      <div className="h-px w-24 bg-gradient-to-r from-transparent via-cyan/40 to-transparent" />
+      <div className="font-display text-6xl font-bold tracking-tight text-ice md:text-7xl" style={{ textShadow: "0 0 40px rgba(0,255,136,0.25)" }}>
+        {w.result}
+      </div>
+    </div>
+  );
+}
+
 // Options panel — a frosted-glass sheet dropping from the top right. Voice lane,
 // speaking voice, motion, and a manual mood override.
 const OPTION_MOODS: { k: string; c: string }[] = [
@@ -540,6 +558,8 @@ function WidgetView({ value }: { value: string }) {
   if (w?.kind === "todos") return <TodosView value={value} />;
   if (w?.kind === "briefing2") return <Briefing2View value={value} />;
   if (w?.kind === "shop") return <ShopView value={value} />;
+  if (w?.kind === "webresults") return <WebResultsView value={value} />;
+  if (w?.kind === "calc") return <CalcView w={w} />;
   if (w?.kind === "market") {
     return (
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6">

@@ -622,6 +622,85 @@ export function DocView({ value }: { value: string }) {
   );
 }
 
+/* ---------------------------------- web result cards ---------------------------------- */
+
+type WebItem = { title: string; url: string; snippet: string; domain: string; image: string; favicon: string };
+
+// Search results as framed tile cards — a live page thumbnail (mShots, favicon
+// fallback), three per page with a pager. Modern frosted glass.
+export function WebResultsView({ value }: { value: string }) {
+  let w: { query: string; answer?: string; items: WebItem[] } | null = null;
+  try {
+    w = JSON.parse(value);
+  } catch {
+    /* noop */
+  }
+  const [page, setPage] = useState(0);
+  const label = w?.query;
+  useEffect(() => setPage(0), [label]);
+  if (!w?.items?.length) return <div className="flex flex-1 items-center justify-center text-sm text-slate">nothing found</div>;
+  const per = 3;
+  const pages = Math.max(1, Math.ceil(w.items.length / per));
+  const cur = Math.min(page, pages - 1);
+  const slice = w.items.slice(cur * per, cur * per + per);
+  return (
+    <div className="flex min-h-0 flex-1 flex-col p-4">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <span className="hud-label truncate">search · {w.query}</span>
+        <div className="flex shrink-0 items-center gap-2">
+          <button disabled={cur === 0} onClick={() => setPage(Math.max(0, cur - 1))} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">&lsaquo; prev</button>
+          <span className="hud-label">{cur + 1}/{pages}</span>
+          <button disabled={cur >= pages - 1} onClick={() => setPage(Math.min(pages - 1, cur + 1))} className="hud-label rounded px-2 py-1 transition disabled:opacity-25 hover:text-cyan">next &rsaquo;</button>
+        </div>
+      </div>
+      {w.answer && (
+        <div className="mb-3 rounded-xl border border-cyan/20 bg-cyan/[0.06] px-3.5 py-2 text-[13px] leading-snug text-ice">
+          <span className="hud-label mr-2 !text-cyan">answer</span>{w.answer}
+        </div>
+      )}
+      <div className="grid flex-1 grid-cols-1 content-start gap-4 md:grid-cols-3">
+        {slice.map((it, i) => (
+          <a
+            key={cur * per + i}
+            href={it.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="frost rise group flex flex-col overflow-hidden text-left"
+            style={{ animationDelay: `${i * 80}ms` }}
+          >
+            <div className="relative aspect-[16/10] w-full overflow-hidden bg-[#0b1220]">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={it.image}
+                alt=""
+                loading="lazy"
+                className="h-full w-full object-cover object-top transition-transform duration-500 group-hover:scale-[1.04]"
+                onError={(e) => {
+                  const img = e.currentTarget;
+                  if (img.src !== it.favicon) {
+                    img.src = it.favicon;
+                    img.className = "m-auto h-12 w-12 object-contain opacity-80";
+                  }
+                }}
+              />
+              <span className="absolute left-2 top-2 flex items-center gap-1.5 rounded-full bg-black/70 px-2 py-0.5 backdrop-blur">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={it.favicon} alt="" className="h-3.5 w-3.5 rounded-sm" />
+                <span className="max-w-[130px] truncate text-[10px] text-ice/90">{it.domain}</span>
+              </span>
+            </div>
+            <div className="flex flex-1 flex-col p-3">
+              <div className="line-clamp-2 text-[14px] font-medium leading-snug text-ice">{it.title}</div>
+              <div className="mt-1 line-clamp-3 text-[11px] leading-snug text-slate">{it.snippet}</div>
+              <span className="mt-auto pt-2 text-[10px] text-cyan/70 opacity-0 transition group-hover:opacity-100">open &nearr;</span>
+            </div>
+          </a>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /* ---------------------------------- shopping frames ---------------------------------- */
 
 type ShopItem = { image: string; title: string; price: string; merchant: string; delivery?: string; rating?: number; reviews?: number; url?: string };
