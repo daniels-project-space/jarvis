@@ -76,11 +76,48 @@ export async function searchWeb(query: string, num = 8, gl = "us"): Promise<WebO
     };
   }
   const j = await serpapi({ engine: "google", q: query, num: String(num) });
-  if (!j) return null;
-  return {
-    answer: j.answer_box?.answer ?? j.answer_box?.snippet,
-    results: (j.organic_results ?? []).slice(0, num).map((r: any) => ({ title: String(r.title ?? ""), link: String(r.link ?? ""), snippet: String(r.snippet ?? "") })),
-  };
+  if (j) {
+    return {
+      answer: j.answer_box?.answer ?? j.answer_box?.snippet,
+      results: (j.organic_results ?? []).slice(0, num).map((r: any) => ({ title: String(r.title ?? ""), link: String(r.link ?? ""), snippet: String(r.snippet ?? "") })),
+    };
+  }
+  // Last resort: keyless DuckDuckGo HTML scrape — keeps general search alive
+  // with no provider/quota at all (shopping/news still need a real provider).
+  return await ddgHtml(query, num);
+}
+
+async function ddgHtml(query: string, num: number): Promise<WebOut> {
+  try {
+    const r = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
+      headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "accept-language": "en" },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) return null;
+    const html = await r.text();
+    const results: WebResult[] = [];
+    const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+    const strip = (s: string) =>
+      s
+        .replace(/<[^>]+>/g, "")
+        .replace(/&amp;/g, "&")
+        .replace(/&#x27;|&#39;/g, "'")
+        .replace(/&quot;/g, '"')
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/\s+/g, " ")
+        .trim();
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html)) && results.length < num) {
+      let link = m[1];
+      const dd = link.match(/uddg=([^&]+)/);
+      if (dd) link = decodeURIComponent(dd[1]);
+      results.push({ title: strip(m[2]), link, snippet: strip(m[3]) });
+    }
+    return results.length ? { results } : null;
+  } catch {
+    return null;
+  }
 }
 
 // ---- shopping (UK) ----
