@@ -98,7 +98,7 @@ export async function POST(req: NextRequest) {
             // JARVIS mid-sentence (phones were worst)
             noise_reduction: { type: "near_field" },
           },
-          output: { voice: process.env.REALTIME_VOICE || "ballad" },
+          output: { voice: process.env.REALTIME_VOICE || "ash" },
         },
       },
     }),
@@ -121,6 +121,6 @@ export async function POST(req: NextRequest) {
     model: process.env.REALTIME_MODEL || "gpt-realtime-2.1",
     client,
     instructions,
-    voice: process.env.REALTIME_VOICE || "ballad",
+    voice: process.env.REALTIME_VOICE || "ash",
   });
 }

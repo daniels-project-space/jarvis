@@ -137,6 +137,22 @@ export const getMood = query({
   handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "mood")).first(),
 });
 
+// Daniel's current location (granted once, persisted) — so "near me" / place
+// lookups work in both lanes and the brain knows where he is.
+export const setLocation = mutation({
+  args: { lat: v.number(), lng: v.number(), label: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "location")).first();
+    const doc = { key: "location", type: "location", value: `${a.lat},${a.lng}`, title: a.label, updatedAt: Date.now() };
+    if (ex) await ctx.db.patch(ex._id, doc);
+    else await ctx.db.insert("ui", doc);
+  },
+});
+export const getLocation = query({
+  args: {},
+  handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "location")).first(),
+});
+
 // Chats: one active thread (UI + brain + agent weaves all follow it) plus a
 // small registry so Daniel can hop back to earlier conversations.
 export const setActiveThread = mutation({

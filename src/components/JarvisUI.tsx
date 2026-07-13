@@ -4,7 +4,7 @@ import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import ThreeOrb from "./ThreeOrb";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
-import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView } from "./Views";
+import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView } from "./Views";
 import TripView from "./TripView";
 import BoardView from "./BoardView";
 
@@ -151,6 +151,8 @@ function panelSize(panel: { type: string; value: string }): string {
       return "w-[min(1340px,82%)] h-[min(700px,92%)]";
     case "w:webresults":
       return "w-[min(1340px,84%)] h-[min(720px,92%)]";
+    case "w:places":
+      return "w-[min(1200px,90%)] h-[min(760px,94%)]";
     case "w:calc":
       return "w-[min(560px,94%)] h-[min(360px,80%)]";
     case "markdown":
@@ -212,11 +214,13 @@ const OPTION_MOODS: { k: string; c: string }[] = [
   { k: "curious", c: "#33e0d0" }, { k: "serious", c: "#8fa3bd" }, { k: "excited", c: "#ff5470" },
 ];
 function OptionsPanel({
-  prefs, setPref, live, onClose, onToggleLive, onMood, onClearMood,
+  prefs, setPref, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood,
 }: {
   prefs: { voice: string; tts: string; reduceMotion: boolean };
   setPref: (k: "voice" | "tts" | "reduceMotion", v: string | boolean) => void;
   live: string;
+  locOn: boolean;
+  onLocation: () => void;
   onClose: () => void;
   onToggleLive: () => void;
   onMood: (m: string) => void;
@@ -258,6 +262,11 @@ function OptionsPanel({
           <Row label="Live conversation" hint={live !== "off" ? "on now" : "start a realtime voice session"}>
             <button onClick={onToggleLive} className={`rounded-lg px-3 py-1 text-[11px] transition ${live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>
               {live === "connecting" ? "…" : live !== "off" ? "stop" : "start"}
+            </button>
+          </Row>
+          <Row label="Location" hint={locOn ? "on — 'near me' works everywhere" : "for 'pizza near me', local hours"}>
+            <button onClick={onLocation} className={`rounded-lg px-3 py-1 text-[11px] transition ${locOn ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>
+              {locOn ? "on" : "enable"}
             </button>
           </Row>
           <Row label="Reduce motion" hint="calmer orb + fewer animations">
@@ -561,6 +570,7 @@ function WidgetView({ value }: { value: string }) {
   if (w?.kind === "briefing2") return <Briefing2View value={value} />;
   if (w?.kind === "shop") return <ShopView value={value} />;
   if (w?.kind === "webresults") return <WebResultsView value={value} />;
+  if (w?.kind === "places") return <PlacesView value={value} />;
   if (w?.kind === "calc") return <CalcView w={w} />;
   if (w?.kind === "market") {
     return (
@@ -1061,6 +1071,36 @@ export default function JarvisUI() {
     const key = k === "voice" ? "jarvis_voice" : k === "tts" ? "jarvis_tts" : "jarvis_reduce_motion";
     localStorage.setItem(key, typeof v === "boolean" ? (v ? "1" : "0") : String(v));
   };
+
+  // Location: granted once, then permanent (browser remembers the permission,
+  // and we refresh the stored coords on load so "near me" works in both lanes).
+  const setLocationMut = useMutation(api.ui.setLocation);
+  const [locOn, setLocOn] = useState(false);
+  const captureLocation = (announce = false): Promise<boolean> =>
+    new Promise((resolve) => {
+      if (!navigator.geolocation) {
+        if (announce) alert("This device can't share location.");
+        return resolve(false);
+      }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          void setLocationMut({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+          localStorage.setItem("jarvis_location", "1");
+          setLocOn(true);
+          resolve(true);
+        },
+        () => {
+          if (announce) alert("Location blocked — allow it in your browser's site settings, then toggle again.");
+          resolve(false);
+        },
+        { enableHighAccuracy: false, timeout: 8000, maximumAge: 5 * 60_000 },
+      );
+    });
+  useEffect(() => {
+    // silently refresh coords on load if he's already granted it once
+    if (localStorage.getItem("jarvis_location") === "1") void captureLocation(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Chat history drawer + intelligent video handling (16:9 stage / PiP corner)
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -1800,6 +1840,8 @@ export default function JarvisUI() {
           prefs={prefs}
           setPref={setPref}
           live={live}
+          locOn={locOn}
+          onLocation={() => void captureLocation(true)}
           onClose={() => setOptionsOpen(false)}
           onToggleLive={() => void toggleLive()}
           onMood={(m) => void setMoodMut({ mood: m, manual: true })}

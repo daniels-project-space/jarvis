@@ -622,6 +622,121 @@ export function DocView({ value }: { value: string }) {
   );
 }
 
+/* ---------------------------------- places near you (dark map) ---------------------------------- */
+
+type Place = {
+  name: string; address: string; rating?: number; reviews?: number; openNow?: boolean;
+  hoursToday?: string; type?: string; lat: number; lng: number; dist: number | null; mapsUri: string;
+};
+
+// A dark interactive map of Daniel's area with the found places pinned, plus a
+// scrollable list of place cards — hours, rating, distance, and one-tap
+// walk/drive/transit directions from his location.
+export function PlacesView({ value }: { value: string }) {
+  let w: { query: string; center: { lat: number; lng: number }; items: Place[] } | null = null;
+  try {
+    w = JSON.parse(value);
+  } catch {
+    /* noop */
+  }
+  const mapEl = useRef<HTMLDivElement>(null);
+  const mapObj = useRef<any>(null);
+  const [sel, setSel] = useState(0);
+  const items = w?.items ?? [];
+  const center = w?.center;
+
+  useEffect(() => {
+    if (!mapEl.current || !center || mapObj.current) return;
+    let cancelled = false;
+    (async () => {
+      const maplibregl = (await import("maplibre-gl")).default;
+      await import("maplibre-gl/dist/maplibre-gl.css");
+      if (cancelled || !mapEl.current) return;
+      const map = new maplibregl.Map({
+        container: mapEl.current,
+        style: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+        center: [center.lng, center.lat],
+        zoom: 13,
+        attributionControl: false,
+      });
+      mapObj.current = map;
+      map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
+      map.on("load", () => {
+        // Daniel's location — pulsing cyan dot
+        const you = document.createElement("div");
+        you.style.cssText = "width:16px;height:16px;border-radius:9999px;background:#00ff88;box-shadow:0 0 0 6px rgba(0,255,136,0.25),0 0 14px rgba(0,255,136,0.8);";
+        new maplibregl.Marker({ element: you }).setLngLat([center.lng, center.lat]).addTo(map);
+        const bounds = new maplibregl.LngLatBounds([center.lng, center.lat], [center.lng, center.lat]);
+        items.forEach((p, i) => {
+          const el = document.createElement("div");
+          el.style.cssText = "display:grid;place-items:center;width:26px;height:26px;border-radius:9999px 9999px 9999px 2px;transform:rotate(45deg);background:#0b1220;border:2px solid #00ff88;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,0.6);";
+          el.innerHTML = `<span style="transform:rotate(-45deg);color:#00ff88;font:600 11px system-ui;">${i + 1}</span>`;
+          el.onclick = () => setSel(i);
+          new maplibregl.Marker({ element: el, anchor: "bottom" }).setLngLat([p.lng, p.lat]).addTo(map);
+          bounds.extend([p.lng, p.lat]);
+        });
+        map.fitBounds(bounds, { padding: 70, maxZoom: 15, duration: 600 });
+      });
+    })();
+    return () => {
+      cancelled = true;
+      mapObj.current?.remove?.();
+      mapObj.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
+
+  if (!w || !items.length) return <div className="flex flex-1 items-center justify-center text-sm text-slate">nothing near you</div>;
+  const dir = (p: Place, mode: string) =>
+    `https://www.google.com/maps/dir/?api=1&origin=${center!.lat},${center!.lng}&destination=${p.lat},${p.lng}&travelmode=${mode}`;
+  return (
+    <div className="flex min-h-0 flex-1 flex-col md:flex-row">
+      <div ref={mapEl} className="h-52 w-full shrink-0 md:h-auto md:flex-1" />
+      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3 md:w-[380px] md:flex-none">
+        <div className="hud-label mb-2">near you · {w.query}</div>
+        <div className="space-y-2.5">
+          {items.map((p, i) => (
+            <div
+              key={i}
+              onClick={() => {
+                setSel(i);
+                mapObj.current?.flyTo?.({ center: [p.lng, p.lat], zoom: 16, duration: 500 });
+              }}
+              className={`frost cursor-pointer p-3 transition ${sel === i ? "!border-cyan/50" : ""}`}
+            >
+              <div className="flex items-start gap-2">
+                <span className="mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-full bg-cyan/15 font-mono text-[11px] text-cyan ring-1 ring-cyan/40">{i + 1}</span>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[14px] font-medium text-ice">{p.name}</div>
+                  <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px]">
+                    {p.dist != null && <span className="text-cyan/80">{p.dist} km</span>}
+                    {p.rating != null && <span className="text-amber">★ {p.rating}{p.reviews ? ` (${p.reviews})` : ""}</span>}
+                    {p.openNow != null && <span className={p.openNow ? "text-emerald-400" : "text-red-400"}>{p.openNow ? "open now" : "closed"}</span>}
+                  </div>
+                  {p.hoursToday && <div className="mt-0.5 text-[11px] text-slate">Today: {p.hoursToday}</div>}
+                  <div className="truncate text-[10px] text-slate">{p.address}</div>
+                  <div className="mt-2 flex gap-1.5">
+                    {[["walking", "🚶"], ["driving", "🚗"], ["transit", "🚆"]].map(([m, ic]) => (
+                      <a key={m} href={dir(p, m)} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()} title={m} className="rounded-lg bg-white/5 px-2 py-1 text-xs ring-1 ring-white/10 transition hover:bg-cyan/15 hover:ring-cyan/40">
+                        {ic}
+                      </a>
+                    ))}
+                    {p.mapsUri && (
+                      <a href={p.mapsUri} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()} className="ml-auto rounded-lg px-2 py-1 text-[10px] text-cyan/70 transition hover:text-cyan">
+                        maps ↗
+                      </a>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ---------------------------------- web result cards ---------------------------------- */
 
 type WebItem = { title: string; url: string; snippet: string; domain: string; image: string; favicon: string };

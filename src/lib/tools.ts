@@ -662,6 +662,18 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "places_near",
+    description:
+      "Find real places NEAR Daniel (uses his live location): 'nearest Pizza Express', 'coffee near me', 'where's the closest pharmacy'. Also for a SPECIFIC local place and its opening hours: 'when does the Royal Mail down the street close', 'is the Tesco open now'. Shows a dark interactive map of his area with the places pinned, each with rating, open/closed + today's hours, distance, and one-tap walk/drive/transit directions. Speak the single best answer (nearest, or the closing time he asked for).",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "what to find, e.g. 'Pizza Express', 'Royal Mail', 'pharmacy'" },
+      },
+      required: ["query"],
+    },
+  },
+  {
     name: "transport_route",
     description:
       "Show a LIVE interactive Google Map with directions between two places (transit/driving/walking) — routes, times and options, embedded on screen. Use for 'how do I get from X to Y', airport transfers, trip transport questions.",
@@ -1984,6 +1996,66 @@ async function musicSearch(args: any): Promise<string> {
 }
 
 // Live Google Maps directions embedded on screen.
+// Places near Daniel: Google Places (New) Text Search biased to his live
+// location, rendered as a dark map + cards with hours/rating/distance.
+function haversine(a: [number, number], b: [number, number]): number {
+  const R = 6371, dLat = ((b[0] - a[0]) * Math.PI) / 180, dLng = ((b[1] - a[1]) * Math.PI) / 180;
+  const lat1 = (a[0] * Math.PI) / 180, lat2 = (b[0] * Math.PI) / 180;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.asin(Math.sqrt(h));
+}
+async function placesNear(args: any): Promise<string> {
+  const query = String(args.query ?? "").trim();
+  if (!query) return "What am I looking for?";
+  const loc: any = await convexQuery("ui:getLocation", {}).catch(() => null);
+  if (!loc?.value) return "I don't have your location yet, sir — tap the location toggle in the options panel (⚙) once and it stays on.";
+  const [lat, lng] = String(loc.value).split(",").map(Number);
+  const key = await getSecret("google", "GOOGLE_PLACES_API_KEY").catch(() => "");
+  if (!key) return "Maps key unavailable.";
+  try {
+    const r = await fetch("https://places.googleapis.com/v1/places:searchText", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "X-Goog-Api-Key": key,
+        "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.currentOpeningHours,places.regularOpeningHours,places.googleMapsUri,places.primaryTypeDisplayName",
+      },
+      body: JSON.stringify({ textQuery: query, locationBias: { circle: { center: { latitude: lat, longitude: lng }, radius: 8000 } }, maxResultCount: 10, languageCode: "en", regionCode: "GB" }),
+      signal: AbortSignal.timeout(9000),
+    });
+    if (!r.ok) return `Places lookup failed (${r.status}).`;
+    const j = await r.json();
+    const dayIdx = (new Date().getDay() + 6) % 7; // Google weekday arrays start Monday
+    const places = (j.places ?? []).map((p: any) => {
+      const plat = p.location?.latitude, plng = p.location?.longitude;
+      const oh = p.currentOpeningHours ?? p.regularOpeningHours;
+      const todayLine = (oh?.weekdayDescriptions ?? [])[dayIdx] ?? "";
+      return {
+        name: String(p.displayName?.text ?? "").slice(0, 60),
+        address: String(p.formattedAddress ?? "").slice(0, 80),
+        rating: p.rating,
+        reviews: p.userRatingCount,
+        openNow: oh?.openNow,
+        hoursToday: todayLine.replace(/^[A-Za-z]+:\s*/, ""),
+        type: String(p.primaryTypeDisplayName?.text ?? ""),
+        lat: plat, lng: plng,
+        dist: plat != null ? Math.round(haversine([lat, lng], [plat, plng]) * 10) / 10 : null,
+        mapsUri: String(p.googleMapsUri ?? ""),
+      };
+    }).filter((p: any) => p.lat != null).sort((a: any, b: any) => (a.dist ?? 99) - (b.dist ?? 99));
+    if (!places.length) return `Couldn't find "${query}" near you.`;
+    await showWidget({ kind: "places", query, center: { lat, lng }, items: places.slice(0, 10) }, `near you · ${query.slice(0, 24)}`);
+    const nearest = places[0];
+    return (
+      `PLACES on a dark map on screen (${places.length} pins near Daniel, tap-through directions). ` +
+      `Nearest: ${nearest.name}, ${nearest.dist}km, ${nearest.openNow === false ? "closed now" : nearest.openNow ? "open now" : ""}${nearest.hoursToday ? ` (today ${nearest.hoursToday})` : ""}. ` +
+      `Answer his exact question in one line — if he asked closing time, give THAT place's closing time from hoursToday.`
+    );
+  } catch (e: any) {
+    return `Places lookup error: ${String(e?.message ?? e).slice(0, 100)}`;
+  }
+}
+
 async function transportRoute(args: any): Promise<string> {
   const from = String(args.from ?? "").trim();
   const to = String(args.to ?? "").trim();
@@ -2624,6 +2696,8 @@ export async function executeTool(name: string, args: any): Promise<string> {
       return await musicSearch(args);
     case "transport_route":
       return await transportRoute(args);
+    case "places_near":
+      return await placesNear(args);
     case "memory_map":
       return await memoryMapTool(args);
     case "price_watch": {

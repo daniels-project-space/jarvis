@@ -63,7 +63,7 @@ async function kokoro(text: string): Promise<Response | null> {
     const pred = await fetch("https://api.replicate.com/v1/predictions", {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Prefer: "wait" },
-      body: JSON.stringify({ version: KOKORO, input: { text, voice: "bm_george", speed: 0.95 } }),
+      body: JSON.stringify({ version: KOKORO, input: { text, voice: process.env.KOKORO_VOICE || "bm_lewis", speed: 1.0 } }),
     });
     const j: any = await pred.json().catch(() => ({}));
     const url = typeof j.output === "string" ? j.output : Array.isArray(j.output) ? j.output[0] : null;
