@@ -1307,7 +1307,9 @@ async function briefingWidget(): Promise<string> {
       method: "POST",
       headers: { Authorization: `Bearer ${gk}`, "content-type": "application/json" },
       body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
+        // 8b-instant is ~3x faster than 70b and plenty for this simple pick —
+        // it's the biggest single latency chunk in the briefing.
+        model: "llama-3.1-8b-instant",
         temperature: 0,
         max_tokens: 400,
         response_format: { type: "json_object" },
@@ -1319,7 +1321,7 @@ async function briefingWidget(): Promise<string> {
           `STRICT JSON {"picks":[{"text":"<exact todo text>","why":"..."}]}.
 TODOS: ${open.slice(0, 20).map((t: any) => JSON.stringify(String(t.text).slice(0, 90))).join(", ")}` }],
       }),
-      signal: AbortSignal.timeout(12_000),
+      signal: AbortSignal.timeout(7_000),
     });
     const pj: any = await resp.json();
     picked = (JSON.parse(pj.choices?.[0]?.message?.content ?? "{}").picks ?? []).slice(0, 6);
