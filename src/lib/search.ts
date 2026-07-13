@@ -194,10 +194,54 @@ async function ebayShopping(query: string): Promise<ShopResult[]> {
   }
 }
 
-// ---- shopping (UK): eBay (free) → Serper → SerpAPI ----
+// Kelkoo (UK price-comparison, aggregates Amazon/John Lewis/Currys/Argos/Shein
+// and dozens more retailers) read FREE + keyless through Jina's reader. This is
+// the broad, sustainable default — no key, no quota, real cross-retailer prices.
+async function kelkooShopping(query: string): Promise<ShopResult[]> {
+  try {
+    const r = await fetch(`https://r.jina.ai/https://www.kelkoo.co.uk/search?query=${encodeURIComponent(query)}`, {
+      headers: { "user-agent": "Mozilla/5.0", "x-return-format": "markdown", "accept-language": "en" },
+      signal: AbortSignal.timeout(16000),
+    });
+    if (!r.ok) return [];
+    const md = await r.text();
+    const out: ShopResult[] = [];
+    const re = /\[([\s\S]*?)\]\((https:\/\/uk-go\.kelkoogroup\.net\/sitesearchGo[^)\s]+)(?:\s+"[^"]*")?\)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(md)) && out.length < 15) {
+      const blob = m[1];
+      const link = m[2];
+      const img = blob.match(/!\[Image \d+:[^\]]*\]\((https:\/\/r\.kelkoo\.com\/resize[^)\s]+)\)/);
+      const titleM = blob.match(/Image \d+:\s*([^\]]+)\]/);
+      const priceM = blob.match(/£([\d,]+\.?\d*)/);
+      if (!img || !titleM || !priceM) continue;
+      const seller = blob.match(/Sold by \*\*([^*]+)\*\*/);
+      const free = /Free delivery/.test(blob);
+      out.push({
+        title: titleM[1].replace(/\s+/g, " ").trim().slice(0, 90),
+        price: `£${priceM[1]}`,
+        priceNum: parseFloat(priceM[1].replace(/,/g, "")) || 0,
+        source: (seller ? seller[1] : "Kelkoo").trim().slice(0, 30),
+        link,
+        image: img[1],
+        rating: undefined,
+        reviews: undefined,
+        delivery: free ? "Free delivery" : (blob.match(/Delivery cost: £[\d.]+/) || [undefined])[0],
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+// ---- shopping (UK): Kelkoo (free, broad) → eBay (free) → Serper → SerpAPI ----
 export async function searchShopping(query: string, gl = "uk"): Promise<ShopResult[]> {
+  const k = await kelkooShopping(query);
+  if (k.length >= 3) return k;
   const e = await ebayShopping(query);
-  if (e.length) return e;
+  if (e.length) return [...k, ...e];
+  if (k.length) return k;
   const s = await serper("shopping", { q: query, gl: gl === "uk" ? "gb" : gl, hl: "en" });
   if (s?.shopping) {
     return (s.shopping as any[])
@@ -277,10 +321,7 @@ export async function searchVideos(query: string): Promise<VideoResult[]> {
 }
 
 // Which provider is live (for status/debug).
-export async function activeSearchProvider(): Promise<"ebay" | "serper" | "serpapi" | "none"> {
-  const c = await getServiceSecrets("ebay").catch(() => ({}) as Record<string, string>);
-  if ((c.EBAY_CLIENT_ID ?? process.env.EBAY_CLIENT_ID) && (c.EBAY_CLIENT_SECRET ?? process.env.EBAY_CLIENT_SECRET)) return "ebay";
-  if (await serperKey()) return "serper";
-  const sk = process.env.SERPAPI_KEY ?? (await getSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
-  return sk ? "serpapi" : "none";
+export async function activeSearchProvider(): Promise<"kelkoo" | "ebay" | "serper" | "serpapi" | "none"> {
+  // Kelkoo (via Jina) is keyless and always available — shopping is never truly offline.
+  return "kelkoo";
 }

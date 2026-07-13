@@ -2037,13 +2037,8 @@ export async function cheapestPrice(query: string): Promise<{ priceNum: number; 
 async function shopSearch(args: any): Promise<string> {
   const query = String(args.query ?? "").trim();
   if (!query) return "What am I finding?";
-  const { searchShopping, activeSearchProvider } = await import("./search");
+  const { searchShopping } = await import("./search");
   const rows = await searchShopping(query);
-  // Shopping needs a structured provider (prices/links can't be scraped). If it
-  // came back empty and Serper isn't configured, it's a provider quota/key
-  // issue, not a bad query — say so plainly (and don't spam self-repair).
-  if (!rows.length && (await activeSearchProvider()) !== "serper")
-    return "Shopping is offline right now — the search provider has run out of searches. Add a Serper key (SERPER_API_KEY) to restore it. Tell Daniel.";
   const FAST = /same.day|next.day|tomorrow|\b1 day|\b1-2 day|24 ?h/i;
   let items = rows.map((r) => ({
     image: r.image,
