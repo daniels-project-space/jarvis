@@ -60,7 +60,12 @@ async function serpapi(params: Record<string, string>): Promise<any | null> {
     const qs = new URLSearchParams({ ...params, api_key: key });
     const r = await fetch(`https://serpapi.com/search.json?${qs}`, { signal: AbortSignal.timeout(10000) });
     if (!r.ok) return null;
-    return await r.json();
+    const j = await r.json();
+    // SerpAPI signals "out of searches" / other faults as a 200 with an error
+    // body — treat that as a hard failure so callers fall through to the next
+    // provider (this is exactly why the DDG fallback wasn't triggering).
+    if (j?.error) return null;
+    return j;
   } catch {
     return null;
   }
@@ -76,10 +81,11 @@ export async function searchWeb(query: string, num = 8, gl = "us"): Promise<WebO
     };
   }
   const j = await serpapi({ engine: "google", q: query, num: String(num) });
-  if (j) {
+  const organic = (j?.organic_results ?? []).slice(0, num);
+  if (organic.length) {
     return {
       answer: j.answer_box?.answer ?? j.answer_box?.snippet,
-      results: (j.organic_results ?? []).slice(0, num).map((r: any) => ({ title: String(r.title ?? ""), link: String(r.link ?? ""), snippet: String(r.snippet ?? "") })),
+      results: organic.map((r: any) => ({ title: String(r.title ?? ""), link: String(r.link ?? ""), snippet: String(r.snippet ?? "") })),
     };
   }
   // Last resort: keyless DuckDuckGo HTML scrape — keeps general search alive
