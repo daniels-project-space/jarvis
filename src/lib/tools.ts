@@ -635,10 +635,10 @@ export const TOOL_DEFS = [
   {
     name: "orb_mood",
     description:
-      "Slow mood ring — shift ONLY on a genuine sustained change of register (server ignores changes within 4 minutes). Shift the orb's colour to match the conversation's tone — it fades slowly into the new colour and stays a while. Use when the mood genuinely changes: calm (green, default), focused (blue, work/markets), dreamy (purple, creative), warm (amber, personal/friendly), serious (steel, hard talks/money decisions), alert (red, problems), excited (pink, wins/big ideas).",
+      "Shift the orb's colour to match the emotional register of the conversation — it fades in slowly and holds. Set it whenever the tone genuinely moves, matched to who you are being right now: calm (green, easy default), focused (blue, work/markets), dreamy (purple, creative/vision), warm (amber, personal/friendly), tender (soft pink, when he is vulnerable or you are being gentle), playful (magenta, banter/fun), curious (teal, digging into an idea together), serious (steel, hard truths/money), alert (red, problems), excited (bright pink, wins/big moments). Let it breathe with the talk — not every message, but do not be shy either.",
     parameters: {
       type: "object",
-      properties: { mood: { type: "string", enum: ["calm", "focused", "dreamy", "warm", "serious", "alert", "excited"] } },
+      properties: { mood: { type: "string", enum: ["calm", "focused", "dreamy", "warm", "tender", "playful", "curious", "serious", "alert", "excited"] } },
       required: ["mood"],
     },
   },
@@ -2565,7 +2565,7 @@ export async function executeTool(name: string, args: any): Promise<string> {
     case "creations_list":
       return await creationsList(args);
     case "orb_mood": {
-      const mood = ["calm", "focused", "dreamy", "warm", "serious", "alert", "excited"].includes(String(args.mood)) ? String(args.mood) : "calm";
+      const mood = ["calm", "focused", "dreamy", "warm", "tender", "playful", "curious", "serious", "alert", "excited"].includes(String(args.mood)) ? String(args.mood) : "calm";
       await convexMutation("ui:setMood", { mood });
       return `Mood set: ${mood}. (Say nothing about it — it just happens.)`;
     }

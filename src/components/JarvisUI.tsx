@@ -920,11 +920,11 @@ export default function JarvisUI() {
   // Orb mood: the brain sets a tone colour; the orb drifts into it slowly.
   const moodRow = useQuery(api.ui.getMood, {}) as { value: string; updatedAt: number } | null | undefined;
   const MOOD_COLORS: Record<string, string> = {
-    calm: "#00ff88", focused: "#4a9eed", dreamy: "#9775fa", warm: "#ffb454",
+    calm: "#00ff88", focused: "#4a9eed", dreamy: "#9775fa", warm: "#ffb454", playful: "#ff7ad9", tender: "#ff9ec4", curious: "#33e0d0",
     serious: "#8fa3bd", alert: "#ff5470", excited: "#ff7ad9",
   };
   const moodColor =
-    moodRow && Date.now() - moodRow.updatedAt < 20 * 60 * 1000 ? MOOD_COLORS[moodRow.value] ?? undefined : undefined;
+    moodRow && Date.now() - moodRow.updatedAt < 30 * 60 * 1000 ? MOOD_COLORS[moodRow.value] ?? undefined : undefined;
 
   // Orbit bubbles: when a new panel takes the stage, the previous one shrinks
   // into a bobbing bubble beside the orb — tap to bring it back.
@@ -1753,20 +1753,23 @@ export default function JarvisUI() {
               aside={!!panel && !panelMin && panel.type !== "video" && (panelFull || stagePanelSize !== "h-full w-full")}
             />
           </div>
-          {/* live captions */}
+          {/* live captions — the spoken words bloom in just under the orb, big
+              and centred (when a compact overlay is up they drop to a small
+              bottom strip so they don't cover it) */}
           {caption && (
             <div
-              className={`pointer-events-none absolute inset-x-0 z-30 flex justify-center px-8 text-center ${
-                panel && !panelMin ? "bottom-1" : "bottom-[18%]"
+              className={`pointer-events-none absolute inset-x-0 z-30 flex justify-center px-6 text-center ${
+                panel && !panelMin ? "bottom-2" : "top-[57%] md:top-[58%]"
               }`}
             >
               <span
-                className={`inline-block rounded-2xl font-medium leading-snug ${
+                key={caption.text}
+                className={`cap-bloom inline-block leading-snug ${
                   panel && !panelMin
-                    ? "max-w-[720px] bg-black/60 px-3 py-1 text-xs backdrop-blur-sm md:text-sm"
-                    : "max-w-[820px] px-5 py-2.5 text-lg md:text-2xl"
-                } ${caption.who === "you" ? "text-amber" : "text-cyan"}`}
-                style={{ textShadow: "0 2px 18px rgba(0,0,0,0.9)" }}
+                    ? "max-w-[720px] rounded-2xl bg-black/55 px-3 py-1 text-xs font-medium backdrop-blur-sm md:text-sm"
+                    : "max-w-[880px] text-2xl font-semibold tracking-tight md:text-[2rem] lg:text-[2.4rem]"
+                } ${caption.who === "you" ? "text-amber" : "text-ice"}`}
+                style={{ textShadow: "0 2px 24px rgba(0,0,0,0.85), 0 0 40px rgba(0,255,136,0.12)" }}
               >
                 {caption.text}
               </span>
