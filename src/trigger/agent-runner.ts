@@ -103,6 +103,29 @@ async function vaultService(service: string): Promise<Record<string, string>> {
 // Cheapest live price for a product (UK) — self-contained so the price-watch
 // cron never has to import the server-only tools module.
 async function cheapestPrice(query: string): Promise<{ priceNum: number } | null> {
+  // Serper.dev first (way more searches than SerpAPI), SerpAPI fallback.
+  const priceOf = (p: any) => {
+    const n = parseFloat(String(p ?? "").replace(/[^\d.]/g, ""));
+    return Number.isFinite(n) ? n : 0;
+  };
+  const serperK = process.env.SERPER_API_KEY || (await vaultService("serper")).SERPER_API_KEY;
+  if (serperK) {
+    try {
+      const r = await fetch("https://google.serper.dev/shopping", {
+        method: "POST",
+        headers: { "X-API-KEY": serperK, "content-type": "application/json" },
+        body: JSON.stringify({ q: query, gl: "gb", hl: "en" }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (r.ok) {
+        const j: any = await r.json();
+        const prices = (j?.shopping ?? []).map((x: any) => priceOf(x.price)).filter((n: number) => n > 0);
+        if (prices.length) return { priceNum: Math.min(...prices) };
+      }
+    } catch {
+      /* fall through to serpapi */
+    }
+  }
   const key = process.env.SERPAPI_KEY || (await vaultService("serpapi")).SERPAPI_KEY;
   if (!key) return null;
   const qs = new URLSearchParams({ engine: "google_shopping", q: query, gl: "uk", hl: "en", num: "20", api_key: key });

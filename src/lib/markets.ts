@@ -238,12 +238,11 @@ export async function fetchCryptoFlows(binanceSym: string): Promise<string> {
   return bits.join("; ") || "flows data unavailable";
 }
 
-export async function fetchNews(query: string, key: string): Promise<string> {
+export async function fetchNews(query: string, _key?: string): Promise<string> {
   try {
-    const qs = new URLSearchParams({ engine: "google_news", q: query, gl: "us", hl: "en", api_key: key });
-    const j: any = await (await fetch(`https://serpapi.com/search.json?${qs}`, { signal: AbortSignal.timeout(8000) })).json();
-    const items = (j?.news_results ?? []).slice(0, 7);
-    return items.map((n: any) => `- [${n.source?.name ?? "?"} ${n.date ?? ""}] ${n.title}`).join("\n") || "no recent headlines";
+    const { searchNews } = await import("./search");
+    const items = (await searchNews(query)).slice(0, 7);
+    return items.map((n) => `- [${n.source} ${n.date}] ${n.title}`).join("\n") || "no recent headlines";
   } catch {
     return "news unavailable";
   }

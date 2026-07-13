@@ -183,6 +183,13 @@ await test("price watch registers", async () => {
   await cv("mutation", "watches:cancel", { match: "SMOKE TEST" });
 });
 
+await test("a search provider is configured", async () => {
+  const r = await fetch(`${BASE}/api/search-status`);
+  const { provider } = await r.json();
+  console.log(`      search provider: ${provider}`);
+  assert(provider === "serper" || provider === "serpapi", `no search provider live (${provider})`);
+});
+
 await test("read_url returns real content (jina reader)", async () => {
   const r = await tool("read_url", { url: "https://example.com" });
   assert(/example|illustrative|domain/i.test(r), `read_url thin: ${r.slice(0, 80)}`);

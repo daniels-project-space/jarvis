@@ -824,19 +824,12 @@ async function youtubeSearch(query: string): Promise<string> {
   } catch {
     /* fall through */
   }
-  const j = await serpapi({ engine: "youtube", search_query: query });
-  const vids = (j?.video_results ?? []).slice(0, 6);
+  const { searchVideos } = await import("./search");
+  const vids = await searchVideos(query);
   if (!vids.length) return "No results found.";
-  await showList(
-    vids.map((v: any) => ({
-      id: YT_ID(v.link) ?? "",
-      title: v.title,
-      channel: v.channel?.name ?? "",
-      length: v.length ?? "",
-    })),
-  );
+  await showList(vids);
   return (
-    vids.map((v: any, i: number) => `${i + 1}. ${v.title} — ${v.channel?.name ?? ""} (${v.length ?? ""}) [id:${YT_ID(v.link) ?? ""}]`).join("\n") +
+    vids.map((v, i: number) => `${i + 1}. ${v.title} — ${v.channel} (${v.length}) [id:${v.id}]`).join("\n") +
     "\n(Thumbnail list is on Daniel's screen, ready to tap — NOTHING is playing. If he asks to play one, use show with the video id and play:true.)"
   );
 }
@@ -885,20 +878,20 @@ async function showResultsPanel(title: string, md: string) {
 }
 
 async function webSearch(query: string): Promise<string> {
-  const j = await serpapi({ engine: "google", q: query, num: "8" });
+  const { searchWeb } = await import("./search");
+  const j = await searchWeb(query, 8);
   if (!j) return "Search unavailable right now.";
   const parts: string[] = [];
   const md: string[] = [`## ${query}`, ""];
-  if (j.answer_box?.answer || j.answer_box?.snippet) {
-    const a = j.answer_box.answer ?? j.answer_box.snippet;
-    parts.push(`Answer: ${a}`);
-    md.push(`**${a}**`, "");
+  if (j.answer) {
+    parts.push(`Answer: ${j.answer}`);
+    md.push(`**${j.answer}**`, "");
   }
   let n = 0;
-  for (const r of (j.organic_results ?? []).slice(0, 8)) {
+  for (const r of j.results.slice(0, 8)) {
     n++;
-    parts.push(`${r.title} — ${r.snippet ?? ""} (${r.link})`);
-    md.push(`${n}. [${r.title}](${r.link})`, `   ${r.snippet ?? ""}`, "");
+    parts.push(`${r.title} — ${r.snippet} (${r.link})`);
+    md.push(`${n}. [${r.title}](${r.link})`, `   ${r.snippet}`, "");
   }
   await showResultsPanel(`search · ${query.slice(0, 40)}`, md.join("\n"));
   return (parts.join("\n") || "No results.") + "\n(The full result list is on Daniel's screen.)";
@@ -1527,22 +1520,22 @@ async function researchTool(args: any): Promise<string> {
     ? args.queries.map(String)
     : [question, `${question} explained details`, `${question} reddit OR forum experience`]
   ).slice(0, 3);
-  const results = await Promise.all(queries.map((q) => serpapi({ engine: "google", q, num: "6" })));
+  const { searchWeb } = await import("./search");
+  const results = await Promise.all(queries.map((q) => searchWeb(q, 6)));
   const md: string[] = [`## Research · ${question}`, ""];
   const forModel: string[] = [];
   let firstLink = "";
   results.forEach((j, i) => {
     if (!j) return;
     md.push(`### Angle ${i + 1}: ${queries[i]}`);
-    if (j.answer_box?.answer || j.answer_box?.snippet) {
-      const a = j.answer_box.answer ?? j.answer_box.snippet;
-      md.push(`**Answer box:** ${a}`, "");
-      forModel.push(`[angle ${i + 1} answer box] ${a}`);
+    if (j.answer) {
+      md.push(`**Answer box:** ${j.answer}`, "");
+      forModel.push(`[angle ${i + 1} answer box] ${j.answer}`);
     }
-    for (const r of (j.organic_results ?? []).slice(0, 4)) {
+    for (const r of j.results.slice(0, 4)) {
       if (!firstLink && r.link) firstLink = r.link;
-      md.push(`- [${r.title}](${r.link}) — ${r.snippet ?? ""}`);
-      forModel.push(`[${new URL(r.link ?? "https://x.x").hostname}] ${r.title}: ${r.snippet ?? ""}`);
+      md.push(`- [${r.title}](${r.link}) — ${r.snippet}`);
+      forModel.push(`[${new URL(r.link || "https://x.x").hostname}] ${r.title}: ${r.snippet}`);
     }
     md.push("");
   });
@@ -1860,22 +1853,17 @@ async function chartTool(args: any): Promise<string> {
 
 // News as a cinematic feed: hero cards with images fading through, then a grid.
 async function newsToday(args: any): Promise<string> {
-  const key = process.env.SERPAPI_KEY ?? (await getSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
-  if (!key) return "News unavailable (no search key).";
   const topic = args.topic ? String(args.topic).trim() : "";
-  const qs = new URLSearchParams({ engine: "google_news", gl: "us", hl: "en", api_key: key });
-  if (topic) qs.set("q", topic);
-  else qs.set("topic_token", "CAAqJggKIiBDQkFTRWdvSUwyMHZNRFZxYUdjU0FtVnVHZ0pWVXlnQVAB"); // top stories
-  const j: any = await (await fetch(`https://serpapi.com/search.json?${qs}`, { signal: AbortSignal.timeout(9000) })).json();
-  const raw: any[] = (j?.news_results ?? []).flatMap((n: any) => (n.stories ? n.stories : [n]));
+  const { searchNews } = await import("./search");
+  const raw = await searchNews(topic || null);
   const items = raw
-    .filter((n: any) => n.thumbnail && n.title)
+    .filter((n) => n.image && n.title)
     .slice(0, 12)
-    .map((n: any) => ({
-      image: String(n.thumbnail),
-      title: String(n.title).slice(0, 140),
-      subtitle: `${n.source?.name ?? ""}${n.date ? " · " + n.date : ""}`,
-      url: String(n.link ?? ""),
+    .map((n) => ({
+      image: n.image,
+      title: n.title,
+      subtitle: `${n.source}${n.date ? " · " + n.date : ""}`,
+      url: n.link,
     }));
   if (!items.length) return "No picture-worthy stories found right now.";
   await showWidget({ kind: "feed", mode: "news", label: topic ? `news · ${topic}` : "news of the day", items }, `news · ${topic || "today"}`);
@@ -1984,39 +1972,33 @@ async function memoryMapTool(args: any): Promise<string> {
 // Cheapest live price for a product query (UK) — shared by shop_search and the
 // price-watch cron. Returns the best match or null.
 export async function cheapestPrice(query: string): Promise<{ priceNum: number; title: string; url: string } | null> {
-  const key = process.env.SERPAPI_KEY ?? (await getSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
-  if (!key) return null;
-  const qs = new URLSearchParams({ engine: "google_shopping", q: query, gl: "uk", hl: "en", num: "20", api_key: key });
-  const j: any = await (await fetch(`https://serpapi.com/search.json?${qs}`, { signal: AbortSignal.timeout(10000) }).catch(() => null))?.json?.() ?? {};
-  const rows = (j?.shopping_results ?? []).filter((r: any) => r.extracted_price);
+  const { searchShopping } = await import("./search");
+  const rows = (await searchShopping(query)).filter((r) => r.priceNum > 0);
   if (!rows.length) return null;
-  rows.sort((a: any, b: any) => Number(a.extracted_price) - Number(b.extracted_price));
+  rows.sort((a, b) => a.priceNum - b.priceNum);
   const r = rows[0];
-  return { priceNum: Number(r.extracted_price), title: String(r.title ?? query).slice(0, 90), url: String(r.product_link ?? r.link ?? "") };
+  return { priceNum: r.priceNum, title: r.title, url: r.link };
 }
 
 async function shopSearch(args: any): Promise<string> {
   const query = String(args.query ?? "").trim();
   if (!query) return "What am I finding?";
-  const key = process.env.SERPAPI_KEY ?? (await getSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
-  if (!key) return "Shopping search unavailable.";
-  const qs = new URLSearchParams({ engine: "google_shopping", q: query, gl: "uk", hl: "en", num: "20", api_key: key });
-  const j: any = await (await fetch(`https://serpapi.com/search.json?${qs}`, { signal: AbortSignal.timeout(10000) })).json();
-  if (j?.error) return `Shopping search failed: ${String(j.error).slice(0, 120)}`;
+  const { searchShopping, activeSearchProvider } = await import("./search");
+  const rows = await searchShopping(query);
+  if (!rows.length && (await activeSearchProvider()) === "none")
+    return "Shopping search is offline — the search provider needs an API key (SERPER_API_KEY). Tell Daniel.";
   const FAST = /same.day|next.day|tomorrow|\b1 day|\b1-2 day|24 ?h/i;
-  let items = (j?.shopping_results ?? [])
-    .filter((r: any) => r.thumbnail && r.extracted_price)
-    .map((r: any) => ({
-      image: String(r.thumbnail),
-      title: String(r.title).slice(0, 90),
-      priceNum: Number(r.extracted_price),
-      price: String(r.price ?? `£${r.extracted_price}`).slice(0, 14),
-      merchant: String(r.source ?? "").slice(0, 30),
-      delivery: String(r.delivery ?? "").slice(0, 40),
-      rating: r.rating,
-      reviews: r.reviews,
-      url: String(r.product_link ?? r.link ?? ""),
-    }));
+  let items = rows.map((r) => ({
+    image: r.image,
+    title: r.title,
+    priceNum: r.priceNum,
+    price: r.price,
+    merchant: r.source,
+    delivery: r.delivery ?? "",
+    rating: r.rating,
+    reviews: r.reviews,
+    url: r.link,
+  }));
   const cap = Number(args.max_price_gbp) || 0;
   if (cap) items = items.filter((i: any) => i.priceNum <= cap);
   // genuinely fast delivery floats up ("free delivery on £120+" is not fast)
@@ -2183,14 +2165,13 @@ async function marketAnalysisTool(args: any): Promise<string> {
   const a = resolveAsset(String(args.asset ?? ""));
   if (!a) return `Couldn't resolve "${args.asset}" to an asset.`;
   const interval = ["4h", "1d", "1w"].includes(String(args.interval)) ? String(args.interval) : "1d";
-  const serp = process.env.SERPAPI_KEY ?? (await getSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
 
   const [daily, weekly, vix, flows, news] = await Promise.all([
     fetchCandles(a, interval, 300),
     fetchCandles(a, "1w", 200),
     a.kind === "crypto" ? Promise.resolve(null) : fetchVix(),
     a.kind === "crypto" && a.binance ? fetchCryptoFlows(a.binance) : Promise.resolve(""),
-    serp ? fetchNews(`${a.label} ${a.kind === "crypto" ? "crypto" : a.kind}`, serp) : Promise.resolve("news unavailable"),
+    fetchNews(`${a.label} ${a.kind === "crypto" ? "crypto" : a.kind}`),
   ]);
   if (daily.length < 50) return `Not enough data to analyse ${a.label}.`;
 
