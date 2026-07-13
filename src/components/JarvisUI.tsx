@@ -1964,7 +1964,7 @@ export default function JarvisUI() {
           {caption && (
             <div
               className={`pointer-events-none absolute inset-x-0 z-30 flex justify-center px-6 text-center ${
-                panel && !panelMin ? "bottom-2" : "top-[57%] md:top-[58%]"
+                panel && !panelMin ? "top-[6%]" : "top-[57%] md:top-[58%]"
               }`}
             >
               <span
@@ -1980,9 +1980,6 @@ export default function JarvisUI() {
               </span>
             </div>
           )}
-          <div className={`pointer-events-none absolute bottom-3 left-0 right-0 text-center ${panel && !panelMin ? "hidden" : ""}`}>
-            <span className="hud-label">{status}</span>
-          </div>
         </div>
 
         {/* conversation panel — on PHONES it's a bottom sheet (orb stays visible

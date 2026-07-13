@@ -186,10 +186,10 @@ export default function ThreeOrb({
 
       // glide toward/away from the side strip (desktop only — phones dim instead)
       const wantAside = asideRef.current && W() >= 768 ? 1 : 0;
-      asideAmt += (wantAside - asideAmt) * 0.045;
+      asideAmt += (wantAside - asideAmt) * 0.05;
       const halfW = Math.tan((45 * Math.PI) / 360) * 80 * (W() / H());
-      const offsetX = halfW * 0.72 * asideAmt;
-      const shrink = 1 - 0.5 * asideAmt;
+      const offsetX = halfW * 0.56 * asideAmt;
+      const shrink = 1 - 0.46 * asideAmt;
 
       points.rotation.set(spinX, spinY, spinZ);
       points.position.set(offsetX, 0, cloudZ);
@@ -313,9 +313,12 @@ export default function ThreeOrb({
       mat.color.lerp(target, 0.004);
       lineMat.color.lerp(target, 0.004);
 
-      camera.position.x = Math.sin(t * 0.02) * 5;
-      camera.position.y = Math.cos(t * 0.03) * 3;
-      camera.lookAt(0, 0, cloudZ * 0.2);
+      // gentle, slow camera breathing — calmed right down so the orb sits
+      // steady instead of drifting all over (worse when it's small and aside),
+      // and the camera eases toward the orb's offset so it never looks flung
+      camera.position.x = Math.sin(t * 0.012) * 1.8 + offsetX * 0.5;
+      camera.position.y = Math.cos(t * 0.018) * 1.1;
+      camera.lookAt(offsetX * 0.5, 0, cloudZ * 0.2);
       renderer.render(scene, camera);
     }
 
