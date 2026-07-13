@@ -137,6 +137,36 @@ await test("realtime token mints (or is legitimately locked)", async () => {
   await cv("mutation", "ui:setLiveOn", { client: "smoke", on: false }).catch(() => {});
 });
 
+await test("timed reminder sets + is due-deliverable", async () => {
+  await tool("remind_at", { text: "SMOKE TEST reminder", in_minutes: 0.05 });
+  await new Promise((r) => setTimeout(r, 4000));
+  const due = await cv("mutation", "reminders:due", {});
+  const mine = (due ?? []).filter((d) => d.text.includes("SMOKE TEST"));
+  assert(mine.length >= 1, "reminder not due");
+  for (const d of mine) await cv("mutation", "reminders:complete", { id: d._id });
+});
+
+await test("price watch registers", async () => {
+  const r = await tool("price_watch", { query: "SMOKE TEST logitech mx master 3s", target_gbp: 50 });
+  assert(/watching/i.test(r), r.slice(0, 100));
+  const list = await cv("query", "watches:list", {});
+  const mine = (list ?? []).filter((w) => w.query.includes("SMOKE TEST"));
+  assert(mine.length >= 1, "watch not created");
+  await cv("mutation", "watches:cancel", { match: "SMOKE TEST" });
+});
+
+await test("read_url returns real content (jina reader)", async () => {
+  const r = await tool("read_url", { url: "https://example.com" });
+  assert(/example|illustrative|domain/i.test(r), `read_url thin: ${r.slice(0, 80)}`);
+});
+
+await test("hide tool clears the panel", async () => {
+  await tool("weather", { location: "London" });
+  await tool("hide", {});
+  const p = await cv("query", "ui:getPanel", {});
+  assert(p === null, `panel still up: ${p?.title}`);
+});
+
 // ---------------------------------------------------------------------------
 // cleanup + report
 await cv("mutation", "chatQueue:clearThread", { threadId: THREAD }).catch(() => {});
