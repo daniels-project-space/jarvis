@@ -293,13 +293,53 @@ export async function searchNews(query: string | null, gl = "us"): Promise<NewsR
   else params.topic_token = "CAAqJggKIiBDQkFTRWdvSUwyMHZNRFZxYUdjU0FtVnVHZ0pWVXlnQVAB";
   const j = await serpapi(params);
   const raw: any[] = (j?.news_results ?? []).flatMap((n: any) => (n.stories ? n.stories : [n]));
-  return raw.map((n: any) => ({
+  const serpNews = raw.map((n: any) => ({
     title: String(n.title ?? "").slice(0, 140),
     link: String(n.link ?? ""),
     source: String(n.source?.name ?? n.source ?? "").slice(0, 40),
     date: String(n.date ?? ""),
     image: String(n.thumbnail ?? ""),
   }));
+  if (serpNews.length) return serpNews;
+  // FREE keyless fallback: Google News RSS. No image field, so a WordPress
+  // mShots screenshot of the article stands in for the hero image.
+  return await googleNewsRss(query, gl);
+}
+
+async function googleNewsRss(query: string | null, gl = "us"): Promise<NewsResult[]> {
+  const hl = gl === "uk" || gl === "gb" ? "en-GB" : "en-US";
+  const geo = gl === "uk" || gl === "gb" ? "GB" : "US";
+  const url = query
+    ? `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=${hl}&gl=${geo}&ceid=${geo}:en`
+    : `https://news.google.com/rss?hl=${hl}&gl=${geo}&ceid=${geo}:en`;
+  try {
+    const r = await fetch(url, { headers: { "user-agent": "Mozilla/5.0", "accept-language": "en" }, signal: AbortSignal.timeout(9000) });
+    if (!r.ok) return [];
+    const xml = await r.text();
+    const out: NewsResult[] = [];
+    const items = xml.split("<item>").slice(1);
+    const dec = (s: string) =>
+      s.replace(/<!\[CDATA\[|\]\]>/g, "").replace(/&amp;/g, "&").replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim();
+    for (const it of items.slice(0, 14)) {
+      const title = dec((it.match(/<title>([\s\S]*?)<\/title>/) || [, ""])[1]);
+      const link = (it.match(/<link>([\s\S]*?)<\/link>/) || [, ""])[1].trim();
+      const source = dec((it.match(/<source[^>]*>([\s\S]*?)<\/source>/) || [, ""])[1]);
+      const pub = (it.match(/<pubDate>([\s\S]*?)<\/pubDate>/) || [, ""])[1].trim();
+      if (!title || !link) continue;
+      // strip the trailing " - Source" Google appends to titles
+      const cleanTitle = title.replace(/\s+-\s+[^-]+$/, "");
+      out.push({
+        title: cleanTitle.slice(0, 140),
+        link,
+        source: source.slice(0, 40),
+        date: pub ? new Date(pub).toLocaleDateString("en-GB", { day: "numeric", month: "short" }) : "",
+        image: `https://s.wordpress.com/mshots/v1/${encodeURIComponent(link)}?w=720`,
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
 }
 
 // ---- videos (youtube-first) ----
