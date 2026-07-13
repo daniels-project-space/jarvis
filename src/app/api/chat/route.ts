@@ -111,6 +111,89 @@ const SCREEN_TOOLS = new Set([
 ]);
 const SCREEN_CLAIM = /\bon (?:your|the) screen\b|\bup on screen\b|\bpulled (?:it |that |them )?up\b|\bshowing (?:you |it |them )?(?:now|here)\b|\bhave a look\b|\btake a look\b/i;
 
+// THE BRAIN, v2: Claude on Daniel's Max subscription (OAuth bearer works
+// directly against the Messages API — verified). Haiku answers quick turns in
+// ~1-2s, Opus takes the hard ones. Groq stays as the fallback lane only.
+const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
+async function runClaude(
+  key: string,
+  oaiMessages: any[],
+  complex: boolean,
+  progress: { toolsRan: number },
+): Promise<{ final: string; used: string[]; screenTouched: boolean }> {
+  const system = String(oaiMessages[0]?.content ?? "");
+  const msgs: any[] = oaiMessages.slice(1).map((m: any) => ({ role: m.role === "user" ? "user" : "assistant", content: String(m.content) }));
+  const tools = TOOL_DEFS.map((t) => ({
+    name: t.name,
+    description: t.description ?? "",
+    input_schema: t.parameters ?? { type: "object", properties: {} },
+  }));
+  const model = complex ? "claude-opus-4-8" : "claude-haiku-4-5-20251001";
+  const used: string[] = [];
+  let screenTouched = false;
+  let interimSaid = false;
+  let final = "";
+  for (let round = 0; round < 6; round++) {
+    const r = await fetch(ANTHROPIC_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model, system, messages: msgs, tools, max_tokens: complex ? 1600 : 800, temperature: 0.7 }),
+      signal: AbortSignal.timeout(90_000),
+    });
+    if (!r.ok) throw new Error(`anthropic ${r.status}: ${(await r.text()).slice(0, 160)}`);
+    const j = await r.json();
+    const blocks: any[] = j.content ?? [];
+    const toolUses = blocks.filter((b) => b.type === "tool_use");
+    const text = blocks.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
+    if (toolUses.length) {
+      msgs.push({ role: "assistant", content: blocks });
+      let sayTimer: ReturnType<typeof setTimeout> | null = null;
+      let sayFired = false;
+      if (!interimSaid) {
+        const line = toolUses.map((t) => SLOW_LINES[t.name]).find(Boolean);
+        if (line) {
+          interimSaid = true;
+          sayTimer = setTimeout(() => {
+            sayFired = true;
+            void convexMutation("ui:say", { text: line }).catch(() => {});
+          }, 1200);
+        }
+      }
+      const results: any[] = [];
+      for (const tu of toolUses) {
+        used.push(tu.name);
+        progress.toolsRan++;
+        const result = await executeTool(tu.name, tu.input ?? {}).catch((e) => `Tool error: ${e?.message ?? e}`);
+        if (SCREEN_TOOLS.has(tu.name) && !/^Tool (error|failed)/i.test(result)) screenTouched = true;
+        results.push({ type: "tool_result", tool_use_id: tu.id, content: result.slice(0, 12000) });
+      }
+      if (sayTimer) {
+        clearTimeout(sayTimer);
+        if (!sayFired) interimSaid = false;
+      }
+      msgs.push({ role: "user", content: results });
+      continue;
+    }
+    final = text;
+    if (final && round < 5 && SCREEN_CLAIM.test(final) && !screenTouched) {
+      msgs.push({ role: "assistant", content: final });
+      msgs.push({
+        role: "user",
+        content:
+          "SYSTEM NOTE: you claimed something is on Daniel's screen but no screen tool ran this turn — NOTHING is showing. Call the tool that shows THE THING YOU CLAIMED (draft with the full updated text if you were writing; weather for weather; price_chart for markets...). Never open anything unrelated. Then answer briefly.",
+      });
+      final = "";
+      continue;
+    }
+    break;
+  }
+  return { final, used, screenTouched };
+}
+
 export async function POST(req: NextRequest) {
   let text = "",
     threadId = "main";
@@ -166,7 +249,24 @@ export async function POST(req: NextRequest) {
     let interimSaid = false;
     let screenTouched = false; // a screen tool ran AND did not error this turn
     const used: string[] = [];
-    for (let round = 0; round < 6; round++) {
+    let brain = "flash";
+    const claudeProgress = { toolsRan: 0 };
+    const anthKey = process.env.ANTHROPIC_AUTH_TOKEN ?? (await getSecret("anthropic", "ANTHROPIC_AUTH_TOKEN").catch(() => ""));
+    if (anthKey) {
+      try {
+        const r = await runClaude(anthKey, messages, complex, claudeProgress);
+        final = r.final;
+        used.push(...r.used);
+        screenTouched = r.screenTouched;
+        brain = complex ? "opus" : "haiku";
+      } catch {
+        // Groq picks the turn up below — UNLESS Claude already ran tools
+        // (re-running them would double todos/panels/agents); then we go
+        // straight to the forced-summary round.
+        brain = "flash";
+      }
+    }
+    for (let round = 0; !final && claudeProgress.toolsRan === 0 && round < 6; round++) {
       const j = await groq(key, {
         messages,
         tools,
@@ -248,7 +348,7 @@ export async function POST(req: NextRequest) {
       threadId,
       status: "done",
       finalText: final,
-      model: "flash",
+      model: brain,
     });
     delivered = true;
     // Post-delivery housekeeping is strictly best-effort: a failure here must

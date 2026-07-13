@@ -940,7 +940,10 @@ export default function JarvisUI() {
       m.startWake(() => {
         setWake(false);
         m.chime();
-        void toggleLive(true);
+        if (voiceMode() === "free") {
+          freeLoop.current = true;
+          void freeVoiceTurn();
+        } else void toggleLive(true);
       });
       setWake(true);
     });
@@ -970,7 +973,10 @@ export default function JarvisUI() {
       m.startWake(() => {
         setWake(false);
         m.chime();
-        void toggleLive(true);
+        if (voiceMode() === "free") {
+          freeLoop.current = true;
+          void freeVoiceTurn();
+        } else void toggleLive(true);
       });
       setWake(true);
     });
@@ -1179,6 +1185,8 @@ export default function JarvisUI() {
         () => setSpeaking(true),
         () => setSpeaking(false),
       );
+      // free-voice conversation: keep the loop going until Daniel goes quiet
+      if (freeLoop.current && voiceMode() === "free" && !liveRef.current) setTimeout(() => void freeVoiceTurn(), 300);
     })();
   }, [messages]);
 
@@ -1347,6 +1355,80 @@ export default function JarvisUI() {
   }
 
   // One-shot voice input: record → STT → send. Works on iOS too.
+  // FREE VOICE MODE (default): wake word → listen (auto-stop on silence) →
+  // STT → Claude brain → free TTS → listen again for the follow-up. No OpenAI
+  // realtime session, no GPT voice. The live button still offers realtime
+  // (localStorage jarvis_voice = "realtime" makes the wake word use it too).
+  const freeLoop = useRef(false);
+  const freeBusy = useRef(false);
+  const voiceMode = () => (typeof localStorage !== "undefined" && localStorage.getItem("jarvis_voice")) || "free";
+  async function freeVoiceTurn() {
+    if (freeBusy.current || liveRef.current) return;
+    freeBusy.current = true;
+    try {
+      import("../lib/tts").then((m) => m.stopSpeaking());
+      void claimVoice({ client: me.current });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      import("../lib/tts").then((m) => m.warm());
+      const actx = new AudioContext();
+      const an = actx.createAnalyser();
+      an.fftSize = 512;
+      actx.createMediaStreamSource(stream).connect(an);
+      const buf = new Uint8Array(an.frequencyBinCount);
+      const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
+      const rec = new MediaRecorder(stream, { mimeType: mime });
+      const chunks: Blob[] = [];
+      rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+      setRecording(true);
+      recRef.current = rec;
+      let spoke = false;
+      let lastVoice = Date.now();
+      const t0 = Date.now();
+      const poll = setInterval(() => {
+        an.getByteFrequencyData(buf);
+        const level = buf.reduce((a, b) => a + b, 0) / buf.length;
+        if (level > 24) {
+          spoke = true;
+          lastVoice = Date.now();
+          energyRef.current = Math.min(1, level / 90);
+        }
+        if ((spoke && Date.now() - lastVoice > 1500) || (!spoke && Date.now() - t0 > 6500) || Date.now() - t0 > 25_000) {
+          clearInterval(poll);
+          if (rec.state === "recording") rec.stop();
+        }
+      }, 140);
+      await new Promise<void>((resolve) => {
+        rec.onstop = () => resolve();
+        rec.start();
+      });
+      clearInterval(poll);
+      stream.getTracks().forEach((t) => t.stop());
+      void actx.close().catch(() => {});
+      setRecording(false);
+      energyRef.current = 0;
+      const blob = new Blob(chunks, { type: mime });
+      if (!spoke || blob.size < 2000) {
+        freeLoop.current = false; // silence — back to wake-word standby
+        return;
+      }
+      const r = await fetch("/api/stt", { method: "POST", headers: { "content-type": mime }, body: blob });
+      const { text } = await r.json();
+      const { isEchoOfTts } = await import("../lib/tts");
+      if (!text?.trim() || isEchoOfTts(text)) {
+        freeLoop.current = false;
+        return;
+      }
+      void submit(text.trim()); // the reply speaks via the normal effect; the loop re-arms after it
+    } catch {
+      setRecording(false);
+      freeLoop.current = false;
+    } finally {
+      freeBusy.current = false;
+    }
+  }
+
   async function toggleMic() {
     if (recording) {
       recRef.current?.stop();

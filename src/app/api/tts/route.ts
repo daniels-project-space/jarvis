@@ -87,7 +87,12 @@ export async function POST(req: NextRequest) {
   const clean = stripForSpeech(String(text || "")).slice(0, 1500);
   if (!clean) return new Response("empty", { status: 400 });
 
-  const res = (await elevenlabs(clean)) ?? (await kokoro(clean));
+  // Daniel wants the FREE voice by default; TTS_PROVIDER=elevenlabs flips back
+  // (ElevenLabs is faster but paid per character).
+  const res =
+    (process.env.TTS_PROVIDER ?? "kokoro") === "elevenlabs"
+      ? ((await elevenlabs(clean)) ?? (await kokoro(clean)))
+      : ((await kokoro(clean)) ?? (await elevenlabs(clean)));
   if (!res) {
     await reportIncident("api/tts", "tts:all-providers-failed", "Both ElevenLabs and Kokoro TTS failed to produce audio.");
     return new Response(JSON.stringify({ error: "tts failed" }), { status: 502 });
