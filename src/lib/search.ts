@@ -320,22 +320,36 @@ async function googleNewsRss(query: string | null, gl = "us"): Promise<NewsResul
     const items = xml.split("<item>").slice(1);
     const dec = (s: string) =>
       s.replace(/<!\[CDATA\[|\]\]>/g, "").replace(/&amp;/g, "&").replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim();
-    for (const it of items.slice(0, 14)) {
+    for (const it of items.slice(0, 12)) {
       const title = dec((it.match(/<title>([\s\S]*?)<\/title>/) || [, ""])[1]);
       const link = (it.match(/<link>([\s\S]*?)<\/link>/) || [, ""])[1].trim();
       const source = dec((it.match(/<source[^>]*>([\s\S]*?)<\/source>/) || [, ""])[1]);
       const pub = (it.match(/<pubDate>([\s\S]*?)<\/pubDate>/) || [, ""])[1].trim();
       if (!title || !link) continue;
-      // strip the trailing " - Source" Google appends to titles
-      const cleanTitle = title.replace(/\s+-\s+[^-]+$/, "");
       out.push({
-        title: cleanTitle.slice(0, 140),
+        title: title.replace(/\s+-\s+[^-]+$/, "").slice(0, 140), // strip trailing " - Source"
         link,
         source: source.slice(0, 40),
         date: pub ? new Date(pub).toLocaleDateString("en-GB", { day: "numeric", month: "short" }) : "",
-        image: `https://s.wordpress.com/mshots/v1/${encodeURIComponent(link)}?w=720`,
+        image: "",
       });
     }
+    // Real article images: resolve each Google redirect and grab og:image, in
+    // parallel with a tight timeout. mShots screenshots caught paywall popups;
+    // og:image is the clean editorial photo. Items without one render as a
+    // tasteful gradient card (FeedView fades a missing image out).
+    await Promise.all(
+      out.map(async (n) => {
+        try {
+          const pr = await fetch(n.link, { headers: { "user-agent": "Mozilla/5.0 (compatible; facebookexternalhit/1.1)" }, redirect: "follow", signal: AbortSignal.timeout(3500) });
+          const html = (await pr.text()).slice(0, 60000);
+          const og = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i) || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i);
+          if (og) n.image = og[1].replace(/&amp;/g, "&");
+        } catch {
+          /* no image — gradient card */
+        }
+      }),
+    );
     return out;
   } catch {
     return [];

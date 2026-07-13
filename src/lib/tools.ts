@@ -1923,7 +1923,7 @@ async function newsToday(args: any): Promise<string> {
   const { searchNews } = await import("./search");
   const raw = await searchNews(topic || null);
   const items = raw
-    .filter((n) => n.image && n.title)
+    .filter((n) => n.title)
     .slice(0, 12)
     .map((n) => ({
       image: n.image,

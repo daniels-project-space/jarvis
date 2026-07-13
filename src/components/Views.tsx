@@ -512,11 +512,11 @@ export function FeedView({ value }: { value: string }) {
         {items.slice(0, 4).map((it, i) => (
           <div
             key={i}
-            className="absolute inset-0 transition-opacity duration-1000 ease-in-out"
+            className="absolute inset-0 bg-[radial-gradient(120%_100%_at_50%_0%,rgba(19,32,51,0.9),rgba(6,10,18,0.98))] transition-opacity duration-1000 ease-in-out"
             style={{ opacity: i === idx ? 1 : 0 }}
           >
             {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src={it.image} alt="" loading="lazy" onError={(e)=>{e.currentTarget.style.opacity="0"}} className="h-full w-full object-cover transition-opacity" />
+            {it.image && <img src={it.image} alt="" loading="lazy" onError={(e)=>{e.currentTarget.style.opacity="0"}} className="h-full w-full object-cover transition-opacity" />}
             <div className="absolute inset-0 bg-gradient-to-t from-black/95 via-black/30 to-black/20" />
             <div className={`absolute bottom-0 left-0 right-0 p-6 transition-transform duration-1000 ${i === idx ? "translate-y-0" : "translate-y-3"}`}>
               <div className="hud-label mb-1 !text-cyan">{w!.label} · {i + 1}/{Math.min(items.length, 4)}</div>
@@ -541,9 +541,9 @@ export function FeedView({ value }: { value: string }) {
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-4">
         {items.map((it, i) => (
           <button key={i} onClick={() => open(it)} className="card-lift glass rise overflow-hidden rounded-xl text-left" style={{ animationDelay: `${i * 45}ms` }}>
-            <div className="relative">
+            <div className={`relative bg-[radial-gradient(120%_100%_at_50%_0%,rgba(19,32,51,0.9),rgba(6,10,18,0.98))] ${w!.mode === "music" ? "aspect-square" : "aspect-video"}`}>
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={it.image} alt="" loading="lazy" onError={(e)=>{e.currentTarget.style.opacity="0"}} className={`w-full object-cover transition-opacity ${w!.mode === "music" ? "aspect-square" : "aspect-video"}`} />
+              {it.image && <img src={it.image} alt="" loading="lazy" onError={(e)=>{e.currentTarget.style.opacity="0"}} className="absolute inset-0 h-full w-full object-cover transition-opacity" />}
               <span className="absolute left-1.5 top-1.5 rounded bg-black/70 px-1.5 py-0.5 font-mono text-[10px] text-cyan">{i + 1}</span>
               {w!.mode === "music" && (
                 <span className="absolute bottom-1.5 right-1.5 grid h-8 w-8 place-items-center rounded-full bg-[#1DB954] pl-0.5 text-sm text-black">▶</span>
