@@ -320,7 +320,7 @@ function ReactorRing({ active, aside, hidden, color }: { active: boolean; aside:
   return (
     <div
       className="pointer-events-none absolute inset-0 grid place-items-center transition-all duration-[900ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
-      style={{ opacity, transform: aside ? "translateX(41%) scale(0.62)" : "translateX(0) scale(1)" }}
+      style={{ opacity, transform: aside ? "translateX(58%) translateY(-4.5%) scale(0.5)" : "translateY(-4.5%) scale(1)" }}
     >
       <svg viewBox="0 0 500 500" className="h-[min(78vmin,720px)] w-[min(78vmin,720px)]" style={{ filter: `drop-shadow(0 0 10px ${c}66)`, transition: "filter 1.2s ease" }}>
         <g fill="none" stroke={c} style={{ transition: "stroke 1.2s ease" }}>
@@ -1117,6 +1117,11 @@ export default function JarvisUI() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const stageRef = useRef<HTMLDivElement>(null);
   const [videoPip, setVideoPip] = useState(false);
+  // The currently-playing video, DECOUPLED from the stage panel slot: once it's
+  // in the mini player it keeps playing even when a new overlay takes the stage
+  // or the panel is cleared. Only an explicit close (✕ / "close the video") or a
+  // brand-new video stops it.
+  const [activeVideo, setActiveVideo] = useState<{ value: string; title?: string } | null>(null);
   const panelTypeRef = useRef<string | null>(null);
   const videoIframeRef = useRef<HTMLIFrameElement | null>(null);
   const videoCmd = useQuery(api.ui.getVideoCmd, {}) as { value: string; updatedAt: number } | null | undefined;
@@ -1136,6 +1141,7 @@ export default function JarvisUI() {
     }
     if (videoCmd.value === "close") {
       setVideoPip(false);
+      setActiveVideo(null);
       void clearPanel({});
       return;
     }
@@ -1147,6 +1153,14 @@ export default function JarvisUI() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [videoCmd]);
+
+  // Adopt any video panel as THE active video (a new value = a new player). When
+  // the stage panel later changes to something else, activeVideo is deliberately
+  // NOT cleared here — that's what keeps the mini player alive across topics.
+  useEffect(() => {
+    if (panel?.type === "video") setActiveVideo({ value: panel.value, title: panel.title });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panel?.type === "video" ? panel?.value : null]);
 
   // Chat presence: full column ↔ floating type bar ↔ hidden ("zen"). Zen keeps
   // JARVIS always listening (wake word forced on) with no chrome in the way.
@@ -1938,7 +1952,7 @@ export default function JarvisUI() {
             </div>
           )}
           {panel && panel.type !== "video" && !panelMin && !panelFull ? (
-            <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-24" : "justify-center"}`}>
+            <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-10 md:pr-[36%] lg:pl-16" : "justify-center"}`}>
               <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${stagePanelSize}`}>
                 <Viewport
                   panel={panel}
@@ -2132,14 +2146,25 @@ export default function JarvisUI() {
       </div>
 
       {/* the video window — never remounts, morphs stage ↔ picture-in-picture */}
-      {panel && panel.type === "video" && !panelMin && (
+      {activeVideo && !(panel?.type === "video" && panelMin) && (
         <VideoDock
-          panel={panel}
-          pip={videoPip}
-          setPip={setVideoPip}
+          key={activeVideo.value}
+          panel={activeVideo}
+          // big only when this video IS the stage panel; otherwise it lives in the
+          // mini player (the stage belongs to whatever overlay is up)
+          pip={panel?.type === "video" ? videoPip : true}
+          setPip={
+            panel?.type === "video"
+              ? setVideoPip
+              : (v) => {
+                  // "big" from a pinned mini player brings the video back to the stage
+                  if (!v) void setPanel({ type: "video", value: activeVideo.value, title: activeVideo.title });
+                }
+          }
           onClose={() => {
             setVideoPip(false);
-            void clearPanel({});
+            setActiveVideo(null);
+            if (panel?.type === "video") void clearPanel({});
           }}
           stageRef={stageRef}
           iframeRef={videoIframeRef}

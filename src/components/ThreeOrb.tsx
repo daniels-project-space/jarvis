@@ -188,14 +188,17 @@ export default function ThreeOrb({
       const wantAside = asideRef.current && W() >= 768 ? 1 : 0;
       asideAmt += (wantAside - asideAmt) * 0.05;
       const halfW = Math.tan((45 * Math.PI) / 360) * 80 * (W() / H());
-      const offsetX = halfW * 0.56 * asideAmt;
-      const shrink = 1 - 0.46 * asideAmt;
+      // aside: hug the right edge as far as the panel sits on the left
+      const offsetX = halfW * 0.64 * asideAmt;
+      const shrink = 1 - 0.5 * asideAmt;
+      // sit a touch higher so the bottom chat bar isn't crowding it
+      const liftY = 3.2;
 
       points.rotation.set(spinX, spinY, spinZ);
-      points.position.set(offsetX, 0, cloudZ);
+      points.position.set(offsetX, liftY, cloudZ);
       points.scale.setScalar(shrink);
       lines.rotation.set(spinX, spinY, spinZ);
-      lines.position.set(offsetX, 0, cloudZ);
+      lines.position.set(offsetX, liftY, cloudZ);
       lines.scale.setScalar(shrink);
 
       const p = geo.getAttribute("position") as THREE.BufferAttribute;
@@ -298,7 +301,7 @@ export default function ThreeOrb({
       electronGeo.setDrawRange(0, aliveCount);
       ep.needsUpdate = true;
       electrons.rotation.set(spinX, spinY, spinZ);
-      electrons.position.set(offsetX, 0, cloudZ);
+      electrons.position.set(offsetX, liftY, cloudZ);
       electrons.scale.setScalar(shrink);
 
       mat.opacity = currentBright + bass * 0.08;
@@ -316,9 +319,11 @@ export default function ThreeOrb({
       // gentle, slow camera breathing — calmed right down so the orb sits
       // steady instead of drifting all over (worse when it's small and aside),
       // and the camera eases toward the orb's offset so it never looks flung
-      camera.position.x = Math.sin(t * 0.012) * 1.8 + offsetX * 0.5;
+      // camera follows less than the orb's own shift, so the orb lands further
+      // to the side; lookAt stays at y=0 so the lifted orb reads higher
+      camera.position.x = Math.sin(t * 0.012) * 1.8 + offsetX * 0.44;
       camera.position.y = Math.cos(t * 0.018) * 1.1;
-      camera.lookAt(offsetX * 0.5, 0, cloudZ * 0.2);
+      camera.lookAt(offsetX * 0.44, 0, cloudZ * 0.2);
       renderer.render(scene, camera);
     }
 
