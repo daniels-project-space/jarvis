@@ -105,14 +105,27 @@ await test("draft revises in place (writing desk)", async () => {
 });
 
 await test("voice election is atomic (CAS)", async () => {
-  // The invariant: once ANY client holds a fresh voice claim, a DIFFERENT
-  // fresh client cannot steal it. (Asserting the first always wins is wrong —
-  // a real open session may legitimately hold the voice.)
-  const a = await cv("mutation", "ui:electVoice", { client: "smoke-a" });
-  const b = await cv("mutation", "ui:electVoice", { client: "smoke-b" });
-  const aAgain = await cv("mutation", "ui:electVoice", { client: "smoke-a" });
-  assert(b === false, `smoke-b stole a fresh claim (a=${a} b=${b})`);
-  if (a === true) assert(aAgain === true, `owner smoke-a lost its own fresh claim (aAgain=${aAgain})`);
+  // The invariant: once a client holds a FRESH voice claim, a DIFFERENT client
+  // cannot steal it via electVoice, while the owner keeps its own.
+  //
+  // Testing this against live prod is only meaningful if we CONTROL the holder:
+  // firing electVoice blind depends on whether a real session happens to hold
+  // the voice, so it can't distinguish working CAS from a broken always-false
+  // election. So we seed a known fresh holder with claimVoice (documented
+  // always-wins), assert the invariant deterministically, then restore the
+  // prior holder so the test stays side-effect-free outside the smoke thread.
+  const before = await cv("query", "ui:getVoice", {});
+  try {
+    await cv("mutation", "ui:claimVoice", { client: "smoke-owner" });
+    const intruder = await cv("mutation", "ui:electVoice", { client: "smoke-intruder" });
+    const owner = await cv("mutation", "ui:electVoice", { client: "smoke-owner" });
+    assert(intruder === false, `smoke-intruder stole a fresh claim (intruder=${intruder})`);
+    assert(owner === true, `smoke-owner lost its own fresh claim (owner=${owner})`);
+  } finally {
+    // Hand the voice back to whoever held it before us (a real open tab
+    // re-claims on interaction anyway; a leftover claim expires in 3 min).
+    if (before?.value) await cv("mutation", "ui:claimVoice", { client: before.value });
+  }
 });
 
 await test("no duplicate answers per question (smoke thread)", async () => {
