@@ -77,9 +77,20 @@ export const setLiveOn = mutation({
   },
 });
 
+// The lock is a LEASE: a live client heartbeats every 20s and setLiveOn refuses
+// takeover only while the held lock is <45s old. If a client dies abnormally
+// (crash, mobile background-kill, dropped pagehide beacon) its release never
+// fires and the row lingers with a stale updatedAt — a phantom lock that reads
+// as "someone is live" to any consumer that forgets its own TTL gate. A lock
+// past its lease is definitionally not held, so report it as none at the source
+// rather than leaving a stale row to masquerade as a live session.
 export const getLiveOn = query({
   args: {},
-  handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "liveOn")).first(),
+  handler: async (ctx) => {
+    const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "liveOn")).first();
+    if (!row || Date.now() - row.updatedAt >= 45_000) return null;
+    return row;
+  },
 });
 
 // Video remote control: the brain writes a command ("play" | "pause" | "close"),
