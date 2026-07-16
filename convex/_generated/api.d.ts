@@ -19,7 +19,9 @@ import type * as memory from "../memory.js";
 import type * as missions from "../missions.js";
 import type * as projectState from "../projectState.js";
 import type * as push from "../push.js";
+import type * as reminders from "../reminders.js";
 import type * as ui from "../ui.js";
+import type * as watches from "../watches.js";
 
 import type {
   ApiFromModules,
@@ -39,7 +41,9 @@ declare const fullApi: ApiFromModules<{
   missions: typeof missions;
   projectState: typeof projectState;
   push: typeof push;
+  reminders: typeof reminders;
   ui: typeof ui;
+  watches: typeof watches;
 }>;
 
 /**
