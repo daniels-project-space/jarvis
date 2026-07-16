@@ -1,6 +1,6 @@
 import { schedules } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
-import { mkdirSync, existsSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { sendPush } from "./push-send";
@@ -15,14 +15,16 @@ const nodeRequire = createRequire(import.meta.url);
 const CONVEX =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
 
-function resolveClaudeBin(): string | null {
+type AgentProvider = "codex" | "claude";
+function resolveAgentBin(provider: AgentProvider): string | null {
   try {
-    const pkgJson = nodeRequire.resolve("@anthropic-ai/claude-code/package.json");
+    const command = provider === "codex" ? "codex" : "claude";
+    const pkgJson = nodeRequire.resolve(`${provider === "codex" ? "@openai/codex" : "@anthropic-ai/claude-code"}/package.json`);
     const pkgDir = dirname(pkgJson);
     const nm = dirname(dirname(pkgDir));
-    const cands = [join(nm, ".bin", "claude")];
+    const cands = [join(nm, ".bin", command)];
     const pkg = JSON.parse(readFileSync(pkgJson, "utf8")) as { bin?: string | Record<string, string> };
-    const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.claude;
+    const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.[command];
     if (rel) cands.push(join(pkgDir, rel));
     return cands.find((c) => existsSync(c)) ?? null;
   } catch {
@@ -52,9 +54,12 @@ async function m(path: string, args: unknown) {
   }).catch(() => {});
 }
 
-function ask(bin: string, env: NodeJS.ProcessEnv, prompt: string): Promise<string> {
+function ask(provider: AgentProvider, bin: string, env: NodeJS.ProcessEnv, prompt: string): Promise<string> {
   return new Promise((resolve) => {
-    const p = spawn(bin, ["-p", prompt, "--model", "sonnet", "--dangerously-skip-permissions"], {
+    const args = provider === "claude"
+      ? ["-p", prompt, "--model", "sonnet", "--dangerously-skip-permissions"]
+      : ["exec", "--model", "gpt-5.6-sol", "--config", 'model_reasoning_effort="medium"', "--dangerously-bypass-approvals-and-sandbox", prompt];
+    const p = spawn(bin, args, {
       env,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -99,10 +104,26 @@ export const insightEngine = schedules.task({
   cron: "0 8,14,20 * * *", // 3x/day
   maxDuration: 200,
   run: async () => {
-    const bin = resolveClaudeBin();
-    if (!bin) return { error: "no claude bin" };
-    const env: NodeJS.ProcessEnv = { ...process.env, HOME: "/tmp/claude-home", ANTHROPIC_API_KEY: "" };
-    mkdirSync("/tmp/claude-home", { recursive: true });
+    const provider: AgentProvider = (await q("ui:getAgentProvider", {})) === "claude" ? "claude" : "codex";
+    const bin = resolveAgentBin(provider);
+    if (!bin) return { error: `no ${provider} bin` };
+    let env: NodeJS.ProcessEnv;
+    if (provider === "claude") {
+      mkdirSync("/tmp/claude-home", { recursive: true });
+      env = { ...process.env, HOME: "/tmp/claude-home", ANTHROPIC_API_KEY: "" };
+    } else {
+      const home = "/tmp/codex-home";
+      mkdirSync(home, { recursive: true });
+      const encoded = process.env.CODEX_AUTH_JSON_B64, raw = process.env.CODEX_AUTH_JSON;
+      if (encoded || raw) try {
+        const json = encoded ? Buffer.from(encoded, "base64").toString("utf8") : raw!;
+        JSON.parse(json);
+        writeFileSync(join(home, "auth.json"), json, { mode: 0o600 });
+        chmodSync(join(home, "auth.json"), 0o600);
+      } catch { return { error: "invalid Codex subscription auth" }; }
+      if (!process.env.CODEX_ACCESS_TOKEN && !encoded && !raw) return { error: "Codex subscription auth is not configured" };
+      env = { ...process.env, HOME: home, CODEX_HOME: home, OPENAI_API_KEY: "", CODEX_API_KEY: "" };
+    }
 
     const biz: any[] = (await q("business:list", {})) ?? [];
     const stack: any[] = (await q("projectState:list", {})) ?? [];
@@ -124,7 +145,7 @@ export const insightEngine = schedules.task({
       "genuinely noteworthy.\n\n" +
       dataBlob;
 
-    const out = await ask(bin, env, prompt);
+    const out = await ask(provider, bin, env, prompt);
     const match = out.match(/\[[\s\S]*\]/);
     if (!match) return { insights: 0 };
     let items: any[] = [];

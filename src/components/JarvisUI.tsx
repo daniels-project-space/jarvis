@@ -217,10 +217,12 @@ const OPTION_MOODS: { k: string; c: string }[] = [
   { k: "curious", c: "#33e0d0" }, { k: "serious", c: "#8fa3bd" }, { k: "excited", c: "#ff5470" },
 ];
 function OptionsPanel({
-  prefs, setPref, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood,
+  prefs, setPref, agentProvider, onAgentProvider, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood,
 }: {
   prefs: { voice: string; tts: string; reduceMotion: boolean };
   setPref: (k: "voice" | "tts" | "reduceMotion", v: string | boolean) => void;
+  agentProvider: "codex" | "claude";
+  onAgentProvider: (provider: "codex" | "claude") => void;
   live: string;
   locOn: boolean;
   onLocation: () => void;
@@ -256,6 +258,9 @@ function OptionsPanel({
           <button onClick={onClose} className="hud-label hover:text-cyan">close</button>
         </div>
         <div className="divide-y divide-white/5">
+          <Row label="Agent intelligence" hint="subscription used for background work and deep fallback">
+            <Seg opts={[["codex", "Codex"], ["claude", "Claude"]]} val={agentProvider} on={(v) => onAgentProvider(v as "codex" | "claude")} />
+          </Row>
           <Row label="Voice" hint="how 'hey Jarvis' talks back">
             <Seg opts={[["free", "Free"], ["realtime", "Live"]]} val={prefs.voice} on={(v) => setPref("voice", v)} />
           </Row>
@@ -1125,6 +1130,8 @@ export default function JarvisUI() {
   // Options panel + persisted preferences (voice lane, TTS voice, wake, motion)
   const [optionsOpen, setOptionsOpen] = useState(false);
   const setMoodMut = useMutation(api.ui.setMood);
+  const agentProvider = (useQuery(api.ui.getAgentProvider, {}) ?? "codex") as "codex" | "claude";
+  const setAgentProvider = useMutation(api.ui.setAgentProvider);
   const [prefs, setPrefs] = useState({ voice: "free", tts: "free", reduceMotion: false });
   useEffect(() => {
     // one-time revert: the browser "fast" voice was a regression Daniel hated —
@@ -1942,6 +1949,8 @@ export default function JarvisUI() {
         <OptionsPanel
           prefs={prefs}
           setPref={setPref}
+          agentProvider={agentProvider}
+          onAgentProvider={(provider) => void setAgentProvider({ provider })}
           live={live}
           locOn={locOn}
           onLocation={() => void captureLocation(true)}

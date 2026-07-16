@@ -1,6 +1,6 @@
 import { schedules } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
-import { mkdirSync, existsSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { PERSONA } from "../lib/persona";
@@ -9,17 +9,19 @@ const nodeRequire = createRequire(import.meta.url);
 
 // The `claude` binary isn't on PATH in the Trigger image — resolve it from the
 // installed @anthropic-ai/claude-code package (mirrors remote-work-hub).
-function resolveClaudeBin(): string | null {
+type AgentProvider = "codex" | "claude";
+function resolveAgentBin(provider: AgentProvider): string | null {
   try {
-    const pkgJson = nodeRequire.resolve("@anthropic-ai/claude-code/package.json");
+    const command = provider === "codex" ? "codex" : "claude";
+    const pkgJson = nodeRequire.resolve(`${provider === "codex" ? "@openai/codex" : "@anthropic-ai/claude-code"}/package.json`);
     const pkgDir = dirname(pkgJson);
     const nodeModules = dirname(dirname(pkgDir));
-    const candidates = [join(nodeModules, ".bin", "claude")];
+    const candidates = [join(nodeModules, ".bin", command)];
     try {
       const pkg = JSON.parse(readFileSync(pkgJson, "utf8")) as {
         bin?: string | Record<string, string>;
       };
-      const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.claude;
+      const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.[command];
       if (rel) candidates.push(join(pkgDir, rel));
     } catch {
       /* ignore */
@@ -28,6 +30,41 @@ function resolveClaudeBin(): string | null {
   } catch {
     return null;
   }
+}
+
+const CODEX_MODELS: Record<string, { model: string; effort: string }> = {
+  haiku: { model: "gpt-5.6-terra", effort: "low" },
+  sonnet: { model: "gpt-5.6-sol", effort: "medium" },
+  opus: { model: "gpt-5.6", effort: "high" },
+};
+function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = false): string[] {
+  if (provider === "claude") {
+    const args = ["-p", prompt, "--model", tier, "--dangerously-skip-permissions"];
+    if (json) args.push("--output-format", "stream-json", "--verbose", "--include-partial-messages");
+    return args;
+  }
+  const m = CODEX_MODELS[tier] ?? CODEX_MODELS.sonnet;
+  const args = ["exec", "--model", m.model, "--config", `model_reasoning_effort=\"${m.effort}\"`, "--dangerously-bypass-approvals-and-sandbox"];
+  if (json) args.push("--json");
+  args.push(prompt);
+  return args;
+}
+function prepareEnv(provider: AgentProvider): { env: NodeJS.ProcessEnv; error?: string } {
+  if (provider === "claude") {
+    mkdirSync("/tmp/claude-home", { recursive: true });
+    return { env: { ...process.env, HOME: "/tmp/claude-home", ANTHROPIC_API_KEY: "" } };
+  }
+  const home = "/tmp/codex-home";
+  mkdirSync(home, { recursive: true });
+  const encoded = process.env.CODEX_AUTH_JSON_B64, raw = process.env.CODEX_AUTH_JSON;
+  if (encoded || raw) try {
+    const json = encoded ? Buffer.from(encoded, "base64").toString("utf8") : raw!;
+    JSON.parse(json);
+    writeFileSync(join(home, "auth.json"), json, { mode: 0o600 });
+    chmodSync(join(home, "auth.json"), 0o600);
+  } catch { return { env: process.env, error: "invalid Codex subscription auth" }; }
+  if (!process.env.CODEX_ACCESS_TOKEN && !encoded && !raw) return { env: process.env, error: "Codex subscription auth is not configured" };
+  return { env: { ...process.env, HOME: home, CODEX_HOME: home, OPENAI_API_KEY: "", CODEX_API_KEY: "" } };
 }
 
 // Subscription brain: each chat turn runs the real `claude` CLI HEADLESS on
@@ -96,6 +133,7 @@ function pickModel(text: string): string {
 }
 
 function runTurn(
+  provider: AgentProvider,
   bin: string,
   env: NodeJS.ProcessEnv,
   assistantId: string,
@@ -131,19 +169,9 @@ function runTurn(
       "\n\n"
     : "";
   const prompt = `${convo}User: ${userText}`;
-  const args = [
-    "-p",
-    prompt,
-    "--append-system-prompt",
-    preamble,
-    "--model",
-    model,
-    "--output-format",
-    "stream-json",
-    "--verbose",
-    "--include-partial-messages",
-    "--dangerously-skip-permissions",
-  ];
+  const fullPrompt = provider === "codex" ? `${preamble}\n\n${prompt}` : prompt;
+  const args = cliArgs(provider, fullPrompt, model, true);
+  if (provider === "claude") args.splice(2, 0, "--append-system-prompt", preamble);
   return new Promise((resolve) => {
     const p = spawn(bin, args, { env, stdio: ["ignore", "pipe", "pipe"] });
     let buf = "",
@@ -173,6 +201,11 @@ function runTurn(
           continue;
         }
         if (ev.session_id && !sessionId) sessionId = ev.session_id;
+        if (ev.type === "thread.started" && typeof ev.thread_id === "string") sessionId = ev.thread_id;
+        if (ev.type === "item.completed" && ev.item?.type === "agent_message" && typeof ev.item.text === "string") {
+          finalText = ev.item.text;
+          pending += ev.item.text;
+        }
         if (ev.type === "stream_event" && ev.event?.type === "content_block_delta") {
           const t = ev.event.delta?.text;
           if (typeof t === "string") pending += t;
@@ -197,6 +230,7 @@ function runTurn(
 // persists them (decoupled from the conversation = far more reliable than
 // in-turn tool calls; the mem0 / Letta sleep-time pattern).
 async function extractAndSave(
+  provider: AgentProvider,
   bin: string,
   env: NodeJS.ProcessEnv,
   userText: string,
@@ -209,7 +243,7 @@ async function extractAndSave(
     "Output [] if nothing is worth remembering. No prose, JSON only.\n\n" +
     `User: ${userText}\nAssistant: ${assistantText}`;
   const out = await new Promise<string>((resolve) => {
-    const p = spawn(bin, ["-p", prompt, "--model", "haiku", "--dangerously-skip-permissions"], {
+    const p = spawn(bin, cliArgs(provider, prompt, "haiku"), {
       env,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -245,16 +279,13 @@ export const chatDispatcher = schedules.task({
   cron: "*/1 * * * *",
   maxDuration: 3300,
   run: async () => {
-    // CLAUDE_CODE_OAUTH_TOKEN is injected by the Trigger project env (Max sub).
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      HOME: "/tmp/claude-home",
-      ANTHROPIC_API_KEY: "",
-    };
-    mkdirSync("/tmp/claude-home", { recursive: true });
-
-    const bin = resolveClaudeBin();
-    if (!bin) return { processed: 0, error: "claude binary not found" };
+    const selected = await convexQuery("ui:getAgentProvider", {});
+    const provider: AgentProvider = selected === "claude" ? "claude" : "codex";
+    const prepared = prepareEnv(provider);
+    if (prepared.error) return { processed: 0, error: prepared.error };
+    const env = prepared.env;
+    const bin = resolveAgentBin(provider);
+    if (!bin) return { processed: 0, error: `${provider} binary not found` };
 
     const started = Date.now();
     let processed = 0,
@@ -331,6 +362,7 @@ export const chatDispatcher = schedules.task({
         const businessContext = [hubLines, bizLines, insLines].filter(Boolean).join("\n").slice(0, 2600);
         const model = pickModel(claim.userText);
         const turn = await runTurn(
+          provider,
           bin,
           env,
           claim.assistantId,
@@ -352,11 +384,11 @@ export const chatDispatcher = schedules.task({
           status: turn.finalText.trim() ? "done" : "error",
           finalText,
           claudeSessionId: turn.sessionId ?? undefined,
-          model,
+          model: `${provider} · ${model}`,
         });
         // Stage 0: capture durable memory from this turn (after reply is delivered).
         if (turn.finalText.trim())
-          await extractAndSave(bin, env, claim.userText, turn.finalText).catch(() => {});
+          await extractAndSave(provider, bin, env, claim.userText, turn.finalText).catch(() => {});
         processed += 1;
       } catch (e: any) {
         await convexMutation("chatQueue:finalize", {

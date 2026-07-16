@@ -1,5 +1,5 @@
 import { defineConfig } from "@trigger.dev/sdk/v3";
-import { additionalPackages, aptGet } from "@trigger.dev/build/extensions/core";
+import { additionalPackages, aptGet, syncEnvVars } from "@trigger.dev/build/extensions/core";
 
 // jarvis-jobs — runs Claude Code HEADLESS on Daniel's Max subscription
 // (CLAUDE_CODE_OAUTH_TOKEN pulled from the project-hub vault at runtime;
@@ -15,10 +15,14 @@ export default defineConfig({
   build: {
     // Claude Code reads its bundled binary from disk — keep it out of the
     // esbuild bundle; Trigger installs it fresh (correct Linux binary).
-    external: ["@anthropic-ai/claude-code", "web-push"],
+    external: ["@anthropic-ai/claude-code", "@openai/codex", "web-push"],
     extensions: [
-      additionalPackages({ packages: ["@anthropic-ai/claude-code@latest"] }),
+      additionalPackages({ packages: ["@anthropic-ai/claude-code@latest", "@openai/codex@latest"] }),
       aptGet({ packages: ["git", "ca-certificates"] }),
+      syncEnvVars(() => {
+        const value = process.env.CODEX_AUTH_JSON_B64;
+        return value ? { CODEX_AUTH_JSON_B64: value } : undefined;
+      }),
     ],
   },
 });

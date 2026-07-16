@@ -1,6 +1,6 @@
 import { schedules } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
-import { mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { sendPush } from "./push-send";
@@ -15,15 +15,19 @@ const nodeRequire = createRequire(import.meta.url);
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
 
-function resolveClaudeBin(): string | null {
+type AgentProvider = "codex" | "claude";
+
+function resolveAgentBin(provider: AgentProvider): string | null {
   try {
-    const pkgJson = nodeRequire.resolve("@anthropic-ai/claude-code/package.json");
+    const packageName = provider === "codex" ? "@openai/codex" : "@anthropic-ai/claude-code";
+    const command = provider === "codex" ? "codex" : "claude";
+    const pkgJson = nodeRequire.resolve(`${packageName}/package.json`);
     const pkgDir = dirname(pkgJson);
     const nodeModules = dirname(dirname(pkgDir));
-    const candidates = [join(nodeModules, ".bin", "claude")];
+    const candidates = [join(nodeModules, ".bin", command)];
     try {
       const pkg = JSON.parse(readFileSync(pkgJson, "utf8")) as { bin?: string | Record<string, string> };
-      const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.claude;
+      const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.[command];
       if (rel) candidates.push(join(pkgDir, rel));
     } catch {
       /* ignore */
@@ -32,6 +36,85 @@ function resolveClaudeBin(): string | null {
   } catch {
     return null;
   }
+}
+
+function prepareAgentEnv(provider: AgentProvider): { env: NodeJS.ProcessEnv; error?: string } {
+  if (provider === "claude") {
+    const home = "/tmp/claude-home";
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    return { env: { ...process.env, HOME: home, ANTHROPIC_API_KEY: "", JARVIS_AGENT_PROVIDER: provider } };
+  }
+  const home = "/tmp/codex-home";
+  mkdirSync(home, { recursive: true });
+  const encoded = process.env.CODEX_AUTH_JSON_B64;
+  const raw = process.env.CODEX_AUTH_JSON;
+  if (encoded || raw) {
+    try {
+      const json = encoded ? Buffer.from(encoded, "base64").toString("utf8") : raw!;
+      JSON.parse(json);
+      const authPath = join(home, "auth.json");
+      writeFileSync(authPath, json, { mode: 0o600 });
+      chmodSync(authPath, 0o600);
+    } catch {
+      return { env: process.env, error: "invalid Codex subscription auth" };
+    }
+  }
+  if (!process.env.CODEX_ACCESS_TOKEN && !encoded && !raw)
+    return { env: process.env, error: "Codex subscription auth is not configured" };
+  return {
+    env: {
+      ...process.env,
+      HOME: home,
+      CODEX_HOME: home,
+      OPENAI_API_KEY: "",
+      CODEX_API_KEY: "",
+      JARVIS_AGENT_PROVIDER: provider,
+    },
+  };
+}
+
+const CODEX_MODELS: Record<string, { model: string; effort: string }> = {
+  haiku: { model: "gpt-5.6-terra", effort: "low" },
+  sonnet: { model: "gpt-5.6-sol", effort: "medium" },
+  opus: { model: "gpt-5.6", effort: "high" },
+};
+
+function promptArgs(env: NodeJS.ProcessEnv, prompt: string, tier: string, json = false, mcpConfig?: string | null): string[] {
+  if (env.JARVIS_AGENT_PROVIDER !== "codex") {
+    const args = ["-p", prompt, "--model", tier, "--dangerously-skip-permissions"];
+    if (json) args.push("--output-format", "stream-json", "--verbose");
+    if (mcpConfig) args.push("--mcp-config", mcpConfig);
+    return args;
+  }
+  const selected = CODEX_MODELS[tier] ?? CODEX_MODELS.sonnet;
+  const args = [
+    "exec", "--model", selected.model, "--config", `model_reasoning_effort=\"${selected.effort}\"`,
+    "--dangerously-bypass-approvals-and-sandbox",
+  ];
+  if (json) args.push("--json");
+  if (mcpConfig) {
+    try {
+      const cfg = JSON.parse(readFileSync(mcpConfig, "utf8")) as { mcpServers?: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> };
+      for (const [name, server] of Object.entries(cfg.mcpServers ?? {})) {
+        args.push("--config", `mcp_servers.${name}.command=${JSON.stringify(server.command)}`);
+        if (server.args) args.push("--config", `mcp_servers.${name}.args=${JSON.stringify(server.args)}`);
+        if (server.env) args.push("--config", `mcp_servers.${name}.env=${JSON.stringify(server.env)}`);
+      }
+    } catch { /* run without an invalid optional MCP config */ }
+  }
+  args.push(prompt);
+  return args;
+}
+
+function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, tier: string, timeoutMs: number): Promise<string> {
+  return new Promise((resolve) => {
+    const p = spawn(bin, promptArgs(env, prompt, tier), { env, stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    const timer = setTimeout(() => { try { p.kill("SIGKILL"); } catch { /* gone */ } resolve(output); }, timeoutMs);
+    p.stdout.on("data", (d) => (output += d.toString()));
+    p.on("close", () => { clearTimeout(timer); resolve(output); });
+    p.on("error", () => { clearTimeout(timer); resolve(""); });
+  });
 }
 async function convexMutation(path: string, args: unknown) {
   return (
@@ -172,30 +255,7 @@ async function weaveLine(bin: string, env: NodeJS.ProcessEnv, task: string, resu
     "End by mentioning the full detail is on his screen. No markdown, no emoji, no preamble. " +
     "If it failed, say what failed honestly in one sentence.\n\n" +
     `The task was: ${task.slice(0, 300)}\nThe result:\n${result.slice(0, 3500)}`;
-  const out = await new Promise<string>((resolve) => {
-    const p = spawn(bin, ["-p", prompt, "--model", "haiku", "--dangerously-skip-permissions"], {
-      env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let o = "";
-    const to = setTimeout(() => {
-      try {
-        p.kill("SIGKILL");
-      } catch {
-        /* gone */
-      }
-      resolve(o);
-    }, 60_000);
-    p.stdout.on("data", (d) => (o += d.toString()));
-    p.on("close", () => {
-      clearTimeout(to);
-      resolve(o);
-    });
-    p.on("error", () => {
-      clearTimeout(to);
-      resolve("");
-    });
-  });
+  const out = await plainPrompt(bin, env, prompt, "haiku", 60_000);
   const line = out.trim().replace(/\s+/g, " ").replace(/[*#`_]/g, "");
   return line.length > 4 && line.length < 400 ? line : "";
 }
@@ -215,30 +275,7 @@ async function verifyWork(
     "verdict rules: pass = work matches the task and looks complete; concerns = done but something specific looks wrong/unfinished (say what in note); " +
     "needs_input = the agent stopped on a question or decision. If that question is answerable with common sense or the task's own context, fill answer so the run can continue autonomously; leave answer empty only when Daniel genuinely must decide (money, accounts, personal preferences).\n\n" +
     `Task: ${task.slice(0, 800)}\n\nAgent result:\n${result.slice(0, 4000)}`;
-  const out = await new Promise<string>((resolve) => {
-    const p = spawn(bin, ["-p", prompt, "--model", "haiku", "--dangerously-skip-permissions"], {
-      env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let o = "";
-    const to = setTimeout(() => {
-      try {
-        p.kill("SIGKILL");
-      } catch {
-        /* gone */
-      }
-      resolve(o);
-    }, 60_000);
-    p.stdout.on("data", (d) => (o += d.toString()));
-    p.on("close", () => {
-      clearTimeout(to);
-      resolve(o);
-    });
-    p.on("error", () => {
-      clearTimeout(to);
-      resolve("");
-    });
-  });
+  const out = await plainPrompt(bin, env, prompt, "haiku", 60_000);
   try {
     const m = out.match(/\{[\s\S]*\}/);
     if (!m) return null;
@@ -250,7 +287,7 @@ async function verifyWork(
   }
 }
 
-function runClaude(
+function runAgent(
   bin: string,
   cwd: string,
   env: NodeJS.ProcessEnv,
@@ -260,17 +297,7 @@ function runClaude(
   mcpConfig?: string | null,
 ): Promise<string> {
   return new Promise((resolve) => {
-    const args = [
-      "-p",
-      prompt,
-      "--model",
-      model,
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--dangerously-skip-permissions",
-    ];
-    if (mcpConfig) args.push("--mcp-config", mcpConfig);
+    const args = promptArgs(env, prompt, model, true, mcpConfig);
     const p = spawn(bin, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     let buf = "";
     let finalText = "";
@@ -313,7 +340,19 @@ function runClaude(
         } catch {
           continue;
         }
-        if (ev.type === "assistant" && ev.message?.content) {
+        if (ev.type === "thread.started") {
+          latest = "session started";
+          pushLog("▸ Codex session started");
+        } else if (ev.type === "item.started" && ev.item?.type === "command_execution") {
+          latest = `Running ${String(ev.item.command ?? "command").slice(0, 120)}`;
+          pushLog(`▸ ${latest}`);
+        } else if (ev.type === "item.completed" && ev.item?.type === "agent_message") {
+          if (typeof ev.item.text === "string") {
+            finalText = ev.item.text;
+            latest = ev.item.text.trim().replace(/\s+/g, " ").slice(-160);
+            pushLog(ev.item.text.trim().slice(0, 400));
+          }
+        } else if (ev.type === "assistant" && ev.message?.content) {
           for (const b of ev.message.content) {
             if (b.type === "tool_use") {
               latest = `Using ${b.name}${b.input?.command ? ": " + String(b.input.command).slice(0, 80) : b.input?.file_path ? ": " + b.input.file_path : ""}`;
@@ -388,8 +427,12 @@ export const agentRunner = schedules.task({
   cron: "*/2 * * * *",
   maxDuration: 1800,
   run: async () => {
-    const bin = resolveClaudeBin();
-    if (!bin) return { processed: 0, error: "no claude binary" };
+    const selected = await convexQuery("ui:getAgentProvider", {});
+    const provider: AgentProvider = selected === "claude" ? "claude" : "codex";
+    const bin = resolveAgentBin(provider);
+    if (!bin) return { processed: 0, error: `no ${provider} binary` };
+    const prepared = prepareAgentEnv(provider);
+    if (prepared.error) return { processed: 0, error: prepared.error };
 
     // Self-healing sweep: open incidents become root-cause repair jobs (attempt-
     // capped); exhausted ones escalate to Daniel instead of looping forever.
@@ -460,15 +503,15 @@ export const agentRunner = schedules.task({
     } catch {
       /* watches never block jobs */
     }
-    const env: NodeJS.ProcessEnv = { ...process.env, HOME: "/tmp/claude-home", ANTHROPIC_API_KEY: "" };
-    mkdirSync("/tmp/claude-home/.claude", { recursive: true });
+    const env = prepared.env;
     mkdirSync("/tmp/work", { recursive: true });
     const token = process.env.GITHUB_TOKEN ?? "";
 
     // Standing briefing every agent reads (global CLAUDE.md in the runner HOME):
     // Daniel's infra map + vault access + repo/deploy conventions = real project access.
+    const briefingPath = provider === "claude" ? "/tmp/claude-home/.claude/CLAUDE.md" : "/tmp/codex-home/AGENTS.md";
     writeFileSync(
-      "/tmp/claude-home/.claude/CLAUDE.md",
+      briefingPath,
       `# You are a JARVIS background agent working for Daniel.\n\n${INFRA_MAP}\n\n` +
         `## Secrets vault (use freely when a task needs API keys)\n` +
         `curl -s -X POST '${VAULT_URL}/api/query' -H 'content-type: application/json' -d '{"path":"secrets:listByService","args":{"service":"<service>"},"format":"json"}'\n` +
@@ -514,7 +557,7 @@ export const agentRunner = schedules.task({
         }
         const model = typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task);
         const mcpConfig = Array.isArray(job.mcp) && job.mcp.length ? await buildMcpConfig(job.mcp) : null;
-        const result = await runClaude(
+        const result = await runAgent(
           bin,
           cwd,
           env,
@@ -683,7 +726,7 @@ export const agentRunner = schedules.task({
       const body = synth.results
         .map((r: any) => `### ${r.label} [${r.status}]\n${r.result || "(no output)"}`)
         .join("\n\n");
-      const merged = await runClaude(
+      const merged = await runAgent(
         bin,
         "/tmp/work",
         env,

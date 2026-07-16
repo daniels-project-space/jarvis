@@ -24,6 +24,26 @@ export const getPanel = query({
   handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first(),
 });
 
+// Global subscription agent selection. Trigger jobs read this before claiming
+// work, so the choice follows Daniel across devices and affects every runner.
+export const setAgentProvider = mutation({
+  args: { provider: v.union(v.literal("codex"), v.literal("claude")) },
+  handler: async (ctx, a) => {
+    const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "agentProvider")).first();
+    const doc = { key: "agentProvider", type: "provider", value: a.provider, updatedAt: Date.now() };
+    if (ex) await ctx.db.patch(ex._id, doc);
+    else await ctx.db.insert("ui", doc);
+  },
+});
+
+export const getAgentProvider = query({
+  args: {},
+  handler: async (ctx) => {
+    const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "agentProvider")).first();
+    return row?.value === "claude" ? "claude" : "codex";
+  },
+});
+
 // Voice election: exactly ONE open tab/device speaks assistant lines out loud
 // (the one Daniel last interacted with, or the live-mode tab). Everyone else
 // stays silent — this is what kills the "two voices" problem for good.
