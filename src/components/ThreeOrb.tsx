@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 
 // Particle-network orb — adapted from ethanplusai/jarvis (frontend/src/orb.ts),
@@ -32,6 +32,7 @@ export default function ThreeOrb({
   // could stick until reload).
   aside?: boolean;
 }) {
+  const [webglUnavailable, setWebglUnavailable] = useState(false);
   const moodRef = useRef<string | undefined>(moodColor);
   useEffect(() => {
     moodRef.current = moodColor;
@@ -57,7 +58,17 @@ export default function ThreeOrb({
     const W = () => mount.clientWidth || 1;
     const H = () => mount.clientHeight || 1;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    } catch {
+      // WebGL can be unavailable after a driver reset, inside a remote browser,
+      // or on battery-constrained devices. The orb is decoration: it must never
+      // be allowed to take the work surface down with it.
+      setWebglUnavailable(true);
+      return;
+    }
+    setWebglUnavailable(false);
     renderer.setPixelRatio(Math.min(compact ? 1.25 : 1.75, window.devicePixelRatio));
     renderer.setSize(W(), H());
     renderer.setClearColor(0x000000, 0);
@@ -373,5 +384,19 @@ export default function ThreeOrb({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return <div ref={mountRef} className="h-full w-full" />;
+  return (
+    <div ref={mountRef} className="relative h-full w-full">
+      {webglUnavailable && (
+        <div
+          aria-label="JARVIS visual core"
+          className="absolute inset-0 grid place-items-center"
+        >
+          <div className="relative h-[min(42vw,280px)] w-[min(42vw,280px)] min-h-36 min-w-36 rounded-full border border-emerald-300/25 bg-[radial-gradient(circle_at_42%_38%,rgba(110,255,196,0.32),rgba(0,255,136,0.1)_34%,rgba(0,255,136,0.02)_68%,transparent_72%)] shadow-[0_0_80px_rgba(0,255,136,0.16)]">
+            <div className="absolute inset-[18%] rounded-full border border-emerald-200/20 shadow-[inset_0_0_45px_rgba(0,255,136,0.18)]" />
+            <div className="absolute inset-[38%] rounded-full bg-emerald-300/35 blur-md" />
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
