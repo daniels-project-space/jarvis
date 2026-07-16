@@ -28,6 +28,7 @@ import type * as reminders from "../reminders.js";
 import type * as ui from "../ui.js";
 import type * as watches from "../watches.js";
 import type * as workEvents from "../workEvents.js";
+import type * as workPolicy from "../workPolicy.js";
 
 import type {
   ApiFromModules,
@@ -56,6 +57,7 @@ declare const fullApi: ApiFromModules<{
   ui: typeof ui;
   watches: typeof watches;
   workEvents: typeof workEvents;
+  workPolicy: typeof workPolicy;
 }>;
 
 /**

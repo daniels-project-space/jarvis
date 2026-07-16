@@ -128,6 +128,12 @@ export function normalizeWorkstream(input: {
   });
   const requestedAgent = input.agentId as AgentSlug | undefined;
   const agentId = requestedAgent && requestedAgent !== "jarvis" && TEAM_BY_SLUG[requestedAgent] ? requestedAgent : route.agentId === "jarvis" ? "atlas" : route.agentId;
+  const approvalRequired = input.approvalRequired === true || route.approvalRequired || input.risk === "consequential";
+  const risk = (approvalRequired
+    ? "consequential"
+    : input.risk && ["low", "medium", "high"].includes(input.risk)
+      ? input.risk
+      : route.risk) as WorkRisk;
   return {
     label: (input.label || `${TEAM_BY_SLUG[agentId].name} · ${TEAM_BY_SLUG[agentId].role}`).slice(0, 80),
     task: input.task.slice(0, 4000),
@@ -135,13 +141,10 @@ export function normalizeWorkstream(input: {
     repo: input.repo ?? null,
     model: route.model as ModelTier,
     readonly: input.readonly ?? route.readonly,
-    approvalRequired: input.approvalRequired ?? route.approvalRequired,
-    risk: (input.risk && ["low", "medium", "high", "consequential"].includes(input.risk)
-      ? input.risk
-      : route.risk) as WorkRisk,
+    approvalRequired,
+    risk,
     acceptanceCriteria: input.acceptanceCriteria?.length
       ? input.acceptanceCriteria.slice(0, 8)
       : suggestedAcceptanceCriteria(input.task, route),
   };
 }
-

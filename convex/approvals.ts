@@ -14,10 +14,11 @@ export const pending = query({
 export const decide = mutation({
   args: { jobId: v.string(), decision: v.union(v.literal("approved"), v.literal("declined")) },
   handler: async (ctx, a) => {
-    const approval = await ctx.db
+    const approvals = await ctx.db
       .query("approvals")
       .withIndex("by_job", (q: any) => q.eq("jobId", a.jobId))
-      .first();
+      .collect();
+    const approval = approvals.find((row) => row.status === "pending");
     const jobId = ctx.db.normalizeId("jobs", a.jobId);
     const job = jobId ? await ctx.db.get(jobId) : null;
     if (!approval || approval.status !== "pending" || !jobId || !job || job.status !== "awaiting_approval") return false;
@@ -32,6 +33,8 @@ export const decide = mutation({
     });
     await ctx.db.insert("workEvents", {
       jobId: a.jobId,
+      missionId: job.missionId,
+      agentId: job.agentId,
       type: "approval_decision",
       message: a.decision === "approved" ? "Daniel approved this work" : "Daniel declined this work",
       stage: a.decision === "approved" ? "queued" : "cancelled",

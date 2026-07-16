@@ -192,9 +192,10 @@ async function weaveLine(bin: string, env: NodeJS.ProcessEnv, task: string, resu
   return line.length > 4 && line.length < 400 ? line : "";
 }
 
-// JARVIS checks its agents: a fast haiku pass over every finished job — did
-// the work actually get done, is anything off, or did the agent stop on a
-// question JARVIS can answer itself (then it auto-continues the session)?
+// JARVIS checks every finished job with the balanced tier: did the work
+// actually meet its definition of done, is anything off, or did the agent stop
+// on a question JARVIS can answer itself? A missing/negative verdict can never
+// be promoted to "verified" by the Convex finalization invariant.
 async function verifyWork(
   bin: string,
   env: NodeJS.ProcessEnv,
@@ -207,7 +208,7 @@ async function verifyWork(
     "verdict rules: pass = work matches the task and looks complete; concerns = done but something specific looks wrong/unfinished (say what in note); " +
     "needs_input = the agent stopped on a question or decision. If that question is answerable with common sense or the task's own context, fill answer so the run can continue autonomously; leave answer empty only when Daniel genuinely must decide (money, accounts, personal preferences).\n\n" +
     `Task: ${task.slice(0, 800)}\n\nAgent result:\n${result.slice(0, 4000)}`;
-  const out = await plainPrompt(bin, env, prompt, "haiku", 60_000);
+  const out = await plainPrompt(bin, env, prompt, "sonnet", 90_000);
   try {
     const m = out.match(/\{[\s\S]*\}/);
     if (!m) return null;
@@ -626,6 +627,27 @@ export const agentRunner = schedules.task({
     // conversation. Mission jobs remain quiet until the reviewed synthesis.
     const processJob = async (job: any): Promise<void> => {
       const originThread = typeof job.originThreadId === "string" && job.originThreadId ? job.originThreadId : "main";
+      const expectedAttempt = Number(job.attempt ?? 1);
+      const executionStatus = async (): Promise<string> => {
+        const lease: any = await convexQuery("jobs:executionLease", { jobId: job.jobId });
+        if (!lease || Number(lease.attempt) !== expectedAttempt) return "superseded";
+        return String(lease.status ?? "missing");
+      };
+      const stopIfLeaseLost = async (checkpoint: string, result: string, branch?: string | null): Promise<boolean> => {
+        const state = await executionStatus();
+        if (state === "running") return false;
+        if (state === "paused" || state === "cancelled") {
+          await convexMutation("jobs:checkpointAndRequeue", {
+            jobId: job.jobId,
+            expectedAttempt,
+            checkpoint,
+            result: result.slice(0, 4000),
+            branch: branch ?? undefined,
+            nextStatus: state,
+          }).catch(() => null);
+        }
+        return true;
+      };
       try {
         let cwd = `/tmp/work/scratch-${String(job.jobId).slice(-6)}`;
         mkdirSync(cwd, { recursive: true });
@@ -655,7 +677,12 @@ export const agentRunner = schedules.task({
             await sh("git", ["-C", dir, "config", "user.name", `${profile.name} via JARVIS`], env);
             baseSha = (await sh("git", ["-C", dir, "rev-parse", "HEAD"], env)).out.trim();
             if (branch) await sh("git", ["-C", dir, "checkout", "-B", branch], env);
-            if (branch) await convexMutation("jobs:setDelivery", { jobId: job.jobId, branch }).catch(() => {});
+            if (branch)
+              await convexMutation("jobs:setDelivery", {
+                jobId: job.jobId,
+                expectedAttempt,
+                branch,
+              }).catch(() => {});
             context = job.readonly
               ? `Your working directory is a read-only checkout of ${repo}. Inspect it deeply, but do not edit or commit.`
               : `Your working directory is an isolated checkout of ${repo} on branch ${branch}. Actually perform the scoped task. You may edit and commit here; never push, merge, deploy, or switch branches because the runner owns delivery.`;
@@ -667,6 +694,7 @@ export const agentRunner = schedules.task({
           cloneFailed = true;
           context = `Repository work was requested for ${repo}, but the runner has no GitHub transport credential. Do not pretend the repository was changed.`;
         }
+        if (await stopIfLeaseLost("Execution stopped while preparing the secure workspace.", "", branch)) return;
         const criteria = Array.isArray(job.acceptanceCriteria) && job.acceptanceCriteria.length
           ? job.acceptanceCriteria.map(String)
           : ["Deliver the requested outcome with concrete evidence"];
@@ -686,12 +714,31 @@ export const agentRunner = schedules.task({
           prompt,
           model,
           (line, log, stage, percent) => {
-            void convexMutation("jobs:updateProgress", { jobId: job.jobId, progress: line, log, stage, percent });
+            void convexMutation("jobs:updateProgress", {
+              jobId: job.jobId,
+              expectedAttempt,
+              progress: line,
+              log,
+              stage,
+              percent,
+            });
           },
           mcpConfig,
-          async () => String((await convexQuery("jobs:executionState", { jobId: job.jobId })) ?? "running"),
+          async () => {
+            const state = await executionStatus();
+            return state === "superseded" ? "cancelled" : state;
+          },
         );
         const result = run.text;
+
+        const checkpointText =
+          `Attempt ${expectedAttempt} ${run.timedOut ? "reached its segment boundary" : run.stopped ? `was ${run.stopped}` : "ended before verification"}. ` +
+          `Continue the original task from this evidence:\n${result.slice(0, 5000)}`;
+        if (run.stopped) {
+          await stopIfLeaseLost(checkpointText, result, branch);
+          return;
+        }
+        if (await stopIfLeaseLost(checkpointText, result, branch)) return;
 
         let pushNote = "";
         let pushFailed = false;
@@ -710,6 +757,7 @@ export const agentRunner = schedules.task({
           if (!needsPush) {
             pushNote = remote ? `existing checkpoint branch ${branch} retained` : "no repository changes were needed";
           } else {
+            if (await stopIfLeaseLost(checkpointText, result, branch)) return;
             let push = await sh("git", ["-C", repoDir, "push", pushUrl, `HEAD:refs/heads/${branch}`], env);
             if (/shallow update not allowed/i.test(push.out)) {
               await sh("git", ["-C", repoDir, "fetch", "--unshallow"], env);
@@ -727,24 +775,15 @@ export const agentRunner = schedules.task({
           }
         }
 
-        const checkpointText =
+        const continuationCheckpoint =
           `Attempt ${job.attempt ?? 1} ${run.timedOut ? "reached its segment boundary" : run.stopped ? `was ${run.stopped}` : "ended before verification"}. ` +
           `${pushNote ? `${pushNote}. ` : ""}Continue the original task from this evidence:\n${result.slice(0, 5000)}`;
-        if (run.stopped) {
-          await convexMutation("jobs:checkpointAndRequeue", {
-            jobId: job.jobId,
-            checkpoint: checkpointText,
-            result: result.slice(0, 4000),
-            branch: branch ?? undefined,
-            nextStatus: run.stopped,
-          });
-          return;
-        }
         const failedRun = /^error:/i.test(result) || result === "(no output)";
         if ((run.timedOut || failedRun) && !cloneFailed && !pushFailed) {
           const continuation = await convexMutation("jobs:checkpointAndRequeue", {
             jobId: job.jobId,
-            checkpoint: checkpointText,
+            expectedAttempt,
+            checkpoint: continuationCheckpoint,
             result: result.slice(0, 4000),
             branch: branch ?? undefined,
             delayMs: run.timedOut ? 5_000 : failureBackoffMs(Number(job.attempt ?? 1)),
@@ -770,7 +809,13 @@ export const agentRunner = schedules.task({
 
         if (cloneFailed || pushFailed) {
           const failure = cloneFailed ? `Could not access ${repo || "the repository"}. ${result}` : `${pushNote}\n\n${result}`;
-          await convexMutation("jobs:finalize", { jobId: job.jobId, status: "error", result: failure.slice(0, 4000) });
+          const finalized = await convexMutation("jobs:finalize", {
+            jobId: job.jobId,
+            expectedAttempt,
+            status: "error",
+            result: failure.slice(0, 4000),
+          });
+          if (!finalized) return;
           if (job.incidentId)
             await convexMutation("incidents:setStatus", { id: job.incidentId, status: "open" }).catch(() => {});
           if (job.missionId) await maybeSynthesizeMission(job.missionId).catch(() => {});
@@ -784,6 +829,7 @@ export const agentRunner = schedules.task({
 
         await convexMutation("jobs:updateProgress", {
           jobId: job.jobId,
+          expectedAttempt,
           progress: "JARVIS is reviewing the evidence",
           stage: "supervisor review",
           percent: 92,
@@ -792,9 +838,50 @@ export const agentRunner = schedules.task({
           result.slice(-500),
         );
         const verify = await verifyWork(bin, env, job.task, result).catch(() => null);
-        if (verify?.verdict === "needs_input" && verify.answer) {
-          await convexMutation("jobs:checkpointAndRequeue", {
+        if (await stopIfLeaseLost(`Supervisor review interrupted.\n\n${continuationCheckpoint}`, result, branch)) return;
+        if (!verify) {
+          const continuation = await convexMutation("jobs:checkpointAndRequeue", {
             jobId: job.jobId,
+            expectedAttempt,
+            checkpoint:
+              `The specialist completed this evidence, but JARVIS's supervisor returned no valid verdict. ` +
+              `Re-check the definition of done and preserve the existing work:\n${result.slice(0, 5000)}`,
+            result: result.slice(0, 4000),
+            branch: branch ?? undefined,
+            delayMs: failureBackoffMs(expectedAttempt),
+          });
+          if (!job.missionId && continuation?.requeued)
+            await convexMutation("chatQueue:postAssistant", {
+              threadId: originThread,
+              text: `${profile.name} finished a pass, but my supervisor check was inconclusive. I saved everything and queued a fresh review instead of calling it verified.`,
+            }).catch(() => {});
+          else if (job.missionId && !continuation?.requeued)
+            await maybeSynthesizeMission(job.missionId).catch(() => {});
+          return;
+        }
+        if (verify.verdict === "concerns") {
+          const continuation = await convexMutation("jobs:checkpointAndRequeue", {
+            jobId: job.jobId,
+            expectedAttempt,
+            checkpoint:
+              `Previous work:\n${result.slice(0, 4200)}\n\nJARVIS supervisor concern: ${verify.note || "The definition of done is not yet evidenced."}\nAddress this concern, re-run the relevant verification, and finish honestly.`,
+            result: result.slice(0, 4000),
+            branch: branch ?? undefined,
+            delayMs: 5_000,
+          });
+          if (!job.missionId && continuation?.requeued)
+            await convexMutation("chatQueue:postAssistant", {
+              threadId: originThread,
+              text: `${profile.name} returned work, but my review found a concrete gap: ${verify.note} I sent the checkpoint back for correction.`,
+            }).catch(() => {});
+          else if (job.missionId && !continuation?.requeued)
+            await maybeSynthesizeMission(job.missionId).catch(() => {});
+          return;
+        }
+        if (verify?.verdict === "needs_input" && verify.answer) {
+          const continuation = await convexMutation("jobs:checkpointAndRequeue", {
+            jobId: job.jobId,
+            expectedAttempt,
             checkpoint:
               `Previous work:\n${result.slice(0, 4200)}\n\nThe specialist stopped on: ${verify.note}\nJARVIS's supervisor decision: ${verify.answer}\nContinue and finish; do not ask Daniel this ordinary implementation question again.`,
             result: result.slice(0, 4000),
@@ -806,12 +893,15 @@ export const agentRunner = schedules.task({
               threadId: originThread,
               text: `${profile.name} hit an implementation choice; I made the call and sent the checkpoint back to finish.`,
             }).catch(() => {});
+          else if (!continuation?.requeued)
+            await maybeSynthesizeMission(job.missionId).catch(() => {});
           return;
         }
         if (verify?.verdict === "needs_input" || needsDaniel) {
           const question = verify?.note || result.slice(-500).trim() || "A personal or consequential decision is required.";
           await convexMutation("jobs:requestInput", {
             jobId: job.jobId,
+            expectedAttempt,
             question,
             checkpoint: `Completed evidence:\n${result.slice(0, 4800)}\n\nWaiting on Daniel: ${question}`,
           });
@@ -825,6 +915,7 @@ export const agentRunner = schedules.task({
 
         let pullRequestUrl: string | null = null;
         if (changed && repo && branch && token) {
+          if (await stopIfLeaseLost(`Delivery interrupted.\n\n${continuationCheckpoint}`, result, branch)) return;
           pullRequestUrl = await openDraftPullRequest(
             repo,
             branch,
@@ -834,18 +925,24 @@ export const agentRunner = schedules.task({
           );
           await convexMutation("jobs:setDelivery", {
             jobId: job.jobId,
+            expectedAttempt,
             branch,
             pullRequestUrl: pullRequestUrl ?? undefined,
           }).catch(() => {});
           pushNote = pullRequestUrl ? `draft PR ready: ${pullRequestUrl}` : `${pushNote}; draft PR creation needs review`;
         }
         const deliveryResult = `${result}${pushNote ? `\n\nDelivery: ${pushNote}` : ""}`;
-        await convexMutation("jobs:finalize", {
+        if (await stopIfLeaseLost(`Finalization interrupted.\n\n${continuationCheckpoint}`, deliveryResult, branch)) return;
+        const finalized = await convexMutation("jobs:finalize", {
           jobId: job.jobId,
+          expectedAttempt,
           status: "done",
           result: deliveryResult.slice(0, 4000),
           pullRequestUrl: pullRequestUrl ?? undefined,
+          verificationVerdict: "pass",
+          verificationNote: verify.note || "Supervisor check passed",
         });
+        if (!finalized) return;
         if (job.incidentId)
           await convexMutation("incidents:setStatus", { id: job.incidentId, status: "resolved" }).catch(() => {});
 
@@ -863,8 +960,7 @@ export const agentRunner = schedules.task({
         let spoken =
           (await weaveLine(bin, env, job.task, deliveryResult)) ||
           `${profile.name} finished and JARVIS verified the evidence${pullRequestUrl ? "; a draft PR is ready for review" : ""}.`;
-        if (verify?.verdict === "concerns" && verify.note) spoken += ` One concern from review: ${verify.note}`;
-        else if (verify?.verdict === "pass") spoken += " Supervisor check passed.";
+        spoken += " Supervisor check passed.";
         const findingId = await convexMutation("findings:add", {
           source: job.task,
           spoken,
@@ -887,6 +983,7 @@ export const agentRunner = schedules.task({
         const message = String(e?.message ?? e);
         const recovered = await convexMutation("jobs:checkpointAndRequeue", {
           jobId: job.jobId,
+          expectedAttempt,
           checkpoint: `Runner exception on attempt ${job.attempt ?? 1}: ${message.slice(0, 1200)}. Retry from the original task with a different approach.`,
           result: message.slice(0, 4000),
           branch: job.branch ?? undefined,
@@ -894,6 +991,7 @@ export const agentRunner = schedules.task({
         }).catch(() => null);
         if (job.incidentId)
           await convexMutation("incidents:setStatus", { id: job.incidentId, status: "open" }).catch(() => {});
+        if (job.missionId && !recovered?.requeued) await maybeSynthesizeMission(job.missionId).catch(() => {});
         if (!job.missionId && !recovered?.requeued)
           await convexMutation("chatQueue:postAssistant", {
             threadId: originThread,

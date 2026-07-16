@@ -11,7 +11,7 @@ export type WorkRoute = {
 };
 
 const consequential =
-  /\b(send|publish|post publicly|book|buy|purchase|pay|transfer|trade|withdraw|delete production|drop (table|database)|rotate (key|secret)|message (a |the )?(customer|guest|tenant)|reply to (a |the )?(customer|guest|tenant)|deploy (to )?production)\b/i;
+  /\b(send|email|contact|publish|post|advertis(?:e|ing)|book|reserve|buy|purchase|order|pay|spend|transfer|trade|withdraw|refund|charge|merge|delete production|destroy|drop (?:table|database)|truncate|rotate (?:a )?(?:key|secret)|change (?:a )?(?:password|credential)|message (?:a |the )?(?:customer|guest|tenant)|reply to (?:a |the )?(?:customer|guest|tenant)|deploy (?:to )?production)\b/i;
 const engineering =
   /\b(code|repo|bug|fix|build|implement|refactor|migrat|database|api|deploy|typescript|react|next\.?js|convex|trigger|mastra|test|ci|architecture)\b/i;
 const operations = /\b(incident|monitor|health|uptime|failed job|stalled|latency|cost|credits|logs?|provider status|production issue)\b/i;
@@ -23,7 +23,7 @@ const trivial = /\b(status|list|locate|read|summari[sz]e|quick check|one[- ]line
 
 export function routeWork(task: string, options?: { repo?: string; requestedModel?: string; readonly?: boolean }): WorkRoute {
   const text = `${task} ${options?.repo ?? ""}`.trim();
-  const isConsequential = consequential.test(text);
+  const isConsequential = options?.readonly === true ? false : consequential.test(text);
   let agentId: AgentSlug = "atlas";
   if (travel.test(text)) agentId = "maya";
   else if (creative.test(text)) agentId = "iris";
@@ -57,4 +57,3 @@ export function suggestedAcceptanceCriteria(task: string, route: WorkRoute): str
   if (/deploy|production/i.test(task)) criteria.push("Do not call it live until the production alias is verified");
   return criteria;
 }
-

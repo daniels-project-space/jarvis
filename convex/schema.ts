@@ -61,8 +61,8 @@ export default defineSchema({
     updatedAt: v.number(),
   }).index("by_slug", ["slug"]),
 
-  // Background agent jobs: brain enqueues, agent-runner Trigger task executes
-  // (Claude Code / Opus, optional repo clone+push) and reports back into chat.
+  // Background agent jobs: the brain enqueues, Trigger executes the routed
+  // subscription agent in bounded segments, and JARVIS reviews the evidence.
   // Price watches — the cron re-prices and pings when a product drops.
   watches: defineTable({
     query: v.string(),
@@ -104,6 +104,7 @@ export default defineSchema({
     risk: v.optional(v.string()), // low | medium | high | consequential
     priority: v.optional(v.number()), // 0-100
     approvalRequired: v.optional(v.boolean()),
+    approvalReason: v.optional(v.string()),
     approvalStatus: v.optional(v.string()), // pending | approved | declined
     stage: v.optional(v.string()),
     percent: v.optional(v.number()),
@@ -118,6 +119,9 @@ export default defineSchema({
     modelReason: v.optional(v.string()),
     branch: v.optional(v.string()),
     pullRequestUrl: v.optional(v.string()),
+    verificationVerdict: v.optional(v.string()), // pass | unavailable
+    verificationNote: v.optional(v.string()),
+    verifiedAt: v.optional(v.number()),
     completedAt: v.optional(v.number()),
     startedAt: v.optional(v.number()),
     createdAt: v.number(),
