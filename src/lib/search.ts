@@ -416,12 +416,49 @@ export async function searchVideos(query: string): Promise<VideoResult[]> {
       .slice(0, 6);
   }
   const j = await serpapi({ engine: "youtube", search_query: query });
-  return (j?.video_results ?? []).slice(0, 6).map((v: any) => ({
+  const serped = (j?.video_results ?? []).slice(0, 6).map((v: any) => ({
     id: YT(v.link ?? ""),
     title: String(v.title ?? ""),
     channel: String(v.channel?.name ?? ""),
     length: String(v.length ?? ""),
   }));
+  if (serped.length) return serped;
+  // Last resort: keyless YouTube scrape. YouTube redirects datacenter IPs into a
+  // consent/"sorry" loop, so — exactly like ddgHtml for web — fetch the results
+  // page THROUGH Jina's reader (r.jina.ai reads from its own unblocked infra).
+  // x-return-format:html gives us the full page with ytInitialData to parse, so
+  // video search stays alive with no provider/quota at all.
+  return await ytJinaScrape(query);
+}
+
+async function ytJinaScrape(query: string): Promise<VideoResult[]> {
+  try {
+    const r = await fetch(`https://r.jina.ai/https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`, {
+      headers: { "user-agent": "Mozilla/5.0", "x-return-format": "html", "accept-language": "en" },
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!r.ok) return [];
+    const html = await r.text();
+    const m = html.match(/ytInitialData\s*=\s*(\{[\s\S]+?\});<\/script>/);
+    if (!m) return [];
+    const vids: VideoResult[] = [];
+    const walk = (o: any) => {
+      if (!o || typeof o !== "object" || vids.length >= 6) return;
+      if (o.videoRenderer?.videoId) {
+        const v = o.videoRenderer;
+        vids.push({
+          id: String(v.videoId),
+          title: String(v.title?.runs?.[0]?.text ?? ""),
+          channel: String(v.ownerText?.runs?.[0]?.text ?? ""),
+          length: String(v.lengthText?.simpleText ?? ""),
+        });
+      } else for (const k of Object.keys(o)) walk(o[k]);
+    };
+    walk(JSON.parse(m[1]));
+    return vids;
+  } catch {
+    return [];
+  }
 }
 
 // Which provider is live (for status/debug). Serper/SerpAPI are the keyed web
