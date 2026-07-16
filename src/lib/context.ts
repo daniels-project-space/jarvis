@@ -1,4 +1,5 @@
 import "server-only";
+import { currentAdminSession } from "./control-context";
 
 // Server-side context bundle for the brain: memory, business intel, hub
 // (to-dos/calendar/wealth), cloud stack, running agents, fresh findings.
@@ -6,6 +7,15 @@ import "server-only";
 
 const CONVEX_URL = process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
 const HUB_URL = "https://fantastic-roadrunner-485.convex.cloud";
+const ADMIN_CONTEXT_MUTATIONS = new Set([
+  "chatQueue:postCard",
+  "chatQueue:clearThread",
+  "ui:setActiveThread",
+  "ui:setAgentProvider",
+  "ui:setLocation",
+  "incidents:report",
+  "incidents:setStatus",
+]);
 
 async function q(base: string, path: string, args: unknown = {}): Promise<any> {
   try {
@@ -21,10 +31,14 @@ async function q(base: string, path: string, args: unknown = {}): Promise<any> {
 }
 
 export async function convexMutation(path: string, args: unknown): Promise<any> {
+  const authTokenHash = currentAdminSession();
+  const protectedArgs = ADMIN_CONTEXT_MUTATIONS.has(path) && authTokenHash
+    ? { ...((args ?? {}) as Record<string, unknown>), authTokenHash }
+    : args;
   const r = await fetch(`${CONVEX_URL}/api/mutation`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, args, format: "json" }),
+    body: JSON.stringify({ path, args: protectedArgs, format: "json" }),
   });
   const j = await r.json();
   if (j.status === "error") throw new Error(j.errorMessage ?? "convex mutation failed");
@@ -35,9 +49,9 @@ export const convexQuery = (path: string, args: unknown = {}) => q(CONVEX_URL, p
 
 // Self-healing hook: anything server-side that breaks files an incident; the
 // healer (agent-runner) turns open incidents into root-cause repair agents.
-export async function reportIncident(source: string, signature: string, message: string, app?: string) {
+export async function reportIncident(source: string, signature: string, message: string, app?: string, authTokenHash?: string) {
   try {
-    await convexMutation("incidents:report", { source, signature, message, app });
+    await convexMutation("incidents:report", { source, signature, message, app, authTokenHash });
   } catch {
     /* never let telemetry break the caller */
   }

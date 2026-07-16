@@ -5,6 +5,7 @@ import { buildContext, convexMutation, reportIncident } from "@/lib/context";
 import { extractMemory } from "@/lib/extract";
 import { TOOL_DEFS, executeTool } from "@/lib/tools";
 import { getSecret } from "@/lib/vault";
+import { adminSessionHash } from "@/lib/control-session";
 
 // The fast lane: every typed/spoken turn is answered here in seconds by a Groq
 // reflex model with the full tool belt, streaming into Convex (the UI is
@@ -120,6 +121,7 @@ async function runClaude(
   oaiMessages: any[],
   model: string,
   progress: { toolsRan: number },
+  authTokenHash: string | undefined,
   staticSys?: string,
   dynamicSys?: string,
 ): Promise<{ final: string; used: string[]; screenTouched: boolean }> {
@@ -181,7 +183,7 @@ async function runClaude(
       for (const tu of toolUses) {
         used.push(tu.name);
         progress.toolsRan++;
-        const result = await executeTool(tu.name, tu.input ?? {}).catch((e) => `Tool error: ${e?.message ?? e}`);
+        const result = await executeTool(tu.name, tu.input ?? {}, authTokenHash).catch((e) => `Tool error: ${e?.message ?? e}`);
         if (SCREEN_TOOLS.has(tu.name) && !/^Tool (error|failed)/i.test(result)) screenTouched = true;
         results.push({ type: "tool_result", tool_use_id: tu.id, content: result.slice(0, 12000) });
       }
@@ -209,6 +211,7 @@ async function runClaude(
 }
 
 export async function POST(req: NextRequest) {
+  const authTokenHash = (await adminSessionHash(req)) ?? undefined;
   let text = "",
     threadId = "main";
   try {
@@ -224,7 +227,7 @@ export async function POST(req: NextRequest) {
   if (!key) return Response.json({ error: "no groq key" }, { status: 500 });
 
   const [{ assistantId, userId, history }, ctx] = await Promise.all([
-    convexMutation("chatQueue:openTurn", { threadId, userText: text }),
+    convexMutation("chatQueue:openTurn", { threadId, userText: text, authTokenHash }),
     buildContext(text),
   ]);
 
@@ -279,7 +282,7 @@ export async function POST(req: NextRequest) {
     if (anthKey && (complex || veryComplex)) {
       const claudeModel = veryComplex ? "claude-opus-4-8" : "claude-sonnet-5";
       try {
-        const r = await runClaude(anthKey, messages, claudeModel, claudeProgress, staticSys, dynamicSys);
+        const r = await runClaude(anthKey, messages, claudeModel, claudeProgress, authTokenHash, staticSys, dynamicSys);
         final = r.final;
         used.push(...r.used);
         screenTouched = r.screenTouched;
@@ -327,7 +330,7 @@ export async function POST(req: NextRequest) {
             /* leave empty */
           }
           used.push(tc.function.name);
-          const result = await executeTool(tc.function.name, args).catch((e) => `Tool error: ${e?.message ?? e}`);
+          const result = await executeTool(tc.function.name, args, authTokenHash).catch((e) => `Tool error: ${e?.message ?? e}`);
           if (SCREEN_TOOLS.has(tc.function.name) && !/^Tool (error|failed)/i.test(result)) screenTouched = true;
           messages.push({ role: "tool", tool_call_id: tc.id, content: result.slice(0, 12000) });
         }
@@ -369,6 +372,7 @@ export async function POST(req: NextRequest) {
     if (!final) final = "Sorry — lost my train of thought there. Say that again?";
 
     await convexMutation("chatQueue:finalize", {
+      authTokenHash,
       messageId: assistantId,
       threadId,
       status: "done",
@@ -383,7 +387,7 @@ export async function POST(req: NextRequest) {
     await extractMemory(key, text, final).catch(() => 0);
     return Response.json({ ok: true, text: final, tools: used });
   } catch (e: any) {
-    await reportIncident("api/chat", `chat:${String(e?.message ?? e).slice(0, 80)}`, String(e?.message ?? e));
+    await reportIncident("api/chat", `chat:${String(e?.message ?? e).slice(0, 80)}`, String(e?.message ?? e), undefined, authTokenHash);
     if (delivered) {
       // The answer already landed — swallow the housekeeping error entirely.
       return Response.json({ ok: true });
@@ -392,12 +396,13 @@ export async function POST(req: NextRequest) {
     // assistant row and flip the ORIGINAL user row back to pending (re-inserting
     // the text made Daniel's message appear twice and got him two answers).
     await convexMutation("chatQueue:finalize", {
+      authTokenHash,
       messageId: assistantId,
       threadId,
       status: "error",
       finalText: "",
     }).catch(() => {});
-    if (userId) await convexMutation("chatQueue:requeueUser", { userId }).catch(() => {});
+    if (userId) await convexMutation("chatQueue:requeueUser", { userId, authTokenHash }).catch(() => {});
     return Response.json({ ok: false, fallback: true, error: String(e?.message ?? e) }, { status: 200 });
   }
 }

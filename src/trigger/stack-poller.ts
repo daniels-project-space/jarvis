@@ -11,10 +11,16 @@ const VAULT_URL = process.env.VAULT_URL ?? "https://fantastic-roadrunner-485.con
 const VERCEL_TEAM = "team_VY2PwHgXLV9Bo0vs2iXdnGxw";
 
 async function convexMutation(path: string, args: unknown) {
+  const workerToken = process.env.JARVIS_WORKER_TOKEN;
+  const protectedPath = path === "chatQueue:postAssistant" || path === "incidents:report";
+  if (protectedPath && !workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
+  const protectedArgs = protectedPath
+    ? { ...((args ?? {}) as Record<string, unknown>), workerToken }
+    : args;
   await fetch(`${CONVEX_URL}/api/mutation`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, args, format: "json" }),
+    body: JSON.stringify({ path, args: protectedArgs, format: "json" }),
   }).catch(() => {});
 }
 async function convexQuery(path: string, args: unknown) {

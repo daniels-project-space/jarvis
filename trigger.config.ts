@@ -19,8 +19,12 @@ export default defineConfig({
       additionalPackages({ packages: ["@anthropic-ai/claude-code@2.1.211", "@openai/codex@0.144.5"] }),
       aptGet({ packages: ["git", "ca-certificates"] }),
       syncEnvVars(() => {
-        const value = process.env.CODEX_AUTH_JSON_B64;
-        return value ? { CODEX_AUTH_JSON_B64: value } : undefined;
+        const values = Object.fromEntries(
+          ["CODEX_AUTH_JSON_B64", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN"]
+            .map((key) => [key, process.env[key]])
+            .filter((entry): entry is [string, string] => Boolean(entry[1])),
+        );
+        return Object.keys(values).length ? values : undefined;
       }),
     ],
   },

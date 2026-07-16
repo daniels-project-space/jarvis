@@ -1,5 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { requireAdmin } from "./controlAuth";
 
 export const pending = query({
   args: {},
@@ -12,8 +13,13 @@ export const pending = query({
 });
 
 export const decide = mutation({
-  args: { jobId: v.string(), decision: v.union(v.literal("approved"), v.literal("declined")) },
+  args: {
+    jobId: v.string(),
+    decision: v.union(v.literal("approved"), v.literal("declined")),
+    authTokenHash: v.optional(v.string()),
+  },
   handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
     const approvals = await ctx.db
       .query("approvals")
       .withIndex("by_job", (q: any) => q.eq("jobId", a.jobId))

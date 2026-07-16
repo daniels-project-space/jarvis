@@ -1,5 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { requireActor, requireDispatcher, requireWorker } from "./controlAuth";
 
 // Self-healing incident ledger. report() dedups by signature (48h window):
 // an existing open/dispatched incident just bumps count; a recently-resolved
@@ -14,8 +15,12 @@ export const report = mutation({
     signature: v.string(),
     message: v.string(),
     app: v.optional(v.string()),
+    authTokenHash: v.optional(v.string()),
+    dispatchToken: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
+    await requireDispatcher(ctx, a);
     const sig = a.signature.slice(0, 200);
     const existing = await ctx.db
       .query("incidents")
@@ -53,8 +58,9 @@ export const report = mutation({
 // Healer claim: open incidents become dispatched (attempts+1); ones that
 // already burned their attempts escalate to needs-daniel instead.
 export const claimForRepair = mutation({
-  args: { limit: v.optional(v.number()), maxAttempts: v.optional(v.number()) },
+  args: { limit: v.optional(v.number()), maxAttempts: v.optional(v.number()), workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
     const open = await ctx.db
       .query("incidents")
       .withIndex("by_status", (q: any) => q.eq("status", "open"))
@@ -85,8 +91,14 @@ export const claimForRepair = mutation({
 });
 
 export const setStatus = mutation({
-  args: { id: v.id("incidents"), status: v.string() },
+  args: {
+    id: v.id("incidents"),
+    status: v.string(),
+    authTokenHash: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     await ctx.db.patch(a.id, { status: a.status, updatedAt: Date.now() });
   },
 });

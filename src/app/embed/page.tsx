@@ -41,7 +41,12 @@ export default function Embed() {
   useEffect(() => {
     voiceRowRef.current = voiceRow ?? null;
   }, [voiceRow]);
-  const logTurn = useMutation(api.chatQueue.logTurn);
+  const logTurn = (args: { role: string; text: string; model?: string }) =>
+    fetch("/api/client-state", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "log_turn", ...args }),
+    });
   const liveOnRow = useQuery(api.ui.getLiveOn, {}) as { value: string; updatedAt: number } | null | undefined;
   const liveOnRef = useRef<typeof liveOnRow>(null);
   useEffect(() => {

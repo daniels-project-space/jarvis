@@ -12,6 +12,21 @@
 const BASE = process.env.BASE ?? "https://jarvis-orcin-six.vercel.app";
 const CV = (process.env.CONVEX ?? "https://tangible-goose-318.convex.cloud") + "/api";
 const THREAD = "smoke";
+const ADMIN_PASSWORD = process.env.JARVIS_ADMIN_PASSWORD ?? "";
+const DISPATCH_TOKEN = process.env.JARVIS_DISPATCH_TOKEN ?? "";
+let COOKIE = "";
+
+async function authenticate() {
+  if (!ADMIN_PASSWORD) throw new Error("JARVIS_ADMIN_PASSWORD is required for production smoke tests");
+  const response = await fetch(`${BASE}/api/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ password: ADMIN_PASSWORD }),
+  });
+  const setCookie = response.headers.get("set-cookie") ?? "";
+  COOKIE = setCookie.split(";")[0];
+  if (!response.ok || !COOKIE) throw new Error(`JARVIS authentication failed (${response.status})`);
+}
 
 const results = [];
 // External-quota / rate-limit failures are billing, not bugs — mark SKIP so
@@ -51,7 +66,7 @@ async function cv(kind, path, args) {
 async function chat(text) {
   const r = await fetch(`${BASE}/api/chat`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", cookie: COOKIE },
     body: JSON.stringify({ text, threadId: THREAD }),
     signal: AbortSignal.timeout(115_000),
   });
@@ -60,12 +75,14 @@ async function chat(text) {
 async function tool(name, args) {
   const r = await fetch(`${BASE}/api/tools`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", cookie: COOKIE },
     body: JSON.stringify({ name, args }),
     signal: AbortSignal.timeout(115_000),
   });
   return String((await r.json()).result ?? "");
 }
+
+await authenticate();
 
 // ---------------------------------------------------------------------------
 await test("chat answers, clean text", async () => {
@@ -163,7 +180,7 @@ await test("realtime token mints (or is legitimately locked)", async () => {
     if (attempt) await new Promise((res) => setTimeout(res, 1500));
     const r = await fetch(`${BASE}/api/realtime-token`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", cookie: COOKIE },
       body: JSON.stringify({ client: "smoke" }),
     });
     const j = await r.json().catch(() => ({}));
@@ -198,7 +215,7 @@ await test("price watch registers", async () => {
 });
 
 await test("a search provider is configured", async () => {
-  const r = await fetch(`${BASE}/api/search-status`);
+  const r = await fetch(`${BASE}/api/search-status`, { headers: { cookie: COOKIE } });
   const { provider } = await r.json();
   console.log(`      search provider: ${provider}`);
   // serper/serpapi are the keyed web providers; kelkoo/ebay are the keyless
@@ -220,7 +237,11 @@ await test("hide tool clears the panel", async () => {
 
 // ---------------------------------------------------------------------------
 // cleanup + report
-await cv("mutation", "chatQueue:clearThread", { threadId: THREAD }).catch(() => {});
+await fetch(`${BASE}/api/client-state`, {
+  method: "POST",
+  headers: { "content-type": "application/json", cookie: COOKIE },
+  body: JSON.stringify({ action: "clear_thread", threadId: THREAD }),
+}).catch(() => {});
 await cv("mutation", "ui:clearPanel", {}).catch(() => {});
 
 const failed = results.filter((r) => !r.ok);
@@ -233,7 +254,12 @@ if (failed.length) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       path: "incidents:report",
-      args: { source: "smoke-test", signature: `smoke:${failed.map((f) => f.name).join(",").slice(0, 60)}`, message: msg },
+      args: {
+        source: "smoke-test",
+        signature: `smoke:${failed.map((f) => f.name).join(",").slice(0, 60)}`,
+        message: msg,
+        dispatchToken: DISPATCH_TOKEN,
+      },
       format: "json",
     }),
   }).catch(() => {});

@@ -1,5 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { requireAdmin } from "./controlAuth";
 
 export const setPanel = mutation({
   args: { type: v.string(), value: v.string(), title: v.optional(v.string()) },
@@ -27,8 +28,9 @@ export const getPanel = query({
 // Global subscription agent selection. Trigger jobs read this before claiming
 // work, so the choice follows Daniel across devices and affects every runner.
 export const setAgentProvider = mutation({
-  args: { provider: v.union(v.literal("codex"), v.literal("claude")) },
+  args: { provider: v.union(v.literal("codex"), v.literal("claude")), authTokenHash: v.optional(v.string()) },
   handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "agentProvider")).first();
     const doc = { key: "agentProvider", type: "provider", value: a.provider, updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
@@ -171,8 +173,9 @@ export const getMood = query({
 // Daniel's current location (granted once, persisted) — so "near me" / place
 // lookups work in both lanes and the brain knows where he is.
 export const setLocation = mutation({
-  args: { lat: v.number(), lng: v.number(), label: v.optional(v.string()) },
+  args: { lat: v.number(), lng: v.number(), label: v.optional(v.string()), authTokenHash: v.optional(v.string()) },
   handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "location")).first();
     const doc = { key: "location", type: "location", value: `${a.lat},${a.lng}`, title: a.label, updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
@@ -187,8 +190,9 @@ export const getLocation = query({
 // Chats: one active thread (UI + brain + agent weaves all follow it) plus a
 // small registry so Daniel can hop back to earlier conversations.
 export const setActiveThread = mutation({
-  args: { thread: v.string(), title: v.optional(v.string()) },
+  args: { thread: v.string(), title: v.optional(v.string()), authTokenHash: v.optional(v.string()) },
   handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
     const cur = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "activeThread")).first();
     const doc = { key: "activeThread", type: "thread", value: a.thread, updatedAt: Date.now() };
     if (cur) await ctx.db.patch(cur._id, doc);
@@ -218,8 +222,9 @@ export const getActiveThread = query({
 
 // Housekeeping: drop dead threads from the registry (test/empty chats).
 export const pruneThreads = mutation({
-  args: { ids: v.array(v.string()) },
+  args: { ids: v.array(v.string()), authTokenHash: v.optional(v.string()) },
   handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
     const reg = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "threads")).first();
     if (!reg) return 0;
     let list: { id: string }[] = [];

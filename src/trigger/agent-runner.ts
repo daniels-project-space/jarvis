@@ -20,6 +20,25 @@ import {
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
 
+const WORKER_MUTATIONS = new Set([
+  "jobs:enqueue",
+  "jobs:claimNext",
+  "jobs:finalize",
+  "jobs:reapStale",
+  "jobs:updateProgress",
+  "jobs:checkpointAndRequeue",
+  "jobs:requestInput",
+  "jobs:setDelivery",
+  "missions:checkComplete",
+  "missions:claimReady",
+  "missions:finish",
+  "chatQueue:reapStuck",
+  "chatQueue:postAssistant",
+  "chatQueue:postCard",
+  "incidents:claimForRepair",
+  "incidents:setStatus",
+]);
+
 function promptArgs(env: NodeJS.ProcessEnv, prompt: string, tier: string, json = false, mcpConfig?: string | null): string[] {
   if (env.JARVIS_AGENT_PROVIDER !== "codex") {
     const args = ["-p", prompt, "--model", tier, "--dangerously-skip-permissions"];
@@ -54,15 +73,21 @@ function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, tier: 
   });
 }
 async function convexMutation(path: string, args: unknown) {
-  return (
-    await (
-      await fetch(`${CONVEX_URL}/api/mutation`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ path, args, format: "json" }),
-      })
-    ).json()
-  ).value;
+  const workerToken = process.env.JARVIS_WORKER_TOKEN;
+  if (WORKER_MUTATIONS.has(path) && !workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
+  const protectedArgs = WORKER_MUTATIONS.has(path)
+    ? { ...((args ?? {}) as Record<string, unknown>), workerToken }
+    : args;
+  const response = await fetch(`${CONVEX_URL}/api/mutation`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, args: protectedArgs, format: "json" }),
+  });
+  const payload = await response.json();
+  if (!response.ok || payload?.status === "error") {
+    throw new Error(`Convex mutation ${path} failed: ${String(payload?.errorMessage ?? response.status).slice(0, 400)}`);
+  }
+  return payload.value;
 }
 async function convexQuery(path: string, args: unknown) {
   try {
@@ -1023,7 +1048,13 @@ export const agentRunner = schedules.task({
       const report = merged.text && !/^error:/.test(merged.text) && merged.text !== "(no output)"
         ? merged.text
         : `## Mission\n${synth.goal}\n\n${body.slice(0, 6000)}`;
-      await convexMutation("missions:finish", { id: missionId, summary: report.slice(0, 4000), failed: failedAll });
+      const finished = await convexMutation("missions:finish", {
+        id: missionId,
+        summary: report.slice(0, 4000),
+        failed: failedAll,
+        expectedSynthesisAttempt: Number(synth.synthesisAttempt),
+      });
+      if (!finished) return;
       const thread = typeof synth.originThreadId === "string" && synth.originThreadId ? synth.originThreadId : "main";
       const spoken =
         (await weaveLine(bin, env, `MISSION: ${synth.goal}`, report)) ||

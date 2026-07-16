@@ -30,12 +30,18 @@ const CONVEX_URL =
 const RUN_BUDGET_MS = 50_000;
 const POLL_MS = 2000;
 const IDLE_EXITS = 3;
+const WORKER_MUTATIONS = new Set(["chatQueue:claimNext", "chatQueue:appendChunk", "chatQueue:finalize"]);
 
 async function convexMutation(path: string, args: unknown) {
+  const workerToken = process.env.JARVIS_WORKER_TOKEN;
+  if (WORKER_MUTATIONS.has(path) && !workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
+  const protectedArgs = WORKER_MUTATIONS.has(path)
+    ? { ...((args ?? {}) as Record<string, unknown>), workerToken }
+    : args;
   const r = await fetch(`${CONVEX_URL}/api/mutation`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, args, format: "json" }),
+    body: JSON.stringify({ path, args: protectedArgs, format: "json" }),
   });
   return (await r.json()).value;
 }
@@ -108,7 +114,7 @@ function runTurn(
     `To DISPATCH a background agent (ONLY when Daniel asks you to run/build/action/fix something in the ` +
     `background or on a repo), run this bash, then tell him it's dispatched and you'll report back when done: ` +
     `curl -s -X POST '${CONVEX_URL}/api/mutation' -H 'content-type: application/json' ` +
-    `-d '{"path":"jobs:enqueue","args":{"task":"<clear, self-contained task>","repo":"<owner/repo or omit>","readonly":<true for research/analysis; false for isolated repo work>,"risk":"<low|medium|high|consequential>","approvalRequired":<true for any external/financial/production/destructive action>,"model":"<haiku|sonnet|opus>"}}'. ` +
+    `-d '{"path":"jobs:enqueue","args":{"task":"<clear, self-contained task>","repo":"<owner/repo or omit>","readonly":<true for research/analysis; false for isolated repo work>,"risk":"<low|medium|high|consequential>","approvalRequired":<true for any external/financial/production/destructive action>,"model":"<haiku|sonnet|opus>","dispatchToken":"'"$JARVIS_DISPATCH_TOKEN"'"}}'. ` +
     `Choose model by difficulty: opus for architecture/multi-file/debugging, sonnet for normal edits, haiku for trivial lookups. ` +
     `Publishing, messaging, booking, money, production deployment, merging and destructive actions MUST be marked consequential and approvalRequired=true; approval only queues the scoped job and is never permission to broaden it. Convex independently enforces this policy.\n` +
     `To SHOW Daniel something on screen (pull up a website, open a document/notes, display an image) when he ` +

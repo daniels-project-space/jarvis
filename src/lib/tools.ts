@@ -3,6 +3,7 @@ import { convexMutation, convexQuery } from "./context";
 import { getSecret, getServiceSecrets } from "./vault";
 import { r2Put, r2StoreFromUrl } from "./r2";
 import type { ManagedMission } from "../mastra/supervisor";
+import { withAdminSession } from "./control-context";
 
 // JARVIS's tool belt — one definition list (OpenAI function schema) executed
 // server-side by /api/chat (Groq loop) and /api/tools (realtime client bridge).
@@ -2701,8 +2702,9 @@ async function activeThread(): Promise<string> {
   return typeof t === "string" && t ? t : "main";
 }
 
-export async function executeTool(name: string, args: any): Promise<string> {
-  switch (name) {
+export async function executeTool(name: string, args: any, authTokenHash?: string): Promise<string> {
+  return await withAdminSession(authTokenHash, async () => {
+    switch (name) {
     case "dispatch_agent": {
       const task = String(args.task ?? "").trim().slice(0, 6000);
       if (!task) return "Give me the outcome you want the team to own.";
@@ -2725,6 +2727,7 @@ export async function executeTool(name: string, args: any): Promise<string> {
         ? args.acceptance_criteria.map(String).slice(0, 8)
         : suggestedAcceptanceCriteria(task, route);
       const jobId = await convexMutation("jobs:enqueue", {
+        authTokenHash,
         task,
         repo,
         readonly: route.readonly,
@@ -2776,6 +2779,7 @@ export async function executeTool(name: string, args: any): Promise<string> {
         "low" as keyof typeof riskOrder,
       );
       const missionId = await convexMutation("missions:create", {
+        authTokenHash,
         goal: mission,
         agentCount: plan.workstreams.length,
         originThreadId,
@@ -2788,6 +2792,7 @@ export async function executeTool(name: string, args: any): Promise<string> {
         const suppliedAgent = supplied.find((candidate: any) => String(candidate.task) === a.task);
         const scaffold = TASK_TEMPLATES[String(suppliedAgent?.template ?? "")] ?? "";
         await convexMutation("jobs:enqueue", {
+          authTokenHash,
           task: `${a.task}${scaffold}\n\nYou are ${a.agentId}, one permanent specialist on a ${plan.workstreams.length}-workstream mission: "${mission}". Own only this workstream, preserve the mission context, checkpoint useful progress, and stop only when the acceptance criteria are evidenced.`,
           repo: a.repo ?? undefined,
           readonly: a.readonly,
@@ -2813,6 +2818,7 @@ export async function executeTool(name: string, args: any): Promise<string> {
       if (!jobId) return "Choose a job from the command deck first.";
       if (action === "approve" || action === "decline") {
         const ok = await convexMutation("approvals:decide", {
+          authTokenHash,
           jobId,
           decision: action === "approve" ? "approved" : "declined",
         });
@@ -2825,10 +2831,10 @@ export async function executeTool(name: string, args: any): Promise<string> {
       if (action === "answer") {
         const answer = String(args.input ?? "").trim();
         if (!answer) return "Tell me the decision or missing information you want passed back to the agent.";
-        const ok = await convexMutation("jobs:provideInput", { jobId, answer });
+        const ok = await convexMutation("jobs:provideInput", { jobId, answer, authTokenHash });
         return ok ? "Passed that decision back to the specialist; the continuation is queued." : "That job is not waiting for input now.";
       }
-      const ok = await convexMutation("jobs:control", { jobId, action });
+      const ok = await convexMutation("jobs:control", { jobId, action, authTokenHash });
       return ok ? `Job ${jobId} ${action} request applied.` : `That job cannot be ${action}d from its current state.`;
     }
     case "creative_sprint": {
@@ -2857,7 +2863,7 @@ export async function executeTool(name: string, args: any): Promise<string> {
             acceptance_criteria: ["Production-ready visual specification", "Editable construction steps and exact generation/drawing prompts"],
           },
         ],
-      });
+      }, authTokenHash);
     }
     case "show": {
       let { kind, value, title } = args as { kind?: string; value: string; title?: string };
@@ -3108,6 +3114,7 @@ export async function executeTool(name: string, args: any): Promise<string> {
       // Dispatch immediately — don't wait for the healer sweep.
       await convexMutation("incidents:setStatus", { id: incidentId, status: "dispatched" }).catch(() => {});
       await convexMutation("jobs:enqueue", {
+        authTokenHash,
         task:
           `SELF-REPAIR: trace the ROOT CAUSE and fix it — never paper over symptoms. Daniel reports: ${problem}\n` +
           `Method: 1) REPRODUCE (hit live endpoints, read the failing path). 2) Trace to the underlying cause. ` +
@@ -3135,6 +3142,7 @@ export async function executeTool(name: string, args: any): Promise<string> {
       const request = String(args.request ?? "").slice(0, 1500);
       if (!request) return "Tell me what ability to build first.";
       await convexMutation("jobs:enqueue", {
+        authTokenHash,
         task: `${SELF_IMPROVE_RULES}\n\nThe upgrade Daniel wants: ${request}`,
         repo: "jarvis",
         model: "opus",
@@ -3218,5 +3226,6 @@ export async function executeTool(name: string, args: any): Promise<string> {
     }
     default:
       return `Unknown tool ${name}.`;
-  }
+    }
+  });
 }

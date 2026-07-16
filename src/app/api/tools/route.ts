@@ -1,5 +1,6 @@
 import type { NextRequest } from "next/server";
 import { reportIncident } from "@/lib/context";
+import { adminSessionHash } from "@/lib/control-session";
 import { TOOL_DEFS, executeTool } from "@/lib/tools";
 
 // The realtime client fetches tool definitions here to register them on the
@@ -61,13 +62,14 @@ export const maxDuration = 120; // market_analysis / trip scouts can run 60-90s
 
 export async function POST(req: NextRequest) {
   let toolName = "unknown";
+  const authTokenHash = (await adminSessionHash(req)) ?? undefined;
   try {
     const { name, args } = await req.json();
     toolName = String(name);
-    const result = await executeTool(toolName, args ?? {});
+    const result = await executeTool(toolName, args ?? {}, authTokenHash);
     return Response.json({ result });
   } catch (e: any) {
-    await reportIncident("api/tools", `tool:${toolName}:${String(e?.message ?? e).slice(0, 60)}`, `Tool ${toolName} crashed: ${e?.message ?? e}`);
+    await reportIncident("api/tools", `tool:${toolName}:${String(e?.message ?? e).slice(0, 60)}`, `Tool ${toolName} crashed: ${e?.message ?? e}`, undefined, authTokenHash);
     return Response.json({ result: `Tool failed: ${e?.message ?? e}` }, { status: 200 });
   }
 }

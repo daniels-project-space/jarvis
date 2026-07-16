@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery } from "convex/react";
+import { useQuery } from "convex/react";
 import { api } from "../../convex/_generated/api";
 
 type CommandDeckProps = {
@@ -46,8 +46,6 @@ function Dot({ tone = "cyan", pulse = false }: { tone?: "cyan" | "amber" | "red"
 
 export default function CommandDeck({ busy, selectedJobId, onSelectJob }: CommandDeckProps) {
   const snapshot = useQuery(api.commandCenter.snapshot, {}) as any;
-  const decide = useMutation(api.approvals.decide);
-  const control = useMutation(api.jobs.control);
   const [collapsed, setCollapsed] = useState(false);
   const [acting, setActing] = useState("");
   useEffect(() => {
@@ -77,7 +75,11 @@ export default function CommandDeck({ busy, selectedJobId, onSelectJob }: Comman
   const decideJob = async (jobId: string, decision: "approved" | "declined") => {
     setActing(`${jobId}:${decision}`);
     try {
-      await decide({ jobId, decision });
+      await fetch("/api/work-control", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jobId, action: decision === "approved" ? "approve" : "decline" }),
+      });
     } finally {
       setActing("");
     }
@@ -86,7 +88,11 @@ export default function CommandDeck({ busy, selectedJobId, onSelectJob }: Comman
   const controlJob = async (jobId: any, action: "pause" | "resume" | "cancel" | "retry") => {
     setActing(`${jobId}:${action}`);
     try {
-      await control({ jobId, action });
+      await fetch("/api/work-control", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jobId: String(jobId), action }),
+      });
     } finally {
       setActing("");
     }

@@ -310,6 +310,17 @@ function OptionsPanel({
               <span className={`block h-4 w-4 rounded-full bg-white transition-transform ${prefs.reduceMotion ? "translate-x-4" : ""}`} />
             </button>
           </Row>
+          <Row label="Private access" hint="revoke this browser's admin session">
+            <button
+              onClick={async () => {
+                await fetch("/api/auth/logout", { method: "POST" }).catch(() => null);
+                window.location.assign("/login");
+              }}
+              className="rounded-lg border border-white/10 px-3 py-1 text-[11px] text-slate transition hover:border-amber/40 hover:text-amber"
+            >
+              sign out
+            </button>
+          </Row>
           <div className="py-2.5">
             <div className="mb-2 flex items-center justify-between">
               <span className="text-[13px] text-ice">Orb mood</span>
@@ -985,8 +996,18 @@ function SpokenCaption({ caption }: { caption: { who: "you" | "jarvis"; text: st
 export default function JarvisUI() {
   const thread = (useQuery(api.ui.getActiveThread, {}) ?? "main") as string;
   const threads = (useQuery(api.ui.getThreads, {}) ?? []) as { id: string; title: string; at: number }[];
-  const setActiveThread = useMutation(api.ui.setActiveThread);
-  const clearThread = useMutation(api.chatQueue.clearThread);
+  const setActiveThread = (args: { thread: string; title?: string }) =>
+    fetch("/api/client-state", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "set_active_thread", ...args }),
+    });
+  const clearThread = (args: { threadId?: string }) =>
+    fetch("/api/client-state", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "clear_thread", ...args }),
+    });
   const threadRef = useRef("main");
   useEffect(() => {
     threadRef.current = thread;
@@ -1000,7 +1021,12 @@ export default function JarvisUI() {
   const stagePanelSize = useMemo(() => (panel ? panelSize(panel) : ""), [panel]);
   const clearPanel = useMutation(api.ui.clearPanel);
   const setPanel = useMutation(api.ui.setPanel);
-  const logTurn = useMutation(api.chatQueue.logTurn);
+  const logTurn = (args: { threadId?: string; role: string; text: string; model?: string }) =>
+    fetch("/api/client-state", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "log_turn", ...args }),
+    });
   const saveSub = useMutation(api.push.saveSub);
   const claimVoice = useMutation(api.ui.claimVoice);
   const electVoice = useMutation(api.ui.electVoice);
@@ -1172,7 +1198,12 @@ export default function JarvisUI() {
   const [optionsOpen, setOptionsOpen] = useState(false);
   const setMoodMut = useMutation(api.ui.setMood);
   const agentProvider = (useQuery(api.ui.getAgentProvider, {}) ?? "codex") as "codex" | "claude";
-  const setAgentProvider = useMutation(api.ui.setAgentProvider);
+  const setAgentProvider = (args: { provider: "codex" | "claude" }) =>
+    fetch("/api/client-state", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "set_agent_provider", ...args }),
+    });
   const [prefs, setPrefs] = useState({ voice: "free", tts: "free", reduceMotion: false });
   useEffect(() => {
     // one-time revert: the browser "fast" voice was a regression Daniel hated —
@@ -1196,7 +1227,12 @@ export default function JarvisUI() {
 
   // Location: granted once, then permanent (browser remembers the permission,
   // and we refresh the stored coords on load so "near me" works in both lanes).
-  const setLocationMut = useMutation(api.ui.setLocation);
+  const setLocationMut = (args: { lat: number; lng: number; label?: string }) =>
+    fetch("/api/client-state", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "set_location", ...args }),
+    });
   const [locOn, setLocOn] = useState(false);
   const captureLocation = (announce = false): Promise<boolean> =>
     new Promise((resolve) => {

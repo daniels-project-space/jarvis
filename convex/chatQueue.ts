@@ -1,9 +1,11 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { requireActor, requireAdmin, requireWorker } from "./controlAuth";
 
 // Cloud chat transport for the subscription brain. UI calls sendMessage +
 // subscribes to listMessages; the Trigger dispatcher calls claimNext /
-// appendChunk / finalize over the HTTP API. Public (personal, single-user).
+// appendChunk / finalize over the HTTP API. Daniel and Trigger authenticate
+// through separate capabilities; no public caller can manufacture work/history.
 
 async function ensureSession(ctx: { db: any }, threadId: string) {
   const existing = await ctx.db
@@ -20,8 +22,9 @@ async function ensureSession(ctx: { db: any }, threadId: string) {
 }
 
 export const sendMessage = mutation({
-  args: { threadId: v.optional(v.string()), text: v.string() },
+  args: { threadId: v.optional(v.string()), text: v.string(), authTokenHash: v.optional(v.string()) },
   handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
     const threadId = a.threadId ?? "main";
     await ensureSession(ctx, threadId);
     return await ctx.db.insert("chatMessages", {
@@ -61,8 +64,9 @@ export const sessionState = query({
 // itself, so the user row is inserted already-done (the cron dispatcher only
 // claims "pending" rows) and a streaming assistant row is opened for it.
 export const openTurn = mutation({
-  args: { threadId: v.optional(v.string()), userText: v.string() },
+  args: { threadId: v.optional(v.string()), userText: v.string(), authTokenHash: v.optional(v.string()) },
   handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
     const threadId = a.threadId ?? "main";
     await ensureSession(ctx, threadId);
     const all = await ctx.db
@@ -100,8 +104,9 @@ export const openTurn = mutation({
 // cron dispatcher answers it. Re-inserting the text (the old fallback) showed
 // Daniel his own message twice — this keeps exactly one user bubble.
 export const requeueUser = mutation({
-  args: { userId: v.id("chatMessages") },
+  args: { userId: v.id("chatMessages"), authTokenHash: v.optional(v.string()) },
   handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
     const m = await ctx.db.get(a.userId);
     if (!m || m.role !== "user") return;
     // Already answered (finalize applied but its response got lost in transit)?
@@ -120,8 +125,9 @@ export const requeueUser = mutation({
 // Assistant rows stuck "streaming" (a route killed mid-run) freeze the UI's
 // busy state forever. Sweep them into hidden error rows.
 export const reapStuck = mutation({
-  args: {},
-  handler: async (ctx) => {
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
     const rows = await ctx.db
       .query("chatMessages")
       .withIndex("by_status", (q: any) => q.eq("status", "streaming"))
@@ -140,8 +146,15 @@ export const reapStuck = mutation({
 
 // Mirror a finished live-voice exchange into history (both sides already spoken).
 export const logTurn = mutation({
-  args: { threadId: v.optional(v.string()), role: v.string(), text: v.string(), model: v.optional(v.string()) },
+  args: {
+    threadId: v.optional(v.string()),
+    role: v.string(),
+    text: v.string(),
+    model: v.optional(v.string()),
+    authTokenHash: v.optional(v.string()),
+  },
   handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
     await ctx.db.insert("chatMessages", {
       threadId: a.threadId ?? "main",
       role: a.role,
@@ -154,8 +167,9 @@ export const logTurn = mutation({
 });
 
 export const claimNext = mutation({
-  args: {},
-  handler: async (ctx) => {
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
     const pending = await ctx.db
       .query("chatMessages")
       .withIndex("by_status", (q: any) => q.eq("status", "pending"))
@@ -198,8 +212,9 @@ export const claimNext = mutation({
 });
 
 export const appendChunk = mutation({
-  args: { messageId: v.id("chatMessages"), chunk: v.string() },
+  args: { messageId: v.id("chatMessages"), chunk: v.string(), workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
     const m = await ctx.db.get(a.messageId);
     if (!m) return;
     await ctx.db.patch(a.messageId, { text: (m.text ?? "") + a.chunk });
@@ -214,8 +229,11 @@ export const finalize = mutation({
     finalText: v.optional(v.string()),
     claudeSessionId: v.optional(v.string()),
     model: v.optional(v.string()),
+    authTokenHash: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     // Transport ambiguity guard: if a finalize APPLIED but its HTTP response
     // was lost, the route's catch used to wipe the delivered answer and
     // requeue — Daniel then heard a second, reworded reply minutes later.
@@ -239,8 +257,9 @@ export const finalize = mutation({
 
 // Post an assistant message directly (used by the agent-runner to report back).
 export const postAssistant = mutation({
-  args: { threadId: v.string(), text: v.string() },
+  args: { threadId: v.string(), text: v.string(), workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
     await ctx.db.insert("chatMessages", {
       threadId: a.threadId,
       role: "assistant",
@@ -258,8 +277,11 @@ export const postCard = mutation({
     type: v.string(),
     value: v.string(),
     title: v.optional(v.string()),
+    authTokenHash: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     await ctx.db.insert("chatMessages", {
       threadId: a.threadId ?? "main",
       role: "assistant",
@@ -273,8 +295,9 @@ export const postCard = mutation({
 
 // Wipe a thread (fresh start after maintenance/testing).
 export const clearThread = mutation({
-  args: { threadId: v.optional(v.string()) },
+  args: { threadId: v.optional(v.string()), authTokenHash: v.optional(v.string()) },
   handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
     const rows = await ctx.db
       .query("chatMessages")
       .withIndex("by_thread", (q: any) => q.eq("threadId", a.threadId ?? "main"))

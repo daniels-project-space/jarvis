@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { workApprovalPolicy } from "./workPolicy";
+import { requireAdmin, requireDispatcher, requireWorker } from "./controlAuth";
 
 const enqueueArgs = {
   task: v.string(),
@@ -25,36 +26,41 @@ const enqueueArgs = {
   maxAttempts: v.optional(v.number()),
   branch: v.optional(v.string()),
   checkpoint: v.optional(v.string()),
+  authTokenHash: v.optional(v.string()),
+  dispatchToken: v.optional(v.string()),
+  workerToken: v.optional(v.string()),
 };
 
 export const enqueue = mutation({
   args: enqueueArgs,
   handler: async (ctx, a) => {
+    await requireDispatcher(ctx, a);
+    const { authTokenHash: _authTokenHash, dispatchToken: _dispatchToken, workerToken: _workerToken, ...input } = a;
     const now = Date.now();
-    const approval = workApprovalPolicy(a);
+    const approval = workApprovalPolicy(input);
     const approvalRequired = approval.required;
     const status = approvalRequired ? "awaiting_approval" : "pending";
     const id = await ctx.db.insert("jobs", {
-      ...a,
-      task: a.task.slice(0, 6000),
-      label: a.label?.slice(0, 80),
-      priority: Math.max(0, Math.min(100, a.priority ?? 50)),
+      ...input,
+      task: input.task.slice(0, 6000),
+      label: input.label?.slice(0, 80),
+      priority: Math.max(0, Math.min(100, input.priority ?? 50)),
       status,
-      risk: approvalRequired ? (a.risk ?? "consequential") : a.risk,
+      risk: approvalRequired ? (input.risk ?? "consequential") : input.risk,
       approvalRequired,
       approvalReason: approval.reason,
       approvalStatus: approvalRequired ? "pending" : undefined,
       stage: approvalRequired ? "approval" : "queued",
       percent: 0,
       attempt: 1,
-      maxAttempts: Math.max(1, Math.min(48, a.maxAttempts ?? 12)),
+      maxAttempts: Math.max(1, Math.min(48, input.maxAttempts ?? 12)),
       nextRunAt: now,
       createdAt: now,
     });
     await ctx.db.insert("workEvents", {
       jobId: String(id),
-      missionId: a.missionId,
-      agentId: a.agentId,
+      missionId: input.missionId,
+      agentId: input.agentId,
       type: approvalRequired ? "approval_requested" : "queued",
       message: approvalRequired
         ? `Waiting for Daniel's approval${approval.reason ? ` · ${approval.reason}` : ""}`
@@ -67,9 +73,9 @@ export const enqueue = mutation({
       await ctx.db.insert("approvals", {
         jobId: String(id),
         kind: "consequential-work",
-        summary: (a.label || a.task).slice(0, 240),
-        risk: a.risk ?? "consequential",
-        payload: { repo: a.repo, agentId: a.agentId, reason: approval.reason },
+        summary: (input.label || input.task).slice(0, 240),
+        risk: input.risk ?? "consequential",
+        payload: { repo: input.repo, agentId: input.agentId, reason: approval.reason },
         status: "pending",
         requestedAt: now,
       });
@@ -79,8 +85,9 @@ export const enqueue = mutation({
 });
 
 export const claimNext = mutation({
-  args: {},
-  handler: async (ctx) => {
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
     const now = Date.now();
     const candidates = await ctx.db
       .query("jobs")
@@ -171,8 +178,10 @@ export const finalize = mutation({
     pullRequestUrl: v.optional(v.string()),
     verificationVerdict: v.optional(v.union(v.literal("pass"), v.literal("unavailable"))),
     verificationNote: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
     // A completed job is called "verified" only when the supervisor actually
@@ -259,8 +268,9 @@ export const list = query({
 // A process can die without finalizing. Heartbeats distinguish a genuinely
 // long segment from a dead runner; recover for up to 14 days/maximum attempts.
 export const reapStale = mutation({
-  args: {},
-  handler: async (ctx) => {
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
     const running = await ctx.db
       .query("jobs")
       .withIndex("by_status", (q: any) => q.eq("status", "running"))
@@ -314,8 +324,10 @@ export const updateProgress = mutation({
     log: v.optional(v.string()),
     stage: v.optional(v.string()),
     percent: v.optional(v.number()),
+    workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
     const now = Date.now();
@@ -353,8 +365,10 @@ export const checkpointAndRequeue = mutation({
     branch: v.optional(v.string()),
     delayMs: v.optional(v.number()),
     nextStatus: v.optional(v.union(v.literal("pending"), v.literal("paused"), v.literal("cancelled"))),
+    workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     if (!row || (row.attempt ?? 1) !== a.expectedAttempt) {
       return { requeued: false, exhausted: false, stale: true };
@@ -448,8 +462,10 @@ export const requestInput = mutation({
     expectedAttempt: v.number(),
     question: v.string(),
     checkpoint: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
     const now = Date.now();
@@ -504,8 +520,9 @@ export const requestInput = mutation({
 });
 
 export const provideInput = mutation({
-  args: { jobId: v.id("jobs"), answer: v.string() },
+  args: { jobId: v.id("jobs"), answer: v.string(), authTokenHash: v.optional(v.string()) },
   handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "needs_input") return false;
     const now = Date.now();
@@ -542,8 +559,10 @@ export const setDelivery = mutation({
     expectedAttempt: v.number(),
     branch: v.optional(v.string()),
     pullRequestUrl: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
     await ctx.db.patch(a.jobId, { branch: a.branch, pullRequestUrl: a.pullRequestUrl, heartbeatAt: Date.now() });
@@ -555,8 +574,10 @@ export const control = mutation({
   args: {
     jobId: v.id("jobs"),
     action: v.union(v.literal("pause"), v.literal("resume"), v.literal("cancel"), v.literal("retry")),
+    authTokenHash: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
     const row = await ctx.db.get(a.jobId);
     if (!row) return false;
     const now = Date.now();

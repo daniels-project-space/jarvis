@@ -147,11 +147,26 @@ export default defineSchema({
     phase: v.optional(v.string()),
     percent: v.optional(v.number()),
     acceptanceCriteria: v.optional(v.array(v.string())),
+    synthesisAttempt: v.optional(v.number()),
+    synthesisLeaseUntil: v.optional(v.number()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_status", ["status", "createdAt"])
     .index("by_createdAt", ["createdAt"]),
+
+  // Opaque, revocable browser sessions for Daniel. The raw bearer token only
+  // exists in an HttpOnly cookie; Convex stores its SHA-256 digest. Privileged
+  // user mutations require a live digest, while Trigger uses a separate
+  // server-held worker capability.
+  adminSessions: defineTable({
+    tokenHash: v.string(),
+    userAgent: v.optional(v.string()),
+    createdAt: v.number(),
+    expiresAt: v.number(),
+  })
+    .index("by_token", ["tokenHash"])
+    .index("by_expiry", ["expiresAt"]),
 
   // Permanent team roster. These are durable identities with stable roles,
   // scope and model policy; jobs reference the profile rather than inventing

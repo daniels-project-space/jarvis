@@ -1,5 +1,22 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { requireDispatcher, requireWorker } from "./controlAuth";
+
+const SYNTHESIS_LEASE_MS = 20 * 60 * 1000;
+
+function synthesisPayload(mission: any, jobs: any[], attempt: number) {
+  return {
+    id: mission._id,
+    goal: mission.goal,
+    originThreadId: mission.originThreadId ?? "main",
+    synthesisAttempt: attempt,
+    results: jobs.map((job: any) => ({
+      label: job.label ?? job.task.slice(0, 60),
+      status: job.status,
+      result: (job.result ?? "").slice(0, 6000),
+    })),
+  };
+}
 
 // Orchestration layer: a mission is a decomposed goal running as a fleet of
 // parallel agent jobs. The runner calls checkComplete after every job — the
@@ -15,19 +32,24 @@ export const create = mutation({
     priority: v.optional(v.number()),
     risk: v.optional(v.string()),
     acceptanceCriteria: v.optional(v.array(v.string())),
+    authTokenHash: v.optional(v.string()),
+    dispatchToken: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
+    await requireDispatcher(ctx, a);
+    const { authTokenHash: _authTokenHash, dispatchToken: _dispatchToken, workerToken: _workerToken, ...mission } = a;
     return await ctx.db.insert("missions", {
-      goal: a.goal.slice(0, 500),
+      goal: mission.goal.slice(0, 500),
       status: "running",
-      agentCount: a.agentCount,
-      originThreadId: a.originThreadId,
-      managerAgentId: a.managerAgentId ?? "jarvis",
-      priority: Math.max(0, Math.min(100, a.priority ?? 50)),
-      risk: a.risk ?? "low",
+      agentCount: mission.agentCount,
+      originThreadId: mission.originThreadId,
+      managerAgentId: mission.managerAgentId ?? "jarvis",
+      priority: Math.max(0, Math.min(100, mission.priority ?? 50)),
+      risk: mission.risk ?? "low",
       phase: "delegating",
       percent: 0,
-      acceptanceCriteria: a.acceptanceCriteria,
+      acceptanceCriteria: mission.acceptanceCriteria,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
@@ -85,8 +107,9 @@ export const active = query({
 // Atomically claim the synthesis step: returns the finished jobs ONLY for the
 // single caller that flips running → synthesizing (no double reports).
 export const checkComplete = mutation({
-  args: { id: v.id("missions") },
+  args: { id: v.id("missions"), workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
     const m = await ctx.db.get(a.id);
     if (!m || m.status !== "running") return null;
     const jobs = await ctx.db
@@ -96,17 +119,17 @@ export const checkComplete = mutation({
     if (jobs.length === 0) return null;
     const unfinished = jobs.filter((j: any) => !["done", "error", "cancelled"].includes(j.status));
     if (unfinished.length > 0) return null;
-    await ctx.db.patch(a.id, { status: "synthesizing", phase: "reviewing", percent: 90, updatedAt: Date.now() });
-    return {
-      id: a.id,
-      goal: m.goal,
-      originThreadId: m.originThreadId ?? "main",
-      results: jobs.map((j: any) => ({
-        label: j.label ?? j.task.slice(0, 60),
-        status: j.status,
-        result: (j.result ?? "").slice(0, 6000),
-      })),
-    };
+    const now = Date.now();
+    const synthesisAttempt = (m.synthesisAttempt ?? 0) + 1;
+    await ctx.db.patch(a.id, {
+      status: "synthesizing",
+      phase: "reviewing",
+      percent: 90,
+      synthesisAttempt,
+      synthesisLeaseUntil: now + SYNTHESIS_LEASE_MS,
+      updatedAt: now,
+    });
+    return synthesisPayload(m, jobs, synthesisAttempt);
   },
 });
 
@@ -115,8 +138,32 @@ export const checkComplete = mutation({
 // atomically claims these orphaned completions so they are synthesized once
 // instead of remaining as ghost "running" missions forever.
 export const claimReady = mutation({
-  args: {},
-  handler: async (ctx) => {
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const now = Date.now();
+    // A Trigger task can be interrupted after the atomic claim but before the
+    // report is committed. Reclaim only after the 15-minute synthesizer ceiling
+    // plus margin, and increment the lease so a late first writer is rejected.
+    const synthesizing = await ctx.db
+      .query("missions")
+      .withIndex("by_status", (q: any) => q.eq("status", "synthesizing"))
+      .order("asc")
+      .take(30);
+    for (const mission of synthesizing) {
+      if ((mission.synthesisLeaseUntil ?? mission.updatedAt + SYNTHESIS_LEASE_MS) > now) continue;
+      const jobs = await ctx.db
+        .query("jobs")
+        .withIndex("by_mission", (q: any) => q.eq("missionId", mission._id))
+        .collect();
+      const synthesisAttempt = (mission.synthesisAttempt ?? 0) + 1;
+      await ctx.db.patch(mission._id, {
+        synthesisAttempt,
+        synthesisLeaseUntil: now + SYNTHESIS_LEASE_MS,
+        updatedAt: now,
+      });
+      return synthesisPayload(mission, jobs, synthesisAttempt);
+    }
     const missions = await ctx.db
       .query("missions")
       .withIndex("by_status", (q: any) => q.eq("status", "running"))
@@ -128,36 +175,43 @@ export const claimReady = mutation({
         .withIndex("by_mission", (q: any) => q.eq("missionId", mission._id))
         .collect();
       if (!jobs.length || jobs.some((job: any) => !["done", "error", "cancelled"].includes(job.status))) continue;
+      const synthesisAttempt = (mission.synthesisAttempt ?? 0) + 1;
       await ctx.db.patch(mission._id, {
         status: "synthesizing",
         phase: "reviewing",
         percent: 90,
-        updatedAt: Date.now(),
+        synthesisAttempt,
+        synthesisLeaseUntil: now + SYNTHESIS_LEASE_MS,
+        updatedAt: now,
       });
-      return {
-        id: mission._id,
-        goal: mission.goal,
-        originThreadId: mission.originThreadId ?? "main",
-        results: jobs.map((job: any) => ({
-          label: job.label ?? job.task.slice(0, 60),
-          status: job.status,
-          result: (job.result ?? "").slice(0, 6000),
-        })),
-      };
+      return synthesisPayload(mission, jobs, synthesisAttempt);
     }
     return null;
   },
 });
 
 export const finish = mutation({
-  args: { id: v.id("missions"), summary: v.string(), failed: v.optional(v.boolean()) },
+  args: {
+    id: v.id("missions"),
+    summary: v.string(),
+    failed: v.optional(v.boolean()),
+    expectedSynthesisAttempt: v.number(),
+    workerToken: v.optional(v.string()),
+  },
   handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const mission = await ctx.db.get(a.id);
+    if (!mission || mission.status !== "synthesizing" || (mission.synthesisAttempt ?? 0) !== a.expectedSynthesisAttempt) {
+      return false;
+    }
     await ctx.db.patch(a.id, {
       status: a.failed ? "failed" : "done",
       phase: a.failed ? "failed" : "complete",
       percent: 100,
       summary: a.summary.slice(0, 4000),
+      synthesisLeaseUntil: undefined,
       updatedAt: Date.now(),
     });
+    return true;
   },
 });

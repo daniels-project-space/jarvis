@@ -47,6 +47,9 @@ function scopedSubscriptionEnv(source: NodeJS.ProcessEnv, provider: AgentProvide
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CODEX_ACCESS_TOKEN",
     "JARVIS_AGENT_PROVIDER",
+    // Dispatch is intentionally narrower than the runner capability: chat can
+    // create policy-checked work, but cannot claim, approve, or finalize it.
+    "JARVIS_DISPATCH_TOKEN",
   ];
   const env = {} as NodeJS.ProcessEnv;
   for (const key of allow) if (source[key] !== undefined) env[key] = source[key];
