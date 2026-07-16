@@ -1,10 +1,10 @@
 import type { NextRequest } from "next/server";
+import { resolveConvexUrl } from "./convex-url";
 
 export const ADMIN_COOKIE = "jarvis_admin";
 export const ADMIN_SESSION_SECONDS = 30 * 24 * 60 * 60;
 
-const CONVEX_URL =
-  process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
+const CONVEX_URL = resolveConvexUrl(process.env.CONVEX_URL, process.env.NEXT_PUBLIC_CONVEX_URL);
 
 export async function sha256Hex(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));

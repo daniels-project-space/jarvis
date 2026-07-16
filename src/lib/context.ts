@@ -1,11 +1,12 @@
 import "server-only";
 import { currentAdminSession } from "./control-context";
+import { resolveConvexUrl } from "./convex-url";
 
 // Server-side context bundle for the brain: memory, business intel, hub
 // (to-dos/calendar/wealth), cloud stack, running agents, fresh findings.
 // Used by /api/chat (every turn) and /api/realtime-token (session start).
 
-const CONVEX_URL = process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
+const CONVEX_URL = resolveConvexUrl(process.env.NEXT_PUBLIC_CONVEX_URL, process.env.CONVEX_URL);
 const HUB_URL = "https://fantastic-roadrunner-485.convex.cloud";
 const ADMIN_CONTEXT_MUTATIONS = new Set([
   "chatQueue:postCard",
