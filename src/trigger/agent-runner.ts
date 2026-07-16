@@ -1000,11 +1000,11 @@ export const agentRunner = schedules.task({
       }
     };
 
-    // When the LAST fleet agent lands, merge everything into one report.
-    // missions:checkComplete is atomic — exactly one runner wins the synthesis.
-    const maybeSynthesizeMission = async (missionId: string): Promise<void> => {
-      const synth: any = await convexMutation("missions:checkComplete", { id: missionId }).catch(() => null);
-      if (!synth) return;
+    // When the last fleet agent lands—or a pending job is declined—the atomic
+    // mission claim is merged exactly once into one reviewed report.
+    const synthesizeMissionClaim = async (synth: any): Promise<void> => {
+      if (!synth?.id) return;
+      const missionId = String(synth.id);
       const failedAll = synth.results.every((r: any) => r.status !== "done");
       const body = synth.results
         .map((r: any) => `### ${r.label} [${r.status}]\n${r.result || "(no output)"}`)
@@ -1037,6 +1037,10 @@ export const agentRunner = schedules.task({
       }).catch(() => {});
       await sendPush("JARVIS — mission complete", synth.goal.slice(0, 120), "/");
     };
+    const maybeSynthesizeMission = async (missionId: string): Promise<void> => {
+      const synth: any = await convexMutation("missions:checkComplete", { id: missionId }).catch(() => null);
+      if (synth) await synthesizeMissionClaim(synth);
+    };
 
     // Claim window must leave room for a full agent run inside the task
     // ceiling. Fleet missions run CONCURRENTLY (cap 3 — each agent is a full
@@ -1061,6 +1065,14 @@ export const agentRunner = schedules.task({
       inFlight.add(p);
     }
     await Promise.all([...inFlight]);
+    // Approval declines/cancellations do not run processJob, so sweep terminal
+    // missions after normal work. Each claim flips running → synthesizing in
+    // Convex, preventing another cron invocation from reporting it twice.
+    for (let i = 0; i < 3; i += 1) {
+      const ready: any = await convexMutation("missions:claimReady", {}).catch(() => null);
+      if (!ready) break;
+      await synthesizeMissionClaim(ready);
+    }
     return { processed };
   },
 });

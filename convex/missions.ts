@@ -98,6 +98,7 @@ export const checkComplete = mutation({
     if (unfinished.length > 0) return null;
     await ctx.db.patch(a.id, { status: "synthesizing", phase: "reviewing", percent: 90, updatedAt: Date.now() });
     return {
+      id: a.id,
       goal: m.goal,
       originThreadId: m.originThreadId ?? "main",
       results: jobs.map((j: any) => ({
@@ -106,6 +107,45 @@ export const checkComplete = mutation({
         result: (j.result ?? "").slice(0, 6000),
       })),
     };
+  },
+});
+
+// A mission can become terminal without a worker completing (for example,
+// Daniel declines its only approval-gated workstream). The scheduled supervisor
+// atomically claims these orphaned completions so they are synthesized once
+// instead of remaining as ghost "running" missions forever.
+export const claimReady = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const missions = await ctx.db
+      .query("missions")
+      .withIndex("by_status", (q: any) => q.eq("status", "running"))
+      .order("asc")
+      .take(30);
+    for (const mission of missions) {
+      const jobs = await ctx.db
+        .query("jobs")
+        .withIndex("by_mission", (q: any) => q.eq("missionId", mission._id))
+        .collect();
+      if (!jobs.length || jobs.some((job: any) => !["done", "error", "cancelled"].includes(job.status))) continue;
+      await ctx.db.patch(mission._id, {
+        status: "synthesizing",
+        phase: "reviewing",
+        percent: 90,
+        updatedAt: Date.now(),
+      });
+      return {
+        id: mission._id,
+        goal: mission.goal,
+        originThreadId: mission.originThreadId ?? "main",
+        results: jobs.map((job: any) => ({
+          label: job.label ?? job.task.slice(0, 60),
+          status: job.status,
+          result: (job.result ?? "").slice(0, 6000),
+        })),
+      };
+    }
+    return null;
   },
 });
 
