@@ -586,6 +586,10 @@ export function repairPrompt(inc: { source: string; message: string; signature: 
 export const agentRunner = schedules.task({
   id: "jarvis-agent-runner",
   cron: "* * * * *",
+  // Scheduled runs must not overlap. One runner already manages three scoped
+  // subprocesses internally; overlapping cron runs multiply subscription use
+  // and can reclaim a freshly checkpointed failure before policy can back off.
+  queue: { concurrencyLimit: 1 },
   maxDuration: 3600,
   run: async () => {
     const selected = await convexQuery("ui:getAgentProvider", {});
@@ -694,6 +698,8 @@ export const agentRunner = schedules.task({
 
     let processed = 0;
     const started = Date.now();
+    const failureBackoffMs = (attempt: number) =>
+      Math.min(6 * 60 * 60 * 1000, 60_000 * 2 ** Math.max(0, Math.min(12, attempt - 1)));
 
     // One permanent agent's lifecycle: clone an isolated branch, execute one
     // bounded segment, checkpoint or verify, then report to the originating
@@ -821,6 +827,7 @@ export const agentRunner = schedules.task({
             checkpoint: checkpointText,
             result: result.slice(0, 4000),
             branch: branch ?? undefined,
+            delayMs: run.timedOut ? 5_000 : failureBackoffMs(Number(job.attempt ?? 1)),
           });
           if (continuation?.requeued) {
             if (!job.missionId)
@@ -872,6 +879,7 @@ export const agentRunner = schedules.task({
               `Previous work:\n${result.slice(0, 4200)}\n\nThe specialist stopped on: ${verify.note}\nJARVIS's supervisor decision: ${verify.answer}\nContinue and finish; do not ask Daniel this ordinary implementation question again.`,
             result: result.slice(0, 4000),
             branch: branch ?? undefined,
+            delayMs: 5_000,
           });
           if (!job.missionId)
             await convexMutation("chatQueue:postAssistant", {
@@ -962,6 +970,7 @@ export const agentRunner = schedules.task({
           checkpoint: `Runner exception on attempt ${job.attempt ?? 1}: ${message.slice(0, 1200)}. Retry from the original task with a different approach.`,
           result: message.slice(0, 4000),
           branch: job.branch ?? undefined,
+          delayMs: failureBackoffMs(Number(job.attempt ?? 1)),
         }).catch(() => null);
         if (job.incidentId)
           await convexMutation("incidents:setStatus", { id: job.incidentId, status: "open" }).catch(() => {});

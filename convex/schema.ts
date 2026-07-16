@@ -108,6 +108,7 @@ export default defineSchema({
     stage: v.optional(v.string()),
     percent: v.optional(v.number()),
     heartbeatAt: v.optional(v.number()),
+    nextRunAt: v.optional(v.number()), // retry/continuation eligibility; prevents hot-loop retries
     checkpoint: v.optional(v.string()),
     attempt: v.optional(v.number()),
     maxAttempts: v.optional(v.number()),
@@ -122,6 +123,7 @@ export default defineSchema({
     createdAt: v.number(),
   })
     .index("by_status", ["status", "createdAt"])
+    .index("by_status_next_run", ["status", "nextRunAt"])
     .index("by_mission", ["missionId"])
     .index("by_createdAt", ["createdAt"])
     .index("by_agent", ["agentId", "createdAt"]),

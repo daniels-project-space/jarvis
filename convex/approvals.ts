@@ -28,6 +28,7 @@ export const decide = mutation({
       completedAt: a.decision === "declined" ? Date.now() : undefined,
       progress: a.decision === "approved" ? "approved — queued" : "declined by Daniel",
       stage: a.decision === "approved" ? "queued" : "cancelled",
+      nextRunAt: a.decision === "approved" ? Date.now() : undefined,
     });
     await ctx.db.insert("workEvents", {
       jobId: a.jobId,

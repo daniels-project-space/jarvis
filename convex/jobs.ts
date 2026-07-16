@@ -44,6 +44,7 @@ export const enqueue = mutation({
       percent: 0,
       attempt: 1,
       maxAttempts: Math.max(1, Math.min(48, a.maxAttempts ?? 12)),
+      nextRunAt: now,
       createdAt: now,
     });
     await ctx.db.insert("workEvents", {
@@ -74,9 +75,10 @@ export const enqueue = mutation({
 export const claimNext = mutation({
   args: {},
   handler: async (ctx) => {
+    const now = Date.now();
     const candidates = await ctx.db
       .query("jobs")
-      .withIndex("by_status", (q: any) => q.eq("status", "pending"))
+      .withIndex("by_status_next_run", (q: any) => q.eq("status", "pending").lte("nextRunAt", now))
       .take(40);
     candidates.sort((a: any, b: any) => (b.priority ?? 50) - (a.priority ?? 50) || a.createdAt - b.createdAt);
     let j: any = null;
@@ -97,7 +99,6 @@ export const claimNext = mutation({
       }
     }
     if (!j) return null;
-    const now = Date.now();
     await ctx.db.patch(j._id, {
       status: "running",
       stage: "starting",
@@ -105,6 +106,7 @@ export const claimNext = mutation({
       percent: Math.max(2, j.percent ?? 0),
       startedAt: now,
       heartbeatAt: now,
+      nextRunAt: undefined,
     });
     await ctx.db.insert("workEvents", {
       jobId: String(j._id),
@@ -268,6 +270,7 @@ export const reapStale = mutation({
           stage: "queued",
           startedAt: undefined,
           heartbeatAt: now,
+          nextRunAt: now + Math.min(6 * 60 * 60 * 1000, 60_000 * 2 ** Math.max(0, nextAttempt - 2)),
           attempt: nextAttempt,
           progress: `recovered after a stalled runner · attempt ${nextAttempt}`,
         });
@@ -329,6 +332,7 @@ export const checkpointAndRequeue = mutation({
     checkpoint: v.string(),
     result: v.optional(v.string()),
     branch: v.optional(v.string()),
+    delayMs: v.optional(v.number()),
     nextStatus: v.optional(v.union(v.literal("pending"), v.literal("paused"), v.literal("cancelled"))),
   },
   handler: async (ctx, a) => {
@@ -336,6 +340,7 @@ export const checkpointAndRequeue = mutation({
     if (!row) return { requeued: false, exhausted: true };
     const requestedStatus = a.nextStatus ?? "pending";
     const attempt = (row.attempt ?? 1) + (requestedStatus === "pending" ? 1 : 0);
+    const delayMs = Math.max(0, Math.min(6 * 60 * 60 * 1000, a.delayMs ?? 0));
     const exhausted =
       requestedStatus === "pending" &&
       (attempt > (row.maxAttempts ?? 12) || Date.now() - row.createdAt > 14 * 86_400_000);
@@ -349,11 +354,12 @@ export const checkpointAndRequeue = mutation({
       attempt,
       startedAt: undefined,
       heartbeatAt: Date.now(),
+      nextRunAt: status === "pending" ? Date.now() + delayMs : undefined,
       completedAt: requestedStatus === "cancelled" || exhausted ? Date.now() : undefined,
       progress: exhausted
         ? "continuation budget exhausted"
         : requestedStatus === "pending"
-          ? `checkpoint saved · continuation ${attempt} queued`
+          ? `checkpoint saved · continuation ${attempt}${delayMs ? ` eligible in ${Math.max(1, Math.ceil(delayMs / 60_000))}m` : " queued"}`
           : `checkpoint saved · ${requestedStatus}`,
     });
     await ctx.db.insert("workEvents", {
@@ -364,7 +370,7 @@ export const checkpointAndRequeue = mutation({
       message: exhausted
         ? "Continuation budget exhausted"
         : requestedStatus === "pending"
-          ? `Checkpoint saved; attempt ${attempt} queued`
+          ? `Checkpoint saved; attempt ${attempt}${delayMs ? ` eligible in ${Math.max(1, Math.ceil(delayMs / 60_000))}m` : " queued"}`
           : `Checkpoint saved; job ${requestedStatus}`,
       stage: exhausted ? "error" : requestedStatus === "pending" ? "checkpointed" : requestedStatus,
       percent: row.percent,
@@ -448,6 +454,7 @@ export const provideInput = mutation({
       checkpoint: `${row.checkpoint ?? ""}\n\nDaniel's answer: ${a.answer.slice(0, 2000)}`.trim(),
       attempt: (row.attempt ?? 1) + 1,
       heartbeatAt: now,
+      nextRunAt: now,
     });
     const attention = await ctx.db
       .query("attentionItems")
@@ -486,7 +493,7 @@ export const control = mutation({
     if (a.action === "pause" && ["pending", "running"].includes(row.status))
       await ctx.db.patch(a.jobId, { status: "paused", stage: "paused", progress: "paused by Daniel" });
     else if (a.action === "resume" && row.status === "paused")
-      await ctx.db.patch(a.jobId, { status: "pending", stage: "queued", progress: "resumed — queued" });
+      await ctx.db.patch(a.jobId, { status: "pending", stage: "queued", progress: "resumed — queued", nextRunAt: now });
     else if (a.action === "cancel" && !["done", "error", "cancelled"].includes(row.status))
       await ctx.db.patch(a.jobId, { status: "cancelled", stage: "cancelled", completedAt: now, progress: "cancelled by Daniel" });
     else if (a.action === "retry" && ["error", "cancelled"].includes(row.status))
@@ -496,6 +503,7 @@ export const control = mutation({
         completedAt: undefined,
         attempt: (row.attempt ?? 1) + 1,
         progress: "manual retry queued",
+        nextRunAt: now,
       });
     else return false;
     await ctx.db.insert("workEvents", {
@@ -550,6 +558,7 @@ export const active = query({
         originThreadId: j.originThreadId ?? "main",
         startedAt: j.startedAt ?? j.createdAt,
         heartbeatAt: j.heartbeatAt ?? j.startedAt ?? j.createdAt,
+        nextRunAt: j.nextRunAt ?? null,
       }));
   },
 });
