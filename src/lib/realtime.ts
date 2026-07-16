@@ -23,8 +23,27 @@ let audioEl: HTMLAudioElement | null = null;
 let energyRaf = 0;
 let energyCtx: AudioContext | null = null;
 
-async function clientTools() {
-  const defs: { name: string; description: string; parameters: any }[] = await (await fetch("/api/tools?live=1")).json();
+type LiveToolDef = { name: string; description: string; parameters: any };
+const definitionCache = new Map<string, Promise<LiveToolDef[]>>();
+
+function toolDefinitions(belt: string) {
+  let promise = definitionCache.get(belt);
+  if (!promise) {
+    promise = fetch(`/api/tools?live=${encodeURIComponent(belt)}`).then(async (response) => {
+      if (!response.ok) throw new Error(`tool belt ${belt} failed`);
+      return (await response.json()) as LiveToolDef[];
+    });
+    definitionCache.set(belt, promise);
+  }
+  return promise;
+}
+
+export function preloadLive() {
+  void toolDefinitions("core").catch(() => definitionCache.delete("core"));
+}
+
+async function clientTools(belt = "core") {
+  const defs = await toolDefinitions(belt);
   return defs.map((d) =>
     tool({
       name: d.name,
@@ -125,14 +144,13 @@ export async function startLive(h: LiveHandlers) {
   starting = true;
   h.onState("connecting");
   try {
-    const res = await fetch("/api/realtime-token", {
+    // Begin every user-gesture-gated startup lane together: server context and
+    // token minting, microphone permission, and the compact core tool belt.
+    const tokenPromise = fetch("/api/realtime-token", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ client: h.clientId ?? "" }),
     });
-    const tk = await res.json();
-    if (!tk.token) throw new Error(tk.error ?? "no token");
-
     audioEl = document.createElement("audio");
     audioEl.autoplay = true;
     document.body.appendChild(audioEl);
@@ -140,9 +158,13 @@ export async function startLive(h: LiveHandlers) {
     // leaks into the mic, semantic VAD reads JARVIS's own voice as Daniel
     // barging in and cancels speech mid-sentence (and the echo guard then
     // makes the model go silent). AEC at the source kills the loop.
-    micStream = await navigator.mediaDevices.getUserMedia({
+    const micPromise = navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
+    const [res, microphone, coreTools] = await Promise.all([tokenPromise, micPromise, clientTools("core")]);
+    micStream = microphone;
+    const tk = await res.json();
+    if (!res.ok || !tk.token) throw new Error(tk.error ?? "no token");
     const transport = new OpenAIRealtimeWebRTC({ audioElement: audioEl, mediaStream: micStream });
 
     const exitTool = tool({
@@ -160,16 +182,42 @@ export async function startLive(h: LiveHandlers) {
         return "Say one short goodbye line — the session ends right after.";
       },
     });
-    const agent = new RealtimeAgent({
+    const activeTools = new Map<string, any>();
+    for (const bridge of coreTools as any[]) activeTools.set(String(bridge.name), bridge);
+    let makeAgent: () => RealtimeAgent;
+    const domainTool = tool({
+      name: "load_tool_domain",
+      description:
+        "Load a specialist tool belt only when needed: work for missions/projects/repairs, creative for images/drawing/docs, travel for trip planning, or business for markets/rentals/shopping. After loading, call the requested specialist tool.",
+      parameters: {
+        type: "object",
+        properties: { domain: { type: "string", enum: ["work", "creative", "travel", "business"] } },
+        required: ["domain"],
+        additionalProperties: false,
+      } as any,
+      strict: false,
+      execute: async (args: any) => {
+        const domain = String(args?.domain ?? "");
+        if (!["work", "creative", "travel", "business"].includes(domain)) return "Unknown tool domain.";
+        const loaded = await clientTools(domain);
+        for (const bridge of loaded as any[]) activeTools.set(String(bridge.name), bridge);
+        if (session) await session.updateAgent(makeAgent());
+        return `${domain} tools loaded. Now call the specific tool Daniel asked for; do not merely describe it.`;
+      },
+    });
+    makeAgent = () => new RealtimeAgent({
       name: "JARVIS",
       // THE CLIENT OWNS THE CONFIG. The SDK's connect sends a session.update
       // built from this agent + SDK defaults, CLOBBERING whatever the server
       // minted — an empty string here silently wiped the entire persona for
       // weeks (and transcription fell back to gpt-4o-mini, noise reduction to
       // null). Everything critical must be set right here.
-      instructions: String(tk.instructions ?? ""),
-      tools: [...(await clientTools()), exitTool],
+      instructions:
+        String(tk.instructions ?? "") +
+        "\n\nYou begin with a compact core tool belt. When Daniel asks for a tool that is not present, call load_tool_domain for work, creative, travel, or business, then immediately use the newly loaded tool. Never claim the action happened after only loading a belt.",
+      tools: [...activeTools.values(), domainTool, exitTool],
     });
+    const agent = makeAgent();
     session = new RealtimeSession(agent, {
       transport,
       model: tk.model || "gpt-realtime-2.1",
@@ -177,7 +225,7 @@ export async function startLive(h: LiveHandlers) {
         audio: {
           input: {
             transcription: { model: "gpt-4o-transcribe", language: "en", prompt: STT_PROMPT },
-            turnDetection: { type: "semantic_vad", eagerness: "medium" },
+            turnDetection: { type: "semantic_vad", eagerness: "high" },
             noiseReduction: { type: "near_field" },
           },
           output: { voice: tk.voice || "ballad" },
@@ -186,6 +234,7 @@ export async function startLive(h: LiveHandlers) {
     });
 
     const mirrored = new Set<string>();
+    const observed = new Map<string, string>();
     // Foreign-script transcription junk (whisper noise-hallucination) never
     // reaches captions or the chat log — Daniel speaks English.
     const isGarbage = (t: string) => {
@@ -219,6 +268,9 @@ export async function startLive(h: LiveHandlers) {
           .map((c: any) => c?.transcript ?? c?.text ?? "")
           .join(" ")
           .trim();
+        const observation = `${item.status ?? ""}|${text}`;
+        if (observed.get(item.itemId) === observation) continue;
+        observed.set(item.itemId, observation);
         if (!text || text.startsWith(NUDGE.slice(0, 20))) continue; // internal nudges stay invisible
         if (role === "user" && isGarbage(text)) continue;
         if (role === "user" && !echoHandled.has(item.itemId) && isSelfEcho(text)) {

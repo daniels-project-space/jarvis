@@ -43,31 +43,31 @@ export async function reportIncident(source: string, signature: string, message:
   }
 }
 
-export async function buildContext(userText?: string): Promise<{ block: string; freshFindingIds: string[] }> {
-  const [memHit, memRecent, biz, stack, todos, events, wealth, jobs, findings, trip, draft, location, panel] = await Promise.all([
-    userText ? q(CONVEX_URL, "memory:search", { q: userText, limit: 8 }) : null,
-    q(CONVEX_URL, "memory:recent", { limit: 6 }),
-    q(CONVEX_URL, "business:list", {}),
-    q(CONVEX_URL, "projectState:list", {}),
-    q(HUB_URL, "todos:list"),
-    q(HUB_URL, "events:list"),
-    q(HUB_URL, "wealth:getWealth"),
-    q(CONVEX_URL, "jobs:active", {}),
-    q(CONVEX_URL, "findings:fresh", {}),
-    q(CONVEX_URL, "creations:latest", { kind: "trip" }),
-    q(CONVEX_URL, "creations:latest", { kind: "doc" }),
-    q(CONVEX_URL, "ui:getLocation", {}),
-    q(CONVEX_URL, "ui:getPanel", {}),
+export async function buildContext(
+  userText?: string,
+  options?: { includeConversation?: boolean },
+): Promise<{ block: string; freshFindingIds: string[]; threadId?: string; conversation?: any[] }> {
+  const [brain, hub] = await Promise.all([
+    q(CONVEX_URL, "brainContext:snapshot", {
+      userText: userText?.slice(0, 240) || undefined,
+      includeConversation: options?.includeConversation || undefined,
+    }),
+    q(HUB_URL, "jarvisContext:snapshot"),
   ]);
-
-  const mem = [...(Array.isArray(memHit) ? memHit : []), ...(Array.isArray(memRecent) ? memRecent : [])]
-    .filter((m: any, i: number, arr: any[]) => arr.findIndex((x: any) => x._id === m._id) === i)
-    .slice(0, 10);
-  const now = Date.now();
-  const openTodos = Array.isArray(todos) ? todos.filter((t: any) => !t.done) : [];
-  const upcoming = Array.isArray(events)
-    ? events.filter((e: any) => (e.start ?? 0) >= now).sort((a: any, b: any) => a.start - b.start).slice(0, 5)
-    : [];
+  const todos = hub?.todos;
+  const events = hub?.events;
+  const wealth = hub?.wealth;
+  const mem = Array.isArray(brain?.memory) ? brain.memory : [];
+  const biz = Array.isArray(brain?.business) ? brain.business : [];
+  const stack = Array.isArray(brain?.projects) ? brain.projects : [];
+  const jobs = Array.isArray(brain?.jobs) ? brain.jobs : [];
+  const findings = Array.isArray(brain?.findings) ? brain.findings : [];
+  const trip = brain?.trip;
+  const draft = brain?.draft;
+  const location = brain?.location;
+  const panel = brain?.panel;
+  const openTodos = Array.isArray(todos) ? todos : [];
+  const upcoming = Array.isArray(events) ? events : [];
 
   const lines: string[] = [];
   if (mem.length) lines.push("Long-term memory:\n" + mem.map((m: any) => `- ${m.title}: ${m.body}`).join("\n"));
@@ -91,19 +91,48 @@ export async function buildContext(userText?: string): Promise<{ block: string; 
           .slice(0, 1800),
     );
   if (Array.isArray(jobs) && jobs.length)
-    lines.push("Agents working right now: " + jobs.map((j: any) => `"${j.task.slice(0, 80)}" (${j.status})`).join("; "));
+    lines.push(
+      "Permanent team work right now: " +
+        jobs
+          .map(
+            (j: any) =>
+              `${j.agentId ?? "agent"}: "${(j.label ?? j.task).slice(0, 70)}" (${j.stage ?? j.status}, ${j.percent ?? 0}%${(j.attempt ?? 1) > 1 ? `, attempt ${j.attempt}` : ""})`,
+          )
+          .join("; "),
+    );
+  if (Array.isArray(brain?.agents) && brain.agents.length)
+    lines.push(
+      "Permanent team: " +
+        brain.agents.map((agent: any) => `${agent.name}=${agent.status} (${agent.role})`).join("; "),
+    );
+  if (Array.isArray(brain?.attention) && brain.attention.length)
+    lines.push(
+      "RANKED ATTENTION — mention only what materially needs Daniel now; otherwise act or keep quiet:\n" +
+        brain.attention
+          .slice(0, 6)
+          .map(
+            (item: any) =>
+              `- ${item.title} [impact ${item.impact}, urgency ${item.urgency}, confidence ${Math.round(item.confidence * 100)}%, action ${item.actionClass}] — ${item.detail}`,
+          )
+          .join("\n"),
+    );
+  if (Array.isArray(brain?.approvals) && brain.approvals.length)
+    lines.push(
+      "NEEDS DANIEL — never execute these until explicitly approved: " +
+        brain.approvals.map((approval: any) => `${approval.jobId}: ${approval.summary}`).join("; "),
+    );
   // Current trip: answer questions and lock choices from THIS doc via
   // trip_update — never re-run trip_plan for a trip that's already in flight.
   if (trip?.data && Date.now() - (trip.updatedAt ?? 0) < 14 * 86_400_000) {
     try {
       const t = JSON.parse(trip.data);
       lines.push(
-        `TRIP IN PROGRESS (${t.status}): ${t.title}, budget £${t.budgetGbp}, total so far £${t.totals?.total ?? "?"}. ` +
+        `TRIP IN PROGRESS id=${trip._id} (${t.status}): ${t.title}, budget £${t.budgetGbp}, projected total £${t.totals?.projectedTotal ?? t.totals?.total ?? "?"}, locked total £${t.totals?.lockedTotal ?? "?"}. ` +
           `Locked: flight ${t.locked?.flight ? `${t.locked.flight.airline} £${t.locked.flight.priceGbp}pp` : "—"}, ` +
           `stay ${t.locked?.stay ? `${t.locked.stay.name} £${t.locked.stay.totalGbp} total` : "—"}, ` +
           `activities: ${(t.locked?.activities ?? []).join(", ") || "—"}` +
           (t.transfer ? `, airport transfer ${t.transfer.durationText} (${t.transfer.distanceText}, by ${t.transfer.mode})` : "") +
-          `. Use trip_update (lock/show/toggle) or trip_finalize on THIS trip; only call trip_plan for a NEW destination or dates.`,
+          `. Every trip_update/trip_finalize call MUST pass trip_id ${trip._id}; only call trip_plan for a NEW destination or dates.`,
       );
     } catch {
       /* stale doc */
@@ -149,5 +178,7 @@ export async function buildContext(userText?: string): Promise<{ block: string; 
   return {
     block: lines.join("\n\n").slice(0, 6000),
     freshFindingIds: Array.isArray(findings) ? findings.map((f: any) => f._id) : [],
+    threadId: brain?.threadId,
+    conversation: Array.isArray(brain?.conversation) ? brain.conversation : undefined,
   };
 }

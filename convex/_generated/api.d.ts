@@ -8,9 +8,14 @@
  * @module
  */
 
+import type * as agents from "../agents.js";
+import type * as approvals from "../approvals.js";
+import type * as attention from "../attention.js";
+import type * as brainContext from "../brainContext.js";
 import type * as business from "../business.js";
 import type * as chat from "../chat.js";
 import type * as chatQueue from "../chatQueue.js";
+import type * as commandCenter from "../commandCenter.js";
 import type * as creations from "../creations.js";
 import type * as findings from "../findings.js";
 import type * as incidents from "../incidents.js";
@@ -22,6 +27,7 @@ import type * as push from "../push.js";
 import type * as reminders from "../reminders.js";
 import type * as ui from "../ui.js";
 import type * as watches from "../watches.js";
+import type * as workEvents from "../workEvents.js";
 
 import type {
   ApiFromModules,
@@ -30,9 +36,14 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  agents: typeof agents;
+  approvals: typeof approvals;
+  attention: typeof attention;
+  brainContext: typeof brainContext;
   business: typeof business;
   chat: typeof chat;
   chatQueue: typeof chatQueue;
+  commandCenter: typeof commandCenter;
   creations: typeof creations;
   findings: typeof findings;
   incidents: typeof incidents;
@@ -44,6 +55,7 @@ declare const fullApi: ApiFromModules<{
   reminders: typeof reminders;
   ui: typeof ui;
   watches: typeof watches;
+  workEvents: typeof workEvents;
 }>;
 
 /**

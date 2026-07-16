@@ -1,44 +1,133 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 
+const enqueueArgs = {
+  task: v.string(),
+  repo: v.optional(v.string()),
+  readonly: v.optional(v.boolean()),
+  model: v.optional(v.string()),
+  mcp: v.optional(v.array(v.string())),
+  incidentId: v.optional(v.string()),
+  retried: v.optional(v.boolean()),
+  missionId: v.optional(v.string()),
+  label: v.optional(v.string()),
+  originThreadId: v.optional(v.string()),
+  originTurnId: v.optional(v.string()),
+  agentId: v.optional(v.string()),
+  risk: v.optional(v.string()),
+  priority: v.optional(v.number()),
+  approvalRequired: v.optional(v.boolean()),
+  acceptanceCriteria: v.optional(v.array(v.string())),
+  modelReason: v.optional(v.string()),
+  parentJobId: v.optional(v.string()),
+  dependsOn: v.optional(v.array(v.string())),
+  maxAttempts: v.optional(v.number()),
+  branch: v.optional(v.string()),
+  checkpoint: v.optional(v.string()),
+};
+
 export const enqueue = mutation({
-  args: {
-    task: v.string(),
-    repo: v.optional(v.string()),
-    readonly: v.optional(v.boolean()),
-    model: v.optional(v.string()),
-    mcp: v.optional(v.array(v.string())),
-    incidentId: v.optional(v.string()),
-    retried: v.optional(v.boolean()),
-    missionId: v.optional(v.string()),
-    label: v.optional(v.string()),
-  },
+  args: enqueueArgs,
   handler: async (ctx, a) => {
-    return await ctx.db.insert("jobs", {
-      task: a.task,
-      repo: a.repo,
-      readonly: a.readonly,
-      model: a.model,
-      mcp: a.mcp,
-      incidentId: a.incidentId,
-      retried: a.retried,
-      missionId: a.missionId,
-      label: a.label,
-      status: "pending",
-      createdAt: Date.now(),
+    const now = Date.now();
+    const approvalRequired = a.approvalRequired ?? false;
+    const status = approvalRequired ? "awaiting_approval" : "pending";
+    const id = await ctx.db.insert("jobs", {
+      ...a,
+      task: a.task.slice(0, 6000),
+      label: a.label?.slice(0, 80),
+      priority: Math.max(0, Math.min(100, a.priority ?? 50)),
+      status,
+      approvalRequired,
+      approvalStatus: approvalRequired ? "pending" : undefined,
+      stage: approvalRequired ? "approval" : "queued",
+      percent: 0,
+      attempt: 1,
+      maxAttempts: Math.max(1, Math.min(48, a.maxAttempts ?? 12)),
+      createdAt: now,
     });
+    await ctx.db.insert("workEvents", {
+      jobId: String(id),
+      missionId: a.missionId,
+      agentId: a.agentId,
+      type: approvalRequired ? "approval_requested" : "queued",
+      message: approvalRequired ? "Waiting for Daniel's approval" : "Work queued",
+      stage: approvalRequired ? "approval" : "queued",
+      percent: 0,
+      createdAt: now,
+    });
+    if (approvalRequired) {
+      await ctx.db.insert("approvals", {
+        jobId: String(id),
+        kind: "consequential-work",
+        summary: (a.label || a.task).slice(0, 240),
+        risk: a.risk ?? "consequential",
+        payload: { repo: a.repo, agentId: a.agentId },
+        status: "pending",
+        requestedAt: now,
+      });
+    }
+    return id;
   },
 });
 
 export const claimNext = mutation({
   args: {},
   handler: async (ctx) => {
-    const j = await ctx.db
+    const candidates = await ctx.db
       .query("jobs")
       .withIndex("by_status", (q: any) => q.eq("status", "pending"))
-      .first();
+      .take(40);
+    candidates.sort((a: any, b: any) => (b.priority ?? 50) - (a.priority ?? 50) || a.createdAt - b.createdAt);
+    let j: any = null;
+    for (const candidate of candidates) {
+      if (candidate.approvalRequired && candidate.approvalStatus !== "approved") continue;
+      let blocked = false;
+      for (const dependency of candidate.dependsOn ?? []) {
+        const id = ctx.db.normalizeId("jobs", dependency);
+        const dep = id ? await ctx.db.get(id) : null;
+        if (!dep || dep.status !== "done") {
+          blocked = true;
+          break;
+        }
+      }
+      if (!blocked) {
+        j = candidate;
+        break;
+      }
+    }
     if (!j) return null;
-    await ctx.db.patch(j._id, { status: "running", startedAt: Date.now() });
+    const now = Date.now();
+    await ctx.db.patch(j._id, {
+      status: "running",
+      stage: "starting",
+      progress: "starting secure workspace",
+      percent: Math.max(2, j.percent ?? 0),
+      startedAt: now,
+      heartbeatAt: now,
+    });
+    await ctx.db.insert("workEvents", {
+      jobId: String(j._id),
+      missionId: j.missionId,
+      agentId: j.agentId,
+      type: "started",
+      message: `Attempt ${j.attempt ?? 1} started`,
+      stage: "starting",
+      percent: Math.max(2, j.percent ?? 0),
+      createdAt: now,
+    });
+    if (j.agentId) {
+      const agent = await ctx.db
+        .query("agentProfiles")
+        .withIndex("by_slug", (q: any) => q.eq("slug", j.agentId))
+        .first();
+      if (agent)
+        await ctx.db.patch(agent._id, {
+          status: "working",
+          currentJobId: String(j._id),
+          updatedAt: now,
+        });
+    }
     return {
       jobId: j._id,
       task: j.task,
@@ -49,76 +138,394 @@ export const claimNext = mutation({
       incidentId: j.incidentId ?? null,
       retried: j.retried ?? false,
       missionId: j.missionId ?? null,
+      label: j.label ?? null,
+      originThreadId: j.originThreadId ?? "main",
+      originTurnId: j.originTurnId ?? null,
+      agentId: j.agentId ?? null,
+      risk: j.risk ?? "low",
+      priority: j.priority ?? 50,
+      attempt: j.attempt ?? 1,
+      maxAttempts: j.maxAttempts ?? 12,
+      checkpoint: j.checkpoint ?? null,
+      branch: j.branch ?? null,
+      acceptanceCriteria: j.acceptanceCriteria ?? [],
+      modelReason: j.modelReason ?? null,
     };
   },
 });
 
 export const finalize = mutation({
-  args: { jobId: v.id("jobs"), status: v.string(), result: v.optional(v.string()) },
+  args: {
+    jobId: v.id("jobs"),
+    status: v.string(),
+    result: v.optional(v.string()),
+    pullRequestUrl: v.optional(v.string()),
+  },
   handler: async (ctx, a) => {
-    await ctx.db.patch(a.jobId, { status: a.status, result: a.result });
+    const row = await ctx.db.get(a.jobId);
+    if (!row) return;
+    const now = Date.now();
+    const success = a.status === "done";
+    await ctx.db.patch(a.jobId, {
+      status: a.status,
+      result: a.result,
+      pullRequestUrl: a.pullRequestUrl,
+      completedAt: now,
+      heartbeatAt: now,
+      stage: success ? "verified" : a.status,
+      percent: success ? 100 : row.percent,
+      progress: success ? "verified and complete" : row.progress,
+    });
+    await ctx.db.insert("workEvents", {
+      jobId: String(a.jobId),
+      missionId: row.missionId,
+      agentId: row.agentId,
+      type: a.status,
+      message: success ? "Work verified and complete" : (a.result ?? a.status).slice(0, 500),
+      stage: success ? "verified" : a.status,
+      percent: success ? 100 : row.percent,
+      createdAt: now,
+    });
+    if (row.missionId) {
+      const missionId = ctx.db.normalizeId("missions", row.missionId);
+      if (missionId) {
+        const mission = await ctx.db.get(missionId);
+        const jobs = await ctx.db
+          .query("jobs")
+          .withIndex("by_mission", (q: any) => q.eq("missionId", row.missionId))
+          .collect();
+        if (mission) {
+          const finished = jobs.filter((j: any) => ["done", "error", "cancelled"].includes(j.status)).length;
+          await ctx.db.patch(missionId, {
+            phase: finished >= mission.agentCount ? "reviewing" : "executing",
+            percent: Math.min(88, Math.round((finished / Math.max(1, mission.agentCount)) * 88)),
+            updatedAt: now,
+          });
+        }
+      }
+    }
+    if (row.agentId) {
+      const agent = await ctx.db
+        .query("agentProfiles")
+        .withIndex("by_slug", (q: any) => q.eq("slug", row.agentId))
+        .first();
+      if (agent) {
+        const previousRuns = agent.completedJobs + agent.failedJobs;
+        const durationMs = Math.max(0, now - (row.startedAt ?? row.createdAt));
+        const averageDurationMs = Math.round(
+          ((agent.averageDurationMs ?? durationMs) * previousRuns + durationMs) / Math.max(1, previousRuns + 1),
+        );
+        await ctx.db.patch(agent._id, {
+          completedJobs: agent.completedJobs + (success ? 1 : 0),
+          failedJobs: agent.failedJobs + (success ? 0 : 1),
+          averageDurationMs,
+          status: "available",
+          currentJobId: undefined,
+          updatedAt: now,
+        });
+      }
+    }
   },
 });
 
 export const list = query({
   args: { limit: v.optional(v.number()) },
-  handler: async (ctx, a) => {
-    const all = await ctx.db.query("jobs").collect();
-    return all.sort((x: any, y: any) => y.createdAt - x.createdAt).slice(0, a.limit ?? 20);
-  },
+  handler: async (ctx, a) =>
+    await ctx.db
+      .query("jobs")
+      .withIndex("by_createdAt")
+      .order("desc")
+      .take(Math.min(a.limit ?? 20, 100)),
 });
 
-// Reaper: a Trigger run killed at maxDuration strands its job as "running"
-// forever. Requeue stale ones (15+ min); give up honestly after 2h total.
+// A process can die without finalizing. Heartbeats distinguish a genuinely
+// long segment from a dead runner; recover for up to 14 days/maximum attempts.
 export const reapStale = mutation({
   args: {},
   handler: async (ctx) => {
     const running = await ctx.db
       .query("jobs")
       .withIndex("by_status", (q: any) => q.eq("status", "running"))
-      .collect();
+      .take(100);
     const now = Date.now();
     const requeued: string[] = [];
     const abandoned: string[] = [];
     for (const j of running) {
-      const startedAt = j.startedAt ?? j.createdAt;
-      if (now - startedAt < 15 * 60 * 1000) continue;
-      if (now - j.createdAt > 2 * 60 * 60 * 1000) {
-        await ctx.db.patch(j._id, { status: "error", result: "abandoned: runner died repeatedly" });
+      const heartbeat = j.heartbeatAt ?? j.startedAt ?? j.createdAt;
+      if (now - heartbeat < 20 * 60 * 1000) continue;
+      const nextAttempt = (j.attempt ?? 1) + 1;
+      if (now - j.createdAt > 14 * 86_400_000 || nextAttempt > (j.maxAttempts ?? 12)) {
+        await ctx.db.patch(j._id, {
+          status: "error",
+          stage: "error",
+          completedAt: now,
+          result: "abandoned: runner repeatedly stopped without a checkpoint",
+        });
         abandoned.push(j.task.slice(0, 80));
       } else {
-        await ctx.db.patch(j._id, { status: "pending", startedAt: undefined, progress: "requeued after a stalled run" });
+        await ctx.db.patch(j._id, {
+          status: "pending",
+          stage: "queued",
+          startedAt: undefined,
+          heartbeatAt: now,
+          attempt: nextAttempt,
+          progress: `recovered after a stalled runner · attempt ${nextAttempt}`,
+        });
         requeued.push(j.task.slice(0, 80));
       }
+      await ctx.db.insert("workEvents", {
+        jobId: String(j._id),
+        missionId: j.missionId,
+        agentId: j.agentId,
+        type: nextAttempt > (j.maxAttempts ?? 12) ? "abandoned" : "recovered",
+        message: nextAttempt > (j.maxAttempts ?? 12) ? "Retry budget exhausted" : `Recovered as attempt ${nextAttempt}`,
+        stage: nextAttempt > (j.maxAttempts ?? 12) ? "error" : "queued",
+        createdAt: now,
+      });
     }
     return { requeued, abandoned };
   },
 });
 
-// Live activity line + rolling session transcript the agent-runner streams.
 export const updateProgress = mutation({
-  args: { jobId: v.id("jobs"), progress: v.string(), log: v.optional(v.string()) },
+  args: {
+    jobId: v.id("jobs"),
+    progress: v.string(),
+    log: v.optional(v.string()),
+    stage: v.optional(v.string()),
+    percent: v.optional(v.number()),
+  },
   handler: async (ctx, a) => {
-    const patch: Record<string, unknown> = { progress: a.progress.slice(0, 400) };
-    if (a.log !== undefined) patch.log = a.log.slice(-7000);
+    const row = await ctx.db.get(a.jobId);
+    if (!row || row.status !== "running") return;
+    const now = Date.now();
+    const percent = a.percent === undefined ? row.percent : Math.max(0, Math.min(99, a.percent));
+    const patch: Record<string, unknown> = {
+      progress: a.progress.slice(0, 400),
+      heartbeatAt: now,
+      percent,
+    };
+    if (a.stage !== undefined) patch.stage = a.stage.slice(0, 80);
+    if (a.log !== undefined) patch.log = a.log.slice(-12_000);
     await ctx.db.patch(a.jobId, patch);
+    const meaningful = (a.stage && a.stage !== row.stage) || (percent ?? 0) - (row.percent ?? 0) >= 10;
+    if (meaningful)
+      await ctx.db.insert("workEvents", {
+        jobId: String(a.jobId),
+        missionId: row.missionId,
+        agentId: row.agentId,
+        type: "progress",
+        message: a.progress.slice(0, 500),
+        stage: a.stage ?? row.stage,
+        percent,
+        createdAt: now,
+      });
   },
 });
 
-// Currently-running / queued agents — drives the pills + progress bars + live view.
+export const checkpointAndRequeue = mutation({
+  args: {
+    jobId: v.id("jobs"),
+    checkpoint: v.string(),
+    result: v.optional(v.string()),
+    branch: v.optional(v.string()),
+    nextStatus: v.optional(v.union(v.literal("pending"), v.literal("paused"), v.literal("cancelled"))),
+  },
+  handler: async (ctx, a) => {
+    const row = await ctx.db.get(a.jobId);
+    if (!row) return { requeued: false, exhausted: true };
+    const requestedStatus = a.nextStatus ?? "pending";
+    const attempt = (row.attempt ?? 1) + (requestedStatus === "pending" ? 1 : 0);
+    const exhausted =
+      requestedStatus === "pending" &&
+      (attempt > (row.maxAttempts ?? 12) || Date.now() - row.createdAt > 14 * 86_400_000);
+    const status = exhausted ? "error" : requestedStatus;
+    await ctx.db.patch(a.jobId, {
+      status,
+      stage: exhausted ? "error" : requestedStatus === "pending" ? "checkpointed" : requestedStatus,
+      checkpoint: a.checkpoint.slice(0, 6000),
+      result: a.result,
+      branch: a.branch ?? row.branch,
+      attempt,
+      startedAt: undefined,
+      heartbeatAt: Date.now(),
+      completedAt: requestedStatus === "cancelled" || exhausted ? Date.now() : undefined,
+      progress: exhausted
+        ? "continuation budget exhausted"
+        : requestedStatus === "pending"
+          ? `checkpoint saved · continuation ${attempt} queued`
+          : `checkpoint saved · ${requestedStatus}`,
+    });
+    await ctx.db.insert("workEvents", {
+      jobId: String(a.jobId),
+      missionId: row.missionId,
+      agentId: row.agentId,
+      type: exhausted ? "continuation_exhausted" : requestedStatus === "pending" ? "checkpoint" : requestedStatus,
+      message: exhausted
+        ? "Continuation budget exhausted"
+        : requestedStatus === "pending"
+          ? `Checkpoint saved; attempt ${attempt} queued`
+          : `Checkpoint saved; job ${requestedStatus}`,
+      stage: exhausted ? "error" : requestedStatus === "pending" ? "checkpointed" : requestedStatus,
+      percent: row.percent,
+      createdAt: Date.now(),
+    });
+    return { requeued: !exhausted, exhausted };
+  },
+});
+
+export const executionState = query({
+  args: { jobId: v.id("jobs") },
+  handler: async (ctx, a) => (await ctx.db.get(a.jobId))?.status ?? "missing",
+});
+
+export const requestInput = mutation({
+  args: { jobId: v.id("jobs"), question: v.string(), checkpoint: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    const row = await ctx.db.get(a.jobId);
+    if (!row) return false;
+    const now = Date.now();
+    await ctx.db.patch(a.jobId, {
+      status: "needs_input",
+      stage: "needs Daniel",
+      progress: a.question.slice(0, 400),
+      checkpoint: a.checkpoint?.slice(0, 6000) ?? row.checkpoint,
+      heartbeatAt: now,
+    });
+    if (row.agentId) {
+      const agent = await ctx.db
+        .query("agentProfiles")
+        .withIndex("by_slug", (q: any) => q.eq("slug", row.agentId))
+        .first();
+      if (agent) await ctx.db.patch(agent._id, { status: "blocked", currentJobId: String(a.jobId), updatedAt: now });
+    }
+    const fingerprint = `job-input:${a.jobId}`;
+    const existing = await ctx.db
+      .query("attentionItems")
+      .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", fingerprint))
+      .first();
+    const item = {
+      fingerprint,
+      project: row.repo,
+      title: `${row.agentId ?? "Agent"} needs your decision`,
+      detail: a.question.slice(0, 2000),
+      evidence: [`Job ${a.jobId}`, (row.label ?? row.task).slice(0, 300)],
+      severity: "decision",
+      impact: 75,
+      urgency: 70,
+      confidence: 1,
+      actionClass: "ask",
+      status: "open",
+      jobId: String(a.jobId),
+      updatedAt: now,
+    };
+    if (existing) await ctx.db.patch(existing._id, item);
+    else await ctx.db.insert("attentionItems", { ...item, createdAt: now });
+    await ctx.db.insert("workEvents", {
+      jobId: String(a.jobId),
+      missionId: row.missionId,
+      agentId: row.agentId,
+      type: "needs_input",
+      message: a.question.slice(0, 1000),
+      stage: "needs Daniel",
+      percent: row.percent,
+      createdAt: now,
+    });
+    return true;
+  },
+});
+
+export const provideInput = mutation({
+  args: { jobId: v.id("jobs"), answer: v.string() },
+  handler: async (ctx, a) => {
+    const row = await ctx.db.get(a.jobId);
+    if (!row || row.status !== "needs_input") return false;
+    const now = Date.now();
+    await ctx.db.patch(a.jobId, {
+      status: "pending",
+      stage: "queued",
+      progress: "Daniel answered — continuation queued",
+      checkpoint: `${row.checkpoint ?? ""}\n\nDaniel's answer: ${a.answer.slice(0, 2000)}`.trim(),
+      attempt: (row.attempt ?? 1) + 1,
+      heartbeatAt: now,
+    });
+    const attention = await ctx.db
+      .query("attentionItems")
+      .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", `job-input:${a.jobId}`))
+      .first();
+    if (attention) await ctx.db.patch(attention._id, { status: "resolved", updatedAt: now });
+    await ctx.db.insert("workEvents", {
+      jobId: String(a.jobId),
+      missionId: row.missionId,
+      agentId: row.agentId,
+      type: "input_received",
+      message: "Daniel supplied the required decision",
+      stage: "queued",
+      createdAt: now,
+    });
+    return true;
+  },
+});
+
+export const setDelivery = mutation({
+  args: { jobId: v.id("jobs"), branch: v.optional(v.string()), pullRequestUrl: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    await ctx.db.patch(a.jobId, { branch: a.branch, pullRequestUrl: a.pullRequestUrl, heartbeatAt: Date.now() });
+  },
+});
+
+export const control = mutation({
+  args: {
+    jobId: v.id("jobs"),
+    action: v.union(v.literal("pause"), v.literal("resume"), v.literal("cancel"), v.literal("retry")),
+  },
+  handler: async (ctx, a) => {
+    const row = await ctx.db.get(a.jobId);
+    if (!row) return false;
+    const now = Date.now();
+    if (a.action === "pause" && ["pending", "running"].includes(row.status))
+      await ctx.db.patch(a.jobId, { status: "paused", stage: "paused", progress: "paused by Daniel" });
+    else if (a.action === "resume" && row.status === "paused")
+      await ctx.db.patch(a.jobId, { status: "pending", stage: "queued", progress: "resumed — queued" });
+    else if (a.action === "cancel" && !["done", "error", "cancelled"].includes(row.status))
+      await ctx.db.patch(a.jobId, { status: "cancelled", stage: "cancelled", completedAt: now, progress: "cancelled by Daniel" });
+    else if (a.action === "retry" && ["error", "cancelled"].includes(row.status))
+      await ctx.db.patch(a.jobId, {
+        status: "pending",
+        stage: "queued",
+        completedAt: undefined,
+        attempt: (row.attempt ?? 1) + 1,
+        progress: "manual retry queued",
+      });
+    else return false;
+    await ctx.db.insert("workEvents", {
+      jobId: String(a.jobId),
+      missionId: row.missionId,
+      agentId: row.agentId,
+      type: a.action,
+      message: `${a.action} requested by Daniel`,
+      stage: a.action === "resume" || a.action === "retry" ? "queued" : `${a.action}d`,
+      createdAt: now,
+    });
+    return true;
+  },
+});
+
 export const active = query({
   args: {},
   handler: async (ctx) => {
-    const pending = await ctx.db
-      .query("jobs")
-      .withIndex("by_status", (q: any) => q.eq("status", "pending"))
-      .collect();
-    const running = await ctx.db
-      .query("jobs")
-      .withIndex("by_status", (q: any) => q.eq("status", "running"))
-      .collect();
-    return [...running, ...pending]
-      .sort((a: any, b: any) => a.createdAt - b.createdAt)
+    const statuses = ["running", "pending", "awaiting_approval", "paused", "needs_input"];
+    const groups = await Promise.all(
+      statuses.map((status) =>
+        ctx.db
+          .query("jobs")
+          .withIndex("by_status", (q: any) => q.eq("status", status))
+          .take(30),
+      ),
+    );
+    return groups
+      .flat()
+      .sort((a: any, b: any) => (b.priority ?? 50) - (a.priority ?? 50) || a.createdAt - b.createdAt)
       .map((j: any) => ({
         _id: j._id,
         task: j.task,
@@ -126,9 +533,23 @@ export const active = query({
         missionId: j.missionId ?? null,
         repo: j.repo ?? null,
         model: j.model ?? null,
+        modelReason: j.modelReason ?? null,
+        agentId: j.agentId ?? null,
+        risk: j.risk ?? "low",
+        priority: j.priority ?? 50,
         status: j.status,
+        stage: j.stage ?? j.status,
+        percent: j.percent ?? 0,
         progress: j.progress ?? "",
+        log: j.log ?? "",
+        attempt: j.attempt ?? 1,
+        maxAttempts: j.maxAttempts ?? 12,
+        checkpoint: j.checkpoint ?? null,
+        branch: j.branch ?? null,
+        pullRequestUrl: j.pullRequestUrl ?? null,
+        originThreadId: j.originThreadId ?? "main",
         startedAt: j.startedAt ?? j.createdAt,
+        heartbeatAt: j.heartbeatAt ?? j.startedAt ?? j.createdAt,
       }));
   },
 });

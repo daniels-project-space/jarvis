@@ -84,6 +84,80 @@ export const update = mutation({
   },
 });
 
+// Atomic progressive travel patch. Provider calls finish independently; doing
+// read/modify/write in the Vercel route let two simultaneous results overwrite
+// one another. Keeping the merge in one Convex mutation makes each arrival
+// reactive and race-safe.
+export const updateTripProvider = mutation({
+  args: {
+    id: v.id("creations"),
+    provider: v.union(v.literal("flights"), v.literal("stays"), v.literal("activities"), v.literal("airport")),
+    status: v.union(v.literal("queued"), v.literal("searching"), v.literal("ready"), v.literal("error"), v.literal("skipped")),
+    source: v.string(),
+    items: v.optional(v.any()),
+    error: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    const row = await ctx.db.get(a.id);
+    if (!row || row.kind !== "trip" || !row.data) return false;
+    let doc: any;
+    try {
+      doc = JSON.parse(row.data);
+    } catch {
+      return false;
+    }
+    const now = Date.now();
+    doc.providers = doc.providers ?? {};
+    const count = Array.isArray(a.items) ? a.items.length : a.items ? 1 : 0;
+    doc.providers[a.provider] = {
+      status: a.status,
+      source: a.source,
+      count,
+      checkedAt: now,
+      error: a.error?.slice(0, 300),
+    };
+    if (a.items !== undefined) {
+      if (a.provider === "airport") doc.airport = a.items || undefined;
+      else doc[a.provider] = a.items;
+    }
+    const points = [...(doc.stays ?? []), ...(doc.activities ?? [])].filter(
+      (item: any) => Number.isFinite(item?.lat) && Number.isFinite(item?.lng),
+    );
+    if (points.length) {
+      doc.center = {
+        lat: points.reduce((sum: number, item: any) => sum + item.lat, 0) / points.length,
+        lng: points.reduce((sum: number, item: any) => sum + item.lng, 0) / points.length,
+      };
+    }
+    const nights = Math.max(1, Math.round((Date.parse(doc.returnDate) - Date.parse(doc.departDate)) / 86_400_000) || 1);
+    const flightOption = doc.locked?.flight ?? doc.flights?.[0];
+    const projectedStay = doc.locked?.stay ?? doc.stays?.[0];
+    const flights = (flightOption?.priceGbp ?? 0) * (doc.adults ?? 1);
+    const stay = projectedStay?.totalGbp ?? (projectedStay?.priceGbp ?? 0) * nights;
+    const activitiesEst = (doc.locked?.activities?.length ?? 0) * 25 * (doc.adults ?? 1);
+    const lockedFlights = (doc.locked?.flight?.priceGbp ?? 0) * (doc.adults ?? 1);
+    const lockedStay = doc.locked?.stay?.totalGbp ?? (doc.locked?.stay?.priceGbp ?? 0) * nights;
+    doc.totals = {
+      flights: Math.round(flights),
+      stay: Math.round(stay),
+      activitiesEst: Math.round(activitiesEst),
+      total: Math.round(flights + stay + activitiesEst),
+      projectedTotal: Math.round(flights + stay + activitiesEst),
+      lockedTotal: Math.round(lockedFlights + lockedStay + activitiesEst),
+    };
+    const states = Object.values(doc.providers).map((provider: any) => provider?.status);
+    if (states.length && states.every((state) => ["ready", "error", "skipped"].includes(String(state)))) {
+      doc.searchCompletedAt = now;
+    }
+    await ctx.db.patch(a.id, {
+      data: JSON.stringify(doc),
+      thumb: row.thumb ?? doc.stays?.[0]?.thumb ?? doc.activities?.[0]?.photo,
+      updatedAt: now,
+    });
+    return true;
+  },
+});
+
 // Board persistence with op-queue merge: the client saves its full element
 // state but must NOT clobber ops the brain queued while it was drawing —
 // ops newer than appliedUpTo survive the save.

@@ -316,6 +316,13 @@ body {
 }
 .bob { animation: bob 5.5s ease-in-out infinite; }
 
+.safe-composer {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
+.safe-floating-bottom {
+  bottom: max(0.75rem, env(safe-area-inset-bottom));
+}
+
 @media (prefers-reduced-motion: reduce) {
   .materialize, .materialize::after, .rise, .breathe, .live-ring, .cap-bloom,
   .brackets::before, .brackets::after, .brackets > .bk::before, .brackets > .bk::after {

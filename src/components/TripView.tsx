@@ -149,12 +149,43 @@ function MapView({
   return <div ref={mountRef} className="h-full w-full [&_.maplibregl-ctrl-attrib]:!bg-black/40 [&_.maplibregl-ctrl-attrib]:!text-[9px]" />;
 }
 
-async function tripTool(action: string, extra: Record<string, unknown> = {}) {
-  await fetch("/api/tools", {
+async function tripTool(tripId: string, action: string, extra: Record<string, unknown> = {}) {
+  const response = await fetch("/api/tools", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name: action === "finalize" ? "trip_finalize" : "trip_update", args: action === "finalize" ? {} : { action, ...extra } }),
-  }).catch(() => {});
+    body: JSON.stringify({
+      name: action === "finalize" ? "trip_finalize" : "trip_update",
+      args: action === "finalize" ? { trip_id: tripId, ...extra } : { trip_id: tripId, action, ...extra },
+    }),
+  });
+  const body = await response.json().catch(() => ({ result: "Travel action failed" }));
+  const result = String(body.result ?? "");
+  if (!response.ok || /^Tool failed:/i.test(result)) throw new Error(result || "Travel action failed");
+  return result;
+}
+
+async function retryTrip(tripId: string, doc: any) {
+  const response = await fetch("/api/tools", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      name: "trip_plan",
+      args: {
+        trip_id: tripId,
+        destination: doc.destination,
+        dest_iata: doc.destIata,
+        origin_iata: doc.origin,
+        depart_date: doc.departDate,
+        return_date: doc.returnDate,
+        adults: doc.adults,
+        budget_total_gbp: doc.budgetGbp,
+        include_flights: doc.includeFlights !== false,
+        vibe: doc.vibe,
+      },
+    }),
+  });
+  const body = await response.json().catch(() => ({ result: "Travel search failed" }));
+  if (!response.ok || /^Tool failed:/i.test(String(body.result ?? ""))) throw new Error(String(body.result ?? "Travel search failed"));
 }
 
 const gbp = (n?: number) => (n != null ? `£${Math.round(n).toLocaleString("en-GB")}` : "£?");
@@ -183,6 +214,8 @@ export default function TripView({ value }: { value: string }) {
   const [amenity, setAmenity] = useState("");
   const [sortBy, setSortBy] = useState<"value" | "price" | "rating">("value");
   const [busy, setBusy] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [syncCalendar, setSyncCalendar] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
   const markers: Marker[] = useMemo(() => {
@@ -215,8 +248,14 @@ export default function TripView({ value }: { value: string }) {
 
   const act = async (label: string, action: string, extra: Record<string, unknown> = {}) => {
     setBusy(label);
-    await tripTool(action, extra);
-    setBusy("");
+    setActionError("");
+    try {
+      await tripTool(creationId, action, extra);
+    } catch (error: any) {
+      setActionError(String(error?.message ?? error));
+    } finally {
+      setBusy("");
+    }
   };
 
   const stays = (doc.stays ?? [])
@@ -235,8 +274,20 @@ export default function TripView({ value }: { value: string }) {
           : (b.rating ?? 3) ** 2 / (b.priceGbp ?? 200) - (a.rating ?? 3) ** 2 / (a.priceGbp ?? 200),
     );
   const totals = doc.totals ?? { total: 0, flights: 0, stay: 0, activitiesEst: 0 };
-  const over = totals.total > doc.budgetGbp;
+  const projectedTotal = totals.projectedTotal ?? totals.total ?? 0;
+  const lockedTotal = totals.lockedTotal ?? 0;
+  const over = projectedTotal > doc.budgetGbp;
   const nights = Math.max(1, Math.round((Date.parse(doc.returnDate || doc.departDate) - Date.parse(doc.departDate)) / 86_400_000)) || 1;
+  const providerEntries = Object.entries(doc.providers ?? {}) as [string, any][];
+  const searchingProviders = providerEntries.filter(([, provider]) => ["queued", "searching"].includes(provider.status));
+  const failedProviders = providerEntries.filter(([, provider]) => provider.status === "error");
+  const searchFinished = providerEntries.length > 0 && providerEntries.every(([, provider]) => ["ready", "error", "skipped"].includes(provider.status));
+  const steps = [
+    { label: "Search", done: searchFinished, active: !searchFinished },
+    { label: "Stay", done: Boolean(doc.locked?.stay), active: searchFinished && !doc.locked?.stay },
+    { label: "Flight", done: doc.includeFlights === false || Boolean(doc.locked?.flight), active: Boolean(doc.locked?.stay) && doc.includeFlights !== false && !doc.locked?.flight },
+    { label: "Plan", done: doc.status === "planned", active: Boolean(doc.locked?.stay) && (doc.includeFlights === false || Boolean(doc.locked?.flight)) && doc.status !== "planned" },
+  ];
 
   const onMapSelect = (key: string) => {
     setSelected(key);
@@ -253,7 +304,7 @@ export default function TripView({ value }: { value: string }) {
     <div className="flex min-h-0 flex-1 flex-col md:flex-row">
       {/* the map */}
       <div className="relative h-[30dvh] shrink-0 border-b border-white/5 md:h-auto md:w-[44%] md:border-b-0 md:border-r">
-        <MapView center={doc.center} markers={markers} links={links} selected={selected} onSelect={onMapSelect} />
+        <MapView center={doc.center ?? { lat: 51.5074, lng: -0.1278 }} markers={markers} links={links} selected={selected} onSelect={onMapSelect} />
         <div className="pointer-events-none absolute left-3 top-3 rounded-lg bg-black/50 px-2 py-1 backdrop-blur">
           <div className="text-sm font-semibold text-ice">{doc.destination}</div>
           <div className="hud-label !text-[9px]">
@@ -269,20 +320,66 @@ export default function TripView({ value }: { value: string }) {
 
       {/* the workspace */}
       <div className="flex min-h-0 flex-1 flex-col">
+        <div className="border-b border-white/5 px-3 py-2">
+          <div className="flex items-center gap-1.5 overflow-x-auto">
+            {steps.map((step, index) => (
+              <div key={step.label} className={`flex shrink-0 items-center gap-1 text-[9px] uppercase tracking-wider ${step.done ? "text-emerald-400" : step.active ? "text-cyan" : "text-slate/60"}`}>
+                <span className={`grid h-4 w-4 place-items-center rounded-full border text-[8px] ${step.done ? "border-emerald-400/50 bg-emerald-400/10" : step.active ? "border-cyan/50 bg-cyan/10" : "border-white/10"}`}>
+                  {step.done ? "✓" : index + 1}
+                </span>
+                {step.label}
+                {index < steps.length - 1 && <span className="mx-0.5 text-white/10">›</span>}
+              </div>
+            ))}
+          </div>
+          {providerEntries.length > 0 && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-1">
+              {providerEntries.map(([name, provider]) => (
+                <span
+                  key={name}
+                  title={provider.error || `${provider.source}${provider.checkedAt ? ` · checked ${new Date(provider.checkedAt).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}` : ""}`}
+                  className={`flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[8px] uppercase tracking-wider ${provider.status === "error" ? "border-red-400/30 text-red-300" : provider.status === "searching" || provider.status === "queued" ? "border-cyan/25 text-cyan" : provider.status === "skipped" ? "border-white/8 text-slate" : "border-emerald-400/25 text-emerald-300"}`}
+                >
+                  <span className={`h-1 w-1 rounded-full ${provider.status === "error" ? "bg-red-400" : provider.status === "searching" || provider.status === "queued" ? "animate-pulse bg-cyan" : provider.status === "skipped" ? "bg-slate" : "bg-emerald-400"}`} />
+                  {name} · {provider.status}{provider.count != null ? ` ${provider.count}` : ""}
+                </span>
+              ))}
+              {searchingProviders.length > 0 && <span className="ml-auto animate-pulse text-[9px] text-cyan">results arriving live…</span>}
+              {failedProviders.length > 0 && (
+                <button
+                  type="button"
+                  disabled={Boolean(busy)}
+                  onClick={() => {
+                    setBusy("retrying providers");
+                    setActionError("");
+                    void retryTrip(creationId, doc)
+                      .catch((error: any) => setActionError(String(error?.message ?? error)))
+                      .finally(() => setBusy(""));
+                  }}
+                  className="ml-auto text-[9px] uppercase tracking-wider text-red-300 hover:text-red-200 disabled:opacity-40"
+                >
+                  retry failed
+                </button>
+              )}
+            </div>
+          )}
+          {actionError && <div className="mt-1.5 rounded border border-red-400/20 bg-red-400/5 px-2 py-1 text-[10px] text-red-300">{actionError}</div>}
+        </div>
         <div className="border-b border-white/5 px-3 pb-2 pt-2.5">
           <div className="flex flex-wrap items-baseline justify-between gap-x-3 text-sm">
             <span className="text-ice">
-              {gbp(totals.total)} <span className="text-slate">of {gbp(doc.budgetGbp)} total</span>
+              {gbp(projectedTotal)} <span className="text-slate">projected of {gbp(doc.budgetGbp)}</span>
+              <span className="ml-2 text-xs text-cyan">{gbp(lockedTotal)} locked</span>
               <span className="ml-2 text-xs text-slate">≈ {gbp(Math.round((doc.budgetGbp || 0) / nights))}/day budget</span>
             </span>
             <span className={`text-xs ${over ? "text-red-400" : "text-cyan"}`}>
-              {over ? `${gbp(totals.total - doc.budgetGbp)} over` : `${gbp(doc.budgetGbp - totals.total)} left`}
+              {over ? `${gbp(projectedTotal - doc.budgetGbp)} over` : `${gbp(doc.budgetGbp - projectedTotal)} headroom`}
             </span>
           </div>
           <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-white/5">
             <div
               className={`h-full rounded-full transition-all duration-700 ${over ? "bg-red-400" : "bg-gradient-to-r from-cyan/50 to-cyan"}`}
-              style={{ width: `${Math.min(100, (totals.total / Math.max(1, doc.budgetGbp)) * 100)}%` }}
+              style={{ width: `${Math.min(100, (projectedTotal / Math.max(1, doc.budgetGbp)) * 100)}%` }}
             />
           </div>
         </div>
@@ -335,6 +432,18 @@ export default function TripView({ value }: { value: string }) {
                   <option value="rating">top rated</option>
                 </select>
               </div>
+              {!doc.stays?.length && ["queued", "searching"].includes(doc.providers?.stays?.status) && (
+                <div className={`${glass} animate-pulse p-5 text-center text-sm text-cyan`}>Searching stays — the first page will appear here as soon as it lands…</div>
+              )}
+              {!doc.stays?.length && doc.providers?.stays?.status === "error" && (
+                <div className={`${glass} border-red-400/20 p-5 text-center text-sm text-red-300`}>Stay search failed: {doc.providers.stays.error ?? "provider unavailable"}. Use retry above.</div>
+              )}
+              {!doc.stays?.length && doc.providers?.stays?.status === "ready" && (
+                <div className={`${glass} p-5 text-center text-sm text-slate`}>No stays matched this budget. Raise the nightly cap or ask JARVIS to widen the search.</div>
+              )}
+              {!!doc.stays?.length && !stays.length && (
+                <div className={`${glass} p-5 text-center text-sm text-slate`}>No stays match these filters. Clear one or more filters to see the full shortlist.</div>
+              )}
               {stays.map((s: any) => {
                 const locked = doc.locked?.stay?.name === s.name;
                 const sel = selected === `stay:${s.name}`;
@@ -386,8 +495,17 @@ export default function TripView({ value }: { value: string }) {
 
           {tab === "flights" && (
             <>
-              {!(doc.flights ?? []).length && (
-                <div className="mt-8 text-center text-sm text-slate">No flights scouted — tell JARVIS where you&apos;re flying from.</div>
+              {!(doc.flights ?? []).length && ["queued", "searching"].includes(doc.providers?.flights?.status) && (
+                <div className={`${glass} animate-pulse p-5 text-center text-sm text-cyan`}>Searching return fares…</div>
+              )}
+              {!(doc.flights ?? []).length && doc.providers?.flights?.status === "error" && (
+                <div className={`${glass} border-red-400/20 p-5 text-center text-sm text-red-300`}>Flight search failed: {doc.providers.flights.error ?? "provider unavailable"}. Use retry above.</div>
+              )}
+              {!(doc.flights ?? []).length && doc.providers?.flights?.status === "skipped" && (
+                <div className={`${glass} p-5 text-center text-sm text-slate`}>Flights were intentionally left out of this trip.</div>
+              )}
+              {!(doc.flights ?? []).length && doc.providers?.flights?.status === "ready" && (
+                <div className={`${glass} p-5 text-center text-sm text-slate`}>No return fares were found for these airports and dates.</div>
               )}
               {(doc.flights ?? []).map((f: any, i: number) => {
                 const locked = doc.locked?.flight && doc.locked.flight.departTime === f.departTime && doc.locked.flight.priceGbp === f.priceGbp;
@@ -407,6 +525,7 @@ export default function TripView({ value }: { value: string }) {
                       <div className="text-[11px] text-slate">
                         {f.departTime} → {f.arriveTime} · {Math.round(((f.durationMin ?? 0) / 60) * 10) / 10}h
                       </div>
+                      {f.roundTrip && <div className="text-[10px] text-amber">return fare · outbound schedule shown</div>}
                       <div className="mt-1 flex gap-2">
                         <a href={f.bookLink} target="_blank" rel="noreferrer" className="rounded-lg bg-white/5 px-2 py-1 text-[11px] text-ice ring-1 ring-white/10 transition hover:text-cyan">
                           book ↗
@@ -425,8 +544,18 @@ export default function TripView({ value }: { value: string }) {
             </>
           )}
 
-          {tab === "activities" &&
-            (doc.activities ?? []).map((a: any) => {
+          {tab === "activities" && (
+            <>
+              {!(doc.activities ?? []).length && ["queued", "searching"].includes(doc.providers?.activities?.status) && (
+                <div className={`${glass} animate-pulse p-5 text-center text-sm text-cyan`}>Finding useful places and visual highlights…</div>
+              )}
+              {!(doc.activities ?? []).length && doc.providers?.activities?.status === "error" && (
+                <div className={`${glass} border-red-400/20 p-5 text-center text-sm text-red-300`}>Activity search failed: {doc.providers.activities.error ?? "provider unavailable"}. Use retry above.</div>
+              )}
+              {!(doc.activities ?? []).length && doc.providers?.activities?.status === "ready" && (
+                <div className={`${glass} p-5 text-center text-sm text-slate`}>No activities were returned for this destination.</div>
+              )}
+              {(doc.activities ?? []).map((a: any) => {
               const picked = (doc.locked?.activities ?? []).includes(a.name);
               const sel = selected === `act:${a.name}`;
               return (
@@ -455,7 +584,9 @@ export default function TripView({ value }: { value: string }) {
                   </div>
                 </div>
               );
-            })}
+              })}
+            </>
+          )}
 
           {tab === "plan" && (
             <>
@@ -473,16 +604,30 @@ export default function TripView({ value }: { value: string }) {
                   <div className={glass + " py-1.5"}><div className="text-ice">{gbp(totals.flights)}</div><div className="text-slate">flights</div></div>
                   <div className={glass + " py-1.5"}><div className="text-ice">{gbp(totals.stay)}</div><div className="text-slate">stay</div></div>
                   <div className={glass + " py-1.5"}><div className="text-ice">{gbp(totals.activitiesEst)}</div><div className="text-slate">activities</div></div>
-                  <div className={glass + " py-1.5"}><div className={over ? "text-red-400" : "text-cyan"}>{gbp(totals.total)}</div><div className="text-slate">total · {gbp(Math.round(totals.total / nights))}/day</div></div>
+                  <div className={glass + " py-1.5"}><div className={over ? "text-red-400" : "text-cyan"}>{gbp(projectedTotal)}</div><div className="text-slate">projected · {gbp(Math.round(projectedTotal / nights))}/day</div></div>
                 </div>
                 {doc.status !== "planned" && (
-                  <button
-                    onClick={() => void act("finalizing", "finalize")}
-                    disabled={!doc.locked?.stay}
-                    className="mt-2 w-full rounded-lg bg-cyan/15 py-2 text-[13px] font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40"
-                  >
-                    finalize → itinerary + calendar + trip map
-                  </button>
+                  <>
+                    <label className="mt-2 flex cursor-pointer items-center gap-2 rounded-lg border border-white/8 bg-black/15 px-2.5 py-2 text-[11px] text-slate">
+                      <input type="checkbox" checked={syncCalendar} onChange={(event) => setSyncCalendar(event.target.checked)} className="accent-cyan" />
+                      Sync the reviewed itinerary to my calendar
+                    </label>
+                    <button
+                      onClick={() => void act("finalizing", "finalize", { add_to_calendar: syncCalendar })}
+                      disabled={Boolean(busy) || !doc.locked?.stay || (doc.includeFlights !== false && (doc.flights ?? []).length > 0 && !doc.locked?.flight)}
+                      className="mt-2 w-full rounded-lg bg-cyan/15 py-2 text-[13px] font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40"
+                    >
+                      finalize reviewed plan{syncCalendar ? " + sync calendar" : " · calendar untouched"}
+                    </button>
+                    {doc.includeFlights !== false && (doc.flights ?? []).length > 0 && !doc.locked?.flight && (
+                      <div className="mt-1 text-center text-[10px] text-amber">Lock a specific flight before finalizing.</div>
+                    )}
+                  </>
+                )}
+                {doc.status === "planned" && (
+                  <div className="mt-2 rounded-lg border border-emerald-400/20 bg-emerald-400/5 px-2.5 py-2 text-center text-[11px] text-emerald-300">
+                    Plan finalized{doc.calendarSyncedAt ? ` · calendar synced ${new Date(doc.calendarSyncedAt).toLocaleString("en-GB")}` : " · calendar untouched"}
+                  </div>
                 )}
               </div>
               {(doc.itinerary ?? []).map((day: any) => (

@@ -6,12 +6,38 @@ import { TOOL_DEFS, executeTool } from "@/lib/tools";
 // session. ?live=1 returns a SLIMMED belt: paragraph-long descriptions and
 // background-ops tools made every voice turn reprocess a huge prompt — that
 // was most of live mode's response lag.
-// persona explicitly routes to deliberate/memory_map — excluding them made
-// the live model call functions that didn't exist; only true internals stay out
-const LIVE_EXCLUDE = new Set(["self_repair", "self_improve"]);
+// Realtime starts with a compact core belt, then loads a domain belt only when
+// the conversation enters work, creative, travel or business territory. This
+// keeps every ordinary voice turn from reconsidering ~70 JSON schemas.
+const LIVE_BELTS: Record<string, Set<string>> = {
+  core: new Set([
+    "dispatch_agent", "work_control", "show", "show_ranking", "rank_focus", "video_control", "hide",
+    "web_search", "read_url", "remember", "memory_search", "agent_status", "weather", "timer", "briefing",
+    "remind_at", "reminder_cancel", "todo_add", "todo_done", "todo_remove", "todo_list", "calendar_add",
+    "calendar_remove", "calendar_view", "open_app", "deliberate", "current_time", "calculate",
+  ]),
+  work: new Set([
+    "orchestrate", "self_repair", "self_improve", "research", "plan_my_day", "net_worth", "memory_map",
+    "rental_availability", "rental_stats", "rentals_calendar", "clear_chat", "new_chat",
+  ]),
+  creative: new Set([
+    "creative_sprint", "create_image", "store_image", "create_pdf", "board", "mind_map", "chart", "draft",
+    "creations_list", "youtube_search", "youtube_transcript", "music_search",
+  ]),
+  travel: new Set([
+    "trip_open", "trip_plan", "trip_update", "trip_finalize", "flight_search", "open_travel_site", "places_near",
+    "transport_route",
+  ]),
+  business: new Set([
+    "market", "price_chart", "market_analysis", "price_watch", "watch_cancel", "shop_search", "news_today",
+    "rental_availability", "rental_stats", "rentals_calendar", "net_worth",
+  ]),
+};
 export async function GET(req: NextRequest) {
-  if (new URL(req.url).searchParams.get("live")) {
-    const slim = TOOL_DEFS.filter((t) => !LIVE_EXCLUDE.has(t.name)).map((t) => {
+  const live = new URL(req.url).searchParams.get("live");
+  if (live) {
+    const belt = LIVE_BELTS[live === "1" ? "core" : live] ?? LIVE_BELTS.core;
+    const slim = TOOL_DEFS.filter((t) => belt.has(t.name)).map((t) => {
       // first sentence (or two, if the first is very short) carries the intent;
       // the persona carries the routing rules
       const d = String(t.description ?? "");

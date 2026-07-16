@@ -1,12 +1,21 @@
 "use client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useMutation } from "convex/react";
+import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
-import ThreeOrb from "./ThreeOrb";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
-import TripView from "./TripView";
-import BoardView from "./BoardView";
+import CommandDeck from "./CommandDeck";
+
+const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
+const TripView = dynamic(() => import("./TripView"), {
+  ssr: false,
+  loading: () => <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-cyan">loading travel workspace…</div>,
+});
+const BoardView = dynamic(() => import("./BoardView"), {
+  ssr: false,
+  loading: () => <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-cyan">loading drawing workspace…</div>,
+});
 
 type Attachment = { type: string; value: string; title?: string };
 type Msg = {
@@ -18,7 +27,26 @@ type Msg = {
   attachment?: Attachment;
   createdAt: number;
 };
-type Job = { _id: string; task: string; model?: string; status: string; progress?: string; log?: string; startedAt: number };
+type Job = {
+  _id: string;
+  task: string;
+  label?: string;
+  agentId?: string;
+  model?: string;
+  modelReason?: string;
+  status: string;
+  stage?: string;
+  percent?: number;
+  progress?: string;
+  log?: string;
+  attempt?: number;
+  maxAttempts?: number;
+  heartbeatAt?: number;
+  checkpoint?: string;
+  branch?: string;
+  pullRequestUrl?: string;
+  startedAt: number;
+};
 type Caption = { who: "you" | "jarvis"; text: string; exiting?: boolean } | null;
 
 const ytId = (s: string) => {
@@ -377,25 +405,38 @@ function LiveSessionLog({ job }: { job: Job }) {
 
 function AgentLiveView({ job, now, onClose }: { job: Job; now: number; onClose: () => void }) {
   const elapsed = Math.max(0, Math.floor((now - job.startedAt) / 1000));
-  const pct = job.status === "running" ? Math.min(95, 6 + Math.round((elapsed / 180) * 90)) : 6;
+  const pct = Math.max(0, Math.min(100, job.percent ?? 0));
+  const owner = ({ paul: "Paul", atlas: "Atlas", iris: "Iris", maya: "Maya", sentry: "Sentry", jarvis: "JARVIS" } as Record<string, string>)[job.agentId ?? ""] ?? "Agent";
   return (
     <div className="materialize glass relative flex h-full flex-col rounded-2xl p-4 pt-11">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <ModelBadge model={job.model} />
-          <span className="hud-label">{job.status === "running" ? "working" : "queued"} · {elapsed}s</span>
+          <span className="hud-label">{owner} · {job.stage ?? job.status} · {elapsed}s</span>
+          {(job.attempt ?? 1) > 1 && <span className="hud-label text-amber">pass {job.attempt}/{job.maxAttempts ?? 12}</span>}
         </div>
         <button onClick={onClose} className="hud-label rounded px-2 py-1 hover:text-cyan">
           close
         </button>
       </div>
-      <div className="mt-3 text-sm text-ice">{job.task}</div>
-      <div className="mt-3 h-px w-full overflow-hidden rounded-full bg-white/10">
+      <div className="mt-3 text-sm text-ice">{job.label ?? job.task}</div>
+      {job.label && <div className="mt-1 text-xs text-slate">{job.task}</div>}
+      <div className="mt-3 flex items-center gap-2">
+        <div className="h-px flex-1 overflow-hidden rounded-full bg-white/10">
         <div
           className="h-full bg-gradient-to-r from-cyan to-sky-400 transition-all duration-1000"
           style={{ width: `${pct}%` }}
         />
+        </div>
+        <span className="font-mono text-[10px] text-cyan">{pct}%</span>
       </div>
+      {(job.branch || job.pullRequestUrl || job.modelReason) && (
+        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-slate">
+          {job.branch && <span className="font-mono">branch · {job.branch}</span>}
+          {job.pullRequestUrl && <a href={job.pullRequestUrl} target="_blank" rel="noreferrer" className="text-cyan hover:underline">draft PR ↗</a>}
+          {job.modelReason && <span title={job.modelReason}>routing · {job.model ?? "auto"}</span>}
+        </div>
+      )}
       <LiveSessionLog job={job} />
     </div>
   );
@@ -1332,6 +1373,11 @@ export default function JarvisUI() {
     me.current = clientId();
   }, []);
   useEffect(() => {
+    const preload = () => import("../lib/realtime").then((module) => module.preloadLive()).catch(() => {});
+    const timer = window.setTimeout(preload, 900);
+    return () => window.clearTimeout(timer);
+  }, []);
+  useEffect(() => {
     voiceRef.current = voiceRow ?? null;
   }, [voiceRow]);
   const liveOnRef = useRef<{ value: string; updatedAt: number } | null>(null);
@@ -1589,13 +1635,9 @@ export default function JarvisUI() {
       return;
     }
     if (liveRef.current) return;
-    // One live session TOTAL, across every device — the lock refuses seconds.
-    const got = await setLiveOn({ client: me.current, on: true }).catch(() => true);
-    if (got === false) {
-      console.warn("live: another device holds the session"); // never a blocking alert
-      rearmWake();
-      return;
-    }
+    // The token route atomically owns the cross-device lease. Keeping the
+    // client-side pre-lock as well added a full network round trip and raced
+    // with the same server check.
     void claimVoice({ client: me.current });
     import("../lib/tts").then((m) => m.stopSpeaking());
     const { stopWake } = await import("../lib/wakeword");
@@ -1891,14 +1933,14 @@ export default function JarvisUI() {
   return (
     <div className="flex h-dvh flex-col overflow-hidden">
       {/* top HUD strip */}
-      <header className="flex items-center justify-between px-5 pb-2 pt-4">
-        <div className="flex items-baseline gap-3">
-          <h1 className="font-display text-xl font-bold tracking-[0.42em] text-green-400" style={{ fontFamily: "var(--font-chakra)" }}>
+      <header className="flex items-center justify-between gap-2 px-3 pb-2 pt-3 sm:px-5 sm:pt-4">
+        <div className="flex min-w-0 items-baseline gap-2 sm:gap-3">
+          <h1 className="font-display shrink-0 text-lg font-bold tracking-[0.32em] text-green-400 sm:text-xl sm:tracking-[0.42em]" style={{ fontFamily: "var(--font-chakra)" }}>
             JARVIS
           </h1>
           <span className="hud-label hidden sm:inline">personal ai · online</span>
         </div>
-        <div className="flex items-center gap-4">
+        <div className="flex min-w-0 items-center gap-2 sm:gap-4">
           <span className="flex items-center gap-1.5">
             <span className={`h-1.5 w-1.5 rounded-full ${live === "live" ? "bg-cyan" : "bg-emerald-400"} breathe`} />
             <span className="hud-label">{status}</span>
@@ -1908,16 +1950,18 @@ export default function JarvisUI() {
             title={wake ? "standby on — say 'hey Jarvis'" : "enable wake word"}
             className={`hud-label rounded px-1 transition ${wake ? "!text-cyan" : "hover:text-cyan"}`}
           >
-            {wake ? "◉ hey jarvis" : "wake"}
+            <span className="sm:hidden">{wake ? "◉" : "wake"}</span>
+            <span className="hidden sm:inline">{wake ? "◉ hey jarvis" : "wake"}</span>
           </button>
           <button
             onClick={() => setChatMode(chatMode === "full" ? "bar" : chatMode === "bar" ? "off" : "full")}
             title="chat layout — full column / type bar / hidden (always listening)"
             className="hud-label rounded px-1 transition hover:text-cyan"
           >
-            {chatMode === "full" ? "▤ chat" : chatMode === "bar" ? "▁ bar" : "◌ zen"}
+            <span className="sm:hidden">{chatMode === "full" ? "▤" : chatMode === "bar" ? "▁" : "◌"}</span>
+            <span className="hidden sm:inline">{chatMode === "full" ? "▤ chat" : chatMode === "bar" ? "▁ bar" : "◌ zen"}</span>
           </button>
-          <Clock />
+          <span className="hidden md:inline"><Clock /></span>
           <button
             onClick={async () => {
               const r = await (await import("../lib/push")).subscribePush(saveSub);
@@ -1932,7 +1976,7 @@ export default function JarvisUI() {
               );
             }}
             title="notifications"
-            className="hud-label rounded px-1 hover:text-cyan"
+            className="hud-label hidden rounded px-1 hover:text-cyan sm:block"
           >
             ping
           </button>
@@ -1945,6 +1989,11 @@ export default function JarvisUI() {
           </button>
         </div>
       </header>
+      <CommandDeck
+        busy={busy}
+        selectedJobId={agentView}
+        onSelectJob={(id) => setAgentView((current) => (current === id ? null : id))}
+      />
       {optionsOpen && (
         <OptionsPanel
           prefs={prefs}
@@ -1959,37 +2008,6 @@ export default function JarvisUI() {
           onMood={(m) => void setMoodMut({ mood: m, manual: true })}
           onClearMood={() => void setMoodMut({ mood: "calm", manual: true })}
         />
-      )}
-
-      {/* ALWAYS-VISIBLE activity layer: whenever JARVIS is thinking or agents
-          are working, the pills sit right under the header on every screen —
-          you can see him working and keep talking. */}
-      {(busy || activeJobs.length > 0) && (
-        <div className="pointer-events-none fixed left-1/2 top-11 z-50 flex max-w-[96vw] -translate-x-1/2 flex-wrap items-center justify-center gap-1.5">
-          {busy && (
-            <span className="glass flex items-center gap-1.5 rounded-full !border-cyan/50 px-3 py-1 text-[11px] text-cyan shadow-lg">
-              <span className="typing-dots inline-flex gap-1"><span /><span /><span /></span>
-              thinking
-            </span>
-          )}
-          {activeJobs.slice(0, 5).map((j) => (
-            <button
-              key={j._id}
-              onClick={() => setAgentView(agentView === j._id ? null : j._id)}
-              className={`glass pointer-events-auto flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] shadow-lg transition ${
-                agentView === j._id ? "!border-cyan/60 text-cyan" : "text-ice hover:text-cyan"
-              }`}
-              title={j.task}
-            >
-              <span className="relative flex h-1.5 w-1.5">
-                <span className={`absolute inline-flex h-full w-full rounded-full ${j.status === "running" ? "animate-ping bg-cyan opacity-60" : "bg-amber opacity-60"}`} />
-                <span className={`inline-flex h-1.5 w-1.5 rounded-full ${j.status === "running" ? "bg-cyan" : "bg-amber"}`} />
-              </span>
-              <span className="max-w-[150px] truncate">{(j as { label?: string }).label ?? j.task}</span>
-            </button>
-          ))}
-          {activeJobs.length > 5 && <span className="glass rounded-full px-2 py-1 text-[10px] text-slate">+{activeJobs.length - 5}</span>}
-        </div>
       )}
 
       <div className={`relative mx-auto flex w-full max-w-[1720px] flex-1 flex-col overflow-clip p-4 pt-2 ${chatMode === "bar" ? "pb-24" : ""}`}>
@@ -2028,7 +2046,11 @@ export default function JarvisUI() {
               </button>
             </div>
           )}
-          {panel && panel.type !== "video" && !panelMin && !panelFull ? (
+          {shownJob ? (
+            <div className="absolute inset-0 z-20 p-1">
+              <AgentLiveView job={shownJob} now={nowTs} onClose={() => setAgentView(null)} />
+            </div>
+          ) : panel && panel.type !== "video" && !panelMin && !panelFull ? (
             <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-10 md:pr-[36%] lg:pl-16" : "justify-center"}`}>
               <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${stagePanelSize}`}>
                 <Viewport
@@ -2039,10 +2061,6 @@ export default function JarvisUI() {
                   onToggleFull={() => setPanelFull(true)}
                 />
               </div>
-            </div>
-          ) : shownJob ? (
-            <div className="absolute inset-0 z-20 p-1">
-              <AgentLiveView job={shownJob} now={nowTs} onClose={() => setAgentView(null)} />
             </div>
           ) : null}
           {/* arc-reactor HUD ring + orb — for a compact overlay they glide into
@@ -2151,11 +2169,11 @@ export default function JarvisUI() {
           </div>
 
           {/* composer */}
-          <div className="flex items-stretch gap-2 border-t border-white/5 p-3">
+          <div className="safe-composer flex items-stretch gap-1.5 border-t border-white/5 p-2 sm:gap-2 sm:p-3">
             <button
               onClick={() => void toggleLive()}
               title="live conversation"
-              className={`flex shrink-0 items-center gap-1.5 rounded-xl px-3 text-sm transition ${
+              className={`flex shrink-0 items-center gap-1.5 rounded-xl px-2 text-sm transition sm:px-3 ${
                 live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "glass text-slate hover:text-ice"
               }`}
             >
@@ -2164,28 +2182,28 @@ export default function JarvisUI() {
               ) : live === "live" ? (
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan" />
               ) : null}
-              live
+              <span className="max-sm:hidden">live</span><span className="sm:hidden">◉</span>
             </button>
             <button
               onClick={toggleMic}
               title="voice input"
-              className={`shrink-0 rounded-xl px-3 text-sm transition ${
+              className={`shrink-0 rounded-xl px-2 text-sm transition sm:px-3 ${
                 recording ? "bg-amber/20 text-amber ring-1 ring-amber/50" : "glass text-slate hover:text-ice"
               }`}
             >
-              {recording ? "■ done" : "mic"}
+              <span className="max-sm:hidden">{recording ? "■ done" : "mic"}</span><span className="sm:hidden">{recording ? "■" : "●"}</span>
             </button>
             <button
               onClick={() => void lookAtScreen()}
               title="show JARVIS your screen (one frame)"
-              className={`shrink-0 rounded-xl px-3 text-sm transition ${seeing ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50 animate-pulse" : "glass text-slate hover:text-ice"}`}
+              className={`hidden shrink-0 rounded-xl px-3 text-sm transition sm:block ${seeing ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50 animate-pulse" : "glass text-slate hover:text-ice"}`}
             >
               👁
             </button>
             <button
               onClick={() => void lookAtCamera()}
               title="point your camera at something — JARVIS reads it"
-              className={`shrink-0 rounded-xl px-3 text-sm transition ${camSeeing ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50 animate-pulse" : "glass text-slate hover:text-ice"}`}
+              className={`hidden shrink-0 rounded-xl px-3 text-sm transition sm:block ${camSeeing ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50 animate-pulse" : "glass text-slate hover:text-ice"}`}
             >
               📷
             </button>
@@ -2208,9 +2226,9 @@ export default function JarvisUI() {
             <button
               onClick={() => submit(input)}
               disabled={busy}
-              className="shrink-0 rounded-xl bg-cyan/15 px-4 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40"
+              className="shrink-0 rounded-xl bg-cyan/15 px-3 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40 sm:px-4"
             >
-              send
+              <span className="sm:hidden">↑</span><span className="max-sm:hidden">send</span>
             </button>
           </div>
         </div>
@@ -2365,7 +2383,7 @@ export default function JarvisUI() {
       {/* bar mode: chat collapsed to a floating type bar — the screen gets the room */}
       {!panelFull && (
         <div
-          className={`fixed inset-x-0 bottom-3 z-40 mx-auto w-[min(94vw,780px)] will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+          className={`safe-floating-bottom fixed inset-x-0 z-40 mx-auto w-[min(94vw,780px)] will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
             chatMode === "bar" ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-28 opacity-0"
           }`}
         >
@@ -2385,7 +2403,7 @@ export default function JarvisUI() {
               }`}
             >
               {live === "connecting" ? <span className="h-1.5 w-1.5 animate-ping rounded-full bg-cyan" /> : live === "live" ? <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan" /> : null}
-              live
+              <span className="max-sm:hidden">live</span><span className="sm:hidden">◉</span>
             </button>
             <button
               onClick={toggleMic}
@@ -2409,9 +2427,9 @@ export default function JarvisUI() {
             <button
               onClick={() => submit(input)}
               disabled={busy}
-              className="shrink-0 rounded-xl bg-cyan/15 px-3.5 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40"
+              className="shrink-0 rounded-xl bg-cyan/15 px-3 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40 sm:px-3.5"
             >
-              send
+              <span className="sm:hidden">↑</span><span className="max-sm:hidden">send</span>
             </button>
           </div>
         </div>

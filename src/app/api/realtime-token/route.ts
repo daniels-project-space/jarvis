@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { PERSONA, CAPABILITIES, REMEMBER } from "@/lib/persona";
-import { buildContext, convexMutation, convexQuery } from "@/lib/context";
+import { buildContext, convexMutation } from "@/lib/context";
 import { getSecret } from "@/lib/vault";
 import { STT_PROMPT } from "@/lib/sttvocab";
 
@@ -30,11 +30,9 @@ export async function POST(req: NextRequest) {
       { status: 409 },
     );
 
-  const threadId = ((await convexQuery("ui:getActiveThread", {})) as string) || "main";
-  const [ctx, msgs] = await Promise.all([
-    buildContext(),
-    convexQuery("chatQueue:listMessages", { threadId }),
-  ]);
+  const ctx = await buildContext(undefined, { includeConversation: true });
+  const threadId = ctx.threadId || "main";
+  const msgs = ctx.conversation ?? [];
 
   // Recent conversation + everything recently shown, so "pull up that video
   // from earlier again" actually means something to a fresh session. Cards are
@@ -92,7 +90,7 @@ export async function POST(req: NextRequest) {
               // vocabulary-primed: proper nouns (apps, gear, providers) come out right
               prompt: STT_PROMPT,
             },
-            turn_detection: { type: "semantic_vad", eagerness: "medium" },
+            turn_detection: { type: "semantic_vad", eagerness: "high" },
             // handheld-mic noise profile: cuts ambient noise BEFORE the VAD,
             // so breaths/room noise stop registering as barge-ins that cancel
             // JARVIS mid-sentence (phones were worst)

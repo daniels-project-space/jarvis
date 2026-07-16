@@ -22,14 +22,18 @@ export const fresh = query({
     await ctx.db
       .query("findings")
       .withIndex("by_status", (q: any) => q.eq("status", "fresh"))
-      .collect(),
+      .order("desc")
+      .take(20),
 });
 
 export const recent = query({
   args: { limit: v.optional(v.number()) },
   handler: async (ctx, a) => {
-    const rows = await ctx.db.query("findings").collect();
-    return rows.sort((x: any, y: any) => y.createdAt - x.createdAt).slice(0, a.limit ?? 6);
+    return await ctx.db
+      .query("findings")
+      .withIndex("by_createdAt")
+      .order("desc")
+      .take(Math.min(a.limit ?? 6, 50));
   },
 });
 

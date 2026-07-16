@@ -2,6 +2,7 @@ import "server-only";
 import { convexMutation, convexQuery } from "./context";
 import { getSecret, getServiceSecrets } from "./vault";
 import { r2Put, r2StoreFromUrl } from "./r2";
+import type { ManagedMission } from "../mastra/supervisor";
 
 // JARVIS's tool belt — one definition list (OpenAI function schema) executed
 // server-side by /api/chat (Groq loop) and /api/tools (realtime client bridge).
@@ -10,13 +11,16 @@ export const TOOL_DEFS = [
   {
     name: "dispatch_agent",
     description:
-      "Launch a background Claude Code agent for work that genuinely needs minutes: deep research across sources, fixing or building something in a repo, digging through code. It has web access, all of Daniel's repos, and the secrets vault. Returns immediately; the result gets woven into conversation when ready (a few minutes). Do NOT dispatch for quick lookups you can do yourself right now (youtube_search, youtube_transcript, web_search, read_url), and never re-dispatch a topic a fresh agent finding already covers.",
+      "Delegate durable work to JARVIS's permanent team. The manager chooses Paul (development), Atlas (research/strategy), Iris (creative), Maya (travel), or Sentry (reliability), selects the required intelligence, binds it to this conversation, and returns immediately. Work can checkpoint and continue for hours or days. Consequential external actions wait for Daniel's approval; code changes use isolated branches. Do not delegate quick lookups.",
     parameters: {
       type: "object",
       properties: {
         task: { type: "string", description: "Clear, self-contained task including all context the agent needs (URLs, video IDs, what to find out)" },
         repo: { type: "string", description: "owner/repo or short name if the task is about a specific repo, else omit" },
         model: { type: "string", enum: ["haiku", "sonnet", "opus"], description: "sonnet for research/summaries/normal code (DEFAULT — fast), opus ONLY for hard multi-file engineering, haiku for trivial lookups" },
+        agent_id: { type: "string", enum: ["paul", "atlas", "iris", "maya", "sentry"], description: "Optional permanent specialist; omit to let JARVIS route it" },
+        readonly: { type: "boolean", description: "Force a read-only run" },
+        acceptance_criteria: { type: "array", items: { type: "string" }, description: "What must be demonstrably true before this is complete" },
         mcp: { type: "array", items: { type: "string", enum: ["playwright", "context7"] }, description: "Optional MCP servers: playwright for live browser automation, context7 for library docs" },
       },
       required: ["task"],
@@ -25,11 +29,14 @@ export const TOOL_DEFS = [
   {
     name: "orchestrate",
     description:
-      "Spawn a FLEET of parallel background agents on one mission — for big asks that decompose into independent workstreams (multi-angle research, building several pieces, auditing multiple repos, competitive analysis). YOU decompose the goal into 2-6 self-contained agent tasks; they run in parallel, the fleet view shows live progress, and when the last one lands the results are synthesized into ONE report back to Daniel. For single simple tasks use dispatch_agent instead.",
+      "Ask the Mastra JARVIS supervisor to plan and run a durable mission with the permanent team. You may supply 2-6 genuinely independent workstreams, or omit them and let the supervisor consult specialists and decompose the goal. Trigger.dev performs the durable execution; Convex reports live stages, checkpoints and approvals. One coherent reviewed result returns to the originating conversation.",
     parameters: {
       type: "object",
       properties: {
         mission: { type: "string", description: "the overall goal in one sentence" },
+        repo: { type: "string", description: "optional primary repo when the supervisor should plan the workstreams" },
+        context: { type: "string", description: "important conversation/project context the supervisor must preserve" },
+        acceptance_criteria: { type: "array", items: { type: "string" }, description: "mission-level definition of done" },
         agents: {
           type: "array",
           description: "2-6 independent workstreams",
@@ -40,13 +47,43 @@ export const TOOL_DEFS = [
               task: { type: "string", description: "fully self-contained task incl. all context (agents start blank)" },
               repo: { type: "string", description: "owner/repo if it works on code" },
               model: { type: "string", enum: ["haiku", "sonnet", "opus"] },
+              agent_id: { type: "string", enum: ["paul", "atlas", "iris", "maya", "sentry"] },
+              readonly: { type: "boolean" },
+              acceptance_criteria: { type: "array", items: { type: "string" } },
               template: { type: "string", enum: ["research_report", "bug_fix", "feature_add", "refactor", "landing_page", "api_integration"], description: "method scaffold to enforce" },
             },
             required: ["label", "task"],
           },
         },
       },
-      required: ["mission", "agents"],
+      required: ["mission"],
+    },
+  },
+  {
+    name: "work_control",
+    description:
+      "Control a durable team job shown in the command deck: approve or decline consequential work, pause/resume/cancel an active job, or retry a failed job. Use only after Daniel identifies the job or explicitly answers an approval card.",
+    parameters: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "Job id from team_status/command deck" },
+        action: { type: "string", enum: ["approve", "decline", "pause", "resume", "cancel", "retry", "answer"] },
+        input: { type: "string", description: "Daniel's answer when action=answer" },
+      },
+      required: ["job_id", "action"],
+    },
+  },
+  {
+    name: "creative_sprint",
+    description:
+      "Run a structured creative sprint when Daniel wants deeper brainstorming plus a visual result. Atlas develops distinct, evidence-aware directions and Iris turns the strongest directions into an illustration/diagram/storyboard brief. Results arrive as one reviewed mission, not a pile of disconnected ideas.",
+    parameters: {
+      type: "object",
+      properties: {
+        brief: { type: "string", description: "The challenge, audience, constraints and desired output" },
+        output: { type: "string", enum: ["illustration", "diagram", "storyboard", "visual_system", "brainstorm" ] },
+      },
+      required: ["brief", "output"],
     },
   },
   {
@@ -552,6 +589,7 @@ export const TOOL_DEFS = [
       type: "object",
       properties: {
         destination: { type: "string", description: "city/region, e.g. 'Barcelona'" },
+        trip_id: { type: "string", description: "creation id returned by trip_open; use it to populate the exact visible draft" },
         dest_iata: { type: "string", description: "destination airport IATA, e.g. BCN" },
         origin_iata: { type: "string", description: "departure airport IATA, default LHR" },
         depart_date: { type: "string", description: "YYYY-MM-DD" },
@@ -573,6 +611,7 @@ export const TOOL_DEFS = [
     parameters: {
       type: "object",
       properties: {
+        trip_id: { type: "string", description: "exact trip creation id shown in context/on the trip workspace" },
         action: { type: "string", enum: ["lock_flight", "lock_stay", "toggle_activity", "set_budget", "rescout_stays", "show"] },
         flight_index: { type: "number", description: "which flight from the list (1-based) for lock_flight" },
         stay: { type: "string", description: "hotel name (or fragment) for lock_stay" },
@@ -581,18 +620,20 @@ export const TOOL_DEFS = [
         max_price_per_night: { type: "number", description: "for rescout_stays" },
         vacation_rentals: { type: "boolean", description: "for rescout_stays" },
       },
-      required: ["action"],
+      required: ["trip_id", "action"],
     },
   },
   {
     name: "trip_finalize",
     description:
-      "Lock the plan in: builds the day-by-day itinerary (flight, airport transfer with real drive time, check-in, activities), writes every item into Daniel's calendar, and saves the whole trip as an interactive connected-node map in the creations library. Call when Daniel says 'book it in / lock it / finalize the plan'.",
+      "Lock the reviewed plan in: builds the day-by-day itinerary (flight, airport transfer with real drive time, check-in, activities), optionally syncs it to Daniel's calendar only after an explicit choice, and saves the trip as an interactive connected-node map. Never infer calendar consent.",
     parameters: {
       type: "object",
       properties: {
-        add_to_calendar: { type: "boolean", description: "default true" },
+        trip_id: { type: "string", description: "exact trip creation id" },
+        add_to_calendar: { type: "boolean", description: "explicit choice; true syncs idempotently, false leaves Daniel's calendar untouched" },
       },
+      required: ["trip_id", "add_to_calendar"],
     },
   },
   {
@@ -796,7 +837,7 @@ const SELF_IMPROVE_RULES =
   "src/components/JarvisUI.tsx. VALIDATE proportionally before committing: for a small single-file change, re-read your " +
   "full diff line by line (the clone has no node_modules; Vercel's build is the gate and a failed deploy auto-files an " +
   "incident straight back to a repair agent). For multi-file or risky changes, run 'npm install' then 'npx tsc --noEmit' " +
-  "and 'npm run build' — they must pass. Commit only working code, message starting 'self-improve:'. Vercel deploys it automatically. " +
+  "and 'npm run build' — they must pass. Commit only working code, message starting 'self-improve:'. Work on the runner's isolated branch; never push directly to main or claim production is live. " +
   "If the change truly requires convex/ schema or src/trigger/ edits, keep them minimal and state clearly in your final " +
   "answer that they need a manual deploy. Never remove existing capabilities.";
 
@@ -2503,10 +2544,11 @@ async function tripPlanTool(args: any): Promise<string> {
   const { scoutTrip, latestTrip } = await import("./travel");
   // If the globe is already open for this destination, populate THAT doc live
   // instead of spawning a duplicate.
-  let reuseId: string | undefined;
+  let reuseId: string | undefined = args.trip_id ? String(args.trip_id) : undefined;
   const existing = await latestTrip();
-  if (existing && existing.doc.destination.toLowerCase().trim() === destination.toLowerCase().trim()) reuseId = existing.id;
-  const { doc } = await scoutTrip({
+  const normalizeDestination = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!reuseId && existing && normalizeDestination(existing.doc.destination) === normalizeDestination(destination)) reuseId = existing.id;
+  const { id, doc } = await scoutTrip({
     destination,
     destIata,
     origin: String(args.origin_iata ?? "LHR"),
@@ -2522,19 +2564,25 @@ async function tripPlanTool(args: any): Promise<string> {
   });
   const f = doc.flights[0];
   const cheapStay = doc.stays[0];
+  const providerIssues = Object.entries(doc.providers ?? {})
+    .filter(([, state]: any) => state.status === "error")
+    .map(([provider, state]: any) => `${provider}: ${state.error ?? "failed"}`);
   return (
-    `Trip planner is live on the globe screen. Found: ${doc.flights.length} flights (best ${f ? `${f.airline} £${f.priceGbp}pp, ${f.stops === 0 ? "direct" : f.stops + " stop"}` : "none"}), ` +
-    `${doc.stays.length} stays within budget (e.g. ${cheapStay ? `${cheapStay.name} ★${cheapStay.rating} £${cheapStay.totalGbp} total` : "none"}), ` +
-    `${doc.activities.length} activities (top: ${doc.activities.slice(0, 3).map((a) => a.name).join(", ")}). ` +
-    `Budget £${budget}. Speak TWO short sentences with the single best flight + stay combo, then ask what he wants to lock in. ` +
-    `Use trip_update to lock choices (hotel names: ${doc.stays.slice(0, 6).map((s) => s.name).join(" | ")}).`
+    `Trip ${id} is live in the guided workspace. Found: ${doc.flights.length} flights (best ${f ? `${f.airline} £${f.priceGbp}pp, ${f.stops === 0 ? "direct" : f.stops + " stop"}` : args.include_flights === false ? "skipped by choice" : "none"}), ` +
+      `${doc.stays.length} stays within budget (e.g. ${cheapStay ? `${cheapStay.name} ★${cheapStay.rating} £${cheapStay.totalGbp} total` : "none"}), ` +
+      `${doc.activities.length} activities (top: ${doc.activities.slice(0, 3).map((a) => a.name).join(", ")}). ` +
+      (providerIssues.length ? `Provider issues shown with retry state: ${providerIssues.join("; ")}. ` : "") +
+      `Budget £${budget}. Speak TWO short sentences with the single best flight + stay combo, then ask what he wants to lock in. ` +
+      `Use trip_update with trip_id ${id} to lock choices (hotel names: ${doc.stays.slice(0, 6).map((s) => s.name).join(" | ")}).`
   );
 }
 
 async function tripUpdateTool(args: any): Promise<string> {
-  const { latestTrip, saveTrip, computeTransfer, hubAction } = await import("./travel");
-  const t = await latestTrip();
-  if (!t) return "No trip on the go — run trip_plan first.";
+  const { getTrip, saveTrip, computeTransfer, hubAction } = await import("./travel");
+  const tripId = String(args.trip_id ?? "").trim();
+  if (!tripId) return "TRIP ID MISSING — use the id on the visible trip workspace; never edit an implicit latest trip.";
+  const t = await getTrip(tripId);
+  if (!t) return `Trip ${tripId} was not found.`;
   const { doc } = t;
   const action = String(args.action ?? "");
   if (action === "show") {
@@ -2542,7 +2590,9 @@ async function tripUpdateTool(args: any): Promise<string> {
     return `Trip "${doc.title}" is back on the globe screen.`;
   }
   if (action === "lock_flight") {
-    const i = Math.max(1, Number(args.flight_index) || 1) - 1;
+    const selected = Number(args.flight_index);
+    if (!Number.isInteger(selected) || selected < 1) return "Choose a specific flight from the list before locking it.";
+    const i = selected - 1;
     if (!doc.flights[i]) return `Only ${doc.flights.length} flights on the list.`;
     doc.locked.flight = doc.flights[i];
     await saveTrip(t.id, doc);
@@ -2588,8 +2638,9 @@ async function tripUpdateTool(args: any): Promise<string> {
       adults: doc.adults,
       maxPricePerNight: Number(args.max_price_per_night) || undefined,
       vacationRentals: !!args.vacation_rentals,
+      maxPages: 1,
     }).catch(() => ({ options: [] }));
-    const stays = (res.options ?? []).filter((s: any) => s.lat && s.lng).slice(0, 24);
+    const stays = (res.options ?? []).slice(0, 24);
     if (!stays.length) return "That search came back empty — loosen the limits.";
     doc.stays = stays;
     await saveTrip(t.id, doc);
@@ -2599,21 +2650,31 @@ async function tripUpdateTool(args: any): Promise<string> {
 }
 
 async function tripFinalizeTool(args: any): Promise<string> {
-  const { latestTrip, saveTrip, computeTransfer, buildItinerary, tripToCalendar, tripToMindmap } = await import("./travel");
-  const t = await latestTrip();
-  if (!t) return "No trip to finalize — run trip_plan first.";
+  const { getTrip, saveTrip, computeTransfer, buildItinerary, tripToCalendar, tripToMindmap } = await import("./travel");
+  const tripId = String(args.trip_id ?? "").trim();
+  if (!tripId) return "TRIP ID MISSING — finalize the exact visible trip, never whichever draft happens to be newest.";
+  if (typeof args.add_to_calendar !== "boolean") return "CALENDAR CHOICE MISSING — ask Daniel whether to sync the reviewed itinerary to his calendar.";
+  const t = await getTrip(tripId);
+  if (!t) return `Trip ${tripId} was not found.`;
   const { doc } = t;
-  if (!doc.locked.flight && doc.flights[0]) doc.locked.flight = doc.flights[0];
+  if (doc.includeFlights !== false && doc.flights.length && !doc.locked.flight)
+    return "Choose and lock a specific flight first — I won't silently select option one.";
   if (!doc.locked.stay) return "Lock a hotel first (trip_update lock_stay) — the itinerary and transfer hang off it.";
   if (!doc.transfer) doc.transfer = await computeTransfer(doc);
   doc.itinerary = buildItinerary(doc);
+  let calNote = "";
+  if (args.add_to_calendar === true) {
+    try {
+      const n = await tripToCalendar(doc, t.id);
+      doc.calendarSyncedAt = Date.now();
+      calNote = ` ${n} calendar items synchronized idempotently (GMT/BST aware).`;
+    } catch (error: any) {
+      await saveTrip(t.id, doc);
+      throw new Error(`Trip itinerary was saved, but calendar sync failed and was not marked complete: ${String(error?.message ?? error).slice(0, 200)}`);
+    }
+  }
   doc.status = "planned";
   await saveTrip(t.id, doc);
-  let calNote = "";
-  if (args.add_to_calendar !== false) {
-    const n = await tripToCalendar(doc, t.id).catch(() => 0);
-    calNote = ` ${n} items written to the calendar (they'll show in briefings).`;
-  }
   const mapId = await tripToMindmap(doc, t.id).catch(() => "");
   return (
     `Trip locked in: ${doc.itinerary?.length} days planned, total ≈ £${doc.totals?.total} of £${doc.budgetGbp}.` +
@@ -2643,32 +2704,160 @@ async function activeThread(): Promise<string> {
 export async function executeTool(name: string, args: any): Promise<string> {
   switch (name) {
     case "dispatch_agent": {
-      await convexMutation("jobs:enqueue", {
-        task: String(args.task).slice(0, 2000),
-        repo: args.repo ? String(args.repo) : undefined,
-        model: args.model ? String(args.model) : undefined,
-        mcp: Array.isArray(args.mcp) ? args.mcp.map(String) : undefined,
+      const task = String(args.task ?? "").trim().slice(0, 6000);
+      if (!task) return "Give me the outcome you want the team to own.";
+      const repo = args.repo ? String(args.repo) : undefined;
+      const [{ routeWork, suggestedAcceptanceCriteria }, { TEAM_BY_SLUG }] = await Promise.all([
+        import("../mastra/routing"),
+        import("../mastra/team"),
+      ]);
+      const route = routeWork(task, {
+        repo,
+        requestedModel: args.model ? String(args.model) : undefined,
+        readonly: typeof args.readonly === "boolean" ? args.readonly : undefined,
       });
-      return "Agent dispatched. It'll report back here in a few minutes — keep the conversation going.";
+      const requested = String(args.agent_id ?? "");
+      const agentId = ["paul", "atlas", "iris", "maya", "sentry"].includes(requested)
+        ? (requested as keyof typeof TEAM_BY_SLUG)
+        : route.agentId;
+      const originThreadId = await activeThread();
+      const criteria = Array.isArray(args.acceptance_criteria) && args.acceptance_criteria.length
+        ? args.acceptance_criteria.map(String).slice(0, 8)
+        : suggestedAcceptanceCriteria(task, route);
+      const jobId = await convexMutation("jobs:enqueue", {
+        task,
+        repo,
+        readonly: route.readonly,
+        model: route.model,
+        mcp: Array.isArray(args.mcp) ? args.mcp.map(String) : undefined,
+        originThreadId,
+        agentId,
+        risk: route.risk,
+        priority: route.priority,
+        approvalRequired: route.approvalRequired,
+        acceptanceCriteria: criteria,
+        modelReason: route.reason,
+        label: `${TEAM_BY_SLUG[agentId].name} · ${task.slice(0, 58)}`,
+      });
+      return route.approvalRequired
+        ? `${TEAM_BY_SLUG[agentId].name} has a scoped plan ready as job ${jobId}, but it includes a consequential external action. I put it in Needs you and will not execute it until Daniel approves.`
+        : `${TEAM_BY_SLUG[agentId].name} owns job ${jobId}. It is bound to this conversation, visible live in the command deck, and will checkpoint rather than disappear if it needs multiple runs.`;
     }
     case "orchestrate": {
       const mission = String(args.mission ?? "").trim();
-      const agents = (Array.isArray(args.agents) ? args.agents : []).filter((a: any) => a?.task && a?.label).slice(0, 6);
-      if (!mission || agents.length < 2)
-        return "A fleet needs a mission and at least 2 independent agent tasks — for one task use dispatch_agent.";
-      const missionId = await convexMutation("missions:create", { goal: mission, agentCount: agents.length });
-      for (const a of agents) {
-        const scaffold = TASK_TEMPLATES[String(a.template ?? "")] ?? "";
+      if (!mission) return "Give the supervisor the outcome the mission must achieve.";
+      const supplied = (Array.isArray(args.agents) ? args.agents : []).filter((a: any) => a?.task).slice(0, 6);
+      const { planManagedMission, normalizeWorkstream } = await import("../mastra/supervisor");
+      const plan: ManagedMission = supplied.length
+        ? {
+            mission,
+            rationale: "Daniel/JARVIS supplied explicit workstreams; the manager normalized owner, risk and model policy.",
+            workstreams: supplied.map((a: any) =>
+              normalizeWorkstream({
+                task: String(a.task),
+                label: a.label ? String(a.label) : undefined,
+                repo: a.repo ? String(a.repo) : undefined,
+                model: a.model ? String(a.model) : undefined,
+                agentId: a.agent_id ? String(a.agent_id) : undefined,
+                readonly: typeof a.readonly === "boolean" ? a.readonly : undefined,
+                acceptanceCriteria: Array.isArray(a.acceptance_criteria) ? a.acceptance_criteria.map(String) : undefined,
+              }),
+            ),
+            plannedBy: "deterministic" as const,
+          }
+        : await planManagedMission(mission, {
+            repo: args.repo ? String(args.repo) : undefined,
+            context: args.context ? String(args.context) : undefined,
+          });
+      const originThreadId = await activeThread();
+      const riskOrder = { low: 0, medium: 1, high: 2, consequential: 3 } as const;
+      const missionRisk = plan.workstreams.reduce(
+        (highest, stream) => (riskOrder[stream.risk] > riskOrder[highest] ? stream.risk : highest),
+        "low" as keyof typeof riskOrder,
+      );
+      const missionId = await convexMutation("missions:create", {
+        goal: mission,
+        agentCount: plan.workstreams.length,
+        originThreadId,
+        managerAgentId: "jarvis",
+        priority: Math.max(...plan.workstreams.map((stream) => (stream.model === "opus" ? 80 : stream.model === "sonnet" ? 60 : 45))),
+        risk: missionRisk,
+        acceptanceCriteria: Array.isArray(args.acceptance_criteria) ? args.acceptance_criteria.map(String).slice(0, 8) : undefined,
+      });
+      for (const a of plan.workstreams) {
+        const suppliedAgent = supplied.find((candidate: any) => String(candidate.task) === a.task);
+        const scaffold = TASK_TEMPLATES[String(suppliedAgent?.template ?? "")] ?? "";
         await convexMutation("jobs:enqueue", {
-          task: `${String(a.task).slice(0, 2000)}${scaffold}\n\n(You are one agent of a ${agents.length}-agent fleet on the mission: "${mission}". Do ONLY your workstream.)`,
-          repo: a.repo ? String(a.repo) : undefined,
-          model: ["haiku", "sonnet", "opus"].includes(a.model) ? String(a.model) : undefined,
+          task: `${a.task}${scaffold}\n\nYou are ${a.agentId}, one permanent specialist on a ${plan.workstreams.length}-workstream mission: "${mission}". Own only this workstream, preserve the mission context, checkpoint useful progress, and stop only when the acceptance criteria are evidenced.`,
+          repo: a.repo ?? undefined,
+          readonly: a.readonly,
+          model: a.model,
           missionId: String(missionId),
-          label: String(a.label).slice(0, 60),
+          label: a.label,
+          originThreadId,
+          agentId: a.agentId,
+          risk: a.risk,
+          priority: a.model === "opus" ? 80 : a.model === "sonnet" ? 60 : 45,
+          approvalRequired: a.approvalRequired,
+          acceptanceCriteria: a.acceptanceCriteria,
+          modelReason: `${a.agentId} owns this Mastra-managed workstream; ${a.model} is the planned execution tier`,
         });
       }
       await convexMutation("ui:setPanel", { type: "fleet", value: JSON.stringify({ missionId: String(missionId) }), title: `mission · ${mission.slice(0, 44)}` }).catch(() => {});
-      return `Fleet of ${agents.length} dispatched on "${mission}" (${agents.map((a: any) => a.label).join(", ")}). Live fleet view is on screen; the synthesized report lands here when the last agent finishes. Tell Daniel in one casual line.`;
+      const waiting = plan.workstreams.filter((stream) => stream.approvalRequired).length;
+      return `JARVIS planned mission ${missionId} with ${plan.workstreams.length} permanent specialists: ${plan.workstreams.map((stream) => `${stream.label} [${stream.model}]`).join(", ")}. ${waiting ? `${waiting} consequential workstream${waiting === 1 ? " is" : "s are"} waiting in Needs you; ` : ""}live stages and checkpoints are on screen, and one reviewed synthesis returns to this conversation.`;
+    }
+    case "work_control": {
+      const jobId = String(args.job_id ?? "");
+      const action = String(args.action ?? "");
+      if (!jobId) return "Choose a job from the command deck first.";
+      if (action === "approve" || action === "decline") {
+        const ok = await convexMutation("approvals:decide", {
+          jobId,
+          decision: action === "approve" ? "approved" : "declined",
+        });
+        return ok
+          ? action === "approve"
+            ? "Approved. The workstream is queued; approval applies only to that scoped job."
+            : "Declined. The job is cancelled and will not execute."
+          : "That approval is no longer pending.";
+      }
+      if (action === "answer") {
+        const answer = String(args.input ?? "").trim();
+        if (!answer) return "Tell me the decision or missing information you want passed back to the agent.";
+        const ok = await convexMutation("jobs:provideInput", { jobId, answer });
+        return ok ? "Passed that decision back to the specialist; the continuation is queued." : "That job is not waiting for input now.";
+      }
+      const ok = await convexMutation("jobs:control", { jobId, action });
+      return ok ? `Job ${jobId} ${action} request applied.` : `That job cannot be ${action}d from its current state.`;
+    }
+    case "creative_sprint": {
+      const brief = String(args.brief ?? "").trim();
+      const output = String(args.output ?? "brainstorm");
+      if (!brief) return "Give Atlas and Iris the creative challenge first.";
+      return await executeTool("orchestrate", {
+        mission: `Develop and visualize: ${brief}`,
+        context: `Desired output: ${output}. Preserve the user's stated audience, constraints and taste.`,
+        agents: [
+          {
+            label: "Atlas · directions",
+            agent_id: "atlas",
+            model: "sonnet",
+            readonly: true,
+            template: "research_report",
+            task: `Develop 3 genuinely distinct creative directions for this brief: ${brief}. For each, give the core idea, audience logic, reference territory, risks, and what would make it visually unmistakable. Recommend one without flattening the alternatives.`,
+            acceptance_criteria: ["Three meaningfully different directions", "A clear recommendation with trade-offs"],
+          },
+          {
+            label: "Iris · visual system",
+            agent_id: "iris",
+            model: "sonnet",
+            readonly: true,
+            task: `Turn this brief into a production-ready ${output} system: ${brief}. Specify composition, visual hierarchy, palette, typography or mark-making, scene/shot structure where relevant, and final image-generation or drawing prompts. Include an editable construction plan, not only adjectives.`,
+            acceptance_criteria: ["Production-ready visual specification", "Editable construction steps and exact generation/drawing prompts"],
+          },
+        ],
+      });
     }
     case "show": {
       let { kind, value, title } = args as { kind?: string; value: string; title?: string };
@@ -2784,8 +2973,8 @@ export async function executeTool(name: string, args: any): Promise<string> {
       const { openTrip } = await import("./travel");
       const destination = String(args.destination ?? "").trim();
       if (!destination) return "Which destination?";
-      const { doc } = await openTrip({ destination, destIata: args.dest_iata ? String(args.dest_iata) : undefined });
-      return `Globe is up, centred on ${destination}${doc.airport ? ` (${doc.airport.name} marked)` : ""} — it fills in live as you plan. Now get budget + dates from Daniel, then trip_plan populates it.`;
+      const { id, doc } = await openTrip({ destination, destIata: args.dest_iata ? String(args.dest_iata) : undefined });
+      return `Trip ${id} is up on the globe, centred on ${destination}${doc.airport ? ` (${doc.airport.name} marked)` : ""}. It fills in live as you plan; use this exact trip_id for trip_plan and every later edit.`;
     }
     case "trip_plan":
       return await tripPlanTool(args);
@@ -2927,8 +3116,20 @@ export async function executeTool(name: string, args: any): Promise<string> {
         repo: app ?? "jarvis",
         model: "opus",
         incidentId: String(incidentId),
+        originThreadId: await activeThread(),
+        agentId: "paul",
+        risk: "high",
+        priority: 95,
+        acceptanceCriteria: [
+          "Reproduce the reported failure",
+          "Trace and repair the root cause on an isolated branch",
+          "Run relevant typecheck/tests/build",
+          "Verify the actual user-visible or provider surface",
+        ],
+        modelReason: "Paul + opus: production repair requires deep engineering and verification",
+        label: `Paul · repair ${problem.slice(0, 48)}`,
       });
-      return "Repair engineer dispatched — it'll trace the root cause and the fix goes live automatically. Result gets woven in here.";
+      return "Paul owns the repair on an isolated branch. He'll reproduce it, verify the fix, and report back here; nothing is pushed directly onto production.";
     }
     case "self_improve": {
       const request = String(args.request ?? "").slice(0, 1500);
@@ -2937,14 +3138,24 @@ export async function executeTool(name: string, args: any): Promise<string> {
         task: `${SELF_IMPROVE_RULES}\n\nThe upgrade Daniel wants: ${request}`,
         repo: "jarvis",
         model: "opus",
+        originThreadId: await activeThread(),
+        agentId: "paul",
+        risk: "high",
+        priority: 80,
+        acceptanceCriteria: ["Connected implementation, not placeholder UI", "Typecheck/tests/build pass", "Production remains gated until verified"],
+        modelReason: "Paul + opus: JARVIS self-modification is complex engineering",
+        label: `Paul · upgrade ${request.slice(0, 46)}`,
       });
-      return "Upgrade engineer dispatched on my own code — validated changes deploy automatically in a few minutes.";
+      return "Paul has the upgrade on an isolated branch with validation gates; progress is live in the command deck.";
     }
     case "agent_status": {
-      const [active, recent, missions] = await Promise.all([
+      const [active, recent, missions, team, attention, approvals] = await Promise.all([
         convexQuery("jobs:active", {}),
         convexQuery("findings:recent", { limit: 4 }),
         convexQuery("missions:active", {}).catch(() => []),
+        convexQuery("agents:list", {}).catch(() => []),
+        convexQuery("attention:list", { status: "open", limit: 5 }).catch(() => []),
+        convexQuery("approvals:pending", {}).catch(() => []),
       ]);
       const m = Array.isArray(missions) && missions.length
         ? "Missions: " +
@@ -2953,12 +3164,21 @@ export async function executeTool(name: string, args: any): Promise<string> {
             .join("; ") + "\n"
         : "";
       const a = Array.isArray(active) && active.length
-        ? "Running: " + active.map((j: any) => `"${(j.label ?? j.task).slice(0, 70)}" — ${j.progress || j.status}`).join("; ")
+        ? "Work: " + active.map((j: any) => `${j._id} · ${j.agentId ?? "agent"} · "${(j.label ?? j.task).slice(0, 60)}" — ${j.stage ?? j.status} ${j.percent ?? 0}%${(j.attempt ?? 1) > 1 ? ` (attempt ${j.attempt})` : ""}`).join("; ")
         : "No agents running.";
+      const roster = Array.isArray(team) && team.length
+        ? "\nPermanent team: " + team.map((member: any) => `${member.name} (${member.role})=${member.status}`).join("; ")
+        : "";
+      const needs = Array.isArray(approvals) && approvals.length
+        ? `\nNeeds Daniel: ${approvals.map((item: any) => `${item.jobId} · ${item.summary}`).join("; ")}`
+        : "";
+      const priorities = Array.isArray(attention) && attention.length
+        ? `\nAttention: ${attention.map((item: any) => `${item.title} [impact ${item.impact}, urgency ${item.urgency}, confidence ${Math.round(item.confidence * 100)}%]`).join("; ")}`
+        : "";
       const f = Array.isArray(recent) && recent.length
         ? "\nRecent findings: " + recent.map((r: any) => r.spoken).join(" | ")
         : "";
-      return m + a + f;
+      return m + a + roster + needs + priorities + f;
     }
     case "calculate": {
       const raw = String(args.expression ?? "").trim();

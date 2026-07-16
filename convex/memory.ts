@@ -41,17 +41,17 @@ export const recent = query({
   },
 });
 
-// Naive substring search (personal scale). Swap for a vector/FTS index later.
+// Indexed lexical search: the previous implementation read the latest 400
+// rows on every conversation turn, which was the dominant avoidable Convex IO.
 export const search = query({
   args: { q: v.string(), limit: v.optional(v.number()) },
   handler: async (ctx, a) => {
     const lim = a.limit ?? 20;
-    const needle = a.q.toLowerCase();
-    const rows = await ctx.db.query("memory").withIndex("by_createdAt").order("desc").take(400);
-    return rows
-      .filter((r) =>
-        `${r.title} ${r.body} ${(r.tags ?? []).join(" ")}`.toLowerCase().includes(needle),
-      )
-      .slice(0, lim);
+    const needle = a.q.trim().slice(0, 240);
+    if (!needle) return [];
+    return await ctx.db
+      .query("memory")
+      .withSearchIndex("search_body", (q) => q.search("body", needle))
+      .take(Math.min(lim, 30));
   },
 });

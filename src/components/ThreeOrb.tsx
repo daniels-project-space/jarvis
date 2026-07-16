@@ -50,12 +50,15 @@ export default function ThreeOrb({
     const mount = mountRef.current;
     if (!mount) return;
     let destroyed = false;
-    const N = 2000;
+    const compact = window.matchMedia("(max-width: 767px)").matches;
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const N = reducedMotion ? 420 : compact ? 800 : 1400;
+    const CONNECTION_SAMPLE = reducedMotion ? 140 : compact ? 190 : 300;
     const W = () => mount.clientWidth || 1;
     const H = () => mount.clientHeight || 1;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
+    renderer.setPixelRatio(Math.min(compact ? 1.25 : 1.75, window.devicePixelRatio));
     renderer.setSize(W(), H());
     renderer.setClearColor(0x000000, 0);
     mount.appendChild(renderer.domElement);
@@ -87,7 +90,7 @@ export default function ThreeOrb({
     scene.add(points);
 
     // ── Connection lines ──
-    const MAX_LINES = 8000;
+    const MAX_LINES = compact ? 1800 : 3200;
     const linePos = new Float32Array(MAX_LINES * 6);
     const lineGeo = new THREE.BufferGeometry();
     lineGeo.setAttribute("position", new THREE.BufferAttribute(linePos, 3));
@@ -132,12 +135,22 @@ export default function ThreeOrb({
     let cloudZ = 0, cloudZVel = 0;
     let smoothEnergy = 0;
     let asideAmt = 0; // 0 = centre stage, 1 = tucked into the right strip
+    let inViewport = true;
+    let frameId = 0;
+    let lastRenderedAt = 0;
 
     const clock = new THREE.Clock();
+    const moodBase = new THREE.Color(BASE);
+    const targetColor = new THREE.Color(BASE);
+    const white = new THREE.Color(0xffffff);
 
-    function animate() {
+    function animate(frameTime = 0) {
       if (destroyed) return;
-      requestAnimationFrame(animate);
+      frameId = requestAnimationFrame(animate);
+      if (document.hidden || !inViewport) return;
+      const slowFrame = reducedMotion || stateRef.current === "idle";
+      if (slowFrame && frameTime - lastRenderedAt < (reducedMotion ? 80 : 32)) return;
+      lastRenderedAt = frameTime;
       const t = clock.getElapsedTime();
       const st = stateRef.current;
 
@@ -239,7 +252,9 @@ export default function ThreeOrb({
         let lineCount = 0;
         const maxDist = lineDistance * (1 + bass * 0.5);
         const maxDistSq = maxDist * maxDist;
-        const step = Math.max(1, Math.floor(N / 600));
+        // Bound the quadratic neighbour scan. Points remain rich, while the
+        // connection mesh samples a stable subset per device class.
+        const step = Math.max(1, Math.ceil(N / CONNECTION_SAMPLE));
         for (let i = 0; i < N && lineCount < MAX_LINES; i += step) {
           const i3 = i * 3;
           const x1 = a[i3], y1 = a[i3 + 1], z1 = a[i3 + 2];
@@ -308,13 +323,12 @@ export default function ThreeOrb({
       mat.size = (currentSize + bass * 0.05) * shrink;
       // mood-aware palette: the whole orb drifts slowly into the conversation's
       // colour and holds it; states tint from that base
-      const moodBase = new THREE.Color(moodRef.current ?? "#00ff88");
-      const target =
-        st === "thinking" ? moodBase.clone().lerp(new THREE.Color("#ffffff"), 0.3)
-        : st === "speaking" ? moodBase.clone().lerp(new THREE.Color("#ffffff"), 0.15)
-        : moodBase;
-      mat.color.lerp(target, 0.004);
-      lineMat.color.lerp(target, 0.004);
+      moodBase.set(moodRef.current ?? "#00ff88");
+      targetColor.copy(moodBase);
+      if (st === "thinking") targetColor.lerp(white, 0.3);
+      else if (st === "speaking") targetColor.lerp(white, 0.15);
+      mat.color.lerp(targetColor, 0.004);
+      lineMat.color.lerp(targetColor, 0.004);
 
       // gentle, slow camera breathing — calmed right down so the orb sits
       // steady instead of drifting all over (worse when it's small and aside),
@@ -335,12 +349,18 @@ export default function ThreeOrb({
     window.addEventListener("resize", onResize);
     const ro = new ResizeObserver(onResize);
     ro.observe(mount);
-    animate();
+    const io = new IntersectionObserver(([entry]) => {
+      inViewport = entry.isIntersecting;
+    });
+    io.observe(mount);
+    frameId = requestAnimationFrame(animate);
 
     return () => {
       destroyed = true;
+      cancelAnimationFrame(frameId);
       window.removeEventListener("resize", onResize);
       ro.disconnect();
+      io.disconnect();
       renderer.dispose();
       geo.dispose();
       lineGeo.dispose();
