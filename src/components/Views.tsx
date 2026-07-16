@@ -1038,7 +1038,10 @@ export function FleetView({ value }: { value: string }) {
         {m.summary && (
           <div className={`${glass} mt-4 p-4`}>
             <div className="hud-label mb-2">mission report</div>
-            <div className="whitespace-pre-wrap text-sm leading-relaxed text-ice">{m.summary}</div>
+            <div
+              className="text-sm leading-relaxed text-ice"
+              dangerouslySetInnerHTML={{ __html: mdPaper(m.summary) }}
+            />
           </div>
         )}
       </div>

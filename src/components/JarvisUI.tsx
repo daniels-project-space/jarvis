@@ -2169,7 +2169,7 @@ export default function JarvisUI() {
           </div>
 
           {/* composer */}
-          <div className="safe-composer flex items-stretch gap-1.5 border-t border-white/5 p-2 sm:gap-2 sm:p-3">
+          <div className="safe-composer flex min-w-0 max-w-full items-stretch gap-1.5 overflow-hidden border-t border-white/5 p-2 sm:gap-2 sm:p-3">
             <button
               onClick={() => void toggleLive()}
               title="live conversation"
@@ -2221,12 +2221,12 @@ export default function JarvisUI() {
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit(input)}
               placeholder={busy ? "thinking…" : "Talk to me…"}
-              className="min-w-0 flex-1 rounded-xl bg-black/30 px-4 py-2.5 text-sm text-ice outline-none ring-1 ring-white/10 transition focus:ring-cyan/50"
+              className="w-0 min-w-0 flex-1 rounded-xl bg-black/30 px-3 py-2.5 text-sm text-ice outline-none ring-1 ring-white/10 transition focus:ring-cyan/50 sm:w-auto sm:px-4"
             />
             <button
               onClick={() => submit(input)}
               disabled={busy}
-              className="shrink-0 rounded-xl bg-cyan/15 px-3 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40 sm:px-4"
+              className="grid w-10 shrink-0 place-items-center rounded-xl bg-cyan/15 px-0 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40 sm:w-auto sm:px-4"
             >
               <span className="sm:hidden">↑</span><span className="max-sm:hidden">send</span>
             </button>
@@ -2387,7 +2387,7 @@ export default function JarvisUI() {
             chatMode === "bar" ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-28 opacity-0"
           }`}
         >
-          <div className="glass flex items-stretch gap-2 rounded-2xl p-2 shadow-2xl">
+          <div className="glass flex min-w-0 max-w-full items-stretch gap-2 overflow-hidden rounded-2xl p-2 shadow-2xl">
             <button
               onClick={() => setChatMode("full")}
               title="expand chat"
@@ -2410,7 +2410,7 @@ export default function JarvisUI() {
               title="voice input"
               className={`shrink-0 rounded-xl px-2.5 text-sm transition ${recording ? "bg-amber/20 text-amber ring-1 ring-amber/50" : "text-slate hover:text-ice"}`}
             >
-              {recording ? "■" : "mic"}
+              <span className="max-sm:hidden">{recording ? "■" : "mic"}</span><span className="sm:hidden">{recording ? "■" : "●"}</span>
             </button>
             {(speaking || (live === "live" && caption?.who === "jarvis")) && (
               <button onClick={stopTalking} title="stop talking" className="shrink-0 rounded-xl bg-red-500/15 px-2.5 text-sm text-red-300 ring-1 ring-red-500/40">
@@ -2422,12 +2422,12 @@ export default function JarvisUI() {
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit(input)}
               placeholder={busy ? "thinking…" : "Talk to me…"}
-              className="min-w-0 flex-1 rounded-xl bg-black/30 px-4 py-2 text-sm text-ice outline-none ring-1 ring-white/10 transition focus:ring-cyan/50"
+              className="w-0 min-w-0 flex-1 rounded-xl bg-black/30 px-3 py-2 text-sm text-ice outline-none ring-1 ring-white/10 transition focus:ring-cyan/50 sm:w-auto sm:px-4"
             />
             <button
               onClick={() => submit(input)}
               disabled={busy}
-              className="shrink-0 rounded-xl bg-cyan/15 px-3 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40 sm:px-3.5"
+              className="grid w-10 shrink-0 place-items-center rounded-xl bg-cyan/15 px-0 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40 sm:w-auto sm:px-3.5"
             >
               <span className="sm:hidden">↑</span><span className="max-sm:hidden">send</span>
             </button>
