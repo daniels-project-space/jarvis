@@ -1,34 +1,19 @@
 import { schedules } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { createRequire } from "node:module";
 import { sendPush } from "./push-send";
+import { codexExecPrefix } from "./model-policy";
+import {
+  prepareSubscriptionEnv,
+  resolveSubscriptionAgentBin,
+  type AgentProvider,
+} from "./subscription-runtime";
 
 // Proactive attention triage: a few times a day Sentry ranks evidence by impact,
 // urgency and confidence. Results live in the command deck; only genuinely
 // urgent high-confidence decisions interrupt Daniel.
 
-const nodeRequire = createRequire(import.meta.url);
 const CONVEX =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
-
-type AgentProvider = "codex" | "claude";
-function resolveAgentBin(provider: AgentProvider): string | null {
-  try {
-    const command = provider === "codex" ? "codex" : "claude";
-    const pkgJson = nodeRequire.resolve(`${provider === "codex" ? "@openai/codex" : "@anthropic-ai/claude-code"}/package.json`);
-    const pkgDir = dirname(pkgJson);
-    const nm = dirname(dirname(pkgDir));
-    const cands = [join(nm, ".bin", command)];
-    const pkg = JSON.parse(readFileSync(pkgJson, "utf8")) as { bin?: string | Record<string, string> };
-    const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.[command];
-    if (rel) cands.push(join(pkgDir, rel));
-    return cands.find((c) => existsSync(c)) ?? null;
-  } catch {
-    return null;
-  }
-}
 async function q(path: string, args: unknown) {
   try {
     return (
@@ -56,7 +41,7 @@ function ask(provider: AgentProvider, bin: string, env: NodeJS.ProcessEnv, promp
   return new Promise((resolve) => {
     const args = provider === "claude"
       ? ["-p", prompt, "--model", "sonnet", "--dangerously-skip-permissions"]
-      : ["exec", "--model", "gpt-5.6-sol", "--config", 'model_reasoning_effort="medium"', "--dangerously-bypass-approvals-and-sandbox", prompt];
+      : [...codexExecPrefix("sonnet"), prompt];
     const p = spawn(bin, args, {
       env,
       stdio: ["ignore", "pipe", "pipe"],
@@ -103,33 +88,11 @@ export const insightEngine = schedules.task({
   maxDuration: 200,
   run: async () => {
     const provider: AgentProvider = (await q("ui:getAgentProvider", {})) === "claude" ? "claude" : "codex";
-    const bin = resolveAgentBin(provider);
+    const bin = resolveSubscriptionAgentBin(provider);
     if (!bin) return { error: `no ${provider} bin` };
-    let env: NodeJS.ProcessEnv;
-    if (provider === "claude") {
-      mkdirSync("/tmp/claude-home", { recursive: true });
-      env = { ...process.env, HOME: "/tmp/claude-home", ANTHROPIC_API_KEY: "" };
-    } else {
-      const home = "/tmp/codex-home";
-      mkdirSync(home, { recursive: true });
-      const encoded = process.env.CODEX_AUTH_JSON_B64, raw = process.env.CODEX_AUTH_JSON;
-      if (encoded || raw) try {
-        const json = encoded ? Buffer.from(encoded, "base64").toString("utf8") : raw!;
-        JSON.parse(json);
-        writeFileSync(join(home, "auth.json"), json, { mode: 0o600 });
-        chmodSync(join(home, "auth.json"), 0o600);
-      } catch { return { error: "invalid Codex subscription auth" }; }
-      if (!process.env.CODEX_ACCESS_TOKEN && !encoded && !raw) return { error: "Codex subscription auth is not configured" };
-      env = { ...process.env, HOME: home, CODEX_HOME: home, OPENAI_API_KEY: "", CODEX_API_KEY: "" };
-    }
-    env = Object.fromEntries(
-      ["PATH", "HOME", "CODEX_HOME", "LANG", "LC_ALL", "NODE_PATH", "CLAUDE_CODE_OAUTH_TOKEN", "CODEX_ACCESS_TOKEN"]
-        .filter((key) => env[key] !== undefined)
-        .map((key) => [key, env[key]]),
-    ) as NodeJS.ProcessEnv;
-    env.ANTHROPIC_API_KEY = "";
-    env.OPENAI_API_KEY = "";
-    env.CODEX_API_KEY = "";
+    const prepared = prepareSubscriptionEnv(provider);
+    if (prepared.error) return { error: prepared.error };
+    const env = prepared.env;
 
     const snapshot: any = (await q("brainContext:snapshot", {})) ?? {};
     const biz: any[] = Array.isArray(snapshot.business) ? snapshot.business : [];

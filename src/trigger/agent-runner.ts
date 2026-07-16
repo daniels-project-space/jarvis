@@ -1,121 +1,24 @@
 import { schedules } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { createRequire } from "node:module";
+import { mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { sendPush } from "./push-send";
 import { INFRA_MAP } from "../lib/persona";
 import { routeWork } from "../mastra/routing";
 import { TEAM_BY_SLUG, type AgentSlug } from "../mastra/team";
+import { codexExecPrefix, codexModelFor } from "./model-policy";
+import {
+  prepareSubscriptionEnv,
+  resolveSubscriptionAgentBin,
+  type AgentProvider,
+} from "./subscription-runtime";
 
-// Slice D — dispatch. Claims background jobs (enqueued by the brain), runs a
-// Claude Code / Opus agent on them (optionally cloning a repo, committing +
-// pushing changes, optionally with MCP servers attached), then WEAVES the result
-// into conversation as one natural spoken line + a findings row (never a dump).
+// Slice D — dispatch. Claims background jobs, runs the routed subscription
+// agent in an isolated workspace (with optional repository and scoped MCP
+// access), then weaves the reviewed result back into the originating thread.
 
-const nodeRequire = createRequire(import.meta.url);
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
-
-type AgentProvider = "codex" | "claude";
-
-function resolveAgentBin(provider: AgentProvider): string | null {
-  try {
-    const packageName = provider === "codex" ? "@openai/codex" : "@anthropic-ai/claude-code";
-    const command = provider === "codex" ? "codex" : "claude";
-    const pkgJson = nodeRequire.resolve(`${packageName}/package.json`);
-    const pkgDir = dirname(pkgJson);
-    const nodeModules = dirname(dirname(pkgDir));
-    const candidates = [join(nodeModules, ".bin", command)];
-    try {
-      const pkg = JSON.parse(readFileSync(pkgJson, "utf8")) as { bin?: string | Record<string, string> };
-      const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.[command];
-      if (rel) candidates.push(join(pkgDir, rel));
-    } catch {
-      /* ignore */
-    }
-    return candidates.find((c) => existsSync(c)) ?? null;
-  } catch {
-    return null;
-  }
-}
-
-function prepareAgentEnv(provider: AgentProvider): { env: NodeJS.ProcessEnv; error?: string } {
-  if (provider === "claude") {
-    const home = "/tmp/claude-home";
-    mkdirSync(join(home, ".claude"), { recursive: true });
-    return { env: { ...process.env, HOME: home, ANTHROPIC_API_KEY: "", JARVIS_AGENT_PROVIDER: provider } };
-  }
-  // Current Codex releases deliberately refuse to create their helper/PATH
-  // aliases under /tmp. Read-only turns can appear healthy without helpers,
-  // while repository-backed turns then fail as soon as they need a command.
-  // Trigger's node home is ephemeral per machine but writable and non-temp.
-  let home = process.env.JARVIS_CODEX_HOME ?? "/home/node/.codex";
-  try {
-    mkdirSync(home, { recursive: true });
-  } catch {
-    home = "/tmp/codex-home";
-    mkdirSync(home, { recursive: true });
-  }
-  const encoded = process.env.CODEX_AUTH_JSON_B64;
-  const raw = process.env.CODEX_AUTH_JSON;
-  if (encoded || raw) {
-    try {
-      const json = encoded ? Buffer.from(encoded, "base64").toString("utf8") : raw!;
-      JSON.parse(json);
-      const authPath = join(home, "auth.json");
-      writeFileSync(authPath, json, { mode: 0o600 });
-      chmodSync(authPath, 0o600);
-    } catch {
-      return { env: process.env, error: "invalid Codex subscription auth" };
-    }
-  }
-  if (!process.env.CODEX_ACCESS_TOKEN && !encoded && !raw)
-    return { env: process.env, error: "Codex subscription auth is not configured" };
-  return {
-    env: {
-      ...process.env,
-      HOME: process.env.HOME ?? dirname(home),
-      CODEX_HOME: home,
-      OPENAI_API_KEY: "",
-      CODEX_API_KEY: "",
-      JARVIS_AGENT_PROVIDER: provider,
-    },
-  };
-}
-
-// Agent subprocesses receive only the credentials required to run the selected
-// subscription CLI. GitHub and application/provider secrets stay in the runner
-// control plane; MCP credentials are attached only when a scoped job requests
-// that specific server.
-function scopedAgentEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const allow = [
-    "PATH",
-    "HOME",
-    "CODEX_HOME",
-    "LANG",
-    "LC_ALL",
-    "TMPDIR",
-    "NODE_PATH",
-    "NODE_OPTIONS",
-    "SSL_CERT_FILE",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CODEX_ACCESS_TOKEN",
-    "JARVIS_AGENT_PROVIDER",
-  ];
-  const env = {} as NodeJS.ProcessEnv;
-  for (const key of allow) if (source[key] !== undefined) env[key] = source[key];
-  env.ANTHROPIC_API_KEY = "";
-  env.OPENAI_API_KEY = "";
-  env.CODEX_API_KEY = "";
-  return env;
-}
-
-const CODEX_MODELS: Record<string, { model: string; effort: string }> = {
-  haiku: { model: "gpt-5.6-terra", effort: "low" },
-  sonnet: { model: "gpt-5.6-sol", effort: "medium" },
-  opus: { model: "gpt-5.6", effort: "high" },
-};
 
 function promptArgs(env: NodeJS.ProcessEnv, prompt: string, tier: string, json = false, mcpConfig?: string | null): string[] {
   if (env.JARVIS_AGENT_PROVIDER !== "codex") {
@@ -124,11 +27,7 @@ function promptArgs(env: NodeJS.ProcessEnv, prompt: string, tier: string, json =
     if (mcpConfig) args.push("--mcp-config", mcpConfig);
     return args;
   }
-  const selected = CODEX_MODELS[tier] ?? CODEX_MODELS.sonnet;
-  const args = [
-    "exec", "--model", selected.model, "--config", `model_reasoning_effort=\"${selected.effort}\"`,
-    "--dangerously-bypass-approvals-and-sandbox",
-  ];
+  const args = codexExecPrefix(tier);
   if (json) args.push("--json");
   if (mcpConfig) {
     try {
@@ -332,6 +231,10 @@ function runAgent(
 ): Promise<{ text: string; timedOut: boolean; stopped: "paused" | "cancelled" | null }> {
   return new Promise((resolve) => {
     const args = promptArgs(env, prompt, model, true, mcpConfig);
+    const codexSelection = env.JARVIS_AGENT_PROVIDER === "codex" ? codexModelFor(model) : null;
+    const runtimeLabel = codexSelection
+      ? `${codexSelection.model} · ${codexSelection.effort}`
+      : `Claude ${model}`;
     const p = spawn(bin, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     let buf = "";
     let stderr = "";
@@ -413,10 +316,10 @@ function runAgent(
           continue;
         }
         if (ev.type === "thread.started") {
-          latest = "session started";
+          latest = `session started · ${runtimeLabel}`;
           stage = "understanding";
           percent = Math.max(percent, 8);
-          pushLog("▸ Codex session started");
+          pushLog(`▸ ${runtimeLabel} session started`);
         } else if (ev.type === "item.started" && ev.item?.type === "command_execution") {
           latest = `Running ${String(ev.item.command ?? "command").slice(0, 120)}`;
           stage = "executing";
@@ -609,9 +512,9 @@ export const agentRunner = schedules.task({
   run: async () => {
     const selected = await convexQuery("ui:getAgentProvider", {});
     const provider: AgentProvider = selected === "claude" ? "claude" : "codex";
-    const bin = resolveAgentBin(provider);
+    const bin = resolveSubscriptionAgentBin(provider);
     if (!bin) return { processed: 0, error: `no ${provider} binary` };
-    const prepared = prepareAgentEnv(provider);
+    const prepared = prepareSubscriptionEnv(provider);
     if (prepared.error) return { processed: 0, error: prepared.error };
 
     // Self-healing sweep: open incidents become root-cause repair jobs (attempt-
@@ -693,15 +596,15 @@ export const agentRunner = schedules.task({
     } catch {
       /* watches never block jobs */
     }
-    const env = scopedAgentEnv(prepared.env);
+    const env = prepared.env;
     mkdirSync("/tmp/work", { recursive: true });
     const token = process.env.GITHUB_TOKEN ?? "";
 
     // Standing briefing every agent reads (global CLAUDE.md in the runner HOME):
     // Daniel's infra map + vault access + repo/deploy conventions = real project access.
     const briefingPath = provider === "claude"
-      ? "/tmp/claude-home/.claude/CLAUDE.md"
-      : join(String(env.CODEX_HOME ?? "/tmp/codex-home"), "AGENTS.md");
+      ? join(String(env.HOME), ".claude", "CLAUDE.md")
+      : join(String(env.CODEX_HOME), "AGENTS.md");
     writeFileSync(
       briefingPath,
       `# You are a scoped JARVIS permanent-team agent working for Daniel.\n\n${INFRA_MAP}\n\n` +

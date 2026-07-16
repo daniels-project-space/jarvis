@@ -1,76 +1,29 @@
 import { schedules } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { createRequire } from "node:module";
 import { PERSONA } from "../lib/persona";
+import { codexExecPrefix } from "./model-policy";
+import {
+  prepareSubscriptionEnv,
+  resolveSubscriptionAgentBin,
+  type AgentProvider,
+} from "./subscription-runtime";
 
-const nodeRequire = createRequire(import.meta.url);
-
-// The `claude` binary isn't on PATH in the Trigger image — resolve it from the
-// installed @anthropic-ai/claude-code package (mirrors remote-work-hub).
-type AgentProvider = "codex" | "claude";
-function resolveAgentBin(provider: AgentProvider): string | null {
-  try {
-    const command = provider === "codex" ? "codex" : "claude";
-    const pkgJson = nodeRequire.resolve(`${provider === "codex" ? "@openai/codex" : "@anthropic-ai/claude-code"}/package.json`);
-    const pkgDir = dirname(pkgJson);
-    const nodeModules = dirname(dirname(pkgDir));
-    const candidates = [join(nodeModules, ".bin", command)];
-    try {
-      const pkg = JSON.parse(readFileSync(pkgJson, "utf8")) as {
-        bin?: string | Record<string, string>;
-      };
-      const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.[command];
-      if (rel) candidates.push(join(pkgDir, rel));
-    } catch {
-      /* ignore */
-    }
-    return candidates.find((c) => existsSync(c)) ?? null;
-  } catch {
-    return null;
-  }
-}
-
-const CODEX_MODELS: Record<string, { model: string; effort: string }> = {
-  haiku: { model: "gpt-5.6-terra", effort: "low" },
-  sonnet: { model: "gpt-5.6-sol", effort: "medium" },
-  opus: { model: "gpt-5.6", effort: "high" },
-};
 function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = false): string[] {
   if (provider === "claude") {
     const args = ["-p", prompt, "--model", tier, "--dangerously-skip-permissions"];
     if (json) args.push("--output-format", "stream-json", "--verbose", "--include-partial-messages");
     return args;
   }
-  const m = CODEX_MODELS[tier] ?? CODEX_MODELS.sonnet;
-  const args = ["exec", "--model", m.model, "--config", `model_reasoning_effort=\"${m.effort}\"`, "--dangerously-bypass-approvals-and-sandbox"];
+  const args = codexExecPrefix(tier);
   if (json) args.push("--json");
   args.push(prompt);
   return args;
 }
-function prepareEnv(provider: AgentProvider): { env: NodeJS.ProcessEnv; error?: string } {
-  if (provider === "claude") {
-    mkdirSync("/tmp/claude-home", { recursive: true });
-    return { env: { ...process.env, HOME: "/tmp/claude-home", ANTHROPIC_API_KEY: "" } };
-  }
-  const home = "/tmp/codex-home";
-  mkdirSync(home, { recursive: true });
-  const encoded = process.env.CODEX_AUTH_JSON_B64, raw = process.env.CODEX_AUTH_JSON;
-  if (encoded || raw) try {
-    const json = encoded ? Buffer.from(encoded, "base64").toString("utf8") : raw!;
-    JSON.parse(json);
-    writeFileSync(join(home, "auth.json"), json, { mode: 0o600 });
-    chmodSync(join(home, "auth.json"), 0o600);
-  } catch { return { env: process.env, error: "invalid Codex subscription auth" }; }
-  if (!process.env.CODEX_ACCESS_TOKEN && !encoded && !raw) return { env: process.env, error: "Codex subscription auth is not configured" };
-  return { env: { ...process.env, HOME: home, CODEX_HOME: home, OPENAI_API_KEY: "", CODEX_API_KEY: "" } };
-}
 
-// Subscription brain: each chat turn runs the real `claude` CLI HEADLESS on
-// Daniel's Max subscription (CLAUDE_CODE_OAUTH_TOKEN from the vault, ANTHROPIC_API_KEY
-// blanked). Mirrors remote-work-hub's proven pattern; no repo clone/push — this is
-// a general assistant, not a coding agent. Memory is injected from Convex.
+// Subscription brain: each queued chat turn runs the selected Codex or Claude
+// CLI headlessly, with metered API keys blanked and only the chosen subscription
+// credential exposed. This is conversational—repository work is delegated to
+// the durable agent runner. Bounded memory and project context come from Convex.
 
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
@@ -281,10 +234,10 @@ export const chatDispatcher = schedules.task({
   run: async () => {
     const selected = await convexQuery("ui:getAgentProvider", {});
     const provider: AgentProvider = selected === "claude" ? "claude" : "codex";
-    const prepared = prepareEnv(provider);
+    const prepared = prepareSubscriptionEnv(provider);
     if (prepared.error) return { processed: 0, error: prepared.error };
     const env = prepared.env;
-    const bin = resolveAgentBin(provider);
+    const bin = resolveSubscriptionAgentBin(provider);
     if (!bin) return { processed: 0, error: `${provider} binary not found` };
 
     const started = Date.now();
