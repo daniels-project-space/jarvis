@@ -1,9 +1,8 @@
 import { defineConfig } from "@trigger.dev/sdk/v3";
 import { additionalPackages, aptGet, syncEnvVars } from "@trigger.dev/build/extensions/core";
 
-// jarvis-jobs — runs Claude Code HEADLESS on Daniel's Max subscription
-// (CLAUDE_CODE_OAUTH_TOKEN pulled from the project-hub vault at runtime;
-// ANTHROPIC_API_KEY blanked → never the metered API). Mirrors remote-work-hub.
+// jarvis-jobs — runs the selected Codex/Claude subscription CLI headlessly;
+// metered API keys are blanked inside agent subprocesses.
 // Set TRIGGER_PROJECT_REF_JARVIS once the `jarvis-jobs` project is created in
 // the Trigger.dev dashboard, then `npx trigger.dev deploy`.
 export default defineConfig({
@@ -13,11 +12,11 @@ export default defineConfig({
   dirs: ["./src/trigger"],
   maxDuration: 3600,
   build: {
-    // Claude Code reads its bundled binary from disk — keep it out of the
-    // esbuild bundle; Trigger installs it fresh (correct Linux binary).
+    // Subscription CLIs read their bundled Linux binary from disk. Pin exact
+    // versions so a new upstream release cannot silently change a live runner.
     external: ["@anthropic-ai/claude-code", "@openai/codex", "web-push"],
     extensions: [
-      additionalPackages({ packages: ["@anthropic-ai/claude-code@latest", "@openai/codex@latest"] }),
+      additionalPackages({ packages: ["@anthropic-ai/claude-code@2.1.211", "@openai/codex@0.144.5"] }),
       aptGet({ packages: ["git", "ca-certificates"] }),
       syncEnvVars(() => {
         const value = process.env.CODEX_AUTH_JSON_B64;

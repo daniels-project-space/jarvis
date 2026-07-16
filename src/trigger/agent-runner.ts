@@ -46,8 +46,17 @@ function prepareAgentEnv(provider: AgentProvider): { env: NodeJS.ProcessEnv; err
     mkdirSync(join(home, ".claude"), { recursive: true });
     return { env: { ...process.env, HOME: home, ANTHROPIC_API_KEY: "", JARVIS_AGENT_PROVIDER: provider } };
   }
-  const home = "/tmp/codex-home";
-  mkdirSync(home, { recursive: true });
+  // Current Codex releases deliberately refuse to create their helper/PATH
+  // aliases under /tmp. Read-only turns can appear healthy without helpers,
+  // while repository-backed turns then fail as soon as they need a command.
+  // Trigger's node home is ephemeral per machine but writable and non-temp.
+  let home = process.env.JARVIS_CODEX_HOME ?? "/home/node/.codex";
+  try {
+    mkdirSync(home, { recursive: true });
+  } catch {
+    home = "/tmp/codex-home";
+    mkdirSync(home, { recursive: true });
+  }
   const encoded = process.env.CODEX_AUTH_JSON_B64;
   const raw = process.env.CODEX_AUTH_JSON;
   if (encoded || raw) {
@@ -66,7 +75,7 @@ function prepareAgentEnv(provider: AgentProvider): { env: NodeJS.ProcessEnv; err
   return {
     env: {
       ...process.env,
-      HOME: home,
+      HOME: process.env.HOME ?? dirname(home),
       CODEX_HOME: home,
       OPENAI_API_KEY: "",
       CODEX_API_KEY: "",
@@ -441,6 +450,12 @@ function runAgent(
           finalText = ev.result;
           stage = "reviewing";
           percent = Math.max(percent, 88);
+        } else if (ev.type === "turn.failed" || ev.type === "error") {
+          const message = String(ev.error?.message ?? ev.message ?? ev.error ?? "agent turn failed").slice(0, 2000);
+          finalText = `error: ${message}`;
+          latest = message.slice(-180);
+          stage = "error";
+          pushLog(`! ${message}`);
         }
       }
     });
@@ -684,7 +699,9 @@ export const agentRunner = schedules.task({
 
     // Standing briefing every agent reads (global CLAUDE.md in the runner HOME):
     // Daniel's infra map + vault access + repo/deploy conventions = real project access.
-    const briefingPath = provider === "claude" ? "/tmp/claude-home/.claude/CLAUDE.md" : "/tmp/codex-home/AGENTS.md";
+    const briefingPath = provider === "claude"
+      ? "/tmp/claude-home/.claude/CLAUDE.md"
+      : join(String(env.CODEX_HOME ?? "/tmp/codex-home"), "AGENTS.md");
     writeFileSync(
       briefingPath,
       `# You are a scoped JARVIS permanent-team agent working for Daniel.\n\n${INFRA_MAP}\n\n` +
