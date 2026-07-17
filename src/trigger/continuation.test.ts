@@ -36,6 +36,23 @@ describe("durable agent continuation", () => {
     expect(checkpoint.length).toBeLessThanOrEqual(6000);
   });
 
+  it("preserves streamed evidence when an entire worker container disappears", () => {
+    const checkpoint = buildContinuationCheckpoint({
+      attempt: 1,
+      timedOut: false,
+      interruption: "lost its worker process or container before checkpoint finalization",
+      narrative: "The Hub capability boundary is sound.",
+      trace: "inspected vault auth\nverified anonymous rejection\nstarted an optional dependency install",
+      deliveryNote: "checkpoint branch jarvis/atlas-audit retained",
+    });
+
+    expect(checkpoint).toContain("lost its worker process or container");
+    expect(checkpoint).toContain("verified anonymous rejection");
+    expect(checkpoint).toContain("Hub capability boundary is sound");
+    expect(checkpoint).toContain("do not restart broad discovery");
+    expect(checkpoint.length).toBeLessThanOrEqual(6000);
+  });
+
   it("gives deep work more room without removing the segment boundary", () => {
     expect(segmentTimeoutMs("opus")).toBe(25 * 60_000);
     expect(segmentTimeoutMs("sonnet")).toBe(15 * 60_000);

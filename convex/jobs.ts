@@ -2,6 +2,7 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { workApprovalPolicy } from "./workPolicy";
 import { requireAdmin, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
+import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
 
 const enqueueArgs = {
   task: v.string(),
@@ -293,6 +294,15 @@ export const reapStale = mutation({
         });
         abandoned.push(j.task.slice(0, 80));
       } else {
+        const checkpoint = buildContinuationCheckpoint({
+          attempt: j.attempt ?? 1,
+          timedOut: false,
+          interruption: "lost its worker process or container before checkpoint finalization",
+          priorCheckpoint: j.checkpoint,
+          narrative: j.result ?? j.progress,
+          trace: j.log,
+          deliveryNote: j.branch ? `checkpoint branch ${j.branch} retained` : undefined,
+        });
         await ctx.db.patch(j._id, {
           status: "pending",
           stage: "queued",
@@ -301,6 +311,8 @@ export const reapStale = mutation({
           nextRunAt: now + Math.min(6 * 60 * 60 * 1000, 60_000 * 2 ** Math.max(0, nextAttempt - 2)),
           attempt: nextAttempt,
           progress: `recovered after a stalled runner · attempt ${nextAttempt}`,
+          checkpoint,
+          result: checkpoint.slice(0, 4000),
         });
         requeued.push(j.task.slice(0, 80));
       }
