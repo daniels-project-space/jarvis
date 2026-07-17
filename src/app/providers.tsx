@@ -6,15 +6,23 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
 import { resolveConvexUrl } from "@/lib/convex-url";
 import { ViewerSessionProvider } from "@/lib/viewer-session";
 
-const convex = new ConvexReactClient(resolveConvexUrl(process.env.NEXT_PUBLIC_CONVEX_URL));
+const convex = new ConvexReactClient(resolveConvexUrl(process.env.NEXT_PUBLIC_CONVEX_URL), {
+  // The viewer JWT is already fresh when this provider mounts. Reusing it lets
+  // Convex schedule one refresh from its expiry instead of immediately
+  // authenticating twice and rerunning every protected subscription.
+  initialAuthTokenReuse: true,
+});
 
-type ViewerAuth = { token: string; refresh: () => Promise<string> };
+type ViewerAuth = {
+  fetchAccessToken: (args: { forceRefreshToken: boolean }) => Promise<string | null>;
+};
 const ViewerAuthContext = createContext<ViewerAuth | null>(null);
 
 class ViewerTokenError extends Error {
@@ -46,51 +54,76 @@ function useJarvisConvexAuth() {
   return useMemo(() => ({
     isLoading: auth === null,
     isAuthenticated: auth !== null,
-    fetchAccessToken: async ({ forceRefreshToken }: { forceRefreshToken: boolean }) => {
-      if (!auth) return null;
-      if (!forceRefreshToken) return auth.token;
-      // Convex requests a refresh when its websocket reconnects. A browser
-      // network transition can briefly abort that HTTP request even though the
-      // current six-hour viewer JWT remains valid. Keep the live connection on
-      // the existing capability and let the next transition retry, rather than
-      // leaking an unhandled rejection into the self-repair pipeline.
-      try {
-        return await auth.refresh();
-      } catch {
-        return auth.token;
-      }
-    },
+    fetchAccessToken: auth?.fetchAccessToken ?? (async () => null),
   }), [auth]);
 }
 
 export default function Providers({ children }: { children: ReactNode }) {
   const [viewerToken, setViewerToken] = useState<string | null>(null);
+  const viewerTokenRef = useRef<string | null>(null);
+  const refreshPromiseRef = useRef<Promise<string> | null>(null);
   const [error, setError] = useState(false);
   const [retryNonce, setRetryNonce] = useState(0);
-  const refreshViewerToken = useCallback(async () => {
-    const token = await requestViewerToken();
-    setViewerToken(token);
-    return token;
+  const retryViewerToken = useCallback(() => {
+    setError(false);
+    setRetryNonce((value) => value + 1);
   }, []);
+
+  const acceptViewerToken = useCallback((token: string) => {
+    viewerTokenRef.current = token;
+    setViewerToken((current) => (current === token ? current : token));
+  }, []);
+
+  const refreshViewerToken = useCallback(async () => {
+    if (refreshPromiseRef.current) return refreshPromiseRef.current;
+    const request = requestViewerToken()
+      .then((token) => {
+        acceptViewerToken(token);
+        return token;
+      })
+      .finally(() => {
+        refreshPromiseRef.current = null;
+      });
+    refreshPromiseRef.current = request;
+    return request;
+  }, [acceptViewerToken]);
+
+  // This callback must keep the same identity when a refreshed JWT is stored.
+  // Convex treats a changed token-fetch callback as a completely new auth
+  // configuration: it pauses the websocket and reruns every live query. The
+  // previous callback closed over React token state, creating a refresh/render/
+  // re-auth loop that hid captions and consumed database reads continuously.
+  const fetchAccessToken = useCallback(async ({ forceRefreshToken }: { forceRefreshToken: boolean }) => {
+    const current = viewerTokenRef.current;
+    if (!forceRefreshToken && current) return current;
+    try {
+      return await refreshViewerToken();
+    } catch {
+      // A short network transition should not discard a still-valid six-hour
+      // capability. Convex can retry after the socket recovers.
+      return current;
+    }
+  }, [refreshViewerToken]);
+
+  const auth = useMemo<ViewerAuth>(() => ({ fetchAccessToken }), [fetchAccessToken]);
 
   useEffect(() => {
     let active = true;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
-    setError(false);
     void requestViewerToken()
       .then((token) => {
-        if (active) setViewerToken(token);
+        if (active) acceptViewerToken(token);
       })
       .catch(() => {
         if (!active) return;
         setError(true);
-        retryTimer = setTimeout(() => setRetryNonce((value) => value + 1), 2_000);
+        retryTimer = setTimeout(retryViewerToken, 2_000);
       });
     return () => {
       active = false;
       if (retryTimer) clearTimeout(retryTimer);
     };
-  }, [retryNonce]);
+  }, [acceptViewerToken, retryNonce, retryViewerToken]);
 
   if (error) {
     return (
@@ -106,7 +139,7 @@ export default function Providers({ children }: { children: ReactNode }) {
           </p>
           <button
             type="button"
-            onClick={() => setRetryNonce((value) => value + 1)}
+            onClick={retryViewerToken}
             className="mt-5 font-mono text-[10px] uppercase tracking-[0.18em] text-white/40 transition hover:text-white/75"
           >
             Retry now
@@ -116,7 +149,6 @@ export default function Providers({ children }: { children: ReactNode }) {
     );
   }
   if (!viewerToken) return <main aria-label="Initializing Jarvis" className="min-h-screen bg-black" />;
-  const auth = { token: viewerToken, refresh: refreshViewerToken };
   return (
     <ViewerAuthContext.Provider value={auth}>
       <ViewerSessionProvider token={viewerToken}>
