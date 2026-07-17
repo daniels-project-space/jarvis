@@ -323,11 +323,82 @@ body {
   bottom: max(0.75rem, env(safe-area-inset-bottom));
 }
 
+/* Composable visual-scene runtime. Motion communicates new/changed state and
+   never owns spatial camera state, which remains local to the user's device. */
+.scene-block { animation: scene-reveal .42s cubic-bezier(.2,.9,.25,1) both; }
+.scene-block:nth-child(2) { animation-delay: 45ms; }
+.scene-block:nth-child(3) { animation-delay: 90ms; }
+.scene-block:nth-child(4) { animation-delay: 135ms; }
+@keyframes scene-reveal {
+  from { opacity: 0; transform: translateY(9px) scale(.992); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.scene-metric { animation: scene-value .46s cubic-bezier(.22,1,.36,1) both; }
+@keyframes scene-value {
+  from { opacity: .15; transform: translateY(5px); filter: blur(2px); }
+  to { opacity: 1; transform: translateY(0); filter: blur(0); }
+}
+.scene-progress, .scene-bar, .scene-gantt, .scene-funnel {
+  transform-origin: left center;
+  animation: scene-grow .65s cubic-bezier(.2,.9,.25,1) both;
+}
+@keyframes scene-grow { from { transform: scaleX(0); opacity: .35; } to { transform: scaleX(1); opacity: 1; } }
+.scene-line { stroke-dasharray: 1500; stroke-dashoffset: 1500; animation: scene-draw 1s ease forwards; }
+@keyframes scene-draw { to { stroke-dashoffset: 0; } }
+.scene-donut, .scene-gauge { animation: scene-ring .8s ease both; }
+@keyframes scene-ring { from { stroke-dashoffset: 282.74; opacity: .3; } to { opacity: 1; } }
+.scene-candle { animation: scene-candle .35s ease both; transform-origin: center bottom; }
+@keyframes scene-candle { from { opacity: 0; transform: scaleY(.45); } to { opacity: 1; transform: scaleY(1); } }
+.scene-node, .scene-spatial-node { transition: filter .2s ease, transform .2s ease; }
+.scene-node:hover, .scene-spatial-node:hover { filter: brightness(1.35) drop-shadow(0 0 8px rgba(0,255,136,.35)); }
+.scene-gallery { animation: scene-value .5s ease both; }
+.scene-focus { animation: scene-focus .7s ease both; }
+@keyframes scene-focus { 50% { box-shadow: 0 0 0 4px rgba(0,255,136,.12), 0 0 42px rgba(0,255,136,.18); } }
+.scene-live-dot { animation: scene-live 2.4s ease-in-out infinite; }
+@keyframes scene-live { 50% { box-shadow: 0 0 0 4px rgba(0,255,136,.1); opacity: .55; } }
+.scene-signal-glow.is-fresh { animation: scene-signal 2.8s ease-in-out infinite; }
+@keyframes scene-signal {
+  50% { background: rgba(56,230,164,.11); box-shadow: inset 0 0 24px rgba(56,230,164,.09), 0 0 18px rgba(56,230,164,.08); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .materialize, .materialize::after, .rise, .breathe, .live-ring, .cap-bloom,
-  .brackets::before, .brackets::after, .brackets > .bk::before, .brackets > .bk::after {
+  .brackets::before, .brackets::after, .brackets > .bk::before, .brackets > .bk::after,
+  .scene-block, .scene-metric, .scene-progress, .scene-bar, .scene-gantt,
+  .scene-funnel, .scene-line, .scene-donut, .scene-gauge, .scene-candle,
+  .scene-gallery, .scene-focus, .scene-live-dot, .scene-signal-glow {
     animation: none !important;
     opacity: 1;
     clip-path: none;
   }
+}
+
+/* The in-app accessibility preference is independent of the operating-system
+   preference and must calm every animation immediately when toggled. */
+html.jarvis-reduce-motion .materialize,
+html.jarvis-reduce-motion .materialize::after,
+html.jarvis-reduce-motion .rise,
+html.jarvis-reduce-motion .breathe,
+html.jarvis-reduce-motion .live-ring,
+html.jarvis-reduce-motion .cap-bloom,
+html.jarvis-reduce-motion .bob,
+html.jarvis-reduce-motion .tile-pulse,
+html.jarvis-reduce-motion .scene-block,
+html.jarvis-reduce-motion .scene-metric,
+html.jarvis-reduce-motion .scene-progress,
+html.jarvis-reduce-motion .scene-bar,
+html.jarvis-reduce-motion .scene-gantt,
+html.jarvis-reduce-motion .scene-funnel,
+html.jarvis-reduce-motion .scene-line,
+html.jarvis-reduce-motion .scene-donut,
+html.jarvis-reduce-motion .scene-gauge,
+html.jarvis-reduce-motion .scene-candle,
+html.jarvis-reduce-motion .scene-gallery,
+html.jarvis-reduce-motion .scene-focus,
+html.jarvis-reduce-motion .scene-live-dot,
+html.jarvis-reduce-motion .scene-signal-glow {
+  animation: none !important;
+  opacity: 1;
+  clip-path: none;
+  transition-duration: 0.01ms !important;
 }

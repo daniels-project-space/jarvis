@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { prepareSubscriptionEnv } from "./subscription-runtime";
+import { prepareSubscriptionEnv, resolveSubscriptionAgentBin } from "./subscription-runtime";
 
 describe("subscription subprocess capability scope", () => {
   afterEach(() => vi.unstubAllEnvs());
@@ -24,5 +24,9 @@ describe("subscription subprocess capability scope", () => {
     const supervisor = prepareSubscriptionEnv("claude", { includeDispatch: true }).env;
     expect(supervisor.JARVIS_DISPATCH_TOKEN).toBe("dispatch-capability");
     expect(supervisor.JARVIS_WORKER_TOKEN).toBeUndefined();
+  });
+
+  it("ships the pinned Codex CLI that Trigger conversation workers resolve", () => {
+    expect(resolveSubscriptionAgentBin("codex")).toMatch(/codex/);
   });
 });

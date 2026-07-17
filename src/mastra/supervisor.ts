@@ -86,7 +86,13 @@ function deterministicPlan(goal: string, repo?: string): ManagedMission {
 }
 
 export async function planManagedMission(goal: string, options?: { repo?: string; context?: string }): Promise<ManagedMission> {
-  if (!process.env.OPENAI_API_KEY) return deterministicPlan(goal, options?.repo);
+  // The conversational Codex subscription worker normally supplies explicit
+  // workstreams. Keep Mastra's deterministic policy fallback available here,
+  // but never silently bill a metered model merely because Vercel has an API
+  // key for Realtime/vision surfaces.
+  if (process.env.JARVIS_ALLOW_METERED_MASTRA !== "1" || !process.env.OPENAI_API_KEY) {
+    return deterministicPlan(goal, options?.repo);
+  }
   try {
     const roster = PERMANENT_TEAM.filter((agent) => agent.slug !== "jarvis")
       .map((agent) => `- ${agent.slug}: ${agent.role} — ${agent.description}`)

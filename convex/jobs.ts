@@ -254,6 +254,19 @@ export const finalize = mutation({
         });
       }
     }
+    // Evidence-backed maintenance launched by Sentry owns an attention item.
+    // Resolve it with the job lifecycle so a later insight sweep cannot
+    // redispatch the same repair after the worker has already finished.
+    const ownedAttention = await ctx.db
+      .query("attentionItems")
+      .withIndex("by_jobId", (q: any) => q.eq("jobId", String(a.jobId)))
+      .first();
+    if (ownedAttention) {
+      await ctx.db.patch(ownedAttention._id, {
+        status: success ? "resolved" : "open",
+        updatedAt: now,
+      });
+    }
     return true;
   },
 });

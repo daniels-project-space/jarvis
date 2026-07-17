@@ -4,6 +4,8 @@ import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
+import { primeMicrophone, readJarvisPermissions, type JarvisPermissionState } from "@/lib/permissions";
+import { registerSW, subscribePush } from "@/lib/push";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
 import CommandDeck from "./CommandDeck";
@@ -17,8 +19,13 @@ const BoardView = dynamic(() => import("./BoardView"), {
   ssr: false,
   loading: () => <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-cyan">loading drawing workspace…</div>,
 });
+const VisualSceneView = dynamic(() => import("./VisualSceneView"), {
+  ssr: false,
+  loading: () => <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-cyan">assembling visual workspace…</div>,
+});
 
 type Attachment = { type: string; value: string; title?: string };
+type JarvisPrefs = { voice: string; tts: string; reduceMotion: boolean; liveDefault: boolean };
 type Msg = {
   _id: string;
   role: string;
@@ -129,6 +136,8 @@ function MediaCard({ a, onShow }: { a: Attachment; onShow: (a: Attachment) => vo
                     ? "📕"
                     : a.type === "canvas"
                       ? "🕸"
+                      : a.type === "scene"
+                        ? "✦"
                       : a.type === "trip"
                         ? "🌍"
                         : "📄"}
@@ -187,6 +196,8 @@ function panelSize(panel: { type: string; value: string }): string {
       return "w-[min(1180px,88%)] h-[min(780px,94%)]";
     case "w:calc":
       return "w-[min(560px,94%)] h-[min(360px,80%)]";
+    case "scene":
+      return "w-[min(1440px,98%)] h-[min(820px,97%)]";
     case "markdown":
       return "w-[min(980px,97%)] h-full";
     case "doc":
@@ -246,12 +257,13 @@ const OPTION_MOODS: { k: string; c: string }[] = [
   { k: "curious", c: "#33e0d0" }, { k: "serious", c: "#8fa3bd" }, { k: "excited", c: "#ff5470" },
 ];
 function OptionsPanel({
-  prefs, setPref, agentProvider, onAgentProvider, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood,
+  prefs, setPref, permissions, permissionBusy, onEnablePermissions, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood,
 }: {
-  prefs: { voice: string; tts: string; reduceMotion: boolean };
-  setPref: (k: "voice" | "tts" | "reduceMotion", v: string | boolean) => void;
-  agentProvider: "codex" | "claude";
-  onAgentProvider: (provider: "codex" | "claude") => void;
+  prefs: JarvisPrefs;
+  setPref: (k: keyof JarvisPrefs, v: string | boolean) => void;
+  permissions: JarvisPermissionState;
+  permissionBusy: boolean;
+  onEnablePermissions: () => void;
   live: string;
   locOn: boolean;
   onLocation: () => void;
@@ -292,6 +304,8 @@ function OptionsPanel({
     setPairingState("ready");
     await navigator.clipboard?.writeText(payload.url).catch(() => undefined);
   };
+  const permissionText = (value: JarvisPermissionState["microphone"]) =>
+    value === "granted" ? "ready" : value === "denied" ? "blocked" : value === "unsupported" ? "unavailable" : "not enabled";
   return (
     <>
       <div className="fixed inset-0 z-[55]" onClick={onClose} />
@@ -302,10 +316,23 @@ function OptionsPanel({
         </div>
         <div className="divide-y divide-white/5">
           <Row label="Agent intelligence" hint="subscription used for background work and deep fallback">
-            <Seg opts={[["codex", "Codex"], ["claude", "Claude"]]} val={agentProvider} on={(v) => onAgentProvider(v as "codex" | "claude")} />
+            <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 font-mono text-[9px] uppercase tracking-wider text-cyan">Codex · adaptive</span>
           </Row>
           <Row label="Voice" hint="how 'hey Jarvis' talks back">
             <Seg opts={[["free", "Free"], ["realtime", "Live"]]} val={prefs.voice} on={(v) => setPref("voice", v)} />
+          </Row>
+          <Row
+            label="Voice & alerts"
+            hint={`microphone ${permissionText(permissions.microphone)} · notifications ${permissionText(permissions.notifications)}`}
+          >
+            <button
+              type="button"
+              disabled={permissionBusy || (permissions.microphone === "granted" && permissions.notifications === "granted")}
+              onClick={onEnablePermissions}
+              className={`rounded-lg px-3 py-1 text-[11px] transition disabled:opacity-70 ${permissions.microphone === "granted" && permissions.notifications === "granted" ? "bg-emerald-400/10 text-emerald-300 ring-1 ring-emerald-400/30" : "border border-cyan/30 text-cyan hover:bg-cyan/10"}`}
+            >
+              {permissionBusy ? "enabling…" : permissions.microphone === "granted" && permissions.notifications === "granted" ? "ready ✓" : "enable once"}
+            </button>
           </Row>
           <Row label="Speaking voice" hint="Fast = instant on-device · Kokoro/Eleven = richer, slower">
             <Seg opts={[["fast", "Fast"], ["free", "Kokoro"], ["elevenlabs", "Eleven"]]} val={prefs.tts} on={(v) => setPref("tts", v)} />
@@ -313,6 +340,11 @@ function OptionsPanel({
           <Row label="Live conversation" hint={live !== "off" ? "on now" : "start a realtime voice session"}>
             <button onClick={onToggleLive} className={`rounded-lg px-3 py-1 text-[11px] transition ${live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>
               {live === "connecting" ? "…" : live !== "off" ? "stop" : "start"}
+            </button>
+          </Row>
+          <Row label="Live by default" hint="starts on load once this browser has microphone permission">
+            <button onClick={() => setPref("liveDefault", !prefs.liveDefault)} className={`h-5 w-9 rounded-full p-0.5 transition ${prefs.liveDefault ? "bg-cyan/60" : "bg-white/15"}`}>
+              <span className={`block h-4 w-4 rounded-full bg-white transition-transform ${prefs.liveDefault ? "translate-x-4" : ""}`} />
             </button>
           </Row>
           <Row label="Location" hint={locOn ? "on — 'near me' works everywhere" : "for 'pizza near me', local hours"}>
@@ -881,6 +913,8 @@ function Viewport({
         <FleetView value={panel.value} />
       ) : panel.type === "board" ? (
         <BoardView value={panel.value} />
+      ) : panel.type === "scene" ? (
+        <VisualSceneView value={panel.value} />
       ) : panel.type === "url" || panel.type === "video" ? (
         <div className="flex min-h-0 flex-1 flex-col">
           <iframe
@@ -1069,7 +1103,8 @@ export default function JarvisUI() {
   const setLiveOn = (args: Record<string, unknown>) => clientMutation("ui:setLiveOn", args);
   const voiceRow = useJarvisQuery(api.ui.getVoice, {}) as { value: string; updatedAt: number } | null | undefined;
   const liveOnRow = useJarvisQuery(api.ui.getLiveOn, {}) as { value: string; updatedAt: number } | null | undefined;
-  const activeJobs = (useJarvisQuery(api.jobs.active, {}) ?? []) as Job[];
+  const commandSnapshot = useJarvisQuery(api.commandCenter.snapshot, {}) as any;
+  const activeJobs = (commandSnapshot?.active ?? []) as Job[];
 
   const [input, setInput] = useState("");
   const [speaking, setSpeaking] = useState(false);
@@ -1233,14 +1268,10 @@ export default function JarvisUI() {
   // Options panel + persisted preferences (voice lane, TTS voice, wake, motion)
   const [optionsOpen, setOptionsOpen] = useState(false);
   const setMoodMut = (args: Record<string, unknown>) => clientMutation("ui:setMood", args);
-  const agentProvider = (useJarvisQuery(api.ui.getAgentProvider, {}) ?? "codex") as "codex" | "claude";
-  const setAgentProvider = (args: { provider: "codex" | "claude" }) =>
-    fetch("/api/client-state", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ action: "set_agent_provider", ...args }),
-    });
-  const [prefs, setPrefs] = useState({ voice: "free", tts: "free", reduceMotion: false });
+  const [prefs, setPrefs] = useState<JarvisPrefs>({ voice: "realtime", tts: "free", reduceMotion: false, liveDefault: true });
+  const [permissions, setPermissions] = useState<JarvisPermissionState>({ microphone: "prompt", notifications: "prompt" });
+  const [permissionBusy, setPermissionBusy] = useState(false);
+  const liveAutoStarted = useRef(false);
   useEffect(() => {
     // one-time revert: the browser "fast" voice was a regression Daniel hated —
     // migrate anyone still stuck on it back to Kokoro ("free"). Guarded so a
@@ -1250,16 +1281,36 @@ export default function JarvisUI() {
       localStorage.setItem("jarvis_tts_revert1", "1");
     }
     setPrefs({
-      voice: localStorage.getItem("jarvis_voice") || "free",
+      voice: localStorage.getItem("jarvis_voice") || "realtime",
       tts: localStorage.getItem("jarvis_tts") || "free",
       reduceMotion: localStorage.getItem("jarvis_reduce_motion") === "1",
+      liveDefault: localStorage.getItem("jarvis_live_default") !== "0",
     });
   }, []);
-  const setPref = (k: "voice" | "tts" | "reduceMotion", v: string | boolean) => {
+  const setPref = (k: keyof JarvisPrefs, v: string | boolean) => {
     setPrefs((p) => ({ ...p, [k]: v }));
-    const key = k === "voice" ? "jarvis_voice" : k === "tts" ? "jarvis_tts" : "jarvis_reduce_motion";
+    const key = k === "voice" ? "jarvis_voice" : k === "tts" ? "jarvis_tts" : k === "reduceMotion" ? "jarvis_reduce_motion" : "jarvis_live_default";
     localStorage.setItem(key, typeof v === "boolean" ? (v ? "1" : "0") : String(v));
+    if (k === "liveDefault" && v === true) liveAutoStarted.current = false;
   };
+  const refreshPermissions = async () => {
+    setPermissions(await readJarvisPermissions());
+  };
+  useEffect(() => {
+    void refreshPermissions();
+    const refresh = () => void refreshPermissions();
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    document.documentElement.classList.toggle("jarvis-reduce-motion", prefs.reduceMotion);
+    return () => document.documentElement.classList.remove("jarvis-reduce-motion");
+  }, [prefs.reduceMotion]);
 
   // Location: granted once, then permanent (browser remembers the permission,
   // and we refresh the stored coords on load so "near me" works in both lanes).
@@ -1488,7 +1539,7 @@ export default function JarvisUI() {
   }, [activeJobs.length]);
 
   const shownJob = activeJobs.find((j) => j._id === agentView) ?? null;
-  const busy = sending || messages.some((m) => m.role === "assistant" && m.status === "streaming");
+  const busy = sending || messages.some((m) => m.status === "pending" || (m.role === "assistant" && m.status === "streaming"));
 
   useEffect(() => {
     // scroll the message CONTAINER only — scrollIntoView reaches into the
@@ -1499,7 +1550,12 @@ export default function JarvisUI() {
   }, [messages.length, messages[messages.length - 1]?.text, caption?.text]);
 
   useEffect(() => {
-    import("../lib/push").then((m) => m.registerSW());
+    void registerSW().then(() => {
+      if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+        void subscribePush(saveSub).then(() => refreshPermissions());
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Self-healing: uncaught client errors feed the incident pipeline (max 3
@@ -1718,6 +1774,7 @@ export default function JarvisUI() {
         if (s === "live") {
           liveRef.current = true;
           setLive("live");
+          void refreshPermissions();
           // keep the cross-device lock fresh for as long as we're live
           if (liveBeat.current) clearInterval(liveBeat.current);
           liveBeat.current = setInterval(() => void setLiveOn({ client: me.current, on: true }).catch(() => {}), 20_000);
@@ -1769,6 +1826,43 @@ export default function JarvisUI() {
       clientId: me.current,
     });
   }
+
+  async function enableDevicePermissions() {
+    if (permissionBusy) return;
+    setPermissionBusy(true);
+    // Both permission-gated calls begin in the same click. The browser owns
+    // the durable decision; Jarvis only records and displays the real state.
+    const [microphone, push] = await Promise.all([
+      primeMicrophone().catch(() => "prompt" as const),
+      subscribePush(saveSub).catch(() => "failed"),
+    ]).finally(() => setPermissionBusy(false));
+    await refreshPermissions().catch(() => undefined);
+    if (microphone === "granted") {
+      setPref("voice", "realtime");
+      setPref("liveDefault", true);
+      liveAutoStarted.current = true;
+      if (!liveRef.current && live === "off") void toggleLive(true);
+    }
+    if (microphone === "denied" || push === "denied") {
+      alert("One permission is blocked. Open this site's browser settings to re-enable microphone or notifications.");
+    } else if (push === "unsupported") {
+      alert("Voice is ready. For notifications on iPhone, add JARVIS to the Home Screen and open it there once.");
+    } else if (push === "failed" || push === "no-key") {
+      alert("Voice is ready, but browser alerts could not be configured yet.");
+    }
+  }
+
+  useEffect(() => {
+    if (!prefs.liveDefault || permissions.microphone !== "granted" || liveAutoStarted.current) return;
+    liveAutoStarted.current = true;
+    const timer = window.setTimeout(() => {
+      if (!liveRef.current) void toggleLive(true);
+    }, 450);
+    return () => window.clearTimeout(timer);
+    // This is intentionally a once-per-load boot. Stopping live mode manually
+    // must not cause the next render to reopen the microphone.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefs.liveDefault, permissions.microphone]);
 
   // Screen sight: share a screen/window for ONE frame — JARVIS reads it and
   // answers about what's actually in front of Daniel.
@@ -1851,13 +1945,13 @@ export default function JarvisUI() {
   }
 
   // One-shot voice input: record → STT → send. Works on iOS too.
-  // FREE VOICE MODE (default): wake word → listen (auto-stop on silence) →
+  // FREE VOICE MODE (optional): wake word → listen (auto-stop on silence) →
   // STT → Claude brain → free TTS → listen again for the follow-up. No OpenAI
   // realtime session, no GPT voice. The live button still offers realtime
   // (localStorage jarvis_voice = "realtime" makes the wake word use it too).
   const freeLoop = useRef(false);
   const freeBusy = useRef(false);
-  const voiceMode = () => (typeof localStorage !== "undefined" && localStorage.getItem("jarvis_voice")) || "free";
+  const voiceMode = () => (typeof localStorage !== "undefined" && localStorage.getItem("jarvis_voice")) || "realtime";
   async function freeVoiceTurn() {
     if (freeBusy.current || liveRef.current) return;
     freeBusy.current = true;
@@ -2035,7 +2129,8 @@ export default function JarvisUI() {
           <span className="hidden md:inline"><Clock /></span>
           <button
             onClick={async () => {
-              const r = await (await import("../lib/push")).subscribePush(saveSub);
+              const r = await subscribePush(saveSub);
+              await refreshPermissions();
               alert(
                 r === "subscribed"
                   ? "Notifications on — JARVIS will ping this device."
@@ -2047,9 +2142,9 @@ export default function JarvisUI() {
               );
             }}
             title="notifications"
-            className="hud-label hidden rounded px-1 hover:text-cyan sm:block"
+            className={`hud-label hidden rounded px-1 hover:text-cyan sm:block ${permissions.notifications === "granted" ? "!text-emerald-300" : ""}`}
           >
-            ping
+            {permissions.notifications === "granted" ? "alerts ✓" : "alerts"}
           </button>
           <button
             onClick={() => setOptionsOpen((o) => !o)}
@@ -2062,6 +2157,7 @@ export default function JarvisUI() {
       </header>
       <CommandDeck
         busy={busy}
+        snapshot={commandSnapshot}
         selectedJobId={agentView}
         onSelectJob={(id) => setAgentView((current) => (current === id ? null : id))}
       />
@@ -2069,8 +2165,9 @@ export default function JarvisUI() {
         <OptionsPanel
           prefs={prefs}
           setPref={setPref}
-          agentProvider={agentProvider}
-          onAgentProvider={(provider) => void setAgentProvider({ provider })}
+          permissions={permissions}
+          permissionBusy={permissionBusy}
+          onEnablePermissions={() => void enableDevicePermissions()}
           live={live}
           locOn={locOn}
           onLocation={() => void captureLocation(true)}
@@ -2149,7 +2246,7 @@ export default function JarvisUI() {
               fullBleed ? "pointer-events-none opacity-0" : compactAside ? "pointer-events-none opacity-0 md:opacity-100" : "opacity-100"
             }`}
           >
-            <ThreeOrb state={orbState} energyRef={energyRef} moodColor={moodColor} aside={compactAside} />
+            <ThreeOrb state={orbState} energyRef={energyRef} moodColor={moodColor} aside={compactAside} reduceMotion={prefs.reduceMotion} />
           </div>
           {/* THE ONE caption — spoken words, under the orb. Short text sits in a
               contained field; a long reply scrolls through like a teleprompter,

@@ -24,6 +24,37 @@ export const upsert = mutation({
   },
 });
 
+// One bounded batch replaces a Vercel poller's N mutations. Unchanged provider
+// snapshots do not rewrite rows, so reactive clients and Convex storage only
+// wake when project truth actually changes.
+export const sync = mutation({
+  args: {
+    projects: v.array(v.object({ slug: v.string(), status: v.string(), summary: v.string(), data: v.optional(v.any()) })),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    const current = await ctx.db.query("projectState").collect();
+    const bySlug = new Map(current.map((row) => [row.slug, row]));
+    const changed: string[] = [];
+    for (const input of a.projects.slice(0, 80)) {
+      const row = bySlug.get(input.slug);
+      const doc = {
+        slug: input.slug.slice(0, 80),
+        status: input.status.slice(0, 40),
+        summary: input.summary.slice(0, 800),
+        data: input.data,
+      };
+      if (row && row.status === doc.status && row.summary === doc.summary && JSON.stringify(row.data ?? null) === JSON.stringify(doc.data ?? null)) continue;
+      const next = { ...doc, updatedAt: Date.now() };
+      if (row) await ctx.db.patch(row._id, next);
+      else await ctx.db.insert("projectState", next);
+      changed.push(doc.slug);
+    }
+    return { changed, total: a.projects.length };
+  },
+});
+
 export const list = query({
   args: { ...viewerAuthArgs },
   handler: async (ctx, a) => {

@@ -23,7 +23,7 @@ export const snapshot = query({
       conversation.reverse();
     }
     const activeStatuses = ["running", "pending", "awaiting_approval", "paused", "needs_input"];
-    const [memHit, memRecent, business, projects, activeGroups, findings, trip, draft, location, panel, agents, attention, approvals] =
+    const [memHit, memRecent, business, projects, activeGroups, findings, trip, draft, location, panel, agents, attentionGroups, approvals, goalGroups] =
       await Promise.all([
         text
           ? ctx.db
@@ -60,16 +60,29 @@ export const snapshot = query({
         ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "location")).first(),
         ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first(),
         ctx.db.query("agentProfiles").collect(),
-        ctx.db
-          .query("attentionItems")
-          .withIndex("by_status", (q: any) => q.eq("status", "open"))
-          .order("desc")
-          .take(8),
+        Promise.all(
+          ["open", "working"].map((status) =>
+            ctx.db
+              .query("attentionItems")
+              .withIndex("by_status", (q: any) => q.eq("status", status))
+              .order("desc")
+              .take(8),
+          ),
+        ),
         ctx.db
           .query("approvals")
           .withIndex("by_status", (q: any) => q.eq("status", "pending"))
           .order("desc")
           .take(8),
+        Promise.all(
+          ["active", "blocked"].map((status) =>
+            ctx.db
+              .query("projectGoals")
+              .withIndex("by_status_priority", (q: any) => q.eq("status", status))
+              .order("desc")
+              .take(20),
+          ),
+        ),
       ]);
     const activeJobs = activeGroups.flat().sort((x: any, y: any) => (y.priority ?? 50) - (x.priority ?? 50));
     const liveAgents = agents.map((profile) => {
@@ -88,6 +101,7 @@ export const snapshot = query({
       ).slice(0, 10),
       business,
       projects,
+      goals: goalGroups.flat().sort((left: any, right: any) => right.priority - left.priority).slice(0, 24),
       jobs: activeJobs,
       findings,
       trip,
@@ -95,9 +109,9 @@ export const snapshot = query({
       location,
       panel,
       agents: liveAgents,
-      attention: attention.sort(
+      attention: attentionGroups.flat().sort(
         (x: any, y: any) => y.impact * y.urgency * y.confidence - x.impact * x.urgency * x.confidence,
-      ),
+      ).slice(0, 12),
       approvals,
       threadId,
       conversation,

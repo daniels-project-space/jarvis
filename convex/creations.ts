@@ -94,6 +94,29 @@ export const update = mutation({
   },
 });
 
+// Compare-and-swap for composable visual scenes. Multiple agents may patch a
+// scene while Daniel is talking; a stale writer must merge again instead of
+// silently erasing the other agent's blocks.
+export const updateScene = mutation({
+  args: {
+    id: v.id("creations"),
+    expectedUpdatedAt: v.number(),
+    title: v.string(),
+    data: v.string(),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    const row = await ctx.db.get(a.id);
+    if (!row || row.kind !== "scene") return { ok: false as const, reason: "not_found" as const };
+    if (row.updatedAt !== a.expectedUpdatedAt)
+      return { ok: false as const, reason: "conflict" as const, data: row.data, title: row.title, updatedAt: row.updatedAt };
+    const updatedAt = Date.now();
+    await ctx.db.patch(a.id, { title: a.title.slice(0, 120), data: a.data, updatedAt });
+    return { ok: true as const, updatedAt };
+  },
+});
+
 // Atomic progressive travel patch. Provider calls finish independently; doing
 // read/modify/write in the Vercel route let two simultaneous results overwrite
 // one another. Keeping the merge in one Convex mutation makes each arrival

@@ -1,6 +1,7 @@
 import { schedules } from "@trigger.dev/sdk/v3";
 import { sendPush } from "./push-send";
 import { vaultService } from "../lib/vault-client";
+import { PROJECT_BY_SLUG } from "../lib/project-registry";
 
 // Slice C — awareness. Polls the cloud stack (Vercel deploy health across all of
 // Daniel's apps) and writes a snapshot to Convex `projectState`, which the brain
@@ -10,15 +11,21 @@ const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
 const VERCEL_TEAM = "team_VY2PwHgXLV9Bo0vs2iXdnGxw";
 
-async function convexMutation(path: string, args: unknown) {
+async function convexMutation<T = unknown>(path: string, args: unknown): Promise<T | null> {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
   if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
   const protectedArgs = { ...((args ?? {}) as Record<string, unknown>), workerToken };
-  await fetch(`${CONVEX_URL}/api/mutation`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, args: protectedArgs, format: "json" }),
-  }).catch(() => {});
+  try {
+    const response = await fetch(`${CONVEX_URL}/api/mutation`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path, args: protectedArgs, format: "json" }),
+    });
+    const payload = await response.json();
+    return response.ok && payload?.status !== "error" ? (payload?.value as T) : null;
+  } catch {
+    return null;
+  }
 }
 async function convexQuery(path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
@@ -62,40 +69,51 @@ export const stackPoller = schedules.task({
     // "What's new" awareness: latest commit per app repo so JARVIS knows what
     // changed across the dashboard, not just whether deploys are green.
     const gh = process.env.GITHUB_TOKEN ?? "";
-    async function latestCommit(repo: string): Promise<string> {
-      if (!gh) return "";
+    async function latestCommit(repo: string): Promise<{ sha: string; message: string; committedAt: string } | null> {
+      if (!gh) return null;
       try {
         const r = await fetch(`https://api.github.com/repos/daniels-project-space/${repo}/commits?per_page=1`, {
           headers: { Authorization: `Bearer ${gh}`, Accept: "application/vnd.github+json" },
         });
-        if (!r.ok) return "";
+        if (!r.ok) return null;
         const c = (await r.json())[0];
-        const when = new Date(c.commit.author.date);
-        const hrs = Math.max(0, Math.round((Date.now() - when.getTime()) / 3_600_000));
         const msg = String(c.commit.message).split("\n")[0].slice(0, 80);
-        return `latest change ${hrs < 1 ? "under an hour" : hrs < 48 ? `${hrs}h` : `${Math.round(hrs / 24)}d`} ago: "${msg}"`;
+        return { sha: String(c.sha).slice(0, 12), message: msg, committedAt: String(c.commit.author.date) };
       } catch {
-        return "";
+        return null;
       }
     }
 
-    let polled = 0;
     const newlyBroken: string[] = [];
-    for (const p of projects) {
+    const rows = await Promise.all(projects.map(async (p) => {
       const prod = p.targets?.production;
       const status = prod?.readyState ?? "no-deploy";
       const alias = (prod?.alias ?? []).find((a: string) => !a.includes("-danielmabro")) ?? (prod?.alias ?? [])[0];
       const old = priorStatus.get(p.name);
       if (status === "ERROR" && old && old !== "ERROR") newlyBroken.push(p.name);
-      const recent = await latestCommit(p.name);
-      await convexMutation("projectState:upsert", {
+      const commit = await latestCommit(p.name);
+      const recent = commit ? `latest: "${commit.message}"` : "";
+      const profile = PROJECT_BY_SLUG.get(p.name);
+      return {
         slug: p.name,
         status,
         summary: `Vercel: ${status}${alias ? ` · ${alias}` : ""}${recent ? ` · ${recent}` : ""}`,
-        data: { vercel: status, url: alias ? `https://${alias}` : null, framework: p.framework ?? null, recent },
-      });
-      polled++;
-    }
+        data: {
+          vercel: status,
+          url: alias ? `https://${alias}` : profile?.productionUrl ?? null,
+          framework: p.framework ?? null,
+          recent,
+          commit,
+          name: profile?.name,
+          repo: profile?.repo,
+          purpose: profile?.purpose,
+          objectives: profile?.objectives ?? [],
+          invariants: profile?.invariants ?? [],
+          related: profile?.related ?? [],
+        },
+      };
+    }));
+    const sync = await convexMutation<{ changed: string[]; total: number }>("projectState:sync", { projects: rows });
     // Self-healing: a newly-broken deploy files an incident (the healer
     // dispatches a root-cause repair agent within ~2 min) and tells Daniel.
     if (newlyBroken.length) {
@@ -112,6 +130,6 @@ export const stackPoller = schedules.task({
       });
       await sendPush("⚠️ Deploy failed", `${newlyBroken.join(", ")} — repair agent dispatched.`, "/");
     }
-    return { polled, newlyBroken };
+    return { polled: rows.length, changed: sync?.changed ?? [], newlyBroken };
   },
 });

@@ -45,7 +45,10 @@ export const setAgentProvider = mutation({
   handler: async (ctx, a) => {
     await requireAdmin(ctx, a.authTokenHash);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "agentProvider")).first();
-    const doc = { key: "agentProvider", type: "provider", value: a.provider, updatedAt: Date.now() };
+    // Jarvis's durable team is subscription-backed Codex. Keep the historical
+    // argument for old clients, but never silently switch the execution plane
+    // back to a metered provider.
+    const doc = { key: "agentProvider", type: "provider", value: "codex", updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
     else await ctx.db.insert("ui", doc);
   },
@@ -55,8 +58,7 @@ export const getAgentProvider = query({
   args: { ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "agentProvider")).first();
-    return row?.value === "claude" ? "claude" : "codex";
+    return "codex";
   },
 });
 

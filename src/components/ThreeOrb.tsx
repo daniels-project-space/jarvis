@@ -22,6 +22,7 @@ export default function ThreeOrb({
   energyRef,
   moodColor,
   aside = false,
+  reduceMotion = false,
 }: {
   state?: OrbState;
   energyRef?: { current: number };
@@ -31,6 +32,7 @@ export default function ThreeOrb({
   // transform on the full-bleed canvas got clipped by the stage bounds and
   // could stick until reload).
   aside?: boolean;
+  reduceMotion?: boolean;
 }) {
   const [webglUnavailable, setWebglUnavailable] = useState(false);
   const moodRef = useRef<string | undefined>(moodColor);
@@ -52,7 +54,7 @@ export default function ThreeOrb({
     if (!mount) return;
     let destroyed = false;
     const compact = window.matchMedia("(max-width: 767px)").matches;
-    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const reducedMotion = reduceMotion || window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const N = reducedMotion ? 420 : compact ? 800 : 1400;
     const CONNECTION_SAMPLE = reducedMotion ? 140 : compact ? 190 : 300;
     const W = () => mount.clientWidth || 1;
@@ -382,7 +384,7 @@ export default function ThreeOrb({
       if (renderer.domElement.parentElement === mount) mount.removeChild(renderer.domElement);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [reduceMotion]);
 
   return (
     <div ref={mountRef} className="relative h-full w-full">

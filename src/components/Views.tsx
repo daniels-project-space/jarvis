@@ -1109,7 +1109,9 @@ type CandlesWidget = {
   sma200: (number | null)[];
   rsi: (number | null)[];
   levels: { price: number; kind: string; touches: number }[];
+  alerts?: { price: number; operator: string; label: string }[];
   notes?: string[];
+  source?: { provider: string; tier: string; latency: string; observedAt: number; freshUntil: number };
 };
 
 const fmtP = (n: number) =>
@@ -1184,6 +1186,12 @@ export function CandlesView({ w }: { w: CandlesWidget }) {
           <span className="text-pink-400">— 200</span>
         </span>
       </div>
+      {w.source && (
+        <div className="flex items-center justify-between border-b border-white/5 px-3 py-1 font-mono text-[8px] uppercase tracking-wider text-slate">
+          <span>{w.source.provider} · {w.source.tier} · {w.source.latency}</span>
+          <span>{w.source.freshUntil < Date.now() ? "stale" : "observed"} {new Date(w.source.observedAt).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}</span>
+        </div>
+      )}
       {w.notes && w.notes[0] && <div className="border-b border-white/5 px-3 py-1 text-[11px] italic text-cyan/80">{w.notes[0]}</div>}
       <div className="scrollbar-thin min-h-0 flex-1 overflow-auto">
         <svg
@@ -1223,6 +1231,14 @@ export function CandlesView({ w }: { w: CandlesWidget }) {
               />
               <text x={4} y={ys(l.price) - 3} fontSize="9" fill={l.kind === "support" ? "#00ff88" : "#ff5470"} opacity="0.9">
                 {l.kind[0].toUpperCase()} {fmtP(l.price)} ×{l.touches}
+              </text>
+            </g>
+          ))}
+          {(w.alerts ?? []).map((alert, i) => (
+            <g key={`alert-${i}`}>
+              <line x1={0} x2={W - padR} y1={ys(alert.price)} y2={ys(alert.price)} stroke="#ffb454" strokeDasharray="2 4" strokeWidth="1.8" />
+              <text x={W - padR - 6} y={ys(alert.price) - 4} textAnchor="end" fontSize="10" fill="#ffb454">
+                ALERT {alert.operator.toUpperCase()} {fmtP(alert.price)}
               </text>
             </g>
           ))}
@@ -1528,7 +1544,7 @@ export function PdfView({ url, title }: { url: string; title?: string }) {
 
 /* ---------------------------------- creations library ---------------------------------- */
 
-const KIND_ICON: Record<string, string> = { canvas: "🕸", board: "🎨", chart: "📊", image: "🖼", pdf: "📕", doc: "📄", trip: "🌍" };
+const KIND_ICON: Record<string, string> = { canvas: "🕸", board: "🎨", chart: "📊", scene: "✦", image: "🖼", pdf: "📕", doc: "📄", trip: "🌍" };
 
 export function CreationsView({ value }: { value: string }) {
   let filter: { kind: string | null } = { kind: null };
@@ -1555,6 +1571,7 @@ export function CreationsView({ value }: { value: string }) {
     else if (r.kind === "canvas" && r.data) void setPanel({ type: "canvas", value: r.data, title: `map · ${r.title}` });
     else if (r.kind === "board") void setPanel({ type: "board", value: JSON.stringify({ creationId: r._id }), title: `board · ${r.title}` });
     else if (r.kind === "trip") void setPanel({ type: "trip", value: JSON.stringify({ creationId: r._id }), title: `trip · ${r.title}` });
+    else if (r.kind === "scene") void setPanel({ type: "scene", value: JSON.stringify({ creationId: r._id }), title: `visual · ${r.title}` });
     else if (r.kind === "doc") void setPanel({ type: "doc", value: JSON.stringify({ creationId: r._id }), title: `draft · ${r.title}` });
     else if (r.kind === "chart" && r.data) void setPanel({ type: "widget", value: r.data, title: r.title });
     else if (r.data) void setPanel({ type: "markdown", value: r.data, title: r.title });
@@ -1563,7 +1580,7 @@ export function CreationsView({ value }: { value: string }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex items-center gap-1.5 border-b border-white/5 px-3 py-2">
-        {[null, "canvas", "chart", "image", "pdf", "doc"].map((k) => (
+        {[null, "scene", "canvas", "chart", "image", "pdf", "doc"].map((k) => (
           <button
             key={k ?? "all"}
             onClick={() => setKind(k)}

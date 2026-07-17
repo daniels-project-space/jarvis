@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { PERSONA, CAPABILITIES, REMEMBER } from "@/lib/persona";
+import { PERSONA, VOICE_CAPABILITIES, REMEMBER } from "@/lib/persona";
 import { buildContext, convexMutation } from "@/lib/context";
 import { getSecret } from "@/lib/vault";
 import { STT_PROMPT } from "@/lib/sttvocab";
@@ -25,14 +25,15 @@ async function handlePost(req: NextRequest) {
     /* legacy bundles send no body */
   }
   if (!client) client = `anon-${Math.random().toString(36).slice(2, 8)}`;
-  const got = await convexMutation("ui:setLiveOn", { client, on: true }).catch(() => true);
+  const [got, ctx] = await Promise.all([
+    convexMutation("ui:setLiveOn", { client, on: true }).catch(() => true),
+    buildContext(undefined, { includeConversation: true }),
+  ]);
   if (got === false)
     return Response.json(
       { error: "Live mode is already running on another device — turn it off there first." },
       { status: 409 },
     );
-
-  const ctx = await buildContext(undefined, { includeConversation: true });
   const threadId = ctx.threadId || "main";
   const msgs = ctx.conversation ?? [];
 
@@ -65,7 +66,7 @@ async function handlePost(req: NextRequest) {
     : "";
 
   const instructions =
-    `${PERSONA}\n\n${CAPABILITIES}\n\nWhat you know right now:\n${ctx.block}${historyBlock}${shownBlock}\n\n${REMEMBER}\n\n` +
+    `${PERSONA}\n\n${VOICE_CAPABILITIES}\n\nWhat you know right now:\n${ctx.block}${historyBlock}${shownBlock}\n\n${REMEMBER}\n\n` +
     `Current date: ${new Date().toDateString()}. This is a live voice conversation — replies of one or two short sentences, always. ` +
     `Daniel speaks English: treat everything you hear as English and reply ONLY in English, whatever it sounds like. ` +
     `When he says to turn off live mode, stop listening, or go quiet: say one short goodbye and call exit_live_mode. ` +

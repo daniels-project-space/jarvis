@@ -4,6 +4,13 @@ import { getSecret, getServiceSecrets } from "./vault";
 import { r2Put, r2StoreFromUrl } from "./r2";
 import type { ManagedMission } from "../mastra/supervisor";
 import { withAdminSession } from "./control-context";
+import {
+  VISUAL_BLOCK_KINDS,
+  VISUAL_CAPABILITIES,
+  mergeVisualScene,
+  parseVisualSceneJson,
+  type VisualScene,
+} from "./visual-scene";
 
 // JARVIS's tool belt — one definition list (OpenAI function schema) executed
 // server-side by /api/chat (Groq loop) and /api/tools (realtime client bridge).
@@ -85,6 +92,55 @@ export const TOOL_DEFS = [
         output: { type: "string", enum: ["illustration", "diagram", "storyboard", "visual_system", "brainstorm" ] },
       },
       required: ["brief", "output"],
+    },
+  },
+  {
+    name: "visual_scene",
+    description:
+      "Compose or edit a beautiful live visual workspace while talking: dashboards, KPI tiles, progress, sparklines, line/bar/donut/gauge/candlestick charts, heatmaps, tables, comparisons, timelines, Gantt, kanban, funnels, decision matrices, camera-driven graphs/maps, galleries, link grids, activity streams and trusted live app snapshots. Use stable block ids and patch the existing scene as the conversation evolves. Live facts must use an allowlisted source; inline data is composed conversation content, never label it live.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["create", "update", "show", "focus"] },
+        scene_id: { type: "string", description: "creation id from the prior tool result; omit to use the latest visual scene" },
+        title: { type: "string" },
+        subtitle: { type: "string" },
+        capability: { type: "string", enum: [...VISUAL_CAPABILITIES], description: "Optional ready-made live workspace. Custom blocks may be supplied as well." },
+        layout: { type: "string", enum: ["dense", "roomy"] },
+        focus_block_id: { type: ["string", "null"], description: "focus/highlight a stable block id; null clears focus" },
+        remove: { type: "array", items: { type: "string" }, description: "stable block ids to remove during update" },
+        blocks: {
+          type: "array",
+          maxItems: 24,
+          description: "Blocks to create or upsert by stable id. For bound app data set source; otherwise pass inline items/series/rows/nodes/edges.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              kind: { type: "string", enum: [...VISUAL_BLOCK_KINDS] },
+              title: { type: "string" },
+              subtitle: { type: "string" },
+              span: { type: "string", enum: ["one", "two", "full"] },
+              tone: { type: "string", enum: ["cyan", "green", "amber", "red", "purple", "blue", "slate"] },
+              source: {
+                type: "string",
+                enum: ["projects", "agents", "attention", "watches", "findings", "reminders", "business:rental", "business:youtube", "business:wealth", "business:music", "business:ads"],
+              },
+              prefix: { type: "string" }, suffix: { type: "string" }, unit: { type: "string" },
+              min: { type: "number" }, max: { type: "number" },
+              labels: { type: "array", items: { type: "string" } },
+              columns: { type: "array", items: { type: "string" } },
+              rows: { type: "array", items: { type: "array", items: { type: ["string", "number", "null"] } } },
+              items: { type: "array", items: { type: "object", additionalProperties: true } },
+              series: { type: "array", items: { type: "object", additionalProperties: true } },
+              nodes: { type: "array", items: { type: "object", additionalProperties: true } },
+              edges: { type: "array", items: { type: "object", additionalProperties: true } },
+            },
+            required: ["id", "kind"],
+          },
+        },
+      },
+      required: ["action"],
     },
   },
   {
@@ -219,6 +275,27 @@ export const TOOL_DEFS = [
         project: { type: "string", description: "project slug, e.g. 'island-script'" },
       },
       required: ["kind", "title", "body"],
+    },
+  },
+  {
+    name: "project_goal",
+    description:
+      "Read or update a durable project outcome so Jarvis connects conversations, agent work and suggestions to what each app is actually for. Use review to show the live portfolio; use upsert/advance/block/achieve only when Daniel states a goal, a real result lands, or evidence changes its status. Do not turn casual ideas into commitments.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["review", "upsert", "advance", "block", "achieve"] },
+        project: { type: "string", description: "canonical project slug" },
+        title: { type: "string" },
+        outcome: { type: "string", description: "observable definition of success; required for a new goal" },
+        priority: { type: "number", description: "0-100" },
+        progress: { type: "number", description: "0-100, based on evidence" },
+        next_action: { type: "string" },
+        blocked_by: { type: "string" },
+        evidence: { type: "array", items: { type: "string" } },
+        owner: { type: "string", description: "Daniel, Jarvis, or permanent specialist" },
+      },
+      required: ["action"],
     },
   },
   {
@@ -661,19 +738,41 @@ export const TOOL_DEFS = [
   {
     name: "price_watch",
     description:
-      "Watch a product's price and ping Daniel when it drops (checks every few hours, alerts on a meaningful fall or below his target). Use for 'let me know if X gets cheaper', 'watch the price of Y', 'tell me when the RTX 5090 drops below £1500'.",
+      "Create a durable UK product hunt. It tracks one verified matching listing/product identity with landed-price provenance and pings once on a real target crossing or a meaningful new low. Use for 'find an RS 3 Pro under £400' or 'tell me when X gets cheaper'. It never buys automatically.",
     parameters: {
       type: "object",
       properties: {
-        query: { type: "string", description: "the specific product to track" },
+        query: { type: "string", description: "the specific brand/model/variant to track" },
         target_gbp: { type: "number", description: "optional: alert when it falls below this price" },
+        condition: { type: "string", enum: ["new", "used", "any"], description: "required product condition if stated" },
       },
       required: ["query"],
     },
   },
   {
+    name: "price_alert",
+    description:
+      "Create a durable asset threshold shown on its chart and notify Daniel only on a genuine below/above crossing. Crypto uses official Binance spot data; equities use Finnhub when connected and an explicitly labelled unofficial fallback otherwise. Informational only — never trades.",
+    parameters: {
+      type: "object",
+      properties: {
+        asset: { type: "string", description: "BTC, ETH, SOL, AAPL, TSLA, etc." },
+        operator: { type: "string", enum: ["above", "below"] },
+        threshold: { type: "number" },
+        interval: { type: "string", enum: ["1m", "5m", "1h", "4h", "1d", "1w"] },
+        currency: { type: "string", description: "default USDT for crypto, USD otherwise" },
+      },
+      required: ["asset", "operator", "threshold"],
+    },
+  },
+  {
+    name: "watch_list",
+    description: "Show active product hunts, chart thresholds and newly hit signals as a live glowing visual workspace.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
     name: "watch_cancel",
-    description: "Stop watching a product's price ('stop watching the headphones').",
+    description: "Cancel an active product hunt or asset threshold by matching its label.",
     parameters: { type: "object", properties: { match: { type: "string" } }, required: ["match"] },
   },
   {
@@ -1170,12 +1269,12 @@ async function rentalAvailability(args: any): Promise<string> {
 }
 
 async function rentalStats(): Promise<string> {
-  const [stats, earners, util, series] = await Promise.all([
-    rentalQuery("dashboard:getStatsDrawerData", { accountSlug: null, _bypassMv: true }), // null = every account combined
-    rentalQuery("mv/top_earners:getRanking", {}),
-    rentalQuery("mv/utilization:get", {}),
-    rentalQuery("mv/earnings_by_period:get", { granularity: "monthly", months: 6 }),
+  const [statsRow, earners, series] = await Promise.all([
+    rentalQuery("mv/stats_drawer:get", { account: "all" }),
+    rentalQuery("mv/top_earners:getRanking", { account: "all", limit: 5 }),
+    rentalQuery("mv/earnings_by_period:get", { account: "all", granularity: "monthly", months: 6 }),
   ]);
+  const stats = statsRow?.payload;
   if (!stats) return "Couldn't reach the rental dashboard right now.";
   const m = stats.monthly ?? {};
   const act = stats.active ?? {};
@@ -1187,7 +1286,7 @@ async function rentalStats(): Promise<string> {
       { label: "this month", value: Math.round(m.current_earnings ?? 0), prefix: "£" },
       { label: "active now", value: act.ongoing_count ?? 0 },
       { label: "upcoming", value: act.upcoming_count ?? 0 },
-      { label: "fleet in use", value: Math.round(util?.fleetUtilizationPct ?? 0), suffix: "%" },
+      { label: "inventory", value: Math.round(stats.inventory_worth?.total_gbp ?? 0), prefix: "£" },
     ],
     series: (Array.isArray(series) ? series : []).map((p: any) => ({
       label: String(p.period).slice(2),
@@ -1204,7 +1303,7 @@ async function rentalStats(): Promise<string> {
   await showWidget(widget, "rental business");
   const bestMonth = widget.series.reduce((a: any, b: any) => (b.value > (a?.value ?? 0) ? b : a), null);
   return (
-    `This month £${widget.kpis[0].value}, ${widget.kpis[1].value} active, ${widget.kpis[2].value} upcoming, fleet ${widget.kpis[3].value}% used.` +
+    `This month £${widget.kpis[0].value}, ${widget.kpis[1].value} active and ${widget.kpis[2].value} upcoming. Inventory is worth about £${widget.kpis[3].value}.` +
     (bestMonth ? ` Best recent month: ${bestMonth.label} at £${bestMonth.value}.` : "") +
     " (Full dashboard widget is on Daniel's screen — speak one highlight only.)"
   );
@@ -2080,6 +2179,119 @@ async function mindMap(args: any): Promise<string> {
     : `Mind map "${doc.title}" is back on screen. Node ids: ${doc.nodes.map((n: any) => n.id).join(", ")}.`;
 }
 
+async function visualSceneTool(args: any): Promise<string> {
+  const action = ["create", "update", "show", "focus"].includes(String(args.action)) ? String(args.action) : "create";
+  let existing: any = null;
+  let sceneId = args.scene_id ? String(args.scene_id) : "";
+
+  if (action !== "create") {
+    if (!sceneId) {
+      const panel: any = await convexQuery("ui:getPanel", {}).catch(() => null);
+      if (panel?.type === "scene") {
+        try { sceneId = String(JSON.parse(panel.value)?.creationId ?? ""); } catch { /* use latest */ }
+      }
+    }
+    existing = sceneId
+      ? await convexQuery("creations:get", { id: sceneId }).catch(() => null)
+      : await convexQuery("creations:latest", { kind: "scene", titleMatch: args.title ? String(args.title) : undefined }).catch(() => null);
+    if (!existing?.data) return "TOOL DID NOTHING: no matching visual workspace exists yet — use action=create.";
+    sceneId = String(existing._id);
+  }
+
+  if (action === "show") {
+    await convexMutation("ui:setPanel", { type: "scene", value: JSON.stringify({ creationId: sceneId }), title: `visual · ${existing.title}` });
+    return `Visual workspace "${existing.title}" is back on screen (scene_id ${sceneId}).`;
+  }
+
+  const current: VisualScene | null = existing?.data ? parseVisualSceneJson(existing.data, existing.title) : null;
+  const input = {
+    ...args,
+    focusBlockId: Object.prototype.hasOwnProperty.call(args, "focus_block_id") ? args.focus_block_id : undefined,
+    blocks: action === "focus" ? [] : args.blocks,
+  } as Record<string, unknown>;
+  let scene = mergeVisualScene(current, input);
+  if (!scene.blocks.length && !scene.capability)
+    return "TOOL DID NOTHING: add at least one visual block or choose a capability.";
+
+  if (action === "create") {
+    sceneId = String(await convexMutation("creations:create", { kind: "scene", title: scene.title, data: JSON.stringify(scene) }));
+    await convexMutation("chatQueue:postCard", {
+      threadId: await activeThread(),
+      type: "scene",
+      value: JSON.stringify({ creationId: sceneId }),
+      title: scene.title,
+    }).catch(() => {});
+  } else {
+    let write: any = await convexMutation("creations:updateScene", {
+      id: sceneId,
+      expectedUpdatedAt: existing.updatedAt,
+      title: scene.title,
+      data: JSON.stringify(scene),
+    });
+    if (!write?.ok && write?.reason === "conflict" && write.data) {
+      // Another agent landed first. Rebase the same stable-id patch once; do
+      // not make Daniel arbitrate harmless concurrent visual composition.
+      scene = mergeVisualScene(parseVisualSceneJson(write.data, write.title), input);
+      write = await convexMutation("creations:updateScene", {
+        id: sceneId,
+        expectedUpdatedAt: write.updatedAt,
+        title: scene.title,
+        data: JSON.stringify(scene),
+      });
+    }
+    if (!write?.ok) return "TOOL DID NOTHING: the visual workspace changed concurrently; show it and retry the patch.";
+  }
+  await convexMutation("ui:setPanel", {
+    type: "scene",
+    value: JSON.stringify({ creationId: sceneId }),
+    title: `visual · ${scene.title}`,
+  });
+  const verb = action === "focus" ? "focused" : action === "update" ? "updated" : "created";
+  return `Visual workspace "${scene.title}" ${verb} live (scene_id ${sceneId}; blocks: ${scene.blocks.map((block) => block.id).join(", ") || "bound capability"}). Keep this id and patch stable blocks as the conversation evolves.`;
+}
+
+async function projectGoalTool(args: any): Promise<string> {
+  const action = ["review", "upsert", "advance", "block", "achieve"].includes(String(args.action)) ? String(args.action) : "review";
+  const project = String(args.project ?? "").trim().toLowerCase();
+  const goals: any[] = (await convexQuery("projectIntelligence:listGoals", {
+    project: project || undefined,
+    limit: 60,
+  }).catch(() => [])) ?? [];
+
+  if (action === "review") {
+    const existing: any = await convexQuery("creations:latest", { kind: "scene", titleMatch: "project portfolio" }).catch(() => null);
+    if (existing?._id) {
+      await convexMutation("ui:setPanel", { type: "scene", value: JSON.stringify({ creationId: String(existing._id) }), title: "visual · Project portfolio" });
+    } else {
+      await visualSceneTool({ action: "create", title: "Project portfolio", subtitle: "Purpose, live provider state and durable outcomes", capability: "project_portfolio" });
+    }
+    const active = goals.filter((goal) => goal.status === "active").length;
+    const blocked = goals.filter((goal) => goal.status === "blocked").length;
+    return `Live project portfolio is on screen. ${active} durable goal${active === 1 ? "" : "s"} active${blocked ? `, ${blocked} blocked` : ""}; provider health and purpose are separate signals.`;
+  }
+
+  const title = String(args.title ?? "").trim();
+  if (!project || !title) return "TOOL DID NOTHING: project and goal title are required.";
+  const existing = goals.find((goal) => goal.title.toLowerCase() === title.toLowerCase()) ??
+    goals.find((goal) => goal.title.toLowerCase().includes(title.toLowerCase()) || title.toLowerCase().includes(goal.title.toLowerCase()));
+  const outcome = String(args.outcome ?? existing?.outcome ?? "").trim();
+  if (!outcome) return "TOOL DID NOTHING: a new goal needs an observable outcome, not just a title.";
+  const status = action === "block" ? "blocked" : action === "achieve" ? "achieved" : "active";
+  const id = await convexMutation("projectIntelligence:upsertGoal", {
+    project,
+    title: existing?.title ?? title,
+    outcome,
+    status,
+    priority: Number.isFinite(Number(args.priority)) ? Number(args.priority) : existing?.priority,
+    progress: action === "achieve" ? 100 : Number.isFinite(Number(args.progress)) ? Number(args.progress) : existing?.progress,
+    nextAction: args.next_action !== undefined ? String(args.next_action) : existing?.nextAction,
+    blockedBy: action === "block" ? String(args.blocked_by ?? "Unspecified blocker") : args.blocked_by !== undefined ? String(args.blocked_by) : existing?.blockedBy,
+    evidence: Array.isArray(args.evidence) ? [...(existing?.evidence ?? []), ...args.evidence.map(String)].slice(-20) : existing?.evidence,
+    owner: args.owner !== undefined ? String(args.owner) : existing?.owner,
+  });
+  return `Project outcome ${id} ${existing ? "updated" : "created"}: ${project} · ${existing?.title ?? title} is ${status}${action === "achieve" ? " with evidence recorded" : ""}.`;
+}
+
 async function chartTool(args: any): Promise<string> {
   const title = String(args.title ?? "Chart").slice(0, 80);
   const widget: Record<string, any> = {
@@ -2455,6 +2667,16 @@ async function priceChartTool(args: any): Promise<string> {
   if (candles.length < 30) return `No chart data for ${a.label} on ${interval}.`;
   const levels = keyLevels(candles);
   const w = chartWidget(a, interval, candles, levels);
+  const rules: any[] = (await convexQuery("watchRules:list", { status: "active", limit: 80 }).catch(() => [])) ?? [];
+  const symbols = new Set([a.binance, a.yahoo, String(args.asset ?? "").toUpperCase()].filter(Boolean));
+  (w as any).alerts = rules
+    .filter((rule) => rule.kind === "asset" && symbols.has(String(rule.definition?.symbol ?? "").toUpperCase()))
+    .map((rule) => ({
+      price: Number(rule.definition.threshold),
+      operator: String(rule.definition.operator),
+      label: rule.label,
+    }))
+    .filter((alert) => Number.isFinite(alert.price));
   await convexMutation("ui:setPanel", { type: "widget", value: JSON.stringify(w), title: `${a.label} · ${interval}` });
   const closes = candles.map((c) => c.c);
   const last = closes[closes.length - 1];
@@ -2503,6 +2725,15 @@ async function marketAnalysisTool(args: any): Promise<string> {
     `\nWEEKLY BARS for the big count (last 60):\n${fmtBars(weekly, 60)}\n` +
     `\nNEWS:\n${news}\n` +
     (args.question ? `\nDANIEL'S QUESTION: ${String(args.question)}\n` : "");
+
+  if (args._subscription_reasoner === true) {
+    const w = chartWidget(a, interval, daily, levels, []);
+    await convexMutation("ui:setPanel", { type: "widget", value: JSON.stringify(w), title: `${a.label} · analysis` });
+    return (
+      `MARKET DOSSIER — the annotated chart is on screen. Analyse this yourself using Wyckoff structure, trend, volume, momentum, catalysts and invalidation. Give a clear bullish/bearish/neutral verdict, key level, invalidation and what changes the view; this is analysis, never an execution instruction.\n\n` +
+      dossier.slice(0, 11_000)
+    );
+  }
 
   // Fast+free reasoning on Groq first (~5-10s), OpenAI gpt-5.1 as a tight-timeout
   // deep fallback. This replaced a 75s+ gpt-5.1 call that made it hang forever.
@@ -2865,6 +3096,8 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         ],
       }, authTokenHash);
     }
+    case "visual_scene":
+      return await visualSceneTool(args);
     case "show": {
       let { kind, value, title } = args as { kind?: string; value: string; title?: string };
       value = String(value ?? "").trim();
@@ -2933,7 +3166,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       else if (args.at_iso) at = Date.parse(String(args.at_iso));
       if (!at || Number.isNaN(at)) return "TOOL DID NOTHING: pass at_iso (ISO datetime) or in_minutes.";
       if (at < Date.now() - 60_000) return "TOOL DID NOTHING: that time is in the past — recompute at_iso.";
-      await convexMutation("reminders:add", { text: rtext, at });
+      await convexMutation("reminders:add", { text: rtext, at, originThreadId: await activeThread() });
       const when = new Date(at).toLocaleString("en-GB", { weekday: "short", hour: "2-digit", minute: "2-digit", timeZone: "Europe/London" });
       return `Reminder set: "${rtext}" at ${when} (delivery within ~2 min of the mark — push + spoken). Confirm to Daniel in a few words.`;
     }
@@ -3008,15 +3241,88 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
     case "price_watch": {
       const q = String(args.query ?? "").trim();
       if (!q) return "TOOL DID NOTHING: what should I watch?";
-      const now = await cheapestPrice(q).catch(() => null);
-      await convexMutation("watches:add", { query: q, targetGbp: Number(args.target_gbp) || undefined, lastGbp: now?.priceNum });
+      const [{ observeProduct }, ebay, serper, serpapi] = await Promise.all([
+        import("./product-observation"),
+        getServiceSecrets("ebay").catch(() => ({} as Record<string, string>)),
+        getServiceSecrets("serper").catch(() => ({} as Record<string, string>)),
+        getServiceSecrets("serpapi").catch(() => ({} as Record<string, string>)),
+      ]);
+      const requestedCondition = ["new", "used"].includes(String(args.condition))
+        ? String(args.condition)
+        : "any";
+      const now = await observeProduct(
+        q,
+        {
+          ebayClientId: ebay.EBAY_CLIENT_ID,
+          ebayClientSecret: ebay.EBAY_CLIENT_SECRET,
+          serperApiKey: serper.SERPER_API_KEY,
+          serpApiKey: serpapi.SERPAPI_KEY,
+        },
+        undefined,
+        requestedCondition,
+      ).catch(() => null);
       const tgt = Number(args.target_gbp) || 0;
+      const watchId = await convexMutation("watchRules:createProduct", {
+        query: q,
+        targetPence: tgt ? Math.round(tgt * 100) : undefined,
+        condition: requestedCondition,
+        initialObservation: now ?? undefined,
+        originThreadId: await activeThread(),
+      });
       return now
-        ? `Watching "${q}" — cheapest right now is £${now.priceNum}${tgt ? `, I'll ping you if it drops below £${tgt}` : ", I'll ping you if it drops"}. Confirm briefly.`
-        : `Watching "${q}"${tgt ? ` for a drop below £${tgt}` : ""} — couldn't get a price this second but I'll keep checking. Confirm briefly.`;
+        ? `Durable hunt ${watchId} is active for "${q}". Best verified match is £${(now.landedPence / 100).toFixed(2)} ${now.deliveryKnown ? "landed" : "listed (delivery still unverified)"} via ${now.source.provider}${tgt ? `; I'll alert only on a verified landed-price crossing below £${tgt}` : "; I'll alert after a verified meaningful new landed-price low"}. Never buys automatically.`
+        : `Durable hunt ${watchId} is active for "${q}"${tgt ? ` below £${tgt}` : ""}. No trustworthy identity match was available this second, so the scheduler will retry without fabricating a baseline.`;
+    }
+    case "price_alert": {
+      const asset = String(args.asset ?? "").trim();
+      const threshold = Number(args.threshold);
+      const operator = args.operator === "below" ? "below" : "above";
+      if (!asset || !Number.isFinite(threshold) || threshold <= 0) return "TOOL DID NOTHING: asset and a positive threshold are required.";
+      const { resolveAsset, fetchCandles } = await import("./markets");
+      const ref = resolveAsset(asset);
+      if (!ref) return `TOOL DID NOTHING: I couldn't map the asset "${asset}" to a supported market symbol.`;
+      const interval = ["1m", "5m", "1h", "4h", "1d", "1w"].includes(String(args.interval)) ? String(args.interval) : "1h";
+      const candles = await fetchCandles(ref, ["1h", "4h", "1d", "1w"].includes(interval) ? interval : "1h", 3).catch(() => []);
+      const latest = candles.at(-1);
+      const provider = ref.binance ? "binance" : "finnhub";
+      const currency = String(args.currency ?? (ref.binance ? "USDT" : "USD"));
+      const initialObservation = latest ? {
+        symbol: ref.binance ?? ref.yahoo,
+        price: latest.c,
+        currency,
+        source: {
+          provider: ref.binance ? "Binance" : "Yahoo Finance",
+          feed: "chart-baseline",
+          tier: ref.binance ? "official" : "aggregator",
+          latency: ref.binance ? "current" : "unknown",
+          observedAt: latest.t,
+          receivedAt: Date.now(),
+          freshUntil: Date.now() + 5 * 60_000,
+        },
+      } : undefined;
+      const watchId = await convexMutation("watchRules:createAsset", {
+        symbol: ref.binance ?? ref.yahoo ?? asset.toUpperCase(),
+        provider,
+        interval,
+        operator,
+        threshold,
+        currency,
+        initialObservation,
+        originThreadId: await activeThread(),
+      });
+      await priceChartTool({ asset, interval: ["1h", "4h", "1d", "1w"].includes(interval) ? interval : "1h" }).catch(() => {});
+      return `Chart alert ${watchId} is active: ${ref.label} ${operator} ${threshold} ${currency}. It fires once on a genuine crossing, rearms with hysteresis, and cannot place a trade.`;
+    }
+    case "watch_list": {
+      const existing: any = await convexQuery("creations:latest", { kind: "scene", titleMatch: "price hunts" }).catch(() => null);
+      if (existing?._id) await convexMutation("ui:setPanel", { type: "scene", value: JSON.stringify({ creationId: String(existing._id) }), title: "visual · Price hunts & signals" });
+      else await visualSceneTool({ action: "create", title: "Price hunts & signals", subtitle: "Verified products, true asset crossings and source freshness", capability: "price_hunts" });
+      const rules: any[] = (await convexQuery("watchRules:list", { status: "active", limit: 40 }).catch(() => [])) ?? [];
+      const events: any[] = (await convexQuery("watchRules:openEvents", { limit: 20 }).catch(() => [])) ?? [];
+      return `${rules.length} active watch${rules.length === 1 ? "" : "es"} and ${events.length} open signal${events.length === 1 ? "" : "s"} are live on screen.`;
     }
     case "watch_cancel": {
-      const hit = await convexMutation("watches:cancel", { match: String(args.match ?? "") });
+      const hit = await convexMutation("watchRules:cancel", { match: String(args.match ?? "") });
       return hit ? `Stopped watching "${hit}".` : "TOOL DID NOTHING: no active watch matches that.";
     }
     case "shop_search":
@@ -3095,6 +3401,8 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       await vaultWrite(String(args.kind ?? "fact"), String(args.title), String(args.body), project);
       return project ? `Saved to memory (filed under project ${project}).` : "Saved to memory.";
     }
+    case "project_goal":
+      return await projectGoalTool(args);
     case "memory_search": {
       const rows = await convexQuery("memory:search", { q: String(args.query), limit: 8 });
       return Array.isArray(rows) && rows.length

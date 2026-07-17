@@ -12,9 +12,12 @@ const HUB_URL = "https://fantastic-roadrunner-485.convex.cloud";
 async function q(base: string, path: string, args: unknown = {}): Promise<any> {
   try {
     const authTokenHash = base === CONVEX_URL ? currentAdminSession() : null;
+    const workerToken = base === CONVEX_URL ? process.env.JARVIS_WORKER_TOKEN : undefined;
     const protectedArgs = authTokenHash
       ? { ...((args ?? {}) as Record<string, unknown>), authTokenHash }
-      : args;
+      : workerToken
+        ? { ...((args ?? {}) as Record<string, unknown>), workerToken }
+        : args;
     const r = await fetch(`${base}/api/query`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -28,9 +31,12 @@ async function q(base: string, path: string, args: unknown = {}): Promise<any> {
 
 export async function convexMutation(path: string, args: unknown): Promise<any> {
   const authTokenHash = currentAdminSession();
+  const workerToken = process.env.JARVIS_WORKER_TOKEN;
   const protectedArgs = authTokenHash
     ? { ...((args ?? {}) as Record<string, unknown>), authTokenHash }
-    : args;
+    : workerToken
+      ? { ...((args ?? {}) as Record<string, unknown>), workerToken }
+      : args;
   const r = await fetch(`${CONVEX_URL}/api/mutation`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -72,6 +78,7 @@ export async function buildContext(
   const mem = Array.isArray(brain?.memory) ? brain.memory : [];
   const biz = Array.isArray(brain?.business) ? brain.business : [];
   const stack = Array.isArray(brain?.projects) ? brain.projects : [];
+  const goals = Array.isArray(brain?.goals) ? brain.goals : [];
   const jobs = Array.isArray(brain?.jobs) ? brain.jobs : [];
   const findings = Array.isArray(brain?.findings) ? brain.findings : [];
   const trip = brain?.trip;
@@ -96,11 +103,28 @@ export async function buildContext(
     lines.push(`Net worth: about £${Math.round(wealth.currentTotalGBP).toLocaleString("en-GB")}.`);
   if (Array.isArray(stack) && stack.length)
     lines.push(
-      "Cloud stack (with what changed recently): " +
+      "PROJECT INTELLIGENCE — distinguish deploy health from whether the app is advancing its purpose:\n" +
         stack
-          .map((s: any) => `${s.slug}=${s.status}${s.data?.recent ? ` — ${s.data.recent}` : ""}`)
-          .join("; ")
-          .slice(0, 1800),
+          .map(
+            (s: any) =>
+              `- ${s.slug} [${s.status}]: ${s.data?.purpose ?? s.summary}` +
+              `${s.data?.objectives?.length ? ` Goal: ${s.data.objectives[0]}.` : ""}` +
+              `${s.data?.recent ? ` ${s.data.recent}.` : ""}`,
+          )
+          .join("\n")
+          .slice(0, 2400),
+    );
+  if (goals.length)
+    lines.push(
+      "DURABLE PROJECT OUTCOMES — connect work and suggestions to these, update evidence rather than inventing a new task list:\n" +
+        goals
+          .slice(0, 12)
+          .map(
+            (goal: any) =>
+              `- ${goal.project}: ${goal.title} [${goal.status}, ${goal.progress}%, priority ${goal.priority}] — ${goal.outcome}` +
+              `${goal.nextAction ? ` Next: ${goal.nextAction}` : ""}${goal.blockedBy ? ` Blocked by: ${goal.blockedBy}` : ""}`,
+          )
+          .join("\n"),
     );
   if (Array.isArray(jobs) && jobs.length)
     lines.push(

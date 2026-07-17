@@ -18,7 +18,7 @@ export const snapshot = query({
           .take(20),
       ),
     );
-    const [approvals, attention, agents, projects, missions, recentCandidates] = await Promise.all([
+    const [approvals, attention, signals, agents, projects, missions, recentCandidates] = await Promise.all([
       ctx.db
         .query("approvals")
         .withIndex("by_status", (q: any) => q.eq("status", "pending"))
@@ -29,6 +29,11 @@ export const snapshot = query({
         .withIndex("by_status", (q: any) => q.eq("status", "open"))
         .order("desc")
         .take(20),
+      ctx.db
+        .query("watchEvents")
+        .withIndex("by_status_createdAt", (q: any) => q.eq("status", "open"))
+        .order("desc")
+        .take(8),
       ctx.db.query("agentProfiles").collect(),
       ctx.db.query("projectState").collect(),
       ctx.db.query("missions").withIndex("by_createdAt").order("desc").take(12),
@@ -51,6 +56,7 @@ export const snapshot = query({
     return {
       generatedAt: Date.now(),
       approvals,
+      signals,
       attention: attention.sort((a: any, b: any) => score(b) - score(a)).slice(0, 8),
       active,
       agents: liveAgents.sort((a: any, b: any) => (a.slug === "jarvis" ? -1 : b.slug === "jarvis" ? 1 : a.name.localeCompare(b.name))),

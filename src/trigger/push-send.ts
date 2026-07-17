@@ -28,7 +28,14 @@ async function cm(path: string, args: unknown) {
     body: JSON.stringify({ path, args: { ...((args ?? {}) as Record<string, unknown>), workerToken }, format: "json" }),
   }).catch(() => {});
 }
-export async function sendPush(title: string, body: string, url = "/"): Promise<void> {
+export type PushOptions = {
+  tag?: string;
+  topic?: string;
+  ttl?: number;
+  urgency?: "very-low" | "low" | "normal" | "high";
+};
+
+export async function sendPush(title: string, body: string, url = "/", options: PushOptions = {}): Promise<void> {
   try {
     const env = await vaultService("jarvis");
     if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY) return;
@@ -40,7 +47,15 @@ export async function sendPush(title: string, body: string, url = "/"): Promise<
     const subs = ((await cq("push:listSubs", {})) as Array<any>) ?? [];
     await Promise.allSettled(
       subs.map((s) =>
-        webpush.sendNotification(s, JSON.stringify({ title, body, url })).catch((e: any) => {
+        webpush.sendNotification(
+          s,
+          JSON.stringify({ title, body, url, tag: options.tag }),
+          {
+            TTL: Math.max(60, Math.min(7 * 86_400, options.ttl ?? 86_400)),
+            urgency: options.urgency ?? "normal",
+            topic: options.topic?.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32),
+          },
+        ).catch((e: any) => {
           if (e?.statusCode === 404 || e?.statusCode === 410) return cm("push:deleteSub", { endpoint: s.endpoint });
         }),
       ),

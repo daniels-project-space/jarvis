@@ -5,13 +5,15 @@ import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./co
 // Timed reminders: "remind me at 7pm to call mum" → push + spoken weave when
 // due. The agent-runner cron (*/2) sweeps `due` and delivers.
 export const add = mutation({
-  args: { text: v.string(), at: v.number(), ...actorAuthArgs },
+  args: { text: v.string(), at: v.number(), originThreadId: v.optional(v.string()), ...actorAuthArgs },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     return await ctx.db.insert("reminders", {
       text: a.text.slice(0, 300),
       at: a.at,
       status: "pending",
+      originThreadId: a.originThreadId,
+      deliveryAttempts: 0,
       createdAt: Date.now(),
     });
   },
@@ -21,15 +23,26 @@ export const due = mutation({
   args: { ...actorAuthArgs },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
-    const rows = await ctx.db
+    const pending = await ctx.db
       .query("reminders")
-      .withIndex("by_status", (q: any) => q.eq("status", "pending"))
-      .collect();
+      .withIndex("by_status", (q: any) => q.eq("status", "pending").lte("at", Date.now()))
+      .take(50);
+    const delivering = await ctx.db
+      .query("reminders")
+      .withIndex("by_status", (q: any) => q.eq("status", "delivering"))
+      .take(50);
     const now = Date.now();
-    const fire = rows.filter((r: any) => r.at <= now);
-    // claim atomically so a second sweep never double-delivers
-    for (const r of fire) await ctx.db.patch(r._id, { status: "delivering" });
-    return fire.map((r: any) => ({ _id: r._id, text: r.text, at: r.at }));
+    const stale = delivering.filter((row: any) => (row.deliverStartedAt ?? 0) < now - 5 * 60_000);
+    const fire = [...pending, ...stale].slice(0, 50);
+    // Claim atomically. A Trigger container dying after this point is recovered
+    // after the lease, rather than leaving the reminder stuck forever.
+    for (const row of fire)
+      await ctx.db.patch(row._id, {
+        status: "delivering",
+        deliverStartedAt: now,
+        deliveryAttempts: (row.deliveryAttempts ?? 0) + 1,
+      });
+    return fire.map((row: any) => ({ _id: row._id, text: row.text, at: row.at, originThreadId: row.originThreadId }));
   },
 });
 

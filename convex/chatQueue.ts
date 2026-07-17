@@ -45,8 +45,9 @@ export const listMessages = query({
     const rows = await ctx.db
       .query("chatMessages")
       .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
-      .collect();
-    return rows.sort((x: any, y: any) => x.createdAt - y.createdAt);
+      .order("desc")
+      .take(240);
+    return rows.reverse();
   },
 });
 
@@ -74,7 +75,8 @@ export const openTurn = mutation({
     const all = await ctx.db
       .query("chatMessages")
       .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
-      .collect();
+      .order("desc")
+      .take(48);
     const history = all
       .filter((m: any) => m.status === "done" && (m.text || m.attachment))
       .sort((x: any, y: any) => x.createdAt - y.createdAt)
@@ -116,7 +118,8 @@ export const requeueUser = mutation({
     const rows = await ctx.db
       .query("chatMessages")
       .withIndex("by_thread", (q: any) => q.eq("threadId", m.threadId))
-      .collect();
+      .order("desc")
+      .take(24);
     const answered = rows.some(
       (r: any) => r.role === "assistant" && r.status === "done" && r.text && r.createdAt >= m.createdAt,
     );
@@ -196,7 +199,8 @@ export const claimNext = mutation({
     const all = await ctx.db
       .query("chatMessages")
       .withIndex("by_thread", (q: any) => q.eq("threadId", pending.threadId))
-      .collect();
+      .order("desc")
+      .take(40);
     const history = all
       .filter((m: any) => m._id !== assistantId && m._id !== pending._id && m.status === "done")
       .sort((a: any, b: any) => a.createdAt - b.createdAt)

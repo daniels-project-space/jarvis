@@ -28,3 +28,20 @@ export function codexExecPrefix(tier: string): string[] {
     "--dangerously-bypass-approvals-and-sandbox",
   ];
 }
+
+export function pickConversationTier(text: string): WorkModelTier {
+  const value = text.toLowerCase().trim();
+  if (
+    value.length > 700 ||
+    /\b(root cause|multi[- ]?(repo|project|file)|architecture migration|security incident|production outage|think (really |very )?hard|from first principles|deep dive)\b/.test(value)
+  ) return "opus";
+  if (
+    value.length <= 60 &&
+    /^(hi|hey|hello|yo|thanks|thank you|ok|okay|sup|morning|evening|good (morning|evening|day)|what'?s up|how are you)\b/.test(value)
+  ) return "haiku";
+  if (
+    value.length <= 80 &&
+    !/\b(brainstorm|compare|design|plan|strategy|analy[sz]e|investigate|recommend|fix|build|create)\b/.test(value)
+  ) return "haiku";
+  return "sonnet";
+}

@@ -188,7 +188,7 @@ export async function startLive(h: LiveHandlers) {
     const domainTool = tool({
       name: "load_tool_domain",
       description:
-        "Load a specialist tool belt only when needed: work for missions/projects/repairs, creative for images/drawing/docs, travel for trip planning, or business for markets/rentals/shopping. After loading, call the requested specialist tool.",
+        "Load a specialist tool belt only when needed: work for missions/projects/repairs/control/memory, creative for images/drawing/docs, travel for trip planning, or business for markets/rentals/shopping. After loading, call the requested specialist tool.",
       parameters: {
         type: "object",
         properties: { domain: { type: "string", enum: ["work", "creative", "travel", "business"] } },

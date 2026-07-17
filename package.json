@@ -13,6 +13,7 @@
     "@excalidraw/excalidraw": "^0.18.1",
     "@mastra/core": "^1.51.0",
     "@openai/agents-realtime": "^0.13.2",
+    "@openai/codex": "0.144.5",
     "@trigger.dev/build": "^4.5.1",
     "@trigger.dev/sdk": "^4.5.1",
     "aws4fetch": "^1.0.20",

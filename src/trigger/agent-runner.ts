@@ -10,6 +10,7 @@ import { codexExecPrefix, codexModelFor } from "./model-policy";
 import { githubGitEnv, githubRepoUrl } from "./git-transport";
 import { vaultService } from "../lib/vault-client";
 import { buildContinuationCheckpoint, segmentTimeoutMs } from "./continuation";
+import { runWatchSweep } from "./watch-runtime";
 import {
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
@@ -110,45 +111,6 @@ function pickAgentModel(task: string): string {
   return routeWork(task).model;
 }
 
-// Cheapest live price for a product (UK) — self-contained so the price-watch
-// cron never has to import the server-only tools module.
-async function cheapestPrice(query: string): Promise<{ priceNum: number } | null> {
-  // Serper.dev first (way more searches than SerpAPI), SerpAPI fallback.
-  const priceOf = (p: any) => {
-    const n = parseFloat(String(p ?? "").replace(/[^\d.]/g, ""));
-    return Number.isFinite(n) ? n : 0;
-  };
-  const serperK = process.env.SERPER_API_KEY || (await vaultService("serper")).SERPER_API_KEY;
-  if (serperK) {
-    try {
-      const r = await fetch("https://google.serper.dev/shopping", {
-        method: "POST",
-        headers: { "X-API-KEY": serperK, "content-type": "application/json" },
-        body: JSON.stringify({ q: query, gl: "gb", hl: "en" }),
-        signal: AbortSignal.timeout(10000),
-      });
-      if (r.ok) {
-        const j: any = await r.json();
-        const prices = (j?.shopping ?? []).map((x: any) => priceOf(x.price)).filter((n: number) => n > 0);
-        if (prices.length) return { priceNum: Math.min(...prices) };
-      }
-    } catch {
-      /* fall through to serpapi */
-    }
-  }
-  const key = process.env.SERPAPI_KEY || (await vaultService("serpapi")).SERPAPI_KEY;
-  if (!key) return null;
-  const qs = new URLSearchParams({ engine: "google_shopping", q: query, gl: "uk", hl: "en", num: "20", api_key: key });
-  try {
-    const j: any = await (await fetch(`https://serpapi.com/search.json?${qs}`, { signal: AbortSignal.timeout(10000) })).json();
-    const rows = (j?.shopping_results ?? []).filter((r: any) => r.extracted_price);
-    if (!rows.length) return null;
-    rows.sort((a: any, b: any) => Number(a.extracted_price) - Number(b.extracted_price));
-    return { priceNum: Number(rows[0].extracted_price) };
-  } catch {
-    return null;
-  }
-}
 
 // MCP servers the brain can attach on demand. Browserbase = hosted browsers
 // (no local Chromium in the Trigger image); context7 = live library docs.
@@ -573,32 +535,22 @@ export const agentRunner = schedules.task({
           threadId: await chatThread(),
           text: `⏰ Reminder, sir — ${r.text}${late}`,
         }).catch(() => {});
-        await sendPush("⏰ JARVIS reminder", String(r.text).slice(0, 140), "/").catch(() => {});
+        const reminderTag = `reminder-${String(r._id).slice(-20)}`;
+        await sendPush(
+          "⏰ JARVIS reminder",
+          String(r.text).slice(0, 140),
+          "/",
+          { tag: reminderTag, topic: reminderTag, ttl: 3600, urgency: "high" },
+        ).catch(() => {});
         await convexMutation("reminders:complete", { id: r._id }).catch(() => {});
       }
     } catch {
       /* reminders must never block jobs either */
     }
-    // Price watches: re-price a few due products, ping on a meaningful drop.
+    // Indexed, leased price/asset rules. One observation is shared by every
+    // threshold on the same subject; Convex commits true crossings atomically.
     try {
-      const watches: any[] = (await convexQuery("watches:due", {})) ?? [];
-      for (const w of watches) {
-        const now = await cheapestPrice(w.query).catch(() => null);
-        if (!now) {
-          await convexMutation("watches:touch", { id: w._id }).catch(() => {});
-          continue;
-        }
-        const prev = Number(w.lastGbp) || 0;
-        const target = Number(w.targetGbp) || 0;
-        const hitTarget = target > 0 && now.priceNum <= target;
-        const bigDrop = prev > 0 && now.priceNum <= prev * 0.93; // >=7% cheaper
-        if (hitTarget || bigDrop) {
-          const line = `💸 Price drop, sir — "${w.query}" is now £${now.priceNum}${prev ? ` (was £${prev})` : ""}${target ? `, under your £${target}` : ""}.`;
-          await convexMutation("chatQueue:postAssistant", { threadId: await chatThread(), text: line }).catch(() => {});
-          await sendPush("💸 Price drop", `${w.query} → £${now.priceNum}`, "/").catch(() => {});
-        }
-        await convexMutation("watches:record", { id: w._id, lastGbp: now.priceNum }).catch(() => {});
-      }
+      await runWatchSweep();
     } catch {
       /* watches never block jobs */
     }

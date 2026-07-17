@@ -68,7 +68,7 @@ export function resolveAsset(name: string): AssetRef | null {
 const IV_BINANCE: Record<string, string> = { "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1w" };
 const IV_YAHOO: Record<string, { interval: string; range: string }> = {
   "1h": { interval: "60m", range: "1mo" },
-  "4h": { interval: "1d", range: "1y" }, // yahoo has no 4h — daily is the honest nearest
+  "4h": { interval: "60m", range: "1y" },
   "1d": { interval: "1d", range: "2y" },
   "1w": { interval: "1wk", range: "10y" },
 };
@@ -105,6 +105,32 @@ export async function fetchCandles(a: AssetRef, interval: string, limit = 260): 
     for (let i = 0; i < res.timestamp.length; i++) {
       if (q.close[i] == null) continue;
       out.push({ t: res.timestamp[i] * 1000, o: q.open[i], h: q.high[i], l: q.low[i], c: q.close[i], v: q.volume[i] ?? 0 });
+    }
+    if (interval === "4h") {
+      const grouped: Candle[] = [];
+      let bucket: Candle[] = [];
+      let day = "";
+      const flush = () => {
+        if (!bucket.length) return;
+        grouped.push({
+          t: bucket[0].t,
+          o: bucket[0].o,
+          h: Math.max(...bucket.map((row) => row.h)),
+          l: Math.min(...bucket.map((row) => row.l)),
+          c: bucket.at(-1)!.c,
+          v: bucket.reduce((sum, row) => sum + row.v, 0),
+        });
+        bucket = [];
+      };
+      for (const row of out) {
+        const rowDay = new Date(row.t).toISOString().slice(0, 10);
+        if (day && rowDay !== day) flush();
+        day = rowDay;
+        bucket.push(row);
+        if (bucket.length === 4) flush();
+      }
+      flush();
+      return grouped.slice(-limit);
     }
     return out.slice(-limit);
   } catch {
@@ -185,6 +211,13 @@ export function chartWidget(a: AssetRef, interval: string, candles: Candle[], le
     rsi: rsi(closes).slice(off).map((x) => (x == null ? null : Math.round(x * 10) / 10)),
     levels,
     notes: notes ?? [],
+    source: {
+      provider: a.binance ? "Binance" : "Yahoo Finance",
+      tier: a.binance ? "official" : "unofficial",
+      latency: a.binance ? "current" : "unknown",
+      observedAt: view.at(-1)?.t ?? Date.now(),
+      freshUntil: (view.at(-1)?.t ?? Date.now()) + (a.binance ? 5 * 60_000 : 20 * 60_000),
+    },
   };
 }
 

@@ -1,11 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { api } from "../../convex/_generated/api";
-import { useJarvisQuery } from "@/lib/secure-convex";
-
 type CommandDeckProps = {
   busy: boolean;
+  snapshot: any;
   selectedJobId: string | null;
   onSelectJob: (id: string) => void;
 };
@@ -44,8 +42,7 @@ function Dot({ tone = "cyan", pulse = false }: { tone?: "cyan" | "amber" | "red"
   );
 }
 
-export default function CommandDeck({ busy, selectedJobId, onSelectJob }: CommandDeckProps) {
-  const snapshot = useJarvisQuery(api.commandCenter.snapshot, {}) as any;
+export default function CommandDeck({ busy, snapshot, selectedJobId, onSelectJob }: CommandDeckProps) {
   const [collapsed, setCollapsed] = useState(false);
   const [acting, setActing] = useState("");
   useEffect(() => {
@@ -57,6 +54,7 @@ export default function CommandDeck({ busy, selectedJobId, onSelectJob }: Comman
   const active = (snapshot?.active ?? []) as any[];
   const approvals = (snapshot?.approvals ?? []) as any[];
   const attention = (snapshot?.attention ?? []) as any[];
+  const signals = (snapshot?.signals ?? []) as any[];
   const agents = (snapshot?.agents ?? []) as any[];
   const projects = (snapshot?.projects ?? []) as any[];
   const recent = (snapshot?.recent ?? []) as any[];
@@ -113,6 +111,7 @@ export default function CommandDeck({ busy, selectedJobId, onSelectJob }: Comman
           <span className="font-mono text-[9px] uppercase tracking-[0.22em] text-cyan">work now</span>
           <span className="ml-auto flex items-center gap-2 font-mono text-[9px] uppercase tracking-wider text-slate">
             {needs.length > 0 && <span className="text-amber">{needs.length} need you</span>}
+            {signals.length > 0 && <span className="text-emerald-300">{signals.length} signal{signals.length === 1 ? "" : "s"}</span>}
             <span>{active.length || (busy ? 1 : 0)} active</span>
             <span aria-hidden>{collapsed ? "＋" : "−"}</span>
           </span>
@@ -120,6 +119,33 @@ export default function CommandDeck({ busy, selectedJobId, onSelectJob }: Comman
 
         {!collapsed && (
           <div className="max-h-[min(70dvh,680px)] overflow-y-auto border-t border-white/8 px-2.5 pb-2.5 scrollbar-thin">
+            {signals.length > 0 && (
+              <section className="pt-2.5">
+                <div className="mb-1.5 flex items-center justify-between px-1">
+                  <h2 className="font-mono text-[9px] uppercase tracking-[0.18em] text-emerald-300">Signals</h2>
+                  <span className="text-[9px] text-slate">verified crossings</span>
+                </div>
+                <div className="space-y-1">
+                  {signals.slice(0, 4).map((signal) => (
+                    <button
+                      type="button"
+                      key={signal._id}
+                      onClick={() => void fetch("/api/tools", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "watch_list", args: {} }) })}
+                      className={`scene-signal-glow w-full border-l border-emerald-300/60 bg-emerald-300/[0.055] px-2 py-2 text-left ${signal.glowUntil > Date.now() ? "is-fresh" : ""}`}
+                    >
+                      <div className="flex gap-2">
+                        <Dot tone="green" pulse={signal.glowUntil > Date.now()} />
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-[11px] font-medium text-ice">{signal.title}</div>
+                          <div className="mt-0.5 line-clamp-2 text-[10px] leading-4 text-slate">{signal.spoken}</div>
+                          <div className="mt-1 font-mono text-[8px] uppercase tracking-wider text-emerald-300">{age(signal.createdAt)} · open visual</div>
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </section>
+            )}
             {needs.length > 0 && (
               <section className="pt-2.5">
                 <div className="mb-1.5 flex items-center justify-between px-1">

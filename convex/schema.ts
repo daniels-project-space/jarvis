@@ -61,6 +61,29 @@ export default defineSchema({
     updatedAt: v.number(),
   }).index("by_slug", ["slug"]),
 
+  // Durable outcomes, not ephemeral task lists. Project state tells Jarvis
+  // what is deployed; goals tell it why the app exists and what progress
+  // should be judged against across conversations and agent missions.
+  projectGoals: defineTable({
+    fingerprint: v.string(),
+    project: v.string(),
+    title: v.string(),
+    outcome: v.string(),
+    status: v.string(), // proposed | active | blocked | achieved | dropped
+    priority: v.number(),
+    progress: v.number(),
+    nextAction: v.optional(v.string()),
+    blockedBy: v.optional(v.string()),
+    evidence: v.array(v.string()),
+    owner: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_fingerprint", ["fingerprint"])
+    .index("by_project_status", ["project", "status"])
+    .index("by_status_priority", ["status", "priority"])
+    .index("by_updatedAt", ["updatedAt"]),
+
   // Background agent jobs: the brain enqueues, Trigger executes the routed
   // subscription agent in bounded segments, and JARVIS reviews the evidence.
   // Price watches — the cron re-prices and pings when a product drops.
@@ -73,11 +96,67 @@ export default defineSchema({
     createdAt: v.number(),
   }).index("by_status", ["status"]),
 
+  // Canonical deterministic product hunts and asset thresholds. Due work is
+  // indexed and leased; observations carry provider/freshness provenance.
+  watchRules: defineTable({
+    kind: v.string(), // product | asset
+    subjectKey: v.string(),
+    label: v.string(),
+    status: v.string(), // active | paused | completed | cancelled
+    definition: v.any(),
+    cadenceMs: v.number(),
+    nextCheckAt: v.number(),
+    version: v.number(),
+    triggerSeq: v.number(),
+    leaseToken: v.optional(v.string()),
+    leaseUntil: v.optional(v.number()),
+    lastObservation: v.optional(v.any()),
+    conditionMet: v.optional(v.boolean()),
+    lastTriggeredAt: v.optional(v.number()),
+    cooldownUntil: v.optional(v.number()),
+    lastNotifiedValue: v.optional(v.number()),
+    failureCount: v.number(),
+    lastError: v.optional(v.string()),
+    originThreadId: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_status_nextCheckAt", ["status", "nextCheckAt"])
+    .index("by_subject_status", ["subjectKey", "status"])
+    .index("by_updatedAt", ["updatedAt"]),
+
+  watchEvents: defineTable({
+    eventKey: v.string(),
+    watchId: v.id("watchRules"),
+    ruleVersion: v.number(),
+    kind: v.string(),
+    reason: v.string(),
+    previousValue: v.optional(v.number()),
+    observation: v.any(),
+    title: v.string(),
+    spoken: v.string(),
+    detail: v.string(),
+    status: v.string(), // open | seen | dismissed
+    glowUntil: v.number(),
+    chatMessageId: v.optional(v.id("chatMessages")),
+    pushStatus: v.string(), // pending | sent | failed
+    pushAttemptedAt: v.optional(v.number()),
+    pushSentAt: v.optional(v.number()),
+    createdAt: v.number(),
+    seenAt: v.optional(v.number()),
+  })
+    .index("by_eventKey", ["eventKey"])
+    .index("by_watch_createdAt", ["watchId", "createdAt"])
+    .index("by_status_createdAt", ["status", "createdAt"]),
+
   // Timed reminders — delivered by the agent-runner cron as push + weave.
   reminders: defineTable({
     text: v.string(),
     at: v.number(), // epoch ms when it should fire
     status: v.string(), // pending | delivering | done | cancelled
+    originThreadId: v.optional(v.string()),
+    deliverStartedAt: v.optional(v.number()),
+    deliveryAttempts: v.optional(v.number()),
     createdAt: v.number(),
   }).index("by_status", ["status", "at"]),
 
@@ -269,6 +348,7 @@ export default defineSchema({
   })
     .index("by_status", ["status", "updatedAt"])
     .index("by_fingerprint", ["fingerprint"])
+    .index("by_jobId", ["jobId"])
     .index("by_updatedAt", ["updatedAt"]),
 
   // "Show me" panel — the brain sets what to display (site / doc / image); the UI
