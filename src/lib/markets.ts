@@ -73,29 +73,47 @@ const IV_YAHOO: Record<string, { interval: string; range: string }> = {
   "1w": { interval: "1wk", range: "10y" },
 };
 
+// A chart often gets requested twice in quick succession: once by the instant
+// visual lane and again when the normal assistant records its context. Keep a
+// tiny, process-local read-through cache so that never becomes two upstream
+// round trips. This is deliberately short lived: it improves interaction
+// latency without presenting stale market data as live.
+const candleCache = new Map<string, { expiresAt: number; value: Candle[]; pending?: Promise<Candle[]> }>();
+
 export async function fetchCandles(a: AssetRef, interval: string, limit = 260): Promise<Candle[]> {
+  const key = `${a.binance ?? a.yahoo ?? a.label}:${interval}:${Math.min(limit, 720)}`;
+  const now = Date.now();
+  const cached = candleCache.get(key);
+  if (cached?.value.length && cached.expiresAt > now) return cached.value;
+  if (cached?.pending) return cached.pending;
+
+  const load = async (): Promise<Candle[]> => {
   if (a.binance) {
     const iv = IV_BINANCE[interval] ?? "1d";
-    for (const host of ["https://data-api.binance.vision", "https://api.binance.com"]) {
-      try {
-        const r = await fetch(`${host}/api/v3/klines?symbol=${a.binance}&interval=${iv}&limit=${Math.min(limit, 720)}`, {
-          signal: AbortSignal.timeout(8000),
-        });
-        if (!r.ok) continue;
-        const rows: any[] = await r.json();
-        return rows.map((k) => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] }));
-      } catch {
-        /* next host */
-      }
+    // Race the official mirror and API instead of waiting through two 8-second
+    // timeouts in sequence. The first valid response wins; this removes the
+    // slow-host tail from the one-tap chart path.
+    const sources = ["https://data-api.binance.vision", "https://api.binance.com"].map(async (host) => {
+      const r = await fetch(`${host}/api/v3/klines?symbol=${a.binance}&interval=${iv}&limit=${Math.min(limit, 720)}`, {
+        signal: AbortSignal.timeout(3_500),
+      });
+      if (!r.ok) throw new Error(`market ${r.status}`);
+      const rows: any[] = await r.json();
+      if (!Array.isArray(rows) || !rows.length) throw new Error("empty market response");
+      return rows.map((k) => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] }));
+    });
+    try {
+      return await Promise.any(sources);
+    } catch {
+      return [];
     }
-    return [];
   }
   const cfg = IV_YAHOO[interval] ?? IV_YAHOO["1d"];
   try {
     const j: any = await (
       await fetch(
         `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(a.yahoo!)}?range=${cfg.range}&interval=${cfg.interval}`,
-        { headers: { "user-agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(8000) },
+        { headers: { "user-agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(5_000) },
       )
     ).json();
     const res = j?.chart?.result?.[0];
@@ -136,6 +154,18 @@ export async function fetchCandles(a: AssetRef, interval: string, limit = 260): 
   } catch {
     return [];
   }
+  };
+
+  const pending = load().then((value) => {
+    const ttl = a.binance ? 12_000 : 30_000;
+    candleCache.set(key, { value, expiresAt: Date.now() + ttl });
+    return value;
+  }).catch((error) => {
+    candleCache.delete(key);
+    throw error;
+  });
+  candleCache.set(key, { value: cached?.value ?? [], expiresAt: cached?.expiresAt ?? 0, pending });
+  return pending;
 }
 
 // ── indicators ──────────────────────────────────────────────────────────────

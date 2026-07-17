@@ -11,8 +11,9 @@ import { createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
 import { relevantActiveWork } from "@/lib/active-work";
 import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
-import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
+import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, MarketChartLoading, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
 import CommandDeck from "./CommandDeck";
+import { parseFastChartIntent, type FastChartIntent } from "@/lib/fast-intents";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 const TripView = dynamic(() => import("./TripView"), {
@@ -60,6 +61,7 @@ type Job = {
   startedAt: number;
 };
 type Caption = { who: "you" | "jarvis"; text: string; exiting?: boolean } | null;
+type StagePanel = { type: string; value: string; title?: string; updatedAt: number };
 
 const ytId = (s: string) => {
   const m = String(s).match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([\w-]{11})/);
@@ -180,11 +182,18 @@ function panelSize(panel: { type: string; value: string }): string {
     case "w:weather":
       return "w-[min(880px,80%)] h-[min(640px,90%)]";
     case "w:market":
-      return "w-[min(960px,80%)] h-[min(540px,88%)]";
+      return "w-[96%] md:w-[min(880px,calc(100%-250px))] h-[min(540px,86%)]";
     case "image":
       return "w-[min(1100px,97%)] h-[min(760px,97%)]";
     case "w:candles":
-      return "w-[min(1360px,98%)] h-[min(780px,96%)]";
+    case "w:chart_loading":
+      return "w-[96%] md:w-[min(1040px,calc(100%-250px))] h-[min(680px,88%)]";
+    case "w:briefing":
+    case "w:briefing2":
+      return "w-[96%] md:w-[min(980px,calc(100%-250px))] h-[min(700px,90%)]";
+    case "w:calendar":
+    case "w:todos":
+      return "w-[96%] md:w-[min(900px,calc(100%-250px))] h-[min(680px,88%)]";
     case "w:stats":
       return "w-[min(1080px,81%)] h-[min(680px,92%)]";
     case "w:videos":
@@ -324,10 +333,11 @@ function OptionsPanel({
               {permissionBusy ? "enabling…" : permissions.microphone === "granted" && permissions.notifications === "granted" ? "ready ✓" : "enable once"}
             </button>
           </Row>
-          <Row label="Speaking voice" hint="instant browser/OS voice · no hosted TTS charges">
-            <span className="rounded-lg border border-emerald-400/25 bg-emerald-400/[0.08] px-2.5 py-1 text-[10px] text-emerald-300">
-              on-device · free
-            </span>
+          <Row
+            label="Speaking voice"
+            hint={prefs.tts === "kokoro" ? "Kokoro AI · local, free · downloads once after you speak" : "instant browser/OS voice · local, free"}
+          >
+            <Seg opts={[["kokoro", "Kokoro AI"], ["system", "System"]]} val={prefs.tts} on={(v) => setPref("tts", v)} />
           </Row>
           <Row label="Live conversation" hint={live !== "off" ? "on now" : "start a realtime voice session"}>
             <button onClick={onToggleLive} className={`rounded-lg px-3 py-1 text-[11px] transition ${live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>
@@ -703,6 +713,7 @@ function WidgetView({ value }: { value: string }) {
   }
   if (w?.kind === "timer") return <TimerWidget w={w} />;
   if (w?.kind === "calendar") return <CalendarView value={value} />;
+  if (w?.kind === "chart_loading") return <MarketChartLoading asset={w.asset ?? "Market"} interval={w.interval ?? "1d"} />;
   if (w?.kind === "candles") return <CandlesView w={w} />;
   if (w?.kind === "videos") return <VideoListView value={value} />;
   if (w?.kind === "feed") return <FeedView value={value} />;
@@ -1096,10 +1107,15 @@ export default function JarvisUI() {
     threadRef.current = thread;
   }, [thread]);
   const messages = (useJarvisQuery(api.chatQueue.listMessages, { threadId: thread }) ?? []) as Msg[];
-  const panel = useJarvisQuery(api.ui.getPanel, {}) as
-    | { type: string; value: string; title?: string; updatedAt: number }
+  const remotePanel = useJarvisQuery(api.ui.getPanel, {}) as
+    | StagePanel
     | null
     | undefined;
+  // A direct market request paints its visual shell locally before Convex has
+  // had a chance to round-trip the completed widget. The remote panel remains
+  // the source of truth; this small optimistic layer only removes visual lag.
+  const [instantPanel, setInstantPanel] = useState<StagePanel | null>(null);
+  const panel = instantPanel ?? remotePanel;
   const sayRow = useJarvisQuery(api.ui.getSay, {}) as { value: string; updatedAt: number } | null | undefined;
   const stagePanelSize = useMemo(() => (panel ? panelSize(panel) : ""), [panel]);
   const clearPanel = (args: Record<string, unknown>) => clientMutation("ui:clearPanel", args);
@@ -1152,9 +1168,14 @@ export default function JarvisUI() {
   const closedPanelRef = useRef<{ key: string; ts: number } | null>(null);
   const closeStage = () => {
     if (panel) closedPanelRef.current = { key: `${panel.title ?? ""}|${panel.value.slice(0, 160)}`, ts: Date.now() };
+    setInstantPanel(null);
     setPanelFull(false);
     void clearPanel({});
   };
+  useEffect(() => {
+    if (!instantPanel || !remotePanel) return;
+    if (remotePanel.title === instantPanel.title && remotePanel.value === instantPanel.value) setInstantPanel(null);
+  }, [instantPanel, remotePanel]);
   useEffect(() => {
     panelTypeRef.current = panel?.type ?? null;
     if (panel && panel.updatedAt !== lastPanelAt.current) {
@@ -1294,25 +1315,28 @@ export default function JarvisUI() {
   // Options panel + persisted preferences (voice lane, TTS voice, wake, motion)
   const [optionsOpen, setOptionsOpen] = useState(false);
   const setMoodMut = (args: Record<string, unknown>) => clientMutation("ui:setMood", args);
-  const [prefs, setPrefs] = useState<JarvisPrefs>({ voice: "realtime", tts: "fast", reduceMotion: false, liveDefault: true });
+  const [prefs, setPrefs] = useState<JarvisPrefs>({ voice: "realtime", tts: "kokoro", reduceMotion: false, liveDefault: true });
   const [permissions, setPermissions] = useState<JarvisPermissionState>({ microphone: "prompt", notifications: "prompt" });
   const [permissionBusy, setPermissionBusy] = useState(false);
   const liveAutoStarted = useRef(false);
   useEffect(() => {
-    // Hosted Kokoro (Replicate) and ElevenLabs both spend provider credits.
-    // The only supported output is now the instant browser/OS voice.
-    localStorage.setItem("jarvis_tts", "fast");
+    // Legacy "fast" meant browser speech. Move it to local Kokoro explicitly:
+    // it is still free and on-device, but much more natural once warmed.
+    const tts = localStorage.getItem("jarvis_tts") === "system" ? "system" : "kokoro";
+    localStorage.setItem("jarvis_tts", tts);
     setPrefs({
       voice: localStorage.getItem("jarvis_voice") || "realtime",
-      tts: "fast",
+      tts,
       reduceMotion: localStorage.getItem("jarvis_reduce_motion") === "1",
       liveDefault: localStorage.getItem("jarvis_live_default") !== "0",
     });
+    void import("../lib/tts").then((module) => module.setTtsMode(tts));
   }, []);
   const setPref = (k: keyof JarvisPrefs, v: string | boolean) => {
     setPrefs((p) => ({ ...p, [k]: v }));
     const key = k === "voice" ? "jarvis_voice" : k === "tts" ? "jarvis_tts" : k === "reduceMotion" ? "jarvis_reduce_motion" : "jarvis_live_default";
     localStorage.setItem(key, typeof v === "boolean" ? (v ? "1" : "0") : String(v));
+    if (k === "tts") void import("../lib/tts").then((module) => module.setTtsMode(v === "system" ? "system" : "kokoro"));
     if (k === "liveDefault" && v === true) liveAutoStarted.current = false;
   };
   const refreshPermissions = async () => {
@@ -1854,6 +1878,67 @@ export default function JarvisUI() {
     );
   }
 
+  const fastChartRequest = useRef(0);
+  async function openFastChart(intent: FastChartIntent, requestedText: string) {
+    const request = ++fastChartRequest.current;
+    const title = `${intent.asset.toUpperCase()} · ${intent.interval}`;
+    const loading: StagePanel = {
+      type: "widget",
+      title,
+      updatedAt: Date.now(),
+      value: JSON.stringify({ kind: "chart_loading", asset: intent.asset.toUpperCase(), interval: intent.interval }),
+    };
+    document.documentElement.dataset.jarvisFirstTokenMs = "0";
+    document.documentElement.dataset.jarvisOverlayStartMs = String(performance.now());
+    setSending(true);
+    setPanelMin(false);
+    setInstantPanel(loading);
+    showCaption({ who: "you", text: requestedText });
+    if (chatModeRef.current === "full") setChatMode("bar", false);
+    try {
+      const response = await fetch(`/api/market-chart?asset=${encodeURIComponent(intent.asset)}&interval=${intent.interval}`, {
+        cache: "no-store",
+        headers: { accept: "application/json" },
+      });
+      const body = await response.json().catch(() => null);
+      if (!response.ok || !body?.widget) throw new Error("market data unavailable");
+      if (request !== fastChartRequest.current) return;
+      const widget = body.widget as { asset?: string; changePct?: number };
+      const ready: StagePanel = { type: "widget", title, value: JSON.stringify(widget), updatedAt: Date.now() };
+      setInstantPanel(ready);
+      void setPanel({ type: ready.type, value: ready.value, title: ready.title });
+      const direction = Number(widget.changePct) >= 0 ? "up" : "down";
+      const reply = `${widget.asset ?? intent.asset.toUpperCase()} chart is live — ${direction} ${Math.abs(Number(widget.changePct ?? 0)).toFixed(2)}% on the latest ${intent.interval} candle.`;
+      updateConversationMood(reply);
+      void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
+      void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "reflex" });
+      if (document.hidden || liveAnywhere() || !(await ensureVoice())) {
+        fadeCaption(requestedText);
+        return;
+      }
+      const { speak } = await import("../lib/tts");
+      await speak(
+        reply,
+        (energy) => (energyRef.current = energy),
+        () => {
+          setSpeaking(true);
+          showCaption({ who: "jarvis", text: reply });
+        },
+        () => {
+          setSpeaking(false);
+          fadeCaption(reply);
+        },
+      );
+    } catch {
+      if (request !== fastChartRequest.current) return;
+      setInstantPanel(null);
+      showCaption({ who: "jarvis", text: "The live feed slipped. I’m getting the full market read." });
+      await queueDurableTurn(requestedText);
+    } finally {
+      if (request === fastChartRequest.current) setSending(false);
+    }
+  }
+
   async function submit(text: string) {
     const t = text.trim();
     if (!t) return;
@@ -1870,6 +1955,11 @@ export default function JarvisUI() {
     // the brain can highlight/extend it (relevance awareness).
     if (panel?.type === "video") setVideoPip(true);
     else if (panel && !panelFull && !isFollowUp(t, panel)) setPanelMin(true);
+    const fastChart = !liveRef.current ? parseFastChartIntent(t) : null;
+    if (fastChart) {
+      void openFastChart(fastChart, t);
+      return;
+    }
     if (liveRef.current) {
       // Live session is the single brain while it's on — no parallel text answer.
       const rt = await import("../lib/realtime");

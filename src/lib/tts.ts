@@ -1,13 +1,23 @@
 "use client";
 
-// Zero-cost speech output. Jarvis uses the browser/OS speech engine only: no
-// text is sent to ElevenLabs, Replicate, OpenAI audio, or another TTS provider.
+// Free speech output. Jarvis uses either the browser/OS voice or Kokoro running
+// locally in this browser; assistant text is never sent to a hosted TTS vendor.
 
 let generation = 0;
 let draining = false;
 let currentUtterance: SpeechSynthesisUtterance | null = null;
+let currentAudio: HTMLAudioElement | null = null;
+let stopAudioPlayback: (() => void) | null = null;
 let queue: string[] = [];
 let cachedVoice: SpeechSynthesisVoice | null = null;
+type TtsMode = "kokoro" | "system";
+type KokoroEngine = {
+  generate: (text: string, options: { voice: "bm_fable"; speed: number }) => Promise<{ toBlob: () => Blob }>;
+};
+let ttsMode: TtsMode = "kokoro";
+let kokoro: KokoroEngine | null = null;
+let kokoroLoading: Promise<boolean> | null = null;
+let kokoroWarmScheduled = false;
 
 type Recent = { text: string; until: number };
 let recentUtterances: Recent[] = [];
@@ -67,13 +77,54 @@ export function prewarmTts() {
   }
 }
 
+// Kokoro runs entirely in this browser. The dynamic import keeps its neural
+// runtime out of JARVIS's startup bundle; captions and the first reply never
+// wait for a model download. q8 is the explicit "balanced local" setting shown
+// in Options, rather than a hidden downgrade or a paid hosted voice.
+async function prepareKokoro(): Promise<boolean> {
+  if (typeof window === "undefined" || ttsMode !== "kokoro") return false;
+  if (kokoro) return true;
+  if (kokoroLoading) return kokoroLoading;
+  kokoroLoading = import("kokoro-js")
+    .then(async ({ KokoroTTS }) => {
+      const loaded = await KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-v1.0-ONNX", {
+        dtype: "q8",
+        device: "wasm",
+      });
+      kokoro = loaded as unknown as KokoroEngine;
+      return true;
+    })
+    .catch(() => false)
+    .finally(() => {
+      kokoroLoading = null;
+    });
+  return kokoroLoading;
+}
+
+function scheduleKokoroWarm() {
+  if (kokoroWarmScheduled || kokoro || ttsMode !== "kokoro") return;
+  kokoroWarmScheduled = true;
+  window.setTimeout(() => {
+    kokoroWarmScheduled = false;
+    void prepareKokoro();
+  }, 350);
+}
+
+export function setTtsMode(mode: TtsMode) {
+  ttsMode = mode;
+  if (mode === "kokoro") scheduleKokoroWarm();
+}
+
 export async function warm() {
-  if (typeof window === "undefined" || !window.speechSynthesis) return;
+  if (typeof window === "undefined") return;
   prewarmTts();
-  window.speechSynthesis.onvoiceschanged = () => {
-    cachedVoice = null;
-    window.speechSynthesis.getVoices();
-  };
+  if (window.speechSynthesis) {
+    window.speechSynthesis.onvoiceschanged = () => {
+      cachedVoice = null;
+      window.speechSynthesis.getVoices();
+    };
+  }
+  scheduleKokoroWarm();
 }
 
 export function stopSpeaking() {
@@ -81,6 +132,9 @@ export function stopSpeaking() {
   queue = [];
   currentUtterance = null;
   draining = false;
+  stopAudioPlayback?.();
+  stopAudioPlayback = null;
+  currentAudio = null;
   try {
     window.speechSynthesis?.cancel();
   } catch {
@@ -90,7 +144,7 @@ export function stopSpeaking() {
 }
 
 export function isSpeaking() {
-  return draining || Boolean(window.speechSynthesis?.speaking);
+  return draining || Boolean(currentAudio) || Boolean(window.speechSynthesis?.speaking);
 }
 
 export function sentences(text: string): string[] {
@@ -107,7 +161,71 @@ export function sentences(text: string): string[] {
   return result;
 }
 
-function speakOne(
+function speechSpeed(text: string): number {
+  const tone = text.toLowerCase();
+  if (/\b(urgent|careful|risk|serious|honestly|numbers|weak plan)\b/.test(tone)) return 0.95;
+  if (/\b(sorry|rough|tired|stressed|gentle|here with you)\b/.test(tone)) return 0.93;
+  if (/\b(ha|haha|brilliant|lets go|let's go|excited|love it)\b/.test(tone)) return 1.07;
+  return 1.01;
+}
+
+function energyLoop(expectedGeneration: number, onEnergy: (energy: number) => void) {
+  const startedAt = performance.now();
+  return setInterval(() => {
+    if (expectedGeneration !== generation) return;
+    const phase = (performance.now() - startedAt) / 125;
+    onEnergy(Math.min(1, 0.25 + 0.34 * Math.abs(Math.sin(phase))));
+  }, 60);
+}
+
+async function speakKokoroOne(
+  text: string,
+  expectedGeneration: number,
+  onEnergy: (energy: number) => void,
+  onStart?: () => void,
+): Promise<boolean> {
+  const engine = kokoro;
+  if (!engine || expectedGeneration !== generation) return false;
+  let blob: Blob;
+  try {
+    blob = (await engine.generate(text, { voice: "bm_fable", speed: speechSpeed(text) })).toBlob();
+  } catch {
+    return false;
+  }
+  if (expectedGeneration !== generation) return true;
+  return new Promise((resolve) => {
+    const audio = new Audio(URL.createObjectURL(blob));
+    currentAudio = audio;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    let settled = false;
+    const finish = (played: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearInterval(timer);
+      if (currentAudio === audio) currentAudio = null;
+      if (stopAudioPlayback === stop) stopAudioPlayback = null;
+      URL.revokeObjectURL(audio.src);
+      audio.removeAttribute("src");
+      onEnergy(0);
+      resolve(played);
+    };
+    const stop = () => {
+      audio.pause();
+      finish(true);
+    };
+    stopAudioPlayback = stop;
+    audio.onplay = () => {
+      if (expectedGeneration !== generation) return stop();
+      onStart?.();
+      timer = energyLoop(expectedGeneration, onEnergy);
+    };
+    audio.onended = () => finish(true);
+    audio.onerror = () => finish(false);
+    void audio.play().catch(() => finish(false));
+  });
+}
+
+function speakSystemOne(
   text: string,
   expectedGeneration: number,
   onEnergy: (energy: number) => void,
@@ -121,9 +239,9 @@ function speakOne(
     const voice = pickVoice();
     if (voice) utterance.voice = voice;
     utterance.lang = voice?.lang || "en-GB";
-    const tone = text.toLowerCase();
     // Web Speech has no emotion markup, but careful prosody makes the free
     // on-device voice feel far less flat without shipping text to a provider.
+    const tone = text.toLowerCase();
     if (/\b(urgent|careful|risk|serious|honestly|numbers|weak plan)\b/.test(tone)) {
       utterance.rate = 0.99;
       utterance.pitch = 0.9;
@@ -138,15 +256,9 @@ function speakOne(
       utterance.pitch = 0.96;
     }
     let energyTimer: ReturnType<typeof setInterval> | null = null;
-    let startedAt = 0;
     utterance.onstart = () => {
       onStart?.();
-      startedAt = performance.now();
-      energyTimer = setInterval(() => {
-        if (expectedGeneration !== generation) return;
-        const phase = (performance.now() - startedAt) / 125;
-        onEnergy(Math.min(1, 0.25 + 0.34 * Math.abs(Math.sin(phase))));
-      }, 60);
+      energyTimer = energyLoop(expectedGeneration, onEnergy);
     };
     const done = () => {
       if (energyTimer) clearInterval(energyTimer);
@@ -160,13 +272,32 @@ function speakOne(
   });
 }
 
+async function speakOne(
+  text: string,
+  expectedGeneration: number,
+  onEnergy: (energy: number) => void,
+  onStart?: () => void,
+  useKokoro = false,
+): Promise<void> {
+  if (useKokoro) {
+    const played = await speakKokoroOne(text, expectedGeneration, onEnergy, onStart);
+    if (played || expectedGeneration !== generation) return;
+  }
+  await speakSystemOne(text, expectedGeneration, onEnergy, onStart);
+}
+
 export async function speak(
   text: string,
   onEnergy: (energy: number) => void,
   onStart?: () => void,
   onEnd?: () => void,
 ): Promise<void> {
-  if (typeof window === "undefined" || !window.speechSynthesis) {
+  if (typeof window === "undefined") {
+    onEnd?.();
+    return;
+  }
+  const useKokoro = ttsMode === "kokoro" && Boolean(kokoro);
+  if (!useKokoro && !window.speechSynthesis) {
     onEnd?.();
     return;
   }
@@ -184,7 +315,7 @@ export async function speak(
     await speakOne(next, expectedGeneration, onEnergy, started ? undefined : () => {
       started = true;
       onStart?.();
-    });
+    }, useKokoro);
   }
   if (expectedGeneration === generation) {
     draining = false;

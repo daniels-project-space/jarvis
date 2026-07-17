@@ -1117,6 +1117,62 @@ type CandlesWidget = {
 const fmtP = (n: number) =>
   n >= 1000 ? n.toLocaleString("en-US", { maximumFractionDigits: 0 }) : n.toLocaleString("en-US", { maximumFractionDigits: n >= 10 ? 2 : 4 });
 
+// This is not a fake chart: it is the short, local bridge while the authenticated
+// market endpoint is fetching real OHLCV. Keeping the chart-shaped stage in
+// place means a request feels immediate, and the real renderer replaces it in
+// situ without moving the orb or the rest of the interface.
+export function MarketChartLoading({ asset, interval }: { asset: string; interval: string }) {
+  return (
+    <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden bg-[radial-gradient(circle_at_78%_18%,rgba(0,255,136,0.13),transparent_30%),linear-gradient(145deg,rgba(12,25,39,0.96),rgba(3,10,18,0.98))]">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-white/10 px-4 py-3">
+        <span className="text-sm font-semibold text-ice">{asset}</span>
+        <span className="hud-label !text-[9px]">{interval} · live market workspace</span>
+        <span className="ml-auto flex items-center gap-2 font-mono text-[9px] uppercase tracking-[0.18em] text-cyan">
+          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan shadow-[0_0_10px_#00ff88]" /> linking feed
+        </span>
+      </div>
+      <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_78px] gap-0 p-3 sm:grid-cols-[minmax(0,1fr)_100px]">
+        <div className="relative min-h-[300px] overflow-hidden rounded-xl border border-white/[0.07] bg-black/20">
+          <div className="absolute inset-0 opacity-60" style={{ backgroundImage: "linear-gradient(rgba(255,255,255,.055) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.045) 1px, transparent 1px)", backgroundSize: "100% 25%, 12.5% 100%" }} />
+          <svg viewBox="0 0 960 480" preserveAspectRatio="none" className="absolute inset-0 h-full w-full" aria-hidden="true">
+            <defs>
+              <linearGradient id="chart-loading-fill" x1="0" x2="0" y1="0" y2="1">
+                <stop offset="0" stopColor="#00ff88" stopOpacity="0.18" />
+                <stop offset="1" stopColor="#00ff88" stopOpacity="0" />
+              </linearGradient>
+              <linearGradient id="chart-loading-line" x1="0" x2="1">
+                <stop offset="0" stopColor="#00ff88" stopOpacity="0.2" />
+                <stop offset="0.5" stopColor="#7fffd4" stopOpacity="0.95" />
+                <stop offset="1" stopColor="#00ff88" stopOpacity="0.2" />
+              </linearGradient>
+            </defs>
+            <path d="M0 326 C70 300 95 342 145 286 S226 297 276 228 S360 274 414 191 S499 240 548 167 S638 217 694 130 S786 166 838 102 S910 146 960 74 L960 480 L0 480 Z" fill="url(#chart-loading-fill)" />
+            <path d="M0 326 C70 300 95 342 145 286 S226 297 276 228 S360 274 414 191 S499 240 548 167 S638 217 694 130 S786 166 838 102 S910 146 960 74" fill="none" stroke="url(#chart-loading-line)" strokeWidth="3" strokeDasharray="7 8" className="animate-[pulse_1.5s_ease-in-out_infinite]" />
+            {[118, 232, 346].map((y) => <line key={y} x1="0" x2="960" y1={y} y2={y} stroke="rgba(255,255,255,.08)" />)}
+          </svg>
+          <div className="absolute bottom-3 left-3 rounded-lg border border-cyan/20 bg-[#08141e]/80 px-2.5 py-1.5 font-mono text-[9px] uppercase tracking-[0.16em] text-cyan backdrop-blur">
+            sourcing candles · indicators queueing
+          </div>
+        </div>
+        <div className="flex flex-col justify-between px-2 py-3 font-mono text-[9px] text-slate">
+          <span className="animate-pulse">LIVE</span>
+          <span>OHLCV</span>
+          <span>MA 20</span>
+          <span>RSI 14</span>
+        </div>
+      </div>
+      <div className="grid grid-cols-3 gap-2 border-t border-white/[0.07] px-4 py-3">
+        {["candles", "volume", "levels"].map((label) => (
+          <div key={label} className="rounded-lg border border-white/[0.07] bg-white/[0.025] px-2.5 py-2">
+            <div className="hud-label !text-[8px]">{label}</div>
+            <div className="mt-1 h-1.5 w-3/4 animate-pulse rounded-full bg-cyan/20" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function CandlesView({ w }: { w: CandlesWidget }) {
   const [hover, setHover] = useState<number | null>(null);
   const W = 960;

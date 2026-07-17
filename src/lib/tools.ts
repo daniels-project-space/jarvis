@@ -2663,13 +2663,18 @@ async function priceChartTool(args: any): Promise<string> {
   const a = resolveAsset(String(args.asset ?? ""));
   if (!a) return `Couldn't resolve "${args.asset}" to a chartable asset.`;
   const interval = ["1h", "4h", "1d", "1w"].includes(String(args.interval)) ? String(args.interval) : "1d";
-  const candles = await fetchCandles(a, interval);
+  // Alerts are helpful decoration, not a reason to withhold the chart. Fetch
+  // them beside the market data so the primary visual is never serialized
+  // behind an unrelated Convex read.
+  const [candles, rules] = await Promise.all([
+    fetchCandles(a, interval),
+    convexQuery("watchRules:list", { status: "active", limit: 80 }).catch(() => [] as any[]),
+  ]);
   if (candles.length < 30) return `No chart data for ${a.label} on ${interval}.`;
   const levels = keyLevels(candles);
   const w = chartWidget(a, interval, candles, levels);
-  const rules: any[] = (await convexQuery("watchRules:list", { status: "active", limit: 80 }).catch(() => [])) ?? [];
   const symbols = new Set([a.binance, a.yahoo, String(args.asset ?? "").toUpperCase()].filter(Boolean));
-  (w as any).alerts = rules
+  (w as any).alerts = (rules as any[])
     .filter((rule) => rule.kind === "asset" && symbols.has(String(rule.definition?.symbol ?? "").toUpperCase()))
     .map((rule) => ({
       price: Number(rule.definition.threshold),
