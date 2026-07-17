@@ -252,20 +252,6 @@ export default defineSchema({
     .index("by_token", ["tokenHash"])
     .index("by_expiry", ["expiresAt"]),
 
-  // Short-lived, one-use capabilities for adding another trusted browser
-  // without a password screen. Only an existing owner session or the trusted
-  // dispatcher can create one; possession of the high-entropy token is needed
-  // to redeem it for a new opaque HttpOnly owner session.
-  devicePairings: defineTable({
-    tokenHash: v.string(),
-    status: v.string(), // active | used | expired
-    createdAt: v.number(),
-    expiresAt: v.number(),
-    usedAt: v.optional(v.number()),
-  })
-    .index("by_token", ["tokenHash"])
-    .index("by_expiry", ["expiresAt"]),
-
   // Short-lived, read-only capabilities issued only after an HttpOnly admin
   // session is validated. The browser may hold this scoped token in memory,
   // but the admin bearer never leaves its cookie and mutations reject viewers.

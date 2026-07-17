@@ -17,14 +17,12 @@ export async function proxy(req: NextRequest) {
   if (
     !pathname.startsWith("/api/")
     || pathname === "/api/auth/viewer"
-    || pathname === "/api/auth/pair"
-    || pathname === "/api/auth/pairing/request"
     || pathname === "/api/agent-tool"
   ) return NextResponse.next();
 
   const tokenHash = await adminSessionHash(req);
   if (await validateAdminSession(tokenHash)) return NextResponse.next();
-  return NextResponse.json({ error: "trusted device required" }, { status: 401 });
+  return NextResponse.json({ error: "Jarvis session required" }, { status: 401 });
 }
 
 export const config = {

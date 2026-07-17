@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 import {
@@ -7,6 +8,7 @@ import {
   adminSessionHash,
   controlMutation,
   isSameOriginRequest,
+  sha256Hex,
 } from "@/lib/control-session";
 import { issueViewerToken } from "@/lib/viewer-jwt";
 
@@ -18,15 +20,29 @@ export async function POST(req: NextRequest) {
     return Response.json({ ok: false }, { status: 403 });
   }
 
-  const ownerToken = req.cookies.get(ADMIN_COOKIE)?.value;
-  const authTokenHash = await adminSessionHash(req);
-  const ownerSession = await adminSessionStatus(authTokenHash);
+  let ownerToken = req.cookies.get(ADMIN_COOKIE)?.value;
+  let authTokenHash = await adminSessionHash(req);
+  let ownerSession = await adminSessionStatus(authTokenHash);
+  let setOwnerCookie = false;
+
   if (!ownerSession.valid || !ownerToken || !authTokenHash) {
-    return Response.json({ ok: false, error: "unpaired device" }, { status: 401 });
+    const workerToken = process.env.JARVIS_WORKER_TOKEN;
+    if (!workerToken) return Response.json({ ok: false, error: "session unavailable" }, { status: 503 });
+
+    ownerToken = randomBytes(32).toString("base64url");
+    authTokenHash = await sha256Hex(ownerToken);
+    const created = await controlMutation("controlAuth:createOpenSession", {
+      ownerTokenHash: authTokenHash,
+      userAgent: req.headers.get("user-agent") ?? undefined,
+      workerToken,
+    }).catch(() => null) as { expiresAt?: number } | null;
+    if (!created?.expiresAt) return Response.json({ ok: false, error: "session unavailable" }, { status: 503 });
+    ownerSession = { valid: true, expiresAt: created.expiresAt };
+    setOwnerCookie = true;
   }
 
   const refreshOwner = Number(ownerSession.expiresAt ?? 0) < Date.now() + REFRESH_WINDOW_MS;
-  if (refreshOwner) {
+  if (refreshOwner && !setOwnerCookie) {
     const refreshed = await controlMutation("controlAuth:refreshSession", { tokenHash: authTokenHash }).catch(() => null);
     if (!refreshed) return Response.json({ ok: false }, { status: 503 });
   }
@@ -38,7 +54,7 @@ export async function POST(req: NextRequest) {
     { ok: true, viewerToken: issued.token, expiresAt: issued.expiresAt },
     { headers: { "cache-control": "no-store" } },
   );
-  if (refreshOwner) {
+  if (setOwnerCookie || refreshOwner) {
     response.cookies.set(ADMIN_COOKIE, ownerToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",

@@ -3,7 +3,6 @@ import { v } from "convex/values";
 
 const SESSION_LIFETIME_MS = 365 * 24 * 60 * 60 * 1000;
 const VIEWER_LIFETIME_MS = 6 * 60 * 60 * 1000;
-const PAIRING_LIFETIME_MS = 10 * 60 * 1000;
 const VIEWER_ISSUER = "https://jarvis-orcin-six.vercel.app";
 const VIEWER_SUBJECT = "daniel-owner";
 
@@ -124,75 +123,37 @@ export const refreshSession = mutation({
   },
 });
 
-async function storeDevicePairing(ctx: any, rawTokenHash: string) {
-  if (!/^[a-f0-9]{64}$/i.test(rawTokenHash)) throw new Error("Invalid pairing capability");
-  const now = Date.now();
-  const stale = await ctx.db
-    .query("devicePairings")
-    .withIndex("by_expiry", (q: any) => q.lt("expiresAt", now))
-    .take(50);
-  for (const pairing of stale) await ctx.db.delete(pairing._id);
-  const tokenHash = rawTokenHash.toLowerCase();
-  const existing = await ctx.db
-    .query("devicePairings")
-    .withIndex("by_token", (q: any) => q.eq("tokenHash", tokenHash))
-    .first();
-  if (existing) await ctx.db.delete(existing._id);
-  const expiresAt = now + PAIRING_LIFETIME_MS;
-  await ctx.db.insert("devicePairings", { tokenHash, status: "active", createdAt: now, expiresAt });
-  return { expiresAt };
-}
-
-export const createDevicePairing = mutation({
+// Jarvis deliberately opens without an interactive sign-in, so browsers receive
+// their opaque admin session automatically on first load. The public Convex
+// mutation still cannot mint a session by itself: only the server-held worker
+// capability may bootstrap one, and the raw cookie never leaves Vercel.
+export const createOpenSession = mutation({
   args: {
-    tokenHash: v.string(),
-    authTokenHash: v.string(),
+    ownerTokenHash: v.string(),
+    userAgent: v.optional(v.string()),
+    workerToken: v.string(),
   },
   handler: async (ctx, args) => {
-    await requireAdmin(ctx, args.authTokenHash);
-    return await storeDevicePairing(ctx, args.tokenHash);
-  },
-});
-
-// Project Hub's recovery bridge holds only the narrow request bearer. The
-// Jarvis route converts that request into the existing dispatcher capability;
-// it cannot mint admin sessions directly or call any other control mutation.
-export const createDevicePairingForDispatcher = mutation({
-  args: {
-    tokenHash: v.string(),
-    dispatchToken: v.string(),
-  },
-  handler: async (ctx, args) => {
-    await requireDispatcher(ctx, { dispatchToken: args.dispatchToken });
-    return await storeDevicePairing(ctx, args.tokenHash);
-  },
-});
-
-export const redeemDevicePairing = mutation({
-  args: { tokenHash: v.string(), ownerTokenHash: v.string(), userAgent: v.optional(v.string()) },
-  handler: async (ctx, args) => {
-    if (!/^[a-f0-9]{64}$/i.test(args.tokenHash) || !/^[a-f0-9]{64}$/i.test(args.ownerTokenHash)) return false;
+    requireWorker(args.workerToken);
+    if (!/^[a-f0-9]{64}$/i.test(args.ownerTokenHash)) return false;
     const now = Date.now();
-    const pairing = await ctx.db
-      .query("devicePairings")
-      .withIndex("by_token", (q: any) => q.eq("tokenHash", args.tokenHash.toLowerCase()))
-      .first();
-    if (!pairing || pairing.status !== "active" || pairing.expiresAt <= now) return false;
-
-    await ctx.db.patch(pairing._id, { status: "used", usedAt: now });
     const ownerTokenHash = args.ownerTokenHash.toLowerCase();
     const existing = await ctx.db
       .query("adminSessions")
       .withIndex("by_token", (q: any) => q.eq("tokenHash", ownerTokenHash))
       .first();
-    if (existing) await ctx.db.delete(existing._id);
-    await ctx.db.insert("adminSessions", {
-      tokenHash: ownerTokenHash,
-      userAgent: args.userAgent?.slice(0, 240),
-      createdAt: now,
-      expiresAt: now + SESSION_LIFETIME_MS,
-    });
-    return true;
+    const expiresAt = now + SESSION_LIFETIME_MS;
+    if (existing) {
+      await ctx.db.patch(existing._id, { userAgent: args.userAgent?.slice(0, 240), expiresAt });
+    } else {
+      await ctx.db.insert("adminSessions", {
+        tokenHash: ownerTokenHash,
+        userAgent: args.userAgent?.slice(0, 240),
+        createdAt: now,
+        expiresAt,
+      });
+    }
+    return { expiresAt };
   },
 });
 
