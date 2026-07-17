@@ -260,6 +260,8 @@ function OptionsPanel({
   onMood: (m: string) => void;
   onClearMood: () => void;
 }) {
+  const [pairingUrl, setPairingUrl] = useState("");
+  const [pairingState, setPairingState] = useState<"idle" | "working" | "ready" | "error">("idle");
   const Row = ({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) => (
     <div className="flex items-center justify-between gap-4 py-2.5">
       <div className="min-w-0">
@@ -278,6 +280,18 @@ function OptionsPanel({
       ))}
     </div>
   );
+  const createPairing = async () => {
+    setPairingState("working");
+    const response = await fetch("/api/auth/pairing", { method: "POST", cache: "no-store" }).catch(() => null);
+    const payload = response?.ok ? await response.json().catch(() => null) : null;
+    if (!payload?.url) {
+      setPairingState("error");
+      return;
+    }
+    setPairingUrl(payload.url);
+    setPairingState("ready");
+    await navigator.clipboard?.writeText(payload.url).catch(() => undefined);
+  };
   return (
     <>
       <div className="fixed inset-0 z-[55]" onClick={onClose} />
@@ -311,17 +325,38 @@ function OptionsPanel({
               <span className={`block h-4 w-4 rounded-full bg-white transition-transform ${prefs.reduceMotion ? "translate-x-4" : ""}`} />
             </button>
           </Row>
-          <Row label="Private access" hint="revoke this browser's admin session">
+          <Row
+            label="Pair another device"
+            hint={pairingState === "ready" ? "one-use link copied · expires in 10 minutes" : "passwordless, one time per browser"}
+          >
             <button
-              onClick={async () => {
-                await fetch("/api/auth/logout", { method: "POST" }).catch(() => null);
-                window.location.assign("/login");
-              }}
-              className="rounded-lg border border-white/10 px-3 py-1 text-[11px] text-slate transition hover:border-amber/40 hover:text-amber"
+              onClick={createPairing}
+              disabled={pairingState === "working"}
+              className="rounded-lg border border-white/10 px-3 py-1 text-[11px] text-slate transition hover:border-cyan/40 hover:text-cyan disabled:opacity-40"
             >
-              sign out
+              {pairingState === "working" ? "creating…" : pairingState === "ready" ? "new link" : "create link"}
             </button>
           </Row>
+          {pairingUrl && (
+            <div className="mb-2 flex gap-2 rounded-lg border border-cyan/15 bg-cyan/5 p-2">
+              <input
+                readOnly
+                value={pairingUrl}
+                aria-label="One-time device pairing link"
+                onFocus={(event) => event.currentTarget.select()}
+                className="min-w-0 flex-1 bg-transparent font-mono text-[9px] text-cyan outline-none"
+              />
+              <button
+                onClick={() => navigator.clipboard?.writeText(pairingUrl).catch(() => undefined)}
+                className="font-mono text-[9px] uppercase tracking-wider text-ice hover:text-cyan"
+              >
+                copy
+              </button>
+            </div>
+          )}
+          {pairingState === "error" && (
+            <div className="pb-2 font-mono text-[9px] uppercase tracking-wider text-amber">Could not create a pairing link.</div>
+          )}
           <div className="py-2.5">
             <div className="mb-2 flex items-center justify-between">
               <span className="text-[13px] text-ice">Orb mood</span>

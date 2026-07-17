@@ -4,22 +4,18 @@ import { adminSessionHash, validateAdminSession } from "@/lib/control-session";
 
 export async function proxy(req: NextRequest) {
   const pathname = req.nextUrl.pathname;
+  if (pathname === "/login") return NextResponse.redirect(new URL("/", req.url));
+  if (
+    !pathname.startsWith("/api/")
+    || pathname === "/api/auth/viewer"
+    || pathname === "/api/auth/pair"
+  ) return NextResponse.next();
+
   const tokenHash = await adminSessionHash(req);
-  const authenticated = await validateAdminSession(tokenHash);
-
-  if (pathname === "/login") {
-    return authenticated ? NextResponse.redirect(new URL("/", req.url)) : NextResponse.next();
-  }
-  if (authenticated) return NextResponse.next();
-  if (pathname.startsWith("/api/")) return NextResponse.json({ error: "authentication required" }, { status: 401 });
-
-  const login = new URL("/login", req.url);
-  login.searchParams.set("next", `${pathname}${req.nextUrl.search}`);
-  return NextResponse.redirect(login);
+  if (await validateAdminSession(tokenHash)) return NextResponse.next();
+  return NextResponse.json({ error: "trusted device required" }, { status: 401 });
 }
 
 export const config = {
-  matcher: [
-    "/((?!_next/static|_next/image|favicon.ico|manifest.webmanifest|api/auth/login|api/auth/logout).*)",
-  ],
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|manifest.webmanifest).*)"],
 };

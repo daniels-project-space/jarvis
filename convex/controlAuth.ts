@@ -1,8 +1,9 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 
-const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_LIFETIME_MS = 365 * 24 * 60 * 60 * 1000;
 const VIEWER_LIFETIME_MS = 6 * 60 * 60 * 1000;
+const PAIRING_LIFETIME_MS = 10 * 60 * 1000;
 
 export const actorAuthArgs = {
   authTokenHash: v.optional(v.string()),
@@ -86,36 +87,79 @@ export async function requireViewer(
   if (!session || session.expiresAt <= Date.now()) throw new Error("Authentication required");
 }
 
-export const createSession = mutation({
-  args: { password: v.string(), tokenHash: v.string(), userAgent: v.optional(v.string()) },
+export const validateSession = query({
+  args: { tokenHash: v.string() },
+  handler: async (ctx, args) => await isAdminSession(ctx, args.tokenHash),
+});
+
+export const refreshSession = mutation({
+  args: { tokenHash: v.string() },
   handler: async (ctx, args) => {
-    const password = process.env.JARVIS_ADMIN_PASSWORD;
-    if (!password || !constantTimeEqual(args.password, password) || !/^[a-f0-9]{64}$/i.test(args.tokenHash)) return false;
-    const now = Date.now();
-    const expired = await ctx.db
+    await requireAdmin(ctx, args.tokenHash);
+    const session = await ctx.db
       .query("adminSessions")
+      .withIndex("by_token", (q: any) => q.eq("tokenHash", args.tokenHash.toLowerCase()))
+      .first();
+    if (!session) return false;
+    const expiresAt = Date.now() + SESSION_LIFETIME_MS;
+    await ctx.db.patch(session._id, { expiresAt });
+    return { expiresAt };
+  },
+});
+
+export const createDevicePairing = mutation({
+  args: {
+    tokenHash: v.string(),
+    authTokenHash: v.optional(v.string()),
+    dispatchToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    await requireDispatcher(ctx, args);
+    if (!/^[a-f0-9]{64}$/i.test(args.tokenHash)) throw new Error("Invalid pairing capability");
+    const now = Date.now();
+    const stale = await ctx.db
+      .query("devicePairings")
       .withIndex("by_expiry", (q: any) => q.lt("expiresAt", now))
       .take(50);
-    for (const session of expired) await ctx.db.delete(session._id);
+    for (const pairing of stale) await ctx.db.delete(pairing._id);
     const tokenHash = args.tokenHash.toLowerCase();
     const existing = await ctx.db
-      .query("adminSessions")
+      .query("devicePairings")
       .withIndex("by_token", (q: any) => q.eq("tokenHash", tokenHash))
       .first();
     if (existing) await ctx.db.delete(existing._id);
+    const expiresAt = now + PAIRING_LIFETIME_MS;
+    await ctx.db.insert("devicePairings", { tokenHash, status: "active", createdAt: now, expiresAt });
+    return { expiresAt };
+  },
+});
+
+export const redeemDevicePairing = mutation({
+  args: { tokenHash: v.string(), ownerTokenHash: v.string(), userAgent: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    if (!/^[a-f0-9]{64}$/i.test(args.tokenHash) || !/^[a-f0-9]{64}$/i.test(args.ownerTokenHash)) return false;
+    const now = Date.now();
+    const pairing = await ctx.db
+      .query("devicePairings")
+      .withIndex("by_token", (q: any) => q.eq("tokenHash", args.tokenHash.toLowerCase()))
+      .first();
+    if (!pairing || pairing.status !== "active" || pairing.expiresAt <= now) return false;
+
+    await ctx.db.patch(pairing._id, { status: "used", usedAt: now });
+    const ownerTokenHash = args.ownerTokenHash.toLowerCase();
+    const existing = await ctx.db
+      .query("adminSessions")
+      .withIndex("by_token", (q: any) => q.eq("tokenHash", ownerTokenHash))
+      .first();
+    if (existing) await ctx.db.delete(existing._id);
     await ctx.db.insert("adminSessions", {
-      tokenHash,
+      tokenHash: ownerTokenHash,
       userAgent: args.userAgent?.slice(0, 240),
       createdAt: now,
       expiresAt: now + SESSION_LIFETIME_MS,
     });
     return true;
   },
-});
-
-export const validateSession = query({
-  args: { tokenHash: v.string() },
-  handler: async (ctx, args) => await isAdminSession(ctx, args.tokenHash),
 });
 
 export const createViewerSession = mutation({

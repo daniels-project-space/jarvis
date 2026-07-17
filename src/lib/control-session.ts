@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server";
 import { resolveConvexUrl } from "./convex-url";
 
 export const ADMIN_COOKIE = "jarvis_admin";
-export const ADMIN_SESSION_SECONDS = 30 * 24 * 60 * 60;
+export const ADMIN_SESSION_SECONDS = 365 * 24 * 60 * 60;
 
 const CONVEX_URL = resolveConvexUrl(process.env.CONVEX_URL, process.env.NEXT_PUBLIC_CONVEX_URL);
 
