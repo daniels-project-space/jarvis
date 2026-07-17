@@ -111,6 +111,16 @@ let reflexSilentStream: MediaStream | null = null;
 let reflexHandlers: ReflexHandlers | null = null;
 let queuedReflexText: string | null = null;
 
+// The SDK emits the complete local history on every streaming update and its
+// own update path scans that array. Keep a useful recent window so a long-lived
+// always-available JARVIS session cannot get progressively more expensive on
+// every later turn. Durable history/context still lives in Convex and is baked
+// into each fresh token.
+function compactSessionHistory(target: RealtimeSession | null) {
+  if (!target || target.history.length <= 32) return;
+  target.updateHistory((history) => history.slice(-24));
+}
+
 function silentAudioStream(): MediaStream {
   // The SDK's WebRTC transport requires an audio track to negotiate the peer
   // connection. A disabled MediaStreamDestination track satisfies WebRTC
@@ -287,7 +297,7 @@ export async function startReflex(h: ReflexHandlers, clientId = ""): Promise<boo
       const mirrored = new Set<string>();
       const observed = new Map<string, string>();
       nextSession.on("history_updated", (history: any[]) => {
-        for (const item of history) {
+        for (const item of history.slice(-32)) {
           if (item?.type !== "message") continue;
           const role = item.role === "user" ? "user" : "assistant";
           let text = (item.content ?? [])
@@ -305,6 +315,7 @@ export async function startReflex(h: ReflexHandlers, clientId = ""): Promise<boo
           if (done && !mirrored.has(item.itemId)) {
             mirrored.add(item.itemId);
             reflexHandlers?.onTurnDone(role, text);
+            if (role === "assistant") setTimeout(() => compactSessionHistory(reflexSession), 0);
           }
         }
       });
@@ -459,7 +470,7 @@ export async function startLive(h: LiveHandlers) {
       return recentAssistant.some((r) => now - r.ts < 30_000 && tokenOverlap(t, r.text) >= 0.65);
     };
     session.on("history_updated", (history: any[]) => {
-      for (const item of history) {
+      for (const item of history.slice(-32)) {
         if (item?.type !== "message") continue;
         const role = item.role === "user" ? "user" : "assistant";
         let text = (item.content ?? [])
@@ -517,6 +528,7 @@ export async function startLive(h: LiveHandlers) {
             if (recentAssistant.length > 5) recentAssistant.shift();
           }
           h.onTurnDone(role, text);
+          if (role === "assistant") setTimeout(() => compactSessionHistory(session), 0);
         }
       }
     });

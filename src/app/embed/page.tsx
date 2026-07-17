@@ -318,6 +318,10 @@ export default function Embed() {
   async function submit(text: string) {
     const t = text.trim();
     if (!t) return;
+    void import("../../lib/tts").then((module) => {
+      module.stopSpeaking();
+      void module.warm();
+    });
     setInput("");
     push({ who: "you", text: t });
     void claimVoice({ client: me.current });

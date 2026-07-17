@@ -1976,7 +1976,13 @@ export default function JarvisUI() {
     lastSent.current = { text: t, ts: Date.now() };
     updateConversationMood(t);
     void claimVoice({ client: me.current });
-    import("../lib/tts").then((m) => m.warm());
+    // A new request is an immediate barge-in. Cancel queued/playback state
+    // before doing anything else; worker inference may finish in the
+    // background, but its stale result is discarded by the generation gate.
+    void import("../lib/tts").then((m) => {
+      m.stopSpeaking();
+      void m.warm();
+    });
     setInput("");
     // a playing video shrinks to picture-in-picture (keeps playing). Other
     // overlays step aside ONLY on a genuine topic switch — a follow-up about

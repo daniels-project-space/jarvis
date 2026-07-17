@@ -1,7 +1,7 @@
 "use client";
 
 // Free speech output. Jarvis uses either the browser/OS voice or Kokoro running
-// locally in this browser; assistant text is never sent to a hosted TTS vendor.
+// in a dedicated browser worker; assistant text is never sent to a TTS vendor.
 
 let generation = 0;
 let draining = false;
@@ -11,14 +11,26 @@ let stopAudioPlayback: (() => void) | null = null;
 let queue: string[] = [];
 let cachedVoice: SpeechSynthesisVoice | null = null;
 type TtsMode = "kokoro" | "system";
-type KokoroEngine = {
-  generate: (text: string, options: { voice: "bm_fable"; speed: number }) => Promise<{ toBlob: () => Blob }>;
-};
+type KokoroWorkerRequest =
+  | { id: number; type: "warm" }
+  | { id: number; type: "generate"; text: string; speed: number };
+type KokoroWorkerPayload =
+  | { type: "warm" }
+  | { type: "generate"; text: string; speed: number };
+type KokoroWorkerResponse =
+  | { id: number; type: "ready" }
+  | { id: number; type: "audio"; blob: Blob }
+  | { id: number; type: "error"; message: string };
+type KokoroWorkerResult = { ok: true; blob?: Blob } | { ok: false };
+type KokoroPending = { resolve: (result: KokoroWorkerResult) => void };
 let ttsMode: TtsMode = "kokoro";
-let kokoro: KokoroEngine | null = null;
+let kokoroWorker: Worker | null = null;
+let kokoroReady = false;
 let kokoroLoading: Promise<boolean> | null = null;
 let kokoroWarmTimer: number | null = null;
 let lastInteractionAt = 0;
+let kokoroRequestId = 0;
+const kokoroPending = new Map<number, KokoroPending>();
 
 type Recent = { text: string; until: number };
 let recentUtterances: Recent[] = [];
@@ -78,23 +90,64 @@ export function prewarmTts() {
   }
 }
 
-// Kokoro runs entirely in this browser. The dynamic import keeps its neural
-// runtime out of JARVIS's startup bundle; captions and the first reply never
-// wait for a model download. q8 is the explicit "balanced local" setting shown
-// in Options, rather than a hidden downgrade or a paid hosted voice.
+function failKokoroWorker() {
+  kokoroReady = false;
+  kokoroWorker?.terminate();
+  kokoroWorker = null;
+  for (const pending of kokoroPending.values()) pending.resolve({ ok: false });
+  kokoroPending.clear();
+}
+
+function getKokoroWorker() {
+  if (kokoroWorker) return kokoroWorker;
+  const worker = new Worker(new URL("../workers/kokoro.worker.ts", import.meta.url), {
+    type: "module",
+    name: "jarvis-kokoro",
+  });
+  worker.onmessage = (event: MessageEvent<KokoroWorkerResponse>) => {
+    const response = event.data;
+    const pending = kokoroPending.get(response.id);
+    if (!pending) return;
+    kokoroPending.delete(response.id);
+    if (response.type === "ready") {
+      kokoroReady = true;
+      pending.resolve({ ok: true });
+    } else if (response.type === "audio") {
+      pending.resolve({ ok: true, blob: response.blob });
+    } else {
+      pending.resolve({ ok: false });
+    }
+  };
+  worker.onerror = () => failKokoroWorker();
+  worker.onmessageerror = () => failKokoroWorker();
+  kokoroWorker = worker;
+  return worker;
+}
+
+function askKokoroWorker(request: KokoroWorkerPayload): Promise<KokoroWorkerResult> {
+  const id = ++kokoroRequestId;
+  return new Promise((resolve) => {
+    kokoroPending.set(id, { resolve });
+    try {
+      getKokoroWorker().postMessage({ ...request, id } as KokoroWorkerRequest);
+    } catch {
+      kokoroPending.delete(id);
+      resolve({ ok: false });
+      failKokoroWorker();
+    }
+  });
+}
+
+// Kokoro runs entirely in this browser, but model loading and inference live in
+// a Web Worker. WASM previously monopolised the UI thread for up to several
+// seconds after every answer, freezing captions, input, and all orb animation.
+// q8 preserves the selected voice/quality without a hosted or paid dependency.
 async function prepareKokoro(): Promise<boolean> {
   if (typeof window === "undefined" || ttsMode !== "kokoro") return false;
-  if (kokoro) return true;
+  if (kokoroReady) return true;
   if (kokoroLoading) return kokoroLoading;
-  kokoroLoading = import("kokoro-js")
-    .then(async ({ KokoroTTS }) => {
-      const loaded = await KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-v1.0-ONNX", {
-        dtype: "q8",
-        device: "wasm",
-      });
-      kokoro = loaded as unknown as KokoroEngine;
-      return true;
-    })
+  kokoroLoading = askKokoroWorker({ type: "warm" })
+    .then((result) => result.ok)
     .catch(() => false)
     .finally(() => {
       kokoroLoading = null;
@@ -103,7 +156,7 @@ async function prepareKokoro(): Promise<boolean> {
 }
 
 function scheduleKokoroWarm(immediate = false) {
-  if (kokoro || ttsMode !== "kokoro") return;
+  if (kokoroReady || ttsMode !== "kokoro") return;
   if (kokoroWarmTimer) {
     window.clearTimeout(kokoroWarmTimer);
     kokoroWarmTimer = null;
@@ -156,7 +209,7 @@ export async function warm() {
   // Preserve the natural Kokoro voice, but never make first-message input or
   // captions compete with its model startup. It warms after the interaction
   // settles and is retained in browser cache for later replies.
-  if (ttsMode === "kokoro" && !kokoro) scheduleKokoroWarm();
+  if (ttsMode === "kokoro" && !kokoroReady) scheduleKokoroWarm();
 }
 
 export function stopSpeaking() {
@@ -216,14 +269,10 @@ async function speakKokoroOne(
   onEnergy: (energy: number) => void,
   onStart?: () => void,
 ): Promise<boolean> {
-  const engine = kokoro;
-  if (!engine || expectedGeneration !== generation) return false;
-  let blob: Blob;
-  try {
-    blob = (await engine.generate(text, { voice: "bm_fable", speed: speechSpeed(text) })).toBlob();
-  } catch {
-    return false;
-  }
+  if (!kokoroReady || expectedGeneration !== generation) return false;
+  const result = await askKokoroWorker({ type: "generate", text, speed: speechSpeed(text) });
+  const blob = result.ok ? result.blob : undefined;
+  if (!blob) return false;
   if (expectedGeneration !== generation) return true;
   return new Promise((resolve) => {
     const audio = new Audio(URL.createObjectURL(blob));
@@ -328,7 +377,7 @@ export async function speak(
     onEnd?.();
     return;
   }
-  const useKokoro = ttsMode === "kokoro" && Boolean(kokoro);
+  const useKokoro = ttsMode === "kokoro" && kokoroReady;
   if (!useKokoro && !window.speechSynthesis) {
     onEnd?.();
     return;
