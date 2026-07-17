@@ -4,6 +4,8 @@ import { workApprovalPolicy } from "./workPolicy";
 import { requireAdmin, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
 
+const STALE_RUNNER_MS = 5 * 60 * 1000;
+
 const enqueueArgs = {
   task: v.string(),
   repo: v.optional(v.string()),
@@ -283,7 +285,11 @@ export const reapStale = mutation({
     const abandoned: string[] = [];
     for (const j of running) {
       const heartbeat = j.heartbeatAt ?? j.startedAt ?? j.createdAt;
-      if (now - heartbeat < 20 * 60 * 1000) continue;
+      // The serialized Trigger task heartbeats every 30 seconds. If its run
+      // disappears (for example an OOM kill), the next scheduled invocation is
+      // the only possible reaper, so five quiet minutes is ample fencing while
+      // avoiding a long ghost-running window.
+      if (now - heartbeat < STALE_RUNNER_MS) continue;
       const nextAttempt = (j.attempt ?? 1) + 1;
       if (now - j.createdAt > 14 * 86_400_000 || nextAttempt > (j.maxAttempts ?? 12)) {
         await ctx.db.patch(j._id, {

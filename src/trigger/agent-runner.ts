@@ -506,6 +506,10 @@ export function repairPrompt(inc: { source: string; message: string; signature: 
 export const agentRunner = schedules.task({
   id: "jarvis-agent-runner",
   cron: "* * * * *",
+  // Subscription CLIs plus dependency/test tooling do not fit reliably in
+  // Trigger's 0.5 GB default. Keep the other seven tasks on the cheap default;
+  // only the durable specialist runner gets enough headroom to avoid OOM loss.
+  machine: "medium-1x",
   // Scheduled runs must not overlap. One runner already manages three scoped
   // subprocesses internally; overlapping cron runs multiply subscription use
   // and can reclaim a freshly checkpointed failure before policy can back off.
