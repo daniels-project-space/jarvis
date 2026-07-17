@@ -9,6 +9,8 @@ import { registerSW, subscribePush } from "@/lib/push";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
 import { createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
 import { relevantActiveWork } from "@/lib/active-work";
+import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
+import { instantSocialReply } from "@/lib/quick-replies";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
 import CommandDeck from "./CommandDeck";
 
@@ -322,8 +324,10 @@ function OptionsPanel({
               {permissionBusy ? "enabling…" : permissions.microphone === "granted" && permissions.notifications === "granted" ? "ready ✓" : "enable once"}
             </button>
           </Row>
-          <Row label="Speaking voice" hint="Fast = instant on-device · Kokoro/Eleven = richer, slower">
-            <Seg opts={[["fast", "Fast"], ["free", "Kokoro"], ["elevenlabs", "Eleven"]]} val={prefs.tts} on={(v) => setPref("tts", v)} />
+          <Row label="Speaking voice" hint="instant browser/OS voice · no hosted TTS charges">
+            <span className="rounded-lg border border-emerald-400/25 bg-emerald-400/[0.08] px-2.5 py-1 text-[10px] text-emerald-300">
+              on-device · free
+            </span>
           </Row>
           <Row label="Live conversation" hint={live !== "off" ? "on now" : "start a realtime voice session"}>
             <button onClick={onToggleLive} className={`rounded-lg px-3 py-1 text-[11px] transition ${live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>
@@ -1201,6 +1205,15 @@ export default function JarvisUI() {
   const energyRef = useRef(0);
   const recRef = useRef<MediaRecorder | null>(null);
   const liveRef = useRef(false);
+  const reflexReadyRef = useRef(false);
+  const reflexRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reflexBackoffRef = useRef(1_000);
+  const reflexPendingRef = useRef<{
+    text: string;
+    startedAt: number;
+    firstToken: boolean;
+    watchdog: ReturnType<typeof setTimeout> | null;
+  } | null>(null);
   const lastLiveUser = useRef<string | null>(null);
   const me = useRef("");
   const voiceRef = useRef<{ value: string; updatedAt: number } | null>(null);
@@ -1263,14 +1276,15 @@ export default function JarvisUI() {
     if (expandedFinding === id) setExpandedFinding(null);
   };
 
-  // Orb mood: the brain sets a tone colour; the orb drifts into it slowly.
-  const moodRow = useJarvisQuery(api.ui.getMood, {}) as { value: string; updatedAt: number } | null | undefined;
-  const MOOD_COLORS: Record<string, string> = {
-    calm: "#00ff88", focused: "#4a9eed", dreamy: "#9775fa", warm: "#ffb454", playful: "#ff7ad9", tender: "#ff9ec4", curious: "#33e0d0",
-    serious: "#8fa3bd", alert: "#ff5470", excited: "#ff7ad9",
-  };
-  const moodColor =
-    moodRow && Date.now() - moodRow.updatedAt < 30 * 60 * 1000 ? MOOD_COLORS[moodRow.value] ?? undefined : undefined;
+  // The colour changes locally on the first keystroke/word, rather than
+  // waiting for a streamed model reply or a Convex write. A deliberate manual
+  // choice remains authoritative until Daniel returns it to automatic mode.
+  const moodRow = useJarvisQuery(api.ui.getMood, {}) as { value: string; title?: string; updatedAt: number } | null | undefined;
+  const [contextMood, setContextMood] = useState<OrbMood>("calm");
+  const manualMood = moodRow?.title === "manual" && moodRow.value in MOOD_COLORS ? (moodRow.value as OrbMood) : null;
+  const activeMood = manualMood ?? contextMood;
+  const moodColor = MOOD_COLORS[activeMood];
+  const updateConversationMood = (text: string) => setContextMood((previous) => inferConversationMood(text, previous));
 
   // Orbit bubbles: when a new panel takes the stage, the previous one shrinks
   // into a bobbing bubble beside the orb — tap to bring it back.
@@ -1280,21 +1294,17 @@ export default function JarvisUI() {
   // Options panel + persisted preferences (voice lane, TTS voice, wake, motion)
   const [optionsOpen, setOptionsOpen] = useState(false);
   const setMoodMut = (args: Record<string, unknown>) => clientMutation("ui:setMood", args);
-  const [prefs, setPrefs] = useState<JarvisPrefs>({ voice: "realtime", tts: "free", reduceMotion: false, liveDefault: true });
+  const [prefs, setPrefs] = useState<JarvisPrefs>({ voice: "realtime", tts: "fast", reduceMotion: false, liveDefault: true });
   const [permissions, setPermissions] = useState<JarvisPermissionState>({ microphone: "prompt", notifications: "prompt" });
   const [permissionBusy, setPermissionBusy] = useState(false);
   const liveAutoStarted = useRef(false);
   useEffect(() => {
-    // one-time revert: the browser "fast" voice was a regression Daniel hated —
-    // migrate anyone still stuck on it back to Kokoro ("free"). Guarded so a
-    // deliberate re-pick of "fast" later still sticks.
-    if (!localStorage.getItem("jarvis_tts_revert1")) {
-      if (localStorage.getItem("jarvis_tts") === "fast") localStorage.setItem("jarvis_tts", "free");
-      localStorage.setItem("jarvis_tts_revert1", "1");
-    }
+    // Hosted Kokoro (Replicate) and ElevenLabs both spend provider credits.
+    // The only supported output is now the instant browser/OS voice.
+    localStorage.setItem("jarvis_tts", "fast");
     setPrefs({
       voice: localStorage.getItem("jarvis_voice") || "realtime",
-      tts: localStorage.getItem("jarvis_tts") || "free",
+      tts: "fast",
       reduceMotion: localStorage.getItem("jarvis_reduce_motion") === "1",
       liveDefault: localStorage.getItem("jarvis_live_default") !== "0",
     });
@@ -1507,6 +1517,28 @@ export default function JarvisUI() {
     me.current = clientId();
   }, []);
   useEffect(() => {
+    // Warm the text-only peer before Daniel speaks. Per-turn traffic then goes
+    // straight over the existing WebRTC data channel: no serverless cold start,
+    // Trigger queue, polling, or subscription CLI bootstrap in the reflex path.
+    const timer = window.setTimeout(() => void bootReflex(), 80);
+    const reconnect = () => {
+      if (document.visibilityState === "visible" && !reflexReadyRef.current) void bootReflex();
+    };
+    window.addEventListener("focus", reconnect);
+    document.addEventListener("visibilitychange", reconnect);
+    return () => {
+      window.clearTimeout(timer);
+      if (reflexRetryRef.current) clearTimeout(reflexRetryRef.current);
+      if (reflexPendingRef.current?.watchdog) clearTimeout(reflexPendingRef.current.watchdog);
+      window.removeEventListener("focus", reconnect);
+      document.removeEventListener("visibilitychange", reconnect);
+      void import("../lib/realtime").then((module) => module.stopReflex());
+    };
+    // The callback reads current refs by design; reconnecting must not tear the
+    // persistent session down on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
     const preload = () => import("../lib/realtime").then((module) => module.preloadLive()).catch(() => {});
     const timer = window.setTimeout(preload, 900);
     return () => window.clearTimeout(timer);
@@ -1671,7 +1703,9 @@ export default function JarvisUI() {
       return;
     }
     lastSpokenId.current = last._id;
-    if (last.model === "live" || !last.text) return;
+    // Realtime lanes speak their completed text immediately in their own
+    // callback. The Convex row is history only; replaying it here double-talks.
+    if (last.model === "live" || last.model === "reflex" || !last.text) return;
     if (isToolGarbage(last.text) && !sanitizeAssistantText(last.text)) return;
     // never say the exact same thing twice in a row (root of "sends results twice")
     if (last.text === lastSpokenText.current.text && Date.now() - lastSpokenText.current.ts < 20_000) return;
@@ -1712,12 +1746,121 @@ export default function JarvisUI() {
     })();
   }, [messages]);
 
+  async function queueDurableTurn(text: string) {
+    setSending(true);
+    try {
+      await fetch("/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ threadId: threadRef.current, text }),
+      });
+    } catch {
+      /* Convex recovery owns a turn once the request reaches the server. */
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function fallbackReflexTurn() {
+    const pending = reflexPendingRef.current;
+    if (!pending) return;
+    reflexPendingRef.current = null;
+    if (pending.watchdog) clearTimeout(pending.watchdog);
+    const realtime = await import("../lib/realtime");
+    realtime.interruptReflex();
+    await queueDurableTurn(pending.text);
+  }
+
+  function scheduleReflexRetry() {
+    if (reflexRetryRef.current) return;
+    const delay = reflexBackoffRef.current;
+    reflexBackoffRef.current = Math.min(30_000, delay * 2);
+    reflexRetryRef.current = setTimeout(() => {
+      reflexRetryRef.current = null;
+      void bootReflex();
+    }, delay);
+  }
+
+  async function bootReflex() {
+    const realtime = await import("../lib/realtime");
+    await realtime.startReflex(
+      {
+        onState: (state) => {
+          reflexReadyRef.current = state === "ready";
+          if (state === "ready") {
+            reflexBackoffRef.current = 1_000;
+            if (reflexRetryRef.current) clearTimeout(reflexRetryRef.current);
+            reflexRetryRef.current = null;
+          } else if (state === "error") {
+            void fallbackReflexTurn();
+            scheduleReflexRetry();
+          }
+        },
+        onCaption: (text, done) => {
+          const pending = reflexPendingRef.current;
+          if (!pending || !text) return;
+          if (!pending.firstToken) {
+            pending.firstToken = true;
+            if (pending.watchdog) clearTimeout(pending.watchdog);
+            pending.watchdog = null;
+            const latency = Math.max(0, Math.round(performance.now() - pending.startedAt));
+            document.documentElement.dataset.jarvisFirstTokenMs = String(latency);
+            setSending(false);
+          }
+          const next = { who: "jarvis", text } as Caption;
+          captionRef.current = done ? null : next;
+          showCaption(next);
+        },
+        onTurnDone: (role, text) => {
+          if (role !== "assistant") return;
+          const pending = reflexPendingRef.current;
+          if (!pending) return; // timed out/interrupted response: never double-answer
+          reflexPendingRef.current = null;
+          if (pending.watchdog) clearTimeout(pending.watchdog);
+          setSending(false);
+          const userText = pending.text;
+          updateConversationMood(text);
+          void (async () => {
+            // Persist once per finished turn. Streaming stays local, avoiding a
+            // Convex write/read for every token while retaining full history.
+            await logTurn({ threadId: threadRef.current, role: "user", text: userText });
+            await logTurn({ threadId: threadRef.current, role: "assistant", text, model: "reflex" });
+            void fetch("/api/extract", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ user: userText, assistant: text }),
+            }).catch(() => {});
+            if (document.hidden || !(await ensureVoice())) {
+              fadeCaption(text);
+              return;
+            }
+            const { speak } = await import("../lib/tts");
+            await speak(
+              text,
+              (energy) => (energyRef.current = energy),
+              () => {
+                setSpeaking(true);
+                showCaption({ who: "jarvis", text });
+              },
+              () => {
+                setSpeaking(false);
+                fadeCaption(text);
+              },
+            );
+          })();
+        },
+      },
+      me.current,
+    );
+  }
+
   async function submit(text: string) {
     const t = text.trim();
     if (!t) return;
     // double-tap / Enter+click within 2.5s = one send, not two
     if (t === lastSent.current.text && Date.now() - lastSent.current.ts < 2500) return;
     lastSent.current = { text: t, ts: Date.now() };
+    updateConversationMood(t);
     void claimVoice({ client: me.current });
     import("../lib/tts").then((m) => m.warm());
     setInput("");
@@ -1732,17 +1875,52 @@ export default function JarvisUI() {
       const rt = await import("../lib/realtime");
       if (rt.sendLiveText(t)) return;
     }
-    setSending(true);
-    try {
-      await fetch("/api/chat", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ threadId: threadRef.current, text: t }),
-      });
-    } catch {
-      /* Convex reactivity shows whatever landed; cron lane is the safety net */
+    const instant = instantSocialReply(t);
+    if (instant) {
+      document.documentElement.dataset.jarvisFirstTokenMs = "0";
+      showCaption({ who: "you", text: t });
+      updateConversationMood(instant);
+      void (async () => {
+        await logTurn({ threadId: threadRef.current, role: "user", text: t });
+        await logTurn({ threadId: threadRef.current, role: "assistant", text: instant, model: "reflex" });
+        if (document.hidden || !(await ensureVoice())) {
+          fadeCaption(instant);
+          return;
+        }
+        const { speak } = await import("../lib/tts");
+        await speak(
+          instant,
+          (energy) => (energyRef.current = energy),
+          () => {
+            setSpeaking(true);
+            showCaption({ who: "jarvis", text: instant });
+          },
+          () => {
+            setSpeaking(false);
+            fadeCaption(instant);
+          },
+        );
+      })();
+      return;
     }
-    setSending(false);
+    const realtime = await import("../lib/realtime");
+    if (!reflexPendingRef.current && realtime.sendReflexText(t)) {
+      const pending = {
+        text: t,
+        startedAt: performance.now(),
+        firstToken: false,
+        watchdog: null as ReturnType<typeof setTimeout> | null,
+      };
+      reflexPendingRef.current = pending;
+      setSending(true);
+      showCaption({ who: "you", text: t });
+      // A dead-but-not-yet-reported peer must never swallow a message. If no
+      // model text arrives, cancel it and hand the untouched turn to Codex.
+      pending.watchdog = setTimeout(() => void fallbackReflexTurn(), 2_000);
+      return;
+    }
+    void bootReflex();
+    await queueDurableTurn(t);
   }
 
   function stopTalking() {
@@ -1828,13 +2006,33 @@ export default function JarvisUI() {
           else if (!panelFullRef.current) setPanelMin((min) => min || lastPanelAt.current < Date.now() - 30_000);
           lastLiveUser.current = text;
         }
-        else if (lastLiveUser.current) {
-          void fetch("/api/extract", {
+        else {
+          updateConversationMood(text);
+          const exchangeUser = lastLiveUser.current;
+          if (exchangeUser) void fetch("/api/extract", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ user: lastLiveUser.current, assistant: text }),
+            body: JSON.stringify({ user: exchangeUser, assistant: text }),
           });
           lastLiveUser.current = null;
+          // Realtime returns text only. Speak it through the same zero-cost,
+          // on-device voice as typed conversation instead of paid model audio.
+          if (!document.hidden) void (async () => {
+            if (!(await ensureVoice())) return;
+            const { speak } = await import("../lib/tts");
+            await speak(
+              text,
+              (energy) => (energyRef.current = energy),
+              () => {
+                setSpeaking(true);
+                showCaption({ who: "jarvis", text });
+              },
+              () => {
+                setSpeaking(false);
+                fadeCaption(text);
+              },
+            );
+          })();
         }
       },
       onEnergy: (e) => (energyRef.current = e),
@@ -2189,7 +2387,7 @@ export default function JarvisUI() {
           onClose={() => setOptionsOpen(false)}
           onToggleLive={() => void toggleLive()}
           onMood={(m) => void setMoodMut({ mood: m, manual: true })}
-          onClearMood={() => void setMoodMut({ mood: "calm", manual: true })}
+          onClearMood={() => void setMoodMut({ mood: "calm", manual: false })}
         />
       )}
 

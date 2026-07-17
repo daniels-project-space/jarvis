@@ -19,9 +19,8 @@ export type LiveHandlers = {
 };
 
 let session: RealtimeSession | null = null;
+let liveTransport: OpenAIRealtimeWebRTC | null = null;
 let audioEl: HTMLAudioElement | null = null;
-let energyRaf = 0;
-let energyCtx: AudioContext | null = null;
 
 type LiveToolDef = { name: string; description: string; parameters: any };
 const definitionCache = new Map<string, Promise<LiveToolDef[]>>();
@@ -63,48 +62,8 @@ async function clientTools(belt = "core") {
   );
 }
 
-// Analysis-only tap on the remote stream for the orb. CRITICAL: never route the
-// element through WebAudio (createMediaElementSource) — that double-plays the
-// audio ("two voices") and breaks browser echo cancellation, which kills
-// barge-in because the session hears itself instead of Daniel. The element
-// keeps playing natively; we read amplitude from a parallel stream source
-// that is NOT connected to the destination.
-function hookEnergy(el: HTMLAudioElement, onEnergy: (e: number) => void) {
-  const arm = () => {
-    if (!session) return; // live ended before audio arrived
-    const stream = el.srcObject as MediaStream | null;
-    if (!stream || !stream.getAudioTracks().length) {
-      energyRaf = requestAnimationFrame(arm);
-      return;
-    }
-    try {
-      energyCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      void energyCtx.resume();
-      const src = energyCtx.createMediaStreamSource(stream);
-      const analyser = energyCtx.createAnalyser();
-      analyser.fftSize = 256;
-      src.connect(analyser); // analysis only — no destination
-      const data = new Uint8Array(analyser.frequencyBinCount);
-      const tick = () => {
-        analyser.getByteTimeDomainData(data);
-        let sum = 0;
-        for (const v of data) {
-          const n = (v - 128) / 128;
-          sum += n * n;
-        }
-        onEnergy(Math.min(1, Math.sqrt(sum / data.length) * 3));
-        energyRaf = requestAnimationFrame(tick);
-      };
-      tick();
-    } catch {
-      /* orb just won't pulse */
-    }
-  };
-  arm();
-}
-
 export function isLive() {
-  return session !== null;
+  return session !== null && liveTransport?.status === "connected";
 }
 
 export function interruptLive() {
@@ -128,13 +87,199 @@ export function nudgeLive(text: string) {
 // Typed input while live is on goes INTO the live session — one brain, one
 // voice, instead of a parallel text-lane answer being re-spoken as a paraphrase.
 export function sendLiveText(text: string): boolean {
-  if (!session) return false;
+  if (!session || liveTransport?.status !== "connected") return false;
   try {
     session.sendMessage(text);
     return true;
   } catch {
     return false;
   }
+}
+
+export type ReflexState = "connecting" | "ready" | "off" | "error";
+export type ReflexHandlers = {
+  onState: (state: ReflexState, detail?: string) => void;
+  onCaption: (text: string, done: boolean) => void;
+  onTurnDone: (role: "user" | "assistant", text: string) => void;
+};
+
+let reflexSession: RealtimeSession | null = null;
+let reflexTransport: OpenAIRealtimeWebRTC | null = null;
+let reflexStarting: Promise<boolean> | null = null;
+let reflexAudioContext: AudioContext | null = null;
+let reflexSilentStream: MediaStream | null = null;
+let reflexHandlers: ReflexHandlers | null = null;
+
+function silentAudioStream(): MediaStream {
+  // The SDK's WebRTC transport requires an audio track to negotiate the peer
+  // connection. A disabled MediaStreamDestination track satisfies WebRTC
+  // without opening the microphone or sending billable speech content.
+  reflexAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+  const destination = reflexAudioContext.createMediaStreamDestination();
+  const track = destination.stream.getAudioTracks()[0];
+  if (!track) throw new Error("could not create silent reflex transport");
+  track.enabled = false;
+  reflexSilentStream = destination.stream;
+  return destination.stream;
+}
+
+export function isReflexReady() {
+  return reflexSession !== null && reflexTransport?.status === "connected";
+}
+
+export function interruptReflex() {
+  try {
+    reflexSession?.interrupt();
+  } catch {
+    /* ignore */
+  }
+}
+
+export function sendReflexText(text: string): boolean {
+  if (!reflexSession || reflexTransport?.status !== "connected") return false;
+  try {
+    reflexSession.sendMessage(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function stopReflex() {
+  try {
+    reflexSession?.close();
+  } catch {
+    /* ignore */
+  }
+  reflexSession = null;
+  reflexTransport = null;
+  try {
+    reflexSilentStream?.getTracks().forEach((track) => track.stop());
+  } catch {
+    /* ignore */
+  }
+  reflexSilentStream = null;
+  try {
+    void reflexAudioContext?.close();
+  } catch {
+    /* ignore */
+  }
+  reflexAudioContext = null;
+}
+
+export async function startReflex(h: ReflexHandlers, clientId = ""): Promise<boolean> {
+  reflexHandlers = h;
+  if (isReflexReady()) {
+    h.onState("ready");
+    return true;
+  }
+  if (reflexStarting) return reflexStarting;
+
+  reflexStarting = (async () => {
+    h.onState("connecting");
+    try {
+      stopReflex();
+      const [response, coreTools] = await Promise.all([
+        fetch("/api/realtime-token", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ client: clientId, mode: "reflex" }),
+        }),
+        clientTools("core"),
+      ]);
+      const token = await response.json();
+      if (!response.ok || !token.token) throw new Error(token.error ?? "no reflex token");
+
+      const transport = new OpenAIRealtimeWebRTC({ mediaStream: silentAudioStream() });
+      reflexTransport = transport;
+      const activeTools = new Map<string, any>();
+      for (const bridge of coreTools as any[]) activeTools.set(String(bridge.name), bridge);
+      let makeAgent: () => RealtimeAgent;
+      const domainTool = tool({
+        name: "load_tool_domain",
+        description:
+          "Load a specialist tool belt only when needed: work for missions/projects/repairs/control/memory, creative for images/drawing/docs, travel for trip planning, or business for markets/rentals/shopping. After loading, call the requested specialist tool.",
+        parameters: {
+          type: "object",
+          properties: { domain: { type: "string", enum: ["work", "creative", "travel", "business"] } },
+          required: ["domain"],
+          additionalProperties: false,
+        } as any,
+        strict: false,
+        execute: async (args: any) => {
+          const domain = String(args?.domain ?? "");
+          if (!["work", "creative", "travel", "business"].includes(domain)) return "Unknown tool domain.";
+          const loaded = await clientTools(domain);
+          for (const bridge of loaded as any[]) activeTools.set(String(bridge.name), bridge);
+          if (reflexSession) await reflexSession.updateAgent(makeAgent());
+          return `${domain} tools loaded. Now call the specific tool Daniel asked for; do not merely describe it.`;
+        },
+      });
+      makeAgent = () =>
+        new RealtimeAgent({
+          name: "JARVIS",
+          instructions:
+            String(token.instructions ?? "") +
+            "\n\nYou begin with a compact core tool belt. When the requested tool is absent, load its domain and immediately use it. Never claim an action happened after only loading a belt.",
+          tools: [...activeTools.values(), domainTool],
+        });
+
+      const nextSession = new RealtimeSession(makeAgent(), {
+        transport,
+        model: token.model || "gpt-realtime-2.1-mini",
+        config: {
+          outputModalities: ["text"],
+          reasoning: { effort: "minimal" },
+          audio: {
+            input: { transcription: null, turnDetection: null, noiseReduction: null },
+            output: null,
+          },
+        },
+      });
+      reflexSession = nextSession;
+      const mirrored = new Set<string>();
+      const observed = new Map<string, string>();
+      nextSession.on("history_updated", (history: any[]) => {
+        for (const item of history) {
+          if (item?.type !== "message") continue;
+          const role = item.role === "user" ? "user" : "assistant";
+          let text = (item.content ?? [])
+            .map((content: any) => content?.transcript ?? content?.text ?? "")
+            .join(" ")
+            .trim();
+          const observation = `${item.status ?? ""}|${text}`;
+          if (observed.get(item.itemId) === observation) continue;
+          observed.set(item.itemId, observation);
+          if (!text || text.startsWith(NUDGE.slice(0, 20))) continue;
+          if (role === "assistant" && isToolGarbage(text)) text = sanitizeAssistantText(text);
+          if (!text) continue;
+          const done = item.status === "completed";
+          if (role === "assistant") reflexHandlers?.onCaption(text, done);
+          if (done && !mirrored.has(item.itemId)) {
+            mirrored.add(item.itemId);
+            reflexHandlers?.onTurnDone(role, text);
+          }
+        }
+      });
+      nextSession.on("error", (event: any) => {
+        const detail = String(event?.error?.message ?? event?.message ?? event?.error ?? event);
+        stopReflex();
+        reflexHandlers?.onState("error", detail);
+      });
+      await nextSession.connect({ apiKey: token.token });
+      // Keep the synthetic negotiation track disabled for the entire session.
+      nextSession.mute(true);
+      reflexHandlers?.onState("ready");
+      return true;
+    } catch (error: any) {
+      stopReflex();
+      reflexHandlers?.onState("error", String(error?.message ?? error));
+      return false;
+    } finally {
+      reflexStarting = null;
+    }
+  })();
+  return reflexStarting;
 }
 
 let starting = false;
@@ -166,6 +311,7 @@ export async function startLive(h: LiveHandlers) {
     const tk = await res.json();
     if (!res.ok || !tk.token) throw new Error(tk.error ?? "no token");
     const transport = new OpenAIRealtimeWebRTC({ audioElement: audioEl, mediaStream: micStream });
+    liveTransport = transport;
 
     const exitTool = tool({
       name: "exit_live_mode",
@@ -222,13 +368,17 @@ export async function startLive(h: LiveHandlers) {
       transport,
       model: tk.model || "gpt-realtime-2.1",
       config: {
+        // All speech output is free on-device TTS. Realtime supplies only the
+        // fast text brain and microphone understanding — never paid model audio.
+        outputModalities: ["text"],
+        reasoning: { effort: "low" },
         audio: {
           input: {
             transcription: { model: "gpt-4o-transcribe", language: "en", prompt: STT_PROMPT },
             turnDetection: { type: "semantic_vad", eagerness: "high" },
             noiseReduction: { type: "near_field" },
           },
-          output: { voice: tk.voice || "ballad" },
+          output: null,
         },
       },
     });
@@ -322,12 +472,21 @@ export async function startLive(h: LiveHandlers) {
         }
       }
     });
+    session.on("transport_event", (event: any) => {
+      // Local TTS is outside the Realtime audio buffer. Stop it explicitly the
+      // instant Daniel starts speaking so barge-in still feels natural.
+      if (event?.type === "input_audio_buffer.speech_started") {
+        void import("./tts").then((m) => m.stopSpeaking());
+      }
+    });
     session.on("error", (e: any) => {
       console.error("live error", e);
+      const detail = String(e?.error?.message ?? e?.message ?? e?.error ?? e);
+      stopLive();
+      h.onState("error", detail);
     });
 
     await session.connect({ apiKey: tk.token });
-    hookEnergy(audioEl, h.onEnergy);
     starting = false;
     h.onState("live");
   } catch (e: any) {
@@ -344,19 +503,13 @@ export function stopLive() {
     /* ignore */
   }
   session = null;
+  liveTransport = null;
   try {
     micStream?.getTracks().forEach((t) => t.stop());
   } catch {
     /* ignore */
   }
   micStream = null;
-  cancelAnimationFrame(energyRaf);
-  try {
-    void energyCtx?.close();
-  } catch {
-    /* ignore */
-  }
-  energyCtx = null;
   if (audioEl) {
     try {
       audioEl.pause();

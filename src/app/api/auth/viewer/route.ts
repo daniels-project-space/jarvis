@@ -42,6 +42,12 @@ export async function POST(req: NextRequest) {
   }
 
   const refreshOwner = Number(ownerSession.expiresAt ?? 0) < Date.now() + REFRESH_WINDOW_MS;
+  // The Project Hub loads JARVIS in a first-party-controlled iframe. The
+  // owner session is minted only from JARVIS itself, but it must be eligible
+  // to travel with that embed; SameSite=Strict silently turned every embed
+  // request into an anonymous 401. Re-issue on viewer bootstrap so existing
+  // devices migrate off the old Strict cookie without a sign-out/login dance.
+  const needsEmbedCookie = ownerSession.valid && !!ownerToken && !!authTokenHash;
   if (refreshOwner && !setOwnerCookie) {
     const refreshed = await controlMutation("controlAuth:refreshSession", { tokenHash: authTokenHash }).catch(() => null);
     if (!refreshed) return Response.json({ ok: false }, { status: 503 });
@@ -54,11 +60,11 @@ export async function POST(req: NextRequest) {
     { ok: true, viewerToken: issued.token, expiresAt: issued.expiresAt },
     { headers: { "cache-control": "no-store" } },
   );
-  if (setOwnerCookie || refreshOwner) {
+  if (setOwnerCookie || refreshOwner || needsEmbedCookie) {
     response.cookies.set(ADMIN_COOKIE, ownerToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
-      sameSite: "strict",
+      sameSite: "none",
       path: "/",
       maxAge: ADMIN_SESSION_SECONDS,
     });

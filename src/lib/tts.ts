@@ -1,305 +1,197 @@
 "use client";
-// Text-lane voice: fetches ElevenLabs/Kokoro audio from /api/tts and plays it
-// through WebAudio with a sentence queue, driving the orb from live amplitude.
-// stopSpeaking() halts playback instantly (stop button / barge-in).
 
-let audioCtx: AudioContext | null = null;
-let unlocked = false;
-let currentSrc: AudioBufferSourceNode | null = null;
-let queue: string[] = [];
+// Zero-cost speech output. Jarvis uses the browser/OS speech engine only: no
+// text is sent to ElevenLabs, Replicate, OpenAI audio, or another TTS provider.
+
+let generation = 0;
 let draining = false;
-let generation = 0; // bumped on stop — cancels queued sentences
+let currentUtterance: SpeechSynthesisUtterance | null = null;
+let queue: string[] = [];
+let cachedVoice: SpeechSynthesisVoice | null = null;
 
-// ── self-trigger protection ─────────────────────────────────────────────────
-// WebAudio output escapes the browser's echo canceller on some platforms, so
-// the mic can hear JARVIS talk. Industry-standard fix: gate input detectors
-// while speaking AND drop transcripts that match what was just said.
 type Recent = { text: string; until: number };
 let recentUtterances: Recent[] = [];
-const norm = (s: string) =>
-  s.toLowerCase().replace(/[^a-z0-9\s']/g, " ").split(/\s+/).filter((w) => w.length > 1);
-function trackUtterance(text: string, durMs: number) {
+
+const words = (text: string) =>
+  text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s']/g, " ")
+    .split(/\s+/)
+    .filter((word) => word.length > 1);
+
+function trackUtterance(text: string, durationMs: number) {
   const now = Date.now();
-  recentUtterances = recentUtterances.filter((r) => r.until > now);
-  recentUtterances.push({ text, until: now + durMs + 5000 });
+  recentUtterances = recentUtterances.filter((row) => row.until > now);
+  recentUtterances.push({ text, until: now + durationMs + 5_000 });
 }
-// True when `input` is (mostly) an echo of something JARVIS spoke recently.
+
 export function isEchoOfTts(input: string): boolean {
   const now = Date.now();
-  recentUtterances = recentUtterances.filter((r) => r.until > now);
-  const inTok = norm(input);
-  if (inTok.length < 3) return false; // short commands ("stop", "yes") always pass
-  for (const r of recentUtterances) {
-    const spoken = new Set(norm(r.text));
+  recentUtterances = recentUtterances.filter((row) => row.until > now);
+  const inputWords = words(input);
+  if (inputWords.length < 3) return false;
+  for (const row of recentUtterances) {
+    const spoken = new Set(words(row.text));
     if (!spoken.size) continue;
-    const hits = inTok.filter((t) => spoken.has(t)).length;
-    if (hits / inTok.length >= 0.65) return true;
+    const matches = inputWords.filter((word) => spoken.has(word)).length;
+    if (matches / inputWords.length >= 0.65) return true;
   }
   return false;
 }
 
-function ctx(): AudioContext {
-  if (!audioCtx) audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-  return audioCtx;
+function pickVoice(): SpeechSynthesisVoice | null {
+  if (cachedVoice) return cachedVoice;
+  const voices = window.speechSynthesis?.getVoices?.() ?? [];
+  if (!voices.length) return null;
+  const preferences = [
+    /Google UK English Male/i,
+    /(Daniel|Arthur|George|Ryan).*en[-_]?GB/i,
+    /Microsoft (Ryan|George|Thomas)/i,
+    /en[-_]?GB.*(Male|Natural|Neural)/i,
+    /en[-_]?GB/i,
+    /British/i,
+    /Google US English/i,
+  ];
+  for (const preference of preferences) {
+    const voice = voices.find((candidate) => preference.test(`${candidate.name} ${candidate.lang}`));
+    if (voice) return (cachedVoice = voice);
+  }
+  return (cachedVoice = voices.find((voice) => /^en/i.test(voice.lang)) ?? voices[0] ?? null);
 }
 
-// Boot the server TTS model early. Kokoro cold-starts on Replicate (~4s vs ~1.5s
-// warm); firing a tiny synth the moment Daniel sends/taps mic boots the container
-// IN PARALLEL with the LLM turn, so the real read-out lands warm. Throttled — a
-// live conversation keeps it warm on its own, so this only bites the first turn
-// after an idle gap.
-let lastPrewarm = 0;
 export function prewarmTts() {
-  const now = Date.now();
-  if (now - lastPrewarm < 45_000) return;
-  lastPrewarm = now;
   try {
-    const provider = typeof localStorage !== "undefined" ? localStorage.getItem("jarvis_tts") || "free" : "free";
-    if (provider === "fast") return; // browser voice has no server to warm
-    fetch("/api/tts", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text: ".", provider }),
-      keepalive: true,
-    }).catch(() => {});
+    window.speechSynthesis?.getVoices();
   } catch {
-    /* ignore */
+    /* unsupported browser */
   }
 }
 
-// Call on a user gesture (send/mic tap) to unlock autoplay on iOS.
 export async function warm() {
+  if (typeof window === "undefined" || !window.speechSynthesis) return;
   prewarmTts();
-  try {
-    // preload speech voices (getVoices is async on first load) so the fast
-    // path has its British voice ready instantly
-    if (typeof window !== "undefined" && window.speechSynthesis) {
-      window.speechSynthesis.getVoices();
-      window.speechSynthesis.onvoiceschanged = () => {
-        cachedVoice = null;
-        window.speechSynthesis.getVoices();
-      };
-    }
-    const c = ctx();
-    await c.resume();
-    if (!unlocked) {
-      const b = c.createBuffer(1, 1, 22050);
-      const s = c.createBufferSource();
-      s.buffer = b;
-      s.connect(c.destination);
-      s.start(0);
-      unlocked = true;
-    }
-  } catch {
-    /* ignore */
-  }
+  window.speechSynthesis.onvoiceschanged = () => {
+    cachedVoice = null;
+    window.speechSynthesis.getVoices();
+  };
 }
 
 export function stopSpeaking() {
   generation++;
   queue = [];
-  try {
-    currentSrc?.stop();
-  } catch {
-    /* already stopped */
-  }
-  currentSrc = null;
+  currentUtterance = null;
+  draining = false;
   try {
     window.speechSynthesis?.cancel();
   } catch {
-    /* ignore */
+    /* unsupported browser */
   }
+  void import("./wakeword").then((module) => module.setSuppressed?.(false)).catch(() => {});
 }
 
-// Instant on-device voice (Web Speech API): ZERO network latency — this is the
-// "fast" path. Picks the best British male voice available, drives the orb with
-// a synthetic amplitude, and honours barge-in via generation.
-let cachedVoice: SpeechSynthesisVoice | null = null;
-function pickVoice(): SpeechSynthesisVoice | null {
-  if (cachedVoice) return cachedVoice;
-  const vs = window.speechSynthesis?.getVoices?.() ?? [];
-  if (!vs.length) return null;
-  const pref = [
-    /Google UK English Male/i, /en-GB.*(Ryan|George|Daniel|Arthur)/i, /Daniel/i, /(George|Arthur).*en-?GB/i,
-    /Microsoft (Ryan|George|Thomas)/i, /en-GB/i, /British/i, /Google US English/i,
-  ];
-  for (const p of pref) {
-    const v = vs.find((x) => p.test(`${x.name} ${x.lang}`));
-    if (v) return (cachedVoice = v);
-  }
-  return (cachedVoice = vs.find((x) => /^en/i.test(x.lang)) ?? vs[0] ?? null);
+export function isSpeaking() {
+  return draining || Boolean(window.speechSynthesis?.speaking);
 }
-function speakBrowser(text: string, onEnergy: (e: number) => void, onStart?: () => void, onEnd?: () => void): Promise<void> {
+
+export function sentences(text: string): string[] {
+  const result: string[] = [];
+  let buffer = "";
+  for (const part of text.split(/(?<=[.!?])\s+(?=[A-Z0-9£"'])/)) {
+    buffer = buffer ? `${buffer} ${part}` : part;
+    if (buffer.length >= 24) {
+      result.push(buffer);
+      buffer = "";
+    }
+  }
+  if (buffer.trim()) result.push(buffer);
+  return result;
+}
+
+function speakOne(
+  text: string,
+  expectedGeneration: number,
+  onEnergy: (energy: number) => void,
+  onStart?: () => void,
+): Promise<void> {
   return new Promise((resolve) => {
     const synth = window.speechSynthesis;
-    if (!synth) return resolve();
-    const gen = generation;
-    const u = new SpeechSynthesisUtterance(text);
-    const v = pickVoice();
-    if (v) u.voice = v;
-    u.lang = v?.lang || "en-GB";
-    u.rate = 1.04;
-    u.pitch = 1.0;
+    if (!synth || expectedGeneration !== generation) return resolve();
+    const utterance = new SpeechSynthesisUtterance(text);
+    currentUtterance = utterance;
+    const voice = pickVoice();
+    if (voice) utterance.voice = voice;
+    utterance.lang = voice?.lang || "en-GB";
+    const tone = text.toLowerCase();
+    // Web Speech has no emotion markup, but careful prosody makes the free
+    // on-device voice feel far less flat without shipping text to a provider.
+    if (/\b(urgent|careful|risk|serious|honestly|numbers|weak plan)\b/.test(tone)) {
+      utterance.rate = 0.99;
+      utterance.pitch = 0.9;
+    } else if (/\b(sorry|rough|tired|stressed|gentle|here with you)\b/.test(tone)) {
+      utterance.rate = 0.97;
+      utterance.pitch = 0.93;
+    } else if (/\b(ha|haha|brilliant|lets go|let's go|excited|love it)\b/.test(tone)) {
+      utterance.rate = 1.1;
+      utterance.pitch = 1.03;
+    } else {
+      utterance.rate = 1.06;
+      utterance.pitch = 0.96;
+    }
     let energyTimer: ReturnType<typeof setInterval> | null = null;
-    let t0 = 0;
-    u.onstart = () => {
+    let startedAt = 0;
+    utterance.onstart = () => {
       onStart?.();
-      t0 = performance.now();
-      // synthetic mouth-movement amplitude for the orb (no real analyser here)
+      startedAt = performance.now();
       energyTimer = setInterval(() => {
-        if (gen !== generation) return;
-        const e = 0.28 + 0.32 * Math.abs(Math.sin((performance.now() - t0) / 130)) * (0.6 + 0.4 * Math.random());
-        onEnergy(Math.min(1, e));
+        if (expectedGeneration !== generation) return;
+        const phase = (performance.now() - startedAt) / 125;
+        onEnergy(Math.min(1, 0.25 + 0.34 * Math.abs(Math.sin(phase))));
       }, 60);
     };
     const done = () => {
       if (energyTimer) clearInterval(energyTimer);
+      if (currentUtterance === utterance) currentUtterance = null;
       onEnergy(0);
-      onEnd?.();
       resolve();
     };
-    u.onend = done;
-    u.onerror = done;
-    if (gen !== generation) return resolve();
-    synth.speak(u);
+    utterance.onend = done;
+    utterance.onerror = done;
+    synth.speak(utterance);
   });
 }
 
-export function isSpeaking() {
-  return draining || currentSrc !== null;
-}
-
-// Split text into speakable chunks (sentence boundaries, abbreviation-safe).
-export function sentences(text: string): string[] {
-  const out: string[] = [];
-  let buf = "";
-  for (const part of text.split(/(?<=[.!?])\s+(?=[A-Z0-9£"'])/)) {
-    buf = buf ? `${buf} ${part}` : part;
-    if (buf.length >= 24) {
-      out.push(buf);
-      buf = "";
-    }
-  }
-  if (buf.trim()) out.push(buf);
-  return out;
-}
-
-async function playBuffer(arr: ArrayBuffer, onEnergy: (e: number) => void, spokenText?: string): Promise<void> {
-  const c = ctx();
-  await c.resume();
-  const decoded = await c.decodeAudioData(arr);
-  if (spokenText) trackUtterance(spokenText, decoded.duration * 1000);
-  return new Promise((resolve) => {
-    const src = c.createBufferSource();
-    src.buffer = decoded;
-    const analyser = c.createAnalyser();
-    analyser.fftSize = 256;
-    src.connect(analyser);
-    analyser.connect(c.destination);
-    const data = new Uint8Array(analyser.frequencyBinCount);
-    currentSrc = src;
-    let playing = true;
-    const tick = () => {
-      if (!playing) return;
-      analyser.getByteTimeDomainData(data);
-      let sum = 0;
-      for (const v of data) {
-        const n = (v - 128) / 128;
-        sum += n * n;
-      }
-      onEnergy(Math.min(1, Math.sqrt(sum / data.length) * 3));
-      requestAnimationFrame(tick);
-    };
-    src.onended = () => {
-      playing = false;
-      onEnergy(0);
-      if (currentSrc === src) currentSrc = null;
-      resolve();
-    };
-    src.start();
-    tick();
-  });
-}
-
-async function fetchAudio(text: string): Promise<ArrayBuffer | null> {
-  try {
-    const provider = typeof localStorage !== "undefined" ? localStorage.getItem("jarvis_tts") || undefined : undefined;
-    const r = await fetch("/api/tts", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text, provider }),
-    });
-    if (!r.ok) return null;
-    return await r.arrayBuffer();
-  } catch {
-    return null;
-  }
-}
-
-// Queue sentences and drain sequentially, prefetching the next while speaking.
 export async function speak(
   text: string,
-  onEnergy: (e: number) => void,
+  onEnergy: (energy: number) => void,
   onStart?: () => void,
   onEnd?: () => void,
 ): Promise<void> {
-  trackUtterance(text, Math.min(90_000, text.length * 70)); // whole-utterance echo window (appended text too)
-  // FAST PATH (default): instant on-device speech, zero network round-trip.
-  // Kokoro on Replicate cold-starts for many seconds — this is why JARVIS
-  // "took too long to talk". Hosted providers stay available in options.
-  const provider = typeof localStorage !== "undefined" ? localStorage.getItem("jarvis_tts") || "free" : "free";
-  if (provider === "fast" && typeof window !== "undefined" && window.speechSynthesis) {
-    if (draining) {
-      if (/jarvis/i.test(text)) import("./wakeword").then((m) => m.setSuppressed?.(true, true)).catch(() => {});
-      queue.push(...sentences(text));
-      return;
-    }
-    draining = true;
-    const fgen = generation;
-    import("./wakeword").then((m) => m.setSuppressed?.(true, /jarvis/i.test(text))).catch(() => {});
-    await speakBrowser(text, onEnergy, onStart, onEnd);
-    // drain any sentences appended mid-speech (barge-in bumps generation)
-    while (queue.length && generation === fgen) {
-      const next = queue.shift()!;
-      await speakBrowser(next, onEnergy);
-    }
-    draining = false;
-    setTimeout(() => import("./wakeword").then((m) => m.setSuppressed?.(false)).catch(() => {}), 700);
+  if (typeof window === "undefined" || !window.speechSynthesis) {
+    onEnd?.();
     return;
   }
+  trackUtterance(text, Math.min(90_000, text.length * 70));
   queue.push(...sentences(text));
-  if (draining) {
-    // the first caller's drain loop speaks this text — but if it contains
-    // "jarvis", escalate the wake gate to HARD or the readout self-wakes
-    if (/jarvis/i.test(text)) import("./wakeword").then((m) => m.setSuppressed?.(true, true)).catch(() => {});
-    return;
-  }
+  if (draining) return;
+
   draining = true;
-  const gen = generation;
-  onStart?.();
-  // Gate the wake detector while speaking: HARD if the reply itself contains
-  // "jarvis" (would self-wake), SOFT otherwise — so Daniel saying a bare
-  // "hey jarvis" still barges in and shuts him up.
-  import("./wakeword").then((m) => m.setSuppressed?.(true, /jarvis/i.test(text))).catch(() => {});
-  let pendingText = "";
-  let pending: Promise<ArrayBuffer | null> | null = null;
-  while ((queue.length || pending) && gen === generation) {
-    const curText = pending ? pendingText : queue[0] ?? "";
-    const cur = pending ?? (queue.length ? fetchAudio(queue.shift()!) : null);
-    pendingText = queue[0] ?? "";
-    pending = queue.length ? fetchAudio(queue.shift()!) : null; // prefetch next while current plays
-    if (!cur) break;
-    try {
-      const buf = await cur;
-      if (gen !== generation) break;
-      if (buf) await playBuffer(buf, onEnergy, curText);
-    } catch {
-      // ONE bad audio chunk (decode hiccup, truncated stream) must not kill the
-      // rest of the read-out — skip the sentence and carry on
-    }
+  const expectedGeneration = generation;
+  const hardWakeGate = /jarvis/i.test(text);
+  void import("./wakeword").then((module) => module.setSuppressed?.(true, hardWakeGate)).catch(() => {});
+  let started = false;
+  while (queue.length && expectedGeneration === generation) {
+    const next = queue.shift()!;
+    await speakOne(next, expectedGeneration, onEnergy, started ? undefined : () => {
+      started = true;
+      onStart?.();
+    });
   }
-  draining = false;
-  onEnergy(0);
-  setTimeout(() => import("./wakeword").then((m) => m.setSuppressed?.(false)).catch(() => {}), 900);
-  onEnd?.();
+  if (expectedGeneration === generation) {
+    draining = false;
+    onEnergy(0);
+    onEnd?.();
+    setTimeout(() => {
+      void import("./wakeword").then((module) => module.setSuppressed?.(false)).catch(() => {});
+    }, 650);
+  }
 }

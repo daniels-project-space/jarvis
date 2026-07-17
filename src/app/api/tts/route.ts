@@ -1,114 +1,12 @@
-import type { NextRequest } from "next/server";
-import { reportIncident } from "@/lib/context";
-import { getSecret } from "@/lib/vault";
-import { adminSessionHash } from "@/lib/control-session";
-
-// Server TTS for the text lane (live mode speaks natively via OpenAI Realtime).
-// Primary: ElevenLabs flash v2.5 (~150ms, properly human). Fallback: Kokoro on
-// Replicate. Strips markup before synthesis.
+// Speech is deliberately generated on-device with the browser's Web Speech
+// engine. Keeping this retired endpoint prevents stale clients from silently
+// spending ElevenLabs or Replicate credits while they refresh onto the current
+// bundle.
 export const runtime = "nodejs";
-export const maxDuration = 60;
 
-const KOKORO = "f559560eb822dc509045f3921a1921234918b91739db4bf3daab2169b71c7a13";
-// "Daniel" — deep, collected British male. Swap via ELEVENLABS_VOICE_ID.
-const EL_VOICE = process.env.ELEVENLABS_VOICE_ID || "onwK4e9ZLuTAKqWW03F9";
-
-function stripForSpeech(t: string): string {
-  return t
-    .replace(/```[\s\S]*?```/g, " ")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
-    .replace(/^#{1,6}\s*/gm, "")
-    .replace(/^\s*[-*+]\s+/gm, "")
-    .replace(/\*\*([^*]+)\*\*/g, "$1")
-    .replace(/\*([^*]+)\*/g, "$1")
-    .replace(/__([^_]+)__/g, "$1")
-    .replace(/_([^_]+)_/g, "$1")
-    .replace(/~~([^~]+)~~/g, "$1")
-    .replace(/https?:\/\/\S+/g, " ")
-    .replace(
-      /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{FE0F}\u{2705}\u{26A0}]/gu,
-      "",
-    )
-    .replace(/[#*_`>~|]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-async function elevenlabs(text: string): Promise<Response | null> {
-  const key = process.env.ELEVENLABS_API_KEY ?? (await getSecret("elevenlabs", "ELEVENLABS_API_KEY").catch(() => ""));
-  if (!key) return null;
-  const r = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${EL_VOICE}/stream?output_format=mp3_44100_128`,
-    {
-      method: "POST",
-      headers: { "xi-api-key": key, "content-type": "application/json" },
-      body: JSON.stringify({
-        text,
-        model_id: "eleven_flash_v2_5",
-        voice_settings: { stability: 0.45, similarity_boost: 0.8, style: 0.25 },
-      }),
-    },
+export async function POST() {
+  return Response.json(
+    { error: "Hosted TTS is disabled; Jarvis uses free on-device speech." },
+    { status: 410, headers: { "cache-control": "no-store" } },
   );
-  if (!r.ok || !r.body) return null;
-  return new Response(r.body, {
-    headers: { "content-type": "audio/mpeg", "cache-control": "public, max-age=86400" },
-  });
-}
-
-async function kokoro(text: string): Promise<Response | null> {
-  const token = process.env.REPLICATE_API_TOKEN;
-  if (!token) return null;
-  try {
-    const pred = await fetch("https://api.replicate.com/v1/predictions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Prefer: "wait" },
-      // bm_fable = younger, lighter British male (still JARVIS, not the deep
-      // Lewis) with a touch more pace for energy. Override via KOKORO_VOICE.
-      body: JSON.stringify({ version: KOKORO, input: { text, voice: process.env.KOKORO_VOICE || "bm_fable", speed: 1.06 } }),
-    });
-    const j: any = await pred.json().catch(() => ({}));
-    const url = typeof j.output === "string" ? j.output : Array.isArray(j.output) ? j.output[0] : null;
-    if (!url) return null;
-    const buf = await (await fetch(url)).arrayBuffer();
-    return new Response(buf, {
-      headers: { "content-type": "audio/wav", "cache-control": "public, max-age=86400" },
-    });
-  } catch {
-    return null;
-  }
-}
-
-export async function POST(req: NextRequest) {
-  let text = "";
-  let provider = "";
-  try {
-    const b = await req.json();
-    text = b.text;
-    provider = String(b.provider ?? "");
-  } catch {
-    return new Response("bad request", { status: 400 });
-  }
-  const clean = stripForSpeech(String(text || "")).slice(0, 1500);
-  if (!clean) return new Response("empty", { status: 400 });
-
-  // Client preference (options panel) wins, else the env default. Free Kokoro
-  // by default; ElevenLabs is premium/paid per character.
-  const want = provider || process.env.TTS_PROVIDER || "kokoro";
-  const res =
-    want === "elevenlabs"
-      ? ((await elevenlabs(clean)) ?? (await kokoro(clean)))
-      : ((await kokoro(clean)) ?? (await elevenlabs(clean)));
-  if (!res) {
-    await reportIncident(
-      "api/tts",
-      "tts:all-providers-failed",
-      "Both ElevenLabs and Kokoro TTS failed to produce audio.",
-      undefined,
-      (await adminSessionHash(req)) ?? undefined,
-    );
-    return new Response(JSON.stringify({ error: "tts failed" }), { status: 502 });
-  }
-  return res;
 }

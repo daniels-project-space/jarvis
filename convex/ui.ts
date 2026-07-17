@@ -170,7 +170,7 @@ export const setMood = mutation({
     // Mood is alive but not a strobe: a genuine model shift holds ~45s before
     // the next. Daniel's MANUAL picks (options panel) always take instantly.
     if (!a.manual && ex && ex.value !== a.mood && a.mood !== "alert" && Date.now() - (ex.updatedAt ?? 0) < 45_000) return;
-    const doc = { key: "mood", type: "mood", value: a.mood, updatedAt: Date.now() };
+    const doc = { key: "mood", type: "mood", value: a.mood, title: a.manual ? "manual" : "auto", updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
     else await ctx.db.insert("ui", doc);
   },
