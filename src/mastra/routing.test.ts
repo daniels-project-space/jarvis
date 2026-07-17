@@ -20,6 +20,22 @@ describe("routeWork", () => {
     expect(route.model).toBe("opus");
   });
 
+  it("does not accept readonly as a consequential-risk override", () => {
+    const route = routeWork("Send a reply to the customer", { readonly: true });
+    expect(route.approvalRequired).toBe(true);
+    expect(route.risk).toBe("consequential");
+    expect(route.readonly).toBe(true);
+  });
+
+  it("keeps negated security-audit language read-only", () => {
+    const route = routeWork(
+      "Audit whether a worker can send replies. Do not send, publish, or deploy anything.",
+      { readonly: true },
+    );
+    expect(route.approvalRequired).toBe(false);
+    expect(route.readonly).toBe(true);
+  });
+
   it("uses the permanent creative and travel specialists", () => {
     expect(routeWork("Illustrate a storyboard for the launch").agentId).toBe("iris");
     expect(routeWork("Plan a visual trip with flights and hotels").agentId).toBe("maya");
@@ -29,4 +45,3 @@ describe("routeWork", () => {
     expect(routeWork("Production security architecture migration", { requestedModel: "haiku" }).model).toBe("opus");
   });
 });
-

@@ -1,4 +1,5 @@
 import type { AgentSlug, ModelTier, WorkRisk } from "./team";
+import { requestsConsequentialAction } from "../lib/work-safety";
 
 export type WorkRoute = {
   agentId: AgentSlug;
@@ -10,8 +11,6 @@ export type WorkRoute = {
   reason: string;
 };
 
-const consequential =
-  /\b(send|email|contact|publish|post|advertis(?:e|ing)|book|reserve|buy|purchase|order|pay|spend|transfer|trade|withdraw|refund|charge|merge|delete production|destroy|drop (?:table|database)|truncate|rotate (?:a )?(?:key|secret)|change (?:a )?(?:password|credential)|message (?:a |the )?(?:customer|guest|tenant)|reply to (?:a |the )?(?:customer|guest|tenant)|deploy (?:to )?production)\b/i;
 const engineering =
   /\b(code|repo|bug|fix|build|implement|refactor|migrat|database|api|deploy|typescript|react|next\.?js|convex|trigger|mastra|test|ci|architecture)\b/i;
 const operations = /\b(incident|monitor|health|uptime|failed job|stalled|latency|cost|credits|logs?|provider status|production issue)\b/i;
@@ -23,7 +22,7 @@ const trivial = /\b(status|list|locate|read|summari[sz]e|quick check|one[- ]line
 
 export function routeWork(task: string, options?: { repo?: string; requestedModel?: string; readonly?: boolean }): WorkRoute {
   const text = `${task} ${options?.repo ?? ""}`.trim();
-  const isConsequential = options?.readonly === true ? false : consequential.test(text);
+  const isConsequential = requestsConsequentialAction(text);
   let agentId: AgentSlug = "atlas";
   if (travel.test(text)) agentId = "maya";
   else if (creative.test(text)) agentId = "iris";
