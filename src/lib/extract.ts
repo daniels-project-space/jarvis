@@ -1,6 +1,7 @@
 import "server-only";
 import { convexMutation } from "./context";
 import { vaultWrite } from "./obsidian";
+import { MEMORY_SECRET_POLICY, redactSecrets, safeMemoryNote } from "./memory-safety";
 
 // Post-turn memory capture — decoupled from the reply (the sleep-time pattern).
 // Used by /api/chat after every text turn and /api/extract after live turns.
@@ -21,9 +22,10 @@ export async function extractMemory(key: string, userText: string, assistantText
             role: "user",
             content:
               "Extract ONLY durable facts, preferences, or decisions worth remembering long-term about Daniel or his projects from this exchange. " +
+              MEMORY_SECRET_POLICY + " " +
               'Reply with STRICT JSON: {"items":[{"kind":"fact|preference|decision|project","title":"...","body":"..."}]} — items may be empty. ' +
               'Example: {"items":[{"kind":"preference","title":"Short replies","body":"Daniel wants replies under two sentences."}]}\n\n' +
-              `User: ${userText}\nAssistant: ${assistantText}`,
+              `User: ${redactSecrets(userText)}\nAssistant: ${redactSecrets(assistantText)}`,
           },
         ],
       }),
@@ -33,13 +35,15 @@ export async function extractMemory(key: string, userText: string, assistantText
     let n = 0;
     for (const it of (Array.isArray(items) ? items : []).slice(0, 4)) {
       if (!it?.title || !it?.body || !it?.kind) continue;
+      const note = safeMemoryNote(it.title, it.body);
+      if (!note) continue;
       await convexMutation("memory:write", {
         kind: String(it.kind),
-        title: String(it.title).slice(0, 120),
-        body: String(it.body).slice(0, 1200),
+        title: note.title,
+        body: note.body,
         tags: [],
       });
-      await vaultWrite(String(it.kind), String(it.title), String(it.body)); // real-time Obsidian
+      await vaultWrite(String(it.kind), note.title, note.body); // real-time Obsidian
       n++;
     }
     return n;

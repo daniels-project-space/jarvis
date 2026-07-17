@@ -1,4 +1,5 @@
 import "server-only";
+import { safeMemoryNote } from "./memory-safety";
 
 // Real-time Obsidian sync: every memory JARVIS saves is committed straight to
 // the git-backed vault (daniels-project-space/jarvis-memory) via the GitHub
@@ -23,8 +24,10 @@ const slug = (s: string) =>
     .slice(0, 50);
 
 export async function vaultWrite(kind: string, title: string, body: string, project?: string): Promise<boolean> {
+  const note = safeMemoryNote(title, body);
+  if (!note) return false;
   const token = process.env.GITHUB_TOKEN;
-  const s = slug(title);
+  const s = slug(note.title);
   if (!token || !s) return false;
   // project-scoped notes live under the project's own folder — the vault
   // carries each project (characters, decisions, world details) forever
@@ -34,12 +37,12 @@ export async function vaultWrite(kind: string, title: string, body: string, proj
   const md = [
     `---`,
     `type: ${kind}`,
-    `title: ${JSON.stringify(String(title))}`,
+    `title: ${JSON.stringify(note.title)}`,
     `updated: ${date}`,
     `---`,
-    `# ${String(title).replace(/[*#`_]/g, "")}`,
+    `# ${note.title.replace(/[*#`_]/g, "")}`,
     ``,
-    String(body).replace(/[*#`_]/g, "").trim(),
+    note.body.replace(/[*#`_]/g, "").trim(),
     ``,
     `Links: [[index]]`,
   ].join("\n");
@@ -56,7 +59,7 @@ export async function vaultWrite(kind: string, title: string, body: string, proj
       method: "PUT",
       headers,
       body: JSON.stringify({
-        message: `memory: ${String(title).slice(0, 60)}`,
+        message: `memory: ${note.title.slice(0, 60)}`,
         content: Buffer.from(md, "utf8").toString("base64"),
         ...(sha ? { sha } : {}),
       }),

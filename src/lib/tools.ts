@@ -3392,15 +3392,18 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
     case "read_url":
       return await readUrl(String(args.url));
     case "remember": {
+      const { safeMemoryNote } = await import("./memory-safety");
+      const note = safeMemoryNote(args.title, args.body);
+      if (!note) return "I won't save credentials or likely secrets to memory. Store them in the credential vault instead.";
       const project = args.project ? String(args.project).slice(0, 50) : undefined;
       await convexMutation("memory:write", {
         kind: String(args.kind ?? "fact"),
-        title: String(args.title).slice(0, 120),
-        body: String(args.body).slice(0, 1200),
+        title: note.title,
+        body: note.body,
         tags: [...(Array.isArray(args.tags) ? args.tags.map(String) : []), ...(project ? [project] : [])].slice(0, 6),
       });
       const { vaultWrite } = await import("./obsidian");
-      await vaultWrite(String(args.kind ?? "fact"), String(args.title), String(args.body), project);
+      await vaultWrite(String(args.kind ?? "fact"), note.title, note.body, project);
       return project ? `Saved to memory (filed under project ${project}).` : "Saved to memory.";
     }
     case "project_goal":

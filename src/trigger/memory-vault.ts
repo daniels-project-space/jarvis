@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { githubGitEnv, githubRepoUrl } from "./git-transport";
+import { redactSecrets, safeMemoryNote } from "../lib/memory-safety";
 
 // Obsidian memory vault: consolidates JARVIS's memory into a git-backed,
 // categorised, wikilinked Obsidian vault (daniels-project-space/jarvis-memory) —
@@ -12,6 +13,11 @@ import { githubGitEnv, githubRepoUrl } from "./git-transport";
 const CONVEX =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
 const REPO = "daniels-project-space/jarvis-memory";
+
+type MemoryRow = { kind?: unknown; title?: unknown; body?: unknown; tags?: unknown[] };
+type InsightRow = { text?: unknown };
+type BusinessRow = { domain?: unknown; headline?: unknown; detail?: unknown };
+type ProjectRow = { slug?: unknown; status?: unknown; summary?: unknown; data?: { recent?: unknown } };
 
 async function q(path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
@@ -40,13 +46,13 @@ function sh(cmd: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code
     p.on("error", () => res({ code: -1, out: o }));
   });
 }
-const slug = (s: string) =>
+const slug = (s: unknown) =>
   String(s || "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 50);
-const clean = (s: string) => String(s || "").replace(/[*#`_>]/g, "").trim();
+const clean = (s: unknown) => redactSecrets(s).replace(/[*#`_>]/g, "").trim();
 
 export const memoryVault = schedules.task({
   id: "jarvis-memory-vault",
@@ -65,10 +71,10 @@ export const memoryVault = schedules.task({
     await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
     await sh("git", ["-C", dir, "config", "user.name", "JARVIS"], env);
 
-    const mem: any[] = (await q("memory:recent", { limit: 60 })) ?? [];
-    const ins: any[] = (await q("business:recentInsights", { limit: 10 })) ?? [];
-    const biz: any[] = (await q("business:list", {})) ?? [];
-    const stack: any[] = (await q("projectState:list", {})) ?? [];
+    const mem = ((await q("memory:recent", { limit: 60 })) as MemoryRow[] | null) ?? [];
+    const ins = ((await q("business:recentInsights", { limit: 10 })) as InsightRow[] | null) ?? [];
+    const biz = ((await q("business:list", {})) as BusinessRow[] | null) ?? [];
+    const stack = ((await q("projectState:list", {})) as ProjectRow[] | null) ?? [];
     const date = new Date().toISOString().slice(0, 10);
     for (const f of ["60-logs", "70-metrics", "20-projects", "30-decisions", "80-facts", "00-MOCs"])
       mkdirSync(join(dir, f), { recursive: true });
@@ -79,17 +85,21 @@ export const memoryVault = schedules.task({
       `# Log ${date}`,
       "",
       "## Insights noticed",
-      ...(ins.length ? ins.map((i: any) => `- ${clean(i.text)}`) : ["- (none)"]),
+      ...(ins.length ? ins.map((i) => `- ${clean(i.text)}`) : ["- (none)"]),
       "",
       "## Remembered",
-      ...mem.slice(0, 15).map((m: any) => `- **${clean(m.title)}** — ${clean(m.body)}`),
+      ...mem
+        .slice(0, 15)
+        .map((m) => safeMemoryNote(m.title, m.body))
+        .filter((note): note is { title: string; body: string } => Boolean(note))
+        .map((note) => `- **${clean(note.title)}** — ${clean(note.body)}`),
       "",
       "Links: [[index]]",
     ];
     writeFileSync(join(dir, "60-logs", `${date}.md`), log.join("\n"));
 
     // rental metric snapshot, wikilinked to its project node
-    const rental = biz.find((b: any) => b.domain === "rental");
+    const rental = biz.find((b) => b.domain === "rental");
     if (rental) {
       writeFileSync(
         join(dir, "70-metrics", `rental-${date}.md`),
@@ -130,16 +140,18 @@ export const memoryVault = schedules.task({
     for (const m of mem) {
       const kind = String(m.kind || "fact");
       if (!["fact", "preference", "decision", "project", "knowledge"].includes(kind)) continue;
+      const note = safeMemoryNote(m.title, m.body);
+      if (!note) continue;
       const folder = kind === "decision" ? "30-decisions" : kind === "project" ? "20-projects" : "80-facts";
-      const s = slug(m.title);
+      const s = slug(note.title);
       if (!s) continue;
       writeFileSync(
         join(dir, folder, `${s}.md`),
         [
-          `---\ntype: ${kind}\ntitle: ${JSON.stringify(String(m.title))}\ntags: [${(m.tags || []).join(", ")}]\nupdated: ${date}\n---`,
-          `# ${clean(m.title)}`,
+          `---\ntype: ${kind}\ntitle: ${JSON.stringify(note.title)}\ntags: [${(m.tags || []).map(clean).join(", ")}]\nupdated: ${date}\n---`,
+          `# ${clean(note.title)}`,
           "",
-          clean(m.body),
+          clean(note.body),
           "",
           "Links: [[index]]",
         ].join("\n"),
