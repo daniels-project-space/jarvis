@@ -26,6 +26,7 @@ import type * as missions from "../missions.js";
 import type * as projectIntelligence from "../projectIntelligence.js";
 import type * as projectState from "../projectState.js";
 import type * as push from "../push.js";
+import type * as reflexContext from "../reflexContext.js";
 import type * as reminders from "../reminders.js";
 import type * as ui from "../ui.js";
 import type * as visualContext from "../visualContext.js";
@@ -60,6 +61,7 @@ declare const fullApi: ApiFromModules<{
   projectIntelligence: typeof projectIntelligence;
   projectState: typeof projectState;
   push: typeof push;
+  reflexContext: typeof reflexContext;
   reminders: typeof reminders;
   ui: typeof ui;
   visualContext: typeof visualContext;

@@ -101,18 +101,30 @@ async function prepareKokoro(): Promise<boolean> {
   return kokoroLoading;
 }
 
-function scheduleKokoroWarm() {
+function scheduleKokoroWarm(immediate = false) {
   if (kokoroWarmScheduled || kokoro || ttsMode !== "kokoro") return;
   kokoroWarmScheduled = true;
+  // The local neural model is intentionally never initialised in the small
+  // window where a typed message is waiting for its first response. That work
+  // can briefly occupy the browser's main thread on lower-powered devices,
+  // which made JARVIS look frozen even though the text lane was healthy.
+  const startWhenIdle = () => {
+    const run = () => {
+      kokoroWarmScheduled = false;
+      void prepareKokoro();
+    };
+    const idle = (window as typeof window & { requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number }).requestIdleCallback;
+    if (idle) idle(run, { timeout: 8_000 });
+    else window.setTimeout(run, 500);
+  };
   window.setTimeout(() => {
-    kokoroWarmScheduled = false;
-    void prepareKokoro();
-  }, 350);
+    startWhenIdle();
+  }, immediate ? 120 : 3_500);
 }
 
-export function setTtsMode(mode: TtsMode) {
+export function setTtsMode(mode: TtsMode, warmNow = false) {
   ttsMode = mode;
-  if (mode === "kokoro") scheduleKokoroWarm();
+  if (mode === "kokoro") scheduleKokoroWarm(warmNow);
 }
 
 export async function warm() {

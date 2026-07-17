@@ -218,3 +218,30 @@ export async function buildContext(
     conversation: Array.isArray(brain?.conversation) ? brain.conversation : undefined,
   };
 }
+
+// A deliberately small context for the instant Realtime text lane. The rich
+// snapshot remains the source for durable work and live sessions; this one is
+// only for the first conversational response, where a full control-plane scan
+// turns an otherwise-warm connection into a noticeable freeze.
+export async function buildReflexContext(): Promise<{ block: string; conversation: any[] }> {
+  const brain = await q(CONVEX_URL, "reflexContext:snapshot");
+  const memory = Array.isArray(brain?.memory) ? brain.memory : [];
+  const panel = brain?.panel;
+  const lines: string[] = [];
+  if (memory.length) lines.push("Remember:\n" + memory.map((m: any) => `- ${m.title}: ${m.body}`).join("\n"));
+  if (panel?.type) {
+    let label = panel.title ?? panel.type;
+    if (panel.type === "widget") {
+      try {
+        label = JSON.parse(panel.value)?.title ?? JSON.parse(panel.value)?.kind ?? label;
+      } catch {
+        /* keep the safe panel label */
+      }
+    }
+    lines.push(`On screen now: ${label}. Keep it up for relevant follow-ups unless Daniel asks to replace or close it.`);
+  }
+  return {
+    block: lines.join("\n\n").slice(0, 1_400),
+    conversation: Array.isArray(brain?.conversation) ? brain.conversation : [],
+  };
+}

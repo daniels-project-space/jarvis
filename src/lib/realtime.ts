@@ -109,6 +109,7 @@ let reflexStarting: Promise<boolean> | null = null;
 let reflexAudioContext: AudioContext | null = null;
 let reflexSilentStream: MediaStream | null = null;
 let reflexHandlers: ReflexHandlers | null = null;
+let queuedReflexText: string | null = null;
 
 function silentAudioStream(): MediaStream {
   // The SDK's WebRTC transport requires an audio track to negotiate the peer
@@ -145,7 +146,52 @@ export function sendReflexText(text: string): boolean {
   }
 }
 
+// A page can receive a typed message during the 1–2 second WebRTC handshake.
+// Previously that race dropped straight into the durable job queue, making the
+// interface look frozen despite the fast lane being moments from ready. Hold
+// exactly one turn locally and flush it the instant the peer connects.
+export function queueReflexText(text: string): boolean {
+  if (sendReflexText(text)) return true;
+  if (queuedReflexText) return false;
+  queuedReflexText = text;
+  return true;
+}
+
+export function cancelQueuedReflexText(text?: string) {
+  if (!text || queuedReflexText === text) queuedReflexText = null;
+}
+
+function flushQueuedReflexText() {
+  const text = queuedReflexText;
+  if (!text || !sendReflexText(text)) return false;
+  queuedReflexText = null;
+  return true;
+}
+
 export function stopReflex() {
+  try {
+    reflexSession?.close();
+  } catch {
+    /* ignore */
+  }
+  reflexSession = null;
+  reflexTransport = null;
+  try {
+    reflexSilentStream?.getTracks().forEach((track) => track.stop());
+  } catch {
+    /* ignore */
+  }
+  reflexSilentStream = null;
+  try {
+    void reflexAudioContext?.close();
+  } catch {
+    /* ignore */
+  }
+  reflexAudioContext = null;
+  queuedReflexText = null;
+}
+
+function resetReflexConnection() {
   try {
     reflexSession?.close();
   } catch {
@@ -178,7 +224,8 @@ export async function startReflex(h: ReflexHandlers, clientId = ""): Promise<boo
   reflexStarting = (async () => {
     h.onState("connecting");
     try {
-      stopReflex();
+      // Do not discard a typed turn queued during this very handshake.
+      resetReflexConnection();
       const [response, coreTools] = await Promise.all([
         fetch("/api/realtime-token", {
           method: "POST",
@@ -263,16 +310,17 @@ export async function startReflex(h: ReflexHandlers, clientId = ""): Promise<boo
       });
       nextSession.on("error", (event: any) => {
         const detail = String(event?.error?.message ?? event?.message ?? event?.error ?? event);
-        stopReflex();
+        resetReflexConnection();
         reflexHandlers?.onState("error", detail);
       });
       await nextSession.connect({ apiKey: token.token });
       // Keep the synthetic negotiation track disabled for the entire session.
       nextSession.mute(true);
       reflexHandlers?.onState("ready");
+      flushQueuedReflexText();
       return true;
     } catch (error: any) {
-      stopReflex();
+      resetReflexConnection();
       reflexHandlers?.onState("error", String(error?.message ?? error));
       return false;
     } finally {

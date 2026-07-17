@@ -1336,7 +1336,7 @@ export default function JarvisUI() {
     setPrefs((p) => ({ ...p, [k]: v }));
     const key = k === "voice" ? "jarvis_voice" : k === "tts" ? "jarvis_tts" : k === "reduceMotion" ? "jarvis_reduce_motion" : "jarvis_live_default";
     localStorage.setItem(key, typeof v === "boolean" ? (v ? "1" : "0") : String(v));
-    if (k === "tts") void import("../lib/tts").then((module) => module.setTtsMode(v === "system" ? "system" : "kokoro"));
+    if (k === "tts") void import("../lib/tts").then((module) => module.setTtsMode(v === "system" ? "system" : "kokoro", true));
     if (k === "liveDefault" && v === true) liveAutoStarted.current = false;
   };
   const refreshPermissions = async () => {
@@ -1791,6 +1791,7 @@ export default function JarvisUI() {
     reflexPendingRef.current = null;
     if (pending.watchdog) clearTimeout(pending.watchdog);
     const realtime = await import("../lib/realtime");
+    realtime.cancelQueuedReflexText(pending.text);
     realtime.interruptReflex();
     await queueDurableTurn(pending.text);
   }
@@ -1994,20 +1995,28 @@ export default function JarvisUI() {
       return;
     }
     const realtime = await import("../lib/realtime");
-    if (!reflexPendingRef.current && realtime.sendReflexText(t)) {
+    if (!reflexPendingRef.current) {
       const pending = {
         text: t,
         startedAt: performance.now(),
         firstToken: false,
         watchdog: null as ReturnType<typeof setTimeout> | null,
       };
-      reflexPendingRef.current = pending;
-      setSending(true);
-      showCaption({ who: "you", text: t });
-      // A dead-but-not-yet-reported peer must never swallow a message. If no
-      // model text arrives, cancel it and hand the untouched turn to Codex.
-      pending.watchdog = setTimeout(() => void fallbackReflexTurn(), 2_000);
-      return;
+      // Accept the turn even while the warm peer is finishing its WebRTC
+      // handshake. The module flushes this one local slot on `ready`; without
+      // it, an early first message took the slow durable route and looked like
+      // a frozen JARVIS screen.
+      if (realtime.queueReflexText(t)) {
+        reflexPendingRef.current = pending;
+        setSending(true);
+        showCaption({ who: "you", text: t });
+        // A genuinely dead peer must never swallow a message. The brief window
+        // covers a cold reconnect while staying well below the old multi-second
+        // silent stall before durable recovery takes over.
+        pending.watchdog = setTimeout(() => void fallbackReflexTurn(), 2_800);
+        void bootReflex();
+        return;
+      }
     }
     void bootReflex();
     await queueDurableTurn(t);

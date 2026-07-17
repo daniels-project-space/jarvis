@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { PERSONA, VOICE_CAPABILITIES, REMEMBER } from "@/lib/persona";
-import { buildContext, convexMutation } from "@/lib/context";
+import { buildContext, buildReflexContext, convexMutation } from "@/lib/context";
 import { getSecret } from "@/lib/vault";
 import { STT_PROMPT } from "@/lib/sttvocab";
 import { adminSessionHash, validateAdminSession } from "@/lib/control-session";
@@ -31,7 +31,7 @@ async function handlePost(req: NextRequest) {
   if (!client) client = `anon-${Math.random().toString(36).slice(2, 8)}`;
   const [got, ctx] = await Promise.all([
     mode === "live" ? convexMutation("ui:setLiveOn", { client, on: true }).catch(() => true) : Promise.resolve(true),
-    buildContext(undefined, { includeConversation: true }),
+    mode === "reflex" ? buildReflexContext() : buildContext(undefined, { includeConversation: true }),
   ]);
   if (mode === "live" && got === false)
     return Response.json(
@@ -128,7 +128,7 @@ async function handlePost(req: NextRequest) {
     return Response.json({ error: `openai ${r.status}: ${err}` }, { status: 502 });
   }
   const j = await r.json();
-  if (mode === "live" && ctx.freshFindingIds.length)
+  if (mode === "live" && "freshFindingIds" in ctx && ctx.freshFindingIds.length)
     await convexMutation("findings:markWoven", { ids: ctx.freshFindingIds }).catch(() => {});
   // The client MUST re-apply instructions + audio config after connect: the
   // agents SDK sends a session.update built from the client agent + SDK
