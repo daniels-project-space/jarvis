@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
@@ -7,7 +7,7 @@ import { clientMutation } from "@/lib/client-mutation";
 import { primeMicrophone, readJarvisPermissions, type JarvisPermissionState } from "@/lib/permissions";
 import { registerSW, subscribePush } from "@/lib/push";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
-import { createOrbMotionFrame, orbCycleSeconds, type OrbMotionFrame } from "@/lib/orb-motion";
+import { orbCycleSeconds } from "@/lib/orb-motion";
 import { relevantActiveWork } from "@/lib/active-work";
 import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
@@ -15,7 +15,6 @@ import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesVi
 import CommandDeck from "./CommandDeck";
 import { parseFastChartIntent, type FastChartIntent } from "@/lib/fast-intents";
 
-const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 const TripView = dynamic(() => import("./TripView"), {
   ssr: false,
   loading: () => <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-cyan">loading travel workspace…</div>,
@@ -447,28 +446,61 @@ function ReactorRing({
   );
 }
 
-// The immediate visual core is deliberately CSS-only. It keeps JARVIS present
-// from first paint while the richer Three.js particle field waits for an actual
-// browser idle slice; downloading/parsing that field during startup was a
-// measurable interaction stall on otherwise healthy connections.
-function OrbCoreFallback({ aside, color, active, reduceMotion }: { aside: boolean; color: string; active: boolean; reduceMotion: boolean }) {
+type VisualOrbState = "idle" | "listening" | "thinking" | "speaking";
+
+// One production visual, from first paint onward. The old two-stage design
+// visibly swapped a basic radial placeholder for a sparse Three.js cloud and
+// spent main-thread time doing it. This reactor core is richer, larger, and all
+// continuous movement stays on compositor transforms/opacity.
+function OrbCore({
+  aside,
+  color,
+  state,
+  reduceMotion,
+}: {
+  aside: boolean;
+  color: string;
+  state: VisualOrbState;
+  reduceMotion: boolean;
+}) {
+  const cycle = orbCycleSeconds(state);
+  const variables = {
+    "--jarvis-orb-color": color,
+    "--jarvis-orb-cycle": `${cycle}s`,
+    "--jarvis-orb-cycle-slow": `${cycle * 1.42}s`,
+    "--jarvis-orb-pulse": state === "speaking" ? "0.82s" : state === "thinking" ? "1.25s" : state === "listening" ? "1.8s" : "5.4s",
+  } as CSSProperties;
   return (
     <div
       aria-label="JARVIS visual core"
       className="absolute inset-0 grid place-items-center will-change-transform transition-transform duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
-      style={{ transform: aside ? "translateX(32%) scale(0.68)" : "scale(1)" }}
+      style={{ transform: aside ? "translateX(47%) translateY(-4.5%) scale(0.68)" : "translateY(-4.5%) scale(1)" }}
     >
       <div
-        className={reduceMotion ? "relative h-[min(42vw,280px)] w-[min(42vw,280px)] min-h-36 min-w-36 rounded-full" : "jarvis-orb-breathe relative h-[min(42vw,280px)] w-[min(42vw,280px)] min-h-36 min-w-36 rounded-full"}
-        style={{
-          animationDuration: active ? "1.7s" : "5.6s",
-          background: `radial-gradient(circle at 42% 38%, ${color}96, ${color}34 34%, ${color}0a 66%, transparent 74%)`,
-          boxShadow: `0 0 ${active ? 88 : 58}px ${color}4d, inset 0 0 48px ${color}26`,
-        }}
+        className="jarvis-core"
+        data-state={state}
+        data-reduce-motion={reduceMotion ? "true" : "false"}
+        style={variables}
       >
-        <div className="absolute inset-[18%] rounded-full border border-white/25" />
-        <div className="absolute inset-[34%] rounded-full border border-white/25" />
-        <div className="absolute inset-[45%] rounded-full bg-white/35 blur-md" />
+        <div className="jarvis-core-aura" />
+        <div className="jarvis-core-shell">
+          <div className="jarvis-core-scan" />
+          <div className="jarvis-core-lattice" />
+          <div className="jarvis-core-arcs" />
+          <div className="jarvis-core-arcs jarvis-core-arcs-inner" />
+          <div className="jarvis-core-filaments" aria-hidden="true">
+            {Array.from({ length: 9 }, (_, index) => (
+              <span key={index} style={{ transform: `rotate(${index * 40}deg)` }} />
+            ))}
+          </div>
+          <span className="jarvis-core-node jarvis-core-node-a" />
+          <span className="jarvis-core-node jarvis-core-node-b" />
+          <span className="jarvis-core-node jarvis-core-node-c" />
+          <div className="jarvis-core-plasma">
+            <div className="jarvis-core-nucleus" />
+          </div>
+          <div className="jarvis-core-glint" />
+        </div>
       </div>
     </div>
   );
@@ -1088,8 +1120,6 @@ function SpokenCaption({ caption }: { caption: { who: "you" | "jarvis"; text: st
 }
 
 export default function JarvisUI() {
-  const orbMotionRef = useRef<OrbMotionFrame>(createOrbMotionFrame());
-  const [visualCoreReady, setVisualCoreReady] = useState(false);
   const thread = (useJarvisQuery(api.ui.getActiveThread, {}) ?? "main") as string;
   const threads = (useJarvisQuery(api.ui.getThreads, {}) ?? []) as { id: string; title: string; at: number }[];
   const setActiveThread = (args: { thread: string; title?: string }) =>
@@ -1313,32 +1343,6 @@ export default function JarvisUI() {
   // into a bobbing bubble beside the orb — tap to bring it back.
   const [bubbles, setBubbles] = useState<{ type: string; value: string; title?: string }[]>([]);
   const prevPanelRef = useRef<{ type: string; value: string; title?: string; updatedAt: number } | null>(null);
-
-  useEffect(() => {
-    // If Daniel touches the page before its quiet startup window, keep the
-    // smooth CSS core. The detailed particle bundle must never compete with a
-    // first typed turn just because the browser happened to report one idle
-    // frame during hydration.
-    let interacted = false;
-    const markInteraction = () => {
-      interacted = true;
-    };
-    window.addEventListener("pointerdown", markInteraction, { passive: true });
-    window.addEventListener("keydown", markInteraction, { passive: true });
-    window.addEventListener("touchstart", markInteraction, { passive: true });
-    const idle = (window as typeof window & { requestIdleCallback?: (callback: () => void) => number }).requestIdleCallback;
-    let handle: number | null = null;
-    const timer = window.setTimeout(() => {
-      if (!interacted && idle) handle = idle(() => !interacted && setVisualCoreReady(true));
-    }, 3_000);
-    return () => {
-      window.clearTimeout(timer);
-      if (handle !== null) window.cancelIdleCallback?.(handle);
-      window.removeEventListener("pointerdown", markInteraction);
-      window.removeEventListener("keydown", markInteraction);
-      window.removeEventListener("touchstart", markInteraction);
-    };
-  }, []);
 
   // Options panel + persisted preferences (voice lane, TTS voice, wake, motion)
   const [optionsOpen, setOptionsOpen] = useState(false);
@@ -2593,11 +2597,7 @@ export default function JarvisUI() {
               fullBleed ? "pointer-events-none opacity-0" : compactAside ? "pointer-events-none opacity-0 md:opacity-100" : "opacity-100"
             }`}
           >
-            {visualCoreReady ? (
-              <ThreeOrb state={orbState} energyRef={energyRef} moodColor={moodColor} motionRef={orbMotionRef} aside={compactAside} reduceMotion={prefs.reduceMotion} />
-            ) : (
-              <OrbCoreFallback aside={compactAside} color={moodColor} active={orbState !== "idle"} reduceMotion={prefs.reduceMotion} />
-            )}
+            <OrbCore aside={compactAside} color={moodColor} state={orbState} reduceMotion={prefs.reduceMotion} />
           </div>
           {/* THE ONE caption — spoken words, under the orb. Short text sits in a
               contained field; a long reply scrolls through like a teleprompter,

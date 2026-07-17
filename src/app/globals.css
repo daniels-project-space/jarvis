@@ -221,15 +221,217 @@ body {
   to { transform: rotate(360deg); }
 }
 
-.jarvis-orb-breathe {
-  animation-name: jarvis-orb-breathe;
-  animation-timing-function: ease-in-out;
-  animation-iteration-count: infinite;
+.jarvis-core {
+  --jarvis-orb-color: #00ff88;
+  --jarvis-orb-cycle: 18s;
+  --jarvis-orb-cycle-slow: 25.5s;
+  --jarvis-orb-pulse: 5.4s;
+  position: relative;
+  width: clamp(220px, 48vmin, 390px);
+  aspect-ratio: 1;
+  border-radius: 999px;
+  isolation: isolate;
+  animation: jarvis-core-breathe var(--jarvis-orb-pulse) ease-in-out infinite;
+  will-change: transform;
+}
+
+.jarvis-core-aura {
+  position: absolute;
+  inset: -13%;
+  border-radius: inherit;
+  opacity: 0.62;
+  background: radial-gradient(circle, color-mix(in srgb, var(--jarvis-orb-color) 22%, transparent) 0 22%, transparent 67%);
+  box-shadow: 0 0 90px color-mix(in srgb, var(--jarvis-orb-color) 24%, transparent);
+  animation: jarvis-core-aura var(--jarvis-orb-pulse) ease-in-out infinite;
+}
+
+.jarvis-core-shell {
+  position: absolute;
+  inset: 6%;
+  overflow: hidden;
+  border-radius: inherit;
+  border: 1px solid color-mix(in srgb, var(--jarvis-orb-color) 48%, transparent);
+  background:
+    radial-gradient(circle at 36% 28%, rgba(255, 255, 255, 0.17), transparent 18%),
+    radial-gradient(circle at 50% 54%, color-mix(in srgb, var(--jarvis-orb-color) 27%, transparent), transparent 48%),
+    radial-gradient(circle at 50% 50%, rgba(4, 18, 25, 0.3) 0 54%, rgba(1, 7, 14, 0.88) 78%);
+  box-shadow:
+    inset 0 0 34px color-mix(in srgb, var(--jarvis-orb-color) 20%, transparent),
+    inset 0 -28px 54px rgba(0, 0, 0, 0.72),
+    0 0 22px color-mix(in srgb, var(--jarvis-orb-color) 22%, transparent);
+}
+
+.jarvis-core-shell::before,
+.jarvis-core-shell::after {
+  content: "";
+  position: absolute;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.jarvis-core-shell::before {
+  inset: 9%;
+  border: 1px solid color-mix(in srgb, var(--jarvis-orb-color) 28%, transparent);
+  box-shadow: inset 0 0 24px color-mix(in srgb, var(--jarvis-orb-color) 13%, transparent);
+}
+
+.jarvis-core-shell::after {
+  inset: 2%;
+  border-top: 1px solid rgba(255, 255, 255, 0.36);
+  border-right: 1px solid color-mix(in srgb, var(--jarvis-orb-color) 30%, transparent);
+  opacity: 0.72;
+}
+
+.jarvis-core-lattice {
+  position: absolute;
+  inset: 15%;
+  border-radius: inherit;
+  opacity: 0.5;
+  background:
+    repeating-radial-gradient(circle, transparent 0 16px, color-mix(in srgb, var(--jarvis-orb-color) 24%, transparent) 17px, transparent 18px),
+    repeating-conic-gradient(from 4deg, color-mix(in srgb, var(--jarvis-orb-color) 18%, transparent) 0 0.7deg, transparent 0.7deg 15deg);
+  -webkit-mask: radial-gradient(circle, transparent 0 21%, #000 23% 66%, transparent 69%);
+  mask: radial-gradient(circle, transparent 0 21%, #000 23% 66%, transparent 69%);
+  animation: jarvis-core-turn var(--jarvis-orb-cycle-slow) linear infinite reverse;
+  will-change: transform;
+}
+
+.jarvis-core-arcs {
+  position: absolute;
+  inset: 5%;
+  border-radius: inherit;
+  background: conic-gradient(
+    from 12deg,
+    transparent 0 8%,
+    color-mix(in srgb, var(--jarvis-orb-color) 88%, white 12%) 10% 13%,
+    transparent 15% 37%,
+    color-mix(in srgb, var(--jarvis-orb-color) 58%, transparent) 40% 50%,
+    transparent 53% 78%,
+    rgba(255, 255, 255, 0.62) 80% 81%,
+    transparent 83%
+  );
+  -webkit-mask: radial-gradient(circle, transparent 0 78%, #000 79% 83%, transparent 84%);
+  mask: radial-gradient(circle, transparent 0 78%, #000 79% 83%, transparent 84%);
+  animation: jarvis-core-turn var(--jarvis-orb-cycle) linear infinite;
+  will-change: transform;
+}
+
+.jarvis-core-arcs-inner {
+  inset: 18%;
+  opacity: 0.74;
+  -webkit-mask: radial-gradient(circle, transparent 0 68%, #000 70% 76%, transparent 78%);
+  mask: radial-gradient(circle, transparent 0 68%, #000 70% 76%, transparent 78%);
+  animation-duration: var(--jarvis-orb-cycle-slow);
+  animation-direction: reverse;
+}
+
+.jarvis-core-scan {
+  position: absolute;
+  inset: -35%;
+  opacity: 0.24;
+  background: linear-gradient(90deg, transparent 43%, color-mix(in srgb, var(--jarvis-orb-color) 56%, transparent) 49.5%, rgba(255, 255, 255, 0.35) 50%, transparent 50.5%);
+  animation: jarvis-core-turn var(--jarvis-orb-cycle-slow) linear infinite;
+  will-change: transform;
+}
+
+.jarvis-core-filaments {
+  position: absolute;
+  inset: 13%;
+  border-radius: inherit;
+  animation: jarvis-core-turn var(--jarvis-orb-cycle-slow) linear infinite reverse;
+  will-change: transform;
+}
+
+.jarvis-core-filaments span {
+  position: absolute;
+  left: 50%;
+  top: calc(50% - 0.5px);
+  width: 47%;
+  height: 1px;
+  transform-origin: left center;
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0.68), color-mix(in srgb, var(--jarvis-orb-color) 46%, transparent) 28%, transparent 86%);
+  opacity: 0.32;
+}
+
+.jarvis-core-plasma {
+  position: absolute;
+  inset: 25%;
+  border-radius: inherit;
+  background:
+    radial-gradient(circle at 38% 32%, rgba(255, 255, 255, 0.94) 0 4%, transparent 16%),
+    radial-gradient(circle at 48% 48%, rgba(255, 255, 255, 0.58), color-mix(in srgb, var(--jarvis-orb-color) 88%, white 12%) 12%, color-mix(in srgb, var(--jarvis-orb-color) 54%, transparent) 38%, transparent 70%);
+  box-shadow:
+    0 0 20px color-mix(in srgb, var(--jarvis-orb-color) 82%, transparent),
+    0 0 52px color-mix(in srgb, var(--jarvis-orb-color) 42%, transparent),
+    inset -10px -14px 24px rgba(0, 0, 0, 0.34);
+  animation: jarvis-core-plasma var(--jarvis-orb-pulse) ease-in-out infinite;
   will-change: transform, opacity;
 }
-@keyframes jarvis-orb-breathe {
-  0%, 100% { transform: scale(0.96); opacity: 0.82; }
-  50% { transform: scale(1.045); opacity: 1; }
+
+.jarvis-core-nucleus {
+  position: absolute;
+  inset: 38%;
+  border-radius: inherit;
+  background: white;
+  box-shadow:
+    0 0 10px white,
+    0 0 22px var(--jarvis-orb-color),
+    0 0 44px var(--jarvis-orb-color);
+  opacity: 0.92;
+}
+
+.jarvis-core-glint {
+  position: absolute;
+  left: 24%;
+  top: 17%;
+  width: 32%;
+  height: 18%;
+  border-radius: 50%;
+  border-top: 2px solid rgba(255, 255, 255, 0.5);
+  transform: rotate(-28deg);
+  opacity: 0.5;
+}
+
+.jarvis-core-node {
+  position: absolute;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: white;
+  box-shadow: 0 0 7px white, 0 0 14px var(--jarvis-orb-color);
+  opacity: 0.8;
+}
+.jarvis-core-node-a { left: 19%; top: 42%; }
+.jarvis-core-node-b { right: 23%; top: 24%; width: 3px; height: 3px; }
+.jarvis-core-node-c { right: 16%; bottom: 33%; width: 4px; height: 4px; }
+
+.jarvis-core[data-state="thinking"] .jarvis-core-shell,
+.jarvis-core[data-state="speaking"] .jarvis-core-shell {
+  box-shadow:
+    inset 0 0 42px color-mix(in srgb, var(--jarvis-orb-color) 28%, transparent),
+    inset 0 -28px 54px rgba(0, 0, 0, 0.68),
+    0 0 34px color-mix(in srgb, var(--jarvis-orb-color) 35%, transparent);
+}
+
+@keyframes jarvis-core-turn {
+  to { transform: rotate(360deg); }
+}
+@keyframes jarvis-core-breathe {
+  0%, 100% { transform: scale(0.985); }
+  50% { transform: scale(1.025); }
+}
+@keyframes jarvis-core-aura {
+  0%, 100% { opacity: 0.48; transform: scale(0.96); }
+  50% { opacity: 0.74; transform: scale(1.035); }
+}
+@keyframes jarvis-core-plasma {
+  0%, 100% { opacity: 0.82; transform: scale(0.92) rotate(-2deg); }
+  50% { opacity: 1; transform: scale(1.08) rotate(2deg); }
+}
+
+.jarvis-core[data-reduce-motion="true"],
+.jarvis-core[data-reduce-motion="true"] * {
+  animation-play-state: paused !important;
 }
 
 /* modern frosted-glass surface — the overlay card language, v2. Deep blur,
