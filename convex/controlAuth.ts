@@ -124,6 +124,25 @@ export const refreshSession = mutation({
   },
 });
 
+async function storeDevicePairing(ctx: any, rawTokenHash: string) {
+  if (!/^[a-f0-9]{64}$/i.test(rawTokenHash)) throw new Error("Invalid pairing capability");
+  const now = Date.now();
+  const stale = await ctx.db
+    .query("devicePairings")
+    .withIndex("by_expiry", (q: any) => q.lt("expiresAt", now))
+    .take(50);
+  for (const pairing of stale) await ctx.db.delete(pairing._id);
+  const tokenHash = rawTokenHash.toLowerCase();
+  const existing = await ctx.db
+    .query("devicePairings")
+    .withIndex("by_token", (q: any) => q.eq("tokenHash", tokenHash))
+    .first();
+  if (existing) await ctx.db.delete(existing._id);
+  const expiresAt = now + PAIRING_LIFETIME_MS;
+  await ctx.db.insert("devicePairings", { tokenHash, status: "active", createdAt: now, expiresAt });
+  return { expiresAt };
+}
+
 export const createDevicePairing = mutation({
   args: {
     tokenHash: v.string(),
@@ -131,22 +150,21 @@ export const createDevicePairing = mutation({
   },
   handler: async (ctx, args) => {
     await requireAdmin(ctx, args.authTokenHash);
-    if (!/^[a-f0-9]{64}$/i.test(args.tokenHash)) throw new Error("Invalid pairing capability");
-    const now = Date.now();
-    const stale = await ctx.db
-      .query("devicePairings")
-      .withIndex("by_expiry", (q: any) => q.lt("expiresAt", now))
-      .take(50);
-    for (const pairing of stale) await ctx.db.delete(pairing._id);
-    const tokenHash = args.tokenHash.toLowerCase();
-    const existing = await ctx.db
-      .query("devicePairings")
-      .withIndex("by_token", (q: any) => q.eq("tokenHash", tokenHash))
-      .first();
-    if (existing) await ctx.db.delete(existing._id);
-    const expiresAt = now + PAIRING_LIFETIME_MS;
-    await ctx.db.insert("devicePairings", { tokenHash, status: "active", createdAt: now, expiresAt });
-    return { expiresAt };
+    return await storeDevicePairing(ctx, args.tokenHash);
+  },
+});
+
+// Project Hub's recovery bridge holds only the narrow request bearer. The
+// Jarvis route converts that request into the existing dispatcher capability;
+// it cannot mint admin sessions directly or call any other control mutation.
+export const createDevicePairingForDispatcher = mutation({
+  args: {
+    tokenHash: v.string(),
+    dispatchToken: v.string(),
+  },
+  handler: async (ctx, args) => {
+    await requireDispatcher(ctx, { dispatchToken: args.dispatchToken });
+    return await storeDevicePairing(ctx, args.tokenHash);
   },
 });
 

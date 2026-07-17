@@ -18,6 +18,7 @@ export async function proxy(req: NextRequest) {
     !pathname.startsWith("/api/")
     || pathname === "/api/auth/viewer"
     || pathname === "/api/auth/pair"
+    || pathname === "/api/auth/pairing/request"
     || pathname === "/api/agent-tool"
   ) return NextResponse.next();
 
