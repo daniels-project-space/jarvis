@@ -4,6 +4,8 @@ import { v } from "convex/values";
 const SESSION_LIFETIME_MS = 365 * 24 * 60 * 60 * 1000;
 const VIEWER_LIFETIME_MS = 6 * 60 * 60 * 1000;
 const PAIRING_LIFETIME_MS = 10 * 60 * 1000;
+const VIEWER_ISSUER = "https://jarvis-orcin-six.vercel.app";
+const VIEWER_SUBJECT = "daniel-owner";
 
 export const actorAuthArgs = {
   authTokenHash: v.optional(v.string()),
@@ -77,6 +79,8 @@ export async function requireViewer(
   const dispatcher = process.env.JARVIS_DISPATCH_TOKEN;
   if (worker && constantTimeEqual(credentials.workerToken, worker)) return;
   if (dispatcher && constantTimeEqual(credentials.dispatchToken, dispatcher)) return;
+  const identity = await ctx.auth?.getUserIdentity?.();
+  if (identity?.issuer === VIEWER_ISSUER && identity?.subject === VIEWER_SUBJECT) return;
   if (await isAdminSession(ctx, credentials.authTokenHash)) return;
   const token = credentials.viewerToken;
   if (!token || !/^[a-f0-9]{64}$/i.test(token)) throw new Error("Authentication required");
@@ -90,6 +94,19 @@ export async function requireViewer(
 export const validateSession = query({
   args: { tokenHash: v.string() },
   handler: async (ctx, args) => await isAdminSession(ctx, args.tokenHash),
+});
+
+export const sessionStatus = query({
+  args: { tokenHash: v.string() },
+  handler: async (ctx, args) => {
+    if (!/^[a-f0-9]{64}$/i.test(args.tokenHash)) return { valid: false };
+    const session = await ctx.db
+      .query("adminSessions")
+      .withIndex("by_token", (q: any) => q.eq("tokenHash", args.tokenHash.toLowerCase()))
+      .first();
+    if (!session || session.expiresAt <= Date.now()) return { valid: false };
+    return { valid: true, expiresAt: session.expiresAt };
+  },
 });
 
 export const refreshSession = mutation({
@@ -110,11 +127,10 @@ export const refreshSession = mutation({
 export const createDevicePairing = mutation({
   args: {
     tokenHash: v.string(),
-    authTokenHash: v.optional(v.string()),
-    dispatchToken: v.optional(v.string()),
+    authTokenHash: v.string(),
   },
   handler: async (ctx, args) => {
-    await requireDispatcher(ctx, args);
+    await requireAdmin(ctx, args.authTokenHash);
     if (!/^[a-f0-9]{64}$/i.test(args.tokenHash)) throw new Error("Invalid pairing capability");
     const now = Date.now();
     const stale = await ctx.db

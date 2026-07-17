@@ -39,6 +39,27 @@ export async function validateAdminSession(tokenHash: string | null): Promise<bo
   }
 }
 
+export async function adminSessionStatus(
+  tokenHash: string | null,
+): Promise<{ valid: boolean; expiresAt?: number }> {
+  if (!tokenHash) return { valid: false };
+  try {
+    const response = await fetch(`${CONVEX_URL}/api/query`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: "controlAuth:sessionStatus", args: { tokenHash }, format: "json" }),
+      cache: "no-store",
+    });
+    const payload = await response.json();
+    const value = payload?.value;
+    return response.ok && value?.valid === true
+      ? { valid: true, expiresAt: Number(value.expiresAt) }
+      : { valid: false };
+  } catch {
+    return { valid: false };
+  }
+}
+
 export async function controlMutation(path: string, args: Record<string, unknown>): Promise<unknown> {
   const response = await fetch(`${CONVEX_URL}/api/mutation`, {
     method: "POST",

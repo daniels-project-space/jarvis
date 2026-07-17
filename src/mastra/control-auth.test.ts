@@ -73,4 +73,21 @@ describe("privileged control authentication", () => {
     await expect(requireAdmin(ctx, viewerToken)).rejects.toThrow(/Authentication required/);
     await expect(requireViewer(ctx, { viewerToken: "e".repeat(64) })).rejects.toThrow(/Authentication required/);
   });
+
+  it("accepts the Convex-verified Jarvis viewer identity without a session-table read", async () => {
+    const ctx = {
+      auth: {
+        getUserIdentity: async () => ({
+          issuer: "https://jarvis-orcin-six.vercel.app",
+          subject: "daniel-owner",
+        }),
+      },
+      db: {
+        query: () => {
+          throw new Error("viewer identity should not touch session storage");
+        },
+      },
+    };
+    await expect(requireViewer(ctx, {})).resolves.toBeUndefined();
+  });
 });
