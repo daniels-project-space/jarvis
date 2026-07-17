@@ -418,6 +418,7 @@ function ReactorRing({
   useEffect(() => {
     let frame = 0;
     let lastPaintAt = 0;
+    let lastGlowAt = 0;
     let lastColor = "";
     let lastAccent = "";
     const paint = (now: number) => {
@@ -442,8 +443,11 @@ function ReactorRing({
         accentStop.current?.setAttribute("stop-color", motion.accent);
         lastAccent = motion.accent;
       }
-      if (svgRef.current) {
+      // SVG drop-shadows are expensive raster work. Colour still follows the
+      // orb, but its glow only needs a few updates per second to feel alive.
+      if (svgRef.current && now - lastGlowAt >= 250) {
         svgRef.current.style.filter = `drop-shadow(0 0 ${6 + motion.intensity * 9}px ${motion.color}66)`;
+        lastGlowAt = now;
       }
       frame = requestAnimationFrame(paint);
     };

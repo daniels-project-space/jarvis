@@ -59,8 +59,8 @@ export default function ThreeOrb({
     // JARVIS was trying to caption/speak. A denser shader cannot compensate
     // for dropped input frames, so keep a rich cloud inside a strict frame
     // budget instead.
-    const N = reducedMotion ? 220 : compact ? 380 : 680;
-    const CONNECTION_SAMPLE = reducedMotion ? 56 : compact ? 92 : 136;
+    const N = reducedMotion ? 160 : compact ? 260 : 420;
+    const CONNECTION_SAMPLE = reducedMotion ? 40 : compact ? 68 : 96;
     const W = () => mount.clientWidth || 1;
     const H = () => mount.clientHeight || 1;
 
@@ -118,7 +118,7 @@ export default function ThreeOrb({
     queueMicrotask(() => {
       if (!destroyed) setWebglUnavailable(false);
     });
-    renderer.setPixelRatio(Math.min(compact ? 1 : 1.25, window.devicePixelRatio));
+    renderer.setPixelRatio(1);
     renderer.setSize(W(), H());
     renderer.setClearColor(0x000000, 0);
     mount.appendChild(renderer.domElement);
@@ -150,7 +150,7 @@ export default function ThreeOrb({
     scene.add(points);
 
     // ── Connection lines ──
-    const MAX_LINES = compact ? 720 : 1_200;
+    const MAX_LINES = compact ? 420 : 700;
     const linePos = new Float32Array(MAX_LINES * 6);
     const lineGeo = new THREE.BufferGeometry();
     lineGeo.setAttribute("position", new THREE.BufferAttribute(linePos, 3));
