@@ -62,7 +62,9 @@ export async function buildContext(
       userText: userText?.slice(0, 240) || undefined,
       includeConversation: options?.includeConversation || undefined,
     }),
-    q(HUB_URL, "jarvisContext:snapshot"),
+    q(HUB_URL, "jarvisContext:snapshot", {
+      vaultToken: process.env.VAULT_ACCESS_TOKEN,
+    }),
   ]);
   const todos = hub?.todos;
   const events = hub?.events;
