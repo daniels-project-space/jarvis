@@ -1,8 +1,9 @@
 import { defineConfig } from "@trigger.dev/sdk/v3";
 import { additionalPackages, aptGet, syncEnvVars } from "@trigger.dev/build/extensions/core";
 
-// jarvis-jobs — runs the selected Codex/Claude subscription CLI headlessly;
-// metered API keys are blanked inside agent subprocesses.
+// Trigger hosts foreground conversation and bounded maintenance schedules.
+// Permanent specialist intelligence runs through the GitHub CLI harness;
+// metered API keys remain blanked inside every subscription subprocess.
 // Set TRIGGER_PROJECT_REF_JARVIS once the `jarvis-jobs` project is created in
 // the Trigger.dev dashboard, then `npx trigger.dev deploy`.
 export default defineConfig({

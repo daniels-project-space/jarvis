@@ -465,19 +465,10 @@ export function repairPrompt(inc: { source: string; message: string; signature: 
   );
 }
 
-export const agentRunner = schedules.task({
-  id: "jarvis-agent-runner",
-  cron: "* * * * *",
-  // Subscription CLIs plus dependency/test tooling do not fit reliably in
-  // Trigger's 0.5 GB default. Keep the other seven tasks on the cheap default;
-  // only the durable specialist runner gets enough headroom to avoid OOM loss.
-  machine: "medium-1x",
-  // Scheduled runs must not overlap. One runner already manages three scoped
-  // subprocesses internally; overlapping cron runs multiply subscription use
-  // and can reclaim a freshly checkpointed failure before policy can back off.
-  queue: { concurrencyLimit: 1 },
-  maxDuration: 3600,
-  run: async () => {
+// The actual specialist runtime is a subscription-authenticated CLI harness.
+// It is exported independently of Trigger so cloud runners can execute the
+// same durable lease/checkpoint protocol with their repository-scoped tools.
+export async function runAgentHarness() {
     const selected = await convexQuery("ui:getAgentProvider", {});
     const provider: AgentProvider = selected === "claude" ? "claude" : "codex";
     const bin = resolveSubscriptionAgentBin(provider);
@@ -1054,6 +1045,20 @@ export const agentRunner = schedules.task({
       if (!ready) break;
       await synthesizeMissionClaim(ready);
     }
-    return { processed };
-  },
+  return { processed };
+}
+
+// Trigger remains a compatibility scheduler only. Production sets
+// JARVIS_AGENT_RUNTIME=github, making this task incapable of claiming agent
+// work; GitHub's isolated cloud runner invokes runAgentHarness directly.
+export const agentRunner = schedules.task({
+  id: "jarvis-agent-runner",
+  cron: "* * * * *",
+  machine: "micro",
+  queue: { concurrencyLimit: 1 },
+  maxDuration: 60,
+  run: async () =>
+    process.env.JARVIS_AGENT_RUNTIME === "trigger"
+      ? runAgentHarness()
+      : { processed: 0, runtime: "cli-harness", host: "github-actions" },
 });

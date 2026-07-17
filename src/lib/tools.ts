@@ -4,6 +4,7 @@ import { getSecret, getServiceSecrets } from "./vault";
 import { r2Put, r2StoreFromUrl } from "./r2";
 import type { ManagedMission } from "../mastra/supervisor";
 import { withAdminSession } from "./control-context";
+import { wakeAgentHarness } from "./agent-harness-dispatch";
 import {
   VISUAL_BLOCK_KINDS,
   VISUAL_CAPABILITIES,
@@ -37,7 +38,7 @@ export const TOOL_DEFS = [
   {
     name: "orchestrate",
     description:
-      "Ask the Mastra JARVIS supervisor to plan and run a durable mission with the permanent team. You may supply 2-6 genuinely independent workstreams, or omit them and let the supervisor consult specialists and decompose the goal. Trigger.dev performs the durable execution; Convex reports live stages, checkpoints and approvals. One coherent reviewed result returns to the originating conversation.",
+      "Ask the Mastra JARVIS supervisor to plan and run a durable mission with the permanent team. You may supply 2-6 genuinely independent workstreams, or omit them and let the supervisor consult specialists and decompose the goal. The subscription CLI harness performs durable execution with repository-scoped tools; Convex reports live stages, checkpoints and approvals. One coherent reviewed result returns to the originating conversation.",
     parameters: {
       type: "object",
       properties: {
@@ -2923,6 +2924,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         modelReason: route.reason,
         label: `${TEAM_BY_SLUG[agentId].name} · ${task.slice(0, 58)}`,
       });
+      if (!route.approvalRequired) await wakeAgentHarness(`job:${String(jobId)}`).catch(() => false);
       return route.approvalRequired
         ? `${TEAM_BY_SLUG[agentId].name} has a scoped plan ready as job ${jobId}, but it includes a consequential external action. I put it in Needs you and will not execute it until Daniel approves.`
         : `${TEAM_BY_SLUG[agentId].name} owns job ${jobId}. It is bound to this conversation, visible live in the command deck, and will checkpoint rather than disappear if it needs multiple runs.`;
@@ -2990,6 +2992,9 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           modelReason: `${a.agentId} owns this Mastra-managed workstream; ${a.model} is the planned execution tier`,
         });
       }
+      if (plan.workstreams.some((stream) => !stream.approvalRequired)) {
+        await wakeAgentHarness(`mission:${String(missionId)}`).catch(() => false);
+      }
       await convexMutation("ui:setPanel", { type: "fleet", value: JSON.stringify({ missionId: String(missionId) }), title: `mission · ${mission.slice(0, 44)}` }).catch(() => {});
       const waiting = plan.workstreams.filter((stream) => stream.approvalRequired).length;
       return `JARVIS planned mission ${missionId} with ${plan.workstreams.length} permanent specialists: ${plan.workstreams.map((stream) => `${stream.label} [${stream.model}]`).join(", ")}. ${waiting ? `${waiting} consequential workstream${waiting === 1 ? " is" : "s are"} waiting in Needs you; ` : ""}live stages and checkpoints are on screen, and one reviewed synthesis returns to this conversation.`;
@@ -3004,6 +3009,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           jobId,
           decision: action === "approve" ? "approved" : "declined",
         });
+        if (ok && action === "approve") await wakeAgentHarness(`approved:${jobId}`).catch(() => false);
         return ok
           ? action === "approve"
             ? "Approved. The workstream is queued; approval applies only to that scoped job."
@@ -3014,6 +3020,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         const answer = String(args.input ?? "").trim();
         if (!answer) return "Tell me the decision or missing information you want passed back to the agent.";
         const ok = await convexMutation("jobs:provideInput", { jobId, answer, authTokenHash });
+        if (ok) await wakeAgentHarness(`continued:${jobId}`).catch(() => false);
         return ok ? "Passed that decision back to the specialist; the continuation is queued." : "That job is not waiting for input now.";
       }
       const ok = await convexMutation("jobs:control", { jobId, action, authTokenHash });
@@ -3399,6 +3406,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         modelReason: "Paul + opus: production repair requires deep engineering and verification",
         label: `Paul · repair ${problem.slice(0, 48)}`,
       });
+      await wakeAgentHarness(`repair:${String(incidentId)}`).catch(() => false);
       return "Paul owns the repair on an isolated branch. He'll reproduce it, verify the fix, and report back here; nothing is pushed directly onto production.";
     }
     case "self_improve": {
@@ -3418,6 +3426,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         modelReason: "Paul + opus: JARVIS self-modification is complex engineering",
         label: `Paul · upgrade ${request.slice(0, 46)}`,
       });
+      await wakeAgentHarness("self-improve").catch(() => false);
       return "Paul has the upgrade on an isolated branch with validation gates; progress is live in the command deck.";
     }
     case "agent_status": {

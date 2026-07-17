@@ -1,0 +1,47 @@
+name: Jarvis CLI agent harness
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: Wake reason
+        required: false
+        default: manual
+  schedule:
+    - cron: "*/5 * * * *"
+
+concurrency:
+  group: jarvis-cli-agent-harness
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    name: Subscription CLI agents
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      CONVEX_URL: https://tangible-goose-318.convex.cloud
+      CODEX_AUTH_JSON_B64: ${{ secrets.CODEX_AUTH_JSON_B64 }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      JARVIS_WORKER_TOKEN: ${{ secrets.JARVIS_WORKER_TOKEN }}
+      VAULT_ACCESS_TOKEN: ${{ secrets.VAULT_ACCESS_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.JARVIS_PORTFOLIO_GITHUB_TOKEN }}
+      JARVIS_AGENT_RUNTIME: github
+    steps:
+      - name: Check out Jarvis harness
+        uses: actions/checkout@v4
+
+      - name: Use pinned Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install the pinned harness
+        run: npm ci
+
+      - name: Run durable CLI agents
+        run: npm run agent:harness
