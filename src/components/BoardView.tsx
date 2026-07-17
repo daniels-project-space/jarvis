@@ -1,8 +1,9 @@
 "use client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
-import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
+import { useJarvisQuery } from "@/lib/secure-convex";
+import { clientMutation } from "@/lib/client-mutation";
 import "@excalidraw/excalidraw/index.css";
 
 // JARVIS's infinite canvas — Excalidraw (MIT) rendering a board creation.
@@ -44,8 +45,8 @@ export default function BoardView({ value }: { value: string }) {
   } catch {
     /* noop */
   }
-  const row = useQuery(api.creations.get, creationId ? { id: creationId as never } : "skip") as { data?: string } | null | undefined;
-  const boardSave = useMutation(api.creations.boardSave);
+  const row = useJarvisQuery(api.creations.get, creationId ? { id: creationId as never } : "skip") as { data?: string } | null | undefined;
+  const boardSave = (args: Record<string, unknown>) => clientMutation("creations:boardSave", args);
   const apiRef = useRef<any>(null);
   const appliedTs = useRef(0);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);

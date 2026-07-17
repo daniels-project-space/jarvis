@@ -8,22 +8,17 @@ import { resolveConvexUrl } from "./convex-url";
 
 const CONVEX_URL = resolveConvexUrl(process.env.NEXT_PUBLIC_CONVEX_URL, process.env.CONVEX_URL);
 const HUB_URL = "https://fantastic-roadrunner-485.convex.cloud";
-const ADMIN_CONTEXT_MUTATIONS = new Set([
-  "chatQueue:postCard",
-  "chatQueue:clearThread",
-  "ui:setActiveThread",
-  "ui:setAgentProvider",
-  "ui:setLocation",
-  "incidents:report",
-  "incidents:setStatus",
-]);
 
 async function q(base: string, path: string, args: unknown = {}): Promise<any> {
   try {
+    const authTokenHash = base === CONVEX_URL ? currentAdminSession() : null;
+    const protectedArgs = authTokenHash
+      ? { ...((args ?? {}) as Record<string, unknown>), authTokenHash }
+      : args;
     const r = await fetch(`${base}/api/query`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ path, args, format: "json" }),
+      body: JSON.stringify({ path, args: protectedArgs, format: "json" }),
     });
     return (await r.json()).value;
   } catch {
@@ -33,7 +28,7 @@ async function q(base: string, path: string, args: unknown = {}): Promise<any> {
 
 export async function convexMutation(path: string, args: unknown): Promise<any> {
   const authTokenHash = currentAdminSession();
-  const protectedArgs = ADMIN_CONTEXT_MUTATIONS.has(path) && authTokenHash
+  const protectedArgs = authTokenHash
     ? { ...((args ?? {}) as Record<string, unknown>), authTokenHash }
     : args;
   const r = await fetch(`${CONVEX_URL}/api/mutation`, {

@@ -1,11 +1,13 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 
 // Agent findings queue: runner adds, brain weaves into conversation, panel shows detail.
 
 export const add = mutation({
-  args: { source: v.string(), spoken: v.string(), detail: v.string() },
+  args: { source: v.string(), spoken: v.string(), detail: v.string(), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     return await ctx.db.insert("findings", {
       source: a.source.slice(0, 300),
       spoken: a.spoken.slice(0, 500),
@@ -17,18 +19,23 @@ export const add = mutation({
 });
 
 export const fresh = query({
-  args: {},
-  handler: async (ctx) =>
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return (
     await ctx.db
       .query("findings")
       .withIndex("by_status", (q: any) => q.eq("status", "fresh"))
       .order("desc")
-      .take(20),
+      .take(20)
+    );
+  },
 });
 
 export const recent = query({
-  args: { limit: v.optional(v.number()) },
+  args: { limit: v.optional(v.number()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     return await ctx.db
       .query("findings")
       .withIndex("by_createdAt")
@@ -38,22 +45,27 @@ export const recent = query({
 });
 
 export const get = query({
-  args: { id: v.id("findings") },
-  handler: async (ctx, a) => ctx.db.get(a.id),
+  args: { id: v.id("findings"), ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return ctx.db.get(a.id);
+  },
 });
 
 // Card intelligence cache: /api/distill screens each finding once (worth
 // showing at all?) and stores the short bullet breakdown.
 export const distill = mutation({
-  args: { id: v.id("findings"), bullets: v.array(v.string()), important: v.boolean() },
+  args: { id: v.id("findings"), bullets: v.array(v.string()), important: v.boolean(), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     await ctx.db.patch(a.id, { bullets: a.bullets, important: a.important });
   },
 });
 
 export const markWoven = mutation({
-  args: { ids: v.array(v.id("findings")) },
+  args: { ids: v.array(v.id("findings")), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     for (const id of a.ids) await ctx.db.patch(id, { status: "woven" });
   },
 });

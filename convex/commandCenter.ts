@@ -1,11 +1,13 @@
 import { query } from "./_generated/server";
+import { requireViewer, viewerAuthArgs } from "./controlAuth";
 
 // One bounded reactive read powers the whole command deck. This avoids a fan
 // out of broad subscriptions and makes Convex I/O proportional to what can be
 // rendered, not to the lifetime size of the tables.
 export const snapshot = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const activeStatuses = ["running", "pending", "awaiting_approval", "paused", "needs_input"];
     const activeGroups = await Promise.all(
       activeStatuses.map((status) =>

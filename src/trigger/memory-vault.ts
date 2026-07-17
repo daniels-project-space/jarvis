@@ -2,6 +2,7 @@ import { schedules } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { githubGitEnv, githubRepoUrl } from "./git-transport";
 
 // Obsidian memory vault: consolidates JARVIS's memory into a git-backed,
 // categorised, wikilinked Obsidian vault (daniels-project-space/jarvis-memory) —
@@ -13,13 +14,15 @@ const CONVEX =
 const REPO = "daniels-project-space/jarvis-memory";
 
 async function q(path: string, args: unknown) {
+  const workerToken = process.env.JARVIS_WORKER_TOKEN;
+  if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
   try {
     return (
       await (
         await fetch(`${CONVEX}/api/query`, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ path, args, format: "json" }),
+          body: JSON.stringify({ path, args: { ...((args ?? {}) as Record<string, unknown>), workerToken }, format: "json" }),
         })
       ).json()
     ).value;
@@ -54,9 +57,10 @@ export const memoryVault = schedules.task({
     if (!token) return { error: "no GITHUB_TOKEN" };
     const dir = "/tmp/vault";
     rmSync(dir, { recursive: true, force: true });
-    const url = `https://x-access-token:${token}@github.com/${REPO}.git`;
+    const url = githubRepoUrl(REPO);
     const env: NodeJS.ProcessEnv = { ...process.env };
-    await sh("git", ["clone", "--depth", "1", url, dir], env);
+    const gitEnv = githubGitEnv(env, token);
+    await sh("git", ["clone", "--depth", "1", url, dir], gitEnv);
     if (!existsSync(join(dir, ".git"))) return { error: "clone failed" };
     await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
     await sh("git", ["-C", dir, "config", "user.name", "JARVIS"], env);
@@ -147,7 +151,7 @@ export const memoryVault = schedules.task({
     const commit = await sh("git", ["-C", dir, "commit", "-m", `memory: consolidate ${date}`], env);
     let pushed = false;
     if (!/nothing to commit/i.test(commit.out)) {
-      const push = await sh("git", ["-C", dir, "push", url, "HEAD"], env);
+      const push = await sh("git", ["-C", dir, "push", url, "HEAD"], gitEnv);
       pushed = push.code === 0;
     }
     return { date, notes, insights: ins.length, pushed };

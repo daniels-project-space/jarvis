@@ -1,7 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { workApprovalPolicy } from "./workPolicy";
-import { requireAdmin, requireDispatcher, requireWorker } from "./controlAuth";
+import { requireAdmin, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 
 const enqueueArgs = {
   task: v.string(),
@@ -256,13 +256,15 @@ export const finalize = mutation({
 });
 
 export const list = query({
-  args: { limit: v.optional(v.number()) },
-  handler: async (ctx, a) =>
-    await ctx.db
+  args: { limit: v.optional(v.number()), ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return await ctx.db
       .query("jobs")
       .withIndex("by_createdAt")
       .order("desc")
-      .take(Math.min(a.limit ?? 20, 100)),
+      .take(Math.min(a.limit ?? 20, 100));
+  },
 });
 
 // A process can die without finalizing. Heartbeats distinguish a genuinely
@@ -444,13 +446,17 @@ export const checkpointAndRequeue = mutation({
 });
 
 export const executionState = query({
-  args: { jobId: v.id("jobs") },
-  handler: async (ctx, a) => (await ctx.db.get(a.jobId))?.status ?? "missing",
+  args: { jobId: v.id("jobs"), ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return (await ctx.db.get(a.jobId))?.status ?? "missing";
+  },
 });
 
 export const executionLease = query({
-  args: { jobId: v.id("jobs") },
+  args: { jobId: v.id("jobs"), ...viewerAuthArgs },
   handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const row = await ctx.db.get(a.jobId);
     return row ? { status: row.status, attempt: row.attempt ?? 1 } : { status: "missing", attempt: 0 };
   },
@@ -654,8 +660,9 @@ export const control = mutation({
 });
 
 export const active = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const statuses = ["running", "pending", "awaiting_approval", "paused", "needs_input"];
     const groups = await Promise.all(
       statuses.map((status) =>

@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery } from "convex/react";
 import { api } from "../../convex/_generated/api";
+import { useJarvisQuery } from "@/lib/secure-convex";
 import "maplibre-gl/dist/maplibre-gl.css";
 
 // The trip planner panel: a REAL dark 3D map (MapLibre globe projection on
@@ -197,7 +197,7 @@ export default function TripView({ value }: { value: string }) {
   } catch {
     /* noop */
   }
-  const row = useQuery(api.creations.get, creationId ? { id: creationId as never } : "skip") as any;
+  const row = useJarvisQuery(api.creations.get, creationId ? { id: creationId as never } : "skip") as any;
   const doc: TripDoc | null = useMemo(() => {
     try {
       return row?.data ? JSON.parse(row.data) : null;

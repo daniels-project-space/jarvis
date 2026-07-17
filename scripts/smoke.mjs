@@ -15,17 +15,25 @@ const THREAD = "smoke";
 const ADMIN_PASSWORD = process.env.JARVIS_ADMIN_PASSWORD ?? "";
 const DISPATCH_TOKEN = process.env.JARVIS_DISPATCH_TOKEN ?? "";
 let COOKIE = "";
+let VIEWER_TOKEN = "";
 
 async function authenticate() {
   if (!ADMIN_PASSWORD) throw new Error("JARVIS_ADMIN_PASSWORD is required for production smoke tests");
   const response = await fetch(`${BASE}/api/auth/login`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", origin: BASE },
     body: JSON.stringify({ password: ADMIN_PASSWORD }),
   });
   const setCookie = response.headers.get("set-cookie") ?? "";
   COOKIE = setCookie.split(";")[0];
   if (!response.ok || !COOKIE) throw new Error(`JARVIS authentication failed (${response.status})`);
+  const viewer = await fetch(`${BASE}/api/auth/viewer`, {
+    method: "POST",
+    headers: { cookie: COOKIE, origin: BASE },
+  });
+  const payload = await viewer.json().catch(() => ({}));
+  VIEWER_TOKEN = payload.viewerToken ?? "";
+  if (!viewer.ok || !VIEWER_TOKEN) throw new Error(`JARVIS viewer capability failed (${viewer.status})`);
 }
 
 const results = [];
@@ -54,10 +62,20 @@ const assert = (cond, msg) => {
   if (!cond) throw new Error(msg);
 };
 async function cv(kind, path, args) {
+  if (kind === "mutation") {
+    const r = await fetch(`${BASE}/api/client-mutation`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: COOKIE, origin: BASE },
+      body: JSON.stringify({ path, args }),
+    });
+    const j = await r.json();
+    if (!r.ok || j.ok !== true) throw new Error(`${path}: private mutation rejected (${r.status})`);
+    return j.value;
+  }
   const r = await fetch(`${CV}/${kind}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, args, format: "json" }),
+    body: JSON.stringify({ path, args: { ...args, viewerToken: VIEWER_TOKEN }, format: "json" }),
   });
   const j = await r.json();
   if (j.status === "error") throw new Error(`${path}: ${String(j.errorMessage).slice(0, 160)}`);

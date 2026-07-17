@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useQuery } from "convex/react";
 import { api } from "../../convex/_generated/api";
+import { useJarvisQuery } from "@/lib/secure-convex";
 
 type CommandDeckProps = {
   busy: boolean;
@@ -45,7 +45,7 @@ function Dot({ tone = "cyan", pulse = false }: { tone?: "cyan" | "amber" | "red"
 }
 
 export default function CommandDeck({ busy, selectedJobId, onSelectJob }: CommandDeckProps) {
-  const snapshot = useQuery(api.commandCenter.snapshot, {}) as any;
+  const snapshot = useJarvisQuery(api.commandCenter.snapshot, {}) as any;
   const [collapsed, setCollapsed] = useState(false);
   const [acting, setActing] = useState("");
   useEffect(() => {

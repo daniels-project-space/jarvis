@@ -22,10 +22,12 @@ async function convexQuery(url: string, path: string, args: unknown) {
   }
 }
 async function jarvisMutation(path: string, args: unknown) {
+  const workerToken = process.env.JARVIS_WORKER_TOKEN;
+  if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
   await fetch(`${JARVIS}/api/mutation`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, args, format: "json" }),
+    body: JSON.stringify({ path, args: { ...((args ?? {}) as Record<string, unknown>), workerToken }, format: "json" }),
   }).catch(() => {});
 }
 

@@ -1,5 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 
 export const upsert = mutation({
   args: {
@@ -15,21 +16,24 @@ export const upsert = mutation({
     actionClass: v.string(),
     status: v.optional(v.string()),
     jobId: v.optional(v.string()),
+    ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    const { authTokenHash: _authTokenHash, workerToken: _workerToken, ...input } = a;
     const existing = await ctx.db
       .query("attentionItems")
       .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", a.fingerprint))
       .first();
     const now = Date.now();
     const doc = {
-      ...a,
-      title: a.title.slice(0, 140),
-      detail: a.detail.slice(0, 2000),
-      impact: Math.max(0, Math.min(100, a.impact)),
-      urgency: Math.max(0, Math.min(100, a.urgency)),
-      confidence: Math.max(0, Math.min(1, a.confidence)),
-      status: a.status ?? existing?.status ?? "open",
+      ...input,
+      title: input.title.slice(0, 140),
+      detail: input.detail.slice(0, 2000),
+      impact: Math.max(0, Math.min(100, input.impact)),
+      urgency: Math.max(0, Math.min(100, input.urgency)),
+      confidence: Math.max(0, Math.min(1, input.confidence)),
+      status: input.status ?? existing?.status ?? "open",
       updatedAt: now,
     };
     if (existing) {
@@ -41,8 +45,9 @@ export const upsert = mutation({
 });
 
 export const list = query({
-  args: { status: v.optional(v.string()), limit: v.optional(v.number()) },
+  args: { status: v.optional(v.string()), limit: v.optional(v.number()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const limit = Math.min(a.limit ?? 20, 60);
     const rows = a.status
       ? await ctx.db
@@ -58,9 +63,9 @@ export const list = query({
 });
 
 export const resolve = mutation({
-  args: { id: v.id("attentionItems"), status: v.string() },
+  args: { id: v.id("attentionItems"), status: v.string(), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     await ctx.db.patch(a.id, { status: a.status, updatedAt: Date.now() });
   },
 });
-

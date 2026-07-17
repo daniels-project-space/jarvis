@@ -1,6 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { requireActor, requireAdmin, requireWorker } from "./controlAuth";
+import { requireActor, requireAdmin, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 
 // Cloud chat transport for the subscription brain. UI calls sendMessage +
 // subscribes to listMessages; the Trigger dispatcher calls claimNext /
@@ -38,8 +38,9 @@ export const sendMessage = mutation({
 });
 
 export const listMessages = query({
-  args: { threadId: v.optional(v.string()) },
+  args: { threadId: v.optional(v.string()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const threadId = a.threadId ?? "main";
     const rows = await ctx.db
       .query("chatMessages")
@@ -50,8 +51,9 @@ export const listMessages = query({
 });
 
 export const sessionState = query({
-  args: { threadId: v.optional(v.string()) },
+  args: { threadId: v.optional(v.string()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const threadId = a.threadId ?? "main";
     return await ctx.db
       .query("chatSessions")

@@ -1,12 +1,14 @@
 import { query } from "./_generated/server";
 import { v } from "convex/values";
+import { requireViewer, viewerAuthArgs } from "./controlAuth";
 
 // A single bounded snapshot replaces the former 10-call Convex fan-out used
 // by every chat and Realtime session. Keep payloads concise: this is model
 // context, while full artifacts remain addressable by id.
 export const snapshot = query({
-  args: { userText: v.optional(v.string()), includeConversation: v.optional(v.boolean()) },
+  args: { userText: v.optional(v.string()), includeConversation: v.optional(v.boolean()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const text = a.userText?.trim().slice(0, 240);
     let threadId = "main";
     let conversation: any[] = [];

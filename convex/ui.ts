@@ -1,10 +1,19 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { requireAdmin } from "./controlAuth";
+import {
+  actorAuthArgs,
+  dispatcherAuthArgs,
+  requireActor,
+  requireAdmin,
+  requireDispatcher,
+  requireViewer,
+  viewerAuthArgs,
+} from "./controlAuth";
 
 export const setPanel = mutation({
-  args: { type: v.string(), value: v.string(), title: v.optional(v.string()) },
+  args: { type: v.string(), value: v.string(), title: v.optional(v.string()), ...dispatcherAuthArgs },
   handler: async (ctx, a) => {
+    await requireDispatcher(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first();
     const doc = { key: "panel", type: a.type, value: a.value, title: a.title, updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
@@ -13,16 +22,20 @@ export const setPanel = mutation({
 });
 
 export const clearPanel = mutation({
-  args: {},
-  handler: async (ctx) => {
+  args: { ...actorAuthArgs },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first();
     if (ex) await ctx.db.delete(ex._id);
   },
 });
 
 export const getPanel = query({
-  args: {},
-  handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first(),
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first();
+  },
 });
 
 // Global subscription agent selection. Trigger jobs read this before claiming
@@ -39,8 +52,9 @@ export const setAgentProvider = mutation({
 });
 
 export const getAgentProvider = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "agentProvider")).first();
     return row?.value === "claude" ? "claude" : "codex";
   },
@@ -50,8 +64,9 @@ export const getAgentProvider = query({
 // (the one Daniel last interacted with, or the live-mode tab). Everyone else
 // stays silent — this is what kills the "two voices" problem for good.
 export const claimVoice = mutation({
-  args: { client: v.string() },
+  args: { client: v.string(), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "voice")).first();
     const doc = { key: "voice", type: "voice", value: a.client, updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
@@ -63,8 +78,9 @@ export const claimVoice = mutation({
 // wins atomically; a fresh claim by another client is respected. User-action
 // claims (typing, mic) keep using claimVoice, which always wins.
 export const electVoice = mutation({
-  args: { client: v.string() },
+  args: { client: v.string(), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "voice")).first();
     if (ex && ex.value !== a.client && Date.now() - ex.updatedAt <= 3 * 60 * 1000) return false;
     const doc = { key: "voice", type: "voice", value: a.client, updatedAt: Date.now() };
@@ -75,16 +91,20 @@ export const electVoice = mutation({
 });
 
 export const getVoice = query({
-  args: {},
-  handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "voice")).first(),
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "voice")).first();
+  },
 });
 
 // Global live-mode lock: at most ONE live session across all of Daniel's
 // devices, and while it's fresh no tab anywhere plays local TTS. The live
 // voice is the only possible speaker — two voices become impossible.
 export const setLiveOn = mutation({
-  args: { client: v.string(), on: v.boolean() },
+  args: { client: v.string(), on: v.boolean(), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "liveOn")).first();
     if (!a.on) {
       if (ex && ex.value === a.client) await ctx.db.delete(ex._id);
@@ -107,8 +127,9 @@ export const setLiveOn = mutation({
 // past its lease is definitionally not held, so report it as none at the source
 // rather than leaving a stale row to masquerade as a live session.
 export const getLiveOn = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "liveOn")).first();
     if (!row || Date.now() - row.updatedAt >= 45_000) return null;
     return row;
@@ -119,8 +140,9 @@ export const getLiveOn = query({
 // the client relays it into the YouTube iframe via the JS API. updatedAt is the
 // nonce — the client acts once per fresh command.
 export const setVideoCmd = mutation({
-  args: { cmd: v.string() },
+  args: { cmd: v.string(), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "videoCmd")).first();
     const doc = { key: "videoCmd", type: "cmd", value: a.cmd, updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
@@ -129,15 +151,19 @@ export const setVideoCmd = mutation({
 });
 
 export const getVideoCmd = query({
-  args: {},
-  handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "videoCmd")).first(),
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "videoCmd")).first();
+  },
 });
 
 // Orb mood: the brain shifts the orb's colour to match the conversation's
 // tone; the client lerps toward it slowly and falls back to green when stale.
 export const setMood = mutation({
-  args: { mood: v.string(), manual: v.optional(v.boolean()) },
+  args: { mood: v.string(), manual: v.optional(v.boolean()), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "mood")).first();
     // Mood is alive but not a strobe: a genuine model shift holds ~45s before
     // the next. Daniel's MANUAL picks (options panel) always take instantly.
@@ -152,8 +178,9 @@ export const setMood = mutation({
 // row for this broke speech ordering: the interim row outlived the answer row
 // in createdAt order, so the answer was never spoken.
 export const say = mutation({
-  args: { text: v.string() },
+  args: { text: v.string(), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "say")).first();
     const doc = { key: "say", type: "say", value: a.text, updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
@@ -161,13 +188,19 @@ export const say = mutation({
   },
 });
 export const getSay = query({
-  args: {},
-  handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "say")).first(),
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "say")).first();
+  },
 });
 
 export const getMood = query({
-  args: {},
-  handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "mood")).first(),
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "mood")).first();
+  },
 });
 
 // Daniel's current location (granted once, persisted) — so "near me" / place
@@ -183,8 +216,11 @@ export const setLocation = mutation({
   },
 });
 export const getLocation = query({
-  args: {},
-  handler: async (ctx) => ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "location")).first(),
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "location")).first();
+  },
 });
 
 // Chats: one active thread (UI + brain + agent weaves all follow it) plus a
@@ -213,8 +249,9 @@ export const setActiveThread = mutation({
 });
 
 export const getActiveThread = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const r = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "activeThread")).first();
     return r?.value ?? "main";
   },
@@ -240,8 +277,9 @@ export const pruneThreads = mutation({
 });
 
 export const getThreads = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const r = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "threads")).first();
     try {
       return r ? JSON.parse(r.value) : [];

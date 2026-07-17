@@ -30,14 +30,10 @@ const CONVEX_URL =
 const RUN_BUDGET_MS = 50_000;
 const POLL_MS = 2000;
 const IDLE_EXITS = 3;
-const WORKER_MUTATIONS = new Set(["chatQueue:claimNext", "chatQueue:appendChunk", "chatQueue:finalize"]);
-
 async function convexMutation(path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
-  if (WORKER_MUTATIONS.has(path) && !workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
-  const protectedArgs = WORKER_MUTATIONS.has(path)
-    ? { ...((args ?? {}) as Record<string, unknown>), workerToken }
-    : args;
+  if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
+  const protectedArgs = { ...((args ?? {}) as Record<string, unknown>), workerToken };
   const r = await fetch(`${CONVEX_URL}/api/mutation`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -46,10 +42,12 @@ async function convexMutation(path: string, args: unknown) {
   return (await r.json()).value;
 }
 async function convexQuery(path: string, args: unknown) {
+  const workerToken = process.env.JARVIS_WORKER_TOKEN;
+  if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
   const r = await fetch(`${CONVEX_URL}/api/query`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, args, format: "json" }),
+    body: JSON.stringify({ path, args: { ...((args ?? {}) as Record<string, unknown>), workerToken }, format: "json" }),
   });
   return (await r.json()).value;
 }
@@ -119,7 +117,7 @@ function runTurn(
     `Publishing, messaging, booking, money, production deployment, merging and destructive actions MUST be marked consequential and approvalRequired=true; approval only queues the scoped job and is never permission to broaden it. Convex independently enforces this policy.\n` +
     `To SHOW Daniel something on screen (pull up a website, open a document/notes, display an image) when he ` +
     `asks you to show/pull up/open something, run: curl -s -X POST '${CONVEX_URL}/api/mutation' ` +
-    `-H 'content-type: application/json' -d '{"path":"ui:setPanel","args":{"type":"url","value":"https://…","title":"<label>"}}' ` +
+    `-H 'content-type: application/json' -d '{"path":"ui:setPanel","args":{"type":"url","value":"https://…","title":"<label>","dispatchToken":"'"$JARVIS_DISPATCH_TOKEN"'"}}' ` +
     `(type can be "url", "markdown" for text/notes, or "image").\n` +
     "Answer the user's question directly, using the memory and cloud-stack facts above when relevant. " +
     "NEVER narrate your process or mention 'context', 'memory', or 'tool calls' — just give the answer itself.";
@@ -241,7 +239,7 @@ export const chatDispatcher = schedules.task({
   run: async () => {
     const selected = await convexQuery("ui:getAgentProvider", {});
     const provider: AgentProvider = selected === "claude" ? "claude" : "codex";
-    const prepared = prepareSubscriptionEnv(provider);
+    const prepared = prepareSubscriptionEnv(provider, { includeDispatch: true });
     if (prepared.error) return { processed: 0, error: prepared.error };
     const env = prepared.env;
     const bin = resolveSubscriptionAgentBin(provider);

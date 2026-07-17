@@ -9,10 +9,8 @@ const CONVEX_URL =
 
 async function convexMutation(path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
-  if (path === "chatQueue:postAssistant" && !workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
-  const protectedArgs = path === "chatQueue:postAssistant"
-    ? { ...((args ?? {}) as Record<string, unknown>), workerToken }
-    : args;
+  if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
+  const protectedArgs = { ...((args ?? {}) as Record<string, unknown>), workerToken };
   await fetch(`${CONVEX_URL}/api/mutation`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -20,13 +18,15 @@ async function convexMutation(path: string, args: unknown) {
   }).catch(() => {});
 }
 async function convexQuery(path: string, args: unknown) {
+  const workerToken = process.env.JARVIS_WORKER_TOKEN;
+  if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
   try {
     return (
       await (
         await fetch(`${CONVEX_URL}/api/query`, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ path, args, format: "json" }),
+          body: JSON.stringify({ path, args: { ...((args ?? {}) as Record<string, unknown>), workerToken }, format: "json" }),
         })
       ).json()
     ).value;

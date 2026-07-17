@@ -1,11 +1,13 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 
 // Timed reminders: "remind me at 7pm to call mum" → push + spoken weave when
 // due. The agent-runner cron (*/2) sweeps `due` and delivers.
 export const add = mutation({
-  args: { text: v.string(), at: v.number() },
+  args: { text: v.string(), at: v.number(), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     return await ctx.db.insert("reminders", {
       text: a.text.slice(0, 300),
       at: a.at,
@@ -16,8 +18,9 @@ export const add = mutation({
 });
 
 export const due = mutation({
-  args: {},
-  handler: async (ctx) => {
+  args: { ...actorAuthArgs },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     const rows = await ctx.db
       .query("reminders")
       .withIndex("by_status", (q: any) => q.eq("status", "pending"))
@@ -31,15 +34,17 @@ export const due = mutation({
 });
 
 export const complete = mutation({
-  args: { id: v.id("reminders") },
+  args: { id: v.id("reminders"), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     await ctx.db.patch(a.id, { status: "done" });
   },
 });
 
 export const cancel = mutation({
-  args: { match: v.string() },
+  args: { match: v.string(), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     const rows = await ctx.db
       .query("reminders")
       .withIndex("by_status", (q: any) => q.eq("status", "pending"))
@@ -53,8 +58,9 @@ export const cancel = mutation({
 });
 
 export const upcoming = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const rows = await ctx.db
       .query("reminders")
       .withIndex("by_status", (q: any) => q.eq("status", "pending"))

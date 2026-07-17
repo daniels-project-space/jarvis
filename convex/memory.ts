@@ -1,5 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 
 // Write a memory row. Full/long bodies live in R2 (r2Key); this row is the
 // reactive index + a short/distilled body for quick recall.
@@ -10,8 +11,10 @@ export const write = mutation({
     body: v.string(),
     tags: v.optional(v.array(v.string())),
     r2Key: v.optional(v.string()),
+    ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     const now = Date.now();
     return await ctx.db.insert("memory", {
       kind: a.kind,
@@ -26,8 +29,9 @@ export const write = mutation({
 });
 
 export const recent = query({
-  args: { kind: v.optional(v.string()), limit: v.optional(v.number()) },
+  args: { kind: v.optional(v.string()), limit: v.optional(v.number()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const lim = a.limit ?? 20;
     if (a.kind) {
       const kind = a.kind;
@@ -44,8 +48,9 @@ export const recent = query({
 // Indexed lexical search: the previous implementation read the latest 400
 // rows on every conversation turn, which was the dominant avoidable Convex IO.
 export const search = query({
-  args: { q: v.string(), limit: v.optional(v.number()) },
+  args: { q: v.string(), limit: v.optional(v.number()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const lim = a.limit ?? 20;
     const needle = a.q.trim().slice(0, 240);
     if (!needle) return [];

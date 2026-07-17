@@ -7,6 +7,8 @@ import { INFRA_MAP } from "../lib/persona";
 import { routeWork } from "../mastra/routing";
 import { TEAM_BY_SLUG, type AgentSlug } from "../mastra/team";
 import { codexExecPrefix, codexModelFor } from "./model-policy";
+import { githubGitEnv, githubRepoUrl } from "./git-transport";
+import { vaultService } from "../lib/vault-client";
 import {
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
@@ -19,25 +21,6 @@ import {
 
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
-
-const WORKER_MUTATIONS = new Set([
-  "jobs:enqueue",
-  "jobs:claimNext",
-  "jobs:finalize",
-  "jobs:reapStale",
-  "jobs:updateProgress",
-  "jobs:checkpointAndRequeue",
-  "jobs:requestInput",
-  "jobs:setDelivery",
-  "missions:checkComplete",
-  "missions:claimReady",
-  "missions:finish",
-  "chatQueue:reapStuck",
-  "chatQueue:postAssistant",
-  "chatQueue:postCard",
-  "incidents:claimForRepair",
-  "incidents:setStatus",
-]);
 
 function promptArgs(env: NodeJS.ProcessEnv, prompt: string, tier: string, json = false, mcpConfig?: string | null): string[] {
   if (env.JARVIS_AGENT_PROVIDER !== "codex") {
@@ -74,10 +57,8 @@ function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, tier: 
 }
 async function convexMutation(path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
-  if (WORKER_MUTATIONS.has(path) && !workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
-  const protectedArgs = WORKER_MUTATIONS.has(path)
-    ? { ...((args ?? {}) as Record<string, unknown>), workerToken }
-    : args;
+  if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
+  const protectedArgs = { ...((args ?? {}) as Record<string, unknown>), workerToken };
   const response = await fetch(`${CONVEX_URL}/api/mutation`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -90,13 +71,15 @@ async function convexMutation(path: string, args: unknown) {
   return payload.value;
 }
 async function convexQuery(path: string, args: unknown) {
+  const workerToken = process.env.JARVIS_WORKER_TOKEN;
+  if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
   try {
     return (
       await (
         await fetch(`${CONVEX_URL}/api/query`, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ path, args, format: "json" }),
+          body: JSON.stringify({ path, args: { ...((args ?? {}) as Record<string, unknown>), workerToken }, format: "json" }),
         })
       ).json()
     ).value;
@@ -119,25 +102,11 @@ function sh(cmd: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code
     p.on("error", () => res({ code: -1, out: o }));
   });
 }
+
 // Sub-agent model routing: match the brain's economy — Opus only for real
 // engineering, Sonnet for the middle, Haiku for trivial lookups/one-liners.
 function pickAgentModel(task: string): string {
   return routeWork(task).model;
-}
-
-const VAULT_URL = "https://fantastic-roadrunner-485.convex.cloud";
-async function vaultService(service: string): Promise<Record<string, string>> {
-  try {
-    const r = await fetch(`${VAULT_URL}/api/query`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ path: "secrets:listByService", args: { service }, format: "json" }),
-    });
-    const rows = ((await r.json()).value ?? []) as { keyName: string; value: string }[];
-    return Object.fromEntries(rows.map((s) => [s.keyName, s.value]));
-  } catch {
-    return {};
-  }
 }
 
 // Cheapest live price for a product (UK) — self-contained so the price-watch
@@ -687,17 +656,21 @@ export const agentRunner = schedules.task({
         if (repo && token) {
           const dir = `/tmp/work/${repo.replace(/[^a-zA-Z0-9]/g, "_")}_${String(job.jobId).slice(-6)}`;
           rmSync(dir, { recursive: true, force: true });
-          const url = `https://x-access-token:${token}@github.com/${repo}.git`;
+          const url = githubRepoUrl(repo);
+          const gitEnv = githubGitEnv(env, token);
           if (job.branch) {
-            await sh("git", ["clone", "--depth", "1", "--single-branch", "--branch", String(job.branch), url, dir], env);
+            await sh("git", ["clone", "--depth", "1", "--single-branch", "--branch", String(job.branch), url, dir], gitEnv);
           }
           if (!existsSync(join(dir, ".git"))) {
             rmSync(dir, { recursive: true, force: true });
-            await sh("git", ["clone", "--depth", "1", url, dir], env);
+            await sh("git", ["clone", "--depth", "1", url, dir], gitEnv);
           }
           if (existsSync(join(dir, ".git"))) {
             cwd = dir;
             repoDir = dir;
+            // Defense in depth: the subprocess only ever sees a credential-free
+            // remote even if Git changes clone credential persistence behavior.
+            await sh("git", ["-C", dir, "remote", "set-url", "origin", url], env);
             await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
             await sh("git", ["-C", dir, "config", "user.name", `${profile.name} via JARVIS`], env);
             baseSha = (await sh("git", ["-C", dir, "rev-parse", "HEAD"], env)).out.trim();
@@ -769,7 +742,8 @@ export const agentRunner = schedules.task({
         let pushFailed = false;
         let changed = false;
         if (repoDir && token && branch && !job.readonly) {
-          const pushUrl = `https://x-access-token:${token}@github.com/${repo}.git`;
+          const pushUrl = githubRepoUrl(repo);
+          const gitEnv = githubGitEnv(env, token);
           await sh("git", ["-C", repoDir, "add", "-A"], env);
           await sh(
             "git",
@@ -777,16 +751,16 @@ export const agentRunner = schedules.task({
             env,
           );
           const local = (await sh("git", ["-C", repoDir, "rev-parse", "HEAD"], env)).out.trim();
-          const remote = (await sh("git", ["-C", repoDir, "ls-remote", pushUrl, `refs/heads/${branch}`], env)).out.split(/\s/)[0]?.trim();
+          const remote = (await sh("git", ["-C", repoDir, "ls-remote", pushUrl, `refs/heads/${branch}`], gitEnv)).out.split(/\s/)[0]?.trim();
           const needsPush = Boolean(local && local !== (remote || baseSha));
           if (!needsPush) {
             pushNote = remote ? `existing checkpoint branch ${branch} retained` : "no repository changes were needed";
           } else {
             if (await stopIfLeaseLost(checkpointText, result, branch)) return;
-            let push = await sh("git", ["-C", repoDir, "push", pushUrl, `HEAD:refs/heads/${branch}`], env);
+            let push = await sh("git", ["-C", repoDir, "push", pushUrl, `HEAD:refs/heads/${branch}`], gitEnv);
             if (/shallow update not allowed/i.test(push.out)) {
-              await sh("git", ["-C", repoDir, "fetch", "--unshallow"], env);
-              push = await sh("git", ["-C", repoDir, "push", pushUrl, `HEAD:refs/heads/${branch}`], env);
+              await sh("git", ["-C", repoDir, "fetch", "--unshallow"], gitEnv);
+              push = await sh("git", ["-C", repoDir, "push", pushUrl, `HEAD:refs/heads/${branch}`], gitEnv);
             }
             pushFailed = push.code !== 0;
             pushNote = pushFailed

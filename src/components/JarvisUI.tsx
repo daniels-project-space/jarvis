@@ -1,8 +1,9 @@
 "use client";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery, useMutation } from "convex/react";
 import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
+import { useJarvisQuery } from "@/lib/secure-convex";
+import { clientMutation } from "@/lib/client-mutation";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
 import CommandDeck from "./CommandDeck";
@@ -994,8 +995,8 @@ function SpokenCaption({ caption }: { caption: { who: "you" | "jarvis"; text: st
 }
 
 export default function JarvisUI() {
-  const thread = (useQuery(api.ui.getActiveThread, {}) ?? "main") as string;
-  const threads = (useQuery(api.ui.getThreads, {}) ?? []) as { id: string; title: string; at: number }[];
+  const thread = (useJarvisQuery(api.ui.getActiveThread, {}) ?? "main") as string;
+  const threads = (useJarvisQuery(api.ui.getThreads, {}) ?? []) as { id: string; title: string; at: number }[];
   const setActiveThread = (args: { thread: string; title?: string }) =>
     fetch("/api/client-state", {
       method: "POST",
@@ -1012,28 +1013,28 @@ export default function JarvisUI() {
   useEffect(() => {
     threadRef.current = thread;
   }, [thread]);
-  const messages = (useQuery(api.chatQueue.listMessages, { threadId: thread }) ?? []) as Msg[];
-  const panel = useQuery(api.ui.getPanel, {}) as
+  const messages = (useJarvisQuery(api.chatQueue.listMessages, { threadId: thread }) ?? []) as Msg[];
+  const panel = useJarvisQuery(api.ui.getPanel, {}) as
     | { type: string; value: string; title?: string; updatedAt: number }
     | null
     | undefined;
-  const sayRow = useQuery(api.ui.getSay, {}) as { value: string; updatedAt: number } | null | undefined;
+  const sayRow = useJarvisQuery(api.ui.getSay, {}) as { value: string; updatedAt: number } | null | undefined;
   const stagePanelSize = useMemo(() => (panel ? panelSize(panel) : ""), [panel]);
-  const clearPanel = useMutation(api.ui.clearPanel);
-  const setPanel = useMutation(api.ui.setPanel);
+  const clearPanel = (args: Record<string, unknown>) => clientMutation("ui:clearPanel", args);
+  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
   const logTurn = (args: { threadId?: string; role: string; text: string; model?: string }) =>
     fetch("/api/client-state", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "log_turn", ...args }),
     });
-  const saveSub = useMutation(api.push.saveSub);
-  const claimVoice = useMutation(api.ui.claimVoice);
-  const electVoice = useMutation(api.ui.electVoice);
-  const setLiveOn = useMutation(api.ui.setLiveOn);
-  const voiceRow = useQuery(api.ui.getVoice, {}) as { value: string; updatedAt: number } | null | undefined;
-  const liveOnRow = useQuery(api.ui.getLiveOn, {}) as { value: string; updatedAt: number } | null | undefined;
-  const activeJobs = (useQuery(api.jobs.active, {}) ?? []) as Job[];
+  const saveSub = (args: Record<string, unknown>) => clientMutation("push:saveSub", args);
+  const claimVoice = (args: Record<string, unknown>) => clientMutation("ui:claimVoice", args);
+  const electVoice = (args: Record<string, unknown>) => clientMutation("ui:electVoice", args);
+  const setLiveOn = (args: Record<string, unknown>) => clientMutation("ui:setLiveOn", args);
+  const voiceRow = useJarvisQuery(api.ui.getVoice, {}) as { value: string; updatedAt: number } | null | undefined;
+  const liveOnRow = useJarvisQuery(api.ui.getLiveOn, {}) as { value: string; updatedAt: number } | null | undefined;
+  const activeJobs = (useJarvisQuery(api.jobs.active, {}) ?? []) as Job[];
 
   const [input, setInput] = useState("");
   const [speaking, setSpeaking] = useState(false);
@@ -1132,7 +1133,7 @@ export default function JarvisUI() {
 
   // Finished background work → bottom popup cards (stack of 3, click to expand
   // into the distilled breakdown, auto-gone after 5 hours, dismissable).
-  const findingsRecent = (useQuery(api.findings.recent, { limit: 8 }) ?? []) as {
+  const findingsRecent = (useJarvisQuery(api.findings.recent, { limit: 8 }) ?? []) as {
     _id: string;
     spoken: string;
     detail: string;
@@ -1181,7 +1182,7 @@ export default function JarvisUI() {
   };
 
   // Orb mood: the brain sets a tone colour; the orb drifts into it slowly.
-  const moodRow = useQuery(api.ui.getMood, {}) as { value: string; updatedAt: number } | null | undefined;
+  const moodRow = useJarvisQuery(api.ui.getMood, {}) as { value: string; updatedAt: number } | null | undefined;
   const MOOD_COLORS: Record<string, string> = {
     calm: "#00ff88", focused: "#4a9eed", dreamy: "#9775fa", warm: "#ffb454", playful: "#ff7ad9", tender: "#ff9ec4", curious: "#33e0d0",
     serious: "#8fa3bd", alert: "#ff5470", excited: "#ff7ad9",
@@ -1196,8 +1197,8 @@ export default function JarvisUI() {
 
   // Options panel + persisted preferences (voice lane, TTS voice, wake, motion)
   const [optionsOpen, setOptionsOpen] = useState(false);
-  const setMoodMut = useMutation(api.ui.setMood);
-  const agentProvider = (useQuery(api.ui.getAgentProvider, {}) ?? "codex") as "codex" | "claude";
+  const setMoodMut = (args: Record<string, unknown>) => clientMutation("ui:setMood", args);
+  const agentProvider = (useJarvisQuery(api.ui.getAgentProvider, {}) ?? "codex") as "codex" | "claude";
   const setAgentProvider = (args: { provider: "codex" | "claude" }) =>
     fetch("/api/client-state", {
       method: "POST",
@@ -1271,7 +1272,7 @@ export default function JarvisUI() {
   const [activeVideo, setActiveVideo] = useState<{ value: string; title?: string } | null>(null);
   const panelTypeRef = useRef<string | null>(null);
   const videoIframeRef = useRef<HTMLIFrameElement | null>(null);
-  const videoCmd = useQuery(api.ui.getVideoCmd, {}) as { value: string; updatedAt: number } | null | undefined;
+  const videoCmd = useJarvisQuery(api.ui.getVideoCmd, {}) as { value: string; updatedAt: number } | null | undefined;
   const lastVideoCmd = useRef(-1);
   // The brain's video remote: relay play/pause into the YouTube iframe, close kills it.
   const videoMountTs = useRef(Date.now());
@@ -1396,9 +1397,8 @@ export default function JarvisUI() {
     // release the live lock instantly if the tab closes mid-session
     const bye = () => {
       if (!liveRef.current) return;
-      const url = `${process.env.NEXT_PUBLIC_CONVEX_URL}/api/mutation`;
-      const body = JSON.stringify({ path: "ui:setLiveOn", args: { client: me.current, on: false }, format: "json" });
-      navigator.sendBeacon?.(url, new Blob([body], { type: "application/json" }));
+      const body = JSON.stringify({ path: "ui:setLiveOn", args: { client: me.current, on: false } });
+      navigator.sendBeacon?.("/api/client-mutation", new Blob([body], { type: "application/json" }));
     };
     window.addEventListener("pagehide", bye);
     return () => window.removeEventListener("pagehide", bye);

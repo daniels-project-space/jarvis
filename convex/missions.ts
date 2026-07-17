@@ -1,6 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { requireDispatcher, requireWorker } from "./controlAuth";
+import { requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 
 const SYNTHESIS_LEASE_MS = 20 * 60 * 1000;
 
@@ -57,15 +57,19 @@ export const create = mutation({
 });
 
 export const get = query({
-  args: { id: v.id("missions") },
-  handler: async (ctx, a) => ctx.db.get(a.id),
+  args: { id: v.id("missions"), ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return ctx.db.get(a.id);
+  },
 });
 
 // Missions still in flight plus recent history. Finished missions remain useful
 // context for the command centre; do not make them disappear after ten minutes.
 export const active = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const rows = await ctx.db.query("missions").withIndex("by_createdAt").order("desc").take(20);
     const live = rows.filter(
       (m: any) => m.status === "running" || m.status === "synthesizing" || Date.now() - m.updatedAt < 14 * 86_400_000,

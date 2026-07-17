@@ -3,6 +3,8 @@ import { PERSONA, CAPABILITIES, REMEMBER } from "@/lib/persona";
 import { buildContext, convexMutation } from "@/lib/context";
 import { getSecret } from "@/lib/vault";
 import { STT_PROMPT } from "@/lib/sttvocab";
+import { adminSessionHash, validateAdminSession } from "@/lib/control-session";
+import { withAdminSession } from "@/lib/control-context";
 
 // Live mode: mint an ephemeral OpenAI Realtime client secret with JARVIS's
 // persona, fresh context, recent conversation AND the live-session lock baked
@@ -12,7 +14,7 @@ import { STT_PROMPT } from "@/lib/sttvocab";
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
-export async function POST(req: NextRequest) {
+async function handlePost(req: NextRequest) {
   const key = process.env.OPENAI_API_KEY ?? (await getSecret("openai", "OPENAI_API_KEY").catch(() => ""));
   if (!key) return Response.json({ error: "no openai key" }, { status: 500 });
 
@@ -121,4 +123,12 @@ export async function POST(req: NextRequest) {
     instructions,
     voice: process.env.REALTIME_VOICE || "ash",
   });
+}
+
+export async function POST(req: NextRequest) {
+  const authTokenHash = await adminSessionHash(req);
+  if (!authTokenHash || !(await validateAdminSession(authTokenHash))) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  return withAdminSession(authTokenHash, () => handlePost(req));
 }

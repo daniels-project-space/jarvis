@@ -1,7 +1,8 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
-import { useMutation, useQuery } from "convex/react";
 import { api } from "../../../convex/_generated/api";
+import { useJarvisQuery } from "@/lib/secure-convex";
+import { clientMutation } from "@/lib/client-mutation";
 
 // JARVIS everywhere: the embeddable mini-orb + one-line composer that lives on
 // the project hub and any internal app (loaded via /jarvis-embed.js iframe).
@@ -33,10 +34,10 @@ export default function Embed() {
   const me = useRef("");
   const liveRef = useRef(false);
   const recRef = useRef<MediaRecorder | null>(null);
-  const claimVoice = useMutation(api.ui.claimVoice);
-  const setLiveOn = useMutation(api.ui.setLiveOn);
+  const claimVoice = (args: Record<string, unknown>) => clientMutation("ui:claimVoice", args);
+  const setLiveOn = (args: Record<string, unknown>) => clientMutation("ui:setLiveOn", args);
   const liveBeat = useRef<ReturnType<typeof setInterval> | null>(null);
-  const voiceRow = useQuery(api.ui.getVoice, {}) as { value: string; updatedAt: number } | null | undefined;
+  const voiceRow = useJarvisQuery(api.ui.getVoice, {}) as { value: string; updatedAt: number } | null | undefined;
   const voiceRowRef = useRef<{ value: string; updatedAt: number } | null>(null);
   useEffect(() => {
     voiceRowRef.current = voiceRow ?? null;
@@ -47,7 +48,7 @@ export default function Embed() {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "log_turn", ...args }),
     });
-  const liveOnRow = useQuery(api.ui.getLiveOn, {}) as { value: string; updatedAt: number } | null | undefined;
+  const liveOnRow = useJarvisQuery(api.ui.getLiveOn, {}) as { value: string; updatedAt: number } | null | undefined;
   const liveOnRef = useRef<typeof liveOnRow>(null);
   useEffect(() => {
     liveOnRef.current = liveOnRow;

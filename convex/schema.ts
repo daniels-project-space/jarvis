@@ -168,6 +168,19 @@ export default defineSchema({
     .index("by_token", ["tokenHash"])
     .index("by_expiry", ["expiresAt"]),
 
+  // Short-lived, read-only capabilities issued only after an HttpOnly admin
+  // session is validated. The browser may hold this scoped token in memory,
+  // but the admin bearer never leaves its cookie and mutations reject viewers.
+  viewerSessions: defineTable({
+    token: v.string(),
+    adminTokenHash: v.string(),
+    createdAt: v.number(),
+    expiresAt: v.number(),
+  })
+    .index("by_token", ["token"])
+    .index("by_admin", ["adminTokenHash"])
+    .index("by_expiry", ["expiresAt"]),
+
   // Permanent team roster. These are durable identities with stable roles,
   // scope and model policy; jobs reference the profile rather than inventing
   // an anonymous agent on every turn.

@@ -1,5 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 
 const TEAM = [
   {
@@ -65,8 +66,9 @@ const TEAM = [
 ] as const;
 
 export const seed = mutation({
-  args: {},
-  handler: async (ctx) => {
+  args: { ...actorAuthArgs },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     let created = 0;
     let updated = 0;
     for (const member of TEAM) {
@@ -98,8 +100,9 @@ export const seed = mutation({
 });
 
 export const list = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const statuses = ["running", "pending", "awaiting_approval", "paused", "needs_input"];
     const [profiles, groups] = await Promise.all([
       ctx.db.query("agentProfiles").collect(),
@@ -133,8 +136,10 @@ export const setWork = mutation({
     slug: v.string(),
     status: v.string(),
     currentJobId: v.optional(v.string()),
+    ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     const row = await ctx.db
       .query("agentProfiles")
       .withIndex("by_slug", (q: any) => q.eq("slug", a.slug))
@@ -150,8 +155,9 @@ export const setWork = mutation({
 });
 
 export const recordOutcome = mutation({
-  args: { slug: v.string(), success: v.boolean(), durationMs: v.number() },
+  args: { slug: v.string(), success: v.boolean(), durationMs: v.number(), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     const row = await ctx.db
       .query("agentProfiles")
       .withIndex("by_slug", (q: any) => q.eq("slug", a.slug))

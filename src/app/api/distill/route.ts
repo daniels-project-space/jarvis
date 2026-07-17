@@ -1,6 +1,8 @@
 import type { NextRequest } from "next/server";
 import { convexMutation, convexQuery } from "@/lib/context";
 import { getSecret } from "@/lib/vault";
+import { adminSessionHash, validateAdminSession } from "@/lib/control-session";
+import { withAdminSession } from "@/lib/control-context";
 
 // Popup-card intelligence: each background finding gets screened (is this
 // worth Daniel's attention at all?) and compressed into a few crisp bullets.
@@ -15,7 +17,7 @@ important=true for: things he explicitly asked for, money/business/rentals/custo
 
 bullets: 3-5 points, each under 14 words, plain human language, keep concrete numbers/names/links, no jargon, no preamble.`;
 
-export async function POST(req: NextRequest) {
+async function handlePost(req: NextRequest) {
   let id = "";
   try {
     id = String((await req.json()).id ?? "");
@@ -57,4 +59,12 @@ export async function POST(req: NextRequest) {
   }
   await convexMutation("findings:distill", { id, bullets, important }).catch(() => {});
   return Response.json({ important, bullets });
+}
+
+export async function POST(req: NextRequest) {
+  const authTokenHash = await adminSessionHash(req);
+  if (!authTokenHash || !(await validateAdminSession(authTokenHash))) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  return withAdminSession(authTokenHash, () => handlePost(req));
 }

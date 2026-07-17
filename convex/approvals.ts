@@ -1,15 +1,17 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { requireAdmin } from "./controlAuth";
+import { requireAdmin, requireViewer, viewerAuthArgs } from "./controlAuth";
 
 export const pending = query({
-  args: {},
-  handler: async (ctx) =>
-    await ctx.db
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return await ctx.db
       .query("approvals")
       .withIndex("by_status", (q: any) => q.eq("status", "pending"))
       .order("desc")
-      .take(30),
+      .take(30);
+  },
 });
 
 export const decide = mutation({

@@ -29,7 +29,11 @@ export function resolveSubscriptionAgentBin(provider: AgentProvider): string | n
   }
 }
 
-function scopedSubscriptionEnv(source: NodeJS.ProcessEnv, provider: AgentProvider): NodeJS.ProcessEnv {
+function scopedSubscriptionEnv(
+  source: NodeJS.ProcessEnv,
+  provider: AgentProvider,
+  includeDispatch: boolean,
+): NodeJS.ProcessEnv {
   const allow = [
     "PATH",
     "HOME",
@@ -47,10 +51,12 @@ function scopedSubscriptionEnv(source: NodeJS.ProcessEnv, provider: AgentProvide
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CODEX_ACCESS_TOKEN",
     "JARVIS_AGENT_PROVIDER",
-    // Dispatch is intentionally narrower than the runner capability: chat can
-    // create policy-checked work, but cannot claim, approve, or finalize it.
-    "JARVIS_DISPATCH_TOKEN",
   ];
+  if (includeDispatch) {
+    // Only the conversational supervisor may delegate policy-checked work.
+    // Specialist/reviewer subprocesses never receive this authority.
+    allow.push("JARVIS_DISPATCH_TOKEN");
+  }
   const env = {} as NodeJS.ProcessEnv;
   for (const key of allow) if (source[key] !== undefined) env[key] = source[key];
   env.JARVIS_AGENT_PROVIDER = provider;
@@ -82,19 +88,21 @@ function writableCodexHome(): string | null {
 
 export function prepareSubscriptionEnv(
   provider: AgentProvider,
+  options: { includeDispatch?: boolean } = {},
 ): { env: NodeJS.ProcessEnv; error?: string } {
+  const includeDispatch = options.includeDispatch === true;
   if (provider === "claude") {
     const home = process.env.JARVIS_CLAUDE_HOME ?? "/tmp/claude-home";
     mkdirSync(join(home, ".claude"), { recursive: true });
     return {
-      env: scopedSubscriptionEnv({ ...process.env, HOME: home }, provider),
+      env: scopedSubscriptionEnv({ ...process.env, HOME: home }, provider, includeDispatch),
     };
   }
 
   const home = writableCodexHome();
   if (!home) {
     return {
-      env: scopedSubscriptionEnv(process.env, provider),
+      env: scopedSubscriptionEnv(process.env, provider, includeDispatch),
       error: "a writable non-temporary Codex home is unavailable",
     };
   }
@@ -110,14 +118,14 @@ export function prepareSubscriptionEnv(
       chmodSync(authPath, 0o600);
     } catch {
       return {
-        env: scopedSubscriptionEnv(process.env, provider),
+        env: scopedSubscriptionEnv(process.env, provider, includeDispatch),
         error: "invalid Codex subscription auth",
       };
     }
   }
   if (!process.env.CODEX_ACCESS_TOKEN && !encoded && !raw) {
     return {
-      env: scopedSubscriptionEnv(process.env, provider),
+      env: scopedSubscriptionEnv(process.env, provider, includeDispatch),
       error: "Codex subscription auth is not configured",
     };
   }
@@ -130,6 +138,7 @@ export function prepareSubscriptionEnv(
         CODEX_HOME: home,
       },
       provider,
+      includeDispatch,
     ),
   };
 }

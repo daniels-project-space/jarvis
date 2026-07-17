@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isAdminSession, requireAdmin, requireDispatcher, requireWorker } from "../../convex/controlAuth";
+import { isAdminSession, requireAdmin, requireDispatcher, requireViewer, requireWorker } from "../../convex/controlAuth";
 
 function authContext(session: { tokenHash: string; expiresAt: number } | null) {
   return {
@@ -50,5 +50,27 @@ describe("privileged control authentication", () => {
     await expect(requireDispatcher(ctx, { workerToken: "worker-capability" })).resolves.toBeUndefined();
     await expect(requireDispatcher(ctx, { authTokenHash: tokenHash })).resolves.toBeUndefined();
     await expect(requireDispatcher(authContext(null), {})).rejects.toThrow(/Authentication required/);
+  });
+
+  it("accepts a live read-only viewer capability without treating it as admin", async () => {
+    const viewerToken = "d".repeat(64);
+    const ctx = {
+      db: {
+        query: (table: string) => ({
+          withIndex: (_index: string, apply: (q: { eq: (field: string, value: string) => unknown }) => unknown) => {
+            let requested = "";
+            apply({ eq: (_field, value) => { requested = value; return {}; } });
+            return {
+              first: async () => table === "viewerSessions" && requested === viewerToken
+                ? { token: viewerToken, expiresAt: Date.now() + 60_000 }
+                : null,
+            };
+          },
+        }),
+      },
+    };
+    await expect(requireViewer(ctx, { viewerToken })).resolves.toBeUndefined();
+    await expect(requireAdmin(ctx, viewerToken)).rejects.toThrow(/Authentication required/);
+    await expect(requireViewer(ctx, { viewerToken: "e".repeat(64) })).rejects.toThrow(/Authentication required/);
   });
 });

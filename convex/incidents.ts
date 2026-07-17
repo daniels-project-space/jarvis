@@ -1,6 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { requireActor, requireDispatcher, requireWorker } from "./controlAuth";
+import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 
 // Self-healing incident ledger. report() dedups by signature (48h window):
 // an existing open/dispatched incident just bumps count; a recently-resolved
@@ -104,8 +104,9 @@ export const setStatus = mutation({
 });
 
 export const list = query({
-  args: { limit: v.optional(v.number()) },
+  args: { limit: v.optional(v.number()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const rows = await ctx.db.query("incidents").collect();
     return rows.sort((x: any, y: any) => y.updatedAt - x.updatedAt).slice(0, a.limit ?? 10);
   },

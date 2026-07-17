@@ -1,5 +1,6 @@
 import { schedules } from "@trigger.dev/sdk/v3";
 import { sendPush } from "./push-send";
+import { vaultService } from "../lib/vault-client";
 
 // Slice C — awareness. Polls the cloud stack (Vercel deploy health across all of
 // Daniel's apps) and writes a snapshot to Convex `projectState`, which the brain
@@ -7,16 +8,12 @@ import { sendPush } from "./push-send";
 
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
-const VAULT_URL = process.env.VAULT_URL ?? "https://fantastic-roadrunner-485.convex.cloud";
 const VERCEL_TEAM = "team_VY2PwHgXLV9Bo0vs2iXdnGxw";
 
 async function convexMutation(path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
-  const protectedPath = path === "chatQueue:postAssistant" || path === "incidents:report";
-  if (protectedPath && !workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
-  const protectedArgs = protectedPath
-    ? { ...((args ?? {}) as Record<string, unknown>), workerToken }
-    : args;
+  if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
+  const protectedArgs = { ...((args ?? {}) as Record<string, unknown>), workerToken };
   await fetch(`${CONVEX_URL}/api/mutation`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -24,13 +21,15 @@ async function convexMutation(path: string, args: unknown) {
   }).catch(() => {});
 }
 async function convexQuery(path: string, args: unknown) {
+  const workerToken = process.env.JARVIS_WORKER_TOKEN;
+  if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
   try {
     return (
       await (
         await fetch(`${CONVEX_URL}/api/query`, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ path, args, format: "json" }),
+          body: JSON.stringify({ path, args: { ...((args ?? {}) as Record<string, unknown>), workerToken }, format: "json" }),
         })
       ).json()
     ).value;
@@ -38,25 +37,10 @@ async function convexQuery(path: string, args: unknown) {
     return null;
   }
 }
-async function vaultService(service: string): Promise<Record<string, string>> {
-  const r = await fetch(`${VAULT_URL}/api/query`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path: "secrets:listByService", args: { service }, format: "json" }),
-  });
-  const rows = ((await r.json()).value ?? []) as Array<{ keyName: string; value: string }>;
-  return Object.fromEntries(rows.map((x) => [x.keyName, x.value]));
-}
-
 
 async function chatThread(): Promise<string> {
   try {
-    const r = await fetch(`${CONVEX_URL}/api/query`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ path: "ui:getActiveThread", args: {}, format: "json" }),
-    });
-    const t = (await r.json()).value;
+    const t = await convexQuery("ui:getActiveThread", {});
     return typeof t === "string" && t ? t : "main";
   } catch {
     return "main";

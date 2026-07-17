@@ -16,6 +16,13 @@ export async function adminSessionHash(req: NextRequest): Promise<string | null>
   return token ? await sha256Hex(token) : null;
 }
 
+export function isSameOriginRequest(req: NextRequest): boolean {
+  const origin = req.headers.get("origin");
+  if (origin) return origin === req.nextUrl.origin;
+  const fetchSite = req.headers.get("sec-fetch-site");
+  return fetchSite === "same-origin" || fetchSite === "none";
+}
+
 export async function validateAdminSession(tokenHash: string | null): Promise<boolean> {
   if (!tokenHash) return false;
   try {

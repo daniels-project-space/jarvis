@@ -5,7 +5,8 @@ import { buildContext, convexMutation, reportIncident } from "@/lib/context";
 import { extractMemory } from "@/lib/extract";
 import { TOOL_DEFS, executeTool } from "@/lib/tools";
 import { getSecret } from "@/lib/vault";
-import { adminSessionHash } from "@/lib/control-session";
+import { adminSessionHash, validateAdminSession } from "@/lib/control-session";
+import { withAdminSession } from "@/lib/control-context";
 
 // The fast lane: every typed/spoken turn is answered here in seconds by a Groq
 // reflex model with the full tool belt, streaming into Convex (the UI is
@@ -210,8 +211,7 @@ async function runClaude(
   return { final, used, screenTouched };
 }
 
-export async function POST(req: NextRequest) {
-  const authTokenHash = (await adminSessionHash(req)) ?? undefined;
+async function handlePost(req: NextRequest, authTokenHash: string) {
   let text = "",
     threadId = "main";
   try {
@@ -405,4 +405,12 @@ export async function POST(req: NextRequest) {
     if (userId) await convexMutation("chatQueue:requeueUser", { userId, authTokenHash }).catch(() => {});
     return Response.json({ ok: false, fallback: true, error: String(e?.message ?? e) }, { status: 200 });
   }
+}
+
+export async function POST(req: NextRequest) {
+  const authTokenHash = await adminSessionHash(req);
+  if (!authTokenHash || !(await validateAdminSession(authTokenHash))) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  return withAdminSession(authTokenHash, () => handlePost(req, authTokenHash));
 }

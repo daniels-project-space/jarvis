@@ -1,7 +1,8 @@
 "use client";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
+import { useJarvisQuery } from "@/lib/secure-convex";
+import { clientMutation } from "@/lib/client-mutation";
 
 // The richer panel views: frosted-glass calendar, live mind-map canvas,
 // app launcher, PDF viewer, creations library.
@@ -441,7 +442,7 @@ export function FeedView({ value }: { value: string }) {
   const [phase, setPhase] = useState<"hero" | "grid">("hero");
   const [idx, setIdx] = useState(0);
   const [page, setPage] = useState(0);
-  const setPanel = useMutation(api.ui.setPanel);
+  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
 
   // fresh content = fresh presentation (state survives panel swaps otherwise:
   // a second search used to open on a stale page/grid)
@@ -594,7 +595,7 @@ export function DocView({ value }: { value: string }) {
   } catch {
     /* noop */
   }
-  const doc = useQuery(api.creations.get, creationId ? ({ id: creationId } as any) : "skip") as any;
+  const doc = useJarvisQuery(api.creations.get, creationId ? ({ id: creationId } as any) : "skip") as any;
   const [flash, setFlash] = useState(false);
   const prev = useRef<string>("");
   useEffect(() => {
@@ -991,7 +992,7 @@ export function FleetView({ value }: { value: string }) {
   } catch {
     /* noop */
   }
-  const missions = (useQuery(api.missions.active, {}) ?? []) as any[];
+  const missions = (useJarvisQuery(api.missions.active, {}) ?? []) as any[];
   const m = missions.find((x) => x._id === missionId) ?? missions[0];
   if (!m)
     return (
@@ -1058,7 +1059,7 @@ export function VideoListView({ value }: { value: string }) {
   } catch {
     /* noop */
   }
-  const setPanel = useMutation(api.ui.setPanel);
+  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
   if (!w) return <pre className="p-4 text-sm text-ice">{value}</pre>;
   return (
     <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3">
@@ -1537,7 +1538,7 @@ export function CreationsView({ value }: { value: string }) {
     /* noop */
   }
   const [kind, setKind] = useState<string | null>(filter.kind);
-  const rows = (useQuery(api.creations.list, { kind: kind ?? undefined, limit: 60 }) ?? []) as {
+  const rows = (useJarvisQuery(api.creations.list, { kind: kind ?? undefined, limit: 60 }) ?? []) as {
     _id: string;
     kind: string;
     title: string;
@@ -1546,7 +1547,7 @@ export function CreationsView({ value }: { value: string }) {
     thumb?: string;
     updatedAt: number;
   }[];
-  const setPanel = useMutation(api.ui.setPanel);
+  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
 
   const open = (r: (typeof rows)[number]) => {
     if (r.kind === "image" && r.url) void setPanel({ type: "image", value: r.url, title: r.title });

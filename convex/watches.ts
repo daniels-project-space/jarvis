@@ -1,12 +1,14 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 
 // Price watches: JARVIS re-checks a product's cheapest price on a schedule and
 // pings Daniel when it drops below his target (or drops meaningfully). The
 // agent-runner cron drives the re-checks.
 export const add = mutation({
-  args: { query: v.string(), targetGbp: v.optional(v.number()), lastGbp: v.optional(v.number()) },
+  args: { query: v.string(), targetGbp: v.optional(v.number()), lastGbp: v.optional(v.number()), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     return await ctx.db.insert("watches", {
       query: a.query.slice(0, 160),
       targetGbp: a.targetGbp,
@@ -20,8 +22,9 @@ export const add = mutation({
 
 // Watches due for a re-check (every ~3h), oldest first, a few per sweep.
 export const due = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const rows = await ctx.db
       .query("watches")
       .withIndex("by_status", (q: any) => q.eq("status", "active"))
@@ -32,22 +35,25 @@ export const due = query({
 });
 
 export const record = mutation({
-  args: { id: v.id("watches"), lastGbp: v.number() },
+  args: { id: v.id("watches"), lastGbp: v.number(), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     await ctx.db.patch(a.id, { lastGbp: a.lastGbp, checkedAt: Date.now() });
   },
 });
 
 export const touch = mutation({
-  args: { id: v.id("watches") },
+  args: { id: v.id("watches"), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     await ctx.db.patch(a.id, { checkedAt: Date.now() });
   },
 });
 
 export const cancel = mutation({
-  args: { match: v.string() },
+  args: { match: v.string(), ...actorAuthArgs },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     const rows = await ctx.db
       .query("watches")
       .withIndex("by_status", (q: any) => q.eq("status", "active"))
@@ -61,8 +67,9 @@ export const cancel = mutation({
 });
 
 export const list = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
     const rows = await ctx.db
       .query("watches")
       .withIndex("by_status", (q: any) => q.eq("status", "active"))

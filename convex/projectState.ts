@@ -1,5 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 
 // Snapshot of each app's cloud-stack health, written by the stack-poller Trigger
 // task and injected into the brain so JARVIS can answer "state of my apps".
@@ -9,8 +10,10 @@ export const upsert = mutation({
     status: v.string(),
     summary: v.string(),
     data: v.optional(v.any()),
+    ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
+    await requireActor(ctx, a);
     const ex = await ctx.db
       .query("projectState")
       .withIndex("by_slug", (q: any) => q.eq("slug", a.slug))
@@ -22,7 +25,9 @@ export const upsert = mutation({
 });
 
 export const list = query({
-  args: {},
-  handler: async (ctx) =>
-    (await ctx.db.query("projectState").collect()).sort((a: any, b: any) => a.slug.localeCompare(b.slug)),
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return (await ctx.db.query("projectState").collect()).sort((x: any, y: any) => x.slug.localeCompare(y.slug));
+  },
 });
