@@ -417,10 +417,20 @@ function ReactorRing({
   const svgRef = useRef<SVGSVGElement>(null);
   useEffect(() => {
     let frame = 0;
+    let lastPaintAt = 0;
     let lastColor = "";
     let lastAccent = "";
-    const paint = () => {
+    const paint = (now: number) => {
       const motion = motionRef.current;
+      // The orb supplies the exact same continuous phase. Painting the large
+      // SVG/filter at 30 fps (rather than invalidating a 760px filtered SVG on
+      // every browser frame) keeps the ring visually smooth and releases the
+      // main thread for message input and captions.
+      if (!reduceMotion && now - lastPaintAt < 33) {
+        frame = requestAnimationFrame(paint);
+        return;
+      }
+      lastPaintAt = now;
       const degrees = reduceMotion ? 0 : (motion.phase * 180) / Math.PI;
       groupRef.current?.setAttribute("transform", `rotate(${degrees.toFixed(3)} 250 250)`);
       if (motion.color !== lastColor) {

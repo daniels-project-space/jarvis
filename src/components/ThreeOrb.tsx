@@ -54,14 +54,19 @@ export default function ThreeOrb({
     let destroyed = false;
     const compact = window.matchMedia("(max-width: 767px)").matches;
     const reducedMotion = reduceMotion || window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const N = reducedMotion ? 420 : compact ? 800 : 1400;
-    const CONNECTION_SAMPLE = reducedMotion ? 140 : compact ? 190 : 300;
+    // This is a decorative surface, not a simulation benchmark. The former
+    // 1,400-particle desktop mesh repeatedly monopolised the main thread while
+    // JARVIS was trying to caption/speak. A denser shader cannot compensate
+    // for dropped input frames, so keep a rich cloud inside a strict frame
+    // budget instead.
+    const N = reducedMotion ? 220 : compact ? 380 : 680;
+    const CONNECTION_SAMPLE = reducedMotion ? 56 : compact ? 92 : 136;
     const W = () => mount.clientWidth || 1;
     const H = () => mount.clientHeight || 1;
 
     let renderer: THREE.WebGLRenderer;
     try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true, powerPreference: "high-performance" });
     } catch {
       // WebGL can be unavailable after a driver reset, inside a remote browser,
       // or on battery-constrained devices. The orb is decoration: it must never
@@ -113,7 +118,7 @@ export default function ThreeOrb({
     queueMicrotask(() => {
       if (!destroyed) setWebglUnavailable(false);
     });
-    renderer.setPixelRatio(Math.min(compact ? 1.25 : 1.75, window.devicePixelRatio));
+    renderer.setPixelRatio(Math.min(compact ? 1 : 1.25, window.devicePixelRatio));
     renderer.setSize(W(), H());
     renderer.setClearColor(0x000000, 0);
     mount.appendChild(renderer.domElement);
@@ -145,7 +150,7 @@ export default function ThreeOrb({
     scene.add(points);
 
     // ── Connection lines ──
-    const MAX_LINES = compact ? 1800 : 3200;
+    const MAX_LINES = compact ? 720 : 1_200;
     const linePos = new Float32Array(MAX_LINES * 6);
     const lineGeo = new THREE.BufferGeometry();
     lineGeo.setAttribute("position", new THREE.BufferAttribute(linePos, 3));
@@ -193,6 +198,7 @@ export default function ThreeOrb({
     let inViewport = true;
     let frameId = 0;
     let lastRenderedAt = 0;
+    let lastConnectionAt = 0;
 
     const clock = new THREE.Clock();
     const moodBase = new THREE.Color(BASE);
@@ -205,7 +211,10 @@ export default function ThreeOrb({
       frameId = requestAnimationFrame(animate);
       if (document.hidden || !inViewport) return;
       const slowFrame = reducedMotion || stateRef.current === "idle";
-      if (slowFrame && frameTime - lastRenderedAt < (reducedMotion ? 80 : 32)) return;
+      // Active states still get a smooth 48 fps, while an idle orb uses 30 fps
+      // and reduced motion uses 12.5 fps. The browser remains responsive for
+      // typing, captions and panel transitions in every case.
+      if (frameTime - lastRenderedAt < (reducedMotion ? 80 : slowFrame ? 33 : 21)) return;
       lastRenderedAt = frameTime;
       const rawDelta = Math.max(1 / 240, clock.getDelta());
       // Particle physics caps recovery steps after a stalled frame; shared
@@ -313,7 +322,11 @@ export default function ThreeOrb({
       }
       p.needsUpdate = true;
 
-      if (lineAmount > 0.01) {
+      // Neighbour discovery is the expensive part of the visual. It need not
+      // run every visual frame: holding it for 50ms is imperceptible but avoids
+      // rebuilding a line mesh during every text/caption update.
+      if (lineAmount > 0.01 && frameTime - lastConnectionAt >= 50) {
+        lastConnectionAt = frameTime;
         const lp = lineGeo.getAttribute("position") as THREE.BufferAttribute;
         const la = lp.array as Float32Array;
         let lineCount = 0;
@@ -347,7 +360,7 @@ export default function ThreeOrb({
             x2: la[ci + 3], y2: la[ci + 4], z2: la[ci + 5],
           });
         }
-      } else {
+      } else if (lineAmount <= 0.01) {
         lineGeo.setDrawRange(0, 0);
         activeConnections = [];
       }

@@ -17,7 +17,8 @@ type KokoroEngine = {
 let ttsMode: TtsMode = "kokoro";
 let kokoro: KokoroEngine | null = null;
 let kokoroLoading: Promise<boolean> | null = null;
-let kokoroWarmScheduled = false;
+let kokoroWarmTimer: number | null = null;
+let lastInteractionAt = 0;
 
 type Recent = { text: string; until: number };
 let recentUtterances: Recent[] = [];
@@ -102,24 +103,39 @@ async function prepareKokoro(): Promise<boolean> {
 }
 
 function scheduleKokoroWarm(immediate = false) {
-  if (kokoroWarmScheduled || kokoro || ttsMode !== "kokoro") return;
-  kokoroWarmScheduled = true;
+  if (kokoro || ttsMode !== "kokoro") return;
+  if (kokoroWarmTimer) {
+    window.clearTimeout(kokoroWarmTimer);
+    kokoroWarmTimer = null;
+  }
   // The local neural model is intentionally never initialised in the small
   // window where a typed message is waiting for its first response. That work
   // can briefly occupy the browser's main thread on lower-powered devices,
   // which made JARVIS look frozen even though the text lane was healthy.
   const startWhenIdle = () => {
     const run = () => {
-      kokoroWarmScheduled = false;
+      if (!immediate && Date.now() - lastInteractionAt < 8_000) {
+        scheduleKokoroWarm();
+        return;
+      }
       void prepareKokoro();
     };
     const idle = (window as typeof window & { requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number }).requestIdleCallback;
     if (idle) idle(run, { timeout: 8_000 });
     else window.setTimeout(run, 500);
   };
-  window.setTimeout(() => {
+  const waitForQuiet = () => {
+    // Initialising the WASM runtime is deliberately deferred until JARVIS has
+    // had a quiet window. On slower machines it can take seconds and was the
+    // source of the visible freeze right after sending a message.
+    if (!immediate && Date.now() - lastInteractionAt < 8_000) {
+      kokoroWarmTimer = window.setTimeout(waitForQuiet, 2_000);
+      return;
+    }
+    kokoroWarmTimer = null;
     startWhenIdle();
-  }, immediate ? 120 : 3_500);
+  };
+  kokoroWarmTimer = window.setTimeout(waitForQuiet, immediate ? 120 : 12_000);
 }
 
 export function setTtsMode(mode: TtsMode, warmNow = false) {
@@ -129,6 +145,7 @@ export function setTtsMode(mode: TtsMode, warmNow = false) {
 
 export async function warm() {
   if (typeof window === "undefined") return;
+  lastInteractionAt = Date.now();
   prewarmTts();
   if (window.speechSynthesis) {
     window.speechSynthesis.onvoiceschanged = () => {
@@ -136,7 +153,10 @@ export async function warm() {
       window.speechSynthesis.getVoices();
     };
   }
-  scheduleKokoroWarm();
+  // Preserve the natural Kokoro voice, but never make first-message input or
+  // captions compete with its model startup. It warms after the interaction
+  // settles and is retained in browser cache for later replies.
+  if (ttsMode === "kokoro" && !kokoro) scheduleKokoroWarm();
 }
 
 export function stopSpeaking() {

@@ -6,8 +6,8 @@
 //   node scripts/smoke.mjs            # full run
 //   BASE=... CONVEX=... node scripts/smoke.mjs
 //
-// Installed as a daily cron on test-vps. Keep tests FAST, IDEMPOTENT and
-// side-effect-free outside the "smoke" thread.
+// If scheduled, run this only from a managed cloud scheduler. Keep tests FAST,
+// IDEMPOTENT and side-effect-free outside the "smoke" thread.
 
 const BASE = process.env.BASE ?? "https://jarvis-orcin-six.vercel.app";
 const CV = (process.env.CONVEX ?? "https://tangible-goose-318.convex.cloud") + "/api";
