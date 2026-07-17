@@ -31,7 +31,7 @@ const VisualSceneView = dynamic(() => import("./VisualSceneView"), {
 });
 
 type Attachment = { type: string; value: string; title?: string };
-type JarvisPrefs = { voice: string; tts: string; reduceMotion: boolean; liveDefault: boolean };
+type JarvisPrefs = { voice: string; tts: string; kokoroVoice: string; reduceMotion: boolean; liveDefault: boolean };
 type Msg = {
   _id: string;
   role: string;
@@ -61,7 +61,12 @@ type Job = {
   pullRequestUrl?: string;
   startedAt: number;
 };
-type Caption = { who: "you" | "jarvis"; text: string; exiting?: boolean } | null;
+type Caption = {
+  who: "you" | "jarvis";
+  text: string;
+  phase?: "streaming" | "ready" | "speaking";
+  exiting?: boolean;
+} | null;
 type StagePanel = { type: string; value: string; title?: string; updatedAt: number };
 
 const ytId = (s: string) => {
@@ -340,6 +345,21 @@ function OptionsPanel({
           >
             <Seg opts={[["kokoro", "Kokoro AI"], ["system", "System"]]} val={prefs.tts} on={(v) => setPref("tts", v)} />
           </Row>
+          {prefs.tts === "kokoro" && (
+            <Row label="Kokoro character" hint="George is the calmer, more refined British voice">
+              <select
+                aria-label="Kokoro voice"
+                value={prefs.kokoroVoice}
+                onChange={(event) => setPref("kokoroVoice", event.target.value)}
+                className="rounded-lg border border-white/10 bg-[#101827] px-2.5 py-1 text-[11px] text-ice outline-none ring-cyan/40 focus:ring-1"
+              >
+                <option value="bm_george">George · refined</option>
+                <option value="bf_emma">Emma · natural</option>
+                <option value="af_heart">Heart · warm</option>
+                <option value="bm_fable">Fable · theatrical</option>
+              </select>
+            </Row>
+          )}
           <Row label="Live conversation" hint={live !== "off" ? "on now" : "listen → answer → listen, with no self-echo"}>
             <button onClick={onToggleLive} className={`rounded-lg px-3 py-1 text-[11px] transition ${live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>
               {live === "connecting" ? "…" : live !== "off" ? "stop" : "start"}
@@ -1026,12 +1046,19 @@ function isFollowUp(msg: string, p: { title?: string }): boolean {
 // The spoken caption. Short text just shows; a long reply that overflows the
 // field scrolls top→bottom over the narration's estimated duration (teleprompter),
 // so Daniel can read along with the voice instead of it clipping.
-function SpokenCaption({ caption }: { caption: { who: "you" | "jarvis"; text: string; exiting?: boolean } }) {
+function SpokenCaption({ caption }: { caption: NonNullable<Caption> }) {
   const boxRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     const el = boxRef.current;
     if (!el || caption.exiting) return;
     el.scrollTop = 0;
+    if (caption.phase === "streaming") {
+      // Follow the newest streamed words without repeatedly restarting the
+      // narration animation from the top.
+      el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+      return;
+    }
+    if (caption.phase !== "speaking") return;
     const overflow = el.scrollHeight - el.clientHeight;
     if (overflow <= 4) return; // fits — no scroll
     // pace to the narration: ~2.7 spoken words/sec, with a lead-in and tail so it
@@ -1049,11 +1076,12 @@ function SpokenCaption({ caption }: { caption: { who: "you" | "jarvis"; text: st
     };
     raf = requestAnimationFrame(step);
     return () => cancelAnimationFrame(raf);
-  }, [caption.text, caption.exiting]);
+  }, [caption.text, caption.phase, caption.exiting]);
   return (
     <div
       ref={boxRef}
-      key={caption.text}
+      data-jarvis-caption
+      data-caption-phase={caption.phase ?? "ready"}
       className={`${caption.exiting ? "cap-fade-out" : "cap-bloom"} max-h-[26vh] max-w-[min(820px,88%)] overflow-hidden text-center text-xl font-semibold leading-snug tracking-tight md:text-[1.7rem] lg:text-[1.95rem] ${caption.who === "you" ? "text-amber" : "text-ice"}`}
     >
       {caption.text}
@@ -1121,16 +1149,40 @@ export default function JarvisUI() {
   const [caption, setCaption] = useState<Caption>(null);
   // Soft dismiss: mark the caption `exiting` so it fades out slowly (CSS), then
   // unmount after the fade. A fresh caption cancels a pending fade.
+  const captionHoldTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const captionExitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const fadeCaption = (onlyText?: string) => {
+  const captionEpoch = useRef(0);
+  const clearCaptionTimers = () => {
+    if (captionHoldTimer.current) clearTimeout(captionHoldTimer.current);
     if (captionExitTimer.current) clearTimeout(captionExitTimer.current);
-    setCaption((c) => (c && (!onlyText || c.text === onlyText) ? { ...c, exiting: true } : c));
-    captionExitTimer.current = setTimeout(() => setCaption((c) => (c?.exiting ? null : c)), 1200);
+    captionHoldTimer.current = null;
+    captionExitTimer.current = null;
+  };
+  const fadeCaption = (onlyText?: string, holdMs = 1400) => {
+    clearCaptionTimers();
+    const epoch = captionEpoch.current;
+    captionHoldTimer.current = setTimeout(() => {
+      if (epoch !== captionEpoch.current) return;
+      setCaption((c) => (c && (!onlyText || c.text === onlyText) ? { ...c, exiting: true } : c));
+      captionExitTimer.current = setTimeout(() => {
+        if (epoch !== captionEpoch.current) return;
+        setCaption((c) => (c?.exiting && (!onlyText || c.text === onlyText) ? null : c));
+      }, 900);
+    }, holdMs);
   };
   const showCaption = (c: Caption) => {
-    if (captionExitTimer.current) clearTimeout(captionExitTimer.current);
-    setCaption(c);
+    captionEpoch.current += 1;
+    clearCaptionTimers();
+    setCaption((current) => {
+      if (!c) return null;
+      // Preserve one DOM surface while streamed text grows and when that same
+      // text hands over to TTS. Replacing the keyed element per token was the
+      // visible flash-to-transparent bug.
+      if (current?.who === c.who) return { ...current, ...c, phase: c.phase ?? "ready", exiting: false };
+      return { ...c, phase: c.phase ?? "ready", exiting: false };
+    });
   };
+  useEffect(() => () => clearCaptionTimers(), []);
   const [agentView, setAgentView] = useState<string | null>(null);
   const [nowTs, setNowTs] = useState(0);
   // Viewport minimize: keep talking and the panel folds into a pill; the orb
@@ -1265,7 +1317,7 @@ export default function JarvisUI() {
   // Options panel + persisted preferences (voice lane, TTS voice, wake, motion)
   const [optionsOpen, setOptionsOpen] = useState(false);
   const setMoodMut = (args: Record<string, unknown>) => clientMutation("ui:setMood", args);
-  const [prefs, setPrefs] = useState<JarvisPrefs>({ voice: "free", tts: "kokoro", reduceMotion: false, liveDefault: true });
+  const [prefs, setPrefs] = useState<JarvisPrefs>({ voice: "free", tts: "kokoro", kokoroVoice: "bm_george", reduceMotion: false, liveDefault: true });
   const [permissions, setPermissions] = useState<JarvisPermissionState>({ microphone: "prompt", notifications: "prompt" });
   const [permissionBusy, setPermissionBusy] = useState(false);
   const liveAutoStarted = useRef(false);
@@ -1273,21 +1325,31 @@ export default function JarvisUI() {
     // Legacy "fast" meant browser speech. Move it to local Kokoro explicitly:
     // it is still free and on-device, but much more natural once warmed.
     const tts = localStorage.getItem("jarvis_tts") === "system" ? "system" : "kokoro";
+    const storedKokoroVoice = localStorage.getItem("jarvis_kokoro_voice");
+    const kokoroVoice = ["bm_george", "bf_emma", "af_heart", "bm_fable"].includes(storedKokoroVoice ?? "")
+      ? storedKokoroVoice!
+      : "bm_george";
     localStorage.setItem("jarvis_tts", tts);
+    localStorage.setItem("jarvis_kokoro_voice", kokoroVoice);
     setPrefs({
       voice: "free",
       tts,
+      kokoroVoice,
       reduceMotion: localStorage.getItem("jarvis_reduce_motion") === "1",
       liveDefault: localStorage.getItem("jarvis_live_default") !== "0",
     });
     localStorage.setItem("jarvis_voice", "free");
-    void import("../lib/tts").then((module) => module.setTtsMode(tts));
+    void import("../lib/tts").then((module) => {
+      module.setKokoroVoice(kokoroVoice);
+      module.setTtsMode(tts);
+    });
   }, []);
   const setPref = (k: keyof JarvisPrefs, v: string | boolean) => {
     setPrefs((p) => ({ ...p, [k]: v }));
-    const key = k === "voice" ? "jarvis_voice" : k === "tts" ? "jarvis_tts" : k === "reduceMotion" ? "jarvis_reduce_motion" : "jarvis_live_default";
+    const key = k === "voice" ? "jarvis_voice" : k === "tts" ? "jarvis_tts" : k === "kokoroVoice" ? "jarvis_kokoro_voice" : k === "reduceMotion" ? "jarvis_reduce_motion" : "jarvis_live_default";
     localStorage.setItem(key, typeof v === "boolean" ? (v ? "1" : "0") : String(v));
     if (k === "tts") void import("../lib/tts").then((module) => module.setTtsMode(v === "system" ? "system" : "kokoro", true));
+    if (k === "kokoroVoice") void import("../lib/tts").then((module) => module.setKokoroVoice(String(v)));
     if (k === "liveDefault" && v === true) liveAutoStarted.current = false;
   };
   const refreshPermissions = async () => {
@@ -1636,14 +1698,14 @@ export default function JarvisUI() {
   // Speak new finalized assistant messages with local Kokoro TTS.
   const lastSpokenThread = useRef<string>("");
   useEffect(() => {
-    const streaming = [...messages].reverse().find((message) => message.role === "assistant" && message.status === "streaming" && message.text);
-    if (!streaming?.text) return;
+    const latestAssistant = [...messages].reverse().find((message) => message.role === "assistant");
+    if (latestAssistant?.status !== "streaming" || !latestAssistant.text) return;
     if (durableStartedAt.current !== null) {
       document.documentElement.dataset.jarvisFirstTokenMs = String(Math.max(0, Math.round(performance.now() - durableStartedAt.current)));
       durableStartedAt.current = null;
       setSending(false);
     }
-    showCaption({ who: "jarvis", text: streaming.text });
+    showCaption({ who: "jarvis", text: latestAssistant.text, phase: "streaming" });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
 
@@ -1674,21 +1736,28 @@ export default function JarvisUI() {
     if (liveAnywhere() && !liveRef.current) return;
     if (document.hidden) return; // background tabs stay silent — one voice, ever
     const spokenText = isToolGarbage(last.text) ? sanitizeAssistantText(last.text) : last.text;
+    // Streaming and finalization use the same stable caption node. Put the
+    // finished text there before voice ownership/model generation, so it never
+    // vanishes during the TTS handoff or when this tab is not the speaker.
+    showCaption({ who: "jarvis", text: spokenText, phase: "ready" });
     (async () => {
-      if (!(await ensureVoice())) return; // another tab/device owns the voice
+      if (!(await ensureVoice())) {
+        fadeCaption(spokenText, 3200);
+        return; // another tab/device owns the voice
+      }
       const { speak } = await import("../lib/tts");
       await speak(
-        last.text,
+        spokenText,
         (e) => (energyRef.current = e),
         () => {
           setSpeaking(true);
           // the spoken words bloom under the orb for TYPED turns too, not just
           // live voice — this is the caption overlay Daniel wasn't seeing
-          showCaption({ who: "jarvis", text: spokenText });
+          showCaption({ who: "jarvis", text: spokenText, phase: "speaking" });
         },
         () => {
           setSpeaking(false);
-          fadeCaption(spokenText); // slow, graceful fade after he finishes speaking
+          fadeCaption(spokenText, 1800); // remain readable, then leave without a flash
         },
       );
       // free-voice conversation: keep the loop going until Daniel goes quiet
@@ -1747,8 +1816,9 @@ export default function JarvisUI() {
       updateConversationMood(reply);
       void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
       void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant" });
+      showCaption({ who: "jarvis", text: reply, phase: "ready" });
       if (document.hidden || liveAnywhere() || !(await ensureVoice())) {
-        fadeCaption(requestedText);
+        fadeCaption(reply, 3200);
         return;
       }
       const { speak } = await import("../lib/tts");
@@ -1757,11 +1827,11 @@ export default function JarvisUI() {
         (energy) => (energyRef.current = energy),
         () => {
           setSpeaking(true);
-          showCaption({ who: "jarvis", text: reply });
+          showCaption({ who: "jarvis", text: reply, phase: "speaking" });
         },
         () => {
           setSpeaking(false);
-          fadeCaption(reply);
+          fadeCaption(reply, 1800);
         },
       );
     } catch {
@@ -1809,8 +1879,9 @@ export default function JarvisUI() {
       void (async () => {
         await logTurn({ threadId: threadRef.current, role: "user", text: t });
         await logTurn({ threadId: threadRef.current, role: "assistant", text: instant, model: "instant" });
+        showCaption({ who: "jarvis", text: instant, phase: "ready" });
         if (document.hidden || !(await ensureVoice())) {
-          fadeCaption(instant);
+          fadeCaption(instant, 3200);
           return;
         }
         const { speak } = await import("../lib/tts");
@@ -1819,11 +1890,11 @@ export default function JarvisUI() {
           (energy) => (energyRef.current = energy),
           () => {
             setSpeaking(true);
-            showCaption({ who: "jarvis", text: instant });
+            showCaption({ who: "jarvis", text: instant, phase: "speaking" });
           },
           () => {
             setSpeaking(false);
-            fadeCaption(instant);
+            fadeCaption(instant, 1800);
           },
         );
       })();
@@ -2304,11 +2375,11 @@ export default function JarvisUI() {
               reduceMotion={prefs.reduceMotion}
             />
           </div>
-          {/* THE ONE caption — spoken words, under the orb. Short text sits in a
-              contained field; a long reply scrolls through like a teleprompter,
-              paced to the narration. Hidden while an overlay owns the screen. */}
-          {caption && !(panel && !panelMin) && (
-            <div className="pointer-events-none absolute inset-x-0 top-[52%] z-30 flex justify-center px-6">
+          {/* THE ONE caption — one persistent node throughout token streaming,
+              finalization and narration. Compact overlays keep it beside their
+              visible orb; only a truly full-screen workspace owns the surface. */}
+          {caption && !fullBleed && (
+            <div className={`pointer-events-none absolute top-[52%] z-30 flex justify-center px-6 ${compactAside ? "hidden md:flex md:left-[62%] md:right-0" : "inset-x-0"}`}>
               <SpokenCaption caption={caption} />
             </div>
           )}

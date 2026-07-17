@@ -293,7 +293,7 @@ body {
     0 2px 20px rgba(0, 0, 0, 0.85),
     0 0 22px rgba(0, 255, 136, 0.26),
     0 0 46px rgba(0, 255, 136, 0.16);
-  animation: cap-fade-out 1.2s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  animation: cap-fade-out 0.9s cubic-bezier(0.4, 0, 0.2, 1) forwards;
 }
 @keyframes cap-fade-out {
   from { opacity: 1; transform: translateY(0); filter: blur(0); }

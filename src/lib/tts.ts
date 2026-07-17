@@ -21,12 +21,20 @@ let queue: SpeechBatch[] = [];
 let activeBatch: SpeechBatch | null = null;
 let cachedVoice: SpeechSynthesisVoice | null = null;
 type TtsMode = "kokoro" | "system";
+export const KOKORO_VOICES = [
+  { id: "bm_george", label: "George", detail: "refined British" },
+  { id: "bf_emma", label: "Emma", detail: "natural British" },
+  { id: "af_heart", label: "Heart", detail: "warm studio" },
+  { id: "bm_fable", label: "Fable", detail: "theatrical British" },
+] as const;
+export type KokoroVoice = (typeof KOKORO_VOICES)[number]["id"];
+export const DEFAULT_KOKORO_VOICE: KokoroVoice = "bm_george";
 type KokoroWorkerRequest =
   | { id: number; type: "warm" }
-  | { id: number; type: "generate"; text: string; speed: number };
+  | { id: number; type: "generate"; text: string; speed: number; voice: KokoroVoice };
 type KokoroWorkerPayload =
   | { type: "warm" }
-  | { type: "generate"; text: string; speed: number };
+  | { type: "generate"; text: string; speed: number; voice: KokoroVoice };
 type KokoroWorkerResponse =
   | { id: number; type: "ready" }
   | { id: number; type: "audio"; blob: Blob }
@@ -34,6 +42,7 @@ type KokoroWorkerResponse =
 type KokoroWorkerResult = { ok: true; blob?: Blob } | { ok: false };
 type KokoroPending = { resolve: (result: KokoroWorkerResult) => void };
 let ttsMode: TtsMode = "kokoro";
+let kokoroVoice: KokoroVoice = DEFAULT_KOKORO_VOICE;
 let kokoroWorker: Worker | null = null;
 let kokoroReady = false;
 let kokoroLoading: Promise<boolean> | null = null;
@@ -206,6 +215,12 @@ export function setTtsMode(mode: TtsMode, warmNow = false) {
   if (mode === "kokoro") scheduleKokoroWarm(warmNow);
 }
 
+export function setKokoroVoice(voice: string) {
+  if (KOKORO_VOICES.some((candidate) => candidate.id === voice)) {
+    kokoroVoice = voice as KokoroVoice;
+  }
+}
+
 export async function warm() {
   if (typeof window === "undefined") return;
   lastInteractionAt = Date.now();
@@ -281,7 +296,12 @@ async function speakKokoroOne(
   onStart?: () => void,
 ): Promise<boolean> {
   if (!kokoroReady || expectedGeneration !== generation) return false;
-  const result = await askKokoroWorker({ type: "generate", text, speed: speechSpeed(text) });
+  const result = await askKokoroWorker({
+    type: "generate",
+    text,
+    speed: speechSpeed(text),
+    voice: kokoroVoice,
+  });
   const blob = result.ok ? result.blob : undefined;
   if (!blob) return false;
   if (expectedGeneration !== generation) return true;

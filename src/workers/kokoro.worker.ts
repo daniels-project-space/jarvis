@@ -2,7 +2,7 @@ import { KokoroTTS } from "kokoro-js";
 
 type WorkerRequest =
   | { id: number; type: "warm" }
-  | { id: number; type: "generate"; text: string; speed: number };
+  | { id: number; type: "generate"; text: string; speed: number; voice: "bm_george" | "bf_emma" | "af_heart" | "bm_fable" };
 
 type WorkerResponse =
   | { id: number; type: "ready" }
@@ -38,7 +38,7 @@ scope.onmessage = (event) => {
         return;
       }
       const audio = await engine.generate(request.text, {
-        voice: "bm_fable",
+        voice: request.voice,
         speed: request.speed,
       });
       scope.postMessage({ id: request.id, type: "audio", blob: audio.toBlob() });
@@ -51,4 +51,3 @@ scope.onmessage = (event) => {
     }
   })();
 };
-
