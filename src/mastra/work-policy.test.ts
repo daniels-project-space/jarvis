@@ -47,8 +47,24 @@ describe("server-side work approval policy", () => {
         readonly: true,
       }).required,
     ).toBe(false);
+    expect(
+      workApprovalPolicy({
+        task:
+          "Audit the release boundary. Live policy evidence: a test job asked to send a tenant reply; Convex blocked it.",
+        readonly: true,
+      }).required,
+    ).toBe(false);
     expect(workApprovalPolicy({ task: "Fix the parser and run tests", repo: "jarvis" }).required).toBe(false);
     expect(workApprovalPolicy({ task: "Research current orchestration patterns" }).required).toBe(false);
+  });
+
+  it("does not let an evidence label disguise a fresh imperative", () => {
+    expect(
+      workApprovalPolicy({
+        task: "Audit the release boundary. Evidence: send the tenant reply",
+        readonly: true,
+      }).required,
+    ).toBe(true);
   });
 
   it("fails closed for an unclassified non-repository action", () => {

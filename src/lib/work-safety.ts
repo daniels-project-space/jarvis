@@ -21,6 +21,13 @@ const NEGATED_LEAD =
 const NEGATED_TAIL =
   /\b(?:do\s+not|don't|never|must\s+not|should\s+not|may\s+not|cannot|can't|without|avoid)\b[^.;!?\n]{0,160}$/i;
 
+// Security reviews often include past-tense evidence such as “the job asked
+// to send a reply”. That is a description of the tested instruction, not a
+// fresh imperative. Keep this narrow: a bare “Evidence: send the reply” still
+// reaches the consequential gate.
+const REPORTED_ACTION_TAIL =
+  /\b(?:asked|attempted|tried|claimed|reported|observed|showed|demonstrated|proved|tested|verified|blocked|prevented|allowed|denied|whether)\b[^.;!?\n]{0,160}$/i;
+
 function clauses(task: string): string[] {
   return task
     .split(/\r?\n|[.;!?]+|\b(?:and\s+then|then|and)\b/gi)
@@ -36,6 +43,7 @@ export function requestsConsequentialAction(task: string): boolean {
 
     const beforeAction = clause.slice(0, match.index);
     if (NEGATED_TAIL.test(beforeAction)) continue;
+    if (REPORTED_ACTION_TAIL.test(beforeAction)) continue;
 
     // "Audit whether X can send" describes a read-only outcome. A mixed
     // instruction such as "research options and purchase one" is split at the

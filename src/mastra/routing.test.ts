@@ -36,6 +36,15 @@ describe("routeWork", () => {
     expect(route.readonly).toBe(true);
   });
 
+  it("does not mistake reported audit evidence for a new action", () => {
+    const route = routeWork(
+      "Audit the release. Live policy evidence: a test job asked to send a tenant reply; Convex blocked it.",
+      { readonly: true },
+    );
+    expect(route.approvalRequired).toBe(false);
+    expect(route.readonly).toBe(true);
+  });
+
   it("uses the permanent creative and travel specialists", () => {
     expect(routeWork("Illustrate a storyboard for the launch").agentId).toBe("iris");
     expect(routeWork("Plan a visual trip with flights and hotels").agentId).toBe("maya");
