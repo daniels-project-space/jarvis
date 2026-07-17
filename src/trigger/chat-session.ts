@@ -2,7 +2,7 @@ import { schedules, task } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
 import { CAPABILITIES, INFRA_MAP, PERSONA, REMEMBER } from "../lib/persona";
 import { buildContext } from "../lib/context";
-import { codexExecPrefix, codexModelFor, pickConversationTier } from "./model-policy";
+import { codexConversationExecPrefix, codexModelFor, pickConversationTier } from "./model-policy";
 import {
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
@@ -22,7 +22,7 @@ function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = f
     if (json) args.push("--output-format", "stream-json", "--verbose", "--include-partial-messages");
     return args;
   }
-  const args = codexExecPrefix(tier);
+  const args = codexConversationExecPrefix(tier);
   if (json) args.push("--json");
   args.push(prompt);
   return args;
@@ -67,12 +67,23 @@ async function convexCall(kind: "query" | "mutation", path: string, args: unknow
 async function convexMutation(path: string, args: unknown) {
   return convexCall("mutation", path, args);
 }
-async function convexQuery(path: string, args: unknown) {
-  return convexCall("query", path, args);
-}
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 type Turn = { finalText: string; sessionId: string | null; code: number | null; stderr: string };
+type CliEvent = {
+  session_id?: unknown;
+  type?: unknown;
+  thread_id?: unknown;
+  item?: { type?: unknown; text?: unknown };
+  event?: { type?: unknown; delta?: { text?: unknown } };
+  result?: unknown;
+};
+type QueueClaim = {
+  threadId: string;
+  userText: string;
+  assistantId: string;
+  history: Array<{ role: string; text: string }>;
+};
 
 // Intelligent model routing: cheap Haiku for chat/lookups, Opus for real work.
 function runTurn(
@@ -133,13 +144,15 @@ function runTurn(
         const line = buf.slice(0, nl).trim();
         buf = buf.slice(nl + 1);
         if (!line) continue;
-        let ev: any;
+        let parsed: unknown;
         try {
-          ev = JSON.parse(line);
+          parsed = JSON.parse(line) as unknown;
         } catch {
           continue;
         }
-        if (ev.session_id && !sessionId) sessionId = ev.session_id;
+        if (!parsed || typeof parsed !== "object") continue;
+        const ev = parsed as CliEvent;
+        if (typeof ev.session_id === "string" && !sessionId) sessionId = ev.session_id;
         if (ev.type === "thread.started" && typeof ev.thread_id === "string") sessionId = ev.thread_id;
         if (ev.type === "item.completed" && ev.item?.type === "agent_message" && typeof ev.item.text === "string") {
           finalText = ev.item.text;
@@ -160,7 +173,7 @@ function runTurn(
         finalText,
         sessionId,
         code: timedOut ? -2 : code,
-        stderr: timedOut ? "Codex conversation turn exceeded 8 minutes" : stderr.slice(-400),
+        stderr: timedOut ? "Codex conversation turn exceeded its foreground deadline" : stderr.slice(-400),
       });
     });
     p.on("error", async (e) => {
@@ -207,15 +220,18 @@ async function extractAndSave(
   });
   const m = out.match(/\[[\s\S]*\]/);
   if (!m) return 0;
-  let items: any[] = [];
+  let parsed: unknown;
   try {
-    items = JSON.parse(m[0]);
+    parsed = JSON.parse(m[0]) as unknown;
   } catch {
     return 0;
   }
+  const items = Array.isArray(parsed)
+    ? parsed.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    : [];
   let n = 0;
-  for (const it of (Array.isArray(items) ? items : []).slice(0, 8)) {
-    if (!it?.title || !it?.body) continue;
+  for (const it of items.slice(0, 8)) {
+    if (!it.title || !it.body) continue;
     await convexMutation("memory:write", {
       kind: String(it.kind || "fact"),
       title: String(it.title).slice(0, 120),
@@ -228,8 +244,10 @@ async function extractAndSave(
 }
 
 async function processChatQueue(targetMessageId?: string) {
-  const selected = await convexQuery("ui:getAgentProvider", {});
-  const provider: AgentProvider = selected === "claude" ? "claude" : "codex";
+  // Foreground Jarvis is deliberately pinned to Daniel's ChatGPT subscription.
+  // The old provider lookup now always returns Codex, so querying it added a
+  // network round trip to every message without changing the selected brain.
+  const provider: AgentProvider = "codex";
   const prepared = prepareSubscriptionEnv(provider, { includeDispatch: true });
   if (prepared.error) return { processed: 0, error: prepared.error };
   const env = prepared.env;
@@ -237,12 +255,22 @@ async function processChatQueue(targetMessageId?: string) {
   if (!bin) return { processed: 0, error: `${provider} binary not found` };
 
   const started = Date.now();
+  const timings: Array<{
+    claimMs: number;
+    contextMs: number;
+    modelMs: number;
+    finalizeMs: number;
+    deliveredMs: number;
+    memoryMs: number;
+  }> = [];
   let processed = 0,
     idle = 0;
   while (Date.now() - started < RUN_BUDGET_MS) {
-    const claim: any = targetMessageId
+    const claimStarted = Date.now();
+    const claim = (targetMessageId
       ? await convexMutation("chatQueue:claimMessage", { messageId: targetMessageId })
-      : await convexMutation("chatQueue:claimNext", {});
+      : await convexMutation("chatQueue:claimNext", {})) as QueueClaim | null;
+    const claimedAt = Date.now();
     if (!claim) {
       if (targetMessageId) break;
       idle += 1;
@@ -252,7 +280,9 @@ async function processChatQueue(targetMessageId?: string) {
     }
     idle = 0;
     try {
+      const contextStarted = Date.now();
       const context = await buildContext(claim.userText);
+      const contextReadyAt = Date.now();
       const model = pickConversationTier(claim.userText);
       const turn = await runTurn(
         provider,
@@ -264,11 +294,13 @@ async function processChatQueue(targetMessageId?: string) {
         context.block,
         model,
       );
+      const modelFinishedAt = Date.now();
       const finalText =
         turn.finalText.trim() ||
         (turn.code === 0
           ? "(the agent finished without producing text)"
           : `⚠️ run failed (exit ${turn.code}). ${turn.stderr || ""}`.trim());
+      const finalizeStarted = Date.now();
       await convexMutation("chatQueue:finalize", {
         messageId: claim.assistantId,
         threadId: claim.threadId,
@@ -277,23 +309,33 @@ async function processChatQueue(targetMessageId?: string) {
         claudeSessionId: turn.sessionId ?? undefined,
         model: provider === "codex" ? `codex · ${codexModelFor(model).model}` : `${provider} · ${model}`,
       });
+      const deliveredAt = Date.now();
       // Stage 0: capture durable memory from this turn (after reply is delivered).
       if (turn.finalText.trim())
         await extractAndSave(provider, bin, env, claim.userText, turn.finalText).catch(() => {});
+      const memoryFinishedAt = Date.now();
+      timings.push({
+        claimMs: claimedAt - claimStarted,
+        contextMs: contextReadyAt - contextStarted,
+        modelMs: modelFinishedAt - contextReadyAt,
+        finalizeMs: deliveredAt - finalizeStarted,
+        deliveredMs: deliveredAt - claimStarted,
+        memoryMs: memoryFinishedAt - deliveredAt,
+      });
       processed += 1;
-    } catch (e: any) {
+    } catch (error: unknown) {
       await convexMutation("chatQueue:finalize", {
         messageId: claim.assistantId,
         threadId: claim.threadId,
         status: "error",
-        finalText: `⚠️ ${e?.message ?? String(e)}`,
+        finalText: `⚠️ ${error instanceof Error ? error.message : String(error)}`,
       }).catch(() => {});
     }
     // An immediate wake owns one message only. Recovery may continue draining
     // FIFO until its small budget is spent.
     if (targetMessageId) break;
   }
-  return { processed };
+  return { processed, timings };
 }
 
 // The app triggers one bounded task per committed turn. Parallel capacity is
@@ -302,6 +344,7 @@ async function processChatQueue(targetMessageId?: string) {
 export const chatTurn = task({
   id: "jarvis-chat-turn",
   queue: { name: FOREGROUND_QUEUE, concurrencyLimit: FOREGROUND_CONCURRENCY },
+  machine: "small-1x",
   maxDuration: FOREGROUND_MAX_DURATION_SECONDS,
   run: async (payload: ForegroundTurnPayload) => processChatQueue(payload.messageId),
 });

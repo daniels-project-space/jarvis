@@ -29,6 +29,27 @@ export function codexExecPrefix(tier: string): string[] {
   ];
 }
 
+// Foreground conversation already supplies its own persona, policy and
+// capability bridge. Skipping repository/user bootstrap avoids loading the
+// general Codex plugin + MCP stack on every short turn while retaining full
+// shell access for Jarvis's private tool endpoint. Durable coding agents keep
+// the broader codexExecPrefix above.
+export function codexConversationExecPrefix(tier: string): string[] {
+  const selected = codexModelFor(tier);
+  return [
+    "exec",
+    "--model",
+    selected.model,
+    "--config",
+    `model_reasoning_effort=\"${selected.effort}\"`,
+    "--sandbox",
+    "danger-full-access",
+    "--skip-git-repo-check",
+    "--ignore-user-config",
+    "--ignore-rules",
+  ];
+}
+
 export function pickConversationTier(text: string): WorkModelTier {
   const value = text.toLowerCase().trim();
   if (

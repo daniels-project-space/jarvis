@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { CODEX_MODEL_POLICY, codexExecPrefix, codexModelFor, pickConversationTier } from "./model-policy";
+import {
+  CODEX_MODEL_POLICY,
+  codexConversationExecPrefix,
+  codexExecPrefix,
+  codexModelFor,
+  pickConversationTier,
+} from "./model-policy";
 
 describe("subscription model policy", () => {
   it("maps increasing work tiers to the live Luna, Terra and Sol catalogue", () => {
@@ -26,6 +32,19 @@ describe("subscription model policy", () => {
       const args = codexExecPrefix(tier);
       expect(args).not.toContain("gpt-5.6");
       expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
+    }
+  });
+
+  it("uses the lean subscription runtime only for foreground conversation", () => {
+    for (const tier of ["haiku", "sonnet", "opus", "unknown"]) {
+      const args = codexConversationExecPrefix(tier);
+      expect(args).toContain(codexModelFor(tier).model);
+      expect(args).toContain("--ignore-user-config");
+      expect(args).toContain("--ignore-rules");
+      expect(args).toContain("--skip-git-repo-check");
+      expect(args).toContain("danger-full-access");
+      expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+      expect(args).not.toContain("gpt-5.6");
     }
   });
 });

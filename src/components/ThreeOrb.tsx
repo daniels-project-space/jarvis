@@ -1,12 +1,12 @@
 "use client";
 import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import * as THREE from "three";
-import { frameDamping, orbCycleSeconds, type OrbMotionFrame, type OrbState } from "@/lib/orb-motion";
+import { advanceOrbPhase, frameDamping, orbCycleSeconds, type OrbMotionFrame, type OrbState } from "@/lib/orb-motion";
 
 // Particle-network orb — adapted from ethanplusai/jarvis (frontend/src/orb.ts),
 // free for personal use: https://github.com/ethanplusai/jarvis
 // Floating particles with line connections between nearby ones; lines fade with
-// state, transition tumble on state change, speaking pulls particles denser,
+// state, speaking pulls particles denser,
 // electrons travel the connections while thinking.
 // Adapted here: container-sized + transparent background, driven by energyRef
 // (0..1 voice amplitude) instead of an AnalyserNode, JARVIS green palette.
@@ -74,8 +74,9 @@ export default function ThreeOrb({
       const fallbackWhite = new THREE.Color(0xffffff);
       const fallbackAccent = new THREE.Color(fallbackColor).lerp(fallbackWhite, 0.34);
       let phase = motionRef?.current.phase ?? 0;
-      let cycle = orbCycleSeconds("idle");
-      let asideAmount = 0;
+      let elapsedSeconds = motionRef?.current.elapsedSeconds ?? 0;
+      let cycle = motionRef?.current.cycleSeconds ?? orbCycleSeconds("idle");
+      let asideAmount = motionRef?.current.aside ?? 0;
       let previous = performance.now();
       let fallbackFrame = 0;
       const animateFallback = (now: number) => {
@@ -84,7 +85,8 @@ export default function ThreeOrb({
         previous = now;
         const currentState = stateRef.current;
         cycle += (orbCycleSeconds(currentState) - cycle) * frameDamping(2.2, delta);
-        if (!reducedMotion) phase = (phase + (Math.PI * 2 * delta) / Math.max(1, cycle)) % (Math.PI * 2);
+        if (!reducedMotion) phase = advanceOrbPhase(phase, cycle, delta);
+        elapsedSeconds += delta;
         asideAmount += ((asideRef.current && W() >= 768 ? 1 : 0) - asideAmount) * frameDamping(3.08, delta);
         fallbackTarget.set(moodRef.current ?? "#00ff88");
         if (currentState === "thinking") fallbackTarget.lerp(fallbackWhite, 0.3);
@@ -93,6 +95,7 @@ export default function ThreeOrb({
         fallbackAccent.copy(fallbackColor).lerp(fallbackWhite, 0.34);
         if (motionRef) {
           motionRef.current.phase = phase;
+          motionRef.current.elapsedSeconds = elapsedSeconds;
           motionRef.current.cycleSeconds = cycle;
           motionRef.current.color = `#${fallbackColor.getHexString()}`;
           motionRef.current.accent = `#${fallbackAccent.getHexString()}`;
@@ -181,14 +184,12 @@ export default function ThreeOrb({
     let targetSize = 0.4, currentSize = 0.4;
     let lineAmount = 0, targetLineAmount = 0;
     const lineDistance = 8;
-    let tumbleX = 0, tumbleY = 0, tumbleZ = 0;
     let sharedPhase = motionRef?.current.phase ?? 0;
-    let currentCycle = orbCycleSeconds("idle");
-    let transitionEnergy = 0;
-    let lastState: OrbState = "idle";
+    let sharedElapsed = motionRef?.current.elapsedSeconds ?? 0;
+    let currentCycle = motionRef?.current.cycleSeconds ?? orbCycleSeconds("idle");
     let cloudZ = 0, cloudZVel = 0;
     let smoothEnergy = 0;
-    let asideAmt = 0; // 0 = centre stage, 1 = tucked into the right strip
+    let asideAmt = motionRef?.current.aside ?? 0; // 0 = centre stage, 1 = tucked into the right strip
     let inViewport = true;
     let frameId = 0;
     let lastRenderedAt = 0;
@@ -213,7 +214,8 @@ export default function ThreeOrb({
       const delta = Math.min(0.05, rawDelta);
       const motionDelta = Math.min(0.25, rawDelta);
       const frameScale = delta * 60;
-      const t = clock.elapsedTime;
+      sharedElapsed += motionDelta;
+      const t = sharedElapsed;
       const st = stateRef.current;
 
       switch (st) {
@@ -239,18 +241,14 @@ export default function ThreeOrb({
       lineAmount += (targetLineAmount - lineAmount) * stateFollow;
       electronSpawnRate += (targetElectronRate - electronSpawnRate) * stateFollow;
       currentCycle += (orbCycleSeconds(st) - currentCycle) * frameDamping(2.2, motionDelta);
-      sharedPhase = (sharedPhase + (Math.PI * 2 * motionDelta) / Math.max(1, currentCycle)) % (Math.PI * 2);
+      sharedPhase = advanceOrbPhase(sharedPhase, currentCycle, motionDelta);
 
-      if (st !== lastState) { transitionEnergy = 1.0; lastState = st; }
-      transitionEnergy *= Math.exp(-0.91 * delta);
-      if (transitionEnergy > 0.05) {
-        tumbleX += transitionEnergy * 0.012 * Math.sin(t * 1.7) * frameScale;
-        tumbleY += transitionEnergy * 0.015 * frameScale;
-        tumbleZ += transitionEnergy * 0.008 * Math.cos(t * 1.3) * frameScale;
-      }
-      const spinX = sharedPhase * 0.17 + tumbleX;
-      const spinY = sharedPhase + tumbleY;
-      const spinZ = sharedPhase * 0.09 + tumbleZ;
+      // State changes already ease radius, speed, brightness and line density.
+      // Rotation stays continuous so typing/speaking transitions cannot kick
+      // the cloud into what looks like a random animation reset.
+      const spinX = sharedPhase * 0.17;
+      const spinY = sharedPhase;
+      const spinZ = sharedPhase * 0.09;
 
       // our live voice-amplitude signal stands in for the upstream AnalyserNode
       const raw = Math.max(0, Math.min(1, energyRef?.current ?? 0));
@@ -406,6 +404,7 @@ export default function ThreeOrb({
 
       if (motionRef) {
         motionRef.current.phase = sharedPhase;
+        motionRef.current.elapsedSeconds = sharedElapsed;
         motionRef.current.cycleSeconds = currentCycle;
         motionRef.current.color = `#${mat.color.getHexString()}`;
         motionRef.current.accent = `#${lineMat.color.getHexString()}`;
