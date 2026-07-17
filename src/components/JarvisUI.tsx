@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
@@ -7,7 +7,7 @@ import { clientMutation } from "@/lib/client-mutation";
 import { primeMicrophone, readJarvisPermissions, type JarvisPermissionState } from "@/lib/permissions";
 import { registerSW, subscribePush } from "@/lib/push";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
-import { createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
+import { createOrbMotionFrame, orbCycleSeconds, type OrbMotionFrame } from "@/lib/orb-motion";
 import { relevantActiveWork } from "@/lib/active-work";
 import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
@@ -391,14 +391,14 @@ function ReactorRing({
   aside,
   hidden,
   color,
-  motionRef,
+  cycleSeconds,
   reduceMotion,
 }: {
   active: boolean;
   aside: boolean;
   hidden: boolean;
   color?: string;
-  motionRef: MutableRefObject<OrbMotionFrame>;
+  cycleSeconds: number;
   reduceMotion: boolean;
 }) {
   const ticks = useMemo(
@@ -410,51 +410,6 @@ function ReactorRing({
       }),
     [],
   );
-  const groupRef = useRef<SVGGElement>(null);
-  const primaryStop = useRef<SVGStopElement>(null);
-  const primaryEndStop = useRef<SVGStopElement>(null);
-  const accentStop = useRef<SVGStopElement>(null);
-  const svgRef = useRef<SVGSVGElement>(null);
-  useEffect(() => {
-    let frame = 0;
-    let lastPaintAt = 0;
-    let lastGlowAt = 0;
-    let lastColor = "";
-    let lastAccent = "";
-    const paint = (now: number) => {
-      const motion = motionRef.current;
-      // The orb supplies the exact same continuous phase. Painting the large
-      // SVG/filter at 30 fps (rather than invalidating a 760px filtered SVG on
-      // every browser frame) keeps the ring visually smooth and releases the
-      // main thread for message input and captions.
-      if (!reduceMotion && now - lastPaintAt < 33) {
-        frame = requestAnimationFrame(paint);
-        return;
-      }
-      lastPaintAt = now;
-      const degrees = reduceMotion ? 0 : (motion.phase * 180) / Math.PI;
-      groupRef.current?.setAttribute("transform", `rotate(${degrees.toFixed(3)} 250 250)`);
-      if (motion.color !== lastColor) {
-        primaryStop.current?.setAttribute("stop-color", motion.color);
-        primaryEndStop.current?.setAttribute("stop-color", motion.color);
-        lastColor = motion.color;
-      }
-      if (motion.accent !== lastAccent) {
-        accentStop.current?.setAttribute("stop-color", motion.accent);
-        lastAccent = motion.accent;
-      }
-      // SVG drop-shadows are expensive raster work. Colour still follows the
-      // orb, but its glow only needs a few updates per second to feel alive.
-      if (svgRef.current && now - lastGlowAt >= 250) {
-        svgRef.current.style.filter = `drop-shadow(0 0 ${6 + motion.intensity * 9}px ${motion.color}66)`;
-        lastGlowAt = now;
-      }
-      frame = requestAnimationFrame(paint);
-    };
-    frame = requestAnimationFrame(paint);
-    return () => cancelAnimationFrame(frame);
-  }, [motionRef, reduceMotion]);
-
   const opacity = hidden ? 0 : aside ? 0.32 : active ? 0.52 : 0.24;
   const c = color || "#00ff88";
   return (
@@ -462,15 +417,20 @@ function ReactorRing({
       className="pointer-events-none absolute inset-0 grid place-items-center will-change-transform transition-[opacity,transform] duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
       style={{ opacity, transform: aside ? "translateX(47%) translateY(-4.5%) scale(0.68)" : "translateY(-4.5%) scale(1)" }}
     >
-      <svg ref={svgRef} viewBox="0 0 500 500" className="h-[min(82vmin,760px)] w-[min(82vmin,760px)]" style={{ filter: `drop-shadow(0 0 10px ${c}66)` }}>
+      <svg viewBox="0 0 500 500" className="h-[min(82vmin,760px)] w-[min(82vmin,760px)]">
         <defs>
           <linearGradient id="jarvis-orb-gradient" x1="65" y1="65" x2="435" y2="435" gradientUnits="userSpaceOnUse">
-            <stop ref={primaryStop} offset="0" stopColor={c} />
-            <stop ref={accentStop} offset="0.48" stopColor="#8affc5" />
-            <stop ref={primaryEndStop} offset="1" stopColor={c} />
+            <stop offset="0" stopColor={c} />
+            <stop offset="0.48" stopColor="#8affc5" />
+            <stop offset="1" stopColor={c} />
           </linearGradient>
         </defs>
-        <g ref={groupRef} fill="none" stroke="url(#jarvis-orb-gradient)">
+        <g
+          fill="none"
+          stroke="url(#jarvis-orb-gradient)"
+          className={reduceMotion ? undefined : "jarvis-reactor-spin"}
+          style={reduceMotion ? undefined : { animationDuration: `${cycleSeconds}s` }}
+        >
           <circle cx="250" cy="250" r="244" strokeWidth="1" strokeOpacity="0.25" strokeDasharray="40 20" />
           <circle cx="250" cy="250" r="200" strokeWidth="1.5" strokeOpacity="0.18" />
           <path d="M250 62 A188 188 0 0 1 438 250" strokeWidth="2" strokeOpacity="0.75" strokeLinecap="round" />
@@ -2565,7 +2525,7 @@ export default function JarvisUI() {
             aside={compactAside}
             hidden={fullBleed}
             color={moodColor}
-            motionRef={orbMotionRef}
+            cycleSeconds={orbCycleSeconds(orbState)}
             reduceMotion={prefs.reduceMotion}
           />
           <div
