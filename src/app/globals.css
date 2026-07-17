@@ -221,6 +221,17 @@ body {
   to { transform: rotate(360deg); }
 }
 
+.jarvis-orb-breathe {
+  animation-name: jarvis-orb-breathe;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+  will-change: transform, opacity;
+}
+@keyframes jarvis-orb-breathe {
+  0%, 100% { transform: scale(0.96); opacity: 0.82; }
+  50% { transform: scale(1.045); opacity: 1; }
+}
+
 /* modern frosted-glass surface — the overlay card language, v2. Deep blur,
    soft top-light sheen, hairline gradient edge, gentle lift on hover. */
 .frost {
