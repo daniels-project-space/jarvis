@@ -9,6 +9,7 @@ import { TEAM_BY_SLUG, type AgentSlug } from "../mastra/team";
 import { codexExecPrefix, codexModelFor } from "./model-policy";
 import { githubGitEnv, githubRepoUrl } from "./git-transport";
 import { vaultService } from "../lib/vault-client";
+import { buildContinuationCheckpoint, segmentTimeoutMs } from "./continuation";
 import {
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
@@ -223,7 +224,8 @@ function runAgent(
   onProgress?: (s: string, log?: string, stage?: string, percent?: number) => void,
   mcpConfig?: string | null,
   executionState?: () => Promise<string>,
-): Promise<{ text: string; timedOut: boolean; stopped: "paused" | "cancelled" | null }> {
+  timeoutMs = 900_000,
+): Promise<{ text: string; timedOut: boolean; stopped: "paused" | "cancelled" | null; checkpointLog: string }> {
   return new Promise((resolve) => {
     const args = promptArgs(env, prompt, model, true, mcpConfig);
     const codexSelection = env.JARVIS_AGENT_PROVIDER === "codex" ? codexModelFor(model) : null;
@@ -264,7 +266,12 @@ function runAgent(
       clearTimeout(to);
       if (timer) clearInterval(timer);
       if (controlTimer) clearInterval(controlTimer);
-      resolve({ text: finalText || (timedOut ? "(agent segment timed out)" : stopped ? `(agent ${stopped})` : "(no output)"), timedOut, stopped });
+      resolve({
+        text: finalText || (timedOut ? "(agent segment timed out)" : stopped ? `(agent ${stopped})` : "(no output)"),
+        timedOut,
+        stopped,
+        checkpointLog: logLines.join("\n").slice(-12_000),
+      });
     };
     const to = setTimeout(() => {
       try {
@@ -273,7 +280,7 @@ function runAgent(
         /* already gone */
       }
       finish(true);
-    }, 900_000); // self-repair/improve jobs may run npm install + tsc + build inside the turn
+    }, timeoutMs); // bounded below Trigger's one-hour task ceiling
     let controlBusy = false;
     const controlTimer = executionState
       ? setInterval(async () => {
@@ -726,12 +733,18 @@ export const agentRunner = schedules.task({
             const state = await executionStatus();
             return state === "superseded" ? "cancelled" : state;
           },
+          segmentTimeoutMs(model),
         );
         const result = run.text;
 
-        const checkpointText =
-          `Attempt ${expectedAttempt} ${run.timedOut ? "reached its segment boundary" : run.stopped ? `was ${run.stopped}` : "ended before verification"}. ` +
-          `Continue the original task from this evidence:\n${result.slice(0, 5000)}`;
+        const checkpointText = buildContinuationCheckpoint({
+          attempt: expectedAttempt,
+          timedOut: run.timedOut,
+          stopped: run.stopped,
+          priorCheckpoint: job.checkpoint,
+          narrative: result,
+          trace: run.checkpointLog,
+        });
         if (run.stopped) {
           await stopIfLeaseLost(checkpointText, result, branch);
           return;
@@ -774,16 +787,22 @@ export const agentRunner = schedules.task({
           }
         }
 
-        const continuationCheckpoint =
-          `Attempt ${job.attempt ?? 1} ${run.timedOut ? "reached its segment boundary" : run.stopped ? `was ${run.stopped}` : "ended before verification"}. ` +
-          `${pushNote ? `${pushNote}. ` : ""}Continue the original task from this evidence:\n${result.slice(0, 5000)}`;
+        const continuationCheckpoint = buildContinuationCheckpoint({
+          attempt: expectedAttempt,
+          timedOut: run.timedOut,
+          stopped: run.stopped,
+          priorCheckpoint: job.checkpoint,
+          narrative: result,
+          trace: run.checkpointLog,
+          deliveryNote: pushNote,
+        });
         const failedRun = /^error:/i.test(result) || result === "(no output)";
         if ((run.timedOut || failedRun) && !cloneFailed && !pushFailed) {
           const continuation = await convexMutation("jobs:checkpointAndRequeue", {
             jobId: job.jobId,
             expectedAttempt,
             checkpoint: continuationCheckpoint,
-            result: result.slice(0, 4000),
+            result: (run.timedOut ? continuationCheckpoint : result).slice(0, 4000),
             branch: branch ?? undefined,
             delayMs: run.timedOut ? 5_000 : failureBackoffMs(Number(job.attempt ?? 1)),
           });
