@@ -507,6 +507,7 @@ export const agentRunner = schedules.task({
           risk: "high",
           priority: 90,
           originThreadId: await chatThread(),
+          visibility: "system",
           acceptanceCriteria: [
             "Reproduce or evidence the root cause before editing",
             "Implement the smallest safe repair on an isolated branch",

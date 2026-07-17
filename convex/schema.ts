@@ -179,6 +179,10 @@ export default defineSchema({
     // the UI reports real state rather than an elapsed-time guess.
     originThreadId: v.optional(v.string()),
     originTurnId: v.optional(v.string()),
+    // conversation = Daniel explicitly asked for this work; system = routine
+    // maintenance/monitoring. System work remains observable in project and
+    // agent views but does not occupy the live conversation strip.
+    visibility: v.optional(v.union(v.literal("conversation"), v.literal("system"))),
     agentId: v.optional(v.string()),
     risk: v.optional(v.string()), // low | medium | high | consequential
     priority: v.optional(v.number()), // 0-100
@@ -209,7 +213,8 @@ export default defineSchema({
     .index("by_status_next_run", ["status", "nextRunAt"])
     .index("by_mission", ["missionId"])
     .index("by_createdAt", ["createdAt"])
-    .index("by_agent", ["agentId", "createdAt"]),
+    .index("by_agent", ["agentId", "createdAt"])
+    .index("by_visibility_status", ["visibility", "status", "createdAt"]),
 
   // Orchestrated agent fleets: one mission = a decomposed goal running as
   // parallel jobs; when the last one lands, a synthesis pass merges the

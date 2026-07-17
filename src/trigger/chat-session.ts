@@ -8,6 +8,13 @@ import {
   resolveSubscriptionAgentBin,
   type AgentProvider,
 } from "./subscription-runtime";
+import {
+  FOREGROUND_CONCURRENCY,
+  FOREGROUND_MAX_DURATION_SECONDS,
+  FOREGROUND_QUEUE,
+  FOREGROUND_TURN_TIMEOUT_MS,
+  type ForegroundTurnPayload,
+} from "./foreground-policy";
 
 function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = false): string[] {
   if (provider === "claude") {
@@ -31,7 +38,6 @@ const CONVEX_URL =
 const RUN_BUDGET_MS = 50_000;
 const POLL_MS = 2000;
 const IDLE_EXITS = 3;
-const TURN_TIMEOUT_MS = 8 * 60_000;
 
 async function convexCall(kind: "query" | "mutation", path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
@@ -118,7 +124,7 @@ function runTurn(
     const timeout = setTimeout(() => {
       timedOut = true;
       p.kill("SIGKILL");
-    }, TURN_TIMEOUT_MS);
+    }, FOREGROUND_TURN_TIMEOUT_MS);
     p.stderr.on("data", (d) => (stderr += d.toString()));
     p.stdout.on("data", (d) => {
       buf += d.toString();
@@ -221,7 +227,7 @@ async function extractAndSave(
   return n;
 }
 
-async function processChatQueue() {
+async function processChatQueue(targetMessageId?: string) {
   const selected = await convexQuery("ui:getAgentProvider", {});
   const provider: AgentProvider = selected === "claude" ? "claude" : "codex";
   const prepared = prepareSubscriptionEnv(provider, { includeDispatch: true });
@@ -234,8 +240,11 @@ async function processChatQueue() {
   let processed = 0,
     idle = 0;
   while (Date.now() - started < RUN_BUDGET_MS) {
-    const claim: any = await convexMutation("chatQueue:claimNext", {});
+    const claim: any = targetMessageId
+      ? await convexMutation("chatQueue:claimMessage", { messageId: targetMessageId })
+      : await convexMutation("chatQueue:claimNext", {});
     if (!claim) {
+      if (targetMessageId) break;
       idle += 1;
       if (processed === 0 && idle >= IDLE_EXITS) break;
       await sleep(POLL_MS);
@@ -280,18 +289,21 @@ async function processChatQueue() {
         finalText: `⚠️ ${e?.message ?? String(e)}`,
       }).catch(() => {});
     }
+    // An immediate wake owns one message only. Recovery may continue draining
+    // FIFO until its small budget is spent.
+    if (targetMessageId) break;
   }
   return { processed };
 }
 
-// The app triggers this task immediately after committing a user turn. The
-// single shared queue preserves conversational ordering while avoiding the
-// old 0-60 second cron wait.
+// The app triggers one bounded task per committed turn. Parallel capacity is
+// intentional: durable work is delegated elsewhere, and Daniel can always
+// start another conversation turn while an earlier answer is still resolving.
 export const chatTurn = task({
   id: "jarvis-chat-turn",
-  queue: { name: "jarvis-conversation", concurrencyLimit: 1 },
-  maxDuration: 3300,
-  run: async () => processChatQueue(),
+  queue: { name: FOREGROUND_QUEUE, concurrencyLimit: FOREGROUND_CONCURRENCY },
+  maxDuration: FOREGROUND_MAX_DURATION_SECONDS,
+  run: async (payload: ForegroundTurnPayload) => processChatQueue(payload.messageId),
 });
 
 // Recovery lane only: if an immediate trigger is lost between Vercel and
@@ -299,7 +311,7 @@ export const chatTurn = task({
 export const chatDispatcher = schedules.task({
   id: "jarvis-chat-dispatcher",
   cron: "*/1 * * * *",
-  queue: { name: "jarvis-conversation", concurrencyLimit: 1 },
-  maxDuration: 3300,
+  queue: { name: "jarvis-foreground-recovery", concurrencyLimit: 1 },
+  maxDuration: FOREGROUND_MAX_DURATION_SECONDS,
   run: async () => processChatQueue(),
 });

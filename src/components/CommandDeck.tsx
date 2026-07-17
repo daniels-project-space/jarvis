@@ -1,9 +1,21 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { needsDaniel, relevantActiveWork, type ActiveWork } from "@/lib/active-work";
+
+type CommandJob = ActiveWork & {
+  _id: string;
+  status: string;
+  task: string;
+  progress?: string;
+  percent?: number;
+  heartbeatAt?: number;
+  startedAt?: number;
+};
+
 type CommandDeckProps = {
   busy: boolean;
-  snapshot: any;
+  snapshot?: { active?: CommandJob[] } | null;
   selectedJobId: string | null;
   onSelectJob: (id: string) => void;
 };
@@ -22,53 +34,60 @@ function age(at?: number) {
   const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-  if (seconds < 86_400) return `${Math.round(seconds / 3600)}h`;
-  return `${Math.round(seconds / 86_400)}d`;
+  return `${Math.round(seconds / 3600)}h`;
 }
 
-function Dot({ tone = "cyan", pulse = false }: { tone?: "cyan" | "amber" | "red" | "green" | "slate"; pulse?: boolean }) {
-  const colors = {
-    cyan: "bg-cyan",
-    amber: "bg-amber",
-    red: "bg-red-400",
-    green: "bg-emerald-400",
-    slate: "bg-slate-500",
-  };
+function Dot({ tone = "cyan", pulse = false }: { tone?: "cyan" | "amber" | "slate"; pulse?: boolean }) {
+  const color = tone === "amber" ? "bg-amber" : tone === "slate" ? "bg-slate-500" : "bg-cyan";
   return (
-    <span className="relative mt-[5px] flex h-1.5 w-1.5 shrink-0">
-      {pulse && <span className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-50 ${colors[tone]}`} />}
-      <span className={`relative inline-flex h-1.5 w-1.5 rounded-full ${colors[tone]}`} />
+    <span className="relative flex h-1.5 w-1.5 shrink-0" aria-hidden>
+      {pulse && <span className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-45 ${color}`} />}
+      <span className={`relative inline-flex h-1.5 w-1.5 rounded-full ${color}`} />
     </span>
   );
 }
 
-export default function CommandDeck({ busy, snapshot, selectedJobId, onSelectJob }: CommandDeckProps) {
-  const [collapsed, setCollapsed] = useState(false);
-  const [acting, setActing] = useState("");
+function useSoftPresence(show: boolean) {
+  const [mounted, setMounted] = useState(show);
+  const [visible, setVisible] = useState(show);
   useEffect(() => {
-    if (!window.matchMedia("(max-width: 639px)").matches) return;
-    const frame = requestAnimationFrame(() => setCollapsed(true));
-    return () => cancelAnimationFrame(frame);
-  }, []);
+    let frame = 0;
+    let revealFrame = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    frame = requestAnimationFrame(() => {
+      if (show) {
+        setMounted(true);
+        revealFrame = requestAnimationFrame(() => setVisible(true));
+      } else {
+        setVisible(false);
+        timer = setTimeout(() => setMounted(false), 280);
+      }
+    });
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      if (revealFrame) cancelAnimationFrame(revealFrame);
+      if (timer) clearTimeout(timer);
+    };
+  }, [show]);
+  return { mounted, visible };
+}
 
-  const active = (snapshot?.active ?? []) as any[];
-  const approvals = (snapshot?.approvals ?? []) as any[];
-  const attention = (snapshot?.attention ?? []) as any[];
-  const signals = (snapshot?.signals ?? []) as any[];
-  const agents = (snapshot?.agents ?? []) as any[];
-  const projects = (snapshot?.projects ?? []) as any[];
-  const recent = (snapshot?.recent ?? []) as any[];
-  const needs = useMemo(
-    () => [
-      ...approvals.map((item) => ({ ...item, kind: "approval" })),
-      ...attention
-        .filter((item) => item.actionClass === "ask")
-        .map((item) => ({ ...item, kind: "attention" })),
-    ].slice(0, 4),
-    [approvals, attention],
-  );
-  const unhealthy = projects.filter((project) => !/^(ready|healthy|ok|live)$/i.test(project.status));
-  const workingAgents = agents.filter((agent) => agent.status === "working" || agent.status === "blocked");
+export default function CommandDeck({ busy, snapshot, selectedJobId, onSelectJob }: CommandDeckProps) {
+  // Start compact on every viewport. The old post-mount mobile collapse was the
+  // visible flash at the top of the app.
+  const [collapsed, setCollapsed] = useState(true);
+  const [acting, setActing] = useState("");
+  const active = useMemo(() => relevantActiveWork(snapshot?.active ?? [], 4), [snapshot?.active]);
+  const decisions = active.filter(needsDaniel);
+  const running = active.filter((job) => job.status === "running");
+  const shouldShow = busy || active.length > 0;
+  const presence = useSoftPresence(shouldShow);
+
+  useEffect(() => {
+    if (shouldShow) return;
+    const timer = setTimeout(() => setCollapsed(true), 300);
+    return () => clearTimeout(timer);
+  }, [shouldShow]);
 
   const decideJob = async (jobId: string, decision: "approved" | "declined") => {
     setActing(`${jobId}:${decision}`);
@@ -83,210 +102,107 @@ export default function CommandDeck({ busy, snapshot, selectedJobId, onSelectJob
     }
   };
 
-  const controlJob = async (jobId: any, action: "pause" | "resume" | "cancel" | "retry") => {
+  const controlJob = async (jobId: string, action: "cancel") => {
     setActing(`${jobId}:${action}`);
     try {
       await fetch("/api/work-control", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jobId: String(jobId), action }),
+        body: JSON.stringify({ jobId, action }),
       });
     } finally {
       setActing("");
     }
   };
 
+  if (!presence.mounted) return null;
+  const summary = decisions.length
+    ? `${decisions.length} need${decisions.length === 1 ? "s" : ""} you`
+    : running.length
+      ? `${running.length} active`
+      : "thinking";
+  const lead = decisions[0] ?? running[0];
+
   return (
     <aside
-      aria-label="JARVIS command deck"
-      className={`fixed left-3 top-[58px] z-40 w-[min(360px,calc(100vw-24px))] transition-all duration-300 md:left-5 md:top-[66px] ${collapsed ? "max-w-[220px]" : ""}`}
+      aria-label="Active JARVIS work"
+      aria-live="polite"
+      className={`fixed left-3 top-[58px] z-40 max-w-[calc(100vw-24px)] origin-top-left will-change-transform transition-[opacity,transform] duration-300 ease-out md:left-5 md:top-[66px] ${
+        presence.visible ? "translate-y-0 opacity-100" : "pointer-events-none -translate-y-1.5 opacity-0"
+      } ${collapsed ? "w-auto" : "w-[min(320px,calc(100vw-24px))]"}`}
     >
-      <div className="border border-white/10 bg-[#050a10]/86 shadow-[0_18px_60px_rgba(0,0,0,.38)] backdrop-blur-2xl">
+      <div className={`overflow-hidden border border-white/10 bg-[#050a10]/88 shadow-[0_12px_38px_rgba(0,0,0,.34)] backdrop-blur-2xl ${collapsed ? "rounded-full" : "rounded-xl"}`}>
         <button
           type="button"
           onClick={() => setCollapsed((value) => !value)}
-          className="flex w-full items-center gap-2 px-3 py-2 text-left"
+          className="flex h-8 max-w-[min(280px,calc(100vw-24px))] items-center gap-2 px-3 text-left"
           aria-expanded={!collapsed}
         >
-          <span className="font-mono text-[9px] uppercase tracking-[0.22em] text-cyan">work now</span>
-          <span className="ml-auto flex items-center gap-2 font-mono text-[9px] uppercase tracking-wider text-slate">
-            {needs.length > 0 && <span className="text-amber">{needs.length} need you</span>}
-            {signals.length > 0 && <span className="text-emerald-300">{signals.length} signal{signals.length === 1 ? "" : "s"}</span>}
-            <span>{active.length || (busy ? 1 : 0)} active</span>
-            <span aria-hidden>{collapsed ? "＋" : "−"}</span>
+          <Dot tone={decisions.length ? "amber" : "cyan"} pulse={busy || running.length > 0} />
+          <span className={`shrink-0 font-mono text-[8px] uppercase tracking-[0.2em] ${decisions.length ? "text-amber" : "text-cyan"}`}>work</span>
+          <span className="min-w-0 flex-1 truncate text-[10px] text-ice/90" title={lead?.label ?? lead?.task}>
+            {collapsed && lead ? lead.label ?? lead.task : summary}
           </span>
+          <span className="shrink-0 font-mono text-[8px] uppercase tracking-wider text-slate">{summary}</span>
+          <span className="shrink-0 text-[10px] text-slate" aria-hidden>{collapsed ? "＋" : "−"}</span>
         </button>
 
         {!collapsed && (
-          <div className="max-h-[min(70dvh,680px)] overflow-y-auto border-t border-white/8 px-2.5 pb-2.5 scrollbar-thin">
-            {signals.length > 0 && (
-              <section className="pt-2.5">
-                <div className="mb-1.5 flex items-center justify-between px-1">
-                  <h2 className="font-mono text-[9px] uppercase tracking-[0.18em] text-emerald-300">Signals</h2>
-                  <span className="text-[9px] text-slate">verified crossings</span>
-                </div>
-                <div className="space-y-1">
-                  {signals.slice(0, 4).map((signal) => (
-                    <button
-                      type="button"
-                      key={signal._id}
-                      onClick={() => void fetch("/api/tools", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "watch_list", args: {} }) })}
-                      className={`scene-signal-glow w-full border-l border-emerald-300/60 bg-emerald-300/[0.055] px-2 py-2 text-left ${signal.glowUntil > Date.now() ? "is-fresh" : ""}`}
-                    >
-                      <div className="flex gap-2">
-                        <Dot tone="green" pulse={signal.glowUntil > Date.now()} />
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-[11px] font-medium text-ice">{signal.title}</div>
-                          <div className="mt-0.5 line-clamp-2 text-[10px] leading-4 text-slate">{signal.spoken}</div>
-                          <div className="mt-1 font-mono text-[8px] uppercase tracking-wider text-emerald-300">{age(signal.createdAt)} · open visual</div>
-                        </div>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </section>
-            )}
-            {needs.length > 0 && (
-              <section className="pt-2.5">
-                <div className="mb-1.5 flex items-center justify-between px-1">
-                  <h2 className="font-mono text-[9px] uppercase tracking-[0.18em] text-amber">Needs Daniel</h2>
-                  <span className="text-[9px] text-slate">only real decisions</span>
-                </div>
-                <div className="space-y-1">
-                  {needs.map((item: any) => (
-                    <div key={`${item.kind}:${item._id}`} className="border-l border-amber/45 bg-amber/[0.035] px-2 py-1.5">
-                      <div className="flex gap-2">
-                        <Dot tone="amber" />
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-[11px] font-medium text-ice">{item.summary ?? item.title}</div>
-                          {item.detail && <div className="mt-0.5 line-clamp-2 text-[10px] leading-4 text-slate">{item.detail}</div>}
-                          {item.kind === "approval" ? (
-                            <div className="mt-1.5 flex gap-1.5">
-                              <button
-                                type="button"
-                                disabled={Boolean(acting)}
-                                onClick={() => void decideJob(String(item.jobId), "approved")}
-                                className="border border-cyan/35 bg-cyan/10 px-2 py-0.5 text-[9px] uppercase tracking-wider text-cyan disabled:opacity-40"
-                              >
-                                approve scope
-                              </button>
-                              <button
-                                type="button"
-                                disabled={Boolean(acting)}
-                                onClick={() => void decideJob(String(item.jobId), "declined")}
-                                className="border border-white/10 px-2 py-0.5 text-[9px] uppercase tracking-wider text-slate disabled:opacity-40"
-                              >
-                                decline
-                              </button>
-                            </div>
-                          ) : item.jobId ? (
-                            <button
-                              type="button"
-                              onClick={() => onSelectJob(String(item.jobId))}
-                              className="mt-1 text-[9px] uppercase tracking-wider text-cyan"
-                            >
-                              open · answer by voice/chat
-                            </button>
-                          ) : null}
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </section>
+          <div className="max-h-[min(46dvh,420px)] overflow-y-auto border-t border-white/8 px-2 pb-2 scrollbar-thin">
+            {busy && (
+              <div className="mt-1.5 flex min-w-0 items-center gap-2 rounded-md bg-cyan/[0.035] px-2 py-1.5 text-[10px] text-cyan">
+                <Dot pulse />
+                <span className="min-w-0 flex-1 truncate">JARVIS · conversation turn underway</span>
+                <span className="shrink-0 text-[8px] uppercase tracking-wider text-slate">still available</span>
+              </div>
             )}
 
-            <section className="pt-2.5">
-              <div className="mb-1.5 flex items-center justify-between px-1">
-                <h2 className="font-mono text-[9px] uppercase tracking-[0.18em] text-cyan">Working now</h2>
-                <span className="text-[9px] text-slate">stage · evidence</span>
-              </div>
-              <div className="space-y-px">
-                {busy && (
-                  <div className="flex gap-2 px-2 py-1.5 text-[10px] text-cyan">
-                    <Dot tone="cyan" pulse />
-                    <span>JARVIS · acting on this conversation</span>
-                  </div>
-                )}
-                {active.slice(0, 6).map((job) => {
-                  const running = job.status === "running";
-                  const selected = selectedJobId === String(job._id);
-                  return (
-                    <button
-                      type="button"
-                      key={job._id}
-                      onClick={() => onSelectJob(String(job._id))}
-                      className={`group w-full border-l px-2 py-1.5 text-left transition ${selected ? "border-cyan bg-cyan/[0.07]" : "border-white/10 hover:border-cyan/40 hover:bg-white/[0.025]"}`}
-                    >
-                      <div className="flex gap-2">
-                        <Dot tone={job.status === "needs_input" || job.status === "awaiting_approval" ? "amber" : running ? "cyan" : "slate"} pulse={running} />
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-1.5">
-                            <span className="shrink-0 text-[10px] text-cyan/90">{AGENT_NAMES[job.agentId] ?? "Agent"}</span>
-                            <span className="truncate text-[11px] text-ice">{job.label ?? job.task}</span>
-                            <span className="ml-auto shrink-0 font-mono text-[9px] text-slate">{job.percent ?? 0}%</span>
-                          </div>
-                          <div className="mt-0.5 flex items-center gap-1.5 text-[9px] text-slate">
-                            <span className="truncate">{job.stage ?? job.status}</span>
-                            {(job.attempt ?? 1) > 1 && <span>· pass {job.attempt}/{job.maxAttempts ?? 12}</span>}
-                            <span className="ml-auto">{age(job.heartbeatAt ?? job.startedAt)}</span>
-                          </div>
-                          <div className="mt-1 h-px overflow-hidden bg-white/7">
-                            <div className="h-full bg-cyan/70 transition-[width] duration-500" style={{ width: `${Math.max(2, job.percent ?? 0)}%` }} />
-                          </div>
-                        </div>
-                      </div>
-                    </button>
-                  );
-                })}
-                {!busy && active.length === 0 && (
-                  <div className="flex gap-2 px-2 py-1.5 text-[10px] text-slate">
-                    <Dot tone="green" />
-                    <span>No queued work · team available</span>
-                  </div>
-                )}
-              </div>
-            </section>
-
-            <section className="grid grid-cols-2 gap-px pt-2.5">
-              <div className="border border-white/8 bg-white/[0.018] p-2">
-                <div className="font-mono text-[8px] uppercase tracking-[0.16em] text-slate">Projects</div>
-                <div className="mt-1 text-[11px] text-ice">{projects.length - unhealthy.length}/{projects.length || 0} healthy</div>
-                <div className={`mt-0.5 truncate text-[9px] ${unhealthy.length ? "text-amber" : "text-emerald-400"}`}>
-                  {unhealthy.length ? unhealthy.slice(0, 2).map((project) => project.slug).join(" · ") : "all current"}
+            {decisions.map((job) => (
+              <div key={String(job._id)} className="mt-1.5 border-l border-amber/45 bg-amber/[0.04] px-2 py-1.5">
+                <div className="flex min-w-0 items-center gap-2">
+                  <Dot tone="amber" />
+                  <span className="min-w-0 flex-1 truncate text-[10px] text-ice" title={job.label ?? job.task}>{job.label ?? job.task}</span>
                 </div>
-              </div>
-              <div className="border border-white/8 bg-white/[0.018] p-2">
-                <div className="font-mono text-[8px] uppercase tracking-[0.16em] text-slate">Team</div>
-                <div className="mt-1 text-[11px] text-ice">{workingAgents.length} engaged · {Math.max(0, agents.length - workingAgents.length)} ready</div>
-                <div className="mt-0.5 truncate text-[9px] text-cyan">
-                  {workingAgents.length ? workingAgents.map((agent) => agent.name).join(" · ") : "Paul · Atlas · Iris · Maya · Sentry"}
-                </div>
-              </div>
-            </section>
-
-            {recent.length > 0 && (
-              <section className="pt-2.5">
-                <h2 className="mb-1 px-1 font-mono text-[9px] uppercase tracking-[0.18em] text-slate">Recently done</h2>
-                {recent.slice(0, 3).map((job) => (
-                  <div key={job._id} className="flex gap-2 border-l border-white/8 px-2 py-1 text-[9px] text-slate">
-                    <Dot tone={job.status === "done" ? "green" : "red"} />
-                    <span className="min-w-0 flex-1 truncate">{AGENT_NAMES[job.agentId] ?? "Agent"} · {job.label ?? job.task}</span>
-                    <span className="shrink-0">{age(job.completedAt ?? job.createdAt)}</span>
+                {job.status === "awaiting_approval" ? (
+                  <div className="mt-1.5 flex flex-wrap gap-1.5 pl-3.5">
+                    <button disabled={Boolean(acting)} onClick={() => void decideJob(String(job._id), "approved")} className="rounded border border-cyan/35 bg-cyan/10 px-2 py-0.5 text-[8px] uppercase tracking-wider text-cyan disabled:opacity-40">approve scope</button>
+                    <button disabled={Boolean(acting)} onClick={() => void decideJob(String(job._id), "declined")} className="rounded border border-white/10 px-2 py-0.5 text-[8px] uppercase tracking-wider text-slate disabled:opacity-40">decline</button>
                   </div>
-                ))}
-              </section>
-            )}
-
-            {selectedJobId && (
-              <div className="mt-2 flex justify-end gap-1.5 border-t border-white/8 pt-2">
-                {active.find((job) => String(job._id) === selectedJobId)?.status === "paused" ? (
-                  <button className="text-[9px] uppercase tracking-wider text-cyan" onClick={() => void controlJob(selectedJobId as any, "resume")}>resume</button>
                 ) : (
-                  <button className="text-[9px] uppercase tracking-wider text-slate hover:text-cyan" onClick={() => void controlJob(selectedJobId as any, "pause")}>pause</button>
+                  <button onClick={() => onSelectJob(String(job._id))} className="ml-3.5 mt-1 text-[8px] uppercase tracking-wider text-cyan">open · answer in chat</button>
                 )}
-                <span className="text-white/10">·</span>
-                <button className="text-[9px] uppercase tracking-wider text-red-300/80" onClick={() => void controlJob(selectedJobId as any, "cancel")}>cancel</button>
+              </div>
+            ))}
+
+            {running.map((job) => {
+              const selected = selectedJobId === String(job._id);
+              return (
+                <button
+                  type="button"
+                  key={String(job._id)}
+                  onClick={() => onSelectJob(String(job._id))}
+                  className={`mt-1.5 w-full min-w-0 border-l px-2 py-1.5 text-left transition-colors ${selected ? "border-cyan bg-cyan/[0.07]" : "border-white/10 hover:border-cyan/40 hover:bg-white/[0.025]"}`}
+                >
+                  <div className="flex min-w-0 items-center gap-2">
+                    <Dot pulse />
+                    <span className="shrink-0 text-[9px] text-cyan/90">{job.agentId ? AGENT_NAMES[job.agentId] ?? "Agent" : "Agent"}</span>
+                    <span className="min-w-0 flex-1 truncate text-[10px] text-ice" title={job.label ?? job.task}>{job.label ?? job.task}</span>
+                    <span className="shrink-0 font-mono text-[8px] text-slate">{job.percent ?? 0}%</span>
+                  </div>
+                  <div className="mt-1 flex min-w-0 items-center gap-2 pl-3.5 text-[8px] text-slate">
+                    <span className="min-w-0 flex-1 truncate">{job.stage ?? job.progress ?? "working"}</span>
+                    <span className="shrink-0">{age(job.heartbeatAt ?? job.startedAt)}</span>
+                  </div>
+                  <div className="ml-3.5 mt-1 h-px overflow-hidden bg-white/7">
+                    <div className="h-full bg-cyan/70 transition-[width] duration-500" style={{ width: `${Math.max(2, job.percent ?? 0)}%` }} />
+                  </div>
+                </button>
+              );
+            })}
+
+            {selectedJobId && active.some((job) => String(job._id) === selectedJobId) && (
+              <div className="mt-2 flex justify-end border-t border-white/8 pt-1.5">
+                <button disabled={Boolean(acting)} className="text-[8px] uppercase tracking-wider text-red-300/80 disabled:opacity-40" onClick={() => void controlJob(selectedJobId, "cancel")}>cancel selected work</button>
               </div>
             )}
           </div>

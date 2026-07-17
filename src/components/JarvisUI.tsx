@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
@@ -7,6 +7,8 @@ import { clientMutation } from "@/lib/client-mutation";
 import { primeMicrophone, readJarvisPermissions, type JarvisPermissionState } from "@/lib/permissions";
 import { registerSW, subscribePush } from "@/lib/push";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
+import { createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
+import { relevantActiveWork } from "@/lib/active-work";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
 import CommandDeck from "./CommandDeck";
 
@@ -416,7 +418,21 @@ function OptionsPanel({
 // glides aside for an overlay, the ring shrinks toward it and fades; when the
 // orb returns to centre, the ring blooms back. Never unmounts (that was the
 // abrupt pop). `active` brightens it while JARVIS is engaged.
-function ReactorRing({ active, aside, hidden, color }: { active: boolean; aside: boolean; hidden: boolean; color?: string }) {
+function ReactorRing({
+  active,
+  aside,
+  hidden,
+  color,
+  motionRef,
+  reduceMotion,
+}: {
+  active: boolean;
+  aside: boolean;
+  hidden: boolean;
+  color?: string;
+  motionRef: MutableRefObject<OrbMotionFrame>;
+  reduceMotion: boolean;
+}) {
   const ticks = useMemo(
     () =>
       Array.from({ length: 60 }, (_, i) => {
@@ -426,25 +442,63 @@ function ReactorRing({ active, aside, hidden, color }: { active: boolean; aside:
       }),
     [],
   );
-  const opacity = hidden ? 0 : aside ? 0.1 : active ? 0.5 : 0.22;
-  // the ring reads as part of the orb — same mood colour, glowing together
+  const groupRef = useRef<SVGGElement>(null);
+  const primaryStop = useRef<SVGStopElement>(null);
+  const primaryEndStop = useRef<SVGStopElement>(null);
+  const accentStop = useRef<SVGStopElement>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
+  useEffect(() => {
+    let frame = 0;
+    let lastColor = "";
+    let lastAccent = "";
+    const paint = () => {
+      const motion = motionRef.current;
+      const degrees = reduceMotion ? 0 : (motion.phase * 180) / Math.PI;
+      groupRef.current?.setAttribute("transform", `rotate(${degrees.toFixed(3)} 250 250)`);
+      if (motion.color !== lastColor) {
+        primaryStop.current?.setAttribute("stop-color", motion.color);
+        primaryEndStop.current?.setAttribute("stop-color", motion.color);
+        lastColor = motion.color;
+      }
+      if (motion.accent !== lastAccent) {
+        accentStop.current?.setAttribute("stop-color", motion.accent);
+        lastAccent = motion.accent;
+      }
+      if (svgRef.current) {
+        svgRef.current.style.filter = `drop-shadow(0 0 ${6 + motion.intensity * 9}px ${motion.color}66)`;
+      }
+      frame = requestAnimationFrame(paint);
+    };
+    frame = requestAnimationFrame(paint);
+    return () => cancelAnimationFrame(frame);
+  }, [motionRef, reduceMotion]);
+
+  const opacity = hidden ? 0 : aside ? 0.32 : active ? 0.52 : 0.24;
   const c = color || "#00ff88";
   return (
     <div
-      className="pointer-events-none absolute inset-0 grid place-items-center transition-all duration-[900ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
-      style={{ opacity, transform: aside ? "translateX(58%) translateY(-4.5%) scale(0.5)" : "translateY(-4.5%) scale(1)" }}
+      className="pointer-events-none absolute inset-0 grid place-items-center will-change-transform transition-[opacity,transform] duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
+      style={{ opacity, transform: aside ? "translateX(47%) translateY(-4.5%) scale(0.68)" : "translateY(-4.5%) scale(1)" }}
     >
-      <svg viewBox="0 0 500 500" className="h-[min(78vmin,720px)] w-[min(78vmin,720px)]" style={{ filter: `drop-shadow(0 0 10px ${c}66)`, transition: "filter 1.2s ease" }}>
-        <g fill="none" stroke={c} style={{ transition: "stroke 1.2s ease" }}>
-          <circle cx="250" cy="250" r="244" strokeWidth="1" strokeOpacity="0.25" strokeDasharray="40 20" style={{ transformOrigin: "center", animation: "reactor-slow 46s linear infinite" }} />
+      <svg ref={svgRef} viewBox="0 0 500 500" className="h-[min(82vmin,760px)] w-[min(82vmin,760px)]" style={{ filter: `drop-shadow(0 0 10px ${c}66)` }}>
+        <defs>
+          <linearGradient id="jarvis-orb-gradient" x1="65" y1="65" x2="435" y2="435" gradientUnits="userSpaceOnUse">
+            <stop ref={primaryStop} offset="0" stopColor={c} />
+            <stop ref={accentStop} offset="0.48" stopColor="#8affc5" />
+            <stop ref={primaryEndStop} offset="1" stopColor={c} />
+          </linearGradient>
+        </defs>
+        <g ref={groupRef} fill="none" stroke="url(#jarvis-orb-gradient)">
+          <circle cx="250" cy="250" r="244" strokeWidth="1" strokeOpacity="0.25" strokeDasharray="40 20" />
           <circle cx="250" cy="250" r="200" strokeWidth="1.5" strokeOpacity="0.18" />
-          <path d="M250 62 A188 188 0 0 1 438 250" strokeWidth="2" strokeOpacity="0.7" strokeLinecap="round" style={{ transformOrigin: "center", animation: "reactor-fast 8s linear infinite reverse" }} />
+          <path d="M250 62 A188 188 0 0 1 438 250" strokeWidth="2" strokeOpacity="0.75" strokeLinecap="round" />
+          <path d="M250 438 A188 188 0 0 1 62 250" strokeWidth="1.2" strokeOpacity="0.38" strokeLinecap="round" />
           <g strokeOpacity="0.35">
             {ticks.map((t, i) => (
               <line key={i} x1={t.x1} y1={t.y1} x2={t.x2} y2={t.y2} strokeWidth={t.major ? 1.6 : 0.8} strokeOpacity={t.major ? 0.5 : 0.28} />
             ))}
           </g>
-          <circle cx="250" cy="250" r="170" strokeWidth="1" strokeOpacity="0.12" strokeDasharray="2 8" style={{ transformOrigin: "center", animation: "reactor-slow 30s linear infinite reverse" }} />
+          <circle cx="250" cy="250" r="170" strokeWidth="1" strokeOpacity="0.12" strokeDasharray="2 8" />
         </g>
       </svg>
     </div>
@@ -1064,6 +1118,7 @@ function SpokenCaption({ caption }: { caption: { who: "you" | "jarvis"; text: st
 }
 
 export default function JarvisUI() {
+  const orbMotionRef = useRef<OrbMotionFrame>(createOrbMotionFrame());
   const thread = (useJarvisQuery(api.ui.getActiveThread, {}) ?? "main") as string;
   const threads = (useJarvisQuery(api.ui.getThreads, {}) ?? []) as { id: string; title: string; at: number }[];
   const setActiveThread = (args: { thread: string; title?: string }) =>
@@ -1104,7 +1159,10 @@ export default function JarvisUI() {
   const voiceRow = useJarvisQuery(api.ui.getVoice, {}) as { value: string; updatedAt: number } | null | undefined;
   const liveOnRow = useJarvisQuery(api.ui.getLiveOn, {}) as { value: string; updatedAt: number } | null | undefined;
   const commandSnapshot = useJarvisQuery(api.commandCenter.snapshot, {}) as any;
-  const activeJobs = (commandSnapshot?.active ?? []) as Job[];
+  const activeJobs = useMemo(
+    () => relevantActiveWork((commandSnapshot?.active ?? []) as Job[], 4),
+    [commandSnapshot?.active],
+  );
 
   const [input, setInput] = useState("");
   const [speaking, setSpeaking] = useState(false);
@@ -1531,14 +1589,17 @@ export default function JarvisUI() {
     }
   }
 
-  useEffect(() => {
-    if (!activeJobs.length) return;
-    setNowTs(Date.now());
-    const t = setInterval(() => setNowTs(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, [activeJobs.length]);
-
   const shownJob = activeJobs.find((j) => j._id === agentView) ?? null;
+  useEffect(() => {
+    if (!shownJob) return;
+    const first = setTimeout(() => setNowTs(Date.now()), 0);
+    const t = setInterval(() => setNowTs(Date.now()), 1000);
+    return () => {
+      clearTimeout(first);
+      clearInterval(t);
+    };
+  }, [shownJob]);
+
   const busy = sending || messages.some((m) => m.status === "pending" || (m.role === "assistant" && m.status === "streaming"));
 
   useEffect(() => {
@@ -2183,7 +2244,6 @@ export default function JarvisUI() {
             away on pure transforms — compositor-only, 120fps-smooth */}
         <div ref={stageRef} className={`brackets relative min-h-0 flex-1 transition-[margin] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${chatMode === "full" ? "md:mr-[416px]" : ""}`}>
           <span className="bk" />
-          {live === "live" && <div className="live-ring pointer-events-none absolute inset-2 rounded-full opacity-60" />}
           {/* orbit bubbles — demoted panels bobbing beside the orb */}
           {bubbles.length > 0 && (
             <div className="absolute left-1.5 top-1/2 z-30 flex max-h-full -translate-y-1/2 flex-col gap-3 md:left-2.5">
@@ -2240,13 +2300,15 @@ export default function JarvisUI() {
             aside={compactAside}
             hidden={fullBleed}
             color={moodColor}
+            motionRef={orbMotionRef}
+            reduceMotion={prefs.reduceMotion}
           />
           <div
             className={`h-full w-full transition-opacity duration-500 ${
               fullBleed ? "pointer-events-none opacity-0" : compactAside ? "pointer-events-none opacity-0 md:opacity-100" : "opacity-100"
             }`}
           >
-            <ThreeOrb state={orbState} energyRef={energyRef} moodColor={moodColor} aside={compactAside} reduceMotion={prefs.reduceMotion} />
+            <ThreeOrb state={orbState} energyRef={energyRef} moodColor={moodColor} motionRef={orbMotionRef} aside={compactAside} reduceMotion={prefs.reduceMotion} />
           </div>
           {/* THE ONE caption — spoken words, under the orb. Short text sits in a
               contained field; a long reply scrolls through like a teleprompter,
@@ -2388,12 +2450,12 @@ export default function JarvisUI() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit(input)}
-              placeholder={busy ? "thinking…" : "Talk to me…"}
+              placeholder={busy ? "Ask another thing while I work…" : "Talk to me…"}
               className="w-0 min-w-0 flex-1 rounded-xl bg-black/30 px-3 py-2.5 text-sm text-ice outline-none ring-1 ring-white/10 transition focus:ring-cyan/50 sm:w-auto sm:px-4"
             />
             <button
               onClick={() => submit(input)}
-              disabled={busy}
+              disabled={sending || !input.trim()}
               className="grid w-10 shrink-0 place-items-center rounded-xl bg-cyan/15 px-0 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40 sm:w-auto sm:px-4"
             >
               <span className="sm:hidden">↑</span><span className="max-sm:hidden">send</span>
@@ -2589,12 +2651,12 @@ export default function JarvisUI() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit(input)}
-              placeholder={busy ? "thinking…" : "Talk to me…"}
+              placeholder={busy ? "Ask another thing while I work…" : "Talk to me…"}
               className="w-0 min-w-0 flex-1 rounded-xl bg-black/30 px-3 py-2 text-sm text-ice outline-none ring-1 ring-white/10 transition focus:ring-cyan/50 sm:w-auto sm:px-4"
             />
             <button
               onClick={() => submit(input)}
-              disabled={busy}
+              disabled={sending || !input.trim()}
               className="grid w-10 shrink-0 place-items-center rounded-xl bg-cyan/15 px-0 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40 sm:w-auto sm:px-3.5"
             >
               <span className="sm:hidden">↑</span><span className="max-sm:hidden">send</span>

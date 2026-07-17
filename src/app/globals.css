@@ -133,13 +133,7 @@ body {
   50% { opacity: 1; }
 }
 
-/* live ring sweep around the stage while live mode is on */
-.live-ring {
-  background: conic-gradient(from 0deg, transparent 0deg, rgba(0, 255, 136, 0.5) 40deg, transparent 90deg);
-  animation: sweep 3.2s linear infinite;
-  mask: radial-gradient(closest-side, transparent 97%, black 98%);
-}
-@keyframes sweep {
+@keyframes embed-orbit {
   to { transform: rotate(360deg); }
 }
 
@@ -215,8 +209,6 @@ body {
 }
 
 /* arc-reactor HUD ring rotations */
-@keyframes reactor-slow { to { transform: rotate(360deg); } }
-@keyframes reactor-fast { to { transform: rotate(360deg); } }
 
 /* modern frosted-glass surface — the overlay card language, v2. Deep blur,
    soft top-light sheen, hairline gradient edge, gentle lift on hover. */
@@ -362,7 +354,7 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .materialize, .materialize::after, .rise, .breathe, .live-ring, .cap-bloom,
+  .materialize, .materialize::after, .rise, .breathe, .cap-bloom,
   .brackets::before, .brackets::after, .brackets > .bk::before, .brackets > .bk::after,
   .scene-block, .scene-metric, .scene-progress, .scene-bar, .scene-gantt,
   .scene-funnel, .scene-line, .scene-donut, .scene-gauge, .scene-candle,
@@ -379,7 +371,6 @@ html.jarvis-reduce-motion .materialize,
 html.jarvis-reduce-motion .materialize::after,
 html.jarvis-reduce-motion .rise,
 html.jarvis-reduce-motion .breathe,
-html.jarvis-reduce-motion .live-ring,
 html.jarvis-reduce-motion .cap-bloom,
 html.jarvis-reduce-motion .bob,
 html.jarvis-reduce-motion .tile-pulse,

@@ -1,6 +1,7 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import * as THREE from "three";
+import { frameDamping, orbCycleSeconds, type OrbMotionFrame, type OrbState } from "@/lib/orb-motion";
 
 // Particle-network orb — adapted from ethanplusai/jarvis (frontend/src/orb.ts),
 // free for personal use: https://github.com/ethanplusai/jarvis
@@ -11,22 +12,20 @@ import * as THREE from "three";
 // (0..1 voice amplitude) instead of an AnalyserNode, JARVIS green palette.
 // The previous orb is preserved as ThreeOrbClassic.tsx (header ◍ toggle).
 
-type OrbState = "idle" | "listening" | "thinking" | "speaking";
-
 const BASE = 0x00ff88; // Daniel's green — do not revert
-const THINK = 0x6effc4;
-const SPEAK = 0x3cf0a4;
 
 export default function ThreeOrb({
   state = "idle",
   energyRef,
   moodColor,
+  motionRef,
   aside = false,
   reduceMotion = false,
 }: {
   state?: OrbState;
   energyRef?: { current: number };
   moodColor?: string;
+  motionRef?: MutableRefObject<OrbMotionFrame>;
   // true while an overlay owns the stage: the orb drifts into the free right
   // strip and shrinks — done in WORLD space inside the render loop (a CSS
   // transform on the full-bleed canvas got clipped by the stage bounds and
@@ -67,10 +66,50 @@ export default function ThreeOrb({
       // WebGL can be unavailable after a driver reset, inside a remote browser,
       // or on battery-constrained devices. The orb is decoration: it must never
       // be allowed to take the work surface down with it.
-      setWebglUnavailable(true);
-      return;
+      queueMicrotask(() => {
+        if (!destroyed) setWebglUnavailable(true);
+      });
+      const fallbackColor = new THREE.Color(moodRef.current ?? "#00ff88");
+      const fallbackTarget = new THREE.Color(fallbackColor);
+      const fallbackWhite = new THREE.Color(0xffffff);
+      const fallbackAccent = new THREE.Color(fallbackColor).lerp(fallbackWhite, 0.34);
+      let phase = motionRef?.current.phase ?? 0;
+      let cycle = orbCycleSeconds("idle");
+      let asideAmount = 0;
+      let previous = performance.now();
+      let fallbackFrame = 0;
+      const animateFallback = (now: number) => {
+        if (destroyed) return;
+        const delta = Math.min(0.25, Math.max(1 / 240, (now - previous) / 1000));
+        previous = now;
+        const currentState = stateRef.current;
+        cycle += (orbCycleSeconds(currentState) - cycle) * frameDamping(2.2, delta);
+        if (!reducedMotion) phase = (phase + (Math.PI * 2 * delta) / Math.max(1, cycle)) % (Math.PI * 2);
+        asideAmount += ((asideRef.current && W() >= 768 ? 1 : 0) - asideAmount) * frameDamping(3.08, delta);
+        fallbackTarget.set(moodRef.current ?? "#00ff88");
+        if (currentState === "thinking") fallbackTarget.lerp(fallbackWhite, 0.3);
+        else if (currentState === "speaking") fallbackTarget.lerp(fallbackWhite, 0.15);
+        fallbackColor.lerp(fallbackTarget, frameDamping(1.8, delta));
+        fallbackAccent.copy(fallbackColor).lerp(fallbackWhite, 0.34);
+        if (motionRef) {
+          motionRef.current.phase = phase;
+          motionRef.current.cycleSeconds = cycle;
+          motionRef.current.color = `#${fallbackColor.getHexString()}`;
+          motionRef.current.accent = `#${fallbackAccent.getHexString()}`;
+          motionRef.current.intensity = currentState === "idle" ? 0.5 : 0.72;
+          motionRef.current.aside = asideAmount;
+        }
+        fallbackFrame = requestAnimationFrame(animateFallback);
+      };
+      fallbackFrame = requestAnimationFrame(animateFallback);
+      return () => {
+        destroyed = true;
+        cancelAnimationFrame(fallbackFrame);
+      };
     }
-    setWebglUnavailable(false);
+    queueMicrotask(() => {
+      if (!destroyed) setWebglUnavailable(false);
+    });
     renderer.setPixelRatio(Math.min(compact ? 1.25 : 1.75, window.devicePixelRatio));
     renderer.setSize(W(), H());
     renderer.setClearColor(0x000000, 0);
@@ -142,7 +181,9 @@ export default function ThreeOrb({
     let targetSize = 0.4, currentSize = 0.4;
     let lineAmount = 0, targetLineAmount = 0;
     const lineDistance = 8;
-    let spinX = 0, spinY = 0, spinZ = 0;
+    let tumbleX = 0, tumbleY = 0, tumbleZ = 0;
+    let sharedPhase = motionRef?.current.phase ?? 0;
+    let currentCycle = orbCycleSeconds("idle");
     let transitionEnergy = 0;
     let lastState: OrbState = "idle";
     let cloudZ = 0, cloudZVel = 0;
@@ -155,6 +196,7 @@ export default function ThreeOrb({
     const clock = new THREE.Clock();
     const moodBase = new THREE.Color(BASE);
     const targetColor = new THREE.Color(BASE);
+    const targetAccent = new THREE.Color(BASE);
     const white = new THREE.Color(0xffffff);
 
     function animate(frameTime = 0) {
@@ -164,7 +206,14 @@ export default function ThreeOrb({
       const slowFrame = reducedMotion || stateRef.current === "idle";
       if (slowFrame && frameTime - lastRenderedAt < (reducedMotion ? 80 : 32)) return;
       lastRenderedAt = frameTime;
-      const t = clock.getElapsedTime();
+      const rawDelta = Math.max(1 / 240, clock.getDelta());
+      // Particle physics caps recovery steps after a stalled frame; shared
+      // phase uses the real visible-frame delta so ring/orb speed never varies
+      // with display refresh rate or a briefly busy main thread.
+      const delta = Math.min(0.05, rawDelta);
+      const motionDelta = Math.min(0.25, rawDelta);
+      const frameScale = delta * 60;
+      const t = clock.elapsedTime;
       const st = stateRef.current;
 
       switch (st) {
@@ -182,41 +231,47 @@ export default function ThreeOrb({
           targetLineAmount = 0.8; targetElectronRate = 0; break;
       }
 
-      currentRadius += (targetRadius - currentRadius) * 0.02;
-      currentSpeed += (targetSpeed - currentSpeed) * 0.02;
-      currentBright += (targetBright - currentBright) * 0.02;
-      currentSize += (targetSize - currentSize) * 0.02;
-      lineAmount += (targetLineAmount - lineAmount) * 0.02;
-      electronSpawnRate += (targetElectronRate - electronSpawnRate) * 0.02;
+      const stateFollow = frameDamping(1.22, delta);
+      currentRadius += (targetRadius - currentRadius) * stateFollow;
+      currentSpeed += (targetSpeed - currentSpeed) * stateFollow;
+      currentBright += (targetBright - currentBright) * stateFollow;
+      currentSize += (targetSize - currentSize) * stateFollow;
+      lineAmount += (targetLineAmount - lineAmount) * stateFollow;
+      electronSpawnRate += (targetElectronRate - electronSpawnRate) * stateFollow;
+      currentCycle += (orbCycleSeconds(st) - currentCycle) * frameDamping(2.2, motionDelta);
+      sharedPhase = (sharedPhase + (Math.PI * 2 * motionDelta) / Math.max(1, currentCycle)) % (Math.PI * 2);
 
       if (st !== lastState) { transitionEnergy = 1.0; lastState = st; }
-      transitionEnergy *= 0.985;
+      transitionEnergy *= Math.exp(-0.91 * delta);
       if (transitionEnergy > 0.05) {
-        spinX += transitionEnergy * 0.012 * Math.sin(t * 1.7);
-        spinY += transitionEnergy * 0.015;
-        spinZ += transitionEnergy * 0.008 * Math.cos(t * 1.3);
+        tumbleX += transitionEnergy * 0.012 * Math.sin(t * 1.7) * frameScale;
+        tumbleY += transitionEnergy * 0.015 * frameScale;
+        tumbleZ += transitionEnergy * 0.008 * Math.cos(t * 1.3) * frameScale;
       }
+      const spinX = sharedPhase * 0.17 + tumbleX;
+      const spinY = sharedPhase + tumbleY;
+      const spinZ = sharedPhase * 0.09 + tumbleZ;
 
       // our live voice-amplitude signal stands in for the upstream AnalyserNode
       const raw = Math.max(0, Math.min(1, energyRef?.current ?? 0));
-      smoothEnergy += (raw - smoothEnergy) * 0.25;
+      smoothEnergy += (raw - smoothEnergy) * frameDamping(17.25, delta);
       const bass = smoothEnergy;
       const mid = smoothEnergy * 0.8;
 
       let zTarget = Math.sin(t * 0.12) * 8;
       if (st === "thinking") zTarget = Math.sin(t * 0.3) * 15 + Math.sin(t * 0.9) * 6;
       else if (st === "speaking") zTarget = Math.sin(t * 0.15) * 6 - bass * 10;
-      cloudZVel += (zTarget - cloudZ) * 0.008;
-      cloudZVel *= 0.94;
-      cloudZ += cloudZVel;
+      cloudZVel += (zTarget - cloudZ) * 0.008 * frameScale;
+      cloudZVel *= Math.pow(0.94, frameScale);
+      cloudZ += cloudZVel * frameScale;
 
       // glide toward/away from the side strip (desktop only — phones dim instead)
       const wantAside = asideRef.current && W() >= 768 ? 1 : 0;
-      asideAmt += (wantAside - asideAmt) * 0.05;
+      asideAmt += (wantAside - asideAmt) * frameDamping(3.08, delta);
       const halfW = Math.tan((45 * Math.PI) / 360) * 80 * (W() / H());
       // aside: hug the right edge as far as the panel sits on the left
-      const offsetX = halfW * 0.64 * asideAmt;
-      const shrink = 1 - 0.5 * asideAmt;
+      const offsetX = halfW * 0.66 * asideAmt;
+      const shrink = 1 - 0.32 * asideAmt;
       // sit a touch higher so the bottom chat bar isn't crowding it
       const liftY = 3.2;
 
@@ -233,29 +288,30 @@ export default function ThreeOrb({
         const i3 = i * 3;
         const x = a[i3], y = a[i3 + 1], z = a[i3 + 2];
         const px = phase[i];
-        vel[i3] += Math.sin(t * 0.05 + px) * 0.001 * currentSpeed;
-        vel[i3 + 1] += Math.cos(t * 0.06 + px * 1.3) * 0.001 * currentSpeed;
-        vel[i3 + 2] += Math.sin(t * 0.055 + px * 0.7) * 0.001 * currentSpeed;
-        vel[i3] += Math.sin(t * 0.02 + px * 2.1 + y * 0.1) * 0.0008 * currentSpeed;
-        vel[i3 + 1] += Math.cos(t * 0.025 + px * 1.7 + z * 0.1) * 0.0008 * currentSpeed;
-        vel[i3 + 2] += Math.sin(t * 0.022 + px * 0.9 + x * 0.1) * 0.0008 * currentSpeed;
+        vel[i3] += Math.sin(t * 0.05 + px) * 0.001 * currentSpeed * frameScale;
+        vel[i3 + 1] += Math.cos(t * 0.06 + px * 1.3) * 0.001 * currentSpeed * frameScale;
+        vel[i3 + 2] += Math.sin(t * 0.055 + px * 0.7) * 0.001 * currentSpeed * frameScale;
+        vel[i3] += Math.sin(t * 0.02 + px * 2.1 + y * 0.1) * 0.0008 * currentSpeed * frameScale;
+        vel[i3 + 1] += Math.cos(t * 0.025 + px * 1.7 + z * 0.1) * 0.0008 * currentSpeed * frameScale;
+        vel[i3 + 2] += Math.sin(t * 0.022 + px * 0.9 + x * 0.1) * 0.0008 * currentSpeed * frameScale;
         const dist = Math.sqrt(x * x + y * y + z * z) || 0.01;
         const pull = Math.max(0, dist - currentRadius) * 0.002 + 0.0003;
-        vel[i3] -= (x / dist) * pull;
-        vel[i3 + 1] -= (y / dist) * pull;
-        vel[i3 + 2] -= (z / dist) * pull;
+        vel[i3] -= (x / dist) * pull * frameScale;
+        vel[i3 + 1] -= (y / dist) * pull * frameScale;
+        vel[i3 + 2] -= (z / dist) * pull * frameScale;
         if (bass > 0.05) {
-          vel[i3] += (x / dist) * bass * 0.02;
-          vel[i3 + 1] += (y / dist) * bass * 0.02;
-          vel[i3 + 2] += (z / dist) * bass * 0.02;
+          vel[i3] += (x / dist) * bass * 0.02 * frameScale;
+          vel[i3 + 1] += (y / dist) * bass * 0.02 * frameScale;
+          vel[i3 + 2] += (z / dist) * bass * 0.02 * frameScale;
         }
         if (st === "speaking" && mid > 0.1) {
           const pulse = Math.sin(t * 8 + px);
-          vel[i3] += (x / dist) * mid * 0.012 * pulse;
-          vel[i3 + 1] += (y / dist) * mid * 0.012 * pulse;
+          vel[i3] += (x / dist) * mid * 0.012 * pulse * frameScale;
+          vel[i3 + 1] += (y / dist) * mid * 0.012 * pulse * frameScale;
         }
-        vel[i3] *= 0.992; vel[i3 + 1] *= 0.992; vel[i3 + 2] *= 0.992;
-        a[i3] += vel[i3]; a[i3 + 1] += vel[i3 + 1]; a[i3 + 2] += vel[i3 + 2];
+        const drag = Math.pow(0.992, frameScale);
+        vel[i3] *= drag; vel[i3 + 1] *= drag; vel[i3 + 2] *= drag;
+        a[i3] += vel[i3] * frameScale; a[i3 + 1] += vel[i3 + 1] * frameScale; a[i3 + 2] += vel[i3 + 2] * frameScale;
       }
       p.needsUpdate = true;
 
@@ -315,7 +371,7 @@ export default function ThreeOrb({
       let aliveCount = 0;
       for (let e = activeElectrons.length - 1; e >= 0; e--) {
         const el = activeElectrons[e];
-        el.t += el.speed;
+        el.t += el.speed * frameScale;
         if (el.t >= 1) {
           activeElectrons.splice(e, 1);
           continue;
@@ -333,15 +389,29 @@ export default function ThreeOrb({
       electrons.scale.setScalar(shrink);
 
       mat.opacity = currentBright + bass * 0.08;
-      mat.size = (currentSize + bass * 0.05) * shrink;
+      // Geometry already scales in aside mode. Scaling the point size as well
+      // made the side-view core look half-sized twice.
+      mat.size = currentSize + bass * 0.05;
       // mood-aware palette: the whole orb drifts slowly into the conversation's
       // colour and holds it; states tint from that base
       moodBase.set(moodRef.current ?? "#00ff88");
       targetColor.copy(moodBase);
       if (st === "thinking") targetColor.lerp(white, 0.3);
       else if (st === "speaking") targetColor.lerp(white, 0.15);
-      mat.color.lerp(targetColor, 0.004);
-      lineMat.color.lerp(targetColor, 0.004);
+      targetAccent.copy(targetColor).lerp(white, 0.34);
+      const colorFollow = frameDamping(1.8, delta);
+      mat.color.lerp(targetColor, colorFollow);
+      lineMat.color.lerp(targetAccent, colorFollow);
+      electronMat.color.lerp(targetAccent, colorFollow);
+
+      if (motionRef) {
+        motionRef.current.phase = sharedPhase;
+        motionRef.current.cycleSeconds = currentCycle;
+        motionRef.current.color = `#${mat.color.getHexString()}`;
+        motionRef.current.accent = `#${lineMat.color.getHexString()}`;
+        motionRef.current.intensity = Math.min(1, currentBright + bass * 0.2);
+        motionRef.current.aside = asideAmt;
+      }
 
       // gentle, slow camera breathing — calmed right down so the orb sits
       // steady instead of drifting all over (worse when it's small and aside),
@@ -391,9 +461,9 @@ export default function ThreeOrb({
       {webglUnavailable && (
         <div
           aria-label="JARVIS visual core"
-          className="absolute inset-0 grid place-items-center"
+          className={`absolute inset-0 grid place-items-center will-change-transform transition-transform duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${aside ? "translate-x-[32%]" : "translate-x-0"}`}
         >
-          <div className="relative h-[min(42vw,280px)] w-[min(42vw,280px)] min-h-36 min-w-36 rounded-full border border-emerald-300/25 bg-[radial-gradient(circle_at_42%_38%,rgba(110,255,196,0.32),rgba(0,255,136,0.1)_34%,rgba(0,255,136,0.02)_68%,transparent_72%)] shadow-[0_0_80px_rgba(0,255,136,0.16)]">
+          <div className={`relative h-[min(42vw,280px)] w-[min(42vw,280px)] min-h-36 min-w-36 rounded-full border border-emerald-300/25 bg-[radial-gradient(circle_at_42%_38%,rgba(110,255,196,0.32),rgba(0,255,136,0.1)_34%,rgba(0,255,136,0.02)_68%,transparent_72%)] shadow-[0_0_80px_rgba(0,255,136,0.16)] transition-transform duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${aside ? "scale-[0.68]" : "scale-100"}`}>
             <div className="absolute inset-[18%] rounded-full border border-emerald-200/20 shadow-[inset_0_0_45px_rgba(0,255,136,0.18)]" />
             <div className="absolute inset-[38%] rounded-full bg-emerald-300/35 blur-md" />
           </div>

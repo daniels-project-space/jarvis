@@ -171,6 +171,7 @@ export const insightEngine = schedules.task({
           risk: "low",
           priority: Math.round(Number(attentionArgs.impact)),
           originThreadId: await chatThread(),
+          visibility: "system",
           acceptanceCriteria: [
             "Reproduce or prove the issue before editing",
             "Implement a root-cause fix without weakening safety gates",

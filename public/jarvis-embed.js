@@ -15,9 +15,9 @@
   f.title = "JARVIS";
   f.allow = "microphone; autoplay; clipboard-write";
   f.style.cssText =
-    "position:fixed;bottom:14px;right:14px;width:340px;height:72px;max-width:94vw;border:0;" +
-    "border-radius:20px;z-index:2147483000;background:transparent;color-scheme:dark;" +
-    "box-shadow:0 14px 44px rgba(0,0,0,.55);transition:height .25s ease,opacity .3s ease,transform .3s ease;" +
+    "position:fixed;bottom:12px;right:12px;width:min(420px,calc(100vw - 24px));height:96px;border:0;" +
+    "border-radius:22px;z-index:2147483000;background:transparent;color-scheme:dark;" +
+    "box-shadow:0 14px 44px rgba(0,0,0,.55);transition:height .36s cubic-bezier(.22,1,.36,1),opacity .3s ease,transform .3s ease;" +
     "opacity:0;transform:translateY(14px);pointer-events:none;";
 
   function show() {
@@ -48,7 +48,7 @@
     if (e.origin !== ORIGIN) return;
     var d = e.data || {};
     if (d.jarvis === "size" && typeof d.h === "number") {
-      f.style.height = Math.max(64, Math.min(d.h, window.innerHeight - 40)) + "px";
+      f.style.height = Math.max(88, Math.min(d.h, window.innerHeight - 24)) + "px";
     } else if (d.jarvis === "wake") show(); // "hey jarvis" → the widget appears
     else if (d.jarvis === "hide") hide();
   });

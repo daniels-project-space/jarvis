@@ -67,7 +67,7 @@ export default function Embed() {
       /* not framed */
     }
   };
-  const size = (expanded: boolean) => post({ jarvis: "size", h: expanded ? 384 : 72 });
+  const size = (expanded: boolean) => post({ jarvis: "size", h: expanded ? 440 : 96 });
   useEffect(() => {
     size(open || live !== "off" || lines.length > 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -188,7 +188,7 @@ export default function Embed() {
 
   async function submit(text: string) {
     const t = text.trim();
-    if (!t || busy) return;
+    if (!t) return;
     setInput("");
     push({ who: "you", text: t });
     void claimVoice({ client: me.current });
@@ -213,8 +213,8 @@ export default function Embed() {
           const { speak } = await import("../../lib/tts");
           void speak(reply, () => {}, () => {}, () => {});
         }
-      } else if (j.fallback) {
-        push({ who: "jarvis", text: "On it — answer's coming through in the main window." });
+      } else if (j.queued || j.fallback) {
+        push({ who: "jarvis", text: "On it — I’m still here if you need to add anything." });
       }
     } catch {
       push({ who: "jarvis", text: "Connection hiccup — try that again." });
@@ -293,18 +293,23 @@ export default function Embed() {
           {lines.length === 0 && <p className="mt-6 text-center text-xs text-slate">Say the word, sir.</p>}
           {lines.map((l, i) => (
             <div key={i} className={l.who === "you" ? "text-right" : "text-left"}>
-              <span className={`inline-block max-w-[92%] rounded-xl px-2.5 py-1 text-xs leading-relaxed ${l.who === "you" ? "bg-amber/10 text-amber" : "bg-cyan/[0.07] text-ice"}`}>
+              <span className={`inline-block max-w-[92%] break-words rounded-xl px-2.5 py-1 text-xs leading-relaxed [overflow-wrap:anywhere] ${l.who === "you" ? "bg-amber/10 text-amber" : "bg-cyan/[0.07] text-ice"}`}>
                 {l.text}
               </span>
             </div>
           ))}
         </div>
       </div>
-      <div className="glass mt-1.5 flex shrink-0 items-stretch gap-1.5 rounded-2xl p-1.5">
-        <span className="relative flex w-8 shrink-0 items-center justify-center" title={orbState}>
+      <div className="glass mt-1.5 flex min-h-[76px] shrink-0 items-center gap-1.5 overflow-hidden rounded-[20px] p-2">
+        <span className="relative flex h-11 w-11 shrink-0 items-center justify-center" title={orbState}>
           <span
-            className={`h-3.5 w-3.5 rounded-full ${orbState === "listening" ? "bg-cyan animate-pulse" : orbState === "thinking" ? "bg-amber animate-ping" : "bg-cyan/70 breathe"}`}
-            style={{ boxShadow: "0 0 14px rgba(0,255,136,0.6)" }}
+            className="absolute inset-0 rounded-full border border-cyan/20 border-t-cyan/80 motion-reduce:animate-none"
+            style={{ animation: `embed-orbit ${orbState === "thinking" ? 5 : orbState === "listening" ? 8 : 14}s linear infinite`, boxShadow: "0 0 16px rgba(0,255,136,.15)" }}
+          />
+          <span className="absolute inset-[18%] rounded-full border border-cyan/15" />
+          <span
+            className={`h-5 w-5 rounded-full ${orbState === "listening" ? "bg-cyan animate-pulse" : orbState === "thinking" ? "bg-amber animate-pulse" : "bg-cyan/70 breathe"}`}
+            style={{ boxShadow: "0 0 20px rgba(0,255,136,0.7)" }}
           />
         </span>
         <button
@@ -324,12 +329,12 @@ export default function Embed() {
           onChange={(e) => setInput(e.target.value)}
           onFocus={() => setOpen(true)}
           onKeyDown={(e) => e.key === "Enter" && submit(input)}
-          placeholder={busy ? "thinking…" : "Talk to me…"}
+          placeholder={busy ? "Ask while I work…" : "Talk to me…"}
           className="min-w-0 flex-1 rounded-xl bg-black/30 px-3 py-1.5 text-xs text-ice outline-none ring-1 ring-white/10 focus:ring-cyan/50"
         />
         <button
           onClick={() => submit(input)}
-          disabled={busy}
+          disabled={!input.trim()}
           className="shrink-0 rounded-xl bg-cyan/15 px-2.5 text-xs font-medium text-cyan ring-1 ring-cyan/40 disabled:opacity-40"
         >
           →

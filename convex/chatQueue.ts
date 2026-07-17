@@ -26,14 +26,19 @@ export const sendMessage = mutation({
   handler: async (ctx, a) => {
     await requireAdmin(ctx, a.authTokenHash);
     const threadId = a.threadId ?? "main";
-    await ensureSession(ctx, threadId);
-    return await ctx.db.insert("chatMessages", {
+    const session = await ensureSession(ctx, threadId);
+    // Stable turn slots keep concurrent replies beside the user message that
+    // caused them, even when a later fast turn finishes before an earlier one.
+    const createdAt = Math.max(Date.now(), Number(session?.lastActiveAt ?? 0) + 2);
+    const id = await ctx.db.insert("chatMessages", {
       threadId,
       role: "user",
       text: a.text,
       status: "pending",
-      createdAt: Date.now(),
+      createdAt,
     });
+    if (session) await ctx.db.patch(session._id, { lastActiveAt: createdAt });
+    return id;
   },
 });
 
@@ -171,15 +176,7 @@ export const logTurn = mutation({
   },
 });
 
-export const claimNext = mutation({
-  args: { workerToken: v.optional(v.string()) },
-  handler: async (ctx, a) => {
-    requireWorker(a.workerToken);
-    const pending = await ctx.db
-      .query("chatMessages")
-      .withIndex("by_status", (q: any) => q.eq("status", "pending"))
-      .first();
-    if (!pending) return null;
+async function claimPending(ctx: { db: any }, pending: any) {
     await ctx.db.patch(pending._id, { status: "done" });
 
     const session = await ctx.db
@@ -193,7 +190,7 @@ export const claimNext = mutation({
       role: "assistant",
       text: "",
       status: "streaming",
-      createdAt: Date.now(),
+      createdAt: pending.createdAt + 1,
     });
 
     const all = await ctx.db
@@ -202,7 +199,13 @@ export const claimNext = mutation({
       .order("desc")
       .take(40);
     const history = all
-      .filter((m: any) => m._id !== assistantId && m._id !== pending._id && m.status === "done")
+      .filter(
+        (m: any) =>
+          m._id !== assistantId &&
+          m._id !== pending._id &&
+          m.status === "done" &&
+          m.createdAt < pending.createdAt,
+      )
       .sort((a: any, b: any) => a.createdAt - b.createdAt)
       .slice(-12)
       .map((m: any) => ({ role: m.role, text: m.text }));
@@ -214,6 +217,32 @@ export const claimNext = mutation({
       claudeSessionId: session?.claudeSessionId ?? null,
       history,
     };
+}
+
+// Immediate Trigger runs claim exactly the message that woke them. This is
+// what permits parallel foreground turns without two workers racing through a
+// shared drain loop or making a new question wait behind an older slow one.
+export const claimMessage = mutation({
+  args: { messageId: v.id("chatMessages"), workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const pending = await ctx.db.get(a.messageId);
+    if (!pending || pending.role !== "user" || pending.status !== "pending") return null;
+    return await claimPending(ctx, pending);
+  },
+});
+
+// Recovery-only FIFO claim for a lost Trigger wake-up.
+export const claimNext = mutation({
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const pending = await ctx.db
+      .query("chatMessages")
+      .withIndex("by_status", (q: any) => q.eq("status", "pending"))
+      .first();
+    if (!pending) return null;
+    return await claimPending(ctx, pending);
   },
 });
 
@@ -254,7 +283,13 @@ export const finalize = mutation({
       .withIndex("by_thread", (q: any) => q.eq("threadId", a.threadId))
       .first();
     if (s) {
-      const sp: Record<string, unknown> = { status: "idle", lastActiveAt: Date.now() };
+      const otherTurns = await ctx.db
+        .query("chatMessages")
+        .withIndex("by_thread", (q: any) => q.eq("threadId", a.threadId))
+        .order("desc")
+        .take(32);
+      const stillWorking = otherTurns.some((row: any) => row._id !== a.messageId && row.status === "streaming");
+      const sp: Record<string, unknown> = { status: stillWorking ? "working" : "idle", lastActiveAt: Date.now() };
       if (a.claudeSessionId) sp.claudeSessionId = a.claudeSessionId;
       await ctx.db.patch(s._id, sp);
     }

@@ -18,6 +18,7 @@ const enqueueArgs = {
   label: v.optional(v.string()),
   originThreadId: v.optional(v.string()),
   originTurnId: v.optional(v.string()),
+  visibility: v.optional(v.union(v.literal("conversation"), v.literal("system"))),
   agentId: v.optional(v.string()),
   risk: v.optional(v.string()),
   priority: v.optional(v.number()),
