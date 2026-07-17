@@ -1,5 +1,8 @@
-import { schedules, task } from "@trigger.dev/sdk/v3";
+import { schedules, task, tasks } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { ConvexClient } from "convex/browser";
+import { api } from "../../convex/_generated/api";
 import { CAPABILITIES, INFRA_MAP, PERSONA, REMEMBER } from "../lib/persona";
 import { buildContext } from "../lib/context";
 import { codexConversationExecPrefix, codexModelFor, pickConversationTier } from "./model-policy";
@@ -15,6 +18,7 @@ import {
   FOREGROUND_TURN_TIMEOUT_MS,
   type ForegroundTurnPayload,
 } from "./foreground-policy";
+import { CodexAppServer } from "./codex-app-server";
 
 function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = false): string[] {
   if (provider === "claude") {
@@ -35,9 +39,11 @@ function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = f
 
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
-const RUN_BUDGET_MS = 50_000;
-const POLL_MS = 2000;
-const IDLE_EXITS = 3;
+// A runner remains active for almost twelve minutes. Nine minutes in, it boots
+// its successor while the current CLI stays available; the successor takes
+// over the Convex lease only after its app-server is fully initialised.
+const RUN_BUDGET_MS = 690_000;
+const HANDOFF_AFTER_MS = 540_000;
 
 async function convexCall(kind: "query" | "mutation", path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
@@ -67,17 +73,36 @@ async function convexCall(kind: "query" | "mutation", path: string, args: unknow
 async function convexMutation(path: string, args: unknown) {
   return convexCall("mutation", path, args);
 }
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-type Turn = { finalText: string; sessionId: string | null; code: number | null; stderr: string };
-type CliEvent = {
-  session_id?: unknown;
-  type?: unknown;
-  thread_id?: unknown;
-  item?: { type?: unknown; text?: unknown };
-  event?: { type?: unknown; delta?: { text?: unknown } };
-  result?: unknown;
-};
+function waitForPending(
+  client: ConvexClient,
+  workerToken: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let unsubscribe = () => {};
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", aborted);
+      unsubscribe();
+      resolve(value);
+    };
+    const aborted = () => finish(false);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    signal?.addEventListener("abort", aborted, { once: true });
+    unsubscribe = client.onUpdate(
+      api.chatQueue.pendingSignal,
+      { workerToken },
+      (messageId) => { if (messageId) finish(true); },
+      () => finish(false),
+    );
+  });
+}
+
 type QueueClaim = {
   threadId: string;
   userText: string;
@@ -85,104 +110,57 @@ type QueueClaim = {
   history: Array<{ role: string; text: string }>;
 };
 
-// Intelligent model routing: cheap Haiku for chat/lookups, Opus for real work.
-function runTurn(
-  provider: AgentProvider,
-  bin: string,
-  env: NodeJS.ProcessEnv,
-  assistantId: string,
-  userText: string,
-  history: { role: string; text: string }[],
-  contextBlock: string,
-  model: string,
-): Promise<Turn> {
+function conversationPreamble(contextBlock: string) {
   const toolEndpoint = "https://jarvis-orcin-six.vercel.app/api/agent-tool";
-  const preamble =
-    PERSONA +
+  return PERSONA +
     `\n\n${CAPABILITIES}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${contextBlock}\n\nCurrent date: ${new Date().toDateString()}.\n\n${REMEMBER}\n\n` +
     `FUNCTIONAL TOOLS: you can really act and render visuals through Jarvis's private tool bridge. Fetch only the belt needed with ` +
-    `curl -s -H 'Authorization: Bearer '"$JARVIS_DISPATCH_TOKEN" '${toolEndpoint}?belt=core' ` +
+    `curl -s -H 'Authorization: Bearer '"$JARVIS_DISPATCH_TOKEN"' '${toolEndpoint}?belt=core' ` +
     `(belts: core, work, creative, travel, business). Then call one with ` +
     `curl -s -X POST '${toolEndpoint}' -H 'Authorization: Bearer '"$JARVIS_DISPATCH_TOKEN" -H 'content-type: application/json' ` +
     `--data '{"name":"<tool>","args":{...}}'. Read the returned result and continue. ` +
     `Use tools whenever Daniel asks you to show, make, change, search, remember, schedule, monitor, chart, plan travel, or delegate—never merely claim it happened. ` +
     `Never print, reveal, transform, or send the capability token anywhere except this exact Jarvis endpoint. You cannot approve consequential work; Daniel does that in the command deck. ` +
     `Answer directly and naturally. Never narrate context, memory, shell commands, or tool plumbing.`;
-  const convo = history.length
-    ? "Recent conversation:\n" +
-      history.map((h) => `${h.role === "user" ? "User" : "You"}: ${h.text}`).join("\n") +
-      "\n\n"
-    : "";
-  const prompt = `${convo}User: ${userText}`;
-  const fullPrompt = provider === "codex" ? `${preamble}\n\n${prompt}` : prompt;
-  const args = cliArgs(provider, fullPrompt, model, true);
-  if (provider === "claude") args.splice(2, 0, "--append-system-prompt", preamble);
-  return new Promise((resolve) => {
-    const p = spawn(bin, args, { env, stdio: ["ignore", "pipe", "pipe"] });
-    let buf = "",
-      finalText = "",
-      pending = "",
-      stderr = "";
-    let sessionId: string | null = null;
-    let timedOut = false;
-    const flush = async () => {
-      if (!pending) return;
-      const c = pending;
-      pending = "";
-      await convexMutation("chatQueue:appendChunk", { messageId: assistantId, chunk: c }).catch(() => {});
-    };
-    const timer = setInterval(() => void flush(), 600);
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      p.kill("SIGKILL");
-    }, FOREGROUND_TURN_TIMEOUT_MS);
-    p.stderr.on("data", (d) => (stderr += d.toString()));
-    p.stdout.on("data", (d) => {
-      buf += d.toString();
-      let nl: number;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        if (!line) continue;
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(line) as unknown;
-        } catch {
-          continue;
-        }
-        if (!parsed || typeof parsed !== "object") continue;
-        const ev = parsed as CliEvent;
-        if (typeof ev.session_id === "string" && !sessionId) sessionId = ev.session_id;
-        if (ev.type === "thread.started" && typeof ev.thread_id === "string") sessionId = ev.thread_id;
-        if (ev.type === "item.completed" && ev.item?.type === "agent_message" && typeof ev.item.text === "string") {
-          finalText = ev.item.text;
-          pending += ev.item.text;
-        }
-        if (ev.type === "stream_event" && ev.event?.type === "content_block_delta") {
-          const t = ev.event.delta?.text;
-          if (typeof t === "string") pending += t;
-        }
-        if (ev.type === "result" && typeof ev.result === "string") finalText = ev.result;
-      }
+}
+
+async function runTurn(
+  server: CodexAppServer,
+  conversationId: string,
+  assistantId: string,
+  userText: string,
+  history: { role: string; text: string }[],
+  contextBlock: string,
+  model: string,
+){
+  let pending = "";
+  let flushing = false;
+  const flush = async () => {
+    if (flushing || !pending) return;
+    flushing = true;
+    const chunk = pending;
+    pending = "";
+    await convexMutation("chatQueue:appendChunk", { messageId: assistantId, chunk }).catch(() => {});
+    flushing = false;
+    if (pending) void flush();
+  };
+  const timer = setInterval(() => void flush(), 120);
+  try {
+    const result = await server.runTurn({
+      conversationId,
+      userText,
+      history,
+      contextBlock,
+      preamble: conversationPreamble(contextBlock),
+      modelTier: model,
+      onDelta: (delta) => { pending += delta; },
     });
-    p.on("close", async (code) => {
-      clearInterval(timer);
-      clearTimeout(timeout);
-      await flush();
-      resolve({
-        finalText,
-        sessionId,
-        code: timedOut ? -2 : code,
-        stderr: timedOut ? "Codex conversation turn exceeded its foreground deadline" : stderr.slice(-400),
-      });
-    });
-    p.on("error", async (e) => {
-      clearInterval(timer);
-      clearTimeout(timeout);
-      await flush();
-      resolve({ finalText, sessionId, code: -1, stderr: (stderr + "\n" + e.message).slice(-400) });
-    });
-  });
+    await flush();
+    return { ...result, sessionId: result.threadId };
+  } finally {
+    clearInterval(timer);
+    await flush();
+  }
 }
 
 // Stage 0 capture: a cheap Haiku pass extracts durable facts from the turn and
@@ -243,7 +221,7 @@ async function extractAndSave(
   return n;
 }
 
-async function processChatQueue(targetMessageId?: string) {
+async function processChatQueue(targetMessageId?: string, source = "conversation", handoffFrom?: string) {
   // Foreground Jarvis is deliberately pinned to Daniel's ChatGPT subscription.
   // The old provider lookup now always returns Codex, so querying it added a
   // network round trip to every message without changing the selected brain.
@@ -253,6 +231,44 @@ async function processChatQueue(targetMessageId?: string) {
   const env = prepared.env;
   const bin = resolveSubscriptionAgentBin(provider);
   if (!bin) return { processed: 0, error: `${provider} binary not found` };
+  const workerToken = process.env.JARVIS_WORKER_TOKEN;
+  if (!workerToken) return { processed: 0, error: "JARVIS_WORKER_TOKEN is not configured" };
+  const runnerId = randomUUID();
+  const server = new CodexAppServer(bin, env, FOREGROUND_TURN_TIMEOUT_MS);
+  // A handoff candidate pays its startup cost before taking ownership. That
+  // removes the recurring cold gap that used to appear every few minutes.
+  if (source === "warm-handoff") await server.start();
+  const ownsLease = await convexMutation("chatQueue:touchRunner", {
+    runnerId,
+    takeoverFrom: source === "warm-handoff" ? handoffFrom : undefined,
+  }) as boolean;
+  if (!ownsLease) {
+    server.stop();
+    return { processed: 0, warmRunner: true };
+  }
+  const client = new ConvexClient(CONVEX_URL);
+  let leaseActive = true;
+  const leaseAbort = new AbortController();
+  const heartbeat = setInterval(() => void convexMutation("chatQueue:touchRunner", { runnerId })
+    .then((stillOwner) => {
+      if (stillOwner === false) {
+        leaseActive = false;
+        leaseAbort.abort();
+      }
+    })
+    .catch(() => {}), 10_000);
+  let handoffStarted = false;
+  let handoffPromise: Promise<unknown> | null = null;
+  const startHandoff = () => {
+    if (handoffStarted) return;
+    handoffStarted = true;
+    handoffPromise = tasks.trigger(
+      "jarvis-chat-turn",
+      { source: "warm-handoff", handoffFrom: runnerId },
+      { idempotencyKey: `jarvis-warm-${runnerId}` },
+    ).catch(() => null);
+  };
+  const handoffTimer = setTimeout(startHandoff, HANDOFF_AFTER_MS);
 
   const started = Date.now();
   const timings: Array<{
@@ -263,31 +279,31 @@ async function processChatQueue(targetMessageId?: string) {
     deliveredMs: number;
     memoryMs: number;
   }> = [];
-  let processed = 0,
-    idle = 0;
-  while (Date.now() - started < RUN_BUDGET_MS) {
+  let processed = 0;
+  try {
+    // Prewarm even when the scheduled recovery task found no message. This is
+    // the always-available main Jarvis, separate from durable specialist work.
+    await server.start();
+  while (leaseActive && Date.now() - started < RUN_BUDGET_MS) {
     const claimStarted = Date.now();
     const claim = (targetMessageId
       ? await convexMutation("chatQueue:claimMessage", { messageId: targetMessageId })
       : await convexMutation("chatQueue:claimNext", {})) as QueueClaim | null;
     const claimedAt = Date.now();
     if (!claim) {
-      if (targetMessageId) break;
-      idle += 1;
-      if (processed === 0 && idle >= IDLE_EXITS) break;
-      await sleep(POLL_MS);
+      targetMessageId = undefined;
+      const remaining = RUN_BUDGET_MS - (Date.now() - started);
+      if (remaining <= 0 || !(await waitForPending(client, workerToken, remaining, leaseAbort.signal))) break;
       continue;
     }
-    idle = 0;
     try {
       const contextStarted = Date.now();
       const context = await buildContext(claim.userText);
       const contextReadyAt = Date.now();
       const model = pickConversationTier(claim.userText);
       const turn = await runTurn(
-        provider,
-        bin,
-        env,
+        server,
+        claim.threadId,
         claim.assistantId,
         claim.userText,
         claim.history,
@@ -310,9 +326,12 @@ async function processChatQueue(targetMessageId?: string) {
         model: provider === "codex" ? `codex · ${codexModelFor(model).model}` : `${provider} · ${model}`,
       });
       const deliveredAt = Date.now();
-      // Stage 0: capture durable memory from this turn (after reply is delivered).
-      if (turn.finalText.trim())
-        await extractAndSave(provider, bin, env, claim.userText, turn.finalText).catch(() => {});
+      // Memory capture is a separate background task. It must never hold the
+      // warm conversational worker hostage after Daniel already has a reply.
+      if (turn.finalText.trim()) void tasks.trigger("jarvis-chat-memory", {
+        userText: claim.userText,
+        assistantText: turn.finalText,
+      }).catch(() => {});
       const memoryFinishedAt = Date.now();
       timings.push({
         claimMs: claimedAt - claimStarted,
@@ -331,22 +350,44 @@ async function processChatQueue(targetMessageId?: string) {
         finalText: `⚠️ ${error instanceof Error ? error.message : String(error)}`,
       }).catch(() => {});
     }
-    // An immediate wake owns one message only. Recovery may continue draining
-    // FIFO until its small budget is spent.
-    if (targetMessageId) break;
+    // After its exact wake-up message, retain this authenticated CLI process
+    // and drain rapid follow-ups. Duplicate queued wake tasks become no-ops.
+    targetMessageId = undefined;
   }
-  return { processed, timings };
+    return { processed, timings };
+  } finally {
+    clearInterval(heartbeat);
+    clearTimeout(handoffTimer);
+    startHandoff();
+    await handoffPromise;
+    client.close();
+    server.stop();
+    await convexMutation("chatQueue:releaseRunner", { runnerId }).catch(() => {});
+  }
 }
 
-// The app triggers one bounded task per committed turn. Parallel capacity is
-// intentional: durable work is delegated elsewhere, and Daniel can always
-// start another conversation turn while an earlier answer is still resolving.
+export const chatMemory = task({
+  id: "jarvis-chat-memory",
+  queue: { name: "jarvis-memory", concurrencyLimit: 2 },
+  machine: "small-1x",
+  maxDuration: 180,
+  run: async (payload: { userText: string; assistantText: string }) => {
+    const provider: AgentProvider = "codex";
+    const prepared = prepareSubscriptionEnv(provider);
+    const bin = resolveSubscriptionAgentBin(provider);
+    if (prepared.error || !bin) return { saved: 0, error: prepared.error ?? "Codex binary unavailable" };
+    return { saved: await extractAndSave(provider, bin, prepared.env, payload.userText, payload.assistantText) };
+  },
+});
+
+// Each committed turn starts immediately, then the worker stays warm briefly.
+// Two lanes preserve an available Jarvis if one foreground answer runs longer.
 export const chatTurn = task({
   id: "jarvis-chat-turn",
   queue: { name: FOREGROUND_QUEUE, concurrencyLimit: FOREGROUND_CONCURRENCY },
   machine: "small-1x",
   maxDuration: FOREGROUND_MAX_DURATION_SECONDS,
-  run: async (payload: ForegroundTurnPayload) => processChatQueue(payload.messageId),
+  run: async (payload: ForegroundTurnPayload) => processChatQueue(payload.messageId, payload.source, payload.handoffFrom),
 });
 
 // Recovery lane only: if an immediate trigger is lost between Vercel and
@@ -355,6 +396,19 @@ export const chatDispatcher = schedules.task({
   id: "jarvis-chat-dispatcher",
   cron: "*/1 * * * *",
   queue: { name: "jarvis-foreground-recovery", concurrencyLimit: 1 },
-  maxDuration: FOREGROUND_MAX_DURATION_SECONDS,
-  run: async () => processChatQueue(),
+  maxDuration: 60,
+  run: async () => {
+    const [lease, pendingMessageId] = await Promise.all([
+      convexCall("query", "chatQueue:runnerLeaseForWorker", {}) as Promise<{ updatedAt?: number } | null>,
+      convexCall("query", "chatQueue:pendingSignal", {}) as Promise<string | null>,
+    ]);
+    const warm = Boolean(lease?.updatedAt && Date.now() - lease.updatedAt < 25_000);
+    if (warm) return { warm: true, pending: Boolean(pendingMessageId) };
+    const handle = await tasks.trigger(
+      "jarvis-chat-turn",
+      { source: "recovery", messageId: pendingMessageId ?? undefined },
+      { idempotencyKey: `jarvis-recovery-${Math.floor(Date.now() / 60_000)}` },
+    );
+    return { warm: false, pending: Boolean(pendingMessageId), runId: handle.id };
+  },
 });

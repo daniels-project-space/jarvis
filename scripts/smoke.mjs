@@ -187,31 +187,13 @@ await test("no phantom live lock", async () => {
   }
 });
 
-await test("realtime token mints (or is legitimately locked)", async () => {
-  // The route builds `instructions` from the static PERSONA const on every 200,
-  // so a healthy mint is ALWAYS complete. A lone cold-start/edge blip that mints
-  // a token but returns a short body is transient, not a regression — retry a
-  // couple of times so a single hiccup doesn't file a false self-repair incident.
-  // Only a PERSISTENT degradation (all attempts short) fails and pages the healer.
-  let last = "";
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (attempt) await new Promise((res) => setTimeout(res, 1500));
-    const r = await fetch(`${BASE}/api/realtime-token`, {
-      method: "POST",
-      headers: { "content-type": "application/json", cookie: COOKIE },
-      body: JSON.stringify({ client: "smoke" }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (r.status === 409) return; // someone is genuinely live — fine
-    await cv("mutation", "ui:setLiveOn", { client: "smoke", on: false }).catch(() => {});
-    if (!j.token) {
-      last = `no token: ${j.error}`;
-      continue;
-    }
-    if (/JARVIS/.test(j.instructions ?? "") && (j.instructions ?? "").length > 2000) return; // healthy mint
-    last = "persona instructions missing from token";
-  }
-  assert(false, last);
+await test("metered realtime API route is absent", async () => {
+  const r = await fetch(`${BASE}/api/realtime-token`, {
+    method: "POST",
+    headers: { "content-type": "application/json", cookie: COOKIE },
+    body: JSON.stringify({ client: "smoke" }),
+  });
+  assert(r.status === 404, `retired realtime route returned ${r.status}`);
 });
 
 await test("timed reminder sets + is due-deliverable", async () => {

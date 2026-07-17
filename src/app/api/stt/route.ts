@@ -2,10 +2,8 @@ import type { NextRequest } from "next/server";
 import { getSecret } from "@/lib/vault";
 import { STT_PROMPT } from "@/lib/sttvocab";
 
-// Speech-to-text, accuracy-first: OpenAI gpt-4o-transcribe (much better word
-// recognition, vocabulary-primed) with Groq whisper-large-v3-turbo as the fast
-// fallback when OpenAI is slow or down. Accepts whatever container
-// MediaRecorder produced (webm/mp4/wav).
+// Speech-to-text utility only: free/fast Groq Whisper. Conversation intelligence
+// remains exclusively in the authenticated Codex subscription CLI worker.
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
@@ -50,20 +48,10 @@ export async function POST(req: NextRequest) {
   const mime = (req.headers.get("content-type") ?? "audio/wav").split(";")[0];
   const ext = EXT[mime] ?? "wav";
 
-  const [openaiKey, groqKey] = await Promise.all([
-    Promise.resolve(process.env.OPENAI_API_KEY ?? "").then((k) => k || getSecret("openai", "OPENAI_API_KEY").catch(() => "")),
-    Promise.resolve(process.env.GROQ_API_KEY ?? "").then((k) => k || getSecret("groq", "GROQ_API_KEY").catch(() => "")),
-  ]);
+  const groqKey = process.env.GROQ_API_KEY ?? (await getSecret("groq", "GROQ_API_KEY").catch(() => ""));
 
   let text: string | null = null;
-  if (openaiKey)
-    text = await transcribe(
-      "https://api.openai.com/v1/audio/transcriptions",
-      openaiKey,
-      buildForm("gpt-4o-transcribe", inBuf, mime, ext),
-      8000,
-    );
-  if (text === null && groqKey)
+  if (groqKey)
     text = await transcribe(
       "https://api.groq.com/openai/v1/audio/transcriptions",
       groqKey,

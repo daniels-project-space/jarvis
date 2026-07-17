@@ -1,46 +1,7 @@
 import "server-only";
-import { Agent } from "@mastra/core/agent";
 import { z } from "zod";
 import { PERMANENT_TEAM, TEAM_BY_SLUG, type AgentSlug, type ModelTier, type WorkRisk } from "./team";
 import { routeWork, suggestedAcceptanceCriteria } from "./routing";
-
-const model = "openai/gpt-5.6";
-
-function specialist(slug: Exclude<AgentSlug, "jarvis">) {
-  const profile = TEAM_BY_SLUG[slug];
-  return new Agent({
-    id: profile.slug,
-    name: profile.name,
-    description: `${profile.role}. ${profile.description}`,
-    instructions: profile.instructions,
-    model,
-    maxRetries: 2,
-  });
-}
-
-export const permanentAgents = {
-  paul: specialist("paul"),
-  atlas: specialist("atlas"),
-  iris: specialist("iris"),
-  maya: specialist("maya"),
-  sentry: specialist("sentry"),
-};
-
-export const jarvisSupervisor = new Agent({
-  id: "jarvis",
-  name: "JARVIS",
-  description: TEAM_BY_SLUG.jarvis.description,
-  instructions:
-    TEAM_BY_SLUG.jarvis.instructions +
-    " You are the manager control plane, while Trigger.dev is the durable execution plane. Produce a lean plan of independent workstreams for the permanent team. Do not pretend a delegate has executed work during planning. Mark consequential external actions for approval. Prefer one strong owner when parallelism would add coordination cost.",
-  model,
-  agents: permanentAgents,
-  maxRetries: 2,
-  defaultOptions: {
-    maxSteps: 6,
-    toolCallConcurrency: 3,
-  },
-});
 
 const workstreamSchema = z.object({
   label: z.string().min(3).max(80),
@@ -86,34 +47,11 @@ function deterministicPlan(goal: string, repo?: string): ManagedMission {
 }
 
 export async function planManagedMission(goal: string, options?: { repo?: string; context?: string }): Promise<ManagedMission> {
-  // The conversational Codex subscription worker normally supplies explicit
-  // workstreams. Keep Mastra's deterministic policy fallback available here,
-  // but never silently bill a metered model merely because Vercel has an API
-  // key for Realtime/vision surfaces.
-  if (process.env.JARVIS_ALLOW_METERED_MASTRA !== "1" || !process.env.OPENAI_API_KEY) {
-    return deterministicPlan(goal, options?.repo);
-  }
-  try {
-    const roster = PERMANENT_TEAM.filter((agent) => agent.slug !== "jarvis")
-      .map((agent) => `- ${agent.slug}: ${agent.role} — ${agent.description}`)
-      .join("\n");
-    const result = await jarvisSupervisor.generate(
-      `Plan durable work for this goal:\n${goal}\n\nRepository if known: ${options?.repo ?? "none"}\n` +
-        `Conversation/project context:\n${options?.context?.slice(0, 5000) ?? "none supplied"}\n\nPermanent team:\n${roster}\n\n` +
-        "Use parallel workstreams only when independent. Each task starts blank, so include all necessary context. Code work goes to Paul on an isolated branch. Research is read-only. Publishing, messaging, booking, money, destructive actions and production deployment require approval.",
-      {
-        maxSteps: 6,
-        structuredOutput: { schema: missionSchema },
-        delegation: {
-          onDelegationStart: ({ prompt }) => ({ modifiedPrompt: `${prompt}\nReturn planning advice only; do not claim execution.` }),
-        },
-      },
-    );
-    const parsed = missionSchema.parse(result.object);
-    return { ...parsed, plannedBy: "mastra" };
-  } catch {
-    return deterministicPlan(goal, options?.repo);
-  }
+  // Mastra remains the typed orchestration contract; intelligence and work
+  // execution are supplied by the subscription Codex supervisor/Trigger tasks.
+  // This policy layer is intentionally deterministic and can never bill an API.
+  void options?.context;
+  return deterministicPlan(goal, options?.repo);
 }
 
 export function normalizeWorkstream(input: {

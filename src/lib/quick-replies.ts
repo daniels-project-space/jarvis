@@ -1,6 +1,6 @@
 // A zero-network courtesy lane for small social openings. It makes JARVIS feel
-// present while the warm Realtime session remains reserved for anything that
-// requires thought, tools, memory, or a real answer.
+// present while the subscription-backed CLI lane handles anything that needs
+// thought, tools, memory, or a real answer.
 
 const normalise = (text: string) => text.trim().toLowerCase().replace(/[^a-z0-9'?\s]/g, "").replace(/\s+/g, " ");
 

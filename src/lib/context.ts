@@ -4,7 +4,7 @@ import { resolveConvexUrl } from "./convex-url";
 
 // Server-side context bundle for the brain: memory, business intel, hub
 // (to-dos/calendar/wealth), cloud stack, running agents, fresh findings.
-// Used by /api/chat (every turn) and /api/realtime-token (session start).
+// Used by the subscription conversation worker on every turn.
 
 const CONVEX_URL = resolveConvexUrl(process.env.NEXT_PUBLIC_CONVEX_URL, process.env.CONVEX_URL);
 const HUB_URL = "https://fantastic-roadrunner-485.convex.cloud";
@@ -219,10 +219,8 @@ export async function buildContext(
   };
 }
 
-// A deliberately small context for the instant Realtime text lane. The rich
-// snapshot remains the source for durable work and live sessions; this one is
-// only for the first conversational response, where a full control-plane scan
-// turns an otherwise-warm connection into a noticeable freeze.
+// A deliberately small context retained for bounded utility callers. The rich
+// snapshot remains the source for subscription conversation and durable work.
 export async function buildReflexContext(): Promise<{ block: string; conversation: any[] }> {
   const brain = await q(CONVEX_URL, "reflexContext:snapshot");
   const memory = Array.isArray(brain?.memory) ? brain.memory : [];

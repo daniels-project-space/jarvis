@@ -12,7 +12,7 @@ import {
   type VisualScene,
 } from "./visual-scene";
 
-// JARVIS's tool belt — one definition list (OpenAI function schema) executed
+// JARVIS's tool belt — one portable JSON-schema definition list executed
 // server-side by /api/chat (Groq loop) and /api/tools (realtime client bridge).
 
 export const TOOL_DEFS = [
@@ -1866,7 +1866,7 @@ async function researchTool(args: any): Promise<string> {
 // Fast, FREE reasoning pass on Groq's gpt-oss-120b. This is a genuine reasoning
 // model (reasoning_effort knob) but on Groq's near-instant inference: ~3-10s vs
 // the 30-75s OpenAI Responses calls that made JARVIS "think forever". Returns ""
-// on any failure so the caller can fall back to OpenAI.
+// on any failure so the subscription supervisor can reason from raw data.
 // NOTE effort: "high" makes gpt-oss burn the ENTIRE max_tokens budget on hidden
 // reasoning and return EMPTY content (finish_reason "length") — verified. "medium"
 // returns a full rich answer in ~4s. Keep this at medium unless you also raise
@@ -1898,35 +1898,8 @@ async function groqReason(system: string, input: string, effort: "low" | "medium
   }
 }
 
-// OpenAI Responses reasoning — the deep fallback. Tight timeout so it fails fast
-// to the caller's own judgement rather than hanging.
-async function openaiReason(system: string, input: string, effort: "low" | "medium" | "high", timeoutMs: number): Promise<string> {
-  const key = process.env.OPENAI_API_KEY ?? (await getSecret("openai", "OPENAI_API_KEY").catch(() => ""));
-  if (!key) return "";
-  for (const model of ["gpt-5.1", "gpt-5-mini"]) {
-    try {
-      const r = await fetch("https://api.openai.com/v1/responses", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" },
-        body: JSON.stringify({ model, instructions: system, input, reasoning: { effort }, max_output_tokens: 8000 }),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (!r.ok) continue;
-      const j: any = await r.json();
-      const text =
-        j.output_text ??
-        (Array.isArray(j.output)
-          ? j.output.flatMap((o: any) => (Array.isArray(o.content) ? o.content : [])).filter((c: any) => c.type === "output_text").map((c: any) => c.text).join("\n")
-          : "");
-      if (text && text.trim()) return text.trim();
-    } catch {
-      /* next model */
-    }
-  }
-  return "";
-}
-
-// Hard calls get a real reasoning pass — fast+free on Groq first, OpenAI fallback.
+// The foreground Codex subscription is already the reasoning core. This
+// optional fast cross-check never falls through to a metered OpenAI API.
 async function deliberateTool(args: any): Promise<string> {
   const question = String(args.question ?? "").trim();
   if (!question) return "What's the decision?";
@@ -1936,7 +1909,7 @@ async function deliberateTool(args: any): Promise<string> {
     `1) A clear recommendation (one line).\n2) The 2-4 decisive reasons.\n3) What would change your mind.\n` +
     `Be concrete and opinionated; no fence-sitting.`;
   const input = `PROBLEM: ${question}\n\nCONTEXT:\n${String(args.context ?? "").slice(0, 3000)}`;
-  const text = (await groqReason(system, input, "medium", 3000)) || (await openaiReason(system, input, "high", 28_000));
+  const text = await groqReason(system, input, "medium", 3000);
   if (text) {
     await showResultsPanel(`deliberation · ${question.slice(0, 36)}`, `## ${question}\n\n${text}`);
     return `CONSIDERED ANALYSIS (deliver the recommendation as your own view, in your voice, short — full version is on his screen):\n${text.slice(0, 4000)}`;
@@ -2568,40 +2541,11 @@ async function planMyDay(args: any): Promise<string> {
     `RENTALS TODAY: ${day0 ? [...(day0.pickups ?? []).map((p: any) => `pickup ${short(p.items?.[0]?.name ?? "")}${p.pickupTime ? " " + p.pickupTime : ""}`), ...(day0.returns ?? []).map((r: any) => `return ${short(r.items?.[0]?.name ?? "")}`)].join("; ") || "none" : "unknown"}\n` +
     `OPEN TO-DOS (${open.length}): ${open.slice(0, 18).map((t: any) => `"${String(t.text).slice(0, 70)}"${t.dueDate ? ` (due ${londonDateStr(t.dueDate)})` : ""}${t.priority ? ` [p${t.priority}]` : ""}`).join("; ")}\n` +
     (args.focus ? `DANIEL WANTS PRIORITISED: ${String(args.focus).slice(0, 300)}\n` : "");
-  const key = process.env.OPENAI_API_KEY ?? (await getSecret("openai", "OPENAI_API_KEY").catch(() => ""));
-  if (!key) return "Planner core unavailable.";
-  let plan = "";
-  try {
-    const r = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "gpt-5.1",
-        instructions:
-          "You are JARVIS planning Daniel's day. He's a solo builder running rental + content businesses; deep-work blocks matter more than busywork. " +
-          "Produce markdown: '## Today's plan' then time blocks (HH:MM–HH:MM — thing, one-line why), respecting fixed events/rentals, batching errands, " +
-          "max 3 meaningful priorities, realistic breaks, and an honest '## Skip today' list for the to-dos that shouldn't happen. Under 300 words.",
-        input: facts,
-        reasoning: { effort: "medium" },
-        max_output_tokens: 5000,
-      }),
-      signal: AbortSignal.timeout(60_000),
-    });
-    if (r.ok) {
-      const j: any = await r.json();
-      plan =
-        j.output_text ??
-        (Array.isArray(j.output)
-          ? j.output.flatMap((o: any) => (Array.isArray(o.content) ? o.content : [])).filter((c: any) => c.type === "output_text").map((c: any) => c.text).join("\n")
-          : "");
-    }
-  } catch {
-    /* fall through */
-  }
-  if (!plan.trim()) return "The planner pass failed — build a quick plan yourself from the briefing data.";
-  await showResultsPanel(`plan · ${date}`, plan);
-  await convexMutation("chatQueue:postCard", { threadId: await activeThread(), type: "markdown", value: plan.slice(0, 3900), title: `day plan · ${date}` }).catch(() => {});
-  return `PLAN READY (on screen + card). Speak the top priority and first block only, then offer to write the blocks into his calendar (calendar_add per block if he says yes):\n${plan.slice(0, 2500)}`;
+  return (
+    `LIVE DAY DATA. Build the plan yourself with your current Codex subscription reasoning; do not call another model. ` +
+    `Use at most three meaningful priorities, respect fixed events and rentals, include realistic breaks and an honest skip-today list. ` +
+    `Then show the complete plan with show_results and speak only the top priority and first block. Offer calendar_add only after Daniel approves.\n\n${facts}`
+  );
 }
 
 // "Open it filled in": travel sites accept everything as URL parameters — the
@@ -2740,9 +2684,9 @@ async function marketAnalysisTool(args: any): Promise<string> {
     );
   }
 
-  // Fast+free reasoning on Groq first (~5-10s), OpenAI gpt-5.1 as a tight-timeout
-  // deep fallback. This replaced a 75s+ gpt-5.1 call that made it hang forever.
-  const analysis = (await groqReason(ANALYST_SYSTEM, dossier, "medium", 5000)) || (await openaiReason(ANALYST_SYSTEM, dossier, "medium", 30_000));
+  // Optional fast/free cross-check only. The foreground Codex subscription is
+  // the deep reasoning path; this function never falls through to OpenAI API.
+  const analysis = await groqReason(ANALYST_SYSTEM, dossier, "medium", 5000);
   if (!analysis.trim())
     return `The analysis pass failed — show the chart with price_chart and reason from the summary instead.`;
 

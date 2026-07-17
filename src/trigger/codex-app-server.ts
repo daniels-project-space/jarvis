@@ -1,0 +1,170 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createInterface } from "node:readline";
+import { codexModelFor } from "./model-policy";
+
+type JsonObject = Record<string, unknown>;
+type PendingRequest = { resolve: (value: JsonObject) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
+type ActiveTurn = {
+  turnId: string;
+  threadId: string;
+  text: string;
+  onDelta: (delta: string) => void;
+  resolve: (result: CodexTurnResult) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+export type CodexTurnResult = { finalText: string; threadId: string; code: number; stderr: string };
+export type CodexTurnInput = {
+  conversationId: string;
+  userText: string;
+  history: Array<{ role: string; text: string }>;
+  contextBlock: string;
+  preamble: string;
+  modelTier: string;
+  onDelta: (delta: string) => void;
+};
+
+// One long-lived subscription CLI process for foreground conversation. The
+// app-server protocol keeps authenticated threads warm and emits real deltas.
+export class CodexAppServer {
+  private process: ChildProcessWithoutNullStreams | null = null;
+  private nextId = 1;
+  private pending = new Map<number, PendingRequest>();
+  private active = new Map<string, ActiveTurn>();
+  private threads = new Map<string, string>();
+  private stderr = "";
+  private ready: Promise<void> | null = null;
+
+  constructor(private readonly bin: string, private readonly env: NodeJS.ProcessEnv, private readonly turnTimeoutMs: number) {}
+
+  async start(): Promise<void> {
+    if (!this.ready) this.ready = this.startInner();
+    return this.ready;
+  }
+
+  private async startInner() {
+    const child = spawn(this.bin, ["app-server", "--listen", "stdio://"], { env: this.env, stdio: ["pipe", "pipe", "pipe"] });
+    this.process = child;
+    child.stderr.on("data", (data) => { this.stderr = (this.stderr + data.toString()).slice(-1200); });
+    child.on("error", (error) => this.failAll(error));
+    child.on("close", (code) => this.failAll(new Error(`Codex app-server exited (${code ?? "unknown"})`)));
+    createInterface({ input: child.stdout }).on("line", (line) => this.receive(line));
+    await this.request("initialize", {
+      clientInfo: { name: "jarvis-trigger", title: "Jarvis", version: "1.0.0" },
+      capabilities: { experimentalApi: false },
+    }, 20_000);
+    this.notify("initialized", {});
+  }
+
+  async runTurn(input: CodexTurnInput): Promise<CodexTurnResult> {
+    await this.start();
+    const selection = codexModelFor(input.modelTier);
+    let threadId = this.threads.get(input.conversationId);
+    const isNewThread = !threadId;
+    if (!threadId) {
+      const response = await this.request("thread/start", {
+        model: selection.model,
+        baseInstructions: input.preamble,
+        developerInstructions: "Remain the foreground Jarvis conversation. Give the useful answer immediately. Delegate long work instead of blocking conversation.",
+        cwd: "/tmp",
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+        ephemeral: false,
+      }, 30_000);
+      const thread = response.thread as JsonObject | undefined;
+      threadId = typeof thread?.id === "string" ? thread.id : "";
+      if (!threadId) throw new Error("Codex app-server did not return a thread id");
+      this.threads.set(input.conversationId, threadId);
+    }
+
+    const history = isNewThread && input.history.length
+      ? `Recent conversation:\n${input.history.map((item) => `${item.role === "user" ? "Daniel" : "Jarvis"}: ${item.text}`).join("\n")}\n\n`
+      : "";
+    const marker = input.userText.match(/\[JARVIS_IMAGE_URL:([^\]]+)\]/);
+    const cleanText = input.userText.replace(/\s*\[JARVIS_IMAGE_URL:[^\]]+\]\s*/g, " ").trim();
+    const text = `${history}Current live context (use only what is relevant):\n${input.contextBlock}\n\nDaniel: ${cleanText}`;
+    const userInput: JsonObject[] = [{ type: "text", text }];
+    if (marker?.[1]) userInput.push({ type: "image", url: marker[1].trim(), detail: "high" });
+    const started = await this.request("turn/start", {
+      threadId,
+      input: userInput,
+      model: selection.model,
+      effort: selection.effort,
+      approvalPolicy: "never",
+    }, 30_000);
+    const turn = started.turn as JsonObject | undefined;
+    const turnId = typeof turn?.id === "string" ? turn.id : "";
+    if (!turnId) throw new Error("Codex app-server did not return a turn id");
+    return new Promise<CodexTurnResult>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.notify("turn/interrupt", { threadId, turnId });
+        this.active.delete(turnId);
+        reject(new Error("Codex conversation turn exceeded its foreground deadline"));
+      }, this.turnTimeoutMs);
+      this.active.set(turnId, { turnId, threadId, text: "", onDelta: input.onDelta, resolve, reject, timer });
+    });
+  }
+
+  stop() { this.process?.kill("SIGTERM"); this.process = null; }
+
+  private receive(line: string) {
+    let message: JsonObject;
+    try { message = JSON.parse(line) as JsonObject; } catch { return; }
+    if (typeof message.id === "number") {
+      const pending = this.pending.get(message.id);
+      if (!pending) return;
+      this.pending.delete(message.id);
+      clearTimeout(pending.timer);
+      if (message.error) pending.reject(new Error(this.errorText(message.error)));
+      else pending.resolve((message.result as JsonObject | undefined) ?? {});
+      return;
+    }
+    const method = typeof message.method === "string" ? message.method : "";
+    const params = (message.params as JsonObject | undefined) ?? {};
+    const turn = params.turn as JsonObject | undefined;
+    const turnId = typeof params.turnId === "string" ? params.turnId : typeof turn?.id === "string" ? turn.id : "";
+    const active = this.active.get(turnId);
+    if (!active) return;
+    if (method === "item/agentMessage/delta" && typeof params.delta === "string") {
+      active.text += params.delta;
+      active.onDelta(params.delta);
+    } else if (method === "item/completed") {
+      const item = params.item as JsonObject | undefined;
+      if (!active.text && item?.type === "agentMessage" && typeof item.text === "string") {
+        active.text = item.text;
+        active.onDelta(item.text);
+      }
+    } else if (method === "turn/completed") {
+      const status = typeof turn?.status === "string" ? turn.status : "failed";
+      clearTimeout(active.timer);
+      this.active.delete(turnId);
+      active.resolve({ finalText: active.text, threadId: active.threadId, code: status === "completed" ? 0 : -1, stderr: status === "completed" ? "" : this.errorText(turn?.error ?? status) });
+    }
+  }
+
+  private request(method: string, params: JsonObject, timeoutMs: number): Promise<JsonObject> {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`${method} timed out`)); }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      this.write({ method, id, params });
+    });
+  }
+  private notify(method: string, params: JsonObject) { this.write({ method, params }); }
+  private write(message: JsonObject) {
+    if (!this.process?.stdin.writable) throw new Error("Codex app-server is not writable");
+    this.process.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+  private errorText(value: unknown): string {
+    if (typeof value === "string") return value;
+    try { return JSON.stringify(value).slice(0, 500); } catch { return String(value).slice(0, 500); }
+  }
+  private failAll(error: Error) {
+    const detail = new Error(`${error.message}${this.stderr ? `: ${this.stderr.slice(-400)}` : ""}`);
+    for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(detail); }
+    this.pending.clear();
+    for (const active of this.active.values()) { clearTimeout(active.timer); active.reject(detail); }
+    this.active.clear();
+  }
+}

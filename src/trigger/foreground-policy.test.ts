@@ -7,10 +7,10 @@ import {
 } from "./foreground-policy";
 
 describe("foreground conversation policy", () => {
-  it("reserves parallel short-lived capacity for Jarvis conversation", () => {
+  it("reserves two warm bounded lanes for Jarvis conversation", () => {
     expect(FOREGROUND_QUEUE).toBe("jarvis-foreground");
-    expect(FOREGROUND_CONCURRENCY).toBeGreaterThanOrEqual(4);
+    expect(FOREGROUND_CONCURRENCY).toBe(2);
     expect(FOREGROUND_TURN_TIMEOUT_MS).toBeLessThanOrEqual(3 * 60_000);
-    expect(FOREGROUND_MAX_DURATION_SECONDS).toBeLessThanOrEqual(5 * 60);
+    expect(FOREGROUND_MAX_DURATION_SECONDS).toBe(15 * 60);
   });
 });

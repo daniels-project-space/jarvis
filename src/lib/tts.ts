@@ -8,7 +8,17 @@ let draining = false;
 let currentUtterance: SpeechSynthesisUtterance | null = null;
 let currentAudio: HTMLAudioElement | null = null;
 let stopAudioPlayback: (() => void) | null = null;
-let queue: string[] = [];
+type SpeechBatch = {
+  generation: number;
+  text: string;
+  segments: string[];
+  onEnergy: (energy: number) => void;
+  onStart?: () => void;
+  onEnd?: () => void;
+  resolve: () => void;
+};
+let queue: SpeechBatch[] = [];
+let activeBatch: SpeechBatch | null = null;
 let cachedVoice: SpeechSynthesisVoice | null = null;
 type TtsMode = "kokoro" | "system";
 type KokoroWorkerRequest =
@@ -214,9 +224,10 @@ export async function warm() {
 
 export function stopSpeaking() {
   generation++;
+  const abandoned = queue;
   queue = [];
+  for (const batch of abandoned) batch.resolve();
   currentUtterance = null;
-  draining = false;
   stopAudioPlayback?.();
   stopAudioPlayback = null;
   currentAudio = null;
@@ -383,27 +394,65 @@ export async function speak(
     return;
   }
   trackUtterance(text, Math.min(90_000, text.length * 70));
-  queue.push(...sentences(text));
-  if (draining) return;
+  const done = new Promise<void>((resolve) => {
+    queue.push({
+      generation,
+      text,
+      segments: sentences(text),
+      onEnergy,
+      onStart,
+      onEnd,
+      resolve,
+    });
+  });
+  void drainSpeechQueue();
+  await done;
+}
 
+async function drainSpeechQueue(): Promise<void> {
+  if (draining) return;
   draining = true;
-  const expectedGeneration = generation;
-  const hardWakeGate = /jarvis/i.test(text);
-  void import("./wakeword").then((module) => module.setSuppressed?.(true, hardWakeGate)).catch(() => {});
-  let started = false;
-  while (queue.length && expectedGeneration === generation) {
-    const next = queue.shift()!;
-    await speakOne(next, expectedGeneration, onEnergy, started ? undefined : () => {
-      started = true;
-      onStart?.();
-    }, useKokoro);
-  }
-  if (expectedGeneration === generation) {
+  try {
+    while (queue.length) {
+      const batch = queue.shift()!;
+      activeBatch = batch;
+      const useKokoro = ttsMode === "kokoro" && kokoroReady;
+      const hardWakeGate = /jarvis/i.test(batch.text);
+      void import("./wakeword")
+        .then((module) => module.setSuppressed?.(true, hardWakeGate))
+        .catch(() => {});
+      let started = false;
+      for (const segment of batch.segments) {
+        if (batch.generation !== generation) break;
+        await speakOne(
+          segment,
+          batch.generation,
+          batch.onEnergy,
+          started
+            ? undefined
+            : () => {
+                started = true;
+                batch.onStart?.();
+              },
+          useKokoro,
+        );
+      }
+      if (batch.generation === generation) {
+        batch.onEnergy(0);
+        batch.onEnd?.();
+      }
+      batch.resolve();
+      activeBatch = null;
+    }
+  } finally {
+    activeBatch = null;
     draining = false;
-    onEnergy(0);
-    onEnd?.();
     setTimeout(() => {
-      void import("./wakeword").then((module) => module.setSuppressed?.(false)).catch(() => {});
+      if (!draining && !activeBatch && queue.length === 0) {
+        void import("./wakeword").then((module) => module.setSuppressed?.(false)).catch(() => {});
+      }
     }, 650);
+    // A stop/new-speech race can enqueue while the previous drain is unwinding.
+    if (queue.length) void drainSpeechQueue();
   }
 }

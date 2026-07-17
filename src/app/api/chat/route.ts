@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { tasks } from "@trigger.dev/sdk/v3";
-import { convexMutation, reportIncident } from "@/lib/context";
+import { convexMutation, convexQuery, reportIncident } from "@/lib/context";
 import { adminSessionHash, validateAdminSession } from "@/lib/control-session";
 import { withAdminSession } from "@/lib/control-context";
 
@@ -28,7 +28,9 @@ async function handlePost(req: NextRequest, authTokenHash: string) {
     text: text.slice(0, 12_000),
     authTokenHash,
   });
-  const handle = await tasks
+  const lease = await convexQuery("chatQueue:runnerLease", { authTokenHash }).catch(() => null) as { updatedAt?: number } | null;
+  const warm = Boolean(lease?.updatedAt && Date.now() - lease.updatedAt < 25_000);
+  const handle = warm ? null : await tasks
     .trigger(
       "jarvis-chat-turn",
       { source: "conversation", threadId, messageId: String(messageId) },
@@ -48,7 +50,7 @@ async function handlePost(req: NextRequest, authTokenHash: string) {
   return Response.json({
     ok: true,
     queued: true,
-    immediate: Boolean(handle),
+    immediate: Boolean(warm || handle),
     model: "codex-adaptive",
   });
 }

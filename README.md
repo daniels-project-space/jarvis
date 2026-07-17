@@ -7,19 +7,18 @@ agents to build and repair Daniel's other projects. One personality
 
 ## Two-lane brain
 
-- **Live lane** — `/api/realtime-token` mints an ephemeral OpenAI Realtime client secret
-  (persona + fresh context + tool defs baked in). The browser (`src/lib/realtime.ts`)
-  connects straight to OpenAI over WebRTC, with native VAD, barge-in, and speech. Tools
-  run through `/api/tools`; finished turns mirror into Convex history.
-- **Text lane** — `/api/chat` answers every typed or mic turn in seconds on Groq
-  (`gpt-oss-120b`, falling back to `llama-3.3`) using the same tool belt
-  (`src/lib/tools.ts`) and streaming into Convex. Replies are spoken by ElevenLabs via
-  `/api/tts` (Kokoro fallback). If the route fails, the turn re-queues as `pending` and a
-  Trigger cron dispatcher (`src/trigger/chat-session.ts`) picks it up.
+- **Live lane** — turn-taking browser audio → free Whisper transcription → a warm,
+  streaming Codex app-server authenticated by Daniel's subscription → local Kokoro TTS.
+  The microphone is closed while Jarvis speaks, so speaker echo cannot cut him off.
+  Tools run through the private agent bridge; finished turns live in Convex history.
+- **Text lane** — `/api/chat` commits each turn to Convex and wakes one of two warm
+  Trigger workers. The same Codex subscription app-server streams deltas every 120 ms;
+  Luna/Terra/Sol are selected by complexity. The minute dispatcher only checks the
+  runner lease and starts a replacement; it never occupies the recovery queue.
 
 ## Supporting systems
 
-- **Cortex** — background Claude Code agents on Trigger.dev
+- **Cortex** — background subscription agents on Trigger.dev
   (`src/trigger/agent-runner.ts`, cron every 2 min). The brain enqueues jobs
   (`jobs:enqueue`), each agent gets a briefing with the infra map and repo access, and
   results are woven back as a single spoken line plus a `findings` row.

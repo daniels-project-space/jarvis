@@ -246,6 +246,66 @@ export const claimNext = mutation({
   },
 });
 
+// A single warm-runner lease lets /api/chat avoid launching a cold container
+// for every follow-up. The pending signal is subscribed over Convex's realtime
+// channel, so an idle warm runner consumes no high-frequency polling reads.
+const RUNNER_KEY = "foregroundRunner";
+const RUNNER_LEASE_MS = 25_000;
+
+export const touchRunner = mutation({
+  args: {
+    runnerId: v.string(),
+    takeoverFrom: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY)).first();
+    const validHandoff = Boolean(a.takeoverFrom && row?.value === a.takeoverFrom);
+    if (row && row.value !== a.runnerId && !validHandoff && Date.now() - row.updatedAt < RUNNER_LEASE_MS) return false;
+    const doc = { key: RUNNER_KEY, type: "lease", value: a.runnerId, updatedAt: Date.now() };
+    if (row) await ctx.db.patch(row._id, doc);
+    else await ctx.db.insert("ui", doc);
+    return true;
+  },
+});
+
+export const releaseRunner = mutation({
+  args: { runnerId: v.string(), workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY)).first();
+    if (row?.value === a.runnerId) await ctx.db.delete(row._id);
+  },
+});
+
+export const runnerLease = query({
+  args: { authTokenHash: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
+    const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY)).first();
+    return row ? { runnerId: row.value, updatedAt: row.updatedAt } : null;
+  },
+});
+
+export const runnerLeaseForWorker = query({
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY)).first();
+    return row ? { runnerId: row.value, updatedAt: row.updatedAt } : null;
+  },
+});
+
+export const pendingSignal = query({
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const pending = await ctx.db.query("chatMessages").withIndex("by_status", (q: any) => q.eq("status", "pending")).first();
+    return pending?._id ?? null;
+  },
+});
+
 export const appendChunk = mutation({
   args: { messageId: v.id("chatMessages"), chunk: v.string(), workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {

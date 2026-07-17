@@ -35,15 +35,7 @@ export default function Embed() {
   const [open, setOpen] = useState(false);
   const me = useRef("");
   const liveRef = useRef(false);
-  const reflexReadyRef = useRef(false);
-  const reflexPendingRef = useRef<{
-    text: string;
-    startedAt: number;
-    firstToken: boolean;
-    watchdog: ReturnType<typeof setTimeout> | null;
-  } | null>(null);
-  const reflexRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const awaitingDurableRef = useRef<{ after: number; threadId: string } | null>(null);
+  const awaitingDurableRef = useRef<{ after: number; startedAt: number; threadId: string; firstToken: boolean } | null>(null);
   const recRef = useRef<MediaRecorder | null>(null);
   const claimVoice = (args: Record<string, unknown>) => clientMutation("ui:claimVoice", args);
   const setLiveOn = (args: Record<string, unknown>) => clientMutation("ui:setLiveOn", args);
@@ -63,23 +55,6 @@ export default function Embed() {
     });
   useEffect(() => {
     me.current = clientId();
-  }, []);
-  useEffect(() => {
-    const timer = window.setTimeout(() => void bootReflex(), 80);
-    const reconnect = () => {
-      if (document.visibilityState === "visible" && !reflexReadyRef.current) void bootReflex();
-    };
-    window.addEventListener("focus", reconnect);
-    document.addEventListener("visibilitychange", reconnect);
-    return () => {
-      window.clearTimeout(timer);
-      if (reflexRetryRef.current) clearTimeout(reflexRetryRef.current);
-      if (reflexPendingRef.current?.watchdog) clearTimeout(reflexPendingRef.current.watchdog);
-      window.removeEventListener("focus", reconnect);
-      document.removeEventListener("visibilitychange", reconnect);
-      void import("../../lib/realtime").then((module) => module.stopReflex());
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Tell the host page how big to draw us / when to summon or dismiss us.
@@ -114,7 +89,7 @@ export default function Embed() {
 
   async function durableTurn(text: string) {
     const sentAt = Date.now();
-    awaitingDurableRef.current = { after: sentAt, threadId: activeThread };
+    awaitingDurableRef.current = { after: sentAt, startedAt: performance.now(), threadId: activeThread, firstToken: false };
     setBusy(true);
     try {
       const response = await fetch("/api/chat", {
@@ -130,68 +105,20 @@ export default function Embed() {
     }
   }
 
-  async function failReflex() {
-    const pending = reflexPendingRef.current;
-    if (!pending) return;
-    reflexPendingRef.current = null;
-    if (pending.watchdog) clearTimeout(pending.watchdog);
-    const realtime = await import("../../lib/realtime");
-    realtime.interruptReflex();
-    await durableTurn(pending.text);
-  }
-
-  async function bootReflex() {
-    const realtime = await import("../../lib/realtime");
-    await realtime.startReflex(
-      {
-        onState: (state) => {
-          reflexReadyRef.current = state === "ready";
-          if (state === "error") {
-            void failReflex();
-            if (!reflexRetryRef.current) {
-              reflexRetryRef.current = setTimeout(() => {
-                reflexRetryRef.current = null;
-                void bootReflex();
-              }, 2_000);
-            }
-          }
-        },
-        onCaption: (text) => {
-          const pending = reflexPendingRef.current;
-          if (!pending || !text) return;
-          if (!pending.firstToken) {
-            pending.firstToken = true;
-            if (pending.watchdog) clearTimeout(pending.watchdog);
-            pending.watchdog = null;
-            document.documentElement.dataset.jarvisFirstTokenMs = String(
-              Math.max(0, Math.round(performance.now() - pending.startedAt)),
-            );
-          }
-          setBusy(false);
-          streamJarvis(text);
-        },
-        onTurnDone: (role, text) => {
-          if (role !== "assistant") return;
-          const pending = reflexPendingRef.current;
-          if (!pending) return;
-          reflexPendingRef.current = null;
-          if (pending.watchdog) clearTimeout(pending.watchdog);
-          setBusy(false);
-          streamJarvis(text);
-          void (async () => {
-            await logTurn({ threadId: activeThread, role: "user", text: pending.text });
-            await logTurn({ threadId: activeThread, role: "assistant", text, model: "reflex" });
-            await speakFree(text);
-          })();
-        },
-      },
-      me.current,
-    );
-  }
-
   useEffect(() => {
     const waiting = awaitingDurableRef.current;
     if (!waiting || waiting.threadId !== activeThread) return;
+    const streaming = [...messages]
+      .reverse()
+      .find((message) => message.role === "assistant" && message.status === "streaming" && message.text && message.createdAt >= waiting.after);
+    if (streaming) {
+      if (!waiting.firstToken) {
+        waiting.firstToken = true;
+        document.documentElement.dataset.jarvisFirstTokenMs = String(Math.max(0, Math.round(performance.now() - waiting.startedAt)));
+      }
+      setBusy(false);
+      streamJarvis(streaming.text);
+    }
     const answer = [...messages]
       .reverse()
       .find((message) => message.role === "assistant" && message.status === "done" && message.text && message.createdAt >= waiting.after);
@@ -199,7 +126,10 @@ export default function Embed() {
     awaitingDurableRef.current = null;
     setBusy(false);
     streamJarvis(answer.text);
-    void speakFree(answer.text);
+    void (async () => {
+      await speakFree(answer.text);
+      if (liveRef.current) setTimeout(() => void toggleMic(), 220);
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages, activeThread]);
 
@@ -253,53 +183,17 @@ export default function Embed() {
 
   async function startLiveMode() {
     if (liveRef.current) return;
-    import("../../lib/tts").then((m) => m.stopSpeaking()); // wake barge-in cuts any read-out
+    import("../../lib/tts").then((m) => m.stopSpeaking());
     const got = await setLiveOn({ client: me.current, on: true }).catch(() => true);
-    if (got === false) return; // another device is live — stay quiet (and NO heartbeat)
-    // heartbeat, or the lock goes stale in 45s and a second device can start a
-    // parallel live session (feedback loop) — main app already does this
+    if (got === false) return;
     if (liveBeat.current) clearInterval(liveBeat.current);
     liveBeat.current = setInterval(() => void setLiveOn({ client: me.current, on: true }).catch(() => {}), 20_000);
-    const rt = await import("../../lib/realtime");
     const { stopWake } = await import("../../lib/wakeword");
     stopWake();
     setWakeState(false);
-    await rt.startLive({
-      onState: (s) => {
-        if (s === "live") {
-          liveRef.current = true;
-          setLive("live");
-        } else if (s === "connecting") setLive("connecting");
-        else {
-          liveRef.current = false;
-          setLive("off");
-          if (liveBeat.current) clearInterval(liveBeat.current);
-          liveBeat.current = null;
-          void setLiveOn({ client: me.current, on: false }).catch(() => {});
-          if (localStorage.getItem("jarvis_embed_wake") !== "0") armWake();
-        }
-      },
-      onExitRequest: () => {
-        liveRef.current = false;
-        setLive("off");
-        if (liveBeat.current) clearInterval(liveBeat.current);
-        liveBeat.current = null;
-        void setLiveOn({ client: me.current, on: false }).catch(() => {});
-        if (localStorage.getItem("jarvis_embed_wake") !== "0") armWake();
-      },
-      onCaption: (who, text, done) => {
-        if (!done) setLines((p) => {
-          const rest = p[p.length - 1]?.who === who ? p.slice(0, -1) : p;
-          return [...rest.slice(-7), { who, text }];
-        });
-      },
-      onTurnDone: (role, text) => {
-        void logTurn({ threadId: activeThread, role, text, model: role === "assistant" ? "live" : undefined });
-        if (role === "assistant") void speakFree(text);
-      },
-      onEnergy: () => {},
-      clientId: me.current,
-    });
+    liveRef.current = true;
+    setLive("live");
+    void toggleMic();
   }
 
   async function stopLiveMode() {
@@ -307,8 +201,7 @@ export default function Embed() {
       clearInterval(liveBeat.current);
       liveBeat.current = null;
     }
-    const rt = await import("../../lib/realtime");
-    rt.stopLive();
+    if (recRef.current?.state === "recording") recRef.current.stop();
     liveRef.current = false;
     setLive("off");
     void setLiveOn({ client: me.current, on: false }).catch(() => {});
@@ -325,35 +218,18 @@ export default function Embed() {
     setInput("");
     push({ who: "you", text: t });
     void claimVoice({ client: me.current });
-    if (liveRef.current) {
-      const rt = await import("../../lib/realtime");
-      if (rt.sendLiveText(t)) return;
-    }
     const instant = instantSocialReply(t);
     if (instant) {
       document.documentElement.dataset.jarvisFirstTokenMs = "0";
       streamJarvis(instant);
       void (async () => {
         await logTurn({ threadId: activeThread, role: "user", text: t });
-        await logTurn({ threadId: activeThread, role: "assistant", text: instant, model: "reflex" });
+        await logTurn({ threadId: activeThread, role: "assistant", text: instant, model: "instant" });
         await speakFree(instant);
+        if (liveRef.current) setTimeout(() => void toggleMic(), 220);
       })();
       return;
     }
-    const realtime = await import("../../lib/realtime");
-    if (!reflexPendingRef.current && realtime.sendReflexText(t)) {
-      const pending = {
-        text: t,
-        startedAt: performance.now(),
-        firstToken: false,
-        watchdog: null as ReturnType<typeof setTimeout> | null,
-      };
-      reflexPendingRef.current = pending;
-      setBusy(true);
-      pending.watchdog = setTimeout(() => void failReflex(), 2_000);
-      return;
-    }
-    void bootReflex();
     await durableTurn(t);
   }
 
