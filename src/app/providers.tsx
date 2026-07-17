@@ -18,11 +18,20 @@ type ViewerAuth = { token: string; refresh: () => Promise<string> };
 const ViewerAuthContext = createContext<ViewerAuth | null>(null);
 
 async function requestViewerToken(): Promise<string> {
-  const response = await fetch("/api/auth/viewer", { method: "POST", cache: "no-store" });
-  if (!response.ok) throw new Error(String(response.status));
-  const payload = await response.json();
-  if (typeof payload.viewerToken !== "string") throw new Error("viewer capability missing");
-  return payload.viewerToken;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await fetch("/api/auth/viewer", { method: "POST", cache: "no-store" });
+      if (!response.ok) throw new Error(String(response.status));
+      const payload = await response.json();
+      if (typeof payload.viewerToken !== "string") throw new Error("viewer capability missing");
+      return payload.viewerToken;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** attempt));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("viewer capability unavailable");
 }
 
 function useJarvisConvexAuth() {
@@ -32,7 +41,17 @@ function useJarvisConvexAuth() {
     isAuthenticated: auth !== null,
     fetchAccessToken: async ({ forceRefreshToken }: { forceRefreshToken: boolean }) => {
       if (!auth) return null;
-      return forceRefreshToken ? await auth.refresh() : auth.token;
+      if (!forceRefreshToken) return auth.token;
+      // Convex requests a refresh when its websocket reconnects. A browser
+      // network transition can briefly abort that HTTP request even though the
+      // current six-hour viewer JWT remains valid. Keep the live connection on
+      // the existing capability and let the next transition retry, rather than
+      // leaking an unhandled rejection into the self-repair pipeline.
+      try {
+        return await auth.refresh();
+      } catch {
+        return auth.token;
+      }
     },
   }), [auth]);
 }
