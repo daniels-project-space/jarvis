@@ -30,6 +30,7 @@ jobs:
       VAULT_ACCESS_TOKEN: ${{ secrets.VAULT_ACCESS_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.JARVIS_PORTFOLIO_GITHUB_TOKEN }}
       JARVIS_AGENT_RUNTIME: github
+      JARVIS_HARNESS_SELF_TEST: ${{ inputs.reason == 'cli-tool-self-test' && '1' || '0' }}
     steps:
       - name: Check out Jarvis harness
         uses: actions/checkout@v4
