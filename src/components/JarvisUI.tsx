@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
@@ -7,13 +7,15 @@ import { clientMutation } from "@/lib/client-mutation";
 import { primeMicrophone, readJarvisPermissions, type JarvisPermissionState } from "@/lib/permissions";
 import { registerSW, subscribePush } from "@/lib/push";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
-import { orbCycleSeconds } from "@/lib/orb-motion";
+import { createOrbMotionFrame, orbCycleSeconds, type OrbMotionFrame } from "@/lib/orb-motion";
 import { relevantActiveWork } from "@/lib/active-work";
 import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, MarketChartLoading, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
 import CommandDeck from "./CommandDeck";
 import { parseFastChartIntent, type FastChartIntent } from "@/lib/fast-intents";
+
+const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
 const TripView = dynamic(() => import("./TripView"), {
   ssr: false,
@@ -442,66 +444,6 @@ function ReactorRing({
           <circle cx="250" cy="250" r="170" strokeWidth="1" strokeOpacity="0.12" strokeDasharray="2 8" />
         </g>
       </svg>
-    </div>
-  );
-}
-
-type VisualOrbState = "idle" | "listening" | "thinking" | "speaking";
-
-// One production visual, from first paint onward. The old two-stage design
-// visibly swapped a basic radial placeholder for a sparse Three.js cloud and
-// spent main-thread time doing it. This reactor core is richer, larger, and all
-// continuous movement stays on compositor transforms/opacity.
-function OrbCore({
-  aside,
-  color,
-  state,
-  reduceMotion,
-}: {
-  aside: boolean;
-  color: string;
-  state: VisualOrbState;
-  reduceMotion: boolean;
-}) {
-  const cycle = orbCycleSeconds(state);
-  const variables = {
-    "--jarvis-orb-color": color,
-    "--jarvis-orb-cycle": `${cycle}s`,
-    "--jarvis-orb-cycle-slow": `${cycle * 1.42}s`,
-    "--jarvis-orb-pulse": state === "speaking" ? "0.82s" : state === "thinking" ? "1.25s" : state === "listening" ? "1.8s" : "5.4s",
-  } as CSSProperties;
-  return (
-    <div
-      aria-label="JARVIS visual core"
-      className="absolute inset-0 grid place-items-center will-change-transform transition-transform duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
-      style={{ transform: aside ? "translateX(32%) translateY(-4.5%) scale(0.76)" : "translateY(-4.5%) scale(1)" }}
-    >
-      <div
-        className="jarvis-core"
-        data-state={state}
-        data-reduce-motion={reduceMotion ? "true" : "false"}
-        style={variables}
-      >
-        <div className="jarvis-core-aura" />
-        <div className="jarvis-core-shell">
-          <div className="jarvis-core-scan" />
-          <div className="jarvis-core-lattice" />
-          <div className="jarvis-core-arcs" />
-          <div className="jarvis-core-arcs jarvis-core-arcs-inner" />
-          <div className="jarvis-core-filaments" aria-hidden="true">
-            {Array.from({ length: 9 }, (_, index) => (
-              <span key={index} style={{ transform: `rotate(${index * 40}deg)` }} />
-            ))}
-          </div>
-          <span className="jarvis-core-node jarvis-core-node-a" />
-          <span className="jarvis-core-node jarvis-core-node-b" />
-          <span className="jarvis-core-node jarvis-core-node-c" />
-          <div className="jarvis-core-plasma">
-            <div className="jarvis-core-nucleus" />
-          </div>
-          <div className="jarvis-core-glint" />
-        </div>
-      </div>
     </div>
   );
 }
@@ -1120,6 +1062,7 @@ function SpokenCaption({ caption }: { caption: { who: "you" | "jarvis"; text: st
 }
 
 export default function JarvisUI() {
+  const orbMotionRef = useRef<OrbMotionFrame>(createOrbMotionFrame());
   const thread = (useJarvisQuery(api.ui.getActiveThread, {}) ?? "main") as string;
   const threads = (useJarvisQuery(api.ui.getThreads, {}) ?? []) as { id: string; title: string; at: number }[];
   const setActiveThread = (args: { thread: string; title?: string }) =>
@@ -2597,7 +2540,14 @@ export default function JarvisUI() {
               fullBleed ? "pointer-events-none opacity-0" : compactAside ? "pointer-events-none opacity-0 md:opacity-100" : "opacity-100"
             }`}
           >
-            <OrbCore aside={compactAside} color={moodColor} state={orbState} reduceMotion={prefs.reduceMotion} />
+            <ThreeOrb
+              state={orbState}
+              energyRef={energyRef}
+              moodColor={moodColor}
+              motionRef={orbMotionRef}
+              aside={compactAside}
+              reduceMotion={prefs.reduceMotion}
+            />
           </div>
           {/* THE ONE caption — spoken words, under the orb. Short text sits in a
               contained field; a long reply scrolls through like a teleprompter,
