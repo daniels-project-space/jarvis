@@ -414,7 +414,7 @@ function ReactorRing({
   return (
     <div
       className="pointer-events-none absolute inset-0 grid place-items-center will-change-transform transition-[opacity,transform] duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
-      style={{ opacity, transform: aside ? "translateX(47%) translateY(-4.5%) scale(0.68)" : "translateY(-4.5%) scale(1)" }}
+      style={{ opacity, transform: aside ? "translateX(32%) translateY(-4.5%) scale(0.76)" : "translateY(-4.5%) scale(1)" }}
     >
       <svg viewBox="0 0 500 500" className="h-[min(82vmin,760px)] w-[min(82vmin,760px)]">
         <defs>
@@ -474,7 +474,7 @@ function OrbCore({
     <div
       aria-label="JARVIS visual core"
       className="absolute inset-0 grid place-items-center will-change-transform transition-transform duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
-      style={{ transform: aside ? "translateX(47%) translateY(-4.5%) scale(0.68)" : "translateY(-4.5%) scale(1)" }}
+      style={{ transform: aside ? "translateX(32%) translateY(-4.5%) scale(0.76)" : "translateY(-4.5%) scale(1)" }}
     >
       <div
         className="jarvis-core"
