@@ -143,7 +143,7 @@ export function TodosView({ value }: { value: string }) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "todo_done", args: { match: text.slice(0, 60) } }),
-    });
+    }).catch(() => {});
   };
   return (
     <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-4">
@@ -196,7 +196,7 @@ export function Briefing2View({ value }: { value: string }) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "todo_done", args: { match: text.slice(0, 60) } }),
-    });
+    }).catch(() => {});
   };
   const toPct = (hhmm: string) => {
     const [h, m] = String(hhmm).split(":").map(Number);
@@ -442,7 +442,7 @@ export function FeedView({ value }: { value: string }) {
   const [phase, setPhase] = useState<"hero" | "grid">("hero");
   const [idx, setIdx] = useState(0);
   const [page, setPage] = useState(0);
-  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
+  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args).catch(() => undefined);
 
   // fresh content = fresh presentation (state survives panel swaps otherwise:
   // a second search used to open on a stale page/grid)
@@ -1059,7 +1059,7 @@ export function VideoListView({ value }: { value: string }) {
   } catch {
     /* noop */
   }
-  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
+  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args).catch(() => undefined);
   if (!w) return <pre className="p-4 text-sm text-ice">{value}</pre>;
   return (
     <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3">
@@ -1619,7 +1619,7 @@ export function CreationsView({ value }: { value: string }) {
     thumb?: string;
     updatedAt: number;
   }[];
-  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
+  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args).catch(() => undefined);
 
   const open = (r: (typeof rows)[number]) => {
     if (r.kind === "image" && r.url) void setPanel({ type: "image", value: r.url, title: r.title });

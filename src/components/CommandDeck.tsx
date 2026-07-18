@@ -97,6 +97,8 @@ export default function CommandDeck({ busy, snapshot, selectedJobId, onSelectJob
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ jobId, action: decision === "approved" ? "approve" : "decline" }),
       });
+    } catch {
+      // The live Convex row remains authoritative when the browser is offline.
     } finally {
       setActing("");
     }
@@ -110,6 +112,8 @@ export default function CommandDeck({ busy, snapshot, selectedJobId, onSelectJob
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ jobId, action }),
       });
+    } catch {
+      // The live Convex row remains authoritative when the browser is offline.
     } finally {
       setActing("");
     }
