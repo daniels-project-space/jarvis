@@ -5,6 +5,21 @@ import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
 import "@excalidraw/excalidraw/index.css";
+import {
+  Background,
+  Controls,
+  Handle,
+  MarkerType,
+  MiniMap,
+  Position,
+  ReactFlow,
+  useNodesState,
+  type Edge,
+  type Node,
+  type NodeProps,
+  type ReactFlowInstance,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
 
 // JARVIS's infinite canvas — Excalidraw (MIT) rendering a board creation.
 // The brain queues high-level ops (see src/lib/board.ts); this view applies
@@ -21,6 +36,53 @@ const Excalidraw = dynamic(() => import("@excalidraw/excalidraw").then((m) => m.
 });
 
 const fileIdFor = (url: string) => "f" + Math.abs(url.split("").reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 7)).toString(36);
+
+type SemanticFlowData = {
+  title: string;
+  detail?: string;
+  category: string;
+  certainty?: string;
+  imageUrl?: string;
+};
+
+const FLOW_COLORS: Record<string, string> = {
+  character: "#f472b6",
+  location: "#38bdf8",
+  plot: "#fb923c",
+  timeline: "#facc15",
+  visual: "#c084fc",
+  relationship: "#f9a8d4",
+  theme: "#a78bfa",
+  object: "#34d399",
+  question: "#94a3b8",
+  note: "#2dd4bf",
+};
+
+function SemanticNode({ data, selected }: NodeProps<Node<SemanticFlowData>>) {
+  const accent = FLOW_COLORS[data.category] ?? FLOW_COLORS.note;
+  return (
+    <div
+      className={`w-[260px] overflow-hidden rounded-2xl border bg-[#0a1320]/95 shadow-[0_18px_50px_rgba(0,0,0,.38)] backdrop-blur-md transition ${selected ? "scale-[1.02]" : ""}`}
+      style={{ borderColor: selected ? accent : `${accent}66`, boxShadow: selected ? `0 0 0 1px ${accent}, 0 18px 50px rgba(0,0,0,.45)` : undefined }}
+    >
+      <Handle type="target" position={Position.Left} className="!h-2 !w-2 !border-0" style={{ background: accent }} />
+      {data.imageUrl && <img src={data.imageUrl} alt="" className="h-28 w-full object-cover" />}
+      <div className="p-3">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[8px] font-semibold uppercase tracking-[0.18em]" style={{ color: accent }}>{data.category}</span>
+          {data.certainty && data.certainty !== "stated" && (
+            <span className="rounded-full border border-white/10 px-1.5 py-0.5 text-[7px] uppercase tracking-wider text-slate">{data.certainty}</span>
+          )}
+        </div>
+        <div className="mt-1.5 text-[13px] font-semibold leading-snug text-ice">{data.title}</div>
+        {data.detail && <div className="mt-1.5 line-clamp-4 text-[10px] leading-[1.45] text-slate">{data.detail}</div>}
+      </div>
+      <Handle type="source" position={Position.Right} className="!h-2 !w-2 !border-0" style={{ background: accent }} />
+    </div>
+  );
+}
+
+const nodeTypes = { semantic: SemanticNode };
 
 async function urlToDataURL(url: string): Promise<string | null> {
   try {
@@ -48,9 +110,11 @@ export default function BoardView({ value }: { value: string }) {
   const row = useJarvisQuery(api.creations.get, creationId ? { id: creationId as never } : "skip") as { data?: string } | null | undefined;
   const boardSave = (args: Record<string, unknown>) => clientMutation("creations:boardSave", args);
   const apiRef = useRef<any>(null);
+  const flowApiRef = useRef<ReactFlowInstance<Node<SemanticFlowData>, Edge> | null>(null);
   const appliedTs = useRef(0);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [ready, setReady] = useState(false);
+  const [viewMode, setViewMode] = useState<"graph" | "canvas">("graph");
   const initialLoaded = useRef(false);
   const overviewFitDone = useRef(false);
 
@@ -62,6 +126,61 @@ export default function BoardView({ value }: { value: string }) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [row?.data]);
+
+  const semanticNodes = useMemo(
+    () => Object.values(doc?.semanticNodes ?? {}) as Array<{
+      id: string;
+      category: string;
+      title: string;
+      detail?: string;
+      certainty?: string;
+      imageUrl?: string;
+      x: number;
+      y: number;
+    }>,
+    [doc?.semanticNodes],
+  );
+  const [flowNodes, setFlowNodes, onFlowNodesChange] = useNodesState<Node<SemanticFlowData>>([]);
+  const flowEdges = useMemo<Edge[]>(() => (doc?.semanticEdges ?? []).map((edge: any) => ({
+    id: String(edge.id),
+    source: String(edge.from),
+    target: String(edge.to),
+    label: edge.label,
+    animated: edge.kind === "sequence",
+    markerEnd: { type: MarkerType.ArrowClosed, color: edge.kind === "sequence" ? "#facc15" : "#64748b" },
+    style: { stroke: edge.kind === "sequence" ? "#facc15" : "#64748b", strokeWidth: edge.kind === "sequence" ? 2.4 : 1.5 },
+    labelStyle: { fill: "#cbd5e1", fontSize: 9 },
+  })), [doc?.semanticEdges]);
+
+  useEffect(() => {
+    setFlowNodes(semanticNodes.map((node) => ({
+      id: node.id,
+      type: "semantic",
+      position: { x: node.x, y: node.y },
+      data: {
+        title: node.title,
+        detail: node.detail,
+        category: node.category,
+        certainty: node.certainty,
+        imageUrl: node.imageUrl,
+      },
+    })));
+    if (doc && semanticNodes.length === 0) setViewMode("canvas");
+  }, [doc, semanticNodes, setFlowNodes]);
+
+  const persistFlowLayout = (nodes: Node<SemanticFlowData>[]) => {
+    if (!creationId) return;
+    void clientMutation("creations:boardLayoutSave", {
+      id: creationId,
+      nodes: JSON.stringify(nodes.map((node) => ({ id: node.id, x: node.position.x, y: node.position.y }))),
+    }).catch(() => {});
+  };
+
+  useEffect(() => {
+    if (viewMode !== "graph") return;
+    apiRef.current = null;
+    setReady(false);
+  }, [viewMode]);
 
   const persist = async () => {
     const ex = apiRef.current;
@@ -81,6 +200,10 @@ export default function BoardView({ value }: { value: string }) {
   };
 
   const fitOverview = (animate = true) => {
+    if (viewMode === "graph") {
+      void flowApiRef.current?.fitView({ padding: 0.18, minZoom: 0.12, maxZoom: 1.05, duration: animate ? 420 : 0 });
+      return;
+    }
     const ex = apiRef.current;
     if (!ex) return;
     const elements = ex.getSceneElements();
@@ -96,6 +219,11 @@ export default function BoardView({ value }: { value: string }) {
   };
 
   const focusConcept = (title: string) => {
+    if (viewMode === "graph") {
+      const target = flowNodes.find((node) => String(node.data.title ?? "").toLowerCase().includes(title.toLowerCase()));
+      if (target) void flowApiRef.current?.setCenter(target.position.x + 130, target.position.y + 90, { zoom: 1, duration: 380 });
+      return;
+    }
     const ex = apiRef.current;
     if (!ex || !title) return;
     const query = title.toLowerCase();
@@ -208,7 +336,6 @@ export default function BoardView({ value }: { value: string }) {
       </div>
     );
 
-  const semanticNodes = Object.values(doc.semanticNodes ?? {}) as { id?: string; category?: string; title?: string; detail?: string }[];
   const categoryCounts = semanticNodes.reduce<Record<string, number>>((counts, node) => {
     const category = String(node.category ?? "note");
     counts[category] = (counts[category] ?? 0) + 1;
@@ -219,7 +346,7 @@ export default function BoardView({ value }: { value: string }) {
 
   return (
     <div className="relative min-h-0 flex-1 overflow-hidden" style={{ colorScheme: "dark" }}>
-      <Excalidraw
+      {viewMode === "canvas" ? <Excalidraw
         theme="dark"
         excalidrawAPI={(ex: any) => {
           apiRef.current = ex;
@@ -242,8 +369,35 @@ export default function BoardView({ value }: { value: string }) {
           saveTimer.current = setTimeout(() => void persist(), 1500);
         }}
         UIOptions={{ canvasActions: { toggleTheme: false, saveToActiveFile: false, loadScene: false, export: { saveFileToDisk: true } } }}
-      />
-      <div className="pointer-events-none absolute left-3 right-3 top-14 z-20 rounded-xl border border-cyan/20 bg-[#071019]/90 px-3 py-2 shadow-[0_14px_42px_rgba(0,0,0,0.35)] backdrop-blur-md">
+      /> : (
+        <ReactFlow
+          nodes={flowNodes}
+          edges={flowEdges}
+          nodeTypes={nodeTypes}
+          onNodesChange={onFlowNodesChange}
+          onInit={(instance) => { flowApiRef.current = instance; }}
+          onNodeDragStop={(_, dragged) => persistFlowLayout(flowNodes.map((node) => node.id === dragged.id ? { ...node, position: dragged.position } : node))}
+          onNodeDoubleClick={(_, node) => {
+            setViewMode("canvas");
+            window.setTimeout(() => focusConcept(String(node.data.title ?? "")), 280);
+          }}
+          fitView
+          fitViewOptions={{ padding: 0.18, minZoom: 0.12, maxZoom: 1.05 }}
+          minZoom={0.06}
+          maxZoom={1.8}
+          className="bg-[radial-gradient(circle_at_50%_42%,rgba(30,122,166,.1),transparent_45%),#050b12]"
+          proOptions={{ hideAttribution: true }}
+        >
+          <Background color="#183047" gap={28} size={1} />
+          <MiniMap
+            nodeColor={(node) => FLOW_COLORS[String(node.data?.category ?? "note")] ?? FLOW_COLORS.note}
+            maskColor="rgba(3,8,14,.72)"
+            className="!border !border-white/10 !bg-[#071019]"
+          />
+          <Controls className="!overflow-hidden !rounded-xl !border !border-white/10 !bg-[#071019] !shadow-xl" />
+        </ReactFlow>
+      )}
+      <div className={`pointer-events-none absolute left-3 right-3 z-20 rounded-xl border border-cyan/20 bg-[#071019]/90 px-3 py-2 shadow-[0_14px_42px_rgba(0,0,0,0.35)] backdrop-blur-md ${viewMode === "canvas" ? "top-14" : "top-3"}`}>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
           <div className="min-w-0">
             <div className="max-w-[280px] truncate text-[11px] font-semibold uppercase tracking-[0.15em] text-ice">{doc.title}</div>
@@ -256,10 +410,26 @@ export default function BoardView({ value }: { value: string }) {
               {category} {count}
             </span>
           ))}
+          <span className="pointer-events-auto ml-auto flex rounded-lg border border-white/10 bg-black/20 p-0.5">
+            <button
+              type="button"
+              onClick={() => setViewMode("graph")}
+              className={`rounded-md px-2 py-1 text-[9px] uppercase tracking-[0.12em] transition ${viewMode === "graph" ? "bg-cyan/15 text-cyan" : "text-slate hover:text-ice"}`}
+            >
+              semantic map
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode("canvas")}
+              className={`rounded-md px-2 py-1 text-[9px] uppercase tracking-[0.12em] transition ${viewMode === "canvas" ? "bg-cyan/15 text-cyan" : "text-slate hover:text-ice"}`}
+            >
+              drawing
+            </button>
+          </span>
           <button
             type="button"
             onClick={() => fitOverview(true)}
-            className="pointer-events-auto ml-auto rounded-md border border-cyan/25 px-2 py-1 text-[9px] uppercase tracking-[0.14em] text-cyan transition hover:border-cyan/60 hover:bg-cyan/10"
+            className="pointer-events-auto rounded-md border border-cyan/25 px-2 py-1 text-[9px] uppercase tracking-[0.14em] text-cyan transition hover:border-cyan/60 hover:bg-cyan/10"
           >
             fit overview
           </button>

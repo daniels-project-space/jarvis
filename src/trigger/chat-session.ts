@@ -26,6 +26,7 @@ import {
   JARVIS_DYNAMIC_TOOLS,
   JARVIS_TOOL_INSTRUCTIONS,
 } from "./agent-tool-bridge";
+import { StreamPublisher } from "./stream-publisher";
 
 function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = false): string[] {
   if (provider !== "codex") throw new Error("Jarvis permits only the Codex CLI runtime");
@@ -131,18 +132,10 @@ async function runTurn(
   contextBlock: string,
   model: string,
 ){
-  let pending = "";
-  let flushing = false;
-  const flush = async () => {
-    if (flushing || !pending) return;
-    flushing = true;
-    const chunk = pending;
-    pending = "";
-    await convexMutation("chatQueue:appendChunk", { messageId: assistantId, chunk }).catch(() => {});
-    flushing = false;
-    if (pending) void flush();
-  };
-  const timer = setInterval(() => void flush(), 120);
+  const publisher = new StreamPublisher((text, revision) =>
+    convexMutation("chatQueue:updateStream", { messageId: assistantId, text, revision }),
+  );
+  publisher.start();
   try {
     const result = await server.runTurn({
       conversationId,
@@ -151,13 +144,13 @@ async function runTurn(
       contextBlock,
       preamble: conversationPreamble(contextBlock, userText),
       modelTier: model,
-      onDelta: (delta) => { pending += delta; },
+      onDelta: (delta) => publisher.push(delta),
     });
-    await flush();
     return { ...result, sessionId: result.threadId };
   } finally {
-    clearInterval(timer);
-    await flush();
+    // This is the decisive ordering barrier: no stream mutation remains alive
+    // when processChatQueue writes the final answer.
+    await publisher.close();
   }
 }
 
@@ -312,7 +305,7 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
         claim.assistantId,
         claim.userText,
         claim.history,
-        context.block,
+        context,
         model,
       );
       const modelFinishedAt = Date.now();

@@ -25,10 +25,22 @@ async function ensureSession(ctx: { db: any }, threadId: string) {
 }
 
 export const sendMessage = mutation({
-  args: { threadId: v.optional(v.string()), text: v.string(), authTokenHash: v.optional(v.string()) },
+  args: {
+    threadId: v.optional(v.string()),
+    text: v.string(),
+    requestId: v.optional(v.string()),
+    authTokenHash: v.optional(v.string()),
+  },
   handler: async (ctx, a) => {
     await requireAdmin(ctx, a.authTokenHash);
     const threadId = a.threadId ?? "main";
+    if (a.requestId) {
+      const prior = await ctx.db
+        .query("chatMessages")
+        .withIndex("by_request", (q: any) => q.eq("requestId", a.requestId))
+        .first();
+      if (prior?.role === "user" && prior.threadId === threadId) return prior._id;
+    }
     const session = await ensureSession(ctx, threadId);
     // Stable turn slots keep concurrent replies beside the user message that
     // caused them, even when a later fast turn finishes before an earlier one.
@@ -38,6 +50,8 @@ export const sendMessage = mutation({
       role: "user",
       text: a.text,
       status: "pending",
+      requestId: a.requestId?.slice(0, 120),
+      delivery: "foreground",
       createdAt,
     });
     if (session) await ctx.db.patch(session._id, { lastActiveAt: createdAt });
@@ -54,7 +68,10 @@ export const listMessages = query({
       .query("chatMessages")
       .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
       .order("desc")
-      .take(240);
+      // The chat surface renders the latest 80 rows. Keep a small hand-over
+      // margin for paired cards/turns without re-reading 240 documents on
+      // every streamed token.
+      .take(100);
     return rows.reverse();
   },
 });
@@ -71,72 +88,6 @@ export const sessionState = query({
   },
 });
 
-// Fast-lane turn: the subscription Codex foreground worker handles the turn
-// itself, so the user row is inserted already-done (the cron dispatcher only
-// claims "pending" rows) and a streaming assistant row is opened for it.
-export const openTurn = mutation({
-  args: { threadId: v.optional(v.string()), userText: v.string(), authTokenHash: v.optional(v.string()) },
-  handler: async (ctx, a) => {
-    await requireAdmin(ctx, a.authTokenHash);
-    const threadId = a.threadId ?? "main";
-    await ensureSession(ctx, threadId);
-    const all = await ctx.db
-      .query("chatMessages")
-      .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
-      .order("desc")
-      .take(48);
-    const history = all
-      .filter((m: any) => m.status === "done" && (m.text || m.attachment))
-      .sort((x: any, y: any) => x.createdAt - y.createdAt)
-      .slice(-16)
-      .map((m: any) => ({
-        role: m.role,
-        // cards surface as context so "that video from earlier" resolves
-        text: m.text
-          ? (m.role === "user" ? visibleTurnText(m.text) : m.text)
-          : (m.attachment ? `[showed on screen: ${m.attachment.title ?? m.attachment.type}]` : ""),
-      }));
-    const userId = await ctx.db.insert("chatMessages", {
-      threadId,
-      role: "user",
-      text: a.userText,
-      status: "done",
-      createdAt: Date.now(),
-    });
-    const assistantId = await ctx.db.insert("chatMessages", {
-      threadId,
-      role: "assistant",
-      text: "",
-      status: "streaming",
-      createdAt: Date.now(),
-    });
-    return { assistantId, userId, history };
-  },
-});
-
-// Fast-lane failure path: flip the ORIGINAL user row back to pending so the
-// cron dispatcher answers it. Re-inserting the text (the old fallback) showed
-// Daniel his own message twice — this keeps exactly one user bubble.
-export const requeueUser = mutation({
-  args: { userId: v.id("chatMessages"), authTokenHash: v.optional(v.string()) },
-  handler: async (ctx, a) => {
-    await requireAdmin(ctx, a.authTokenHash);
-    const m = await ctx.db.get(a.userId);
-    if (!m || m.role !== "user") return;
-    // Already answered (finalize applied but its response got lost in transit)?
-    // Requeueing would produce a duplicate reply from the cron lane.
-    const rows = await ctx.db
-      .query("chatMessages")
-      .withIndex("by_thread", (q: any) => q.eq("threadId", m.threadId))
-      .order("desc")
-      .take(24);
-    const answered = rows.some(
-      (r: any) => r.role === "assistant" && r.status === "done" && r.text && r.createdAt >= m.createdAt,
-    );
-    if (!answered) await ctx.db.patch(a.userId, { status: "pending" });
-  },
-});
-
 // Assistant rows stuck "streaming" (a route killed mid-run) freeze the UI's
 // busy state forever. Sweep them into hidden error rows.
 export const reapStuck = mutation({
@@ -146,7 +97,7 @@ export const reapStuck = mutation({
     const rows = await ctx.db
       .query("chatMessages")
       .withIndex("by_status", (q: any) => q.eq("status", "streaming"))
-      .collect();
+      .take(100);
     let n = 0;
     const cutoff = Date.now() - 5 * 60 * 1000;
     for (const r of rows) {
@@ -176,6 +127,7 @@ export const logTurn = mutation({
       text: a.text,
       status: "done",
       model: a.model,
+      delivery: "foreground",
       createdAt: Date.now(),
     });
   },
@@ -195,6 +147,9 @@ async function claimPending(ctx: { db: any }, pending: any) {
       role: "assistant",
       text: "",
       status: "streaming",
+      parentMessageId: pending._id,
+      delivery: "foreground",
+      streamRevision: 0,
       createdAt: pending.createdAt + 1,
     });
 
@@ -209,6 +164,7 @@ async function claimPending(ctx: { db: any }, pending: any) {
           m._id !== assistantId &&
           m._id !== pending._id &&
           m.status === "done" &&
+          m.delivery !== "notification" &&
           m.createdAt < pending.createdAt,
       )
       .sort((a: any, b: any) => a.createdAt - b.createdAt)
@@ -310,13 +266,23 @@ export const pendingSignal = query({
   },
 });
 
-export const appendChunk = mutation({
-  args: { messageId: v.id("chatMessages"), chunk: v.string(), workerToken: v.optional(v.string()) },
+export const updateStream = mutation({
+  args: {
+    messageId: v.id("chatMessages"),
+    text: v.string(),
+    revision: v.number(),
+    workerToken: v.optional(v.string()),
+  },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const m = await ctx.db.get(a.messageId);
-    if (!m) return;
-    await ctx.db.patch(a.messageId, { text: (m.text ?? "") + a.chunk });
+    if (!m || m.role !== "assistant" || m.status !== "streaming") return false;
+    if (a.revision <= (m.streamRevision ?? 0)) return false;
+    await ctx.db.patch(a.messageId, {
+      text: a.text,
+      streamRevision: a.revision,
+    });
+    return true;
   },
 });
 
@@ -336,7 +302,9 @@ export const finalize = mutation({
     // was lost, the route's catch used to wipe the delivered answer and
     // requeue — Daniel then heard a second, reworded reply minutes later.
     const ex = await ctx.db.get(a.messageId);
-    if (ex?.status === "done" && a.status === "error") return;
+    if (!ex || ex.role !== "assistant") return false;
+    if (ex.status === "done") return a.status === "done" && (a.finalText === undefined || a.finalText === ex.text);
+    if (ex.status !== "streaming") return false;
     const patch: Record<string, unknown> = { status: a.status };
     if (a.finalText !== undefined) patch.text = a.finalText;
     if (a.model) patch.model = a.model;
@@ -355,10 +323,13 @@ export const finalize = mutation({
       const sp: Record<string, unknown> = { status: stillWorking ? "working" : "idle", lastActiveAt: Date.now() };
       await ctx.db.patch(s._id, sp);
     }
+    return true;
   },
 });
 
-// Post an assistant message directly (used by the agent-runner to report back).
+// Background work reports through a distinct delivery class. These rows remain
+// visible/findable, but the browser must never confuse one with the foreground
+// answer to Daniel's current turn or speak it minutes later.
 export const postAssistant = mutation({
   args: { threadId: v.string(), text: v.string(), workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
@@ -368,6 +339,7 @@ export const postAssistant = mutation({
       role: "assistant",
       text: a.text,
       status: "done",
+      delivery: "notification",
       createdAt: Date.now(),
     });
   },
@@ -390,6 +362,7 @@ export const postCard = mutation({
       role: "assistant",
       text: "",
       status: "done",
+      delivery: "foreground",
       attachment: { type: a.type, value: a.value, title: a.title },
       createdAt: Date.now(),
     });

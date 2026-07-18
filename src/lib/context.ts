@@ -80,12 +80,10 @@ export async function reportIncident(source: string, signature: string, message:
 
 export async function buildContext(
   userText?: string,
-  options?: { includeConversation?: boolean },
-): Promise<{ block: string; freshFindingIds: string[]; threadId?: string; conversation?: any[] }> {
+): Promise<string> {
   const [brain, hub] = await Promise.all([
     q(CONVEX_URL, "brainContext:snapshot", {
       userText: userText?.slice(0, 240) || undefined,
-      includeConversation: options?.includeConversation || undefined,
     }),
     hubSnapshot(),
   ]);
@@ -102,6 +100,7 @@ export async function buildContext(
   const draft = brain?.draft;
   const location = brain?.location;
   const panel = brain?.panel;
+  const creations = Array.isArray(brain?.creations) ? brain.creations : [];
   const openTodos = Array.isArray(todos) ? todos : [];
   const upcoming = Array.isArray(events) ? events : [];
 
@@ -118,6 +117,17 @@ export async function buildContext(
     lines.push("Calendar: " + upcoming.map((e: any) => `${e.title} on ${new Date(e.start).toDateString()}`).join("; "));
   if (wealth && typeof wealth.currentTotalGBP === "number")
     lines.push(`Net worth: about £${Math.round(wealth.currentTotalGBP).toLocaleString("en-GB")}.`);
+  if (creations.length) {
+    lines.push(
+      "RECENT CREATIONS — reuse, reopen or update these stable artifacts instead of creating duplicates:\n" +
+        creations
+          .slice(0, 8)
+          .map((creation: any) =>
+            `- id=${creation.id} ${creation.kind} \"${creation.title}\" · ${creation.folder ?? creation.category ?? "Library"}${creation.project ? ` · project ${creation.project}` : ""}`,
+          )
+          .join("\n"),
+    );
+  }
   if (Array.isArray(stack) && stack.length)
     lines.push(
       "PROJECT INTELLIGENCE — distinguish deploy health from whether the app is advancing its purpose:\n" +
@@ -233,12 +243,7 @@ export async function buildContext(
     lines.push(desc);
   }
 
-  return {
-    block: lines.join("\n\n").slice(0, 6000),
-    freshFindingIds: Array.isArray(findings) ? findings.map((f: any) => f._id) : [],
-    threadId: brain?.threadId,
-    conversation: Array.isArray(brain?.conversation) ? brain.conversation : undefined,
-  };
+  return lines.join("\n\n").slice(0, 6000);
 }
 
 // A deliberately small context retained for bounded utility callers. The rich

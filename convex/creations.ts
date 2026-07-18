@@ -163,6 +163,44 @@ export const updateScene = mutation({
   },
 });
 
+// Layout is a collaborative property of stable scene blocks. Merge only grid
+// coordinates so a browser resize cannot clobber fresh live data or blocks
+// that Jarvis is patching concurrently.
+export const sceneLayoutSave = mutation({
+  args: {
+    id: v.id("creations"),
+    layout: v.string(),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    const row = await ctx.db.get(a.id);
+    if (!row?.data || row.kind !== "scene") return false;
+    let data: any;
+    let layout: Array<{ i: string; x: number; y: number; w: number; h: number }>;
+    try {
+      data = JSON.parse(row.data);
+      layout = JSON.parse(a.layout);
+    } catch {
+      return false;
+    }
+    if (!Array.isArray(data.blocks) || !Array.isArray(layout)) return false;
+    const byId = new Map(layout.slice(0, 100).map((item) => [String(item?.i ?? ""), item]));
+    for (const block of data.blocks) {
+      const item = byId.get(String(block?.id ?? ""));
+      if (!item || ![item.x, item.y, item.w, item.h].every(Number.isFinite)) continue;
+      block.grid = {
+        x: Math.max(0, Math.round(item.x)),
+        y: Math.max(0, Math.round(item.y)),
+        w: Math.max(1, Math.min(12, Math.round(item.w))),
+        h: Math.max(2, Math.min(24, Math.round(item.h))),
+      };
+    }
+    await ctx.db.patch(a.id, { data: JSON.stringify(data), updatedAt: Date.now() });
+    return true;
+  },
+});
+
 // Atomic progressive travel patch. Provider calls finish independently; doing
 // read/modify/write in the Vercel route let two simultaneous results overwrite
 // one another. Keeping the merge in one Convex mutation makes each arrival
@@ -264,6 +302,39 @@ export const boardSave = mutation({
     data.imageUrls = JSON.parse(a.imageUrls);
     data.pendingOps = (data.pendingOps ?? []).filter((op: any) => (op.ts ?? 0) > a.appliedUpTo);
     await ctx.db.patch(a.id, { data: JSON.stringify(data), updatedAt: Date.now() });
+  },
+});
+
+// React Flow persists only semantic node positions. Merge them into the live
+// board document atomically so dragging a concept can never overwrite new
+// concepts or Excalidraw operations queued by Jarvis at the same moment.
+export const boardLayoutSave = mutation({
+  args: {
+    id: v.id("creations"),
+    nodes: v.string(),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    const row = await ctx.db.get(a.id);
+    if (!row?.data || row.kind !== "board") return false;
+    let data: any;
+    let positions: Array<{ id: string; x: number; y: number }>;
+    try {
+      data = JSON.parse(row.data);
+      positions = JSON.parse(a.nodes);
+    } catch {
+      return false;
+    }
+    if (!Array.isArray(positions) || !data.semanticNodes) return false;
+    for (const position of positions.slice(0, 500)) {
+      const node = data.semanticNodes[String(position?.id ?? "")];
+      if (!node || !Number.isFinite(position?.x) || !Number.isFinite(position?.y)) continue;
+      node.x = Math.round(position.x);
+      node.y = Math.round(position.y);
+    }
+    await ctx.db.patch(a.id, { data: JSON.stringify(data), updatedAt: Date.now() });
+    return true;
   },
 });
 

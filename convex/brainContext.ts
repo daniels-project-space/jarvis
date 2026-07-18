@@ -6,24 +6,12 @@ import { requireViewer, viewerAuthArgs } from "./controlAuth";
 // by every chat and Realtime session. Keep payloads concise: this is model
 // context, while full artifacts remain addressable by id.
 export const snapshot = query({
-  args: { userText: v.optional(v.string()), includeConversation: v.optional(v.boolean()), ...viewerAuthArgs },
+  args: { userText: v.optional(v.string()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
     const text = a.userText?.trim().slice(0, 240);
-    let threadId = "main";
-    let conversation: any[] = [];
-    if (a.includeConversation) {
-      const activeThread = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "activeThread")).first();
-      threadId = activeThread?.value || "main";
-      conversation = await ctx.db
-        .query("chatMessages")
-        .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
-        .order("desc")
-        .take(60);
-      conversation.reverse();
-    }
     const activeStatuses = ["running", "pending", "awaiting_approval", "paused", "needs_input"];
-    const [memHit, memRecent, business, projects, activeGroups, findings, trip, draft, location, panel, agents, attentionGroups, approvals, goalGroups] =
+    const [memHit, memRecent, business, projects, activeGroups, findings, trip, draft, location, panel, creations, agents, attentionGroups, approvals, goalGroups] =
       await Promise.all([
         text
           ? ctx.db
@@ -39,7 +27,7 @@ export const snapshot = query({
             ctx.db
               .query("jobs")
               .withIndex("by_status", (q: any) => q.eq("status", status))
-              .take(12),
+              .take(8),
           ),
         ),
         ctx.db
@@ -59,6 +47,7 @@ export const snapshot = query({
           .first(),
         ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "location")).first(),
         ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first(),
+        ctx.db.query("creations").withIndex("by_updatedAt").order("desc").take(12),
         ctx.db.query("agentProfiles").collect(),
         Promise.all(
           ["open", "working"].map((status) =>
@@ -110,13 +99,21 @@ export const snapshot = query({
       draft,
       location,
       panel,
+      creations: creations.map((creation: any) => ({
+        id: String(creation._id),
+        kind: creation.kind,
+        title: creation.title,
+        category: creation.category,
+        folder: creation.folder,
+        project: creation.project,
+        inquiry: creation.inquiry,
+        updatedAt: creation.updatedAt,
+      })),
       agents: liveAgents,
       attention: attentionGroups.flat().sort(
         (x: any, y: any) => y.impact * y.urgency * y.confidence - x.impact * x.urgency * x.confidence,
       ).slice(0, 12),
       approvals,
-      threadId,
-      conversation,
       generatedAt: Date.now(),
     };
   },

@@ -9,6 +9,41 @@ import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAu
 
 const WINDOW_MS = 48 * 60 * 60 * 1000;
 
+const attentionFingerprint = (id: unknown) => `incident:${String(id)}`;
+
+async function syncIncidentAttention(
+  ctx: any,
+  incident: { _id: unknown; app?: string; source: string; message: string; count: number; status: string },
+  options?: { jobId?: string },
+) {
+  const fingerprint = attentionFingerprint(incident._id);
+  const existing = await ctx.db
+    .query("attentionItems")
+    .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", fingerprint))
+    .first();
+  const needsDaniel = incident.status === "needs-daniel";
+  const resolved = incident.status === "resolved";
+  const item = {
+    fingerprint,
+    project: incident.app,
+    title: needsDaniel
+      ? `Repair needs Daniel · ${incident.app ?? "Jarvis"}`.slice(0, 140)
+      : `Self-repair · ${incident.app ?? "Jarvis"}`.slice(0, 140),
+    detail: incident.message.slice(0, 2_000),
+    evidence: [`source ${incident.source}`, `seen ${incident.count}x`, `incident ${String(incident._id)}`],
+    severity: needsDaniel ? "critical" : "warning",
+    impact: incident.source === "stack-poller" ? 80 : 65,
+    urgency: needsDaniel ? 90 : incident.source === "stack-poller" ? 80 : 60,
+    confidence: 1,
+    actionClass: needsDaniel ? "ask" : "safe-auto-fix",
+    status: resolved ? "resolved" : incident.status === "dispatched" ? "working" : "open",
+    jobId: options?.jobId,
+    updatedAt: Date.now(),
+  };
+  if (existing) await ctx.db.patch(existing._id, item);
+  else await ctx.db.insert("attentionItems", { ...item, createdAt: Date.now() });
+}
+
 export const report = mutation({
   args: {
     source: v.string(),
@@ -25,23 +60,31 @@ export const report = mutation({
     const existing = await ctx.db
       .query("incidents")
       .withIndex("by_signature", (q: any) => q.eq("signature", sig))
-      .collect();
+      .order("desc")
+      .take(10);
     const now = Date.now();
     const recent = existing
       .filter((i: any) => now - i.updatedAt < WINDOW_MS)
       .sort((x: any, y: any) => y.updatedAt - x.updatedAt)[0];
     if (recent) {
+      const nextStatus = recent.status === "resolved" ? "open" : recent.status;
       const patch: Record<string, unknown> = {
         count: recent.count + 1,
         updatedAt: now,
         message: a.message.slice(0, 1500),
       };
       // recurrence after a "fix" = the fix didn't hold — reopen with history
-      if (recent.status === "resolved") patch.status = "open";
+      if (recent.status === "resolved") patch.status = nextStatus;
       await ctx.db.patch(recent._id, patch);
+      await syncIncidentAttention(ctx, {
+        ...recent,
+        message: a.message.slice(0, 1500),
+        count: recent.count + 1,
+        status: nextStatus,
+      });
       return recent._id;
     }
-    return await ctx.db.insert("incidents", {
+    const id = await ctx.db.insert("incidents", {
       source: a.source,
       app: a.app,
       signature: sig,
@@ -52,6 +95,15 @@ export const report = mutation({
       createdAt: now,
       updatedAt: now,
     });
+    await syncIncidentAttention(ctx, {
+      _id: id,
+      source: a.source,
+      app: a.app,
+      message: a.message.slice(0, 1500),
+      count: 1,
+      status: "open",
+    });
+    return id;
   },
 });
 
@@ -71,11 +123,13 @@ export const claimForRepair = mutation({
     for (const inc of open.sort((x: any, y: any) => x.updatedAt - y.updatedAt)) {
       if (inc.attempts >= max) {
         await ctx.db.patch(inc._id, { status: "needs-daniel", updatedAt: Date.now() });
+        await syncIncidentAttention(ctx, { ...inc, status: "needs-daniel" });
         escalations.push({ id: inc._id, signature: inc.signature, message: inc.message, attempts: inc.attempts });
         continue;
       }
       if (claims.length >= (a.limit ?? 2)) continue;
       await ctx.db.patch(inc._id, { status: "dispatched", attempts: inc.attempts + 1, updatedAt: Date.now() });
+      await syncIncidentAttention(ctx, { ...inc, status: "dispatched", count: inc.count });
       claims.push({
         id: inc._id,
         source: inc.source,
@@ -99,7 +153,22 @@ export const setStatus = mutation({
   },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
+    const incident = await ctx.db.get(a.id);
+    if (!incident) return false;
     await ctx.db.patch(a.id, { status: a.status, updatedAt: Date.now() });
+    await syncIncidentAttention(ctx, { ...incident, status: a.status });
+    return true;
+  },
+});
+
+export const linkJob = mutation({
+  args: { id: v.id("incidents"), jobId: v.string(), workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const incident = await ctx.db.get(a.id);
+    if (!incident) return false;
+    await syncIncidentAttention(ctx, { ...incident, status: "dispatched" }, { jobId: a.jobId });
+    return true;
   },
 });
 

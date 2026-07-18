@@ -14,10 +14,12 @@ export const maxDuration = 30;
 async function handlePost(req: NextRequest, authTokenHash: string) {
   let text = "";
   let threadId = "main";
+  let requestId = "";
   try {
     const body = await req.json();
     text = String(body?.text ?? "").trim();
     threadId = String(body?.threadId ?? "main").trim() || "main";
+    requestId = String(body?.requestId ?? "").trim().slice(0, 120);
   } catch {
     return Response.json({ error: "bad request" }, { status: 400 });
   }
@@ -26,6 +28,7 @@ async function handlePost(req: NextRequest, authTokenHash: string) {
   const messageId = await convexMutation("chatQueue:sendMessage", {
     threadId,
     text: text.slice(0, 12_000),
+    requestId: requestId || undefined,
     authTokenHash,
   });
   const lease = await convexQuery("chatQueue:runnerLease", { authTokenHash }).catch(() => null) as { updatedAt?: number } | null;

@@ -15,7 +15,7 @@ const CONVEX =
 const REPO = "daniels-project-space/jarvis-memory";
 
 type MemoryRow = { kind?: unknown; title?: unknown; body?: unknown; tags?: unknown[] };
-type InsightRow = { text?: unknown };
+type AttentionRow = { title?: unknown; detail?: unknown; status?: unknown };
 type BusinessRow = { domain?: unknown; headline?: unknown; detail?: unknown };
 type ProjectRow = { slug?: unknown; status?: unknown; summary?: unknown; data?: { recent?: unknown } };
 
@@ -72,7 +72,7 @@ export const memoryVault = schedules.task({
     await sh("git", ["-C", dir, "config", "user.name", "JARVIS"], env);
 
     const mem = ((await q("memory:recent", { limit: 60 })) as MemoryRow[] | null) ?? [];
-    const ins = ((await q("business:recentInsights", { limit: 10 })) as InsightRow[] | null) ?? [];
+    const attention = ((await q("attention:list", { limit: 10 })) as AttentionRow[] | null) ?? [];
     const biz = ((await q("business:list", {})) as BusinessRow[] | null) ?? [];
     const stack = ((await q("projectState:list", {})) as ProjectRow[] | null) ?? [];
     const date = new Date().toISOString().slice(0, 10);
@@ -84,8 +84,8 @@ export const memoryVault = schedules.task({
       `---\ntype: log\ndate: ${date}\n---`,
       `# Log ${date}`,
       "",
-      "## Insights noticed",
-      ...(ins.length ? ins.map((i) => `- ${clean(i.text)}`) : ["- (none)"]),
+      "## Attention noticed",
+      ...(attention.length ? attention.map((item) => `- **${clean(item.title)}** — ${clean(item.detail)}`) : ["- (none)"]),
       "",
       "## Remembered",
       ...mem
@@ -166,6 +166,6 @@ export const memoryVault = schedules.task({
       const push = await sh("git", ["-C", dir, "push", url, "HEAD"], gitEnv);
       pushed = push.code === 0;
     }
-    return { date, notes, insights: ins.length, pushed };
+    return { date, notes, attention: attention.length, pushed };
   },
 });

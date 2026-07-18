@@ -14,6 +14,23 @@ import { advanceOrbPhase, frameDamping, orbCycleSeconds, type OrbMotionFrame, ty
 // were removed so no second animation system can fight this clock.
 
 const BASE = 0x00ff88; // Daniel's green — do not revert
+const FALLBACK_PARTICLES = Array.from({ length: 72 }, (_, index) => {
+  const angle = index * 2.399963;
+  const radius = 5 + Math.sqrt(index / 72) * 40;
+  return {
+    x: 50 + Math.cos(angle) * radius,
+    y: 50 + Math.sin(angle) * radius * 0.9,
+    r: index % 9 === 0 ? 1.1 : index % 4 === 0 ? 0.75 : 0.48,
+  };
+});
+const FALLBACK_LINKS = FALLBACK_PARTICLES.flatMap((point, index) => {
+  const next = FALLBACK_PARTICLES[index + 1];
+  const cross = index % 4 === 0 ? FALLBACK_PARTICLES[index + 7] : undefined;
+  return [next && { from: point, to: next }, cross && { from: point, to: cross }].filter(Boolean) as {
+    from: (typeof FALLBACK_PARTICLES)[number];
+    to: (typeof FALLBACK_PARTICLES)[number];
+  }[];
+});
 
 export default function ThreeOrb({
   state = "idle",
@@ -123,6 +140,15 @@ export default function ThreeOrb({
     renderer.setSize(W(), H());
     renderer.setClearColor(0x000000, 0);
     mount.appendChild(renderer.domElement);
+    const onContextLost = (event: Event) => {
+      event.preventDefault();
+      if (!destroyed) setWebglUnavailable(true);
+    };
+    const onContextRestored = () => {
+      if (!destroyed) setWebglUnavailable(false);
+    };
+    renderer.domElement.addEventListener("webglcontextlost", onContextLost);
+    renderer.domElement.addEventListener("webglcontextrestored", onContextRestored);
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(45, W() / H(), 1, 1000);
@@ -279,7 +305,7 @@ export default function ThreeOrb({
       const halfW = Math.tan((45 * Math.PI) / 360) * 80 * (W() / H());
       // aside: hug the right edge as far as the panel sits on the left
       const offsetX = halfW * 0.66 * asideAmt;
-      const shrink = 1 - 0.32 * asideAmt;
+      const shrink = 1 - 0.22 * asideAmt;
       // sit a touch higher so the bottom chat bar isn't crowding it
       const liftY = 3.2;
 
@@ -464,6 +490,8 @@ export default function ThreeOrb({
       mat.dispose();
       lineMat.dispose();
       electronMat.dispose();
+      renderer.domElement.removeEventListener("webglcontextlost", onContextLost);
+      renderer.domElement.removeEventListener("webglcontextrestored", onContextRestored);
       if (renderer.domElement.parentElement === mount) mount.removeChild(renderer.domElement);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -476,10 +504,22 @@ export default function ThreeOrb({
           aria-label="JARVIS visual core"
           className={`absolute inset-0 grid place-items-center will-change-transform transition-transform duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${aside ? "translate-x-[32%]" : "translate-x-0"}`}
         >
-          <div className={`relative h-[min(42vw,280px)] w-[min(42vw,280px)] min-h-36 min-w-36 rounded-full border border-emerald-300/25 bg-[radial-gradient(circle_at_42%_38%,rgba(110,255,196,0.32),rgba(0,255,136,0.1)_34%,rgba(0,255,136,0.02)_68%,transparent_72%)] shadow-[0_0_80px_rgba(0,255,136,0.16)] transition-transform duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${aside ? "scale-[0.68]" : "scale-100"}`}>
-            <div className="absolute inset-[18%] rounded-full border border-emerald-200/20 shadow-[inset_0_0_45px_rgba(0,255,136,0.18)]" />
-            <div className="absolute inset-[38%] rounded-full bg-emerald-300/35 blur-md" />
-          </div>
+          <svg
+            viewBox="0 0 100 100"
+            className={`h-[min(54vw,360px)] w-[min(54vw,360px)] min-h-44 min-w-44 overflow-visible transition-transform duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${aside ? "scale-[0.78]" : "scale-100"} ${reduceMotion ? "" : "animate-spin"}`}
+            style={{ color: moodColor ?? "#00ff88", animationDuration: "28s", filter: `drop-shadow(0 0 18px ${moodColor ?? "#00ff88"}55)` }}
+          >
+            <g stroke="currentColor" strokeWidth="0.18" strokeOpacity="0.2">
+              {FALLBACK_LINKS.map((link, index) => (
+                <line key={index} x1={link.from.x} y1={link.from.y} x2={link.to.x} y2={link.to.y} />
+              ))}
+            </g>
+            <g fill="currentColor">
+              {FALLBACK_PARTICLES.map((particle, index) => (
+                <circle key={index} cx={particle.x} cy={particle.y} r={particle.r} opacity={0.42 + (index % 5) * 0.1} />
+              ))}
+            </g>
+          </svg>
         </div>
       )}
     </div>

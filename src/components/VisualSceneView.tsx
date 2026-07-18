@@ -3,6 +3,9 @@
 import { useMemo, useRef, useState } from "react";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
+import { clientMutation } from "@/lib/client-mutation";
+import ReactGridLayout, { useContainerWidth, verticalCompactor, type Layout } from "react-grid-layout";
+import "react-grid-layout/css/styles.css";
 import {
   materializeCapability,
   parseVisualSceneJson,
@@ -81,22 +84,33 @@ function SourceBadge({ block, live }: { block: VisualBlock; live?: LiveContext }
   );
 }
 
-function BlockShell({ block, live, focus, children }: { block: VisualBlock; live?: LiveContext; focus?: boolean; children: React.ReactNode }) {
-  const span = block.span === "full" ? "lg:col-span-3" : block.span === "two" ? "lg:col-span-2" : "lg:col-span-1";
+function BlockShell({ block, live, focus, onFocus, children }: { block: VisualBlock; live?: LiveContext; focus?: boolean; onFocus?: () => void; children: React.ReactNode }) {
   const tone = block.tone ?? "cyan";
   return (
     <section
-      className={`scene-block tile ${span} min-w-0 overflow-hidden p-4 ${focus ? "scene-focus ring-1 ring-cyan/70" : ""}`}
+      className={`scene-block tile flex h-full min-w-0 flex-col overflow-hidden p-4 ${focus ? "scene-focus ring-1 ring-cyan/70" : ""}`}
       aria-label={block.title ?? block.kind}
     >
-      <div className="relative z-[1] mb-3 flex items-start justify-between gap-3">
+      <div className="scene-drag-handle relative z-[1] mb-3 flex shrink-0 cursor-grab items-start justify-between gap-3 active:cursor-grabbing">
         <div className="min-w-0">
           {block.title && <h2 className="truncate font-display text-sm font-semibold tracking-wide text-ice">{block.title}</h2>}
           {block.subtitle && <p className="mt-0.5 line-clamp-2 text-[10px] leading-relaxed text-slate">{block.subtitle}</p>}
         </div>
-        <SourceBadge block={block} live={live} />
+        <span className="flex items-center gap-1">
+          <SourceBadge block={block} live={live} />
+          {onFocus && (
+            <button
+              type="button"
+              onClick={onFocus}
+              className={`rounded-md border px-1.5 py-1 text-[7px] uppercase tracking-wider transition ${focus ? "border-cyan/40 bg-cyan/10 text-cyan" : "border-white/10 text-slate hover:text-ice"}`}
+              title={focus ? "Return to all modules" : "Focus this module"}
+            >
+              {focus ? "all" : "focus"}
+            </button>
+          )}
+        </span>
       </div>
-      <div className="relative z-[1]" style={{ "--scene-accent": COLORS[tone] } as React.CSSProperties}>
+      <div className="scrollbar-thin relative z-[1] min-h-0 flex-1 overflow-auto" style={{ "--scene-accent": COLORS[tone] } as React.CSSProperties}>
         {children}
       </div>
     </section>
@@ -472,44 +486,183 @@ function AppSnapshot({ block, live, items }: { block: VisualBlock; live?: LiveCo
   return <Metrics block={{...block,kind:"metrics"}} items={items}/>;
 }
 
-function SceneBlock({ block, live, focus }: { block: VisualBlock; live?: LiveContext; focus?: boolean }) {
-  const items = resolveItems(block, live);
+function SceneBlock({ block, live, focus, filter, onFocus }: { block: VisualBlock; live?: LiveContext; focus?: boolean; filter?: string; onFocus?: () => void }) {
+  const allItems = resolveItems(block, live);
+  const query = filter?.trim().toLowerCase();
+  const items = query
+    ? allItems.filter((item) => [item.label, item.detail, item.status, item.value, item.secondary].some((value) => String(value ?? "").toLowerCase().includes(query)))
+    : allItems;
+  const visibleBlock = query && block.kind === "graph" ? { ...block, nodes: items } : block;
   let content: React.ReactNode;
-  switch (block.kind) {
-    case "metrics": content=<Metrics block={block} items={items}/>; break;
-    case "progress": content=<Progress block={block} items={items}/>; break;
-    case "sparkline": content=<Sparkline block={block} items={items}/>; break;
-    case "line": content=<LineChart block={block} items={items}/>; break;
-    case "bar": content=<BarChart block={block} items={items}/>; break;
-    case "donut": content=<Donut block={block} items={items}/>; break;
-    case "gauge": content=<Gauge block={block} items={items}/>; break;
-    case "candlestick": content=<Candles block={block} items={items}/>; break;
-    case "heatmap": content=<Heatmap block={block} items={items}/>; break;
-    case "table": content=<DataTable block={block} items={items}/>; break;
-    case "comparison": content=<Comparison block={block} items={items}/>; break;
-    case "timeline": content=<Timeline block={block} items={items}/>; break;
-    case "gantt": content=<Gantt block={block} items={items}/>; break;
-    case "kanban": content=<Kanban block={block} items={items}/>; break;
-    case "funnel": content=<Funnel block={block} items={items}/>; break;
-    case "matrix": content=<Matrix block={block} items={items}/>; break;
-    case "graph": content=<Spatial block={block} items={items} graph/>; break;
-    case "gallery": content=<Gallery block={block} items={items}/>; break;
-    case "link_grid": content=<LinkGrid block={block} items={items}/>; break;
-    case "activity": content=<Activity block={block} items={items}/>; break;
-    case "map": content=<Spatial block={block} items={items}/>; break;
-    case "app": content=<AppSnapshot block={block} live={live} items={items}/>; break;
+  switch (visibleBlock.kind) {
+    case "metrics": content=<Metrics block={visibleBlock} items={items}/>; break;
+    case "progress": content=<Progress block={visibleBlock} items={items}/>; break;
+    case "sparkline": content=<Sparkline block={visibleBlock} items={items}/>; break;
+    case "line": content=<LineChart block={visibleBlock} items={items}/>; break;
+    case "bar": content=<BarChart block={visibleBlock} items={items}/>; break;
+    case "donut": content=<Donut block={visibleBlock} items={items}/>; break;
+    case "gauge": content=<Gauge block={visibleBlock} items={items}/>; break;
+    case "candlestick": content=<Candles block={visibleBlock} items={items}/>; break;
+    case "heatmap": content=<Heatmap block={visibleBlock} items={items}/>; break;
+    case "table": content=<DataTable block={visibleBlock} items={items}/>; break;
+    case "comparison": content=<Comparison block={visibleBlock} items={items}/>; break;
+    case "timeline": content=<Timeline block={visibleBlock} items={items}/>; break;
+    case "gantt": content=<Gantt block={visibleBlock} items={items}/>; break;
+    case "kanban": content=<Kanban block={visibleBlock} items={items}/>; break;
+    case "funnel": content=<Funnel block={visibleBlock} items={items}/>; break;
+    case "matrix": content=<Matrix block={visibleBlock} items={items}/>; break;
+    case "graph": content=<Spatial block={visibleBlock} items={items} graph/>; break;
+    case "gallery": content=<Gallery block={visibleBlock} items={items}/>; break;
+    case "link_grid": content=<LinkGrid block={visibleBlock} items={items}/>; break;
+    case "activity": content=<Activity block={visibleBlock} items={items}/>; break;
+    case "map": content=<Spatial block={visibleBlock} items={items}/>; break;
+    case "app": content=<AppSnapshot block={visibleBlock} live={live} items={items}/>; break;
   }
-  return <BlockShell block={block} live={live} focus={focus}>{content}</BlockShell>;
+  return <BlockShell block={visibleBlock} live={live} focus={focus} onFocus={onFocus}>{content}</BlockShell>;
+}
+
+function defaultBlockHeight(kind: VisualBlock["kind"]): number {
+  if (["app", "graph", "map"].includes(kind)) return 9;
+  if (["candlestick", "line", "bar", "heatmap", "table", "gallery", "matrix"].includes(kind)) return 7;
+  if (["timeline", "gantt", "kanban", "comparison", "activity"].includes(kind)) return 6;
+  return 5;
+}
+
+function buildLayout(blocks: VisualBlock[], mobile: boolean): Layout {
+  if (mobile) {
+    let y = 0;
+    return blocks.map((block) => {
+      const h = defaultBlockHeight(block.kind);
+      const item = { i: block.id, x: 0, y, w: 1, h, minH: 3 };
+      y += h;
+      return item;
+    });
+  }
+  let x = 0;
+  let y = 0;
+  let rowHeight = 0;
+  return blocks.map((block) => {
+    if (block.grid) return { i: block.id, ...block.grid, minW: 3, minH: 3 };
+    const w = block.span === "full" ? 12 : block.span === "two" ? 8 : 4;
+    const h = defaultBlockHeight(block.kind);
+    if (x + w > 12) {
+      x = 0;
+      y += rowHeight;
+      rowHeight = 0;
+    }
+    const item = { i: block.id, x, y, w, h, minW: 3, minH: 3 };
+    x += w;
+    rowHeight = Math.max(rowHeight, h);
+    return item;
+  });
 }
 
 export default function VisualSceneView({ value }: { value: string }) {
   let reference: { creationId?: string; scene?: unknown } = {};
-  try { reference=JSON.parse(value); } catch { reference={}; }
+  try { reference = JSON.parse(value); } catch { reference = {}; }
   const creation = useJarvisQuery(api.creations.get, reference.creationId ? ({ id: reference.creationId } as any) : "skip") as any;
   const raw = creation?.data ?? (reference.scene ? JSON.stringify(reference.scene) : value);
-  const scene: VisualScene = useMemo(() => materializeCapability(parseVisualSceneJson(raw, creation?.title)), [raw, creation?.title]);
-  const sources = useMemo(() => [...new Set(scene.blocks.map((block)=>block.source).filter((source): source is string => !!source))].slice(0,12), [scene.blocks]);
+  const scene: VisualScene = useMemo(
+    () => materializeCapability(parseVisualSceneJson(raw, creation?.title)),
+    [raw, creation?.title],
+  );
+  const sources = useMemo(
+    () => [...new Set(scene.blocks.map((block) => block.source).filter((source): source is string => !!source))].slice(0, 12),
+    [scene.blocks],
+  );
   const live = useJarvisQuery(api.visualContext.snapshot, sources.length ? { sources } : "skip") as LiveContext | undefined;
-  if (reference.creationId && creation === undefined) return <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-xs text-cyan"><span className="h-2 w-2 animate-ping rounded-full bg-cyan"/>assembling visual workspace…</div>;
-  return <div className="scrollbar-thin min-h-0 flex-1 overflow-auto bg-[radial-gradient(circle_at_18%_0%,rgba(0,255,136,.07),transparent_28%),radial-gradient(circle_at_90%_12%,rgba(92,200,255,.08),transparent_30%)] p-3 sm:p-5"><header className="mb-5 flex flex-wrap items-end justify-between gap-3"><div><div className="hud-label !text-[8px] !text-cyan-dim">visual intelligence · {scene.blocks.length} modules</div><h1 className="mt-1 font-display text-xl font-semibold tracking-wide text-ice sm:text-2xl">{scene.title}</h1>{scene.subtitle && <p className="mt-1 max-w-3xl text-[10px] leading-relaxed text-slate sm:text-xs">{scene.subtitle}</p>}</div>{scene.capability && <span className="rounded-full border border-cyan/20 bg-cyan/[0.05] px-3 py-1 font-mono text-[8px] uppercase tracking-widest text-cyan">{scene.capability.replace(/_/g," ")}</span>}</header>{scene.blocks.length ? <div className={`grid grid-cols-1 ${scene.layout === "roomy" ? "gap-4" : "gap-3"} lg:grid-cols-3`}>{scene.blocks.map((block)=><SceneBlock key={block.id} block={block} live={live} focus={scene.focusBlockId===block.id}/>)}</div> : <Empty>This workspace is ready for Jarvis to compose into as you talk.</Empty>}<footer className="mt-4 flex justify-between gap-3 font-mono text-[8px] uppercase tracking-widest text-slate/60"><span>stable blocks · live bindings · local camera</span><span>{dateLabel(scene.updatedAt)}</span></footer></div>;
+  const { width, containerRef, mounted } = useContainerWidth();
+  const mobile = width < 760;
+  const layout = useMemo(() => buildLayout(scene.blocks, mobile), [scene.blocks, mobile]);
+  const [filter, setFilter] = useState("");
+  const [localFocus, setLocalFocus] = useState<string | null>(null);
+  const focusedId = localFocus ?? scene.focusBlockId ?? null;
+
+  const persistLayout = (next: Layout) => {
+    if (!reference.creationId || mobile) return;
+    void clientMutation("creations:sceneLayoutSave", {
+      id: reference.creationId,
+      layout: JSON.stringify(next.map(({ i, x, y, w, h }) => ({ i, x, y, w, h }))),
+    }).catch(() => {});
+  };
+
+  if (reference.creationId && creation === undefined) {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-xs text-cyan">
+        <span className="h-2 w-2 animate-ping rounded-full bg-cyan" /> assembling visual workspace…
+      </div>
+    );
+  }
+
+  return (
+    <div className="scrollbar-thin min-h-0 flex-1 overflow-auto bg-[radial-gradient(circle_at_18%_0%,rgba(0,255,136,.07),transparent_28%),radial-gradient(circle_at_90%_12%,rgba(92,200,255,.08),transparent_30%)] p-3 sm:p-5">
+      <header className="mb-3 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <div className="hud-label !text-[8px] !text-cyan-dim">visual intelligence · {scene.blocks.length} live modules</div>
+          <h1 className="mt-1 font-display text-xl font-semibold tracking-wide text-ice sm:text-2xl">{scene.title}</h1>
+          {scene.subtitle && <p className="mt-1 max-w-3xl text-[10px] leading-relaxed text-slate sm:text-xs">{scene.subtitle}</p>}
+        </div>
+        <div className="flex min-w-[240px] flex-wrap items-center justify-end gap-2">
+          <label className="flex min-w-[220px] flex-1 items-center gap-2 rounded-xl border border-white/10 bg-black/20 px-3 py-2">
+            <span className="text-cyan">⌕</span>
+            <input
+              value={filter}
+              onChange={(event) => setFilter(event.target.value)}
+              placeholder="filter every module"
+              className="min-w-0 flex-1 bg-transparent text-[10px] text-ice outline-none placeholder:text-slate/70"
+            />
+            {filter && <button type="button" onClick={() => setFilter("")} className="text-[9px] text-slate hover:text-ice">clear</button>}
+          </label>
+          {scene.capability && (
+            <span className="rounded-full border border-cyan/20 bg-cyan/[0.05] px-3 py-1 font-mono text-[8px] uppercase tracking-widest text-cyan">
+              {scene.capability.replace(/_/g, " ")}
+            </span>
+          )}
+        </div>
+      </header>
+
+      {scene.blocks.length ? (
+        <div ref={containerRef} className="min-w-0">
+          {mounted && (
+            <ReactGridLayout
+              width={width}
+              layout={layout}
+              gridConfig={{ cols: mobile ? 1 : 12, rowHeight: 54, margin: scene.layout === "roomy" ? [16, 16] : [12, 12], containerPadding: [0, 0] }}
+              dragConfig={{ enabled: !mobile, handle: ".scene-drag-handle", cancel: "button,input,a,select,textarea" }}
+              resizeConfig={{ enabled: !mobile, handles: ["se"] }}
+              compactor={verticalCompactor}
+              onDragStop={(next) => persistLayout(next)}
+              onResizeStop={(next) => persistLayout(next)}
+              autoSize
+            >
+              {scene.blocks.map((block) => {
+                const focused = focusedId === block.id;
+                return (
+                  <div
+                    key={block.id}
+                    className={`transition-opacity duration-300 ${focusedId && !focused ? "opacity-30" : "opacity-100"}`}
+                  >
+                    <SceneBlock
+                      block={block}
+                      live={live}
+                      filter={filter}
+                      focus={focused}
+                      onFocus={() => setLocalFocus(focused ? null : block.id)}
+                    />
+                  </div>
+                );
+              })}
+            </ReactGridLayout>
+          )}
+        </div>
+      ) : (
+        <Empty>This workspace is ready for Jarvis to compose into as you talk.</Empty>
+      )}
+
+      <footer className="mt-4 flex justify-between gap-3 font-mono text-[8px] uppercase tracking-widest text-slate/60">
+        <span>{mobile ? "responsive stack" : "drag · resize · shared filter"} · live bindings</span>
+        <span>{dateLabel(scene.updatedAt)}</span>
+      </footer>
+    </div>
+  );
 }

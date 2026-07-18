@@ -13,13 +13,22 @@ import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversa
 import { instantSocialReply } from "@/lib/quick-replies";
 import { isPanelFollowUp } from "@/lib/panel-relevance";
 import { nextVoiceLoopAction, type VoiceCaptureOutcome } from "@/lib/voice-loop";
-import { advanceLiveVad, createLiveVadState, shouldCloseLiveUtterance, spectrumBandLevel } from "@/lib/live-vad";
-import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, MarketChartLoading, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
+import {
+  LIVE_SPEAKER_TAIL_MS,
+  advanceLiveVad,
+  createLiveVadState,
+  shouldCloseLiveUtterance,
+  shouldDeferLiveCapture,
+  spectrumBandLevel,
+} from "@/lib/live-vad";
+import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, StructuredListView, CandlesView, MarketChartLoading, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView, PanelUnavailable } from "./Views";
 import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
 import { parseTerminalOutput, type TerminalTone } from "@/lib/terminal-output";
 import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate } from "@/lib/transcript";
 import { completeSpeechPrefix, isSpeaking as isTtsActuallySpeaking, unlockSpeechPlayback } from "@/lib/tts";
+import { NarrationLedger, narrationClaim } from "@/lib/narration";
+import { resolvePanelRoute } from "@/lib/panel-contract";
 import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
 import { needsHostContext, visibleTurnText, withHostContext, type JarvisHostContext } from "@/lib/host-context";
 import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
@@ -47,6 +56,8 @@ type Msg = {
   text: string;
   status: string;
   model?: string;
+  delivery?: "foreground" | "notification";
+  parentMessageId?: string;
   attachment?: Attachment;
   createdAt: number;
 };
@@ -176,77 +187,6 @@ function MediaCard({ a, onShow }: { a: Attachment; onShow: (a: Attachment) => vo
       )}
     </span>
   );
-}
-
-// Content-aware stage sizing: small things present as centered cards, dense
-// things take the whole stage — the overlay reshuffles itself per content.
-function panelSize(panel: { type: string; value: string }): string {
-  let kind = panel.type;
-  if (kind === "widget") {
-    try {
-      kind = "w:" + (JSON.parse(panel.value)?.kind ?? "");
-    } catch {
-      /* raw */
-    }
-  }
-  switch (kind) {
-    case "launch":
-      return "w-[min(560px,94%)] h-[400px]";
-    case "w:timer":
-      return "w-[min(500px,94%)] h-[460px]";
-    case "w:mac_action":
-      return "w-[min(620px,94%)] h-[480px]";
-    case "w:mac_setup":
-      return "w-[min(720px,96%)] h-[min(680px,92%)]";
-    case "w:weather":
-      return "w-[min(880px,80%)] h-[min(640px,90%)]";
-    case "w:market":
-      return "w-[96%] md:w-[min(880px,calc(100%-250px))] h-[min(540px,86%)]";
-    case "image":
-      return "w-[min(1100px,97%)] h-[min(760px,97%)]";
-    case "w:candles":
-    case "w:chart_loading":
-      return "w-[96%] md:w-[min(1040px,calc(100%-250px))] h-[min(680px,88%)]";
-    case "w:briefing":
-    case "w:briefing2":
-      return "w-[96%] md:w-[min(980px,calc(100%-250px))] h-[min(700px,90%)]";
-    case "w:calendar":
-    case "w:todos":
-      return "w-[96%] md:w-[min(900px,calc(100%-250px))] h-[min(680px,88%)]";
-    case "w:net_worth_loading":
-    case "w:stats":
-      return "w-[96%] h-[min(680px,92%)]";
-    case "w:videos":
-    case "w:feed":
-      return "w-[min(1340px,82%)] h-[min(740px,92%)]";
-    case "w:shop":
-      return "w-[min(1340px,82%)] h-[min(700px,92%)]";
-    case "w:webresults":
-      return "w-[min(1340px,84%)] h-[min(720px,92%)]";
-    case "w:places":
-      return "w-[min(1200px,90%)] h-[min(760px,94%)]";
-    case "w:ranking":
-      return "w-[min(1180px,88%)] h-[min(780px,94%)]";
-    case "w:calc":
-      return "w-[min(560px,94%)] h-[min(360px,80%)]";
-    case "scene":
-      return "w-[min(1440px,98%)] h-[min(820px,97%)]";
-    case "board":
-    case "canvas":
-      // Drawing stays a large working surface but deliberately leaves the
-      // right-side Jarvis lane visible instead of claiming full-bleed mode;
-      // the stage wrapper already reserves that lane, so don't subtract it a
-      // second time and accidentally crush the canvas.
-      return "w-[97%] md:w-full h-[min(820px,96%)]";
-    case "markdown":
-      return "w-[min(980px,97%)] h-full";
-    case "doc":
-      return "w-[min(880px,80%)] h-[min(800px,94%)]";
-    case "creations":
-      return "w-[96%] md:w-full md:max-w-[1200px] h-[min(780px,94%)]";
-    default:
-      return "h-full w-full";
-  }
 }
 
 function Clock() {
@@ -430,6 +370,7 @@ function ReactorRing({
   motionRef: { current: OrbMotionFrame };
   reduceMotion: boolean;
 }) {
+  const containerRef = useRef<HTMLDivElement>(null);
   const ringRef = useRef<SVGGElement>(null);
   const firstStopRef = useRef<SVGStopElement>(null);
   const middleStopRef = useRef<SVGStopElement>(null);
@@ -446,11 +387,17 @@ function ReactorRing({
   const opacity = hidden ? 0 : aside ? 0.32 : active ? 0.52 : 0.24;
   useEffect(() => {
     const ring = ringRef.current;
-    if (!ring) return;
+    const container = containerRef.current;
+    if (!ring || !container) return;
     let frame = 0;
     const paint = () => {
       const motion = motionRef.current;
       ring.style.transform = reduceMotion ? "none" : `rotate(${motion.phase}rad)`;
+      // The ring reads the orb's own eased aside value instead of running a
+      // second CSS clock. Translation, scale, colour and rotation therefore
+      // cannot lag behind or snap in a different direction.
+      container.style.transform = `translateX(${32 * motion.aside}%) translateY(-4.5%) scale(${1 - 0.22 * motion.aside})`;
+      container.style.opacity = String(hidden ? 0 : (active ? 0.52 : 0.24) * (1 - 0.38 * motion.aside));
       firstStopRef.current?.setAttribute("stop-color", motion.color);
       middleStopRef.current?.setAttribute("stop-color", motion.accent);
       lastStopRef.current?.setAttribute("stop-color", motion.color);
@@ -460,10 +407,11 @@ function ReactorRing({
     };
     paint();
     return () => cancelAnimationFrame(frame);
-  }, [motionRef, reduceMotion]);
+  }, [active, hidden, motionRef, reduceMotion]);
   return (
     <div
-      className="pointer-events-none absolute inset-0 grid place-items-center will-change-transform transition-[opacity,transform] duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
+      ref={containerRef}
+      className="pointer-events-none absolute inset-0 grid place-items-center will-change-transform"
       style={{ opacity, transform: aside ? "translateX(32%) translateY(-4.5%) scale(0.76)" : "translateY(-4.5%) scale(1)" }}
     >
       <svg viewBox="0 0 500 500" className="h-[min(82vmin,760px)] w-[min(82vmin,760px)]">
@@ -1046,12 +994,12 @@ function WidgetView({ value }: { value: string }) {
     return (
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 p-8 text-center">
         <span className="text-2xl">{"\u2726"}</span>
-        <div className="text-sm text-ice">This view just shipped &mdash; one refresh and it renders properly.</div>
-        <button onClick={() => window.location.reload()} className="mt-1 rounded-lg bg-cyan/10 px-3 py-1.5 text-xs text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/20">refresh</button>
+        <div className="text-sm text-ice">This widget is not supported by the current visual bundle.</div>
+        <div className="max-w-sm text-xs text-slate">Ask Jarvis to recreate it as a structured list or visual workspace.</div>
       </div>
     );
   }
-  return <pre className="scrollbar-thin min-h-0 flex-1 overflow-auto whitespace-pre-wrap p-4 text-sm text-ice">{value}</pre>;
+  return <PanelUnavailable label="widget" />;
 }
 
 // Scrollable full-page screenshot dressed as a browser — the "embed" that
@@ -1109,6 +1057,7 @@ function Viewport({
   full: boolean;
   onToggleFull: () => void;
 }) {
+  const route = resolvePanelRoute(panel);
   return (
     <div className="materialize frost-shell relative flex h-full flex-col overflow-hidden rounded-2xl">
       <div className="flex items-center justify-between border-b border-white/8 px-3 py-2">
@@ -1125,29 +1074,29 @@ function Viewport({
           </button>
         </span>
       </div>
-      {panel.type === "site" ? (
+      {route.renderer === "site" ? (
         <SiteView url={panel.value} />
-      ) : panel.type === "widget" ? (
+      ) : route.renderer === "widget" ? (
         <WidgetView value={panel.value} />
-      ) : panel.type === "canvas" ? (
+      ) : route.renderer === "canvas" ? (
         <CanvasView value={panel.value} />
-      ) : panel.type === "trip" ? (
+      ) : route.renderer === "trip" ? (
         <TripView value={panel.value} />
-      ) : panel.type === "doc" ? (
+      ) : route.renderer === "doc" ? (
         <DocView value={panel.value} />
-      ) : panel.type === "launch" ? (
+      ) : route.renderer === "launch" ? (
         <LaunchView value={panel.value} />
-      ) : panel.type === "pdf" ? (
+      ) : route.renderer === "pdf" ? (
         <PdfView url={panel.value} title={panel.title} />
-      ) : panel.type === "creations" ? (
+      ) : route.renderer === "creations" ? (
         <CreationsView value={panel.value} />
-      ) : panel.type === "fleet" ? (
+      ) : route.renderer === "fleet" ? (
         <FleetView value={panel.value} />
-      ) : panel.type === "board" ? (
+      ) : route.renderer === "board" ? (
         <BoardView value={panel.value} />
-      ) : panel.type === "scene" ? (
+      ) : route.renderer === "scene" ? (
         <VisualSceneView value={panel.value} />
-      ) : panel.type === "url" || panel.type === "video" ? (
+      ) : route.renderer === "iframe" ? (
         <div className="flex min-h-0 flex-1 flex-col">
           <iframe
             src={panel.value}
@@ -1156,12 +1105,14 @@ function Viewport({
             allow="autoplay; encrypted-media; picture-in-picture"
           />
         </div>
-      ) : panel.type === "image" ? (
+      ) : route.renderer === "image" ? (
         <img src={panel.value} alt={panel.title ?? ""} className="min-h-0 flex-1 object-contain" />
-      ) : panel.type === "code" ? (
+      ) : route.renderer === "code" ? (
         <pre className="scrollbar-thin min-h-0 flex-1 overflow-auto whitespace-pre p-4 font-mono text-xs leading-relaxed text-cyan/90">
           {panel.value}
         </pre>
+      ) : route.renderer === "list" ? (
+        <StructuredListView value={panel.value} />
       ) : (
         <div
           className="scrollbar-thin min-h-0 flex-1 overflow-auto p-4 text-sm leading-relaxed text-ice"
@@ -1336,8 +1287,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // the source of truth; this small optimistic layer only removes visual lag.
   const [instantPanel, setInstantPanel] = useState<StagePanel | null>(null);
   const panel = instantPanel ?? remotePanel;
-  const sayRow = useJarvisQuery(api.ui.getSay, {}) as { value: string; updatedAt: number } | null | undefined;
-  const stagePanelSize = useMemo(() => (panel ? panelSize(panel) : ""), [panel]);
+  const panelRoute = useMemo(() => (panel ? resolvePanelRoute(panel) : null), [panel]);
+  const stagePanelSize = panelRoute?.size ?? "";
   const clearPanel = (args: Record<string, unknown>) => clientMutation("ui:clearPanel", args);
   const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
   const logTurn = (args: { threadId?: string; role: string; text: string; model?: string }) =>
@@ -1360,7 +1311,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const lastHostNotificationId = useRef<string | null>(null);
   useEffect(() => {
     if (!embedded) return;
-    const latest = [...messages].reverse().find((message) => message.role === "assistant" && message.status === "done" && message.text);
+    const latest = [...messages].reverse().find((message) => message.role === "assistant" && message.delivery !== "notification" && message.status === "done" && message.text);
     if (!latest) return;
     if (lastHostNotificationId.current === null) {
       lastHostNotificationId.current = latest._id;
@@ -1378,10 +1329,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const wasSpeakingRef = useRef(false);
   const ttsQuietUntilRef = useRef(0);
   const keyboardQuietUntilRef = useRef(0);
+  const lastKeyboardActivityRef = useRef(0);
   useEffect(() => {
     speakingRef.current = speaking;
     if (wasSpeakingRef.current && !speaking) {
-      ttsQuietUntilRef.current = Math.max(ttsQuietUntilRef.current, Date.now() + 900);
+      ttsQuietUntilRef.current = Math.max(ttsQuietUntilRef.current, Date.now() + LIVE_SPEAKER_TAIL_MS);
     }
     wasSpeakingRef.current = speaking;
   }, [speaking]);
@@ -1491,6 +1443,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     queuedChars: 0,
     chain: Promise.resolve(),
   });
+  const narrationLedgerRef = useRef(new NarrationLedger());
   const captionRef = useRef<Caption>(null);
   const energyRef = useRef(0);
   const recRef = useRef<MediaRecorder | null>(null);
@@ -1562,7 +1515,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       // Physical key taps are close to the laptop microphone and can resemble
       // voiced transients to a generic VAD. DOM input gives us deterministic
       // evidence, so mute capture briefly rather than asking STT to guess.
-      keyboardQuietUntilRef.current = Math.max(keyboardQuietUntilRef.current, Date.now() + 700);
+      lastKeyboardActivityRef.current = Date.now();
+      keyboardQuietUntilRef.current = Math.max(keyboardQuietUntilRef.current, Date.now() + 1_100);
       unlock();
     };
     window.addEventListener("pointerdown", unlock, { capture: true });
@@ -1843,6 +1797,46 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
   }
 
+  async function narrateText(args: {
+    text: string;
+    claim: string;
+    captionText?: string;
+    final?: boolean;
+  }): Promise<boolean> {
+    const text = args.text.trim();
+    const final = args.final !== false;
+    const captionText = args.captionText ?? text;
+    if (!text || !narrationLedgerRef.current.claim(args.claim)) return false;
+    const finishWithoutSpeech = () => {
+      if (!final) return;
+      fadeCaption(captionText, 3_200);
+      finishOneShotVoiceTurn();
+    };
+    if (document.hidden || (liveAnywhere() && !liveRef.current) || !(await ensureVoice())) {
+      finishWithoutSpeech();
+      return false;
+    }
+    const { speak } = await import("../lib/tts");
+    await speak(
+      text,
+      (energy) => (energyRef.current = energy),
+      () => {
+        setSpeaking(true);
+        setCaption((current) => current?.who === "jarvis" && current.text.length >= captionText.length
+          ? { ...current, phase: "speaking", exiting: false }
+          : { who: "jarvis", text: captionText, phase: "speaking", exiting: false });
+      },
+      () => {
+        setSpeaking(false);
+        if (final) {
+          fadeCaption(captionText, 1_800);
+          finishOneShotVoiceTurn();
+        }
+      },
+    );
+    return true;
+  }
+
   const shownJob = activeJobs.find((j) => j._id === agentView) ?? null;
   const shownJobId = shownJob?._id ?? null;
   useEffect(() => {
@@ -1964,36 +1958,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     };
   }, []);
 
-  // Ephemeral progress lines (ui:say): voiced once, never in the transcript.
-  const lastSayAt = useRef<number>(-1);
-  useEffect(() => {
-    if (sayRow === undefined) return;
-    const at = sayRow?.updatedAt ?? 0;
-    if (lastSayAt.current === -1) {
-      lastSayAt.current = at; // mount: never replay an old line
-      return;
-    }
-    if (!sayRow?.value || at === lastSayAt.current) return;
-    lastSayAt.current = at;
-    if (Date.now() - at > 15_000) return; // stale
-    if (liveRef.current || liveAnywhere() || document.hidden) return;
-    (async () => {
-      if (!(await ensureVoice())) return;
-      const { speak } = await import("../lib/tts");
-      await speak(
-        sayRow.value,
-        (e) => (energyRef.current = e),
-        () => setSpeaking(true),
-        () => setSpeaking(false),
-      );
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sayRow]);
-
   // Speak new finalized assistant messages with the one streamed neural voice.
   const lastSpokenThread = useRef<string>("");
   useEffect(() => {
-    const latestAssistant = [...messages].reverse().find((message) => message.role === "assistant");
+    const latestAssistant = [...messages].reverse().find((message) => message.role === "assistant" && message.delivery !== "notification");
     if (latestAssistant?.status !== "streaming" || !latestAssistant.text) return;
     if (durableStartedAt.current !== null) {
       document.documentElement.dataset.jarvisFirstTokenMs = String(Math.max(0, Math.round(performance.now() - durableStartedAt.current)));
@@ -2002,7 +1970,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     showCaption({ who: "jarvis", text: latestAssistant.text, phase: "streaming" });
     if (liveRef.current && !latestAssistant.model) return;
-    if ((liveAnywhere() && !liveRef.current) || document.hidden) return;
     const stablePrefix = completeSpeechPrefix(latestAssistant.text);
     if (!stablePrefix) return;
     let streamState = streamingSpeechRef.current;
@@ -2011,31 +1978,27 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       streamingSpeechRef.current = streamState;
     }
     if (stablePrefix.length <= streamState.queuedChars) return;
-    const speechChunk = stablePrefix.slice(streamState.queuedChars).trim();
+    const from = streamState.queuedChars;
+    const speechChunk = stablePrefix.slice(from).trim();
     streamState.queuedChars = stablePrefix.length;
     if (!speechChunk) return;
     // Queue stable sentences immediately. The final-message effect only voices
     // the unqueued tail, so complex replies start audibly while Codex is still
     // generating without ever repeating the opening.
     streamState.chain = streamState.chain.then(async () => {
-      if (streamingSpeechRef.current.id !== latestAssistant._id || !(await ensureVoice())) return;
-      const { speak } = await import("../lib/tts");
-      await speak(
-        speechChunk,
-        (e) => (energyRef.current = e),
-        () => {
-          setSpeaking(true);
-          setCaption((current) => current?.who === "jarvis"
-            ? { ...current, phase: "speaking", exiting: false }
-            : { who: "jarvis", text: latestAssistant.text, phase: "speaking" });
-        },
-      );
+      if (streamingSpeechRef.current.id !== latestAssistant._id) return;
+      await narrateText({
+        text: speechChunk,
+        claim: narrationClaim(`turn:${latestAssistant._id}`, stablePrefix, from, stablePrefix.length),
+        captionText: latestAssistant.text,
+        final: false,
+      });
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
 
   useEffect(() => {
-    const last = [...messages].reverse().find((m) => m.role === "assistant" && m.status === "done" && m.text);
+    const last = [...messages].reverse().find((m) => m.role === "assistant" && m.delivery !== "notification" && m.status === "done" && m.text);
     // hopping threads must never re-voice that thread's old last reply
     if (lastSpokenThread.current !== thread) {
       lastSpokenThread.current = thread;
@@ -2056,52 +2019,27 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // Background findings never interrupt an active voice exchange. Normal
     // Codex replies do speak, then the turn-taking microphone re-arms.
     if (liveRef.current && !last.model) return;
-    // HARD RULE: while a live session exists on ANY device, nothing else may
-    // produce speech — the live voice is the only speaker in the house.
-    if (liveAnywhere() && !liveRef.current) {
-      finishOneShotVoiceTurn();
-      return;
-    }
-    if (document.hidden) {
-      finishOneShotVoiceTurn();
-      return; // background tabs stay silent — one voice, ever
-    }
     const spokenText = isToolGarbage(last.text) ? sanitizeAssistantText(last.text) : last.text;
     // Streaming and finalization use the same stable caption node. Put the
     // finished text there before voice ownership/model generation, so it never
     // vanishes during the TTS handoff or when this tab is not the speaker.
     showCaption({ who: "jarvis", text: spokenText, phase: "ready" });
     (async () => {
-      if (!(await ensureVoice())) {
-        fadeCaption(spokenText, 3200);
-        finishOneShotVoiceTurn();
-        return; // another tab/device owns the voice
-      }
       const streamed = streamingSpeechRef.current.id === last._id ? streamingSpeechRef.current : null;
       if (streamed) await streamed.chain;
-      const unsaidText = streamed ? spokenText.slice(streamed.queuedChars).trim() : spokenText;
+      const from = streamed?.queuedChars ?? 0;
+      const unsaidText = spokenText.slice(from).trim();
       if (!unsaidText) {
         setSpeaking(false);
         fadeCaption(spokenText, 1800);
         finishOneShotVoiceTurn();
         return;
       }
-      const { speak } = await import("../lib/tts");
-      await speak(
-        unsaidText,
-        (e) => (energyRef.current = e),
-        () => {
-          setSpeaking(true);
-          // the spoken words bloom under the orb for TYPED turns too, not just
-          // live voice — this is the caption overlay Daniel wasn't seeing
-          showCaption({ who: "jarvis", text: spokenText, phase: "speaking" });
-        },
-        () => {
-          setSpeaking(false);
-          fadeCaption(spokenText, 1800); // remain readable, then leave without a flash
-          finishOneShotVoiceTurn();
-        },
-      );
+      await narrateText({
+        text: unsaidText,
+        claim: narrationClaim(`turn:${last._id}`, spokenText, from, spokenText.length),
+        captionText: spokenText,
+      });
     })();
   }, [messages]);
 
@@ -2134,7 +2072,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       await fetch("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ threadId: threadRef.current, text }),
+        body: JSON.stringify({
+          threadId: threadRef.current,
+          text,
+          requestId: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        }),
       });
     } catch {
       /* Convex recovery owns a turn once the request reaches the server. */
@@ -2144,6 +2086,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }
 
   async function openFastAgentDispatch(intent: FastAgentDispatch, requestedText: string) {
+    const narrationId = `dispatch:${Date.now()}`;
     const owner = intent.agentId
       ? ({ paul: "Paul", atlas: "Atlas", iris: "Iris", maya: "Maya", sentry: "Sentry" } as const)[intent.agentId]
       : "the right specialist";
@@ -2175,25 +2118,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
       void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
       void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant-dispatch" });
-      if (document.hidden || (liveAnywhere() && !liveRef.current) || !(await ensureVoice())) {
-        fadeCaption(reply, 3200);
-        finishOneShotVoiceTurn();
-        return;
-      }
-      const { speak } = await import("../lib/tts");
-      await speak(
-        reply,
-        (energy) => (energyRef.current = energy),
-        () => {
-          setSpeaking(true);
-          showCaption({ who: "jarvis", text: reply, phase: "speaking" });
-        },
-        () => {
-          setSpeaking(false);
-          fadeCaption(reply, 1800);
-          finishOneShotVoiceTurn();
-        },
-      );
+      await narrateText({ text: reply, claim: narrationClaim(narrationId, reply), captionText: reply });
     } catch {
       showCaption({ who: "jarvis", text: "The fast handoff slipped. I’m retrying it through the durable lane now." });
       await queueDurableTurn(requestedText);
@@ -2238,25 +2163,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
       void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant" });
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
-      if (document.hidden || (liveAnywhere() && !liveRef.current) || !(await ensureVoice())) {
-        fadeCaption(reply, 3200);
-        finishOneShotVoiceTurn();
-        return;
-      }
-      const { speak } = await import("../lib/tts");
-      await speak(
-        reply,
-        (energy) => (energyRef.current = energy),
-        () => {
-          setSpeaking(true);
-          showCaption({ who: "jarvis", text: reply, phase: "speaking" });
-        },
-        () => {
-          setSpeaking(false);
-          fadeCaption(reply, 1800);
-          finishOneShotVoiceTurn();
-        },
-      );
+      await narrateText({
+        text: reply,
+        claim: narrationClaim(`chart:${request}`, reply),
+        captionText: reply,
+      });
     } catch {
       if (request !== fastChartRequest.current) return;
       setInstantPanel(null);
@@ -2309,25 +2220,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
       void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant-tool" });
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
-      if (document.hidden || (liveAnywhere() && !liveRef.current) || !(await ensureVoice())) {
-        fadeCaption(reply, 3200);
-        finishOneShotVoiceTurn();
-        return;
-      }
-      const { speak } = await import("../lib/tts");
-      await speak(
-        reply,
-        (energy) => (energyRef.current = energy),
-        () => {
-          setSpeaking(true);
-          showCaption({ who: "jarvis", text: reply, phase: "speaking" });
-        },
-        () => {
-          setSpeaking(false);
-          fadeCaption(reply, 1800);
-          finishOneShotVoiceTurn();
-        },
-      );
+      await narrateText({
+        text: reply,
+        claim: narrationClaim(`net-worth:${request}`, reply),
+        captionText: reply,
+      });
     } catch {
       if (request !== fastNetWorthRequest.current) return;
       setInstantPanel(null);
@@ -2400,25 +2297,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         .then(() => logTurn({ threadId: threadRef.current, role: "assistant", text: instant, model: "instant" }))
         .catch(() => {});
       void (async () => {
-        if (document.hidden || !(await ensureVoice())) {
-          fadeCaption(instant, 3200);
-          finishOneShotVoiceTurn();
-          return;
-        }
-        const { speak } = await import("../lib/tts");
-        await speak(
-          instant,
-          (energy) => (energyRef.current = energy),
-          () => {
-            setSpeaking(true);
-            showCaption({ who: "jarvis", text: instant, phase: "speaking" });
-          },
-          () => {
-            setSpeaking(false);
-            fadeCaption(instant, 1800);
-            finishOneShotVoiceTurn();
-          },
-        );
+        await narrateText({
+          text: instant,
+          claim: narrationClaim(`instant:${lastSent.current.ts}`, instant),
+          captionText: instant,
+        });
       })();
       return;
     }
@@ -2669,6 +2552,18 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // make the mic blink every few seconds and lets Daniel interrupt speech.
   async function freeVoiceTurn() {
     if (freeBusy.current || !freeLoop.current) return;
+    const beforeCapture = Date.now();
+    if (shouldDeferLiveCapture({
+      ttsActive: speakingRef.current || isTtsActuallySpeaking(),
+      now: beforeCapture,
+      quietUntil: ttsQuietUntilRef.current,
+      keyboardQuietUntil: keyboardQuietUntilRef.current,
+    })) {
+      // The physical stream stays open. Only the utterance recorder is held
+      // back, so Jarvis cannot transcribe his own output or a keyboard burst.
+      scheduleFreeVoiceTurn(180);
+      return;
+    }
     freeBusy.current = true;
     const sessionEpoch = liveSessionEpoch.current;
     let outcome: VoiceCaptureOutcome = "failure";
@@ -2687,6 +2582,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const t0 = Date.now();
       let vad = createLiveVadState(t0);
       let ttsWasActive = speakingRef.current || isTtsActuallySpeaking();
+      let contaminatedByOutput = false;
       const poll = setInterval(() => {
         analyser.getByteFrequencyData(buf);
         const level = buf.reduce((a, b) => a + b, 0) / buf.length;
@@ -2694,8 +2590,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         const highFrequencyLevel = spectrumBandLevel(buf, context.sampleRate, 4_500, 10_000);
         const now = Date.now();
         const ttsActive = speakingRef.current || isTtsActuallySpeaking();
+        if (ttsActive) {
+          contaminatedByOutput = true;
+          ttsQuietUntilRef.current = Math.max(ttsQuietUntilRef.current, now + LIVE_SPEAKER_TAIL_MS);
+          clearInterval(poll);
+          if (rec.state === "recording") rec.stop();
+          return;
+        }
         if (ttsWasActive && !ttsActive) {
-          ttsQuietUntilRef.current = Math.max(ttsQuietUntilRef.current, now + 900);
+          ttsQuietUntilRef.current = Math.max(ttsQuietUntilRef.current, now + LIVE_SPEAKER_TAIL_MS);
         }
         ttsWasActive = ttsActive;
         const result = advanceLiveVad(vad, {
@@ -2728,6 +2631,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       energyRef.current = 0;
       if (!freeLoop.current || sessionEpoch !== liveSessionEpoch.current) {
         outcome = "empty";
+        return;
+      }
+      if (contaminatedByOutput || lastKeyboardActivityRef.current >= t0) {
+        outcome = contaminatedByOutput ? "echo" : "empty";
         return;
       }
       const blob = new Blob(chunks, { type: mime });
@@ -2874,7 +2781,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // running. The compact work widget stays live underneath and returns when
   // the visual is folded/closed; it must never suppress boards or the library.
   const overlayUp = !!panel && !panelMin;
-  const fullBleed = overlayUp && (panelFull || panel!.type === "video" || stagePanelSize === "h-full w-full");
+  const fullBleed = overlayUp && (panelFull || !panelRoute?.keepOrbVisible);
   const compactAside = overlayUp && !fullBleed && panel!.type !== "video";
 
   return (

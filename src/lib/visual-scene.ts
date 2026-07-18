@@ -110,6 +110,7 @@ export type VisualBlock = {
   series?: VisualSeries[];
   nodes?: VisualItem[];
   edges?: VisualEdge[];
+  grid?: { x: number; y: number; w: number; h: number };
 };
 
 export type VisualScene = {
@@ -192,6 +193,7 @@ export function normalizeVisualBlock(value: unknown, index = 0): VisualBlock | n
   const kind = text(row.kind, 30);
   if (!kind || !BLOCK_KIND_SET.has(kind)) return null;
   const rawSpan = text(row.span, 16);
+  const rawGrid = row.grid && typeof row.grid === "object" ? row.grid as Record<string, unknown> : null;
   const block: VisualBlock = {
     id: text(row.id, 80) ?? `block-${index + 1}`,
     kind: kind as VisualBlockKind,
@@ -249,6 +251,14 @@ export function normalizeVisualBlock(value: unknown, index = 0): VisualBlock | n
           .filter((edge): edge is VisualEdge => !!edge)
           .slice(0, 160)
       : undefined,
+    grid: rawGrid && [rawGrid.x, rawGrid.y, rawGrid.w, rawGrid.h].every((value) => finite(value) !== undefined)
+      ? {
+          x: Math.max(0, Math.round(finite(rawGrid.x)!)),
+          y: Math.max(0, Math.round(finite(rawGrid.y)!)),
+          w: Math.max(1, Math.min(12, Math.round(finite(rawGrid.w)!))),
+          h: Math.max(2, Math.min(24, Math.round(finite(rawGrid.h)!))),
+        }
+      : undefined,
   };
   return block;
 }
@@ -285,7 +295,12 @@ export function mergeVisualScene(
   const byId = new Map(base.blocks.filter((block) => !remove.has(block.id)).map((block) => [block.id, block]));
   for (const block of incoming) {
     const previous = byId.get(block.id);
-    byId.set(block.id, previous ? normalizeVisualBlock({ ...previous, ...block }, 0) ?? block : block);
+    // Normalization deliberately includes optional keys as `undefined`.
+    // Spreading that partial over an existing block used to erase its items,
+    // live source and saved layout when Jarvis changed only the title. Merge
+    // only supplied values; `remove` remains the explicit deletion mechanism.
+    const supplied = Object.fromEntries(Object.entries(block).filter(([, value]) => value !== undefined));
+    byId.set(block.id, previous ? normalizeVisualBlock({ ...previous, ...supplied }, 0) ?? block : block);
   }
   const capability = text(input.capability, 50);
   const rawLayout = text(input.layout, 16);

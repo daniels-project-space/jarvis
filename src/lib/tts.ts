@@ -1,7 +1,7 @@
 "use client";
 
-// One speech path: streamed Microsoft neural audio through Jarvis's own London
-// edge route. Intelligence remains Codex CLI; this module only plays sound.
+// One speech engine, one queue, one voice. Kokoro runs in a Web Worker so
+// neural generation never blocks captions, the orb, or pointer interaction.
 
 type SpeechBatch = {
   generation: number;
@@ -10,101 +10,159 @@ type SpeechBatch = {
   onEnergy: (energy: number) => void;
   onStart?: () => void;
   onEnd?: () => void;
+  settled: boolean;
   resolve: () => void;
 };
 
-let generation = 0;
-let draining = false;
-let currentAudio: HTMLAudioElement | null = null;
-let stopAudioPlayback: (() => void) | null = null;
-let queue: SpeechBatch[] = [];
-let activeBatch: SpeechBatch | null = null;
-const COMMON_GREETING = "Right here, sir. What's the first thing we're sorting?";
-const ECHO_GUARD_TAIL_MS = 45_000;
-const primedAudio = new Map<string, HTMLAudioElement>();
-const reusableAudio = new WeakMap<HTMLAudioElement, string>();
-// Browsers may fetch every byte of a TTS response and still reject play() once
-// the short user-activation window has elapsed (especially inside the Project
-// Hub iframe). Prime one real, reusable media element while Daniel is actively
-// clicking/typing and use that same unlocked element if a later element is
-// refused by autoplay policy.
-const SILENT_WAV = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQQAAACAgICA";
-let unlockedAudio: HTMLAudioElement | null = null;
-let playbackUnlocked = false;
-let unlockInFlight = false;
-let lastPlaybackFailure = { signature: "", at: 0 };
+type AudioResult = { audio: Float32Array; sampleRate: number };
+type WorkerReply =
+  | { type: "ready" }
+  | { type: "progress"; progress: number | null; status: string; file: string | null }
+  | { type: "audio"; id: number; audio: ArrayBuffer; sampleRate: number }
+  | { type: "error"; id: number | null; message: string };
 
+type PendingAudio = {
+  resolve: (result: AudioResult) => void;
+  reject: (error: Error) => void;
+};
+
+const ECHO_GUARD_TAIL_MS = 45_000;
+const WORKER_TIMEOUT_MS = 30_000;
+
+let generation = 0;
+let requestId = 0;
+let worker: Worker | null = null;
+let modelReady: Promise<void> | null = null;
+let resolveModelReady: (() => void) | null = null;
+let rejectModelReady: ((error: Error) => void) | null = null;
+let audioContext: AudioContext | null = null;
+let currentSource: AudioBufferSourceNode | null = null;
+let finishCurrentPlayback: (() => void) | null = null;
+let draining = false;
+let activeBatch: SpeechBatch | null = null;
+let queue: SpeechBatch[] = [];
+const pending = new Map<number, PendingAudio>();
 type Recent = { text: string; until: number };
 let recentUtterances: Recent[] = [];
 
 const words = (text: string) =>
   text.toLowerCase().replace(/[^a-z0-9\s']/g, " ").split(/\s+/).filter((word) => word.length > 1);
 
-function setTtsStatus(status: "ready" | "buffering" | "speaking" | "idle" | "unavailable") {
-  if (typeof document !== "undefined") {
-    document.documentElement.dataset.jarvisTts = status;
-    document.documentElement.dataset.jarvisTtsEngine = "neural-ryan-stream";
-  }
-}
-
-function describeMediaError(audio: HTMLAudioElement): string {
-  const error = audio.error;
-  if (!error) return "unknown media playback failure";
-  return `media error ${error.code}${error.message ? `: ${error.message}` : ""}`;
-}
-
-function reportPlaybackFailure(reason: string) {
+function setTtsStatus(status: "loading" | "ready" | "buffering" | "speaking" | "unavailable") {
   if (typeof document === "undefined") return;
-  const clean = reason.replace(/\s+/g, " ").slice(0, 240);
-  document.documentElement.dataset.jarvisTtsFailure = clean;
-  const signature = clean.replace(/https?:\/\/\S+/g, "url").slice(0, 100);
-  const now = Date.now();
-  if (lastPlaybackFailure.signature === signature && now - lastPlaybackFailure.at < 60_000) return;
-  lastPlaybackFailure = { signature, at: now };
-  const activation = typeof navigator !== "undefined" && "userActivation" in navigator
-    ? `; user activation=${String((navigator as Navigator & { userActivation?: { hasBeenActive?: boolean } }).userActivation?.hasBeenActive)}`
-    : "";
+  document.documentElement.dataset.jarvisTts = status;
+  document.documentElement.dataset.jarvisTtsEngine = "kokoro-q8-george";
+}
+
+function reportFailure(error: unknown) {
+  const message = String(error).replace(/\s+/g, " ").slice(0, 240);
+  setTtsStatus("unavailable");
+  if (typeof document === "undefined") return;
+  document.documentElement.dataset.jarvisTtsFailure = message;
   void fetch("/api/incident", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      signature: `client:tts-playback:${signature}`,
-      message: `Jarvis generated speech but the browser could not play it: ${clean}; visibility=${document.visibilityState}${activation}`,
+      signature: "client:kokoro-tts",
+      message: `Jarvis's only speech engine failed: ${message}`,
     }),
   }).catch(() => {});
 }
 
-/** Call synchronously from a genuine pointer/key interaction. */
+function invalidateWorker(instance: Worker, error: Error) {
+  if (worker !== instance) return;
+  rejectModelReady?.(error);
+  for (const waiter of pending.values()) waiter.reject(error);
+  pending.clear();
+  resolveModelReady = null;
+  rejectModelReady = null;
+  modelReady = null;
+  worker = null;
+  try { instance.terminate(); } catch { /* already gone */ }
+}
+
+function ensureWorker(): Worker {
+  if (worker) return worker;
+  const instance = new Worker(new URL("../workers/kokoro.worker.ts", import.meta.url), { type: "module" });
+  worker = instance;
+  modelReady = new Promise<void>((resolve, reject) => {
+    resolveModelReady = resolve;
+    rejectModelReady = reject;
+  });
+  instance.onmessage = (event: MessageEvent<WorkerReply>) => {
+    const reply = event.data;
+    if (reply.type === "progress") {
+      setTtsStatus("loading");
+      if (typeof document !== "undefined" && reply.progress != null) {
+        document.documentElement.dataset.jarvisTtsProgress = String(Math.round(reply.progress));
+      }
+      return;
+    }
+    if (reply.type === "ready") {
+      resolveModelReady?.();
+      resolveModelReady = null;
+      rejectModelReady = null;
+      setTtsStatus("ready");
+      return;
+    }
+    if (reply.type === "error") {
+      const error = new Error(reply.message);
+      if (reply.id == null) {
+        invalidateWorker(instance, error);
+      } else {
+        pending.get(reply.id)?.reject(error);
+        pending.delete(reply.id);
+      }
+      return;
+    }
+    const waiter = pending.get(reply.id);
+    if (!waiter) return;
+    pending.delete(reply.id);
+    waiter.resolve({ audio: new Float32Array(reply.audio), sampleRate: reply.sampleRate });
+  };
+  instance.onerror = (event) => {
+    const error = new Error(event.message || "Kokoro worker failed");
+    invalidateWorker(instance, error);
+  };
+  setTtsStatus("loading");
+  instance.postMessage({ type: "warm" });
+  return instance;
+}
+
+function ensureAudioContext(): AudioContext {
+  if (!audioContext) {
+    const Context = window.AudioContext
+      ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!Context) throw new Error("Web Audio is unavailable in this browser");
+    audioContext = new Context({ latencyHint: "interactive" });
+  }
+  return audioContext;
+}
+
+/** Resume Web Audio synchronously from a genuine pointer/key interaction. */
 export function unlockSpeechPlayback(): void {
-  if (typeof Audio === "undefined" || playbackUnlocked || unlockInFlight) return;
-  const audio = unlockedAudio ?? new Audio(SILENT_WAV);
-  unlockedAudio = audio;
-  audio.preload = "auto";
-  if (currentAudio === audio) return;
-  unlockInFlight = true;
+  if (typeof window === "undefined") return;
   try {
-    audio.src = SILENT_WAV;
-    const attempt = audio.play();
-    void attempt.then(() => {
-      playbackUnlocked = true;
-      audio.pause();
-      try { audio.currentTime = 0; } catch { /* not seekable in this browser */ }
-    }).catch(() => {
-      // Mount-time warmup has no user gesture and is expected to fail. The
-      // pointer/key capture hook retries from a genuine interaction.
-    }).finally(() => {
-      unlockInFlight = false;
-    });
-  } catch {
-    unlockInFlight = false;
+    const context = ensureAudioContext();
+    if (context.state === "suspended") void context.resume().catch(reportFailure);
+  } catch (error) {
+    reportFailure(error);
+  }
+}
+
+export async function warm(): Promise<void> {
+  if (typeof window === "undefined" || typeof Worker === "undefined") return;
+  try {
+    ensureWorker();
+    await modelReady;
+  } catch (error) {
+    reportFailure(error);
   }
 }
 
 function trackUtterance(text: string, durationMs: number) {
   const now = Date.now();
   recentUtterances = recentUtterances.filter((row) => row.until > now);
-  // Keep the fingerprint beyond playback, a full microphone window, and STT
-  // turnaround so short Jarvis replies cannot return as delayed user turns.
   recentUtterances.push({ text, until: now + durationMs + ECHO_GUARD_TAIL_MS });
 }
 
@@ -114,68 +172,23 @@ export function isEchoOfTts(input: string): boolean {
   const inputWords = words(input);
   if (!inputWords.length) return false;
   for (const row of recentUtterances) {
-    const spokenWords = words(row.text);
-    const spoken = new Set(spokenWords);
+    const spoken = new Set(words(row.text));
     if (!spoken.size) continue;
     const matches = inputWords.filter((word) => spoken.has(word)).length;
-    // Short Whisper fragments need stricter, not weaker, echo protection. A
-    // delayed "Music" extracted from Jarvis saying "Music-house" caused a
-    // real self-answering loop in production.
     if (inputWords.length <= 2 && matches === inputWords.length) return true;
     if (matches / inputWords.length >= 0.65) return true;
   }
   return false;
 }
 
-// Return only source text whose sentence boundary is stable while tokens are
-// still arriving. This lets complex answers begin speaking before the model
-// finishes without guessing punctuation for an incomplete clause.
 export function completeSpeechPrefix(input: string): string {
   const matches = [...input.matchAll(/[.!?](?:[”"')\]]+)?(?=\s|$)|\n\s*\n/g)];
   const last = matches.at(-1);
   if (!last || last.index == null) return "";
-  const end = last.index + last[0].length;
-  const prefix = input.slice(0, end);
+  const prefix = input.slice(0, last.index + last[0].length);
   return prefix.trim().length >= 18 ? prefix : "";
 }
 
-// There is no local model to initialise. Keeping this API lets all voice entry
-// points share the same lifecycle without delaying a message after interaction.
-export async function warm(): Promise<void> {
-  setTtsStatus("ready");
-  // Do not call play() here. warm() runs on mount, outside a user gesture.
-  // Safari can leave that rejected promise pending long enough for the real
-  // pointer interaction to hit `unlockInFlight` and be discarded. The result
-  // is a perfectly generated reply whose audio is then blocked. Playback is
-  // primed only by a real pointer/key event, or after microphone capture is
-  // live (which browsers treat as an allowed media session).
-  if (typeof window !== "undefined" && !primedAudio.has(COMMON_GREETING)) {
-    const audio = makeAudio(COMMON_GREETING);
-    reusableAudio.set(audio, COMMON_GREETING);
-    primedAudio.set(COMMON_GREETING, audio);
-  }
-}
-
-export function stopSpeaking() {
-  generation++;
-  const abandoned = queue;
-  queue = [];
-  for (const batch of abandoned) batch.resolve();
-  stopAudioPlayback?.();
-  stopAudioPlayback = null;
-  currentAudio = null;
-  setTtsStatus("ready");
-  void import("./wakeword").then((module) => module.setSuppressed?.(false)).catch(() => {});
-}
-
-export function isSpeaking() {
-  return draining || Boolean(currentAudio);
-}
-
-// Models write for the eye even when the answer is destined for speech. Neural
-// voices handle ordinary punctuation well, but raw markdown, URLs and long dash
-// glyphs produce literal or oddly clipped delivery. Keep compound hyphens and
-// ISO dates intact while turning visual separators into spoken phrasing.
 export function normalizeSpeechText(input: string): string {
   let text = input.normalize("NFKC").replace(/\r\n?/g, "\n");
   text = text
@@ -185,11 +198,7 @@ export function normalizeSpeechText(input: string): string {
     .replace(/^\s*(?:[-*•▪◦]|\d+[.)])\s+/gm, "")
     .replace(/[`*]+/g, "")
     .replace(/_/g, " ")
-    .replace(/\n+/g, ". ");
-
-  // A typographic range should sound like a range. Other em/en dashes are
-  // conversational beats, so a comma gives Ryan a pause without saying “dash”.
-  text = text
+    .replace(/\n+/g, ". ")
     .replace(/(\d)\s*[–—]\s*(\d)/g, "$1 to $2")
     .replace(/\s*[–—]\s*/g, ", ")
     .replace(/\s+--?\s+/g, ", ")
@@ -204,7 +213,6 @@ export function normalizeSpeechText(input: string): string {
     .replace(/(?:\.\s*){2,}/g, ". ")
     .replace(/[ \t]{2,}/g, " ")
     .trim();
-
   if (!text) return "";
   if (/[,:;]\s*$/.test(text)) text = text.replace(/[,:;]\s*$/, ".");
   else if (!/[.!?][”"')\]]?$/.test(text)) text += ".";
@@ -215,8 +223,6 @@ export function sentences(text: string): string[] {
   const speech = normalizeSpeechText(text);
   const result: string[] = [];
   let buffer = "";
-  // Clause boundaries keep time-to-first-audio low while preserving natural
-  // phrasing. The next clause begins buffering during current playback.
   for (const part of speech.split(/(?<=[.!?;:])\s+|(?<=,)\s+(?=\S)/)) {
     buffer = buffer ? `${buffer} ${part}` : part;
     if (buffer.length >= 24) {
@@ -239,123 +245,113 @@ export function speechPauseMs(text: string): number {
 
 function speechSpeed(text: string): number {
   const tone = text.toLowerCase();
-  if (/\b(urgent|careful|risk|serious|honestly|numbers|weak plan)\b/.test(tone)) return 0.98;
-  if (/\b(sorry|rough|tired|stressed|gentle|here with you)\b/.test(tone)) return 0.95;
-  if (/\b(ha|haha|brilliant|lets go|let's go|excited|love it)\b/.test(tone)) return 1.1;
+  if (/\b(urgent|careful|risk|serious|honestly|weak plan)\b/.test(tone)) return 0.98;
+  if (/\b(sorry|rough|tired|stressed|gentle)\b/.test(tone)) return 0.96;
+  if (/\b(ha|haha|brilliant|let's go|excited|love it)\b/.test(tone)) return 1.1;
   return 1.04;
 }
 
-function energyLoop(expectedGeneration: number, onEnergy: (energy: number) => void) {
-  const startedAt = performance.now();
-  return setInterval(() => {
-    if (expectedGeneration !== generation) return;
-    const phase = (performance.now() - startedAt) / 125;
-    onEnergy(Math.min(1, 0.25 + 0.34 * Math.abs(Math.sin(phase))));
-  }, 60);
-}
-
-function makeAudio(text: string): HTMLAudioElement {
-  const params = new URLSearchParams({ text, speed: String(speechSpeed(text)) });
-  const audio = new Audio(`/api/tts?${params.toString()}`);
-  audio.preload = "auto";
-  audio.load?.();
-  return audio;
-}
-
-function prepareSegment(text: string): HTMLAudioElement {
-  const ready = primedAudio.get(text);
-  if (ready) {
-    primedAudio.delete(text);
-    return ready;
+async function synthesize(text: string, attempt = 0): Promise<AudioResult> {
+  const activeWorker = ensureWorker();
+  try {
+    await modelReady;
+    const id = ++requestId;
+    return await new Promise<AudioResult>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        pending.delete(id);
+        const error = new Error("Kokoro synthesis timed out");
+        invalidateWorker(activeWorker, error);
+        reject(error);
+      }, WORKER_TIMEOUT_MS);
+      pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timeout);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        },
+      });
+      activeWorker.postMessage({ type: "synthesize", id, text, speed: speechSpeed(text) });
+    });
+  } catch (error) {
+    // One bounded retry covers a transient worker/GPU/WASM interruption while
+    // preserving the one-engine invariant. A second failure is surfaced and
+    // never replaced with a robotic browser voice.
+    if (attempt === 0) return synthesize(text, 1);
+    throw error;
   }
-  return makeAudio(text);
 }
 
-type PlaybackResult = { played: boolean; failure?: string; source: string };
-
-function playAudio(
-  audio: HTMLAudioElement,
-  expectedGeneration: number,
-  onEnergy: (energy: number) => void,
-  onStart?: () => void,
-): Promise<PlaybackResult> {
-  const source = audio.currentSrc || audio.src;
-  if (expectedGeneration !== generation) return Promise.resolve({ played: false, source });
-  return new Promise((resolve) => {
-    currentAudio = audio;
-    let timer: ReturnType<typeof setInterval> | null = null;
+async function playPcm(result: AudioResult, expectedGeneration: number, onEnergy: (energy: number) => void) {
+  if (expectedGeneration !== generation) return false;
+  const context = ensureAudioContext();
+  if (context.state === "suspended") await context.resume();
+  const buffer = context.createBuffer(1, result.audio.length, result.sampleRate);
+  // DOM's AudioBuffer typing requires an ArrayBuffer-backed view. Worker
+  // replies are transferable, but TypeScript correctly allows their generic
+  // view to also be SharedArrayBuffer-backed, so copy into an owned channel.
+  const channel = new Float32Array(result.audio.length);
+  channel.set(result.audio);
+  buffer.copyToChannel(channel, 0);
+  const source = context.createBufferSource();
+  const analyser = context.createAnalyser();
+  analyser.fftSize = 128;
+  source.buffer = buffer;
+  source.connect(analyser);
+  analyser.connect(context.destination);
+  currentSource = source;
+  setTtsStatus("speaking");
+  return new Promise<boolean>((resolve) => {
     let settled = false;
-    const finish = (played: boolean, failure?: string) => {
+    const levels = new Uint8Array(analyser.frequencyBinCount);
+    const energyTimer = setInterval(() => {
+      analyser.getByteFrequencyData(levels);
+      const mean = levels.reduce((sum, value) => sum + value, 0) / Math.max(1, levels.length);
+      onEnergy(Math.min(1, mean / 110));
+    }, 48);
+    const finish = (played: boolean) => {
       if (settled) return;
       settled = true;
-      if (timer) clearInterval(timer);
-      if (currentAudio === audio) currentAudio = null;
-      if (stopAudioPlayback === stop) stopAudioPlayback = null;
-      const reusableText = reusableAudio.get(audio);
-      if (reusableText) {
-        try { audio.currentTime = 0; } catch { /* not seekable yet */ }
-        primedAudio.set(reusableText, audio);
-      } else {
-        audio.removeAttribute("src");
-        audio.load?.();
-      }
+      clearInterval(energyTimer);
       onEnergy(0);
-      resolve({ played, failure, source });
+      if (currentSource === source) currentSource = null;
+      if (finishCurrentPlayback === stop) finishCurrentPlayback = null;
+      source.disconnect();
+      analyser.disconnect();
+      resolve(played);
     };
-    const stop = () => {
-      audio.pause();
-      finish(false);
-    };
-    stopAudioPlayback = stop;
-    audio.onwaiting = () => setTtsStatus("buffering");
-    audio.onplay = () => {
-      if (expectedGeneration !== generation) return stop();
-      setTtsStatus("speaking");
-      onStart?.();
-      timer = energyLoop(expectedGeneration, onEnergy);
-    };
-    audio.onended = () => finish(true);
-    audio.onerror = () => finish(false, describeMediaError(audio));
-    setTtsStatus("buffering");
-    void audio.play().catch((error) => finish(false, String(error)));
+    const stop = () => finish(false);
+    finishCurrentPlayback = stop;
+    source.onended = () => finish(true);
+    source.start();
   });
 }
 
-async function playSegment(
-  audio: HTMLAudioElement,
-  expectedGeneration: number,
-  onEnergy: (energy: number) => void,
-  onStart?: () => void,
-): Promise<boolean> {
-  let started = false;
-  const start = () => {
-    if (started) return;
-    started = true;
-    onStart?.();
-  };
-  const first = await playAudio(audio, expectedGeneration, onEnergy, start);
-  if (first.played || expectedGeneration !== generation || !first.failure) return first.played;
+function settle(batch: SpeechBatch, callEnd: boolean) {
+  if (batch.settled) return;
+  batch.settled = true;
+  if (callEnd) batch.onEnd?.();
+  batch.resolve();
+}
 
-  // Autoplay rejection is per media element on Safari/iOS and embedded Chrome.
-  // Retry once on the exact element primed during Daniel's interaction.
-  const fallback = playbackUnlocked ? unlockedAudio : null;
-  if (fallback && fallback !== audio && first.source) {
-    fallback.src = first.source;
-    fallback.preload = "auto";
-    fallback.load?.();
-    const retried = await playAudio(fallback, expectedGeneration, onEnergy, start);
-    if (retried.played) {
-      if (typeof document !== "undefined") delete document.documentElement.dataset.jarvisTtsFailure;
-      return true;
-    }
-    if (expectedGeneration === generation && retried.failure) {
-      reportPlaybackFailure(`${first.failure}; unlocked retry failed: ${retried.failure}`);
-    }
-    return false;
-  }
+export function stopSpeaking() {
+  generation++;
+  const abandoned = queue;
+  queue = [];
+  for (const batch of abandoned) settle(batch, false);
+  if (activeBatch) settle(activeBatch, false);
+  try { currentSource?.stop(); } catch { /* already ended */ }
+  finishCurrentPlayback?.();
+  currentSource = null;
+  finishCurrentPlayback = null;
+  setTtsStatus(modelReady ? "ready" : "loading");
+  void import("./wakeword").then((module) => module.setSuppressed?.(false)).catch(() => {});
+}
 
-  reportPlaybackFailure(first.failure);
-  return false;
+export function isSpeaking() {
+  return Boolean(currentSource);
 }
 
 export async function speak(
@@ -371,7 +367,16 @@ export async function speak(
   }
   trackUtterance(speech, Math.min(90_000, speech.length * 70));
   const done = new Promise<void>((resolve) => {
-    queue.push({ generation, text: speech, segments: sentences(speech), onEnergy, onStart, onEnd, resolve });
+    queue.push({
+      generation,
+      text: speech,
+      segments: sentences(speech),
+      onEnergy,
+      onStart,
+      onEnd,
+      settled: false,
+      resolve,
+    });
   });
   void drainSpeechQueue();
   await done;
@@ -386,42 +391,45 @@ async function drainSpeechQueue(): Promise<void> {
       activeBatch = batch;
       void import("./wakeword").then((module) => module.setSuppressed?.(true, /jarvis/i.test(batch.text))).catch(() => {});
       let started = false;
-      let nextAudio = batch.segments.length ? prepareSegment(batch.segments[0]) : null;
-      for (let index = 0; nextAudio && index < batch.segments.length; index++) {
-        if (batch.generation !== generation) break;
-        const audio = nextAudio;
-        nextAudio = index + 1 < batch.segments.length ? prepareSegment(batch.segments[index + 1]) : null;
-        const played = await playSegment(
-          audio,
-          batch.generation,
-          batch.onEnergy,
-          started ? undefined : () => {
+      let next = batch.segments[0] ? synthesize(batch.segments[0]) : null;
+      try {
+        for (let index = 0; next && index < batch.segments.length; index++) {
+          if (batch.generation !== generation) break;
+          setTtsStatus("buffering");
+          const audio = await next;
+          if (batch.generation !== generation) break;
+          next = batch.segments[index + 1] ? synthesize(batch.segments[index + 1]) : null;
+          if (!started) {
             started = true;
             batch.onStart?.();
-          },
-        );
-        if (!played && batch.generation === generation) break;
-        const pause = speechPauseMs(batch.segments[index]);
-        if (played && pause > 0 && batch.generation === generation) {
-          await new Promise<void>((resolve) => setTimeout(resolve, pause));
+          }
+          const played = await playPcm(audio, batch.generation, batch.onEnergy);
+          if (!played || batch.generation !== generation) break;
+          const pause = speechPauseMs(batch.segments[index]);
+          if (pause) await new Promise((resolve) => setTimeout(resolve, pause));
         }
+        if (batch.generation === generation) {
+          setTtsStatus("ready");
+          settle(batch, true);
+        } else {
+          settle(batch, false);
+        }
+      } catch (error) {
+        reportFailure(error);
+        settle(batch, true);
+      } finally {
+        activeBatch = null;
       }
-      if (batch.generation === generation) {
-        batch.onEnergy(0);
-        batch.onEnd?.();
-        setTtsStatus("ready");
-      }
-      batch.resolve();
-      activeBatch = null;
     }
   } finally {
-    activeBatch = null;
     draining = false;
-    setTimeout(() => {
-      if (!draining && !activeBatch && queue.length === 0) {
-        void import("./wakeword").then((module) => module.setSuppressed?.(false)).catch(() => {});
-      }
-    }, 650);
+    if (!activeBatch && queue.length === 0) {
+      setTimeout(() => {
+        if (!currentSource) {
+          void import("./wakeword").then((module) => module.setSuppressed?.(false)).catch(() => {});
+        }
+      }, 900);
+    }
     if (queue.length) void drainSpeechQueue();
   }
 }

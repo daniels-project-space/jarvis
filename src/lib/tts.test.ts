@@ -1,42 +1,97 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { completeSpeechPrefix, isEchoOfTts, normalizeSpeechText, sentences, speak, speechPauseMs, stopSpeaking, unlockSpeechPlayback, warm } from "./tts";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  completeSpeechPrefix,
+  isEchoOfTts,
+  normalizeSpeechText,
+  sentences,
+  speak,
+  speechPauseMs,
+  stopSpeaking,
+  unlockSpeechPlayback,
+  warm,
+} from "./tts";
 
-class FakeAudio {
-  static instances: FakeAudio[] = [];
-  static rejectNewTtsElements = false;
-  onplay: (() => void) | null = null;
-  onended: (() => void) | null = null;
-  onerror: (() => void) | null = null;
-  src: string;
-  currentSrc = "";
-  currentTime = 0;
-  preload = "";
-  playCalls: string[] = [];
+class FakeWorker {
+  static instances: FakeWorker[] = [];
+  static failNextSynthesis = false;
+  static synthesisCount = 0;
+  onmessage: ((event: MessageEvent) => void) | null = null;
+  onerror: ((event: ErrorEvent) => void) | null = null;
+  syntheses: string[] = [];
 
-  constructor(src: string) {
-    this.src = src;
-    FakeAudio.instances.push(this);
+  constructor() {
+    FakeWorker.instances.push(this);
   }
 
-  async play() {
-    this.playCalls.push(this.src);
-    if (FakeAudio.rejectNewTtsElements && this !== FakeAudio.instances[0] && this.src.startsWith("/api/tts")) {
-      throw new DOMException("playback requires user activation", "NotAllowedError");
-    }
-    this.onplay?.();
+  postMessage(message: { type: string; id?: number; text?: string }) {
+    queueMicrotask(() => {
+      if (message.type === "warm") {
+        this.onmessage?.({ data: { type: "ready" } } as MessageEvent);
+      } else if (message.type === "synthesize") {
+        FakeWorker.synthesisCount += 1;
+        this.syntheses.push(message.text ?? "");
+        if (FakeWorker.failNextSynthesis) {
+          FakeWorker.failNextSynthesis = false;
+          this.onmessage?.({ data: { type: "error", id: message.id, message: "transient generation error" } } as MessageEvent);
+          return;
+        }
+        const audio = new Float32Array(2_400);
+        audio.fill(0.2);
+        this.onmessage?.({
+          data: { type: "audio", id: message.id, sampleRate: 24_000, audio: audio.buffer },
+        } as MessageEvent);
+      }
+    });
   }
 
-  pause() {}
-  removeAttribute() {}
-  load() {}
+  terminate() {}
 }
 
-describe("single neural speech queue", () => {
+class FakeSource {
+  static instances: FakeSource[] = [];
+  buffer: unknown = null;
+  onended: (() => void) | null = null;
+
+  constructor() {
+    FakeSource.instances.push(this);
+  }
+
+  connect() {}
+  disconnect() {}
+  start() {}
+  stop() { this.onended?.(); }
+}
+
+class FakeAnalyser {
+  fftSize = 128;
+  frequencyBinCount = 64;
+  connect() {}
+  disconnect() {}
+  getByteFrequencyData(levels: Uint8Array) { levels.fill(32); }
+}
+
+class FakeAudioContext {
+  state = "running";
+  destination = {};
+  resume = vi.fn(async () => { this.state = "running"; });
+  createBuffer() {
+    return { copyToChannel: vi.fn() };
+  }
+  createBufferSource() { return new FakeSource(); }
+  createAnalyser() { return new FakeAnalyser(); }
+}
+
+describe("single Kokoro speech queue", () => {
+  beforeEach(() => {
+    FakeSource.instances = [];
+    FakeWorker.failNextSynthesis = false;
+    FakeWorker.synthesisCount = 0;
+    vi.stubGlobal("Worker", FakeWorker);
+    vi.stubGlobal("window", { AudioContext: FakeAudioContext });
+  });
+
   afterEach(() => {
     stopSpeaking();
-    FakeAudio.instances = [];
-    FakeAudio.rejectNewTtsElements = false;
-    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -73,75 +128,66 @@ describe("single neural speech queue", () => {
   });
 
   it("blocks short delayed fragments of Jarvis's own speech", async () => {
-    vi.stubGlobal("window", {});
-    vi.stubGlobal("Audio", FakeAudio);
     const reply = speak("Music-house is the sensible next move.", () => {});
-    await vi.waitFor(() => expect(FakeAudio.instances).toHaveLength(1));
+    await vi.waitFor(() => expect(FakeSource.instances).toHaveLength(1));
     expect(isEchoOfTts("Music")).toBe(true);
     stopSpeaking();
     await reply;
   });
 
   it("keeps a spoken reply guarded through capture and transcription latency", async () => {
-    vi.stubGlobal("window", {});
-    vi.stubGlobal("Audio", FakeAudio);
     const startedAt = 1_000_000;
     vi.spyOn(Date, "now").mockReturnValue(startedAt);
-
     const reply = speak("Right here, sir. What's the first thing we're sorting?", () => {});
-    await vi.waitFor(() => expect(FakeAudio.instances).toHaveLength(1));
+    await vi.waitFor(() => expect(FakeSource.instances).toHaveLength(1));
     vi.spyOn(Date, "now").mockReturnValue(startedAt + 40_000);
-
     expect(isEchoOfTts("Right here sir, what's the first thing we're sorting?"))
       .toBe(true);
     stopSpeaking();
     await reply;
   });
 
-  it("does not resolve a queued reply before its audio has finished", async () => {
-    vi.stubGlobal("window", {});
-    vi.stubGlobal("Audio", FakeAudio);
-
+  it("does not resolve a queued reply before its PCM playback has finished", async () => {
     const first = speak("The first reply is playing.", () => {});
-    await vi.waitFor(() => expect(FakeAudio.instances).toHaveLength(1));
+    await vi.waitFor(() => expect(FakeSource.instances).toHaveLength(1));
     let secondFinished = false;
     const second = speak("The second reply waits its turn.", () => {}).then(() => {
       secondFinished = true;
     });
-
     await Promise.resolve();
     expect(secondFinished).toBe(false);
-    FakeAudio.instances[0].onended?.();
+    FakeSource.instances[0].onended?.();
     await first;
-    await vi.waitFor(() => expect(FakeAudio.instances).toHaveLength(2));
+    await vi.waitFor(() => expect(FakeSource.instances).toHaveLength(2));
     expect(secondFinished).toBe(false);
-    FakeAudio.instances[1].onended?.();
+    FakeSource.instances[1].onended?.();
     await second;
     expect(secondFinished).toBe(true);
   });
 
-  it("does not spend an autoplay attempt while warming outside a gesture", async () => {
-    vi.stubGlobal("window", {});
-    vi.stubGlobal("Audio", FakeAudio);
-
+  it("warms the worker without spending an audio playback attempt", async () => {
+    const sourcesBefore = FakeSource.instances.length;
     await warm();
-
-    expect(FakeAudio.instances.every((audio) => audio.playCalls.length === 0)).toBe(true);
+    expect(FakeSource.instances).toHaveLength(sourcesBefore);
   });
 
-  it("retries blocked speech on the player primed during user interaction", async () => {
-    vi.stubGlobal("window", {});
-    vi.stubGlobal("Audio", FakeAudio);
-
+  it("uses Web Audio only and never invokes a browser speech fallback", async () => {
+    const browserSpeak = vi.fn();
+    vi.stubGlobal("speechSynthesis", { speak: browserSpeak });
     unlockSpeechPlayback();
-    await vi.waitFor(() => expect(FakeAudio.instances).toHaveLength(1));
-    expect(FakeAudio.instances[0].src).toMatch(/^data:audio\/wav/);
-    FakeAudio.rejectNewTtsElements = true;
+    const reply = speak("There is exactly one voice engine.", () => {});
+    await vi.waitFor(() => expect(FakeSource.instances).toHaveLength(1));
+    expect(browserSpeak).not.toHaveBeenCalled();
+    FakeSource.instances[0].onended?.();
+    await reply;
+  });
 
-    const reply = speak("This reply must survive autoplay policy.", () => {});
-    await vi.waitFor(() => expect(FakeAudio.instances).toHaveLength(2));
-    await vi.waitFor(() => expect(FakeAudio.instances[0].playCalls.some((src) => src.startsWith("/api/tts"))).toBe(true));
-    FakeAudio.instances[0].onended?.();
+  it("retries one transient neural generation failure without changing engines", async () => {
+    FakeWorker.failNextSynthesis = true;
+    const reply = speak("Recover the same neural voice once.", () => {});
+    await vi.waitFor(() => expect(FakeSource.instances).toHaveLength(1));
+    expect(FakeWorker.synthesisCount).toBe(2);
+    FakeSource.instances[0].onended?.();
     await reply;
   });
 });

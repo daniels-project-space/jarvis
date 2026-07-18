@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   LIVE_END_SILENCE_MS,
+  LIVE_SPEAKER_TAIL_MS,
   advanceLiveVad,
   createLiveVadState,
+  shouldDeferLiveCapture,
   shouldCloseLiveUtterance,
   spectrumBandLevel,
 } from "./live-vad";
@@ -28,6 +30,13 @@ function frames(levels: number[], options: { ttsActive: boolean; quietUntil?: nu
 }
 
 describe("live full-duplex voice gate", () => {
+  it("does not begin a recorder while TTS, its tail, or keyboard input is active", () => {
+    expect(shouldDeferLiveCapture({ ttsActive: true, now: 5_000, quietUntil: 0, keyboardQuietUntil: 0 })).toBe(true);
+    expect(shouldDeferLiveCapture({ ttsActive: false, now: 5_000, quietUntil: 5_000 + LIVE_SPEAKER_TAIL_MS, keyboardQuietUntil: 0 })).toBe(true);
+    expect(shouldDeferLiveCapture({ ttsActive: false, now: 5_000, quietUntil: 0, keyboardQuietUntil: 5_500 })).toBe(true);
+    expect(shouldDeferLiveCapture({ ttsActive: false, now: 6_500, quietUntil: 6_400, keyboardQuietUntil: 6_000 })).toBe(false);
+  });
+
   it("never treats ordinary speaker leakage as user speech", () => {
     const result = frames(Array(20).fill(35), { ttsActive: true });
     expect(result.state.spoke).toBe(false);

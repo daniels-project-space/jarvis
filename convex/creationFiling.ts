@@ -24,6 +24,7 @@ const CATEGORY_BY_KIND: Record<string, string> = {
   pdf: "pdfs",
   trip: "travel plans",
   doc: "documents",
+  list: "lists",
 };
 
 const FOLDER_BY_CATEGORY: Record<string, string> = {
@@ -38,6 +39,7 @@ const FOLDER_BY_CATEGORY: Record<string, string> = {
   messages: "Writing / Messages",
   scripts: "Writing / Scripts",
   documents: "Documents / General",
+  lists: "Notes / Lists",
   "travel plans": "Travel / Plans",
 };
 

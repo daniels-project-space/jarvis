@@ -491,7 +491,7 @@ export async function runAgentHarness() {
       const healer: any = await convexMutation("incidents:claimForRepair", { limit: 2, maxAttempts: 2 });
       for (const inc of healer?.claims ?? []) {
         const repo = inc.app && inc.app !== "jarvis" ? inc.app : "jarvis";
-        await convexMutation("jobs:enqueue", {
+        const repairJobId = await convexMutation("jobs:enqueue", {
           task: repairPrompt(inc, repo),
           repo,
           model: "sol",
@@ -508,6 +508,9 @@ export async function runAgentHarness() {
           ],
           incidentId: String(inc.id),
         });
+        if (repairJobId) {
+          await convexMutation("incidents:linkJob", { id: inc.id, jobId: String(repairJobId) }).catch(() => {});
+        }
       }
       for (const esc of healer?.escalations ?? []) {
         await convexMutation("chatQueue:postAssistant", {

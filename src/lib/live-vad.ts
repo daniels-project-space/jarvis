@@ -17,7 +17,19 @@ export type LiveVadFrame = {
 };
 
 export const LIVE_END_SILENCE_MS = 1_800;
+// Do not merely ask VAD to ignore Jarvis's loudspeaker. Do not open an
+// utterance recording at all until the room has lost its acoustic tail.
+export const LIVE_SPEAKER_TAIL_MS = 1_400;
 const VOICE_START_FRAMES = 4;
+
+export function shouldDeferLiveCapture(args: {
+  ttsActive: boolean;
+  now: number;
+  quietUntil: number;
+  keyboardQuietUntil: number;
+}): boolean {
+  return args.ttsActive || args.now < Math.max(args.quietUntil, args.keyboardQuietUntil);
+}
 
 export function spectrumBandLevel(
   spectrum: ArrayLike<number>,

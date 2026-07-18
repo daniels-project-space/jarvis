@@ -8,6 +8,16 @@ import { workModelLabel } from "@/lib/work-models";
 // The richer panel views: frosted-glass calendar, live mind-map canvas,
 // app launcher, PDF viewer, creations library.
 
+export function PanelUnavailable({ label = "panel" }: { label?: string }) {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 bg-[radial-gradient(circle_at_50%_35%,rgba(0,255,136,.08),transparent_38%)] p-8 text-center">
+      <div className="grid h-12 w-12 place-items-center rounded-2xl border border-cyan/20 bg-cyan/[0.06] text-xl text-cyan">✦</div>
+      <div className="text-sm font-medium text-ice">This {label} could not be rendered safely.</div>
+      <div className="max-w-sm text-xs leading-relaxed text-slate">Close it and ask Jarvis to recreate the view. The underlying data was not shown as raw code.</div>
+    </div>
+  );
+}
+
 /* ---------------------------------- calendar ---------------------------------- */
 
 type CalEvent = { title: string; time?: string; kind: string; location?: string };
@@ -39,7 +49,7 @@ export function CalendarView({ value }: { value: string }) {
   } catch {
     /* noop */
   }
-  if (!w) return <pre className="p-4 text-sm text-ice">{value}</pre>;
+  if (!w) return <PanelUnavailable label="calendar" />;
   const glass = "rounded-xl border border-white/10 bg-white/[0.045] backdrop-blur-xl";
 
   if (w.view === "month") {
@@ -137,7 +147,7 @@ export function TodosView({ value }: { value: string }) {
     /* noop */
   }
   const [ticked, setTicked] = useState<Set<string>>(new Set());
-  if (!w) return <pre className="p-4 text-sm text-ice">{value}</pre>;
+  if (!w) return <PanelUnavailable label="to-do list" />;
   const tick = (text: string) => {
     setTicked((t) => new Set(t).add(text));
     void fetch("/api/tools", {
@@ -190,7 +200,7 @@ export function Briefing2View({ value }: { value: string }) {
     /* noop */
   }
   const [ticked, setTicked] = useState<Set<string>>(new Set());
-  if (!w) return <pre className="p-4 text-sm text-ice">{value}</pre>;
+  if (!w) return <PanelUnavailable label="briefing" />;
   const tick = (text: string) => {
     setTicked((t) => new Set(t).add(text));
     void fetch("/api/tools", {
@@ -1094,7 +1104,7 @@ export function VideoListView({ value }: { value: string }) {
     /* noop */
   }
   const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
-  if (!w) return <pre className="p-4 text-sm text-ice">{value}</pre>;
+  if (!w) return <PanelUnavailable label="video list" />;
   return (
     <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3">
       <div className="hud-label mb-2">youtube · {w.query}</div>
@@ -1483,7 +1493,7 @@ export function CanvasView({ value }: { value: string }) {
   const nodes = useMemo(() => doc?.nodes ?? [], [doc?.nodes]);
   const edges = useMemo(() => doc?.edges ?? [], [doc?.edges]);
   const { pos, W, width, height } = useMemo(() => layout(nodes, edges), [nodes, edges]);
-  if (!doc) return <pre className="p-4 text-sm text-ice">{value}</pre>;
+  if (!doc) return <PanelUnavailable label="mind map" />;
 
   const treeLinks: { from: string; to: string; label?: string }[] = [];
   const byId = new Map(nodes.map((n) => [n.id, n]));
@@ -1596,7 +1606,7 @@ export function LaunchView({ value }: { value: string }) {
       }
     }
   }, [app?.url]);
-  if (!app) return <pre className="p-4 text-sm text-ice">{value}</pre>;
+  if (!app) return <PanelUnavailable label="app launcher" />;
   return (
     <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-5 p-8 text-center">
       <div className="hud-label">launching</div>
@@ -1634,7 +1644,80 @@ export function PdfView({ url, title }: { url: string; title?: string }) {
 
 /* ---------------------------------- creations library ---------------------------------- */
 
-const KIND_ICON: Record<string, string> = { canvas: "◇", board: "✎", chart: "▥", scene: "✦", image: "▧", pdf: "▤", doc: "▱", trip: "◎" };
+export function StructuredListView({ value }: { value: string }) {
+  type Item = { id?: string; label?: string; detail?: string; status?: string; value?: string | number; icon?: string; group?: string; href?: string; checked?: boolean };
+  let doc: { title?: string; subtitle?: string; ordered?: boolean; items?: Item[] } = {};
+  let invalid = false;
+  try { doc = JSON.parse(value); } catch { invalid = true; }
+  const items = Array.isArray(doc.items) ? doc.items.slice(0, 80) : [];
+  const keyedItems = items.map((item, index) => ({ item, id: item.id ?? `item-${index}` }));
+  const initialChecked = () => new Set(keyedItems.filter(({ item }) => item.checked).map(({ id }) => id));
+  const [checked, setChecked] = useState<Set<string>>(initialChecked);
+  const [selected, setSelected] = useState<string | null>(null);
+  useEffect(() => {
+    setChecked(initialChecked());
+    setSelected(null);
+    // The stable serialized panel value is the reset boundary.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
+  if (invalid) return <PanelUnavailable label="structured list" />;
+  const groups = [...new Set(items.map((item) => item.group ?? "Overview"))];
+  return (
+    <div className="scrollbar-thin min-h-0 flex-1 overflow-auto bg-[radial-gradient(circle_at_20%_0%,rgba(0,255,136,.07),transparent_32%)] p-4 sm:p-6">
+      {(doc.title || doc.subtitle) && (
+        <header className="mb-5">
+          {doc.title && <h1 className="font-display text-xl font-semibold text-ice">{doc.title}</h1>}
+          {doc.subtitle && <p className="mt-1 max-w-2xl text-xs leading-relaxed text-slate">{doc.subtitle}</p>}
+        </header>
+      )}
+      <div className="space-y-5">
+        {groups.map((group) => (
+          <section key={group}>
+            {groups.length > 1 && <div className="hud-label mb-2 !text-cyan-dim">{group}</div>}
+            <div className="space-y-2">
+              {keyedItems.filter(({ item }) => (item.group ?? "Overview") === group).map(({ item, id }, index) => {
+                const done = checked.has(id);
+                const active = selected === id;
+                const className = `flex w-full items-start gap-3 rounded-xl border p-3 text-left transition ${active ? "border-cyan/35 bg-cyan/[0.07]" : "border-white/8 bg-white/[0.025] hover:border-white/15"}`;
+                const information = (
+                  <>
+                    <span className="min-w-0 flex-1">
+                      <span className={`block text-sm font-medium ${done ? "text-slate line-through" : "text-ice"}`}>{item.label ?? "Untitled item"}</span>
+                      {item.detail && <span className={`mt-1 block text-[11px] leading-relaxed ${active ? "text-slate" : "line-clamp-2 text-slate/80"}`}>{item.detail}</span>}
+                      {item.status && <span className="mt-2 inline-block rounded-full border border-white/10 px-2 py-0.5 text-[8px] uppercase tracking-wider text-cyan-dim">{item.status}</span>}
+                    </span>
+                    {item.value !== undefined && <span className="shrink-0 font-mono text-sm text-cyan">{item.value}</span>}
+                  </>
+                );
+                return (
+                  <div key={id} className={className}>
+                    <button
+                      type="button"
+                      onClick={() => setChecked((current) => {
+                        const next = new Set(current);
+                        if (next.has(id)) next.delete(id); else next.add(id);
+                        return next;
+                      })}
+                      className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border text-[10px] transition ${done ? "border-cyan/45 bg-cyan/15 text-cyan" : "border-white/12 text-slate"}`}
+                      aria-label={done ? "Mark not complete" : "Mark complete"}
+                    >
+                      {done ? "✓" : doc.ordered ? index + 1 : item.icon ?? "·"}
+                    </button>
+                    {item.href && /^https?:\/\//.test(item.href)
+                      ? <a href={item.href} target="_blank" rel="noreferrer" className="flex min-w-0 flex-1 items-start gap-3">{information}</a>
+                      : <button type="button" onClick={() => setSelected(active ? null : id)} className="flex min-w-0 flex-1 items-start gap-3 text-left">{information}</button>}
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+const KIND_ICON: Record<string, string> = { canvas: "◇", board: "✎", chart: "▥", scene: "✦", image: "▧", pdf: "▤", doc: "▱", trip: "◎", list: "☷" };
 
 type CreationRow = {
   _id: string;
@@ -1660,6 +1743,7 @@ export function CreationsView({ value }: { value: string }) {
   const [kind, setKind] = useState<string | null>(filter.kind);
   const [folder, setFolder] = useState<string | null>(filter.folder ?? null);
   const [search, setSearch] = useState("");
+  const [editing, setEditing] = useState<{ id: string; title: string; folder: string } | null>(null);
   const queriedRows = useJarvisQuery(api.creations.list, { limit: 100 }) as CreationRow[] | undefined;
   const rows = useMemo(() => queriedRows ?? [], [queriedRows]);
   const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
@@ -1701,11 +1785,12 @@ export function CreationsView({ value }: { value: string }) {
     else if (r.kind === "scene") void setPanel({ type: "scene", value: JSON.stringify({ creationId: r._id }), title: `visual · ${r.title}` });
     else if (r.kind === "doc") void setPanel({ type: "doc", value: JSON.stringify({ creationId: r._id }), title: `draft · ${r.title}` });
     else if (r.kind === "chart" && r.data) void setPanel({ type: "widget", value: r.data, title: r.title });
+    else if (r.kind === "list" && r.data) void setPanel({ type: "list", value: r.data, title: r.title });
     else if (r.data) void setPanel({ type: "markdown", value: r.data, title: r.title });
   };
 
   return (
-    <div className="flex min-h-0 flex-1 overflow-hidden">
+    <div className="relative flex min-h-0 flex-1 overflow-hidden">
       <aside className="hidden w-60 shrink-0 flex-col border-r border-white/7 bg-black/10 md:flex">
         <div className="border-b border-white/7 px-4 py-4">
           <div className="hud-label !text-cyan">saved work</div>
@@ -1738,7 +1823,7 @@ export function CreationsView({ value }: { value: string }) {
             <span className="hud-label shrink-0 !text-[9px]">{visible.length} item{visible.length === 1 ? "" : "s"}</span>
           </div>
           <div className="scrollbar-thin mt-2 flex gap-1.5 overflow-x-auto pb-0.5">
-            {[null, "board", "scene", "canvas", "doc", "chart", "image", "pdf", "trip"].map((k) => (
+            {[null, "board", "scene", "canvas", "list", "doc", "chart", "image", "pdf", "trip"].map((k) => (
               <button key={k ?? "all"} onClick={() => setKind(k)} className={`shrink-0 rounded-full px-2.5 py-1 text-[9px] uppercase tracking-widest transition ${kind === k ? "bg-cyan/15 text-cyan ring-1 ring-cyan/35" : "bg-white/[0.025] text-slate hover:text-ice"}`}>
                 {k === "canvas" ? "mind maps" : k === "doc" ? "writing" : k ?? "all"}
               </button>
@@ -1770,8 +1855,14 @@ export function CreationsView({ value }: { value: string }) {
                           <div className="mt-1 truncate text-[9px] uppercase tracking-[0.12em] text-slate">{r.category} · {new Date(r.updatedAt).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}</div>
                         </div>
                       </button>
-                      <div className="flex items-center justify-between border-t border-white/5 px-2.5 py-1.5">
+                      <div className="flex items-center justify-between gap-1 border-t border-white/5 px-2.5 py-1.5">
                         <button onClick={() => open(r)} className="text-[9px] uppercase tracking-wider text-cyan-dim hover:text-cyan">open / edit</button>
+                        <button
+                          onClick={() => setEditing({ id: r._id, title: r.title, folder: r.folder })}
+                          className="text-[9px] uppercase tracking-wider text-slate hover:text-cyan"
+                        >
+                          organize
+                        </button>
                         <a href={`/api/creation-download?id=${encodeURIComponent(r._id)}`} className="text-[9px] uppercase tracking-wider text-slate hover:text-cyan">download ↓</a>
                       </div>
                     </div>
@@ -1782,6 +1873,50 @@ export function CreationsView({ value }: { value: string }) {
           </div>
         </div>
       </div>
+      {editing && (
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-[#03070d]/75 p-4 backdrop-blur-sm">
+          <form
+            className="glass w-full max-w-md rounded-2xl p-5 shadow-2xl"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const next = editing;
+              void clientMutation("creations:update", {
+                id: next.id,
+                title: next.title.trim() || "Untitled",
+                folder: next.folder.trim() || "Library / General",
+              }).then(() => setEditing(null));
+            }}
+          >
+            <div className="hud-label !text-cyan">organize creation</div>
+            <label className="mt-4 block text-[10px] uppercase tracking-wider text-slate">
+              title
+              <input
+                autoFocus
+                value={editing.title}
+                onChange={(event) => setEditing({ ...editing, title: event.target.value })}
+                className="mt-1.5 w-full rounded-xl border border-white/10 bg-black/25 px-3 py-2 text-sm normal-case tracking-normal text-ice outline-none focus:border-cyan/40"
+              />
+            </label>
+            <label className="mt-3 block text-[10px] uppercase tracking-wider text-slate">
+              folder
+              <input
+                list="jarvis-creation-folders"
+                value={editing.folder}
+                onChange={(event) => setEditing({ ...editing, folder: event.target.value })}
+                placeholder="Projects / My project"
+                className="mt-1.5 w-full rounded-xl border border-white/10 bg-black/25 px-3 py-2 text-sm normal-case tracking-normal text-ice outline-none focus:border-cyan/40"
+              />
+              <datalist id="jarvis-creation-folders">
+                {folders.map(([name]) => <option key={name} value={name} />)}
+              </datalist>
+            </label>
+            <div className="mt-5 flex justify-end gap-2">
+              <button type="button" onClick={() => setEditing(null)} className="rounded-lg border border-white/10 px-3 py-2 text-xs text-slate hover:text-ice">cancel</button>
+              <button type="submit" className="rounded-lg border border-cyan/35 bg-cyan/10 px-3 py-2 text-xs text-cyan hover:bg-cyan/15">save</button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

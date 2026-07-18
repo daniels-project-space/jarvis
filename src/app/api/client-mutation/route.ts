@@ -8,6 +8,8 @@ import {
 
 const ALLOWED = new Set([
   "creations:boardSave",
+  "creations:boardLayoutSave",
+  "creations:sceneLayoutSave",
   "creations:update",
   "creations:remove",
   "push:saveSub",
@@ -22,7 +24,7 @@ const ALLOWED = new Set([
   "ui:setLiveOn",
   "ui:setMood",
   "ui:setVideoCmd",
-  "watches:cancel",
+  "watchRules:cancel",
 ]);
 
 export async function POST(req: NextRequest) {

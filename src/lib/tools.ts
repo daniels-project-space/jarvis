@@ -140,6 +140,12 @@ export const TOOL_DEFS = [
               series: { type: "array", items: { type: "object", additionalProperties: true } },
               nodes: { type: "array", items: { type: "object", additionalProperties: true } },
               edges: { type: "array", items: { type: "object", additionalProperties: true } },
+              grid: {
+                type: "object",
+                description: "Optional 12-column starting position; Daniel can rearrange it later.",
+                properties: { x: { type: "number" }, y: { type: "number" }, w: { type: "number" }, h: { type: "number" } },
+                required: ["x", "y", "w", "h"],
+              },
             },
             required: ["id", "kind"],
           },
@@ -151,16 +157,31 @@ export const TOOL_DEFS = [
   {
     name: "show",
     description:
-      "Put something on Daniel's screen while you talk: a webpage, YouTube video, image, code, or notes. Use this for ANYTHING visual or detailed instead of reading it out. For videos, set play=true when he asked to PLAY/watch it (it autoplays); videos render 16:9 and shrink to picture-in-picture when he keeps talking.",
+      "Put one thing on Daniel's screen while you talk: a webpage, YouTube video, image, code, notes, or a structured list. Use kind=list for steps, checklists, grouped choices or any response with several parallel items; never flatten those into markdown. For richer multi-module work use visual_scene. Videos render 16:9 and shrink to picture-in-picture when he keeps talking.",
     parameters: {
       type: "object",
       properties: {
-        kind: { type: "string", enum: ["url", "video", "image", "code", "markdown"] },
-        value: { type: "string", description: "url / YouTube link or ID / image url / code text / markdown text" },
+        kind: { type: "string", enum: ["url", "video", "image", "code", "markdown", "list"] },
+        value: { type: "string", description: "Required except for list: URL / YouTube link or ID / image URL / code / markdown" },
         title: { type: "string", description: "Short label shown above the panel" },
+        subtitle: { type: "string", description: "List only: one-line context" },
+        ordered: { type: "boolean", description: "List only: show step numbers" },
+        items: {
+          type: "array",
+          description: "List only: structured, individually selectable rows",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" }, label: { type: "string" }, detail: { type: "string" },
+              status: { type: "string" }, value: { type: ["string", "number"] }, icon: { type: "string" },
+              group: { type: "string" }, href: { type: "string" }, checked: { type: "boolean" },
+            },
+            required: ["label"],
+          },
+        },
         play: { type: "boolean", description: "video only: start playback immediately" },
       },
-      required: ["kind", "value"],
+      required: ["kind"],
     },
   },
   {
@@ -2969,28 +2990,20 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       const mission = String(args.mission ?? "").trim();
       if (!mission) return "Give the supervisor the outcome the mission must achieve.";
       const supplied = (Array.isArray(args.agents) ? args.agents : []).filter((a: any) => a?.task).slice(0, 6);
-      const { planManagedMission, normalizeWorkstream } = await import("../mastra/supervisor");
-      const plan: ManagedMission = supplied.length
-        ? {
-            mission,
-            rationale: "Daniel/JARVIS supplied explicit workstreams; the manager normalized owner, risk and model policy.",
-            workstreams: supplied.map((a: any) =>
-              normalizeWorkstream({
-                task: String(a.task),
-                label: a.label ? String(a.label) : undefined,
-                repo: a.repo ? String(a.repo) : undefined,
-                model: a.model ? String(a.model) : undefined,
-                agentId: a.agent_id ? String(a.agent_id) : undefined,
-                readonly: typeof a.readonly === "boolean" ? a.readonly : undefined,
-                acceptanceCriteria: Array.isArray(a.acceptance_criteria) ? a.acceptance_criteria.map(String) : undefined,
-              }),
-            ),
-            plannedBy: "deterministic" as const,
-          }
-        : await planManagedMission(mission, {
-            repo: args.repo ? String(args.repo) : undefined,
-            context: args.context ? String(args.context) : undefined,
-          });
+      const { planManagedMission } = await import("../mastra/supervisor");
+      const plan: ManagedMission = await planManagedMission(mission, {
+        repo: args.repo ? String(args.repo) : undefined,
+        context: args.context ? String(args.context) : undefined,
+        workstreams: supplied.map((a: any) => ({
+          task: String(a.task),
+          label: a.label ? String(a.label) : undefined,
+          repo: a.repo ? String(a.repo) : undefined,
+          model: a.model ? String(a.model) : undefined,
+          agentId: a.agent_id ? String(a.agent_id) : undefined,
+          readonly: typeof a.readonly === "boolean" ? a.readonly : undefined,
+          acceptanceCriteria: Array.isArray(a.acceptance_criteria) ? a.acceptance_criteria.map(String) : undefined,
+        })),
+      });
       const originThreadId = await activeThread();
       const riskOrder = { low: 0, medium: 1, high: 2, consequential: 3 } as const;
       const missionRisk = plan.workstreams.reduce(
@@ -3010,9 +3023,10 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       for (const a of plan.workstreams) {
         const suppliedAgent = supplied.find((candidate: any) => String(candidate.task) === a.task);
         const scaffold = TASK_TEMPLATES[String(suppliedAgent?.template ?? "")] ?? "";
+        const sharedContext = plan.context ? `\n\nShared mission context:\n${plan.context}` : "";
         await convexMutation("jobs:enqueue", {
           authTokenHash,
-          task: `${a.task}${scaffold}\n\nYou are ${a.agentId}, one permanent specialist on a ${plan.workstreams.length}-workstream mission: "${mission}". Own only this workstream, preserve the mission context, checkpoint useful progress, and stop only when the acceptance criteria are evidenced.`,
+          task: `${a.task}${scaffold}${sharedContext}\n\nYou are ${a.agentId}, one permanent specialist on a ${plan.workstreams.length}-workstream mission: "${mission}". Own only this workstream, preserve the mission context, checkpoint useful progress, and stop only when the acceptance criteria are evidenced.`,
           repo: a.repo ?? undefined,
           readonly: a.readonly,
           model: a.model,
@@ -3095,14 +3109,34 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
     case "show": {
       let { kind, value, title } = args as { kind?: string; value: string; title?: string };
       value = String(value ?? "").trim();
-      if (!value) return "Nothing to show — give me a url, image, code or text.";
+      if (kind === "list") {
+        const items = (Array.isArray(args.items) ? args.items : []).slice(0, 40).map((item: any, index: number) => ({
+          id: String(item?.id ?? `item-${index + 1}`).slice(0, 80),
+          label: String(item?.label ?? "").trim().slice(0, 180),
+          detail: item?.detail ? String(item.detail).slice(0, 500) : undefined,
+          status: item?.status ? String(item.status).slice(0, 60) : undefined,
+          value: typeof item?.value === "number" ? item.value : item?.value ? String(item.value).slice(0, 80) : undefined,
+          icon: item?.icon ? String(item.icon).slice(0, 8) : undefined,
+          group: item?.group ? String(item.group).slice(0, 80) : undefined,
+          href: item?.href && /^https?:\/\//.test(String(item.href)) ? String(item.href).slice(0, 1_000) : undefined,
+          checked: Boolean(item?.checked),
+        })).filter((item: any) => item.label);
+        if (!items.length) return "Nothing to show — add at least one labelled list item.";
+        title = String(title ?? "Structured list").slice(0, 120);
+        value = JSON.stringify({ title, subtitle: args.subtitle ? String(args.subtitle).slice(0, 300) : undefined, ordered: Boolean(args.ordered), items });
+        const filing = await creationFiling(args, "lists");
+        const existing: any = await convexQuery("creations:latest", { kind: "list", titleMatch: title.toLowerCase() }).catch(() => null);
+        if (existing?._id) await convexMutation("creations:update", { id: existing._id, title, data: value, ...filing });
+        else await convexMutation("creations:create", { kind: "list", title, data: value, ...filing });
+      }
+      if (!value) return "Nothing to show — give me a URL, image, code, text or list items.";
       // Models omit/confuse `kind` — infer and normalize so it always renders.
       const id = YT_ID(value);
       if (id) {
         kind = "video";
         // jsapi enabled so video_control can drive it; autoplay when he asked to play
         value = `https://www.youtube.com/embed/${id}?enablejsapi=1&rel=0${args.play ? "&autoplay=1" : ""}`;
-      } else if (!kind || !["url", "video", "image", "code", "markdown", "site"].includes(kind)) {
+      } else if (!kind || !["url", "video", "image", "code", "markdown", "site", "list"].includes(kind)) {
         kind = /\.(png|jpe?g|gif|webp|svg)(\?|$)/i.test(value) ? "image" : /^https?:\/\//i.test(value) ? "url" : "markdown";
       }
       // Real sites block iframes almost universally (headers, CSP variants, JS
@@ -3114,7 +3148,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       await convexMutation("chatQueue:postCard", {
         threadId: await activeThread(),
         type: kind,
-        value: String(value).slice(0, 4000),
+        value: kind === "list" ? String(value) : String(value).slice(0, 4000),
         title: title ? String(title) : undefined,
       }).catch(() => {});
       return "On screen now.";

@@ -18,7 +18,10 @@ export default defineSchema({
     .index("by_createdAt", ["createdAt"])
     .searchIndex("search_body", { searchField: "body", filterFields: ["kind"] }),
 
-  // Conversation history per thread (survives reloads).
+  // Storage-only archive from the pre-streaming chat transport (6 rows on the
+  // canonical deployment at retirement). No runtime function reads/writes it;
+  // chatMessages is the sole conversation source. Keep the archive until
+  // Daniel explicitly authorises historical data deletion.
   chat: defineTable({
     threadId: v.string(),
     role: v.string(), // "user" | "assistant"
@@ -35,6 +38,17 @@ export default defineSchema({
     text: v.string(),
     status: v.string(), // "pending" | "streaming" | "done" | "error"
     model: v.optional(v.string()), // Codex model/tier that answered (Luna|Terra|Sol|live)
+    // One durable turn identity crosses browser -> Vercel -> Convex -> Trigger.
+    // requestId makes client retries idempotent; parentMessageId prevents a
+    // concurrent/late assistant row from being mistaken for another turn.
+    requestId: v.optional(v.string()),
+    parentMessageId: v.optional(v.id("chatMessages")),
+    // Background work may inform Daniel, but it is never a foreground answer
+    // and therefore never owns captions, narration, or microphone turn-taking.
+    delivery: v.optional(v.union(v.literal("foreground"), v.literal("notification"))),
+    // Streaming text is an idempotent snapshot, not an append-only byte pipe.
+    // Convex rejects old revisions and all writes after finalization.
+    streamRevision: v.optional(v.number()),
     // Persistent media card: everything JARVIS shows also lands in the stream
     // so Daniel can always get back to it later.
     attachment: v.optional(
@@ -43,7 +57,8 @@ export default defineSchema({
     createdAt: v.number(),
   })
     .index("by_thread", ["threadId", "createdAt"])
-    .index("by_status", ["status", "createdAt"]),
+    .index("by_status", ["status", "createdAt"])
+    .index("by_request", ["requestId"]),
 
   chatSessions: defineTable({
     threadId: v.string(),
@@ -88,7 +103,8 @@ export default defineSchema({
 
   // Background agent jobs: the brain enqueues, Trigger executes the routed
   // subscription agent in bounded segments, and JARVIS reviews the evidence.
-  // Price watches — the cron re-prices and pings when a product drops.
+  // Storage-only archive from the retired unleased watch implementation. All
+  // rows were inactive at retirement; watchRules is the sole live system.
   watches: defineTable({
     query: v.string(),
     targetGbp: v.optional(v.number()),
@@ -428,7 +444,8 @@ export default defineSchema({
     .index("by_thread", ["threadId", "updatedAt"])
     .index("by_updatedAt", ["updatedAt"]),
 
-  // Proactive insights the insight engine generates + surfaces (chat/notification).
+  // Storage-only archive from the retired model-generated insight loop. The
+  // 50 historical rows remain untouched; attentionItems is the live queue.
   insights: defineTable({
     domain: v.string(),
     text: v.string(),

@@ -55,6 +55,17 @@ describe("visual scene contract", () => {
     vi.restoreAllMocks();
   });
 
+  it("preserves and bounds persistent draggable module geometry", () => {
+    const scene = normalizeVisualScene({
+      blocks: [{ id: "chart", kind: "line", grid: { x: -4, y: 8.4, w: 40, h: 99 } }],
+    });
+    expect(scene.blocks[0].grid).toEqual({ x: 0, y: 8, w: 12, h: 24 });
+    const updated = mergeVisualScene(scene, {
+      blocks: [{ id: "chart", kind: "line", title: "Updated live chart" }],
+    });
+    expect(updated.blocks[0].grid).toEqual({ x: 0, y: 8, w: 12, h: 24 });
+  });
+
   it("materializes allowlisted live capability bindings without fake data", () => {
     const scene = materializeCapability(
       normalizeVisualScene({ title: "Morning command", capability: "executive_brief" }),

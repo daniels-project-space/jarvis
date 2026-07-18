@@ -208,10 +208,10 @@ await test("timed reminder sets + is due-deliverable", async () => {
 await test("price watch registers", async () => {
   const r = await tool("price_watch", { query: "SMOKE TEST logitech mx master 3s", target_gbp: 50 });
   assert(/watching/i.test(r), r.slice(0, 100));
-  const list = await cv("query", "watches:list", {});
-  const mine = (list ?? []).filter((w) => w.query.includes("SMOKE TEST"));
+  const list = await cv("query", "watchRules:list", { status: "active", limit: 80 });
+  const mine = (list ?? []).filter((w) => w.label.includes("SMOKE TEST"));
   assert(mine.length >= 1, "watch not created");
-  await cv("mutation", "watches:cancel", { match: "SMOKE TEST" });
+  await cv("mutation", "watchRules:cancel", { match: "SMOKE TEST" });
 });
 
 await test("a search provider is configured", async () => {
