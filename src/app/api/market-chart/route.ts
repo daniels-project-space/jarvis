@@ -1,5 +1,6 @@
 import type { NextRequest } from "next/server";
-import { adminSessionHash, isSameOriginRequest, validateAdminSession } from "@/lib/control-session";
+import { isSameOriginRequest } from "@/lib/control-session";
+import { controlActor } from "@/lib/request-auth";
 import { chartWidget, fetchCandles, keyLevels, resolveAsset } from "@/lib/markets";
 
 export const runtime = "nodejs";
@@ -10,8 +11,7 @@ export const maxDuration = 8;
 // analyst remains available for questions that actually need reasoning.
 export async function GET(req: NextRequest) {
   if (!isSameOriginRequest(req)) return Response.json({ error: "forbidden" }, { status: 403 });
-  const auth = await adminSessionHash(req);
-  if (!(await validateAdminSession(auth))) return Response.json({ error: "unauthorized" }, { status: 401 });
+  if (!(await controlActor(req))) return Response.json({ error: "unauthorized" }, { status: 401 });
 
   const params = req.nextUrl.searchParams;
   const asset = resolveAsset(params.get("asset") ?? "");

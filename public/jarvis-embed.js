@@ -18,9 +18,9 @@
   f.title = "JARVIS";
   f.allow = "microphone; autoplay; clipboard-write; display-capture";
   f.style.cssText =
-    "position:fixed;bottom:12px;right:12px;width:min(540px,calc(100vw - 24px));height:min(760px,calc(100vh - 24px));border:0;" +
-    "border-radius:22px;z-index:2147483000;background:transparent;color-scheme:dark;" +
-    "box-shadow:0 18px 58px rgba(0,0,0,.6);transition:opacity .24s ease,transform .3s cubic-bezier(.22,1,.36,1);" +
+    "position:fixed;bottom:8px;right:8px;width:min(460px,calc(100vw - 16px));height:min(520px,calc(100vh - 16px));border:0;" +
+    "border-radius:28px;z-index:2147483000;background:transparent;color-scheme:dark;" +
+    "box-shadow:none;transition:opacity .2s ease,transform .28s cubic-bezier(.22,1,.36,1);" +
     "opacity:0;transform:translateY(14px);pointer-events:none;";
 
   function show() {
@@ -35,6 +35,7 @@
     f.style.opacity = "0";
     f.style.transform = "translateY(14px)";
     f.style.pointerEvents = "none";
+    if (f.contentWindow) f.contentWindow.postMessage({ jarvis: "host-hide" }, ORIGIN);
   }
   function flushCommands() {
     if (!ready || !f.contentWindow) return;

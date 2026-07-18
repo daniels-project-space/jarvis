@@ -12,6 +12,7 @@ import {
 } from "react";
 import { resolveConvexUrl } from "@/lib/convex-url";
 import { ViewerSessionProvider } from "@/lib/viewer-session";
+import { setViewerRequestToken } from "@/lib/viewer-request";
 
 const convex = new ConvexReactClient(resolveConvexUrl(process.env.NEXT_PUBLIC_CONVEX_URL), {
   // The viewer JWT is already fresh when this provider mounts. Reusing it lets
@@ -35,7 +36,12 @@ async function requestViewerToken(): Promise<string> {
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      const response = await fetch("/api/auth/viewer", { method: "POST", cache: "no-store" });
+      const embedded = window.location.pathname === "/embed" || window.self !== window.top;
+      const response = await fetch("/api/auth/viewer", {
+        method: "POST",
+        cache: "no-store",
+        headers: embedded ? { "x-jarvis-embed": "1" } : undefined,
+      });
       if (!response.ok) throw new ViewerTokenError(response.status);
       const payload = await response.json();
       if (typeof payload.viewerToken !== "string") throw new Error("viewer capability missing");
@@ -71,6 +77,7 @@ export default function Providers({ children }: { children: ReactNode }) {
 
   const acceptViewerToken = useCallback((token: string) => {
     viewerTokenRef.current = token;
+    setViewerRequestToken(token);
     setViewerToken((current) => (current === token ? current : token));
   }, []);
 

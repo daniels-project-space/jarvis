@@ -1,4 +1,5 @@
 "use client";
+import { viewerFetch } from "./viewer-request";
 
 // One speech engine, one queue, one voice. Kokoro runs in a Web Worker so
 // neural generation never blocks captions, the orb, or pointer interaction.
@@ -59,7 +60,7 @@ function reportFailure(error: unknown) {
   setTtsStatus("unavailable");
   if (typeof document === "undefined") return;
   document.documentElement.dataset.jarvisTtsFailure = message;
-  void fetch("/api/incident", {
+  void viewerFetch("/api/incident", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({

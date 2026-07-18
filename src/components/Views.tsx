@@ -4,6 +4,7 @@ import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
 import { workModelLabel } from "@/lib/work-models";
+import { viewerFetch } from "@/lib/viewer-request";
 
 // The richer panel views: frosted-glass calendar, live mind-map canvas,
 // app launcher, PDF viewer, creations library.
@@ -150,7 +151,7 @@ export function TodosView({ value }: { value: string }) {
   if (!w) return <PanelUnavailable label="to-do list" />;
   const tick = (text: string) => {
     setTicked((t) => new Set(t).add(text));
-    void fetch("/api/tools", {
+    void viewerFetch("/api/tools", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "todo_done", args: { match: text.slice(0, 60) } }),
@@ -203,7 +204,7 @@ export function Briefing2View({ value }: { value: string }) {
   if (!w) return <PanelUnavailable label="briefing" />;
   const tick = (text: string) => {
     setTicked((t) => new Set(t).add(text));
-    void fetch("/api/tools", {
+    void viewerFetch("/api/tools", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "todo_done", args: { match: text.slice(0, 60) } }),

@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
+import { viewerFetch } from "@/lib/viewer-request";
 import "maplibre-gl/dist/maplibre-gl.css";
 
 // The trip planner panel: a REAL dark 3D map (MapLibre globe projection on
@@ -150,7 +151,7 @@ function MapView({
 }
 
 async function tripTool(tripId: string, action: string, extra: Record<string, unknown> = {}) {
-  const response = await fetch("/api/tools", {
+  const response = await viewerFetch("/api/tools", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -165,7 +166,7 @@ async function tripTool(tripId: string, action: string, extra: Record<string, un
 }
 
 async function retryTrip(tripId: string, doc: any) {
-  const response = await fetch("/api/tools", {
+  const response = await viewerFetch("/api/tools", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({

@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { reportIncident } from "@/lib/context";
-import { adminSessionHash } from "@/lib/control-session";
+import { actorAdminHash, controlActor } from "@/lib/request-auth";
 import { TOOL_DEFS, executeTool } from "@/lib/tools";
 import { TOOL_BELTS, slimToolDefinition } from "@/lib/tool-belts";
 
@@ -28,14 +28,17 @@ export const maxDuration = 120; // market_analysis / trip scouts can run 60-90s
 
 export async function POST(req: NextRequest) {
   let toolName = "unknown";
-  const authTokenHash = (await adminSessionHash(req)) ?? undefined;
+  const actor = await controlActor(req);
+  if (!actor) return Response.json({ error: "unauthorized" }, { status: 401 });
+  const authTokenHash = actorAdminHash(actor);
   try {
     const { name, args } = await req.json();
     toolName = String(name);
     const result = await executeTool(toolName, args ?? {}, authTokenHash);
     return Response.json({ result });
-  } catch (e: any) {
-    await reportIncident("api/tools", `tool:${toolName}:${String(e?.message ?? e).slice(0, 60)}`, `Tool ${toolName} crashed: ${e?.message ?? e}`, undefined, authTokenHash);
-    return Response.json({ result: `Tool failed: ${e?.message ?? e}` }, { status: 200 });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    await reportIncident("api/tools", `tool:${toolName}:${message.slice(0, 60)}`, `Tool ${toolName} crashed: ${message}`, undefined, authTokenHash);
+    return Response.json({ result: `Tool failed: ${message}` }, { status: 200 });
   }
 }

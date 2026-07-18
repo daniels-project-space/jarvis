@@ -1,10 +1,6 @@
 import type { NextRequest } from "next/server";
-import {
-  adminSessionHash,
-  controlMutation,
-  isSameOriginRequest,
-  validateAdminSession,
-} from "@/lib/control-session";
+import { controlMutation, isSameOriginRequest } from "@/lib/control-session";
+import { controlActor, controlCredentials } from "@/lib/request-auth";
 
 const ALLOWED = new Set([
   "creations:boardSave",
@@ -31,8 +27,8 @@ export async function POST(req: NextRequest) {
   if (!isSameOriginRequest(req)) {
     return Response.json({ ok: false }, { status: 403 });
   }
-  const authTokenHash = await adminSessionHash(req);
-  if (!(await validateAdminSession(authTokenHash))) {
+  const actor = await controlActor(req);
+  if (!actor) {
     return Response.json({ ok: false }, { status: 401 });
   }
   const body = await req.json().catch(() => ({}));
@@ -41,7 +37,7 @@ export async function POST(req: NextRequest) {
     return Response.json({ ok: false }, { status: 400 });
   }
   try {
-    const value = await controlMutation(path, { ...body.args, authTokenHash });
+    const value = await controlMutation(path, { ...body.args, ...controlCredentials(actor) });
     return Response.json({ ok: true, value });
   } catch {
     return Response.json({ ok: false }, { status: 409 });

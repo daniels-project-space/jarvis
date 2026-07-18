@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server";
 import { getSecret } from "@/lib/vault";
 import { STT_PROMPT } from "@/lib/sttvocab";
 import { cleanSpeechTranscript, hasConfidentSpeechSegments, isMeaningfulSpeechTranscript } from "@/lib/transcript";
+import { controlActor } from "@/lib/request-auth";
 
 // Speech-to-text utility only: free/fast Groq Whisper. Conversation intelligence
 // remains exclusively in the authenticated Codex subscription CLI worker.
@@ -50,6 +51,7 @@ async function transcribe(url: string, key: string, form: FormData, timeoutMs: n
 }
 
 export async function POST(req: NextRequest) {
+  if (!(await controlActor(req))) return Response.json({ error: "unauthorized" }, { status: 401 });
   const inBuf = Buffer.from(await req.arrayBuffer());
   if (inBuf.length < 2000) return new Response(JSON.stringify({ text: "" }), { status: 200 });
   const mime = (req.headers.get("content-type") ?? "audio/wav").split(";")[0];

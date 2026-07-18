@@ -1,7 +1,8 @@
 "use client";
+import { viewerFetch } from "./viewer-request";
 
 export async function clientMutation<T = unknown>(path: string, args: Record<string, unknown>): Promise<T> {
-  const response = await fetch("/api/client-mutation", {
+  const response = await viewerFetch("/api/client-mutation", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ path, args }),

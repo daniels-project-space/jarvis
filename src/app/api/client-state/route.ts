@@ -1,9 +1,11 @@
 import type { NextRequest } from "next/server";
-import { adminSessionHash, controlMutation, validateAdminSession } from "@/lib/control-session";
+import { controlMutation } from "@/lib/control-session";
+import { controlActor, controlCredentials } from "@/lib/request-auth";
 
 export async function POST(req: NextRequest) {
-  const authTokenHash = await adminSessionHash(req);
-  if (!(await validateAdminSession(authTokenHash))) return Response.json({ ok: false }, { status: 401 });
+  const actor = await controlActor(req);
+  if (!actor) return Response.json({ ok: false }, { status: 401 });
+  const credentials = controlCredentials(actor);
   const body = await req.json().catch(() => ({}));
   const action = String(body?.action ?? "");
 
@@ -16,7 +18,7 @@ export async function POST(req: NextRequest) {
       role,
       text,
       model: body?.model ? String(body.model) : undefined,
-      authTokenHash,
+      ...credentials,
     });
     return Response.json({ ok: true });
   }
@@ -24,7 +26,7 @@ export async function POST(req: NextRequest) {
   if (action === "clear_thread") {
     const count = await controlMutation("chatQueue:clearThread", {
       threadId: body?.threadId ? String(body.threadId) : undefined,
-      authTokenHash,
+      ...credentials,
     });
     return Response.json({ ok: true, count });
   }
@@ -35,7 +37,7 @@ export async function POST(req: NextRequest) {
     await controlMutation("ui:setActiveThread", {
       thread,
       title: body?.title ? String(body.title).slice(0, 160) : undefined,
-      authTokenHash,
+      ...credentials,
     });
     return Response.json({ ok: true });
   }
@@ -44,7 +46,7 @@ export async function POST(req: NextRequest) {
     if (body?.provider !== "codex") {
       return Response.json({ ok: false, error: "Jarvis intelligence is Codex CLI only." }, { status: 400 });
     }
-    await controlMutation("ui:setAgentProvider", { provider: "codex", authTokenHash });
+    await controlMutation("ui:setAgentProvider", { provider: "codex", ...credentials });
     return Response.json({ ok: true });
   }
 
@@ -56,7 +58,7 @@ export async function POST(req: NextRequest) {
       lat,
       lng,
       label: body?.label ? String(body.label).slice(0, 160) : undefined,
-      authTokenHash,
+      ...credentials,
     });
     return Response.json({ ok: true });
   }

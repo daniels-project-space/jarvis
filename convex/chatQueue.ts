@@ -1,6 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { requireActor, requireAdmin, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
+import { actorAuthArgs, requireActor, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 
 const HOST_CONTEXT_BLOCK = /\s*\[JARVIS_HOST_CONTEXT\][\s\S]*?\[\/JARVIS_HOST_CONTEXT\]\s*/g;
 const visibleTurnText = (text: string) => text.replace(HOST_CONTEXT_BLOCK, " ").replace(/\s{2,}/g, " ").trim();
@@ -29,10 +29,10 @@ export const sendMessage = mutation({
     threadId: v.optional(v.string()),
     text: v.string(),
     requestId: v.optional(v.string()),
-    authTokenHash: v.optional(v.string()),
+    ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
-    await requireAdmin(ctx, a.authTokenHash);
+    await requireActor(ctx, a);
     const threadId = a.threadId ?? "main";
     if (a.requestId) {
       const prior = await ctx.db
@@ -72,6 +72,22 @@ export const listMessages = query({
       // margin for paired cards/turns without re-reading 240 documents on
       // every streamed token.
       .take(100);
+    return rows.reverse();
+  },
+});
+
+// The Project Hub renders only the orb and live captions. It needs the current
+// foreground turn, not a 100-row chat drawer, so keep that embedded realtime
+// subscription deliberately lean while retaining enough rows for overlap.
+export const listRecentMessages = query({
+  args: { threadId: v.optional(v.string()), ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    const rows = await ctx.db
+      .query("chatMessages")
+      .withIndex("by_thread", (q: any) => q.eq("threadId", a.threadId ?? "main"))
+      .order("desc")
+      .take(8);
     return rows.reverse();
   },
 });
@@ -117,10 +133,10 @@ export const logTurn = mutation({
     role: v.string(),
     text: v.string(),
     model: v.optional(v.string()),
-    authTokenHash: v.optional(v.string()),
+    ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
-    await requireAdmin(ctx, a.authTokenHash);
+    await requireActor(ctx, a);
     await ctx.db.insert("chatMessages", {
       threadId: a.threadId ?? "main",
       role: a.role,
@@ -240,9 +256,9 @@ export const releaseRunner = mutation({
 });
 
 export const runnerLease = query({
-  args: { authTokenHash: v.optional(v.string()) },
+  args: { ...actorAuthArgs },
   handler: async (ctx, a) => {
-    await requireAdmin(ctx, a.authTokenHash);
+    await requireActor(ctx, a);
     const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY)).first();
     return row ? { runnerId: row.value, updatedAt: row.updatedAt } : null;
   },
@@ -371,9 +387,9 @@ export const postCard = mutation({
 
 // Wipe a thread (fresh start after maintenance/testing).
 export const clearThread = mutation({
-  args: { threadId: v.optional(v.string()), authTokenHash: v.optional(v.string()) },
+  args: { threadId: v.optional(v.string()), ...actorAuthArgs },
   handler: async (ctx, a) => {
-    await requireAdmin(ctx, a.authTokenHash);
+    await requireActor(ctx, a);
     const rows = await ctx.db
       .query("chatMessages")
       .withIndex("by_thread", (q: any) => q.eq("threadId", a.threadId ?? "main"))

@@ -2,6 +2,8 @@ import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 import { adminSessionHash, validateAdminSession } from "@/lib/control-session";
 import { canonicalJarvisRedirect } from "@/lib/canonical-origin";
+import { bearerToken } from "@/lib/request-auth";
+import { verifyViewerToken } from "@/lib/viewer-jwt";
 
 export async function proxy(req: NextRequest) {
   const canonical = canonicalJarvisRedirect({
@@ -20,6 +22,7 @@ export async function proxy(req: NextRequest) {
     || pathname === "/api/agent-tool"
   ) return NextResponse.next();
 
+  if (await verifyViewerToken(bearerToken(req.headers.get("authorization")))) return NextResponse.next();
   const tokenHash = await adminSessionHash(req);
   if (await validateAdminSession(tokenHash)) return NextResponse.next();
   return NextResponse.json({ error: "Jarvis session required" }, { status: 401 });

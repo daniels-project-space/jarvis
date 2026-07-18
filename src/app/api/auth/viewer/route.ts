@@ -20,6 +20,20 @@ export async function POST(req: NextRequest) {
     return Response.json({ ok: false }, { status: 403 });
   }
 
+  // The Hub iframe authenticates every API call with this signed capability.
+  // Browsers that block third-party cookies could never retain jarvis_admin,
+  // so minting a fresh one-year Convex session on every embed reload only
+  // created orphan rows and delayed startup. The main app still receives the
+  // cookie for routes such as direct artifact downloads.
+  if (req.headers.get("x-jarvis-embed") === "1") {
+    const issued = await issueViewerToken().catch(() => null);
+    if (!issued) return Response.json({ ok: false }, { status: 503 });
+    return NextResponse.json(
+      { ok: true, viewerToken: issued.token, expiresAt: issued.expiresAt },
+      { headers: { "cache-control": "no-store" } },
+    );
+  }
+
   let ownerToken = req.cookies.get(ADMIN_COOKIE)?.value;
   let authTokenHash = await adminSessionHash(req);
   let ownerSession = await adminSessionStatus(authTokenHash);

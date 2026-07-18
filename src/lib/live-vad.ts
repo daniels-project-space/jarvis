@@ -16,7 +16,9 @@ export type LiveVadFrame = {
   quietUntil: number;
 };
 
-export const LIVE_END_SILENCE_MS = 1_800;
+// 1.25s preserves a deliberate mid-sentence pause (the regression suite holds
+// 1.1s open) while removing 550ms from every normal speech turn.
+export const LIVE_END_SILENCE_MS = 1_250;
 // Do not merely ask VAD to ignore Jarvis's loudspeaker. Do not open an
 // utterance recording at all until the room has lost its acoustic tail.
 export const LIVE_SPEAKER_TAIL_MS = 1_400;

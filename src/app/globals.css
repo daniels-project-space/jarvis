@@ -30,6 +30,18 @@ body {
   height: 100%;
 }
 
+/* The cross-app Hub surface is genuinely only the particle orb. Its iframe
+   must not paint Jarvis's full-page cockpit background or grid as a dark card. */
+html.jarvis-embedded-document,
+body.jarvis-embedded-document,
+body:has([data-jarvis-embed-surface]) {
+  background: transparent !important;
+}
+body.jarvis-embedded-document > .hud-grid,
+body:has([data-jarvis-embed-surface]) > .hud-grid {
+  display: none;
+}
+
 body {
   background:
     radial-gradient(1200px 800px at 70% -10%, rgba(30, 58, 110, 0.25), transparent 60%),

@@ -32,6 +32,7 @@ import { resolvePanelRoute } from "@/lib/panel-contract";
 import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
 import { needsHostContext, visibleTurnText, withHostContext, type JarvisHostContext } from "@/lib/host-context";
 import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
+import { viewerFetch } from "@/lib/viewer-request";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -557,7 +558,7 @@ function AgentLiveView({
   const control = async (action: "approve" | "decline" | "cancel") => {
     setActing(action);
     try {
-      await fetch("/api/work-control", {
+      await viewerFetch("/api/work-control", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ jobId: job._id, action }),
@@ -1243,18 +1244,27 @@ function SpokenCaption({ caption }: { caption: NonNullable<Caption> }) {
 
 export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const orbMotionRef = useRef<OrbMotionFrame>(createOrbMotionFrame());
+  useEffect(() => {
+    if (!embedded) return;
+    document.documentElement.classList.add("jarvis-embedded-document");
+    document.body.classList.add("jarvis-embedded-document");
+    return () => {
+      document.documentElement.classList.remove("jarvis-embedded-document");
+      document.body.classList.remove("jarvis-embedded-document");
+    };
+  }, [embedded]);
   const activeThreadQuery = useJarvisQuery(api.ui.getActiveThread, {});
   const activeThreadReady = activeThreadQuery !== undefined;
   const thread = (activeThreadQuery ?? "main") as string;
-  const threads = (useJarvisQuery(api.ui.getThreads, {}) ?? []) as { id: string; title: string; at: number }[];
+  const threads = (useJarvisQuery(api.ui.getThreads, embedded ? "skip" : {}) ?? []) as { id: string; title: string; at: number }[];
   const setActiveThread = (args: { thread: string; title?: string }) =>
-    fetch("/api/client-state", {
+    viewerFetch("/api/client-state", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "set_active_thread", ...args }),
     });
   const clearThread = (args: { threadId?: string }) =>
-    fetch("/api/client-state", {
+    viewerFetch("/api/client-state", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "clear_thread", ...args }),
@@ -1277,8 +1287,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     void submit(command);
   }
-  const messages = (useJarvisQuery(api.chatQueue.listMessages, { threadId: thread }) ?? []) as Msg[];
-  const remotePanel = useJarvisQuery(api.ui.getPanel, {}) as
+  const fullMessages = useJarvisQuery(api.chatQueue.listMessages, embedded ? "skip" : { threadId: thread });
+  const embeddedMessages = useJarvisQuery(api.chatQueue.listRecentMessages, embedded ? { threadId: thread } : "skip");
+  const messages = ((embedded ? embeddedMessages : fullMessages) ?? []) as Msg[];
+  const remotePanel = useJarvisQuery(api.ui.getPanel, embedded ? "skip" : {}) as
     | StagePanel
     | null
     | undefined;
@@ -1292,7 +1304,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const clearPanel = (args: Record<string, unknown>) => clientMutation("ui:clearPanel", args);
   const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
   const logTurn = (args: { threadId?: string; role: string; text: string; model?: string }) =>
-    fetch("/api/client-state", {
+    viewerFetch("/api/client-state", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "log_turn", ...args }),
@@ -1303,7 +1315,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const setLiveOn = (args: Record<string, unknown>) => clientMutation("ui:setLiveOn", args);
   const voiceRow = useJarvisQuery(api.ui.getVoice, {}) as { value: string; updatedAt: number } | null | undefined;
   const liveOnRow = useJarvisQuery(api.ui.getLiveOn, {}) as { value: string; updatedAt: number } | null | undefined;
-  const commandSnapshot = useJarvisQuery(api.commandCenter.snapshot, {}) as any;
+  const commandSnapshot = useJarvisQuery(api.commandCenter.snapshot, embedded ? "skip" : {}) as any;
   const activeJobs = useMemo(
     () => relevantActiveWork((commandSnapshot?.active ?? []) as Job[], 4),
     [commandSnapshot?.active],
@@ -1556,7 +1568,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // Location: granted once, then permanent (browser remembers the permission,
   // and we refresh the stored coords on load so "near me" works in both lanes).
   const setLocationMut = (args: { lat: number; lng: number; label?: string }) =>
-    fetch("/api/client-state", {
+    viewerFetch("/api/client-state", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "set_location", ...args }),
@@ -1599,7 +1611,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const [activeVideo, setActiveVideo] = useState<{ value: string; title?: string } | null>(null);
   const panelTypeRef = useRef<string | null>(null);
   const videoIframeRef = useRef<HTMLIFrameElement | null>(null);
-  const videoCmd = useJarvisQuery(api.ui.getVideoCmd, {}) as { value: string; updatedAt: number } | null | undefined;
+  const videoCmd = useJarvisQuery(api.ui.getVideoCmd, embedded ? "skip" : {}) as { value: string; updatedAt: number } | null | undefined;
   const lastVideoCmd = useRef(-1);
   // The brain's video remote: relay play/pause into the YouTube iframe, close kills it.
   const videoMountTs = useRef(Date.now());
@@ -1654,7 +1666,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   };
   useEffect(() => {
     if (embedded) {
-      setChatMode("full", false);
+      setChatMode("off", false);
       return;
     }
     try {
@@ -1676,15 +1688,24 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       setWake(false);
       m.chime();
       if (embedded) window.parent.postMessage({ jarvis: "wake" }, "*");
-      setChatMode("full", false);
+      setChatMode(embedded ? "off" : "full", false);
       const command = m.commandAfterWake(transcript);
-      freeLoop.current = true;
-      if (command) {
-        void ownVoice();
-        submitEntryCommand(command);
-      } else {
-        void freeVoiceTurn();
-      }
+      void (async () => {
+        // A wake activation becomes one persistent conversation session. The
+        // old one-shot path closed the device after every turn and dropped
+        // back into browser SpeechRecognition, which looked like the mic was
+        // switching itself on and off every few seconds.
+        const started = await toggleLive(true, false);
+        if (!started) return;
+        if (command) {
+          void ownVoice();
+          submitEntryCommand(command);
+          scheduleFreeVoiceTurn(120);
+        } else {
+          showCaption({ who: "you", text: "Listening…" });
+          void freeVoiceTurn();
+        }
+      })();
     });
   };
   const rearmWake = () => {
@@ -1735,7 +1756,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     const bye = () => {
       if (!liveRef.current) return;
       const body = JSON.stringify({ path: "ui:setLiveOn", args: { client: me.current, on: false } });
-      navigator.sendBeacon?.("/api/client-mutation", new Blob([body], { type: "application/json" }));
+      void viewerFetch("/api/client-mutation", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        keepalive: true,
+      }).catch(() => {});
     };
     window.addEventListener("pagehide", bye);
     return () => window.removeEventListener("pagehide", bye);
@@ -1747,11 +1773,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     const receiveHostMessage = (event: MessageEvent) => {
       if (event.source !== window.parent) return;
       const message = event.data ?? {};
-      if (message.jarvis === "host-show") setChatMode("full", false);
+      if (message.jarvis === "host-show") setChatMode("off", false);
+      if (message.jarvis === "host-hide" && liveRef.current) void toggleLive();
       if (message.jarvis === "host-command" && typeof message.text === "string") {
         const command = message.text.trim().slice(0, 4000);
         if (command) {
-          setChatMode("full", false);
+          setChatMode("off", false);
           submitEntryCommand(command);
         }
       }
@@ -1911,7 +1938,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     const report = (sig: string, msg: string) => {
       if (seen.size >= 3 || seen.has(sig)) return;
       seen.add(sig);
-      void fetch("/api/incident", {
+      void viewerFetch("/api/incident", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ signature: sig, message: msg }),
@@ -2069,7 +2096,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     setSending(true);
     showCaption({ who: "you", text: visibleText });
     try {
-      await fetch("/api/chat", {
+      const response = await viewerFetch("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -2078,9 +2105,18 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           requestId: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
         }),
       });
-    } catch {
-      /* Convex recovery owns a turn once the request reaches the server. */
-    } finally {
+      if (!response.ok) throw new Error(`conversation queue rejected (${response.status})`);
+      // The streaming-message effect owns `sending=false`. Keeping it true
+      // closes the old request/subscription gap where the orb flashed idle.
+      return;
+    } catch (error) {
+      durableStartedAt.current = null;
+      document.documentElement.dataset.jarvisConversationFailure = String(error).slice(0, 160);
+      showCaption({
+        who: "jarvis",
+        text: "I heard you, but the conversation line failed. Please say that once more.",
+        phase: "ready",
+      });
       setSending(false);
     }
   }
@@ -2095,7 +2131,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     showCaption({ who: "you", text: requestedText });
     showCaption({ who: "jarvis", text: `Assigning ${owner}…`, phase: "streaming" });
     try {
-      const response = await fetch("/api/tools", {
+      const response = await viewerFetch("/api/tools", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -2145,7 +2181,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     showCaption({ who: "you", text: requestedText });
     if (chatModeRef.current === "full") setChatMode("bar", false);
     try {
-      const response = await fetch(`/api/market-chart?asset=${encodeURIComponent(intent.asset)}&interval=${intent.interval}`, {
+      const response = await viewerFetch(`/api/market-chart?asset=${encodeURIComponent(intent.asset)}&interval=${intent.interval}`, {
         cache: "no-store",
         headers: { accept: "application/json" },
       });
@@ -2195,7 +2231,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     showCaption({ who: "you", text: requestedText });
     if (chatModeRef.current === "full") setChatMode("bar", false);
     try {
-      const response = await fetch("/api/tools", {
+      const response = await viewerFetch("/api/tools", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ name: "net_worth", args: {} }),
@@ -2397,7 +2433,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     rearmWake();
   }
 
-  async function toggleLive(forceStart = false) {
+  async function toggleLive(forceStart = false, captureImmediately = true): Promise<boolean> {
     if (!forceStart && (liveRef.current || live !== "off")) {
       freeLoop.current = false;
       cancelFreeRearm();
@@ -2407,22 +2443,47 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       setCaption(null);
       releaseLive();
       rearmWake();
-      return;
+      return false;
     }
-    if (liveRef.current) return;
-    const owned = await setLiveOn({ client: me.current, on: true }).catch(() => true);
-    if (owned === false) return;
-    void ownVoice();
-    import("../lib/tts").then((m) => m.stopSpeaking());
+    if (liveRef.current) return true;
+    // Stop the browser wake recognizer and open the persistent stream before a
+    // network round-trip. Otherwise the wake mic visibly closes while Convex
+    // elects the live owner, then opens again a moment later.
     const { stopWake } = await import("../lib/wakeword");
     stopWake();
+    setWake(false);
     freeLoop.current = true;
     liveRef.current = true;
+    setLive("connecting");
+    const microphone = ensurePersistentLiveMic().then(() => true, () => false);
+    const ownership = setLiveOn({ client: me.current, on: true }).catch(() => true);
+    const owned = await ownership;
+    if (owned === false) {
+      freeLoop.current = false;
+      liveRef.current = false;
+      setLive("off");
+      closePersistentLiveMic();
+      showCaption({ who: "jarvis", text: "Jarvis is already live on another device." });
+      rearmWake();
+      return false;
+    }
+    if (!(await microphone)) {
+      freeLoop.current = false;
+      liveRef.current = false;
+      setLive("off");
+      releaseLive();
+      showCaption({ who: "jarvis", text: "I could not open this microphone. Check its browser permission." });
+      rearmWake();
+      return false;
+    }
+    void ownVoice();
+    import("../lib/tts").then((m) => m.stopSpeaking());
     setLive("live");
     void refreshPermissions();
     if (liveBeat.current) clearInterval(liveBeat.current);
     liveBeat.current = setInterval(() => void setLiveOn({ client: me.current, on: true }).catch(() => {}), 20_000);
-    void freeVoiceTurn();
+    if (captureImmediately) void freeVoiceTurn();
+    return true;
   }
 
   useEffect(() => () => {
@@ -2493,7 +2554,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       stream.getTracks().forEach((t) => t.stop());
       const image = canvas.toDataURL("image/jpeg", 0.82);
       const q = input.trim();
-      const r = await fetch("/api/see", {
+      const r = await viewerFetch("/api/see", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ image, question: q, mode: "camera" }),
@@ -2529,7 +2590,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       stream.getTracks().forEach((t) => t.stop());
       const image = canvas.toDataURL("image/jpeg", 0.8);
       const q = input.trim();
-      const r = await fetch("/api/see", {
+      const r = await viewerFetch("/api/see", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ image, question: q }),
@@ -2581,6 +2642,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       recRef.current = rec;
       const t0 = Date.now();
       let vad = createLiveVadState(t0);
+      let listeningCaptionShown = false;
       let ttsWasActive = speakingRef.current || isTtsActuallySpeaking();
       let contaminatedByOutput = false;
       const poll = setInterval(() => {
@@ -2613,6 +2675,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         vad = result.state;
         if (result.acceptedSpeech) {
           energyRef.current = Math.min(1, level / 90);
+          if (!listeningCaptionShown) {
+            listeningCaptionShown = true;
+            showCaption({ who: "you", text: "Listening…" });
+          }
         }
         if (result.bargeIn) {
           void import("../lib/tts").then((m) => m.stopSpeaking());
@@ -2642,10 +2708,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         outcome = "silence";
         return;
       }
+      const speechClosedAt = performance.now();
+      document.documentElement.dataset.jarvisSpeechClosedMs = String(Math.round(speechClosedAt));
+      showCaption({ who: "you", text: "Processing…" });
       const controller = new AbortController();
       sttAbortRef.current?.abort();
       sttAbortRef.current = controller;
-      const r = await fetch("/api/stt", {
+      const r = await viewerFetch("/api/stt", {
         method: "POST",
         headers: { "content-type": mime },
         body: blob,
@@ -2674,6 +2743,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         return;
       }
       lastVoiceInput.current = { text: cleanedText, at: Date.now() };
+      document.documentElement.dataset.jarvisTranscriptionMs = String(Math.round(performance.now() - speechClosedAt));
+      showCaption({ who: "you", text: cleanedText });
       outcome = "speech";
       void submit(cleanedText);
     } catch (error) {
@@ -2731,7 +2802,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const blob = new Blob(chunks, { type: mime });
       if (blob.size < 2000) return;
       try {
-        const r = await fetch("/api/stt", { method: "POST", headers: { "content-type": mime }, body: blob });
+        const r = await viewerFetch("/api/stt", { method: "POST", headers: { "content-type": mime }, body: blob });
         const { text } = await r.json();
         if (isMeaningfulSpeechTranscript(text?.trim() ?? "")) {
           const { isEchoOfTts } = await import("../lib/tts");
@@ -2783,6 +2854,57 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const overlayUp = !!panel && !panelMin;
   const fullBleed = overlayUp && (panelFull || !panelRoute?.keepOrbVisible);
   const compactAside = overlayUp && !fullBleed && panel!.type !== "video";
+
+  if (embedded) {
+    return (
+      <div
+        data-jarvis-embed-surface
+        data-voice-state={orbState}
+        className="relative h-dvh w-full overflow-hidden bg-transparent"
+      >
+        <button
+          type="button"
+          onClick={() => {
+            if (liveRef.current) void toggleLive();
+            window.parent.postMessage({ jarvis: "hide" }, "*");
+          }}
+          aria-label="Close Jarvis"
+          className="absolute right-3 top-3 z-40 grid h-8 w-8 place-items-center rounded-full text-lg text-white/35 transition hover:bg-white/[0.06] hover:text-cyan"
+        >
+          ×
+        </button>
+        <div className="absolute inset-0">
+          <ReactorRing
+            active={live === "live" || orbState === "thinking" || orbState === "listening"}
+            aside={false}
+            hidden={false}
+            motionRef={orbMotionRef}
+            reduceMotion={prefs.reduceMotion}
+          />
+          <ThreeOrb
+            state={orbState}
+            energyRef={energyRef}
+            moodColor={moodColor}
+            motionRef={orbMotionRef}
+            reduceMotion={prefs.reduceMotion}
+          />
+          <button
+            type="button"
+            aria-label={live === "live" ? "Stop Jarvis live listening" : "Start Jarvis live listening"}
+            title={live === "live" ? "Tap to stop listening" : "Tap to start listening"}
+            onClick={() => void toggleLive()}
+            className="absolute inset-[20%] z-20 rounded-full bg-transparent"
+          />
+          {caption && (
+            <div className="pointer-events-none absolute inset-x-2 top-[67%] z-30 flex justify-center px-3">
+              <SpokenCaption caption={caption} />
+            </div>
+          )}
+          <span className="sr-only" aria-live="polite">Jarvis is {status}</span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-dvh flex-col overflow-hidden">

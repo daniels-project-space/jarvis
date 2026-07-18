@@ -13,7 +13,6 @@ const BASE = process.env.BASE ?? "https://jarvis-orcin-six.vercel.app";
 const CV = (process.env.CONVEX ?? "https://tangible-goose-318.convex.cloud") + "/api";
 const THREAD = "smoke";
 const DISPATCH_TOKEN = process.env.JARVIS_DISPATCH_TOKEN ?? "";
-let COOKIE = "";
 let VIEWER_TOKEN = "";
 
 async function authenticate() {
@@ -22,13 +21,11 @@ async function authenticate() {
   // the monitor report a false outage while real browsers worked correctly.
   const viewer = await fetch(`${BASE}/api/auth/viewer`, {
     method: "POST",
-    headers: { origin: BASE },
+    headers: { origin: BASE, "x-jarvis-embed": "1" },
   });
-  const setCookie = viewer.headers.get("set-cookie") ?? "";
-  COOKIE = setCookie.split(";")[0];
   const payload = await viewer.json().catch(() => ({}));
   VIEWER_TOKEN = payload.viewerToken ?? "";
-  if (!viewer.ok || !COOKIE || !VIEWER_TOKEN) {
+  if (!viewer.ok || !VIEWER_TOKEN) {
     throw new Error(`JARVIS open viewer bootstrap failed (${viewer.status})`);
   }
 }
@@ -62,7 +59,9 @@ async function cv(kind, path, args) {
   if (kind === "mutation") {
     const r = await fetch(`${BASE}/api/client-mutation`, {
       method: "POST",
-      headers: { "content-type": "application/json", cookie: COOKIE, origin: BASE },
+      // Deliberately omit the admin cookie: this is the Project Hub iframe
+      // transport, where third-party cookies may be blocked by the browser.
+      headers: { "content-type": "application/json", authorization: `Bearer ${VIEWER_TOKEN}`, origin: BASE },
       body: JSON.stringify({ path, args }),
     });
     const j = await r.json();
@@ -85,7 +84,7 @@ async function chat(text) {
   const requestId = `smoke-${crypto.randomUUID()}`;
   const r = await fetch(`${BASE}/api/chat`, {
     method: "POST",
-    headers: { "content-type": "application/json", cookie: COOKIE },
+    headers: { "content-type": "application/json", authorization: `Bearer ${VIEWER_TOKEN}` },
     body: JSON.stringify({ text, threadId: THREAD, requestId }),
     signal: AbortSignal.timeout(30_000),
   });
@@ -108,7 +107,7 @@ async function chat(text) {
 async function tool(name, args) {
   const r = await fetch(`${BASE}/api/tools`, {
     method: "POST",
-    headers: { "content-type": "application/json", cookie: COOKIE },
+    headers: { "content-type": "application/json", authorization: `Bearer ${VIEWER_TOKEN}` },
     body: JSON.stringify({ name, args }),
     signal: AbortSignal.timeout(115_000),
   });
@@ -118,6 +117,15 @@ async function tool(name, args) {
 await authenticate();
 
 // ---------------------------------------------------------------------------
+await test("Hub bearer transport works without a cookie", async () => {
+  const r = await fetch(`${BASE}/api/stt`, {
+    method: "POST",
+    headers: { "content-type": "audio/webm", authorization: `Bearer ${VIEWER_TOKEN}` },
+    body: new Uint8Array([0]),
+  });
+  assert(r.status === 200, `bearer-only STT transport returned ${r.status}`);
+});
+
 await test("chat answers, clean text", async () => {
   const j = await chat("quick smoke check — reply with one short sentence");
   assert(j.ok === true, `ok=${j.ok} ${j.error ?? ""}`);
@@ -205,7 +213,7 @@ await test("no phantom live lock", async () => {
 await test("metered realtime API route is absent", async () => {
   const r = await fetch(`${BASE}/api/realtime-token`, {
     method: "POST",
-    headers: { "content-type": "application/json", cookie: COOKIE },
+    headers: { "content-type": "application/json", authorization: `Bearer ${VIEWER_TOKEN}` },
     body: JSON.stringify({ client: "smoke" }),
   });
   assert(r.status === 404, `retired realtime route returned ${r.status}`);
@@ -230,7 +238,7 @@ await test("price watch registers", async () => {
 });
 
 await test("a search provider is configured", async () => {
-  const r = await fetch(`${BASE}/api/search-status`, { headers: { cookie: COOKIE } });
+  const r = await fetch(`${BASE}/api/search-status`, { headers: { authorization: `Bearer ${VIEWER_TOKEN}` } });
   const { provider } = await r.json();
   console.log(`      search provider: ${provider}`);
   // serper/serpapi are the keyed web providers; kelkoo/ebay are the keyless
@@ -254,7 +262,7 @@ await test("hide tool clears the panel", async () => {
 // cleanup + report
 await fetch(`${BASE}/api/client-state`, {
   method: "POST",
-  headers: { "content-type": "application/json", cookie: COOKIE },
+  headers: { "content-type": "application/json", authorization: `Bearer ${VIEWER_TOKEN}` },
   body: JSON.stringify({ action: "clear_thread", threadId: THREAD }),
 }).catch(() => {});
 await cv("mutation", "ui:clearPanel", {}).catch(() => {});

@@ -1,8 +1,7 @@
 import type { NextRequest } from "next/server";
 import { tasks } from "@trigger.dev/sdk/v3";
 import { convexMutation, convexQuery, reportIncident } from "@/lib/context";
-import { adminSessionHash, validateAdminSession } from "@/lib/control-session";
-import { withAdminSession } from "@/lib/control-context";
+import { actorAdminHash, controlActor, controlCredentials, type ControlActor } from "@/lib/request-auth";
 
 // Conversation transport only. The durable answer is produced by a trusted
 // Trigger worker running Codex with Daniel's subscription; neither the browser
@@ -11,7 +10,7 @@ import { withAdminSession } from "@/lib/control-context";
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
-async function handlePost(req: NextRequest, authTokenHash: string) {
+async function handlePost(req: NextRequest, actor: ControlActor) {
   let text = "";
   let threadId = "main";
   let requestId = "";
@@ -25,13 +24,14 @@ async function handlePost(req: NextRequest, authTokenHash: string) {
   }
   if (!text) return Response.json({ error: "empty" }, { status: 400 });
 
+  const credentials = controlCredentials(actor);
   const messageId = await convexMutation("chatQueue:sendMessage", {
     threadId,
     text: text.slice(0, 12_000),
     requestId: requestId || undefined,
-    authTokenHash,
+    ...credentials,
   });
-  const lease = await convexQuery("chatQueue:runnerLease", { authTokenHash }).catch(() => null) as { updatedAt?: number } | null;
+  const lease = await convexQuery("chatQueue:runnerLease", credentials).catch(() => null) as { updatedAt?: number } | null;
   const warm = Boolean(lease?.updatedAt && Date.now() - lease.updatedAt < 25_000);
   const handle = warm ? null : await tasks
     .trigger(
@@ -45,7 +45,7 @@ async function handlePost(req: NextRequest, authTokenHash: string) {
         `chat-trigger:${String(messageId)}`,
         `Immediate subscription wake-up failed; durable recovery remains queued: ${String(error).slice(0, 300)}`,
         undefined,
-        authTokenHash,
+        actorAdminHash(actor),
       );
       return null;
     });
@@ -59,9 +59,16 @@ async function handlePost(req: NextRequest, authTokenHash: string) {
 }
 
 export async function POST(req: NextRequest) {
-  const authTokenHash = await adminSessionHash(req);
-  if (!authTokenHash || !(await validateAdminSession(authTokenHash))) {
+  const actor = await controlActor(req);
+  if (!actor) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
-  return withAdminSession(authTokenHash, () => handlePost(req, authTokenHash));
+  try {
+    return await handlePost(req, actor);
+  } catch (error) {
+    if (/worker capability is unavailable/i.test(String(error))) {
+      return Response.json({ error: "conversation transport unavailable" }, { status: 503 });
+    }
+    throw error;
+  }
 }
