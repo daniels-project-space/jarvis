@@ -1250,6 +1250,13 @@ export default function JarvisUI() {
   const liveRef = useRef(false);
   const me = useRef("");
   const voiceRef = useRef<{ value: string; updatedAt: number } | null>(null);
+  const ownVoice = () => {
+    // A direct interaction is authoritative locally. Waiting for the Convex
+    // subscription to echo this claim back added ~650 ms before buffered
+    // audio could start.
+    voiceRef.current = { value: me.current, updatedAt: Date.now() };
+    return claimVoice({ client: me.current });
+  };
   const lastSent = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
   const durableStartedAt = useRef<number | null>(null);
   const [wake, setWake] = useState(false);
@@ -1919,7 +1926,7 @@ export default function JarvisUI() {
     if (t === lastSent.current.text && Date.now() - lastSent.current.ts < 2500) return;
     lastSent.current = { text: t, ts: Date.now() };
     updateConversationMood(t);
-    void claimVoice({ client: me.current });
+    void ownVoice();
     // A new request is an immediate barge-in. Cancel queued/playback state
     // before doing anything else; worker inference may finish in the
     // background, but its stale result is discarded by the generation gate.
@@ -2005,7 +2012,7 @@ export default function JarvisUI() {
     if (liveRef.current) return;
     const owned = await setLiveOn({ client: me.current, on: true }).catch(() => true);
     if (owned === false) return;
-    void claimVoice({ client: me.current });
+    void ownVoice();
     import("../lib/tts").then((m) => m.stopSpeaking());
     const { stopWake } = await import("../lib/wakeword");
     stopWake();
@@ -2144,7 +2151,7 @@ export default function JarvisUI() {
     freeBusy.current = true;
     try {
       import("../lib/tts").then((m) => m.stopSpeaking());
-      void claimVoice({ client: me.current });
+      void ownVoice();
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
@@ -2221,7 +2228,7 @@ export default function JarvisUI() {
     // recording can't capture his voice as input
     import("../lib/tts").then((m) => m.stopSpeaking());
     setSpeaking(false);
-    void claimVoice({ client: me.current });
+    void ownVoice();
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
