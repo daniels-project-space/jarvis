@@ -89,6 +89,13 @@ export default function CommandDeck({ busy, snapshot, selectedJobId, onSelectJob
     return () => clearTimeout(timer);
   }, [shouldShow]);
 
+  // The expanded work picker and the selected worker terminal occupy the same
+  // top-left visual lane. Collapse as the terminal opens so the picker never
+  // covers its heading, task, or controls; Daniel can deliberately reopen it.
+  useEffect(() => {
+    if (selectedJobId) setCollapsed(true);
+  }, [selectedJobId]);
+
   const decideJob = async (jobId: string, decision: "approved" | "declined") => {
     setActing(`${jobId}:${decision}`);
     try {
