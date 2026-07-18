@@ -13,7 +13,7 @@ import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversa
 import { instantSocialReply } from "@/lib/quick-replies";
 import { isPanelFollowUp } from "@/lib/panel-relevance";
 import { nextVoiceLoopAction, type VoiceCaptureOutcome } from "@/lib/voice-loop";
-import { advanceLiveVad, createLiveVadState } from "@/lib/live-vad";
+import { advanceLiveVad, createLiveVadState, shouldCloseLiveUtterance, spectrumBandLevel } from "@/lib/live-vad";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, MarketChartLoading, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
 import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
 import { parseTerminalOutput, type TerminalTone } from "@/lib/terminal-output";
@@ -2467,6 +2467,8 @@ export default function JarvisUI() {
       const poll = setInterval(() => {
         analyser.getByteFrequencyData(buf);
         const level = buf.reduce((a, b) => a + b, 0) / buf.length;
+        const voiceLevel = spectrumBandLevel(buf, context.sampleRate, 90, 3_800);
+        const highFrequencyLevel = spectrumBandLevel(buf, context.sampleRate, 4_500, 10_000);
         const now = Date.now();
         const ttsActive = speakingRef.current || isTtsActuallySpeaking();
         if (ttsWasActive && !ttsActive) {
@@ -2475,6 +2477,8 @@ export default function JarvisUI() {
         ttsWasActive = ttsActive;
         const result = advanceLiveVad(vad, {
           level,
+          voiceLevel,
+          highFrequencyLevel,
           now,
           startedAt: t0,
           ttsActive,
@@ -2488,7 +2492,7 @@ export default function JarvisUI() {
           void import("../lib/tts").then((m) => m.stopSpeaking());
           setSpeaking(false);
         }
-        if ((vad.spoke && now - vad.lastVoice > 1100) || (!vad.spoke && now - t0 > 8000) || now - t0 > 25_000) {
+        if (shouldCloseLiveUtterance(vad, now) || (!vad.spoke && now - t0 > 8000) || now - t0 > 25_000) {
           clearInterval(poll);
           if (rec.state === "recording") rec.stop();
         }

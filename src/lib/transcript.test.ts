@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cleanSpeechTranscript, isMeaningfulSpeechTranscript, isRecentVoiceDuplicate } from "./transcript";
+import { cleanSpeechTranscript, hasConfidentSpeechSegments, isMeaningfulSpeechTranscript, isRecentVoiceDuplicate } from "./transcript";
 
 describe("cleanSpeechTranscript", () => {
   it("collapses the exact repeated live utterance seen in production", () => {
@@ -25,6 +25,13 @@ describe("cleanSpeechTranscript", () => {
     expect(isMeaningfulSpeechTranscript(".")).toBe(false);
     expect(isMeaningfulSpeechTranscript(" … — ")).toBe(false);
     expect(isMeaningfulSpeechTranscript("Music")).toBe(true);
+  });
+
+  it("rejects non-speech and low-confidence transcription segments", () => {
+    expect(hasConfidentSpeechSegments([{ start: 0, end: 1.2, avg_logprob: -0.2, no_speech_prob: 0.04 }])).toBe(true);
+    expect(hasConfidentSpeechSegments([{ start: 0, end: 1.2, avg_logprob: -0.2, no_speech_prob: 0.82 }])).toBe(false);
+    expect(hasConfidentSpeechSegments([{ start: 0, end: 1.2, avg_logprob: -1.1, no_speech_prob: 0.1 }])).toBe(false);
+    expect(hasConfidentSpeechSegments([])).toBe(false);
   });
 
   it("holds short repeated voice fragments long enough to break an echo loop", () => {

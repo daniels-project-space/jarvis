@@ -28,6 +28,29 @@ export function isMeaningfulSpeechTranscript(input: string): boolean {
   return /[\p{L}\p{N}]/u.test(text);
 }
 
+export type SpeechSegmentEvidence = {
+  start?: number;
+  end?: number;
+  avg_logprob?: number;
+  no_speech_prob?: number;
+};
+
+export function hasConfidentSpeechSegments(input: unknown): boolean {
+  if (!Array.isArray(input)) return true;
+  if (!input.length) return false;
+  return input.some((value) => {
+    if (!value || typeof value !== "object") return false;
+    const segment = value as SpeechSegmentEvidence;
+    const noSpeech = Number(segment.no_speech_prob);
+    const logProbability = Number(segment.avg_logprob);
+    const duration = Number(segment.end) - Number(segment.start);
+    if (Number.isFinite(noSpeech) && noSpeech >= 0.6) return false;
+    if (Number.isFinite(logProbability) && logProbability <= -0.8) return false;
+    if (Number.isFinite(duration) && duration < 0.16) return false;
+    return true;
+  });
+}
+
 export function isRecentVoiceDuplicate(
   input: string,
   previous: { text: string; at: number } | null,

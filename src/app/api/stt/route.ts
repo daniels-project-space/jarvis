@@ -1,7 +1,7 @@
 import type { NextRequest } from "next/server";
 import { getSecret } from "@/lib/vault";
 import { STT_PROMPT } from "@/lib/sttvocab";
-import { cleanSpeechTranscript, isMeaningfulSpeechTranscript } from "@/lib/transcript";
+import { cleanSpeechTranscript, hasConfidentSpeechSegments, isMeaningfulSpeechTranscript } from "@/lib/transcript";
 
 // Speech-to-text utility only: free/fast Groq Whisper. Conversation intelligence
 // remains exclusively in the authenticated Codex subscription CLI worker.
@@ -23,11 +23,14 @@ function buildForm(model: string, buf: Buffer, mime: string, ext: string): FormD
   form.append("language", "en");
   form.append("temperature", "0");
   form.append("prompt", STT_PROMPT);
-  form.append("response_format", "json");
+  form.append("response_format", "verbose_json");
+  form.append("timestamp_granularities[]", "segment");
   return form;
 }
 
-async function transcribe(url: string, key: string, form: FormData, timeoutMs: number): Promise<string | null> {
+type TranscriptionResult = { text: string; confidentSpeech: boolean };
+
+async function transcribe(url: string, key: string, form: FormData, timeoutMs: number): Promise<TranscriptionResult | null> {
   try {
     const r = await fetch(url, {
       method: "POST",
@@ -36,8 +39,11 @@ async function transcribe(url: string, key: string, form: FormData, timeoutMs: n
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!r.ok) return null;
-    const j: any = await r.json();
-    return String(j.text ?? "").trim();
+    const j = (await r.json()) as { text?: unknown; segments?: unknown };
+    return {
+      text: String(j.text ?? "").trim(),
+      confidentSpeech: hasConfidentSpeechSegments(j.segments),
+    };
   } catch {
     return null;
   }
@@ -51,16 +57,16 @@ export async function POST(req: NextRequest) {
 
   const groqKey = process.env.GROQ_API_KEY ?? (await getSecret("groq", "GROQ_API_KEY").catch(() => ""));
 
-  let text: string | null = null;
+  let transcription: TranscriptionResult | null = null;
   if (groqKey)
-    text = await transcribe(
+    transcription = await transcribe(
       "https://api.groq.com/openai/v1/audio/transcriptions",
       groqKey,
       buildForm("whisper-large-v3-turbo", inBuf, mime, ext),
       10000,
     );
-  if (text === null) return new Response(JSON.stringify({ error: "stt unavailable" }), { status: 502 });
-  text = cleanSpeechTranscript(text);
+  if (transcription === null) return new Response(JSON.stringify({ error: "stt unavailable" }), { status: 502 });
+  let text = transcription.confidentSpeech ? cleanSpeechTranscript(transcription.text) : "";
 
   // Foreign-script junk on noise never reaches the brain (an English speaker's
   // real words are overwhelmingly Latin).
