@@ -5,6 +5,7 @@ import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
 import { CAPABILITIES, INFRA_MAP, PERSONA, REMEMBER } from "../lib/persona";
 import { visualInitiativeDirective } from "../lib/visual-initiative";
+import { visibleTurnText } from "../lib/host-context";
 import { buildContext } from "../lib/context";
 import { codexConversationExecPrefix, codexModelFor, pickConversationTier } from "./model-policy";
 import {
@@ -113,7 +114,7 @@ type QueueClaim = {
 };
 
 function conversationPreamble(contextBlock: string, userText: string) {
-  const visualDirective = visualInitiativeDirective(userText);
+  const visualDirective = visualInitiativeDirective(visibleTurnText(userText));
   return PERSONA +
     `\n\n${CAPABILITIES}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${contextBlock}\n\nCurrent date: ${new Date().toDateString()}.\n\n${REMEMBER}\n\n` +
     JARVIS_TOOL_INSTRUCTIONS + " " +
@@ -300,10 +301,11 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
       continue;
     }
     try {
+      const visibleUserText = visibleTurnText(claim.userText);
       const contextStarted = Date.now();
-      const context = await buildContext(claim.userText);
+      const context = await buildContext(visibleUserText);
       const contextReadyAt = Date.now();
-      const model = pickConversationTier(claim.userText);
+      const model = pickConversationTier(visibleUserText);
       const turn = await runTurn(
         server,
         claim.threadId,
@@ -331,7 +333,7 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
       // Memory capture is a separate background task. It must never hold the
       // warm conversational worker hostage after Daniel already has a reply.
       if (turn.finalText.trim()) void tasks.trigger("jarvis-chat-memory", {
-        userText: claim.userText,
+        userText: visibleUserText,
         assistantText: turn.finalText,
       }).catch(() => {});
       const memoryFinishedAt = Date.now();

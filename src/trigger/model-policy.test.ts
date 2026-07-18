@@ -6,6 +6,7 @@ import {
   codexModelFor,
   pickConversationTier,
 } from "./model-policy";
+import { withHostContext } from "../lib/host-context";
 
 describe("subscription model policy", () => {
   it("maps increasing work tiers to the live Luna, Terra and Sol catalogue", () => {
@@ -21,6 +22,15 @@ describe("subscription model policy", () => {
     expect(pickConversationTier("Show me the weather in London")).toBe("luna");
     expect(pickConversationTier("Brainstorm a sharper product strategy for Jarvis and compare the trade-offs")).toBe("terra");
     expect(pickConversationTier("Trace the root cause of this multi-repo production outage from first principles")).toBe("sol");
+  });
+
+  it("does not treat bounded host-screen evidence as user-request complexity", () => {
+    const text = withHostContext("What is the title of this page?", {
+      url: "https://project-hub.example",
+      title: "Project Hub",
+      text: "dashboard evidence ".repeat(600),
+    });
+    expect(pickConversationTier(text)).toBe("luna");
   });
 
   it("falls back unknown tiers to balanced work instead of the highest-cost tier", () => {

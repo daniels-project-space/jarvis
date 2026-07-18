@@ -1,4 +1,5 @@
 import { normalizeWorkModelTier, type WorkModelTier } from "../lib/work-models";
+import { visibleTurnText } from "../lib/host-context";
 
 export const CODEX_MODEL_POLICY = {
   luna: { model: "gpt-5.6-luna", effort: "low" },
@@ -50,7 +51,10 @@ export function codexConversationExecPrefix(tier: string): string[] {
 }
 
 export function pickConversationTier(text: string): WorkModelTier {
-  const value = text.toLowerCase().trim();
+  // Host screen evidence can be thousands of characters. It is useful to the
+  // answer, but it is not Daniel's request and must not inflate a simple page
+  // question into the frontier tier.
+  const value = visibleTurnText(text).toLowerCase().trim();
   if (
     value.length > 700 ||
     /\b(root cause|multi[- ]?(repo|project|file)|architecture migration|security incident|production outage|think (really |very )?hard|from first principles|deep dive)\b/.test(value)
