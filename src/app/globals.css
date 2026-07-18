@@ -30,12 +30,13 @@ body {
   height: 100%;
 }
 
-/* The cross-app Hub surface is genuinely only the particle orb. Its iframe
-   must not paint Jarvis's full-page cockpit background or grid as a dark card. */
+/* A transparent cross-origin iframe canvas is flattened to white by Chromium's
+   out-of-process iframe compositor. Paint the embed document itself so the Hub
+   mini keeps Jarvis's intended black canvas; the orb surface stays unboxed. */
 html.jarvis-embedded-document,
 body.jarvis-embedded-document,
 body:has([data-jarvis-embed-surface]) {
-  background: transparent !important;
+  background: var(--void) !important;
 }
 body.jarvis-embedded-document > .hud-grid,
 body:has([data-jarvis-embed-surface]) > .hud-grid {

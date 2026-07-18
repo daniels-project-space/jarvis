@@ -14,12 +14,14 @@
   var ready = false;
   var pendingCommands = [];
   var f = document.createElement("iframe");
-  f.src = ORIGIN + "/embed";
+  // Version the document as well as this loader. Long-lived Hub tabs used to
+  // preserve an obsolete full-chat frame across Jarvis deployments.
+  f.src = ORIGIN + "/embed?v=hub-orb-voice-20260718-1";
   f.title = "JARVIS";
   f.allow = "microphone; autoplay; clipboard-write; display-capture";
   f.style.cssText =
     "position:fixed;bottom:8px;right:8px;width:min(460px,calc(100vw - 16px));height:min(520px,calc(100vh - 16px));border:0;" +
-    "border-radius:28px;z-index:2147483000;background:transparent;color-scheme:dark;" +
+    "border-radius:28px;z-index:2147483000;background:#05070d;color-scheme:dark;" +
     "box-shadow:none;transition:opacity .2s ease,transform .28s cubic-bezier(.22,1,.36,1);" +
     "opacity:0;transform:translateY(14px);pointer-events:none;";
 

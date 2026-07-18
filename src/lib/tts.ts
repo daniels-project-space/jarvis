@@ -17,7 +17,7 @@ type SpeechBatch = {
 
 type AudioResult = { audio: Float32Array; sampleRate: number };
 type WorkerReply =
-  | { type: "ready" }
+  | { type: "ready"; engine?: string }
   | { type: "progress"; progress: number | null; status: string; file: string | null }
   | { type: "audio"; id: number; audio: ArrayBuffer; sampleRate: number }
   | { type: "error"; id: number | null; message: string };
@@ -29,6 +29,8 @@ type PendingAudio = {
 
 const ECHO_GUARD_TAIL_MS = 45_000;
 const WORKER_TIMEOUT_MS = 30_000;
+const FIRST_SPEECH_CHUNK_MIN = 12;
+const MAX_SPEECH_CHUNK_CHARS = 84;
 
 let generation = 0;
 let requestId = 0;
@@ -45,6 +47,7 @@ let queue: SpeechBatch[] = [];
 const pending = new Map<number, PendingAudio>();
 type Recent = { text: string; until: number };
 let recentUtterances: Recent[] = [];
+let ttsEngine = "kokoro-q8-wasm-george";
 
 const words = (text: string) =>
   text.toLowerCase().replace(/[^a-z0-9\s']/g, " ").split(/\s+/).filter((word) => word.length > 1);
@@ -52,7 +55,7 @@ const words = (text: string) =>
 function setTtsStatus(status: "loading" | "ready" | "buffering" | "speaking" | "unavailable") {
   if (typeof document === "undefined") return;
   document.documentElement.dataset.jarvisTts = status;
-  document.documentElement.dataset.jarvisTtsEngine = "kokoro-q8-george";
+  document.documentElement.dataset.jarvisTtsEngine = ttsEngine;
 }
 
 function reportFailure(error: unknown) {
@@ -100,6 +103,7 @@ function ensureWorker(): Worker {
       return;
     }
     if (reply.type === "ready") {
+      if (reply.engine) ttsEngine = reply.engine;
       resolveModelReady?.();
       resolveModelReady = null;
       rejectModelReady = null;
@@ -224,14 +228,32 @@ export function sentences(text: string): string[] {
   const speech = normalizeSpeechText(text);
   const result: string[] = [];
   let buffer = "";
+
+  const appendBounded = (value: string) => {
+    let remaining = value.trim();
+    while (remaining.length > MAX_SPEECH_CHUNK_CHARS) {
+      const window = remaining.slice(0, MAX_SPEECH_CHUNK_CHARS + 1);
+      const boundary = window.lastIndexOf(" ");
+      const cut = boundary >= Math.floor(MAX_SPEECH_CHUNK_CHARS * 0.58)
+        ? boundary
+        : MAX_SPEECH_CHUNK_CHARS;
+      result.push(remaining.slice(0, cut).trim());
+      remaining = remaining.slice(cut).trim();
+    }
+    if (remaining) result.push(remaining);
+  };
+
   for (const part of speech.split(/(?<=[.!?;:])\s+|(?<=,)\s+(?=\S)/)) {
     buffer = buffer ? `${buffer} ${part}` : part;
-    if (buffer.length >= 24) {
-      result.push(buffer);
+    // Short complete openings ("Right here, sir.") are deliberately allowed
+    // through. They give the neural voice a fast first audio frame while the
+    // following sentence is generated under playback.
+    if (buffer.length >= FIRST_SPEECH_CHUNK_MIN) {
+      appendBounded(buffer);
       buffer = "";
     }
   }
-  if (buffer.trim()) result.push(buffer);
+  if (buffer.trim()) appendBounded(buffer);
   return result;
 }
 

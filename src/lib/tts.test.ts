@@ -100,6 +100,18 @@ describe("single Kokoro speech queue", () => {
       .toEqual(["First complete sentence.", "Second complete sentence."]);
   });
 
+  it("starts a short complete opening without waiting for the next sentence", () => {
+    expect(sentences("Right here, sir. What's the first thing we're sorting?"))
+      .toEqual(["Right here, sir.", "What's the first thing we're sorting?"]);
+  });
+
+  it("bounds long neural requests without losing spoken content", () => {
+    const input = "This deliberately long sentence explains the entire plan in enough detail that a single neural generation request would otherwise become slow and timeout-prone on a browser without a hardware GPU, while every word must still be spoken in order.";
+    const chunks = sentences(input);
+    expect(Math.max(...chunks.map((chunk) => chunk.length))).toBeLessThanOrEqual(84);
+    expect(chunks.join(" ")).toBe(normalizeSpeechText(input));
+  });
+
   it("turns visual dash marks into natural phrasing without breaking compound words", () => {
     expect(normalizeSpeechText("Right — that is the real-time fix -- ship it"))
       .toBe("Right, that is the real-time fix, ship it.");
