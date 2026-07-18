@@ -1517,8 +1517,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       liveDefault: localStorage.getItem("jarvis_live_default") !== "0",
     });
     // Mark the single streaming speech path ready before Daniel asks anything.
-    void import("../lib/tts").then((module) => module.warm());
-  }, []);
+    // The Hub iframe loads hidden, so persist its common greeting in the exact
+    // same George voice before the orb is opened. No browser/system voice is
+    // introduced, and a cold cache simply falls through to normal generation.
+    void import("../lib/tts").then((module) => {
+      void module.warm();
+      if (embedded) {
+        const greeting = instantSocialReply("hi");
+        if (greeting) void module.primeSpeech([greeting]);
+      }
+    });
+  }, [embedded]);
   useEffect(() => {
     // Capture the browser activation itself. Waiting for Codex/Trigger to
     // answer before calling play() is too late and used to leave fully-loaded
