@@ -20,6 +20,7 @@ import { parseTerminalOutput, type TerminalTone } from "@/lib/terminal-output";
 import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate } from "@/lib/transcript";
 import { completeSpeechPrefix } from "@/lib/tts";
+import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -1942,6 +1943,63 @@ export default function JarvisUI() {
     }
   }
 
+  async function openFastAgentDispatch(intent: FastAgentDispatch, requestedText: string) {
+    const owner = intent.agentId
+      ? ({ paul: "Paul", atlas: "Atlas", iris: "Iris", maya: "Maya", sentry: "Sentry" } as const)[intent.agentId]
+      : "the right specialist";
+    document.documentElement.dataset.jarvisFirstTokenMs = "0";
+    setSending(true);
+    showCaption({ who: "you", text: requestedText });
+    showCaption({ who: "jarvis", text: `Assigning ${owner}…`, phase: "streaming" });
+    try {
+      const response = await fetch("/api/tools", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "dispatch_agent",
+          args: { task: intent.task, agent_id: intent.agentId },
+        }),
+      });
+      const body = await response.json().catch(() => null);
+      const result = String(body?.result ?? "");
+      if (!response.ok || !result || /^(?:Tool failed|Tool unavailable|Give me)/i.test(result)) {
+        throw new Error(result || "dispatch unavailable");
+      }
+      const assigned = result.match(/^(Paul|Atlas|Iris|Maya|Sentry)\b/)?.[1] ?? owner;
+      const awaitingApproval = /consequential|Needs you|will not execute/i.test(result);
+      const reply = awaitingApproval
+        ? `${assigned} has the plan ready, but it needs your approval in the work card before anything consequential happens.`
+        : `${assigned} is on it. The work is live, and I’m still right here with you.`;
+      updateConversationMood(reply);
+      lastSpokenText.current = { text: reply, ts: Date.now() };
+      showCaption({ who: "jarvis", text: reply, phase: "ready" });
+      void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
+      void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant-dispatch" });
+      if (document.hidden || (liveAnywhere() && !liveRef.current) || !(await ensureVoice())) {
+        fadeCaption(reply, 3200);
+        return;
+      }
+      const { speak } = await import("../lib/tts");
+      await speak(
+        reply,
+        (energy) => (energyRef.current = energy),
+        () => {
+          setSpeaking(true);
+          showCaption({ who: "jarvis", text: reply, phase: "speaking" });
+        },
+        () => {
+          setSpeaking(false);
+          fadeCaption(reply, 1800);
+        },
+      );
+    } catch {
+      showCaption({ who: "jarvis", text: "The fast handoff slipped. I’m retrying it through the durable lane now." });
+      await queueDurableTurn(requestedText);
+    } finally {
+      setSending(false);
+    }
+  }
+
   const fastChartRequest = useRef(0);
   async function openFastChart(intent: FastChartIntent, requestedText: string) {
     const request = ++fastChartRequest.current;
@@ -2109,6 +2167,11 @@ export default function JarvisUI() {
       setPanelFull(false);
       setPanelMin(true); // hide locally during the authenticated clear round-trip
       void clearPanel({});
+    }
+    const fastDispatch = parseFastAgentDispatch(t);
+    if (fastDispatch) {
+      void openFastAgentDispatch(fastDispatch, t);
+      return;
     }
     const fastChart = !liveRef.current ? parseFastChartIntent(t) : null;
     if (fastChart) {
