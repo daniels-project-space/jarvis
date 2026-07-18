@@ -38,6 +38,17 @@ export const getPanel = query({
   },
 });
 
+// Compatibility for clients left open across the removal of the ephemeral
+// say channel. Convex subscriptions can outlive a Vercel client deployment,
+// so keep the authenticated read contract until those clients have aged out.
+export const getSay = query({
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "say")).first();
+  },
+});
+
 // Global subscription agent selection. Trigger jobs read this before claiming
 // work, so the choice follows Daniel across devices and affects every runner.
 export const setAgentProvider = mutation({
