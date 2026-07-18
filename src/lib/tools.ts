@@ -470,6 +470,20 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "mac_shortcut",
+    description:
+      "Prepare a named Apple Shortcut for Daniel to run locally on his Mac. Use only when he explicitly asks for a Mac-local action and the action maps to a Shortcut he has installed. This never executes automatically: it shows an approval card Daniel must click.",
+    parameters: {
+      type: "object",
+      properties: {
+        shortcut: { type: "string", description: "Exact installed Apple Shortcut name, e.g. Add to Notes" },
+        input: { type: "string", description: "Text input passed to that Shortcut" },
+        reason: { type: "string", description: "Short plain-language description of what it will do" },
+      },
+      required: ["shortcut"],
+    },
+  },
+  {
     name: "research",
     description:
       "Verified research: runs SEVERAL searches, reads the top source, and cross-checks results before answering — slower than web_search but grounded. Use whenever the fact actually matters (specs, compatibility, prices to act on, medical/legal, anything Daniel will rely on) or when he says 'make sure / double check'.",
@@ -3125,6 +3139,14 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       return await calendarView(args);
     case "open_app":
       return await openApp(args);
+    case "mac_shortcut": {
+      const shortcut = String(args.shortcut ?? "").trim().slice(0, 120);
+      if (!shortcut) return "TOOL DID NOTHING: name the installed Apple Shortcut.";
+      const input = String(args.input ?? "").trim().slice(0, 4000);
+      const reason = String(args.reason ?? "").trim().slice(0, 300);
+      await showWidget({ kind: "mac_action", shortcut, input, reason }, `Mac · ${shortcut}`);
+      return `The Mac action “${shortcut}” is ready on screen. It has not run; Daniel must click Run on this Mac.`;
+    }
     case "research":
       return await researchTool(args);
     case "deliberate":

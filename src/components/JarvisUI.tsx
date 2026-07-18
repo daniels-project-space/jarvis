@@ -22,6 +22,7 @@ import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate } from "@/lib/tran
 import { completeSpeechPrefix, isSpeaking as isTtsActuallySpeaking, unlockSpeechPlayback } from "@/lib/tts";
 import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
 import { needsHostContext, visibleTurnText, withHostContext, type JarvisHostContext } from "@/lib/host-context";
+import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -193,6 +194,10 @@ function panelSize(panel: { type: string; value: string }): string {
       return "w-[min(560px,94%)] h-[400px]";
     case "w:timer":
       return "w-[min(500px,94%)] h-[460px]";
+    case "w:mac_action":
+      return "w-[min(620px,94%)] h-[480px]";
+    case "w:mac_setup":
+      return "w-[min(720px,96%)] h-[min(680px,92%)]";
     case "w:weather":
       return "w-[min(880px,80%)] h-[min(640px,90%)]";
     case "w:market":
@@ -289,7 +294,7 @@ const OPTION_MOODS: { k: string; c: string }[] = [
   { k: "curious", c: "#33e0d0" }, { k: "serious", c: "#8fa3bd" }, { k: "excited", c: "#ff5470" },
 ];
 function OptionsPanel({
-  prefs, setPref, permissions, permissionBusy, onEnablePermissions, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary,
+  prefs, setPref, permissions, permissionBusy, onEnablePermissions, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary, onMacSetup,
 }: {
   prefs: JarvisPrefs;
   setPref: (k: keyof JarvisPrefs, v: string | boolean) => void;
@@ -304,6 +309,7 @@ function OptionsPanel({
   onMood: (m: string) => void;
   onClearMood: () => void;
   onOpenLibrary: () => void;
+  onMacSetup: () => void;
 }) {
   const Row = ({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) => (
     <div className="flex items-center justify-between gap-4 py-2.5">
@@ -350,6 +356,11 @@ function OptionsPanel({
           <Row label="Saved work" hint="projects, inquiries, notes, emails, boards, maps and files">
             <button onClick={onOpenLibrary} className="rounded-lg border border-cyan/30 px-3 py-1 text-[11px] text-cyan transition hover:bg-cyan/10">
               open library
+            </button>
+          </Row>
+          <Row label="Mac shortcut" hint="global keyboard/voice entry · local actions always need your click">
+            <button onClick={onMacSetup} className="rounded-lg border border-cyan/30 px-3 py-1 text-[11px] text-cyan transition hover:bg-cyan/10">
+              set up
             </button>
           </Row>
           <Row label="Live conversation" hint={live !== "off" ? "on now" : "listen → answer → listen, with no self-echo"}>
@@ -816,6 +827,62 @@ function OrbitBubble({
   );
 }
 
+function MacShortcutAction({ w }: { w: any }) {
+  const name = String(w.shortcut ?? "").trim();
+  const input = String(w.input ?? "").trim();
+  const url = macShortcutUrl(name, input);
+  return (
+    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 p-6 text-center">
+      <div className="hud-label !text-cyan">Mac action ready · approval required</div>
+      <div className="text-2xl font-semibold text-ice">{name || "Apple Shortcut"}</div>
+      {input && <div className="glass max-w-lg rounded-xl px-4 py-3 text-sm text-slate">{input}</div>}
+      {w.reason && <div className="max-w-lg text-xs leading-relaxed text-slate">{String(w.reason)}</div>}
+      <a
+        href={url}
+        className="rounded-xl bg-cyan/15 px-6 py-3 text-sm font-medium text-cyan ring-1 ring-cyan/50 transition hover:bg-cyan/25"
+      >
+        Run on this Mac
+      </a>
+      <div className="max-w-md text-[10px] leading-relaxed text-slate/75">
+        Jarvis never opens this link automatically. macOS runs it only after you click and only if that named Shortcut exists.
+      </div>
+    </div>
+  );
+}
+
+function MacSetupWidget() {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    await navigator.clipboard.writeText(JARVIS_MAC_ENTRY_URL);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1600);
+  };
+  return (
+    <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
+      <div className="hud-label !text-cyan">Jarvis on your Mac</div>
+      <div className="mt-2 text-xl font-semibold text-ice">One shortcut, available everywhere</div>
+      <ol className="mt-5 space-y-3 text-sm text-ice">
+        <li className="glass rounded-xl p-3"><span className="mr-2 text-cyan">01</span>In Apple Shortcuts, create <b>Talk to Jarvis</b> with <b>Dictate Text</b>.</li>
+        <li className="glass rounded-xl p-3"><span className="mr-2 text-cyan">02</span>Add <b>URL Encode</b>, then append its result to the Jarvis entry URL below.</li>
+        <li className="glass rounded-xl p-3"><span className="mr-2 text-cyan">03</span>Add <b>Open URLs</b>. In Details, choose <b>Add Keyboard Shortcut</b> for a global key combination.</li>
+        <li className="glass rounded-xl p-3"><span className="mr-2 text-cyan">04</span>In Safari, open Project Hub and choose <b>File → Add to Dock</b>; allow microphone and notifications once.</li>
+      </ol>
+      <div className="mt-4 flex flex-wrap gap-2">
+        <button onClick={() => void copy()} className="rounded-lg border border-cyan/35 px-3 py-2 text-xs text-cyan transition hover:bg-cyan/10">
+          {copied ? "copied ✓" : "copy entry URL"}
+        </button>
+        <a href="shortcuts://create-shortcut" className="rounded-lg border border-white/10 px-3 py-2 text-xs text-ice transition hover:border-cyan/35">
+          open Shortcuts
+        </a>
+      </div>
+      <div className="mt-3 break-all rounded-lg bg-black/25 p-2 font-mono text-[10px] text-slate">{JARVIS_MAC_ENTRY_URL}[URL Encoded Dictated Text]</div>
+      <p className="mt-4 text-[11px] leading-relaxed text-slate">
+        For Mac-only actions, create named Apple Shortcuts (for example “Add to Notes”). Jarvis can prepare those actions, but the on-screen Run button is deliberately the final approval boundary.
+      </p>
+    </div>
+  );
+}
+
 // Native widget panels (weather/stats/market/timer/briefing; more via self_improve).
 function WidgetView({ value }: { value: string }) {
   let w: any = null;
@@ -825,6 +892,8 @@ function WidgetView({ value }: { value: string }) {
     /* fall through */
   }
   if (w?.kind === "timer") return <TimerWidget w={w} />;
+  if (w?.kind === "mac_action") return <MacShortcutAction w={w} />;
+  if (w?.kind === "mac_setup") return <MacSetupWidget />;
   if (w?.kind === "calendar") return <CalendarView value={value} />;
   if (w?.kind === "chart_loading") return <MarketChartLoading asset={w.asset ?? "Market"} interval={w.interval ?? "1d"} />;
   if (w?.kind === "net_worth_loading") {
@@ -1692,6 +1761,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       if (event.source !== window.parent) return;
       const message = event.data ?? {};
       if (message.jarvis === "host-show") setChatMode("full", false);
+      if (message.jarvis === "host-command" && typeof message.text === "string") {
+        const command = message.text.trim().slice(0, 4000);
+        if (command) {
+          setChatMode("full", false);
+          void submit(command);
+        }
+      }
     };
     window.addEventListener("message", receiveHostMessage);
     window.parent.postMessage({ jarvis: "ready" }, "*");
@@ -2856,6 +2932,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             setPanelFull(false);
             setPanelMin(false);
             void setPanel({ type: "creations", value: JSON.stringify({ kind: null, folder: null }), title: "saved work" });
+          }}
+          onMacSetup={() => {
+            setOptionsOpen(false);
+            setPanelFull(false);
+            setPanelMin(false);
+            void setPanel({ type: "widget", value: JSON.stringify({ kind: "mac_setup" }), title: "Mac shortcut setup" });
           }}
         />
       )}

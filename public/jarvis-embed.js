@@ -11,6 +11,8 @@
   if (location.origin === ORIGIN) return; // never embed JARVIS inside JARVIS
 
   var visible = false;
+  var ready = false;
+  var pendingCommands = [];
   var f = document.createElement("iframe");
   f.src = ORIGIN + "/embed";
   f.title = "JARVIS";
@@ -34,9 +36,23 @@
     f.style.transform = "translateY(14px)";
     f.style.pointerEvents = "none";
   }
+  function flushCommands() {
+    if (!ready || !f.contentWindow) return;
+    while (pendingCommands.length) {
+      f.contentWindow.postMessage({ jarvis: "host-command", text: pendingCommands.shift() }, ORIGIN);
+    }
+  }
+  function ask(text) {
+    var command = String(text || "").trim().slice(0, 4000);
+    if (!command) return;
+    pendingCommands.push(command);
+    show();
+    flushCommands();
+  }
   window.JARVIS = {
     show: show,
     hide: hide,
+    ask: ask,
     toggle: function () {
       if (visible) hide();
       else show();
@@ -49,7 +65,10 @@
   window.addEventListener("message", function (e) {
     if (e.origin !== ORIGIN || e.source !== f.contentWindow) return;
     var d = e.data || {};
-    if (d.jarvis === "wake" || d.jarvis === "notify") show();
+    if (d.jarvis === "ready") {
+      ready = true;
+      flushCommands();
+    } else if (d.jarvis === "wake" || d.jarvis === "notify") show();
     else if (d.jarvis === "hide") hide();
     else if (d.jarvis === "context-request" && typeof d.id === "string") {
       var selection = "";
@@ -70,7 +89,18 @@
   });
 
   function mount() {
-    if (!f.isConnected && document.body) document.body.appendChild(f);
+    if (!f.isConnected && document.body) {
+      document.body.appendChild(f);
+      try {
+        var url = new URL(location.href);
+        var command = url.searchParams.get("jarvis");
+        if (command) {
+          url.searchParams.delete("jarvis");
+          history.replaceState(history.state, "", url.pathname + url.search + url.hash);
+          ask(command);
+        }
+      } catch (_) {}
+    }
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", mount);
   else mount();
