@@ -202,7 +202,7 @@ function panelSize(panel: { type: string; value: string }): string {
       return "w-[96%] md:w-[min(900px,calc(100%-250px))] h-[min(680px,88%)]";
     case "w:net_worth_loading":
     case "w:stats":
-      return "w-[96%] md:w-[min(1080px,calc(100%-250px))] h-[min(680px,92%)]";
+      return "w-[96%] h-[min(680px,92%)]";
     case "w:videos":
     case "w:feed":
       return "w-[min(1340px,82%)] h-[min(740px,92%)]";
