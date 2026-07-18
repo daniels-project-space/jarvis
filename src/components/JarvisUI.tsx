@@ -284,8 +284,8 @@ function OptionsPanel({
           <Row label="Agent intelligence" hint="Codex CLI via ChatGPT subscription · foreground and agents">
             <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 font-mono text-[9px] uppercase tracking-wider text-cyan">Codex CLI · adaptive</span>
           </Row>
-          <Row label="Voice" hint="free streamed neural speech · Codex CLI intelligence">
-            <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 text-[11px] text-cyan">Ryan · free neural</span>
+          <Row label="Voice" hint="private neural speech · free no-silence fallback">
+            <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 text-[11px] text-cyan">Jarvis · private neural</span>
           </Row>
           <Row
             label="Voice & alerts"
@@ -300,8 +300,8 @@ function OptionsPanel({
               {permissionBusy ? "enabling…" : permissions.microphone === "granted" && permissions.notifications === "granted" ? "ready ✓" : "enable once"}
             </button>
           </Row>
-          <Row label="Speaking voice" hint="one consistent expressive voice · no robotic fallback">
-            <span className="rounded-lg border border-white/10 bg-black/20 px-2.5 py-1 text-[11px] text-ice">Ryan</span>
+          <Row label="Speaking voice" hint="Voicebox Jarvis profile when its cloud worker is warm">
+            <span className="rounded-lg border border-white/10 bg-black/20 px-2.5 py-1 text-[11px] text-ice">Jarvis</span>
           </Row>
           <Row label="Saved work" hint="projects, inquiries, notes, emails, boards, maps and files">
             <button onClick={onOpenLibrary} className="rounded-lg border border-cyan/30 px-3 py-1 text-[11px] text-cyan transition hover:bg-cyan/10">

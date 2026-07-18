@@ -2,6 +2,12 @@ import type { NextRequest } from "next/server";
 import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 import { isSameOriginRequest } from "@/lib/control-session";
 import { controlActor } from "@/lib/request-auth";
+import {
+  requestVoiceboxSpeech,
+  voiceboxTtsConfig,
+  VOICEBOX_ENGINE,
+  VOICEBOX_VOICE,
+} from "@/lib/voicebox-tts";
 
 export const runtime = "nodejs";
 export const maxDuration = 15;
@@ -30,12 +36,13 @@ async function authorized(req: NextRequest): Promise<boolean> {
 
 export async function GET(req: NextRequest) {
   if (!(await authorized(req))) return Response.json({ error: "unauthorized" }, { status: 401 });
+  const voicebox = voiceboxTtsConfig();
   return new Response(null, {
     status: 204,
     headers: {
       "cache-control": "private, no-store",
-      "x-jarvis-tts-engine": JARVIS_TTS_ENGINE,
-      "x-jarvis-tts-voice": JARVIS_TTS_VOICE,
+      "x-jarvis-tts-engine": voicebox ? VOICEBOX_ENGINE : JARVIS_TTS_ENGINE,
+      "x-jarvis-tts-voice": voicebox ? VOICEBOX_VOICE : JARVIS_TTS_VOICE,
     },
   });
 }
@@ -47,6 +54,31 @@ export async function POST(req: NextRequest) {
   const text = String(payload?.text ?? "").trim();
   if (!text || text.length > 800) {
     return Response.json({ error: "Speech text must contain 1–800 characters" }, { status: 400 });
+  }
+
+  const voicebox = voiceboxTtsConfig();
+  if (voicebox) {
+    try {
+      const upstream = await requestVoiceboxSpeech(
+        voicebox,
+        text,
+        AbortSignal.any([req.signal, AbortSignal.timeout(voicebox.timeoutMs)]),
+      );
+      return new Response(upstream.body, {
+        headers: {
+          "content-type": upstream.headers.get("content-type") || "audio/wav",
+          "cache-control": "private, no-store",
+          "x-content-type-options": "nosniff",
+          "x-jarvis-tts-engine": VOICEBOX_ENGINE,
+          "x-jarvis-tts-voice": VOICEBOX_VOICE,
+        },
+      });
+    } catch {
+      if (req.signal.aborted) return new Response(null, { status: 499 });
+      // A reclaimed spot worker or cold model must never make Jarvis silent.
+      // Fall through to the existing sub-second free cloud voice for this one
+      // segment; a later segment can use Voicebox again once it is healthy.
+    }
   }
 
   const tts = new MsEdgeTTS();
@@ -93,6 +125,7 @@ export async function POST(req: NextRequest) {
         "x-content-type-options": "nosniff",
         "x-jarvis-tts-engine": JARVIS_TTS_ENGINE,
         "x-jarvis-tts-voice": JARVIS_TTS_VOICE,
+        ...(voicebox ? { "x-jarvis-tts-fallback": "voicebox-unavailable" } : {}),
       },
     });
   } catch (error) {
