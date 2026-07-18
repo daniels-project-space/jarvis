@@ -8,18 +8,18 @@ import { primeMicrophone, readJarvisPermissions, type JarvisPermissionState } fr
 import { registerSW, subscribePush } from "@/lib/push";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
 import { createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
-import { relevantActiveWork } from "@/lib/active-work";
+import { needsDaniel, relevantActiveWork } from "@/lib/active-work";
 import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
 import { isPanelFollowUp } from "@/lib/panel-relevance";
 import { nextVoiceLoopAction, type VoiceCaptureOutcome } from "@/lib/voice-loop";
+import { advanceLiveVad, createLiveVadState } from "@/lib/live-vad";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, MarketChartLoading, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
-import CommandDeck from "./CommandDeck";
 import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
 import { parseTerminalOutput, type TerminalTone } from "@/lib/terminal-output";
 import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate } from "@/lib/transcript";
-import { completeSpeechPrefix } from "@/lib/tts";
+import { completeSpeechPrefix, isSpeaking as isTtsActuallySpeaking } from "@/lib/tts";
 import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
@@ -562,27 +562,49 @@ function AgentLiveView({
   job,
   now,
   compact,
+  activeCount,
   onCompact,
   onClose,
+  onNext,
 }: {
   job: Job;
   now: number;
   compact: boolean;
+  activeCount: number;
   onCompact: () => void;
   onClose: () => void;
+  onNext: () => void;
 }) {
+  const [acting, setActing] = useState("");
   const elapsed = Math.max(0, Math.floor((now - job.startedAt) / 1000));
   const pct = Math.max(0, Math.min(100, job.percent ?? 0));
   const owner = ({ paul: "Paul", atlas: "Atlas", iris: "Iris", maya: "Maya", sentry: "Sentry", jarvis: "JARVIS" } as Record<string, string>)[job.agentId ?? ""] ?? "Agent";
+  const control = async (action: "approve" | "decline" | "cancel") => {
+    setActing(action);
+    try {
+      await fetch("/api/work-control", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jobId: job._id, action }),
+      });
+    } finally {
+      setActing("");
+    }
+  };
   return (
-    <div className={`materialize glass relative flex h-full flex-col rounded-2xl ${compact ? "p-3" : "p-4 pt-5"}`}>
+    <div data-work-overlay="active-task" className={`materialize glass relative flex h-full flex-col rounded-2xl ${compact ? "p-3" : "p-4 pt-5"}`}>
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-2">
           <ModelBadge model={job.model} />
-          <span className="hud-label">{owner} · {job.stage ?? job.status} · {elapsed}s</span>
+          <span className="hud-label truncate">{owner} · {job.stage ?? job.status} · {elapsed}s</span>
           {(job.attempt ?? 1) > 1 && <span className="hud-label text-amber">pass {job.attempt}/{job.maxAttempts ?? 12}</span>}
         </div>
         <div className="flex items-center gap-1">
+          {activeCount > 1 && (
+            <button onClick={onNext} className="hud-label rounded px-2 py-1 hover:text-cyan" title="Show next active task">
+              next · {activeCount}
+            </button>
+          )}
           <button onClick={onCompact} className="hud-label rounded px-2 py-1 hover:text-cyan">
             {compact ? "expand" : "minimize"}
           </button>
@@ -608,8 +630,19 @@ function AgentLiveView({
         </div>
       )}
       {compact
-        ? <div className="mt-2 truncate font-mono text-[10px] text-slate">{job.progress ?? job.stage ?? "working"}</div>
+        ? <div className="mt-2 truncate pr-28 font-mono text-[10px] text-slate">{job.progress ?? job.stage ?? "working"}</div>
         : <LiveSessionLog job={job} />}
+      <div className={`${compact ? "absolute bottom-2 right-3" : "mt-2 justify-end"} flex gap-1.5`}>
+        {job.status === "awaiting_approval" && (
+          <>
+            <button disabled={Boolean(acting)} onClick={() => void control("approve")} className="rounded border border-cyan/35 bg-cyan/10 px-2 py-0.5 text-[8px] uppercase tracking-wider text-cyan disabled:opacity-40">approve</button>
+            <button disabled={Boolean(acting)} onClick={() => void control("decline")} className="rounded border border-white/10 px-2 py-0.5 text-[8px] uppercase tracking-wider text-slate disabled:opacity-40">decline</button>
+          </>
+        )}
+        {!needsDaniel(job) && job.status === "running" && (
+          <button disabled={Boolean(acting)} onClick={() => void control("cancel")} className="rounded px-2 py-0.5 text-[8px] uppercase tracking-wider text-red-300/80 disabled:opacity-40">cancel</button>
+        )}
+      </div>
     </div>
   );
 }
@@ -1227,8 +1260,14 @@ export default function JarvisUI() {
   const [input, setInput] = useState("");
   const [speaking, setSpeaking] = useState(false);
   const speakingRef = useRef(false);
+  const wasSpeakingRef = useRef(false);
+  const ttsQuietUntilRef = useRef(0);
   useEffect(() => {
     speakingRef.current = speaking;
+    if (wasSpeakingRef.current && !speaking) {
+      ttsQuietUntilRef.current = Math.max(ttsQuietUntilRef.current, Date.now() + 900);
+    }
+    wasSpeakingRef.current = speaking;
   }, [speaking]);
   const [sending, setSending] = useState(false);
   const [recording, setRecording] = useState(false);
@@ -1694,16 +1733,34 @@ export default function JarvisUI() {
     if (commandSnapshot === undefined) return;
     const ids = new Set(activeJobs.map((job) => job._id));
     if (knownActiveJobIds.current === null) {
-      knownActiveJobIds.current = ids; // never resurrect work that predates this page load
+      knownActiveJobIds.current = ids;
+      // Existing relevant work survives a reload as the small replacement
+      // widget. Only newly launched work gets the large introduction.
+      if (activeJobs[0]) {
+        const jobId = activeJobs[0]._id;
+        const timer = setTimeout(() => {
+          setAgentView(jobId);
+          setAgentViewCompact(true);
+        }, 0);
+        return () => clearTimeout(timer);
+      }
       return;
     }
     const fresh = activeJobs.find((job) => !knownActiveJobIds.current!.has(job._id));
     knownActiveJobIds.current = ids;
     if (fresh) {
-      setAgentView(fresh._id);
-      setAgentViewCompact(false);
+      const timer = setTimeout(() => {
+        setAgentView(fresh._id);
+        setAgentViewCompact(false);
+      }, 0);
+      return () => clearTimeout(timer);
     } else if (agentView && !ids.has(agentView)) {
-      setAgentView(null);
+      const nextJobId = activeJobs[0]?._id ?? null;
+      const timer = setTimeout(() => {
+        setAgentView(nextJobId);
+        setAgentViewCompact(true);
+      }, 0);
+      return () => clearTimeout(timer);
     }
   }, [activeJobs, agentView, commandSnapshot]);
   useEffect(() => {
@@ -1920,9 +1977,6 @@ export default function JarvisUI() {
           fadeCaption(spokenText, 1800); // remain readable, then leave without a flash
         },
       );
-      // In persistent live mode, silence opens another listening window rather
-      // than releasing the live lease. Wake-word sessions remain one-shot.
-      if (freeLoop.current) scheduleFreeVoiceTurn(220);
     })();
   }, [messages]);
 
@@ -2038,7 +2092,6 @@ export default function JarvisUI() {
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
       if (document.hidden || (liveAnywhere() && !liveRef.current) || !(await ensureVoice())) {
         fadeCaption(reply, 3200);
-        if (freeLoop.current) scheduleFreeVoiceTurn(220);
         return;
       }
       const { speak } = await import("../lib/tts");
@@ -2054,7 +2107,6 @@ export default function JarvisUI() {
           fadeCaption(reply, 1800);
         },
       );
-      if (freeLoop.current) scheduleFreeVoiceTurn(220);
     } catch {
       if (request !== fastChartRequest.current) return;
       setInstantPanel(null);
@@ -2109,7 +2161,6 @@ export default function JarvisUI() {
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
       if (document.hidden || (liveAnywhere() && !liveRef.current) || !(await ensureVoice())) {
         fadeCaption(reply, 3200);
-        if (freeLoop.current) scheduleFreeVoiceTurn(220);
         return;
       }
       const { speak } = await import("../lib/tts");
@@ -2125,7 +2176,6 @@ export default function JarvisUI() {
           fadeCaption(reply, 1800);
         },
       );
-      if (freeLoop.current) scheduleFreeVoiceTurn(220);
     } catch {
       if (request !== fastNetWorthRequest.current) return;
       setInstantPanel(null);
@@ -2195,27 +2245,23 @@ export default function JarvisUI() {
         .then(() => logTurn({ threadId: threadRef.current, role: "assistant", text: instant, model: "instant" }))
         .catch(() => {});
       void (async () => {
-        try {
-          if (document.hidden || !(await ensureVoice())) {
-            fadeCaption(instant, 3200);
-            return;
-          }
-          const { speak } = await import("../lib/tts");
-          await speak(
-            instant,
-            (energy) => (energyRef.current = energy),
-            () => {
-              setSpeaking(true);
-              showCaption({ who: "jarvis", text: instant, phase: "speaking" });
-            },
-            () => {
-              setSpeaking(false);
-              fadeCaption(instant, 1800);
-            },
-          );
-        } finally {
-          if (freeLoop.current) scheduleFreeVoiceTurn(220);
+        if (document.hidden || !(await ensureVoice())) {
+          fadeCaption(instant, 3200);
+          return;
         }
+        const { speak } = await import("../lib/tts");
+        await speak(
+          instant,
+          (energy) => (energyRef.current = energy),
+          () => {
+            setSpeaking(true);
+            showCaption({ who: "jarvis", text: instant, phase: "speaking" });
+          },
+          () => {
+            setSpeaking(false);
+            fadeCaption(instant, 1800);
+          },
+        );
       })();
       return;
     }
@@ -2238,7 +2284,8 @@ export default function JarvisUI() {
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
-        autoGainControl: true,
+        // AGC amplifies residual loudspeaker echo and turns it into false VAD.
+        autoGainControl: false,
         channelCount: 1,
       },
     });
@@ -2464,34 +2511,35 @@ export default function JarvisUI() {
       const rec = new MediaRecorder(stream, { mimeType: mime });
       const chunks: Blob[] = [];
       rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-      setRecording(true);
       recRef.current = rec;
-      let spoke = false;
-      let lastVoice = Date.now();
-      let noiseFloor = 5;
-      let voiceFrames = 0;
-      let bargeFrames = 0;
       const t0 = Date.now();
+      let vad = createLiveVadState(t0);
+      let ttsWasActive = speakingRef.current || isTtsActuallySpeaking();
       const poll = setInterval(() => {
         analyser.getByteFrequencyData(buf);
         const level = buf.reduce((a, b) => a + b, 0) / buf.length;
-        if (!spoke && Date.now() - t0 < 900) noiseFloor = noiseFloor * 0.88 + level * 0.12;
-        const threshold = Math.max(14, noiseFloor + 9);
-        voiceFrames = level > threshold ? voiceFrames + 1 : 0;
-        if (voiceFrames >= 2) {
-          spoke = true;
-          lastVoice = Date.now();
+        const now = Date.now();
+        const ttsActive = speakingRef.current || isTtsActuallySpeaking();
+        if (ttsWasActive && !ttsActive) {
+          ttsQuietUntilRef.current = Math.max(ttsQuietUntilRef.current, now + 900);
+        }
+        ttsWasActive = ttsActive;
+        const result = advanceLiveVad(vad, {
+          level,
+          now,
+          startedAt: t0,
+          ttsActive,
+          quietUntil: ttsQuietUntilRef.current,
+        });
+        vad = result.state;
+        if (result.acceptedSpeech) {
           energyRef.current = Math.min(1, level / 90);
         }
-        // Echo cancellation handles normal speaker output. A sustained, much
-        // louder foreground voice is an intentional barge-in and stops TTS at
-        // VAD time, well before transcription returns.
-        bargeFrames = speakingRef.current && level > Math.max(30, threshold + 11) ? bargeFrames + 1 : 0;
-        if (bargeFrames === 3) {
+        if (result.bargeIn) {
           void import("../lib/tts").then((m) => m.stopSpeaking());
           setSpeaking(false);
         }
-        if ((spoke && Date.now() - lastVoice > 1100) || (!spoke && Date.now() - t0 > 8000) || Date.now() - t0 > 25_000) {
+        if ((vad.spoke && now - vad.lastVoice > 1100) || (!vad.spoke && now - t0 > 8000) || now - t0 > 25_000) {
           clearInterval(poll);
           if (rec.state === "recording") rec.stop();
         }
@@ -2501,14 +2549,13 @@ export default function JarvisUI() {
         rec.start(250);
       });
       clearInterval(poll);
-      setRecording(false);
       energyRef.current = 0;
       if (!freeLoop.current || sessionEpoch !== liveSessionEpoch.current) {
         outcome = "empty";
         return;
       }
       const blob = new Blob(chunks, { type: mime });
-      if (!spoke || blob.size < 2000) {
+      if (!vad.spoke || blob.size < 2000) {
         outcome = "silence";
         return;
       }
@@ -2547,7 +2594,6 @@ export default function JarvisUI() {
       outcome = "speech";
       void submit(cleanedText);
     } catch (error) {
-      setRecording(false);
       const aborted = error instanceof DOMException && error.name === "AbortError";
       outcome = aborted ? "empty" : "failure";
       if (!aborted) {
@@ -2556,7 +2602,6 @@ export default function JarvisUI() {
       }
     } finally {
       recRef.current = null;
-      setRecording(false);
       energyRef.current = 0;
       freeBusy.current = false;
       const action = nextVoiceLoopAction({
@@ -2570,6 +2615,9 @@ export default function JarvisUI() {
   }
 
   async function toggleMic() {
+    // Live mode already owns one continuous stream. Never layer a second
+    // one-shot recorder on top of it or let this control flicker per window.
+    if (liveRef.current) return;
     if (recording) {
       recRef.current?.stop();
       return;
@@ -2709,15 +2757,6 @@ export default function JarvisUI() {
           </button>
         </div>
       </header>
-      <CommandDeck
-        busy={busy}
-        snapshot={commandSnapshot}
-        selectedJobId={agentView}
-        onSelectJob={(id) => {
-          setAgentViewCompact(false);
-          setAgentView((current) => (current === id ? null : id));
-        }}
-      />
       {optionsOpen && (
         <OptionsPanel
           prefs={prefs}
@@ -2782,8 +2821,14 @@ export default function JarvisUI() {
                 job={shownJob}
                 now={nowTs}
                 compact={agentViewCompact}
+                activeCount={activeJobs.length}
                 onCompact={() => setAgentViewCompact((value) => !value)}
                 onClose={() => setAgentView(null)}
+                onNext={() => {
+                  const current = activeJobs.findIndex((job) => job._id === shownJob._id);
+                  setAgentView(activeJobs[(current + 1) % activeJobs.length]?._id ?? null);
+                  setAgentViewCompact(true);
+                }}
               />
             </div>
           ) : panel && panel.type !== "video" && !panelMin && !panelFull ? (
@@ -2930,12 +2975,17 @@ export default function JarvisUI() {
             </button>
             <button
               onClick={toggleMic}
-              title="voice input"
+              disabled={live === "live"}
+              title={live === "live" ? "Live conversation is continuously listening" : "voice input"}
               className={`shrink-0 rounded-xl px-2 text-sm transition sm:px-3 ${
-                recording ? "bg-amber/20 text-amber ring-1 ring-amber/50" : "glass text-slate hover:text-ice"
+                live === "live"
+                  ? "bg-cyan/10 text-cyan ring-1 ring-cyan/30"
+                  : recording
+                    ? "bg-amber/20 text-amber ring-1 ring-amber/50"
+                    : "glass text-slate hover:text-ice"
               }`}
             >
-              <span className="max-sm:hidden">{recording ? "■ done" : "mic"}</span><span className="sm:hidden">{recording ? "■" : "●"}</span>
+              <span className="max-sm:hidden">{live === "live" ? "mic on" : recording ? "■ done" : "mic"}</span><span className="sm:hidden">{recording ? "■" : "●"}</span>
             </button>
             <button
               onClick={() => void lookAtScreen()}
@@ -3151,10 +3201,11 @@ export default function JarvisUI() {
             </button>
             <button
               onClick={toggleMic}
-              title="voice input"
-              className={`shrink-0 rounded-xl px-2.5 text-sm transition ${recording ? "bg-amber/20 text-amber ring-1 ring-amber/50" : "text-slate hover:text-ice"}`}
+              disabled={live === "live"}
+              title={live === "live" ? "Live conversation is continuously listening" : "voice input"}
+              className={`shrink-0 rounded-xl px-2.5 text-sm transition ${live === "live" ? "bg-cyan/10 text-cyan ring-1 ring-cyan/30" : recording ? "bg-amber/20 text-amber ring-1 ring-amber/50" : "text-slate hover:text-ice"}`}
             >
-              <span className="max-sm:hidden">{recording ? "■" : "mic"}</span><span className="sm:hidden">{recording ? "■" : "●"}</span>
+              <span className="max-sm:hidden">{live === "live" ? "mic on" : recording ? "■" : "mic"}</span><span className="sm:hidden">{recording ? "■" : "●"}</span>
             </button>
             {(speaking || (live === "live" && caption?.who === "jarvis")) && (
               <button onClick={stopTalking} title="stop talking" className="shrink-0 rounded-xl bg-red-500/15 px-2.5 text-sm text-red-300 ring-1 ring-red-500/40">

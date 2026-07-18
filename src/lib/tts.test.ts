@@ -79,7 +79,7 @@ describe("single neural speech queue", () => {
 
     const reply = speak("Right here, sir. What's the first thing we're sorting?", () => {});
     await vi.waitFor(() => expect(FakeAudio.instances).toHaveLength(1));
-    vi.spyOn(Date, "now").mockReturnValue(startedAt + 15_000);
+    vi.spyOn(Date, "now").mockReturnValue(startedAt + 40_000);
 
     expect(isEchoOfTts("Right here sir, what's the first thing we're sorting?"))
       .toBe(true);

@@ -20,7 +20,7 @@ let stopAudioPlayback: (() => void) | null = null;
 let queue: SpeechBatch[] = [];
 let activeBatch: SpeechBatch | null = null;
 const COMMON_GREETING = "Right here, sir. What's the first thing we're sorting?";
-const ECHO_GUARD_TAIL_MS = 20_000;
+const ECHO_GUARD_TAIL_MS = 45_000;
 const primedAudio = new Map<string, HTMLAudioElement>();
 const reusableAudio = new WeakMap<HTMLAudioElement, string>();
 
