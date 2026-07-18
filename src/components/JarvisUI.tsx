@@ -1285,7 +1285,9 @@ function SpokenCaption({ caption }: { caption: NonNullable<Caption> }) {
 
 export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const orbMotionRef = useRef<OrbMotionFrame>(createOrbMotionFrame());
-  const thread = (useJarvisQuery(api.ui.getActiveThread, {}) ?? "main") as string;
+  const activeThreadQuery = useJarvisQuery(api.ui.getActiveThread, {});
+  const activeThreadReady = activeThreadQuery !== undefined;
+  const thread = (activeThreadQuery ?? "main") as string;
   const threads = (useJarvisQuery(api.ui.getThreads, {}) ?? []) as { id: string; title: string; at: number }[];
   const setActiveThread = (args: { thread: string; title?: string }) =>
     fetch("/api/client-state", {
@@ -1300,9 +1302,23 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       body: JSON.stringify({ action: "clear_thread", ...args }),
     });
   const threadRef = useRef("main");
+  const threadReadyRef = useRef(false);
+  const pendingEntryCommands = useRef<string[]>([]);
   useEffect(() => {
     threadRef.current = thread;
-  }, [thread]);
+    if (!activeThreadReady) return;
+    threadReadyRef.current = true;
+    const queued = pendingEntryCommands.current.splice(0);
+    for (const command of queued) void submit(command);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeThreadReady, thread]);
+  function submitEntryCommand(command: string) {
+    if (!threadReadyRef.current) {
+      pendingEntryCommands.current.push(command);
+      return;
+    }
+    void submit(command);
+  }
   const messages = (useJarvisQuery(api.chatQueue.listMessages, { threadId: thread }) ?? []) as Msg[];
   const remotePanel = useJarvisQuery(api.ui.getPanel, {}) as
     | StagePanel
@@ -1694,7 +1710,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       freeLoop.current = true;
       if (command) {
         void ownVoice();
-        void submit(command);
+        submitEntryCommand(command);
       } else {
         void freeVoiceTurn();
       }
@@ -1756,7 +1772,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }, []);
 
   useEffect(() => {
-    if (!embedded) return;
+    if (!embedded || !activeThreadReady) return;
     const receiveHostMessage = (event: MessageEvent) => {
       if (event.source !== window.parent) return;
       const message = event.data ?? {};
@@ -1765,7 +1781,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         const command = message.text.trim().slice(0, 4000);
         if (command) {
           setChatMode("full", false);
-          void submit(command);
+          submitEntryCommand(command);
         }
       }
     };
@@ -1773,7 +1789,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     window.parent.postMessage({ jarvis: "ready" }, "*");
     return () => window.removeEventListener("message", receiveHostMessage);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [embedded]);
+  }, [activeThreadReady, embedded]);
 
   useEffect(() => {
     me.current = clientId();
