@@ -2654,7 +2654,10 @@ export default function JarvisUI() {
   //  • compactAside — a sized widget (weather/shop/places/ranking/…): the panel
   //    takes the left, the orb SHRINKS INTO THE RIGHT CORNER (still visible).
   //  • fullBleed — a page/video/full panel: it owns everything, orb+ring gone.
-  const overlayUp = !!panel && !panelMin && !shownJob;
+  // A deliberately opened visual owns the stage even while durable work is
+  // running. The compact work widget stays live underneath and returns when
+  // the visual is folded/closed; it must never suppress boards or the library.
+  const overlayUp = !!panel && !panelMin;
   const fullBleed = overlayUp && (panelFull || panel!.type === "video" || stagePanelSize === "h-full w-full");
   const compactAside = overlayUp && !fullBleed && panel!.type !== "video";
 
@@ -2776,7 +2779,7 @@ export default function JarvisUI() {
               </button>
             </div>
           )}
-          {shownJob ? (
+          {shownJob && !overlayUp ? (
             <div
               className={`absolute left-2 top-12 z-30 will-change-transform transition-[width,height,transform] duration-700 ease-[cubic-bezier(0.22,1,0.36,1)] sm:left-4 ${
                 agentViewCompact
@@ -2798,7 +2801,8 @@ export default function JarvisUI() {
                 }}
               />
             </div>
-          ) : panel && panel.type !== "video" && !panelMin && !panelFull ? (
+          ) : null}
+          {panel && panel.type !== "video" && !panelMin && !panelFull ? (
             <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-10 md:pr-[36%] lg:pl-16" : "justify-center"}`}>
               <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${stagePanelSize}`}>
                 <Viewport
