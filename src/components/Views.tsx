@@ -1028,9 +1028,14 @@ const JOB_DOT: Record<string, string> = {
   running: "bg-cyan animate-pulse",
   done: "bg-emerald-400",
   error: "bg-red-400",
+  paused: "bg-amber",
+  needs_input: "bg-amber animate-pulse",
+  awaiting_approval: "bg-amber animate-pulse",
+  cancelled: "bg-slate/40",
 };
 
 export function FleetView({ value }: { value: string }) {
+  const [busy, setBusy] = useState<string | null>(null);
   let missionId = "";
   try {
     missionId = JSON.parse(value)?.missionId ?? "";
@@ -1038,7 +1043,9 @@ export function FleetView({ value }: { value: string }) {
     /* noop */
   }
   const missions = (useJarvisQuery(api.missions.active, {}) ?? []) as any[];
-  const m = missions.find((x) => x._id === missionId) ?? missions[0];
+  const m = missions.find((x) => x._id === missionId)
+    ?? (!missionId ? missions.find((x) => x.mode === "goal" && ["running", "paused", "needs_input"].includes(x.status)) : null)
+    ?? missions[0];
   if (!m)
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-slate">
@@ -1046,26 +1053,71 @@ export function FleetView({ value }: { value: string }) {
       </div>
     );
   const done = m.jobs.filter((j: any) => j.status === "done").length;
+  const goalMode = m.mode === "goal";
+  const controlGoal = async (action: "pause" | "resume" | "cancel") => {
+    setBusy(action);
+    try {
+      await viewerFetch("/api/work-control", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ missionId: m._id, action }),
+      });
+    } finally {
+      setBusy(null);
+    }
+  };
+  const phaseIndex = m.phase === "planning" ? 0 : ["building", "refining", "factory approval"].includes(m.phase) ? 1 : m.phase === "validating" ? 2 : m.phase === "complete" ? 3 : 1;
+  const phaseLabels = ["Sol plan", "Terra build", "Sol validate", "achieved"];
   const glass = "rounded-xl border border-white/10 bg-white/[0.045] backdrop-blur-xl";
   return (
     <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
       <div className="mx-auto max-w-2xl">
         <div className="text-center">
-          <div className="hud-label mb-1">mission</div>
+          <div className="hud-label mb-1">{goalMode ? "durable goal mode" : "mission"}</div>
           <div className="text-lg font-semibold leading-snug text-ice">{m.goal}</div>
+          {goalMode && (
+            <div className="mt-2 flex flex-wrap items-center justify-center gap-2 text-[10px] text-slate">
+              <span className="rounded-full border border-cyan/20 bg-cyan/[0.06] px-2 py-1 text-cyan">{String(m.route ?? "goal").replace(/_/g, " ")}</span>
+              {m.primaryRepo && <span className="rounded-full border border-white/10 px-2 py-1 font-mono">{m.primaryRepo}</span>}
+              {m.revisionWave > 0 && <span className="rounded-full border border-amber/25 bg-amber/[0.06] px-2 py-1 text-amber">repair wave {m.revisionWave}/{m.maxRevisionWaves}</span>}
+            </div>
+          )}
           <div className="mt-2 flex items-center justify-center gap-2">
-            <span className={`h-2 w-2 rounded-full ${m.status === "running" ? "bg-cyan animate-pulse" : m.status === "synthesizing" ? "bg-amber animate-pulse" : m.status === "done" ? "bg-emerald-400" : "bg-red-400"}`} />
+            <span className={`h-2 w-2 rounded-full ${m.status === "running" ? "bg-cyan animate-pulse" : ["synthesizing", "needs_input", "paused"].includes(m.status) ? "bg-amber animate-pulse" : m.status === "done" ? "bg-emerald-400" : "bg-red-400"}`} />
             <span className="hud-label">
-              {m.status === "synthesizing" ? "synthesizing report" : m.status} · {done}/{m.jobs.length} agents done
+              {m.status === "synthesizing" ? "synthesizing report" : m.phase ?? m.status} · {done}/{m.jobs.length} sessions complete
             </span>
           </div>
           <div className="mx-auto mt-3 h-1.5 w-64 overflow-hidden rounded-full bg-white/5">
             <div
               className="h-full rounded-full bg-gradient-to-r from-cyan/50 to-cyan transition-all duration-700"
-              style={{ width: `${m.status === "done" ? 100 : Math.round((done / Math.max(1, m.jobs.length)) * 92)}%` }}
+              style={{ width: `${goalMode ? Math.max(2, m.percent ?? 0) : m.status === "done" ? 100 : Math.round((done / Math.max(1, m.jobs.length)) * 92)}%` }}
             />
           </div>
         </div>
+        {goalMode && (
+          <div className={`${glass} mt-5 p-3`}>
+            <div className="grid grid-cols-4 gap-1.5">
+              {phaseLabels.map((label, index) => {
+                const complete = index < phaseIndex || m.status === "done";
+                const active = index === phaseIndex && m.status !== "done";
+                return (
+                  <div key={label} className={`rounded-lg border px-2 py-2 text-center text-[9px] uppercase tracking-[0.12em] ${complete ? "border-emerald-400/25 bg-emerald-400/[0.07] text-emerald-300" : active ? "border-cyan/35 bg-cyan/[0.08] text-cyan" : "border-white/[0.06] text-slate/55"}`}>
+                    <div className={`mx-auto mb-1 h-1.5 w-1.5 rounded-full ${complete ? "bg-emerald-300" : active ? "bg-cyan animate-pulse" : "bg-slate/30"}`} />
+                    {label}
+                  </div>
+                );
+              })}
+            </div>
+            {m.routeReason && <div className="mt-3 text-[11px] leading-relaxed text-slate">{m.routeReason}</div>}
+            {m.plan?.summary && <div className="mt-2 text-xs leading-relaxed text-ice">{m.plan.summary}</div>}
+            {m.externalKind === "app-factory" && m.externalSlug && (
+              <a href={`https://app-factory-v2.vercel.app/apps/${encodeURIComponent(m.externalSlug)}`} target="_blank" rel="noreferrer" className="mt-3 inline-flex rounded-lg border border-cyan/30 px-3 py-1.5 text-[10px] text-cyan hover:bg-cyan/10">
+                open App Factory · {m.externalStage ?? m.externalStatus ?? "queued"} ↗
+              </a>
+            )}
+          </div>
+        )}
         <div className="mt-5 space-y-2">
           {m.jobs.map((j: any) => (
             <div key={j._id} className={`${glass} flex items-center gap-3 p-3`}>
@@ -1076,11 +1128,28 @@ export function FleetView({ value }: { value: string }) {
                   <div className="mt-0.5 truncate font-mono text-[10px] text-cyan/80">› {j.progress}</div>
                 )}
               </div>
-              {j.model && <span className="hud-label shrink-0 !text-[9px]">{workModelLabel(j.model)}</span>}
+              {j.model && <span className="hud-label shrink-0 !text-[9px]">{workModelLabel(j.model)}{j.reasoningEffort ? `/${j.reasoningEffort}` : ""}</span>}
               <span className="hud-label shrink-0 !text-[9px]">{j.status}</span>
+              {j.pullRequestUrl && <a href={j.pullRequestUrl} target="_blank" rel="noreferrer" className="text-[9px] text-cyan">PR ↗</a>}
             </div>
           ))}
         </div>
+        {goalMode && m.failureReason && (
+          <div className="mt-4 rounded-xl border border-amber/25 bg-amber/[0.06] p-3 text-xs leading-relaxed text-amber">
+            <div className="hud-label mb-1 !text-amber">needs attention</div>
+            {m.failureReason}
+          </div>
+        )}
+        {goalMode && !["done", "cancelled"].includes(m.status) && (
+          <div className="mt-4 flex flex-wrap justify-center gap-2">
+            {m.status === "running" ? (
+              <button disabled={Boolean(busy)} onClick={() => void controlGoal("pause")} className="rounded-lg border border-white/10 px-3 py-1.5 text-[10px] text-slate hover:text-ice disabled:opacity-50">{busy === "pause" ? "pausing…" : "pause"}</button>
+            ) : (
+              <button disabled={Boolean(busy)} onClick={() => void controlGoal("resume")} className="rounded-lg border border-cyan/30 bg-cyan/[0.06] px-3 py-1.5 text-[10px] text-cyan hover:bg-cyan/10 disabled:opacity-50">{busy === "resume" ? "resuming…" : "resume"}</button>
+            )}
+            <button disabled={Boolean(busy)} onClick={() => void controlGoal("cancel")} className="rounded-lg border border-red-400/20 px-3 py-1.5 text-[10px] text-red-300/80 hover:bg-red-400/[0.06] disabled:opacity-50">{busy === "cancel" ? "cancelling…" : "cancel goal"}</button>
+          </div>
+        )}
         {m.summary && (
           <div className={`${glass} mt-4 p-4`}>
             <div className="hud-label mb-2">mission report</div>

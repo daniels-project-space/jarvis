@@ -185,6 +185,7 @@ export default defineSchema({
     result: v.optional(v.string()),
     readonly: v.optional(v.boolean()), // if true, runner never commits/pushes
     model: v.optional(v.string()), // optional Codex tier override (luna|terra|sol)
+    reasoningEffort: v.optional(v.string()), // optional per-job override (low|medium|high|max)
     mcp: v.optional(v.array(v.string())), // MCP servers to attach (playwright, context7)
     incidentId: v.optional(v.string()), // set on self-repair jobs → resolves the incident on success
     retried: v.optional(v.boolean()), // failed once already — no second retry
@@ -216,6 +217,9 @@ export default defineSchema({
     maxAttempts: v.optional(v.number()),
     parentJobId: v.optional(v.string()),
     dependsOn: v.optional(v.array(v.string())),
+    goalStage: v.optional(v.string()), // planning | building | validating | refining
+    goalWorkstreamId: v.optional(v.string()),
+    goalWave: v.optional(v.number()),
     acceptanceCriteria: v.optional(v.array(v.string())),
     modelReason: v.optional(v.string()),
     branch: v.optional(v.string()),
@@ -240,6 +244,7 @@ export default defineSchema({
   missions: defineTable({
     goal: v.string(),
     status: v.string(), // running | synthesizing | done | failed
+    mode: v.optional(v.string()), // fleet | goal
     agentCount: v.number(),
     summary: v.optional(v.string()),
     originThreadId: v.optional(v.string()),
@@ -249,8 +254,33 @@ export default defineSchema({
     phase: v.optional(v.string()),
     percent: v.optional(v.number()),
     acceptanceCriteria: v.optional(v.array(v.string())),
+    route: v.optional(v.string()),
+    routeReason: v.optional(v.string()),
+    primaryRepo: v.optional(v.string()),
+    infrastructureContext: v.optional(v.string()),
+    plan: v.optional(v.any()),
+    validation: v.optional(v.any()),
+    validationHistory: v.optional(v.array(v.any())),
+    planningJobId: v.optional(v.string()),
+    validatorJobId: v.optional(v.string()),
+    sharedBranch: v.optional(v.string()),
+    revisionWave: v.optional(v.number()),
+    maxRevisionWaves: v.optional(v.number()),
+    maxBuildSessions: v.optional(v.number()),
+    advanceAttempt: v.optional(v.number()),
+    advanceLeaseUntil: v.optional(v.number()),
+    pausedPhase: v.optional(v.string()),
+    pendingRefinements: v.optional(v.any()),
+    failureReason: v.optional(v.string()),
+    externalKind: v.optional(v.string()),
+    externalRunId: v.optional(v.string()),
+    externalSlug: v.optional(v.string()),
+    externalStatus: v.optional(v.string()),
+    externalStage: v.optional(v.string()),
+    externalUpdatedAt: v.optional(v.number()),
     synthesisAttempt: v.optional(v.number()),
     synthesisLeaseUntil: v.optional(v.number()),
+    completedAt: v.optional(v.number()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })

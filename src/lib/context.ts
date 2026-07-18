@@ -94,6 +94,7 @@ export async function buildContext(
   const biz = Array.isArray(brain?.business) ? brain.business : [];
   const stack = Array.isArray(brain?.projects) ? brain.projects : [];
   const goals = Array.isArray(brain?.goals) ? brain.goals : [];
+  const goalMissions = Array.isArray(brain?.goalMissions) ? brain.goalMissions : [];
   const jobs = Array.isArray(brain?.jobs) ? brain.jobs : [];
   const findings = Array.isArray(brain?.findings) ? brain.findings : [];
   const trip = brain?.trip;
@@ -150,6 +151,18 @@ export async function buildContext(
             (goal: any) =>
               `- ${goal.project}: ${goal.title} [${goal.status}, ${goal.progress}%, priority ${goal.priority}] — ${goal.outcome}` +
               `${goal.nextAction ? ` Next: ${goal.nextAction}` : ""}${goal.blockedBy ? ` Blocked by: ${goal.blockedBy}` : ""}`,
+          )
+          .join("\n"),
+    );
+  if (goalMissions.length)
+    lines.push(
+      "GOAL MODE — these are durable outcomes, not disposable chat jobs. Keep the main conversation available; inspect status before starting a duplicate:\n" +
+        goalMissions
+          .map(
+            (goal: any) =>
+              `- id=${goal.id} \"${goal.goal}\" [${goal.status}, ${goal.phase}, ${goal.percent ?? 0}%${goal.revisionWave ? `, repair wave ${goal.revisionWave}` : ""}]` +
+              `${goal.externalStage ? ` · external ${goal.externalStage}/${goal.externalStatus}` : ""}` +
+              `${goal.failureReason ? ` · needs attention: ${goal.failureReason}` : ""}`,
           )
           .join("\n"),
     );

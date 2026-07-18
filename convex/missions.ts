@@ -42,6 +42,7 @@ export const create = mutation({
     const { authTokenHash: _authTokenHash, dispatchToken: _dispatchToken, workerToken: _workerToken, ...mission } = a;
     return await ctx.db.insert("missions", {
       goal: mission.goal.slice(0, 500),
+      mode: "fleet",
       status: "running",
       agentCount: mission.agentCount,
       originThreadId: mission.originThreadId,
@@ -71,9 +72,19 @@ export const active = query({
   args: { ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    const rows = await ctx.db.query("missions").withIndex("by_createdAt").order("desc").take(20);
+    // Goal Mode can live for days. Indexed status reads keep it visible without
+    // repeatedly scanning a large mission history on every reactive UI update.
+    const [recent, ...openGroups] = await Promise.all([
+      ctx.db.query("missions").withIndex("by_createdAt").order("desc").take(20),
+      ...["running", "synthesizing", "paused", "needs_input"].map((status) =>
+        ctx.db.query("missions").withIndex("by_status", (q: any) => q.eq("status", status)).order("desc").take(20),
+      ),
+    ]);
+    const rows = [...openGroups.flat(), ...recent]
+      .filter((mission: any, index: number, all: any[]) => all.findIndex((candidate: any) => candidate._id === mission._id) === index)
+      .sort((left: any, right: any) => right.createdAt - left.createdAt);
     const live = rows.filter(
-      (m: any) => m.status === "running" || m.status === "synthesizing" || Date.now() - m.updatedAt < 14 * 86_400_000,
+      (m: any) => ["running", "synthesizing", "paused", "needs_input"].includes(m.status) || Date.now() - m.updatedAt < 14 * 86_400_000,
     );
     const out = [];
     for (const m of live) {
@@ -84,6 +95,7 @@ export const active = query({
       out.push({
         _id: m._id,
         goal: m.goal,
+        mode: m.mode ?? "fleet",
         status: m.status,
         agentCount: m.agentCount,
         summary: m.summary ?? null,
@@ -91,6 +103,23 @@ export const active = query({
         managerAgentId: m.managerAgentId ?? "jarvis",
         phase: m.phase ?? m.status,
         percent: m.percent ?? 0,
+        route: m.route ?? null,
+        routeReason: m.routeReason ?? null,
+        primaryRepo: m.primaryRepo ?? null,
+        plan: m.plan ?? null,
+        validation: m.validation ?? null,
+        validationHistory: m.validationHistory ?? [],
+        revisionWave: m.revisionWave ?? 0,
+        maxRevisionWaves: m.maxRevisionWaves ?? 0,
+        maxBuildSessions: m.maxBuildSessions ?? 0,
+        sharedBranch: m.sharedBranch ?? null,
+        externalKind: m.externalKind ?? null,
+        externalRunId: m.externalRunId ?? null,
+        externalSlug: m.externalSlug ?? null,
+        externalStatus: m.externalStatus ?? null,
+        externalStage: m.externalStage ?? null,
+        failureReason: m.failureReason ?? null,
+        completedAt: m.completedAt ?? null,
         updatedAt: m.updatedAt,
         jobs: jobs.map((j: any) => ({
           _id: j._id,
@@ -102,6 +131,13 @@ export const active = query({
           agentId: j.agentId ?? null,
           attempt: j.attempt ?? 1,
           model: j.model ? normalizeWorkModelTier(j.model) : null,
+          reasoningEffort: j.reasoningEffort ?? null,
+          goalStage: j.goalStage ?? null,
+          goalWorkstreamId: j.goalWorkstreamId ?? null,
+          goalWave: j.goalWave ?? 0,
+          branch: j.branch ?? null,
+          pullRequestUrl: j.pullRequestUrl ?? null,
+          verificationNote: j.verificationNote ?? null,
         })),
       });
     }
@@ -116,7 +152,7 @@ export const checkComplete = mutation({
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const m = await ctx.db.get(a.id);
-    if (!m || m.status !== "running") return null;
+    if (!m || m.status !== "running" || m.mode === "goal") return null;
     const jobs = await ctx.db
       .query("jobs")
       .withIndex("by_mission", (q: any) => q.eq("missionId", a.id))
@@ -156,6 +192,7 @@ export const claimReady = mutation({
       .order("asc")
       .take(30);
     for (const mission of synthesizing) {
+      if (mission.mode === "goal") continue;
       if ((mission.synthesisLeaseUntil ?? mission.updatedAt + SYNTHESIS_LEASE_MS) > now) continue;
       const jobs = await ctx.db
         .query("jobs")
@@ -175,6 +212,7 @@ export const claimReady = mutation({
       .order("asc")
       .take(30);
     for (const mission of missions) {
+      if (mission.mode === "goal") continue;
       const jobs = await ctx.db
         .query("jobs")
         .withIndex("by_mission", (q: any) => q.eq("missionId", mission._id))

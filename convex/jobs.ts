@@ -12,6 +12,7 @@ const enqueueArgs = {
   repo: v.optional(v.string()),
   readonly: v.optional(v.boolean()),
   model: v.optional(v.string()),
+  reasoningEffort: v.optional(v.string()),
   mcp: v.optional(v.array(v.string())),
   incidentId: v.optional(v.string()),
   retried: v.optional(v.boolean()),
@@ -28,6 +29,9 @@ const enqueueArgs = {
   modelReason: v.optional(v.string()),
   parentJobId: v.optional(v.string()),
   dependsOn: v.optional(v.array(v.string())),
+  goalStage: v.optional(v.string()),
+  goalWorkstreamId: v.optional(v.string()),
+  goalWave: v.optional(v.number()),
   maxAttempts: v.optional(v.number()),
   branch: v.optional(v.string()),
   checkpoint: v.optional(v.string()),
@@ -143,6 +147,7 @@ export const claimNext = mutation({
       repo: j.repo ?? null,
       readonly: j.readonly ?? false,
       model: j.model ? normalizeWorkModelTier(j.model) : null,
+      reasoningEffort: j.reasoningEffort ?? null,
       mcp: j.mcp ?? [],
       incidentId: j.incidentId ?? null,
       retried: j.retried ?? false,
@@ -160,6 +165,9 @@ export const claimNext = mutation({
       acceptanceCriteria: j.acceptanceCriteria ?? [],
       modelReason: j.modelReason ?? null,
       parentJobId: j.parentJobId ?? null,
+      goalStage: j.goalStage ?? null,
+      goalWorkstreamId: j.goalWorkstreamId ?? null,
+      goalWave: j.goalWave ?? 0,
     };
   },
 });
@@ -215,7 +223,20 @@ export const finalize = mutation({
           .query("jobs")
           .withIndex("by_mission", (q: any) => q.eq("missionId", row.missionId))
           .collect();
-        if (mission) {
+        if (mission && mission.mode === "goal") {
+          const stage = mission.phase === "refining" ? "refining" : mission.phase === "building" ? "building" : null;
+          if (stage) {
+            const wave = mission.revisionWave ?? 0;
+            const phaseJobs = jobs.filter((job: any) => job.goalStage === stage && (job.goalWave ?? 0) === wave);
+            const finished = phaseJobs.filter((job: any) => ["done", "error", "cancelled"].includes(job.status)).length;
+            const start = stage === "building" ? 12 : Math.min(90, 84 + wave * 3);
+            const end = stage === "building" ? 78 : Math.min(96, start + 6);
+            await ctx.db.patch(missionId, {
+              percent: Math.max(mission.percent ?? 0, Math.round(start + ((end - start) * finished) / Math.max(1, phaseJobs.length))),
+              updatedAt: now,
+            });
+          }
+        } else if (mission) {
           const finished = jobs.filter((j: any) => ["done", "error", "cancelled"].includes(j.status)).length;
           await ctx.db.patch(missionId, {
             phase: finished >= mission.agentCount ? "reviewing" : "executing",
@@ -700,6 +721,7 @@ export const active = query({
         missionId: j.missionId ?? null,
         repo: j.repo ?? null,
         model: j.model ? normalizeWorkModelTier(j.model) : null,
+        reasoningEffort: j.reasoningEffort ?? null,
         modelReason: j.modelReason ?? null,
         agentId: j.agentId ?? null,
         risk: j.risk ?? "low",
@@ -716,6 +738,9 @@ export const active = query({
         pullRequestUrl: j.pullRequestUrl ?? null,
         originThreadId: j.originThreadId ?? "main",
         parentJobId: j.parentJobId ?? null,
+        goalStage: j.goalStage ?? null,
+        goalWorkstreamId: j.goalWorkstreamId ?? null,
+        goalWave: j.goalWave ?? 0,
         startedAt: j.startedAt ?? j.createdAt,
         heartbeatAt: j.heartbeatAt ?? j.startedAt ?? j.createdAt,
         nextRunAt: j.nextRunAt ?? null,

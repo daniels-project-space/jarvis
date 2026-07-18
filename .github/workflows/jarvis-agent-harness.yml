@@ -20,6 +20,7 @@ jobs:
     timeout-minutes: 355
     env:
       CONVEX_URL: https://tangible-goose-318.convex.cloud
+      APP_FACTORY_CONVEX_URL: https://successful-starling-140.eu-west-1.convex.cloud
       CODEX_AUTH_JSON_B64: ${{ secrets.CODEX_AUTH_JSON_B64 }}
       JARVIS_WORKER_TOKEN: ${{ secrets.JARVIS_WORKER_TOKEN }}
       VAULT_ACCESS_TOKEN: ${{ secrets.VAULT_ACCESS_TOKEN }}

@@ -4,6 +4,7 @@ import {
   codexConversationExecPrefix,
   codexExecPrefix,
   codexModelFor,
+  normalizeReasoningEffort,
   pickConversationTier,
 } from "./model-policy";
 import { withHostContext } from "../lib/host-context";
@@ -44,6 +45,13 @@ describe("subscription model policy", () => {
       expect(args[0]).toBe("--search");
       expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
     }
+  });
+
+  it("allows Goal Mode to run Terra/high without changing the default tier policy", () => {
+    const args = codexExecPrefix("terra", "high");
+    expect(args).toContain('model_reasoning_effort="high"');
+    expect(args).toContain("gpt-5.6-terra");
+    expect(normalizeReasoningEffort("invented", "medium")).toBe("medium");
   });
 
   it("uses the lean subscription runtime only for foreground conversation", () => {

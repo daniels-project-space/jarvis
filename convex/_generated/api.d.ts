@@ -19,6 +19,7 @@ import type * as controlAuth from "../controlAuth.js";
 import type * as creationFiling from "../creationFiling.js";
 import type * as creations from "../creations.js";
 import type * as findings from "../findings.js";
+import type * as goalMode from "../goalMode.js";
 import type * as incidents from "../incidents.js";
 import type * as jobs from "../jobs.js";
 import type * as memory from "../memory.js";
@@ -55,6 +56,7 @@ declare const fullApi: ApiFromModules<{
   creationFiling: typeof creationFiling;
   creations: typeof creations;
   findings: typeof findings;
+  goalMode: typeof goalMode;
   incidents: typeof incidents;
   jobs: typeof jobs;
   memory: typeof memory;

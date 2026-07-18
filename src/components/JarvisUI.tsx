@@ -243,7 +243,7 @@ const OPTION_MOODS: { k: string; c: string }[] = [
   { k: "curious", c: "#33e0d0" }, { k: "serious", c: "#8fa3bd" }, { k: "excited", c: "#ff5470" },
 ];
 function OptionsPanel({
-  prefs, setPref, permissions, permissionBusy, onEnablePermissions, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary, onMacSetup,
+  prefs, setPref, permissions, permissionBusy, onEnablePermissions, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary, onOpenGoals, onMacSetup,
 }: {
   prefs: JarvisPrefs;
   setPref: (k: keyof JarvisPrefs, v: string | boolean) => void;
@@ -258,6 +258,7 @@ function OptionsPanel({
   onMood: (m: string) => void;
   onClearMood: () => void;
   onOpenLibrary: () => void;
+  onOpenGoals: () => void;
   onMacSetup: () => void;
 }) {
   const Row = ({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) => (
@@ -305,6 +306,11 @@ function OptionsPanel({
           <Row label="Saved work" hint="projects, inquiries, notes, emails, boards, maps and files">
             <button onClick={onOpenLibrary} className="rounded-lg border border-cyan/30 px-3 py-1 text-[11px] text-cyan transition hover:bg-cyan/10">
               open library
+            </button>
+          </Row>
+          <Row label="Goal Mode" hint="Sol plan → Terra/high build → Sol deep validation · durable for days">
+            <button onClick={onOpenGoals} className="rounded-lg border border-cyan/30 px-3 py-1 text-[11px] text-cyan transition hover:bg-cyan/10">
+              command deck
             </button>
           </Row>
           <Row label="Mac shortcut" hint="global keyboard/voice entry · local actions always need your click">
@@ -3125,6 +3131,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             setPanelFull(false);
             setPanelMin(false);
             void setPanel({ type: "creations", value: JSON.stringify({ kind: null, folder: null }), title: "saved work" });
+          }}
+          onOpenGoals={() => {
+            setOptionsOpen(false);
+            setPanelFull(false);
+            setPanelMin(false);
+            void setPanel({ type: "fleet", value: JSON.stringify({}), title: "Goal Mode" });
           }}
           onMacSetup={() => {
             setOptionsOpen(false);

@@ -6,7 +6,7 @@ import { sendPush } from "./push-send";
 import { INFRA_MAP } from "../lib/persona";
 import { routeWork } from "../mastra/routing";
 import { TEAM_BY_SLUG, type AgentSlug } from "../mastra/team";
-import { codexExecPrefix, codexModelFor } from "./model-policy";
+import { codexExecPrefix, codexModelFor, normalizeReasoningEffort } from "./model-policy";
 import { normalizeWorkModelTier } from "../lib/work-models";
 import { githubGitEnv, githubRepoUrl } from "./git-transport";
 import { vaultService } from "../lib/vault-client";
@@ -20,6 +20,7 @@ import {
   type AgentProvider,
 } from "./subscription-runtime";
 import { runConcurrentClaimLoop } from "./agent-pool";
+import { parseGoalPlan, parseGoalValidation, type GoalPlan } from "../lib/goal-mode";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -27,9 +28,11 @@ import { runConcurrentClaimLoop } from "./agent-pool";
 
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
+const APP_FACTORY_CONVEX_URL =
+  process.env.APP_FACTORY_CONVEX_URL ?? "https://successful-starling-140.eu-west-1.convex.cloud";
 
-function promptArgs(prompt: string, tier: string, json = false, mcpConfig?: string | null): string[] {
-  const args = codexExecPrefix(tier);
+function promptArgs(prompt: string, tier: string, json = false, mcpConfig?: string | null, reasoningEffort?: unknown): string[] {
+  const args = codexExecPrefix(tier, reasoningEffort);
   if (json) args.push("--json");
   if (mcpConfig) {
     try {
@@ -86,6 +89,62 @@ async function convexQuery(path: string, args: unknown) {
   } catch {
     return null;
   }
+}
+
+async function appFactoryCall(kind: "query" | "mutation", path: string, args: Record<string, unknown>) {
+  const response = await fetch(`${APP_FACTORY_CONVEX_URL.replace(/\/$/, "")}/api/${kind}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, args, format: "json" }),
+  });
+  const payload = await response.json();
+  if (!response.ok || payload?.status === "error") {
+    throw new Error(`App Factory ${path} failed: ${String(payload?.errorMessage ?? response.status).slice(0, 400)}`);
+  }
+  return payload.value;
+}
+
+async function startAppFactoryGoal(plan: GoalPlan, missionId: string) {
+  if (!plan.factory) throw new Error("The Sol plan omitted the required App Factory build brief");
+  const suffix = missionId.replace(/[^a-zA-Z0-9]/g, "").slice(-6).toLowerCase();
+  const baseSlug = plan.factory.slug.replace(/[^a-z0-9-]/g, "-").replace(/^-+|-+$/g, "").slice(0, 42) || "new-app";
+  const slug = `${baseSlug}-${suffix}`.slice(0, 50);
+  const existing: any = await appFactoryCall("query", "apps:bySlug", { slug });
+  if (existing?._id) return { kind: "app-factory", id: String(existing._id), slug };
+  const id = await appFactoryCall("mutation", "apps:create", {
+    slug,
+    name: plan.factory.name,
+    oneLiner: plan.summary.slice(0, 120),
+    idea: plan.factory.brief,
+    origin: "daniel",
+    priority: 100,
+  });
+  if (!id) throw new Error("App Factory did not return a live app id");
+  return { kind: "app-factory", id: String(id), slug };
+}
+
+async function syncExternalGoalRuns() {
+  const rows: any[] = (await convexQuery("goalMode:externalPending", {})) ?? [];
+  let updated = 0;
+  for (const row of rows.slice(0, 20)) {
+    if (row.externalKind !== "app-factory" || !row.externalRunId) continue;
+    try {
+      const app: any = await appFactoryCall("query", "apps:get", { id: row.externalRunId });
+      if (!app) throw new Error("App Factory run no longer exists");
+      const ok = await convexMutation("goalMode:updateExternal", {
+        id: row.id,
+        status: String(app.status ?? "unknown"),
+        stage: String(app.stage ?? "unknown"),
+        stageState: app.stageState ? String(app.stageState) : undefined,
+        detail: app.lastError ? String(app.lastError).slice(0, 1_500) : undefined,
+      });
+      if (ok) updated += 1;
+    } catch {
+      // A temporary provider failure must not rewrite durable goal state. The
+      // next scheduled cloud harness retries the same external id.
+    }
+  }
+  return updated;
 }
 // Weaves land wherever Daniel is actually chatting.
 async function chatThread(): Promise<string> {
@@ -185,11 +244,12 @@ function runAgent(
   mcpConfig?: string | null,
   executionState?: () => Promise<string>,
   timeoutMs = 900_000,
+  reasoningEffort?: unknown,
 ): Promise<{ text: string; timedOut: boolean; stopped: "paused" | "cancelled" | null; checkpointLog: string }> {
   return new Promise((resolve) => {
-    const args = promptArgs(prompt, model, true, mcpConfig);
+    const args = promptArgs(prompt, model, true, mcpConfig, reasoningEffort);
     const codexSelection = codexModelFor(model);
-    const runtimeLabel = `${codexSelection.model} · ${codexSelection.effort}`;
+    const runtimeLabel = `${codexSelection.model} · ${normalizeReasoningEffort(reasoningEffort, codexSelection.effort)}`;
     const p = spawn(bin, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     let buf = "";
     let stderr = "";
@@ -574,6 +634,111 @@ export async function runAgentHarness() {
     const failureBackoffMs = (attempt: number) =>
       Math.min(6 * 60 * 60 * 1000, 60_000 * 2 ** Math.max(0, Math.min(12, attempt - 1)));
 
+    const drainGoalAdvances = async (): Promise<number> => {
+      let advanced = 0;
+      for (let index = 0; index < 12; index += 1) {
+        const claim: any = await convexMutation("goalMode:claimAdvance", {}).catch(() => null);
+        if (!claim) break;
+        if (claim.kind === "advanced") {
+          advanced += 1;
+          continue;
+        }
+        if (claim.kind === "plan") {
+          let plan: GoalPlan;
+          try {
+            plan = parseGoalPlan(String(claim.result ?? ""), Number(claim.maxBuildSessions ?? 6));
+            plan.route = claim.route || plan.route;
+            plan.primaryRepo = claim.primaryRepo || plan.primaryRepo;
+          } catch (error) {
+            await convexMutation("goalMode:rejectAdvance", {
+              id: claim.missionId,
+              jobId: claim.jobId,
+              expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
+              error: String(error),
+            }).catch(() => null);
+            advanced += 1;
+            continue;
+          }
+          let externalRun: { kind: string; id: string; slug?: string } | undefined;
+          if (claim.route === "app_factory") {
+            try {
+              externalRun = await startAppFactoryGoal(plan, String(claim.missionId));
+            } catch (error) {
+              await convexMutation("goalMode:releaseAdvance", {
+                id: claim.missionId,
+                expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
+                error: String(error),
+                delayMs: 60_000,
+              }).catch(() => null);
+              break;
+            }
+          }
+          const result: any = await convexMutation("goalMode:recordPlan", {
+            id: claim.missionId,
+            expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
+            plan,
+            externalRun,
+          }).catch(() => null);
+          if (result?.advanced) {
+            advanced += 1;
+            const thread = await chatThread();
+            const line = result.external
+              ? `I have locked the Sol architecture and handed the build to App Factory ${externalRun?.slug ? `as ${externalRun.slug}` : ""}. I am monitoring every stage and will stop at its human gates.`
+              : `I have locked the Sol architecture. ${result.jobs} Terra/high sessions are now working through it on one durable goal branch; the final Sol review cannot pass without deep evidence.`;
+            await convexMutation("chatQueue:postAssistant", { threadId: thread, text: line }).catch(() => {});
+          }
+          continue;
+        }
+        if (claim.kind === "validation") {
+          let validation;
+          try {
+            validation = parseGoalValidation(String(claim.result ?? ""));
+          } catch (error) {
+            await convexMutation("goalMode:rejectAdvance", {
+              id: claim.missionId,
+              jobId: claim.jobId,
+              expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
+              error: String(error),
+            }).catch(() => null);
+            advanced += 1;
+            continue;
+          }
+          const result: any = await convexMutation("goalMode:recordValidation", {
+            id: claim.missionId,
+            expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
+            validation,
+          }).catch(() => null);
+          if (!result?.advanced) continue;
+          advanced += 1;
+          if (result.status === "done") {
+            const thread = await chatThread();
+            const report = [
+              `## Goal achieved\n${validation.summary}`,
+              validation.evidence.length ? `## Validation evidence\n${validation.evidence.map((item: string) => `- ${item}`).join("\n")}` : "",
+              validation.gaps.length ? `## Remaining notes\n${validation.gaps.map((item: string) => `- ${item}`).join("\n")}` : "",
+            ].filter(Boolean).join("\n\n");
+            const spoken = (await weaveLine(bin, env, "LONG-RUNNING GOAL COMPLETED", report)) || "The goal has passed its final Sol validation. The evidence is on your screen.";
+            await convexMutation("chatQueue:postAssistant", { threadId: thread, text: spoken }).catch(() => {});
+            await convexMutation("chatQueue:postCard", {
+              threadId: thread,
+              type: "markdown",
+              value: report.slice(0, 3_900),
+              title: "Goal Mode · validated outcome",
+            }).catch(() => {});
+            await sendPush("JARVIS — goal achieved", validation.summary.slice(0, 120), "/").catch(() => {});
+          } else if (result.status === "needs_input") {
+            const thread = await chatThread();
+            await convexMutation("chatQueue:postAssistant", {
+              threadId: thread,
+              text: `The deep validator found a boundary I cannot cross honestly: ${String(result.reason ?? validation.summary).slice(0, 320)} I have preserved every checkpoint in Goal Mode.`,
+            }).catch(() => {});
+            await sendPush("JARVIS needs your decision", String(result.reason ?? validation.summary).slice(0, 120), "/").catch(() => {});
+          }
+        }
+      }
+      return advanced;
+    };
+
     // One permanent agent's lifecycle: clone an isolated branch, execute one
     // bounded segment, checkpoint or verify, then report to the originating
     // conversation. Mission jobs remain quiet until the reviewed synthesis.
@@ -692,6 +857,7 @@ export async function runAgentHarness() {
             return state === "superseded" ? "cancelled" : state;
           },
           segmentTimeoutMs(model),
+          job.reasoningEffort,
         );
         const result = run.text;
 
@@ -800,6 +966,35 @@ export async function runAgentHarness() {
               threadId: originThread,
               text: `${profile.name} could not complete that safely: ${failure.slice(0, 220)}`,
             }).catch(() => {});
+          return;
+        }
+
+        if (job.goalStage === "planning" || job.goalStage === "validating") {
+          try {
+            if (job.goalStage === "planning") parseGoalPlan(result, 8);
+            else parseGoalValidation(result);
+          } catch (error) {
+            await convexMutation("jobs:checkpointAndRequeue", {
+              jobId: job.jobId,
+              expectedAttempt,
+              checkpoint:
+                `The investigation completed, but the machine contract was invalid: ${String(error).slice(0, 1_000)}\n` +
+                `Preserve the reasoning and return the required marker plus compact valid JSON. Do not redo discovery merely to repair formatting.`,
+              result: result.slice(0, 4_000),
+              branch: branch ?? undefined,
+              delayMs: 5_000,
+            }).catch(() => null);
+            return;
+          }
+          const finalized = await convexMutation("jobs:finalize", {
+            jobId: job.jobId,
+            expectedAttempt,
+            status: "done",
+            result: result.slice(0, 4_000),
+            verificationVerdict: "pass",
+            verificationNote: `${job.goalStage === "planning" ? "Goal plan" : "Deep validation"} machine contract is structurally valid`,
+          });
+          if (finalized) await drainGoalAdvances();
           return;
         }
 
@@ -923,6 +1118,10 @@ export async function runAgentHarness() {
           await convexMutation("incidents:setStatus", { id: job.incidentId, status: "resolved" }).catch(() => {});
 
         if (job.missionId) {
+          if (job.goalStage) {
+            await drainGoalAdvances();
+            return;
+          }
           const fleetFid = await convexMutation("findings:add", {
             source: job.task,
             spoken: `Fleet update: "${job.label ?? job.task.slice(0, 40)}" passed supervisor review.`,
@@ -1020,6 +1219,7 @@ export async function runAgentHarness() {
       await sendPush("JARVIS — mission complete", synth.goal.slice(0, 120), "/");
     };
     const maybeSynthesizeMission = async (missionId: string): Promise<void> => {
+      await drainGoalAdvances();
       const synth: any = await convexMutation("missions:checkComplete", { id: missionId }).catch(() => null);
       if (synth) await synthesizeMissionClaim(synth);
     };
@@ -1028,6 +1228,8 @@ export async function runAgentHarness() {
     // overlap; Convex's atomic status+attempt lease prevents duplicate work.
     // A short idle drain catches jobs queued beside a mission without holding
     // an Actions runner open after the queue is empty.
+    await syncExternalGoalRuns();
+    await drainGoalAdvances();
     processed += await runConcurrentClaimLoop({
       capacity: 3,
       claimWindowMs: 120_000,
@@ -1036,6 +1238,8 @@ export async function runAgentHarness() {
       claim: () => convexMutation("jobs:claimNext", {}),
       run: processJob,
     });
+    await syncExternalGoalRuns();
+    await drainGoalAdvances();
     // Approval declines/cancellations do not run processJob, so sweep terminal
     // missions after normal work. Each claim flips running → synthesizing in
     // Convex, preventing another cron invocation from reporting it twice.

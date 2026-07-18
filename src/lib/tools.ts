@@ -71,6 +71,24 @@ export const TOOL_DEFS = [
     },
   },
   {
+    name: "goal_mode",
+    description:
+      "Start or control one durable long-running outcome. Goal Mode uses one Sol/max architecture session, 2-8 dependency-aware Terra/high build sessions with persistent checkpoints, then Sol/max deep validation and bounded repair waves. It routes new apps through App Factory, video work through YouTube Studio AI, existing products into their own repo, and genuinely new infrastructure through Daniel's isolated cloud standard. Use for outcomes that may take hours or days; use orchestrate for a short parallel fleet.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["start", "status", "pause", "resume", "cancel"] },
+        goal: { type: "string", description: "Concrete observable outcome; required for start" },
+        mission_id: { type: "string", description: "Goal Mode mission id; required for pause/resume/cancel and optional for status" },
+        repo: { type: "string", description: "Known owner/repo only when the goal explicitly belongs there" },
+        acceptance_criteria: { type: "array", items: { type: "string" }, description: "Observable goal-level truths the final Sol validator must prove" },
+        build_sessions: { type: "number", description: "Maximum bounded Terra/high implementation sessions, 2-8; default 6" },
+        revision_waves: { type: "number", description: "Maximum automatic Terra repair waves after final validation, 1-4; default 2" },
+      },
+      required: ["action"],
+    },
+  },
+  {
     name: "work_control",
     description:
       "Control a durable team job shown in the command deck: approve or decline consequential work, pause/resume/cancel an active job, or retry a failed job. Use only after Daniel identifies the job or explicitly answers an approval card.",
@@ -2985,6 +3003,59 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       return route.approvalRequired
         ? `${TEAM_BY_SLUG[agentId].name} has a scoped plan ready as job ${jobId}, but it includes a consequential external action. I put it in Needs you and will not execute it until Daniel approves.`
         : `${TEAM_BY_SLUG[agentId].name} owns job ${jobId}${args.parent_job_id ? ` as a concurrent follow-up to ${String(args.parent_job_id)}` : ""}. It is bound to this conversation, visible live in the command deck, and can run beside that specialist's other jobs on its own lease and checkout.`;
+    }
+    case "goal_mode": {
+      const action = String(args.action ?? "status");
+      const missionId = String(args.mission_id ?? "").trim();
+      if (action === "status") {
+        const missions: any[] = (await convexQuery("missions:active", {})) ?? [];
+        const goal = missionId
+          ? missions.find((mission) => String(mission._id) === missionId && mission.mode === "goal")
+          : missions.find((mission) => mission.mode === "goal" && ["running", "paused", "needs_input"].includes(mission.status));
+        await convexMutation("ui:setPanel", {
+          type: "fleet",
+          value: JSON.stringify(goal ? { missionId: String(goal._id) } : {}),
+          title: goal ? `goal · ${String(goal.goal).slice(0, 44)}` : "Goal Mode",
+        }).catch(() => {});
+        return goal
+          ? `Goal ${goal._id} is ${goal.status}, phase ${goal.phase}, ${goal.percent}% complete${goal.failureReason ? ` — ${goal.failureReason}` : ""}. Its durable sessions and evidence are on screen.`
+          : "There is no active Goal Mode outcome. The Goal Mode command deck is open.";
+      }
+      if (action === "pause" || action === "resume" || action === "cancel") {
+        if (!missionId) return `Choose the Goal Mode outcome to ${action}.`;
+        const ok = await convexMutation("goalMode:control", { id: missionId, action, authTokenHash });
+        if (ok && action === "resume") await wakeAgentHarness(`goal-resume:${missionId}`).catch(() => false);
+        return ok ? `Goal Mode ${missionId} ${action} request applied.` : `That goal cannot be ${action}d from its current state.`;
+      }
+      if (action !== "start") return "Unknown Goal Mode action.";
+      const goal = String(args.goal ?? "").trim();
+      if (goal.length < 12) return "Tell me the concrete outcome Goal Mode must achieve.";
+      const { routeGoal } = await import("./goal-mode");
+      const route = routeGoal(goal, args.repo ? String(args.repo) : undefined);
+      const originThreadId = await activeThread();
+      const created = await convexMutation("goalMode:create", {
+        authTokenHash,
+        goal,
+        route: route.kind,
+        routeReason: route.reason,
+        primaryRepo: route.primaryRepo,
+        infrastructureContext: route.infrastructureContext,
+        originThreadId,
+        priority: 98,
+        risk: "high",
+        acceptanceCriteria: Array.isArray(args.acceptance_criteria) ? args.acceptance_criteria.map(String).slice(0, 10) : undefined,
+        maxBuildSessions: Number(args.build_sessions) || 6,
+        maxRevisionWaves: Number(args.revision_waves) || 2,
+      });
+      const id = String(created?.missionId ?? "");
+      if (!id) throw new Error("Goal Mode did not create a durable mission");
+      await wakeAgentHarness(`goal:${id}`).catch(() => false);
+      await convexMutation("ui:setPanel", {
+        type: "fleet",
+        value: JSON.stringify({ missionId: id }),
+        title: `goal · ${goal.slice(0, 44)}`,
+      }).catch(() => {});
+      return `Goal Mode ${id} is live. Route: ${route.kind}${route.primaryRepo ? ` in ${route.primaryRepo}` : ""} — ${route.reason} One Sol/max planner is working now; it will hand bounded work to Terra/high, preserve checkpoints for days if needed, and only finish after a Sol/max deep validation passes.`;
     }
     case "orchestrate": {
       const mission = String(args.mission ?? "").trim();

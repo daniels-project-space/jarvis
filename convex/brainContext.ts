@@ -11,7 +11,7 @@ export const snapshot = query({
     await requireViewer(ctx, a);
     const text = a.userText?.trim().slice(0, 240);
     const activeStatuses = ["running", "pending", "awaiting_approval", "paused", "needs_input"];
-    const [memHit, memRecent, business, projects, activeGroups, findings, trip, draft, location, panel, creations, agents, attentionGroups, approvals, goalGroups] =
+    const [memHit, memRecent, business, projects, activeGroups, findings, trip, draft, location, panel, creations, agents, attentionGroups, approvals, goalGroups, missionGoals] =
       await Promise.all([
         text
           ? ctx.db
@@ -72,6 +72,7 @@ export const snapshot = query({
               .take(20),
           ),
         ),
+        ctx.db.query("missions").withIndex("by_createdAt").order("desc").take(20),
       ]);
     const activeJobs = activeGroups.flat().sort((x: any, y: any) => (y.priority ?? 50) - (x.priority ?? 50));
     const liveAgents = agents.map((profile) => {
@@ -93,6 +94,21 @@ export const snapshot = query({
       business,
       projects,
       goals: goalGroups.flat().sort((left: any, right: any) => right.priority - left.priority).slice(0, 24),
+      goalMissions: missionGoals
+        .filter((mission: any) => mission.mode === "goal" && ["running", "paused", "needs_input"].includes(mission.status))
+        .slice(0, 8)
+        .map((mission: any) => ({
+          id: String(mission._id),
+          goal: mission.goal,
+          status: mission.status,
+          phase: mission.phase,
+          percent: mission.percent,
+          route: mission.route,
+          revisionWave: mission.revisionWave ?? 0,
+          failureReason: mission.failureReason,
+          externalStatus: mission.externalStatus,
+          externalStage: mission.externalStage,
+        })),
       jobs: activeJobs,
       findings,
       trip,

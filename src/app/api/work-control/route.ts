@@ -10,11 +10,15 @@ export async function POST(req: NextRequest) {
   }
   const body = await req.json().catch(() => ({}));
   const jobId = String(body?.jobId ?? "");
+  const missionId = String(body?.missionId ?? "");
   const action = String(body?.action ?? "");
-  if (!jobId || !ACTIONS.has(action)) return Response.json({ ok: false }, { status: 400 });
+  if ((!jobId && !missionId) || !ACTIONS.has(action)) return Response.json({ ok: false }, { status: 400 });
 
   let ok: unknown = false;
-  if (action === "approve" || action === "decline") {
+  if (missionId) {
+    if (!new Set(["pause", "resume", "cancel"]).has(action)) return Response.json({ ok: false }, { status: 400 });
+    ok = await controlMutation("goalMode:control", { id: missionId, action, authTokenHash });
+  } else if (action === "approve" || action === "decline") {
     ok = await controlMutation("approvals:decide", {
       jobId,
       decision: action === "approve" ? "approved" : "declined",

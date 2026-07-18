@@ -11,20 +11,26 @@ export const CODEX_MODEL_POLICY = {
 } as const;
 
 export type CodexModelSelection = (typeof CODEX_MODEL_POLICY)[WorkModelTier];
+export type CodexReasoningEffort = "low" | "medium" | "high" | "max";
+
+export function normalizeReasoningEffort(value: unknown, fallback: CodexReasoningEffort): CodexReasoningEffort {
+  return value === "low" || value === "medium" || value === "high" || value === "max" ? value : fallback;
+}
 
 export function codexModelFor(tier: string): CodexModelSelection {
   return CODEX_MODEL_POLICY[normalizeWorkModelTier(tier)];
 }
 
-export function codexExecPrefix(tier: string): string[] {
+export function codexExecPrefix(tier: string, effort?: unknown): string[] {
   const selected = codexModelFor(tier);
+  const reasoningEffort = normalizeReasoningEffort(effort, selected.effort);
   return [
     "--search",
     "exec",
     "--model",
     selected.model,
     "--config",
-    `model_reasoning_effort=\"${selected.effort}\"`,
+    `model_reasoning_effort=\"${reasoningEffort}\"`,
     "--dangerously-bypass-approvals-and-sandbox",
   ];
 }
