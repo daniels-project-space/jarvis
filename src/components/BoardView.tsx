@@ -95,6 +95,25 @@ export default function BoardView({ value }: { value: string }) {
     });
   };
 
+  const focusConcept = (title: string) => {
+    const ex = apiRef.current;
+    if (!ex || !title) return;
+    const query = title.toLowerCase();
+    const elements = ex.getSceneElements();
+    const direct = elements.filter((element: any) => String(element.text ?? "").toLowerCase().includes(query));
+    const ids = new Set(direct.flatMap((element: any) => [element.id, element.containerId].filter(Boolean)));
+    const targets = elements.filter((element: any) => ids.has(element.id) || ids.has(element.containerId));
+    if (!targets.length) return;
+    ex.scrollToContent(targets, {
+      fitToViewport: true,
+      viewportZoomFactor: 0.52,
+      minZoom: 0.5,
+      maxZoom: 0.9,
+      animate: true,
+      duration: 380,
+    });
+  };
+
   // Apply queued brain ops + restore images whenever the doc changes.
   useEffect(() => {
     const ex = apiRef.current;
@@ -189,12 +208,14 @@ export default function BoardView({ value }: { value: string }) {
       </div>
     );
 
-  const semanticNodes = Object.values(doc.semanticNodes ?? {}) as { category?: string }[];
+  const semanticNodes = Object.values(doc.semanticNodes ?? {}) as { id?: string; category?: string; title?: string; detail?: string }[];
   const categoryCounts = semanticNodes.reduce<Record<string, number>>((counts, node) => {
     const category = String(node.category ?? "note");
     counts[category] = (counts[category] ?? 0) + 1;
     return counts;
   }, {});
+  const latestNodeIds = new Set<string>((doc.sourceLog?.at(-1)?.nodeIds ?? []).map(String));
+  const latestConcepts = (latestNodeIds.size ? semanticNodes.filter((node) => latestNodeIds.has(String(node.id))) : semanticNodes).slice(0, 10);
 
   return (
     <div className="relative min-h-0 flex-1 overflow-hidden" style={{ colorScheme: "dark" }}>
@@ -222,7 +243,7 @@ export default function BoardView({ value }: { value: string }) {
         }}
         UIOptions={{ canvasActions: { toggleTheme: false, saveToActiveFile: false, loadScene: false, export: { saveFileToDisk: true } } }}
       />
-      <div className="pointer-events-none absolute left-3 top-14 z-20 max-w-[calc(100%-24px)] rounded-xl border border-cyan/20 bg-[#071019]/88 px-3 py-2 shadow-[0_14px_42px_rgba(0,0,0,0.35)] backdrop-blur-md">
+      <div className="pointer-events-none absolute left-3 right-3 top-14 z-20 rounded-xl border border-cyan/20 bg-[#071019]/90 px-3 py-2 shadow-[0_14px_42px_rgba(0,0,0,0.35)] backdrop-blur-md">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
           <div className="min-w-0">
             <div className="max-w-[280px] truncate text-[11px] font-semibold uppercase tracking-[0.15em] text-ice">{doc.title}</div>
@@ -243,6 +264,23 @@ export default function BoardView({ value }: { value: string }) {
             fit overview
           </button>
         </div>
+        {latestConcepts.length > 0 && (
+          <div className="scrollbar-thin pointer-events-auto mt-2 flex gap-2 overflow-x-auto pb-1" aria-label="Latest extracted concepts">
+            {latestConcepts.map((node) => (
+              <button
+                key={node.id ?? `${node.category}-${node.title}`}
+                type="button"
+                onClick={() => focusConcept(String(node.title ?? ""))}
+                className="group min-w-[150px] max-w-[190px] flex-1 rounded-lg border border-white/10 bg-white/[0.035] px-2.5 py-2 text-left transition hover:border-cyan/45 hover:bg-cyan/[0.07]"
+                title={`Focus ${node.title ?? "concept"} on the editable canvas`}
+              >
+                <span className="block text-[7px] font-semibold uppercase tracking-[0.16em] text-cyan-dim">{node.category ?? "note"}</span>
+                <span className="mt-1 block truncate text-[10px] font-medium text-ice group-hover:text-cyan">{node.title}</span>
+                {node.detail && <span className="mt-0.5 line-clamp-2 block text-[8px] leading-3 text-slate">{node.detail}</span>}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
