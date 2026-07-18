@@ -44,10 +44,10 @@ export function shouldCloseLiveUtterance(state: LiveVadState, now: number): bool
 }
 
 /**
- * One frame of the full-duplex voice gate. Speaker output is never ordinary
- * speech input: only a sustained, clearly foreground voice may barge in while
- * TTS is playing. The short tail guard also rejects audio still leaving the
- * speakers after playback reports that it ended.
+ * One frame of the live voice gate. A single laptop microphone cannot
+ * reliably distinguish a loud human interruption from the assistant coming
+ * out of its own speakers. TTS and its acoustic tail are therefore a hard
+ * boundary: no frame can start or extend an utterance while guarded.
  */
 export function advanceLiveVad(state: LiveVadState, frame: LiveVadFrame): {
   state: LiveVadState;
@@ -69,20 +69,15 @@ export function advanceLiveVad(state: LiveVadState, frame: LiveVadFrame): {
   const speechShaped = highFrequencyLevel === undefined || voiceLevel >= highFrequencyLevel * 1.1 + 2;
 
   if (guarded) {
-    const foreground = frame.ttsActive && speechShaped && voiceLevel > Math.max(46, threshold + 24);
-    const bargeFrames = foreground ? state.bargeFrames + 1 : 0;
-    const bargeIn = !state.spoke && bargeFrames >= 5;
     return {
       state: {
         ...state,
         noiseFloor,
         voiceFrames: 0,
-        bargeFrames,
-        spoke: state.spoke || bargeIn,
-        lastVoice: bargeIn ? frame.now : state.lastVoice,
+        bargeFrames: 0,
       },
-      acceptedSpeech: bargeIn,
-      bargeIn,
+      acceptedSpeech: false,
+      bargeIn: false,
     };
   }
 

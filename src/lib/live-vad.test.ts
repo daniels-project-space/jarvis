@@ -34,10 +34,10 @@ describe("live full-duplex voice gate", () => {
     expect(result.barged).toBe(false);
   });
 
-  it("allows a sustained foreground voice to interrupt TTS", () => {
+  it("never accepts loud speaker output as a barge-in", () => {
     const result = frames(Array(5).fill(70), { ttsActive: true });
-    expect(result.state.spoke).toBe(true);
-    expect(result.barged).toBe(true);
+    expect(result.state.spoke).toBe(false);
+    expect(result.barged).toBe(false);
   });
 
   it("rejects the speaker tail after TTS ends", () => {

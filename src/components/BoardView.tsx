@@ -52,6 +52,7 @@ export default function BoardView({ value }: { value: string }) {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [ready, setReady] = useState(false);
   const initialLoaded = useRef(false);
+  const overviewFitDone = useRef(false);
 
   const doc = useMemo(() => {
     try {
@@ -79,6 +80,21 @@ export default function BoardView({ value }: { value: string }) {
     }).catch(() => {});
   };
 
+  const fitOverview = (animate = true) => {
+    const ex = apiRef.current;
+    if (!ex) return;
+    const elements = ex.getSceneElements();
+    if (!elements.length) return;
+    ex.scrollToContent(elements, {
+      fitToViewport: true,
+      viewportZoomFactor: 0.72,
+      minZoom: 0.08,
+      maxZoom: 1,
+      animate,
+      duration: animate ? 420 : 0,
+    });
+  };
+
   // Apply queued brain ops + restore images whenever the doc changes.
   useEffect(() => {
     const ex = apiRef.current;
@@ -96,6 +112,8 @@ export default function BoardView({ value }: { value: string }) {
       const ops = (doc.pendingOps ?? []).filter((op: any) => (op.ts ?? 0) > appliedTs.current);
       if (!ops.length) return;
       const skeletons: any[] = [];
+      const skeletonFocus: (string | undefined)[] = [];
+      const latestFocusBatch = [...ops].reverse().find((op: any) => op.focusBatch)?.focusBatch as string | undefined;
       for (const op of ops) {
         // edit/delete existing items by fuzzy text match — "fix what I asked"
         if (op.kind === "edit" || op.kind === "delete") {
@@ -123,7 +141,10 @@ export default function BoardView({ value }: { value: string }) {
           appliedTs.current = Math.max(appliedTs.current, op.ts ?? 0);
           continue;
         }
-        if (op.kind === "skeleton") skeletons.push(op.skel);
+        if (op.kind === "skeleton") {
+          skeletons.push(op.skel);
+          skeletonFocus.push(op.focusBatch);
+        }
         else if (op.kind === "image" && op.url) {
           const fileId = fileIdFor(op.url);
           if (!ex.getFiles()?.[fileId]) {
@@ -132,6 +153,7 @@ export default function BoardView({ value }: { value: string }) {
               ex.addFiles([{ id: fileId, dataURL, mimeType: dataURL.slice(5, dataURL.indexOf(";")) || "image/png", created: Date.now(), __url: op.url } as any]);
           }
           skeletons.push({ type: "image", x: op.x, y: op.y, width: op.w, height: op.h, fileId, link: op.link });
+          skeletonFocus.push(op.focusBatch);
         }
         appliedTs.current = Math.max(appliedTs.current, op.ts ?? 0);
       }
@@ -139,7 +161,18 @@ export default function BoardView({ value }: { value: string }) {
       if (skeletons.length) {
         const fresh = convertToExcalidrawElements(skeletons, { regenerateIds: true });
         ex.updateScene({ elements: [...ex.getSceneElements(), ...fresh] });
-        ex.scrollToContent(fresh, { fitToViewport: false, animate: true });
+        // Frame the entire semantic thought, not the first sticky note. Keeping
+        // content to ~64% of the viewport gives enough surrounding context to
+        // see its category and connected nodes without a manual zoom-out.
+        const focus = latestFocusBatch ? fresh.filter((_, index) => skeletonFocus[index] === latestFocusBatch) : fresh;
+        ex.scrollToContent(focus.length ? focus : fresh, {
+          fitToViewport: true,
+          viewportZoomFactor: 0.64,
+          minZoom: 0.12,
+          maxZoom: 1.15,
+          animate: true,
+          duration: 460,
+        });
       }
       void persist(); // also clears applied edit/delete ops from the queue
     })();
@@ -156,13 +189,24 @@ export default function BoardView({ value }: { value: string }) {
       </div>
     );
 
+  const semanticNodes = Object.values(doc.semanticNodes ?? {}) as { category?: string }[];
+  const categoryCounts = semanticNodes.reduce<Record<string, number>>((counts, node) => {
+    const category = String(node.category ?? "note");
+    counts[category] = (counts[category] ?? 0) + 1;
+    return counts;
+  }, {});
+
   return (
-    <div className="min-h-0 flex-1" style={{ colorScheme: "dark" }}>
+    <div className="relative min-h-0 flex-1 overflow-hidden" style={{ colorScheme: "dark" }}>
       <Excalidraw
         theme="dark"
         excalidrawAPI={(ex: any) => {
           apiRef.current = ex;
           setReady(true);
+          if (!overviewFitDone.current && (doc.elements?.length ?? 0) > 0) {
+            overviewFitDone.current = true;
+            window.setTimeout(() => fitOverview(false), 60);
+          }
         }}
         initialData={{
           elements: initialLoaded.current ? undefined : doc.elements ?? [],
@@ -178,6 +222,28 @@ export default function BoardView({ value }: { value: string }) {
         }}
         UIOptions={{ canvasActions: { toggleTheme: false, saveToActiveFile: false, loadScene: false, export: { saveFileToDisk: true } } }}
       />
+      <div className="pointer-events-none absolute left-3 top-14 z-20 max-w-[calc(100%-24px)] rounded-xl border border-cyan/20 bg-[#071019]/88 px-3 py-2 shadow-[0_14px_42px_rgba(0,0,0,0.35)] backdrop-blur-md">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+          <div className="min-w-0">
+            <div className="max-w-[280px] truncate text-[11px] font-semibold uppercase tracking-[0.15em] text-ice">{doc.title}</div>
+            <div className="mt-0.5 text-[9px] uppercase tracking-[0.14em] text-slate">
+              {semanticNodes.length ? `${semanticNodes.length} concepts · ${doc.semanticEdges?.length ?? 0} links` : "live spatial workspace"}
+            </div>
+          </div>
+          {Object.entries(categoryCounts).map(([category, count]) => (
+            <span key={category} className="rounded-full border border-white/10 bg-white/[0.035] px-2 py-0.5 text-[8px] uppercase tracking-[0.12em] text-cyan-dim">
+              {category} {count}
+            </span>
+          ))}
+          <button
+            type="button"
+            onClick={() => fitOverview(true)}
+            className="pointer-events-auto ml-auto rounded-md border border-cyan/25 px-2 py-1 text-[9px] uppercase tracking-[0.14em] text-cyan transition hover:border-cyan/60 hover:bg-cyan/10"
+          >
+            fit overview
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

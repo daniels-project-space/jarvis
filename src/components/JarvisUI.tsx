@@ -231,6 +231,13 @@ function panelSize(panel: { type: string; value: string }): string {
       return "w-[min(560px,94%)] h-[min(360px,80%)]";
     case "scene":
       return "w-[min(1440px,98%)] h-[min(820px,97%)]";
+    case "board":
+    case "canvas":
+      // Drawing stays a large working surface but deliberately leaves the
+      // right-side Jarvis lane visible instead of claiming full-bleed mode;
+      // the stage wrapper already reserves that lane, so don't subtract it a
+      // second time and accidentally crush the canvas.
+      return "w-[97%] md:w-full h-[min(820px,96%)]";
     case "markdown":
       return "w-[min(980px,97%)] h-full";
     case "doc":
@@ -1370,6 +1377,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const speakingRef = useRef(false);
   const wasSpeakingRef = useRef(false);
   const ttsQuietUntilRef = useRef(0);
+  const keyboardQuietUntilRef = useRef(0);
   useEffect(() => {
     speakingRef.current = speaking;
     if (wasSpeakingRef.current && !speaking) {
@@ -1550,11 +1558,20 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // answer before calling play() is too late and used to leave fully-loaded
     // MP3s silent with NotAllowedError, particularly in the Project Hub embed.
     const unlock = () => unlockSpeechPlayback();
+    const keyboardActivity = () => {
+      // Physical key taps are close to the laptop microphone and can resemble
+      // voiced transients to a generic VAD. DOM input gives us deterministic
+      // evidence, so mute capture briefly rather than asking STT to guess.
+      keyboardQuietUntilRef.current = Math.max(keyboardQuietUntilRef.current, Date.now() + 700);
+      unlock();
+    };
     window.addEventListener("pointerdown", unlock, { capture: true });
-    window.addEventListener("keydown", unlock, { capture: true });
+    window.addEventListener("keydown", keyboardActivity, { capture: true });
+    window.addEventListener("keyup", keyboardActivity, { capture: true });
     return () => {
       window.removeEventListener("pointerdown", unlock, { capture: true });
-      window.removeEventListener("keydown", unlock, { capture: true });
+      window.removeEventListener("keydown", keyboardActivity, { capture: true });
+      window.removeEventListener("keyup", keyboardActivity, { capture: true });
     };
   }, []);
   const setPref = (k: keyof JarvisPrefs, v: string | boolean) => {
@@ -2688,7 +2705,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           now,
           startedAt: t0,
           ttsActive,
-          quietUntil: ttsQuietUntilRef.current,
+          quietUntil: Math.max(ttsQuietUntilRef.current, keyboardQuietUntilRef.current),
         });
         vad = result.state;
         if (result.acceptedSpeech) {

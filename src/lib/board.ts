@@ -1,5 +1,13 @@
 import "server-only";
 import { convexMutation, convexQuery } from "./context";
+import {
+  type BoardCaptureInput,
+  type BoardSemanticEdge,
+  type BoardSemanticNode,
+  boardZoneForCategory,
+  normalizeBoardCapture,
+  semanticCategoryLabel,
+} from "./board-semantic";
 
 // The board engine — JARVIS's infinite canvas (rendered client-side by
 // Excalidraw). The brain works in ZONES (named regions) and high-level items
@@ -9,6 +17,7 @@ import { convexMutation, convexQuery } from "./context";
 type Zone = { x: number; y: number; w: number; h: number; cursor: number };
 export type BoardDoc = {
   kind: "board";
+  version?: 2;
   title: string;
   project?: string;
   inquiry?: string;
@@ -16,6 +25,9 @@ export type BoardDoc = {
   pendingOps: any[]; // {ts, kind:"skeleton"|"image", ...}
   elements: any[]; // full excalidraw elements — client-persisted
   imageUrls: Record<string, string>;
+  semanticNodes?: Record<string, BoardSemanticNode>;
+  semanticEdges?: BoardSemanticEdge[];
+  sourceLog?: { text: string; nodeIds: string[]; capturedAt: number }[];
 };
 
 // Excalidraw's own pastel palette — designed to survive the dark-theme invert
@@ -37,15 +49,23 @@ const color = (c?: string) => COLORS[String(c ?? "")] ?? COLORS.green;
 const TEMPLATES: Record<string, { name: string; w: number; h: number }[][]> = {
   film: [
     [
-      { name: "characters", w: 1800, h: 1300 },
-      { name: "locations", w: 1800, h: 1300 },
-      { name: "moodboard", w: 1800, h: 1300 },
+      { name: "characters", w: 1500, h: 1100 },
+      { name: "locations", w: 1500, h: 1100 },
+      { name: "themes", w: 1500, h: 1100 },
     ],
     [
-      { name: "storyboard", w: 3700, h: 1300 },
-      { name: "playlist", w: 1800, h: 1300 },
+      { name: "plot", w: 1500, h: 1100 },
+      { name: "timeline", w: 1500, h: 1100 },
+      { name: "relationships", w: 1500, h: 1100 },
     ],
-    [{ name: "notes", w: 5600, h: 900 }],
+    [
+      { name: "moodboard", w: 2300, h: 1250 },
+      { name: "storyboard", w: 2300, h: 1250 },
+    ],
+    [
+      { name: "questions", w: 1500, h: 800 },
+      { name: "notes", w: 3100, h: 800 },
+    ],
   ],
   scavenger: [
     [
@@ -189,6 +209,185 @@ export function itemToOps(doc: BoardDoc, item: any): any[] {
   ];
 }
 
+const SEMANTIC_COLORS: Record<string, string> = {
+  character: "pink",
+  location: "blue",
+  plot: "amber",
+  timeline: "yellow",
+  visual: "purple",
+  relationship: "pink",
+  theme: "purple",
+  object: "green",
+  question: "slate",
+  note: "green",
+};
+
+function semanticCardOps(node: BoardSemanticNode): any[] {
+  const certainty = node.certainty === "inferred" ? " · INFERRED" : node.certainty === "question" ? " · OPEN" : "";
+  const detail = node.detail ? node.detail.slice(0, 360) : "";
+  const body = [node.title, detail].filter(Boolean).join("\n\n");
+  const ops: any[] = [
+    skel({
+      type: "rectangle",
+      x: node.x,
+      y: node.y,
+      width: node.w,
+      height: node.h,
+      strokeColor: "#34455d",
+      backgroundColor: color(SEMANTIC_COLORS[node.category]),
+      fillStyle: "solid",
+      roughness: 0,
+      roundness: { type: 3 },
+      label: { text: body, fontSize: 18, strokeColor: INK },
+    }),
+    skel({
+      type: "text",
+      x: node.x + 14,
+      y: node.y - 28,
+      text: `${semanticCategoryLabel(node.category)}${certainty}`,
+      fontSize: 13,
+      strokeColor: color(SEMANTIC_COLORS[node.category]),
+    }),
+  ];
+  if (node.imagePrompt && !node.imageUrl) {
+    ops.push(
+      skel({
+        type: "text",
+        x: node.x + 14,
+        y: node.y + node.h + 12,
+        text: `VISUAL PROMPT · ${node.imagePrompt.slice(0, 220)}`,
+        fontSize: 13,
+        strokeColor: "#9c6ade",
+      }),
+    );
+  }
+  return ops;
+}
+
+/**
+ * Convert one spoken idea into a semantic graph. `captures` is deliberately a
+ * batch: the same source sentence can create a character, setting, action,
+ * timeline beat and visual reference without forcing it into one bucket.
+ */
+export function capturesToOps(doc: BoardDoc, inputs: BoardCaptureInput[], sourceText?: string): { added: number; updated: number; ops: any[] } {
+  doc.version = 2;
+  doc.semanticNodes ??= {};
+  doc.semanticEdges ??= [];
+  const captures = inputs.map(normalizeBoardCapture).filter((value): value is NonNullable<typeof value> => Boolean(value)).slice(0, 30);
+  const ops: any[] = [];
+  let added = 0;
+  let updated = 0;
+
+  // Position the full batch first so arrows can connect nodes regardless of
+  // the order the model emitted them in.
+  for (const capture of captures) {
+    const previous = doc.semanticNodes[capture.id];
+    const zone = previous?.zone ?? boardZoneForCategory(capture.category, doc.zones);
+    const dimensions = capture.category === "visual" ? { w: 420, h: 240 } : { w: 330, h: capture.detail ? 190 : 150 };
+    const position = previous ?? place(doc, zone, undefined, undefined, dimensions.w, dimensions.h);
+    doc.semanticNodes[capture.id] = {
+      id: capture.id,
+      category: capture.category,
+      title: capture.title,
+      detail: capture.detail,
+      zone,
+      x: position.x,
+      y: position.y,
+      w: previous?.w ?? dimensions.w,
+      h: previous?.h ?? dimensions.h,
+      relatedIds: capture.relatedIds,
+      sequence: capture.sequence,
+      imagePrompt: capture.imagePrompt,
+      imageUrl: capture.imageUrl,
+      sourceText: sourceText?.slice(0, 1_000),
+      certainty: capture.certainty,
+      updatedAt: Date.now(),
+    };
+    if (previous) {
+      updated += 1;
+      ops.push({ ts: Date.now(), kind: "delete", match: previous.title });
+    } else added += 1;
+  }
+
+  for (const capture of captures) {
+    const node = doc.semanticNodes[capture.id];
+    ops.push(...semanticCardOps(node));
+    if (node.imageUrl) {
+      const imageZone = doc.zones.moodboard ? "moodboard" : node.zone;
+      const visualPosition = place(doc, imageZone, undefined, undefined, 520, 340);
+      ops.push({ ts: Date.now(), kind: "image", url: node.imageUrl, x: visualPosition.x, y: visualPosition.y, w: 520, h: 340 });
+      ops.push(skel({ type: "text", x: visualPosition.x, y: visualPosition.y - 34, text: node.title, fontSize: 20, strokeColor: "#9c6ade" }));
+      const timelineTargets = [node, ...(node.relatedIds ?? []).map((id) => doc.semanticNodes?.[id]).filter(Boolean)].filter(
+        (candidate): candidate is BoardSemanticNode => candidate?.category === "timeline",
+      );
+      for (const target of timelineTargets.slice(0, 3)) {
+        // A scene render remains in the moodboard library and is also pinned
+        // directly beneath each linked timeline beat for chronological review.
+        ops.push({ ts: Date.now(), kind: "image", url: node.imageUrl, x: target.x, y: target.y + target.h + 24, w: 330, h: 205 });
+      }
+    }
+  }
+
+  const edgeKeys = new Set(doc.semanticEdges.map((edge) => `${edge.from}|${edge.to}|${edge.kind ?? "relation"}`));
+  for (const capture of captures) {
+    const from = doc.semanticNodes[capture.id];
+    for (const relatedId of capture.relatedIds) {
+      const to = doc.semanticNodes[relatedId];
+      if (!to) continue;
+      const key = `${from.id}|${to.id}|relation`;
+      if (edgeKeys.has(key)) continue;
+      edgeKeys.add(key);
+      doc.semanticEdges.push({ id: `edge-${from.id}-${to.id}`, from: from.id, to: to.id, kind: "relation" });
+      ops.push(
+        skel({
+          type: "arrow",
+          x: from.x + from.w / 2,
+          y: from.y + from.h / 2,
+          width: to.x + to.w / 2 - (from.x + from.w / 2),
+          height: to.y + to.h / 2 - (from.y + from.h / 2),
+          strokeColor: "#74839a",
+          strokeWidth: 2,
+          endArrowhead: "arrow",
+        }),
+      );
+    }
+  }
+
+  const timeline = Object.values(doc.semanticNodes)
+    .filter((node) => node.category === "timeline" && Number.isFinite(node.sequence))
+    .sort((a, b) => Number(a.sequence) - Number(b.sequence));
+  for (let index = 1; index < timeline.length; index += 1) {
+    const from = timeline[index - 1];
+    const to = timeline[index];
+    const key = `${from.id}|${to.id}|sequence`;
+    if (edgeKeys.has(key)) continue;
+    edgeKeys.add(key);
+    doc.semanticEdges.push({ id: `sequence-${from.id}-${to.id}`, from: from.id, to: to.id, kind: "sequence" });
+    ops.push(
+      skel({
+        type: "arrow",
+        x: from.x + from.w,
+        y: from.y + from.h / 2,
+        width: to.x - (from.x + from.w),
+        height: to.y + to.h / 2 - (from.y + from.h / 2),
+        strokeColor: "#d19a28",
+        strokeWidth: 3,
+        endArrowhead: "arrow",
+        label: { text: "NEXT", fontSize: 12 },
+      }),
+    );
+  }
+
+  if (sourceText?.trim()) {
+    doc.sourceLog ??= [];
+    doc.sourceLog = [
+      ...doc.sourceLog,
+      { text: sourceText.trim().slice(0, 1_000), nodeIds: captures.map((capture) => capture.id), capturedAt: Date.now() },
+    ].slice(-100);
+  }
+  return { added, updated, ops };
+}
+
 export async function loadBoard(titleMatch?: string): Promise<{ id: string; doc: BoardDoc } | null> {
   const row: any = await convexQuery("creations:latest", { kind: "board", titleMatch });
   if (!row?.data) return null;
@@ -207,6 +406,7 @@ export async function createBoard(
   const { zones, ops } = buildZones(template);
   const doc: BoardDoc = {
     kind: "board",
+    version: 2,
     title,
     project: filing?.project,
     inquiry: filing?.inquiry,
@@ -214,6 +414,9 @@ export async function createBoard(
     pendingOps: ops,
     elements: [],
     imageUrls: {},
+    semanticNodes: {},
+    semanticEdges: [],
+    sourceLog: [],
   };
   const id = await convexMutation("creations:create", {
     kind: "board",

@@ -61,7 +61,9 @@ export function isRecentVoiceDuplicate(
   const prior = previous.text.toLocaleLowerCase("en-GB").replace(/[^\p{L}\p{N}']+/gu, " ").trim();
   if (!normalized || normalized !== prior) return false;
   const words = normalized.split(/\s+/).length;
-  // Short echo fragments are the dangerous loop case ("Music" in the live
-  // transcript). Longer deliberate repeats only need a transport debounce.
-  return now - previous.at < (words <= 2 ? 30_000 : 4_000);
+  // False Whisper text often survives several silent recorder windows. Hold
+  // exact repeats well beyond that retry cadence so an empty room cannot keep
+  // resubmitting one stale command. Longer phrases use a shorter window so a
+  // deliberately repeated instruction remains possible later in a session.
+  return now - previous.at < (words <= 2 ? 5 * 60_000 : 90_000);
 }

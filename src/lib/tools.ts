@@ -557,16 +557,43 @@ export const TOOL_DEFS = [
   {
     name: "board",
     description:
-      "JARVIS's INFINITE CANVAS — a real freeform Excalidraw board you build and edit LIVE while talking: sticky notes, shapes, text, tables, arrows, links and rendered images in named zones. Proactively create template=scavenger whenever Daniel discusses a scavenger hunt, then put his confirmed choices/clues into choices, clues, route, tasks and notes as they emerge. template=film is for worldbuilding. Use for brainstorming, moodboards, project planning and spatial thinking. GROUNDING RULE: mirror what Daniel says or approves; never invent missing names, clues, plot points or facts. update rewrites an existing item and remove deletes it—never add a duplicate when he asks for a change. Daniel can drag/edit and export everything by hand too.",
+      "JARVIS's LIVE VISUAL WORKSPACE — a persistent Excalidraw canvas with semantic nodes, categories, relationships, timeline order, visual prompts, images, sticky notes, shapes, tables and arrows. PROACTIVELY use it when a conversation is spatial or visual (film/worldbuilding, brainstorming, scavenger hunts, plans). For creative speech use action=capture and MULTI-LABEL EXTRACTION: decompose one sentence into every category it establishes, never choose just one. Example: 'Anna sits on a hill behind her house' creates linked character=Anna, location=hill/behind Anna's house, plot=Anna sits on hill, timeline=that beat, and visual=a renderable composition prompt. Preserve the original sentence in source_text. Mark deductions certainty=inferred and unknowns certainty=question; never invent facts. If the scene is visually central or Daniel asks to render it, call create_image and attach its URL to the visual/timeline capture. Stable ids let later captures update concepts instead of duplicating them. template=scavenger remains grounded in Daniel's confirmed choices/clues. update/remove rewrite existing freeform items. Daniel can rearrange, draw, edit and export by hand.",
     parameters: {
       type: "object",
       properties: {
-        action: { type: "string", enum: ["create", "add", "update", "remove", "show"] },
+        action: { type: "string", enum: ["create", "capture", "add", "update", "remove", "show"] },
         match: { type: "string", description: "update/remove: a few words from the EXISTING item's text" },
         title: { type: "string", description: "board title (create/show)" },
         template: { type: "string", enum: ["film", "scavenger", "blank"], description: "create only; scavenger has choices/clues/route/tasks/notes zones" },
         project: { type: "string", description: "project slug this board belongs to (memory filing), e.g. 'island-script'" },
         inquiry: { type: "string", description: "short stable topic when this is not a named project" },
+        source_text: {
+          type: "string",
+          description: "capture only — Daniel's original sentence or paragraph, preserved as provenance for all extracted nodes",
+        },
+        captures: {
+          type: "array",
+          description:
+            "capture only — all semantic facts established by source_text. Emit MULTIPLE linked entries when one sentence spans character/location/plot/timeline/visual/etc.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "stable concept slug; reuse it to update the same concept later" },
+              category: {
+                type: "string",
+                enum: ["character", "location", "plot", "timeline", "visual", "relationship", "theme", "object", "question", "note"],
+              },
+              title: { type: "string", description: "short visible node title" },
+              detail: { type: "string", description: "grounded detail from the source, plus clearly marked implications only" },
+              related_ids: { type: "array", items: { type: "string" }, description: "ids this node connects to" },
+              sequence: { type: "number", description: "timeline order when known; omit when unknown" },
+              image_prompt: { type: "string", description: "visual composition ready for create_image; include only grounded visual details" },
+              image_url: { type: "string", description: "rendered/reference image URL to attach to this node and moodboard" },
+              certainty: { type: "string", enum: ["stated", "inferred", "question"] },
+            },
+            required: ["id", "category", "title"],
+          },
+        },
         items: {
           type: "array",
           description: "add only — high-level items; JARVIS places them (zone grid) unless x/y given",
@@ -1985,7 +2012,7 @@ async function createPdf(args: any): Promise<string> {
 // The infinite canvas: high-level items → excalidraw ops the open board
 // applies live (see src/lib/board.ts + BoardView).
 async function boardTool(args: any): Promise<string> {
-  const { createBoard, loadBoard, saveBoardDoc, itemToOps } = await import("./board");
+  const { createBoard, loadBoard, saveBoardDoc, itemToOps, capturesToOps } = await import("./board");
   const action = String(args.action ?? "");
   if (action === "create") {
     const title = String(args.title ?? "Board").slice(0, 80);
@@ -1998,7 +2025,7 @@ async function boardTool(args: any): Promise<string> {
     });
     return (
       `Board "${title}" is live on screen (zones: ${Object.keys(doc.zones).join(", ")}). ` +
-      `Add items with board/add into those zones as the conversation flows — and ASK Daniel the next good question about the project. ` +
+      `For creative speech use board/capture to extract every relevant category from the same source sentence; use board/add for freeform marks — then ASK Daniel the next good question. ` +
       `For pictures: create_image first, then add {kind:"image", image_url, zone}.`
     );
   }
@@ -2006,7 +2033,23 @@ async function boardTool(args: any): Promise<string> {
   if (!b) return action === "show" ? "No board found — create one first." : "No board to add to — board/create first.";
   if (action === "show") {
     await saveBoardDoc(b.id, b.doc, true);
-    return `Board "${b.doc.title}" is back on screen. Zones: ${Object.keys(b.doc.zones).join(", ")}.`;
+    const concepts = Object.keys(b.doc.semanticNodes ?? {}).length;
+    return `Board "${b.doc.title}" is back on screen. ${concepts ? `${concepts} structured concepts. ` : ""}Zones: ${Object.keys(b.doc.zones).join(", ")}.`;
+  }
+  if (action === "capture") {
+    const captures = Array.isArray(args.captures) ? args.captures : [];
+    if (!captures.length) return "Extract the spoken idea into captures first — include every relevant category, not only one.";
+    const sourceText = String(args.source_text ?? "").trim();
+    const result = capturesToOps(b.doc, captures, sourceText);
+    if (!result.added && !result.updated) return "I couldn't find any titled concepts in that capture.";
+    const focusBatch = `semantic-${Date.now()}`;
+    b.doc.pendingOps.push(...result.ops.map((op: any) => ({ ...op, focusBatch })));
+    await saveBoardDoc(b.id, b.doc, true);
+    const categories = [...new Set(captures.map((capture: any) => String(capture.category ?? "note")))].join(", ");
+    return (
+      `Structured ${result.added} new and ${result.updated} updated concept(s) across ${categories}. ` +
+      `They are linked and appearing live on "${b.doc.title}". Keep extracting the conversation into every relevant category.`
+    );
   }
   if (action === "update" || action === "remove") {
     const match = String(args.match ?? "").trim();
@@ -2035,7 +2078,7 @@ async function boardTool(args: any): Promise<string> {
     await saveBoardDoc(b.id, b.doc, true);
     return `${added} item(s) placed on "${b.doc.title}" — they appear live. Zones: ${Object.keys(b.doc.zones).join(", ")}. Keep building or ask Daniel what's next.`;
   }
-  return "board actions: create, add, show.";
+  return "board actions: create, capture, add, update, remove, show.";
 }
 
 // Live mind map: create/update re-render on Daniel's screen as you talk.

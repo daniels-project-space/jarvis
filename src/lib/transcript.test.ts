@@ -34,10 +34,12 @@ describe("cleanSpeechTranscript", () => {
     expect(hasConfidentSpeechSegments([])).toBe(false);
   });
 
-  it("holds short repeated voice fragments long enough to break an echo loop", () => {
+  it("holds exact repeated voice text long enough to break a stale STT loop", () => {
     const previous = { text: "Music.", at: 10_000 };
     expect(isRecentVoiceDuplicate("music", previous, 35_000)).toBe(true);
-    expect(isRecentVoiceDuplicate("music", previous, 41_000)).toBe(false);
-    expect(isRecentVoiceDuplicate("repeat the longer request now", { text: "repeat the longer request now", at: 10_000 }, 15_000)).toBe(false);
+    expect(isRecentVoiceDuplicate("music", previous, 310_001)).toBe(false);
+    const longer = { text: "repeat the longer request now", at: 10_000 };
+    expect(isRecentVoiceDuplicate("repeat the longer request now", longer, 25_000)).toBe(true);
+    expect(isRecentVoiceDuplicate("repeat the longer request now", longer, 100_001)).toBe(false);
   });
 });
