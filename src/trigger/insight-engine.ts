@@ -2,13 +2,14 @@ import { schedules } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
 import { sendPush } from "./push-send";
 import { codexExecPrefix } from "./model-policy";
+import { wakeAgentHarness } from "../lib/agent-harness-wake";
 import {
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
   type AgentProvider,
 } from "./subscription-runtime";
 
-// Proactive attention triage: a few times a day Sentry ranks evidence by impact,
+// Proactive attention triage: hourly Sentry ranks evidence by impact,
 // urgency and confidence. Results live in the command deck; only genuinely
 // urgent high-confidence decisions interrupt Daniel.
 
@@ -86,7 +87,7 @@ async function chatThread(): Promise<string> {
 
 export const insightEngine = schedules.task({
   id: "jarvis-insight-engine",
-  cron: "0 8,14,20 * * *", // 3x/day
+  cron: "7 * * * *",
   maxDuration: 200,
   run: async () => {
     const provider: AgentProvider = "codex";
@@ -116,7 +117,9 @@ export const insightEngine = schedules.task({
     const prompt =
       "You are Sentry, JARVIS's attention triage lead. From only the evidence below, return at most 5 items that " +
       "materially deserve action. Do not summarize healthy systems and do not manufacture urgency. Separate what " +
-      "Daniel personally must decide from reversible work JARVIS can propose or safely repair. Impact and urgency are " +
+      "Daniel personally must decide from reversible work JARVIS can safely repair. A concrete code or runtime defect " +
+      "in a known project that can be reproduced, fixed on an isolated branch, tested, and left unmerged is safe-auto-fix; " +
+      "deployment, merging, spending, publishing, financial execution, destructive data work, and external messaging remain gated. Impact and urgency are " +
       "0-100; confidence is 0-1. fingerprint must be stable and terse (project:issue-kind) so repeated runs deduplicate. " +
       'Output STRICT JSON only: [{"fingerprint":"...","project":"...","title":"...","detail":"...",' +
       '"evidence":["..."],"severity":"info|opportunity|warning|critical","impact":0,"urgency":0,"confidence":0,' +
@@ -153,8 +156,8 @@ export const insightEngine = schedules.task({
       const alreadyOwned = priorAttention.find((item) => item.fingerprint === attentionArgs.fingerprint && (item.status === "working" || item.jobId));
       if (
         attentionArgs.actionClass === "safe-auto-fix" &&
-        Number(attentionArgs.confidence) >= 0.9 &&
-        Number(attentionArgs.impact) >= 55 &&
+        Number(attentionArgs.confidence) >= 0.78 &&
+        Number(attentionArgs.impact) >= 40 &&
         attentionArgs.project &&
         knownProjects.has(attentionArgs.project) &&
         !alreadyOwned
@@ -178,8 +181,10 @@ export const insightEngine = schedules.task({
           ],
           modelReason: "Evidence-backed reversible maintenance selected by Sentry; work policy remains the final approval backstop",
         });
-        if (jobId)
+        if (jobId) {
           await m("attention:upsert", { ...attentionArgs, status: "working", jobId: String(jobId) });
+          await wakeAgentHarness(`insight:${attentionArgs.project}:${String(jobId)}`).catch(() => false);
+        }
       }
     }
     // The command deck is the default surface. Interrupt only for a critical,

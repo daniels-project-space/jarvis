@@ -8,7 +8,10 @@ export function nextVoiceLoopAction(args: {
   loopRequested: boolean;
 }): VoiceLoopAction {
   if (!args.loopRequested) return "stop";
-  if (args.outcome === "speech") return "await-reply";
+  // A true live session keeps capturing while Jarvis thinks and speaks. Echo
+  // cancellation plus transcript echo guards distinguish his voice; Daniel's
+  // own speech becomes a barge-in instead of waiting for the answer to finish.
+  if (args.outcome === "speech") return args.persistentLive ? "listen" : "await-reply";
   if (
     args.persistentLive &&
     (args.outcome === "silence" || args.outcome === "empty" || args.outcome === "echo")

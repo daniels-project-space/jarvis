@@ -1,7 +1,7 @@
 import type { NextRequest } from "next/server";
 import { getSecret } from "@/lib/vault";
 import { STT_PROMPT } from "@/lib/sttvocab";
-import { cleanSpeechTranscript } from "@/lib/transcript";
+import { cleanSpeechTranscript, isMeaningfulSpeechTranscript } from "@/lib/transcript";
 
 // Speech-to-text utility only: free/fast Groq Whisper. Conversation intelligence
 // remains exclusively in the authenticated Codex subscription CLI worker.
@@ -66,6 +66,7 @@ export async function POST(req: NextRequest) {
   // real words are overwhelmingly Latin).
   const latin = (text.match(/[a-zA-Z0-9\s.,!?'"£$%()@:;/-]/g) ?? []).length;
   if (text && latin / text.length < 0.7) text = "";
+  if (!isMeaningfulSpeechTranscript(text)) text = "";
   return new Response(JSON.stringify({ text }), {
     headers: { "content-type": "application/json" },
   });

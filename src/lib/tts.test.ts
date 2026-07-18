@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isEchoOfTts, normalizeSpeechText, sentences, speak, speechPauseMs, stopSpeaking } from "./tts";
+import { completeSpeechPrefix, isEchoOfTts, normalizeSpeechText, sentences, speak, speechPauseMs, stopSpeaking } from "./tts";
 
 class FakeAudio {
   static instances: FakeAudio[] = [];
@@ -53,6 +53,22 @@ describe("single neural speech queue", () => {
   it("gives complete sentence endings a longer pause than clause endings", () => {
     expect(speechPauseMs("One thought,")).toBeLessThan(speechPauseMs("That is the answer."));
     expect(speechPauseMs("Is that right?")).toBeGreaterThanOrEqual(150);
+  });
+
+  it("exposes only stable complete sentences during token streaming", () => {
+    expect(completeSpeechPrefix("I have the first answer. The second is still"))
+      .toBe("I have the first answer.");
+    expect(completeSpeechPrefix("Still thinking")).toBe("");
+  });
+
+  it("blocks short delayed fragments of Jarvis's own speech", async () => {
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("Audio", FakeAudio);
+    const reply = speak("Music-house is the sensible next move.", () => {});
+    await vi.waitFor(() => expect(FakeAudio.instances).toHaveLength(1));
+    expect(isEchoOfTts("Music")).toBe(true);
+    stopSpeaking();
+    await reply;
   });
 
   it("keeps a spoken reply guarded through capture and transcription latency", async () => {

@@ -9,9 +9,15 @@ describe("nextVoiceLoopAction", () => {
     },
   );
 
-  it("waits for the assistant after captured speech", () => {
+  it("keeps listening after captured speech in a persistent live session", () => {
     expect(
       nextVoiceLoopAction({ outcome: "speech", persistentLive: true, loopRequested: true }),
+    ).toBe("listen");
+  });
+
+  it("waits for the assistant in a one-shot wake session", () => {
+    expect(
+      nextVoiceLoopAction({ outcome: "speech", persistentLive: false, loopRequested: true }),
     ).toBe("await-reply");
   });
 

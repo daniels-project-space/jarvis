@@ -19,3 +19,26 @@ export function cleanSpeechTranscript(input: string): string {
   }
   return text;
 }
+
+export function isMeaningfulSpeechTranscript(input: string): boolean {
+  const text = input.trim();
+  if (!text) return false;
+  // Whisper returns punctuation-only fragments such as "." for room noise.
+  // They previously became real turns and could restart a stale topic loop.
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
+export function isRecentVoiceDuplicate(
+  input: string,
+  previous: { text: string; at: number } | null,
+  now = Date.now(),
+): boolean {
+  if (!previous) return false;
+  const normalized = input.toLocaleLowerCase("en-GB").replace(/[^\p{L}\p{N}']+/gu, " ").trim();
+  const prior = previous.text.toLocaleLowerCase("en-GB").replace(/[^\p{L}\p{N}']+/gu, " ").trim();
+  if (!normalized || normalized !== prior) return false;
+  const words = normalized.split(/\s+/).length;
+  // Short echo fragments are the dangerous loop case ("Music" in the live
+  // transcript). Longer deliberate repeats only need a transport debounce.
+  return now - previous.at < (words <= 2 ? 30_000 : 4_000);
+}

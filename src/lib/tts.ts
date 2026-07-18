@@ -49,14 +49,31 @@ export function isEchoOfTts(input: string): boolean {
   const now = Date.now();
   recentUtterances = recentUtterances.filter((row) => row.until > now);
   const inputWords = words(input);
-  if (inputWords.length < 3) return false;
+  if (!inputWords.length) return false;
   for (const row of recentUtterances) {
-    const spoken = new Set(words(row.text));
+    const spokenWords = words(row.text);
+    const spoken = new Set(spokenWords);
     if (!spoken.size) continue;
     const matches = inputWords.filter((word) => spoken.has(word)).length;
+    // Short Whisper fragments need stricter, not weaker, echo protection. A
+    // delayed "Music" extracted from Jarvis saying "Music-house" caused a
+    // real self-answering loop in production.
+    if (inputWords.length <= 2 && matches === inputWords.length) return true;
     if (matches / inputWords.length >= 0.65) return true;
   }
   return false;
+}
+
+// Return only source text whose sentence boundary is stable while tokens are
+// still arriving. This lets complex answers begin speaking before the model
+// finishes without guessing punctuation for an incomplete clause.
+export function completeSpeechPrefix(input: string): string {
+  const matches = [...input.matchAll(/[.!?](?:[”"')\]]+)?(?=\s|$)|\n\s*\n/g)];
+  const last = matches.at(-1);
+  if (!last || last.index == null) return "";
+  const end = last.index + last[0].length;
+  const prefix = input.slice(0, end);
+  return prefix.trim().length >= 18 ? prefix : "";
 }
 
 // There is no local model to initialise. Keeping this API lets all voice entry

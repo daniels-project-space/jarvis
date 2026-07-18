@@ -8,6 +8,8 @@ import { resolveConvexUrl } from "./convex-url";
 
 const CONVEX_URL = resolveConvexUrl(process.env.NEXT_PUBLIC_CONVEX_URL, process.env.CONVEX_URL);
 const HUB_URL = "https://fantastic-roadrunner-485.convex.cloud";
+let hubCache: { value: any; expiresAt: number } | null = null;
+let hubRequest: Promise<any> | null = null;
 
 async function q(base: string, path: string, args: unknown = {}): Promise<any> {
   try {
@@ -49,6 +51,23 @@ export async function convexMutation(path: string, args: unknown): Promise<any> 
 
 export const convexQuery = (path: string, args: unknown = {}) => q(CONVEX_URL, path, args);
 
+async function hubSnapshot() {
+  if (hubCache && hubCache.expiresAt > Date.now()) return hubCache.value;
+  if (hubRequest) return hubRequest;
+  hubRequest = q(HUB_URL, "jarvisContext:snapshot", {
+    vaultToken: process.env.VAULT_ACCESS_TOKEN,
+  }).then((value) => {
+    // The remote-work hub is expensive relative to a conversational turn and
+    // does not change token-by-token. A short shared cache removes a whole
+    // network dependency from rapid follow-ups while keeping work data fresh.
+    hubCache = { value, expiresAt: Date.now() + (value ? 20_000 : 3_000) };
+    return value;
+  }).finally(() => {
+    hubRequest = null;
+  });
+  return hubRequest;
+}
+
 // Self-healing hook: anything server-side that breaks files an incident; the
 // healer (agent-runner) turns open incidents into root-cause repair agents.
 export async function reportIncident(source: string, signature: string, message: string, app?: string, authTokenHash?: string) {
@@ -68,9 +87,7 @@ export async function buildContext(
       userText: userText?.slice(0, 240) || undefined,
       includeConversation: options?.includeConversation || undefined,
     }),
-    q(HUB_URL, "jarvisContext:snapshot", {
-      vaultToken: process.env.VAULT_ACCESS_TOKEN,
-    }),
+    hubSnapshot(),
   ]);
   const todos = hub?.todos;
   const events = hub?.events;

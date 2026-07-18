@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cleanSpeechTranscript } from "./transcript";
+import { cleanSpeechTranscript, isMeaningfulSpeechTranscript, isRecentVoiceDuplicate } from "./transcript";
 
 describe("cleanSpeechTranscript", () => {
   it("collapses the exact repeated live utterance seen in production", () => {
@@ -19,5 +19,18 @@ describe("cleanSpeechTranscript", () => {
       .toBe("That is very, very good.");
     expect(cleanSpeechTranscript("How are you? I am feeling better."))
       .toBe("How are you? I am feeling better.");
+  });
+
+  it("rejects punctuation-only Whisper noise", () => {
+    expect(isMeaningfulSpeechTranscript(".")).toBe(false);
+    expect(isMeaningfulSpeechTranscript(" … — ")).toBe(false);
+    expect(isMeaningfulSpeechTranscript("Music")).toBe(true);
+  });
+
+  it("holds short repeated voice fragments long enough to break an echo loop", () => {
+    const previous = { text: "Music.", at: 10_000 };
+    expect(isRecentVoiceDuplicate("music", previous, 35_000)).toBe(true);
+    expect(isRecentVoiceDuplicate("music", previous, 41_000)).toBe(false);
+    expect(isRecentVoiceDuplicate("repeat the longer request now", { text: "repeat the longer request now", at: 10_000 }, 15_000)).toBe(false);
   });
 });

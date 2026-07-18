@@ -18,6 +18,8 @@ import CommandDeck from "./CommandDeck";
 import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
 import { parseTerminalOutput, type TerminalTone } from "@/lib/terminal-output";
 import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
+import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate } from "@/lib/transcript";
+import { completeSpeechPrefix } from "@/lib/tts";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -555,25 +557,40 @@ function LiveSessionLog({ job }: { job: Job }) {
   );
 }
 
-function AgentLiveView({ job, now, onClose }: { job: Job; now: number; onClose: () => void }) {
+function AgentLiveView({
+  job,
+  now,
+  compact,
+  onCompact,
+  onClose,
+}: {
+  job: Job;
+  now: number;
+  compact: boolean;
+  onCompact: () => void;
+  onClose: () => void;
+}) {
   const elapsed = Math.max(0, Math.floor((now - job.startedAt) / 1000));
   const pct = Math.max(0, Math.min(100, job.percent ?? 0));
   const owner = ({ paul: "Paul", atlas: "Atlas", iris: "Iris", maya: "Maya", sentry: "Sentry", jarvis: "JARVIS" } as Record<string, string>)[job.agentId ?? ""] ?? "Agent";
   return (
-    <div className="materialize glass relative flex h-full flex-col rounded-2xl p-4 pt-11">
+    <div className={`materialize glass relative flex h-full flex-col rounded-2xl ${compact ? "p-3" : "p-4 pt-5"}`}>
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <ModelBadge model={job.model} />
           <span className="hud-label">{owner} · {job.stage ?? job.status} · {elapsed}s</span>
           {(job.attempt ?? 1) > 1 && <span className="hud-label text-amber">pass {job.attempt}/{job.maxAttempts ?? 12}</span>}
         </div>
-        <button onClick={onClose} className="hud-label rounded px-2 py-1 hover:text-cyan">
-          close
-        </button>
+        <div className="flex items-center gap-1">
+          <button onClick={onCompact} className="hud-label rounded px-2 py-1 hover:text-cyan">
+            {compact ? "expand" : "minimize"}
+          </button>
+          <button onClick={onClose} className="hud-label rounded px-2 py-1 hover:text-cyan">close</button>
+        </div>
       </div>
-      <div className="mt-3 text-sm text-ice">{job.label ?? job.task}</div>
-      {job.label && <div className="mt-1 text-xs text-slate">{job.task}</div>}
-      <div className="mt-3 flex items-center gap-2">
+      <div className={`${compact ? "mt-2 truncate text-xs" : "mt-3 text-sm"} text-ice`}>{job.label ?? job.task}</div>
+      {!compact && job.label && <div className="mt-1 text-xs text-slate">{job.task}</div>}
+      <div className={`${compact ? "mt-2" : "mt-3"} flex items-center gap-2`}>
         <div className="h-px flex-1 overflow-hidden rounded-full bg-white/10">
         <div
           className="h-full bg-gradient-to-r from-cyan to-sky-400 transition-all duration-1000"
@@ -582,14 +599,16 @@ function AgentLiveView({ job, now, onClose }: { job: Job; now: number; onClose: 
         </div>
         <span className="font-mono text-[10px] text-cyan">{pct}%</span>
       </div>
-      {(job.branch || job.pullRequestUrl || job.modelReason) && (
+      {!compact && (job.branch || job.pullRequestUrl || job.modelReason) && (
         <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-slate">
           {job.branch && <span className="font-mono">branch · {job.branch}</span>}
           {job.pullRequestUrl && <a href={job.pullRequestUrl} target="_blank" rel="noreferrer" className="text-cyan hover:underline">draft PR ↗</a>}
           {job.modelReason && <span title={job.modelReason}>routing · {job.model ? workModelLabel(job.model) : "auto"}</span>}
         </div>
       )}
-      <LiveSessionLog job={job} />
+      {compact
+        ? <div className="mt-2 truncate font-mono text-[10px] text-slate">{job.progress ?? job.stage ?? "working"}</div>
+        : <LiveSessionLog job={job} />}
     </div>
   );
 }
@@ -1206,6 +1225,10 @@ export default function JarvisUI() {
 
   const [input, setInput] = useState("");
   const [speaking, setSpeaking] = useState(false);
+  const speakingRef = useRef(false);
+  useEffect(() => {
+    speakingRef.current = speaking;
+  }, [speaking]);
   const [sending, setSending] = useState(false);
   const [recording, setRecording] = useState(false);
   const [live, setLive] = useState<"off" | "connecting" | "live">("off");
@@ -1247,10 +1270,14 @@ export default function JarvisUI() {
   };
   useEffect(() => () => clearCaptionTimers(), []);
   const [agentView, setAgentView] = useState<string | null>(null);
+  const [agentViewCompact, setAgentViewCompact] = useState(false);
+  const knownActiveJobIds = useRef<Set<string> | null>(null);
   const [nowTs, setNowTs] = useState(0);
   // Viewport minimize: keep talking and the panel folds into a pill; the orb
   // comes back. Fresh panel content pops it open again.
-  const [panelMin, setPanelMin] = useState(false);
+  // Start folded: the first Convex snapshot may be hours old. Only content
+  // created during this browser session is allowed to expand itself.
+  const [panelMin, setPanelMin] = useState(true);
   const lastPanelAt = useRef(0);
   // Daniel closed it = it stays closed. If the exact same panel content comes
   // back within 30s of an explicit close (a live-session loop re-showing the
@@ -1269,6 +1296,13 @@ export default function JarvisUI() {
   useEffect(() => {
     panelTypeRef.current = panel?.type ?? null;
     if (panel && panel.updatedAt !== lastPanelAt.current) {
+      if (lastPanelAt.current === 0 && !instantPanel && Date.now() - panel.updatedAt > 60_000) {
+        lastPanelAt.current = panel.updatedAt;
+        prevPanelRef.current = null;
+        setPanelMin(true);
+        void clearPanel({});
+        return;
+      }
       lastPanelAt.current = panel.updatedAt;
       const cp = closedPanelRef.current;
       if (cp && cp.key === `${panel.title ?? ""}|${panel.value.slice(0, 160)}` && Date.now() - cp.ts < 12_000) {
@@ -1296,9 +1330,18 @@ export default function JarvisUI() {
   const endRef = useRef<HTMLDivElement>(null);
   const lastSpokenId = useRef<string | null>(null);
   const lastSpokenText = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
+  const streamingSpeechRef = useRef<{ id: string; queuedChars: number; chain: Promise<void> }>({
+    id: "",
+    queuedChars: 0,
+    chain: Promise.resolve(),
+  });
   const captionRef = useRef<Caption>(null);
   const energyRef = useRef(0);
   const recRef = useRef<MediaRecorder | null>(null);
+  const liveMicRef = useRef<{ stream: MediaStream; context: AudioContext; analyser: AnalyserNode } | null>(null);
+  const liveSessionEpoch = useRef(0);
+  const sttAbortRef = useRef<AbortController | null>(null);
+  const lastVoiceInput = useRef<{ text: string; at: number } | null>(null);
   const liveRef = useRef(false);
   const me = useRef("");
   const voiceRef = useRef<{ value: string; updatedAt: number } | null>(null);
@@ -1645,15 +1688,33 @@ export default function JarvisUI() {
   }
 
   const shownJob = activeJobs.find((j) => j._id === agentView) ?? null;
+  const shownJobId = shownJob?._id ?? null;
   useEffect(() => {
-    if (!shownJob) return;
+    const ids = new Set(activeJobs.map((job) => job._id));
+    if (knownActiveJobIds.current === null) {
+      knownActiveJobIds.current = ids; // never resurrect work that predates this page load
+      return;
+    }
+    const fresh = activeJobs.find((job) => !knownActiveJobIds.current!.has(job._id));
+    knownActiveJobIds.current = ids;
+    if (fresh) {
+      setAgentView(fresh._id);
+      setAgentViewCompact(false);
+    } else if (agentView && !ids.has(agentView)) {
+      setAgentView(null);
+    }
+  }, [activeJobs, agentView]);
+  useEffect(() => {
+    if (!shownJobId) return;
     const first = setTimeout(() => setNowTs(Date.now()), 0);
     const t = setInterval(() => setNowTs(Date.now()), 1000);
+    const fold = setTimeout(() => setAgentViewCompact(true), 6500);
     return () => {
       clearTimeout(first);
       clearInterval(t);
+      clearTimeout(fold);
     };
-  }, [shownJob]);
+  }, [shownJobId]);
 
   const busy = sending || messages.some((m) => m.status === "pending" || (m.role === "assistant" && m.status === "streaming"));
 
@@ -1765,6 +1826,36 @@ export default function JarvisUI() {
       setSending(false);
     }
     showCaption({ who: "jarvis", text: latestAssistant.text, phase: "streaming" });
+    if (liveRef.current && !latestAssistant.model) return;
+    if ((liveAnywhere() && !liveRef.current) || document.hidden) return;
+    const stablePrefix = completeSpeechPrefix(latestAssistant.text);
+    if (!stablePrefix) return;
+    let streamState = streamingSpeechRef.current;
+    if (streamState.id !== latestAssistant._id) {
+      streamState = { id: latestAssistant._id, queuedChars: 0, chain: Promise.resolve() };
+      streamingSpeechRef.current = streamState;
+    }
+    if (stablePrefix.length <= streamState.queuedChars) return;
+    const speechChunk = stablePrefix.slice(streamState.queuedChars).trim();
+    streamState.queuedChars = stablePrefix.length;
+    if (!speechChunk) return;
+    // Queue stable sentences immediately. The final-message effect only voices
+    // the unqueued tail, so complex replies start audibly while Codex is still
+    // generating without ever repeating the opening.
+    streamState.chain = streamState.chain.then(async () => {
+      if (streamingSpeechRef.current.id !== latestAssistant._id || !(await ensureVoice())) return;
+      const { speak } = await import("../lib/tts");
+      await speak(
+        speechChunk,
+        (e) => (energyRef.current = e),
+        () => {
+          setSpeaking(true);
+          setCaption((current) => current?.who === "jarvis"
+            ? { ...current, phase: "speaking", exiting: false }
+            : { who: "jarvis", text: latestAssistant.text, phase: "speaking" });
+        },
+      );
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
 
@@ -1804,9 +1895,17 @@ export default function JarvisUI() {
         fadeCaption(spokenText, 3200);
         return; // another tab/device owns the voice
       }
+      const streamed = streamingSpeechRef.current.id === last._id ? streamingSpeechRef.current : null;
+      if (streamed) await streamed.chain;
+      const unsaidText = streamed ? spokenText.slice(streamed.queuedChars).trim() : spokenText;
+      if (!unsaidText) {
+        setSpeaking(false);
+        fadeCaption(spokenText, 1800);
+        return;
+      }
       const { speak } = await import("../lib/tts");
       await speak(
-        spokenText,
+        unsaidText,
         (e) => (energyRef.current = e),
         () => {
           setSpeaking(true);
@@ -1874,6 +1973,7 @@ export default function JarvisUI() {
       const direction = Number(widget.changePct) >= 0 ? "up" : "down";
       const reply = `${widget.asset ?? intent.asset.toUpperCase()} chart is live — ${direction} ${Math.abs(Number(widget.changePct ?? 0)).toFixed(2)}% on the latest ${intent.interval} candle.`;
       updateConversationMood(reply);
+      lastSpokenText.current = { text: reply, ts: Date.now() };
       void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
       void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant" });
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
@@ -1944,6 +2044,7 @@ export default function JarvisUI() {
         ?? result.replace(/One-line takeaway only\.?/i, "").trim();
       const reply = detail ? `Your net worth is ${detail}.` : "Your live net-worth dashboard is open.";
       updateConversationMood(reply);
+      lastSpokenText.current = { text: reply, ts: Date.now() };
       void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
       void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant-tool" });
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
@@ -1982,6 +2083,7 @@ export default function JarvisUI() {
     // double-tap / Enter+click within 2.5s = one send, not two
     if (t === lastSent.current.text && Date.now() - lastSent.current.ts < 2500) return;
     lastSent.current = { text: t, ts: Date.now() };
+    streamingSpeechRef.current = { id: "", queuedChars: 0, chain: Promise.resolve() };
     updateConversationMood(t);
     void ownVoice();
     // A new request is an immediate barge-in. Cancel queued/playback state
@@ -1991,6 +2093,7 @@ export default function JarvisUI() {
       m.stopSpeaking();
       void m.warm();
     });
+    setSpeaking(false);
     setInput("");
     // A playing video shrinks to picture-in-picture (keeps playing). A genuine
     // follow-up keeps the current visual; a topic switch clears it immediately
@@ -2019,6 +2122,7 @@ export default function JarvisUI() {
     const instant = instantSocialReply(t);
     if (instant) {
       document.documentElement.dataset.jarvisFirstTokenMs = "0";
+      lastSpokenText.current = { text: instant, ts: Date.now() };
       showCaption({ who: "you", text: t });
       updateConversationMood(instant);
       showCaption({ who: "jarvis", text: instant, phase: "ready" });
@@ -2063,6 +2167,36 @@ export default function JarvisUI() {
   const freeLoop = useRef(false);
   const freeBusy = useRef(false);
   const freeRearmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  async function ensurePersistentLiveMic() {
+    const current = liveMicRef.current;
+    if (current && current.stream.getAudioTracks().some((track) => track.readyState === "live")) return current;
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+      },
+    });
+    const context = new AudioContext({ latencyHint: "interactive" });
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.35;
+    context.createMediaStreamSource(stream).connect(analyser);
+    const resources = { stream, context, analyser };
+    liveMicRef.current = resources;
+    return resources;
+  }
+  function closePersistentLiveMic() {
+    liveSessionEpoch.current += 1;
+    sttAbortRef.current?.abort();
+    sttAbortRef.current = null;
+    const resources = liveMicRef.current;
+    liveMicRef.current = null;
+    resources?.stream.getTracks().forEach((track) => track.stop());
+    void resources?.context.close().catch(() => {});
+    recRef.current = null;
+  }
   function cancelFreeRearm() {
     if (freeRearmTimer.current) clearTimeout(freeRearmTimer.current);
     freeRearmTimer.current = null;
@@ -2076,6 +2210,7 @@ export default function JarvisUI() {
   }
   function releaseLive() {
     cancelFreeRearm();
+    closePersistentLiveMic();
     if (liveBeat.current) clearInterval(liveBeat.current);
     liveBeat.current = null;
     captionRef.current = null;
@@ -2089,6 +2224,8 @@ export default function JarvisUI() {
       liveRef.current = false;
       setLive("off");
       releaseLive();
+    } else {
+      closePersistentLiveMic();
     }
     rearmWake();
   }
@@ -2121,7 +2258,10 @@ export default function JarvisUI() {
     void freeVoiceTurn();
   }
 
-  useEffect(() => () => cancelFreeRearm(), []);
+  useEffect(() => () => {
+    cancelFreeRearm();
+    closePersistentLiveMic();
+  }, []);
 
   async function enableDevicePermissions() {
     if (permissionBusy) return;
@@ -2239,25 +2379,23 @@ export default function JarvisUI() {
     setSeeing(false);
   }
 
-  // Turn-taking voice: the microphone is physically closed while Jarvis speaks,
-  // so speaker echo cannot cancel Jarvis mid-sentence or reset the orb.
+  // One persistent, full-duplex microphone session. MediaRecorder windows turn
+  // the continuous stream into utterances, but the physical device remains
+  // open. This avoids the browser permission/audio-stack churn that used to
+  // make the mic blink every few seconds and lets Daniel interrupt speech.
   const voiceMode = () => "free";
   async function freeVoiceTurn() {
     if (freeBusy.current || !freeLoop.current) return;
     freeBusy.current = true;
+    const sessionEpoch = liveSessionEpoch.current;
     let outcome: VoiceCaptureOutcome = "failure";
     try {
-      import("../lib/tts").then((m) => m.stopSpeaking());
       void ownVoice();
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
+      const { stream, context, analyser } = await ensurePersistentLiveMic();
+      if (!freeLoop.current || sessionEpoch !== liveSessionEpoch.current) return;
+      if (context.state === "suspended") await context.resume().catch(() => undefined);
       import("../lib/tts").then((m) => m.warm());
-      const actx = new AudioContext();
-      const an = actx.createAnalyser();
-      an.fftSize = 512;
-      actx.createMediaStreamSource(stream).connect(an);
-      const buf = new Uint8Array(an.frequencyBinCount);
+      const buf = new Uint8Array(analyser.frequencyBinCount);
       const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
       const rec = new MediaRecorder(stream, { mimeType: mime });
       const chunks: Blob[] = [];
@@ -2266,39 +2404,69 @@ export default function JarvisUI() {
       recRef.current = rec;
       let spoke = false;
       let lastVoice = Date.now();
+      let noiseFloor = 5;
+      let voiceFrames = 0;
+      let bargeFrames = 0;
       const t0 = Date.now();
       const poll = setInterval(() => {
-        an.getByteFrequencyData(buf);
+        analyser.getByteFrequencyData(buf);
         const level = buf.reduce((a, b) => a + b, 0) / buf.length;
-        if (level > 24) {
+        if (!spoke && Date.now() - t0 < 900) noiseFloor = noiseFloor * 0.88 + level * 0.12;
+        const threshold = Math.max(14, noiseFloor + 9);
+        voiceFrames = level > threshold ? voiceFrames + 1 : 0;
+        if (voiceFrames >= 2) {
           spoke = true;
           lastVoice = Date.now();
           energyRef.current = Math.min(1, level / 90);
         }
-        if ((spoke && Date.now() - lastVoice > 1500) || (!spoke && Date.now() - t0 > 6500) || Date.now() - t0 > 25_000) {
+        // Echo cancellation handles normal speaker output. A sustained, much
+        // louder foreground voice is an intentional barge-in and stops TTS at
+        // VAD time, well before transcription returns.
+        bargeFrames = speakingRef.current && level > Math.max(30, threshold + 11) ? bargeFrames + 1 : 0;
+        if (bargeFrames === 3) {
+          void import("../lib/tts").then((m) => m.stopSpeaking());
+          setSpeaking(false);
+        }
+        if ((spoke && Date.now() - lastVoice > 1100) || (!spoke && Date.now() - t0 > 8000) || Date.now() - t0 > 25_000) {
           clearInterval(poll);
           if (rec.state === "recording") rec.stop();
         }
-      }, 140);
+      }, 90);
       await new Promise<void>((resolve) => {
         rec.onstop = () => resolve();
-        rec.start();
+        rec.start(250);
       });
       clearInterval(poll);
-      stream.getTracks().forEach((t) => t.stop());
-      void actx.close().catch(() => {});
       setRecording(false);
       energyRef.current = 0;
+      if (!freeLoop.current || sessionEpoch !== liveSessionEpoch.current) {
+        outcome = "empty";
+        return;
+      }
       const blob = new Blob(chunks, { type: mime });
       if (!spoke || blob.size < 2000) {
         outcome = "silence";
         return;
       }
-      const r = await fetch("/api/stt", { method: "POST", headers: { "content-type": mime }, body: blob });
+      const controller = new AbortController();
+      sttAbortRef.current?.abort();
+      sttAbortRef.current = controller;
+      const r = await fetch("/api/stt", {
+        method: "POST",
+        headers: { "content-type": mime },
+        body: blob,
+        signal: controller.signal,
+      });
+      if (!r.ok) throw new Error(`STT failed (${r.status})`);
       const { text } = await r.json();
+      if (sttAbortRef.current === controller) sttAbortRef.current = null;
+      if (!freeLoop.current || sessionEpoch !== liveSessionEpoch.current) {
+        outcome = "empty";
+        return;
+      }
       const { isEchoOfTts } = await import("../lib/tts");
       const cleanedText = text?.trim() ?? "";
-      if (!cleanedText) {
+      if (!isMeaningfulSpeechTranscript(cleanedText)) {
         outcome = "empty";
         return;
       }
@@ -2306,23 +2474,28 @@ export default function JarvisUI() {
         outcome = "echo";
         return;
       }
-      if (cleanedText === lastSent.current.text && Date.now() - lastSent.current.ts < 2500) {
+      const previousVoice = lastVoiceInput.current;
+      if (isRecentVoiceDuplicate(cleanedText, previousVoice)) {
         outcome = "empty";
         return;
       }
+      lastVoiceInput.current = { text: cleanedText, at: Date.now() };
       outcome = "speech";
-      void submit(cleanedText); // the reply speaks via the normal effect; the loop re-arms after it
-    } catch {
+      void submit(cleanedText);
+    } catch (error) {
       setRecording(false);
-      outcome = "failure";
+      outcome = error instanceof DOMException && error.name === "AbortError" ? "empty" : "failure";
     } finally {
+      recRef.current = null;
+      setRecording(false);
+      energyRef.current = 0;
       freeBusy.current = false;
       const action = nextVoiceLoopAction({
         outcome,
         persistentLive: liveRef.current,
         loopRequested: freeLoop.current,
       });
-      if (action === "listen") scheduleFreeVoiceTurn(350);
+      if (action === "listen") scheduleFreeVoiceTurn(outcome === "speech" ? 90 : 180);
       else if (action === "stop") endFreeVoiceSession();
     }
   }
@@ -2359,10 +2532,14 @@ export default function JarvisUI() {
       try {
         const r = await fetch("/api/stt", { method: "POST", headers: { "content-type": mime }, body: blob });
         const { text } = await r.json();
-        if (text?.trim()) {
+        if (isMeaningfulSpeechTranscript(text?.trim() ?? "")) {
           const { isEchoOfTts } = await import("../lib/tts");
           if (isEchoOfTts(text)) return; // that was JARVIS's own voice leaking in
-          void submit(text.trim());
+          const cleaned = text.trim();
+          const previousVoice = lastVoiceInput.current;
+          if (isRecentVoiceDuplicate(cleaned, previousVoice)) return;
+          lastVoiceInput.current = { text: cleaned, at: Date.now() };
+          void submit(cleaned);
         }
       } catch {
         /* ignore */
@@ -2399,7 +2576,7 @@ export default function JarvisUI() {
   //  • compactAside — a sized widget (weather/shop/places/ranking/…): the panel
   //    takes the left, the orb SHRINKS INTO THE RIGHT CORNER (still visible).
   //  • fullBleed — a page/video/full panel: it owns everything, orb+ring gone.
-  const overlayUp = !!panel && !panelMin;
+  const overlayUp = !!panel && !panelMin && !shownJob;
   const fullBleed = overlayUp && (panelFull || panel!.type === "video" || stagePanelSize === "h-full w-full");
   const compactAside = overlayUp && !fullBleed && panel!.type !== "video";
 
@@ -2467,7 +2644,10 @@ export default function JarvisUI() {
         busy={busy}
         snapshot={commandSnapshot}
         selectedJobId={agentView}
-        onSelectJob={(id) => setAgentView((current) => (current === id ? null : id))}
+        onSelectJob={(id) => {
+          setAgentViewCompact(false);
+          setAgentView((current) => (current === id ? null : id));
+        }}
       />
       {optionsOpen && (
         <OptionsPanel
@@ -2522,8 +2702,20 @@ export default function JarvisUI() {
             </div>
           )}
           {shownJob ? (
-            <div className="absolute inset-0 z-20 p-1">
-              <AgentLiveView job={shownJob} now={nowTs} onClose={() => setAgentView(null)} />
+            <div
+              className={`absolute left-2 top-12 z-30 will-change-transform transition-[width,height,transform] duration-700 ease-[cubic-bezier(0.22,1,0.36,1)] sm:left-4 ${
+                agentViewCompact
+                  ? "h-[132px] w-[min(350px,calc(100%-16px))]"
+                  : "h-[min(430px,70vh)] w-[min(620px,calc(100%-16px))]"
+              }`}
+            >
+              <AgentLiveView
+                job={shownJob}
+                now={nowTs}
+                compact={agentViewCompact}
+                onCompact={() => setAgentViewCompact((value) => !value)}
+                onClose={() => setAgentView(null)}
+              />
             </div>
           ) : panel && panel.type !== "video" && !panelMin && !panelFull ? (
             <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-10 md:pr-[36%] lg:pl-16" : "justify-center"}`}>
