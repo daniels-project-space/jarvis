@@ -586,7 +586,7 @@ function AgentLiveView({ job, now, onClose }: { job: Job; now: number; onClose: 
         <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-slate">
           {job.branch && <span className="font-mono">branch · {job.branch}</span>}
           {job.pullRequestUrl && <a href={job.pullRequestUrl} target="_blank" rel="noreferrer" className="text-cyan hover:underline">draft PR ↗</a>}
-          {job.modelReason && <span title={job.modelReason}>routing · {job.model ?? "auto"}</span>}
+          {job.modelReason && <span title={job.modelReason}>routing · {job.model ? workModelLabel(job.model) : "auto"}</span>}
         </div>
       )}
       <LiveSessionLog job={job} />
