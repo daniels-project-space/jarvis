@@ -16,9 +16,11 @@ export type LiveVadFrame = {
   quietUntil: number;
 };
 
-// 1.25s preserves a deliberate mid-sentence pause (the regression suite holds
-// 1.1s open) while removing 550ms from every normal speech turn.
-export const LIVE_END_SILENCE_MS = 1_250;
+// 1.15s preserves the tested 1.1s mid-sentence pause while removing 650ms
+// from the former turn boundary. STT begins speculatively during the tail, so
+// the network request is normally complete by the time this safe gate closes.
+export const LIVE_END_SILENCE_MS = 1_150;
+export const LIVE_STT_PREFETCH_SILENCE_MS = 700;
 // Do not merely ask VAD to ignore Jarvis's loudspeaker. Do not open an
 // utterance recording at all until the room has lost its acoustic tail.
 export const LIVE_SPEAKER_TAIL_MS = 1_400;
@@ -55,6 +57,16 @@ export function createLiveVadState(now: number): LiveVadState {
 
 export function shouldCloseLiveUtterance(state: LiveVadState, now: number): boolean {
   return state.spoke && now - state.lastVoice > LIVE_END_SILENCE_MS;
+}
+
+export function shouldPrefetchLiveTranscript(
+  state: LiveVadState,
+  now: number,
+  lastPrefetchedVoice: number,
+): boolean {
+  return state.spoke
+    && state.lastVoice !== lastPrefetchedVoice
+    && now - state.lastVoice >= LIVE_STT_PREFETCH_SILENCE_MS;
 }
 
 /**

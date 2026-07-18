@@ -19,6 +19,7 @@ import {
   createLiveVadState,
   shouldCloseLiveUtterance,
   shouldDeferLiveCapture,
+  shouldPrefetchLiveTranscript,
   spectrumBandLevel,
 } from "@/lib/live-vad";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, StructuredListView, CandlesView, MarketChartLoading, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView, PanelUnavailable } from "./Views";
@@ -2628,6 +2629,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     freeBusy.current = true;
     const sessionEpoch = liveSessionEpoch.current;
     let outcome: VoiceCaptureOutcome = "failure";
+    let pendingSttController: AbortController | null = null;
     try {
       void ownVoice();
       const { stream, context, analyser } = await ensurePersistentLiveMic();
@@ -2639,9 +2641,24 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const rec = new MediaRecorder(stream, { mimeType: mime });
       const chunks: Blob[] = [];
       rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+      const requestTranscript = async (blob: Blob, controller: AbortController): Promise<string> => {
+        const response = await viewerFetch("/api/stt", {
+          method: "POST",
+          headers: { "content-type": mime },
+          body: blob,
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`STT failed (${response.status})`);
+        const payload = await response.json();
+        return String(payload?.text ?? "").trim();
+      };
       recRef.current = rec;
       const t0 = Date.now();
       let vad = createLiveVadState(t0);
+      const prefetch = {
+        lastVoice: -1,
+        promise: null as Promise<{ text: string; lastVoice: number } | null> | null,
+      };
       let listeningCaptionShown = false;
       let ttsWasActive = speakingRef.current || isTtsActuallySpeaking();
       let contaminatedByOutput = false;
@@ -2674,11 +2691,53 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         });
         vad = result.state;
         if (result.acceptedSpeech) {
+          if (prefetch.lastVoice >= 0 && vad.lastVoice !== prefetch.lastVoice) {
+            pendingSttController?.abort();
+            pendingSttController = null;
+            prefetch.promise = null;
+            prefetch.lastVoice = -1;
+          }
           energyRef.current = Math.min(1, level / 90);
           if (!listeningCaptionShown) {
             listeningCaptionShown = true;
             showCaption({ who: "you", text: "Listening…" });
           }
+        }
+        if (shouldPrefetchLiveTranscript(vad, now, prefetch.lastVoice)) {
+          const lastVoice = vad.lastVoice;
+          prefetch.lastVoice = lastVoice;
+          const flushRecorder = new Promise<void>((resolve) => {
+            let settled = false;
+            const finish = () => {
+              if (settled) return;
+              settled = true;
+              rec.removeEventListener("dataavailable", finish);
+              resolve();
+            };
+            rec.addEventListener("dataavailable", finish, { once: true });
+            try { rec.requestData(); } catch { finish(); }
+            window.setTimeout(finish, 120);
+          });
+          void flushRecorder.then(() => {
+            if (
+              rec.state !== "recording"
+              || !freeLoop.current
+              || sessionEpoch !== liveSessionEpoch.current
+              || vad.lastVoice !== lastVoice
+            ) return;
+            const partial = new Blob([...chunks], { type: mime });
+            if (partial.size < 2000) return;
+            const controller = new AbortController();
+            pendingSttController = controller;
+            sttAbortRef.current?.abort();
+            sttAbortRef.current = controller;
+            prefetch.promise = requestTranscript(partial, controller)
+              .then((text) => ({ text, lastVoice }), () => null)
+              .finally(() => {
+                if (sttAbortRef.current === controller) sttAbortRef.current = null;
+                if (pendingSttController === controller) pendingSttController = null;
+              });
+          });
         }
         if (result.bargeIn) {
           void import("../lib/tts").then((m) => m.stopSpeaking());
@@ -2711,24 +2770,26 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const speechClosedAt = performance.now();
       document.documentElement.dataset.jarvisSpeechClosedMs = String(Math.round(speechClosedAt));
       showCaption({ who: "you", text: "Processing…" });
-      const controller = new AbortController();
-      sttAbortRef.current?.abort();
-      sttAbortRef.current = controller;
-      const r = await viewerFetch("/api/stt", {
-        method: "POST",
-        headers: { "content-type": mime },
-        body: blob,
-        signal: controller.signal,
-      });
-      if (!r.ok) throw new Error(`STT failed (${r.status})`);
-      const { text } = await r.json();
-      if (sttAbortRef.current === controller) sttAbortRef.current = null;
+      const pendingPrefetch = prefetch.promise;
+      const prefetched = pendingPrefetch && prefetch.lastVoice === vad.lastVoice
+        ? await pendingPrefetch
+        : null;
+      let text = prefetched?.text ?? "";
+      if (!text) {
+        const controller = new AbortController();
+        pendingSttController = controller;
+        sttAbortRef.current?.abort();
+        sttAbortRef.current = controller;
+        text = await requestTranscript(blob, controller);
+        if (sttAbortRef.current === controller) sttAbortRef.current = null;
+        if (pendingSttController === controller) pendingSttController = null;
+      }
       if (!freeLoop.current || sessionEpoch !== liveSessionEpoch.current) {
         outcome = "empty";
         return;
       }
       const { isEchoOfTts } = await import("../lib/tts");
-      const cleanedText = text?.trim() ?? "";
+      const cleanedText = text.trim();
       if (!isMeaningfulSpeechTranscript(cleanedText)) {
         outcome = "empty";
         return;
@@ -2755,6 +2816,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         closePersistentLiveMic();
       }
     } finally {
+      pendingSttController?.abort();
       recRef.current = null;
       energyRef.current = 0;
       freeBusy.current = false;

@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   LIVE_END_SILENCE_MS,
+  LIVE_STT_PREFETCH_SILENCE_MS,
   LIVE_SPEAKER_TAIL_MS,
   advanceLiveVad,
   createLiveVadState,
   shouldDeferLiveCapture,
   shouldCloseLiveUtterance,
+  shouldPrefetchLiveTranscript,
   spectrumBandLevel,
 } from "./live-vad";
 
@@ -78,6 +80,14 @@ describe("live full-duplex voice gate", () => {
     }).state;
     expect(state.lastVoice).toBe(3_200);
     expect(shouldCloseLiveUtterance(state, state.lastVoice + LIVE_END_SILENCE_MS + 1)).toBe(true);
+  });
+
+  it("prefetches STT once during silence without closing a natural pause", () => {
+    const state = { ...createLiveVadState(1_000), spoke: true, lastVoice: 2_000 };
+    expect(shouldPrefetchLiveTranscript(state, 2_000 + LIVE_STT_PREFETCH_SILENCE_MS - 1, -1)).toBe(false);
+    expect(shouldPrefetchLiveTranscript(state, 2_000 + LIVE_STT_PREFETCH_SILENCE_MS, -1)).toBe(true);
+    expect(shouldPrefetchLiveTranscript(state, 2_000 + LIVE_STT_PREFETCH_SILENCE_MS + 100, 2_000)).toBe(false);
+    expect(shouldCloseLiveUtterance(state, 3_100)).toBe(false);
   });
 
   it("measures vocal and keyboard bands independently", () => {
