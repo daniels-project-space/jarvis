@@ -11,6 +11,8 @@ import { createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
 import { relevantActiveWork } from "@/lib/active-work";
 import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
+import { advanceLiveConversation, inactiveLiveConversation, type LiveConversationEvent } from "@/lib/live-conversation";
+import { isPanelFollowUp } from "@/lib/panel-context";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, MarketChartLoading, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
 import CommandDeck from "./CommandDeck";
 import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
@@ -1042,19 +1044,6 @@ function VideoDock({
   );
 }
 
-// Is this new message a FOLLOW-UP about what's already on screen (so the overlay
-// should stay), or a genuine topic switch (so it should step aside)? Errs toward
-// keeping the overlay — the brain replaces or hides it if the topic really moved.
-function isFollowUp(msg: string, p: { title?: string }): boolean {
-  const m = ` ${msg.toLowerCase()} `;
-  if (/\b(number|no\.?|#|box|option|item|pic|picture|photo)\s*(one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\b/.test(m)) return true;
-  if (/\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|top|bottom|next|previous)\b/.test(m)) return true;
-  if (/\b(that|this|these|those|it|its|they|them|their|there|him|his|her|hers|he|she)\b/.test(m)) return true;
-  if (/\b(more|expand|tell me|who (is|are|was)|what about|whats?|why|how come|and the|bio|details?|explain|zoom|go on|about the?)\b/.test(m)) return true;
-  const words = String(p.title ?? "").toLowerCase().split(/\W+/).filter((w) => w.length > 3);
-  return words.some((w) => m.includes(w));
-}
-
 // The spoken caption. Short text just shows; a long reply that overflows the
 // field scrolls top→bottom over the narration's estimated duration (teleprompter),
 // so Daniel can read along with the voice instead of it clipping.
@@ -1248,7 +1237,16 @@ export default function JarvisUI() {
   const captionRef = useRef<Caption>(null);
   const energyRef = useRef(0);
   const recRef = useRef<MediaRecorder | null>(null);
+  // Session ownership is deliberately separate from a single microphone turn.
+  // Recorder/STT misses can re-arm capture without mutating the live ticker or
+  // releasing the cross-device lease.
   const liveRef = useRef(false);
+  const liveConversationRef = useRef(inactiveLiveConversation());
+  const liveSessionEpoch = useRef(0);
+  const liveStartPending = useRef(false);
+  const liveBeat = useRef<ReturnType<typeof setInterval> | null>(null);
+  const liveCaptureTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const freeBusy = useRef(false);
   const me = useRef("");
   const voiceRef = useRef<{ value: string; updatedAt: number } | null>(null);
   const ownVoice = () => {
@@ -1496,10 +1494,7 @@ export default function JarvisUI() {
       m.startWake(() => {
         setWake(false);
         m.chime();
-        if (voiceMode() === "free") {
-          freeLoop.current = true;
-          void freeVoiceTurn();
-        } else void toggleLive(true);
+        void toggleLive(true);
       });
       setWake(true);
     });
@@ -1529,10 +1524,7 @@ export default function JarvisUI() {
       m.startWake(() => {
         setWake(false);
         m.chime();
-        if (voiceMode() === "free") {
-          freeLoop.current = true;
-          void freeVoiceTurn();
-        } else void toggleLive(true);
+        void toggleLive(true);
       });
       setWake(true);
     });
@@ -1549,7 +1541,14 @@ export default function JarvisUI() {
     rearmWake(); // resume standby across reloads if Daniel left it on
     // release the live lock instantly if the tab closes mid-session
     const bye = () => {
+      liveSessionEpoch.current += 1;
       if (!liveRef.current) return;
+      liveConversationRef.current = advanceLiveConversation(liveConversationRef.current, {
+        type: "page-hidden",
+        now: Date.now(),
+      });
+      liveRef.current = false;
+      if (liveCaptureTimer.current) clearTimeout(liveCaptureTimer.current);
       const body = JSON.stringify({ path: "ui:setLiveOn", args: { client: me.current, on: false } });
       navigator.sendBeacon?.("/api/client-mutation", new Blob([body], { type: "application/json" }));
     };
@@ -1768,8 +1767,9 @@ export default function JarvisUI() {
           fadeCaption(spokenText, 1800); // remain readable, then leave without a flash
         },
       );
-      // free-voice conversation: keep the loop going until Daniel goes quiet
-      if (freeLoop.current) setTimeout(() => void freeVoiceTurn(), 220);
+      // The assistant turn completes inside the same live session. Re-arm the
+      // microphone without touching ticker/lease ownership.
+      markLiveAssistantFinished();
     })();
   }, [messages]);
 
@@ -1926,6 +1926,12 @@ export default function JarvisUI() {
     // double-tap / Enter+click within 2.5s = one send, not two
     if (t === lastSent.current.text && Date.now() - lastSent.current.ts < 2500) return;
     lastSent.current = { text: t, ts: Date.now() };
+    if (liveRef.current && liveConversationRef.current.phase === "listening") {
+      liveConversationRef.current = advanceLiveConversation(liveConversationRef.current, {
+        type: "speech-accepted",
+        now: Date.now(),
+      });
+    }
     updateConversationMood(t);
     void ownVoice();
     // A new request is an immediate barge-in. Cancel queued/playback state
@@ -1936,18 +1942,28 @@ export default function JarvisUI() {
       void m.warm();
     });
     setInput("");
-    // a playing video shrinks to picture-in-picture (keeps playing). Other
-    // overlays step aside ONLY on a genuine topic switch — a follow-up about
-    // what's on screen ("more on number 3", "who's the second") keeps it up so
-    // the brain can highlight/extend it (relevance awareness).
+    // A playing video keeps its established PiP lifecycle. Other panels are
+    // removed from both the stage and Convex context on a genuine topic switch;
+    // structured/deictic follow-ups retain the panel for continued interaction.
     if (panel?.type === "video") setVideoPip(true);
-    else if (panel && !panelFull && !isFollowUp(t, panel)) setPanelMin(true);
+    else if (panel && !isPanelFollowUp(t, panel)) {
+      const stalePanel = panel;
+      const staleKey = `${stalePanel.title ?? ""}|${stalePanel.value.slice(0, 160)}`;
+      fastChartRequest.current += 1;
+      fastNetWorthRequest.current += 1;
+      setPanelMin(true); // hide synchronously; the awaited mutation clears model context
+      setPanelFull(false);
+      setInstantPanel(null);
+      prevPanelRef.current = null;
+      setBubbles((items) => items.filter((item) => `${item.title ?? ""}|${item.value.slice(0, 160)}` !== staleKey));
+      await clearPanel({}).catch(() => false);
+    }
     const fastChart = !liveRef.current ? parseFastChartIntent(t) : null;
     if (fastChart) {
       void openFastChart(fastChart, t);
       return;
     }
-    const fastNetWorth = parseFastNetWorthIntent(t);
+    const fastNetWorth = !liveRef.current ? parseFastNetWorthIntent(t) : null;
     if (fastNetWorth) {
       void openFastNetWorth(fastNetWorth, t);
       return;
@@ -1980,6 +1996,7 @@ export default function JarvisUI() {
             fadeCaption(instant, 1800);
           },
         );
+        markLiveAssistantFinished();
       })();
       return;
     }
@@ -1991,7 +2008,6 @@ export default function JarvisUI() {
     setSpeaking(false);
   }
 
-  const liveBeat = useRef<ReturnType<typeof setInterval> | null>(null);
   function releaseLive() {
     if (liveBeat.current) clearInterval(liveBeat.current);
     liveBeat.current = null;
@@ -1999,31 +2015,90 @@ export default function JarvisUI() {
     void setLiveOn({ client: me.current, on: false }).catch(() => {});
   }
 
+  function finishLiveSession() {
+    liveRef.current = false;
+    if (liveCaptureTimer.current) clearTimeout(liveCaptureTimer.current);
+    liveCaptureTimer.current = null;
+    if (recRef.current?.state === "recording") recRef.current.stop();
+    setLive("off");
+    setCaption(null);
+    releaseLive();
+    rearmWake();
+  }
+
+  function stopLiveSession(type: "explicit-stop" | "permission-lost" | "lease-lost") {
+    liveSessionEpoch.current += 1;
+    liveConversationRef.current = advanceLiveConversation(liveConversationRef.current, {
+      type,
+      now: Date.now(),
+    } as LiveConversationEvent);
+    finishLiveSession();
+  }
+
+  function scheduleLiveCapture(delay = 220) {
+    if (!liveRef.current || !liveConversationRef.current.active) return;
+    if (liveCaptureTimer.current) clearTimeout(liveCaptureTimer.current);
+    liveCaptureTimer.current = setTimeout(() => {
+      liveCaptureTimer.current = null;
+      if (liveRef.current && liveConversationRef.current.active) void freeVoiceTurn();
+    }, delay);
+  }
+
+  function markLiveAssistantFinished() {
+    if (!liveRef.current) return;
+    liveConversationRef.current = advanceLiveConversation(liveConversationRef.current, {
+      type: "assistant-finished",
+      now: Date.now(),
+    });
+    scheduleLiveCapture();
+  }
+
   async function toggleLive(forceStart = false) {
     if (!forceStart && (liveRef.current || live !== "off")) {
-      freeLoop.current = false;
-      if (recRef.current?.state === "recording") recRef.current.stop();
-      liveRef.current = false;
-      setLive("off");
-      setCaption(null);
-      releaseLive();
-      rearmWake();
+      stopLiveSession("explicit-stop");
       return;
     }
-    if (liveRef.current) return;
+    if (liveRef.current || liveStartPending.current) return;
+    liveStartPending.current = true;
+    const startEpoch = ++liveSessionEpoch.current;
+    setLive("connecting");
     const owned = await setLiveOn({ client: me.current, on: true }).catch(() => true);
-    if (owned === false) return;
+    if (startEpoch !== liveSessionEpoch.current) {
+      liveStartPending.current = false;
+      if (owned !== false) void setLiveOn({ client: me.current, on: false }).catch(() => {});
+      return;
+    }
+    if (owned === false) {
+      liveStartPending.current = false;
+      setLive("off");
+      return;
+    }
     void ownVoice();
     import("../lib/tts").then((m) => m.stopSpeaking());
     const { stopWake } = await import("../lib/wakeword");
+    if (startEpoch !== liveSessionEpoch.current) {
+      liveStartPending.current = false;
+      void setLiveOn({ client: me.current, on: false }).catch(() => {});
+      return;
+    }
+    liveStartPending.current = false;
     stopWake();
-    freeLoop.current = true;
+    liveConversationRef.current = advanceLiveConversation(liveConversationRef.current, {
+      type: "start",
+      now: Date.now(),
+    });
     liveRef.current = true;
     setLive("live");
     void refreshPermissions();
     if (liveBeat.current) clearInterval(liveBeat.current);
-    liveBeat.current = setInterval(() => void setLiveOn({ client: me.current, on: true }).catch(() => {}), 20_000);
-    void freeVoiceTurn();
+    liveBeat.current = setInterval(() => {
+      void setLiveOn({ client: me.current, on: true })
+        .then((held) => {
+          if (held === false && liveRef.current) stopLiveSession("lease-lost");
+        })
+        .catch(() => {});
+    }, 20_000);
+    scheduleLiveCapture(0);
   }
 
   async function enableDevicePermissions() {
@@ -2144,34 +2219,37 @@ export default function JarvisUI() {
 
   // Turn-taking voice: the microphone is physically closed while Jarvis speaks,
   // so speaker echo cannot cancel Jarvis mid-sentence or reset the orb.
-  const freeLoop = useRef(false);
-  const freeBusy = useRef(false);
-  const voiceMode = () => "free";
   async function freeVoiceTurn() {
-    if (freeBusy.current) return;
+    if (freeBusy.current || !liveRef.current || !liveConversationRef.current.active) return;
     freeBusy.current = true;
+    let stream: MediaStream | null = null;
+    let audioContext: AudioContext | null = null;
+    let poll: ReturnType<typeof setInterval> | null = null;
+    let recorder: MediaRecorder | null = null;
+    let next: "wait-for-assistant" | "retry" | "end" | "none" = "none";
     try {
       import("../lib/tts").then((m) => m.stopSpeaking());
       void ownVoice();
-      const stream = await navigator.mediaDevices.getUserMedia({
+      stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
+      if (!liveRef.current) return;
       import("../lib/tts").then((m) => m.warm());
-      const actx = new AudioContext();
-      const an = actx.createAnalyser();
+      audioContext = new AudioContext();
+      const an = audioContext.createAnalyser();
       an.fftSize = 512;
-      actx.createMediaStreamSource(stream).connect(an);
+      audioContext.createMediaStreamSource(stream).connect(an);
       const buf = new Uint8Array(an.frequencyBinCount);
       const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
-      const rec = new MediaRecorder(stream, { mimeType: mime });
+      recorder = new MediaRecorder(stream, { mimeType: mime });
       const chunks: Blob[] = [];
-      rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+      recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
       setRecording(true);
-      recRef.current = rec;
+      recRef.current = recorder;
       let spoke = false;
       let lastVoice = Date.now();
       const t0 = Date.now();
-      const poll = setInterval(() => {
+      poll = setInterval(() => {
         an.getByteFrequencyData(buf);
         const level = buf.reduce((a, b) => a + b, 0) / buf.length;
         if (level > 24) {
@@ -2180,43 +2258,62 @@ export default function JarvisUI() {
           energyRef.current = Math.min(1, level / 90);
         }
         if ((spoke && Date.now() - lastVoice > 1500) || (!spoke && Date.now() - t0 > 6500) || Date.now() - t0 > 25_000) {
-          clearInterval(poll);
-          if (rec.state === "recording") rec.stop();
+          if (poll) clearInterval(poll);
+          poll = null;
+          if (recorder?.state === "recording") recorder.stop();
         }
       }, 140);
       await new Promise<void>((resolve) => {
-        rec.onstop = () => resolve();
-        rec.start();
+        recorder!.onstop = () => resolve();
+        recorder!.start();
       });
-      clearInterval(poll);
-      stream.getTracks().forEach((t) => t.stop());
-      void actx.close().catch(() => {});
-      setRecording(false);
-      energyRef.current = 0;
+      if (!liveRef.current) return;
       const blob = new Blob(chunks, { type: mime });
       if (!spoke || blob.size < 2000) {
-        freeLoop.current = false; // silence — back to wake-word standby
+        liveConversationRef.current = advanceLiveConversation(liveConversationRef.current, {
+          type: "no-speech",
+          now: Date.now(),
+        });
+        next = liveConversationRef.current.active ? "retry" : "end";
         return;
       }
       const r = await fetch("/api/stt", { method: "POST", headers: { "content-type": mime }, body: blob });
       const { text } = await r.json();
       const { isEchoOfTts } = await import("../lib/tts");
       if (!text?.trim() || isEchoOfTts(text)) {
-        freeLoop.current = false;
+        liveConversationRef.current = advanceLiveConversation(liveConversationRef.current, {
+          type: "transcript-rejected",
+          now: Date.now(),
+        });
+        next = "retry";
         return;
       }
+      liveConversationRef.current = advanceLiveConversation(liveConversationRef.current, {
+        type: "speech-accepted",
+        now: Date.now(),
+      });
+      next = "wait-for-assistant";
       void submit(text.trim()); // the reply speaks via the normal effect; the loop re-arms after it
-    } catch {
-      setRecording(false);
-      freeLoop.current = false;
+    } catch (error) {
+      if (!liveRef.current) return;
+      const name = error instanceof DOMException ? error.name : "";
+      const permissionLost = name === "NotAllowedError" || name === "SecurityError" || name === "NotFoundError";
+      liveConversationRef.current = advanceLiveConversation(liveConversationRef.current, {
+        type: permissionLost ? "permission-lost" : "capture-retryable-error",
+        now: Date.now(),
+      });
+      next = permissionLost ? "end" : "retry";
     } finally {
+      if (poll) clearInterval(poll);
+      stream?.getTracks().forEach((track) => track.stop());
+      if (audioContext) void audioContext.close().catch(() => {});
+      if (recRef.current === recorder) recRef.current = null;
+      setRecording(false);
+      energyRef.current = 0;
       freeBusy.current = false;
-      if (!freeLoop.current && liveRef.current) {
-        liveRef.current = false;
-        setLive("off");
-        releaseLive();
-        rearmWake();
-      }
+      if (!liveRef.current) return;
+      if (next === "retry") scheduleLiveCapture();
+      else if (next === "end") finishLiveSession();
     }
   }
 
