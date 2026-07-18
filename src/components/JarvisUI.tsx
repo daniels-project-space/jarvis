@@ -12,7 +12,7 @@ import { relevantActiveWork } from "@/lib/active-work";
 import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
 import { advanceLiveConversation, inactiveLiveConversation, type LiveConversationEvent } from "@/lib/live-conversation";
-import { isPanelFollowUp } from "@/lib/panel-context";
+import { disciplineConversationOverlay, rearmLiveCaptureAfterAssistant, runAssistantUiTurn } from "@/lib/conversation-ui";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, MarketChartLoading, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
 import CommandDeck from "./CommandDeck";
 import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
@@ -1257,12 +1257,11 @@ export default function JarvisUI() {
     }, delay);
   }
   function markLiveAssistantFinished(now: number) {
-    if (!liveRef.current || liveConversationRef.current.phase !== "awaiting-assistant") return;
-    liveConversationRef.current = advanceLiveConversation(liveConversationRef.current, {
-      type: "assistant-finished",
-      now,
-    });
-    scheduleLiveCapture();
+    rearmLiveCaptureAfterAssistant({
+      sessionOwned: liveRef,
+      conversation: liveConversationRef,
+      scheduleCapture: () => scheduleLiveCapture(),
+    }, now);
   }
   const me = useRef("");
   const voiceRef = useRef<{ value: string; updatedAt: number } | null>(null);
@@ -1770,8 +1769,8 @@ export default function JarvisUI() {
     // finished text there before voice ownership/model generation, so it never
     // vanishes during the TTS handoff or when this tab is not the speaker.
     showCaption({ who: "jarvis", text: spokenText, phase: "ready" });
-    void (async () => {
-      try {
+    void runAssistantUiTurn(
+      async () => {
         if (!(await ensureVoice())) {
           fadeCaption(spokenText, 3200);
           return; // another tab/device owns the voice
@@ -1791,12 +1790,13 @@ export default function JarvisUI() {
             fadeCaption(spokenText, 1800); // remain readable, then leave without a flash
           },
         );
-      } finally {
+      },
+      () => {
         // Voice ownership or TTS failure must not strand a live turn in
         // awaiting-assistant. The session itself remains the ticker owner.
         markLiveAssistantFinished(Date.now());
-      }
-    })().catch(() => {
+      },
+    ).catch(() => {
       setSpeaking(false);
       fadeCaption(spokenText, 3200);
     });
@@ -1978,21 +1978,24 @@ export default function JarvisUI() {
     });
     setInput("");
     // A playing video keeps its established PiP lifecycle. Other panels are
-    // removed from both the stage and Convex context on a genuine topic switch;
-    // structured/deictic follow-ups retain the panel for continued interaction.
-    if (panel?.type === "video") setVideoPip(true);
-    else if (panel && !isPanelFollowUp(t, panel)) {
-      const stalePanel = panel;
-      const staleKey = `${stalePanel.title ?? ""}|${stalePanel.value.slice(0, 160)}`;
-      closedPanelRef.current = { key: staleKey, ts: Date.now() };
-      fastChartRequest.current += 1;
-      fastNetWorthRequest.current += 1;
-      setPanelMin(true); // hide synchronously; the awaited mutation clears model context
-      setPanelFull(false);
-      setInstantPanel(null);
-      setBubbles((items) => items.filter((item) => `${item.title ?? ""}|${item.value.slice(0, 160)}` !== staleKey));
-      await clearPanel({}).catch(() => false);
-    }
+    // removed from stage, Convex context, pending fast requests, and landscape
+    // history on a genuine topic switch; contextual follow-ups retain them.
+    await disciplineConversationOverlay(t, panel, {
+      moveVideoToPip: () => setVideoPip(true),
+      markDismissed: (key, at) => {
+        closedPanelRef.current = { key, ts: at };
+      },
+      cancelPendingPanels: () => {
+        fastChartRequest.current += 1;
+        fastNetWorthRequest.current += 1;
+      },
+      hideStage: () => setPanelMin(true),
+      exitFullscreen: () => setPanelFull(false),
+      clearOptimisticPanel: () => setInstantPanel(null),
+      removeFromHistory: (key) =>
+        setBubbles((items) => items.filter((item) => `${item.title ?? ""}|${item.value.slice(0, 160)}` !== key)),
+      clearRemotePanel: () => clearPanel({}),
+    }, Date.now());
     const fastChart = !liveRef.current ? parseFastChartIntent(t) : null;
     if (fastChart) {
       void openFastChart(fastChart, t);
@@ -2013,8 +2016,8 @@ export default function JarvisUI() {
       void logTurn({ threadId: threadRef.current, role: "user", text: t })
         .then(() => logTurn({ threadId: threadRef.current, role: "assistant", text: instant, model: "instant" }))
         .catch(() => {});
-      void (async () => {
-        try {
+      void runAssistantUiTurn(
+        async () => {
           if (document.hidden || !(await ensureVoice())) {
             fadeCaption(instant, 3200);
             return;
@@ -2032,10 +2035,9 @@ export default function JarvisUI() {
               fadeCaption(instant, 1800);
             },
           );
-        } finally {
-          markLiveAssistantFinished(Date.now());
-        }
-      })().catch(() => {
+        },
+        () => markLiveAssistantFinished(Date.now()),
+      ).catch(() => {
         setSpeaking(false);
         fadeCaption(instant, 3200);
       });
