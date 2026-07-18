@@ -10,7 +10,9 @@ agents to build and repair Daniel's other projects. One personality
 - **Live lane** — turn-taking browser audio → free Whisper transcription → a warm,
   streaming Codex app-server authenticated by Daniel's subscription → local Kokoro TTS.
   The microphone is closed while Jarvis speaks, so speaker echo cannot cut him off.
-  Tools run through the private agent bridge; finished turns live in Convex history.
+  Tools run through native app-server callbacks and Node HTTPS in the private agent
+  bridge—no shell `curl`/Python dependency, and no bridge token in the Codex child.
+  Finished turns live in Convex history.
 - **Text lane** — `/api/chat` commits each turn to Convex and wakes one of two warm
   Trigger workers. The same Codex subscription app-server streams deltas every 120 ms;
   Luna/Terra/Sol are selected by complexity. The minute dispatcher only checks the

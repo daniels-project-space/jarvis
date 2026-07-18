@@ -19,6 +19,11 @@ import {
   type ForegroundTurnPayload,
 } from "./foreground-policy";
 import { CodexAppServer } from "./codex-app-server";
+import {
+  AgentToolBridge,
+  JARVIS_DYNAMIC_TOOLS,
+  JARVIS_TOOL_INSTRUCTIONS,
+} from "./agent-tool-bridge";
 
 function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = false): string[] {
   if (provider !== "codex") throw new Error("Jarvis permits only the Codex CLI runtime");
@@ -107,16 +112,9 @@ type QueueClaim = {
 };
 
 function conversationPreamble(contextBlock: string) {
-  const toolEndpoint = "https://jarvis-orcin-six.vercel.app/api/agent-tool";
   return PERSONA +
     `\n\n${CAPABILITIES}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${contextBlock}\n\nCurrent date: ${new Date().toDateString()}.\n\n${REMEMBER}\n\n` +
-    `FUNCTIONAL TOOLS: you can really act and render visuals through Jarvis's private tool bridge. Fetch only the belt needed with ` +
-    `curl -s -H 'Authorization: Bearer '"$JARVIS_DISPATCH_TOKEN"' '${toolEndpoint}?belt=core' ` +
-    `(belts: core, work, creative, travel, business). Then call one with ` +
-    `curl -s -X POST '${toolEndpoint}' -H 'Authorization: Bearer '"$JARVIS_DISPATCH_TOKEN" -H 'content-type: application/json' ` +
-    `--data '{"name":"<tool>","args":{...}}'. Read the returned result and continue. ` +
-    `Use tools whenever Daniel asks you to show, make, change, search, remember, schedule, monitor, chart, plan travel, or delegate—never merely claim it happened. ` +
-    `Never print, reveal, transform, or send the capability token anywhere except this exact Jarvis endpoint. You cannot approve consequential work; Daniel does that in the command deck. ` +
+    JARVIS_TOOL_INSTRUCTIONS + " " +
     `Answer directly and naturally. Never narrate context, memory, shell commands, or tool plumbing.`;
 }
 
@@ -222,7 +220,9 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
   // The old provider lookup now always returns Codex, so querying it added a
   // network round trip to every message without changing the selected brain.
   const provider: AgentProvider = "codex";
-  const prepared = prepareSubscriptionEnv(provider, { includeDispatch: true });
+  const dispatchToken = process.env.JARVIS_DISPATCH_TOKEN;
+  if (!dispatchToken) return { processed: 0, error: "JARVIS_DISPATCH_TOKEN is not configured" };
+  const prepared = prepareSubscriptionEnv(provider);
   if (prepared.error) return { processed: 0, error: prepared.error };
   const env = prepared.env;
   const bin = resolveSubscriptionAgentBin(provider);
@@ -230,7 +230,11 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
   if (!workerToken) return { processed: 0, error: "JARVIS_WORKER_TOKEN is not configured" };
   const runnerId = randomUUID();
-  const server = new CodexAppServer(bin, env, FOREGROUND_TURN_TIMEOUT_MS);
+  const bridge = new AgentToolBridge(dispatchToken);
+  const server = new CodexAppServer(bin, env, FOREGROUND_TURN_TIMEOUT_MS, {
+    dynamicTools: JARVIS_DYNAMIC_TOOLS,
+    onDynamicToolCall: (call) => bridge.invoke(call),
+  });
   // A handoff candidate pays its startup cost before taking ownership. That
   // removes the recurring cold gap that used to appear every few minutes.
   if (source === "warm-handoff") await server.start();

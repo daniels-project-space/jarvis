@@ -14,11 +14,11 @@ describe("subscription subprocess capability scope", () => {
     expect(specialist.GITHUB_TOKEN).toBeUndefined();
   });
 
-  it("grants only the narrow dispatcher to the conversational supervisor", () => {
+  it("keeps bridge authentication in the Trigger host instead of every Codex child", () => {
     vi.stubEnv("JARVIS_DISPATCH_TOKEN", "dispatch-capability");
     vi.stubEnv("JARVIS_WORKER_TOKEN", "worker-capability");
-    const supervisor = prepareSubscriptionEnv("codex", { includeDispatch: true }).env;
-    expect(supervisor.JARVIS_DISPATCH_TOKEN).toBe("dispatch-capability");
+    const supervisor = prepareSubscriptionEnv("codex").env;
+    expect(supervisor.JARVIS_DISPATCH_TOKEN).toBeUndefined();
     expect(supervisor.JARVIS_WORKER_TOKEN).toBeUndefined();
   });
 

@@ -18,6 +18,9 @@ export default defineConfig({
     external: ["@openai/codex", "web-push"],
     extensions: [
       additionalPackages({ packages: ["@openai/codex@0.144.5"] }),
+      // Keep the managed image minimal. Foreground bridge HTTPS runs through
+      // Node fetch/app-server dynamic tools, so curl and Python are deliberately
+      // not runtime dependencies.
       aptGet({ packages: ["git", "ca-certificates"] }),
       syncEnvVars(() => {
         const values = Object.fromEntries(

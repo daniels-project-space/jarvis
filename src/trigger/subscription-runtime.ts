@@ -33,7 +33,6 @@ export function resolveSubscriptionAgentBin(provider: AgentProvider): string | n
 function scopedSubscriptionEnv(
   source: NodeJS.ProcessEnv,
   provider: AgentProvider,
-  includeDispatch: boolean,
 ): NodeJS.ProcessEnv {
   const allow = [
     "PATH",
@@ -52,11 +51,6 @@ function scopedSubscriptionEnv(
     "CODEX_ACCESS_TOKEN",
     "JARVIS_AGENT_PROVIDER",
   ];
-  if (includeDispatch) {
-    // Only the conversational supervisor may delegate policy-checked work.
-    // Specialist/reviewer subprocesses never receive this authority.
-    allow.push("JARVIS_DISPATCH_TOKEN");
-  }
   const env = {} as NodeJS.ProcessEnv;
   for (const key of allow) if (source[key] !== undefined) env[key] = source[key];
   env.JARVIS_AGENT_PROVIDER = provider;
@@ -88,16 +82,14 @@ function writableCodexHome(): string | null {
 
 export function prepareSubscriptionEnv(
   provider: AgentProvider,
-  options: { includeDispatch?: boolean } = {},
 ): { env: NodeJS.ProcessEnv; error?: string } {
   if (provider !== "codex") {
     return { env: {} as NodeJS.ProcessEnv, error: "Jarvis permits only the Codex CLI runtime" };
   }
-  const includeDispatch = options.includeDispatch === true;
   const home = writableCodexHome();
   if (!home) {
     return {
-      env: scopedSubscriptionEnv(process.env, provider, includeDispatch),
+      env: scopedSubscriptionEnv(process.env, provider),
       error: "a writable non-temporary Codex home is unavailable",
     };
   }
@@ -113,14 +105,14 @@ export function prepareSubscriptionEnv(
       chmodSync(authPath, 0o600);
     } catch {
       return {
-        env: scopedSubscriptionEnv(process.env, provider, includeDispatch),
+        env: scopedSubscriptionEnv(process.env, provider),
         error: "invalid Codex subscription auth",
       };
     }
   }
   if (!process.env.CODEX_ACCESS_TOKEN && !encoded && !raw) {
     return {
-      env: scopedSubscriptionEnv(process.env, provider, includeDispatch),
+      env: scopedSubscriptionEnv(process.env, provider),
       error: "Codex subscription auth is not configured",
     };
   }
@@ -133,7 +125,6 @@ export function prepareSubscriptionEnv(
         CODEX_HOME: home,
       },
       provider,
-      includeDispatch,
     ),
   };
 }
