@@ -9,6 +9,32 @@ export type LiveAssistantUiBridge = {
   scheduleCapture: () => void;
 };
 
+export type FinalAssistantCursor = { thread: string; messageId: string | null } | null;
+
+export type FinalAssistantObservation = {
+  cursor: FinalAssistantCursor;
+  messageId: string | null;
+};
+
+/**
+ * Seed already-loaded history without replaying it, then surface every newly
+ * finalized assistant message. Query readiness matters: an empty hydrated
+ * thread must not mistake its first real reply for mount-time history.
+ */
+export function observeFinalAssistantMessage(
+  cursor: FinalAssistantCursor,
+  thread: string,
+  queryReady: boolean,
+  latestMessageId: string | null,
+): FinalAssistantObservation {
+  if (!queryReady) return { cursor, messageId: null };
+  if (!cursor || cursor.thread !== thread) {
+    return { cursor: { thread, messageId: latestMessageId }, messageId: null };
+  }
+  if (!latestMessageId || cursor.messageId === latestMessageId) return { cursor, messageId: null };
+  return { cursor: { thread, messageId: latestMessageId }, messageId: latestMessageId };
+}
+
 /**
  * Complete one assistant turn without surrendering the live-session ticker.
  * The browser session remains the owner; only the next recorder turn is

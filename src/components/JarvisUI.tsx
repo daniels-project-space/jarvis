@@ -12,7 +12,13 @@ import { relevantActiveWork } from "@/lib/active-work";
 import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
 import { advanceLiveConversation, inactiveLiveConversation, type LiveConversationEvent } from "@/lib/live-conversation";
-import { disciplineConversationOverlay, rearmLiveCaptureAfterAssistant, runAssistantUiTurn } from "@/lib/conversation-ui";
+import {
+  disciplineConversationOverlay,
+  observeFinalAssistantMessage,
+  rearmLiveCaptureAfterAssistant,
+  runAssistantUiTurn,
+  type FinalAssistantCursor,
+} from "@/lib/conversation-ui";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, MarketChartLoading, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
 import CommandDeck from "./CommandDeck";
 import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
@@ -1110,7 +1116,8 @@ export default function JarvisUI() {
   useEffect(() => {
     threadRef.current = thread;
   }, [thread]);
-  const messages = (useJarvisQuery(api.chatQueue.listMessages, { threadId: thread }) ?? []) as Msg[];
+  const messageRows = useJarvisQuery(api.chatQueue.listMessages, { threadId: thread }) as Msg[] | undefined;
+  const messages = messageRows ?? [];
   const remotePanel = useJarvisQuery(api.ui.getPanel, {}) as
     | StagePanel
     | null
@@ -1233,7 +1240,7 @@ export default function JarvisUI() {
   }, [panel]);
 
   const endRef = useRef<HTMLDivElement>(null);
-  const lastSpokenId = useRef<string | null>(null);
+  const finalAssistantCursor = useRef<FinalAssistantCursor>(null);
   const lastSpokenText = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
   const captionRef = useRef<Caption>(null);
   const energyRef = useRef(0);
@@ -1719,7 +1726,6 @@ export default function JarvisUI() {
   }, [sayRow]);
 
   // Speak new finalized assistant messages with the one streamed neural voice.
-  const lastSpokenThread = useRef<string>("");
   useEffect(() => {
     const latestAssistant = [...messages].reverse().find((message) => message.role === "assistant");
     if (latestAssistant?.status !== "streaming" || !latestAssistant.text) return;
@@ -1733,19 +1739,15 @@ export default function JarvisUI() {
   }, [messages]);
 
   useEffect(() => {
-    const last = [...messages].reverse().find((m) => m.role === "assistant" && m.status === "done" && m.text);
-    // hopping threads must never re-voice that thread's old last reply
-    if (lastSpokenThread.current !== thread) {
-      lastSpokenThread.current = thread;
-      lastSpokenId.current = last?._id ?? null;
-      return;
-    }
-    if (!last || last._id === lastSpokenId.current) return;
-    if (lastSpokenId.current === null) {
-      lastSpokenId.current = last._id; // don't re-speak history on page load
-      return;
-    }
-    lastSpokenId.current = last._id;
+    const last = [...(messageRows ?? [])].reverse().find((m) => m.role === "assistant" && m.status === "done" && m.text);
+    const observation = observeFinalAssistantMessage(
+      finalAssistantCursor.current,
+      thread,
+      messageRows !== undefined,
+      last?._id ?? null,
+    );
+    finalAssistantCursor.current = observation.cursor;
+    if (!last || observation.messageId !== last._id) return;
     if (!last.text) return;
     if (isToolGarbage(last.text) && !sanitizeAssistantText(last.text)) {
       markLiveAssistantFinished(Date.now());
@@ -1800,7 +1802,7 @@ export default function JarvisUI() {
       setSpeaking(false);
       fadeCaption(spokenText, 3200);
     });
-  }, [messages]);
+  }, [messageRows, thread]);
 
   async function queueDurableTurn(text: string) {
     durableStartedAt.current = performance.now();

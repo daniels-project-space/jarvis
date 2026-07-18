@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import {
   conversationPanelKey,
   disciplineConversationOverlay,
+  observeFinalAssistantMessage,
   rearmLiveCaptureAfterAssistant,
   runAssistantUiTurn,
+  type FinalAssistantCursor,
   type ConversationOverlayActions,
 } from "./conversation-ui";
 import { advanceLiveConversation, inactiveLiveConversation } from "./live-conversation";
@@ -29,33 +31,52 @@ function overlayActions(): ConversationOverlayActions {
 }
 
 describe("conversation UI bridge", () => {
-  it("re-arms browser capture after consecutive assistant turns, including TTS failure", async () => {
+  it("re-arms browser capture after the first and consecutive assistant turns, including TTS failure", async () => {
     const sessionOwned = { current: true };
     const conversation = {
       current: advanceLiveConversation(inactiveLiveConversation(), { type: "start", now: 0 }),
     };
     const scheduleCapture = vi.fn();
     const bridge = { sessionOwned, conversation, scheduleCapture };
+    let cursor: FinalAssistantCursor = null;
+
+    const observeReply = async (messageId: string, now: number, fail = false) => {
+      const observation = observeFinalAssistantMessage(cursor, "main", true, messageId);
+      cursor = observation.cursor;
+      if (!observation.messageId) return;
+      await runAssistantUiTurn(
+        async () => {
+          if (fail) throw new Error("tts unavailable");
+        },
+        () => rearmLiveCaptureAfterAssistant(bridge, now),
+      );
+    };
+
+    // Loading is not history. Once an empty thread has hydrated, its first
+    // completed response must flow through the same production completion gate.
+    cursor = observeFinalAssistantMessage(cursor, "main", false, null).cursor;
+    cursor = observeFinalAssistantMessage(cursor, "main", true, null).cursor;
 
     conversation.current = advanceLiveConversation(conversation.current, { type: "speech-accepted", now: 1_000 });
-    await runAssistantUiTurn(
-      async () => undefined,
-      () => rearmLiveCaptureAfterAssistant(bridge, 2_000),
-    );
+    await observeReply("reply-1", 2_000);
 
     conversation.current = advanceLiveConversation(conversation.current, { type: "speech-accepted", now: 3_000 });
-    await expect(
-      runAssistantUiTurn(
-        async () => {
-          throw new Error("tts unavailable");
-        },
-        () => rearmLiveCaptureAfterAssistant(bridge, 4_000),
-      ),
-    ).rejects.toThrow("tts unavailable");
+    await expect(observeReply("reply-2", 4_000, true)).rejects.toThrow("tts unavailable");
 
     expect(sessionOwned.current).toBe(true);
     expect(conversation.current).toMatchObject({ active: true, phase: "listening", completedTurns: 2 });
     expect(scheduleCapture).toHaveBeenCalledTimes(2);
+  });
+
+  it("seeds existing thread history without replaying it", () => {
+    const initial = observeFinalAssistantMessage(null, "main", true, "historic-reply");
+    expect(initial.messageId).toBeNull();
+
+    const next = observeFinalAssistantMessage(initial.cursor, "main", true, "new-reply");
+    expect(next.messageId).toBe("new-reply");
+
+    const threadHop = observeFinalAssistantMessage(next.cursor, "planning", true, "planning-history");
+    expect(threadHop.messageId).toBeNull();
   });
 
   it("does not re-arm capture after an intentional session stop", async () => {
