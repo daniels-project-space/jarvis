@@ -1,24 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { sentences, speak, stopSpeaking } from "./tts";
 
-class FakeWorker {
-  onmessage: ((event: MessageEvent) => void) | null = null;
-  onerror: (() => void) | null = null;
-  onmessageerror: (() => void) | null = null;
-
-  postMessage(request: { id: number; type: string }) {
-    queueMicrotask(() => {
-      if (request.type === "warm") {
-        this.onmessage?.({ data: { id: request.id, type: "ready" } } as MessageEvent);
-      } else {
-        this.onmessage?.({ data: { id: request.id, type: "audio", blob: new Blob(["audio"]) } } as MessageEvent);
-      }
-    });
-  }
-
-  terminate() {}
-}
-
 class FakeAudio {
   static instances: FakeAudio[] = [];
   onplay: (() => void) | null = null;
@@ -53,7 +35,6 @@ describe("single neural speech queue", () => {
 
   it("does not resolve a queued reply before its audio has finished", async () => {
     vi.stubGlobal("window", {});
-    vi.stubGlobal("Worker", FakeWorker);
     vi.stubGlobal("Audio", FakeAudio);
 
     const first = speak("The first reply is playing.", () => {});

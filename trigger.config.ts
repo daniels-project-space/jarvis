@@ -15,9 +15,9 @@ export default defineConfig({
   build: {
     // Subscription CLIs read their bundled Linux binary from disk. Pin exact
     // versions so a new upstream release cannot silently change a live runner.
-    external: ["@anthropic-ai/claude-code", "@openai/codex", "web-push"],
+    external: ["@openai/codex", "web-push"],
     extensions: [
-      additionalPackages({ packages: ["@anthropic-ai/claude-code@2.1.211", "@openai/codex@0.144.5"] }),
+      additionalPackages({ packages: ["@openai/codex@0.144.5"] }),
       aptGet({ packages: ["git", "ca-certificates"] }),
       syncEnvVars(() => {
         const values = Object.fromEntries(

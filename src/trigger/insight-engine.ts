@@ -47,9 +47,8 @@ async function m(path: string, args: unknown) {
 
 function ask(provider: AgentProvider, bin: string, env: NodeJS.ProcessEnv, prompt: string): Promise<string> {
   return new Promise((resolve) => {
-    const args = provider === "claude"
-      ? ["-p", prompt, "--model", "sonnet", "--dangerously-skip-permissions"]
-      : [...codexExecPrefix("sonnet"), prompt];
+    if (provider !== "codex") return resolve("");
+    const args = [...codexExecPrefix("sonnet"), prompt];
     const p = spawn(bin, args, {
       env,
       stdio: ["ignore", "pipe", "pipe"],
@@ -90,7 +89,7 @@ export const insightEngine = schedules.task({
   cron: "0 8,14,20 * * *", // 3x/day
   maxDuration: 200,
   run: async () => {
-    const provider: AgentProvider = (await q("ui:getAgentProvider", {})) === "claude" ? "claude" : "codex";
+    const provider: AgentProvider = "codex";
     const bin = resolveSubscriptionAgentBin(provider);
     if (!bin) return { error: `no ${provider} bin` };
     const prepared = prepareSubscriptionEnv(provider);

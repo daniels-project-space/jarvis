@@ -2,14 +2,15 @@ import { createRequire } from "node:module";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-export type AgentProvider = "codex" | "claude";
+export type AgentProvider = "codex";
 
 const nodeRequire = createRequire(import.meta.url);
 
 export function resolveSubscriptionAgentBin(provider: AgentProvider): string | null {
+  if (provider !== "codex") return null;
   try {
-    const packageName = provider === "codex" ? "@openai/codex" : "@anthropic-ai/claude-code";
-    const command = provider === "codex" ? "codex" : "claude";
+    const packageName = "@openai/codex";
+    const command = "codex";
     const pkgJson = nodeRequire.resolve(`${packageName}/package.json`);
     const pkgDir = dirname(pkgJson);
     const nodeModules = dirname(dirname(pkgDir));
@@ -48,7 +49,6 @@ function scopedSubscriptionEnv(
     "SSL_CERT_DIR",
     "TERM",
     "CI",
-    "CLAUDE_CODE_OAUTH_TOKEN",
     "CODEX_ACCESS_TOKEN",
     "JARVIS_AGENT_PROVIDER",
   ];
@@ -90,15 +90,10 @@ export function prepareSubscriptionEnv(
   provider: AgentProvider,
   options: { includeDispatch?: boolean } = {},
 ): { env: NodeJS.ProcessEnv; error?: string } {
-  const includeDispatch = options.includeDispatch === true;
-  if (provider === "claude") {
-    const home = process.env.JARVIS_CLAUDE_HOME ?? "/tmp/claude-home";
-    mkdirSync(join(home, ".claude"), { recursive: true });
-    return {
-      env: scopedSubscriptionEnv({ ...process.env, HOME: home }, provider, includeDispatch),
-    };
+  if (provider !== "codex") {
+    return { env: {} as NodeJS.ProcessEnv, error: "Jarvis permits only the Codex CLI runtime" };
   }
-
+  const includeDispatch = options.includeDispatch === true;
   const home = writableCodexHome();
   if (!home) {
     return {

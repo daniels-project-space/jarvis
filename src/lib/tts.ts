@@ -1,20 +1,7 @@
 "use client";
 
-// Jarvis has one audible identity: KittenTTS Jasper, generated locally in a
-// worker. Never fall back to Web Speech — doing so made one reply sound like
-// two people and allowed a robotic voice to race the neural one.
-
-type KittenWorkerRequest =
-  | { id: number; type: "warm" }
-  | { id: number; type: "generate"; text: string; speed: number };
-type KittenWorkerPayload =
-  | { type: "warm" }
-  | { type: "generate"; text: string; speed: number };
-type KittenWorkerResponse =
-  | { id: number; type: "ready" }
-  | { id: number; type: "audio"; blob: Blob }
-  | { id: number; type: "error"; message: string };
-type KittenWorkerResult = { ok: true; blob?: Blob } | { ok: false };
+// One speech path: streamed Microsoft neural audio through Jarvis's own London
+// edge route. Intelligence remains Codex CLI; this module only plays sound.
 
 type SpeechBatch = {
   generation: number;
@@ -32,21 +19,19 @@ let currentAudio: HTMLAudioElement | null = null;
 let stopAudioPlayback: (() => void) | null = null;
 let queue: SpeechBatch[] = [];
 let activeBatch: SpeechBatch | null = null;
-let kittenWorker: Worker | null = null;
-let kittenReady = false;
-let kittenLoading: Promise<boolean> | null = null;
-let kittenRequestId = 0;
-const kittenPending = new Map<number, { resolve: (result: KittenWorkerResult) => void }>();
 
 type Recent = { text: string; until: number };
 let recentUtterances: Recent[] = [];
 
 const words = (text: string) =>
-  text
-    .toLowerCase()
-    .replace(/[^a-z0-9\s']/g, " ")
-    .split(/\s+/)
-    .filter((word) => word.length > 1);
+  text.toLowerCase().replace(/[^a-z0-9\s']/g, " ").split(/\s+/).filter((word) => word.length > 1);
+
+function setTtsStatus(status: "ready" | "buffering" | "speaking" | "idle" | "unavailable") {
+  if (typeof document !== "undefined") {
+    document.documentElement.dataset.jarvisTts = status;
+    document.documentElement.dataset.jarvisTtsEngine = "neural-ryan-stream";
+  }
+}
 
 function trackUtterance(text: string, durationMs: number) {
   const now = Date.now();
@@ -68,82 +53,10 @@ export function isEchoOfTts(input: string): boolean {
   return false;
 }
 
-function setTtsStatus(status: "warming" | "ready" | "generating" | "speaking" | "idle" | "unavailable") {
-  if (typeof document !== "undefined") {
-    document.documentElement.dataset.jarvisTts = status;
-    document.documentElement.dataset.jarvisTtsEngine = "kitten-jasper";
-  }
-}
-
-function failKittenWorker() {
-  kittenReady = false;
-  kittenWorker?.terminate();
-  kittenWorker = null;
-  for (const pending of kittenPending.values()) pending.resolve({ ok: false });
-  kittenPending.clear();
-  setTtsStatus("unavailable");
-}
-
-function getKittenWorker() {
-  if (kittenWorker) return kittenWorker;
-  const worker = new Worker(new URL("../workers/kitten.worker.ts", import.meta.url), {
-    type: "module",
-    name: "jarvis-kitten-jasper",
-  });
-  worker.onmessage = (event: MessageEvent<KittenWorkerResponse>) => {
-    const response = event.data;
-    const pending = kittenPending.get(response.id);
-    if (!pending) return;
-    kittenPending.delete(response.id);
-    if (response.type === "ready") {
-      kittenReady = true;
-      setTtsStatus("ready");
-      pending.resolve({ ok: true });
-    } else if (response.type === "audio") {
-      pending.resolve({ ok: true, blob: response.blob });
-    } else {
-      pending.resolve({ ok: false });
-    }
-  };
-  worker.onerror = failKittenWorker;
-  worker.onmessageerror = failKittenWorker;
-  kittenWorker = worker;
-  return worker;
-}
-
-function askKittenWorker(request: KittenWorkerPayload): Promise<KittenWorkerResult> {
-  const id = ++kittenRequestId;
-  return new Promise((resolve) => {
-    kittenPending.set(id, { resolve });
-    try {
-      getKittenWorker().postMessage({ ...request, id } as KittenWorkerRequest);
-    } catch {
-      kittenPending.delete(id);
-      resolve({ ok: false });
-      failKittenWorker();
-    }
-  });
-}
-
-async function prepareKitten(): Promise<boolean> {
-  if (typeof window === "undefined") return false;
-  if (kittenReady) return true;
-  if (kittenLoading) return kittenLoading;
-  setTtsStatus("warming");
-  kittenLoading = askKittenWorker({ type: "warm" })
-    .then((result) => result.ok)
-    .catch(() => false)
-    .finally(() => {
-      kittenLoading = null;
-    });
-  return kittenLoading;
-}
-
-// Model download/initialisation starts on Jarvis mount. It runs in a worker,
-// so delaying it until after a message only created a long silent gap without
-// protecting the UI thread.
+// There is no local model to initialise. Keeping this API lets all voice entry
+// points share the same lifecycle without delaying a message after interaction.
 export async function warm(): Promise<void> {
-  await prepareKitten();
+  setTtsStatus("ready");
 }
 
 export function stopSpeaking() {
@@ -154,7 +67,7 @@ export function stopSpeaking() {
   stopAudioPlayback?.();
   stopAudioPlayback = null;
   currentAudio = null;
-  setTtsStatus(kittenReady ? "ready" : "warming");
+  setTtsStatus("ready");
   void import("./wakeword").then((module) => module.setSuppressed?.(false)).catch(() => {});
 }
 
@@ -165,7 +78,9 @@ export function isSpeaking() {
 export function sentences(text: string): string[] {
   const result: string[] = [];
   let buffer = "";
-  for (const part of text.split(/(?<=[.!?])\s+(?=[A-Z0-9£"'])/)) {
+  // Clause boundaries keep time-to-first-audio low while preserving natural
+  // phrasing. The next clause begins buffering during current playback.
+  for (const part of text.split(/(?<=[.!?;:])\s+|(?<=,)\s+(?=\S)/)) {
     buffer = buffer ? `${buffer} ${part}` : part;
     if (buffer.length >= 24) {
       result.push(buffer);
@@ -178,10 +93,10 @@ export function sentences(text: string): string[] {
 
 function speechSpeed(text: string): number {
   const tone = text.toLowerCase();
-  if (/\b(urgent|careful|risk|serious|honestly|numbers|weak plan)\b/.test(tone)) return 0.95;
-  if (/\b(sorry|rough|tired|stressed|gentle|here with you)\b/.test(tone)) return 0.93;
-  if (/\b(ha|haha|brilliant|lets go|let's go|excited|love it)\b/.test(tone)) return 1.07;
-  return 1.01;
+  if (/\b(urgent|careful|risk|serious|honestly|numbers|weak plan)\b/.test(tone)) return 0.98;
+  if (/\b(sorry|rough|tired|stressed|gentle|here with you)\b/.test(tone)) return 0.95;
+  if (/\b(ha|haha|brilliant|lets go|let's go|excited|love it)\b/.test(tone)) return 1.1;
+  return 1.04;
 }
 
 function energyLoop(expectedGeneration: number, onEnergy: (energy: number) => void) {
@@ -193,27 +108,22 @@ function energyLoop(expectedGeneration: number, onEnergy: (energy: number) => vo
   }, 60);
 }
 
-async function generateSegment(text: string, expectedGeneration: number): Promise<Blob | null> {
-  if (expectedGeneration !== generation) return null;
-  setTtsStatus("generating");
-  const result = await askKittenWorker({
-    type: "generate",
-    text,
-    speed: speechSpeed(text),
-  });
-  return result.ok && result.blob ? result.blob : null;
+function prepareSegment(text: string): HTMLAudioElement {
+  const params = new URLSearchParams({ text, speed: String(speechSpeed(text)) });
+  const audio = new Audio(`/api/tts?${params.toString()}`);
+  audio.preload = "auto";
+  audio.load?.();
+  return audio;
 }
 
 function playSegment(
-  blob: Blob,
+  audio: HTMLAudioElement,
   expectedGeneration: number,
   onEnergy: (energy: number) => void,
   onStart?: () => void,
 ): Promise<boolean> {
   if (expectedGeneration !== generation) return Promise.resolve(false);
   return new Promise((resolve) => {
-    const objectUrl = URL.createObjectURL(blob);
-    const audio = new Audio(objectUrl);
     currentAudio = audio;
     let timer: ReturnType<typeof setInterval> | null = null;
     let settled = false;
@@ -223,8 +133,8 @@ function playSegment(
       if (timer) clearInterval(timer);
       if (currentAudio === audio) currentAudio = null;
       if (stopAudioPlayback === stop) stopAudioPlayback = null;
-      URL.revokeObjectURL(objectUrl);
       audio.removeAttribute("src");
+      audio.load?.();
       onEnergy(0);
       resolve(played);
     };
@@ -233,6 +143,7 @@ function playSegment(
       finish(false);
     };
     stopAudioPlayback = stop;
+    audio.onwaiting = () => setTtsStatus("buffering");
     audio.onplay = () => {
       if (expectedGeneration !== generation) return stop();
       setTtsStatus("speaking");
@@ -241,6 +152,7 @@ function playSegment(
     };
     audio.onended = () => finish(true);
     audio.onerror = () => finish(false);
+    setTtsStatus("buffering");
     void audio.play().catch(() => finish(false));
   });
 }
@@ -270,39 +182,28 @@ async function drainSpeechQueue(): Promise<void> {
     while (queue.length) {
       const batch = queue.shift()!;
       activeBatch = batch;
-      const hardWakeGate = /jarvis/i.test(batch.text);
-      void import("./wakeword").then((module) => module.setSuppressed?.(true, hardWakeGate)).catch(() => {});
-
-      const ready = await prepareKitten();
+      void import("./wakeword").then((module) => module.setSuppressed?.(true, /jarvis/i.test(batch.text))).catch(() => {});
       let started = false;
-      if (ready && batch.generation === generation && batch.segments.length) {
-        // Once segment N is generated, segment N+1 is generated during N's
-        // playback. This keeps one inference in flight and removes the long
-        // dead air that used to appear between sentences.
-        let nextAudio = generateSegment(batch.segments[0], batch.generation);
-        for (let index = 0; index < batch.segments.length; index++) {
-          const blob = await nextAudio;
-          if (!blob || batch.generation !== generation) break;
-          nextAudio = index + 1 < batch.segments.length
-            ? generateSegment(batch.segments[index + 1], batch.generation)
-            : Promise.resolve(null);
-          const played = await playSegment(
-            blob,
-            batch.generation,
-            batch.onEnergy,
-            started ? undefined : () => {
-              started = true;
-              batch.onStart?.();
-            },
-          );
-          if (!played && batch.generation === generation) break;
-        }
+      let nextAudio = batch.segments.length ? prepareSegment(batch.segments[0]) : null;
+      for (let index = 0; nextAudio && index < batch.segments.length; index++) {
+        if (batch.generation !== generation) break;
+        const audio = nextAudio;
+        nextAudio = index + 1 < batch.segments.length ? prepareSegment(batch.segments[index + 1]) : null;
+        const played = await playSegment(
+          audio,
+          batch.generation,
+          batch.onEnergy,
+          started ? undefined : () => {
+            started = true;
+            batch.onStart?.();
+          },
+        );
+        if (!played && batch.generation === generation) break;
       }
-
       if (batch.generation === generation) {
         batch.onEnergy(0);
         batch.onEnd?.();
-        setTtsStatus(kittenReady ? "ready" : "unavailable");
+        setTtsStatus("ready");
       }
       batch.resolve();
       activeBatch = null;

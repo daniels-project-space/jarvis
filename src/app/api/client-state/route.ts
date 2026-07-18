@@ -41,9 +41,10 @@ export async function POST(req: NextRequest) {
   }
 
   if (action === "set_agent_provider") {
-    const provider = body?.provider === "claude" ? "claude" : body?.provider === "codex" ? "codex" : null;
-    if (!provider) return Response.json({ ok: false }, { status: 400 });
-    await controlMutation("ui:setAgentProvider", { provider, authTokenHash });
+    if (body?.provider !== "codex") {
+      return Response.json({ ok: false, error: "Jarvis intelligence is Codex CLI only." }, { status: 400 });
+    }
+    await controlMutation("ui:setAgentProvider", { provider: "codex", authTokenHash });
     return Response.json({ ok: true });
   }
 

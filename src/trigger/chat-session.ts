@@ -21,19 +21,15 @@ import {
 import { CodexAppServer } from "./codex-app-server";
 
 function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = false): string[] {
-  if (provider === "claude") {
-    const args = ["-p", prompt, "--model", tier, "--dangerously-skip-permissions"];
-    if (json) args.push("--output-format", "stream-json", "--verbose", "--include-partial-messages");
-    return args;
-  }
+  if (provider !== "codex") throw new Error("Jarvis permits only the Codex CLI runtime");
   const args = codexConversationExecPrefix(tier);
   if (json) args.push("--json");
   args.push(prompt);
   return args;
 }
 
-// Subscription brain: each queued chat turn runs the selected Codex or Claude
-// CLI headlessly, with metered API keys blanked and only the chosen subscription
+// Subscription brain: each queued chat turn runs the Codex CLI headlessly,
+// with metered API keys blanked and only the subscription
 // credential exposed. This is conversational—repository work is delegated to
 // the durable agent runner. Bounded memory and project context come from Convex.
 
@@ -323,7 +319,7 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
         status: turn.finalText.trim() ? "done" : "error",
         finalText,
         claudeSessionId: turn.sessionId ?? undefined,
-        model: provider === "codex" ? `codex · ${codexModelFor(model).model}` : `${provider} · ${model}`,
+        model: `codex · ${codexModelFor(model).model}`,
       });
       const deliveredAt = Date.now();
       // Memory capture is a separate background task. It must never hold the

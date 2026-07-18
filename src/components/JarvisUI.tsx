@@ -311,11 +311,11 @@ function OptionsPanel({
           <button onClick={onClose} className="hud-label hover:text-cyan">close</button>
         </div>
         <div className="divide-y divide-white/5">
-          <Row label="Agent intelligence" hint="subscription used for background work and deep fallback">
-            <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 font-mono text-[9px] uppercase tracking-wider text-cyan">Codex · adaptive</span>
+          <Row label="Agent intelligence" hint="Codex CLI via ChatGPT subscription · foreground and agents">
+            <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 font-mono text-[9px] uppercase tracking-wider text-cyan">Codex CLI · adaptive</span>
           </Row>
-          <Row label="Voice" hint="24 MB local neural speech · Codex subscription intelligence">
-            <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 text-[11px] text-cyan">Jasper · free</span>
+          <Row label="Voice" hint="free streamed neural speech · Codex CLI intelligence">
+            <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 text-[11px] text-cyan">Ryan · free neural</span>
           </Row>
           <Row
             label="Voice & alerts"
@@ -331,7 +331,7 @@ function OptionsPanel({
             </button>
           </Row>
           <Row label="Speaking voice" hint="one consistent expressive voice · no robotic fallback">
-            <span className="rounded-lg border border-white/10 bg-black/20 px-2.5 py-1 text-[11px] text-ice">Jasper</span>
+            <span className="rounded-lg border border-white/10 bg-black/20 px-2.5 py-1 text-[11px] text-ice">Ryan</span>
           </Row>
           <Row label="Live conversation" hint={live !== "off" ? "on now" : "listen → answer → listen, with no self-echo"}>
             <button onClick={onToggleLive} className={`rounded-lg px-3 py-1 text-[11px] transition ${live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>
@@ -1343,8 +1343,7 @@ export default function JarvisUI() {
       reduceMotion: localStorage.getItem("jarvis_reduce_motion") === "1",
       liveDefault: localStorage.getItem("jarvis_live_default") !== "0",
     });
-    // Begin the model download before Daniel asks anything. It is worker-only
-    // and cannot block the orb, captions or input.
+    // Mark the single streaming speech path ready before Daniel asks anything.
     void import("../lib/tts").then((module) => module.warm());
   }, []);
   const setPref = (k: keyof JarvisPrefs, v: string | boolean) => {
@@ -1696,7 +1695,7 @@ export default function JarvisUI() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sayRow]);
 
-  // Speak new finalized assistant messages with the one local neural voice.
+  // Speak new finalized assistant messages with the one streamed neural voice.
   const lastSpokenThread = useRef<string>("");
   useEffect(() => {
     const latestAssistant = [...messages].reverse().find((message) => message.role === "assistant");

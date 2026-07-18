@@ -41,7 +41,7 @@ export const getPanel = query({
 // Global subscription agent selection. Trigger jobs read this before claiming
 // work, so the choice follows Daniel across devices and affects every runner.
 export const setAgentProvider = mutation({
-  args: { provider: v.union(v.literal("codex"), v.literal("claude")), authTokenHash: v.optional(v.string()) },
+  args: { provider: v.literal("codex"), authTokenHash: v.optional(v.string()) },
   handler: async (ctx, a) => {
     await requireAdmin(ctx, a.authTokenHash);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "agentProvider")).first();

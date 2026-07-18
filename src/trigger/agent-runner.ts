@@ -469,8 +469,7 @@ export function repairPrompt(inc: { source: string; message: string; signature: 
 // It is exported independently of Trigger so cloud runners can execute the
 // same durable lease/checkpoint protocol with their repository-scoped tools.
 export async function runAgentHarness() {
-    const selected = await convexQuery("ui:getAgentProvider", {});
-    const provider: AgentProvider = selected === "claude" ? "claude" : "codex";
+    const provider: AgentProvider = "codex";
     const bin = resolveSubscriptionAgentBin(provider);
     if (!bin) return { processed: 0, error: `no ${provider} binary` };
     const prepared = prepareSubscriptionEnv(provider);
@@ -550,11 +549,9 @@ export async function runAgentHarness() {
     mkdirSync("/tmp/work", { recursive: true });
     const token = process.env.GITHUB_TOKEN ?? "";
 
-    // Standing briefing every agent reads (global CLAUDE.md in the runner HOME):
+    // Standing briefing every agent reads from the Codex home:
     // Daniel's infra map + vault access + repo/deploy conventions = real project access.
-    const briefingPath = provider === "claude"
-      ? join(String(env.HOME), ".claude", "CLAUDE.md")
-      : join(String(env.CODEX_HOME), "AGENTS.md");
+    const briefingPath = join(String(env.CODEX_HOME), "AGENTS.md");
     writeFileSync(
       briefingPath,
       `# You are a scoped JARVIS permanent-team agent working for Daniel.\n\n${INFRA_MAP}\n\n` +

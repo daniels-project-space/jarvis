@@ -11,6 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@andresaya/edge-tts": "^1.8.0",
     "@excalidraw/excalidraw": "^0.18.1",
     "@mastra/core": "^1.51.0",
     "@openai/codex": "0.144.5",
@@ -21,9 +22,7 @@
     "jose": "^6.2.3",
     "maplibre-gl": "^5.24.0",
     "next": "16.2.10",
-    "onnxruntime-web": "^1.22.0",
     "pdf-lib": "^1.17.1",
-    "phonemizer": "^1.2.1",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "server-only": "^0.0.1",
