@@ -19,7 +19,7 @@ import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, ty
 import { parseTerminalOutput, type TerminalTone } from "@/lib/terminal-output";
 import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate } from "@/lib/transcript";
-import { completeSpeechPrefix, isSpeaking as isTtsActuallySpeaking } from "@/lib/tts";
+import { completeSpeechPrefix, isSpeaking as isTtsActuallySpeaking, unlockSpeechPlayback } from "@/lib/tts";
 import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
@@ -1445,6 +1445,18 @@ export default function JarvisUI() {
     // Mark the single streaming speech path ready before Daniel asks anything.
     void import("../lib/tts").then((module) => module.warm());
   }, []);
+  useEffect(() => {
+    // Capture the browser activation itself. Waiting for Codex/Trigger to
+    // answer before calling play() is too late and used to leave fully-loaded
+    // MP3s silent with NotAllowedError, particularly in the Project Hub embed.
+    const unlock = () => unlockSpeechPlayback();
+    window.addEventListener("pointerdown", unlock, { capture: true });
+    window.addEventListener("keydown", unlock, { capture: true });
+    return () => {
+      window.removeEventListener("pointerdown", unlock, { capture: true });
+      window.removeEventListener("keydown", unlock, { capture: true });
+    };
+  }, []);
   const setPref = (k: keyof JarvisPrefs, v: string | boolean) => {
     setPrefs((p) => ({ ...p, [k]: v }));
     const key = k === "reduceMotion" ? "jarvis_reduce_motion" : "jarvis_live_default";
@@ -2146,6 +2158,9 @@ export default function JarvisUI() {
   async function submit(text: string) {
     const t = text.trim();
     if (!t) return;
+    // Typed/button calls reach this inside a user gesture. Live/STT calls have
+    // already been primed by the control that opened the microphone.
+    unlockSpeechPlayback();
     // double-tap / Enter+click within 2.5s = one send, not two
     if (t === lastSent.current.text && Date.now() - lastSent.current.ts < 2500) return;
     lastSent.current = { text: t, ts: Date.now() };

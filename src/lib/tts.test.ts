@@ -1,12 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { completeSpeechPrefix, isEchoOfTts, normalizeSpeechText, sentences, speak, speechPauseMs, stopSpeaking } from "./tts";
+import { completeSpeechPrefix, isEchoOfTts, normalizeSpeechText, sentences, speak, speechPauseMs, stopSpeaking, unlockSpeechPlayback } from "./tts";
 
 class FakeAudio {
   static instances: FakeAudio[] = [];
+  static rejectNewTtsElements = false;
   onplay: (() => void) | null = null;
   onended: (() => void) | null = null;
   onerror: (() => void) | null = null;
   src: string;
+  currentSrc = "";
+  currentTime = 0;
+  preload = "";
+  playCalls: string[] = [];
 
   constructor(src: string) {
     this.src = src;
@@ -14,17 +19,23 @@ class FakeAudio {
   }
 
   async play() {
+    this.playCalls.push(this.src);
+    if (FakeAudio.rejectNewTtsElements && this !== FakeAudio.instances[0] && this.src.startsWith("/api/tts")) {
+      throw new DOMException("playback requires user activation", "NotAllowedError");
+    }
     this.onplay?.();
   }
 
   pause() {}
   removeAttribute() {}
+  load() {}
 }
 
 describe("single neural speech queue", () => {
   afterEach(() => {
     stopSpeaking();
     FakeAudio.instances = [];
+    FakeAudio.rejectNewTtsElements = false;
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -107,5 +118,21 @@ describe("single neural speech queue", () => {
     FakeAudio.instances[1].onended?.();
     await second;
     expect(secondFinished).toBe(true);
+  });
+
+  it("retries blocked speech on the player primed during user interaction", async () => {
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("Audio", FakeAudio);
+
+    unlockSpeechPlayback();
+    await vi.waitFor(() => expect(FakeAudio.instances).toHaveLength(1));
+    expect(FakeAudio.instances[0].src).toMatch(/^data:audio\/wav/);
+    FakeAudio.rejectNewTtsElements = true;
+
+    const reply = speak("This reply must survive autoplay policy.", () => {});
+    await vi.waitFor(() => expect(FakeAudio.instances).toHaveLength(2));
+    await vi.waitFor(() => expect(FakeAudio.instances[0].playCalls.some((src) => src.startsWith("/api/tts"))).toBe(true));
+    FakeAudio.instances[0].onended?.();
+    await reply;
   });
 });

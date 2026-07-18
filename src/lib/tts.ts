@@ -23,6 +23,16 @@ const COMMON_GREETING = "Right here, sir. What's the first thing we're sorting?"
 const ECHO_GUARD_TAIL_MS = 45_000;
 const primedAudio = new Map<string, HTMLAudioElement>();
 const reusableAudio = new WeakMap<HTMLAudioElement, string>();
+// Browsers may fetch every byte of a TTS response and still reject play() once
+// the short user-activation window has elapsed (especially inside the Project
+// Hub iframe). Prime one real, reusable media element while Daniel is actively
+// clicking/typing and use that same unlocked element if a later element is
+// refused by autoplay policy.
+const SILENT_WAV = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQQAAACAgICA";
+let unlockedAudio: HTMLAudioElement | null = null;
+let playbackUnlocked = false;
+let unlockInFlight = false;
+let lastPlaybackFailure = { signature: "", at: 0 };
 
 type Recent = { text: string; until: number };
 let recentUtterances: Recent[] = [];
@@ -34,6 +44,59 @@ function setTtsStatus(status: "ready" | "buffering" | "speaking" | "idle" | "una
   if (typeof document !== "undefined") {
     document.documentElement.dataset.jarvisTts = status;
     document.documentElement.dataset.jarvisTtsEngine = "neural-ryan-stream";
+  }
+}
+
+function describeMediaError(audio: HTMLAudioElement): string {
+  const error = audio.error;
+  if (!error) return "unknown media playback failure";
+  return `media error ${error.code}${error.message ? `: ${error.message}` : ""}`;
+}
+
+function reportPlaybackFailure(reason: string) {
+  if (typeof document === "undefined") return;
+  const clean = reason.replace(/\s+/g, " ").slice(0, 240);
+  document.documentElement.dataset.jarvisTtsFailure = clean;
+  const signature = clean.replace(/https?:\/\/\S+/g, "url").slice(0, 100);
+  const now = Date.now();
+  if (lastPlaybackFailure.signature === signature && now - lastPlaybackFailure.at < 60_000) return;
+  lastPlaybackFailure = { signature, at: now };
+  const activation = typeof navigator !== "undefined" && "userActivation" in navigator
+    ? `; user activation=${String((navigator as Navigator & { userActivation?: { hasBeenActive?: boolean } }).userActivation?.hasBeenActive)}`
+    : "";
+  void fetch("/api/incident", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      signature: `client:tts-playback:${signature}`,
+      message: `Jarvis generated speech but the browser could not play it: ${clean}; visibility=${document.visibilityState}${activation}`,
+    }),
+  }).catch(() => {});
+}
+
+/** Call synchronously from a genuine pointer/key interaction. */
+export function unlockSpeechPlayback(): void {
+  if (typeof Audio === "undefined" || playbackUnlocked || unlockInFlight) return;
+  const audio = unlockedAudio ?? new Audio(SILENT_WAV);
+  unlockedAudio = audio;
+  audio.preload = "auto";
+  if (currentAudio === audio) return;
+  unlockInFlight = true;
+  try {
+    audio.src = SILENT_WAV;
+    const attempt = audio.play();
+    void attempt.then(() => {
+      playbackUnlocked = true;
+      audio.pause();
+      try { audio.currentTime = 0; } catch { /* not seekable in this browser */ }
+    }).catch(() => {
+      // Mount-time warmup has no user gesture and is expected to fail. The
+      // pointer/key capture hook retries from a genuine interaction.
+    }).finally(() => {
+      unlockInFlight = false;
+    });
+  } catch {
+    unlockInFlight = false;
   }
 }
 
@@ -80,6 +143,7 @@ export function completeSpeechPrefix(input: string): string {
 // points share the same lifecycle without delaying a message after interaction.
 export async function warm(): Promise<void> {
   setTtsStatus("ready");
+  unlockSpeechPlayback();
   if (typeof window !== "undefined" && !primedAudio.has(COMMON_GREETING)) {
     const audio = makeAudio(COMMON_GREETING);
     reusableAudio.set(audio, COMMON_GREETING);
@@ -202,18 +266,21 @@ function prepareSegment(text: string): HTMLAudioElement {
   return makeAudio(text);
 }
 
-function playSegment(
+type PlaybackResult = { played: boolean; failure?: string; source: string };
+
+function playAudio(
   audio: HTMLAudioElement,
   expectedGeneration: number,
   onEnergy: (energy: number) => void,
   onStart?: () => void,
-): Promise<boolean> {
-  if (expectedGeneration !== generation) return Promise.resolve(false);
+): Promise<PlaybackResult> {
+  const source = audio.currentSrc || audio.src;
+  if (expectedGeneration !== generation) return Promise.resolve({ played: false, source });
   return new Promise((resolve) => {
     currentAudio = audio;
     let timer: ReturnType<typeof setInterval> | null = null;
     let settled = false;
-    const finish = (played: boolean) => {
+    const finish = (played: boolean, failure?: string) => {
       if (settled) return;
       settled = true;
       if (timer) clearInterval(timer);
@@ -228,7 +295,7 @@ function playSegment(
         audio.load?.();
       }
       onEnergy(0);
-      resolve(played);
+      resolve({ played, failure, source });
     };
     const stop = () => {
       audio.pause();
@@ -243,10 +310,47 @@ function playSegment(
       timer = energyLoop(expectedGeneration, onEnergy);
     };
     audio.onended = () => finish(true);
-    audio.onerror = () => finish(false);
+    audio.onerror = () => finish(false, describeMediaError(audio));
     setTtsStatus("buffering");
-    void audio.play().catch(() => finish(false));
+    void audio.play().catch((error) => finish(false, String(error)));
   });
+}
+
+async function playSegment(
+  audio: HTMLAudioElement,
+  expectedGeneration: number,
+  onEnergy: (energy: number) => void,
+  onStart?: () => void,
+): Promise<boolean> {
+  let started = false;
+  const start = () => {
+    if (started) return;
+    started = true;
+    onStart?.();
+  };
+  const first = await playAudio(audio, expectedGeneration, onEnergy, start);
+  if (first.played || expectedGeneration !== generation || !first.failure) return first.played;
+
+  // Autoplay rejection is per media element on Safari/iOS and embedded Chrome.
+  // Retry once on the exact element primed during Daniel's interaction.
+  const fallback = playbackUnlocked ? unlockedAudio : null;
+  if (fallback && fallback !== audio && first.source) {
+    fallback.src = first.source;
+    fallback.preload = "auto";
+    fallback.load?.();
+    const retried = await playAudio(fallback, expectedGeneration, onEnergy, start);
+    if (retried.played) {
+      if (typeof document !== "undefined") delete document.documentElement.dataset.jarvisTtsFailure;
+      return true;
+    }
+    if (expectedGeneration === generation && retried.failure) {
+      reportPlaybackFailure(`${first.failure}; unlocked retry failed: ${retried.failure}`);
+    }
+    return false;
+  }
+
+  reportPlaybackFailure(first.failure);
+  return false;
 }
 
 export async function speak(
