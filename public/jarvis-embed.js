@@ -10,13 +10,20 @@
   var ORIGIN = "https://jarvis-orcin-six.vercel.app";
   if (location.origin === ORIGIN) return; // never embed JARVIS inside JARVIS
 
+  // Keep the frame and loader on one release marker. Hosts only need to bump
+  // their script URL; a long-lived browser can no longer mix two Jarvis builds.
+  var release = "";
+  try {
+    release = new URL(document.currentScript && document.currentScript.src).searchParams.get("v") || "";
+  } catch (_) {}
+
   var visible = false;
   var ready = false;
   var pendingCommands = [];
   var f = document.createElement("iframe");
   // Version the document as well as this loader. Long-lived Hub tabs used to
   // preserve an obsolete full-chat frame across Jarvis deployments.
-  f.src = ORIGIN + "/embed?v=hub-orb-voice-20260718-1";
+  f.src = ORIGIN + "/embed" + (release ? "?v=" + encodeURIComponent(release) : "");
   f.title = "JARVIS";
   f.allow = "microphone; autoplay; clipboard-write; display-capture";
   f.style.cssText =
