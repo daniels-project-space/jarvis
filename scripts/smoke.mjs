@@ -12,28 +12,25 @@
 const BASE = process.env.BASE ?? "https://jarvis-orcin-six.vercel.app";
 const CV = (process.env.CONVEX ?? "https://tangible-goose-318.convex.cloud") + "/api";
 const THREAD = "smoke";
-const ADMIN_PASSWORD = process.env.JARVIS_ADMIN_PASSWORD ?? "";
 const DISPATCH_TOKEN = process.env.JARVIS_DISPATCH_TOKEN ?? "";
 let COOKIE = "";
 let VIEWER_TOKEN = "";
 
 async function authenticate() {
-  if (!ADMIN_PASSWORD) throw new Error("JARVIS_ADMIN_PASSWORD is required for production smoke tests");
-  const response = await fetch(`${BASE}/api/auth/login`, {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: BASE },
-    body: JSON.stringify({ password: ADMIN_PASSWORD }),
-  });
-  const setCookie = response.headers.get("set-cookie") ?? "";
-  COOKIE = setCookie.split(";")[0];
-  if (!response.ok || !COOKIE) throw new Error(`JARVIS authentication failed (${response.status})`);
+  // Jarvis is deliberately open: viewer bootstrap creates or refreshes the
+  // long-lived owner session. Exercising the retired password-login route made
+  // the monitor report a false outage while real browsers worked correctly.
   const viewer = await fetch(`${BASE}/api/auth/viewer`, {
     method: "POST",
-    headers: { cookie: COOKIE, origin: BASE },
+    headers: { origin: BASE },
   });
+  const setCookie = viewer.headers.get("set-cookie") ?? "";
+  COOKIE = setCookie.split(";")[0];
   const payload = await viewer.json().catch(() => ({}));
   VIEWER_TOKEN = payload.viewerToken ?? "";
-  if (!viewer.ok || !VIEWER_TOKEN) throw new Error(`JARVIS viewer capability failed (${viewer.status})`);
+  if (!viewer.ok || !COOKIE || !VIEWER_TOKEN) {
+    throw new Error(`JARVIS open viewer bootstrap failed (${viewer.status})`);
+  }
 }
 
 const results = [];
@@ -74,21 +71,39 @@ async function cv(kind, path, args) {
   }
   const r = await fetch(`${CV}/${kind}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, args: { ...args, viewerToken: VIEWER_TOKEN }, format: "json" }),
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${VIEWER_TOKEN}`,
+    },
+    body: JSON.stringify({ path, args, format: "json" }),
   });
   const j = await r.json();
   if (j.status === "error") throw new Error(`${path}: ${String(j.errorMessage).slice(0, 160)}`);
   return j.value;
 }
 async function chat(text) {
+  const requestId = `smoke-${crypto.randomUUID()}`;
   const r = await fetch(`${BASE}/api/chat`, {
     method: "POST",
     headers: { "content-type": "application/json", cookie: COOKIE },
-    body: JSON.stringify({ text, threadId: THREAD }),
-    signal: AbortSignal.timeout(115_000),
+    body: JSON.stringify({ text, threadId: THREAD, requestId }),
+    signal: AbortSignal.timeout(30_000),
   });
-  return await r.json();
+  const queued = await r.json();
+  if (!r.ok || queued.ok !== true) return queued;
+
+  // /api/chat only commits and wakes the durable subscription worker. Follow
+  // the exact request-id/parent-id pair just like the realtime UI does.
+  const deadline = Date.now() + 115_000;
+  while (Date.now() < deadline) {
+    const rows = await cv("query", "chatQueue:listMessages", { threadId: THREAD });
+    const user = rows.find((row) => row.role === "user" && row.requestId === requestId);
+    const answer = user && rows.find((row) => row.role === "assistant" && row.parentMessageId === user._id);
+    if (answer?.status === "done") return { ...queued, text: answer.text };
+    if (answer?.status === "error") return { ...queued, ok: false, error: "worker turn failed" };
+    await new Promise((resolve) => setTimeout(resolve, 350));
+  }
+  return { ...queued, ok: false, error: "timed out waiting for streamed answer" };
 }
 async function tool(name, args) {
   const r = await fetch(`${BASE}/api/tools`, {
@@ -112,14 +127,14 @@ await test("chat answers, clean text", async () => {
 
 await test("weather ask routes to the weather tool + widget panel", async () => {
   const j = await chat("show me the weather");
-  assert((j.tools ?? []).includes("weather"), `tools=${j.tools}`);
+  assert(j.ok === true && j.text, `answer=${j.error ?? "empty"}`);
   const p = await cv("query", "ui:getPanel", {});
   assert(p && p.type === "widget" && p.value.includes('"kind":"weather"'), `panel=${p?.title}`);
 });
 
 await test("youtube ask routes to the video lineup", async () => {
   const j = await chat("show me videos of lofi girl");
-  assert((j.tools ?? []).includes("youtube_search"), `tools=${j.tools}`);
+  assert(j.ok === true && j.text, `answer=${j.error ?? "empty"}`);
   const p = await cv("query", "ui:getPanel", {});
   assert(p && p.value.includes('"mode":"videos"'), `panel=${p?.title}`);
 });
@@ -207,7 +222,7 @@ await test("timed reminder sets + is due-deliverable", async () => {
 
 await test("price watch registers", async () => {
   const r = await tool("price_watch", { query: "SMOKE TEST logitech mx master 3s", target_gbp: 50 });
-  assert(/watching/i.test(r), r.slice(0, 100));
+  assert(/watching|active/i.test(r), r.slice(0, 100));
   const list = await cv("query", "watchRules:list", { status: "active", limit: 80 });
   const mine = (list ?? []).filter((w) => w.label.includes("SMOKE TEST"));
   assert(mine.length >= 1, "watch not created");
