@@ -1221,7 +1221,8 @@ export default function JarvisUI() {
       if (chatModeRef.current === "full") setChatMode("bar", false);
       // previous panel → orbit bubble (still one tap away, out of the way)
       const prev = prevPanelRef.current;
-      if (prev && (prev.title ?? prev.type) !== (panel.title ?? panel.type)) {
+      const prevKey = prev ? `${prev.title ?? ""}|${prev.value.slice(0, 160)}` : "";
+      if (prev && cp?.key !== prevKey && (prev.title ?? prev.type) !== (panel.title ?? panel.type)) {
         setBubbles((bs) =>
           [{ type: prev.type, value: prev.value, title: prev.title }, ...bs.filter((b) => (b.title ?? b.type) !== (prev.title ?? prev.type))].slice(0, 6),
         );
@@ -1247,6 +1248,22 @@ export default function JarvisUI() {
   const liveBeat = useRef<ReturnType<typeof setInterval> | null>(null);
   const liveCaptureTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const freeBusy = useRef(false);
+  function scheduleLiveCapture(delay = 220) {
+    if (!liveRef.current || !liveConversationRef.current.active) return;
+    if (liveCaptureTimer.current) clearTimeout(liveCaptureTimer.current);
+    liveCaptureTimer.current = setTimeout(() => {
+      liveCaptureTimer.current = null;
+      if (liveRef.current && liveConversationRef.current.active) void freeVoiceTurn();
+    }, delay);
+  }
+  function markLiveAssistantFinished(now: number) {
+    if (!liveRef.current || liveConversationRef.current.phase !== "awaiting-assistant") return;
+    liveConversationRef.current = advanceLiveConversation(liveConversationRef.current, {
+      type: "assistant-finished",
+      now,
+    });
+    scheduleLiveCapture();
+  }
   const me = useRef("");
   const voiceRef = useRef<{ value: string; updatedAt: number } | null>(null);
   const ownVoice = () => {
@@ -1731,9 +1748,15 @@ export default function JarvisUI() {
     }
     lastSpokenId.current = last._id;
     if (!last.text) return;
-    if (isToolGarbage(last.text) && !sanitizeAssistantText(last.text)) return;
+    if (isToolGarbage(last.text) && !sanitizeAssistantText(last.text)) {
+      markLiveAssistantFinished(Date.now());
+      return;
+    }
     // never say the exact same thing twice in a row (root of "sends results twice")
-    if (last.text === lastSpokenText.current.text && Date.now() - lastSpokenText.current.ts < 20_000) return;
+    if (last.text === lastSpokenText.current.text && Date.now() - lastSpokenText.current.ts < 20_000) {
+      markLiveAssistantFinished(Date.now());
+      return;
+    }
     lastSpokenText.current = { text: last.text, ts: Date.now() };
     // Background findings never interrupt an active voice exchange. Normal
     // Codex replies do speak, then the turn-taking microphone re-arms.
@@ -1747,30 +1770,36 @@ export default function JarvisUI() {
     // finished text there before voice ownership/model generation, so it never
     // vanishes during the TTS handoff or when this tab is not the speaker.
     showCaption({ who: "jarvis", text: spokenText, phase: "ready" });
-    (async () => {
-      if (!(await ensureVoice())) {
-        fadeCaption(spokenText, 3200);
-        return; // another tab/device owns the voice
+    void (async () => {
+      try {
+        if (!(await ensureVoice())) {
+          fadeCaption(spokenText, 3200);
+          return; // another tab/device owns the voice
+        }
+        const { speak } = await import("../lib/tts");
+        await speak(
+          spokenText,
+          (e) => (energyRef.current = e),
+          () => {
+            setSpeaking(true);
+            // the spoken words bloom under the orb for TYPED turns too, not just
+            // live voice — this is the caption overlay Daniel wasn't seeing
+            showCaption({ who: "jarvis", text: spokenText, phase: "speaking" });
+          },
+          () => {
+            setSpeaking(false);
+            fadeCaption(spokenText, 1800); // remain readable, then leave without a flash
+          },
+        );
+      } finally {
+        // Voice ownership or TTS failure must not strand a live turn in
+        // awaiting-assistant. The session itself remains the ticker owner.
+        markLiveAssistantFinished(Date.now());
       }
-      const { speak } = await import("../lib/tts");
-      await speak(
-        spokenText,
-        (e) => (energyRef.current = e),
-        () => {
-          setSpeaking(true);
-          // the spoken words bloom under the orb for TYPED turns too, not just
-          // live voice — this is the caption overlay Daniel wasn't seeing
-          showCaption({ who: "jarvis", text: spokenText, phase: "speaking" });
-        },
-        () => {
-          setSpeaking(false);
-          fadeCaption(spokenText, 1800); // remain readable, then leave without a flash
-        },
-      );
-      // The assistant turn completes inside the same live session. Re-arm the
-      // microphone without touching ticker/lease ownership.
-      markLiveAssistantFinished();
-    })();
+    })().catch(() => {
+      setSpeaking(false);
+      fadeCaption(spokenText, 3200);
+    });
   }, [messages]);
 
   async function queueDurableTurn(text: string) {
@@ -1855,6 +1884,7 @@ export default function JarvisUI() {
   const fastNetWorthRequest = useRef(0);
   async function openFastNetWorth(intent: FastNetWorthIntent, requestedText: string) {
     const request = ++fastNetWorthRequest.current;
+    let completedLocally = false;
     const loading: StagePanel = {
       type: "widget",
       title: "Net worth",
@@ -1889,11 +1919,12 @@ export default function JarvisUI() {
       const detail = result.match(/Net worth dashboard on screen:\s*(.+?)\.\s*One-line/i)?.[1]
         ?? result.replace(/One-line takeaway only\.?/i, "").trim();
       const reply = detail ? `Your net worth is ${detail}.` : "Your live net-worth dashboard is open.";
+      completedLocally = true;
       updateConversationMood(reply);
       void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
       void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant-tool" });
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
-      if (document.hidden || liveAnywhere() || !(await ensureVoice())) {
+      if (document.hidden || (liveAnywhere() && !liveRef.current) || !(await ensureVoice())) {
         fadeCaption(reply, 3200);
         return;
       }
@@ -1912,11 +1943,15 @@ export default function JarvisUI() {
       );
     } catch {
       if (request !== fastNetWorthRequest.current) return;
+      completedLocally = false;
       setInstantPanel(null);
       showCaption({ who: "jarvis", text: "The wealth ledger did not answer. I’m tracing it through the full work lane." });
       await queueDurableTurn(requestedText);
     } finally {
-      if (request === fastNetWorthRequest.current) setSending(false);
+      if (request === fastNetWorthRequest.current) {
+        setSending(false);
+        if (completedLocally) markLiveAssistantFinished(Date.now());
+      }
     }
   }
 
@@ -1949,12 +1984,12 @@ export default function JarvisUI() {
     else if (panel && !isPanelFollowUp(t, panel)) {
       const stalePanel = panel;
       const staleKey = `${stalePanel.title ?? ""}|${stalePanel.value.slice(0, 160)}`;
+      closedPanelRef.current = { key: staleKey, ts: Date.now() };
       fastChartRequest.current += 1;
       fastNetWorthRequest.current += 1;
       setPanelMin(true); // hide synchronously; the awaited mutation clears model context
       setPanelFull(false);
       setInstantPanel(null);
-      prevPanelRef.current = null;
       setBubbles((items) => items.filter((item) => `${item.title ?? ""}|${item.value.slice(0, 160)}` !== staleKey));
       await clearPanel({}).catch(() => false);
     }
@@ -1963,7 +1998,7 @@ export default function JarvisUI() {
       void openFastChart(fastChart, t);
       return;
     }
-    const fastNetWorth = !liveRef.current ? parseFastNetWorthIntent(t) : null;
+    const fastNetWorth = parseFastNetWorthIntent(t);
     if (fastNetWorth) {
       void openFastNetWorth(fastNetWorth, t);
       return;
@@ -1979,25 +2014,31 @@ export default function JarvisUI() {
         .then(() => logTurn({ threadId: threadRef.current, role: "assistant", text: instant, model: "instant" }))
         .catch(() => {});
       void (async () => {
-        if (document.hidden || !(await ensureVoice())) {
-          fadeCaption(instant, 3200);
-          return;
+        try {
+          if (document.hidden || !(await ensureVoice())) {
+            fadeCaption(instant, 3200);
+            return;
+          }
+          const { speak } = await import("../lib/tts");
+          await speak(
+            instant,
+            (energy) => (energyRef.current = energy),
+            () => {
+              setSpeaking(true);
+              showCaption({ who: "jarvis", text: instant, phase: "speaking" });
+            },
+            () => {
+              setSpeaking(false);
+              fadeCaption(instant, 1800);
+            },
+          );
+        } finally {
+          markLiveAssistantFinished(Date.now());
         }
-        const { speak } = await import("../lib/tts");
-        await speak(
-          instant,
-          (energy) => (energyRef.current = energy),
-          () => {
-            setSpeaking(true);
-            showCaption({ who: "jarvis", text: instant, phase: "speaking" });
-          },
-          () => {
-            setSpeaking(false);
-            fadeCaption(instant, 1800);
-          },
-        );
-        markLiveAssistantFinished();
-      })();
+      })().catch(() => {
+        setSpeaking(false);
+        fadeCaption(instant, 3200);
+      });
       return;
     }
     await queueDurableTurn(t);
@@ -2033,24 +2074,6 @@ export default function JarvisUI() {
       now: Date.now(),
     } as LiveConversationEvent);
     finishLiveSession();
-  }
-
-  function scheduleLiveCapture(delay = 220) {
-    if (!liveRef.current || !liveConversationRef.current.active) return;
-    if (liveCaptureTimer.current) clearTimeout(liveCaptureTimer.current);
-    liveCaptureTimer.current = setTimeout(() => {
-      liveCaptureTimer.current = null;
-      if (liveRef.current && liveConversationRef.current.active) void freeVoiceTurn();
-    }, delay);
-  }
-
-  function markLiveAssistantFinished() {
-    if (!liveRef.current) return;
-    liveConversationRef.current = advanceLiveConversation(liveConversationRef.current, {
-      type: "assistant-finished",
-      now: Date.now(),
-    });
-    scheduleLiveCapture();
   }
 
   async function toggleLive(forceStart = false) {
@@ -2280,7 +2303,12 @@ export default function JarvisUI() {
       const r = await fetch("/api/stt", { method: "POST", headers: { "content-type": mime }, body: blob });
       const { text } = await r.json();
       const { isEchoOfTts } = await import("../lib/tts");
-      if (!text?.trim() || isEchoOfTts(text)) {
+      const cleanedText = text?.trim() ?? "";
+      if (
+        !cleanedText ||
+        isEchoOfTts(cleanedText) ||
+        (cleanedText === lastSent.current.text && Date.now() - lastSent.current.ts < 2500)
+      ) {
         liveConversationRef.current = advanceLiveConversation(liveConversationRef.current, {
           type: "transcript-rejected",
           now: Date.now(),
@@ -2293,7 +2321,7 @@ export default function JarvisUI() {
         now: Date.now(),
       });
       next = "wait-for-assistant";
-      void submit(text.trim()); // the reply speaks via the normal effect; the loop re-arms after it
+      void submit(cleanedText); // the reply speaks via the normal effect; the loop re-arms after it
     } catch (error) {
       if (!liveRef.current) return;
       const name = error instanceof DOMException ? error.name : "";

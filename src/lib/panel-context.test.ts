@@ -14,6 +14,8 @@ describe("conversation panel context", () => {
     expect(isPanelFollowUp("Tell me a joke", bitcoinChart)).toBe(false);
     expect(isPanelFollowUp("What time is it?", bitcoinChart)).toBe(false);
     expect(isPanelFollowUp("What about tomorrow's weather?", bitcoinChart)).toBe(false);
+    expect(isPanelFollowUp("What's the first meeting on my calendar?", bitcoinChart)).toBe(false);
+    expect(isPanelFollowUp("What's the high temperature tomorrow?", bitcoinChart)).toBe(false);
   });
 
   it("retains the chart for meaningful subject and deictic follow-ups", () => {
@@ -36,7 +38,14 @@ describe("conversation panel context", () => {
     expect(isPanelFollowUp("How is my calendar looking?", ranking)).toBe(false);
   });
 
+  it("retains explicit navigation within document overlays", () => {
+    const documentPanel: ConversationPanel = { type: "pdf", title: "Quarterly plan", value: "/plan.pdf" };
+    expect(isPanelFollowUp("Show me the next page", documentPanel)).toBe(true);
+    expect(isPanelFollowUp("What's my next meeting?", documentPanel)).toBe(false);
+  });
+
   it("treats an explicit close request as a context exit", () => {
     expect(isPanelFollowUp("Close that chart", bitcoinChart)).toBe(false);
+    expect(isPanelFollowUp("Why is the Bitcoin chart still open?", bitcoinChart)).toBe(false);
   });
 });

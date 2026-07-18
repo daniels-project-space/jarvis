@@ -89,18 +89,35 @@ export function isPanelFollowUp(message: string, panel: ConversationPanel): bool
     return false;
   }
 
+  // Naming the stale visual while reporting that it is stuck is a dismissal,
+  // not a Bitcoin follow-up. This must run before matching panel subject terms.
+  if (
+    /\b(?:chart|dashboard|overlay|panel|screen|view)\b/.test(normalized) &&
+    /\b(?:still|stuck|left|keeps? being)\s+(?:open|up|visible|showing)\b/.test(normalized)
+  ) {
+    return false;
+  }
+
   const { kind, terms } = panelDetails(panel);
   const messageTerms = new Set(words(normalized));
   if (hasPanelTerm(messageTerms, terms)) return true;
 
-  if (/\b(?:number|no\.?|#)\s*(?:one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\b/.test(normalized)) return true;
-  if (/\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|top|bottom|next|previous)\b/.test(normalized)) return true;
+  const orderedPanel = /ranking|shop|places|videos?|feed|results|creations|todos?|calendar|trip/.test(kind);
+  if (orderedPanel && /\b(?:number|no\.?|#)\s*(?:one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\b/.test(normalized)) return true;
+  if (orderedPanel && /\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|top|bottom|next|previous)\b/.test(normalized)) return true;
+
+  const navigablePanel = /pdf|doc|markdown|url|site|image|canvas|scene/.test(kind);
+  if (
+    navigablePanel &&
+    /\b(?:(?:first|second|third|fourth|fifth|last|next|previous)\s+(?:page|slide|image|picture|section|paragraph|result|one)|(?:page|slide|image|picture|section|paragraph|result)\s*(?:one|two|three|four|five|\d{1,3}))\b/.test(normalized)
+  ) return true;
 
   if (isShortContextualReference(normalized)) return true;
 
   if (/candles?|market|chart/.test(kind)) {
     if (ASSET_ALIASES.some((aliases) => aliases.some((alias) => messageTerms.has(alias)))) return true;
-    return /\b(?:price|candles?|market|trend|support|resistance|volume|rsi|sma|timeframe|interval|hourly|daily|weekly|bullish|bearish|breakout|pullback|move|moving|drop(?:ped)?|rise|rising|target|level|high|low|compare)\b/.test(normalized);
+    if (/^(?:what(?:'s| is| was)\s+)?(?:the\s+)?(?:high|low)\s*[?!.]*$/.test(normalized)) return true;
+    return /\b(?:price|candles?|market|trend|support|resistance|volume|rsi|sma|timeframe|interval|hourly|daily|weekly|bullish|bearish|breakout|pullback|move|moving|drop(?:ped)?|rise|rising|target|level|compare)\b/.test(normalized);
   }
   if (/ranking/.test(kind)) return /\b(?:rank|ranking|person|people|entry|item|option|bio|details?)\b/.test(normalized);
   if (/weather/.test(kind)) return /\b(?:weather|forecast|rain|temperature|wind|humidity|sunny|cloudy|tomorrow)\b/.test(normalized);

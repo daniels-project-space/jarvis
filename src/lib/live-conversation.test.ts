@@ -49,4 +49,13 @@ describe("live conversation lifecycle", () => {
 
     expect(state).toMatchObject({ active: false, phase: "off", completedTurns: 0 });
   });
+
+  it("ignores duplicate assistant completion without ending or double-counting the session", () => {
+    let state = start();
+    state = advanceLiveConversation(state, { type: "speech-accepted", now: 1_000 });
+    state = advanceLiveConversation(state, { type: "assistant-finished", now: 2_000 });
+    state = advanceLiveConversation(state, { type: "assistant-finished", now: 3_000 });
+
+    expect(state).toMatchObject({ active: true, phase: "listening", completedTurns: 1 });
+  });
 });
