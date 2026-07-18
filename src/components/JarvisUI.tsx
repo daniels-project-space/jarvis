@@ -433,10 +433,13 @@ function ReactorRing({
   }, [motionRef, reduceMotion]);
   return (
     <div
-      className="pointer-events-none absolute inset-0 grid place-items-center will-change-transform transition-[opacity,transform] duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
-      style={{ opacity, transform: aside ? "translateX(32%) translateY(-4.5%) scale(0.76)" : "translateY(-4.5%) scale(1)" }}
+      className={`pointer-events-none absolute inset-0 transition-opacity duration-500 ${aside ? "opacity-0 md:opacity-100" : "opacity-100"}`}
     >
-      <svg viewBox="0 0 500 500" className="h-[min(82vmin,760px)] w-[min(82vmin,760px)]">
+      <div
+        className="absolute inset-0 grid place-items-center will-change-transform transition-[opacity,transform] duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
+        style={{ opacity, transform: aside ? "translateX(32%) translateY(-4.5%) scale(0.76)" : "translateY(-4.5%) scale(1)" }}
+      >
+        <svg viewBox="0 0 500 500" className="h-[min(82vmin,760px)] w-[min(82vmin,760px)]">
         <defs>
           <linearGradient id="jarvis-orb-gradient" x1="65" y1="65" x2="435" y2="435" gradientUnits="userSpaceOnUse">
             <stop ref={firstStopRef} offset="0" stopColor="#00ff88" />
@@ -461,7 +464,8 @@ function ReactorRing({
           </g>
           <circle cx="250" cy="250" r="170" strokeWidth="1" strokeOpacity="0.12" strokeDasharray="2 8" />
         </g>
-      </svg>
+        </svg>
+      </div>
     </div>
   );
 }
