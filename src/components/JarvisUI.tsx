@@ -200,8 +200,9 @@ function panelSize(panel: { type: string; value: string }): string {
     case "w:calendar":
     case "w:todos":
       return "w-[96%] md:w-[min(900px,calc(100%-250px))] h-[min(680px,88%)]";
+    case "w:net_worth_loading":
     case "w:stats":
-      return "w-[min(1080px,81%)] h-[min(680px,92%)]";
+      return "w-[96%] md:w-[min(1080px,calc(100%-250px))] h-[min(680px,92%)]";
     case "w:videos":
     case "w:feed":
       return "w-[min(1340px,82%)] h-[min(740px,92%)]";
@@ -704,7 +705,7 @@ function WidgetView({ value }: { value: string }) {
     return (
       <div className="flex min-h-0 flex-1 flex-col justify-center p-5">
         <div className="hud-label mb-3">live wealth ledger</div>
-        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <div className="grid grid-cols-[repeat(auto-fit,minmax(145px,1fr))] gap-3">
           {["net worth", "cashflow /mo", "expenses /mo", "rental /mo"].map((label, index) => (
             <div key={label} className="glass rounded-xl px-3 py-4 text-center">
               <div className="mx-auto h-8 w-24 animate-pulse rounded bg-cyan/10" style={{ animationDelay: `${index * 80}ms` }} />
@@ -790,10 +791,10 @@ function WidgetView({ value }: { value: string }) {
     const maxB = Math.max(1, ...(w.bars ?? []).map((b: any) => b.value));
     return (
       <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
-        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <div className="grid grid-cols-[repeat(auto-fit,minmax(145px,1fr))] gap-3">
           {(w.kpis ?? []).map((k: any, i: number) => (
-            <div key={i} className="glass rounded-xl px-3 py-4 text-center">
-              <div className="text-2xl font-semibold text-ice md:text-3xl">
+            <div key={i} className="glass min-w-0 overflow-hidden rounded-xl px-3 py-4 text-center">
+              <div className="truncate text-xl font-semibold text-ice md:text-2xl xl:text-3xl" title={`${k.prefix ?? ""}${k.value}${k.suffix ?? ""}`}>
                 <CountUp value={k.value} prefix={k.prefix ?? ""} suffix={k.suffix ?? ""} />
               </div>
               <div className="hud-label mt-1">{k.label}</div>
@@ -2384,7 +2385,7 @@ export default function JarvisUI() {
         <div ref={stageRef} className={`brackets relative min-h-0 flex-1 transition-[margin] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${chatMode === "full" ? "md:mr-[416px]" : ""}`}>
           <span className="bk" />
           {/* orbit bubbles — demoted panels bobbing beside the orb */}
-          {bubbles.length > 0 && (
+          {bubbles.length > 0 && (!panel || panelMin) && (
             <div className="absolute left-1.5 top-1/2 z-30 flex max-h-full -translate-y-1/2 flex-col gap-3 md:left-2.5">
               {bubbles.map((b, i) => (
                 <OrbitBubble
