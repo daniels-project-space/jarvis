@@ -1,7 +1,7 @@
 "use client";
 import { viewerFetch } from "./viewer-request";
 
-// One speech engine, one queue, one voice. Kokoro runs in a Web Worker so
+// One speech engine, one queue, one voice. KittenTTS runs in a Web Worker so
 // neural generation never blocks captions, the orb, or pointer interaction.
 
 type SpeechBatch = {
@@ -28,15 +28,15 @@ type PendingAudio = {
 };
 
 const ECHO_GUARD_TAIL_MS = 45_000;
-const WORKER_TIMEOUT_MS = 30_000;
+const WORKER_TIMEOUT_MS = 12_000;
 const FIRST_SPEECH_CHUNK_MIN = 12;
-const MAX_SPEECH_CHUNK_CHARS = 84;
+const MAX_SPEECH_CHUNK_CHARS = 56;
 const MAX_MEMORY_AUDIO_SEGMENTS = 12;
-const COURTESY_AUDIO_CACHE = "jarvis-kokoro-george-courtesy-v1";
 
 let generation = 0;
 let requestId = 0;
 let worker: Worker | null = null;
+let forceWasmNext = false;
 let modelReady: Promise<void> | null = null;
 let resolveModelReady: (() => void) | null = null;
 let rejectModelReady: ((error: Error) => void) | null = null;
@@ -49,10 +49,9 @@ let queue: SpeechBatch[] = [];
 const pending = new Map<number, PendingAudio>();
 const audioCache = new Map<string, AudioResult>();
 const synthesisInFlight = new Map<string, Promise<AudioResult>>();
-const primeInFlight = new Map<string, Promise<void>>();
 type Recent = { text: string; until: number };
 let recentUtterances: Recent[] = [];
-let ttsEngine = "kokoro-q8-wasm-george";
+let ttsEngine = "kitten-nano-fp32-auto-jasper";
 
 const words = (text: string) =>
   text.toLowerCase().replace(/[^a-z0-9\s']/g, " ").split(/\s+/).filter((word) => word.length > 1);
@@ -72,8 +71,8 @@ function reportFailure(error: unknown) {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      signature: "client:kokoro-tts",
-      message: `Jarvis's only speech engine failed: ${message}`,
+      signature: "client:kitten-tts",
+      message: `Jarvis's KittenTTS engine failed: ${message}`,
     }),
   }).catch(() => {});
 }
@@ -92,7 +91,7 @@ function invalidateWorker(instance: Worker, error: Error) {
 
 function ensureWorker(): Worker {
   if (worker) return worker;
-  const instance = new Worker(new URL("../workers/kokoro.worker.ts", import.meta.url), { type: "module" });
+  const instance = new Worker(new URL("../workers/kitten.worker.ts", import.meta.url), { type: "module" });
   worker = instance;
   modelReady = new Promise<void>((resolve, reject) => {
     resolveModelReady = resolve;
@@ -131,11 +130,14 @@ function ensureWorker(): Worker {
     waiter.resolve({ audio: new Float32Array(reply.audio), sampleRate: reply.sampleRate });
   };
   instance.onerror = (event) => {
-    const error = new Error(event.message || "Kokoro worker failed");
+    const error = new Error(event.message || "KittenTTS worker failed");
     invalidateWorker(instance, error);
   };
+  instance.onmessageerror = () => {
+    invalidateWorker(instance, new Error("KittenTTS returned unreadable audio"));
+  };
   setTtsStatus("loading");
-  instance.postMessage({ type: "warm" });
+  instance.postMessage({ type: "warm", forceWasm: forceWasmNext });
   return instance;
 }
 
@@ -287,7 +289,7 @@ async function synthesizeGenerated(text: string, attempt = 0): Promise<AudioResu
     return await new Promise<AudioResult>((resolve, reject) => {
       const timeout = setTimeout(() => {
         pending.delete(id);
-        const error = new Error("Kokoro synthesis timed out");
+        const error = new Error("KittenTTS synthesis timed out");
         invalidateWorker(activeWorker, error);
         reject(error);
       }, WORKER_TIMEOUT_MS);
@@ -307,7 +309,14 @@ async function synthesizeGenerated(text: string, attempt = 0): Promise<AudioResu
     // One bounded retry covers a transient worker/GPU/WASM interruption while
     // preserving the one-engine invariant. A second failure is surfaced and
     // never replaced with a robotic browser voice.
-    if (attempt === 0) return synthesizeGenerated(text, 1);
+    if (attempt === 0) {
+      // A hung WebGPU invocation is not retried on the same execution
+      // provider. The replacement worker keeps the same Jasper model/voice
+      // but uses WASM, which is slower than real GPU inference and reliable
+      // on software/fallback adapters.
+      forceWasmNext = true;
+      return synthesizeGenerated(text, 1);
+    }
     throw error;
   }
 }
@@ -337,86 +346,9 @@ async function generateAudio(text: string): Promise<AudioResult> {
   }
 }
 
-function courtesyCacheRequest(text: string): Request {
-  return new Request(`${window.location.origin}/__jarvis_tts_courtesy__?text=${encodeURIComponent(text)}`);
-}
-
-async function readCourtesyAudio(text: string): Promise<AudioResult | null> {
-  if (typeof window === "undefined" || typeof caches === "undefined") return null;
-  try {
-    const response = await (await caches.open(COURTESY_AUDIO_CACHE)).match(courtesyCacheRequest(text));
-    if (!response) return null;
-    const sampleRate = Number(response.headers.get("x-jarvis-sample-rate"));
-    const buffer = await response.arrayBuffer();
-    if (!Number.isFinite(sampleRate) || sampleRate <= 0 || buffer.byteLength === 0 || buffer.byteLength % 4 !== 0) {
-      return null;
-    }
-    return { audio: new Float32Array(buffer), sampleRate };
-  } catch {
-    return null;
-  }
-}
-
-async function persistCourtesyAudio(text: string, result: AudioResult): Promise<void> {
-  if (typeof window === "undefined" || typeof caches === "undefined") return;
-  try {
-    const pcm = new Float32Array(result.audio);
-    const response = new Response(pcm.buffer, {
-      headers: {
-        "content-type": "application/octet-stream",
-        "x-jarvis-sample-rate": String(result.sampleRate),
-      },
-    });
-    await (await caches.open(COURTESY_AUDIO_CACHE)).put(courtesyCacheRequest(text), response);
-  } catch {
-    // Cache Storage may be disabled or full. The in-memory neural voice still
-    // works, so a background optimisation must never make speech unavailable.
-  }
-}
-
-function primeSegment(text: string): Promise<void> {
-  if (audioCache.has(text)) return Promise.resolve();
-  const existing = primeInFlight.get(text);
-  if (existing) return existing;
-  const request = (async () => {
-    const persisted = await readCourtesyAudio(text);
-    if (persisted) {
-      rememberAudio(text, persisted);
-      return;
-    }
-    const generated = await generateAudio(text);
-    await persistCourtesyAudio(text, generated);
-  })();
-  primeInFlight.set(text, request);
-  const clear = () => {
-    if (primeInFlight.get(text) === request) primeInFlight.delete(text);
-  };
-  void request.then(clear, clear);
-  return request;
-}
-
-/** Render the Hub's small courtesy reply while its hidden iframe is idle. */
-export async function primeSpeech(texts: string[]): Promise<void> {
-  const segments = [...new Set(texts.flatMap((text) => sentences(text)))];
-  if (!segments.length) return;
-  if (typeof document !== "undefined") document.documentElement.dataset.jarvisTtsPrime = "loading";
-  try {
-    for (const segment of segments) await primeSegment(segment);
-    if (typeof document !== "undefined") document.documentElement.dataset.jarvisTtsPrime = "ready";
-  } catch {
-    if (typeof document !== "undefined") document.documentElement.dataset.jarvisTtsPrime = "retry";
-  }
-}
-
 async function synthesize(text: string): Promise<AudioResult> {
   const cached = audioCache.get(text);
   if (cached) return cached;
-  const priming = primeInFlight.get(text);
-  if (priming) {
-    await priming;
-    const primed = audioCache.get(text);
-    if (primed) return primed;
-  }
   return generateAudio(text);
 }
 

@@ -1467,12 +1467,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const liveRef = useRef(false);
   const me = useRef("");
   const voiceRef = useRef<{ value: string; updatedAt: number } | null>(null);
+  const localVoiceLeaseUntilRef = useRef(0);
+  const localVoiceClaimedAtRef = useRef(0);
   const ownVoice = () => {
     // A direct interaction is authoritative locally. Waiting for the Convex
     // subscription to echo this claim back added ~650 ms before buffered
     // audio could start.
-    voiceRef.current = { value: me.current, updatedAt: Date.now() };
-    return claimVoice({ client: me.current });
+    const now = Date.now();
+    voiceRef.current = { value: me.current, updatedAt: now };
+    localVoiceClaimedAtRef.current = now;
+    // Covers only the subscription echo race. Once Convex confirms this claim
+    // (or a newer tab claims afterward), the authoritative row takes over.
+    localVoiceLeaseUntilRef.current = now + 8_000;
+    return claimVoice({ client: me.current }).catch(() => undefined);
   };
   const lastSent = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
   const durableStartedAt = useRef<number | null>(null);
@@ -1516,17 +1523,24 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       reduceMotion: localStorage.getItem("jarvis_reduce_motion") === "1",
       liveDefault: localStorage.getItem("jarvis_live_default") !== "0",
     });
-    // Mark the single streaming speech path ready before Daniel asks anything.
-    // The Hub iframe loads hidden, so persist its common greeting in the exact
-    // same George voice before the orb is opened. No browser/system voice is
-    // introduced, and a cold cache simply falls through to normal generation.
-    void import("../lib/tts").then((module) => {
-      void module.warm();
-      if (embedded) {
-        const greeting = instantSocialReply("hi");
-        if (greeting) void module.primeSpeech([greeting]);
-      }
-    });
+    // Greeting synthesis is never run on mount. It competed with wake-word
+    // recognition in the old large Kokoro worker and could make both fail.
+  }, []);
+  useEffect(() => {
+    // Initialise only the much smaller Kitten model once the browser is idle.
+    // Inference remains off the UI thread and there is no speculative speech;
+    // this removes the first-reply warm-up without delaying Hub wake startup.
+    const idleWindow = window as typeof window & {
+      requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    const start = () => void import("../lib/tts").then((module) => module.warm());
+    if (idleWindow.requestIdleCallback) {
+      const id = idleWindow.requestIdleCallback(start, { timeout: embedded ? 2_000 : 900 });
+      return () => idleWindow.cancelIdleCallback?.(id);
+    }
+    const id = window.setTimeout(start, embedded ? 1_200 : 500);
+    return () => window.clearTimeout(id);
   }, [embedded]);
   useEffect(() => {
     // Capture the browser activation itself. Waiting for Codex/Trigger to
@@ -1693,11 +1707,20 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const wakeIsEnabled = () => embedded
     ? localStorage.getItem(wakePreferenceKey) !== "0"
     : localStorage.getItem(wakePreferenceKey) === "1";
+  const onWakeDetected = () => {
+    setWake(false);
+    setChatMode(embedded ? "off" : "full", false);
+    showCaption({ who: "you", text: "Listening…" });
+    unlockSpeechPlayback();
+    // Show the Hub overlay and begin the neural voice load immediately, while
+    // SpeechRecognition is still collecting a same-breath command.
+    if (embedded) window.parent.postMessage({ jarvis: "wake" }, "*");
+    void import("../lib/wakeword").then((module) => module.chime());
+    void import("../lib/tts").then((module) => module.warm());
+  };
   const onWake = (transcript: string) => {
     import("../lib/wakeword").then((m) => {
       setWake(false);
-      m.chime();
-      if (embedded) window.parent.postMessage({ jarvis: "wake" }, "*");
       setChatMode(embedded ? "off" : "full", false);
       const command = m.commandAfterWake(transcript);
       void (async () => {
@@ -1722,7 +1745,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (!wakeIsEnabled()) return;
     import("../lib/wakeword").then((m) => {
       if (!m.wakeSupported()) return;
-      m.startWake(onWake);
+      m.startWake(onWake, (listening) => setWake(listening), onWakeDetected);
       setWake(true);
     });
   };
@@ -1748,7 +1771,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (chatMode !== "off") return;
     import("../lib/wakeword").then((m) => {
       if (!m.wakeSupported() || liveRef.current) return;
-      m.startWake(onWake);
+      m.startWake(onWake, (listening) => setWake(listening), onWakeDetected);
       setWake(true);
     });
     return () => {
@@ -1804,6 +1827,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }, []);
   useEffect(() => {
     voiceRef.current = voiceRow ?? null;
+    if (
+      voiceRow
+      && localVoiceLeaseUntilRef.current > 0
+      && (
+        voiceRow.value === me.current
+        || voiceRow.updatedAt >= localVoiceClaimedAtRef.current - 2_000
+      )
+    ) {
+      localVoiceLeaseUntilRef.current = 0;
+    }
   }, [voiceRow]);
   const liveOnRef = useRef<{ value: string; updatedAt: number } | null>(null);
   useEffect(() => {
@@ -1825,6 +1858,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // two visible tabs used to both optimistically claim and voice the same
   // sentence in stereo.
   async function ensureVoice(): Promise<boolean> {
+    if (Date.now() < localVoiceLeaseUntilRef.current) return true;
     const v = voiceRef.current;
     if (v && Date.now() - v.updatedAt <= 3 * 60 * 1000) return v.value === me.current;
     try {

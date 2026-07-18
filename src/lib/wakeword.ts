@@ -7,6 +7,8 @@ let rec: any = null;
 let wanted = false;
 let suppressed = false; // hard gate: JARVIS is literally saying "jarvis" right now
 let softGuard = false; // JARVIS is speaking: only a short, bare "hey jarvis" gets through
+export const WAKE_COMMAND_GRACE_MS = 650;
+const WAKE_RESTART_DELAY_MS = 120;
 
 // Self-trigger gate with barge-in: while JARVIS speaks, long recognized speech
 // is his own voice (ignored) — but Daniel snapping "hey jarvis" still
@@ -33,7 +35,11 @@ export function commandAfterWake(transcript: string): string {
     .trim();
 }
 
-export function startWake(onWake: (transcript: string) => void, onState?: (listening: boolean) => void) {
+export function startWake(
+  onWake: (transcript: string) => void,
+  onState?: (listening: boolean) => void,
+  onDetected?: (transcript: string) => void,
+) {
   const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
   if (!SR || wanted) return;
   wanted = true;
@@ -47,6 +53,7 @@ export function startWake(onWake: (transcript: string) => void, onState?: (liste
     let wakeTranscript = "";
     let wakeTimer: ReturnType<typeof setTimeout> | null = null;
     let delivered = false;
+    let detected = false;
     const deliver = () => {
       if (delivered) return;
       delivered = true;
@@ -63,6 +70,12 @@ export function startWake(onWake: (transcript: string) => void, onState?: (liste
           // interrupting — longer speech is JARVIS's own voice leaking in
           if (softGuard && text.split(/\s+/).length > 4) continue;
           wakeTranscript = text;
+          if (!detected) {
+            detected = true;
+            // React on the first interim wake fragment. Command delivery keeps
+            // a short grace window so "Jarvis, add milk" remains one turn.
+            onDetected?.(wakeTranscript);
+          }
           // Do not stop on the first interim "hey Jarvis" fragment. Waiting
           // for the final transcript preserves same-breath commands such as
           // "Hey Jarvis, add milk to my list" instead of opening and then
@@ -70,7 +83,7 @@ export function startWake(onWake: (transcript: string) => void, onState?: (liste
           if (e.results[i].isFinal) deliver();
           else {
             if (wakeTimer) clearTimeout(wakeTimer);
-            wakeTimer = setTimeout(deliver, 900);
+            wakeTimer = setTimeout(deliver, WAKE_COMMAND_GRACE_MS);
           }
           continue;
         }
@@ -81,16 +94,25 @@ export function startWake(onWake: (transcript: string) => void, onState?: (liste
       }
     };
     r.onend = () => {
-      onState?.(false);
       if (wakeTranscript && !delivered) {
         deliver();
         return;
       }
-      if (wanted) setTimeout(spin, 400); // browser kills sessions periodically — respin
+      if (wanted) {
+        // SpeechRecognition ends its own sessions periodically. Keep the UI
+        // logically active across the tiny respawn gap instead of flashing the
+        // microphone off/on every few seconds.
+        setTimeout(spin, WAKE_RESTART_DELAY_MS);
+        return;
+      }
+      onState?.(false);
     };
     r.onerror = (e: any) => {
       // "not-allowed" = mic permission denied — stop trying
-      if (e?.error === "not-allowed" || e?.error === "service-not-allowed") wanted = false;
+      if (e?.error === "not-allowed" || e?.error === "service-not-allowed") {
+        wanted = false;
+        onState?.(false);
+      }
     };
     try {
       r.start();

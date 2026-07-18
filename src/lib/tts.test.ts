@@ -3,7 +3,6 @@ import {
   completeSpeechPrefix,
   isEchoOfTts,
   normalizeSpeechText,
-  primeSpeech,
   sentences,
   speak,
   speechPauseMs,
@@ -82,7 +81,7 @@ class FakeAudioContext {
   createAnalyser() { return new FakeAnalyser(); }
 }
 
-describe("single Kokoro speech queue", () => {
+describe("single KittenTTS speech queue", () => {
   beforeEach(() => {
     FakeSource.instances = [];
     FakeWorker.failNextSynthesis = false;
@@ -109,7 +108,7 @@ describe("single Kokoro speech queue", () => {
   it("bounds long neural requests without losing spoken content", () => {
     const input = "This deliberately long sentence explains the entire plan in enough detail that a single neural generation request would otherwise become slow and timeout-prone on a browser without a hardware GPU, while every word must still be spoken in order.";
     const chunks = sentences(input);
-    expect(Math.max(...chunks.map((chunk) => chunk.length))).toBeLessThanOrEqual(84);
+    expect(Math.max(...chunks.map((chunk) => chunk.length))).toBeLessThanOrEqual(56);
     expect(chunks.join(" ")).toBe(normalizeSpeechText(input));
   });
 
@@ -182,17 +181,6 @@ describe("single Kokoro speech queue", () => {
     const sourcesBefore = FakeSource.instances.length;
     await warm();
     expect(FakeSource.instances).toHaveLength(sourcesBefore);
-  });
-
-  it("primes courtesy audio once and reuses it without another synthesis", async () => {
-    const courtesy = "A uniquely cached courtesy reply.";
-    await primeSpeech([courtesy]);
-    expect(FakeWorker.synthesisCount).toBe(1);
-    const reply = speak(courtesy, () => {});
-    await vi.waitFor(() => expect(FakeSource.instances).toHaveLength(1));
-    expect(FakeWorker.synthesisCount).toBe(1);
-    FakeSource.instances[0].onended?.();
-    await reply;
   });
 
   it("uses Web Audio only and never invokes a browser speech fallback", async () => {
