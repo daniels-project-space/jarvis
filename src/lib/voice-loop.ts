@@ -12,11 +12,9 @@ export function nextVoiceLoopAction(args: {
   // cancellation plus transcript echo guards distinguish his voice; Daniel's
   // own speech becomes a barge-in instead of waiting for the answer to finish.
   if (args.outcome === "speech") return args.persistentLive ? "listen" : "await-reply";
-  if (
-    args.persistentLive &&
-    (args.outcome === "silence" || args.outcome === "empty" || args.outcome === "echo")
-  ) {
-    return "listen";
-  }
+  // A transient MediaRecorder, network, or STT failure is not an instruction
+  // to switch live mode off. Only Daniel (loopRequested=false) owns that
+  // lifecycle decision; the caller may rebuild the device before retrying.
+  if (args.persistentLive) return "listen";
   return "stop";
 }

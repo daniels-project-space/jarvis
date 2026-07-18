@@ -27,10 +27,10 @@ describe("nextVoiceLoopAction", () => {
     ).toBe("stop");
   });
 
-  it("stops on device failure or an explicit live-off request", () => {
+  it("recovers a persistent device failure but obeys an explicit live-off request", () => {
     expect(
       nextVoiceLoopAction({ outcome: "failure", persistentLive: true, loopRequested: true }),
-    ).toBe("stop");
+    ).toBe("listen");
     expect(
       nextVoiceLoopAction({ outcome: "silence", persistentLive: true, loopRequested: false }),
     ).toBe("stop");

@@ -2485,7 +2485,12 @@ export default function JarvisUI() {
       void submit(cleanedText);
     } catch (error) {
       setRecording(false);
-      outcome = error instanceof DOMException && error.name === "AbortError" ? "empty" : "failure";
+      const aborted = error instanceof DOMException && error.name === "AbortError";
+      outcome = aborted ? "empty" : "failure";
+      if (!aborted) {
+        document.documentElement.dataset.jarvisVoiceRecovery = String(error).slice(0, 160);
+        closePersistentLiveMic();
+      }
     } finally {
       recRef.current = null;
       setRecording(false);
@@ -2496,7 +2501,7 @@ export default function JarvisUI() {
         persistentLive: liveRef.current,
         loopRequested: freeLoop.current,
       });
-      if (action === "listen") scheduleFreeVoiceTurn(outcome === "speech" ? 90 : 180);
+      if (action === "listen") scheduleFreeVoiceTurn(outcome === "speech" ? 90 : outcome === "failure" ? 900 : 180);
       else if (action === "stop") endFreeVoiceSession();
     }
   }
