@@ -27,7 +27,13 @@ export function wakeSupported(): boolean {
   return typeof window !== "undefined" && !!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
 }
 
-export function startWake(onWake: () => void, onState?: (listening: boolean) => void) {
+export function commandAfterWake(transcript: string): string {
+  return transcript
+    .replace(/^.*?\b(?:hey\s+)?jarvis\b[\s,.:;!?-]*/i, "")
+    .trim();
+}
+
+export function startWake(onWake: (transcript: string) => void, onState?: (listening: boolean) => void) {
   const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
   if (!SR || wanted) return;
   wanted = true;
@@ -38,6 +44,16 @@ export function startWake(onWake: () => void, onState?: (listening: boolean) => 
     r.lang = "en-GB";
     r.continuous = true;
     r.interimResults = true;
+    let wakeTranscript = "";
+    let wakeTimer: ReturnType<typeof setTimeout> | null = null;
+    let delivered = false;
+    const deliver = () => {
+      if (delivered) return;
+      delivered = true;
+      if (wakeTimer) clearTimeout(wakeTimer);
+      stopWake();
+      onWake(wakeTranscript);
+    };
     r.onresult = (e: any) => {
       if (suppressed) return; // JARVIS is saying "jarvis" himself — never self-wake
       for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -46,14 +62,30 @@ export function startWake(onWake: () => void, onState?: (listening: boolean) => 
           // while he's speaking, only a short bare wake phrase counts as Daniel
           // interrupting — longer speech is JARVIS's own voice leaking in
           if (softGuard && text.split(/\s+/).length > 4) continue;
-          stopWake();
-          onWake();
-          return;
+          wakeTranscript = text;
+          // Do not stop on the first interim "hey Jarvis" fragment. Waiting
+          // for the final transcript preserves same-breath commands such as
+          // "Hey Jarvis, add milk to my list" instead of opening and then
+          // appearing to ignore everything after the wake word.
+          if (e.results[i].isFinal) deliver();
+          else {
+            if (wakeTimer) clearTimeout(wakeTimer);
+            wakeTimer = setTimeout(deliver, 900);
+          }
+          continue;
+        }
+        if (wakeTranscript && text) {
+          wakeTranscript = `${wakeTranscript} ${text}`.trim();
+          if (e.results[i].isFinal) deliver();
         }
       }
     };
     r.onend = () => {
       onState?.(false);
+      if (wakeTranscript && !delivered) {
+        deliver();
+        return;
+      }
       if (wanted) setTimeout(spin, 400); // browser kills sessions periodically — respin
     };
     r.onerror = (e: any) => {

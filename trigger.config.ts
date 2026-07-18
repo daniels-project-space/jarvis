@@ -18,6 +18,8 @@ export default defineConfig({
     external: ["@openai/codex", "web-push"],
     extensions: [
       additionalPackages({ packages: ["@openai/codex@0.144.5"] }),
+      // Foreground bridge HTTPS uses Node fetch/app-server dynamic tools, so
+      // the managed image does not depend on curl, Python or shell quoting.
       aptGet({ packages: ["git", "ca-certificates"] }),
       syncEnvVars(() => {
         const values = Object.fromEntries(

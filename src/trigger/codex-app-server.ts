@@ -17,6 +17,28 @@ type ActiveTurn = {
 };
 
 export type CodexTurnResult = { finalText: string; threadId: string; code: number; stderr: string };
+export type CodexDynamicToolSpec = {
+  type: "function";
+  name: string;
+  description: string;
+  inputSchema: JsonObject;
+};
+export type CodexDynamicToolCall = {
+  threadId: string;
+  turnId: string;
+  callId: string;
+  namespace: string | null;
+  tool: string;
+  arguments: unknown;
+};
+export type CodexDynamicToolResult = {
+  contentItems: Array<{ type: "inputText"; text: string } | { type: "inputImage"; imageUrl: string }>;
+  success: boolean;
+};
+export type CodexAppServerOptions = {
+  dynamicTools?: CodexDynamicToolSpec[];
+  onDynamicToolCall?: (call: CodexDynamicToolCall) => Promise<CodexDynamicToolResult>;
+};
 export type CodexTurnInput = {
   conversationId: string;
   userText: string;
@@ -38,7 +60,12 @@ export class CodexAppServer {
   private stderr = "";
   private ready: Promise<void> | null = null;
 
-  constructor(private readonly bin: string, private readonly env: NodeJS.ProcessEnv, private readonly turnTimeoutMs: number) {}
+  constructor(
+    private readonly bin: string,
+    private readonly env: NodeJS.ProcessEnv,
+    private readonly turnTimeoutMs: number,
+    private readonly options: CodexAppServerOptions = {},
+  ) {}
 
   async start(): Promise<void> {
     if (!this.ready) this.ready = this.startInner();
@@ -54,7 +81,9 @@ export class CodexAppServer {
     createInterface({ input: child.stdout }).on("line", (line) => this.receive(line));
     await this.request("initialize", {
       clientInfo: { name: "jarvis-trigger", title: "Jarvis", version: "1.0.0" },
-      capabilities: { experimentalApi: false },
+      // Dynamic tools are experimental in the pinned 0.144.5 protocol. This
+      // capability is required for thread/start.dynamicTools.
+      capabilities: { experimentalApi: true },
     }, 20_000);
     this.notify("initialized", {});
   }
@@ -73,6 +102,7 @@ export class CodexAppServer {
         approvalPolicy: "never",
         sandbox: "danger-full-access",
         ephemeral: false,
+        dynamicTools: this.options.dynamicTools,
       }, 30_000);
       const thread = response.thread as JsonObject | undefined;
       threadId = typeof thread?.id === "string" ? thread.id : "";
@@ -113,6 +143,14 @@ export class CodexAppServer {
   private receive(line: string) {
     let message: JsonObject;
     try { message = JSON.parse(line) as JsonObject; } catch { return; }
+    const method = typeof message.method === "string" ? message.method : "";
+    if (
+      method === "item/tool/call" &&
+      (typeof message.id === "number" || typeof message.id === "string")
+    ) {
+      void this.respondToDynamicToolCall(message);
+      return;
+    }
     if (typeof message.id === "number") {
       const pending = this.pending.get(message.id);
       if (!pending) return;
@@ -122,7 +160,6 @@ export class CodexAppServer {
       else pending.resolve((message.result as JsonObject | undefined) ?? {});
       return;
     }
-    const method = typeof message.method === "string" ? message.method : "";
     const params = (message.params as JsonObject | undefined) ?? {};
     const turn = params.turn as JsonObject | undefined;
     const turnId = typeof params.turnId === "string" ? params.turnId : typeof turn?.id === "string" ? turn.id : "";
@@ -145,6 +182,39 @@ export class CodexAppServer {
       clearTimeout(active.timer);
       this.active.delete(turnId);
       active.resolve({ finalText: active.text, threadId: active.threadId, code: status === "completed" ? 0 : -1, stderr: status === "completed" ? "" : this.errorText(turn?.error ?? status) });
+    }
+  }
+
+  private async respondToDynamicToolCall(message: JsonObject) {
+    const params = (message.params as JsonObject | undefined) ?? {};
+    const handler = this.options.onDynamicToolCall;
+    let dynamicResult: CodexDynamicToolResult;
+    if (!handler || typeof params.tool !== "string") {
+      dynamicResult = {
+        contentItems: [{ type: "inputText", text: "Jarvis dynamic tool bridge is unavailable." }],
+        success: false,
+      };
+    } else {
+      try {
+        dynamicResult = await handler({
+          threadId: typeof params.threadId === "string" ? params.threadId : "",
+          turnId: typeof params.turnId === "string" ? params.turnId : "",
+          callId: typeof params.callId === "string" ? params.callId : "",
+          namespace: typeof params.namespace === "string" ? params.namespace : null,
+          tool: params.tool,
+          arguments: params.arguments,
+        });
+      } catch {
+        dynamicResult = {
+          contentItems: [{ type: "inputText", text: "Jarvis dynamic tool bridge failed inside its host." }],
+          success: false,
+        };
+      }
+    }
+    try {
+      this.write({ id: message.id, result: dynamicResult });
+    } catch {
+      // The process may have ended while the host request was active.
     }
   }
 

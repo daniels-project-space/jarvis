@@ -21,6 +21,7 @@ import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate } from "@/lib/transcript";
 import { completeSpeechPrefix, isSpeaking as isTtsActuallySpeaking, unlockSpeechPlayback } from "@/lib/tts";
 import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
+import { needsHostContext, visibleTurnText, withHostContext, type JarvisHostContext } from "@/lib/host-context";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -1213,7 +1214,7 @@ function SpokenCaption({ caption }: { caption: NonNullable<Caption> }) {
   );
 }
 
-export default function JarvisUI() {
+export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const orbMotionRef = useRef<OrbMotionFrame>(createOrbMotionFrame());
   const thread = (useJarvisQuery(api.ui.getActiveThread, {}) ?? "main") as string;
   const threads = (useJarvisQuery(api.ui.getThreads, {}) ?? []) as { id: string; title: string; at: number }[];
@@ -1264,6 +1265,20 @@ export default function JarvisUI() {
     () => relevantActiveWork((commandSnapshot?.active ?? []) as Job[], 4),
     [commandSnapshot?.active],
   );
+  const lastHostNotificationId = useRef<string | null>(null);
+  useEffect(() => {
+    if (!embedded) return;
+    const latest = [...messages].reverse().find((message) => message.role === "assistant" && message.status === "done" && message.text);
+    if (!latest) return;
+    if (lastHostNotificationId.current === null) {
+      lastHostNotificationId.current = latest._id;
+      return;
+    }
+    if (latest._id === lastHostNotificationId.current) return;
+    lastHostNotificationId.current = latest._id;
+    if (Date.now() - latest.createdAt > 60_000) return;
+    window.parent.postMessage({ jarvis: "notify", text: sanitizeAssistantText(latest.text).slice(0, 240) }, "*");
+  }, [embedded, messages]);
 
   const [input, setInput] = useState("");
   const [speaking, setSpeaking] = useState(false);
@@ -1582,6 +1597,10 @@ export default function JarvisUI() {
     }
   };
   useEffect(() => {
+    if (embedded) {
+      setChatMode("full", false);
+      return;
+    }
     try {
       const saved = localStorage.getItem("jarvis_chat_mode");
       if (saved === "bar" || saved === "off" || saved === "full") setChatMode(saved, false);
@@ -1592,18 +1611,31 @@ export default function JarvisUI() {
   }, []);
 
   // Standby wake word: "hey jarvis" / "jarvis" starts live mode, Siri-style.
+  const wakePreferenceKey = embedded ? "jarvis_embed_wake" : "jarvis_wake";
+  const wakeIsEnabled = () => embedded
+    ? localStorage.getItem(wakePreferenceKey) !== "0"
+    : localStorage.getItem(wakePreferenceKey) === "1";
+  const onWake = (transcript: string) => {
+    import("../lib/wakeword").then((m) => {
+      setWake(false);
+      m.chime();
+      if (embedded) window.parent.postMessage({ jarvis: "wake" }, "*");
+      setChatMode("full", false);
+      const command = m.commandAfterWake(transcript);
+      freeLoop.current = true;
+      if (command) {
+        void ownVoice();
+        void submit(command);
+      } else {
+        void freeVoiceTurn();
+      }
+    });
+  };
   const rearmWake = () => {
-    if (localStorage.getItem("jarvis_wake") !== "1") return;
+    if (!wakeIsEnabled()) return;
     import("../lib/wakeword").then((m) => {
       if (!m.wakeSupported()) return;
-      m.startWake(() => {
-        setWake(false);
-        m.chime();
-        if (voiceMode() === "free") {
-          freeLoop.current = true;
-          void freeVoiceTurn();
-        } else void toggleLive(true);
-      });
+      m.startWake(onWake);
       setWake(true);
     });
   };
@@ -1614,11 +1646,11 @@ export default function JarvisUI() {
         return;
       }
       if (wake) {
-        localStorage.setItem("jarvis_wake", "0");
+        localStorage.setItem(wakePreferenceKey, "0");
         m.stopWake();
         setWake(false);
       } else {
-        localStorage.setItem("jarvis_wake", "1");
+        localStorage.setItem(wakePreferenceKey, "1");
         rearmWake();
       }
     });
@@ -1629,18 +1661,11 @@ export default function JarvisUI() {
     if (chatMode !== "off") return;
     import("../lib/wakeword").then((m) => {
       if (!m.wakeSupported() || liveRef.current) return;
-      m.startWake(() => {
-        setWake(false);
-        m.chime();
-        if (voiceMode() === "free") {
-          freeLoop.current = true;
-          void freeVoiceTurn();
-        } else void toggleLive(true);
-      });
+      m.startWake(onWake);
       setWake(true);
     });
     return () => {
-      if (localStorage.getItem("jarvis_wake") !== "1") {
+      if (!wakeIsEnabled()) {
         import("../lib/wakeword").then((m) => m.stopWake());
         setWake(false);
       }
@@ -1660,6 +1685,19 @@ export default function JarvisUI() {
     return () => window.removeEventListener("pagehide", bye);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!embedded) return;
+    const receiveHostMessage = (event: MessageEvent) => {
+      if (event.source !== window.parent) return;
+      const message = event.data ?? {};
+      if (message.jarvis === "host-show") setChatMode("full", false);
+    };
+    window.addEventListener("message", receiveHostMessage);
+    window.parent.postMessage({ jarvis: "ready" }, "*");
+    return () => window.removeEventListener("message", receiveHostMessage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [embedded]);
 
   useEffect(() => {
     me.current = clientId();
@@ -1911,8 +1949,14 @@ export default function JarvisUI() {
     if (liveRef.current && !last.model) return;
     // HARD RULE: while a live session exists on ANY device, nothing else may
     // produce speech — the live voice is the only speaker in the house.
-    if (liveAnywhere() && !liveRef.current) return;
-    if (document.hidden) return; // background tabs stay silent — one voice, ever
+    if (liveAnywhere() && !liveRef.current) {
+      finishOneShotVoiceTurn();
+      return;
+    }
+    if (document.hidden) {
+      finishOneShotVoiceTurn();
+      return; // background tabs stay silent — one voice, ever
+    }
     const spokenText = isToolGarbage(last.text) ? sanitizeAssistantText(last.text) : last.text;
     // Streaming and finalization use the same stable caption node. Put the
     // finished text there before voice ownership/model generation, so it never
@@ -1921,6 +1965,7 @@ export default function JarvisUI() {
     (async () => {
       if (!(await ensureVoice())) {
         fadeCaption(spokenText, 3200);
+        finishOneShotVoiceTurn();
         return; // another tab/device owns the voice
       }
       const streamed = streamingSpeechRef.current.id === last._id ? streamingSpeechRef.current : null;
@@ -1929,6 +1974,7 @@ export default function JarvisUI() {
       if (!unsaidText) {
         setSpeaking(false);
         fadeCaption(spokenText, 1800);
+        finishOneShotVoiceTurn();
         return;
       }
       const { speak } = await import("../lib/tts");
@@ -1944,15 +1990,37 @@ export default function JarvisUI() {
         () => {
           setSpeaking(false);
           fadeCaption(spokenText, 1800); // remain readable, then leave without a flash
+          finishOneShotVoiceTurn();
         },
       );
     })();
   }, [messages]);
 
-  async function queueDurableTurn(text: string) {
+  async function requestHostContext(): Promise<JarvisHostContext | null> {
+    if (!embedded || window.parent === window) return null;
+    const id = `jarvis-context-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return new Promise((resolve) => {
+      const finish = (context: JarvisHostContext | null) => {
+        window.removeEventListener("message", receive);
+        window.clearTimeout(timer);
+        resolve(context);
+      };
+      const receive = (event: MessageEvent) => {
+        if (event.source !== window.parent) return;
+        const message = event.data ?? {};
+        if (message.jarvis !== "context-response" || message.id !== id) return;
+        finish(message.context as JarvisHostContext);
+      };
+      const timer = window.setTimeout(() => finish(null), 350);
+      window.addEventListener("message", receive);
+      window.parent.postMessage({ jarvis: "context-request", id }, "*");
+    });
+  }
+
+  async function queueDurableTurn(text: string, visibleText = text) {
     durableStartedAt.current = performance.now();
     setSending(true);
-    showCaption({ who: "you", text });
+    showCaption({ who: "you", text: visibleText });
     try {
       await fetch("/api/chat", {
         method: "POST",
@@ -2000,6 +2068,7 @@ export default function JarvisUI() {
       void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant-dispatch" });
       if (document.hidden || (liveAnywhere() && !liveRef.current) || !(await ensureVoice())) {
         fadeCaption(reply, 3200);
+        finishOneShotVoiceTurn();
         return;
       }
       const { speak } = await import("../lib/tts");
@@ -2013,6 +2082,7 @@ export default function JarvisUI() {
         () => {
           setSpeaking(false);
           fadeCaption(reply, 1800);
+          finishOneShotVoiceTurn();
         },
       );
     } catch {
@@ -2061,6 +2131,7 @@ export default function JarvisUI() {
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
       if (document.hidden || (liveAnywhere() && !liveRef.current) || !(await ensureVoice())) {
         fadeCaption(reply, 3200);
+        finishOneShotVoiceTurn();
         return;
       }
       const { speak } = await import("../lib/tts");
@@ -2074,6 +2145,7 @@ export default function JarvisUI() {
         () => {
           setSpeaking(false);
           fadeCaption(reply, 1800);
+          finishOneShotVoiceTurn();
         },
       );
     } catch {
@@ -2130,6 +2202,7 @@ export default function JarvisUI() {
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
       if (document.hidden || (liveAnywhere() && !liveRef.current) || !(await ensureVoice())) {
         fadeCaption(reply, 3200);
+        finishOneShotVoiceTurn();
         return;
       }
       const { speak } = await import("../lib/tts");
@@ -2143,6 +2216,7 @@ export default function JarvisUI() {
         () => {
           setSpeaking(false);
           fadeCaption(reply, 1800);
+          finishOneShotVoiceTurn();
         },
       );
     } catch {
@@ -2219,6 +2293,7 @@ export default function JarvisUI() {
       void (async () => {
         if (document.hidden || !(await ensureVoice())) {
           fadeCaption(instant, 3200);
+          finishOneShotVoiceTurn();
           return;
         }
         const { speak } = await import("../lib/tts");
@@ -2232,12 +2307,18 @@ export default function JarvisUI() {
           () => {
             setSpeaking(false);
             fadeCaption(instant, 1800);
+            finishOneShotVoiceTurn();
           },
         );
       })();
       return;
     }
-    await queueDurableTurn(t);
+    let modelText = t;
+    if (embedded && needsHostContext(t)) {
+      const context = await requestHostContext();
+      if (context) modelText = withHostContext(t, context);
+    }
+    await queueDurableTurn(modelText, t);
   }
 
   function stopTalking() {
@@ -2249,6 +2330,13 @@ export default function JarvisUI() {
   const freeLoop = useRef(false);
   const freeBusy = useRef(false);
   const freeRearmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function finishOneShotVoiceTurn() {
+    if (!freeLoop.current || liveRef.current) return;
+    freeLoop.current = false;
+    cancelFreeRearm();
+    closePersistentLiveMic();
+    window.setTimeout(rearmWake, 650);
+  }
   async function ensurePersistentLiveMic() {
     const current = liveMicRef.current;
     if (current && current.stream.getAudioTracks().some((track) => track.readyState === "live")) return current;
@@ -2375,7 +2463,7 @@ export default function JarvisUI() {
   }
 
   useEffect(() => {
-    if (!prefs.liveDefault || permissions.microphone !== "granted" || liveAutoStarted.current) return;
+    if (embedded || !prefs.liveDefault || permissions.microphone !== "granted" || liveAutoStarted.current) return;
     liveAutoStarted.current = true;
     const timer = window.setTimeout(() => {
       if (!liveRef.current) void toggleLive(true);
@@ -2384,7 +2472,7 @@ export default function JarvisUI() {
     // This is intentionally a once-per-load boot. Stopping live mode manually
     // must not cause the next render to reopen the microphone.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [prefs.liveDefault, permissions.microphone]);
+  }, [embedded, prefs.liveDefault, permissions.microphone]);
 
   // Screen sight: share a screen/window for ONE frame — JARVIS reads it and
   // answers about what's actually in front of Daniel.
@@ -2470,7 +2558,6 @@ export default function JarvisUI() {
   // the continuous stream into utterances, but the physical device remains
   // open. This avoids the browser permission/audio-stack churn that used to
   // make the mic blink every few seconds and lets Daniel interrupt speech.
-  const voiceMode = () => "free";
   async function freeVoiceTurn() {
     if (freeBusy.current || !freeLoop.current) return;
     freeBusy.current = true;
@@ -2739,6 +2826,15 @@ export default function JarvisUI() {
           >
             <span className="inline-block transition-transform duration-500" style={{ transform: optionsOpen ? "rotate(90deg)" : "none" }}>⚙</span>
           </button>
+          {embedded && (
+            <button
+              onClick={() => window.parent.postMessage({ jarvis: "hide" }, "*")}
+              title="close Jarvis"
+              className="rounded px-1 text-lg leading-none text-slate transition hover:text-cyan"
+            >
+              ×
+            </button>
+          )}
         </div>
       </header>
       {optionsOpen && (
@@ -2906,7 +3002,11 @@ export default function JarvisUI() {
             )}
             {messages
               .slice(-80)
-              .map((m) => (m.role === "assistant" && m.text && isToolGarbage(m.text) ? { ...m, text: sanitizeAssistantText(m.text) } : m))
+              .map((m) => {
+                if (m.role === "assistant" && m.text && isToolGarbage(m.text)) return { ...m, text: sanitizeAssistantText(m.text) };
+                if (m.role === "user" && m.text) return { ...m, text: visibleTurnText(m.text) };
+                return m;
+              })
               .filter((m) => m.text || m.attachment || m.status === "streaming")
               .map((m) => (
               <div key={m._id} className={`rise ${m.role === "user" ? "text-right" : "text-left"}`}>

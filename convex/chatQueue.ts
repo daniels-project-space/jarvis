@@ -2,6 +2,9 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireActor, requireAdmin, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 
+const HOST_CONTEXT_BLOCK = /\s*\[JARVIS_HOST_CONTEXT\][\s\S]*?\[\/JARVIS_HOST_CONTEXT\]\s*/g;
+const visibleTurnText = (text: string) => text.replace(HOST_CONTEXT_BLOCK, " ").replace(/\s{2,}/g, " ").trim();
+
 // Cloud chat transport for the subscription brain. UI calls sendMessage +
 // subscribes to listMessages; the Trigger dispatcher calls claimNext /
 // appendChunk / finalize over the HTTP API. Daniel and Trigger authenticate
@@ -89,7 +92,9 @@ export const openTurn = mutation({
       .map((m: any) => ({
         role: m.role,
         // cards surface as context so "that video from earlier" resolves
-        text: m.text || (m.attachment ? `[showed on screen: ${m.attachment.title ?? m.attachment.type}]` : ""),
+        text: m.text
+          ? (m.role === "user" ? visibleTurnText(m.text) : m.text)
+          : (m.attachment ? `[showed on screen: ${m.attachment.title ?? m.attachment.type}]` : ""),
       }));
     const userId = await ctx.db.insert("chatMessages", {
       threadId,
@@ -208,7 +213,7 @@ async function claimPending(ctx: { db: any }, pending: any) {
       )
       .sort((a: any, b: any) => a.createdAt - b.createdAt)
       .slice(-12)
-      .map((m: any) => ({ role: m.role, text: m.text }));
+      .map((m: any) => ({ role: m.role, text: m.role === "user" ? visibleTurnText(m.text) : m.text }));
 
     return {
       threadId: pending.threadId,

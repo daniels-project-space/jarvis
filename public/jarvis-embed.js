@@ -1,6 +1,7 @@
 // JARVIS everywhere — one script tag on any of Daniel's internal apps:
 //   <script src="https://jarvis-orcin-six.vercel.app/jarvis-embed.js" defer></script>
-// The widget stays INVISIBLE (but listening for "hey jarvis") until summoned —
+// The canonical client stays loaded (and listening for "hey jarvis") while its
+// frame is invisible, then opens without remounting or swapping implementations.
 // by the wake word, or programmatically via window.JARVIS.toggle() from a
 // header button. It never floats over the page uninvited.
 (function () {
@@ -13,11 +14,11 @@
   var f = document.createElement("iframe");
   f.src = ORIGIN + "/embed";
   f.title = "JARVIS";
-  f.allow = "microphone; autoplay; clipboard-write";
+  f.allow = "microphone; autoplay; clipboard-write; display-capture";
   f.style.cssText =
-    "position:fixed;bottom:12px;right:12px;width:min(420px,calc(100vw - 24px));height:96px;border:0;" +
+    "position:fixed;bottom:12px;right:12px;width:min(540px,calc(100vw - 24px));height:min(760px,calc(100vh - 24px));border:0;" +
     "border-radius:22px;z-index:2147483000;background:transparent;color-scheme:dark;" +
-    "box-shadow:0 14px 44px rgba(0,0,0,.55);transition:height .36s cubic-bezier(.22,1,.36,1),opacity .3s ease,transform .3s ease;" +
+    "box-shadow:0 18px 58px rgba(0,0,0,.6);transition:opacity .24s ease,transform .3s cubic-bezier(.22,1,.36,1);" +
     "opacity:0;transform:translateY(14px);pointer-events:none;";
 
   function show() {
@@ -25,6 +26,7 @@
     f.style.opacity = "1";
     f.style.transform = "translateY(0)";
     f.style.pointerEvents = "auto";
+    if (f.contentWindow) f.contentWindow.postMessage({ jarvis: "host-show" }, ORIGIN);
   }
   function hide() {
     visible = false;
@@ -45,12 +47,26 @@
   };
 
   window.addEventListener("message", function (e) {
-    if (e.origin !== ORIGIN) return;
+    if (e.origin !== ORIGIN || e.source !== f.contentWindow) return;
     var d = e.data || {};
-    if (d.jarvis === "size" && typeof d.h === "number") {
-      f.style.height = Math.max(88, Math.min(d.h, window.innerHeight - 24)) + "px";
-    } else if (d.jarvis === "wake") show(); // "hey jarvis" → the widget appears
+    if (d.jarvis === "wake" || d.jarvis === "notify") show();
     else if (d.jarvis === "hide") hide();
+    else if (d.jarvis === "context-request" && typeof d.id === "string") {
+      var selection = "";
+      var text = "";
+      try {
+        selection = String(window.getSelection ? window.getSelection() : "").slice(0, 1800);
+        text = String(document.body ? document.body.innerText : "").slice(0, 7000);
+      } catch (_) {}
+      f.contentWindow.postMessage(
+        {
+          jarvis: "context-response",
+          id: d.id,
+          context: { url: location.href, title: document.title, selection: selection, text: text },
+        },
+        ORIGIN,
+      );
+    }
   });
 
   function mount() {
