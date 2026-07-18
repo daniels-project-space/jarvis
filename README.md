@@ -8,8 +8,10 @@ agents to build and repair Daniel's other projects. One personality
 ## Two-lane brain
 
 - **Live lane** — turn-taking browser audio → free Whisper transcription → a warm,
-  streaming Codex app-server authenticated by Daniel's subscription → local Kokoro TTS.
-  The microphone is closed while Jarvis speaks, so speaker echo cannot cut him off.
+  streaming Codex app-server authenticated by Daniel's subscription → the authenticated
+  Edge neural Ryan voice route. Short MP3 segments are decoded in the browser with no
+  local model download or inference warm-up. The microphone is closed while Jarvis
+  speaks, so speaker echo cannot cut him off.
   Tools run through the private agent bridge; finished turns live in Convex history.
 - **Text lane** — `/api/chat` commits each turn to Convex and wakes one of two warm
   Trigger workers. The same Codex subscription app-server streams deltas every 120 ms;

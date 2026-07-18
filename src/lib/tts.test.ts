@@ -11,41 +11,9 @@ import {
   warm,
 } from "./tts";
 
-class FakeWorker {
-  static instances: FakeWorker[] = [];
-  static failNextSynthesis = false;
-  static synthesisCount = 0;
-  onmessage: ((event: MessageEvent) => void) | null = null;
-  onerror: ((event: ErrorEvent) => void) | null = null;
-  syntheses: string[] = [];
-
-  constructor() {
-    FakeWorker.instances.push(this);
-  }
-
-  postMessage(message: { type: string; id?: number; text?: string }) {
-    queueMicrotask(() => {
-      if (message.type === "warm") {
-        this.onmessage?.({ data: { type: "ready" } } as MessageEvent);
-      } else if (message.type === "synthesize") {
-        FakeWorker.synthesisCount += 1;
-        this.syntheses.push(message.text ?? "");
-        if (FakeWorker.failNextSynthesis) {
-          FakeWorker.failNextSynthesis = false;
-          this.onmessage?.({ data: { type: "error", id: message.id, message: "transient generation error" } } as MessageEvent);
-          return;
-        }
-        const audio = new Float32Array(2_400);
-        audio.fill(0.2);
-        this.onmessage?.({
-          data: { type: "audio", id: message.id, sampleRate: 24_000, audio: audio.buffer },
-        } as MessageEvent);
-      }
-    });
-  }
-
-  terminate() {}
-}
+let failNextSynthesis = false;
+let synthesisCount = 0;
+let warmCount = 0;
 
 class FakeSource {
   static instances: FakeSource[] = [];
@@ -74,20 +42,43 @@ class FakeAudioContext {
   state = "running";
   destination = {};
   resume = vi.fn(async () => { this.state = "running"; });
-  createBuffer() {
-    return { copyToChannel: vi.fn() };
-  }
+  decodeAudioData = vi.fn(async () => ({ duration: 1.2 }));
   createBufferSource() { return new FakeSource(); }
   createAnalyser() { return new FakeAnalyser(); }
 }
 
-describe("single KittenTTS speech queue", () => {
+describe("single Edge neural speech queue", () => {
   beforeEach(() => {
     FakeSource.instances = [];
-    FakeWorker.failNextSynthesis = false;
-    FakeWorker.synthesisCount = 0;
-    vi.stubGlobal("Worker", FakeWorker);
-    vi.stubGlobal("window", { AudioContext: FakeAudioContext });
+    failNextSynthesis = false;
+    synthesisCount = 0;
+    warmCount = 0;
+    vi.stubGlobal("window", {
+      AudioContext: FakeAudioContext,
+      location: { origin: "https://jarvis.test" },
+      setTimeout,
+      clearTimeout,
+    });
+    vi.stubGlobal("document", { documentElement: { dataset: {} } });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/tts" && init?.method === "GET") {
+        warmCount += 1;
+        return new Response(null, { status: 204 });
+      }
+      if (url === "/api/tts") {
+        synthesisCount += 1;
+        if (failNextSynthesis) {
+          failNextSynthesis = false;
+          return Response.json({ error: "transient service error" }, { status: 502 });
+        }
+        return new Response(new Uint8Array(2_400), {
+          status: 200,
+          headers: { "content-type": "audio/mpeg" },
+        });
+      }
+      return Response.json({ ok: true });
+    }));
   });
 
   afterEach(() => {
@@ -159,7 +150,7 @@ describe("single KittenTTS speech queue", () => {
     await reply;
   });
 
-  it("does not resolve a queued reply before its PCM playback has finished", async () => {
+  it("does not resolve a queued reply before its decoded playback has finished", async () => {
     const first = speak("The first reply is playing.", () => {});
     await vi.waitFor(() => expect(FakeSource.instances).toHaveLength(1));
     let secondFinished = false;
@@ -177,10 +168,11 @@ describe("single KittenTTS speech queue", () => {
     expect(secondFinished).toBe(true);
   });
 
-  it("warms the worker without spending an audio playback attempt", async () => {
+  it("warms the cloud route without spending an audio playback attempt", async () => {
     const sourcesBefore = FakeSource.instances.length;
     await warm();
     expect(FakeSource.instances).toHaveLength(sourcesBefore);
+    expect(warmCount).toBe(1);
   });
 
   it("uses Web Audio only and never invokes a browser speech fallback", async () => {
@@ -195,10 +187,10 @@ describe("single KittenTTS speech queue", () => {
   });
 
   it("retries one transient neural generation failure without changing engines", async () => {
-    FakeWorker.failNextSynthesis = true;
+    failNextSynthesis = true;
     const reply = speak("Recover the same neural voice once.", () => {});
     await vi.waitFor(() => expect(FakeSource.instances).toHaveLength(1));
-    expect(FakeWorker.synthesisCount).toBe(2);
+    expect(synthesisCount).toBe(2);
     FakeSource.instances[0].onended?.();
     await reply;
   });

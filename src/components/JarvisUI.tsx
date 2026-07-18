@@ -1353,6 +1353,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const [sending, setSending] = useState(false);
   const [recording, setRecording] = useState(false);
   const [live, setLive] = useState<"off" | "connecting" | "live">("off");
+  useEffect(() => {
+    if (!embedded || window.parent === window) return;
+    window.parent.postMessage({ jarvis: speaking ? "speech-start" : "speech-end" }, "*");
+  }, [embedded, speaking]);
+  useEffect(() => {
+    if (!embedded || window.parent === window) return;
+    window.parent.postMessage({ jarvis: live === "off" ? "live-end" : "live-start" }, "*");
+  }, [embedded, live]);
   const [caption, setCaption] = useState<Caption>(null);
   // Soft dismiss: mark the caption `exiting` so it fades out slowly (CSS), then
   // unmount after the fade. A fresh caption cancels a pending fade.
@@ -1523,13 +1531,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       reduceMotion: localStorage.getItem("jarvis_reduce_motion") === "1",
       liveDefault: localStorage.getItem("jarvis_live_default") !== "0",
     });
-    // Greeting synthesis is never run on mount. It competed with wake-word
-    // recognition in the old large Kokoro worker and could make both fail.
+    // Greeting synthesis is never run on mount. It competes with wake-word
+    // recognition and makes an assistant speak before Daniel has asked.
   }, []);
   useEffect(() => {
-    // Initialise only the much smaller Kitten model once the browser is idle.
-    // Inference remains off the UI thread and there is no speculative speech;
-    // this removes the first-reply warm-up without delaying Hub wake startup.
+    // There is no browser voice model now. This only warms the authenticated
+    // Vercel route bundle so the first reply can go straight to Edge speech.
     const idleWindow = window as typeof window & {
       requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
       cancelIdleCallback?: (id: number) => void;
@@ -1704,6 +1711,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
 
   // Standby wake word: "hey jarvis" / "jarvis" starts live mode, Siri-style.
   const wakePreferenceKey = embedded ? "jarvis_embed_wake" : "jarvis_wake";
+  const wakeOwnedByHost = () => embedded && window.parent !== window;
   const wakeIsEnabled = () => embedded
     ? localStorage.getItem(wakePreferenceKey) !== "0"
     : localStorage.getItem(wakePreferenceKey) === "1";
@@ -1742,6 +1750,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     });
   };
   const rearmWake = () => {
+    // A cross-origin iframe cannot reliably obtain microphone permission.
+    // Project Hub owns recognition at the top level and sends commands here.
+    if (wakeOwnedByHost()) return;
     if (!wakeIsEnabled()) return;
     import("../lib/wakeword").then((m) => {
       if (!m.wakeSupported()) return;
@@ -1768,6 +1779,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // Zen mode = always listening: the wake word is forced on while chat is
   // hidden, regardless of the manual wake toggle.
   useEffect(() => {
+    if (wakeOwnedByHost()) return;
     if (chatMode !== "off") return;
     import("../lib/wakeword").then((m) => {
       if (!m.wakeSupported() || liveRef.current) return;
@@ -1808,9 +1820,23 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const message = event.data ?? {};
       if (message.jarvis === "host-show") setChatMode("off", false);
       if (message.jarvis === "host-hide" && liveRef.current) void toggleLive();
+      if (message.jarvis === "host-wake-state") setWake(message.listening === true);
+      if (message.jarvis === "host-wake-detected") {
+        setWake(true);
+        setChatMode("off", false);
+        showCaption({ who: "you", text: "Listening…" });
+        unlockSpeechPlayback();
+        void import("../lib/wakeword").then((module) => module.chime());
+        void import("../lib/tts").then((module) => module.warm());
+      }
+      if (message.jarvis === "host-transcript" && typeof message.text === "string") {
+        const transcript = message.text.trim().slice(0, 4000);
+        if (transcript) showCaption({ who: "you", text: transcript });
+      }
       if (message.jarvis === "host-command" && typeof message.text === "string") {
         const command = message.text.trim().slice(0, 4000);
         if (command) {
+          setWake(false);
           setChatMode("off", false);
           submitEntryCommand(command);
         }
@@ -1842,7 +1868,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => {
     liveOnRef.current = liveOnRow ?? null;
   }, [liveOnRow]);
-  // A fresh live session anywhere = local TTS is forbidden everywhere.
+  // A fresh live session anywhere = narrated TTS is forbidden everywhere.
   const liveAnywhere = () => {
     const l = liveOnRef.current;
     return !!l && Date.now() - l.updatedAt < 45_000;
