@@ -1401,57 +1401,6 @@ export default function JarvisUI() {
     panelFullRef.current = panelFull;
   }, [panelFull]);
 
-
-  // Finished background work → bottom popup cards (stack of 3, click to expand
-  // into the distilled breakdown, auto-gone after 5 hours, dismissable).
-  const findingsRecent = (useJarvisQuery(api.findings.recent, { limit: 8 }) ?? []) as {
-    _id: string;
-    spoken: string;
-    detail: string;
-    source: string;
-    createdAt: number;
-    bullets?: string[];
-    important?: boolean;
-  }[];
-  const [dismissed, setDismissed] = useState<Set<string>>(() => {
-    try {
-      return new Set(JSON.parse(localStorage.getItem("jarvis_dismissed") ?? "[]"));
-    } catch {
-      return new Set();
-    }
-  });
-  const [expandedFinding, setExpandedFinding] = useState<string | null>(null);
-  // Only findings the distiller judged worth an interruption become cards —
-  // internal plumbing and dev chatter stay out of Daniel's face.
-  const popups = findingsRecent
-    .filter((f) => Date.now() - f.createdAt < 5 * 60 * 60 * 1000 && !dismissed.has(f._id) && f.spoken && f.important === true)
-    .slice(0, 3);
-  const distillTried = useRef<Set<string>>(new Set());
-  useEffect(() => {
-    const next = findingsRecent.find(
-      (f) => Date.now() - f.createdAt < 5 * 60 * 60 * 1000 && !dismissed.has(f._id) && f.important === undefined && !distillTried.current.has(f._id),
-    );
-    if (!next) return;
-    distillTried.current.add(next._id);
-    void fetch("/api/distill", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ id: next._id }),
-    }).catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [findingsRecent]);
-  const dismissFinding = (id: string) => {
-    setDismissed((d) => {
-      const nd = new Set(d);
-      nd.add(id);
-      try {
-        localStorage.setItem("jarvis_dismissed", JSON.stringify([...nd].slice(-60)));
-      } catch { /* private mode */ }
-      return nd;
-    });
-    if (expandedFinding === id) setExpandedFinding(null);
-  };
-
   // The colour changes locally on the first keystroke/word, rather than
   // waiting for a streamed model reply or a Convex write. A deliberate manual
   // choice remains authoritative until Daniel returns it to automatic mode.
@@ -3053,70 +3002,6 @@ export default function JarvisUI() {
           stageRef={stageRef}
           iframeRef={videoIframeRef}
         />
-      )}
-
-      {/* finished-work popups — bottom-left stack, click to read the breakdown */}
-      {popups.length > 0 && !panelFull && (
-        <div className={`fixed bottom-[116px] left-3 z-40 flex w-[min(280px,calc(100vw-104px))] flex-col-reverse gap-1.5 md:bottom-4 md:left-4 md:w-[min(340px,60vw)] ${chatMode === "full" ? "max-md:hidden" : ""}`}>
-          {popups.map((f, i) => (
-            <div key={f._id} className={`rise glass overflow-hidden rounded-xl !border-cyan/25 shadow-2xl ${i >= 2 ? "hidden md:block" : ""}`}>
-              <button onClick={() => setExpandedFinding(f._id)} className="block w-full p-2.5 text-left transition hover:bg-white/[0.03]">
-                <div className="mb-1 flex items-center gap-1.5">
-                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                  <span className="hud-label !text-[8px]">while you were away</span>
-                </div>
-                <div className="line-clamp-2 text-xs leading-snug text-ice">{f.spoken}</div>
-              </button>
-              <button
-                onClick={() => dismissFinding(f._id)}
-                className="absolute right-1.5 top-1.5 rounded px-1 text-[10px] text-slate hover:text-red-300"
-                title="dismiss"
-              >
-                ✕
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-      {expandedFinding && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={() => setExpandedFinding(null)}>
-          {(() => {
-            const f = findingsRecent.find((x) => x._id === expandedFinding);
-            if (!f) return null;
-            return (
-              <div onClick={(e) => e.stopPropagation()} className="glass max-h-[80vh] w-[min(720px,94vw)] overflow-hidden rounded-2xl !border-cyan/30">
-                <div className="flex items-center justify-between border-b border-white/5 px-5 py-3">
-                  <span className="hud-label !text-cyan">work done while you were away</span>
-                  <span className="flex gap-2">
-                    <button onClick={() => dismissFinding(f._id)} className="hud-label rounded px-1.5 hover:text-red-300">dismiss</button>
-                    <button onClick={() => setExpandedFinding(null)} className="hud-label rounded px-1.5 hover:text-cyan">close</button>
-                  </span>
-                </div>
-                <div className="scrollbar-thin max-h-[65vh] overflow-y-auto p-5">
-                  <p className="mb-4 text-lg font-medium leading-relaxed text-ice">{f.spoken}</p>
-                  {f.bullets?.length ? (
-                    <>
-                      <ul className="space-y-2.5">
-                        {f.bullets.map((b, j) => (
-                          <li key={j} className="flex gap-2.5 text-[15px] leading-relaxed text-ice/90">
-                            <span className="mt-0.5 text-cyan/70">›</span>
-                            <span className="min-w-0 flex-1">{b}</span>
-                          </li>
-                        ))}
-                      </ul>
-                      <details className="mt-5">
-                        <summary className="hud-label cursor-pointer select-none hover:text-cyan">full log</summary>
-                        <div className="mt-2 whitespace-pre-wrap text-[13px] leading-relaxed text-ice/60">{f.detail}</div>
-                      </details>
-                    </>
-                  ) : (
-                    <div className="whitespace-pre-wrap text-[15px] leading-relaxed text-ice/85">{f.detail}</div>
-                  )}
-                </div>
-              </div>
-            );
-          })()}
-        </div>
       )}
 
       {/* threads drawer — chat history in a slide-out */}
