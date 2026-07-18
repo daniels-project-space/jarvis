@@ -1110,13 +1110,13 @@ export default function JarvisUI() {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "set_active_thread", ...args }),
-    });
+    }).catch(() => undefined);
   const clearThread = (args: { threadId?: string }) =>
     fetch("/api/client-state", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "clear_thread", ...args }),
-    });
+    }).catch(() => undefined);
   const threadRef = useRef("main");
   useEffect(() => {
     threadRef.current = thread;
@@ -1133,14 +1133,14 @@ export default function JarvisUI() {
   const panel = instantPanel ?? remotePanel;
   const sayRow = useJarvisQuery(api.ui.getSay, {}) as { value: string; updatedAt: number } | null | undefined;
   const stagePanelSize = useMemo(() => (panel ? panelSize(panel) : ""), [panel]);
-  const clearPanel = (args: Record<string, unknown>) => clientMutation("ui:clearPanel", args);
-  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
+  const clearPanel = (args: Record<string, unknown>) => clientMutation("ui:clearPanel", args).catch(() => undefined);
+  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args).catch(() => undefined);
   const logTurn = (args: { threadId?: string; role: string; text: string; model?: string }) =>
     fetch("/api/client-state", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "log_turn", ...args }),
-    });
+    }).catch(() => undefined);
   const saveSub = (args: Record<string, unknown>) => clientMutation("push:saveSub", args);
   const claimVoice = (args: Record<string, unknown>) => clientMutation("ui:claimVoice", args);
   const electVoice = (args: Record<string, unknown>) => clientMutation("ui:electVoice", args);
@@ -1256,7 +1256,9 @@ export default function JarvisUI() {
     // subscription to echo this claim back added ~650 ms before buffered
     // audio could start.
     voiceRef.current = { value: me.current, updatedAt: Date.now() };
-    return claimVoice({ client: me.current });
+    // A transient connection loss is expected here: the next direct
+    // interaction or live heartbeat reconciles the best-effort remote claim.
+    return claimVoice({ client: me.current }).catch(() => undefined);
   };
   const lastSent = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
   const durableStartedAt = useRef<number | null>(null);
@@ -1336,7 +1338,7 @@ export default function JarvisUI() {
   // Speech deliberately has no engine or voice switch: every device uses the
   // same neural Jarvis identity.
   const [optionsOpen, setOptionsOpen] = useState(false);
-  const setMoodMut = (args: Record<string, unknown>) => clientMutation("ui:setMood", args);
+  const setMoodMut = (args: Record<string, unknown>) => clientMutation("ui:setMood", args).catch(() => undefined);
   const [prefs, setPrefs] = useState<JarvisPrefs>({ reduceMotion: false, liveDefault: true });
   const [permissions, setPermissions] = useState<JarvisPermissionState>({ microphone: "prompt", notifications: "prompt" });
   const [permissionBusy, setPermissionBusy] = useState(false);
@@ -1386,7 +1388,7 @@ export default function JarvisUI() {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "set_location", ...args }),
-    });
+    }).catch(() => undefined);
   const [locOn, setLocOn] = useState(false);
   const captureLocation = (announce = false): Promise<boolean> =>
     new Promise((resolve) => {
@@ -1617,7 +1619,7 @@ export default function JarvisUI() {
   useEffect(() => {
     void registerSW().then(() => {
       if (typeof Notification !== "undefined" && Notification.permission === "granted") {
-        void subscribePush(saveSub).then(() => refreshPermissions());
+        void subscribePush(saveSub).then(() => refreshPermissions()).catch(() => {});
       }
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
