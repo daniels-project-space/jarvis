@@ -1,4 +1,5 @@
 export type FastChartIntent = { asset: string; interval: "1h" | "4h" | "1d" | "1w" };
+export type FastNetWorthIntent = { requiresAnalysis: boolean };
 
 const ALIASES: Record<string, string> = {
   bitcoin: "btc", btc: "btc", ethereum: "eth", eth: "eth", solana: "sol", sol: "sol",
@@ -24,4 +25,18 @@ export function parseFastChartIntent(input: string): FastChartIntent | null {
         ? "1h"
         : "1d";
   return { asset: alias[1], interval };
+}
+
+// Net worth is already a real visual tool backed by Project Hub data. Making
+// a model rediscover that tool on every request caused two-minute answers with
+// no overlay whenever the total was also present in text context.
+export function parseFastNetWorthIntent(input: string): FastNetWorthIntent | null {
+  const text = input.toLowerCase().replace(/[^a-z0-9£\s']/g, " ").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  const explicit = /\bnet worth\b/.test(text)
+    || /\b(how much am i worth|show (me )?my wealth|my wealth dashboard|how'?s my money)\b/.test(text);
+  if (!explicit) return null;
+  return {
+    requiresAnalysis: /\b(analy[sz]e|analysis|advice|improve|strategy|why|plan|deep|breakdown|what should)\b/.test(text),
+  };
 }

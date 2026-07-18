@@ -10,7 +10,8 @@ import { advanceOrbPhase, frameDamping, orbCycleSeconds, type OrbMotionFrame, ty
 // electrons travel the connections while thinking.
 // Adapted here: container-sized + transparent background, driven by energyRef
 // (0..1 voice amplitude) instead of an AnalyserNode, JARVIS green palette.
-// The previous orb is preserved as ThreeOrbClassic.tsx (header ◍ toggle).
+// This is the only orb renderer; the superseded canvas/classic experiments
+// were removed so no second animation system can fight this clock.
 
 const BASE = 0x00ff88; // Daniel's green — do not revert
 

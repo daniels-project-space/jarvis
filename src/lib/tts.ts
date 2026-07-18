@@ -1,13 +1,21 @@
 "use client";
 
-// Free speech output. Jarvis uses either the browser/OS voice or Kokoro running
-// in a dedicated browser worker; assistant text is never sent to a TTS vendor.
+// Jarvis has one audible identity: KittenTTS Jasper, generated locally in a
+// worker. Never fall back to Web Speech — doing so made one reply sound like
+// two people and allowed a robotic voice to race the neural one.
 
-let generation = 0;
-let draining = false;
-let currentUtterance: SpeechSynthesisUtterance | null = null;
-let currentAudio: HTMLAudioElement | null = null;
-let stopAudioPlayback: (() => void) | null = null;
+type KittenWorkerRequest =
+  | { id: number; type: "warm" }
+  | { id: number; type: "generate"; text: string; speed: number };
+type KittenWorkerPayload =
+  | { type: "warm" }
+  | { type: "generate"; text: string; speed: number };
+type KittenWorkerResponse =
+  | { id: number; type: "ready" }
+  | { id: number; type: "audio"; blob: Blob }
+  | { id: number; type: "error"; message: string };
+type KittenWorkerResult = { ok: true; blob?: Blob } | { ok: false };
+
 type SpeechBatch = {
   generation: number;
   text: string;
@@ -17,39 +25,18 @@ type SpeechBatch = {
   onEnd?: () => void;
   resolve: () => void;
 };
+
+let generation = 0;
+let draining = false;
+let currentAudio: HTMLAudioElement | null = null;
+let stopAudioPlayback: (() => void) | null = null;
 let queue: SpeechBatch[] = [];
 let activeBatch: SpeechBatch | null = null;
-let cachedVoice: SpeechSynthesisVoice | null = null;
-type TtsMode = "kokoro" | "system";
-export const KOKORO_VOICES = [
-  { id: "bm_george", label: "George", detail: "refined British" },
-  { id: "bf_emma", label: "Emma", detail: "natural British" },
-  { id: "af_heart", label: "Heart", detail: "warm studio" },
-  { id: "bm_fable", label: "Fable", detail: "theatrical British" },
-] as const;
-export type KokoroVoice = (typeof KOKORO_VOICES)[number]["id"];
-export const DEFAULT_KOKORO_VOICE: KokoroVoice = "bm_george";
-type KokoroWorkerRequest =
-  | { id: number; type: "warm" }
-  | { id: number; type: "generate"; text: string; speed: number; voice: KokoroVoice };
-type KokoroWorkerPayload =
-  | { type: "warm" }
-  | { type: "generate"; text: string; speed: number; voice: KokoroVoice };
-type KokoroWorkerResponse =
-  | { id: number; type: "ready" }
-  | { id: number; type: "audio"; blob: Blob }
-  | { id: number; type: "error"; message: string };
-type KokoroWorkerResult = { ok: true; blob?: Blob } | { ok: false };
-type KokoroPending = { resolve: (result: KokoroWorkerResult) => void };
-let ttsMode: TtsMode = "kokoro";
-let kokoroVoice: KokoroVoice = DEFAULT_KOKORO_VOICE;
-let kokoroWorker: Worker | null = null;
-let kokoroReady = false;
-let kokoroLoading: Promise<boolean> | null = null;
-let kokoroWarmTimer: number | null = null;
-let lastInteractionAt = 0;
-let kokoroRequestId = 0;
-const kokoroPending = new Map<number, KokoroPending>();
+let kittenWorker: Worker | null = null;
+let kittenReady = false;
+let kittenLoading: Promise<boolean> | null = null;
+let kittenRequestId = 0;
+const kittenPending = new Map<number, { resolve: (result: KittenWorkerResult) => void }>();
 
 type Recent = { text: string; until: number };
 let recentUtterances: Recent[] = [];
@@ -81,55 +68,36 @@ export function isEchoOfTts(input: string): boolean {
   return false;
 }
 
-function pickVoice(): SpeechSynthesisVoice | null {
-  if (cachedVoice) return cachedVoice;
-  const voices = window.speechSynthesis?.getVoices?.() ?? [];
-  if (!voices.length) return null;
-  const preferences = [
-    /Google UK English Male/i,
-    /(Daniel|Arthur|George|Ryan).*en[-_]?GB/i,
-    /Microsoft (Ryan|George|Thomas)/i,
-    /en[-_]?GB.*(Male|Natural|Neural)/i,
-    /en[-_]?GB/i,
-    /British/i,
-    /Google US English/i,
-  ];
-  for (const preference of preferences) {
-    const voice = voices.find((candidate) => preference.test(`${candidate.name} ${candidate.lang}`));
-    if (voice) return (cachedVoice = voice);
-  }
-  return (cachedVoice = voices.find((voice) => /^en/i.test(voice.lang)) ?? voices[0] ?? null);
-}
-
-export function prewarmTts() {
-  try {
-    window.speechSynthesis?.getVoices();
-  } catch {
-    /* unsupported browser */
+function setTtsStatus(status: "warming" | "ready" | "generating" | "speaking" | "idle" | "unavailable") {
+  if (typeof document !== "undefined") {
+    document.documentElement.dataset.jarvisTts = status;
+    document.documentElement.dataset.jarvisTtsEngine = "kitten-jasper";
   }
 }
 
-function failKokoroWorker() {
-  kokoroReady = false;
-  kokoroWorker?.terminate();
-  kokoroWorker = null;
-  for (const pending of kokoroPending.values()) pending.resolve({ ok: false });
-  kokoroPending.clear();
+function failKittenWorker() {
+  kittenReady = false;
+  kittenWorker?.terminate();
+  kittenWorker = null;
+  for (const pending of kittenPending.values()) pending.resolve({ ok: false });
+  kittenPending.clear();
+  setTtsStatus("unavailable");
 }
 
-function getKokoroWorker() {
-  if (kokoroWorker) return kokoroWorker;
-  const worker = new Worker(new URL("../workers/kokoro.worker.ts", import.meta.url), {
+function getKittenWorker() {
+  if (kittenWorker) return kittenWorker;
+  const worker = new Worker(new URL("../workers/kitten.worker.ts", import.meta.url), {
     type: "module",
-    name: "jarvis-kokoro",
+    name: "jarvis-kitten-jasper",
   });
-  worker.onmessage = (event: MessageEvent<KokoroWorkerResponse>) => {
+  worker.onmessage = (event: MessageEvent<KittenWorkerResponse>) => {
     const response = event.data;
-    const pending = kokoroPending.get(response.id);
+    const pending = kittenPending.get(response.id);
     if (!pending) return;
-    kokoroPending.delete(response.id);
+    kittenPending.delete(response.id);
     if (response.type === "ready") {
-      kokoroReady = true;
+      kittenReady = true;
+      setTtsStatus("ready");
       pending.resolve({ ok: true });
     } else if (response.type === "audio") {
       pending.resolve({ ok: true, blob: response.blob });
@@ -137,104 +105,45 @@ function getKokoroWorker() {
       pending.resolve({ ok: false });
     }
   };
-  worker.onerror = () => failKokoroWorker();
-  worker.onmessageerror = () => failKokoroWorker();
-  kokoroWorker = worker;
+  worker.onerror = failKittenWorker;
+  worker.onmessageerror = failKittenWorker;
+  kittenWorker = worker;
   return worker;
 }
 
-function askKokoroWorker(request: KokoroWorkerPayload): Promise<KokoroWorkerResult> {
-  const id = ++kokoroRequestId;
+function askKittenWorker(request: KittenWorkerPayload): Promise<KittenWorkerResult> {
+  const id = ++kittenRequestId;
   return new Promise((resolve) => {
-    kokoroPending.set(id, { resolve });
+    kittenPending.set(id, { resolve });
     try {
-      getKokoroWorker().postMessage({ ...request, id } as KokoroWorkerRequest);
+      getKittenWorker().postMessage({ ...request, id } as KittenWorkerRequest);
     } catch {
-      kokoroPending.delete(id);
+      kittenPending.delete(id);
       resolve({ ok: false });
-      failKokoroWorker();
+      failKittenWorker();
     }
   });
 }
 
-// Kokoro runs entirely in this browser, but model loading and inference live in
-// a Web Worker. WASM previously monopolised the UI thread for up to several
-// seconds after every answer, freezing captions, input, and all orb animation.
-// q8 preserves the selected voice/quality without a hosted or paid dependency.
-async function prepareKokoro(): Promise<boolean> {
-  if (typeof window === "undefined" || ttsMode !== "kokoro") return false;
-  if (kokoroReady) return true;
-  if (kokoroLoading) return kokoroLoading;
-  kokoroLoading = askKokoroWorker({ type: "warm" })
+async function prepareKitten(): Promise<boolean> {
+  if (typeof window === "undefined") return false;
+  if (kittenReady) return true;
+  if (kittenLoading) return kittenLoading;
+  setTtsStatus("warming");
+  kittenLoading = askKittenWorker({ type: "warm" })
     .then((result) => result.ok)
     .catch(() => false)
     .finally(() => {
-      kokoroLoading = null;
+      kittenLoading = null;
     });
-  return kokoroLoading;
+  return kittenLoading;
 }
 
-function scheduleKokoroWarm(immediate = false) {
-  if (kokoroReady || ttsMode !== "kokoro") return;
-  if (kokoroWarmTimer) {
-    window.clearTimeout(kokoroWarmTimer);
-    kokoroWarmTimer = null;
-  }
-  // The local neural model is intentionally never initialised in the small
-  // window where a typed message is waiting for its first response. That work
-  // can briefly occupy the browser's main thread on lower-powered devices,
-  // which made JARVIS look frozen even though the text lane was healthy.
-  const startWhenIdle = () => {
-    const run = () => {
-      if (!immediate && Date.now() - lastInteractionAt < 8_000) {
-        scheduleKokoroWarm();
-        return;
-      }
-      void prepareKokoro();
-    };
-    const idle = (window as typeof window & { requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number }).requestIdleCallback;
-    if (idle) idle(run, { timeout: 8_000 });
-    else window.setTimeout(run, 500);
-  };
-  const waitForQuiet = () => {
-    // Initialising the WASM runtime is deliberately deferred until JARVIS has
-    // had a quiet window. On slower machines it can take seconds and was the
-    // source of the visible freeze right after sending a message.
-    if (!immediate && Date.now() - lastInteractionAt < 8_000) {
-      kokoroWarmTimer = window.setTimeout(waitForQuiet, 2_000);
-      return;
-    }
-    kokoroWarmTimer = null;
-    startWhenIdle();
-  };
-  kokoroWarmTimer = window.setTimeout(waitForQuiet, immediate ? 120 : 12_000);
-}
-
-export function setTtsMode(mode: TtsMode, warmNow = false) {
-  ttsMode = mode;
-  if (mode === "kokoro") scheduleKokoroWarm(warmNow);
-}
-
-export function setKokoroVoice(voice: string) {
-  if (KOKORO_VOICES.some((candidate) => candidate.id === voice)) {
-    kokoroVoice = voice as KokoroVoice;
-  }
-}
-
-export async function warm() {
-  if (typeof window === "undefined") return;
-  lastInteractionAt = Date.now();
-  prewarmTts();
-  if (window.speechSynthesis) {
-    window.speechSynthesis.onvoiceschanged = () => {
-      cachedVoice = null;
-      window.speechSynthesis.getVoices();
-    };
-  }
-  // Preserve the natural Kokoro voice, but never make first-message input or
-  // captions compete with its model startup. It warms after the interaction
-  // settles and is retained in browser cache for later replies.
-  if (ttsMode === "kokoro" && !kokoroReady) scheduleKokoroWarm();
+// Model download/initialisation starts on Jarvis mount. It runs in a worker,
+// so delaying it until after a message only created a long silent gap without
+// protecting the UI thread.
+export async function warm(): Promise<void> {
+  await prepareKitten();
 }
 
 export function stopSpeaking() {
@@ -242,20 +151,15 @@ export function stopSpeaking() {
   const abandoned = queue;
   queue = [];
   for (const batch of abandoned) batch.resolve();
-  currentUtterance = null;
   stopAudioPlayback?.();
   stopAudioPlayback = null;
   currentAudio = null;
-  try {
-    window.speechSynthesis?.cancel();
-  } catch {
-    /* unsupported browser */
-  }
+  setTtsStatus(kittenReady ? "ready" : "warming");
   void import("./wakeword").then((module) => module.setSuppressed?.(false)).catch(() => {});
 }
 
 export function isSpeaking() {
-  return draining || Boolean(currentAudio) || Boolean(window.speechSynthesis?.speaking);
+  return draining || Boolean(currentAudio);
 }
 
 export function sentences(text: string): string[] {
@@ -289,24 +193,27 @@ function energyLoop(expectedGeneration: number, onEnergy: (energy: number) => vo
   }, 60);
 }
 
-async function speakKokoroOne(
-  text: string,
+async function generateSegment(text: string, expectedGeneration: number): Promise<Blob | null> {
+  if (expectedGeneration !== generation) return null;
+  setTtsStatus("generating");
+  const result = await askKittenWorker({
+    type: "generate",
+    text,
+    speed: speechSpeed(text),
+  });
+  return result.ok && result.blob ? result.blob : null;
+}
+
+function playSegment(
+  blob: Blob,
   expectedGeneration: number,
   onEnergy: (energy: number) => void,
   onStart?: () => void,
 ): Promise<boolean> {
-  if (!kokoroReady || expectedGeneration !== generation) return false;
-  const result = await askKokoroWorker({
-    type: "generate",
-    text,
-    speed: speechSpeed(text),
-    voice: kokoroVoice,
-  });
-  const blob = result.ok ? result.blob : undefined;
-  if (!blob) return false;
-  if (expectedGeneration !== generation) return true;
+  if (expectedGeneration !== generation) return Promise.resolve(false);
   return new Promise((resolve) => {
-    const audio = new Audio(URL.createObjectURL(blob));
+    const objectUrl = URL.createObjectURL(blob);
+    const audio = new Audio(objectUrl);
     currentAudio = audio;
     let timer: ReturnType<typeof setInterval> | null = null;
     let settled = false;
@@ -316,18 +223,19 @@ async function speakKokoroOne(
       if (timer) clearInterval(timer);
       if (currentAudio === audio) currentAudio = null;
       if (stopAudioPlayback === stop) stopAudioPlayback = null;
-      URL.revokeObjectURL(audio.src);
+      URL.revokeObjectURL(objectUrl);
       audio.removeAttribute("src");
       onEnergy(0);
       resolve(played);
     };
     const stop = () => {
       audio.pause();
-      finish(true);
+      finish(false);
     };
     stopAudioPlayback = stop;
     audio.onplay = () => {
       if (expectedGeneration !== generation) return stop();
+      setTtsStatus("speaking");
       onStart?.();
       timer = energyLoop(expectedGeneration, onEnergy);
     };
@@ -337,93 +245,19 @@ async function speakKokoroOne(
   });
 }
 
-function speakSystemOne(
-  text: string,
-  expectedGeneration: number,
-  onEnergy: (energy: number) => void,
-  onStart?: () => void,
-): Promise<void> {
-  return new Promise((resolve) => {
-    const synth = window.speechSynthesis;
-    if (!synth || expectedGeneration !== generation) return resolve();
-    const utterance = new SpeechSynthesisUtterance(text);
-    currentUtterance = utterance;
-    const voice = pickVoice();
-    if (voice) utterance.voice = voice;
-    utterance.lang = voice?.lang || "en-GB";
-    // Web Speech has no emotion markup, but careful prosody makes the free
-    // on-device voice feel far less flat without shipping text to a provider.
-    const tone = text.toLowerCase();
-    if (/\b(urgent|careful|risk|serious|honestly|numbers|weak plan)\b/.test(tone)) {
-      utterance.rate = 0.99;
-      utterance.pitch = 0.9;
-    } else if (/\b(sorry|rough|tired|stressed|gentle|here with you)\b/.test(tone)) {
-      utterance.rate = 0.97;
-      utterance.pitch = 0.93;
-    } else if (/\b(ha|haha|brilliant|lets go|let's go|excited|love it)\b/.test(tone)) {
-      utterance.rate = 1.1;
-      utterance.pitch = 1.03;
-    } else {
-      utterance.rate = 1.06;
-      utterance.pitch = 0.96;
-    }
-    let energyTimer: ReturnType<typeof setInterval> | null = null;
-    utterance.onstart = () => {
-      onStart?.();
-      energyTimer = energyLoop(expectedGeneration, onEnergy);
-    };
-    const done = () => {
-      if (energyTimer) clearInterval(energyTimer);
-      if (currentUtterance === utterance) currentUtterance = null;
-      onEnergy(0);
-      resolve();
-    };
-    utterance.onend = done;
-    utterance.onerror = done;
-    synth.speak(utterance);
-  });
-}
-
-async function speakOne(
-  text: string,
-  expectedGeneration: number,
-  onEnergy: (energy: number) => void,
-  onStart?: () => void,
-  useKokoro = false,
-): Promise<void> {
-  if (useKokoro) {
-    const played = await speakKokoroOne(text, expectedGeneration, onEnergy, onStart);
-    if (played || expectedGeneration !== generation) return;
-  }
-  await speakSystemOne(text, expectedGeneration, onEnergy, onStart);
-}
-
 export async function speak(
   text: string,
   onEnergy: (energy: number) => void,
   onStart?: () => void,
   onEnd?: () => void,
 ): Promise<void> {
-  if (typeof window === "undefined") {
-    onEnd?.();
-    return;
-  }
-  const useKokoro = ttsMode === "kokoro" && kokoroReady;
-  if (!useKokoro && !window.speechSynthesis) {
+  if (typeof window === "undefined" || !text.trim()) {
     onEnd?.();
     return;
   }
   trackUtterance(text, Math.min(90_000, text.length * 70));
   const done = new Promise<void>((resolve) => {
-    queue.push({
-      generation,
-      text,
-      segments: sentences(text),
-      onEnergy,
-      onStart,
-      onEnd,
-      resolve,
-    });
+    queue.push({ generation, text, segments: sentences(text), onEnergy, onStart, onEnd, resolve });
   });
   void drainSpeechQueue();
   await done;
@@ -436,30 +270,39 @@ async function drainSpeechQueue(): Promise<void> {
     while (queue.length) {
       const batch = queue.shift()!;
       activeBatch = batch;
-      const useKokoro = ttsMode === "kokoro" && kokoroReady;
       const hardWakeGate = /jarvis/i.test(batch.text);
-      void import("./wakeword")
-        .then((module) => module.setSuppressed?.(true, hardWakeGate))
-        .catch(() => {});
+      void import("./wakeword").then((module) => module.setSuppressed?.(true, hardWakeGate)).catch(() => {});
+
+      const ready = await prepareKitten();
       let started = false;
-      for (const segment of batch.segments) {
-        if (batch.generation !== generation) break;
-        await speakOne(
-          segment,
-          batch.generation,
-          batch.onEnergy,
-          started
-            ? undefined
-            : () => {
-                started = true;
-                batch.onStart?.();
-              },
-          useKokoro,
-        );
+      if (ready && batch.generation === generation && batch.segments.length) {
+        // Once segment N is generated, segment N+1 is generated during N's
+        // playback. This keeps one inference in flight and removes the long
+        // dead air that used to appear between sentences.
+        let nextAudio = generateSegment(batch.segments[0], batch.generation);
+        for (let index = 0; index < batch.segments.length; index++) {
+          const blob = await nextAudio;
+          if (!blob || batch.generation !== generation) break;
+          nextAudio = index + 1 < batch.segments.length
+            ? generateSegment(batch.segments[index + 1], batch.generation)
+            : Promise.resolve(null);
+          const played = await playSegment(
+            blob,
+            batch.generation,
+            batch.onEnergy,
+            started ? undefined : () => {
+              started = true;
+              batch.onStart?.();
+            },
+          );
+          if (!played && batch.generation === generation) break;
+        }
       }
+
       if (batch.generation === generation) {
         batch.onEnergy(0);
         batch.onEnd?.();
+        setTtsStatus(kittenReady ? "ready" : "unavailable");
       }
       batch.resolve();
       activeBatch = null;
@@ -472,7 +315,6 @@ async function drainSpeechQueue(): Promise<void> {
         void import("./wakeword").then((module) => module.setSuppressed?.(false)).catch(() => {});
       }
     }, 650);
-    // A stop/new-speech race can enqueue while the previous drain is unwinding.
     if (queue.length) void drainSpeechQueue();
   }
 }

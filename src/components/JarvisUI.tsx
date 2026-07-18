@@ -7,13 +7,13 @@ import { clientMutation } from "@/lib/client-mutation";
 import { primeMicrophone, readJarvisPermissions, type JarvisPermissionState } from "@/lib/permissions";
 import { registerSW, subscribePush } from "@/lib/push";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
-import { createOrbMotionFrame, orbCycleSeconds, type OrbMotionFrame } from "@/lib/orb-motion";
+import { createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
 import { relevantActiveWork } from "@/lib/active-work";
 import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, MarketChartLoading, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
 import CommandDeck from "./CommandDeck";
-import { parseFastChartIntent, type FastChartIntent } from "@/lib/fast-intents";
+import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -31,7 +31,7 @@ const VisualSceneView = dynamic(() => import("./VisualSceneView"), {
 });
 
 type Attachment = { type: string; value: string; title?: string };
-type JarvisPrefs = { voice: string; tts: string; kokoroVoice: string; reduceMotion: boolean; liveDefault: boolean };
+type JarvisPrefs = { reduceMotion: boolean; liveDefault: boolean };
 type Msg = {
   _id: string;
   role: string;
@@ -300,15 +300,6 @@ function OptionsPanel({
       <div className="shrink-0">{children}</div>
     </div>
   );
-  const Seg = ({ opts, val, on }: { opts: [string, string][]; val: string; on: (v: string) => void }) => (
-    <div className="flex overflow-hidden rounded-lg border border-white/10 bg-black/30 text-[11px]">
-      {opts.map(([v, lbl]) => (
-        <button key={v} onClick={() => on(v)} className={`px-2.5 py-1 transition ${val === v ? "bg-cyan/20 text-cyan" : "text-slate hover:text-ice"}`}>
-          {lbl}
-        </button>
-      ))}
-    </div>
-  );
   const permissionText = (value: JarvisPermissionState["microphone"]) =>
     value === "granted" ? "ready" : value === "denied" ? "blocked" : value === "unsupported" ? "unavailable" : "not enabled";
   return (
@@ -323,8 +314,8 @@ function OptionsPanel({
           <Row label="Agent intelligence" hint="subscription used for background work and deep fallback">
             <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 font-mono text-[9px] uppercase tracking-wider text-cyan">Codex · adaptive</span>
           </Row>
-          <Row label="Voice" hint="free turn-taking voice · subscription intelligence">
-            <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 text-[11px] text-cyan">Kokoro + CLI</span>
+          <Row label="Voice" hint="24 MB local neural speech · Codex subscription intelligence">
+            <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 text-[11px] text-cyan">Jasper · free</span>
           </Row>
           <Row
             label="Voice & alerts"
@@ -339,27 +330,9 @@ function OptionsPanel({
               {permissionBusy ? "enabling…" : permissions.microphone === "granted" && permissions.notifications === "granted" ? "ready ✓" : "enable once"}
             </button>
           </Row>
-          <Row
-            label="Speaking voice"
-            hint={prefs.tts === "kokoro" ? "Kokoro AI · local, free · downloads once after you speak" : "instant browser/OS voice · local, free"}
-          >
-            <Seg opts={[["kokoro", "Kokoro AI"], ["system", "System"]]} val={prefs.tts} on={(v) => setPref("tts", v)} />
+          <Row label="Speaking voice" hint="one consistent expressive voice · no robotic fallback">
+            <span className="rounded-lg border border-white/10 bg-black/20 px-2.5 py-1 text-[11px] text-ice">Jasper</span>
           </Row>
-          {prefs.tts === "kokoro" && (
-            <Row label="Kokoro character" hint="George is the calmer, more refined British voice">
-              <select
-                aria-label="Kokoro voice"
-                value={prefs.kokoroVoice}
-                onChange={(event) => setPref("kokoroVoice", event.target.value)}
-                className="rounded-lg border border-white/10 bg-[#101827] px-2.5 py-1 text-[11px] text-ice outline-none ring-cyan/40 focus:ring-1"
-              >
-                <option value="bm_george">George · refined</option>
-                <option value="bf_emma">Emma · natural</option>
-                <option value="af_heart">Heart · warm</option>
-                <option value="bm_fable">Fable · theatrical</option>
-              </select>
-            </Row>
-          )}
           <Row label="Live conversation" hint={live !== "off" ? "on now" : "listen → answer → listen, with no self-echo"}>
             <button onClick={onToggleLive} className={`rounded-lg px-3 py-1 text-[11px] transition ${live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>
               {live === "connecting" ? "…" : live !== "off" ? "stop" : "start"}
@@ -411,17 +384,19 @@ function ReactorRing({
   active,
   aside,
   hidden,
-  color,
-  cycleSeconds,
+  motionRef,
   reduceMotion,
 }: {
   active: boolean;
   aside: boolean;
   hidden: boolean;
-  color?: string;
-  cycleSeconds: number;
+  motionRef: { current: OrbMotionFrame };
   reduceMotion: boolean;
 }) {
+  const ringRef = useRef<SVGGElement>(null);
+  const firstStopRef = useRef<SVGStopElement>(null);
+  const middleStopRef = useRef<SVGStopElement>(null);
+  const lastStopRef = useRef<SVGStopElement>(null);
   const ticks = useMemo(
     () =>
       Array.from({ length: 60 }, (_, i) => {
@@ -432,7 +407,23 @@ function ReactorRing({
     [],
   );
   const opacity = hidden ? 0 : aside ? 0.32 : active ? 0.52 : 0.24;
-  const c = color || "#00ff88";
+  useEffect(() => {
+    const ring = ringRef.current;
+    if (!ring) return;
+    let frame = 0;
+    const paint = () => {
+      const motion = motionRef.current;
+      ring.style.transform = reduceMotion ? "none" : `rotate(${motion.phase}rad)`;
+      firstStopRef.current?.setAttribute("stop-color", motion.color);
+      middleStopRef.current?.setAttribute("stop-color", motion.accent);
+      lastStopRef.current?.setAttribute("stop-color", motion.color);
+      // Reduced motion freezes rotation but still follows the orb's slowly
+      // changing conversation colour.
+      frame = requestAnimationFrame(paint);
+    };
+    paint();
+    return () => cancelAnimationFrame(frame);
+  }, [motionRef, reduceMotion]);
   return (
     <div
       className="pointer-events-none absolute inset-0 grid place-items-center will-change-transform transition-[opacity,transform] duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
@@ -441,16 +432,16 @@ function ReactorRing({
       <svg viewBox="0 0 500 500" className="h-[min(82vmin,760px)] w-[min(82vmin,760px)]">
         <defs>
           <linearGradient id="jarvis-orb-gradient" x1="65" y1="65" x2="435" y2="435" gradientUnits="userSpaceOnUse">
-            <stop offset="0" stopColor={c} />
-            <stop offset="0.48" stopColor="#8affc5" />
-            <stop offset="1" stopColor={c} />
+            <stop ref={firstStopRef} offset="0" stopColor="#00ff88" />
+            <stop ref={middleStopRef} offset="0.48" stopColor="#8affc5" />
+            <stop ref={lastStopRef} offset="1" stopColor="#00ff88" />
           </linearGradient>
         </defs>
         <g
+          ref={ringRef}
           fill="none"
           stroke="url(#jarvis-orb-gradient)"
-          className={reduceMotion ? undefined : "jarvis-reactor-spin"}
-          style={reduceMotion ? undefined : { animationDuration: `${cycleSeconds}s` }}
+          style={{ transformBox: "fill-box", transformOrigin: "center", willChange: reduceMotion ? undefined : "transform" }}
         >
           <circle cx="250" cy="250" r="244" strokeWidth="1" strokeOpacity="0.25" strokeDasharray="40 20" />
           <circle cx="250" cy="250" r="200" strokeWidth="1.5" strokeOpacity="0.18" />
@@ -709,6 +700,26 @@ function WidgetView({ value }: { value: string }) {
   if (w?.kind === "timer") return <TimerWidget w={w} />;
   if (w?.kind === "calendar") return <CalendarView value={value} />;
   if (w?.kind === "chart_loading") return <MarketChartLoading asset={w.asset ?? "Market"} interval={w.interval ?? "1d"} />;
+  if (w?.kind === "net_worth_loading") {
+    return (
+      <div className="flex min-h-0 flex-1 flex-col justify-center p-5">
+        <div className="hud-label mb-3">live wealth ledger</div>
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+          {["net worth", "cashflow /mo", "expenses /mo", "rental /mo"].map((label, index) => (
+            <div key={label} className="glass rounded-xl px-3 py-4 text-center">
+              <div className="mx-auto h-8 w-24 animate-pulse rounded bg-cyan/10" style={{ animationDelay: `${index * 80}ms` }} />
+              <div className="hud-label mt-2">{label}</div>
+            </div>
+          ))}
+        </div>
+        <div className="mt-5 flex h-28 items-end gap-2">
+          {[42, 74, 55, 92, 63, 35].map((height, index) => (
+            <div key={index} className="flex-1 animate-pulse rounded-t bg-gradient-to-t from-cyan/10 to-cyan/35" style={{ height: `${height}%`, animationDelay: `${index * 70}ms` }} />
+          ))}
+        </div>
+      </div>
+    );
+  }
   if (w?.kind === "candles") return <CandlesView w={w} />;
   if (w?.kind === "videos") return <VideoListView value={value} />;
   if (w?.kind === "feed") return <FeedView value={value} />;
@@ -1314,42 +1325,32 @@ export default function JarvisUI() {
   const [bubbles, setBubbles] = useState<{ type: string; value: string; title?: string }[]>([]);
   const prevPanelRef = useRef<{ type: string; value: string; title?: string; updatedAt: number } | null>(null);
 
-  // Options panel + persisted preferences (voice lane, TTS voice, wake, motion)
+  // Speech deliberately has no engine or voice switch: every device uses the
+  // same neural Jarvis identity.
   const [optionsOpen, setOptionsOpen] = useState(false);
   const setMoodMut = (args: Record<string, unknown>) => clientMutation("ui:setMood", args);
-  const [prefs, setPrefs] = useState<JarvisPrefs>({ voice: "free", tts: "kokoro", kokoroVoice: "bm_george", reduceMotion: false, liveDefault: true });
+  const [prefs, setPrefs] = useState<JarvisPrefs>({ reduceMotion: false, liveDefault: true });
   const [permissions, setPermissions] = useState<JarvisPermissionState>({ microphone: "prompt", notifications: "prompt" });
   const [permissionBusy, setPermissionBusy] = useState(false);
   const liveAutoStarted = useRef(false);
   useEffect(() => {
-    // Legacy "fast" meant browser speech. Move it to local Kokoro explicitly:
-    // it is still free and on-device, but much more natural once warmed.
-    const tts = localStorage.getItem("jarvis_tts") === "system" ? "system" : "kokoro";
-    const storedKokoroVoice = localStorage.getItem("jarvis_kokoro_voice");
-    const kokoroVoice = ["bm_george", "bf_emma", "af_heart", "bm_fable"].includes(storedKokoroVoice ?? "")
-      ? storedKokoroVoice!
-      : "bm_george";
-    localStorage.setItem("jarvis_tts", tts);
-    localStorage.setItem("jarvis_kokoro_voice", kokoroVoice);
+    // Settings left by the superseded speech engines made different browsers
+    // silently select different Jarvis voices.
+    localStorage.removeItem("jarvis_voice");
+    localStorage.removeItem("jarvis_tts");
+    localStorage.removeItem("jarvis_kokoro_voice");
     setPrefs({
-      voice: "free",
-      tts,
-      kokoroVoice,
       reduceMotion: localStorage.getItem("jarvis_reduce_motion") === "1",
       liveDefault: localStorage.getItem("jarvis_live_default") !== "0",
     });
-    localStorage.setItem("jarvis_voice", "free");
-    void import("../lib/tts").then((module) => {
-      module.setKokoroVoice(kokoroVoice);
-      module.setTtsMode(tts);
-    });
+    // Begin the model download before Daniel asks anything. It is worker-only
+    // and cannot block the orb, captions or input.
+    void import("../lib/tts").then((module) => module.warm());
   }, []);
   const setPref = (k: keyof JarvisPrefs, v: string | boolean) => {
     setPrefs((p) => ({ ...p, [k]: v }));
-    const key = k === "voice" ? "jarvis_voice" : k === "tts" ? "jarvis_tts" : k === "kokoroVoice" ? "jarvis_kokoro_voice" : k === "reduceMotion" ? "jarvis_reduce_motion" : "jarvis_live_default";
+    const key = k === "reduceMotion" ? "jarvis_reduce_motion" : "jarvis_live_default";
     localStorage.setItem(key, typeof v === "boolean" ? (v ? "1" : "0") : String(v));
-    if (k === "tts") void import("../lib/tts").then((module) => module.setTtsMode(v === "system" ? "system" : "kokoro", true));
-    if (k === "kokoroVoice") void import("../lib/tts").then((module) => module.setKokoroVoice(String(v)));
     if (k === "liveDefault" && v === true) liveAutoStarted.current = false;
   };
   const refreshPermissions = async () => {
@@ -1695,7 +1696,7 @@ export default function JarvisUI() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sayRow]);
 
-  // Speak new finalized assistant messages with local Kokoro TTS.
+  // Speak new finalized assistant messages with the one local neural voice.
   const lastSpokenThread = useRef<string>("");
   useEffect(() => {
     const latestAssistant = [...messages].reverse().find((message) => message.role === "assistant");
@@ -1844,6 +1845,74 @@ export default function JarvisUI() {
     }
   }
 
+  const fastNetWorthRequest = useRef(0);
+  async function openFastNetWorth(intent: FastNetWorthIntent, requestedText: string) {
+    const request = ++fastNetWorthRequest.current;
+    const loading: StagePanel = {
+      type: "widget",
+      title: "Net worth",
+      updatedAt: Date.now(),
+      value: JSON.stringify({ kind: "net_worth_loading" }),
+    };
+    document.documentElement.dataset.jarvisFirstTokenMs = "0";
+    document.documentElement.dataset.jarvisOverlayStartMs = String(performance.now());
+    setSending(true);
+    setPanelMin(false);
+    setInstantPanel(loading);
+    showCaption({ who: "you", text: requestedText });
+    if (chatModeRef.current === "full") setChatMode("bar", false);
+    try {
+      const response = await fetch("/api/tools", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "net_worth", args: {} }),
+      });
+      const body = await response.json().catch(() => null);
+      const result = String(body?.result ?? "");
+      if (!response.ok || !result || /^(Tool failed|Couldn't reach)/i.test(result)) throw new Error("wealth data unavailable");
+      if (request !== fastNetWorthRequest.current) return;
+      // executeTool has already published the real animated stats widget to
+      // Convex. Reveal that canonical panel instead of maintaining a second
+      // client-side copy of financial data.
+      setInstantPanel(null);
+      if (intent.requiresAnalysis) {
+        await queueDurableTurn(requestedText);
+        return;
+      }
+      const detail = result.match(/Net worth dashboard on screen:\s*(.+?)\.\s*One-line/i)?.[1]
+        ?? result.replace(/One-line takeaway only\.?/i, "").trim();
+      const reply = detail ? `Your net worth is ${detail}.` : "Your live net-worth dashboard is open.";
+      updateConversationMood(reply);
+      void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
+      void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant-tool" });
+      showCaption({ who: "jarvis", text: reply, phase: "ready" });
+      if (document.hidden || liveAnywhere() || !(await ensureVoice())) {
+        fadeCaption(reply, 3200);
+        return;
+      }
+      const { speak } = await import("../lib/tts");
+      await speak(
+        reply,
+        (energy) => (energyRef.current = energy),
+        () => {
+          setSpeaking(true);
+          showCaption({ who: "jarvis", text: reply, phase: "speaking" });
+        },
+        () => {
+          setSpeaking(false);
+          fadeCaption(reply, 1800);
+        },
+      );
+    } catch {
+      if (request !== fastNetWorthRequest.current) return;
+      setInstantPanel(null);
+      showCaption({ who: "jarvis", text: "The wealth ledger did not answer. I’m tracing it through the full work lane." });
+      await queueDurableTurn(requestedText);
+    } finally {
+      if (request === fastNetWorthRequest.current) setSending(false);
+    }
+  }
+
   async function submit(text: string) {
     const t = text.trim();
     if (!t) return;
@@ -1869,6 +1938,11 @@ export default function JarvisUI() {
     const fastChart = !liveRef.current ? parseFastChartIntent(t) : null;
     if (fastChart) {
       void openFastChart(fastChart, t);
+      return;
+    }
+    const fastNetWorth = parseFastNetWorthIntent(t);
+    if (fastNetWorth) {
+      void openFastNetWorth(fastNetWorth, t);
       return;
     }
     const instant = instantSocialReply(t);
@@ -1954,7 +2028,6 @@ export default function JarvisUI() {
     ]).finally(() => setPermissionBusy(false));
     await refreshPermissions().catch(() => undefined);
     if (microphone === "granted") {
-      setPref("voice", "free");
       setPref("liveDefault", true);
       liveAutoStarted.current = true;
       if (!liveRef.current && live === "off") void toggleLive(true);
@@ -2060,7 +2133,7 @@ export default function JarvisUI() {
     setSeeing(false);
   }
 
-  // Turn-taking voice: the microphone is physically closed while Kokoro speaks,
+  // Turn-taking voice: the microphone is physically closed while Jarvis speaks,
   // so speaker echo cannot cancel Jarvis mid-sentence or reset the orb.
   const freeLoop = useRef(false);
   const freeBusy = useRef(false);
@@ -2357,8 +2430,7 @@ export default function JarvisUI() {
             active={live === "live" || orbState === "thinking" || orbState === "listening"}
             aside={compactAside}
             hidden={fullBleed}
-            color={moodColor}
-            cycleSeconds={orbCycleSeconds(orbState)}
+            motionRef={orbMotionRef}
             reduceMotion={prefs.reduceMotion}
           />
           <div

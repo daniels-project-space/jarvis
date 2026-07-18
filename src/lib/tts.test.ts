@@ -1,53 +1,75 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { setTtsMode, speak, stopSpeaking } from "./tts";
+import { sentences, speak, stopSpeaking } from "./tts";
 
-class FakeUtterance {
-  voice: unknown = null;
-  lang = "";
-  rate = 1;
-  pitch = 1;
-  onstart: (() => void) | null = null;
-  onend: (() => void) | null = null;
+class FakeWorker {
+  onmessage: ((event: MessageEvent) => void) | null = null;
   onerror: (() => void) | null = null;
+  onmessageerror: (() => void) | null = null;
 
-  constructor(public readonly text: string) {}
+  postMessage(request: { id: number; type: string }) {
+    queueMicrotask(() => {
+      if (request.type === "warm") {
+        this.onmessage?.({ data: { id: request.id, type: "ready" } } as MessageEvent);
+      } else {
+        this.onmessage?.({ data: { id: request.id, type: "audio", blob: new Blob(["audio"]) } } as MessageEvent);
+      }
+    });
+  }
+
+  terminate() {}
 }
 
-describe("speech queue", () => {
+class FakeAudio {
+  static instances: FakeAudio[] = [];
+  onplay: (() => void) | null = null;
+  onended: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  src: string;
+
+  constructor(src: string) {
+    this.src = src;
+    FakeAudio.instances.push(this);
+  }
+
+  async play() {
+    this.onplay?.();
+  }
+
+  pause() {}
+  removeAttribute() {}
+}
+
+describe("single neural speech queue", () => {
   afterEach(() => {
     stopSpeaking();
+    FakeAudio.instances = [];
     vi.unstubAllGlobals();
   });
 
-  it("does not resolve a queued utterance before that utterance has finished", async () => {
-    const utterances: FakeUtterance[] = [];
-    const synth = {
-      speaking: false,
-      getVoices: () => [],
-      speak: (utterance: FakeUtterance) => utterances.push(utterance),
-      cancel: () => {},
-    };
-    vi.stubGlobal("SpeechSynthesisUtterance", FakeUtterance);
-    vi.stubGlobal("window", { speechSynthesis: synth });
-    setTtsMode("system");
+  it("keeps complete sentences for neural generation", () => {
+    expect(sentences("First complete sentence. Second complete sentence."))
+      .toEqual(["First complete sentence.", "Second complete sentence."]);
+  });
 
-    const first = speak("The first complete sentence is playing.", () => {});
-    await vi.waitFor(() => expect(utterances).toHaveLength(1));
+  it("does not resolve a queued reply before its audio has finished", async () => {
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("Worker", FakeWorker);
+    vi.stubGlobal("Audio", FakeAudio);
+
+    const first = speak("The first reply is playing.", () => {});
+    await vi.waitFor(() => expect(FakeAudio.instances).toHaveLength(1));
     let secondFinished = false;
-    const second = speak("The second complete sentence waits its turn.", () => {}).then(() => {
+    const second = speak("The second reply waits its turn.", () => {}).then(() => {
       secondFinished = true;
     });
 
     await Promise.resolve();
     expect(secondFinished).toBe(false);
-    utterances[0].onstart?.();
-    utterances[0].onend?.();
+    FakeAudio.instances[0].onended?.();
     await first;
-    await vi.waitFor(() => expect(utterances).toHaveLength(2));
+    await vi.waitFor(() => expect(FakeAudio.instances).toHaveLength(2));
     expect(secondFinished).toBe(false);
-
-    utterances[1].onstart?.();
-    utterances[1].onend?.();
+    FakeAudio.instances[1].onended?.();
     await second;
     expect(secondFinished).toBe(true);
   });

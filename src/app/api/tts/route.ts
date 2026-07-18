@@ -1,5 +1,5 @@
-// Speech is deliberately generated on-device with Kokoro or the browser's
-// speech engine. Keeping this retired endpoint prevents stale clients from
+// Speech is deliberately generated on-device with KittenTTS. Keeping this
+// retired endpoint prevents stale clients from
 // silently spending hosted-TTS credits while they refresh onto the current bundle.
 export const runtime = "nodejs";
 
