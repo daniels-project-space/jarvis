@@ -143,7 +143,12 @@ export function completeSpeechPrefix(input: string): string {
 // points share the same lifecycle without delaying a message after interaction.
 export async function warm(): Promise<void> {
   setTtsStatus("ready");
-  unlockSpeechPlayback();
+  // Do not call play() here. warm() runs on mount, outside a user gesture.
+  // Safari can leave that rejected promise pending long enough for the real
+  // pointer interaction to hit `unlockInFlight` and be discarded. The result
+  // is a perfectly generated reply whose audio is then blocked. Playback is
+  // primed only by a real pointer/key event, or after microphone capture is
+  // live (which browsers treat as an allowed media session).
   if (typeof window !== "undefined" && !primedAudio.has(COMMON_GREETING)) {
     const audio = makeAudio(COMMON_GREETING);
     reusableAudio.set(audio, COMMON_GREETING);

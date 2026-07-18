@@ -2261,6 +2261,10 @@ export default function JarvisUI() {
         channelCount: 1,
       },
     });
+    // Wake-word/live sessions can begin without a fresh click. Once capture
+    // is active browsers permit media playback, so prime the neural player
+    // here and keep the later response out of the autoplay dead end.
+    unlockSpeechPlayback();
     const context = new AudioContext({ latencyHint: "interactive" });
     const analyser = context.createAnalyser();
     analyser.fftSize = 512;
@@ -2608,6 +2612,7 @@ export default function JarvisUI() {
       stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true },
       });
+      unlockSpeechPlayback();
     } catch {
       alert("JARVIS needs the microphone — allow it in your browser settings.");
       return;

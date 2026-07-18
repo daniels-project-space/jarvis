@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { completeSpeechPrefix, isEchoOfTts, normalizeSpeechText, sentences, speak, speechPauseMs, stopSpeaking, unlockSpeechPlayback } from "./tts";
+import { completeSpeechPrefix, isEchoOfTts, normalizeSpeechText, sentences, speak, speechPauseMs, stopSpeaking, unlockSpeechPlayback, warm } from "./tts";
 
 class FakeAudio {
   static instances: FakeAudio[] = [];
@@ -118,6 +118,15 @@ describe("single neural speech queue", () => {
     FakeAudio.instances[1].onended?.();
     await second;
     expect(secondFinished).toBe(true);
+  });
+
+  it("does not spend an autoplay attempt while warming outside a gesture", async () => {
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("Audio", FakeAudio);
+
+    await warm();
+
+    expect(FakeAudio.instances.every((audio) => audio.playCalls.length === 0)).toBe(true);
   });
 
   it("retries blocked speech on the player primed during user interaction", async () => {
