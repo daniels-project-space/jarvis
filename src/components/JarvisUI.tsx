@@ -230,7 +230,7 @@ function panelSize(panel: { type: string; value: string }): string {
     case "doc":
       return "w-[min(880px,80%)] h-[min(800px,94%)]";
     case "creations":
-      return "w-[96%] md:w-[min(1200px,calc(100%-250px))] h-[min(780px,94%)]";
+      return "w-[96%] md:w-full md:max-w-[1200px] h-[min(780px,94%)]";
     default:
       return "h-full w-full";
   }

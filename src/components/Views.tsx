@@ -1752,7 +1752,7 @@ export function CreationsView({ value }: { value: string }) {
             {groups.map(([name, items]) => (
               <section key={name}>
                 <div className="mb-2 flex items-center gap-2"><span className="hud-label !text-cyan-dim">{name}</span><span className="h-px flex-1 bg-white/5" /></div>
-                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-4">
+                <div className="grid grid-cols-2 gap-2 2xl:grid-cols-3">
                   {items.map((r) => (
                     <div key={r._id} className="card-lift glass group relative flex min-w-0 flex-col overflow-hidden rounded-xl">
                       <button onClick={() => open(r)} className="min-w-0 text-left" title={`Open ${r.title}`}>
