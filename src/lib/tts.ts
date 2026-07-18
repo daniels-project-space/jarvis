@@ -19,6 +19,9 @@ let currentAudio: HTMLAudioElement | null = null;
 let stopAudioPlayback: (() => void) | null = null;
 let queue: SpeechBatch[] = [];
 let activeBatch: SpeechBatch | null = null;
+const COMMON_GREETING = "Right here, sir. What's the first thing we're sorting?";
+const primedAudio = new Map<string, HTMLAudioElement>();
+const reusableAudio = new WeakMap<HTMLAudioElement, string>();
 
 type Recent = { text: string; until: number };
 let recentUtterances: Recent[] = [];
@@ -57,6 +60,11 @@ export function isEchoOfTts(input: string): boolean {
 // points share the same lifecycle without delaying a message after interaction.
 export async function warm(): Promise<void> {
   setTtsStatus("ready");
+  if (typeof window !== "undefined" && !primedAudio.has(COMMON_GREETING)) {
+    const audio = makeAudio(COMMON_GREETING);
+    reusableAudio.set(audio, COMMON_GREETING);
+    primedAudio.set(COMMON_GREETING, audio);
+  }
 }
 
 export function stopSpeaking() {
@@ -108,12 +116,21 @@ function energyLoop(expectedGeneration: number, onEnergy: (energy: number) => vo
   }, 60);
 }
 
-function prepareSegment(text: string): HTMLAudioElement {
+function makeAudio(text: string): HTMLAudioElement {
   const params = new URLSearchParams({ text, speed: String(speechSpeed(text)) });
   const audio = new Audio(`/api/tts?${params.toString()}`);
   audio.preload = "auto";
   audio.load?.();
   return audio;
+}
+
+function prepareSegment(text: string): HTMLAudioElement {
+  const ready = primedAudio.get(text);
+  if (ready) {
+    primedAudio.delete(text);
+    return ready;
+  }
+  return makeAudio(text);
 }
 
 function playSegment(
@@ -133,8 +150,14 @@ function playSegment(
       if (timer) clearInterval(timer);
       if (currentAudio === audio) currentAudio = null;
       if (stopAudioPlayback === stop) stopAudioPlayback = null;
-      audio.removeAttribute("src");
-      audio.load?.();
+      const reusableText = reusableAudio.get(audio);
+      if (reusableText) {
+        try { audio.currentTime = 0; } catch { /* not seekable yet */ }
+        primedAudio.set(reusableText, audio);
+      } else {
+        audio.removeAttribute("src");
+        audio.load?.();
+      }
       onEnergy(0);
       resolve(played);
     };

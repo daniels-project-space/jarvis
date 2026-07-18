@@ -1949,10 +1949,12 @@ export default function JarvisUI() {
       document.documentElement.dataset.jarvisFirstTokenMs = "0";
       showCaption({ who: "you", text: t });
       updateConversationMood(instant);
+      showCaption({ who: "jarvis", text: instant, phase: "ready" });
+      // Persistence is bookkeeping, never part of the live response path.
+      void logTurn({ threadId: threadRef.current, role: "user", text: t })
+        .then(() => logTurn({ threadId: threadRef.current, role: "assistant", text: instant, model: "instant" }))
+        .catch(() => {});
       void (async () => {
-        await logTurn({ threadId: threadRef.current, role: "user", text: t });
-        await logTurn({ threadId: threadRef.current, role: "assistant", text: instant, model: "instant" });
-        showCaption({ who: "jarvis", text: instant, phase: "ready" });
         if (document.hidden || !(await ensureVoice())) {
           fadeCaption(instant, 3200);
           return;
