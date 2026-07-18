@@ -7,7 +7,7 @@ import { clientMutation } from "@/lib/client-mutation";
 import { primeMicrophone, readJarvisPermissions, type JarvisPermissionState } from "@/lib/permissions";
 import { registerSW, subscribePush } from "@/lib/push";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
-import { createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
+import { counterRotateOrbRing, createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
 import { relevantActiveWork } from "@/lib/active-work";
 import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
@@ -420,7 +420,7 @@ function ReactorRing({
     let frame = 0;
     const paint = () => {
       const motion = motionRef.current;
-      ring.style.transform = reduceMotion ? "none" : `rotate(${motion.phase}rad)`;
+      ring.style.transform = reduceMotion ? "none" : `rotate(${counterRotateOrbRing(motion.phase)}rad)`;
       firstStopRef.current?.setAttribute("stop-color", motion.color);
       middleStopRef.current?.setAttribute("stop-color", motion.accent);
       lastStopRef.current?.setAttribute("stop-color", motion.color);

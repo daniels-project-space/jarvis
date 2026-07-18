@@ -1,11 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { advanceOrbPhase, createOrbMotionFrame, frameDamping, orbCycleSeconds } from "./orb-motion";
+import { advanceOrbPhase, counterRotateOrbRing, createOrbMotionFrame, frameDamping, orbCycleSeconds } from "./orb-motion";
 
 describe("shared orb motion", () => {
-  it("accelerates for active states while keeping one cycle for orb and ring", () => {
+  it("accelerates for active states while keeping the ring phase synchronized", () => {
     expect(orbCycleSeconds("thinking")).toBeLessThan(orbCycleSeconds("listening"));
     expect(orbCycleSeconds("listening")).toBeLessThan(orbCycleSeconds("idle"));
     expect(createOrbMotionFrame().cycleSeconds).toBe(orbCycleSeconds("idle"));
+  });
+
+  it("counter-rotates the ring at a complementary, slower rate", () => {
+    const corePhase = Math.PI * 2;
+    const ringPhase = counterRotateOrbRing(corePhase);
+
+    expect(ringPhase).toBeLessThan(0);
+    expect(Math.abs(ringPhase)).toBeCloseTo(corePhase * 0.72);
   });
 
   it("uses frame-rate-independent damping", () => {

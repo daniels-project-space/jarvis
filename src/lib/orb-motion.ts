@@ -17,6 +17,12 @@ const CYCLES: Record<OrbState, number> = {
   speaking: 16,
 };
 
+// The reactor ring is deliberately a little slower than the particle core and
+// travels in the opposite direction. Keeping this derived from the cumulative
+// shared phase means state changes remain continuous (including while an
+// overlay eases the orb aside) instead of restarting a separate animation.
+const RING_COUNTER_ROTATION = -0.72;
+
 export function orbCycleSeconds(state: OrbState): number {
   return CYCLES[state];
 }
@@ -38,6 +44,10 @@ export function createOrbMotionFrame(color = "#00ff88"): OrbMotionFrame {
 // wrapping made those axes snap backwards once per cycle.
 export function advanceOrbPhase(phase: number, cycleSeconds: number, deltaSeconds: number): number {
   return phase + (Math.PI * 2 * Math.max(0, deltaSeconds)) / Math.max(1, cycleSeconds);
+}
+
+export function counterRotateOrbRing(orbPhase: number): number {
+  return orbPhase * RING_COUNTER_ROTATION;
 }
 
 export function frameDamping(responsePerSecond: number, deltaSeconds: number): number {
