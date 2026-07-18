@@ -68,7 +68,7 @@ export const sessionState = query({
   },
 });
 
-// Fast-lane turn: the /api/chat route (Groq reflex brain) handles the turn
+// Fast-lane turn: the subscription Codex foreground worker handles the turn
 // itself, so the user row is inserted already-done (the cron dispatcher only
 // claims "pending" rows) and a streaming assistant row is opened for it.
 export const openTurn = mutation({
@@ -214,7 +214,6 @@ async function claimPending(ctx: { db: any }, pending: any) {
       threadId: pending.threadId,
       userText: pending.text,
       assistantId,
-      claudeSessionId: session?.claudeSessionId ?? null,
       history,
     };
 }
@@ -322,7 +321,6 @@ export const finalize = mutation({
     threadId: v.string(),
     status: v.union(v.literal("done"), v.literal("error")),
     finalText: v.optional(v.string()),
-    claudeSessionId: v.optional(v.string()),
     model: v.optional(v.string()),
     authTokenHash: v.optional(v.string()),
     workerToken: v.optional(v.string()),
@@ -350,7 +348,6 @@ export const finalize = mutation({
         .take(32);
       const stillWorking = otherTurns.some((row: any) => row._id !== a.messageId && row.status === "streaming");
       const sp: Record<string, unknown> = { status: stillWorking ? "working" : "idle", lastActiveAt: Date.now() };
-      if (a.claudeSessionId) sp.claudeSessionId = a.claudeSessionId;
       await ctx.db.patch(s._id, sp);
     }
   },

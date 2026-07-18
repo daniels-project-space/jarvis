@@ -20,6 +20,7 @@ let stopAudioPlayback: (() => void) | null = null;
 let queue: SpeechBatch[] = [];
 let activeBatch: SpeechBatch | null = null;
 const COMMON_GREETING = "Right here, sir. What's the first thing we're sorting?";
+const ECHO_GUARD_TAIL_MS = 20_000;
 const primedAudio = new Map<string, HTMLAudioElement>();
 const reusableAudio = new WeakMap<HTMLAudioElement, string>();
 
@@ -39,7 +40,9 @@ function setTtsStatus(status: "ready" | "buffering" | "speaking" | "idle" | "una
 function trackUtterance(text: string, durationMs: number) {
   const now = Date.now();
   recentUtterances = recentUtterances.filter((row) => row.until > now);
-  recentUtterances.push({ text, until: now + durationMs + 5_000 });
+  // Keep the fingerprint beyond playback, a full microphone window, and STT
+  // turnaround so short Jarvis replies cannot return as delayed user turns.
+  recentUtterances.push({ text, until: now + durationMs + ECHO_GUARD_TAIL_MS });
 }
 
 export function isEchoOfTts(input: string): boolean {
@@ -83,12 +86,52 @@ export function isSpeaking() {
   return draining || Boolean(currentAudio);
 }
 
+// Models write for the eye even when the answer is destined for speech. Neural
+// voices handle ordinary punctuation well, but raw markdown, URLs and long dash
+// glyphs produce literal or oddly clipped delivery. Keep compound hyphens and
+// ISO dates intact while turning visual separators into spoken phrasing.
+export function normalizeSpeechText(input: string): string {
+  let text = input.normalize("NFKC").replace(/\r\n?/g, "\n");
+  text = text
+    .replace(/\[([^\]]+)]\((?:https?:\/\/)[^)]+\)/gi, "$1")
+    .replace(/https?:\/\/\S+/gi, "the link")
+    .replace(/^\s*#{1,6}\s+/gm, "")
+    .replace(/^\s*(?:[-*•▪◦]|\d+[.)])\s+/gm, "")
+    .replace(/[`*]+/g, "")
+    .replace(/_/g, " ")
+    .replace(/\n+/g, ". ");
+
+  // A typographic range should sound like a range. Other em/en dashes are
+  // conversational beats, so a comma gives Ryan a pause without saying “dash”.
+  text = text
+    .replace(/(\d)\s*[–—]\s*(\d)/g, "$1 to $2")
+    .replace(/\s*[–—]\s*/g, ", ")
+    .replace(/\s+--?\s+/g, ", ")
+    .replace(/--+/g, ", ")
+    .replace(/(?:\.{3,}|…+)(?=\s*(?:$|[”"']))/g, ".")
+    .replace(/(?:\.{3,}|…+)/g, ", ")
+    .replace(/\s+\/\s+/g, " or ")
+    .replace(/\s*&\s*/g, " and ")
+    .replace(/([!?])\1+/g, "$1")
+    .replace(/\s+([,.;:!?])/g, "$1")
+    .replace(/,\s*([.!?])/g, "$1")
+    .replace(/(?:\.\s*){2,}/g, ". ")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+
+  if (!text) return "";
+  if (/[,:;]\s*$/.test(text)) text = text.replace(/[,:;]\s*$/, ".");
+  else if (!/[.!?][”"')\]]?$/.test(text)) text += ".";
+  return text;
+}
+
 export function sentences(text: string): string[] {
+  const speech = normalizeSpeechText(text);
   const result: string[] = [];
   let buffer = "";
   // Clause boundaries keep time-to-first-audio low while preserving natural
   // phrasing. The next clause begins buffering during current playback.
-  for (const part of text.split(/(?<=[.!?;:])\s+|(?<=,)\s+(?=\S)/)) {
+  for (const part of speech.split(/(?<=[.!?;:])\s+|(?<=,)\s+(?=\S)/)) {
     buffer = buffer ? `${buffer} ${part}` : part;
     if (buffer.length >= 24) {
       result.push(buffer);
@@ -97,6 +140,15 @@ export function sentences(text: string): string[] {
   }
   if (buffer.trim()) result.push(buffer);
   return result;
+}
+
+export function speechPauseMs(text: string): number {
+  const ending = text.trim();
+  if (/[?!][”"')\]]?$/.test(ending)) return 170;
+  if (/\.[”"')\]]?$/.test(ending)) return 140;
+  if (/[;:][”"')\]]?$/.test(ending)) return 85;
+  if (/,[”"')\]]?$/.test(ending)) return 45;
+  return 0;
 }
 
 function speechSpeed(text: string): number {
@@ -186,13 +238,14 @@ export async function speak(
   onStart?: () => void,
   onEnd?: () => void,
 ): Promise<void> {
-  if (typeof window === "undefined" || !text.trim()) {
+  const speech = normalizeSpeechText(text);
+  if (typeof window === "undefined" || !speech) {
     onEnd?.();
     return;
   }
-  trackUtterance(text, Math.min(90_000, text.length * 70));
+  trackUtterance(speech, Math.min(90_000, speech.length * 70));
   const done = new Promise<void>((resolve) => {
-    queue.push({ generation, text, segments: sentences(text), onEnergy, onStart, onEnd, resolve });
+    queue.push({ generation, text: speech, segments: sentences(speech), onEnergy, onStart, onEnd, resolve });
   });
   void drainSpeechQueue();
   await done;
@@ -222,6 +275,10 @@ async function drainSpeechQueue(): Promise<void> {
           },
         );
         if (!played && batch.generation === generation) break;
+        const pause = speechPauseMs(batch.segments[index]);
+        if (played && pause > 0 && batch.generation === generation) {
+          await new Promise<void>((resolve) => setTimeout(resolve, pause));
+        }
       }
       if (batch.generation === generation) {
         batch.onEnergy(0);

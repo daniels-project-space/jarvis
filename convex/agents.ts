@@ -10,7 +10,7 @@ const TEAM = [
     description: "Owns the conversation, chooses the right specialist, reviews outcomes, and keeps Daniel's attention queue small.",
     capabilities: ["planning", "delegation", "attention-triage", "review", "conversation"],
     projectScopes: ["*"],
-    defaultModel: "opus",
+    defaultModel: "sol",
     autonomy: "supervised",
   },
   {
@@ -20,7 +20,7 @@ const TEAM = [
     description: "Builds, debugs, tests, and reviews software across Daniel's project estate using isolated branches.",
     capabilities: ["engineering", "architecture", "debugging", "testing", "deployment-review"],
     projectScopes: ["*"],
-    defaultModel: "opus",
+    defaultModel: "sol",
     autonomy: "branch-only",
   },
   {
@@ -30,7 +30,7 @@ const TEAM = [
     description: "Researches primary sources, compares options, challenges assumptions, and turns ambiguity into decisions.",
     capabilities: ["research", "strategy", "analysis", "brainstorming", "fact-checking"],
     projectScopes: ["*"],
-    defaultModel: "sonnet",
+    defaultModel: "terra",
     autonomy: "read-only",
   },
   {
@@ -40,7 +40,7 @@ const TEAM = [
     description: "Turns ideas into visual systems, illustrations, storyboards, diagrams, and polished creative briefs.",
     capabilities: ["illustration", "design", "storyboarding", "diagramming", "creative-direction"],
     projectScopes: ["media-engine", "music-house", "youtube-studio-ai", "*"],
-    defaultModel: "sonnet",
+    defaultModel: "terra",
     autonomy: "draft-only",
   },
   {
@@ -50,7 +50,7 @@ const TEAM = [
     description: "Builds progressive, visual trip plans while keeping booking and calendar commitments explicitly gated.",
     capabilities: ["travel", "flights", "stays", "itineraries", "maps"],
     projectScopes: ["jarvis"],
-    defaultModel: "sonnet",
+    defaultModel: "terra",
     autonomy: "draft-only",
   },
   {
@@ -60,7 +60,7 @@ const TEAM = [
     description: "Monitors projects and agent runs, verifies evidence, retries recoverable failures, and escalates real blockers.",
     capabilities: ["operations", "monitoring", "verification", "incident-response", "cost-awareness"],
     projectScopes: ["*"],
-    defaultModel: "sonnet",
+    defaultModel: "terra",
     autonomy: "safe-auto-fix",
   },
 ] as const;
@@ -125,6 +125,8 @@ export const list = query({
           ...profile,
           status: executing ? "working" : blocked ? "blocked" : "available",
           currentJobId: executing ? String(executing._id) : blocked ? String(blocked._id) : undefined,
+          activeJobIds: owned.map((job) => String(job._id)),
+          activeJobCount: owned.length,
         };
       })
       .sort((a: any, b: any) => (a.slug === "jarvis" ? -1 : b.slug === "jarvis" ? 1 : a.name.localeCompare(b.name)));

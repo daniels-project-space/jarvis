@@ -10,33 +10,34 @@ import {
 describe("subscription model policy", () => {
   it("maps increasing work tiers to the live Luna, Terra and Sol catalogue", () => {
     expect(CODEX_MODEL_POLICY).toEqual({
-      haiku: { model: "gpt-5.6-luna", effort: "low" },
-      sonnet: { model: "gpt-5.6-terra", effort: "medium" },
-      opus: { model: "gpt-5.6-sol", effort: "max" },
+      luna: { model: "gpt-5.6-luna", effort: "low" },
+      terra: { model: "gpt-5.6-terra", effort: "medium" },
+      sol: { model: "gpt-5.6-sol", effort: "max" },
     });
   });
 
   it("routes conversation difficulty without spending frontier intelligence on reflexes", () => {
-    expect(pickConversationTier("hello Jarvis")).toBe("haiku");
-    expect(pickConversationTier("Show me the weather in London")).toBe("haiku");
-    expect(pickConversationTier("Brainstorm a sharper product strategy for Jarvis and compare the trade-offs")).toBe("sonnet");
-    expect(pickConversationTier("Trace the root cause of this multi-repo production outage from first principles")).toBe("opus");
+    expect(pickConversationTier("hello Jarvis")).toBe("luna");
+    expect(pickConversationTier("Show me the weather in London")).toBe("luna");
+    expect(pickConversationTier("Brainstorm a sharper product strategy for Jarvis and compare the trade-offs")).toBe("terra");
+    expect(pickConversationTier("Trace the root cause of this multi-repo production outage from first principles")).toBe("sol");
   });
 
   it("falls back unknown tiers to balanced work instead of the highest-cost tier", () => {
-    expect(codexModelFor("unknown")).toBe(CODEX_MODEL_POLICY.sonnet);
+    expect(codexModelFor("unknown")).toBe(CODEX_MODEL_POLICY.terra);
   });
 
   it("never sends the unsupported plain gpt-5.6 model to a ChatGPT account", () => {
-    for (const tier of ["haiku", "sonnet", "opus", "unknown"]) {
+    for (const tier of ["luna", "terra", "sol", "unknown"]) {
       const args = codexExecPrefix(tier);
       expect(args).not.toContain("gpt-5.6");
+      expect(args[0]).toBe("--search");
       expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
     }
   });
 
   it("uses the lean subscription runtime only for foreground conversation", () => {
-    for (const tier of ["haiku", "sonnet", "opus", "unknown"]) {
+    for (const tier of ["luna", "terra", "sol", "unknown"]) {
       const args = codexConversationExecPrefix(tier);
       expect(args).toContain(codexModelFor(tier).model);
       expect(args).toContain("--ignore-user-config");

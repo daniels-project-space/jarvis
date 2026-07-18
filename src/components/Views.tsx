@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
+import { workModelLabel } from "@/lib/work-models";
 
 // The richer panel views: frosted-glass calendar, live mind-map canvas,
 // app launcher, PDF viewer, creations library.
@@ -1031,7 +1032,7 @@ export function FleetView({ value }: { value: string }) {
                   <div className="mt-0.5 truncate font-mono text-[10px] text-cyan/80">› {j.progress}</div>
                 )}
               </div>
-              {j.model && <span className="hud-label shrink-0 !text-[9px]">{j.model}</span>}
+              {j.model && <span className="hud-label shrink-0 !text-[9px]">{workModelLabel(j.model)}</span>}
               <span className="hud-label shrink-0 !text-[9px]">{j.status}</span>
             </div>
           ))}

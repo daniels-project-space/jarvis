@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
+import { normalizeWorkModelTier } from "../src/lib/work-models";
 
 const SYNTHESIS_LEASE_MS = 20 * 60 * 1000;
 
@@ -100,7 +101,7 @@ export const active = query({
           percent: j.percent ?? 0,
           agentId: j.agentId ?? null,
           attempt: j.attempt ?? 1,
-          model: j.model ?? null,
+          model: j.model ? normalizeWorkModelTier(j.model) : null,
         })),
       });
     }

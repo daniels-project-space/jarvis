@@ -5,6 +5,7 @@ import { r2Put, r2StoreFromUrl } from "./r2";
 import type { ManagedMission } from "../mastra/supervisor";
 import { withAdminSession } from "./control-context";
 import { wakeAgentHarness } from "./agent-harness-dispatch";
+import { workModelLabel, workModelPriority } from "./work-models";
 import {
   VISUAL_BLOCK_KINDS,
   VISUAL_CAPABILITIES,
@@ -13,21 +14,22 @@ import {
   type VisualScene,
 } from "./visual-scene";
 
-// JARVIS's tool belt — one portable JSON-schema definition list executed
-// server-side by /api/chat (Groq loop) and /api/tools (realtime client bridge).
+// JARVIS's tool belt — one portable JSON-schema definition list executed by
+// the foreground Codex supervisor and the realtime client bridge.
 
 export const TOOL_DEFS = [
   {
     name: "dispatch_agent",
     description:
-      "Delegate durable work to JARVIS's permanent team. The manager chooses Paul (development), Atlas (research/strategy), Iris (creative), Maya (travel), or Sentry (reliability), selects the required intelligence, binds it to this conversation, and returns immediately. Work can checkpoint and continue for hours or days. Consequential external actions wait for Daniel's approval; code changes use isolated branches. Do not delegate quick lookups.",
+      "Delegate durable work to JARVIS's permanent team. The same specialist can own multiple concurrent jobs, so dispatch a follow-up without pausing earlier work and link it with parent_job_id when known. The manager chooses Paul (development), Atlas (research/strategy), Iris (creative), Maya (travel), or Sentry (reliability), selects Luna/Terra/Sol intelligence, binds it to this conversation, and returns immediately. Work can checkpoint and continue for hours or days. Consequential external actions wait for Daniel's approval; code changes use isolated branches. Do not delegate quick lookups.",
     parameters: {
       type: "object",
       properties: {
         task: { type: "string", description: "Clear, self-contained task including all context the agent needs (URLs, video IDs, what to find out)" },
         repo: { type: "string", description: "owner/repo or short name if the task is about a specific repo, else omit" },
-        model: { type: "string", enum: ["haiku", "sonnet", "opus"], description: "sonnet for research/summaries/normal code (DEFAULT — fast), opus ONLY for hard multi-file engineering, haiku for trivial lookups" },
+        model: { type: "string", enum: ["luna", "terra", "sol"], description: "Terra for research/summaries/normal code (default), Sol for hard multi-file engineering or consequential reasoning, Luna for bounded lookups" },
         agent_id: { type: "string", enum: ["paul", "atlas", "iris", "maya", "sentry"], description: "Optional permanent specialist; omit to let JARVIS route it" },
+        parent_job_id: { type: "string", description: "Optional earlier job this follow-up extends. The follow-up starts independently and does not wait for the parent." },
         readonly: { type: "boolean", description: "Force a read-only run" },
         acceptance_criteria: { type: "array", items: { type: "string" }, description: "What must be demonstrably true before this is complete" },
         mcp: { type: "array", items: { type: "string", enum: ["playwright", "context7"] }, description: "Optional MCP servers: playwright for live browser automation, context7 for library docs" },
@@ -55,7 +57,7 @@ export const TOOL_DEFS = [
               label: { type: "string", description: "3-5 word fleet-view label" },
               task: { type: "string", description: "fully self-contained task incl. all context (agents start blank)" },
               repo: { type: "string", description: "owner/repo if it works on code" },
-              model: { type: "string", enum: ["haiku", "sonnet", "opus"] },
+              model: { type: "string", enum: ["luna", "terra", "sol"] },
               agent_id: { type: "string", enum: ["paul", "atlas", "iris", "maya", "sentry"] },
               readonly: { type: "boolean" },
               acceptance_criteria: { type: "array", items: { type: "string" } },
@@ -1539,14 +1541,13 @@ async function cryptoSparks(): Promise<Record<string, number[]>> {
 
 async function briefingWidget(): Promise<string> {
   const today = new Date().toISOString().slice(0, 10);
-  const [w, strip, todos, events, wealth, markets, mem, sparks] = await Promise.all([
+  const [w, strip, todos, events, wealth, markets, sparks] = await Promise.all([
     fetchWeatherData("London").catch(() => null),
     rentalQuery("calendar:getCalendarStrip", { accountSlug: null, startDate: today, days: 1 }),
     q_hub("todos:list"),
     q_hub("events:list"),
     q_hub("wealth:getWealth"),
     fetchMarketData(["bitcoin", "ethereum"], ["GC=F"]).catch(() => []),
-    convexQuery("memory:recent", { limit: 8 }).catch(() => []),
     cryptoSparks(),
   ]);
   const short = (x: string) => String(x || "").split(/[|,]/)[0].split(/\s+/).slice(0, 4).join(" ");
@@ -1556,34 +1557,20 @@ async function briefingWidget(): Promise<string> {
   for (const pck of day0?.pickups ?? []) rentalMarks.push({ time: pck.pickupTime || "12:00", kind: "pickup", name: short(pck.items?.[0]?.name ?? pck.imageAlt ?? "item") });
   for (const r of day0?.returns ?? []) rentalMarks.push({ time: r.returnTime || "18:00", kind: "return", name: short(r.items?.[0]?.name ?? r.imageAlt ?? "item") });
   const open = (Array.isArray(todos) ? todos : []).filter((t: any) => !t.done);
-  // DAY-RELEVANT todo pick: fast model pass with his context (memory + time)
-  let picked: { text: string; why: string }[] = [];
-  try {
-    const gk = process.env.GROQ_API_KEY ?? (await getSecret("groq", "GROQ_API_KEY").catch(() => ""));
-    const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${gk}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        // 8b-instant is ~3x faster than 70b and plenty for this simple pick —
-        // it's the biggest single latency chunk in the briefing.
-        model: "llama-3.1-8b-instant",
-        temperature: 0,
-        max_tokens: 400,
-        response_format: { type: "json_object" },
-        messages: [{ role: "user", content:
-          `It is ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London", weekday: "long", hour: "2-digit", minute: "2-digit" })} in London where Daniel is. ` +
-          `His fixed commitments today: ${rentalMarks.map((m) => m.kind + " " + m.name + " " + m.time).join("; ") || "none"}. ` +
-          `Recent context about him: ${(Array.isArray(mem) ? mem : []).map((x: any) => x.title).join("; ").slice(0, 500)}. ` +
-          `From his open to-dos below, pick the 4-6 genuinely DOABLE TODAY given the time left and his context; for each give a 5-word why. ` +
-          `STRICT JSON {"picks":[{"text":"<exact todo text>","why":"..."}]}.
-TODOS: ${open.slice(0, 20).map((t: any) => JSON.stringify(String(t.text).slice(0, 90))).join(", ")}` }],
-      }),
-      signal: AbortSignal.timeout(7_000),
-    });
-    const pj: any = await resp.json();
-    picked = (JSON.parse(pj.choices?.[0]?.message?.content ?? "{}").picks ?? []).slice(0, 6);
-  } catch { /* fall back below */ }
-  if (!picked.length) picked = open.slice(0, 5).map((t: any) => ({ text: String(t.text).slice(0, 90), why: "" }));
+  // Keep the briefing instant and deterministic. The foreground Codex worker
+  // supplies any judgement in its spoken summary; this data helper never calls
+  // a second model or spends a separate inference credit.
+  const picked: { text: string; why: string }[] = open
+    .slice()
+    .sort((left: any, right: any) =>
+      Number(right.priority ?? 0) - Number(left.priority ?? 0) ||
+      Number(left.dueAt ?? Number.MAX_SAFE_INTEGER) - Number(right.dueAt ?? Number.MAX_SAFE_INTEGER),
+    )
+    .slice(0, 6)
+    .map((todo: any) => ({
+      text: String(todo.text).slice(0, 90),
+      why: todo.dueAt ? "due soon" : todo.priority ? "high priority" : "open next action",
+    }));
   const now = Date.now();
   const upcoming = (Array.isArray(events) ? events : []).filter((e: any) => (e.start ?? 0) >= now).sort((a: any, b: any) => a.start - b.start).slice(0, 4);
   const widget = {
@@ -1864,58 +1851,14 @@ async function researchTool(args: any): Promise<string> {
   );
 }
 
-// Fast, FREE reasoning pass on Groq's gpt-oss-120b. This is a genuine reasoning
-// model (reasoning_effort knob) but on Groq's near-instant inference: ~3-10s vs
-// the 30-75s OpenAI Responses calls that made JARVIS "think forever". Returns ""
-// on any failure so the subscription supervisor can reason from raw data.
-// NOTE effort: "high" makes gpt-oss burn the ENTIRE max_tokens budget on hidden
-// reasoning and return EMPTY content (finish_reason "length") — verified. "medium"
-// returns a full rich answer in ~4s. Keep this at medium unless you also raise
-// max_tokens well above the expected reasoning cost.
-async function groqReason(system: string, input: string, effort: "low" | "medium" | "high" = "medium", maxTokens = 2400): Promise<string> {
-  const gk = process.env.GROQ_API_KEY ?? (await getSecret("groq", "GROQ_API_KEY").catch(() => ""));
-  if (!gk) return "";
-  try {
-    const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${gk}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "openai/gpt-oss-120b",
-        reasoning_effort: effort,
-        temperature: 0.4,
-        max_tokens: maxTokens,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: input },
-        ],
-      }),
-      signal: AbortSignal.timeout(28_000),
-    });
-    if (!r.ok) return "";
-    const j: any = await r.json();
-    return String(j.choices?.[0]?.message?.content ?? "").trim();
-  } catch {
-    return "";
-  }
-}
-
-// The foreground Codex subscription is already the reasoning core. This
-// optional fast cross-check never falls through to a metered OpenAI API.
 async function deliberateTool(args: any): Promise<string> {
   const question = String(args.question ?? "").trim();
   if (!question) return "What's the decision?";
-  const system =
-    `You are the deep-reasoning core of JARVIS, advising Daniel (a solo builder/designer who ships fast and values taste).\n` +
-    `Think hard about the problem, weigh the real trade-offs, then give:\n` +
-    `1) A clear recommendation (one line).\n2) The 2-4 decisive reasons.\n3) What would change your mind.\n` +
-    `Be concrete and opinionated; no fence-sitting.`;
-  const input = `PROBLEM: ${question}\n\nCONTEXT:\n${String(args.context ?? "").slice(0, 3000)}`;
-  const text = await groqReason(system, input, "medium", 3000);
-  if (text) {
-    await showResultsPanel(`deliberation · ${question.slice(0, 36)}`, `## ${question}\n\n${text}`);
-    return `CONSIDERED ANALYSIS (deliver the recommendation as your own view, in your voice, short — full version is on his screen):\n${text.slice(0, 4000)}`;
-  }
-  return "The reasoning pass failed — answer from your own judgement and say it wasn't double-checked.";
+  return (
+    `DELIBERATE WITH YOUR CURRENT CODEX SUBSCRIPTION MODEL — do not call another model. ` +
+    `Give one clear recommendation, the 2-4 decisive reasons, and what would change your mind. ` +
+    `Be concrete and opinionated; no fence-sitting.\n\nPROBLEM: ${question}\n\nCONTEXT:\n${String(args.context ?? "").slice(0, 3000)}`
+  );
 }
 
 // Z-Image Turbo via Novita — generated art is re-homed to R2 (provider URLs
@@ -2641,7 +2584,7 @@ async function priceChartTool(args: any): Promise<string> {
 }
 
 async function marketAnalysisTool(args: any): Promise<string> {
-  const { resolveAsset, fetchCandles, keyLevels, chartWidget, fetchVix, fetchCryptoFlows, fetchNews, sma, rsi, ANALYST_SYSTEM } =
+  const { resolveAsset, fetchCandles, keyLevels, chartWidget, fetchVix, fetchCryptoFlows, fetchNews, sma, rsi } =
     await import("./markets");
   const a = resolveAsset(String(args.asset ?? ""));
   if (!a) return `Couldn't resolve "${args.asset}" to an asset.`;
@@ -2676,34 +2619,11 @@ async function marketAnalysisTool(args: any): Promise<string> {
     `\nNEWS:\n${news}\n` +
     (args.question ? `\nDANIEL'S QUESTION: ${String(args.question)}\n` : "");
 
-  if (args._subscription_reasoner === true) {
-    const w = chartWidget(a, interval, daily, levels, []);
-    await convexMutation("ui:setPanel", { type: "widget", value: JSON.stringify(w), title: `${a.label} · analysis` });
-    return (
-      `MARKET DOSSIER — the annotated chart is on screen. Analyse this yourself using Wyckoff structure, trend, volume, momentum, catalysts and invalidation. Give a clear bullish/bearish/neutral verdict, key level, invalidation and what changes the view; this is analysis, never an execution instruction.\n\n` +
-      dossier.slice(0, 11_000)
-    );
-  }
-
-  // Optional fast/free cross-check only. The foreground Codex subscription is
-  // the deep reasoning path; this function never falls through to OpenAI API.
-  const analysis = await groqReason(ANALYST_SYSTEM, dossier, "medium", 5000);
-  if (!analysis.trim())
-    return `The analysis pass failed — show the chart with price_chart and reason from the summary instead.`;
-
-  // annotated chart on the big screen + the full write-up as a tappable card
-  const verdictLine = (analysis.match(/## Verdict[\s\S]*?\n([^\n#].{20,240})/i)?.[1] ?? "").trim();
-  const w = chartWidget(a, interval, daily, levels, [verdictLine].filter(Boolean));
+  const w = chartWidget(a, interval, daily, levels, []);
   await convexMutation("ui:setPanel", { type: "widget", value: JSON.stringify(w), title: `${a.label} · analysis` });
-  await convexMutation("chatQueue:postCard", {
-    threadId: await activeThread(),
-    type: "markdown",
-    value: `# ${a.label} — full analysis (${interval})\n\n${analysis}`.slice(0, 3900),
-    title: `analysis · ${a.label}`,
-  }).catch(() => {});
   return (
-    `FULL ANALYSIS (annotated chart is on screen; complete write-up posted as a card — deliver the verdict as your own read, short and direct):\n` +
-    analysis.slice(0, 4500)
+    `MARKET DOSSIER — the chart is on screen. Analyse this yourself with the current Codex subscription model using Wyckoff structure, trend, volume, momentum, catalysts and invalidation. Give a clear bullish/bearish/neutral verdict, key level, invalidation and what changes the view; this is analysis, never an execution instruction.\n\n` +
+    dossier.slice(0, 11_000)
   );
 }
 
@@ -2922,12 +2842,13 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         approvalRequired: route.approvalRequired,
         acceptanceCriteria: criteria,
         modelReason: route.reason,
+        parentJobId: args.parent_job_id ? String(args.parent_job_id) : undefined,
         label: `${TEAM_BY_SLUG[agentId].name} · ${task.slice(0, 58)}`,
       });
       if (!route.approvalRequired) await wakeAgentHarness(`job:${String(jobId)}`).catch(() => false);
       return route.approvalRequired
         ? `${TEAM_BY_SLUG[agentId].name} has a scoped plan ready as job ${jobId}, but it includes a consequential external action. I put it in Needs you and will not execute it until Daniel approves.`
-        : `${TEAM_BY_SLUG[agentId].name} owns job ${jobId}. It is bound to this conversation, visible live in the command deck, and will checkpoint rather than disappear if it needs multiple runs.`;
+        : `${TEAM_BY_SLUG[agentId].name} owns job ${jobId}${args.parent_job_id ? ` as a concurrent follow-up to ${String(args.parent_job_id)}` : ""}. It is bound to this conversation, visible live in the command deck, and can run beside that specialist's other jobs on its own lease and checkout.`;
     }
     case "orchestrate": {
       const mission = String(args.mission ?? "").trim();
@@ -2967,7 +2888,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         agentCount: plan.workstreams.length,
         originThreadId,
         managerAgentId: "jarvis",
-        priority: Math.max(...plan.workstreams.map((stream) => (stream.model === "opus" ? 80 : stream.model === "sonnet" ? 60 : 45))),
+        priority: Math.max(...plan.workstreams.map((stream) => workModelPriority(stream.model))),
         risk: missionRisk,
         acceptanceCriteria: Array.isArray(args.acceptance_criteria) ? args.acceptance_criteria.map(String).slice(0, 8) : undefined,
       });
@@ -2986,10 +2907,10 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           visibility: "conversation",
           agentId: a.agentId,
           risk: a.risk,
-          priority: a.model === "opus" ? 80 : a.model === "sonnet" ? 60 : 45,
+          priority: workModelPriority(a.model),
           approvalRequired: a.approvalRequired,
           acceptanceCriteria: a.acceptanceCriteria,
-          modelReason: `${a.agentId} owns this Mastra-managed workstream; ${a.model} is the planned execution tier`,
+          modelReason: `${a.agentId} owns this Mastra-managed workstream; ${workModelLabel(a.model)} is the planned Codex execution tier`,
         });
       }
       if (plan.workstreams.some((stream) => !stream.approvalRequired)) {
@@ -2997,7 +2918,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       }
       await convexMutation("ui:setPanel", { type: "fleet", value: JSON.stringify({ missionId: String(missionId) }), title: `mission · ${mission.slice(0, 44)}` }).catch(() => {});
       const waiting = plan.workstreams.filter((stream) => stream.approvalRequired).length;
-      return `JARVIS planned mission ${missionId} with ${plan.workstreams.length} permanent specialists: ${plan.workstreams.map((stream) => `${stream.label} [${stream.model}]`).join(", ")}. ${waiting ? `${waiting} consequential workstream${waiting === 1 ? " is" : "s are"} waiting in Needs you; ` : ""}live stages and checkpoints are on screen, and one reviewed synthesis returns to this conversation.`;
+      return `JARVIS planned mission ${missionId} with ${plan.workstreams.length} permanent specialists: ${plan.workstreams.map((stream) => `${stream.label} [${workModelLabel(stream.model)}]`).join(", ")}. ${waiting ? `${waiting} consequential workstream${waiting === 1 ? " is" : "s are"} waiting in Needs you; ` : ""}live stages and checkpoints are on screen, and one reviewed synthesis returns to this conversation.`;
     }
     case "work_control": {
       const jobId = String(args.job_id ?? "");
@@ -3037,7 +2958,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           {
             label: "Atlas · directions",
             agent_id: "atlas",
-            model: "sonnet",
+            model: "terra",
             readonly: true,
             template: "research_report",
             task: `Develop 3 genuinely distinct creative directions for this brief: ${brief}. For each, give the core idea, audience logic, reference territory, risks, and what would make it visually unmistakable. Recommend one without flattening the alternatives.`,
@@ -3046,7 +2967,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           {
             label: "Iris · visual system",
             agent_id: "iris",
-            model: "sonnet",
+            model: "terra",
             readonly: true,
             task: `Turn this brief into a production-ready ${output} system: ${brief}. Specify composition, visual hierarchy, palette, typography or mark-making, scene/shot structure where relevant, and final image-generation or drawing prompts. Include an editable construction plan, not only adjectives.`,
             acceptance_criteria: ["Production-ready visual specification", "Editable construction steps and exact generation/drawing prompts"],
@@ -3390,7 +3311,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           `3) Minimal correct fix. 4) VALIDATE: 'npm install' + 'npx tsc --noEmit' must pass; 'npm run build' must pass for app code. ` +
           `5) Commit only working code ("self-repair: ..."). If it needs convex/ or src/trigger/ redeploy, commit and say so plainly.`,
         repo: app ?? "jarvis",
-        model: "opus",
+        model: "sol",
         incidentId: String(incidentId),
         originThreadId: await activeThread(),
         visibility: "conversation",
@@ -3403,7 +3324,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           "Run relevant typecheck/tests/build",
           "Verify the actual user-visible or provider surface",
         ],
-        modelReason: "Paul + opus: production repair requires deep engineering and verification",
+        modelReason: "Paul + Sol: production repair requires deep Codex engineering and verification",
         label: `Paul · repair ${problem.slice(0, 48)}`,
       });
       await wakeAgentHarness(`repair:${String(incidentId)}`).catch(() => false);
@@ -3416,14 +3337,14 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         authTokenHash,
         task: `${SELF_IMPROVE_RULES}\n\nThe upgrade Daniel wants: ${request}`,
         repo: "jarvis",
-        model: "opus",
+        model: "sol",
         originThreadId: await activeThread(),
         visibility: "conversation",
         agentId: "paul",
         risk: "high",
         priority: 80,
         acceptanceCriteria: ["Connected implementation, not placeholder UI", "Typecheck/tests/build pass", "Production remains gated until verified"],
-        modelReason: "Paul + opus: JARVIS self-modification is complex engineering",
+        modelReason: "Paul + Sol: JARVIS self-modification is complex Codex engineering",
         label: `Paul · upgrade ${request.slice(0, 46)}`,
       });
       await wakeAgentHarness("self-improve").catch(() => false);

@@ -1,10 +1,31 @@
 import { createRequire } from "node:module";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { delimiter, dirname, join } from "node:path";
 
 export type AgentProvider = "codex";
 
 const nodeRequire = createRequire(import.meta.url);
+
+export const REQUIRED_AGENT_TOOLS = ["curl", "git", "node", "npm", "npx", "gh"] as const;
+
+export function missingSubscriptionTools(
+  env: Readonly<Record<string, string | undefined>>,
+  tools: readonly string[] = REQUIRED_AGENT_TOOLS,
+): string[] {
+  const directories = String(env.PATH ?? "")
+    .split(delimiter)
+    .filter(Boolean);
+  return tools.filter((tool) =>
+    !directories.some((directory) => {
+      try {
+        accessSync(join(directory, tool), constants.X_OK);
+        return true;
+      } catch {
+        return false;
+      }
+    }),
+  );
+}
 
 export function resolveSubscriptionAgentBin(provider: AgentProvider): string | null {
   if (provider !== "codex") return null;
@@ -49,6 +70,19 @@ function scopedSubscriptionEnv(
     "SSL_CERT_DIR",
     "TERM",
     "CI",
+    "SHELL",
+    "USER",
+    "LOGNAME",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "NPM_CONFIG_REGISTRY",
+    "npm_config_registry",
     "CODEX_ACCESS_TOKEN",
     "JARVIS_AGENT_PROVIDER",
   ];
@@ -59,7 +93,10 @@ function scopedSubscriptionEnv(
   }
   const env = {} as NodeJS.ProcessEnv;
   for (const key of allow) if (source[key] !== undefined) env[key] = source[key];
+  env.PATH = source.PATH?.trim() || "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
   env.JARVIS_AGENT_PROVIDER = provider;
+  env.GIT_TERMINAL_PROMPT = "0";
+  env.GH_PROMPT_DISABLED = "1";
   // Never let a subscription-backed subprocess silently switch to metered API
   // billing, and never pass unrelated application/provider secrets to it.
   env.ANTHROPIC_API_KEY = "";

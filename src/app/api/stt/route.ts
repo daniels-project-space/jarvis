@@ -1,6 +1,7 @@
 import type { NextRequest } from "next/server";
 import { getSecret } from "@/lib/vault";
 import { STT_PROMPT } from "@/lib/sttvocab";
+import { cleanSpeechTranscript } from "@/lib/transcript";
 
 // Speech-to-text utility only: free/fast Groq Whisper. Conversation intelligence
 // remains exclusively in the authenticated Codex subscription CLI worker.
@@ -59,6 +60,7 @@ export async function POST(req: NextRequest) {
       10000,
     );
   if (text === null) return new Response(JSON.stringify({ error: "stt unavailable" }), { status: 502 });
+  text = cleanSpeechTranscript(text);
 
   // Foreign-script junk on noise never reaches the brain (an English speaker's
   // real words are overwhelmingly Latin).

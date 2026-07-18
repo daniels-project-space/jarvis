@@ -11,9 +11,13 @@ import { createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
 import { relevantActiveWork } from "@/lib/active-work";
 import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
+import { isPanelFollowUp } from "@/lib/panel-relevance";
+import { nextVoiceLoopAction, type VoiceCaptureOutcome } from "@/lib/voice-loop";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, CandlesView, MarketChartLoading, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView } from "./Views";
 import CommandDeck from "./CommandDeck";
 import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
+import { parseTerminalOutput, type TerminalTone } from "@/lib/terminal-output";
+import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -241,15 +245,17 @@ function Clock() {
 
 function ModelBadge({ model }: { model?: string | null }) {
   if (!model) return null;
+  const tier = parseWorkModelTier(model);
   const c =
-    model === "opus"
+    tier === "sol"
       ? "text-purple-300"
-      : model === "haiku"
+      : tier === "luna"
         ? "text-slate"
         : model === "live"
           ? "text-cyan"
           : "text-sky-300";
-  return <span className={`hud-label !text-[9px] ${c}`}>{model}</span>;
+  const label = tier ? `Codex · ${workModelLabel(tier)}` : model;
+  return <span className={`hud-label !text-[9px] ${c}`}>{label}</span>;
 }
 
 // Ambient arc-reactor HUD ring — concentric SVG rings (a segmented outer ring,
@@ -462,31 +468,89 @@ function ReactorRing({
 
 // The agent's actual CLI session, streamed: tool calls and thoughts scroll in
 // live (auto-follows unless Daniel scrolled up to read something).
+const TERMINAL_TONE: Record<TerminalTone, string> = {
+  neutral: "text-slate-200/90",
+  muted: "text-slate-500",
+  command: "text-sky-300",
+  info: "text-blue-300",
+  accent: "text-violet-300",
+  value: "text-amber-300",
+  success: "text-emerald-300",
+  warning: "text-amber-300",
+  error: "text-rose-300",
+};
+
 function LiveSessionLog({ job }: { job: Job }) {
   const ref = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
+  const [following, setFollowing] = useState(true);
+  const lines = useMemo(
+    () => parseTerminalOutput(job.log, job.progress || "starting up…"),
+    [job.log, job.progress],
+  );
+  const followTail = () => {
+    pinned.current = true;
+    setFollowing(true);
+    const el = ref.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  };
   useEffect(() => {
     const el = ref.current;
     if (el && pinned.current) el.scrollTop = el.scrollHeight;
-  }, [job.log, job.progress]);
+  }, [lines]);
   return (
     <div
       ref={ref}
       onScroll={() => {
         const el = ref.current;
-        if (el) pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+        if (!el) return;
+        const next = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+        pinned.current = next;
+        setFollowing(next);
       }}
-      className="scrollbar-thin mt-4 flex-1 overflow-auto rounded-xl bg-black/40 p-3 font-mono text-xs leading-relaxed text-cyan/90"
+      role="log"
+      aria-label={`${job.agentId ?? "agent"} live work terminal`}
+      aria-live="off"
+      className="scrollbar-thin mt-4 flex-1 overflow-auto rounded-xl border border-white/[0.08] bg-[#05070a]/95 font-mono text-[11px] leading-[1.65] shadow-[inset_0_1px_0_rgba(255,255,255,0.035),0_18px_60px_rgba(0,0,0,0.3)]"
     >
-      {job.log ? (
-        <pre className="whitespace-pre-wrap break-words">{job.log}</pre>
-      ) : (
-        <>
-          <span className="mr-1 opacity-60">›</span>
-          {job.progress || "starting up…"}
-        </>
-      )}
-      {job.status === "running" && <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-cyan/70 align-middle" />}
+      <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-white/[0.07] bg-[#080b10]/95 px-3 py-2 backdrop-blur-xl">
+        <span className="flex gap-1.5" aria-hidden="true">
+          <span className="h-2 w-2 rounded-full bg-rose-400/75" />
+          <span className="h-2 w-2 rounded-full bg-amber-300/75" />
+          <span className="h-2 w-2 rounded-full bg-sky-300/75" />
+        </span>
+        <span className="min-w-0 flex-1 truncate text-[9px] uppercase tracking-[0.16em] text-slate-400">
+          agent://{job.agentId ?? "worker"}/{job.stage ?? job.status}
+        </span>
+        <button
+          type="button"
+          onClick={followTail}
+          className={`rounded px-1.5 py-0.5 text-[8px] uppercase tracking-[0.14em] transition ${following ? "text-cyan/70" : "bg-amber-300/10 text-amber-300 hover:bg-amber-300/15"}`}
+          title={following ? "Following live output" : "Resume following live output"}
+        >
+          {following ? "● follow" : "resume ↓"}
+        </button>
+      </div>
+      <ol className="min-w-full py-2" aria-label="Agent output">
+        {lines.map((line) => (
+          <li key={line.id} className="group grid min-h-[1.65em] grid-cols-[2.75rem_minmax(0,1fr)] px-3 hover:bg-white/[0.025]">
+            <span aria-hidden="true" className="select-none pr-3 text-right text-slate-700 group-hover:text-slate-600">
+              {String(line.number).padStart(2, "0")}
+            </span>
+            <span className="whitespace-pre-wrap break-words">
+              {line.spans.map((span, index) => (
+                <span key={`${line.id}:${index}`} className={TERMINAL_TONE[span.tone]}>{span.text}</span>
+              ))}
+            </span>
+          </li>
+        ))}
+        {job.status === "running" && (
+          <li className="grid min-h-[1.65em] grid-cols-[2.75rem_minmax(0,1fr)] px-3" aria-label="Agent is still working">
+            <span aria-hidden="true" className="pr-3 text-right text-slate-700">{String(lines.length + 1).padStart(2, "0")}</span>
+            <span aria-hidden="true" className="text-slate-500">› <span className="ml-1 inline-block h-3 w-1.5 animate-pulse bg-slate-300/70 align-middle" /></span>
+          </li>
+        )}
+      </ol>
     </div>
   );
 }
@@ -1040,19 +1104,6 @@ function VideoDock({
       </div>
     </div>
   );
-}
-
-// Is this new message a FOLLOW-UP about what's already on screen (so the overlay
-// should stay), or a genuine topic switch (so it should step aside)? Errs toward
-// keeping the overlay — the brain replaces or hides it if the topic really moved.
-function isFollowUp(msg: string, p: { title?: string }): boolean {
-  const m = ` ${msg.toLowerCase()} `;
-  if (/\b(number|no\.?|#|box|option|item|pic|picture|photo)\s*(one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\b/.test(m)) return true;
-  if (/\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|top|bottom|next|previous)\b/.test(m)) return true;
-  if (/\b(that|this|these|those|it|its|they|them|their|there|him|his|her|hers|he|she)\b/.test(m)) return true;
-  if (/\b(more|expand|tell me|who (is|are|was)|what about|whats?|why|how come|and the|bio|details?|explain|zoom|go on|about the?)\b/.test(m)) return true;
-  const words = String(p.title ?? "").toLowerCase().split(/\W+/).filter((w) => w.length > 3);
-  return words.some((w) => m.includes(w));
 }
 
 // The spoken caption. Short text just shows; a long reply that overflows the
@@ -1768,8 +1819,9 @@ export default function JarvisUI() {
           fadeCaption(spokenText, 1800); // remain readable, then leave without a flash
         },
       );
-      // free-voice conversation: keep the loop going until Daniel goes quiet
-      if (freeLoop.current) setTimeout(() => void freeVoiceTurn(), 220);
+      // In persistent live mode, silence opens another listening window rather
+      // than releasing the live lease. Wake-word sessions remain one-shot.
+      if (freeLoop.current) scheduleFreeVoiceTurn(220);
     })();
   }, [messages]);
 
@@ -1825,8 +1877,9 @@ export default function JarvisUI() {
       void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
       void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant" });
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
-      if (document.hidden || liveAnywhere() || !(await ensureVoice())) {
+      if (document.hidden || (liveAnywhere() && !liveRef.current) || !(await ensureVoice())) {
         fadeCaption(reply, 3200);
+        if (freeLoop.current) scheduleFreeVoiceTurn(220);
         return;
       }
       const { speak } = await import("../lib/tts");
@@ -1842,6 +1895,7 @@ export default function JarvisUI() {
           fadeCaption(reply, 1800);
         },
       );
+      if (freeLoop.current) scheduleFreeVoiceTurn(220);
     } catch {
       if (request !== fastChartRequest.current) return;
       setInstantPanel(null);
@@ -1893,8 +1947,9 @@ export default function JarvisUI() {
       void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
       void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant-tool" });
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
-      if (document.hidden || liveAnywhere() || !(await ensureVoice())) {
+      if (document.hidden || (liveAnywhere() && !liveRef.current) || !(await ensureVoice())) {
         fadeCaption(reply, 3200);
+        if (freeLoop.current) scheduleFreeVoiceTurn(220);
         return;
       }
       const { speak } = await import("../lib/tts");
@@ -1910,6 +1965,7 @@ export default function JarvisUI() {
           fadeCaption(reply, 1800);
         },
       );
+      if (freeLoop.current) scheduleFreeVoiceTurn(220);
     } catch {
       if (request !== fastNetWorthRequest.current) return;
       setInstantPanel(null);
@@ -1936,12 +1992,20 @@ export default function JarvisUI() {
       void m.warm();
     });
     setInput("");
-    // a playing video shrinks to picture-in-picture (keeps playing). Other
-    // overlays step aside ONLY on a genuine topic switch — a follow-up about
-    // what's on screen ("more on number 3", "who's the second") keeps it up so
-    // the brain can highlight/extend it (relevance awareness).
+    // A playing video shrinks to picture-in-picture (keeps playing). A genuine
+    // follow-up keeps the current visual; a topic switch clears it immediately
+    // instead of leaving a stale chart/widget behind while the next turn runs.
     if (panel?.type === "video") setVideoPip(true);
-    else if (panel && !panelFull && !isFollowUp(t, panel)) setPanelMin(true);
+    else if (panel && !isPanelFollowUp(t, panel)) {
+      closedPanelRef.current = {
+        key: `${panel.title ?? ""}|${panel.value.slice(0, 160)}`,
+        ts: Date.now(),
+      };
+      setInstantPanel(null);
+      setPanelFull(false);
+      setPanelMin(true); // hide locally during the authenticated clear round-trip
+      void clearPanel({});
+    }
     const fastChart = !liveRef.current ? parseFastChartIntent(t) : null;
     if (fastChart) {
       void openFastChart(fastChart, t);
@@ -1963,23 +2027,27 @@ export default function JarvisUI() {
         .then(() => logTurn({ threadId: threadRef.current, role: "assistant", text: instant, model: "instant" }))
         .catch(() => {});
       void (async () => {
-        if (document.hidden || !(await ensureVoice())) {
-          fadeCaption(instant, 3200);
-          return;
+        try {
+          if (document.hidden || !(await ensureVoice())) {
+            fadeCaption(instant, 3200);
+            return;
+          }
+          const { speak } = await import("../lib/tts");
+          await speak(
+            instant,
+            (energy) => (energyRef.current = energy),
+            () => {
+              setSpeaking(true);
+              showCaption({ who: "jarvis", text: instant, phase: "speaking" });
+            },
+            () => {
+              setSpeaking(false);
+              fadeCaption(instant, 1800);
+            },
+          );
+        } finally {
+          if (freeLoop.current) scheduleFreeVoiceTurn(220);
         }
-        const { speak } = await import("../lib/tts");
-        await speak(
-          instant,
-          (energy) => (energyRef.current = energy),
-          () => {
-            setSpeaking(true);
-            showCaption({ who: "jarvis", text: instant, phase: "speaking" });
-          },
-          () => {
-            setSpeaking(false);
-            fadeCaption(instant, 1800);
-          },
-        );
       })();
       return;
     }
@@ -1992,16 +2060,43 @@ export default function JarvisUI() {
   }
 
   const liveBeat = useRef<ReturnType<typeof setInterval> | null>(null);
+  const freeLoop = useRef(false);
+  const freeBusy = useRef(false);
+  const freeRearmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function cancelFreeRearm() {
+    if (freeRearmTimer.current) clearTimeout(freeRearmTimer.current);
+    freeRearmTimer.current = null;
+  }
+  function scheduleFreeVoiceTurn(delayMs = 300) {
+    cancelFreeRearm();
+    freeRearmTimer.current = setTimeout(() => {
+      freeRearmTimer.current = null;
+      if (freeLoop.current) void freeVoiceTurn();
+    }, delayMs);
+  }
   function releaseLive() {
+    cancelFreeRearm();
     if (liveBeat.current) clearInterval(liveBeat.current);
     liveBeat.current = null;
     captionRef.current = null;
     void setLiveOn({ client: me.current, on: false }).catch(() => {});
   }
 
+  function endFreeVoiceSession() {
+    freeLoop.current = false;
+    cancelFreeRearm();
+    if (liveRef.current) {
+      liveRef.current = false;
+      setLive("off");
+      releaseLive();
+    }
+    rearmWake();
+  }
+
   async function toggleLive(forceStart = false) {
     if (!forceStart && (liveRef.current || live !== "off")) {
       freeLoop.current = false;
+      cancelFreeRearm();
       if (recRef.current?.state === "recording") recRef.current.stop();
       liveRef.current = false;
       setLive("off");
@@ -2025,6 +2120,8 @@ export default function JarvisUI() {
     liveBeat.current = setInterval(() => void setLiveOn({ client: me.current, on: true }).catch(() => {}), 20_000);
     void freeVoiceTurn();
   }
+
+  useEffect(() => () => cancelFreeRearm(), []);
 
   async function enableDevicePermissions() {
     if (permissionBusy) return;
@@ -2144,12 +2241,11 @@ export default function JarvisUI() {
 
   // Turn-taking voice: the microphone is physically closed while Jarvis speaks,
   // so speaker echo cannot cancel Jarvis mid-sentence or reset the orb.
-  const freeLoop = useRef(false);
-  const freeBusy = useRef(false);
   const voiceMode = () => "free";
   async function freeVoiceTurn() {
-    if (freeBusy.current) return;
+    if (freeBusy.current || !freeLoop.current) return;
     freeBusy.current = true;
+    let outcome: VoiceCaptureOutcome = "failure";
     try {
       import("../lib/tts").then((m) => m.stopSpeaking());
       void ownVoice();
@@ -2195,28 +2291,39 @@ export default function JarvisUI() {
       energyRef.current = 0;
       const blob = new Blob(chunks, { type: mime });
       if (!spoke || blob.size < 2000) {
-        freeLoop.current = false; // silence — back to wake-word standby
+        outcome = "silence";
         return;
       }
       const r = await fetch("/api/stt", { method: "POST", headers: { "content-type": mime }, body: blob });
       const { text } = await r.json();
       const { isEchoOfTts } = await import("../lib/tts");
-      if (!text?.trim() || isEchoOfTts(text)) {
-        freeLoop.current = false;
+      const cleanedText = text?.trim() ?? "";
+      if (!cleanedText) {
+        outcome = "empty";
         return;
       }
-      void submit(text.trim()); // the reply speaks via the normal effect; the loop re-arms after it
+      if (isEchoOfTts(cleanedText)) {
+        outcome = "echo";
+        return;
+      }
+      if (cleanedText === lastSent.current.text && Date.now() - lastSent.current.ts < 2500) {
+        outcome = "empty";
+        return;
+      }
+      outcome = "speech";
+      void submit(cleanedText); // the reply speaks via the normal effect; the loop re-arms after it
     } catch {
       setRecording(false);
-      freeLoop.current = false;
+      outcome = "failure";
     } finally {
       freeBusy.current = false;
-      if (!freeLoop.current && liveRef.current) {
-        liveRef.current = false;
-        setLive("off");
-        releaseLive();
-        rearmWake();
-      }
+      const action = nextVoiceLoopAction({
+        outcome,
+        persistentLive: liveRef.current,
+        loopRequested: freeLoop.current,
+      });
+      if (action === "listen") scheduleFreeVoiceTurn(350);
+      else if (action === "stop") endFreeVoiceSession();
     }
   }
 

@@ -1,3 +1,5 @@
+import { normalizeWorkModelTier } from "./work-models";
+
 const CHECKPOINT_LIMIT = 6000;
 
 function clean(value: string | null | undefined): string {
@@ -19,7 +21,7 @@ export function segmentTimeoutMs(modelTier: string): number {
   // Deep engineering and audit passes routinely need more than fifteen
   // minutes to inspect, test and form a verdict. They still checkpoint well
   // inside Trigger's one-hour task ceiling; lighter work stays responsive.
-  return modelTier === "opus" ? 25 * 60_000 : 15 * 60_000;
+  return normalizeWorkModelTier(modelTier) === "sol" ? 25 * 60_000 : 15 * 60_000;
 }
 
 export function buildContinuationCheckpoint(input: {

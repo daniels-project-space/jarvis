@@ -52,8 +52,8 @@ export const get = query({
   },
 });
 
-// Card intelligence cache: /api/distill screens each finding once (worth
-// showing at all?) and stores the short bullet breakdown.
+// Deterministic card cache: /api/distill screens each already-reviewed Codex
+// finding once and stores the short bullet breakdown without another model.
 export const distill = mutation({
   args: { id: v.id("findings"), bullets: v.array(v.string()), important: v.boolean(), ...actorAuthArgs },
   handler: async (ctx, a) => {

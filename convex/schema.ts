@@ -28,13 +28,13 @@ export default defineSchema({
 
   // Queue transport for the subscription brain: UI writes a pending user row;
   // the Trigger dispatcher claims it, opens a streaming assistant row, streams
-  // Claude Code deltas in, finalizes. UI subscribes reactively.
+  // Codex subscription deltas in, and finalizes. UI subscribes reactively.
   chatMessages: defineTable({
     threadId: v.string(),
     role: v.string(), // "user" | "assistant"
     text: v.string(),
     status: v.string(), // "pending" | "streaming" | "done" | "error"
-    model: v.optional(v.string()), // which tier answered (haiku|sonnet|opus|flash|live)
+    model: v.optional(v.string()), // Codex model/tier that answered (Luna|Terra|Sol|live)
     // Persistent media card: everything JARVIS shows also lands in the stream
     // so Daniel can always get back to it later.
     attachment: v.optional(
@@ -48,6 +48,8 @@ export default defineSchema({
   chatSessions: defineTable({
     threadId: v.string(),
     status: v.string(), // "idle" | "working"
+    // Storage-only compatibility for sessions written before the Codex cutover.
+    // Active workers no longer read or write this value.
     claudeSessionId: v.optional(v.string()),
     lastActiveAt: v.number(),
   }).index("by_thread", ["threadId"]),
@@ -166,7 +168,7 @@ export default defineSchema({
     status: v.string(), // pending | running | done | error
     result: v.optional(v.string()),
     readonly: v.optional(v.boolean()), // if true, runner never commits/pushes
-    model: v.optional(v.string()), // optional model override (haiku|sonnet|opus)
+    model: v.optional(v.string()), // optional Codex tier override (luna|terra|sol)
     mcp: v.optional(v.array(v.string())), // MCP servers to attach (playwright, context7)
     incidentId: v.optional(v.string()), // set on self-repair jobs → resolves the incident on success
     retried: v.optional(v.boolean()), // failed once already — no second retry

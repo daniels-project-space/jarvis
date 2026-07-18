@@ -3,6 +3,7 @@ import { v } from "convex/values";
 import { workApprovalPolicy } from "./workPolicy";
 import { requireAdmin, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
+import { normalizeWorkModelTier } from "../src/lib/work-models";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
 
@@ -47,6 +48,7 @@ export const enqueue = mutation({
     const id = await ctx.db.insert("jobs", {
       ...input,
       task: input.task.slice(0, 6000),
+      model: input.model ? normalizeWorkModelTier(input.model) : undefined,
       label: input.label?.slice(0, 80),
       priority: Math.max(0, Math.min(100, input.priority ?? 50)),
       status,
@@ -135,24 +137,12 @@ export const claimNext = mutation({
       percent: Math.max(2, j.percent ?? 0),
       createdAt: now,
     });
-    if (j.agentId) {
-      const agent = await ctx.db
-        .query("agentProfiles")
-        .withIndex("by_slug", (q: any) => q.eq("slug", j.agentId))
-        .first();
-      if (agent)
-        await ctx.db.patch(agent._id, {
-          status: "working",
-          currentJobId: String(j._id),
-          updatedAt: now,
-        });
-    }
     return {
       jobId: j._id,
       task: j.task,
       repo: j.repo ?? null,
       readonly: j.readonly ?? false,
-      model: j.model ?? null,
+      model: j.model ? normalizeWorkModelTier(j.model) : null,
       mcp: j.mcp ?? [],
       incidentId: j.incidentId ?? null,
       retried: j.retried ?? false,
@@ -169,6 +159,7 @@ export const claimNext = mutation({
       branch: j.branch ?? null,
       acceptanceCriteria: j.acceptanceCriteria ?? [],
       modelReason: j.modelReason ?? null,
+      parentJobId: j.parentJobId ?? null,
     };
   },
 });
@@ -249,8 +240,6 @@ export const finalize = mutation({
           completedJobs: agent.completedJobs + (success ? 1 : 0),
           failedJobs: agent.failedJobs + (success ? 0 : 1),
           averageDurationMs,
-          status: "available",
-          currentJobId: undefined,
           updatedAt: now,
         });
       }
@@ -276,11 +265,15 @@ export const list = query({
   args: { limit: v.optional(v.number()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    return await ctx.db
+    const rows = await ctx.db
       .query("jobs")
       .withIndex("by_createdAt")
       .order("desc")
       .take(Math.min(a.limit ?? 20, 100));
+    return rows.map((row: any) => ({
+      ...row,
+      model: row.model ? normalizeWorkModelTier(row.model) : undefined,
+    }));
   },
 });
 
@@ -514,13 +507,6 @@ export const requestInput = mutation({
       checkpoint: a.checkpoint?.slice(0, 6000) ?? row.checkpoint,
       heartbeatAt: now,
     });
-    if (row.agentId) {
-      const agent = await ctx.db
-        .query("agentProfiles")
-        .withIndex("by_slug", (q: any) => q.eq("slug", row.agentId))
-        .first();
-      if (agent) await ctx.db.patch(agent._id, { status: "blocked", currentJobId: String(a.jobId), updatedAt: now });
-    }
     const fingerprint = `job-input:${a.jobId}`;
     const existing = await ctx.db
       .query("attentionItems")
@@ -713,7 +699,7 @@ export const active = query({
         label: j.label ?? null,
         missionId: j.missionId ?? null,
         repo: j.repo ?? null,
-        model: j.model ?? null,
+        model: j.model ? normalizeWorkModelTier(j.model) : null,
         modelReason: j.modelReason ?? null,
         agentId: j.agentId ?? null,
         risk: j.risk ?? "low",
@@ -729,6 +715,7 @@ export const active = query({
         branch: j.branch ?? null,
         pullRequestUrl: j.pullRequestUrl ?? null,
         originThreadId: j.originThreadId ?? "main",
+        parentJobId: j.parentJobId ?? null,
         startedAt: j.startedAt ?? j.createdAt,
         heartbeatAt: j.heartbeatAt ?? j.startedAt ?? j.createdAt,
         nextRunAt: j.nextRunAt ?? null,

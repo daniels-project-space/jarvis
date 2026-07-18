@@ -10,10 +10,6 @@ on:
   schedule:
     - cron: "*/5 * * * *"
 
-concurrency:
-  group: jarvis-cli-agent-harness
-  cancel-in-progress: false
-
 permissions:
   contents: read
 
@@ -25,7 +21,6 @@ jobs:
     env:
       CONVEX_URL: https://tangible-goose-318.convex.cloud
       CODEX_AUTH_JSON_B64: ${{ secrets.CODEX_AUTH_JSON_B64 }}
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       JARVIS_WORKER_TOKEN: ${{ secrets.JARVIS_WORKER_TOKEN }}
       VAULT_ACCESS_TOKEN: ${{ secrets.VAULT_ACCESS_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.JARVIS_PORTFOLIO_GITHUB_TOKEN }}
@@ -43,6 +38,17 @@ jobs:
 
       - name: Install the pinned harness
         run: npm ci
+
+      - name: Verify Codex agent toolchain
+        run: |
+          missing=0
+          for tool in curl git node npm npx gh; do
+            if ! command -v "$tool"; then
+              echo "::error::Codex worker toolchain is missing $tool on PATH"
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
 
       - name: Run durable CLI agents
         run: npm run agent:harness

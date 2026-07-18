@@ -5,7 +5,7 @@ describe("routeWork", () => {
   it("routes complex engineering to Paul at the deep tier", () => {
     const route = routeWork("Trace the root cause and redesign this multi-repo Convex architecture", { repo: "jarvis" });
     expect(route.agentId).toBe("paul");
-    expect(route.model).toBe("opus");
+    expect(route.model).toBe("sol");
     expect(route.approvalRequired).toBe(false);
     expect(suggestedAcceptanceCriteria("deploy it", route)).toContain(
       "Do not call it live until the production alias is verified",
@@ -17,7 +17,7 @@ describe("routeWork", () => {
     expect(route.approvalRequired).toBe(true);
     expect(route.risk).toBe("consequential");
     expect(route.readonly).toBe(true);
-    expect(route.model).toBe("opus");
+    expect(route.model).toBe("sol");
   });
 
   it("does not accept readonly as a consequential-risk override", () => {
@@ -51,6 +51,6 @@ describe("routeWork", () => {
   });
 
   it("does not honour a cheap override for hard work", () => {
-    expect(routeWork("Production security architecture migration", { requestedModel: "haiku" }).model).toBe("opus");
+    expect(routeWork("Production security architecture migration", { requestedModel: "luna" }).model).toBe("sol");
   });
 });

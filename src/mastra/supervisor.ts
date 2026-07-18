@@ -8,7 +8,7 @@ const workstreamSchema = z.object({
   task: z.string().min(12).max(4000),
   agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]),
   repo: z.string().nullable(),
-  model: z.enum(["haiku", "sonnet", "opus"]),
+  model: z.enum(["luna", "terra", "sol"]),
   readonly: z.boolean(),
   approvalRequired: z.boolean(),
   risk: z.enum(["low", "medium", "high", "consequential"]),

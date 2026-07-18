@@ -102,6 +102,8 @@ export const snapshot = query({
         role: profile.role,
         status: current ? (current.status === "running" || current.status === "pending" ? "working" : "blocked") : "available",
         currentJobId: current ? String(current._id) : undefined,
+        activeJobIds: owned.map((job: any) => String(job._id)),
+        activeJobCount: owned.length,
         completedJobs: profile.completedJobs,
         failedJobs: profile.failedJobs,
         updatedAt: profile.updatedAt,

@@ -48,7 +48,7 @@ async function m(path: string, args: unknown) {
 function ask(provider: AgentProvider, bin: string, env: NodeJS.ProcessEnv, prompt: string): Promise<string> {
   return new Promise((resolve) => {
     if (provider !== "codex") return resolve("");
-    const args = [...codexExecPrefix("sonnet"), prompt];
+    const args = [...codexExecPrefix("terra"), prompt];
     const p = spawn(bin, args, {
       env,
       stdio: ["ignore", "pipe", "pipe"],

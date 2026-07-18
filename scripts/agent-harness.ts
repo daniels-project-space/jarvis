@@ -1,19 +1,25 @@
 import { spawn } from "node:child_process";
 import { runAgentHarness } from "../src/trigger/agent-runner";
 import { codexExecPrefix } from "../src/trigger/model-policy";
-import { prepareSubscriptionEnv, resolveSubscriptionAgentBin } from "../src/trigger/subscription-runtime";
+import {
+  missingSubscriptionTools,
+  prepareSubscriptionEnv,
+  resolveSubscriptionAgentBin,
+} from "../src/trigger/subscription-runtime";
 
 function verifyCliTools(): Promise<{ cli: true; shellTool: true }> {
   const bin = resolveSubscriptionAgentBin("codex");
   const prepared = prepareSubscriptionEnv("codex");
   if (!bin || prepared.error) throw new Error(prepared.error ?? "Codex CLI binary unavailable");
+  const missing = missingSubscriptionTools(prepared.env);
+  if (missing.length) throw new Error(`Codex worker toolchain unavailable: missing ${missing.join(", ")} on PATH`);
   return new Promise((resolve, reject) => {
     const child = spawn(
       bin,
       [
-        ...codexExecPrefix("haiku"),
+        ...codexExecPrefix("luna"),
         "--json",
-        "Use the shell tool to run pwd. Then reply with exactly HARNESS_READY and nothing else.",
+        "Use the shell tool to run: pwd; curl --version; git --version; node --version; npm --version; npx --version; gh --version. If every command succeeds, reply with exactly HARNESS_READY and nothing else.",
       ],
       { cwd: process.cwd(), env: prepared.env, stdio: ["ignore", "pipe", "pipe"] },
     );

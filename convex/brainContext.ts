@@ -93,6 +93,8 @@ export const snapshot = query({
         ...profile,
         status: executing ? "working" : blocked ? "blocked" : "available",
         currentJobId: executing ? String(executing._id) : blocked ? String(blocked._id) : undefined,
+        activeJobIds: owned.map((job: any) => String(job._id)),
+        activeJobCount: owned.length,
       };
     });
     return {

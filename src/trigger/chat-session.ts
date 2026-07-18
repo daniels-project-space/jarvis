@@ -159,7 +159,7 @@ async function runTurn(
   }
 }
 
-// Stage 0 capture: a cheap Haiku pass extracts durable facts from the turn and
+// Stage 0 capture: a fast Luna pass extracts durable facts from the turn and
 // persists them (decoupled from the conversation = far more reliable than
 // in-turn tool calls; the mem0 / Letta sleep-time pattern).
 async function extractAndSave(
@@ -176,7 +176,7 @@ async function extractAndSave(
     "Output [] if nothing is worth remembering. No prose, JSON only.\n\n" +
     `User: ${userText}\nAssistant: ${assistantText}`;
   const out = await new Promise<string>((resolve) => {
-    const p = spawn(bin, cliArgs(provider, prompt, "haiku"), {
+    const p = spawn(bin, cliArgs(provider, prompt, "luna"), {
       env,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -318,7 +318,6 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
         threadId: claim.threadId,
         status: turn.finalText.trim() ? "done" : "error",
         finalText,
-        claudeSessionId: turn.sessionId ?? undefined,
         model: `codex · ${codexModelFor(model).model}`,
       });
       const deliveredAt = Date.now();

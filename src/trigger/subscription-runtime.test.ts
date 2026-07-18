@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { prepareSubscriptionEnv, resolveSubscriptionAgentBin } from "./subscription-runtime";
+import {
+  missingSubscriptionTools,
+  prepareSubscriptionEnv,
+  REQUIRED_AGENT_TOOLS,
+  resolveSubscriptionAgentBin,
+} from "./subscription-runtime";
 
 describe("subscription subprocess capability scope", () => {
   afterEach(() => vi.unstubAllEnvs());
@@ -12,6 +17,25 @@ describe("subscription subprocess capability scope", () => {
     expect(specialist.JARVIS_DISPATCH_TOKEN).toBeUndefined();
     expect(specialist.JARVIS_WORKER_TOKEN).toBeUndefined();
     expect(specialist.GITHUB_TOKEN).toBeUndefined();
+    expect(specialist.GH_TOKEN).toBeUndefined();
+  });
+
+  it("preserves the executable and network runtime without passing application authority", () => {
+    vi.stubEnv("PATH", process.env.PATH ?? "/usr/bin:/bin");
+    vi.stubEnv("HTTPS_PROXY", "http://proxy.internal:8080");
+    vi.stubEnv("CODEX_ACCESS_TOKEN", "subscription-token");
+    const specialist = prepareSubscriptionEnv("codex").env;
+    expect(specialist.PATH).toBe(process.env.PATH);
+    expect(specialist.HTTPS_PROXY).toBe("http://proxy.internal:8080");
+    expect(specialist.GIT_TERMINAL_PROMPT).toBe("0");
+  });
+
+  it("finds every required specialist binary on the worker PATH", () => {
+    expect(missingSubscriptionTools(process.env, REQUIRED_AGENT_TOOLS)).toEqual([]);
+  });
+
+  it("reports an honest missing-tool list for an over-sanitized PATH", () => {
+    expect(missingSubscriptionTools({ PATH: "/definitely/missing" }, ["curl", "git"])).toEqual(["curl", "git"]);
   });
 
   it("grants only the narrow dispatcher to the conversational supervisor", () => {

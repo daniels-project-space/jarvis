@@ -139,7 +139,12 @@ export async function buildContext(
   if (Array.isArray(brain?.agents) && brain.agents.length)
     lines.push(
       "Permanent team: " +
-        brain.agents.map((agent: any) => `${agent.name}=${agent.status} (${agent.role})`).join("; "),
+        brain.agents
+          .map(
+            (agent: any) =>
+              `${agent.name}=${agent.status}${agent.activeJobCount ? `, ${agent.activeJobCount} active job${agent.activeJobCount === 1 ? "" : "s"}` : ""} (${agent.role})`,
+          )
+          .join("; "),
     );
   if (Array.isArray(brain?.attention) && brain.attention.length)
     lines.push(

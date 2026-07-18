@@ -54,8 +54,8 @@ describe("durable agent continuation", () => {
   });
 
   it("gives deep work more room without removing the segment boundary", () => {
-    expect(segmentTimeoutMs("opus")).toBe(25 * 60_000);
-    expect(segmentTimeoutMs("sonnet")).toBe(15 * 60_000);
-    expect(segmentTimeoutMs("haiku")).toBe(15 * 60_000);
+    expect(segmentTimeoutMs("sol")).toBe(25 * 60_000);
+    expect(segmentTimeoutMs("terra")).toBe(15 * 60_000);
+    expect(segmentTimeoutMs("luna")).toBe(15 * 60_000);
   });
 });

@@ -7,15 +7,18 @@ import { INFRA_MAP } from "../lib/persona";
 import { routeWork } from "../mastra/routing";
 import { TEAM_BY_SLUG, type AgentSlug } from "../mastra/team";
 import { codexExecPrefix, codexModelFor } from "./model-policy";
+import { normalizeWorkModelTier } from "../lib/work-models";
 import { githubGitEnv, githubRepoUrl } from "./git-transport";
 import { vaultService } from "../lib/vault-client";
 import { buildContinuationCheckpoint, segmentTimeoutMs } from "./continuation";
 import { runWatchSweep } from "./watch-runtime";
 import {
+  missingSubscriptionTools,
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
   type AgentProvider,
 } from "./subscription-runtime";
+import { runConcurrentClaimLoop } from "./agent-pool";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -24,13 +27,7 @@ import {
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
 
-function promptArgs(env: NodeJS.ProcessEnv, prompt: string, tier: string, json = false, mcpConfig?: string | null): string[] {
-  if (env.JARVIS_AGENT_PROVIDER !== "codex") {
-    const args = ["-p", prompt, "--model", tier, "--dangerously-skip-permissions"];
-    if (json) args.push("--output-format", "stream-json", "--verbose");
-    if (mcpConfig) args.push("--mcp-config", mcpConfig);
-    return args;
-  }
+function promptArgs(prompt: string, tier: string, json = false, mcpConfig?: string | null): string[] {
   const args = codexExecPrefix(tier);
   if (json) args.push("--json");
   if (mcpConfig) {
@@ -49,7 +46,7 @@ function promptArgs(env: NodeJS.ProcessEnv, prompt: string, tier: string, json =
 
 function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, tier: string, timeoutMs: number): Promise<string> {
   return new Promise((resolve) => {
-    const p = spawn(bin, promptArgs(env, prompt, tier), { env, stdio: ["ignore", "pipe", "pipe"] });
+    const p = spawn(bin, promptArgs(prompt, tier), { env, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     const timer = setTimeout(() => { try { p.kill("SIGKILL"); } catch { /* gone */ } resolve(output); }, timeoutMs);
     p.stdout.on("data", (d) => (output += d.toString()));
@@ -105,8 +102,8 @@ function sh(cmd: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code
   });
 }
 
-// Sub-agent model routing: match the brain's economy — Opus only for real
-// engineering, Sonnet for the middle, Haiku for trivial lookups/one-liners.
+// Sub-agent model routing uses the same Codex subscription tiers as the
+// conversational supervisor.
 function pickAgentModel(task: string): string {
   return routeWork(task).model;
 }
@@ -114,7 +111,7 @@ function pickAgentModel(task: string): string {
 
 // MCP servers the brain can attach on demand. Browserbase = hosted browsers
 // (no local Chromium in the Trigger image); context7 = live library docs.
-async function buildMcpConfig(names: string[]): Promise<string | null> {
+async function buildMcpConfig(names: string[], jobKey: string): Promise<string | null> {
   const servers: Record<string, unknown> = {};
   for (const n of names) {
     if (["playwright", "browser", "browserbase"].includes(n)) {
@@ -129,7 +126,7 @@ async function buildMcpConfig(names: string[]): Promise<string | null> {
     if (n === "context7") servers["context7"] = { command: "npx", args: ["-y", "@upstash/context7-mcp"] };
   }
   if (!Object.keys(servers).length) return null;
-  const path = "/tmp/mcp.json";
+  const path = `/tmp/work/mcp-${jobKey.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`;
   writeFileSync(path, JSON.stringify({ mcpServers: servers }));
   return path;
 }
@@ -144,7 +141,7 @@ async function weaveLine(bin: string, env: NodeJS.ProcessEnv, task: string, resu
     "End by mentioning the full detail is on his screen. No markdown, no emoji, no preamble. " +
     "If it failed, say what failed honestly in one sentence.\n\n" +
     `The task was: ${task.slice(0, 300)}\nThe result:\n${result.slice(0, 3500)}`;
-  const out = await plainPrompt(bin, env, prompt, "haiku", 60_000);
+  const out = await plainPrompt(bin, env, prompt, "luna", 60_000);
   const line = out.trim().replace(/\s+/g, " ").replace(/[*#`_]/g, "");
   return line.length > 4 && line.length < 400 ? line : "";
 }
@@ -165,7 +162,7 @@ async function verifyWork(
     "verdict rules: pass = work matches the task and looks complete; concerns = done but something specific looks wrong/unfinished (say what in note); " +
     "needs_input = the agent stopped on a question or decision. If that question is answerable with common sense or the task's own context, fill answer so the run can continue autonomously; leave answer empty only when Daniel genuinely must decide (money, accounts, personal preferences).\n\n" +
     `Task: ${task.slice(0, 800)}\n\nAgent result:\n${result.slice(0, 4000)}`;
-  const out = await plainPrompt(bin, env, prompt, "sonnet", 90_000);
+  const out = await plainPrompt(bin, env, prompt, "terra", 90_000);
   try {
     const m = out.match(/\{[\s\S]*\}/);
     if (!m) return null;
@@ -189,11 +186,9 @@ function runAgent(
   timeoutMs = 900_000,
 ): Promise<{ text: string; timedOut: boolean; stopped: "paused" | "cancelled" | null; checkpointLog: string }> {
   return new Promise((resolve) => {
-    const args = promptArgs(env, prompt, model, true, mcpConfig);
-    const codexSelection = env.JARVIS_AGENT_PROVIDER === "codex" ? codexModelFor(model) : null;
-    const runtimeLabel = codexSelection
-      ? `${codexSelection.model} · ${codexSelection.effort}`
-      : `Claude ${model}`;
+    const args = promptArgs(prompt, model, true, mcpConfig);
+    const codexSelection = codexModelFor(model);
+    const runtimeLabel = `${codexSelection.model} · ${codexSelection.effort}`;
     const p = spawn(bin, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     let buf = "";
     let stderr = "";
@@ -474,6 +469,13 @@ export async function runAgentHarness() {
     if (!bin) return { processed: 0, error: `no ${provider} binary` };
     const prepared = prepareSubscriptionEnv(provider);
     if (prepared.error) return { processed: 0, error: prepared.error };
+    const missingTools = missingSubscriptionTools(prepared.env);
+    if (missingTools.length) {
+      return {
+        processed: 0,
+        error: `Codex worker toolchain unavailable: missing ${missingTools.join(", ")} on PATH`,
+      };
+    }
 
     // Self-healing sweep: open incidents become root-cause repair jobs (attempt-
     // capped); exhausted ones escalate to Daniel instead of looping forever.
@@ -491,7 +493,7 @@ export async function runAgentHarness() {
         await convexMutation("jobs:enqueue", {
           task: repairPrompt(inc, repo),
           repo,
-          model: "opus",
+          model: "sol",
           modelReason: "Paul uses the highest tier for production root-cause repair",
           agentId: "paul",
           risk: "high",
@@ -558,13 +560,13 @@ export async function runAgentHarness() {
         `## Capability boundary\n` +
         `You run inside an isolated worktree with no general secrets-vault access. Use only the repository and explicitly attached MCP capabilities. Never seek credentials, publish, message people, spend money, or perform destructive/production actions. If one is required, stop with the exact approval needed.\n\n` +
         `## Conventions\n- The runner supplies the repository when one is in scope; do not clone or push another repository.\n` +
-        `- Web research: use your WebSearch/WebFetch tools directly.\n` +
+        `- Toolchain: curl, git, node, npm, npx and gh were verified before this lease. Use them through Codex's shell tool. Live web search is enabled for current information.\n` +
+        `- The repository is already checked out for you. GitHub credentials remain with the delivery controller; use gh only for public/read-only inspection and report if a remote authenticated operation is required.\n` +
         `- Never invent results. If something is inaccessible, say so plainly in your final answer.\n` +
         `- Final answer style: plain text, the key outcome first, under 300 words.\n`,
     );
 
     let processed = 0;
-    const started = Date.now();
     const failureBackoffMs = (attempt: number) =>
       Math.min(6 * 60 * 60 * 1000, 60_000 * 2 ** Math.max(0, Math.min(12, attempt - 1)));
 
@@ -595,7 +597,8 @@ export async function runAgentHarness() {
         return true;
       };
       try {
-        let cwd = `/tmp/work/scratch-${String(job.jobId).slice(-6)}`;
+        const jobKey = String(job.jobId).replace(/[^a-zA-Z0-9_-]/g, "_");
+        let cwd = `/tmp/work/scratch-${jobKey}`;
         mkdirSync(cwd, { recursive: true });
         const agentId = (TEAM_BY_SLUG[job.agentId as AgentSlug] ? job.agentId : routeWork(job.task, { repo: job.repo }).agentId) as AgentSlug;
         const profile = TEAM_BY_SLUG[agentId];
@@ -606,7 +609,7 @@ export async function runAgentHarness() {
         let baseSha = "";
         let cloneFailed = false;
         if (repo && token) {
-          const dir = `/tmp/work/${repo.replace(/[^a-zA-Z0-9]/g, "_")}_${String(job.jobId).slice(-6)}`;
+          const dir = `/tmp/work/${repo.replace(/[^a-zA-Z0-9]/g, "_")}_${jobKey}`;
           rmSync(dir, { recursive: true, force: true });
           const url = githubRepoUrl(repo);
           const gitEnv = githubGitEnv(env, token);
@@ -651,12 +654,17 @@ export async function runAgentHarness() {
         const checkpoint = job.checkpoint
           ? `\n\nCONTINUATION CHECKPOINT (attempt ${job.attempt ?? 1}; preserve completed work, do not start over):\n${String(job.checkpoint).slice(0, 6000)}`
           : "";
+        const followUp = job.parentJobId
+          ? `\n\nCONCURRENT FOLLOW-UP: this job extends ${job.parentJobId}. That earlier job may still be running. Own this issue independently; do not wait for it or overwrite its branch.`
+          : "";
         const prompt =
           `You are ${profile.name}, JARVIS's permanent ${profile.role}.\n${profile.instructions}\n\n${context}\n\n` +
           `TASK:\n${job.task}\n\nDEFINITION OF DONE:\n${criteria.map((item: string) => `- ${item}`).join("\n")}` +
-          `${checkpoint}\n\nBefore finishing, verify the definition of done and explicitly report the evidence. If a consequential action or personal decision is required, stop and ask one precise question.`;
-        const model = typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task);
-        const mcpConfig = Array.isArray(job.mcp) && job.mcp.length ? await buildMcpConfig(job.mcp) : null;
+          `${checkpoint}${followUp}\n\nBefore finishing, verify the definition of done and explicitly report the evidence. If a consequential action or personal decision is required, stop and ask one precise question.`;
+        const model = normalizeWorkModelTier(
+          typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task),
+        );
+        const mcpConfig = Array.isArray(job.mcp) && job.mcp.length ? await buildMcpConfig(job.mcp, jobKey) : null;
         const run = await runAgent(
           bin,
           cwd,
@@ -981,7 +989,7 @@ export async function runAgentHarness() {
           `then "## Findings" (the substance, deduplicated, agent labels only where they add clarity), then "## Next moves" ` +
           `(concrete recommended actions). Be direct; flag agents that failed. Under 500 words.\n\n` +
           `MISSION: ${synth.goal}\n\nAGENT RESULTS:\n${body.slice(0, 24000)}`,
-        "sonnet",
+        "terra",
       );
       const report = merged.text && !/^error:/.test(merged.text) && merged.text !== "(no output)"
         ? merged.text
@@ -1011,29 +1019,18 @@ export async function runAgentHarness() {
       if (synth) await synthesizeMissionClaim(synth);
     };
 
-    // Claim window must leave room for a full agent run inside the task
-    // ceiling. Fleet missions run CONCURRENTLY (cap 3 — each agent is a full
-    // claude process; the box has headroom for three).
-    const CONCURRENCY = 3;
-    const inFlight = new Set<Promise<void>>();
-    while (Date.now() - started < 120_000) {
-      if (inFlight.size >= CONCURRENCY) {
-        await Promise.race(inFlight);
-        continue;
-      }
-      const job: any = await convexMutation("jobs:claimNext", {});
-      if (!job) {
-        if (inFlight.size === 0) break;
-        await Promise.race(inFlight);
-        continue;
-      }
-      processed += 1;
-      let p: Promise<void>;
-      // eslint-disable-next-line prefer-const
-      p = processJob(job).finally(() => inFlight.delete(p));
-      inFlight.add(p);
-    }
-    await Promise.all([...inFlight]);
+    // Each GitHub wake is a bounded three-process pool. Wake workflows may
+    // overlap; Convex's atomic status+attempt lease prevents duplicate work.
+    // A short idle drain catches jobs queued beside a mission without holding
+    // an Actions runner open after the queue is empty.
+    processed += await runConcurrentClaimLoop({
+      capacity: 3,
+      claimWindowMs: 120_000,
+      idleDrainMs: 6_000,
+      pollIntervalMs: 2_000,
+      claim: () => convexMutation("jobs:claimNext", {}),
+      run: processJob,
+    });
     // Approval declines/cancellations do not run processJob, so sweep terminal
     // missions after normal work. Each claim flips running → synthesizing in
     // Convex, preventing another cron invocation from reporting it twice.

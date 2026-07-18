@@ -1,5 +1,6 @@
 import type { AgentSlug, ModelTier, WorkRisk } from "./team";
 import { requestsConsequentialAction } from "../lib/work-safety";
+import { parseWorkModelTier } from "../lib/work-models";
 
 export type WorkRoute = {
   agentId: AgentSlug;
@@ -32,11 +33,12 @@ export function routeWork(task: string, options?: { repo?: string; requestedMode
 
   const hard = complex.test(text) || (engineering.test(text) && text.length > 500);
   const easy = text.length < 140 && trivial.test(text) && !isConsequential;
-  let model: ModelTier = hard ? "opus" : easy ? "haiku" : "sonnet";
-  if (["haiku", "sonnet", "opus"].includes(options?.requestedModel ?? "")) model = options!.requestedModel as ModelTier;
+  let model: ModelTier = hard ? "sol" : easy ? "luna" : "terra";
+  const requestedModel = parseWorkModelTier(options?.requestedModel);
+  if (requestedModel) model = requestedModel;
   // Never allow an explicit cheap tier to silently reduce high-risk or hard
   // engineering quality; Daniel's workspace standard prioritizes correctness.
-  if ((hard || isConsequential) && model !== "opus") model = "opus";
+  if ((hard || isConsequential) && model !== "sol") model = "sol";
 
   const readonly = options?.readonly ?? (agentId === "atlas" || isConsequential);
   const risk: WorkRisk = isConsequential ? "consequential" : hard ? "high" : agentId === "paul" ? "medium" : "low";

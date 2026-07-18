@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { codexModelFor } from "./model-policy";
+import { appendAgentMessageDelta } from "./codex-stream";
 
 type JsonObject = Record<string, unknown>;
 type PendingRequest = { resolve: (value: JsonObject) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
@@ -8,6 +9,7 @@ type ActiveTurn = {
   turnId: string;
   threadId: string;
   text: string;
+  itemId?: string;
   onDelta: (delta: string) => void;
   resolve: (result: CodexTurnResult) => void;
   reject: (error: Error) => void;
@@ -127,8 +129,11 @@ export class CodexAppServer {
     const active = this.active.get(turnId);
     if (!active) return;
     if (method === "item/agentMessage/delta" && typeof params.delta === "string") {
-      active.text += params.delta;
-      active.onDelta(params.delta);
+      const itemId = typeof params.itemId === "string" ? params.itemId : undefined;
+      const next = appendAgentMessageDelta({ text: active.text, itemId: active.itemId }, params.delta, itemId);
+      active.text = next.state.text;
+      active.itemId = next.state.itemId;
+      active.onDelta(next.emitted);
     } else if (method === "item/completed") {
       const item = params.item as JsonObject | undefined;
       if (!active.text && item?.type === "agentMessage" && typeof item.text === "string") {
