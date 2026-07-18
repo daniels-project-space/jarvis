@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import * as THREE from "three";
-import { advanceOrbPhase, frameDamping, orbCycleSeconds, type OrbMotionFrame, type OrbState } from "@/lib/orb-motion";
+import { advanceOrbPhase, frameDamping, orbCycleSeconds, orbScreenTarget, type OrbMotionFrame, type OrbState } from "@/lib/orb-motion";
 
 // Particle-network orb — adapted from ethanplusai/jarvis (frontend/src/orb.ts),
 // free for personal use: https://github.com/ethanplusai/jarvis
@@ -206,6 +206,9 @@ export default function ThreeOrb({
     const targetColor = new THREE.Color(BASE);
     const targetAccent = new THREE.Color(BASE);
     const white = new THREE.Color(0xffffff);
+    const screenRayNear = new THREE.Vector3();
+    const screenRayFar = new THREE.Vector3();
+    const screenTarget = new THREE.Vector3();
 
     function animate(frameTime = 0) {
       if (destroyed) return;
@@ -276,18 +279,27 @@ export default function ThreeOrb({
       // glide toward/away from the side strip (desktop only — phones dim instead)
       const wantAside = asideRef.current && W() >= 768 ? 1 : 0;
       asideAmt += (wantAside - asideAmt) * frameDamping(3.08, delta);
-      const halfW = Math.tan((45 * Math.PI) / 360) * 80 * (W() / H());
-      // aside: hug the right edge as far as the panel sits on the left
-      const offsetX = halfW * 0.66 * asideAmt;
       const shrink = 1 - 0.32 * asideAmt;
-      // sit a touch higher so the bottom chat bar isn't crowding it
-      const liftY = 3.2;
+
+      // The SVG ring is positioned in stage-relative CSS coordinates. Project
+      // that exact same target through the camera at the cloud's current depth;
+      // a hand-tuned world-space x plus a following camera cancelled almost half
+      // the shift on wide, shallow stages and left the core outside its ring.
+      camera.position.x = Math.sin(t * 0.012) * 1.8;
+      camera.position.y = Math.cos(t * 0.018) * 1.1;
+      camera.lookAt(0, 0, cloudZ * 0.2);
+      camera.updateMatrixWorld();
+      const target = orbScreenTarget(asideAmt);
+      screenRayNear.set(target.x * 2, target.y * -2, -1).unproject(camera);
+      screenRayFar.set(target.x * 2, target.y * -2, 1).unproject(camera);
+      const rayProgress = (cloudZ - screenRayNear.z) / (screenRayFar.z - screenRayNear.z);
+      screenTarget.copy(screenRayNear).lerp(screenRayFar, rayProgress);
 
       points.rotation.set(spinX, spinY, spinZ);
-      points.position.set(offsetX, liftY, cloudZ);
+      points.position.copy(screenTarget);
       points.scale.setScalar(shrink);
       lines.rotation.set(spinX, spinY, spinZ);
-      lines.position.set(offsetX, liftY, cloudZ);
+      lines.position.copy(screenTarget);
       lines.scale.setScalar(shrink);
 
       const p = geo.getAttribute("position") as THREE.BufferAttribute;
@@ -397,7 +409,7 @@ export default function ThreeOrb({
       electronGeo.setDrawRange(0, aliveCount);
       ep.needsUpdate = true;
       electrons.rotation.set(spinX, spinY, spinZ);
-      electrons.position.set(offsetX, liftY, cloudZ);
+      electrons.position.copy(screenTarget);
       electrons.scale.setScalar(shrink);
 
       mat.opacity = currentBright + bass * 0.08;
@@ -426,14 +438,6 @@ export default function ThreeOrb({
         motionRef.current.aside = asideAmt;
       }
 
-      // gentle, slow camera breathing — calmed right down so the orb sits
-      // steady instead of drifting all over (worse when it's small and aside),
-      // and the camera eases toward the orb's offset so it never looks flung
-      // camera follows less than the orb's own shift, so the orb lands further
-      // to the side; lookAt stays at y=0 so the lifted orb reads higher
-      camera.position.x = Math.sin(t * 0.012) * 1.8 + offsetX * 0.44;
-      camera.position.y = Math.cos(t * 0.018) * 1.1;
-      camera.lookAt(offsetX * 0.44, 0, cloudZ * 0.2);
       renderer.render(scene, camera);
     }
 
@@ -474,7 +478,8 @@ export default function ThreeOrb({
       {webglUnavailable && (
         <div
           aria-label="JARVIS visual core"
-          className={`absolute inset-0 grid place-items-center will-change-transform transition-transform duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${aside ? "translate-x-[32%]" : "translate-x-0"}`}
+          className="absolute inset-0 grid place-items-center will-change-transform transition-transform duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
+          style={{ transform: `translate(${orbScreenTarget(aside ? 1 : 0).x * 100}%, ${orbScreenTarget(aside ? 1 : 0).y * 100}%)` }}
         >
           <div className={`relative h-[min(42vw,280px)] w-[min(42vw,280px)] min-h-36 min-w-36 rounded-full border border-emerald-300/25 bg-[radial-gradient(circle_at_42%_38%,rgba(110,255,196,0.32),rgba(0,255,136,0.1)_34%,rgba(0,255,136,0.02)_68%,transparent_72%)] shadow-[0_0_80px_rgba(0,255,136,0.16)] transition-transform duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${aside ? "scale-[0.68]" : "scale-100"}`}>
             <div className="absolute inset-[18%] rounded-full border border-emerald-200/20 shadow-[inset_0_0_45px_rgba(0,255,136,0.18)]" />

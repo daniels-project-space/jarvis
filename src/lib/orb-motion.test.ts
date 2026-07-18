@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { advanceOrbPhase, createOrbMotionFrame, frameDamping, orbCycleSeconds } from "./orb-motion";
+import { advanceOrbPhase, createOrbMotionFrame, frameDamping, orbCycleSeconds, orbScreenTarget } from "./orb-motion";
 
 describe("shared orb motion", () => {
   it("accelerates for active states while keeping one cycle for orb and ring", () => {
@@ -17,5 +17,11 @@ describe("shared orb motion", () => {
     const frame = createOrbMotionFrame();
     expect(frame.elapsedSeconds).toBe(0);
     expect(advanceOrbPhase(Math.PI * 2 - 0.01, 10, 1)).toBeGreaterThan(Math.PI * 2);
+  });
+
+  it("uses one bounded stage target for the WebGL core and reactor ring", () => {
+    expect(orbScreenTarget(0)).toEqual({ x: 0, y: -0.045 });
+    expect(orbScreenTarget(1)).toEqual({ x: 0.32, y: -0.045 });
+    expect(orbScreenTarget(2)).toEqual(orbScreenTarget(1));
   });
 });
