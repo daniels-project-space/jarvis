@@ -7,7 +7,7 @@ import { clientMutation } from "@/lib/client-mutation";
 import { primeMicrophone, readJarvisPermissions, type JarvisPermissionState } from "@/lib/permissions";
 import { registerSW, subscribePush } from "@/lib/push";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
-import { createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
+import { createOrbMotionFrame, orbScreenTarget, type OrbMotionFrame } from "@/lib/orb-motion";
 import { relevantActiveWork } from "@/lib/active-work";
 import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
@@ -394,6 +394,7 @@ function ReactorRing({
   motionRef: { current: OrbMotionFrame };
   reduceMotion: boolean;
 }) {
+  const stageRef = useRef<HTMLDivElement>(null);
   const ringRef = useRef<SVGGElement>(null);
   const firstStopRef = useRef<SVGStopElement>(null);
   const middleStopRef = useRef<SVGStopElement>(null);
@@ -410,10 +411,13 @@ function ReactorRing({
   const opacity = hidden ? 0 : aside ? 0.32 : active ? 0.52 : 0.24;
   useEffect(() => {
     const ring = ringRef.current;
-    if (!ring) return;
+    const stage = stageRef.current;
+    if (!ring || !stage) return;
     let frame = 0;
     const paint = () => {
       const motion = motionRef.current;
+      const target = orbScreenTarget(motion.aside);
+      stage.style.transform = `translate(${target.x * 100}%, ${target.y * 100}%) scale(${1 - motion.aside * 0.24})`;
       ring.style.transform = reduceMotion ? "none" : `rotate(${motion.phase}rad)`;
       firstStopRef.current?.setAttribute("stop-color", motion.color);
       middleStopRef.current?.setAttribute("stop-color", motion.accent);
@@ -427,8 +431,9 @@ function ReactorRing({
   }, [motionRef, reduceMotion]);
   return (
     <div
-      className="pointer-events-none absolute inset-0 grid place-items-center will-change-transform transition-[opacity,transform] duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
-      style={{ opacity, transform: aside ? "translateX(32%) translateY(-4.5%) scale(0.76)" : "translateY(-4.5%) scale(1)" }}
+      ref={stageRef}
+      className={`pointer-events-none absolute inset-0 place-items-center will-change-transform transition-opacity duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${aside ? "hidden md:grid" : "grid"}`}
+      style={{ opacity }}
     >
       <svg viewBox="0 0 500 500" className="h-[min(82vmin,760px)] w-[min(82vmin,760px)]">
         <defs>

@@ -10,6 +10,17 @@ export type OrbMotionFrame = {
   aside: number;
 };
 
+// The reactor ring is DOM/SVG while the particle core is WebGL. Keep their
+// stage target in one coordinate system: fractions of the stage dimensions,
+// with positive y pointing down as it does in CSS.
+export const ORB_ASIDE_X = 0.32;
+export const ORB_STAGE_Y = -0.045;
+
+export function orbScreenTarget(asideAmount: number): { x: number; y: number } {
+  const aside = Math.max(0, Math.min(1, asideAmount));
+  return { x: ORB_ASIDE_X * aside, y: ORB_STAGE_Y };
+}
+
 const CYCLES: Record<OrbState, number> = {
   idle: 28,
   listening: 20,
