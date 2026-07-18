@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
+  isolateSubscriptionEnv,
   missingSubscriptionTools,
   prepareSubscriptionEnv,
   REQUIRED_AGENT_TOOLS,
@@ -48,5 +52,23 @@ describe("subscription subprocess capability scope", () => {
 
   it("ships the pinned Codex CLI that Trigger conversation workers resolve", () => {
     expect(resolveSubscriptionAgentBin("codex")).toMatch(/codex/);
+  });
+
+  it("gives concurrent agents separate Codex homes with shared auth only", () => {
+    const root = mkdtempSync(join(tmpdir(), "jarvis-codex-test-"));
+    const source = join(root, "source");
+    const homes = join(root, "homes");
+    try {
+      mkdirSync(source, { recursive: true });
+      writeFileSync(join(source, "auth.json"), '{"tokens":{}}');
+      writeFileSync(join(source, "AGENTS.md"), "scoped briefing");
+      const one = isolateSubscriptionEnv({ ...process.env, CODEX_HOME: source }, "job-one", homes);
+      const two = isolateSubscriptionEnv({ ...process.env, CODEX_HOME: source }, "job-two", homes);
+      expect(one.CODEX_HOME).not.toBe(two.CODEX_HOME);
+      expect(readFileSync(join(String(one.CODEX_HOME), "AGENTS.md"), "utf8")).toBe("scoped briefing");
+      expect(readFileSync(join(String(two.CODEX_HOME), "auth.json"), "utf8")).toContain("tokens");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

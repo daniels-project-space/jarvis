@@ -14,6 +14,7 @@ import { buildContinuationCheckpoint, segmentTimeoutMs } from "./continuation";
 import { runWatchSweep } from "./watch-runtime";
 import {
   missingSubscriptionTools,
+  isolateSubscriptionEnv,
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
   type AgentProvider,
@@ -598,6 +599,7 @@ export async function runAgentHarness() {
       };
       try {
         const jobKey = String(job.jobId).replace(/[^a-zA-Z0-9_-]/g, "_");
+        const jobEnv = isolateSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}`);
         let cwd = `/tmp/work/scratch-${jobKey}`;
         mkdirSync(cwd, { recursive: true });
         const agentId = (TEAM_BY_SLUG[job.agentId as AgentSlug] ? job.agentId : routeWork(job.task, { repo: job.repo }).agentId) as AgentSlug;
@@ -668,7 +670,7 @@ export async function runAgentHarness() {
         const run = await runAgent(
           bin,
           cwd,
-          env,
+          jobEnv,
           prompt,
           model,
           (line, log, stage, percent) => {
@@ -808,7 +810,7 @@ export async function runAgentHarness() {
         const needsDaniel = /\b(need (your|daniel)|which (one|option)|please (confirm|choose|decide)|waiting on (you|daniel)|\?\s*$)/i.test(
           result.slice(-500),
         );
-        const verify = await verifyWork(bin, env, job.task, result).catch(() => null);
+        const verify = await verifyWork(bin, jobEnv, job.task, result).catch(() => null);
         if (await stopIfLeaseLost(`Supervisor review interrupted.\n\n${continuationCheckpoint}`, result, branch)) return;
         if (!verify) {
           const continuation = await convexMutation("jobs:checkpointAndRequeue", {
@@ -929,7 +931,7 @@ export async function runAgentHarness() {
         }
 
         let spoken =
-          (await weaveLine(bin, env, job.task, deliveryResult)) ||
+          (await weaveLine(bin, jobEnv, job.task, deliveryResult)) ||
           `${profile.name} finished and JARVIS verified the evidence${pullRequestUrl ? "; a draft PR is ready for review" : ""}.`;
         spoken += " Supervisor check passed.";
         const findingId = await convexMutation("findings:add", {

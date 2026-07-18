@@ -1690,6 +1690,7 @@ export default function JarvisUI() {
   const shownJob = activeJobs.find((j) => j._id === agentView) ?? null;
   const shownJobId = shownJob?._id ?? null;
   useEffect(() => {
+    if (commandSnapshot === undefined) return;
     const ids = new Set(activeJobs.map((job) => job._id));
     if (knownActiveJobIds.current === null) {
       knownActiveJobIds.current = ids; // never resurrect work that predates this page load
@@ -1703,7 +1704,7 @@ export default function JarvisUI() {
     } else if (agentView && !ids.has(agentView)) {
       setAgentView(null);
     }
-  }, [activeJobs, agentView]);
+  }, [activeJobs, agentView, commandSnapshot]);
   useEffect(() => {
     if (!shownJobId) return;
     const first = setTimeout(() => setNowTs(Date.now()), 0);

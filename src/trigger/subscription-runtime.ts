@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 
 export type AgentProvider = "codex";
@@ -173,4 +173,25 @@ export function prepareSubscriptionEnv(
       includeDispatch,
     ),
   };
+}
+
+export function isolateSubscriptionEnv(
+  base: NodeJS.ProcessEnv,
+  scope: string,
+  root = "/tmp/work/codex-homes",
+): NodeJS.ProcessEnv {
+  const sourceHome = String(base.CODEX_HOME ?? "");
+  const safeScope = scope.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120) || "agent";
+  const isolatedHome = join(root, safeScope);
+  mkdirSync(isolatedHome, { recursive: true });
+  // Authentication and Daniel's scoped briefing are read-only inputs. System
+  // skills are intentionally not copied: every concurrent Codex process gets
+  // its own install directory, removing the shared `skills/` startup race.
+  for (const file of ["auth.json", "config.toml", "AGENTS.md"]) {
+    const source = join(sourceHome, file);
+    if (sourceHome && existsSync(source)) copyFileSync(source, join(isolatedHome, file));
+  }
+  const authPath = join(isolatedHome, "auth.json");
+  if (existsSync(authPath)) chmodSync(authPath, 0o600);
+  return { ...base, CODEX_HOME: isolatedHome };
 }
