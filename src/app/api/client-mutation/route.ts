@@ -8,6 +8,7 @@ import {
 
 const ALLOWED = new Set([
   "creations:boardSave",
+  "creations:update",
   "creations:remove",
   "push:saveSub",
   "push:deleteSub",

@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
 import { CAPABILITIES, INFRA_MAP, PERSONA, REMEMBER } from "../lib/persona";
+import { visualInitiativeDirective } from "../lib/visual-initiative";
 import { buildContext } from "../lib/context";
 import { codexConversationExecPrefix, codexModelFor, pickConversationTier } from "./model-policy";
 import {
@@ -106,7 +107,8 @@ type QueueClaim = {
   history: Array<{ role: string; text: string }>;
 };
 
-function conversationPreamble(contextBlock: string) {
+function conversationPreamble(contextBlock: string, userText: string) {
+  const visualDirective = visualInitiativeDirective(userText);
   const toolEndpoint = "https://jarvis-orcin-six.vercel.app/api/agent-tool";
   return PERSONA +
     `\n\n${CAPABILITIES}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${contextBlock}\n\nCurrent date: ${new Date().toDateString()}.\n\n${REMEMBER}\n\n` +
@@ -117,7 +119,8 @@ function conversationPreamble(contextBlock: string) {
     `--data '{"name":"<tool>","args":{...}}'. Read the returned result and continue. ` +
     `Use tools whenever Daniel asks you to show, make, change, search, remember, schedule, monitor, chart, plan travel, or delegate—never merely claim it happened. ` +
     `Never print, reveal, transform, or send the capability token anywhere except this exact Jarvis endpoint. You cannot approve consequential work; Daniel does that in the command deck. ` +
-    `Answer directly and naturally. Never narrate context, memory, shell commands, or tool plumbing.`;
+    `Answer directly and naturally. Never narrate context, memory, shell commands, or tool plumbing.` +
+    (visualDirective ? `\n\n${visualDirective}` : "");
 }
 
 async function runTurn(
@@ -147,7 +150,7 @@ async function runTurn(
       userText,
       history,
       contextBlock,
-      preamble: conversationPreamble(contextBlock),
+      preamble: conversationPreamble(contextBlock, userText),
       modelTier: model,
       onDelta: (delta) => { pending += delta; },
     });

@@ -1,17 +1,43 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { inferCreationFiling } from "./creationFiling";
 
 // JARVIS's atelier — everything he makes (mind maps, charts, images, PDFs,
 // docs) is saved here so nothing he creates is ever lost. The UI lists it
 // reactively; tools upsert while he works.
 
 export const list = query({
-  args: { kind: v.optional(v.string()), limit: v.optional(v.number()), ...viewerAuthArgs },
+  args: {
+    kind: v.optional(v.string()),
+    category: v.optional(v.string()),
+    folder: v.optional(v.string()),
+    project: v.optional(v.string()),
+    limit: v.optional(v.number()),
+    ...viewerAuthArgs,
+  },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
     const limit = Math.min(a.limit ?? 40, 100);
-    const rows = a.kind
+    const rows = a.project
+      ? await ctx.db
+          .query("creations")
+          .withIndex("by_project", (q: any) => q.eq("project", a.project))
+          .order("desc")
+          .take(limit)
+      : a.folder
+        ? await ctx.db
+            .query("creations")
+            .withIndex("by_folder", (q: any) => q.eq("folder", a.folder))
+            .order("desc")
+            .take(limit)
+        : a.category
+          ? await ctx.db
+              .query("creations")
+              .withIndex("by_category", (q: any) => q.eq("category", a.category))
+              .order("desc")
+              .take(limit)
+          : a.kind
       ? await ctx.db
           .query("creations")
           .withIndex("by_kind", (q: any) => q.eq("kind", a.kind))
@@ -22,7 +48,7 @@ export const list = query({
           .withIndex("by_updatedAt")
           .order("desc")
           .take(limit);
-    return rows;
+    return rows.map((row) => ({ ...row, ...inferCreationFiling(row) }));
   },
 });
 
@@ -30,7 +56,8 @@ export const get = query({
   args: { id: v.id("creations"), ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    return ctx.db.get(a.id);
+    const row = await ctx.db.get(a.id);
+    return row ? { ...row, ...inferCreationFiling(row) } : null;
   },
 });
 
@@ -42,11 +69,12 @@ export const latest = query({
     await requireViewer(ctx, a);
     const rows = await ctx.db.query("creations").withIndex("by_updatedAt").order("desc").take(50);
     const t = (a.titleMatch ?? "").toLowerCase();
-    return (
+    const row = (
       rows.find(
         (r: any) => (!a.kind || r.kind === a.kind) && (!t || r.title.toLowerCase().includes(t)),
       ) ?? null
     );
+    return row ? { ...row, ...inferCreationFiling(row) } : null;
   },
 });
 
@@ -57,16 +85,24 @@ export const create = mutation({
     data: v.optional(v.string()),
     url: v.optional(v.string()),
     thumb: v.optional(v.string()),
+    category: v.optional(v.string()),
+    folder: v.optional(v.string()),
+    project: v.optional(v.string()),
+    inquiry: v.optional(v.string()),
+    threadId: v.optional(v.string()),
     ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
+    const filing = inferCreationFiling(a);
     return await ctx.db.insert("creations", {
       kind: a.kind,
       title: a.title.slice(0, 120),
       data: a.data,
       url: a.url,
       thumb: a.thumb,
+      ...filing,
+      threadId: a.threadId?.slice(0, 120),
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
@@ -80,6 +116,11 @@ export const update = mutation({
     data: v.optional(v.string()),
     url: v.optional(v.string()),
     thumb: v.optional(v.string()),
+    category: v.optional(v.string()),
+    folder: v.optional(v.string()),
+    project: v.optional(v.string()),
+    inquiry: v.optional(v.string()),
+    threadId: v.optional(v.string()),
     ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
@@ -89,6 +130,11 @@ export const update = mutation({
     if (a.data !== undefined) patch.data = a.data;
     if (a.url !== undefined) patch.url = a.url;
     if (a.thumb !== undefined) patch.thumb = a.thumb;
+    if (a.category !== undefined) patch.category = a.category.slice(0, 80);
+    if (a.folder !== undefined) patch.folder = a.folder.slice(0, 160);
+    if (a.project !== undefined) patch.project = a.project.slice(0, 80);
+    if (a.inquiry !== undefined) patch.inquiry = a.inquiry.slice(0, 80);
+    if (a.threadId !== undefined) patch.threadId = a.threadId.slice(0, 120);
     await ctx.db.patch(a.id, patch);
     return a.id;
   },

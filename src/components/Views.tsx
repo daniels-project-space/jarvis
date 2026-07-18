@@ -598,6 +598,9 @@ export function DocView({ value }: { value: string }) {
   }
   const doc = useJarvisQuery(api.creations.get, creationId ? ({ id: creationId } as any) : "skip") as any;
   const [flash, setFlash] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
   const prev = useRef<string>("");
   useEffect(() => {
     const cur = String(doc?.data ?? "");
@@ -611,7 +614,17 @@ export function DocView({ value }: { value: string }) {
   }, [doc?.data]);
   if (!doc) return <div className="flex flex-1 items-center justify-center text-sm text-slate">opening the draft…</div>;
   const text = String(doc.data ?? "");
-  const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+  const visibleText = editing ? draft : text;
+  const words = visibleText.trim() ? visibleText.trim().split(/\s+/).length : 0;
+  const save = async () => {
+    setSaving(true);
+    try {
+      await clientMutation("creations:update", { id: creationId, data: draft });
+      setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  };
   return (
     <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-4 md:p-6">
       <div
@@ -619,16 +632,36 @@ export function DocView({ value }: { value: string }) {
           flash ? "ring-4 ring-cyan/60" : "ring-1 ring-black/20"
         }`}
       >
-        <div className="mb-6 flex items-baseline justify-between gap-3 border-b border-black/10 pb-3">
+        <div className="mb-6 flex items-center justify-between gap-3 border-b border-black/10 pb-3">
           <div className="min-w-0 truncate text-lg font-semibold text-neutral-800">{doc.title}</div>
-          <div className="shrink-0 text-[10px] uppercase tracking-[0.2em] text-neutral-400">
-            {flash ? <span className="text-emerald-600">✎ updating…</span> : `${words} words · live`}
+          <div className="flex shrink-0 items-center gap-2 text-[10px] uppercase tracking-[0.14em] text-neutral-400">
+            <span>{flash ? <span className="text-emerald-600">✎ updating…</span> : `${words} words · ${editing ? "editing" : "live"}`}</span>
+            <a href={`/api/creation-download?id=${encodeURIComponent(creationId)}`} className="rounded border border-black/10 px-2 py-1 text-neutral-600 hover:bg-black/5">
+              download
+            </a>
+            {editing ? (
+              <>
+                <button onClick={() => { setDraft(text); setEditing(false); }} className="rounded border border-black/10 px-2 py-1 text-neutral-600 hover:bg-black/5">cancel</button>
+                <button disabled={saving} onClick={() => void save()} className="rounded bg-neutral-800 px-2 py-1 text-white disabled:opacity-50">{saving ? "saving…" : "save"}</button>
+              </>
+            ) : (
+              <button onClick={() => { setDraft(text); setEditing(true); }} className="rounded border border-black/10 px-2 py-1 text-neutral-600 hover:bg-black/5">edit</button>
+            )}
           </div>
         </div>
-        <div
-          className="font-serif text-[15px] leading-[1.8] text-neutral-800 md:text-base"
-          dangerouslySetInnerHTML={{ __html: mdPaper(text) }}
-        />
+        {editing ? (
+          <textarea
+            autoFocus
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            className="min-h-[420px] w-full resize-y bg-transparent font-serif text-[15px] leading-[1.8] text-neutral-800 outline-none md:text-base"
+          />
+        ) : (
+          <div
+            className="font-serif text-[15px] leading-[1.8] text-neutral-800 md:text-base"
+            dangerouslySetInnerHTML={{ __html: mdPaper(text) }}
+          />
+        )}
       </div>
     </div>
   );
@@ -1601,28 +1634,65 @@ export function PdfView({ url, title }: { url: string; title?: string }) {
 
 /* ---------------------------------- creations library ---------------------------------- */
 
-const KIND_ICON: Record<string, string> = { canvas: "🕸", board: "🎨", chart: "📊", scene: "✦", image: "🖼", pdf: "📕", doc: "📄", trip: "🌍" };
+const KIND_ICON: Record<string, string> = { canvas: "◇", board: "✎", chart: "▥", scene: "✦", image: "▧", pdf: "▤", doc: "▱", trip: "◎" };
+
+type CreationRow = {
+  _id: string;
+  kind: string;
+  title: string;
+  data?: string;
+  url?: string;
+  thumb?: string;
+  category: string;
+  folder: string;
+  project?: string;
+  inquiry?: string;
+  updatedAt: number;
+};
 
 export function CreationsView({ value }: { value: string }) {
-  let filter: { kind: string | null } = { kind: null };
+  let filter: { kind: string | null; folder?: string | null } = { kind: null, folder: null };
   try {
     filter = JSON.parse(value);
   } catch {
     /* noop */
   }
   const [kind, setKind] = useState<string | null>(filter.kind);
-  const rows = (useJarvisQuery(api.creations.list, { kind: kind ?? undefined, limit: 60 }) ?? []) as {
-    _id: string;
-    kind: string;
-    title: string;
-    data?: string;
-    url?: string;
-    thumb?: string;
-    updatedAt: number;
-  }[];
+  const [folder, setFolder] = useState<string | null>(filter.folder ?? null);
+  const [search, setSearch] = useState("");
+  const queriedRows = useJarvisQuery(api.creations.list, { limit: 100 }) as CreationRow[] | undefined;
+  const rows = useMemo(() => queriedRows ?? [], [queriedRows]);
   const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
 
-  const open = (r: (typeof rows)[number]) => {
+  const folders = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const row of rows) counts.set(row.folder || "Library / General", (counts.get(row.folder || "Library / General") ?? 0) + 1);
+    return [...counts.entries()].sort(([a], [b]) => {
+      const rank = (name: string) => name.startsWith("Projects /") ? 0 : name.startsWith("Inquiries /") ? 1 : 2;
+      return rank(a) - rank(b) || a.localeCompare(b);
+    });
+  }, [rows]);
+
+  const visible = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return rows.filter((row) => {
+      if (kind && row.kind !== kind) return false;
+      if (folder && row.folder !== folder) return false;
+      if (q && !`${row.title} ${row.category} ${row.folder} ${row.project ?? ""} ${row.inquiry ?? ""}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [rows, kind, folder, search]);
+
+  const groups = useMemo(() => {
+    const grouped = new Map<string, CreationRow[]>();
+    for (const row of visible) {
+      const key = row.folder || "Library / General";
+      grouped.set(key, [...(grouped.get(key) ?? []), row]);
+    }
+    return [...grouped.entries()];
+  }, [visible]);
+
+  const open = (r: CreationRow) => {
     if (r.kind === "image" && r.url) void setPanel({ type: "image", value: r.url, title: r.title });
     else if (r.kind === "pdf" && r.url) void setPanel({ type: "pdf", value: r.url, title: r.title });
     else if (r.kind === "canvas" && r.data) void setPanel({ type: "canvas", value: r.data, title: `map · ${r.title}` });
@@ -1635,44 +1705,81 @@ export function CreationsView({ value }: { value: string }) {
   };
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex items-center gap-1.5 border-b border-white/5 px-3 py-2">
-        {[null, "scene", "canvas", "chart", "image", "pdf", "doc"].map((k) => (
-          <button
-            key={k ?? "all"}
-            onClick={() => setKind(k)}
-            className={`rounded-full px-2.5 py-0.5 text-[10px] uppercase tracking-widest transition ${
-              kind === k ? "bg-cyan/15 text-cyan ring-1 ring-cyan/40" : "text-slate hover:text-ice"
-            }`}
-          >
-            {k ?? "all"}
+    <div className="flex min-h-0 flex-1 overflow-hidden">
+      <aside className="hidden w-60 shrink-0 flex-col border-r border-white/7 bg-black/10 md:flex">
+        <div className="border-b border-white/7 px-4 py-4">
+          <div className="hud-label !text-cyan">saved work</div>
+          <div className="mt-1 text-[11px] leading-relaxed text-slate">Automatically filed by project, inquiry and format.</div>
+        </div>
+        <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-2">
+          <button onClick={() => setFolder(null)} className={`mb-1 flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left text-xs ${!folder ? "bg-cyan/10 text-cyan" : "text-slate hover:bg-white/5 hover:text-ice"}`}>
+            <span>All files</span><span className="font-mono text-[9px] opacity-60">{rows.length}</span>
           </button>
-        ))}
-      </div>
-      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3">
-        {rows.length === 0 && <div className="mt-10 text-center text-sm text-slate">Nothing here yet — everything I create lands in this library.</div>}
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
-          {rows.map((r) => (
-            <button
-              key={r._id}
-              onClick={() => open(r)}
-              className="card-lift glass flex flex-col overflow-hidden rounded-xl text-left"
-              title={r.title}
-            >
-              {r.thumb ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img src={r.thumb} alt="" className="h-24 w-full object-cover" />
-              ) : (
-                <div className="flex h-24 w-full items-center justify-center bg-cyan/5 text-3xl">{KIND_ICON[r.kind] ?? "✦"}</div>
-              )}
-              <div className="p-2">
-                <div className="truncate text-xs text-ice">{r.title}</div>
-                <div className="hud-label !text-[8px]">
-                  {r.kind} · {new Date(r.updatedAt).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}
+          {folders.map(([name, count]) => {
+            const [root, leaf = root] = name.split(" / ");
+            return (
+              <button key={name} onClick={() => setFolder(name)} title={name} className={`mb-1 flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-2 text-left ${folder === name ? "bg-cyan/10 text-cyan ring-1 ring-cyan/20" : "text-slate hover:bg-white/5 hover:text-ice"}`}>
+                <span className="min-w-0"><span className="block truncate text-[10px] uppercase tracking-wider opacity-55">{root}</span><span className="block truncate text-xs">{leaf}</span></span>
+                <span className="font-mono text-[9px] opacity-60">{count}</span>
+              </button>
+            );
+          })}
+        </div>
+      </aside>
+
+      <div className="flex min-w-0 flex-1 flex-col">
+        <div className="border-b border-white/7 px-3 py-3 sm:px-4">
+          <div className="flex flex-wrap items-center gap-2">
+            <select value={folder ?? ""} onChange={(event) => setFolder(event.target.value || null)} className="max-w-[48%] rounded-lg border border-white/10 bg-[#0c1524] px-2 py-1.5 text-xs text-ice outline-none md:hidden">
+              <option value="">All files</option>
+              {folders.map(([name, count]) => <option key={name} value={name}>{name} ({count})</option>)}
+            </select>
+            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search saved work…" className="min-w-[150px] flex-1 rounded-lg border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-ice outline-none placeholder:text-slate/60 focus:border-cyan/40" />
+            <span className="hud-label shrink-0 !text-[9px]">{visible.length} item{visible.length === 1 ? "" : "s"}</span>
+          </div>
+          <div className="scrollbar-thin mt-2 flex gap-1.5 overflow-x-auto pb-0.5">
+            {[null, "board", "scene", "canvas", "doc", "chart", "image", "pdf", "trip"].map((k) => (
+              <button key={k ?? "all"} onClick={() => setKind(k)} className={`shrink-0 rounded-full px-2.5 py-1 text-[9px] uppercase tracking-widest transition ${kind === k ? "bg-cyan/15 text-cyan ring-1 ring-cyan/35" : "bg-white/[0.025] text-slate hover:text-ice"}`}>
+                {k === "canvas" ? "mind maps" : k === "doc" ? "writing" : k ?? "all"}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3 sm:p-4">
+          {visible.length === 0 && <div className="mt-12 text-center text-sm text-slate">No saved work matches this view.</div>}
+          <div className="space-y-6">
+            {groups.map(([name, items]) => (
+              <section key={name}>
+                <div className="mb-2 flex items-center gap-2"><span className="hud-label !text-cyan-dim">{name}</span><span className="h-px flex-1 bg-white/5" /></div>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-4">
+                  {items.map((r) => (
+                    <div key={r._id} className="card-lift glass group relative flex min-w-0 flex-col overflow-hidden rounded-xl">
+                      <button onClick={() => open(r)} className="min-w-0 text-left" title={`Open ${r.title}`}>
+                        {r.thumb ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img src={r.thumb} alt="" className="h-24 w-full object-cover" />
+                        ) : (
+                          <div className="relative flex h-24 w-full items-center justify-center overflow-hidden bg-[radial-gradient(circle_at_50%_30%,rgba(0,255,136,0.11),transparent_65%)] text-3xl text-cyan/75">
+                            <span className="absolute inset-x-4 top-1/2 h-px bg-gradient-to-r from-transparent via-cyan/20 to-transparent" />
+                            <span className="relative">{KIND_ICON[r.kind] ?? "✦"}</span>
+                          </div>
+                        )}
+                        <div className="p-2.5 pb-2">
+                          <div className="truncate text-xs text-ice">{r.title}</div>
+                          <div className="mt-1 truncate text-[9px] uppercase tracking-[0.12em] text-slate">{r.category} · {new Date(r.updatedAt).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}</div>
+                        </div>
+                      </button>
+                      <div className="flex items-center justify-between border-t border-white/5 px-2.5 py-1.5">
+                        <button onClick={() => open(r)} className="text-[9px] uppercase tracking-wider text-cyan-dim hover:text-cyan">open / edit</button>
+                        <a href={`/api/creation-download?id=${encodeURIComponent(r._id)}`} className="text-[9px] uppercase tracking-wider text-slate hover:text-cyan">download ↓</a>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              </div>
-            </button>
-          ))}
+              </section>
+            ))}
+          </div>
         </div>
       </div>
     </div>

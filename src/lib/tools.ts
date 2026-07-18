@@ -100,7 +100,7 @@ export const TOOL_DEFS = [
   {
     name: "visual_scene",
     description:
-      "Compose or edit a beautiful live visual workspace while talking: dashboards, KPI tiles, progress, sparklines, line/bar/donut/gauge/candlestick charts, heatmaps, tables, comparisons, timelines, Gantt, kanban, funnels, decision matrices, camera-driven graphs/maps, galleries, link grids, activity streams and trusted live app snapshots. Use stable block ids and patch the existing scene as the conversation evolves. Live facts must use an allowlisted source; inline data is composed conversation content, never label it live.",
+      "Compose or edit a beautiful live visual workspace while talking: dashboards, choices, KPI tiles, progress, charts, heatmaps, tables, comparisons, timelines, Gantt, kanban, funnels, decision matrices, camera-driven graphs/maps, galleries, link grids, activity streams and trusted live app snapshots. Proactively use it when structured conversation is clearer visually, keep one scene per topic, and patch stable block ids as the conversation evolves. Live facts must use an allowlisted source; inline data is composed conversation content, never label it live.",
     parameters: {
       type: "object",
       properties: {
@@ -108,6 +108,8 @@ export const TOOL_DEFS = [
         scene_id: { type: "string", description: "creation id from the prior tool result; omit to use the latest visual scene" },
         title: { type: "string" },
         subtitle: { type: "string" },
+        project: { type: "string", description: "known project this belongs to; omit when it is an ad-hoc inquiry" },
+        inquiry: { type: "string", description: "short stable topic when this is not tied to a known project" },
         capability: { type: "string", enum: [...VISUAL_CAPABILITIES], description: "Optional ready-made live workspace. Custom blocks may be supplied as well." },
         layout: { type: "string", enum: ["dense", "roomy"] },
         focus_block_id: { type: ["string", "null"], description: "focus/highlight a stable block id; null clears focus" },
@@ -503,6 +505,8 @@ export const TOOL_DEFS = [
         prompt: { type: "string", description: "detailed visual prompt, English" },
         size: { type: "string", enum: ["1024*1024", "1280*720", "720*1280", "1152*864"], description: "default 1024*1024" },
         title: { type: "string", description: "short name for the library" },
+        project: { type: "string", description: "known project this belongs to" },
+        inquiry: { type: "string", description: "short stable topic when not tied to a project" },
       },
       required: ["prompt"],
     },
@@ -512,7 +516,12 @@ export const TOOL_DEFS = [
     description: "Save any image URL permanently into Daniel's creations library (re-hosted on his own storage).",
     parameters: {
       type: "object",
-      properties: { url: { type: "string" }, title: { type: "string" } },
+      properties: {
+        url: { type: "string" },
+        title: { type: "string" },
+        project: { type: "string" },
+        inquiry: { type: "string" },
+      },
       required: ["url"],
     },
   },
@@ -525,6 +534,8 @@ export const TOOL_DEFS = [
       properties: {
         title: { type: "string" },
         markdown: { type: "string", description: "the full document content as markdown (#/##/### headings, bullets, numbered lists)" },
+        project: { type: "string" },
+        inquiry: { type: "string", description: "short stable topic when not tied to a project" },
       },
       required: ["title", "markdown"],
     },
@@ -532,15 +543,16 @@ export const TOOL_DEFS = [
   {
     name: "board",
     description:
-      "JARVIS's INFINITE CANVAS — a real freeform board (Excalidraw) you build and edit LIVE while talking: sticky notes, shapes, text, tables, arrows, clickable links (Spotify, references), and rendered images placed anywhere or into named ZONES. create with template 'film' gives a worldbuilding layout (characters / locations / moodboard / storyboard / playlist / notes zones). Use for brainstorming, film/script development, moodboards, project planning — ANY visual thinking. GROUNDING RULE: the board mirrors what DANIEL says and approves — never invent names, plot points or details he didn't confirm; PROPOSE out loud first, add after he agrees. update rewrites an existing item (match its text); remove deletes it — when he asks to change something, change THAT item, don't add a duplicate. To add a rendered picture: create_image first, then board add an image item with its URL into the right zone. Ask Daniel questions as you build (characters? tone? locations?) and keep adding as answers come. Daniel can drag/edit everything by hand too.",
+      "JARVIS's INFINITE CANVAS — a real freeform Excalidraw board you build and edit LIVE while talking: sticky notes, shapes, text, tables, arrows, links and rendered images in named zones. Proactively create template=scavenger whenever Daniel discusses a scavenger hunt, then put his confirmed choices/clues into choices, clues, route, tasks and notes as they emerge. template=film is for worldbuilding. Use for brainstorming, moodboards, project planning and spatial thinking. GROUNDING RULE: mirror what Daniel says or approves; never invent missing names, clues, plot points or facts. update rewrites an existing item and remove deletes it—never add a duplicate when he asks for a change. Daniel can drag/edit and export everything by hand too.",
     parameters: {
       type: "object",
       properties: {
         action: { type: "string", enum: ["create", "add", "update", "remove", "show"] },
         match: { type: "string", description: "update/remove: a few words from the EXISTING item's text" },
         title: { type: "string", description: "board title (create/show)" },
-        template: { type: "string", enum: ["film", "blank"], description: "create only, default blank" },
+        template: { type: "string", enum: ["film", "scavenger", "blank"], description: "create only; scavenger has choices/clues/route/tasks/notes zones" },
         project: { type: "string", description: "project slug this board belongs to (memory filing), e.g. 'island-script'" },
+        inquiry: { type: "string", description: "short stable topic when this is not a named project" },
         items: {
           type: "array",
           description: "add only — high-level items; JARVIS places them (zone grid) unless x/y given",
@@ -573,6 +585,8 @@ export const TOOL_DEFS = [
       properties: {
         action: { type: "string", enum: ["create", "update", "show"] },
         title: { type: "string", description: "map title (create/show)" },
+        project: { type: "string" },
+        inquiry: { type: "string", description: "short stable topic when not tied to a project" },
         nodes: {
           type: "array",
           description: "nodes to add/update; id is a short slug; parent links it into the tree layout",
@@ -618,6 +632,8 @@ export const TOOL_DEFS = [
         series_label: { type: "string" },
         bars: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" }, note: { type: "string" } }, required: ["label", "value"] } },
         bars_label: { type: "string" },
+        project: { type: "string" },
+        inquiry: { type: "string", description: "short stable topic when not tied to a project" },
       },
       required: ["title"],
     },
@@ -719,10 +735,13 @@ export const TOOL_DEFS = [
   },
   {
     name: "creations_list",
-    description: "Open Daniel's creations library on screen — everything you've made (mind maps, charts, images, PDFs). Use for 'show my/your creations, where's that image/pdf/map'.",
+    description: "Open Daniel's organised saved-work library on screen—projects and inquiry folders containing boards, visual workspaces, mind maps, charts, images, PDFs, notes, emails, documents and travel plans. Every item can be reopened and downloaded.",
     parameters: {
       type: "object",
-      properties: { kind: { type: "string", enum: ["canvas", "chart", "image", "pdf", "doc"], description: "filter, optional" } },
+      properties: {
+        kind: { type: "string", enum: ["board", "scene", "canvas", "chart", "image", "pdf", "doc", "trip"], description: "filter, optional" },
+        folder: { type: "string", description: "folder label to open, optional" },
+      },
     },
   },
   {
@@ -734,6 +753,9 @@ export const TOOL_DEFS = [
       properties: {
         title: { type: "string", description: "short stable name, e.g. 'Email to Hygglo support'" },
         content: { type: "string", description: "the complete current draft text (markdown ok) — full replacement each call" },
+        document_type: { type: "string", enum: ["email", "note", "document", "message", "script"], description: "used to file the draft in the right library category" },
+        project: { type: "string" },
+        inquiry: { type: "string", description: "short stable topic when not tied to a project" },
       },
       required: ["title", "content"],
     },
@@ -1906,9 +1928,10 @@ async function createImage(args: any): Promise<string> {
       message: `R2 re-home of generated image failed: ${String(e?.message ?? e).slice(0, 200)}`,
     }).catch(() => {});
   }
-  await convexMutation("creations:create", { kind: "image", title, url: finalUrl, thumb: finalUrl, data: prompt }).catch(() => {});
+  const filing = await creationFiling(args);
+  await convexMutation("creations:create", { kind: "image", title, url: finalUrl, thumb: finalUrl, data: prompt, ...filing }).catch(() => {});
   await convexMutation("ui:setPanel", { type: "image", value: finalUrl, title });
-  await convexMutation("chatQueue:postCard", { threadId: await activeThread(), type: "image", value: finalUrl, title }).catch(() => {});
+  await convexMutation("chatQueue:postCard", { threadId: filing.threadId, type: "image", value: finalUrl, title }).catch(() => {});
   return `Image generated and on screen (saved to the creations library). URL: ${finalUrl}`;
 }
 
@@ -1918,8 +1941,9 @@ async function storeImage(args: any): Promise<string> {
   const title = String(args.title ?? "stored image").slice(0, 80);
   try {
     const { url: stored } = await r2StoreFromUrl(title, url);
-    await convexMutation("creations:create", { kind: "image", title, url: stored, thumb: stored }).catch(() => {});
-    await convexMutation("chatQueue:postCard", { threadId: await activeThread(), type: "image", value: stored, title }).catch(() => {});
+    const filing = await creationFiling(args);
+    await convexMutation("creations:create", { kind: "image", title, url: stored, thumb: stored, ...filing }).catch(() => {});
+    await convexMutation("chatQueue:postCard", { threadId: filing.threadId, type: "image", value: stored, title }).catch(() => {});
     return `Stored permanently in the creations library: ${stored}`;
   } catch (e: any) {
     return `Couldn't store that image: ${e?.message ?? e}`;
@@ -1934,9 +1958,10 @@ async function createPdf(args: any): Promise<string> {
     const { markdownToPdf } = await import("./pdf");
     const bytes = await markdownToPdf(title, md.slice(0, 30_000));
     const url = await r2Put(title, bytes, "application/pdf");
-    await convexMutation("creations:create", { kind: "pdf", title, url, data: md.slice(0, 20_000) }).catch(() => {});
+    const filing = await creationFiling(args);
+    await convexMutation("creations:create", { kind: "pdf", title, url, data: md.slice(0, 20_000), ...filing }).catch(() => {});
     await convexMutation("ui:setPanel", { type: "pdf", value: url, title });
-    await convexMutation("chatQueue:postCard", { threadId: await activeThread(), type: "pdf", value: url, title: `${title}.pdf` }).catch(() => {});
+    await convexMutation("chatQueue:postCard", { threadId: filing.threadId, type: "pdf", value: url, title: `${title}.pdf` }).catch(() => {});
     return `PDF ready and on screen — download link: ${url} (also saved in the creations library).`;
   } catch (e: any) {
     return `PDF creation failed: ${e?.message ?? e}`;
@@ -1950,8 +1975,13 @@ async function boardTool(args: any): Promise<string> {
   const action = String(args.action ?? "");
   if (action === "create") {
     const title = String(args.title ?? "Board").slice(0, 80);
-    const template = ["film", "blank"].includes(String(args.template)) ? String(args.template) : "blank";
-    const { doc } = await createBoard(title, template, args.project ? String(args.project) : undefined);
+    const template = ["film", "scavenger", "blank"].includes(String(args.template)) ? String(args.template) : "blank";
+    const filing = await creationFiling(args, "boards");
+    const { doc } = await createBoard(title, template, {
+      project: filing.project,
+      inquiry: filing.inquiry,
+      threadId: filing.threadId,
+    });
     return (
       `Board "${title}" is live on screen (zones: ${Object.keys(doc.zones).join(", ")}). ` +
       `Add items with board/add into those zones as the conversation flows — and ASK Daniel the next good question about the project. ` +
@@ -2055,7 +2085,12 @@ async function mindMap(args: any): Promise<string> {
     if (!cleanNodes.length) return "Give me at least one node.";
     const { good } = resolveRefs(cleanNodes, cleanEdges);
     const doc = { title, nodes: cleanNodes, edges: good };
-    const id = await convexMutation("creations:create", { kind: "canvas", title, data: JSON.stringify(doc) });
+    const id = await convexMutation("creations:create", {
+      kind: "canvas",
+      title,
+      data: JSON.stringify(doc),
+      ...(await creationFiling(args, "mind maps")),
+    });
     await convexMutation("ui:setPanel", { type: "canvas", value: JSON.stringify({ ...doc, creationId: String(id) }), title: `map · ${title}` });
     return `Mind map "${title}" is live on screen. Node ids: ${cleanNodes.map((n: any) => n.id).join(", ")}. Keep talking — use mind_map update (these exact ids) to add/change/remove as the conversation flows.`;
   }
@@ -2131,9 +2166,10 @@ async function visualSceneTool(args: any): Promise<string> {
     return "TOOL DID NOTHING: add at least one visual block or choose a capability.";
 
   if (action === "create") {
-    sceneId = String(await convexMutation("creations:create", { kind: "scene", title: scene.title, data: JSON.stringify(scene) }));
+    const filing = await creationFiling(args, "visual workspaces");
+    sceneId = String(await convexMutation("creations:create", { kind: "scene", title: scene.title, data: JSON.stringify(scene), ...filing }));
     await convexMutation("chatQueue:postCard", {
-      threadId: await activeThread(),
+      threadId: filing.threadId,
       type: "scene",
       value: JSON.stringify({ creationId: sceneId }),
       title: scene.title,
@@ -2227,7 +2263,7 @@ async function chartTool(args: any): Promise<string> {
   };
   if (!widget.kpis.length && !widget.series.length && !widget.bars.length) return "Give me some numbers to chart (kpis, series or bars).";
   await showWidget(widget, title);
-  await convexMutation("creations:create", { kind: "chart", title, data: JSON.stringify(widget) }).catch(() => {});
+  await convexMutation("creations:create", { kind: "chart", title, data: JSON.stringify(widget), ...(await creationFiling(args, "charts")) }).catch(() => {});
   return `Chart "${title}" is on screen and saved in the creations library. Speak one takeaway.`;
 }
 
@@ -2458,9 +2494,19 @@ async function draftDoc(args: any): Promise<string> {
   const content = String(args.content ?? "");
   if (!content.trim()) return "TOOL DID NOTHING: no content passed.";
   const existing: any = await convexQuery("creations:latest", { kind: "doc", titleMatch: title.toLowerCase() }).catch(() => null);
+  const categoryByType: Record<string, string> = {
+    email: "emails",
+    note: "notes",
+    document: "documents",
+    message: "messages",
+    script: "scripts",
+  };
+  const filing = await creationFiling(args, categoryByType[String(args.document_type ?? "")] ?? undefined);
   let id = existing?._id ?? null;
-  if (id) await convexMutation("creations:update", { id, title, data: content });
-  else id = await convexMutation("creations:create", { kind: "doc", title, data: content });
+  if (id && filing.project && existing.project && existing.project !== filing.project) id = null;
+  if (id && filing.inquiry && existing.inquiry && existing.inquiry !== filing.inquiry) id = null;
+  if (id) await convexMutation("creations:update", { id, title, data: content, ...filing });
+  else id = await convexMutation("creations:create", { kind: "doc", title, data: content, ...filing });
   await convexMutation("ui:setPanel", { type: "doc", value: JSON.stringify({ creationId: id }), title: `draft · ${title}` });
   const words = content.trim().split(/\s+/).length;
   return `Draft "${title}" is on screen (${words} words) and updates LIVE. Discuss it in one or two short sentences — don't read it out. To revise, call draft again with the same title and the full new text.`;
@@ -2787,9 +2833,10 @@ async function tripFinalizeTool(args: any): Promise<string> {
 }
 
 async function creationsList(args: any): Promise<string> {
-  const kind = ["canvas", "chart", "image", "pdf", "doc"].includes(String(args.kind)) ? String(args.kind) : undefined;
-  const rows: any[] = (await convexQuery("creations:list", { kind, limit: 30 })) ?? [];
-  await convexMutation("ui:setPanel", { type: "creations", value: JSON.stringify({ kind: kind ?? null }), title: "creations library" });
+  const kind = ["board", "scene", "canvas", "chart", "image", "pdf", "doc", "trip"].includes(String(args.kind)) ? String(args.kind) : undefined;
+  const folder = args.folder ? String(args.folder).slice(0, 160) : undefined;
+  const rows: any[] = (await convexQuery("creations:list", { kind, folder, limit: 30 })) ?? [];
+  await convexMutation("ui:setPanel", { type: "creations", value: JSON.stringify({ kind: kind ?? null, folder: folder ?? null }), title: "saved work" });
   if (!rows.length) return "The creations library is empty so far — everything I make from now on lands there.";
   return (
     `Creations library is on screen (${rows.length} items). Latest: ` +
@@ -2801,6 +2848,17 @@ async function creationsList(args: any): Promise<string> {
 async function activeThread(): Promise<string> {
   const t = await convexQuery("ui:getActiveThread", {});
   return typeof t === "string" && t ? t : "main";
+}
+
+async function creationFiling(args: any, category?: string): Promise<{
+  category?: string;
+  project?: string;
+  inquiry?: string;
+  threadId: string;
+}> {
+  const project = String(args?.project ?? "").trim().slice(0, 80) || undefined;
+  const inquiry = String(args?.inquiry ?? "").trim().slice(0, 80) || undefined;
+  return { category, project, inquiry, threadId: await activeThread() };
 }
 
 export async function executeTool(name: string, args: any, authTokenHash?: string): Promise<string> {

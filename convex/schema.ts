@@ -413,10 +413,19 @@ export default defineSchema({
     data: v.optional(v.string()), // JSON (canvas/chart) or markdown (doc)
     url: v.optional(v.string()), // R2 public url (image/pdf)
     thumb: v.optional(v.string()), // small preview url if any
+    category: v.optional(v.string()), // emails, notes, boards, mind maps, etc.
+    folder: v.optional(v.string()), // human-readable hierarchy: Projects / X, Visuals / Boards…
+    project: v.optional(v.string()),
+    inquiry: v.optional(v.string()),
+    threadId: v.optional(v.string()), // conversation that produced the creation
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_kind", ["kind", "updatedAt"])
+    .index("by_category", ["category", "updatedAt"])
+    .index("by_folder", ["folder", "updatedAt"])
+    .index("by_project", ["project", "updatedAt"])
+    .index("by_thread", ["threadId", "updatedAt"])
     .index("by_updatedAt", ["updatedAt"]),
 
   // Proactive insights the insight engine generates + surfaces (chat/notification).

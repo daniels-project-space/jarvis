@@ -71,3 +71,15 @@ export async function controlMutation(path: string, args: Record<string, unknown
   if (!response.ok || payload?.status === "error") throw new Error("Control request was rejected");
   return payload.value;
 }
+
+export async function controlQuery(path: string, args: Record<string, unknown>): Promise<unknown> {
+  const response = await fetch(`${CONVEX_URL}/api/query`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, args, format: "json" }),
+    cache: "no-store",
+  });
+  const payload = await response.json();
+  if (!response.ok || payload?.status === "error") throw new Error("Control request was rejected");
+  return payload.value;
+}

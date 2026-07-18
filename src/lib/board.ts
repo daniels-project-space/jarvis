@@ -11,6 +11,7 @@ export type BoardDoc = {
   kind: "board";
   title: string;
   project?: string;
+  inquiry?: string;
   zones: Record<string, Zone>;
   pendingOps: any[]; // {ts, kind:"skeleton"|"image", ...}
   elements: any[]; // full excalidraw elements — client-persisted
@@ -45,6 +46,19 @@ const TEMPLATES: Record<string, { name: string; w: number; h: number }[][]> = {
       { name: "playlist", w: 1800, h: 1300 },
     ],
     [{ name: "notes", w: 5600, h: 900 }],
+  ],
+  scavenger: [
+    [
+      { name: "choices", w: 1900, h: 1200 },
+      { name: "clues", w: 2500, h: 1200 },
+      { name: "route", w: 1900, h: 1200 },
+    ],
+    [
+      { name: "tasks", w: 1900, h: 1050 },
+      { name: "people", w: 1900, h: 1050 },
+      { name: "evidence", w: 2500, h: 1050 },
+    ],
+    [{ name: "notes", w: 6600, h: 850 }],
   ],
   blank: [[{ name: "ideas", w: 2400, h: 1600 }]],
 };
@@ -185,17 +199,38 @@ export async function loadBoard(titleMatch?: string): Promise<{ id: string; doc:
   }
 }
 
-export async function createBoard(title: string, template: string, project?: string): Promise<{ id: string; doc: BoardDoc }> {
+export async function createBoard(
+  title: string,
+  template: string,
+  filing?: { project?: string; inquiry?: string; threadId?: string },
+): Promise<{ id: string; doc: BoardDoc }> {
   const { zones, ops } = buildZones(template);
-  const doc: BoardDoc = { kind: "board", title, project, zones, pendingOps: ops, elements: [], imageUrls: {} };
-  const id = await convexMutation("creations:create", { kind: "board", title, data: JSON.stringify(doc) });
+  const doc: BoardDoc = {
+    kind: "board",
+    title,
+    project: filing?.project,
+    inquiry: filing?.inquiry,
+    zones,
+    pendingOps: ops,
+    elements: [],
+    imageUrls: {},
+  };
+  const id = await convexMutation("creations:create", {
+    kind: "board",
+    title,
+    data: JSON.stringify(doc),
+    category: "boards",
+    project: filing?.project,
+    inquiry: filing?.inquiry,
+    threadId: filing?.threadId,
+  });
   await convexMutation("ui:setPanel", { type: "board", value: JSON.stringify({ creationId: String(id) }), title: `board · ${title}` });
-  if (project)
+  if (filing?.project)
     await convexMutation("memory:write", {
       kind: "project",
       title: `Board started: ${title}`,
-      body: `Working board "${title}" (template ${template}) for project ${project} — lives in the creations library.`,
-      tags: ["board", project],
+      body: `Working board "${title}" (template ${template}) for project ${filing.project} — lives in the creations library.`,
+      tags: ["board", filing.project],
     }).catch(() => {});
   return { id: String(id), doc };
 }

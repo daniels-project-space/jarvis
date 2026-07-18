@@ -17,6 +17,7 @@ import type * as chat from "../chat.js";
 import type * as chatQueue from "../chatQueue.js";
 import type * as commandCenter from "../commandCenter.js";
 import type * as controlAuth from "../controlAuth.js";
+import type * as creationFiling from "../creationFiling.js";
 import type * as creations from "../creations.js";
 import type * as findings from "../findings.js";
 import type * as incidents from "../incidents.js";
@@ -52,6 +53,7 @@ declare const fullApi: ApiFromModules<{
   chatQueue: typeof chatQueue;
   commandCenter: typeof commandCenter;
   controlAuth: typeof controlAuth;
+  creationFiling: typeof creationFiling;
   creations: typeof creations;
   findings: typeof findings;
   incidents: typeof incidents;

@@ -229,6 +229,8 @@ function panelSize(panel: { type: string; value: string }): string {
       return "w-[min(980px,97%)] h-full";
     case "doc":
       return "w-[min(880px,80%)] h-[min(800px,94%)]";
+    case "creations":
+      return "w-[96%] md:w-[min(1200px,calc(100%-250px))] h-[min(780px,94%)]";
     default:
       return "h-full w-full";
   }
@@ -286,7 +288,7 @@ const OPTION_MOODS: { k: string; c: string }[] = [
   { k: "curious", c: "#33e0d0" }, { k: "serious", c: "#8fa3bd" }, { k: "excited", c: "#ff5470" },
 ];
 function OptionsPanel({
-  prefs, setPref, permissions, permissionBusy, onEnablePermissions, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood,
+  prefs, setPref, permissions, permissionBusy, onEnablePermissions, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary,
 }: {
   prefs: JarvisPrefs;
   setPref: (k: keyof JarvisPrefs, v: string | boolean) => void;
@@ -300,6 +302,7 @@ function OptionsPanel({
   onToggleLive: () => void;
   onMood: (m: string) => void;
   onClearMood: () => void;
+  onOpenLibrary: () => void;
 }) {
   const Row = ({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) => (
     <div className="flex items-center justify-between gap-4 py-2.5">
@@ -315,7 +318,7 @@ function OptionsPanel({
   return (
     <>
       <div className="fixed inset-0 z-[55]" onClick={onClose} />
-      <div className="absolute right-3 top-14 z-[56] w-[min(340px,92vw)] rounded-2xl border border-white/12 bg-[rgba(14,22,38,0.72)] p-4 shadow-2xl backdrop-blur-2xl md:right-5">
+      <div className="scrollbar-thin absolute right-3 top-14 z-[56] max-h-[calc(100dvh-5rem)] w-[min(340px,92vw)] overflow-y-auto rounded-2xl border border-white/12 bg-[rgba(14,22,38,0.72)] p-4 shadow-2xl backdrop-blur-2xl md:right-5">
         <div className="mb-1 flex items-center justify-between">
           <span className="hud-label !text-cyan">options</span>
           <button onClick={onClose} className="hud-label hover:text-cyan">close</button>
@@ -342,6 +345,11 @@ function OptionsPanel({
           </Row>
           <Row label="Speaking voice" hint="one consistent expressive voice · no robotic fallback">
             <span className="rounded-lg border border-white/10 bg-black/20 px-2.5 py-1 text-[11px] text-ice">Ryan</span>
+          </Row>
+          <Row label="Saved work" hint="projects, inquiries, notes, emails, boards, maps and files">
+            <button onClick={onOpenLibrary} className="rounded-lg border border-cyan/30 px-3 py-1 text-[11px] text-cyan transition hover:bg-cyan/10">
+              open library
+            </button>
           </Row>
           <Row label="Live conversation" hint={live !== "off" ? "on now" : "listen → answer → listen, with no self-echo"}>
             <button onClick={onToggleLive} className={`rounded-lg px-3 py-1 text-[11px] transition ${live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>
@@ -2724,6 +2732,12 @@ export default function JarvisUI() {
           onToggleLive={() => void toggleLive()}
           onMood={(m) => void setMoodMut({ mood: m, manual: true })}
           onClearMood={() => void setMoodMut({ mood: "calm", manual: false })}
+          onOpenLibrary={() => {
+            setOptionsOpen(false);
+            setPanelFull(false);
+            setPanelMin(false);
+            void setPanel({ type: "creations", value: JSON.stringify({ kind: null, folder: null }), title: "saved work" });
+          }}
         />
       )}
 

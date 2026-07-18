@@ -176,7 +176,7 @@ export default function BoardView({ value }: { value: string }) {
           if (saveTimer.current) clearTimeout(saveTimer.current);
           saveTimer.current = setTimeout(() => void persist(), 1500);
         }}
-        UIOptions={{ canvasActions: { toggleTheme: false, saveToActiveFile: false, loadScene: false, export: false } }}
+        UIOptions={{ canvasActions: { toggleTheme: false, saveToActiveFile: false, loadScene: false, export: { saveFileToDisk: true } } }}
       />
     </div>
   );
