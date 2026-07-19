@@ -2,7 +2,7 @@ export const TOOL_BELTS: Record<string, Set<string>> = {
   core: new Set([
     "dispatch_agent", "show", "show_ranking", "rank_focus", "video_control", "hide", "web_search", "weather",
     "timer", "briefing", "remind_at", "todo_add", "todo_done", "todo_list", "calendar_add", "calendar_view",
-    "open_app", "mac_shortcut", "current_time", "calculate", "orb_mood",
+    "open_app", "host_ui", "mac_shortcut", "current_time", "calculate", "orb_mood",
   ]),
   work: new Set([
     "orchestrate", "goal_mode", "self_repair", "self_improve", "research", "plan_my_day", "net_worth", "memory_map",

@@ -107,6 +107,7 @@ export const stackPoller = schedules.task({
           name: profile?.name,
           repo: profile?.repo,
           purpose: profile?.purpose,
+          vision: profile?.vision,
           objectives: profile?.objectives ?? [],
           invariants: profile?.invariants ?? [],
           related: profile?.related ?? [],

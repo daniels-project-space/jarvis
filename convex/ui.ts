@@ -38,6 +38,35 @@ export const getPanel = query({
   },
 });
 
+// One-shot action for the top-level app surrounding the cross-origin Jarvis
+// embed. The iframe relays only fresh rows to its verified parent; main Jarvis
+// clients ignore this channel. Keeping it separate from `panel` means a real
+// host navigation can never be mistaken for a visual that merely looks open.
+export const setHostAction = mutation({
+  args: { value: v.string(), title: v.optional(v.string()), ...dispatcherAuthArgs },
+  handler: async (ctx, a) => {
+    await requireDispatcher(ctx, a);
+    const ex = await ctx.db.query("ui").withIndex("by_key", (q) => q.eq("key", "hostAction")).first();
+    const doc = {
+      key: "hostAction",
+      type: "host-action",
+      value: a.value.slice(0, 6_000),
+      title: a.title?.slice(0, 160),
+      updatedAt: Date.now(),
+    };
+    if (ex) await ctx.db.patch(ex._id, doc);
+    else await ctx.db.insert("ui", doc);
+  },
+});
+
+export const getHostAction = query({
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return ctx.db.query("ui").withIndex("by_key", (q) => q.eq("key", "hostAction")).first();
+  },
+});
+
 // Compatibility for clients left open across the removal of the ephemeral
 // say channel. Convex subscriptions can outlive a Vercel client deployment,
 // so keep the authenticated read contract until those clients have aged out.

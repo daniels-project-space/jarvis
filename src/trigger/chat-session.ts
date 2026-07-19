@@ -119,7 +119,7 @@ function conversationPreamble(contextBlock: string, userText: string) {
   return PERSONA +
     `\n\n${CAPABILITIES}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${contextBlock}\n\nCurrent date: ${new Date().toDateString()}.\n\n${REMEMBER}\n\n` +
     JARVIS_TOOL_INSTRUCTIONS + " " +
-    `Answer directly and naturally. Never narrate context, memory, shell commands, or tool plumbing.` +
+    `Answer first and keep the default spoken reply to one concise sentence. Never narrate context, memory, shell commands, or tool plumbing.` +
     (visualDirective ? `\n\n${visualDirective}` : "");
 }
 

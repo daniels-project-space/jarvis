@@ -86,20 +86,21 @@ describe("single Edge neural speech queue", () => {
     vi.restoreAllMocks();
   });
 
-  it("keeps complete sentences for neural generation", () => {
+  it("keeps an ordinary multi-sentence reply in one neural generation", () => {
     expect(sentences("First complete sentence. Second complete sentence."))
-      .toEqual(["First complete sentence.", "Second complete sentence."]);
+      .toEqual(["First complete sentence. Second complete sentence."]);
   });
 
-  it("starts a short complete opening without waiting for the next sentence", () => {
+  it("does not introduce a decode seam between two short spoken thoughts", () => {
     expect(sentences("Right here, sir. What's the first thing we're sorting?"))
-      .toEqual(["Right here, sir.", "What's the first thing we're sorting?"]);
+      .toEqual(["Right here, sir. What's the first thing we're sorting?"]);
   });
 
   it("bounds long neural requests without losing spoken content", () => {
     const input = "This deliberately long sentence explains the entire plan in enough detail that a single neural generation request would otherwise become slow and timeout-prone on a browser without a hardware GPU, while every word must still be spoken in order.";
     const chunks = sentences(input);
-    expect(Math.max(...chunks.map((chunk) => chunk.length))).toBeLessThanOrEqual(56);
+    expect(Math.max(...chunks.map((chunk) => chunk.length))).toBeLessThanOrEqual(240);
+    expect(chunks.length).toBeLessThanOrEqual(2);
     expect(chunks.join(" ")).toBe(normalizeSpeechText(input));
   });
 
@@ -119,9 +120,9 @@ describe("single Edge neural speech queue", () => {
       .toEqual(["This answer arrived without punctuation."]);
   });
 
-  it("gives complete sentence endings a longer pause than clause endings", () => {
+  it("keeps only a short boundary pause between separately generated chunks", () => {
     expect(speechPauseMs("One thought,")).toBeLessThan(speechPauseMs("That is the answer."));
-    expect(speechPauseMs("Is that right?")).toBeGreaterThanOrEqual(150);
+    expect(speechPauseMs("Is that right?")).toBeLessThanOrEqual(45);
   });
 
   it("exposes only stable complete sentences during token streaming", () => {

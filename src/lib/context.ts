@@ -1,6 +1,7 @@
 import "server-only";
 import { currentAdminSession } from "./control-context";
 import { resolveConvexUrl } from "./convex-url";
+import { PORTFOLIO_NORTH_STAR, PROJECT_REGISTRY } from "./project-registry";
 
 // Server-side context bundle for the brain: memory, business intel, hub
 // (to-dos/calendar/wealth), cloud stack, running agents, fresh findings.
@@ -106,6 +107,10 @@ export async function buildContext(
   const upcoming = Array.isArray(events) ? events : [];
 
   const lines: string[] = [];
+  lines.push(
+    `PORTFOLIO NORTH STAR: ${PORTFOLIO_NORTH_STAR} ` +
+      "Judge projects by movement toward their intended outcome and current phase, never by commit age or elapsed time alone.",
+  );
   if (mem.length) lines.push("Long-term memory:\n" + mem.map((m: any) => `- ${m.title}: ${m.body}`).join("\n"));
   if (Array.isArray(biz) && biz.length)
     lines.push("Businesses right now:\n" + biz.map((b: any) => `- ${b.headline}${b.detail ? " " + b.detail : ""}`).join("\n"));
@@ -136,12 +141,26 @@ export async function buildContext(
           .map(
             (s: any) =>
               `- ${s.slug} [${s.status}]: ${s.data?.purpose ?? s.summary}` +
+              `${s.data?.vision ? ` Vision: ${s.data.vision}` : ""}` +
               `${s.data?.objectives?.length ? ` Goal: ${s.data.objectives[0]}.` : ""}` +
               `${s.data?.recent ? ` ${s.data.recent}.` : ""}`,
           )
           .join("\n")
-          .slice(0, 2400),
+          .slice(0, 3600),
     );
+  const mentionedProfiles = PROJECT_REGISTRY.filter((profile) => {
+    // Do not include the shared organisation name here: the word "project"
+    // appears in every repo owner and would otherwise select arbitrary apps.
+    const haystack = `${profile.slug} ${profile.name}`.toLowerCase();
+    const words = (userText ?? "").toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length >= 4);
+    return words.some((word) => haystack.includes(word));
+  }).slice(0, 3);
+  if (mentionedProfiles.length) {
+    lines.push(
+      "RELEVANT LONG-HORIZON VISION:\n" +
+        mentionedProfiles.map((profile) => `- ${profile.name}: ${profile.vision}`).join("\n"),
+    );
+  }
   if (goals.length)
     lines.push(
       "DURABLE PROJECT OUTCOMES — connect work and suggestions to these, update evidence rather than inventing a new task list:\n" +
@@ -256,7 +275,7 @@ export async function buildContext(
     lines.push(desc);
   }
 
-  return lines.join("\n\n").slice(0, 6000);
+  return lines.join("\n\n").slice(0, 9000);
 }
 
 // A deliberately small context retained for bounded utility callers. The rich

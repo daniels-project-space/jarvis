@@ -32,6 +32,7 @@ import { NarrationLedger, narrationClaim } from "@/lib/narration";
 import { resolvePanelRoute } from "@/lib/panel-contract";
 import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
 import { needsHostContext, visibleTurnText, withHostContext, type JarvisHostContext } from "@/lib/host-context";
+import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actions";
 import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
 import { viewerFetch } from "@/lib/viewer-request";
 import { normalizeIncidentSignature } from "@/lib/incident-signature";
@@ -93,6 +94,15 @@ type Caption = {
   exiting?: boolean;
 } | null;
 type StagePanel = { type: string; value: string; title?: string; updatedAt: number };
+type HostActionResult = { ok: boolean; detail?: string };
+type StreamingSpeechState = {
+  id: string;
+  queuedChars: number;
+  chain: Promise<void>;
+  timer: ReturnType<typeof setTimeout> | null;
+  pendingPrefix: string;
+  pendingCaption: string;
+};
 
 const ytId = (s: string) => {
   const m = String(s).match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([\w-]{11})/);
@@ -1282,6 +1292,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const threadRef = useRef("main");
   const threadReadyRef = useRef(false);
   const pendingEntryCommands = useRef<string[]>([]);
+  const hostContextRef = useRef<JarvisHostContext | null>(null);
+  const hostActionWaiters = useRef(new Map<string, (result: HostActionResult) => void>());
   useEffect(() => {
     threadRef.current = thread;
     if (!activeThreadReady) return;
@@ -1325,6 +1337,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const setLiveOn = (args: Record<string, unknown>) => clientMutation("ui:setLiveOn", args);
   const voiceRow = useJarvisQuery(api.ui.getVoice, {}) as { value: string; updatedAt: number } | null | undefined;
   const liveOnRow = useJarvisQuery(api.ui.getLiveOn, {}) as { value: string; updatedAt: number } | null | undefined;
+  const hostActionRow = useJarvisQuery(api.ui.getHostAction, embedded ? {} : "skip") as
+    | { value: string; updatedAt: number }
+    | null
+    | undefined;
   const commandSnapshot = useJarvisQuery(api.commandCenter.snapshot, embedded ? "skip" : {}) as any;
   const activeJobs = useMemo(
     () => relevantActiveWork((commandSnapshot?.active ?? []) as Job[], 4),
@@ -1344,6 +1360,28 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (Date.now() - latest.createdAt > 60_000) return;
     window.parent.postMessage({ jarvis: "notify", text: sanitizeAssistantText(latest.text).slice(0, 240) }, "*");
   }, [embedded, messages]);
+  const lastRelayedHostAction = useRef<string | null>(null);
+  useEffect(() => {
+    if (!embedded || !hostActionRow || Date.now() - hostActionRow.updatedAt > 20_000) return;
+    let action: JarvisHostAction;
+    try {
+      action = JSON.parse(hostActionRow.value) as JarvisHostAction;
+    } catch {
+      return;
+    }
+    const currentHostId = hostContextRef.current?.hostId;
+    if (!action.hostId || !currentHostId || action.hostId !== currentHostId) return;
+    const id = action.id || String(hostActionRow.updatedAt);
+    if (lastRelayedHostAction.current === id) return;
+    try {
+      if (sessionStorage.getItem("jarvis_host_action") === id) return;
+      sessionStorage.setItem("jarvis_host_action", id);
+    } catch {
+      /* private mode */
+    }
+    lastRelayedHostAction.current = id;
+    window.parent.postMessage({ jarvis: "host-action", action: { ...action, id } }, "*");
+  }, [embedded, hostActionRow]);
 
   const [input, setInput] = useState("");
   const [speaking, setSpeaking] = useState(false);
@@ -1468,10 +1506,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const endRef = useRef<HTMLDivElement>(null);
   const lastSpokenId = useRef<string | null>(null);
   const lastSpokenText = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
-  const streamingSpeechRef = useRef<{ id: string; queuedChars: number; chain: Promise<void> }>({
+  const streamingSpeechRef = useRef<StreamingSpeechState>({
     id: "",
     queuedChars: 0,
     chain: Promise.resolve(),
+    timer: null,
+    pendingPrefix: "",
+    pendingCaption: "",
   });
   const narrationLedgerRef = useRef(new NarrationLedger());
   const captionRef = useRef<Caption>(null);
@@ -1732,7 +1773,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // Show the Hub overlay and begin the neural voice load immediately, while
     // SpeechRecognition is still collecting a same-breath command.
     if (embedded) window.parent.postMessage({ jarvis: "wake" }, "*");
-    void import("../lib/wakeword").then((module) => module.chime());
     void import("../lib/tts").then((module) => module.warm());
   };
   const onWake = (transcript: string) => {
@@ -1830,12 +1870,22 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       if (message.jarvis === "host-show") setChatMode("off", false);
       if (message.jarvis === "host-hide" && liveRef.current) void toggleLive();
       if (message.jarvis === "host-wake-state") setWake(message.listening === true);
+      if ((message.jarvis === "host-context" || message.jarvis === "context-response") && message.context) {
+        hostContextRef.current = message.context as JarvisHostContext;
+      }
+      if (message.jarvis === "host-action-result" && typeof message.id === "string") {
+        const finish = hostActionWaiters.current.get(message.id);
+        if (finish) {
+          hostActionWaiters.current.delete(message.id);
+          finish({ ok: message.ok === true, detail: typeof message.detail === "string" ? message.detail : undefined });
+        }
+      }
+      if (message.jarvis === "host-interrupt") stopTalking();
       if (message.jarvis === "host-wake-detected") {
         setWake(true);
         setChatMode("off", false);
         showCaption({ who: "you", text: "Listening…" });
         unlockSpeechPlayback();
-        void import("../lib/wakeword").then((module) => module.chime());
         void import("../lib/tts").then((module) => module.warm());
       }
       if (message.jarvis === "host-transcript" && typeof message.text === "string") {
@@ -2081,26 +2131,46 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (!stablePrefix) return;
     let streamState = streamingSpeechRef.current;
     if (streamState.id !== latestAssistant._id) {
-      streamState = { id: latestAssistant._id, queuedChars: 0, chain: Promise.resolve() };
+      if (streamState.timer) clearTimeout(streamState.timer);
+      streamState = {
+        id: latestAssistant._id,
+        queuedChars: 0,
+        chain: Promise.resolve(),
+        timer: null,
+        pendingPrefix: "",
+        pendingCaption: "",
+      };
       streamingSpeechRef.current = streamState;
     }
-    if (stablePrefix.length <= streamState.queuedChars) return;
-    const from = streamState.queuedChars;
-    const speechChunk = stablePrefix.slice(from).trim();
-    streamState.queuedChars = stablePrefix.length;
-    if (!speechChunk) return;
-    // Queue stable sentences immediately. The final-message effect only voices
-    // the unqueued tail, so complex replies start audibly while Codex is still
-    // generating without ever repeating the opening.
-    streamState.chain = streamState.chain.then(async () => {
-      if (streamingSpeechRef.current.id !== latestAssistant._id) return;
-      await narrateText({
-        text: speechChunk,
-        claim: narrationClaim(`turn:${latestAssistant._id}`, stablePrefix, from, stablePrefix.length),
-        captionText: latestAssistant.text,
-        final: false,
+    if (stablePrefix.length <= Math.max(streamState.queuedChars, streamState.pendingPrefix.length)) return;
+    streamState.pendingPrefix = stablePrefix;
+    streamState.pendingCaption = latestAssistant.text;
+    if (streamState.timer) clearTimeout(streamState.timer);
+    // Give a concise answer a fraction of a second to finalise. Most replies
+    // then become one natural neural request rather than sentence-sized MP3s
+    // with audible network/decode gaps. Long-running generations still begin
+    // with their first stable paragraph instead of waiting indefinitely.
+    streamState.timer = setTimeout(() => {
+      const current = streamingSpeechRef.current;
+      if (current.id !== latestAssistant._id) return;
+      current.timer = null;
+      const prefix = current.pendingPrefix;
+      const from = current.queuedChars;
+      if (prefix.length <= from) return;
+      const speechChunk = prefix.slice(from).trim();
+      current.pendingPrefix = "";
+      current.queuedChars = prefix.length;
+      if (!speechChunk) return;
+      current.chain = current.chain.then(async () => {
+        if (streamingSpeechRef.current.id !== latestAssistant._id) return;
+        await narrateText({
+          text: speechChunk,
+          claim: narrationClaim(`turn:${latestAssistant._id}`, prefix, from, prefix.length),
+          captionText: current.pendingCaption,
+          final: false,
+        });
       });
-    });
+    }, 220);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
 
@@ -2133,6 +2203,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     showCaption({ who: "jarvis", text: spokenText, phase: "ready" });
     (async () => {
       const streamed = streamingSpeechRef.current.id === last._id ? streamingSpeechRef.current : null;
+      if (streamed?.timer) {
+        clearTimeout(streamed.timer);
+        streamed.timer = null;
+        streamed.pendingPrefix = "";
+      }
       if (streamed) await streamed.chain;
       const from = streamed?.queuedChars ?? 0;
       const unsaidText = spokenText.slice(from).trim();
@@ -2150,6 +2225,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     })();
   }, [messages]);
 
+  useEffect(() => () => {
+    if (streamingSpeechRef.current.timer) clearTimeout(streamingSpeechRef.current.timer);
+  }, []);
+
   async function requestHostContext(): Promise<JarvisHostContext | null> {
     if (!embedded || window.parent === window) return null;
     const id = `jarvis-context-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -2157,6 +2236,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const finish = (context: JarvisHostContext | null) => {
         window.removeEventListener("message", receive);
         window.clearTimeout(timer);
+        if (context) hostContextRef.current = context;
         resolve(context);
       };
       const receive = (event: MessageEvent) => {
@@ -2165,9 +2245,32 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         if (message.jarvis !== "context-response" || message.id !== id) return;
         finish(message.context as JarvisHostContext);
       };
-      const timer = window.setTimeout(() => finish(null), 350);
+      const timer = window.setTimeout(() => finish(hostContextRef.current), 120);
       window.addEventListener("message", receive);
       window.parent.postMessage({ jarvis: "context-request", id }, "*");
+    });
+  }
+
+  async function sendHostAction(action: JarvisHostAction): Promise<HostActionResult> {
+    if (!embedded || window.parent === window) return { ok: false, detail: "No host page is connected." };
+    if (!hostContextRef.current?.hostId) await requestHostContext();
+    const id = globalThis.crypto?.randomUUID?.() ?? `host-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const payload: JarvisHostAction = {
+      ...action,
+      id,
+      hostId: action.hostId ?? hostContextRef.current?.hostId,
+      expectedUrl: action.expectedUrl ?? hostContextRef.current?.url,
+    };
+    return new Promise((resolve) => {
+      const timer = window.setTimeout(() => {
+        hostActionWaiters.current.delete(id);
+        resolve({ ok: false, detail: "The host page did not acknowledge the action." });
+      }, 1_200);
+      hostActionWaiters.current.set(id, (result) => {
+        window.clearTimeout(timer);
+        resolve(result);
+      });
+      window.parent.postMessage({ jarvis: "host-action", action: payload }, "*");
     });
   }
 
@@ -2360,7 +2463,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // double-tap / Enter+click within 2.5s = one send, not two
     if (t === lastSent.current.text && Date.now() - lastSent.current.ts < 2500) return;
     lastSent.current = { text: t, ts: Date.now() };
-    streamingSpeechRef.current = { id: "", queuedChars: 0, chain: Promise.resolve() };
+    if (streamingSpeechRef.current.timer) clearTimeout(streamingSpeechRef.current.timer);
+    streamingSpeechRef.current = {
+      id: "",
+      queuedChars: 0,
+      chain: Promise.resolve(),
+      timer: null,
+      pendingPrefix: "",
+      pendingCaption: "",
+    };
     updateConversationMood(t);
     void ownVoice();
     // A new request is an immediate barge-in. Cancel queued/playback state
@@ -2372,6 +2483,29 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     });
     setSpeaking(false);
     setInput("");
+    const embeddedHostIntent = embedded ? parseEmbeddedHostIntent(t) : null;
+    if (embeddedHostIntent) {
+      showCaption({ who: "you", text: t });
+      const result = await sendHostAction(embeddedHostIntent.action);
+      if (result.ok) {
+        const reply = result.detail || embeddedHostIntent.reply;
+        document.documentElement.dataset.jarvisFirstTokenMs = "0";
+        lastSpokenText.current = { text: reply, ts: Date.now() };
+        updateConversationMood(reply);
+        showCaption({ who: "jarvis", text: reply, phase: "ready" });
+        void logTurn({ threadId: threadRef.current, role: "user", text: t })
+          .then(() => logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant-host" }))
+          .catch(() => {});
+        await narrateText({
+          text: reply,
+          claim: narrationClaim(`host:${lastSent.current.ts}`, reply),
+          captionText: reply,
+        });
+        return;
+      }
+      // If the parent cannot fulfil a fast path, let the full model inspect its
+      // inventory and choose a grounded fallback rather than claiming success.
+    }
     // A playing video shrinks to picture-in-picture (keeps playing). A genuine
     // follow-up keeps the current visual; a topic switch clears it immediately
     // instead of leaving a stale chart/widget behind while the next turn runs.
@@ -2422,9 +2556,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       return;
     }
     let modelText = t;
-    if (embedded && needsHostContext(t)) {
+    if (embedded) {
       const context = await requestHostContext();
-      if (context) modelText = withHostContext(t, context);
+      if (context) {
+        const bounded = needsHostContext(t)
+          ? context
+          : { ...context, selection: undefined, text: undefined };
+        modelText = withHostContext(t, bounded);
+      }
     }
     await queueDurableTurn(modelText, t);
   }
@@ -2432,7 +2571,22 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   function stopTalking() {
     import("../lib/tts").then((m) => m.stopSpeaking());
     setSpeaking(false);
+    ttsQuietUntilRef.current = Date.now() + 120;
+    if (freeLoop.current) {
+      showCaption({ who: "you", text: "Listening…" });
+      scheduleFreeVoiceTurn(120);
+    }
   }
+
+  useEffect(() => {
+    const interrupt = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && speakingRef.current) stopTalking();
+    };
+    window.addEventListener("keydown", interrupt);
+    return () => window.removeEventListener("keydown", interrupt);
+    // The interruption path is ref-backed and intentionally stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const liveBeat = useRef<ReturnType<typeof setInterval> | null>(null);
   const freeLoop = useRef(false);
@@ -3031,9 +3185,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           />
           <button
             type="button"
-            aria-label={live === "live" ? "Stop Jarvis live listening" : "Start Jarvis live listening"}
-            title={live === "live" ? "Tap to stop listening" : "Tap to start listening"}
-            onClick={() => void toggleLive()}
+            aria-label={speaking ? "Interrupt Jarvis" : live === "live" ? "Stop Jarvis live listening" : "Start Jarvis live listening"}
+            title={speaking ? "Tap to interrupt" : live === "live" ? "Tap to stop listening" : "Tap to start listening"}
+            onClick={() => speaking ? stopTalking() : void toggleLive()}
             className="absolute inset-[20%] z-20 rounded-full bg-transparent"
           />
           {caption && (
@@ -3247,6 +3401,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               reduceMotion={prefs.reduceMotion}
             />
           </div>
+          {speaking && !fullBleed && !compactAside && (
+            <button
+              type="button"
+              aria-label="Interrupt Jarvis"
+              title="Tap the orb to interrupt"
+              onClick={stopTalking}
+              className="absolute inset-[28%] z-20 rounded-full bg-transparent"
+            />
+          )}
           {/* THE ONE caption — one persistent node throughout token streaming,
               finalization and narration. Compact overlays keep it beside their
               visible orb; only a truly full-screen workspace owns the surface. */}

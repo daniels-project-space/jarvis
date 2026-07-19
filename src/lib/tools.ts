@@ -6,6 +6,7 @@ import type { ManagedMission } from "../mastra/supervisor";
 import { withAdminSession } from "./control-context";
 import { wakeAgentHarness } from "./agent-harness-dispatch";
 import { workModelLabel, workModelPriority } from "./work-models";
+import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
 import {
   VISUAL_BLOCK_KINDS,
   VISUAL_CAPABILITIES,
@@ -501,11 +502,31 @@ export const TOOL_DEFS = [
   {
     name: "open_app",
     description:
-      "Launch one of Daniel's own apps on screen with a one-tap open button (rental manager, project hub, music house, youtube studio, media engine, remote work hub, app factory, jarvis...). Use for ANY 'open/launch/pull up <app>'.",
+      "Actually launch one of Daniel's own apps. In an embedded Hub session this navigates the host page; in the main Jarvis app it also shows a launch card. Use for ANY 'open/launch/pull up <app>'.",
     parameters: {
       type: "object",
-      properties: { app: { type: "string", description: "app name as Daniel said it, e.g. 'rental manager'" } },
+      properties: {
+        app: { type: "string", description: "app name as Daniel said it, e.g. 'rental manager'" },
+        expected_url: { type: "string", description: "When embedded, copy the current context URL so only that host navigates" },
+        host_id: { type: "string", description: "When embedded, copy hostId from JARVIS_HOST_CONTEXT so only that browser tab acts" },
+      },
       required: ["app"],
+    },
+  },
+  {
+    name: "host_ui",
+    description:
+      "Act on the real app page surrounding the Jarvis embed. Use only when JARVIS_HOST_CONTEXT is present: show_widget scrolls/reveals a dashboard widget, focus highlights a visible element, activate opens a button/menu, navigate changes a same-origin route, and edit starts visual element selection that returns an exact DOM/source target for an engineer. Never claim a host-page action without this tool.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["show_widget", "focus", "activate", "navigate", "edit"] },
+        target: { type: "string", description: "Exact id/label from host context, a widget name, or a same-origin route" },
+        instruction: { type: "string", description: "For edit: Daniel's requested change shown while he selects the element" },
+        expected_url: { type: "string", description: "Current host URL copied from JARVIS_HOST_CONTEXT; prevents acting on a different tab/page" },
+        host_id: { type: "string", description: "Exact hostId copied from JARVIS_HOST_CONTEXT; scopes the action to this browser tab" },
+      },
+      required: ["action", "expected_url", "host_id"],
     },
   },
   {
@@ -1886,29 +1907,53 @@ async function calendarView(args: any): Promise<string> {
   );
 }
 
-// Daniel's own apps — "open the rental manager" should actually open it.
-const APPS: { name: string; url: string; aliases: string[] }[] = [
-  { name: "Rental Manager", url: "https://rental-manager-v2-nu.vercel.app", aliases: ["rental manager", "rentals app", "rmv2", "rental-manager", "hygglo dashboard"] },
-  { name: "Project Hub", url: "https://project-hub-olive-pi.vercel.app", aliases: ["project hub", "the hub", "dashboard", "project-hub"] },
-  { name: "Music House", url: "https://music-house-nine.vercel.app", aliases: ["music house", "music-house", "music app"] },
-  { name: "YouTube Studio AI", url: "https://youtube-studio-ai.vercel.app", aliases: ["youtube studio", "ysa", "youtube app", "video factory"] },
-  { name: "Remote Work Hub", url: "https://remote-work-hub-sepia.vercel.app", aliases: ["remote work hub", "rwh", "work hub", "agents hub"] },
-  { name: "Media Engine", url: "https://media-engine-seven.vercel.app", aliases: ["media engine", "media-engine"] },
-  { name: "App Factory", url: "https://app-factory-v2.vercel.app", aliases: ["app factory", "factory", "app-factory"] },
-  { name: "JARVIS", url: "https://jarvis-orcin-six.vercel.app", aliases: ["jarvis", "yourself", "your ui"] },
-];
+async function publishHostAction(action: JarvisHostAction): Promise<void> {
+  const payload = {
+    ...action,
+    id: action.id ?? globalThis.crypto.randomUUID(),
+  };
+  await convexMutation("ui:setHostAction", {
+    value: JSON.stringify(payload),
+    title: `${payload.action}${payload.target ? ` · ${payload.target}` : ""}`.slice(0, 160),
+  });
+}
 
 async function openApp(args: any): Promise<string> {
   if (!String(args.app ?? "").trim()) return "Which app, sir?";
-  const want = String(args.app ?? "").toLowerCase().trim();
-  const app =
-    APPS.find((a) => a.aliases.some((al) => want.includes(al) || al.includes(want))) ??
-    APPS.find((a) => a.name.toLowerCase().includes(want));
+  const app = findHostApp(String(args.app ?? ""));
   if (!app)
-    return `I don't have a live URL for "${args.app}". Apps I can open: ${APPS.map((a) => a.name).join(", ")}.`;
-  await convexMutation("ui:setPanel", { type: "launch", value: JSON.stringify({ name: app.name, url: app.url }), title: `launch · ${app.name}` });
+    return `I don't have a live URL for "${args.app}".`;
+  const expectedUrl = String(args.expected_url ?? "").trim().slice(0, 1_200);
+  const hostId = String(args.host_id ?? "").trim().slice(0, 160);
+  const embedded = /^https?:\/\//i.test(expectedUrl) && Boolean(hostId);
+  await Promise.all([
+    convexMutation("ui:setPanel", { type: "launch", value: JSON.stringify({ name: app.name, url: app.url }), title: `launch · ${app.name}` }),
+    embedded
+      ? publishHostAction({ action: "open_app", target: app.name, url: app.url, expectedUrl, hostId })
+      : Promise.resolve(),
+  ]);
   await convexMutation("chatQueue:postCard", { threadId: await activeThread(), type: "url", value: app.url, title: `open ${app.name} ↗` }).catch(() => {});
-  return `${app.name} is on screen with a one-tap open button (it also auto-opens in a new tab if the browser allows). URL: ${app.url}`;
+  return embedded
+    ? `${app.name} launch sent to this host page; the main Jarvis view also has the fallback card.`
+    : `${app.name} is ready on the launch card.`;
+}
+
+async function hostUi(args: Record<string, unknown>): Promise<string> {
+  const allowed: JarvisHostActionName[] = ["show_widget", "focus", "activate", "navigate", "edit"];
+  const action = allowed.includes(String(args.action) as JarvisHostActionName)
+    ? String(args.action) as JarvisHostActionName
+    : null;
+  if (!action) return "TOOL DID NOTHING: choose a valid host action.";
+  const expectedUrl = String(args.expected_url ?? "").trim().slice(0, 1_200);
+  if (!/^https?:\/\//i.test(expectedUrl)) return "TOOL DID NOTHING: copy the current URL from host context.";
+  const hostId = String(args.host_id ?? "").trim().slice(0, 160);
+  if (!hostId) return "TOOL DID NOTHING: copy hostId from host context.";
+  const target = String(args.target ?? "").trim().slice(0, 500);
+  const instruction = String(args.instruction ?? "").trim().slice(0, 1_200);
+  if (action !== "edit" && !target) return "TOOL DID NOTHING: name the page element, widget or route.";
+  await publishHostAction({ action, target: target || undefined, instruction: instruction || undefined, expectedUrl, hostId });
+  if (action === "edit") return "Visual edit selection is open on the host page. Daniel must confirm the highlighted element before engineering work starts.";
+  return `Host page action sent: ${action} ${target}.`;
 }
 
 // Verified research: several search angles + the top source read, so the answer
@@ -3300,6 +3345,8 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       return await calendarView(args);
     case "open_app":
       return await openApp(args);
+    case "host_ui":
+      return await hostUi(args);
     case "mac_shortcut": {
       const shortcut = String(args.shortcut ?? "").trim().slice(0, 120);
       if (!shortcut) return "TOOL DID NOTHING: name the installed Apple Shortcut.";

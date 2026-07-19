@@ -21,8 +21,11 @@ type AudioResult = { audio: ArrayBuffer };
 
 const ECHO_GUARD_TAIL_MS = 45_000;
 const REQUEST_TIMEOUT_MS = 7_000;
-const FIRST_SPEECH_CHUNK_MIN = 12;
-const MAX_SPEECH_CHUNK_CHARS = 56;
+// Edge handles sentence rhythm better than a browser-side chain of tiny MP3s.
+// Keep ordinary replies in one request and split only genuinely long speech.
+// The old 56-character ceiling created a network/decode seam every few words.
+const TARGET_SPEECH_CHUNK_CHARS = 170;
+const MAX_SPEECH_CHUNK_CHARS = 240;
 const MAX_MEMORY_AUDIO_SEGMENTS = 12;
 let ttsEngine = "edge-neural-ryan-gb";
 
@@ -175,23 +178,27 @@ export function sentences(text: string): string[] {
     if (remaining) result.push(remaining);
   };
 
-  for (const part of speech.split(/(?<=[.!?;:])\s+|(?<=,)\s+(?=\S)/)) {
+  const flush = () => {
+    if (!buffer.trim()) return;
+    appendBounded(buffer);
+    buffer = "";
+  };
+
+  for (const part of speech.split(/(?<=[.!?;:])\s+/)) {
+    const next = buffer ? `${buffer} ${part}` : part;
+    if (buffer && next.length > MAX_SPEECH_CHUNK_CHARS) flush();
     buffer = buffer ? `${buffer} ${part}` : part;
-    if (buffer.length >= FIRST_SPEECH_CHUNK_MIN) {
-      appendBounded(buffer);
-      buffer = "";
-    }
+    if (buffer.length >= TARGET_SPEECH_CHUNK_CHARS) flush();
   }
-  if (buffer.trim()) appendBounded(buffer);
+  flush();
   return result;
 }
 
 export function speechPauseMs(text: string): number {
   const ending = text.trim();
-  if (/[?!][”"')\]]?$/.test(ending)) return 150;
-  if (/\.[”"')\]]?$/.test(ending)) return 120;
-  if (/[;:][”"')\]]?$/.test(ending)) return 70;
-  if (/,[”"')\]]?$/.test(ending)) return 35;
+  if (/[?!][”"')\]]?$/.test(ending)) return 45;
+  if (/\.[”"')\]]?$/.test(ending)) return 30;
+  if (/[;:][”"')\]]?$/.test(ending)) return 15;
   return 0;
 }
 
@@ -314,6 +321,9 @@ export function stopSpeaking() {
   generation++;
   for (const controller of pendingRequests) controller.abort("speech cancelled");
   pendingRequests.clear();
+  // An aborted synthesis promise is tied to the old generation. Do not let an
+  // immediate replay of the same phrase inherit that rejected promise.
+  synthesisInFlight.clear();
   const abandoned = queue;
   queue = [];
   for (const batch of abandoned) settle(batch, false);
@@ -383,7 +393,9 @@ async function drainSpeechQueue(): Promise<void> {
           }
           const played = await playAudio(audio, batch.generation, batch.onEnergy);
           if (!played || batch.generation !== generation) break;
-          const pause = speechPauseMs(batch.segments[index]);
+          const pause = index + 1 < batch.segments.length
+            ? speechPauseMs(batch.segments[index])
+            : 0;
           if (pause) await new Promise((resolve) => setTimeout(resolve, pause));
         }
         if (batch.generation === generation) {
