@@ -25,6 +25,7 @@ import { startAppFactoryGoal, syncExternalGoalRevisions, syncExternalGoalRuns } 
 import { codexMcpConfigArgs, type CodexMcpConfig } from "../lib/codex-mcp";
 import { redactSensitiveText } from "../lib/secret-redaction";
 import { isPermittedReadonlyAccessGap } from "../lib/work-verification";
+import { gitDeliveryDisposition, isNonFastForwardPush } from "../lib/git-delivery";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -842,6 +843,8 @@ export async function runAgentHarness() {
 
         let pushNote = "";
         let pushFailed = false;
+        let deliveryRetry = false;
+        let deliveryDiffStat = "";
         let changed = false;
         if (repoDir && token && branch && !job.readonly) {
           const pushUrl = githubRepoUrl(repo);
@@ -852,24 +855,70 @@ export async function runAgentHarness() {
             ["-C", repoDir, "commit", "-m", `chore: ${profile.name.toLowerCase()} — ${job.task.slice(0, 60).replace(/"/g, "'")}`],
             env,
           );
-          const local = (await sh("git", ["-C", repoDir, "rev-parse", "HEAD"], env)).out.trim();
-          const remote = (await sh("git", ["-C", repoDir, "ls-remote", pushUrl, `refs/heads/${branch}`], gitEnv)).out.split(/\s/)[0]?.trim();
-          const needsPush = Boolean(local && local !== (remote || baseSha));
-          if (!needsPush) {
-            pushNote = remote ? `existing checkpoint branch ${branch} retained` : "no repository changes were needed";
-          } else {
-            if (await stopIfLeaseLost(checkpointText, result, branch)) return;
-            let push = await sh("git", ["-C", repoDir, "push", pushUrl, `HEAD:refs/heads/${branch}`], gitEnv);
-            if (/shallow update not allowed/i.test(push.out)) {
-              await sh("git", ["-C", repoDir, "fetch", "--unshallow"], gitEnv);
-              push = await sh("git", ["-C", repoDir, "push", pushUrl, `HEAD:refs/heads/${branch}`], gitEnv);
-            }
-            pushFailed = push.code !== 0;
-            pushNote = pushFailed
-              ? `branch push failed: ${push.out.slice(-180).replace(/\s+/g, " ")}`
-              : `checkpoint branch ${branch} pushed`;
+          let local = (await sh("git", ["-C", repoDir, "rev-parse", "HEAD"], env)).out.trim();
+          if (baseSha && local && local !== baseSha) {
+            deliveryDiffStat = (await sh("git", ["-C", repoDir, "diff", "--stat", `${baseSha}..${local}`], env)).out
+              .trim()
+              .slice(0, 1_500);
           }
-          if (!pushFailed) {
+          const remote = (await sh("git", ["-C", repoDir, "ls-remote", pushUrl, `refs/heads/${branch}`], gitEnv)).out.split(/\s/)[0]?.trim();
+          let needsPush = gitDeliveryDisposition({ baseSha, localSha: local, remoteSha: remote }) !== "noop";
+          if (!needsPush) {
+            pushNote = remote && remote !== baseSha
+              ? `newer checkpoint branch ${branch} retained without overwrite`
+              : remote ? `existing checkpoint branch ${branch} retained` : "no repository changes were needed";
+          } else {
+            if (gitDeliveryDisposition({ baseSha, localSha: local, remoteSha: remote }) === "reconcile") {
+              const remoteRef = "refs/remotes/jarvis-delivery/current";
+              const fetched = await sh(
+                "git",
+                ["-C", repoDir, "fetch", "--no-tags", "--depth", "50", pushUrl, `+refs/heads/${branch}:${remoteRef}`],
+                gitEnv,
+              );
+              if (fetched.code !== 0) {
+                deliveryRetry = true;
+                pushNote = `shared branch ${branch} advanced; remote refresh will retry from a checkpoint`;
+              } else {
+                const localAlreadyDelivered = await sh("git", ["-C", repoDir, "merge-base", "--is-ancestor", local, remoteRef], env);
+                const remoteAlreadyIntegrated = await sh("git", ["-C", repoDir, "merge-base", "--is-ancestor", remoteRef, local], env);
+                if (localAlreadyDelivered.code === 0) {
+                  needsPush = false;
+                  pushNote = `newer checkpoint branch ${branch} already contains this delivery`;
+                } else if (remoteAlreadyIntegrated.code !== 0 && baseSha) {
+                  const rebased = await sh("git", ["-C", repoDir, "rebase", "--onto", remoteRef, baseSha], env);
+                  if (rebased.code !== 0) {
+                    await sh("git", ["-C", repoDir, "rebase", "--abort"], env);
+                    deliveryRetry = true;
+                    pushNote = `shared branch ${branch} changed concurrently; the bounded work is checkpointed for a clean replay`;
+                  } else {
+                    local = (await sh("git", ["-C", repoDir, "rev-parse", "HEAD"], env)).out.trim();
+                    pushNote = `local delivery rebased onto the newer checkpoint branch ${branch}`;
+                  }
+                } else if (remoteAlreadyIntegrated.code !== 0) {
+                  deliveryRetry = true;
+                  pushNote = `shared branch ${branch} changed without a usable base; retrying from its latest checkpoint`;
+                }
+              }
+            }
+            if (needsPush && !deliveryRetry) {
+              if (await stopIfLeaseLost(checkpointText, result, branch)) return;
+              let push = await sh("git", ["-C", repoDir, "push", pushUrl, `HEAD:refs/heads/${branch}`], gitEnv);
+              if (/shallow update not allowed/i.test(push.out)) {
+                await sh("git", ["-C", repoDir, "fetch", "--unshallow"], gitEnv);
+                push = await sh("git", ["-C", repoDir, "push", pushUrl, `HEAD:refs/heads/${branch}`], gitEnv);
+              }
+              if (push.code !== 0 && isNonFastForwardPush(push.out)) {
+                deliveryRetry = true;
+                pushNote = `shared branch ${branch} advanced again during delivery; retrying from the new head`;
+              } else {
+                pushFailed = push.code !== 0;
+                pushNote = pushFailed
+                  ? `branch push failed: ${push.out.slice(-180).replace(/\s+/g, " ")}`
+                  : `${pushNote ? `${pushNote}; ` : ""}checkpoint branch ${branch} pushed`;
+              }
+            }
+          }
+          if (!pushFailed && !deliveryRetry) {
             const compared = await branchHasChanges(repo, branch, token);
             changed = compared ?? (needsPush || Boolean(remote && job.branch));
             if (!changed && needsPush) pushNote = "branch matches the repository default after verification";
@@ -909,6 +958,30 @@ export async function runAgentHarness() {
             await convexMutation("chatQueue:postAssistant", {
               threadId: originThread,
               text: `${profile.name} exhausted the continuation budget. I kept the checkpoints and marked the job honestly as failed.`,
+            }).catch(() => {});
+          }
+          return;
+        }
+
+        if (deliveryRetry) {
+          const continuation = await convexMutation("jobs:checkpointAndRequeue", {
+            jobId: job.jobId,
+            expectedAttempt,
+            checkpoint: [
+              "The shared checkpoint branch advanced during this bounded session. No history was overwritten and no force push was attempted.",
+              pushNote,
+              deliveryDiffStat ? `Local diff summary to replay only if still missing:\n${deliveryDiffStat}` : "",
+              continuationCheckpoint,
+            ].filter(Boolean).join("\n\n").slice(0, 6_000),
+            result: result.slice(0, 4_000),
+            branch,
+            delayMs: 5_000,
+          });
+          if (job.missionId && !continuation?.requeued) await maybeSynthesizeMission(job.missionId).catch(() => {});
+          else if (!job.missionId && continuation?.requeued) {
+            await convexMutation("chatQueue:postAssistant", {
+              threadId: originThread,
+              text: `${profile.name} preserved the work and is replaying it onto a newer checkpoint branch.`,
             }).catch(() => {});
           }
           return;
