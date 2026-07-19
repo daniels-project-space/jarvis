@@ -1143,8 +1143,9 @@ export function FleetView({ value }: { value: string }) {
   const phaseLabels = ["Sol plan", "Terra build", "Sol validate", "achieved"];
   const glass = "rounded-xl border border-white/10 bg-white/[0.045] backdrop-blur-xl";
   return (
-    <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
-      <div className="mx-auto max-w-2xl">
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
+        <div className="mx-auto max-w-2xl">
         <div className="text-center">
           <div className="hud-label mb-1">{goalMode ? "durable goal mode" : "mission"}</div>
           <div className="text-lg font-semibold leading-snug text-ice">{m.goal}</div>
@@ -1213,8 +1214,20 @@ export function FleetView({ value }: { value: string }) {
             {m.failureReason}
           </div>
         )}
-        {goalMode && !["done", "cancelled"].includes(m.status) && (
-          <div className="mt-4 flex flex-wrap justify-center gap-2">
+        {m.summary && (
+          <div className={`${glass} mt-4 p-4`}>
+            <div className="hud-label mb-2">mission report</div>
+            <div
+              className="text-sm leading-relaxed text-ice"
+              dangerouslySetInnerHTML={{ __html: mdPaper(m.summary) }}
+            />
+          </div>
+        )}
+        </div>
+      </div>
+      {goalMode && !["done", "cancelled"].includes(m.status) && (
+        <div className="shrink-0 border-t border-white/[0.07] bg-[#07101c]/95 px-5 py-3 backdrop-blur-xl">
+          <div className="flex flex-wrap justify-center gap-2">
             {m.status === "running" ? (
               <button disabled={Boolean(busy)} onClick={() => void controlGoal("pause")} className="rounded-lg border border-white/10 px-3 py-1.5 text-[10px] text-slate hover:text-ice disabled:opacity-50">{busy === "pause" ? "pausing…" : "pause"}</button>
             ) : m.phase === "factory approval" ? (
@@ -1226,18 +1239,9 @@ export function FleetView({ value }: { value: string }) {
             )}
             <button disabled={Boolean(busy)} onClick={() => void controlGoal("cancel")} className="rounded-lg border border-red-400/20 px-3 py-1.5 text-[10px] text-red-300/80 hover:bg-red-400/[0.06] disabled:opacity-50">{busy === "cancel" ? "cancelling…" : "cancel goal"}</button>
           </div>
-        )}
-        {controlError && <div className="mt-3 rounded-lg border border-red-400/20 bg-red-400/[0.06] px-3 py-2 text-xs text-red-300">{controlError}</div>}
-        {m.summary && (
-          <div className={`${glass} mt-4 p-4`}>
-            <div className="hud-label mb-2">mission report</div>
-            <div
-              className="text-sm leading-relaxed text-ice"
-              dangerouslySetInnerHTML={{ __html: mdPaper(m.summary) }}
-            />
-          </div>
-        )}
-      </div>
+          {controlError && <div className="mx-auto mt-2 max-w-2xl rounded-lg border border-red-400/20 bg-red-400/[0.06] px-3 py-2 text-xs text-red-300">{controlError}</div>}
+        </div>
+      )}
     </div>
   );
 }
