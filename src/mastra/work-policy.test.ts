@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { workApprovalPolicy } from "../../convex/workPolicy";
+import { plannerTask, routeGoal } from "../lib/goal-mode";
 
 describe("server-side work approval policy", () => {
   it("does not let an explicit false waive consequential work", () => {
@@ -56,6 +57,15 @@ describe("server-side work approval policy", () => {
     ).toBe(false);
     expect(workApprovalPolicy({ task: "Fix the parser and run tests", repo: "jarvis" }).required).toBe(false);
     expect(workApprovalPolicy({ task: "Research current orchestration patterns" }).required).toBe(false);
+  });
+
+  it("does not deadlock Goal Mode on its own generated planner safety contract", () => {
+    const goal = "Produce a strictly read-only audit report with two evidence workstreams.";
+    expect(workApprovalPolicy({
+      task: plannerTask(goal, routeGoal(goal), ["Report concrete evidence"], 2),
+      readonly: true,
+      risk: "low",
+    }).required).toBe(false);
   });
 
   it("does not let an evidence label disguise a fresh imperative", () => {
