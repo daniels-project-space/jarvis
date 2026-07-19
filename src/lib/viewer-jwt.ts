@@ -30,9 +30,12 @@ async function getVerificationKey(): Promise<CryptoKey> {
   if (verificationKey) return await verificationKey;
   verificationKey = (async () => {
     // Import a public-only key. A private WebCrypto key has `sign` usage and
-    // cannot be passed to subtle.verify even though it contains x/y.
+    // cannot be passed to subtle.verify even though it contains x/y. Private
+    // JWKs may also be provisioned with key_ops=["sign"]; carrying that onto
+    // the public copy makes jose reject it as a verification key.
     const publicJwk = { ...configuredJwk() };
     delete publicJwk.d;
+    delete publicJwk.key_ops;
     return await importJWK(publicJwk, "ES256") as CryptoKey;
   })();
   return await verificationKey;

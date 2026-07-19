@@ -12,7 +12,12 @@ describe("stateless Convex viewer identity", () => {
   it("mints a short-lived audience-bound ES256 token", async () => {
     const { publicKey, privateKey } = await generateKeyPair("ES256", { extractable: true });
     const privateJwk = await exportJWK(privateKey);
-    Object.assign(privateJwk, { kid: "test-viewer", alg: "ES256", use: "sig" });
+    Object.assign(privateJwk, {
+      kid: "test-viewer",
+      alg: "ES256",
+      use: "sig",
+      key_ops: ["sign"],
+    });
     const encodedJwk = Buffer.from(JSON.stringify(privateJwk)).toString("base64");
     vi.stubEnv("JARVIS_VIEWER_SIGNING_JWK_B64", encodedJwk);
     vi.stubGlobal("Buffer", undefined);
