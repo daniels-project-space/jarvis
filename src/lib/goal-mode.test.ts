@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   GOAL_PLAN_MARKER,
   GOAL_VALIDATION_MARKER,
+  GOAL_VALIDATOR_TASK_MAX_CHARS,
   goalJobRunnableForMission,
   goalJobMatchesMissionPhase,
   goalBranch,
@@ -9,6 +10,7 @@ import {
   parseGoalValidation,
   routeGoal,
   summarizeGoalPhase,
+  validatorTask,
 } from "./goal-mode";
 
 describe("Goal Mode contracts", () => {
@@ -108,6 +110,40 @@ describe("Goal Mode contracts", () => {
       refinements: [{ label: "Mobile repair", task: "Repair the broken mobile flow and verify it with a real browser run." }],
     })}`);
     expect(value.refinements).toHaveLength(1);
+  });
+
+  it("keeps deep validator evidence and its machine contract inside the durable task budget", () => {
+    const repeated = (count: number, prefix: string) => Array.from(
+      { length: count },
+      (_, index) => `${prefix} ${index} ${"evidence ".repeat(80)}`,
+    );
+    const task = validatorTask({
+      goal: "Validate the complete production outcome. ".repeat(40),
+      plan: {
+        summary: "Skeptically validate every protected and public surface. ".repeat(40),
+        route: "existing_project",
+        assumptions: [],
+        workstreams: [],
+        validation: {
+          criteria: repeated(12, "criterion"),
+          tests: repeated(12, "test"),
+          liveChecks: repeated(12, "live check"),
+        },
+      },
+      acceptanceCriteria: repeated(10, "acceptance"),
+      buildEvidence: repeated(8, "builder").map((result, index) => ({
+        label: `Workstream ${index}`,
+        status: "done",
+        result,
+      })),
+      revisionWave: 3,
+      externalContext: "provider evidence ".repeat(500),
+      auditSnapshot: "protected snapshot evidence ".repeat(500),
+    });
+    expect(task.length).toBeLessThanOrEqual(GOAL_VALIDATOR_TASK_MAX_CHARS);
+    expect(task).toContain("Delivery-controller audit snapshot");
+    expect(task).toContain(GOAL_VALIDATION_MARKER);
+    expect(task).toContain('"verdict":"pass|refine|blocked"');
   });
 
   it("creates a stable shared goal branch", () => {

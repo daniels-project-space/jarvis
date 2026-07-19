@@ -5,6 +5,7 @@ import { workApprovalPolicy } from "./workPolicy";
 import {
   goalBranch,
   goalJobRunnableForMission,
+  GOAL_VALIDATOR_TASK_MAX_CHARS,
   plannerTask,
   summarizeGoalPhase,
   validatorTask,
@@ -134,7 +135,7 @@ async function insertGoalJob(ctx: any, input: GoalJobInput) {
   const status = approvalRequired ? "awaiting_approval" : "pending";
   const jobId = await ctx.db.insert("jobs", {
     ...input,
-    task: input.task.slice(0, 6000),
+    task: input.task.slice(0, input.goalStage === "validating" ? GOAL_VALIDATOR_TASK_MAX_CHARS : 6_000),
     label: input.label.slice(0, 80),
     visibility: "conversation",
     status,
@@ -1508,7 +1509,7 @@ export const control = mutation({
         if (!job) return false;
         if (phase === "validating") {
           await ctx.db.patch(job._id, {
-            task: await validatorTaskForMission(ctx, mission, jobs),
+            task: (await validatorTaskForMission(ctx, mission, jobs)).slice(0, GOAL_VALIDATOR_TASK_MAX_CHARS),
           });
         }
         if (!(await resetGoalJob(ctx, job, now, true))) return false;

@@ -2,6 +2,7 @@ import { PROJECT_REGISTRY } from "./project-registry";
 
 export const GOAL_PLAN_MARKER = "GOAL_PLAN_JSON:";
 export const GOAL_VALIDATION_MARKER = "GOAL_VALIDATION_JSON:";
+export const GOAL_VALIDATOR_TASK_MAX_CHARS = 40_000;
 
 export const GOAL_ROUTE_KINDS = [
   "app_factory",
@@ -451,18 +452,22 @@ export function validatorTask(args: {
   auditSnapshot?: string;
 }): string {
   const evidence = args.buildEvidence
-    .map((item) => `### ${item.label} [${item.status}]\n${item.result.slice(0, 1_500)}`)
+    .map((item) => `### ${item.label.slice(0, 120)} [${item.status.slice(0, 40)}]\n${item.result.slice(0, 1_000)}`)
     .join("\n\n")
-    .slice(0, 12_000);
-  return [
+    .slice(0, 8_000);
+  const bullets = (items: string[], maxChars: number) => items
+    .map((item) => `- ${String(item).slice(0, 500)}`)
+    .join("\n")
+    .slice(0, maxChars);
+  const prompt = [
     "GOAL MODE — SOL/MAX FINAL VALIDATION SESSION. Be the skeptical owner of the outcome, not a summary writer.",
-    `Outcome: ${args.goal}`,
+    `Outcome: ${args.goal.slice(0, 1_000)}`,
     `Revision wave: ${args.revisionWave}`,
-    `Plan summary: ${args.plan.summary}`,
-    args.externalContext ? `External build ownership:\n${args.externalContext}` : "",
-    `Goal criteria:\n${[...args.acceptanceCriteria, ...args.plan.validation.criteria].map((item) => `- ${item}`).join("\n")}`,
-    args.plan.validation.tests.length ? `Required tests:\n${args.plan.validation.tests.map((item) => `- ${item}`).join("\n")}` : "",
-    args.plan.validation.liveChecks.length ? `Required live/provider checks:\n${args.plan.validation.liveChecks.map((item) => `- ${item}`).join("\n")}` : "",
+    `Plan summary: ${args.plan.summary.slice(0, 1_500)}`,
+    args.externalContext ? `External build ownership:\n${args.externalContext.slice(0, 3_000)}` : "",
+    `Goal criteria:\n${bullets([...args.acceptanceCriteria, ...args.plan.validation.criteria], 4_000)}`,
+    args.plan.validation.tests.length ? `Required tests:\n${bullets(args.plan.validation.tests, 3_000)}` : "",
+    args.plan.validation.liveChecks.length ? `Required live/provider checks:\n${bullets(args.plan.validation.liveChecks, 3_000)}` : "",
     `Builder evidence:\n${evidence}`,
     args.auditSnapshot
       ? [
@@ -476,4 +481,16 @@ export function validatorTask(args: {
     '{"verdict":"pass|refine|blocked","summary":"...","evidence":["exact check/result"],"gaps":["..."],"refinements":[{"id":"...","label":"...","task":"self-contained repair","acceptanceCriteria":["..."]}],"blocker":"only when blocked"}',
     "The JSON is a machine contract. Keep it under 3,500 characters.",
   ].filter(Boolean).join("\n\n");
+  if (prompt.length <= GOAL_VALIDATOR_TASK_MAX_CHARS) return prompt;
+
+  // Keep the machine-readable result contract even if unexpectedly large
+  // evidence reaches this final defensive boundary. Normalized Goal Mode
+  // inputs fit below the cap; this fallback protects the parser from a raw
+  // prefix truncation that would otherwise remove its required output shape.
+  const contractAt = prompt.lastIndexOf("\n\nEnd with exactly one compact JSON object");
+  if (contractAt < 0) return prompt.slice(0, GOAL_VALIDATOR_TASK_MAX_CHARS);
+  const tail = prompt.slice(contractAt);
+  const omission = "\n\n[Earlier validation evidence was truncated at the durable task boundary.]";
+  const headChars = Math.max(0, GOAL_VALIDATOR_TASK_MAX_CHARS - tail.length - omission.length);
+  return `${prompt.slice(0, headChars).trimEnd()}${omission}${tail}`;
 }
