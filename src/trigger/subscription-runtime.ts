@@ -169,11 +169,15 @@ export function prepareSubscriptionEnv(
 export function isolateSubscriptionEnv(
   base: NodeJS.ProcessEnv,
   scope: string,
-  root = "/tmp/work/codex-homes",
+  root?: string,
 ): NodeJS.ProcessEnv {
   const sourceHome = String(base.CODEX_HOME ?? "");
   const safeScope = scope.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120) || "agent";
-  const isolatedHome = join(root, safeScope);
+  // Codex deliberately refuses to create helper aliases inside a temporary
+  // CODEX_HOME. Keep each lease isolated beside the non-temporary source home
+  // so its CLI toolchain initializes fully on both GitHub and Trigger workers.
+  const isolationRoot = root ?? (sourceHome ? join(dirname(sourceHome), ".jarvis-codex-homes") : "/tmp/work/codex-homes");
+  const isolatedHome = join(isolationRoot, safeScope);
   mkdirSync(isolatedHome, { recursive: true });
   // Authentication and Daniel's scoped briefing are read-only inputs. System
   // skills are intentionally not copied: every concurrent Codex process gets

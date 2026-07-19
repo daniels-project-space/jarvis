@@ -22,6 +22,8 @@ import {
 import { runConcurrentClaimLoop } from "./agent-pool";
 import { parseGoalPlan, parseGoalValidation, type GoalPlan } from "../lib/goal-mode";
 import { startAppFactoryGoal, syncExternalGoalRevisions, syncExternalGoalRuns } from "./goal-runtime";
+import { codexMcpConfigArgs, type CodexMcpConfig } from "../lib/codex-mcp";
+import { redactSensitiveText } from "../lib/secret-redaction";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -35,12 +37,8 @@ function promptArgs(prompt: string, tier: string, json = false, mcpConfig?: stri
   if (json) args.push("--json");
   if (mcpConfig) {
     try {
-      const cfg = JSON.parse(readFileSync(mcpConfig, "utf8")) as { mcpServers?: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> };
-      for (const [name, server] of Object.entries(cfg.mcpServers ?? {})) {
-        args.push("--config", `mcp_servers.${name}.command=${JSON.stringify(server.command)}`);
-        if (server.args) args.push("--config", `mcp_servers.${name}.args=${JSON.stringify(server.args)}`);
-        if (server.env) args.push("--config", `mcp_servers.${name}.env=${JSON.stringify(server.env)}`);
-      }
+      const cfg = JSON.parse(readFileSync(mcpConfig, "utf8")) as CodexMcpConfig;
+      args.push(...codexMcpConfigArgs(cfg));
     } catch { /* run without an invalid optional MCP config */ }
   }
   args.push(prompt);
@@ -115,24 +113,31 @@ function pickAgentModel(task: string): string {
 
 // MCP servers the brain can attach on demand. Browserbase = hosted browsers
 // (no local Chromium in the Trigger image); context7 = live library docs.
-async function buildMcpConfig(names: string[], jobKey: string): Promise<string | null> {
+async function buildMcpConfig(
+  names: string[],
+  jobKey: string,
+): Promise<{ configPath: string | null; env: Record<string, string> }> {
   const servers: Record<string, unknown> = {};
+  const runtimeEnv: Record<string, string> = {};
   for (const n of names) {
     if (["playwright", "browser", "browserbase"].includes(n)) {
       const bb = await vaultService("browserbase");
-      if (bb.BROWSERBASE_API_KEY)
+      if (bb.BROWSERBASE_API_KEY) {
+        runtimeEnv.BROWSERBASE_API_KEY = bb.BROWSERBASE_API_KEY;
+        runtimeEnv.BROWSERBASE_PROJECT_ID = bb.BROWSERBASE_PROJECT_ID ?? "";
         servers["browserbase"] = {
           command: "npx",
           args: ["-y", "@browserbasehq/mcp-server-browserbase"],
-          env: { BROWSERBASE_API_KEY: bb.BROWSERBASE_API_KEY, BROWSERBASE_PROJECT_ID: bb.BROWSERBASE_PROJECT_ID ?? "" },
+          envVars: ["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
         };
+      }
     }
     if (n === "context7") servers["context7"] = { command: "npx", args: ["-y", "@upstash/context7-mcp"] };
   }
-  if (!Object.keys(servers).length) return null;
+  if (!Object.keys(servers).length) return { configPath: null, env: runtimeEnv };
   const path = `/tmp/work/mcp-${jobKey.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`;
   writeFileSync(path, JSON.stringify({ mcpServers: servers }));
-  return path;
+  return { configPath: path, env: runtimeEnv };
 }
 
 // The weave: a short spoken report that CONTAINS the answer — Daniel complained
@@ -267,7 +272,7 @@ function runAgent(
         }, 12_000)
       : null;
     p.stdout.on("data", (d) => {
-      buf += d.toString();
+      buf += redactSensitiveText(d.toString(), env);
       let nl: number;
       while ((nl = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, nl).trim();
@@ -327,8 +332,9 @@ function runAgent(
       }
     });
     p.stderr.on("data", (data) => {
-      stderr = (stderr + data.toString()).slice(-4000);
-      const line = data.toString().trim().replace(/\s+/g, " ").slice(-180);
+      const safe = redactSensitiveText(data.toString(), env);
+      stderr = (stderr + safe).slice(-4000);
+      const line = safe.trim().replace(/\s+/g, " ").slice(-180);
       if (line) {
         latest = line;
         pushLog(`! ${line}`);
@@ -787,11 +793,14 @@ export async function runAgentHarness() {
         const model = normalizeWorkModelTier(
           typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task),
         );
-        const mcpConfig = Array.isArray(job.mcp) && job.mcp.length ? await buildMcpConfig(job.mcp, jobKey) : null;
+        const mcp = Array.isArray(job.mcp) && job.mcp.length
+          ? await buildMcpConfig(job.mcp, jobKey)
+          : { configPath: null, env: {} };
+        const agentEnv = { ...jobEnv, ...mcp.env };
         const run = await runAgent(
           bin,
           cwd,
-          jobEnv,
+          agentEnv,
           prompt,
           model,
           (line, log, stage, percent) => {
@@ -804,7 +813,7 @@ export async function runAgentHarness() {
               percent,
             });
           },
-          mcpConfig,
+          mcp.configPath,
           async () => {
             const state = await executionStatus();
             return state === "superseded" ? "cancelled" : state;
@@ -812,6 +821,7 @@ export async function runAgentHarness() {
           segmentTimeoutMs(model),
           job.reasoningEffort,
         );
+        if (mcp.configPath) rmSync(mcp.configPath, { force: true });
         const result = run.text;
 
         const checkpointText = buildContinuationCheckpoint({

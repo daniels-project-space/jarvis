@@ -5,6 +5,7 @@ import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAu
 import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
 import { normalizeWorkModelTier } from "../src/lib/work-models";
 import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
+import { redactSensitiveText } from "../src/lib/secret-redaction";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
 
@@ -314,6 +315,27 @@ export const list = query({
       ...row,
       model: row.model ? normalizeWorkModelTier(row.model) : undefined,
     }));
+  },
+});
+
+// A provider startup error can echo its command line before the worker has a
+// chance to classify it. This maintenance action only removes credential-like
+// material; it cannot alter status, ownership, attempts, or mission progress.
+export const scrubSensitiveOutput = mutation({
+  args: { jobId: v.id("jobs"), ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    const row: any = await ctx.db.get(a.jobId);
+    if (!row) return { scrubbed: false, fields: [] as string[] };
+    const patch: Record<string, string> = {};
+    for (const field of ["result", "checkpoint", "log", "progress", "verificationNote", "question"] as const) {
+      if (typeof row[field] !== "string") continue;
+      const redacted = redactSensitiveText(row[field]);
+      if (redacted !== row[field]) patch[field] = redacted;
+    }
+    if (!Object.keys(patch).length) return { scrubbed: false, fields: [] as string[] };
+    await ctx.db.patch(a.jobId, patch);
+    return { scrubbed: true, fields: Object.keys(patch) };
   },
 });
 
