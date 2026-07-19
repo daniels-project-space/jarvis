@@ -24,6 +24,7 @@ import { parseGoalPlan, parseGoalValidation, type GoalPlan } from "../lib/goal-m
 import { startAppFactoryGoal, syncExternalGoalRevisions, syncExternalGoalRuns } from "./goal-runtime";
 import { codexMcpConfigArgs, type CodexMcpConfig } from "../lib/codex-mcp";
 import { redactSensitiveText } from "../lib/secret-redaction";
+import { isPermittedReadonlyAccessGap } from "../lib/work-verification";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -170,6 +171,7 @@ async function verifyWork(
     '{"verdict":"pass"|"concerns"|"needs_input","note":"<one short sentence>","answer":"<only for needs_input: your answer/decision if YOU can make it from context, else empty>"} ' +
     "verdict rules: pass = work matches the task and looks complete; concerns = done but something specific looks wrong/unfinished (say what in note); " +
     "needs_input = the agent stopped on a question or decision. If that question is answerable with common sense or the task's own context, fill answer so the run can continue autonomously; leave answer empty only when Daniel genuinely must decide (money, accounts, personal preferences).\n\n" +
+    "If the task explicitly says to stop and name a missing read-access gap, a documented gap is a completed evidence outcome, not a request for Daniel to relax the boundary.\n\n" +
     `Task: ${task.slice(0, 800)}\n\nAgent result:\n${result.slice(0, 4000)}`;
   const out = await plainPrompt(bin, env, prompt, "terra", 90_000);
   try {
@@ -1029,6 +1031,21 @@ export async function runAgentHarness() {
             }).catch(() => {});
           else if (!continuation?.requeued)
             await maybeSynthesizeMission(job.missionId).catch(() => {});
+          return;
+        }
+        if (
+          verify?.verdict === "needs_input"
+          && isPermittedReadonlyAccessGap({ readonly: Boolean(job.readonly), task: String(job.task ?? ""), result })
+        ) {
+          const finalized = await convexMutation("jobs:finalize", {
+            jobId: job.jobId,
+            expectedAttempt,
+            status: "done",
+            result: result.slice(0, 4_000),
+            verificationVerdict: "pass",
+            verificationNote: "The read-only task expressly defines a named access gap as a valid evidence boundary",
+          });
+          if (finalized && job.missionId) await maybeSynthesizeMission(job.missionId).catch(() => {});
           return;
         }
         if (verify?.verdict === "needs_input" || needsDaniel) {
