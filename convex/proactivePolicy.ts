@@ -18,6 +18,7 @@ export type ProactiveJob = {
   agentId?: string;
   visibility?: string;
   incidentId?: string;
+  missionId?: string;
   nextRunAt?: number;
   heartbeatAt?: number;
   startedAt?: number;
@@ -40,6 +41,18 @@ export type ProactiveSignal = {
 
 const TWENTY_MINUTES = 20 * 60_000;
 const THREE_DAYS = 3 * 86_400_000;
+
+export function countGeneralHarnessDemand(input: {
+  jobs: ProactiveJob[];
+  goalMissionIds: Set<string>;
+  now: number;
+}): number {
+  return input.jobs.filter((job) =>
+    job.status === "pending"
+    && (job.nextRunAt ?? job.createdAt) <= input.now
+    && (!job.missionId || !input.goalMissionIds.has(job.missionId)),
+  ).length;
+}
 
 /**
  * Rank only facts the state machine can prove. Codex CLI agents diagnose and

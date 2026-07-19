@@ -1,9 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { deriveProactiveSignals } from "./proactivePolicy";
+import { countGeneralHarnessDemand, deriveProactiveSignals } from "./proactivePolicy";
 
 const now = 2_000_000_000_000;
 
 describe("deriveProactiveSignals", () => {
+  it("leaves Goal Mode wake ownership to its dedicated coordinator", () => {
+    expect(countGeneralHarnessDemand({
+      now,
+      goalMissionIds: new Set(["goal-1"]),
+      jobs: [
+        { _id: "goal-job", missionId: "goal-1", status: "pending", task: "Terra build", createdAt: now - 1_000 },
+        { _id: "general-job", missionId: "mission-2", status: "pending", task: "General work", createdAt: now - 1_000 },
+        { _id: "future-job", status: "pending", task: "Later", createdAt: now, nextRunAt: now + 60_000 },
+      ],
+    })).toBe(1);
+  });
+
   it("detects an eligible queue with no live harness", () => {
     const signals = deriveProactiveSignals({
       now,

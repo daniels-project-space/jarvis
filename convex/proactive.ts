@@ -1,7 +1,7 @@
 import { mutation } from "./_generated/server";
 import { v } from "convex/values";
 import { requireWorker } from "./controlAuth";
-import { deriveProactiveSignals } from "./proactivePolicy";
+import { countGeneralHarnessDemand, deriveProactiveSignals } from "./proactivePolicy";
 
 export const reconcile = mutation({
   args: { now: v.number(), workerToken: v.string() },
@@ -27,6 +27,16 @@ export const reconcile = mutation({
       jobs: [...pendingJobs, ...runningJobs, ...failedJobs],
       now: a.now,
     });
+    const missionIds = [...new Set(pendingJobs.map((job: any) => job.missionId).filter(Boolean))];
+    const missionRows = await Promise.all(
+      missionIds.map(async (rawId) => {
+        const id = ctx.db.normalizeId("missions", String(rawId));
+        return id ? await ctx.db.get(id) : null;
+      }),
+    );
+    const goalMissionIds = new Set(
+      missionRows.filter((mission: any) => mission?.mode === "goal").map((mission: any) => String(mission._id)),
+    );
     const priorByFingerprint = new Map(existingAttention.map((item: any) => [item.fingerprint, item]));
     const activeFingerprints = new Set(signals.map((signal) => signal.fingerprint));
     const newInterruptions: string[] = [];
@@ -54,7 +64,10 @@ export const reconcile = mutation({
     return {
       signals: signals.length,
       newInterruptions,
-      eligiblePending: pendingJobs.filter((job: any) => (job.nextRunAt ?? job.createdAt) <= a.now).length,
+      // Goal Mode has its own five-minute owner. Excluding those leases here
+      // prevents the general ten-minute insight sweep from double-dispatching
+      // the same GitHub harness.
+      eligiblePending: countGeneralHarnessDemand({ jobs: pendingJobs, goalMissionIds, now: a.now }),
     };
   },
 });
