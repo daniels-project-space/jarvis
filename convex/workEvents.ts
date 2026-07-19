@@ -41,3 +41,30 @@ export const forJob = query({
       .take(Math.min(a.limit ?? 80, 200));
   },
 });
+
+// Mission events are intentionally a read model. Pause and resume entries are
+// written by Goal Mode control and remain in chronological order here; this
+// query neither advances work nor acknowledges any outbox.
+export const forMission = query({
+  args: { missionId: v.string(), limit: v.optional(v.number()), ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    const rows = await ctx.db
+      .query("workEvents")
+      .withIndex("by_mission", (q: any) => q.eq("missionId", a.missionId))
+      .order("asc")
+      .take(Math.min(Math.max(a.limit ?? 80, 1), 200));
+    // Do not expose arbitrary event payloads to the panel. The durable event
+    // fields are enough to audit stage changes, including pause and resume.
+    return rows.map((event: any) => ({
+      _id: event._id,
+      jobId: event.jobId ?? null,
+      agentId: event.agentId ?? null,
+      type: event.type,
+      message: event.message,
+      stage: event.stage ?? null,
+      percent: event.percent ?? null,
+      createdAt: event.createdAt,
+    }));
+  },
+});

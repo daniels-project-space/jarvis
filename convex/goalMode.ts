@@ -1,6 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { requireActor, requireDispatcher, requireWorker } from "./controlAuth";
+import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { workApprovalPolicy } from "./workPolicy";
 import {
   goalBranch,
@@ -15,6 +15,7 @@ import {
 } from "../src/lib/goal-mode";
 
 const ADVANCE_LEASE_MS = 10 * 60 * 1000;
+const COORDINATOR_RECEIPT_FRESH_MS = 10 * 60 * 1000;
 const TERMINAL = new Set(["done", "error", "cancelled"]);
 
 type GoalJobInput = {
@@ -39,6 +40,92 @@ type GoalJobInput = {
   goalWorkstreamId?: string;
   goalWave: number;
 };
+
+function receiptError(value: unknown): string | undefined {
+  if (!value) return undefined;
+  return String(value).slice(0, 1000);
+}
+
+function receiptCount(value: unknown): number {
+  return Math.max(0, Math.min(100, Number(value) || 0));
+}
+
+export const recordCoordinatorReceipt = mutation({
+  args: {
+    deploymentVersion: v.string(),
+    demand: v.object({
+      needed: v.boolean(),
+      reasons: v.array(v.string()),
+      error: v.optional(v.string()),
+    }),
+    controls: v.object({
+      checked: v.number(),
+      applied: v.number(),
+      blocked: v.number(),
+      error: v.optional(v.string()),
+    }),
+    revisions: v.object({
+      checked: v.number(),
+      applied: v.number(),
+      blocked: v.number(),
+      error: v.optional(v.string()),
+    }),
+    external: v.object({
+      checked: v.number(),
+      updated: v.number(),
+      blocked: v.number(),
+      error: v.optional(v.string()),
+    }),
+    wakeRequested: v.boolean(),
+    wakeResult: v.string(),
+    wakeWorkflow: v.optional(v.string()),
+    wakeRef: v.optional(v.string()),
+    wakeReason: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const id = await ctx.db.insert("goalCoordinatorReceipts", {
+      deploymentVersion: args.deploymentVersion.slice(0, 160),
+      demandNeeded: args.demand.needed,
+      demandReasons: args.demand.reasons.map((reason) => reason.slice(0, 400)).slice(0, 12),
+      demandError: receiptError(args.demand.error),
+      controlsChecked: receiptCount(args.controls.checked),
+      controlsApplied: receiptCount(args.controls.applied),
+      controlsBlocked: receiptCount(args.controls.blocked),
+      controlsError: receiptError(args.controls.error),
+      revisionsChecked: receiptCount(args.revisions.checked),
+      revisionsApplied: receiptCount(args.revisions.applied),
+      revisionsBlocked: receiptCount(args.revisions.blocked),
+      revisionsError: receiptError(args.revisions.error),
+      externalChecked: receiptCount(args.external.checked),
+      externalUpdated: receiptCount(args.external.updated),
+      externalBlocked: receiptCount(args.external.blocked),
+      externalError: receiptError(args.external.error),
+      wakeRequested: args.wakeRequested,
+      wakeResult: args.wakeResult.slice(0, 40),
+      wakeWorkflow: args.wakeWorkflow?.slice(0, 400),
+      wakeRef: args.wakeRef?.slice(0, 160),
+      wakeReason: args.wakeReason?.slice(0, 160),
+      createdAt: Date.now(),
+    });
+    return { id };
+  },
+});
+
+// Viewer-only audit surface for the last coordinator pass. Freshness is
+// computed server-side so a panel cannot mistake an old receipt for a healthy
+// five-minute coordinator.
+export const latestCoordinatorReceipt = query({
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, args) => {
+    await requireViewer(ctx, args);
+    const receipt = await ctx.db.query("goalCoordinatorReceipts").withIndex("by_createdAt").order("desc").first();
+    if (!receipt) return { receipt: null, fresh: false, ageMs: null };
+    const ageMs = Math.max(0, Date.now() - receipt.createdAt);
+    return { receipt, fresh: ageMs < COORDINATOR_RECEIPT_FRESH_MS, ageMs };
+  },
+});
 
 async function insertGoalJob(ctx: any, input: GoalJobInput) {
   const now = Date.now();

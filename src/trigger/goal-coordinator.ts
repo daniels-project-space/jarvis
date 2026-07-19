@@ -2,10 +2,17 @@ import { schedules } from "@trigger.dev/sdk/v3";
 import { wakeAgentHarness } from "../lib/agent-harness-wake";
 import {
   goalCoordinationDemand,
+  recordGoalCoordinatorReceipt,
   syncExternalGoalControls,
   syncExternalGoalRevisions,
   syncExternalGoalRuns,
 } from "./goal-runtime";
+
+const HARNESS_WORKFLOW = "https://github.com/daniels-project-space/jarvis/actions/workflows/jarvis-agent-harness.yml";
+
+function deploymentVersion(): string {
+  return String(process.env.TRIGGER_VERSION ?? process.env.VERCEL_GIT_COMMIT_SHA ?? process.env.GITHUB_SHA ?? "unversioned").slice(0, 160);
+}
 
 // Cheap five-minute supervision keeps multi-day goals moving without booting a
 // full GitHub/Codex workspace merely to poll an external factory record. The
@@ -27,6 +34,22 @@ export const goalCoordinator = schedules.task({
     ]);
     const shouldWake = external.wake || demand.needed === true;
     const woken = shouldWake ? await wakeAgentHarness("goal-coordinator").catch(() => false) : false;
-    return { external, controls, revisions, demand, woken };
+    const receipt = await recordGoalCoordinatorReceipt({
+      deploymentVersion: deploymentVersion(),
+      demand: {
+        needed: demand.needed === true,
+        reasons: Array.isArray(demand.reasons) ? demand.reasons.map(String).slice(0, 12) : [],
+        error: "error" in demand && demand.error ? String(demand.error).slice(0, 1000) : undefined,
+      },
+      controls,
+      revisions,
+      external,
+      wakeRequested: shouldWake,
+      wakeResult: shouldWake ? (woken ? "dispatched" : "not_dispatched") : "not_requested",
+      wakeWorkflow: shouldWake ? HARNESS_WORKFLOW : undefined,
+      wakeRef: shouldWake ? "main" : undefined,
+      wakeReason: shouldWake ? "goal-coordinator" : undefined,
+    }).then(() => ({ recorded: true })).catch((error) => ({ recorded: false, error: String(error).slice(0, 1000) }));
+    return { external, controls, revisions, demand, woken, receipt };
   },
 });

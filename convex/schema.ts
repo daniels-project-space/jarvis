@@ -365,6 +365,34 @@ export default defineSchema({
     .index("by_mission", ["missionId", "createdAt"])
     .index("by_createdAt", ["createdAt"]),
 
+  // Compact, append-only supervisor receipts. These deliberately describe
+  // coordination rather than changing it, so viewers can audit Trigger's
+  // five-minute Goal Mode owner without receiving a control capability.
+  goalCoordinatorReceipts: defineTable({
+    deploymentVersion: v.string(),
+    demandNeeded: v.boolean(),
+    demandReasons: v.array(v.string()),
+    demandError: v.optional(v.string()),
+    controlsChecked: v.number(),
+    controlsApplied: v.number(),
+    controlsBlocked: v.number(),
+    controlsError: v.optional(v.string()),
+    revisionsChecked: v.number(),
+    revisionsApplied: v.number(),
+    revisionsBlocked: v.number(),
+    revisionsError: v.optional(v.string()),
+    externalChecked: v.number(),
+    externalUpdated: v.number(),
+    externalBlocked: v.number(),
+    externalError: v.optional(v.string()),
+    wakeRequested: v.boolean(),
+    wakeResult: v.string(), // not_requested | dispatched | not_dispatched
+    wakeWorkflow: v.optional(v.string()),
+    wakeRef: v.optional(v.string()),
+    wakeReason: v.optional(v.string()),
+    createdAt: v.number(),
+  }).index("by_createdAt", ["createdAt"]),
+
   // Consequential work is suspended here until Daniel explicitly approves or
   // declines it. Approval changes are separate from execution logs for audit.
   approvals: defineTable({

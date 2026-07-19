@@ -179,4 +179,40 @@ describe("Goal Mode external runtime", () => {
     await expect(syncExternalGoalRuns()).resolves.toEqual({ checked: 1, updated: 0, blocked: 1, wake: false });
     expect(seen).toEqual(["goalMode:externalPending", "apps:get"]);
   });
+
+  it("writes a compact coordinator receipt only through the worker capability", async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      expect(body.path).toBe("goalMode:recordCoordinatorReceipt");
+      expect(body.args).toMatchObject({
+        deploymentVersion: "trigger-v42",
+        demand: { needed: true, reasons: ["runnable goal work"] },
+        controls: { checked: 2, applied: 1, blocked: 0 },
+        revisions: { checked: 1, applied: 0, blocked: 0 },
+        external: { checked: 3, updated: 1, blocked: 0 },
+        wakeRequested: true,
+        wakeResult: "dispatched",
+        wakeWorkflow: "https://github.com/daniels-project-space/jarvis/actions/workflows/jarvis-agent-harness.yml",
+        wakeRef: "main",
+        wakeReason: "goal-coordinator",
+        workerToken: "worker-capability",
+      });
+      return new Response(JSON.stringify({ value: { id: "receipt-1" } }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { recordGoalCoordinatorReceipt } = await import("./goal-runtime");
+    await expect(recordGoalCoordinatorReceipt({
+      deploymentVersion: "trigger-v42",
+      demand: { needed: true, reasons: ["runnable goal work"] },
+      controls: { checked: 2, applied: 1, blocked: 0 },
+      revisions: { checked: 1, applied: 0, blocked: 0 },
+      external: { checked: 3, updated: 1, blocked: 0 },
+      wakeRequested: true,
+      wakeResult: "dispatched",
+      wakeWorkflow: "https://github.com/daniels-project-space/jarvis/actions/workflows/jarvis-agent-harness.yml",
+      wakeRef: "main",
+      wakeReason: "goal-coordinator",
+    })).resolves.toEqual({ id: "receipt-1" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });

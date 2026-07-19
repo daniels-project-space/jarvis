@@ -175,3 +175,22 @@ export async function syncExternalGoalRevisions() {
 export async function goalCoordinationDemand() {
   return await jarvisCall("query", "goalMode:coordinationDemand") as { needed?: boolean; reasons?: string[] };
 }
+
+export type GoalCoordinatorReceipt = {
+  deploymentVersion: string;
+  demand: { needed: boolean; reasons: string[]; error?: string };
+  controls: { checked: number; applied: number; blocked: number; error?: string };
+  revisions: { checked: number; applied: number; blocked: number; error?: string };
+  external: { checked: number; updated: number; blocked: number; error?: string };
+  wakeRequested: boolean;
+  wakeResult: string;
+  wakeWorkflow?: string;
+  wakeRef?: string;
+  wakeReason?: string;
+};
+
+// This is an observation-only write. Goal control, the two durable outboxes,
+// and the GitHub wake all complete before a receipt is recorded.
+export async function recordGoalCoordinatorReceipt(receipt: GoalCoordinatorReceipt) {
+  return await jarvisCall("mutation", "goalMode:recordCoordinatorReceipt", receipt);
+}

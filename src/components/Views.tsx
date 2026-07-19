@@ -1054,6 +1054,10 @@ export function FleetView({ value }: { value: string }) {
   const m = missions.find((x) => x._id === missionId)
     ?? (!missionId ? missions.find((x) => x.mode === "goal" && ["running", "paused", "needs_input"].includes(x.status)) : null)
     ?? (requestedMode === "goal" ? null : missions[0]);
+  const missionEvents = (useJarvisQuery(
+    api.workEvents.forMission,
+    m ? ({ missionId: m._id, limit: 20 } as any) : "skip",
+  ) ?? []) as any[];
   const startGoal = async () => {
     const goal = goalDraft.trim();
     if (goal.length < 12) return;
@@ -1154,6 +1158,7 @@ export function FleetView({ value }: { value: string }) {
               <span className="rounded-full border border-cyan/20 bg-cyan/[0.06] px-2 py-1 text-cyan">{String(m.route ?? "goal").replace(/_/g, " ")}</span>
               {m.primaryRepo && <span className="rounded-full border border-white/10 px-2 py-1 font-mono">{m.primaryRepo}</span>}
               {m.revisionWave > 0 && <span className="rounded-full border border-amber/25 bg-amber/[0.06] px-2 py-1 text-amber">repair wave {m.revisionWave}/{m.maxRevisionWaves}</span>}
+              {m.pausedPhase && <span className="rounded-full border border-amber/25 bg-amber/[0.06] px-2 py-1 text-amber">paused at {m.pausedPhase}</span>}
             </div>
           )}
           <div className="mt-2 flex items-center justify-center gap-2">
@@ -1203,6 +1208,8 @@ export function FleetView({ value }: { value: string }) {
                 )}
               </div>
               {j.model && <span className="hud-label shrink-0 !text-[9px]">{workModelLabel(j.model)}{j.reasoningEffort ? `/${j.reasoningEffort}` : ""}</span>}
+              {j.readonly && <span className="hud-label shrink-0 !text-[9px] !text-cyan">read-only</span>}
+              {j.dependsOn?.length > 0 && <span className="hud-label shrink-0 !text-[9px]">after {j.dependsOn.length}</span>}
               <span className="hud-label shrink-0 !text-[9px]">{j.status}</span>
               {j.pullRequestUrl && <a href={j.pullRequestUrl} target="_blank" rel="noreferrer" className="text-[9px] text-cyan">PR ↗</a>}
             </div>
@@ -1212,6 +1219,19 @@ export function FleetView({ value }: { value: string }) {
           <div className="mt-4 rounded-xl border border-amber/25 bg-amber/[0.06] p-3 text-xs leading-relaxed text-amber">
             <div className="hud-label mb-1 !text-amber">needs attention</div>
             {m.failureReason}
+          </div>
+        )}
+        {goalMode && missionEvents.filter((event) => event.type === "pause" || event.type === "resume").length > 0 && (
+          <div className={`${glass} mt-4 p-3`}>
+            <div className="hud-label mb-2">pause / resume history</div>
+            <div className="space-y-1.5">
+              {missionEvents.filter((event) => event.type === "pause" || event.type === "resume").map((event) => (
+                <div key={event._id} className="flex items-center justify-between gap-3 text-[11px] text-slate">
+                  <span className="truncate"><span className="text-cyan">{event.type}</span> · {event.message}</span>
+                  <span className="shrink-0 font-mono text-[9px]">{new Date(event.createdAt).toLocaleString()}</span>
+                </div>
+              ))}
+            </div>
           </div>
         )}
         {m.summary && (
