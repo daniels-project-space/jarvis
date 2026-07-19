@@ -3136,7 +3136,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             setOptionsOpen(false);
             setPanelFull(false);
             setPanelMin(false);
-            void setPanel({ type: "fleet", value: JSON.stringify({}), title: "Goal Mode" });
+            void setPanel({ type: "fleet", value: JSON.stringify({ mode: "goal" }), title: "Goal Mode" });
           }}
           onMacSetup={() => {
             setOptionsOpen(false);

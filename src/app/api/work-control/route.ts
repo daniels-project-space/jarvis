@@ -1,13 +1,14 @@
 import type { NextRequest } from "next/server";
-import { adminSessionHash, controlMutation, validateAdminSession } from "@/lib/control-session";
+import { controlMutation } from "@/lib/control-session";
+import { wakeAgentHarness } from "@/lib/agent-harness-wake";
+import { controlActor, controlCredentials } from "@/lib/request-auth";
 
 const ACTIONS = new Set(["approve", "decline", "pause", "resume", "cancel", "retry", "answer"]);
 
 export async function POST(req: NextRequest) {
-  const authTokenHash = await adminSessionHash(req);
-  if (!(await validateAdminSession(authTokenHash))) {
-    return Response.json({ ok: false }, { status: 401 });
-  }
+  const actor = await controlActor(req);
+  if (!actor) return Response.json({ ok: false }, { status: 401 });
+  const credentials = controlCredentials(actor);
   const body = await req.json().catch(() => ({}));
   const jobId = String(body?.jobId ?? "");
   const missionId = String(body?.missionId ?? "");
@@ -15,21 +16,40 @@ export async function POST(req: NextRequest) {
   if ((!jobId && !missionId) || !ACTIONS.has(action)) return Response.json({ ok: false }, { status: 400 });
 
   let ok: unknown = false;
+  let shouldWake = false;
   if (missionId) {
     if (!new Set(["pause", "resume", "cancel"]).has(action)) return Response.json({ ok: false }, { status: 400 });
-    ok = await controlMutation("goalMode:control", { id: missionId, action, authTokenHash });
+    ok = await controlMutation("goalMode:control", { id: missionId, action, ...credentials });
   } else if (action === "approve" || action === "decline") {
     ok = await controlMutation("approvals:decide", {
       jobId,
       decision: action === "approve" ? "approved" : "declined",
-      authTokenHash,
+      ...credentials,
     });
   } else if (action === "answer") {
     const answer = String(body?.input ?? "").trim();
     if (!answer) return Response.json({ ok: false }, { status: 400 });
-    ok = await controlMutation("jobs:provideInput", { jobId, answer, authTokenHash });
+    ok = await controlMutation("jobs:provideInput", { jobId, answer, ...credentials });
   } else {
-    ok = await controlMutation("jobs:control", { jobId, action, authTokenHash });
+    ok = await controlMutation("jobs:control", { jobId, action, ...credentials });
   }
-  return Response.json({ ok: ok === true }, { status: ok === true ? 200 : 409 });
+  if (ok === true && missionId) {
+    const { goalCoordinationDemand, syncExternalGoalControls, syncExternalGoalRevisions } = await import("@/trigger/goal-runtime");
+    await syncExternalGoalControls().catch(() => null);
+    await syncExternalGoalRevisions().catch(() => null);
+    if (action === "resume") {
+      shouldWake = true;
+      const demand = await goalCoordinationDemand().catch(() => null);
+      if (demand) shouldWake = demand.needed === true;
+    }
+  } else if (ok === true && ["approve", "resume", "retry", "answer"].includes(action)) {
+    shouldWake = true;
+  }
+  if (shouldWake) {
+    await wakeAgentHarness(`${missionId ? "goal" : "job"}-${action}:${missionId || jobId}`).catch(() => false);
+  }
+  return Response.json(
+    { ok: ok === true, ...(ok === true ? {} : { error: "That work item cannot apply this control from its current state." }) },
+    { status: ok === true ? 200 : 409 },
+  );
 }

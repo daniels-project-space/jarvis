@@ -21,6 +21,7 @@ import {
 } from "./subscription-runtime";
 import { runConcurrentClaimLoop } from "./agent-pool";
 import { parseGoalPlan, parseGoalValidation, type GoalPlan } from "../lib/goal-mode";
+import { startAppFactoryGoal, syncExternalGoalRevisions, syncExternalGoalRuns } from "./goal-runtime";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -28,8 +29,6 @@ import { parseGoalPlan, parseGoalValidation, type GoalPlan } from "../lib/goal-m
 
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
-const APP_FACTORY_CONVEX_URL =
-  process.env.APP_FACTORY_CONVEX_URL ?? "https://successful-starling-140.eu-west-1.convex.cloud";
 
 function promptArgs(prompt: string, tier: string, json = false, mcpConfig?: string | null, reasoningEffort?: unknown): string[] {
   const args = codexExecPrefix(tier, reasoningEffort);
@@ -91,61 +90,6 @@ async function convexQuery(path: string, args: unknown) {
   }
 }
 
-async function appFactoryCall(kind: "query" | "mutation", path: string, args: Record<string, unknown>) {
-  const response = await fetch(`${APP_FACTORY_CONVEX_URL.replace(/\/$/, "")}/api/${kind}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, args, format: "json" }),
-  });
-  const payload = await response.json();
-  if (!response.ok || payload?.status === "error") {
-    throw new Error(`App Factory ${path} failed: ${String(payload?.errorMessage ?? response.status).slice(0, 400)}`);
-  }
-  return payload.value;
-}
-
-async function startAppFactoryGoal(plan: GoalPlan, missionId: string) {
-  if (!plan.factory) throw new Error("The Sol plan omitted the required App Factory build brief");
-  const suffix = missionId.replace(/[^a-zA-Z0-9]/g, "").slice(-6).toLowerCase();
-  const baseSlug = plan.factory.slug.replace(/[^a-z0-9-]/g, "-").replace(/^-+|-+$/g, "").slice(0, 42) || "new-app";
-  const slug = `${baseSlug}-${suffix}`.slice(0, 50);
-  const existing: any = await appFactoryCall("query", "apps:bySlug", { slug });
-  if (existing?._id) return { kind: "app-factory", id: String(existing._id), slug };
-  const id = await appFactoryCall("mutation", "apps:create", {
-    slug,
-    name: plan.factory.name,
-    oneLiner: plan.summary.slice(0, 120),
-    idea: plan.factory.brief,
-    origin: "daniel",
-    priority: 100,
-  });
-  if (!id) throw new Error("App Factory did not return a live app id");
-  return { kind: "app-factory", id: String(id), slug };
-}
-
-async function syncExternalGoalRuns() {
-  const rows: any[] = (await convexQuery("goalMode:externalPending", {})) ?? [];
-  let updated = 0;
-  for (const row of rows.slice(0, 20)) {
-    if (row.externalKind !== "app-factory" || !row.externalRunId) continue;
-    try {
-      const app: any = await appFactoryCall("query", "apps:get", { id: row.externalRunId });
-      if (!app) throw new Error("App Factory run no longer exists");
-      const ok = await convexMutation("goalMode:updateExternal", {
-        id: row.id,
-        status: String(app.status ?? "unknown"),
-        stage: String(app.stage ?? "unknown"),
-        stageState: app.stageState ? String(app.stageState) : undefined,
-        detail: app.lastError ? String(app.lastError).slice(0, 1_500) : undefined,
-      });
-      if (ok) updated += 1;
-    } catch {
-      // A temporary provider failure must not rewrite durable goal state. The
-      // next scheduled cloud harness retries the same external id.
-    }
-  }
-  return updated;
-}
 // Weaves land wherever Daniel is actually chatting.
 async function chatThread(): Promise<string> {
   const t = await convexQuery("ui:getActiveThread", {});
@@ -726,6 +670,15 @@ export async function runAgentHarness() {
               title: "Goal Mode · validated outcome",
             }).catch(() => {});
             await sendPush("JARVIS — goal achieved", validation.summary.slice(0, 120), "/").catch(() => {});
+          } else if (result.status === "external_refining") {
+            const revisionSync = await syncExternalGoalRevisions().catch(() => ({ applied: 0 }));
+            const thread = await chatThread();
+            await convexMutation("chatQueue:postAssistant", {
+              threadId: thread,
+              text: revisionSync.applied > 0
+                ? "The final Sol review found fixable product gaps. I returned them to the same App Factory run, which is rebuilding through its real validation gates now."
+                : "The final Sol review found fixable product gaps. They are durably queued for the same App Factory run and Jarvis will keep retrying the handoff without losing the validation evidence.",
+            }).catch(() => {});
           } else if (result.status === "needs_input") {
             const thread = await chatThread();
             await convexMutation("chatQueue:postAssistant", {

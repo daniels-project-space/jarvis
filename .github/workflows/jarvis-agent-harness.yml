@@ -8,7 +8,10 @@ on:
         required: false
         default: manual
   schedule:
-    - cron: "*/5 * * * *"
+    # Immediate dispatch handles new work and Trigger's five-minute goal
+    # coordinator handles recovery/external polling. This hourly run is only a
+    # dead-man switch, avoiding 288 full npm/Codex bootstraps every day.
+    - cron: "17 * * * *"
 
 permissions:
   contents: read

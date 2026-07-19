@@ -278,6 +278,17 @@ export default defineSchema({
     externalStatus: v.optional(v.string()),
     externalStage: v.optional(v.string()),
     externalUpdatedAt: v.optional(v.number()),
+    externalPollFailures: v.optional(v.number()),
+    externalPollError: v.optional(v.string()),
+    externalPollAlertedAt: v.optional(v.number()),
+    externalControlRequested: v.optional(v.string()),
+    externalControlUpdatedAt: v.optional(v.number()),
+    externalRevisionRequested: v.optional(v.string()),
+    externalRevisionWave: v.optional(v.number()),
+    externalRevisionUpdatedAt: v.optional(v.number()),
+    externalActionFailures: v.optional(v.number()),
+    externalActionError: v.optional(v.string()),
+    externalActionAlertedAt: v.optional(v.number()),
     synthesisAttempt: v.optional(v.number()),
     synthesisLeaseUntil: v.optional(v.number()),
     completedAt: v.optional(v.number()),
@@ -285,7 +296,9 @@ export default defineSchema({
     updatedAt: v.number(),
   })
     .index("by_status", ["status", "createdAt"])
-    .index("by_createdAt", ["createdAt"]),
+    .index("by_createdAt", ["createdAt"])
+    .index("by_external_control", ["externalControlRequested", "createdAt"])
+    .index("by_external_revision", ["externalRevisionRequested", "createdAt"]),
 
   // Opaque, revocable browser sessions for Daniel. The raw bearer token only
   // exists in an HttpOnly cookie; Convex stores its SHA-256 digest. Privileged

@@ -1036,37 +1036,110 @@ const JOB_DOT: Record<string, string> = {
 
 export function FleetView({ value }: { value: string }) {
   const [busy, setBusy] = useState<string | null>(null);
+  const [goalDraft, setGoalDraft] = useState("");
+  const [maxBuildSessions, setMaxBuildSessions] = useState(6);
+  const [maxRevisionWaves, setMaxRevisionWaves] = useState(2);
+  const [startError, setStartError] = useState("");
+  const [controlError, setControlError] = useState("");
   let missionId = "";
+  let requestedMode = "";
   try {
-    missionId = JSON.parse(value)?.missionId ?? "";
+    const request = JSON.parse(value);
+    missionId = request?.missionId ?? "";
+    requestedMode = request?.mode ?? "";
   } catch {
     /* noop */
   }
   const missions = (useJarvisQuery(api.missions.active, {}) ?? []) as any[];
   const m = missions.find((x) => x._id === missionId)
     ?? (!missionId ? missions.find((x) => x.mode === "goal" && ["running", "paused", "needs_input"].includes(x.status)) : null)
-    ?? missions[0];
+    ?? (requestedMode === "goal" ? null : missions[0]);
+  const startGoal = async () => {
+    const goal = goalDraft.trim();
+    if (goal.length < 12) return;
+    setBusy("start");
+    setStartError("");
+    try {
+      const response = await viewerFetch("/api/goal-mode", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ goal, maxBuildSessions, maxRevisionWaves }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload?.missionId) throw new Error(String(payload?.error ?? "Goal Mode could not start."));
+      setGoalDraft("");
+    } catch (error) {
+      setStartError(String(error instanceof Error ? error.message : error));
+    } finally {
+      setBusy(null);
+    }
+  };
   if (!m)
     return (
-      <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-slate">
-        No fleet in flight right now.
+      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
+        <div className="mx-auto flex min-h-full max-w-2xl items-center justify-center">
+          <div className="w-full rounded-2xl border border-cyan/20 bg-[radial-gradient(circle_at_50%_0%,rgba(0,255,136,.09),rgba(7,13,23,.88)_58%)] p-5 shadow-2xl backdrop-blur-xl">
+            <div className="hud-label text-cyan">durable goal mode</div>
+            <div className="mt-2 text-xl font-semibold text-ice">Give Jarvis the outcome, not a task list.</div>
+            <p className="mt-2 max-w-xl text-xs leading-relaxed text-slate">
+              One Sol/max session designs the path, bounded Terra/high sessions build it with checkpoints, and Sol/max validates the complete result before Jarvis can call it achieved.
+            </p>
+            <textarea
+              value={goalDraft}
+              onChange={(event) => setGoalDraft(event.target.value)}
+              rows={4}
+              maxLength={500}
+              placeholder="Example: Make the Rental Manager return workflow fully accurate, fast and proven in production…"
+              className="mt-4 w-full resize-none rounded-xl border border-white/10 bg-black/25 px-3 py-3 text-sm leading-relaxed text-ice outline-none transition placeholder:text-slate/45 focus:border-cyan/35"
+            />
+            <div className="mt-3 flex flex-wrap items-end gap-3">
+              <label className="grid gap-1 text-[9px] uppercase tracking-[0.14em] text-slate">
+                max build sessions
+                <select value={maxBuildSessions} onChange={(event) => setMaxBuildSessions(Number(event.target.value))} className="rounded-lg border border-white/10 bg-[#0b1422] px-2 py-1.5 text-[11px] normal-case tracking-normal text-ice outline-none">
+                  {[4, 6, 8].map((count) => <option key={count} value={count}>{count}</option>)}
+                </select>
+              </label>
+              <label className="grid gap-1 text-[9px] uppercase tracking-[0.14em] text-slate">
+                repair waves
+                <select value={maxRevisionWaves} onChange={(event) => setMaxRevisionWaves(Number(event.target.value))} className="rounded-lg border border-white/10 bg-[#0b1422] px-2 py-1.5 text-[11px] normal-case tracking-normal text-ice outline-none">
+                  {[1, 2, 3, 4].map((count) => <option key={count} value={count}>{count}</option>)}
+                </select>
+              </label>
+              <button
+                disabled={busy === "start" || goalDraft.trim().length < 12}
+                onClick={() => void startGoal()}
+                className="ml-auto rounded-xl border border-cyan/35 bg-cyan/[0.09] px-4 py-2 text-[11px] font-medium text-cyan transition hover:bg-cyan/[0.16] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {busy === "start" ? "starting durable mission…" : "start goal mode"}
+              </button>
+            </div>
+            {startError && <div className="mt-3 rounded-lg border border-red-400/20 bg-red-400/[0.06] px-3 py-2 text-xs text-red-300">{startError}</div>}
+          </div>
+        </div>
       </div>
     );
   const done = m.jobs.filter((j: any) => j.status === "done").length;
   const goalMode = m.mode === "goal";
   const controlGoal = async (action: "pause" | "resume" | "cancel") => {
     setBusy(action);
+    setControlError("");
     try {
-      await viewerFetch("/api/work-control", {
+      const response = await viewerFetch("/api/work-control", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ missionId: m._id, action }),
       });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload?.ok !== true) {
+        throw new Error(String(payload?.error ?? `Goal Mode could not ${action} this outcome.`));
+      }
+    } catch (error) {
+      setControlError(String(error instanceof Error ? error.message : error));
     } finally {
       setBusy(null);
     }
   };
-  const phaseIndex = m.phase === "planning" ? 0 : ["building", "refining", "factory approval"].includes(m.phase) ? 1 : m.phase === "validating" ? 2 : m.phase === "complete" ? 3 : 1;
+  const phaseIndex = m.phase === "planning" ? 0 : ["building", "refining", "factory approval", "factory refinement"].includes(m.phase) ? 1 : m.phase === "validating" ? 2 : m.phase === "complete" ? 3 : 1;
   const phaseLabels = ["Sol plan", "Terra build", "Sol validate", "achieved"];
   const glass = "rounded-xl border border-white/10 bg-white/[0.045] backdrop-blur-xl";
   return (
@@ -1144,12 +1217,17 @@ export function FleetView({ value }: { value: string }) {
           <div className="mt-4 flex flex-wrap justify-center gap-2">
             {m.status === "running" ? (
               <button disabled={Boolean(busy)} onClick={() => void controlGoal("pause")} className="rounded-lg border border-white/10 px-3 py-1.5 text-[10px] text-slate hover:text-ice disabled:opacity-50">{busy === "pause" ? "pausing…" : "pause"}</button>
+            ) : m.phase === "factory approval" ? (
+              m.externalSlug
+                ? <a href={`https://app-factory-v2.vercel.app/apps/${encodeURIComponent(m.externalSlug)}`} target="_blank" rel="noreferrer" className="rounded-lg border border-amber/30 bg-amber/[0.06] px-3 py-1.5 text-[10px] text-amber hover:bg-amber/10">review the human gate in App Factory ↗</a>
+                : <span className="rounded-lg border border-amber/20 px-3 py-1.5 text-[10px] text-amber">waiting for App Factory approval</span>
             ) : (
-              <button disabled={Boolean(busy)} onClick={() => void controlGoal("resume")} className="rounded-lg border border-cyan/30 bg-cyan/[0.06] px-3 py-1.5 text-[10px] text-cyan hover:bg-cyan/10 disabled:opacity-50">{busy === "resume" ? "resuming…" : "resume"}</button>
+              <button disabled={Boolean(busy)} onClick={() => void controlGoal("resume")} className="rounded-lg border border-cyan/30 bg-cyan/[0.06] px-3 py-1.5 text-[10px] text-cyan hover:bg-cyan/10 disabled:opacity-50">{busy === "resume" ? "resuming…" : m.canExtendExternal ? "allow one more repair wave" : "resume"}</button>
             )}
             <button disabled={Boolean(busy)} onClick={() => void controlGoal("cancel")} className="rounded-lg border border-red-400/20 px-3 py-1.5 text-[10px] text-red-300/80 hover:bg-red-400/[0.06] disabled:opacity-50">{busy === "cancel" ? "cancelling…" : "cancel goal"}</button>
           </div>
         )}
+        {controlError && <div className="mt-3 rounded-lg border border-red-400/20 bg-red-400/[0.06] px-3 py-2 text-xs text-red-300">{controlError}</div>}
         {m.summary && (
           <div className={`${glass} mt-4 p-4`}>
             <div className="hud-label mb-2">mission report</div>

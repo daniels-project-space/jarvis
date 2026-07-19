@@ -1,10 +1,12 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { requireAdmin, requireDispatcher, requireWorker } from "./controlAuth";
+import { requireActor, requireDispatcher, requireWorker } from "./controlAuth";
 import { workApprovalPolicy } from "./workPolicy";
 import {
   goalBranch,
+  goalJobRunnableForMission,
   plannerTask,
+  summarizeGoalPhase,
   validatorTask,
   type GoalPlan,
   type GoalRefinement,
@@ -221,6 +223,16 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
     acceptanceCriteria: mission.acceptanceCriteria ?? [],
     buildEvidence,
     revisionWave: Number(mission.revisionWave ?? 0),
+    externalContext: mission.externalRunId
+      ? [
+          `App Factory run ${mission.externalRunId}${mission.externalSlug ? ` (${mission.externalSlug})` : ""}.`,
+          `Current provider state: ${mission.externalStatus ?? "unknown"} · ${mission.externalStage ?? "unknown"}.`,
+          mission.externalSlug
+            ? `Inspect the real run and its demo/deployment evidence at https://app-factory-v2.vercel.app/apps/${encodeURIComponent(String(mission.externalSlug))}.`
+            : "Inspect the real App Factory run and its demo/deployment evidence.",
+          "Any fixable product gap must be returned as a refinement; Jarvis will feed it back into this same factory run rather than editing the factory platform itself.",
+        ].join(" ")
+      : undefined,
   });
   const validatorJobId = await insertGoalJob(ctx, {
     task,
@@ -230,7 +242,7 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
     readonly: true,
     model: "sol",
     reasoningEffort: "max",
-    mcp: plan.validation.liveChecks.length ? ["playwright", "context7"] : ["context7"],
+    mcp: mission.externalRunId || plan.validation.liveChecks.length ? ["playwright", "context7"] : ["context7"],
     originThreadId: mission.originThreadId,
     agentId: "jarvis",
     risk: "low",
@@ -262,6 +274,51 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
   return validatorJobId;
 }
 
+async function resolveGoalAttention(ctx: any, missionId: unknown) {
+  const attention = await ctx.db
+    .query("attentionItems")
+    .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", `goal-mode:${missionId}`))
+    .first();
+  if (attention && attention.status !== "resolved") {
+    await ctx.db.patch(attention._id, { status: "resolved", updatedAt: Date.now() });
+  }
+}
+
+async function blockGoalForPhaseFailure(ctx: any, mission: any, phaseJobs: any[], phase: string) {
+  const failed = phaseJobs.filter((job) => job.status === "error" || job.status === "cancelled");
+  const reason = failed.length
+    ? `${failed.map((job) => `${job.label ?? job.task?.slice(0, 80) ?? "Goal session"} ended ${job.status}`).join("; ")}. Checkpoints and dependent work are preserved; resume retries this phase.`
+    : `Goal Mode could not continue the ${phase} phase.`;
+  const now = Date.now();
+  // Stop independent siblings as well as dependency-blocked children. Their
+  // workers observe the lease change, save a final checkpoint, and cannot be
+  // reclaimed until Daniel resumes the parent mission.
+  for (const job of phaseJobs) {
+    if (job.status === "pending" || job.status === "running") {
+      await ctx.db.patch(job._id, {
+        status: "paused",
+        stage: "blocked dependency",
+        progress: "Goal Mode held after a phase failure",
+        nextRunAt: undefined,
+      });
+    }
+  }
+  await ctx.db.patch(mission._id, {
+    status: "needs_input",
+    phase: "blocked",
+    pausedPhase: phase,
+    failureReason: reason.slice(0, 2000),
+    advanceLeaseUntil: undefined,
+    updatedAt: now,
+  });
+  await upsertGoalAttention(ctx, mission, reason);
+  await recordMissionEvent(ctx, String(mission._id), "goal_blocked", reason, "blocked", mission.percent, {
+    failedJobIds: failed.map((job) => String(job._id)),
+    phase,
+  });
+  return reason;
+}
+
 export const claimAdvance = mutation({
   args: { workerToken: v.optional(v.string()) },
   handler: async (ctx, args) => {
@@ -271,9 +328,12 @@ export const claimAdvance = mutation({
       .query("missions")
       .withIndex("by_status", (q: any) => q.eq("status", "running"))
       .order("asc")
-      .take(50);
+      .take(100);
     for (const mission of running) {
-      if (mission.mode !== "goal" || mission.externalRunId) continue;
+      if (mission.mode !== "goal") continue;
+      // External factories own their build loop, but their completed Sol
+      // validator still returns through this same durable contract parser.
+      if (mission.externalRunId && mission.phase !== "validating") continue;
       const jobs = await ctx.db
         .query("jobs")
         .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
@@ -282,13 +342,7 @@ export const claimAdvance = mutation({
         const planner = jobs.find((job: any) => String(job._id) === mission.planningJobId);
         if (!planner || !TERMINAL.has(planner.status)) continue;
         if (planner.status !== "done") {
-          await ctx.db.patch(mission._id, {
-            status: "needs_input",
-            phase: "blocked",
-            failureReason: `The Sol planning session ended ${planner.status}: ${String(planner.result ?? "no result").slice(0, 800)}`,
-            updatedAt: now,
-          });
-          await recordMissionEvent(ctx, String(mission._id), "goal_blocked", "Planning could not produce a verified plan", "blocked", mission.percent);
+          await blockGoalForPhaseFailure(ctx, mission, [planner], "planning");
           continue;
         }
         if ((mission.advanceLeaseUntil ?? 0) > now) continue;
@@ -313,7 +367,12 @@ export const claimAdvance = mutation({
       }
       if (mission.phase === "building" || mission.phase === "refining") {
         const phaseJobs = activeStageJobs(jobs, mission);
-        if (!phaseJobs.length || phaseJobs.some((job: any) => !TERMINAL.has(job.status))) continue;
+        const phaseState = summarizeGoalPhase(phaseJobs);
+        if (phaseState.state === "blocked") {
+          await blockGoalForPhaseFailure(ctx, mission, phaseJobs, mission.phase);
+          return { kind: "advanced", missionId: mission._id, phase: "blocked" };
+        }
+        if (phaseState.state !== "complete") continue;
         await enqueueValidator(ctx, mission, jobs);
         return { kind: "advanced", missionId: mission._id, phase: "validating" };
       }
@@ -321,13 +380,7 @@ export const claimAdvance = mutation({
         const validator = jobs.find((job: any) => String(job._id) === mission.validatorJobId);
         if (!validator || !TERMINAL.has(validator.status)) continue;
         if (validator.status !== "done") {
-          await ctx.db.patch(mission._id, {
-            status: "needs_input",
-            phase: "blocked",
-            failureReason: `The Sol validation session ended ${validator.status}: ${String(validator.result ?? "no result").slice(0, 800)}`,
-            updatedAt: now,
-          });
-          await recordMissionEvent(ctx, String(mission._id), "goal_blocked", "Deep validation could not complete", "blocked", mission.percent);
+          await blockGoalForPhaseFailure(ctx, mission, [validator], "validating");
           continue;
         }
         if ((mission.advanceLeaseUntil ?? 0) > now) continue;
@@ -343,6 +396,10 @@ export const claimAdvance = mutation({
           jobId: validator._id,
           result: String(validator.result ?? ""),
           expectedAdvanceAttempt: advanceAttempt,
+          externalKind: mission.externalKind,
+          externalRunId: mission.externalRunId,
+          revisionWave: Number(mission.revisionWave ?? 0),
+          maxRevisionWaves: Number(mission.maxRevisionWaves ?? 2),
         };
       }
     }
@@ -385,6 +442,7 @@ export const recordPlan = mutation({
         advanceLeaseUntil: undefined,
         updatedAt: now,
       });
+      await resolveGoalAttention(ctx, args.id);
       await recordMissionEvent(ctx, String(args.id), "goal_plan_ready", "Sol plan accepted; App Factory now owns the build lifecycle", "building", 12, {
         externalRunId: args.externalRun.id,
         externalSlug: args.externalRun.slug,
@@ -448,6 +506,7 @@ export const recordPlan = mutation({
       advanceLeaseUntil: undefined,
       updatedAt: now,
     });
+    await resolveGoalAttention(ctx, args.id);
     await recordMissionEvent(ctx, String(args.id), "goal_plan_ready", `Sol plan accepted; ${workstreamJobs.size} Terra/high sessions queued`, "building", 12, {
       waitingApprovals,
       branch,
@@ -480,6 +539,7 @@ export const rejectAdvance = mutation({
       await ctx.db.patch(args.id, {
         status: "needs_input",
         phase: "blocked",
+        pausedPhase: mission.phase,
         failureReason: reason,
         advanceLeaseUntil: undefined,
         updatedAt: now,
@@ -592,6 +652,55 @@ async function upsertGoalAttention(ctx: any, mission: any, detail: string) {
   else await ctx.db.insert("attentionItems", { ...item, createdAt: now });
 }
 
+async function queueExternalRevision(
+  ctx: any,
+  mission: any,
+  validation: GoalValidation,
+  wave: number,
+  options: { validationHistory?: GoalValidation[]; extendBudget?: boolean; eventType: string },
+) {
+  if (mission.externalKind !== "app-factory" || !mission.externalRunId) {
+    throw new Error("Only an owned App Factory run can accept an external Goal Mode revision");
+  }
+  const now = Date.now();
+  const patch: Record<string, unknown> = {
+    status: "running",
+    phase: "factory refinement",
+    percent: Math.min(94, 84 + wave * 4),
+    validation,
+    revisionWave: Number(mission.revisionWave ?? 0),
+    maxRevisionWaves: options.extendBudget
+      ? Math.max(wave, Number(mission.maxRevisionWaves ?? 2) + 1)
+      : mission.maxRevisionWaves,
+    validatorJobId: undefined,
+    pendingRefinements: validation.refinements,
+    externalRevisionRequested: "pending",
+    externalRevisionWave: wave,
+    externalRevisionUpdatedAt: now,
+    externalActionFailures: 0,
+    externalActionError: undefined,
+    externalActionAlertedAt: undefined,
+    advanceLeaseUntil: undefined,
+    failureReason: undefined,
+    pausedPhase: undefined,
+    updatedAt: now,
+  };
+  if (options.validationHistory) patch.validationHistory = options.validationHistory;
+  await ctx.db.patch(mission._id, patch);
+  await resolveGoalAttention(ctx, mission._id);
+  await recordMissionEvent(
+    ctx,
+    String(mission._id),
+    options.eventType,
+    options.extendBudget
+      ? `Daniel approved App Factory repair wave ${wave}; the durable revision outbox is applying it to the same generated app`
+      : `Sol validation queued repair wave ${wave} for the same App Factory run`,
+    "factory refinement",
+    Math.min(94, 84 + wave * 4),
+    { wave, gaps: validation.gaps, externalRunId: mission.externalRunId },
+  );
+}
+
 export const recordValidation = mutation({
   args: {
     id: v.id("missions"),
@@ -622,6 +731,7 @@ export const recordValidation = mutation({
         failureReason: undefined,
         updatedAt: now,
       });
+      await resolveGoalAttention(ctx, args.id);
       await recordMissionEvent(ctx, String(args.id), "goal_complete", "Sol validation passed the complete outcome", "complete", 100, {
         evidence: validation.evidence,
       });
@@ -629,6 +739,13 @@ export const recordValidation = mutation({
     }
     const nextWave = Number(mission.revisionWave ?? 0) + 1;
     if (validation.verdict === "refine" && nextWave <= Number(mission.maxRevisionWaves ?? 2)) {
+      if (mission.externalKind === "app-factory" && mission.externalRunId) {
+        await queueExternalRevision(ctx, mission, validation, nextWave, {
+          validationHistory: history,
+          eventType: "goal_factory_refinement_queued",
+        });
+        return { advanced: true, status: "external_refining", jobs: 0 };
+      }
       const ids = await enqueueRefinements(ctx, mission, validation.refinements, nextWave);
       await ctx.db.patch(args.id, {
         phase: "refining",
@@ -653,6 +770,7 @@ export const recordValidation = mutation({
     await ctx.db.patch(args.id, {
       status: "needs_input",
       phase: "needs Daniel",
+      pausedPhase: "validating",
       validation,
       validationHistory: history,
       pendingRefinements: validation.refinements,
@@ -670,9 +788,18 @@ export const externalPending = query({
   args: { workerToken: v.optional(v.string()) },
   handler: async (ctx, args) => {
     requireWorker(args.workerToken);
-    const rows = await ctx.db.query("missions").withIndex("by_createdAt").order("desc").take(80);
-    return rows
-      .filter((mission: any) => mission.mode === "goal" && mission.externalRunId && ["running", "needs_input"].includes(mission.status))
+    const groups = await Promise.all(
+      ["running", "needs_input"].map((status) =>
+        ctx.db.query("missions").withIndex("by_status", (q: any) => q.eq("status", status)).order("asc").take(100),
+      ),
+    );
+    return groups.flat()
+      .filter((mission: any) => {
+        if (mission.mode !== "goal" || !mission.externalRunId) return false;
+        if (mission.externalControlRequested || mission.externalRevisionRequested) return false;
+        if (mission.phase === "building" || mission.phase === "factory approval") return true;
+        return mission.phase === "blocked" && mission.externalStatus !== "shipped";
+      })
       .map((mission: any) => ({
         id: mission._id,
         goal: mission.goal,
@@ -683,7 +810,235 @@ export const externalPending = query({
         externalSlug: mission.externalSlug,
         externalStatus: mission.externalStatus,
         externalStage: mission.externalStage,
+        externalPollFailures: mission.externalPollFailures ?? 0,
       }));
+  },
+});
+
+export const externalRevisionsPending = query({
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const rows = await ctx.db
+      .query("missions")
+      .withIndex("by_external_revision", (q: any) => q.eq("externalRevisionRequested", "pending"))
+      .order("asc")
+      .take(50);
+    return rows
+      .filter((mission: any) =>
+        mission.mode === "goal" &&
+        mission.externalKind === "app-factory" &&
+        mission.externalRunId &&
+        mission.validation?.verdict === "refine" &&
+        (mission.status === "running" || (mission.status === "needs_input" && mission.phase === "blocked")),
+      )
+      .map((mission: any) => ({
+        id: mission._id,
+        externalRunId: mission.externalRunId,
+        wave: Number(mission.externalRevisionWave ?? 0),
+        validation: mission.validation,
+        externalActionFailures: mission.externalActionFailures ?? 0,
+      }));
+  },
+});
+
+export const acknowledgeExternalRevision = mutation({
+  args: {
+    id: v.id("missions"),
+    wave: v.number(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const mission = await ctx.db.get(args.id);
+    if (
+      !mission ||
+      mission.externalRevisionRequested !== "pending" ||
+      Number(mission.externalRevisionWave ?? 0) !== args.wave ||
+      mission.externalKind !== "app-factory" ||
+      !mission.externalRunId
+    ) return false;
+    if (mission.status === "cancelled" || mission.status === "done") {
+      await ctx.db.patch(args.id, {
+        externalRevisionRequested: undefined,
+        externalRevisionWave: undefined,
+        externalRevisionUpdatedAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      return false;
+    }
+    const now = Date.now();
+    const paused = mission.status === "paused";
+    await ctx.db.patch(args.id, {
+      status: paused ? "paused" : "running",
+      phase: paused ? "paused" : "building",
+      pausedPhase: paused ? "building" : undefined,
+      revisionWave: args.wave,
+      maxRevisionWaves: Math.max(args.wave, Number(mission.maxRevisionWaves ?? 2)),
+      pendingRefinements: undefined,
+      externalRevisionRequested: undefined,
+      externalRevisionWave: undefined,
+      externalRevisionUpdatedAt: now,
+      externalStatus: "active",
+      externalStage: "build",
+      externalUpdatedAt: now,
+      externalControlRequested: paused ? "pause" : mission.externalControlRequested,
+      externalControlUpdatedAt: paused ? now : mission.externalControlUpdatedAt,
+      externalActionFailures: 0,
+      externalActionError: undefined,
+      externalActionAlertedAt: undefined,
+      failureReason: undefined,
+      advanceLeaseUntil: undefined,
+      updatedAt: now,
+    });
+    await resolveGoalAttention(ctx, args.id);
+    await recordMissionEvent(ctx, String(args.id), "goal_factory_refinement_applied", `App Factory accepted repair wave ${args.wave} on the same generated app`, paused ? "paused" : "building", mission.percent, {
+      wave: args.wave,
+      externalRunId: mission.externalRunId,
+    });
+    return true;
+  },
+});
+
+export const externalControlsPending = query({
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const groups = await Promise.all(
+      ["pause", "resume", "retry"].map((action) =>
+        ctx.db
+          .query("missions")
+          .withIndex("by_external_control", (q: any) => q.eq("externalControlRequested", action))
+          .order("asc")
+          .take(50),
+      ),
+    );
+    return groups.flat()
+      .filter((mission: any) => mission.mode === "goal" && mission.externalKind === "app-factory" && mission.externalRunId)
+      .map((mission: any) => ({
+        id: mission._id,
+        externalRunId: mission.externalRunId,
+        action: mission.externalControlRequested,
+        externalActionFailures: mission.externalActionFailures ?? 0,
+      }));
+  },
+});
+
+export const acknowledgeExternalControl = mutation({
+  args: {
+    id: v.id("missions"),
+    action: v.union(v.literal("pause"), v.literal("resume"), v.literal("retry")),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const mission = await ctx.db.get(args.id);
+    if (!mission || mission.externalControlRequested !== args.action) return false;
+    const now = Date.now();
+    const recoveredResume = (args.action === "resume" || args.action === "retry") && mission.status === "needs_input" && Boolean(mission.externalActionAlertedAt);
+    await ctx.db.patch(args.id, {
+      externalControlRequested: undefined,
+      externalControlUpdatedAt: now,
+      externalActionFailures: 0,
+      externalActionError: undefined,
+      externalActionAlertedAt: undefined,
+      status: recoveredResume ? "running" : mission.status,
+      phase: recoveredResume ? "building" : mission.phase,
+      pausedPhase: recoveredResume ? undefined : mission.pausedPhase,
+      failureReason: mission.externalActionAlertedAt ? undefined : mission.failureReason,
+      updatedAt: now,
+    });
+    if (mission.externalActionAlertedAt) await resolveGoalAttention(ctx, args.id);
+    return true;
+  },
+});
+
+export const recordExternalActionFailure = mutation({
+  args: {
+    id: v.id("missions"),
+    action: v.union(v.literal("pause"), v.literal("resume"), v.literal("retry"), v.literal("refine")),
+    error: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const mission = await ctx.db.get(args.id);
+    if (!mission || mission.mode !== "goal" || !mission.externalRunId) return { recorded: false, blocked: false };
+    const pending = args.action === "refine"
+      ? mission.externalRevisionRequested === "pending"
+      : mission.externalControlRequested === args.action;
+    if (!pending) return { recorded: false, blocked: false };
+    const failures = Number(mission.externalActionFailures ?? 0) + 1;
+    const now = Date.now();
+    const detail = `Jarvis could not ${args.action === "refine" ? "apply the App Factory repair" : `${args.action} the App Factory run`} after ${failures} consecutive attempts: ${args.error.slice(0, 800)}`;
+    const firstAlert = failures >= 12 && !mission.externalActionAlertedAt;
+    const patch: Record<string, unknown> = {
+      externalActionFailures: failures,
+      externalActionError: args.error.slice(0, 1000),
+      updatedAt: now,
+    };
+    if (firstAlert) {
+      patch.externalActionAlertedAt = now;
+      patch.failureReason = detail.slice(0, 2000);
+      if (args.action === "refine") {
+        patch.status = "needs_input";
+        patch.phase = "blocked";
+        patch.pausedPhase = "factory refinement";
+      } else if ((args.action === "resume" || args.action === "retry") && !["done", "cancelled"].includes(mission.status)) {
+        patch.status = "needs_input";
+        patch.phase = "blocked";
+        patch.pausedPhase = "building";
+      }
+    }
+    await ctx.db.patch(args.id, patch);
+    if (firstAlert) {
+      await upsertGoalAttention(ctx, mission, detail);
+      await recordMissionEvent(ctx, String(args.id), "goal_external_action_blocked", detail, "blocked", mission.percent, {
+        action: args.action,
+        failures,
+      });
+    }
+    return { recorded: true, blocked: failures >= 12, failures };
+  },
+});
+
+// Lightweight Trigger supervision uses this read model to wake the expensive
+// CLI harness only when a durable goal has a transition to process. Immediate
+// job completion still advances inline; this is the crash/restart backstop.
+export const coordinationDemand = query({
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const now = Date.now();
+    const missions = await ctx.db
+      .query("missions")
+      .withIndex("by_status", (q: any) => q.eq("status", "running"))
+      .order("asc")
+      .take(100);
+    const reasons: string[] = [];
+    for (const mission of missions) {
+      if (mission.mode !== "goal") continue;
+      if (mission.externalRunId && ["building", "factory approval", "factory refinement", "blocked"].includes(mission.phase ?? "")) continue;
+      const jobs = await ctx.db
+        .query("jobs")
+        .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
+        .collect();
+      const completed = new Set(jobs.filter((job: any) => job.status === "done").map((job: any) => String(job._id)));
+      const runnable = jobs.find((job: any) => goalJobRunnableForMission(job, mission, completed, now));
+      if (runnable) reasons.push(`runnable:${mission._id}:${runnable._id}`);
+      if (mission.phase === "planning") {
+        const planner = jobs.find((job: any) => String(job._id) === mission.planningJobId);
+        if (planner && TERMINAL.has(planner.status)) reasons.push(`plan:${mission._id}`);
+      } else if (mission.phase === "validating") {
+        const validator = jobs.find((job: any) => String(job._id) === mission.validatorJobId);
+        if (validator && TERMINAL.has(validator.status)) reasons.push(`validation:${mission._id}`);
+      } else if (mission.phase === "building" || mission.phase === "refining") {
+        const state = summarizeGoalPhase(activeStageJobs(jobs, mission)).state;
+        if (state === "complete" || state === "blocked") reasons.push(`${mission.phase}:${mission._id}`);
+      }
+      if (reasons.length >= 20) break;
+    }
+    return { needed: reasons.length > 0, reasons };
   },
 });
 
@@ -700,13 +1055,24 @@ export const updateExternal = mutation({
     requireWorker(args.workerToken);
     const mission = await ctx.db.get(args.id);
     if (!mission || mission.mode !== "goal" || !mission.externalRunId || ["done", "cancelled"].includes(mission.status)) return false;
+    if (!["building", "factory approval", "blocked"].includes(mission.phase ?? "")) return false;
     const now = Date.now();
     const stageOrder = ["inception", "roadmap", "design", "build", "validate", "review", "approval", "package"];
     const progress = 12 + Math.max(0, stageOrder.indexOf(args.stage)) * 8;
-    const waiting = args.status === "waiting_approval" || args.stage === "approval" || args.stageState === "waiting";
+    const waiting = args.status === "waiting_approval" || args.status === "paused" || args.stage === "approval" || args.stageState === "waiting";
     const failed = args.status === "failed" || args.stageState === "failed";
+    const pollStateClean = Number(mission.externalPollFailures ?? 0) === 0 &&
+      !mission.externalPollError && !mission.externalPollAlertedAt;
     if (waiting) {
       const detail = args.detail || `App Factory reached ${args.stage} and is waiting for Daniel's review.`;
+      if (
+        mission.status === "needs_input" &&
+        mission.phase === "factory approval" &&
+        mission.externalStatus === args.status &&
+        mission.externalStage === args.stage &&
+        mission.failureReason === detail.slice(0, 2000) &&
+        pollStateClean
+      ) return { updated: false, wake: false };
       await ctx.db.patch(args.id, {
         status: "needs_input",
         phase: "factory approval",
@@ -714,25 +1080,40 @@ export const updateExternal = mutation({
         externalStatus: args.status,
         externalStage: args.stage,
         externalUpdatedAt: now,
+        externalPollFailures: 0,
+        externalPollError: undefined,
+        externalPollAlertedAt: undefined,
         failureReason: detail.slice(0, 2000),
         updatedAt: now,
       });
       await upsertGoalAttention(ctx, mission, `${detail} Open App Factory to review; Jarvis will resume monitoring after the gate is decided.`);
-      return true;
+      return { updated: true, wake: false };
     }
     if (failed) {
       const detail = args.detail || `App Factory failed during ${args.stage}.`;
+      if (
+        mission.status === "needs_input" &&
+        mission.phase === "blocked" &&
+        mission.externalStatus === args.status &&
+        mission.externalStage === args.stage &&
+        mission.failureReason === detail.slice(0, 2000) &&
+        pollStateClean
+      ) return { updated: false, wake: false };
       await ctx.db.patch(args.id, {
         status: "needs_input",
         phase: "blocked",
         externalStatus: args.status,
         externalStage: args.stage,
         externalUpdatedAt: now,
+        externalPollFailures: 0,
+        externalPollError: undefined,
+        externalPollAlertedAt: undefined,
         failureReason: detail.slice(0, 2000),
+        pausedPhase: "building",
         updatedAt: now,
       });
       await upsertGoalAttention(ctx, mission, detail);
-      return true;
+      return { updated: true, wake: false };
     }
     if (args.status === "shipped") {
       const jobs = await ctx.db
@@ -744,13 +1125,25 @@ export const updateExternal = mutation({
         externalStatus: args.status,
         externalStage: args.stage,
         externalUpdatedAt: now,
+        externalPollFailures: 0,
+        externalPollError: undefined,
+        externalPollAlertedAt: undefined,
         failureReason: undefined,
         updatedAt: now,
       });
       const refreshed = await ctx.db.get(args.id);
       if (refreshed?.phase !== "validating") await enqueueValidator(ctx, refreshed, jobs);
-      return true;
+      await resolveGoalAttention(ctx, args.id);
+      return { updated: true, wake: true };
     }
+    if (
+      mission.status === "running" &&
+      mission.phase === "building" &&
+      mission.externalStatus === args.status &&
+      mission.externalStage === args.stage &&
+      !mission.failureReason &&
+      pollStateClean
+    ) return { updated: false, wake: false };
     await ctx.db.patch(args.id, {
       status: "running",
       phase: "building",
@@ -758,21 +1151,116 @@ export const updateExternal = mutation({
       externalStatus: args.status,
       externalStage: args.stage,
       externalUpdatedAt: now,
+      externalPollFailures: 0,
+      externalPollError: undefined,
+      externalPollAlertedAt: undefined,
       failureReason: undefined,
+      pausedPhase: undefined,
       updatedAt: now,
     });
-    return true;
+    await resolveGoalAttention(ctx, args.id);
+    return { updated: true, wake: false };
   },
 });
+
+export const recordExternalPollFailure = mutation({
+  args: {
+    id: v.id("missions"),
+    error: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const mission = await ctx.db.get(args.id);
+    if (!mission || mission.mode !== "goal" || !mission.externalRunId || !["building", "factory approval", "blocked"].includes(mission.phase ?? "")) {
+      return { recorded: false, blocked: false };
+    }
+    const failures = Number(mission.externalPollFailures ?? 0) + 1;
+    const now = Date.now();
+    const detail = `App Factory run ${mission.externalRunId} could not be read after ${failures} consecutive checks: ${args.error.slice(0, 800)}`;
+    if (failures < 12) {
+      await ctx.db.patch(args.id, {
+        externalPollFailures: failures,
+        externalPollError: args.error.slice(0, 1000),
+        updatedAt: now,
+      });
+      return { recorded: true, blocked: false, failures };
+    }
+    const firstAlert = !mission.externalPollAlertedAt;
+    await ctx.db.patch(args.id, {
+      status: "needs_input",
+      phase: "blocked",
+      pausedPhase: "building",
+      externalPollFailures: failures,
+      externalPollError: args.error.slice(0, 1000),
+      externalPollAlertedAt: mission.externalPollAlertedAt ?? now,
+      failureReason: detail.slice(0, 2000),
+      updatedAt: now,
+    });
+    if (firstAlert) {
+      await upsertGoalAttention(ctx, mission, detail);
+      await recordMissionEvent(ctx, String(args.id), "goal_external_blocked", detail, "blocked", mission.percent, { failures });
+    }
+    return { recorded: true, blocked: true, failures };
+  },
+});
+
+async function resetGoalJob(ctx: any, job: any, now: number, force = false) {
+  if (!force && !["error", "cancelled", "paused"].includes(job.status)) return false;
+  if (job.status === "running") return false;
+  const nextAttempt = Number(job.attempt ?? 1) + 1;
+  const awaitingApproval = job.approvalRequired === true && job.approvalStatus !== "approved";
+  const priorResult = String(job.result ?? "").trim();
+  if (awaitingApproval) {
+    const approvals = await ctx.db
+      .query("approvals")
+      .withIndex("by_job", (q: any) => q.eq("jobId", String(job._id)))
+      .collect();
+    if (!approvals.some((approval: any) => approval.status === "pending")) {
+      await ctx.db.insert("approvals", {
+        jobId: String(job._id),
+        kind: "goal-mode-work-retry",
+        summary: (job.label || job.task).slice(0, 240),
+        risk: job.risk ?? "consequential",
+        payload: { repo: job.repo, agentId: job.agentId, reason: job.approvalReason },
+        status: "pending",
+        requestedAt: now,
+      });
+    }
+  }
+  await ctx.db.patch(job._id, {
+    status: awaitingApproval ? "awaiting_approval" : "pending",
+    stage: awaitingApproval ? "approval" : "queued",
+    progress: awaitingApproval ? "Goal Mode retry waiting for approval" : "Goal Mode recovery queued",
+    checkpoint: [
+      String(job.checkpoint ?? "").trim(),
+      priorResult ? `Previous attempt evidence:\n${priorResult.slice(0, 3000)}` : "",
+      "Daniel resumed the parent goal. Preserve completed evidence and retry only the unfinished boundary.",
+    ].filter(Boolean).join("\n\n").slice(0, 6000),
+    result: undefined,
+    attempt: nextAttempt,
+    maxAttempts: Math.min(48, Math.max(Number(job.maxAttempts ?? 12), nextAttempt + 4)),
+    approvalStatus: awaitingApproval ? "pending" : job.approvalStatus,
+    completedAt: undefined,
+    startedAt: undefined,
+    heartbeatAt: now,
+    nextRunAt: awaitingApproval ? undefined : now,
+    verificationVerdict: undefined,
+    verificationNote: undefined,
+    verifiedAt: undefined,
+  });
+  return true;
+}
 
 export const control = mutation({
   args: {
     id: v.id("missions"),
     action: v.union(v.literal("pause"), v.literal("resume"), v.literal("cancel")),
     authTokenHash: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    await requireAdmin(ctx, args.authTokenHash);
+    await requireActor(ctx, args);
     const mission = await ctx.db.get(args.id);
     if (!mission || mission.mode !== "goal") return false;
     const jobs = await ctx.db
@@ -780,7 +1268,9 @@ export const control = mutation({
       .withIndex("by_mission", (q: any) => q.eq("missionId", String(args.id)))
       .collect();
     const now = Date.now();
+    let externalControl: "pause" | "resume" | "retry" | null = null;
     if (args.action === "pause" && mission.status === "running") {
+      if (mission.externalRunId && mission.externalStatus !== "shipped") externalControl = "pause";
       await ctx.db.patch(args.id, { status: "paused", pausedPhase: mission.phase, phase: "paused", updatedAt: now });
       for (const job of jobs) {
         if (["pending", "running"].includes(job.status)) {
@@ -788,23 +1278,40 @@ export const control = mutation({
         }
       }
     } else if (args.action === "resume" && mission.status === "paused") {
-      await ctx.db.patch(args.id, { status: "running", phase: mission.pausedPhase ?? "building", pausedPhase: undefined, updatedAt: now });
+      const restoredPhase = mission.pausedPhase ?? "building";
+      if (mission.externalRunId && mission.externalStatus !== "shipped" && ["building", "factory approval", "factory refinement"].includes(restoredPhase)) externalControl = "resume";
       for (const job of jobs) {
-        if (job.status === "paused") {
-          await ctx.db.patch(job._id, {
-            status: "pending",
-            stage: "queued",
-            progress: "Goal Mode resumed",
-            attempt: Number(job.attempt ?? 1) + 1,
-            startedAt: undefined,
-            heartbeatAt: now,
-            nextRunAt: now,
-          });
-        }
+        if (job.status === "paused") await resetGoalJob(ctx, job, now);
       }
+      await ctx.db.patch(args.id, {
+        status: "running",
+        phase: restoredPhase,
+        pausedPhase: undefined,
+        failureReason: undefined,
+        advanceLeaseUntil: undefined,
+        updatedAt: now,
+      });
+      await resolveGoalAttention(ctx, args.id);
     } else if (args.action === "resume" && mission.status === "needs_input") {
+      // Factory approval is a protected human gate. Jarvis monitors it but
+      // never turns a generic Resume click into an approval.
+      if (mission.phase === "factory approval") return false;
       const refinements = Array.isArray(mission.pendingRefinements) ? mission.pendingRefinements as GoalRefinement[] : [];
-      if (refinements.length) {
+      if (
+        refinements.length &&
+        mission.externalKind === "app-factory" &&
+        mission.externalRunId &&
+        mission.validation?.verdict === "refine"
+      ) {
+        const alreadyQueued = mission.externalRevisionRequested === "pending";
+        const nextWave = alreadyQueued
+          ? Number(mission.externalRevisionWave ?? Number(mission.revisionWave ?? 0) + 1)
+          : Number(mission.revisionWave ?? 0) + 1;
+        await queueExternalRevision(ctx, mission, mission.validation as GoalValidation, nextWave, {
+          extendBudget: !alreadyQueued,
+          eventType: alreadyQueued ? "goal_factory_refinement_retried" : "goal_factory_extension_queued",
+        });
+      } else if (refinements.length) {
         const nextWave = Number(mission.revisionWave ?? 0) + 1;
         const ids = await enqueueRefinements(ctx, mission, refinements, nextWave);
         await ctx.db.patch(args.id, {
@@ -817,17 +1324,102 @@ export const control = mutation({
           agentCount: Number(mission.agentCount ?? 0) + ids.length,
           updatedAt: now,
         });
+      } else if (["planning", "validating"].includes(mission.pausedPhase ?? "")) {
+        const phase = String(mission.pausedPhase);
+        const jobId = phase === "planning" ? mission.planningJobId : mission.validatorJobId;
+        const job = jobs.find((candidate) => String(candidate._id) === jobId);
+        if (!job || !(await resetGoalJob(ctx, job, now, true))) return false;
+        await ctx.db.patch(args.id, {
+          status: "running",
+          phase,
+          pausedPhase: undefined,
+          failureReason: undefined,
+          advanceLeaseUntil: undefined,
+          updatedAt: now,
+        });
+      } else if (["building", "refining"].includes(mission.pausedPhase ?? "")) {
+        const phase = String(mission.pausedPhase);
+        const stage = phase === "refining" ? "refining" : "building";
+        const wave = phase === "refining" ? Number(mission.revisionWave ?? 0) : 0;
+        const phaseJobs = jobs.filter((job) => job.goalStage === stage && Number(job.goalWave ?? 0) === wave);
+        let reset = 0;
+        for (const job of phaseJobs) if (await resetGoalJob(ctx, job, now)) reset += 1;
+        if (!reset && mission.externalRunId) {
+          externalControl = mission.externalStatus === "failed"
+            ? "retry"
+            : mission.externalStatus === "paused" ? "resume" : null;
+          await ctx.db.patch(args.id, {
+            status: "running",
+            phase: "building",
+            pausedPhase: undefined,
+            failureReason: undefined,
+            externalPollFailures: 0,
+            externalPollError: undefined,
+            externalPollAlertedAt: undefined,
+            updatedAt: now,
+          });
+        } else if (!reset) return false;
+        else {
+          await ctx.db.patch(args.id, {
+            status: "running",
+            phase,
+            pausedPhase: undefined,
+            failureReason: undefined,
+            advanceLeaseUntil: undefined,
+            updatedAt: now,
+          });
+        }
       } else if (mission.externalRunId) {
-        await ctx.db.patch(args.id, { status: "running", phase: "building", failureReason: undefined, updatedAt: now });
+        externalControl = mission.externalStatus === "failed"
+          ? "retry"
+          : mission.externalStatus === "paused" ? "resume" : null;
+        await ctx.db.patch(args.id, {
+          status: "running",
+          phase: "building",
+          pausedPhase: undefined,
+          failureReason: undefined,
+          externalPollFailures: 0,
+          externalPollError: undefined,
+          externalPollAlertedAt: undefined,
+          updatedAt: now,
+        });
       } else return false;
+      await resolveGoalAttention(ctx, args.id);
     } else if (args.action === "cancel" && !["done", "cancelled"].includes(mission.status)) {
-      await ctx.db.patch(args.id, { status: "cancelled", phase: "cancelled", completedAt: now, updatedAt: now });
+      if (mission.externalRunId && mission.externalStatus !== "shipped") externalControl = "pause";
+      await ctx.db.patch(args.id, {
+        status: "cancelled",
+        phase: "cancelled",
+        externalRevisionRequested: undefined,
+        externalRevisionWave: undefined,
+        externalRevisionUpdatedAt: now,
+        completedAt: now,
+        updatedAt: now,
+      });
       for (const job of jobs) {
         if (!TERMINAL.has(job.status)) {
           await ctx.db.patch(job._id, { status: "cancelled", stage: "cancelled", progress: "Goal Mode cancelled by Daniel", completedAt: now, nextRunAt: undefined });
         }
+        const approvals = await ctx.db
+          .query("approvals")
+          .withIndex("by_job", (q: any) => q.eq("jobId", String(job._id)))
+          .collect();
+        for (const approval of approvals) {
+          if (approval.status === "pending") await ctx.db.patch(approval._id, { status: "cancelled", resolvedAt: now });
+        }
       }
+      await resolveGoalAttention(ctx, args.id);
     } else return false;
+    if (externalControl) {
+      await ctx.db.patch(args.id, {
+        externalControlRequested: externalControl,
+        externalControlUpdatedAt: now,
+        externalActionFailures: 0,
+        externalActionError: undefined,
+        externalActionAlertedAt: undefined,
+        updatedAt: now,
+      });
+    }
     await recordMissionEvent(ctx, String(args.id), args.action, `Goal Mode ${args.action} requested by Daniel`, args.action, mission.percent);
     return true;
   },

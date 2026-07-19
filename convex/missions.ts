@@ -118,6 +118,14 @@ export const active = query({
         externalSlug: m.externalSlug ?? null,
         externalStatus: m.externalStatus ?? null,
         externalStage: m.externalStage ?? null,
+        externalPollFailures: m.externalPollFailures ?? 0,
+        externalRevisionRequested: m.externalRevisionRequested ?? null,
+        canExtendExternal: Boolean(
+          m.externalKind === "app-factory" &&
+          m.validation?.verdict === "refine" &&
+          Array.isArray(m.pendingRefinements) &&
+          m.pendingRefinements.length > 0,
+        ),
         failureReason: m.failureReason ?? null,
         completedAt: m.completedAt ?? null,
         updatedAt: m.updatedAt,

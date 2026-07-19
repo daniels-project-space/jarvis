@@ -3014,7 +3014,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           : missions.find((mission) => mission.mode === "goal" && ["running", "paused", "needs_input"].includes(mission.status));
         await convexMutation("ui:setPanel", {
           type: "fleet",
-          value: JSON.stringify(goal ? { missionId: String(goal._id) } : {}),
+          value: JSON.stringify(goal ? { missionId: String(goal._id), mode: "goal" } : { mode: "goal" }),
           title: goal ? `goal · ${String(goal.goal).slice(0, 44)}` : "Goal Mode",
         }).catch(() => {});
         return goal
@@ -3024,7 +3024,17 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       if (action === "pause" || action === "resume" || action === "cancel") {
         if (!missionId) return `Choose the Goal Mode outcome to ${action}.`;
         const ok = await convexMutation("goalMode:control", { id: missionId, action, authTokenHash });
-        if (ok && action === "resume") await wakeAgentHarness(`goal-resume:${missionId}`).catch(() => false);
+        let shouldWake = action === "resume";
+        if (ok) {
+          const { goalCoordinationDemand, syncExternalGoalControls, syncExternalGoalRevisions } = await import("../trigger/goal-runtime");
+          await syncExternalGoalControls().catch(() => null);
+          await syncExternalGoalRevisions().catch(() => null);
+          if (action === "resume") {
+            const demand = await goalCoordinationDemand().catch(() => null);
+            if (demand) shouldWake = demand.needed === true;
+          }
+        }
+        if (ok && shouldWake) await wakeAgentHarness(`goal-resume:${missionId}`).catch(() => false);
         return ok ? `Goal Mode ${missionId} ${action} request applied.` : `That goal cannot be ${action}d from its current state.`;
       }
       if (action !== "start") return "Unknown Goal Mode action.";
@@ -3052,7 +3062,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       await wakeAgentHarness(`goal:${id}`).catch(() => false);
       await convexMutation("ui:setPanel", {
         type: "fleet",
-        value: JSON.stringify({ missionId: id }),
+        value: JSON.stringify({ missionId: id, mode: "goal" }),
         title: `goal · ${goal.slice(0, 44)}`,
       }).catch(() => {});
       return `Goal Mode ${id} is live. Route: ${route.kind}${route.primaryRepo ? ` in ${route.primaryRepo}` : ""} — ${route.reason} One Sol/max planner is working now; it will hand bounded work to Terra/high, preserve checkpoints for days if needed, and only finish after a Sol/max deep validation passes.`;
@@ -3145,6 +3155,9 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         return ok ? "Passed that decision back to the specialist; the continuation is queued." : "That job is not waiting for input now.";
       }
       const ok = await convexMutation("jobs:control", { jobId, action, authTokenHash });
+      if (ok && (action === "resume" || action === "retry")) {
+        await wakeAgentHarness(`${action}:${jobId}`).catch(() => false);
+      }
       return ok ? `Job ${jobId} ${action} request applied.` : `That job cannot be ${action}d from its current state.`;
     }
     case "creative_sprint": {

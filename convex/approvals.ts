@@ -1,6 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { requireAdmin, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 
 export const pending = query({
   args: { ...viewerAuthArgs },
@@ -19,9 +19,10 @@ export const decide = mutation({
     jobId: v.string(),
     decision: v.union(v.literal("approved"), v.literal("declined")),
     authTokenHash: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
-    await requireAdmin(ctx, a.authTokenHash);
+    await requireActor(ctx, a);
     const approvals = await ctx.db
       .query("approvals")
       .withIndex("by_job", (q: any) => q.eq("jobId", a.jobId))
@@ -30,14 +31,19 @@ export const decide = mutation({
     const jobId = ctx.db.normalizeId("jobs", a.jobId);
     const job = jobId ? await ctx.db.get(jobId) : null;
     if (!approval || approval.status !== "pending" || !jobId || !job || job.status !== "awaiting_approval") return false;
+    const missionId = job.missionId ? ctx.db.normalizeId("missions", job.missionId) : null;
+    const mission = missionId ? await ctx.db.get(missionId) : null;
+    const heldByGoal = mission?.mode === "goal" && mission.status !== "running";
     await ctx.db.patch(approval._id, { status: a.decision, resolvedAt: Date.now() });
     await ctx.db.patch(jobId, {
       approvalStatus: a.decision,
-      status: a.decision === "approved" ? "pending" : "cancelled",
+      status: a.decision === "approved" ? (heldByGoal ? "paused" : "pending") : "cancelled",
       completedAt: a.decision === "declined" ? Date.now() : undefined,
-      progress: a.decision === "approved" ? "approved — queued" : "declined by Daniel",
-      stage: a.decision === "approved" ? "queued" : "cancelled",
-      nextRunAt: a.decision === "approved" ? Date.now() : undefined,
+      progress: a.decision === "approved"
+        ? heldByGoal ? "approved — held until Goal Mode resumes" : "approved — queued"
+        : "declined by Daniel",
+      stage: a.decision === "approved" ? (heldByGoal ? "paused" : "queued") : "cancelled",
+      nextRunAt: a.decision === "approved" && !heldByGoal ? Date.now() : undefined,
     });
     await ctx.db.insert("workEvents", {
       jobId: a.jobId,
@@ -45,7 +51,7 @@ export const decide = mutation({
       agentId: job.agentId,
       type: "approval_decision",
       message: a.decision === "approved" ? "Daniel approved this work" : "Daniel declined this work",
-      stage: a.decision === "approved" ? "queued" : "cancelled",
+      stage: a.decision === "approved" ? (heldByGoal ? "paused" : "queued") : "cancelled",
       createdAt: Date.now(),
     });
     return true;

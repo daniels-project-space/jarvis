@@ -69,6 +69,73 @@ export type GoalValidation = {
   blocker?: string;
 };
 
+export type GoalPhaseJob = {
+  _id?: unknown;
+  status?: string;
+  label?: string;
+  task?: string;
+  goalStage?: string;
+  goalWave?: number;
+  nextRunAt?: number;
+  approvalRequired?: boolean;
+  approvalStatus?: string;
+  dependsOn?: string[];
+};
+
+export type GoalMissionLease = {
+  mode?: string;
+  status?: string;
+  phase?: string;
+  revisionWave?: number;
+};
+
+export function summarizeGoalPhase(jobs: GoalPhaseJob[]) {
+  const failed = jobs.filter((job) => job.status === "error" || job.status === "cancelled");
+  return {
+    state: jobs.length === 0
+      ? "empty" as const
+      : failed.length > 0
+        ? "blocked" as const
+        : jobs.every((job) => job.status === "done")
+          ? "complete" as const
+          : "active" as const,
+    failed,
+  };
+}
+
+export function goalJobMatchesMissionPhase(job: GoalPhaseJob, mission: GoalMissionLease): boolean {
+  if (mission.mode !== "goal") return true;
+  if (mission.status !== "running") return false;
+  const expectedStage = mission.phase === "planning"
+    ? "planning"
+    : mission.phase === "building"
+      ? "building"
+      : mission.phase === "refining"
+        ? "refining"
+        : mission.phase === "validating"
+          ? "validating"
+          : null;
+  if (!expectedStage || job.goalStage !== expectedStage) return false;
+  if (expectedStage === "building") return Number(job.goalWave ?? 0) === 0;
+  if (expectedStage === "refining" || expectedStage === "validating") {
+    return Number(job.goalWave ?? 0) === Number(mission.revisionWave ?? 0);
+  }
+  return true;
+}
+
+export function goalJobRunnableForMission(
+  job: GoalPhaseJob,
+  mission: GoalMissionLease,
+  completedIds: Set<string>,
+  now = Date.now(),
+) {
+  return job.status === "pending" &&
+    Number(job.nextRunAt ?? 0) <= now &&
+    (!job.approvalRequired || job.approvalStatus === "approved") &&
+    goalJobMatchesMissionPhase(job, mission) &&
+    (job.dependsOn ?? []).every((dependency) => completedIds.has(String(dependency)));
+}
+
 const clampText = (value: unknown, max: number) => String(value ?? "").trim().slice(0, max);
 const slug = (value: unknown, fallback: string) =>
   clampText(value, 80)
@@ -95,21 +162,32 @@ export function routeGoal(goal: string, requestedRepo?: string): GoalRoute {
   const requested = requestedRepo?.trim();
   const project = knownProject(`${goal} ${requested ?? ""}`);
 
-  if (
-    project?.slug === "youtube-studio-ai" ||
-    /\b(youtube|video|episode|thumbnail|edit(?:ing)?|render|channel|footage|shorts?)\b/.test(text)
-  ) {
+  // Explicit ownership is stronger than broad content words. "Fix Jarvis's
+  // video overlay" belongs to Jarvis, and a caller-supplied repository must
+  // never be silently replaced with YouTube Studio.
+  if (project?.slug === "youtube-studio-ai") {
     return {
       kind: "youtube_studio",
-      primaryRepo: "daniels-project-space/youtube-studio-ai",
-      project: "youtube-studio-ai",
-      reason: "The outcome belongs in the existing modular YouTube Studio AI production system.",
+      primaryRepo: project.repo,
+      project: project.slug,
+      reason: "The outcome explicitly targets the existing modular YouTube Studio AI production system.",
       infrastructureContext:
         "Reuse YouTube Studio AI's module registry, crew/composer/critic loop, Remotion/FFmpeg render path, Convex state, Trigger tasks and R2 artifacts. Extend real modules and live callers; do not create a parallel video pipeline.",
     };
   }
 
-  if (project && project.slug !== "app-factory-v2") {
+  if (project?.slug === "app-factory-v2") {
+    return {
+      kind: "app_factory",
+      primaryRepo: project.repo,
+      project: project.slug,
+      reason: "The outcome explicitly asks App Factory to own the application build lifecycle.",
+      infrastructureContext:
+        "Use App Factory v2's real idea-to-app state machine, current starter/design assets, Trigger stage runner, Convex records, R2 artifacts and Playwright/vision gates. The factory must produce a usable app rather than a mock. Keep its design and ship approvals intact.",
+    };
+  }
+
+  if (project) {
     return {
       kind: "existing_project",
       primaryRepo: project.repo,
@@ -120,10 +198,20 @@ export function routeGoal(goal: string, requestedRepo?: string): GoalRoute {
     };
   }
 
+  if (requested) {
+    return {
+      kind: "existing_project",
+      primaryRepo: requested.includes("/") ? requested : `daniels-project-space/${requested}`,
+      reason: "The caller supplied the repository that owns the outcome.",
+      infrastructureContext:
+        "Read the repository's current AGENTS.md and provider manifests first. Reuse its Convex, Trigger, Mastra, R2 and Vercel boundaries instead of creating cross-project glue.",
+    };
+  }
+
   const newProduct =
     /\b(build|create|make|launch|develop|ship)\b[\s\S]{0,50}\b(app|application|website|site|platform|saas|portal|dashboard|product)\b/.test(text) ||
     /\b(new|another)\s+(app|application|website|site|platform|saas|product)\b/.test(text);
-  if (project?.slug === "app-factory-v2" || (newProduct && !requested)) {
+  if (newProduct) {
     return {
       kind: "app_factory",
       primaryRepo: "daniels-project-space/app-factory-v2",
@@ -134,13 +222,18 @@ export function routeGoal(goal: string, requestedRepo?: string): GoalRoute {
     };
   }
 
-  if (requested) {
+  const videoWorkflow =
+    /\b(youtube|episode|thumbnail|channel|footage|shorts?)\b/.test(text) ||
+    /\b(edit|refine|render|produce)\w*\b[\s\S]{0,50}\b(video|episode|footage)\b/.test(text) ||
+    /\b(video|episode|footage)\b[\s\S]{0,50}\b(edit|refine|render|produce)\w*\b/.test(text);
+  if (videoWorkflow) {
     return {
-      kind: "existing_project",
-      primaryRepo: requested.includes("/") ? requested : `daniels-project-space/${requested}`,
-      reason: "The caller supplied the repository that owns the outcome.",
+      kind: "youtube_studio",
+      primaryRepo: "daniels-project-space/youtube-studio-ai",
+      project: "youtube-studio-ai",
+      reason: "The outcome belongs in the existing modular YouTube Studio AI production system.",
       infrastructureContext:
-        "Read the repository's current AGENTS.md and provider manifests first. Reuse its Convex, Trigger, Mastra, R2 and Vercel boundaries instead of creating cross-project glue.",
+        "Reuse YouTube Studio AI's module registry, crew/composer/critic loop, Remotion/FFmpeg render path, Convex state, Trigger tasks and R2 artifacts. Extend real modules and live callers; do not create a parallel video pipeline.",
     };
   }
 
@@ -354,6 +447,7 @@ export function validatorTask(args: {
   acceptanceCriteria: string[];
   buildEvidence: Array<{ label: string; status: string; result: string }>;
   revisionWave: number;
+  externalContext?: string;
 }): string {
   const evidence = args.buildEvidence
     .map((item) => `### ${item.label} [${item.status}]\n${item.result.slice(0, 1_500)}`)
@@ -364,6 +458,7 @@ export function validatorTask(args: {
     `Outcome: ${args.goal}`,
     `Revision wave: ${args.revisionWave}`,
     `Plan summary: ${args.plan.summary}`,
+    args.externalContext ? `External build ownership:\n${args.externalContext}` : "",
     `Goal criteria:\n${[...args.acceptanceCriteria, ...args.plan.validation.criteria].map((item) => `- ${item}`).join("\n")}`,
     args.plan.validation.tests.length ? `Required tests:\n${args.plan.validation.tests.map((item) => `- ${item}`).join("\n")}` : "",
     args.plan.validation.liveChecks.length ? `Required live/provider checks:\n${args.plan.validation.liveChecks.map((item) => `- ${item}`).join("\n")}` : "",

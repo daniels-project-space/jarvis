@@ -1,9 +1,10 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { workApprovalPolicy } from "./workPolicy";
-import { requireAdmin, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
+import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
 import { normalizeWorkModelTier } from "../src/lib/work-models";
+import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
 
@@ -105,12 +106,30 @@ export const claimNext = mutation({
       .take(40);
     candidates.sort((a: any, b: any) => (b.priority ?? 50) - (a.priority ?? 50) || a.createdAt - b.createdAt);
     let j: any = null;
+    const missionCache = new Map<string, any>();
+    const dependencyCache = new Map<string, any>();
     for (const candidate of candidates) {
       if (candidate.approvalRequired && candidate.approvalStatus !== "approved") continue;
+      if (candidate.missionId) {
+        let mission = missionCache.get(candidate.missionId);
+        if (mission === undefined) {
+          const missionId = ctx.db.normalizeId("missions", candidate.missionId);
+          mission = missionId ? await ctx.db.get(missionId) : null;
+          missionCache.set(candidate.missionId, mission ?? null);
+        }
+        // A paused/blocked/cancelled Goal Mode mission owns the lease. This
+        // server-side fence prevents a manually approved or retried child job
+        // from escaping while the parent goal is stopped.
+        if (candidate.goalStage && (!mission || !goalJobMatchesMissionPhase(candidate, mission))) continue;
+      }
       let blocked = false;
       for (const dependency of candidate.dependsOn ?? []) {
-        const id = ctx.db.normalizeId("jobs", dependency);
-        const dep = id ? await ctx.db.get(id) : null;
+        let dep = dependencyCache.get(dependency);
+        if (dep === undefined) {
+          const id = ctx.db.normalizeId("jobs", dependency);
+          dep = id ? await ctx.db.get(id) : null;
+          dependencyCache.set(dependency, dep ?? null);
+        }
         if (!dep || dep.status !== "done") {
           blocked = true;
           break;
@@ -565,9 +584,9 @@ export const requestInput = mutation({
 });
 
 export const provideInput = mutation({
-  args: { jobId: v.id("jobs"), answer: v.string(), authTokenHash: v.optional(v.string()) },
+  args: { jobId: v.id("jobs"), answer: v.string(), authTokenHash: v.optional(v.string()), workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
-    await requireAdmin(ctx, a.authTokenHash);
+    await requireActor(ctx, a);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "needs_input") return false;
     const now = Date.now();
@@ -620,9 +639,10 @@ export const control = mutation({
     jobId: v.id("jobs"),
     action: v.union(v.literal("pause"), v.literal("resume"), v.literal("cancel"), v.literal("retry")),
     authTokenHash: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
-    await requireAdmin(ctx, a.authTokenHash);
+    await requireActor(ctx, a);
     const row = await ctx.db.get(a.jobId);
     if (!row) return false;
     const now = Date.now();

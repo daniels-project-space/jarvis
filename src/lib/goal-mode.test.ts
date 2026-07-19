@@ -2,10 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   GOAL_PLAN_MARKER,
   GOAL_VALIDATION_MARKER,
+  goalJobRunnableForMission,
+  goalJobMatchesMissionPhase,
   goalBranch,
   parseGoalPlan,
   parseGoalValidation,
   routeGoal,
+  summarizeGoalPhase,
 } from "./goal-mode";
 
 describe("Goal Mode contracts", () => {
@@ -18,6 +21,56 @@ describe("Goal Mode contracts", () => {
     const route = routeGoal("Massively improve Jarvis long-term agent work");
     expect(route.kind).toBe("existing_project");
     expect(route.primaryRepo).toBe("daniels-project-space/jarvis");
+    expect(routeGoal("Fix the video overlay inside Jarvis").primaryRepo).toBe("daniels-project-space/jarvis");
+    expect(routeGoal("Build a new video editing app").kind).toBe("app_factory");
+    expect(routeGoal("Refine this video", "daniels-project-space/media-engine").primaryRepo)
+      .toBe("daniels-project-space/media-engine");
+  });
+
+  it("classifies failed dependency phases instead of waiting forever", () => {
+    expect(summarizeGoalPhase([
+      { _id: "a", status: "error" },
+      { _id: "b", status: "pending" },
+    ])).toMatchObject({ state: "blocked", failed: [{ _id: "a", status: "error" }] });
+    expect(summarizeGoalPhase([{ status: "done" }, { status: "done" }]).state).toBe("complete");
+    expect(summarizeGoalPhase([{ status: "done" }, { status: "running" }]).state).toBe("active");
+  });
+
+  it("fences goal jobs to the mission's active phase and repair wave", () => {
+    expect(goalJobMatchesMissionPhase(
+      { goalStage: "building", goalWave: 0 },
+      { mode: "goal", status: "running", phase: "building", revisionWave: 0 },
+    )).toBe(true);
+    expect(goalJobMatchesMissionPhase(
+      { goalStage: "refining", goalWave: 1 },
+      { mode: "goal", status: "running", phase: "refining", revisionWave: 2 },
+    )).toBe(false);
+    expect(goalJobMatchesMissionPhase(
+      { goalStage: "building", goalWave: 0 },
+      { mode: "goal", status: "paused", phase: "building", revisionWave: 0 },
+    )).toBe(false);
+  });
+
+  it("wakes the expensive harness only for runnable work", () => {
+    const mission = { mode: "goal", status: "running", phase: "building", revisionWave: 0 };
+    expect(goalJobRunnableForMission(
+      { status: "pending", goalStage: "building", goalWave: 0, dependsOn: ["plan"], nextRunAt: 100 },
+      mission,
+      new Set(["plan"]),
+      100,
+    )).toBe(true);
+    expect(goalJobRunnableForMission(
+      { status: "pending", goalStage: "building", goalWave: 0, dependsOn: ["plan"], nextRunAt: 100 },
+      mission,
+      new Set(),
+      100,
+    )).toBe(false);
+    expect(goalJobRunnableForMission(
+      { status: "pending", goalStage: "building", goalWave: 0, approvalRequired: true, approvalStatus: "pending" },
+      mission,
+      new Set(),
+      100,
+    )).toBe(false);
   });
 
   it("parses and topologically orders a bounded plan", () => {
