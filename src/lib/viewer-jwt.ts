@@ -12,7 +12,10 @@ let verificationKey: Promise<CryptoKey> | null = null;
 function configuredJwk(): JWK {
   const encoded = process.env.JARVIS_VIEWER_SIGNING_JWK_B64;
   if (!encoded) throw new Error("Viewer signing key is not configured");
-  return JSON.parse(Buffer.from(encoded, "base64").toString("utf8")) as JWK;
+  // Proxy can execute in an Edge isolate where Node's Buffer global does not
+  // exist. JWK JSON is ASCII, so the Web-standard decoder works in both the
+  // Node route that issues capabilities and the Proxy that verifies them.
+  return JSON.parse(atob(encoded)) as JWK;
 }
 
 async function getSigningKey(): Promise<CryptoKey> {
