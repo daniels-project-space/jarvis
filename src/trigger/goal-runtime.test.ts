@@ -218,7 +218,7 @@ describe("Goal Mode external runtime", () => {
 
   it("builds an exact receipt payload with Trigger's real deployment version", async () => {
     const { createGoalCoordinatorReceipt, goalCoordinatorDeploymentVersion } = await import("./goal-runtime");
-    const deploymentVersion = goalCoordinatorDeploymentVersion({
+    const deploymentVersion = goalCoordinatorDeploymentVersion("20260719.5", {
       TRIGGER_DEPLOYMENT_VERSION: "20260719.5",
       TRIGGER_VERSION: "legacy-version",
       GITHUB_SHA: "fallback-sha",
@@ -234,6 +234,7 @@ describe("Goal Mode external runtime", () => {
     });
 
     expect(deploymentVersion).toBe("20260719.5");
+    expect(goalCoordinatorDeploymentVersion(undefined, { TRIGGER_VERSION: "legacy-version" })).toBe("legacy-version");
     expect(receipt.external).toEqual({ checked: 3, updated: 1, blocked: 0, error: undefined });
     expect(receipt.external).not.toHaveProperty("wake");
     expect(receipt).toMatchObject({

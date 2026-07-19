@@ -17,7 +17,7 @@ export const goalCoordinator = schedules.task({
   id: "jarvis-goal-coordinator",
   cron: "*/5 * * * *",
   maxDuration: 60,
-  run: async () => {
+  run: async (_payload, { ctx }) => {
     // Controls precede revisions so a paused mission cannot be reactivated by
     // a stale factory repair. Poll only after both outboxes settle.
     const controls = await syncExternalGoalControls()
@@ -31,7 +31,7 @@ export const goalCoordinator = schedules.task({
     const shouldWake = external.wake || demand.needed === true;
     const woken = shouldWake ? await wakeAgentHarness("goal-coordinator").catch(() => false) : false;
     const receipt = await recordGoalCoordinatorReceipt(createGoalCoordinatorReceipt({
-      deploymentVersion: goalCoordinatorDeploymentVersion(),
+      deploymentVersion: goalCoordinatorDeploymentVersion(ctx.run.version),
       demand,
       controls,
       revisions,

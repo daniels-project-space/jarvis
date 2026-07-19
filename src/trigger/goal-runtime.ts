@@ -204,10 +204,12 @@ function coordinatorError(value: unknown): string | undefined {
 }
 
 export function goalCoordinatorDeploymentVersion(
+  runtimeVersion?: string,
   env: Record<string, string | undefined> = process.env,
 ): string {
   return String(
-    env.TRIGGER_DEPLOYMENT_VERSION
+    runtimeVersion
+      ?? env.TRIGGER_DEPLOYMENT_VERSION
       ?? env.TRIGGER_VERSION
       ?? env.VERCEL_GIT_COMMIT_SHA
       ?? env.GITHUB_SHA
