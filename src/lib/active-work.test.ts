@@ -16,6 +16,7 @@ describe("live work visibility", () => {
     expect(isRelevantActiveWork({ status: "running", agentId: "sentry", task: "Investigate uptime" })).toBe(false);
     expect(isRelevantActiveWork({ status: "needs_input", incidentId: "incident-1" })).toBe(false);
     expect(isRelevantActiveWork({ status: "awaiting_approval", visibility: "system" })).toBe(false);
+    expect(isRelevantActiveWork({ status: "needs_input", visibility: "conversation", label: "Cloud health audit" })).toBe(false);
     expect(isRelevantActiveWork({ status: "running", task: "Routine provider health check" })).toBe(false);
   });
 

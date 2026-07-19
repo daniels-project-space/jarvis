@@ -11,7 +11,7 @@ export type ActiveWork = {
 
 const ACTIVE_STATUSES = new Set(["running", "awaiting_approval", "needs_input"]);
 const DECISION_STATUSES = new Set(["awaiting_approval", "needs_input"]);
-const LEGACY_SYSTEM_WORK = /\b(?:health[ -]?check|heartbeat|uptime poll|stack poll|polling sweep|sentry sweep|provider health|background check|routine monitor)\b/i;
+const LEGACY_SYSTEM_WORK = /\b(?:health[ -]?(?:check|audit)|cloud health audit|heartbeat|uptime poll|stack poll|polling sweep|sentry sweep|provider health|background check|routine monitor)\b/i;
 
 /**
  * The live-work pill is an attention surface, not an operations log.
@@ -21,15 +21,21 @@ const LEGACY_SYSTEM_WORK = /\b(?:health[ -]?check|heartbeat|uptime poll|stack po
 export function isRelevantActiveWork(job: ActiveWork): boolean {
   const status = String(job.status ?? "");
   if (!ACTIVE_STATUSES.has(status)) return false;
+  const description = [job.label, job.task, job.stage].filter(Boolean).join(" ");
   // Incident repair is operations telemetry, even when its worker is waiting
   // on a provider publication or approval. Alerts retains that attention;
   // the conversational work pill is reserved for Daniel's deliberate work.
-  if (job.visibility === "system" || job.incidentId || (job.agentId === "sentry" && job.visibility !== "conversation")) return false;
+  if (
+    job.visibility === "system" ||
+    job.incidentId ||
+    (job.agentId === "sentry" && job.visibility !== "conversation") ||
+    LEGACY_SYSTEM_WORK.test(description)
+  ) return false;
   if (DECISION_STATUSES.has(status)) return true;
   if (job.visibility === "conversation") return true;
 
   // Compatibility for jobs created before visibility was recorded explicitly.
-  return !LEGACY_SYSTEM_WORK.test([job.label, job.task, job.stage].filter(Boolean).join(" "));
+  return true;
 }
 
 export function relevantActiveWork<T extends ActiveWork>(jobs: readonly T[], limit = 4): T[] {
