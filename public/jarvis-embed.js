@@ -398,7 +398,10 @@
     outline.style.cssText = "position:fixed;display:none;pointer-events:none;z-index:2147483645;border:2px solid #67e8f9;border-radius:10px;background:rgba(34,211,238,.05);box-shadow:0 0 0 5px rgba(34,211,238,.11),0 0 38px rgba(34,211,238,.24);transition:left .08s,top .08s,width .08s,height .08s";
     var card = document.createElement("div");
     card.dataset.jarvisEditUi = "card";
-    card.style.cssText = "position:fixed;left:16px;bottom:16px;z-index:2147483646;width:min(430px,calc(100vw - 32px));padding:14px 15px;border:1px solid rgba(103,232,249,.35);border-radius:16px;background:rgba(4,9,16,.96);box-shadow:0 20px 70px rgba(0,0,0,.5);color:#e7f8ff;font:500 13px/1.45 system-ui,sans-serif;backdrop-filter:blur(18px)";
+    // Keep the selector instructions above the universal controls. At phone
+    // widths the old 16px bottom edge put both fixed surfaces on top of each
+    // other, obscuring the instructions and the cancel action.
+    card.style.cssText = "position:fixed;left:16px;bottom:72px;z-index:2147483646;width:min(430px,calc(100vw - 32px));padding:14px 15px;border:1px solid rgba(103,232,249,.35);border-radius:16px;background:rgba(4,9,16,.96);box-shadow:0 20px 70px rgba(0,0,0,.5);color:#e7f8ff;font:500 13px/1.45 system-ui,sans-serif;backdrop-filter:blur(18px)";
     document.body.appendChild(outline);
     document.body.appendChild(card);
     var selected = null;

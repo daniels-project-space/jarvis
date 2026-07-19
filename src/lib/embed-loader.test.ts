@@ -179,6 +179,10 @@ describe("Project Hub Jarvis loader", () => {
     expect(controls?.children[0].attributes["aria-label"]).toContain("always listening");
     expect(controls?.children[1].attributes["aria-label"]).toContain("Select an element");
     expect(controls?.children[1].onclick).toBeTypeOf("function");
+
+    controls?.children[1].onclick?.();
+    const editCard = harness.createdElements.find((element) => element.dataset.jarvisEditUi === "card");
+    expect(editCard?.style.cssText).toContain("bottom:72px");
   });
 
   it("captures the wake word in the top-level page and forwards the command", () => {
