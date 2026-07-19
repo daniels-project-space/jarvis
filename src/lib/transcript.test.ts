@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { cleanSpeechTranscript, hasConfidentSpeechSegments, isMeaningfulSpeechTranscript, isRecentVoiceDuplicate } from "./transcript";
+import {
+  cleanSpeechTranscript,
+  hasConfidentSpeechSegments,
+  isMeaningfulSpeechTranscript,
+  isRecentVoiceDuplicate,
+  shouldIgnoreHandsFreeTranscript,
+} from "./transcript";
 
 describe("cleanSpeechTranscript", () => {
   it("collapses the exact repeated live utterance seen in production", () => {
@@ -41,5 +47,28 @@ describe("cleanSpeechTranscript", () => {
     const longer = { text: "repeat the longer request now", at: 10_000 };
     expect(isRecentVoiceDuplicate("repeat the longer request now", longer, 25_000)).toBe(true);
     expect(isRecentVoiceDuplicate("repeat the longer request now", longer, 100_001)).toBe(false);
+  });
+
+  it("drops non-actionable hands-free acknowledgements that Whisper invents on silence", () => {
+    expect(shouldIgnoreHandsFreeTranscript("Thank you.", {
+      acceptedFrames: 20,
+      speechSpanMs: 1_200,
+      peakVoiceMargin: 30,
+    })).toBe(true);
+    expect(shouldIgnoreHandsFreeTranscript("Thanks for watching", {
+      acceptedFrames: 4,
+      speechSpanMs: 270,
+      peakVoiceMargin: 5,
+    })).toBe(true);
+    expect(shouldIgnoreHandsFreeTranscript("Play music", {
+      acceptedFrames: 4,
+      speechSpanMs: 270,
+      peakVoiceMargin: 5,
+    })).toBe(false);
+    expect(shouldIgnoreHandsFreeTranscript("Music", {
+      acceptedFrames: 9,
+      speechSpanMs: 720,
+      peakVoiceMargin: 22,
+    })).toBe(false);
   });
 });

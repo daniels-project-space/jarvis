@@ -1,5 +1,5 @@
 import type { AgentSlug, ModelTier, WorkRisk } from "./team";
-import { requestsConsequentialAction } from "../lib/work-safety";
+import { isOwnedRepository, requestsConsequentialAction } from "../lib/work-safety";
 import { parseWorkModelTier } from "../lib/work-models";
 
 export type WorkRoute = {
@@ -23,7 +23,8 @@ const trivial = /\b(status|list|locate|read|summari[sz]e|quick check|one[- ]line
 
 export function routeWork(task: string, options?: { repo?: string; requestedModel?: string; readonly?: boolean }): WorkRoute {
   const text = `${task} ${options?.repo ?? ""}`.trim();
-  const isConsequential = requestsConsequentialAction(text);
+  const repoOutsidePortfolio = Boolean(options?.repo && options.readonly !== true && !isOwnedRepository(options.repo));
+  const isConsequential = repoOutsidePortfolio || requestsConsequentialAction(task, { repo: options?.repo });
   let agentId: AgentSlug = "atlas";
   if (travel.test(text)) agentId = "maya";
   else if (creative.test(text)) agentId = "iris";

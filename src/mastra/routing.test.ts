@@ -20,6 +20,16 @@ describe("routeWork", () => {
     expect(route.model).toBe("sol");
   });
 
+  it("does not turn owned-repository merge and deploy work into a human decision", () => {
+    const route = routeWork("Fix the worker, merge the verified PR, and deploy it", { repo: "jarvis" });
+    expect(route).toMatchObject({
+      agentId: "paul",
+      approvalRequired: false,
+      readonly: false,
+    });
+    expect(route.risk).not.toBe("consequential");
+  });
+
   it("does not accept readonly as a consequential-risk override", () => {
     const route = routeWork("Send a reply to the customer", { readonly: true });
     expect(route.approvalRequired).toBe(true);

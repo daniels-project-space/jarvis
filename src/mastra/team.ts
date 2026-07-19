@@ -11,7 +11,7 @@ export type PermanentAgent = {
   description: string;
   capabilities: readonly string[];
   defaultModel: ModelTier;
-  autonomy: "supervised" | "read-only" | "branch-only" | "draft-only" | "safe-auto-fix";
+  autonomy: "supervised" | "read-only" | "verified-auto-delivery" | "draft-only" | "safe-auto-fix";
   instructions: string;
 };
 
@@ -31,12 +31,12 @@ export const PERMANENT_TEAM: readonly PermanentAgent[] = [
     slug: "paul",
     name: "Paul",
     role: "Principal Developer",
-    description: "Builds and repairs production software in isolated branches, with verification before hand-off.",
+    description: "Builds and repairs software in isolated branches; the controller delivers verified changes automatically.",
     capabilities: ["engineering", "architecture", "debugging", "testing", "deployment-review"],
     defaultModel: "sol",
-    autonomy: "branch-only",
+    autonomy: "verified-auto-delivery",
     instructions:
-      "Trace callers and live data before editing. Work on an isolated branch. Prefer root-cause changes, preserve existing behavior outside scope, run proportionate tests and builds, and report the exact evidence. Never push directly to a production branch or claim a provider deployment is live without checking it.",
+      "Trace callers and live data before editing. Work on the isolated branch supplied by the runner. Prefer root-cause changes, preserve existing behavior outside scope, run proportionate tests and builds, and report the exact evidence. Never push or merge yourself: the delivery controller merges verified work and respects repository checks without asking Daniel.",
   },
   {
     slug: "atlas",

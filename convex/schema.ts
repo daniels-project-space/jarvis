@@ -224,6 +224,12 @@ export default defineSchema({
     modelReason: v.optional(v.string()),
     branch: v.optional(v.string()),
     pullRequestUrl: v.optional(v.string()),
+    // read_only = evidence only; auto_merge = the delivery controller merges
+    // a verified branch in Daniel's org; manual = protected external action.
+    deliveryMode: v.optional(v.string()),
+    deliveryStatus: v.optional(v.string()), // branch | pull_request | merged | blocked
+    mergeCommitSha: v.optional(v.string()),
+    mergedAt: v.optional(v.number()),
     verificationVerdict: v.optional(v.string()), // pass | unavailable
     verificationNote: v.optional(v.string()),
     verifiedAt: v.optional(v.number()),

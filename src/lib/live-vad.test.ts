@@ -59,6 +59,9 @@ describe("live full-duplex voice gate", () => {
   it("accepts normal speech after the speaker tail is quiet", () => {
     const result = frames([28, 28, 28, 28], { ttsActive: false, highFrequencyLevel: 8 });
     expect(result.state.spoke).toBe(true);
+    expect(result.state.acceptedFrames).toBe(4);
+    expect(result.state.voiceStartedAt).toBe(1_000);
+    expect(result.state.peakVoiceMargin).toBeGreaterThan(0);
   });
 
   it("rejects sustained broadband keyboard noise", () => {

@@ -3,7 +3,7 @@
  *
  * The supervisor supplies structured risk, but a caller-controlled `readonly`
  * flag must never be able to erase an explicit request to message, publish,
- * spend, deploy, or destroy. At the same time, audit prompts routinely mention
+ * spend, or destroy. At the same time, audit prompts routinely mention
  * those verbs inside prohibitions ("do not deploy") or analysis clauses
  * ("verify whether a worker can send"). Clause-aware classification keeps the
  * boundary conservative without turning every security review into an approval.
@@ -11,6 +11,18 @@
 
 export const CONSEQUENTIAL_ACTION =
   /\b(send|email|message|reply|contact|publish|post|advertis(?:e|ing)|deploy|merge|book|reserve|buy|purchase|order|pay|spend|transfer|trade|withdraw|refund|charge|invoice|delete|destroy|drop|truncate|rotate (?:a )?(?:key|secret)|change (?:a )?(?:password|credential)|cancel (?:a )?(?:booking|subscription|account))\b/i;
+
+const SOFTWARE_DELIVERY_ACTION = /^(?:deploy|merge)$/i;
+const TECHNICAL_PUBLICATION =
+  /\b(?:convex|trigger(?:\.dev)?|vercel|function|schema|migration|build|release|deployment)\b/i;
+
+export type WorkSafetyBoundary = "internal" | "software_delivery" | "external";
+
+export type WorkSafetyDecision = {
+  approvalRequired: boolean;
+  boundary: WorkSafetyBoundary;
+  reason?: string;
+};
 
 const NON_MUTATING_LEAD =
   /^(?:please\s+)?(?:research|investigate|inspect|audit|review|analyse|analyze|compare|summari[sz]e|report|recommend|brainstorm|plan|draft|design|draw|illustrat|write|explain|calculate|model|prototype|test|verify|locate|list)\b/i;
@@ -35,21 +47,69 @@ function clauses(task: string): string[] {
     .filter(Boolean);
 }
 
-export function requestsConsequentialAction(task: string): boolean {
+export function isOwnedRepository(repo: string | undefined): boolean {
+  const raw = String(repo ?? "")
+    .trim()
+    .replace(/^https?:\/\/github\.com\//i, "")
+    .replace(/^git@github\.com:/i, "")
+    .replace(/\.git$/i, "")
+    .replace(/^\/+|\/+$/g, "");
+  if (!raw) return false;
+  if (!raw.includes("/")) return /^[a-z0-9][a-z0-9._-]*$/i.test(raw);
+  const [owner, name, ...rest] = raw.split("/");
+  return rest.length === 0
+    && owner.toLocaleLowerCase("en-GB") === "daniels-project-space"
+    && /^[a-z0-9][a-z0-9._-]*$/i.test(name ?? "");
+}
+
+function softwareDeliveryAllowed(action: string, clause: string, repo: string | undefined): boolean {
+  if (!isOwnedRepository(repo)) return false;
+  if (SOFTWARE_DELIVERY_ACTION.test(action)) return true;
+  // "Publish" is normally a public/content action. In a scoped Daniel-owned
+  // repository, narrowly technical publication such as Convex functions is
+  // software delivery; publishing a post, advert or package remains gated.
+  return action.toLocaleLowerCase("en-GB") === "publish" && TECHNICAL_PUBLICATION.test(clause);
+}
+
+export function classifyWorkSafety(
+  task: string,
+  options?: { repo?: string },
+): WorkSafetyDecision {
   for (const clause of clauses(task)) {
-    const match = CONSEQUENTIAL_ACTION.exec(clause);
-    if (!match) continue;
-    if (NEGATED_LEAD.test(clause)) continue;
+    const matcher = new RegExp(CONSEQUENTIAL_ACTION.source, "gi");
+    for (const match of clause.matchAll(matcher)) {
+      const action = match[0];
+      const actionIndex = match.index ?? 0;
+      if (NEGATED_LEAD.test(clause)) continue;
 
-    const beforeAction = clause.slice(0, match.index);
-    if (NEGATED_TAIL.test(beforeAction)) continue;
-    if (REPORTED_ACTION_TAIL.test(beforeAction)) continue;
+      const beforeAction = clause.slice(0, actionIndex);
+      if (NEGATED_TAIL.test(beforeAction)) continue;
+      if (REPORTED_ACTION_TAIL.test(beforeAction)) continue;
 
-    // "Audit whether X can send" describes a read-only outcome. A mixed
-    // instruction such as "research options and purchase one" is split at the
-    // conjunction, so its purchase clause still reaches the gate.
-    if (NON_MUTATING_LEAD.test(clause)) continue;
-    return true;
+      // "Audit whether X can send" describes a read-only outcome. A mixed
+      // instruction such as "research options and purchase one" is split at
+      // the conjunction, so its purchase clause still reaches the gate.
+      if (NON_MUTATING_LEAD.test(clause)) continue;
+      if (softwareDeliveryAllowed(action, clause, options?.repo)) {
+        continue;
+      }
+      return {
+        approvalRequired: true,
+        boundary: "external",
+        reason: "task requests an external, financial, public, credential, or destructive action",
+      };
+    }
   }
-  return false;
+  const asksForSoftwareDelivery = clauses(task).some((clause) => {
+    const match = CONSEQUENTIAL_ACTION.exec(clause);
+    return Boolean(match && softwareDeliveryAllowed(match[0], clause, options?.repo));
+  });
+  return {
+    approvalRequired: false,
+    boundary: asksForSoftwareDelivery ? "software_delivery" : "internal",
+  };
+}
+
+export function requestsConsequentialAction(task: string, options?: { repo?: string }): boolean {
+  return classifyWorkSafety(task, options).approvalRequired;
 }

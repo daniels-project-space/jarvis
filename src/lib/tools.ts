@@ -22,7 +22,7 @@ export const TOOL_DEFS = [
   {
     name: "dispatch_agent",
     description:
-      "Delegate durable work to JARVIS's permanent team. The same specialist can own multiple concurrent jobs, so dispatch a follow-up without pausing earlier work and link it with parent_job_id when known. The manager chooses Paul (development), Atlas (research/strategy), Iris (creative), Maya (travel), or Sentry (reliability), selects Luna/Terra/Sol intelligence, binds it to this conversation, and returns immediately. Work can checkpoint and continue for hours or days. Consequential external actions wait for Daniel's approval; code changes use isolated branches. Do not delegate quick lookups.",
+      "Delegate durable work to JARVIS's permanent team. The same specialist can own multiple concurrent jobs, so dispatch a follow-up without pausing earlier work and link it with parent_job_id when known. The manager chooses Paul (development), Atlas (research/strategy), Iris (creative), Maya (travel), or Sentry (reliability), selects Luna/Terra/Sol intelligence, binds it to this conversation, and returns immediately. Work can checkpoint and continue for hours or days. Verified code changes in Daniel's repositories are merged automatically by the delivery controller; only protected external actions wait for Daniel. Do not delegate quick lookups.",
     parameters: {
       type: "object",
       properties: {
@@ -41,7 +41,7 @@ export const TOOL_DEFS = [
   {
     name: "orchestrate",
     description:
-      "Ask the Mastra JARVIS supervisor to plan and run a durable mission with the permanent team. You may supply 2-6 genuinely independent workstreams, or omit them and let the supervisor consult specialists and decompose the goal. The subscription CLI harness performs durable execution with repository-scoped tools; Convex reports live stages, checkpoints and approvals. One coherent reviewed result returns to the originating conversation.",
+      "Ask the Mastra JARVIS supervisor to plan and run a durable mission with the permanent team. You may supply 2-6 genuinely independent workstreams, or omit them and let the supervisor consult specialists and decompose the goal. The subscription CLI harness performs durable execution with repository-scoped tools; Convex reports live stages, checkpoints, automatic delivery and protected external decisions. One coherent reviewed result returns to the originating conversation.",
     parameters: {
       type: "object",
       properties: {
@@ -1063,9 +1063,9 @@ const SELF_IMPROVE_RULES =
   "src/components/JarvisUI.tsx. VALIDATE proportionally before committing: for a small single-file change, re-read your " +
   "full diff line by line (the clone has no node_modules; Vercel's build is the gate and a failed deploy auto-files an " +
   "incident straight back to a repair agent). For multi-file or risky changes, run 'npm install' then 'npx tsc --noEmit' " +
-  "and 'npm run build' — they must pass. Commit only working code, message starting 'self-improve:'. Work on the runner's isolated branch; never push directly to main or claim production is live. " +
+  "and 'npm run build' — they must pass. Commit only working code, message starting 'self-improve:'. Work on the runner's isolated branch; the controller owns verified merge and delivery, so never push directly to main or claim production is live. " +
   "If the change truly requires convex/ schema or src/trigger/ edits, keep them minimal and state clearly in your final " +
-  "answer that they need a manual deploy. Never remove existing capabilities.";
+  "answer which provider deployment remains to be verified; the controller continues delivery without asking Daniel. Never remove existing capabilities.";
 
 // Method scaffolds appended to fleet/agent tasks (adapted from the
 // ethanplusai/jarvis prompt-template library) — they raise output quality by
@@ -3616,7 +3616,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         label: `Paul · repair ${problem.slice(0, 48)}`,
       });
       await wakeAgentHarness(`repair:${String(incidentId)}`).catch(() => false);
-      return "Paul owns the repair on an isolated branch. He'll reproduce it, verify the fix, and report back here; nothing is pushed directly onto production.";
+      return "Paul owns the repair on an isolated branch. He'll reproduce it and verify the fix; the delivery controller will merge it automatically once the evidence and repository checks pass.";
     }
     case "self_improve": {
       const request = String(args.request ?? "").slice(0, 1500);
@@ -3631,12 +3631,12 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         agentId: "paul",
         risk: "high",
         priority: 80,
-        acceptanceCriteria: ["Connected implementation, not placeholder UI", "Typecheck/tests/build pass", "Production remains gated until verified"],
+        acceptanceCriteria: ["Connected implementation, not placeholder UI", "Typecheck/tests/build pass", "Verified repository delivery completes without a manual approval"],
         modelReason: "Paul + Sol: JARVIS self-modification is complex Codex engineering",
         label: `Paul · upgrade ${request.slice(0, 46)}`,
       });
       await wakeAgentHarness("self-improve").catch(() => false);
-      return "Paul has the upgrade on an isolated branch with validation gates; progress is live in the command deck.";
+      return "Paul has the upgrade on an isolated branch with validation gates; verified delivery will complete automatically and progress is live in the command deck.";
     }
     case "agent_status": {
       const [active, recent, missions, team, attention, approvals] = await Promise.all([

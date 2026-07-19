@@ -27,26 +27,67 @@ type LoaderWindow = {
   window: LoaderWindow;
 };
 
+type FakeElement = {
+  allow?: string;
+  attributes: Record<string, string>;
+  appendChild: (child: FakeElement) => FakeElement;
+  children: FakeElement[];
+  contentWindow?: { postMessage: ReturnType<typeof vi.fn> };
+  dataset: Record<string, string>;
+  isConnected: boolean;
+  onclick?: (() => void) | null;
+  remove: ReturnType<typeof vi.fn>;
+  setAttribute: ReturnType<typeof vi.fn>;
+  src?: string;
+  style: Record<string, string> & { cssText?: string };
+  textContent?: string;
+  title?: string;
+  type?: string;
+};
+
 function createLoader(options: { denyFirstRecognition?: boolean } = {}) {
   const messages: unknown[] = [];
   const listeners = new Map<string, LoaderListener[]>();
   const frameWindow = { postMessage: vi.fn((message: unknown) => messages.push(message)) };
+  const createdElements: FakeElement[] = [];
+  const fakeElement = (): FakeElement => {
+    const attributes: Record<string, string> = {};
+    const element = {
+      attributes,
+      appendChild(child: FakeElement) {
+        this.children.push(child);
+        return child;
+      },
+      children: [],
+      dataset: {},
+      isConnected: false,
+      remove: vi.fn(),
+      setAttribute: vi.fn((name: string, value: string) => { attributes[name] = value; }),
+      style: {},
+    } as FakeElement;
+    return element;
+  };
   const frame = {
+    ...fakeElement(),
     allow: "",
     contentWindow: frameWindow,
-    dataset: {} as Record<string, string>,
-    isConnected: false,
     src: "",
-    style: {} as Record<string, string>,
     title: "",
-  };
+  } as FakeElement;
   const document = {
     body: {
       innerText: "Project Hub",
-      appendChild: vi.fn(() => { frame.isConnected = true; }),
+      appendChild: vi.fn((node: FakeElement) => { node.isConnected = true; }),
     },
-    currentScript: { src: `${JARVIS_ORIGIN}/jarvis-embed.js?v=test-release` },
-    createElement: vi.fn(() => frame),
+    currentScript: {
+      src: `${JARVIS_ORIGIN}/jarvis-embed.js?v=test-release`,
+      dataset: { jarvisApp: "project-hub" },
+    },
+    createElement: vi.fn((tag: string) => {
+      const node = tag === "iframe" ? frame : fakeElement();
+      createdElements.push(node);
+      return node;
+    }),
     querySelector: vi.fn(() => null),
     querySelectorAll: vi.fn(() => []),
     addEventListener: vi.fn((name: string, listener: LoaderListener) => {
@@ -64,7 +105,7 @@ function createLoader(options: { denyFirstRecognition?: boolean } = {}) {
     onstart: (() => void) | null = null;
     onresult: ((event: {
       resultIndex: number;
-      results: Array<Array<{ transcript: string }> & { isFinal: boolean }>;
+      results: Array<Array<{ transcript: string; confidence?: number }> & { isFinal: boolean }>;
     }) => void) | null = null;
     onerror: ((event: { error: string }) => void) | null = null;
     onend: (() => void) | null = null;
@@ -82,8 +123,8 @@ function createLoader(options: { denyFirstRecognition?: boolean } = {}) {
       this.onstart?.();
     }
 
-    result(text: string, isFinal: boolean) {
-      const result = Object.assign([{ transcript: text }], { isFinal });
+    result(text: string, isFinal: boolean, confidence = 0.9) {
+      const result = Object.assign([{ transcript: text, confidence }], { isFinal });
       this.onresult?.({ resultIndex: 0, results: [result] });
     }
   }
@@ -120,7 +161,7 @@ function createLoader(options: { denyFirstRecognition?: boolean } = {}) {
     window: windowObject,
   };
   runInNewContext(loaderSource, context);
-  return { FakeRecognition, frame, frameWindow, listeners, messages, navigator, window: windowObject };
+  return { createdElements, FakeRecognition, frame, frameWindow, listeners, messages, navigator, window: windowObject };
 }
 
 afterEach(() => {
@@ -128,6 +169,18 @@ afterEach(() => {
 });
 
 describe("Project Hub Jarvis loader", () => {
+  it("mounts one universal Jarvis control with the visual selector beside it", () => {
+    const harness = createLoader();
+    const controls = harness.createdElements.find((element) => "data-jarvis-universal-controls" in element.attributes);
+
+    expect(controls).toBeDefined();
+    expect(controls?.attributes["data-jarvis-edit-ui"]).toBe("controls");
+    expect(controls?.children).toHaveLength(2);
+    expect(controls?.children[0].attributes["aria-label"]).toContain("always listening");
+    expect(controls?.children[1].attributes["aria-label"]).toContain("Select an element");
+    expect(controls?.children[1].onclick).toBeTypeOf("function");
+  });
+
   it("captures the wake word in the top-level page and forwards the command", () => {
     const harness = createLoader();
     expect(harness.frame.src).toBe(`${JARVIS_ORIGIN}/embed?v=test-release`);
@@ -159,6 +212,7 @@ describe("Project Hub Jarvis loader", () => {
       context: expect.objectContaining({
         url: "https://project-hub.test/dashboard?view=work#today",
         route: "/dashboard?view=work#today",
+        app: "project-hub",
         elements: [],
       }),
     });
@@ -227,5 +281,20 @@ describe("Project Hub Jarvis loader", () => {
     vi.advanceTimersByTime(1);
     expect(harness.FakeRecognition.instances).toHaveLength(2);
     expect(harness.window.JARVIS.wake.listening).toBe(true);
+  });
+
+  it("does not forward an invented ambient thank-you after Jarvis speaks", () => {
+    vi.useFakeTimers();
+    const harness = createLoader();
+    const receive = harness.listeners.get("message")?.[0];
+    harness.window.JARVIS.show();
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "speech-start" } });
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "speech-end" } });
+    vi.advanceTimersByTime(800);
+
+    harness.FakeRecognition.instances[1].result("Thank you.", true, 0.99);
+
+    expect(harness.messages).not.toContainEqual({ jarvis: "host-transcript", text: "Thank you." });
+    expect(harness.messages).not.toContainEqual({ jarvis: "host-command", text: "Thank you." });
   });
 });

@@ -1,7 +1,12 @@
 import type { NextRequest } from "next/server";
 import { getSecret } from "@/lib/vault";
 import { STT_PROMPT } from "@/lib/sttvocab";
-import { cleanSpeechTranscript, hasConfidentSpeechSegments, isMeaningfulSpeechTranscript } from "@/lib/transcript";
+import {
+  cleanSpeechTranscript,
+  hasConfidentSpeechSegments,
+  isMeaningfulSpeechTranscript,
+  shouldIgnoreHandsFreeTranscript,
+} from "@/lib/transcript";
 import { controlActor } from "@/lib/request-auth";
 
 // Speech-to-text utility only: free/fast Groq Whisper. Conversation intelligence
@@ -69,6 +74,18 @@ export async function POST(req: NextRequest) {
     );
   if (transcription === null) return new Response(JSON.stringify({ error: "stt unavailable" }), { status: 502 });
   let text = transcription.confidentSpeech ? cleanSpeechTranscript(transcription.text) : "";
+
+  if (req.headers.get("x-jarvis-continuous-live") === "1") {
+    const numberHeader = (name: string) => {
+      const value = Number(req.headers.get(name));
+      return Number.isFinite(value) ? Math.max(0, value) : 0;
+    };
+    if (shouldIgnoreHandsFreeTranscript(text, {
+      acceptedFrames: numberHeader("x-jarvis-voice-frames"),
+      speechSpanMs: numberHeader("x-jarvis-speech-span-ms"),
+      peakVoiceMargin: numberHeader("x-jarvis-peak-voice-margin"),
+    })) text = "";
+  }
 
   // Foreign-script junk on noise never reaches the brain (an English speaker's
   // real words are overwhelmingly Latin).

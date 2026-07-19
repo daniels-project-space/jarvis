@@ -10,8 +10,11 @@
   if (location.origin === ORIGIN) return;
 
   var release = "";
+  var configuredApp = "";
   try {
-    release = new URL(document.currentScript && document.currentScript.src).searchParams.get("v") || "";
+    var hostScript = document.currentScript;
+    release = new URL(hostScript && hostScript.src).searchParams.get("v") || "";
+    configuredApp = String(hostScript && hostScript.dataset && hostScript.dataset.jarvisApp || "").slice(0, 120);
   } catch {}
 
   var visible = false;
@@ -45,10 +48,74 @@
   f.title = "JARVIS";
   f.allow = "microphone; autoplay; clipboard-write; display-capture";
   f.style.cssText =
-    "position:fixed;bottom:8px;right:8px;width:min(460px,calc(100vw - 16px));height:min(520px,calc(100vh - 16px));border:0;" +
+    "position:fixed;bottom:66px;right:8px;width:min(460px,calc(100vw - 16px));height:min(520px,calc(100vh - 82px));border:0;" +
     "border-radius:28px;z-index:2147483000;background:#05070d;color-scheme:dark;" +
     "box-shadow:none;transition:opacity .2s ease,transform .28s cubic-bezier(.22,1,.36,1);" +
     "opacity:0;transform:translateY(14px);pointer-events:none;";
+
+  // One host-owned control in every app. Individual products no longer need
+  // to reinvent a Jarvis button or remember to expose the element selector.
+  // Inline `all:initial` styling prevents app CSS from corrupting the control.
+  var controls = document.createElement("div");
+  controls.setAttribute("data-jarvis-universal-controls", "");
+  controls.setAttribute("data-jarvis-edit-ui", "controls");
+  controls.style.cssText =
+    "all:initial;position:fixed;right:12px;bottom:12px;z-index:2147483001;display:flex;align-items:center;gap:6px;" +
+    "padding:5px;border:1px solid rgba(130,220,255,.24);border-radius:18px;background:rgba(4,9,16,.9);" +
+    "box-shadow:0 14px 48px rgba(0,0,0,.42),inset 0 1px rgba(255,255,255,.06);backdrop-filter:blur(18px);";
+  var jarvisButton = document.createElement("button");
+  jarvisButton.type = "button";
+  jarvisButton.setAttribute("aria-label", "Open Jarvis; wake word is always listening");
+  jarvisButton.style.cssText =
+    "all:unset;box-sizing:border-box;display:flex;align-items:center;gap:8px;height:38px;padding:0 12px;border-radius:13px;" +
+    "cursor:pointer;color:#dff9ff;background:rgba(64,208,255,.08);font:700 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;" +
+    "letter-spacing:.14em;transition:background .18s ease,color .18s ease,box-shadow .18s ease;";
+  var wakeDot = document.createElement("span");
+  wakeDot.setAttribute("aria-hidden", "true");
+  wakeDot.style.cssText =
+    "all:initial;display:block;width:8px;height:8px;border-radius:999px;background:#67e8f9;" +
+    "box-shadow:0 0 0 4px rgba(103,232,249,.1),0 0 16px rgba(103,232,249,.7);";
+  var jarvisLabel = document.createElement("span");
+  jarvisLabel.textContent = "JARVIS";
+  jarvisLabel.style.cssText = "all:initial;color:inherit;font:inherit;letter-spacing:inherit";
+  jarvisButton.appendChild(wakeDot);
+  jarvisButton.appendChild(jarvisLabel);
+  var selectorButton = document.createElement("button");
+  selectorButton.type = "button";
+  selectorButton.setAttribute("aria-label", "Select an element for Jarvis to inspect or change");
+  selectorButton.title = "Select an element for Jarvis";
+  selectorButton.textContent = "⌖";
+  selectorButton.style.cssText =
+    "all:unset;box-sizing:border-box;display:grid;place-items:center;width:38px;height:38px;border-radius:13px;cursor:pointer;" +
+    "color:#8fdff5;background:rgba(255,255,255,.045);font:500 23px/1 system-ui,sans-serif;" +
+    "transition:background .18s ease,color .18s ease,box-shadow .18s ease;";
+  controls.appendChild(jarvisButton);
+  controls.appendChild(selectorButton);
+
+  function paintUniversalControls() {
+    var awake = Boolean(recognition) && !speechBlocked && !liveBlocked;
+    jarvisButton.setAttribute("aria-pressed", visible ? "true" : "false");
+    jarvisButton.title = awake
+      ? "Jarvis is always listening — say ‘Hey Jarvis’ or tap to open"
+      : "Open Jarvis and enable the wake word";
+    jarvisButton.style.background = visible ? "rgba(34,211,238,.18)" : "rgba(64,208,255,.08)";
+    jarvisButton.style.boxShadow = visible ? "inset 0 0 0 1px rgba(103,232,249,.35)" : "none";
+    wakeDot.style.background = awake ? "#67e8f9" : recognitionNeedsGesture ? "#fbbf24" : "#64748b";
+    wakeDot.style.boxShadow = awake
+      ? "0 0 0 4px rgba(103,232,249,.1),0 0 16px rgba(103,232,249,.7)"
+      : "0 0 0 4px rgba(148,163,184,.08)";
+  }
+
+  jarvisButton.onclick = function () {
+    enableWakeFromGesture();
+    if (visible) hide();
+    else show();
+  };
+  selectorButton.onclick = function () {
+    enableWakeFromGesture();
+    show();
+    startEditMode("");
+  };
 
   function post(message) {
     if (f.contentWindow) f.contentWindow.postMessage(message, ORIGIN);
@@ -158,7 +225,7 @@
       selection = compact(window.getSelection ? window.getSelection() : "", 1800);
       text = compact(document.body ? document.body.innerText : "", 4500);
       var appNode = document.querySelector ? document.querySelector("[data-jarvis-app]") : null;
-      app = compact(appNode && appNode.dataset && appNode.dataset.jarvisApp, 120);
+      app = compact((appNode && appNode.dataset && appNode.dataset.jarvisApp) || configuredApp, 120);
     } catch {}
     var route = "";
     try {
@@ -183,8 +250,12 @@
   }
 
   function mount() {
-    if (!f.isConnected && document.body) {
-      document.body.appendChild(f);
+    if (document.body) {
+      var firstMount = !f.isConnected;
+      if (firstMount) document.body.appendChild(f);
+      if (!controls.isConnected) document.body.appendChild(controls);
+      paintUniversalControls();
+      if (firstMount) {
       try {
         var url = new URL(location.href);
         var command = url.searchParams.get("jarvis");
@@ -194,6 +265,7 @@
           ask(command);
         }
       } catch {}
+      }
     }
   }
 
@@ -205,6 +277,7 @@
         detail: { listening: Boolean(listening), reason: reason || null },
       }));
     } catch {}
+    paintUniversalControls();
   }
 
   function show() {
@@ -216,6 +289,7 @@
     post({ jarvis: "host-show" });
     postHostContext();
     if (navigator.userActivation && navigator.userActivation.isActive) enableWakeFromGesture();
+    paintUniversalControls();
   }
 
   function hide() {
@@ -228,6 +302,7 @@
     f.style.transform = "translateY(14px)";
     f.style.pointerEvents = "none";
     post({ jarvis: "host-hide" });
+    paintUniversalControls();
   }
 
   function flushCommands() {
@@ -505,6 +580,10 @@
       .trim();
   }
 
+  function isAmbientAcknowledgement(text) {
+    return /^(?:thank you|thanks|thank you very much|thanks very much|cheers)[.!?]*$/i.test(String(text || "").trim());
+  }
+
   function deliverCommand(text) {
     var command = String(text || "").trim().slice(0, 4000);
     pendingTranscript = "";
@@ -553,7 +632,18 @@
         continue;
       }
       if (visible && Date.now() < commandModeUntil) {
-        stageTranscript(text, result.isFinal);
+        // Follow-ups have no wake-word proof. Never turn an interim browser
+        // hypothesis into a command, and close the ambient window on bare
+        // acknowledgements—the most common Chrome silence hallucination.
+        if (!result.isFinal) continue;
+        if (isAmbientAcknowledgement(text)) {
+          pendingTranscript = "";
+          commandModeUntil = 0;
+          if (commandTimer) clearTimeout(commandTimer);
+          commandTimer = null;
+          continue;
+        }
+        stageTranscript(text, true);
       }
     }
   }

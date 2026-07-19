@@ -4,6 +4,9 @@ export type LiveVadState = {
   noiseFloor: number;
   voiceFrames: number;
   bargeFrames: number;
+  voiceStartedAt: number;
+  acceptedFrames: number;
+  peakVoiceMargin: number;
 };
 
 export type LiveVadFrame = {
@@ -52,7 +55,16 @@ export function spectrumBandLevel(
 }
 
 export function createLiveVadState(now: number): LiveVadState {
-  return { spoke: false, lastVoice: now, noiseFloor: 5, voiceFrames: 0, bargeFrames: 0 };
+  return {
+    spoke: false,
+    lastVoice: now,
+    noiseFloor: 5,
+    voiceFrames: 0,
+    bargeFrames: 0,
+    voiceStartedAt: 0,
+    acceptedFrames: 0,
+    peakVoiceMargin: 0,
+  };
 }
 
 export function shouldCloseLiveUtterance(state: LiveVadState, now: number): boolean {
@@ -107,7 +119,15 @@ export function advanceLiveVad(state: LiveVadState, frame: LiveVadFrame): {
     };
   }
 
-  const voiceFrames = speechShaped && voiceLevel > threshold ? state.voiceFrames + 1 : 0;
+  const candidate = speechShaped && voiceLevel > threshold;
+  const voiceFrames = candidate ? state.voiceFrames + 1 : 0;
+  const voiceStartedAt = state.spoke
+    ? state.voiceStartedAt
+    : voiceFrames === 1
+      ? frame.now
+      : voiceFrames === 0
+        ? 0
+        : state.voiceStartedAt;
   // Starting an utterance is deliberately strict so clicks cannot open one.
   // Once Daniel is speaking, even a short connecting word refreshes the end
   // timer so a natural sentence cadence is not cut into separate requests.
@@ -118,6 +138,13 @@ export function advanceLiveVad(state: LiveVadState, frame: LiveVadFrame): {
       noiseFloor,
       voiceFrames,
       bargeFrames: 0,
+      voiceStartedAt,
+      acceptedFrames: acceptedSpeech
+        ? state.spoke ? state.acceptedFrames + 1 : voiceFrames
+        : state.acceptedFrames,
+      peakVoiceMargin: candidate
+        ? Math.max(state.peakVoiceMargin, voiceLevel - threshold)
+        : state.peakVoiceMargin,
       spoke: state.spoke || acceptedSpeech,
       lastVoice: acceptedSpeech ? frame.now : state.lastVoice,
     },

@@ -143,6 +143,7 @@ async function insertGoalJob(ctx: any, input: GoalJobInput) {
     approvalRequired,
     approvalReason: approval.reason,
     approvalStatus: approvalRequired ? "pending" : undefined,
+    deliveryMode: approval.deliveryMode,
     stage: approvalRequired ? "approval" : "queued",
     percent: 0,
     attempt: 1,

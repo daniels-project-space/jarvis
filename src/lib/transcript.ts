@@ -35,6 +35,42 @@ export type SpeechSegmentEvidence = {
   no_speech_prob?: number;
 };
 
+export type ClientSpeechEvidence = {
+  acceptedFrames: number;
+  speechSpanMs: number;
+  peakVoiceMargin: number;
+};
+
+const HANDS_FREE_ACKNOWLEDGEMENT =
+  /^(?:thank you|thanks|thank you very much|thanks very much|cheers)$/i;
+const COMMON_WHISPER_GHOST =
+  /^(?:thanks? for (?:watching|listening)|bye|goodbye|music|you)$/i;
+
+const normalizedSpeech = (input: string) => input
+  .toLocaleLowerCase("en-GB")
+  .replace(/[^\p{L}\p{N}']+/gu, " ")
+  .trim();
+
+/**
+ * Bare acknowledgements have no actionable intent and are a common Whisper /
+ * browser-recognition silence hallucination. In an always-on session they are
+ * ignored; typed text and an explicit wake-word command still work normally.
+ * Other known ghost fragments are rejected only when browser VAD evidence is
+ * weak, preserving genuine short commands.
+ */
+export function shouldIgnoreHandsFreeTranscript(
+  input: string,
+  evidence?: ClientSpeechEvidence | null,
+): boolean {
+  const normalized = normalizedSpeech(input);
+  if (HANDS_FREE_ACKNOWLEDGEMENT.test(normalized)) return true;
+  if (!COMMON_WHISPER_GHOST.test(normalized) || !evidence) return false;
+  if (evidence.peakVoiceMargin < 7) return true;
+  return evidence.acceptedFrames <= 4
+    && evidence.speechSpanMs < 280
+    && evidence.peakVoiceMargin < 16;
+}
+
 export function hasConfidentSpeechSegments(input: unknown): boolean {
   if (!Array.isArray(input)) return true;
   if (!input.length) return false;
@@ -57,8 +93,8 @@ export function isRecentVoiceDuplicate(
   now = Date.now(),
 ): boolean {
   if (!previous) return false;
-  const normalized = input.toLocaleLowerCase("en-GB").replace(/[^\p{L}\p{N}']+/gu, " ").trim();
-  const prior = previous.text.toLocaleLowerCase("en-GB").replace(/[^\p{L}\p{N}']+/gu, " ").trim();
+  const normalized = normalizedSpeech(input);
+  const prior = normalizedSpeech(previous.text);
   if (!normalized || normalized !== prior) return false;
   const words = normalized.split(/\s+/).length;
   // False Whisper text often survives several silent recorder windows. Hold

@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { workApprovalPolicy } from "./workPolicy";
+import { classifyWorkSafety, isOwnedRepository } from "../src/lib/work-safety";
 import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
 import { normalizeWorkModelTier } from "../src/lib/work-models";
@@ -62,6 +63,7 @@ export const enqueue = mutation({
       approvalRequired,
       approvalReason: approval.reason,
       approvalStatus: approvalRequired ? "pending" : undefined,
+      deliveryMode: approval.deliveryMode,
       stage: approvalRequired ? "approval" : "queued",
       percent: 0,
       attempt: 1,
@@ -93,6 +95,61 @@ export const enqueue = mutation({
       });
     }
     return id;
+  },
+});
+
+// One-time-compatible policy reconciliation. Jobs created before autonomous
+// software work could inherit a planner-level approval hint even inside
+// Daniel's own repositories. A worker wake upgrades every safe owned-repo job;
+// messages, money, public publishing and destructive work remain untouched in
+// awaiting_approval.
+export const reconcileAutonomousSoftwareWork = mutation({
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const rows = await ctx.db
+      .query("jobs")
+      .withIndex("by_status", (q) => q.eq("status", "awaiting_approval"))
+      .take(100);
+    const now = Date.now();
+    let reconciled = 0;
+    for (const row of rows) {
+      const safety = classifyWorkSafety(row.task, { repo: row.repo });
+      if (safety.approvalRequired || !isOwnedRepository(row.repo)) continue;
+      await ctx.db.patch(row._id, {
+        status: "pending",
+        readonly: false,
+        risk: row.risk === "consequential" ? "high" : row.risk,
+        approvalRequired: false,
+        approvalReason: undefined,
+        approvalStatus: "superseded",
+        deliveryMode: "auto_merge",
+        stage: "queued",
+        progress: "autonomous software delivery enabled — queued",
+        nextRunAt: now,
+      });
+      const approvals = await ctx.db
+        .query("approvals")
+        .withIndex("by_job", (q) => q.eq("jobId", String(row._id)))
+        .collect();
+      for (const approval of approvals) {
+        if (approval.status === "pending") {
+          await ctx.db.patch(approval._id, { status: "superseded", resolvedAt: now });
+        }
+      }
+      await ctx.db.insert("workEvents", {
+        jobId: String(row._id),
+        missionId: row.missionId,
+        agentId: row.agentId,
+        type: "autonomy_reconciled",
+        message: "Legacy software-delivery approval removed; verified delivery is automatic",
+        stage: "queued",
+        percent: row.percent ?? 0,
+        createdAt: now,
+      });
+      reconciled += 1;
+    }
+    return reconciled;
   },
 });
 
@@ -181,7 +238,14 @@ export const claimNext = mutation({
       attempt: j.attempt ?? 1,
       maxAttempts: j.maxAttempts ?? 12,
       checkpoint: j.checkpoint ?? null,
+      result: j.result ?? null,
       branch: j.branch ?? null,
+      deliveryMode: j.deliveryMode ?? (j.readonly ? "read_only" : "manual"),
+      deliveryStatus: j.deliveryStatus ?? null,
+      pullRequestUrl: j.pullRequestUrl ?? null,
+      mergeCommitSha: j.mergeCommitSha ?? null,
+      verificationVerdict: j.verificationVerdict ?? null,
+      verificationNote: j.verificationNote ?? null,
       acceptanceCriteria: j.acceptanceCriteria ?? [],
       modelReason: j.modelReason ?? null,
       parentJobId: j.parentJobId ?? null,
@@ -212,15 +276,18 @@ export const finalize = mutation({
     if (a.status === "done" && a.verificationVerdict !== "pass") return false;
     const now = Date.now();
     const success = a.status === "done";
+    const delivered = success && row.deliveryStatus === "merged";
     await ctx.db.patch(a.jobId, {
       status: a.status,
       result: a.result,
       pullRequestUrl: a.pullRequestUrl,
       completedAt: now,
       heartbeatAt: now,
-      stage: success ? "verified" : a.status,
+      stage: success ? (delivered ? "delivered" : "verified") : a.status,
       percent: success ? 100 : row.percent,
-      progress: success ? "verified and complete" : row.progress,
+      progress: success
+        ? delivered ? "verified, merged and handed to deployment" : "verified and complete"
+        : row.progress,
       verificationVerdict: a.verificationVerdict,
       verificationNote: a.verificationNote?.slice(0, 1000),
       verifiedAt: success ? now : undefined,
@@ -230,8 +297,10 @@ export const finalize = mutation({
       missionId: row.missionId,
       agentId: row.agentId,
       type: a.status,
-      message: success ? "Work verified and complete" : (a.result ?? a.status).slice(0, 500),
-      stage: success ? "verified" : a.status,
+      message: success
+        ? delivered ? "Work verified and merged automatically" : "Work verified and complete"
+        : (a.result ?? a.status).slice(0, 500),
+      stage: success ? (delivered ? "delivered" : "verified") : a.status,
       percent: success ? 100 : row.percent,
       createdAt: now,
     });
@@ -645,13 +714,61 @@ export const setDelivery = mutation({
     expectedAttempt: v.number(),
     branch: v.optional(v.string()),
     pullRequestUrl: v.optional(v.string()),
+    deliveryStatus: v.optional(v.union(
+      v.literal("branch"),
+      v.literal("pull_request"),
+      v.literal("merged"),
+      v.literal("blocked"),
+    )),
+    mergeCommitSha: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
-    await ctx.db.patch(a.jobId, { branch: a.branch, pullRequestUrl: a.pullRequestUrl, heartbeatAt: Date.now() });
+    await ctx.db.patch(a.jobId, {
+      branch: a.branch,
+      pullRequestUrl: a.pullRequestUrl,
+      deliveryStatus: a.deliveryStatus,
+      mergeCommitSha: a.mergeCommitSha?.slice(0, 80),
+      mergedAt: a.deliveryStatus === "merged" ? Date.now() : undefined,
+      heartbeatAt: Date.now(),
+    });
+    return true;
+  },
+});
+
+// Persist supervisor evidence before any GitHub delivery call. If checks take
+// longer than one harness lease, the next attempt resumes the controller step
+// directly instead of paying for (and risking divergence from) another model
+// run over already verified code.
+export const markVerifiedForDelivery = mutation({
+  args: {
+    jobId: v.id("jobs"),
+    expectedAttempt: v.number(),
+    result: v.string(),
+    verificationNote: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.get(a.jobId);
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
+    if (!isOwnedRepository(row.repo)) return false;
+    if (classifyWorkSafety(row.task, { repo: row.repo }).approvalRequired) return false;
+    if (row.deliveryMode !== "auto_merge" && row.goalStage !== "validating") return false;
+    const now = Date.now();
+    await ctx.db.patch(a.jobId, {
+      result: a.result.slice(0, 4_000),
+      verificationVerdict: "pass",
+      verificationNote: a.verificationNote.slice(0, 1_000),
+      verifiedAt: now,
+      stage: "delivery",
+      progress: "supervisor passed — controller delivery in progress",
+      percent: Math.max(96, row.percent ?? 0),
+      heartbeatAt: now,
+    });
     return true;
   },
 });
@@ -778,6 +895,9 @@ export const active = query({
         checkpoint: j.checkpoint ?? null,
         branch: j.branch ?? null,
         pullRequestUrl: j.pullRequestUrl ?? null,
+        deliveryMode: j.deliveryMode ?? (j.readonly ? "read_only" : "manual"),
+        deliveryStatus: j.deliveryStatus ?? null,
+        mergeCommitSha: j.mergeCommitSha ?? null,
         originThreadId: j.originThreadId ?? "main",
         parentJobId: j.parentJobId ?? null,
         goalStage: j.goalStage ?? null,

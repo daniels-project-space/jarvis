@@ -21,12 +21,13 @@ import {
   shouldDeferLiveCapture,
   shouldPrefetchLiveTranscript,
   spectrumBandLevel,
+  type LiveVadState,
 } from "@/lib/live-vad";
 import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, StructuredListView, CandlesView, MarketChartLoading, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView, PanelUnavailable } from "./Views";
 import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
 import { parseTerminalOutput, type TerminalTone } from "@/lib/terminal-output";
 import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
-import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate } from "@/lib/transcript";
+import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate, shouldIgnoreHandsFreeTranscript } from "@/lib/transcript";
 import { completeSpeechPrefix, isSpeaking as isTtsActuallySpeaking, unlockSpeechPlayback } from "@/lib/tts";
 import { NarrationLedger, narrationClaim } from "@/lib/narration";
 import { resolvePanelRoute } from "@/lib/panel-contract";
@@ -2874,10 +2875,23 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const rec = new MediaRecorder(stream, { mimeType: mime });
       const chunks: Blob[] = [];
       rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-      const requestTranscript = async (blob: Blob, controller: AbortController): Promise<string> => {
+      const requestTranscript = async (
+        blob: Blob,
+        controller: AbortController,
+        evidence: LiveVadState,
+      ): Promise<string> => {
+        const speechSpanMs = evidence.voiceStartedAt
+          ? Math.max(0, evidence.lastVoice - evidence.voiceStartedAt)
+          : 0;
         const response = await viewerFetch("/api/stt", {
           method: "POST",
-          headers: { "content-type": mime },
+          headers: {
+            "content-type": mime,
+            "x-jarvis-continuous-live": "1",
+            "x-jarvis-voice-frames": String(evidence.acceptedFrames),
+            "x-jarvis-speech-span-ms": String(Math.round(speechSpanMs)),
+            "x-jarvis-peak-voice-margin": String(Math.round(evidence.peakVoiceMargin * 10) / 10),
+          },
           body: blob,
           signal: controller.signal,
         });
@@ -2964,7 +2978,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             pendingSttController = controller;
             sttAbortRef.current?.abort();
             sttAbortRef.current = controller;
-            prefetch.promise = requestTranscript(partial, controller)
+            prefetch.promise = requestTranscript(partial, controller, { ...vad })
               .then((text) => ({ text, lastVoice }), () => null)
               .finally(() => {
                 if (sttAbortRef.current === controller) sttAbortRef.current = null;
@@ -3013,7 +3027,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         pendingSttController = controller;
         sttAbortRef.current?.abort();
         sttAbortRef.current = controller;
-        text = await requestTranscript(blob, controller);
+        text = await requestTranscript(blob, controller, { ...vad });
         if (sttAbortRef.current === controller) sttAbortRef.current = null;
         if (pendingSttController === controller) pendingSttController = null;
       }
@@ -3024,6 +3038,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const { isEchoOfTts } = await import("../lib/tts");
       const cleanedText = text.trim();
       if (!isMeaningfulSpeechTranscript(cleanedText)) {
+        outcome = "empty";
+        return;
+      }
+      if (shouldIgnoreHandsFreeTranscript(cleanedText, {
+        acceptedFrames: vad.acceptedFrames,
+        speechSpanMs: vad.voiceStartedAt ? Math.max(0, vad.lastVoice - vad.voiceStartedAt) : 0,
+        peakVoiceMargin: vad.peakVoiceMargin,
+      })) {
         outcome = "empty";
         return;
       }

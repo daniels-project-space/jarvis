@@ -3,14 +3,28 @@ import { workApprovalPolicy } from "../../convex/workPolicy";
 import { plannerTask, routeGoal, validatorTask } from "../lib/goal-mode";
 
 describe("server-side work approval policy", () => {
-  it("does not let an explicit false waive consequential work", () => {
+  it("lets verified delivery run autonomously inside Daniel's repository", () => {
     expect(
       workApprovalPolicy({
         task: "Deploy the release to production",
         repo: "jarvis",
         approvalRequired: false,
-      }).required,
-    ).toBe(true);
+      }),
+    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    expect(
+      workApprovalPolicy({
+        task: "Merge the verified fix and deploy it",
+        repo: "daniels-project-space/jarvis",
+      }),
+    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    expect(
+      workApprovalPolicy({
+        task: "Fix the parser and run its regression suite",
+        repo: "jarvis",
+        approvalRequired: true,
+        risk: "consequential",
+      }),
+    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
   });
 
   it("gates messaging, money, booking and destructive actions", () => {
@@ -40,6 +54,18 @@ describe("server-side work approval policy", () => {
     ).toBe(true);
   });
 
+  it("does not grant autonomous writes outside Daniel's portfolio", () => {
+    expect(
+      workApprovalPolicy({
+        task: "Fix the parser and merge it",
+        repo: "someone-else/project",
+      }),
+    ).toMatchObject({
+      required: true,
+      deliveryMode: "manual",
+    });
+  });
+
   it("allows bounded read-only and isolated repository work", () => {
     expect(workApprovalPolicy({ task: "Audit why publishing can race", readonly: true }).required).toBe(false);
     expect(
@@ -55,7 +81,10 @@ describe("server-side work approval policy", () => {
         readonly: true,
       }).required,
     ).toBe(false);
-    expect(workApprovalPolicy({ task: "Fix the parser and run tests", repo: "jarvis" }).required).toBe(false);
+    expect(workApprovalPolicy({ task: "Fix the parser and run tests", repo: "jarvis" })).toMatchObject({
+      required: false,
+      deliveryMode: "auto_merge",
+    });
     expect(workApprovalPolicy({ task: "Research current orchestration patterns" }).required).toBe(false);
   });
 
