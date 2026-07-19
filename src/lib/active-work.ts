@@ -6,6 +6,7 @@ export type ActiveWork = {
   label?: string;
   task?: string;
   stage?: string;
+  incidentId?: string;
 };
 
 const ACTIVE_STATUSES = new Set(["running", "awaiting_approval", "needs_input"]);
@@ -20,9 +21,12 @@ const LEGACY_SYSTEM_WORK = /\b(?:health[ -]?check|heartbeat|uptime poll|stack po
 export function isRelevantActiveWork(job: ActiveWork): boolean {
   const status = String(job.status ?? "");
   if (!ACTIVE_STATUSES.has(status)) return false;
+  // Incident repair is operations telemetry, even when its worker is waiting
+  // on a provider publication or approval. Alerts retains that attention;
+  // the conversational work pill is reserved for Daniel's deliberate work.
+  if (job.visibility === "system" || job.incidentId || (job.agentId === "sentry" && job.visibility !== "conversation")) return false;
   if (DECISION_STATUSES.has(status)) return true;
   if (job.visibility === "conversation") return true;
-  if (job.visibility === "system" || job.agentId === "sentry") return false;
 
   // Compatibility for jobs created before visibility was recorded explicitly.
   return !LEGACY_SYSTEM_WORK.test([job.label, job.task, job.stage].filter(Boolean).join(" "));

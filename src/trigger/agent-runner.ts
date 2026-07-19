@@ -26,6 +26,7 @@ import { codexMcpConfigArgs, type CodexMcpConfig } from "../lib/codex-mcp";
 import { redactSensitiveText } from "../lib/secret-redaction";
 import { isPermittedReadonlyAccessGap } from "../lib/work-verification";
 import { gitDeliveryDisposition, isNonFastForwardPush } from "../lib/git-delivery";
+import { repairPrompt } from "../lib/repair-prompt";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -457,21 +458,6 @@ async function branchHasChanges(repo: string, branch: string, token: string): Pr
   } catch {
     return null;
   }
-}
-
-// Root-cause repair briefing for self-healing jobs.
-export function repairPrompt(inc: { source: string; message: string; signature: string; count: number; attempts: number }, repo: string): string {
-  return (
-    `SELF-REPAIR (attempt ${inc.attempts}): something in Daniel's system is broken — trace the ROOT CAUSE and fix it. ` +
-    `Never paper over symptoms.\n\n` +
-    `Incident (source: ${inc.source}, seen ${inc.count}x): ${inc.message}\n\n` +
-    `Method, in order: 1) REPRODUCE — hit the live endpoints (e.g. curl https://jarvis-orcin-six.vercel.app/api/...) ` +
-    `or read the failing path until you can explain the error. 2) Trace to the underlying cause in the code of ${repo}. ` +
-    `3) Apply the MINIMAL correct fix. 4) VALIDATE proportionally: for a small single-file change, re-read your full diff line by line instead of building (the clone has no node_modules; Vercel's build is the gate and a failed deploy auto-files an incident straight back to you). For multi-file or risky changes, run "npm install" then "npx tsc --noEmit" and "npm run build" — they must pass. ` +
-    `5) Commit ONLY working code with a message starting "self-repair:". ` +
-    `If the true fix needs convex/ or src/trigger/ redeploy (you cannot deploy those), still commit and SAY SO plainly. ` +
-    `If you cannot find the root cause, do NOT guess-edit — say exactly what you ruled out and what you suspect.`
-  );
 }
 
 // The actual specialist runtime is a subscription-authenticated CLI harness.

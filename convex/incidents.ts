@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
+import { normalizeIncidentSignature } from "../src/lib/incident-signature";
 
 // Self-healing incident ledger. report() dedups by signature (48h window):
 // an existing open/dispatched incident just bumps count; a recently-resolved
@@ -56,7 +57,7 @@ export const report = mutation({
   },
   handler: async (ctx, a) => {
     await requireDispatcher(ctx, a);
-    const sig = a.signature.slice(0, 200);
+    const sig = normalizeIncidentSignature(a.signature);
     const existing = await ctx.db
       .query("incidents")
       .withIndex("by_signature", (q: any) => q.eq("signature", sig))

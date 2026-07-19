@@ -4,8 +4,9 @@ import { isRelevantActiveWork, needsDaniel, relevantActiveWork } from "./active-
 describe("live work visibility", () => {
   it("shows only work that is executing or genuinely needs Daniel", () => {
     expect(isRelevantActiveWork({ status: "running", visibility: "conversation" })).toBe(true);
-    expect(isRelevantActiveWork({ status: "awaiting_approval", visibility: "system" })).toBe(true);
-    expect(isRelevantActiveWork({ status: "needs_input", agentId: "sentry" })).toBe(true);
+    expect(isRelevantActiveWork({ status: "awaiting_approval", visibility: "conversation" })).toBe(true);
+    expect(isRelevantActiveWork({ status: "needs_input", visibility: "conversation" })).toBe(true);
+    expect(isRelevantActiveWork({ status: "running", visibility: "conversation", agentId: "sentry" })).toBe(true);
     expect(isRelevantActiveWork({ status: "pending", visibility: "conversation" })).toBe(false);
     expect(isRelevantActiveWork({ status: "paused", visibility: "conversation" })).toBe(false);
   });
@@ -13,6 +14,8 @@ describe("live work visibility", () => {
   it("keeps routine system work out of the conversation surface", () => {
     expect(isRelevantActiveWork({ status: "running", visibility: "system", label: "Paul · repair" })).toBe(false);
     expect(isRelevantActiveWork({ status: "running", agentId: "sentry", task: "Investigate uptime" })).toBe(false);
+    expect(isRelevantActiveWork({ status: "needs_input", incidentId: "incident-1" })).toBe(false);
+    expect(isRelevantActiveWork({ status: "awaiting_approval", visibility: "system" })).toBe(false);
     expect(isRelevantActiveWork({ status: "running", task: "Routine provider health check" })).toBe(false);
   });
 

@@ -34,6 +34,7 @@ import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent
 import { needsHostContext, visibleTurnText, withHostContext, type JarvisHostContext } from "@/lib/host-context";
 import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
 import { viewerFetch } from "@/lib/viewer-request";
+import { normalizeIncidentSignature } from "@/lib/incident-signature";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -81,6 +82,8 @@ type Job = {
   checkpoint?: string;
   branch?: string;
   pullRequestUrl?: string;
+  visibility?: string;
+  incidentId?: string;
   startedAt: number;
 };
 type Caption = {
@@ -2012,12 +2015,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => {
     const seen = new Set<string>();
     const report = (sig: string, msg: string) => {
-      if (seen.size >= 3 || seen.has(sig)) return;
-      seen.add(sig);
+      const stableSignature = normalizeIncidentSignature(sig);
+      if (seen.size >= 3 || seen.has(stableSignature)) return;
+      seen.add(stableSignature);
       void viewerFetch("/api/incident", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ signature: sig, message: msg }),
+        body: JSON.stringify({ signature: stableSignature, message: msg }),
       }).catch(() => {});
     };
     // A ChunkLoadError means this tab is holding HTML from a PREVIOUS deploy:
