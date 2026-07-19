@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { workApprovalPolicy } from "../../convex/workPolicy";
-import { plannerTask, routeGoal } from "../lib/goal-mode";
+import { plannerTask, routeGoal, validatorTask } from "../lib/goal-mode";
 
 describe("server-side work approval policy", () => {
   it("does not let an explicit false waive consequential work", () => {
@@ -66,6 +66,27 @@ describe("server-side work approval policy", () => {
       readonly: true,
       risk: "low",
     }).required).toBe(false);
+  });
+
+  it("does not mistake a no-POST evidence boundary for a POST request", () => {
+    const task = validatorTask({
+      goal: "Produce a strictly read-only production audit.",
+      plan: {
+        summary: "Read-only audit",
+        route: "general",
+        assumptions: [],
+        workstreams: [],
+        validation: { criteria: [], tests: [], liveChecks: [] },
+      },
+      acceptanceCriteria: ["Keep every provider boundary read-only"],
+      buildEvidence: [{
+        label: "Production state",
+        status: "done",
+        result: "Production-state proof is incomplete under the no-POST boundary.",
+      }],
+      revisionWave: 0,
+    });
+    expect(workApprovalPolicy({ task, readonly: true, risk: "low" }).required).toBe(false);
   });
 
   it("does not let an evidence label disguise a fresh imperative", () => {

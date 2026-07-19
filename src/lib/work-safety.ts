@@ -19,7 +19,7 @@ const NEGATED_LEAD =
   /^(?:do\s+not|don't|never|must\s+not|should\s+not|may\s+not|cannot|can't|without|avoid|forbid(?:den)?|prohibit(?:ed)?|no\b)/i;
 
 const NEGATED_TAIL =
-  /\b(?:do\s+not|don't|never|must\s+not|should\s+not|may\s+not|cannot|can't|without|avoid)\b[^.;!?\n]{0,160}$/i;
+  /\b(?:do\s+not|don't|never|must\s+not|should\s+not|may\s+not|cannot|can't|without|avoid|no)\b[^.;!?\n]{0,160}$/i;
 
 // Security reviews often include past-tense evidence such as “the job asked
 // to send a reply”. That is a description of the tested instruction, not a
