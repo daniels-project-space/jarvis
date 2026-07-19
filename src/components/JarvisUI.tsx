@@ -3401,13 +3401,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               reduceMotion={prefs.reduceMotion}
             />
           </div>
-          {speaking && !fullBleed && !compactAside && (
+          {speaking && !fullBleed && (
             <button
               type="button"
               aria-label="Interrupt Jarvis"
               title="Tap the orb to interrupt"
               onClick={stopTalking}
-              className="absolute inset-[28%] z-20 rounded-full bg-transparent"
+              className={compactAside
+                ? "absolute bottom-[25%] left-[69%] right-[3%] top-[25%] z-20 hidden rounded-full bg-transparent md:block"
+                : "absolute inset-[28%] z-20 rounded-full bg-transparent"}
             />
           )}
           {/* THE ONE caption — one persistent node throughout token streaming,
@@ -3713,14 +3715,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
 
       {/* zen mode: no chat at all — JARVIS is always listening */}
       <button
-        onClick={() => setChatMode("bar")}
+        onClick={() => speaking ? stopTalking() : setChatMode("bar")}
         className={`glass fixed bottom-4 right-4 z-40 flex items-center gap-2 rounded-full px-3.5 py-2 text-xs text-slate will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] hover:text-ice ${
           chatMode === "off" && !panelFull ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-20 opacity-0"
         }`}
-        title="bring the chat back"
+        title={speaking ? "interrupt Jarvis" : "bring the chat back"}
       >
-        <span className={`h-1.5 w-1.5 rounded-full ${live === "live" ? "bg-cyan animate-pulse" : wake ? "bg-cyan breathe" : "bg-slate"}`} />
-        {live === "live" ? "live" : wake ? "listening — say “hey jarvis”" : "tap to chat"}
+        <span className={`h-1.5 w-1.5 rounded-full ${speaking ? "bg-red-300 animate-pulse" : live === "live" ? "bg-cyan animate-pulse" : wake ? "bg-cyan breathe" : "bg-slate"}`} />
+        {speaking ? "hush" : live === "live" ? "live" : wake ? "listening — say “hey jarvis”" : "tap to chat"}
       </button>
 
       {/* full-screen viewport — keeps a floating composer so Daniel can still talk */}
