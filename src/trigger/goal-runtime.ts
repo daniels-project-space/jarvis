@@ -189,6 +189,77 @@ export type GoalCoordinatorReceipt = {
   wakeReason?: string;
 };
 
+type CoordinatorCounts = {
+  checked?: number;
+  applied?: number;
+  updated?: number;
+  blocked?: number;
+  error?: unknown;
+};
+
+const HARNESS_WORKFLOW = "https://github.com/daniels-project-space/jarvis/actions/workflows/jarvis-agent-harness.yml";
+
+function coordinatorError(value: unknown): string | undefined {
+  return value ? String(value).slice(0, 1000) : undefined;
+}
+
+export function goalCoordinatorDeploymentVersion(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  return String(
+    env.TRIGGER_DEPLOYMENT_VERSION
+      ?? env.TRIGGER_VERSION
+      ?? env.VERCEL_GIT_COMMIT_SHA
+      ?? env.GITHUB_SHA
+      ?? "unversioned",
+  ).slice(0, 160);
+}
+
+// Build an exact Convex payload instead of forwarding provider result objects.
+// Trigger's external snapshot also contains `wake`; Convex object validators
+// reject undeclared fields, so forwarding it would silently lose every receipt.
+export function createGoalCoordinatorReceipt(input: {
+  deploymentVersion: string;
+  demand: { needed?: boolean; reasons?: unknown[]; error?: unknown };
+  controls: CoordinatorCounts;
+  revisions: CoordinatorCounts;
+  external: CoordinatorCounts & { wake?: boolean };
+  shouldWake: boolean;
+  woken: boolean;
+}): GoalCoordinatorReceipt {
+  return {
+    deploymentVersion: input.deploymentVersion,
+    demand: {
+      needed: input.demand.needed === true,
+      reasons: Array.isArray(input.demand.reasons) ? input.demand.reasons.map(String).slice(0, 12) : [],
+      error: coordinatorError(input.demand.error),
+    },
+    controls: {
+      checked: Number(input.controls.checked ?? 0),
+      applied: Number(input.controls.applied ?? 0),
+      blocked: Number(input.controls.blocked ?? 0),
+      error: coordinatorError(input.controls.error),
+    },
+    revisions: {
+      checked: Number(input.revisions.checked ?? 0),
+      applied: Number(input.revisions.applied ?? 0),
+      blocked: Number(input.revisions.blocked ?? 0),
+      error: coordinatorError(input.revisions.error),
+    },
+    external: {
+      checked: Number(input.external.checked ?? 0),
+      updated: Number(input.external.updated ?? 0),
+      blocked: Number(input.external.blocked ?? 0),
+      error: coordinatorError(input.external.error),
+    },
+    wakeRequested: input.shouldWake,
+    wakeResult: input.shouldWake ? (input.woken ? "dispatched" : "not_dispatched") : "not_requested",
+    wakeWorkflow: input.shouldWake ? HARNESS_WORKFLOW : undefined,
+    wakeRef: input.shouldWake ? "main" : undefined,
+    wakeReason: input.shouldWake ? "goal-coordinator" : undefined,
+  };
+}
+
 // This is an observation-only write. Goal control, the two durable outboxes,
 // and the GitHub wake all complete before a receipt is recorded.
 export async function recordGoalCoordinatorReceipt(receipt: GoalCoordinatorReceipt) {

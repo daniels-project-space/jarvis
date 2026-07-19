@@ -215,4 +215,32 @@ describe("Goal Mode external runtime", () => {
     })).resolves.toEqual({ id: "receipt-1" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it("builds an exact receipt payload with Trigger's real deployment version", async () => {
+    const { createGoalCoordinatorReceipt, goalCoordinatorDeploymentVersion } = await import("./goal-runtime");
+    const deploymentVersion = goalCoordinatorDeploymentVersion({
+      TRIGGER_DEPLOYMENT_VERSION: "20260719.5",
+      TRIGGER_VERSION: "legacy-version",
+      GITHUB_SHA: "fallback-sha",
+    });
+    const receipt = createGoalCoordinatorReceipt({
+      deploymentVersion,
+      demand: { needed: true, reasons: ["runnable goal work"] },
+      controls: { checked: 2, applied: 1, blocked: 0 },
+      revisions: { checked: 1, applied: 0, blocked: 0 },
+      external: { checked: 3, updated: 1, blocked: 0, wake: true },
+      shouldWake: true,
+      woken: true,
+    });
+
+    expect(deploymentVersion).toBe("20260719.5");
+    expect(receipt.external).toEqual({ checked: 3, updated: 1, blocked: 0, error: undefined });
+    expect(receipt.external).not.toHaveProperty("wake");
+    expect(receipt).toMatchObject({
+      wakeRequested: true,
+      wakeResult: "dispatched",
+      wakeRef: "main",
+      wakeReason: "goal-coordinator",
+    });
+  });
 });

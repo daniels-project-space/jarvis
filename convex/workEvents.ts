@@ -52,11 +52,13 @@ export const forMission = query({
     const rows = await ctx.db
       .query("workEvents")
       .withIndex("by_mission", (q: any) => q.eq("missionId", a.missionId))
-      .order("asc")
+      .order("desc")
       .take(Math.min(Math.max(a.limit ?? 80, 1), 200));
     // Do not expose arbitrary event payloads to the panel. The durable event
     // fields are enough to audit stage changes, including pause and resume.
-    return rows.map((event: any) => ({
+    // Fetch the newest bounded slice, then restore chronological display order
+    // so a multi-day mission cannot hide its latest pause behind old events.
+    return rows.reverse().map((event: any) => ({
       _id: event._id,
       jobId: event.jobId ?? null,
       agentId: event.agentId ?? null,
