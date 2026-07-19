@@ -290,13 +290,92 @@ function activeStageJobs(jobs: any[], mission: any) {
   return jobs.filter((job) => job.goalStage === stage && Number(job.goalWave ?? 0) === wave);
 }
 
-async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
+async function validatorAuditSnapshot(ctx: any, mission: any, jobs: any[]): Promise<string> {
+  const capturedAt = Date.now();
+  const [eventRows, receipt] = await Promise.all([
+    ctx.db
+      .query("workEvents")
+      .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
+      .order("desc")
+      .take(200),
+    ctx.db.query("goalCoordinatorReceipts").withIndex("by_createdAt").order("desc").first(),
+  ]);
+  const pauseResumeEvents = eventRows
+    .filter((event: any) => event.type === "pause" || event.type === "resume")
+    .slice(0, 20)
+    .reverse()
+    .map((event: any) => ({
+      id: String(event._id),
+      type: event.type,
+      message: event.message,
+      stage: event.stage ?? null,
+      percent: event.percent ?? null,
+      createdAt: event.createdAt,
+    }));
+  const coordinator = receipt
+    ? {
+        id: String(receipt._id),
+        createdAt: receipt.createdAt,
+        ageMs: Math.max(0, capturedAt - receipt.createdAt),
+        fresh: capturedAt - receipt.createdAt < COORDINATOR_RECEIPT_FRESH_MS,
+        deploymentVersion: receipt.deploymentVersion,
+        demandNeeded: receipt.demandNeeded,
+        demandReasons: receipt.demandReasons,
+        controls: {
+          checked: receipt.controlsChecked,
+          applied: receipt.controlsApplied,
+          blocked: receipt.controlsBlocked,
+        },
+        revisions: {
+          checked: receipt.revisionsChecked,
+          applied: receipt.revisionsApplied,
+          blocked: receipt.revisionsBlocked,
+        },
+        external: {
+          checked: receipt.externalChecked,
+          updated: receipt.externalUpdated,
+          blocked: receipt.externalBlocked,
+        },
+        wakeRequested: receipt.wakeRequested,
+        wakeResult: receipt.wakeResult,
+        wakeWorkflow: receipt.wakeWorkflow ?? null,
+        wakeRef: receipt.wakeRef ?? null,
+        wakeReason: receipt.wakeReason ?? null,
+      }
+    : null;
+  return JSON.stringify({
+    authority: "Convex server-side Goal Mode snapshot",
+    capturedAt,
+    mission: {
+      id: String(mission._id),
+      status: mission.status,
+      phase: mission.phase,
+      nextPhase: "validating",
+      percent: mission.percent ?? 0,
+      route: mission.route ?? null,
+      primaryRepo: mission.primaryRepo ?? null,
+      revisionWave: Number(mission.revisionWave ?? 0),
+      pausedPhase: mission.pausedPhase ?? null,
+    },
+    jobs: jobs.map((job: any) => ({
+      id: String(job._id),
+      label: job.label ?? job.task?.slice(0, 80) ?? "Goal session",
+      status: job.status,
+      stage: job.stage ?? job.status,
+      attempt: Number(job.attempt ?? 1),
+      readonly: Boolean(job.readonly),
+      dependsOn: job.dependsOn ?? [],
+      goalStage: job.goalStage ?? null,
+      goalWave: Number(job.goalWave ?? 0),
+      verificationVerdict: job.verificationVerdict ?? null,
+    })),
+    pauseResumeEvents,
+    coordinator,
+  });
+}
+
+async function validatorTaskForMission(ctx: any, mission: any, jobs: any[]): Promise<string> {
   const plan = mission.plan as GoalPlan;
-  // App Factory owns its own repository/build lifecycle. Its final Sol session
-  // validates the external run and must not be pointed at a made-up Jarvis branch.
-  const branch = mission.externalRunId
-    ? undefined
-    : mission.sharedBranch || missionBranch(mission, mission.primaryRepo);
   const buildEvidence = jobs
     .filter((job) => job.goalStage === "building" || job.goalStage === "refining")
     .map((job) => ({
@@ -304,12 +383,13 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
       status: job.status,
       result: String(job.result ?? job.progress ?? "").slice(0, 2_000),
     }));
-  const task = validatorTask({
+  return validatorTask({
     goal: mission.goal,
     plan,
     acceptanceCriteria: mission.acceptanceCriteria ?? [],
     buildEvidence,
     revisionWave: Number(mission.revisionWave ?? 0),
+    auditSnapshot: await validatorAuditSnapshot(ctx, mission, jobs),
     externalContext: mission.externalRunId
       ? [
           `App Factory run ${mission.externalRunId}${mission.externalSlug ? ` (${mission.externalSlug})` : ""}.`,
@@ -321,6 +401,16 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
         ].join(" ")
       : undefined,
   });
+}
+
+async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
+  const plan = mission.plan as GoalPlan;
+  // App Factory owns its own repository/build lifecycle. Its final Sol session
+  // validates the external run and must not be pointed at a made-up Jarvis branch.
+  const branch = mission.externalRunId
+    ? undefined
+    : mission.sharedBranch || missionBranch(mission, mission.primaryRepo);
+  const task = await validatorTaskForMission(ctx, mission, jobs);
   const validatorJobId = await insertGoalJob(ctx, {
     task,
     missionId: String(mission._id),
@@ -1415,7 +1505,13 @@ export const control = mutation({
         const phase = String(mission.pausedPhase);
         const jobId = phase === "planning" ? mission.planningJobId : mission.validatorJobId;
         const job = jobs.find((candidate) => String(candidate._id) === jobId);
-        if (!job || !(await resetGoalJob(ctx, job, now, true))) return false;
+        if (!job) return false;
+        if (phase === "validating") {
+          await ctx.db.patch(job._id, {
+            task: await validatorTaskForMission(ctx, mission, jobs),
+          });
+        }
+        if (!(await resetGoalJob(ctx, job, now, true))) return false;
         await ctx.db.patch(args.id, {
           status: "running",
           phase,

@@ -448,6 +448,7 @@ export function validatorTask(args: {
   buildEvidence: Array<{ label: string; status: string; result: string }>;
   revisionWave: number;
   externalContext?: string;
+  auditSnapshot?: string;
 }): string {
   const evidence = args.buildEvidence
     .map((item) => `### ${item.label} [${item.status}]\n${item.result.slice(0, 1_500)}`)
@@ -463,6 +464,13 @@ export function validatorTask(args: {
     args.plan.validation.tests.length ? `Required tests:\n${args.plan.validation.tests.map((item) => `- ${item}`).join("\n")}` : "",
     args.plan.validation.liveChecks.length ? `Required live/provider checks:\n${args.plan.validation.liveChecks.map((item) => `- ${item}`).join("\n")}` : "",
     `Builder evidence:\n${evidence}`,
+    args.auditSnapshot
+      ? [
+          "Delivery-controller audit snapshot (captured server-side when this validator was queued):",
+          args.auditSnapshot.slice(0, 8_000),
+          "Treat this as the scoped read evidence for protected Convex state. Do not mint a viewer session or weaken authentication merely to re-fetch it. An otherwise consistent protected history being unavailable inside the sandbox is not, by itself, a blocker; verify the snapshot against source, tests, and public provider evidence.",
+        ].join("\n")
+      : "",
     "Inspect the actual branch and current code. Run proportionate deep tests, typecheck/build, end-to-end or browser checks, and exact provider/deployment checks where the goal requires them. A command exit code alone is not proof. Do not deploy, merge, publish, spend, message or perform destructive actions. If a gap is fixable in the existing scope, return refine with 1-3 precise Terra repair sessions. Use blocked only for a genuine Daniel/external decision. Use pass only when the outcome—not merely each task—is evidenced.",
     "End with exactly one compact JSON object after GOAL_VALIDATION_JSON: using:",
     '{"verdict":"pass|refine|blocked","summary":"...","evidence":["exact check/result"],"gaps":["..."],"refinements":[{"id":"...","label":"...","task":"self-contained repair","acceptanceCriteria":["..."]}],"blocker":"only when blocked"}',

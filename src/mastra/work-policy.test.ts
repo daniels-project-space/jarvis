@@ -69,6 +69,12 @@ describe("server-side work approval policy", () => {
   });
 
   it("does not mistake a no-POST evidence boundary for a POST request", () => {
+    const auditSnapshot = JSON.stringify({
+      authority: "Convex server-side Goal Mode snapshot",
+      capturedAt: 1_725_000_000_000,
+      mission: { status: "needs_input", pausedPhase: "validating" },
+      coordinator: { deploymentVersion: "20260719.6", fresh: true, wakeResult: "dispatched" },
+    });
     const task = validatorTask({
       goal: "Produce a strictly read-only production audit.",
       plan: {
@@ -85,7 +91,11 @@ describe("server-side work approval policy", () => {
         result: "Production-state proof is incomplete under the no-POST boundary.",
       }],
       revisionWave: 0,
+      auditSnapshot,
     });
+    expect(task).toContain("Delivery-controller audit snapshot");
+    expect(task).toContain(auditSnapshot);
+    expect(task).toContain("unavailable inside the sandbox is not, by itself, a blocker");
     expect(workApprovalPolicy({ task, readonly: true, risk: "low" }).required).toBe(false);
   });
 
