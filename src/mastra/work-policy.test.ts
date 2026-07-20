@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { goalWorkApprovalPolicy, workApprovalPolicy } from "../../convex/workPolicy";
 import { plannerTask, routeGoal, validatorTask } from "../lib/goal-mode";
-import { SAFE_SANDBOX_EXECUTION_RULES } from "../lib/work-safety";
+import { classifyWorkSafety, SAFE_SANDBOX_EXECUTION_RULES } from "../lib/work-safety";
 
 describe("server-side work approval policy", () => {
   it("keeps explicitly requested zero-effect sandbox validation autonomous", () => {
@@ -108,6 +108,84 @@ describe("server-side work approval policy", () => {
       workApprovalPolicy({
         task: "Wire the Shopify order/fulfillment pipeline and make its webhook idempotent",
         repo: "daniels-project-space/dropship-ai",
+      }),
+    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+  });
+
+  it("treats a controller review prompt sent through standard input as local transport", () => {
+    for (const task of [
+      "Send the delivery-controller review prompt through standard input instead of argv.",
+      "Use standard input to send the delivery-controller review prompt instead of using argv.",
+    ]) {
+      expect(classifyWorkSafety(task, { repo: "jarvis" })).toEqual({
+        approvalRequired: false,
+        boundary: "internal",
+      });
+      expect(workApprovalPolicy({ task, repo: "jarvis", risk: "high" })).toMatchObject({
+        required: false,
+        deliveryMode: "auto_merge",
+      });
+    }
+
+    for (const outreach of [
+      "Send the delivery-controller review prompt to the maintainer.",
+      "Send the delivery-controller review prompt through stdin to the reviewer.",
+      "Send the maintainer the delivery-controller review prompt through stdin.",
+      "Send the delivery-controller review prompt through stdin to Alice.",
+      "Send Alice the delivery-controller review prompt through stdin.",
+    ]) {
+      expect(workApprovalPolicy({ task: outreach, repo: "jarvis" }).required).toBe(true);
+    }
+  });
+
+  it("treats post-index as a technical prefix without waiving public posting", () => {
+    for (const task of [
+      "Add a post-index filter to the repository scanner.",
+      "Add a post-index-stage filter to the repository scanner.",
+    ]) {
+      expect(classifyWorkSafety(task, { repo: "jarvis" })).toEqual({
+        approvalRequired: false,
+        boundary: "internal",
+      });
+      expect(workApprovalPolicy({ task, repo: "jarvis", risk: "high" })).toMatchObject({
+        required: false,
+        deliveryMode: "auto_merge",
+      });
+    }
+    expect(
+      workApprovalPolicy({
+        task: "Post the index-stage findings publicly.",
+        repo: "jarvis",
+      }).required,
+    ).toBe(true);
+  });
+
+  it("keeps mixed technical clauses gated and explicit prohibitions autonomous", () => {
+    for (const mixed of [
+      "Send the delivery-controller review prompt through stdin and message the maintainer.",
+      "Add a post-index filter and post the index-stage findings publicly.",
+      "Send the delivery-controller review prompt through stdin and pay the supplier.",
+      "Add a post-index filter and rotate a key.",
+      "Send the delivery-controller review prompt through stdin and delete production records.",
+      "Add a post-index filter and publish the findings publicly.",
+    ]) {
+      expect(workApprovalPolicy({ task: mixed, repo: "jarvis" }).required).toBe(true);
+    }
+    expect(
+      workApprovalPolicy({
+        task: "Send the delivery-controller review prompt through stdin and deploy the live provider change.",
+      }).required,
+    ).toBe(true);
+    expect(
+      workApprovalPolicy({
+        task: "Do not send the delivery-controller review prompt to the reviewer. Send the delivery-controller review prompt through stdin only.",
+        repo: "jarvis",
+      }),
+    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    expect(
+      workApprovalPolicy({
+        task: "Do not post the index-stage findings publicly. Add only the post-index filter.",
+        repo: "jarvis",
       }),
     ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
   });
