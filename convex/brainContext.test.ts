@@ -4,12 +4,14 @@ import { snapshot } from "./brainContext";
 import {
   BRAIN_CONTEXT_KEY,
   BRAIN_CONTEXT_VERSION,
+  BRAIN_ACTIVE_INDEX_VERSION,
   CONTEXT_SOURCES,
   MAX_MEMORY_MATCHES,
   MAX_PROJECTION_PAYLOAD_BYTES,
   emptyBrainContext,
   estimateJsonBytes,
   fitBrainContextPayload,
+  materiallyDifferentMission,
   materiallyDifferentWork,
   projectMemoryRow,
 } from "./brainContextModel";
@@ -42,6 +44,7 @@ type Read = {
   table: string;
   index?: string;
   search?: string;
+  searchTerm?: string;
   limit?: number;
   documents: number;
   bytes: number;
@@ -74,8 +77,9 @@ function queryContext(options?: { projection?: any; refresh?: any; matches?: any
           withSearchIndex(index: string, apply: (q: any) => unknown) {
             read.index = index;
             apply({
-              search(field: string) {
+              search(field: string, term: string) {
                 read.search = field;
+                read.searchTerm = term;
                 return {};
               },
             });
@@ -125,6 +129,8 @@ describe("brainContext compact foreground contract", () => {
       lastCompletedAt: payload.generatedAt,
       memoryComplete: true,
       memoryVersion: 1,
+      activeIndexVersion: BRAIN_ACTIVE_INDEX_VERSION,
+      activeIndexComplete: true,
       updatedAt: payload.generatedAt,
     };
     const matches = Array.from({ length: MAX_MEMORY_MATCHES }, (_, index) => projectMemoryRow({
@@ -147,6 +153,13 @@ describe("brainContext compact foreground contract", () => {
     ]);
     expect(reads.reduce((sum, read) => sum + read.documents, 0)).toBe(2 + MAX_MEMORY_MATCHES);
     expect(reads.reduce((sum, read) => sum + read.bytes, 0)).toBeLessThan(42_000);
+    expect(reads[2]).toMatchObject({
+      table: "brainMemory",
+      index: "search_text",
+      search: "searchText",
+      searchTerm: "What is the latest reliability context?",
+      limit: MAX_MEMORY_MATCHES,
+    });
     expect(result.memory[0]).toMatchObject({ id: "memory-0", title: expect.stringContaining("Relevant memory") });
     expect(result.projects[0].slug).toBe("jarvis");
     expect(result.attention[0].title).toBe("Validate rollout");
@@ -211,8 +224,34 @@ describe("brain context projection bounds", () => {
     for (const key of ["memory", "projects", "goals", "jobs", "attention", "creations"] as const) {
       expect(fitted[key].length, key).toBeGreaterThan(0);
     }
+    for (const key of ["business", "goalMissions", "findings", "agents", "approvals"] as const) {
+      expect(fitted[key].length, key).toBeGreaterThan(0);
+    }
     expect(fitted.trip).not.toBeNull();
+    expect(fitted.draft).not.toBeNull();
+    expect(fitted.location).not.toBeNull();
+    expect(fitted.panel).not.toBeNull();
     expect(fitted.sources.memory?.provenance[0]).toContain("memory");
+  });
+
+  it("indexes bounded title, tag and body terms for lexical foreground relevance", () => {
+    const projected = projectMemoryRow({
+      _id: "memory-lexical",
+      kind: "reliability",
+      title: `Refresh lease ${"t".repeat(300)}`,
+      tags: ["scheduler-fence", "context-projection", ...Array.from({ length: 20 }, () => "overflow")],
+      body: `A lost refresh lease is recovered from its checkpoint. ${"b".repeat(2_000)}`,
+      createdAt: 10,
+      updatedAt: 20,
+    });
+
+    expect(projected.title.length).toBeLessThanOrEqual(120);
+    expect(projected.body.length).toBeLessThanOrEqual(700);
+    expect(projected.tags).toHaveLength(8);
+    expect(projected.searchText.length).toBeLessThanOrEqual(1_000);
+    expect(projected.searchText).toContain("Refresh lease");
+    expect(projected.searchText).toContain("scheduler-fence");
+    expect(projected.searchText).toContain("lost refresh lease");
   });
 
   it("does not refresh work for heartbeat-only churn", () => {
@@ -222,5 +261,22 @@ describe("brain context projection bounds", () => {
     expect(materiallyDifferentWork(previous, { ...previous, percent: 50 })).toBe(true);
     expect(materiallyDifferentWork(previous, { ...previous, stage: "provider validation" })).toBe(true);
     expect(materiallyDifferentWork(previous, { ...previous, status: "done" })).toBe(true);
+  });
+
+  it("refreshes mission membership, rank and visible route without reacting to timestamp churn", () => {
+    const previous = {
+      mode: "goal",
+      status: "running",
+      phase: "building",
+      goal: "Ship reliable context",
+      priority: 50,
+      route: "team",
+      percent: 42,
+      updatedAt: 100,
+    };
+    expect(materiallyDifferentMission(previous, { ...previous, updatedAt: 200 })).toBe(false);
+    expect(materiallyDifferentMission(previous, { ...previous, priority: 90 })).toBe(true);
+    expect(materiallyDifferentMission(previous, { ...previous, route: "app-factory" })).toBe(true);
+    expect(materiallyDifferentMission(previous, { ...previous, mode: "fleet" })).toBe(true);
   });
 });

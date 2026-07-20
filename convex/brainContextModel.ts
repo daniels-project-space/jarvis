@@ -594,8 +594,22 @@ export function materiallyDifferentWork(previous: any | null, next: any): boolea
 
 export function materiallyDifferentMission(previous: any | null, next: any): boolean {
   if (!previous) return isActiveGoalMission(next);
-  if (!isActiveGoalMission(previous) && !isActiveGoalMission(next)) return false;
-  for (const field of ["status", "phase", "goal", "failureReason", "externalStatus", "externalStage", "revisionWave"]) {
+  const previousActive = isActiveGoalMission(previous);
+  const nextActive = isActiveGoalMission(next);
+  if (previousActive !== nextActive) return true;
+  if (!nextActive) return false;
+  for (const field of [
+    "mode",
+    "status",
+    "phase",
+    "goal",
+    "priority",
+    "route",
+    "failureReason",
+    "externalStatus",
+    "externalStage",
+    "revisionWave",
+  ]) {
     if (previous?.[field] !== next?.[field]) return true;
   }
   return percentBucket(previous?.percent) !== percentBucket(next?.percent);

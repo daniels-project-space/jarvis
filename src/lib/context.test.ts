@@ -39,7 +39,7 @@ function compactSnapshot() {
     generatedAt: at + 2_000,
     projection: {
       state: "fresh",
-      version: 1,
+      version: 2,
       generatedAt: at + 2_000,
       payloadBytes: 12_345,
       memoryIndexComplete: true,
@@ -76,7 +76,7 @@ describe("buildContext compact projection integration", () => {
     const block = await buildContext("How is the Jarvis context repair going?");
 
     expect(block.length).toBeLessThanOrEqual(12_000);
-    expect(block).toContain("CONTEXT READ MODEL: fresh projection v1");
+    expect(block).toContain("CONTEXT READ MODEL: fresh projection v2");
     expect(block).toContain("Long-term memory (brainMemory.bounded_index; source updated");
     expect(block).toContain("PROJECT INTELLIGENCE");
     expect(block).toContain("RANKED ATTENTION");

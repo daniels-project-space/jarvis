@@ -358,7 +358,10 @@ export const remove = mutation({
   args: { id: v.id("creations"), ...actorAuthArgs },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
+    const row = await ctx.db.get(a.id);
+    if (!row) return false;
     await ctx.db.delete(a.id);
     await requestContextRefresh(ctx, ["artifacts"]);
+    return true;
   },
 });

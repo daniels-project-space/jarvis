@@ -332,9 +332,16 @@ describe("active rank-index migration", () => {
         .filter((row) => row.source === source)
         .sort((left, right) => right.rank - left.rank || right.tieBreakAt - left.tieBreakAt)
         .slice(0, ACTIVE_CONTEXT_LIMITS[source]);
-      expect(ranked[0].sourceId).toBe(
-        source === "job" || source === "mission" ? `${source}-0` : `${source}-row-0`,
-      );
+      const id = (index: number) => source === "job" || source === "mission"
+        ? `${source}-${index}`
+        : `${source}-row-${index}`;
+      expect(ranked.map((row) => row.sourceId)).toEqual([
+        id(0),
+        ...Array.from(
+          { length: ACTIVE_CONTEXT_LIMITS[source] - 1 },
+          (_, index) => id(39 - index),
+        ),
+      ]);
     }
   });
 });
