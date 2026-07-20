@@ -481,8 +481,7 @@ type AgentHarnessOptions = {
 // containers. This keeps reminders, recovery and incident dispatch alive even
 // when no Codex job happens to be running.
 export async function runAgentMaintenance() {
-  await convexMutation("jobs:reconcileGoalWorkstreamModes", {}).catch(() => 0);
-  await convexMutation("jobs:reconcileAutonomousSoftwareWork", {}).catch(() => 0);
+  await convexMutation("jobs:migrateControlPlane", {}).catch(() => null);
   let recovered = 0;
   let abandoned = 0;
   let repairs = 0;
@@ -966,7 +965,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               jobId: job.jobId,
               expectedAttempt,
               progress: line,
-              log,
               stage,
               percent,
             }))

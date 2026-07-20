@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { patchJobWithRuntime } from "./controlPlane";
 
 export const pending = query({
   args: { ...viewerAuthArgs },
@@ -26,7 +27,7 @@ export const decide = mutation({
     const approvals = await ctx.db
       .query("approvals")
       .withIndex("by_job", (q: any) => q.eq("jobId", a.jobId))
-      .collect();
+      .take(20);
     const approval = approvals.find((row) => row.status === "pending");
     const jobId = ctx.db.normalizeId("jobs", a.jobId);
     const job = jobId ? await ctx.db.get(jobId) : null;
@@ -35,7 +36,7 @@ export const decide = mutation({
     const mission = missionId ? await ctx.db.get(missionId) : null;
     const heldByGoal = mission?.mode === "goal" && mission.status !== "running";
     await ctx.db.patch(approval._id, { status: a.decision, resolvedAt: Date.now() });
-    await ctx.db.patch(jobId, {
+    await patchJobWithRuntime(ctx, job, {
       approvalStatus: a.decision,
       status: a.decision === "approved" ? (heldByGoal ? "paused" : "pending") : "cancelled",
       completedAt: a.decision === "declined" ? Date.now() : undefined,

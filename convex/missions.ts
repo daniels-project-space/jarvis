@@ -2,6 +2,7 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { normalizeWorkModelTier } from "../src/lib/work-models";
+import { insertMissionWithRuntime, patchMissionWithRuntime, runtimeMission } from "./controlPlane";
 
 const SYNTHESIS_LEASE_MS = 20 * 60 * 1000;
 
@@ -16,6 +17,31 @@ function synthesisPayload(mission: any, jobs: any[], attempt: number) {
       status: job.status,
       result: (job.result ?? "").slice(0, 6000),
     })),
+  };
+}
+
+function missionJobActivity(job: any) {
+  return {
+    _id: job.jobId,
+    label: job.label ?? job.task.slice(0, 50),
+    status: job.status,
+    progress: job.progress ?? "",
+    stage: job.stage ?? job.status,
+    percent: job.percent ?? 0,
+    agentId: job.agentId ?? null,
+    attempt: job.attempt ?? 1,
+    model: job.model ? normalizeWorkModelTier(job.model) : null,
+    reasoningEffort: job.reasoningEffort ?? null,
+    goalStage: job.goalStage ?? null,
+    goalWorkstreamId: job.goalWorkstreamId ?? null,
+    goalWave: job.goalWave ?? 0,
+    readonly: Boolean(job.readonly),
+    dependsOn: job.dependsOn ?? [],
+    branch: job.branch ?? null,
+    pullRequestUrl: job.pullRequestUrl ?? null,
+    verificationNote: null,
+    workerRunId: job.workerRunId ?? null,
+    workerRuntime: job.workerRuntime ?? null,
   };
 }
 
@@ -40,7 +66,7 @@ export const create = mutation({
   handler: async (ctx, a) => {
     await requireDispatcher(ctx, a);
     const { authTokenHash: _authTokenHash, dispatchToken: _dispatchToken, workerToken: _workerToken, ...mission } = a;
-    return await ctx.db.insert("missions", {
+    return await insertMissionWithRuntime(ctx, {
       goal: mission.goal.slice(0, 500),
       mode: "fleet",
       status: "running",
@@ -69,50 +95,56 @@ export const get = query({
 // Missions still in flight plus recent history. Finished missions remain useful
 // context for the command centre; do not make them disappear after ten minutes.
 export const active = query({
-  args: { ...viewerAuthArgs },
+  args: { includeJobs: v.optional(v.boolean()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
     // Goal Mode can live for days. Indexed status reads keep it visible without
     // repeatedly scanning a large mission history on every reactive UI update.
     const [recent, ...openGroups] = await Promise.all([
-      ctx.db.query("missions").withIndex("by_createdAt").order("desc").take(20),
+      ctx.db.query("missionRuntime").withIndex("by_createdAt").order("desc").take(20),
       ...["running", "synthesizing", "paused", "needs_input"].map((status) =>
-        ctx.db.query("missions").withIndex("by_status", (q: any) => q.eq("status", status)).order("desc").take(20),
+        ctx.db.query("missionRuntime").withIndex("by_status", (q: any) => q.eq("status", status)).order("desc").take(20),
       ),
     ]);
     const rows = [...openGroups.flat(), ...recent]
-      .filter((mission: any, index: number, all: any[]) => all.findIndex((candidate: any) => candidate._id === mission._id) === index)
+      .filter((mission: any, index: number, all: any[]) => all.findIndex((candidate: any) => candidate.missionId === mission.missionId) === index)
       .sort((left: any, right: any) => right.createdAt - left.createdAt);
     const live = rows.filter(
       (m: any) => ["running", "synthesizing", "paused", "needs_input"].includes(m.status) || Date.now() - m.updatedAt < 14 * 86_400_000,
     );
     const out = [];
     for (const m of live) {
-      const jobs = await ctx.db
-        .query("jobs")
-        .withIndex("by_mission", (q: any) => q.eq("missionId", m._id))
-        .collect();
+      // Human/model status summaries may opt into child rows for a one-shot
+      // read. The reactive fleet list stays mission-only so one heartbeat does
+      // not fan out across every historical mission's children.
+      const jobs = a.includeJobs
+        ? await ctx.db
+            .query("jobRuntime")
+            .withIndex("by_mission", (q: any) => q.eq("missionId", String(m.missionId)))
+            .take(100)
+        : [];
       out.push({
-        _id: m._id,
+        ...runtimeMission(m),
+        _id: m.missionId,
         goal: m.goal,
         mode: m.mode ?? "fleet",
         status: m.status,
         agentCount: m.agentCount,
-        summary: m.summary ?? null,
+        summary: null,
         originThreadId: m.originThreadId ?? "main",
         managerAgentId: m.managerAgentId ?? "jarvis",
         phase: m.phase ?? m.status,
         percent: m.percent ?? 0,
         route: m.route ?? null,
-        routeReason: m.routeReason ?? null,
+        routeReason: null,
         primaryRepo: m.primaryRepo ?? null,
-        plan: m.plan ?? null,
-        validation: m.validation ?? null,
-        validationHistory: m.validationHistory ?? [],
+        plan: null,
+        validation: null,
+        validationHistory: [],
         revisionWave: m.revisionWave ?? 0,
         maxRevisionWaves: m.maxRevisionWaves ?? 0,
         maxBuildSessions: m.maxBuildSessions ?? 0,
-        sharedBranch: m.sharedBranch ?? null,
+        sharedBranch: null,
         pausedPhase: m.pausedPhase ?? null,
         externalKind: m.externalKind ?? null,
         externalRunId: m.externalRunId ?? null,
@@ -121,40 +153,28 @@ export const active = query({
         externalStage: m.externalStage ?? null,
         externalPollFailures: m.externalPollFailures ?? 0,
         externalRevisionRequested: m.externalRevisionRequested ?? null,
-        canExtendExternal: Boolean(
-          m.externalKind === "app-factory" &&
-          m.validation?.verdict === "refine" &&
-          Array.isArray(m.pendingRefinements) &&
-          m.pendingRefinements.length > 0,
-        ),
+        canExtendExternal: false,
         failureReason: m.failureReason ?? null,
         completedAt: m.completedAt ?? null,
         updatedAt: m.updatedAt,
-        jobs: jobs.map((j: any) => ({
-          _id: j._id,
-          label: j.label ?? j.task.slice(0, 50),
-          status: j.status,
-          progress: j.progress ?? "",
-          stage: j.stage ?? j.status,
-          percent: j.percent ?? 0,
-          agentId: j.agentId ?? null,
-          attempt: j.attempt ?? 1,
-          model: j.model ? normalizeWorkModelTier(j.model) : null,
-          reasoningEffort: j.reasoningEffort ?? null,
-          goalStage: j.goalStage ?? null,
-          goalWorkstreamId: j.goalWorkstreamId ?? null,
-          goalWave: j.goalWave ?? 0,
-          readonly: Boolean(j.readonly),
-          dependsOn: j.dependsOn ?? [],
-          branch: j.branch ?? null,
-          pullRequestUrl: j.pullRequestUrl ?? null,
-          verificationNote: j.verificationNote ?? null,
-          workerRunId: j.workerRunId ?? null,
-          workerRuntime: j.workerRuntime ?? null,
-        })),
+        jobs: jobs.map(missionJobActivity),
       });
     }
     return out;
+  },
+});
+
+// The fleet panel subscribes only to the selected mission's compact children.
+// This is the live detail surface; rich plans and reports remain in get().
+export const activity = query({
+  args: { id: v.id("missions"), ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    const jobs = await ctx.db
+      .query("jobRuntime")
+      .withIndex("by_mission", (q: any) => q.eq("missionId", String(a.id)))
+      .take(100);
+    return jobs.map(missionJobActivity);
   },
 });
 
@@ -169,13 +189,13 @@ export const checkComplete = mutation({
     const jobs = await ctx.db
       .query("jobs")
       .withIndex("by_mission", (q: any) => q.eq("missionId", a.id))
-      .collect();
+      .take(100);
     if (jobs.length === 0) return null;
     const unfinished = jobs.filter((j: any) => !["done", "error", "cancelled"].includes(j.status));
     if (unfinished.length > 0) return null;
     const now = Date.now();
     const synthesisAttempt = (m.synthesisAttempt ?? 0) + 1;
-    await ctx.db.patch(a.id, {
+    await patchMissionWithRuntime(ctx, m, {
       status: "synthesizing",
       phase: "reviewing",
       percent: 90,
@@ -200,19 +220,20 @@ export const claimReady = mutation({
     // report is committed. Reclaim only after the 15-minute synthesizer ceiling
     // plus margin, and increment the lease so a late first writer is rejected.
     const synthesizing = await ctx.db
-      .query("missions")
+      .query("missionRuntime")
       .withIndex("by_status", (q: any) => q.eq("status", "synthesizing"))
       .order("asc")
       .take(30);
-    for (const mission of synthesizing) {
-      if (mission.mode === "goal") continue;
-      if ((mission.synthesisLeaseUntil ?? mission.updatedAt + SYNTHESIS_LEASE_MS) > now) continue;
+    for (const activity of synthesizing) {
+      if (activity.mode === "goal" || activity.updatedAt + SYNTHESIS_LEASE_MS > now) continue;
+      const mission = await ctx.db.get(activity.missionId);
+      if (!mission || mission.status !== "synthesizing" || (mission.synthesisLeaseUntil ?? mission.updatedAt + SYNTHESIS_LEASE_MS) > now) continue;
       const jobs = await ctx.db
         .query("jobs")
-        .withIndex("by_mission", (q: any) => q.eq("missionId", mission._id))
-        .collect();
+        .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
+        .take(100);
       const synthesisAttempt = (mission.synthesisAttempt ?? 0) + 1;
-      await ctx.db.patch(mission._id, {
+      await patchMissionWithRuntime(ctx, mission, {
         synthesisAttempt,
         synthesisLeaseUntil: now + SYNTHESIS_LEASE_MS,
         updatedAt: now,
@@ -220,19 +241,26 @@ export const claimReady = mutation({
       return synthesisPayload(mission, jobs, synthesisAttempt);
     }
     const missions = await ctx.db
-      .query("missions")
+      .query("missionRuntime")
       .withIndex("by_status", (q: any) => q.eq("status", "running"))
       .order("asc")
       .take(30);
-    for (const mission of missions) {
-      if (mission.mode === "goal") continue;
+    for (const activity of missions) {
+      if (activity.mode === "goal") continue;
+      const projectedJobs = await ctx.db
+        .query("jobRuntime")
+        .withIndex("by_mission", (q: any) => q.eq("missionId", String(activity.missionId)))
+        .take(100);
+      if (!projectedJobs.length || projectedJobs.some((job: any) => !["done", "error", "cancelled"].includes(job.status))) continue;
+      const mission = await ctx.db.get(activity.missionId);
+      if (!mission || mission.status !== "running" || mission.mode === "goal") continue;
       const jobs = await ctx.db
         .query("jobs")
-        .withIndex("by_mission", (q: any) => q.eq("missionId", mission._id))
-        .collect();
+        .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
+        .take(100);
       if (!jobs.length || jobs.some((job: any) => !["done", "error", "cancelled"].includes(job.status))) continue;
       const synthesisAttempt = (mission.synthesisAttempt ?? 0) + 1;
-      await ctx.db.patch(mission._id, {
+      await patchMissionWithRuntime(ctx, mission, {
         status: "synthesizing",
         phase: "reviewing",
         percent: 90,
@@ -260,7 +288,7 @@ export const finish = mutation({
     if (!mission || mission.status !== "synthesizing" || (mission.synthesisAttempt ?? 0) !== a.expectedSynthesisAttempt) {
       return false;
     }
-    await ctx.db.patch(a.id, {
+    await patchMissionWithRuntime(ctx, mission, {
       status: a.failed ? "failed" : "done",
       phase: a.failed ? "failed" : "complete",
       percent: 100,

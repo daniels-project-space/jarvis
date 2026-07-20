@@ -3642,7 +3642,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       const [active, recent, missions, team, attention, approvals] = await Promise.all([
         convexQuery("jobs:active", {}),
         convexQuery("findings:recent", { limit: 4 }),
-        convexQuery("missions:active", {}).catch(() => []),
+        convexQuery("missions:active", { includeJobs: true }).catch(() => []),
         convexQuery("agents:list", {}).catch(() => []),
         convexQuery("attention:list", { status: "open", limit: 5 }).catch(() => []),
         convexQuery("approvals:pending", {}).catch(() => []),
