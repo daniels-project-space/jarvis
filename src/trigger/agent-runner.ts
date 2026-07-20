@@ -36,7 +36,11 @@ import {
 } from "../lib/work-verification";
 import { gitDeliveryDisposition, isNonFastForwardPush } from "../lib/git-delivery";
 import { repairPrompt } from "../lib/repair-prompt";
-import { isOwnedRepository, requestsConsequentialAction } from "../lib/work-safety";
+import {
+  isOwnedRepository,
+  requestsConsequentialAction,
+  SAFE_SANDBOX_EXECUTION_RULES,
+} from "../lib/work-safety";
 import {
   mergeVerifiedPullRequest,
   openDeliveryPullRequest,
@@ -190,6 +194,7 @@ async function verifyWork(
     "verdict rules: pass = work matches the task and looks complete; concerns = done but something specific looks wrong/unfinished (say what in note); " +
     "needs_input = the agent stopped on a question or decision. If that question is answerable with common sense or the task's own context, fill answer so the run can continue autonomously; leave answer empty only when Daniel genuinely must decide (money, accounts, personal preferences).\n\n" +
     "If the task explicitly says to stop and name a missing read-access gap, a documented gap is a completed evidence outcome, not a request for Daniel to relax the boundary.\n\n" +
+    `${SAFE_SANDBOX_EXECUTION_RULES}\n\n` +
     `${EVIDENCE_INTEGRITY_RULES}\n\n` +
     `Task: ${task.slice(0, 800)}\n\nCumulative agent evidence:\n${result.slice(0, 8_000)}`;
   const out = await plainPrompt(bin, env, prompt, "terra", 90_000);
@@ -918,7 +923,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const prompt =
           `You are ${profile.name}, JARVIS's permanent ${profile.role}.\n${profile.instructions}\n\n${context}\n\n` +
           `TASK:\n${job.task}\n\nDEFINITION OF DONE:\n${criteria.map((item: string) => `- ${item}`).join("\n")}` +
-          `${checkpoint}${followUp}\n\nBefore finishing, verify the definition of done and explicitly report the evidence. If a consequential action or personal decision is required, stop and ask one precise question.`;
+          `${checkpoint}${followUp}\n\n${SAFE_SANDBOX_EXECUTION_RULES}\n\nBefore finishing, verify the definition of done and explicitly report the evidence. If a consequential action or personal decision is required, stop and ask one precise question.`;
         const model = normalizeWorkModelTier(
           typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task),
         );

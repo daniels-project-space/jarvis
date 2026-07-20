@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { goalWorkApprovalPolicy, workApprovalPolicy } from "../../convex/workPolicy";
 import { plannerTask, routeGoal, validatorTask } from "../lib/goal-mode";
+import { SAFE_SANDBOX_EXECUTION_RULES } from "../lib/work-safety";
 
 describe("server-side work approval policy", () => {
+  it("keeps explicitly requested zero-effect sandbox validation autonomous", () => {
+    expect(SAFE_SANDBOX_EXECUTION_RULES).toContain("already authorized");
+    expect(SAFE_SANDBOX_EXECUTION_RULES).toContain("cannot pay or charge");
+    expect(SAFE_SANDBOX_EXECUTION_RULES).toContain("never authorizes live-effect flags");
+  });
+
   it("lets verified delivery run autonomously inside Daniel's repository", () => {
     expect(
       workApprovalPolicy({
