@@ -1,5 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { isResumeOnlyUntouchedGoalJob } from "../src/lib/goal-job-lifecycle";
 import { workApprovalPolicy } from "./workPolicy";
 import { classifyWorkSafety, isOwnedRepository } from "../src/lib/work-safety";
 import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
@@ -184,6 +185,14 @@ export const reconcileGoalWorkstreamModes = mutation({
         .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
         .collect();
       for (const job of jobs) {
+        if (isResumeOnlyUntouchedGoalJob(job)) {
+          await ctx.db.patch(job._id, {
+            attempt: 1,
+            checkpoint: undefined,
+            progress: "Queued · waiting for dependencies",
+          });
+          repaired += 1;
+        }
         if (job.goalStage !== "building" || !job.goalWorkstreamId) continue;
         const stream = byId.get(String(job.goalWorkstreamId));
         if (!stream) continue;

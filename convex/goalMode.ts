@@ -1,5 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { shouldPauseGoalJob } from "../src/lib/goal-job-lifecycle";
 import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { goalWorkApprovalPolicy } from "./workPolicy";
 import {
@@ -1459,8 +1460,16 @@ export const control = mutation({
       if (mission.externalRunId && mission.externalStatus !== "shipped") externalControl = "pause";
       await ctx.db.patch(args.id, { status: "paused", pausedPhase: mission.phase, phase: "paused", updatedAt: now });
       for (const job of jobs) {
-        if (["pending", "running"].includes(job.status)) {
-          await ctx.db.patch(job._id, { status: "paused", stage: "paused", progress: "Goal Mode paused by Daniel", nextRunAt: undefined });
+        if (shouldPauseGoalJob(job.status)) {
+          await ctx.db.patch(job._id, {
+            status: "paused",
+            stage: "paused",
+            progress: "Goal Mode paused by Daniel",
+            nextRunAt: undefined,
+            dispatchId: undefined,
+            dispatchLeaseUntil: undefined,
+            workerRunId: undefined,
+          });
         }
       }
     } else if (args.action === "resume" && mission.status === "paused") {
