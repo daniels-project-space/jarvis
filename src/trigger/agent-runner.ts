@@ -8,12 +8,11 @@ import { projectProviderBoundary } from "../lib/project-registry";
 import { routeWork } from "../mastra/routing";
 import { TEAM_BY_SLUG, type AgentSlug } from "../mastra/team";
 import {
-  CODEX_REVIEW_WORKING_DIRECTORY,
   codexExecPrefix,
   codexModelFor,
-  codexReviewExecPrefix,
   normalizeReasoningEffort,
 } from "./model-policy";
+import { reviewPrompt } from "./codex-review";
 import { normalizeWorkModelTier } from "../lib/work-models";
 import { githubGitEnv, githubRepoUrl } from "./git-transport";
 import { vaultService } from "../lib/vault-client";
@@ -97,25 +96,6 @@ function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, tier: 
     const p = spawn(bin, promptArgs(prompt, tier), { env, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     const timer = setTimeout(() => { try { p.kill("SIGKILL"); } catch { /* gone */ } resolve(output); }, timeoutMs);
-    p.stdout.on("data", (d) => (output += d.toString()));
-    p.on("close", () => { clearTimeout(timer); resolve(output); });
-    p.on("error", () => { clearTimeout(timer); resolve(""); });
-  });
-}
-
-function reviewPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, timeoutMs: number): Promise<string> {
-  return new Promise((resolve) => {
-    const args = [...codexReviewExecPrefix("terra"), prompt];
-    const p = spawn(bin, args, {
-      cwd: CODEX_REVIEW_WORKING_DIRECTORY,
-      env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let output = "";
-    const timer = setTimeout(() => {
-      try { p.kill("SIGKILL"); } catch { /* gone */ }
-      resolve(output);
-    }, timeoutMs);
     p.stdout.on("data", (d) => (output += d.toString()));
     p.on("close", () => { clearTimeout(timer); resolve(output); });
     p.on("error", () => { clearTimeout(timer); resolve(""); });
