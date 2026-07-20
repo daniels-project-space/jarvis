@@ -1,32 +1,46 @@
 import { describe, expect, it } from "vitest";
-import { isRelevantActiveWork, needsDaniel, relevantActiveWork } from "./active-work";
+import {
+  cacheCompactWorkSnapshot,
+  needsDaniel,
+  visibleCompactWork,
+  type CompactWorkCache,
+  type CompactWorkItem,
+} from "./active-work";
 
-describe("live work visibility", () => {
-  it("shows only work that is executing or genuinely needs Daniel", () => {
-    expect(isRelevantActiveWork({ status: "running", visibility: "conversation" })).toBe(true);
-    expect(isRelevantActiveWork({ status: "awaiting_approval", visibility: "conversation" })).toBe(true);
-    expect(isRelevantActiveWork({ status: "needs_input", visibility: "conversation" })).toBe(true);
-    expect(isRelevantActiveWork({ status: "running", visibility: "conversation", agentId: "sentry" })).toBe(true);
-    expect(isRelevantActiveWork({ status: "pending", visibility: "conversation" })).toBe(false);
-    expect(isRelevantActiveWork({ status: "paused", visibility: "conversation" })).toBe(false);
+const dispatching: CompactWorkItem = {
+  id: "job-1",
+  label: "Paul · current repair",
+  status: "dispatching",
+  stage: "dispatching",
+  percent: 2,
+};
+
+describe("compact work-bar continuity", () => {
+  it("retains one resolved item through an unresolved refresh and state handoff", () => {
+    let cache: CompactWorkCache = cacheCompactWorkSnapshot(null, "thread-a", { active: dispatching });
+    expect(visibleCompactWork(cache, "thread-a", undefined)).toBe(dispatching);
+
+    const running: CompactWorkItem = { ...dispatching, status: "running", stage: "testing", percent: 64 };
+    expect(visibleCompactWork(cache, "thread-a", { active: running })).toBe(running);
+    cache = cacheCompactWorkSnapshot(cache, "thread-a", { active: running });
+    expect(visibleCompactWork(cache, "thread-a", undefined)).toBe(running);
+    expect(visibleCompactWork(cache, "thread-a", undefined)?.id).toBe("job-1");
   });
 
-  it("keeps routine system work out of the conversation surface", () => {
-    expect(isRelevantActiveWork({ status: "running", visibility: "system", label: "Paul · repair" })).toBe(false);
-    expect(isRelevantActiveWork({ status: "running", agentId: "sentry", task: "Investigate uptime" })).toBe(false);
-    expect(isRelevantActiveWork({ status: "needs_input", incidentId: "incident-1" })).toBe(false);
-    expect(isRelevantActiveWork({ status: "awaiting_approval", visibility: "system" })).toBe(false);
-    expect(isRelevantActiveWork({ status: "needs_input", visibility: "conversation", label: "Cloud health audit" })).toBe(false);
-    expect(isRelevantActiveWork({ status: "running", task: "Routine provider health check" })).toBe(false);
+  it("hides immediately on an explicit empty result and stays hidden on refresh", () => {
+    let cache: CompactWorkCache = cacheCompactWorkSnapshot(null, "thread-a", { active: dispatching });
+    expect(visibleCompactWork(cache, "thread-a", { active: null })).toBeNull();
+    cache = cacheCompactWorkSnapshot(cache, "thread-a", { active: null });
+    expect(visibleCompactWork(cache, "thread-a", undefined)).toBeNull();
   });
 
-  it("bounds the list and marks decision states", () => {
-    const jobs = [
-      { status: "running", visibility: "conversation", label: "one" },
-      { status: "running", visibility: "conversation", label: "two" },
-      { status: "running", visibility: "conversation", label: "three" },
-    ];
-    expect(relevantActiveWork(jobs, 2).map((job) => job.label)).toEqual(["one", "two"]);
+  it("never carries work into a different conversation", () => {
+    const cache = cacheCompactWorkSnapshot(null, "thread-a", { active: dispatching });
+    expect(visibleCompactWork(cache, "thread-b", undefined)).toBeNull();
+  });
+
+  it("keeps decision states out of the active bar's control path", () => {
+    expect(needsDaniel({ status: "awaiting_approval" })).toBe(true);
     expect(needsDaniel({ status: "needs_input" })).toBe(true);
     expect(needsDaniel({ status: "running" })).toBe(false);
   });

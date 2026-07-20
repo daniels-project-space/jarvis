@@ -1,36 +1,101 @@
+import { v } from "convex/values";
 import { query } from "./_generated/server";
 import { requireViewer, viewerAuthArgs } from "./controlAuth";
-import { runtimeJob } from "./controlPlane";
 
-// The top work pill intentionally has a tiny data contract. Project health,
-// watches, team rosters, missions and history each have dedicated visual
-// surfaces; subscribing to all of them here multiplied Convex reads and made
-// routine background changes flicker in the conversation UI.
+export type CompactConversationWork = {
+  id: string;
+  label: string;
+  status: "dispatching" | "running";
+  stage: string;
+  percent: number;
+};
+
+type RuntimeRow = {
+  jobId?: unknown;
+  task?: unknown;
+  label?: unknown;
+  status?: unknown;
+  visibility?: unknown;
+  originThreadId?: unknown;
+  stage?: unknown;
+  percent?: unknown;
+  priority?: unknown;
+  createdAt?: unknown;
+};
+
+export const COMPACT_WORK_STATUSES = ["running", "dispatching"] as const;
+
+const HEALTH_CHECK_WORK = /\b(?:health[ -]?(?:check|audit)|cloud health audit|heartbeat|uptime poll|stack poll|polling sweep|sentry sweep|provider health|background check|routine monitor)\b/i;
+
+function isCurrentConversationWork(row: RuntimeRow, threadId: string): boolean {
+  const status = String(row.status ?? "");
+  if (status !== "running" && status !== "dispatching") return false;
+  if (row.visibility !== "conversation" || row.originThreadId !== threadId) return false;
+  return !HEALTH_CHECK_WORK.test([row.label, row.task, row.stage].filter(Boolean).join(" "));
+}
+
+function compactWork(row: RuntimeRow): CompactConversationWork {
+  const status = row.status === "dispatching" ? "dispatching" : "running";
+  return {
+    id: String(row.jobId),
+    label: String(row.label ?? row.task ?? "Active work").slice(0, 80),
+    status,
+    stage: String(row.stage ?? status).slice(0, 80),
+    percent: Math.max(0, Math.min(100, Number(row.percent ?? 0))),
+  };
+}
+
+// Keep selection defensive even though the indexed reads below already fence
+// visibility, thread and status. A malformed or legacy projection must never
+// widen this compact conversation-only contract.
+export function selectCompactConversationWork(
+  rows: readonly RuntimeRow[],
+  threadId: string,
+): CompactConversationWork | null {
+  const selected = rows
+    .filter((row) => isCurrentConversationWork(row, threadId))
+    .sort((left, right) =>
+      Number(right.priority ?? 50) - Number(left.priority ?? 50)
+      || Number(right.createdAt ?? 0) - Number(left.createdAt ?? 0),
+    )[0];
+  return selected ? compactWork(selected) : null;
+}
+
+// This subscription is deliberately singular and tiny. Operations health,
+// attention, approvals, missions and rich job details have dedicated queries
+// and must never be folded into the top conversation work bar.
 export const snapshot = query({
-  args: { ...viewerAuthArgs },
+  args: { threadId: v.string(), ...viewerAuthArgs },
+  returns: v.object({
+    active: v.union(
+      v.null(),
+      v.object({
+        id: v.string(),
+        label: v.string(),
+        status: v.union(v.literal("dispatching"), v.literal("running")),
+        stage: v.string(),
+        percent: v.number(),
+      }),
+    ),
+  }),
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    const groups = await Promise.all([
-      // Routine maintenance is never fetched into the live conversation strip
-      // in the first place; client filtering remains a compatibility backstop.
-      ctx.db
-        .query("jobRuntime")
-        .withIndex("by_visibility_status_priority", (q: any) => q.eq("visibility", "conversation").eq("status", "running"))
-        .order("desc")
-        .take(12),
-      ctx.db
-        .query("jobRuntime")
-        .withIndex("by_visibility_status_priority", (q: any) => q.eq("visibility", "conversation").eq("status", "dispatching"))
-        .order("desc")
-        .take(12),
-      ctx.db.query("jobRuntime").withIndex("by_status_priority", (q: any) => q.eq("status", "awaiting_approval")).order("desc").take(12),
-      ctx.db.query("jobRuntime").withIndex("by_status_priority", (q: any) => q.eq("status", "needs_input")).order("desc").take(12),
-    ]);
-    return {
-      active: groups
-        .flat()
-        .sort((x: any, y: any) => (y.priority ?? 50) - (x.priority ?? 50) || x.createdAt - y.createdAt)
-        .map(runtimeJob),
-    };
+    const threadId = a.threadId.trim();
+    if (!threadId) return { active: null };
+
+    const groups = await Promise.all(
+      COMPACT_WORK_STATUSES.map((status) =>
+        ctx.db
+          .query("jobRuntime")
+          .withIndex("by_visibility_status_priority", (q) =>
+            q.eq("visibility", "conversation").eq("status", status),
+          )
+          .filter((q) => q.eq(q.field("originThreadId"), threadId))
+          .order("desc")
+          .take(12),
+      ),
+    );
+
+    return { active: selectCompactConversationWork(groups.flat(), threadId) };
   },
 });

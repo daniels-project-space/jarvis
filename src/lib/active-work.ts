@@ -1,47 +1,40 @@
-export type ActiveWork = {
-  _id?: unknown;
-  status?: string;
-  visibility?: "conversation" | "system" | string;
-  agentId?: string;
-  label?: string;
-  task?: string;
-  stage?: string;
-  incidentId?: string;
+export type CompactWorkItem = {
+  id: string;
+  label: string;
+  status: "dispatching" | "running";
+  stage: string;
+  percent: number;
 };
 
-const ACTIVE_STATUSES = new Set(["dispatching", "running", "awaiting_approval", "needs_input"]);
-const DECISION_STATUSES = new Set(["awaiting_approval", "needs_input"]);
-const LEGACY_SYSTEM_WORK = /\b(?:health[ -]?(?:check|audit)|cloud health audit|heartbeat|uptime poll|stack poll|polling sweep|sentry sweep|provider health|background check|routine monitor)\b/i;
+export type CompactWorkSnapshot = { active: CompactWorkItem | null };
+
+export type CompactWorkCache = {
+  threadId: string;
+  active: CompactWorkItem | null;
+} | null;
 
 /**
- * The live-work pill is an attention surface, not an operations log.
- * Decisions are always relevant; executing system maintenance stays available
- * in project/agent views without interrupting the conversation surface.
+ * A resolved server result is authoritative, including an explicit empty one.
+ * While the same subscription is unresolved during a refresh, retain its last
+ * result so an active bar does not flash out and back in.
  */
-export function isRelevantActiveWork(job: ActiveWork): boolean {
-  const status = String(job.status ?? "");
-  if (!ACTIVE_STATUSES.has(status)) return false;
-  const description = [job.label, job.task, job.stage].filter(Boolean).join(" ");
-  // Incident repair is operations telemetry, even when its worker is waiting
-  // on a provider publication or approval. Alerts retains that attention;
-  // the conversational work pill is reserved for Daniel's deliberate work.
-  if (
-    job.visibility === "system" ||
-    job.incidentId ||
-    (job.agentId === "sentry" && job.visibility !== "conversation") ||
-    LEGACY_SYSTEM_WORK.test(description)
-  ) return false;
-  if (DECISION_STATUSES.has(status)) return true;
-  if (job.visibility === "conversation") return true;
-
-  // Compatibility for jobs created before visibility was recorded explicitly.
-  return true;
+export function visibleCompactWork(
+  cache: CompactWorkCache,
+  threadId: string,
+  snapshot: CompactWorkSnapshot | undefined,
+): CompactWorkItem | null {
+  if (snapshot !== undefined) return snapshot.active;
+  return cache?.threadId === threadId ? cache.active : null;
 }
 
-export function relevantActiveWork<T extends ActiveWork>(jobs: readonly T[], limit = 4): T[] {
-  return jobs.filter(isRelevantActiveWork).slice(0, Math.max(0, limit));
+export function cacheCompactWorkSnapshot(
+  cache: CompactWorkCache,
+  threadId: string,
+  snapshot: CompactWorkSnapshot | undefined,
+): CompactWorkCache {
+  return snapshot === undefined ? cache : { threadId, active: snapshot.active };
 }
 
-export function needsDaniel(job: ActiveWork): boolean {
-  return DECISION_STATUSES.has(String(job.status ?? ""));
+export function needsDaniel(job: { status?: string }): boolean {
+  return job.status === "awaiting_approval" || job.status === "needs_input";
 }
