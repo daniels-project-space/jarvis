@@ -46,7 +46,12 @@ import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actio
 import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
 import { viewerFetch } from "@/lib/viewer-request";
 import { normalizeIncidentSignature } from "@/lib/incident-signature";
-import { loadClientChunk, recoverClientChunkLoad } from "@/lib/client-chunk";
+import {
+  isClientChunkLoadError,
+  loadClientChunk,
+  recoverClientChunkLoad,
+  recoverDynamicClientChunkLoad,
+} from "@/lib/client-chunk";
 
 type WakewordModule = typeof import("../lib/wakeword");
 
@@ -58,17 +63,17 @@ const withWakeword = (action: (module: WakewordModule) => unknown) => {
 };
 const warmSpeech = () => void warmTts().catch(() => {});
 
-const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
+const ThreeOrb = dynamic(() => import("./ThreeOrb").catch(recoverDynamicClientChunkLoad), { ssr: false });
 
-const TripView = dynamic(() => import("./TripView"), {
+const TripView = dynamic(() => import("./TripView").catch(recoverDynamicClientChunkLoad), {
   ssr: false,
   loading: () => <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-cyan">loading travel workspace…</div>,
 });
-const BoardView = dynamic(() => import("./BoardView"), {
+const BoardView = dynamic(() => import("./BoardView").catch(recoverDynamicClientChunkLoad), {
   ssr: false,
   loading: () => <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-cyan">loading drawing workspace…</div>,
 });
-const VisualSceneView = dynamic(() => import("./VisualSceneView"), {
+const VisualSceneView = dynamic(() => import("./VisualSceneView").catch(recoverDynamicClientChunkLoad), {
   ssr: false,
   loading: () => <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-cyan">assembling visual workspace…</div>,
 });
@@ -2148,13 +2153,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // replaced on the CDN by Vercel's auto-deploy, so the lazy fetch 404s. It's
     // not a bug in any module — reload ONCE to pull the fresh chunks. Guarded by
     // a timestamp so a genuinely-missing chunk can't loop forever.
-    const isChunkError = (v: unknown) => {
-      const s = String((v as { name?: string; message?: string })?.name ?? "") +
-        " " + String((v as { message?: string })?.message ?? v ?? "");
-      return /ChunkLoadError|Loading chunk [\w-]+ failed|Failed to load chunk/i.test(s);
-    };
     const onErr = (e: ErrorEvent) => {
-      if (isChunkError(e.error ?? e.message)) { recoverClientChunkLoad(e.error ?? e.message); return; } // stale post-deploy chunk
+      if (isClientChunkLoadError(e.error ?? e.message)) { recoverClientChunkLoad(e.error ?? e.message); return; } // stale post-deploy chunk
       if (e.message === "Script error." || !e.message) return; // cross-origin iframe noise, unactionable
       // Benign browser warning, not an app fault: fired as a window error event
       // whenever a ResizeObserver callback schedules layout that triggers another
@@ -2165,7 +2165,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       report(`client:${String(e.message).slice(0, 80)}`, `${e.message} @ ${e.filename}:${e.lineno}`);
     };
     const onRej = (e: PromiseRejectionEvent) => {
-      if (isChunkError(e.reason)) { recoverClientChunkLoad(e.reason); return; } // stale post-deploy chunk
+      if (isClientChunkLoadError(e.reason)) { recoverClientChunkLoad(e.reason); return; } // stale post-deploy chunk
       report(`client:rejection:${String(e.reason).slice(0, 80)}`, `Unhandled rejection: ${String(e.reason).slice(0, 400)}`);
     };
     window.addEventListener("error", onErr);

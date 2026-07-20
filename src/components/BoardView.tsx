@@ -4,7 +4,7 @@ import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
-import { loadClientChunk } from "@/lib/client-chunk";
+import { loadClientChunk, recoverDynamicClientChunkLoad } from "@/lib/client-chunk";
 import "@excalidraw/excalidraw/index.css";
 import {
   Background,
@@ -27,7 +27,7 @@ import "@xyflow/react/dist/style.css";
 // them LIVE into the scene, and Daniel's own edits persist back via
 // creations:boardSave (which never clobbers ops queued mid-save).
 
-const Excalidraw = dynamic(() => import("@excalidraw/excalidraw").then((m) => m.Excalidraw), {
+const Excalidraw = dynamic(() => import("@excalidraw/excalidraw").then((m) => m.Excalidraw).catch(recoverDynamicClientChunkLoad), {
   ssr: false,
   loading: () => (
     <div className="flex h-full items-center justify-center text-sm text-slate">

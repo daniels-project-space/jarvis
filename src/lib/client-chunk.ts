@@ -1,5 +1,6 @@
 const CHUNK_RELOAD_KEY = "jarvis-chunk-reload";
 const CHUNK_RELOAD_COOLDOWN_MS = 10_000;
+const CLIENT_CHUNK_LOAD_ERROR = /ChunkLoadError|Loading chunk [\w-]+ failed|Failed to load chunk|Failed to fetch dynamically imported module|error loading dynamically imported module|Importing a module script failed|\bTypeError:?\s+Load failed\b/i;
 
 export type ClientChunkRecoveryRuntime = {
   now: () => number;
@@ -20,6 +21,18 @@ function browserRuntime(): ClientChunkRecoveryRuntime | null {
     },
     reload: () => window.location.reload(),
   };
+}
+
+/** Recognize the browser-specific errors emitted when a lazy module cannot be fetched. */
+export function isClientChunkLoadError(value: unknown): boolean {
+  try {
+    const error = value as { name?: unknown; message?: unknown } | null;
+    const name = typeof error?.name === "string" ? error.name : "";
+    const message = typeof error?.message === "string" ? error.message : String(value ?? "");
+    return CLIENT_CHUNK_LOAD_ERROR.test(`${name} ${message}`);
+  } catch {
+    return false;
+  }
 }
 
 /** Recover a lazy client module without turning its fetch rejection into an app incident. */
@@ -63,4 +76,21 @@ export async function loadClientChunk<T>(load: () => Promise<T>): Promise<T | nu
     recoverClientChunkLoad(error);
     return null;
   }
+}
+
+/**
+ * Keep a React lazy boundary in its loading state while stale-chunk recovery
+ * reloads the page. Unknown module failures still reject into React's normal
+ * error handling instead of being disguised as transport failures.
+ */
+export function recoverDynamicClientChunkLoad(
+  error: unknown,
+  providedRuntime?: ClientChunkRecoveryRuntime | null,
+): Promise<never> {
+  if (!isClientChunkLoadError(error)) return Promise.reject(error);
+  recoverClientChunkLoad(error, providedRuntime);
+  return new Promise<never>(() => {
+    // The scheduled reload replaces this lazy boundary. If reload is blocked,
+    // retaining its loading UI is safer than surfacing the handled rejection.
+  });
 }
