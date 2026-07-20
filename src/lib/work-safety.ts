@@ -59,11 +59,126 @@ const NEGATED_TAIL =
 const REPORTED_ACTION_TAIL =
   /\b(?:asked|attempted|tried|claimed|reported|observed|showed|demonstrated|proved|tested|verified|blocked|prevented|allowed|denied|whether)\b[^.;!?\n]{0,160}$/i;
 
+const REPORTED_CONVERSATION_CONTEXT =
+  /(?:\b(?:response|answer|output|result|transcript|turn|input|prompt|request|instruction|command)\b[^;\n]{0,160}\b(?:was|were|is|are|said|read|returned|produced|contained|showed)\b|\b(?:the\s+)?(?:first|second|third|next|previous|prior|former|latter)(?:\s+(?:response|answer|output|result|turn|one))?\s+(?:was|were|is|are)\b)[^;\n]{0,240}$/i;
+
+const NOMINAL_COMMUNICATION_TAIL =
+  /^(?:['’]s\s+)?(?:association|body|content|correctness|event|handler|handling|id|latency|ordering|parser|payload|protocol|schema|state|status|stream|text|timing|trace|turn)\b/i;
+
+const NOMINAL_COMMUNICATION_LEAD =
+  /\b(?:a|an|the|this|that|these|those|my|your|his|her|its|our|their|first|second|third|last|previous|next|incoming|outgoing|assistant|user|chat|foreground|model|synthetic|customer|tenant)\s*$/i;
+
+const NOMINAL_COMMUNICATION_AFTER_LEAD =
+  /^(?:['’]s\b|(?:to|from|was|were|is|are|has|had|text|content|body|payload|event|turn)\b|$)/i;
+
+function quoteCloser(task: string, index: number): string | null {
+  const character = task[index];
+  if (character === "\"") return "\"";
+  if (character === "“") return "”";
+  if (character === "‘") return "’";
+  if (character !== "'") return null;
+  const previous = task[index - 1] ?? "";
+  const next = task[index + 1] ?? "";
+  return !/[a-z0-9]/i.test(previous) && /\S/.test(next) ? "'" : null;
+}
+
+function closesQuote(task: string, index: number, closer: string): boolean {
+  if (task[index] !== closer) return false;
+  if (closer === "'" && /[a-z0-9]/i.test(task[index - 1] ?? "") && /[a-z0-9]/i.test(task[index + 1] ?? "")) {
+    return false;
+  }
+  let escapes = 0;
+  for (let cursor = index - 1; cursor >= 0 && task[cursor] === "\\"; cursor -= 1) escapes += 1;
+  return escapes % 2 === 0;
+}
+
+function hasClosingQuote(task: string, openingIndex: number, closer: string): boolean {
+  for (let index = openingIndex + 1; index < task.length; index += 1) {
+    if (closesQuote(task, index, closer)) return true;
+  }
+  return false;
+}
+
+function cleanClause(value: string): string {
+  return value.trim().replace(/^[-*•]+\s*/, "");
+}
+
 function clauses(task: string): string[] {
-  return task
-    .split(/\r?\n|[.;!?]+|\b(?:and\s+then|then|and)\b/gi)
-    .map((part) => part.trim().replace(/^[-*•]+\s*/, ""))
-    .filter(Boolean);
+  const result: string[] = [];
+  let current = "";
+  let closingQuote: string | null = null;
+
+  const finish = () => {
+    const clause = cleanClause(current);
+    if (clause) result.push(clause);
+    current = "";
+  };
+
+  for (let index = 0; index < task.length; index += 1) {
+    const character = task[index];
+    if (closingQuote) {
+      current += character;
+      if (closesQuote(task, index, closingQuote)) closingQuote = null;
+      continue;
+    }
+
+    const closer = quoteCloser(task, index);
+    if (closer && hasClosingQuote(task, index, closer)) {
+      closingQuote = closer;
+      current += character;
+      continue;
+    }
+
+    if (character === "\n" || character === "\r" || /[.;!?]/.test(character)) {
+      finish();
+      if (character === "\r" && task[index + 1] === "\n") index += 1;
+      continue;
+    }
+
+    const previous = task[index - 1] ?? "";
+    if (!/[a-z0-9_]/i.test(previous)) {
+      const conjunction = task.slice(index).match(/^(?:and\s+instead|and\s+then|then|but|and)\b/i);
+      if (conjunction) {
+        const clause = cleanClause(current);
+        const contrast = /^(?:but|and\s+instead)$/i.test(conjunction[0]);
+        // A leading prohibition scopes over coordinated verbs: “do not send
+        // and publish” prohibits both. Positive clauses still split here so
+        // “research and purchase” cannot borrow the read-only lead.
+        if (!contrast && (NEGATED_LEAD.test(clause) || NEGATED_TAIL.test(clause))) {
+          current += ` ${conjunction[0]} `;
+        } else {
+          finish();
+        }
+        index += conjunction[0].length - 1;
+        continue;
+      }
+    }
+
+    current += character;
+  }
+  finish();
+  return result;
+}
+
+function quotedActionContext(clause: string, actionIndex: number): string | null {
+  let closingQuote: string | null = null;
+  let openingIndex = -1;
+  for (let index = 0; index < clause.length; index += 1) {
+    if (closingQuote) {
+      if (!closesQuote(clause, index, closingQuote)) continue;
+      if (openingIndex < actionIndex && actionIndex < index) {
+        return clause.slice(0, openingIndex).trim();
+      }
+      closingQuote = null;
+      openingIndex = -1;
+      continue;
+    }
+    const closer = quoteCloser(clause, index);
+    if (!closer || !hasClosingQuote(clause, index, closer)) continue;
+    closingQuote = closer;
+    openingIndex = index;
+  }
+  return null;
 }
 
 export function isOwnedRepository(repo: string | undefined): boolean {
@@ -111,6 +226,16 @@ function consequentialUse(action: string, clause: string, actionIndex: number): 
   const normalized = action.toLocaleLowerCase("en-GB");
   const before = clause.slice(0, actionIndex).trim();
   const after = clause.slice(actionIndex + action.length).trim();
+  if (/^(?:message|reply)$/i.test(normalized)) {
+    // Chat engineering prompts use these words as data nouns (“reply
+    // latency”, “message event”). An actual imperative has no determiner, and
+    // consequential companion verbs such as “send a reply” are matched on
+    // their own before this nominal occurrence can be ignored.
+    if (
+      NOMINAL_COMMUNICATION_LEAD.test(before)
+      && (NOMINAL_COMMUNICATION_TAIL.test(after) || NOMINAL_COMMUNICATION_AFTER_LEAD.test(after))
+    ) return false;
+  }
   if (normalized === "send") {
     if (controllerReviewStdinTransfer(clause, before, after)) return false;
   }
@@ -143,6 +268,8 @@ export function classifyWorkSafety(
       const action = match[0];
       const actionIndex = match.index ?? 0;
       if (!consequentialUse(action, clause, actionIndex)) continue;
+      const quoteContext = quotedActionContext(clause, actionIndex);
+      if (quoteContext !== null && REPORTED_CONVERSATION_CONTEXT.test(quoteContext)) continue;
       if (NEGATED_LEAD.test(clause)) continue;
 
       const beforeAction = clause.slice(0, actionIndex);
@@ -152,7 +279,7 @@ export function classifyWorkSafety(
       // "Audit whether X can send" describes a read-only outcome. A mixed
       // instruction such as "research options and purchase one" is split at
       // the conjunction, so its purchase clause still reaches the gate.
-      if (NON_MUTATING_LEAD.test(clause)) continue;
+      if (quoteContext === null && NON_MUTATING_LEAD.test(clause)) continue;
       if (softwareDeliveryAllowed(action, clause, options?.repo)) {
         continue;
       }

@@ -3,6 +3,13 @@ import { goalWorkApprovalPolicy, workApprovalPolicy } from "../../convex/workPol
 import { plannerTask, routeGoal, validatorTask } from "../lib/goal-mode";
 import { classifyWorkSafety, SAFE_SANDBOX_EXECUTION_RULES } from "../lib/work-safety";
 
+const CHAT_LATENCY_JOB_REGRESSION = {
+  id: "js73f7b1rnjfqap286193t0hcs8awpq3",
+  repo: "/home/ubuntu/jarvis",
+  task:
+    "Root-cause and repair Jarvis foreground chat latency/cutout behavior without weakening intelligence or introducing a second voice/model/provider. Production evidence on Trigger 20260720.11: a healthy warm jarvis-chat-turn claimed two sequential synthetic same-thread turns in 491ms and 268ms, but first visible text arrived at 3746ms and 1701ms. The first response was \"Understood, sir.\" to \"Reply with exactly ONE.\"; the second was \"Barcelona.\" to \"Reply with exactly TWO.\", so also audit turn/event association and short-turn correctness. Inspect the actual Codex app-server protocol implementation",
+} as const;
+
 describe("server-side work approval policy", () => {
   it("keeps explicitly requested zero-effect sandbox validation autonomous", () => {
     expect(SAFE_SANDBOX_EXECUTION_RULES).toContain("already authorized");
@@ -110,6 +117,39 @@ describe("server-side work approval policy", () => {
         repo: "daniels-project-space/dropship-ai",
       }),
     ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+  });
+
+  it("does not classify persisted conversational engineering evidence as consequential", () => {
+    expect(CHAT_LATENCY_JOB_REGRESSION.id).toBe("js73f7b1rnjfqap286193t0hcs8awpq3");
+    expect(
+      classifyWorkSafety(CHAT_LATENCY_JOB_REGRESSION.task, {
+        repo: CHAT_LATENCY_JOB_REGRESSION.repo,
+      }),
+    ).toEqual({ approvalRequired: false, boundary: "internal" });
+  });
+
+  it("distinguishes nominal chat wording and coordinated prohibitions from outreach", () => {
+    for (const task of [
+      "Fix the reply latency regression in the foreground worker.",
+      "Correlate the message event with its response turn.",
+      "The observed response was \"Reply with exactly THREE.\" during the synthetic protocol test.",
+      "Do not message the maintainer and publish the findings publicly.",
+      "Never send customer replies and publish transcript excerpts.",
+    ]) {
+      expect(classifyWorkSafety(task, { repo: "jarvis" }).approvalRequired, task).toBe(false);
+    }
+
+    for (const task of [
+      "Reply to the tenant.",
+      "Message the maintainer.",
+      "Message event details to the maintainer.",
+      "Fix the reply parser and reply to the tenant.",
+      "Do not message the maintainer, but publish the findings publicly.",
+      "Evidence: \"send the tenant reply.\"",
+      "Audit the broken \"reply transcript. Purchase the selected product.",
+    ]) {
+      expect(classifyWorkSafety(task, { repo: "jarvis" }).approvalRequired, task).toBe(true);
+    }
   });
 
   it("treats a controller review prompt sent through standard input as local transport", () => {
