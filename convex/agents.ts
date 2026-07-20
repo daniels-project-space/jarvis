@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { requestContextRefresh } from "./contextProjection";
 
 const TEAM = [
   {
@@ -95,6 +96,7 @@ export const seed = mutation({
         created += 1;
       }
     }
+    if (created || updated) await requestContextRefresh(ctx, ["work"]);
     return { created, updated, total: TEAM.length };
   },
 });
@@ -152,6 +154,7 @@ export const setWork = mutation({
       currentJobId: a.currentJobId,
       updatedAt: Date.now(),
     });
+    await requestContextRefresh(ctx, ["work"]);
     return true;
   },
 });
@@ -177,6 +180,7 @@ export const recordOutcome = mutation({
       currentJobId: undefined,
       updatedAt: Date.now(),
     });
+    await requestContextRefresh(ctx, ["work"]);
     return true;
   },
 });

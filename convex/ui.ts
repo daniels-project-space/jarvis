@@ -9,6 +9,7 @@ import {
   requireViewer,
   viewerAuthArgs,
 } from "./controlAuth";
+import { requestContextRefresh } from "./contextProjection";
 
 export const setPanel = mutation({
   args: { type: v.string(), value: v.string(), title: v.optional(v.string()), ...dispatcherAuthArgs },
@@ -18,6 +19,7 @@ export const setPanel = mutation({
     const doc = { key: "panel", type: a.type, value: a.value, title: a.title, updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
     else await ctx.db.insert("ui", doc);
+    await requestContextRefresh(ctx, ["ui"]);
   },
 });
 
@@ -26,7 +28,10 @@ export const clearPanel = mutation({
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first();
-    if (ex) await ctx.db.delete(ex._id);
+    if (ex) {
+      await ctx.db.delete(ex._id);
+      await requestContextRefresh(ctx, ["ui"]);
+    }
   },
 });
 
@@ -233,6 +238,7 @@ export const setLocation = mutation({
     const doc = { key: "location", type: "location", value: `${a.lat},${a.lng}`, title: a.label, updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
     else await ctx.db.insert("ui", doc);
+    await requestContextRefresh(ctx, ["ui"]);
   },
 });
 export const getLocation = query({

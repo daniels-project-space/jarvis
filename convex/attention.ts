@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { requestContextRefresh } from "./contextProjection";
 
 export const upsert = mutation({
   args: {
@@ -38,9 +39,12 @@ export const upsert = mutation({
     };
     if (existing) {
       await ctx.db.patch(existing._id, doc);
+      await requestContextRefresh(ctx, ["attention"]);
       return existing._id;
     }
-    return await ctx.db.insert("attentionItems", { ...doc, createdAt: now });
+    const id = await ctx.db.insert("attentionItems", { ...doc, createdAt: now });
+    await requestContextRefresh(ctx, ["attention"]);
+    return id;
   },
 });
 
@@ -67,5 +71,6 @@ export const resolve = mutation({
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     await ctx.db.patch(a.id, { status: a.status, updatedAt: Date.now() });
+    await requestContextRefresh(ctx, ["attention"]);
   },
 });

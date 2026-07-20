@@ -2,6 +2,7 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 import { inferCreationFiling } from "./creationFiling";
+import { requestContextRefresh } from "./contextProjection";
 
 // JARVIS's atelier — everything he makes (mind maps, charts, images, PDFs,
 // docs) is saved here so nothing he creates is ever lost. The UI lists it
@@ -95,7 +96,7 @@ export const create = mutation({
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     const filing = inferCreationFiling(a);
-    return await ctx.db.insert("creations", {
+    const id = await ctx.db.insert("creations", {
       kind: a.kind,
       title: a.title.slice(0, 120),
       data: a.data,
@@ -106,6 +107,8 @@ export const create = mutation({
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
+    await requestContextRefresh(ctx, ["artifacts"]);
+    return id;
   },
 });
 
@@ -136,6 +139,7 @@ export const update = mutation({
     if (a.inquiry !== undefined) patch.inquiry = a.inquiry.slice(0, 80);
     if (a.threadId !== undefined) patch.threadId = a.threadId.slice(0, 120);
     await ctx.db.patch(a.id, patch);
+    await requestContextRefresh(ctx, ["artifacts"]);
     return a.id;
   },
 });
@@ -159,6 +163,7 @@ export const updateScene = mutation({
       return { ok: false as const, reason: "conflict" as const, data: row.data, title: row.title, updatedAt: row.updatedAt };
     const updatedAt = Date.now();
     await ctx.db.patch(a.id, { title: a.title.slice(0, 120), data: a.data, updatedAt });
+    await requestContextRefresh(ctx, ["artifacts"]);
     return { ok: true as const, updatedAt };
   },
 });
@@ -273,6 +278,7 @@ export const updateTripProvider = mutation({
       thumb: row.thumb ?? doc.stays?.[0]?.thumb ?? doc.activities?.[0]?.photo,
       updatedAt: now,
     });
+    await requestContextRefresh(ctx, ["artifacts"]);
     return true;
   },
 });
@@ -343,5 +349,6 @@ export const remove = mutation({
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     await ctx.db.delete(a.id);
+    await requestContextRefresh(ctx, ["artifacts"]);
   },
 });

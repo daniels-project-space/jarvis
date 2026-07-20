@@ -2,6 +2,9 @@
 // this file are intentionally database-only so every durable writer can use
 // them in the same Convex transaction without calling another function.
 
+import { materiallyDifferentMission, materiallyDifferentWork } from "./brainContextModel";
+import { requestContextRefresh } from "./contextProjection";
+
 function defined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
 }
@@ -127,6 +130,7 @@ export async function upsertJobRuntime(ctx: any, job: any) {
   const projected = projectJobRuntime(source);
   if (existing) await ctx.db.replace(existing._id, projected);
   else await ctx.db.insert("jobRuntime", projected);
+  if (materiallyDifferentWork(existing, projected)) await requestContextRefresh(ctx, ["work", "attention"]);
 }
 
 const LIVE_JOB_ACTIVITY_FIELDS = ["stage", "percent", "progress", "heartbeatAt", "updatedAt"] as const;
@@ -153,6 +157,7 @@ export async function upsertMissionRuntime(ctx: any, mission: any) {
   const existing = await missionRuntimeFor(ctx, mission._id);
   if (existing) await ctx.db.replace(existing._id, projected);
   else await ctx.db.insert("missionRuntime", projected);
+  if (materiallyDifferentMission(existing, projected)) await requestContextRefresh(ctx, ["work", "attention"]);
 }
 
 export async function insertJobWithRuntime(ctx: any, value: any) {
@@ -167,6 +172,7 @@ export async function patchJobWithRuntime(ctx: any, job: any, patch: Record<stri
   const projected = projectJobRuntime(mergeJobRuntimeSource(job, patch, existing));
   if (existing) await ctx.db.replace(existing._id, projected);
   else await ctx.db.insert("jobRuntime", projected);
+  if (materiallyDifferentWork(existing, projected)) await requestContextRefresh(ctx, ["work", "attention"]);
 }
 
 export async function insertMissionWithRuntime(ctx: any, value: any) {

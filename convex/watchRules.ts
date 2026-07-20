@@ -2,6 +2,7 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { evaluateWatchTransition } from "./watchPolicy";
+import { requestContextRefresh } from "./contextProjection";
 
 const clampCadence = (value: number | undefined, fallback: number, minimum = 15 * 60_000) =>
   Math.max(minimum, Math.min(7 * 86_400_000, Math.round(value ?? fallback)));
@@ -198,6 +199,7 @@ export const commitObservation = mutation({
         };
         if (existing) await ctx.db.patch(existing._id, attention);
         else await ctx.db.insert("attentionItems", { ...attention, createdAt: a.now });
+        await requestContextRefresh(ctx, ["attention"]);
       }
       return { ok: true as const, triggered: false as const };
     }
@@ -275,6 +277,7 @@ export const commitObservation = mutation({
       };
       if (existingAttention) await ctx.db.patch(existingAttention._id, attention);
       else await ctx.db.insert("attentionItems", { ...attention, createdAt: a.now });
+      await requestContextRefresh(ctx, ["attention"]);
       await ctx.db.patch(rule._id, {
         triggerSeq,
         lastTriggeredAt: a.now,

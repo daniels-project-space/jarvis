@@ -2,6 +2,7 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 import { patchJobWithRuntime } from "./controlPlane";
+import { requestContextRefresh } from "./contextProjection";
 
 export const pending = query({
   args: { ...viewerAuthArgs },
@@ -55,6 +56,7 @@ export const decide = mutation({
       stage: a.decision === "approved" ? (heldByGoal ? "paused" : "queued") : "cancelled",
       createdAt: Date.now(),
     });
+    await requestContextRefresh(ctx, ["work"]);
     return true;
   },
 });

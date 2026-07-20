@@ -17,6 +17,7 @@ import {
   upsertJobRuntime,
   upsertMissionRuntime,
 } from "./controlPlane";
+import { requestContextRefresh } from "./contextProjection";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
 const DISPATCH_LEASE_MS = 2 * 60 * 1000;
@@ -894,8 +895,10 @@ export const updateProgress = mutation({
     if (a.stage !== undefined) patch.stage = a.stage.slice(0, 80);
     patch.updatedAt = now;
     await ctx.db.patch(row._id, patch);
-    const meaningful = (a.stage && a.stage !== row.stage) || (percent ?? 0) - (row.percent ?? 0) >= 10;
-    if (meaningful)
+    const meaningful =
+      (a.stage && a.stage !== row.stage)
+      || Math.floor((percent ?? 0) / 10) !== Math.floor((row.percent ?? 0) / 10);
+    if (meaningful) {
       await ctx.db.insert("workEvents", {
         jobId: String(a.jobId),
         missionId: row.missionId,
@@ -906,6 +909,8 @@ export const updateProgress = mutation({
         percent,
         createdAt: now,
       });
+      await requestContextRefresh(ctx, ["work", "attention"]);
+    }
     return true;
   },
 });

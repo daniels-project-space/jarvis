@@ -3,6 +3,7 @@ import { v } from "convex/values";
 import { requireWorker } from "./controlAuth";
 import { countGeneralFleetDemand, deriveProactiveSignals } from "./proactivePolicy";
 import { runtimeJob } from "./controlPlane";
+import { requestContextRefresh } from "./contextProjection";
 
 export const reconcile = mutation({
   args: { now: v.number(), workerToken: v.string() },
@@ -64,6 +65,10 @@ export const reconcile = mutation({
       ) {
         await ctx.db.patch(item._id, { status: "resolved", updatedAt: a.now });
       }
+    }
+
+    if (signals.length || existingAttention.some((item: any) => item.fingerprint.startsWith("proactive:"))) {
+      await requestContextRefresh(ctx, ["attention"]);
     }
 
     return {

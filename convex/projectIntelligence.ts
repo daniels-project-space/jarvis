@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { requestContextRefresh } from "./contextProjection";
 
 const fingerprint = (project: string, title: string) =>
   `${project.trim().toLowerCase()}:${title.trim().toLowerCase().replace(/\s+/g, " ")}`.slice(0, 240);
@@ -43,9 +44,12 @@ export const upsertGoal = mutation({
     };
     if (existing) {
       await ctx.db.patch(existing._id, doc);
+      await requestContextRefresh(ctx, ["projects"]);
       return existing._id;
     }
-    return await ctx.db.insert("projectGoals", { ...doc, createdAt: now });
+    const id = await ctx.db.insert("projectGoals", { ...doc, createdAt: now });
+    await requestContextRefresh(ctx, ["projects"]);
+    return id;
   },
 });
 

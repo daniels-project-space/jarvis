@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { requestContextRefresh } from "./contextProjection";
 
 // Agent findings queue: runner adds, brain weaves into conversation, panel shows detail.
 
@@ -8,13 +9,15 @@ export const add = mutation({
   args: { source: v.string(), spoken: v.string(), detail: v.string(), ...actorAuthArgs },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
-    return await ctx.db.insert("findings", {
+    const id = await ctx.db.insert("findings", {
       source: a.source.slice(0, 300),
       spoken: a.spoken.slice(0, 500),
       detail: a.detail.slice(0, 8000),
       status: "fresh",
       createdAt: Date.now(),
     });
+    await requestContextRefresh(ctx, ["work"]);
+    return id;
   },
 });
 
@@ -67,5 +70,6 @@ export const markWoven = mutation({
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     for (const id of a.ids) await ctx.db.patch(id, { status: "woven" });
+    if (a.ids.length) await requestContextRefresh(ctx, ["work"]);
   },
 });

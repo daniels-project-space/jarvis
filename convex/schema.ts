@@ -309,7 +309,8 @@ export default defineSchema({
     .index("by_status_dispatch_lease", ["status", "dispatchLeaseUntil"])
     .index("by_visibility_status_priority", ["visibility", "status", "priority", "createdAt"])
     .index("by_thread_visibility_status_priority", ["originThreadId", "visibility", "status", "priority", "createdAt"])
-    .index("by_mission", ["missionId", "createdAt"]),
+    .index("by_mission", ["missionId", "createdAt"])
+    .index("by_updatedAt", ["updatedAt"]),
 
   // Orchestrated agent fleets: one mission = a decomposed goal running as
   // parallel jobs; when the last one lands, a synthesis pass merges the
@@ -651,6 +652,50 @@ export default defineSchema({
     .index("by_project", ["project", "updatedAt"])
     .index("by_thread", ["threadId", "updatedAt"])
     .index("by_updatedAt", ["updatedAt"]),
+
+  // Perplexity-Brain-style foreground read model. Conversation turns read one
+  // compact projection plus at most four compact lexical memory hits instead
+  // of reconstructing context from the operational tables. Refresh state is
+  // deliberately separate so scheduler bookkeeping never fattens the hot row.
+  brainContextProjection: defineTable({
+    key: v.string(),
+    version: v.number(),
+    payload: v.any(),
+    payloadBytes: v.number(),
+    generatedAt: v.number(),
+  }).index("by_key", ["key"]),
+
+  brainContextRefresh: defineTable({
+    key: v.string(),
+    version: v.number(),
+    generation: v.number(),
+    dirtySources: v.array(v.string()),
+    requestedAt: v.number(),
+    scheduledAt: v.optional(v.number()),
+    lastCompletedAt: v.optional(v.number()),
+    lastError: v.optional(v.string()),
+    memoryCursor: v.optional(v.string()),
+    memoryComplete: v.boolean(),
+    memoryVersion: v.number(),
+    memoryBackfillScheduledAt: v.optional(v.number()),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
+
+  // Searchable memory DTOs are bounded at write/backfill time. The source
+  // memory rows remain untouched and retain their richer R2 pointers.
+  brainMemory: defineTable({
+    sourceId: v.id("memory"),
+    kind: v.string(),
+    title: v.string(),
+    body: v.string(),
+    tags: v.array(v.string()),
+    searchText: v.string(),
+    sourceCreatedAt: v.number(),
+    sourceUpdatedAt: v.number(),
+  })
+    .index("by_source", ["sourceId"])
+    .index("by_updatedAt", ["sourceUpdatedAt"])
+    .searchIndex("search_text", { searchField: "searchText", filterFields: ["kind"] }),
 
   // Storage-only archive from the retired model-generated insight loop. The
   // 50 historical rows remain untouched; attentionItems is the live queue.

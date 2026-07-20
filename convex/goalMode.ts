@@ -22,6 +22,7 @@ import {
   patchMissionWithRuntime,
   runtimeJob,
 } from "./controlPlane";
+import { requestContextRefresh } from "./contextProjection";
 
 const ADVANCE_LEASE_MS = 10 * 60 * 1000;
 const COORDINATOR_RECEIPT_FRESH_MS = 10 * 60 * 1000;
@@ -472,6 +473,7 @@ async function resolveGoalAttention(ctx: any, missionId: unknown) {
     .first();
   if (attention && attention.status !== "resolved") {
     await ctx.db.patch(attention._id, { status: "resolved", updatedAt: Date.now() });
+    await requestContextRefresh(ctx, ["attention"]);
   }
 }
 
@@ -869,6 +871,7 @@ async function upsertGoalAttention(ctx: any, mission: any, detail: string) {
   };
   if (existing) await ctx.db.patch(existing._id, item);
   else await ctx.db.insert("attentionItems", { ...item, createdAt: now });
+  await requestContextRefresh(ctx, ["attention"]);
 }
 
 async function queueExternalRevision(

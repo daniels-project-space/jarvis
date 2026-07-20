@@ -2,6 +2,7 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { normalizeIncidentSignature } from "../src/lib/incident-signature";
+import { requestContextRefresh } from "./contextProjection";
 
 // Self-healing incident ledger. report() dedups by signature (48h window):
 // an existing open/dispatched incident just bumps count; a recently-resolved
@@ -43,6 +44,7 @@ async function syncIncidentAttention(
   };
   if (existing) await ctx.db.patch(existing._id, item);
   else await ctx.db.insert("attentionItems", { ...item, createdAt: Date.now() });
+  await requestContextRefresh(ctx, ["attention"]);
 }
 
 export const report = mutation({

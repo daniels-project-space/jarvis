@@ -52,6 +52,14 @@ export async function convexMutation(path: string, args: unknown): Promise<any> 
 
 export const convexQuery = (path: string, args: unknown = {}) => q(CONVEX_URL, path, args);
 
+function sourceEvidence(brain: any, source: string): string {
+  const meta = brain?.sources?.[source];
+  if (!meta) return "projection source unavailable";
+  const provenance = Array.isArray(meta.provenance) ? meta.provenance.join(" + ") : String(meta.provenance ?? source);
+  const timestamp = Number(meta.sourceUpdatedAt ?? 0);
+  return `${provenance}; source updated ${timestamp > 0 ? new Date(timestamp).toISOString() : "unknown"}`;
+}
+
 async function hubSnapshot() {
   if (hubCache && hubCache.expiresAt > Date.now()) return hubCache.value;
   if (hubRequest) return hubRequest;
@@ -82,12 +90,30 @@ export async function reportIncident(source: string, signature: string, message:
 export async function buildContext(
   userText?: string,
 ): Promise<string> {
-  const [brain, hub] = await Promise.all([
+  let [brain, hub] = await Promise.all([
     q(CONVEX_URL, "brainContext:snapshot", {
       userText: userText?.slice(0, 240) || undefined,
     }),
     hubSnapshot(),
   ]);
+  if (brain?.projection?.state === "missing") {
+    // One rollout-only bootstrap preserves a grounded first answer. Once the
+    // versioned row exists, every foreground turn stays on the bounded query.
+    try {
+      brain = await convexMutation("contextProjection:bootstrap", {});
+    } catch {
+      // Keep the explicit empty/missing DTO returned by the query. The model is
+      // told that live state is unavailable instead of receiving invented data.
+    }
+  } else if (brain?.projection?.state === "stale") {
+    // Serve last-known-good context and cheaply re-arm a lost scheduler lease;
+    // rebuilding remains a background mutation.
+    try {
+      await convexMutation("contextProjection:kick", {});
+    } catch {
+      /* the stale marker below keeps consequential claims conservative */
+    }
+  }
   const todos = hub?.todos;
   const events = hub?.events;
   const wealth = hub?.wealth;
@@ -111,9 +137,29 @@ export async function buildContext(
     `PORTFOLIO NORTH STAR: ${PORTFOLIO_NORTH_STAR} ` +
       "Judge projects by movement toward their intended outcome and current phase, never by commit age or elapsed time alone.",
   );
-  if (mem.length) lines.push("Long-term memory:\n" + mem.map((m: any) => `- ${m.title}: ${m.body}`).join("\n"));
+  const projection = brain?.projection;
+  if (projection) {
+    const state = String(projection.state ?? "unknown");
+    lines.push(
+      `CONTEXT READ MODEL: ${state} projection v${projection.version ?? 0}, generated ${projection.generatedAt ? new Date(projection.generatedAt).toISOString() : "unavailable"}, ` +
+        `${projection.payloadBytes ?? 0} bytes. ` +
+        (state === "stale"
+          ? "This is last-known-good state; verify consequential live claims with a dedicated tool."
+          : state === "missing"
+            ? "Live portfolio context is unavailable; do not infer current state."
+            : "Use source timestamps below to distinguish durable facts from live observations."),
+    );
+  }
+  if (mem.length)
+    lines.push(
+      `Long-term memory (${sourceEvidence(brain, "memory")}):\n` +
+        mem.map((m: any) => `- ${m.title}: ${m.body}`).join("\n"),
+    );
   if (Array.isArray(biz) && biz.length)
-    lines.push("Businesses right now:\n" + biz.map((b: any) => `- ${b.headline}${b.detail ? " " + b.detail : ""}`).join("\n"));
+    lines.push(
+      `Businesses right now (${sourceEvidence(brain, "business")}):\n` +
+        biz.map((b: any) => `- ${b.headline}${b.detail ? " " + b.detail : ""}`).join("\n"),
+    );
   lines.push(
     openTodos.length
       ? `His actual to-do list (${openTodos.length} open): ${openTodos.slice(0, 10).map((t: any) => t.text).join("; ")}`
@@ -137,6 +183,7 @@ export async function buildContext(
   if (Array.isArray(stack) && stack.length)
     lines.push(
       "PROJECT INTELLIGENCE — distinguish deploy health from whether the app is advancing its purpose:\n" +
+        `Source: ${sourceEvidence(brain, "projects")}\n` +
         stack
           .map(
             (s: any) =>
@@ -164,6 +211,7 @@ export async function buildContext(
   if (goals.length)
     lines.push(
       "DURABLE PROJECT OUTCOMES — connect work and suggestions to these, update evidence rather than inventing a new task list:\n" +
+        `Source: ${sourceEvidence(brain, "projects")}\n` +
         goals
           .slice(0, 12)
           .map(
@@ -176,6 +224,7 @@ export async function buildContext(
   if (goalMissions.length)
     lines.push(
       "GOAL MODE — these are durable outcomes, not disposable chat jobs. Keep the main conversation available; inspect status before starting a duplicate:\n" +
+        `Source: ${sourceEvidence(brain, "work")}\n` +
         goalMissions
           .map(
             (goal: any) =>
@@ -187,7 +236,7 @@ export async function buildContext(
     );
   if (Array.isArray(jobs) && jobs.length)
     lines.push(
-      "Permanent team work right now: " +
+      `Permanent team work right now (${sourceEvidence(brain, "work")}): ` +
         jobs
           .map(
             (j: any) =>
@@ -208,6 +257,7 @@ export async function buildContext(
   if (Array.isArray(brain?.attention) && brain.attention.length)
     lines.push(
       "RANKED ATTENTION — mention only what materially needs Daniel now; otherwise act or keep quiet:\n" +
+        `Source: ${sourceEvidence(brain, "attention")}\n` +
         brain.attention
           .slice(0, 6)
           .map(
@@ -223,16 +273,18 @@ export async function buildContext(
     );
   // Current trip: answer questions and lock choices from THIS doc via
   // trip_update — never re-run trip_plan for a trip that's already in flight.
-  if (trip?.data && Date.now() - (trip.updatedAt ?? 0) < 14 * 86_400_000) {
+  if ((trip?.data || trip?.id) && Date.now() - (trip.updatedAt ?? 0) < 14 * 86_400_000) {
     try {
-      const t = JSON.parse(trip.data);
+      const t = trip.data ? JSON.parse(trip.data) : trip;
+      const tripId = trip.id ?? trip._id;
+      const locked = trip.data ? t.locked ?? {} : { flight: t.flight, stay: t.stay, activities: t.activities };
       lines.push(
-        `TRIP IN PROGRESS id=${trip._id} (${t.status}): ${t.title}, budget £${t.budgetGbp}, projected total £${t.totals?.projectedTotal ?? t.totals?.total ?? "?"}, locked total £${t.totals?.lockedTotal ?? "?"}. ` +
-          `Locked: flight ${t.locked?.flight ? `${t.locked.flight.airline} £${t.locked.flight.priceGbp}pp` : "—"}, ` +
-          `stay ${t.locked?.stay ? `${t.locked.stay.name} £${t.locked.stay.totalGbp} total` : "—"}, ` +
-          `activities: ${(t.locked?.activities ?? []).join(", ") || "—"}` +
+        `TRIP IN PROGRESS id=${tripId} (${t.status}): ${t.title}, budget £${t.budgetGbp}, projected total £${t.projectedTotal ?? t.totals?.projectedTotal ?? t.totals?.total ?? "?"}, locked total £${t.lockedTotal ?? t.totals?.lockedTotal ?? "?"}. ` +
+          `Locked: flight ${locked.flight ? `${locked.flight.airline} £${locked.flight.priceGbp}pp` : "—"}, ` +
+          `stay ${locked.stay ? `${locked.stay.name} £${locked.stay.totalGbp} total` : "—"}, ` +
+          `activities: ${(locked.activities ?? []).join(", ") || "—"}` +
           (t.transfer ? `, airport transfer ${t.transfer.durationText} (${t.transfer.distanceText}, by ${t.transfer.mode})` : "") +
-          `. Every trip_update/trip_finalize call MUST pass trip_id ${trip._id}; only call trip_plan for a NEW destination or dates.`,
+          `. Source: ${sourceEvidence(brain, "artifacts")}. Every trip_update/trip_finalize call MUST pass trip_id ${tripId}; only call trip_plan for a NEW destination or dates.`,
       );
     } catch {
       /* stale doc */
@@ -249,7 +301,7 @@ export async function buildContext(
   }
   if (Array.isArray(findings) && findings.length)
     lines.push(
-      "FRESH AGENT FINDINGS — weave the relevant one into your reply naturally (one casual sentence, offer detail on screen), don't recite:\n" +
+      `FRESH AGENT FINDINGS (${sourceEvidence(brain, "work")}) — weave the relevant one into your reply naturally (one casual sentence, offer detail on screen), don't recite:\n` +
         findings.map((f: any) => `- ${f.spoken}`).join("\n"),
     );
 
@@ -275,7 +327,7 @@ export async function buildContext(
     lines.push(desc);
   }
 
-  return lines.join("\n\n").slice(0, 9000);
+  return lines.join("\n\n").slice(0, 12_000);
 }
 
 // A deliberately small context retained for bounded utility callers. The rich
