@@ -146,7 +146,7 @@ export async function buildContext(
         (state === "stale"
           ? "This is last-known-good state; verify consequential live claims with a dedicated tool."
           : state === "migrating"
-            ? "This is the complete rollout snapshot while the bounded active-rank index backfill finishes; no legacy active row is omitted."
+            ? "The active-rank index is migrating; active work and attention coverage may be incomplete. Treat shown active records as last-known-good until completion."
           : state === "missing"
             ? "Live portfolio context is unavailable; do not infer current state."
             : "Use source timestamps below to distinguish durable facts from live observations."),

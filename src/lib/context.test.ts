@@ -39,7 +39,7 @@ function compactSnapshot() {
     generatedAt: at + 2_000,
     projection: {
       state: "fresh",
-      version: 2,
+      version: 3,
       generatedAt: at + 2_000,
       payloadBytes: 12_345,
       memoryIndexComplete: true,
@@ -76,7 +76,7 @@ describe("buildContext compact projection integration", () => {
     const block = await buildContext("How is the Jarvis context repair going?");
 
     expect(block.length).toBeLessThanOrEqual(12_000);
-    expect(block).toContain("CONTEXT READ MODEL: fresh projection v2");
+    expect(block).toContain("CONTEXT READ MODEL: fresh projection v3");
     expect(block).toContain("Long-term memory (brainMemory.bounded_index; source updated");
     expect(block).toContain("PROJECT INTELLIGENCE");
     expect(block).toContain("RANKED ATTENTION");
@@ -88,5 +88,54 @@ describe("buildContext compact projection integration", () => {
     expect(block).toContain("ON SCREEN NOW: a ranking overlay");
     expect(block).toContain("NEEDS DANIEL");
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps stale last-known-good context visible while re-arming background recovery", async () => {
+    const brain = compactSnapshot();
+    brain.projection = { ...brain.projection, state: "stale", refreshRecommended: true };
+    const paths: string[] = [];
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      paths.push(body.path);
+      if (body.path === "brainContext:snapshot") return { json: async () => ({ value: brain }) } as Response;
+      if (body.path === "jarvisContext:snapshot") {
+        return { json: async () => ({ value: { todos: [], events: [], wealth: null } }) } as Response;
+      }
+      if (body.path === "contextProjection:kick") return { json: async () => ({ value: true }) } as Response;
+      throw new Error(`Unexpected Convex path ${body.path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const block = await buildContext("What still needs attention?");
+
+    expect(paths).toContain("brainContext:snapshot");
+    expect(paths).toContain("contextProjection:kick");
+    expect(block).toContain("CONTEXT READ MODEL: stale projection v3");
+    expect(block).toContain("Validate production reads");
+    expect(block).toContain("This is last-known-good state");
+  });
+
+  it("labels migration coverage honestly instead of calling a partial active slice complete", async () => {
+    const brain = compactSnapshot();
+    brain.projection = { ...brain.projection, state: "migrating", activeIndexComplete: false } as any;
+    const paths: string[] = [];
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      paths.push(body.path);
+      if (body.path === "brainContext:snapshot") return { json: async () => ({ value: brain }) } as Response;
+      if (body.path === "jarvisContext:snapshot") {
+        return { json: async () => ({ value: { todos: [], events: [], wealth: null } }) } as Response;
+      }
+      throw new Error(`Unexpected Convex path ${body.path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const block = await buildContext("What is active?");
+
+    expect(block).toContain("active work and attention coverage may be incomplete");
+    expect(block).not.toContain("complete rollout snapshot");
+    expect(paths).toContain("brainContext:snapshot");
+    expect(paths).not.toContain("contextProjection:bootstrap");
+    expect(paths).not.toContain("contextProjection:kick");
   });
 });

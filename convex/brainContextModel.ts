@@ -1,7 +1,7 @@
 export const BRAIN_CONTEXT_KEY = "foreground";
-export const BRAIN_CONTEXT_VERSION = 2;
+export const BRAIN_CONTEXT_VERSION = 3;
 export const BRAIN_MEMORY_VERSION = 1;
-export const BRAIN_ACTIVE_INDEX_VERSION = 1;
+export const BRAIN_ACTIVE_INDEX_VERSION = 2;
 export const MAX_PROJECTION_PAYLOAD_BYTES = 30_000;
 export const MAX_MEMORY_MATCHES = 4;
 

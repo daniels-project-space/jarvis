@@ -99,6 +99,7 @@ export default defineSchema({
     .index("by_fingerprint", ["fingerprint"])
     .index("by_project_status", ["project", "status"])
     .index("by_status_priority", ["status", "priority"])
+    .index("by_createdAt", ["createdAt"])
     .index("by_updatedAt", ["updatedAt"]),
 
   // Background agent jobs: the brain enqueues, Trigger executes the routed
@@ -568,6 +569,7 @@ export default defineSchema({
     .index("by_status", ["status", "updatedAt"])
     .index("by_fingerprint", ["fingerprint"])
     .index("by_jobId", ["jobId"])
+    .index("by_createdAt", ["createdAt"])
     .index("by_updatedAt", ["updatedAt"]),
 
   // "Show me" panel — the brain sets what to display (site / doc / image); the UI
@@ -684,6 +686,8 @@ export default defineSchema({
     // the rank index until activeIndexComplete is true for the exact version.
     activeIndexVersion: v.optional(v.number()),
     activeIndexComplete: v.optional(v.boolean()),
+    activeBackfillGeneration: v.optional(v.number()),
+    activeBackfillPhase: v.optional(v.string()),
     activeBackfillSource: v.optional(v.string()),
     activeBackfillCursor: v.optional(v.string()),
     activeBackfillScheduledAt: v.optional(v.number()),

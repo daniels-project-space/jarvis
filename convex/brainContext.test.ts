@@ -184,6 +184,49 @@ describe("brainContext compact foreground contract", () => {
     });
   });
 
+  it("serves a preceding-version last-known-good payload while the bounded index migrates", async () => {
+    const payload = semanticPayload();
+    const projection = {
+      _id: "projection-prior",
+      key: BRAIN_CONTEXT_KEY,
+      version: BRAIN_CONTEXT_VERSION - 1,
+      payload,
+      payloadBytes: estimateJsonBytes(payload),
+      generatedAt: payload.generatedAt,
+    };
+    const refresh = {
+      _id: "refresh-migrating",
+      key: BRAIN_CONTEXT_KEY,
+      version: BRAIN_CONTEXT_VERSION,
+      generation: 5,
+      dirtySources: ["projects", "work", "attention"],
+      requestedAt: Date.now(),
+      memoryComplete: true,
+      memoryVersion: 1,
+      activeIndexVersion: BRAIN_ACTIVE_INDEX_VERSION,
+      activeIndexComplete: false,
+      activeBackfillGeneration: 2,
+      activeBackfillPhase: "source",
+      activeBackfillSource: "attention",
+      activeBackfillScheduledAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    const { ctx, reads } = queryContext({ projection, refresh });
+    const handler = (snapshot as unknown as { _handler: (ctx: unknown, args: unknown) => Promise<any> })._handler;
+
+    const result = await handler(ctx, {});
+
+    expect(reads.map((read) => read.table)).toEqual(["brainContextProjection", "brainContextRefresh"]);
+    expect(result.attention[0].title).toBe("Validate rollout");
+    expect(result.projects[0].slug).toBe("jarvis");
+    expect(result.projection).toMatchObject({
+      state: "migrating",
+      version: BRAIN_CONTEXT_VERSION - 1,
+      activeIndexComplete: false,
+      refreshRecommended: false,
+    });
+  });
+
   it("contains no operational-table fan-out or duplicate status scans", () => {
     const source = readFileSync(new URL("./brainContext.ts", import.meta.url), "utf8");
     for (const table of [

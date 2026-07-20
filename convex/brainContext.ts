@@ -39,19 +39,33 @@ export const snapshot = query({
           .take(MAX_MEMORY_MATCHES)
       : [];
 
+    const hasProjection = Boolean(projection?.payload);
     const versionValid = projection?.version === BRAIN_CONTEXT_VERSION;
-    const payload = versionValid ? projection.payload : emptyBrainContext(0);
-    const pending = Boolean(refresh?.dirtySources?.length);
-    const refreshLeaseLost = pending && (!refresh?.scheduledAt || now - refresh.scheduledAt >= LOST_REFRESH_LEASE_MS);
+    // A preceding-version row is still the last known good read model. During
+    // rollout it is safer and more useful than pretending that all operational
+    // state vanished; the projection state below makes its migration explicit.
+    const payload = hasProjection ? projection!.payload : emptyBrainContext(0);
     const activeIndexComplete = refresh?.activeIndexVersion === BRAIN_ACTIVE_INDEX_VERSION
       && refresh?.activeIndexComplete === true;
+    const dirtySources = Array.isArray(refresh?.dirtySources) ? refresh.dirtySources : [];
+    const pending = dirtySources.length > 0;
+    const refreshablePending = pending && (
+      activeIndexComplete
+      || dirtySources.some((source: string) => !["projects", "work", "attention"].includes(source))
+    );
+    // Dependent dirt is intentionally unscheduled while the active index is
+    // migrating. Only a source that can currently be rebuilt needs a live
+    // refresh lease; otherwise every foreground turn would mislabel healthy
+    // migration as stale and repeatedly kick a scheduler that has no work yet.
+    const refreshLeaseLost = refreshablePending
+      && (!refresh?.scheduledAt || now - refresh.scheduledAt >= LOST_REFRESH_LEASE_MS);
     const activeLeaseLost = !activeIndexComplete
       && (!refresh?.activeBackfillScheduledAt || now - refresh.activeBackfillScheduledAt >= LOST_REFRESH_LEASE_MS);
-    const state = !versionValid
+    const state = !hasProjection
       ? "missing"
       : refreshLeaseLost || activeLeaseLost
         ? "stale"
-        : !activeIndexComplete
+        : !versionValid || !activeIndexComplete
           ? "migrating"
           : pending
             ? "refreshing"
@@ -60,12 +74,12 @@ export const snapshot = query({
     return {
       ...payload,
       memory: mergeMemoryDtos(matches, payload.memory ?? [], 10),
-      generatedAt: versionValid ? projection.generatedAt : 0,
+      generatedAt: hasProjection ? projection!.generatedAt : 0,
       projection: {
         state,
-        version: versionValid ? projection.version : 0,
-        generatedAt: versionValid ? projection.generatedAt : 0,
-        payloadBytes: versionValid ? projection.payloadBytes : 0,
+        version: hasProjection ? projection!.version : 0,
+        generatedAt: hasProjection ? projection!.generatedAt : 0,
+        payloadBytes: hasProjection ? projection!.payloadBytes : 0,
         refreshRequestedAt: refresh?.requestedAt ?? 0,
         lastRefreshCompletedAt: refresh?.lastCompletedAt ?? 0,
         memoryIndexComplete: refresh?.memoryComplete ?? false,

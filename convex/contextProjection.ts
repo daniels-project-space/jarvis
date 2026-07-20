@@ -15,14 +15,10 @@ import {
   type ContextSource,
   compactAgent,
   compactApproval,
-  compactAttention,
   compactBusiness,
   compactCreation,
   compactDraft,
   compactFinding,
-  compactGoal,
-  compactJob,
-  compactMission,
   compactProject,
   compactTrip,
   compactUi,
@@ -44,16 +40,16 @@ export const ACTIVE_BACKFILL_PAGE = 32;
 
 const ACTIVE_DEPENDENT_SOURCES = new Set<ContextSource>(["projects", "work", "attention"]);
 const ACTIVE_SOURCE_SEQUENCE: readonly ActiveContextSource[] = ACTIVE_CONTEXT_SOURCES;
-const ACTIVE_JOB_STATUSES = [
-  "dispatching",
-  "running",
-  "pending",
-  "awaiting_approval",
-  "paused",
-  "needs_input",
-] as const;
-const ACTIVE_MISSION_STATUSES = ["running", "paused", "needs_input"] as const;
+const ACTIVE_BACKFILL_SOURCE_PHASE = "source";
+const ACTIVE_BACKFILL_CLEANUP_PHASE = "cleanup";
 const contextInternal = (internal as any).contextProjection;
+
+type ActiveBackfillPosition = {
+  generation: number;
+  phase: typeof ACTIVE_BACKFILL_SOURCE_PHASE | typeof ACTIVE_BACKFILL_CLEANUP_PHASE;
+  source?: ActiveContextSource;
+  cursor: string | null;
+};
 
 function uniqueSources(values: readonly string[]): ContextSource[] {
   const allowed = new Set<string>(CONTEXT_SOURCES);
@@ -180,11 +176,44 @@ export async function upsertAttentionWithContext(
   return { id, changed: true, contextChanged, created: !existing, row };
 }
 
-function activeBackfillPosition(state: any): { source: ActiveContextSource; cursor: string | null } {
-  const source = ACTIVE_SOURCE_SEQUENCE.includes(state?.activeBackfillSource)
-    ? state.activeBackfillSource as ActiveContextSource
-    : ACTIVE_SOURCE_SEQUENCE[0];
-  return { source, cursor: state?.activeBackfillCursor ?? null };
+function activeBackfillPosition(state: any): ActiveBackfillPosition | null {
+  const generation = Number(state?.activeBackfillGeneration);
+  if (!Number.isSafeInteger(generation) || generation < 1) return null;
+  const cursor = state?.activeBackfillCursor ?? null;
+  if (state?.activeBackfillPhase === ACTIVE_BACKFILL_CLEANUP_PHASE) {
+    return { generation, phase: ACTIVE_BACKFILL_CLEANUP_PHASE, cursor };
+  }
+  if (
+    state?.activeBackfillPhase === ACTIVE_BACKFILL_SOURCE_PHASE
+    && ACTIVE_SOURCE_SEQUENCE.includes(state?.activeBackfillSource)
+  ) {
+    return {
+      generation,
+      phase: ACTIVE_BACKFILL_SOURCE_PHASE,
+      source: state.activeBackfillSource as ActiveContextSource,
+      cursor,
+    };
+  }
+  return null;
+}
+
+function initialActiveBackfillPosition(generation: number): ActiveBackfillPosition {
+  return {
+    generation,
+    phase: ACTIVE_BACKFILL_SOURCE_PHASE,
+    source: ACTIVE_SOURCE_SEQUENCE[0],
+    cursor: null,
+  };
+}
+
+function activeBackfillArgs(position: ActiveBackfillPosition) {
+  return {
+    version: BRAIN_ACTIVE_INDEX_VERSION,
+    generation: position.generation,
+    phase: position.phase,
+    source: position.source,
+    cursor: position.cursor,
+  };
 }
 
 export async function requestContextRefresh(ctx: any, requested: readonly ContextSource[]) {
@@ -195,6 +224,7 @@ export async function requestContextRefresh(ctx: any, requested: readonly Contex
   const currentDirty = versionChanged ? [...CONTEXT_SOURCES] : uniqueSources(state.dirtySources ?? []);
   const dirtySources = uniqueSources([...currentDirty, ...requested]);
   const ready = !indexVersionChanged && activeIndexReady(state);
+  const storedPosition = !indexVersionChanged && !ready ? activeBackfillPosition(state) : null;
   const refreshable = ready
     ? dirtySources
     : dirtySources.filter((source) => !ACTIVE_DEPENDENT_SOURCES.has(source));
@@ -204,6 +234,7 @@ export async function requestContextRefresh(ctx: any, requested: readonly Contex
   const activeLeaseHealthy = Boolean(
     !indexVersionChanged
       && !ready
+      && storedPosition
       && state?.activeBackfillScheduledAt
       && now - state.activeBackfillScheduledAt < REFRESH_LEASE_MS,
   );
@@ -214,19 +245,14 @@ export async function requestContextRefresh(ctx: any, requested: readonly Contex
   if (state && !versionChanged && !dirtyChanged && !needsRefreshSchedule && !needsActiveSchedule) return;
 
   const generation = (state?.generation ?? 0) + (needsRefreshSchedule ? 1 : 0);
-  const position = indexVersionChanged
-    ? { source: ACTIVE_SOURCE_SEQUENCE[0], cursor: null }
-    : activeBackfillPosition(state);
-  if (needsRefreshSchedule) {
-    await ctx.scheduler.runAfter(REFRESH_DELAY_MS, contextInternal.refresh, { generation });
-  }
-  if (needsActiveSchedule) {
-    await ctx.scheduler.runAfter(0, contextInternal.backfillActive, {
-      version: BRAIN_ACTIVE_INDEX_VERSION,
-      source: position.source,
-      cursor: position.cursor,
-    });
-  }
+  // Every initial/recovered lease advances a durable generation. An abandoned
+  // scheduled mutation can therefore never resume at a reused cursor.
+  const activeGeneration = needsActiveSchedule
+    ? Number(state?.activeBackfillGeneration ?? 0) + 1
+    : storedPosition?.generation ?? Number(state?.activeBackfillGeneration ?? 0);
+  const position = storedPosition
+    ? { ...storedPosition, generation: activeGeneration }
+    : initialActiveBackfillPosition(activeGeneration || 1);
 
   const common = {
     key: BRAIN_CONTEXT_KEY,
@@ -244,6 +270,8 @@ export async function requestContextRefresh(ctx: any, requested: readonly Contex
       state?.memoryVersion === BRAIN_MEMORY_VERSION ? state.memoryBackfillScheduledAt : undefined,
     activeIndexVersion: BRAIN_ACTIVE_INDEX_VERSION,
     activeIndexComplete: ready,
+    activeBackfillGeneration: activeGeneration || undefined,
+    activeBackfillPhase: ready ? undefined : position.phase,
     activeBackfillSource: ready ? undefined : position.source,
     activeBackfillCursor: ready ? undefined : position.cursor ?? undefined,
     activeBackfillScheduledAt: needsActiveSchedule
@@ -255,6 +283,14 @@ export async function requestContextRefresh(ctx: any, requested: readonly Contex
   };
   if (state) await ctx.db.patch(state._id, common);
   else await ctx.db.insert("brainContextRefresh", common);
+  // The migration is persisted and queued before the optional non-dependent
+  // projection refresh. Both effects commit atomically with this transaction.
+  if (needsActiveSchedule) {
+    await ctx.scheduler.runAfter(0, contextInternal.backfillActive, activeBackfillArgs(position));
+  }
+  if (needsRefreshSchedule) {
+    await ctx.scheduler.runAfter(REFRESH_DELAY_MS, contextInternal.refresh, { generation });
+  }
 }
 
 async function loadMemory(ctx: any, refreshedAt: number) {
@@ -266,7 +302,7 @@ async function loadMemory(ctx: any, refreshedAt: number) {
   }
   return {
     memory: rows.map(memoryDto).slice(0, 6),
-    meta: sourceMeta(["brainMemory.by_updatedAt", "memory.by_createdAt (rollout bootstrap only)"], rows, refreshedAt),
+    meta: sourceMeta(["brainMemory.by_updatedAt", "memory.by_createdAt (bounded cold index seed)"], rows, refreshedAt),
   };
 }
 
@@ -297,7 +333,7 @@ async function loadProjects(ctx: any, refreshedAt: number) {
     projects: projects.map(compactProject),
     goals: goals.map((row: any) => row.payload),
     meta: sourceMeta(
-      ["projectState.by_slug", "brainContextActive.v1.goal.by_rank (complete active set)"],
+      ["projectState.by_slug", `brainContextActive.v${BRAIN_ACTIVE_INDEX_VERSION}.goal.by_rank (complete active set)`],
       [...projects, ...goals],
       refreshedAt,
     ),
@@ -329,8 +365,8 @@ async function loadWork(ctx: any, refreshedAt: number) {
     agents: profiles.map((profile: any) => compactAgent(profile, jobs)),
     meta: sourceMeta(
       [
-        "brainContextActive.v1.job.by_rank (complete active set)",
-        "brainContextActive.v1.mission.by_rank (complete active set)",
+        `brainContextActive.v${BRAIN_ACTIVE_INDEX_VERSION}.job.by_rank (complete active set)`,
+        `brainContextActive.v${BRAIN_ACTIVE_INDEX_VERSION}.mission.by_rank (complete active set)`,
         "agentProfiles.by_slug",
         "findings.by_status=fresh",
         "approvals.by_status=pending",
@@ -346,131 +382,8 @@ async function loadAttention(ctx: any, refreshedAt: number) {
   return {
     attention: rows.map((row: any) => row.payload),
     meta: sourceMeta(
-      ["brainContextActive.v1.attention.by_true_score (complete open + working set)"],
+      [`brainContextActive.v${BRAIN_ACTIVE_INDEX_VERSION}.attention.by_true_score (complete open + working set)`],
       rows,
-      refreshedAt,
-    ),
-  };
-}
-
-// This is the only operational fan-out in the new design. It runs once when a
-// projection version is first rolled out, so legacy rows are visible in the
-// last-known-good DTO while the bounded rank-index migration catches up.
-async function loadLegacyProjects(ctx: any, refreshedAt: number) {
-  const [projects, goalGroups] = await Promise.all([
-    ctx.db.query("projectState").withIndex("by_slug").take(24),
-    Promise.all(
-      ["active", "blocked"].map((status) =>
-        ctx.db
-          .query("projectGoals")
-          .withIndex("by_status_priority", (q: any) => q.eq("status", status))
-          .order("desc")
-          .take(ACTIVE_CONTEXT_LIMITS.goal),
-      ),
-    ),
-  ]);
-  const goals = goalGroups
-    .flat()
-    .sort((left: any, right: any) => right.priority - left.priority || right.createdAt - left.createdAt)
-    .slice(0, ACTIVE_CONTEXT_LIMITS.goal);
-  return {
-    projects: projects.map(compactProject),
-    goals: goals.map(compactGoal),
-    meta: sourceMeta(
-      ["projectState.by_slug", "projectGoals.by_status_priority (rollout bootstrap only)"],
-      [...projects, ...goals],
-      refreshedAt,
-    ),
-  };
-}
-
-async function loadLegacyWork(ctx: any, refreshedAt: number) {
-  const [jobGroups, missionGroups, profiles, findings, approvals] = await Promise.all([
-    Promise.all(
-      ACTIVE_JOB_STATUSES.map((status) =>
-        ctx.db
-          .query("jobRuntime")
-          .withIndex("by_status_priority", (q: any) => q.eq("status", status))
-          .order("desc")
-          .take(ACTIVE_CONTEXT_LIMITS.job),
-      ),
-    ),
-    Promise.all(
-      ACTIVE_MISSION_STATUSES.map((status) =>
-        ctx.db
-          .query("missionRuntime")
-          .withIndex("by_mode_status_priority", (q: any) => q.eq("mode", "goal").eq("status", status))
-          .order("desc")
-          .take(ACTIVE_CONTEXT_LIMITS.mission),
-      ),
-    ),
-    ctx.db.query("agentProfiles").withIndex("by_slug").take(12),
-    ctx.db
-      .query("findings")
-      .withIndex("by_status", (q: any) => q.eq("status", "fresh"))
-      .order("desc")
-      .take(8),
-    ctx.db
-      .query("approvals")
-      .withIndex("by_status", (q: any) => q.eq("status", "pending"))
-      .order("desc")
-      .take(6),
-  ]);
-  const sourceJobs = jobGroups
-    .flat()
-    .sort((left: any, right: any) => right.priority - left.priority || right.createdAt - left.createdAt)
-    .slice(0, ACTIVE_CONTEXT_LIMITS.job);
-  const sourceMissions = missionGroups
-    .flat()
-    .sort((left: any, right: any) => right.priority - left.priority || right.createdAt - left.createdAt)
-    .slice(0, ACTIVE_CONTEXT_LIMITS.mission);
-  const jobs = sourceJobs.map(compactJob);
-  return {
-    jobs,
-    goalMissions: sourceMissions.map(compactMission),
-    findings: findings.map(compactFinding).slice(0, 6),
-    approvals: approvals.map(compactApproval),
-    agents: profiles.map((profile: any) => compactAgent(profile, jobs)),
-    meta: sourceMeta(
-      [
-        "jobRuntime.by_status_priority (rollout bootstrap only)",
-        "missionRuntime.by_mode_status_priority (rollout bootstrap only)",
-        "agentProfiles.by_slug",
-        "findings.by_status=fresh",
-        "approvals.by_status=pending",
-      ],
-      [...sourceJobs, ...sourceMissions, ...profiles, ...findings, ...approvals],
-      refreshedAt,
-    ),
-  };
-}
-
-async function loadLegacyAttention(ctx: any, refreshedAt: number) {
-  // Attention score is a product of three stored fields and cannot be derived
-  // from a legacy lexicographic index. The rollout bootstrap reads the complete
-  // current active set once; every later rebuild uses brainContextActive.
-  const groups = await Promise.all(
-    ["open", "working"].map((status) =>
-      ctx.db
-        .query("attentionItems")
-        .withIndex("by_status", (q: any) => q.eq("status", status))
-        .collect(),
-    ),
-  );
-  const sourceRows = groups
-    .flat()
-    .sort(
-      (left: any, right: any) =>
-        right.impact * right.urgency * right.confidence
-        - left.impact * left.urgency * left.confidence
-        || right.createdAt - left.createdAt,
-    )
-    .slice(0, ACTIVE_CONTEXT_LIMITS.attention);
-  return {
-    attention: sourceRows.map(compactAttention),
-    meta: sourceMeta(
-      ["attentionItems.by_status complete active set (one rollout bootstrap only)"],
-      sourceRows,
       refreshedAt,
     ),
   };
@@ -510,27 +423,35 @@ async function rebuildProjection(
   ctx: any,
   requested: readonly ContextSource[],
   now: number,
-  mode: "indexed" | "rollout" = "indexed",
 ): Promise<{ payload: BrainContextPayload; payloadBytes: number }> {
   const existing = await projectionRow(ctx);
   const versionValid = existing?.version === BRAIN_CONTEXT_VERSION;
-  if (!versionValid && mode !== "rollout") throw new Error("rollout bootstrap required");
-  const previous: BrainContextPayload = versionValid ? existing.payload : emptyBrainContext(now);
-  const sources = mode === "rollout" ? [...CONTEXT_SOURCES] : uniqueSources(requested);
+  const previous: BrainContextPayload = existing?.payload ?? emptyBrainContext(now);
+  const sources = uniqueSources(requested);
   const payload: BrainContextPayload = JSON.parse(JSON.stringify(previous));
+  payload.sources ??= {};
+  if (!versionValid) {
+    // Carry a preceding projection forward only as explicitly labelled
+    // last-known-good data. No active slice is claimed complete until the
+    // versioned source pass and cleanup pass both finish.
+    for (const source of ACTIVE_DEPENDENT_SOURCES) {
+      const prior = payload.sources[source];
+      payload.sources[source] = {
+        provenance: [existing
+          ? `brainContextProjection.v${existing.version} last-known-good; active index v${BRAIN_ACTIVE_INDEX_VERSION} migrating (coverage incomplete)`
+          : `brainContextActive.v${BRAIN_ACTIVE_INDEX_VERSION} migration pending (no complete active slice)`],
+        sourceUpdatedAt: prior?.sourceUpdatedAt ?? 0,
+        refreshedAt: prior?.refreshedAt ?? 0,
+      };
+    }
+  }
 
   const results = await Promise.all([
     sources.includes("memory") ? loadMemory(ctx, now) : null,
     sources.includes("business") ? loadBusiness(ctx, now) : null,
-    sources.includes("projects")
-      ? mode === "rollout" ? loadLegacyProjects(ctx, now) : loadProjects(ctx, now)
-      : null,
-    sources.includes("work")
-      ? mode === "rollout" ? loadLegacyWork(ctx, now) : loadWork(ctx, now)
-      : null,
-    sources.includes("attention")
-      ? mode === "rollout" ? loadLegacyAttention(ctx, now) : loadAttention(ctx, now)
-      : null,
+    sources.includes("projects") ? loadProjects(ctx, now) : null,
+    sources.includes("work") ? loadWork(ctx, now) : null,
+    sources.includes("attention") ? loadAttention(ctx, now) : null,
     sources.includes("artifacts") ? loadArtifacts(ctx, now) : null,
     sources.includes("ui") ? loadUi(ctx, now) : null,
   ]);
@@ -645,74 +566,184 @@ async function activeSourcePage(ctx: any, source: ActiveContextSource, cursor: s
     return await ctx.db.query("missionRuntime").withIndex("by_createdAt").order("asc").paginate(pagination);
   }
   if (source === "goal") {
-    return await ctx.db.query("projectGoals").withIndex("by_updatedAt").order("asc").paginate(pagination);
+    return await ctx.db.query("projectGoals").withIndex("by_createdAt").order("asc").paginate(pagination);
   }
-  return await ctx.db.query("attentionItems").withIndex("by_updatedAt").order("asc").paginate(pagination);
+  return await ctx.db.query("attentionItems").withIndex("by_createdAt").order("asc").paginate(pagination);
+}
+
+async function authoritativeActiveSource(ctx: any, row: any) {
+  const source = row?.source as ActiveContextSource;
+  const sourceId = String(row?.sourceId ?? "");
+  if (!ACTIVE_SOURCE_SEQUENCE.includes(source) || !sourceId) return null;
+  if (source === "job") {
+    const id = ctx.db.normalizeId("jobs", sourceId);
+    return id
+      ? await ctx.db.query("jobRuntime").withIndex("by_job", (q: any) => q.eq("jobId", id)).first()
+      : null;
+  }
+  if (source === "mission") {
+    const id = ctx.db.normalizeId("missions", sourceId);
+    return id
+      ? await ctx.db.query("missionRuntime").withIndex("by_mission", (q: any) => q.eq("missionId", id)).first()
+      : null;
+  }
+  const id = ctx.db.normalizeId(source === "goal" ? "projectGoals" : "attentionItems", sourceId);
+  return id ? await ctx.db.get(id) : null;
+}
+
+// The cleanup pass is deliberately source-authoritative. It removes orphaned,
+// inactive and duplicate rows, and reprojects a stale rank from the newest
+// source document. Every lookup is singleton or take(2), so a corrupt index
+// still cannot turn one migration page into an unbounded transaction.
+async function reconcileActiveIndexEntry(ctx: any, candidate: any): Promise<boolean> {
+  const live = await ctx.db.get(candidate._id);
+  if (!live) return false;
+  if (!ACTIVE_SOURCE_SEQUENCE.includes(live.source as ActiveContextSource)) {
+    await ctx.db.delete(live._id);
+    return true;
+  }
+  const source = live.source as ActiveContextSource;
+  const sourceRow = await authoritativeActiveSource(ctx, live);
+  const projected = sourceRow ? contextActiveRecord(source, sourceRow) : null;
+  if (!projected) {
+    await ctx.db.delete(live._id);
+    return true;
+  }
+  const siblings = await ctx.db
+    .query("brainContextActive")
+    .withIndex("by_source_id", (q: any) => q.eq("source", source).eq("sourceId", live.sourceId))
+    .take(2);
+  const canonical = [...siblings].sort((left: any, right: any) =>
+    Number(right.version === BRAIN_ACTIVE_INDEX_VERSION) - Number(left.version === BRAIN_ACTIVE_INDEX_VERSION)
+    || Number(right.sourceUpdatedAt ?? 0) - Number(left.sourceUpdatedAt ?? 0)
+    || Number(left._creationTime ?? 0) - Number(right._creationTime ?? 0),
+  )[0] ?? live;
+  if (String(canonical._id) !== String(live._id)) {
+    await ctx.db.delete(live._id);
+    return true;
+  }
+  let changed = false;
+  if (contextActiveMaterialChanged(live, projected)) {
+    await ctx.db.replace(live._id, projected);
+    changed = true;
+  }
+  for (const sibling of siblings) {
+    if (String(sibling._id) === String(live._id)) continue;
+    await ctx.db.delete(sibling._id);
+    changed = true;
+  }
+  return changed;
+}
+
+async function activeCleanupPage(ctx: any, cursor: string | null) {
+  return await ctx.db
+    .query("brainContextActive")
+    .withIndex("by_source_id")
+    .order("asc")
+    .paginate({
+      cursor,
+      numItems: ACTIVE_BACKFILL_PAGE,
+      maximumRowsRead: ACTIVE_BACKFILL_PAGE,
+    });
+}
+
+function sameActiveBackfillCall(a: any, position: ActiveBackfillPosition): boolean {
+  return a.version === BRAIN_ACTIVE_INDEX_VERSION
+    && a.generation === position.generation
+    && a.phase === position.phase
+    && (a.source ?? undefined) === position.source
+    && a.cursor === position.cursor;
+}
+
+async function scheduleActiveBackfill(ctx: any, position: ActiveBackfillPosition, delay = 100) {
+  await ctx.scheduler.runAfter(delay, contextInternal.backfillActive, activeBackfillArgs(position));
 }
 
 export const backfillActive = internalMutation({
   args: {
     version: v.number(),
-    source: v.string(),
+    generation: v.optional(v.number()),
+    phase: v.optional(v.string()),
+    source: v.optional(v.string()),
     cursor: v.union(v.string(), v.null()),
   },
   handler: async (ctx, a) => {
     const state = await refreshState(ctx);
     if (!state || activeIndexReady(state)) return { complete: true };
     const position = activeBackfillPosition(state);
-    if (
-      a.version !== BRAIN_ACTIVE_INDEX_VERSION
-      || a.source !== position.source
-      || a.cursor !== position.cursor
-    ) return { complete: false, reason: "superseded" };
+    if (!position || !sameActiveBackfillCall(a, position)) {
+      return { complete: false, reason: "superseded" };
+    }
 
-    const page = await activeSourcePage(ctx, position.source, position.cursor);
     let changed = 0;
+    const page = position.phase === ACTIVE_BACKFILL_SOURCE_PHASE
+      ? await activeSourcePage(ctx, position.source!, position.cursor)
+      : await activeCleanupPage(ctx, position.cursor);
     for (const row of page.page) {
-      if (await syncContextActiveRow(ctx, position.source, row)) changed += 1;
+      const didChange = position.phase === ACTIVE_BACKFILL_SOURCE_PHASE
+        ? await syncContextActiveRow(ctx, position.source!, row)
+        : await reconcileActiveIndexEntry(ctx, row);
+      if (didChange) changed += 1;
     }
     const now = Date.now();
     if (!page.isDone) {
-      await ctx.scheduler.runAfter(100, contextInternal.backfillActive, {
-        version: BRAIN_ACTIVE_INDEX_VERSION,
-        source: position.source,
+      const next = {
+        ...position,
         cursor: page.continueCursor,
-      });
+      };
+      await scheduleActiveBackfill(ctx, next);
       await ctx.db.patch(state._id, {
         activeBackfillCursor: page.continueCursor,
         activeBackfillScheduledAt: now,
         updatedAt: now,
       });
-      return { complete: false, source: position.source, processed: page.page.length, changed };
+      return {
+        complete: false,
+        phase: position.phase,
+        source: position.source,
+        processed: page.page.length,
+        changed,
+      };
     }
 
-    const sourceIndex = ACTIVE_SOURCE_SEQUENCE.indexOf(position.source);
-    const nextSource = ACTIVE_SOURCE_SEQUENCE[sourceIndex + 1];
-    if (nextSource) {
-      await ctx.scheduler.runAfter(100, contextInternal.backfillActive, {
-        version: BRAIN_ACTIVE_INDEX_VERSION,
-        source: nextSource,
-        cursor: null,
-      });
+    if (position.phase === ACTIVE_BACKFILL_SOURCE_PHASE) {
+      const sourceIndex = ACTIVE_SOURCE_SEQUENCE.indexOf(position.source!);
+      const nextSource = ACTIVE_SOURCE_SEQUENCE[sourceIndex + 1];
+      const next: ActiveBackfillPosition = nextSource
+        ? { ...position, source: nextSource, cursor: null }
+        : {
+            generation: position.generation,
+            phase: ACTIVE_BACKFILL_CLEANUP_PHASE,
+            cursor: null,
+          };
+      await scheduleActiveBackfill(ctx, next);
       await ctx.db.patch(state._id, {
-        activeBackfillSource: nextSource,
+        activeBackfillPhase: next.phase,
+        activeBackfillSource: next.source,
         activeBackfillCursor: undefined,
         activeBackfillScheduledAt: now,
         updatedAt: now,
       });
-      return { complete: false, source: position.source, processed: page.page.length, changed };
+      return {
+        complete: false,
+        phase: position.phase,
+        source: position.source,
+        processed: page.page.length,
+        changed,
+      };
     }
 
     await ctx.db.patch(state._id, {
       activeIndexVersion: BRAIN_ACTIVE_INDEX_VERSION,
       activeIndexComplete: true,
+      activeBackfillPhase: undefined,
       activeBackfillSource: undefined,
       activeBackfillCursor: undefined,
       activeBackfillScheduledAt: undefined,
       updatedAt: now,
     });
     await requestContextRefresh(ctx, ["projects", "work", "attention"]);
-    return { complete: true, source: position.source, processed: page.page.length, changed };
+    return { complete: true, phase: position.phase, processed: page.page.length, changed };
   },
 });
 
@@ -761,77 +792,34 @@ export const backfillMemory = internalMutation({
   },
 });
 
-// A deployment/cold-start safety valve. It performs one complete operational
-// bootstrap for the new version, then all foreground reads and rebuilds stay on
-// singleton/compact rank projections while the resumable migration finishes.
+// Deployment/cold-start safety valve. It only persists and schedules bounded
+// background work. A prior projection is returned as explicitly migrating
+// last-known-good context; a true cold start returns an honest empty DTO. No
+// operational source table is read by this foreground-triggered transaction.
 export const bootstrap = mutation({
   args: { ...actorAuthArgs },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
-    const [existing, state] = await Promise.all([projectionRow(ctx), refreshState(ctx)]);
-    if (existing?.version === BRAIN_CONTEXT_VERSION) {
-      await requestContextRefresh(ctx, []);
-      const current = await refreshState(ctx);
-      if (current) await scheduleMemoryBackfill(ctx, current, Date.now());
-      return {
-        ...existing.payload,
-        projection: {
-          state: activeIndexReady(current) ? "fresh" : "migrating",
-          version: existing.version,
-          payloadBytes: existing.payloadBytes,
-          generatedAt: existing.generatedAt,
-          memoryIndexComplete: current?.memoryComplete ?? false,
-          activeIndexComplete: activeIndexReady(current),
-        },
-      };
-    }
-
+    const existing = await projectionRow(ctx);
     const now = Date.now();
-    const generation = (state?.generation ?? 0) + 1;
-    const result = await rebuildProjection(ctx, CONTEXT_SOURCES, now, "rollout");
-    const keepActiveMigration = state?.activeIndexVersion === BRAIN_ACTIVE_INDEX_VERSION;
-    const nextState = {
-      key: BRAIN_CONTEXT_KEY,
-      version: BRAIN_CONTEXT_VERSION,
-      generation,
-      dirtySources: [],
-      requestedAt: now,
-      scheduledAt: undefined,
-      lastCompletedAt: now,
-      lastError: undefined,
-      memoryCursor: state?.memoryVersion === BRAIN_MEMORY_VERSION ? state.memoryCursor : undefined,
-      memoryComplete: state?.memoryVersion === BRAIN_MEMORY_VERSION ? Boolean(state.memoryComplete) : false,
-      memoryVersion: BRAIN_MEMORY_VERSION,
-      memoryBackfillScheduledAt: undefined,
-      activeIndexVersion: BRAIN_ACTIVE_INDEX_VERSION,
-      activeIndexComplete: keepActiveMigration ? Boolean(state.activeIndexComplete) : false,
-      activeBackfillSource: keepActiveMigration
-        ? state.activeBackfillSource ?? ACTIVE_SOURCE_SEQUENCE[0]
-        : ACTIVE_SOURCE_SEQUENCE[0],
-      activeBackfillCursor: keepActiveMigration ? state.activeBackfillCursor : undefined,
-      activeBackfillScheduledAt: undefined,
-      updatedAt: now,
-    };
-    let persistedState: any;
-    if (state) {
-      await ctx.db.replace(state._id, nextState);
-      persistedState = { ...nextState, _id: state._id };
-    } else {
-      const id = await ctx.db.insert("brainContextRefresh", nextState);
-      persistedState = { ...nextState, _id: id };
-    }
     await requestContextRefresh(ctx, []);
-    const current = await refreshState(ctx) ?? persistedState;
-    await scheduleMemoryBackfill(ctx, current, now);
+    const current = await refreshState(ctx);
+    if (current) await scheduleMemoryBackfill(ctx, current, now);
+    const payload: BrainContextPayload = existing?.payload ?? emptyBrainContext(0);
+    const ready = activeIndexReady(current);
+    const currentVersion = existing?.version === BRAIN_CONTEXT_VERSION;
     return {
-      ...result.payload,
+      ...payload,
       projection: {
-        state: activeIndexReady(current) ? "fresh" : "migrating",
-        version: BRAIN_CONTEXT_VERSION,
-        payloadBytes: result.payloadBytes,
-        generatedAt: now,
-        memoryIndexComplete: current.memoryComplete ?? false,
-        activeIndexComplete: activeIndexReady(current),
+        state: ready && currentVersion
+          ? current?.dirtySources?.length ? "refreshing" : "fresh"
+          : "migrating",
+        version: existing?.version ?? 0,
+        payloadBytes: existing?.payloadBytes ?? estimateJsonBytes(payload),
+        generatedAt: existing?.generatedAt ?? 0,
+        memoryIndexComplete: current?.memoryComplete ?? false,
+        activeIndexComplete: ready,
+        refreshRecommended: false,
       },
     };
   },
