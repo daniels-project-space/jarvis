@@ -78,13 +78,14 @@ describe("commandCenter.snapshot contract", () => {
     expect(selected).not.toHaveProperty("branch");
   });
 
-  it("reads only the compact runtime source for the requested thread", async () => {
+  it("scopes reads to the requested or canonical active thread", async () => {
     const reads: Array<{
       table: string;
       index?: string;
       equalities: Record<string, unknown>;
       order?: string;
       limit?: number;
+      first?: boolean;
     }> = [];
     const rowsByStatus: Record<string, Array<Record<string, unknown>>> = {
       running: [runtime({ jobId: "job-running", priority: 60 })],
@@ -99,6 +100,7 @@ describe("commandCenter.snapshot contract", () => {
       filter: (apply: (q: MockFilter) => unknown) => MockBuilder;
       order: (direction: string) => MockBuilder;
       take: (limit: number) => Promise<Array<Record<string, unknown>>>;
+      first: () => Promise<Record<string, unknown> | null>;
     };
     const ctx = {
       auth: {
@@ -138,6 +140,10 @@ describe("commandCenter.snapshot contract", () => {
               read.limit = limit;
               return rowsByStatus[String(read.equalities.status)] ?? [];
             },
+            async first() {
+              read.first = true;
+              return table === "ui" ? { value: currentThread } : null;
+            },
           };
           return builder;
         },
@@ -145,7 +151,7 @@ describe("commandCenter.snapshot contract", () => {
     };
 
     const handler = (snapshot as unknown as {
-      _handler: (context: unknown, args: { threadId: string }) => Promise<unknown>;
+      _handler: (context: unknown, args: { threadId?: string }) => Promise<unknown>;
     })._handler;
     const result = await handler(ctx, { threadId: currentThread });
 
@@ -158,7 +164,7 @@ describe("commandCenter.snapshot contract", () => {
         percent: 64,
       },
     });
-    expect(reads).toEqual(COMPACT_WORK_STATUSES.map((status) => ({
+    const expectedRuntimeReads = COMPACT_WORK_STATUSES.map((status) => ({
       table: "jobRuntime",
       index: "by_visibility_status_priority",
       equalities: {
@@ -168,7 +174,20 @@ describe("commandCenter.snapshot contract", () => {
       },
       order: "desc",
       limit: 12,
-    })));
+    }));
+    expect(reads).toEqual(expectedRuntimeReads);
     expect(reads.some((read) => read.table === "attentionItems" || read.table === "approvals")).toBe(false);
+
+    reads.length = 0;
+    expect(await handler(ctx, {})).toEqual(result);
+    expect(reads).toEqual([
+      {
+        table: "ui",
+        index: "by_key",
+        equalities: { key: "activeThread" },
+        first: true,
+      },
+      ...expectedRuntimeReads,
+    ]);
   });
 });

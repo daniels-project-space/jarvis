@@ -65,7 +65,7 @@ export function selectCompactConversationWork(
 // attention, approvals, missions and rich job details have dedicated queries
 // and must never be folded into the top conversation work bar.
 export const snapshot = query({
-  args: { threadId: v.string(), ...viewerAuthArgs },
+  args: { threadId: v.optional(v.string()), ...viewerAuthArgs },
   returns: v.object({
     active: v.union(
       v.null(),
@@ -80,7 +80,17 @@ export const snapshot = query({
   }),
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    const threadId = a.threadId.trim();
+    let threadId = a.threadId?.trim();
+    if (a.threadId === undefined) {
+      // Browser tabs can outlive a Vercel rollout. Callers loaded before the
+      // snapshot became thread-scoped must follow the same canonical thread,
+      // never fall back to a cross-conversation view.
+      const activeThread = await ctx.db
+        .query("ui")
+        .withIndex("by_key", (q) => q.eq("key", "activeThread"))
+        .first();
+      threadId = activeThread?.value.trim() || "main";
+    }
     if (!threadId) return { active: null };
 
     const groups = await Promise.all(
