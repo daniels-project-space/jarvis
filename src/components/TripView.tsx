@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { viewerFetch } from "@/lib/viewer-request";
+import { loadClientChunk } from "@/lib/client-chunk";
 import "maplibre-gl/dist/maplibre-gl.css";
 
 // The trip planner panel: a REAL dark 3D map (MapLibre globe projection on
@@ -41,7 +42,9 @@ function MapView({
   useEffect(() => {
     let dead = false;
     (async () => {
-      const maplibregl = (await import("maplibre-gl")).default;
+      const maplibreModule = await loadClientChunk(() => import("maplibre-gl"));
+      if (!maplibreModule) return;
+      const maplibregl = maplibreModule.default;
       if (dead || !mountRef.current) return;
       const map = new maplibregl.Map({
         container: mountRef.current,
@@ -69,7 +72,7 @@ function MapView({
         setMapReady(true);
       });
       mapRef.current = map;
-    })();
+    })().catch(() => {});
     return () => {
       dead = true;
       try {
@@ -87,7 +90,9 @@ function MapView({
     const map = mapRef.current;
     if (!map || !mapReady) return;
     (async () => {
-      const maplibregl = (await import("maplibre-gl")).default;
+      const maplibreModule = await loadClientChunk(() => import("maplibre-gl"));
+      if (!maplibreModule) return;
+      const maplibregl = maplibreModule.default;
       const seen = new Set<string>();
       for (const m of markers) {
         seen.add(m.key);
@@ -144,7 +149,7 @@ function MapView({
         }));
       const src = map.getSource("plan-links");
       if (src) (src as any).setData({ type: "FeatureCollection", features: feats });
-    })();
+    })().catch(() => {});
   }, [markers, links, selected, mapReady]);
 
   return <div ref={mountRef} className="h-full w-full [&_.maplibregl-ctrl-attrib]:!bg-black/40 [&_.maplibregl-ctrl-attrib]:!text-[9px]" />;

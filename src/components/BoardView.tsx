@@ -4,6 +4,7 @@ import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
+import { loadClientChunk, recoverDynamicClientChunkLoad } from "@/lib/client-chunk";
 import "@excalidraw/excalidraw/index.css";
 import {
   Background,
@@ -26,7 +27,7 @@ import "@xyflow/react/dist/style.css";
 // them LIVE into the scene, and Daniel's own edits persist back via
 // creations:boardSave (which never clobbers ops queued mid-save).
 
-const Excalidraw = dynamic(() => import("@excalidraw/excalidraw").then((m) => m.Excalidraw), {
+const Excalidraw = dynamic(() => import("@excalidraw/excalidraw").then((m) => m.Excalidraw).catch(recoverDynamicClientChunkLoad), {
   ssr: false,
   loading: () => (
     <div className="flex h-full items-center justify-center text-sm text-slate">
@@ -248,7 +249,9 @@ export default function BoardView({ value }: { value: string }) {
     if (!ex || !doc || !ready) return;
     let cancelled = false;
     (async () => {
-      const { convertToExcalidrawElements } = await import("@excalidraw/excalidraw");
+      const excalidraw = await loadClientChunk(() => import("@excalidraw/excalidraw"));
+      if (!excalidraw) return;
+      const { convertToExcalidrawElements } = excalidraw;
       // restore image files for elements loaded from persistence
       for (const [fileId, url] of Object.entries<string>(doc.imageUrls ?? {})) {
         if (ex.getFiles()?.[fileId]) continue;
@@ -322,7 +325,7 @@ export default function BoardView({ value }: { value: string }) {
         });
       }
       void persist(); // also clears applied edit/delete ops from the queue
-    })();
+    })().catch(() => {});
     return () => {
       cancelled = true;
     };

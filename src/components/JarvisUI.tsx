@@ -29,7 +29,15 @@ import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, ty
 import { parseTerminalOutput, type TerminalTone } from "@/lib/terminal-output";
 import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate, shouldIgnoreHandsFreeTranscript } from "@/lib/transcript";
-import { completeSpeechPrefix, isSpeaking as isTtsActuallySpeaking, unlockSpeechPlayback } from "@/lib/tts";
+import {
+  completeSpeechPrefix,
+  isEchoOfTts,
+  isSpeaking as isTtsActuallySpeaking,
+  speak,
+  stopSpeaking,
+  unlockSpeechPlayback,
+  warm as warmTts,
+} from "@/lib/tts";
 import { NarrationLedger, narrationClaim } from "@/lib/narration";
 import { resolvePanelRoute } from "@/lib/panel-contract";
 import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
@@ -38,18 +46,34 @@ import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actio
 import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
 import { viewerFetch } from "@/lib/viewer-request";
 import { normalizeIncidentSignature } from "@/lib/incident-signature";
+import {
+  isClientChunkLoadError,
+  loadClientChunk,
+  recoverClientChunkLoad,
+  recoverDynamicClientChunkLoad,
+} from "@/lib/client-chunk";
 
-const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
+type WakewordModule = typeof import("../lib/wakeword");
 
-const TripView = dynamic(() => import("./TripView"), {
+const loadWakeword = () => loadClientChunk(() => import("../lib/wakeword"));
+const withWakeword = (action: (module: WakewordModule) => unknown) => {
+  void loadWakeword()
+    .then((module) => module ? action(module) : undefined)
+    .catch(() => {});
+};
+const warmSpeech = () => void warmTts().catch(() => {});
+
+const ThreeOrb = dynamic(() => import("./ThreeOrb").catch(recoverDynamicClientChunkLoad), { ssr: false });
+
+const TripView = dynamic(() => import("./TripView").catch(recoverDynamicClientChunkLoad), {
   ssr: false,
   loading: () => <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-cyan">loading travel workspace…</div>,
 });
-const BoardView = dynamic(() => import("./BoardView"), {
+const BoardView = dynamic(() => import("./BoardView").catch(recoverDynamicClientChunkLoad), {
   ssr: false,
   loading: () => <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-cyan">loading drawing workspace…</div>,
 });
-const VisualSceneView = dynamic(() => import("./VisualSceneView"), {
+const VisualSceneView = dynamic(() => import("./VisualSceneView").catch(recoverDynamicClientChunkLoad), {
   ssr: false,
   loading: () => <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-cyan">assembling visual workspace…</div>,
 });
@@ -589,6 +613,8 @@ function AgentLiveSurface({
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ jobId: job._id, action }),
       });
+    } catch {
+      // The live work row remains authoritative while this client reconnects.
     } finally {
       setActing("");
     }
@@ -727,7 +753,7 @@ function TimerWidget({ w }: { w: any }) {
       setLeft(l);
       if (l === 0 && !chimed.current) {
         chimed.current = true;
-        import("../lib/wakeword").then((m) => {
+        withWakeword((m) => {
           m.chime();
           setTimeout(m.chime, 500);
           setTimeout(m.chime, 1000);
@@ -1333,13 +1359,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "set_active_thread", ...args }),
-    });
+    }).catch(() => undefined);
   const clearThread = (args: { threadId?: string }) =>
     viewerFetch("/api/client-state", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "clear_thread", ...args }),
-    });
+    }).catch(() => undefined);
   const threadRef = useRef("main");
   const threadReadyRef = useRef(false);
   const pendingEntryCommands = useRef<string[]>([]);
@@ -1374,14 +1400,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const panel = instantPanel ?? remotePanel;
   const panelRoute = useMemo(() => (panel ? resolvePanelRoute(panel) : null), [panel]);
   const stagePanelSize = panelRoute?.size ?? "";
-  const clearPanel = (args: Record<string, unknown>) => clientMutation("ui:clearPanel", args);
-  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
+  const clearPanel = (args: Record<string, unknown>) => clientMutation("ui:clearPanel", args).catch(() => undefined);
+  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args).catch(() => undefined);
   const logTurn = (args: { threadId?: string; role: string; text: string; model?: string }) =>
     viewerFetch("/api/client-state", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "log_turn", ...args }),
-    });
+    }).catch(() => undefined);
   const saveSub = (args: Record<string, unknown>) => clientMutation("push:saveSub", args);
   const claimVoice = (args: Record<string, unknown>) => clientMutation("ui:claimVoice", args);
   const electVoice = (args: Record<string, unknown>) => clientMutation("ui:electVoice", args);
@@ -1617,7 +1643,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // Speech deliberately has no engine or voice switch: every device uses the
   // same neural Jarvis identity.
   const [optionsOpen, setOptionsOpen] = useState(false);
-  const setMoodMut = (args: Record<string, unknown>) => clientMutation("ui:setMood", args);
+  const setMoodMut = (args: Record<string, unknown>) => clientMutation("ui:setMood", args).catch(() => undefined);
   const [prefs, setPrefs] = useState<JarvisPrefs>({ reduceMotion: false, liveDefault: true });
   const [permissions, setPermissions] = useState<JarvisPermissionState>({ microphone: "prompt", notifications: "prompt" });
   const [permissionBusy, setPermissionBusy] = useState(false);
@@ -1642,7 +1668,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
       cancelIdleCallback?: (id: number) => void;
     };
-    const start = () => void import("../lib/tts").then((module) => module.warm());
+    const start = warmSpeech;
     if (idleWindow.requestIdleCallback) {
       const id = idleWindow.requestIdleCallback(start, { timeout: embedded ? 2_000 : 900 });
       return () => idleWindow.cancelIdleCallback?.(id);
@@ -1704,7 +1730,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "set_location", ...args }),
-    });
+    }).catch(() => undefined);
   const [locOn, setLocOn] = useState(false);
   const captureLocation = (announce = false): Promise<boolean> =>
     new Promise((resolve) => {
@@ -1824,29 +1850,27 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // Show the Hub overlay and begin the neural voice load immediately, while
     // SpeechRecognition is still collecting a same-breath command.
     if (embedded) window.parent.postMessage({ jarvis: "wake" }, "*");
-    void import("../lib/tts").then((module) => module.warm());
+    warmSpeech();
   };
   const onWake = (transcript: string) => {
-    import("../lib/wakeword").then((m) => {
+    withWakeword(async (m) => {
       setWake(false);
       setChatMode(embedded ? "off" : "full", false);
       const command = m.commandAfterWake(transcript);
-      void (async () => {
-        // A wake activation becomes one persistent conversation session. The
-        // old one-shot path closed the device after every turn and dropped
-        // back into browser SpeechRecognition, which looked like the mic was
-        // switching itself on and off every few seconds.
-        const started = await toggleLive(true, false);
-        if (!started) return;
-        if (command) {
-          void ownVoice();
-          submitEntryCommand(command);
-          scheduleFreeVoiceTurn(120);
-        } else {
-          showCaption({ who: "you", text: "Listening…" });
-          void freeVoiceTurn();
-        }
-      })();
+      // A wake activation becomes one persistent conversation session. The
+      // old one-shot path closed the device after every turn and dropped
+      // back into browser SpeechRecognition, which looked like the mic was
+      // switching itself on and off every few seconds.
+      const started = await toggleLive(true, false);
+      if (!started) return;
+      if (command) {
+        void ownVoice();
+        submitEntryCommand(command);
+        scheduleFreeVoiceTurn(120);
+      } else {
+        showCaption({ who: "you", text: "Listening…" });
+        void freeVoiceTurn();
+      }
     });
   };
   const rearmWake = () => {
@@ -1854,14 +1878,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // Project Hub owns recognition at the top level and sends commands here.
     if (wakeOwnedByHost()) return;
     if (!wakeIsEnabled()) return;
-    import("../lib/wakeword").then((m) => {
+    withWakeword((m) => {
       if (!m.wakeSupported()) return;
       m.startWake(onWake, (listening) => setWake(listening), onWakeDetected);
       setWake(true);
     });
   };
   function toggleWake() {
-    import("../lib/wakeword").then((m) => {
+    withWakeword((m) => {
       if (!m.wakeSupported()) {
         alert("Wake word needs Chrome/Edge/Safari speech recognition.");
         return;
@@ -1881,14 +1905,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => {
     if (wakeOwnedByHost()) return;
     if (chatMode !== "off") return;
-    import("../lib/wakeword").then((m) => {
+    withWakeword((m) => {
       if (!m.wakeSupported() || liveRef.current) return;
       m.startWake(onWake, (listening) => setWake(listening), onWakeDetected);
       setWake(true);
     });
     return () => {
       if (!wakeIsEnabled()) {
-        import("../lib/wakeword").then((m) => m.stopWake());
+        withWakeword((m) => m.stopWake());
         setWake(false);
       }
     };
@@ -1937,7 +1961,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         setChatMode("off", false);
         showCaption({ who: "you", text: "Listening…" });
         unlockSpeechPlayback();
-        void import("../lib/tts").then((module) => module.warm());
+        warmSpeech();
       }
       if (message.jarvis === "host-transcript" && typeof message.text === "string") {
         const transcript = message.text.trim().slice(0, 4000);
@@ -1986,7 +2010,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // The instant a live session starts anywhere, cut any local speech mid-word.
   useEffect(() => {
     if (liveOnRow && Date.now() - liveOnRow.updatedAt < 45_000 && !liveRef.current) {
-      import("../lib/tts").then((m) => m.stopSpeaking());
+      stopSpeaking();
       setSpeaking(false);
     }
   }, [liveOnRow]);
@@ -2023,7 +2047,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       finishWithoutSpeech();
       return false;
     }
-    const { speak } = await import("../lib/tts");
     await speak(
       text,
       (energy) => (energyRef.current = energy),
@@ -2105,7 +2128,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => {
     void registerSW().then(() => {
       if (typeof Notification !== "undefined" && Notification.permission === "granted") {
-        void subscribePush(saveSub).then(() => refreshPermissions());
+        void subscribePush(saveSub).then(() => refreshPermissions()).catch(() => {});
       }
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2126,25 +2149,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       }).catch(() => {});
     };
     // A ChunkLoadError means this tab is holding HTML from a PREVIOUS deploy:
-    // its hashed dynamic-import chunks (wakeword/tts/push/three…) were
+    // its hashed dynamic-import chunks (wakeword/maps/three…) were
     // replaced on the CDN by Vercel's auto-deploy, so the lazy fetch 404s. It's
     // not a bug in any module — reload ONCE to pull the fresh chunks. Guarded by
     // a timestamp so a genuinely-missing chunk can't loop forever.
-    const isChunkError = (v: unknown) => {
-      const s = String((v as { name?: string; message?: string })?.name ?? "") +
-        " " + String((v as { message?: string })?.message ?? v ?? "");
-      return /ChunkLoadError|Loading chunk [\w-]+ failed|Failed to load chunk/i.test(s);
-    };
-    const recoverStaleChunks = () => {
-      try {
-        const last = Number(sessionStorage.getItem("jarvis-chunk-reload") || 0);
-        if (Date.now() - last < 10000) return; // just reloaded and it still fails — don't loop
-        sessionStorage.setItem("jarvis-chunk-reload", String(Date.now()));
-      } catch { /* sessionStorage unavailable — fall through to a single reload */ }
-      window.location.reload();
-    };
     const onErr = (e: ErrorEvent) => {
-      if (isChunkError(e.error ?? e.message)) { recoverStaleChunks(); return; } // stale post-deploy chunk
+      if (isClientChunkLoadError(e.error ?? e.message)) { recoverClientChunkLoad(e.error ?? e.message); return; } // stale post-deploy chunk
       if (e.message === "Script error." || !e.message) return; // cross-origin iframe noise, unactionable
       // Benign browser warning, not an app fault: fired as a window error event
       // whenever a ResizeObserver callback schedules layout that triggers another
@@ -2155,7 +2165,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       report(`client:${String(e.message).slice(0, 80)}`, `${e.message} @ ${e.filename}:${e.lineno}`);
     };
     const onRej = (e: PromiseRejectionEvent) => {
-      if (isChunkError(e.reason)) { recoverStaleChunks(); return; } // stale post-deploy chunk
+      if (isClientChunkLoadError(e.reason)) { recoverClientChunkLoad(e.reason); return; } // stale post-deploy chunk
       report(`client:rejection:${String(e.reason).slice(0, 80)}`, `Unhandled rejection: ${String(e.reason).slice(0, 400)}`);
     };
     window.addEventListener("error", onErr);
@@ -2212,15 +2222,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       current.pendingPrefix = "";
       current.queuedChars = prefix.length;
       if (!speechChunk) return;
-      current.chain = current.chain.then(async () => {
-        if (streamingSpeechRef.current.id !== latestAssistant._id) return;
-        await narrateText({
-          text: speechChunk,
-          claim: narrationClaim(`turn:${latestAssistant._id}`, prefix, from, prefix.length),
-          captionText: current.pendingCaption,
-          final: false,
+      current.chain = current.chain
+        .then(async () => {
+          if (streamingSpeechRef.current.id !== latestAssistant._id) return;
+          await narrateText({
+            text: speechChunk,
+            claim: narrationClaim(`turn:${latestAssistant._id}`, prefix, from, prefix.length),
+            captionText: current.pendingCaption,
+            final: false,
+          });
+        })
+        .catch(() => {
+          if (streamingSpeechRef.current.id === latestAssistant._id) current.queuedChars = from;
         });
-      });
     }, 220);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
@@ -2252,7 +2266,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // finished text there before voice ownership/model generation, so it never
     // vanishes during the TTS handoff or when this tab is not the speaker.
     showCaption({ who: "jarvis", text: spokenText, phase: "ready" });
-    (async () => {
+    void (async () => {
       const streamed = streamingSpeechRef.current.id === last._id ? streamingSpeechRef.current : null;
       if (streamed?.timer) {
         clearTimeout(streamed.timer);
@@ -2273,7 +2287,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         claim: narrationClaim(`turn:${last._id}`, spokenText, from, spokenText.length),
         captionText: spokenText,
       });
-    })();
+    })().catch(() => {
+      setSpeaking(false);
+      fadeCaption(spokenText, 1800);
+      finishOneShotVoiceTurn();
+    });
   }, [messages]);
 
   useEffect(() => () => {
@@ -2528,10 +2546,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // A new request is an immediate barge-in. Cancel queued/playback state
     // before doing anything else; worker inference may finish in the
     // background, but its stale result is discarded by the generation gate.
-    void import("../lib/tts").then((m) => {
-      m.stopSpeaking();
-      void m.warm();
-    });
+    stopSpeaking();
+    warmSpeech();
     setSpeaking(false);
     setInput("");
     const embeddedHostIntent = embedded ? parseEmbeddedHostIntent(t) : null;
@@ -2620,7 +2636,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }
 
   function stopTalking() {
-    import("../lib/tts").then((m) => m.stopSpeaking());
+    stopSpeaking();
     setSpeaking(false);
     ttsQuietUntilRef.current = Date.now() + 120;
     if (freeLoop.current) {
@@ -2734,8 +2750,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // Stop the browser wake recognizer and open the persistent stream before a
     // network round-trip. Otherwise the wake mic visibly closes while Convex
     // elects the live owner, then opens again a moment later.
-    const { stopWake } = await import("../lib/wakeword");
-    stopWake();
+    const wakeword = await loadWakeword();
+    if (!wakeword) {
+      showCaption({ who: "jarvis", text: "Voice controls did not load. Refresh this page and try once more." });
+      return false;
+    }
+    wakeword.stopWake();
     setWake(false);
     freeLoop.current = true;
     liveRef.current = true;
@@ -2762,7 +2782,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       return false;
     }
     void ownVoice();
-    import("../lib/tts").then((m) => m.stopSpeaking());
+    stopSpeaking();
     setLive("live");
     void refreshPermissions();
     if (liveBeat.current) clearInterval(liveBeat.current);
@@ -2919,7 +2939,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const { stream, context, analyser } = await ensurePersistentLiveMic();
       if (!freeLoop.current || sessionEpoch !== liveSessionEpoch.current) return;
       if (context.state === "suspended") await context.resume().catch(() => undefined);
-      import("../lib/tts").then((m) => m.warm());
+      warmSpeech();
       const buf = new Uint8Array(analyser.frequencyBinCount);
       const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
       const rec = new MediaRecorder(stream, { mimeType: mime });
@@ -3037,7 +3057,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           });
         }
         if (result.bargeIn) {
-          void import("../lib/tts").then((m) => m.stopSpeaking());
+          stopSpeaking();
           setSpeaking(false);
         }
         if (shouldCloseLiveUtterance(vad, now) || (!vad.spoke && now - t0 > 8000) || now - t0 > 25_000) {
@@ -3085,7 +3105,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         outcome = "empty";
         return;
       }
-      const { isEchoOfTts } = await import("../lib/tts");
       const cleanedText = text.trim();
       if (!isMeaningfulSpeechTranscript(cleanedText)) {
         outcome = "empty";
@@ -3145,7 +3164,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     // barge-in: JARVIS shuts up the moment Daniel reaches for the mic, so the
     // recording can't capture his voice as input
-    import("../lib/tts").then((m) => m.stopSpeaking());
+    stopSpeaking();
     setSpeaking(false);
     void ownVoice();
     let stream: MediaStream;
@@ -3158,7 +3177,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       alert("JARVIS needs the microphone — allow it in your browser settings.");
       return;
     }
-    import("../lib/tts").then((m) => m.warm());
+    warmSpeech();
     const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
     const rec = new MediaRecorder(stream, { mimeType: mime });
     const chunks: Blob[] = [];
@@ -3172,7 +3191,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         const r = await viewerFetch("/api/stt", { method: "POST", headers: { "content-type": mime }, body: blob });
         const { text } = await r.json();
         if (isMeaningfulSpeechTranscript(text?.trim() ?? "")) {
-          const { isEchoOfTts } = await import("../lib/tts");
           if (isEchoOfTts(text)) return; // that was JARVIS's own voice leaking in
           const cleaned = text.trim();
           const previousVoice = lastVoiceInput.current;
@@ -3307,8 +3325,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           <span className="hidden md:inline"><Clock /></span>
           <button
             onClick={async () => {
-              const r = await subscribePush(saveSub);
-              await refreshPermissions();
+              const r = await subscribePush(saveSub).catch(() => "failed");
+              await refreshPermissions().catch(() => undefined);
               alert(
                 r === "subscribed"
                   ? "Notifications on — JARVIS will ping this device."
