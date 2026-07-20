@@ -159,6 +159,8 @@ describe("Goal Mode contracts", () => {
     });
     expect(task.length).toBeLessThanOrEqual(GOAL_VALIDATOR_TASK_MAX_CHARS);
     expect(task).toContain("Delivery-controller audit snapshot");
+    expect(task).toContain("caller-supplied field");
+    expect(task).toContain("persisted lineage");
     expect(task).toContain(GOAL_VALIDATION_MARKER);
     expect(task).toContain('"verdict":"pass|refine|blocked"');
   });

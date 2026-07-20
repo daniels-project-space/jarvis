@@ -1,6 +1,19 @@
 export const WORK_VERIFICATION_EVIDENCE_MAX_CHARS = 8_000;
 
 /**
+ * Shared standard for both the fast workstream supervisor and the final Sol
+ * validator. It prevents a green build or a caller-supplied field from being
+ * promoted into evidence that an external provider actually supplied data or
+ * accepted an operation.
+ */
+export const EVIDENCE_INTEGRITY_RULES = [
+  "Evidence integrity: a caller-supplied field or self-reported timestamp, ID, inventory count, cost, URL, environment value, screenshot, or agent claim is an assertion—not provider proof.",
+  "For a claimed live pipeline, trace an upstream provider response or signed event through validation and persisted lineage into the exact downstream caller; exercise provider sandbox/test mode where it exists.",
+  "A build, typecheck, mock, compile-time placeholder, or configured target proves only that boundary. It does not prove runtime provider state, a deployed revision, data provenance, or a user journey.",
+  "Long-lived service authentication must be renewable or have an evidenced rotation path; a static expiring token is not launch-ready merely because it works today.",
+].join(" ");
+
+/**
  * A continuation is one logical workstream, not a brand-new task. Preserve the
  * prior checkpoint when the supervisor reviews a repair pass so a concise
  * delta cannot make already-evidenced work look missing.

@@ -1,11 +1,19 @@
 import { describe, expect, it } from "vitest";
 import {
   cumulativeWorkEvidence,
+  EVIDENCE_INTEGRITY_RULES,
   isPermittedReadonlyAccessGap,
   WORK_VERIFICATION_EVIDENCE_MAX_CHARS,
 } from "./work-verification";
 
 describe("supervisor verification boundaries", () => {
+  it("rejects assertions and compile checks as substitutes for provider lineage", () => {
+    expect(EVIDENCE_INTEGRITY_RULES).toContain("caller-supplied field");
+    expect(EVIDENCE_INTEGRITY_RULES).toContain("persisted lineage");
+    expect(EVIDENCE_INTEGRITY_RULES).toContain("compile-time placeholder");
+    expect(EVIDENCE_INTEGRITY_RULES).toContain("static expiring token");
+  });
+
   it("carries completed checkpoint evidence into repair-pass supervision", () => {
     const evidence = cumulativeWorkEvidence(
       "R2 guards, outbox traces, migrations, and CI were implemented and verified.",

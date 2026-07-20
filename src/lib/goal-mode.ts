@@ -1,4 +1,5 @@
 import { PROJECT_REGISTRY, projectProviderBoundary } from "./project-registry";
+import { EVIDENCE_INTEGRITY_RULES } from "./work-verification";
 
 export const GOAL_PLAN_MARKER = "GOAL_PLAN_JSON:";
 export const GOAL_VALIDATION_MARKER = "GOAL_VALIDATION_JSON:";
@@ -479,6 +480,7 @@ export function validatorTask(args: {
           "Treat this as the scoped read evidence for protected Convex state. Do not mint a viewer session or weaken authentication merely to re-fetch it. An otherwise consistent protected history being unavailable inside the sandbox is not, by itself, a blocker; verify the snapshot against source, tests, and public provider evidence.",
         ].join("\n")
       : "",
+    EVIDENCE_INTEGRITY_RULES,
     "Inspect the actual branch and current code. Run proportionate deep tests, typecheck/build, end-to-end or browser checks, and exact provider/deployment checks where the goal requires them. A command exit code alone is not proof. Do not merge or deploy yourself; a pass hands the branch to the automatic delivery controller. Do not publish publicly, spend, message or perform destructive actions. If a gap is fixable in the existing scope, return refine with 1-3 precise Terra repair sessions. Use blocked only for a genuine Daniel/external decision. Use pass only when the outcome—not merely each task—is evidenced.",
     "End with exactly one compact JSON object after GOAL_VALIDATION_JSON: using:",
     '{"verdict":"pass|refine|blocked","summary":"...","evidence":["exact check/result"],"gaps":["..."],"refinements":[{"id":"...","label":"...","task":"self-contained repair","acceptanceCriteria":["..."]}],"blocker":"only when blocked"}',
