@@ -97,12 +97,14 @@ export const snapshot = query({
       COMPACT_WORK_STATUSES.map((status) =>
         ctx.db
           .query("jobRuntime")
-          .withIndex("by_visibility_status_priority", (q) =>
-            q.eq("visibility", "conversation").eq("status", status),
+          .withIndex("by_thread_visibility_status_priority", (q) =>
+            q
+              .eq("originThreadId", threadId)
+              .eq("visibility", "conversation")
+              .eq("status", status),
           )
-          .filter((q) => q.eq(q.field("originThreadId"), threadId))
           .order("desc")
-          .take(12),
+          .take(1),
       ),
     );
 
