@@ -78,7 +78,18 @@ function softwareDeliveryAllowed(action: string, clause: string, repo: string | 
 // order, order/fulfillment). Treat it as an action only in an imperative or
 // after an explicit placement verb; the other money verbs remain conservative.
 function consequentialUse(action: string, clause: string, actionIndex: number): boolean {
-  if (action.toLocaleLowerCase("en-GB") !== "order") return true;
+  const normalized = action.toLocaleLowerCase("en-GB");
+  if (normalized === "message") {
+    const before = clause.slice(0, actionIndex).trim();
+    // Repository instructions routinely describe a git commit message, while
+    // the consequential meaning is an instruction to message a person. The
+    // conjunction splitter keeps "commit this and message the tenant" in a
+    // separate clause, so this narrow nominal-use exception cannot waive the
+    // external action.
+    if (/\bcommit\b[^.;!?\n]{0,80}$/i.test(before)) return false;
+    if (/\b(?:error|status|progress|validation|log)\s*$/i.test(before)) return false;
+  }
+  if (normalized !== "order") return true;
   const before = clause.slice(0, actionIndex).trim();
   if (/^(?:(?:please|can you|could you|would you)\s*)?$/i.test(before)) return true;
   return /\b(?:place|submit|make|create|buy|purchase|pay(?:\s+for)?|want\s+(?:you|jarvis)\s+to|need\s+(?:you|jarvis)?\s*to)\s+(?:(?:a|an|the|this|that|one|real)\s+)*$/i.test(before);

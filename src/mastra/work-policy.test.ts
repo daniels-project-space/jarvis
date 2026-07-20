@@ -98,6 +98,14 @@ describe("server-side work approval policy", () => {
     expect(workApprovalPolicy({ task: "Research current orchestration patterns" }).required).toBe(false);
     expect(
       workApprovalPolicy({
+        task:
+          "Commit only working code, message starting 'self-improve:'. Work on the isolated branch; the controller owns verified delivery.",
+        repo: "jarvis",
+        risk: "high",
+      }),
+    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    expect(
+      workApprovalPolicy({
         task: "Wire the Shopify order/fulfillment pipeline and make its webhook idempotent",
         repo: "daniels-project-space/dropship-ai",
       }),
@@ -178,6 +186,7 @@ describe("server-side work approval policy", () => {
         readonly: true,
       }).required,
     ).toBe(true);
+    expect(workApprovalPolicy({ task: "Commit the fix and message the tenant", repo: "jarvis" }).required).toBe(true);
   });
 
   it("fails closed for an unclassified non-repository action", () => {
