@@ -181,7 +181,7 @@ export default defineSchema({
   jobs: defineTable({
     repo: v.optional(v.string()),
     task: v.string(),
-    status: v.string(), // pending | running | done | error
+    status: v.string(), // pending | dispatching | running | done | error
     result: v.optional(v.string()),
     readonly: v.optional(v.boolean()), // if true, runner never commits/pushes
     model: v.optional(v.string()), // optional Codex tier override (luna|terra|sol)
@@ -212,6 +212,14 @@ export default defineSchema({
     percent: v.optional(v.number()),
     heartbeatAt: v.optional(v.number()),
     nextRunAt: v.optional(v.number()), // retry/continuation eligibility; prevents hot-loop retries
+    // Trigger-native fleet dispatch. A short reservation fences one exact job
+    // before its independent cloud run is created; the worker run id then
+    // connects Trigger Realtime to the durable Convex work record.
+    dispatchId: v.optional(v.string()),
+    dispatchLeaseUntil: v.optional(v.number()),
+    dispatchReason: v.optional(v.string()),
+    workerRunId: v.optional(v.string()),
+    workerRuntime: v.optional(v.string()),
     checkpoint: v.optional(v.string()),
     attempt: v.optional(v.number()),
     maxAttempts: v.optional(v.number()),
@@ -393,6 +401,9 @@ export default defineSchema({
     externalError: v.optional(v.string()),
     wakeRequested: v.boolean(),
     wakeResult: v.string(), // not_requested | dispatched | not_dispatched
+    wakeTarget: v.optional(v.string()),
+    // Historical GitHub-harness receipt fields. New receipts use wakeTarget;
+    // retain these optional fields until old production documents age out.
     wakeWorkflow: v.optional(v.string()),
     wakeRef: v.optional(v.string()),
     wakeReason: v.optional(v.string()),

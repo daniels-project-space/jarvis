@@ -4,7 +4,7 @@ import { getSecret, getServiceSecrets } from "./vault";
 import { r2Put, r2StoreFromUrl } from "./r2";
 import type { ManagedMission } from "../mastra/supervisor";
 import { withAdminSession } from "./control-context";
-import { wakeAgentHarness } from "./agent-harness-dispatch";
+import { wakeAgentFleet } from "./agent-fleet-dispatch";
 import { workModelLabel, workModelPriority } from "./work-models";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
 import {
@@ -41,7 +41,7 @@ export const TOOL_DEFS = [
   {
     name: "orchestrate",
     description:
-      "Ask the Mastra JARVIS supervisor to plan and run a durable mission with the permanent team. You may supply 2-6 genuinely independent workstreams, or omit them and let the supervisor consult specialists and decompose the goal. The subscription CLI harness performs durable execution with repository-scoped tools; Convex reports live stages, checkpoints, automatic delivery and protected external decisions. One coherent reviewed result returns to the originating conversation.",
+      "Ask the Mastra JARVIS supervisor to plan and run a durable mission with the permanent team. You may supply 2-6 genuinely independent workstreams, or omit them and let the supervisor consult specialists and decompose the goal. Independent Trigger workers run pinned subscription Codex CLI sessions with repository-scoped tools; Trigger Realtime streams activity while Convex preserves checkpoints, automatic delivery and protected external decisions. One coherent reviewed result returns to the originating conversation.",
     parameters: {
       type: "object",
       properties: {
@@ -3044,7 +3044,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         parentJobId: args.parent_job_id ? String(args.parent_job_id) : undefined,
         label: `${TEAM_BY_SLUG[agentId].name} · ${task.slice(0, 58)}`,
       });
-      if (!route.approvalRequired) await wakeAgentHarness(`job:${String(jobId)}`).catch(() => false);
+      if (!route.approvalRequired) await wakeAgentFleet(`job:${String(jobId)}`).catch(() => false);
       return route.approvalRequired
         ? `${TEAM_BY_SLUG[agentId].name} has a scoped plan ready as job ${jobId}, but it includes a consequential external action. I put it in Needs you and will not execute it until Daniel approves.`
         : `${TEAM_BY_SLUG[agentId].name} owns job ${jobId}${args.parent_job_id ? ` as a concurrent follow-up to ${String(args.parent_job_id)}` : ""}. It is bound to this conversation, visible live in the command deck, and can run beside that specialist's other jobs on its own lease and checkout.`;
@@ -3079,7 +3079,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
             if (demand) shouldWake = demand.needed === true;
           }
         }
-        if (ok && shouldWake) await wakeAgentHarness(`goal-resume:${missionId}`).catch(() => false);
+        if (ok && shouldWake) await wakeAgentFleet(`goal-resume:${missionId}`).catch(() => false);
         return ok ? `Goal Mode ${missionId} ${action} request applied.` : `That goal cannot be ${action}d from its current state.`;
       }
       if (action !== "start") return "Unknown Goal Mode action.";
@@ -3104,7 +3104,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       });
       const id = String(created?.missionId ?? "");
       if (!id) throw new Error("Goal Mode did not create a durable mission");
-      await wakeAgentHarness(`goal:${id}`).catch(() => false);
+      await wakeAgentFleet(`goal:${id}`).catch(() => false);
       await convexMutation("ui:setPanel", {
         type: "fleet",
         value: JSON.stringify({ missionId: id, mode: "goal" }),
@@ -3169,7 +3169,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         });
       }
       if (plan.workstreams.some((stream) => !stream.approvalRequired)) {
-        await wakeAgentHarness(`mission:${String(missionId)}`).catch(() => false);
+        await wakeAgentFleet(`mission:${String(missionId)}`).catch(() => false);
       }
       await convexMutation("ui:setPanel", { type: "fleet", value: JSON.stringify({ missionId: String(missionId) }), title: `mission · ${mission.slice(0, 44)}` }).catch(() => {});
       const waiting = plan.workstreams.filter((stream) => stream.approvalRequired).length;
@@ -3185,7 +3185,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           jobId,
           decision: action === "approve" ? "approved" : "declined",
         });
-        if (ok && action === "approve") await wakeAgentHarness(`approved:${jobId}`).catch(() => false);
+        if (ok && action === "approve") await wakeAgentFleet(`approved:${jobId}`).catch(() => false);
         return ok
           ? action === "approve"
             ? "Approved. The workstream is queued; approval applies only to that scoped job."
@@ -3196,12 +3196,12 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         const answer = String(args.input ?? "").trim();
         if (!answer) return "Tell me the decision or missing information you want passed back to the agent.";
         const ok = await convexMutation("jobs:provideInput", { jobId, answer, authTokenHash });
-        if (ok) await wakeAgentHarness(`continued:${jobId}`).catch(() => false);
+        if (ok) await wakeAgentFleet(`continued:${jobId}`).catch(() => false);
         return ok ? "Passed that decision back to the specialist; the continuation is queued." : "That job is not waiting for input now.";
       }
       const ok = await convexMutation("jobs:control", { jobId, action, authTokenHash });
       if (ok && (action === "resume" || action === "retry")) {
-        await wakeAgentHarness(`${action}:${jobId}`).catch(() => false);
+        await wakeAgentFleet(`${action}:${jobId}`).catch(() => false);
       }
       return ok ? `Job ${jobId} ${action} request applied.` : `That job cannot be ${action}d from its current state.`;
     }
@@ -3615,7 +3615,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         modelReason: "Paul + Sol: production repair requires deep Codex engineering and verification",
         label: `Paul · repair ${problem.slice(0, 48)}`,
       });
-      await wakeAgentHarness(`repair:${String(incidentId)}`).catch(() => false);
+      await wakeAgentFleet(`repair:${String(incidentId)}`).catch(() => false);
       return "Paul owns the repair on an isolated branch. He'll reproduce it and verify the fix; the delivery controller will merge it automatically once the evidence and repository checks pass.";
     }
     case "self_improve": {
@@ -3635,7 +3635,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         modelReason: "Paul + Sol: JARVIS self-modification is complex Codex engineering",
         label: `Paul · upgrade ${request.slice(0, 46)}`,
       });
-      await wakeAgentHarness("self-improve").catch(() => false);
+      await wakeAgentFleet("self-improve").catch(() => false);
       return "Paul has the upgrade on an isolated branch with validation gates; verified delivery will complete automatically and progress is live in the command deck.";
     }
     case "agent_status": {

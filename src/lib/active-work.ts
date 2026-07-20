@@ -9,7 +9,7 @@ export type ActiveWork = {
   incidentId?: string;
 };
 
-const ACTIVE_STATUSES = new Set(["running", "awaiting_approval", "needs_input"]);
+const ACTIVE_STATUSES = new Set(["dispatching", "running", "awaiting_approval", "needs_input"]);
 const DECISION_STATUSES = new Set(["awaiting_approval", "needs_input"]);
 const LEGACY_SYSTEM_WORK = /\b(?:health[ -]?(?:check|audit)|cloud health audit|heartbeat|uptime poll|stack poll|polling sweep|sentry sweep|provider health|background check|routine monitor)\b/i;
 

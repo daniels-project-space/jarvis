@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { wakeAgentHarness } from "@/lib/agent-harness-wake";
+import { wakeAgentFleet } from "@/lib/agent-fleet-dispatch";
 import { controlMutation, controlQuery } from "@/lib/control-session";
 import { routeGoal } from "@/lib/goal-mode";
 import { controlActor, controlCredentials } from "@/lib/request-auth";
@@ -43,6 +43,6 @@ export async function POST(req: NextRequest) {
     value: JSON.stringify({ missionId, mode: "goal" }),
     title: `goal · ${goal.slice(0, 44)}`,
   }).catch(() => null);
-  const woken = await wakeAgentHarness(`goal:${missionId}`).catch(() => false);
+  const woken = await wakeAgentFleet(`goal:${missionId}`).catch(() => false);
   return Response.json({ ok: true, missionId, route: route.kind, woken }, { status: 201 });
 }

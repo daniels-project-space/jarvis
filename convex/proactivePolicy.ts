@@ -42,7 +42,7 @@ export type ProactiveSignal = {
 const TWENTY_MINUTES = 20 * 60_000;
 const THREE_DAYS = 3 * 86_400_000;
 
-export function countGeneralHarnessDemand(input: {
+export function countGeneralFleetDemand(input: {
   jobs: ProactiveJob[];
   goalMissionIds: Set<string>;
   now: number;
@@ -67,7 +67,7 @@ export function deriveProactiveSignals(input: {
   const signals: ProactiveSignal[] = [];
   const liveRunner = jobs.some(
     (job) =>
-      job.status === "running" &&
+      ["dispatching", "running"].includes(job.status) &&
       now - (job.heartbeatAt ?? job.startedAt ?? job.createdAt) < 5 * 60_000,
   );
   const overduePending = jobs
@@ -82,9 +82,9 @@ export function deriveProactiveSignals(input: {
   if (overduePending.length && !liveRunner) {
     const oldest = overduePending[0];
     signals.push({
-      fingerprint: "proactive:agent-harness:not-claiming",
+      fingerprint: "proactive:agent-fleet:not-claiming",
       project: "jarvis",
-      title: "Agent harness is not claiming work",
+      title: "Agent fleet is not claiming work",
       detail: `${overduePending.length} eligible job${overduePending.length === 1 ? " has" : "s have"} waited over 20 minutes with no live worker heartbeat.`,
       evidence: [
         `oldest job ${String(oldest._id)}`,

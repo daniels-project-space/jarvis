@@ -1,19 +1,20 @@
 import { mutation } from "./_generated/server";
 import { v } from "convex/values";
 import { requireWorker } from "./controlAuth";
-import { countGeneralHarnessDemand, deriveProactiveSignals } from "./proactivePolicy";
+import { countGeneralFleetDemand, deriveProactiveSignals } from "./proactivePolicy";
 
 export const reconcile = mutation({
   args: { now: v.number(), workerToken: v.string() },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
-    const [blockedGoals, pendingJobs, runningJobs, failedJobs, existingAttention] = await Promise.all([
+    const [blockedGoals, pendingJobs, dispatchingJobs, runningJobs, failedJobs, existingAttention] = await Promise.all([
       ctx.db
         .query("projectGoals")
         .withIndex("by_status_priority", (q: any) => q.eq("status", "blocked"))
         .order("desc")
         .take(30),
       ctx.db.query("jobs").withIndex("by_status", (q: any) => q.eq("status", "pending")).take(100),
+      ctx.db.query("jobs").withIndex("by_status", (q: any) => q.eq("status", "dispatching")).take(100),
       ctx.db.query("jobs").withIndex("by_status", (q: any) => q.eq("status", "running")).take(100),
       ctx.db
         .query("jobs")
@@ -24,7 +25,7 @@ export const reconcile = mutation({
     ]);
     const signals = deriveProactiveSignals({
       goals: blockedGoals,
-      jobs: [...pendingJobs, ...runningJobs, ...failedJobs],
+      jobs: [...pendingJobs, ...dispatchingJobs, ...runningJobs, ...failedJobs],
       now: a.now,
     });
     const missionIds = [...new Set(pendingJobs.map((job: any) => job.missionId).filter(Boolean))];
@@ -65,9 +66,9 @@ export const reconcile = mutation({
       signals: signals.length,
       newInterruptions,
       // Goal Mode has its own five-minute owner. Excluding those leases here
-      // prevents the general ten-minute insight sweep from double-dispatching
-      // the same GitHub harness.
-      eligiblePending: countGeneralHarnessDemand({ jobs: pendingJobs, goalMissionIds, now: a.now }),
+      // prevents the general ten-minute insight sweep from creating redundant
+      // fleet reservations for the same goal transition.
+      eligiblePending: countGeneralFleetDemand({ jobs: pendingJobs, goalMissionIds, now: a.now }),
     };
   },
 });

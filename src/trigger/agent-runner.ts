@@ -1,4 +1,4 @@
-import { schedules } from "@trigger.dev/sdk/v3";
+import { metadata, schedules, task, timeout } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
 import { mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -19,7 +19,6 @@ import {
   resolveSubscriptionAgentBin,
   type AgentProvider,
 } from "./subscription-runtime";
-import { runConcurrentClaimLoop } from "./agent-pool";
 import { parseGoalPlan, parseGoalValidation, type GoalPlan } from "../lib/goal-mode";
 import { startAppFactoryGoal, syncExternalGoalRevisions, syncExternalGoalRuns } from "./goal-runtime";
 import { codexMcpConfigArgs, type CodexMcpConfig } from "../lib/codex-mcp";
@@ -33,6 +32,7 @@ import {
   openDeliveryPullRequest,
   validatedGoalDeliveryBranch,
 } from "./github-delivery";
+import { wakeAgentFleet } from "../lib/agent-fleet-dispatch";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -436,100 +436,128 @@ async function branchHasChanges(repo: string, branch: string, token: string): Pr
   }
 }
 
-// The actual specialist runtime is a subscription-authenticated CLI harness.
-// It is exported independently of Trigger so cloud runners can execute the
-// same durable lease/checkpoint protocol with their repository-scoped tools.
-export async function runAgentHarness() {
+export type AgentWorkerPayload = {
+  jobId: string;
+  dispatchId: string;
+  reason?: string;
+};
+
+type AgentProgress = {
+  jobId: string;
+  missionId?: string | null;
+  agentId?: string | null;
+  progress: string;
+  log?: string;
+  stage?: string;
+  percent?: number;
+};
+
+type AgentHarnessOptions = {
+  reservation: AgentWorkerPayload & { workerRunId: string };
+  onProgress?: (progress: AgentProgress) => void;
+};
+
+// Cheap controller duties run once per minute, independently of specialist
+// containers. This keeps reminders, recovery and incident dispatch alive even
+// when no Codex job happens to be running.
+export async function runAgentMaintenance() {
+  await convexMutation("jobs:reconcileAutonomousSoftwareWork", {}).catch(() => 0);
+  let recovered = 0;
+  let abandoned = 0;
+  let repairs = 0;
+  try {
+    await convexMutation("chatQueue:reapStuck", {}).catch(() => {});
+    const reaped: any = await convexMutation("jobs:reapStale", {});
+    recovered = Number(reaped?.requeued?.length ?? 0) + Number(reaped?.releasedDispatches?.length ?? 0);
+    abandoned = Number(reaped?.abandoned?.length ?? 0);
+    for (const title of reaped?.abandoned ?? [])
+      await convexMutation("chatQueue:postAssistant", {
+        threadId: await chatThread(),
+        text: `I have to be honest, sir — the background job "${title}" kept dying on me and I've stopped retrying it.`,
+      }).catch(() => {});
+    const healer: any = await convexMutation("incidents:claimForRepair", { limit: 2, maxAttempts: 2 });
+    repairs = Number(healer?.claims?.length ?? 0);
+    for (const inc of healer?.claims ?? []) {
+      const repo = inc.app && inc.app !== "jarvis" ? inc.app : "jarvis";
+      const repairJobId = await convexMutation("jobs:enqueue", {
+        task: repairPrompt(inc, repo),
+        repo,
+        model: "sol",
+        modelReason: "Paul uses the highest tier for production root-cause repair",
+        agentId: "paul",
+        risk: "high",
+        priority: 90,
+        originThreadId: await chatThread(),
+        visibility: "system",
+        acceptanceCriteria: [
+          "Reproduce or evidence the root cause before editing",
+          "Implement the smallest safe repair on an isolated branch",
+          "Verify the relevant build or live surface and report evidence",
+        ],
+        incidentId: String(inc.id),
+      });
+      if (repairJobId) {
+        await convexMutation("incidents:linkJob", { id: inc.id, jobId: String(repairJobId) }).catch(() => {});
+      }
+    }
+    for (const esc of healer?.escalations ?? []) {
+      await convexMutation("chatQueue:postAssistant", {
+        threadId: await chatThread(),
+        text: `Sir, I've had two goes at fixing "${String(esc.message).slice(0, 120)}" and it's still misbehaving — this one needs your eyes.`,
+      });
+      await sendPush("JARVIS needs you", String(esc.message).slice(0, 120), "/");
+    }
+  } catch {
+    /* recovery must never block fleet dispatch */
+  }
+  try {
+    const due: any[] = (await convexMutation("reminders:due", {})) ?? [];
+    for (const reminder of due) {
+      const minutesLate = Math.round((Date.now() - reminder.at) / 60000);
+      const late = minutesLate > 4
+        ? ` (set for ${new Date(reminder.at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/London" })})`
+        : "";
+      await convexMutation("chatQueue:postAssistant", {
+        threadId: await chatThread(),
+        text: `⏰ Reminder, sir — ${reminder.text}${late}`,
+      }).catch(() => {});
+      const reminderTag = `reminder-${String(reminder._id).slice(-20)}`;
+      await sendPush(
+        "⏰ JARVIS reminder",
+        String(reminder.text).slice(0, 140),
+        "/",
+        { tag: reminderTag, topic: reminderTag, ttl: 3600, urgency: "high" },
+      ).catch(() => {});
+      await convexMutation("reminders:complete", { id: reminder._id }).catch(() => {});
+    }
+  } catch {
+    /* reminders must never block fleet dispatch */
+  }
+  await runWatchSweep().catch(() => {});
+  return { recovered, abandoned, repairs };
+}
+
+// One Trigger run owns one exact durable job and one isolated Codex process.
+// Multi-hour goals continue through checkpointed jobs, never by monopolising a
+// global orchestrator or preventing Jarvis from answering in the foreground.
+export async function runAgentHarness(options: AgentHarnessOptions) {
+    const rejectReservation = async (error: string) => {
+      await convexMutation("jobs:rejectDispatch", {
+        jobId: options.reservation.jobId,
+        dispatchId: options.reservation.dispatchId,
+        reason: error,
+        delayMs: 60_000,
+      }).catch(() => false);
+      return { processed: 0, error };
+    };
     const provider: AgentProvider = "codex";
     const bin = resolveSubscriptionAgentBin(provider);
-    if (!bin) return { processed: 0, error: `no ${provider} binary` };
+    if (!bin) return rejectReservation(`no ${provider} binary`);
     const prepared = prepareSubscriptionEnv(provider);
-    if (prepared.error) return { processed: 0, error: prepared.error };
+    if (prepared.error) return rejectReservation(prepared.error);
     const missingTools = missingSubscriptionTools(prepared.env);
     if (missingTools.length) {
-      return {
-        processed: 0,
-        error: `Codex worker toolchain unavailable: missing ${missingTools.join(", ")} on PATH`,
-      };
-    }
-
-    // Upgrade only legacy deploy/merge approvals in Daniel-owned repos before
-    // claiming work. This mutation is idempotent and leaves every protected
-    // external action untouched.
-    await convexMutation("jobs:reconcileAutonomousSoftwareWork", {}).catch(() => 0);
-
-    // Self-healing sweep: open incidents become root-cause repair jobs (attempt-
-    // capped); exhausted ones escalate to Daniel instead of looping forever.
-    try {
-      await convexMutation("chatQueue:reapStuck", {}).catch(() => {}); // unstick frozen typing bubbles
-      const reaped: any = await convexMutation("jobs:reapStale", {});
-      for (const t of reaped?.abandoned ?? [])
-        await convexMutation("chatQueue:postAssistant", {
-          threadId: await chatThread(),
-          text: `I have to be honest, sir — the background job "${t}" kept dying on me and I've stopped retrying it.`,
-        }).catch(() => {});
-      const healer: any = await convexMutation("incidents:claimForRepair", { limit: 2, maxAttempts: 2 });
-      for (const inc of healer?.claims ?? []) {
-        const repo = inc.app && inc.app !== "jarvis" ? inc.app : "jarvis";
-        const repairJobId = await convexMutation("jobs:enqueue", {
-          task: repairPrompt(inc, repo),
-          repo,
-          model: "sol",
-          modelReason: "Paul uses the highest tier for production root-cause repair",
-          agentId: "paul",
-          risk: "high",
-          priority: 90,
-          originThreadId: await chatThread(),
-          visibility: "system",
-          acceptanceCriteria: [
-            "Reproduce or evidence the root cause before editing",
-            "Implement the smallest safe repair on an isolated branch",
-            "Verify the relevant build or live surface and report evidence",
-          ],
-          incidentId: String(inc.id),
-        });
-        if (repairJobId) {
-          await convexMutation("incidents:linkJob", { id: inc.id, jobId: String(repairJobId) }).catch(() => {});
-        }
-      }
-      for (const esc of healer?.escalations ?? []) {
-        await convexMutation("chatQueue:postAssistant", {
-          threadId: await chatThread(),
-          text: `Sir, I've had two goes at fixing "${String(esc.message).slice(0, 120)}" and it's still misbehaving — this one needs your eyes.`,
-        });
-        await sendPush("JARVIS needs you", String(esc.message).slice(0, 120), "/");
-      }
-    } catch {
-      /* healer must never block normal jobs */
-    }
-    // Timed reminders: deliver anything due as a push + a spoken weave.
-    try {
-      const due: any[] = (await convexMutation("reminders:due", {})) ?? [];
-      for (const r of due) {
-        const mins = Math.round((Date.now() - r.at) / 60000);
-        const late = mins > 4 ? ` (set for ${new Date(r.at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/London" })})` : "";
-        await convexMutation("chatQueue:postAssistant", {
-          threadId: await chatThread(),
-          text: `⏰ Reminder, sir — ${r.text}${late}`,
-        }).catch(() => {});
-        const reminderTag = `reminder-${String(r._id).slice(-20)}`;
-        await sendPush(
-          "⏰ JARVIS reminder",
-          String(r.text).slice(0, 140),
-          "/",
-          { tag: reminderTag, topic: reminderTag, ttl: 3600, urgency: "high" },
-        ).catch(() => {});
-        await convexMutation("reminders:complete", { id: r._id }).catch(() => {});
-      }
-    } catch {
-      /* reminders must never block jobs either */
-    }
-    // Indexed, leased price/asset rules. One observation is shared by every
-    // threshold on the same subject; Convex commits true crossings atomically.
-    try {
-      await runWatchSweep();
-    } catch {
-      /* watches never block jobs */
+      return rejectReservation(`Codex worker toolchain unavailable: missing ${missingTools.join(", ")} on PATH`);
     }
     const env = prepared.env;
     mkdirSync("/tmp/work", { recursive: true });
@@ -884,22 +912,48 @@ export async function runAgentHarness() {
           ? await buildMcpConfig(job.mcp, jobKey)
           : { configPath: null, env: {} };
         const agentEnv = { ...jobEnv, ...mcp.env };
-        const run = await runAgent(
-          bin,
-          cwd,
-          agentEnv,
-          prompt,
-          model,
-          (line, log, stage, percent) => {
-            void convexMutation("jobs:updateProgress", {
+        let lastDurableProgressAt = 0;
+        let lastDurableStage = "";
+        let lastDurablePercent = 0;
+        let durableProgress = Promise.resolve<unknown>(undefined);
+        const reportProgress = (line: string, log?: string, stage?: string, percent?: number) => {
+          options.onProgress?.({
+            jobId: String(job.jobId),
+            missionId: job.missionId,
+            agentId: job.agentId,
+            progress: line,
+            log,
+            stage,
+            percent,
+          });
+          const now = Date.now();
+          const nextPercent = Number(percent ?? 0);
+          const majorTransition = Boolean(stage && stage !== lastDurableStage)
+            || nextPercent - lastDurablePercent >= 15;
+          const heartbeatDue = now - lastDurableProgressAt >= 30_000;
+          if (!majorTransition && !heartbeatDue) return;
+          lastDurableProgressAt = now;
+          lastDurableStage = stage ?? lastDurableStage;
+          lastDurablePercent = Math.max(lastDurablePercent, nextPercent);
+          durableProgress = durableProgress
+            .catch(() => undefined)
+            .then(() => convexMutation("jobs:updateProgress", {
               jobId: job.jobId,
               expectedAttempt,
               progress: line,
               log,
               stage,
               percent,
-            });
-          },
+            }))
+            .catch(() => undefined);
+        };
+        const run = await runAgent(
+          bin,
+          cwd,
+          agentEnv,
+          prompt,
+          model,
+          reportProgress,
           mcp.configPath,
           async () => {
             const state = await executionStatus();
@@ -908,6 +962,7 @@ export async function runAgentHarness() {
           segmentTimeoutMs(model),
           job.reasoningEffort,
         );
+        await durableProgress;
         if (mcp.configPath) rmSync(mcp.configPath, { force: true });
         const result = run.text;
 
@@ -1560,20 +1615,22 @@ export async function runAgentHarness() {
       if (synth) await synthesizeMissionClaim(synth);
     };
 
-    // Each GitHub wake is a bounded three-process pool. Wake workflows may
-    // overlap; Convex's atomic status+attempt lease prevents duplicate work.
-    // A short idle drain catches jobs queued beside a mission without holding
-    // an Actions runner open after the queue is empty.
-    await syncExternalGoalRuns();
-    await drainGoalAdvances();
-    processed += await runConcurrentClaimLoop({
-      capacity: 3,
-      claimWindowMs: 120_000,
-      idleDrainMs: 6_000,
-      pollIntervalMs: 2_000,
-      claim: () => convexMutation("jobs:claimNext", {}),
-      run: processJob,
+    const job: any = await convexMutation("jobs:claimDispatched", {
+      jobId: options.reservation.jobId,
+      dispatchId: options.reservation.dispatchId,
+      workerRunId: options.reservation.workerRunId,
+    }).catch(() => null);
+    if (!job) return { processed: 0, stale: true };
+    processed = 1;
+    options.onProgress?.({
+      jobId: String(job.jobId),
+      missionId: job.missionId,
+      agentId: job.agentId,
+      progress: "starting secure workspace",
+      stage: "starting",
+      percent: 2,
     });
+    await processJob(job);
     await syncExternalGoalRuns();
     await drainGoalAdvances();
     // Approval declines/cancellations do not run processJob, so sweep terminal
@@ -1587,17 +1644,56 @@ export async function runAgentHarness() {
   return { processed };
 }
 
-// Trigger remains a compatibility scheduler only. Production sets
-// JARVIS_AGENT_RUNTIME=github, making this task incapable of claiming agent
-// work; GitHub's isolated cloud runner invokes runAgentHarness directly.
-export const agentRunner = schedules.task({
-  id: "jarvis-agent-runner",
+export const agentWorker = task({
+  id: "jarvis-agent-worker",
+  machine: "medium-2x",
+  queue: { concurrencyLimit: 8 },
+  maxDuration: timeout.None,
+  run: async (payload: AgentWorkerPayload, { ctx }) => {
+    metadata
+      .set("status", "claiming")
+      .set("stage", "claiming")
+      .set("percent", 1)
+      .set("jobId", payload.jobId)
+      .set("reason", String(payload.reason ?? "work-available").slice(0, 160));
+    const result = await runAgentHarness({
+      reservation: { ...payload, workerRunId: ctx.run.id },
+      onProgress: (progress) => {
+        metadata
+          .set("status", "running")
+          .set("jobId", progress.jobId)
+          .set("missionId", progress.missionId ?? null)
+          .set("agentId", progress.agentId ?? null)
+          .set("stage", progress.stage ?? "working")
+          .set("percent", progress.percent ?? 0)
+          .set("progress", progress.progress.slice(0, 400));
+        if (progress.log) metadata.set("logTail", progress.log.slice(-12_000));
+      },
+    });
+    const deferred = "error" in result && Boolean(result.error);
+    const superseded = "stale" in result && result.stale === true;
+    metadata
+      .set("status", deferred ? "deferred" : superseded ? "superseded" : "complete")
+      .set("stage", deferred ? "queued" : superseded ? "superseded" : "complete")
+      .set("percent", result.processed ? 100 : 0);
+    await metadata.flush();
+    const continued = await wakeAgentFleet(`worker-complete:${payload.jobId}`).catch(() => false);
+    return { ...result, continued, runtime: "trigger", runId: ctx.run.id };
+  },
+});
+
+// The fleet controller is intentionally cheap and always available. It never
+// runs Codex itself; it repairs leases, performs bounded housekeeping and fans
+// runnable jobs into independent workers.
+export const agentFleetSupervisor = schedules.task({
+  id: "jarvis-agent-fleet-supervisor",
   cron: "* * * * *",
   machine: "micro",
   queue: { concurrencyLimit: 1 },
-  maxDuration: 60,
-  run: async () =>
-    process.env.JARVIS_AGENT_RUNTIME === "trigger"
-      ? runAgentHarness()
-      : { processed: 0, runtime: "cli-harness", host: "github-actions" },
+  maxDuration: 120,
+  run: async () => {
+    const maintenance = await runAgentMaintenance();
+    const dispatched = await wakeAgentFleet("fleet-supervisor").catch(() => false);
+    return { maintenance, dispatched, runtime: "trigger-fleet" };
+  },
 });

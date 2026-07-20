@@ -149,6 +149,8 @@ export const active = query({
           branch: j.branch ?? null,
           pullRequestUrl: j.pullRequestUrl ?? null,
           verificationNote: j.verificationNote ?? null,
+          workerRunId: j.workerRunId ?? null,
+          workerRuntime: j.workerRuntime ?? null,
         })),
       });
     }

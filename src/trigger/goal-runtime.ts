@@ -184,8 +184,7 @@ export type GoalCoordinatorReceipt = {
   external: { checked: number; updated: number; blocked: number; error?: string };
   wakeRequested: boolean;
   wakeResult: string;
-  wakeWorkflow?: string;
-  wakeRef?: string;
+  wakeTarget?: string;
   wakeReason?: string;
 };
 
@@ -197,7 +196,7 @@ type CoordinatorCounts = {
   error?: unknown;
 };
 
-const HARNESS_WORKFLOW = "https://github.com/daniels-project-space/jarvis/actions/workflows/jarvis-agent-harness.yml";
+const FLEET_TARGET = "trigger:jarvis-agent-worker";
 
 function coordinatorError(value: unknown): string | undefined {
   return value ? String(value).slice(0, 1000) : undefined;
@@ -256,14 +255,13 @@ export function createGoalCoordinatorReceipt(input: {
     },
     wakeRequested: input.shouldWake,
     wakeResult: input.shouldWake ? (input.woken ? "dispatched" : "not_dispatched") : "not_requested",
-    wakeWorkflow: input.shouldWake ? HARNESS_WORKFLOW : undefined,
-    wakeRef: input.shouldWake ? "main" : undefined,
+    wakeTarget: input.shouldWake ? FLEET_TARGET : undefined,
     wakeReason: input.shouldWake ? "goal-coordinator" : undefined,
   };
 }
 
 // This is an observation-only write. Goal control, the two durable outboxes,
-// and the GitHub wake all complete before a receipt is recorded.
+// and the Trigger fleet wake all complete before a receipt is recorded.
 export async function recordGoalCoordinatorReceipt(receipt: GoalCoordinatorReceipt) {
   return await jarvisCall("mutation", "goalMode:recordCoordinatorReceipt", receipt);
 }

@@ -79,8 +79,7 @@ export const recordCoordinatorReceipt = mutation({
     }),
     wakeRequested: v.boolean(),
     wakeResult: v.string(),
-    wakeWorkflow: v.optional(v.string()),
-    wakeRef: v.optional(v.string()),
+    wakeTarget: v.optional(v.string()),
     wakeReason: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
@@ -105,8 +104,7 @@ export const recordCoordinatorReceipt = mutation({
       externalError: receiptError(args.external.error),
       wakeRequested: args.wakeRequested,
       wakeResult: args.wakeResult.slice(0, 40),
-      wakeWorkflow: args.wakeWorkflow?.slice(0, 400),
-      wakeRef: args.wakeRef?.slice(0, 160),
+      wakeTarget: args.wakeTarget?.slice(0, 240),
       wakeReason: args.wakeReason?.slice(0, 160),
       createdAt: Date.now(),
     });
@@ -340,8 +338,7 @@ async function validatorAuditSnapshot(ctx: any, mission: any, jobs: any[]): Prom
         },
         wakeRequested: receipt.wakeRequested,
         wakeResult: receipt.wakeResult,
-        wakeWorkflow: receipt.wakeWorkflow ?? null,
-        wakeRef: receipt.wakeRef ?? null,
+        wakeTarget: receipt.wakeTarget ?? receipt.wakeWorkflow ?? null,
         wakeReason: receipt.wakeReason ?? null,
       }
     : null;
@@ -1182,7 +1179,7 @@ export const recordExternalActionFailure = mutation({
 });
 
 // Lightweight Trigger supervision uses this read model to wake the expensive
-// CLI harness only when a durable goal has a transition to process. Immediate
+// Trigger fleet only when a durable goal has a transition to process. Immediate
 // job completion still advances inline; this is the crash/restart backstop.
 export const coordinationDemand = query({
   args: { workerToken: v.optional(v.string()) },

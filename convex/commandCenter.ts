@@ -17,6 +17,11 @@ export const snapshot = query({
         .withIndex("by_visibility_status", (q: any) => q.eq("visibility", "conversation").eq("status", "running"))
         .order("asc")
         .take(12),
+      ctx.db
+        .query("jobs")
+        .withIndex("by_visibility_status", (q: any) => q.eq("visibility", "conversation").eq("status", "dispatching"))
+        .order("asc")
+        .take(12),
       ctx.db.query("jobs").withIndex("by_status", (q: any) => q.eq("status", "awaiting_approval")).order("asc").take(12),
       ctx.db.query("jobs").withIndex("by_status", (q: any) => q.eq("status", "needs_input")).order("asc").take(12),
     ]);

@@ -1,5 +1,5 @@
 import { schedules } from "@trigger.dev/sdk/v3";
-import { wakeAgentHarness } from "../lib/agent-harness-wake";
+import { wakeAgentFleet } from "../lib/agent-fleet-dispatch";
 import {
   createGoalCoordinatorReceipt,
   goalCoordinationDemand,
@@ -29,7 +29,7 @@ export const goalCoordinator = schedules.task({
       goalCoordinationDemand().catch((error) => ({ needed: false, reasons: [], error: String(error) })),
     ]);
     const shouldWake = external.wake || demand.needed === true;
-    const woken = shouldWake ? await wakeAgentHarness("goal-coordinator").catch(() => false) : false;
+    const woken = shouldWake ? await wakeAgentFleet("goal-coordinator").catch(() => false) : false;
     const receipt = await recordGoalCoordinatorReceipt(createGoalCoordinatorReceipt({
       deploymentVersion: goalCoordinatorDeploymentVersion(ctx.run.version),
       demand,

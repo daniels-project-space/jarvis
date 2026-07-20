@@ -9,6 +9,7 @@ import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
+const DISPATCH_LEASE_MS = 2 * 60 * 1000;
 
 const enqueueArgs = {
   task: v.string(),
@@ -153,52 +154,158 @@ export const reconcileAutonomousSoftwareWork = mutation({
   },
 });
 
-export const claimNext = mutation({
-  args: { workerToken: v.optional(v.string()) },
-  handler: async (ctx, a) => {
-    requireWorker(a.workerToken);
-    const now = Date.now();
-    const candidates = await ctx.db
-      .query("jobs")
-      .withIndex("by_status_next_run", (q: any) => q.eq("status", "pending").lte("nextRunAt", now))
-      .take(40);
-    candidates.sort((a: any, b: any) => (b.priority ?? 50) - (a.priority ?? 50) || a.createdAt - b.createdAt);
-    let j: any = null;
-    const missionCache = new Map<string, any>();
-    const dependencyCache = new Map<string, any>();
-    for (const candidate of candidates) {
-      if (candidate.approvalRequired && candidate.approvalStatus !== "approved") continue;
-      if (candidate.missionId) {
-        let mission = missionCache.get(candidate.missionId);
-        if (mission === undefined) {
-          const missionId = ctx.db.normalizeId("missions", candidate.missionId);
-          mission = missionId ? await ctx.db.get(missionId) : null;
-          missionCache.set(candidate.missionId, mission ?? null);
-        }
-        // A paused/blocked/cancelled Goal Mode mission owns the lease. This
-        // server-side fence prevents a manually approved or retried child job
-        // from escaping while the parent goal is stopped.
-        if (candidate.goalStage && (!mission || !goalJobMatchesMissionPhase(candidate, mission))) continue;
+async function runnableCandidates(ctx: any, now: number, limit: number): Promise<any[]> {
+  const candidates = await ctx.db
+    .query("jobs")
+    .withIndex("by_status_next_run", (q: any) => q.eq("status", "pending").lte("nextRunAt", now))
+    .take(Math.max(40, Math.min(120, limit * 8)));
+  candidates.sort((a: any, b: any) => (b.priority ?? 50) - (a.priority ?? 50) || a.createdAt - b.createdAt);
+  const runnable: any[] = [];
+  const missionCache = new Map<string, any>();
+  const dependencyCache = new Map<string, any>();
+  for (const candidate of candidates) {
+    if (candidate.approvalRequired && candidate.approvalStatus !== "approved") continue;
+    if (candidate.missionId) {
+      let mission = missionCache.get(candidate.missionId);
+      if (mission === undefined) {
+        const missionId = ctx.db.normalizeId("missions", candidate.missionId);
+        mission = missionId ? await ctx.db.get(missionId) : null;
+        missionCache.set(candidate.missionId, mission ?? null);
       }
-      let blocked = false;
-      for (const dependency of candidate.dependsOn ?? []) {
-        let dep = dependencyCache.get(dependency);
-        if (dep === undefined) {
-          const id = ctx.db.normalizeId("jobs", dependency);
-          dep = id ? await ctx.db.get(id) : null;
-          dependencyCache.set(dependency, dep ?? null);
-        }
-        if (!dep || dep.status !== "done") {
-          blocked = true;
-          break;
-        }
+      // A paused/blocked/cancelled Goal Mode mission owns the lease. This
+      // server-side fence prevents a manually approved or retried child job
+      // from escaping while the parent goal is stopped.
+      if (candidate.goalStage && (!mission || !goalJobMatchesMissionPhase(candidate, mission))) continue;
+    }
+    let blocked = false;
+    for (const dependency of candidate.dependsOn ?? []) {
+      let dep = dependencyCache.get(dependency);
+      if (dep === undefined) {
+        const id = ctx.db.normalizeId("jobs", dependency);
+        dep = id ? await ctx.db.get(id) : null;
+        dependencyCache.set(dependency, dep ?? null);
       }
-      if (!blocked) {
-        j = candidate;
+      if (!dep || dep.status !== "done") {
+        blocked = true;
         break;
       }
     }
-    if (!j) return null;
+    if (!blocked) {
+      runnable.push(candidate);
+      if (runnable.length >= limit) break;
+    }
+  }
+  return runnable;
+}
+
+function claimedJob(j: any) {
+  return {
+    jobId: j._id,
+    task: j.task,
+    repo: j.repo ?? null,
+    readonly: j.readonly ?? false,
+    model: j.model ? normalizeWorkModelTier(j.model) : null,
+    reasoningEffort: j.reasoningEffort ?? null,
+    mcp: j.mcp ?? [],
+    incidentId: j.incidentId ?? null,
+    retried: j.retried ?? false,
+    missionId: j.missionId ?? null,
+    label: j.label ?? null,
+    originThreadId: j.originThreadId ?? "main",
+    originTurnId: j.originTurnId ?? null,
+    agentId: j.agentId ?? null,
+    risk: j.risk ?? "low",
+    priority: j.priority ?? 50,
+    attempt: j.attempt ?? 1,
+    maxAttempts: j.maxAttempts ?? 12,
+    checkpoint: j.checkpoint ?? null,
+    result: j.result ?? null,
+    branch: j.branch ?? null,
+    deliveryMode: j.deliveryMode ?? (j.readonly ? "read_only" : "manual"),
+    deliveryStatus: j.deliveryStatus ?? null,
+    pullRequestUrl: j.pullRequestUrl ?? null,
+    mergeCommitSha: j.mergeCommitSha ?? null,
+    verificationVerdict: j.verificationVerdict ?? null,
+    verificationNote: j.verificationNote ?? null,
+    acceptanceCriteria: j.acceptanceCriteria ?? [],
+    modelReason: j.modelReason ?? null,
+    parentJobId: j.parentJobId ?? null,
+    goalStage: j.goalStage ?? null,
+    goalWorkstreamId: j.goalWorkstreamId ?? null,
+    goalWave: j.goalWave ?? 0,
+  };
+}
+
+// Reserve concrete jobs before asking Trigger.dev to create cloud runs. Convex
+// serializes this mutation, so overlapping supervisors receive disjoint work
+// and never need a global "is any runner active?" lock.
+export const reserveDispatchBatch = mutation({
+  args: {
+    limit: v.number(),
+    reason: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const now = Date.now();
+    const limit = Math.max(1, Math.min(12, Math.floor(a.limit)));
+    const candidates = await runnableCandidates(ctx, now, limit);
+    const reservations = [];
+    for (const j of candidates) {
+      const dispatchId = `${String(j._id)}:${j.attempt ?? 1}:${now}`;
+      await ctx.db.patch(j._id, {
+        status: "dispatching",
+        stage: "dispatching",
+        progress: "cloud worker reserved",
+        dispatchId,
+        dispatchLeaseUntil: now + DISPATCH_LEASE_MS,
+        dispatchReason: a.reason?.slice(0, 160),
+        workerRunId: undefined,
+        workerRuntime: "trigger",
+        heartbeatAt: now,
+      });
+      await ctx.db.insert("workEvents", {
+        jobId: String(j._id),
+        missionId: j.missionId,
+        agentId: j.agentId,
+        type: "dispatched",
+        message: `Independent Trigger worker reserved${a.reason ? ` · ${a.reason.slice(0, 120)}` : ""}`,
+        stage: "dispatching",
+        percent: Math.max(1, j.percent ?? 0),
+        createdAt: now,
+      });
+      reservations.push({
+        jobId: String(j._id),
+        dispatchId,
+        attempt: j.attempt ?? 1,
+        missionId: j.missionId ?? null,
+        agentId: j.agentId ?? null,
+        label: j.label ?? j.task.slice(0, 80),
+      });
+    }
+    return { reservations };
+  },
+});
+
+// Bind one reserved job to one Trigger run. Late/retried platform deliveries
+// are harmless: only the exact live dispatch id can cross this fence.
+export const claimDispatched = mutation({
+  args: {
+    jobId: v.id("jobs"),
+    dispatchId: v.string(),
+    workerRunId: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const now = Date.now();
+    const j: any = await ctx.db.get(a.jobId);
+    if (
+      !j ||
+      j.status !== "dispatching" ||
+      j.dispatchId !== a.dispatchId ||
+      (j.dispatchLeaseUntil ?? 0) < now
+    ) return null;
     await ctx.db.patch(j._id, {
       status: "running",
       stage: "starting",
@@ -207,6 +314,9 @@ export const claimNext = mutation({
       startedAt: now,
       heartbeatAt: now,
       nextRunAt: undefined,
+      dispatchLeaseUntil: undefined,
+      workerRunId: a.workerRunId.slice(0, 120),
+      workerRuntime: "trigger",
     });
     await ctx.db.insert("workEvents", {
       jobId: String(j._id),
@@ -218,41 +328,45 @@ export const claimNext = mutation({
       percent: Math.max(2, j.percent ?? 0),
       createdAt: now,
     });
-    return {
-      jobId: j._id,
-      task: j.task,
-      repo: j.repo ?? null,
-      readonly: j.readonly ?? false,
-      model: j.model ? normalizeWorkModelTier(j.model) : null,
-      reasoningEffort: j.reasoningEffort ?? null,
-      mcp: j.mcp ?? [],
-      incidentId: j.incidentId ?? null,
-      retried: j.retried ?? false,
-      missionId: j.missionId ?? null,
-      label: j.label ?? null,
-      originThreadId: j.originThreadId ?? "main",
-      originTurnId: j.originTurnId ?? null,
-      agentId: j.agentId ?? null,
-      risk: j.risk ?? "low",
-      priority: j.priority ?? 50,
-      attempt: j.attempt ?? 1,
-      maxAttempts: j.maxAttempts ?? 12,
-      checkpoint: j.checkpoint ?? null,
-      result: j.result ?? null,
-      branch: j.branch ?? null,
-      deliveryMode: j.deliveryMode ?? (j.readonly ? "read_only" : "manual"),
-      deliveryStatus: j.deliveryStatus ?? null,
-      pullRequestUrl: j.pullRequestUrl ?? null,
-      mergeCommitSha: j.mergeCommitSha ?? null,
-      verificationVerdict: j.verificationVerdict ?? null,
-      verificationNote: j.verificationNote ?? null,
-      acceptanceCriteria: j.acceptanceCriteria ?? [],
-      modelReason: j.modelReason ?? null,
-      parentJobId: j.parentJobId ?? null,
-      goalStage: j.goalStage ?? null,
-      goalWorkstreamId: j.goalWorkstreamId ?? null,
-      goalWave: j.goalWave ?? 0,
-    };
+    return claimedJob(j);
+  },
+});
+
+export const rejectDispatch = mutation({
+  args: {
+    jobId: v.id("jobs"),
+    dispatchId: v.string(),
+    reason: v.string(),
+    delayMs: v.optional(v.number()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.get(a.jobId);
+    if (!row || row.status !== "dispatching" || row.dispatchId !== a.dispatchId) return false;
+    const now = Date.now();
+    const delayMs = Math.max(0, Math.min(10 * 60_000, a.delayMs ?? 30_000));
+    await ctx.db.patch(a.jobId, {
+      status: "pending",
+      stage: "queued",
+      progress: `worker launch deferred · ${a.reason.slice(0, 240)}`,
+      nextRunAt: now + delayMs,
+      dispatchId: undefined,
+      dispatchLeaseUntil: undefined,
+      workerRunId: undefined,
+      heartbeatAt: now,
+    });
+    await ctx.db.insert("workEvents", {
+      jobId: String(a.jobId),
+      missionId: row.missionId,
+      agentId: row.agentId,
+      type: "dispatch_released",
+      message: a.reason.slice(0, 500),
+      stage: "queued",
+      percent: row.percent,
+      createdAt: now,
+    });
+    return true;
   },
 });
 
@@ -414,11 +528,40 @@ export const reapStale = mutation({
   args: { workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
+    const now = Date.now();
+    const dispatching = await ctx.db
+      .query("jobs")
+      .withIndex("by_status", (q: any) => q.eq("status", "dispatching"))
+      .take(100);
+    const releasedDispatches: string[] = [];
+    for (const j of dispatching) {
+      if ((j.dispatchLeaseUntil ?? j.heartbeatAt ?? j.createdAt) > now) continue;
+      await ctx.db.patch(j._id, {
+        status: "pending",
+        stage: "queued",
+        progress: "worker reservation expired — redispatch queued",
+        nextRunAt: now,
+        dispatchId: undefined,
+        dispatchLeaseUntil: undefined,
+        workerRunId: undefined,
+        heartbeatAt: now,
+      });
+      await ctx.db.insert("workEvents", {
+        jobId: String(j._id),
+        missionId: j.missionId,
+        agentId: j.agentId,
+        type: "dispatch_recovered",
+        message: "Expired Trigger worker reservation released",
+        stage: "queued",
+        percent: j.percent,
+        createdAt: now,
+      });
+      releasedDispatches.push(j.task.slice(0, 80));
+    }
     const running = await ctx.db
       .query("jobs")
       .withIndex("by_status", (q: any) => q.eq("status", "running"))
       .take(100);
-    const now = Date.now();
     const requeued: string[] = [];
     const abandoned: string[] = [];
     for (const j of running) {
@@ -470,7 +613,7 @@ export const reapStale = mutation({
         createdAt: now,
       });
     }
-    return { requeued, abandoned };
+    return { requeued, abandoned, releasedDispatches };
   },
 });
 
@@ -576,6 +719,9 @@ export const checkpointAndRequeue = mutation({
       startedAt: undefined,
       heartbeatAt: Date.now(),
       nextRunAt: status === "pending" ? Date.now() + delayMs : undefined,
+      dispatchId: undefined,
+      dispatchLeaseUntil: undefined,
+      workerRunId: status === "pending" ? undefined : row.workerRunId,
       completedAt: requestedStatus === "cancelled" || exhausted ? Date.now() : undefined,
       progress: exhausted
         ? "continuation budget exhausted"
@@ -785,12 +931,14 @@ export const control = mutation({
     const row = await ctx.db.get(a.jobId);
     if (!row) return false;
     const now = Date.now();
-    if (a.action === "pause" && ["pending", "running"].includes(row.status))
+    if (a.action === "pause" && ["pending", "dispatching", "running"].includes(row.status))
       await ctx.db.patch(a.jobId, {
         status: "paused",
         stage: "paused",
         progress: "paused by Daniel",
         nextRunAt: undefined,
+        dispatchId: undefined,
+        dispatchLeaseUntil: undefined,
       });
     else if (a.action === "resume" && row.status === "paused")
       await ctx.db.patch(a.jobId, {
@@ -801,6 +949,9 @@ export const control = mutation({
         startedAt: undefined,
         heartbeatAt: now,
         nextRunAt: now,
+        dispatchId: undefined,
+        dispatchLeaseUntil: undefined,
+        workerRunId: undefined,
       });
     else if (a.action === "cancel" && !["done", "error", "cancelled"].includes(row.status)) {
       await ctx.db.patch(a.jobId, {
@@ -829,6 +980,9 @@ export const control = mutation({
         approvalStatus: renewApproval ? "pending" : row.approvalStatus,
         progress: renewApproval ? "retry waiting for Daniel's approval" : "manual retry queued",
         nextRunAt: renewApproval ? undefined : now,
+        dispatchId: undefined,
+        dispatchLeaseUntil: undefined,
+        workerRunId: undefined,
       });
       if (renewApproval) {
         await ctx.db.insert("approvals", {
@@ -861,7 +1015,7 @@ export const active = query({
   args: { ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    const statuses = ["running", "pending", "awaiting_approval", "paused", "needs_input"];
+    const statuses = ["running", "dispatching", "pending", "awaiting_approval", "paused", "needs_input"];
     const groups = await Promise.all(
       statuses.map((status) =>
         ctx.db
@@ -906,6 +1060,19 @@ export const active = query({
         startedAt: j.startedAt ?? j.createdAt,
         heartbeatAt: j.heartbeatAt ?? j.startedAt ?? j.createdAt,
         nextRunAt: j.nextRunAt ?? null,
+        workerRunId: j.workerRunId ?? null,
+        workerRuntime: j.workerRuntime ?? null,
       }));
+  },
+});
+
+export const workerRun = query({
+  args: { jobId: v.id("jobs"), ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    const row = await ctx.db.get(a.jobId);
+    return row?.workerRunId
+      ? { runId: row.workerRunId, taskId: "jarvis-agent-worker", runtime: row.workerRuntime ?? "trigger" }
+      : null;
   },
 });

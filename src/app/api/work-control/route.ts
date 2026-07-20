@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { controlMutation } from "@/lib/control-session";
-import { wakeAgentHarness } from "@/lib/agent-harness-wake";
+import { wakeAgentFleet } from "@/lib/agent-fleet-dispatch";
 import { controlActor, controlCredentials } from "@/lib/request-auth";
 
 const ACTIONS = new Set(["approve", "decline", "pause", "resume", "cancel", "retry", "answer"]);
@@ -46,7 +46,7 @@ export async function POST(req: NextRequest) {
     shouldWake = true;
   }
   if (shouldWake) {
-    await wakeAgentHarness(`${missionId ? "goal" : "job"}-${action}:${missionId || jobId}`).catch(() => false);
+    await wakeAgentFleet(`${missionId ? "goal" : "job"}-${action}:${missionId || jobId}`).catch(() => false);
   }
   return Response.json(
     { ok: ok === true, ...(ok === true ? {} : { error: "That work item cannot apply this control from its current state." }) },

@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useRealtimeRun } from "@trigger.dev/react-hooks";
 import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
@@ -86,6 +87,8 @@ type Job = {
   pullRequestUrl?: string;
   visibility?: string;
   incidentId?: string;
+  workerRunId?: string;
+  workerRuntime?: string;
   startedAt: number;
 };
 type Caption = {
@@ -555,15 +558,7 @@ function LiveSessionLog({ job }: { job: Job }) {
   );
 }
 
-function AgentLiveView({
-  job,
-  now,
-  compact,
-  activeCount,
-  onCompact,
-  onClose,
-  onNext,
-}: {
+type AgentLiveViewProps = {
   job: Job;
   now: number;
   compact: boolean;
@@ -571,7 +566,17 @@ function AgentLiveView({
   onCompact: () => void;
   onClose: () => void;
   onNext: () => void;
-}) {
+};
+
+function AgentLiveSurface({
+  job,
+  now,
+  compact,
+  activeCount,
+  onCompact,
+  onClose,
+  onNext,
+}: AgentLiveViewProps) {
   const [acting, setActing] = useState("");
   const elapsed = Math.max(0, Math.floor((now - job.startedAt) / 1000));
   const pct = Math.max(0, Math.min(100, job.percent ?? 0));
@@ -642,6 +647,51 @@ function AgentLiveView({
       </div>
     </div>
   );
+}
+
+function TriggerRealtimeAgentView({
+  accessToken,
+  ...props
+}: AgentLiveViewProps & { accessToken: string }) {
+  const { run } = useRealtimeRun(props.job.workerRunId ?? "", { accessToken });
+  const liveJob = useMemo(() => {
+    const data = (run?.metadata ?? {}) as Record<string, unknown>;
+    const text = (key: string) => typeof data[key] === "string" ? String(data[key]) : undefined;
+    const numeric = (key: string) => Number.isFinite(Number(data[key])) ? Number(data[key]) : undefined;
+    return {
+      ...props.job,
+      stage: text("stage") ?? props.job.stage,
+      progress: text("progress") ?? props.job.progress,
+      log: text("logTail") ?? props.job.log,
+      percent: numeric("percent") ?? props.job.percent,
+    };
+  }, [props.job, run?.metadata]);
+  return <AgentLiveSurface {...props} job={liveJob} />;
+}
+
+function AgentLiveView(props: AgentLiveViewProps) {
+  const [accessToken, setAccessToken] = useState("");
+  useEffect(() => {
+    setAccessToken("");
+    if (!props.job.workerRunId) return;
+    const abort = new AbortController();
+    void viewerFetch("/api/work-realtime", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jobId: props.job._id }),
+      signal: abort.signal,
+    })
+      .then((response) => response.ok ? response.json() : null)
+      .then((payload) => {
+        if (!abort.signal.aborted && typeof payload?.accessToken === "string") setAccessToken(payload.accessToken);
+      })
+      .catch(() => {});
+    return () => abort.abort();
+  }, [props.job._id, props.job.workerRunId]);
+
+  return accessToken && props.job.workerRunId
+    ? <TriggerRealtimeAgentView {...props} accessToken={accessToken} />
+    : <AgentLiveSurface {...props} />;
 }
 
 // Animated count-up for KPI tiles.

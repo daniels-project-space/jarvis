@@ -1,6 +1,6 @@
 import { schedules } from "@trigger.dev/sdk/v3";
 import { sendPush } from "./push-send";
-import { wakeAgentHarness } from "../lib/agent-harness-wake";
+import { wakeAgentFleet } from "../lib/agent-fleet-dispatch";
 
 // Evidence-first proactive supervision. Trigger owns only bounded state
 // reconciliation; all diagnosis and implementation remains in isolated,
@@ -54,7 +54,7 @@ export const insightEngine = schedules.task({
       Number(state?.eligiblePending ?? 0) > 0 ||
       (Array.isArray(reaped?.requeued) && reaped.requeued.length > 0) ||
       Number(stuck?.requeued ?? 0) > 0;
-    if (shouldWake) await wakeAgentHarness("proactive-reconcile").catch(() => false);
+    if (shouldWake) await wakeAgentFleet("proactive-reconcile").catch(() => false);
 
     for (const title of Array.isArray(state?.newInterruptions) ? state.newInterruptions.slice(0, 1) : []) {
       await m("chatQueue:postAssistant", {

@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { countGeneralHarnessDemand, deriveProactiveSignals } from "./proactivePolicy";
+import { countGeneralFleetDemand, deriveProactiveSignals } from "./proactivePolicy";
 
 const now = 2_000_000_000_000;
 
 describe("deriveProactiveSignals", () => {
   it("leaves Goal Mode wake ownership to its dedicated coordinator", () => {
-    expect(countGeneralHarnessDemand({
+    expect(countGeneralFleetDemand({
       now,
       goalMissionIds: new Set(["goal-1"]),
       jobs: [
@@ -16,14 +16,14 @@ describe("deriveProactiveSignals", () => {
     })).toBe(1);
   });
 
-  it("detects an eligible queue with no live harness", () => {
+  it("detects an eligible queue with no live fleet worker", () => {
     const signals = deriveProactiveSignals({
       now,
       goals: [],
       jobs: [{ _id: "job-1", status: "pending", task: "Build feature", createdAt: now - 21 * 60_000 }],
     });
     expect(signals[0]).toMatchObject({
-      fingerprint: "proactive:agent-harness:not-claiming",
+      fingerprint: "proactive:agent-fleet:not-claiming",
       severity: "critical",
       actionClass: "ask",
     });

@@ -192,8 +192,7 @@ describe("Goal Mode external runtime", () => {
         external: { checked: 3, updated: 1, blocked: 0 },
         wakeRequested: true,
         wakeResult: "dispatched",
-        wakeWorkflow: "https://github.com/daniels-project-space/jarvis/actions/workflows/jarvis-agent-harness.yml",
-        wakeRef: "main",
+        wakeTarget: "trigger:jarvis-agent-worker",
         wakeReason: "goal-coordinator",
         workerToken: "worker-capability",
       });
@@ -209,8 +208,7 @@ describe("Goal Mode external runtime", () => {
       external: { checked: 3, updated: 1, blocked: 0 },
       wakeRequested: true,
       wakeResult: "dispatched",
-      wakeWorkflow: "https://github.com/daniels-project-space/jarvis/actions/workflows/jarvis-agent-harness.yml",
-      wakeRef: "main",
+      wakeTarget: "trigger:jarvis-agent-worker",
       wakeReason: "goal-coordinator",
     })).resolves.toEqual({ id: "receipt-1" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -240,7 +238,7 @@ describe("Goal Mode external runtime", () => {
     expect(receipt).toMatchObject({
       wakeRequested: true,
       wakeResult: "dispatched",
-      wakeRef: "main",
+      wakeTarget: "trigger:jarvis-agent-worker",
       wakeReason: "goal-coordinator",
     });
   });

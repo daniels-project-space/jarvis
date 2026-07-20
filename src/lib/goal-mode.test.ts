@@ -53,7 +53,7 @@ describe("Goal Mode contracts", () => {
     )).toBe(false);
   });
 
-  it("wakes the expensive harness only for runnable work", () => {
+  it("wakes specialist workers only for runnable work", () => {
     const mission = { mode: "goal", status: "running", phase: "building", revisionWave: 0 };
     expect(goalJobRunnableForMission(
       { status: "pending", goalStage: "building", goalWave: 0, dependsOn: ["plan"], nextRunAt: 100 },
