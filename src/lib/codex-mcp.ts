@@ -8,21 +8,26 @@ export type CodexMcpConfig = {
   mcpServers?: Record<string, CodexMcpServerConfig>;
 };
 
+export type DisabledCodexMcpHandoff = Readonly<{
+  configPath: null;
+  env: Readonly<Record<string, never>>;
+  unavailable: string[];
+}>;
+
+export function disabledCodexMcpHandoff(names: readonly string[]): DisabledCodexMcpHandoff {
+  const requested = [...new Set(names.map((name) => String(name).trim().toLowerCase()).filter(Boolean))];
+  return {
+    configPath: null,
+    env: {},
+    unavailable: requested.map((name) => `${name} (stdio MCP disabled pending the controller proxy)`),
+  };
+}
+
 /**
- * Codex CLI parses every --config value as TOML. JSON string/array literals are
- * valid TOML values, but JSON objects are not TOML inline tables. Secrets stay
- * in the child process environment and only their variable names are passed.
+ * Stdio MCPs share the model process tree and therefore cannot receive either
+ * subscription or provider authority. Keep the old boundary as an explicit
+ * fail-closed shim until a controller-hosted proxy replaces it.
  */
-export function codexMcpConfigArgs(config: CodexMcpConfig): string[] {
-  const args: string[] = [];
-  for (const [name, server] of Object.entries(config.mcpServers ?? {})) {
-    if (!/^[a-zA-Z0-9_-]+$/.test(name) || !server?.command) continue;
-    args.push("--config", `mcp_servers.${name}.command=${JSON.stringify(server.command)}`);
-    if (server.args?.length) args.push("--config", `mcp_servers.${name}.args=${JSON.stringify(server.args)}`);
-    if (server.envVars?.length) {
-      const names = [...new Set(server.envVars.filter((key) => /^[A-Z][A-Z0-9_]*$/.test(key)))];
-      if (names.length) args.push("--config", `mcp_servers.${name}.env_vars=${JSON.stringify(names)}`);
-    }
-  }
-  return args;
+export function codexMcpConfigArgs(_config: CodexMcpConfig): string[] {
+  return [];
 }

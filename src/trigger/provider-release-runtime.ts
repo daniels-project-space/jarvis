@@ -1,5 +1,5 @@
 import { configure, runs, tasks } from "@trigger.dev/sdk/v3";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
   existsSync,
@@ -31,7 +31,6 @@ import {
 import type {
   ConvexReleaseTarget,
   ReleaseCapabilityRef,
-  TrustedProviderBoundary,
 } from "../lib/project-registry";
 import { githubGitEnv, githubRepoUrl } from "./git-transport";
 import type { ProviderMergeGate, PullRequestChange } from "./github-delivery";
@@ -44,6 +43,14 @@ type CommandRunner = (
   args: string[],
   options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number },
 ) => Promise<CommandResult>;
+
+export const CONVEX_PREMERGE_PROOF_COMMAND = [
+  "tsc", "--project", "convex/tsconfig.json", "--noEmit", "--incremental", "false",
+] as const;
+
+export function convexReleaseAction(phase: ProviderReleaseStep["phase"]): "local-proof" | "live-deploy" {
+  return phase === "premerge" ? "local-proof" : "live-deploy";
+}
 
 export async function installDependenciesInPinnedCheckout(input: {
   sourceSha: string;
@@ -73,7 +80,7 @@ export type TrustedProviderReleaseGateArgs = {
   heartbeatMs?: number;
 };
 
-const RELEASE_ATTESTOR_TASK = "jarvis-provider-release-attestor";
+const JARVIS_SANDBOX_SMOKE_TASK = "jarvis-specialist-sandbox-smoke";
 const CONVEX_ATTESTOR_FILE = "convex/_jarvisRelease.ts";
 const PARSED_SOURCE_FILE = /\.(?:[cm]?[jt]sx?|json)$/i;
 const TERMINAL_TRIGGER_STATUSES = new Set([
@@ -124,7 +131,7 @@ function defaultCommandRunner(
   });
 }
 
-function safeToolEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function safeProviderToolEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env = {} as NodeJS.ProcessEnv;
   for (const key of [
     "PATH",
@@ -132,7 +139,6 @@ function safeToolEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     "LANG",
     "LC_ALL",
     "TMPDIR",
-    "NODE_OPTIONS",
     "NODE_EXTRA_CA_CERTS",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
@@ -143,10 +149,21 @@ function safeToolEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     "http_proxy",
     "https_proxy",
     "no_proxy",
-    "NPM_CONFIG_REGISTRY",
-    "npm_config_registry",
   ]) {
-    if (base[key] !== undefined) env[key] = base[key];
+    const value = base[key];
+    if (value === undefined) continue;
+    if (["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"].includes(key) && value) {
+      let proxy: URL;
+      try { proxy = new URL(value); } catch { throw new Error(`invalid provider tool proxy URL ${key}`); }
+      if (
+        !["http:", "https:"].includes(proxy.protocol)
+        || proxy.username
+        || proxy.password
+        || proxy.search
+        || proxy.hash
+      ) throw new Error(`credential-bearing or non-canonical provider tool proxy URL ${key} is forbidden`);
+    }
+    env[key] = value;
   }
   env.PATH = base.PATH?.trim() || "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
   env.CI = "1";
@@ -155,21 +172,70 @@ function safeToolEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return env;
 }
 
-function triggerDeployEnv(
+export function triggerReleaseEnv(
   base: NodeJS.ProcessEnv,
-  boundary: TrustedProviderBoundary,
   accessToken: string,
-  headSha: string,
 ): NodeJS.ProcessEnv {
-  // This command is the trusted controller, not the Codex specialist. Existing
-  // Trigger worker capabilities must remain available to trigger.config's
-  // explicit sync allowlist when it builds the replacement bundle.
   return {
-    ...base,
+    ...safeProviderToolEnv(base),
     TRIGGER_ACCESS_TOKEN: accessToken,
-    TRIGGER_PROJECT_REF_JARVIS: boundary.trigger!.projectRef,
-    JARVIS_RELEASE_SOURCE_SHA: headSha,
   };
+}
+
+export function triggerDeployCommand(projectRef: string): string[] {
+  return [
+    "trigger.dev",
+    "deploy",
+    "--project-ref",
+    projectRef,
+    "--env-file",
+    "/dev/null",
+    "--skip-promotion",
+    "--skip-sync-env-vars",
+  ];
+}
+
+export function triggerPromoteCommand(projectRef: string, version: string): string[] {
+  return ["trigger.dev", "promote", version, "--project-ref", projectRef];
+}
+
+export type GeneratedTriggerAttestor = Readonly<{
+  taskId: string;
+  relativePath: string;
+  source: string;
+}>;
+
+export function generatedTriggerAttestor(input: {
+  releaseId: string;
+  sourceSha: string;
+  projectRef: string;
+}): GeneratedTriggerAttestor {
+  if (!/^providers-v2:[0-9a-f]{64}$/.test(input.releaseId)) throw new Error("invalid generated attestor release id");
+  if (!/^[0-9a-f]{40,64}$/i.test(input.sourceSha)) throw new Error("invalid generated attestor source SHA");
+  if (!/^proj_[a-z0-9]+$/i.test(input.projectRef)) throw new Error("invalid generated attestor project ref");
+  const suffix = createHash("sha256")
+    .update(`${input.releaseId}\0${input.sourceSha}\0${input.projectRef}`)
+    .digest("hex")
+    .slice(0, 20);
+  const taskId = `provider-release-attestor-${suffix}`;
+  const relativePath = `src/trigger/__provider_release_attestor_${suffix}.ts`;
+  const receipt = {
+    protocol: 1,
+    releaseId: input.releaseId,
+    sourceSha: input.sourceSha,
+    projectRef: input.projectRef,
+    taskId,
+  } as const;
+  const source = `import { task } from "@trigger.dev/sdk/v3";\n\n` +
+    `const RELEASE = Object.freeze(${JSON.stringify(receipt)} as const);\n\n` +
+    `export const providerReleaseAttestor = task({\n` +
+    `  id: RELEASE.taskId,\n  maxDuration: 60,\n  retry: { maxAttempts: 1 },\n` +
+    `  run: async (payload: { protocol: number; releaseId: string; expectedSourceSha: string; expectedProjectRef: string; expectedVersion: string }, { ctx }) => {\n` +
+    `    const version = String(ctx.task.version ?? "");\n` +
+    `    if (payload.protocol !== RELEASE.protocol || payload.releaseId !== RELEASE.releaseId || payload.expectedSourceSha !== RELEASE.sourceSha || payload.expectedProjectRef !== RELEASE.projectRef || !version || payload.expectedVersion !== version) {\n` +
+    `      throw new Error("provider release attestation does not match this immutable task bundle");\n    }\n` +
+    `    return { ...RELEASE, version };\n  },\n});\n`;
+  return Object.freeze({ taskId, relativePath, source });
 }
 
 function deploymentFromConvexKey(key: string): { type: string; deployment: string } | null {
@@ -219,6 +285,7 @@ class TrustedProviderReleaseRuntime {
   private checkoutDir: string | null = null;
   private checkoutSourceSha = "";
   private dependenciesSourceSha = "";
+  private convexProofSourceSha = "";
   private releaseLeaseBegun = false;
   private currentState: ProviderReleaseState | undefined;
   private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
@@ -290,7 +357,7 @@ class TrustedProviderReleaseRuntime {
     if (this.checkoutDir) return this.checkoutDir;
     const root = mkdtempSync(join(tmpdir(), "jarvis-provider-release-"));
     const dir = join(root, "repository");
-    const gitEnv = githubGitEnv(safeToolEnv(this.args.baseEnv), this.args.githubToken);
+    const gitEnv = githubGitEnv(safeProviderToolEnv(this.args.baseEnv), this.args.githubToken);
     try {
       await this.command(
         "git",
@@ -298,11 +365,11 @@ class TrustedProviderReleaseRuntime {
         root,
         gitEnv,
       );
-      await this.command("git", ["remote", "set-url", "origin", githubRepoUrl(this.args.repository)], dir, safeToolEnv(this.args.baseEnv));
-      const head = oneLine(await this.command("git", ["rev-parse", "HEAD"], dir, safeToolEnv(this.args.baseEnv)), 80);
-      const branch = oneLine(await this.command("git", ["branch", "--show-current"], dir, safeToolEnv(this.args.baseEnv)), 240);
-      const shallow = oneLine(await this.command("git", ["rev-parse", "--is-shallow-repository"], dir, safeToolEnv(this.args.baseEnv)), 20);
-      const status = (await this.command("git", ["status", "--porcelain=v1", "--untracked-files=all"], dir, safeToolEnv(this.args.baseEnv))).trim();
+      await this.command("git", ["remote", "set-url", "origin", githubRepoUrl(this.args.repository)], dir, safeProviderToolEnv(this.args.baseEnv));
+      const head = oneLine(await this.command("git", ["rev-parse", "HEAD"], dir, safeProviderToolEnv(this.args.baseEnv)), 80);
+      const branch = oneLine(await this.command("git", ["branch", "--show-current"], dir, safeProviderToolEnv(this.args.baseEnv)), 240);
+      const shallow = oneLine(await this.command("git", ["rev-parse", "--is-shallow-repository"], dir, safeProviderToolEnv(this.args.baseEnv)), 20);
+      const status = (await this.command("git", ["status", "--porcelain=v1", "--untracked-files=all"], dir, safeProviderToolEnv(this.args.baseEnv))).trim();
       if (head !== expectedSha || branch !== initialBranch || shallow !== "false" || status) {
         throw new Error("the trusted provider checkout is not the exact clean, complete-history source candidate");
       }
@@ -317,7 +384,7 @@ class TrustedProviderReleaseRuntime {
 
   private async remoteRefs(): Promise<Map<string, string>> {
     const dir = this.checkoutDir ?? await this.checkout();
-    const env = safeToolEnv(this.args.baseEnv);
+    const env = safeProviderToolEnv(this.args.baseEnv);
     const output = await this.command(
       "git",
       [
@@ -357,9 +424,9 @@ class TrustedProviderReleaseRuntime {
     const dir = this.checkoutDir
       ?? await this.checkout(postmerge ? this.change.baseBranch : this.args.branch, sourceSha);
     if (this.checkoutSourceSha !== sourceSha) {
-      const env = githubGitEnv(safeToolEnv(this.args.baseEnv), this.args.githubToken);
+      const env = githubGitEnv(safeProviderToolEnv(this.args.baseEnv), this.args.githubToken);
       await this.command("git", ["fetch", "--no-tags", "origin", sourceSha], dir, env);
-      await this.command("git", ["checkout", "--detach", sourceSha], dir, safeToolEnv(this.args.baseEnv));
+      await this.command("git", ["checkout", "--detach", sourceSha], dir, safeProviderToolEnv(this.args.baseEnv));
       this.checkoutSourceSha = sourceSha;
       this.dependenciesSourceSha = "";
     }
@@ -368,7 +435,7 @@ class TrustedProviderReleaseRuntime {
 
   private async verifyCheckoutStillPinned(sourceSha = this.plan.headSha): Promise<string> {
     const dir = await this.switchToSource(sourceSha);
-    const env = safeToolEnv(this.args.baseEnv);
+    const env = safeProviderToolEnv(this.args.baseEnv);
     const head = oneLine(await this.command("git", ["rev-parse", "HEAD"], dir, env), 80);
     const shallow = oneLine(await this.command("git", ["rev-parse", "--is-shallow-repository"], dir, env), 20);
     const status = (await this.command("git", ["status", "--porcelain=v1", "--untracked-files=all"], dir, env)).trim();
@@ -381,16 +448,16 @@ class TrustedProviderReleaseRuntime {
 
   private async verifyPinnedBaseIsIncluded(): Promise<void> {
     const dir = await this.verifyCheckoutStillPinned(this.plan.headSha);
-    const env = githubGitEnv(safeToolEnv(this.args.baseEnv), this.args.githubToken);
+    const env = githubGitEnv(safeProviderToolEnv(this.args.baseEnv), this.args.githubToken);
     const known = await this.runCommand("git", ["cat-file", "-e", `${this.plan.baseSha}^{commit}`], {
       cwd: dir,
-      env: safeToolEnv(this.args.baseEnv),
+      env: safeProviderToolEnv(this.args.baseEnv),
       timeoutMs: 30_000,
     });
     if (known.code !== 0) await this.command("git", ["fetch", "--no-tags", "origin", this.plan.baseSha], dir, env);
     const ancestry = await this.runCommand("git", ["merge-base", "--is-ancestor", this.plan.baseSha, this.plan.headSha], {
       cwd: dir,
-      env: safeToolEnv(this.args.baseEnv),
+      env: safeProviderToolEnv(this.args.baseEnv),
       timeoutMs: 30_000,
     });
     if (ancestry.code !== 0) {
@@ -400,7 +467,7 @@ class TrustedProviderReleaseRuntime {
 
   private async sourceSnapshot(): Promise<Map<string, string>> {
     const dir = await this.verifyCheckoutStillPinned(this.plan.headSha);
-    const listed = await this.command("git", ["ls-files", "-z"], dir, safeToolEnv(this.args.baseEnv), 60_000);
+    const listed = await this.command("git", ["ls-files", "-z"], dir, safeProviderToolEnv(this.args.baseEnv), 60_000);
     const sources = new Map<string, string>();
     let totalBytes = 0;
     for (const path of listed.split("\0").filter(Boolean)) {
@@ -447,7 +514,7 @@ class TrustedProviderReleaseRuntime {
       sourceSha,
       verifyPinned: (sha) => this.verifyCheckoutStillPinned(sha),
       runNpmCi: async (cwd) => {
-        await this.command("npm", ["ci"], cwd, safeToolEnv(this.args.baseEnv), 20 * 60_000);
+        await this.command("npm", ["ci"], cwd, safeProviderToolEnv(this.args.baseEnv), 20 * 60_000);
       },
     });
     this.dependenciesSourceSha = sourceSha;
@@ -606,11 +673,34 @@ class TrustedProviderReleaseRuntime {
     });
   }
 
+  private async proveConvexPremerge(
+    step: ProviderReleaseStep,
+    sourceSha: string,
+  ): Promise<ProviderStepReceipt> {
+    if (step.phase !== "premerge") throw new Error("local Convex proof is restricted to the pre-merge phase");
+    const dir = await this.prepareDependencies(sourceSha);
+    if (this.convexProofSourceSha !== sourceSha) {
+      await this.command(
+        "npx",
+        [...CONVEX_PREMERGE_PROOF_COMMAND],
+        dir,
+        safeProviderToolEnv(this.args.baseEnv),
+        20 * 60_000,
+      );
+      await this.verifyCheckoutStillPinned(sourceSha);
+      this.convexProofSourceSha = sourceSha;
+    }
+    return verifiedReceipt(step, `Convex source for ${step.target} passed pinned local typecheck without a live deployment`, {
+      data: { sourceSha, localProof: true, liveMutation: false },
+    });
+  }
+
   private async deployConvex(
     step: ProviderReleaseStep,
     checkpoint: (receipt: ProviderStepReceipt) => Promise<boolean>,
     sourceSha: string,
   ): Promise<ProviderStepReceipt> {
+    if (step.phase !== "postmerge") throw new Error("live Convex deployment is forbidden before merge");
     const target = targetForStep(this.plan, step);
     const deployKey = await this.capability(target.deployKey);
     const keyTarget = deploymentFromConvexKey(deployKey);
@@ -620,7 +710,7 @@ class TrustedProviderReleaseRuntime {
     const dir = await this.prepareDependencies(sourceSha);
     const tracked = await this.runCommand("git", ["ls-files", "--error-unmatch", CONVEX_ATTESTOR_FILE], {
       cwd: dir,
-      env: safeToolEnv(this.args.baseEnv),
+      env: safeProviderToolEnv(this.args.baseEnv),
       timeoutMs: 30_000,
     });
     if (tracked.code === 0 || existsSync(join(dir, CONVEX_ATTESTOR_FILE))) {
@@ -638,7 +728,7 @@ class TrustedProviderReleaseRuntime {
         "npx",
         ["convex", "deploy", "--yes", "--codegen", "disable", "--message", `JARVIS ${this.plan.releaseId}`],
         dir,
-        { ...safeToolEnv(this.args.baseEnv), CONVEX_DEPLOY_KEY: deployKey },
+        { ...safeProviderToolEnv(this.args.baseEnv), CONVEX_DEPLOY_KEY: deployKey },
         20 * 60_000,
       );
       return await this.verifyConvexAttestation(step, target, sourceSha);
@@ -647,7 +737,12 @@ class TrustedProviderReleaseRuntime {
     }
   }
 
-  private validateTriggerOutput(run: any, version: string, sourceSha: string): { sourceSha: string; version: string } {
+  private validateTriggerOutput(
+    run: any,
+    version: string,
+    sourceSha: string,
+    attestor: GeneratedTriggerAttestor,
+  ): { sourceSha: string; version: string } {
     const output = run?.output as any;
     if (
       run?.status !== "COMPLETED"
@@ -657,17 +752,22 @@ class TrustedProviderReleaseRuntime {
       || output?.sourceSha !== sourceSha
       || output?.projectRef !== this.plan.boundary?.trigger?.projectRef
       || output?.version !== version
-      || output?.sandboxSmoke !== true
+      || output?.taskId !== attestor.taskId
     ) throw new Error(`Trigger run ${String(run?.id ?? "unknown")} did not attest the exact new bundle`);
     return { sourceSha: output.sourceSha, version: output.version };
   }
 
-  private async awaitTriggerRun(runId: string, version: string, sourceSha: string): Promise<any> {
+  private async awaitTriggerRun(
+    runId: string,
+    version: string,
+    sourceSha: string,
+    attestor: GeneratedTriggerAttestor,
+  ): Promise<any> {
     for (let attempt = 0; attempt < 180; attempt += 1) {
       await this.continuing();
       const run = await runs.retrieve(runId);
       if (TERMINAL_TRIGGER_STATUSES.has(String(run.status))) {
-        this.validateTriggerOutput(run, version, sourceSha);
+        this.validateTriggerOutput(run, version, sourceSha, attestor);
         return run;
       }
       await this.sleep(2_000);
@@ -675,9 +775,14 @@ class TrustedProviderReleaseRuntime {
     throw new Error(`Trigger attestation run ${runId} did not finish within the trusted release lease`);
   }
 
-  private async launchTriggerAttestor(version: string, pinned: boolean, sourceSha: string): Promise<string> {
+  private async launchTriggerAttestor(
+    version: string,
+    pinned: boolean,
+    sourceSha: string,
+    attestor: GeneratedTriggerAttestor,
+  ): Promise<string> {
     const handle = await tasks.trigger(
-      RELEASE_ATTESTOR_TASK,
+      attestor.taskId,
       {
         protocol: 1,
         releaseId: this.plan.releaseId,
@@ -694,14 +799,62 @@ class TrustedProviderReleaseRuntime {
     step: ProviderReleaseStep,
     version: string,
     sourceSha: string,
+    attestor: GeneratedTriggerAttestor,
   ): Promise<ProviderStepReceipt> {
-    const runId = await this.launchTriggerAttestor(version, false, sourceSha);
-    await this.awaitTriggerRun(runId, version, sourceSha);
+    const runId = await this.launchTriggerAttestor(version, false, sourceSha, attestor);
+    await this.awaitTriggerRun(runId, version, sourceSha, attestor);
     return verifiedReceipt(step, `Trigger ${step.target} current version ${version} attested ${sourceSha}`, {
       version,
       runId,
-      data: { sourceSha, currentAttested: true },
+      data: { sourceSha, taskId: attestor.taskId, currentAttested: true },
     });
+  }
+
+  private async verifyJarvisSandboxSmoke(version: string): Promise<string> {
+    const handle = await tasks.trigger(JARVIS_SANDBOX_SMOKE_TASK, {}, { version });
+    const runId = String(handle.id);
+    for (let attempt = 0; attempt < 180; attempt += 1) {
+      await this.continuing();
+      const run = await runs.retrieve(runId);
+      if (TERMINAL_TRIGGER_STATUSES.has(String(run.status))) {
+        const output = run.output as any;
+        if (
+          run.status !== "COMPLETED"
+          || String(run.version ?? "") !== version
+          || output?.protocol !== 1
+          || output?.legacyLandlock !== true
+          || output?.exactSmoke !== true
+        ) throw new Error(`Trigger staged sandbox smoke ${runId} failed closed`);
+        return runId;
+      }
+      await this.sleep(2_000);
+    }
+    throw new Error(`Trigger staged sandbox smoke ${runId} did not finish within the trusted release lease`);
+  }
+
+  private async assertTriggerAttestorCollisionFree(
+    dir: string,
+    attestor: GeneratedTriggerAttestor,
+  ): Promise<void> {
+    const taskDirectory = join(dir, "src/trigger");
+    const taskStat = lstatSync(taskDirectory);
+    if (!taskStat.isDirectory() || taskStat.isSymbolicLink()) {
+      throw new Error("target src/trigger must be a non-symlink task directory");
+    }
+    const file = join(dir, attestor.relativePath);
+    const tracked = await this.runCommand("git", ["ls-files", "--error-unmatch", attestor.relativePath], {
+      cwd: dir,
+      env: safeProviderToolEnv(this.args.baseEnv),
+      timeoutMs: 30_000,
+    });
+    if (tracked.code === 0 || existsSync(file)) throw new Error(`${attestor.relativePath} collides with target source`);
+    const idCollision = await this.runCommand("git", ["grep", "-F", "--", attestor.taskId, "--", "src/trigger"], {
+      cwd: dir,
+      env: safeProviderToolEnv(this.args.baseEnv),
+      timeoutMs: 30_000,
+    });
+    if (idCollision.code === 0) throw new Error(`generated Trigger task id ${attestor.taskId} collides with target source`);
+    if (idCollision.code !== 1) throw new Error("target Trigger task ids could not be collision-checked");
   }
 
   private async deployTrigger(
@@ -721,19 +874,34 @@ class TrustedProviderReleaseRuntime {
     if (!config.includes(trigger.projectRef)) {
       throw new Error(`trigger.config.ts does not contain exact project ${trigger.projectRef}`);
     }
+    const attestor = generatedTriggerAttestor({
+      releaseId: this.plan.releaseId,
+      sourceSha,
+      projectRef: trigger.projectRef,
+    });
     let version = prior.version;
     const priorData = prior.data ?? {};
-    if (version && priorData.sourceSha !== sourceSha) {
+    if (version && (priorData.sourceSha !== sourceSha || priorData.taskId !== attestor.taskId)) {
       throw new Error("the resumed Trigger version belongs to a different source commit");
     }
     if (!version) {
-      const output = await this.command(
-        "npx",
-        ["trigger.dev", "deploy", "--skip-promotion"],
-        dir,
-        triggerDeployEnv(this.args.baseEnv, this.plan.boundary!, accessToken, sourceSha),
-        25 * 60_000,
-      );
+      await this.verifyCheckoutStillPinned(sourceSha);
+      await this.assertTriggerAttestorCollisionFree(dir, attestor);
+      const generatedPath = join(dir, attestor.relativePath);
+      writeFileSync(generatedPath, attestor.source, { mode: 0o600 });
+      let output = "";
+      try {
+        output = await this.command(
+          "npx",
+          triggerDeployCommand(trigger.projectRef),
+          dir,
+          triggerReleaseEnv(this.args.baseEnv, accessToken),
+          25 * 60_000,
+        );
+      } finally {
+        rmSync(generatedPath, { force: true });
+      }
+      await this.verifyCheckoutStillPinned(sourceSha);
       version = output.match(/(?:Successfully deployed version|Version)\s+(\d{8}\.\d+)/i)?.[1];
       if (!version) throw new Error("Trigger deploy completed without an exact deployment version receipt");
       if (!(await checkpoint({
@@ -741,37 +909,59 @@ class TrustedProviderReleaseRuntime {
         status: "deploying",
         version,
         proof: `Trigger ${trigger.projectRef} staged version ${version} without promotion`,
-        data: { sourceSha, staged: true },
+        data: { sourceSha, taskId: attestor.taskId, staged: true },
       }))) throw new Error("the staged Trigger version could not be persisted");
     }
 
     let pinnedRunId = typeof priorData.pinnedRunId === "string" ? priorData.pinnedRunId : "";
     if (!priorData.pinnedAttested) {
-      if (!pinnedRunId) pinnedRunId = await this.launchTriggerAttestor(version, true, sourceSha);
+      if (!pinnedRunId) pinnedRunId = await this.launchTriggerAttestor(version, true, sourceSha, attestor);
       if (!(await checkpoint({
         id: step.id,
         status: "deploying",
         version,
         runId: pinnedRunId,
         proof: `new-version attestation ${pinnedRunId} handed to Trigger ${version}`,
-        data: { sourceSha, staged: true, pinnedRunId },
+        data: { sourceSha, taskId: attestor.taskId, staged: true, pinnedRunId },
       }))) throw new Error("the Trigger handoff run could not be persisted");
-      await this.awaitTriggerRun(pinnedRunId, version, sourceSha);
+      await this.awaitTriggerRun(pinnedRunId, version, sourceSha, attestor);
       if (!(await checkpoint({
         id: step.id,
         status: "deploying",
         version,
         runId: pinnedRunId,
         proof: `new worker ${version} independently attested its source bundle`,
-        data: { sourceSha, staged: true, pinnedRunId, pinnedAttested: true },
+        data: { sourceSha, taskId: attestor.taskId, staged: true, pinnedRunId, pinnedAttested: true },
       }))) throw new Error("the Trigger new-worker proof could not be persisted");
+    }
+
+    let sandboxRunId = typeof priorData.sandboxRunId === "string" ? priorData.sandboxRunId : "";
+    const jarvisTarget = this.plan.repository === "daniels-project-space/jarvis";
+    if (jarvisTarget && !priorData.sandboxAttested) {
+      sandboxRunId = await this.verifyJarvisSandboxSmoke(version);
+      if (!(await checkpoint({
+        id: step.id,
+        status: "deploying",
+        version,
+        runId: pinnedRunId,
+        proof: `staged Jarvis worker ${version} passed the exact specialist sandbox smoke`,
+        data: {
+          sourceSha,
+          taskId: attestor.taskId,
+          staged: true,
+          pinnedRunId,
+          pinnedAttested: true,
+          sandboxRunId,
+          sandboxAttested: true,
+        },
+      }))) throw new Error("the staged Jarvis sandbox proof could not be persisted");
     }
 
     await this.command(
       "npx",
-      ["trigger.dev", "promote", version],
+      triggerPromoteCommand(trigger.projectRef, version),
       dir,
-      triggerDeployEnv(this.args.baseEnv, this.plan.boundary!, accessToken, sourceSha),
+      triggerReleaseEnv(this.args.baseEnv, accessToken),
       10 * 60_000,
     );
     if (!(await checkpoint({
@@ -780,9 +970,16 @@ class TrustedProviderReleaseRuntime {
       version,
       runId: pinnedRunId,
       proof: `Trigger ${trigger.projectRef} promoted independently-attested ${version}`,
-      data: { sourceSha, pinnedRunId, pinnedAttested: true, promoted: true },
+      data: {
+        sourceSha,
+        taskId: attestor.taskId,
+        pinnedRunId,
+        pinnedAttested: true,
+        ...(jarvisTarget ? { sandboxRunId, sandboxAttested: true } : {}),
+        promoted: true,
+      },
     }))) throw new Error("the Trigger promotion checkpoint could not be persisted");
-    return await this.verifyCurrentTrigger(step, version, sourceSha);
+    return await this.verifyCurrentTrigger(step, version, sourceSha, attestor);
   }
 
   async execute(
@@ -796,7 +993,11 @@ class TrustedProviderReleaseRuntime {
     if (!/^[0-9a-f]{40,64}$/i.test(sourceSha)) throw new Error("provider step has no exact source commit");
     if (step.kind === "vercel_identity") return await this.verifyVercel(step);
     if (step.kind === "vercel_live") return await this.verifyVercelLive(step, sourceSha);
-    if (step.kind === "convex") return await this.deployConvex(step, checkpoint, sourceSha);
+    if (step.kind === "convex") {
+      return convexReleaseAction(step.phase) === "local-proof"
+        ? await this.proveConvexPremerge(step, sourceSha)
+        : await this.deployConvex(step, checkpoint, sourceSha);
+    }
     return await this.deployTrigger(step, prior, checkpoint, sourceSha);
   }
 
@@ -805,11 +1006,21 @@ class TrustedProviderReleaseRuntime {
     const sourceSha = step.phase === "postmerge" ? String(state.mergeSha ?? "") : this.plan.headSha;
     if (step.kind === "vercel_identity") return await this.verifyVercel(step);
     if (step.kind === "vercel_live") return await this.verifyVercelLive(step, sourceSha);
-    if (step.kind === "convex") return await this.verifyConvexAttestation(step, targetForStep(this.plan, step), sourceSha);
+    if (step.kind === "convex") {
+      return convexReleaseAction(step.phase) === "local-proof"
+        ? await this.proveConvexPremerge(step, sourceSha)
+        : await this.verifyConvexAttestation(step, targetForStep(this.plan, step), sourceSha);
+    }
     if (!prior.version) throw new Error("the Trigger receipt has no deployment version");
     const secretKey = await this.capability(this.plan.boundary!.trigger!.secretKey);
     configure({ accessToken: secretKey });
-    return await this.verifyCurrentTrigger(step, prior.version, sourceSha);
+    const attestor = generatedTriggerAttestor({
+      releaseId: this.plan.releaseId,
+      sourceSha,
+      projectRef: this.plan.boundary!.trigger!.projectRef,
+    });
+    if (prior.data?.taskId !== attestor.taskId) throw new Error("the Trigger receipt names a different generated attestor");
+    return await this.verifyCurrentTrigger(step, prior.version, sourceSha, attestor);
   }
 
   private operations() {

@@ -77,13 +77,45 @@ describe("trusted provider release planning", () => {
     expect(impact.reasons.trigger.join("\n")).toContain("transitively imported by Trigger");
   });
 
-  it("fails closed for shared modules even when a custom alias is not statically resolvable", () => {
+  it("resolves tsconfig and package import aliases without classifying unrelated providers", () => {
     const sources = {
+      "tsconfig.json": JSON.stringify({ compilerOptions: { baseUrl: ".", paths: { "@worker/*": ["src/worker-shared/*"] } } }),
+      "package.json": JSON.stringify({ imports: { "#shared/*": "./src/lib/*" } }),
       "convex/jobs.ts": 'import { guard } from "#shared/work-safety"; guard();',
+      "src/trigger/agent-runner.ts": 'import { worker } from "@worker/runtime"; worker();',
       "src/lib/work-safety.ts": "export const guard = () => true;",
+      "src/worker-shared/runtime.ts": "export const worker = () => true;",
     };
     expect(analyseProviderImpact(["src/lib/work-safety.ts"], sources).providers)
-      .toEqual(["convex", "trigger"]);
+      .toEqual(["convex"]);
+    expect(analyseProviderImpact(["src/worker-shared/runtime.ts"], sources).providers)
+      .toEqual(["trigger"]);
+  });
+
+  it("retains alias reachability when the changed target was deleted", () => {
+    const sources = {
+      "tsconfig.json": `{
+        // real tsconfig files are JSONC
+        "compilerOptions": { "paths": { "@deleted/*": ["./src/deleted/*",], }, },
+      }`,
+      "src/trigger/agent-runner.ts": 'import data from "@deleted/provider-data.json"; export { data };',
+    };
+    expect(analyseProviderImpact(["src/deleted/provider-data.json"], sources).providers)
+      .toEqual(["trigger"]);
+  });
+
+  it("keeps web-only shared modules off both exact provider release paths", () => {
+    const sources = {
+      "tsconfig.json": JSON.stringify({ compilerOptions: { paths: { "@/*": ["./src/*"] } } }),
+      "src/app/page.tsx": 'import { format } from "@/lib/web-only"; export default () => format("web");',
+      "src/components/WebPanel.tsx": 'import { format } from "@/lib/web-only"; export const WebPanel = () => format("panel");',
+      "src/lib/web-only.ts": "export const format = (value: string) => value;",
+      "convex/jobs.ts": "export const provider = true;",
+      "src/trigger/agent-runner.ts": "export const provider = true;",
+    };
+    const impact = analyseProviderImpact(["src/lib/web-only.ts"], sources);
+    expect(impact.providers).toEqual([]);
+    expect(impact.reasons).toEqual({ convex: [], trigger: [] });
   });
 
   it("fails closed for package, lock, root config, and provider build scripts", () => {

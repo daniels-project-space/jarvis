@@ -44,7 +44,7 @@ export default defineConfig({
       },
       syncEnvVars(() => {
         const values = Object.fromEntries(
-          ["CODEX_AUTH_JSON_B64", "CONVEX_URL", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN", "GITHUB_TOKEN", "VAULT_ACCESS_TOKEN", "JARVIS_RELEASE_SOURCE_SHA"]
+          ["CODEX_AUTH_JSON_B64", "CONVEX_URL", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN", "GITHUB_TOKEN", "VAULT_ACCESS_TOKEN"]
             .map((key) => [key, process.env[key]])
             .filter((entry): entry is [string, string] => Boolean(entry[1])),
         );

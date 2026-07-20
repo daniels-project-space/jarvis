@@ -7,6 +7,7 @@ import {
   buildSpecialistNamespaceProbeInvocation,
   verifySpecialistSandboxIsolation,
 } from "./specialist-sandbox";
+import { buildPrivateProcNamespaceInvocation, PRIVATE_PROC_NAMESPACE_SETUP } from "./codex-launcher";
 
 const roots: string[] = [];
 const codexBin = realpathSync(join(process.cwd(), "node_modules/.bin/codex"));
@@ -30,17 +31,16 @@ function sandboxFixture() {
 
 function localNamespaceAvailable(): boolean {
   if (!existsSync("/usr/bin/unshare")) return false;
-  return spawnSync("/usr/bin/unshare", [
-    "--user",
-    "--map-root-user",
-    "--pid",
-    "--fork",
-    "--mount-proc=/proc",
-    "--propagation",
-    "unchanged",
-    "--",
-    "/bin/true",
-  ]).status === 0;
+  const invocation = buildPrivateProcNamespaceInvocation({
+    command: "/bin/true",
+    args: [],
+    cwd: "/tmp",
+    env: { NODE_ENV: "test", PATH: process.env.PATH },
+  });
+  return spawnSync(invocation.command, invocation.args, {
+    cwd: invocation.cwd,
+    env: invocation.env,
+  }).status === 0;
 }
 
 afterEach(() => {
@@ -61,10 +61,13 @@ describe("specialist OS trust boundary", () => {
     expect(invocation.args).toEqual(expect.arrayContaining([
       "--user",
       "--map-root-user",
+      "--mount",
       "--pid",
       "--fork",
       "--kill-child=SIGKILL",
-      "--mount-proc=/proc",
+      "/bin/sh",
+      "-c",
+      PRIVATE_PROC_NAMESPACE_SETUP,
       "sandbox",
       ":read-only",
       "features.use_legacy_landlock=true",
@@ -77,6 +80,7 @@ describe("specialist OS trust boundary", () => {
     expect(invocation.env.VAULT_ACCESS_TOKEN).toBeUndefined();
     expect(invocation.env.CONVEX_DEPLOY_KEY_JARVIS_CANONICAL).toBeUndefined();
     expect(invocation.args.join("\0")).not.toContain("synthetic-controller-sentinel");
+    expect(invocation.args).not.toContain("--mount-proc=/proc");
   });
 
   it("proves the unsandboxed same-container /proc attack is real without emitting the sentinel", () => {

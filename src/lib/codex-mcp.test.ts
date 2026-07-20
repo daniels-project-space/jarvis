@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { codexMcpConfigArgs } from "./codex-mcp";
+import { codexMcpConfigArgs, disabledCodexMcpHandoff } from "./codex-mcp";
 
 describe("Codex MCP CLI configuration", () => {
-  it("forwards secret names through TOML env_vars without putting values in argv", () => {
+  it("never builds stdio child configuration, even for a credentialed request", () => {
     const args = codexMcpConfigArgs({
       mcpServers: {
         browserbase: {
@@ -12,8 +12,17 @@ describe("Codex MCP CLI configuration", () => {
         },
       },
     });
-    expect(args).toContain('mcp_servers.browserbase.env_vars=["BROWSERBASE_API_KEY","BROWSERBASE_PROJECT_ID"]');
-    expect(args.join(" ")).not.toContain("bb_live_");
-    expect(args.join(" ")).not.toContain("mcp_servers.browserbase.env=");
+    expect(args).toEqual([]);
+  });
+
+  it("turns Context7 and Playwright into a controller handoff without config, process env, or subscription token", () => {
+    const handoff = disabledCodexMcpHandoff(["context7", "playwright", "context7"]);
+    expect(handoff.configPath).toBeNull();
+    expect(handoff.env).toEqual({});
+    expect(handoff.unavailable).toEqual([
+      "context7 (stdio MCP disabled pending the controller proxy)",
+      "playwright (stdio MCP disabled pending the controller proxy)",
+    ]);
+    expect(JSON.stringify(handoff)).not.toMatch(/mcp_servers|CODEX_ACCESS_TOKEN|@upstash|npx/);
   });
 });

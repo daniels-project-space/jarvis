@@ -1,6 +1,7 @@
 import { metadata, schedules, task, timeout } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
-import { mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sendPush } from "./push-send";
 import { INFRA_MAP } from "../lib/persona";
@@ -32,7 +33,6 @@ import {
   type GoalPlan,
 } from "../lib/goal-mode";
 import { startAppFactoryGoal, syncExternalGoalRevisions, syncExternalGoalRuns } from "./goal-runtime";
-import { codexMcpConfigArgs, type CodexMcpConfig } from "../lib/codex-mcp";
 import { redactSensitiveText } from "../lib/secret-redaction";
 import {
   cumulativeWorkEvidence,
@@ -74,6 +74,14 @@ import {
 import { spawnCodex } from "./codex-launcher";
 import { verifySpecialistSandboxIsolation } from "./specialist-sandbox";
 import { createSpecialistExitBarrier } from "./specialist-process-lifecycle";
+import { disabledCodexMcpHandoff } from "../lib/codex-mcp";
+import {
+  captureControllerGitWorkspace,
+  controllerGitArgs,
+  controllerGitEnv,
+  createControllerCommit,
+  type ControllerOwnedGitWorkspace,
+} from "./controller-git-workspace";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -88,17 +96,10 @@ function promptArgs(
   cwd: string,
   env: NodeJS.ProcessEnv,
   json = false,
-  mcpConfig?: string | null,
   reasoningEffort?: unknown,
 ): string[] {
   const args = codexExecPrefix(tier, reasoningEffort, cwd, env.PATH);
   if (json) args.push("--json");
-  if (mcpConfig) {
-    try {
-      const cfg = JSON.parse(readFileSync(mcpConfig, "utf8")) as CodexMcpConfig;
-      args.push(...codexMcpConfigArgs(cfg));
-    } catch { /* run without an invalid optional MCP config */ }
-  }
   args.push(prompt);
   return args;
 }
@@ -178,28 +179,13 @@ function pickAgentModel(task: string): string {
 }
 
 
-// MCP servers the brain can attach on demand. Browserbase = hosted browsers
-// (no local Chromium in the Trigger image); context7 = live library docs.
-async function buildMcpConfig(
-  names: string[],
-  jobKey: string,
-): Promise<{ configPath: string | null; env: Record<string, string>; unavailable: string[] }> {
-  const servers: Record<string, unknown> = {};
-  const runtimeEnv: Record<string, string> = {};
-  const unavailable: string[] = [];
-  for (const n of names) {
-    if (["playwright", "browser", "browserbase"].includes(n)) {
-      // A credentialed stdio MCP would place a provider token in the same
-      // Codex process tree. Preserve the explicit safe handoff until a
-      // controller-hosted capability proxy exists.
-      unavailable.push("browserbase (credentialed MCP requires the controller proxy)");
-    }
-    if (n === "context7") servers["context7"] = { command: "npx", args: ["-y", "@upstash/context7-mcp"] };
-  }
-  if (!Object.keys(servers).length) return { configPath: null, env: runtimeEnv, unavailable };
-  const path = `/tmp/work/mcp-${jobKey.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`;
-  writeFileSync(path, JSON.stringify({ mcpServers: servers }));
-  return { configPath: path, env: runtimeEnv, unavailable };
+// Every stdio MCP child is disabled until it can run behind a controller-hosted
+// capability proxy. Specialists retain the CLI's native `--search`; requested
+// MCP names become an explicit handoff note, never Codex config or child env.
+export function buildMcpConfig(
+  names: readonly string[],
+) {
+  return disabledCodexMcpHandoff(names);
 }
 
 // The weave: a short spoken report that CONTAINS the answer — Daniel complained
@@ -278,7 +264,6 @@ function runAgent(
   prompt: string,
   model: string,
   onProgress?: (s: string, log?: string, stage?: string, percent?: number) => void,
-  mcpConfig?: string | null,
   executionState?: () => Promise<string>,
   timeoutMs = 900_000,
   reasoningEffort?: unknown,
@@ -290,7 +275,7 @@ function runAgent(
   commands: GitCommandEvidence[];
 }> {
   return new Promise((resolve) => {
-    const args = promptArgs(prompt, model, cwd, env, true, mcpConfig, reasoningEffort);
+    const args = promptArgs(prompt, model, cwd, env, true, reasoningEffort);
     const codexSelection = codexModelFor(model);
     const runtimeLabel = `${codexSelection.model} · ${normalizeReasoningEffort(reasoningEffort, codexSelection.effort)}`;
     const p = spawnCodex({
@@ -819,6 +804,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         }
         return true;
       };
+      let controllerGitRoot = "";
       try {
         const jobKey = String(job.jobId).replace(/[^a-zA-Z0-9_-]/g, "_");
         const jobEnv = isolateSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}`);
@@ -828,6 +814,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const profile = TEAM_BY_SLUG[agentId];
         let context = "This is a read-only knowledge/research run. Do not edit local files or mutate external systems.";
         let repoDir: string | null = null;
+        let repoGitWorkspace: ControllerOwnedGitWorkspace | null = null;
         const repo = resolveRepo(job.repo);
         const branch = repo && !job.readonly ? workBranch({ ...job, agentId }) : null;
         const validatedGoalBranch = validatedGoalDeliveryBranch(job);
@@ -996,36 +983,40 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         if (repo && token) {
           const dir = `/tmp/work/${repo.replace(/[^a-zA-Z0-9]/g, "_")}_${jobKey}`;
           rmSync(dir, { recursive: true, force: true });
+          controllerGitRoot = mkdtempSync(join(tmpdir(), "jarvis-controller-git-"));
+          const gitDir = join(controllerGitRoot, "repository.git");
           const url = githubRepoUrl(repo);
-          const gitEnv = githubGitEnv(env, token);
+          const gitEnv = controllerGitEnv(githubGitEnv(env, token));
+          const localGitEnv = controllerGitEnv(env);
+          const gitPaths = { gitDir, workTree: dir };
           let cloneReady = false;
           if (job.branch) {
             const cloned = await sh(
               "git",
-              ["clone", "--depth", "1", "--single-branch", "--branch", String(job.branch), url, dir],
+              ["clone", "--separate-git-dir", gitDir, "--depth", "1", "--single-branch", "--branch", String(job.branch), url, dir],
               gitEnv,
             );
-            cloneReady = cloned.code === 0 && existsSync(join(dir, ".git"));
+            cloneReady = cloned.code === 0 && existsSync(gitDir) && existsSync(join(dir, ".git"));
             if (cloneReady) checkoutSourceBranch = String(job.branch);
           }
           if (!cloneReady) {
             rmSync(dir, { recursive: true, force: true });
-            const cloned = await sh("git", ["clone", "--depth", "1", url, dir], gitEnv);
-            cloneReady = cloned.code === 0 && existsSync(join(dir, ".git"));
+            rmSync(gitDir, { recursive: true, force: true });
+            const cloned = await sh("git", ["clone", "--separate-git-dir", gitDir, "--depth", "1", url, dir], gitEnv);
+            cloneReady = cloned.code === 0 && existsSync(gitDir) && existsSync(join(dir, ".git"));
           }
           if (cloneReady) {
-            // Defense in depth: the subprocess only ever sees a credential-free
-            // remote even if Git changes clone credential persistence behavior.
-            await sh("git", ["-C", dir, "remote", "set-url", "origin", url], env);
-            await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
-            await sh("git", ["-C", dir, "config", "user.name", `${profile.name} via JARVIS`], env);
+            const runLocalGit = (args: string[]) => sh("git", controllerGitArgs(gitPaths, args), localGitEnv);
+            const runAuthenticatedGit = (args: string[]) => sh("git", controllerGitArgs(gitPaths, args), gitEnv);
+            // The remote contains no credential. The model can read history via
+            // the worktree's .git pointer, but Landlock cannot write the random
+            // controller metadata directory outside its workspace.
+            await runLocalGit(["remote", "set-url", "origin", url]);
             if (!checkoutSourceBranch) {
-              checkoutSourceBranch = (
-                await sh("git", ["-C", dir, "branch", "--show-current"], env)
-              ).out.trim();
+              checkoutSourceBranch = (await runLocalGit(["branch", "--show-current"])).out.trim();
             }
             const history = await ensureCompleteRepositoryHistory({
-              runGit: (args) => sh("git", ["-C", dir, ...args], gitEnv),
+              runGit: runAuthenticatedGit,
               remote: url,
               sourceBranch: checkoutSourceBranch,
             });
@@ -1034,9 +1025,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               cloneFailureReason = `${SHALLOW_PROVENANCE_RULE} Safe checkout preparation failed: ${history.note}`;
               context = `${cloneFailureReason} Do not inspect the incomplete checkout or pretend repository work was performed.`;
             } else {
-              baseSha = (await sh("git", ["-C", dir, "rev-parse", "HEAD"], env)).out.trim();
+              baseSha = (await runLocalGit(["rev-parse", "HEAD"])).out.trim();
               const checkedOut = branch
-                ? await sh("git", ["-C", dir, "checkout", "-B", branch], env)
+                ? await runLocalGit(["checkout", "-B", branch])
                 : { code: 0, out: "" };
               if (!baseSha || checkedOut.code !== 0) {
                 cloneFailed = true;
@@ -1045,6 +1036,13 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               } else {
                 cwd = dir;
                 repoDir = dir;
+                repoGitWorkspace = await captureControllerGitWorkspace({
+                  gitDir,
+                  workTree: dir,
+                  expectedBranch: branch || checkoutSourceBranch,
+                  expectedHead: baseSha,
+                  runGit: runLocalGit,
+                });
                 if (branch)
                   await convexMutation("jobs:setDelivery", {
                     jobId: job.jobId,
@@ -1054,7 +1052,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                   }).catch(() => {});
                 context = job.readonly
                   ? `Your working directory is a read-only checkout of ${repo}. Inspect it deeply, but do not edit or commit.`
-                  : `Your working directory is an isolated checkout of ${repo} on branch ${branch}. Actually perform the scoped task. You may edit and commit here; never push, merge, deploy, or switch branches because the runner owns delivery.`;
+                  : `Your working directory is an isolated checkout of ${repo} on branch ${branch}. Actually perform the scoped task. You may edit and test workspace files, but Git metadata, refs, configuration, hooks, commits, branch changes, and pushes belong only to the delivery controller. Never run a deployment.`;
                 context += `\n\nRepository lineage rule: ${SHALLOW_PROVENANCE_RULE} The runner hydrated the exact ancestry for ${checkoutSourceBranch} before this session. Treat a persisted shared branch as canonical; never manufacture replacement commits from a truncated revision walk.`;
                 const providerBoundary = projectProviderBoundary(repo);
                 if (providerBoundary) context += `\n\n${providerBoundary}`;
@@ -1090,7 +1088,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task),
         );
         const mcp = Array.isArray(job.mcp) && job.mcp.length
-          ? await buildMcpConfig(job.mcp, jobKey)
+          ? buildMcpConfig(job.mcp)
           : { configPath: null, env: {}, unavailable: [] };
         if (mcp.unavailable.length) {
           prompt += `\n\nSCOPED CAPABILITY HANDOFF: ${mcp.unavailable.join(", ")} is unavailable inside the specialist credential boundary. Preserve the gap honestly; do not request broader credentials or claim the provider trace ran.`;
@@ -1137,7 +1135,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           prompt,
           model,
           reportProgress,
-          mcp.configPath,
           async () => {
             const state = await executionStatus();
             return state === "superseded" ? "cancelled" : state;
@@ -1146,7 +1143,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           job.reasoningEffort,
         );
         await durableProgress;
-        if (mcp.configPath) rmSync(mcp.configPath, { force: true });
         const result = run.text;
 
         const checkpointText = buildContinuationCheckpoint({
@@ -1168,20 +1164,20 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         let deliveryRetry = false;
         let deliveryDiffStat = "";
         let changed = false;
-        if (repoDir && token && branch && !job.readonly) {
-          const deliveryDir = repoDir;
+        if (repoDir && repoGitWorkspace && token && branch && !job.readonly) {
           const pushUrl = githubRepoUrl(repo);
-          const gitEnv = githubGitEnv(env, token);
-          const runGit = (args: string[]) => sh("git", ["-C", deliveryDir, ...args], gitEnv);
-          await sh("git", ["-C", deliveryDir, "add", "-A"], env);
-          await sh(
-            "git",
-            ["-C", deliveryDir, "commit", "-m", `chore: ${profile.name.toLowerCase()} — ${job.task.slice(0, 60).replace(/"/g, "'")}`],
-            env,
-          );
-          let local = (await sh("git", ["-C", deliveryDir, "rev-parse", "HEAD"], env)).out.trim();
+          const gitEnv = controllerGitEnv(githubGitEnv(env, token));
+          const localGitEnv = controllerGitEnv(env);
+          const runGit = (args: string[]) => sh("git", controllerGitArgs(repoGitWorkspace!, args), gitEnv);
+          const runLocalGit = (args: string[]) => sh("git", controllerGitArgs(repoGitWorkspace!, args), localGitEnv);
+          const committed = await createControllerCommit({
+            workspace: repoGitWorkspace,
+            message: `chore: ${profile.name.toLowerCase()} — ${job.task.slice(0, 60).replace(/"/g, "'")}`,
+            runGit: runLocalGit,
+          });
+          let local = committed.headSha;
           if (baseSha && local && local !== baseSha) {
-            deliveryDiffStat = (await sh("git", ["-C", deliveryDir, "diff", "--stat", `${baseSha}..${local}`], env)).out
+            deliveryDiffStat = (await runLocalGit(["diff", "--stat", `${baseSha}..${local}`])).out
               .trim()
               .slice(0, 1_500);
           }
@@ -1512,9 +1508,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
 
         const reviewEvidence = cumulativeWorkEvidence(job.checkpoint, result);
         let gitReview: { envelope: GitReviewEnvelope; binding: GitReviewBinding } | undefined;
-        if (repoDir) {
+        if (repoDir && repoGitWorkspace) {
+          const reviewGitEnv = controllerGitEnv(env);
           const receipt = await buildGitReviewReceipt({
-            runGit: (args) => sh("git", ["-C", repoDir!, ...args], env),
+            runGit: (args) => sh("git", controllerGitArgs(repoGitWorkspace!, args), reviewGitEnv),
             jobId: String(job.jobId),
             attempt: expectedAttempt,
             repository: repo,
@@ -1828,6 +1825,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             threadId: originThread,
             text: `⚠️ ${job.agentId ?? "Agent"} exhausted its recovery budget: ${message.slice(0, 240)}`,
           }).catch(() => {});
+      } finally {
+        if (controllerGitRoot) rmSync(controllerGitRoot, { recursive: true, force: true });
       }
     };
 

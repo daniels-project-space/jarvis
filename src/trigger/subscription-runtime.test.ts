@@ -113,6 +113,50 @@ describe("subscription subprocess capability scope", () => {
     }
   });
 
+  it("does not pass Node/registry injection and rejects credential-bearing proxy URLs", () => {
+    const now = 2_000_000_000_000;
+    const root = mkdtempSync(join(tmpdir(), "jarvis-codex-minimal-env-test-"));
+    try {
+      const prepared = prepareSubscriptionEnv("codex", {
+        boundedRuntimeMs: 60_000,
+        nowMs: now,
+        runtimeRoot: root,
+        sourceEnv: {
+          NODE_ENV: "test",
+          PATH: process.env.PATH,
+          CODEX_ACCESS_TOKEN: jwt(now + 60 * 60_000),
+          NODE_OPTIONS: "--require=/tmp/controller-hook.cjs",
+          NPM_CONFIG_REGISTRY: "https://registry.example/?token=secret",
+          HTTPS_PROXY: "https://proxy.example:8443",
+        },
+      });
+      expect(prepared.error).toBeUndefined();
+      expect(prepared.env.NODE_OPTIONS).toBeUndefined();
+      expect(prepared.env.NPM_CONFIG_REGISTRY).toBeUndefined();
+      expect(prepared.env.HTTPS_PROXY).toBe("https://proxy.example:8443");
+
+      for (const proxy of [
+        "https://user:password@proxy.example",
+        "https://proxy.example/?token=secret",
+        "https://proxy.example/#secret",
+      ]) {
+        const rejected = prepareSubscriptionEnv("codex", {
+          nowMs: now,
+          runtimeRoot: root,
+          sourceEnv: {
+            NODE_ENV: "test",
+            PATH: process.env.PATH,
+            CODEX_ACCESS_TOKEN: jwt(now + 60 * 60_000),
+            HTTPS_PROXY: proxy,
+          },
+        });
+        expect(rejected.error).toMatch(/credential-bearing|non-canonical/);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("gives concurrent agents separate credentialless homes with only the scoped briefing", () => {
     const root = mkdtempSync(join(tmpdir(), "jarvis-codex-home-test-"));
     const source = join(root, "source");

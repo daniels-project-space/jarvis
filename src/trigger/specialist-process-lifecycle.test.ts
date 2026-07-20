@@ -1,6 +1,11 @@
 import { EventEmitter } from "node:events";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createSpecialistExitBarrier } from "./specialist-process-lifecycle";
+import { buildPrivateProcNamespaceInvocation } from "./codex-launcher";
+import { createSpecialistExitBarrier, verifyRealNamespaceProcessLifecycle } from "./specialist-process-lifecycle";
 
 class FakeChild extends EventEmitter {
   readonly signals: NodeJS.Signals[] = [];
@@ -12,6 +17,23 @@ class FakeChild extends EventEmitter {
 }
 
 afterEach(() => vi.useRealTimers());
+
+function realNamespaceAvailable(): boolean {
+  try {
+    const invocation = buildPrivateProcNamespaceInvocation({
+      command: "/bin/true",
+      args: [],
+      cwd: "/tmp",
+      env: { NODE_ENV: "test", PATH: process.env.PATH },
+    });
+    return spawnSync(invocation.command, invocation.args, {
+      cwd: invocation.cwd,
+      env: invocation.env,
+    }).status === 0;
+  } catch {
+    return false;
+  }
+}
 
 describe("specialist-to-controller credential handoff", () => {
   it("does not release after SIGKILL until the namespace process is actually closed", async () => {
@@ -72,5 +94,17 @@ describe("specialist-to-controller credential handoff", () => {
 
     child.emit("close", null, "SIGKILL");
     await expect(barrier.exited).resolves.toMatchObject({ stopped: "paused" });
+  });
+
+  it.skipIf(!realNamespaceAvailable())("reaps detached grandchildren for real timeout and pause namespace exits", async () => {
+    const root = mkdtempSync(join(tmpdir(), "jarvis-real-namespace-lifecycle-"));
+    try {
+      await expect(verifyRealNamespaceProcessLifecycle({
+        cwd: root,
+        env: { NODE_ENV: "test", PATH: process.env.PATH, HOME: root },
+      })).resolves.toEqual({ ok: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

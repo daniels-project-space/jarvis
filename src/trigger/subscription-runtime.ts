@@ -75,35 +75,42 @@ function scopedSubscriptionEnv(
     "LANG",
     "LC_ALL",
     "TMPDIR",
-    "NODE_PATH",
-    "NODE_OPTIONS",
     "NODE_EXTRA_CA_CERTS",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "TERM",
     "CI",
-    "SHELL",
-    "USER",
-    "LOGNAME",
-    "XDG_CACHE_HOME",
-    "XDG_CONFIG_HOME",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "NO_PROXY",
     "http_proxy",
     "https_proxy",
     "no_proxy",
-    "NPM_CONFIG_REGISTRY",
-    "npm_config_registry",
     "CODEX_ACCESS_TOKEN",
-    "JARVIS_AGENT_PROVIDER",
   ];
   const env = {} as NodeJS.ProcessEnv;
-  for (const key of allow) if (source[key] !== undefined) env[key] = source[key];
+  for (const key of allow) {
+    const value = source[key];
+    if (value === undefined) continue;
+    if (["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"].includes(key) && value) {
+      let proxy: URL;
+      try {
+        proxy = new URL(value);
+      } catch {
+        throw new Error(`invalid Codex proxy URL ${key}`);
+      }
+      if (
+        !["http:", "https:"].includes(proxy.protocol)
+        || proxy.username
+        || proxy.password
+        || proxy.search
+        || proxy.hash
+      ) throw new Error(`credential-bearing or non-canonical Codex proxy URL ${key} is forbidden`);
+    }
+    env[key] = value;
+  }
   env.PATH = source.PATH?.trim() || "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-  env.JARVIS_AGENT_PROVIDER = provider;
-  env.GIT_TERMINAL_PROMPT = "0";
-  env.GH_PROMPT_DISABLED = "1";
+  env.HOME = String(source.CODEX_HOME ?? source.HOME ?? "");
   // Never let a subscription-backed subprocess silently switch to metered API
   // billing, and never pass unrelated application/provider secrets to it.
   env.ANTHROPIC_API_KEY = "";
@@ -188,6 +195,14 @@ export function prepareSubscriptionEnv(
     return { env: {} as NodeJS.ProcessEnv, error: "Jarvis permits only the Codex CLI runtime" };
   }
   const source = options.sourceEnv ?? process.env;
+  try {
+    // Validate proxy inputs even when credential preparation fails later. A
+    // credential-bearing proxy URL is itself controller authority and must not
+    // be silently dropped into an ambiguous fallback path.
+    scopedSubscriptionEnv(source, provider);
+  } catch (error) {
+    return { env: {} as NodeJS.ProcessEnv, error: error instanceof Error ? error.message : "invalid Codex parent environment" };
+  }
   const root = writableCodexRuntimeRoot(options.runtimeRoot);
   if (!root) {
     return {
@@ -217,7 +232,7 @@ export function prepareSubscriptionEnv(
 
   const env = scopedSubscriptionEnv({
     ...source,
-    HOME: dirname(root),
+    HOME: home,
     CODEX_HOME: home,
     CODEX_ACCESS_TOKEN: token,
   }, provider);
@@ -245,6 +260,7 @@ export function isolateSubscriptionEnv(
   // so its CLI toolchain initializes fully on both GitHub and Trigger workers.
   const isolationRoot = root ?? (sourceHome ? join(dirname(sourceHome), ".jarvis-codex-homes") : "/tmp/work/codex-homes");
   const isolatedHome = join(isolationRoot, safeScope);
+  rmSync(isolatedHome, { recursive: true, force: true });
   mkdirSync(isolatedHome, { recursive: true });
   // Only Daniel's scoped briefing crosses into a lease home. Authentication
   // remains an in-memory access token on the Codex parent, and strict launcher
@@ -254,5 +270,5 @@ export function isolateSubscriptionEnv(
     const source = join(sourceHome, file);
     if (sourceHome && existsSync(source)) copyFileSync(source, join(isolatedHome, file));
   }
-  return { ...base, CODEX_HOME: isolatedHome };
+  return { ...base, HOME: isolatedHome, CODEX_HOME: isolatedHome };
 }

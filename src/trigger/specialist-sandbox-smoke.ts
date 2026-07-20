@@ -8,6 +8,7 @@ import {
   resolveSubscriptionAgentBin,
 } from "./subscription-runtime";
 import { verifySpecialistSandboxIsolation } from "./specialist-sandbox";
+import { verifyRealNamespaceProcessLifecycle } from "./specialist-process-lifecycle";
 
 type ExactSandboxObservation = {
   readSucceeded?: boolean;
@@ -18,6 +19,9 @@ type ExactSandboxObservation = {
   procCredentialVisible?: boolean;
   credentialFileVisible?: boolean;
   namespaceProcSafe?: boolean;
+  applyPatchSucceeded?: boolean;
+  noSecretEchoed?: boolean;
+  namespaceLifecycleSafe?: boolean;
   tools?: Record<string, boolean>;
 };
 
@@ -32,6 +36,9 @@ export function exactSandboxObservationPassed(observation: ExactSandboxObservati
     && observation.procCredentialVisible === false
     && observation.credentialFileVisible === false
     && observation.namespaceProcSafe === true
+    && observation.applyPatchSucceeded === true
+    && observation.noSecretEchoed === true
+    && observation.namespaceLifecycleSafe === true
     && REQUIRED_TOOLS.every((tool) => observation.tools?.[tool] === true);
 }
 
@@ -122,6 +129,16 @@ export async function runExactSpecialistSandboxSmoke(): Promise<
   const credentialPath = join(String(prepared.env.CODEX_HOME), "auth.json");
   writeFileSync(join(workspace, "probe.cjs"), probeSource(outsidePath, credentialPath), { mode: 0o600 });
   try {
+    const lifecycle = await verifyRealNamespaceProcessLifecycle({
+      cwd: workspace,
+      env: {
+        PATH: prepared.env.PATH,
+        HOME: workspace,
+        LANG: prepared.env.LANG ?? "C.UTF-8",
+        NODE_ENV: "production",
+      },
+    });
+    if (!lifecycle.ok) return lifecycle;
     const namespace = verifySpecialistSandboxIsolation({
       codexBin: bin,
       cwd: workspace,
@@ -138,17 +155,19 @@ export async function runExactSpecialistSandboxSmoke(): Promise<
       command: bin,
       args,
       cwd: workspace,
-      env: { ...prepared.env, JARVIS_NAMESPACE_SENTINEL: "synthetic-never-live" },
+      env: prepared.env,
       boundedRuntimeMs: 3 * 60_000,
     }, { stdio: ["ignore", "pipe", "pipe"] });
-    const completed = await new Promise<{ code: number | null }>((resolve) => {
+    const completed = await new Promise<{ code: number | null; output: string }>((resolve) => {
+      let output = "";
       const timer = setTimeout(() => {
         try { child.kill("SIGKILL"); } catch { /* already gone */ }
       }, 3 * 60_000);
-      child.stdout.resume();
-      child.stderr.resume();
-      child.once("error", () => { clearTimeout(timer); resolve({ code: -1 }); });
-      child.once("close", (code) => { clearTimeout(timer); resolve({ code }); });
+      const append = (chunk: unknown) => { output = `${output}${String(chunk)}`.slice(-256_000); };
+      child.stdout.on("data", append);
+      child.stderr.on("data", append);
+      child.once("error", () => { clearTimeout(timer); resolve({ code: -1, output }); });
+      child.once("close", (code) => { clearTimeout(timer); resolve({ code, output }); });
     });
     if (completed.code !== 0 || !existsSync(join(workspace, "sandbox-observation.json"))) {
       return {
@@ -159,6 +178,17 @@ export async function runExactSpecialistSandboxSmoke(): Promise<
     const observation = JSON.parse(readFileSync(join(workspace, "sandbox-observation.json"), "utf8")) as ExactSandboxObservation;
     const patched = readFileSync(join(workspace, "patch-target.txt"), "utf8").trim() === "after";
     const homeCredential = existsSync(credentialPath);
+    const secretValues = [
+      prepared.env.CODEX_ACCESS_TOKEN,
+      process.env.CODEX_AUTH_JSON_B64,
+      process.env.JARVIS_WORKER_TOKEN,
+      process.env.JARVIS_DISPATCH_TOKEN,
+      process.env.VAULT_ACCESS_TOKEN,
+      process.env.GITHUB_TOKEN,
+    ].filter((value): value is string => Boolean(value && value.length >= 8));
+    observation.applyPatchSucceeded = patched;
+    observation.noSecretEchoed = secretValues.every((secret) => !completed.output.includes(secret));
+    observation.namespaceLifecycleSafe = true;
     if (!patched || homeCredential || existsSync(outsidePath) || !exactSandboxObservationPassed(observation)) {
       return {
         ok: false,

@@ -132,6 +132,8 @@ export type ProviderReleaseOperations = {
 const SOURCE_EXTENSIONS = [
   ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json",
   ".css", ".scss", ".sass", ".less", ".graphql", ".gql", ".sql", ".wasm",
+  ".svg", ".png", ".jpg", ".jpeg", ".webp", ".avif", ".gif", ".txt", ".md",
+  ".toml", ".yaml", ".yml",
 ];
 const GLOBAL_PROVIDER_INPUT = /^(?:(?:[^/]+\/)*(?:package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)|\.npmrc|\.node-version|\.nvmrc|\.tool-versions|tsconfig(?:\.[^/]+)?\.json|vercel\.json|[^/]+\.config\.[cm]?[jt]s)$/i;
 const SOURCE_LIKE = /\.(?:[cm]?[jt]sx?|json)$/i;
@@ -252,12 +254,103 @@ export function providerKindsForPaths(paths: readonly string[]): ProviderKind[] 
   return orderedKinds(kinds);
 }
 
-function resolveLocalImports(from: string, specifier: string, sources: ReadonlyMap<string, string>): string[] {
-  let candidate: string;
-  if (specifier.startsWith(".")) candidate = normalizedPath(posix.join(dirname(from), specifier));
-  else if (specifier.startsWith("@/")) candidate = normalizedPath(`src/${specifier.slice(2)}`);
-  else if (specifier.startsWith("~/")) candidate = normalizedPath(`src/${specifier.slice(2)}`);
-  else return [];
+type AliasRule = Readonly<{ pattern: string; targets: readonly string[]; base: string }>;
+
+function parseJsonConfig(source: string): Record<string, any> | null {
+  let clean = "";
+  let quoted = false;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (lineComment) {
+      if (char === "\n") { lineComment = false; clean += char; }
+      continue;
+    }
+    if (blockComment) {
+      if (char === "*" && next === "/") { blockComment = false; index += 1; }
+      continue;
+    }
+    if (!quoted && char === "/" && next === "/") { lineComment = true; index += 1; continue; }
+    if (!quoted && char === "/" && next === "*") { blockComment = true; index += 1; continue; }
+    clean += char;
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quoted = false;
+    } else if (char === '"') quoted = true;
+  }
+  // JSONC permits trailing commas. Remove only commas outside quoted strings.
+  let normalized = "";
+  quoted = false;
+  escaped = false;
+  for (let index = 0; index < clean.length; index += 1) {
+    const char = clean[index];
+    if (quoted) {
+      normalized += char;
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quoted = false;
+      continue;
+    }
+    if (char === '"') { quoted = true; normalized += char; continue; }
+    if (char === ",") {
+      let cursor = index + 1;
+      while (/\s/.test(clean[cursor] ?? "")) cursor += 1;
+      if (clean[cursor] === "}" || clean[cursor] === "]") continue;
+    }
+    normalized += char;
+  }
+  try {
+    const parsed = JSON.parse(normalized) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, any> : null;
+  } catch {
+    return null;
+  }
+}
+
+function stringTargets(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(stringTargets);
+  if (value && typeof value === "object") return Object.values(value as Record<string, unknown>).flatMap(stringTargets);
+  return [];
+}
+
+function repositoryAliasRules(sources: ReadonlyMap<string, string>): AliasRule[] {
+  const rules: AliasRule[] = [];
+  const tsconfig = parseJsonConfig(sources.get("tsconfig.json") ?? "");
+  const compiler = tsconfig?.compilerOptions;
+  if (compiler && typeof compiler === "object" && compiler.paths && typeof compiler.paths === "object") {
+    const base = normalizedPath(typeof compiler.baseUrl === "string" ? compiler.baseUrl : ".");
+    for (const [pattern, rawTargets] of Object.entries(compiler.paths as Record<string, unknown>)) {
+      const targets = stringTargets(rawTargets).filter((target) => target.startsWith(".") || !/^[a-z]+:/i.test(target));
+      if (pattern && targets.length) rules.push({ pattern, targets, base });
+    }
+  }
+  const pkg = parseJsonConfig(sources.get("package.json") ?? "");
+  if (pkg?.imports && typeof pkg.imports === "object") {
+    for (const [pattern, rawTargets] of Object.entries(pkg.imports as Record<string, unknown>)) {
+      const targets = stringTargets(rawTargets).filter((target) => target.startsWith("./"));
+      if (pattern.startsWith("#") && targets.length) rules.push({ pattern, targets, base: "." });
+    }
+  }
+  return rules;
+}
+
+function aliasMatch(pattern: string, specifier: string): string | null {
+  const star = pattern.indexOf("*");
+  if (star < 0) return pattern === specifier ? "" : null;
+  const prefix = pattern.slice(0, star);
+  const suffix = pattern.slice(star + 1);
+  return specifier.startsWith(prefix) && specifier.endsWith(suffix)
+    ? specifier.slice(prefix.length, specifier.length - suffix.length)
+    : null;
+}
+
+function existingCandidates(candidateInput: string, sources: ReadonlyMap<string, string>): string[] {
+  const candidate = normalizedPath(candidateInput);
   const explicit = extname(candidate)
     ? [candidate]
     : [candidate, ...SOURCE_EXTENSIONS.map((extension) => `${candidate}${extension}`), ...SOURCE_EXTENSIONS.map((extension) => `${candidate}/index${extension}`)];
@@ -270,12 +363,44 @@ function resolveLocalImports(from: string, specifier: string, sources: ReadonlyM
   return [...candidates].filter((path) => sources.has(path));
 }
 
-function importsFor(path: string, source: string, sources: ReadonlyMap<string, string>): string[] {
+function resolveLocalImports(
+  from: string,
+  specifier: string,
+  sources: ReadonlyMap<string, string>,
+  aliases: readonly AliasRule[],
+): string[] {
+  const candidates: string[] = [];
+  if (specifier.startsWith(".")) {
+    candidates.push(posix.join(dirname(from), specifier));
+  } else {
+    for (const rule of aliases) {
+      const matched = aliasMatch(rule.pattern, specifier);
+      if (matched === null) continue;
+      for (const target of rule.targets) {
+        const expanded = target.includes("*") ? target.replace("*", matched) : target;
+        candidates.push(posix.join(rule.base, expanded));
+      }
+    }
+    // Preserve the repository's long-standing aliases even if an older target
+    // snapshot omitted its root tsconfig from a bounded source fixture.
+    if (!candidates.length && (specifier.startsWith("@/") || specifier.startsWith("~/"))) {
+      candidates.push(`src/${specifier.slice(2)}`);
+    }
+  }
+  return [...new Set(candidates.flatMap((candidate) => existingCandidates(candidate, sources)))];
+}
+
+function importsFor(
+  path: string,
+  source: string,
+  sources: ReadonlyMap<string, string>,
+  aliases: readonly AliasRule[],
+): string[] {
   const imports = new Set<string>();
   for (const pattern of [IMPORT_SPECIFIER, RUNTIME_FILE_SPECIFIER]) {
     pattern.lastIndex = 0;
     for (const match of source.matchAll(pattern)) {
-      for (const resolved of resolveLocalImports(path, match[1], sources)) imports.add(resolved);
+      for (const resolved of resolveLocalImports(path, match[1], sources, aliases)) imports.add(resolved);
     }
   }
   return [...imports];
@@ -307,15 +432,15 @@ export function analyseProviderImpact(
     ? new Map([...sourceInput].map(([path, source]) => [normalizedPath(path), source]))
     : new Map(Object.entries(sourceInput).map(([path, source]) => [normalizedPath(path), source]));
   const missingChangedPaths = new Set(changedPaths.filter((path) => !sources.has(path)));
-  // Candidate-tree snapshots cannot list a deleted asset. Add a non-executable
-  // placeholder so an existing provider import/new URL/readFile edge can still
-  // reach the removed path instead of silently dropping it from the graph.
+  // Candidate-tree snapshots cannot list deleted files. Virtual entries let
+  // exact relative/alias/package-import edges retain deletion reachability.
   for (const path of missingChangedPaths) {
-    if (SOURCE_EXTENSIONS.includes(extname(path).toLowerCase())) sources.set(path, "");
+    if (path !== ".." && !path.startsWith("../") && !path.endsWith("/")) sources.set(path, "");
   }
+  const aliases = repositoryAliasRules(sources);
   const graph = new Map<string, readonly string[]>();
   for (const [path, source] of sources) {
-    if (SOURCE_LIKE.test(path)) graph.set(path, importsFor(path, source, sources));
+    if (SOURCE_LIKE.test(path)) graph.set(path, importsFor(path, source, sources, aliases));
   }
   const convexReachable = reachableFrom(
     [...sources.keys()].filter((path) => path.startsWith("convex/") && SOURCE_LIKE.test(path)),
@@ -333,17 +458,6 @@ export function analyseProviderImpact(
     for (const kind of globalInputProviders(path)) add(kind, `${path}: provider build/runtime input`);
     if (convexReachable.has(path)) add("convex", `${path}: transitively imported by Convex`);
     if (triggerReachable.has(path)) add("trigger", `${path}: transitively imported by Trigger`);
-    // Custom tsconfig aliases and generated indirection are intentionally not
-    // treated as proof that a shared module is web-only. Shared changes remain
-    // fail-closed even when the lightweight parser cannot resolve an edge.
-    if (/^(?:src\/(?:lib|shared)|lib|shared)\//.test(path)) {
-      add("convex", `${path}: conservative shared source boundary`);
-      add("trigger", `${path}: conservative shared source boundary`);
-    }
-    if (missingChangedPaths.has(path) && SOURCE_LIKE.test(path) && /^(?:src|lib|shared)\//.test(path)) {
-      add("convex", `${path}: deleted or unavailable shared source`);
-      add("trigger", `${path}: deleted or unavailable shared source`);
-    }
   }
   const kinds = new Set<ProviderKind>();
   if (reasons.convex.length) kinds.add("convex");

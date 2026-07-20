@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
-import { isAbsolute, join, normalize } from "node:path";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { buildPrivateProcNamespaceInvocation } from "./codex-launcher";
 
-const UNSHARE_BINARY = "/usr/bin/unshare";
 const SYNTHETIC_CODEX_TOKEN = "eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDI0NDQ4MDB9.synthetic";
 const REQUIRED_TOOLS = ["node", "npm", "npx", "git", "gh", "curl"] as const;
 
@@ -22,11 +22,6 @@ type NamespaceObservation = {
   selfPid?: number;
   tools?: Record<string, boolean>;
 };
-
-function existingAbsolute(path: string, label: string): string {
-  if (!isAbsolute(path) || !existsSync(path)) throw new Error(`${label} must be an existing absolute path`);
-  return normalize(realpathSync(path));
-}
 
 const NAMESPACE_PROBE_SOURCE = String.raw`
 const fs = require("node:fs");
@@ -80,9 +75,7 @@ export function buildSpecialistNamespaceProbeInvocation(input: {
   controllerPid?: number;
   unshareBinary?: string;
 }): NamespaceProbeInvocation {
-  const unshare = existingAbsolute(input.unshareBinary ?? UNSHARE_BINARY, "unshare executable");
-  const codex = existingAbsolute(input.codexBin, "Codex executable");
-  const cwd = existingAbsolute(input.cwd, "specialist probe working directory");
+  const cwd = input.cwd;
   const path = input.env.PATH?.trim() || "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
   const env: NodeJS.ProcessEnv = {
     PATH: path,
@@ -95,19 +88,9 @@ export function buildSpecialistNamespaceProbeInvocation(input: {
     CODEX_API_KEY: "",
     ANTHROPIC_API_KEY: "",
   };
-  return {
-    command: unshare,
+  return buildPrivateProcNamespaceInvocation({
+    command: input.codexBin,
     args: [
-      "--user",
-      "--map-root-user",
-      "--pid",
-      "--fork",
-      "--kill-child=SIGKILL",
-      "--mount-proc=/proc",
-      "--propagation",
-      "unchanged",
-      "--",
-      codex,
       "sandbox",
       "-P",
       ":read-only",
@@ -127,7 +110,8 @@ export function buildSpecialistNamespaceProbeInvocation(input: {
     ],
     cwd,
     env,
-  };
+    unshareBinary: input.unshareBinary,
+  });
 }
 
 /** Run a sentinel-only adversary before a specialist lease; any uncertainty fails closed. */
