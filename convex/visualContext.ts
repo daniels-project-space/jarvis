@@ -48,14 +48,14 @@ export const snapshot = query({
         wants("agents")
           ? Promise.all(
               activeStatuses.map((status) =>
-                ctx.db.query("jobs").withIndex("by_status", (q: any) => q.eq("status", status)).take(16),
+                ctx.db.query("jobRuntime").withIndex("by_status_priority", (q: any) => q.eq("status", status)).take(16),
               ),
             )
           : [],
         wants("agents")
           ? Promise.all(
               ["running", "synthesizing"].map((status) =>
-                ctx.db.query("missions").withIndex("by_status", (q: any) => q.eq("status", status)).take(12),
+                ctx.db.query("missionRuntime").withIndex("by_status", (q: any) => q.eq("status", status)).take(12),
               ),
             )
           : [],
@@ -101,8 +101,8 @@ export const snapshot = query({
         name: profile.name,
         role: profile.role,
         status: current ? (current.status === "running" || current.status === "pending" ? "working" : "blocked") : "available",
-        currentJobId: current ? String(current._id) : undefined,
-        activeJobIds: owned.map((job: any) => String(job._id)),
+        currentJobId: current ? String(current.jobId) : undefined,
+        activeJobIds: owned.map((job: any) => String(job.jobId)),
         activeJobCount: owned.length,
         completedJobs: profile.completedJobs,
         failedJobs: profile.failedJobs,
@@ -130,7 +130,7 @@ export const snapshot = query({
         .sort((left: any, right: any) => (right.priority ?? 50) - (left.priority ?? 50))
         .slice(0, 40)
         .map((job: any) => ({
-          id: String(job._id),
+          id: String(job.jobId),
           agentId: job.agentId,
           label: job.label,
           task: job.task,
@@ -143,7 +143,7 @@ export const snapshot = query({
           startedAt: job.startedAt,
         })),
       missions: missions.map((mission: any) => ({
-        id: String(mission._id),
+        id: String(mission.missionId),
         goal: mission.goal,
         status: mission.status,
         phase: mission.phase,

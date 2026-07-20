@@ -25,8 +25,8 @@ export const snapshot = query({
         Promise.all(
           activeStatuses.map((status) =>
             ctx.db
-              .query("jobs")
-              .withIndex("by_status", (q: any) => q.eq("status", status))
+              .query("jobRuntime")
+              .withIndex("by_status_priority", (q: any) => q.eq("status", status))
               .take(8),
           ),
         ),
@@ -72,7 +72,7 @@ export const snapshot = query({
               .take(20),
           ),
         ),
-        ctx.db.query("missions").withIndex("by_createdAt").order("desc").take(20),
+        ctx.db.query("missionRuntime").withIndex("by_createdAt").order("desc").take(20),
       ]);
     const activeJobs = activeGroups.flat().sort((x: any, y: any) => (y.priority ?? 50) - (x.priority ?? 50));
     const liveAgents = agents.map((profile) => {
@@ -82,8 +82,8 @@ export const snapshot = query({
       return {
         ...profile,
         status: executing ? "working" : blocked ? "blocked" : "available",
-        currentJobId: executing ? String(executing._id) : blocked ? String(blocked._id) : undefined,
-        activeJobIds: owned.map((job: any) => String(job._id)),
+        currentJobId: executing ? String(executing.jobId) : blocked ? String(blocked.jobId) : undefined,
+        activeJobIds: owned.map((job: any) => String(job.jobId)),
         activeJobCount: owned.length,
       };
     });
@@ -98,7 +98,7 @@ export const snapshot = query({
         .filter((mission: any) => mission.mode === "goal" && ["running", "paused", "needs_input"].includes(mission.status))
         .slice(0, 8)
         .map((mission: any) => ({
-          id: String(mission._id),
+          id: String(mission.missionId),
           goal: mission.goal,
           status: mission.status,
           phase: mission.phase,
@@ -109,7 +109,7 @@ export const snapshot = query({
           externalStatus: mission.externalStatus,
           externalStage: mission.externalStage,
         })),
-      jobs: activeJobs,
+      jobs: activeJobs.map((job: any) => ({ ...job, _id: job.jobId })),
       findings,
       trip,
       draft,

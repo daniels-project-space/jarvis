@@ -8,6 +8,15 @@ import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
 import { normalizeWorkModelTier } from "../src/lib/work-models";
 import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
+import {
+  insertJobWithRuntime,
+  jobRuntimeFor,
+  patchMissionWithRuntime,
+  patchJobWithRuntime,
+  runtimeJob,
+  upsertJobRuntime,
+  upsertMissionRuntime,
+} from "./controlPlane";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
 const DISPATCH_LEASE_MS = 2 * 60 * 1000;
@@ -54,7 +63,7 @@ export const enqueue = mutation({
     const approval = workApprovalPolicy(input);
     const approvalRequired = approval.required;
     const status = approvalRequired ? "awaiting_approval" : "pending";
-    const id = await ctx.db.insert("jobs", {
+    const id = await insertJobWithRuntime(ctx, {
       ...input,
       task: input.task.slice(0, 6000),
       model: input.model ? normalizeWorkModelTier(input.model) : undefined,
@@ -100,45 +109,64 @@ export const enqueue = mutation({
   },
 });
 
-// One-time-compatible policy reconciliation. Jobs created before autonomous
-// software work could inherit a planner-level approval hint even inside
-// Daniel's own repositories. A worker wake upgrades every safe owned-repo job;
-// messages, money, public publishing and destructive work remain untouched in
-// awaiting_approval.
-export const reconcileAutonomousSoftwareWork = mutation({
-  args: { workerToken: v.optional(v.string()) },
-  handler: async (ctx, a) => {
-    requireWorker(a.workerToken);
-    const rows = await ctx.db
-      .query("jobs")
-      .withIndex("by_status", (q) => q.eq("status", "awaiting_approval"))
-      .take(100);
-    const now = Date.now();
-    let reconciled = 0;
-    for (const row of rows) {
-      const safety = classifyWorkSafety(row.task, { repo: row.repo });
-      if (safety.approvalRequired || !isOwnedRepository(row.repo)) continue;
-      await ctx.db.patch(row._id, {
+const CONTROL_PLANE_MIGRATION = "compact-runtime-v1";
+
+async function migrationState(ctx: any) {
+  const existing = await ctx.db
+    .query("controlPlaneMigrations")
+    .withIndex("by_key", (q: any) => q.eq("key", CONTROL_PLANE_MIGRATION))
+    .first();
+  if (existing) return existing;
+  const value = {
+    key: CONTROL_PLANE_MIGRATION,
+    jobsComplete: false,
+    jobsScanned: 0,
+    jobsRepaired: 0,
+    missionsComplete: false,
+    missionsScanned: 0,
+    missionsRepaired: 0,
+    updatedAt: Date.now(),
+  };
+  const id = await ctx.db.insert("controlPlaneMigrations", value);
+  return { ...value, _id: id };
+}
+
+// One bounded page both backfills the compact runtime row and repairs the old
+// false-positive software approval policy. The cursor is durable, so completed
+// history is never scanned again by the minute supervisor.
+async function migrateLegacyJobsPage(ctx: any) {
+  const state = await migrationState(ctx);
+  if (state.jobsComplete) return { scanned: 0, repaired: 0, complete: true };
+  const page = await ctx.db
+    .query("jobs")
+    .withIndex("by_createdAt")
+    // Recent rows are most likely to be live during rollout. Older durable
+    // history follows through the same resumable cursor.
+    .order("desc")
+    .paginate({ cursor: state.jobsCursor ?? null, numItems: 12, maximumRowsRead: 12 });
+  const now = Date.now();
+  let repaired = 0;
+  for (const row of page.page) {
+    const safety = row.status === "awaiting_approval" ? classifyWorkSafety(row.task, { repo: row.repo }) : null;
+    if (safety && !safety.approvalRequired && isOwnedRepository(row.repo)) {
+      const patch = {
         status: "pending",
         risk: row.risk === "consequential" ? "high" : row.risk,
         approvalRequired: false,
         approvalReason: undefined,
         approvalStatus: "superseded",
-        // Approval reconciliation must never widen capabilities. A read-only
-        // audit remains read-only even when its false-positive card is removed.
         deliveryMode: row.readonly === true ? "read_only" : "auto_merge",
         stage: "queued",
         progress: "autonomous software delivery enabled — queued",
         nextRunAt: now,
-      });
+      };
+      await patchJobWithRuntime(ctx, row, patch);
       const approvals = await ctx.db
         .query("approvals")
-        .withIndex("by_job", (q) => q.eq("jobId", String(row._id)))
-        .collect();
+        .withIndex("by_job", (q: any) => q.eq("jobId", String(row._id)))
+        .take(20);
       for (const approval of approvals) {
-        if (approval.status === "pending") {
-          await ctx.db.patch(approval._id, { status: "superseded", resolvedAt: now });
-        }
+        if (approval.status === "pending") await ctx.db.patch(approval._id, { status: "superseded", resolvedAt: now });
       }
       await ctx.db.insert("workEvents", {
         jobId: String(row._id),
@@ -150,72 +178,119 @@ export const reconcileAutonomousSoftwareWork = mutation({
         percent: row.percent ?? 0,
         createdAt: now,
       });
-      reconciled += 1;
+      repaired += 1;
+    } else {
+      await upsertJobRuntime(ctx, row);
     }
-    return reconciled;
+  }
+  const complete = page.isDone;
+  await ctx.db.patch(state._id, {
+    jobsCursor: complete ? undefined : page.continueCursor,
+    jobsComplete: complete,
+    jobsScanned: Number(state.jobsScanned ?? 0) + page.page.length,
+    jobsRepaired: Number(state.jobsRepaired ?? 0) + repaired,
+    completedAt: complete && state.missionsComplete ? now : undefined,
+    updatedAt: now,
+  });
+  return { scanned: page.page.length, repaired, complete };
+}
+
+// Goal workstream mode repair is similarly cursor-bound. One mission (and at
+// most the architecture's bounded 100 child rows) is examined per invocation.
+async function migrateLegacyMissionsPage(ctx: any) {
+  const state = await migrationState(ctx);
+  if (state.missionsComplete) return { scanned: 0, repaired: 0, complete: true };
+  const page = await ctx.db
+    .query("missions")
+    .withIndex("by_createdAt")
+    .order("desc")
+    .paginate({ cursor: state.missionsCursor ?? null, numItems: 1, maximumRowsRead: 1 });
+  let repaired = 0;
+  for (const mission of page.page) {
+    await upsertMissionRuntime(ctx, mission);
+    const streams = mission.mode === "goal" && Array.isArray((mission.plan as any)?.workstreams)
+      ? (mission.plan as any).workstreams as Array<{ id?: string; readonly?: boolean }>
+      : [];
+    if (!streams.length) continue;
+    const byId = new Map(streams.map((stream) => [String(stream.id ?? ""), stream]));
+    const jobs = await ctx.db
+      .query("jobs")
+      .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
+      .take(100);
+    for (const job of jobs) {
+      const patch: Record<string, unknown> = {};
+      if (isResumeOnlyUntouchedGoalJob(job)) {
+        patch.attempt = 1;
+        patch.checkpoint = undefined;
+        patch.progress = "Queued · waiting for dependencies";
+      }
+      if (job.goalStage === "building" && job.goalWorkstreamId) {
+        const stream = byId.get(String(job.goalWorkstreamId));
+        if (stream) {
+          const readonly = stream.readonly === true;
+          const deliveryMode = readonly ? "read_only" : "auto_merge";
+          if (job.readonly !== readonly || job.deliveryMode !== deliveryMode || (readonly && job.branch)) {
+            patch.readonly = readonly;
+            patch.deliveryMode = deliveryMode;
+            if (readonly) patch.branch = undefined;
+          }
+        }
+      }
+      if (Object.keys(patch).length) {
+        await patchJobWithRuntime(ctx, job, patch);
+        repaired += 1;
+      } else {
+        await upsertJobRuntime(ctx, job);
+      }
+    }
+  }
+  const now = Date.now();
+  const complete = page.isDone;
+  await ctx.db.patch(state._id, {
+    missionsCursor: complete ? undefined : page.continueCursor,
+    missionsComplete: complete,
+    missionsScanned: Number(state.missionsScanned ?? 0) + page.page.length,
+    missionsRepaired: Number(state.missionsRepaired ?? 0) + repaired,
+    completedAt: complete && state.jobsComplete ? now : undefined,
+    updatedAt: now,
+  });
+  return { scanned: page.page.length, repaired, complete };
+}
+
+export const migrateControlPlane = mutation({
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const jobs = await migrateLegacyJobsPage(ctx);
+    const missions = await migrateLegacyMissionsPage(ctx);
+    return { jobs, missions, complete: jobs.complete && missions.complete };
   },
 });
 
-// Repair the persisted execution mode from the Sol plan. This is both a
-// migration for jobs affected by the legacy reconciler above and a cheap
-// recurring invariant check for multi-day goals.
+// Compatibility names for Trigger workers that were already running during
+// rollout. They advance the same persisted cursors and become constant-time
+// no-ops after completion.
+export const reconcileAutonomousSoftwareWork = mutation({
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    return (await migrateLegacyJobsPage(ctx)).repaired;
+  },
+});
+
 export const reconcileGoalWorkstreamModes = mutation({
   args: { workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
-    const groups = await Promise.all(
-      ["running", "paused", "needs_input"].map((status) =>
-        ctx.db.query("missions").withIndex("by_status", (q: any) => q.eq("status", status)).take(20),
-      ),
-    );
-    const missions = groups
-      .flat()
-      .filter((mission: any, index: number, all: any[]) =>
-        mission.mode === "goal" && all.findIndex((candidate: any) => candidate._id === mission._id) === index,
-      );
-    let repaired = 0;
-    for (const mission of missions) {
-      const streams = Array.isArray((mission.plan as any)?.workstreams)
-        ? (mission.plan as any).workstreams as Array<{ id?: string; readonly?: boolean }>
-        : [];
-      if (!streams.length) continue;
-      const byId = new Map(streams.map((stream) => [String(stream.id ?? ""), stream]));
-      const jobs = await ctx.db
-        .query("jobs")
-        .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
-        .collect();
-      for (const job of jobs) {
-        if (isResumeOnlyUntouchedGoalJob(job)) {
-          await ctx.db.patch(job._id, {
-            attempt: 1,
-            checkpoint: undefined,
-            progress: "Queued · waiting for dependencies",
-          });
-          repaired += 1;
-        }
-        if (job.goalStage !== "building" || !job.goalWorkstreamId) continue;
-        const stream = byId.get(String(job.goalWorkstreamId));
-        if (!stream) continue;
-        const readonly = stream.readonly === true;
-        const deliveryMode = readonly ? "read_only" : "auto_merge";
-        if (job.readonly === readonly && job.deliveryMode === deliveryMode && (!readonly || !job.branch)) continue;
-        await ctx.db.patch(job._id, {
-          readonly,
-          deliveryMode,
-          ...(readonly ? { branch: undefined } : {}),
-        });
-        repaired += 1;
-      }
-    }
-    return repaired;
+    return (await migrateLegacyMissionsPage(ctx)).repaired;
   },
 });
 
 async function runnableCandidates(ctx: any, now: number, limit: number): Promise<any[]> {
   const candidates = await ctx.db
-    .query("jobs")
+    .query("jobRuntime")
     .withIndex("by_status_next_run", (q: any) => q.eq("status", "pending").lte("nextRunAt", now))
-    .take(Math.max(40, Math.min(120, limit * 8)));
+    .take(Math.max(24, Math.min(96, limit * 8)));
   candidates.sort((a: any, b: any) => (b.priority ?? 50) - (a.priority ?? 50) || a.createdAt - b.createdAt);
   const runnable: any[] = [];
   const missionCache = new Map<string, any>();
@@ -226,7 +301,12 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
       let mission = missionCache.get(candidate.missionId);
       if (mission === undefined) {
         const missionId = ctx.db.normalizeId("missions", candidate.missionId);
-        mission = missionId ? await ctx.db.get(missionId) : null;
+        mission = missionId
+          ? await ctx.db
+              .query("missionRuntime")
+              .withIndex("by_mission", (q: any) => q.eq("missionId", missionId))
+              .first()
+          : null;
         missionCache.set(candidate.missionId, mission ?? null);
       }
       // A paused/blocked/cancelled Goal Mode mission owns the lease. This
@@ -239,7 +319,7 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
       let dep = dependencyCache.get(dependency);
       if (dep === undefined) {
         const id = ctx.db.normalizeId("jobs", dependency);
-        dep = id ? await ctx.db.get(id) : null;
+        dep = id ? await jobRuntimeFor(ctx, id) : null;
         dependencyCache.set(dependency, dep ?? null);
       }
       if (!dep || dep.status !== "done") {
@@ -247,10 +327,21 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
         break;
       }
     }
-    if (!blocked) {
-      runnable.push(candidate);
-      if (runnable.length >= limit) break;
+    if (blocked) continue;
+    // The projection selects exact candidates; the one bounded authority read
+    // below fences dispatch against any stale rollout row without scanning jobs.
+    const job = await ctx.db.get(candidate.jobId);
+    if (!job || job.status !== "pending" || (job.attempt ?? 1) !== candidate.attempt || (job.nextRunAt ?? 0) > now) {
+      if (job) await upsertJobRuntime(ctx, job);
+      continue;
     }
+    if (job.goalStage && job.missionId) {
+      const missionId = ctx.db.normalizeId("missions", job.missionId);
+      const mission = missionId ? await ctx.db.get(missionId) : null;
+      if (!mission || !goalJobMatchesMissionPhase(job, mission)) continue;
+    }
+    runnable.push(job);
+    if (runnable.length >= limit) break;
   }
   return runnable;
 }
@@ -311,7 +402,7 @@ export const reserveDispatchBatch = mutation({
     const reservations = [];
     for (const j of candidates) {
       const dispatchId = `${String(j._id)}:${j.attempt ?? 1}:${now}`;
-      await ctx.db.patch(j._id, {
+      await patchJobWithRuntime(ctx, j, {
         status: "dispatching",
         stage: "dispatching",
         progress: "cloud worker reserved",
@@ -364,7 +455,7 @@ export const claimDispatched = mutation({
       j.dispatchId !== a.dispatchId ||
       (j.dispatchLeaseUntil ?? 0) < now
     ) return null;
-    await ctx.db.patch(j._id, {
+    await patchJobWithRuntime(ctx, j, {
       status: "running",
       stage: "starting",
       progress: "starting secure workspace",
@@ -380,7 +471,7 @@ export const claimDispatched = mutation({
       ? await ctx.db
           .query("jobs")
           .withIndex("by_mission", (q: any) => q.eq("missionId", j.missionId))
-          .collect()
+          .take(100)
       : await Promise.all((j.dependsOn ?? []).slice(0, 8).map(async (dependency: string) => {
           const id = ctx.db.normalizeId("jobs", dependency);
           return id ? await ctx.db.get(id) : null;
@@ -423,7 +514,7 @@ export const rejectDispatch = mutation({
     if (!row || row.status !== "dispatching" || row.dispatchId !== a.dispatchId) return false;
     const now = Date.now();
     const delayMs = Math.max(0, Math.min(10 * 60_000, a.delayMs ?? 30_000));
-    await ctx.db.patch(a.jobId, {
+    await patchJobWithRuntime(ctx, row, {
       status: "pending",
       stage: "queued",
       progress: `worker launch deferred · ${a.reason.slice(0, 240)}`,
@@ -468,7 +559,7 @@ export const finalize = mutation({
     const now = Date.now();
     const success = a.status === "done";
     const delivered = success && row.deliveryStatus === "merged";
-    await ctx.db.patch(a.jobId, {
+    const finalPatch = {
       status: a.status,
       result: a.result,
       pullRequestUrl: a.pullRequestUrl,
@@ -482,7 +573,8 @@ export const finalize = mutation({
       verificationVerdict: a.verificationVerdict,
       verificationNote: a.verificationNote?.slice(0, 1000),
       verifiedAt: success ? now : undefined,
-    });
+    };
+    await patchJobWithRuntime(ctx, row, finalPatch);
     await ctx.db.insert("workEvents", {
       jobId: String(a.jobId),
       missionId: row.missionId,
@@ -502,7 +594,7 @@ export const finalize = mutation({
         const jobs = await ctx.db
           .query("jobs")
           .withIndex("by_mission", (q: any) => q.eq("missionId", row.missionId))
-          .collect();
+          .take(100);
         if (mission && mission.mode === "goal") {
           const stage = mission.phase === "refining" ? "refining" : mission.phase === "building" ? "building" : null;
           if (stage) {
@@ -511,14 +603,14 @@ export const finalize = mutation({
             const finished = phaseJobs.filter((job: any) => ["done", "error", "cancelled"].includes(job.status)).length;
             const start = stage === "building" ? 12 : Math.min(90, 84 + wave * 3);
             const end = stage === "building" ? 78 : Math.min(96, start + 6);
-            await ctx.db.patch(missionId, {
+            await patchMissionWithRuntime(ctx, mission, {
               percent: Math.max(mission.percent ?? 0, Math.round(start + ((end - start) * finished) / Math.max(1, phaseJobs.length))),
               updatedAt: now,
             });
           }
         } else if (mission) {
           const finished = jobs.filter((j: any) => ["done", "error", "cancelled"].includes(j.status)).length;
-          await ctx.db.patch(missionId, {
+          await patchMissionWithRuntime(ctx, mission, {
             phase: finished >= mission.agentCount ? "reviewing" : "executing",
             percent: Math.min(88, Math.round((finished / Math.max(1, mission.agentCount)) * 88)),
             updatedAt: now,
@@ -567,12 +659,12 @@ export const list = query({
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
     const rows = await ctx.db
-      .query("jobs")
+      .query("jobRuntime")
       .withIndex("by_createdAt")
       .order("desc")
       .take(Math.min(a.limit ?? 20, 100));
     return rows.map((row: any) => ({
-      ...row,
+      ...runtimeJob(row),
       model: row.model ? normalizeWorkModelTier(row.model) : undefined,
     }));
   },
@@ -594,7 +686,7 @@ export const scrubSensitiveOutput = mutation({
       if (redacted !== row[field]) patch[field] = redacted;
     }
     if (!Object.keys(patch).length) return { scrubbed: false, fields: [] as string[] };
-    await ctx.db.patch(a.jobId, patch);
+    await patchJobWithRuntime(ctx, row, patch);
     return { scrubbed: true, fields: Object.keys(patch) };
   },
 });
@@ -607,13 +699,17 @@ export const reapStale = mutation({
     requireWorker(a.workerToken);
     const now = Date.now();
     const dispatching = await ctx.db
-      .query("jobs")
-      .withIndex("by_status", (q: any) => q.eq("status", "dispatching"))
+      .query("jobRuntime")
+      .withIndex("by_status_dispatch_lease", (q: any) => q.eq("status", "dispatching").lte("dispatchLeaseUntil", now))
       .take(100);
     const releasedDispatches: string[] = [];
-    for (const j of dispatching) {
-      if ((j.dispatchLeaseUntil ?? j.heartbeatAt ?? j.createdAt) > now) continue;
-      await ctx.db.patch(j._id, {
+    for (const activity of dispatching) {
+      const j = await ctx.db.get(activity.jobId);
+      if (!j || j.status !== "dispatching" || j.dispatchId !== activity.dispatchId) {
+        if (j) await upsertJobRuntime(ctx, j);
+        continue;
+      }
+      await patchJobWithRuntime(ctx, j, {
         status: "pending",
         stage: "queued",
         progress: "worker reservation expired — redispatch queued",
@@ -636,21 +732,24 @@ export const reapStale = mutation({
       releasedDispatches.push(j.task.slice(0, 80));
     }
     const running = await ctx.db
-      .query("jobs")
-      .withIndex("by_status", (q: any) => q.eq("status", "running"))
+      .query("jobRuntime")
+      .withIndex("by_status_heartbeat", (q: any) => q.eq("status", "running").lte("heartbeatAt", now - STALE_RUNNER_MS))
       .take(100);
     const requeued: string[] = [];
     const abandoned: string[] = [];
-    for (const j of running) {
-      const heartbeat = j.heartbeatAt ?? j.startedAt ?? j.createdAt;
+    for (const activity of running) {
+      const j = await ctx.db.get(activity.jobId);
+      if (!j || j.status !== "running" || (j.attempt ?? 1) !== activity.attempt) {
+        if (j) await upsertJobRuntime(ctx, j);
+        continue;
+      }
       // The serialized Trigger task heartbeats every 30 seconds. If its run
       // disappears (for example an OOM kill), the next scheduled invocation is
       // the only possible reaper, so five quiet minutes is ample fencing while
       // avoiding a long ghost-running window.
-      if (now - heartbeat < STALE_RUNNER_MS) continue;
       const nextAttempt = (j.attempt ?? 1) + 1;
       if (now - j.createdAt > 14 * 86_400_000 || nextAttempt > (j.maxAttempts ?? 12)) {
-        await ctx.db.patch(j._id, {
+        await patchJobWithRuntime(ctx, j, {
           status: "error",
           stage: "error",
           completedAt: now,
@@ -663,11 +762,11 @@ export const reapStale = mutation({
           timedOut: false,
           interruption: "lost its worker process or container before checkpoint finalization",
           priorCheckpoint: j.checkpoint,
-          narrative: j.result ?? j.progress,
+          narrative: j.result ?? activity.progress ?? j.progress,
           trace: j.log,
           deliveryNote: j.branch ? `checkpoint branch ${j.branch} retained` : undefined,
         });
-        await ctx.db.patch(j._id, {
+        await patchJobWithRuntime(ctx, j, {
           status: "pending",
           stage: "queued",
           startedAt: undefined,
@@ -699,6 +798,8 @@ export const updateProgress = mutation({
     jobId: v.id("jobs"),
     expectedAttempt: v.number(),
     progress: v.string(),
+    // Accepted only for rolling compatibility with already-running workers.
+    // Transcript tails live exclusively in Trigger Realtime metadata.
     log: v.optional(v.string()),
     stage: v.optional(v.string()),
     percent: v.optional(v.number()),
@@ -706,8 +807,21 @@ export const updateProgress = mutation({
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
-    const row = await ctx.db.get(a.jobId);
-    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
+    let row = await jobRuntimeFor(ctx, a.jobId);
+    if (!row) {
+      // One exact legacy bootstrap is permitted only while the bounded cursor
+      // migration is incomplete. There is never a full-table hot fallback.
+      const state = await ctx.db
+        .query("controlPlaneMigrations")
+        .withIndex("by_key", (q: any) => q.eq("key", CONTROL_PLANE_MIGRATION))
+        .first();
+      if (state?.jobsComplete) return false;
+      const legacy = await ctx.db.get(a.jobId);
+      if (!legacy) return false;
+      await upsertJobRuntime(ctx, legacy);
+      row = await jobRuntimeFor(ctx, a.jobId);
+    }
+    if (!row || row.status !== "running" || row.attempt !== a.expectedAttempt) return false;
     const now = Date.now();
     const percent = a.percent === undefined ? row.percent : Math.max(0, Math.min(99, a.percent));
     const patch: Record<string, unknown> = {
@@ -716,8 +830,8 @@ export const updateProgress = mutation({
       percent,
     };
     if (a.stage !== undefined) patch.stage = a.stage.slice(0, 80);
-    if (a.log !== undefined) patch.log = a.log.slice(-12_000);
-    await ctx.db.patch(a.jobId, patch);
+    patch.updatedAt = now;
+    await ctx.db.patch(row._id, patch);
     const meaningful = (a.stage && a.stage !== row.stage) || (percent ?? 0) - (row.percent ?? 0) >= 10;
     if (meaningful)
       await ctx.db.insert("workEvents", {
@@ -760,7 +874,7 @@ export const checkpointAndRequeue = mutation({
       // above before reaching this branch.
       if (stoppedState && row.status === requestedStatus) {
         const now = Date.now();
-        await ctx.db.patch(a.jobId, {
+        await patchJobWithRuntime(ctx, row, {
           checkpoint: a.checkpoint.slice(0, 6000),
           result: a.result,
           branch: a.branch ?? row.branch,
@@ -786,7 +900,7 @@ export const checkpointAndRequeue = mutation({
       requestedStatus === "pending" &&
       (attempt > (row.maxAttempts ?? 12) || Date.now() - row.createdAt > 14 * 86_400_000);
     const status = exhausted ? "error" : requestedStatus;
-    await ctx.db.patch(a.jobId, {
+    await patchJobWithRuntime(ctx, row, {
       status,
       stage: exhausted ? "error" : requestedStatus === "pending" ? "checkpointed" : requestedStatus,
       checkpoint: a.checkpoint.slice(0, 6000),
@@ -828,7 +942,7 @@ export const executionState = query({
   args: { jobId: v.id("jobs"), ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    return (await ctx.db.get(a.jobId))?.status ?? "missing";
+    return (await jobRuntimeFor(ctx, a.jobId))?.status ?? "missing";
   },
 });
 
@@ -836,8 +950,19 @@ export const executionLease = query({
   args: { jobId: v.id("jobs"), ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    const row = await ctx.db.get(a.jobId);
-    return row ? { status: row.status, attempt: row.attempt ?? 1 } : { status: "missing", attempt: 0 };
+    const row = await jobRuntimeFor(ctx, a.jobId);
+    if (row) return { status: row.status, attempt: row.attempt };
+    const state = await ctx.db
+      .query("controlPlaneMigrations")
+      .withIndex("by_key", (q: any) => q.eq("key", CONTROL_PLANE_MIGRATION))
+      .first();
+    if (state?.jobsComplete) return { status: "missing", attempt: 0 };
+    // Rollout-only point compatibility: an old live worker may predate its
+    // projection row. This disappears permanently when the cursor completes.
+    const legacy = await ctx.db.get(a.jobId);
+    return legacy
+      ? { status: legacy.status, attempt: legacy.attempt ?? 1 }
+      : { status: "missing", attempt: 0 };
   },
 });
 
@@ -854,7 +979,7 @@ export const requestInput = mutation({
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
     const now = Date.now();
-    await ctx.db.patch(a.jobId, {
+    await patchJobWithRuntime(ctx, row, {
       status: "needs_input",
       stage: "needs Daniel",
       progress: a.question.slice(0, 400),
@@ -904,7 +1029,7 @@ export const provideInput = mutation({
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "needs_input") return false;
     const now = Date.now();
-    await ctx.db.patch(a.jobId, {
+    await patchJobWithRuntime(ctx, row, {
       status: "pending",
       stage: "queued",
       progress: "Daniel answered — continuation queued",
@@ -950,7 +1075,7 @@ export const setDelivery = mutation({
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
-    await ctx.db.patch(a.jobId, {
+    await patchJobWithRuntime(ctx, row, {
       branch: a.branch,
       pullRequestUrl: a.pullRequestUrl,
       deliveryStatus: a.deliveryStatus,
@@ -982,7 +1107,7 @@ export const markVerifiedForDelivery = mutation({
     if (classifyWorkSafety(row.task, { repo: row.repo }).approvalRequired) return false;
     if (row.deliveryMode !== "auto_merge" && row.goalStage !== "validating") return false;
     const now = Date.now();
-    await ctx.db.patch(a.jobId, {
+    await patchJobWithRuntime(ctx, row, {
       result: a.result.slice(0, 4_000),
       verificationVerdict: "pass",
       verificationNote: a.verificationNote.slice(0, 1_000),
@@ -1009,7 +1134,7 @@ export const control = mutation({
     if (!row) return false;
     const now = Date.now();
     if (a.action === "pause" && ["pending", "dispatching", "running"].includes(row.status))
-      await ctx.db.patch(a.jobId, {
+      await patchJobWithRuntime(ctx, row, {
         status: "paused",
         stage: "paused",
         progress: "paused by Daniel",
@@ -1018,7 +1143,7 @@ export const control = mutation({
         dispatchLeaseUntil: undefined,
       });
     else if (a.action === "resume" && row.status === "paused")
-      await ctx.db.patch(a.jobId, {
+      await patchJobWithRuntime(ctx, row, {
         status: "pending",
         stage: "queued",
         progress: "resumed — queued",
@@ -1031,7 +1156,7 @@ export const control = mutation({
         workerRunId: undefined,
       });
     else if (a.action === "cancel" && !["done", "error", "cancelled"].includes(row.status)) {
-      await ctx.db.patch(a.jobId, {
+      await patchJobWithRuntime(ctx, row, {
         status: "cancelled",
         stage: "cancelled",
         completedAt: now,
@@ -1041,13 +1166,13 @@ export const control = mutation({
       const approvals = await ctx.db
         .query("approvals")
         .withIndex("by_job", (q: any) => q.eq("jobId", String(a.jobId)))
-        .collect();
+        .take(20);
       for (const approval of approvals) {
         if (approval.status === "pending") await ctx.db.patch(approval._id, { status: "cancelled", resolvedAt: now });
       }
     } else if (a.action === "retry" && ["error", "cancelled"].includes(row.status)) {
       const renewApproval = row.approvalRequired === true && row.approvalStatus !== "approved";
-      await ctx.db.patch(a.jobId, {
+      await patchJobWithRuntime(ctx, row, {
         status: renewApproval ? "awaiting_approval" : "pending",
         stage: renewApproval ? "approval" : "queued",
         completedAt: undefined,
@@ -1096,8 +1221,8 @@ export const active = query({
     const groups = await Promise.all(
       statuses.map((status) =>
         ctx.db
-          .query("jobs")
-          .withIndex("by_status", (q: any) => q.eq("status", status))
+          .query("jobRuntime")
+          .withIndex("by_status_priority", (q: any) => q.eq("status", status))
           .take(30),
       ),
     );
@@ -1105,7 +1230,7 @@ export const active = query({
       .flat()
       .sort((a: any, b: any) => (b.priority ?? 50) - (a.priority ?? 50) || a.createdAt - b.createdAt)
       .map((j: any) => ({
-        _id: j._id,
+        _id: j.jobId,
         task: j.task,
         label: j.label ?? null,
         missionId: j.missionId ?? null,
@@ -1147,7 +1272,7 @@ export const workerRun = query({
   args: { jobId: v.id("jobs"), ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    const row = await ctx.db.get(a.jobId);
+    const row = await jobRuntimeFor(ctx, a.jobId);
     return row?.workerRunId
       ? { runId: row.workerRunId, taskId: "jarvis-agent-worker", runtime: row.workerRuntime ?? "trigger" }
       : null;

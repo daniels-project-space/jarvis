@@ -109,8 +109,8 @@ export const list = query({
       Promise.all(
         statuses.map((status) =>
           ctx.db
-            .query("jobs")
-            .withIndex("by_status", (q: any) => q.eq("status", status))
+            .query("jobRuntime")
+            .withIndex("by_status_priority", (q: any) => q.eq("status", status))
             .take(30),
         ),
       ),
@@ -124,8 +124,8 @@ export const list = query({
         return {
           ...profile,
           status: executing ? "working" : blocked ? "blocked" : "available",
-          currentJobId: executing ? String(executing._id) : blocked ? String(blocked._id) : undefined,
-          activeJobIds: owned.map((job) => String(job._id)),
+          currentJobId: executing ? String(executing.jobId) : blocked ? String(blocked.jobId) : undefined,
+          activeJobIds: owned.map((job) => String(job.jobId)),
           activeJobCount: owned.length,
         };
       })

@@ -1051,9 +1051,18 @@ export function FleetView({ value }: { value: string }) {
     /* noop */
   }
   const missions = (useJarvisQuery(api.missions.active, {}) ?? []) as any[];
-  const m = missions.find((x) => x._id === missionId)
+  const activityMission = missions.find((x) => x._id === missionId)
     ?? (!missionId ? missions.find((x) => x.mode === "goal" && ["running", "paused", "needs_input"].includes(x.status)) : null)
     ?? (requestedMode === "goal" ? null : missions[0]);
+  // Rich plans/reports have their own subscription. Live job progress updates
+  // only invalidate the compact activity list and never reread this document.
+  const missionDetail = useJarvisQuery(
+    api.missions.get,
+    activityMission ? ({ id: activityMission._id } as any) : "skip",
+  ) as any;
+  const m = activityMission
+    ? { ...activityMission, ...(missionDetail ?? {}), jobs: activityMission.jobs }
+    : null;
   const missionEvents = (useJarvisQuery(
     api.workEvents.forMission,
     m ? ({ missionId: m._id, limit: 20 } as any) : "skip",

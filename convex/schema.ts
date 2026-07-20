@@ -252,6 +252,64 @@ export default defineSchema({
     .index("by_agent", ["agentId", "createdAt"])
     .index("by_visibility_status", ["visibility", "status", "createdAt"]),
 
+  // Compact control-plane read model. Live subscriptions, scheduler polls and
+  // execution lease checks use this table instead of materialising the much
+  // larger durable jobs (task/result/checkpoint/transcript). Durable state
+  // transitions still commit to jobs and update this projection atomically.
+  jobRuntime: defineTable({
+    jobId: v.id("jobs"),
+    task: v.string(),
+    label: v.optional(v.string()),
+    repo: v.optional(v.string()),
+    status: v.string(),
+    visibility: v.optional(v.string()),
+    incidentId: v.optional(v.string()),
+    missionId: v.optional(v.string()),
+    originThreadId: v.optional(v.string()),
+    agentId: v.optional(v.string()),
+    model: v.optional(v.string()),
+    reasoningEffort: v.optional(v.string()),
+    modelReason: v.optional(v.string()),
+    risk: v.optional(v.string()),
+    priority: v.number(),
+    approvalRequired: v.optional(v.boolean()),
+    approvalStatus: v.optional(v.string()),
+    stage: v.string(),
+    percent: v.number(),
+    progress: v.optional(v.string()),
+    attempt: v.number(),
+    maxAttempts: v.number(),
+    heartbeatAt: v.number(),
+    nextRunAt: v.optional(v.number()),
+    dispatchId: v.optional(v.string()),
+    dispatchLeaseUntil: v.optional(v.number()),
+    workerRunId: v.optional(v.string()),
+    workerRuntime: v.optional(v.string()),
+    readonly: v.optional(v.boolean()),
+    parentJobId: v.optional(v.string()),
+    dependsOn: v.optional(v.array(v.string())),
+    goalStage: v.optional(v.string()),
+    goalWorkstreamId: v.optional(v.string()),
+    goalWave: v.optional(v.number()),
+    branch: v.optional(v.string()),
+    pullRequestUrl: v.optional(v.string()),
+    deliveryMode: v.optional(v.string()),
+    deliveryStatus: v.optional(v.string()),
+    mergeCommitSha: v.optional(v.string()),
+    startedAt: v.optional(v.number()),
+    completedAt: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_job", ["jobId"])
+    .index("by_createdAt", ["createdAt"])
+    .index("by_status_priority", ["status", "priority", "createdAt"])
+    .index("by_status_next_run", ["status", "nextRunAt", "createdAt"])
+    .index("by_status_heartbeat", ["status", "heartbeatAt"])
+    .index("by_status_dispatch_lease", ["status", "dispatchLeaseUntil"])
+    .index("by_visibility_status_priority", ["visibility", "status", "priority", "createdAt"])
+    .index("by_mission", ["missionId", "createdAt"]),
+
   // Orchestrated agent fleets: one mission = a decomposed goal running as
   // parallel jobs; when the last one lands, a synthesis pass merges the
   // results into ONE coherent report back to Daniel.
@@ -313,6 +371,67 @@ export default defineSchema({
     .index("by_createdAt", ["createdAt"])
     .index("by_external_control", ["externalControlRequested", "createdAt"])
     .index("by_external_revision", ["externalRevisionRequested", "createdAt"]),
+
+  // Mission list/status projection. Rich plans, validation histories and final
+  // reports remain in missions and are fetched only by the dedicated detail
+  // query, so a job heartbeat cannot amplify into a reread of those payloads.
+  missionRuntime: defineTable({
+    missionId: v.id("missions"),
+    goal: v.string(),
+    mode: v.string(),
+    status: v.string(),
+    agentCount: v.number(),
+    originThreadId: v.optional(v.string()),
+    managerAgentId: v.optional(v.string()),
+    priority: v.number(),
+    phase: v.string(),
+    percent: v.number(),
+    route: v.optional(v.string()),
+    primaryRepo: v.optional(v.string()),
+    revisionWave: v.number(),
+    maxRevisionWaves: v.number(),
+    maxBuildSessions: v.number(),
+    planningJobId: v.optional(v.string()),
+    validatorJobId: v.optional(v.string()),
+    advanceLeaseUntil: v.optional(v.number()),
+    pausedPhase: v.optional(v.string()),
+    failureReason: v.optional(v.string()),
+    externalKind: v.optional(v.string()),
+    externalRunId: v.optional(v.string()),
+    externalSlug: v.optional(v.string()),
+    externalStatus: v.optional(v.string()),
+    externalStage: v.optional(v.string()),
+    externalPollFailures: v.number(),
+    externalControlRequested: v.optional(v.string()),
+    externalRevisionRequested: v.optional(v.string()),
+    externalRevisionWave: v.optional(v.number()),
+    externalActionFailures: v.number(),
+    completedAt: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_mission", ["missionId"])
+    .index("by_createdAt", ["createdAt"])
+    .index("by_status", ["status", "createdAt"])
+    .index("by_external_control", ["externalControlRequested", "createdAt"])
+    .index("by_external_revision", ["externalRevisionRequested", "createdAt"]),
+
+  // Resumable cursors make the legacy backfill and policy repairs one-time,
+  // bounded work. Once both cursors finish, minute maintenance reads this one
+  // tiny row and performs no historical scan.
+  controlPlaneMigrations: defineTable({
+    key: v.string(),
+    jobsCursor: v.optional(v.string()),
+    jobsComplete: v.boolean(),
+    jobsScanned: v.number(),
+    jobsRepaired: v.number(),
+    missionsCursor: v.optional(v.string()),
+    missionsComplete: v.boolean(),
+    missionsScanned: v.number(),
+    missionsRepaired: v.number(),
+    completedAt: v.optional(v.number()),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
 
   // Opaque, revocable browser sessions for Daniel. The raw bearer token only
   // exists in an HttpOnly cookie; Convex stores its SHA-256 digest. Privileged

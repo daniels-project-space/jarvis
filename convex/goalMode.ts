@@ -15,6 +15,13 @@ import {
   type GoalRoute,
   type GoalValidation,
 } from "../src/lib/goal-mode";
+import {
+  insertJobWithRuntime,
+  insertMissionWithRuntime,
+  patchJobWithRuntime,
+  patchMissionWithRuntime,
+  runtimeJob,
+} from "./controlPlane";
 
 const ADVANCE_LEASE_MS = 10 * 60 * 1000;
 const COORDINATOR_RECEIPT_FRESH_MS = 10 * 60 * 1000;
@@ -138,7 +145,7 @@ async function insertGoalJob(ctx: any, input: GoalJobInput) {
   const approvalRequired = approval.required;
   const status = approvalRequired ? "awaiting_approval" : "pending";
   const { policyTask: _policyTask, ...persistedInput } = input;
-  const jobId = await ctx.db.insert("jobs", {
+  const jobId = await insertJobWithRuntime(ctx, {
     ...persistedInput,
     task: input.task.slice(0, input.goalStage === "validating" ? GOAL_VALIDATOR_TASK_MAX_CHARS : 6_000),
     label: input.label.slice(0, 80),
@@ -233,7 +240,7 @@ export const create = mutation({
       reason: args.routeReason.slice(0, 1000),
       infrastructureContext: args.infrastructureContext.slice(0, 4000),
     };
-    const missionId = await ctx.db.insert("missions", {
+    const missionId = await insertMissionWithRuntime(ctx, {
       goal,
       mode: "goal",
       status: "running",
@@ -280,7 +287,8 @@ export const create = mutation({
       goalWorkstreamId: "goal-plan",
       goalWave: 0,
     });
-    await ctx.db.patch(missionId, { planningJobId: String(plannerJobId) });
+    const mission = await ctx.db.get(missionId);
+    if (mission) await patchMissionWithRuntime(ctx, mission, { planningJobId: String(plannerJobId) });
     await recordMissionEvent(ctx, String(missionId), "goal_started", "Goal Mode started with a Sol/max planning session", "planning", 3, {
       route: route.kind,
       primaryRepo: route.primaryRepo,
@@ -443,7 +451,7 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
     goalWave: Number(mission.revisionWave ?? 0),
   });
   const now = Date.now();
-  await ctx.db.patch(mission._id, {
+  await patchMissionWithRuntime(ctx, mission, {
     phase: "validating",
     percent: Math.min(96, 82 + Number(mission.revisionWave ?? 0) * 5),
     validatorJobId: String(validatorJobId),
@@ -478,7 +486,7 @@ async function blockGoalForPhaseFailure(ctx: any, mission: any, phaseJobs: any[]
   // reclaimed until Daniel resumes the parent mission.
   for (const job of phaseJobs) {
     if (job.status === "pending" || job.status === "running") {
-      await ctx.db.patch(job._id, {
+      await patchJobWithRuntime(ctx, job, {
         status: "paused",
         stage: "blocked dependency",
         progress: "Goal Mode held after a phase failure",
@@ -486,7 +494,7 @@ async function blockGoalForPhaseFailure(ctx: any, mission: any, phaseJobs: any[]
       });
     }
   }
-  await ctx.db.patch(mission._id, {
+  await patchMissionWithRuntime(ctx, mission, {
     status: "needs_input",
     phase: "blocked",
     pausedPhase: phase,
@@ -508,29 +516,36 @@ export const claimAdvance = mutation({
     requireWorker(args.workerToken);
     const now = Date.now();
     const running = await ctx.db
-      .query("missions")
+      .query("missionRuntime")
       .withIndex("by_status", (q: any) => q.eq("status", "running"))
       .order("asc")
       .take(100);
-    for (const mission of running) {
-      if (mission.mode !== "goal") continue;
+    for (const activity of running) {
+      if (activity.mode !== "goal") continue;
       // External factories own their build loop, but their completed Sol
       // validator still returns through this same durable contract parser.
-      if (mission.externalRunId && mission.phase !== "validating") continue;
-      const jobs = await ctx.db
-        .query("jobs")
-        .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
-        .collect();
-      if (mission.phase === "planning") {
-        const planner = jobs.find((job: any) => String(job._id) === mission.planningJobId);
-        if (!planner || !TERMINAL.has(planner.status)) continue;
+      if (activity.externalRunId && activity.phase !== "validating") continue;
+      const projectedJobs = await ctx.db
+        .query("jobRuntime")
+        .withIndex("by_mission", (q: any) => q.eq("missionId", String(activity.missionId)))
+        .take(100);
+      if (activity.phase === "planning") {
+        const plannerActivity = projectedJobs.find((job: any) =>
+          String(job.jobId) === activity.planningJobId || job.goalStage === "planning",
+        );
+        if (!plannerActivity || !TERMINAL.has(plannerActivity.status) || (activity.advanceLeaseUntil ?? 0) > now) continue;
+        const [mission, planner] = await Promise.all([
+          ctx.db.get(activity.missionId),
+          ctx.db.get(plannerActivity.jobId),
+        ]);
+        if (!mission || mission.status !== "running" || mission.phase !== "planning" || !planner || !TERMINAL.has(planner.status)) continue;
         if (planner.status !== "done") {
           await blockGoalForPhaseFailure(ctx, mission, [planner], "planning");
           continue;
         }
         if ((mission.advanceLeaseUntil ?? 0) > now) continue;
         const advanceAttempt = Number(mission.advanceAttempt ?? 0) + 1;
-        await ctx.db.patch(mission._id, {
+        await patchMissionWithRuntime(ctx, mission, {
           advanceAttempt,
           advanceLeaseUntil: now + ADVANCE_LEASE_MS,
           updatedAt: now,
@@ -548,27 +563,44 @@ export const claimAdvance = mutation({
           maxBuildSessions: mission.maxBuildSessions ?? 6,
         };
       }
-      if (mission.phase === "building" || mission.phase === "refining") {
+      if (activity.phase === "building" || activity.phase === "refining") {
+        const projectedPhaseJobs = activeStageJobs(projectedJobs, activity);
+        const phaseState = summarizeGoalPhase(projectedPhaseJobs);
+        if (phaseState.state !== "blocked" && phaseState.state !== "complete") continue;
+        const mission = await ctx.db.get(activity.missionId);
+        if (!mission || mission.status !== "running" || mission.phase !== activity.phase) continue;
+        const jobs = await ctx.db
+          .query("jobs")
+          .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
+          .take(100);
         const phaseJobs = activeStageJobs(jobs, mission);
-        const phaseState = summarizeGoalPhase(phaseJobs);
-        if (phaseState.state === "blocked") {
+        const authoritativeState = summarizeGoalPhase(phaseJobs);
+        if (authoritativeState.state === "blocked") {
           await blockGoalForPhaseFailure(ctx, mission, phaseJobs, mission.phase);
           return { kind: "advanced", missionId: mission._id, phase: "blocked" };
         }
-        if (phaseState.state !== "complete") continue;
+        if (authoritativeState.state !== "complete") continue;
         await enqueueValidator(ctx, mission, jobs);
         return { kind: "advanced", missionId: mission._id, phase: "validating" };
       }
-      if (mission.phase === "validating") {
-        const validator = jobs.find((job: any) => String(job._id) === mission.validatorJobId);
-        if (!validator || !TERMINAL.has(validator.status)) continue;
+      if (activity.phase === "validating") {
+        const validatorActivity = projectedJobs.find((job: any) =>
+          String(job.jobId) === activity.validatorJobId ||
+          (job.goalStage === "validating" && Number(job.goalWave ?? 0) === Number(activity.revisionWave ?? 0)),
+        );
+        if (!validatorActivity || !TERMINAL.has(validatorActivity.status) || (activity.advanceLeaseUntil ?? 0) > now) continue;
+        const [mission, validator] = await Promise.all([
+          ctx.db.get(activity.missionId),
+          ctx.db.get(validatorActivity.jobId),
+        ]);
+        if (!mission || mission.status !== "running" || mission.phase !== "validating" || !validator || !TERMINAL.has(validator.status)) continue;
         if (validator.status !== "done") {
           await blockGoalForPhaseFailure(ctx, mission, [validator], "validating");
           continue;
         }
         if ((mission.advanceLeaseUntil ?? 0) > now) continue;
         const advanceAttempt = Number(mission.advanceAttempt ?? 0) + 1;
-        await ctx.db.patch(mission._id, {
+        await patchMissionWithRuntime(ctx, mission, {
           advanceAttempt,
           advanceLeaseUntil: now + ADVANCE_LEASE_MS,
           updatedAt: now,
@@ -612,7 +644,7 @@ export const recordPlan = mutation({
     const now = Date.now();
     if (mission.route === "app_factory") {
       if (!args.externalRun?.id) throw new Error("App Factory route requires a live factory run");
-      await ctx.db.patch(args.id, {
+      await patchMissionWithRuntime(ctx, mission, {
         plan,
         phase: "building",
         percent: 12,
@@ -682,7 +714,7 @@ export const recordPlan = mutation({
       workstreamJobs.set(stream.id, String(id));
       if (!stream.readonly && repo) lastWritableByRepo.set(repo, String(id));
     }
-    await ctx.db.patch(args.id, {
+    await patchMissionWithRuntime(ctx, mission, {
       plan,
       phase: "building",
       percent: 12,
@@ -722,7 +754,7 @@ export const rejectAdvance = mutation({
     const now = Date.now();
     if (nextAttempt > Number(job.maxAttempts ?? 16)) {
       const reason = `Goal session repeatedly returned an invalid machine contract: ${args.error.slice(0, 800)}`;
-      await ctx.db.patch(args.id, {
+      await patchMissionWithRuntime(ctx, mission, {
         status: "needs_input",
         phase: "blocked",
         pausedPhase: mission.phase,
@@ -733,7 +765,7 @@ export const rejectAdvance = mutation({
       await upsertGoalAttention(ctx, mission, reason);
       return { requeued: false, stale: false };
     }
-    await ctx.db.patch(args.jobId, {
+    await patchJobWithRuntime(ctx, job, {
       status: "pending",
       stage: "checkpointed",
       progress: `Structured contract rejected; correction attempt ${nextAttempt} queued`,
@@ -746,7 +778,7 @@ export const rejectAdvance = mutation({
       verificationNote: undefined,
       verifiedAt: undefined,
     });
-    await ctx.db.patch(args.id, { advanceLeaseUntil: undefined, updatedAt: now });
+    await patchMissionWithRuntime(ctx, mission, { advanceLeaseUntil: undefined, updatedAt: now });
     await recordMissionEvent(ctx, String(args.id), "goal_contract_rejected", args.error, mission.phase ?? "goal", mission.percent, {
       attempt: nextAttempt,
     });
@@ -767,7 +799,7 @@ export const releaseAdvance = mutation({
     const mission = await ctx.db.get(args.id);
     if (!mission || mission.mode !== "goal" || Number(mission.advanceAttempt ?? 0) !== args.expectedAdvanceAttempt) return false;
     const delay = Math.max(10_000, Math.min(30 * 60_000, args.delayMs ?? 60_000));
-    await ctx.db.patch(args.id, {
+    await patchMissionWithRuntime(ctx, mission, {
       advanceLeaseUntil: Date.now() + delay,
       failureReason: `Temporary Goal Mode integration error: ${args.error.slice(0, 800)}`,
       updatedAt: Date.now(),
@@ -873,7 +905,7 @@ async function queueExternalRevision(
     updatedAt: now,
   };
   if (options.validationHistory) patch.validationHistory = options.validationHistory;
-  await ctx.db.patch(mission._id, patch);
+  await patchMissionWithRuntime(ctx, mission, patch);
   await resolveGoalAttention(ctx, mission._id);
   await recordMissionEvent(
     ctx,
@@ -906,7 +938,7 @@ export const recordValidation = mutation({
     const now = Date.now();
     const history = [...(mission.validationHistory ?? []), validation].slice(-6);
     if (validation.verdict === "pass") {
-      await ctx.db.patch(args.id, {
+      await patchMissionWithRuntime(ctx, mission, {
         status: "done",
         phase: "complete",
         percent: 100,
@@ -934,7 +966,7 @@ export const recordValidation = mutation({
         return { advanced: true, status: "external_refining", jobs: 0 };
       }
       const ids = await enqueueRefinements(ctx, mission, validation.refinements, nextWave);
-      await ctx.db.patch(args.id, {
+      await patchMissionWithRuntime(ctx, mission, {
         phase: "refining",
         percent: Math.min(94, 84 + nextWave * 4),
         validation,
@@ -954,7 +986,7 @@ export const recordValidation = mutation({
     const reason = validation.verdict === "blocked"
       ? validation.blocker || validation.summary
       : `The bounded ${mission.maxRevisionWaves ?? 2}-wave refinement budget is exhausted. Remaining gaps: ${validation.gaps.join("; ")}`;
-    await ctx.db.patch(args.id, {
+    await patchMissionWithRuntime(ctx, mission, {
       status: "needs_input",
       phase: "needs Daniel",
       pausedPhase: "validating",
@@ -977,7 +1009,7 @@ export const externalPending = query({
     requireWorker(args.workerToken);
     const groups = await Promise.all(
       ["running", "needs_input"].map((status) =>
-        ctx.db.query("missions").withIndex("by_status", (q: any) => q.eq("status", status)).order("asc").take(100),
+        ctx.db.query("missionRuntime").withIndex("by_status", (q: any) => q.eq("status", status)).order("asc").take(100),
       ),
     );
     return groups.flat()
@@ -988,7 +1020,7 @@ export const externalPending = query({
         return mission.phase === "blocked" && mission.externalStatus !== "shipped";
       })
       .map((mission: any) => ({
-        id: mission._id,
+        id: mission.missionId,
         goal: mission.goal,
         status: mission.status,
         phase: mission.phase,
@@ -1007,18 +1039,19 @@ export const externalRevisionsPending = query({
   handler: async (ctx, args) => {
     requireWorker(args.workerToken);
     const rows = await ctx.db
-      .query("missions")
+      .query("missionRuntime")
       .withIndex("by_external_revision", (q: any) => q.eq("externalRevisionRequested", "pending"))
       .order("asc")
       .take(50);
-    return rows
-      .filter((mission: any) =>
-        mission.mode === "goal" &&
-        mission.externalKind === "app-factory" &&
-        mission.externalRunId &&
-        mission.validation?.verdict === "refine" &&
-        (mission.status === "running" || (mission.status === "needs_input" && mission.phase === "blocked")),
-      )
+    const candidates = rows.filter((mission: any) =>
+      mission.mode === "goal" &&
+      mission.externalKind === "app-factory" &&
+      mission.externalRunId &&
+      (mission.status === "running" || (mission.status === "needs_input" && mission.phase === "blocked")),
+    );
+    const missions = await Promise.all(candidates.map((activity: any) => ctx.db.get(activity.missionId)));
+    return missions
+      .filter((mission: any) => mission?.validation?.verdict === "refine" && mission.externalRevisionRequested === "pending")
       .map((mission: any) => ({
         id: mission._id,
         externalRunId: mission.externalRunId,
@@ -1046,7 +1079,7 @@ export const acknowledgeExternalRevision = mutation({
       !mission.externalRunId
     ) return false;
     if (mission.status === "cancelled" || mission.status === "done") {
-      await ctx.db.patch(args.id, {
+      await patchMissionWithRuntime(ctx, mission, {
         externalRevisionRequested: undefined,
         externalRevisionWave: undefined,
         externalRevisionUpdatedAt: Date.now(),
@@ -1056,7 +1089,7 @@ export const acknowledgeExternalRevision = mutation({
     }
     const now = Date.now();
     const paused = mission.status === "paused";
-    await ctx.db.patch(args.id, {
+    await patchMissionWithRuntime(ctx, mission, {
       status: paused ? "paused" : "running",
       phase: paused ? "paused" : "building",
       pausedPhase: paused ? "building" : undefined,
@@ -1094,7 +1127,7 @@ export const externalControlsPending = query({
     const groups = await Promise.all(
       ["pause", "resume", "retry"].map((action) =>
         ctx.db
-          .query("missions")
+          .query("missionRuntime")
           .withIndex("by_external_control", (q: any) => q.eq("externalControlRequested", action))
           .order("asc")
           .take(50),
@@ -1103,7 +1136,7 @@ export const externalControlsPending = query({
     return groups.flat()
       .filter((mission: any) => mission.mode === "goal" && mission.externalKind === "app-factory" && mission.externalRunId)
       .map((mission: any) => ({
-        id: mission._id,
+        id: mission.missionId,
         externalRunId: mission.externalRunId,
         action: mission.externalControlRequested,
         externalActionFailures: mission.externalActionFailures ?? 0,
@@ -1123,7 +1156,7 @@ export const acknowledgeExternalControl = mutation({
     if (!mission || mission.externalControlRequested !== args.action) return false;
     const now = Date.now();
     const recoveredResume = (args.action === "resume" || args.action === "retry") && mission.status === "needs_input" && Boolean(mission.externalActionAlertedAt);
-    await ctx.db.patch(args.id, {
+    await patchMissionWithRuntime(ctx, mission, {
       externalControlRequested: undefined,
       externalControlUpdatedAt: now,
       externalActionFailures: 0,
@@ -1177,7 +1210,7 @@ export const recordExternalActionFailure = mutation({
         patch.pausedPhase = "building";
       }
     }
-    await ctx.db.patch(args.id, patch);
+    await patchMissionWithRuntime(ctx, mission, patch);
     if (firstAlert) {
       await upsertGoalAttention(ctx, mission, detail);
       await recordMissionEvent(ctx, String(args.id), "goal_external_action_blocked", detail, "blocked", mission.percent, {
@@ -1198,7 +1231,7 @@ export const coordinationDemand = query({
     requireWorker(args.workerToken);
     const now = Date.now();
     const missions = await ctx.db
-      .query("missions")
+      .query("missionRuntime")
       .withIndex("by_status", (q: any) => q.eq("status", "running"))
       .order("asc")
       .take(100);
@@ -1206,22 +1239,22 @@ export const coordinationDemand = query({
     for (const mission of missions) {
       if (mission.mode !== "goal") continue;
       if (mission.externalRunId && ["building", "factory approval", "factory refinement", "blocked"].includes(mission.phase ?? "")) continue;
-      const jobs = await ctx.db
-        .query("jobs")
-        .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
-        .collect();
+      const jobs = (await ctx.db
+        .query("jobRuntime")
+        .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission.missionId)))
+        .take(100)).map(runtimeJob);
       const completed = new Set(jobs.filter((job: any) => job.status === "done").map((job: any) => String(job._id)));
       const runnable = jobs.find((job: any) => goalJobRunnableForMission(job, mission, completed, now));
-      if (runnable) reasons.push(`runnable:${mission._id}:${runnable._id}`);
+      if (runnable) reasons.push(`runnable:${mission.missionId}:${runnable._id}`);
       if (mission.phase === "planning") {
         const planner = jobs.find((job: any) => String(job._id) === mission.planningJobId);
-        if (planner && TERMINAL.has(planner.status)) reasons.push(`plan:${mission._id}`);
+        if (planner && TERMINAL.has(planner.status)) reasons.push(`plan:${mission.missionId}`);
       } else if (mission.phase === "validating") {
         const validator = jobs.find((job: any) => String(job._id) === mission.validatorJobId);
-        if (validator && TERMINAL.has(validator.status)) reasons.push(`validation:${mission._id}`);
+        if (validator && TERMINAL.has(validator.status)) reasons.push(`validation:${mission.missionId}`);
       } else if (mission.phase === "building" || mission.phase === "refining") {
         const state = summarizeGoalPhase(activeStageJobs(jobs, mission)).state;
-        if (state === "complete" || state === "blocked") reasons.push(`${mission.phase}:${mission._id}`);
+        if (state === "complete" || state === "blocked") reasons.push(`${mission.phase}:${mission.missionId}`);
       }
       if (reasons.length >= 20) break;
     }
@@ -1260,7 +1293,7 @@ export const updateExternal = mutation({
         mission.failureReason === detail.slice(0, 2000) &&
         pollStateClean
       ) return { updated: false, wake: false };
-      await ctx.db.patch(args.id, {
+      await patchMissionWithRuntime(ctx, mission, {
         status: "needs_input",
         phase: "factory approval",
         percent: Math.max(68, progress),
@@ -1286,7 +1319,7 @@ export const updateExternal = mutation({
         mission.failureReason === detail.slice(0, 2000) &&
         pollStateClean
       ) return { updated: false, wake: false };
-      await ctx.db.patch(args.id, {
+      await patchMissionWithRuntime(ctx, mission, {
         status: "needs_input",
         phase: "blocked",
         externalStatus: args.status,
@@ -1306,8 +1339,8 @@ export const updateExternal = mutation({
       const jobs = await ctx.db
         .query("jobs")
         .withIndex("by_mission", (q: any) => q.eq("missionId", String(args.id)))
-        .collect();
-      await ctx.db.patch(args.id, {
+        .take(100);
+      await patchMissionWithRuntime(ctx, mission, {
         status: "running",
         externalStatus: args.status,
         externalStage: args.stage,
@@ -1331,7 +1364,7 @@ export const updateExternal = mutation({
       !mission.failureReason &&
       pollStateClean
     ) return { updated: false, wake: false };
-    await ctx.db.patch(args.id, {
+    await patchMissionWithRuntime(ctx, mission, {
       status: "running",
       phase: "building",
       percent: Math.max(Number(mission.percent ?? 0), Math.min(76, progress)),
@@ -1366,7 +1399,7 @@ export const recordExternalPollFailure = mutation({
     const now = Date.now();
     const detail = `App Factory run ${mission.externalRunId} could not be read after ${failures} consecutive checks: ${args.error.slice(0, 800)}`;
     if (failures < 12) {
-      await ctx.db.patch(args.id, {
+      await patchMissionWithRuntime(ctx, mission, {
         externalPollFailures: failures,
         externalPollError: args.error.slice(0, 1000),
         updatedAt: now,
@@ -1374,7 +1407,7 @@ export const recordExternalPollFailure = mutation({
       return { recorded: true, blocked: false, failures };
     }
     const firstAlert = !mission.externalPollAlertedAt;
-    await ctx.db.patch(args.id, {
+    await patchMissionWithRuntime(ctx, mission, {
       status: "needs_input",
       phase: "blocked",
       pausedPhase: "building",
@@ -1415,7 +1448,7 @@ async function resetGoalJob(ctx: any, job: any, now: number, force = false) {
       });
     }
   }
-  await ctx.db.patch(job._id, {
+  await patchJobWithRuntime(ctx, job, {
     status: awaitingApproval ? "awaiting_approval" : "pending",
     stage: awaitingApproval ? "approval" : "queued",
     progress: awaitingApproval ? "Goal Mode retry waiting for approval" : "Goal Mode recovery queued",
@@ -1453,15 +1486,15 @@ export const control = mutation({
     const jobs = await ctx.db
       .query("jobs")
       .withIndex("by_mission", (q: any) => q.eq("missionId", String(args.id)))
-      .collect();
+      .take(100);
     const now = Date.now();
     let externalControl: "pause" | "resume" | "retry" | null = null;
     if (args.action === "pause" && mission.status === "running") {
       if (mission.externalRunId && mission.externalStatus !== "shipped") externalControl = "pause";
-      await ctx.db.patch(args.id, { status: "paused", pausedPhase: mission.phase, phase: "paused", updatedAt: now });
+      await patchMissionWithRuntime(ctx, mission, { status: "paused", pausedPhase: mission.phase, phase: "paused", updatedAt: now });
       for (const job of jobs) {
         if (shouldPauseGoalJob(job.status)) {
-          await ctx.db.patch(job._id, {
+          await patchJobWithRuntime(ctx, job, {
             status: "paused",
             stage: "paused",
             progress: "Goal Mode paused by Daniel",
@@ -1478,7 +1511,7 @@ export const control = mutation({
       for (const job of jobs) {
         if (job.status === "paused") await resetGoalJob(ctx, job, now);
       }
-      await ctx.db.patch(args.id, {
+      await patchMissionWithRuntime(ctx, mission, {
         status: "running",
         phase: restoredPhase,
         pausedPhase: undefined,
@@ -1509,7 +1542,7 @@ export const control = mutation({
       } else if (refinements.length) {
         const nextWave = Number(mission.revisionWave ?? 0) + 1;
         const ids = await enqueueRefinements(ctx, mission, refinements, nextWave);
-        await ctx.db.patch(args.id, {
+        await patchMissionWithRuntime(ctx, mission, {
           status: "running",
           phase: "refining",
           revisionWave: nextWave,
@@ -1525,12 +1558,12 @@ export const control = mutation({
         const job = jobs.find((candidate) => String(candidate._id) === jobId);
         if (!job) return false;
         if (phase === "validating") {
-          await ctx.db.patch(job._id, {
+          await patchJobWithRuntime(ctx, job, {
             task: (await validatorTaskForMission(ctx, mission, jobs)).slice(0, GOAL_VALIDATOR_TASK_MAX_CHARS),
           });
         }
         if (!(await resetGoalJob(ctx, job, now, true))) return false;
-        await ctx.db.patch(args.id, {
+        await patchMissionWithRuntime(ctx, mission, {
           status: "running",
           phase,
           pausedPhase: undefined,
@@ -1549,7 +1582,7 @@ export const control = mutation({
           externalControl = mission.externalStatus === "failed"
             ? "retry"
             : mission.externalStatus === "paused" ? "resume" : null;
-          await ctx.db.patch(args.id, {
+          await patchMissionWithRuntime(ctx, mission, {
             status: "running",
             phase: "building",
             pausedPhase: undefined,
@@ -1561,7 +1594,7 @@ export const control = mutation({
           });
         } else if (!reset) return false;
         else {
-          await ctx.db.patch(args.id, {
+          await patchMissionWithRuntime(ctx, mission, {
             status: "running",
             phase,
             pausedPhase: undefined,
@@ -1574,7 +1607,7 @@ export const control = mutation({
         externalControl = mission.externalStatus === "failed"
           ? "retry"
           : mission.externalStatus === "paused" ? "resume" : null;
-        await ctx.db.patch(args.id, {
+        await patchMissionWithRuntime(ctx, mission, {
           status: "running",
           phase: "building",
           pausedPhase: undefined,
@@ -1588,7 +1621,7 @@ export const control = mutation({
       await resolveGoalAttention(ctx, args.id);
     } else if (args.action === "cancel" && !["done", "cancelled"].includes(mission.status)) {
       if (mission.externalRunId && mission.externalStatus !== "shipped") externalControl = "pause";
-      await ctx.db.patch(args.id, {
+      await patchMissionWithRuntime(ctx, mission, {
         status: "cancelled",
         phase: "cancelled",
         externalRevisionRequested: undefined,
@@ -1599,12 +1632,12 @@ export const control = mutation({
       });
       for (const job of jobs) {
         if (!TERMINAL.has(job.status)) {
-          await ctx.db.patch(job._id, { status: "cancelled", stage: "cancelled", progress: "Goal Mode cancelled by Daniel", completedAt: now, nextRunAt: undefined });
+          await patchJobWithRuntime(ctx, job, { status: "cancelled", stage: "cancelled", progress: "Goal Mode cancelled by Daniel", completedAt: now, nextRunAt: undefined });
         }
         const approvals = await ctx.db
           .query("approvals")
           .withIndex("by_job", (q: any) => q.eq("jobId", String(job._id)))
-          .collect();
+          .take(20);
         for (const approval of approvals) {
           if (approval.status === "pending") await ctx.db.patch(approval._id, { status: "cancelled", resolvedAt: now });
         }
@@ -1612,7 +1645,7 @@ export const control = mutation({
       await resolveGoalAttention(ctx, args.id);
     } else return false;
     if (externalControl) {
-      await ctx.db.patch(args.id, {
+      await patchMissionWithRuntime(ctx, mission, {
         externalControlRequested: externalControl,
         externalControlUpdatedAt: now,
         externalActionFailures: 0,
