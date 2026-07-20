@@ -81,12 +81,13 @@ function consequentialUse(action: string, clause: string, actionIndex: number): 
   const normalized = action.toLocaleLowerCase("en-GB");
   if (normalized === "message") {
     const before = clause.slice(0, actionIndex).trim();
+    const after = clause.slice(actionIndex + action.length).trim();
     // Repository instructions routinely describe a git commit message, while
     // the consequential meaning is an instruction to message a person. The
     // conjunction splitter keeps "commit this and message the tenant" in a
     // separate clause, so this narrow nominal-use exception cannot waive the
     // external action.
-    if (/\bcommit\b[^.;!?\n]{0,80}$/i.test(before)) return false;
+    if (/\bcommit\b[^.;!?\n]{0,80}$/i.test(before) && /^(?:starting|prefix(?:ed)?|format(?:ted)?|must\s+(?:start|begin)|should\s+(?:start|begin)|:)/i.test(after)) return false;
     if (/\b(?:error|status|progress|validation|log)\s*$/i.test(before)) return false;
   }
   if (normalized !== "order") return true;
