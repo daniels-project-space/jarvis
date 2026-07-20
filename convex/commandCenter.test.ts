@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   COMPACT_WORK_STATUSES,
@@ -24,6 +25,18 @@ function runtime(overrides: Record<string, unknown> = {}) {
 }
 
 describe("commandCenter.snapshot contract", () => {
+  it("defines the exact thread-first active-work index", () => {
+    const schema = readFileSync(new URL("./schema.ts", import.meta.url), "utf8");
+    const jobRuntime = schema.slice(
+      schema.indexOf("jobRuntime: defineTable"),
+      schema.indexOf("missionRuntime: defineTable"),
+    );
+
+    expect(jobRuntime).toContain(
+      '.index("by_thread_visibility_status_priority", ["originThreadId", "visibility", "status", "priority", "createdAt"])',
+    );
+  });
+
   it.each(COMPACT_WORK_STATUSES)("accepts current-conversation %s work", (status) => {
     expect(selectCompactConversationWork([runtime({ status })], currentThread)).toEqual({
       id: "job-active",
@@ -91,13 +104,11 @@ describe("commandCenter.snapshot contract", () => {
       running: [runtime({ jobId: "job-running", priority: 60 })],
       dispatching: [runtime({ jobId: "job-dispatching", status: "dispatching", priority: 90 })],
     };
-    type MockFilter = {
-      eq: (field: string, value: unknown) => MockFilter;
-      field: (field: string) => string;
+    type MockIndex = {
+      eq: (field: string, value: unknown) => MockIndex;
     };
     type MockBuilder = {
-      withIndex: (index: string, apply: (q: MockFilter) => unknown) => MockBuilder;
-      filter: (apply: (q: MockFilter) => unknown) => MockBuilder;
+      withIndex: (index: string, apply: (q: MockIndex) => unknown) => MockBuilder;
       order: (direction: string) => MockBuilder;
       take: (limit: number) => Promise<Array<Record<string, unknown>>>;
       first: () => Promise<Record<string, unknown> | null>;
@@ -113,23 +124,16 @@ describe("commandCenter.snapshot contract", () => {
         query: (table: string) => {
           const read: (typeof reads)[number] = { table, equalities: {} };
           reads.push(read);
-          const filter: MockFilter = {
+          const index: MockIndex = {
             eq(field: string, value: unknown) {
               read.equalities[field] = value;
-              return filter;
-            },
-            field(field: string) {
-              return field;
+              return index;
             },
           };
           const builder: MockBuilder = {
-            withIndex(index: string, apply: (q: typeof filter) => unknown) {
-              read.index = index;
-              apply(filter);
-              return builder;
-            },
-            filter(apply: (q: typeof filter) => unknown) {
-              apply(filter);
+            withIndex(indexName: string, apply: (q: MockIndex) => unknown) {
+              read.index = indexName;
+              apply(index);
               return builder;
             },
             order(direction: string) {
@@ -166,14 +170,14 @@ describe("commandCenter.snapshot contract", () => {
     });
     const expectedRuntimeReads = COMPACT_WORK_STATUSES.map((status) => ({
       table: "jobRuntime",
-      index: "by_visibility_status_priority",
+      index: "by_thread_visibility_status_priority",
       equalities: {
+        originThreadId: currentThread,
         visibility: "conversation",
         status,
-        originThreadId: currentThread,
       },
       order: "desc",
-      limit: 12,
+      limit: 1,
     }));
     expect(reads).toEqual(expectedRuntimeReads);
     expect(reads.some((read) => read.table === "attentionItems" || read.table === "approvals")).toBe(false);
@@ -189,5 +193,22 @@ describe("commandCenter.snapshot contract", () => {
       },
       ...expectedRuntimeReads,
     ]);
+
+    reads.length = 0;
+    rowsByStatus.running = [runtime({ originThreadId: "thread-other" })];
+    rowsByStatus.dispatching = [runtime({ status: "dispatching", visibility: "system" })];
+    expect(await handler(ctx, { threadId: currentThread })).toEqual({ active: null });
+    expect(reads).toEqual(expectedRuntimeReads);
+
+    reads.length = 0;
+    rowsByStatus.running = [runtime({ label: "Cloud health audit" })];
+    rowsByStatus.dispatching = [];
+    expect(await handler(ctx, { threadId: currentThread })).toEqual({ active: null });
+    expect(reads).toEqual(expectedRuntimeReads);
+
+    reads.length = 0;
+    rowsByStatus.running = [];
+    expect(await handler(ctx, { threadId: currentThread })).toEqual({ active: null });
+    expect(reads).toEqual(expectedRuntimeReads);
   });
 });

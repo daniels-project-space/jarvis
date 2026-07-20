@@ -308,6 +308,7 @@ export default defineSchema({
     .index("by_status_heartbeat", ["status", "heartbeatAt"])
     .index("by_status_dispatch_lease", ["status", "dispatchLeaseUntil"])
     .index("by_visibility_status_priority", ["visibility", "status", "priority", "createdAt"])
+    .index("by_thread_visibility_status_priority", ["originThreadId", "visibility", "status", "priority", "createdAt"])
     .index("by_mission", ["missionId", "createdAt"]),
 
   // Orchestrated agent fleets: one mission = a decomposed goal running as
