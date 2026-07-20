@@ -16,6 +16,10 @@ export type WorkApprovalDecision = {
   deliveryMode: WorkDeliveryMode;
 };
 
+export type GoalWorkApprovalInput = WorkApprovalInput & {
+  goalStage: "planning" | "building" | "validating" | "refining";
+};
+
 const NON_MUTATING_OUTCOME =
   /\b(research|investigate|inspect|audit|review|analyse|analyze|compare|summari[sz]e|report|recommend|brainstorm|plan|draft|design|draw|illustrat|write|explain|calculate|model|prototype|test|verify|locate|list)\b/i;
 
@@ -60,4 +64,21 @@ export function workApprovalPolicy(input: WorkApprovalInput): WorkApprovalDecisi
     reason: "unclassified non-repository action defaults to approval",
     deliveryMode: "manual",
   };
+}
+
+/**
+ * Goal Mode's planner and validator are trusted, internally-created review
+ * sessions. Their prompts quote the requested outcome and build evidence, so
+ * the text can legitimately contain words such as "send", "pay" or "delete"
+ * even though the session is explicitly read-only and has no delivery path.
+ *
+ * Keep that narrow provenance decision here instead of weakening the general
+ * consequence classifier: building/refining sessions and every caller-created
+ * job still pass through the normal fail-closed policy.
+ */
+export function goalWorkApprovalPolicy(input: GoalWorkApprovalInput): WorkApprovalDecision {
+  if (input.readonly === true && (input.goalStage === "planning" || input.goalStage === "validating")) {
+    return { required: false, deliveryMode: "read_only" };
+  }
+  return workApprovalPolicy(input);
 }

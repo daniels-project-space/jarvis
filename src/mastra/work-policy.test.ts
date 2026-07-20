@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { workApprovalPolicy } from "../../convex/workPolicy";
+import { goalWorkApprovalPolicy, workApprovalPolicy } from "../../convex/workPolicy";
 import { plannerTask, routeGoal, validatorTask } from "../lib/goal-mode";
 
 describe("server-side work approval policy", () => {
@@ -95,6 +95,33 @@ describe("server-side work approval policy", () => {
       readonly: true,
       risk: "low",
     }).required).toBe(false);
+  });
+
+  it("keeps trusted Goal Mode review sessions moving when their quoted outcome is consequential", () => {
+    const task =
+      "GOAL MODE — SOL/MAX PLANNING SESSION. Plan only; do not act. Quoted outcome: delete production records and send customer replies after explicit approval.";
+
+    // The general policy still fails closed for this text. Only Goal Mode's
+    // internally-created, delivery-disabled review stages receive the bypass.
+    expect(workApprovalPolicy({ task, repo: "daniels-project-space/dropship-ai", readonly: true }).required).toBe(true);
+    expect(goalWorkApprovalPolicy({
+      task,
+      repo: "daniels-project-space/dropship-ai",
+      readonly: true,
+      goalStage: "planning",
+    })).toMatchObject({ required: false, deliveryMode: "read_only" });
+    expect(goalWorkApprovalPolicy({
+      task,
+      repo: "daniels-project-space/dropship-ai",
+      readonly: true,
+      goalStage: "validating",
+    })).toMatchObject({ required: false, deliveryMode: "read_only" });
+    expect(goalWorkApprovalPolicy({
+      task,
+      repo: "daniels-project-space/dropship-ai",
+      readonly: true,
+      goalStage: "building",
+    }).required).toBe(true);
   });
 
   it("does not mistake a no-POST evidence boundary for a POST request", () => {

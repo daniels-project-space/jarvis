@@ -1,7 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
-import { workApprovalPolicy } from "./workPolicy";
+import { goalWorkApprovalPolicy } from "./workPolicy";
 import {
   goalBranch,
   goalJobRunnableForMission,
@@ -128,7 +128,7 @@ export const latestCoordinatorReceipt = query({
 
 async function insertGoalJob(ctx: any, input: GoalJobInput) {
   const now = Date.now();
-  const approval = workApprovalPolicy(input);
+  const approval = goalWorkApprovalPolicy(input);
   const approvalRequired = approval.required;
   const status = approvalRequired ? "awaiting_approval" : "pending";
   const jobId = await ctx.db.insert("jobs", {
