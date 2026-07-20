@@ -4,6 +4,7 @@ import {
   buildProviderReleasePlan,
   providerKindsForPaths,
   runProviderReleaseBarrier,
+  vercelProjectIdentityMismatch,
   type ProviderReleaseState,
   type ProviderStepReceipt,
 } from "./provider-release";
@@ -59,6 +60,33 @@ describe("trusted provider release planning", () => {
     expect(plan.required).toBe(true);
     expect(plan.valid).toBe(false);
     expect(plan.note).toContain("exact trusted release boundary is missing");
+  });
+
+  it("enforces the stable Vercel project, team, Git route and production alias", () => {
+    const boundary = jarvisPlan(["convex/schema.ts"]).boundary!.vercel;
+    const observed = {
+      id: "prj_JarvisStableId",
+      name: "jarvis",
+      accountId: "team_VY2PwHgXLV9Bo0vs2iXdnGxw",
+      link: {
+        type: "github",
+        org: "daniels-project-space",
+        repo: "jarvis",
+        productionBranch: "main",
+      },
+      alias: [{ domain: "jarvis-orcin-six.vercel.app" }],
+    };
+    expect(vercelProjectIdentityMismatch(boundary, observed)).toBeNull();
+    expect(vercelProjectIdentityMismatch({ ...boundary, projectId: "prj_Expected" }, observed))
+      .toContain("wrong stable project id");
+    expect(vercelProjectIdentityMismatch(boundary, {
+      ...observed,
+      link: { ...observed.link, repo: "dropship-ai" },
+    })).toContain("does not match");
+    expect(vercelProjectIdentityMismatch(boundary, {
+      ...observed,
+      alias: [{ domain: "another-project.vercel.app" }],
+    })).toContain("was not independently observed");
   });
 
   it("leaves ordinary code-only delivery on the no-prerequisite fast path", async () => {
@@ -145,6 +173,53 @@ describe("durable two-phase provider barrier", () => {
     expect(resumed.status === "ready" && resumed.state.attempts).toBe(2);
   });
 
+  it("preserves a staged provider handoff when a later operation fails", async () => {
+    const plan = jarvisPlan(["src/trigger/agent-runner.ts"]);
+    const version = "20260720.7";
+    const first = await runProviderReleaseBarrier(plan, undefined, {
+      persist: async () => true,
+      execute: async ({ step, checkpoint }) => {
+        if (step.kind === "vercel_identity") {
+          return { id: step.id, status: "verified", proof: step.target };
+        }
+        await checkpoint({
+          id: step.id,
+          status: "deploying",
+          version,
+          runId: "run_attestor_1",
+          proof: "new-version handoff persisted",
+          data: { staged: true, pinnedRunId: "run_attestor_1" },
+        });
+        throw new Error("attestor temporarily unavailable");
+      },
+      reverify: async ({ prior }) => prior,
+      now: () => 100,
+    });
+    expect(first.status).toBe("blocked");
+    const blocked = first.status === "blocked" ? first.state : undefined;
+    expect(blocked?.steps.at(-1)).toMatchObject({
+      status: "failed",
+      version,
+      runId: "run_attestor_1",
+      data: { staged: true, pinnedRunId: "run_attestor_1" },
+    });
+
+    const resumedPriors: ProviderStepReceipt[] = [];
+    const resumed = await runProviderReleaseBarrier(plan, blocked, {
+      persist: async () => true,
+      execute: async ({ step, prior }) => {
+        resumedPriors.push(prior);
+        return { ...prior, id: step.id, status: "verified", proof: "handoff resumed" };
+      },
+      reverify: async ({ prior }) => prior,
+      now: () => 200,
+    });
+    expect(resumed.status).toBe("ready");
+    expect(resumedPriors).toEqual([
+      expect.objectContaining({ version, runId: "run_attestor_1" }),
+    ]);
+  });
+
   it("rejects a stale or mismatched release receipt at finalization", () => {
     const readyRelease: ProviderReleaseState = {
       releaseId: `providers-v1:${"c".repeat(64)}`,
@@ -174,4 +249,3 @@ describe("durable two-phase provider barrier", () => {
     })).toBe(true);
   });
 });
-

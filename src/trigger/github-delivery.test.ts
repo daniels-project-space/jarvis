@@ -158,6 +158,36 @@ describe("autonomous GitHub delivery", () => {
     expect(fetchImpl.mock.calls.some(([, init]) => init?.method === "PUT")).toBe(false);
   });
 
+  it("does not submit the merge until the exact provider gate is ready", async () => {
+    const headSha = "abc123abc123abc123abc123abc123abc123abcd";
+    const events: string[] = [];
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/pulls/42")) return response(200, inspectedPull(headSha));
+      if (url.includes("/pulls/42/files")) return response(200, [{ filename: "convex/schema.ts" }]);
+      if (url.endsWith("/pulls/42/merge") && init?.method === "PUT") {
+        events.push("merge");
+        return response(200, { merged: true, sha: "merge123", message: "merged" });
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    const result = await mergeVerifiedPullRequest({
+      repo: "daniels-project-space/jarvis",
+      pull: { number: 42, url: "https://github.test/42", headSha },
+      title: "Paul: provider fix",
+      token: "token",
+      releaseGate: async (change) => {
+        events.push("providers-ready");
+        expect(change.changedPaths).toEqual(["convex/schema.ts"]);
+        return { status: "ready", note: "exact prerequisites attested", headSha };
+      },
+      fetchImpl: fetchImpl as typeof fetch,
+      sleep: async () => undefined,
+    });
+    expect(result.status).toBe("merged");
+    expect(events).toEqual(["providers-ready", "merge"]);
+  });
+
   it("rejects a provider proof for any head other than the exact PR head", async () => {
     const headSha = "abc123abc123abc123abc123abc123abc123abcd";
     const fetchImpl = vi.fn()
