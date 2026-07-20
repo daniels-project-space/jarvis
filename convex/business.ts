@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { requestContextRefresh } from "./contextProjection";
 
 // Per-domain live business snapshots (rentals, youtube, music, wealth, ads).
 export const upsert = mutation({
@@ -17,9 +18,17 @@ export const upsert = mutation({
       .query("businessState")
       .withIndex("by_domain", (q: any) => q.eq("domain", a.domain))
       .first();
+    if (
+      existing
+      && existing.headline === a.headline
+      && existing.detail === a.detail
+      && JSON.stringify(existing.data ?? null) === JSON.stringify(a.data ?? null)
+    ) return existing._id;
     const row = { domain: a.domain, headline: a.headline, detail: a.detail, data: a.data, updatedAt: Date.now() };
+    const id = existing ? existing._id : await ctx.db.insert("businessState", row);
     if (existing) await ctx.db.patch(existing._id, row);
-    else await ctx.db.insert("businessState", row);
+    await requestContextRefresh(ctx, ["business"]);
+    return id;
   },
 });
 

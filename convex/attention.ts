@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { upsertAttentionWithContext } from "./contextProjection";
 
 export const upsert = mutation({
   args: {
@@ -25,7 +26,6 @@ export const upsert = mutation({
       .query("attentionItems")
       .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", a.fingerprint))
       .first();
-    const now = Date.now();
     const doc = {
       ...input,
       title: input.title.slice(0, 140),
@@ -34,13 +34,8 @@ export const upsert = mutation({
       urgency: Math.max(0, Math.min(100, input.urgency)),
       confidence: Math.max(0, Math.min(1, input.confidence)),
       status: input.status ?? existing?.status ?? "open",
-      updatedAt: now,
     };
-    if (existing) {
-      await ctx.db.patch(existing._id, doc);
-      return existing._id;
-    }
-    return await ctx.db.insert("attentionItems", { ...doc, createdAt: now });
+    return (await upsertAttentionWithContext(ctx, existing, doc)).id;
   },
 });
 
@@ -66,6 +61,9 @@ export const resolve = mutation({
   args: { id: v.id("attentionItems"), status: v.string(), ...actorAuthArgs },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
-    await ctx.db.patch(a.id, { status: a.status, updatedAt: Date.now() });
+    const existing = await ctx.db.get(a.id);
+    if (!existing) return false;
+    await upsertAttentionWithContext(ctx, existing, { ...existing, status: a.status });
+    return true;
   },
 });

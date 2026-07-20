@@ -9,15 +9,19 @@ import {
   requireViewer,
   viewerAuthArgs,
 } from "./controlAuth";
+import { requestContextRefresh } from "./contextProjection";
 
 export const setPanel = mutation({
   args: { type: v.string(), value: v.string(), title: v.optional(v.string()), ...dispatcherAuthArgs },
   handler: async (ctx, a) => {
     await requireDispatcher(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first();
+    if (ex && ex.type === a.type && ex.value === a.value && ex.title === a.title) return ex._id;
     const doc = { key: "panel", type: a.type, value: a.value, title: a.title, updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
     else await ctx.db.insert("ui", doc);
+    await requestContextRefresh(ctx, ["ui"]);
+    return ex?._id;
   },
 });
 
@@ -26,7 +30,10 @@ export const clearPanel = mutation({
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first();
-    if (ex) await ctx.db.delete(ex._id);
+    if (ex) {
+      await ctx.db.delete(ex._id);
+      await requestContextRefresh(ctx, ["ui"]);
+    }
   },
 });
 
@@ -230,9 +237,13 @@ export const setLocation = mutation({
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "location")).first();
-    const doc = { key: "location", type: "location", value: `${a.lat},${a.lng}`, title: a.label, updatedAt: Date.now() };
+    const value = `${a.lat},${a.lng}`;
+    if (ex && ex.type === "location" && ex.value === value && ex.title === a.label) return ex._id;
+    const doc = { key: "location", type: "location", value, title: a.label, updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
     else await ctx.db.insert("ui", doc);
+    await requestContextRefresh(ctx, ["ui"]);
+    return ex?._id;
   },
 });
 export const getLocation = query({

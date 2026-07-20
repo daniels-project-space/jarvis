@@ -309,7 +309,8 @@ export default defineSchema({
     .index("by_status_dispatch_lease", ["status", "dispatchLeaseUntil"])
     .index("by_visibility_status_priority", ["visibility", "status", "priority", "createdAt"])
     .index("by_thread_visibility_status_priority", ["originThreadId", "visibility", "status", "priority", "createdAt"])
-    .index("by_mission", ["missionId", "createdAt"]),
+    .index("by_mission", ["missionId", "createdAt"])
+    .index("by_updatedAt", ["updatedAt"]),
 
   // Orchestrated agent fleets: one mission = a decomposed goal running as
   // parallel jobs; when the last one lands, a synthesis pass merges the
@@ -414,6 +415,7 @@ export default defineSchema({
     .index("by_mission", ["missionId"])
     .index("by_createdAt", ["createdAt"])
     .index("by_status", ["status", "createdAt"])
+    .index("by_mode_status_priority", ["mode", "status", "priority", "createdAt"])
     .index("by_external_control", ["externalControlRequested", "createdAt"])
     .index("by_external_revision", ["externalRevisionRequested", "createdAt"]),
 
@@ -651,6 +653,87 @@ export default defineSchema({
     .index("by_project", ["project", "updatedAt"])
     .index("by_thread", ["threadId", "updatedAt"])
     .index("by_updatedAt", ["updatedAt"]),
+
+  // Perplexity-Brain-style foreground read model. Conversation turns read one
+  // compact projection plus at most four compact lexical memory hits instead
+  // of reconstructing context from the operational tables. Refresh state is
+  // deliberately separate so scheduler bookkeeping never fattens the hot row.
+  brainContextProjection: defineTable({
+    key: v.string(),
+    version: v.number(),
+    payload: v.any(),
+    payloadBytes: v.number(),
+    generatedAt: v.number(),
+  }).index("by_key", ["key"]),
+
+  brainContextRefresh: defineTable({
+    key: v.string(),
+    version: v.number(),
+    generation: v.number(),
+    dirtySources: v.array(v.string()),
+    requestedAt: v.number(),
+    scheduledAt: v.optional(v.number()),
+    lastCompletedAt: v.optional(v.number()),
+    lastError: v.optional(v.string()),
+    memoryCursor: v.optional(v.string()),
+    memoryComplete: v.boolean(),
+    memoryVersion: v.number(),
+    memoryBackfillScheduledAt: v.optional(v.number()),
+    // Version-gated, resumable migration for the four operational active sets.
+    // Optional fields keep a pre-v2 refresh row deployable; v2 never consumes
+    // the rank index until activeIndexComplete is true for the exact version.
+    activeIndexVersion: v.optional(v.number()),
+    activeIndexComplete: v.optional(v.boolean()),
+    activeBackfillSource: v.optional(v.string()),
+    activeBackfillCursor: v.optional(v.string()),
+    activeBackfillScheduledAt: v.optional(v.number()),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
+
+  // Complete active/rank read model for the background context builder. Each
+  // source writer maintains its row atomically; a versioned bounded migration
+  // covers rows that existed before this table was introduced.
+  brainContextActive: defineTable({
+    version: v.number(),
+    source: v.string(), // job | mission | goal | attention
+    sourceId: v.string(),
+    rank: v.number(),
+    tieBreakAt: v.number(),
+    payload: v.any(),
+    materialKey: v.string(),
+    sourceUpdatedAt: v.number(),
+  })
+    .index("by_source_id", ["source", "sourceId"])
+    .index("by_version_source_rank", ["version", "source", "rank", "tieBreakAt"]),
+
+  // Searchable memory DTOs are bounded at write/backfill time. The source
+  // memory rows remain untouched and retain their richer R2 pointers.
+  brainMemory: defineTable({
+    sourceId: v.id("memory"),
+    kind: v.string(),
+    title: v.string(),
+    body: v.string(),
+    tags: v.array(v.string()),
+    searchText: v.string(),
+    sourceCreatedAt: v.number(),
+    sourceUpdatedAt: v.number(),
+  })
+    .index("by_source", ["sourceId"])
+    .index("by_updatedAt", ["sourceUpdatedAt"])
+    .searchIndex("search_text", { searchField: "searchText", filterFields: ["kind"] }),
+
+  // The ten-minute proactive pass remembers only its bounded active signal
+  // fingerprints. A one-time cursor cleans legacy proactive attention rows;
+  // steady-state reconciles use point indexes and perform zero full scans.
+  proactiveReconcileState: defineTable({
+    key: v.string(),
+    version: v.number(),
+    activeFingerprints: v.array(v.string()),
+    legacyCursor: v.optional(v.string()),
+    legacyComplete: v.boolean(),
+    legacyScheduledAt: v.optional(v.number()),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
 
   // Storage-only archive from the retired model-generated insight loop. The
   // 50 historical rows remain untouched; attentionItems is the live queue.

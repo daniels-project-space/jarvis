@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { requestContextRefresh } from "./contextProjection";
 
 // Snapshot of each app's cloud-stack health, written by the stack-poller Trigger
 // task and injected into the brain so JARVIS can answer "state of my apps".
@@ -18,9 +19,17 @@ export const upsert = mutation({
       .query("projectState")
       .withIndex("by_slug", (q: any) => q.eq("slug", a.slug))
       .first();
+    if (
+      ex
+      && ex.status === a.status
+      && ex.summary === a.summary
+      && JSON.stringify(ex.data ?? null) === JSON.stringify(a.data ?? null)
+    ) return ex._id;
     const doc = { slug: a.slug, status: a.status, summary: a.summary, data: a.data, updatedAt: Date.now() };
+    const id = ex ? ex._id : await ctx.db.insert("projectState", doc);
     if (ex) await ctx.db.patch(ex._id, doc);
-    else await ctx.db.insert("projectState", doc);
+    await requestContextRefresh(ctx, ["projects"]);
+    return id;
   },
 });
 
@@ -34,10 +43,18 @@ export const sync = mutation({
   },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
-    const current = await ctx.db.query("projectState").collect();
-    const bySlug = new Map(current.map((row) => [row.slug, row]));
+    const inputs = a.projects.slice(0, 80);
+    const current = await Promise.all(
+      inputs.map((input) =>
+        ctx.db
+          .query("projectState")
+          .withIndex("by_slug", (q: any) => q.eq("slug", input.slug.slice(0, 80)))
+          .first(),
+      ),
+    );
+    const bySlug = new Map(current.filter(Boolean).map((row: any) => [row.slug, row]));
     const changed: string[] = [];
-    for (const input of a.projects.slice(0, 80)) {
+    for (const input of inputs) {
       const row = bySlug.get(input.slug);
       const doc = {
         slug: input.slug.slice(0, 80),
@@ -51,6 +68,7 @@ export const sync = mutation({
       else await ctx.db.insert("projectState", next);
       changed.push(doc.slug);
     }
+    if (changed.length) await requestContextRefresh(ctx, ["projects"]);
     return { changed, total: a.projects.length };
   },
 });

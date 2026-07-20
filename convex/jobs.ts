@@ -17,6 +17,11 @@ import {
   upsertJobRuntime,
   upsertMissionRuntime,
 } from "./controlPlane";
+import {
+  requestContextRefresh,
+  syncContextActiveRow,
+  upsertAttentionWithContext,
+} from "./contextProjection";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
 const DISPATCH_LEASE_MS = 2 * 60 * 1000;
@@ -707,10 +712,10 @@ export const finalize = mutation({
       .withIndex("by_jobId", (q: any) => q.eq("jobId", String(a.jobId)))
       .first();
     if (ownedAttention) {
-      await ctx.db.patch(ownedAttention._id, {
+      await upsertAttentionWithContext(ctx, ownedAttention, {
+        ...ownedAttention,
         status: success ? "resolved" : "open",
-        updatedAt: now,
-      });
+      }, now);
     }
     return true;
   },
@@ -894,8 +899,11 @@ export const updateProgress = mutation({
     if (a.stage !== undefined) patch.stage = a.stage.slice(0, 80);
     patch.updatedAt = now;
     await ctx.db.patch(row._id, patch);
-    const meaningful = (a.stage && a.stage !== row.stage) || (percent ?? 0) - (row.percent ?? 0) >= 10;
-    if (meaningful)
+    const meaningful =
+      (a.stage && a.stage !== row.stage)
+      || Math.floor((percent ?? 0) / 10) !== Math.floor((row.percent ?? 0) / 10);
+    if (meaningful) {
+      await syncContextActiveRow(ctx, "job", { ...row, ...patch });
       await ctx.db.insert("workEvents", {
         jobId: String(a.jobId),
         missionId: row.missionId,
@@ -906,6 +914,8 @@ export const updateProgress = mutation({
         percent,
         createdAt: now,
       });
+      await requestContextRefresh(ctx, ["work"]);
+    }
     return true;
   },
 });
@@ -1066,10 +1076,8 @@ export const requestInput = mutation({
       actionClass: "ask",
       status: "open",
       jobId: String(a.jobId),
-      updatedAt: now,
     };
-    if (existing) await ctx.db.patch(existing._id, item);
-    else await ctx.db.insert("attentionItems", { ...item, createdAt: now });
+    await upsertAttentionWithContext(ctx, existing, item, now);
     await ctx.db.insert("workEvents", {
       jobId: String(a.jobId),
       missionId: row.missionId,
@@ -1104,7 +1112,9 @@ export const provideInput = mutation({
       .query("attentionItems")
       .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", `job-input:${a.jobId}`))
       .first();
-    if (attention) await ctx.db.patch(attention._id, { status: "resolved", updatedAt: now });
+    if (attention) {
+      await upsertAttentionWithContext(ctx, attention, { ...attention, status: "resolved" }, now);
+    }
     await ctx.db.insert("workEvents", {
       jobId: String(a.jobId),
       missionId: row.missionId,
