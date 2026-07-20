@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { workApprovalPolicy } from "../../convex/workPolicy";
+import { SHALLOW_PROVENANCE_RULE } from "./git-delivery";
 import { repairPrompt } from "./repair-prompt";
+import { TEAM_BY_SLUG } from "../mastra/team";
 
 describe("self-repair prompt", () => {
   it("stays repository-scoped instead of approval-gating its own repair worker", () => {
@@ -13,5 +15,7 @@ describe("self-repair prompt", () => {
     }, "jarvis");
     expect(workApprovalPolicy({ task, repo: "jarvis", risk: "high" }).required).toBe(false);
     expect(task).toContain("you cannot deploy those");
+    expect(task).toContain(SHALLOW_PROVENANCE_RULE);
+    expect(TEAM_BY_SLUG.paul.instructions).toContain(SHALLOW_PROVENANCE_RULE);
   });
 });

@@ -5,6 +5,7 @@ import { r2Put, r2StoreFromUrl } from "./r2";
 import type { ManagedMission } from "../mastra/supervisor";
 import { withAdminSession } from "./control-context";
 import { wakeAgentFleet } from "./agent-fleet-dispatch";
+import { SHALLOW_PROVENANCE_RULE } from "./git-delivery";
 import { workModelLabel, workModelPriority } from "./work-models";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
 import {
@@ -1064,6 +1065,7 @@ const SELF_IMPROVE_RULES =
   "full diff line by line (the clone has no node_modules; Vercel's build is the gate and a failed deploy auto-files an " +
   "incident straight back to a repair agent). For multi-file or risky changes, run 'npm install' then 'npx tsc --noEmit' " +
   "and 'npm run build' — they must pass. Commit only working code, message starting 'self-improve:'. Work on the runner's isolated branch; the controller owns verified merge and delivery, so never push directly to main or claim production is live. " +
+  `${SHALLOW_PROVENANCE_RULE} Never replace or reparent a persisted shared branch based on a truncated revision walk. ` +
   "If the change truly requires convex/ schema or src/trigger/ edits, keep them minimal and state clearly in your final " +
   "answer which provider deployment remains to be verified; the controller continues delivery without asking Daniel. Never remove existing capabilities.";
 
@@ -3597,7 +3599,8 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           `SELF-REPAIR: trace the ROOT CAUSE and fix it — never paper over symptoms. Daniel reports: ${problem}\n` +
           `Method: 1) REPRODUCE (hit live endpoints, read the failing path). 2) Trace to the underlying cause. ` +
           `3) Minimal correct fix. 4) VALIDATE: 'npm install' + 'npx tsc --noEmit' must pass; 'npm run build' must pass for app code. ` +
-          `5) Commit only working code ("self-repair: ..."). If it needs convex/ or src/trigger/ redeploy, commit and say so plainly.`,
+          `5) Commit only working code ("self-repair: ..."). ${SHALLOW_PROVENANCE_RULE} Never replace or reparent a persisted shared branch based on a truncated revision walk. ` +
+          `If it needs convex/ or src/trigger/ redeploy, commit and say so plainly.`,
         repo: app ?? "jarvis",
         model: "sol",
         incidentId: String(incidentId),

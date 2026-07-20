@@ -35,7 +35,14 @@ import {
   isPermittedReadonlyAccessGap,
   supervisorDeliveryBoundary,
 } from "../lib/work-verification";
-import { gitDeliveryDisposition, isNonFastForwardPush } from "../lib/git-delivery";
+import {
+  ensureCompleteRepositoryHistory,
+  gitCommitIsAncestor,
+  gitDeliveryDisposition,
+  isNonFastForwardPush,
+  reconcileSharedBranch,
+  SHALLOW_PROVENANCE_RULE,
+} from "../lib/git-delivery";
 import { repairPrompt } from "../lib/repair-prompt";
 import {
   isOwnedRepository,
@@ -594,6 +601,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         `## Conventions\n- The runner supplies the repository when one is in scope; do not clone or push another repository.\n` +
         `- Toolchain: curl, git, node, npm, npx and gh were verified before this lease. Use them through Codex's shell tool. Live web search is enabled for current information.\n` +
         `- The repository is already checked out for you. GitHub credentials remain with the delivery controller; use gh only for public/read-only inspection and report if a remote authenticated operation is required.\n` +
+        `- ${SHALLOW_PROVENANCE_RULE} Never replace, reparent, or rewrite a persisted shared branch because a depth-limited checkout hides its parents.\n` +
         `- Never invent results. If something is inaccessible, say so plainly in your final answer.\n` +
         `- Final answer style: plain text, the key outcome first, under 300 words.\n`,
     );
@@ -871,47 +879,84 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         }
         let baseSha = "";
         let cloneFailed = false;
+        let cloneFailureReason = "";
+        let checkoutSourceBranch = "";
         if (repo && token) {
           const dir = `/tmp/work/${repo.replace(/[^a-zA-Z0-9]/g, "_")}_${jobKey}`;
           rmSync(dir, { recursive: true, force: true });
           const url = githubRepoUrl(repo);
           const gitEnv = githubGitEnv(env, token);
+          let cloneReady = false;
           if (job.branch) {
-            await sh("git", ["clone", "--depth", "1", "--single-branch", "--branch", String(job.branch), url, dir], gitEnv);
+            const cloned = await sh(
+              "git",
+              ["clone", "--depth", "1", "--single-branch", "--branch", String(job.branch), url, dir],
+              gitEnv,
+            );
+            cloneReady = cloned.code === 0 && existsSync(join(dir, ".git"));
+            if (cloneReady) checkoutSourceBranch = String(job.branch);
           }
-          if (!existsSync(join(dir, ".git"))) {
+          if (!cloneReady) {
             rmSync(dir, { recursive: true, force: true });
-            await sh("git", ["clone", "--depth", "1", url, dir], gitEnv);
+            const cloned = await sh("git", ["clone", "--depth", "1", url, dir], gitEnv);
+            cloneReady = cloned.code === 0 && existsSync(join(dir, ".git"));
           }
-          if (existsSync(join(dir, ".git"))) {
-            cwd = dir;
-            repoDir = dir;
+          if (cloneReady) {
             // Defense in depth: the subprocess only ever sees a credential-free
             // remote even if Git changes clone credential persistence behavior.
             await sh("git", ["-C", dir, "remote", "set-url", "origin", url], env);
             await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
             await sh("git", ["-C", dir, "config", "user.name", `${profile.name} via JARVIS`], env);
-            baseSha = (await sh("git", ["-C", dir, "rev-parse", "HEAD"], env)).out.trim();
-            if (branch) await sh("git", ["-C", dir, "checkout", "-B", branch], env);
-            if (branch)
-              await convexMutation("jobs:setDelivery", {
-                jobId: job.jobId,
-                expectedAttempt,
-                branch,
-                deliveryStatus: "branch",
-              }).catch(() => {});
-            context = job.readonly
-              ? `Your working directory is a read-only checkout of ${repo}. Inspect it deeply, but do not edit or commit.`
-              : `Your working directory is an isolated checkout of ${repo} on branch ${branch}. Actually perform the scoped task. You may edit and commit here; never push, merge, deploy, or switch branches because the runner owns delivery.`;
-            const providerBoundary = projectProviderBoundary(repo);
-            if (providerBoundary) context += `\n\n${providerBoundary}`;
+            if (!checkoutSourceBranch) {
+              checkoutSourceBranch = (
+                await sh("git", ["-C", dir, "branch", "--show-current"], env)
+              ).out.trim();
+            }
+            const history = await ensureCompleteRepositoryHistory({
+              runGit: (args) => sh("git", ["-C", dir, ...args], gitEnv),
+              remote: url,
+              sourceBranch: checkoutSourceBranch,
+            });
+            if (!history.ok) {
+              cloneFailed = true;
+              cloneFailureReason = `${SHALLOW_PROVENANCE_RULE} Safe checkout preparation failed: ${history.note}`;
+              context = `${cloneFailureReason} Do not inspect the incomplete checkout or pretend repository work was performed.`;
+            } else {
+              baseSha = (await sh("git", ["-C", dir, "rev-parse", "HEAD"], env)).out.trim();
+              const checkedOut = branch
+                ? await sh("git", ["-C", dir, "checkout", "-B", branch], env)
+                : { code: 0, out: "" };
+              if (!baseSha || checkedOut.code !== 0) {
+                cloneFailed = true;
+                cloneFailureReason = `The canonical checkout tip or isolated branch ${branch || "HEAD"} could not be prepared safely.`;
+                context = `${cloneFailureReason} Do not pretend repository work was performed.`;
+              } else {
+                cwd = dir;
+                repoDir = dir;
+                if (branch)
+                  await convexMutation("jobs:setDelivery", {
+                    jobId: job.jobId,
+                    expectedAttempt,
+                    branch,
+                    deliveryStatus: "branch",
+                  }).catch(() => {});
+                context = job.readonly
+                  ? `Your working directory is a read-only checkout of ${repo}. Inspect it deeply, but do not edit or commit.`
+                  : `Your working directory is an isolated checkout of ${repo} on branch ${branch}. Actually perform the scoped task. You may edit and commit here; never push, merge, deploy, or switch branches because the runner owns delivery.`;
+                context += `\n\nRepository lineage rule: ${SHALLOW_PROVENANCE_RULE} The runner hydrated the exact ancestry for ${checkoutSourceBranch} before this session. Treat a persisted shared branch as canonical; never manufacture replacement commits from a truncated revision walk.`;
+                const providerBoundary = projectProviderBoundary(repo);
+                if (providerBoundary) context += `\n\n${providerBoundary}`;
+              }
+            }
           } else {
             cloneFailed = true;
-            context = `The scoped repository ${repo} could not be cloned. Do not pretend you edited it. State the access/repository failure and what remains blocked.`;
+            cloneFailureReason = `The scoped repository ${repo} could not be cloned.`;
+            context = `${cloneFailureReason} Do not pretend you edited it. State the access/repository failure and what remains blocked.`;
           }
         } else if (repo && !token) {
           cloneFailed = true;
-          context = `Repository work was requested for ${repo}, but the runner has no GitHub transport credential. Do not pretend the repository was changed.`;
+          cloneFailureReason = `Repository work was requested for ${repo}, but the runner has no GitHub transport credential.`;
+          context = `${cloneFailureReason} Do not pretend the repository was changed.`;
         }
         if (await stopIfLeaseLost("Execution stopped while preparing the secure workspace.", "", branch)) return;
         const criteria = Array.isArray(job.acceptanceCriteria) && job.acceptanceCriteria.length
@@ -1009,66 +1054,68 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         let deliveryDiffStat = "";
         let changed = false;
         if (repoDir && token && branch && !job.readonly) {
+          const deliveryDir = repoDir;
           const pushUrl = githubRepoUrl(repo);
           const gitEnv = githubGitEnv(env, token);
-          await sh("git", ["-C", repoDir, "add", "-A"], env);
+          const runGit = (args: string[]) => sh("git", ["-C", deliveryDir, ...args], gitEnv);
+          await sh("git", ["-C", deliveryDir, "add", "-A"], env);
           await sh(
             "git",
-            ["-C", repoDir, "commit", "-m", `chore: ${profile.name.toLowerCase()} — ${job.task.slice(0, 60).replace(/"/g, "'")}`],
+            ["-C", deliveryDir, "commit", "-m", `chore: ${profile.name.toLowerCase()} — ${job.task.slice(0, 60).replace(/"/g, "'")}`],
             env,
           );
-          let local = (await sh("git", ["-C", repoDir, "rev-parse", "HEAD"], env)).out.trim();
+          let local = (await sh("git", ["-C", deliveryDir, "rev-parse", "HEAD"], env)).out.trim();
           if (baseSha && local && local !== baseSha) {
-            deliveryDiffStat = (await sh("git", ["-C", repoDir, "diff", "--stat", `${baseSha}..${local}`], env)).out
+            deliveryDiffStat = (await sh("git", ["-C", deliveryDir, "diff", "--stat", `${baseSha}..${local}`], env)).out
               .trim()
               .slice(0, 1_500);
           }
-          const remote = (await sh("git", ["-C", repoDir, "ls-remote", pushUrl, `refs/heads/${branch}`], gitEnv)).out.split(/\s/)[0]?.trim();
+          const history = await ensureCompleteRepositoryHistory({
+            runGit,
+            remote: pushUrl,
+            sourceBranch: checkoutSourceBranch,
+          });
+          if (!history.ok) {
+            deliveryRetry = true;
+            pushNote = `${SHALLOW_PROVENANCE_RULE} ${history.note}; retrying from canonical branch ${branch}`;
+          }
+          const remote = (await runGit(["ls-remote", pushUrl, `refs/heads/${branch}`])).out.split(/\s/)[0]?.trim();
           let needsPush = gitDeliveryDisposition({ baseSha, localSha: local, remoteSha: remote }) !== "noop";
-          if (!needsPush) {
+          if (deliveryRetry) {
+            // An incomplete graph is never used to judge or modify lineage.
+          } else if (!needsPush) {
             pushNote = remote && remote !== baseSha
               ? `newer checkpoint branch ${branch} retained without overwrite`
               : remote ? `existing checkpoint branch ${branch} retained` : "no repository changes were needed";
           } else {
-            if (gitDeliveryDisposition({ baseSha, localSha: local, remoteSha: remote }) === "reconcile") {
-              const remoteRef = "refs/remotes/jarvis-delivery/current";
-              const fetched = await sh(
-                "git",
-                ["-C", repoDir, "fetch", "--no-tags", "--depth", "50", pushUrl, `+refs/heads/${branch}:${remoteRef}`],
-                gitEnv,
-              );
-              if (fetched.code !== 0) {
+            if (remote) {
+              const reconciliation = await reconcileSharedBranch({
+                runGit,
+                remote: pushUrl,
+                branch,
+                historySourceBranch: checkoutSourceBranch,
+                baseSha,
+                localSha: local,
+              });
+              local = reconciliation.localSha;
+              pushNote = reconciliation.note;
+              if (reconciliation.status === "already_delivered") {
+                needsPush = false;
+              } else if (reconciliation.status === "retry") {
                 deliveryRetry = true;
-                pushNote = `shared branch ${branch} advanced; remote refresh will retry from a checkpoint`;
-              } else {
-                const localAlreadyDelivered = await sh("git", ["-C", repoDir, "merge-base", "--is-ancestor", local, remoteRef], env);
-                const remoteAlreadyIntegrated = await sh("git", ["-C", repoDir, "merge-base", "--is-ancestor", remoteRef, local], env);
-                if (localAlreadyDelivered.code === 0) {
-                  needsPush = false;
-                  pushNote = `newer checkpoint branch ${branch} already contains this delivery`;
-                } else if (remoteAlreadyIntegrated.code !== 0 && baseSha) {
-                  const rebased = await sh("git", ["-C", repoDir, "rebase", "--onto", remoteRef, baseSha], env);
-                  if (rebased.code !== 0) {
-                    await sh("git", ["-C", repoDir, "rebase", "--abort"], env);
-                    deliveryRetry = true;
-                    pushNote = `shared branch ${branch} changed concurrently; the bounded work is checkpointed for a clean replay`;
-                  } else {
-                    local = (await sh("git", ["-C", repoDir, "rev-parse", "HEAD"], env)).out.trim();
-                    pushNote = `local delivery rebased onto the newer checkpoint branch ${branch}`;
-                  }
-                } else if (remoteAlreadyIntegrated.code !== 0) {
-                  deliveryRetry = true;
-                  pushNote = `shared branch ${branch} changed without a usable base; retrying from its latest checkpoint`;
-                }
+              }
+            } else {
+              const continuesFromBase = await gitCommitIsAncestor(runGit, baseSha, local);
+              if (continuesFromBase !== true) {
+                deliveryRetry = true;
+                pushNote = continuesFromBase === null
+                  ? `local lineage could not be verified; retrying from canonical base ${baseSha}`
+                  : `local history does not descend from canonical base ${baseSha}; replacement history will not be pushed`;
               }
             }
             if (needsPush && !deliveryRetry) {
               if (await stopIfLeaseLost(checkpointText, result, branch)) return;
-              let push = await sh("git", ["-C", repoDir, "push", pushUrl, `HEAD:refs/heads/${branch}`], gitEnv);
-              if (/shallow update not allowed/i.test(push.out)) {
-                await sh("git", ["-C", repoDir, "fetch", "--unshallow"], gitEnv);
-                push = await sh("git", ["-C", repoDir, "push", pushUrl, `HEAD:refs/heads/${branch}`], gitEnv);
-              }
+              const push = await runGit(["push", pushUrl, `HEAD:refs/heads/${branch}`]);
               if (push.code !== 0 && isNonFastForwardPush(push.out)) {
                 deliveryRetry = true;
                 pushNote = `shared branch ${branch} advanced again during delivery; retrying from the new head`;
@@ -1130,7 +1177,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             jobId: job.jobId,
             expectedAttempt,
             checkpoint: [
-              "The shared checkpoint branch advanced during this bounded session. No history was overwritten and no force push was attempted.",
+              `The next attempt must resume from the canonical shared branch. Its commits were preserved; no history was overwritten and no force push was attempted. ${SHALLOW_PROVENANCE_RULE}`,
               pushNote,
               deliveryDiffStat ? `Local diff summary to replay only if still missing:\n${deliveryDiffStat}` : "",
               continuationCheckpoint,
@@ -1150,7 +1197,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         }
 
         if (cloneFailed || pushFailed) {
-          const failure = cloneFailed ? `Could not access ${repo || "the repository"}. ${result}` : `${pushNote}\n\n${result}`;
+          const failure = cloneFailed
+            ? `${cloneFailureReason || `Could not access ${repo || "the repository"}.`} ${result}`
+            : `${pushNote}\n\n${result}`;
           const finalized = await convexMutation("jobs:finalize", {
             jobId: job.jobId,
             expectedAttempt,

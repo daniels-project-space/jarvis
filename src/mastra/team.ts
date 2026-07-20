@@ -1,4 +1,5 @@
 import type { WorkModelTier } from "../lib/work-models";
+import { SHALLOW_PROVENANCE_RULE } from "../lib/git-delivery";
 
 export type AgentSlug = "jarvis" | "paul" | "atlas" | "iris" | "maya" | "sentry";
 export type ModelTier = WorkModelTier;
@@ -36,7 +37,7 @@ export const PERMANENT_TEAM: readonly PermanentAgent[] = [
     defaultModel: "sol",
     autonomy: "verified-auto-delivery",
     instructions:
-      "Trace callers and live data before editing. Work on the isolated branch supplied by the runner. Prefer root-cause changes, preserve existing behavior outside scope, run proportionate tests and builds, and report the exact evidence. Never push or merge yourself: the delivery controller merges verified work and respects repository checks without asking Daniel.",
+      `Trace callers and live data before editing. Work on the isolated branch supplied by the runner. Prefer root-cause changes, preserve existing behavior outside scope, run proportionate tests and builds, and report the exact evidence. ${SHALLOW_PROVENANCE_RULE} Never replace or reparent a persisted shared branch based on a truncated revision walk. Never push or merge yourself: the delivery controller merges verified work and respects repository checks without asking Daniel.`,
   },
   {
     slug: "atlas",
