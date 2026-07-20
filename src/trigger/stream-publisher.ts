@@ -13,11 +13,19 @@ export class StreamPublisher {
   private chain: Promise<void> = Promise.resolve();
   private timer: ReturnType<typeof setInterval> | null = null;
   private closed = false;
+  private readonly startedAt: number;
+  private firstDeltaAt: number | null = null;
+  private firstPublishStartedAt: number | null = null;
+  private firstPublishCommittedAt: number | null = null;
+  private publishCount = 0;
 
   constructor(
     private readonly publish: (text: string, revision: number) => Promise<unknown>,
     private readonly intervalMs = 120,
-  ) {}
+    private readonly now: () => number = () => performance.now(),
+  ) {
+    this.startedAt = this.now();
+  }
 
   start() {
     if (this.timer || this.closed) return;
@@ -26,7 +34,13 @@ export class StreamPublisher {
 
   push(delta: string) {
     if (this.closed || !delta) return;
+    const first = !this.text;
+    if (this.firstDeltaAt === null) this.firstDeltaAt = this.now();
     this.text += delta;
+    // Commit the truthful opening immediately. Later deltas still coalesce on
+    // the normal interval, keeping Convex writes bounded without adding up to a
+    // full tick before Daniel sees that the model has begun answering.
+    if (first) void this.flush();
   }
 
   flush(): Promise<void> {
@@ -38,7 +52,14 @@ export class StreamPublisher {
       // A failed interim paint is harmless: finalize writes the authoritative
       // complete answer. Most importantly, no rejected write can fork a second
       // chain or escape the close barrier.
-      await this.publish(snapshot, revision).catch(() => undefined);
+      if (this.firstPublishStartedAt === null) this.firstPublishStartedAt = this.now();
+      this.publishCount += 1;
+      try {
+        await this.publish(snapshot, revision);
+        if (this.firstPublishCommittedAt === null) this.firstPublishCommittedAt = this.now();
+      } catch {
+        // Finalization remains authoritative when an interim mutation fails.
+      }
     });
     return this.chain;
   }
@@ -54,5 +75,15 @@ export class StreamPublisher {
 
   get value() {
     return this.text;
+  }
+
+  get timing() {
+    const elapsed = (at: number | null) => at === null ? null : Math.max(0, Math.round(at - this.startedAt));
+    return {
+      firstDeltaMs: elapsed(this.firstDeltaAt),
+      firstPublishStartedMs: elapsed(this.firstPublishStartedAt),
+      firstPublishCommittedMs: elapsed(this.firstPublishCommittedAt),
+      publishCount: this.publishCount,
+    };
   }
 }

@@ -195,13 +195,26 @@ async function claimPending(ctx: { db: any }, pending: any) {
     };
 }
 
+async function ownsRunner(ctx: { db: any }, runnerId: string | undefined) {
+  // Optional during rolling deployments: old workers do not send runnerId,
+  // while new workers make ownership and the queue claim one transaction.
+  if (!runnerId) return true;
+  const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY)).first();
+  return row?.value === runnerId;
+}
+
 // Immediate Trigger runs claim exactly the message that woke them. This is
 // what permits parallel foreground turns without two workers racing through a
 // shared drain loop or making a new question wait behind an older slow one.
 export const claimMessage = mutation({
-  args: { messageId: v.id("chatMessages"), workerToken: v.optional(v.string()) },
+  args: {
+    messageId: v.id("chatMessages"),
+    runnerId: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
+    if (!(await ownsRunner(ctx, a.runnerId))) return null;
     const pending = await ctx.db.get(a.messageId);
     if (!pending || pending.role !== "user" || pending.status !== "pending") return null;
     return await claimPending(ctx, pending);
@@ -210,9 +223,10 @@ export const claimMessage = mutation({
 
 // Recovery-only FIFO claim for a lost Trigger wake-up.
 export const claimNext = mutation({
-  args: { workerToken: v.optional(v.string()) },
+  args: { runnerId: v.optional(v.string()), workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
+    if (!(await ownsRunner(ctx, a.runnerId))) return null;
     const pending = await ctx.db
       .query("chatMessages")
       .withIndex("by_status", (q: any) => q.eq("status", "pending"))
