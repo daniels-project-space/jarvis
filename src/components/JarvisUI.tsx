@@ -44,6 +44,11 @@ import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actio
 import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
 import { viewerFetch } from "@/lib/viewer-request";
 import { normalizeIncidentSignature } from "@/lib/incident-signature";
+import {
+  assistantForRequest,
+  FOREGROUND_THINKING_TEXT,
+  requestIdForAssistant,
+} from "@/lib/foreground-turn";
 import { CompactWorkBar } from "./CompactWorkBar";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
@@ -70,6 +75,7 @@ type Msg = {
   status: string;
   model?: string;
   delivery?: "foreground" | "notification";
+  requestId?: string;
   parentMessageId?: string;
   attachment?: Attachment;
   createdAt: number;
@@ -1606,7 +1612,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     return claimVoice({ client: me.current }).catch(() => undefined);
   };
   const lastSent = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
-  const durableStartedAt = useRef<number | null>(null);
+  const activeDurableRequest = useRef<{
+    requestId: string;
+    submissionId: string;
+    startedAt: number;
+    firstTokenRecorded: boolean;
+  } | null>(null);
+  const foregroundOwnerRef = useRef<{ submissionId: string; requestId?: string } | null>(null);
+  const ownsForegroundSubmission = (submissionId: string) =>
+    foregroundOwnerRef.current?.submissionId === submissionId;
   const [wake, setWake] = useState(false);
   const [panelFull, setPanelFull] = useState(false);
   const panelFullRef = useRef(false);
@@ -2024,13 +2038,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     claim: string;
     captionText?: string;
     final?: boolean;
+    isCurrent?: () => boolean;
   }): Promise<boolean> {
     const text = args.text.trim();
     const final = args.final !== false;
     const captionText = args.captionText ?? text;
+    const isCurrent = () => args.isCurrent?.() !== false;
+    if (!isCurrent()) return false;
     if (!text || !narrationLedgerRef.current.claim(args.claim)) return false;
     const finishWithoutSpeech = () => {
-      if (!final) return;
+      if (!final || !isCurrent()) return;
       fadeCaption(captionText, 3_200);
       finishOneShotVoiceTurn();
     };
@@ -2039,16 +2056,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       return false;
     }
     const { speak } = await import("../lib/tts");
+    if (!isCurrent()) return false;
     await speak(
       text,
-      (energy) => (energyRef.current = energy),
+      (energy) => { if (isCurrent()) energyRef.current = energy; },
       () => {
+        if (!isCurrent()) return;
         setSpeaking(true);
         setCaption((current) => current?.who === "jarvis" && current.text.length >= captionText.length
           ? { ...current, phase: "speaking", exiting: false }
           : { who: "jarvis", text: captionText, phase: "speaking", exiting: false });
       },
       () => {
+        if (!isCurrent()) return;
         setSpeaking(false);
         if (final) {
           fadeCaption(captionText, 1_800);
@@ -2147,11 +2167,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // Speak new finalized assistant messages with the one streamed neural voice.
   const lastSpokenThread = useRef<string>("");
   useEffect(() => {
-    const latestAssistant = [...messages].reverse().find((message) => message.role === "assistant" && message.delivery !== "notification");
+    const request = activeDurableRequest.current;
+    if (
+      !request ||
+      foregroundOwnerRef.current?.submissionId !== request.submissionId ||
+      foregroundOwnerRef.current?.requestId !== request.requestId
+    ) return;
+    const latestAssistant = assistantForRequest(messages, request.requestId);
     if (latestAssistant?.status !== "streaming" || !latestAssistant.text) return;
-    if (durableStartedAt.current !== null) {
-      document.documentElement.dataset.jarvisFirstTokenMs = String(Math.max(0, Math.round(performance.now() - durableStartedAt.current)));
-      durableStartedAt.current = null;
+    if (!request.firstTokenRecorded) {
+      document.documentElement.dataset.jarvisFirstTokenMs = String(Math.max(0, Math.round(performance.now() - request.startedAt)));
+      request.firstTokenRecorded = true;
       setSending(false);
     }
     showCaption({ who: "jarvis", text: latestAssistant.text, phase: "streaming" });
@@ -2181,7 +2207,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // with their first stable paragraph instead of waiting indefinitely.
     streamState.timer = setTimeout(() => {
       const current = streamingSpeechRef.current;
-      if (current.id !== latestAssistant._id) return;
+      const ownsTurn = () =>
+        foregroundOwnerRef.current?.submissionId === request.submissionId &&
+        foregroundOwnerRef.current?.requestId === request.requestId &&
+        streamingSpeechRef.current.id === latestAssistant._id;
+      if (current.id !== latestAssistant._id || !ownsTurn()) return;
       current.timer = null;
       const prefix = current.pendingPrefix;
       const from = current.queuedChars;
@@ -2191,12 +2221,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       current.queuedChars = prefix.length;
       if (!speechChunk) return;
       current.chain = current.chain.then(async () => {
-        if (streamingSpeechRef.current.id !== latestAssistant._id) return;
+        if (!ownsTurn()) return;
         await narrateText({
           text: speechChunk,
           claim: narrationClaim(`turn:${latestAssistant._id}`, prefix, from, prefix.length),
           captionText: current.pendingCaption,
           final: false,
+          isCurrent: ownsTurn,
         });
       });
     }, 220);
@@ -2204,19 +2235,51 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }, [messages]);
 
   useEffect(() => {
-    const last = [...messages].reverse().find((m) => m.role === "assistant" && m.delivery !== "notification" && m.status === "done" && m.text);
+    const activeRequest = activeDurableRequest.current;
+    const associated = activeRequest
+      ? assistantForRequest(messages, activeRequest.requestId)
+      : undefined;
+    if (activeRequest && (!associated || (associated.status !== "done" && associated.status !== "error"))) return;
+    const wasActive = Boolean(activeRequest && associated);
+    if (wasActive) {
+      if (activeRequest && !activeRequest.firstTokenRecorded) {
+        document.documentElement.dataset.jarvisFirstTokenMs = String(
+          Math.max(0, Math.round(performance.now() - activeRequest.startedAt)),
+        );
+      }
+      activeDurableRequest.current = null;
+      setSending(false);
+    }
+    const last = associated ?? [...messages].reverse().find((m) =>
+      m.role === "assistant" && m.delivery !== "notification" && m.status === "done" && m.text,
+    );
+    if (!last) return;
+    const requestId = requestIdForAssistant(messages, last);
+    if (requestId && foregroundOwnerRef.current?.requestId !== requestId) {
+      lastSpokenId.current = last._id;
+      return;
+    }
     // hopping threads must never re-voice that thread's old last reply
     if (lastSpokenThread.current !== thread) {
       lastSpokenThread.current = thread;
-      lastSpokenId.current = last?._id ?? null;
-      return;
+      if (!wasActive) {
+        lastSpokenId.current = last._id;
+        return;
+      }
     }
-    if (!last || last._id === lastSpokenId.current) return;
-    if (lastSpokenId.current === null) {
+    if (last._id === lastSpokenId.current) return;
+    if (lastSpokenId.current === null && !wasActive) {
       lastSpokenId.current = last._id; // don't re-speak history on page load
       return;
     }
     lastSpokenId.current = last._id;
+    if (last.status === "error") {
+      const failureText = sanitizeAssistantText(last.text) || "The conversation line failed before I could answer.";
+      showCaption({ who: "jarvis", text: failureText, phase: "ready" });
+      fadeCaption(failureText, 3_200);
+      finishOneShotVoiceTurn();
+      return;
+    }
     if (!last.text) return;
     if (isToolGarbage(last.text) && !sanitizeAssistantText(last.text)) return;
     // never say the exact same thing twice in a row (root of "sends results twice")
@@ -2231,6 +2294,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // vanishes during the TTS handoff or when this tab is not the speaker.
     showCaption({ who: "jarvis", text: spokenText, phase: "ready" });
     (async () => {
+      const ownsNarration = () => !requestId || foregroundOwnerRef.current?.requestId === requestId;
       const streamed = streamingSpeechRef.current.id === last._id ? streamingSpeechRef.current : null;
       if (streamed?.timer) {
         clearTimeout(streamed.timer);
@@ -2238,6 +2302,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         streamed.pendingPrefix = "";
       }
       if (streamed) await streamed.chain;
+      if (!ownsNarration()) return;
       const from = streamed?.queuedChars ?? 0;
       const unsaidText = spokenText.slice(from).trim();
       if (!unsaidText) {
@@ -2250,6 +2315,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         text: unsaidText,
         claim: narrationClaim(`turn:${last._id}`, spokenText, from, spokenText.length),
         captionText: spokenText,
+        isCurrent: ownsNarration,
       });
     })();
   }, [messages]);
@@ -2303,10 +2369,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     });
   }
 
-  async function queueDurableTurn(text: string, visibleText = text) {
-    durableStartedAt.current = performance.now();
+  async function queueDurableTurn(text: string, visibleText: string, submissionId: string) {
+    if (!ownsForegroundSubmission(submissionId)) return;
+    const requestId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    foregroundOwnerRef.current = { submissionId, requestId };
+    activeDurableRequest.current = {
+      requestId,
+      submissionId,
+      startedAt: performance.now(),
+      firstTokenRecorded: false,
+    };
     setSending(true);
     showCaption({ who: "you", text: visibleText });
+    showCaption({ who: "jarvis", text: FOREGROUND_THINKING_TEXT, phase: "streaming" });
     try {
       const response = await viewerFetch("/api/chat", {
         method: "POST",
@@ -2314,7 +2389,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         body: JSON.stringify({
           threadId: threadRef.current,
           text,
-          requestId: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          requestId,
         }),
       });
       if (!response.ok) throw new Error(`conversation queue rejected (${response.status})`);
@@ -2322,7 +2397,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       // closes the old request/subscription gap where the orb flashed idle.
       return;
     } catch (error) {
-      durableStartedAt.current = null;
+      if (
+        activeDurableRequest.current?.requestId !== requestId ||
+        !ownsForegroundSubmission(submissionId)
+      ) return;
+      activeDurableRequest.current = null;
       document.documentElement.dataset.jarvisConversationFailure = String(error).slice(0, 160);
       showCaption({
         who: "jarvis",
@@ -2333,7 +2412,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
   }
 
-  async function openFastAgentDispatch(intent: FastAgentDispatch, requestedText: string) {
+  async function openFastAgentDispatch(intent: FastAgentDispatch, requestedText: string, submissionId: string) {
     const narrationId = `dispatch:${Date.now()}`;
     const owner = intent.agentId
       ? ({ paul: "Paul", atlas: "Atlas", iris: "Iris", maya: "Maya", sentry: "Sentry" } as const)[intent.agentId]
@@ -2356,6 +2435,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       if (!response.ok || !result || /^(?:Tool failed|Tool unavailable|Give me)/i.test(result)) {
         throw new Error(result || "dispatch unavailable");
       }
+      if (!ownsForegroundSubmission(submissionId)) return;
       const assigned = result.match(/^(Paul|Atlas|Iris|Maya|Sentry)\b/)?.[1] ?? owner;
       const awaitingApproval = /consequential|Needs you|will not execute/i.test(result);
       const reply = awaitingApproval
@@ -2366,17 +2446,25 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
       void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
       void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant-dispatch" });
-      await narrateText({ text: reply, claim: narrationClaim(narrationId, reply), captionText: reply });
+      await narrateText({
+        text: reply,
+        claim: narrationClaim(narrationId, reply),
+        captionText: reply,
+        isCurrent: () => ownsForegroundSubmission(submissionId),
+      });
     } catch {
+      if (!ownsForegroundSubmission(submissionId)) return;
       showCaption({ who: "jarvis", text: "The fast handoff slipped. I’m retrying it through the durable lane now." });
-      await queueDurableTurn(requestedText);
+      await queueDurableTurn(requestedText, requestedText, submissionId);
     } finally {
-      setSending(false);
+      if (ownsForegroundSubmission(submissionId) && activeDurableRequest.current?.submissionId !== submissionId) {
+        setSending(false);
+      }
     }
   }
 
   const fastChartRequest = useRef(0);
-  async function openFastChart(intent: FastChartIntent, requestedText: string) {
+  async function openFastChart(intent: FastChartIntent, requestedText: string, submissionId: string) {
     const request = ++fastChartRequest.current;
     const title = `${intent.asset.toUpperCase()} · ${intent.interval}`;
     const loading: StagePanel = {
@@ -2399,7 +2487,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       });
       const body = await response.json().catch(() => null);
       if (!response.ok || !body?.widget) throw new Error("market data unavailable");
-      if (request !== fastChartRequest.current) return;
+      if (request !== fastChartRequest.current || !ownsForegroundSubmission(submissionId)) return;
       const widget = body.widget as { asset?: string; changePct?: number };
       const ready: StagePanel = { type: "widget", title, value: JSON.stringify(widget), updatedAt: Date.now() };
       setInstantPanel(ready);
@@ -2415,19 +2503,24 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         text: reply,
         claim: narrationClaim(`chart:${request}`, reply),
         captionText: reply,
+        isCurrent: () => ownsForegroundSubmission(submissionId),
       });
     } catch {
-      if (request !== fastChartRequest.current) return;
+      if (request !== fastChartRequest.current || !ownsForegroundSubmission(submissionId)) return;
       setInstantPanel(null);
       showCaption({ who: "jarvis", text: "The live feed slipped. I’m getting the full market read." });
-      await queueDurableTurn(requestedText);
+      await queueDurableTurn(requestedText, requestedText, submissionId);
     } finally {
-      if (request === fastChartRequest.current) setSending(false);
+      if (
+        request === fastChartRequest.current &&
+        ownsForegroundSubmission(submissionId) &&
+        activeDurableRequest.current?.submissionId !== submissionId
+      ) setSending(false);
     }
   }
 
   const fastNetWorthRequest = useRef(0);
-  async function openFastNetWorth(intent: FastNetWorthIntent, requestedText: string) {
+  async function openFastNetWorth(intent: FastNetWorthIntent, requestedText: string, submissionId: string) {
     const request = ++fastNetWorthRequest.current;
     const loading: StagePanel = {
       type: "widget",
@@ -2451,13 +2544,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const body = await response.json().catch(() => null);
       const result = String(body?.result ?? "");
       if (!response.ok || !result || /^(Tool failed|Couldn't reach)/i.test(result)) throw new Error("wealth data unavailable");
-      if (request !== fastNetWorthRequest.current) return;
+      if (request !== fastNetWorthRequest.current || !ownsForegroundSubmission(submissionId)) return;
       // executeTool has already published the real animated stats widget to
       // Convex. Reveal that canonical panel instead of maintaining a second
       // client-side copy of financial data.
       setInstantPanel(null);
       if (intent.requiresAnalysis) {
-        await queueDurableTurn(requestedText);
+        await queueDurableTurn(requestedText, requestedText, submissionId);
         return;
       }
       const detail = result.match(/Net worth dashboard on screen:\s*(.+?)\.\s*One-line/i)?.[1]
@@ -2472,14 +2565,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         text: reply,
         claim: narrationClaim(`net-worth:${request}`, reply),
         captionText: reply,
+        isCurrent: () => ownsForegroundSubmission(submissionId),
       });
     } catch {
-      if (request !== fastNetWorthRequest.current) return;
+      if (request !== fastNetWorthRequest.current || !ownsForegroundSubmission(submissionId)) return;
       setInstantPanel(null);
       showCaption({ who: "jarvis", text: "The wealth ledger did not answer. I’m tracing it through the full work lane." });
-      await queueDurableTurn(requestedText);
+      await queueDurableTurn(requestedText, requestedText, submissionId);
     } finally {
-      if (request === fastNetWorthRequest.current) setSending(false);
+      if (
+        request === fastNetWorthRequest.current &&
+        ownsForegroundSubmission(submissionId) &&
+        activeDurableRequest.current?.submissionId !== submissionId
+      ) setSending(false);
     }
   }
 
@@ -2492,6 +2590,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // double-tap / Enter+click within 2.5s = one send, not two
     if (t === lastSent.current.text && Date.now() - lastSent.current.ts < 2500) return;
     lastSent.current = { text: t, ts: Date.now() };
+    const submissionId = globalThis.crypto?.randomUUID?.() ?? `submission-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    foregroundOwnerRef.current = { submissionId };
+    const superseded = activeDurableRequest.current;
+    if (superseded) {
+      activeDurableRequest.current = null;
+      setSending(false);
+    }
     if (streamingSpeechRef.current.timer) clearTimeout(streamingSpeechRef.current.timer);
     streamingSpeechRef.current = {
       id: "",
@@ -2516,6 +2621,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (embeddedHostIntent) {
       showCaption({ who: "you", text: t });
       const result = await sendHostAction(embeddedHostIntent.action);
+      if (!ownsForegroundSubmission(submissionId)) return;
       if (result.ok) {
         const reply = result.detail || embeddedHostIntent.reply;
         document.documentElement.dataset.jarvisFirstTokenMs = "0";
@@ -2529,6 +2635,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           text: reply,
           claim: narrationClaim(`host:${lastSent.current.ts}`, reply),
           captionText: reply,
+          isCurrent: () => ownsForegroundSubmission(submissionId),
         });
         return;
       }
@@ -2551,17 +2658,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     const fastDispatch = parseFastAgentDispatch(t);
     if (fastDispatch) {
-      void openFastAgentDispatch(fastDispatch, t);
+      void openFastAgentDispatch(fastDispatch, t, submissionId);
       return;
     }
     const fastChart = !liveRef.current ? parseFastChartIntent(t) : null;
     if (fastChart) {
-      void openFastChart(fastChart, t);
+      void openFastChart(fastChart, t, submissionId);
       return;
     }
     const fastNetWorth = parseFastNetWorthIntent(t);
     if (fastNetWorth) {
-      void openFastNetWorth(fastNetWorth, t);
+      void openFastNetWorth(fastNetWorth, t, submissionId);
       return;
     }
     const instant = instantSocialReply(t);
@@ -2580,6 +2687,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           text: instant,
           claim: narrationClaim(`instant:${lastSent.current.ts}`, instant),
           captionText: instant,
+          isCurrent: () => ownsForegroundSubmission(submissionId),
         });
       })();
       return;
@@ -2587,6 +2695,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     let modelText = t;
     if (embedded) {
       const context = await requestHostContext();
+      if (!ownsForegroundSubmission(submissionId)) return;
       if (context) {
         const bounded = needsHostContext(t)
           ? context
@@ -2594,7 +2703,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         modelText = withHostContext(t, bounded);
       }
     }
-    await queueDurableTurn(modelText, t);
+    await queueDurableTurn(modelText, t, submissionId);
   }
 
   function stopTalking() {

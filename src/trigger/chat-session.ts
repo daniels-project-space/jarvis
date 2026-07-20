@@ -20,13 +20,18 @@ import {
   FOREGROUND_TURN_TIMEOUT_MS,
   type ForegroundTurnPayload,
 } from "./foreground-policy";
-import { CodexAppServer } from "./codex-app-server";
+import { CodexAppServer, type CodexTurnResult } from "./codex-app-server";
 import {
   AgentToolBridge,
   JARVIS_DYNAMIC_TOOLS,
   JARVIS_TOOL_INSTRUCTIONS,
 } from "./agent-tool-bridge";
 import { StreamPublisher } from "./stream-publisher";
+import {
+  acquireRunnerLease,
+  isLegacyRunnerClaimValidationError,
+  WarmHandoffController,
+} from "./foreground-handoff";
 
 function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = false): string[] {
   if (provider !== "codex") throw new Error("Jarvis permits only the Codex CLI runtime");
@@ -48,6 +53,11 @@ const CONVEX_URL =
 // over the Convex lease only after its app-server is fully initialised.
 const RUN_BUDGET_MS = 690_000;
 const HANDOFF_AFTER_MS = 540_000;
+const HANDOFF_RETRY_MS = 30_000;
+const HANDOFF_FAILURE_RETRY_MS = 2_000;
+const HANDOFF_MAX_ATTEMPTS = 5;
+const HANDOFF_TRIGGER_TIMEOUT_MS = 15_000;
+const PENDING_SIGNAL_RETRY_MS = 1_000;
 
 async function convexCall(kind: "query" | "mutation", path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
@@ -87,23 +97,43 @@ function waitForPending(
   return new Promise((resolve) => {
     let settled = false;
     let unsubscribe = () => {};
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     const finish = (value: boolean) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       signal?.removeEventListener("abort", aborted);
       unsubscribe();
       resolve(value);
     };
     const aborted = () => finish(false);
+    const retryAfterSubscriptionError = () => {
+      if (settled || reconnectTimer) return;
+      // Keep the owning process alive and fall back to one bounded claim per
+      // second while Convex realtime reconnects. Exiting here would recreate
+      // the cold handoff gap even though this runner still owns the lease.
+      reconnectTimer = setTimeout(
+        () => finish(true),
+        Math.max(1, Math.min(PENDING_SIGNAL_RETRY_MS, timeoutMs)),
+      );
+    };
     const timer = setTimeout(() => finish(false), timeoutMs);
+    if (signal?.aborted) {
+      finish(false);
+      return;
+    }
     signal?.addEventListener("abort", aborted, { once: true });
-    unsubscribe = client.onUpdate(
-      api.chatQueue.pendingSignal,
-      { workerToken },
-      (messageId) => { if (messageId) finish(true); },
-      () => finish(false),
-    );
+    try {
+      unsubscribe = client.onUpdate(
+        api.chatQueue.pendingSignal,
+        { workerToken },
+        (messageId) => { if (messageId) finish(true); },
+        retryAfterSubscriptionError,
+      );
+    } catch {
+      retryAfterSubscriptionError();
+    }
   });
 }
 
@@ -114,13 +144,25 @@ type QueueClaim = {
   history: Array<{ role: string; text: string }>;
 };
 
-function conversationPreamble(contextBlock: string, userText: string) {
-  const visualDirective = visualInitiativeDirective(visibleTurnText(userText));
+async function claimChatMessage(targetMessageId: string | undefined, runnerId: string) {
+  const path = targetMessageId ? "chatQueue:claimMessage" : "chatQueue:claimNext";
+  const legacyArgs = targetMessageId ? { messageId: targetMessageId } : {};
+  try {
+    return await convexMutation(path, { ...legacyArgs, runnerId }) as QueueClaim | null;
+  } catch (error) {
+    // During a provider rolling deploy, the new Trigger worker can briefly see
+    // the old Convex validator. Retry only that pre-execution validation error;
+    // ambiguous transport failures must never risk claiming a second message.
+    if (!isLegacyRunnerClaimValidationError(error)) throw error;
+    return await convexMutation(path, legacyArgs) as QueueClaim | null;
+  }
+}
+
+function conversationPreamble() {
   return PERSONA +
-    `\n\n${CAPABILITIES}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${contextBlock}\n\nCurrent date: ${new Date().toDateString()}.\n\n${REMEMBER}\n\n` +
+    `\n\n${CAPABILITIES}\n\n${INFRA_MAP}\n\nCurrent date: ${new Date().toDateString()}.\n\n${REMEMBER}\n\n` +
     JARVIS_TOOL_INSTRUCTIONS + " " +
-    `Answer first and keep the default spoken reply to one concise sentence. Never narrate context, memory, shell commands, or tool plumbing.` +
-    (visualDirective ? `\n\n${visualDirective}` : "");
+    `Answer first and keep the default spoken reply to one concise sentence. Never narrate context, memory, shell commands, or tool plumbing.`;
 }
 
 async function runTurn(
@@ -136,22 +178,26 @@ async function runTurn(
     convexMutation("chatQueue:updateStream", { messageId: assistantId, text, revision }),
   );
   publisher.start();
+  let result: CodexTurnResult | null = null;
   try {
-    const result = await server.runTurn({
+    result = await server.runTurn({
       conversationId,
+      turnKey: assistantId,
       userText,
       history,
       contextBlock,
-      preamble: conversationPreamble(contextBlock, userText),
+      turnDirective: visualInitiativeDirective(visibleTurnText(userText)),
+      preamble: conversationPreamble(),
       modelTier: model,
       onDelta: (delta) => publisher.push(delta),
     });
-    return { ...result, sessionId: result.threadId };
   } finally {
     // This is the decisive ordering barrier: no stream mutation remains alive
     // when processChatQueue writes the final answer.
     await publisher.close();
   }
+  if (!result) throw new Error("Codex conversation turn ended without a result");
+  return { ...result, sessionId: result.threadId, streamTiming: publisher.timing };
 }
 
 // Stage 0 capture: a fast Luna pass extracts durable facts from the turn and
@@ -212,7 +258,12 @@ async function extractAndSave(
   return n;
 }
 
-async function processChatQueue(targetMessageId?: string, source = "conversation", handoffFrom?: string) {
+async function processChatQueue(
+  targetMessageId?: string,
+  source = "conversation",
+  handoffFrom?: string,
+  handoffConversations: ForegroundTurnPayload["handoffConversations"] = [],
+) {
   // Foreground Jarvis is deliberately pinned to Daniel's ChatGPT subscription.
   // The old provider lookup now always returns Codex, so querying it added a
   // network round trip to every message without changing the selected brain.
@@ -232,65 +283,117 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
     dynamicTools: JARVIS_DYNAMIC_TOOLS,
     onDynamicToolCall: (call) => bridge.invoke(call),
   });
-  // A handoff candidate pays its startup cost before taking ownership. That
-  // removes the recurring cold gap that used to appear every few minutes.
-  if (source === "warm-handoff") await server.start();
-  const ownsLease = await convexMutation("chatQueue:touchRunner", {
-    runnerId,
-    takeoverFrom: source === "warm-handoff" ? handoffFrom : undefined,
-  }) as boolean;
+  const workerStartedAt = Date.now();
+  let appServerReadyMs = 0;
+  let conversationPrewarmMs = 0;
+  let prewarmedConversations = 0;
+  let serverReady = false;
+  // A handoff candidate starts the pinned app-server and seeds the most recent
+  // model-visible conversation before taking the lease. The prior worker stays
+  // alive until the lease change arrives over Convex realtime.
+  if (source === "warm-handoff") {
+    await server.start();
+    serverReady = true;
+    const serverReadyAt = Date.now();
+    appServerReadyMs = serverReadyAt - workerStartedAt;
+    prewarmedConversations = await server.prewarmConversations(
+      handoffConversations ?? [],
+      conversationPreamble(),
+    );
+    conversationPrewarmMs = Date.now() - serverReadyAt;
+  }
+  let ownsLease: boolean;
+  try {
+    ownsLease = await acquireRunnerLease({
+      acquire: () => convexMutation("chatQueue:touchRunner", {
+        runnerId,
+        takeoverFrom: source === "warm-handoff" ? handoffFrom : undefined,
+      }) as Promise<boolean>,
+    });
+  } catch (error) {
+    server.stop();
+    throw error;
+  }
   if (!ownsLease) {
     server.stop();
     return { processed: 0, warmRunner: true };
   }
   const client = new ConvexClient(CONVEX_URL);
   let leaseActive = true;
-  const leaseAbort = new AbortController();
+  const loopAbort = new AbortController();
+  const handoff = new WarmHandoffController<ForegroundTurnPayload>({
+    runnerId,
+    payload: () => ({
+      source: "warm-handoff",
+      handoffFrom: runnerId,
+      handoffConversations: server.handoffConversations(1),
+    }),
+    launch: async (payload, attempt) => Boolean(await tasks.trigger(
+      "jarvis-chat-turn",
+      payload,
+      { idempotencyKey: `jarvis-warm-${runnerId}-${attempt}` },
+    ).catch(() => null)),
+    onTakeover: () => {
+      leaseActive = false;
+      loopAbort.abort();
+    },
+    maxAttempts: HANDOFF_MAX_ATTEMPTS,
+    retryDelayMs: HANDOFF_RETRY_MS,
+    failureRetryDelayMs: HANDOFF_FAILURE_RETRY_MS,
+    launchTimeoutMs: HANDOFF_TRIGGER_TIMEOUT_MS,
+  });
+  const stopLeaseWatch = client.onUpdate(
+    api.chatQueue.runnerLeaseForWorker,
+    { workerToken },
+    (lease) => handoff.observeRunner(lease?.runnerId),
+    () => {},
+  );
   const heartbeat = setInterval(() => void convexMutation("chatQueue:touchRunner", { runnerId })
     .then((stillOwner) => {
-      if (stillOwner === false) {
-        leaseActive = false;
-        leaseAbort.abort();
-      }
+      if (stillOwner === false) handoff.markTakenOver();
     })
     .catch(() => {}), 10_000);
-  let handoffStarted = false;
-  let handoffPromise: Promise<unknown> | null = null;
-  const startHandoff = () => {
-    if (handoffStarted) return;
-    handoffStarted = true;
-    handoffPromise = tasks.trigger(
-      "jarvis-chat-turn",
-      { source: "warm-handoff", handoffFrom: runnerId },
-      { idempotencyKey: `jarvis-warm-${runnerId}` },
-    ).catch(() => null);
-  };
-  const handoffTimer = setTimeout(startHandoff, HANDOFF_AFTER_MS);
+  const handoffTimer = setTimeout(() => void handoff.start(), HANDOFF_AFTER_MS);
 
   const started = Date.now();
   const timings: Array<{
     claimMs: number;
     contextMs: number;
     modelMs: number;
+    appServerReadyMs: number;
+    conversationReadyMs: number;
+    turnResponseMs: number;
+    firstDeltaMs: number | null;
+    generationMs: number;
+    modelCompletedMs: number;
+    firstStreamCommitMs: number | null;
+    streamBufferMs: number | null;
+    streamCommitMs: number | null;
+    bufferedEventCount: number;
+    firstDeltaBeforeTurnResponse: boolean;
     finalizeMs: number;
     deliveredMs: number;
     memoryMs: number;
   }> = [];
   let processed = 0;
+  let handoffReady = false;
   try {
     // Prewarm even when the scheduled recovery task found no message. This is
     // the always-available main Jarvis, separate from durable specialist work.
-    await server.start();
+    if (!serverReady) {
+      const serverStartedAt = Date.now();
+      await server.start();
+      appServerReadyMs = Date.now() - serverStartedAt;
+      serverReady = true;
+    }
   while (leaseActive && Date.now() - started < RUN_BUDGET_MS) {
     const claimStarted = Date.now();
-    const claim = (targetMessageId
-      ? await convexMutation("chatQueue:claimMessage", { messageId: targetMessageId })
-      : await convexMutation("chatQueue:claimNext", {})) as QueueClaim | null;
+    const claim = await claimChatMessage(targetMessageId, runnerId);
     const claimedAt = Date.now();
     if (!claim) {
       targetMessageId = undefined;
       const remaining = RUN_BUDGET_MS - (Date.now() - started);
-      if (remaining <= 0 || !(await waitForPending(client, workerToken, remaining, leaseAbort.signal))) break;
+      if (remaining <= 0 || !(await waitForPending(client, workerToken, remaining, loopAbort.signal))) break;
       continue;
     }
     try {
@@ -330,10 +433,29 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
         assistantText: turn.finalText,
       }).catch(() => {});
       const memoryFinishedAt = Date.now();
+      const streamBufferMs = turn.streamTiming.firstDeltaMs === null || turn.streamTiming.firstPublishStartedMs === null
+        ? null
+        : Math.max(0, turn.streamTiming.firstPublishStartedMs - turn.streamTiming.firstDeltaMs);
+      const streamCommitMs = turn.streamTiming.firstPublishStartedMs === null || turn.streamTiming.firstPublishCommittedMs === null
+        ? null
+        : Math.max(0, turn.streamTiming.firstPublishCommittedMs - turn.streamTiming.firstPublishStartedMs);
       timings.push({
         claimMs: claimedAt - claimStarted,
         contextMs: contextReadyAt - contextStarted,
         modelMs: modelFinishedAt - contextReadyAt,
+        appServerReadyMs: turn.timing.appServerReadyMs,
+        conversationReadyMs: turn.timing.conversationReadyMs,
+        turnResponseMs: turn.timing.turnResponseMs,
+        firstDeltaMs: turn.timing.firstDeltaMs,
+        generationMs: turn.timing.generationMs,
+        modelCompletedMs: turn.timing.modelCompletedMs,
+        firstStreamCommitMs: turn.streamTiming.firstPublishCommittedMs === null
+          ? null
+          : contextReadyAt - claimStarted + turn.streamTiming.firstPublishCommittedMs,
+        streamBufferMs,
+        streamCommitMs,
+        bufferedEventCount: turn.timing.bufferedEventCount,
+        firstDeltaBeforeTurnResponse: turn.timing.firstDeltaBeforeTurnResponse,
         finalizeMs: deliveredAt - finalizeStarted,
         deliveredMs: deliveredAt - claimStarted,
         memoryMs: memoryFinishedAt - deliveredAt,
@@ -351,16 +473,28 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
     // and drain rapid follow-ups. Duplicate queued wake tasks become no-ops.
     targetMessageId = undefined;
   }
-    return { processed, timings };
   } finally {
     clearInterval(heartbeat);
     clearTimeout(handoffTimer);
-    startHandoff();
-    await handoffPromise;
+    if (leaseActive) await handoff.ensureLaunched();
+    handoffReady = handoff.state.takenOver;
+    handoff.stop();
+    stopLeaseWatch();
     client.close();
     server.stop();
     await convexMutation("chatQueue:releaseRunner", { runnerId }).catch(() => {});
   }
+  return {
+    processed,
+    timings,
+    workerTiming: {
+      source,
+      appServerReadyMs,
+      conversationPrewarmMs,
+      prewarmedConversations,
+      handoffReady,
+    },
+  };
 }
 
 export const chatMemory = task({
@@ -384,7 +518,12 @@ export const chatTurn = task({
   queue: { name: FOREGROUND_QUEUE, concurrencyLimit: FOREGROUND_CONCURRENCY },
   machine: "small-1x",
   maxDuration: FOREGROUND_MAX_DURATION_SECONDS,
-  run: async (payload: ForegroundTurnPayload) => processChatQueue(payload.messageId, payload.source, payload.handoffFrom),
+  run: async (payload: ForegroundTurnPayload) => processChatQueue(
+    payload.messageId,
+    payload.source,
+    payload.handoffFrom,
+    payload.handoffConversations,
+  ),
 });
 
 // Recovery lane only: if an immediate trigger is lost between Vercel and

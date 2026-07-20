@@ -1,3 +1,5 @@
+import type { CodexConversationHandoff } from "./codex-app-server";
+
 // Foreground conversation is deliberately a short, parallel lane. Durable
 // research/coding belongs to the independent agent fleet; a slow background
 // run must never inherit or monopolise Daniel's foreground voice lane.
@@ -11,4 +13,5 @@ export type ForegroundTurnPayload = {
   threadId?: string;
   source?: string;
   handoffFrom?: string;
+  handoffConversations?: CodexConversationHandoff[];
 };
