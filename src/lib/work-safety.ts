@@ -24,7 +24,7 @@ const TECHNICAL_PUBLICATION =
 // not merely co-occurring technical words, so a direct or named recipient
 // cannot borrow the exception.
 const CONTROLLER_REVIEW_PROMPT_OBJECT =
-  /^(?:(?:the|a|an|this|that)\s+)?(?:(?:final|generated|full|large|long|sol|max|codex)\s+)*(?:(?:delivery[- ]?)?controller(?:['’]s)?[- ]+)?(?:review[- ]+)?prompt\b/i;
+  /^(?:(?:the|a|an|this|that)\s+)?(?:(?:final|generated|full|large|long|sol|max|codex)\s+)*(?:(?:(?:delivery[- ]?)?controller|reviewer)(?:['’]s)?[- ]+(?:review[- ]+)?|review[- ]+)prompt\b/i;
 
 const STANDARD_INPUT_AFTER_PROMPT =
   /^\s+(?:through|via|over|on|into|using)\s+(?:the\s+)?(?:standard[- ]input|stdin)\b/i;
@@ -91,7 +91,7 @@ function softwareDeliveryAllowed(action: string, clause: string, repo: string | 
 }
 
 function controllerReviewStdinTransfer(clause: string, before: string, after: string): boolean {
-  if (!/\breview\b/i.test(clause) || !/\b(?:standard[- ]input|stdin)\b/i.test(clause)) return false;
+  if (!/\b(?:standard[- ]input|stdin)\b/i.test(clause)) return false;
   const prompt = after.match(CONTROLLER_REVIEW_PROMPT_OBJECT);
   if (!prompt) return false;
   const afterPrompt = after.slice(prompt[0].length);

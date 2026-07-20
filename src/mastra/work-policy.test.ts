@@ -116,6 +116,7 @@ describe("server-side work approval policy", () => {
     for (const task of [
       "Send the delivery-controller review prompt through standard input instead of argv.",
       "Use standard input to send the delivery-controller review prompt instead of using argv.",
+      "Send the reviewer prompt through stdin using the Codex exec dash input contract, never a temporary file and never argv.",
     ]) {
       expect(classifyWorkSafety(task, { repo: "jarvis" })).toEqual({
         approvalRequired: false,
@@ -133,6 +134,8 @@ describe("server-side work approval policy", () => {
       "Send the maintainer the delivery-controller review prompt through stdin.",
       "Send the delivery-controller review prompt through stdin to Alice.",
       "Send Alice the delivery-controller review prompt through stdin.",
+      "Send the reviewer prompt through stdin to Alice.",
+      "Send the reviewer prompt to the maintainer.",
     ]) {
       expect(workApprovalPolicy({ task: outreach, repo: "jarvis" }).required).toBe(true);
     }
