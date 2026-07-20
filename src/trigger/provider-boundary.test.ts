@@ -11,6 +11,11 @@ function runtimeFiles(root: string): string[] {
 }
 
 describe("intelligence provider boundary", () => {
+  it("pins Trigger workers to node-22 instead of the Node 21 default", () => {
+    const config = readFileSync(join(process.cwd(), "trigger.config.ts"), "utf8");
+    expect(config).toMatch(/^\s*runtime:\s*"node-22",\s*$/m);
+  });
+
   it("keeps Groq limited to speech transcription transport", () => {
     const root = join(process.cwd(), "src");
     const stt = join(root, "app/api/stt/route.ts");
