@@ -9,7 +9,13 @@ import { primeMicrophone, readJarvisPermissions, type JarvisPermissionState } fr
 import { registerSW, subscribePush } from "@/lib/push";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
 import { createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
-import { needsDaniel, relevantActiveWork } from "@/lib/active-work";
+import {
+  cacheCompactWorkSnapshot,
+  needsDaniel,
+  visibleCompactWork,
+  type CompactWorkCache,
+  type CompactWorkSnapshot,
+} from "@/lib/active-work";
 import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
 import { isPanelFollowUp } from "@/lib/panel-relevance";
@@ -38,6 +44,7 @@ import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actio
 import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
 import { viewerFetch } from "@/lib/viewer-request";
 import { normalizeIncidentSignature } from "@/lib/incident-signature";
+import { CompactWorkBar } from "./CompactWorkBar";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -1392,11 +1399,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     | { value: string; updatedAt: number }
     | null
     | undefined;
-  const commandSnapshot = useJarvisQuery(api.commandCenter.snapshot, embedded ? "skip" : {}) as any;
-  const activeJobs = useMemo(
-    () => relevantActiveWork((commandSnapshot?.active ?? []) as Job[], 4),
-    [commandSnapshot?.active],
-  );
+  const commandSnapshot = useJarvisQuery(
+    api.commandCenter.snapshot,
+    embedded || !activeThreadReady ? "skip" : { threadId: thread },
+  ) as CompactWorkSnapshot | undefined;
+  const compactWorkCache = useRef<CompactWorkCache>(null);
+  useEffect(() => {
+    compactWorkCache.current = cacheCompactWorkSnapshot(compactWorkCache.current, thread, commandSnapshot);
+  }, [commandSnapshot, thread]);
+  const compactWork = visibleCompactWork(compactWorkCache.current, thread, commandSnapshot);
   const lastHostNotificationId = useRef<string | null>(null);
   useEffect(() => {
     if (!embedded) return;
@@ -1496,9 +1507,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     });
   };
   useEffect(() => () => clearCaptionTimers(), []);
-  const [agentView, setAgentView] = useState<string | null>(null);
-  const [agentViewCompact, setAgentViewCompact] = useState(false);
-  const knownActiveJobIds = useRef<Set<string> | null>(null);
+  const [detailJobId, setDetailJobId] = useState<string | null>(null);
+  const requestedDetailId = detailJobId === compactWork?.id ? detailJobId : null;
+  const detailedJobs = useJarvisQuery(api.jobs.active, requestedDetailId ? {} : "skip") as Job[] | undefined;
+  const shownJob = useMemo(
+    () => requestedDetailId ? detailedJobs?.find((job) => job._id === requestedDetailId) ?? null : null,
+    [detailedJobs, requestedDetailId],
+  );
   const [nowTs, setNowTs] = useState(0);
   // Viewport minimize: keep talking and the panel folds into a pill; the orb
   // comes back. Fresh panel content pops it open again.
@@ -2044,51 +2059,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     return true;
   }
 
-  const shownJob = activeJobs.find((j) => j._id === agentView) ?? null;
   const shownJobId = shownJob?._id ?? null;
-  useEffect(() => {
-    if (commandSnapshot === undefined) return;
-    const ids = new Set(activeJobs.map((job) => job._id));
-    if (knownActiveJobIds.current === null) {
-      knownActiveJobIds.current = ids;
-      // Existing relevant work survives a reload as the small replacement
-      // widget. Only newly launched work gets the large introduction.
-      if (activeJobs[0]) {
-        const jobId = activeJobs[0]._id;
-        const timer = setTimeout(() => {
-          setAgentView(jobId);
-          setAgentViewCompact(true);
-        }, 0);
-        return () => clearTimeout(timer);
-      }
-      return;
-    }
-    const fresh = activeJobs.find((job) => !knownActiveJobIds.current!.has(job._id));
-    knownActiveJobIds.current = ids;
-    if (fresh) {
-      const timer = setTimeout(() => {
-        setAgentView(fresh._id);
-        setAgentViewCompact(false);
-      }, 0);
-      return () => clearTimeout(timer);
-    } else if (agentView && !ids.has(agentView)) {
-      const nextJobId = activeJobs[0]?._id ?? null;
-      const timer = setTimeout(() => {
-        setAgentView(nextJobId);
-        setAgentViewCompact(true);
-      }, 0);
-      return () => clearTimeout(timer);
-    }
-  }, [activeJobs, agentView, commandSnapshot]);
   useEffect(() => {
     if (!shownJobId) return;
     const first = setTimeout(() => setNowTs(Date.now()), 0);
     const t = setInterval(() => setNowTs(Date.now()), 1000);
-    const fold = setTimeout(() => setAgentViewCompact(true), 6500);
     return () => {
       clearTimeout(first);
       clearInterval(t);
-      clearTimeout(fold);
     };
   }, [shownJobId]);
 
@@ -3412,26 +3390,25 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               </button>
             </div>
           )}
+          <CompactWorkBar
+            work={compactWork}
+            hidden={overlayUp || Boolean(shownJob)}
+            onOpen={() => {
+              if (compactWork) setDetailJobId(compactWork.id);
+            }}
+          />
           {shownJob && !overlayUp ? (
             <div
-              className={`absolute left-2 top-12 z-30 will-change-transform transition-[width,height,transform] duration-700 ease-[cubic-bezier(0.22,1,0.36,1)] sm:left-4 ${
-                agentViewCompact
-                  ? "h-[132px] w-[min(350px,calc(100%-16px))]"
-                  : "h-[min(430px,70vh)] w-[min(620px,calc(100%-16px))]"
-              }`}
+              className="absolute left-2 top-12 z-30 h-[min(430px,70vh)] w-[min(620px,calc(100%-16px))] will-change-transform sm:left-4"
             >
               <AgentLiveView
                 job={shownJob}
                 now={nowTs}
-                compact={agentViewCompact}
-                activeCount={activeJobs.length}
-                onCompact={() => setAgentViewCompact((value) => !value)}
-                onClose={() => setAgentView(null)}
-                onNext={() => {
-                  const current = activeJobs.findIndex((job) => job._id === shownJob._id);
-                  setAgentView(activeJobs[(current + 1) % activeJobs.length]?._id ?? null);
-                  setAgentViewCompact(true);
-                }}
+                compact={false}
+                activeCount={1}
+                onCompact={() => setDetailJobId(null)}
+                onClose={() => setDetailJobId(null)}
+                onNext={() => undefined}
               />
             </div>
           ) : null}

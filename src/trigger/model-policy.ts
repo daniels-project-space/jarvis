@@ -35,6 +35,56 @@ export function codexExecPrefix(tier: string, effort?: unknown): string[] {
   ];
 }
 
+export const CODEX_REVIEW_WORKING_DIRECTORY = "/app";
+
+// Supervisor review consumes a controller-signed receipt, not a writable
+// specialist checkout. It needs model reasoning only: no shell, web, apps,
+// plugins, hooks or child agents. Authentication remains in the Codex parent
+// process while the shell environment policy would pass no variables even if
+// a future CLI regression accidentally reintroduced a command tool.
+export function codexReviewExecPrefix(tier: string, effort?: unknown): string[] {
+  const selected = codexModelFor(tier);
+  const reasoningEffort = normalizeReasoningEffort(effort, selected.effort);
+  return [
+    "exec",
+    "--model",
+    selected.model,
+    "--config",
+    `model_reasoning_effort=\"${reasoningEffort}\"`,
+    "--sandbox",
+    "read-only",
+    "--ephemeral",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--skip-git-repo-check",
+    "--strict-config",
+    "--config",
+    'approval_policy="never"',
+    "--config",
+    'web_search="disabled"',
+    "--config",
+    'shell_environment_policy.inherit="none"',
+    "--config",
+    "project_doc_max_bytes=0",
+    "--disable",
+    "shell_tool",
+    "--disable",
+    "unified_exec",
+    "--disable",
+    "apps",
+    "--disable",
+    "plugins",
+    "--disable",
+    "hooks",
+    "--disable",
+    "browser_use",
+    "--disable",
+    "computer_use",
+    "--disable",
+    "multi_agent",
+  ];
+}
+
 // Foreground conversation already supplies its own persona, policy and
 // capability bridge. Skipping repository/user bootstrap avoids loading the
 // general Codex plugin + MCP stack on every short turn while retaining full

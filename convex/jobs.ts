@@ -134,8 +134,8 @@ async function migrationState(ctx: any) {
 // One bounded page both backfills the compact runtime row and repairs the old
 // false-positive software approval policy. The cursor is durable, so completed
 // history is never scanned again by the minute supervisor.
-async function migrateLegacyJobsPage(ctx: any) {
-  const state = await migrationState(ctx);
+async function migrateLegacyJobsPage(ctx: any, migration?: any) {
+  const state = migration ?? await migrationState(ctx);
   if (state.jobsComplete) return { scanned: 0, repaired: 0, complete: true };
   const page = await ctx.db
     .query("jobs")
@@ -197,8 +197,8 @@ async function migrateLegacyJobsPage(ctx: any) {
 
 // Goal workstream mode repair is similarly cursor-bound. One mission (and at
 // most the architecture's bounded 100 child rows) is examined per invocation.
-async function migrateLegacyMissionsPage(ctx: any) {
-  const state = await migrationState(ctx);
+async function migrateLegacyMissionsPage(ctx: any, migration?: any) {
+  const state = migration ?? await migrationState(ctx);
   if (state.missionsComplete) return { scanned: 0, repaired: 0, complete: true };
   const page = await ctx.db
     .query("missions")
@@ -257,13 +257,52 @@ async function migrateLegacyMissionsPage(ctx: any) {
   return { scanned: page.page.length, repaired, complete };
 }
 
+type MigrationPageResult = { scanned: number; repaired: number; complete: boolean };
+
+function idleMigrationPage(complete: boolean): MigrationPageResult {
+  return { scanned: 0, repaired: 0, complete };
+}
+
+// Convex permits one built-in pagination call per function execution. Select
+// exactly one durable phase before paginating; the migration row is also the
+// optimistic-concurrency fence, so overlapping/retried mutations either commit
+// one cursor advance or rerun from the cursor that won. Completed phases are
+// constant-time no-ops and never restart their historical scan.
+export async function migrateControlPlaneStep(ctx: any) {
+  const state = await migrationState(ctx);
+  if (!state.jobsComplete) {
+    const jobs = await migrateLegacyJobsPage(ctx, state);
+    const missions = idleMigrationPage(Boolean(state.missionsComplete));
+    return {
+      phase: "jobs" as const,
+      jobs,
+      missions,
+      complete: jobs.complete && missions.complete,
+    };
+  }
+  if (!state.missionsComplete) {
+    const jobs = idleMigrationPage(true);
+    const missions = await migrateLegacyMissionsPage(ctx, state);
+    return {
+      phase: "missions" as const,
+      jobs,
+      missions,
+      complete: missions.complete,
+    };
+  }
+  return {
+    phase: "complete" as const,
+    jobs: idleMigrationPage(true),
+    missions: idleMigrationPage(true),
+    complete: true,
+  };
+}
+
 export const migrateControlPlane = mutation({
   args: { workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
-    const jobs = await migrateLegacyJobsPage(ctx);
-    const missions = await migrateLegacyMissionsPage(ctx);
-    return { jobs, missions, complete: jobs.complete && missions.complete };
+    return await migrateControlPlaneStep(ctx);
   },
 });
 
