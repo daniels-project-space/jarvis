@@ -19,6 +19,12 @@ const SOFTWARE_DELIVERY_ACTION = /^(?:deploy|merge)$/i;
 const TECHNICAL_PUBLICATION =
   /\b(?:convex|trigger(?:\.dev)?|vercel|function|schema|migration|build|release|deployment)\b/i;
 
+// In repository prose, these hyphenated forms use "post-" to mean "after".
+// Keep the allowlist technical and exact so "post the findings" remains an
+// external publication action.
+const TECHNICAL_TEMPORAL_POST_PREFIX =
+  /^-(?:index(?:ed|ing)?(?:-stage)?|merge)\b/i;
+
 // A delivery controller can move its review prompt to a local child process
 // through standard input. These patterns describe the object and transport,
 // not merely co-occurring technical words, so a direct or named recipient
@@ -66,7 +72,20 @@ const NOMINAL_COMMUNICATION_TAIL =
   /^(?:['’]s\s+)?(?:association|body|content|correctness|event|handler|handling|id|latency|ordering|parser|payload|protocol|schema|state|status|stream|text|timing|trace|turn)\b/i;
 
 const NOMINAL_COMMUNICATION_LEAD =
-  /\b(?:a|an|the|this|that|these|those|my|your|his|her|its|our|their|first|second|third|last|previous|next|incoming|outgoing|assistant|user|chat|foreground|model|synthetic|customer|tenant)\s*$/i;
+  /\b(?:a|an|the|this|that|these|those|my|your|his|her|its|our|their|first|second|third|last|previous|next|incoming|outgoing|assistant|user|chat|foreground|model|synthetic|customer|tenant|parent)\s*$/i;
+
+const COMMUNICATION_DETERMINER_LEAD =
+  /\b(?:a|an|the|this|that|these|those|my|your|his|her|its|our|their)\s*$/i;
+
+// A determiner makes "message" / "reply" a noun in clauses such as "a
+// message arriving during handoff". Limit the extra grammar to present
+// participles; direct imperatives such as "message arriving passengers" have
+// no determiner and still reach the consequential gate.
+const NOMINAL_COMMUNICATION_PARTICIPIAL_TAIL =
+  /^[a-z]+ing\b/i;
+
+const PASSIVE_EXTERNAL_COMMUNICATION =
+  /\b(?:sent|emailed|messaged|replied|contacted|published|posted|advertised)\b/i;
 
 const NOMINAL_COMMUNICATION_AFTER_LEAD =
   /^(?:['’]s\b|(?:to|from|was|were|is|are|has|had|text|content|body|payload|event|turn)\b|$)/i;
@@ -235,14 +254,17 @@ function consequentialUse(action: string, clause: string, actionIndex: number): 
       NOMINAL_COMMUNICATION_LEAD.test(before)
       && (NOMINAL_COMMUNICATION_TAIL.test(after) || NOMINAL_COMMUNICATION_AFTER_LEAD.test(after))
     ) return false;
+    if (
+      COMMUNICATION_DETERMINER_LEAD.test(before)
+      && NOMINAL_COMMUNICATION_PARTICIPIAL_TAIL.test(after)
+      && !PASSIVE_EXTERNAL_COMMUNICATION.test(after)
+    ) return false;
   }
   if (normalized === "send") {
     if (controllerReviewStdinTransfer(clause, before, after)) return false;
   }
   if (normalized === "post") {
-    // In "post-index" / "post-index-stage", post- is the technical prefix
-    // meaning "after", not an imperative to publish content.
-    if (/^-index(?:ed|ing)?(?:-stage)?\b/i.test(after)) return false;
+    if (TECHNICAL_TEMPORAL_POST_PREFIX.test(after)) return false;
   }
   if (normalized === "message") {
     // Repository instructions routinely describe a git commit message, while

@@ -203,6 +203,41 @@ describe("server-side work approval policy", () => {
     ).toBe(true);
   });
 
+  it("keeps technical temporal prefixes and communication nouns internal", () => {
+    for (const task of [
+      "Final delivery must prove the exact post-merge commit is live on the production Vercel alias and on each impacted provider before marking the job done.",
+      "Preserve and test the valuable fixes; associate captions and TTS with the exact request and parent message.",
+      "Prove with deterministic tests that a message arriving during handoff is claimed without a cold gap.",
+      "Measure the post-merge handoff latency and retain the parent reply.",
+      "Verify that the reply waiting during handoff keeps its request association.",
+    ]) {
+      expect(classifyWorkSafety(task, { repo: "jarvis" })).toEqual({
+        approvalRequired: false,
+        boundary: "internal",
+      });
+      expect(workApprovalPolicy({ task, repo: "jarvis", risk: "high" })).toMatchObject({
+        required: false,
+        deliveryMode: "auto_merge",
+      });
+    }
+  });
+
+  it("does not let temporal prefixes or communication nouns waive real external actions", () => {
+    for (const task of [
+      "Post the merge findings publicly.",
+      "Publish the post-merge report publicly.",
+      "Message the parent about the caption and TTS.",
+      "Reply to the parent message.",
+      "Send the parent message to the customer.",
+      "Message arriving passengers about the delay.",
+      "A message arriving during handoff should be sent to the customer.",
+      "Review the parent message and reply to the tenant.",
+    ]) {
+      expect(classifyWorkSafety(task, { repo: "jarvis" }).approvalRequired, task).toBe(true);
+      expect(workApprovalPolicy({ task, repo: "jarvis" }).required, task).toBe(true);
+    }
+  });
+
   it("keeps mixed technical clauses gated and explicit prohibitions autonomous", () => {
     for (const mixed of [
       "Send the delivery-controller review prompt through stdin and message the maintainer.",
