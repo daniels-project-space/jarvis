@@ -21,7 +21,56 @@ export function codexModelFor(tier: string): CodexModelSelection {
   return CODEX_MODEL_POLICY[normalizeWorkModelTier(tier)];
 }
 
-export function codexExecPrefix(tier: string, effort?: unknown): string[] {
+const MODEL_ONLY_FEATURES = [
+  "shell_tool",
+  "unified_exec",
+  "apps",
+  "plugins",
+  "hooks",
+  "browser_use",
+  "computer_use",
+  "multi_agent",
+] as const;
+
+const SPECIALIST_DISABLED_FEATURES = [
+  "apps",
+  "plugins",
+  "hooks",
+  "browser_use",
+  "computer_use",
+  "multi_agent",
+] as const;
+
+function disabledFeatures(features: readonly string[]): string[] {
+  return features.flatMap((feature) => ["--disable", feature]);
+}
+
+function specialistShellEnvironment(workspace: string, path: string): string {
+  const values = {
+    PATH: path || "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    HOME: workspace,
+    LANG: "C.UTF-8",
+    CI: "1",
+    GIT_TERMINAL_PROMPT: "0",
+    GH_PROMPT_DISABLED: "1",
+  };
+  return `shell_environment_policy.set={ ${Object.entries(values)
+    .map(([key, value]) => `${key} = ${JSON.stringify(value)}`)
+    .join(", ")} }`;
+}
+
+/**
+ * The only model-child profile with command tools. The outer launcher adds a
+ * user/PID namespace; this classic workspace-write policy deliberately stays
+ * legacy-round-trippable so `features.use_legacy_landlock` cannot select
+ * Bubblewrap again.
+ */
+export function codexExecPrefix(
+  tier: string,
+  effort?: unknown,
+  workspace = process.cwd(),
+  path = process.env.PATH ?? "",
+): string[] {
   const selected = codexModelFor(tier);
   const reasoningEffort = normalizeReasoningEffort(effort, selected.effort);
   return [
@@ -31,7 +80,32 @@ export function codexExecPrefix(tier: string, effort?: unknown): string[] {
     selected.model,
     "--config",
     `model_reasoning_effort=\"${reasoningEffort}\"`,
-    "--dangerously-bypass-approvals-and-sandbox",
+    "--sandbox",
+    "workspace-write",
+    "--ephemeral",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--skip-git-repo-check",
+    "--strict-config",
+    "--cd",
+    workspace,
+    "--config",
+    'approval_policy="never"',
+    "--config",
+    "features.use_legacy_landlock=true",
+    "--config",
+    "sandbox_workspace_write.network_access=false",
+    "--config",
+    "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+    "--config",
+    "sandbox_workspace_write.exclude_slash_tmp=true",
+    "--config",
+    "allow_login_shell=false",
+    "--config",
+    'shell_environment_policy.inherit="none"',
+    "--config",
+    specialistShellEnvironment(workspace, path),
+    ...disabledFeatures(SPECIALIST_DISABLED_FEATURES),
   ];
 }
 
@@ -66,43 +140,34 @@ export function codexReviewExecPrefix(tier: string, effort?: unknown): string[] 
     'shell_environment_policy.inherit="none"',
     "--config",
     "project_doc_max_bytes=0",
-    "--disable",
-    "shell_tool",
-    "--disable",
-    "unified_exec",
-    "--disable",
-    "apps",
-    "--disable",
-    "plugins",
-    "--disable",
-    "hooks",
-    "--disable",
-    "browser_use",
-    "--disable",
-    "computer_use",
-    "--disable",
-    "multi_agent",
+    ...disabledFeatures(MODEL_ONLY_FEATURES),
   ];
 }
 
-// Foreground conversation already supplies its own persona, policy and
-// capability bridge. Skipping repository/user bootstrap avoids loading the
-// general Codex plugin + MCP stack on every short turn while retaining full
-// shell access for Jarvis's private tool endpoint. Durable coding agents keep
-// the broader codexExecPrefix above.
+// Memory and fallback foreground execs are reasoning-only. Jarvis capabilities
+// are served by the controller-owned dynamic-tool bridge, never a shell.
 export function codexConversationExecPrefix(tier: string): string[] {
-  const selected = codexModelFor(tier);
+  return codexReviewExecPrefix(tier);
+}
+
+/** Strict process-level defaults for the warm foreground app-server. */
+export function codexAppServerArgs(): string[] {
   return [
-    "exec",
-    "--model",
-    selected.model,
+    "app-server",
+    "--listen",
+    "stdio://",
+    "--strict-config",
     "--config",
-    `model_reasoning_effort=\"${selected.effort}\"`,
-    "--sandbox",
-    "danger-full-access",
-    "--skip-git-repo-check",
-    "--ignore-user-config",
-    "--ignore-rules",
+    'approval_policy="never"',
+    "--config",
+    'sandbox_mode="read-only"',
+    "--config",
+    'web_search="disabled"',
+    "--config",
+    'shell_environment_policy.inherit="none"',
+    "--config",
+    "project_doc_max_bytes=0",
+    ...disabledFeatures(MODEL_ONLY_FEATURES),
   ];
 }
 

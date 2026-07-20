@@ -52,8 +52,21 @@ describe("trusted provider release planning", () => {
       .toEqual([]);
   });
 
+  it("includes non-code assets and runtime file inputs reached through provider bundles", () => {
+    const sources = {
+      "convex/jobs.ts": 'import schema from "../src/lib/provider-schema.json"; export const value = schema;',
+      "src/trigger/agent-runner.ts": 'const worker = new URL("../lib/provider-worker.wasm", import.meta.url); export { worker };',
+      "src/lib/provider-schema.json": '{"ok":true}',
+      "src/lib/provider-worker.wasm": "",
+    };
+    expect(analyseProviderImpact([
+      "src/lib/provider-schema.json",
+      "src/lib/provider-worker.wasm",
+    ], sources).providers).toEqual(["convex", "trigger"]);
+  });
+
   it("fails closed for package, lock, root config, and provider build scripts", () => {
-    for (const path of ["package.json", "package-lock.json", "tsconfig.json", "instrumentation.config.ts", "scripts/release-provider.mjs"]) {
+    for (const path of ["package.json", "package-lock.json", "packages/shared/package.json", "tsconfig.json", "instrumentation.config.ts", "scripts/release-provider.mjs"]) {
       expect(providerKindsForPaths([path]), path).toEqual(["convex", "trigger"]);
     }
   });

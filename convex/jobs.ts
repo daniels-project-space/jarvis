@@ -23,6 +23,14 @@ const STALE_RUNNER_MS = 5 * 60 * 1000;
 const DISPATCH_LEASE_MS = 2 * 60 * 1000;
 const PROVIDER_RELEASE_LEASE_MS = 10 * 60 * 1000;
 
+export function runningActivityIsStale(
+  activity: { status?: unknown; heartbeatAt?: unknown },
+  now: number,
+): boolean {
+  return activity.status === "running"
+    && Number(activity.heartbeatAt ?? 0) <= now - STALE_RUNNER_MS;
+}
+
 const providerReleaseValidator = v.object({
   releaseId: v.string(),
   repository: v.string(),
@@ -865,6 +873,7 @@ export const reapStale = mutation({
     const requeued: string[] = [];
     const abandoned: string[] = [];
     for (const activity of running) {
+      if (!runningActivityIsStale(activity, now)) continue;
       const j = await ctx.db.get(activity.jobId);
       if (!j || j.status !== "running" || (j.attempt ?? 1) !== activity.attempt) {
         if (j) await upsertJobRuntime(ctx, j);
@@ -1367,6 +1376,46 @@ export const updateProviderRelease = mutation({
 // Heartbeats are controller-authenticated lock renewals, not elapsed-time
 // guesses. The same identity check is called once more immediately before the
 // GitHub PUT and before atomic post-merge finalization.
+export async function renewProviderReleaseLockTransaction(ctx: any, a: {
+  jobId: any;
+  expectedAttempt: number;
+  releaseId: string;
+  baseSha: string;
+  headSha: string;
+  leaseToken: string;
+}, now = Date.now()) {
+  const row = await ctx.db.get(a.jobId);
+  if (
+    !row
+    || row.status !== "running"
+    || (row.attempt ?? 1) !== a.expectedAttempt
+    || row.providerRelease?.releaseId !== a.releaseId
+    || row.providerRelease?.baseSha !== a.baseSha
+    || row.providerRelease?.headSha !== a.headSha
+  ) return { ok: false, reason: "provider release job ownership changed" };
+  const lock = await ctx.db
+    .query("providerReleaseLocks")
+    .withIndex("by_repo", (q: any) => q.eq("repo", normalizedRepo(row.repo)))
+    .first();
+  if (
+    !lock
+    || lock.releaseId !== a.releaseId
+    || lock.jobId !== a.jobId
+    || lock.baseSha !== a.baseSha
+    || lock.headSha !== a.headSha
+    || lock.leaseToken !== a.leaseToken
+    || lock.leaseUntil <= now
+    || lock.status === "delivered"
+  ) return { ok: false, reason: "provider release lock is missing, expired, or owned elsewhere" };
+  const leaseUntil = now + PROVIDER_RELEASE_LEASE_MS;
+  // Convex commits the lock, durable job heartbeat and compact reaper index in
+  // one serializable transaction. Provider waits therefore cannot be
+  // duplicated by the five-minute stale-runner reaper.
+  await ctx.db.patch(lock._id, { leaseUntil, updatedAt: now });
+  await patchJobWithRuntime(ctx, row, { heartbeatAt: now });
+  return { ok: true, leaseUntil };
+}
+
 export const renewProviderReleaseLock = mutation({
   args: {
     jobId: v.id("jobs"),
@@ -1379,35 +1428,7 @@ export const renewProviderReleaseLock = mutation({
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
-    const row = await ctx.db.get(a.jobId);
-    if (
-      !row
-      || row.status !== "running"
-      || (row.attempt ?? 1) !== a.expectedAttempt
-      || row.providerRelease?.releaseId !== a.releaseId
-      || row.providerRelease?.baseSha !== a.baseSha
-      || row.providerRelease?.headSha !== a.headSha
-    ) return { ok: false, reason: "provider release job ownership changed" };
-    const lock = await ctx.db
-      .query("providerReleaseLocks")
-      .withIndex("by_repo", (q: any) => q.eq("repo", normalizedRepo(row.repo)))
-      .first();
-    const now = Date.now();
-    if (
-      !lock
-      || lock.releaseId !== a.releaseId
-      || lock.jobId !== a.jobId
-      || lock.baseSha !== a.baseSha
-      || lock.headSha !== a.headSha
-      || lock.leaseToken !== a.leaseToken
-      || lock.leaseUntil <= now
-      || lock.status === "delivered"
-    ) return { ok: false, reason: "provider release lock is missing, expired, or owned elsewhere" };
-    await ctx.db.patch(lock._id, {
-      leaseUntil: now + PROVIDER_RELEASE_LEASE_MS,
-      updatedAt: now,
-    });
-    return { ok: true, leaseUntil: now + PROVIDER_RELEASE_LEASE_MS };
+    return await renewProviderReleaseLockTransaction(ctx, a);
   },
 });
 

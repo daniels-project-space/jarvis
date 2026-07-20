@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  assertSubscriptionCredentialFresh,
   isolateSubscriptionEnv,
   missingSubscriptionTools,
   prepareSubscriptionEnv,
@@ -10,65 +11,129 @@ import {
   resolveSubscriptionAgentBin,
 } from "./subscription-runtime";
 
+function jwt(expMs: number): string {
+  const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({ exp: Math.floor(expMs / 1000) })).toString("base64url");
+  return `${header}.${payload}.synthetic`;
+}
+
+function authEnvelope(accessToken: string): string {
+  return Buffer.from(JSON.stringify({
+    tokens: {
+      access_token: accessToken,
+      refresh_token: "synthetic-refresh-never-write",
+    },
+  })).toString("base64");
+}
+
+function allFiles(root: string): string[] {
+  const files: string[] = [];
+  const visit = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else files.push(path);
+    }
+  };
+  visit(root);
+  return files;
+}
+
 describe("subscription subprocess capability scope", () => {
-  afterEach(() => vi.unstubAllEnvs());
-
-  it("withholds dispatcher, worker and GitHub authority from specialists", () => {
-    vi.stubEnv("JARVIS_DISPATCH_TOKEN", "dispatch-capability");
-    vi.stubEnv("JARVIS_WORKER_TOKEN", "worker-capability");
-    vi.stubEnv("GITHUB_TOKEN", "github-capability");
-    const specialist = prepareSubscriptionEnv("codex").env;
-    expect(specialist.JARVIS_DISPATCH_TOKEN).toBeUndefined();
-    expect(specialist.JARVIS_WORKER_TOKEN).toBeUndefined();
-    expect(specialist.GITHUB_TOKEN).toBeUndefined();
-    expect(specialist.GH_TOKEN).toBeUndefined();
+  it("extracts only the expiring access token in memory and never materializes auth JSON", () => {
+    const now = 2_000_000_000_000;
+    const root = mkdtempSync(join(tmpdir(), "jarvis-codex-auth-test-"));
+    const accessToken = jwt(now + 60 * 60_000);
+    try {
+      const prepared = prepareSubscriptionEnv("codex", {
+        boundedRuntimeMs: 25 * 60_000,
+        nowMs: now,
+        runtimeRoot: root,
+        scope: "worker",
+        sourceEnv: {
+          PATH: process.env.PATH,
+          CODEX_AUTH_JSON_B64: authEnvelope(accessToken),
+          JARVIS_DISPATCH_TOKEN: "synthetic-dispatch",
+          JARVIS_WORKER_TOKEN: "synthetic-worker",
+          GITHUB_TOKEN: "synthetic-github",
+          VAULT_ACCESS_TOKEN: "synthetic-vault",
+        },
+      });
+      expect(prepared.error).toBeUndefined();
+      expect(prepared.env.CODEX_ACCESS_TOKEN).toBe(accessToken);
+      expect(prepared.env.CODEX_AUTH_JSON_B64).toBeUndefined();
+      expect(prepared.env.JARVIS_DISPATCH_TOKEN).toBeUndefined();
+      expect(prepared.env.JARVIS_WORKER_TOKEN).toBeUndefined();
+      expect(prepared.env.GITHUB_TOKEN).toBeUndefined();
+      expect(prepared.env.VAULT_ACCESS_TOKEN).toBeUndefined();
+      expect(existsSync(join(String(prepared.env.CODEX_HOME), "auth.json"))).toBe(false);
+      const disk = allFiles(root).map((path) => readFileSync(path, "utf8")).join("\n");
+      expect(disk).not.toContain(accessToken);
+      expect(disk).not.toContain("synthetic-refresh-never-write");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
-  it("preserves the executable and network runtime without passing application authority", () => {
-    vi.stubEnv("PATH", process.env.PATH ?? "/usr/bin:/bin");
-    vi.stubEnv("HTTPS_PROXY", "http://proxy.internal:8080");
-    vi.stubEnv("CODEX_ACCESS_TOKEN", "subscription-token");
-    const specialist = prepareSubscriptionEnv("codex").env;
-    expect(specialist.PATH).toBe(process.env.PATH);
-    expect(specialist.HTTPS_PROXY).toBe("http://proxy.internal:8080");
-    expect(specialist.GIT_TERMINAL_PROMPT).toBe("0");
+  it("fails closed with an explicit refresh status when JWT life cannot cover the segment plus margin", () => {
+    const now = 2_000_000_000_000;
+    const root = mkdtempSync(join(tmpdir(), "jarvis-codex-expiry-test-"));
+    try {
+      const prepared = prepareSubscriptionEnv("codex", {
+        boundedRuntimeMs: 15 * 60_000,
+        nowMs: now,
+        runtimeRoot: root,
+        sourceEnv: {
+          PATH: process.env.PATH,
+          CODEX_AUTH_JSON_B64: authEnvelope(jwt(now + 19 * 60_000)),
+        },
+      });
+      expect(prepared.status).toBe("credential_refresh_required");
+      expect(prepared.error).toContain("refresh required");
+      expect(() => assertSubscriptionCredentialFresh(prepared.env, 15 * 60_000, now))
+        .toThrow("refresh required");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
-  it("finds every required specialist binary on the worker PATH", () => {
-    expect(missingSubscriptionTools(process.env, REQUIRED_AGENT_TOOLS)).toEqual([]);
+  it("rejects raw auth JSON instead of copying its refresh credential", () => {
+    const root = mkdtempSync(join(tmpdir(), "jarvis-codex-raw-auth-test-"));
+    try {
+      const prepared = prepareSubscriptionEnv("codex", {
+        runtimeRoot: root,
+        sourceEnv: { PATH: process.env.PATH, CODEX_AUTH_JSON: '{"tokens":{}}' },
+      });
+      expect(prepared.error).toContain("raw Codex auth JSON is forbidden");
+      expect(allFiles(root)).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
-  it("reports an honest missing-tool list for an over-sanitized PATH", () => {
-    expect(missingSubscriptionTools({ PATH: "/definitely/missing" }, ["curl", "git"])).toEqual(["curl", "git"]);
-  });
-
-  it("keeps bridge authentication in the Trigger host instead of every Codex child", () => {
-    vi.stubEnv("JARVIS_DISPATCH_TOKEN", "dispatch-capability");
-    vi.stubEnv("JARVIS_WORKER_TOKEN", "worker-capability");
-    const supervisor = prepareSubscriptionEnv("codex").env;
-    expect(supervisor.JARVIS_DISPATCH_TOKEN).toBeUndefined();
-    expect(supervisor.JARVIS_WORKER_TOKEN).toBeUndefined();
-  });
-
-  it("ships the pinned Codex CLI that Trigger conversation workers resolve", () => {
-    expect(resolveSubscriptionAgentBin("codex")).toMatch(/codex/);
-  });
-
-  it("gives concurrent agents separate Codex homes with shared auth only", () => {
-    const root = mkdtempSync(join(tmpdir(), "jarvis-codex-test-"));
+  it("gives concurrent agents separate credentialless homes with only the scoped briefing", () => {
+    const root = mkdtempSync(join(tmpdir(), "jarvis-codex-home-test-"));
     const source = join(root, "source");
     const homes = join(root, "homes");
     try {
       mkdirSync(source, { recursive: true });
-      writeFileSync(join(source, "auth.json"), '{"tokens":{}}');
+      writeFileSync(join(source, "auth.json"), "synthetic stale credential");
       writeFileSync(join(source, "AGENTS.md"), "scoped briefing");
-      const one = isolateSubscriptionEnv({ ...process.env, CODEX_HOME: source }, "job-one", homes);
-      const two = isolateSubscriptionEnv({ ...process.env, CODEX_HOME: source }, "job-two", homes);
+      const one = isolateSubscriptionEnv({ CODEX_HOME: source }, "job-one", homes);
+      const two = isolateSubscriptionEnv({ CODEX_HOME: source }, "job-two", homes);
       expect(one.CODEX_HOME).not.toBe(two.CODEX_HOME);
       expect(readFileSync(join(String(one.CODEX_HOME), "AGENTS.md"), "utf8")).toBe("scoped briefing");
-      expect(readFileSync(join(String(two.CODEX_HOME), "auth.json"), "utf8")).toContain("tokens");
+      expect(existsSync(join(String(one.CODEX_HOME), "auth.json"))).toBe(false);
+      expect(existsSync(join(String(two.CODEX_HOME), "auth.json"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("finds the pinned runtime and every required specialist executable", () => {
+    expect(resolveSubscriptionAgentBin("codex")).toMatch(/codex/);
+    expect(missingSubscriptionTools(process.env, REQUIRED_AGENT_TOOLS)).toEqual([]);
+    expect(missingSubscriptionTools({ PATH: "/definitely/missing" }, ["curl", "git"]))
+      .toEqual(["curl", "git"]);
   });
 });

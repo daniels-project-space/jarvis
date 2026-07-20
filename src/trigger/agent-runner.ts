@@ -8,6 +8,7 @@ import { projectProviderBoundary } from "../lib/project-registry";
 import { routeWork } from "../mastra/routing";
 import { TEAM_BY_SLUG, type AgentSlug } from "../mastra/team";
 import {
+  codexConversationExecPrefix,
   codexExecPrefix,
   codexModelFor,
   normalizeReasoningEffort,
@@ -15,7 +16,6 @@ import {
 import { reviewPrompt } from "./codex-review";
 import { normalizeWorkModelTier } from "../lib/work-models";
 import { githubGitEnv, githubRepoUrl } from "./git-transport";
-import { vaultService } from "../lib/vault-client";
 import { buildContinuationCheckpoint, segmentTimeoutMs } from "./continuation";
 import { runWatchSweep } from "./watch-runtime";
 import {
@@ -71,7 +71,8 @@ import {
   type GitReviewBinding,
   type GitReviewEnvelope,
 } from "./git-review-receipt";
-import { spawnSpecialist, verifySpecialistSandboxIsolation } from "./specialist-sandbox";
+import { spawnCodex } from "./codex-launcher";
+import { verifySpecialistSandboxIsolation } from "./specialist-sandbox";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -80,8 +81,16 @@ import { spawnSpecialist, verifySpecialistSandboxIsolation } from "./specialist-
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
 
-function promptArgs(prompt: string, tier: string, json = false, mcpConfig?: string | null, reasoningEffort?: unknown): string[] {
-  const args = codexExecPrefix(tier, reasoningEffort);
+function promptArgs(
+  prompt: string,
+  tier: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  json = false,
+  mcpConfig?: string | null,
+  reasoningEffort?: unknown,
+): string[] {
+  const args = codexExecPrefix(tier, reasoningEffort, cwd, env.PATH);
   if (json) args.push("--json");
   if (mcpConfig) {
     try {
@@ -95,11 +104,13 @@ function promptArgs(prompt: string, tier: string, json = false, mcpConfig?: stri
 
 function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, tier: string, timeoutMs: number): Promise<string> {
   return new Promise((resolve) => {
-    const p = spawnSpecialist({
+    const p = spawnCodex({
+      mode: "restricted",
       command: bin,
-      args: promptArgs(prompt, tier),
+      args: [...codexConversationExecPrefix(tier), prompt],
       cwd: String(env.CODEX_HOME),
       env,
+      boundedRuntimeMs: timeoutMs,
     }, { stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     const timer = setTimeout(() => { try { p.kill("SIGKILL"); } catch { /* gone */ } resolve(output); }, timeoutMs);
@@ -171,28 +182,23 @@ function pickAgentModel(task: string): string {
 async function buildMcpConfig(
   names: string[],
   jobKey: string,
-): Promise<{ configPath: string | null; env: Record<string, string> }> {
+): Promise<{ configPath: string | null; env: Record<string, string>; unavailable: string[] }> {
   const servers: Record<string, unknown> = {};
   const runtimeEnv: Record<string, string> = {};
+  const unavailable: string[] = [];
   for (const n of names) {
     if (["playwright", "browser", "browserbase"].includes(n)) {
-      const bb = await vaultService("browserbase");
-      if (bb.BROWSERBASE_API_KEY) {
-        runtimeEnv.BROWSERBASE_API_KEY = bb.BROWSERBASE_API_KEY;
-        runtimeEnv.BROWSERBASE_PROJECT_ID = bb.BROWSERBASE_PROJECT_ID ?? "";
-        servers["browserbase"] = {
-          command: "npx",
-          args: ["-y", "@browserbasehq/mcp-server-browserbase"],
-          envVars: ["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
-        };
-      }
+      // A credentialed stdio MCP would place a provider token in the same
+      // Codex process tree. Preserve the explicit safe handoff until a
+      // controller-hosted capability proxy exists.
+      unavailable.push("browserbase (credentialed MCP requires the controller proxy)");
     }
     if (n === "context7") servers["context7"] = { command: "npx", args: ["-y", "@upstash/context7-mcp"] };
   }
-  if (!Object.keys(servers).length) return { configPath: null, env: runtimeEnv };
+  if (!Object.keys(servers).length) return { configPath: null, env: runtimeEnv, unavailable };
   const path = `/tmp/work/mcp-${jobKey.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`;
   writeFileSync(path, JSON.stringify({ mcpServers: servers }));
-  return { configPath: path, env: runtimeEnv };
+  return { configPath: path, env: runtimeEnv, unavailable };
 }
 
 // The weave: a short spoken report that CONTAINS the answer — Daniel complained
@@ -283,15 +289,16 @@ function runAgent(
   commands: GitCommandEvidence[];
 }> {
   return new Promise((resolve) => {
-    const args = promptArgs(prompt, model, true, mcpConfig, reasoningEffort);
+    const args = promptArgs(prompt, model, cwd, env, true, mcpConfig, reasoningEffort);
     const codexSelection = codexModelFor(model);
     const runtimeLabel = `${codexSelection.model} · ${normalizeReasoningEffort(reasoningEffort, codexSelection.effort)}`;
-    const p = spawnSpecialist({
+    const p = spawnCodex({
+      mode: "specialist",
       command: bin,
       args,
       cwd,
       env,
-      readablePaths: mcpConfig ? [mcpConfig] : [],
+      boundedRuntimeMs: timeoutMs,
     }, { stdio: ["ignore", "pipe", "pipe"] });
     let buf = "";
     let stderr = "";
@@ -649,7 +656,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     const provider: AgentProvider = "codex";
     const bin = resolveSubscriptionAgentBin(provider);
     if (!bin) return rejectReservation(`no ${provider} binary`);
-    const prepared = prepareSubscriptionEnv(provider);
+    const prepared = prepareSubscriptionEnv(provider, {
+      boundedRuntimeMs: segmentTimeoutMs("sol"),
+      scope: "agent-worker",
+    });
     if (prepared.error) return rejectReservation(prepared.error);
     const missingTools = missingSubscriptionTools(prepared.env);
     if (missingTools.length) {
@@ -657,7 +667,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     }
     const env = prepared.env;
     mkdirSync("/tmp/work", { recursive: true });
-    const isolation = verifySpecialistSandboxIsolation({ cwd: "/tmp/work", env });
+    const isolation = verifySpecialistSandboxIsolation({ codexBin: bin, cwd: "/tmp/work", env });
     if (!isolation.ok) return rejectReservation(isolation.reason);
     const token = process.env.GITHUB_TOKEN ?? "";
 
@@ -1083,7 +1093,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           ? `\n\nCONCURRENT FOLLOW-UP: this job extends ${job.parentJobId}. That earlier job may still be running. Own this issue independently; do not wait for it or overwrite its branch.`
           : "";
         const upstream = upstreamEvidencePrompt(job.upstreamEvidence);
-        const prompt =
+        let prompt =
           `You are ${profile.name}, JARVIS's permanent ${profile.role}.\n${profile.instructions}\n\n${context}\n\n` +
           `${upstream ? `${upstream}\n\n` : ""}` +
           `TASK:\n${job.task}\n\nDEFINITION OF DONE:\n${criteria.map((item: string) => `- ${item}`).join("\n")}` +
@@ -1093,7 +1103,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         );
         const mcp = Array.isArray(job.mcp) && job.mcp.length
           ? await buildMcpConfig(job.mcp, jobKey)
-          : { configPath: null, env: {} };
+          : { configPath: null, env: {}, unavailable: [] };
+        if (mcp.unavailable.length) {
+          prompt += `\n\nSCOPED CAPABILITY HANDOFF: ${mcp.unavailable.join(", ")} is unavailable inside the specialist credential boundary. Preserve the gap honestly; do not request broader credentials or claim the provider trace ran.`;
+        }
         const agentEnv = { ...jobEnv, ...mcp.env };
         let lastDurableProgressAt = 0;
         let lastDurableStage = "";
@@ -1839,9 +1852,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       const body = synth.results
         .map((r: any) => `### ${r.label} [${r.status}]\n${r.result || "(no output)"}`)
         .join("\n\n");
-      const merged = await runAgent(
+      const merged = await plainPrompt(
         bin,
-        "/tmp/work",
         env,
         `You are JARVIS's mission synthesizer. A fleet of agents just finished parallel work on ONE mission. ` +
           `Merge their results into a single coherent markdown report: start with "## Mission" and a 2-sentence outcome, ` +
@@ -1849,9 +1861,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           `(concrete recommended actions). Be direct; flag agents that failed. Under 500 words.\n\n` +
           `MISSION: ${synth.goal}\n\nAGENT RESULTS:\n${body.slice(0, 24000)}`,
         "terra",
+        90_000,
       );
-      const report = merged.text && !/^error:/.test(merged.text) && merged.text !== "(no output)"
-        ? merged.text
+      const report = merged && !/^error:/.test(merged) && merged !== "(no output)"
+        ? merged
         : `## Mission\n${synth.goal}\n\n${body.slice(0, 6000)}`;
       const finished = await convexMutation("missions:finish", {
         id: missionId,

@@ -1,5 +1,4 @@
 import { schedules, task, tasks } from "@trigger.dev/sdk/v3";
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
@@ -21,6 +20,7 @@ import {
   type ForegroundTurnPayload,
 } from "./foreground-policy";
 import { CodexAppServer } from "./codex-app-server";
+import { spawnCodex } from "./codex-launcher";
 import {
   AgentToolBridge,
   JARVIS_DYNAMIC_TOOLS,
@@ -171,10 +171,14 @@ async function extractAndSave(
     "Output [] if nothing is worth remembering. No prose, JSON only.\n\n" +
     `User: ${userText}\nAssistant: ${assistantText}`;
   const out = await new Promise<string>((resolve) => {
-    const p = spawn(bin, cliArgs(provider, prompt, "luna"), {
+    const p = spawnCodex({
+      mode: "restricted",
+      command: bin,
+      args: cliArgs(provider, prompt, "luna"),
+      cwd: String(env.CODEX_HOME),
       env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+      boundedRuntimeMs: 90_000,
+    }, { stdio: ["ignore", "pipe", "pipe"] });
     let o = "";
     const timeout = setTimeout(() => p.kill("SIGKILL"), 90_000);
     p.stdout.on("data", (d) => (o += d.toString()));
@@ -219,7 +223,10 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
   const provider: AgentProvider = "codex";
   const dispatchToken = process.env.JARVIS_DISPATCH_TOKEN;
   if (!dispatchToken) return { processed: 0, error: "JARVIS_DISPATCH_TOKEN is not configured" };
-  const prepared = prepareSubscriptionEnv(provider);
+  const prepared = prepareSubscriptionEnv(provider, {
+    boundedRuntimeMs: RUN_BUDGET_MS + 60_000,
+    scope: "foreground",
+  });
   if (prepared.error) return { processed: 0, error: prepared.error };
   const env = prepared.env;
   const bin = resolveSubscriptionAgentBin(provider);
@@ -231,6 +238,7 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
   const server = new CodexAppServer(bin, env, FOREGROUND_TURN_TIMEOUT_MS, {
     dynamicTools: JARVIS_DYNAMIC_TOOLS,
     onDynamicToolCall: (call) => bridge.invoke(call),
+    boundedRuntimeMs: RUN_BUDGET_MS + 60_000,
   });
   // A handoff candidate pays its startup cost before taking ownership. That
   // removes the recurring cold gap that used to appear every few minutes.
@@ -370,7 +378,10 @@ export const chatMemory = task({
   maxDuration: 180,
   run: async (payload: { userText: string; assistantText: string }) => {
     const provider: AgentProvider = "codex";
-    const prepared = prepareSubscriptionEnv(provider);
+    const prepared = prepareSubscriptionEnv(provider, {
+      boundedRuntimeMs: 90_000,
+      scope: "memory",
+    });
     const bin = resolveSubscriptionAgentBin(provider);
     if (prepared.error || !bin) return { saved: 0, error: prepared.error ?? "Codex binary unavailable" };
     return { saved: await extractAndSave(provider, bin, prepared.env, payload.userText, payload.assistantText) };

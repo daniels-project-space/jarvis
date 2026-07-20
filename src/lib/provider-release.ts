@@ -129,10 +129,14 @@ export type ProviderReleaseOperations = {
   now?: () => number;
 };
 
-const SOURCE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json"];
-const GLOBAL_PROVIDER_INPUT = /^(?:package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|\.npmrc|\.node-version|\.nvmrc|\.tool-versions|tsconfig(?:\.[^/]+)?\.json|[^/]+\.config\.[cm]?[jt]s)$/i;
+const SOURCE_EXTENSIONS = [
+  ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json",
+  ".css", ".scss", ".sass", ".less", ".graphql", ".gql", ".sql", ".wasm",
+];
+const GLOBAL_PROVIDER_INPUT = /^(?:(?:[^/]+\/)*(?:package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)|\.npmrc|\.node-version|\.nvmrc|\.tool-versions|tsconfig(?:\.[^/]+)?\.json|vercel\.json|[^/]+\.config\.[cm]?[jt]s)$/i;
 const SOURCE_LIKE = /\.(?:[cm]?[jt]sx?|json)$/i;
 const IMPORT_SPECIFIER = /(?:\b(?:import|export)\s+(?:type\s+)?(?:[^"']*?\s+from\s*)?|\brequire\s*\(|\bimport\s*\()\s*["']([^"']+)["']/g;
+const RUNTIME_FILE_SPECIFIER = /\b(?:new\s+URL|readFile(?:Sync)?|readFile)\s*\(\s*["']([^"']+)["']/g;
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 
@@ -240,7 +244,7 @@ export function providerKindsForPaths(paths: readonly string[]): ProviderKind[] 
     const path = normalizedPath(rawPath);
     if (!path || path === ".." || path.startsWith("../") || path.includes("/../")) continue;
     for (const kind of globalInputProviders(path)) kinds.add(kind);
-    if (/^(?:src\/lib|lib|shared)\//.test(path) && SOURCE_LIKE.test(path)) {
+    if (/^(?:src\/(?:lib|shared)|lib|shared)\//.test(path)) {
       kinds.add("convex");
       kinds.add("trigger");
     }
@@ -248,23 +252,31 @@ export function providerKindsForPaths(paths: readonly string[]): ProviderKind[] 
   return orderedKinds(kinds);
 }
 
-function resolveLocalImport(from: string, specifier: string, sources: ReadonlyMap<string, string>): string | null {
+function resolveLocalImports(from: string, specifier: string, sources: ReadonlyMap<string, string>): string[] {
   let candidate: string;
   if (specifier.startsWith(".")) candidate = normalizedPath(posix.join(dirname(from), specifier));
   else if (specifier.startsWith("@/")) candidate = normalizedPath(`src/${specifier.slice(2)}`);
   else if (specifier.startsWith("~/")) candidate = normalizedPath(`src/${specifier.slice(2)}`);
-  else return null;
-  const candidates = extname(candidate)
+  else return [];
+  const explicit = extname(candidate)
     ? [candidate]
     : [candidate, ...SOURCE_EXTENSIONS.map((extension) => `${candidate}${extension}`), ...SOURCE_EXTENSIONS.map((extension) => `${candidate}/index${extension}`)];
-  return candidates.find((path) => sources.has(path)) ?? null;
+  const candidates = new Set(explicit);
+  if (!extname(candidate)) {
+    for (const path of sources.keys()) {
+      if (path.startsWith(`${candidate}.`) || path.startsWith(`${candidate}/index.`)) candidates.add(path);
+    }
+  }
+  return [...candidates].filter((path) => sources.has(path));
 }
 
 function importsFor(path: string, source: string, sources: ReadonlyMap<string, string>): string[] {
   const imports = new Set<string>();
-  for (const match of source.matchAll(IMPORT_SPECIFIER)) {
-    const resolved = resolveLocalImport(path, match[1], sources);
-    if (resolved) imports.add(resolved);
+  for (const pattern of [IMPORT_SPECIFIER, RUNTIME_FILE_SPECIFIER]) {
+    pattern.lastIndex = 0;
+    for (const match of source.matchAll(pattern)) {
+      for (const resolved of resolveLocalImports(path, match[1], sources)) imports.add(resolved);
+    }
   }
   return [...imports];
 }

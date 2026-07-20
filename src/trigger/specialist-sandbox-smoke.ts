@@ -1,0 +1,184 @@
+import { task } from "@trigger.dev/sdk/v3";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { codexExecPrefix } from "./model-policy";
+import { spawnCodex } from "./codex-launcher";
+import {
+  prepareSubscriptionEnv,
+  resolveSubscriptionAgentBin,
+} from "./subscription-runtime";
+import { verifySpecialistSandboxIsolation } from "./specialist-sandbox";
+
+type ExactSandboxObservation = {
+  readSucceeded?: boolean;
+  workspaceWriteSucceeded?: boolean;
+  outsideWriteBlocked?: boolean;
+  curlBlocked?: boolean;
+  socketBlocked?: boolean;
+  procCredentialVisible?: boolean;
+  namespaceProcSafe?: boolean;
+  tools?: Record<string, boolean>;
+};
+
+const REQUIRED_TOOLS = ["node", "npm", "npx", "git", "gh", "curl"] as const;
+
+export function exactSandboxObservationPassed(observation: ExactSandboxObservation): boolean {
+  return observation.readSucceeded === true
+    && observation.workspaceWriteSucceeded === true
+    && observation.outsideWriteBlocked === true
+    && observation.curlBlocked === true
+    && observation.socketBlocked === true
+    && observation.procCredentialVisible === false
+    && observation.namespaceProcSafe === true
+    && REQUIRED_TOOLS.every((tool) => observation.tools?.[tool] === true);
+}
+
+function probeSource(outsidePath: string): string {
+  return String.raw`
+const fs = require("node:fs");
+const net = require("node:net");
+const { spawnSync } = require("node:child_process");
+
+async function socketBlocked() {
+  return await new Promise((resolve) => {
+    const socket = net.connect({ host: "1.1.1.1", port: 53 });
+    const timer = setTimeout(() => { socket.destroy(); resolve(true); }, 1500);
+    socket.once("connect", () => { clearTimeout(timer); socket.destroy(); resolve(false); });
+    socket.once("error", () => { clearTimeout(timer); resolve(true); });
+  });
+}
+
+(async () => {
+  let readSucceeded = false;
+  try { readSucceeded = fs.readFileSync("fixture.txt", "utf8").trim() === "read-ok"; } catch {}
+  let workspaceWriteSucceeded = false;
+  try { fs.writeFileSync("workspace-write.txt", "write-ok"); workspaceWriteSucceeded = true; } catch {}
+  let outsideWriteBlocked = false;
+  try { fs.writeFileSync(${JSON.stringify(outsidePath)}, "must-not-write"); } catch { outsideWriteBlocked = true; }
+  const curl = spawnSync("curl", ["--connect-timeout", "1", "--max-time", "2", "http://example.com"], { encoding: "utf8" });
+  const curlBlocked = curl.status !== 0;
+  const numericPids = fs.readdirSync("/proc").filter((entry) => /^\d+$/.test(entry)).map(Number);
+  let procCredentialVisible = false;
+  for (const pid of numericPids) {
+    if (pid === process.pid) continue;
+    try {
+      const value = fs.readFileSync("/proc/" + pid + "/environ");
+      if (value.includes(Buffer.from("CODEX_ACCESS_TOKEN=")) || value.includes(Buffer.from("JARVIS_NAMESPACE_SENTINEL="))) {
+        procCredentialVisible = true;
+      }
+    } catch {}
+  }
+  const tools = Object.fromEntries(${JSON.stringify(REQUIRED_TOOLS)}.map((tool) => [
+    tool,
+    spawnSync("/bin/sh", ["-c", "command -v -- \"$1\" >/dev/null", "sh", tool]).status === 0,
+  ]));
+  const observation = {
+    readSucceeded,
+    workspaceWriteSucceeded,
+    outsideWriteBlocked,
+    curlBlocked,
+    socketBlocked: await socketBlocked(),
+    procCredentialVisible,
+    namespaceProcSafe: numericPids.length > 0 && numericPids.length <= 24 && numericPids.every((pid) => pid > 0 && pid < 128),
+    tools,
+  };
+  fs.writeFileSync("sandbox-observation.json", JSON.stringify(observation));
+  process.stdout.write(JSON.stringify(observation));
+})().catch(() => process.exit(1));
+`;
+}
+
+/**
+ * Run inside Trigger's real image and real pinned Codex binary. The model must
+ * make an apply_patch edit and execute the adversarial probe through its own
+ * legacy-Landlock shell; controller-side simulation cannot create a receipt.
+ */
+export async function runExactSpecialistSandboxSmoke(): Promise<
+  { ok: true; observation: ExactSandboxObservation } | { ok: false; reason: string }
+> {
+  const prepared = prepareSubscriptionEnv("codex", {
+    boundedRuntimeMs: 3 * 60_000,
+    scope: "sandbox-smoke",
+  });
+  const bin = resolveSubscriptionAgentBin("codex");
+  if (prepared.error || !bin) {
+    return {
+      ok: false,
+      reason: prepared.error ?? "pinned Codex binary unavailable; E2B remains the unactivated provider-neutral fallback",
+    };
+  }
+  mkdirSync("/tmp/work", { recursive: true });
+  const root = mkdtempSync("/tmp/work/jarvis-exact-sandbox-smoke-");
+  const workspace = join(root, "workspace");
+  const outsidePath = join(root, "outside-write.txt");
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(join(workspace, "fixture.txt"), "read-ok\n");
+  writeFileSync(join(workspace, "patch-target.txt"), "before\n");
+  writeFileSync(join(workspace, "probe.cjs"), probeSource(outsidePath), { mode: 0o600 });
+  try {
+    const namespace = verifySpecialistSandboxIsolation({
+      codexBin: bin,
+      cwd: workspace,
+      env: prepared.env,
+    });
+    if (!namespace.ok) return namespace;
+    const args = codexExecPrefix("luna", "low", workspace, prepared.env.PATH);
+    args.push(
+      "--json",
+      "This is a deterministic security attestation. Use the apply_patch tool to change patch-target.txt from exactly `before` to exactly `after`. Then run `node ./probe.cjs` once with the shell tool. Do not use any other tool or command. Report whether the command completed, but never print environment values.",
+    );
+    const child = spawnCodex({
+      mode: "specialist",
+      command: bin,
+      args,
+      cwd: workspace,
+      env: { ...prepared.env, JARVIS_NAMESPACE_SENTINEL: "synthetic-never-live" },
+      boundedRuntimeMs: 3 * 60_000,
+    }, { stdio: ["ignore", "pipe", "pipe"] });
+    const completed = await new Promise<{ code: number | null }>((resolve) => {
+      const timer = setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      }, 3 * 60_000);
+      child.stdout.resume();
+      child.stderr.resume();
+      child.once("error", () => { clearTimeout(timer); resolve({ code: -1 }); });
+      child.once("close", (code) => { clearTimeout(timer); resolve({ code }); });
+    });
+    if (completed.code !== 0 || !existsSync(join(workspace, "sandbox-observation.json"))) {
+      return {
+        ok: false,
+        reason: "real Codex legacy-Landlock smoke did not produce a receipt; E2B remains the unactivated provider-neutral fallback",
+      };
+    }
+    const observation = JSON.parse(readFileSync(join(workspace, "sandbox-observation.json"), "utf8")) as ExactSandboxObservation;
+    const patched = readFileSync(join(workspace, "patch-target.txt"), "utf8").trim() === "after";
+    const homeCredential = existsSync(join(String(prepared.env.CODEX_HOME), "auth.json"));
+    if (!patched || homeCredential || existsSync(outsidePath) || !exactSandboxObservationPassed(observation)) {
+      return {
+        ok: false,
+        reason: "real Codex legacy-Landlock smoke violated the workspace, network, proc, auth-file, patch, or toolchain boundary; E2B remains the unactivated provider-neutral fallback",
+      };
+    }
+    return { ok: true, observation };
+  } catch {
+    return {
+      ok: false,
+      reason: "real Codex legacy-Landlock smoke failed closed; E2B remains the unactivated provider-neutral fallback",
+    };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+export const specialistSandboxSmoke = task({
+  id: "jarvis-specialist-sandbox-smoke",
+  machine: "small-1x",
+  maxDuration: 300,
+  retry: { maxAttempts: 1 },
+  run: async () => {
+    const result = await runExactSpecialistSandboxSmoke();
+    if (!result.ok) throw new Error(result.reason);
+    return { protocol: 1 as const, legacyLandlock: true as const, exactSmoke: true as const };
+  },
+});

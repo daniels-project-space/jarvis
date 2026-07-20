@@ -3,12 +3,13 @@ import {
   CODEX_REVIEW_WORKING_DIRECTORY,
   codexReviewExecPrefix,
 } from "./model-policy";
-import { spawnSpecialist } from "./specialist-sandbox";
+import { spawnCodex } from "./codex-launcher";
 
 type ReviewSpawnOptions = {
   cwd: string;
   env: NodeJS.ProcessEnv;
   stdio: ["pipe", "pipe", "pipe"];
+  boundedRuntimeMs: number;
 };
 
 export type CodexReviewSpawn = (
@@ -18,12 +19,13 @@ export type CodexReviewSpawn = (
 ) => ChildProcessWithoutNullStreams;
 
 const spawnCodexReview: CodexReviewSpawn = (command, args, options) =>
-  spawnSpecialist({
+  spawnCodex({
+    mode: "restricted",
     command,
     args,
     cwd: options.cwd,
     env: options.env,
-    writableCwd: false,
+    boundedRuntimeMs: options.boundedRuntimeMs,
   }, { stdio: options.stdio });
 
 // Controller receipts can exceed Linux's single-argument limit. Codex exec's
@@ -62,6 +64,7 @@ export function reviewPrompt(
         cwd: CODEX_REVIEW_WORKING_DIRECTORY,
         env,
         stdio: ["pipe", "pipe", "pipe"],
+        boundedRuntimeMs: timeoutMs,
       });
     } catch {
       finish("");

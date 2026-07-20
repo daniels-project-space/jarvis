@@ -1,8 +1,20 @@
 import { createRequire } from "node:module";
-import { accessSync, chmodSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { accessSync, constants, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 
 export type AgentProvider = "codex";
+
+export const CODEX_CREDENTIAL_REFRESH_MARGIN_MS = 5 * 60_000;
+
+export class CodexCredentialRefreshRequiredError extends Error {
+  readonly code = "credential_refresh_required";
+
+  constructor() {
+    super("Codex subscription credential refresh required before the bounded model segment");
+    this.name = "CodexCredentialRefreshRequiredError";
+  }
+}
 
 const nodeRequire = createRequire(import.meta.url);
 
@@ -99,14 +111,16 @@ function scopedSubscriptionEnv(
   return env;
 }
 
-function writableCodexHome(): string | null {
+function writableCodexRuntimeRoot(explicitRoot?: string): string | null {
   const candidates = [
-    process.env.JARVIS_CODEX_HOME,
-    process.env.HOME && !process.env.HOME.startsWith("/tmp") ? join(process.env.HOME, ".codex") : undefined,
-    "/home/node/.codex",
+    explicitRoot,
+    process.env.JARVIS_CODEX_RUNTIME_ROOT,
+    process.env.JARVIS_CODEX_HOME ? join(dirname(process.env.JARVIS_CODEX_HOME), ".jarvis-codex-homes") : undefined,
+    process.env.HOME && !process.env.HOME.startsWith("/tmp") ? join(process.env.HOME, ".jarvis-codex-homes") : undefined,
+    "/home/node/.jarvis-codex-homes",
+    "/tmp/work/jarvis-codex-homes",
   ].filter((value): value is string => Boolean(value));
   for (const candidate of [...new Set(candidates)]) {
-    if (candidate.startsWith("/tmp")) continue;
     try {
       mkdirSync(candidate, { recursive: true });
       return candidate;
@@ -117,53 +131,105 @@ function writableCodexHome(): string | null {
   return null;
 }
 
+function jwtExpiryMs(token: string): number | null {
+  const segments = token.split(".");
+  if (segments.length !== 3 || !segments[1]) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(segments[1], "base64url").toString("utf8")) as { exp?: unknown };
+    return typeof payload.exp === "number" && Number.isFinite(payload.exp) ? payload.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+export function assertSubscriptionCredentialFresh(
+  env: Readonly<Record<string, string | undefined>>,
+  boundedRuntimeMs: number,
+  nowMs = Date.now(),
+): void {
+  const token = String(env.CODEX_ACCESS_TOKEN ?? "").trim();
+  const expiresAt = token ? jwtExpiryMs(token) : null;
+  const requiredUntil = nowMs + Math.max(0, boundedRuntimeMs) + CODEX_CREDENTIAL_REFRESH_MARGIN_MS;
+  if (!expiresAt || expiresAt <= requiredUntil) throw new CodexCredentialRefreshRequiredError();
+}
+
+function accessTokenFromController(source: NodeJS.ProcessEnv): string {
+  const encoded = source.CODEX_AUTH_JSON_B64?.trim();
+  if (encoded) {
+    if (encoded.length > 2 * 1024 * 1024) throw new Error("invalid Codex subscription auth envelope");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+    } catch {
+      throw new Error("invalid Codex subscription auth envelope");
+    }
+    const token = (parsed as { tokens?: { access_token?: unknown } } | null)?.tokens?.access_token;
+    if (typeof token !== "string" || !token.trim()) throw new Error("invalid Codex subscription auth envelope");
+    return token.trim();
+  }
+  if (source.CODEX_AUTH_JSON) {
+    throw new Error("raw Codex auth JSON is forbidden; refresh the encoded controller credential");
+  }
+  return String(source.CODEX_ACCESS_TOKEN ?? "").trim();
+}
+
 export function prepareSubscriptionEnv(
   provider: AgentProvider,
-): { env: NodeJS.ProcessEnv; error?: string } {
+  options: {
+    boundedRuntimeMs?: number;
+    nowMs?: number;
+    runtimeRoot?: string;
+    scope?: string;
+    sourceEnv?: NodeJS.ProcessEnv;
+  } = {},
+): { env: NodeJS.ProcessEnv; error?: string; status?: "credential_refresh_required" } {
   if (provider !== "codex") {
     return { env: {} as NodeJS.ProcessEnv, error: "Jarvis permits only the Codex CLI runtime" };
   }
-  const home = writableCodexHome();
-  if (!home) {
+  const source = options.sourceEnv ?? process.env;
+  const root = writableCodexRuntimeRoot(options.runtimeRoot);
+  if (!root) {
     return {
-      env: scopedSubscriptionEnv(process.env, provider),
-      error: "a writable non-temporary Codex home is unavailable",
+      env: scopedSubscriptionEnv(source, provider),
+      error: "a writable credentialless Codex runtime root is unavailable",
     };
   }
+  let token = "";
+  try {
+    token = accessTokenFromController(source);
+  } catch (error) {
+    return {
+      env: scopedSubscriptionEnv(source, provider),
+      error: error instanceof Error ? error.message : "invalid Codex subscription auth envelope",
+    };
+  }
+  if (!token) return { env: scopedSubscriptionEnv(source, provider), error: "Codex subscription auth is not configured" };
 
-  const encoded = process.env.CODEX_AUTH_JSON_B64;
-  const raw = process.env.CODEX_AUTH_JSON;
-  if (encoded || raw) {
-    try {
-      const json = encoded ? Buffer.from(encoded, "base64").toString("utf8") : raw!;
-      JSON.parse(json);
-      const authPath = join(home, "auth.json");
-      writeFileSync(authPath, json, { mode: 0o600 });
-      chmodSync(authPath, 0o600);
-    } catch {
-      return {
-        env: scopedSubscriptionEnv(process.env, provider),
-        error: "invalid Codex subscription auth",
-      };
+  const safeScope = String(options.scope ?? `controller-${process.pid}-${randomUUID()}`)
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .slice(0, 80) || "controller";
+  const home = mkdtempSync(join(root, `${safeScope}-`));
+  // A stale runtime directory must never turn access-token auth back into a
+  // refresh-token filesystem credential. The new directory is already empty;
+  // this explicit removal protects future changes to its construction.
+  rmSync(join(home, "auth.json"), { force: true });
+
+  const env = scopedSubscriptionEnv({
+    ...source,
+    HOME: dirname(root),
+    CODEX_HOME: home,
+    CODEX_ACCESS_TOKEN: token,
+  }, provider);
+  try {
+    assertSubscriptionCredentialFresh(env, options.boundedRuntimeMs ?? 0, options.nowMs);
+  } catch (error) {
+    if (error instanceof CodexCredentialRefreshRequiredError) {
+      return { env, error: error.message, status: error.code };
     }
-  }
-  if (!process.env.CODEX_ACCESS_TOKEN && !encoded && !raw) {
-    return {
-      env: scopedSubscriptionEnv(process.env, provider),
-      error: "Codex subscription auth is not configured",
-    };
+    throw error;
   }
 
-  return {
-    env: scopedSubscriptionEnv(
-      {
-        ...process.env,
-        HOME: process.env.HOME && !process.env.HOME.startsWith("/tmp") ? process.env.HOME : dirname(home),
-        CODEX_HOME: home,
-      },
-      provider,
-    ),
-  };
+  return { env };
 }
 
 export function isolateSubscriptionEnv(
@@ -179,14 +245,13 @@ export function isolateSubscriptionEnv(
   const isolationRoot = root ?? (sourceHome ? join(dirname(sourceHome), ".jarvis-codex-homes") : "/tmp/work/codex-homes");
   const isolatedHome = join(isolationRoot, safeScope);
   mkdirSync(isolatedHome, { recursive: true });
-  // Authentication and Daniel's scoped briefing are read-only inputs. System
-  // skills are intentionally not copied: every concurrent Codex process gets
-  // its own install directory, removing the shared `skills/` startup race.
-  for (const file of ["auth.json", "config.toml", "AGENTS.md"]) {
+  // Only Daniel's scoped briefing crosses into a lease home. Authentication
+  // remains an in-memory access token on the Codex parent, and strict launcher
+  // config replaces user config for every model-driven child.
+  rmSync(join(isolatedHome, "auth.json"), { force: true });
+  for (const file of ["AGENTS.md"]) {
     const source = join(sourceHome, file);
     if (sourceHome && existsSync(source)) copyFileSync(source, join(isolatedHome, file));
   }
-  const authPath = join(isolatedHome, "auth.json");
-  if (existsSync(authPath)) chmodSync(authPath, 0o600);
   return { ...base, CODEX_HOME: isolatedHome };
 }

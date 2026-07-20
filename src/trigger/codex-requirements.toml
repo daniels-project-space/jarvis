@@ -1,0 +1,5 @@
+# Legacy sandbox-mode requirements only. Filesystem split/deny profiles are
+# intentionally absent because Codex 0.144.5 must remain on the supported
+# legacy Landlock path in Trigger's restricted container runtime.
+allowed_approval_policies = ["never"]
+allowed_sandbox_modes = ["read-only", "workspace-write"]

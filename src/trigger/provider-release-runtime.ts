@@ -45,6 +45,18 @@ type CommandRunner = (
   options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number },
 ) => Promise<CommandResult>;
 
+export async function installDependenciesInPinnedCheckout(input: {
+  sourceSha: string;
+  verifyPinned: (sourceSha: string) => Promise<string>;
+  runNpmCi: (cwd: string) => Promise<void>;
+}): Promise<string> {
+  const before = await input.verifyPinned(input.sourceSha);
+  await input.runNpmCi(before);
+  const after = await input.verifyPinned(input.sourceSha);
+  if (after !== before) throw new Error("dependency install changed the pinned checkout identity");
+  return after;
+}
+
 export type TrustedProviderReleaseGateArgs = {
   jobId: string;
   expectedAttempt: number;
@@ -63,7 +75,7 @@ export type TrustedProviderReleaseGateArgs = {
 
 const RELEASE_ATTESTOR_TASK = "jarvis-provider-release-attestor";
 const CONVEX_ATTESTOR_FILE = "convex/_jarvisRelease.ts";
-const SOURCE_FILE = /\.(?:[cm]?[jt]sx?|json)$/i;
+const PARSED_SOURCE_FILE = /\.(?:[cm]?[jt]sx?|json)$/i;
 const TERMINAL_TRIGGER_STATUSES = new Set([
   "COMPLETED",
   "CANCELED",
@@ -392,11 +404,16 @@ class TrustedProviderReleaseRuntime {
     const sources = new Map<string, string>();
     let totalBytes = 0;
     for (const path of listed.split("\0").filter(Boolean)) {
-      if (!SOURCE_FILE.test(path)) continue;
       const absolute = resolve(dir, path);
       if (!absolute.startsWith(`${resolve(dir)}${sep}`)) throw new Error("a tracked provider source escaped the pinned checkout");
       const stat = lstatSync(absolute);
       if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`tracked provider source ${path} is not a regular file`);
+      if (!PARSED_SOURCE_FILE.test(path)) {
+        // Asset/config presence is sufficient for import resolution; only
+        // executable source needs to enter the bounded parser payload.
+        sources.set(path, "");
+        continue;
+      }
       totalBytes += stat.size;
       if (stat.size > 5 * 1024 * 1024 || totalBytes > 50 * 1024 * 1024) {
         throw new Error("the exact provider source graph exceeds the trusted analysis boundary");
@@ -426,8 +443,13 @@ class TrustedProviderReleaseRuntime {
     // A release must use the dependency graph committed in the verified head.
     // `npm ci` fails closed on a stale/missing lock instead of rewriting it and
     // silently publishing source that differs from the reviewed branch.
-    await this.command("npm", ["ci"], dir, safeToolEnv(this.args.baseEnv), 20 * 60_000);
-    await this.verifyCheckoutStillPinned(sourceSha);
+    await installDependenciesInPinnedCheckout({
+      sourceSha,
+      verifyPinned: (sha) => this.verifyCheckoutStillPinned(sha),
+      runNpmCi: async (cwd) => {
+        await this.command("npm", ["ci"], cwd, safeToolEnv(this.args.baseEnv), 20 * 60_000);
+      },
+    });
     this.dependenciesSourceSha = sourceSha;
     return dir;
   }
@@ -449,7 +471,7 @@ class TrustedProviderReleaseRuntime {
     return ok;
   }
 
-  private async renewOwnership(): Promise<boolean> {
+  private async performOwnershipRenewal(): Promise<boolean> {
     const result = await this.args.convexMutation("jobs:renewProviderReleaseLock", {
       jobId: this.args.jobId,
       expectedAttempt: this.args.expectedAttempt,
@@ -461,17 +483,26 @@ class TrustedProviderReleaseRuntime {
     return result === true || result?.ok === true;
   }
 
+  private async renewOwnership(): Promise<boolean> {
+    if (this.heartbeatPromise) return await this.heartbeatPromise;
+    const pending = this.performOwnershipRenewal();
+    this.heartbeatPromise = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.heartbeatPromise === pending) this.heartbeatPromise = undefined;
+    }
+  }
+
   private startHeartbeat(): void {
     if (this.heartbeatTimer) return;
     const intervalMs = Math.max(5_000, Math.min(120_000, this.args.heartbeatMs ?? 60_000));
     this.heartbeatTimer = setInterval(() => {
-      if (this.heartbeatPromise) return;
-      this.heartbeatPromise = this.renewOwnership()
+      void this.renewOwnership()
         .then((ok) => {
           if (!ok) this.heartbeatFailure = "the trusted repository release lock could not be renewed";
           return ok;
-        })
-        .finally(() => { this.heartbeatPromise = undefined; });
+        });
     }, intervalMs);
     this.heartbeatTimer.unref?.();
   }
@@ -626,12 +657,13 @@ class TrustedProviderReleaseRuntime {
       || output?.sourceSha !== sourceSha
       || output?.projectRef !== this.plan.boundary?.trigger?.projectRef
       || output?.version !== version
+      || output?.sandboxSmoke !== true
     ) throw new Error(`Trigger run ${String(run?.id ?? "unknown")} did not attest the exact new bundle`);
     return { sourceSha: output.sourceSha, version: output.version };
   }
 
   private async awaitTriggerRun(runId: string, version: string, sourceSha: string): Promise<any> {
-    for (let attempt = 0; attempt < 90; attempt += 1) {
+    for (let attempt = 0; attempt < 180; attempt += 1) {
       await this.continuing();
       const run = await runs.retrieve(runId);
       if (TERMINAL_TRIGGER_STATUSES.has(String(run.status))) {

@@ -1,7 +1,8 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
-import { codexModelFor } from "./model-policy";
+import { codexAppServerArgs, codexModelFor } from "./model-policy";
 import { appendAgentMessageDelta } from "./codex-stream";
+import { spawnCodex } from "./codex-launcher";
 
 type JsonObject = Record<string, unknown>;
 type PendingRequest = { resolve: (value: JsonObject) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
@@ -38,6 +39,7 @@ export type CodexDynamicToolResult = {
 export type CodexAppServerOptions = {
   dynamicTools?: CodexDynamicToolSpec[];
   onDynamicToolCall?: (call: CodexDynamicToolCall) => Promise<CodexDynamicToolResult>;
+  boundedRuntimeMs?: number;
 };
 export type CodexTurnInput = {
   conversationId: string;
@@ -73,7 +75,14 @@ export class CodexAppServer {
   }
 
   private async startInner() {
-    const child = spawn(this.bin, ["app-server", "--listen", "stdio://"], { env: this.env, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawnCodex({
+      mode: "foreground",
+      command: this.bin,
+      args: codexAppServerArgs(),
+      cwd: String(this.env.CODEX_HOME),
+      env: this.env,
+      boundedRuntimeMs: this.options.boundedRuntimeMs ?? this.turnTimeoutMs,
+    }, { stdio: ["pipe", "pipe", "pipe"] });
     this.process = child;
     child.stderr.on("data", (data) => { this.stderr = (this.stderr + data.toString()).slice(-1200); });
     child.on("error", (error) => this.failAll(error));
@@ -100,8 +109,8 @@ export class CodexAppServer {
         developerInstructions: "Remain the foreground Jarvis conversation. Give the useful answer immediately. Delegate long work instead of blocking conversation.",
         cwd: "/tmp",
         approvalPolicy: "never",
-        sandbox: "danger-full-access",
-        ephemeral: false,
+        sandbox: "read-only",
+        ephemeral: true,
         dynamicTools: this.options.dynamicTools,
       }, 30_000);
       const thread = response.thread as JsonObject | undefined;
