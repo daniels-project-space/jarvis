@@ -5,6 +5,7 @@ import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
 import { workModelLabel } from "@/lib/work-models";
 import { viewerFetch } from "@/lib/viewer-request";
+import { loadClientChunk } from "@/lib/client-chunk";
 
 // The richer panel views: frosted-glass calendar, live mind-map canvas,
 // app launcher, PDF viewer, creations library.
@@ -707,8 +708,11 @@ export function PlacesView({ value }: { value: string }) {
     if (!mapEl.current || !center || mapObj.current) return;
     let cancelled = false;
     (async () => {
-      const maplibregl = (await import("maplibre-gl")).default;
-      await import("maplibre-gl/dist/maplibre-gl.css");
+      const maplibreModule = await loadClientChunk(() => import("maplibre-gl"));
+      if (!maplibreModule) return;
+      const styles = await loadClientChunk(() => import("maplibre-gl/dist/maplibre-gl.css"));
+      if (!styles) return;
+      const maplibregl = maplibreModule.default;
       if (cancelled || !mapEl.current) return;
       const map = new maplibregl.Map({
         container: mapEl.current,
@@ -735,7 +739,7 @@ export function PlacesView({ value }: { value: string }) {
         });
         map.fitBounds(bounds, { padding: 70, maxZoom: 15, duration: 600 });
       });
-    })();
+    })().catch(() => {});
     return () => {
       cancelled = true;
       mapObj.current?.remove?.();
