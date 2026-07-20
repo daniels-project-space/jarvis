@@ -1,4 +1,4 @@
-import { PROJECT_REGISTRY } from "./project-registry";
+import { PROJECT_REGISTRY, projectProviderBoundary } from "./project-registry";
 
 export const GOAL_PLAN_MARKER = "GOAL_PLAN_JSON:";
 export const GOAL_VALIDATION_MARKER = "GOAL_VALIDATION_JSON:";
@@ -195,8 +195,10 @@ export function routeGoal(goal: string, requestedRepo?: string): GoalRoute {
       primaryRepo: project.repo,
       project: project.slug,
       reason: `The goal explicitly targets the existing ${project.name} product.`,
-      infrastructureContext:
+      infrastructureContext: [
         `Work in ${project.repo}. Preserve its purpose (${project.purpose}) and invariants: ${project.invariants.join("; ")}. Inspect its current AGENTS.md, callers, manifests and live providers before planning changes.`,
+        projectProviderBoundary(project.repo),
+      ].filter(Boolean).join(" "),
     };
   }
 

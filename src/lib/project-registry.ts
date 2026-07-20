@@ -8,6 +8,12 @@ export type ProjectProfile = {
   objectives: string[];
   invariants: string[];
   related: string[];
+  /** Expected non-secret provider identities; live provider state still wins. */
+  providerBoundary?: {
+    convexDeployment?: string;
+    triggerProjectRef?: string;
+    r2Bucket?: string;
+  };
 };
 
 export const PORTFOLIO_NORTH_STAR =
@@ -94,6 +100,11 @@ export const PROJECT_REGISTRY: ProjectProfile[] = [
     objectives: ["Find economically viable products", "Create believable product-first media", "Keep publishing and spend reviewable"],
     invariants: ["Verified COGS and contribution margin before launch", "No automatic paid spend", "Publishing follows explicit autonomy gates"],
     related: ["media-engine", "app-factory-v2"],
+    providerBoundary: {
+      convexDeployment: "peaceful-panda-894",
+      triggerProjectRef: "proj_ebwgqvfufapbqnhjxhnc",
+      r2Bucket: "dropship-ai",
+    },
   },
   {
     slug: "media-engine",
@@ -142,3 +153,24 @@ export const PROJECT_REGISTRY: ProjectProfile[] = [
 ];
 
 export const PROJECT_BY_SLUG = new Map(PROJECT_REGISTRY.map((project) => [project.slug, project]));
+
+export function projectProviderBoundary(repo: string): string | null {
+  const normalized = repo.trim().replace(/\.git$/, "").toLowerCase();
+  const project = PROJECT_REGISTRY.find((candidate) => candidate.repo.toLowerCase() === normalized);
+  if (!project) return null;
+  const expected = [
+    project.productionUrl ? `Vercel production: ${project.productionUrl}` : "",
+    project.providerBoundary?.convexDeployment
+      ? `Convex deployment: ${project.providerBoundary.convexDeployment}`
+      : "",
+    project.providerBoundary?.triggerProjectRef
+      ? `Trigger project: ${project.providerBoundary.triggerProjectRef}`
+      : "",
+    project.providerBoundary?.r2Bucket ? `R2 bucket: ${project.providerBoundary.r2Bucket}` : "",
+  ].filter(Boolean).join(" · ");
+  return [
+    `Target project boundary for ${project.name}: ${expected}.`,
+    "These non-secret identifiers constrain routing but are not live proof; current repository manifests and provider state override them.",
+    "Never use Jarvis control-plane provider IDs, URLs, or environment values as this project's build or deployment target.",
+  ].join(" ");
+}

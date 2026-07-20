@@ -29,6 +29,10 @@ describe("Goal Mode contracts", () => {
     expect(routeGoal("Build a new video editing app").kind).toBe("app_factory");
     expect(routeGoal("Refine this video", "daniels-project-space/media-engine").primaryRepo)
       .toBe("daniels-project-space/media-engine");
+    const dropship = routeGoal("Make Dropship AI launch-ready", "daniels-project-space/dropship-ai");
+    expect(dropship.infrastructureContext).toContain("peaceful-panda-894");
+    expect(dropship.infrastructureContext).toContain("proj_ebwgqvfufapbqnhjxhnc");
+    expect(dropship.infrastructureContext).not.toContain("tangible-goose-318");
   });
 
   it("classifies failed dependency phases instead of waiting forever", () => {

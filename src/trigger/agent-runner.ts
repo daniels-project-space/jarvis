@@ -4,6 +4,7 @@ import { mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import { sendPush } from "./push-send";
 import { INFRA_MAP } from "../lib/persona";
+import { projectProviderBoundary } from "../lib/project-registry";
 import { routeWork } from "../mastra/routing";
 import { TEAM_BY_SLUG, type AgentSlug } from "../mastra/team";
 import { codexExecPrefix, codexModelFor, normalizeReasoningEffort } from "./model-policy";
@@ -889,6 +890,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             context = job.readonly
               ? `Your working directory is a read-only checkout of ${repo}. Inspect it deeply, but do not edit or commit.`
               : `Your working directory is an isolated checkout of ${repo} on branch ${branch}. Actually perform the scoped task. You may edit and commit here; never push, merge, deploy, or switch branches because the runner owns delivery.`;
+            const providerBoundary = projectProviderBoundary(repo);
+            if (providerBoundary) context += `\n\n${providerBoundary}`;
           } else {
             cloneFailed = true;
             context = `The scoped repository ${repo} could not be cloned. Do not pretend you edited it. State the access/repository failure and what remains blocked.`;
