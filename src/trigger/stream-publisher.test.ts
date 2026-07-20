@@ -42,4 +42,26 @@ describe("StreamPublisher", () => {
     expect(writes).toEqual([{ text: "One", revision: 1 }]);
     expect(publisher.value).toBe("One");
   });
+
+  it("commits the first truthful delta immediately and exposes stage timing", async () => {
+    let now = 100;
+    const writes: Array<{ text: string; revision: number }> = [];
+    const publisher = new StreamPublisher(async (text, revision) => {
+      writes.push({ text, revision });
+      now += 3;
+    }, 10_000, () => now);
+    publisher.start();
+    now = 105;
+    publisher.push("First");
+
+    await publisher.flush();
+    expect(writes).toEqual([{ text: "First", revision: 1 }]);
+    expect(publisher.timing).toEqual({
+      firstDeltaMs: 5,
+      firstPublishStartedMs: 5,
+      firstPublishCommittedMs: 8,
+      publishCount: 1,
+    });
+    await publisher.close();
+  });
 });

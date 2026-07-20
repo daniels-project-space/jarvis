@@ -1,22 +1,83 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
+import { performance } from "node:perf_hooks";
 import { codexModelFor } from "./model-policy";
 import { appendAgentMessageDelta } from "./codex-stream";
 
 type JsonObject = Record<string, unknown>;
-type PendingRequest = { resolve: (value: JsonObject) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
+type PendingRequest = {
+  resolve: (value: JsonObject) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+type ConversationHistoryItem = { role: "user" | "assistant"; text: string };
+type ConversationState = {
+  threadId: string;
+  modelTier: string;
+  history: ConversationHistoryItem[];
+  lastUsedAt: number;
+};
+type TurnEvent = { message: JsonObject; receivedAt: number; bytes: number };
+type BufferedTurnEvents = {
+  events: TurnEvent[];
+  bytes: number;
+  firstReceivedAt: number;
+  overflowed: boolean;
+};
 type ActiveTurn = {
   turnId: string;
   threadId: string;
+  conversationId: string;
+  userText: string;
   text: string;
   itemId?: string;
   onDelta: (delta: string) => void;
   resolve: (result: CodexTurnResult) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  startedAt: number;
+  serverReadyAt: number;
+  conversationReadyAt: number;
+  turnAcceptedAt: number;
+  firstEventAt?: number;
+  firstDeltaAt?: number;
+  firstDeltaBuffered: boolean;
+  bufferedEventCount: number;
 };
 
-export type CodexTurnResult = { finalText: string; threadId: string; code: number; stderr: string };
+const MAX_HANDOFF_CONVERSATIONS = 2;
+const MAX_HISTORY_ITEMS = 12;
+const MAX_HISTORY_ITEM_CHARS = 4_000;
+const MAX_HISTORY_CHARS = 24_000;
+const MAX_BUFFERED_TURNS = 8;
+const MAX_BUFFERED_EVENTS_PER_TURN = 512;
+const MAX_BUFFERED_BYTES_PER_TURN = 512 * 1024;
+const BUFFERED_EVENT_TTL_MS = 35_000;
+const MAX_SETTLED_TURN_IDS = 64;
+
+export type CodexTurnTiming = {
+  appServerReadyMs: number;
+  conversationReadyMs: number;
+  turnResponseMs: number;
+  firstDeltaMs: number | null;
+  generationMs: number;
+  modelCompletedMs: number;
+  totalMs: number;
+  bufferedEventCount: number;
+  firstDeltaBeforeTurnResponse: boolean;
+};
+export type CodexTurnResult = {
+  finalText: string;
+  threadId: string;
+  code: number;
+  stderr: string;
+  timing: CodexTurnTiming;
+};
+export type CodexConversationHandoff = {
+  conversationId: string;
+  modelTier: string;
+  history: ConversationHistoryItem[];
+};
 export type CodexDynamicToolSpec = {
   type: "function";
   name: string;
@@ -38,16 +99,50 @@ export type CodexDynamicToolResult = {
 export type CodexAppServerOptions = {
   dynamicTools?: CodexDynamicToolSpec[];
   onDynamicToolCall?: (call: CodexDynamicToolCall) => Promise<CodexDynamicToolResult>;
+  now?: () => number;
 };
 export type CodexTurnInput = {
   conversationId: string;
+  turnKey?: string;
   userText: string;
   history: Array<{ role: string; text: string }>;
   contextBlock: string;
+  turnDirective?: string;
   preamble: string;
   modelTier: string;
   onDelta: (delta: string) => void;
 };
+
+function boundedHistory(history: Array<{ role: string; text: string }>): ConversationHistoryItem[] {
+  const newestFirst = history
+    .filter((item) => item.role === "user" || item.role === "assistant")
+    .map((item) => ({
+      role: item.role as ConversationHistoryItem["role"],
+      text: String(item.text ?? "").trim().slice(0, MAX_HISTORY_ITEM_CHARS),
+    }))
+    .filter((item) => item.text)
+    .slice(-MAX_HISTORY_ITEMS)
+    .reverse();
+  const kept: ConversationHistoryItem[] = [];
+  let chars = 0;
+  for (const item of newestFirst) {
+    if (chars + item.text.length > MAX_HISTORY_CHARS) continue;
+    kept.unshift(item);
+    chars += item.text.length;
+  }
+  return kept;
+}
+
+function responseItems(history: ConversationHistoryItem[]): JsonObject[] {
+  return history.map((item) => ({
+    type: "message",
+    role: item.role,
+    content: [{
+      type: item.role === "user" ? "input_text" : "output_text",
+      text: item.text,
+    }],
+  }));
+}
 
 // One long-lived subscription CLI process for foreground conversation. The
 // app-server protocol keeps authenticated threads warm and emits real deltas.
@@ -56,7 +151,11 @@ export class CodexAppServer {
   private nextId = 1;
   private pending = new Map<number, PendingRequest>();
   private active = new Map<string, ActiveTurn>();
-  private threads = new Map<string, string>();
+  private conversations = new Map<string, ConversationState>();
+  private conversationStarts = new Map<string, Promise<ConversationState>>();
+  private earlyTurnEvents = new Map<string, BufferedTurnEvents>();
+  private settledTurnIds = new Set<string>();
+  private turnStartsInFlight = 0;
   private stderr = "";
   private ready: Promise<void> | null = null;
 
@@ -81,64 +180,191 @@ export class CodexAppServer {
     createInterface({ input: child.stdout }).on("line", (line) => this.receive(line));
     await this.request("initialize", {
       clientInfo: { name: "jarvis-trigger", title: "Jarvis", version: "1.0.0" },
-      // Dynamic tools are experimental in the pinned 0.144.5 protocol. This
-      // capability is required for thread/start.dynamicTools.
+      // Dynamic tools and thread/inject_items are experimental in the pinned
+      // 0.144.5 protocol, so the foreground client opts into that exact schema.
       capabilities: { experimentalApi: true },
     }, 20_000);
     this.notify("initialized", {});
   }
 
-  async runTurn(input: CodexTurnInput): Promise<CodexTurnResult> {
+  async prewarmConversations(
+    handoffs: CodexConversationHandoff[],
+    preamble: string,
+  ): Promise<number> {
     await this.start();
-    const selection = codexModelFor(input.modelTier);
-    let threadId = this.threads.get(input.conversationId);
-    const isNewThread = !threadId;
-    if (!threadId) {
-      const response = await this.request("thread/start", {
-        model: selection.model,
-        baseInstructions: input.preamble,
-        developerInstructions: "Remain the foreground Jarvis conversation. Give the useful answer immediately. Delegate long work instead of blocking conversation.",
-        cwd: "/tmp",
-        approvalPolicy: "never",
-        sandbox: "danger-full-access",
-        ephemeral: false,
-        dynamicTools: this.options.dynamicTools,
-      }, 30_000);
-      const thread = response.thread as JsonObject | undefined;
-      threadId = typeof thread?.id === "string" ? thread.id : "";
-      if (!threadId) throw new Error("Codex app-server did not return a thread id");
-      this.threads.set(input.conversationId, threadId);
+    let warmed = 0;
+    for (const handoff of handoffs.slice(0, MAX_HANDOFF_CONVERSATIONS)) {
+      if (!handoff.conversationId || this.conversations.has(handoff.conversationId)) continue;
+      try {
+        await this.ensureConversation(
+          handoff.conversationId,
+          preamble,
+          handoff.modelTier,
+          handoff.history,
+        );
+        warmed += 1;
+      } catch {
+        // The worker is still useful when a persisted handoff is unavailable:
+        // its first claimed turn will create a fresh, history-seeded thread.
+        this.conversations.delete(handoff.conversationId);
+      }
     }
+    return warmed;
+  }
 
-    const history = isNewThread && input.history.length
-      ? `Recent conversation:\n${input.history.map((item) => `${item.role === "user" ? "Daniel" : "Jarvis"}: ${item.text}`).join("\n")}\n\n`
-      : "";
+  handoffConversations(limit = 1): CodexConversationHandoff[] {
+    return [...this.conversations.entries()]
+      .sort((a, b) => b[1].lastUsedAt - a[1].lastUsedAt)
+      .slice(0, Math.min(Math.max(0, limit), MAX_HANDOFF_CONVERSATIONS))
+      .map(([conversationId, state]) => ({
+        conversationId,
+        modelTier: state.modelTier,
+        history: boundedHistory(state.history),
+      }));
+  }
+
+  async runTurn(input: CodexTurnInput): Promise<CodexTurnResult> {
+    const startedAt = this.now();
+    await this.start();
+    const serverReadyAt = this.now();
+    const conversation = await this.ensureConversation(
+      input.conversationId,
+      input.preamble,
+      input.modelTier,
+      input.history,
+    );
+    conversation.modelTier = input.modelTier;
+    conversation.lastUsedAt = this.now();
+    const conversationReadyAt = this.now();
+    const selection = codexModelFor(input.modelTier);
     const marker = input.userText.match(/\[JARVIS_IMAGE_URL:([^\]]+)\]/);
     const cleanText = input.userText.replace(/\s*\[JARVIS_IMAGE_URL:[^\]]+\]\s*/g, " ").trim();
-    const text = `${history}Current live context (use only what is relevant):\n${input.contextBlock}\n\nDaniel: ${cleanText}`;
-    const userInput: JsonObject[] = [{ type: "text", text }];
+    const userInput: JsonObject[] = [{ type: "text", text: cleanText }];
     if (marker?.[1]) userInput.push({ type: "image", url: marker[1].trim(), detail: "high" });
-    const started = await this.request("turn/start", {
-      threadId,
-      input: userInput,
-      model: selection.model,
-      effort: selection.effort,
-      approvalPolicy: "never",
-    }, 30_000);
+    const additionalContext: JsonObject = {};
+    if (input.contextBlock.trim()) {
+      additionalContext["jarvis-live-context"] = { value: input.contextBlock, kind: "application" };
+    }
+    if (input.turnDirective?.trim()) {
+      additionalContext["jarvis-turn-guidance"] = { value: input.turnDirective, kind: "application" };
+    }
+
+    if (this.turnStartsInFlight >= MAX_BUFFERED_TURNS) {
+      throw new Error("Codex foreground turn concurrency exceeded its event handoff bound");
+    }
+    this.turnStartsInFlight += 1;
+    let started: JsonObject;
+    try {
+      started = await this.request("turn/start", {
+        threadId: conversation.threadId,
+        clientUserMessageId: input.turnKey,
+        input: userInput,
+        additionalContext: Object.keys(additionalContext).length ? additionalContext : undefined,
+        model: selection.model,
+        effort: selection.effort,
+        approvalPolicy: "never",
+      }, 30_000);
+    } finally {
+      this.turnStartsInFlight -= 1;
+    }
+    const turnAcceptedAt = this.now();
     const turn = started.turn as JsonObject | undefined;
     const turnId = typeof turn?.id === "string" ? turn.id : "";
     if (!turnId) throw new Error("Codex app-server did not return a turn id");
+    const buffered = this.takeEarlyTurnEvents(turnId);
+    if (buffered?.overflowed) {
+      this.notify("turn/interrupt", { threadId: conversation.threadId, turnId });
+      this.rememberSettledTurn(turnId);
+      throw new Error("Codex early turn event handoff exceeded its deterministic bound");
+    }
+
     return new Promise<CodexTurnResult>((resolve, reject) => {
+      const elapsed = Math.max(0, this.now() - conversationReadyAt);
       const timer = setTimeout(() => {
-        this.notify("turn/interrupt", { threadId, turnId });
+        this.notify("turn/interrupt", { threadId: conversation.threadId, turnId });
         this.active.delete(turnId);
+        this.rememberSettledTurn(turnId);
         reject(new Error("Codex conversation turn exceeded its foreground deadline"));
-      }, this.turnTimeoutMs);
-      this.active.set(turnId, { turnId, threadId, text: "", onDelta: input.onDelta, resolve, reject, timer });
+      }, Math.max(1, this.turnTimeoutMs - elapsed));
+      this.active.set(turnId, {
+        turnId,
+        threadId: conversation.threadId,
+        conversationId: input.conversationId,
+        userText: cleanText,
+        text: "",
+        onDelta: input.onDelta,
+        resolve,
+        reject,
+        timer,
+        startedAt,
+        serverReadyAt,
+        conversationReadyAt,
+        turnAcceptedAt,
+        firstDeltaBuffered: false,
+        bufferedEventCount: buffered?.events.length ?? 0,
+      });
+      for (const event of buffered?.events ?? []) {
+        this.routeTurnNotification(event.message, event.receivedAt, false, true);
+      }
     });
   }
 
-  stop() { this.process?.kill("SIGTERM"); this.process = null; }
+  stop() {
+    this.process?.kill("SIGTERM");
+    this.process = null;
+    this.earlyTurnEvents.clear();
+  }
+
+  private async ensureConversation(
+    conversationId: string,
+    preamble: string,
+    modelTier: string,
+    history: Array<{ role: string; text: string }>,
+  ): Promise<ConversationState> {
+    const existing = this.conversations.get(conversationId);
+    if (existing) return existing;
+    const starting = this.conversationStarts.get(conversationId);
+    if (starting) return starting;
+    const promise = this.startConversation(conversationId, preamble, modelTier, history);
+    this.conversationStarts.set(conversationId, promise);
+    try {
+      return await promise;
+    } finally {
+      this.conversationStarts.delete(conversationId);
+    }
+  }
+
+  private async startConversation(
+    conversationId: string,
+    preamble: string,
+    modelTier: string,
+    history: Array<{ role: string; text: string }>,
+  ): Promise<ConversationState> {
+    const selection = codexModelFor(modelTier);
+    const response = await this.request("thread/start", {
+      model: selection.model,
+      baseInstructions: preamble,
+      developerInstructions: "Remain the foreground Jarvis conversation. Give the useful answer immediately. Delegate long work instead of blocking conversation.",
+      cwd: "/tmp",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+      ephemeral: false,
+      dynamicTools: this.options.dynamicTools,
+    }, 30_000);
+    const thread = response.thread as JsonObject | undefined;
+    const threadId = typeof thread?.id === "string" ? thread.id : "";
+    if (!threadId) throw new Error("Codex app-server did not return a thread id");
+    const seededHistory = boundedHistory(history);
+    if (seededHistory.length) {
+      await this.request("thread/inject_items", {
+        threadId,
+        items: responseItems(seededHistory),
+      }, 30_000);
+    }
+    const state = { threadId, modelTier, history: seededHistory, lastUsedAt: this.now() };
+    this.conversations.set(conversationId, state);
+    return state;
+  }
 
   private receive(line: string) {
     let message: JsonObject;
@@ -160,28 +386,135 @@ export class CodexAppServer {
       else pending.resolve((message.result as JsonObject | undefined) ?? {});
       return;
     }
+    this.routeTurnNotification(message, this.now(), true, false, line.length);
+  }
+
+  private routeTurnNotification(
+    message: JsonObject,
+    receivedAt: number,
+    allowBuffer: boolean,
+    buffered: boolean,
+    bytes = 0,
+  ) {
+    const method = typeof message.method === "string" ? message.method : "";
+    if (!this.isTurnLifecycleMethod(method)) return;
     const params = (message.params as JsonObject | undefined) ?? {};
     const turn = params.turn as JsonObject | undefined;
     const turnId = typeof params.turnId === "string" ? params.turnId : typeof turn?.id === "string" ? turn.id : "";
+    if (!turnId || this.settledTurnIds.has(turnId)) return;
     const active = this.active.get(turnId);
-    if (!active) return;
+    if (!active) {
+      if (allowBuffer && this.turnStartsInFlight > 0) {
+        this.bufferEarlyTurnEvent(turnId, { message, receivedAt, bytes });
+      }
+      return;
+    }
+    const notificationThreadId = typeof params.threadId === "string" ? params.threadId : "";
+    if (notificationThreadId && notificationThreadId !== active.threadId) return;
+    active.firstEventAt ??= receivedAt;
     if (method === "item/agentMessage/delta" && typeof params.delta === "string") {
       const itemId = typeof params.itemId === "string" ? params.itemId : undefined;
       const next = appendAgentMessageDelta({ text: active.text, itemId: active.itemId }, params.delta, itemId);
       active.text = next.state.text;
       active.itemId = next.state.itemId;
+      if (active.firstDeltaAt === undefined) {
+        active.firstDeltaAt = receivedAt;
+        active.firstDeltaBuffered = buffered;
+      }
       active.onDelta(next.emitted);
     } else if (method === "item/completed") {
       const item = params.item as JsonObject | undefined;
       if (!active.text && item?.type === "agentMessage" && typeof item.text === "string") {
         active.text = item.text;
+        active.firstDeltaAt ??= receivedAt;
+        active.firstDeltaBuffered ||= buffered;
         active.onDelta(item.text);
       }
     } else if (method === "turn/completed") {
       const status = typeof turn?.status === "string" ? turn.status : "failed";
       clearTimeout(active.timer);
       this.active.delete(turnId);
-      active.resolve({ finalText: active.text, threadId: active.threadId, code: status === "completed" ? 0 : -1, stderr: status === "completed" ? "" : this.errorText(turn?.error ?? status) });
+      this.rememberSettledTurn(turnId);
+      if (status === "completed" && active.text) {
+        const conversation = this.conversations.get(active.conversationId);
+        if (conversation?.threadId === active.threadId) {
+          conversation.history = boundedHistory([
+            ...conversation.history,
+            { role: "user", text: active.userText },
+            { role: "assistant", text: active.text },
+          ]);
+          conversation.lastUsedAt = this.now();
+        }
+      }
+      const resultAt = this.now();
+      const firstDeltaAt = active.firstDeltaAt;
+      active.resolve({
+        finalText: active.text,
+        threadId: active.threadId,
+        code: status === "completed" ? 0 : -1,
+        stderr: status === "completed" ? "" : this.errorText(turn?.error ?? status),
+        timing: {
+          appServerReadyMs: this.duration(active.startedAt, active.serverReadyAt),
+          conversationReadyMs: this.duration(active.serverReadyAt, active.conversationReadyAt),
+          turnResponseMs: this.duration(active.conversationReadyAt, active.turnAcceptedAt),
+          firstDeltaMs: firstDeltaAt === undefined ? null : this.duration(active.conversationReadyAt, firstDeltaAt),
+          generationMs: this.duration(firstDeltaAt ?? active.conversationReadyAt, receivedAt),
+          modelCompletedMs: this.duration(active.conversationReadyAt, receivedAt),
+          totalMs: this.duration(active.startedAt, resultAt),
+          bufferedEventCount: active.bufferedEventCount,
+          firstDeltaBeforeTurnResponse: active.firstDeltaBuffered,
+        },
+      });
+    }
+  }
+
+  private isTurnLifecycleMethod(method: string) {
+    return method === "turn/started" ||
+      method === "item/agentMessage/delta" ||
+      method === "item/completed" ||
+      method === "turn/completed";
+  }
+
+  private bufferEarlyTurnEvent(turnId: string, event: TurnEvent) {
+    this.sweepEarlyTurnEvents(event.receivedAt);
+    let bucket = this.earlyTurnEvents.get(turnId);
+    if (!bucket) {
+      if (this.earlyTurnEvents.size >= MAX_BUFFERED_TURNS) return;
+      bucket = { events: [], bytes: 0, firstReceivedAt: event.receivedAt, overflowed: false };
+      this.earlyTurnEvents.set(turnId, bucket);
+    }
+    const eventBytes = event.bytes || JSON.stringify(event.message).length;
+    if (
+      bucket.events.length >= MAX_BUFFERED_EVENTS_PER_TURN ||
+      bucket.bytes + eventBytes > MAX_BUFFERED_BYTES_PER_TURN
+    ) {
+      bucket.overflowed = true;
+      return;
+    }
+    bucket.events.push({ ...event, bytes: eventBytes });
+    bucket.bytes += eventBytes;
+  }
+
+  private takeEarlyTurnEvents(turnId: string): BufferedTurnEvents | undefined {
+    this.sweepEarlyTurnEvents(this.now());
+    const buffered = this.earlyTurnEvents.get(turnId);
+    this.earlyTurnEvents.delete(turnId);
+    return buffered;
+  }
+
+  private sweepEarlyTurnEvents(now: number) {
+    for (const [turnId, bucket] of this.earlyTurnEvents) {
+      if (now - bucket.firstReceivedAt > BUFFERED_EVENT_TTL_MS) this.earlyTurnEvents.delete(turnId);
+    }
+  }
+
+  private rememberSettledTurn(turnId: string) {
+    this.settledTurnIds.delete(turnId);
+    this.settledTurnIds.add(turnId);
+    while (this.settledTurnIds.size > MAX_SETTLED_TURN_IDS) {
+      const oldest = this.settledTurnIds.values().next().value as string | undefined;
+      if (!oldest) break;
+      this.settledTurnIds.delete(oldest);
     }
   }
 
@@ -241,5 +574,9 @@ export class CodexAppServer {
     this.pending.clear();
     for (const active of this.active.values()) { clearTimeout(active.timer); active.reject(detail); }
     this.active.clear();
+    this.earlyTurnEvents.clear();
+    this.conversationStarts.clear();
   }
+  private now() { return this.options.now?.() ?? performance.now(); }
+  private duration(start: number, end: number) { return Math.max(0, Math.round(end - start)); }
 }

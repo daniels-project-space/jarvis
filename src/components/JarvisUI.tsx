@@ -44,6 +44,11 @@ import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actio
 import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
 import { viewerFetch } from "@/lib/viewer-request";
 import { normalizeIncidentSignature } from "@/lib/incident-signature";
+import {
+  assistantForRequest,
+  FOREGROUND_THINKING_TEXT,
+  requestIdForAssistant,
+} from "@/lib/foreground-turn";
 import { CompactWorkBar } from "./CompactWorkBar";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
@@ -70,6 +75,7 @@ type Msg = {
   status: string;
   model?: string;
   delivery?: "foreground" | "notification";
+  requestId?: string;
   parentMessageId?: string;
   attachment?: Attachment;
   createdAt: number;
@@ -1606,7 +1612,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     return claimVoice({ client: me.current }).catch(() => undefined);
   };
   const lastSent = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
-  const durableStartedAt = useRef<number | null>(null);
+  const activeDurableRequest = useRef<{
+    requestId: string;
+    startedAt: number;
+    firstTokenRecorded: boolean;
+  } | null>(null);
+  const supersededDurableRequests = useRef(new Set<string>());
   const [wake, setWake] = useState(false);
   const [panelFull, setPanelFull] = useState(false);
   const panelFullRef = useRef(false);
@@ -2147,11 +2158,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // Speak new finalized assistant messages with the one streamed neural voice.
   const lastSpokenThread = useRef<string>("");
   useEffect(() => {
-    const latestAssistant = [...messages].reverse().find((message) => message.role === "assistant" && message.delivery !== "notification");
+    const request = activeDurableRequest.current;
+    if (!request) return;
+    const latestAssistant = assistantForRequest(messages, request.requestId);
     if (latestAssistant?.status !== "streaming" || !latestAssistant.text) return;
-    if (durableStartedAt.current !== null) {
-      document.documentElement.dataset.jarvisFirstTokenMs = String(Math.max(0, Math.round(performance.now() - durableStartedAt.current)));
-      durableStartedAt.current = null;
+    if (!request.firstTokenRecorded) {
+      document.documentElement.dataset.jarvisFirstTokenMs = String(Math.max(0, Math.round(performance.now() - request.startedAt)));
+      request.firstTokenRecorded = true;
       setSending(false);
     }
     showCaption({ who: "jarvis", text: latestAssistant.text, phase: "streaming" });
@@ -2204,21 +2217,49 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }, [messages]);
 
   useEffect(() => {
-    const last = [...messages].reverse().find((m) => m.role === "assistant" && m.delivery !== "notification" && m.status === "done" && m.text);
+    const activeRequest = activeDurableRequest.current;
+    const associated = activeRequest
+      ? assistantForRequest(messages, activeRequest.requestId)
+      : undefined;
+    if (activeRequest && (!associated || (associated.status !== "done" && associated.status !== "error"))) return;
+    const wasActive = Boolean(activeRequest && associated);
+    if (wasActive) {
+      activeDurableRequest.current = null;
+      setSending(false);
+    }
+    const last = associated ?? [...messages].reverse().find((m) =>
+      m.role === "assistant" && m.delivery !== "notification" && m.status === "done" && m.text,
+    );
+    if (!last) return;
+    const requestId = requestIdForAssistant(messages, last);
+    if (!wasActive && requestId && supersededDurableRequests.current.has(requestId)) {
+      supersededDurableRequests.current.delete(requestId);
+      lastSpokenId.current = last._id;
+      return;
+    }
     // hopping threads must never re-voice that thread's old last reply
     if (lastSpokenThread.current !== thread) {
       lastSpokenThread.current = thread;
-      lastSpokenId.current = last?._id ?? null;
-      return;
+      if (!wasActive) {
+        lastSpokenId.current = last._id;
+        return;
+      }
     }
-    if (!last || last._id === lastSpokenId.current) return;
-    if (lastSpokenId.current === null) {
+    if (last._id === lastSpokenId.current) return;
+    if (lastSpokenId.current === null && !wasActive) {
       lastSpokenId.current = last._id; // don't re-speak history on page load
       return;
     }
     lastSpokenId.current = last._id;
     if (!last.text) return;
     if (isToolGarbage(last.text) && !sanitizeAssistantText(last.text)) return;
+    if (last.status === "error") {
+      const failureText = sanitizeAssistantText(last.text) || "The conversation line failed before I could answer.";
+      showCaption({ who: "jarvis", text: failureText, phase: "ready" });
+      fadeCaption(failureText, 3_200);
+      finishOneShotVoiceTurn();
+      return;
+    }
     // never say the exact same thing twice in a row (root of "sends results twice")
     if (last.text === lastSpokenText.current.text && Date.now() - lastSpokenText.current.ts < 20_000) return;
     lastSpokenText.current = { text: last.text, ts: Date.now() };
@@ -2304,9 +2345,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }
 
   async function queueDurableTurn(text: string, visibleText = text) {
-    durableStartedAt.current = performance.now();
+    const requestId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    activeDurableRequest.current = {
+      requestId,
+      startedAt: performance.now(),
+      firstTokenRecorded: false,
+    };
     setSending(true);
     showCaption({ who: "you", text: visibleText });
+    showCaption({ who: "jarvis", text: FOREGROUND_THINKING_TEXT, phase: "streaming" });
     try {
       const response = await viewerFetch("/api/chat", {
         method: "POST",
@@ -2314,7 +2361,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         body: JSON.stringify({
           threadId: threadRef.current,
           text,
-          requestId: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          requestId,
         }),
       });
       if (!response.ok) throw new Error(`conversation queue rejected (${response.status})`);
@@ -2322,7 +2369,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       // closes the old request/subscription gap where the orb flashed idle.
       return;
     } catch (error) {
-      durableStartedAt.current = null;
+      if (activeDurableRequest.current?.requestId !== requestId) return;
+      activeDurableRequest.current = null;
       document.documentElement.dataset.jarvisConversationFailure = String(error).slice(0, 160);
       showCaption({
         who: "jarvis",
@@ -2492,6 +2540,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // double-tap / Enter+click within 2.5s = one send, not two
     if (t === lastSent.current.text && Date.now() - lastSent.current.ts < 2500) return;
     lastSent.current = { text: t, ts: Date.now() };
+    const superseded = activeDurableRequest.current;
+    if (superseded) {
+      supersededDurableRequests.current.add(superseded.requestId);
+      while (supersededDurableRequests.current.size > 32) {
+        const oldest = supersededDurableRequests.current.values().next().value as string | undefined;
+        if (!oldest) break;
+        supersededDurableRequests.current.delete(oldest);
+      }
+      activeDurableRequest.current = null;
+      setSending(false);
+    }
     if (streamingSpeechRef.current.timer) clearTimeout(streamingSpeechRef.current.timer);
     streamingSpeechRef.current = {
       id: "",
