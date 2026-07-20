@@ -2,6 +2,7 @@ import { PROJECT_REGISTRY } from "./project-registry";
 
 export const GOAL_PLAN_MARKER = "GOAL_PLAN_JSON:";
 export const GOAL_VALIDATION_MARKER = "GOAL_VALIDATION_JSON:";
+export const GOAL_PLAN_RESULT_MAX_CHARS = 8_000;
 export const GOAL_VALIDATOR_TASK_MAX_CHARS = 40_000;
 
 export const GOAL_ROUTE_KINDS = [
@@ -438,7 +439,7 @@ export function plannerTask(goal: string, route: GoalRoute, acceptanceCriteria: 
     `Inspect the current repository, AGENTS.md, callers, live manifests and relevant primary-source docs. Find existing skills, templates and infrastructure before proposing new code. Break the outcome into 2-${maxBuildSessions} bounded sessions. Use dependencies where later work must build on earlier work; do not parallelize writable sessions in one repository. Agents do not merge or deploy directly: the delivery controller automatically ships the validated goal branch. Actions with public, third-party communication, financial, credential, booking, or destructive consequences remain separately approval-gated.`,
     "End with exactly one compact JSON object after GOAL_PLAN_JSON:. It must use this shape:",
     '{"summary":"...","route":"app_factory|youtube_studio|existing_project|cloud_new|general","primaryRepo":"owner/repo or empty","assumptions":["..."],"workstreams":[{"id":"stable-id","label":"short label","task":"self-contained task","agentId":"paul|atlas|iris|maya|sentry","repo":"owner/repo or empty","readonly":false,"dependsOn":["earlier-id"],"acceptanceCriteria":["observable evidence"],"mcp":["playwright|context7"]}],"validation":{"criteria":["goal-level truth"],"tests":["deep test"],"liveChecks":["deployed/provider check"]},"factory":{"name":"required only for app_factory","slug":"...","brief":"full build brief"}}',
-    "The JSON is a machine contract. Keep the whole response and JSON concise enough to fit in 3,500 characters.",
+    "The JSON is a machine contract. Keep the whole response and JSON concise enough to fit in 7,500 characters.",
   ].filter(Boolean).join("\n\n");
 }
 

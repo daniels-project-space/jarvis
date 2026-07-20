@@ -19,7 +19,12 @@ import {
   resolveSubscriptionAgentBin,
   type AgentProvider,
 } from "./subscription-runtime";
-import { parseGoalPlan, parseGoalValidation, type GoalPlan } from "../lib/goal-mode";
+import {
+  GOAL_PLAN_RESULT_MAX_CHARS,
+  parseGoalPlan,
+  parseGoalValidation,
+  type GoalPlan,
+} from "../lib/goal-mode";
 import { startAppFactoryGoal, syncExternalGoalRevisions, syncExternalGoalRuns } from "./goal-runtime";
 import { codexMcpConfigArgs, type CodexMcpConfig } from "../lib/codex-mcp";
 import { redactSensitiveText } from "../lib/secret-redaction";
@@ -461,6 +466,7 @@ type AgentHarnessOptions = {
 // containers. This keeps reminders, recovery and incident dispatch alive even
 // when no Codex job happens to be running.
 export async function runAgentMaintenance() {
+  await convexMutation("jobs:reconcileGoalWorkstreamModes", {}).catch(() => 0);
   await convexMutation("jobs:reconcileAutonomousSoftwareWork", {}).catch(() => 0);
   let recovered = 0;
   let abandoned = 0;
@@ -1298,7 +1304,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             jobId: job.jobId,
             expectedAttempt,
             status: "done",
-            result: `${result}${goalDeliveryNote}`.slice(0, 4_000),
+            result: `${result}${goalDeliveryNote}`.slice(
+              0,
+              job.goalStage === "planning" ? GOAL_PLAN_RESULT_MAX_CHARS : 4_000,
+            ),
             pullRequestUrl: goalPullRequestUrl,
             verificationVerdict: "pass",
             verificationNote: `${job.goalStage === "planning" ? "Goal plan" : "Deep validation"} machine contract is structurally valid`,

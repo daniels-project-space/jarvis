@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   GOAL_PLAN_MARKER,
+  GOAL_PLAN_RESULT_MAX_CHARS,
   GOAL_VALIDATION_MARKER,
   GOAL_VALIDATOR_TASK_MAX_CHARS,
   goalJobRunnableForMission,
@@ -8,6 +9,7 @@ import {
   goalBranch,
   parseGoalPlan,
   parseGoalValidation,
+  plannerTask,
   routeGoal,
   summarizeGoalPhase,
   validatorTask,
@@ -88,6 +90,17 @@ describe("Goal Mode contracts", () => {
     })}`);
     expect(value.workstreams.map((stream) => stream.id)).toEqual(["core", "ui"]);
     expect(value.workstreams.every((stream) => stream.agentId === "paul")).toBe(true);
+  });
+
+  it("gives complex plans a useful durable response envelope", () => {
+    const prompt = plannerTask(
+      "Make a mature commerce application launch-ready end to end",
+      routeGoal("Make Dropship AI launch-ready", "daniels-project-space/dropship-ai"),
+      ["Verify every external pipeline", "Preserve all consequential approval gates"],
+      8,
+    );
+    expect(GOAL_PLAN_RESULT_MAX_CHARS).toBeGreaterThanOrEqual(8_000);
+    expect(prompt).toContain("7,500 characters");
   });
 
   it("rejects cyclic plans", () => {

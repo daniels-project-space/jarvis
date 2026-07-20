@@ -21,6 +21,8 @@ const TERMINAL = new Set(["done", "error", "cancelled"]);
 
 type GoalJobInput = {
   task: string;
+  /** Internally-owned executable scope, excluding quoted goal/evidence context. */
+  policyTask?: string;
   missionId: string;
   label: string;
   repo?: string;
@@ -128,11 +130,15 @@ export const latestCoordinatorReceipt = query({
 
 async function insertGoalJob(ctx: any, input: GoalJobInput) {
   const now = Date.now();
-  const approval = goalWorkApprovalPolicy(input);
+  const approval = goalWorkApprovalPolicy({
+    ...input,
+    task: input.policyTask?.trim() || input.task,
+  });
   const approvalRequired = approval.required;
   const status = approvalRequired ? "awaiting_approval" : "pending";
+  const { policyTask: _policyTask, ...persistedInput } = input;
   const jobId = await ctx.db.insert("jobs", {
-    ...input,
+    ...persistedInput,
     task: input.task.slice(0, input.goalStage === "validating" ? GOAL_VALIDATOR_TASK_MAX_CHARS : 6_000),
     label: input.label.slice(0, 80),
     visibility: "conversation",
@@ -647,6 +653,9 @@ export const recordPlan = mutation({
       ].join("\n\n");
       const id = await insertGoalJob(ctx, {
         task,
+        // The outcome below is quoted context. Only the planner-authored
+        // workstream is executable scope for consequence classification.
+        policyTask: stream.task,
         missionId: String(args.id),
         label: stream.label,
         repo,
@@ -777,6 +786,7 @@ async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefin
         `Goal Mode outcome: ${mission.goal}`,
         `Final validator gap from wave ${wave - 1}: close only this gap, preserve the shared branch, run the relevant checks, and report exact evidence for the next Sol validation.`,
       ].join("\n\n"),
+      policyTask: refinement.task,
       missionId: String(mission._id),
       label: refinement.label,
       repo: mission.primaryRepo,

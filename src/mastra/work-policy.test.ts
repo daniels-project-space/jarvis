@@ -36,6 +36,9 @@ describe("server-side work approval policy", () => {
     ]) {
       expect(workApprovalPolicy({ task }).required).toBe(true);
     }
+    expect(workApprovalPolicy({ task: "Order the selected product from the supplier" }).required).toBe(true);
+    expect(workApprovalPolicy({ task: "Please order a real test item now" }).required).toBe(true);
+    expect(workApprovalPolicy({ task: "Place a real order with the supplier" }).required).toBe(true);
   });
 
   it("does not let readonly waive an explicit consequential action", () => {
@@ -86,6 +89,12 @@ describe("server-side work approval policy", () => {
       deliveryMode: "auto_merge",
     });
     expect(workApprovalPolicy({ task: "Research current orchestration patterns" }).required).toBe(false);
+    expect(
+      workApprovalPolicy({
+        task: "Wire the Shopify order/fulfillment pipeline and make its webhook idempotent",
+        repo: "daniels-project-space/dropship-ai",
+      }),
+    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
   });
 
   it("does not deadlock Goal Mode on its own generated planner safety contract", () => {

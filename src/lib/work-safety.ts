@@ -71,6 +71,16 @@ function softwareDeliveryAllowed(action: string, clause: string, repo: string | 
   return action.toLocaleLowerCase("en-GB") === "publish" && TECHNICAL_PUBLICATION.test(clause);
 }
 
+// "Order" is also a pervasive commerce data noun (order pipeline, Shopify
+// order, order/fulfillment). Treat it as an action only in an imperative or
+// after an explicit placement verb; the other money verbs remain conservative.
+function consequentialUse(action: string, clause: string, actionIndex: number): boolean {
+  if (action.toLocaleLowerCase("en-GB") !== "order") return true;
+  const before = clause.slice(0, actionIndex).trim();
+  if (/^(?:(?:please|can you|could you|would you)\s*)?$/i.test(before)) return true;
+  return /\b(?:place|submit|make|create|buy|purchase|pay(?:\s+for)?|want\s+(?:you|jarvis)\s+to|need\s+(?:you|jarvis)?\s*to)\s+(?:(?:a|an|the|this|that|one|real)\s+)*$/i.test(before);
+}
+
 export function classifyWorkSafety(
   task: string,
   options?: { repo?: string },
@@ -80,6 +90,7 @@ export function classifyWorkSafety(
     for (const match of clause.matchAll(matcher)) {
       const action = match[0];
       const actionIndex = match.index ?? 0;
+      if (!consequentialUse(action, clause, actionIndex)) continue;
       if (NEGATED_LEAD.test(clause)) continue;
 
       const beforeAction = clause.slice(0, actionIndex);

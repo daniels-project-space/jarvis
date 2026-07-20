@@ -119,12 +119,13 @@ export const reconcileAutonomousSoftwareWork = mutation({
       if (safety.approvalRequired || !isOwnedRepository(row.repo)) continue;
       await ctx.db.patch(row._id, {
         status: "pending",
-        readonly: false,
         risk: row.risk === "consequential" ? "high" : row.risk,
         approvalRequired: false,
         approvalReason: undefined,
         approvalStatus: "superseded",
-        deliveryMode: "auto_merge",
+        // Approval reconciliation must never widen capabilities. A read-only
+        // audit remains read-only even when its false-positive card is removed.
+        deliveryMode: row.readonly === true ? "read_only" : "auto_merge",
         stage: "queued",
         progress: "autonomous software delivery enabled — queued",
         nextRunAt: now,
@@ -151,6 +152,53 @@ export const reconcileAutonomousSoftwareWork = mutation({
       reconciled += 1;
     }
     return reconciled;
+  },
+});
+
+// Repair the persisted execution mode from the Sol plan. This is both a
+// migration for jobs affected by the legacy reconciler above and a cheap
+// recurring invariant check for multi-day goals.
+export const reconcileGoalWorkstreamModes = mutation({
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const groups = await Promise.all(
+      ["running", "paused", "needs_input"].map((status) =>
+        ctx.db.query("missions").withIndex("by_status", (q: any) => q.eq("status", status)).take(20),
+      ),
+    );
+    const missions = groups
+      .flat()
+      .filter((mission: any, index: number, all: any[]) =>
+        mission.mode === "goal" && all.findIndex((candidate: any) => candidate._id === mission._id) === index,
+      );
+    let repaired = 0;
+    for (const mission of missions) {
+      const streams = Array.isArray((mission.plan as any)?.workstreams)
+        ? (mission.plan as any).workstreams as Array<{ id?: string; readonly?: boolean }>
+        : [];
+      if (!streams.length) continue;
+      const byId = new Map(streams.map((stream) => [String(stream.id ?? ""), stream]));
+      const jobs = await ctx.db
+        .query("jobs")
+        .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
+        .collect();
+      for (const job of jobs) {
+        if (job.goalStage !== "building" || !job.goalWorkstreamId) continue;
+        const stream = byId.get(String(job.goalWorkstreamId));
+        if (!stream) continue;
+        const readonly = stream.readonly === true;
+        const deliveryMode = readonly ? "read_only" : "auto_merge";
+        if (job.readonly === readonly && job.deliveryMode === deliveryMode && (!readonly || !job.branch)) continue;
+        await ctx.db.patch(job._id, {
+          readonly,
+          deliveryMode,
+          ...(readonly ? { branch: undefined } : {}),
+        });
+        repaired += 1;
+      }
+    }
+    return repaired;
   },
 });
 
