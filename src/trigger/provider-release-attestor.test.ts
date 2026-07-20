@@ -22,18 +22,27 @@ describe("Trigger provider release attestor protocol", () => {
   });
 
   it("rejects the obsolete v1 protocol and every mismatched bundle coordinate", () => {
-    const payload = {
+    const obsolete = {
       protocol: 1 as const,
       releaseId: `providers-v1:${"b".repeat(64)}`,
       expectedSourceSha: sourceSha,
       expectedProjectRef: projectRef,
       expectedVersion: version,
     };
-    expect(providerReleaseAttestationMatches({ payload, projectRef, sourceSha, version })).toBe(false);
+    expect(providerReleaseAttestationMatches({ payload: obsolete, projectRef, sourceSha, version })).toBe(false);
+
+    const payload = { ...obsolete, releaseId: `providers-v2:${"b".repeat(64)}` };
+    for (const observed of [
+      { projectRef: "proj_wrong", sourceSha, version },
+      { projectRef, sourceSha: "c".repeat(40), version },
+      { projectRef, sourceSha, version: "20260720.41" },
+    ]) {
+      expect(providerReleaseAttestationMatches({ payload, ...observed }), JSON.stringify(observed)).toBe(false);
+    }
     expect(providerReleaseAttestationMatches({
-      payload: { ...payload, releaseId: `providers-v2:${"b".repeat(64)}` },
-      projectRef: "proj_wrong",
-      sourceSha,
+      payload: { ...payload, expectedSourceSha: "not-a-commit" },
+      projectRef,
+      sourceSha: "not-a-commit",
       version,
     })).toBe(false);
   });

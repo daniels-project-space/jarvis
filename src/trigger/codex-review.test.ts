@@ -113,6 +113,7 @@ describe("controller Codex review transport", () => {
         cwd: "/app",
         env,
         stdio: ["pipe", "pipe", "pipe"],
+        boundedRuntimeMs: 90_000,
       },
     });
     expect(invocation!.args.join("\0")).not.toContain("signed-review-receipt");

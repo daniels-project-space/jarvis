@@ -1,5 +1,4 @@
 import { task } from "@trigger.dev/sdk/v3";
-import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { codexExecPrefix } from "./model-policy";
@@ -17,6 +16,7 @@ type ExactSandboxObservation = {
   curlBlocked?: boolean;
   socketBlocked?: boolean;
   procCredentialVisible?: boolean;
+  credentialFileVisible?: boolean;
   namespaceProcSafe?: boolean;
   tools?: Record<string, boolean>;
 };
@@ -30,11 +30,12 @@ export function exactSandboxObservationPassed(observation: ExactSandboxObservati
     && observation.curlBlocked === true
     && observation.socketBlocked === true
     && observation.procCredentialVisible === false
+    && observation.credentialFileVisible === false
     && observation.namespaceProcSafe === true
     && REQUIRED_TOOLS.every((tool) => observation.tools?.[tool] === true);
 }
 
-function probeSource(outsidePath: string): string {
+function probeSource(outsidePath: string, credentialPath: string): string {
   return String.raw`
 const fs = require("node:fs");
 const net = require("node:net");
@@ -69,6 +70,8 @@ async function socketBlocked() {
       }
     } catch {}
   }
+  let credentialFileVisible = false;
+  try { credentialFileVisible = fs.readFileSync(${JSON.stringify(credentialPath)}).length > 0; } catch {}
   const tools = Object.fromEntries(${JSON.stringify(REQUIRED_TOOLS)}.map((tool) => [
     tool,
     spawnSync("/bin/sh", ["-c", "command -v -- \"$1\" >/dev/null", "sh", tool]).status === 0,
@@ -80,6 +83,7 @@ async function socketBlocked() {
     curlBlocked,
     socketBlocked: await socketBlocked(),
     procCredentialVisible,
+    credentialFileVisible,
     namespaceProcSafe: numericPids.length > 0 && numericPids.length <= 24 && numericPids.every((pid) => pid > 0 && pid < 128),
     tools,
   };
@@ -115,7 +119,8 @@ export async function runExactSpecialistSandboxSmoke(): Promise<
   mkdirSync(workspace, { recursive: true });
   writeFileSync(join(workspace, "fixture.txt"), "read-ok\n");
   writeFileSync(join(workspace, "patch-target.txt"), "before\n");
-  writeFileSync(join(workspace, "probe.cjs"), probeSource(outsidePath), { mode: 0o600 });
+  const credentialPath = join(String(prepared.env.CODEX_HOME), "auth.json");
+  writeFileSync(join(workspace, "probe.cjs"), probeSource(outsidePath, credentialPath), { mode: 0o600 });
   try {
     const namespace = verifySpecialistSandboxIsolation({
       codexBin: bin,
@@ -153,7 +158,7 @@ export async function runExactSpecialistSandboxSmoke(): Promise<
     }
     const observation = JSON.parse(readFileSync(join(workspace, "sandbox-observation.json"), "utf8")) as ExactSandboxObservation;
     const patched = readFileSync(join(workspace, "patch-target.txt"), "utf8").trim() === "after";
-    const homeCredential = existsSync(join(String(prepared.env.CODEX_HOME), "auth.json"));
+    const homeCredential = existsSync(credentialPath);
     if (!patched || homeCredential || existsSync(outsidePath) || !exactSandboxObservationPassed(observation)) {
       return {
         ok: false,

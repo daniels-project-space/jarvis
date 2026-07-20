@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CODEX_REVIEW_WORKING_DIRECTORY,
   CODEX_MODEL_POLICY,
+  codexAppServerArgs,
   codexConversationExecPrefix,
   codexExecPrefix,
   codexModelFor,
@@ -40,12 +41,17 @@ describe("subscription model policy", () => {
     expect(codexModelFor("unknown")).toBe(CODEX_MODEL_POLICY.terra);
   });
 
-  it("never sends the unsupported plain gpt-5.6 model to a ChatGPT account", () => {
+  it("never sends the unsupported plain gpt-5.6 model or a dangerous sandbox to a specialist", () => {
     for (const tier of ["luna", "terra", "sol", "unknown"]) {
       const args = codexExecPrefix(tier);
       expect(args).not.toContain("gpt-5.6");
       expect(args[0]).toBe("--search");
-      expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
+      expect(args).toContain("workspace-write");
+      expect(args).toContain("features.use_legacy_landlock=true");
+      expect(args).toContain("sandbox_workspace_write.network_access=false");
+      expect(args).toContain('shell_environment_policy.inherit="none"');
+      expect(args).not.toContain("danger-full-access");
+      expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
     }
   });
 
@@ -73,16 +79,32 @@ describe("subscription model policy", () => {
     }
   });
 
-  it("uses the lean subscription runtime only for foreground conversation", () => {
+  it("keeps fallback conversation reasoning-only", () => {
     for (const tier of ["luna", "terra", "sol", "unknown"]) {
       const args = codexConversationExecPrefix(tier);
       expect(args).toContain(codexModelFor(tier).model);
       expect(args).toContain("--ignore-user-config");
       expect(args).toContain("--ignore-rules");
       expect(args).toContain("--skip-git-repo-check");
-      expect(args).toContain("danger-full-access");
+      expect(args).toContain("read-only");
+      expect(args).toContain('shell_environment_policy.inherit="none"');
+      for (const feature of ["shell_tool", "unified_exec", "apps", "plugins", "hooks", "browser_use", "computer_use", "multi_agent"]) {
+        expect(args[args.indexOf(feature) - 1]).toBe("--disable");
+      }
+      expect(args).not.toContain("danger-full-access");
       expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
       expect(args).not.toContain("gpt-5.6");
+    }
+  });
+
+  it("starts the foreground app server with process-level read-only defaults", () => {
+    const args = codexAppServerArgs();
+    expect(args.slice(0, 3)).toEqual(["app-server", "--listen", "stdio://"]);
+    expect(args).toContain('sandbox_mode="read-only"');
+    expect(args).toContain('shell_environment_policy.inherit="none"');
+    expect(args).not.toContain("danger-full-access");
+    for (const feature of ["shell_tool", "unified_exec", "apps", "plugins", "hooks", "browser_use", "computer_use", "multi_agent"]) {
+      expect(args[args.indexOf(feature) - 1]).toBe("--disable");
     }
   });
 });

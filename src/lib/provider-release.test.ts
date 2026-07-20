@@ -33,8 +33,11 @@ describe("trusted provider release planning", () => {
       "convex/commandCenter.ts",
       "src/components/JarvisUI.tsx",
     ])).toEqual(["convex"]);
+    // Path-only callers have no candidate-tree import graph. Root build config
+    // therefore fails closed for both provider bundles; the exact planner below
+    // narrows ordinary source through its transitive import closure.
     expect(providerKindsForPaths(["src/trigger/agent-runner.ts", "trigger.config.ts"]))
-      .toEqual(["trigger"]);
+      .toEqual(["convex", "trigger"]);
   });
 
   it("follows transitive candidate-tree imports into both provider bundles", () => {
@@ -63,6 +66,24 @@ describe("trusted provider release planning", () => {
       "src/lib/provider-schema.json",
       "src/lib/provider-worker.wasm",
     ], sources).providers).toEqual(["convex", "trigger"]);
+  });
+
+  it("retains provider impact when an imported runtime asset was deleted from the candidate tree", () => {
+    const sources = {
+      "src/trigger/agent-runner.ts": 'const worker = new URL("../assets/provider-worker.wasm", import.meta.url); export { worker };',
+    };
+    const impact = analyseProviderImpact(["src/assets/provider-worker.wasm"], sources);
+    expect(impact.providers).toEqual(["trigger"]);
+    expect(impact.reasons.trigger.join("\n")).toContain("transitively imported by Trigger");
+  });
+
+  it("fails closed for shared modules even when a custom alias is not statically resolvable", () => {
+    const sources = {
+      "convex/jobs.ts": 'import { guard } from "#shared/work-safety"; guard();',
+      "src/lib/work-safety.ts": "export const guard = () => true;",
+    };
+    expect(analyseProviderImpact(["src/lib/work-safety.ts"], sources).providers)
+      .toEqual(["convex", "trigger"]);
   });
 
   it("fails closed for package, lock, root config, and provider build scripts", () => {

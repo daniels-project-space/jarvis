@@ -302,10 +302,17 @@ export function analyseProviderImpact(
   changedPathsInput: readonly string[],
   sourceInput: ReadonlyMap<string, string> | Readonly<Record<string, string>>,
 ): ProviderImpact {
+  const changedPaths = [...new Set(changedPathsInput.map(normalizedPath).filter(Boolean))].sort();
   const sources = sourceInput instanceof Map
     ? new Map([...sourceInput].map(([path, source]) => [normalizedPath(path), source]))
     : new Map(Object.entries(sourceInput).map(([path, source]) => [normalizedPath(path), source]));
-  const changedPaths = [...new Set(changedPathsInput.map(normalizedPath).filter(Boolean))].sort();
+  const missingChangedPaths = new Set(changedPaths.filter((path) => !sources.has(path)));
+  // Candidate-tree snapshots cannot list a deleted asset. Add a non-executable
+  // placeholder so an existing provider import/new URL/readFile edge can still
+  // reach the removed path instead of silently dropping it from the graph.
+  for (const path of missingChangedPaths) {
+    if (SOURCE_EXTENSIONS.includes(extname(path).toLowerCase())) sources.set(path, "");
+  }
   const graph = new Map<string, readonly string[]>();
   for (const [path, source] of sources) {
     if (SOURCE_LIKE.test(path)) graph.set(path, importsFor(path, source, sources));
@@ -326,7 +333,14 @@ export function analyseProviderImpact(
     for (const kind of globalInputProviders(path)) add(kind, `${path}: provider build/runtime input`);
     if (convexReachable.has(path)) add("convex", `${path}: transitively imported by Convex`);
     if (triggerReachable.has(path)) add("trigger", `${path}: transitively imported by Trigger`);
-    if (!sources.has(path) && SOURCE_LIKE.test(path) && /^(?:src|lib|shared)\//.test(path)) {
+    // Custom tsconfig aliases and generated indirection are intentionally not
+    // treated as proof that a shared module is web-only. Shared changes remain
+    // fail-closed even when the lightweight parser cannot resolve an edge.
+    if (/^(?:src\/(?:lib|shared)|lib|shared)\//.test(path)) {
+      add("convex", `${path}: conservative shared source boundary`);
+      add("trigger", `${path}: conservative shared source boundary`);
+    }
+    if (missingChangedPaths.has(path) && SOURCE_LIKE.test(path) && /^(?:src|lib|shared)\//.test(path)) {
       add("convex", `${path}: deleted or unavailable shared source`);
       add("trigger", `${path}: deleted or unavailable shared source`);
     }

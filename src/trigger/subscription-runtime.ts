@@ -71,6 +71,7 @@ function scopedSubscriptionEnv(
     "PATH",
     "HOME",
     "CODEX_HOME",
+    "NODE_ENV",
     "LANG",
     "LC_ALL",
     "TMPDIR",

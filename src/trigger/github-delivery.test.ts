@@ -164,6 +164,7 @@ describe("autonomous GitHub delivery", () => {
 
   it("does not submit the merge until the exact provider gate is ready", async () => {
     const headSha = "abc123abc123abc123abc123abc123abc123abcd";
+    const mergeSha = "fedcba9876543210fedcba9876543210fedcba98";
     const events: string[] = [];
     const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
@@ -171,7 +172,7 @@ describe("autonomous GitHub delivery", () => {
       if (url.includes("/pulls/42/files")) return response(200, [{ filename: "convex/schema.ts" }]);
       if (url.endsWith("/pulls/42/merge") && init?.method === "PUT") {
         events.push("merge");
-        return response(200, { merged: true, sha: "merge123", message: "merged" });
+        return response(200, { merged: true, sha: mergeSha, message: "merged" });
       }
       throw new Error(`unexpected request ${url}`);
     });
@@ -183,17 +184,42 @@ describe("autonomous GitHub delivery", () => {
       releaseGate: async (change) => {
         events.push("providers-ready");
         expect(change.changedPaths).toEqual(["convex/schema.ts"]);
-        return { status: "ready", note: "exact prerequisites attested", headSha };
+        return {
+          status: "ready",
+          note: "exact prerequisites attested",
+          headSha,
+          baseSha,
+          controller: {
+            confirmMerge: async (candidate) => {
+              events.push("ownership-confirmed");
+              expect(candidate).toMatchObject({ headSha, baseSha });
+              return { status: "ready", note: "lease renewed" };
+            },
+            proveLive: async (sha) => {
+              events.push("live-proved");
+              expect(sha).toBe(mergeSha);
+              return { status: "live", note: "exact merge is live" };
+            },
+            cleanup: async () => { events.push("cleanup"); },
+          },
+        };
       },
       fetchImpl: fetchImpl as typeof fetch,
       sleep: async () => undefined,
     });
     expect(result.status).toBe("merged");
-    expect(events).toEqual(["providers-ready", "merge"]);
+    expect(events).toEqual([
+      "providers-ready",
+      "ownership-confirmed",
+      "merge",
+      "live-proved",
+      "cleanup",
+    ]);
   });
 
   it("rejects a provider proof for any head other than the exact PR head", async () => {
     const headSha = "abc123abc123abc123abc123abc123abc123abcd";
+    const cleanup = vi.fn(async () => undefined);
     const fetchImpl = vi.fn()
       .mockResolvedValueOnce(response(200, inspectedPull(headSha)))
       .mockResolvedValueOnce(response(200, [{ filename: "src/trigger/agent-runner.ts" }]));
@@ -202,12 +228,100 @@ describe("autonomous GitHub delivery", () => {
       pull: { number: 42, url: "https://github.test/42", headSha },
       title: "Paul: provider fix",
       token: "token",
-      releaseGate: async () => ({ status: "ready", note: "wrong proof", headSha: "f".repeat(40) }),
+      releaseGate: async () => ({
+        status: "ready",
+        note: "wrong proof",
+        headSha: "f".repeat(40),
+        baseSha,
+        controller: {
+          confirmMerge: async () => ({ status: "ready", note: "must not run" }),
+          proveLive: async () => ({ status: "live", note: "must not run" }),
+          cleanup,
+        },
+      }),
       fetchImpl: fetchImpl as typeof fetch,
       sleep: async () => undefined,
     });
     expect(result.status).toBe("blocked");
     expect(result.note).toContain("does not match");
     expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("invalidates predeployment when main advances before the merge PUT", async () => {
+    const headSha = "abc123abc123abc123abc123abc123abc123abcd";
+    const advancedBase = "e".repeat(40);
+    const confirmMerge = vi.fn(async () => ({ status: "ready" as const, note: "owned" }));
+    const cleanup = vi.fn(async () => undefined);
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(response(200, inspectedPull(headSha, baseSha)))
+      .mockResolvedValueOnce(response(200, [{ filename: "convex/schema.ts" }]))
+      .mockResolvedValueOnce(response(200, inspectedPull(headSha, advancedBase)));
+
+    const result = await mergeVerifiedPullRequest({
+      repo: "daniels-project-space/jarvis",
+      pull: { number: 42, url: "https://github.test/42", headSha },
+      title: "Paul: provider fix",
+      token: "token",
+      releaseGate: async () => ({
+        status: "ready",
+        note: "predeployment complete",
+        headSha,
+        baseSha,
+        controller: {
+          confirmMerge,
+          proveLive: async () => ({ status: "live", note: "must not run" }),
+          cleanup,
+        },
+      }),
+      fetchImpl: fetchImpl as typeof fetch,
+      sleep: async () => undefined,
+    });
+
+    expect(result).toEqual({
+      status: "pending",
+      note: "main advanced after provider verification; the exact candidate must be refreshed and re-attested",
+    });
+    expect(confirmMerge).not.toHaveBeenCalled();
+    expect(fetchImpl.mock.calls.some(([, init]) => init?.method === "PUT")).toBe(false);
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("preserves the merge receipt but blocks finalization when exact live proof fails", async () => {
+    const headSha = "abc123abc123abc123abc123abc123abc123abcd";
+    const mergeSha = "fedcba9876543210fedcba9876543210fedcba98";
+    const cleanup = vi.fn(async () => undefined);
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(response(200, inspectedPull(headSha)))
+      .mockResolvedValueOnce(response(200, [{ filename: "src/trigger/agent-runner.ts" }]))
+      .mockResolvedValueOnce(response(200, inspectedPull(headSha)))
+      .mockResolvedValueOnce(response(200, { merged: true, sha: mergeSha, message: "merged" }));
+
+    const result = await mergeVerifiedPullRequest({
+      repo: "daniels-project-space/jarvis",
+      pull: { number: 42, url: "https://github.test/42", headSha },
+      title: "Paul: provider fix",
+      token: "token",
+      releaseGate: async () => ({
+        status: "ready",
+        note: "predeployment complete",
+        headSha,
+        baseSha,
+        controller: {
+          confirmMerge: async () => ({ status: "ready", note: "lease renewed" }),
+          proveLive: async () => ({ status: "blocked", note: "production alias still serves an older SHA" }),
+          cleanup,
+        },
+      }),
+      fetchImpl: fetchImpl as typeof fetch,
+      sleep: async () => undefined,
+    });
+
+    expect(result).toEqual({
+      status: "postmerge_pending",
+      sha: mergeSha,
+      note: "production alias still serves an older SHA",
+    });
+    expect(cleanup).toHaveBeenCalledOnce();
   });
 });

@@ -51,6 +51,7 @@ describe("subscription subprocess capability scope", () => {
         runtimeRoot: root,
         scope: "worker",
         sourceEnv: {
+          NODE_ENV: "test",
           PATH: process.env.PATH,
           CODEX_AUTH_JSON_B64: authEnvelope(accessToken),
           JARVIS_DISPATCH_TOKEN: "synthetic-dispatch",
@@ -84,6 +85,7 @@ describe("subscription subprocess capability scope", () => {
         nowMs: now,
         runtimeRoot: root,
         sourceEnv: {
+          NODE_ENV: "test",
           PATH: process.env.PATH,
           CODEX_AUTH_JSON_B64: authEnvelope(jwt(now + 19 * 60_000)),
         },
@@ -102,7 +104,7 @@ describe("subscription subprocess capability scope", () => {
     try {
       const prepared = prepareSubscriptionEnv("codex", {
         runtimeRoot: root,
-        sourceEnv: { PATH: process.env.PATH, CODEX_AUTH_JSON: '{"tokens":{}}' },
+        sourceEnv: { NODE_ENV: "test", PATH: process.env.PATH, CODEX_AUTH_JSON: '{"tokens":{}}' },
       });
       expect(prepared.error).toContain("raw Codex auth JSON is forbidden");
       expect(allFiles(root)).toEqual([]);
@@ -119,8 +121,8 @@ describe("subscription subprocess capability scope", () => {
       mkdirSync(source, { recursive: true });
       writeFileSync(join(source, "auth.json"), "synthetic stale credential");
       writeFileSync(join(source, "AGENTS.md"), "scoped briefing");
-      const one = isolateSubscriptionEnv({ CODEX_HOME: source }, "job-one", homes);
-      const two = isolateSubscriptionEnv({ CODEX_HOME: source }, "job-two", homes);
+      const one = isolateSubscriptionEnv({ NODE_ENV: "test", CODEX_HOME: source }, "job-one", homes);
+      const two = isolateSubscriptionEnv({ NODE_ENV: "test", CODEX_HOME: source }, "job-two", homes);
       expect(one.CODEX_HOME).not.toBe(two.CODEX_HOME);
       expect(readFileSync(join(String(one.CODEX_HOME), "AGENTS.md"), "utf8")).toBe("scoped briefing");
       expect(existsSync(join(String(one.CODEX_HOME), "auth.json"))).toBe(false);

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   renewProviderReleaseLockTransaction,
   runningActivityIsStale,
@@ -78,5 +78,50 @@ describe("provider release lease heartbeat", () => {
     expect(job.heartbeatAt).toBe(now);
     expect(runtime.heartbeatAt).toBe(now);
     expect(runningActivityIsStale(runtime, now + 4 * 60_000)).toBe(false);
+  });
+
+  it("does not revive an expired or foreign release owner", async () => {
+    const now = 3_000_000;
+    const release = {
+      releaseId: `providers-v2:${"a".repeat(64)}`,
+      baseSha: "b".repeat(40),
+      headSha: "c".repeat(40),
+    };
+    const job: any = {
+      _id: "job-2",
+      repo: "daniels-project-space/jarvis",
+      task: "provider release",
+      status: "running",
+      attempt: 2,
+      heartbeatAt: now - 299_000,
+      createdAt: 1,
+      providerRelease: release,
+    };
+    const lock: any = {
+      _id: "lock-2",
+      repo: job.repo,
+      jobId: job._id,
+      ...release,
+      leaseToken: "d".repeat(48),
+      leaseUntil: now,
+      status: "premerge_ready",
+    };
+    const patch = vi.fn();
+    const result = await renewProviderReleaseLockTransaction({
+      db: {
+        get: async () => job,
+        query: () => ({ withIndex: () => ({ first: async () => lock }) }),
+        patch,
+      },
+    }, {
+      jobId: job._id,
+      expectedAttempt: 2,
+      ...release,
+      leaseToken: lock.leaseToken,
+    }, now);
+
+    expect(result).toEqual({ ok: false, reason: "provider release lock is missing, expired, or owned elsewhere" });
+    expect(patch).not.toHaveBeenCalled();
+    expect(job.heartbeatAt).toBe(now - 299_000);
   });
 });

@@ -73,6 +73,7 @@ import {
 } from "./git-review-receipt";
 import { spawnCodex } from "./codex-launcher";
 import { verifySpecialistSandboxIsolation } from "./specialist-sandbox";
+import { createSpecialistExitBarrier } from "./specialist-process-lifecycle";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -300,6 +301,7 @@ function runAgent(
       env,
       boundedRuntimeMs: timeoutMs,
     }, { stdio: ["ignore", "pipe", "pipe"] });
+    const exitBarrier = createSpecialistExitBarrier(p);
     let buf = "";
     let stderr = "";
     let finalText = "";
@@ -343,12 +345,7 @@ function runAgent(
       });
     };
     const to = setTimeout(() => {
-      try {
-        p.kill("SIGKILL");
-      } catch {
-        /* already gone */
-      }
-      finish(true);
+      exitBarrier.requestStop({ timedOut: true, stopped: null });
     }, timeoutMs); // bounded below Trigger's one-hour task ceiling
     let controlBusy = false;
     const controlTimer = executionState
@@ -358,15 +355,7 @@ function runAgent(
           try {
             const state = await executionState();
             if (state === "paused" || state === "cancelled") {
-              try {
-                p.kill("SIGTERM");
-                setTimeout(() => {
-                  if (p.exitCode === null) p.kill("SIGKILL");
-                }, 3000);
-              } catch {
-                /* already gone */
-              }
-              finish(false, state);
+              exitBarrier.requestStop({ timedOut: false, stopped: state }, 3_000);
             }
           } finally {
             controlBusy = false;
@@ -451,13 +440,12 @@ function runAgent(
         pushLog(`! ${line}`);
       }
     });
-    p.on("close", (code) => {
-      if (code !== 0 && !finalText) finalText = `error: ${stderr.trim() || `agent exited ${code}`}`;
-      finish(false);
-    });
-    p.on("error", (e) => {
-      finalText = "error: " + e.message;
-      finish(false);
+    void exitBarrier.exited.then(({ code, error, timedOut, stopped }) => {
+      if (error && !finalText) finalText = `error: ${error.message}`;
+      if (code !== 0 && !finalText && !timedOut && !stopped) {
+        finalText = `error: ${stderr.trim() || `agent exited ${code}`}`;
+      }
+      finish(timedOut, stopped);
     });
   });
 }

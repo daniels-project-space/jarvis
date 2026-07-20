@@ -86,6 +86,7 @@ export function buildSpecialistNamespaceProbeInvocation(input: {
   const path = input.env.PATH?.trim() || "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
   const env: NodeJS.ProcessEnv = {
     PATH: path,
+    NODE_ENV: input.env.NODE_ENV ?? "production",
     HOME: String(input.env.HOME ?? cwd),
     CODEX_HOME: String(input.env.CODEX_HOME ?? ""),
     CODEX_ACCESS_TOKEN: SYNTHETIC_CODEX_TOKEN,
