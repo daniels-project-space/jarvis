@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -29,6 +29,8 @@ function repositoryFixture(label = "review") {
   const root = mkdtempSync(join(tmpdir(), `jarvis-${label}-receipt-`));
   roots.push(root);
   const checkout = join(root, "checkout");
+  const unrelatedDirectory = join(root, "unrelated-current-working-directory");
+  mkdirSync(unrelatedDirectory);
   execFileSync("git", ["init", "--initial-branch", "main", checkout], { stdio: "ignore" });
   git(checkout, ["config", "user.email", "jarvis@example.invalid"]);
   git(checkout, ["config", "user.name", "JARVIS test"]);
@@ -40,7 +42,7 @@ function repositoryFixture(label = "review") {
   git(checkout, ["add", "proof.txt"]);
   git(checkout, ["commit", "-m", `${label} change`]);
   const headSha = git(checkout, ["rev-parse", "HEAD"]);
-  return { root, checkout, baseSha, headSha };
+  return { root, checkout, unrelatedDirectory, baseSha, headSha };
 }
 
 afterEach(() => {
@@ -49,7 +51,7 @@ afterEach(() => {
 });
 
 describe("controller Git review receipts", () => {
-  it("verifies the exact hydrated checkout from /app with commit, diff, tests and ancestry", async () => {
+  it("verifies the exact hydrated checkout despite an unrelated caller working directory", async () => {
     const fixture = repositoryFixture();
     const command = commandEvidenceFromCodexEvent({
       type: "item.completed",
@@ -62,7 +64,8 @@ describe("controller Git review receipts", () => {
       },
     }, { AUTH_TOKEN: "controller-secret-value" });
     expect(command).not.toBeNull();
-    process.chdir("/app");
+    process.chdir(fixture.unrelatedDirectory);
+    expect(process.cwd()).not.toBe(fixture.checkout);
 
     const built = await buildGitReviewReceipt({
       runGit: runGit(fixture.checkout),
