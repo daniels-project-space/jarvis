@@ -22,6 +22,7 @@ import {
   patchMissionWithRuntime,
   runtimeJob,
 } from "./controlPlane";
+import { upsertAttentionWithContext } from "./contextProjection";
 
 const ADVANCE_LEASE_MS = 10 * 60 * 1000;
 const COORDINATOR_RECEIPT_FRESH_MS = 10 * 60 * 1000;
@@ -471,7 +472,7 @@ async function resolveGoalAttention(ctx: any, missionId: unknown) {
     .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", `goal-mode:${missionId}`))
     .first();
   if (attention && attention.status !== "resolved") {
-    await ctx.db.patch(attention._id, { status: "resolved", updatedAt: Date.now() });
+    await upsertAttentionWithContext(ctx, attention, { ...attention, status: "resolved" });
   }
 }
 
@@ -865,10 +866,8 @@ async function upsertGoalAttention(ctx: any, mission: any, detail: string) {
     confidence: 1,
     actionClass: "ask",
     status: "open",
-    updatedAt: now,
   };
-  if (existing) await ctx.db.patch(existing._id, item);
-  else await ctx.db.insert("attentionItems", { ...item, createdAt: now });
+  await upsertAttentionWithContext(ctx, existing, item, now);
 }
 
 async function queueExternalRevision(

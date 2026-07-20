@@ -2,6 +2,9 @@
 // this file are intentionally database-only so every durable writer can use
 // them in the same Convex transaction without calling another function.
 
+import { materiallyDifferentMission, materiallyDifferentWork } from "./brainContextModel";
+import { requestContextRefresh, syncContextActiveRow } from "./contextProjection";
+
 function defined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
 }
@@ -125,8 +128,13 @@ export async function upsertJobRuntime(ctx: any, job: any) {
     ? mergeJobRuntimeSource(job, {}, existing)
     : job;
   const projected = projectJobRuntime(source);
+  const materialChange = materiallyDifferentWork(existing, projected);
   if (existing) await ctx.db.replace(existing._id, projected);
   else await ctx.db.insert("jobRuntime", projected);
+  if (materialChange) {
+    await syncContextActiveRow(ctx, "job", projected);
+    await requestContextRefresh(ctx, ["work"]);
+  }
 }
 
 const LIVE_JOB_ACTIVITY_FIELDS = ["stage", "percent", "progress", "heartbeatAt", "updatedAt"] as const;
@@ -151,8 +159,13 @@ export function mergeJobRuntimeSource(
 export async function upsertMissionRuntime(ctx: any, mission: any) {
   const projected = projectMissionRuntime(mission);
   const existing = await missionRuntimeFor(ctx, mission._id);
+  const materialChange = materiallyDifferentMission(existing, projected);
   if (existing) await ctx.db.replace(existing._id, projected);
   else await ctx.db.insert("missionRuntime", projected);
+  if (materialChange) {
+    await syncContextActiveRow(ctx, "mission", projected);
+    await requestContextRefresh(ctx, ["work"]);
+  }
 }
 
 export async function insertJobWithRuntime(ctx: any, value: any) {
@@ -165,8 +178,13 @@ export async function patchJobWithRuntime(ctx: any, job: any, patch: Record<stri
   const existing = await jobRuntimeFor(ctx, job._id);
   await ctx.db.patch(job._id, patch);
   const projected = projectJobRuntime(mergeJobRuntimeSource(job, patch, existing));
+  const materialChange = materiallyDifferentWork(existing, projected);
   if (existing) await ctx.db.replace(existing._id, projected);
   else await ctx.db.insert("jobRuntime", projected);
+  if (materialChange) {
+    await syncContextActiveRow(ctx, "job", projected);
+    await requestContextRefresh(ctx, ["work"]);
+  }
 }
 
 export async function insertMissionWithRuntime(ctx: any, value: any) {

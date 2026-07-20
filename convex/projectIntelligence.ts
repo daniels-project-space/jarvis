@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { requestContextRefresh, syncContextActiveRow } from "./contextProjection";
 
 const fingerprint = (project: string, title: string) =>
   `${project.trim().toLowerCase()}:${title.trim().toLowerCase().replace(/\s+/g, " ")}`.slice(0, 240);
@@ -26,8 +27,7 @@ export const upsertGoal = mutation({
       .query("projectGoals")
       .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", key))
       .first();
-    const now = Date.now();
-    const doc = {
+    const stable = {
       fingerprint: key,
       project: a.project.trim().toLowerCase().slice(0, 80),
       title: a.title.trim().slice(0, 160),
@@ -39,13 +39,35 @@ export const upsertGoal = mutation({
       blockedBy: a.blockedBy?.trim().slice(0, 600) ?? existing?.blockedBy,
       evidence: (a.evidence ?? existing?.evidence ?? []).map((item) => item.slice(0, 400)).slice(0, 20),
       owner: a.owner?.trim().slice(0, 80) ?? existing?.owner,
-      updatedAt: now,
     };
-    if (existing) {
-      await ctx.db.patch(existing._id, doc);
+    if (
+      existing
+      && existing.fingerprint === stable.fingerprint
+      && existing.project === stable.project
+      && existing.title === stable.title
+      && existing.outcome === stable.outcome
+      && existing.status === stable.status
+      && existing.priority === stable.priority
+      && existing.progress === stable.progress
+      && existing.nextAction === stable.nextAction
+      && existing.blockedBy === stable.blockedBy
+      && JSON.stringify(existing.evidence) === JSON.stringify(stable.evidence)
+      && existing.owner === stable.owner
+    ) {
       return existing._id;
     }
-    return await ctx.db.insert("projectGoals", { ...doc, createdAt: now });
+    const now = Date.now();
+    const doc = { ...stable, updatedAt: now };
+    const id = existing?._id ?? await ctx.db.insert("projectGoals", { ...doc, createdAt: now });
+    if (existing) await ctx.db.patch(existing._id, doc);
+    const contextChanged = await syncContextActiveRow(ctx, "goal", {
+      ...(existing ?? {}),
+      ...doc,
+      _id: id,
+      createdAt: existing?.createdAt ?? now,
+    });
+    if (contextChanged) await requestContextRefresh(ctx, ["projects"]);
+    return id;
   },
 });
 

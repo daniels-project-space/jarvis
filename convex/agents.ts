@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { requestContextRefresh } from "./contextProjection";
 
 const TEAM = [
   {
@@ -80,21 +81,31 @@ export const seed = mutation({
         ...member,
         capabilities: [...member.capabilities],
         projectScopes: [...member.projectScopes],
-        updatedAt: Date.now(),
       };
       if (existing) {
-        await ctx.db.patch(existing._id, stable);
-        updated += 1;
+        const changed = existing.name !== stable.name
+          || existing.role !== stable.role
+          || existing.description !== stable.description
+          || existing.defaultModel !== stable.defaultModel
+          || existing.autonomy !== stable.autonomy
+          || JSON.stringify(existing.capabilities) !== JSON.stringify(stable.capabilities)
+          || JSON.stringify(existing.projectScopes) !== JSON.stringify(stable.projectScopes);
+        if (changed) {
+          await ctx.db.patch(existing._id, { ...stable, updatedAt: Date.now() });
+          updated += 1;
+        }
       } else {
         await ctx.db.insert("agentProfiles", {
           ...stable,
           status: "available",
           completedJobs: 0,
           failedJobs: 0,
+          updatedAt: Date.now(),
         });
         created += 1;
       }
     }
+    if (created || updated) await requestContextRefresh(ctx, ["work"]);
     return { created, updated, total: TEAM.length };
   },
 });
@@ -147,6 +158,7 @@ export const setWork = mutation({
       .withIndex("by_slug", (q: any) => q.eq("slug", a.slug))
       .first();
     if (!row) return false;
+    if (row.status === a.status && row.currentJobId === a.currentJobId) return true;
     await ctx.db.patch(row._id, {
       status: a.status,
       currentJobId: a.currentJobId,

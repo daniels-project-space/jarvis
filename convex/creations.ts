@@ -2,6 +2,8 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 import { inferCreationFiling } from "./creationFiling";
+import { requestContextRefresh } from "./contextProjection";
+import { materiallyDifferentArtifact } from "./brainContextModel";
 
 // JARVIS's atelier — everything he makes (mind maps, charts, images, PDFs,
 // docs) is saved here so nothing he creates is ever lost. The UI lists it
@@ -95,7 +97,7 @@ export const create = mutation({
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     const filing = inferCreationFiling(a);
-    return await ctx.db.insert("creations", {
+    const id = await ctx.db.insert("creations", {
       kind: a.kind,
       title: a.title.slice(0, 120),
       data: a.data,
@@ -106,6 +108,8 @@ export const create = mutation({
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
+    await requestContextRefresh(ctx, ["artifacts"]);
+    return id;
   },
 });
 
@@ -125,7 +129,9 @@ export const update = mutation({
   },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
-    const patch: Record<string, unknown> = { updatedAt: Date.now() };
+    const row = await ctx.db.get(a.id);
+    if (!row) return false;
+    const patch: Record<string, unknown> = {};
     if (a.title !== undefined) patch.title = a.title.slice(0, 120);
     if (a.data !== undefined) patch.data = a.data;
     if (a.url !== undefined) patch.url = a.url;
@@ -135,7 +141,12 @@ export const update = mutation({
     if (a.project !== undefined) patch.project = a.project.slice(0, 80);
     if (a.inquiry !== undefined) patch.inquiry = a.inquiry.slice(0, 80);
     if (a.threadId !== undefined) patch.threadId = a.threadId.slice(0, 120);
-    await ctx.db.patch(a.id, patch);
+    const changed = Object.entries(patch).some(([key, value]) => row[key as keyof typeof row] !== value);
+    if (!changed) return a.id;
+    const updatedAt = Date.now();
+    const next = { ...row, ...patch, updatedAt };
+    await ctx.db.patch(a.id, { ...patch, updatedAt });
+    if (materiallyDifferentArtifact(row, next)) await requestContextRefresh(ctx, ["artifacts"]);
     return a.id;
   },
 });
@@ -157,8 +168,13 @@ export const updateScene = mutation({
     if (!row || row.kind !== "scene") return { ok: false as const, reason: "not_found" as const };
     if (row.updatedAt !== a.expectedUpdatedAt)
       return { ok: false as const, reason: "conflict" as const, data: row.data, title: row.title, updatedAt: row.updatedAt };
+    if (row.title === a.title.slice(0, 120) && row.data === a.data) {
+      return { ok: true as const, updatedAt: row.updatedAt };
+    }
     const updatedAt = Date.now();
-    await ctx.db.patch(a.id, { title: a.title.slice(0, 120), data: a.data, updatedAt });
+    const next = { ...row, title: a.title.slice(0, 120), data: a.data, updatedAt };
+    await ctx.db.patch(a.id, { title: next.title, data: next.data, updatedAt });
+    if (materiallyDifferentArtifact(row, next)) await requestContextRefresh(ctx, ["artifacts"]);
     return { ok: true as const, updatedAt };
   },
 });
@@ -268,11 +284,11 @@ export const updateTripProvider = mutation({
     if (states.length && states.every((state) => ["ready", "error", "skipped"].includes(String(state)))) {
       doc.searchCompletedAt = now;
     }
-    await ctx.db.patch(a.id, {
-      data: JSON.stringify(doc),
-      thumb: row.thumb ?? doc.stays?.[0]?.thumb ?? doc.activities?.[0]?.photo,
-      updatedAt: now,
-    });
+    const data = JSON.stringify(doc);
+    const thumb = row.thumb ?? doc.stays?.[0]?.thumb ?? doc.activities?.[0]?.photo;
+    const next = { ...row, data, thumb, updatedAt: now };
+    await ctx.db.patch(a.id, { data, thumb, updatedAt: now });
+    if (materiallyDifferentArtifact(row, next)) await requestContextRefresh(ctx, ["artifacts"]);
     return true;
   },
 });
@@ -342,6 +358,10 @@ export const remove = mutation({
   args: { id: v.id("creations"), ...actorAuthArgs },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
+    const row = await ctx.db.get(a.id);
+    if (!row) return false;
     await ctx.db.delete(a.id);
+    await requestContextRefresh(ctx, ["artifacts"]);
+    return true;
   },
 });

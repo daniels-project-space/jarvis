@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { requestContextRefresh, upsertBrainMemory } from "./contextProjection";
 
 // Write a memory row. Full/long bodies live in R2 (r2Key); this row is the
 // reactive index + a short/distilled body for quick recall.
@@ -16,7 +17,7 @@ export const write = mutation({
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     const now = Date.now();
-    return await ctx.db.insert("memory", {
+    const row = {
       kind: a.kind,
       title: a.title,
       body: a.body,
@@ -24,7 +25,11 @@ export const write = mutation({
       r2Key: a.r2Key,
       createdAt: now,
       updatedAt: now,
-    });
+    };
+    const id = await ctx.db.insert("memory", row);
+    await upsertBrainMemory(ctx, { ...row, _id: id });
+    await requestContextRefresh(ctx, ["memory"]);
+    return id;
   },
 });
 

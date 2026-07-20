@@ -88,7 +88,7 @@ export function deriveProactiveSignals(input: {
       detail: `${overduePending.length} eligible job${overduePending.length === 1 ? " has" : "s have"} waited over 20 minutes with no live worker heartbeat.`,
       evidence: [
         `oldest job ${String(oldest._id)}`,
-        `queued ${Math.round((now - oldest.createdAt) / 60_000)} minutes`,
+        `queued at ${new Date(oldest.createdAt).toISOString()}`,
       ],
       severity: "critical",
       impact: 90,
