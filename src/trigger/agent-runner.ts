@@ -47,6 +47,7 @@ import {
   validatedGoalDeliveryBranch,
 } from "./github-delivery";
 import { wakeAgentFleet } from "../lib/agent-fleet-dispatch";
+import { upstreamEvidencePrompt } from "../lib/upstream-evidence";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -920,8 +921,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const followUp = job.parentJobId
           ? `\n\nCONCURRENT FOLLOW-UP: this job extends ${job.parentJobId}. That earlier job may still be running. Own this issue independently; do not wait for it or overwrite its branch.`
           : "";
+        const upstream = upstreamEvidencePrompt(job.upstreamEvidence);
         const prompt =
           `You are ${profile.name}, JARVIS's permanent ${profile.role}.\n${profile.instructions}\n\n${context}\n\n` +
+          `${upstream ? `${upstream}\n\n` : ""}` +
           `TASK:\n${job.task}\n\nDEFINITION OF DONE:\n${criteria.map((item: string) => `- ${item}`).join("\n")}` +
           `${checkpoint}${followUp}\n\n${SAFE_SANDBOX_EXECUTION_RULES}\n\nBefore finishing, verify the definition of done and explicitly report the evidence. If a consequential action or personal decision is required, stop and ask one precise question.`;
         const model = normalizeWorkModelTier(

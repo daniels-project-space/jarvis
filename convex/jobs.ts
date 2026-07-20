@@ -255,7 +255,7 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
   return runnable;
 }
 
-function claimedJob(j: any) {
+function claimedJob(j: any, upstreamEvidence: any[] = []) {
   return {
     jobId: j._id,
     task: j.task,
@@ -290,6 +290,7 @@ function claimedJob(j: any) {
     goalStage: j.goalStage ?? null,
     goalWorkstreamId: j.goalWorkstreamId ?? null,
     goalWave: j.goalWave ?? 0,
+    upstreamEvidence,
   };
 }
 
@@ -375,6 +376,25 @@ export const claimDispatched = mutation({
       workerRunId: a.workerRunId.slice(0, 120),
       workerRuntime: "trigger",
     });
+    const upstreamRows = j.missionId
+      ? await ctx.db
+          .query("jobs")
+          .withIndex("by_mission", (q: any) => q.eq("missionId", j.missionId))
+          .collect()
+      : await Promise.all((j.dependsOn ?? []).slice(0, 8).map(async (dependency: string) => {
+          const id = ctx.db.normalizeId("jobs", dependency);
+          return id ? await ctx.db.get(id) : null;
+        }));
+    const upstreamEvidence = upstreamRows
+      .filter((row: any) => row && row._id !== j._id && row.status === "done" && String(row.result ?? "").trim())
+      .sort((left: any, right: any) => Number(left.completedAt ?? left.createdAt ?? 0) - Number(right.completedAt ?? right.createdAt ?? 0))
+      .slice(-8)
+      .map((row: any) => ({
+        label: String(row.label ?? row.task ?? "Upstream workstream").slice(0, 120),
+        status: row.status,
+        result: String(row.result).slice(0, 1_400),
+        verificationNote: String(row.verificationNote ?? "").slice(0, 300),
+      }));
     await ctx.db.insert("workEvents", {
       jobId: String(j._id),
       missionId: j.missionId,
@@ -385,7 +405,7 @@ export const claimDispatched = mutation({
       percent: Math.max(2, j.percent ?? 0),
       createdAt: now,
     });
-    return claimedJob(j);
+    return claimedJob(j, upstreamEvidence);
   },
 });
 
