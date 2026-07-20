@@ -19,6 +19,22 @@ const SOFTWARE_DELIVERY_ACTION = /^(?:deploy|merge)$/i;
 const TECHNICAL_PUBLICATION =
   /\b(?:convex|trigger(?:\.dev)?|vercel|function|schema|migration|build|release|deployment)\b/i;
 
+// A delivery controller can move its review prompt to a local child process
+// through standard input. These patterns describe the object and transport,
+// not merely co-occurring technical words, so a direct or named recipient
+// cannot borrow the exception.
+const CONTROLLER_REVIEW_PROMPT_OBJECT =
+  /^(?:(?:the|a|an|this|that)\s+)?(?:(?:final|generated|full|large|long|sol|max|codex)\s+)*(?:(?:delivery[- ]?)?controller(?:['’]s)?[- ]+)?(?:review[- ]+)?prompt\b/i;
+
+const STANDARD_INPUT_AFTER_PROMPT =
+  /^\s+(?:through|via|over|on|into|using)\s+(?:the\s+)?(?:standard[- ]input|stdin)\b/i;
+
+const STANDARD_INPUT_SEND_LEAD =
+  /(?:\b(?:standard[- ]input|stdin)\s+to|(?:through|via|over|on|into|using)\s+(?:the\s+)?(?:standard[- ]input|stdin)\s*,?)\s*$/i;
+
+const NON_TECHNICAL_TRANSFER_TAIL =
+  /\b(?:email|message|reply|contact|cc|copy|publicly|externally)\b|\b(?:to|for)\s+(?!(?:avoid|prevent|remove|keep|reduce|handle|support|fix|eliminate|review|the\s+(?:controller|codex|process|runner)|(?:controller|codex|process|runner))\b)/i;
+
 export type WorkSafetyBoundary = "internal" | "software_delivery" | "external";
 
 export type WorkSafetyDecision = {
@@ -74,14 +90,36 @@ function softwareDeliveryAllowed(action: string, clause: string, repo: string | 
   return action.toLocaleLowerCase("en-GB") === "publish" && TECHNICAL_PUBLICATION.test(clause);
 }
 
+function controllerReviewStdinTransfer(clause: string, before: string, after: string): boolean {
+  if (!/\breview\b/i.test(clause) || !/\b(?:standard[- ]input|stdin)\b/i.test(clause)) return false;
+  const prompt = after.match(CONTROLLER_REVIEW_PROMPT_OBJECT);
+  if (!prompt) return false;
+  const afterPrompt = after.slice(prompt[0].length);
+  const transport = afterPrompt.match(STANDARD_INPUT_AFTER_PROMPT);
+  const tail = transport
+    ? afterPrompt.slice(transport[0].length)
+    : STANDARD_INPUT_SEND_LEAD.test(before)
+      ? afterPrompt
+      : null;
+  return tail !== null && !NON_TECHNICAL_TRANSFER_TAIL.test(tail);
+}
+
 // "Order" is also a pervasive commerce data noun (order pipeline, Shopify
 // order, order/fulfillment). Treat it as an action only in an imperative or
 // after an explicit placement verb; the other money verbs remain conservative.
 function consequentialUse(action: string, clause: string, actionIndex: number): boolean {
   const normalized = action.toLocaleLowerCase("en-GB");
+  const before = clause.slice(0, actionIndex).trim();
+  const after = clause.slice(actionIndex + action.length).trim();
+  if (normalized === "send") {
+    if (controllerReviewStdinTransfer(clause, before, after)) return false;
+  }
+  if (normalized === "post") {
+    // In "post-index" / "post-index-stage", post- is the technical prefix
+    // meaning "after", not an imperative to publish content.
+    if (/^-index(?:ed|ing)?(?:-stage)?\b/i.test(after)) return false;
+  }
   if (normalized === "message") {
-    const before = clause.slice(0, actionIndex).trim();
-    const after = clause.slice(actionIndex + action.length).trim();
     // Repository instructions routinely describe a git commit message, while
     // the consequential meaning is an instruction to message a person. The
     // conjunction splitter keeps "commit this and message the tenant" in a
@@ -91,7 +129,6 @@ function consequentialUse(action: string, clause: string, actionIndex: number): 
     if (/\b(?:error|status|progress|validation|log)\s*$/i.test(before)) return false;
   }
   if (normalized !== "order") return true;
-  const before = clause.slice(0, actionIndex).trim();
   if (/^(?:(?:please|can you|could you|would you)\s*)?$/i.test(before)) return true;
   return /\b(?:place|submit|make|create|buy|purchase|pay(?:\s+for)?|want\s+(?:you|jarvis)\s+to|need\s+(?:you|jarvis)?\s*to)\s+(?:(?:a|an|the|this|that|one|real)\s+)*$/i.test(before);
 }
