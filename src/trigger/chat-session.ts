@@ -27,7 +27,11 @@ import {
   JARVIS_TOOL_INSTRUCTIONS,
 } from "./agent-tool-bridge";
 import { StreamPublisher } from "./stream-publisher";
-import { isLegacyRunnerClaimValidationError, WarmHandoffController } from "./foreground-handoff";
+import {
+  acquireRunnerLease,
+  isLegacyRunnerClaimValidationError,
+  WarmHandoffController,
+} from "./foreground-handoff";
 
 function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = false): string[] {
   if (provider !== "codex") throw new Error("Jarvis permits only the Codex CLI runtime");
@@ -52,6 +56,8 @@ const HANDOFF_AFTER_MS = 540_000;
 const HANDOFF_RETRY_MS = 30_000;
 const HANDOFF_FAILURE_RETRY_MS = 2_000;
 const HANDOFF_MAX_ATTEMPTS = 5;
+const HANDOFF_TRIGGER_TIMEOUT_MS = 15_000;
+const PENDING_SIGNAL_RETRY_MS = 1_000;
 
 async function convexCall(kind: "query" | "mutation", path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
@@ -91,27 +97,43 @@ function waitForPending(
   return new Promise((resolve) => {
     let settled = false;
     let unsubscribe = () => {};
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     const finish = (value: boolean) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       signal?.removeEventListener("abort", aborted);
       unsubscribe();
       resolve(value);
     };
     const aborted = () => finish(false);
+    const retryAfterSubscriptionError = () => {
+      if (settled || reconnectTimer) return;
+      // Keep the owning process alive and fall back to one bounded claim per
+      // second while Convex realtime reconnects. Exiting here would recreate
+      // the cold handoff gap even though this runner still owns the lease.
+      reconnectTimer = setTimeout(
+        () => finish(true),
+        Math.max(1, Math.min(PENDING_SIGNAL_RETRY_MS, timeoutMs)),
+      );
+    };
     const timer = setTimeout(() => finish(false), timeoutMs);
     if (signal?.aborted) {
       finish(false);
       return;
     }
     signal?.addEventListener("abort", aborted, { once: true });
-    unsubscribe = client.onUpdate(
-      api.chatQueue.pendingSignal,
-      { workerToken },
-      (messageId) => { if (messageId) finish(true); },
-      () => finish(false),
-    );
+    try {
+      unsubscribe = client.onUpdate(
+        api.chatQueue.pendingSignal,
+        { workerToken },
+        (messageId) => { if (messageId) finish(true); },
+        retryAfterSubscriptionError,
+      );
+    } catch {
+      retryAfterSubscriptionError();
+    }
   });
 }
 
@@ -282,10 +304,12 @@ async function processChatQueue(
   }
   let ownsLease: boolean;
   try {
-    ownsLease = await convexMutation("chatQueue:touchRunner", {
-      runnerId,
-      takeoverFrom: source === "warm-handoff" ? handoffFrom : undefined,
-    }) as boolean;
+    ownsLease = await acquireRunnerLease({
+      acquire: () => convexMutation("chatQueue:touchRunner", {
+        runnerId,
+        takeoverFrom: source === "warm-handoff" ? handoffFrom : undefined,
+      }) as Promise<boolean>,
+    });
   } catch (error) {
     server.stop();
     throw error;
@@ -316,6 +340,7 @@ async function processChatQueue(
     maxAttempts: HANDOFF_MAX_ATTEMPTS,
     retryDelayMs: HANDOFF_RETRY_MS,
     failureRetryDelayMs: HANDOFF_FAILURE_RETRY_MS,
+    launchTimeoutMs: HANDOFF_TRIGGER_TIMEOUT_MS,
   });
   const stopLeaseWatch = client.onUpdate(
     api.chatQueue.runnerLeaseForWorker,

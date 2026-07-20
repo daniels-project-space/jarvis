@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { isLegacyRunnerClaimValidationError, WarmHandoffController } from "./foreground-handoff";
+import {
+  acquireRunnerLease,
+  isLegacyRunnerClaimValidationError,
+  WarmHandoffController,
+} from "./foreground-handoff";
 
 function deferred() {
   let resolve!: () => void;
@@ -8,6 +12,42 @@ function deferred() {
 }
 
 describe("warm foreground handoff", () => {
+  it("keeps a ready successor alive when lease commit succeeds but its response is lost", async () => {
+    let leaseOwner = "old";
+    const waits: number[] = [];
+    const acquire = vi.fn(async () => {
+      if (leaseOwner === "old") {
+        leaseOwner = "new";
+        throw new Error("response lost after commit");
+      }
+      return leaseOwner === "new";
+    });
+
+    await expect(acquireRunnerLease({
+      acquire,
+      maxAttempts: 3,
+      retryDelayMs: 5,
+      wait: async (delayMs) => { waits.push(delayMs); },
+    })).resolves.toBe(true);
+    expect(leaseOwner).toBe("new");
+    expect(acquire).toHaveBeenCalledTimes(2);
+    expect(waits).toEqual([5]);
+  });
+
+  it("bounds ambiguous lease retries when the provider remains unavailable", async () => {
+    const acquire = vi.fn().mockRejectedValue(new Error("provider unavailable"));
+    const wait = vi.fn().mockResolvedValue(undefined);
+
+    await expect(acquireRunnerLease({
+      acquire,
+      maxAttempts: 3,
+      retryDelayMs: 5,
+      wait,
+    })).rejects.toThrow("provider unavailable");
+    expect(acquire).toHaveBeenCalledTimes(3);
+    expect(wait).toHaveBeenCalledTimes(2);
+  });
+
   it("keeps the predecessor draining until a ready successor atomically takes over", async () => {
     const ready = deferred();
     const claimedBy = new Map<string, string>();
@@ -95,6 +135,34 @@ describe("warm foreground handoff", () => {
     timers[1].callback();
     await Promise.resolve();
     expect(launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("times out a hung launch and exhausts successor attempts deterministically", async () => {
+    vi.useFakeTimers();
+    try {
+      const launch = vi.fn(() => new Promise<boolean>(() => {}));
+      const controller = new WarmHandoffController({
+        runnerId: "old",
+        payload: () => ({ handoffFrom: "old" }),
+        launch,
+        onTakeover: () => {},
+        maxAttempts: 2,
+        launchTimeoutMs: 5,
+        failureRetryDelayMs: 2,
+      });
+
+      const first = controller.start();
+      await vi.advanceTimersByTimeAsync(5);
+      await expect(first).resolves.toBe(false);
+      await vi.advanceTimersByTimeAsync(2);
+      expect(launch).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(5);
+      expect(controller.state).toMatchObject({ attempts: 2, takenOver: false });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(launch).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps handoff payloads compatible in both rolling directions", () => {
