@@ -10,7 +10,11 @@ const response = (status: number, body: unknown) => new Response(JSON.stringify(
   headers: { "content-type": "application/json" },
 });
 
-const inspectedPull = (headSha = "abc123abc123abc123abc123abc123abc123abcd") => ({
+const baseSha = "def456def456def456def456def456def456defa";
+const inspectedPull = (
+  headSha = "abc123abc123abc123abc123abc123abc123abcd",
+  observedBaseSha = baseSha,
+) => ({
   state: "open",
   merged: false,
   head: {
@@ -19,7 +23,7 @@ const inspectedPull = (headSha = "abc123abc123abc123abc123abc123abc123abcd") => 
     repo: { full_name: "daniels-project-space/jarvis" },
   },
   base: {
-    sha: "def456def456def456def456def456def456defa",
+    sha: observedBaseSha,
     ref: "main",
     repo: { full_name: "daniels-project-space/jarvis" },
   },
@@ -87,12 +91,14 @@ describe("autonomous GitHub delivery", () => {
 
   it("merges verified work without bypassing GitHub's checks", async () => {
     const headSha = "abc123abc123abc123abc123abc123abc123abcd";
+    const mergeSha = "fedcba9876543210fedcba9876543210fedcba98";
     const fetchImpl = vi.fn()
       .mockResolvedValueOnce(response(200, inspectedPull(headSha)))
       .mockResolvedValueOnce(response(200, [{ filename: "src/app/page.tsx" }]))
+      .mockResolvedValueOnce(response(200, inspectedPull(headSha)))
       .mockResolvedValueOnce(response(200, {
         merged: true,
-        sha: "merge123",
+        sha: mergeSha,
         message: "Pull Request successfully merged",
       }));
     const result = await mergeVerifiedPullRequest({
@@ -106,23 +112,21 @@ describe("autonomous GitHub delivery", () => {
     });
     expect(result).toEqual({
       status: "merged",
-      sha: "merge123",
+      sha: mergeSha,
       note: "Pull Request successfully merged",
+      providerFinalized: false,
     });
-    expect(JSON.parse(String(fetchImpl.mock.calls[2][1]?.body))).toMatchObject({ sha: headSha });
+    expect(JSON.parse(String(fetchImpl.mock.calls[3][1]?.body))).toMatchObject({ sha: headSha });
   });
 
   it("stops on a real branch conflict instead of force-delivering", async () => {
     const fetchImpl = vi.fn()
       .mockResolvedValueOnce(response(200, inspectedPull()))
       .mockResolvedValueOnce(response(200, [{ filename: "src/app/page.tsx" }]))
-      .mockResolvedValueOnce(response(409, { message: "Head branch was modified" }))
       .mockResolvedValueOnce(response(200, {
-        state: "open",
-        merged: false,
+        ...inspectedPull(),
         mergeable: false,
         mergeable_state: "dirty",
-        head: { sha: "abc123abc123abc123abc123abc123abc123abcd" },
       }));
     const result = await mergeVerifiedPullRequest({
       repo: "daniels-project-space/jarvis",

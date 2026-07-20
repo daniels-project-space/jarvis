@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { verifiedDeliveryCanFinalize } from "./provider-release-finalization";
 import {
+  analyseProviderImpact,
   buildProviderReleasePlan,
   providerKindsForPaths,
+  runPostMergeReleaseBarrier,
   runProviderReleaseBarrier,
+  vercelLiveDeploymentMismatch,
   vercelProjectIdentityMismatch,
   type ProviderReleaseState,
   type ProviderStepReceipt,
@@ -12,13 +15,14 @@ import {
 const baseSha = "a".repeat(40);
 const headSha = "b".repeat(40);
 
-function jarvisPlan(paths: string[]) {
+function jarvisPlan(paths: string[], sources?: Record<string, string>) {
   return buildProviderReleasePlan({
     repository: "daniels-project-space/jarvis",
     branch: "jarvis/paul-provider-order",
     baseSha,
     headSha,
     changedPaths: paths,
+    sources,
   });
 }
 
@@ -33,6 +37,27 @@ describe("trusted provider release planning", () => {
       .toEqual(["trigger"]);
   });
 
+  it("follows transitive candidate-tree imports into both provider bundles", () => {
+    const sources = {
+      "convex/jobs.ts": 'import { guard } from "../src/lib/convex-shared"; guard();',
+      "src/lib/convex-shared.ts": 'export { guard } from "./work-safety";',
+      "src/trigger/agent-runner.ts": 'import { guard } from "../lib/trigger-shared"; guard();',
+      "src/lib/trigger-shared.ts": 'export { guard } from "./work-safety";',
+      "src/lib/work-safety.ts": "export const guard = () => true;",
+      "src/components/OnlyWeb.tsx": "export const OnlyWeb = () => null;",
+    };
+    expect(analyseProviderImpact(["src/lib/work-safety.ts"], sources).providers)
+      .toEqual(["convex", "trigger"]);
+    expect(analyseProviderImpact(["src/components/OnlyWeb.tsx"], sources).providers)
+      .toEqual([]);
+  });
+
+  it("fails closed for package, lock, root config, and provider build scripts", () => {
+    for (const path of ["package.json", "package-lock.json", "tsconfig.json", "instrumentation.config.ts", "scripts/release-provider.mjs"]) {
+      expect(providerKindsForPaths([path]), path).toEqual(["convex", "trigger"]);
+    }
+  });
+
   it("orders Jarvis's exact project-isolated prerequisites before web delivery", () => {
     const plan = jarvisPlan(["convex/schema.ts", "src/trigger/agent-runner.ts"]);
     expect(plan).toMatchObject({ required: true, valid: true });
@@ -41,12 +66,35 @@ describe("trusted provider release planning", () => {
       "convex:canonical:tangible-goose-318",
       "convex:mirror:scintillating-camel-329",
       "trigger:proj_wjwbdgeipgpddvrazxnp",
+      "live:vercel:jarvis-orcin-six.vercel.app",
+      "live:convex:canonical:tangible-goose-318",
+      "live:convex:mirror:scintillating-camel-329",
+      "live:trigger:proj_wjwbdgeipgpddvrazxnp",
     ]);
     expect(plan.boundary?.vercel).toMatchObject({
       productionAlias: "jarvis-orcin-six.vercel.app",
       productionBranch: "main",
       gitRepository: "daniels-project-space/jarvis",
     });
+  });
+
+  it("declares Dropship AI's exact isolated release boundary using capability names", () => {
+    const plan = buildProviderReleasePlan({
+      repository: "daniels-project-space/dropship-ai",
+      branch: "jarvis/paul-provider-order",
+      baseSha,
+      headSha,
+      changedPaths: ["package-lock.json"],
+    });
+    expect(plan).toMatchObject({ required: true, valid: true });
+    expect(plan.boundary).toMatchObject({
+      vercel: { projectId: "prj_506MgOrVxyVJzbnR95z8f853Upp4" },
+      convex: { targets: [{ deployment: "peaceful-panda-894" }] },
+      trigger: { projectRef: "proj_ebwgqvfufapbqnhjxhnc" },
+      r2: { bucket: "dropship-ai" },
+    });
+    expect(JSON.stringify(plan.boundary)).toContain("dropship-ai-release");
+    expect(JSON.stringify(plan.boundary)).not.toMatch(/(?:token|key)_[a-z0-9]{12,}/i);
   });
 
   it("fails closed when an owned repository has no exact release identity", () => {
@@ -98,7 +146,7 @@ describe("trusted provider release planning", () => {
       execute,
       reverify: vi.fn(),
     });
-    expect(result).toEqual({ status: "not_required", note: "no provider-sensitive paths changed" });
+    expect(result).toEqual({ status: "not_required", note: "no provider bundle or build/runtime input is affected" });
     expect(persist).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
   });
@@ -107,6 +155,7 @@ describe("trusted provider release planning", () => {
 describe("durable two-phase provider barrier", () => {
   it("persists deployment phase before exact prerequisites execute in safe order", async () => {
     const plan = jarvisPlan(["convex/schema.ts", "src/trigger/agent-runner.ts"]);
+    const premerge = plan.steps.filter((step) => step.phase === "premerge");
     const events: string[] = [];
     const result = await runProviderReleaseBarrier(plan, undefined, {
       persist: async (state) => {
@@ -121,15 +170,16 @@ describe("durable two-phase provider barrier", () => {
       now: () => 100,
     });
     expect(result.status).toBe("ready");
-    expect(events[0]).toBe("persist:deploying:pending,pending,pending,pending");
+    expect(events[0]).toBe(`persist:deploying:${plan.steps.map(() => "pending").join(",")}`);
     expect(events.filter((event) => event.startsWith("execute:"))).toEqual(
-      plan.steps.map((step) => `execute:${step.id}`),
+      premerge.map((step) => `execute:${step.id}`),
     );
-    expect(events.at(-1)).toContain("persist:ready:");
+    expect(events.at(-1)).toContain("persist:premerge_ready:");
   });
 
   it("fences merge/finalization on provider failure and resumes receipts without implementation", async () => {
     const plan = jarvisPlan(["convex/schema.ts", "src/trigger/agent-runner.ts"]);
+    const premerge = plan.steps.filter((step) => step.phase === "premerge");
     let failedOnce = false;
     const first = await runProviderReleaseBarrier(plan, undefined, {
       persist: async () => true,
@@ -169,12 +219,13 @@ describe("durable two-phase provider barrier", () => {
     });
     expect(resumed.status).toBe("ready");
     expect(reverified).toEqual(plan.steps.slice(0, 2).map((step) => step.id));
-    expect(executed).toEqual(plan.steps.slice(2).map((step) => step.id));
+    expect(executed).toEqual(premerge.slice(2).map((step) => step.id));
     expect(resumed.status === "ready" && resumed.state.attempts).toBe(2);
   });
 
   it("preserves a staged provider handoff when a later operation fails", async () => {
     const plan = jarvisPlan(["src/trigger/agent-runner.ts"]);
+    const triggerStep = plan.steps.find((step) => step.phase === "premerge" && step.kind === "trigger")!;
     const version = "20260720.7";
     const first = await runProviderReleaseBarrier(plan, undefined, {
       persist: async () => true,
@@ -197,7 +248,7 @@ describe("durable two-phase provider barrier", () => {
     });
     expect(first.status).toBe("blocked");
     const blocked = first.status === "blocked" ? first.state : undefined;
-    expect(blocked?.steps.at(-1)).toMatchObject({
+    expect(blocked?.steps.find((step) => step.id === triggerStep.id)).toMatchObject({
       status: "failed",
       version,
       runId: "run_attestor_1",
@@ -220,32 +271,126 @@ describe("durable two-phase provider barrier", () => {
     ]);
   });
 
-  it("rejects a stale or mismatched release receipt at finalization", () => {
-    const readyRelease: ProviderReleaseState = {
-      releaseId: `providers-v1:${"c".repeat(64)}`,
-      repository: "daniels-project-space/jarvis",
-      branch: "jarvis/paul-provider-order",
+  it("blocks a failed exact post-merge proof and resumes its durable receipts idempotently", async () => {
+    const plan = jarvisPlan(["convex/schema.ts", "src/trigger/agent-runner.ts"]);
+    const premerge = await runProviderReleaseBarrier(plan, undefined, {
+      persist: async () => true,
+      execute: async ({ step }) => ({ id: step.id, status: "verified", proof: step.target }),
+      reverify: async ({ prior }) => prior,
+      now: () => 100,
+    });
+    expect(premerge.status).toBe("ready");
+    if (premerge.status !== "ready") throw new Error("pre-merge fixture failed");
+    const mergeSha = "d".repeat(40);
+    const first = await runPostMergeReleaseBarrier(plan, premerge.state, mergeSha, {
+      persist: async () => true,
+      execute: async ({ step }) => {
+        if (step.id.includes("mirror")) throw new Error("live mirror proof unavailable");
+        return { id: step.id, status: "verified", proof: `${step.target}:${mergeSha}` };
+      },
+      reverify: async ({ prior }) => prior,
+      now: () => 200,
+    });
+    expect(first.status).toBe("blocked");
+    expect(first.state.mergeSha).toBe(mergeSha);
+    expect(first.state.phase).toBe("blocked");
+    expect(verifiedDeliveryCanFinalize({
+      verificationVerdict: "pass",
+      deliveryStatus: "blocked",
+      mergeCommitSha: mergeSha,
+      providerRelease: first.state,
+    })).toBe(false);
+
+    const executed: string[] = [];
+    const reverified: string[] = [];
+    const resumed = await runPostMergeReleaseBarrier(plan, first.state, mergeSha, {
+      persist: async () => true,
+      execute: async ({ step }) => {
+        executed.push(step.id);
+        return { id: step.id, status: "verified", proof: `${step.target}:${mergeSha}` };
+      },
+      reverify: async ({ step, prior }) => {
+        reverified.push(step.id);
+        return { ...prior, status: "verified" };
+      },
+      now: () => 300,
+    });
+    expect(resumed.status).toBe("live");
+    expect(reverified).toEqual(plan.steps.filter((step) => step.phase === "postmerge").slice(0, 2).map((step) => step.id));
+    expect(executed).toEqual(plan.steps.filter((step) => step.phase === "postmerge").slice(2).map((step) => step.id));
+  });
+
+  it("requires the exact merged SHA on the production alias and every provider before finalization", () => {
+    const plan = jarvisPlan(["convex/schema.ts"]);
+    const mergeSha = "d".repeat(40);
+    const liveRelease: ProviderReleaseState = {
+      releaseId: plan.releaseId,
+      repository: plan.repository,
+      branch: plan.branch,
       baseSha,
       headSha,
-      changedPaths: ["convex/schema.ts"],
-      providers: ["convex"],
-      boundaryDigest: "digest",
-      phase: "ready",
-      attempts: 1,
-      steps: [{ id: "convex:canonical:tangible-goose-318", status: "verified" }],
+      mergeSha,
+      changedPaths: [...plan.changedPaths],
+      providers: [...plan.providers],
+      impactDigest: plan.impactDigest,
+      boundaryDigest: plan.boundaryDigest,
+      phase: "live",
+      attempts: 2,
+      steps: plan.steps.map((step) => ({ id: step.id, status: "verified", proof: mergeSha })),
       updatedAt: 100,
     };
     expect(verifiedDeliveryCanFinalize({
       verificationVerdict: "pass",
       deliveryStatus: "merged",
       deliveredHeadSha: "d".repeat(40),
-      providerRelease: readyRelease,
+      mergeCommitSha: mergeSha,
+      providerRelease: liveRelease,
     })).toBe(false);
     expect(verifiedDeliveryCanFinalize({
       verificationVerdict: "pass",
       deliveryStatus: "merged",
       deliveredHeadSha: headSha,
-      providerRelease: readyRelease,
+      mergeCommitSha: "e".repeat(40),
+      providerRelease: liveRelease,
+    })).toBe(false);
+    expect(verifiedDeliveryCanFinalize({
+      verificationVerdict: "pass",
+      deliveryStatus: "merged",
+      deliveredHeadSha: headSha,
+      mergeCommitSha: mergeSha,
+      providerRelease: liveRelease,
     })).toBe(true);
+  });
+
+  it("rejects a READY Vercel deployment when the production alias or merged SHA differs", () => {
+    const boundary = jarvisPlan(["convex/schema.ts"]).boundary!.vercel;
+    const mergeSha = "d".repeat(40);
+    const deployment = {
+      uid: "dpl_exact123",
+      projectId: "prj_exact123",
+      target: "production",
+      readyState: "READY",
+      meta: { githubCommitSha: mergeSha },
+    };
+    const alias = {
+      alias: boundary.productionAlias,
+      deploymentId: deployment.uid,
+      projectId: deployment.projectId,
+    };
+    expect(vercelLiveDeploymentMismatch({ boundary, expectedProjectId: deployment.projectId, mergeSha, deployment, alias })).toBeNull();
+    expect(vercelLiveDeploymentMismatch({
+      boundary,
+      expectedProjectId: deployment.projectId,
+      mergeSha: "e".repeat(40),
+      deployment,
+      alias,
+    })).toContain("exact merged commit");
+    expect(vercelLiveDeploymentMismatch({
+      boundary,
+      expectedProjectId: deployment.projectId,
+      mergeSha,
+      deployment,
+      alias: { ...alias, alias: "preview.vercel.app" },
+    })).toContain("production alias");
   });
 });

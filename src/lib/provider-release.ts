@@ -130,7 +130,7 @@ export type ProviderReleaseOperations = {
 };
 
 const SOURCE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json"];
-const GLOBAL_PROVIDER_INPUT = /^(?:package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|\.npmrc|tsconfig(?:\.[^/]+)?\.json)$/i;
+const GLOBAL_PROVIDER_INPUT = /^(?:package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|\.npmrc|\.node-version|\.nvmrc|\.tool-versions|tsconfig(?:\.[^/]+)?\.json|[^/]+\.config\.[cm]?[jt]s)$/i;
 const SOURCE_LIKE = /\.(?:[cm]?[jt]sx?|json)$/i;
 const IMPORT_SPECIFIER = /(?:\b(?:import|export)\s+(?:type\s+)?(?:[^"']*?\s+from\s*)?|\brequire\s*\(|\bimport\s*\()\s*["']([^"']+)["']/g;
 

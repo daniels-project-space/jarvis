@@ -59,7 +59,7 @@ import {
   openDeliveryPullRequest,
   validatedGoalDeliveryBranch,
 } from "./github-delivery";
-import { createTrustedProviderReleaseGate } from "./provider-release-runtime";
+import { createTrustedProviderReleaseGate, resumeTrustedProviderPostMerge } from "./provider-release-runtime";
 import { wakeAgentFleet } from "../lib/agent-fleet-dispatch";
 import { upstreamEvidencePrompt } from "../lib/upstream-evidence";
 import { drainControlPlaneMigration } from "./control-plane-migration";
@@ -842,7 +842,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           && token
           && resumeBranch
           && job.verificationVerdict === "pass"
-          && ["pull_request", "blocked", "provider_release", "provider_ready"].includes(String(job.deliveryStatus ?? ""))
+          && ["pull_request", "blocked", "provider_release", "provider_ready", "provider_postmerge"].includes(String(job.deliveryStatus ?? ""))
           && (
             autonomousRepositoryDelivery(job, repo)
             || Boolean(validatedGoalBranch && isOwnedRepository(repo))
@@ -856,13 +856,39 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             stage: "delivery",
             percent: 97,
           }).catch(() => {});
-          const branchChanged = await branchHasChanges(repo, resumeBranch, token);
+          let providerDeliveryRecorded = false;
+          let branchChanged: boolean | null = null;
           let pullRequestUrl = typeof job.pullRequestUrl === "string" ? job.pullRequestUrl : "";
           let mergeSha = "";
-          let deliveredHeadSha = branchChanged === false ? String(job.providerRelease?.headSha ?? "") : "";
-          let deliveryFailure = branchChanged === null
-            ? "the controller could not compare the verified branch with the default branch"
-            : "";
+          let deliveredHeadSha = "";
+          let deliveryFailure = "";
+          if (job.providerRelease?.mergeSha) {
+            const resumed = await resumeTrustedProviderPostMerge({
+              jobId: String(job.jobId),
+              expectedAttempt,
+              repository: repo,
+              branch: resumeBranch,
+              prior: job.providerRelease,
+              githubToken: token,
+              baseEnv: process.env,
+              convexMutation,
+              shouldContinue: async () => (await executionStatus()) === "running",
+            });
+            if (resumed.status === "live") {
+              providerDeliveryRecorded = true;
+              branchChanged = false;
+              mergeSha = String(job.providerRelease.mergeSha);
+              deliveredHeadSha = String(job.providerRelease.headSha);
+            } else {
+              deliveryFailure = resumed.note;
+            }
+          } else {
+            branchChanged = await branchHasChanges(repo, resumeBranch, token);
+            deliveredHeadSha = branchChanged === false ? String(job.providerRelease?.headSha ?? "") : "";
+            if (branchChanged === null) {
+              deliveryFailure = "the controller could not compare the verified branch with the default branch";
+            }
+          }
           if (branchChanged === true) {
             const title = validatedGoalBranch
               ? `JARVIS goal: ${(job.label ?? job.task).slice(0, 78)}`
@@ -906,6 +932,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               if (merge.status === "merged") {
                 mergeSha = merge.sha;
                 deliveredHeadSha = pull.headSha;
+                providerDeliveryRecorded = merge.providerFinalized;
               }
               else deliveryFailure = merge.note;
             }
@@ -928,15 +955,15 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }).catch(() => null);
             return;
           }
-          const recorded = await convexMutation("jobs:setDelivery", {
-            jobId: job.jobId,
-            expectedAttempt,
-            branch: resumeBranch,
-            pullRequestUrl: pullRequestUrl || undefined,
-            deliveryStatus: "merged",
-            mergeCommitSha: mergeSha || undefined,
-            deliveredHeadSha: deliveredHeadSha || undefined,
-          }).catch(() => false);
+          const recorded = providerDeliveryRecorded || await convexMutation("jobs:setDelivery", {
+              jobId: job.jobId,
+              expectedAttempt,
+              branch: resumeBranch,
+              pullRequestUrl: pullRequestUrl || undefined,
+              deliveryStatus: "merged",
+              mergeCommitSha: mergeSha || undefined,
+              deliveredHeadSha: deliveredHeadSha || undefined,
+            }).catch(() => false);
           if (!recorded) throw new Error("verified delivery completed but its durable receipt could not be recorded");
           const deliveryResult = [
             String(job.result ?? "Supervisor verification passed."),
@@ -1442,15 +1469,15 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               return;
             }
             goalDeliveryNote = `\n\nDelivery: merged ${pull?.url ?? goalBranch}${merge.sha ? ` at ${merge.sha}` : ""}.`;
-            const recorded = await convexMutation("jobs:setDelivery", {
-              jobId: job.jobId,
-              expectedAttempt,
-              branch: goalBranch,
-              pullRequestUrl: pull?.url,
-              deliveryStatus: "merged",
-              mergeCommitSha: merge.sha,
-              deliveredHeadSha: pull?.headSha,
-            }).catch(() => false);
+            const recorded = merge.providerFinalized || await convexMutation("jobs:setDelivery", {
+                jobId: job.jobId,
+                expectedAttempt,
+                branch: goalBranch,
+                pullRequestUrl: pull?.url,
+                deliveryStatus: "merged",
+                mergeCommitSha: merge.sha,
+                deliveredHeadSha: pull?.headSha,
+              }).catch(() => false);
             if (!recorded) throw new Error("goal branch merged but its durable delivery receipt could not be recorded");
           } else if (job.deliveryStatus === "merged") {
             goalDeliveryNote = `\n\nDelivery: the validated goal branch is already merged${goalPullRequestUrl ? ` via ${goalPullRequestUrl}` : ""}.`;
@@ -1688,15 +1715,15 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               }),
             });
             if (merged.status === "merged") {
-              const recorded = await convexMutation("jobs:setDelivery", {
-                jobId: job.jobId,
-                expectedAttempt,
-                branch,
-                pullRequestUrl: pull.url,
-                deliveryStatus: "merged",
-                mergeCommitSha: merged.sha,
-                deliveredHeadSha: pull.headSha,
-              }).catch(() => false);
+              const recorded = merged.providerFinalized || await convexMutation("jobs:setDelivery", {
+                  jobId: job.jobId,
+                  expectedAttempt,
+                  branch,
+                  pullRequestUrl: pull.url,
+                  deliveryStatus: "merged",
+                  mergeCommitSha: merged.sha,
+                  deliveredHeadSha: pull.headSha,
+                }).catch(() => false);
               if (!recorded) throw new Error("verified branch merged but its durable delivery receipt could not be recorded");
               pushNote = `verified PR merged automatically: ${pull.url}${merged.sha ? ` · ${merged.sha}` : ""}`;
             } else {

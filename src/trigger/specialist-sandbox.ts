@@ -1,17 +1,10 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams, type SpawnOptions } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, normalize } from "node:path";
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, normalize, sep } from "node:path";
 import { tmpdir } from "node:os";
 
 const SANDBOX_BINARY = "/usr/bin/bwrap";
-const SENSITIVE_CAPABILITY_NAMES = [
-  "VAULT_ACCESS_TOKEN",
-  "GITHUB_TOKEN",
-  "TRIGGER_ACCESS_TOKEN",
-  "TRIGGER_SECRET_KEY",
-  "VERCEL_TOKEN",
-  "CONVEX_DEPLOY_KEY",
-] as const;
+const SENSITIVE_CAPABILITY = /^(?:VAULT_ACCESS_TOKEN|GITHUB_TOKEN|VERCEL_TOKEN(?:_|$)|CONVEX_DEPLOY_KEY(?:_|$)|TRIGGER_(?:ACCESS_TOKEN|SECRET_KEY)(?:_|$)|CLOUDFLARE_API_TOKEN(?:_|$)|R2_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY)(?:_|$)|AWS_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY)(?:_|$))/;
 
 type SandboxInput = {
   command: string;
@@ -58,6 +51,28 @@ function addMount(args: string[], mounted: Set<string>, mode: "--bind" | "--ro-b
   mounted.add(resolved);
 }
 
+function addOptionalReadMount(args: string[], mounted: Set<string>, path: string): void {
+  if (existsSync(path)) addMount(args, mounted, "--ro-bind", path);
+}
+
+function commandRuntimePaths(command: string): string[] {
+  const resolved = realpathSync(command);
+  const marker = `${sep}node_modules${sep}`;
+  const markerAt = resolved.lastIndexOf(marker);
+  if (markerAt < 0) return [resolved];
+  const nodeModules = resolved.slice(0, markerAt + marker.length - 1);
+  const relative = resolved.slice(markerAt + marker.length);
+  const parts = relative.split(sep);
+  const packageParts = parts[0]?.startsWith("@") ? parts.slice(0, 2) : parts.slice(0, 1);
+  const paths = [join(nodeModules, ...packageParts)];
+  if (packageParts.join("/") === "@openai/codex") {
+    const platformPackage = process.arch === "arm64" ? "codex-linux-arm64" : "codex-linux-x64";
+    const nativePackage = join(nodeModules, "@openai", platformPackage);
+    if (existsSync(nativePackage)) paths.push(nativePackage);
+  }
+  return paths;
+}
+
 /**
  * Bubblewrap gives the Codex subprocess a separate PID namespace and a
  * capability-minimal filesystem. Environment filtering is retained as defence
@@ -66,12 +81,14 @@ function addMount(args: string[], mounted: Set<string>, mode: "--bind" | "--ro-b
 export function buildSpecialistSandboxInvocation(input: SandboxInput): SpecialistSandboxInvocation {
   const sandboxBinary = input.sandboxBinary ?? SANDBOX_BINARY;
   const cwd = absoluteExisting(input.cwd, "specialist cwd");
-  const command = absoluteExisting(input.command, "specialist executable");
+  const command = realpathSync(absoluteExisting(input.command, "specialist executable"));
   const codexHome = absoluteExisting(String(input.env.CODEX_HOME ?? ""), "specialist CODEX_HOME");
-  for (const name of SENSITIVE_CAPABILITY_NAMES) {
-    if (input.env[name] !== undefined) throw new Error(`specialist environment contains forbidden controller capability ${name}`);
+  for (const name of Object.keys(input.env)) {
+    if (SENSITIVE_CAPABILITY.test(name) && input.env[name] !== undefined) {
+      throw new Error(`specialist environment contains forbidden controller capability ${name}`);
+    }
   }
-  const mounted = new Set<string>(["/", "/proc", "/dev", "/tmp"]);
+  const mounted = new Set<string>(["/", "/proc", "/dev", "/tmp", "/usr", "/bin", "/sbin", "/lib", "/lib64"]);
   const args = [
     "--die-with-parent",
     "--new-session",
@@ -89,10 +106,21 @@ export function buildSpecialistSandboxInvocation(input: SandboxInput): Specialis
     "--ro-bind-try", "/sbin", "/sbin",
     "--ro-bind-try", "/lib", "/lib",
     "--ro-bind-try", "/lib64", "/lib64",
-    "--ro-bind-try", "/usr/local", "/usr/local",
-    "--ro-bind-try", "/etc", "/etc",
-    "--ro-bind-try", "/app", "/app",
   ];
+  for (const path of [
+    "/etc/ssl/certs",
+    "/etc/ssl/openssl.cnf",
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+    "/etc/passwd",
+    "/etc/group",
+  ]) addOptionalReadMount(args, mounted, path);
+  for (const path of commandRuntimePaths(command)) addMount(args, mounted, "--ro-bind", path);
+  for (const key of ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR"] as const) {
+    const path = input.env[key];
+    if (path) addOptionalReadMount(args, mounted, path);
+  }
   addMount(args, mounted, input.writableCwd === false ? "--ro-bind" : "--bind", cwd);
   addMount(args, mounted, "--bind", codexHome);
   for (const path of input.writablePaths ?? []) addMount(args, mounted, "--bind", path);
@@ -113,6 +141,7 @@ export function buildSpecialistSandboxInvocation(input: SandboxInput): Specialis
       PATH: process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
       HOME: "/",
       LANG: process.env.LANG ?? "C.UTF-8",
+      NODE_ENV: input.env.NODE_ENV ?? "production",
     },
   };
 }
@@ -131,13 +160,14 @@ export function spawnSpecialist(
 
 const ADVERSARY_SOURCE = `
 const fs = require("node:fs");
-const names = ${JSON.stringify(SENSITIVE_CAPABILITY_NAMES.map((name) => `${name}=`))};
+const sensitive = new RegExp(${JSON.stringify(SENSITIVE_CAPABILITY.source)});
 let procExposed = false;
 for (const entry of fs.readdirSync("/proc")) {
   if (!/^\\d+$/.test(entry) || Number(entry) === process.pid) continue;
   try {
-    const value = fs.readFileSync("/proc/" + entry + "/environ");
-    if (names.some((name) => value.includes(Buffer.from(name)))) procExposed = true;
+    const names = fs.readFileSync("/proc/" + entry + "/environ", "utf8")
+      .split("\\0").map((item) => item.slice(0, item.indexOf("="))).filter(Boolean);
+    if (names.some((name) => sensitive.test(name))) procExposed = true;
   } catch {}
 }
 let fileExposed = false;

@@ -7,7 +7,8 @@ export type PullRequestDelivery = {
 };
 
 export type MergeDeliveryResult =
-  | { status: "merged"; sha: string; note: string }
+  | { status: "merged"; sha: string; note: string; providerFinalized: boolean }
+  | { status: "postmerge_pending"; sha: string; note: string }
   | { status: "blocked" | "pending"; note: string };
 
 export type PullRequestChange = {
@@ -20,8 +21,22 @@ export type PullRequestChange = {
 
 export type ProviderMergeGate =
   | { status: "not_required"; note: string }
-  | { status: "ready"; note: string; headSha: string }
-  | { status: "blocked" | "pending"; note: string };
+  | {
+      status: "ready";
+      note: string;
+      headSha: string;
+      baseSha: string;
+      controller: {
+        confirmMerge: (change: PullRequestChange) => Promise<
+          { status: "ready"; note: string } | { status: "blocked" | "pending"; note: string }
+        >;
+        proveLive: (mergeSha: string) => Promise<
+          { status: "live"; note: string } | { status: "blocked" | "pending"; note: string }
+        >;
+        cleanup: () => Promise<void>;
+      };
+    }
+  | { status: "blocked" | "pending"; note: string; refreshBase?: boolean };
 
 export function validatedGoalDeliveryBranch(job: {
   goalStage?: unknown;
@@ -236,7 +251,6 @@ export async function mergeVerifiedPullRequest(args: {
   const sleep = args.sleep ?? wait;
   const headers = apiHeaders(args.token);
   const attempts = Math.max(1, Math.min(90, args.attempts ?? 60));
-  let headSha = args.pull.headSha;
   let lastMessage = "GitHub checks have not completed yet";
   const inspection = await inspectDeliveryPullRequest({
     repo: args.repo,
@@ -246,57 +260,62 @@ export async function mergeVerifiedPullRequest(args: {
   });
   if (!inspection.ok) return { status: "blocked", note: inspection.note };
   const gate = await args.releaseGate(inspection.change);
-  if (gate.status === "blocked" || gate.status === "pending") return gate;
+  if (gate.status === "blocked") return gate;
+  if (gate.status === "pending") {
+    if (gate.refreshBase) {
+      await fetchImpl(
+        `https://api.github.com/repos/${args.repo}/pulls/${args.pull.number}/update-branch`,
+        {
+          method: "PUT",
+          headers,
+          body: JSON.stringify({ expected_head_sha: inspection.change.headSha }),
+          cache: "no-store",
+        },
+      ).catch(() => null);
+    }
+    return { status: "pending", note: gate.note };
+  }
   const providerLockedHead = gate.status === "ready" ? gate.headSha : "";
+  const providerLockedBase = gate.status === "ready" ? gate.baseSha : "";
   if (providerLockedHead && providerLockedHead !== inspection.change.headSha) {
+    if (gate.status === "ready") await gate.controller.cleanup();
     return { status: "blocked", note: "the provider release proof does not match the pull request head" };
   }
+  if (providerLockedBase && providerLockedBase !== inspection.change.baseSha) {
+    if (gate.status === "ready") await gate.controller.cleanup();
+    return { status: "blocked", note: "the provider release proof does not match the pull request base" };
+  }
 
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    if (args.shouldContinue && !(await args.shouldContinue())) {
-      return { status: "pending", note: "delivery lease ended before merge" };
+  const completeMergedDelivery = async (shaInput: string, note: string): Promise<MergeDeliveryResult> => {
+    const sha = shaInput.trim();
+    if (!/^[0-9a-f]{40,64}$/i.test(sha)) {
+      return { status: "postmerge_pending", sha, note: "GitHub merged the pull request but did not return an exact merge commit" };
     }
-    const merged = await fetchImpl(
-      `https://api.github.com/repos/${args.repo}/pulls/${args.pull.number}/merge`,
-      {
-        method: "PUT",
-        headers,
-        body: JSON.stringify({
-          ...(headSha ? { sha: headSha } : {}),
-          merge_method: "squash",
-          commit_title: args.title.slice(0, 120),
-          commit_message: "Verified and delivered automatically by JARVIS.",
-        }),
-        cache: "no-store",
-      },
-    ).catch(() => null);
-    if (merged?.ok) {
-      const payload = (await merged.json().catch(() => ({}))) as {
-        merged?: boolean;
-        sha?: string;
-        message?: string;
-      };
-      if (payload.merged) {
-        return {
-          status: "merged",
-          sha: String(payload.sha ?? ""),
-          note: String(payload.message ?? "Pull request merged"),
-        };
-      }
-      lastMessage = String(payload.message ?? lastMessage);
-    } else if (merged) {
-      const payload = (await merged.json().catch(() => ({}))) as { message?: string };
-      lastMessage = String(payload.message ?? `${merged.status} from GitHub merge`);
-      if (![405, 409, 422].includes(merged.status)) {
-        return { status: "blocked", note: lastMessage.slice(0, 500) };
-      }
+    if (gate.status !== "ready") {
+      return { status: "merged", sha, note, providerFinalized: false };
     }
+    const live = await gate.controller.proveLive(sha);
+    if (live.status !== "live") return { status: "postmerge_pending", sha, note: live.note };
+    return { status: "merged", sha, note: `${note}; ${live.note}`, providerFinalized: true };
+  };
 
-    const stateResponse = await fetchImpl(
-      `https://api.github.com/repos/${args.repo}/pulls/${args.pull.number}`,
-      { headers, cache: "no-store" },
-    ).catch(() => null);
-    if (stateResponse?.ok) {
+  try {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (args.shouldContinue && !(await args.shouldContinue())) {
+        return { status: "pending", note: "delivery lease ended before merge" };
+      }
+
+      // GitHub's merge endpoint can pin only the head SHA. Resolve and compare
+      // the base immediately before the controller's ownership recheck and PUT;
+      // a changed base invalidates the provider candidate instead of silently
+      // merging a bundle prepared against stale main.
+      const stateResponse = await fetchImpl(
+        `https://api.github.com/repos/${args.repo}/pulls/${args.pull.number}`,
+        { headers, cache: "no-store" },
+      ).catch(() => null);
+      if (!stateResponse?.ok) {
+        return { status: "pending", note: "GitHub could not recheck the pull request immediately before merge" };
+      }
       const state = (await stateResponse.json()) as {
         state?: string;
         merged?: boolean;
@@ -304,20 +323,23 @@ export async function mergeVerifiedPullRequest(args: {
         mergeable?: boolean | null;
         mergeable_state?: string;
         head?: { sha?: string };
+        base?: { sha?: string };
       };
       if (state.merged) {
-        return {
-          status: "merged",
-          sha: String(state.merge_commit_sha ?? ""),
-          note: "Pull request was already merged",
-        };
+        return await completeMergedDelivery(String(state.merge_commit_sha ?? ""), "Pull request was already merged");
       }
       if (state.state === "closed") return { status: "blocked", note: "pull request closed before delivery" };
-      const observedHead = String(state.head?.sha ?? headSha);
+      const observedHead = String(state.head?.sha ?? "");
+      const observedBase = String(state.base?.sha ?? "");
+      if (!/^[0-9a-f]{40,64}$/i.test(observedHead) || !/^[0-9a-f]{40,64}$/i.test(observedBase)) {
+        return { status: "pending", note: "GitHub did not return exact pull request heads immediately before merge" };
+      }
       if (providerLockedHead && observedHead !== providerLockedHead) {
         return { status: "pending", note: "the pull request head changed after provider verification; prerequisites must be re-attested" };
       }
-      headSha = observedHead;
+      if (providerLockedBase && observedBase !== providerLockedBase) {
+        return { status: "pending", note: "main advanced after provider verification; the exact candidate must be refreshed and re-attested" };
+      }
       if (state.mergeable === false && state.mergeable_state === "dirty") {
         return { status: "blocked", note: "the verified branch conflicts with the current default branch" };
       }
@@ -327,19 +349,65 @@ export async function mergeVerifiedPullRequest(args: {
           {
             method: "PUT",
             headers,
-            body: JSON.stringify(headSha ? { expected_head_sha: headSha } : {}),
+            body: JSON.stringify({ expected_head_sha: observedHead }),
             cache: "no-store",
           },
         ).catch(() => null);
-        if (providerLockedHead) {
-          return {
-            status: "pending",
-            note: "GitHub updated the protected branch; provider prerequisites must be re-attested for its new head",
-          };
+        return {
+          status: "pending",
+          note: providerLockedHead
+            ? "GitHub refreshed the branch; provider prerequisites must be re-attested for its new exact head and base"
+            : "GitHub refreshed the branch; delivery will resume on its new exact head",
+        };
+      }
+
+      if (gate.status === "ready") {
+        const confirmed = await gate.controller.confirmMerge({
+          ...inspection.change,
+          headSha: observedHead,
+          baseSha: observedBase,
+        });
+        if (confirmed.status !== "ready") return confirmed;
+      }
+
+      const merged = await fetchImpl(
+        `https://api.github.com/repos/${args.repo}/pulls/${args.pull.number}/merge`,
+        {
+          method: "PUT",
+          headers,
+          body: JSON.stringify({
+            sha: observedHead,
+            merge_method: "squash",
+            commit_title: args.title.slice(0, 120),
+            commit_message: "Verified and delivered automatically by JARVIS.",
+          }),
+          cache: "no-store",
+        },
+      ).catch(() => null);
+      if (merged?.ok) {
+        const payload = (await merged.json().catch(() => ({}))) as {
+          merged?: boolean;
+          sha?: string;
+          message?: string;
+        };
+        if (payload.merged) {
+          return await completeMergedDelivery(
+            String(payload.sha ?? ""),
+            String(payload.message ?? "Pull request merged"),
+          );
+        }
+        lastMessage = String(payload.message ?? lastMessage);
+      } else if (merged) {
+        const payload = (await merged.json().catch(() => ({}))) as { message?: string };
+        lastMessage = String(payload.message ?? `${merged.status} from GitHub merge`);
+        if (![405, 409, 422].includes(merged.status)) {
+          return { status: "blocked", note: lastMessage.slice(0, 500) };
         }
       }
+      if (attempt + 1 < attempts) await sleep(Math.max(0, args.intervalMs ?? 10_000));
     }
-    if (attempt + 1 < attempts) await sleep(Math.max(0, args.intervalMs ?? 10_000));
+    return { status: "pending", note: lastMessage.slice(0, 500) };
+  } finally {
+    if (gate.status === "ready") await gate.controller.cleanup();
   }
-  return { status: "pending", note: lastMessage.slice(0, 500) };
 }
