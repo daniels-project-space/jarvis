@@ -63,6 +63,15 @@ export type ProviderBarrierResult =
   | { status: "ready"; note: string; headSha: string; state: ProviderReleaseState }
   | { status: "blocked"; note: string; state?: ProviderReleaseState };
 
+export type VercelProjectObservation = {
+  id?: string;
+  name?: string;
+  accountId?: string;
+  link?: { type?: string; org?: string; repo?: string; productionBranch?: string };
+  targets?: { production?: { alias?: string[] } };
+  alias?: Array<string | { domain?: string }>;
+};
+
 type StepExecutionContext = {
   plan: ProviderReleasePlan;
   state: ProviderReleaseState;
@@ -93,6 +102,42 @@ function stableJson(value: unknown): string {
 
 function normalizedRepo(repo: string): string {
   return repo.trim().replace(/^https:\/\/github\.com\//i, "").replace(/\.git$/i, "").toLowerCase();
+}
+
+function normalizedDomain(value: string): string {
+  return value.trim().replace(/^https?:\/\//i, "").split("/")[0].replace(/\.$/, "").toLowerCase();
+}
+
+/** Validate the live Vercel lookup before its Git integration can be trusted. */
+export function vercelProjectIdentityMismatch(
+  boundary: TrustedProviderBoundary["vercel"],
+  project: VercelProjectObservation,
+): string | null {
+  if (!/^prj_[a-z0-9]+$/i.test(String(project.id ?? ""))) {
+    return "Vercel did not return a stable project id";
+  }
+  if (project.name !== boundary.projectName || project.accountId !== boundary.teamId) {
+    return "Vercel returned a project outside the registered team/name identity";
+  }
+  if (boundary.projectId && project.id !== boundary.projectId) {
+    return "Vercel returned the wrong stable project id";
+  }
+  const linkedRepo = `${String(project.link?.org ?? "")}/${String(project.link?.repo ?? "")}`;
+  if (
+    project.link?.type !== "github"
+    || normalizedRepo(linkedRepo) !== normalizedRepo(boundary.gitRepository)
+    || project.link?.productionBranch !== boundary.productionBranch
+  ) {
+    return "Vercel Git repository or production branch does not match the trusted registry";
+  }
+  const aliases = [
+    ...(project.targets?.production?.alias ?? []),
+    ...((project.alias ?? []).map((entry) => typeof entry === "string" ? entry : String(entry.domain ?? ""))),
+  ].map(normalizedDomain);
+  if (!aliases.includes(normalizedDomain(boundary.productionAlias))) {
+    return `Vercel production alias ${boundary.productionAlias} was not independently observed`;
+  }
+  return null;
 }
 
 function normalizedPath(path: string): string {
@@ -298,7 +343,17 @@ export async function runProviderReleaseBarrier(
       state.phase = "blocked";
       state.note = note;
       state.updatedAt = now();
-      state.steps[index] = { ...receipt, id: step.id, status: "failed", proof: note, checkedAt: now() };
+      // execute() may have durably checkpointed a staged provider version or
+      // handoff run before a later operation failed. Preserve that newest
+      // receipt so a retry can resume the release phase instead of rebuilding
+      // or losing the independently verifiable provider identity.
+      state.steps[index] = {
+        ...state.steps[index],
+        id: step.id,
+        status: "failed",
+        proof: note,
+        checkedAt: now(),
+      };
       await operations.persist({ ...state, steps: state.steps.map((item) => ({ ...item })) });
       return { status: "blocked", note, state };
     }
@@ -312,4 +367,3 @@ export async function runProviderReleaseBarrier(
   }
   return { status: "ready", note: state.note, headSha: plan.headSha, state };
 }
-

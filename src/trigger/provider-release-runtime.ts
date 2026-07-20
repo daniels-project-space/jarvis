@@ -13,11 +13,13 @@ import { join } from "node:path";
 import {
   buildProviderReleasePlan,
   runProviderReleaseBarrier,
+  vercelProjectIdentityMismatch,
   type ProviderBarrierResult,
   type ProviderReleasePlan,
   type ProviderReleaseState,
   type ProviderReleaseStep,
   type ProviderStepReceipt,
+  type VercelProjectObservation,
 } from "../lib/provider-release";
 import type {
   ConvexReleaseTarget,
@@ -296,7 +298,11 @@ class TrustedProviderReleaseRuntime {
   private async prepareDependencies(): Promise<string> {
     const dir = await this.verifyCheckoutStillPinned();
     if (this.dependenciesReady) return dir;
-    await this.command("npm", ["install"], dir, safeToolEnv(this.args.baseEnv), 20 * 60_000);
+    // A release must use the dependency graph committed in the verified head.
+    // `npm ci` fails closed on a stale/missing lock instead of rewriting it and
+    // silently publishing source that differs from the reviewed branch.
+    await this.command("npm", ["ci"], dir, safeToolEnv(this.args.baseEnv), 20 * 60_000);
+    await this.verifyCheckoutStillPinned();
     this.dependenciesReady = true;
     return dir;
   }
@@ -322,36 +328,12 @@ class TrustedProviderReleaseRuntime {
       { headers: { authorization: `Bearer ${token}` }, cache: "no-store" },
     );
     if (!response.ok) throw new Error(`Vercel project lookup failed with ${response.status}`);
-    const project = (await response.json()) as {
-      id?: string;
-      name?: string;
-      accountId?: string;
-      link?: { type?: string; org?: string; repo?: string; productionBranch?: string };
-      targets?: { production?: { alias?: string[] } };
-      alias?: Array<{ domain?: string }> | string[];
-    };
-    if (project.name !== vercel.projectName || project.accountId !== vercel.teamId) {
-      throw new Error("Vercel returned a project outside the registered team/name identity");
-    }
-    if (vercel.projectId && project.id !== vercel.projectId) {
-      throw new Error("Vercel returned the wrong stable project id");
-    }
-    const linkedRepo = `${String(project.link?.org ?? "")}/${String(project.link?.repo ?? "")}`.toLowerCase();
-    if (
-      project.link?.type !== "github"
-      || linkedRepo !== vercel.gitRepository.toLowerCase()
-      || project.link?.productionBranch !== vercel.productionBranch
-    ) {
-      throw new Error("Vercel Git repository or production branch does not match the trusted registry");
-    }
-    const aliases = [
-      ...(project.targets?.production?.alias ?? []),
-      ...((project.alias ?? []).map((entry) => typeof entry === "string" ? entry : String(entry.domain ?? ""))),
-    ];
-    if (!aliases.includes(vercel.productionAlias)) {
-      throw new Error(`Vercel production alias ${vercel.productionAlias} was not independently observed`);
-    }
-    return verifiedReceipt(step, `Vercel ${project.id ?? project.name} is bound to ${vercel.gitRepository}@${vercel.productionBranch}`);
+    const project = (await response.json()) as VercelProjectObservation;
+    const mismatch = vercelProjectIdentityMismatch(vercel, project);
+    if (mismatch) throw new Error(mismatch);
+    return verifiedReceipt(step, `Vercel ${project.id} is bound to ${vercel.gitRepository}@${vercel.productionBranch}`, {
+      data: { projectId: String(project.id), teamId: vercel.teamId },
+    });
   }
 
   private async verifyConvexAttestation(
