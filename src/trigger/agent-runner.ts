@@ -28,7 +28,7 @@ import {
 import { startAppFactoryGoal, syncExternalGoalRevisions, syncExternalGoalRuns } from "./goal-runtime";
 import { codexMcpConfigArgs, type CodexMcpConfig } from "../lib/codex-mcp";
 import { redactSensitiveText } from "../lib/secret-redaction";
-import { isPermittedReadonlyAccessGap } from "../lib/work-verification";
+import { cumulativeWorkEvidence, isPermittedReadonlyAccessGap } from "../lib/work-verification";
 import { gitDeliveryDisposition, isNonFastForwardPush } from "../lib/git-delivery";
 import { repairPrompt } from "../lib/repair-prompt";
 import { isOwnedRepository, requestsConsequentialAction } from "../lib/work-safety";
@@ -185,7 +185,7 @@ async function verifyWork(
     "verdict rules: pass = work matches the task and looks complete; concerns = done but something specific looks wrong/unfinished (say what in note); " +
     "needs_input = the agent stopped on a question or decision. If that question is answerable with common sense or the task's own context, fill answer so the run can continue autonomously; leave answer empty only when Daniel genuinely must decide (money, accounts, personal preferences).\n\n" +
     "If the task explicitly says to stop and name a missing read-access gap, a documented gap is a completed evidence outcome, not a request for Daniel to relax the boundary.\n\n" +
-    `Task: ${task.slice(0, 800)}\n\nAgent result:\n${result.slice(0, 4000)}`;
+    `Task: ${task.slice(0, 800)}\n\nCumulative agent evidence:\n${result.slice(0, 8_000)}`;
   const out = await plainPrompt(bin, env, prompt, "terra", 90_000);
   try {
     const m = out.match(/\{[\s\S]*\}/);
@@ -1323,7 +1323,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           stage: "supervisor review",
           percent: 92,
         }).catch(() => {});
-        const verify = await verifyWork(bin, jobEnv, job.task, result).catch(() => null);
+        const verify = await verifyWork(
+          bin,
+          jobEnv,
+          job.task,
+          cumulativeWorkEvidence(job.checkpoint, result),
+        ).catch(() => null);
         if (await stopIfLeaseLost(`Supervisor review interrupted.\n\n${continuationCheckpoint}`, result, branch)) return;
         if (!verify) {
           const continuation = await convexMutation("jobs:checkpointAndRequeue", {
