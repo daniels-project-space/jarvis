@@ -1,3 +1,39 @@
+export type ReleaseCapabilityRef = {
+  service: string;
+  key: string;
+  env?: string;
+};
+
+export type ConvexReleaseTarget = {
+  role: "canonical" | "mirror";
+  deployment: string;
+  deploymentType: "dev" | "prod";
+  url: string;
+  deployKey: ReleaseCapabilityRef;
+};
+
+export type TrustedProviderBoundary = {
+  convex?: {
+    targets: ConvexReleaseTarget[];
+  };
+  trigger?: {
+    projectRef: string;
+    accessToken: ReleaseCapabilityRef;
+    secretKey: ReleaseCapabilityRef;
+  };
+  vercel: {
+    teamId: string;
+    teamSlug: string;
+    projectName: string;
+    /** The API's stable project id can be added when it is present in live registry evidence. */
+    projectId?: string;
+    productionAlias: string;
+    productionBranch: string;
+    gitRepository: string;
+    token: ReleaseCapabilityRef;
+  };
+};
+
 export type ProjectProfile = {
   slug: string;
   name: string;
@@ -13,6 +49,8 @@ export type ProjectProfile = {
     convexDeployment?: string;
     triggerProjectRef?: string;
     r2Bucket?: string;
+    /** Exact, controller-owned release coordinates. Missing coordinates fail closed. */
+    release?: TrustedProviderBoundary;
   };
 };
 
@@ -34,6 +72,61 @@ export const PROJECT_REGISTRY: ProjectProfile[] = [
     objectives: ["Replace fragmented work hubs", "Coordinate durable specialist work", "Surface only decisions and opportunities that matter"],
     invariants: ["One personality across voice and text", "Consequential actions require Daniel", "Agents must show evidence and resumable progress"],
     related: ["remote-work-hub", "project-hub", "app-factory-v2"],
+    providerBoundary: {
+      convexDeployment: "tangible-goose-318",
+      triggerProjectRef: "proj_wjwbdgeipgpddvrazxnp",
+      r2Bucket: "jarvis",
+      release: {
+        convex: {
+          targets: [
+            {
+              role: "canonical",
+              deployment: "tangible-goose-318",
+              deploymentType: "dev",
+              url: "https://tangible-goose-318.convex.cloud",
+              deployKey: {
+                service: "jarvis-release",
+                key: "CONVEX_CANONICAL_DEPLOY_KEY",
+                env: "CONVEX_DEPLOY_KEY_JARVIS_CANONICAL",
+              },
+            },
+            {
+              role: "mirror",
+              deployment: "scintillating-camel-329",
+              deploymentType: "prod",
+              url: "https://scintillating-camel-329.convex.cloud",
+              deployKey: {
+                service: "jarvis-release",
+                key: "CONVEX_MIRROR_DEPLOY_KEY",
+                env: "CONVEX_DEPLOY_KEY_JARVIS_MIRROR",
+              },
+            },
+          ],
+        },
+        trigger: {
+          projectRef: "proj_wjwbdgeipgpddvrazxnp",
+          accessToken: {
+            service: "jarvis-release",
+            key: "TRIGGER_ACCESS_TOKEN",
+            env: "TRIGGER_ACCESS_TOKEN_JARVIS",
+          },
+          secretKey: {
+            service: "jarvis-release",
+            key: "TRIGGER_SECRET_KEY",
+            env: "TRIGGER_SECRET_KEY_JARVIS",
+          },
+        },
+        vercel: {
+          teamId: "team_VY2PwHgXLV9Bo0vs2iXdnGxw",
+          teamSlug: "danielmabro-news-projects",
+          projectName: "jarvis",
+          productionAlias: "jarvis-orcin-six.vercel.app",
+          productionBranch: "main",
+          gitRepository: "daniels-project-space/jarvis",
+          token: { service: "vercel", key: "VERCEL_TOKEN", env: "VERCEL_TOKEN" },
+        },
+      },
+    },
   },
   {
     slug: "rental-manager-v2",
@@ -167,6 +260,9 @@ export function projectProviderBoundary(repo: string): string | null {
       ? `Trigger project: ${project.providerBoundary.triggerProjectRef}`
       : "",
     project.providerBoundary?.r2Bucket ? `R2 bucket: ${project.providerBoundary.r2Bucket}` : "",
+    project.providerBoundary?.release?.vercel
+      ? `Vercel project: ${project.providerBoundary.release.vercel.teamId}/${project.providerBoundary.release.vercel.projectName}`
+      : "",
   ].filter(Boolean).join(" · ");
   return [
     `Target project boundary for ${project.name}: ${expected}.`,

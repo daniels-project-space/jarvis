@@ -237,7 +237,34 @@ export default defineSchema({
     deliveryMode: v.optional(v.string()),
     deliveryStatus: v.optional(v.string()), // branch | pull_request | merged | blocked
     mergeCommitSha: v.optional(v.string()),
+    deliveredHeadSha: v.optional(v.string()),
     mergedAt: v.optional(v.number()),
+    // A provider-sensitive branch enters this durable two-phase record before
+    // any live prerequisite is touched. Receipts contain identities and source
+    // versions only; provider credentials never enter Convex.
+    providerRelease: v.optional(v.object({
+      releaseId: v.string(),
+      repository: v.string(),
+      branch: v.string(),
+      baseSha: v.string(),
+      headSha: v.string(),
+      changedPaths: v.array(v.string()),
+      providers: v.array(v.string()),
+      boundaryDigest: v.string(),
+      phase: v.string(),
+      attempts: v.number(),
+      steps: v.array(v.object({
+        id: v.string(),
+        status: v.string(),
+        proof: v.optional(v.string()),
+        version: v.optional(v.string()),
+        runId: v.optional(v.string()),
+        data: v.optional(v.any()),
+        checkedAt: v.optional(v.number()),
+      })),
+      note: v.optional(v.string()),
+      updatedAt: v.number(),
+    })),
     verificationVerdict: v.optional(v.string()), // pass | unavailable
     verificationNote: v.optional(v.string()),
     verifiedAt: v.optional(v.number()),
@@ -251,6 +278,20 @@ export default defineSchema({
     .index("by_createdAt", ["createdAt"])
     .index("by_agent", ["agentId", "createdAt"])
     .index("by_visibility_status", ["visibility", "status", "createdAt"]),
+
+  // Cross-job serialization for live provider releases. A ready receipt keeps
+  // the lease until the exact Git head is merged; expired/blocked work remains
+  // retryable but cannot race another repository release.
+  providerReleaseLocks: defineTable({
+    repo: v.string(),
+    releaseId: v.string(),
+    jobId: v.id("jobs"),
+    headSha: v.string(),
+    leaseToken: v.string(),
+    leaseUntil: v.number(),
+    status: v.string(), // deploying | ready | blocked | delivered
+    updatedAt: v.number(),
+  }).index("by_repo", ["repo"]),
 
   // Compact control-plane read model. Live subscriptions, scheduler polls and
   // execution lease checks use this table instead of materialising the much
