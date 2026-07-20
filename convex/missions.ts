@@ -20,6 +20,31 @@ function synthesisPayload(mission: any, jobs: any[], attempt: number) {
   };
 }
 
+function missionJobActivity(job: any) {
+  return {
+    _id: job.jobId,
+    label: job.label ?? job.task.slice(0, 50),
+    status: job.status,
+    progress: job.progress ?? "",
+    stage: job.stage ?? job.status,
+    percent: job.percent ?? 0,
+    agentId: job.agentId ?? null,
+    attempt: job.attempt ?? 1,
+    model: job.model ? normalizeWorkModelTier(job.model) : null,
+    reasoningEffort: job.reasoningEffort ?? null,
+    goalStage: job.goalStage ?? null,
+    goalWorkstreamId: job.goalWorkstreamId ?? null,
+    goalWave: job.goalWave ?? 0,
+    readonly: Boolean(job.readonly),
+    dependsOn: job.dependsOn ?? [],
+    branch: job.branch ?? null,
+    pullRequestUrl: job.pullRequestUrl ?? null,
+    verificationNote: null,
+    workerRunId: job.workerRunId ?? null,
+    workerRuntime: job.workerRuntime ?? null,
+  };
+}
+
 // Orchestration layer: a mission is a decomposed goal running as a fleet of
 // parallel agent jobs. The runner calls checkComplete after every job — the
 // LAST one to land flips the mission to "synthesizing" exactly once, and the
@@ -70,7 +95,7 @@ export const get = query({
 // Missions still in flight plus recent history. Finished missions remain useful
 // context for the command centre; do not make them disappear after ten minutes.
 export const active = query({
-  args: { ...viewerAuthArgs },
+  args: { includeJobs: v.optional(v.boolean()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
     // Goal Mode can live for days. Indexed status reads keep it visible without
@@ -89,10 +114,15 @@ export const active = query({
     );
     const out = [];
     for (const m of live) {
-      const jobs = await ctx.db
-        .query("jobRuntime")
-        .withIndex("by_mission", (q: any) => q.eq("missionId", String(m.missionId)))
-        .take(100);
+      // Human/model status summaries may opt into child rows for a one-shot
+      // read. The reactive fleet list stays mission-only so one heartbeat does
+      // not fan out across every historical mission's children.
+      const jobs = a.includeJobs
+        ? await ctx.db
+            .query("jobRuntime")
+            .withIndex("by_mission", (q: any) => q.eq("missionId", String(m.missionId)))
+            .take(100)
+        : [];
       out.push({
         ...runtimeMission(m),
         _id: m.missionId,
@@ -127,31 +157,24 @@ export const active = query({
         failureReason: m.failureReason ?? null,
         completedAt: m.completedAt ?? null,
         updatedAt: m.updatedAt,
-        jobs: jobs.map((j: any) => ({
-          _id: j.jobId,
-          label: j.label ?? j.task.slice(0, 50),
-          status: j.status,
-          progress: j.progress ?? "",
-          stage: j.stage ?? j.status,
-          percent: j.percent ?? 0,
-          agentId: j.agentId ?? null,
-          attempt: j.attempt ?? 1,
-          model: j.model ? normalizeWorkModelTier(j.model) : null,
-          reasoningEffort: j.reasoningEffort ?? null,
-          goalStage: j.goalStage ?? null,
-          goalWorkstreamId: j.goalWorkstreamId ?? null,
-          goalWave: j.goalWave ?? 0,
-          readonly: Boolean(j.readonly),
-          dependsOn: j.dependsOn ?? [],
-          branch: j.branch ?? null,
-          pullRequestUrl: j.pullRequestUrl ?? null,
-          verificationNote: null,
-          workerRunId: j.workerRunId ?? null,
-          workerRuntime: j.workerRuntime ?? null,
-        })),
+        jobs: jobs.map(missionJobActivity),
       });
     }
     return out;
+  },
+});
+
+// The fleet panel subscribes only to the selected mission's compact children.
+// This is the live detail surface; rich plans and reports remain in get().
+export const activity = query({
+  args: { id: v.id("missions"), ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    const jobs = await ctx.db
+      .query("jobRuntime")
+      .withIndex("by_mission", (q: any) => q.eq("missionId", String(a.id)))
+      .take(100);
+    return jobs.map(missionJobActivity);
   },
 });
 

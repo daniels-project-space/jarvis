@@ -27,7 +27,7 @@ export const decide = mutation({
     const approvals = await ctx.db
       .query("approvals")
       .withIndex("by_job", (q: any) => q.eq("jobId", a.jobId))
-      .collect();
+      .take(20);
     const approval = approvals.find((row) => row.status === "pending");
     const jobId = ctx.db.normalizeId("jobs", a.jobId);
     const job = jobId ? await ctx.db.get(jobId) : null;

@@ -187,6 +187,7 @@ describe("server-side work approval policy", () => {
       }).required,
     ).toBe(true);
     expect(workApprovalPolicy({ task: "Commit the fix and message the tenant", repo: "jarvis" }).required).toBe(true);
+    expect(workApprovalPolicy({ task: "Commit the fix, message the tenant", repo: "jarvis" }).required).toBe(true);
   });
 
   it("fails closed for an unclassified non-repository action", () => {

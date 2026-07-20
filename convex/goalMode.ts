@@ -1435,7 +1435,7 @@ async function resetGoalJob(ctx: any, job: any, now: number, force = false) {
     const approvals = await ctx.db
       .query("approvals")
       .withIndex("by_job", (q: any) => q.eq("jobId", String(job._id)))
-      .collect();
+      .take(20);
     if (!approvals.some((approval: any) => approval.status === "pending")) {
       await ctx.db.insert("approvals", {
         jobId: String(job._id),

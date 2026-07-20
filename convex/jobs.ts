@@ -335,6 +335,26 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
       if (job) await upsertJobRuntime(ctx, job);
       continue;
     }
+    // The projection carries the common bounded dependency prefix. If a
+    // legacy/general job has more, the selected authority document must fence
+    // every remaining dependency before dispatch; oversized graphs stay held
+    // for explicit recovery instead of silently dropping an edge.
+    const projectedDependencyCount = Array.isArray(candidate.dependsOn) ? candidate.dependsOn.length : 0;
+    const authorityDependencies = Array.isArray(job.dependsOn) ? job.dependsOn : [];
+    if (authorityDependencies.length > 100) continue;
+    for (const dependency of authorityDependencies.slice(projectedDependencyCount)) {
+      let dep = dependencyCache.get(dependency);
+      if (dep === undefined) {
+        const id = ctx.db.normalizeId("jobs", dependency);
+        dep = id ? await jobRuntimeFor(ctx, id) : null;
+        dependencyCache.set(dependency, dep ?? null);
+      }
+      if (!dep || dep.status !== "done") {
+        blocked = true;
+        break;
+      }
+    }
+    if (blocked) continue;
     if (job.goalStage && job.missionId) {
       const missionId = ctx.db.normalizeId("missions", job.missionId);
       const mission = missionId ? await ctx.db.get(missionId) : null;
@@ -559,6 +579,11 @@ export const finalize = mutation({
     const now = Date.now();
     const success = a.status === "done";
     const delivered = success && row.deliveryStatus === "merged";
+    const activity = success ? null : await jobRuntimeFor(ctx, a.jobId);
+    const finalPercent = success ? 100 : activity?.percent ?? row.percent;
+    const finalProgress = success
+      ? delivered ? "verified, merged and handed to deployment" : "verified and complete"
+      : activity?.progress ?? row.progress;
     const finalPatch = {
       status: a.status,
       result: a.result,
@@ -566,10 +591,8 @@ export const finalize = mutation({
       completedAt: now,
       heartbeatAt: now,
       stage: success ? (delivered ? "delivered" : "verified") : a.status,
-      percent: success ? 100 : row.percent,
-      progress: success
-        ? delivered ? "verified, merged and handed to deployment" : "verified and complete"
-        : row.progress,
+      percent: finalPercent,
+      progress: finalProgress,
       verificationVerdict: a.verificationVerdict,
       verificationNote: a.verificationNote?.slice(0, 1000),
       verifiedAt: success ? now : undefined,
@@ -584,7 +607,7 @@ export const finalize = mutation({
         ? delivered ? "Work verified and merged automatically" : "Work verified and complete"
         : (a.result ?? a.status).slice(0, 500),
       stage: success ? (delivered ? "delivered" : "verified") : a.status,
-      percent: success ? 100 : row.percent,
+      percent: finalPercent,
       createdAt: now,
     });
     if (row.missionId) {

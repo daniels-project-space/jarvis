@@ -117,10 +117,35 @@ export async function missionRuntimeFor(ctx: any, missionId: any) {
 }
 
 export async function upsertJobRuntime(ctx: any, job: any) {
-  const projected = projectJobRuntime(job);
   const existing = await jobRuntimeFor(ctx, job._id);
+  // A rollout backfill may meet a row that a live heartbeat already created.
+  // Preserve that newer activity while the authoritative status still agrees;
+  // a status mismatch is recovery evidence and is rebuilt from the job.
+  const source = existing && existing.status === job.status
+    ? mergeJobRuntimeSource(job, {}, existing)
+    : job;
+  const projected = projectJobRuntime(source);
   if (existing) await ctx.db.replace(existing._id, projected);
   else await ctx.db.insert("jobRuntime", projected);
+}
+
+const LIVE_JOB_ACTIVITY_FIELDS = ["stage", "percent", "progress", "heartbeatAt", "updatedAt"] as const;
+
+// Progress heartbeats intentionally do not rewrite the durable job. When a
+// later authority transition patches an unrelated field (for example a pull
+// request receipt), retain the newer compact activity instead of rebuilding it
+// from the deliberately stale durable progress snapshot.
+export function mergeJobRuntimeSource(
+  job: Record<string, unknown>,
+  patch: Record<string, unknown>,
+  activity?: Record<string, unknown> | null,
+) {
+  const merged: Record<string, unknown> = { ...job, ...patch, _id: job._id };
+  if (!activity) return merged;
+  for (const field of LIVE_JOB_ACTIVITY_FIELDS) {
+    if (!(field in patch) && activity[field] !== undefined) merged[field] = activity[field];
+  }
+  return merged;
 }
 
 export async function upsertMissionRuntime(ctx: any, mission: any) {
@@ -137,8 +162,11 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
 }
 
 export async function patchJobWithRuntime(ctx: any, job: any, patch: Record<string, unknown>) {
+  const existing = await jobRuntimeFor(ctx, job._id);
   await ctx.db.patch(job._id, patch);
-  await upsertJobRuntime(ctx, { ...job, ...patch });
+  const projected = projectJobRuntime(mergeJobRuntimeSource(job, patch, existing));
+  if (existing) await ctx.db.replace(existing._id, projected);
+  else await ctx.db.insert("jobRuntime", projected);
 }
 
 export async function insertMissionWithRuntime(ctx: any, value: any) {
