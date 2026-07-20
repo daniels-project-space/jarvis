@@ -32,6 +32,10 @@ export type TrustedProviderBoundary = {
     gitRepository: string;
     token: ReleaseCapabilityRef;
   };
+  /** Artifact identity only. R2 has no source bundle to deploy or promote. */
+  r2?: {
+    bucket: string;
+  };
 };
 
 export type ProjectProfile = {
@@ -197,6 +201,47 @@ export const PROJECT_REGISTRY: ProjectProfile[] = [
       convexDeployment: "peaceful-panda-894",
       triggerProjectRef: "proj_ebwgqvfufapbqnhjxhnc",
       r2Bucket: "dropship-ai",
+      release: {
+        convex: {
+          targets: [
+            {
+              role: "canonical",
+              deployment: "peaceful-panda-894",
+              deploymentType: "prod",
+              url: "https://peaceful-panda-894.convex.cloud",
+              deployKey: {
+                service: "dropship-ai-release",
+                key: "CONVEX_DEPLOY_KEY",
+              },
+            },
+          ],
+        },
+        trigger: {
+          projectRef: "proj_ebwgqvfufapbqnhjxhnc",
+          accessToken: {
+            service: "dropship-ai-release",
+            key: "TRIGGER_ACCESS_TOKEN",
+          },
+          secretKey: {
+            service: "dropship-ai-release",
+            key: "TRIGGER_SECRET_KEY",
+          },
+        },
+        vercel: {
+          teamId: "team_VY2PwHgXLV9Bo0vs2iXdnGxw",
+          teamSlug: "danielmabro-news-projects",
+          projectName: "dropship-ai",
+          projectId: "prj_506MgOrVxyVJzbnR95z8f853Upp4",
+          productionAlias: "dropship-ai-cyan.vercel.app",
+          productionBranch: "main",
+          gitRepository: "daniels-project-space/dropship-ai",
+          token: {
+            service: "dropship-ai-release",
+            key: "VERCEL_TOKEN",
+          },
+        },
+        r2: { bucket: "dropship-ai" },
+      },
     },
   },
   {

@@ -71,6 +71,7 @@ import {
   type GitReviewBinding,
   type GitReviewEnvelope,
 } from "./git-review-receipt";
+import { spawnSpecialist, verifySpecialistSandboxIsolation } from "./specialist-sandbox";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -94,7 +95,12 @@ function promptArgs(prompt: string, tier: string, json = false, mcpConfig?: stri
 
 function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, tier: string, timeoutMs: number): Promise<string> {
   return new Promise((resolve) => {
-    const p = spawn(bin, promptArgs(prompt, tier), { env, stdio: ["ignore", "pipe", "pipe"] });
+    const p = spawnSpecialist({
+      command: bin,
+      args: promptArgs(prompt, tier),
+      cwd: String(env.CODEX_HOME),
+      env,
+    }, { stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     const timer = setTimeout(() => { try { p.kill("SIGKILL"); } catch { /* gone */ } resolve(output); }, timeoutMs);
     p.stdout.on("data", (d) => (output += d.toString()));
@@ -280,7 +286,13 @@ function runAgent(
     const args = promptArgs(prompt, model, true, mcpConfig, reasoningEffort);
     const codexSelection = codexModelFor(model);
     const runtimeLabel = `${codexSelection.model} · ${normalizeReasoningEffort(reasoningEffort, codexSelection.effort)}`;
-    const p = spawn(bin, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    const p = spawnSpecialist({
+      command: bin,
+      args,
+      cwd,
+      env,
+      readablePaths: mcpConfig ? [mcpConfig] : [],
+    }, { stdio: ["ignore", "pipe", "pipe"] });
     let buf = "";
     let stderr = "";
     let finalText = "";
@@ -645,6 +657,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     }
     const env = prepared.env;
     mkdirSync("/tmp/work", { recursive: true });
+    const isolation = verifySpecialistSandboxIsolation({ cwd: "/tmp/work", env });
+    if (!isolation.ok) return rejectReservation(isolation.reason);
     const token = process.env.GITHUB_TOKEN ?? "";
 
     // Standing briefing every agent reads from the Codex home:

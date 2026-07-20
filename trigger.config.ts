@@ -22,9 +22,10 @@ export default defineConfig({
     external: ["@openai/codex", "web-push"],
     extensions: [
       additionalPackages({ packages: ["@openai/codex@0.144.5"] }),
-      // The Codex CLI receives a normal engineering shell in every isolated
-      // worker. Credentials remain in the parent delivery controller.
-      aptGet({ packages: ["curl", "git", "gh", "jq", "ca-certificates"] }),
+      // Bubblewrap creates a separate PID/mount namespace around every Codex
+      // specialist. This is the credential boundary; child-env filtering alone
+      // cannot stop a same-container process reading its parent through /proc.
+      aptGet({ packages: ["curl", "git", "gh", "jq", "ca-certificates", "bubblewrap"] }),
       syncEnvVars(() => {
         const values = Object.fromEntries(
           ["CODEX_AUTH_JSON_B64", "CONVEX_URL", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN", "GITHUB_TOKEN", "VAULT_ACCESS_TOKEN", "JARVIS_RELEASE_SOURCE_SHA"]

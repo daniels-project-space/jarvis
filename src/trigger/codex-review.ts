@@ -1,8 +1,9 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { type ChildProcessWithoutNullStreams } from "node:child_process";
 import {
   CODEX_REVIEW_WORKING_DIRECTORY,
   codexReviewExecPrefix,
 } from "./model-policy";
+import { spawnSpecialist } from "./specialist-sandbox";
 
 type ReviewSpawnOptions = {
   cwd: string;
@@ -17,7 +18,13 @@ export type CodexReviewSpawn = (
 ) => ChildProcessWithoutNullStreams;
 
 const spawnCodexReview: CodexReviewSpawn = (command, args, options) =>
-  spawn(command, args, options);
+  spawnSpecialist({
+    command,
+    args,
+    cwd: options.cwd,
+    env: options.env,
+    writableCwd: false,
+  }, { stdio: options.stdio });
 
 // Controller receipts can exceed Linux's single-argument limit. Codex exec's
 // dash prompt contract keeps the signed payload out of argv and streams it
