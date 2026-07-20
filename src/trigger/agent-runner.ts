@@ -59,6 +59,7 @@ import {
   openDeliveryPullRequest,
   validatedGoalDeliveryBranch,
 } from "./github-delivery";
+import { createTrustedProviderReleaseGate } from "./provider-release-runtime";
 import { wakeAgentFleet } from "../lib/agent-fleet-dispatch";
 import { upstreamEvidencePrompt } from "../lib/upstream-evidence";
 import { drainControlPlaneMigration } from "./control-plane-migration";
@@ -827,7 +828,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           && token
           && resumeBranch
           && job.verificationVerdict === "pass"
-          && ["pull_request", "blocked"].includes(String(job.deliveryStatus ?? ""))
+          && ["pull_request", "blocked", "provider_release", "provider_ready"].includes(String(job.deliveryStatus ?? ""))
           && (
             autonomousRepositoryDelivery(job, repo)
             || Boolean(validatedGoalBranch && isOwnedRepository(repo))
@@ -844,6 +845,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           const branchChanged = await branchHasChanges(repo, resumeBranch, token);
           let pullRequestUrl = typeof job.pullRequestUrl === "string" ? job.pullRequestUrl : "";
           let mergeSha = "";
+          let deliveredHeadSha = branchChanged === false ? String(job.providerRelease?.headSha ?? "") : "";
           let deliveryFailure = branchChanged === null
             ? "the controller could not compare the verified branch with the default branch"
             : "";
@@ -875,8 +877,22 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 title,
                 token,
                 shouldContinue: async () => (await executionStatus()) === "running",
+                releaseGate: createTrustedProviderReleaseGate({
+                  jobId: String(job.jobId),
+                  expectedAttempt,
+                  repository: repo,
+                  branch: resumeBranch,
+                  prior: job.providerRelease ?? undefined,
+                  githubToken: token,
+                  baseEnv: process.env,
+                  convexMutation,
+                  shouldContinue: async () => (await executionStatus()) === "running",
+                }),
               });
-              if (merge.status === "merged") mergeSha = merge.sha;
+              if (merge.status === "merged") {
+                mergeSha = merge.sha;
+                deliveredHeadSha = pull.headSha;
+              }
               else deliveryFailure = merge.note;
             }
           }
@@ -905,6 +921,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             pullRequestUrl: pullRequestUrl || undefined,
             deliveryStatus: "merged",
             mergeCommitSha: mergeSha || undefined,
+            deliveredHeadSha: deliveredHeadSha || undefined,
           }).catch(() => false);
           if (!recorded) throw new Error("verified delivery completed but its durable receipt could not be recorded");
           const deliveryResult = [
@@ -1379,6 +1396,17 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                   title: `JARVIS goal: ${(job.label ?? job.task).slice(0, 78)}`,
                   token,
                   shouldContinue: async () => (await executionStatus()) === "running",
+                  releaseGate: createTrustedProviderReleaseGate({
+                    jobId: String(job.jobId),
+                    expectedAttempt,
+                    repository: repo,
+                    branch: goalBranch,
+                    prior: job.providerRelease ?? undefined,
+                    githubToken: token,
+                    baseEnv: process.env,
+                    convexMutation,
+                    shouldContinue: async () => (await executionStatus()) === "running",
+                  }),
                 })
               : { status: "blocked" as const, note: "the delivery controller could not open the goal pull request" };
             if (merge.status !== "merged") {
@@ -1407,6 +1435,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               pullRequestUrl: pull?.url,
               deliveryStatus: "merged",
               mergeCommitSha: merge.sha,
+              deliveredHeadSha: pull?.headSha,
             }).catch(() => false);
             if (!recorded) throw new Error("goal branch merged but its durable delivery receipt could not be recorded");
           } else if (job.deliveryStatus === "merged") {
@@ -1419,6 +1448,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               branch: goalBranch,
               pullRequestUrl: goalPullRequestUrl,
               deliveryStatus: "merged",
+              deliveredHeadSha: job.providerRelease?.headSha,
             }).catch(() => false);
             if (!recorded) throw new Error("goal branch is delivered but its durable receipt could not be recorded");
           }
@@ -1631,6 +1661,17 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               title,
               token,
               shouldContinue: async () => (await executionStatus()) === "running",
+              releaseGate: createTrustedProviderReleaseGate({
+                jobId: String(job.jobId),
+                expectedAttempt,
+                repository: repo,
+                branch,
+                prior: job.providerRelease ?? undefined,
+                githubToken: token,
+                baseEnv: process.env,
+                convexMutation,
+                shouldContinue: async () => (await executionStatus()) === "running",
+              }),
             });
             if (merged.status === "merged") {
               const recorded = await convexMutation("jobs:setDelivery", {
@@ -1640,6 +1681,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 pullRequestUrl: pull.url,
                 deliveryStatus: "merged",
                 mergeCommitSha: merged.sha,
+                deliveredHeadSha: pull.headSha,
               }).catch(() => false);
               if (!recorded) throw new Error("verified branch merged but its durable delivery receipt could not be recorded");
               pushNote = `verified PR merged automatically: ${pull.url}${merged.sha ? ` · ${merged.sha}` : ""}`;

@@ -10,6 +10,19 @@ export type MergeDeliveryResult =
   | { status: "merged"; sha: string; note: string }
   | { status: "blocked" | "pending"; note: string };
 
+export type PullRequestChange = {
+  baseSha: string;
+  headSha: string;
+  baseBranch: string;
+  headBranch: string;
+  changedPaths: string[];
+};
+
+export type ProviderMergeGate =
+  | { status: "not_required"; note: string }
+  | { status: "ready"; note: string; headSha: string }
+  | { status: "blocked" | "pending"; note: string };
+
 export function validatedGoalDeliveryBranch(job: {
   goalStage?: unknown;
   branch?: unknown;
@@ -125,6 +138,83 @@ export async function openDeliveryPullRequest(args: {
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+function normalizedRepo(repo: string): string {
+  return repo.trim().replace(/\.git$/i, "").toLowerCase();
+}
+
+/**
+ * Resolve every PR path and both immutable Git heads before a provider plan is
+ * allowed to run. GitHub caps the endpoint at 3,000 files; reaching that cap is
+ * unverifiable and therefore fails closed instead of silently missing a
+ * provider-sensitive path.
+ */
+export async function inspectDeliveryPullRequest(args: {
+  repo: string;
+  pull: PullRequestDelivery;
+  token: string;
+  fetchImpl?: FetchLike;
+}): Promise<{ ok: true; change: PullRequestChange } | { ok: false; note: string }> {
+  const fetchImpl = args.fetchImpl ?? fetch;
+  const headers = apiHeaders(args.token);
+  try {
+    const response = await fetchImpl(
+      `https://api.github.com/repos/${args.repo}/pulls/${args.pull.number}`,
+      { headers, cache: "no-store" },
+    );
+    if (!response.ok) return { ok: false, note: `GitHub could not resolve pull request ${args.pull.number}` };
+    const pull = (await response.json()) as {
+      state?: string;
+      merged?: boolean;
+      head?: { sha?: string; ref?: string; repo?: { full_name?: string } };
+      base?: { sha?: string; ref?: string; repo?: { full_name?: string } };
+    };
+    const headSha = String(pull.head?.sha ?? "");
+    const baseSha = String(pull.base?.sha ?? "");
+    const expectedRepo = normalizedRepo(args.repo);
+    if (pull.state !== "open" || pull.merged || !/^[0-9a-f]{40,64}$/i.test(headSha) || !/^[0-9a-f]{40,64}$/i.test(baseSha)) {
+      return { ok: false, note: "the open pull request heads could not be verified" };
+    }
+    if (args.pull.headSha && headSha !== args.pull.headSha) {
+      return { ok: false, note: "the pull request head changed before provider release planning" };
+    }
+    if (
+      normalizedRepo(String(pull.head?.repo?.full_name ?? "")) !== expectedRepo
+      || normalizedRepo(String(pull.base?.repo?.full_name ?? "")) !== expectedRepo
+    ) {
+      return { ok: false, note: "the pull request crosses an unexpected repository boundary" };
+    }
+
+    const changedPaths = new Set<string>();
+    for (let page = 1; page <= 30; page += 1) {
+      const filesResponse = await fetchImpl(
+        `https://api.github.com/repos/${args.repo}/pulls/${args.pull.number}/files?per_page=100&page=${page}`,
+        { headers, cache: "no-store" },
+      );
+      if (!filesResponse.ok) return { ok: false, note: "GitHub could not enumerate the verified pull request paths" };
+      const files = (await filesResponse.json()) as Array<{ filename?: string; previous_filename?: string }>;
+      for (const file of files) {
+        if (file.filename) changedPaths.add(file.filename);
+        if (file.previous_filename) changedPaths.add(file.previous_filename);
+      }
+      if (files.length < 100) {
+        return {
+          ok: true,
+          change: {
+            baseSha,
+            headSha,
+            baseBranch: String(pull.base?.ref ?? ""),
+            headBranch: String(pull.head?.ref ?? ""),
+            changedPaths: [...changedPaths].sort(),
+          },
+        };
+      }
+    }
+    return { ok: false, note: "the pull request exceeds GitHub's exact 3,000-file verification boundary" };
+  } catch (error) {
+    return { ok: false, note: `pull request inspection failed: ${String(error).slice(0, 300)}` };
+  }
+}
+
 /**
  * Let GitHub's branch protection remain the final delivery gate. The
  * controller retries while checks are pending, pins the expected head SHA,
@@ -138,6 +228,7 @@ export async function mergeVerifiedPullRequest(args: {
   attempts?: number;
   intervalMs?: number;
   shouldContinue?: () => Promise<boolean>;
+  releaseGate: (change: PullRequestChange) => Promise<ProviderMergeGate>;
   fetchImpl?: FetchLike;
   sleep?: (ms: number) => Promise<void>;
 }): Promise<MergeDeliveryResult> {
@@ -147,6 +238,19 @@ export async function mergeVerifiedPullRequest(args: {
   const attempts = Math.max(1, Math.min(90, args.attempts ?? 60));
   let headSha = args.pull.headSha;
   let lastMessage = "GitHub checks have not completed yet";
+  const inspection = await inspectDeliveryPullRequest({
+    repo: args.repo,
+    pull: args.pull,
+    token: args.token,
+    fetchImpl,
+  });
+  if (!inspection.ok) return { status: "blocked", note: inspection.note };
+  const gate = await args.releaseGate(inspection.change);
+  if (gate.status === "blocked" || gate.status === "pending") return gate;
+  const providerLockedHead = gate.status === "ready" ? gate.headSha : "";
+  if (providerLockedHead && providerLockedHead !== inspection.change.headSha) {
+    return { status: "blocked", note: "the provider release proof does not match the pull request head" };
+  }
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     if (args.shouldContinue && !(await args.shouldContinue())) {
@@ -209,7 +313,11 @@ export async function mergeVerifiedPullRequest(args: {
         };
       }
       if (state.state === "closed") return { status: "blocked", note: "pull request closed before delivery" };
-      headSha = String(state.head?.sha ?? headSha);
+      const observedHead = String(state.head?.sha ?? headSha);
+      if (providerLockedHead && observedHead !== providerLockedHead) {
+        return { status: "pending", note: "the pull request head changed after provider verification; prerequisites must be re-attested" };
+      }
+      headSha = observedHead;
       if (state.mergeable === false && state.mergeable_state === "dirty") {
         return { status: "blocked", note: "the verified branch conflicts with the current default branch" };
       }
@@ -223,6 +331,12 @@ export async function mergeVerifiedPullRequest(args: {
             cache: "no-store",
           },
         ).catch(() => null);
+        if (providerLockedHead) {
+          return {
+            status: "pending",
+            note: "GitHub updated the protected branch; provider prerequisites must be re-attested for its new head",
+          };
+        }
       }
     }
     if (attempt + 1 < attempts) await sleep(Math.max(0, args.intervalMs ?? 10_000));

@@ -8,6 +8,7 @@ import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
 import { normalizeWorkModelTier } from "../src/lib/work-models";
 import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
+import { verifiedDeliveryCanFinalize } from "../src/lib/provider-release-finalization";
 import {
   insertJobWithRuntime,
   jobRuntimeFor,
@@ -20,6 +21,51 @@ import {
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
 const DISPATCH_LEASE_MS = 2 * 60 * 1000;
+const PROVIDER_RELEASE_LEASE_MS = 10 * 60 * 1000;
+
+const providerReleaseValidator = v.object({
+  releaseId: v.string(),
+  repository: v.string(),
+  branch: v.string(),
+  baseSha: v.string(),
+  headSha: v.string(),
+  changedPaths: v.array(v.string()),
+  providers: v.array(v.string()),
+  boundaryDigest: v.string(),
+  phase: v.string(),
+  attempts: v.number(),
+  steps: v.array(v.object({
+    id: v.string(),
+    status: v.string(),
+    proof: v.optional(v.string()),
+    version: v.optional(v.string()),
+    runId: v.optional(v.string()),
+    data: v.optional(v.any()),
+    checkedAt: v.optional(v.number()),
+  })),
+  note: v.optional(v.string()),
+  updatedAt: v.number(),
+});
+
+function normalizedRepo(repo: unknown): string {
+  return String(repo ?? "").trim().replace(/^https:\/\/github\.com\//i, "").replace(/\.git$/i, "").toLowerCase();
+}
+
+function validProviderReleaseShape(release: any): boolean {
+  return /^providers-v1:[0-9a-f]{64}$/.test(String(release?.releaseId ?? ""))
+    && /^[0-9a-f]{40,64}$/i.test(String(release?.baseSha ?? ""))
+    && /^[0-9a-f]{40,64}$/i.test(String(release?.headSha ?? ""))
+    && /^jarvis\/[a-z0-9._/-]+$/i.test(String(release?.branch ?? ""))
+    && ["deploying", "ready", "blocked"].includes(String(release?.phase ?? ""))
+    && Array.isArray(release?.providers)
+    && release.providers.length > 0
+    && release.providers.every((provider: unknown) => ["convex", "trigger"].includes(String(provider)))
+    && Array.isArray(release?.steps)
+    && release.steps.length > 1
+    && release.steps[0]?.id?.startsWith("vercel:")
+    && new Set(release.steps.map((step: any) => String(step.id))).size === release.steps.length
+    && release.steps.every((step: any) => ["pending", "deploying", "verified", "failed"].includes(String(step.status)));
+}
 
 const enqueueArgs = {
   task: v.string(),
@@ -432,6 +478,8 @@ function claimedJob(j: any, upstreamEvidence: any[] = []) {
     deliveryStatus: j.deliveryStatus ?? null,
     pullRequestUrl: j.pullRequestUrl ?? null,
     mergeCommitSha: j.mergeCommitSha ?? null,
+    deliveredHeadSha: j.deliveredHeadSha ?? null,
+    providerRelease: j.providerRelease ?? null,
     verificationVerdict: j.verificationVerdict ?? null,
     verificationNote: j.verificationNote ?? null,
     acceptanceCriteria: j.acceptanceCriteria ?? [],
@@ -615,6 +663,11 @@ export const finalize = mutation({
     // A completed job is called "verified" only when the supervisor actually
     // returned pass. This invariant lives in Convex, not only in the runner.
     if (a.status === "done" && a.verificationVerdict !== "pass") return false;
+    // Once a verified branch enters controller delivery, neither a failed
+    // provider phase nor an unmerged PR may be mislabeled done. The Trigger
+    // process can disappear or contain a caller bug; Convex remains the final
+    // durable fence.
+    if (a.status === "done" && !verifiedDeliveryCanFinalize(row)) return false;
     const now = Date.now();
     const success = a.status === "done";
     const delivered = success && row.deliveryStatus === "merged";
@@ -1118,6 +1171,146 @@ export const provideInput = mutation({
   },
 });
 
+// Phase one of provider-sensitive delivery. The release lock serializes exact
+// repository provider state across otherwise independent specialist jobs.
+export const beginProviderRelease = mutation({
+  args: {
+    jobId: v.id("jobs"),
+    expectedAttempt: v.number(),
+    release: providerReleaseValidator,
+    leaseToken: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.get(a.jobId);
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return { ok: false, reason: "stale job lease" };
+    if (
+      row.verificationVerdict !== "pass"
+      || !isOwnedRepository(row.repo)
+      || classifyWorkSafety(row.task, { repo: row.repo }).approvalRequired
+      || (row.deliveryMode !== "auto_merge" && row.goalStage !== "validating")
+    ) return { ok: false, reason: "job is not eligible for autonomous verified delivery" };
+    if (
+      !validProviderReleaseShape(a.release)
+      || a.release.phase !== "deploying"
+      || normalizedRepo(a.release.repository) !== normalizedRepo(row.repo)
+      || a.release.branch !== row.branch
+      || !/^[0-9a-f]{48}$/.test(a.leaseToken)
+    ) return { ok: false, reason: "provider release identity does not match the verified job" };
+
+    const now = Date.now();
+    const lock = await ctx.db
+      .query("providerReleaseLocks")
+      .withIndex("by_repo", (q: any) => q.eq("repo", normalizedRepo(row.repo)))
+      .first();
+    if (lock && lock.releaseId !== a.release.releaseId && lock.leaseUntil > now) {
+      return { ok: false, reason: "another exact provider release owns this repository lease" };
+    }
+    const lockPatch = {
+      repo: normalizedRepo(row.repo),
+      releaseId: a.release.releaseId,
+      jobId: a.jobId,
+      headSha: a.release.headSha,
+      leaseToken: a.leaseToken,
+      leaseUntil: now + PROVIDER_RELEASE_LEASE_MS,
+      status: "deploying",
+      updatedAt: now,
+    };
+    if (lock) await ctx.db.patch(lock._id, lockPatch);
+    else await ctx.db.insert("providerReleaseLocks", lockPatch);
+    await patchJobWithRuntime(ctx, row, {
+      providerRelease: { ...a.release, updatedAt: now },
+      deliveryStatus: "provider_release",
+      stage: "provider_release",
+      progress: "verified branch preserved · trusted provider prerequisites deploying",
+      percent: Math.max(97, row.percent ?? 0),
+      heartbeatAt: now,
+    });
+    await ctx.db.insert("workEvents", {
+      jobId: String(a.jobId),
+      missionId: row.missionId,
+      agentId: row.agentId,
+      type: "provider_release_started",
+      message: `Trusted provider release ${a.release.releaseId.slice(-12)} entered for ${a.release.providers.join(", ")}`,
+      stage: "provider_release",
+      percent: Math.max(97, row.percent ?? 0),
+      createdAt: now,
+    });
+    return { ok: true };
+  },
+});
+
+export const updateProviderRelease = mutation({
+  args: {
+    jobId: v.id("jobs"),
+    expectedAttempt: v.number(),
+    release: providerReleaseValidator,
+    leaseToken: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.get(a.jobId);
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return { ok: false, reason: "stale job lease" };
+    if (
+      !row.providerRelease
+      || !validProviderReleaseShape(a.release)
+      || row.providerRelease.releaseId !== a.release.releaseId
+      || row.providerRelease.headSha !== a.release.headSha
+      || row.providerRelease.boundaryDigest !== a.release.boundaryDigest
+      || normalizedRepo(a.release.repository) !== normalizedRepo(row.repo)
+      || a.release.branch !== row.branch
+    ) return { ok: false, reason: "provider release receipt changed identity" };
+    if (a.release.phase === "ready" && a.release.steps.some((step: any) => step.status !== "verified")) {
+      return { ok: false, reason: "provider release cannot become ready without every exact receipt" };
+    }
+    const lock = await ctx.db
+      .query("providerReleaseLocks")
+      .withIndex("by_repo", (q: any) => q.eq("repo", normalizedRepo(row.repo)))
+      .first();
+    const now = Date.now();
+    if (
+      !lock
+      || lock.releaseId !== a.release.releaseId
+      || lock.jobId !== a.jobId
+      || lock.headSha !== a.release.headSha
+      || lock.leaseToken !== a.leaseToken
+      || lock.leaseUntil <= now
+    ) return { ok: false, reason: "trusted provider release lease is missing or expired" };
+    const status = a.release.phase === "ready" ? "ready" : a.release.phase === "blocked" ? "blocked" : "deploying";
+    await ctx.db.patch(lock._id, {
+      status,
+      leaseUntil: status === "blocked" ? now : now + PROVIDER_RELEASE_LEASE_MS,
+      updatedAt: now,
+    });
+    await patchJobWithRuntime(ctx, row, {
+      providerRelease: { ...a.release, updatedAt: now },
+      deliveryStatus: status === "ready" ? "provider_ready" : status === "blocked" ? "blocked" : "provider_release",
+      stage: status === "ready" ? "delivery" : "provider_release",
+      progress: status === "ready"
+        ? "provider prerequisites verified · GitHub merge unlocked"
+        : status === "blocked"
+          ? `provider release blocked · ${String(a.release.note ?? "verification failed").slice(0, 300)}`
+          : String(a.release.note ?? "trusted provider release in progress").slice(0, 500),
+      heartbeatAt: now,
+    });
+    if (status !== "deploying") {
+      await ctx.db.insert("workEvents", {
+        jobId: String(a.jobId),
+        missionId: row.missionId,
+        agentId: row.agentId,
+        type: status === "ready" ? "provider_release_ready" : "provider_release_blocked",
+        message: String(a.release.note ?? status).slice(0, 500),
+        stage: status === "ready" ? "delivery" : "provider_release",
+        percent: row.percent,
+        createdAt: now,
+      });
+    }
+    return { ok: true };
+  },
+});
+
 export const setDelivery = mutation({
   args: {
     jobId: v.id("jobs"),
@@ -1131,20 +1324,39 @@ export const setDelivery = mutation({
       v.literal("blocked"),
     )),
     mergeCommitSha: v.optional(v.string()),
+    deliveredHeadSha: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
+    if (a.deliveryStatus === "merged" && row.providerRelease) {
+      if (
+        row.providerRelease.phase !== "ready"
+        || a.deliveredHeadSha !== row.providerRelease.headSha
+        || row.providerRelease.steps.some((step: any) => step.status !== "verified")
+      ) return false;
+    }
+    const now = Date.now();
     await patchJobWithRuntime(ctx, row, {
       branch: a.branch,
       pullRequestUrl: a.pullRequestUrl,
       deliveryStatus: a.deliveryStatus,
       mergeCommitSha: a.mergeCommitSha?.slice(0, 80),
-      mergedAt: a.deliveryStatus === "merged" ? Date.now() : undefined,
-      heartbeatAt: Date.now(),
+      deliveredHeadSha: a.deliveredHeadSha?.slice(0, 80),
+      mergedAt: a.deliveryStatus === "merged" ? now : undefined,
+      heartbeatAt: now,
     });
+    if (a.deliveryStatus === "merged" && row.providerRelease) {
+      const lock = await ctx.db
+        .query("providerReleaseLocks")
+        .withIndex("by_repo", (q: any) => q.eq("repo", normalizedRepo(row.repo)))
+        .first();
+      if (lock?.releaseId === row.providerRelease.releaseId && lock.jobId === a.jobId) {
+        await ctx.db.patch(lock._id, { status: "delivered", leaseUntil: now, updatedAt: now });
+      }
+    }
     return true;
   },
 });

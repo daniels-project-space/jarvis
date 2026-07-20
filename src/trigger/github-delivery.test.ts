@@ -10,6 +10,21 @@ const response = (status: number, body: unknown) => new Response(JSON.stringify(
   headers: { "content-type": "application/json" },
 });
 
+const inspectedPull = (headSha = "abc123abc123abc123abc123abc123abc123abcd") => ({
+  state: "open",
+  merged: false,
+  head: {
+    sha: headSha,
+    ref: "jarvis/paul-fix",
+    repo: { full_name: "daniels-project-space/jarvis" },
+  },
+  base: {
+    sha: "def456def456def456def456def456def456defa",
+    ref: "main",
+    repo: { full_name: "daniels-project-space/jarvis" },
+  },
+});
+
 describe("autonomous GitHub delivery", () => {
   it("retains a validator's shared branch even though the model lease is read-only", () => {
     expect(validatedGoalDeliveryBranch({
@@ -71,16 +86,21 @@ describe("autonomous GitHub delivery", () => {
   });
 
   it("merges verified work without bypassing GitHub's checks", async () => {
-    const fetchImpl = vi.fn().mockResolvedValueOnce(response(200, {
-      merged: true,
-      sha: "merge123",
-      message: "Pull Request successfully merged",
-    }));
+    const headSha = "abc123abc123abc123abc123abc123abc123abcd";
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(response(200, inspectedPull(headSha)))
+      .mockResolvedValueOnce(response(200, [{ filename: "src/app/page.tsx" }]))
+      .mockResolvedValueOnce(response(200, {
+        merged: true,
+        sha: "merge123",
+        message: "Pull Request successfully merged",
+      }));
     const result = await mergeVerifiedPullRequest({
       repo: "daniels-project-space/jarvis",
-      pull: { number: 42, url: "https://github.test/42", headSha: "abc123" },
+      pull: { number: 42, url: "https://github.test/42", headSha },
       title: "Paul: fix",
       token: "token",
+      releaseGate: async () => ({ status: "not_required", note: "ordinary code" }),
       fetchImpl: fetchImpl as typeof fetch,
       sleep: async () => undefined,
     });
@@ -89,24 +109,27 @@ describe("autonomous GitHub delivery", () => {
       sha: "merge123",
       note: "Pull Request successfully merged",
     });
-    expect(JSON.parse(String(fetchImpl.mock.calls[0][1]?.body))).toMatchObject({ sha: "abc123" });
+    expect(JSON.parse(String(fetchImpl.mock.calls[2][1]?.body))).toMatchObject({ sha: headSha });
   });
 
   it("stops on a real branch conflict instead of force-delivering", async () => {
     const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(response(200, inspectedPull()))
+      .mockResolvedValueOnce(response(200, [{ filename: "src/app/page.tsx" }]))
       .mockResolvedValueOnce(response(409, { message: "Head branch was modified" }))
       .mockResolvedValueOnce(response(200, {
         state: "open",
         merged: false,
         mergeable: false,
         mergeable_state: "dirty",
-        head: { sha: "new-head" },
+        head: { sha: "abc123abc123abc123abc123abc123abc123abcd" },
       }));
     const result = await mergeVerifiedPullRequest({
       repo: "daniels-project-space/jarvis",
-      pull: { number: 42, url: "https://github.test/42", headSha: "abc123" },
+      pull: { number: 42, url: "https://github.test/42", headSha: "abc123abc123abc123abc123abc123abc123abcd" },
       title: "Paul: fix",
       token: "token",
+      releaseGate: async () => ({ status: "not_required", note: "ordinary code" }),
       fetchImpl: fetchImpl as typeof fetch,
       sleep: async () => undefined,
     });
@@ -114,5 +137,43 @@ describe("autonomous GitHub delivery", () => {
       status: "blocked",
       note: "the verified branch conflicts with the current default branch",
     });
+  });
+
+  it("never calls GitHub merge when a provider prerequisite fails", async () => {
+    const headSha = "abc123abc123abc123abc123abc123abc123abcd";
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(response(200, inspectedPull(headSha)))
+      .mockResolvedValueOnce(response(200, [{ filename: "convex/schema.ts" }]));
+    const result = await mergeVerifiedPullRequest({
+      repo: "daniels-project-space/jarvis",
+      pull: { number: 42, url: "https://github.test/42", headSha },
+      title: "Paul: provider fix",
+      token: "token",
+      releaseGate: async () => ({ status: "blocked", note: "canonical Convex attestation mismatched" }),
+      fetchImpl: fetchImpl as typeof fetch,
+      sleep: async () => undefined,
+    });
+    expect(result).toEqual({ status: "blocked", note: "canonical Convex attestation mismatched" });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fetchImpl.mock.calls.some(([, init]) => init?.method === "PUT")).toBe(false);
+  });
+
+  it("rejects a provider proof for any head other than the exact PR head", async () => {
+    const headSha = "abc123abc123abc123abc123abc123abc123abcd";
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(response(200, inspectedPull(headSha)))
+      .mockResolvedValueOnce(response(200, [{ filename: "src/trigger/agent-runner.ts" }]));
+    const result = await mergeVerifiedPullRequest({
+      repo: "daniels-project-space/jarvis",
+      pull: { number: 42, url: "https://github.test/42", headSha },
+      title: "Paul: provider fix",
+      token: "token",
+      releaseGate: async () => ({ status: "ready", note: "wrong proof", headSha: "f".repeat(40) }),
+      fetchImpl: fetchImpl as typeof fetch,
+      sleep: async () => undefined,
+    });
+    expect(result.status).toBe("blocked");
+    expect(result.note).toContain("does not match");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 });

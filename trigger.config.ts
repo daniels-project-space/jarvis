@@ -1,13 +1,17 @@
 import { defineConfig } from "@trigger.dev/sdk/v3";
 import { additionalPackages, aptGet, syncEnvVars } from "@trigger.dev/build/extensions/core";
+import { PROJECT_BY_SLUG } from "./src/lib/project-registry";
 
 // Trigger hosts foreground conversation, the fleet controller and independent
 // specialist containers. Every specialist remains a pinned Codex CLI process;
 // metered API keys stay blanked inside the subscription subprocess.
-// Set TRIGGER_PROJECT_REF_JARVIS once the `jarvis-jobs` project is created in
-// the Trigger.dev dashboard, then `npx trigger.dev deploy`.
+const JARVIS_TRIGGER_PROJECT = PROJECT_BY_SLUG.get("jarvis")?.providerBoundary?.release?.trigger?.projectRef;
+if (!JARVIS_TRIGGER_PROJECT) throw new Error("Jarvis's exact Trigger project is absent from the project registry");
+
 export default defineConfig({
-  project: process.env.TRIGGER_PROJECT_REF_JARVIS ?? "proj_wjwbdgeipgpddvrazxnp",
+  // Provider routing is registry-owned. An ambient env value must never turn a
+  // Jarvis release into a deployment for another Daniel-owned project.
+  project: JARVIS_TRIGGER_PROJECT,
   runtime: "node-22",
   logLevel: "log",
   dirs: ["./src/trigger"],
@@ -23,7 +27,7 @@ export default defineConfig({
       aptGet({ packages: ["curl", "git", "gh", "jq", "ca-certificates"] }),
       syncEnvVars(() => {
         const values = Object.fromEntries(
-          ["CODEX_AUTH_JSON_B64", "CONVEX_URL", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN", "GITHUB_TOKEN", "VAULT_ACCESS_TOKEN"]
+          ["CODEX_AUTH_JSON_B64", "CONVEX_URL", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN", "GITHUB_TOKEN", "VAULT_ACCESS_TOKEN", "JARVIS_RELEASE_SOURCE_SHA"]
             .map((key) => [key, process.env[key]])
             .filter((entry): entry is [string, string] => Boolean(entry[1])),
         );
