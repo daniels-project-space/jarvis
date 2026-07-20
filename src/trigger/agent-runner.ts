@@ -33,6 +33,7 @@ import {
   cumulativeWorkEvidence,
   EVIDENCE_INTEGRITY_RULES,
   isPermittedReadonlyAccessGap,
+  supervisorDeliveryBoundary,
 } from "../lib/work-verification";
 import { gitDeliveryDisposition, isNonFastForwardPush } from "../lib/git-delivery";
 import { repairPrompt } from "../lib/repair-prompt";
@@ -188,6 +189,7 @@ async function verifyWork(
   env: NodeJS.ProcessEnv,
   task: string,
   result: string,
+  goalStage?: unknown,
 ): Promise<{ verdict: "pass" | "concerns" | "needs_input"; note: string; answer: string } | null> {
   const prompt =
     "You are JARVIS quickly verifying a background agent's finished work. Reply with ONLY minified JSON: " +
@@ -196,6 +198,7 @@ async function verifyWork(
     "needs_input = the agent stopped on a question or decision. If that question is answerable with common sense or the task's own context, fill answer so the run can continue autonomously; leave answer empty only when Daniel genuinely must decide (money, accounts, personal preferences).\n\n" +
     "If the task explicitly says to stop and name a missing read-access gap, a documented gap is a completed evidence outcome, not a request for Daniel to relax the boundary.\n\n" +
     `${SAFE_SANDBOX_EXECUTION_RULES}\n\n` +
+    `${supervisorDeliveryBoundary(goalStage)}\n\n` +
     `${EVIDENCE_INTEGRITY_RULES}\n\n` +
     `Task: ${task.slice(0, 800)}\n\nCumulative agent evidence:\n${result.slice(0, 8_000)}`;
   const out = await plainPrompt(bin, env, prompt, "terra", 90_000);
@@ -1344,6 +1347,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           jobEnv,
           job.task,
           cumulativeWorkEvidence(job.checkpoint, result),
+          job.goalStage,
         ).catch(() => null);
         if (await stopIfLeaseLost(`Supervisor review interrupted.\n\n${continuationCheckpoint}`, result, branch)) return;
         if (!verify) {

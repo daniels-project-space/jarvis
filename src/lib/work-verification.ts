@@ -13,6 +13,12 @@ export const EVIDENCE_INTEGRITY_RULES = [
   "Long-lived service authentication must be renewable or have an evidenced rotation path; a static expiring token is not launch-ready merely because it works today.",
 ].join(" ");
 
+export function supervisorDeliveryBoundary(goalStage: unknown): string {
+  return goalStage === "building" || goalStage === "refining"
+    ? "This is one shared-branch Goal Mode implementation session. Judge its scoped definition of done. Do not return concerns solely because the branch is not merged/deployed or because goal-level provider validation remains: the final Release Proof, Sol validator, and trusted delivery controller own those later boundaries."
+    : "";
+}
+
 /**
  * A continuation is one logical workstream, not a brand-new task. Preserve the
  * prior checkpoint when the supervisor reviews a repair pass so a concise

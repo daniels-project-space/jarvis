@@ -3,10 +3,17 @@ import {
   cumulativeWorkEvidence,
   EVIDENCE_INTEGRITY_RULES,
   isPermittedReadonlyAccessGap,
+  supervisorDeliveryBoundary,
   WORK_VERIFICATION_EVIDENCE_MAX_CHARS,
 } from "./work-verification";
 
 describe("supervisor verification boundaries", () => {
+  it("does not demand controller delivery from an implementation workstream", () => {
+    expect(supervisorDeliveryBoundary("building")).toContain("trusted delivery controller");
+    expect(supervisorDeliveryBoundary("refining")).toContain("scoped definition of done");
+    expect(supervisorDeliveryBoundary("validating")).toBe("");
+  });
+
   it("rejects assertions and compile checks as substitutes for provider lineage", () => {
     expect(EVIDENCE_INTEGRITY_RULES).toContain("caller-supplied field");
     expect(EVIDENCE_INTEGRITY_RULES).toContain("persisted lineage");
