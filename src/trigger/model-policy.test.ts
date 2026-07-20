@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  CODEX_REVIEW_WORKING_DIRECTORY,
   CODEX_MODEL_POLICY,
   codexConversationExecPrefix,
   codexExecPrefix,
   codexModelFor,
+  codexReviewExecPrefix,
   normalizeReasoningEffort,
   pickConversationTier,
 } from "./model-policy";
@@ -52,6 +54,23 @@ describe("subscription model policy", () => {
     expect(args).toContain('model_reasoning_effort="high"');
     expect(args).toContain("gpt-5.6-terra");
     expect(normalizeReasoningEffort("invented", "medium")).toBe("medium");
+  });
+
+  it("launches receipt-only supervisor review from /app without mutation or tool authority", () => {
+    const args = codexReviewExecPrefix("terra");
+    expect(CODEX_REVIEW_WORKING_DIRECTORY).toBe("/app");
+    expect(args).toContain("read-only");
+    expect(args).toContain("--ephemeral");
+    expect(args).toContain("--ignore-user-config");
+    expect(args).toContain("--ignore-rules");
+    expect(args).toContain('shell_environment_policy.inherit="none"');
+    expect(args).toContain('web_search="disabled"');
+    expect(args).not.toContain("--search");
+    expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    for (const feature of ["shell_tool", "unified_exec", "apps", "plugins", "hooks", "browser_use", "computer_use", "multi_agent"]) {
+      expect(args).toContain(feature);
+      expect(args[args.indexOf(feature) - 1]).toBe("--disable");
+    }
   });
 
   it("uses the lean subscription runtime only for foreground conversation", () => {
