@@ -155,7 +155,7 @@ export function TodosView({ value }: { value: string }) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "todo_done", args: { match: text.slice(0, 60) } }),
-    });
+    }).catch(() => {});
   };
   return (
     <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-4">
@@ -208,7 +208,7 @@ export function Briefing2View({ value }: { value: string }) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "todo_done", args: { match: text.slice(0, 60) } }),
-    });
+    }).catch(() => {});
   };
   const toPct = (hhmm: string) => {
     const [h, m] = String(hhmm).split(":").map(Number);
@@ -454,7 +454,7 @@ export function FeedView({ value }: { value: string }) {
   const [phase, setPhase] = useState<"hero" | "grid">("hero");
   const [idx, setIdx] = useState(0);
   const [page, setPage] = useState(0);
-  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
+  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args).catch(() => undefined);
 
   // fresh content = fresh presentation (state survives panel swaps otherwise:
   // a second search used to open on a stale page/grid)
@@ -632,6 +632,8 @@ export function DocView({ value }: { value: string }) {
     try {
       await clientMutation("creations:update", { id: creationId, data: draft });
       setEditing(false);
+    } catch {
+      // Keep the unsaved draft open while the client reconnects.
     } finally {
       setSaving(false);
     }
@@ -1275,7 +1277,7 @@ export function VideoListView({ value }: { value: string }) {
   } catch {
     /* noop */
   }
-  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
+  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args).catch(() => undefined);
   if (!w) return <PanelUnavailable label="video list" />;
   return (
     <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3">
@@ -1918,7 +1920,7 @@ export function CreationsView({ value }: { value: string }) {
   const [editing, setEditing] = useState<{ id: string; title: string; folder: string } | null>(null);
   const queriedRows = useJarvisQuery(api.creations.list, { limit: 100 }) as CreationRow[] | undefined;
   const rows = useMemo(() => queriedRows ?? [], [queriedRows]);
-  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
+  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args).catch(() => undefined);
 
   const folders = useMemo(() => {
     const counts = new Map<string, number>();
@@ -2056,7 +2058,7 @@ export function CreationsView({ value }: { value: string }) {
                 id: next.id,
                 title: next.title.trim() || "Untitled",
                 folder: next.folder.trim() || "Library / General",
-              }).then(() => setEditing(null));
+              }).then(() => setEditing(null)).catch(() => {});
             }}
           >
             <div className="hud-label !text-cyan">organize creation</div>
