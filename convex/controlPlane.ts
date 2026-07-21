@@ -8,6 +8,7 @@ function defined<T extends Record<string, unknown>>(value: T): T {
 
 export function projectJobRuntime(job: any) {
   const createdAt = Number(job.createdAt ?? job._creationTime ?? Date.now());
+  const active = ["running", "dispatching", "pending", "awaiting_approval", "paused", "stalled", "needs_input", "steering"].includes(String(job.status));
   return defined({
     jobId: job._id,
     // The overlay needs enough context to identify the task, not the full
@@ -34,22 +35,46 @@ export function projectJobRuntime(job: any) {
     attempt: Math.max(1, Number(job.attempt ?? 1)),
     maxAttempts: Math.max(1, Number(job.maxAttempts ?? 12)),
     heartbeatAt: Number(job.heartbeatAt ?? job.startedAt ?? createdAt),
+    progressAt: Number(job.progressAt ?? job.startedAt ?? createdAt),
+    stallCount: Math.max(0, Number(job.stallCount ?? 0)),
+    stalledAt: typeof job.stalledAt === "number" ? job.stalledAt : undefined,
+    stallReason: typeof job.stallReason === "string" ? job.stallReason.slice(0, 400) : undefined,
+    steerRevision: Math.max(0, Number(job.steerRevision ?? 0)),
+    active,
     nextRunAt: typeof job.nextRunAt === "number" ? job.nextRunAt : undefined,
     dispatchId: typeof job.dispatchId === "string" ? job.dispatchId.slice(0, 180) : undefined,
     dispatchLeaseUntil: typeof job.dispatchLeaseUntil === "number" ? job.dispatchLeaseUntil : undefined,
     workerRunId: typeof job.workerRunId === "string" ? job.workerRunId.slice(0, 120) : undefined,
     workerRuntime: typeof job.workerRuntime === "string" ? job.workerRuntime.slice(0, 40) : undefined,
+    providerRunState: typeof job.providerRunState === "string" ? job.providerRunState.slice(0, 40) : undefined,
+    providerObservedAt: typeof job.providerObservedAt === "number" ? job.providerObservedAt : undefined,
     readonly: typeof job.readonly === "boolean" ? job.readonly : undefined,
     parentJobId: typeof job.parentJobId === "string" ? job.parentJobId.slice(0, 120) : undefined,
     dependsOn: Array.isArray(job.dependsOn) ? job.dependsOn.slice(0, 16).map((id: unknown) => String(id).slice(0, 120)) : undefined,
+    planParentMissionId: job.planParentMissionId,
+    planDigest: typeof job.planDigest === "string" ? job.planDigest.slice(0, 64) : undefined,
+    planGeneration: typeof job.planGeneration === "number" ? job.planGeneration : undefined,
+    planNodeId: typeof job.planNodeId === "string" ? job.planNodeId.slice(0, 80) : undefined,
     goalStage: typeof job.goalStage === "string" ? job.goalStage.slice(0, 40) : undefined,
     goalWorkstreamId: typeof job.goalWorkstreamId === "string" ? job.goalWorkstreamId.slice(0, 120) : undefined,
     goalWave: typeof job.goalWave === "number" ? job.goalWave : undefined,
+    sourceBranch: typeof job.sourceBranch === "string" ? job.sourceBranch.slice(0, 240) : undefined,
+    sourceHeadSha: typeof job.sourceHeadSha === "string" ? job.sourceHeadSha.slice(0, 80) : undefined,
+    integrationBranch: typeof job.integrationBranch === "string" ? job.integrationBranch.slice(0, 240) : undefined,
+    workerBranch: typeof job.workerBranch === "string" ? job.workerBranch.slice(0, 240) : undefined,
+    workspaceLineage: typeof job.workspaceLineage === "string" ? job.workspaceLineage.slice(0, 240) : undefined,
+    retryLineage: typeof job.retryLineage === "string" ? job.retryLineage.slice(0, 240) : undefined,
+    integrationAttemptId: job.integrationAttemptId,
+    integrationState: typeof job.integrationState === "string" ? job.integrationState.slice(0, 40) : undefined,
+    evidenceSummary: typeof job.evidenceSummary === "string" ? job.evidenceSummary.slice(0, 500) : undefined,
     branch: typeof job.branch === "string" ? job.branch.slice(0, 240) : undefined,
     pullRequestUrl: typeof job.pullRequestUrl === "string" ? job.pullRequestUrl.slice(0, 500) : undefined,
     deliveryMode: typeof job.deliveryMode === "string" ? job.deliveryMode.slice(0, 32) : undefined,
     deliveryStatus: typeof job.deliveryStatus === "string" ? job.deliveryStatus.slice(0, 32) : undefined,
     mergeCommitSha: typeof job.mergeCommitSha === "string" ? job.mergeCommitSha.slice(0, 80) : undefined,
+    deliveryLeaseVersion: Math.max(0, Number(job.deliveryLeaseVersion ?? 0)),
+    deliveryGeneration: Math.max(0, Number(job.deliveryGeneration ?? 0)),
+    deliveryRunId: job.deliveryRunId,
     startedAt: typeof job.startedAt === "number" ? job.startedAt : undefined,
     completedAt: typeof job.completedAt === "number" ? job.completedAt : undefined,
     createdAt,
@@ -83,6 +108,15 @@ export function projectMissionRuntime(mission: any) {
     maxBuildSessions: Math.max(0, Number(mission.maxBuildSessions ?? 0)),
     planningJobId: typeof mission.planningJobId === "string" ? mission.planningJobId.slice(0, 120) : undefined,
     validatorJobId: typeof mission.validatorJobId === "string" ? mission.validatorJobId.slice(0, 120) : undefined,
+    planDigest: typeof mission.planDigest === "string" ? mission.planDigest.slice(0, 64) : undefined,
+    planGeneration: typeof mission.planGeneration === "number" ? mission.planGeneration : undefined,
+    planNodeCount: typeof mission.planNodeCount === "number" ? mission.planNodeCount : undefined,
+    sourceBranch: typeof mission.sourceBranch === "string" ? mission.sourceBranch.slice(0, 240) : undefined,
+    integrationBranch: typeof mission.integrationBranch === "string" ? mission.integrationBranch.slice(0, 240) : undefined,
+    integrationHeadSha: typeof mission.integrationHeadSha === "string" ? mission.integrationHeadSha.slice(0, 80) : undefined,
+    integrationGeneration: Math.max(0, Number(mission.integrationGeneration ?? 0)),
+    activeIntegrationAttemptId: mission.activeIntegrationAttemptId,
+    integrationLeaseUntil: typeof mission.integrationLeaseUntil === "number" ? mission.integrationLeaseUntil : undefined,
     advanceLeaseUntil: typeof mission.advanceLeaseUntil === "number" ? mission.advanceLeaseUntil : undefined,
     pausedPhase: typeof mission.pausedPhase === "string" ? mission.pausedPhase.slice(0, 80) : undefined,
     failureReason: typeof mission.failureReason === "string" ? mission.failureReason.slice(0, 600) : undefined,
@@ -129,7 +163,7 @@ export async function upsertJobRuntime(ctx: any, job: any) {
   else await ctx.db.insert("jobRuntime", projected);
 }
 
-const LIVE_JOB_ACTIVITY_FIELDS = ["stage", "percent", "progress", "heartbeatAt", "updatedAt"] as const;
+const LIVE_JOB_ACTIVITY_FIELDS = ["stage", "percent", "progress", "heartbeatAt", "progressAt", "providerRunState", "providerObservedAt", "updatedAt"] as const;
 
 // Progress heartbeats intentionally do not rewrite the durable job. When a
 // later authority transition patches an unrelated field (for example a pull

@@ -116,6 +116,23 @@ describe("Goal Mode contracts", () => {
     })}`)).toThrow(/cycle/);
   });
 
+  it.each([
+    ["duplicate ids", [
+      { id: "same", task: "Implement the first substantial bounded work package." },
+      { id: "same", task: "Implement the second substantial bounded work package." },
+    ], /duplicate workstream id/],
+    ["missing dependency", [
+      { id: "a", task: "Implement the first substantial bounded work package.", dependsOn: ["missing"] },
+      { id: "b", task: "Implement the second substantial bounded work package." },
+    ], /unknown workstream/],
+    ["duplicate edge", [
+      { id: "a", task: "Implement the first substantial bounded work package." },
+      { id: "b", task: "Implement the second substantial bounded work package.", dependsOn: ["a", "a"] },
+    ], /duplicate dependency/],
+  ])("rejects %s before dispatch", (_label, workstreams, expected) => {
+    expect(() => parseGoalPlan(`${GOAL_PLAN_MARKER}${JSON.stringify({ workstreams })}`)).toThrow(expected as RegExp);
+  });
+
   it("requires evidence for a pass and repairs for refine", () => {
     expect(() => parseGoalValidation(`${GOAL_VALIDATION_MARKER}{"verdict":"pass","evidence":["build passed"]}`))
       .toThrow(/two concrete/);

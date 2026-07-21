@@ -1,6 +1,8 @@
 import { PROJECT_REGISTRY, projectProviderBoundary } from "./project-registry";
 import { EVIDENCE_INTEGRITY_RULES } from "./work-verification";
 import { SAFE_SANDBOX_EXECUTION_RULES } from "./work-safety";
+import { canonicalizeRepository } from "./workflow-contract";
+import { validateWorkDag } from "./workspace-protocol";
 
 export const GOAL_PLAN_MARKER = "GOAL_PLAN_JSON:";
 export const GOAL_VALIDATION_MARKER = "GOAL_VALIDATION_JSON:";
@@ -300,6 +302,7 @@ function parseMarkedObject(text: string, marker: string): Record<string, unknown
 }
 
 function topologicalWorkstreams(workstreams: GoalWorkstream[]): GoalWorkstream[] {
+  validateWorkDag(workstreams, 8);
   const byId = new Map(workstreams.map((stream) => [stream.id, stream]));
   const emitted = new Set<string>();
   const ordered: GoalWorkstream[] = [];
@@ -328,8 +331,8 @@ export function parseGoalPlan(text: string, maxBuildSessions = 6): GoalPlan {
   const allowedAgents = new Set(["paul", "atlas", "iris", "maya", "sentry"]);
   const streams: GoalWorkstream[] = rawStreams.map((raw, index) => {
     const row = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
-    let id = slug(row.id, `work-${index + 1}`);
-    while (used.has(id)) id = `${id}-${index + 1}`;
+    const id = slug(row.id, `work-${index + 1}`);
+    if (used.has(id)) throw new Error(`Goal plan contains duplicate workstream id ${id}`);
     used.add(id);
     const task = clampText(row.task, 5_000);
     if (task.length < 20) throw new Error(`Goal plan workstream ${id} needs a concrete task`);
@@ -340,7 +343,13 @@ export function parseGoalPlan(text: string, maxBuildSessions = 6): GoalPlan {
       label: clampText(row.label, 80) || `Workstream ${index + 1}`,
       task,
       agentId,
-      repo: clampText(row.repo, 160) || undefined,
+      repo: (() => {
+        const supplied = clampText(row.repo, 160);
+        if (!supplied) return undefined;
+        const canonical = canonicalizeRepository(supplied, { allowShortName: true });
+        if (!canonical) throw new Error(`Goal plan workstream ${id} has an invalid repository scope`);
+        return canonical;
+      })(),
       readonly: row.readonly === true,
       dependsOn: strings(row.dependsOn ?? row.depends_on, 8, 48).map((dependency) => slug(dependency, "")),
       acceptanceCriteria: strings(row.acceptanceCriteria ?? row.acceptance_criteria, 8, 500).length
@@ -376,7 +385,13 @@ export function parseGoalPlan(text: string, maxBuildSessions = 6): GoalPlan {
   return {
     summary: clampText(input.summary, 1_200) || "A staged plan for the requested outcome.",
     route: normalizedRoute,
-    primaryRepo: clampText(input.primaryRepo ?? input.primary_repo, 160) || undefined,
+    primaryRepo: (() => {
+      const supplied = clampText(input.primaryRepo ?? input.primary_repo, 160);
+      if (!supplied) return undefined;
+      const canonical = canonicalizeRepository(supplied, { allowShortName: true });
+      if (!canonical) throw new Error("Goal plan has an invalid primary repository scope");
+      return canonical;
+    })(),
     assumptions: strings(input.assumptions, 8, 500),
     workstreams: topologicalWorkstreams(streams),
     validation: {
@@ -440,7 +455,7 @@ export function plannerTask(goal: string, route: GoalRoute, acceptanceCriteria: 
     `Why: ${route.reason}`,
     `Reuse boundary: ${route.infrastructureContext}`,
     acceptanceCriteria.length ? `Daniel's acceptance criteria:\n${acceptanceCriteria.map((item) => `- ${item}`).join("\n")}` : "",
-    `Inspect the current repository, AGENTS.md, callers, live manifests and relevant primary-source docs. Find existing skills, templates and infrastructure before proposing new code. Break the outcome into 2-${maxBuildSessions} bounded sessions. Use dependencies where later work must build on earlier work; do not parallelize writable sessions in one repository. Agents do not merge or deploy directly: the delivery controller automatically ships the validated goal branch. Actions with public, third-party communication, financial, credential, booking, or destructive consequences remain separately approval-gated.`,
+    `Inspect the current repository, AGENTS.md, callers, live manifests and relevant primary-source docs. Find existing skills, templates and infrastructure before proposing new code. Break the outcome into 2-${maxBuildSessions} bounded sessions. Express only real ordering requirements as dependsOn edges. Independent writable sessions may run concurrently because every work item receives its own immutable worker branch and sandbox; specialists never share or integrate branches. Agents do not merge or deploy directly: the fenced delivery controller serializes reviewed receipts into the mission integration branch. Actions with public, third-party communication, financial, credential, booking, or destructive consequences remain separately approval-gated.`,
     "End with exactly one compact JSON object after GOAL_PLAN_JSON:. It must use this shape:",
     '{"summary":"...","route":"app_factory|youtube_studio|existing_project|cloud_new|general","primaryRepo":"owner/repo or empty","assumptions":["..."],"workstreams":[{"id":"stable-id","label":"short label","task":"self-contained task","agentId":"paul|atlas|iris|maya|sentry","repo":"owner/repo or empty","readonly":false,"dependsOn":["earlier-id"],"acceptanceCriteria":["observable evidence"],"mcp":["playwright|context7"]}],"validation":{"criteria":["goal-level truth"],"tests":["deep test"],"liveChecks":["deployed/provider check"]},"factory":{"name":"required only for app_factory","slug":"...","brief":"full build brief"}}',
     "The JSON is a machine contract. Keep the whole response and JSON concise enough to fit in 7,500 characters.",

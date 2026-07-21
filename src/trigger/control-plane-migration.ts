@@ -5,6 +5,11 @@ export type ControlPlaneMigrationStep = {
   complete?: boolean;
 };
 
+/** v1 completion is intentionally irrelevant to the independent v2 cursor. */
+export function projectionReadMode(v2?: { jobsComplete?: boolean } | null) {
+  return v2?.jobsComplete ? "indexed" : "compatibility";
+}
+
 /**
  * Drain many small Convex transactions without ever putting two pagination
  * calls in one transaction. The Trigger supervisor remains time/work bounded;

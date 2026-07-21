@@ -170,6 +170,7 @@ export function isolateSubscriptionEnv(
   base: NodeJS.ProcessEnv,
   scope: string,
   root?: string,
+  copiedFiles: readonly ("auth.json" | "config.toml" | "AGENTS.md")[] = ["auth.json", "config.toml", "AGENTS.md"],
 ): NodeJS.ProcessEnv {
   const sourceHome = String(base.CODEX_HOME ?? "");
   const safeScope = scope.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120) || "agent";
@@ -182,11 +183,25 @@ export function isolateSubscriptionEnv(
   // Authentication and Daniel's scoped briefing are read-only inputs. System
   // skills are intentionally not copied: every concurrent Codex process gets
   // its own install directory, removing the shared `skills/` startup race.
-  for (const file of ["auth.json", "config.toml", "AGENTS.md"]) {
+  for (const file of copiedFiles) {
     const source = join(sourceHome, file);
     if (sourceHome && existsSync(source)) copyFileSync(source, join(isolatedHome, file));
   }
   const authPath = join(isolatedHome, "auth.json");
   if (existsSync(authPath)) chmodSync(authPath, 0o600);
-  return { ...base, CODEX_HOME: isolatedHome };
+  // This is the final boundary before spawn(). Do not re-expand the
+  // controller environment: it carries receipt, vault, Convex, Trigger and
+  // GitHub authority that a Codex specialist must never inherit.
+  return scopedSubscriptionEnv({ ...base, CODEX_HOME: isolatedHome }, "codex");
+}
+
+export function isolateCloudSubscriptionEnv(
+  base: NodeJS.ProcessEnv,
+  scope: string,
+  root?: string,
+): NodeJS.ProcessEnv {
+  // Cloud threads receive their entire executable policy through thread/start.
+  // Copy only subscription auth so user config cannot inject a legacy sandbox,
+  // MCP server, plugin, hook, rule, or instruction source into the specialist.
+  return isolateSubscriptionEnv(base, scope, root, ["auth.json"]);
 }

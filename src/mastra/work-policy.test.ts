@@ -1,7 +1,20 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { goalWorkApprovalPolicy, workApprovalPolicy } from "../../convex/workPolicy";
 import { plannerTask, routeGoal, validatorTask } from "../lib/goal-mode";
 import { classifyWorkSafety, SAFE_SANDBOX_EXECUTION_RULES } from "../lib/work-safety";
+import {
+  INTEGRATION_FINAL_BARRIER_APPROVAL_TASK,
+  WORKSPACE_ISOLATION_APPROVAL_TASK,
+} from "./fixtures/work-policy-regressions";
+
+const CLOUD_SANDBOX_APPROVAL_TASK = readFileSync(
+  new URL("./fixtures/cloud-sandbox-approval-task.txt", import.meta.url),
+  "utf8",
+);
+const CLOUD_SANDBOX_APPROVAL_TASK_SHA256 =
+  "d48d26ff68ae0789b70fbc9520aefe45a3de204bfef79fef95fe3c4ef57f7130";
 
 const CHAT_LATENCY_JOB_REGRESSION = {
   id: "js73f7b1rnjfqap286193t0hcs8awpq3",
@@ -33,6 +46,12 @@ describe("server-side work approval policy", () => {
     ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
     expect(
       workApprovalPolicy({
+        task: "Merge the verified fix and deploy it",
+        repo: "https://github.com/daniels-project-space/jarvis.git",
+      }),
+    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    expect(
+      workApprovalPolicy({
         task: "Fix the parser and run its regression suite",
         repo: "jarvis",
         approvalRequired: true,
@@ -44,9 +63,18 @@ describe("server-side work approval policy", () => {
   it("gates messaging, money, booking and destructive actions", () => {
     for (const task of [
       "Reply to the tenant",
+      "Send the rent arrears notice to the customer",
+      "Post the findings publicly",
+      "Publish the campaign content publicly",
+      "Advertise the rental listing",
+      "Publish the package to npm",
+      "Publish the app in the store",
       "Transfer the supplier payment",
+      "Trade the selected shares",
       "Book the selected hotel",
+      "Change the credential",
       "Delete the production records",
+      "Deploy the provider change to production",
     ]) {
       expect(workApprovalPolicy({ task }).required).toBe(true);
     }
@@ -201,6 +229,180 @@ describe("server-side work approval policy", () => {
         repo: "jarvis",
       }).required,
     ).toBe(true);
+  });
+
+  it("keeps the full repository approval regressions autonomous in standalone and Goal Mode", () => {
+    expect(WORKSPACE_ISOLATION_APPROVAL_TASK.split("\n")[10]).toContain("publish the reviewed Git worker ref");
+    expect(INTEGRATION_FINAL_BARRIER_APPROVAL_TASK.split("\n")[8]).toBe(
+      "The deterministic final integration ref already equals the prepared synthetic head, but integrateReviewedWorker immediately prepares/observes only update_ref. A prior stage_blob POST may have applied and then lost its durable observe callback. Jarvis therefore declares integrated and releases FIFO while a prepared cold effect remains unobserved. Fix the root state machine, not the external script.",
+    );
+    expect(Buffer.byteLength(CLOUD_SANDBOX_APPROVAL_TASK, "utf8")).toBe(7_876);
+    expect(createHash("sha256").update(CLOUD_SANDBOX_APPROVAL_TASK).digest("hex")).toBe(
+      CLOUD_SANDBOX_APPROVAL_TASK_SHA256,
+    );
+    for (const task of [
+      WORKSPACE_ISOLATION_APPROVAL_TASK,
+      INTEGRATION_FINAL_BARRIER_APPROVAL_TASK,
+      CLOUD_SANDBOX_APPROVAL_TASK,
+    ]) {
+      const standalone = workApprovalPolicy({
+        task,
+        repo: "daniels-project-space/jarvis",
+        risk: "consequential",
+        approvalRequired: true,
+      });
+      const goalMode = goalWorkApprovalPolicy({
+        task,
+        repo: "daniels-project-space/jarvis",
+        risk: "consequential",
+        approvalRequired: true,
+        goalStage: "building",
+      });
+      expect(standalone).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+      expect(goalMode).toEqual(standalone);
+    }
+  });
+
+  it("allows only precise owned-repository Git-ref publication grammar", () => {
+    for (const task of [
+      "Only the trusted delivery controller may publish the reviewed Git worker ref after verification.",
+      "Publish the reviewed worker ref through the controller repository delivery.",
+      "The controller may `publish` the `reviewed Git worker ref` after verification.",
+      "The controller may publish only on the verified Git integration ref.",
+      "The controller can publish the Git branch after review.",
+      "The controller can publish the Git ref after review.",
+    ]) {
+      expect(classifyWorkSafety(task, { repo: "daniels-project-space/jarvis" }), task).toEqual({
+        approvalRequired: false,
+        boundary: "software_delivery",
+      });
+    }
+
+    expect(classifyWorkSafety(
+      "Publish the reviewed Git worker ref.",
+      { repo: "someone-else/jarvis" },
+    ).approvalRequired).toBe(true);
+
+    for (const task of [
+      "Publish the findings from the reviewed Git worker ref publicly.",
+      "Publish the package from the reviewed worker ref to npm.",
+      "Publish the reviewed worker ref and post the findings publicly.",
+      "The trusted controller may publish the reviewed worker ref and email the customer.",
+      "Publish public content after reviewing the Git branch.",
+      "Publish the reviewed Git worker ref to the public.",
+      "Publish the reviewed Git worker ref externally.",
+      "Publish the reviewed branch.",
+    ]) {
+      expect(workApprovalPolicy({ task, repo: "daniels-project-space/jarvis" }).required, task).toBe(true);
+    }
+  });
+
+  it("recognizes uppercase POST only in unambiguous HTTP/provider noun grammar", () => {
+    for (const task of [
+      "Reconcile the already-applied stage_blob POST whose callback was lost.",
+      "Reconcile the already-applied `stage_blob POST` whose callback was lost.",
+      "Record the stage_tree POST response before recovery.",
+      "Inspect the HTTP POST request idempotency key.",
+      "Inspect the `HTTP POST request` idempotency key.",
+      "Verify POST /webhook returns 204.",
+      "Document `POST /webhook` in the API contract.",
+      "Reconcile the response-lost POST before retrying the provider effect.",
+      "Persist provider-method POST evidence with the effect receipt.",
+      "A prior stage_blob POST may have applied and then lost its durable observe callback.",
+      "A prior stage_blob POST might have failed before the callback.",
+      "A prior stage_blob POST could have returned without a durable observation.",
+      "A prior stage_blob POST can have applied before recovery.",
+      "A prior stage_blob POST should have failed with a receipt.",
+      "A prior stage_blob POST would have returned a provider result.",
+      "A prior stage_blob POST will have applied by reconciliation.",
+      "A prior stage_blob POST must have returned before observation.",
+    ]) {
+      expect(classifyWorkSafety(task), task).toEqual({ approvalRequired: false, boundary: "internal" });
+    }
+
+    for (const task of [
+      "post the findings publicly",
+      "Post the findings publicly",
+      "POST the findings publicly",
+      "Use stage_blob POST and post the result publicly.",
+      "Inspect the HTTP POST request and post an advert.",
+      "stage_blob POST the findings publicly.",
+      "Post a social update about POST /webhook.",
+    ]) {
+      expect(workApprovalPolicy({ task, repo: "daniels-project-space/jarvis" }).required, task).toBe(true);
+    }
+  });
+
+  it("enforces the exact cloud-sandbox acceptance matrix through every executable policy path", () => {
+    const ownedRepo = "daniels-project-space/jarvis";
+    const matrix = [
+      { task: CLOUD_SANDBOX_APPROVAL_TASK, required: false },
+      {
+        task: "Represent auto-stop/archive/delete, snapshot identity, and persistent volumes as sandbox lifecycle configuration.",
+        required: false,
+      },
+      { task: "Email the verified user.", required: true },
+      { task: "Delete, snapshot, and export the archived customer records.", required: true },
+      { task: "Configure auto-stop/archive/delete customer records.", required: true },
+      { task: "Configure auto-stop/archive/delete archived customer data.", required: true },
+      { task: "Pay the provider.", required: true },
+      { task: "Message the queue owner.", required: true },
+      { task: "Publish a reviewed report.", required: true },
+      {
+        task: "Only the trusted controller may publish a reviewed ref for root review and email the customer.",
+        required: true,
+      },
+      {
+        task: "Only the trusted controller may publish a reviewed ref for root review.",
+        repo: "someone-else/jarvis",
+        required: true,
+      },
+      {
+        task: "Publish the public report, email the customer, pay the provider, delete production records, and deploy the live provider configuration.",
+        required: true,
+      },
+    ] as const;
+
+    for (const entry of matrix) {
+      const repo = "repo" in entry ? entry.repo : ownedRepo;
+      expect(classifyWorkSafety(entry.task, { repo }).approvalRequired, `classifier: ${entry.task}`).toBe(entry.required);
+      expect(workApprovalPolicy({ task: entry.task, repo }).required, `standalone: ${entry.task}`).toBe(entry.required);
+      for (const goalStage of ["building", "refining"] as const) {
+        expect(
+          goalWorkApprovalPolicy({ task: entry.task, repo, goalStage }).required,
+          `${goalStage}: ${entry.task}`,
+        ).toBe(entry.required);
+      }
+    }
+  });
+
+  it("keeps neighboring cloud compounds narrow", () => {
+    for (const task of [
+      "Keep access bound to the email-verified identity state.",
+      "Represent auto-stop/archive/delete as sandbox lifecycle policy.",
+      "Contract-test bounded resources and TTL, auto-stop/archive/delete, snapshot identity, persistent volume isolation.",
+      "Model pay-as-you-go billing configuration.",
+      "Keep delivery behind the message-queue boundary.",
+      "Only the trusted controller may publish a reviewed ref for root review.",
+    ]) {
+      expect(classifyWorkSafety(task, { repo: "daniels-project-space/jarvis" }).approvalRequired, task).toBe(false);
+    }
+
+    for (const task of [
+      "Delete the archived customer records.",
+      "Publish a reviewed ref for root review.",
+      "Configure stop/archive/delete, snapshot identity for customer records.",
+      "Configure auto-stop/archive/delete, customer snapshot identity.",
+      "Configure auto-stop/archive/delete, snapshot customer identity.",
+      "Configure auto-stop/archive/delete, snapshot identity for customer records.",
+      "Configure auto-stop/archive/delete, snapshot identity customer records.",
+      "Configure auto-stop/archive/delete, snapshot identity, then delete customer records.",
+      "Model pay-as-you-go billing and pay the provider.",
+      "Inspect the message-queue and message the queue owner.",
+      "Represent auto-stop/archive/delete, then publish the findings publicly.",
+    ]) {
+      expect(workApprovalPolicy({ task, repo: "daniels-project-space/jarvis" }).required, task).toBe(true);
+    }
   });
 
   it("keeps technical temporal prefixes and communication nouns internal", () => {

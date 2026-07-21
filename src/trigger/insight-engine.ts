@@ -69,6 +69,7 @@ export const insightEngine = schedules.task({
       woken: shouldWake,
       recovered: reaped?.requeued?.length ?? 0,
       abandoned: reaped?.abandoned?.length ?? 0,
+      stalled: reaped?.stalled?.length ?? 0,
     };
   },
 });

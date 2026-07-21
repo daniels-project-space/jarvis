@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { redactSensitiveText } from "../lib/secret-redaction";
 import type { GitCommandResult, GitCommandRunner } from "../lib/git-delivery";
 
@@ -49,8 +49,15 @@ export type GitReviewBinding = Readonly<{
 }>;
 
 export type GitReviewEnvelope = Readonly<{
+  /** Public selector only. Key material and rotation metadata never leave the controller. */
+  keyId: string;
   receipt: GitReviewReceipt;
   signature: string;
+}>;
+
+export type GitReviewReceiptKey = Readonly<{
+  keyId: string;
+  secret: Uint8Array | string;
 }>;
 
 type BuildReceiptInput = {
@@ -236,11 +243,29 @@ export async function buildGitReviewReceipt(input: BuildReceiptInput): Promise<B
   }
 }
 
-export function createGitReviewReceiptAuthority(secret: Uint8Array = randomBytes(32)) {
-  const key = Buffer.from(secret);
-  if (key.length < 32) throw new Error("Git review receipt authority requires at least 32 bytes");
+/**
+ * The authority is controller configuration, never per-process randomness.
+ * Callers must fail closed when the Trigger-only secret is unavailable; a
+ * random key would make a resumed delivery unverifiable.
+ */
+export function createGitReviewReceiptKeyring(
+  current: GitReviewReceiptKey,
+  previous: readonly GitReviewReceiptKey[] = [],
+) {
+  const keyIdPattern = /^[a-zA-Z0-9._-]{1,64}$/;
+  const entries = [current, ...previous];
+  if (!keyIdPattern.test(current.keyId)) throw new Error("Git review receipt key id is invalid");
+  if (new Set(entries.map((entry) => entry.keyId)).size !== entries.length) {
+    throw new Error("Git review receipt key ids must be unique");
+  }
+  const keys = new Map(entries.map((entry) => {
+    if (!keyIdPattern.test(entry.keyId)) throw new Error("Git review receipt key id is invalid");
+    const key = Buffer.from(entry.secret);
+    if (key.length < 32) throw new Error("Git review receipt authority requires at least 32 bytes");
+    return [entry.keyId, key] as const;
+  }));
 
-  const sign = (receipt: GitReviewReceipt) => createHmac("sha256", key).update(receiptJson(receipt)).digest("hex");
+  const sign = (receipt: GitReviewReceipt, key: Buffer) => createHmac("sha256", key).update(receiptJson(receipt)).digest("hex");
   const matchesBinding = (receipt: GitReviewReceipt, expected: GitReviewBinding) =>
     receipt.jobId === expected.jobId
     && receipt.attempt === expected.attempt
@@ -253,21 +278,30 @@ export function createGitReviewReceiptAuthority(secret: Uint8Array = randomBytes
   return {
     issue(receipt: GitReviewReceipt): GitReviewEnvelope {
       const immutable = deepFreeze(JSON.parse(receiptJson(receipt)) as GitReviewReceipt);
-      return deepFreeze({ receipt: immutable, signature: sign(immutable) });
+      return deepFreeze({ keyId: current.keyId, receipt: immutable, signature: sign(immutable, keys.get(current.keyId)!) });
     },
     verify(envelope: GitReviewEnvelope, expected: GitReviewBinding): boolean {
       if (!matchesBinding(envelope.receipt, expected) || !/^[0-9a-f]{64}$/.test(envelope.signature)) return false;
+      const key = keys.get(envelope.keyId);
+      // Unknown and retired key ids are indistinguishable and fail closed.
+      if (!key) return false;
       const actual = Buffer.from(envelope.signature, "hex");
-      const wanted = Buffer.from(sign(envelope.receipt), "hex");
+      const wanted = Buffer.from(sign(envelope.receipt, key), "hex");
       return actual.length === wanted.length && timingSafeEqual(actual, wanted);
     },
     render(envelope: GitReviewEnvelope, expected: GitReviewBinding): string {
       if (!this.verify(envelope, expected)) throw new Error("Git review receipt integrity or job binding failed");
       return JSON.stringify({
         integrity: "controller-hmac-sha256-verified",
+        keyId: envelope.keyId,
         receipt: envelope.receipt,
         signature: envelope.signature,
       });
     },
   };
+}
+
+/** Compatibility constructor for one current signer; new configuration uses an explicit keyring. */
+export function createGitReviewReceiptAuthority(secret: Uint8Array | string, keyId = "legacy-v1") {
+  return createGitReviewReceiptKeyring({ keyId, secret });
 }

@@ -49,13 +49,15 @@ export const list = query({
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
     const limit = Math.min(a.limit ?? 20, 60);
-    const rows = a.status
-      ? await ctx.db
-          .query("attentionItems")
-          .withIndex("by_status", (q: any) => q.eq("status", a.status))
-          .order("desc")
-          .take(limit)
-      : await ctx.db.query("attentionItems").withIndex("by_updatedAt").order("desc").take(limit);
+    // The default is the active queue. Historical/resolved rows require an
+    // explicit status so routine health and activity surfaces cannot revive
+    // resolved work merely because it was updated recently.
+    const status = a.status ?? "open";
+    const rows = await ctx.db
+      .query("attentionItems")
+      .withIndex("by_status", (q: any) => q.eq("status", status))
+      .order("desc")
+      .take(limit);
     return rows.sort(
       (x: any, y: any) => y.impact * y.urgency * y.confidence - x.impact * x.urgency * x.confidence,
     );

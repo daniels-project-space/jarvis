@@ -210,26 +210,65 @@ export default defineSchema({
     approvalStatus: v.optional(v.string()), // pending | approved | declined
     stage: v.optional(v.string()),
     percent: v.optional(v.number()),
+    // Liveness and progress deliberately have separate clocks. A worker can
+    // still be alive while making no durable, causal progress.
+    progressAt: v.optional(v.number()),
+    stallCount: v.optional(v.number()),
+    stalledAt: v.optional(v.number()),
+    stallReason: v.optional(v.string()),
+    steer: v.optional(v.string()),
+    steerRevision: v.optional(v.number()),
     heartbeatAt: v.optional(v.number()),
     nextRunAt: v.optional(v.number()), // retry/continuation eligibility; prevents hot-loop retries
     // Trigger-native fleet dispatch. A short reservation fences one exact job
     // before its independent cloud run is created; the worker run id then
     // connects Trigger Realtime to the durable Convex work record.
     dispatchId: v.optional(v.string()),
+    // Snapshot produced by the claim transaction. Exact redelivery returns
+    // this immutable envelope rather than re-reading changing upstream work.
+    upstreamEvidence: v.optional(v.array(v.object({
+      label: v.string(), status: v.string(), result: v.string(), verificationNote: v.string(),
+      planDigest: v.optional(v.string()), planGeneration: v.optional(v.number()),
+      sourceNodeId: v.optional(v.string()), sourceJobId: v.optional(v.string()),
+      sourceAttempt: v.optional(v.number()), sourceSteerRevision: v.optional(v.number()),
+      reviewReceiptDigest: v.optional(v.string()), integrationReceiptDigest: v.optional(v.string()),
+      repository: v.optional(v.string()), sourceBranch: v.optional(v.string()), sourceHeadSha: v.optional(v.string()),
+      integrationBranch: v.optional(v.string()), integrationHeadSha: v.optional(v.string()),
+      artifactRefs: v.optional(v.array(v.string())), resultDigest: v.optional(v.string()),
+    }))),
     dispatchLeaseUntil: v.optional(v.number()),
     dispatchReason: v.optional(v.string()),
     workerRunId: v.optional(v.string()),
     workerRuntime: v.optional(v.string()),
+    providerRunState: v.optional(v.string()),
+    providerObservedAt: v.optional(v.number()),
     checkpoint: v.optional(v.string()),
     attempt: v.optional(v.number()),
     maxAttempts: v.optional(v.number()),
     parentJobId: v.optional(v.string()),
     dependsOn: v.optional(v.array(v.string())),
+    // Immutable parent-plan binding for executable Goal Mode DAG nodes. A job
+    // may live in a repository child mission, but this authority never moves.
+    planParentMissionId: v.optional(v.id("missions")),
+    planDigest: v.optional(v.string()),
+    planGeneration: v.optional(v.number()),
+    planNodeId: v.optional(v.string()),
     goalStage: v.optional(v.string()), // planning | building | validating | refining
     goalWorkstreamId: v.optional(v.string()),
     goalWave: v.optional(v.number()),
     acceptanceCriteria: v.optional(v.array(v.string())),
     modelReason: v.optional(v.string()),
+    // Immutable work-item isolation identities. `branch` remains the legacy
+    // display/transport alias for workerBranch during the rollout.
+    sourceBranch: v.optional(v.string()),
+    sourceHeadSha: v.optional(v.string()),
+    integrationBranch: v.optional(v.string()),
+    workerBranch: v.optional(v.string()),
+    workspaceLineage: v.optional(v.string()),
+    retryLineage: v.optional(v.string()),
+    integrationAttemptId: v.optional(v.id("integrationAttempts")),
+    integrationState: v.optional(v.string()),
+    evidenceSummary: v.optional(v.string()),
     branch: v.optional(v.string()),
     pullRequestUrl: v.optional(v.string()),
     // read_only = evidence only; auto_merge = the delivery controller merges
@@ -238,6 +277,31 @@ export default defineSchema({
     deliveryStatus: v.optional(v.string()), // branch | pull_request | merged | blocked
     mergeCommitSha: v.optional(v.string()),
     mergedAt: v.optional(v.number()),
+    // Monotonic controller linearization token for consequential delivery.
+    deliveryLeaseVersion: v.optional(v.number()),
+    // Delivery retries are distinct from specialist work attempts. They retain
+    // a pointer to the immutable source review without relabelling it.
+    deliveryGeneration: v.optional(v.number()),
+    deliveryRunId: v.optional(v.string()),
+    // The active controller generation is an authority pointer, not merely
+    // display state.  A specialist never owns this row after review.
+    activeDeliveryAttemptId: v.optional(v.id("deliveryAttempts")),
+    // Controller-owned delivery lease.  The opaque token never reaches an
+    // agent sandbox; its version makes stale controller writes harmless.
+    deliveryLeaseOwner: v.optional(v.string()),
+    deliveryLeaseToken: v.optional(v.string()),
+    deliveryLeaseUntil: v.optional(v.number()),
+    // One job-wide causal cursor. Attempt cursors are retained for rolling
+    // compatibility, but new events are ordered against this single cursor.
+    lifecycleSequence: v.optional(v.number()),
+    lifecycleEventKey: v.optional(v.string()),
+    // A signed controller receipt is persisted before repository delivery.
+    reviewReceiptJson: v.optional(v.string()),
+    reviewReceiptSignature: v.optional(v.string()),
+    // Compact pointer only. The potentially large immutable review document
+    // lives in reviewReceipts, never on this hot control document.
+    reviewReceiptId: v.optional(v.id("reviewReceipts")),
+    reviewReceiptDigest: v.optional(v.string()),
     verificationVerdict: v.optional(v.string()), // pass | unavailable
     verificationNote: v.optional(v.string()),
     verifiedAt: v.optional(v.number()),
@@ -277,6 +341,16 @@ export default defineSchema({
     stage: v.string(),
     percent: v.number(),
     progress: v.optional(v.string()),
+    // Optional during the first projection rollout. The bounded migration
+    // supplies these values before a later schema-tightening release.
+    progressAt: v.optional(v.number()),
+    stallCount: v.optional(v.number()),
+    stalledAt: v.optional(v.number()),
+    stallReason: v.optional(v.string()),
+    steerRevision: v.optional(v.number()),
+    // A compact one-index read model for live UI work. This stays optional in
+    // rollout one so existing runtime rows remain schema-valid.
+    active: v.optional(v.boolean()),
     attempt: v.number(),
     maxAttempts: v.number(),
     heartbeatAt: v.number(),
@@ -285,17 +359,36 @@ export default defineSchema({
     dispatchLeaseUntil: v.optional(v.number()),
     workerRunId: v.optional(v.string()),
     workerRuntime: v.optional(v.string()),
+    providerRunState: v.optional(v.string()),
+    providerObservedAt: v.optional(v.number()),
     readonly: v.optional(v.boolean()),
     parentJobId: v.optional(v.string()),
     dependsOn: v.optional(v.array(v.string())),
+    planParentMissionId: v.optional(v.id("missions")),
+    planDigest: v.optional(v.string()),
+    planGeneration: v.optional(v.number()),
+    planNodeId: v.optional(v.string()),
     goalStage: v.optional(v.string()),
     goalWorkstreamId: v.optional(v.string()),
     goalWave: v.optional(v.number()),
+    sourceBranch: v.optional(v.string()),
+    sourceHeadSha: v.optional(v.string()),
+    integrationBranch: v.optional(v.string()),
+    workerBranch: v.optional(v.string()),
+    workspaceLineage: v.optional(v.string()),
+    retryLineage: v.optional(v.string()),
+    integrationAttemptId: v.optional(v.id("integrationAttempts")),
+    integrationState: v.optional(v.string()),
+    evidenceSummary: v.optional(v.string()),
     branch: v.optional(v.string()),
     pullRequestUrl: v.optional(v.string()),
     deliveryMode: v.optional(v.string()),
     deliveryStatus: v.optional(v.string()),
     mergeCommitSha: v.optional(v.string()),
+    deliveryLeaseVersion: v.optional(v.number()),
+    deliveryGeneration: v.optional(v.number()),
+    deliveryRunId: v.optional(v.string()),
+    deliveryLeaseUntil: v.optional(v.number()),
     startedAt: v.optional(v.number()),
     completedAt: v.optional(v.number()),
     createdAt: v.number(),
@@ -306,9 +399,13 @@ export default defineSchema({
     .index("by_status_priority", ["status", "priority", "createdAt"])
     .index("by_status_next_run", ["status", "nextRunAt", "createdAt"])
     .index("by_status_heartbeat", ["status", "heartbeatAt"])
+    .index("by_status_progress", ["status", "progressAt"])
     .index("by_status_dispatch_lease", ["status", "dispatchLeaseUntil"])
+    .index("by_active_priority", ["active", "priority", "createdAt"])
     .index("by_visibility_status_priority", ["visibility", "status", "priority", "createdAt"])
     .index("by_thread_visibility_status_priority", ["originThreadId", "visibility", "status", "priority", "createdAt"])
+    .index("by_thread_visibility_active_priority", ["originThreadId", "visibility", "active", "priority", "createdAt"])
+    .index("by_plan_parent_generation_node", ["planParentMissionId", "planGeneration", "planNodeId"])
     .index("by_mission", ["missionId", "createdAt"]),
 
   // Orchestrated agent fleets: one mission = a decomposed goal running as
@@ -322,6 +419,16 @@ export default defineSchema({
     summary: v.optional(v.string()),
     originThreadId: v.optional(v.string()),
     managerAgentId: v.optional(v.string()),
+    parentMissionId: v.optional(v.id("missions")),
+    splitChildMissionIds: v.optional(v.array(v.id("missions"))),
+    splitChildKind: v.optional(v.string()),
+    planDigest: v.optional(v.string()),
+    planGeneration: v.optional(v.number()),
+    planNodeCount: v.optional(v.number()),
+    controlRequested: v.optional(v.string()),
+    controlRequestedAt: v.optional(v.number()),
+    steer: v.optional(v.string()),
+    steerRevision: v.optional(v.number()),
     priority: v.optional(v.number()),
     risk: v.optional(v.string()),
     phase: v.optional(v.string()),
@@ -337,6 +444,17 @@ export default defineSchema({
     planningJobId: v.optional(v.string()),
     validatorJobId: v.optional(v.string()),
     sharedBranch: v.optional(v.string()),
+    // `sharedBranch` is legacy display state. Only integrationBranch may be
+    // advanced, and only by the fenced integration queue below.
+    sourceBranch: v.optional(v.string()),
+    integrationBranch: v.optional(v.string()),
+    integrationHeadSha: v.optional(v.string()),
+    integrationGeneration: v.optional(v.number()),
+    activeIntegrationAttemptId: v.optional(v.id("integrationAttempts")),
+    integrationLeaseOwner: v.optional(v.string()),
+    integrationLeaseToken: v.optional(v.string()),
+    integrationLeaseVersion: v.optional(v.number()),
+    integrationLeaseUntil: v.optional(v.number()),
     revisionWave: v.optional(v.number()),
     maxRevisionWaves: v.optional(v.number()),
     maxBuildSessions: v.optional(v.number()),
@@ -394,6 +512,15 @@ export default defineSchema({
     maxBuildSessions: v.number(),
     planningJobId: v.optional(v.string()),
     validatorJobId: v.optional(v.string()),
+    planDigest: v.optional(v.string()),
+    planGeneration: v.optional(v.number()),
+    planNodeCount: v.optional(v.number()),
+    sourceBranch: v.optional(v.string()),
+    integrationBranch: v.optional(v.string()),
+    integrationHeadSha: v.optional(v.string()),
+    integrationGeneration: v.optional(v.number()),
+    activeIntegrationAttemptId: v.optional(v.id("integrationAttempts")),
+    integrationLeaseUntil: v.optional(v.number()),
     advanceLeaseUntil: v.optional(v.number()),
     pausedPhase: v.optional(v.string()),
     failureReason: v.optional(v.string()),
@@ -492,12 +619,398 @@ export default defineSchema({
     message: v.string(),
     stage: v.optional(v.string()),
     percent: v.optional(v.number()),
+    // Event fields are write-once evidence. Causation is optional while old
+    // rows age out, but every new attempt transition supplies it.
+    attempt: v.optional(v.number()),
+    causationId: v.optional(v.string()),
+    evidenceKind: v.optional(v.string()),
+    eventKey: v.optional(v.string()),
+    sequence: v.optional(v.number()),
+    predecessorKey: v.optional(v.string()),
     data: v.optional(v.any()),
     createdAt: v.number(),
   })
     .index("by_job", ["jobId", "createdAt"])
     .index("by_mission", ["missionId", "createdAt"])
+    .index("by_createdAt", ["createdAt"])
+    .index("by_job_event", ["jobId", "eventKey"])
+    .index("by_job_sequence", ["jobId", "sequence", "createdAt"]),
+
+  // One immutable row per fenced Trigger attempt. Jobs remain the authority
+  // for scheduling; this table makes intent → workspace → session lineage
+  // auditable without putting a second control plane beside Convex.
+  workAttempts: defineTable({
+    jobId: v.id("jobs"),
+    attempt: v.number(),
+    status: v.string(), // queued | dispatching | running | checkpointed | paused | steered | needs_input | stalled | done | error | cancelled
+    // A lifecycle record is created while queued. Launch identities remain
+    // optional until the exact dispatch crosses the worker fence, allowing
+    // every event from enqueue onward to use one causal cursor.
+    workspaceKey: v.optional(v.string()),
+    workspaceLineage: v.optional(v.string()),
+    workerBranch: v.optional(v.string()),
+    sessionId: v.optional(v.string()),
+    workerRunId: v.optional(v.string()),
+    dispatchId: v.optional(v.string()),
+    parentAttempt: v.optional(v.number()),
+    sourceHeadSha: v.optional(v.string()),
+    workspaceBaseSha: v.optional(v.string()),
+    parentCheckpointHeadSha: v.optional(v.string()),
+    checkpointHeadSha: v.optional(v.string()),
+    // Immutable claim envelope. Exact Trigger redelivery returns this exact
+    // snapshot and must never re-read changing dependencies.
+    upstreamEvidence: v.optional(v.array(v.object({
+      label: v.string(), status: v.string(), result: v.string(), verificationNote: v.string(),
+      planDigest: v.optional(v.string()), planGeneration: v.optional(v.number()),
+      sourceNodeId: v.optional(v.string()), sourceJobId: v.optional(v.string()),
+      sourceAttempt: v.optional(v.number()), sourceSteerRevision: v.optional(v.number()),
+      reviewReceiptDigest: v.optional(v.string()), integrationReceiptDigest: v.optional(v.string()),
+      repository: v.optional(v.string()), sourceBranch: v.optional(v.string()), sourceHeadSha: v.optional(v.string()),
+      integrationBranch: v.optional(v.string()), integrationHeadSha: v.optional(v.string()),
+      artifactRefs: v.optional(v.array(v.string())), resultDigest: v.optional(v.string()),
+    }))),
+    // The Trigger run is only delivery metadata. Sandbox/provider sessions
+    // are deliberately separate identities for the sandbox adapter workstream.
+    providerName: v.optional(v.string()),
+    providerWorkspaceId: v.optional(v.string()),
+    providerSessionId: v.optional(v.string()),
+    providerCreatedAt: v.optional(v.number()),
+    providerTerminatedAt: v.optional(v.number()),
+    workspaceRuntime: v.optional(v.string()),
+    workspaceLockfileDigest: v.optional(v.string()),
+    workspaceTemplate: v.optional(v.string()),
+    sourceArchiveDigest: v.optional(v.string()),
+    sourceArchiveBytes: v.optional(v.number()),
+    checkpointRef: v.optional(v.string()),
+    checkpointDigest: v.optional(v.string()),
+    checkpointBytes: v.optional(v.number()),
+    checkpointManifestDigest: v.optional(v.string()),
+    checkpointManifest: v.optional(v.string()),
+    // This write-once marker is the replay lookup authority. It is set in
+    // the same mutation as the complete immutable receipt so replay never
+    // has to scan historical attempts or infer availability from fragments.
+    checkpointAvailable: v.optional(v.boolean()),
+    cleanupBlockedCode: v.optional(v.string()),
+    cleanupBlockedReason: v.optional(v.string()),
+    cleanupBlockedAt: v.optional(v.number()),
+    lastEventSeq: v.optional(v.number()),
+    lastEventKey: v.optional(v.string()),
+    launchedAt: v.optional(v.number()),
+    livenessAt: v.number(),
+    progressAt: v.number(),
+    lastEventAt: v.number(),
+    completedAt: v.optional(v.number()),
+    createdAt: v.number(),
+  })
+    .index("by_job_attempt", ["jobId", "attempt"])
+    .index("by_job_checkpoint_available_attempt", ["jobId", "checkpointAvailable", "attempt"])
+    .index("by_status_progress", ["status", "progressAt"]),
+
+  // Accepted GoalPlan authority is normalized once. These compact rows map
+  // every original id exactly once to its executable job and repository/evidence
+  // child without making mission summaries or heartbeats authoritative.
+  goalPlanNodes: defineTable({
+    parentMissionId: v.id("missions"),
+    planDigest: v.string(),
+    planGeneration: v.number(),
+    nodeId: v.string(),
+    childMissionId: v.id("missions"),
+    jobId: v.id("jobs"),
+    label: v.string(),
+    agentId: v.string(),
+    repository: v.optional(v.string()),
+    readonly: v.boolean(),
+    dependencyCount: v.number(),
+    weight: v.number(),
+    createdAt: v.number(),
+  })
+    .index("by_parent_generation", ["parentMissionId", "planGeneration", "nodeId"])
+    .index("by_parent_generation_node", ["parentMissionId", "planGeneration", "nodeId"])
+    .index("by_child", ["childMissionId", "nodeId"])
+    .index("by_job", ["jobId"]),
+
+  goalPlanEdges: defineTable({
+    parentMissionId: v.id("missions"),
+    planDigest: v.string(),
+    planGeneration: v.number(),
+    edgeId: v.string(),
+    sourceNodeId: v.string(),
+    targetNodeId: v.string(),
+    sourceJobId: v.id("jobs"),
+    targetJobId: v.id("jobs"),
+    createdAt: v.number(),
+  })
+    .index("by_parent_generation", ["parentMissionId", "planGeneration", "edgeId"])
+    .index("by_target", ["targetJobId", "planGeneration", "sourceNodeId"])
+    .index("by_source", ["sourceJobId", "planGeneration", "targetNodeId"]),
+
+  // One compact immutable receipt per successful node execution generation.
+  // Full reviews, integration manifests and artifacts remain in their cold
+  // authority tables and are loaded only by validators or explicit detail UI.
+  goalHandoffs: defineTable({
+    parentMissionId: v.id("missions"),
+    planDigest: v.string(),
+    planGeneration: v.number(),
+    sourceNodeId: v.string(),
+    sourceJobId: v.id("jobs"),
+    sourceAttempt: v.number(),
+    sourceSteerRevision: v.number(),
+    reviewReceiptDigest: v.optional(v.string()),
+    integrationReceiptDigest: v.optional(v.string()),
+    repository: v.optional(v.string()),
+    sourceBranch: v.optional(v.string()),
+    sourceHeadSha: v.optional(v.string()),
+    integrationBranch: v.optional(v.string()),
+    integrationHeadSha: v.optional(v.string()),
+    artifactRefs: v.array(v.string()),
+    resultDigest: v.string(),
+    summary: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_source_attempt", ["sourceJobId", "sourceAttempt", "planGeneration"])
+    .index("by_parent_generation", ["parentMissionId", "planGeneration", "sourceNodeId"]),
+
+  // Mission integration is distinct from specialist delivery. These rows are
+  // append-only generations around one immutable review receipt. Exactly one
+  // row per mission can hold the controller lease and advance the integration
+  // ref; conflicts create focused repair jobs instead of replaying siblings.
+  integrationAttempts: defineTable({
+    missionId: v.id("missions"),
+    jobId: v.id("jobs"),
+    workAttempt: v.number(),
+    generation: v.number(),
+    revisionWave: v.number(),
+    workstreamId: v.string(),
+    repository: v.string(),
+    sourceBranch: v.string(),
+    workerBranch: v.string(),
+    integrationBranch: v.string(),
+    reviewReceiptId: v.id("reviewReceipts"),
+    reviewReceiptDigest: v.string(),
+    reviewedBaseSha: v.string(),
+    reviewedHeadSha: v.string(),
+    reviewedHeadTreeSha: v.string(),
+    reviewedDiffSha256: v.string(),
+    status: v.string(), // queued | claimed | prepared | provider_waiting | integrated | conflict | stale | cancelled
+    controllerRunId: v.optional(v.string()),
+    leaseOwner: v.optional(v.string()),
+    leaseToken: v.optional(v.string()),
+    leaseVersion: v.number(),
+    leaseUntil: v.optional(v.number()),
+    expectedIntegrationBaseSha: v.optional(v.string()),
+    // Exact persisted old ref identity for GitHub updateRefs. The zero OID is
+    // used only when the mission integration ref was intentionally absent.
+    expectedIntegrationRefSha: v.optional(v.string()),
+    preparedEffectId: v.optional(v.string()),
+    preparedIntegrationHeadSha: v.optional(v.string()),
+    preparedIntegrationTreeSha: v.optional(v.string()),
+    providerObservation: v.optional(v.string()),
+    providerObservedHeadSha: v.optional(v.string()),
+    providerEffectCount: v.optional(v.number()),
+    controllerState: v.optional(v.string()),
+    controllerStateSince: v.optional(v.number()),
+    controllerDeadlineAt: v.optional(v.number()),
+    controllerHeartbeatAt: v.optional(v.number()),
+    controlRequested: v.optional(v.string()), // pause | cancel | steer
+    controlRequestedAt: v.optional(v.number()),
+    reconcileAfter: v.optional(v.number()),
+    // Set only when bounded automatic reconciliation yields to Daniel. The
+    // attempt remains a nonterminal FIFO head and resume clears this marker.
+    reconciliationAttentionAt: v.optional(v.number()),
+    effects: v.optional(v.array(v.object({
+      effectId: v.string(),
+      effectKind: v.string(),
+      provider: v.string(),
+      providerIdentity: v.string(),
+      providerMethod: v.string(),
+      providerTarget: v.string(),
+      requestDigest: v.string(),
+      expectedBaseSha: v.optional(v.string()),
+      headSha: v.string(),
+      treeSha: v.string(),
+      preparedAt: v.number(),
+      observation: v.optional(v.string()),
+      providerHeadSha: v.optional(v.string()),
+      providerResponse: v.optional(v.string()),
+      observedAt: v.optional(v.number()),
+    }))),
+    outcome: v.optional(v.string()),
+    retryReason: v.optional(v.string()),
+    cumulativeRetries: v.number(),
+    repairJobId: v.optional(v.id("jobs")),
+    terminalReceiptDigest: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+    completedAt: v.optional(v.number()),
+  })
+    .index("by_mission_status", ["missionId", "status", "createdAt"])
+    .index("by_mission_generation", ["missionId", "generation"])
+    .index("by_job_attempt", ["jobId", "workAttempt"])
+    .index("by_status_created", ["status", "createdAt"])
+    .index("by_mission_repository_status_generation", ["missionId", "repository", "status", "generation"]),
+
+  // Provider writes are cold, independently replayable effects. Integration
+  // attempts retain only compact pointers/state so large exact responses and
+  // long object-staging lineages never inflate dispatch/heartbeat documents.
+  integrationProviderEffects: defineTable({
+    integrationAttemptId: v.id("integrationAttempts"),
+    effectId: v.string(),
+    effectKind: v.string(),
+    provider: v.string(),
+    providerIdentity: v.string(),
+    providerMethod: v.string(),
+    providerTarget: v.string(),
+    requestDigest: v.string(),
+    expectedBaseSha: v.optional(v.string()),
+    headSha: v.string(),
+    treeSha: v.string(),
+    preparedAt: v.number(),
+    observation: v.optional(v.string()),
+    providerHeadSha: v.optional(v.string()),
+    providerResponse: v.optional(v.string()),
+    providerResponseDigest: v.optional(v.string()),
+    observedAt: v.optional(v.number()),
+  })
+    .index("by_attempt_effect", ["integrationAttemptId", "effectId"])
+    .index("by_attempt_prepared", ["integrationAttemptId", "preparedAt"]),
+
+  // Full canonical integration terminal evidence is cold and append-only.
+  // Hot mission/job/attempt rows retain only outcome and digest pointers.
+  integrationTerminalReceipts: defineTable({
+    missionId: v.id("missions"),
+    jobId: v.id("jobs"),
+    integrationAttemptId: v.id("integrationAttempts"),
+    outcome: v.string(),
+    receiptJson: v.string(),
+    receiptDigest: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_attempt", ["integrationAttemptId"])
+    .index("by_mission", ["missionId", "createdAt"])
+    .index("by_digest", ["receiptDigest"]),
+
+  // Controller delivery has its own durable lease lineage.  It deliberately
+  // points at an immutable specialist attempt rather than reusing that
+  // attempt's running/liveness state while GitHub checks are pending.
+  deliveryAttempts: defineTable({
+    jobId: v.id("jobs"),
+    integrationAttemptId: v.optional(v.id("integrationAttempts")),
+    sourceWorkAttempt: v.number(),
+    generation: v.number(),
+    // These are assigned only when the controller generation is dispatched.
+    // A queued cold receipt deliberately has no Trigger identity yet.
+    dispatchId: v.optional(v.string()),
+    deliveryRunId: v.optional(v.string()),
+    policy: v.string(),
+    status: v.string(), // running | checkpointed | done | blocked | abandoned
+    // The controller row is the complete authority record. Job fields are
+    // projections only and cannot authorize a provider effect.
+    outcome: v.optional(v.string()),
+    sourceDispatchId: v.optional(v.string()),
+    parentDeliveryAttemptId: v.optional(v.id("deliveryAttempts")),
+    reviewLineage: v.optional(v.array(v.object({
+      sourceWorkAttempt: v.number(),
+      reviewReceiptId: v.id("reviewReceipts"),
+      reviewReceiptDigest: v.string(),
+      keyId: v.optional(v.string()),
+    }))),
+    reviewReceiptId: v.optional(v.id("reviewReceipts")),
+    reviewReceiptDigest: v.optional(v.string()),
+    reviewKeyId: v.optional(v.string()),
+    reviewedHeadSha: v.optional(v.string()),
+    reviewedBaseSha: v.optional(v.string()),
+    reviewedHeadTreeSha: v.optional(v.string()),
+    reviewedDiffSha256: v.optional(v.string()),
+    observedPullRequestHead: v.optional(v.string()),
+    observedPullRequestBase: v.optional(v.string()),
+    pullRequestNumber: v.optional(v.number()),
+    pullRequestUrl: v.optional(v.string()),
+    pullRequestNodeId: v.optional(v.string()),
+    pullRequestDraft: v.optional(v.boolean()),
+    preparedEffectId: v.optional(v.string()),
+    preparedEffectKind: v.optional(v.string()), // create_draft_pr | create_pr | promote_pr | merge_pr
+    preparedEffectAt: v.optional(v.number()),
+    providerObservation: v.optional(v.string()),
+    providerObservedAt: v.optional(v.number()),
+    effects: v.optional(v.array(v.object({
+      effectId: v.string(), effectKind: v.string(), preparedAt: v.number(),
+      reviewedHeadSha: v.string(), reviewedBaseSha: v.string(),
+      pullRequestNumber: v.optional(v.number()),
+      observation: v.optional(v.string()), observedAt: v.optional(v.number()),
+      pullRequestUrl: v.optional(v.string()), pullRequestNodeId: v.optional(v.string()),
+      pullRequestDraft: v.optional(v.boolean()), observedPullRequestHead: v.optional(v.string()),
+      observedPullRequestBase: v.optional(v.string()), mergeCommitSha: v.optional(v.string()),
+    }))),
+    mergeCommitSha: v.optional(v.string()),
+    retryReason: v.optional(v.string()),
+    leaseOwner: v.optional(v.string()),
+    leaseToken: v.optional(v.string()),
+    leaseVersion: v.optional(v.number()),
+    leaseUntil: v.optional(v.number()),
+    heartbeatAt: v.number(),
+    retries: v.number(),
+    // Retry budget belongs to the immutable review lineage and is copied
+    // forward; resetting it on every generation made the cap unreachable.
+    cumulativeRetries: v.optional(v.number()),
+    currentStep: v.optional(v.string()), // queued | preflight | prepared | observing | receipt | terminal
+    terminalReceiptDigest: v.optional(v.string()),
+    nextRunAt: v.optional(v.number()),
+    completedAt: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_job", ["jobId", "generation"])
+    .index("by_job_source_generation", ["jobId", "sourceWorkAttempt", "generation"])
+    .index("by_status_heartbeat", ["status", "heartbeatAt"]),
+
+  // Receipts are only inserted by terminal authority transitions and are
+  // never patched. They bind acceptance evidence and artifacts to one exact
+  // attempt, closing the replay/substitution gap at completion.
+  workReceipts: defineTable({
+    jobId: v.id("jobs"),
+    attempt: v.number(),
+    status: v.string(),
+    acceptanceEvidence: v.array(v.string()),
+    artifacts: v.array(v.string()),
+    verification: v.string(),
+    deliveryOutcome: v.optional(v.string()),
+    terminalEventKey: v.optional(v.string()),
+    resultDigest: v.optional(v.string()),
+    evidenceDigest: v.optional(v.string()),
+    // Controller-issued signed review binding for repository work.
+    reviewReceiptSignature: v.optional(v.string()),
+    reviewDiffSha256: v.optional(v.string()),
+    reviewReceiptId: v.optional(v.id("reviewReceipts")),
+    reviewReceiptDigest: v.optional(v.string()),
+    createdAt: v.number(),
+  })
+    .index("by_job_attempt", ["jobId", "attempt"])
     .index("by_createdAt", ["createdAt"]),
+
+  // Cold, append-only repository review evidence. It is content-addressed
+  // and never patched; jobs retain only the small binding fields above.
+  reviewReceipts: defineTable({
+    jobId: v.id("jobs"),
+    attempt: v.number(),
+    repository: v.string(),
+    workerBranch: v.optional(v.string()),
+    sourceBranch: v.optional(v.string()),
+    workspaceLineage: v.optional(v.string()),
+    retryLineage: v.optional(v.string()),
+    receiptJson: v.string(),
+    receiptDigest: v.string(),
+    signature: v.string(),
+    keyId: v.optional(v.string()),
+    diffSha256: v.string(),
+    baseSha: v.string(),
+    headSha: v.string(),
+    baseTreeSha: v.string(),
+    headTreeSha: v.string(),
+    agentEvidenceSha256: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_job_attempt", ["jobId", "attempt"])
+    .index("by_job_attempt_digest", ["jobId", "attempt", "receiptDigest"]),
 
   // Compact, append-only supervisor receipts. These deliberately describe
   // coordination rather than changing it, so viewers can audit Trigger's

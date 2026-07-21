@@ -11,7 +11,9 @@ describe("scoped GitHub transport", () => {
     const token = "github-write-capability";
     const gitEnv = githubGitEnv(base, token);
     expect(githubRepoUrl("daniels-project-space/jarvis")).toBe("https://github.com/daniels-project-space/jarvis.git");
+    expect(githubRepoUrl("https://github.com/daniels-project-space/jarvis.git")).toBe("https://github.com/daniels-project-space/jarvis.git");
     expect(githubRepoUrl("daniels-project-space/jarvis")).not.toContain(token);
+    expect(() => githubRepoUrl("https://token@github.com/daniels-project-space/jarvis.git")).toThrow(/credential-free/);
     expect(base).not.toHaveProperty("GIT_CONFIG_VALUE_0");
     expect(gitEnv.GIT_CONFIG_VALUE_0).toMatch(/^AUTHORIZATION: basic /);
     expect(gitEnv.GIT_TERMINAL_PROMPT).toBe("0");

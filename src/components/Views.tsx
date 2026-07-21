@@ -3,7 +3,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
-import { workModelLabel } from "@/lib/work-models";
 import { viewerFetch } from "@/lib/viewer-request";
 
 // The richer panel views: frosted-glass calendar, live mind-map canvas,
@@ -1021,56 +1020,16 @@ export function RankingView({ value }: { value: string }) {
   );
 }
 
-/* ---------------------------------- fleet / mission control ---------------------------------- */
+/* ----------------------------- durable goal launcher ----------------------------- */
 
-const JOB_DOT: Record<string, string> = {
-  pending: "bg-slate/60",
-  running: "bg-cyan animate-pulse",
-  done: "bg-emerald-400",
-  error: "bg-red-400",
-  paused: "bg-amber",
-  needs_input: "bg-amber animate-pulse",
-  awaiting_approval: "bg-amber animate-pulse",
-  cancelled: "bg-slate/40",
-};
-
-export function FleetView({ value }: { value: string }) {
+// Live ownership moved to FleetCommandCenter. This panel only creates a new
+// durable goal, so opening it cannot create a second mission/work-detail view.
+export function GoalModeLauncherView() {
   const [busy, setBusy] = useState<string | null>(null);
   const [goalDraft, setGoalDraft] = useState("");
   const [maxBuildSessions, setMaxBuildSessions] = useState(6);
   const [maxRevisionWaves, setMaxRevisionWaves] = useState(2);
   const [startError, setStartError] = useState("");
-  const [controlError, setControlError] = useState("");
-  let missionId = "";
-  let requestedMode = "";
-  try {
-    const request = JSON.parse(value);
-    missionId = request?.missionId ?? "";
-    requestedMode = request?.mode ?? "";
-  } catch {
-    /* noop */
-  }
-  const missions = (useJarvisQuery(api.missions.active, {}) ?? []) as any[];
-  const activityMission = missions.find((x) => x._id === missionId)
-    ?? (!missionId ? missions.find((x) => x.mode === "goal" && ["running", "paused", "needs_input"].includes(x.status)) : null)
-    ?? (requestedMode === "goal" ? null : missions[0]);
-  const missionJobs = (useJarvisQuery(
-    api.missions.activity,
-    activityMission ? ({ id: activityMission._id } as any) : "skip",
-  ) ?? []) as any[];
-  // Rich plans/reports have their own subscription. Live job progress updates
-  // only invalidate the compact activity list and never reread this document.
-  const missionDetail = useJarvisQuery(
-    api.missions.get,
-    activityMission ? ({ id: activityMission._id } as any) : "skip",
-  ) as any;
-  const m = activityMission
-    ? { ...activityMission, ...(missionDetail ?? {}), jobs: missionJobs }
-    : null;
-  const missionEvents = (useJarvisQuery(
-    api.workEvents.forMission,
-    m ? ({ missionId: m._id, limit: 20 } as any) : "skip",
-  ) ?? []) as any[];
   const startGoal = async () => {
     const goal = goalDraft.trim();
     if (goal.length < 12) return;
@@ -1091,190 +1050,23 @@ export function FleetView({ value }: { value: string }) {
       setBusy(null);
     }
   };
-  if (!m)
-    return (
-      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
-        <div className="mx-auto flex min-h-full max-w-2xl items-center justify-center">
-          <div className="w-full rounded-2xl border border-cyan/20 bg-[radial-gradient(circle_at_50%_0%,rgba(0,255,136,.09),rgba(7,13,23,.88)_58%)] p-5 shadow-2xl backdrop-blur-xl">
-            <div className="hud-label text-cyan">durable goal mode</div>
-            <div className="mt-2 text-xl font-semibold text-ice">Give Jarvis the outcome, not a task list.</div>
-            <p className="mt-2 max-w-xl text-xs leading-relaxed text-slate">
-              One Sol/max session designs the path, bounded Terra/high sessions build it with checkpoints, and Sol/max validates the complete result before Jarvis can call it achieved.
-            </p>
-            <textarea
-              value={goalDraft}
-              onChange={(event) => setGoalDraft(event.target.value)}
-              rows={4}
-              maxLength={500}
-              placeholder="Example: Make the Rental Manager return workflow fully accurate, fast and proven in production…"
-              className="mt-4 w-full resize-none rounded-xl border border-white/10 bg-black/25 px-3 py-3 text-sm leading-relaxed text-ice outline-none transition placeholder:text-slate/45 focus:border-cyan/35"
-            />
-            <div className="mt-3 flex flex-wrap items-end gap-3">
-              <label className="grid gap-1 text-[9px] uppercase tracking-[0.14em] text-slate">
-                max build sessions
-                <select value={maxBuildSessions} onChange={(event) => setMaxBuildSessions(Number(event.target.value))} className="rounded-lg border border-white/10 bg-[#0b1422] px-2 py-1.5 text-[11px] normal-case tracking-normal text-ice outline-none">
-                  {[4, 6, 8].map((count) => <option key={count} value={count}>{count}</option>)}
-                </select>
-              </label>
-              <label className="grid gap-1 text-[9px] uppercase tracking-[0.14em] text-slate">
-                repair waves
-                <select value={maxRevisionWaves} onChange={(event) => setMaxRevisionWaves(Number(event.target.value))} className="rounded-lg border border-white/10 bg-[#0b1422] px-2 py-1.5 text-[11px] normal-case tracking-normal text-ice outline-none">
-                  {[1, 2, 3, 4].map((count) => <option key={count} value={count}>{count}</option>)}
-                </select>
-              </label>
-              <button
-                disabled={busy === "start" || goalDraft.trim().length < 12}
-                onClick={() => void startGoal()}
-                className="ml-auto rounded-xl border border-cyan/35 bg-cyan/[0.09] px-4 py-2 text-[11px] font-medium text-cyan transition hover:bg-cyan/[0.16] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                {busy === "start" ? "starting durable mission…" : "start goal mode"}
-              </button>
-            </div>
-            {startError && <div className="mt-3 rounded-lg border border-red-400/20 bg-red-400/[0.06] px-3 py-2 text-xs text-red-300">{startError}</div>}
-          </div>
-        </div>
-      </div>
-    );
-  const done = m.jobs.filter((j: any) => j.status === "done").length;
-  const goalMode = m.mode === "goal";
-  const controlGoal = async (action: "pause" | "resume" | "cancel") => {
-    setBusy(action);
-    setControlError("");
-    try {
-      const response = await viewerFetch("/api/work-control", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ missionId: m._id, action }),
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok || payload?.ok !== true) {
-        throw new Error(String(payload?.error ?? `Goal Mode could not ${action} this outcome.`));
-      }
-    } catch (error) {
-      setControlError(String(error instanceof Error ? error.message : error));
-    } finally {
-      setBusy(null);
-    }
-  };
-  const phaseIndex = m.phase === "planning" ? 0 : ["building", "refining", "factory approval", "factory refinement"].includes(m.phase) ? 1 : m.phase === "validating" ? 2 : m.phase === "complete" ? 3 : 1;
-  const phaseLabels = ["Sol plan", "Terra build", "Sol validate", "achieved"];
-  const glass = "rounded-xl border border-white/10 bg-white/[0.045] backdrop-blur-xl";
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
-        <div className="mx-auto max-w-2xl">
-        <div className="text-center">
-          <div className="hud-label mb-1">{goalMode ? "durable goal mode" : "mission"}</div>
-          <div className="text-lg font-semibold leading-snug text-ice">{m.goal}</div>
-          {goalMode && (
-            <div className="mt-2 flex flex-wrap items-center justify-center gap-2 text-[10px] text-slate">
-              <span className="rounded-full border border-cyan/20 bg-cyan/[0.06] px-2 py-1 text-cyan">{String(m.route ?? "goal").replace(/_/g, " ")}</span>
-              {m.primaryRepo && <span className="rounded-full border border-white/10 px-2 py-1 font-mono">{m.primaryRepo}</span>}
-              {m.revisionWave > 0 && <span className="rounded-full border border-amber/25 bg-amber/[0.06] px-2 py-1 text-amber">repair wave {m.revisionWave}/{m.maxRevisionWaves}</span>}
-              {m.pausedPhase && <span className="rounded-full border border-amber/25 bg-amber/[0.06] px-2 py-1 text-amber">paused at {m.pausedPhase}</span>}
-            </div>
-          )}
-          <div className="mt-2 flex items-center justify-center gap-2">
-            <span className={`h-2 w-2 rounded-full ${m.status === "running" ? "bg-cyan animate-pulse" : ["synthesizing", "needs_input", "paused"].includes(m.status) ? "bg-amber animate-pulse" : m.status === "done" ? "bg-emerald-400" : "bg-red-400"}`} />
-            <span className="hud-label">
-              {m.status === "synthesizing" ? "synthesizing report" : m.phase ?? m.status} · {done}/{m.jobs.length} sessions complete
-            </span>
+    <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
+      <div className="mx-auto flex min-h-full max-w-2xl items-center justify-center">
+        <div className="w-full rounded-2xl border border-cyan/20 bg-[radial-gradient(circle_at_50%_0%,rgba(0,255,136,.09),rgba(7,13,23,.88)_58%)] p-5 shadow-2xl backdrop-blur-xl">
+          <div className="hud-label text-cyan">durable goal mode</div>
+          <div className="mt-2 text-xl font-semibold text-ice">Give Jarvis the outcome, not a task list.</div>
+          <p className="mt-2 max-w-xl text-xs leading-relaxed text-slate">One Sol/max session designs the path, bounded Terra/high sessions build it with checkpoints, and Sol/max validates the complete result.</p>
+          <div className="mt-3 rounded-xl border border-cyan/15 bg-cyan/[0.04] px-3 py-2 text-[10px] leading-relaxed text-slate">Once started, the top-left live-work tile is the single command centre for the exact DAG, workers, handoffs, controls and realtime detail.</div>
+          <textarea value={goalDraft} onChange={(event) => setGoalDraft(event.target.value)} rows={4} maxLength={500} placeholder="Example: Make the Rental Manager return workflow fully accurate, fast and proven in production…" className="mt-4 w-full resize-none rounded-xl border border-white/10 bg-black/25 px-3 py-3 text-sm leading-relaxed text-ice outline-none transition placeholder:text-slate/45 focus:border-cyan/35" />
+          <div className="mt-3 flex flex-wrap items-end gap-3">
+            <label className="grid gap-1 text-[9px] uppercase tracking-[0.14em] text-slate">max build sessions<select value={maxBuildSessions} onChange={(event) => setMaxBuildSessions(Number(event.target.value))} className="rounded-lg border border-white/10 bg-[#0b1422] px-2 py-1.5 text-[11px] normal-case tracking-normal text-ice outline-none">{[4, 6, 8].map((count) => <option key={count} value={count}>{count}</option>)}</select></label>
+            <label className="grid gap-1 text-[9px] uppercase tracking-[0.14em] text-slate">repair waves<select value={maxRevisionWaves} onChange={(event) => setMaxRevisionWaves(Number(event.target.value))} className="rounded-lg border border-white/10 bg-[#0b1422] px-2 py-1.5 text-[11px] normal-case tracking-normal text-ice outline-none">{[1, 2, 3, 4].map((count) => <option key={count} value={count}>{count}</option>)}</select></label>
+            <button disabled={busy === "start" || goalDraft.trim().length < 12} onClick={() => void startGoal()} className="ml-auto rounded-xl border border-cyan/35 bg-cyan/[0.09] px-4 py-2 text-[11px] font-medium text-cyan transition hover:bg-cyan/[0.16] disabled:cursor-not-allowed disabled:opacity-40">{busy === "start" ? "starting durable mission…" : "start goal mode"}</button>
           </div>
-          <div className="mx-auto mt-3 h-1.5 w-64 overflow-hidden rounded-full bg-white/5">
-            <div
-              className="h-full rounded-full bg-gradient-to-r from-cyan/50 to-cyan transition-all duration-700"
-              style={{ width: `${goalMode ? Math.max(2, m.percent ?? 0) : m.status === "done" ? 100 : Math.round((done / Math.max(1, m.jobs.length)) * 92)}%` }}
-            />
-          </div>
-        </div>
-        {goalMode && (
-          <div className={`${glass} mt-5 p-3`}>
-            <div className="grid grid-cols-4 gap-1.5">
-              {phaseLabels.map((label, index) => {
-                const complete = index < phaseIndex || m.status === "done";
-                const active = index === phaseIndex && m.status !== "done";
-                return (
-                  <div key={label} className={`rounded-lg border px-2 py-2 text-center text-[9px] uppercase tracking-[0.12em] ${complete ? "border-emerald-400/25 bg-emerald-400/[0.07] text-emerald-300" : active ? "border-cyan/35 bg-cyan/[0.08] text-cyan" : "border-white/[0.06] text-slate/55"}`}>
-                    <div className={`mx-auto mb-1 h-1.5 w-1.5 rounded-full ${complete ? "bg-emerald-300" : active ? "bg-cyan animate-pulse" : "bg-slate/30"}`} />
-                    {label}
-                  </div>
-                );
-              })}
-            </div>
-            {m.routeReason && <div className="mt-3 text-[11px] leading-relaxed text-slate">{m.routeReason}</div>}
-            {m.plan?.summary && <div className="mt-2 text-xs leading-relaxed text-ice">{m.plan.summary}</div>}
-            {m.externalKind === "app-factory" && m.externalSlug && (
-              <a href={`https://app-factory-v2.vercel.app/apps/${encodeURIComponent(m.externalSlug)}`} target="_blank" rel="noreferrer" className="mt-3 inline-flex rounded-lg border border-cyan/30 px-3 py-1.5 text-[10px] text-cyan hover:bg-cyan/10">
-                open App Factory · {m.externalStage ?? m.externalStatus ?? "queued"} ↗
-              </a>
-            )}
-          </div>
-        )}
-        <div className="mt-5 space-y-2">
-          {m.jobs.map((j: any) => (
-            <div key={j._id} className={`${glass} flex items-center gap-3 p-3`}>
-              <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${JOB_DOT[j.status] ?? "bg-slate"}`} />
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-sm text-ice">{j.label}</div>
-                {j.status === "running" && j.progress && (
-                  <div className="mt-0.5 truncate font-mono text-[10px] text-cyan/80">› {j.progress}</div>
-                )}
-              </div>
-              {j.model && <span className="hud-label shrink-0 !text-[9px]">{workModelLabel(j.model)}{j.reasoningEffort ? `/${j.reasoningEffort}` : ""}</span>}
-              {j.readonly && <span className="hud-label shrink-0 !text-[9px] !text-cyan">read-only</span>}
-              {j.dependsOn?.length > 0 && <span className="hud-label shrink-0 !text-[9px]">after {j.dependsOn.length}</span>}
-              <span className="hud-label shrink-0 !text-[9px]">{j.status}</span>
-              {j.pullRequestUrl && <a href={j.pullRequestUrl} target="_blank" rel="noreferrer" className="text-[9px] text-cyan">PR ↗</a>}
-            </div>
-          ))}
-        </div>
-        {goalMode && m.failureReason && (
-          <div className="mt-4 rounded-xl border border-amber/25 bg-amber/[0.06] p-3 text-xs leading-relaxed text-amber">
-            <div className="hud-label mb-1 !text-amber">needs attention</div>
-            {m.failureReason}
-          </div>
-        )}
-        {goalMode && missionEvents.filter((event) => event.type === "pause" || event.type === "resume").length > 0 && (
-          <div className={`${glass} mt-4 p-3`}>
-            <div className="hud-label mb-2">pause / resume history</div>
-            <div className="space-y-1.5">
-              {missionEvents.filter((event) => event.type === "pause" || event.type === "resume").map((event) => (
-                <div key={event._id} className="flex items-center justify-between gap-3 text-[11px] text-slate">
-                  <span className="truncate"><span className="text-cyan">{event.type}</span> · {event.message}</span>
-                  <span className="shrink-0 font-mono text-[9px]">{new Date(event.createdAt).toLocaleString()}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-        {m.summary && (
-          <div className={`${glass} mt-4 p-4`}>
-            <div className="hud-label mb-2">mission report</div>
-            <div
-              className="text-sm leading-relaxed text-ice"
-              dangerouslySetInnerHTML={{ __html: mdPaper(m.summary) }}
-            />
-          </div>
-        )}
+          {startError && <div role="alert" className="mt-3 rounded-lg border border-red-400/20 bg-red-400/[0.06] px-3 py-2 text-xs text-red-300">{startError}</div>}
         </div>
       </div>
-      {goalMode && !["done", "cancelled"].includes(m.status) && (
-        <div className="shrink-0 border-t border-white/[0.07] bg-[#07101c]/95 px-5 py-3 backdrop-blur-xl">
-          <div className="flex flex-wrap justify-center gap-2">
-            {m.status === "running" ? (
-              <button disabled={Boolean(busy)} onClick={() => void controlGoal("pause")} className="rounded-lg border border-white/10 px-3 py-1.5 text-[10px] text-slate hover:text-ice disabled:opacity-50">{busy === "pause" ? "pausing…" : "pause"}</button>
-            ) : m.phase === "factory approval" ? (
-              m.externalSlug
-                ? <a href={`https://app-factory-v2.vercel.app/apps/${encodeURIComponent(m.externalSlug)}`} target="_blank" rel="noreferrer" className="rounded-lg border border-amber/30 bg-amber/[0.06] px-3 py-1.5 text-[10px] text-amber hover:bg-amber/10">review the human gate in App Factory ↗</a>
-                : <span className="rounded-lg border border-amber/20 px-3 py-1.5 text-[10px] text-amber">waiting for App Factory approval</span>
-            ) : (
-              <button disabled={Boolean(busy)} onClick={() => void controlGoal("resume")} className="rounded-lg border border-cyan/30 bg-cyan/[0.06] px-3 py-1.5 text-[10px] text-cyan hover:bg-cyan/10 disabled:opacity-50">{busy === "resume" ? "resuming…" : m.canExtendExternal ? "allow one more repair wave" : "resume"}</button>
-            )}
-            <button disabled={Boolean(busy)} onClick={() => void controlGoal("cancel")} className="rounded-lg border border-red-400/20 px-3 py-1.5 text-[10px] text-red-300/80 hover:bg-red-400/[0.06] disabled:opacity-50">{busy === "cancel" ? "cancelling…" : "cancel goal"}</button>
-          </div>
-          {controlError && <div className="mx-auto mt-2 max-w-2xl rounded-lg border border-red-400/20 bg-red-400/[0.06] px-3 py-2 text-xs text-red-300">{controlError}</div>}
-        </div>
-      )}
     </div>
   );
 }

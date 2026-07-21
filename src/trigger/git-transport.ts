@@ -1,3 +1,5 @@
+import { githubRepositoryUrl } from "../lib/workflow-contract";
+
 /**
  * GitHub authentication belongs only to the runner's individual git process.
  * Supplying it through ephemeral Git config keeps credentials out of command
@@ -21,4 +23,5 @@ export function githubGitEnv(base: NodeJS.ProcessEnv, token: string): NodeJS.Pro
   };
 }
 
-export const githubRepoUrl = (repo: string): string => `https://github.com/${repo}.git`;
+/** A remote is always rebuilt from a canonical, credential-free repository identity. */
+export const githubRepoUrl = (repo: string): string => githubRepositoryUrl(repo);

@@ -7,6 +7,7 @@ import { withAdminSession } from "./control-context";
 import { wakeAgentFleet } from "./agent-fleet-dispatch";
 import { SHALLOW_PROVENANCE_RULE } from "./git-delivery";
 import { workModelLabel, workModelPriority } from "./work-models";
+import { exactTextWorkOrder } from "./work-order";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
 import {
   VISUAL_BLOCK_KINDS,
@@ -79,9 +80,10 @@ export const TOOL_DEFS = [
     parameters: {
       type: "object",
       properties: {
-        action: { type: "string", enum: ["start", "status", "pause", "resume", "cancel"] },
+        action: { type: "string", enum: ["start", "status", "pause", "resume", "cancel", "steer"] },
         goal: { type: "string", description: "Concrete observable outcome; required for start" },
         mission_id: { type: "string", description: "Goal Mode mission id; required for pause/resume/cancel and optional for status" },
+        input: { type: "string", description: "Steering instruction when action=steer; preserves accepted node scope and creates fresh execution generations" },
         repo: { type: "string", description: "Known owner/repo only when the goal explicitly belongs there" },
         acceptance_criteria: { type: "array", items: { type: "string" }, description: "Observable goal-level truths the final Sol validator must prove" },
         build_sessions: { type: "number", description: "Maximum bounded Terra/high implementation sessions, 2-8; default 6" },
@@ -93,13 +95,13 @@ export const TOOL_DEFS = [
   {
     name: "work_control",
     description:
-      "Control a durable team job shown in the command deck: approve or decline consequential work, pause/resume/cancel an active job, or retry a failed job. Use only after Daniel identifies the job or explicitly answers an approval card.",
+      "Control a durable team job shown in the command deck: approve or decline consequential work, steer/pause/resume/cancel active work, or retry a failed job. Steering checkpoints the current attempt into a fresh scoped session.",
     parameters: {
       type: "object",
       properties: {
         job_id: { type: "string", description: "Job id from team_status/command deck" },
-        action: { type: "string", enum: ["approve", "decline", "pause", "resume", "cancel", "retry", "answer"] },
-        input: { type: "string", description: "Daniel's answer when action=answer" },
+        action: { type: "string", enum: ["approve", "decline", "pause", "resume", "cancel", "retry", "answer", "steer"] },
+        input: { type: "string", description: "Daniel's answer when action=answer, or new instruction when action=steer" },
       },
       required: ["job_id", "action"],
     },
@@ -3008,8 +3010,8 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
   return await withAdminSession(authTokenHash, async () => {
     switch (name) {
     case "dispatch_agent": {
-      const task = String(args.task ?? "").trim().slice(0, 6000);
-      if (!task) return "Give me the outcome you want the team to own.";
+      const task = exactTextWorkOrder(String(args.task ?? ""));
+      if (!task.trim()) return "Give me the outcome you want the team to own.";
       const repo = args.repo ? String(args.repo) : undefined;
       const [{ routeWork, suggestedAcceptanceCriteria }, { TEAM_BY_SLUG }] = await Promise.all([
         import("../mastra/routing"),
@@ -3058,7 +3060,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         const missions: any[] = (await convexQuery("missions:active", {})) ?? [];
         const goal = missionId
           ? missions.find((mission) => String(mission._id) === missionId && mission.mode === "goal")
-          : missions.find((mission) => mission.mode === "goal" && ["running", "paused", "needs_input"].includes(mission.status));
+          : missions.find((mission) => mission.mode === "goal" && ["running", "split", "paused", "needs_input"].includes(mission.status));
         await convexMutation("ui:setPanel", {
           type: "fleet",
           value: JSON.stringify(goal ? { missionId: String(goal._id), mode: "goal" } : { mode: "goal" }),
@@ -3068,15 +3070,17 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           ? `Goal ${goal._id} is ${goal.status}, phase ${goal.phase}, ${goal.percent}% complete${goal.failureReason ? ` — ${goal.failureReason}` : ""}. Its durable sessions and evidence are on screen.`
           : "There is no active Goal Mode outcome. The Goal Mode command deck is open.";
       }
-      if (action === "pause" || action === "resume" || action === "cancel") {
+      if (action === "pause" || action === "resume" || action === "cancel" || action === "steer") {
         if (!missionId) return `Choose the Goal Mode outcome to ${action}.`;
-        const ok = await convexMutation("goalMode:control", { id: missionId, action, authTokenHash });
-        let shouldWake = action === "resume";
+        const input = action === "steer" ? String(args.input ?? "").trim() : undefined;
+        if (action === "steer" && !input) return "Tell me the new direction for the unfinished Goal Mode nodes.";
+        const ok = await convexMutation("goalMode:control", { id: missionId, action, input, authTokenHash });
+        let shouldWake = action === "resume" || action === "steer";
         if (ok) {
           const { goalCoordinationDemand, syncExternalGoalControls, syncExternalGoalRevisions } = await import("../trigger/goal-runtime");
           await syncExternalGoalControls().catch(() => null);
           await syncExternalGoalRevisions().catch(() => null);
-          if (action === "resume") {
+          if (action === "resume" || action === "steer") {
             const demand = await goalCoordinationDemand().catch(() => null);
             if (demand) shouldWake = demand.needed === true;
           }
@@ -3201,8 +3205,10 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         if (ok) await wakeAgentFleet(`continued:${jobId}`).catch(() => false);
         return ok ? "Passed that decision back to the specialist; the continuation is queued." : "That job is not waiting for input now.";
       }
-      const ok = await convexMutation("jobs:control", { jobId, action, authTokenHash });
-      if (ok && (action === "resume" || action === "retry")) {
+      const input = action === "steer" ? String(args.input ?? "").trim() : undefined;
+      if (action === "steer" && !input) return "Tell me the new direction you want the specialist to follow.";
+      const ok = await convexMutation("jobs:control", { jobId, action, input, authTokenHash });
+      if (ok && (action === "resume" || action === "retry" || action === "steer")) {
         await wakeAgentFleet(`${action}:${jobId}`).catch(() => false);
       }
       return ok ? `Job ${jobId} ${action} request applied.` : `That job cannot be ${action}d from its current state.`;

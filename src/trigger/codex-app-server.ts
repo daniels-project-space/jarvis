@@ -35,10 +35,49 @@ export type CodexDynamicToolResult = {
   contentItems: Array<{ type: "inputText"; text: string } | { type: "inputImage"; imageUrl: string }>;
   success: boolean;
 };
+export type CodexPermissionProfileOptions = {
+  id: string;
+  config: JsonObject;
+  environments: [];
+  runtimeWorkspaceRoots: string[];
+  expected: {
+    activePermissionProfileId: string;
+    sandbox: { type: "readOnly"; networkAccess: false };
+  };
+};
 export type CodexAppServerOptions = {
   dynamicTools?: CodexDynamicToolSpec[];
   onDynamicToolCall?: (call: CodexDynamicToolCall) => Promise<CodexDynamicToolResult>;
+  controllerCwd?: string;
+  threadSandbox?: "danger-full-access" | "read-only" | "workspace-write";
+  permissionProfile?: CodexPermissionProfileOptions;
+  developerInstructions?: string;
+  ephemeral?: boolean;
 };
+
+export class CodexPermissionAttestationError extends Error {
+  readonly code = "permission_attestation_failed";
+  readonly disposition = "blocked";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "CodexPermissionAttestationError";
+  }
+}
+
+export function verifyCodexPermissionAttestation(
+  response: JsonObject,
+  expected: CodexPermissionProfileOptions["expected"],
+): void {
+  const active = response.activePermissionProfile as JsonObject | undefined;
+  const sandbox = response.sandbox as JsonObject | undefined;
+  if (active?.id !== expected.activePermissionProfileId) {
+    throw new CodexPermissionAttestationError("Codex thread did not activate the required permission profile");
+  }
+  if (sandbox?.type !== expected.sandbox.type || sandbox?.networkAccess !== expected.sandbox.networkAccess) {
+    throw new CodexPermissionAttestationError("Codex thread did not attest the required read-only, network-denied sandbox");
+  }
+}
 export type CodexTurnInput = {
   conversationId: string;
   userText: string;
@@ -73,7 +112,11 @@ export class CodexAppServer {
   }
 
   private async startInner() {
-    const child = spawn(this.bin, ["app-server", "--listen", "stdio://"], { env: this.env, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(this.bin, ["app-server", "--listen", "stdio://"], {
+      env: this.env,
+      cwd: this.options.controllerCwd,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
     this.process = child;
     child.stderr.on("data", (data) => { this.stderr = (this.stderr + data.toString()).slice(-1200); });
     child.on("error", (error) => this.failAll(error));
@@ -94,16 +137,33 @@ export class CodexAppServer {
     let threadId = this.threads.get(input.conversationId);
     const isNewThread = !threadId;
     if (!threadId) {
-      const response = await this.request("thread/start", {
-        model: selection.model,
-        baseInstructions: input.preamble,
-        developerInstructions: "Remain the foreground Jarvis conversation. Give the useful answer immediately. Delegate long work instead of blocking conversation.",
-        cwd: "/tmp",
-        approvalPolicy: "never",
-        sandbox: "danger-full-access",
-        ephemeral: false,
-        dynamicTools: this.options.dynamicTools,
-      }, 30_000);
+      const permissionProfile = this.options.permissionProfile;
+      let response: JsonObject;
+      try {
+        response = await this.request("thread/start", {
+          model: selection.model,
+          baseInstructions: input.preamble,
+          developerInstructions: this.options.developerInstructions ?? "Remain the foreground Jarvis conversation. Give the useful answer immediately. Delegate long work instead of blocking conversation.",
+          cwd: this.options.controllerCwd ?? "/tmp",
+          approvalPolicy: "never",
+          ...(permissionProfile ? {
+            permissions: permissionProfile.id,
+            config: permissionProfile.config,
+            environments: permissionProfile.environments,
+            runtimeWorkspaceRoots: permissionProfile.runtimeWorkspaceRoots,
+          } : {
+            sandbox: this.options.threadSandbox ?? "danger-full-access",
+          }),
+          ephemeral: this.options.ephemeral ?? false,
+          dynamicTools: this.options.dynamicTools,
+        }, 30_000);
+      } catch (error) {
+        if (permissionProfile) {
+          throw new CodexPermissionAttestationError("Codex thread permission attestation was unavailable");
+        }
+        throw error;
+      }
+      if (permissionProfile) verifyCodexPermissionAttestation(response, permissionProfile.expected);
       const thread = response.thread as JsonObject | undefined;
       threadId = typeof thread?.id === "string" ? thread.id : "";
       if (!threadId) throw new Error("Codex app-server did not return a thread id");

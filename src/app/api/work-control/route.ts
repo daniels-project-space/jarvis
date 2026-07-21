@@ -3,7 +3,7 @@ import { controlMutation } from "@/lib/control-session";
 import { wakeAgentFleet } from "@/lib/agent-fleet-dispatch";
 import { controlActor, controlCredentials } from "@/lib/request-auth";
 
-const ACTIONS = new Set(["approve", "decline", "pause", "resume", "cancel", "retry", "answer"]);
+const ACTIONS = new Set(["approve", "decline", "pause", "resume", "cancel", "retry", "answer", "steer"]);
 
 export async function POST(req: NextRequest) {
   const actor = await controlActor(req);
@@ -18,8 +18,10 @@ export async function POST(req: NextRequest) {
   let ok: unknown = false;
   let shouldWake = false;
   if (missionId) {
-    if (!new Set(["pause", "resume", "cancel"]).has(action)) return Response.json({ ok: false }, { status: 400 });
-    ok = await controlMutation("goalMode:control", { id: missionId, action, ...credentials });
+    if (!new Set(["pause", "resume", "cancel", "steer"]).has(action)) return Response.json({ ok: false }, { status: 400 });
+    const input = action === "steer" ? String(body?.input ?? "").trim() : undefined;
+    if (action === "steer" && !input) return Response.json({ ok: false }, { status: 400 });
+    ok = await controlMutation("goalMode:control", { id: missionId, action, input, ...credentials });
   } else if (action === "approve" || action === "decline") {
     ok = await controlMutation("approvals:decide", {
       jobId,
@@ -31,18 +33,20 @@ export async function POST(req: NextRequest) {
     if (!answer) return Response.json({ ok: false }, { status: 400 });
     ok = await controlMutation("jobs:provideInput", { jobId, answer, ...credentials });
   } else {
-    ok = await controlMutation("jobs:control", { jobId, action, ...credentials });
+    const input = action === "steer" ? String(body?.input ?? "").trim() : undefined;
+    if (action === "steer" && !input) return Response.json({ ok: false }, { status: 400 });
+    ok = await controlMutation("jobs:control", { jobId, action, input, ...credentials });
   }
   if (ok === true && missionId) {
     const { goalCoordinationDemand, syncExternalGoalControls, syncExternalGoalRevisions } = await import("@/trigger/goal-runtime");
     await syncExternalGoalControls().catch(() => null);
     await syncExternalGoalRevisions().catch(() => null);
-    if (action === "resume") {
+    if (action === "resume" || action === "steer") {
       shouldWake = true;
       const demand = await goalCoordinationDemand().catch(() => null);
       if (demand) shouldWake = demand.needed === true;
     }
-  } else if (ok === true && ["approve", "resume", "retry", "answer"].includes(action)) {
+  } else if (ok === true && ["approve", "resume", "retry", "answer", "steer"].includes(action)) {
     shouldWake = true;
   }
   if (shouldWake) {

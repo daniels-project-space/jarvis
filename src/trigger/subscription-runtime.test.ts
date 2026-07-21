@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   isolateSubscriptionEnv,
+  isolateCloudSubscriptionEnv,
   missingSubscriptionTools,
   prepareSubscriptionEnv,
   REQUIRED_AGENT_TOOLS,
@@ -70,5 +72,38 @@ describe("subscription subprocess capability scope", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("gives cloud specialists auth without inheriting user config or instructions", () => {
+    const root = mkdtempSync(join(tmpdir(), "jarvis-cloud-codex-test-"));
+    const source = join(root, "source");
+    const homes = join(root, "homes");
+    try {
+      mkdirSync(source, { recursive: true });
+      writeFileSync(join(source, "auth.json"), '{"tokens":{}}');
+      writeFileSync(join(source, "config.toml"), 'sandbox_mode = "danger-full-access"');
+      writeFileSync(join(source, "AGENTS.md"), "controller authority briefing");
+      const env = isolateCloudSubscriptionEnv({ ...process.env, CODEX_HOME: source }, "cloud-job", homes);
+      expect(readFileSync(join(String(env.CODEX_HOME), "auth.json"), "utf8")).toContain("tokens");
+      expect(() => readFileSync(join(String(env.CODEX_HOME), "config.toml"), "utf8")).toThrow();
+      expect(() => readFileSync(join(String(env.CODEX_HOME), "AGENTS.md"), "utf8")).toThrow();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("strips controller authority from an actual spawned specialist environment", () => {
+    const env = isolateCloudSubscriptionEnv({
+      ...process.env, CODEX_HOME: process.cwd(),
+      JARVIS_GIT_REVIEW_RECEIPT_SECRET: "receipt-secret", CONVEX_URL: "https://control.example",
+      JARVIS_GIT_REVIEW_RECEIPT_KEYRING: "keyring-secret-and-metadata",
+      JARVIS_CLOUD_PROVIDER_PROBE_KEYRING: "provider-probe-verifier-secret",
+      JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT: "signed-provider-probe-envelope",
+      SANDBOX0_TOKEN: "sandbox-provider-secret",
+      TRIGGER_SECRET_KEY: "trigger-secret", GITHUB_TOKEN: "github-secret",
+    }, "spawn-scope");
+    const child = spawnSync(process.execPath, ["-e", "process.stdout.write(JSON.stringify({receipt:process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET,keyring:process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING,providerProbeKeyring:process.env.JARVIS_CLOUD_PROVIDER_PROBE_KEYRING,providerProbeReceipt:process.env.JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT,providerToken:process.env.SANDBOX0_TOKEN,convex:process.env.CONVEX_URL,trigger:process.env.TRIGGER_SECRET_KEY,github:process.env.GITHUB_TOKEN}))"], { env, encoding: "utf8" });
+    expect(child.status).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual({});
   });
 });
