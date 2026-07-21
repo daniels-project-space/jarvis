@@ -272,7 +272,7 @@ function runAgent(
 ): Promise<{
   text: string;
   timedOut: boolean;
-  stopped: "paused" | "cancelled" | null;
+  stopped: "paused" | "cancelled" | "stalled" | "steered" | null;
   checkpointLog: string;
   commands: GitCommandEvidence[];
 }> {
@@ -309,7 +309,7 @@ function runAgent(
           }
         }, 1500)
       : null;
-    const finish = (timedOut: boolean, stopped: "paused" | "cancelled" | null = null) => {
+    const finish = (timedOut: boolean, stopped: "paused" | "cancelled" | "stalled" | "steered" | null = null) => {
       if (settled) return;
       settled = true;
       clearTimeout(to);
@@ -338,7 +338,7 @@ function runAgent(
           controlBusy = true;
           try {
             const state = await executionState();
-            if (state === "paused" || state === "cancelled") {
+            if (state === "paused" || state === "cancelled" || state === "stalled" || state === "steered") {
               try {
                 p.kill("SIGTERM");
                 setTimeout(() => {
@@ -765,9 +765,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     const processJob = async (job: any): Promise<void> => {
       const originThread = typeof job.originThreadId === "string" && job.originThreadId ? job.originThreadId : "main";
       const expectedAttempt = Number(job.attempt ?? 1);
+      const expectedSteerRevision = Number(job.steerRevision ?? 0);
       const executionStatus = async (): Promise<string> => {
         const lease: any = await convexQuery("jobs:executionLease", { jobId: job.jobId });
         if (!lease || Number(lease.attempt) !== expectedAttempt) return "superseded";
+        if (Number(lease.steerRevision ?? 0) !== expectedSteerRevision) return "steered";
         return String(lease.status ?? "missing");
       };
       const stopIfLeaseLost = async (checkpoint: string, result: string, branch?: string | null): Promise<boolean> => {
@@ -1000,6 +1002,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const checkpoint = job.checkpoint
           ? `\n\nCONTINUATION CHECKPOINT (attempt ${job.attempt ?? 1}; preserve completed work, do not start over):\n${String(job.checkpoint).slice(0, 6000)}`
           : "";
+        const steering = typeof job.steer === "string" && job.steer.trim()
+          ? `\n\nLATEST DANIEL STEERING (supersedes conflicting prior direction):\n${job.steer.slice(0, 2000)}`
+          : "";
         const followUp = job.parentJobId
           ? `\n\nCONCURRENT FOLLOW-UP: this job extends ${job.parentJobId}. That earlier job may still be running. Own this issue independently; do not wait for it or overwrite its branch.`
           : "";
@@ -1008,7 +1013,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           `You are ${profile.name}, JARVIS's permanent ${profile.role}.\n${profile.instructions}\n\n${context}\n\n` +
           `${upstream ? `${upstream}\n\n` : ""}` +
           `TASK:\n${job.task}\n\nDEFINITION OF DONE:\n${criteria.map((item: string) => `- ${item}`).join("\n")}` +
-          `${checkpoint}${followUp}\n\n${SAFE_SANDBOX_EXECUTION_RULES}\n\nBefore finishing, verify the definition of done and explicitly report the evidence. If a consequential action or personal decision is required, stop and ask one precise question.`;
+          `${checkpoint}${steering}${followUp}\n\n${SAFE_SANDBOX_EXECUTION_RULES}\n\nBefore finishing, verify the definition of done and explicitly report the evidence. If a consequential action or personal decision is required, stop and ask one precise question.`;
         const model = normalizeWorkModelTier(
           typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task),
         );
@@ -1016,7 +1021,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           ? await buildMcpConfig(job.mcp, jobKey)
           : { configPath: null, env: {} };
         const agentEnv = { ...jobEnv, ...mcp.env };
-        let lastDurableProgressAt = 0;
+        let lastHeartbeatAt = 0;
         let lastDurableStage = "";
         let lastDurablePercent = 0;
         let durableProgress = Promise.resolve<unknown>(undefined);
@@ -1034,9 +1039,15 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           const nextPercent = Number(percent ?? 0);
           const majorTransition = Boolean(stage && stage !== lastDurableStage)
             || nextPercent - lastDurablePercent >= 15;
-          const heartbeatDue = now - lastDurableProgressAt >= 30_000;
-          if (!majorTransition && !heartbeatDue) return;
-          lastDurableProgressAt = now;
+          const heartbeatDue = now - lastHeartbeatAt >= 30_000;
+          if (heartbeatDue) {
+            lastHeartbeatAt = now;
+            durableProgress = durableProgress
+              .catch(() => undefined)
+              .then(() => convexMutation("jobs:touchHeartbeat", { jobId: job.jobId, expectedAttempt }))
+              .catch(() => undefined);
+          }
+          if (!majorTransition) return;
           lastDurableStage = stage ?? lastDurableStage;
           lastDurablePercent = Math.max(lastDurablePercent, nextPercent);
           durableProgress = durableProgress
@@ -1072,12 +1083,22 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const checkpointText = buildContinuationCheckpoint({
           attempt: expectedAttempt,
           timedOut: run.timedOut,
-          stopped: run.stopped,
+          stopped: run.stopped === "steered" || run.stopped === "stalled" ? null : run.stopped,
           priorCheckpoint: job.checkpoint,
           narrative: result,
           trace: run.checkpointLog,
         });
         if (run.stopped) {
+          if (run.stopped === "steered") {
+            await convexMutation("jobs:checkpointAndRequeue", {
+              jobId: job.jobId,
+              expectedAttempt,
+              checkpoint: `${checkpointText}\n\nA steering instruction arrived. Start a fresh scoped session from this checkpoint.`,
+              result: result.slice(0, 4000),
+              branch: branch ?? undefined,
+            }).catch(() => null);
+            return;
+          }
           await stopIfLeaseLost(checkpointText, result, branch);
           return;
         }

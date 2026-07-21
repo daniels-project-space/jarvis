@@ -34,6 +34,11 @@ export function projectJobRuntime(job: any) {
     attempt: Math.max(1, Number(job.attempt ?? 1)),
     maxAttempts: Math.max(1, Number(job.maxAttempts ?? 12)),
     heartbeatAt: Number(job.heartbeatAt ?? job.startedAt ?? createdAt),
+    progressAt: Number(job.progressAt ?? job.startedAt ?? createdAt),
+    stallCount: Math.max(0, Number(job.stallCount ?? 0)),
+    stalledAt: typeof job.stalledAt === "number" ? job.stalledAt : undefined,
+    stallReason: typeof job.stallReason === "string" ? job.stallReason.slice(0, 400) : undefined,
+    steerRevision: Math.max(0, Number(job.steerRevision ?? 0)),
     nextRunAt: typeof job.nextRunAt === "number" ? job.nextRunAt : undefined,
     dispatchId: typeof job.dispatchId === "string" ? job.dispatchId.slice(0, 180) : undefined,
     dispatchLeaseUntil: typeof job.dispatchLeaseUntil === "number" ? job.dispatchLeaseUntil : undefined,
@@ -129,7 +134,7 @@ export async function upsertJobRuntime(ctx: any, job: any) {
   else await ctx.db.insert("jobRuntime", projected);
 }
 
-const LIVE_JOB_ACTIVITY_FIELDS = ["stage", "percent", "progress", "heartbeatAt", "updatedAt"] as const;
+const LIVE_JOB_ACTIVITY_FIELDS = ["stage", "percent", "progress", "heartbeatAt", "progressAt", "updatedAt"] as const;
 
 // Progress heartbeats intentionally do not rewrite the durable job. When a
 // later authority transition patches an unrelated field (for example a pull

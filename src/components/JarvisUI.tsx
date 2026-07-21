@@ -89,6 +89,9 @@ type Job = {
   attempt?: number;
   maxAttempts?: number;
   heartbeatAt?: number;
+  progressAt?: number;
+  stalledAt?: number;
+  stallReason?: string;
   checkpoint?: string;
   branch?: string;
   pullRequestUrl?: string;
@@ -588,7 +591,7 @@ function AgentLiveSurface({
   const elapsed = Math.max(0, Math.floor((now - job.startedAt) / 1000));
   const pct = Math.max(0, Math.min(100, job.percent ?? 0));
   const owner = ({ paul: "Paul", atlas: "Atlas", iris: "Iris", maya: "Maya", sentry: "Sentry", jarvis: "JARVIS" } as Record<string, string>)[job.agentId ?? ""] ?? "Agent";
-  const control = async (action: "approve" | "decline" | "cancel") => {
+  const control = async (action: "approve" | "decline" | "pause" | "resume" | "cancel") => {
     setActing(action);
     try {
       await viewerFetch("/api/work-control", {
@@ -648,8 +651,12 @@ function AgentLiveSurface({
             <button disabled={Boolean(acting)} onClick={() => void control("decline")} className="rounded border border-white/10 px-2 py-0.5 text-[8px] uppercase tracking-wider text-slate disabled:opacity-40">decline</button>
           </>
         )}
-        {!needsDaniel(job) && job.status === "running" && (
+        {!needsDaniel(job) && job.status === "running" && <>
+          <button disabled={Boolean(acting)} onClick={() => void control("pause")} className="rounded px-2 py-0.5 text-[8px] uppercase tracking-wider text-slate disabled:opacity-40">pause</button>
           <button disabled={Boolean(acting)} onClick={() => void control("cancel")} className="rounded px-2 py-0.5 text-[8px] uppercase tracking-wider text-red-300/80 disabled:opacity-40">cancel</button>
+        </>}
+        {!needsDaniel(job) && (job.status === "paused" || job.status === "stalled") && (
+          <button disabled={Boolean(acting)} onClick={() => void control("resume")} className="rounded px-2 py-0.5 text-[8px] uppercase tracking-wider text-cyan disabled:opacity-40">resume</button>
         )}
       </div>
     </div>

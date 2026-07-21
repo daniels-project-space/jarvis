@@ -93,13 +93,13 @@ export const TOOL_DEFS = [
   {
     name: "work_control",
     description:
-      "Control a durable team job shown in the command deck: approve or decline consequential work, pause/resume/cancel an active job, or retry a failed job. Use only after Daniel identifies the job or explicitly answers an approval card.",
+      "Control a durable team job shown in the command deck: approve or decline consequential work, steer/pause/resume/cancel active work, or retry a failed job. Steering checkpoints the current attempt into a fresh scoped session.",
     parameters: {
       type: "object",
       properties: {
         job_id: { type: "string", description: "Job id from team_status/command deck" },
-        action: { type: "string", enum: ["approve", "decline", "pause", "resume", "cancel", "retry", "answer"] },
-        input: { type: "string", description: "Daniel's answer when action=answer" },
+        action: { type: "string", enum: ["approve", "decline", "pause", "resume", "cancel", "retry", "answer", "steer"] },
+        input: { type: "string", description: "Daniel's answer when action=answer, or new instruction when action=steer" },
       },
       required: ["job_id", "action"],
     },
@@ -3201,8 +3201,10 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         if (ok) await wakeAgentFleet(`continued:${jobId}`).catch(() => false);
         return ok ? "Passed that decision back to the specialist; the continuation is queued." : "That job is not waiting for input now.";
       }
-      const ok = await convexMutation("jobs:control", { jobId, action, authTokenHash });
-      if (ok && (action === "resume" || action === "retry")) {
+      const input = action === "steer" ? String(args.input ?? "").trim() : undefined;
+      if (action === "steer" && !input) return "Tell me the new direction you want the specialist to follow.";
+      const ok = await convexMutation("jobs:control", { jobId, action, input, authTokenHash });
+      if (ok && (action === "resume" || action === "retry" || action === "steer")) {
         await wakeAgentFleet(`${action}:${jobId}`).catch(() => false);
       }
       return ok ? `Job ${jobId} ${action} request applied.` : `That job cannot be ${action}d from its current state.`;

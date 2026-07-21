@@ -9,6 +9,7 @@ import { normalizeWorkModelTier } from "../src/lib/work-models";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
+import { hasAttemptBudget, isMeaningfulWorkProgress } from "../src/lib/work-attempt";
 import {
   insertJobWithRuntime,
   jobRuntimeFor,
@@ -20,7 +21,41 @@ import {
 } from "./controlPlane";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
+// A live process that cannot produce a causal stage/percentage advance is not
+// healthy work. Keep this comfortably above a normal Codex tool segment while
+// still surfacing a genuinely stuck attempt before its lease disappears.
+const STALLED_PROGRESS_MS = 20 * 60 * 1000;
 const DISPATCH_LEASE_MS = 2 * 60 * 1000;
+
+async function attemptFor(ctx: any, jobId: any, attempt: number) {
+  return await ctx.db
+    .query("workAttempts")
+    .withIndex("by_job_attempt", (q: any) => q.eq("jobId", jobId).eq("attempt", attempt))
+    .first();
+}
+
+async function appendAttemptEvidence(ctx: any, row: any, type: string, message: string, options: {
+  stage?: string;
+  percent?: number;
+  evidenceKind?: string;
+  causationId?: string;
+  data?: unknown;
+} = {}) {
+  return await ctx.db.insert("workEvents", {
+    jobId: String(row._id),
+    missionId: row.missionId,
+    agentId: row.agentId,
+    type,
+    message: message.slice(0, 1200),
+    stage: options.stage,
+    percent: options.percent,
+    attempt: row.attempt ?? 1,
+    causationId: options.causationId ?? `attempt:${String(row._id)}:${row.attempt ?? 1}`,
+    evidenceKind: options.evidenceKind ?? "lifecycle",
+    data: options.data,
+    createdAt: Date.now(),
+  });
+}
 
 const enqueueArgs = {
   task: v.string(),
@@ -83,6 +118,9 @@ export const enqueue = mutation({
       deliveryMode: approval.deliveryMode,
       stage: approvalRequired ? "approval" : "queued",
       percent: 0,
+      progressAt: now,
+      stallCount: 0,
+      steerRevision: 0,
       attempt: 1,
       maxAttempts: Math.max(1, Math.min(48, input.maxAttempts ?? 12)),
       nextRunAt: now,
@@ -446,6 +484,8 @@ function claimedJob(j: any, upstreamEvidence: any[] = []) {
     goalStage: j.goalStage ?? null,
     goalWorkstreamId: j.goalWorkstreamId ?? null,
     goalWave: j.goalWave ?? 0,
+    steer: j.steer ?? null,
+    steerRevision: j.steerRevision ?? 0,
     upstreamEvidence,
   };
 }
@@ -520,6 +560,12 @@ export const claimDispatched = mutation({
       j.dispatchId !== a.dispatchId ||
       (j.dispatchLeaseUntil ?? 0) < now
     ) return null;
+    const priorAttempt = await attemptFor(ctx, a.jobId, j.attempt ?? 1);
+    if (priorAttempt) {
+      // A stale platform redelivery must not replace the original workspace
+      // or session receipt. It cannot cross the launch fence a second time.
+      return null;
+    }
     await patchJobWithRuntime(ctx, j, {
       status: "running",
       stage: "starting",
@@ -527,10 +573,26 @@ export const claimDispatched = mutation({
       percent: Math.max(2, j.percent ?? 0),
       startedAt: now,
       heartbeatAt: now,
+      progressAt: now,
+      stalledAt: undefined,
+      stallReason: undefined,
       nextRunAt: undefined,
       dispatchLeaseUntil: undefined,
       workerRunId: a.workerRunId.slice(0, 120),
       workerRuntime: "trigger",
+    });
+    await ctx.db.insert("workAttempts", {
+      jobId: a.jobId,
+      attempt: j.attempt ?? 1,
+      status: "running",
+      workspaceKey: `convex:${String(a.jobId)}:attempt:${j.attempt ?? 1}`,
+      sessionId: a.workerRunId.slice(0, 120),
+      workerRunId: a.workerRunId.slice(0, 120),
+      launchedAt: now,
+      livenessAt: now,
+      progressAt: now,
+      lastEventAt: now,
+      createdAt: now,
     });
     const upstreamRows = j.missionId
       ? await ctx.db
@@ -551,15 +613,11 @@ export const claimDispatched = mutation({
         result: String(row.result).slice(0, 1_400),
         verificationNote: String(row.verificationNote ?? "").slice(0, 300),
       }));
-    await ctx.db.insert("workEvents", {
-      jobId: String(j._id),
-      missionId: j.missionId,
-      agentId: j.agentId,
-      type: "started",
-      message: `Attempt ${j.attempt ?? 1} started`,
+    await appendAttemptEvidence(ctx, j, "started", `Attempt ${j.attempt ?? 1} started`, {
       stage: "starting",
       percent: Math.max(2, j.percent ?? 0),
-      createdAt: now,
+      evidenceKind: "attempt_launch",
+      data: { workspace: `convex:${String(a.jobId)}:attempt:${j.attempt ?? 1}`, session: a.workerRunId.slice(0, 120) },
     });
     return claimedJob(j, upstreamEvidence);
   },
@@ -620,7 +678,11 @@ export const finalize = mutation({
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
     // A completed job is called "verified" only when the supervisor actually
     // returned pass. This invariant lives in Convex, not only in the runner.
-    if (a.status === "done" && a.verificationVerdict !== "pass") return false;
+    if (a.status === "done" && (
+      a.verificationVerdict !== "pass"
+      || !String(a.result ?? "").trim()
+      || !String(a.verificationNote ?? "").trim()
+    )) return false;
     const now = Date.now();
     const success = a.status === "done";
     const delivered = success && row.deliveryStatus === "merged";
@@ -642,19 +704,39 @@ export const finalize = mutation({
       verificationNote: a.verificationNote?.slice(0, 1000),
       verifiedAt: success ? now : undefined,
     };
+    if (success) {
+      const priorReceipt = await ctx.db
+        .query("workReceipts")
+        .withIndex("by_job_attempt", (q: any) => q.eq("jobId", a.jobId).eq("attempt", a.expectedAttempt))
+        .first();
+      if (priorReceipt) return false;
+      const artifacts = [row.branch, a.pullRequestUrl ?? row.pullRequestUrl, row.mergeCommitSha]
+        .filter((value): value is string => typeof value === "string" && value.length > 0)
+        .slice(0, 8);
+      // A bounded result is the portable artifact for research/read-only work;
+      // repository work additionally carries its branch/PR/merge evidence.
+      if (!artifacts.length) artifacts.push(`result:${String(a.result).trim().slice(0, 240)}`);
+      await ctx.db.insert("workReceipts", {
+        jobId: a.jobId,
+        attempt: a.expectedAttempt,
+        status: "succeeded",
+        acceptanceEvidence: [String(a.verificationNote).slice(0, 1_000), String(a.result).slice(0, 1_000)],
+        artifacts,
+        verification: "pass",
+        createdAt: now,
+      });
+    }
     await patchJobWithRuntime(ctx, row, finalPatch);
-    await ctx.db.insert("workEvents", {
-      jobId: String(a.jobId),
-      missionId: row.missionId,
-      agentId: row.agentId,
-      type: a.status,
-      message: success
-        ? delivered ? "Work verified and merged automatically" : "Work verified and complete"
-        : (a.result ?? a.status).slice(0, 500),
-      stage: success ? (delivered ? "delivered" : "verified") : a.status,
-      percent: finalPercent,
-      createdAt: now,
+    const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    if (attempt) await ctx.db.patch(attempt._id, {
+      status: success ? "done" : "error",
+      completedAt: now,
+      lastEventAt: now,
     });
+    await appendAttemptEvidence(ctx, row, a.status,
+      success ? delivered ? "Work verified and merged automatically" : "Work verified and complete" : (a.result ?? a.status),
+      { stage: success ? (delivered ? "delivered" : "verified") : a.status, percent: finalPercent, evidenceKind: success ? "completion_receipt" : "terminal" },
+    );
     if (row.missionId) {
       const missionId = ctx.db.normalizeId("missions", row.missionId);
       if (missionId) {
@@ -805,6 +887,41 @@ export const reapStale = mutation({
       .take(100);
     const requeued: string[] = [];
     const abandoned: string[] = [];
+    const stalled: string[] = [];
+    // This pass catches the important case the old heartbeat-only design
+    // could not see: a responsive container emitting liveness ticks while no
+    // stage, percentage, or evidence has advanced.
+    const noProgress = await ctx.db
+      .query("jobRuntime")
+      .withIndex("by_status_progress", (q: any) => q.eq("status", "running").lte("progressAt", now - STALLED_PROGRESS_MS))
+      .take(100);
+    for (const activity of noProgress) {
+      if ((activity.heartbeatAt ?? 0) <= now - STALE_RUNNER_MS) continue;
+      const j = await ctx.db.get(activity.jobId);
+      if (!j || j.status !== "running" || (j.attempt ?? 1) !== activity.attempt) {
+        if (j) await upsertJobRuntime(ctx, j);
+        continue;
+      }
+      const attempt = await attemptFor(ctx, j._id, j.attempt ?? 1);
+      if (!attempt || attempt.status !== "running") continue;
+      const reason = `No causal progress for ${Math.floor((now - activity.progressAt) / 60_000)} minutes while the worker remained live`;
+      await patchJobWithRuntime(ctx, j, {
+        status: "stalled",
+        stage: "stalled",
+        progress: reason,
+        stalledAt: now,
+        stallReason: reason,
+        stallCount: (j.stallCount ?? 0) + 1,
+        nextRunAt: undefined,
+      });
+      await ctx.db.patch(attempt._id, { status: "stalled", completedAt: now, lastEventAt: now });
+      await appendAttemptEvidence(ctx, j, "stalled", reason, {
+        stage: "stalled",
+        percent: activity.percent,
+        evidenceKind: "watchdog",
+      });
+      stalled.push(j.task.slice(0, 80));
+    }
     for (const activity of running) {
       const j = await ctx.db.get(activity.jobId);
       if (!j || j.status !== "running" || (j.attempt ?? 1) !== activity.attempt) {
@@ -824,6 +941,8 @@ export const reapStale = mutation({
           result: "abandoned: runner repeatedly stopped without a checkpoint",
         });
         abandoned.push(j.task.slice(0, 80));
+        const attempt = await attemptFor(ctx, j._id, j.attempt ?? 1);
+        if (attempt) await ctx.db.patch(attempt._id, { status: "error", completedAt: now, lastEventAt: now });
       } else {
         const checkpoint = buildContinuationCheckpoint({
           attempt: j.attempt ?? 1,
@@ -846,6 +965,8 @@ export const reapStale = mutation({
           result: checkpoint.slice(0, 4000),
         });
         requeued.push(j.task.slice(0, 80));
+        const attempt = await attemptFor(ctx, j._id, j.attempt ?? 1);
+        if (attempt) await ctx.db.patch(attempt._id, { status: "checkpointed", completedAt: now, lastEventAt: now });
       }
       await ctx.db.insert("workEvents", {
         jobId: String(j._id),
@@ -857,7 +978,7 @@ export const reapStale = mutation({
         createdAt: now,
       });
     }
-    return { requeued, abandoned, releasedDispatches };
+    return { requeued, abandoned, stalled, releasedDispatches };
   },
 });
 
@@ -891,27 +1012,60 @@ export const updateProgress = mutation({
     }
     if (!row || row.status !== "running" || row.attempt !== a.expectedAttempt) return false;
     const now = Date.now();
-    const percent = a.percent === undefined ? row.percent : Math.max(0, Math.min(99, a.percent));
+    const percent = a.percent === undefined ? row.percent : Math.max(row.percent ?? 0, Math.min(99, a.percent));
+    // Heartbeats are deliberately excluded from this test. A changed stage,
+    // percentage advance, or new evidence line is causal progress; liveness
+    // traffic alone can never postpone the stall watchdog.
+    const meaningful = isMeaningfulWorkProgress({
+      currentStage: row.stage,
+      currentPercent: row.percent,
+      currentProgress: row.progress,
+      nextStage: a.stage,
+      nextPercent: a.percent,
+      nextProgress: a.progress,
+    });
     const patch: Record<string, unknown> = {
       progress: a.progress.slice(0, 400),
-      heartbeatAt: now,
       percent,
     };
     if (a.stage !== undefined) patch.stage = a.stage.slice(0, 80);
+    if (meaningful) patch.progressAt = now;
     patch.updatedAt = now;
     await ctx.db.patch(row._id, patch);
-    const meaningful = (a.stage && a.stage !== row.stage) || (percent ?? 0) - (row.percent ?? 0) >= 10;
-    if (meaningful)
-      await ctx.db.insert("workEvents", {
-        jobId: String(a.jobId),
-        missionId: row.missionId,
-        agentId: row.agentId,
-        type: "progress",
-        message: a.progress.slice(0, 500),
+    if (meaningful) {
+      const durable = await ctx.db.get(a.jobId);
+      const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+      if (!durable || !attempt) return false;
+      await ctx.db.patch(attempt._id, { progressAt: now, lastEventAt: now });
+      await appendAttemptEvidence(ctx, durable, "progress", a.progress, {
         stage: a.stage ?? row.stage,
         percent,
-        createdAt: now,
+        evidenceKind: "progress",
       });
+    }
+    return true;
+  },
+});
+
+// Liveness is intentionally a different fenced operation from progress. It
+// is cheap enough to send every thirty seconds and cannot make a stalled job
+// look productive.
+export const touchHeartbeat = mutation({
+  args: {
+    jobId: v.id("jobs"),
+    expectedAttempt: v.number(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const job = await ctx.db.get(a.jobId);
+    if (!job || job.status !== "running" || (job.attempt ?? 1) !== a.expectedAttempt) return false;
+    const runtime = await jobRuntimeFor(ctx, a.jobId);
+    const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    if (!runtime || !attempt || attempt.status !== "running") return false;
+    const now = Date.now();
+    await ctx.db.patch(runtime._id, { heartbeatAt: now, updatedAt: now });
+    await ctx.db.patch(attempt._id, { livenessAt: now });
     return true;
   },
 });
@@ -958,6 +1112,8 @@ export const checkpointAndRequeue = mutation({
           percent: row.percent,
           createdAt: now,
         });
+        const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+        if (attempt) await ctx.db.patch(attempt._id, { status: requestedStatus, completedAt: now, lastEventAt: now });
         return { requeued: false, exhausted: false, stale: false };
       }
       return { requeued: false, exhausted: false, stale: true };
@@ -987,6 +1143,12 @@ export const checkpointAndRequeue = mutation({
         : requestedStatus === "pending"
           ? `checkpoint saved · continuation ${attempt}${delayMs ? ` eligible in ${Math.max(1, Math.ceil(delayMs / 60_000))}m` : " queued"}`
           : `checkpoint saved · ${requestedStatus}`,
+    });
+    const attemptRecord = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    if (attemptRecord) await ctx.db.patch(attemptRecord._id, {
+      status: exhausted ? "error" : requestedStatus === "pending" ? "checkpointed" : requestedStatus,
+      completedAt: Date.now(),
+      lastEventAt: Date.now(),
     });
     await ctx.db.insert("workEvents", {
       jobId: String(a.jobId),
@@ -1019,18 +1181,18 @@ export const executionLease = query({
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
     const row = await jobRuntimeFor(ctx, a.jobId);
-    if (row) return { status: row.status, attempt: row.attempt };
+    if (row) return { status: row.status, attempt: row.attempt, steerRevision: row.steerRevision ?? 0 };
     const state = await ctx.db
       .query("controlPlaneMigrations")
       .withIndex("by_key", (q: any) => q.eq("key", CONTROL_PLANE_MIGRATION))
       .first();
-    if (state?.jobsComplete) return { status: "missing", attempt: 0 };
+    if (state?.jobsComplete) return { status: "missing", attempt: 0, steerRevision: 0 };
     // Rollout-only point compatibility: an old live worker may predate its
     // projection row. This disappears permanently when the cursor completes.
     const legacy = await ctx.db.get(a.jobId);
     return legacy
-      ? { status: legacy.status, attempt: legacy.attempt ?? 1 }
-      : { status: "missing", attempt: 0 };
+      ? { status: legacy.status, attempt: legacy.attempt ?? 1, steerRevision: legacy.steerRevision ?? 0 }
+      : { status: "missing", attempt: 0, steerRevision: 0 };
   },
 });
 
@@ -1192,7 +1354,8 @@ export const markVerifiedForDelivery = mutation({
 export const control = mutation({
   args: {
     jobId: v.id("jobs"),
-    action: v.union(v.literal("pause"), v.literal("resume"), v.literal("cancel"), v.literal("retry")),
+    action: v.union(v.literal("pause"), v.literal("resume"), v.literal("cancel"), v.literal("retry"), v.literal("steer")),
+    input: v.optional(v.string()),
     authTokenHash: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
@@ -1210,19 +1373,25 @@ export const control = mutation({
         dispatchId: undefined,
         dispatchLeaseUntil: undefined,
       });
-    else if (a.action === "resume" && row.status === "paused")
+    else if (a.action === "resume" && ["paused", "stalled"].includes(row.status)) {
+      const nextAttempt = (row.attempt ?? 1) + 1;
+      if (!hasAttemptBudget(nextAttempt, row.maxAttempts ?? 12)) return false;
       await patchJobWithRuntime(ctx, row, {
         status: "pending",
         stage: "queued",
-        progress: "resumed — queued",
-        attempt: (row.attempt ?? 1) + 1,
+        progress: row.status === "stalled" ? "stalled attempt resumed — fresh workspace queued" : "resumed — queued",
+        attempt: nextAttempt,
         startedAt: undefined,
         heartbeatAt: now,
+        progressAt: now,
+        stalledAt: undefined,
+        stallReason: undefined,
         nextRunAt: now,
         dispatchId: undefined,
         dispatchLeaseUntil: undefined,
         workerRunId: undefined,
       });
+    }
     else if (a.action === "cancel" && !["done", "error", "cancelled"].includes(row.status)) {
       await patchJobWithRuntime(ctx, row, {
         status: "cancelled",
@@ -1239,6 +1408,7 @@ export const control = mutation({
         if (approval.status === "pending") await ctx.db.patch(approval._id, { status: "cancelled", resolvedAt: now });
       }
     } else if (a.action === "retry" && ["error", "cancelled"].includes(row.status)) {
+      if (!hasAttemptBudget((row.attempt ?? 1) + 1, row.maxAttempts ?? 12)) return false;
       const renewApproval = row.approvalRequired === true && row.approvalStatus !== "approved";
       await patchJobWithRuntime(ctx, row, {
         status: renewApproval ? "awaiting_approval" : "pending",
@@ -1246,6 +1416,7 @@ export const control = mutation({
         completedAt: undefined,
         startedAt: undefined,
         heartbeatAt: now,
+        progressAt: now,
         attempt: (row.attempt ?? 1) + 1,
         approvalStatus: renewApproval ? "pending" : row.approvalStatus,
         progress: renewApproval ? "retry waiting for Daniel's approval" : "manual retry queued",
@@ -1265,6 +1436,15 @@ export const control = mutation({
           requestedAt: now,
         });
       }
+    } else if (a.action === "steer" && ["pending", "dispatching", "running", "paused", "stalled"].includes(row.status)) {
+      const steer = String(a.input ?? "").trim().slice(0, 2_000);
+      if (!steer) return false;
+      await patchJobWithRuntime(ctx, row, {
+        steer,
+        steerRevision: (row.steerRevision ?? 0) + 1,
+        checkpoint: `${row.checkpoint ?? ""}\n\nDaniel steering instruction:\n${steer}`.trim().slice(-6_000),
+        progress: "Daniel supplied steering — the current attempt will checkpoint into a fresh scoped session",
+      });
     } else return false;
     const retryNeedsApproval =
       a.action === "retry" && row.approvalRequired === true && row.approvalStatus !== "approved";
@@ -1273,8 +1453,11 @@ export const control = mutation({
       missionId: row.missionId,
       agentId: row.agentId,
       type: a.action,
-      message: `${a.action} requested by Daniel`,
-      stage: retryNeedsApproval ? "approval" : a.action === "resume" || a.action === "retry" ? "queued" : `${a.action}d`,
+      message: a.action === "steer" ? `Daniel steering: ${String(a.input ?? "").trim().slice(0, 500)}` : `${a.action} requested by Daniel`,
+      stage: retryNeedsApproval ? "approval" : a.action === "resume" || a.action === "retry" ? "queued" : a.action === "steer" ? "steering" : `${a.action}d`,
+      attempt: row.attempt ?? 1,
+      causationId: `attempt:${String(a.jobId)}:${row.attempt ?? 1}`,
+      evidenceKind: a.action === "steer" ? "steering" : "control",
       createdAt: now,
     });
     return true;
@@ -1285,7 +1468,7 @@ export const active = query({
   args: { ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    const statuses = ["running", "dispatching", "pending", "awaiting_approval", "paused", "needs_input"];
+    const statuses = ["running", "dispatching", "pending", "awaiting_approval", "paused", "stalled", "needs_input"];
     const groups = await Promise.all(
       statuses.map((status) =>
         ctx.db
@@ -1329,6 +1512,9 @@ export const active = query({
         goalWave: j.goalWave ?? 0,
         startedAt: j.startedAt ?? j.createdAt,
         heartbeatAt: j.heartbeatAt ?? j.startedAt ?? j.createdAt,
+        progressAt: j.progressAt ?? j.startedAt ?? j.createdAt,
+        stalledAt: j.stalledAt ?? null,
+        stallReason: j.stallReason ?? null,
         nextRunAt: j.nextRunAt ?? null,
         workerRunId: j.workerRunId ?? null,
         workerRuntime: j.workerRuntime ?? null,

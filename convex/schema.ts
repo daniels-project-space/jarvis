@@ -210,6 +210,14 @@ export default defineSchema({
     approvalStatus: v.optional(v.string()), // pending | approved | declined
     stage: v.optional(v.string()),
     percent: v.optional(v.number()),
+    // Liveness and progress deliberately have separate clocks. A worker can
+    // still be alive while making no durable, causal progress.
+    progressAt: v.optional(v.number()),
+    stallCount: v.optional(v.number()),
+    stalledAt: v.optional(v.number()),
+    stallReason: v.optional(v.string()),
+    steer: v.optional(v.string()),
+    steerRevision: v.optional(v.number()),
     heartbeatAt: v.optional(v.number()),
     nextRunAt: v.optional(v.number()), // retry/continuation eligibility; prevents hot-loop retries
     // Trigger-native fleet dispatch. A short reservation fences one exact job
@@ -277,6 +285,11 @@ export default defineSchema({
     stage: v.string(),
     percent: v.number(),
     progress: v.optional(v.string()),
+    progressAt: v.number(),
+    stallCount: v.number(),
+    stalledAt: v.optional(v.number()),
+    stallReason: v.optional(v.string()),
+    steerRevision: v.number(),
     attempt: v.number(),
     maxAttempts: v.number(),
     heartbeatAt: v.number(),
@@ -306,6 +319,7 @@ export default defineSchema({
     .index("by_status_priority", ["status", "priority", "createdAt"])
     .index("by_status_next_run", ["status", "nextRunAt", "createdAt"])
     .index("by_status_heartbeat", ["status", "heartbeatAt"])
+    .index("by_status_progress", ["status", "progressAt"])
     .index("by_status_dispatch_lease", ["status", "dispatchLeaseUntil"])
     .index("by_visibility_status_priority", ["visibility", "status", "priority", "createdAt"])
     .index("by_thread_visibility_status_priority", ["originThreadId", "visibility", "status", "priority", "createdAt"])
@@ -492,11 +506,51 @@ export default defineSchema({
     message: v.string(),
     stage: v.optional(v.string()),
     percent: v.optional(v.number()),
+    // Event fields are write-once evidence. Causation is optional while old
+    // rows age out, but every new attempt transition supplies it.
+    attempt: v.optional(v.number()),
+    causationId: v.optional(v.string()),
+    evidenceKind: v.optional(v.string()),
     data: v.optional(v.any()),
     createdAt: v.number(),
   })
     .index("by_job", ["jobId", "createdAt"])
     .index("by_mission", ["missionId", "createdAt"])
+    .index("by_createdAt", ["createdAt"]),
+
+  // One immutable row per fenced Trigger attempt. Jobs remain the authority
+  // for scheduling; this table makes intent → workspace → session lineage
+  // auditable without putting a second control plane beside Convex.
+  workAttempts: defineTable({
+    jobId: v.id("jobs"),
+    attempt: v.number(),
+    status: v.string(), // running | checkpointed | stalled | done | error | cancelled
+    workspaceKey: v.string(),
+    sessionId: v.string(),
+    workerRunId: v.string(),
+    launchedAt: v.number(),
+    livenessAt: v.number(),
+    progressAt: v.number(),
+    lastEventAt: v.number(),
+    completedAt: v.optional(v.number()),
+    createdAt: v.number(),
+  })
+    .index("by_job_attempt", ["jobId", "attempt"])
+    .index("by_status_progress", ["status", "progressAt"]),
+
+  // Receipts are only inserted by terminal authority transitions and are
+  // never patched. They bind acceptance evidence and artifacts to one exact
+  // attempt, closing the replay/substitution gap at completion.
+  workReceipts: defineTable({
+    jobId: v.id("jobs"),
+    attempt: v.number(),
+    status: v.string(),
+    acceptanceEvidence: v.array(v.string()),
+    artifacts: v.array(v.string()),
+    verification: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_job_attempt", ["jobId", "attempt"])
     .index("by_createdAt", ["createdAt"]),
 
   // Compact, append-only supervisor receipts. These deliberately describe
