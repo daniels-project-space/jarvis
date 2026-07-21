@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -7,6 +7,7 @@ import {
   convexPremergeReceiptProvesNoMutation,
   convexReleaseAction,
   createProviderToolSession,
+  defaultCommandRunner,
   generatedTriggerAttestor,
   installDependenciesInPinnedCheckout,
   triggerDeployCommand,
@@ -48,6 +49,57 @@ describe("provider release pinned dependency install", () => {
       verifyPinned,
       runNpmCi: async () => undefined,
     })).rejects.toThrow("changed the pinned checkout identity");
+  });
+});
+
+describe("controller command CLOSE barrier", () => {
+  it("records a real spawn error but resolves exactly once and only after CLOSE", async () => {
+    const root = mkdtempSync(join(tmpdir(), "jarvis-command-spawn-error-"));
+    roots.push(root);
+    const events: string[] = [];
+    const result = await defaultCommandRunner(join(root, "missing-executable"), [], {
+      cwd: root,
+      env: { NODE_ENV: "test", PATH: process.env.PATH, HOME: root },
+      timeoutMs: 2_000,
+      onLifecycleEvent: (event) => events.push(event),
+    });
+    expect(result.code).toBe(-1);
+    expect(result.out).toMatch(/ENOENT|spawn/i);
+    expect(events).toEqual(["error", "close", "resolve"]);
+    expect(events.filter((event) => event === "resolve")).toHaveLength(1);
+  });
+
+  it("kills a real detached grandchild on timeout and returns only after CLOSE", async () => {
+    const root = mkdtempSync(join(tmpdir(), "jarvis-command-timeout-"));
+    roots.push(root);
+    const marker = join(root, "detached-survived");
+    const grandchildSource = String.raw`
+const fs = require("node:fs");
+setTimeout(() => fs.writeFileSync(process.argv[1], "survived"), 700);
+setInterval(() => {}, 1_000);
+`;
+    const parentSource = String.raw`
+const { spawn } = require("node:child_process");
+const child = spawn(process.execPath, ["-e", ${JSON.stringify(grandchildSource)}, process.argv[1]], {
+  detached: true,
+  stdio: "ignore",
+});
+child.unref();
+process.stdout.write("READY\n");
+setInterval(() => {}, 1_000);
+`;
+    const events: string[] = [];
+    const result = await defaultCommandRunner(process.execPath, ["-e", parentSource, marker], {
+      cwd: root,
+      env: { NODE_ENV: "test", PATH: process.env.PATH, HOME: root },
+      timeoutMs: 150,
+      onLifecycleEvent: (event) => events.push(event),
+    });
+    expect(result.code).toBe(-1);
+    expect(result.out).toContain("READY");
+    expect(events).toEqual(["timeout", "close", "resolve"]);
+    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 850));
+    expect(existsSync(marker)).toBe(false);
   });
 });
 

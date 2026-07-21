@@ -3,7 +3,10 @@ import { spawn } from "node:child_process";
 import {
   chmodSync,
   closeSync,
+  constants as fsConstants,
   existsSync,
+  fstatSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -12,6 +15,7 @@ import {
   readlinkSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -115,13 +119,14 @@ type EtcRuntimeEntry = Readonly<{
   source: string;
   destination: string;
   kind: "file" | "directory";
+  snapshotDigest?: string;
 }>;
 
 type RuntimePaths = Readonly<{
   unshare: string;
   mount: string;
   chroot: string;
-  capsh: string;
+  setpriv: string;
   env: string;
   shell: string;
   usr: string;
@@ -133,13 +138,14 @@ type RuntimePaths = Readonly<{
   devRandom: string;
   devUrandom: string;
   etc: readonly EtcRuntimeEntry[];
+  snapshotRoot: string;
 }>;
 
 const FIXED_RUNTIME = Object.freeze({
   unshare: "/usr/bin/unshare",
   mount: "/usr/bin/mount",
   chroot: "/usr/sbin/chroot",
-  capsh: "/usr/sbin/capsh",
+  setpriv: "/usr/bin/setpriv",
   env: "/usr/bin/env",
   shell: "/bin/sh",
   usr: "/usr",
@@ -152,16 +158,29 @@ const FIXED_RUNTIME = Object.freeze({
   devUrandom: "/dev/urandom",
 });
 
-const ETC_RUNTIME_CANDIDATES = Object.freeze([
-  ["/etc/resolv.conf", "etc/resolv.conf", "file"],
-  ["/etc/hosts", "etc/hosts", "file"],
-  ["/etc/nsswitch.conf", "etc/nsswitch.conf", "file"],
+const STATIC_ETC_RUNTIME_CANDIDATES = Object.freeze([
   ["/etc/passwd", "etc/passwd", "file"],
   ["/etc/group", "etc/group", "file"],
   ["/etc/ssl", "etc/ssl", "directory"],
   ["/etc/pki", "etc/pki", "directory"],
   ["/etc/ca-certificates", "etc/ca-certificates", "directory"],
 ] as const);
+
+const DYNAMIC_ETC_RUNTIME_CANDIDATES = Object.freeze([
+  {
+    source: "/etc/resolv.conf",
+    destination: "etc/resolv.conf",
+    allowedTargets: [
+      "/etc/resolv.conf",
+      "/run/systemd/resolve/resolv.conf",
+      "/run/systemd/resolve/stub-resolv.conf",
+    ],
+  },
+  { source: "/etc/hosts", destination: "etc/hosts", allowedTargets: ["/etc/hosts"] },
+  { source: "/etc/nsswitch.conf", destination: "etc/nsswitch.conf", allowedTargets: ["/etc/nsswitch.conf"] },
+] as const);
+
+const MAX_DYNAMIC_ETC_BYTES = 64 * 1024;
 
 /**
  * Fixed setup code. Candidate text is never evaluated by this shell: every
@@ -227,8 +246,9 @@ readonly_device_bind "$dev_urandom" "$rootfs/dev/urandom"
 
 cd "$rootfs"
 exec /usr/sbin/chroot "$rootfs" \
-  /usr/sbin/capsh --drop=all --caps= --inh= --noamb --no-new-privs -- \
-  -c 'cd /workspace
+  /usr/bin/setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
+  --securebits=+noroot,+noroot_locked,+no_setuid_fixup,+no_setuid_fixup_locked --no-new-privs -- \
+  /usr/bin/dash -c 'cd /workspace
     capability_name=\${JARVIS_PROVIDER_CAPABILITY_NAME-none}
     case "$capability_name" in
       none) ;;
@@ -386,7 +406,7 @@ const receipt = {
     devicesUsable,
     chrootBlocked: commandBlocked("/usr/sbin/chroot", ["/", "/bin/true"]),
     mountBlocked: commandBlocked("/usr/bin/mount", ["-t", "tmpfs", "tmpfs", "/home/provider/tmp"]),
-    capabilityRegainBlocked: commandBlocked("/usr/sbin/capsh", ["--caps=cap_sys_admin+ep", "--", "-c", "true"]),
+    capabilityRegainBlocked: commandBlocked("/usr/bin/setpriv", ["--bounding-set=+sys_admin", "--inh-caps=+sys_admin", "--ambient-caps=+sys_admin", "--", "/bin/true"]),
     gitMetadataWriteBlocked: blockedWrite(".git/config"),
     gitRefWriteBlocked,
     gitHookWriteBlocked,
@@ -451,6 +471,141 @@ function canonicalOwnedDirectory(path: string, label: string): string {
     throw new Error(`${label} must be controller-owned`);
   }
   return canonical;
+}
+
+function assertDynamicRuntimeParents(path: string): void {
+  const dynamicServiceDirectory = "/run/systemd/resolve";
+  let cursor = "/";
+  const parents = dirname(path).split("/").filter(Boolean);
+  for (const component of parents) {
+    cursor = join(cursor, component);
+    const stat = lstatSync(cursor);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error("provider dynamic runtime config traversed a non-directory or symlinked parent");
+    }
+    const serviceOwnedLeaf = cursor === dynamicServiceDirectory && path.startsWith(`${dynamicServiceDirectory}/`);
+    if (stat.uid !== 0 && !serviceOwnedLeaf) {
+      throw new Error("provider dynamic runtime config traversed an untrusted non-root parent");
+    }
+    if ((stat.mode & 0o022) !== 0) {
+      throw new Error("provider dynamic runtime config traversed a writable parent");
+    }
+  }
+}
+
+function readDynamicRuntimeConfig(input: {
+  source: string;
+  allowedTargets: readonly string[];
+}): Buffer {
+  const lexical = lstatSync(input.source);
+  if (!lexical.isFile() && !lexical.isSymbolicLink()) {
+    throw new Error(`provider dynamic runtime ${input.source} is not a file or approved symlink`);
+  }
+  const canonical = realpathSync(input.source);
+  if (!input.allowedTargets.includes(canonical)) {
+    throw new Error(`provider dynamic runtime ${input.source} resolved outside its exact allowlist`);
+  }
+  assertDynamicRuntimeParents(canonical);
+  const fd = openSync(
+    canonical,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    const before = fstatSync(fd);
+    const serviceOwned = canonical.startsWith("/run/systemd/resolve/");
+    if (
+      !before.isFile()
+      || before.nlink !== 1
+      || (!serviceOwned && before.uid !== 0)
+      || (before.mode & 0o022) !== 0
+      || before.size < 1
+      || before.size > MAX_DYNAMIC_ETC_BYTES
+    ) throw new Error(`provider dynamic runtime ${input.source} failed its bounded file policy`);
+    const bytes = readFileSync(fd);
+    const after = fstatSync(fd);
+    const finalPath = lstatSync(canonical);
+    const stable = before.dev === after.dev
+      && before.ino === after.ino
+      && before.size === after.size
+      && before.mtimeMs === after.mtimeMs
+      && before.ctimeMs === after.ctimeMs
+      && after.dev === finalPath.dev
+      && after.ino === finalPath.ino
+      && realpathSync(input.source) === canonical;
+    if (!stable || bytes.byteLength !== before.size || bytes.includes(0)) {
+      throw new Error(`provider dynamic runtime ${input.source} changed during its snapshot`);
+    }
+    return bytes;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function writeControllerSnapshot(root: string, name: string, bytes: Buffer): EtcRuntimeEntry {
+  if (!/^[a-z0-9.-]+$/i.test(name)) throw new Error("provider runtime snapshot name is invalid");
+  const destination = join(root, name);
+  const temporary = join(root, `.${name}.${randomBytes(8).toString("hex")}.tmp`);
+  const fd = openSync(
+    temporary,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    writeFileSync(fd, bytes);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(temporary, destination);
+  const directory = openSync(root, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
+  try { fsyncSync(directory); } finally { closeSync(directory); }
+  const stat = lstatSync(destination);
+  if (
+    stat.isSymbolicLink()
+    || !stat.isFile()
+    || stat.nlink !== 1
+    || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    || (stat.mode & 0o077) !== 0
+  ) throw new Error("provider runtime snapshot did not become a private controller-owned file");
+  return Object.freeze({
+    source: destination,
+    destination: `etc/${name}`,
+    kind: "file" as const,
+    snapshotDigest: createHash("sha256").update(bytes).digest("hex"),
+  });
+}
+
+function createDynamicEtcSnapshot(sessionRoot: string): { root: string; entries: EtcRuntimeEntry[] } {
+  const root = canonicalOwnedDirectory(
+    mkdtempSync(join(sessionRoot, "runtime-etc-snapshot-")),
+    "provider runtime config snapshot",
+  );
+  try {
+    const entries = DYNAMIC_ETC_RUNTIME_CANDIDATES.map((candidate) => {
+      const name = candidate.destination.slice("etc/".length);
+      const bytes = readDynamicRuntimeConfig(candidate);
+      return writeControllerSnapshot(root, name, bytes);
+    });
+    return { root, entries };
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function assertRuntimeSnapshots(paths: RuntimePaths): void {
+  const root = canonicalOwnedDirectory(paths.snapshotRoot, "provider runtime config snapshot");
+  for (const entry of paths.etc.filter((candidate) => candidate.snapshotDigest)) {
+    const source = canonicalExisting(entry.source, "file", `provider runtime ${entry.destination}`);
+    if (!pathIsWithin(source, root)) throw new Error("provider runtime snapshot escaped controller-owned state");
+    const stat = lstatSync(source);
+    if (
+      stat.nlink !== 1
+      || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+      || (stat.mode & 0o077) !== 0
+      || createHash("sha256").update(readFileSync(source)).digest("hex") !== entry.snapshotDigest
+    ) throw new Error(`provider runtime snapshot ${entry.destination} changed before launch`);
+  }
 }
 
 function canonicalCheckout(path: string): string {
@@ -616,32 +771,42 @@ export function safeProviderToolEnv(base: NodeJS.ProcessEnv, session: ProviderTo
   return { ...session.env };
 }
 
-function runtimePaths(): RuntimePaths {
-  const etc: EtcRuntimeEntry[] = [];
-  for (const [source, destination, kind] of ETC_RUNTIME_CANDIDATES) {
-    if (!existsSync(source)) continue;
-    etc.push({ source: canonicalTrustedSystemPath(source, kind, `provider runtime ${source}`), destination, kind });
+function runtimePaths(sessionRoot: string): RuntimePaths {
+  const root = canonicalOwnedDirectory(sessionRoot, "provider tool state");
+  const snapshot = createDynamicEtcSnapshot(root);
+  try {
+    const etc: EtcRuntimeEntry[] = [...snapshot.entries];
+    for (const [source, destination, kind] of STATIC_ETC_RUNTIME_CANDIDATES) {
+      if (!existsSync(source)) continue;
+      etc.push({ source: canonicalTrustedSystemPath(source, kind, `provider runtime ${source}`), destination, kind });
+    }
+    for (const required of ["etc/resolv.conf", "etc/hosts", "etc/nsswitch.conf", "etc/passwd", "etc/group"]) {
+      if (!etc.some((entry) => entry.destination === required)) throw new Error(`provider runtime ${required} is unavailable`);
+    }
+    const paths = Object.freeze({
+      unshare: canonicalTrustedSystemPath(FIXED_RUNTIME.unshare, "file", "unshare executable"),
+      mount: canonicalTrustedSystemPath(FIXED_RUNTIME.mount, "file", "mount executable"),
+      chroot: canonicalTrustedSystemPath(FIXED_RUNTIME.chroot, "file", "chroot executable"),
+      setpriv: canonicalTrustedSystemPath(FIXED_RUNTIME.setpriv, "file", "setpriv executable"),
+      env: canonicalTrustedSystemPath(FIXED_RUNTIME.env, "file", "env executable"),
+      shell: canonicalTrustedSystemPath(FIXED_RUNTIME.shell, "file", "namespace setup shell"),
+      usr: canonicalTrustedSystemPath(FIXED_RUNTIME.usr, "directory", "runtime /usr"),
+      bin: canonicalTrustedSystemPath(FIXED_RUNTIME.bin, "directory", "runtime /bin"),
+      lib: canonicalTrustedSystemPath(FIXED_RUNTIME.lib, "directory", "runtime /lib"),
+      lib64: canonicalTrustedSystemPath(FIXED_RUNTIME.lib64, "directory", "runtime /lib64"),
+      devNull: canonicalTrustedSystemPath(FIXED_RUNTIME.devNull, "device", "runtime /dev/null"),
+      devZero: canonicalTrustedSystemPath(FIXED_RUNTIME.devZero, "device", "runtime /dev/zero"),
+      devRandom: canonicalTrustedSystemPath(FIXED_RUNTIME.devRandom, "device", "runtime /dev/random"),
+      devUrandom: canonicalTrustedSystemPath(FIXED_RUNTIME.devUrandom, "device", "runtime /dev/urandom"),
+      etc: Object.freeze(etc),
+      snapshotRoot: snapshot.root,
+    });
+    assertRuntimeSnapshots(paths);
+    return paths;
+  } catch (error) {
+    rmSync(snapshot.root, { recursive: true, force: true });
+    throw error;
   }
-  for (const required of ["etc/resolv.conf", "etc/hosts", "etc/passwd", "etc/group"]) {
-    if (!etc.some((entry) => entry.destination === required)) throw new Error(`provider runtime ${required} is unavailable`);
-  }
-  return Object.freeze({
-    unshare: canonicalTrustedSystemPath(FIXED_RUNTIME.unshare, "file", "unshare executable"),
-    mount: canonicalTrustedSystemPath(FIXED_RUNTIME.mount, "file", "mount executable"),
-    chroot: canonicalTrustedSystemPath(FIXED_RUNTIME.chroot, "file", "chroot executable"),
-    capsh: canonicalTrustedSystemPath(FIXED_RUNTIME.capsh, "file", "capsh executable"),
-    env: canonicalTrustedSystemPath(FIXED_RUNTIME.env, "file", "env executable"),
-    shell: canonicalTrustedSystemPath(FIXED_RUNTIME.shell, "file", "namespace setup shell"),
-    usr: canonicalTrustedSystemPath(FIXED_RUNTIME.usr, "directory", "runtime /usr"),
-    bin: canonicalTrustedSystemPath(FIXED_RUNTIME.bin, "directory", "runtime /bin"),
-    lib: canonicalTrustedSystemPath(FIXED_RUNTIME.lib, "directory", "runtime /lib"),
-    lib64: canonicalTrustedSystemPath(FIXED_RUNTIME.lib64, "directory", "runtime /lib64"),
-    devNull: canonicalTrustedSystemPath(FIXED_RUNTIME.devNull, "device", "runtime /dev/null"),
-    devZero: canonicalTrustedSystemPath(FIXED_RUNTIME.devZero, "device", "runtime /dev/zero"),
-    devRandom: canonicalTrustedSystemPath(FIXED_RUNTIME.devRandom, "device", "runtime /dev/random"),
-    devUrandom: canonicalTrustedSystemPath(FIXED_RUNTIME.devUrandom, "device", "runtime /dev/urandom"),
-    etc: Object.freeze(etc),
-  });
 }
 
 function mkdirRootfs(rootfs: string, etc: readonly EtcRuntimeEntry[]): void {
@@ -892,7 +1057,7 @@ export class ProviderCandidateSandbox {
 
   private getPaths(): RuntimePaths {
     if (!this.paths) {
-      const paths = runtimePaths();
+      const paths = runtimePaths(this.input.session.root);
       for (const [label, path] of [
         ["runtime /usr", paths.usr],
         ["runtime /bin", paths.bin],
@@ -903,6 +1068,7 @@ export class ProviderCandidateSandbox {
       }
       this.paths = paths;
     }
+    assertRuntimeSnapshots(this.paths);
     return this.paths;
   }
 
@@ -1142,15 +1308,24 @@ if (process.argv[2] === "timeout") setInterval(() => {}, 1000);
     this.cleaned = true;
     await this.waitForIdle();
     rmSync(this.setup, { force: true });
+    if (this.paths?.snapshotRoot) rmSync(this.paths.snapshotRoot, { recursive: true, force: true });
   }
 }
 
 export function providerSandboxRuntimeAvailable(): boolean {
+  let root = "";
   try {
-    runtimePaths();
+    root = canonicalOwnedDirectory(
+      mkdtempSync(join(canonicalExisting(tmpdir(), "directory", "system temporary directory"), "jarvis-provider-runtime-check-")),
+      "provider runtime availability state",
+    );
+    const paths = runtimePaths(root);
+    assertRuntimeSnapshots(paths);
     return true;
   } catch {
     return false;
+  } finally {
+    if (root) rmSync(root, { recursive: true, force: true });
   }
 }
 

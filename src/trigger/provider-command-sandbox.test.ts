@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -18,7 +19,6 @@ import {
   PROVIDER_SANDBOX_SETUP,
   ProviderCandidateSandbox,
   createProviderToolSession,
-  providerSandboxRuntimeAvailable,
   readProviderSandboxReceipt,
   safeProviderToolEnv,
   validateProviderSandboxReceipt,
@@ -130,7 +130,8 @@ describe("provider candidate command boundary", () => {
     expect(PROVIDER_SANDBOX_SETUP).toContain('/usr/bin/mount -t proc -o nosuid,nodev,noexec proc "$rootfs/proc"');
     expect(PROVIDER_SANDBOX_SETUP).toContain('/usr/bin/mount -o remount,bind,ro,nosuid,nodev "$rootfs/workspace/.git"');
     expect(PROVIDER_SANDBOX_SETUP).toContain('/usr/sbin/chroot "$rootfs"');
-    expect(PROVIDER_SANDBOX_SETUP).toContain("/usr/sbin/capsh --drop=all --caps= --inh= --noamb --no-new-privs");
+    expect(PROVIDER_SANDBOX_SETUP).toContain("/usr/bin/setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all");
+    expect(PROVIDER_SANDBOX_SETUP).toContain("+noroot_locked,+no_setuid_fixup,+no_setuid_fixup_locked --no-new-privs");
     expect(PROVIDER_SANDBOX_SETUP).toContain("exec /usr/bin/env -i");
     expect(PROVIDER_SANDBOX_SETUP).toContain('"$@"\' provider-sandbox "$@"');
     expect(PROVIDER_SANDBOX_SETUP).not.toMatch(/\/controller\/codex|codex\s+sandbox|bubblewrap|sandbox-state|eval\s/i);
@@ -238,7 +239,7 @@ describe("provider candidate command boundary", () => {
     session.cleanup();
   });
 
-  it.skipIf(!providerSandboxRuntimeAvailable())("proves real filesystem/proc/env/network/Git containment, argv safety, exact capability scope, CLOSE barriers, timeout reaping, redaction, and cleanup", async () => {
+  it("proves real filesystem/proc/env/network/Git containment, argv safety, exact capability scope, CLOSE barriers, timeout reaping, redaction, and cleanup", async () => {
     const checkout = syntheticCheckout();
     const metadataBefore = gitMetadataReceipt(checkout);
     const ambient = {
@@ -258,6 +259,17 @@ describe("provider candidate command boundary", () => {
       expect(observation.network.namespace).toBe(observation.network.expectedNamespace);
       expect(observation.network.policy).toBe("target-egress-allowed-not-secret");
       expect(gitMetadataReceipt(checkout)).toEqual(metadataBefore);
+      const snapshots = readdirSync(session.root).filter((name) => name.startsWith("runtime-etc-snapshot-"));
+      expect(snapshots).toHaveLength(1);
+      const snapshotRoot = join(session.root, snapshots[0]);
+      expect(readdirSync(snapshotRoot).sort()).toEqual(["hosts", "nsswitch.conf", "resolv.conf"]);
+      for (const name of readdirSync(snapshotRoot)) {
+        const stat = lstatSync(join(snapshotRoot, name));
+        expect(stat.isFile(), name).toBe(true);
+        expect(stat.isSymbolicLink(), name).toBe(false);
+        expect(stat.mode & 0o077, name).toBe(0);
+        if (typeof process.getuid === "function") expect(stat.uid, name).toBe(process.getuid());
+      }
 
       const commandDir = join(checkout, ".jarvis-provider-command-test");
       mkdirSync(commandDir);
@@ -304,6 +316,7 @@ if (process.env.TRIGGER_ACCESS_TOKEN) process.stdout.write(process.env.TRIGGER_A
       rmSync(commandDir, { recursive: true, force: true });
     } finally {
       await sandbox.cleanup();
+      expect(readdirSync(session.root).some((name) => name.startsWith("runtime-etc-snapshot-"))).toBe(false);
       session.cleanup();
     }
     expect(existsSync(session.root)).toBe(false);

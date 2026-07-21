@@ -6,6 +6,7 @@ import {
   lstatSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -47,10 +48,17 @@ export { createProviderToolSession, safeProviderToolEnv } from "./provider-comma
 
 type ConvexMutation = (path: string, args: unknown) => Promise<any>;
 type CommandResult = { code: number | null; out: string };
+export type CommandRunnerLifecycleEvent = "error" | "timeout" | "close" | "resolve";
+type CommandRunOptions = {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+  onLifecycleEvent?: (event: CommandRunnerLifecycleEvent) => void;
+};
 type CommandRunner = (
   command: string,
   args: string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number },
+  options: CommandRunOptions,
 ) => Promise<CommandResult>;
 
 export const CONVEX_PREMERGE_PROOF_COMMAND = [
@@ -121,6 +129,66 @@ const TERMINAL_TRIGGER_STATUSES = new Set([
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+function linuxDescendants(rootPid: number): number[] {
+  if (process.platform !== "linux" || !Number.isInteger(rootPid) || rootPid < 1) return [];
+  const children = new Map<number, number[]>();
+  let entries: string[] = [];
+  try { entries = readdirSync("/proc"); } catch { return []; }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    try {
+      const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+      const end = stat.lastIndexOf(")");
+      if (end < 0) continue;
+      const fields = stat.slice(end + 2).trim().split(/\s+/);
+      const parent = Number(fields[1]);
+      if (!Number.isInteger(parent) || parent < 1) continue;
+      const existing = children.get(parent) ?? [];
+      existing.push(pid);
+      children.set(parent, existing);
+    } catch { /* process exited during the bounded snapshot */ }
+  }
+  const descendants: number[] = [];
+  const pending = [...(children.get(rootPid) ?? [])];
+  const seen = new Set<number>();
+  while (pending.length && descendants.length < 4_096) {
+    const pid = pending.pop()!;
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    descendants.push(pid);
+    pending.push(...(children.get(pid) ?? []));
+  }
+  return descendants;
+}
+
+function killTimedOutProcessTree(pid: number | undefined): void {
+  if (!pid) return;
+  if (process.platform === "linux") {
+    // Stop the root first so it cannot race another fork. Re-snapshot while
+    // stopping every observed descendant, including children in new sessions.
+    try { process.kill(pid, "SIGSTOP"); } catch { /* already exited */ }
+    let prior = "";
+    for (let pass = 0; pass < 8; pass += 1) {
+      const descendants = linuxDescendants(pid).sort((a, b) => a - b);
+      for (const childPid of descendants) {
+        try { process.kill(childPid, "SIGSTOP"); } catch { /* raced exit */ }
+      }
+      const signature = descendants.join(",");
+      if (signature === prior) break;
+      prior = signature;
+    }
+    const descendants = linuxDescendants(pid).reverse();
+    for (const childPid of descendants) {
+      try { process.kill(childPid, "SIGKILL"); } catch { /* raced exit */ }
+    }
+  }
+  if (process.platform !== "win32") {
+    try { process.kill(-pid, "SIGKILL"); } catch { /* process group already gone */ }
+  }
+  try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+}
+
 function oneLine(value: string, limit = 500): string {
   return value.trim().replace(/\s+/g, " ").slice(-limit);
 }
@@ -128,7 +196,7 @@ function oneLine(value: string, limit = 500): string {
 export function defaultCommandRunner(
   command: string,
   args: string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number },
+  options: CommandRunOptions,
 ): Promise<CommandResult> {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
@@ -143,10 +211,9 @@ export function defaultCommandRunner(
     const outputLimit = command === "git" && args[0] === "ls-files" ? 10 * 1024 * 1024 : 30_000;
     const timer = setTimeout(() => {
       timedOut = true;
-      if (process.platform !== "win32" && child.pid) {
-        try { process.kill(-child.pid, "SIGKILL"); } catch { /* process group already gone */ }
-      }
-      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      options.onLifecycleEvent?.("timeout");
+      killTimedOutProcessTree(child.pid);
+      try { child.kill("SIGKILL"); } catch { /* CLOSE remains the barrier */ }
     }, options.timeoutMs);
     timer.unref?.();
     const append = (chunk: unknown) => {
@@ -154,12 +221,15 @@ export function defaultCommandRunner(
     };
     child.stdout.on("data", append);
     child.stderr.on("data", append);
-    child.on("error", (error) => {
+    child.once("error", (error) => {
       processError = error;
+      options.onLifecycleEvent?.("error");
     });
-    child.on("close", (code) => {
+    child.once("close", (code) => {
       clearTimeout(timer);
       if (processError) output = `${output}\n${processError.message}`;
+      options.onLifecycleEvent?.("close");
+      options.onLifecycleEvent?.("resolve");
       resolve({ code: timedOut || processError ? -1 : code, out: output });
     });
   });

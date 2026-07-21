@@ -1,11 +1,10 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildSpecialistNamespaceProbeInvocation,
-  readNamespaceProbeReceipt,
   validateNamespaceProbeReceipt,
   verifySpecialistSandboxIsolation,
 } from "./specialist-sandbox";
@@ -45,6 +44,44 @@ function localNamespaceAvailable(): boolean {
   }).status === 0;
 }
 
+type FakeProbeBehavior = "valid" | "empty" | "malformed" | "stale" | "replayed" | "oversized" | "authority" | "timeout";
+
+function fakeUnshare(root: string, behavior: FakeProbeBehavior, executable = true): string {
+  const path = join(root, `fake-unshare-${behavior}-${Math.random().toString(16).slice(2)}.cjs`);
+  writeFileSync(path, `#!/usr/bin/env node
+const behavior = ${JSON.stringify(behavior)};
+const value = (prefix) => (process.argv.find((arg) => arg.startsWith(prefix)) || "").slice(prefix.length);
+const nonce = value("JARVIS_NAMESPACE_PROBE_NONCE=");
+const receipt = {
+  protocol: 1,
+  kind: "jarvis-specialist-namespace-preflight",
+  nonce: behavior === "replayed" ? "f".repeat(64) : nonce,
+  issuedAt: Date.now() - (behavior === "stale" ? 60_000 : 0),
+  controllerVisible: behavior === "authority",
+  parentReadable: false,
+  parentTokenVisible: false,
+  foreignEnvironmentVisible: false,
+  numericPids: [1],
+  selfPid: 1,
+  tools: Object.fromEntries(["node", "npm", "npx", "git", "gh", "curl"].map((tool) => [
+    tool,
+    { available: true, version: tool + "-synthetic" },
+  ])),
+};
+if (behavior === "empty") process.exit(0);
+if (behavior === "malformed") process.stdout.write("{");
+else if (behavior === "oversized") process.stdout.write("x".repeat(16 * 1024 + 1));
+else if (behavior === "timeout") setInterval(() => {}, 1_000);
+else {
+  const encoded = JSON.stringify(receipt);
+  process.stdout.write(encoded.slice(0, Math.floor(encoded.length / 2)));
+  setTimeout(() => process.stdout.write(encoded.slice(Math.floor(encoded.length / 2))), 10);
+}
+`, { mode: executable ? 0o700 : 0o600 });
+  chmodSync(path, executable ? 0o700 : 0o600);
+  return path;
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -75,12 +112,23 @@ describe("specialist OS trust boundary", () => {
       PRIVATE_PROC_NAMESPACE_SETUP,
       "sh",
     ]);
-    expect(invocation.args).toContain(":workspace-write");
-    expect(invocation.args).not.toContain(":read-only");
+    expect(invocation.args).toContain(":read-only");
+    expect(invocation.args).not.toContain(":workspace");
+    expect(invocation.args).not.toContain(":workspace-write");
     expect(invocation.args).toContain("features.use_legacy_landlock=true");
-    expect(invocation.args).toContain("sandbox_workspace_write.network_access=false");
     expect(invocation.args).toContain("JARVIS_NAMESPACE_CONTROLLER_PID=4242");
-    expect(invocation.args).toContain(`JARVIS_NAMESPACE_PROBE_RECEIPT=${invocation.receiptPath.split("/").at(-1)}`);
+    expect(invocation.args.some((arg) => arg.startsWith("JARVIS_NAMESPACE_PROBE_RECEIPT="))).toBe(false);
+    const codex = invocation.args.indexOf(codexBin);
+    expect(invocation.args.slice(codex, codex + 8)).toEqual([
+      codexBin,
+      "sandbox",
+      "-P",
+      ":read-only",
+      "-c",
+      "features.use_legacy_landlock=true",
+      "-C",
+      fixture.root,
+    ]);
     expect(invocation.env.CODEX_ACCESS_TOKEN).toMatch(/^eyJ/);
     expect(invocation.env.CODEX_ACCESS_TOKEN).not.toBe(fixture.env.CODEX_ACCESS_TOKEN);
     expect(invocation.env.VAULT_ACCESS_TOKEN).toBeUndefined();
@@ -113,6 +161,34 @@ describe("specialist OS trust boundary", () => {
     expect(result.stdout).not.toContain("synthetic-never-live");
   });
 
+  it("runs the pinned CLI's supported read-only legacy-Landlock profile", () => {
+    const fixture = sandboxFixture();
+    const result = spawnSync(codexBin, [
+      "sandbox",
+      "-P",
+      ":read-only",
+      "-c",
+      "features.use_legacy_landlock=true",
+      "-C",
+      fixture.root,
+      "--",
+      "/usr/bin/env",
+      "-i",
+      `PATH=${String(process.env.PATH ?? "")}`,
+      `HOME=${fixture.root}`,
+      "node",
+      "-e",
+      'process.stdout.write("PINNED_READ_ONLY_OK")',
+    ], {
+      cwd: fixture.root,
+      env: { NODE_ENV: "test", PATH: process.env.PATH, HOME: fixture.root, CODEX_HOME: fixture.root },
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe("PINNED_READ_ONLY_OK");
+  });
+
   it("fails closed when the namespace executable is unavailable", async () => {
     const fixture = sandboxFixture();
     const result = await verifySpecialistSandboxIsolation({
@@ -125,30 +201,66 @@ describe("specialist OS trust boundary", () => {
     if (!result.ok) expect(result.reason).toContain("namespace probe failed");
   });
 
-  it("never treats adversarial piped stdout as a receipt", async () => {
+  it("captures a bounded nonce receipt asynchronously and validates it only after CLOSE", async () => {
     const fixture = sandboxFixture();
-    const fakeUnshare = join(fixture.root, "fake-unshare.cjs");
-    writeFileSync(fakeUnshare, `#!/usr/bin/env node
-process.stdout.write(JSON.stringify({
-  controllerVisible: true,
-  parentReadable: false,
-  parentTokenVisible: false,
-  foreignEnvironmentVisible: false,
-  numericPids: [1, 2],
-  selfPid: 2,
-  tools: { node: true, npm: true, npx: true, git: true, gh: true, curl: true }
-}));
-`, { mode: 0o700 });
-    chmodSync(fakeUnshare, 0o700);
-
     const result = await verifySpecialistSandboxIsolation({
       codexBin,
       cwd: fixture.root,
       env: fixture.env,
-      unshareBinary: fakeUnshare,
+      unshareBinary: fakeUnshare(fixture.root, "valid"),
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.observation).toMatchObject({
+        protocol: 1,
+        controllerVisible: false,
+        parentReadable: false,
+        parentTokenVisible: false,
+        foreignEnvironmentVisible: false,
+      });
+    }
+  });
+
+  it.each(["empty", "malformed", "stale", "replayed", "oversized", "authority"] as const)(
+    "fails closed on %s stdout receipts",
+    async (behavior) => {
+      const fixture = sandboxFixture();
+      const result = await verifySpecialistSandboxIsolation({
+        codexBin,
+        cwd: fixture.root,
+        env: fixture.env,
+        unshareBinary: fakeUnshare(fixture.root, behavior),
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toMatch(/unavailable|failed/);
+    },
+  );
+
+  it("kills a timed-out probe and still waits for CLOSE", async () => {
+    const fixture = sandboxFixture();
+    const startedAt = Date.now();
+    const result = await verifySpecialistSandboxIsolation({
+      codexBin,
+      cwd: fixture.root,
+      env: fixture.env,
+      unshareBinary: fakeUnshare(fixture.root, "timeout"),
+      probeTimeoutMs: 50,
     });
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.reason).toContain("namespace probe failed");
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(40);
+  });
+
+  it("records a spawn error but resolves only after the failed child emits CLOSE", async () => {
+    const fixture = sandboxFixture();
+    const result = await verifySpecialistSandboxIsolation({
+      codexBin,
+      cwd: fixture.root,
+      env: fixture.env,
+      unshareBinary: fakeUnshare(fixture.root, "valid", false),
+      probeTimeoutMs: 1_000,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("unavailable");
   });
 
   it("either proves the real pinned boundary or fails the worker closed on this kernel", async () => {
@@ -167,25 +279,7 @@ process.stdout.write(JSON.stringify({
     }
   });
 
-  it("rejects missing, empty, malformed, oversized, stale, replayed, and symlink receipts", () => {
-    const fixture = sandboxFixture();
-    const missing = join(fixture.root, "missing.json");
-    expect(() => readNamespaceProbeReceipt(missing)).toThrow("missing");
-
-    const empty = join(fixture.root, "empty.json");
-    writeFileSync(empty, "", { mode: 0o600 });
-    expect(() => readNamespaceProbeReceipt(empty)).toThrow("empty");
-
-    const oversized = join(fixture.root, "oversized.json");
-    writeFileSync(oversized, "x".repeat(16 * 1024 + 1), { mode: 0o600 });
-    expect(() => readNamespaceProbeReceipt(oversized)).toThrow("oversized");
-
-    const target = join(fixture.root, "target.json");
-    const linked = join(fixture.root, "linked.json");
-    writeFileSync(target, "{}", { mode: 0o600 });
-    symlinkSync(target, linked);
-    expect(() => readNamespaceProbeReceipt(linked)).toThrow("unique regular file");
-
+  it("rejects empty, malformed, oversized, stale, replayed, and schema-weakened receipt bytes", () => {
     const now = Date.now();
     const validReceipt = (nonce: string, issuedAt = now) => JSON.stringify({
       protocol: 1,
@@ -205,11 +299,23 @@ process.stdout.write(JSON.stringify({
     });
     const malformedNonce = "1".repeat(64);
     expect(() => validateNamespaceProbeReceipt({
+      raw: "",
+      expectedNonce: malformedNonce,
+      startedAt: now - 10,
+      closedAt: now + 10,
+    })).toThrow("empty");
+    expect(() => validateNamespaceProbeReceipt({
       raw: "{",
       expectedNonce: malformedNonce,
       startedAt: now - 10,
       closedAt: now + 10,
     })).toThrow("malformed");
+    expect(() => validateNamespaceProbeReceipt({
+      raw: "x".repeat(16 * 1024 + 1),
+      expectedNonce: "4".repeat(64),
+      startedAt: now - 10,
+      closedAt: now + 10,
+    })).toThrow("oversized");
     const staleNonce = "2".repeat(64);
     expect(() => validateNamespaceProbeReceipt({
       raw: validReceipt(staleNonce, now - 60_000),
@@ -223,5 +329,14 @@ process.stdout.write(JSON.stringify({
       .toBe(replayNonce);
     expect(() => validateNamespaceProbeReceipt({ raw, expectedNonce: replayNonce, startedAt: now - 10, closedAt: now + 10 }))
       .toThrow("replayed");
+    const schemaNonce = "5".repeat(64);
+    const weakened = JSON.parse(validReceipt(schemaNonce)) as Record<string, unknown>;
+    weakened.unexpected = true;
+    expect(() => validateNamespaceProbeReceipt({
+      raw: JSON.stringify(weakened),
+      expectedNonce: schemaNonce,
+      startedAt: now - 10,
+      closedAt: now + 10,
+    })).toThrow("schema");
   });
 });
