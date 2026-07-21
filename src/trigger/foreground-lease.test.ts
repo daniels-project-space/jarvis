@@ -4,6 +4,16 @@ import { waitForForegroundLease, type ForegroundLease } from "./foreground-lease
 const LEASE_MS = 1_000;
 const TIMEOUT_MS = 5_000;
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function waiter(
   touch: (runnerId: string) => Promise<boolean>,
   listeners: Set<(lease: ForegroundLease) => void>,
@@ -109,5 +119,37 @@ describe("foreground handoff lease", () => {
     expect(touch).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(TIMEOUT_MS);
     await expect(pending).resolves.toBe(false);
+  });
+
+  it("serializes a synchronous initial lease notification and retries after a failed claim", async () => {
+    const first = deferred<boolean>();
+    const second = deferred<boolean>();
+    const listeners = new Set<(lease: ForegroundLease) => void>();
+    const touch = vi.fn()
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const pending = waitForForegroundLease({
+      runnerId: crypto.randomUUID(),
+      timeoutMs: TIMEOUT_MS,
+      leaseMs: LEASE_MS,
+      touch,
+      subscribe: (listener) => {
+        listeners.add(listener);
+        listener(null);
+        return () => { listeners.delete(listener); };
+      },
+    });
+
+    await vi.runAllTicks();
+    expect(touch).toHaveBeenCalledTimes(1);
+
+    first.resolve(false);
+    await vi.advanceTimersByTimeAsync(0);
+    for (const listener of listeners) listener(null);
+    await vi.runAllTicks();
+    expect(touch).toHaveBeenCalledTimes(2);
+
+    second.resolve(true);
+    await expect(pending).resolves.toBe(true);
   });
 });

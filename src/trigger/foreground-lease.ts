@@ -21,6 +21,7 @@ export function waitForForegroundLease(options: ForegroundLeaseWaitOptions): Pro
   const clearTimer = options.clearTimer ?? clearTimeout;
   return new Promise((resolve) => {
     let settled = false;
+    let claimInFlight = false;
     let staleTimer: ReturnType<typeof setTimeout> | null = null;
     let unsubscribe = () => {};
     const clearStaleTimer = () => {
@@ -36,10 +37,14 @@ export function waitForForegroundLease(options: ForegroundLeaseWaitOptions): Pro
       resolve(owned);
     };
     const tryClaim = () => {
-      void Promise.resolve(options.touch(options.runnerId))
+      if (settled || claimInFlight) return;
+      claimInFlight = true;
+      void Promise.resolve()
+        .then(() => options.touch(options.runnerId))
         .then((owned) => { if (owned) finish(true); })
         // A later successful subscription notification remains the only retry.
-        .catch(() => undefined);
+        .catch(() => undefined)
+        .finally(() => { claimInFlight = false; });
     };
     const observe = (lease: ForegroundLease) => {
       if (settled) return;

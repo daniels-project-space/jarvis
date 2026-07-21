@@ -28,6 +28,7 @@ import {
 } from "./foreground-policy";
 import { waitForForegroundLease } from "./foreground-lease";
 import { successorLane, taskForForegroundLane, type ForegroundLane } from "./foreground-lanes";
+import { buildForegroundTiming, type ForegroundTurnTiming } from "./foreground-timing";
 import { CodexAppServer } from "./codex-app-server";
 import {
   AgentToolBridge,
@@ -320,16 +321,7 @@ async function processChatQueue(
   const handoffTimer = setTimeout(startHandoff, HANDOFF_AFTER_MS);
 
   const started = Date.now();
-  const timings: Array<{
-    claimMs: number;
-    contextMs: number;
-    codexAckMs?: number;
-    firstDeltaMs?: number;
-    firstConvexPaintMs?: number;
-    completionMs: number;
-    finalizeMs: number;
-    deliveredMs: number;
-  }> = [];
+  const timings: ForegroundTurnTiming[] = [];
   let processed = 0;
   try {
     // Prewarm even when the scheduled recovery task found no message. This is
@@ -406,11 +398,7 @@ async function processChatQueue(
       // Realtime metadata is deliberately per delivered turn, never per token.
       // It contains only durations and lets the active run be monitored before
       // its eventual four-hour cleanup path executes.
-      metadata.set("foregroundTiming", JSON.stringify({
-        turns: timings,
-        runnerAgeMs: Date.now() - started,
-        lane,
-      }));
+      metadata.set("foregroundTiming", buildForegroundTiming(timings, Date.now() - started, lane));
       await metadata.flush();
     } catch (error: unknown) {
       await convexMutation("chatQueue:finalize", {
@@ -424,17 +412,22 @@ async function processChatQueue(
     // and drain rapid follow-ups. Duplicate queued wake tasks become no-ops.
     targetMessageId = undefined;
   }
-    metadata.set("foregroundTiming", JSON.stringify({ turns: timings, runnerAgeMs: Date.now() - started, lane }));
-    await metadata.flush();
     return { processed, timings };
   } finally {
-    clearInterval(heartbeat);
-    clearTimeout(handoffTimer);
-    if (!handoffStarted && leaseActive) startHandoff();
-    await handoffPromise;
-    client.close();
-    server.stop();
-    await convexMutation("chatQueue:releaseRunner", { runnerId }).catch(() => {});
+    // A final structured snapshot records the bounded timing state even when
+    // the worker exits through its cleanup path rather than a delivered turn.
+    try {
+      metadata.set("foregroundTiming", buildForegroundTiming(timings, Date.now() - started, lane));
+      await metadata.flush();
+    } finally {
+      clearInterval(heartbeat);
+      clearTimeout(handoffTimer);
+      if (!handoffStarted && leaseActive) startHandoff();
+      await handoffPromise;
+      client.close();
+      server.stop();
+      await convexMutation("chatQueue:releaseRunner", { runnerId }).catch(() => {});
+    }
   }
 }
 
