@@ -48,12 +48,12 @@ async function plannedGoal() {
   return { t, missionId, jobs };
 }
 
-async function goalAwaitingPlan() {
+async function goalAwaitingPlan(maxBuildSessions = 4) {
   const t = convexTest(schema, modules);
   const created = await t.mutation(api.goalMode.create, {
     goal: "Make the Dropship catalogue and content metrics durable in parallel",
     route: "existing_project", routeReason: "owned product", primaryRepo: REPO,
-    infrastructureContext: "Preserve the owned Dropship infrastructure.", maxBuildSessions: 4,
+    infrastructureContext: "Preserve the owned Dropship infrastructure.", maxBuildSessions,
     workerToken: TOKEN,
   });
   await t.run(async (ctx) => {
@@ -263,6 +263,52 @@ describe("real Convex multi-agent workspace and integration races", () => {
       id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     })).toMatchObject({ advanced: true, stale: false, replay: true, jobs: 3 });
     expect((await f.t.run(async (ctx) => ctx.db.query("missions").collect())).filter((row) => row.parentMissionId === f.missionId)).toHaveLength(3);
+  });
+
+  it("materializes the eight-node transaction bound with at most 28 immutable DAG edges", async () => {
+    const f = await goalAwaitingPlan(8);
+    const other = "daniels-project-space/jarvis";
+    const workstreams = Array.from({ length: 8 }, (_, index) => ({
+      id: `bounded-${index + 1}`,
+      label: `Bounded node ${index + 1}`,
+      task: `Execute immutable bounded node ${index + 1}.`,
+      agentId: index === 0 ? "iris" : "paul",
+      ...(index === 0 ? { readonly: true } : { repo: index % 2 ? REPO : other, readonly: false }),
+      dependsOn: Array.from({ length: index }, (__, dependency) => `bounded-${dependency + 1}`),
+      acceptanceCriteria: [`bounded node ${index + 1} verified`],
+      mcp: [],
+    }));
+    const plan = {
+      summary: "Worst-case bounded parent DAG", route: "existing_project", primaryRepo: REPO, assumptions: [],
+      workstreams, validation: { criteria: ["bounded"], tests: [], liveChecks: [] },
+    };
+    const recorded: any = await f.t.mutation(api.goalMode.recordPlan, {
+      id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
+    });
+    expect(recorded).toMatchObject({ advanced: true, jobs: 8, planGeneration: 1 });
+    const authority = await f.t.run(async (ctx) => ({
+      nodes: await ctx.db.query("goalPlanNodes").collect(),
+      edges: await ctx.db.query("goalPlanEdges").collect(),
+      handoffs: await ctx.db.query("goalHandoffs").collect(),
+      children: (await ctx.db.query("missions").collect()).filter((row) => row.parentMissionId === f.missionId),
+    }));
+    expect(authority).toMatchObject({ nodes: expect.any(Array), edges: expect.any(Array), handoffs: [] });
+    expect(authority.nodes).toHaveLength(8);
+    expect(authority.edges).toHaveLength(28); // n(n-1)/2 is the maximum for an acyclic eight-node graph.
+    expect(authority.children).toHaveLength(3); // two repository authorities plus one read-only evidence authority.
+    expect(new Set(authority.edges.map((edge) => edge.edgeId)).size).toBe(28);
+    expect(await f.t.query(api.goalMode.dagProjection, { id: f.missionId, workerToken: TOKEN }))
+      .toMatchObject({ nodeCount: 8, maxNodes: 8, planDigest: recorded.planDigest, planGeneration: 1 });
+    expect(await f.t.mutation(api.goalMode.recordPlan, {
+      id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
+    })).toMatchObject({ replay: true, jobs: 8, planDigest: recorded.planDigest, planGeneration: 1 });
+    const replayCounts = await f.t.run(async (ctx) => ({
+      nodes: (await ctx.db.query("goalPlanNodes").collect()).length,
+      edges: (await ctx.db.query("goalPlanEdges").collect()).length,
+      handoffs: (await ctx.db.query("goalHandoffs").collect()).length,
+      children: (await ctx.db.query("missions").collect()).filter((row) => row.parentMissionId === f.missionId).length,
+    }));
+    expect(replayCounts).toEqual({ nodes: 8, edges: 28, handoffs: 0, children: 3 });
   });
 
   it("refuses to roll a split parent done from child summaries without node handoffs and Sol validation", async () => {
