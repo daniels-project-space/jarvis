@@ -1,6 +1,6 @@
 import { leaseDecision, type LeaseSnapshot } from "../lib/durable-attempt-protocol";
 
-export type LeaseStatus = "running" | "steered" | "superseded" | "unknown";
+export type LeaseStatus = "running" | "paused" | "cancelled" | "steered" | "superseded" | "unknown";
 
 /**
  * One bounded monitor used by the runner. Subscription failures retain a
@@ -29,7 +29,7 @@ export class ExecutionLeaseMonitor {
   async status(): Promise<LeaseStatus> {
     const time = this.now();
     let decision = leaseDecision({ now: time, expectedAttempt: this.expectedAttempt, expectedSteerRevision: this.expectedSteerRevision, lease: this.lease, leaseObservedAt: this.observedAt, maxKnownAgeMs: this.maxKnownAgeMs });
-    if (decision === "running" || decision === "steered" || decision === "superseded") return decision;
+    if (decision === "running" || decision === "paused" || decision === "cancelled" || decision === "steered" || decision === "superseded") return decision;
     if (time - this.lastFallbackAt < this.fallbackIntervalMs) return "unknown";
     this.lastFallbackAt = time;
     try {

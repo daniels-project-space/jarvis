@@ -265,6 +265,10 @@ export default defineSchema({
     // A signed controller receipt is persisted before repository delivery.
     reviewReceiptJson: v.optional(v.string()),
     reviewReceiptSignature: v.optional(v.string()),
+    // Compact pointer only. The potentially large immutable review document
+    // lives in reviewReceipts, never on this hot control document.
+    reviewReceiptId: v.optional(v.id("reviewReceipts")),
+    reviewReceiptDigest: v.optional(v.string()),
     verificationVerdict: v.optional(v.string()), // pass | unavailable
     verificationNote: v.optional(v.string()),
     verifiedAt: v.optional(v.number()),
@@ -600,10 +604,32 @@ export default defineSchema({
     // Controller-issued signed review binding for repository work.
     reviewReceiptSignature: v.optional(v.string()),
     reviewDiffSha256: v.optional(v.string()),
+    reviewReceiptId: v.optional(v.id("reviewReceipts")),
+    reviewReceiptDigest: v.optional(v.string()),
     createdAt: v.number(),
   })
     .index("by_job_attempt", ["jobId", "attempt"])
     .index("by_createdAt", ["createdAt"]),
+
+  // Cold, append-only repository review evidence. It is content-addressed
+  // and never patched; jobs retain only the small binding fields above.
+  reviewReceipts: defineTable({
+    jobId: v.id("jobs"),
+    attempt: v.number(),
+    repository: v.string(),
+    receiptJson: v.string(),
+    receiptDigest: v.string(),
+    signature: v.string(),
+    diffSha256: v.string(),
+    baseSha: v.string(),
+    headSha: v.string(),
+    baseTreeSha: v.string(),
+    headTreeSha: v.string(),
+    agentEvidenceSha256: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_job_attempt", ["jobId", "attempt"])
+    .index("by_job_attempt_digest", ["jobId", "attempt", "receiptDigest"]),
 
   // Compact, append-only supervisor receipts. These deliberately describe
   // coordination rather than changing it, so viewers can audit Trigger's

@@ -27,6 +27,30 @@ const STALE_RUNNER_MS = 5 * 60 * 1000;
 // still surfacing a genuinely stuck attempt before its lease disappears.
 const STALLED_PROGRESS_MS = 20 * 60 * 1000;
 const DISPATCH_LEASE_MS = 2 * 60 * 1000;
+const DELIVERY_LEASE_MS = 45_000;
+
+async function sha256Hex(value: string) {
+  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function invalidateDeliveryLease(row: any) {
+  return {
+    deliveryLeaseVersion: Math.max(0, Number(row.deliveryLeaseVersion ?? 0)) + 1,
+    deliveryLeaseOwner: undefined,
+    deliveryLeaseToken: undefined,
+    deliveryLeaseUntil: undefined,
+  };
+}
+
+function hasLiveDeliveryLease(row: any, a: any, now = Date.now()) {
+  return typeof a.deliveryLeaseOwner === "string"
+    && typeof a.deliveryLeaseToken === "string"
+    && a.deliveryLeaseOwner === row.deliveryLeaseOwner
+    && a.deliveryLeaseToken === row.deliveryLeaseToken
+    && Number(a.deliveryLeaseVersion) === Number(row.deliveryLeaseVersion)
+    && Number(row.deliveryLeaseUntil ?? 0) >= now;
+}
 
 async function attemptFor(ctx: any, jobId: any, attempt: number) {
   return await ctx.db
@@ -235,6 +259,40 @@ async function migrateLegacyJobsPage(ctx: any, migration?: any) {
   const now = Date.now();
   let repaired = 0;
   for (const row of page.page) {
+    // v1 placed the full review patch on the hot jobs document. Re-home only
+    // structurally complete legacy receipts into the immutable cold table;
+    // malformed values stay unavailable rather than becoming delivery proof.
+    if (row.repo && row.reviewReceiptJson && row.reviewReceiptSignature && !row.reviewReceiptId) {
+      try {
+        const receipt = JSON.parse(row.reviewReceiptJson);
+        const receiptJson = String(row.reviewReceiptJson).slice(0, 300_000);
+        const digest = await sha256Hex(receiptJson);
+        if (receipt?.jobId === String(row._id) && Number(receipt?.attempt) === (row.attempt ?? 1)
+          && receipt?.repository === row.repo && isSha256Digest(row.reviewReceiptSignature)
+          && isSha256Digest(receipt?.diffSha256) && isSha256Digest(receipt?.agentEvidenceSha256)) {
+          const existingReceipt = await ctx.db.query("reviewReceipts")
+            .withIndex("by_job_attempt_digest", (q: any) => q.eq("jobId", row._id).eq("attempt", row.attempt ?? 1).eq("receiptDigest", digest)).first();
+          const reviewReceiptId = existingReceipt?._id ?? await ctx.db.insert("reviewReceipts", {
+            jobId: row._id, attempt: row.attempt ?? 1, repository: row.repo, receiptJson, receiptDigest: digest,
+            signature: row.reviewReceiptSignature, diffSha256: receipt.diffSha256,
+            baseSha: String(receipt.baseSha ?? ""), headSha: String(receipt.headSha ?? ""), baseTreeSha: String(receipt.baseTreeSha ?? ""), headTreeSha: String(receipt.headTreeSha ?? ""),
+            agentEvidenceSha256: receipt.agentEvidenceSha256, createdAt: now,
+          });
+          await ctx.db.patch(row._id, { reviewReceiptId, reviewReceiptDigest: digest, reviewReceiptJson: undefined });
+          row.reviewReceiptId = reviewReceiptId; row.reviewReceiptDigest = digest; row.reviewReceiptJson = undefined;
+        }
+      } catch { /* fail closed; a malformed old row is not a review receipt */ }
+    }
+    // Old rows can already contain append-only evidence. Seed the job-wide
+    // cursor from it so rollout never restarts causal numbering at one.
+    const historical = await ctx.db.query("workEvents")
+      .withIndex("by_job", (q: any) => q.eq("jobId", String(row._id))).take(200);
+    const newest = [...historical].sort((a: any, b: any) => Number(b.sequence ?? 0) - Number(a.sequence ?? 0) || Number(b.createdAt ?? 0) - Number(a.createdAt ?? 0))[0];
+    if (newest && Number(row.lifecycleSequence ?? 0) < Number(newest.sequence ?? 0)) {
+      await ctx.db.patch(row._id, { lifecycleSequence: Number(newest.sequence ?? 0), lifecycleEventKey: newest.eventKey });
+      row.lifecycleSequence = Number(newest.sequence ?? 0);
+      row.lifecycleEventKey = newest.eventKey;
+    }
     const safety = row.status === "awaiting_approval" ? classifyWorkSafety(row.task, { repo: row.repo }) : null;
     if (safety && !safety.approvalRequired && isOwnedRepository(row.repo)) {
       const patch = {
@@ -558,7 +616,27 @@ export const reserveDispatchBatch = mutation({
     const candidates = await runnableCandidates(ctx, now, limit);
     const reservations = [];
     for (const j of candidates) {
-      const dispatchId = `${String(j._id)}:${j.attempt ?? 1}:${now}`;
+      let attemptNumber = j.attempt ?? 1;
+      let attempt = await attemptFor(ctx, j._id, attemptNumber);
+      // A malformed/legacy pending row may still point at a launched worker.
+      // Never overwrite that binding into an unclaimable reservation: close
+      // it first, record its terminal lineage, then reserve a fresh attempt.
+      if (attempt?.workerRunId) {
+        if (!hasAttemptBudget(attemptNumber + 1, j.maxAttempts ?? 12)) continue;
+        await ctx.db.patch(attempt._id, { status: "checkpointed", completedAt: now, lastEventAt: now });
+        await appendAttemptEvidence(ctx, j, "reservation_repaired", "Malformed launched reservation fenced before redispatch", {
+          stage: "checkpointed", evidenceKind: "reconcile", eventKey: `reservation-repaired:${attemptNumber}`, attempt: attemptNumber,
+        });
+        attemptNumber += 1;
+        await patchJobWithRuntime(ctx, j, { attempt: attemptNumber, ...invalidateDeliveryLease(j) });
+        await ensureAttempt(ctx, j._id, attemptNumber, "pending", now);
+        await appendAttemptEvidence(ctx, j, "queued", `Fresh attempt ${attemptNumber} queued after reservation repair`, {
+          stage: "queued", evidenceKind: "intent", eventKey: `intent:${attemptNumber}`, attempt: attemptNumber,
+        });
+        j.attempt = attemptNumber;
+        attempt = await attemptFor(ctx, j._id, attemptNumber);
+      }
+      const dispatchId = `${String(j._id)}:${attemptNumber}:${now}`;
       await patchJobWithRuntime(ctx, j, {
         status: "dispatching",
         stage: "dispatching",
@@ -570,16 +648,16 @@ export const reserveDispatchBatch = mutation({
         workerRuntime: "trigger",
         heartbeatAt: now,
       });
-      const attempt = await attemptFor(ctx, j._id, j.attempt ?? 1);
+      attempt = await attemptFor(ctx, j._id, attemptNumber);
       if (attempt && !attempt.workerRunId) await ctx.db.patch(attempt._id, { status: "dispatching", dispatchId, lastEventAt: now });
-      else if (!attempt) await ensureAttempt(ctx, j._id, j.attempt ?? 1, "dispatching", now, { dispatchId });
+      else if (!attempt) await ensureAttempt(ctx, j._id, attemptNumber, "dispatching", now, { dispatchId });
       await appendAttemptEvidence(ctx, j, "dispatched", `Independent Trigger worker reserved${a.reason ? ` · ${a.reason.slice(0, 120)}` : ""}`, {
-        stage: "dispatching", percent: Math.max(1, j.percent ?? 0), evidenceKind: "dispatch", eventKey: `dispatch:${j.attempt ?? 1}:${dispatchId}`,
+        stage: "dispatching", percent: Math.max(1, j.percent ?? 0), evidenceKind: "dispatch", eventKey: `dispatch:${attemptNumber}:${dispatchId}`,
       });
       reservations.push({
         jobId: String(j._id),
         dispatchId,
-        attempt: j.attempt ?? 1,
+        attempt: attemptNumber,
         missionId: j.missionId ?? null,
         agentId: j.agentId ?? null,
         label: j.label ?? j.task.slice(0, 80),
@@ -717,12 +795,16 @@ export const finalize = mutation({
     reviewReceiptSignature: v.optional(v.string()),
     reviewDiffSha256: v.optional(v.string()),
     reviewReceiptJson: v.optional(v.string()),
+    deliveryLeaseOwner: v.optional(v.string()),
+    deliveryLeaseToken: v.optional(v.string()),
+    deliveryLeaseVersion: v.optional(v.number()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
+    if (row.repo && !hasLiveDeliveryLease(row, a)) return false;
     // A completed job is called "verified" only when the supervisor actually
     // returned pass. This invariant lives in Convex, not only in the runner.
     if (a.status === "done" && (a.verificationVerdict !== "pass" || !completionReceiptAllowed(a))) return false;
@@ -730,7 +812,19 @@ export const finalize = mutation({
     // signed checkout review before any delivery continuation. Convex checks
     // immutable binding fields; the Trigger controller validates the HMAC with
     // its private stable authority before it ever sends this mutation.
-    if (a.status === "done" && row.repo && (!row.reviewReceiptJson || !row.reviewReceiptSignature)) return false;
+    if (a.status === "done" && row.repo && (!row.reviewReceiptId || !row.reviewReceiptDigest || !row.reviewReceiptSignature)) return false;
+    if (a.status === "done" && row.repo) {
+      const review: any = await ctx.db.get(row.reviewReceiptId as any);
+      if (!review || review.jobId !== a.jobId || review.attempt !== a.expectedAttempt
+        || review.receiptDigest !== row.reviewReceiptDigest || review.signature !== row.reviewReceiptSignature
+        || review.diffSha256 !== a.reviewDiffSha256 || review.signature !== a.reviewReceiptSignature) return false;
+    }
+    const normalizedResult = String(a.result ?? "").slice(0, 4_000);
+    const normalizedNote = String(a.verificationNote ?? "").slice(0, 1_000);
+    if (a.status === "done" && (
+      a.resultDigest !== await sha256Hex(normalizedResult)
+      || a.evidenceDigest !== await sha256Hex(normalizedNote)
+    )) return false;
     const now = Date.now();
     const success = a.status === "done";
     const delivered = success && row.deliveryStatus === "merged";
@@ -741,7 +835,7 @@ export const finalize = mutation({
       : activity?.progress ?? row.progress;
     const finalPatch = {
       status: a.status,
-      result: a.result,
+      result: normalizedResult || undefined,
       pullRequestUrl: a.pullRequestUrl,
       completedAt: now,
       heartbeatAt: now,
@@ -749,7 +843,7 @@ export const finalize = mutation({
       percent: finalPercent,
       progress: finalProgress,
       verificationVerdict: a.verificationVerdict,
-      verificationNote: a.verificationNote?.slice(0, 1000),
+      verificationNote: normalizedNote || undefined,
       verifiedAt: success ? now : undefined,
     };
     const terminalEventKey = `terminal:${a.expectedAttempt}:${a.status}:${a.status === "done" ? a.resultDigest : eventIdentity(`${a.result ?? ""}|${a.verificationNote ?? ""}`)}`;
@@ -779,7 +873,8 @@ export const finalize = mutation({
         jobId: a.jobId, attempt: a.expectedAttempt, status: "succeeded",
         acceptanceEvidence: [String(a.verificationNote).slice(0, 1_000)], artifacts, verification: "pass",
         terminalEventKey, resultDigest: a.resultDigest, evidenceDigest: a.evidenceDigest,
-        reviewReceiptSignature: a.reviewReceiptSignature, reviewDiffSha256: a.reviewDiffSha256, createdAt: now,
+        reviewReceiptSignature: a.reviewReceiptSignature, reviewDiffSha256: a.reviewDiffSha256,
+        reviewReceiptId: row.reviewReceiptId, reviewReceiptDigest: row.reviewReceiptDigest, createdAt: now,
       });
     }
     if (row.missionId) {
@@ -979,6 +1074,7 @@ export const reapStale = mutation({
       // the only possible reaper, so five quiet minutes is ample fencing while
       // avoiding a long ghost-running window.
       const nextAttempt = (j.attempt ?? 1) + 1;
+      let recoveryEventEmitted = false;
       if (now - j.createdAt > 14 * 86_400_000 || nextAttempt > (j.maxAttempts ?? 12)) {
         await patchJobWithRuntime(ctx, j, {
           status: "error",
@@ -999,7 +1095,18 @@ export const reapStale = mutation({
           trace: j.log,
           deliveryNote: j.branch ? `checkpoint branch ${j.branch} retained` : undefined,
         });
+        // The old attempt's terminal event must precede allocation of the
+        // replacement attempt, otherwise causal readers see a child before
+        // its failed parent.
+        await appendAttemptEvidence(ctx, j, "recovered", `Recovered as attempt ${nextAttempt}`, {
+          stage: "checkpointed", evidenceKind: "watchdog", eventKey: `recovery:${j.attempt ?? 1}:${nextAttempt}`,
+          attempt: j.attempt ?? 1,
+        });
+        recoveryEventEmitted = true;
+        const attempt = await attemptFor(ctx, j._id, j.attempt ?? 1);
+        if (attempt && !attempt.completedAt) await ctx.db.patch(attempt._id, { status: "checkpointed", completedAt: now, lastEventAt: now });
         await patchJobWithRuntime(ctx, j, {
+          ...invalidateDeliveryLease(j),
           status: "pending",
           stage: "queued",
           startedAt: undefined,
@@ -1011,14 +1118,12 @@ export const reapStale = mutation({
           result: checkpoint.slice(0, 4000),
         });
         requeued.push(j.task.slice(0, 80));
-        const attempt = await attemptFor(ctx, j._id, j.attempt ?? 1);
-        if (attempt) await ctx.db.patch(attempt._id, { status: "checkpointed", completedAt: now, lastEventAt: now });
         await ensureAttempt(ctx, j._id, nextAttempt, "pending", now);
         await appendAttemptEvidence(ctx, j, "queued", `Recovered attempt ${nextAttempt} queued`, {
           stage: "queued", evidenceKind: "intent", eventKey: `intent:${nextAttempt}`, attempt: nextAttempt,
         });
       }
-      await appendAttemptEvidence(ctx, j, nextAttempt > (j.maxAttempts ?? 12) ? "abandoned" : "recovered",
+      if (!recoveryEventEmitted) await appendAttemptEvidence(ctx, j, nextAttempt > (j.maxAttempts ?? 12) ? "abandoned" : "recovered",
         nextAttempt > (j.maxAttempts ?? 12) ? "Retry budget exhausted" : `Recovered as attempt ${nextAttempt}`,
         { stage: nextAttempt > (j.maxAttempts ?? 12) ? "error" : "queued", evidenceKind: "watchdog", eventKey: `recovery:${j.attempt ?? 1}:${nextAttempt}` });
     }
@@ -1142,6 +1247,7 @@ export const checkpointAndRequeue = mutation({
         const nextAttempt = (row.attempt ?? 1) + 1;
         if (!hasAttemptBudget(nextAttempt, row.maxAttempts ?? 12)) return { requeued: false, exhausted: true, stale: false };
         await patchJobWithRuntime(ctx, row, {
+          ...invalidateDeliveryLease(row),
           status: "pending", stage: "checkpointed", attempt: nextAttempt,
           checkpoint: a.checkpoint.slice(0, 6000), result: a.result, branch: a.branch ?? row.branch,
           startedAt: undefined, heartbeatAt: now, nextRunAt: now, dispatchId: undefined,
@@ -1185,6 +1291,7 @@ export const checkpointAndRequeue = mutation({
       (attempt > (row.maxAttempts ?? 12) || Date.now() - row.createdAt > 14 * 86_400_000);
     const status = exhausted ? "error" : requestedStatus;
     await patchJobWithRuntime(ctx, row, {
+      ...invalidateDeliveryLease(row),
       status,
       stage: exhausted ? "error" : requestedStatus === "pending" ? "checkpointed" : requestedStatus,
       checkpoint: a.checkpoint.slice(0, 6000),
@@ -1317,23 +1424,30 @@ export const provideInput = mutation({
     const now = Date.now();
     const previousAttempt = await attemptFor(ctx, a.jobId, row.attempt ?? 1);
     if (!previousAttempt || previousAttempt.status !== "needs_input") return false;
+    // Close and journal the old lineage before allocating its continuation.
+    await ctx.db.patch(previousAttempt._id, { status: "needs_input", completedAt: now, lastEventAt: now });
+    await appendAttemptEvidence(ctx, row, "input_received", "Daniel supplied the required decision", {
+      stage: "needs Daniel", evidenceKind: "control", eventKey: `input-received:${row.attempt ?? 1}`, attempt: row.attempt ?? 1,
+    });
+    const nextAttempt = (row.attempt ?? 1) + 1;
     await patchJobWithRuntime(ctx, row, {
       status: "pending",
       stage: "queued",
       progress: "Daniel answered — continuation queued",
       checkpoint: `${row.checkpoint ?? ""}\n\nDaniel's answer: ${a.answer.slice(0, 2000)}`.trim(),
-      attempt: (row.attempt ?? 1) + 1,
+      attempt: nextAttempt,
       heartbeatAt: now,
       nextRunAt: now,
+    });
+    await ensureAttempt(ctx, a.jobId, nextAttempt, "pending", now);
+    await appendAttemptEvidence(ctx, row, "queued", `Continuation attempt ${nextAttempt} queued after input`, {
+      stage: "queued", evidenceKind: "intent", eventKey: `intent:${nextAttempt}`, attempt: nextAttempt,
     });
     const attention = await ctx.db
       .query("attentionItems")
       .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", `job-input:${a.jobId}`))
       .first();
     if (attention) await ctx.db.patch(attention._id, { status: "resolved", updatedAt: now });
-    await appendAttemptEvidence(ctx, row, "input_received", "Daniel supplied the required decision", {
-      stage: "queued", evidenceKind: "control", eventKey: `input-received:${row.attempt ?? 1}`,
-    });
     return true;
   },
 });
@@ -1351,12 +1465,16 @@ export const setDelivery = mutation({
       v.literal("blocked"),
     )),
     mergeCommitSha: v.optional(v.string()),
+    deliveryLeaseOwner: v.optional(v.string()),
+    deliveryLeaseToken: v.optional(v.string()),
+    deliveryLeaseVersion: v.optional(v.number()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
+    if (!hasLiveDeliveryLease(row, a)) return false;
     await patchJobWithRuntime(ctx, row, {
       branch: a.branch,
       pullRequestUrl: a.pullRequestUrl,
@@ -1374,14 +1492,26 @@ export const setDelivery = mutation({
 // still arrive during an in-flight external call, so the following durable
 // writer rechecks status/attempt and never resurrects the old lease.
 export const linearizeDelivery = mutation({
-  args: { jobId: v.id("jobs"), expectedAttempt: v.number(), workerToken: v.optional(v.string()) },
+  args: {
+    jobId: v.id("jobs"), expectedAttempt: v.number(), deliveryLeaseOwner: v.string(), deliveryLeaseToken: v.string(),
+    deliveryLeaseVersion: v.optional(v.number()), workerToken: v.optional(v.string()),
+  },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return null;
-    const version = Math.max(0, Number(row.deliveryLeaseVersion ?? 0)) + 1;
-    await patchJobWithRuntime(ctx, row, { deliveryLeaseVersion: version, heartbeatAt: Date.now() });
-    return version;
+    const now = Date.now();
+    const sameOwner = row.deliveryLeaseOwner === a.deliveryLeaseOwner && row.deliveryLeaseToken === a.deliveryLeaseToken;
+    const requestedVersion = Number(a.deliveryLeaseVersion ?? 0);
+    const live = sameOwner && Number(row.deliveryLeaseUntil ?? 0) >= now && requestedVersion === Number(row.deliveryLeaseVersion);
+    if (row.deliveryLeaseUntil && Number(row.deliveryLeaseUntil) >= now && !live) return null;
+    const version = live ? Number(row.deliveryLeaseVersion) : Math.max(0, Number(row.deliveryLeaseVersion ?? 0)) + 1;
+    const until = now + DELIVERY_LEASE_MS;
+    await patchJobWithRuntime(ctx, row, {
+      deliveryLeaseVersion: version, deliveryLeaseOwner: a.deliveryLeaseOwner.slice(0, 120),
+      deliveryLeaseToken: a.deliveryLeaseToken.slice(0, 160), deliveryLeaseUntil: until, heartbeatAt: now,
+    });
+    return { owner: a.deliveryLeaseOwner, token: a.deliveryLeaseToken, version, until };
   },
 });
 
@@ -1398,16 +1528,25 @@ export const markVerifiedForDelivery = mutation({
     reviewReceiptJson: v.optional(v.string()),
     reviewReceiptSignature: v.optional(v.string()),
     reviewDiffSha256: v.optional(v.string()),
+    resultDigest: v.optional(v.string()),
+    evidenceDigest: v.optional(v.string()),
+    deliveryLeaseOwner: v.optional(v.string()),
+    deliveryLeaseToken: v.optional(v.string()),
+    deliveryLeaseVersion: v.optional(v.number()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
+    if (!hasLiveDeliveryLease(row, a)) return false;
     if (!isOwnedRepository(row.repo)) return false;
     if (classifyWorkSafety(row.task, { repo: row.repo }).approvalRequired) return false;
     if (row.deliveryMode !== "auto_merge" && row.goalStage !== "validating") return false;
     if (!a.reviewReceiptJson || !isSha256Digest(a.reviewReceiptSignature) || !isSha256Digest(a.reviewDiffSha256)) return false;
+    const result = a.result.slice(0, 4_000);
+    const verificationNote = a.verificationNote.slice(0, 1_000);
+    if (a.resultDigest !== await sha256Hex(result) || a.evidenceDigest !== await sha256Hex(verificationNote)) return false;
     let receipt: any;
     try { receipt = JSON.parse(a.reviewReceiptJson); } catch { return false; }
     if (
@@ -1417,18 +1556,30 @@ export const markVerifiedForDelivery = mutation({
       || receipt?.diffSha256 !== a.reviewDiffSha256
       || !isSha256Digest(receipt?.agentEvidenceSha256)
     ) return false;
+    const receiptJson = a.reviewReceiptJson.slice(0, 300_000);
+    const receiptDigest = await sha256Hex(receiptJson);
+    const existing = await ctx.db.query("reviewReceipts")
+      .withIndex("by_job_attempt_digest", (q: any) => q.eq("jobId", a.jobId).eq("attempt", a.expectedAttempt).eq("receiptDigest", receiptDigest)).first();
+    const reviewReceiptId = existing?._id ?? await ctx.db.insert("reviewReceipts", {
+      jobId: a.jobId, attempt: a.expectedAttempt, repository: String(row.repo), receiptJson, receiptDigest,
+      signature: a.reviewReceiptSignature, diffSha256: a.reviewDiffSha256,
+      baseSha: String(receipt.baseSha), headSha: String(receipt.headSha), baseTreeSha: String(receipt.baseTreeSha), headTreeSha: String(receipt.headTreeSha),
+      agentEvidenceSha256: String(receipt.agentEvidenceSha256), createdAt: Date.now(),
+    });
     const now = Date.now();
     await patchJobWithRuntime(ctx, row, {
-      result: a.result.slice(0, 4_000),
+      result,
       verificationVerdict: "pass",
-      verificationNote: a.verificationNote.slice(0, 1_000),
+      verificationNote,
       verifiedAt: now,
       stage: "delivery",
       progress: "supervisor passed — controller delivery in progress",
       percent: Math.max(96, row.percent ?? 0),
       heartbeatAt: now,
-      reviewReceiptJson: a.reviewReceiptJson.slice(0, 300_000),
+      reviewReceiptJson: undefined,
       reviewReceiptSignature: a.reviewReceiptSignature,
+      reviewReceiptId,
+      reviewReceiptDigest: receiptDigest,
     });
     return true;
   },
@@ -1447,6 +1598,7 @@ export const control = mutation({
     const row = await ctx.db.get(a.jobId);
     if (!row) return false;
     const now = Date.now();
+    let controlEventEmitted = false;
     const closeAttempt = async (status: string) => {
       const attempt = await attemptFor(ctx, a.jobId, row.attempt ?? 1);
       if (attempt && !attempt.completedAt) await ctx.db.patch(attempt._id, { status, completedAt: now, lastEventAt: now });
@@ -1459,6 +1611,7 @@ export const control = mutation({
         await ctx.db.patch(attempt._id, { status: "paused", dispatchId: undefined, lastEventAt: now });
       }
       await patchJobWithRuntime(ctx, row, {
+        ...invalidateDeliveryLease(row),
         status: "paused",
         stage: "paused",
         progress: "paused by Daniel",
@@ -1477,6 +1630,7 @@ export const control = mutation({
       const nextAttempt = (row.attempt ?? 1) + (shouldAdvanceAttempt(Boolean(previous?.workerRunId)) ? 1 : 0);
       if (!hasAttemptBudget(nextAttempt, row.maxAttempts ?? 12)) return false;
       await patchJobWithRuntime(ctx, row, {
+        ...invalidateDeliveryLease(row),
         status: "pending",
         stage: "queued",
         progress: row.status === "stalled" ? "stalled attempt resumed — fresh workspace queued" : "resumed — queued",
@@ -1496,6 +1650,11 @@ export const control = mutation({
       if (nextAttempt === (row.attempt ?? 1) && previous?.status === "paused") {
         await ctx.db.patch(previous._id, { status: "queued", dispatchId: undefined, lastEventAt: now });
       } else {
+        await appendAttemptEvidence(ctx, row, "resume", `${row.status} resumed by Daniel`, {
+          stage: "queued", evidenceKind: "control", eventKey: `control:resume:${row.attempt ?? 1}:${now}`,
+          attempt: row.attempt ?? 1,
+        });
+        controlEventEmitted = true;
         await ensureAttempt(ctx, a.jobId, nextAttempt, "pending", now);
         await appendAttemptEvidence(ctx, row, "queued", `Fresh attempt ${nextAttempt} queued after ${row.status}`, {
           stage: "queued", evidenceKind: "intent", eventKey: `intent:${nextAttempt}`, attempt: nextAttempt,
@@ -1506,6 +1665,7 @@ export const control = mutation({
       if (["running", "steering"].includes(row.status) && !await closeAttempt("cancelled")) return false;
       if (["pending", "dispatching", "paused"].includes(row.status)) await closeAttempt("cancelled");
       await patchJobWithRuntime(ctx, row, {
+        ...invalidateDeliveryLease(row),
         status: "cancelled",
         stage: "cancelled",
         completedAt: now,
@@ -1527,6 +1687,7 @@ export const control = mutation({
       if (!hasAttemptBudget((row.attempt ?? 1) + 1, row.maxAttempts ?? 12)) return false;
       const renewApproval = row.approvalRequired === true && row.approvalStatus !== "approved";
       await patchJobWithRuntime(ctx, row, {
+        ...invalidateDeliveryLease(row),
         status: renewApproval ? "awaiting_approval" : "pending",
         stage: renewApproval ? "approval" : "queued",
         completedAt: undefined,
@@ -1561,6 +1722,7 @@ export const control = mutation({
       const running = row.status === "running";
       if (running && !await closeAttempt("steered")) return false;
       await patchJobWithRuntime(ctx, row, {
+        ...invalidateDeliveryLease(row),
         status: running ? "steering" : row.status,
         stage: running ? "steering" : row.stage,
         steer,
@@ -1571,6 +1733,11 @@ export const control = mutation({
         deliveryLeaseToken: undefined,
       });
       if (running) {
+        await appendAttemptEvidence(ctx, row, "steer", `Daniel steering: ${steer.slice(0, 500)}`, {
+          stage: "steering", evidenceKind: "steering", eventKey: `control:steer:${row.attempt ?? 1}:${row.steerRevision ?? 0}`,
+          attempt: row.attempt ?? 1,
+        });
+        controlEventEmitted = true;
         const nextAttempt = (row.attempt ?? 1) + 1;
         await ensureAttempt(ctx, a.jobId, nextAttempt, "queued", now);
         await appendAttemptEvidence(ctx, row, "queued", `Fresh attempt ${nextAttempt} reserved for steering continuation`, {
@@ -1580,7 +1747,7 @@ export const control = mutation({
     } else return false;
     const retryNeedsApproval =
       a.action === "retry" && row.approvalRequired === true && row.approvalStatus !== "approved";
-    await appendAttemptEvidence(ctx, row, a.action,
+    if (!controlEventEmitted) await appendAttemptEvidence(ctx, row, a.action,
       a.action === "steer" ? `Daniel steering: ${String(a.input ?? "").trim().slice(0, 500)}` : `${a.action} requested by Daniel`,
       { stage: retryNeedsApproval ? "approval" : a.action === "resume" || a.action === "retry" ? "queued" : a.action === "steer" ? "steering" : `${a.action}d`,
         evidenceKind: a.action === "steer" ? "steering" : "control", eventKey: `control:${a.action}:${row.attempt ?? 1}:${a.action === "steer" ? row.steerRevision ?? 0 : now}` });

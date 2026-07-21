@@ -2,7 +2,7 @@ import { metadata, schedules, task, timeout } from "@trigger.dev/sdk/v3";
 import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { sendPush } from "./push-send";
@@ -133,11 +133,6 @@ const completionEvidence = (result: string, verificationNote: string, gitReview?
   reviewReceiptJson: gitReview ? JSON.stringify(gitReview.envelope.receipt) : undefined,
   };
 };
-const deliveryReceipt = (gitReview?: { envelope: GitReviewEnvelope; binding: GitReviewBinding }) => gitReview ? ({
-  reviewReceiptJson: JSON.stringify(gitReview.envelope.receipt),
-  reviewReceiptSignature: gitReview.envelope.signature,
-  reviewDiffSha256: gitReview.envelope.receipt.diffSha256,
-}) : null;
 async function convexMutation(path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
   if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
@@ -841,9 +836,30 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         }
         return true;
       };
-      const linearizeDelivery = async () => Boolean(await convexMutation("jobs:linearizeDelivery", {
-        jobId: job.jobId, expectedAttempt,
-      }).catch(() => null));
+      // Delivery is serialized by a controller-only opaque lease. Every
+      // durable delivery writer renews it immediately before recording the
+      // external boundary; controls invalidate the version. An in-flight
+      // provider call cannot be undone, but a stale controller cannot record
+      // it or advance to the next consequential call.
+      const deliveryOwner = `trigger:${String(job.jobId)}:${randomBytes(12).toString("hex")}`;
+      const deliveryToken = randomBytes(32).toString("hex");
+      let deliveryLease: { owner: string; token: string; version: number; until: number } | null = null;
+      const linearizeDelivery = async () => {
+        const lease = await convexMutation("jobs:linearizeDelivery", {
+          jobId: job.jobId, expectedAttempt, deliveryLeaseOwner: deliveryOwner, deliveryLeaseToken: deliveryToken,
+          deliveryLeaseVersion: deliveryLease?.version,
+        }).catch(() => null);
+        if (!lease || typeof lease !== "object" || typeof lease.version !== "number") return false;
+        deliveryLease = lease as typeof deliveryLease;
+        return true;
+      };
+      const deliveryMutation = async (path: string, args: Record<string, unknown>) => {
+        if (!await linearizeDelivery() || !deliveryLease) return false;
+        return await convexMutation(path, {
+          ...args, deliveryLeaseOwner: deliveryLease.owner, deliveryLeaseToken: deliveryLease.token,
+          deliveryLeaseVersion: deliveryLease.version,
+        }).catch(() => false);
+      };
       try {
         const jobKey = String(job.jobId).replace(/[^a-zA-Z0-9_-]/g, "_");
         const jobEnv = isolateSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}`);
@@ -903,7 +919,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             if (!pull) {
               deliveryFailure = "the controller could not open or recover the verified pull request";
             } else {
-              await convexMutation("jobs:setDelivery", {
+              await deliveryMutation("jobs:setDelivery", {
                 jobId: job.jobId,
                 expectedAttempt,
                 branch: resumeBranch,
@@ -922,7 +938,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }
           }
           if (deliveryFailure) {
-            await convexMutation("jobs:setDelivery", {
+            await deliveryMutation("jobs:setDelivery", {
               jobId: job.jobId,
               expectedAttempt,
               branch: resumeBranch,
@@ -939,7 +955,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }).catch(() => null);
             return;
           }
-          const recorded = await convexMutation("jobs:setDelivery", {
+          const recorded = await deliveryMutation("jobs:setDelivery", {
             jobId: job.jobId,
             expectedAttempt,
             branch: resumeBranch,
@@ -952,7 +968,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             String(job.result ?? "Supervisor verification passed."),
             `Delivery: verified branch ${resumeBranch} is on the default branch${pullRequestUrl ? ` via ${pullRequestUrl}` : ""}${mergeSha ? ` at ${mergeSha}` : ""}.`,
           ].filter(Boolean).join("\n\n").slice(0, 4_000);
-          const finalized = await convexMutation("jobs:finalize", {
+          const finalized = await deliveryMutation("jobs:finalize", {
             jobId: job.jobId,
             expectedAttempt,
             status: "done",
@@ -1032,7 +1048,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 cwd = dir;
                 repoDir = dir;
                 if (branch)
-                  await convexMutation("jobs:setDelivery", {
+                  await deliveryMutation("jobs:setDelivery", {
                     jobId: job.jobId,
                     expectedAttempt,
                     branch,
@@ -1318,7 +1334,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           const failure = cloneFailed
             ? `${cloneFailureReason || `Could not access ${repo || "the repository"}.`} ${result}`
             : `${pushNote}\n\n${result}`;
-          const finalized = await convexMutation("jobs:finalize", {
+          const finalized = await deliveryMutation("jobs:finalize", {
             jobId: job.jobId,
             expectedAttempt,
             status: "error",
@@ -1366,7 +1382,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             && isOwnedRepository(repo)
           );
           if (goalNeedsControllerDelivery && job.deliveryStatus !== "merged") {
-            const persisted = await convexMutation("jobs:markVerifiedForDelivery", {
+            const persisted = await deliveryMutation("jobs:markVerifiedForDelivery", {
               jobId: job.jobId,
               expectedAttempt,
               result: result.slice(0, 4_000),
@@ -1388,7 +1404,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             goalNeedsControllerDelivery
           ) ? await branchHasChanges(repo, goalBranch, token) : false;
           if (goalBranchComparison === null) {
-            await convexMutation("jobs:setDelivery", {
+            await deliveryMutation("jobs:setDelivery", {
               jobId: job.jobId,
               expectedAttempt,
               branch: goalBranch,
@@ -1428,7 +1444,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             });
             goalPullRequestUrl = pull?.url;
             if (pull) {
-              await convexMutation("jobs:setDelivery", {
+              await deliveryMutation("jobs:setDelivery", {
                 jobId: job.jobId,
                 expectedAttempt,
                 branch: goalBranch,
@@ -1446,7 +1462,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 })
               : { status: "blocked" as const, note: "the delivery controller could not open the goal pull request" };
             if (merge.status !== "merged") {
-              await convexMutation("jobs:setDelivery", {
+              await deliveryMutation("jobs:setDelivery", {
                 jobId: job.jobId,
                 expectedAttempt,
                 branch: goalBranch,
@@ -1464,7 +1480,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               return;
             }
             goalDeliveryNote = `\n\nDelivery: merged ${pull?.url ?? goalBranch}${merge.sha ? ` at ${merge.sha}` : ""}.`;
-            const recorded = await convexMutation("jobs:setDelivery", {
+            const recorded = await deliveryMutation("jobs:setDelivery", {
               jobId: job.jobId,
               expectedAttempt,
               branch: goalBranch,
@@ -1477,7 +1493,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             goalDeliveryNote = `\n\nDelivery: the validated goal branch is already merged${goalPullRequestUrl ? ` via ${goalPullRequestUrl}` : ""}.`;
           } else if (goalBranchComparison === false && goalPullRequestUrl && repo && goalBranch) {
             goalDeliveryNote = `\n\nDelivery: the validated goal branch already matches the default branch via ${goalPullRequestUrl}.`;
-            const recorded = await convexMutation("jobs:setDelivery", {
+            const recorded = await deliveryMutation("jobs:setDelivery", {
               jobId: job.jobId,
               expectedAttempt,
               branch: goalBranch,
@@ -1486,7 +1502,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }).catch(() => false);
             if (!recorded) throw new Error("goal branch is delivered but its durable receipt could not be recorded");
           }
-          const finalized = await convexMutation("jobs:finalize", {
+          const finalized = await deliveryMutation("jobs:finalize", {
             jobId: job.jobId,
             expectedAttempt,
             status: "done",
@@ -1632,7 +1648,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           verify?.verdict === "needs_input"
           && isPermittedReadonlyAccessGap({ readonly: Boolean(job.readonly), task: String(job.task ?? ""), result })
         ) {
-          const finalized = await convexMutation("jobs:finalize", {
+          const finalized = await deliveryMutation("jobs:finalize", {
             jobId: job.jobId,
             expectedAttempt,
             status: "done",
@@ -1669,12 +1685,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           if (await stopIfLeaseLost(`Delivery interrupted.\n\n${continuationCheckpoint}`, result, branch)) return;
           const autonomous = autonomousRepositoryDelivery(job, repo);
           const title = `${profile.name}: ${(job.label ?? job.task).slice(0, 82)}`;
-          const verificationPersisted = !autonomous || await convexMutation("jobs:markVerifiedForDelivery", {
+          const verificationPersisted = !autonomous || await deliveryMutation("jobs:markVerifiedForDelivery", {
             jobId: job.jobId,
             expectedAttempt,
             result: result.slice(0, 4_000),
             verificationNote: verify.note || "Supervisor check passed before controller delivery",
-            ...(deliveryReceipt(gitReview) ?? {}),
+            ...completionEvidence(result.slice(0, 4_000), verify.note || "Supervisor check passed before controller delivery", gitReview),
           }).catch(() => false);
           if (!verificationPersisted) {
             deliveryBlocked = "the supervisor verdict could not be stored before delivery";
@@ -1692,7 +1708,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               })
             : null;
           pullRequestUrl = pull?.url ?? null;
-          await convexMutation("jobs:setDelivery", {
+          await deliveryMutation("jobs:setDelivery", {
             jobId: job.jobId,
             expectedAttempt,
             branch,
@@ -1710,7 +1726,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               shouldContinue: async () => (await executionStatus()) === "running",
             });
             if (merged.status === "merged") {
-              const recorded = await convexMutation("jobs:setDelivery", {
+              const recorded = await deliveryMutation("jobs:setDelivery", {
                 jobId: job.jobId,
                 expectedAttempt,
                 branch,
@@ -1722,7 +1738,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               pushNote = `verified PR merged automatically: ${pull.url}${merged.sha ? ` · ${merged.sha}` : ""}`;
             } else {
               deliveryBlocked = merged.note;
-              await convexMutation("jobs:setDelivery", {
+              await deliveryMutation("jobs:setDelivery", {
                 jobId: job.jobId,
                 expectedAttempt,
                 branch,
@@ -1754,7 +1770,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const deliveryResult = `${result}${pushNote ? `\n\nDelivery: ${pushNote}` : ""}`;
         if (await stopIfLeaseLost(`Finalization interrupted.\n\n${continuationCheckpoint}`, deliveryResult, branch)) return;
         if (!await linearizeDelivery()) return;
-        const finalized = await convexMutation("jobs:finalize", {
+        const finalized = await deliveryMutation("jobs:finalize", {
           jobId: job.jobId,
           expectedAttempt,
           status: "done",

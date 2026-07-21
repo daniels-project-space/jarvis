@@ -188,5 +188,8 @@ export function isolateSubscriptionEnv(
   }
   const authPath = join(isolatedHome, "auth.json");
   if (existsSync(authPath)) chmodSync(authPath, 0o600);
-  return { ...base, CODEX_HOME: isolatedHome };
+  // This is the final boundary before spawn(). Do not re-expand the
+  // controller environment: it carries receipt, vault, Convex, Trigger and
+  // GitHub authority that a Codex specialist must never inherit.
+  return scopedSubscriptionEnv({ ...base, CODEX_HOME: isolatedHome }, "codex");
 }

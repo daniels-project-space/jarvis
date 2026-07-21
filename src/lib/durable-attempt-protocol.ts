@@ -29,11 +29,14 @@ export function leaseDecision(input: {
   lease?: LeaseSnapshot | null;
   leaseObservedAt?: number;
   maxKnownAgeMs: number;
-}): "running" | "steered" | "superseded" | "query" {
+}): "running" | "paused" | "cancelled" | "steered" | "superseded" | "query" {
   if (!input.lease || !input.leaseObservedAt || input.now - input.leaseObservedAt > input.maxKnownAgeMs) return "query";
   if (input.lease.attempt !== input.expectedAttempt) return "superseded";
   if (Number(input.lease.steerRevision ?? 0) !== input.expectedSteerRevision) return "steered";
-  return input.lease.status === "running" ? "running" : "superseded";
+  if (input.lease.status === "running") return "running";
+  if (input.lease.status === "paused") return "paused";
+  if (input.lease.status === "cancelled") return "cancelled";
+  return "superseded";
 }
 
 export type CausalCursor = { sequence: number; eventKey?: string };

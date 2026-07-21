@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -70,5 +71,16 @@ describe("subscription subprocess capability scope", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("strips controller authority from an actual spawned specialist environment", () => {
+    const env = isolateSubscriptionEnv({
+      ...process.env, CODEX_HOME: process.cwd(),
+      JARVIS_GIT_REVIEW_RECEIPT_SECRET: "receipt-secret", CONVEX_URL: "https://control.example",
+      TRIGGER_SECRET_KEY: "trigger-secret", GITHUB_TOKEN: "github-secret",
+    }, "spawn-scope");
+    const child = spawnSync(process.execPath, ["-e", "process.stdout.write(JSON.stringify({receipt:process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET,convex:process.env.CONVEX_URL,trigger:process.env.TRIGGER_SECRET_KEY,github:process.env.GITHUB_TOKEN}))"], { env, encoding: "utf8" });
+    expect(child.status).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual({});
   });
 });

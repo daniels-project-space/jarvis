@@ -43,5 +43,7 @@ describe("durable attempt protocol", () => {
     expect(leaseDecision({ ...input, now: 20_000 })).toBe("running");
     expect(leaseDecision({ ...input, now: 31_001 })).toBe("query");
     expect(leaseDecision({ ...input, now: 20_000, lease: { status: "running", attempt: 3, steerRevision: 2 } })).toBe("steered");
+    expect(leaseDecision({ ...input, now: 20_000, lease: { status: "paused", attempt: 3, steerRevision: 1 } })).toBe("paused");
+    expect(leaseDecision({ ...input, now: 20_000, lease: { status: "cancelled", attempt: 3, steerRevision: 1 } })).toBe("cancelled");
   });
 });
