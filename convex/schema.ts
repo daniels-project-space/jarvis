@@ -224,6 +224,11 @@ export default defineSchema({
     // before its independent cloud run is created; the worker run id then
     // connects Trigger Realtime to the durable Convex work record.
     dispatchId: v.optional(v.string()),
+    // Snapshot produced by the claim transaction. Exact redelivery returns
+    // this immutable envelope rather than re-reading changing upstream work.
+    upstreamEvidence: v.optional(v.array(v.object({
+      label: v.string(), status: v.string(), result: v.string(), verificationNote: v.string(),
+    }))),
     dispatchLeaseUntil: v.optional(v.number()),
     dispatchReason: v.optional(v.string()),
     workerRunId: v.optional(v.string()),
@@ -246,6 +251,8 @@ export default defineSchema({
     deliveryStatus: v.optional(v.string()), // branch | pull_request | merged | blocked
     mergeCommitSha: v.optional(v.string()),
     mergedAt: v.optional(v.number()),
+    // Monotonic controller linearization token for consequential delivery.
+    deliveryLeaseVersion: v.optional(v.number()),
     verificationVerdict: v.optional(v.string()), // pass | unavailable
     verificationNote: v.optional(v.string()),
     verifiedAt: v.optional(v.number()),
@@ -314,6 +321,7 @@ export default defineSchema({
     deliveryMode: v.optional(v.string()),
     deliveryStatus: v.optional(v.string()),
     mergeCommitSha: v.optional(v.string()),
+    deliveryLeaseVersion: v.optional(v.number()),
     startedAt: v.optional(v.number()),
     completedAt: v.optional(v.number()),
     createdAt: v.number(),
@@ -534,10 +542,13 @@ export default defineSchema({
   workAttempts: defineTable({
     jobId: v.id("jobs"),
     attempt: v.number(),
-    status: v.string(), // running | checkpointed | paused | steered | needs_input | stalled | done | error | cancelled
-    workspaceKey: v.string(),
-    sessionId: v.string(),
-    workerRunId: v.string(),
+    status: v.string(), // queued | dispatching | running | checkpointed | paused | steered | needs_input | stalled | done | error | cancelled
+    // A lifecycle record is created while queued. Launch identities remain
+    // optional until the exact dispatch crosses the worker fence, allowing
+    // every event from enqueue onward to use one causal cursor.
+    workspaceKey: v.optional(v.string()),
+    sessionId: v.optional(v.string()),
+    workerRunId: v.optional(v.string()),
     dispatchId: v.optional(v.string()),
     // The Trigger run is only delivery metadata. Sandbox/provider sessions
     // are deliberately separate identities for the sandbox adapter workstream.
@@ -545,7 +556,7 @@ export default defineSchema({
     providerSessionId: v.optional(v.string()),
     lastEventSeq: v.optional(v.number()),
     lastEventKey: v.optional(v.string()),
-    launchedAt: v.number(),
+    launchedAt: v.optional(v.number()),
     livenessAt: v.number(),
     progressAt: v.number(),
     lastEventAt: v.number(),
@@ -568,6 +579,9 @@ export default defineSchema({
     terminalEventKey: v.optional(v.string()),
     resultDigest: v.optional(v.string()),
     evidenceDigest: v.optional(v.string()),
+    // Controller-issued signed review binding for repository work.
+    reviewReceiptSignature: v.optional(v.string()),
+    reviewDiffSha256: v.optional(v.string()),
     createdAt: v.number(),
   })
     .index("by_job_attempt", ["jobId", "attempt"])

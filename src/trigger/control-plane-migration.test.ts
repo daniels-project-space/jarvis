@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   CONTROL_PLANE_MIGRATION_STEPS_PER_TICK,
   drainControlPlaneMigration,
+  projectionReadMode,
 } from "./control-plane-migration";
 
 describe("Trigger control-plane migration continuation", () => {
@@ -40,5 +41,18 @@ describe("Trigger control-plane migration continuation", () => {
       phase: "complete",
     });
     expect(advance).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("v2 active projection rollout", () => {
+  it("keeps bounded compatibility when the already-completed v1 cursor is irrelevant", () => {
+    const completedV1 = { jobsComplete: true };
+    expect(projectionReadMode(undefined)).toBe("compatibility");
+    expect(completedV1.jobsComplete).toBe(true);
+  });
+
+  it("retires compatibility only after the independent v2 cursor completes", () => {
+    expect(projectionReadMode({ jobsComplete: false })).toBe("compatibility");
+    expect(projectionReadMode({ jobsComplete: true })).toBe("indexed");
   });
 });

@@ -2,6 +2,7 @@ import { metadata, schedules, task, timeout } from "@trigger.dev/sdk/v3";
 import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { sendPush } from "./push-send";
@@ -106,6 +107,15 @@ function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, tier: 
 }
 
 const gitReviewReceiptAuthority = createGitReviewReceiptAuthority();
+const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+const completionEvidence = (result: string, verificationNote: string, gitReview?: { envelope: GitReviewEnvelope; binding: GitReviewBinding }) => ({
+  resultDigest: sha256(result),
+  evidenceDigest: sha256(verificationNote),
+  // These values are controller-created; Convex validates their exact
+  // cryptographic form before making an immutable completion receipt.
+  reviewReceiptSignature: gitReview?.envelope.signature,
+  reviewDiffSha256: gitReview?.envelope.receipt.diffSha256,
+});
 async function convexMutation(path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
   if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
@@ -773,21 +783,30 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       // has not delivered a snapshot (for example during a transient outage).
       const controlClient = new ConvexClient(CONVEX_URL);
       let subscribedLease: any = null;
+      let lastKnownLease: any = null;
+      let lastKnownLeaseAt = 0;
       let lastLeaseFallbackAt = 0;
       const workerToken = process.env.JARVIS_WORKER_TOKEN;
       const unsubscribeLease = controlClient.onUpdate(
         api.jobs.executionLease,
         { jobId: job.jobId, workerToken },
-        (lease) => { subscribedLease = lease; },
+        (lease) => {
+          subscribedLease = lease;
+          if (lease) { lastKnownLease = lease; lastKnownLeaseAt = Date.now(); }
+        },
         () => { subscribedLease = null; },
       );
       const executionStatus = async (): Promise<string> => {
-        let lease: any = subscribedLease;
-        if (!lease && Date.now() - lastLeaseFallbackAt >= 120_000) {
+        let lease: any = subscribedLease ?? lastKnownLease;
+        const leaseFresh = Boolean(lease) && Date.now() - lastKnownLeaseAt <= 30_000;
+        if (!leaseFresh && Date.now() - lastLeaseFallbackAt >= 15_000) {
           lastLeaseFallbackAt = Date.now();
-          lease = await convexQuery("jobs:executionLease", { jobId: job.jobId });
+          try {
+            lease = await convexQuery("jobs:executionLease", { jobId: job.jobId });
+            if (lease) { lastKnownLease = lease; lastKnownLeaseAt = Date.now(); }
+          } catch { return "unknown"; }
         }
-        if (!lease) return "unknown";
+        if (!lease || (!leaseFresh && Date.now() - lastKnownLeaseAt > 30_000)) return "unknown";
         if (!lease || Number(lease.attempt) !== expectedAttempt) return "superseded";
         if (Number(lease.steerRevision ?? 0) !== expectedSteerRevision) return "steered";
         return String(lease.status ?? "missing");
@@ -805,8 +824,17 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             nextStatus: state,
           }).catch(() => null);
         }
+        if (state === "unknown") {
+          await convexMutation("jobs:checkpointAndRequeue", {
+            jobId: job.jobId, expectedAttempt, checkpoint, result: result.slice(0, 4000),
+            branch: branch ?? undefined, delayMs: 15_000,
+          }).catch(() => null);
+        }
         return true;
       };
+      const linearizeDelivery = async () => Boolean(await convexMutation("jobs:linearizeDelivery", {
+        jobId: job.jobId, expectedAttempt,
+      }).catch(() => null));
       try {
         const jobKey = String(job.jobId).replace(/[^a-zA-Z0-9_-]/g, "_");
         const jobEnv = isolateSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}`);
@@ -835,6 +863,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           )
         );
         if (mayResumeControllerDelivery) {
+          if (await stopIfLeaseLost("Delivery lease changed before resume.", String(job.result ?? ""), resumeBranch)) return;
           await convexMutation("jobs:updateProgress", {
             jobId: job.jobId,
             expectedAttempt,
@@ -849,6 +878,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             ? "the controller could not compare the verified branch with the default branch"
             : "";
           if (branchChanged === true) {
+            if (await stopIfLeaseLost("Delivery lease changed before pull request.", String(job.result ?? ""), resumeBranch)) return;
+            if (!await linearizeDelivery()) return;
             const title = validatedGoalBranch
               ? `JARVIS goal: ${(job.label ?? job.task).slice(0, 78)}`
               : `${profile.name}: ${(job.label ?? job.task).slice(0, 82)}`;
@@ -920,6 +951,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             pullRequestUrl: pullRequestUrl || undefined,
             verificationVerdict: "pass",
             verificationNote: String(job.verificationNote ?? "Supervisor check passed before delivery continuation"),
+            ...completionEvidence(deliveryResult, String(job.verificationNote ?? "Supervisor check passed before delivery continuation")),
           });
           if (!finalized) return;
           if (job.incidentId) {
@@ -1189,8 +1221,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                   : `local history does not descend from canonical base ${baseSha}; replacement history will not be pushed`;
               }
             }
-            if (needsPush && !deliveryRetry) {
+          if (needsPush && !deliveryRetry) {
               if (await stopIfLeaseLost(checkpointText, result, branch)) return;
+              if (!await linearizeDelivery()) return;
               const push = await runGit(["push", pushUrl, `HEAD:refs/heads/${branch}`]);
               if (push.code !== 0 && isNonFastForwardPush(push.out)) {
                 deliveryRetry = true;
@@ -1368,6 +1401,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             && repo
             && token
           ) {
+            if (await stopIfLeaseLost("Delivery lease changed before goal pull request.", result, goalBranch)) return;
+            if (!await linearizeDelivery()) return;
             await convexMutation("jobs:updateProgress", {
               jobId: job.jobId,
               expectedAttempt,
@@ -1453,6 +1488,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             pullRequestUrl: goalPullRequestUrl,
             verificationVerdict: "pass",
             verificationNote: `${job.goalStage === "planning" ? "Goal plan" : "Deep validation"} machine contract is structurally valid`,
+            ...completionEvidence(`${result}${goalDeliveryNote}`.slice(0, job.goalStage === "planning" ? GOAL_PLAN_RESULT_MAX_CHARS : 4_000), `${job.goalStage === "planning" ? "Goal plan" : "Deep validation"} machine contract is structurally valid`),
           });
           if (finalized) await drainGoalAdvances();
           return;
@@ -1586,6 +1622,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             result: result.slice(0, 4_000),
             verificationVerdict: "pass",
             verificationNote: "The read-only task expressly defines a named access gap as a valid evidence boundary",
+            ...completionEvidence(result.slice(0, 4_000), "The read-only task expressly defines a named access gap as a valid evidence boundary"),
           });
           if (finalized && job.missionId) await maybeSynthesizeMission(job.missionId).catch(() => {});
           return;
@@ -1624,6 +1661,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           if (!verificationPersisted) {
             deliveryBlocked = "the supervisor verdict could not be stored before delivery";
           }
+          if (verificationPersisted && await stopIfLeaseLost(`Delivery lease changed before pull request.\n\n${continuationCheckpoint}`, result, branch)) return;
+          if (verificationPersisted && !await linearizeDelivery()) return;
           const pull = verificationPersisted
             ? await openDeliveryPullRequest({
                 repo,
@@ -1696,6 +1735,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         }
         const deliveryResult = `${result}${pushNote ? `\n\nDelivery: ${pushNote}` : ""}`;
         if (await stopIfLeaseLost(`Finalization interrupted.\n\n${continuationCheckpoint}`, deliveryResult, branch)) return;
+        if (!await linearizeDelivery()) return;
         const finalized = await convexMutation("jobs:finalize", {
           jobId: job.jobId,
           expectedAttempt,
@@ -1704,6 +1744,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           pullRequestUrl: pullRequestUrl ?? undefined,
           verificationVerdict: "pass",
           verificationNote: verify.note || "Supervisor check passed",
+          ...completionEvidence(deliveryResult.slice(0, 4_000), verify.note || "Supervisor check passed", gitReview),
         });
         if (!finalized) return;
         if (job.incidentId)

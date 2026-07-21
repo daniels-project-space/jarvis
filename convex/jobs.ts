@@ -10,6 +10,7 @@ import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
 import { hasAttemptBudget, isMeaningfulWorkProgress } from "../src/lib/work-attempt";
+import { claimDisposition, completionReceiptAllowed, replayEnvelope, shouldAdvanceAttempt } from "../src/lib/durable-attempt-protocol";
 import {
   insertJobWithRuntime,
   jobRuntimeFor,
@@ -34,10 +35,9 @@ async function attemptFor(ctx: any, jobId: any, attempt: number) {
     .first();
 }
 
-function evidenceDigest(value: unknown) {
-  // Stable, non-cryptographic identity for mutation replay. This is not a
-  // security boundary; attempt/dispatch fences are. Keeping it local avoids
-  // bringing a second runtime into Convex merely to hash audit text.
+function eventIdentity(value: unknown) {
+  // Event keys are replay identifiers, not evidence digests or a security
+  // boundary. Completion evidence is SHA-256 computed by the controller.
   let hash = 2166136261;
   for (const char of String(value)) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
   return (hash >>> 0).toString(36);
@@ -53,7 +53,7 @@ async function appendAttemptEvidence(ctx: any, row: any, type: string, message: 
 } = {}) {
   const attemptNumber = row.attempt ?? 1;
   const causationId = options.causationId ?? `attempt:${String(row._id)}:${attemptNumber}`;
-  const eventKey = options.eventKey ?? `${attemptNumber}:${type}:${evidenceDigest(`${causationId}|${message}|${JSON.stringify(options.data ?? null)}`)}`;
+  const eventKey = options.eventKey ?? `${attemptNumber}:${type}:${eventIdentity(`${causationId}|${message}|${JSON.stringify(options.data ?? null)}`)}`;
   const existing = await ctx.db
     .query("workEvents")
     .withIndex("by_job_event", (q: any) => q.eq("jobId", String(row._id)).eq("eventKey", eventKey))
@@ -153,6 +153,12 @@ export const enqueue = mutation({
       createdAt: now,
     });
     const queued = await ctx.db.get(id);
+    // This early lifecycle row is the serialized cursor for queue, dispatch,
+    // launch and terminal events. Provider identities are bound later.
+    await ctx.db.insert("workAttempts", {
+      jobId: id, attempt: 1, status, lastEventSeq: 0,
+      livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now,
+    });
     if (queued) await appendAttemptEvidence(ctx, queued, approvalRequired ? "approval_requested" : "queued",
       approvalRequired ? `Waiting for Daniel's approval${approval.reason ? ` · ${approval.reason}` : ""}` : "Work queued",
       { stage: approvalRequired ? "approval" : "queued", percent: 0, evidenceKind: "intent", eventKey: `intent:${String(id)}` });
@@ -171,7 +177,10 @@ export const enqueue = mutation({
   },
 });
 
-const CONTROL_PLANE_MIGRATION = "compact-runtime-v1";
+// v1 completed in production before active/priority became a required live
+// projection. Never reuse its completed cursor: v2 deliberately reprojects
+// every durable job and is the only gate for retiring compatibility reads.
+const CONTROL_PLANE_MIGRATION = "active-projection-v2";
 
 async function migrationState(ctx: any) {
   const existing = await ctx.db
@@ -460,7 +469,7 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
   return runnable;
 }
 
-function claimedJob(j: any, upstreamEvidence: any[] = []) {
+function claimedJob(j: any, upstreamEvidence: readonly any[] = []) {
   return {
     jobId: j._id,
     task: j.task,
@@ -501,6 +510,23 @@ function claimedJob(j: any, upstreamEvidence: any[] = []) {
   };
 }
 
+async function upstreamEvidenceForClaim(ctx: any, j: any) {
+  const upstreamRows = j.missionId
+    ? await ctx.db.query("jobs").withIndex("by_mission", (q: any) => q.eq("missionId", j.missionId)).take(100)
+    : await Promise.all((j.dependsOn ?? []).slice(0, 8).map(async (dependency: string) => {
+        const id = ctx.db.normalizeId("jobs", dependency);
+        return id ? await ctx.db.get(id) : null;
+      }));
+  return upstreamRows
+    .filter((row: any) => row && row._id !== j._id && row.status === "done" && String(row.result ?? "").trim())
+    .sort((left: any, right: any) => Number(left.completedAt ?? left.createdAt ?? 0) - Number(right.completedAt ?? right.createdAt ?? 0))
+    .slice(-8)
+    .map((row: any) => ({
+      label: String(row.label ?? row.task ?? "Upstream workstream").slice(0, 120), status: row.status,
+      result: String(row.result).slice(0, 1_400), verificationNote: String(row.verificationNote ?? "").slice(0, 300),
+    }));
+}
+
 // Reserve concrete jobs before asking Trigger.dev to create cloud runs. Convex
 // serializes this mutation, so overlapping supervisors receive disjoint work
 // and never need a global "is any runner active?" lock.
@@ -528,6 +554,12 @@ export const reserveDispatchBatch = mutation({
         workerRunId: undefined,
         workerRuntime: "trigger",
         heartbeatAt: now,
+      });
+      const attempt = await attemptFor(ctx, j._id, j.attempt ?? 1);
+      if (attempt && !attempt.workerRunId) await ctx.db.patch(attempt._id, { status: "dispatching", dispatchId, lastEventAt: now });
+      else if (!attempt) await ctx.db.insert("workAttempts", {
+        jobId: j._id, attempt: j.attempt ?? 1, status: "dispatching", dispatchId,
+        lastEventSeq: 0, livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now,
       });
       await appendAttemptEvidence(ctx, j, "dispatched", `Independent Trigger worker reserved${a.reason ? ` · ${a.reason.slice(0, 120)}` : ""}`, {
         stage: "dispatching", percent: Math.max(1, j.percent ?? 0), evidenceKind: "dispatch", eventKey: `dispatch:${j.attempt ?? 1}:${dispatchId}`,
@@ -563,24 +595,23 @@ export const claimDispatched = mutation({
     // Trigger can redeliver after Convex committed the claim but before the
     // worker received the response. Recover exactly the already-bound launch;
     // a competing Trigger session is fenced rather than stranding `running`.
-    if (
-      j?.status === "running" &&
-      j.dispatchId === a.dispatchId &&
-      priorAttempt?.dispatchId === a.dispatchId &&
-      priorAttempt.workerRunId === a.workerRunId.slice(0, 120) &&
-      priorAttempt.sessionId === a.workerRunId.slice(0, 120)
-    ) return claimedJob(j, []);
+    const disposition = claimDisposition({
+      jobStatus: j?.status ?? "missing", jobDispatchId: j?.dispatchId,
+      requestDispatchId: a.dispatchId, requestWorkerRunId: a.workerRunId, attempt: priorAttempt,
+    });
+    if (disposition === "replay") return claimedJob(j, replayEnvelope(priorAttempt?.upstreamEvidence, await upstreamEvidenceForClaim(ctx, j)));
     if (
       !j ||
       j.status !== "dispatching" ||
       j.dispatchId !== a.dispatchId ||
       (j.dispatchLeaseUntil ?? 0) < now
     ) return null;
-    if (priorAttempt) {
+    if (priorAttempt?.workerRunId || priorAttempt?.dispatchId !== a.dispatchId) {
       // A stale platform redelivery must not replace the original workspace
       // or session receipt. It cannot cross the launch fence a second time.
       return null;
     }
+    const upstreamEvidence = await upstreamEvidenceForClaim(ctx, j);
     await patchJobWithRuntime(ctx, j, {
       status: "running",
       stage: "starting",
@@ -597,38 +628,21 @@ export const claimDispatched = mutation({
       dispatchId: a.dispatchId,
       workerRuntime: "trigger",
     });
-    await ctx.db.insert("workAttempts", {
-      jobId: a.jobId,
-      attempt: j.attempt ?? 1,
+    // Bind dispatch and worker identities in the same transaction as the
+    // running transition. This makes an exact lost-response replay reachable.
+    if (!priorAttempt) return null; // only legacy rows without queue lineage
+    await ctx.db.patch(priorAttempt._id, {
       status: "running",
       workspaceKey: `convex:${String(a.jobId)}:attempt:${j.attempt ?? 1}`,
       sessionId: a.workerRunId.slice(0, 120),
       workerRunId: a.workerRunId.slice(0, 120),
+      dispatchId: a.dispatchId,
+      upstreamEvidence,
       launchedAt: now,
       livenessAt: now,
       progressAt: now,
       lastEventAt: now,
-      createdAt: now,
     });
-    const upstreamRows = j.missionId
-      ? await ctx.db
-          .query("jobs")
-          .withIndex("by_mission", (q: any) => q.eq("missionId", j.missionId))
-          .take(100)
-      : await Promise.all((j.dependsOn ?? []).slice(0, 8).map(async (dependency: string) => {
-          const id = ctx.db.normalizeId("jobs", dependency);
-          return id ? await ctx.db.get(id) : null;
-        }));
-    const upstreamEvidence = upstreamRows
-      .filter((row: any) => row && row._id !== j._id && row.status === "done" && String(row.result ?? "").trim())
-      .sort((left: any, right: any) => Number(left.completedAt ?? left.createdAt ?? 0) - Number(right.completedAt ?? right.createdAt ?? 0))
-      .slice(-8)
-      .map((row: any) => ({
-        label: String(row.label ?? row.task ?? "Upstream workstream").slice(0, 120),
-        status: row.status,
-        result: String(row.result).slice(0, 1_400),
-        verificationNote: String(row.verificationNote ?? "").slice(0, 300),
-      }));
     await appendAttemptEvidence(ctx, j, "started", `Attempt ${j.attempt ?? 1} started`, {
       stage: "starting",
       percent: Math.max(2, j.percent ?? 0),
@@ -679,6 +693,10 @@ export const finalize = mutation({
     pullRequestUrl: v.optional(v.string()),
     verificationVerdict: v.optional(v.union(v.literal("pass"), v.literal("unavailable"))),
     verificationNote: v.optional(v.string()),
+    resultDigest: v.optional(v.string()),
+    evidenceDigest: v.optional(v.string()),
+    reviewReceiptSignature: v.optional(v.string()),
+    reviewDiffSha256: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
@@ -687,11 +705,7 @@ export const finalize = mutation({
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
     // A completed job is called "verified" only when the supervisor actually
     // returned pass. This invariant lives in Convex, not only in the runner.
-    if (a.status === "done" && (
-      a.verificationVerdict !== "pass"
-      || !String(a.result ?? "").trim()
-      || !String(a.verificationNote ?? "").trim()
-    )) return false;
+    if (a.status === "done" && (a.verificationVerdict !== "pass" || !completionReceiptAllowed(a))) return false;
     const now = Date.now();
     const success = a.status === "done";
     const delivered = success && row.deliveryStatus === "merged";
@@ -713,7 +727,7 @@ export const finalize = mutation({
       verificationNote: a.verificationNote?.slice(0, 1000),
       verifiedAt: success ? now : undefined,
     };
-    const terminalEventKey = `terminal:${a.expectedAttempt}:${a.status}:${evidenceDigest(`${a.result ?? ""}|${a.verificationNote ?? ""}`)}`;
+    const terminalEventKey = `terminal:${a.expectedAttempt}:${a.status}:${a.status === "done" ? a.resultDigest : eventIdentity(`${a.result ?? ""}|${a.verificationNote ?? ""}`)}`;
     if (success) {
       const priorReceipt = await ctx.db.query("workReceipts")
         .withIndex("by_job_attempt", (q: any) => q.eq("jobId", a.jobId).eq("attempt", a.expectedAttempt)).first();
@@ -739,7 +753,8 @@ export const finalize = mutation({
       await ctx.db.insert("workReceipts", {
         jobId: a.jobId, attempt: a.expectedAttempt, status: "succeeded",
         acceptanceEvidence: [String(a.verificationNote).slice(0, 1_000)], artifacts, verification: "pass",
-        terminalEventKey, resultDigest: evidenceDigest(a.result ?? ""), evidenceDigest: evidenceDigest(a.verificationNote ?? ""), createdAt: now,
+        terminalEventKey, resultDigest: a.resultDigest, evidenceDigest: a.evidenceDigest,
+        reviewReceiptSignature: a.reviewReceiptSignature, reviewDiffSha256: a.reviewDiffSha256, createdAt: now,
       });
     }
     if (row.missionId) {
@@ -1315,6 +1330,22 @@ export const setDelivery = mutation({
   },
 });
 
+// Convex is the delivery linearization point. The controller acquires this
+// immediately before a push, PR, merge, receipt or finalization; control can
+// still arrive during an in-flight external call, so the following durable
+// writer rechecks status/attempt and never resurrects the old lease.
+export const linearizeDelivery = mutation({
+  args: { jobId: v.id("jobs"), expectedAttempt: v.number(), workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.get(a.jobId);
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return null;
+    const version = Math.max(0, Number(row.deliveryLeaseVersion ?? 0)) + 1;
+    await patchJobWithRuntime(ctx, row, { deliveryLeaseVersion: version, heartbeatAt: Date.now() });
+    return version;
+  },
+});
+
 // Persist supervisor evidence before any GitHub delivery call. If checks take
 // longer than one harness lease, the next attempt resumes the controller step
 // directly instead of paying for (and risking divergence from) another model
@@ -1367,8 +1398,8 @@ export const control = mutation({
       if (attempt && !attempt.completedAt) await ctx.db.patch(attempt._id, { status, completedAt: now, lastEventAt: now });
       return attempt;
     };
-    if (a.action === "pause" && ["pending", "dispatching", "running"].includes(row.status)) {
-      if (row.status === "running" && !await closeAttempt("paused")) return false;
+    if (a.action === "pause" && ["pending", "dispatching", "running", "steering"].includes(row.status)) {
+      if (["running", "steering"].includes(row.status) && !await closeAttempt("paused")) return false;
       await patchJobWithRuntime(ctx, row, {
         status: "paused",
         stage: "paused",
@@ -1381,7 +1412,9 @@ export const control = mutation({
     else if (a.action === "resume" && ["paused", "stalled"].includes(row.status)) {
       const previous = await attemptFor(ctx, a.jobId, row.attempt ?? 1);
       if (previous && !previous.completedAt) return false;
-      const nextAttempt = (row.attempt ?? 1) + 1;
+      // A paused reservation never launched a worker and therefore must not
+      // consume a retry budget. A closed launched workspace gets a fresh id.
+      const nextAttempt = (row.attempt ?? 1) + (shouldAdvanceAttempt(Boolean(previous?.workerRunId)) ? 1 : 0);
       if (!hasAttemptBudget(nextAttempt, row.maxAttempts ?? 12)) return false;
       await patchJobWithRuntime(ctx, row, {
         status: "pending",
@@ -1400,7 +1433,7 @@ export const control = mutation({
       });
     }
     else if (a.action === "cancel" && !["done", "error", "cancelled"].includes(row.status)) {
-      if (row.status === "running" && !await closeAttempt("cancelled")) return false;
+      if (["running", "steering"].includes(row.status) && !await closeAttempt("cancelled")) return false;
       await patchJobWithRuntime(ctx, row, {
         status: "cancelled",
         stage: "cancelled",
@@ -1474,13 +1507,28 @@ export const active = query({
   args: { ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    // This is the sole reactive read for the compact work strip. A status
-    // fan-out multiplied reads for every liveness update; migration projects
-    // `active` before this query becomes the only rollout read path.
-    const active = await ctx.db
+    const state = await ctx.db
+      .query("controlPlaneMigrations")
+      .withIndex("by_key", (q: any) => q.eq("key", CONTROL_PLANE_MIGRATION))
+      .first();
+    // The indexed v2 path is the permanent read. Before its independent
+    // cursor completes, add only a bounded legacy page so an already-complete
+    // v1 record cannot make the panel silently empty during rollout.
+    const projected = await ctx.db
       .query("jobRuntime")
       .withIndex("by_active_priority", (q: any) => q.eq("active", true))
+      .order("desc")
       .take(100);
+    let active = projected;
+    if (!state?.jobsComplete) {
+      const legacy = await ctx.db.query("jobs").withIndex("by_createdAt").order("desc").take(100);
+      const projectedIds = new Set(projected.map((row: any) => String(row.jobId)));
+      const legacyActive = legacy.filter((job: any) =>
+        ["running", "dispatching", "pending", "awaiting_approval", "paused", "stalled", "needs_input", "steering"].includes(job.status)
+        && !projectedIds.has(String(job._id)),
+      ).map((job: any) => ({ ...job, jobId: job._id }));
+      active = [...projected, ...legacyActive].slice(0, 100);
+    }
     return active
       .sort((a: any, b: any) => (b.priority ?? 50) - (a.priority ?? 50) || a.createdAt - b.createdAt)
       .map((j: any) => ({
