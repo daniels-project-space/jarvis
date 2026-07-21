@@ -82,10 +82,14 @@ import {
   prepareCloudWorkspaceExecution,
 } from "./cloud-workspace-controller";
 import { createR2CheckpointStore } from "./cloud-checkpoint-r2";
-import { configuredCloudWorkspaceProvider } from "./cloud-workspace-providers";
+import {
+  configuredCloudWorkspaceCleanupProvider,
+  configuredCloudWorkspaceProvider,
+} from "./cloud-workspace-providers";
 import {
   CLOUD_WORKSPACE_RUNTIME_IDENTITY,
   DEFAULT_CLOUD_WORKSPACE_TEMPLATE,
+  type CloudProviderRuntimeAttestation,
 } from "./cloud-provider-probe-attestation";
 import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider } from "./cloud-workspace";
 
@@ -543,6 +547,7 @@ type AgentProgress = {
 
 type AgentHarnessOptions = {
   reservation: AgentWorkerPayload & { workerRunId: string };
+  runtimeAttestation: CloudProviderRuntimeAttestation;
   onProgress?: (progress: AgentProgress) => void;
 };
 
@@ -602,7 +607,7 @@ export async function runAgentMaintenance() {
     /* recovery must never block fleet dispatch */
   }
   try {
-    const cleanupProvider = configuredCloudWorkspaceProvider(process.env, false);
+    const cleanupProvider = configuredCloudWorkspaceCleanupProvider(process.env);
     const orphans: any[] = await convexQuery("jobs:cloudWorkspaceOrphans", { olderThan: Date.now() - 5 * 60_000 }) ?? [];
     for (const orphan of orphans.filter((row) => row.providerName === cleanupProvider.name)) {
       const workspace: CloudWorkspace = {
@@ -2257,7 +2262,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     processed = 1;
     let cloudProvider: CloudWorkspaceProvider;
     try {
-      cloudProvider = configuredCloudWorkspaceProvider(process.env);
+      cloudProvider = configuredCloudWorkspaceProvider(process.env, options.runtimeAttestation);
     } catch (error) {
       const failure = error instanceof CloudWorkspaceError
         ? error
@@ -2308,6 +2313,7 @@ export const agentWorker = task({
       .set("reason", String(payload.reason ?? "work-available").slice(0, 160));
     const result = await runAgentHarness({
       reservation: { ...payload, workerRunId: ctx.run.id },
+      runtimeAttestation: { triggerDeploymentVersion: ctx.deployment?.version },
       onProgress: (progress) => {
         metadata
           .set("status", "running")

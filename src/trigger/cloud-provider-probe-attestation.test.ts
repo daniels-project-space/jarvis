@@ -10,14 +10,22 @@ import {
   createCloudProviderProbeKeyring,
   type CloudProviderProbeEnvelope,
   type CloudProviderProbeReceipt,
+  type CloudProviderRuntimeAttestation,
 } from "./cloud-provider-probe-attestation";
 import { DEFAULT_WORKSPACE_LIMITS, REQUIRED_CLOUD_WORKSPACE_CAPABILITIES } from "./cloud-workspace";
-import { configuredCloudWorkspaceProvider } from "./cloud-workspace-providers";
+import {
+  configuredCloudWorkspaceCleanupProvider,
+  configuredCloudWorkspaceProvider,
+} from "./cloud-workspace-providers";
 import { prepareCloudWorkspaceExecution } from "./cloud-workspace-controller";
 
 const NOW = Date.now();
 const SECRET = "controller-provider-probe-secret-32-bytes-minimum";
 const DIGEST = "a".repeat(64);
+const DEPLOYMENT_VERSION = "trigger-deploy-2026-07-21-a";
+const RUNTIME_ATTESTATION: CloudProviderRuntimeAttestation = {
+  triggerDeploymentVersion: DEPLOYMENT_VERSION,
+};
 
 function baseEnvironment(): NodeJS.ProcessEnv {
   return {
@@ -25,8 +33,9 @@ function baseEnvironment(): NodeJS.ProcessEnv {
     JARVIS_CLOUD_WORKSPACE_PROVIDER: "sandbox0",
     JARVIS_CLOUD_WORKSPACE_TEMPLATE: "template-immutable-v7",
     JARVIS_CLOUD_WORKSPACE_TEMPLATE_DIGEST: DIGEST,
-    JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID: "trigger-deploy-2026-07-21-a",
-    TRIGGER_DEPLOYMENT_VERSION: "trigger-deploy-2026-07-21-a",
+    JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID: DEPLOYMENT_VERSION,
+    TRIGGER_DEPLOYMENT_VERSION: DEPLOYMENT_VERSION,
+    TRIGGER_VERSION: DEPLOYMENT_VERSION,
     JARVIS_CLOUD_PROVIDER_PROBE_KEYRING: JSON.stringify({
       current: { keyId: "current", secret: SECRET }, previous: [],
     }),
@@ -67,35 +76,42 @@ function signedEnvironment(env = baseEnvironment(), value = receipt(env)): NodeJ
 describe("deployment-bound cloud provider probe authority", () => {
   it("keeps SANDBOX0_TOKEN alone blocked before adapter construction, hydration, or model execution", async () => {
     const env = baseEnvironment();
+    env.JARVIS_CLOUD_PROVIDER_PROBE = "live";
     delete env.JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT;
-    expect(() => configuredCloudWorkspaceProvider(env)).toThrow(expect.objectContaining({
+    expect(() => configuredCloudWorkspaceProvider(env, RUNTIME_ATTESTATION)).toThrow(expect.objectContaining({
       code: "provider_probe_attestation_failed", disposition: "blocked", provider: "sandbox0",
     }));
     const hydrate = vi.fn();
     await expect(prepareCloudWorkspaceExecution({
-      providerFactory: () => configuredCloudWorkspaceProvider(env),
+      providerFactory: () => configuredCloudWorkspaceProvider(env, RUNTIME_ATTESTATION),
       hydrateArchive: hydrate,
       attemptKey: "blocked:1", template: env.JARVIS_CLOUD_WORKSPACE_TEMPLATE!,
       runtime: "node-22:codex-0.144.5", lockfileDigest: "0".repeat(64),
     })).rejects.toMatchObject({ code: "provider_probe_attestation_failed", disposition: "blocked" });
     expect(hydrate).not.toHaveBeenCalled();
+    expect(() => configuredCloudWorkspaceProvider({ ...env, SANDBOX0_TOKEN: undefined }, RUNTIME_ATTESTATION)).toThrow(expect.objectContaining({
+      code: "provider_probe_attestation_failed", disposition: "blocked",
+    }));
     const source = readFileSync(join(process.cwd(), "src/trigger/cloud-workspace-providers.ts"), "utf8");
-    const configured = source.slice(source.indexOf("export function configuredCloudWorkspaceProvider("), source.indexOf("/** Live-probe authority"));
-    expect(configured.indexOf("assertCloudProviderExecutionReady(env)")).toBeLessThan(configured.indexOf("configuredProviderAdapter(env)"));
+    const configured = source.slice(source.indexOf("export function configuredCloudWorkspaceProvider("), source.indexOf("/** Orphan cleanup"));
+    expect(configured.indexOf("assertCloudProviderExecutionReady(env, runtimeAttestation)")).toBeLessThan(configured.indexOf("configuredProviderAdapter(env)"));
     const runner = readFileSync(join(process.cwd(), "src/trigger/agent-runner.ts"), "utf8");
-    expect(runner.lastIndexOf("cloudProvider = configuredCloudWorkspaceProvider(process.env)")).toBeLessThan(runner.indexOf("await processJob(job, cloudProvider)"));
+    expect(runner).toContain("runtimeAttestation: { triggerDeploymentVersion: ctx.deployment?.version }");
+    expect(runner).not.toContain("configuredCloudWorkspaceProviderForLiveProbe");
+    expect(runner.match(/options\.runtimeAttestation/g)).toHaveLength(1);
+    expect(runner.lastIndexOf("cloudProvider = configuredCloudWorkspaceProvider(process.env, options.runtimeAttestation)")).toBeLessThan(runner.indexOf("await processJob(job, cloudProvider)"));
   });
 
-  it("opens execution only for a fresh signed exact provider/template/SDK/deployment tuple", () => {
+  it("opens execution for the exact ctx.deployment.version and a fresh signed provider tuple", () => {
     const env = signedEnvironment();
-    expect(configuredCloudWorkspaceProvider(env).name).toBe("sandbox0");
+    expect(configuredCloudWorkspaceProvider(env, RUNTIME_ATTESTATION).name).toBe("sandbox0");
     for (const changed of [
       { JARVIS_CLOUD_WORKSPACE_PROVIDER: "e2b", E2B_API_KEY: "test", SANDBOX0_TOKEN: undefined },
       { JARVIS_CLOUD_WORKSPACE_TEMPLATE: "other-template" },
       { JARVIS_CLOUD_WORKSPACE_TEMPLATE_DIGEST: "b".repeat(64) },
       { JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID: "other-deployment" },
     ]) {
-      expect(() => configuredCloudWorkspaceProvider({ ...env, ...changed })).toThrow(expect.objectContaining({
+      expect(() => configuredCloudWorkspaceProvider({ ...env, ...changed }, RUNTIME_ATTESTATION)).toThrow(expect.objectContaining({
         code: "provider_probe_attestation_failed", disposition: "blocked",
       }));
     }
@@ -103,48 +119,56 @@ describe("deployment-bound cloud provider probe authority", () => {
 
   it("rejects an otherwise valid signed receipt after the actual Trigger deployment version changes", () => {
     const env = signedEnvironment();
-    expect(() => configuredCloudWorkspaceProvider({
-      ...env,
-      TRIGGER_DEPLOYMENT_VERSION: "trigger-deploy-2026-07-21-b",
+    expect(() => configuredCloudWorkspaceProvider(env, {
+      triggerDeploymentVersion: "trigger-deploy-2026-07-21-b",
     })).toThrow(expect.objectContaining({
       code: "provider_probe_attestation_failed", disposition: "blocked",
       message: expect.stringMatching(/actual Trigger worker deployment/),
     }));
   });
 
-  it("does not let a claimed deployment id or TRIGGER_VERSION override the actual worker version", () => {
+  it("does not let matching environment or configuration claims override mismatched runtime context", () => {
     const env = signedEnvironment();
     expect(() => configuredCloudWorkspaceProvider({
       ...env,
-      JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID: "trigger-deploy-2026-07-21-a",
-      TRIGGER_VERSION: "trigger-deploy-2026-07-21-a",
-      TRIGGER_DEPLOYMENT_VERSION: "trigger-deploy-2026-07-21-b",
-    })).toThrow(expect.objectContaining({
+      NODE_ENV: "production",
+      JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID: DEPLOYMENT_VERSION,
+      TRIGGER_VERSION: DEPLOYMENT_VERSION,
+      TRIGGER_DEPLOYMENT_VERSION: DEPLOYMENT_VERSION,
+    }, { triggerDeploymentVersion: "trigger-deploy-2026-07-21-b" })).toThrow(expect.objectContaining({
       code: "provider_probe_attestation_failed", disposition: "blocked",
     }));
     expect(actualTriggerDeploymentId({
-      ...env,
-      TRIGGER_VERSION: "trigger-deploy-2026-07-21-a",
-      TRIGGER_DEPLOYMENT_VERSION: "trigger-deploy-2026-07-21-b",
-    })).toBe("trigger-deploy-2026-07-21-b");
+      triggerDeploymentVersion: "trigger-deploy-2026-07-21-b",
+    }, "sandbox0")).toBe("trigger-deploy-2026-07-21-b");
+    const source = readFileSync(join(process.cwd(), "src/trigger/cloud-provider-probe-attestation.ts"), "utf8");
+    const actualIdentity = source.slice(source.indexOf("export function actualTriggerDeploymentId("), source.indexOf("/** Normal worker verification"));
+    expect(actualIdentity).not.toMatch(/TRIGGER_VERSION|TRIGGER_DEPLOYMENT_VERSION|NODE_ENV|JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID/);
   });
 
   it.each([
-    { runtime: { TRIGGER_DEPLOYMENT_VERSION: undefined, TRIGGER_VERSION: undefined }, label: "missing" },
-    { runtime: { TRIGGER_DEPLOYMENT_VERSION: "unversioned", TRIGGER_VERSION: undefined }, label: "unversioned" },
-    { runtime: { TRIGGER_DEPLOYMENT_VERSION: "worker-unversioned", TRIGGER_VERSION: undefined }, label: "unversioned placeholder" },
-  ])("blocks execution when the actual Trigger deployment identity is $label", ({ runtime }) => {
+    { version: undefined, label: "missing" },
+    { version: "bad deployment value", label: "malformed" },
+    { version: "unversioned", label: "unversioned" },
+    { version: "worker-unversioned", label: "unversioned placeholder" },
+  ])("blocks execution when the SDK runtime deployment identity is $label", ({ version }) => {
     const env = signedEnvironment();
-    expect(() => configuredCloudWorkspaceProvider({ ...env, ...runtime })).toThrow(expect.objectContaining({
+    expect(() => configuredCloudWorkspaceProvider(env, { triggerDeploymentVersion: version })).toThrow(expect.objectContaining({
       code: "provider_probe_attestation_failed", disposition: "blocked",
     }));
   });
 
-  it("uses the documented TRIGGER_VERSION contract only when the worker-specific version is absent", () => {
-    const env = signedEnvironment();
-    delete env.TRIGGER_DEPLOYMENT_VERSION;
-    env.TRIGGER_VERSION = env.JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID;
-    expect(configuredCloudWorkspaceProvider(env).name).toBe("sandbox0");
+  it("never fills missing runtime context from Trigger or configured environment claims", () => {
+    const env = {
+      ...signedEnvironment(),
+      NODE_ENV: "production",
+      TRIGGER_DEPLOYMENT_VERSION: DEPLOYMENT_VERSION,
+      TRIGGER_VERSION: DEPLOYMENT_VERSION,
+      JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID: DEPLOYMENT_VERSION,
+    };
+    expect(() => configuredCloudWorkspaceProvider(env, {
+      triggerDeploymentVersion: undefined,
+    })).toThrow(expect.objectContaining({ code: "provider_probe_attestation_failed", disposition: "blocked" }));
   });
 
   it.each(["malformed", "stale", "partial", "tampered", "wrong sdk", "wrong provider", "conflicting key ids"])(
@@ -180,22 +204,21 @@ describe("deployment-bound cloud provider probe authority", () => {
         const first = envelope.signature[0] === "0" ? "1" : "0";
         candidate = { ...valid, JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT: JSON.stringify({ ...envelope, signature: `${first}${envelope.signature.slice(1)}` }) };
       }
-      expect(() => configuredCloudWorkspaceProvider(candidate)).toThrow(expect.objectContaining({
+      expect(() => configuredCloudWorkspaceProvider(candidate, RUNTIME_ATTESTATION)).toThrow(expect.objectContaining({
         code: "provider_probe_attestation_failed", disposition: "blocked",
       }));
     },
   );
 
-  it("keeps cleanup authority narrowly available without an execution receipt", async () => {
+  it("keeps cleanup authority narrowly available without an execution receipt", () => {
     const env = baseEnvironment();
     delete env.JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT;
-    const cleanup = configuredCloudWorkspaceProvider(env, false);
+    const cleanup = configuredCloudWorkspaceCleanupProvider(env);
     expect(cleanup.name).toBe("sandbox0");
-    await expect(cleanup.createWorkspace({
-      attemptKey: "forbidden", template: "forbidden", runtime: "forbidden",
-      lockfileDigest: "0".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS,
-    })).rejects.toMatchObject({ code: "provider_probe_attestation_failed", disposition: "blocked" });
+    expect(Object.keys(cleanup).sort()).toEqual(["name", "terminate"]);
+    expect(cleanup.terminate).toBeTypeOf("function");
+    expect("createWorkspace" in cleanup).toBe(false);
     delete env.SANDBOX0_TOKEN;
-    expect(() => configuredCloudWorkspaceProvider(env, false)).toThrow(expect.objectContaining({ code: "missing_configuration" }));
+    expect(() => configuredCloudWorkspaceCleanupProvider(env)).toThrow(expect.objectContaining({ code: "missing_configuration" }));
   });
 });

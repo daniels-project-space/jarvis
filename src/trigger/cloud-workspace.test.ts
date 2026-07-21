@@ -17,7 +17,11 @@ import {
 import { FakeCloudWorkspaceProvider } from "./cloud-workspace-fake";
 import { CloudWorkspaceToolBridge } from "./cloud-workspace-tools";
 import { prepareCloudWorkspaceExecution, terminateOrphanedCloudWorkspaces } from "./cloud-workspace-controller";
-import { CLOUD_WORKSPACE_CAPABILITY_MATRIX, configuredCloudWorkspaceProvider } from "./cloud-workspace-providers";
+import {
+  CLOUD_WORKSPACE_CAPABILITY_MATRIX,
+  configuredCloudWorkspaceCleanupProvider,
+  configuredCloudWorkspaceProvider,
+} from "./cloud-workspace-providers";
 
 const BASE = "a".repeat(40);
 
@@ -78,7 +82,7 @@ describe("fail-closed cloud workspace boundary", () => {
   it("resolves missing configuration before hydration and therefore before host spawn", async () => {
     const hydrate = vi.fn(async () => archive([{ name: "safe.txt", data: new TextEncoder().encode("safe") }]));
     await expect(prepareCloudWorkspaceExecution({
-      providerFactory: () => configuredCloudWorkspaceProvider({}),
+      providerFactory: () => configuredCloudWorkspaceProvider({}, { triggerDeploymentVersion: undefined }),
       hydrateArchive: hydrate,
       attemptKey: "job:1", template: "node", runtime: "node-22", lockfileDigest: "b".repeat(64),
     })).rejects.toMatchObject({ code: "missing_configuration" });
@@ -201,8 +205,11 @@ describe("fail-closed cloud workspace boundary", () => {
       exactCommandCancellation: false,
     });
     expect(Object.values(CLOUD_WORKSPACE_CAPABILITY_MATRIX.cloudflare).every((value) => value === false)).toBe(true);
-    const e2b = configuredCloudWorkspaceProvider({ JARVIS_CLOUD_WORKSPACE_PROVIDER: "e2b", E2B_API_KEY: "test-only" }, false);
-    expect(() => assertRequiredCapabilities(e2b)).toThrow(/boundedResources/);
+    const e2b = configuredCloudWorkspaceCleanupProvider({ JARVIS_CLOUD_WORKSPACE_PROVIDER: "e2b", E2B_API_KEY: "test-only" });
+    expect(Object.keys(e2b).sort()).toEqual(["name", "terminate"]);
+    const unprovenE2b = new FakeCloudWorkspaceProvider();
+    unprovenE2b.capabilities.boundedResources = false;
+    expect(() => assertRequiredCapabilities(unprovenE2b)).toThrow(/boundedResources/);
     const fake = new FakeCloudWorkspaceProvider();
     fake.capabilities.exactCommandCancellation = false;
     expect(() => assertRequiredCapabilities(fake)).toThrow(/exactCommandCancellation/);
@@ -223,7 +230,7 @@ describe("fail-closed cloud workspace boundary", () => {
     expect(specialist).toContain("controllerScratch");
     expect(specialist).toContain("applyValidatedPatchToControllerCheckout");
     expect(specialist).not.toMatch(/await runAgent\s*\(/);
-    expect(runner.indexOf("configuredCloudWorkspaceProvider(process.env)")).toBeLessThan(runner.indexOf("await processJob(job, cloudProvider)"));
+    expect(runner.indexOf("configuredCloudWorkspaceProvider(process.env, options.runtimeAttestation)")).toBeLessThan(runner.indexOf("await processJob(job, cloudProvider)"));
     expect(specialist).toContain("isolateCloudSubscriptionEnv");
     expect(specialist).toContain("trusted controller checkout still exists at Codex startup");
     expect(specialist.indexOf("rmSync(repoDir, { recursive: true, force: true })")).toBeLessThan(specialist.indexOf("runCloudWorkspaceAgent({"));

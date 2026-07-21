@@ -69,6 +69,11 @@ export type CloudProviderProbeBinding = Readonly<{
   runtime: Readonly<{ identity: string; digest: string }>;
 }>;
 
+/** Controller-only proof copied from the Trigger SDK task run context. */
+export type CloudProviderRuntimeAttestation = Readonly<{
+  triggerDeploymentVersion: string | null | undefined;
+}>;
+
 export type CloudProviderProbeKey = Readonly<{ keyId: string; secret: Uint8Array | string }>;
 
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -150,19 +155,12 @@ export function configuredCloudProviderProbeBinding(
   };
 }
 
-/**
- * Resolve the immutable version of the Trigger worker that is executing this
- * code. TRIGGER_DEPLOYMENT_VERSION is worker-owned and therefore wins over
- * TRIGGER_VERSION, whose documented contract also allows callers to select a
- * task version. There is deliberately no NODE_ENV escape hatch.
- */
+/** Resolve only the SDK-attested version of the Trigger deployment executing this task. */
 export function actualTriggerDeploymentId(
-  env: Readonly<Record<string, string | undefined>>,
-  provider = selectedProvider(env),
+  runtimeAttestation: CloudProviderRuntimeAttestation,
+  provider: CloudWorkspaceProviderName,
 ): string {
-  const deploymentVersion = String(env.TRIGGER_DEPLOYMENT_VERSION ?? "").trim();
-  const triggerVersion = String(env.TRIGGER_VERSION ?? "").trim();
-  const actual = deploymentVersion || triggerVersion;
+  const actual = String(runtimeAttestation.triggerDeploymentVersion ?? "").trim();
   if (!SAFE_ID.test(actual) || UNVERSIONED_DEPLOYMENT.test(actual)) {
     throw new CloudWorkspaceError(
       provider,
@@ -177,9 +175,10 @@ export function actualTriggerDeploymentId(
 /** Normal worker verification must bind to provider-observed runtime state. */
 export function runtimeCloudProviderProbeBinding(
   env: Readonly<Record<string, string | undefined>>,
+  runtimeAttestation: CloudProviderRuntimeAttestation,
 ): CloudProviderProbeBinding {
   const configured = configuredCloudProviderProbeBinding(env);
-  const actualDeploymentId = actualTriggerDeploymentId(env, configured.provider);
+  const actualDeploymentId = actualTriggerDeploymentId(runtimeAttestation, configured.provider);
   if (configured.deploymentId !== actualDeploymentId) {
     throw new CloudWorkspaceError(
       configured.provider,
@@ -322,9 +321,10 @@ export function installedCloudProviderSdkVersion(provider: CloudWorkspaceProvide
 
 export function assertCloudProviderExecutionReady(
   env: Readonly<Record<string, string | undefined>>,
+  runtimeAttestation: CloudProviderRuntimeAttestation,
   now = Date.now(),
 ): CloudProviderProbeReceipt {
-  const binding = runtimeCloudProviderProbeBinding(env);
+  const binding = runtimeCloudProviderProbeBinding(env, runtimeAttestation);
   if (installedCloudProviderSdkVersion(binding.provider) !== binding.sdk.version) {
     blocked(binding.provider, "installed cloud provider SDK does not match the pinned receipt tuple");
   }

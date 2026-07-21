@@ -22,7 +22,10 @@ import {
   type WorkspaceCheckpoint,
   type WorkspaceLimits,
 } from "./cloud-workspace";
-import { assertCloudProviderExecutionReady } from "./cloud-provider-probe-attestation";
+import {
+  assertCloudProviderExecutionReady,
+  type CloudProviderRuntimeAttestation,
+} from "./cloud-provider-probe-attestation";
 
 const ROOT = "/workspace/repository";
 const ARCHIVE_PATH = "/workspace/jarvis-source.tar";
@@ -429,24 +432,10 @@ export class CloudflareSandboxCompatibleProvider implements CloudWorkspaceProvid
   terminate: CloudWorkspaceProvider["terminate"] = (workspace, reason) => this.require().terminate(workspace, reason);
 }
 
-class CleanupOnlyCloudWorkspaceProvider implements CloudWorkspaceProvider {
-  readonly name: CloudWorkspaceProviderName;
-  readonly capabilities = CAPABILITIES.cloudflare;
-  constructor(private readonly provider: CloudWorkspaceProvider) { this.name = provider.name; }
-  private denied(): never {
-    throw new CloudWorkspaceError(this.name, "provider_probe_attestation_failed", "cleanup authority cannot start or operate a cloud workspace", "blocked");
-  }
-  createWorkspace: CloudWorkspaceProvider["createWorkspace"] = async () => this.denied();
-  uploadCredentiallessArchive: CloudWorkspaceProvider["uploadCredentiallessArchive"] = async () => this.denied();
-  exec: CloudWorkspaceProvider["exec"] = async () => this.denied();
-  readFile: CloudWorkspaceProvider["readFile"] = async () => this.denied();
-  writeFile: CloudWorkspaceProvider["writeFile"] = async () => this.denied();
-  listFiles: CloudWorkspaceProvider["listFiles"] = async () => this.denied();
-  checkpoint: CloudWorkspaceProvider["checkpoint"] = async () => this.denied();
-  recreateFromCheckpoint: CloudWorkspaceProvider["recreateFromCheckpoint"] = async () => this.denied();
-  exportPatch: CloudWorkspaceProvider["exportPatch"] = async () => this.denied();
-  terminate: CloudWorkspaceProvider["terminate"] = (workspace, reason) => this.provider.terminate(workspace, reason);
-}
+export type CloudWorkspaceCleanupProvider = Readonly<{
+  name: CloudWorkspaceProviderName;
+  terminate: CloudWorkspaceProvider["terminate"];
+}>;
 
 function configuredProviderAdapter(env: Readonly<Record<string, string | undefined>>): CloudWorkspaceProvider {
   const name = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
@@ -470,25 +459,23 @@ function configuredProviderAdapter(env: Readonly<Record<string, string | undefin
 
 export function configuredCloudWorkspaceProvider(
   env: Readonly<Record<string, string | undefined>>,
-  requireExecutionCapabilities = true,
+  runtimeAttestation: CloudProviderRuntimeAttestation,
 ): CloudWorkspaceProvider {
-  const name = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
-  if (name === "e2b") {
-    if (!env.E2B_API_KEY) throw new CloudWorkspaceError("e2b", "missing_configuration", "E2B_API_KEY is not configured");
-  } else if (name === "daytona") {
-    if (!env.DAYTONA_API_KEY) throw new CloudWorkspaceError("daytona", "missing_configuration", "DAYTONA_API_KEY is not configured");
-  } else if (name === "sandbox0") {
-    if (!env.SANDBOX0_TOKEN) throw new CloudWorkspaceError("sandbox0", "missing_configuration", "SANDBOX0_TOKEN is not configured");
-  }
-  else if (name === "cloudflare") {
-    throw new CloudWorkspaceError("cloudflare", "missing_configuration", "Cloudflare Sandbox-compatible client is not configured");
-  }
-  else throw new CloudWorkspaceError("cloudflare", "missing_configuration", "JARVIS_CLOUD_WORKSPACE_PROVIDER must select e2b, daytona, sandbox0, or cloudflare");
-  if (requireExecutionCapabilities) assertCloudProviderExecutionReady(env);
+  assertCloudProviderExecutionReady(env, runtimeAttestation);
   const provider = configuredProviderAdapter(env);
-  if (!requireExecutionCapabilities) return new CleanupOnlyCloudWorkspaceProvider(provider);
   assertRequiredCapabilities(provider);
   return provider;
+}
+
+/** Orphan cleanup never receives execution authority or exposes execution methods. */
+export function configuredCloudWorkspaceCleanupProvider(
+  env: Readonly<Record<string, string | undefined>>,
+): CloudWorkspaceCleanupProvider {
+  const provider = configuredProviderAdapter(env);
+  return Object.freeze({
+    name: provider.name,
+    terminate: (workspace, reason) => provider.terminate(workspace, reason),
+  });
 }
 
 /** Live-probe authority is explicit and never available to normal execution or cleanup callers. */
