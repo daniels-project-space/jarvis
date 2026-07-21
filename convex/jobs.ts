@@ -32,6 +32,7 @@ const MAX_WRITABLE_PER_MISSION_REPO = 4;
 const DELIVERY_LEASE_MS = 45_000;
 const DELIVERY_RETRY_LIMIT = 6;
 const REVIEW_RECEIPT_MAX_CHARS = 300_000;
+const GIT_OID = /^[0-9a-f]{40,64}$/i;
 const DELIVERY_OUTCOMES = new Set([
   "protected_draft", "read_only_complete", "no_change",
   "merged", "blocked", "needs_attention",
@@ -243,6 +244,7 @@ async function ensureAttempt(ctx: any, jobId: any, attempt: number, status: stri
     workspaceLineage,
     workspaceKey: workspaceLineage ? attemptWorkspaceKey(workspaceLineage, attempt) : undefined,
     workerBranch: job?.workerBranch,
+    sourceHeadSha: job?.sourceHeadSha,
     livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now, ...patch,
   });
   return { _id: id, jobId, attempt, status, ...patch };
@@ -685,6 +687,19 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
       const missionId = ctx.db.normalizeId("missions", job.missionId);
       const mission = missionId ? await ctx.db.get(missionId) : null;
       if (!mission || !goalJobMatchesMissionPhase(job, mission)) continue;
+    }
+    if (job.integrationAttemptId && job.missionId && job.repo) {
+      const integration: any = await ctx.db.get(job.integrationAttemptId);
+      if (!integration || integration.jobId !== job._id || ["integrated", "conflict", "stale", "cancelled", "exhausted", "parked"].includes(integration.status)) continue;
+      const missionId = ctx.db.normalizeId("missions", job.missionId);
+      if (!missionId) continue;
+      const lineage = await ctx.db.query("integrationAttempts")
+        .withIndex("by_mission_generation", (q: any) => q.eq("missionId", missionId)).take(100);
+      const first = lineage
+        .filter((row: any) => row.repository === integration.repository
+          && !["integrated", "conflict", "stale", "cancelled", "exhausted", "parked"].includes(row.status))
+        .sort((left: any, right: any) => left.generation - right.generation)[0];
+      if (!first || first._id !== integration._id) continue;
     }
     if (job.missionId && job.repo && !job.readonly && !job.integrationAttemptId) {
       const key = `${job.missionId}:${job.repo}`;
@@ -1538,11 +1553,44 @@ export const touchDeliveryHeartbeat = mutation({
   },
 });
 
+// A controller that loses a mechanical FIFO claim returns the same immutable
+// delivery generation to pending. This is not a retry and consumes no work
+// attempt, delivery generation, provider budget or attention item.
+export const releaseIntegrationQueueWait = mutation({
+  args: {
+    jobId: v.id("jobs"), expectedAttempt: v.number(), sourceWorkAttempt: v.number(),
+    deliveryGeneration: v.number(), deliveryRunId: v.string(), deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
+    deliveryLeaseOwner: v.optional(v.string()), deliveryLeaseToken: v.optional(v.string()), deliveryLeaseVersion: v.optional(v.number()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row: any = await ctx.db.get(a.jobId);
+    const delivery: any = await deliveryAttemptFor(ctx, a.jobId, a.sourceWorkAttempt, a.deliveryGeneration);
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
+      || !delivery || delivery.policy !== "mission_integration" || !hasLiveControllerFence(row, delivery, a)) return false;
+    const now = Date.now();
+    await ctx.db.patch(delivery._id, {
+      status: "checkpointed", dispatchId: undefined, deliveryRunId: undefined,
+      currentStep: "queued", leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined,
+      heartbeatAt: now, updatedAt: now,
+    });
+    await patchJobWithRuntime(ctx, row, {
+      ...invalidateDeliveryLease(row), status: "pending", stage: "delivery",
+      progress: "integration receipt waiting in repository FIFO", integrationState: "provider_waiting",
+      dispatchId: undefined, dispatchLeaseUntil: undefined, workerRunId: undefined, deliveryRunId: undefined,
+      nextRunAt: now, heartbeatAt: now,
+    });
+    return true;
+  },
+});
+
 export const checkpointAndRequeue = mutation({
   args: {
     jobId: v.id("jobs"),
     expectedAttempt: v.number(),
     checkpoint: v.string(),
+    checkpointHeadSha: v.optional(v.string()),
     result: v.optional(v.string()),
     branch: v.optional(v.string()),
     delayMs: v.optional(v.number()),
@@ -1586,7 +1634,14 @@ export const checkpointAndRequeue = mutation({
         await appendAttemptEvidence(ctx, row, "steering_checkpoint", "Steering checkpoint saved before fresh scoped attempt", {
           stage: "checkpointed", percent: row.percent, evidenceKind: "checkpoint", eventKey: `steering-checkpoint:${a.expectedAttempt}`, attempt: a.expectedAttempt,
         });
-        await ensureAttempt(ctx, a.jobId, nextAttempt, "pending", now);
+        const priorAttempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+        if (priorAttempt && a.checkpointHeadSha && GIT_OID.test(a.checkpointHeadSha)) {
+          await ctx.db.patch(priorAttempt._id, { checkpointHeadSha: a.checkpointHeadSha });
+        }
+        await ensureAttempt(ctx, a.jobId, nextAttempt, "pending", now, {
+          parentAttempt: a.expectedAttempt, sourceHeadSha: row.sourceHeadSha,
+          parentCheckpointHeadSha: a.checkpointHeadSha && GIT_OID.test(a.checkpointHeadSha) ? a.checkpointHeadSha : undefined,
+        });
         await appendAttemptEvidence(ctx, row, "queued", `Fresh attempt ${nextAttempt} queued after steering`, {
           stage: "queued", evidenceKind: "intent", eventKey: `intent:${nextAttempt}`, attempt: nextAttempt,
         });
@@ -1659,6 +1714,7 @@ export const checkpointAndRequeue = mutation({
     const attemptRecord = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (attemptRecord) await ctx.db.patch(attemptRecord._id, {
       status: exhausted ? "error" : requestedStatus === "pending" ? "checkpointed" : requestedStatus,
+      checkpointHeadSha: a.checkpointHeadSha && GIT_OID.test(a.checkpointHeadSha) ? a.checkpointHeadSha : attemptRecord.checkpointHeadSha,
       completedAt: Date.now(),
       lastEventAt: Date.now(),
     });
@@ -1671,7 +1727,10 @@ export const checkpointAndRequeue = mutation({
       { stage: exhausted ? "error" : requestedStatus === "pending" ? "checkpointed" : requestedStatus,
         percent: row.percent, evidenceKind: "checkpoint", eventKey: `checkpoint:${a.expectedAttempt}:${requestedStatus}`, attempt: a.expectedAttempt });
     if (status === "pending" && !deliveryContinuation) {
-      await ensureAttempt(ctx, a.jobId, attempt, "pending", Date.now());
+      await ensureAttempt(ctx, a.jobId, attempt, "pending", Date.now(), {
+        parentAttempt: a.expectedAttempt, sourceHeadSha: row.sourceHeadSha,
+        parentCheckpointHeadSha: a.checkpointHeadSha && GIT_OID.test(a.checkpointHeadSha) ? a.checkpointHeadSha : undefined,
+      });
       await appendAttemptEvidence(ctx, row, "queued", `Continuation attempt ${attempt} queued`, {
         stage: "queued", evidenceKind: "intent", eventKey: `intent:${attempt}`, attempt,
       });
@@ -1766,7 +1825,7 @@ export const bindWorkspaceSource = mutation({
       evidenceSummary: `sandbox source ${args.sourceBranch}@${args.sourceHeadSha.slice(0, 12)}`,
     });
     const attempt = await attemptFor(ctx, args.jobId, args.expectedAttempt);
-    if (attempt) await ctx.db.patch(attempt._id, { lastEventAt: Date.now() });
+    if (attempt) await ctx.db.patch(attempt._id, { sourceHeadSha: args.sourceHeadSha, lastEventAt: Date.now() });
     await appendAttemptEvidence(ctx, row, "workspace_source_bound", `Sandbox source bound to ${args.sourceBranch}@${args.sourceHeadSha}`, {
       stage: "starting", evidenceKind: "workspace", eventKey: `workspace-source:${args.expectedAttempt}:${args.sourceHeadSha}`,
       data: { sourceBranch: args.sourceBranch, sourceHeadSha: args.sourceHeadSha, workerBranch: row.workerBranch },
@@ -2180,6 +2239,8 @@ export const markVerifiedForDelivery = mutation({
       || !/^[0-9a-f]{40,64}$/i.test(String(receipt?.headTreeSha ?? ""))
       || !isSha256Digest(receipt?.agentEvidenceSha256)
     ) return false;
+    const missionWritable = Boolean(row.missionId && !row.readonly && ["building", "refining"].includes(String(row.goalStage)));
+    if (missionWritable && (!GIT_OID.test(String(row.sourceHeadSha ?? "")) || receipt.baseSha !== row.sourceHeadSha)) return false;
     const receiptJson = a.reviewReceiptJson;
     const receiptDigest = await sha256Hex(receiptJson);
     if (row.status === "pending") {
@@ -2259,7 +2320,7 @@ export const markVerifiedForDelivery = mutation({
       reviewReceiptId,
       reviewReceiptDigest: receiptDigest,
       integrationAttemptId: integration?._id,
-      integrationState: integration ? "queued" : row.integrationState,
+      integrationState: integration ? String(integration.status) : row.integrationState,
       evidenceSummary: `signed review ${receiptDigest.slice(0, 12)} queued`,
       activeDeliveryAttemptId: deliveryAttemptId,
       deliveryGeneration: generation,

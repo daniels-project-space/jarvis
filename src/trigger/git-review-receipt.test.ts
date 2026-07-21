@@ -191,4 +191,41 @@ describe("controller Git review receipts", () => {
       note: "review checkout history is shallow; parent and ancestry claims are unverifiable",
     });
   });
+
+  it("reviews the cumulative two-attempt lineage from the immutable first source head", async () => {
+    const fixture = repositoryFixture("attempt-one");
+    writeFileSync(join(fixture.checkout, "attempt-two.txt"), "second checkpoint\n");
+    git(fixture.checkout, ["add", "attempt-two.txt"]);
+    git(fixture.checkout, ["commit", "-m", "attempt two change"]);
+    const finalHead = git(fixture.checkout, ["rev-parse", "HEAD"]);
+    const finalTree = git(fixture.checkout, ["rev-parse", "HEAD^{tree}"]);
+
+    const built = await buildGitReviewReceipt({
+      runGit: runGit(fixture.checkout), jobId: "job-two-attempt", attempt: 2,
+      repository: "daniels-project-space/jarvis", expectedBranch: "main",
+      baseSha: fixture.baseSha, expectedHeadSha: finalHead,
+      agentEvidence: "attempt one checkpoint plus attempt two completion",
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    expect(built.receipt).toMatchObject({
+      baseSha: fixture.baseSha, headSha: finalHead, headTreeSha: finalTree, commitCount: 2,
+    });
+    expect(built.receipt.commits).toContain("attempt-one change");
+    expect(built.receipt.commits).toContain("attempt two change");
+    expect(built.receipt.diffPatch).toContain("+attempt-one change");
+    expect(built.receipt.diffPatch).toContain("+second checkpoint");
+
+    git(fixture.checkout, ["checkout", "-b", "moved-source", fixture.baseSha]);
+    writeFileSync(join(fixture.checkout, "forged.txt"), "moved source\n");
+    git(fixture.checkout, ["add", "forged.txt"]);
+    git(fixture.checkout, ["commit", "-m", "moved source"]);
+    const movedSource = git(fixture.checkout, ["rev-parse", "HEAD"]);
+    git(fixture.checkout, ["checkout", "main"]);
+    await expect(buildGitReviewReceipt({
+      runGit: runGit(fixture.checkout), jobId: "job-two-attempt", attempt: 2,
+      repository: "daniels-project-space/jarvis", expectedBranch: "main",
+      baseSha: movedSource, expectedHeadSha: finalHead, agentEvidence: "forged source",
+    })).resolves.toEqual({ ok: false, note: "review checkout head does not descend from its prepared base" });
+  });
 });

@@ -24,6 +24,7 @@ import {
 } from "./controlPlane";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { validateWorkDag, workItemIdentity } from "../src/lib/workspace-protocol";
+import { writeIntegrationTerminalReceipt } from "./goalIntegration";
 
 const ADVANCE_LEASE_MS = 10 * 60 * 1000;
 const COORDINATOR_RECEIPT_FRESH_MS = 10 * 60 * 1000;
@@ -700,6 +701,24 @@ export const recordPlan = mutation({
       throw new Error("Goal plan workstream budget is invalid");
     }
     validateWorkDag(plan.workstreams, Math.min(8, Number(mission.maxBuildSessions ?? 6)));
+    const writableRepositories = new Set<string>();
+    for (const stream of plan.workstreams) {
+      if (stream.readonly) continue;
+      const requested = stream.repo || mission.primaryRepo || plan.primaryRepo;
+      const canonical = requested ? canonicalizeRepository(requested, { allowShortName: true }) : null;
+      if (!canonical) throw new Error(`Writable goal workstream ${stream.id} requires one canonical repository`);
+      writableRepositories.add(canonical);
+    }
+    if (writableRepositories.size > 1) {
+      return {
+        advanced: false,
+        stale: false,
+        splitRequired: true,
+        code: "WRITABLE_REPOSITORY_SPLIT_REQUIRED",
+        repositories: [...writableRepositories].sort(),
+        parentMissionId: String(args.id),
+      };
+    }
     const now = Date.now();
     if (mission.route === "app_factory") {
       if (!args.externalRun?.id) throw new Error("App Factory route requires a live factory run");
@@ -1487,7 +1506,7 @@ async function resetGoalJob(ctx: any, job: any, now: number, force = false) {
   if (job.status === "running") return false;
   if (job.verificationVerdict === "pass" && job.reviewReceiptId && job.integrationAttemptId) {
     const integration: any = await ctx.db.get(job.integrationAttemptId);
-    if (!integration || ["integrated", "cancelled", "exhausted"].includes(integration.status)) return false;
+    if (!integration || ["integrated", "cancelled", "exhausted", "parked"].includes(integration.status)) return false;
     const prior: any = job.activeDeliveryAttemptId ? await ctx.db.get(job.activeDeliveryAttemptId) : null;
     if (!prior) return false;
     const generation = Number(job.deliveryGeneration ?? prior.generation ?? 1) + 1;
@@ -1582,7 +1601,7 @@ export const control = mutation({
       });
       if (mission.activeIntegrationAttemptId) {
         const integration: any = await ctx.db.get(mission.activeIntegrationAttemptId);
-        if (integration && !["integrated", "conflict", "stale", "cancelled", "exhausted"].includes(integration.status)) {
+        if (integration && !["integrated", "conflict", "stale", "cancelled", "exhausted", "parked"].includes(integration.status)) {
           await ctx.db.patch(integration._id, {
             status: integration.preparedEffectId ? "prepared" : "queued",
             leaseUntil: undefined, retryReason: "paused by mission control", updatedAt: now,
@@ -1734,10 +1753,12 @@ export const control = mutation({
       const integrations = await ctx.db.query("integrationAttempts")
         .withIndex("by_mission_generation", (q: any) => q.eq("missionId", mission._id)).take(100);
       for (const integration of integrations) {
-        if (!["integrated", "conflict", "stale", "cancelled", "exhausted"].includes(integration.status)) {
+        if (!["integrated", "conflict", "stale", "cancelled", "exhausted", "parked"].includes(integration.status)) {
+          const terminal = await writeIntegrationTerminalReceipt(ctx, integration, "cancelled", { reason: "cancelled by mission control" });
+          if (!terminal) throw new Error("cancelled integration terminal receipt could not be canonicalized");
           await ctx.db.patch(integration._id, {
             status: "cancelled", outcome: "cancelled", leaseUntil: undefined,
-            terminalReceiptDigest: integration.reviewReceiptDigest, completedAt: now, updatedAt: now,
+            terminalReceiptDigest: terminal.receiptDigest, completedAt: now, updatedAt: now,
           });
         }
       }

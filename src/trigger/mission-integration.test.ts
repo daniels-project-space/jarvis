@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { integrateReviewedWorker, type IntegrationAdapter } from "./mission-integration";
+import { integrateReviewedWorker, type IntegrationAdapter, type ProviderEffect } from "./mission-integration";
 
 const BASE = "a".repeat(40);
 const WORKER = "b".repeat(40);
@@ -7,10 +7,20 @@ const WORKER_TREE = "c".repeat(40);
 const MERGED = "d".repeat(40);
 const MERGED_TREE = "e".repeat(40);
 const receipt = {
+  integrationAttemptId: "integration-1",
   workerBranch: "jarvis/work/goal/catalog-job-a", reviewedHeadSha: WORKER,
   reviewedHeadTreeSha: WORKER_TREE, expectedIntegrationBaseSha: BASE,
+  expectedIntegrationRefSha: BASE,
   integrationBranch: "jarvis/goal/catalog", generation: 1,
 };
+
+function refEffect(input: { effectId: string; branch: string; expectedBaseSha: string; newHeadSha: string; treeSha: string }): ProviderEffect {
+  return {
+    effectId: input.effectId, kind: "update_ref", provider: "github", providerIdentity: `R:${input.branch}`,
+    method: "POST", target: "graphql:updateRefs", requestDigest: "9".repeat(64),
+    expectedBaseSha: input.expectedBaseSha, headSha: input.newHeadSha, treeSha: input.treeSha,
+  };
+}
 
 function harness(options: { integration?: string | null; advance?: "applied" | "not_applied" | "unknown"; conflict?: boolean } = {}) {
   const calls: string[] = [];
@@ -21,57 +31,64 @@ function harness(options: { integration?: string | null; advance?: "applied" | "
     prepareMerge: vi.fn(async () => {
       calls.push("SANDBOX_MERGE");
       return options.conflict ? { status: "conflict" as const, reason: "content conflict" }
-        : { status: "clean" as const, headSha: MERGED, treeSha: MERGED_TREE };
+        : { status: "clean" as const, headSha: MERGED, treeSha: MERGED_TREE, synthetic: false };
     }),
+    stageCandidate: vi.fn(async () => ({ outcome: "applied" as const, providerHeadSha: MERGED })),
+    prepareRefEffect: vi.fn(async (input) => refEffect(input)),
     advanceRef: vi.fn(async ({ newHeadSha }) => {
-      calls.push("PATCH");
+      calls.push("GRAPHQL");
       if (options.advance !== "not_applied") refs.set(receipt.integrationBranch, newHeadSha);
-      return options.advance ?? "applied";
+      return { outcome: options.advance ?? "applied", providerHeadSha: options.advance === "not_applied" ? undefined : newHeadSha };
     }),
   };
   return { adapter, calls, refs };
 }
 
 describe("serialized integration provider protocol", () => {
-  it("performs one non-force ref effect with exact mechanical reads", async () => {
+  it("performs one exact ref effect with mechanical reads", async () => {
     const h = harness();
     const prepare = vi.fn().mockResolvedValue({ replay: false });
     const observe = vi.fn().mockResolvedValue(true);
     await expect(integrateReviewedWorker(receipt, h.adapter, { prepare, observe })).resolves.toEqual({
-      status: "integrated", effectId: `integrate:${receipt.integrationBranch}:${BASE}:${MERGED}`,
+      status: "integrated", effectId: `update-ref:${receipt.integrationAttemptId}:${receipt.integrationBranch}:${BASE}:${MERGED}`,
       headSha: MERGED, treeSha: MERGED_TREE,
     });
     expect(h.calls.filter((call) => call === "GET")).toHaveLength(4);
-    expect(h.calls.filter((call) => call === "PATCH")).toHaveLength(1);
-    expect(h.calls.filter((call) => call === "SANDBOX_MERGE")).toHaveLength(1);
+    expect(h.calls.filter((call) => call === "GRAPHQL")).toHaveLength(1);
+    expect(prepare).toHaveBeenCalledWith(expect.objectContaining({ kind: "update_ref", expectedBaseSha: BASE, headSha: MERGED }));
     expect(observe).toHaveBeenCalledWith(expect.objectContaining({ observation: "applied", providerHeadSha: MERGED }));
   });
 
   it("reconciles a lost ref response and never sends a second write", async () => {
     const h = harness({ advance: "unknown" });
-    const observe = vi.fn().mockResolvedValue(true);
     const result = await integrateReviewedWorker(receipt, h.adapter, {
-      prepare: vi.fn().mockResolvedValue({ replay: false }), observe,
+      prepare: vi.fn().mockResolvedValue({ replay: false }), observe: vi.fn().mockResolvedValue(true),
     });
     expect(result.status).toBe("integrated");
-    expect(h.calls.filter((call) => call === "PATCH")).toHaveLength(1);
+    expect(h.calls.filter((call) => call === "GRAPHQL")).toHaveLength(1);
     expect(h.calls.filter((call) => call === "GET")).toHaveLength(5);
   });
 
-  it("reconciles a controller crash after preparation from the prepared head", async () => {
+  it("reconciles a controller crash after preparation without a duplicate write", async () => {
     const h = harness({ integration: MERGED });
-    const observe = vi.fn().mockResolvedValue(true);
+    // Initial preflight must still see the persisted expected base; emulate a
+    // crash replay by changing the ref only after the first two reads.
+    let reads = 0;
+    vi.mocked(h.adapter.readRef).mockImplementation(async (branch) => {
+      reads += 1;
+      if (branch === receipt.workerBranch) return WORKER;
+      return reads <= 2 ? BASE : MERGED;
+    });
     const result = await integrateReviewedWorker(receipt, h.adapter, {
-      prepare: vi.fn().mockResolvedValue({ replay: true, observation: "unknown" }), observe,
+      prepare: vi.fn().mockResolvedValue({ replay: true, observation: "unknown" }), observe: vi.fn().mockResolvedValue(true),
     });
     expect(result.status).toBe("integrated");
-    expect(h.calls.filter((call) => call === "PATCH")).toHaveLength(0);
-    expect(observe).toHaveBeenCalledWith(expect.objectContaining({ observation: "applied", providerHeadSha: MERGED }));
+    expect(h.calls.filter((call) => call === "GRAPHQL")).toHaveLength(0);
   });
 
   it.each([
     ["moved worker", { worker: "f".repeat(40), integration: BASE }, "stale"],
-    ["advanced integration", { worker: WORKER, integration: "f".repeat(40) }, "stale"],
+    ["rolled-back integration", { worker: WORKER, integration: "f".repeat(40) }, "stale"],
   ])("rejects %s without a provider write", async (_label, state, expected) => {
     const h = harness({ integration: state.integration });
     h.refs.set(receipt.workerBranch, state.worker);
@@ -79,15 +96,13 @@ describe("serialized integration provider protocol", () => {
       prepare: vi.fn().mockResolvedValue({ replay: false }), observe: vi.fn(),
     });
     expect(result.status).toBe(expected);
-    expect(h.calls.filter((call) => call === "PATCH")).toHaveLength(0);
+    expect(h.calls).not.toContain("GRAPHQL");
   });
 
   it("turns a semantic conflict into a focused result without touching the ref", async () => {
     const h = harness({ conflict: true });
-    const result = await integrateReviewedWorker(receipt, h.adapter, {
-      prepare: vi.fn(), observe: vi.fn(),
-    });
+    const result = await integrateReviewedWorker(receipt, h.adapter, { prepare: vi.fn(), observe: vi.fn() });
     expect(result).toMatchObject({ status: "conflict", reason: "content conflict" });
-    expect(h.calls.filter((call) => call === "PATCH")).toHaveLength(0);
+    expect(h.calls).not.toContain("GRAPHQL");
   });
 });

@@ -81,6 +81,10 @@ async function review(t: ReturnType<typeof convexTest>, job: any, workerRunId: s
     branch: job.workerBranch, baseSha: BASE, baseTreeSha: "2".repeat(40), headSha: head,
     headTreeSha: tree, diffSha256: "3".repeat(64), agentEvidenceSha256: "4".repeat(64),
   });
+  expect(await t.mutation(api.jobs.bindWorkspaceSource, {
+    jobId: job._id, expectedAttempt: 1, workerRunId,
+    sourceBranch: job.sourceBranch, sourceHeadSha: BASE, workerToken: TOKEN,
+  })).toBe(true);
   expect(await t.mutation(api.jobs.markVerifiedForDelivery, {
     jobId: job._id, expectedAttempt: 1, specialistRunId: workerRunId,
     result, verificationNote: note, reviewReceiptJson: receipt,
@@ -116,6 +120,85 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(buildJobs).toHaveLength(0);
   });
 
+  it("atomically returns a typed child-mission split for writable work in two repositories", async () => {
+    const f = await goalAwaitingPlan();
+    const other = "daniels-project-space/jarvis";
+    const plan = {
+      summary: "Cross-project plan", route: "existing_project", primaryRepo: REPO, assumptions: [],
+      workstreams: [
+        { id: "catalog", label: "Catalog", task: "Edit catalog", agentId: "paul", repo: REPO, readonly: false, dependsOn: [], acceptanceCriteria: ["done"], mcp: [] },
+        { id: "jarvis", label: "Jarvis", task: "Edit Jarvis", agentId: "paul", repo: other, readonly: false, dependsOn: [], acceptanceCriteria: ["done"], mcp: [] },
+        { id: "research", label: "Research", task: "Read across projects", agentId: "loki", repo: "daniels-project-space/music-house", readonly: true, dependsOn: [], acceptanceCriteria: ["evidence"], mcp: [] },
+      ],
+      validation: { criteria: ["split"], tests: [], liveChecks: [] },
+    };
+    await expect(f.t.mutation(api.goalMode.recordPlan, {
+      id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
+    })).resolves.toEqual({
+      advanced: false, stale: false, splitRequired: true,
+      code: "WRITABLE_REPOSITORY_SPLIT_REQUIRED",
+      repositories: [other, REPO].sort(), parentMissionId: String(f.missionId),
+    });
+    const state = await f.t.run(async (ctx) => ({
+      mission: await ctx.db.get(f.missionId),
+      builders: (await ctx.db.query("jobs").withIndex("by_mission", (q) => q.eq("missionId", String(f.missionId))).collect())
+        .filter((job) => job.goalStage === "building"),
+      integrations: await ctx.db.query("integrationAttempts").collect(),
+    }));
+    expect(state.builders).toHaveLength(0);
+    expect(state.integrations).toHaveLength(0);
+    expect(state.mission).toMatchObject({ phase: "planning", integrationGeneration: 0 });
+    expect((state.mission as any)?.plan).toBeUndefined();
+  });
+
+  it("fails closed when a mission review substitutes a source base other than the first bound head", async () => {
+    const f = await plannedGoal();
+    const [specialist] = await dispatch(f.t, 1, "source-forgery");
+    const job = f.jobs.find((row) => String(row._id) === String(specialist.reservation.jobId))!;
+    expect(await f.t.mutation(api.jobs.bindWorkspaceSource, {
+      jobId: job._id, expectedAttempt: 1, workerRunId: String(specialist.claim!.workerRunId),
+      sourceBranch: String(job.sourceBranch), sourceHeadSha: BASE, workerToken: TOKEN,
+    })).toBe(true);
+    const result = "forged result";
+    const note = "forged review";
+    const receipt = JSON.stringify({
+      version: 1, jobId: String(job._id), attempt: 1, repository: REPO, branch: job.workerBranch,
+      baseSha: "f".repeat(40), baseTreeSha: "2".repeat(40), headSha: "6".repeat(40),
+      headTreeSha: "8".repeat(40), diffSha256: "3".repeat(64), agentEvidenceSha256: "4".repeat(64),
+    });
+    expect(await f.t.mutation(api.jobs.markVerifiedForDelivery, {
+      jobId: job._id, expectedAttempt: 1, specialistRunId: String(specialist.claim!.workerRunId),
+      result, verificationNote: note, reviewReceiptJson: receipt,
+      reviewReceiptSignature: "5".repeat(64), reviewReceiptKeyId: "test-key",
+      reviewDiffSha256: "3".repeat(64), resultDigest: sha256(result), evidenceDigest: sha256(note), workerToken: TOKEN,
+    })).toBe(false);
+    expect(await f.t.run(async (ctx) => ctx.db.query("reviewReceipts").collect())).toHaveLength(0);
+    expect(await f.t.run(async (ctx) => ctx.db.query("integrationAttempts").collect())).toHaveLength(0);
+  });
+
+  it("canonicalizes distinct cancelled receipts under mission control without accepting caller digests", async () => {
+    const f = await plannedGoal();
+    const specialists = await dispatch(f.t, 2, "cancel-specialist");
+    const byId = new Map(f.jobs.map((job) => [String(job._id), job]));
+    for (let index = 0; index < specialists.length; index += 1) {
+      const entry = specialists[index];
+      await review(f.t, byId.get(String(entry.reservation.jobId))!, String(entry.claim!.workerRunId), String(index + 6).repeat(40), String(index + 8).repeat(40));
+    }
+    expect(await f.t.mutation(api.goalMode.control, { id: f.missionId, action: "cancel", workerToken: TOKEN })).toBe(true);
+    const rows = await f.t.run(async (ctx) => ({
+      attempts: await ctx.db.query("integrationAttempts").collect(),
+      terminals: await ctx.db.query("integrationTerminalReceipts").collect(),
+    }));
+    expect(rows.attempts.every((row) => row.status === "cancelled" && row.terminalReceiptDigest)).toBe(true);
+    expect(rows.terminals).toHaveLength(2);
+    expect(new Set(rows.terminals.map((row) => row.receiptDigest)).size).toBe(2);
+    for (const terminal of rows.terminals) {
+      expect(terminal.outcome).toBe("cancelled");
+      expect(sha256(terminal.receiptJson)).toBe(terminal.receiptDigest);
+      expect(JSON.parse(terminal.receiptJson)).toMatchObject({ terminal: { outcome: "cancelled" } });
+    }
+  });
+
   it("eliminates the shared goal branch bug and serializes exact attributed receipts", async () => {
     const f = await plannedGoal();
     expect(new Set(f.jobs.map((job) => job.workerBranch)).size).toBe(2);
@@ -145,38 +228,44 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(new Set(integrations.map((row) => row.reviewedHeadSha))).toEqual(new Set(["6".repeat(40), "7".repeat(40)]));
 
     const controllers = await dispatch(f.t, 2, "controller");
-    expect(controllers).toHaveLength(2);
-    const controllerByJob = new Map(controllers.map((entry) => [String(entry.reservation.jobId), entry]));
+    expect(controllers).toHaveLength(1);
     const first = integrations[0];
     const second = integrations[1];
-    const claimArgs = (row: any, suffix: string) => ({
-      id: row._id, controllerRunId: String(controllerByJob.get(String(row.jobId))!.claim!.deliveryRunId),
+    expect(String(controllers[0].reservation.jobId)).toBe(String(first.jobId));
+    const claimArgs = (row: any, controller: any, suffix: string) => ({
+      id: row._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: `owner-${suffix}`, leaseToken: `lease-${suffix}`, workerToken: TOKEN,
     });
-    const [firstClaim, competingClaim] = await Promise.all([
-      f.t.mutation(api.goalIntegration.claim, claimArgs(first, "one")),
-      f.t.mutation(api.goalIntegration.claim, claimArgs(second, "two")),
-    ]);
+    const firstClaim = await f.t.mutation(api.goalIntegration.claim, claimArgs(first, controllers[0], "one"));
     expect(firstClaim).not.toBeNull();
-    expect(competingClaim).toBeNull();
+    const queuedBefore = await f.t.run(async (ctx) => ctx.db.get(second.jobId));
+    expect(queuedBefore).toMatchObject({ status: "pending", integrationState: "provider_waiting", deliveryGeneration: 1 });
+    expect((queuedBefore as any)?.deliveryRunId).toBeUndefined();
 
     const finishIntegration = async (row: any, claim: any, head: string, tree: string, suffix: string) => {
       const fence = { id: row._id, controllerRunId: claim.controllerRunId, leaseOwner: claim.leaseOwner,
         leaseToken: claim.leaseToken, leaseVersion: claim.leaseVersion, workerToken: TOKEN };
       const effectId = `effect-${suffix}`;
       expect(await f.t.mutation(api.goalIntegration.prepare, {
-        ...fence, effectId, expectedIntegrationBaseSha: claim.expectedIntegrationBaseSha,
+        ...fence, effectId, effectKind: "update_ref", provider: "github",
+        providerIdentity: `repo-node:refs/heads/${claim.integrationBranch}`, providerMethod: "POST",
+        providerTarget: "https://api.github.com/graphql#updateRefs", requestDigest: "9".repeat(64),
+        expectedIntegrationRefSha: claim.expectedIntegrationRefSha,
         preparedIntegrationHeadSha: head, preparedIntegrationTreeSha: tree,
       })).toMatchObject({ replay: false });
       expect(await f.t.mutation(api.goalIntegration.observe, {
         ...fence, effectId, observation: "applied", providerHeadSha: head,
+        providerResponse: JSON.stringify({ data: { updateRefs: { clientMutationId: effectId } } }),
       })).toBe(true);
       expect(await f.t.mutation(api.goalIntegration.complete, {
-        ...fence, effectId, terminalReceiptDigest: sha256(`${row._id}:${head}`),
+        ...fence, effectId,
       })).toBe(true);
     };
     await finishIntegration(first, firstClaim, "a".repeat(40), "b".repeat(40), "one");
-    const secondClaim = await f.t.mutation(api.goalIntegration.claim, claimArgs(second, "two-retry"));
+    const secondControllers = await dispatch(f.t, 2, "controller-two");
+    expect(secondControllers).toHaveLength(1);
+    expect(String(secondControllers[0].reservation.jobId)).toBe(String(second.jobId));
+    const secondClaim = await f.t.mutation(api.goalIntegration.claim, claimArgs(second, secondControllers[0], "two-retry"));
     expect(secondClaim).toMatchObject({ expectedIntegrationBaseSha: "a".repeat(40) });
     await finishIntegration(second, secondClaim, "c".repeat(40), "d".repeat(40), "two");
 
@@ -184,12 +273,23 @@ describe("real Convex multi-agent workspace and integration races", () => {
       mission: await ctx.db.get(f.missionId), jobs: await ctx.db.query("jobs").withIndex("by_mission", (q) => q.eq("missionId", String(f.missionId))).collect(),
       attempts: await ctx.db.query("workAttempts").collect(), receipts: await ctx.db.query("workReceipts").collect(),
       integrationRows: await ctx.db.query("integrationAttempts").collect(),
+      terminalReceipts: await ctx.db.query("integrationTerminalReceipts").collect(),
     }));
     expect((final.mission as any)?.integrationHeadSha).toBe("c".repeat(40));
     expect(final.jobs.filter((job) => job.goalStage === "building").every((job) => job.status === "done" && job.integrationState === "integrated")).toBe(true);
     expect(final.attempts).toHaveLength(2); // delivery never reran either specialist
     expect(final.receipts).toHaveLength(2);
     expect(final.integrationRows.map((row) => row.status)).toEqual(["integrated", "integrated"]);
+    expect(final.terminalReceipts).toHaveLength(2);
+    for (const terminal of final.terminalReceipts) {
+      expect(sha256(terminal.receiptJson)).toBe(terminal.receiptDigest);
+      const canonical = JSON.parse(terminal.receiptJson);
+      expect(canonical).toMatchObject({ outcome: "integrated", review: { digest: expect.stringMatching(/^[0-9a-f]{64}$/) } });
+      expect(canonical.providerEffects[0]).toMatchObject({ kind: "update_ref", observation: "applied" });
+      expect(terminal.receiptDigest).not.toBe(canonical.review.digest);
+      expect(terminal.receiptJson).not.toContain("lease-one");
+      expect(terminal.receiptJson).not.toContain("lease-two-retry");
+    }
 
     expect(await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN })).toMatchObject({ kind: "advanced", phase: "validating" });
     const validator = await f.t.run(async (ctx) => (await ctx.db.query("jobs")
@@ -213,6 +313,99 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(((await f.t.run(async (ctx) => ctx.db.get(f.missionId))) as any)?.status).toBe("done");
   });
 
+  it("reconciles an unknown provider observation and rechecks the authoritative head at completion", async () => {
+    const f = await plannedGoal();
+    const specialists = await dispatch(f.t, 2, "lost-specialist");
+    const byId = new Map(f.jobs.map((job) => [String(job._id), job]));
+    for (let index = 0; index < specialists.length; index += 1) {
+      const entry = specialists[index];
+      await review(f.t, byId.get(String(entry.reservation.jobId))!, String(entry.claim!.workerRunId), String(index + 6).repeat(40), String(index + 8).repeat(40));
+    }
+    const [controller] = await dispatch(f.t, 2, "lost-controller");
+    const integration = (await f.t.run(async (ctx) => ctx.db.query("integrationAttempts").collect()))
+      .sort((left, right) => left.generation - right.generation)[0];
+    const claim = await f.t.mutation(api.goalIntegration.claim, {
+      id: integration._id, controllerRunId: String(controller.claim!.deliveryRunId),
+      leaseOwner: "lost-owner", leaseToken: "lost-secret-token", workerToken: TOKEN,
+    });
+    const fence = { id: integration._id, controllerRunId: claim!.controllerRunId, leaseOwner: claim!.leaseOwner,
+      leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
+    const effectId = "lost-update-ref";
+    const prepareArgs = {
+      ...fence, effectId, effectKind: "update_ref" as const, provider: "github" as const,
+      providerIdentity: "repo-node:refs/heads/integration", providerMethod: "POST" as const,
+      providerTarget: "https://api.github.com/graphql#updateRefs", requestDigest: "9".repeat(64),
+      expectedIntegrationRefSha: claim!.expectedIntegrationRefSha,
+      preparedIntegrationHeadSha: "a".repeat(40), preparedIntegrationTreeSha: "b".repeat(40),
+    };
+    expect(await f.t.mutation(api.goalIntegration.prepare, prepareArgs)).toMatchObject({ replay: false });
+    expect(await f.t.mutation(api.goalIntegration.observe, {
+      ...fence, effectId, observation: "unknown", providerResponse: "network:ambiguous",
+    })).toBe(true);
+    expect(await f.t.mutation(api.goalIntegration.prepare, prepareArgs)).toMatchObject({ replay: true, observation: "unknown" });
+    expect(await f.t.mutation(api.goalIntegration.complete, { ...fence, effectId })).toBe(false);
+    expect(await f.t.mutation(api.goalIntegration.observe, {
+      ...fence, effectId, observation: "applied", providerHeadSha: "a".repeat(40),
+      providerResponse: "reconciled:exact-ref",
+    })).toBe(true);
+    await f.t.run(async (ctx) => ctx.db.patch(f.missionId, { integrationHeadSha: "f".repeat(40) }));
+    expect(await f.t.mutation(api.goalIntegration.complete, { ...fence, effectId })).toBe(false);
+    await f.t.run(async (ctx) => ctx.db.patch(f.missionId, { integrationHeadSha: undefined }));
+    expect(await f.t.mutation(api.goalIntegration.complete, { ...fence, effectId })).toBe(true);
+    const terminal = (await f.t.run(async (ctx) => ctx.db.query("integrationTerminalReceipts").collect()))[0];
+    expect(terminal.receiptJson).not.toContain("lost-secret-token");
+    expect(JSON.parse(terminal.receiptJson).providerEffects).toEqual([
+      expect.objectContaining({ effectId, observation: "applied", providerResponse: "reconciled:exact-ref" }),
+    ]);
+  });
+
+  it("charges only genuine ambiguous provider retries and emits an exhausted terminal receipt", async () => {
+    const f = await plannedGoal();
+    const specialists = await dispatch(f.t, 2, "retry-specialist");
+    const byId = new Map(f.jobs.map((job) => [String(job._id), job]));
+    for (let index = 0; index < specialists.length; index += 1) {
+      const entry = specialists[index];
+      await review(f.t, byId.get(String(entry.reservation.jobId))!, String(entry.claim!.workerRunId), String(index + 6).repeat(40), String(index + 8).repeat(40));
+    }
+    const integrations = (await f.t.run(async (ctx) => ctx.db.query("integrationAttempts").collect()))
+      .sort((left, right) => left.generation - right.generation);
+    let [controller] = await dispatch(f.t, 2, "retry-controller-0");
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now());
+    for (let retry = 1; retry <= 7; retry += 1) {
+      const claim = await f.t.mutation(api.goalIntegration.claim, {
+        id: integrations[0]._id, controllerRunId: String(controller.claim!.deliveryRunId),
+        leaseOwner: `retry-owner-${retry}`, leaseToken: `retry-token-${retry}`, workerToken: TOKEN,
+      });
+      expect(claim).not.toBeNull();
+      expect(await f.t.mutation(api.goalIntegration.defer, {
+        id: integrations[0]._id, controllerRunId: claim!.controllerRunId,
+        leaseOwner: claim!.leaseOwner, leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion,
+        reasonCode: "provider_observation_pending", reason: "ambiguous response could not yet be reconciled", workerToken: TOKEN,
+      })).toBe(true);
+      if (retry < 7) {
+        vi.setSystemTime(Date.now() + 31 * 60_000);
+        const next = await dispatch(f.t, 2, `retry-controller-${retry}`);
+        expect(next).toHaveLength(1);
+        expect(String(next[0].reservation.jobId)).toBe(String(integrations[0].jobId));
+        controller = next[0];
+      }
+    }
+    const final = await f.t.run(async (ctx) => ({
+      integration: await ctx.db.get(integrations[0]._id), job: await ctx.db.get(integrations[0].jobId),
+      deliveries: await ctx.db.query("deliveryAttempts").collect(),
+      terminals: await ctx.db.query("integrationTerminalReceipts").collect(),
+      queuedSecond: await ctx.db.get(integrations[1].jobId),
+    }));
+    expect(final.integration).toMatchObject({ status: "exhausted", outcome: "exhausted", cumulativeRetries: 7 });
+    expect(final.job).toMatchObject({ status: "needs_input", integrationState: "exhausted", deliveryGeneration: 7 });
+    expect(final.deliveries.filter((row) => row.jobId === integrations[0].jobId)).toHaveLength(7);
+    expect(final.terminals).toHaveLength(1);
+    expect(final.terminals[0].outcome).toBe("exhausted");
+    expect(JSON.parse(final.terminals[0].receiptJson)).toMatchObject({ terminal: { outcome: "exhausted" } });
+    expect(final.queuedSecond).toMatchObject({ status: "pending", integrationState: "queued", deliveryGeneration: 1 });
+  });
+
   it("fences stale controllers and creates one focused conflict repair without replaying siblings", async () => {
     const f = await plannedGoal();
     const specialists = await dispatch(f.t, 2, "specialist");
@@ -232,7 +425,10 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const fence = { id: integration._id, controllerRunId: claim!.controllerRunId, leaseOwner: claim!.leaseOwner,
       leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
     expect(await f.t.mutation(api.goalIntegration.prepare, {
-      ...fence, effectId: "prepared", expectedIntegrationBaseSha: claim!.expectedIntegrationBaseSha,
+      ...fence, effectId: "prepared", effectKind: "update_ref", provider: "github",
+      providerIdentity: "repo-node:refs/heads/integration", providerMethod: "POST",
+      providerTarget: "https://api.github.com/graphql#updateRefs", requestDigest: "9".repeat(64),
+      expectedIntegrationRefSha: claim!.expectedIntegrationRefSha,
       preparedIntegrationHeadSha: "a".repeat(40), preparedIntegrationTreeSha: "b".repeat(40),
     })).toMatchObject({ replay: false });
     await f.t.run(async (ctx) => ctx.db.patch(f.missionId, { status: "paused" }));

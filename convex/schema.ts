@@ -620,6 +620,10 @@ export default defineSchema({
     sessionId: v.optional(v.string()),
     workerRunId: v.optional(v.string()),
     dispatchId: v.optional(v.string()),
+    parentAttempt: v.optional(v.number()),
+    sourceHeadSha: v.optional(v.string()),
+    parentCheckpointHeadSha: v.optional(v.string()),
+    checkpointHeadSha: v.optional(v.string()),
     // Immutable claim envelope. Exact Trigger redelivery returns this exact
     // snapshot and must never re-read changing dependencies.
     upstreamEvidence: v.optional(v.array(v.object({
@@ -669,11 +673,31 @@ export default defineSchema({
     leaseVersion: v.number(),
     leaseUntil: v.optional(v.number()),
     expectedIntegrationBaseSha: v.optional(v.string()),
+    // Exact persisted old ref identity for GitHub updateRefs. The zero OID is
+    // used only when the mission integration ref was intentionally absent.
+    expectedIntegrationRefSha: v.optional(v.string()),
     preparedEffectId: v.optional(v.string()),
     preparedIntegrationHeadSha: v.optional(v.string()),
     preparedIntegrationTreeSha: v.optional(v.string()),
     providerObservation: v.optional(v.string()),
     providerObservedHeadSha: v.optional(v.string()),
+    effects: v.optional(v.array(v.object({
+      effectId: v.string(),
+      effectKind: v.string(),
+      provider: v.string(),
+      providerIdentity: v.string(),
+      providerMethod: v.string(),
+      providerTarget: v.string(),
+      requestDigest: v.string(),
+      expectedBaseSha: v.optional(v.string()),
+      headSha: v.string(),
+      treeSha: v.string(),
+      preparedAt: v.number(),
+      observation: v.optional(v.string()),
+      providerHeadSha: v.optional(v.string()),
+      providerResponse: v.optional(v.string()),
+      observedAt: v.optional(v.number()),
+    }))),
     outcome: v.optional(v.string()),
     retryReason: v.optional(v.string()),
     cumulativeRetries: v.number(),
@@ -687,6 +711,21 @@ export default defineSchema({
     .index("by_mission_generation", ["missionId", "generation"])
     .index("by_job_attempt", ["jobId", "workAttempt"])
     .index("by_status_created", ["status", "createdAt"]),
+
+  // Full canonical integration terminal evidence is cold and append-only.
+  // Hot mission/job/attempt rows retain only outcome and digest pointers.
+  integrationTerminalReceipts: defineTable({
+    missionId: v.id("missions"),
+    jobId: v.id("jobs"),
+    integrationAttemptId: v.id("integrationAttempts"),
+    outcome: v.string(),
+    receiptJson: v.string(),
+    receiptDigest: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_attempt", ["integrationAttemptId"])
+    .index("by_mission", ["missionId", "createdAt"])
+    .index("by_digest", ["receiptDigest"]),
 
   // Controller delivery has its own durable lease lineage.  It deliberately
   // points at an immutable specialist attempt rather than reusing that
@@ -758,6 +797,7 @@ export default defineSchema({
     createdAt: v.number(),
     updatedAt: v.number(),
   })
+    .index("by_job", ["jobId", "generation"])
     .index("by_job_source_generation", ["jobId", "sourceWorkAttempt", "generation"])
     .index("by_status_heartbeat", ["status", "heartbeatAt"]),
 

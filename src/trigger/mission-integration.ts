@@ -1,17 +1,54 @@
+export const ZERO_OID = "0".repeat(40);
+
 export type IntegrationReceipt = Readonly<{
+  integrationAttemptId: string;
   workerBranch: string;
   reviewedHeadSha: string;
   reviewedHeadTreeSha: string;
   expectedIntegrationBaseSha: string;
+  expectedIntegrationRefSha: string;
   integrationBranch: string;
   generation: number;
 }>;
 
+export type ProviderEffect = Readonly<{
+  effectId: string;
+  kind: "stage_blob" | "stage_tree" | "stage_commit" | "update_ref";
+  provider: "github";
+  providerIdentity: string;
+  method: "POST";
+  target: string;
+  requestDigest: string;
+  expectedBaseSha?: string;
+  headSha: string;
+  treeSha: string;
+}>;
+
+export type ProviderObservation = Readonly<{
+  effectId: string;
+  observation: "applied" | "not_applied" | "unknown";
+  providerHeadSha?: string;
+  providerResponse?: string;
+}>;
+
 export type PreparedIntegration = Readonly<{
-  status: "clean" | "conflict";
+  status: "clean" | "conflict" | "stale" | "deferred";
   headSha?: string;
   treeSha?: string;
+  synthetic?: boolean;
+  candidate?: unknown;
   reason?: string;
+}>;
+
+export type ProviderWriteResult = Readonly<{
+  outcome: "applied" | "not_applied" | "unknown";
+  providerHeadSha?: string;
+  providerResponse?: string;
+}>;
+
+export type IntegrationHooks = Readonly<{
+  prepare(effect: ProviderEffect): Promise<{ replay: boolean; observation?: string | null } | null>;
+  observe(observation: ProviderObservation): Promise<boolean>;
 }>;
 
 export type IntegrationAdapter = Readonly<{
@@ -22,96 +59,134 @@ export type IntegrationAdapter = Readonly<{
     workerTreeSha: string;
     generation: number;
   }): Promise<PreparedIntegration>;
-  advanceRef(input: {
+  stageCandidate(prepared: PreparedIntegration, hooks: IntegrationHooks): Promise<ProviderWriteResult>;
+  prepareRefEffect(input: {
+    effectId: string;
     branch: string;
     expectedBaseSha: string;
     newHeadSha: string;
-  }): Promise<"applied" | "not_applied" | "unknown">;
-}>;
-
-export type IntegrationHooks = Readonly<{
-  prepare(input: { effectId: string; expectedBaseSha: string; headSha: string; treeSha: string }): Promise<{ replay: boolean; observation?: string | null } | null>;
-  observe(input: { effectId: string; observation: "applied" | "not_applied" | "unknown"; providerHeadSha?: string }): Promise<boolean>;
+    treeSha: string;
+  }): Promise<ProviderEffect>;
+  advanceRef(input: {
+    effectId: string;
+    branch: string;
+    expectedBaseSha: string;
+    newHeadSha: string;
+  }): Promise<ProviderWriteResult>;
 }>;
 
 export type IntegrationResult =
   | { status: "integrated"; effectId: string; headSha: string; treeSha: string }
   | { status: "conflict" | "stale" | "pending"; reason: string };
 
+function expectedObservedRef(expected: string) {
+  return expected === ZERO_OID ? null : expected;
+}
+
 /**
- * Provider writes occur only after a durable preparation. Every ambiguous
- * response is reconciled by exact ref observation before a retry. The adapter
- * must use a non-force update, making expectedBaseSha the compare-and-set
- * precondition even if another writer exists outside the controller lease.
+ * Every GitHub write crosses its own durable prepare/observe boundary. A
+ * synthetic object is staged before the final updateRefs compare-and-set;
+ * response-loss recovery observes exact immutable identities before retrying.
  */
 export async function integrateReviewedWorker(
   receipt: IntegrationReceipt,
   adapter: IntegrationAdapter,
   hooks: IntegrationHooks,
 ): Promise<IntegrationResult> {
-  const workerHead = await adapter.readRef(receipt.workerBranch);
-  if (workerHead !== receipt.reviewedHeadSha) {
-    return { status: "stale", reason: `reviewed worker head moved: expected ${receipt.reviewedHeadSha}, observed ${workerHead ?? "missing"}` };
-  }
-  const observedIntegration = await adapter.readRef(receipt.integrationBranch);
-  const integrationBase = receipt.expectedIntegrationBaseSha;
-  const merged = await adapter.prepareMerge({
-    integrationBaseSha: integrationBase,
-    workerHeadSha: receipt.reviewedHeadSha,
-    workerTreeSha: receipt.reviewedHeadTreeSha,
-    generation: receipt.generation,
-  });
-  if (merged.status === "conflict" || !merged.headSha || !merged.treeSha) {
-    return { status: "conflict", reason: merged.reason ?? "worker receipt conflicts with the current integration head" };
-  }
-  const effectId = `integrate:${receipt.integrationBranch}:${integrationBase}:${merged.headSha}`;
-  const prepared = await hooks.prepare({ effectId, expectedBaseSha: integrationBase, headSha: merged.headSha, treeSha: merged.treeSha });
-  if (!prepared) return { status: "pending", reason: "integration effect was not durably prepared" };
+  try {
+    const workerHead = await adapter.readRef(receipt.workerBranch);
+    if (workerHead !== receipt.reviewedHeadSha) {
+      return { status: "stale", reason: `reviewed worker head moved: expected ${receipt.reviewedHeadSha}, observed ${workerHead ?? "missing"}` };
+    }
+    const expectedRef = expectedObservedRef(receipt.expectedIntegrationRefSha);
+    const observedIntegration = await adapter.readRef(receipt.integrationBranch);
+    if (observedIntegration !== expectedRef) {
+      return { status: "stale", reason: `integration ref changed: expected ${expectedRef ?? "absent"}, observed ${observedIntegration ?? "absent"}` };
+    }
+    const merged = await adapter.prepareMerge({
+      integrationBaseSha: receipt.expectedIntegrationBaseSha,
+      workerHeadSha: receipt.reviewedHeadSha,
+      workerTreeSha: receipt.reviewedHeadTreeSha,
+      generation: receipt.generation,
+    });
+    if (merged.status === "conflict") return { status: "conflict", reason: merged.reason ?? "semantic merge conflict" };
+    if (merged.status === "stale") return { status: "stale", reason: merged.reason ?? "reviewed worker identity changed" };
+    if (merged.status === "deferred" || !merged.headSha || !merged.treeSha) {
+      return { status: "pending", reason: merged.reason ?? "integration sandbox could not prepare the exact merge" };
+    }
 
-  // Crash/response-loss recovery always observes before considering another
-  // write. An exact prepared head is the only adoptable external state.
-  if (prepared.replay) {
-    const current = observedIntegration === merged.headSha
-      ? observedIntegration
-      : await adapter.readRef(receipt.integrationBranch);
-    if (current === merged.headSha) {
-      await hooks.observe({ effectId, observation: "applied", providerHeadSha: current });
+    if (merged.synthetic) {
+      const staged = await adapter.stageCandidate(merged, hooks);
+      if (staged.outcome !== "applied" || staged.providerHeadSha !== merged.headSha) {
+        return { status: "pending", reason: "synthetic integration object is not yet durably observable at its exact identity" };
+      }
+    }
+
+    const effectId = `update-ref:${receipt.integrationAttemptId}:${receipt.integrationBranch}:${receipt.expectedIntegrationRefSha}:${merged.headSha}`;
+    const effect = await adapter.prepareRefEffect({
+      effectId,
+      branch: receipt.integrationBranch,
+      expectedBaseSha: receipt.expectedIntegrationRefSha,
+      newHeadSha: merged.headSha,
+      treeSha: merged.treeSha,
+    });
+    const prepared = await hooks.prepare(effect);
+    if (!prepared) return { status: "pending", reason: "final ref effect was not durably prepared" };
+
+    if (prepared.replay) {
+      if (prepared.observation === "not_applied") {
+        return { status: "stale", reason: "the prepared GitHub updateRefs CAS was already rejected" };
+      }
+      const current = await adapter.readRef(receipt.integrationBranch);
+      if (current === merged.headSha) {
+        await hooks.observe({ effectId, observation: "applied", providerHeadSha: current, providerResponse: "reconciled:exact-ref" });
+        return { status: "integrated", effectId, headSha: merged.headSha, treeSha: merged.treeSha };
+      }
+      if (current !== expectedRef) {
+        return { status: "stale", reason: `prepared updateRefs CAS lost: observed ${current ?? "absent"}` };
+      }
+    }
+
+    const workerImmediatelyBefore = await adapter.readRef(receipt.workerBranch);
+    const integrationImmediatelyBefore = await adapter.readRef(receipt.integrationBranch);
+    if (workerImmediatelyBefore !== receipt.reviewedHeadSha) {
+      return { status: "stale", reason: "worker head moved after durable preparation" };
+    }
+    if (integrationImmediatelyBefore !== expectedRef) {
+      return { status: "stale", reason: "integration ref changed after durable preparation" };
+    }
+    const outcome = await adapter.advanceRef({
+      effectId,
+      branch: receipt.integrationBranch,
+      expectedBaseSha: receipt.expectedIntegrationRefSha,
+      newHeadSha: merged.headSha,
+    });
+    if (outcome.outcome === "applied") {
+      await hooks.observe({
+        effectId,
+        observation: "applied",
+        providerHeadSha: outcome.providerHeadSha ?? merged.headSha,
+        providerResponse: outcome.providerResponse,
+      });
       return { status: "integrated", effectId, headSha: merged.headSha, treeSha: merged.treeSha };
     }
-    if (current && current !== integrationBase) {
-      return { status: "stale", reason: `prepared integration lost compare-and-set: observed ${current}` };
+    if (outcome.outcome === "not_applied") {
+      await hooks.observe({ effectId, observation: "not_applied", providerResponse: outcome.providerResponse });
+      return { status: "stale", reason: "GitHub rejected the exact beforeOid/afterOid updateRefs compare-and-set" };
     }
+    const reconciled = await adapter.readRef(receipt.integrationBranch);
+    if (reconciled === merged.headSha) {
+      await hooks.observe({ effectId, observation: "applied", providerHeadSha: reconciled, providerResponse: outcome.providerResponse ?? "reconciled:response-loss" });
+      return { status: "integrated", effectId, headSha: merged.headSha, treeSha: merged.treeSha };
+    }
+    await hooks.observe({
+      effectId,
+      observation: "unknown",
+      providerHeadSha: reconciled ?? undefined,
+      providerResponse: outcome.providerResponse,
+    });
+    return { status: "pending", reason: "GitHub response was ambiguous and the exact prepared head is not observable" };
+  } catch (error) {
+    return { status: "pending", reason: `GitHub integration observation failed closed: ${String(error instanceof Error ? error.message : error).slice(0, 500)}` };
   }
-  if (observedIntegration && observedIntegration !== integrationBase) {
-    return { status: "stale", reason: `integration base advanced: expected ${integrationBase}, observed ${observedIntegration}` };
-  }
-
-  const workerImmediatelyBefore = await adapter.readRef(receipt.workerBranch);
-  const integrationImmediatelyBefore = await adapter.readRef(receipt.integrationBranch);
-  if (workerImmediatelyBefore !== receipt.reviewedHeadSha) {
-    return { status: "stale", reason: "worker head moved after durable preparation" };
-  }
-  if (integrationImmediatelyBefore !== null && integrationImmediatelyBefore !== integrationBase) {
-    return { status: "stale", reason: "integration base advanced after durable preparation" };
-  }
-  const outcome = await adapter.advanceRef({
-    branch: receipt.integrationBranch,
-    expectedBaseSha: integrationBase,
-    newHeadSha: merged.headSha,
-  });
-  if (outcome === "applied") {
-    await hooks.observe({ effectId, observation: "applied", providerHeadSha: merged.headSha });
-    return { status: "integrated", effectId, headSha: merged.headSha, treeSha: merged.treeSha };
-  }
-  if (outcome === "not_applied") {
-    await hooks.observe({ effectId, observation: "not_applied" });
-    return { status: "stale", reason: "provider rejected the non-force compare-and-set ref update" };
-  }
-  const reconciled = await adapter.readRef(receipt.integrationBranch);
-  if (reconciled === merged.headSha) {
-    await hooks.observe({ effectId, observation: "applied", providerHeadSha: reconciled });
-    return { status: "integrated", effectId, headSha: merged.headSha, treeSha: merged.treeSha };
-  }
-  await hooks.observe({ effectId, observation: "unknown", providerHeadSha: reconciled ?? undefined });
-  return { status: "pending", reason: "provider response was lost and the exact prepared head is not yet observable" };
 }

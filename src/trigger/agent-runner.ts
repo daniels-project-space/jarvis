@@ -72,7 +72,8 @@ import {
   type GitReviewEnvelope,
 } from "./git-review-receipt";
 import { repositoryDeliveryReadiness, trustedGitReviewReceiptAuthority, verifyGitReviewReceiptEnvelope } from "./git-review-authority";
-import { integrateReviewedWorker, type IntegrationAdapter } from "./mission-integration";
+import { integrateReviewedWorker } from "./mission-integration";
+import { createGitHubIntegrationAdapter } from "./github-integration-adapter";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -980,10 +981,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               leaseToken: integrationToken,
             }).catch(() => null);
             if (!claimed) {
-              await deliveryMutation("jobs:checkpointAndRequeue", {
+              await deliveryMutation("jobs:releaseIntegrationQueueWait", {
                 jobId: job.jobId, expectedAttempt,
-                checkpoint: "Another fenced controller generation owns the mission integration queue. Resume this exact reviewed receipt after that lease completes.",
-                result: String(job.result ?? "").slice(0, 4_000), branch: resumeBranch, delayMs: 30_000,
               }).catch(() => null);
               return;
             }
@@ -1010,64 +1009,41 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             await sh("git", ["-C", integrationDir, "config", "user.name", "JARVIS integration controller"], env);
             const runIntegrationGit = (args: string[], commandEnv: NodeJS.ProcessEnv = gitEnv) =>
               sh("git", ["-C", integrationDir, ...args], commandEnv);
-            const readRef = async (name: string) => {
-              const ref = await runIntegrationGit(["ls-remote", remote, `refs/heads/${name}`]);
-              return ref.code === 0 ? ref.out.trim().split(/\s+/)[0] || null : null;
-            };
-            const adapter: IntegrationAdapter = {
-              readRef,
-              prepareMerge: async ({ integrationBaseSha, workerHeadSha, workerTreeSha, generation }) => {
-                const fetchedWorker = await runIntegrationGit(["fetch", "--no-tags", remote, `refs/heads/${claimed.workerBranch}`]);
-                if (fetchedWorker.code !== 0) return { status: "conflict", reason: "reviewed worker ref could not be materialized" };
-                const fetchedBase = await runIntegrationGit(["fetch", "--no-tags", remote, integrationBaseSha]);
-                if (fetchedBase.code !== 0) return { status: "conflict", reason: "integration base commit could not be materialized" };
-                const ancestor = await runIntegrationGit(["merge-base", "--is-ancestor", integrationBaseSha, workerHeadSha]);
-                if (ancestor.code === 0) return { status: "clean", headSha: workerHeadSha, treeSha: workerTreeSha };
-                const merged = await runIntegrationGit(["merge-tree", "--write-tree", integrationBaseSha, workerHeadSha]);
-                if (merged.code !== 0) return { status: "conflict", reason: merged.out.slice(-800) || "semantic merge conflict" };
-                const treeSha = merged.out.trim().split(/\s+/)[0];
-                if (!/^[0-9a-f]{40,64}$/i.test(treeSha)) return { status: "conflict", reason: "sandbox did not produce an exact merge tree" };
-                const fixedDate = new Date(Number(claimed.createdAt ?? Date.now())).toISOString();
-                const commit = await runIntegrationGit(
-                  ["commit-tree", treeSha, "-p", integrationBaseSha, "-p", workerHeadSha, "-m", `JARVIS integration generation ${generation}`],
-                  { ...gitEnv, GIT_AUTHOR_DATE: fixedDate, GIT_COMMITTER_DATE: fixedDate },
-                );
-                const headSha = commit.out.trim().split(/\s+/)[0];
-                return /^[0-9a-f]{40,64}$/i.test(headSha)
-                  ? { status: "clean", headSha, treeSha }
-                  : { status: "conflict", reason: "sandbox could not create the deterministic merge commit" };
-              },
-              advanceRef: async ({ branch: target, newHeadSha }) => {
-                const pushed = await runIntegrationGit(["push", remote, `${newHeadSha}:refs/heads/${target}`]);
-                if (pushed.code === 0) return "applied";
-                const observed = await readRef(target);
-                return observed === newHeadSha ? "unknown" : "not_applied";
-              },
-            };
+            const adapter = createGitHubIntegrationAdapter({
+              repository: repo,
+              remote,
+              workerBranch: String(claimed.workerBranch),
+              integrationAttemptId: String(job.integrationAttemptId),
+              createdAt: Number(claimed.createdAt ?? Date.now()),
+              token: String(token),
+              runGit: runIntegrationGit,
+              gitEnv,
+            });
             const result = await integrateReviewedWorker({
+              integrationAttemptId: String(job.integrationAttemptId),
               workerBranch: String(claimed.workerBranch), reviewedHeadSha: String(claimed.reviewedHeadSha),
               reviewedHeadTreeSha: String(claimed.reviewedHeadTreeSha),
               expectedIntegrationBaseSha: String(claimed.expectedIntegrationBaseSha),
+              expectedIntegrationRefSha: String(claimed.expectedIntegrationRefSha),
               integrationBranch: String(claimed.integrationBranch), generation: Number(claimed.generation),
             }, adapter, {
               prepare: async (effect) => await convexMutation("goalIntegration:prepare", {
                 ...integrationFence, effectId: effect.effectId,
-                expectedIntegrationBaseSha: effect.expectedBaseSha,
+                effectKind: effect.kind, provider: effect.provider,
+                providerIdentity: effect.providerIdentity, providerMethod: effect.method,
+                providerTarget: effect.target, requestDigest: effect.requestDigest,
+                expectedIntegrationRefSha: effect.expectedBaseSha,
                 preparedIntegrationHeadSha: effect.headSha,
                 preparedIntegrationTreeSha: effect.treeSha,
               }).catch(() => null) as any,
               observe: async (observation) => Boolean(await convexMutation("goalIntegration:observe", {
                 ...integrationFence, effectId: observation.effectId, observation: observation.observation,
-                providerHeadSha: observation.providerHeadSha,
+                providerHeadSha: observation.providerHeadSha, providerResponse: observation.providerResponse,
               }).catch(() => false)),
             });
             if (result.status === "integrated") {
               const completed = await convexMutation("goalIntegration:complete", {
                 ...integrationFence, effectId: result.effectId,
-                terminalReceiptDigest: sha256(JSON.stringify({
-                  integrationAttemptId: String(job.integrationAttemptId), receipt: job.reviewReceiptDigest,
-                  base: claimed.expectedIntegrationBaseSha, head: result.headSha, tree: result.treeSha,
-                })),
               }).catch(() => false);
               if (completed) await drainGoalAdvances();
               return;
@@ -1210,6 +1186,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           return;
         }
         let baseSha = "";
+        let reviewBaseSha = "";
         let cloneFailed = false;
         let cloneFailureReason = "";
         let checkoutSourceBranch = "";
@@ -1265,10 +1242,27 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               context = `${cloneFailureReason} Do not inspect the incomplete checkout or pretend repository work was performed.`;
             } else {
               baseSha = (await sh("git", ["-C", dir, "rev-parse", "HEAD"], env)).out.trim();
-              if (job.sourceHeadSha && checkoutSourceBranch === job.sourceBranch && baseSha !== job.sourceHeadSha) {
-                cloneFailed = true;
-                cloneFailureReason = `Pinned source head moved: expected ${job.sourceHeadSha}, observed ${baseSha || "missing"}.`;
-                context = `${cloneFailureReason} Do not validate a moving integration branch.`;
+              if (job.sourceHeadSha) {
+                const sourceHeadSha = String(job.sourceHeadSha);
+                let sourceExists = await sh("git", ["-C", dir, "cat-file", "-e", `${sourceHeadSha}^{commit}`], env);
+                if (sourceExists.code !== 0) {
+                  const hydratedSource = await sh("git", ["-C", dir, "fetch", "--no-tags", url, sourceHeadSha], gitEnv);
+                  sourceExists = hydratedSource.code === 0
+                    ? await sh("git", ["-C", dir, "cat-file", "-e", `${sourceHeadSha}^{commit}`], env)
+                    : { code: hydratedSource.code, out: hydratedSource.out };
+                }
+                const cumulativeAncestry = sourceExists.code === 0
+                  ? await sh("git", ["-C", dir, "merge-base", "--is-ancestor", sourceHeadSha, baseSha], env)
+                  : { code: sourceExists.code, out: sourceExists.out };
+                if (sourceExists.code !== 0 || cumulativeAncestry.code !== 0) {
+                  cloneFailed = true;
+                  cloneFailureReason = cumulativeAncestry.code === 1
+                    ? `Worker checkpoint ${baseSha || "missing"} no longer descends from immutable source ${sourceHeadSha}.`
+                    : `Immutable source ${sourceHeadSha} could not be hydrated and verified: ${cumulativeAncestry.out.slice(-300)}`;
+                  context = `${cloneFailureReason} Do not review or replace this worker lineage.`;
+                } else {
+                  reviewBaseSha = sourceHeadSha;
+                }
               }
               if (!cloneFailed && !job.sourceHeadSha) {
                 const bound = await convexMutation("jobs:bindWorkspaceSource", {
@@ -1279,6 +1273,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                   cloneFailed = true;
                   cloneFailureReason = "The sandbox source identity could not be durably bound before execution.";
                   context = `${cloneFailureReason} Do not edit an untracked workspace.`;
+                } else {
+                  reviewBaseSha = baseSha;
                 }
               }
               const checkedOut = branch
@@ -1432,6 +1428,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         let pushFailed = false;
         let deliveryRetry = false;
         let deliveryDiffStat = "";
+        let checkpointHeadSha = "";
         if (repoDir && token && branch && !job.readonly) {
           const deliveryDir = repoDir;
           const pushUrl = githubRepoUrl(repo);
@@ -1444,8 +1441,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             env,
           );
           let local = (await sh("git", ["-C", deliveryDir, "rev-parse", "HEAD"], env)).out.trim();
-          if (baseSha && local && local !== baseSha) {
-            deliveryDiffStat = (await sh("git", ["-C", deliveryDir, "diff", "--stat", `${baseSha}..${local}`], env)).out
+          checkpointHeadSha = local;
+          if ((reviewBaseSha || baseSha) && local && local !== (reviewBaseSha || baseSha)) {
+            deliveryDiffStat = (await sh("git", ["-C", deliveryDir, "diff", "--stat", `${reviewBaseSha || baseSha}..${local}`], env)).out
               .trim()
               .slice(0, 1_500);
           }
@@ -1477,6 +1475,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 localSha: local,
               });
               local = reconciliation.localSha;
+              checkpointHeadSha = local;
               pushNote = reconciliation.note;
               if (reconciliation.status === "already_delivered") {
                 needsPush = false;
@@ -1529,6 +1528,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             jobId: job.jobId,
             expectedAttempt,
             checkpoint: continuationCheckpoint,
+            checkpointHeadSha: checkpointHeadSha || undefined,
             result: (run.timedOut ? continuationCheckpoint : result).slice(0, 4000),
             branch: branch ?? undefined,
             delayMs: run.timedOut ? 5_000 : failureBackoffMs(Number(job.attempt ?? 1)),
@@ -1562,6 +1562,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               deliveryDiffStat ? `Local diff summary to replay only if still missing:\n${deliveryDiffStat}` : "",
               continuationCheckpoint,
             ].filter(Boolean).join("\n\n").slice(0, 6_000),
+            checkpointHeadSha: checkpointHeadSha || undefined,
             result: result.slice(0, 4_000),
             branch,
             delayMs: 5_000,
@@ -1609,6 +1610,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               checkpoint:
                 `The investigation completed, but the machine contract was invalid: ${String(error).slice(0, 1_000)}\n` +
                 `Preserve the reasoning and return the required marker plus compact valid JSON. Do not redo discovery merely to repair formatting.`,
+              checkpointHeadSha: checkpointHeadSha || undefined,
               result: result.slice(0, 4_000),
               branch: branch ?? undefined,
               delayMs: 5_000,
@@ -1619,13 +1621,14 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           if (repoDir) {
             const receipt = await buildGitReviewReceipt({
               runGit: (args) => sh("git", ["-C", repoDir!, ...args], env), jobId: String(job.jobId), attempt: expectedAttempt,
-              repository: repo!, expectedBranch: branch || checkoutSourceBranch, baseSha,
+              repository: repo!, expectedBranch: branch || checkoutSourceBranch, baseSha: reviewBaseSha || baseSha,
               agentEvidence: cumulativeWorkEvidence(job.checkpoint, result), commands: run.commands,
             });
             if (!receipt.ok) {
               await convexMutation("jobs:checkpointAndRequeue", {
                 jobId: job.jobId, expectedAttempt,
                 checkpoint: `Goal evidence is complete, but the controller could not bind its immutable Git receipt: ${receipt.note}`,
+                checkpointHeadSha: checkpointHeadSha || undefined,
                 result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: failureBackoffMs(expectedAttempt),
               }).catch(() => null);
               return;
@@ -1635,6 +1638,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               await convexMutation("jobs:checkpointAndRequeue", {
                 jobId: job.jobId, expectedAttempt,
                 checkpoint: "Repository completion is held: the trusted controller receipt authority is unavailable. Do not rerun the specialist.",
+                checkpointHeadSha: checkpointHeadSha || undefined,
                 result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: failureBackoffMs(expectedAttempt),
               }).catch(() => null);
               return;
@@ -1649,6 +1653,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               await convexMutation("jobs:checkpointAndRequeue", {
                 jobId: job.jobId, expectedAttempt,
                 checkpoint: "Goal completion is held because its controller review receipt could not be persisted. Do not rerun the specialist.",
+                checkpointHeadSha: checkpointHeadSha || undefined,
                 result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: 30_000,
               }).catch(() => null);
               return;
@@ -1687,7 +1692,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             attempt: expectedAttempt,
             repository: repo,
             expectedBranch: branch || checkoutSourceBranch,
-            baseSha,
+            baseSha: reviewBaseSha || baseSha,
             agentEvidence: reviewEvidence,
             commands: run.commands,
           });
@@ -1701,6 +1706,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 "Preserve the existing branch and evidence; repair only this verification boundary on the next attempt.",
                 continuationCheckpoint,
               ].join("\n\n").slice(0, 6_000),
+              checkpointHeadSha: checkpointHeadSha || undefined,
               result: result.slice(0, 4_000),
               branch: branch ?? undefined,
               delayMs: failureBackoffMs(expectedAttempt),
@@ -1720,6 +1726,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             await convexMutation("jobs:checkpointAndRequeue", {
               jobId: job.jobId, expectedAttempt,
               checkpoint: "Repository delivery is held: the controller receipt signer is unavailable. Do not rerun the specialist.",
+              checkpointHeadSha: checkpointHeadSha || undefined,
               result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: failureBackoffMs(expectedAttempt),
             }).catch(() => null);
             return;
@@ -1755,6 +1762,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             checkpoint:
               `The specialist completed this evidence, but JARVIS's supervisor returned no valid verdict. ` +
               `Re-check the definition of done and preserve the existing work:\n${result.slice(0, 5000)}`,
+            checkpointHeadSha: checkpointHeadSha || undefined,
             result: result.slice(0, 4000),
             branch: branch ?? undefined,
             delayMs: failureBackoffMs(expectedAttempt),
@@ -1774,6 +1782,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             expectedAttempt,
             checkpoint:
               `Previous work:\n${result.slice(0, 4200)}\n\nJARVIS supervisor concern: ${verify.note || "The definition of done is not yet evidenced."}\nAddress this concern, re-run the relevant verification, and finish honestly.`,
+            checkpointHeadSha: checkpointHeadSha || undefined,
             result: result.slice(0, 4000),
             branch: branch ?? undefined,
             delayMs: 5_000,
@@ -1793,6 +1802,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             expectedAttempt,
             checkpoint:
               `Previous work:\n${result.slice(0, 4200)}\n\nThe specialist stopped on: ${verify.note}\nJARVIS's supervisor decision: ${verify.answer}\nContinue and finish; do not ask Daniel this ordinary implementation question again.`,
+            checkpointHeadSha: checkpointHeadSha || undefined,
             result: result.slice(0, 4000),
             branch: branch ?? undefined,
             delayMs: 5_000,
@@ -1862,6 +1872,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             await convexMutation("jobs:checkpointAndRequeue", {
             jobId: job.jobId, expectedAttempt, specialistRunId: String(job.workerRunId),
               checkpoint: "Supervisor verification passed, but the immutable controller review receipt could not be persisted. Do not rerun the specialist.",
+              checkpointHeadSha: checkpointHeadSha || undefined,
               result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: 30_000,
             }).catch(() => null);
             return;
