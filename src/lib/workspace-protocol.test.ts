@@ -11,6 +11,13 @@ describe("multi-agent workspace protocol", () => {
     expect(attemptWorkspaceKey(first.workspaceLineage, 1)).not.toBe(attemptWorkspaceKey(first.workspaceLineage, 2));
   });
 
+  it("does not collapse distinct immutable ids that normalize to the same label", () => {
+    const punctuation = workItemIdentity({ missionId: "goal-1", jobId: "job/a", workstreamId: "same", readonly: false });
+    const dash = workItemIdentity({ missionId: "goal-1", jobId: "job-a", workstreamId: "same", readonly: false });
+    expect(punctuation.workerBranch).not.toBe(dash.workerBranch);
+    expect(punctuation.workerBranch).toContain("6a6f622f61");
+  });
+
   it("assigns no writable ref to read-only work", () => {
     expect(workItemIdentity({ missionId: "goal-1", jobId: "audit", readonly: true }).workerBranch).toBeUndefined();
   });

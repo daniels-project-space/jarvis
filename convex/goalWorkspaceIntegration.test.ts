@@ -18,6 +18,28 @@ beforeEach(() => { process.env.JARVIS_WORKER_TOKEN = TOKEN; vi.useRealTimers(); 
 afterEach(() => { delete process.env.JARVIS_WORKER_TOKEN; vi.useRealTimers(); });
 
 async function plannedGoal() {
+  const { t, missionId } = await goalAwaitingPlan();
+  const plan = {
+    summary: "Two independent owned workstreams",
+    route: "existing_project",
+    primaryRepo: REPO,
+    assumptions: [],
+    workstreams: [
+      { id: "cj-durability", label: "CJ durability", task: "Implement the durable CJ catalogue boundary with real integration coverage.", agentId: "paul", repo: REPO, readonly: false, dependsOn: [], acceptanceCriteria: ["CJ tests pass"], mcp: ["context7"] },
+      { id: "content-metrics", label: "Content metrics", task: "Implement independent content metric persistence with exact attribution tests.", agentId: "paul", repo: REPO, readonly: false, dependsOn: [], acceptanceCriteria: ["Metrics tests pass"], mcp: ["context7"] },
+    ],
+    validation: { criteria: ["Integrated result works"], tests: ["npm test"], liveChecks: [] },
+  };
+  expect(await t.mutation(api.goalMode.recordPlan, {
+    id: missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
+  })).toMatchObject({ advanced: true, jobs: 2 });
+  const jobs = await t.run(async (ctx) => (await ctx.db.query("jobs")
+    .withIndex("by_mission", (q) => q.eq("missionId", String(missionId))).collect())
+    .filter((job) => job.goalStage === "building"));
+  return { t, missionId, jobs };
+}
+
+async function goalAwaitingPlan() {
   const t = convexTest(schema, modules);
   const created = await t.mutation(api.goalMode.create, {
     goal: "Make the Dropship catalogue and content metrics durable in parallel",
@@ -33,24 +55,7 @@ async function plannedGoal() {
     if (runtime) await ctx.db.patch(runtime._id, { updatedAt: Date.now() });
     expect(mission).not.toBeNull();
   });
-  const plan = {
-    summary: "Two independent owned workstreams",
-    route: "existing_project",
-    primaryRepo: REPO,
-    assumptions: [],
-    workstreams: [
-      { id: "cj-durability", label: "CJ durability", task: "Implement the durable CJ catalogue boundary with real integration coverage.", agentId: "paul", repo: REPO, readonly: false, dependsOn: [], acceptanceCriteria: ["CJ tests pass"], mcp: ["context7"] },
-      { id: "content-metrics", label: "Content metrics", task: "Implement independent content metric persistence with exact attribution tests.", agentId: "paul", repo: REPO, readonly: false, dependsOn: [], acceptanceCriteria: ["Metrics tests pass"], mcp: ["context7"] },
-    ],
-    validation: { criteria: ["Integrated result works"], tests: ["npm test"], liveChecks: [] },
-  };
-  expect(await t.mutation(api.goalMode.recordPlan, {
-    id: created.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
-  })).toMatchObject({ advanced: true, jobs: 2 });
-  const jobs = await t.run(async (ctx) => (await ctx.db.query("jobs")
-    .withIndex("by_mission", (q) => q.eq("missionId", String(created.missionId))).collect())
-    .filter((job) => job.goalStage === "building"));
-  return { t, missionId: created.missionId, jobs };
+  return { t, missionId: created.missionId };
 }
 
 async function dispatch(t: ReturnType<typeof convexTest>, count: number, prefix: string) {
@@ -86,6 +91,31 @@ async function review(t: ReturnType<typeof convexTest>, job: any, workerRunId: s
 }
 
 describe("real Convex multi-agent workspace and integration races", () => {
+  it("rejects invalid DAG authority records before dispatch creates a specialist", async () => {
+    const f = await goalAwaitingPlan();
+    const plan = (workstreams: Array<{ id: string; dependsOn: string[] }>) => ({ workstreams });
+    await expect(f.t.mutation(api.goalMode.recordPlan, {
+      id: f.missionId, expectedAdvanceAttempt: 1,
+      plan: plan([{ id: "same", dependsOn: [] }, { id: "same", dependsOn: [] }]), workerToken: TOKEN,
+    })).rejects.toThrow(/duplicate workstream id/);
+    await expect(f.t.mutation(api.goalMode.recordPlan, {
+      id: f.missionId, expectedAdvanceAttempt: 1,
+      plan: plan([{ id: "a", dependsOn: ["missing"] }, { id: "b", dependsOn: [] }]), workerToken: TOKEN,
+    })).rejects.toThrow(/unknown workstream/);
+    await expect(f.t.mutation(api.goalMode.recordPlan, {
+      id: f.missionId, expectedAdvanceAttempt: 1,
+      plan: plan([{ id: "a", dependsOn: ["b"] }, { id: "b", dependsOn: ["a"] }]), workerToken: TOKEN,
+    })).rejects.toThrow(/cycle/);
+    await expect(f.t.mutation(api.goalMode.recordPlan, {
+      id: f.missionId, expectedAdvanceAttempt: 1,
+      plan: plan(Array.from({ length: 5 }, (_, index) => ({ id: `fanout-${index}`, dependsOn: [] }))), workerToken: TOKEN,
+    })).rejects.toThrow(/budget/);
+    const buildJobs = await f.t.run(async (ctx) => (await ctx.db.query("jobs")
+      .withIndex("by_mission", (q) => q.eq("missionId", String(f.missionId))).collect())
+      .filter((job) => job.goalStage === "building"));
+    expect(buildJobs).toHaveLength(0);
+  });
+
   it("eliminates the shared goal branch bug and serializes exact attributed receipts", async () => {
     const f = await plannedGoal();
     expect(new Set(f.jobs.map((job) => job.workerBranch)).size).toBe(2);

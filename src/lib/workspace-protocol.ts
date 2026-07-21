@@ -5,6 +5,14 @@ const safe = (value: unknown, fallback: string, max = 32) =>
     .replace(/^-+|-+$/g, "")
     .slice(0, max) || fallback;
 
+// Ledger ids are already short ASCII tokens in production. Keep that exact
+// token in the ref instead of normalizing/truncating it: two distinct ids must
+// never collapse onto one writable branch. The hexadecimal fallback is a
+// lossless encoding for defensive callers with punctuation or Unicode ids.
+const immutableId = (value: string) => /^[A-Za-z0-9_-]{1,96}$/.test(value)
+  ? value
+  : Array.from(new TextEncoder().encode(value), (byte) => byte.toString(16).padStart(2, "0")).join("");
+
 export type WorkItemIdentity = Readonly<{
   workerBranch?: string;
   workspaceLineage: string;
@@ -24,7 +32,7 @@ export function workItemIdentity(args: {
   readonly: boolean;
 }): WorkItemIdentity {
   const mission = safe(args.missionId, "mission", 16);
-  const job = safe(args.jobId, "job", 24);
+  const job = immutableId(args.jobId);
   const stream = safe(args.workstreamId, "work", 24);
   const retryLineage = `job:${args.jobId}:lineage:1`;
   return {
