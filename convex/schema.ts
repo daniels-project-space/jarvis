@@ -404,6 +404,8 @@ export default defineSchema({
     .index("by_active_priority", ["active", "priority", "createdAt"])
     .index("by_visibility_status_priority", ["visibility", "status", "priority", "createdAt"])
     .index("by_thread_visibility_status_priority", ["originThreadId", "visibility", "status", "priority", "createdAt"])
+    .index("by_thread_visibility_active_priority", ["originThreadId", "visibility", "active", "priority", "createdAt"])
+    .index("by_plan_parent_generation_node", ["planParentMissionId", "planGeneration", "planNodeId"])
     .index("by_mission", ["missionId", "createdAt"]),
 
   // Orchestrated agent fleets: one mission = a decomposed goal running as

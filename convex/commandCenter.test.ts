@@ -1,214 +1,184 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
-  COMPACT_WORK_STATUSES,
-  selectCompactConversationWork,
+  ACTIVE_CANDIDATE_LIMIT,
+  FLEET_MAX_EDGES,
+  FLEET_MAX_NODES,
+  buildFleetSnapshot,
+  isUserRelevantWork,
+  selectRelevantWork,
   snapshot,
 } from "./commandCenter";
 
-const currentThread = "thread-current";
+const threadId = "thread-current";
 
 function runtime(overrides: Record<string, unknown> = {}) {
   return {
-    jobId: "job-active",
-    task: "Repair the current conversation request",
-    label: "Paul · current repair",
-    status: "running",
-    visibility: "conversation",
-    originThreadId: currentThread,
-    stage: "testing",
-    percent: 64,
-    priority: 80,
-    createdAt: 100,
+    jobId: "job-a", task: "Implement the requested surface", label: "Paul · fleet surface",
+    status: "running", visibility: "conversation", originThreadId: threadId,
+    stage: "testing", percent: 64, progress: "Running focused tests", progressAt: 120,
+    priority: 80, createdAt: 100, active: true, agentId: "paul", model: "terra",
+    reasoningEffort: "high", attempt: 1, maxAttempts: 12, steerRevision: 0,
     ...overrides,
   };
 }
 
-describe("commandCenter.snapshot contract", () => {
-  it("defines the exact thread-first active-work index", () => {
-    const schema = readFileSync(new URL("./schema.ts", import.meta.url), "utf8");
-    const jobRuntime = schema.slice(
-      schema.indexOf("jobRuntime: defineTable"),
-      schema.indexOf("missionRuntime: defineTable"),
-    );
+function planNodes(count = FLEET_MAX_NODES) {
+  return Array.from({ length: count }, (_, index) => ({
+    nodeId: String.fromCharCode(97 + index), jobId: `job-${String.fromCharCode(97 + index)}`,
+    label: `Node ${String.fromCharCode(65 + index)}`, agentId: index % 2 ? "atlas" : "paul",
+    repository: index < 4 ? "daniels-project-space/jarvis" : "daniels-project-space/project-hub",
+    dependencyCount: index,
+  }));
+}
 
-    expect(jobRuntime).toContain(
-      '.index("by_thread_visibility_status_priority", ["originThreadId", "visibility", "status", "priority", "createdAt"])',
-    );
+function completeEdges(count = FLEET_MAX_NODES) {
+  const nodes = planNodes(count);
+  return nodes.flatMap((target, targetIndex) => nodes.slice(0, targetIndex).map((source) => ({
+    edgeId: `${source.nodeId}->${target.nodeId}`, sourceNodeId: source.nodeId, targetNodeId: target.nodeId,
+    sourceJobId: source.jobId, targetJobId: target.jobId,
+  })));
+}
+
+function activities(count = FLEET_MAX_NODES) {
+  return planNodes(count).map((node, index) => runtime({
+    jobId: node.jobId, planNodeId: node.nodeId, status: index === 0 ? "running" : "pending",
+    label: node.label, agentId: node.agentId, dependsOn: planNodes(count).slice(0, index).map((item) => item.jobId),
+  }));
+}
+
+describe("commandCenter relevance and bounded projection", () => {
+  it.each([
+    { label: "Cloud health audit" },
+    { task: "Run the lease reaper" },
+    { stage: "control-plane migration" },
+    { label: "nightly cron job" },
+    { task: "background monitor sweep" },
+    { agentId: "execution reaper" },
+    { visibility: "system" },
+    { originThreadId: "another-thread" },
+  ])("excludes routine or out-of-thread work %#", (overrides) => {
+    expect(isUserRelevantWork(runtime(overrides), threadId)).toBe(false);
   });
 
-  it.each(COMPACT_WORK_STATUSES)("accepts current-conversation %s work", (status) => {
-    expect(selectCompactConversationWork([runtime({ status })], currentThread)).toEqual({
-      id: "job-active",
-      label: "Paul · current repair",
-      status,
-      stage: "testing",
-      percent: 64,
+  it.each(["pending", "dispatching", "running", "paused", "stalled", "needs_input", "awaiting_approval", "steering"])("includes user-relevant %s work", (status) => {
+    expect(isUserRelevantWork(runtime({ status }), threadId)).toBe(true);
+  });
+
+  it("prioritizes Daniel attention before runtime priority", () => {
+    const rows = selectRelevantWork([
+      runtime({ jobId: "running", priority: 100 }),
+      runtime({ jobId: "paused", status: "paused", priority: 10 }),
+      runtime({ jobId: "input", status: "needs_input", priority: 1 }),
+    ], threadId);
+    expect(rows.map((row) => row.jobId)).toEqual(["input", "paused", "running"]);
+  });
+
+  it("accepts exactly 8 nodes and 28 edges, then rejects either overflow", () => {
+    const input = { threadId, activeRows: [runtime()], nodes: planNodes(), edges: completeEdges(), activities: activities() };
+    const projected = buildFleetSnapshot(input);
+    expect(projected.fleet?.nodes).toHaveLength(8);
+    expect(projected.fleet?.edges).toHaveLength(28);
+    expect(() => buildFleetSnapshot({ ...input, nodes: planNodes(9) })).toThrow("8 nodes");
+    expect(() => buildFleetSnapshot({ ...input, edges: [...completeEdges(), { edgeId: "overflow", sourceNodeId: "a", targetNodeId: "b" }] })).toThrow("28 edges");
+  });
+
+  it("keeps topological DAG order stable across persisted row order", () => {
+    const nodes = planNodes(4);
+    const edges = [
+      { edgeId: "a->c", sourceNodeId: "a", targetNodeId: "c", sourceJobId: "job-a", targetJobId: "job-c" },
+      { edgeId: "b->c", sourceNodeId: "b", targetNodeId: "c", sourceJobId: "job-b", targetJobId: "job-c" },
+      { edgeId: "c->d", sourceNodeId: "c", targetNodeId: "d", sourceJobId: "job-c", targetJobId: "job-d" },
+    ];
+    const one = buildFleetSnapshot({ threadId, activeRows: [runtime()], nodes: [nodes[3], nodes[2], nodes[1], nodes[0]], edges: [...edges].reverse(), activities: activities(4) });
+    const two = buildFleetSnapshot({ threadId, activeRows: [runtime()], nodes, edges, activities: activities(4) });
+    expect(one.fleet?.nodes.map((node) => node.id)).toEqual(["a", "b", "c", "d"]);
+    expect(one.fleet?.nodes.map((node) => node.id)).toEqual(two.fleet?.nodes.map((node) => node.id));
+    expect(one.fleet?.edges.map((edge) => edge.id)).toEqual(["a->c", "b->c", "c->d"]);
+  });
+
+  it("projects typed handoff, recovery, integration, worker identity and honest controls without cold bytes", () => {
+    const result = buildFleetSnapshot({
+      threadId, activeRows: [runtime({ status: "needs_input" })],
+      mission: { missionId: "mission-1", goal: "Ship one surface", mode: "goal", status: "needs_input", phase: "blocked", percent: 62, planDigest: "digest", planGeneration: 3 },
+      nodes: planNodes(2), edges: completeEdges(2),
+      activities: [
+        runtime({ jobId: "job-a", status: "done", deliveryStatus: "merged", attempt: 2, steerRevision: 1, workerRuntime: "trigger" }),
+        runtime({ jobId: "job-b", status: "needs_input", integrationState: "needs_attention", stallReason: "Merge conflict needs a decision", approvalRequired: true, approvalStatus: "pending", risk: "high", task: "x".repeat(1000), log: "private", checkpoint: "private" }),
+      ],
+      handoffs: [{ sourceJobId: "job-a", sourceAttempt: 2, sourceSteerRevision: 1, planDigest: "digest" }],
     });
+    expect(result.active).toMatchObject({ needsDaniel: true, extraCount: 0 });
+    expect(result.fleet).toMatchObject({ planDigest: "digest", planGeneration: 3, attentionCount: 1 });
+    expect(result.fleet?.edges[0].readiness).toBe("delivered");
+    expect(result.fleet?.nodes[0]).toMatchObject({ attempt: 2, workerRuntime: "trigger", mergeState: "merged" });
+    expect(result.fleet?.nodes[1]).toMatchObject({ state: "needs_input", recoverySummary: "Merge conflict needs a decision" });
+    expect(result.fleet?.nodes[1].controls).not.toContain("approve");
+    expect(result.fleet?.nodes[1]).not.toHaveProperty("task");
+    expect(result.fleet?.nodes[1]).not.toHaveProperty("log");
+    expect(result.fleet?.nodes[1]).not.toHaveProperty("checkpoint");
   });
 
-  it.each([
-    "pending",
-    "paused",
-    "awaiting_approval",
-    "needs_input",
-    "done",
-    "error",
-    "cancelled",
-  ])("excludes the %s state", (status) => {
-    expect(selectCompactConversationWork([runtime({ status })], currentThread)).toBeNull();
+  it("shows approve/decline only for a persisted consequential gate", () => {
+    const result = buildFleetSnapshot({
+      threadId, activeRows: [runtime({ status: "awaiting_approval", approvalRequired: true, approvalStatus: "pending", risk: "consequential", deliveryMode: "manual" })],
+    });
+    expect(result.fleet?.nodes[0].controls).toEqual(expect.arrayContaining(["approve", "decline"]));
+  });
+});
+
+describe("commandCenter.snapshot indexed IO", () => {
+  it("defines the two exact hot indexes", () => {
+    const schema = readFileSync(new URL("./schema.ts", import.meta.url), "utf8");
+    const jobRuntime = schema.slice(schema.indexOf("jobRuntime: defineTable"), schema.indexOf("missions: defineTable"));
+    expect(jobRuntime).toContain('.index("by_thread_visibility_active_priority", ["originThreadId", "visibility", "active", "priority", "createdAt"])');
+    expect(jobRuntime).toContain('.index("by_plan_parent_generation_node", ["planParentMissionId", "planGeneration", "planNodeId"])');
   });
 
-  it.each([
-    ["system visibility", { visibility: "system" }],
-    ["another conversation", { originThreadId: "thread-other" }],
-    ["unowned legacy work", { originThreadId: undefined }],
-    ["a health-check label", { label: "Cloud health audit" }],
-    ["a health-check task", { task: "Routine provider health check" }],
-    ["a health-check stage", { stage: "stack polling sweep" }],
-  ])("excludes %s", (_case, overrides) => {
-    expect(selectCompactConversationWork([runtime(overrides)], currentThread)).toBeNull();
-  });
-
-  it("projects only the five fields rendered by the compact bar", () => {
-    const selected = selectCompactConversationWork([
-      runtime({
-        task: "t".repeat(600),
-        result: "private durable result",
-        log: "private live transcript",
-        checkpoint: "private checkpoint",
-        workerRunId: "run-1",
-        branch: "branch-1",
-      }),
-    ], currentThread);
-
-    expect(Object.keys(selected ?? {}).sort()).toEqual(["id", "label", "percent", "stage", "status"]);
-    expect(selected).not.toHaveProperty("task");
-    expect(selected).not.toHaveProperty("result");
-    expect(selected).not.toHaveProperty("log");
-    expect(selected).not.toHaveProperty("checkpoint");
-    expect(selected).not.toHaveProperty("workerRunId");
-    expect(selected).not.toHaveProperty("branch");
-  });
-
-  it("scopes reads to the requested or canonical active thread", async () => {
-    const reads: Array<{
-      table: string;
-      index?: string;
-      equalities: Record<string, unknown>;
-      order?: string;
-      limit?: number;
-      first?: boolean;
-    }> = [];
-    const rowsByStatus: Record<string, Array<Record<string, unknown>>> = {
-      running: [runtime({ jobId: "job-running", priority: 60 })],
-      dispatching: [runtime({ jobId: "job-dispatching", status: "dispatching", priority: 90 })],
-    };
-    type MockIndex = {
-      eq: (field: string, value: unknown) => MockIndex;
-    };
-    type MockBuilder = {
-      withIndex: (index: string, apply: (q: MockIndex) => unknown) => MockBuilder;
-      order: (direction: string) => MockBuilder;
-      take: (limit: number) => Promise<Array<Record<string, unknown>>>;
-      first: () => Promise<Record<string, unknown> | null>;
+  it("uses six bounded indexed reads for an exact persisted GoalPlan", async () => {
+    const reads: Array<{ table: string; index?: string; equalities: Record<string, unknown>; limit?: number; first?: boolean; order?: string }> = [];
+    const primary = runtime({ planParentMissionId: "mission-1" });
+    const responses: Record<string, any[]> = {
+      jobRuntime: [primary], goalPlanNodes: planNodes(2), goalPlanEdges: completeEdges(2),
+      goalHandoffs: [],
     };
     const ctx = {
-      auth: {
-        getUserIdentity: async () => ({
-          issuer: "https://jarvis-orcin-six.vercel.app",
-          subject: "daniel-owner",
-        }),
-      },
+      auth: { getUserIdentity: async () => ({ issuer: "https://jarvis-orcin-six.vercel.app", subject: "daniel-owner" }) },
       db: {
+        normalizeId: (_table: string, id: string) => id,
         query: (table: string) => {
-          const read: (typeof reads)[number] = { table, equalities: {} };
+          const read = { table, equalities: {} } as (typeof reads)[number];
           reads.push(read);
-          const index: MockIndex = {
-            eq(field: string, value: unknown) {
-              read.equalities[field] = value;
-              return index;
-            },
-          };
-          const builder: MockBuilder = {
-            withIndex(indexName: string, apply: (q: MockIndex) => unknown) {
-              read.index = indexName;
-              apply(index);
-              return builder;
-            },
-            order(direction: string) {
-              read.order = direction;
-              return builder;
-            },
+          const indexQuery = { eq(field: string, value: unknown) { read.equalities[field] = value; return indexQuery; } };
+          const builder = {
+            withIndex(index: string, apply: (q: typeof indexQuery) => unknown) { read.index = index; apply(indexQuery); return builder; },
+            order(order: string) { read.order = order; return builder; },
             async take(limit: number) {
               read.limit = limit;
-              return rowsByStatus[String(read.equalities.status)] ?? [];
+              if (table === "jobRuntime" && read.index === "by_plan_parent_generation_node") return activities(2);
+              return responses[table] ?? [];
             },
             async first() {
               read.first = true;
-              return table === "ui" ? { value: currentThread } : null;
+              if (table === "missionRuntime") return { missionId: "mission-1", goal: "Ship fleet", mode: "goal", status: "running", phase: "building", percent: 20, planDigest: "digest", planGeneration: 1 };
+              return null;
             },
           };
           return builder;
         },
       },
     };
-
-    const handler = (snapshot as unknown as {
-      _handler: (context: unknown, args: { threadId?: string }) => Promise<unknown>;
-    })._handler;
-    const result = await handler(ctx, { threadId: currentThread });
-
-    expect(result).toEqual({
-      active: {
-        id: "job-dispatching",
-        label: "Paul · current repair",
-        status: "dispatching",
-        stage: "testing",
-        percent: 64,
-      },
-    });
-    const expectedRuntimeReads = COMPACT_WORK_STATUSES.map((status) => ({
-      table: "jobRuntime",
-      index: "by_thread_visibility_status_priority",
-      equalities: {
-        originThreadId: currentThread,
-        visibility: "conversation",
-        status,
-      },
-      order: "desc",
-      limit: 1,
-    }));
-    expect(reads).toEqual(expectedRuntimeReads);
-    expect(reads.some((read) => read.table === "attentionItems" || read.table === "approvals")).toBe(false);
-
-    reads.length = 0;
-    expect(await handler(ctx, {})).toEqual(result);
+    const handler = (snapshot as unknown as { _handler: (context: unknown, args: { threadId?: string }) => Promise<any> })._handler;
+    const result = await handler(ctx, { threadId });
+    expect(result.fleet).toMatchObject({ id: "mission-1", planDigest: "digest", planGeneration: 1 });
     expect(reads).toEqual([
-      {
-        table: "ui",
-        index: "by_key",
-        equalities: { key: "activeThread" },
-        first: true,
-      },
-      ...expectedRuntimeReads,
+      { table: "jobRuntime", index: "by_thread_visibility_active_priority", equalities: { originThreadId: threadId, visibility: "conversation", active: true }, order: "desc", limit: ACTIVE_CANDIDATE_LIMIT },
+      { table: "missionRuntime", index: "by_mission", equalities: { missionId: "mission-1" }, first: true },
+      { table: "goalPlanNodes", index: "by_parent_generation", equalities: { parentMissionId: "mission-1", planGeneration: 1 }, limit: 9 },
+      { table: "goalPlanEdges", index: "by_parent_generation", equalities: { parentMissionId: "mission-1", planGeneration: 1 }, limit: 29 },
+      { table: "goalHandoffs", index: "by_parent_generation", equalities: { parentMissionId: "mission-1", planGeneration: 1 }, limit: 9 },
+      { table: "jobRuntime", index: "by_plan_parent_generation_node", equalities: { planParentMissionId: "mission-1", planGeneration: 1 }, limit: 9 },
     ]);
-
-    reads.length = 0;
-    rowsByStatus.running = [runtime({ originThreadId: "thread-other" })];
-    rowsByStatus.dispatching = [runtime({ status: "dispatching", visibility: "system" })];
-    expect(await handler(ctx, { threadId: currentThread })).toEqual({ active: null });
-    expect(reads).toEqual(expectedRuntimeReads);
-
-    reads.length = 0;
-    rowsByStatus.running = [runtime({ label: "Cloud health audit" })];
-    rowsByStatus.dispatching = [];
-    expect(await handler(ctx, { threadId: currentThread })).toEqual({ active: null });
-    expect(reads).toEqual(expectedRuntimeReads);
-
-    reads.length = 0;
-    rowsByStatus.running = [];
-    expect(await handler(ctx, { threadId: currentThread })).toEqual({ active: null });
-    expect(reads).toEqual(expectedRuntimeReads);
+    expect(reads.some((read) => ["jobs", "approvals", "attentionItems", "workEvents"].includes(read.table))).toBe(false);
   });
 });

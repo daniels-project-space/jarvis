@@ -1,30 +1,113 @@
+export type FleetNodeState =
+  | "queued"
+  | "dependency_held"
+  | "dispatching"
+  | "running"
+  | "reviewing"
+  | "integrating"
+  | "paused"
+  | "done"
+  | "blocked"
+  | "needs_input";
+
+export type FleetControl = "pause" | "resume" | "cancel" | "steer" | "approve" | "decline";
+
 export type CompactWorkItem = {
   id: string;
+  missionId: string | null;
   label: string;
-  status: "dispatching" | "running";
+  status: FleetNodeState;
   stage: string;
   percent: number;
+  extraCount: number;
+  needsDaniel: boolean;
 };
 
-export type CompactWorkSnapshot = { active: CompactWorkItem | null };
+export type FleetEdge = {
+  id: string;
+  source: string;
+  target: string;
+  readiness: "waiting" | "ready" | "delivered" | "blocked";
+};
+
+export type FleetNode = {
+  id: string;
+  jobId: string;
+  label: string;
+  agent: string;
+  repository: string | null;
+  state: FleetNodeState;
+  status: string;
+  stage: string;
+  percent: number;
+  progress: string;
+  progressAt: number | null;
+  model: string | null;
+  reasoningEffort: string | null;
+  workerRuntime: string | null;
+  workerRunId: string | null;
+  generation: number;
+  attempt: number;
+  maxAttempts: number;
+  dependencyCount: number;
+  dependenciesReady: number;
+  integrationState: string;
+  deliveryStatus: string | null;
+  mergeState: string;
+  recoverySummary: string | null;
+  needsDaniel: boolean;
+  attentionReason: string | null;
+  controls: FleetControl[];
+  startedAt: number | null;
+};
+
+export type FleetMission = {
+  id: string;
+  goal: string;
+  mode: string;
+  status: string;
+  phase: string;
+  percent: number;
+  repository: string | null;
+  planDigest: string | null;
+  planGeneration: number | null;
+  integrationState: string;
+  attentionCount: number;
+  controls: FleetControl[];
+  nodes: FleetNode[];
+  edges: FleetEdge[];
+};
+
+export type CompactWorkSnapshot = {
+  active: CompactWorkItem | null;
+  fleet: FleetMission | null;
+};
 
 export type CompactWorkCache = {
   threadId: string;
-  active: CompactWorkItem | null;
+  snapshot: CompactWorkSnapshot;
 } | null;
 
 /**
  * A resolved server result is authoritative, including an explicit empty one.
  * While the same subscription is unresolved during a refresh, retain its last
- * result so an active bar does not flash out and back in.
+ * result so the command centre does not flash out and back in.
  */
+export function visibleWorkSnapshot(
+  cache: CompactWorkCache,
+  threadId: string,
+  snapshot: CompactWorkSnapshot | undefined,
+): CompactWorkSnapshot {
+  if (snapshot !== undefined) return snapshot;
+  return cache?.threadId === threadId ? cache.snapshot : { active: null, fleet: null };
+}
+
 export function visibleCompactWork(
   cache: CompactWorkCache,
   threadId: string,
   snapshot: CompactWorkSnapshot | undefined,
 ): CompactWorkItem | null {
-  if (snapshot !== undefined) return snapshot.active;
-  return cache?.threadId === threadId ? cache.active : null;
+  return visibleWorkSnapshot(cache, threadId, snapshot).active;
 }
 
 export function cacheCompactWorkSnapshot(
@@ -32,9 +115,15 @@ export function cacheCompactWorkSnapshot(
   threadId: string,
   snapshot: CompactWorkSnapshot | undefined,
 ): CompactWorkCache {
-  return snapshot === undefined ? cache : { threadId, active: snapshot.active };
+  return snapshot === undefined ? cache : { threadId, snapshot };
 }
 
-export function needsDaniel(job: { status?: string }): boolean {
-  return job.status === "awaiting_approval" || job.status === "needs_input";
+/** A selection is explicit browser-session state; snapshots never choose it. */
+export function retainedFleetSelection(selectedJobId: string | null, snapshot: CompactWorkSnapshot): string | null {
+  if (!selectedJobId) return null;
+  return snapshot.fleet?.nodes.some((node) => node.jobId === selectedJobId) ? selectedJobId : null;
+}
+
+export function needsDaniel(job: { status?: string; needsDaniel?: boolean }): boolean {
+  return job.needsDaniel === true || job.status === "awaiting_approval" || job.status === "needs_input";
 }
