@@ -18,14 +18,33 @@ export const SAFE_SANDBOX_EXECUTION_RULES =
   "When the task or its acceptance criteria explicitly require provider sandbox/test-mode validation, an isolated non-billable test artifact is already authorized if it cannot pay or charge, message anyone, publish publicly, reserve real inventory, create a real supplier/customer order, or start fulfillment. Do not ask Daniel to approve that bounded test again. This never authorizes live-effect flags, credential changes, real commerce, outreach, publication, or spend. A specialist without scoped test credentials must preserve the safe controller handoff instead of requesting broader credentials or pretending the provider trace ran.";
 
 const SOFTWARE_DELIVERY_ACTION = /^(?:deploy|merge)$/i;
-const TECHNICAL_PUBLICATION =
-  /\b(?:convex|trigger(?:\.dev)?|vercel|function|schema|migration|build|release|deployment)\b/i;
+
+// Publication is public/consequential by default. The owned-repository
+// exception is bound to the direct technical object of the verb; a Git word
+// elsewhere in the clause cannot make "publish the findings" autonomous.
+const REVIEWED_GIT_REF_PUBLICATION_OBJECT =
+  /^(?:only\s+)?(?:to\s+|on\s+)?(?:(?:the|a|an|this|that|its)\s+)?(?:(?:reviewed|verified|accepted|approved|signed)\s+(?:(?:git\s+)(?:(?:worker|integration|delivery)\s+)?(?:branch|ref)|(?:worker|integration|delivery)\s+(?:branch|ref))|git\s+(?:(?:worker|integration|delivery)\s+)?(?:branch|ref))\b/i;
+
+const TECHNICAL_PROVIDER_PUBLICATION_OBJECT =
+  /^(?:only\s+)?(?:(?:the|a|an|this|that|its)\s+)?(?:convex\s+(?:functions?|schema|migration)|trigger(?:\.dev)?\s+(?:tasks?|build)|vercel\s+(?:build|deployment))\b/i;
+
+const NON_REPOSITORY_PUBLICATION_CONTEXT =
+  /\b(?:public|publicly|external|externally|social|content|findings|report|article|blog|website|internet|forum|feed|channel|audience|users?|advert(?:isement|ising)?|ads?|package|npm|registry|store|marketplace|newsletter|press|customer|tenant)\b/i;
 
 // In repository prose, these hyphenated forms use "post-" to mean "after".
 // Keep the allowlist technical and exact so "post the findings" remains an
 // external publication action.
 const TECHNICAL_TEMPORAL_POST_PREFIX =
   /^-(?:index(?:ed|ing)?(?:-stage)?|merge)\b/i;
+
+// Uppercase POST is an HTTP/provider-method noun only when either its direct
+// left-hand qualifier or its direct path-shaped object makes that grammar
+// unambiguous. Lowercase/title-case "post" never borrows this exception.
+const HTTP_POST_NOMINAL_LEAD =
+  /\b(?:https?|api|rest|graphql|provider[-_ ]method|stage_(?:blob|tree|commit)|update_ref|response[-_ ]lost|request[-_ ]lost)\s*$/i;
+
+const HTTP_POST_NOMINAL_TAIL =
+  /^(?:$|\/[^\s]*|(?:request|method|call|operation|effect|response|receipt|evidence|idempotency|failure|result|status|body|payload|headers?|endpoint|whose|that|which|was|were|is|are|has|had|with|without|before|after|during|from|to|against)\b)/i;
 
 // A delivery controller can move its review prompt to a local child process
 // through standard input. These patterns describe the object and transport,
@@ -206,13 +225,29 @@ export function isOwnedRepository(repo: string | undefined): boolean {
   return isOwnedRepositoryScope(repo);
 }
 
-function softwareDeliveryAllowed(action: string, clause: string, repo: string | undefined): boolean {
+function softwareDeliveryAllowed(
+  action: string,
+  clause: string,
+  repo: string | undefined,
+  actionIndex: number,
+): boolean {
   if (!isOwnedRepository(repo)) return false;
   if (SOFTWARE_DELIVERY_ACTION.test(action)) return true;
-  // "Publish" is normally a public/content action. In a scoped Daniel-owned
-  // repository, narrowly technical publication such as Convex functions is
-  // software delivery; publishing a post, advert or package remains gated.
-  return action.toLocaleLowerCase("en-GB") === "publish" && TECHNICAL_PUBLICATION.test(clause);
+  if (action.toLocaleLowerCase("en-GB") !== "publish") return false;
+  // Markdown code/emphasis delimiters do not change the grammatical object.
+  const after = clause.slice(actionIndex + action.length).replace(/[`*]/g, "").trim();
+  if (!REVIEWED_GIT_REF_PUBLICATION_OBJECT.test(after) && !TECHNICAL_PROVIDER_PUBLICATION_OBJECT.test(after)) {
+    return false;
+  }
+  return !NON_REPOSITORY_PUBLICATION_CONTEXT.test(clause);
+}
+
+function technicalHttpPostUse(action: string, before: string, after: string): boolean {
+  if (action !== "POST") return false;
+  const technicalBefore = before.replace(/[`*]/g, "").trim();
+  const technicalAfter = after.replace(/[`*]/g, "").trim();
+  if (/^\/[^\s]*/.test(technicalAfter)) return true;
+  return HTTP_POST_NOMINAL_LEAD.test(technicalBefore) && HTTP_POST_NOMINAL_TAIL.test(technicalAfter);
 }
 
 function controllerReviewStdinTransfer(clause: string, before: string, after: string): boolean {
@@ -256,6 +291,7 @@ function consequentialUse(action: string, clause: string, actionIndex: number): 
   }
   if (normalized === "post") {
     if (TECHNICAL_TEMPORAL_POST_PREFIX.test(after)) return false;
+    if (technicalHttpPostUse(action, before, after)) return false;
   }
   if (normalized === "message") {
     // Repository instructions routinely describe a git commit message, while
@@ -293,7 +329,7 @@ export function classifyWorkSafety(
       // instruction such as "research options and purchase one" is split at
       // the conjunction, so its purchase clause still reaches the gate.
       if (quoteContext === null && NON_MUTATING_LEAD.test(clause)) continue;
-      if (softwareDeliveryAllowed(action, clause, options?.repo)) {
+      if (softwareDeliveryAllowed(action, clause, options?.repo, actionIndex)) {
         continue;
       }
       return {
@@ -305,7 +341,7 @@ export function classifyWorkSafety(
   }
   const asksForSoftwareDelivery = clauses(task).some((clause) => {
     const match = CONSEQUENTIAL_ACTION.exec(clause);
-    return Boolean(match && softwareDeliveryAllowed(match[0], clause, options?.repo));
+    return Boolean(match && softwareDeliveryAllowed(match[0], clause, options?.repo, match.index));
   });
   return {
     approvalRequired: false,

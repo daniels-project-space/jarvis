@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import { goalWorkApprovalPolicy, workApprovalPolicy } from "../../convex/workPolicy";
 import { plannerTask, routeGoal, validatorTask } from "../lib/goal-mode";
 import { classifyWorkSafety, SAFE_SANDBOX_EXECUTION_RULES } from "../lib/work-safety";
+import {
+  INTEGRATION_FINAL_BARRIER_APPROVAL_TASK,
+  WORKSPACE_ISOLATION_APPROVAL_TASK,
+} from "./fixtures/work-policy-regressions";
 
 const CHAT_LATENCY_JOB_REGRESSION = {
   id: "js73f7b1rnjfqap286193t0hcs8awpq3",
@@ -50,9 +54,18 @@ describe("server-side work approval policy", () => {
   it("gates messaging, money, booking and destructive actions", () => {
     for (const task of [
       "Reply to the tenant",
+      "Send the rent arrears notice to the customer",
+      "Post the findings publicly",
+      "Publish the campaign content publicly",
+      "Advertise the rental listing",
+      "Publish the package to npm",
+      "Publish the app in the store",
       "Transfer the supplier payment",
+      "Trade the selected shares",
       "Book the selected hotel",
+      "Change the credential",
       "Delete the production records",
+      "Deploy the provider change to production",
     ]) {
       expect(workApprovalPolicy({ task }).required).toBe(true);
     }
@@ -207,6 +220,91 @@ describe("server-side work approval policy", () => {
         repo: "jarvis",
       }).required,
     ).toBe(true);
+  });
+
+  it("keeps the full repository approval regressions autonomous in standalone and Goal Mode", () => {
+    expect(WORKSPACE_ISOLATION_APPROVAL_TASK.split("\n")[10]).toContain("publish the reviewed Git worker ref");
+    expect(INTEGRATION_FINAL_BARRIER_APPROVAL_TASK.split("\n")[8]).toContain("stage_blob POST");
+
+    for (const task of [WORKSPACE_ISOLATION_APPROVAL_TASK, INTEGRATION_FINAL_BARRIER_APPROVAL_TASK]) {
+      const standalone = workApprovalPolicy({
+        task,
+        repo: "daniels-project-space/jarvis",
+        risk: "consequential",
+        approvalRequired: true,
+      });
+      const goalMode = goalWorkApprovalPolicy({
+        task,
+        repo: "daniels-project-space/jarvis",
+        risk: "consequential",
+        approvalRequired: true,
+        goalStage: "building",
+      });
+      expect(standalone).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+      expect(goalMode).toEqual(standalone);
+    }
+  });
+
+  it("allows only precise owned-repository Git-ref publication grammar", () => {
+    for (const task of [
+      "Only the trusted delivery controller may publish the reviewed Git worker ref after verification.",
+      "Publish the reviewed worker ref through the controller repository delivery.",
+      "The controller may `publish` the `reviewed Git worker ref` after verification.",
+      "The controller may publish only on the verified Git integration ref.",
+      "The controller can publish the Git branch after review.",
+      "The controller can publish the Git ref after review.",
+    ]) {
+      expect(classifyWorkSafety(task, { repo: "daniels-project-space/jarvis" }), task).toEqual({
+        approvalRequired: false,
+        boundary: "software_delivery",
+      });
+    }
+
+    expect(classifyWorkSafety(
+      "Publish the reviewed Git worker ref.",
+      { repo: "someone-else/jarvis" },
+    ).approvalRequired).toBe(true);
+
+    for (const task of [
+      "Publish the findings from the reviewed Git worker ref publicly.",
+      "Publish the package from the reviewed worker ref to npm.",
+      "Publish the reviewed worker ref and post the findings publicly.",
+      "The trusted controller may publish the reviewed worker ref and email the customer.",
+      "Publish public content after reviewing the Git branch.",
+      "Publish the reviewed Git worker ref to the public.",
+      "Publish the reviewed Git worker ref externally.",
+      "Publish the reviewed branch.",
+    ]) {
+      expect(workApprovalPolicy({ task, repo: "daniels-project-space/jarvis" }).required, task).toBe(true);
+    }
+  });
+
+  it("recognizes uppercase POST only in unambiguous HTTP/provider noun grammar", () => {
+    for (const task of [
+      "Reconcile the already-applied stage_blob POST whose callback was lost.",
+      "Reconcile the already-applied `stage_blob POST` whose callback was lost.",
+      "Record the stage_tree POST response before recovery.",
+      "Inspect the HTTP POST request idempotency key.",
+      "Inspect the `HTTP POST request` idempotency key.",
+      "Verify POST /webhook returns 204.",
+      "Document `POST /webhook` in the API contract.",
+      "Reconcile the response-lost POST before retrying the provider effect.",
+      "Persist provider-method POST evidence with the effect receipt.",
+    ]) {
+      expect(classifyWorkSafety(task), task).toEqual({ approvalRequired: false, boundary: "internal" });
+    }
+
+    for (const task of [
+      "post the findings publicly",
+      "Post the findings publicly",
+      "POST the findings publicly",
+      "Use stage_blob POST and post the result publicly.",
+      "Inspect the HTTP POST request and post an advert.",
+      "stage_blob POST the findings publicly.",
+      "Post a social update about POST /webhook.",
+    ]) {
+      expect(workApprovalPolicy({ task, repo: "daniels-project-space/jarvis" }).required, task).toBe(true);
+    }
   });
 
   it("keeps technical temporal prefixes and communication nouns internal", () => {
