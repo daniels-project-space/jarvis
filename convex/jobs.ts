@@ -9,7 +9,7 @@ import { normalizeWorkModelTier } from "../src/lib/work-models";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
 import { attemptWorkspaceKey, workItemIdentity } from "../src/lib/workspace-protocol";
-import { queueReviewedIntegration } from "./goalIntegration";
+import { controlIntegrationForJob, queueReviewedIntegration } from "./goalIntegration";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
 import { hasAttemptBudget, isMeaningfulWorkProgress } from "../src/lib/work-attempt";
 import { claimDisposition, completionReceiptAllowed, isSha256Digest, replayEnvelope, shouldAdvanceAttempt } from "../src/lib/durable-attempt-protocol";
@@ -28,7 +28,7 @@ const STALE_RUNNER_MS = 5 * 60 * 1000;
 // healthy work. Keep this comfortably above a normal Codex tool segment while
 // still surfacing a genuinely stuck attempt before its lease disappears.
 const DISPATCH_LEASE_MS = 2 * 60 * 1000;
-const MAX_WRITABLE_PER_MISSION_REPO = 4;
+const MAX_WRITABLE_PER_MISSION_REPO = 8;
 const DELIVERY_LEASE_MS = 45_000;
 const DELIVERY_RETRY_LIMIT = 6;
 const REVIEW_RECEIPT_MAX_CHARS = 300_000;
@@ -690,16 +690,9 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
     }
     if (job.integrationAttemptId && job.missionId && job.repo) {
       const integration: any = await ctx.db.get(job.integrationAttemptId);
-      if (!integration || integration.jobId !== job._id || ["integrated", "conflict", "stale", "cancelled", "exhausted", "parked"].includes(integration.status)) continue;
-      const missionId = ctx.db.normalizeId("missions", job.missionId);
-      if (!missionId) continue;
-      const lineage = await ctx.db.query("integrationAttempts")
-        .withIndex("by_mission_generation", (q: any) => q.eq("missionId", missionId)).take(100);
-      const first = lineage
-        .filter((row: any) => row.repository === integration.repository
-          && !["integrated", "conflict", "stale", "cancelled", "exhausted", "parked"].includes(row.status))
-        .sort((left: any, right: any) => left.generation - right.generation)[0];
-      if (!first || first._id !== integration._id) continue;
+      // Queue maintenance exposes exactly one head as queued. Later cold
+      // receipts have no nextRunAt and cannot consume a Trigger reservation.
+      if (!integration || integration.jobId !== job._id || integration.status !== "queued") continue;
     }
     if (job.missionId && job.repo && !job.readonly && !job.integrationAttemptId) {
       const key = `${job.missionId}:${job.repo}`;
@@ -1811,7 +1804,7 @@ export const executionLease = query({
 export const bindWorkspaceSource = mutation({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
-    sourceBranch: v.string(), sourceHeadSha: v.string(), workerToken: v.optional(v.string()),
+    sourceBranch: v.string(), sourceHeadSha: v.string(), checkoutHeadSha: v.optional(v.string()), workerToken: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     requireWorker(args.workerToken);
@@ -1819,12 +1812,20 @@ export const bindWorkspaceSource = mutation({
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== args.expectedAttempt
       || row.workerRunId !== args.workerRunId || !/^[a-zA-Z0-9._/-]{1,240}$/.test(args.sourceBranch)
       || !/^[0-9a-f]{40,64}$/i.test(args.sourceHeadSha)) return false;
-    if (row.sourceHeadSha) return row.sourceHeadSha === args.sourceHeadSha && row.sourceBranch === args.sourceBranch;
+    const attempt = await attemptFor(ctx, args.jobId, args.expectedAttempt);
+    const checkoutHeadSha = args.checkoutHeadSha ?? args.sourceHeadSha;
+    if (!GIT_OID.test(checkoutHeadSha)) return false;
+    if (attempt?.parentAttempt !== undefined && (!GIT_OID.test(String(attempt.parentCheckpointHeadSha ?? ""))
+      || attempt.parentCheckpointHeadSha !== checkoutHeadSha)) return false;
+    if (row.sourceHeadSha) {
+      if (row.sourceHeadSha !== args.sourceHeadSha || row.sourceBranch !== args.sourceBranch) return false;
+      if (attempt) await ctx.db.patch(attempt._id, { sourceHeadSha: args.sourceHeadSha, lastEventAt: Date.now() });
+      return true;
+    }
     await patchJobWithRuntime(ctx, row, {
       sourceBranch: args.sourceBranch, sourceHeadSha: args.sourceHeadSha,
       evidenceSummary: `sandbox source ${args.sourceBranch}@${args.sourceHeadSha.slice(0, 12)}`,
     });
-    const attempt = await attemptFor(ctx, args.jobId, args.expectedAttempt);
     if (attempt) await ctx.db.patch(attempt._id, { sourceHeadSha: args.sourceHeadSha, lastEventAt: Date.now() });
     await appendAttemptEvidence(ctx, row, "workspace_source_bound", `Sandbox source bound to ${args.sourceBranch}@${args.sourceHeadSha}`, {
       stage: "starting", evidenceKind: "workspace", eventKey: `workspace-source:${args.expectedAttempt}:${args.sourceHeadSha}`,
@@ -2331,7 +2332,7 @@ export const markVerifiedForDelivery = mutation({
       deliveryLeaseUntil: undefined,
       deliveryLeaseOwner: undefined,
       deliveryLeaseToken: undefined,
-      nextRunAt: now,
+      nextRunAt: integration && integration.status !== "queued" ? undefined : now,
     });
     await appendAttemptEvidence(ctx, row, "delivery_queued", "Supervisor receipt persisted; controller-only delivery queued", {
       stage: "delivery", evidenceKind: "delivery", eventKey: `delivery-queued:${a.expectedAttempt}:${generation}`, attempt: a.expectedAttempt,
@@ -2360,6 +2361,7 @@ export const control = mutation({
       return attempt;
     };
     if (a.action === "pause" && ["pending", "dispatching", "running", "steering"].includes(row.status)) {
+      await controlIntegrationForJob(ctx, row, "pause");
       if (["running", "steering"].includes(row.status) && !await closeAttempt("paused")) return false;
       if (["pending", "dispatching"].includes(row.status)) {
         const attempt = await ensureAttempt(ctx, a.jobId, row.attempt ?? 1, "queued", now);
@@ -2455,6 +2457,7 @@ export const control = mutation({
       }
     }
     else if (a.action === "cancel" && !["done", "error", "cancelled"].includes(row.status)) {
+      await controlIntegrationForJob(ctx, row, "cancel");
       if (["running", "steering"].includes(row.status) && !await closeAttempt("cancelled")) return false;
       if (["pending", "dispatching", "paused"].includes(row.status)) await closeAttempt("cancelled");
       await patchJobWithRuntime(ctx, row, {
@@ -2522,6 +2525,7 @@ export const control = mutation({
     } else if (a.action === "steer" && ["pending", "dispatching", "running", "paused", "stalled", "steering"].includes(row.status)) {
       const steer = String(a.input ?? "").trim().slice(0, 2_000);
       if (!steer) return false;
+      await controlIntegrationForJob(ctx, row, "steer");
       const running = row.status === "running";
       if (running && !await closeAttempt("steered")) return false;
       await patchJobWithRuntime(ctx, row, {

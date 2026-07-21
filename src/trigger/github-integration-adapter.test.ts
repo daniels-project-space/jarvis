@@ -7,26 +7,27 @@ const TREE = "c".repeat(40);
 const REPOSITORY_ID = "R_repo_node";
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
-function adapter(fetchImpl: typeof fetch) {
+function adapter(fetchImpl: typeof fetch, readGitObject?: (sha: string) => Promise<Buffer>) {
   return createGitHubIntegrationAdapter({
     repository: "daniels-project-space/jarvis", repositoryNodeId: REPOSITORY_ID,
     remote: "https://github.com/daniels-project-space/jarvis.git",
     workerBranch: "jarvis/work/mission/job", integrationAttemptId: "attempt-1",
     createdAt: Date.parse("2026-07-21T00:00:00Z"), token: "test-token",
-    fetchImpl, runGit: vi.fn(async () => ({ code: 0, out: "" })),
+    fetchImpl, readGitObject, runGit: vi.fn(async () => ({ code: 0, out: "" })),
   });
 }
 
 describe("GitHub integration fetch contract", () => {
   it("uses one updateRefs GraphQL POST with exact beforeOid/afterOid and force false", async () => {
     const calls: Array<{ url: string; method: string; body?: any }> = [];
-    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const mockFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
       calls.push({ url, method: init?.method ?? "GET", body });
       if (url.endsWith("/graphql")) return json({ data: { updateRefs: { clientMutationId: body.variables.input.clientMutationId } } });
       return json({ object: { sha: BASE } });
-    }) as unknown as typeof fetch;
+    });
+    const fetchImpl = mockFetch as unknown as typeof fetch;
     const github = adapter(fetchImpl);
     const effect = await github.prepareRefEffect({ effectId: "cas-1", branch: "jarvis/goal/x", expectedBaseSha: BASE, newHeadSha: HEAD, treeSha: TREE });
     expect(effect).toMatchObject({
@@ -60,7 +61,7 @@ describe("GitHub integration fetch contract", () => {
   it("reconciles a lost GraphQL response by exact REST observation with zero duplicate writes", async () => {
     let head = BASE;
     let graphqlCalls = 0;
-    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const mockFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/graphql")) {
         graphqlCalls += 1;
@@ -68,10 +69,29 @@ describe("GitHub integration fetch contract", () => {
         throw new Error("response lost after commit");
       }
       return json({ object: { sha: head } });
-    }) as unknown as typeof fetch;
+    });
+    const fetchImpl = mockFetch as unknown as typeof fetch;
     const github = adapter(fetchImpl);
     const result = await github.advanceRef({ effectId: "cas-lost", branch: "jarvis/goal/x", expectedBaseSha: BASE, newHeadSha: HEAD });
     expect(result.outcome).toBe("unknown");
+    await expect(github.readRef("jarvis/goal/x")).resolves.toBe(HEAD);
+    expect(graphqlCalls).toBe(1);
+  });
+
+  it("classifies a non-2xx updateRefs response as ambiguous and permits exact read reconciliation", async () => {
+    let head = BASE;
+    let graphqlCalls = 0;
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/graphql")) {
+        graphqlCalls += 1; head = HEAD;
+        return json({ message: "gateway lost upstream response" }, 502);
+      }
+      return json({ object: { sha: head } });
+    }) as unknown as typeof fetch;
+    const github = adapter(fetchImpl);
+    await expect(github.advanceRef({ effectId: "cas-http-lost", branch: "jarvis/goal/x", expectedBaseSha: BASE, newHeadSha: HEAD }))
+      .resolves.toMatchObject({ outcome: "unknown", providerResponse: expect.stringContaining("http:502") });
     await expect(github.readRef("jarvis/goal/x")).resolves.toBe(HEAD);
     expect(graphqlCalls).toBe(1);
   });
@@ -126,5 +146,91 @@ describe("GitHub integration fetch contract", () => {
     await expect(github.stageCandidate(prepared, { prepare: vi.fn(async () => ({ replay: true })), observe: vi.fn(async () => true) }))
       .rejects.toThrow("wrong existing candidate commit blocked");
     expect(posts).toBe(0);
+  });
+
+  it("stages arbitrary blob bytes without UTF-8 corruption", async () => {
+    const blobSha = "1".repeat(40);
+    const binary = Buffer.from([0, 255, 254, 128, 10, 65]);
+    let postedContent = "";
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith(`/git/blobs/${blobSha}`)) return json({ message: "Not Found" }, 404);
+      if (url.endsWith("/git/blobs") && init?.method === "POST") {
+        postedContent = JSON.parse(String(init.body)).content;
+        return json({ sha: blobSha });
+      }
+      if (url.endsWith(`/git/trees/${TREE}`)) return json({ sha: TREE, tree: [] });
+      if (url.endsWith(`/git/commits/${HEAD}`)) return json({ sha: HEAD, tree: { sha: TREE }, parents: [{ sha: BASE }, { sha: "d".repeat(40) }] });
+      throw new Error(`unexpected fetch ${url}`);
+    }) as unknown as typeof fetch;
+    const github = adapter(fetchImpl, async () => binary);
+    const prepared = { status: "clean" as const, synthetic: true, headSha: HEAD, treeSha: TREE, candidate: {
+      headSha: HEAD, treeSha: TREE, baseTreeSha: "e".repeat(40), entries: [{ path: "binary.dat", mode: "100644", type: "blob" as const, sha: blobSha }],
+      message: "JARVIS integration generation 1", parents: [BASE, "d".repeat(40)],
+      actor: { name: "JARVIS integration controller", email: "jarvis@daniels-project-space.dev", date: "2026-07-21T00:00:00.000Z" },
+    } };
+    await expect(github.stageCandidate(prepared, { prepare: vi.fn(async () => ({ replay: false })), observe: vi.fn(async () => true) }))
+      .resolves.toMatchObject({ outcome: "applied" });
+    expect(Buffer.from(postedContent, "base64")).toEqual(binary);
+  });
+
+  it("reconciles an exact non-2xx create race after observation", async () => {
+    let exists = false;
+    let posts = 0;
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith(`/git/trees/${TREE}`)) return json({ sha: TREE, tree: [] });
+      if (url.endsWith(`/git/commits/${HEAD}`)) return exists
+        ? json({ sha: HEAD, tree: { sha: TREE }, parents: [{ sha: BASE }, { sha: "d".repeat(40) }] })
+        : json({ message: "Not Found" }, 404);
+      if (url.endsWith("/git/commits") && init?.method === "POST") {
+        posts += 1; exists = true; return json({ message: "already exists" }, 422);
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    }) as unknown as typeof fetch;
+    const github = adapter(fetchImpl);
+    const prepared = { status: "clean" as const, synthetic: true, headSha: HEAD, treeSha: TREE, candidate: {
+      headSha: HEAD, treeSha: TREE, baseTreeSha: "e".repeat(40), entries: [], message: "JARVIS integration generation 1",
+      parents: [BASE, "d".repeat(40)], actor: { name: "JARVIS integration controller", email: "jarvis@daniels-project-space.dev", date: "2026-07-21T00:00:00.000Z" },
+    } };
+    await expect(github.stageCandidate(prepared, { prepare: vi.fn(async () => ({ replay: false })), observe: vi.fn(async () => true) }))
+      .resolves.toMatchObject({ outcome: "applied", providerHeadSha: HEAD });
+    expect(posts).toBe(1);
+  });
+
+  it.each(["blob", "tree"] as const)("reconciles lost %s-create responses with one write", async (lostKind) => {
+    const blobSha = "1".repeat(40);
+    let blobExists = false;
+    let treeExists = false;
+    let writes = 0;
+    const mockFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith(`/git/blobs/${blobSha}`)) return blobExists ? json({ sha: blobSha }) : json({ message: "Not Found" }, 404);
+      if (url.endsWith("/git/blobs") && init?.method === "POST") {
+        writes += 1; blobExists = true;
+        if (lostKind === "blob") throw new Error("blob response lost");
+        return json({ sha: blobSha });
+      }
+      if (url.endsWith(`/git/trees/${TREE}`)) return treeExists ? json({ sha: TREE, tree: [] }) : json({ message: "Not Found" }, 404);
+      if (url.endsWith("/git/trees") && init?.method === "POST") {
+        writes += 1; treeExists = true;
+        if (lostKind === "tree") throw new Error("tree response lost");
+        return json({ sha: TREE });
+      }
+      if (url.endsWith(`/git/commits/${HEAD}`)) return json({ sha: HEAD, tree: { sha: TREE }, parents: [{ sha: BASE }, { sha: "d".repeat(40) }] });
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    const fetchImpl = mockFetch as unknown as typeof fetch;
+    const github = adapter(fetchImpl, async () => Buffer.from([0, 255, 1]));
+    const prepared = { status: "clean" as const, synthetic: true, headSha: HEAD, treeSha: TREE, candidate: {
+      headSha: HEAD, treeSha: TREE, baseTreeSha: "e".repeat(40),
+      entries: [{ path: "asset.bin", mode: "100644", type: "blob" as const, sha: blobSha }],
+      message: "JARVIS integration generation 1", parents: [BASE, "d".repeat(40)],
+      actor: { name: "JARVIS integration controller", email: "jarvis@daniels-project-space.dev", date: "2026-07-21T00:00:00.000Z" },
+    } };
+    await expect(github.stageCandidate(prepared, { prepare: vi.fn(async () => ({ replay: false })), observe: vi.fn(async () => true) }))
+      .resolves.toMatchObject({ outcome: "applied" });
+    expect(writes).toBe(2);
+    expect(mockFetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(2);
   });
 });

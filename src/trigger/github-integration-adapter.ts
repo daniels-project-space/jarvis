@@ -22,7 +22,7 @@ type SyntheticCandidate = {
   actor: { name: string; email: string; date: string };
 };
 
-const API_VERSION = "2026-03-10";
+const API_VERSION = "2022-11-28";
 const OID = /^[0-9a-f]{40,64}$/i;
 
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -63,6 +63,7 @@ export function createGitHubIntegrationAdapter(options: {
   runGit: GitRunner;
   fetchImpl?: FetchLike;
   gitEnv?: NodeJS.ProcessEnv;
+  readGitObject?: (sha: string) => Promise<Buffer>;
 }): IntegrationAdapter {
   const { owner, name } = splitRepository(options.repository);
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -121,6 +122,10 @@ export function createGitHubIntegrationAdapter(options: {
     path: string,
     body: unknown,
   ): Promise<ProviderWriteResult> => {
+    const persist = async (observation: Parameters<IntegrationHooks["observe"]>[0]) => {
+      const accepted = await hooks.observe(observation);
+      return accepted ? null : { outcome: "unknown" as const, providerResponse: "durable-observation-fence-lost" };
+    };
     const prepared = await hooks.prepare(effect);
     if (!prepared) return { outcome: "unknown" };
     if (prepared.replay && prepared.observation === "not_applied") return { outcome: "not_applied", providerResponse: "reconciled:prior-rejection" };
@@ -129,11 +134,13 @@ export function createGitHubIntegrationAdapter(options: {
       prior = await observeCandidate(candidate, effect.kind, effect.headSha);
     } catch (error) {
       if (error instanceof GitHubProviderError && error.message.startsWith("wrong existing")) throw error;
-      await hooks.observe({ effectId: effect.effectId, observation: "unknown", providerResponse: `observation:${String(error).slice(0, 300)}` });
+      const lost = await persist({ effectId: effect.effectId, observation: "unknown", providerResponse: `observation:${String(error).slice(0, 300)}` });
+      if (lost) return lost;
       return { outcome: "unknown", providerResponse: "observation:failed" };
     }
     if (prior.exists) {
-      await hooks.observe({ effectId: effect.effectId, observation: "applied", providerHeadSha: effect.headSha, providerResponse: prior.response });
+      const lost = await persist({ effectId: effect.effectId, observation: "applied", providerHeadSha: effect.headSha, providerResponse: prior.response });
+      if (lost) return lost;
       return { outcome: "applied", providerHeadSha: effect.headSha, providerResponse: prior.response };
     }
     let response: Response;
@@ -143,26 +150,37 @@ export function createGitHubIntegrationAdapter(options: {
       try {
         const reconciled = await observeCandidate(candidate, effect.kind, effect.headSha);
         if (reconciled.exists) {
-          await hooks.observe({ effectId: effect.effectId, observation: "applied", providerHeadSha: effect.headSha, providerResponse: reconciled.response });
+          const lost = await persist({ effectId: effect.effectId, observation: "applied", providerHeadSha: effect.headSha, providerResponse: reconciled.response });
+          if (lost) return lost;
           return { outcome: "applied", providerHeadSha: effect.headSha, providerResponse: reconciled.response };
         }
       } catch (reconciliationError) {
-        await hooks.observe({ effectId: effect.effectId, observation: "unknown", providerResponse: `network:${String(error).slice(0, 160)}; observation:${String(reconciliationError).slice(0, 160)}` });
+        const lost = await persist({ effectId: effect.effectId, observation: "unknown", providerResponse: `network:${String(error).slice(0, 160)}; observation:${String(reconciliationError).slice(0, 160)}` });
+        if (lost) return lost;
         return { outcome: "unknown", providerResponse: "network-and-observation:ambiguous" };
       }
-      await hooks.observe({ effectId: effect.effectId, observation: "unknown", providerResponse: `network:${String(error).slice(0, 300)}` });
+      const lost = await persist({ effectId: effect.effectId, observation: "unknown", providerResponse: `network:${String(error).slice(0, 300)}` });
+      if (lost) return lost;
       return { outcome: "unknown", providerResponse: "network:ambiguous" };
     }
     const parsed = await jsonResponse(response);
     if (!response.ok) {
-      await hooks.observe({ effectId: effect.effectId, observation: "not_applied", providerResponse: parsed.exact });
-      return { outcome: "not_applied", providerResponse: parsed.exact };
+      // GitHub may return 409/422 after a concurrent create committed the
+      // exact immutable object. Observe identity before classifying the race.
+      const reconciled = await observeCandidate(candidate, effect.kind, effect.headSha);
+      const observation = reconciled.exists ? "applied" as const : "not_applied" as const;
+      const lost = await persist({ effectId: effect.effectId, observation,
+        providerHeadSha: reconciled.exists ? effect.headSha : undefined, providerResponse: parsed.exact });
+      if (lost) return lost;
+      return { outcome: observation, providerHeadSha: reconciled.exists ? effect.headSha : undefined, providerResponse: parsed.exact };
     }
     if (parsed.body?.sha !== effect.headSha) {
-      await hooks.observe({ effectId: effect.effectId, observation: "not_applied", providerResponse: parsed.exact });
+      const lost = await persist({ effectId: effect.effectId, observation: "not_applied", providerResponse: parsed.exact });
+      if (lost) return lost;
       return { outcome: "not_applied", providerResponse: parsed.exact };
     }
-    await hooks.observe({ effectId: effect.effectId, observation: "applied", providerHeadSha: effect.headSha, providerResponse: parsed.exact });
+    const lost = await persist({ effectId: effect.effectId, observation: "applied", providerHeadSha: effect.headSha, providerResponse: parsed.exact });
+    if (lost) return lost;
     return { outcome: "applied", providerHeadSha: effect.headSha, providerResponse: parsed.exact };
   };
 
@@ -263,9 +281,9 @@ export function createGitHubIntegrationAdapter(options: {
         if (entry.type !== "blob" || !entry.sha) continue;
         const existing = await getObject("blobs", entry.sha);
         if (existing.exists) continue;
-        const blob = await options.runGit(["cat-file", "blob", entry.sha], options.gitEnv);
-        if (blob.code !== 0) throw new Error(`candidate blob ${entry.sha} failed (${String(blob.code)}): ${blob.out.slice(-500)}`);
-        const body = { content: Buffer.from(blob.out, "utf8").toString("base64"), encoding: "base64" };
+        if (!options.readGitObject) throw new Error("binary-safe Git object reader is required for candidate blob staging");
+        const bytes = await options.readGitObject(entry.sha);
+        const body = { content: bytes.toString("base64"), encoding: "base64" };
         const effect: ProviderEffect = {
           effectId: `stage-blob:${options.integrationAttemptId}:${entry.sha}`,
           kind: "stage_blob", provider: "github", providerIdentity: `${repoId}:blob:${entry.sha}`,
@@ -311,7 +329,7 @@ export function createGitHubIntegrationAdapter(options: {
         return { outcome: "unknown", providerResponse: `network:${String(error).slice(0, 300)}` };
       }
       const parsed = await jsonResponse(response);
-      if (!response.ok) throw new GitHubProviderError(`GitHub updateRefs transport failed (${response.status}): ${parsed.exact}`, response.status);
+      if (!response.ok) return { outcome: "unknown", providerResponse: `http:${response.status}:${parsed.exact}` };
       if (Array.isArray(parsed.body?.errors) && parsed.body.errors.length) {
         return { outcome: "not_applied", providerResponse: parsed.exact };
       }

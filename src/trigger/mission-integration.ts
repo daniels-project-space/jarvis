@@ -100,9 +100,6 @@ export async function integrateReviewedWorker(
     }
     const expectedRef = expectedObservedRef(receipt.expectedIntegrationRefSha);
     const observedIntegration = await adapter.readRef(receipt.integrationBranch);
-    if (observedIntegration !== expectedRef) {
-      return { status: "stale", reason: `integration ref changed: expected ${expectedRef ?? "absent"}, observed ${observedIntegration ?? "absent"}` };
-    }
     const merged = await adapter.prepareMerge({
       integrationBaseSha: receipt.expectedIntegrationBaseSha,
       workerHeadSha: receipt.reviewedHeadSha,
@@ -122,7 +119,7 @@ export async function integrateReviewedWorker(
       }
     }
 
-    const effectId = `update-ref:${receipt.integrationAttemptId}:${receipt.integrationBranch}:${receipt.expectedIntegrationRefSha}:${merged.headSha}`;
+    const effectId = `update-ref:${receipt.integrationAttemptId}:${merged.headSha}`;
     const effect = await adapter.prepareRefEffect({
       effectId,
       branch: receipt.integrationBranch,
@@ -139,12 +136,17 @@ export async function integrateReviewedWorker(
       }
       const current = await adapter.readRef(receipt.integrationBranch);
       if (current === merged.headSha) {
-        await hooks.observe({ effectId, observation: "applied", providerHeadSha: current, providerResponse: "reconciled:exact-ref" });
+        if (!await hooks.observe({ effectId, observation: "applied", providerHeadSha: current, providerResponse: "reconciled:exact-ref" })) {
+          return { status: "pending", reason: "exact ref replay was observed but its durable observation fence was lost" };
+        }
         return { status: "integrated", effectId, headSha: merged.headSha, treeSha: merged.treeSha };
       }
       if (current !== expectedRef) {
         return { status: "stale", reason: `prepared updateRefs CAS lost: observed ${current ?? "absent"}` };
       }
+    }
+    if (observedIntegration !== expectedRef) {
+      return { status: "stale", reason: `integration ref changed: expected ${expectedRef ?? "absent"}, observed ${observedIntegration ?? "absent"}` };
     }
 
     const workerImmediatelyBefore = await adapter.readRef(receipt.workerBranch);
@@ -162,29 +164,33 @@ export async function integrateReviewedWorker(
       newHeadSha: merged.headSha,
     });
     if (outcome.outcome === "applied") {
-      await hooks.observe({
+      if (!await hooks.observe({
         effectId,
         observation: "applied",
         providerHeadSha: outcome.providerHeadSha ?? merged.headSha,
         providerResponse: outcome.providerResponse,
-      });
+      })) return { status: "pending", reason: "GitHub applied updateRefs but the durable observation fence was lost" };
       return { status: "integrated", effectId, headSha: merged.headSha, treeSha: merged.treeSha };
     }
     if (outcome.outcome === "not_applied") {
-      await hooks.observe({ effectId, observation: "not_applied", providerResponse: outcome.providerResponse });
+      if (!await hooks.observe({ effectId, observation: "not_applied", providerResponse: outcome.providerResponse })) {
+        return { status: "pending", reason: "GitHub rejected updateRefs but the durable observation fence was lost" };
+      }
       return { status: "stale", reason: "GitHub rejected the exact beforeOid/afterOid updateRefs compare-and-set" };
     }
     const reconciled = await adapter.readRef(receipt.integrationBranch);
     if (reconciled === merged.headSha) {
-      await hooks.observe({ effectId, observation: "applied", providerHeadSha: reconciled, providerResponse: outcome.providerResponse ?? "reconciled:response-loss" });
+      if (!await hooks.observe({ effectId, observation: "applied", providerHeadSha: reconciled, providerResponse: outcome.providerResponse ?? "reconciled:response-loss" })) {
+        return { status: "pending", reason: "response-loss reconciliation could not cross the durable observation fence" };
+      }
       return { status: "integrated", effectId, headSha: merged.headSha, treeSha: merged.treeSha };
     }
-    await hooks.observe({
+    if (!await hooks.observe({
       effectId,
       observation: "unknown",
       providerHeadSha: reconciled ?? undefined,
       providerResponse: outcome.providerResponse,
-    });
+    })) return { status: "pending", reason: "ambiguous provider observation could not be persisted" };
     return { status: "pending", reason: "GitHub response was ambiguous and the exact prepared head is not observable" };
   } catch (error) {
     return { status: "pending", reason: `GitHub integration observation failed closed: ${String(error instanceof Error ? error.message : error).slice(0, 500)}` };

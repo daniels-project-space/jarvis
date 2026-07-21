@@ -175,6 +175,18 @@ function sh(cmd: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code
   });
 }
 
+function readGitObject(cwd: string, sha: string, env: NodeJS.ProcessEnv): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const p = spawn("git", ["-C", cwd, "cat-file", "blob", sha], { env, stdio: ["ignore", "pipe", "pipe"] });
+    const chunks: Buffer[] = [];
+    let error = "";
+    p.stdout.on("data", (data: Buffer) => chunks.push(Buffer.from(data)));
+    p.stderr.on("data", (data) => { error += data.toString(); });
+    p.on("close", (code) => code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`git cat-file ${sha} failed (${String(code)}): ${error.slice(-500)}`)));
+    p.on("error", reject);
+  });
+}
+
 // Sub-agent model routing uses the same Codex subscription tiers as the
 // conversational supervisor.
 function pickAgentModel(task: string): string {
@@ -704,7 +716,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           if (result?.advanced) {
             advanced += 1;
             const thread = await chatThread();
-            const line = result.external
+            const line = result.splitRequired
+              ? `I split the cross-project plan into ${Number(result.childMissionIds?.length ?? result.repositories?.length ?? 0)} durable repository-scoped child missions. Each now has its own integration head and controller queue under the parent goal.`
+              : result.external
               ? `I have locked the Sol architecture and handed the build to App Factory ${externalRun?.slug ? `as ${externalRun.slug}` : ""}. I am monitoring every stage and will stop at its human gates.`
               : `I have locked the Sol architecture. ${result.jobs} Terra/high sessions are now working on isolated refs; the controller will serialize their signed receipts before the final Sol review.`;
             await convexMutation("chatQueue:postAssistant", { threadId: thread, text: line }).catch(() => {});
@@ -993,6 +1007,15 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               leaseToken: integrationToken,
               leaseVersion: Number(claimed.leaseVersion),
             };
+            let integrationControllerState: "command" | "provider" | "reconcile" = "command";
+            let integrationDeadlineAt = Date.now() + 10 * 60_000;
+            const heartbeatIntegration = () => convexMutation("goalIntegration:heartbeat", {
+              ...integrationFence, state: integrationControllerState, deadlineAt: integrationDeadlineAt,
+            }).catch(() => false);
+            if (!await heartbeatIntegration()) return;
+            const integrationHeartbeat = setInterval(() => { void heartbeatIntegration(); }, 15_000);
+            integrationHeartbeat.unref?.();
+            try {
             const integrationDir = `/tmp/work/integration-${jobKey}-${Number(claimed.generation)}`;
             rmSync(integrationDir, { recursive: true, force: true });
             const remote = githubRepoUrl(repo);
@@ -1017,8 +1040,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               createdAt: Number(claimed.createdAt ?? Date.now()),
               token: String(token),
               runGit: runIntegrationGit,
+              readGitObject: (sha) => readGitObject(integrationDir, sha, gitEnv),
               gitEnv,
             });
+            integrationControllerState = "provider";
+            integrationDeadlineAt = Date.now() + 6 * 60 * 60_000;
+            if (!await heartbeatIntegration()) return;
             const result = await integrateReviewedWorker({
               integrationAttemptId: String(job.integrationAttemptId),
               workerBranch: String(claimed.workerBranch), reviewedHeadSha: String(claimed.reviewedHeadSha),
@@ -1041,6 +1068,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 providerHeadSha: observation.providerHeadSha, providerResponse: observation.providerResponse,
               }).catch(() => false)),
             });
+            integrationControllerState = "reconcile";
+            integrationDeadlineAt = Date.now() + 10 * 60_000;
+            if (!await heartbeatIntegration()) return;
             if (result.status === "integrated") {
               const completed = await convexMutation("goalIntegration:complete", {
                 ...integrationFence, effectId: result.effectId,
@@ -1059,6 +1089,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               ...integrationFence, reasonCode: "provider_observation_pending", reason: result.reason,
             }).catch(() => false);
             return;
+            } finally {
+              clearInterval(integrationHeartbeat);
+            }
           }
           if (await stopIfLeaseLost("Delivery lease changed before resume.", String(job.result ?? ""), resumeBranch)) return;
           const existingPull = Number(job.deliveryPullRequestNumber) > 0
@@ -1264,16 +1297,17 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                   reviewBaseSha = sourceHeadSha;
                 }
               }
-              if (!cloneFailed && !job.sourceHeadSha) {
+              if (!cloneFailed) {
                 const bound = await convexMutation("jobs:bindWorkspaceSource", {
                   jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
-                  sourceBranch: checkoutSourceBranch, sourceHeadSha: baseSha,
+                  sourceBranch: checkoutSourceBranch,
+                  sourceHeadSha: String(job.sourceHeadSha ?? baseSha), checkoutHeadSha: baseSha,
                 }).catch(() => false);
                 if (!bound) {
                   cloneFailed = true;
-                  cloneFailureReason = "The sandbox source identity could not be durably bound before execution.";
+                  cloneFailureReason = "The sandbox source/checkpoint lineage could not be durably bound before execution.";
                   context = `${cloneFailureReason} Do not edit an untracked workspace.`;
-                } else {
+                } else if (!job.sourceHeadSha) {
                   reviewBaseSha = baseSha;
                 }
               }
@@ -1456,7 +1490,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             deliveryRetry = true;
             pushNote = `${SHALLOW_PROVENANCE_RULE} ${history.note}; retrying from canonical branch ${branch}`;
           }
-          const remote = (await runGit(["ls-remote", pushUrl, `refs/heads/${branch}`])).out.split(/\s/)[0]?.trim();
+          const remoteObservation = await runGit(["ls-remote", pushUrl, `refs/heads/${branch}`]);
+          if (remoteObservation.code !== 0) {
+            deliveryRetry = true;
+            pushNote = `worker ref observation failed (${String(remoteObservation.code)}): ${remoteObservation.out.slice(-300)}`;
+          }
+          const remote = remoteObservation.code === 0 ? remoteObservation.out.split(/\s/)[0]?.trim() : undefined;
           let needsPush = gitDeliveryDisposition({ baseSha, localSha: local, remoteSha: remote }) !== "noop";
           if (deliveryRetry) {
             // An incomplete graph is never used to judge or modify lineage.

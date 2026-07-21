@@ -50,7 +50,7 @@ describe("serialized integration provider protocol", () => {
     const prepare = vi.fn().mockResolvedValue({ replay: false });
     const observe = vi.fn().mockResolvedValue(true);
     await expect(integrateReviewedWorker(receipt, h.adapter, { prepare, observe })).resolves.toEqual({
-      status: "integrated", effectId: `update-ref:${receipt.integrationAttemptId}:${receipt.integrationBranch}:${BASE}:${MERGED}`,
+      status: "integrated", effectId: `update-ref:${receipt.integrationAttemptId}:${MERGED}`,
       headSha: MERGED, treeSha: MERGED_TREE,
     });
     expect(h.calls.filter((call) => call === "GET")).toHaveLength(4);
@@ -71,18 +71,19 @@ describe("serialized integration provider protocol", () => {
 
   it("reconciles a controller crash after preparation without a duplicate write", async () => {
     const h = harness({ integration: MERGED });
-    // Initial preflight must still see the persisted expected base; emulate a
-    // crash replay by changing the ref only after the first two reads.
-    let reads = 0;
-    vi.mocked(h.adapter.readRef).mockImplementation(async (branch) => {
-      reads += 1;
-      if (branch === receipt.workerBranch) return WORKER;
-      return reads <= 2 ? BASE : MERGED;
-    });
     const result = await integrateReviewedWorker(receipt, h.adapter, {
       prepare: vi.fn().mockResolvedValue({ replay: true, observation: "unknown" }), observe: vi.fn().mockResolvedValue(true),
     });
     expect(result.status).toBe("integrated");
+    expect(h.calls.filter((call) => call === "GRAPHQL")).toHaveLength(0);
+  });
+
+  it("fails closed when a reconciled provider observation cannot be persisted", async () => {
+    const h = harness({ integration: MERGED });
+    const result = await integrateReviewedWorker(receipt, h.adapter, {
+      prepare: vi.fn().mockResolvedValue({ replay: true, observation: "unknown" }), observe: vi.fn().mockResolvedValue(false),
+    });
+    expect(result).toMatchObject({ status: "pending" });
     expect(h.calls.filter((call) => call === "GRAPHQL")).toHaveLength(0);
   });
 

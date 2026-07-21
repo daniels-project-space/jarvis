@@ -710,13 +710,57 @@ export const recordPlan = mutation({
       writableRepositories.add(canonical);
     }
     if (writableRepositories.size > 1) {
+      const now = Date.now();
+      const childMissionIds: any[] = [];
+      for (const repository of [...writableRepositories].sort()) {
+        const childGoal = `${mission.goal} [project scope: ${repository}]`;
+        const childId = await insertMissionWithRuntime(ctx, {
+          goal: childGoal.slice(0, 500), mode: "goal", status: "running", agentCount: 1,
+          parentMissionId: mission._id, originThreadId: mission.originThreadId, managerAgentId: "jarvis",
+          priority: mission.priority ?? 95, risk: mission.risk ?? "high", phase: "planning", percent: 3,
+          acceptanceCriteria: mission.acceptanceCriteria ?? [], route: "existing_project",
+          routeReason: `Writable multi-project goal split atomically from parent ${String(mission._id)}`,
+          primaryRepo: repository,
+          infrastructureContext: `${mission.infrastructureContext ?? ""}\nThis child owns only ${repository}; coordinate results through parent ${String(mission._id)}.`.trim().slice(0, 4_000),
+          revisionWave: 0, maxRevisionWaves: mission.maxRevisionWaves ?? 2,
+          maxBuildSessions: mission.maxBuildSessions ?? 6, advanceAttempt: 0, createdAt: now, updatedAt: now,
+        });
+        const route: GoalRoute = {
+          kind: "existing_project", primaryRepo: repository,
+          reason: `Atomic child scope of parent ${String(mission._id)}`,
+          infrastructureContext: `Work only in ${repository}; preserve the parent goal and return independently integrable evidence.`,
+        };
+        const plannerJobId = await insertGoalJob(ctx, {
+          task: plannerTask(childGoal, route, mission.acceptanceCriteria ?? [], mission.maxBuildSessions ?? 6),
+          missionId: String(childId), label: `JARVIS · ${repository.split("/").pop()} architecture`, repo: repository,
+          readonly: true, model: "sol", reasoningEffort: "max", mcp: ["context7"],
+          originThreadId: mission.originThreadId, agentId: "jarvis", risk: "low", priority: 100,
+          acceptanceCriteria: ["Plan only this canonical repository scope", "Return a valid GOAL_PLAN_JSON contract"],
+          modelReason: "A cross-project parent is split into independently serialized repository missions",
+          maxAttempts: 16, goalStage: "planning", goalWorkstreamId: "goal-plan", goalWave: 0,
+        });
+        const child: any = await ctx.db.get(childId);
+        if (child) await patchMissionWithRuntime(ctx, child, {
+          planningJobId: String(plannerJobId), integrationBranch: goalBranch(childGoal, String(childId)), integrationGeneration: 0,
+        });
+        childMissionIds.push(childId);
+      }
+      await patchMissionWithRuntime(ctx, mission, {
+        status: "split", phase: "split", plan, splitChildMissionIds: childMissionIds,
+        summary: `Writable work split into ${childMissionIds.length} canonical repository child missions`,
+        advanceLeaseUntil: undefined, updatedAt: now,
+      });
+      await recordMissionEvent(ctx, String(args.id), "goal_split", `Writable plan split into ${childMissionIds.length} repository child missions`, "split", mission.percent, {
+        repositories: [...writableRepositories].sort(), childMissionIds: childMissionIds.map(String),
+      });
       return {
-        advanced: false,
+        advanced: true,
         stale: false,
         splitRequired: true,
         code: "WRITABLE_REPOSITORY_SPLIT_REQUIRED",
         repositories: [...writableRepositories].sort(),
         parentMissionId: String(args.id),
+        childMissionIds: childMissionIds.map(String),
       };
     }
     const now = Date.now();
@@ -1603,8 +1647,9 @@ export const control = mutation({
         const integration: any = await ctx.db.get(mission.activeIntegrationAttemptId);
         if (integration && !["integrated", "conflict", "stale", "cancelled", "exhausted", "parked"].includes(integration.status)) {
           await ctx.db.patch(integration._id, {
-            status: integration.preparedEffectId ? "prepared" : "queued",
-            leaseUntil: undefined, retryReason: "paused by mission control", updatedAt: now,
+            status: "queued",
+            leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined,
+            retryReason: "paused by mission control", updatedAt: now,
           });
         }
       }
@@ -1618,7 +1663,17 @@ export const control = mutation({
             dispatchId: undefined,
             dispatchLeaseUntil: undefined,
             workerRunId: undefined,
+            deliveryLeaseOwner: undefined,
+            deliveryLeaseToken: undefined,
+            deliveryLeaseUntil: undefined,
           });
+          if (job.activeDeliveryAttemptId) {
+            const delivery: any = await ctx.db.get(job.activeDeliveryAttemptId);
+            if (delivery && !["done", "blocked", "abandoned"].includes(delivery.status)) await ctx.db.patch(delivery._id, {
+              status: "checkpointed", leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined,
+              retryReason: "paused by mission control", heartbeatAt: now, updatedAt: now,
+            });
+          }
         }
       }
     } else if (args.action === "resume" && mission.status === "paused") {
@@ -1757,7 +1812,7 @@ export const control = mutation({
           const terminal = await writeIntegrationTerminalReceipt(ctx, integration, "cancelled", { reason: "cancelled by mission control" });
           if (!terminal) throw new Error("cancelled integration terminal receipt could not be canonicalized");
           await ctx.db.patch(integration._id, {
-            status: "cancelled", outcome: "cancelled", leaseUntil: undefined,
+            status: "cancelled", outcome: "cancelled", leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined,
             terminalReceiptDigest: terminal.receiptDigest, completedAt: now, updatedAt: now,
           });
         }
@@ -1765,6 +1820,15 @@ export const control = mutation({
       for (const job of jobs) {
         if (!TERMINAL.has(job.status)) {
           await patchJobWithRuntime(ctx, job, { status: "cancelled", stage: "cancelled", progress: "Goal Mode cancelled by Daniel", completedAt: now, nextRunAt: undefined });
+        }
+        if (job.activeDeliveryAttemptId) {
+          const delivery: any = await ctx.db.get(job.activeDeliveryAttemptId);
+          const integration = job.integrationAttemptId ? await ctx.db.get(job.integrationAttemptId) : null;
+          if (delivery && integration?.terminalReceiptDigest && !["done", "blocked", "abandoned"].includes(delivery.status)) await ctx.db.patch(delivery._id, {
+            status: "blocked", outcome: "cancelled", currentStep: "terminal",
+            terminalReceiptDigest: integration.terminalReceiptDigest, leaseOwner: undefined, leaseToken: undefined,
+            leaseUntil: undefined, completedAt: now, heartbeatAt: now, updatedAt: now,
+          });
         }
         const approvals = await ctx.db
           .query("approvals")

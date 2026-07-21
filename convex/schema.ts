@@ -400,6 +400,8 @@ export default defineSchema({
     summary: v.optional(v.string()),
     originThreadId: v.optional(v.string()),
     managerAgentId: v.optional(v.string()),
+    parentMissionId: v.optional(v.id("missions")),
+    splitChildMissionIds: v.optional(v.array(v.id("missions"))),
     priority: v.optional(v.number()),
     risk: v.optional(v.string()),
     phase: v.optional(v.string()),
@@ -681,6 +683,11 @@ export default defineSchema({
     preparedIntegrationTreeSha: v.optional(v.string()),
     providerObservation: v.optional(v.string()),
     providerObservedHeadSha: v.optional(v.string()),
+    providerEffectCount: v.optional(v.number()),
+    controllerState: v.optional(v.string()),
+    controllerStateSince: v.optional(v.number()),
+    controllerDeadlineAt: v.optional(v.number()),
+    controllerHeartbeatAt: v.optional(v.number()),
     effects: v.optional(v.array(v.object({
       effectId: v.string(),
       effectKind: v.string(),
@@ -710,7 +717,33 @@ export default defineSchema({
     .index("by_mission_status", ["missionId", "status", "createdAt"])
     .index("by_mission_generation", ["missionId", "generation"])
     .index("by_job_attempt", ["jobId", "workAttempt"])
-    .index("by_status_created", ["status", "createdAt"]),
+    .index("by_status_created", ["status", "createdAt"])
+    .index("by_mission_repository_status_generation", ["missionId", "repository", "status", "generation"]),
+
+  // Provider writes are cold, independently replayable effects. Integration
+  // attempts retain only compact pointers/state so large exact responses and
+  // long object-staging lineages never inflate dispatch/heartbeat documents.
+  integrationProviderEffects: defineTable({
+    integrationAttemptId: v.id("integrationAttempts"),
+    effectId: v.string(),
+    effectKind: v.string(),
+    provider: v.string(),
+    providerIdentity: v.string(),
+    providerMethod: v.string(),
+    providerTarget: v.string(),
+    requestDigest: v.string(),
+    expectedBaseSha: v.optional(v.string()),
+    headSha: v.string(),
+    treeSha: v.string(),
+    preparedAt: v.number(),
+    observation: v.optional(v.string()),
+    providerHeadSha: v.optional(v.string()),
+    providerResponse: v.optional(v.string()),
+    providerResponseDigest: v.optional(v.string()),
+    observedAt: v.optional(v.number()),
+  })
+    .index("by_attempt_effect", ["integrationAttemptId", "effectId"])
+    .index("by_attempt_prepared", ["integrationAttemptId", "preparedAt"]),
 
   // Full canonical integration terminal evidence is cold and append-only.
   // Hot mission/job/attempt rows retain only outcome and digest pointers.

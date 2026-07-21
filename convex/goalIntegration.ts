@@ -28,17 +28,34 @@ export async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, ou
   const existing: any = await ctx.db.query("integrationTerminalReceipts")
     .withIndex("by_attempt", (q: any) => q.eq("integrationAttemptId", attempt._id)).first();
   if (existing) return existing.outcome === outcome ? existing : null;
-  const [mission, job, review, workAttempts, deliveryAttempts] = await Promise.all([
+  const [mission, job, review, workAttempts, deliveryAttempts, coldEffects] = await Promise.all([
     ctx.db.get(attempt.missionId),
     ctx.db.get(attempt.jobId),
     ctx.db.get(attempt.reviewReceiptId),
     ctx.db.query("workAttempts").withIndex("by_job_attempt", (q: any) => q.eq("jobId", attempt.jobId)).collect(),
     ctx.db.query("deliveryAttempts").withIndex("by_job", (q: any) => q.eq("jobId", attempt.jobId)).collect(),
+    ctx.db.query("integrationProviderEffects").withIndex("by_attempt_prepared", (q: any) => q.eq("integrationAttemptId", attempt._id)).collect(),
   ]);
-  if (!mission || !job || !review || review.receiptDigest !== attempt.reviewReceiptDigest) return null;
+  if (!mission || !job || !review
+    || review.jobId !== attempt.jobId || review.attempt !== attempt.workAttempt
+    || review.receiptDigest !== attempt.reviewReceiptDigest
+    || review.repository !== attempt.repository || review.workerBranch !== attempt.workerBranch
+    || review.sourceBranch !== job.sourceBranch || review.workspaceLineage !== job.workspaceLineage
+    || review.retryLineage !== job.retryLineage
+    || review.baseSha !== attempt.reviewedBaseSha || review.headSha !== attempt.reviewedHeadSha
+    || review.headTreeSha !== attempt.reviewedHeadTreeSha || review.diffSha256 !== attempt.reviewedDiffSha256
+    || !SHA.test(String(job.sourceHeadSha ?? "")) || review.baseSha !== job.sourceHeadSha) return null;
   const delivery: any = job.activeDeliveryAttemptId ? await ctx.db.get(job.activeDeliveryAttemptId) : null;
+  if (!delivery || delivery.integrationAttemptId !== attempt._id
+    || delivery.sourceWorkAttempt !== attempt.workAttempt
+    || delivery.reviewReceiptId !== attempt.reviewReceiptId
+    || delivery.reviewReceiptDigest !== attempt.reviewReceiptDigest
+    || delivery.reviewedBaseSha !== attempt.reviewedBaseSha
+    || delivery.reviewedHeadSha !== attempt.reviewedHeadSha
+    || delivery.reviewedHeadTreeSha !== attempt.reviewedHeadTreeSha
+    || delivery.reviewedDiffSha256 !== attempt.reviewedDiffSha256) return null;
   const repair: any = detail?.repairJobId ? await ctx.db.get(detail.repairJobId) : null;
-  const effects = [...(attempt.effects ?? [])]
+  const effects = [...(coldEffects.length ? coldEffects : (attempt.effects ?? []))]
     .sort((left: any, right: any) => left.preparedAt - right.preparedAt || left.effectId.localeCompare(right.effectId))
     .map((effect: any) => ({
       effectId: effect.effectId, kind: effect.effectKind, provider: effect.provider,
@@ -46,8 +63,12 @@ export async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, ou
       requestDigest: effect.requestDigest, expectedBaseSha: effect.expectedBaseSha,
       headSha: effect.headSha, treeSha: effect.treeSha, preparedAt: effect.preparedAt,
       observation: effect.observation ?? null, providerHeadSha: effect.providerHeadSha ?? null,
-      providerResponse: effect.providerResponse ?? null, observedAt: effect.observedAt ?? null,
+      providerResponse: effect.providerResponse ?? null,
+      providerResponseDigest: effect.providerResponseDigest ?? null,
+      observedAt: effect.observedAt ?? null,
     }));
+  if (outcome === "integrated" && !effects.some((effect: any) => effect.kind === "update_ref"
+    && effect.observation === "applied" && effect.providerHeadSha === attempt.preparedIntegrationHeadSha)) return null;
   const receipt = canonicalValue({
     version: 1,
     kind: "mission_integration_terminal",
@@ -65,6 +86,7 @@ export async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, ou
       workspaceLineage: row.workspaceLineage ?? null, workerBranch: row.workerBranch ?? null,
       sourceHeadSha: row.sourceHeadSha ?? null, parentCheckpointHeadSha: row.parentCheckpointHeadSha ?? null,
       checkpointHeadSha: row.checkpointHeadSha ?? null, workerRunId: row.workerRunId ?? null,
+      providerWorkspaceId: row.providerWorkspaceId ?? null, providerSessionId: row.providerSessionId ?? null,
     })),
     review: {
       id: String(review._id), digest: review.receiptDigest, keyId: review.keyId ?? "legacy-v1",
@@ -99,10 +121,13 @@ export async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, ou
         reviewReceiptId: row.reviewReceiptId ? String(row.reviewReceiptId) : null,
         reviewReceiptDigest: row.reviewReceiptDigest ?? null, reviewKeyId: row.reviewKeyId ?? null,
         cumulativeRetries: row.cumulativeRetries ?? 0, currentStep: row.currentStep ?? null,
+        status: row.status, outcome: row.outcome ?? null,
       })),
     providerEffects: effects,
     terminal: {
       outcome, reason: detail?.reason?.slice(0, 500) ?? attempt.retryReason ?? null,
+      deliveryStatus: outcome === "integrated" ? "done" : "blocked",
+      deliveryOutcome: outcome === "integrated" ? "mission_integrated" : outcome,
       focusedRepair: repair ? {
         jobId: String(repair._id), parentJobId: repair.parentJobId ?? null,
         workerBranch: repair.workerBranch ?? null, workspaceLineage: repair.workspaceLineage ?? null,
@@ -119,12 +144,17 @@ export async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, ou
   return { _id: id, outcome, receiptJson, receiptDigest };
 }
 
+const NONTERMINAL = ["queued", "claimed", "prepared", "provider_waiting"] as const;
+
+async function fifoHead(ctx: any, missionId: any, repository: string) {
+  const candidates = await Promise.all(NONTERMINAL.map((status) => ctx.db.query("integrationAttempts")
+    .withIndex("by_mission_repository_status_generation", (q: any) => q.eq("missionId", missionId).eq("repository", repository).eq("status", status))
+    .order("asc").first()));
+  return candidates.filter(Boolean).sort((left: any, right: any) => left.generation - right.generation)[0] ?? null;
+}
+
 async function wakeNextIntegration(ctx: any, attempt: any) {
-  const lineage = await ctx.db.query("integrationAttempts")
-    .withIndex("by_mission_generation", (q: any) => q.eq("missionId", attempt.missionId)).take(100);
-  const next: any = lineage
-    .filter((candidate: any) => candidate.repository === attempt.repository && candidate.generation > attempt.generation && !TERMINAL.has(candidate.status))
-    .sort((a: any, b: any) => a.generation - b.generation)[0];
+  const next: any = await fifoHead(ctx, attempt.missionId, attempt.repository);
   if (!next) return;
   await ctx.db.patch(next._id, { status: "queued", updatedAt: Date.now() });
   const job: any = await ctx.db.get(next.jobId);
@@ -177,9 +207,7 @@ export async function queueReviewedIntegration(ctx: any, job: any, review: any, 
   if (existing) return existing.reviewReceiptDigest === reviewReceiptDigest ? existing : null;
   const generation = Number(mission.integrationGeneration ?? 0) + 1;
   const now = Date.now();
-  const lineage = await ctx.db.query("integrationAttempts")
-    .withIndex("by_mission_generation", (q: any) => q.eq("missionId", missionId)).take(100);
-  const waiting = lineage.some((candidate: any) => candidate.repository === job.repo && !TERMINAL.has(candidate.status));
+  const waiting = Boolean(await fifoHead(ctx, missionId, job.repo));
   const id = await ctx.db.insert("integrationAttempts", {
     missionId, jobId: job._id, workAttempt: job.attempt ?? 1, generation,
     revisionWave: Number(job.goalWave ?? 0), workstreamId: String(job.goalWorkstreamId ?? job._id),
@@ -218,10 +246,8 @@ export const claim = mutation({
       || job.integrationAttemptId !== attempt._id || job.deliveryRunId !== args.controllerRunId
       || delivery?.integrationAttemptId !== attempt._id || delivery?.deliveryRunId !== args.controllerRunId
       || delivery?.policy !== "mission_integration" || !["pending", "running"].includes(job.status)) return null;
-    const lineage = await ctx.db.query("integrationAttempts")
-      .withIndex("by_mission_generation", (q: any) => q.eq("missionId", mission._id)).take(100);
-    if (lineage.some((candidate: any) => candidate.repository === attempt.repository
-      && candidate.generation < attempt.generation && !TERMINAL.has(candidate.status))) return null;
+    const head = await fifoHead(ctx, mission._id, attempt.repository);
+    if (!head || head._id !== attempt._id) return null;
     const now = Date.now();
     if (mission.activeIntegrationAttemptId && mission.activeIntegrationAttemptId !== attempt._id
       && Number(mission.integrationLeaseUntil ?? 0) >= now) return null;
@@ -232,10 +258,12 @@ export const claim = mutation({
     const expectedIntegrationBaseSha = String(mission.integrationHeadSha ?? attempt.reviewedBaseSha);
     const expectedIntegrationRefSha = String(mission.integrationHeadSha ?? ZERO_OID);
     await ctx.db.patch(attempt._id, {
-      status: attempt.status === "prepared" || attempt.status === "provider_waiting" ? attempt.status : "claimed",
+      status: "claimed",
       controllerRunId: args.controllerRunId.slice(0, 160), leaseOwner: args.leaseOwner.slice(0, 160),
       leaseToken: args.leaseToken.slice(0, 160), leaseVersion: version, leaseUntil: until,
       expectedIntegrationBaseSha, expectedIntegrationRefSha, updatedAt: now,
+      controllerState: "command", controllerStateSince: now,
+      controllerDeadlineAt: now + 10 * 60_000, controllerHeartbeatAt: now,
     });
     await patchMissionWithRuntime(ctx, mission, {
       activeIntegrationAttemptId: attempt._id, integrationLeaseOwner: args.leaseOwner.slice(0, 160),
@@ -250,16 +278,27 @@ export const claim = mutation({
 });
 
 export const heartbeat = mutation({
-  args: fenceArgs,
+  args: {
+    ...fenceArgs,
+    state: v.optional(v.union(v.literal("command"), v.literal("provider"), v.literal("reconcile"))),
+    deadlineAt: v.optional(v.number()),
+  },
   handler: async (ctx, args) => {
     requireWorker(args.workerToken);
     const attempt: any = await ctx.db.get(args.id);
     const mission: any = attempt ? await ctx.db.get(attempt.missionId) : null;
     const job: any = attempt ? await ctx.db.get(attempt.jobId) : null;
     if (!exactFence(mission, attempt, args, job)) return false;
-    const until = Date.now() + LEASE_MS;
-    await ctx.db.patch(attempt._id, { leaseUntil: until, updatedAt: Date.now() });
-    await patchMissionWithRuntime(ctx, mission, { integrationLeaseUntil: until, updatedAt: Date.now() });
+    const now = Date.now();
+    if (args.deadlineAt !== undefined && (args.deadlineAt < now || args.deadlineAt > now + 6 * 60 * 60_000)) return false;
+    const until = now + LEASE_MS;
+    await ctx.db.patch(attempt._id, {
+      leaseUntil: until, controllerHeartbeatAt: now,
+      ...(args.state && args.state !== attempt.controllerState ? { controllerState: args.state, controllerStateSince: now } : {}),
+      ...(args.deadlineAt !== undefined ? { controllerDeadlineAt: args.deadlineAt } : {}),
+      updatedAt: now,
+    });
+    await patchMissionWithRuntime(ctx, mission, { integrationLeaseUntil: until, updatedAt: now });
     return true;
   },
 });
@@ -278,11 +317,12 @@ export const prepare = mutation({
     const mission: any = attempt ? await ctx.db.get(attempt.missionId) : null;
     const job: any = attempt ? await ctx.db.get(attempt.jobId) : null;
     if (!exactFence(mission, attempt, args, job)
+      || args.effectId.length < 1 || args.effectId.length > 300
       || !SHA.test(args.preparedIntegrationHeadSha) || !SHA.test(args.preparedIntegrationTreeSha)
       || !DIGEST.test(args.requestDigest)
       || (args.effectKind === "update_ref" && args.expectedIntegrationRefSha !== attempt.expectedIntegrationRefSha)) return null;
-    const effects = [...(attempt.effects ?? [])];
-    const existing = effects.find((effect: any) => effect.effectId === args.effectId);
+    const existing: any = await ctx.db.query("integrationProviderEffects")
+      .withIndex("by_attempt_effect", (q: any) => q.eq("integrationAttemptId", attempt._id).eq("effectId", args.effectId)).first();
     if (existing) {
       const same = existing.effectKind === args.effectKind && existing.provider === args.provider
         && existing.providerIdentity === args.providerIdentity && existing.providerMethod === args.providerMethod
@@ -292,16 +332,17 @@ export const prepare = mutation({
       return same ? { replay: true, observation: existing.observation ?? null } : null;
     }
     const now = Date.now();
-    effects.push({
-      effectId: args.effectId.slice(0, 300), effectKind: args.effectKind, provider: args.provider,
+    await ctx.db.insert("integrationProviderEffects", {
+      integrationAttemptId: attempt._id,
+      effectId: args.effectId, effectKind: args.effectKind, provider: args.provider,
       providerIdentity: args.providerIdentity.slice(0, 500), providerMethod: args.providerMethod,
       providerTarget: args.providerTarget.slice(0, 500), requestDigest: args.requestDigest,
       expectedBaseSha: args.expectedIntegrationRefSha,
       headSha: args.preparedIntegrationHeadSha, treeSha: args.preparedIntegrationTreeSha, preparedAt: now,
     });
     await ctx.db.patch(attempt._id, {
-      status: "prepared", effects,
-      ...(args.effectKind === "update_ref" ? { preparedEffectId: args.effectId.slice(0, 300) } : {}),
+      status: "prepared", providerEffectCount: Number(attempt.providerEffectCount ?? 0) + 1,
+      ...(args.effectKind === "update_ref" ? { preparedEffectId: args.effectId } : {}),
       preparedIntegrationHeadSha: args.preparedIntegrationHeadSha,
       preparedIntegrationTreeSha: args.preparedIntegrationTreeSha, updatedAt: now,
     });
@@ -316,24 +357,24 @@ export const observe = mutation({
     const attempt: any = await ctx.db.get(args.id);
     const mission: any = attempt ? await ctx.db.get(attempt.missionId) : null;
     const job: any = attempt ? await ctx.db.get(attempt.jobId) : null;
-    if (!exactFence(mission, attempt, args, job)) return false;
-    const effects = [...(attempt.effects ?? [])];
-    const index = effects.findIndex((effect: any) => effect.effectId === args.effectId);
-    if (index < 0) return false;
-    const effect = effects[index];
+    if (!exactFence(mission, attempt, args, job) || args.effectId.length < 1 || args.effectId.length > 300) return false;
+    const effect: any = await ctx.db.query("integrationProviderEffects")
+      .withIndex("by_attempt_effect", (q: any) => q.eq("integrationAttemptId", attempt._id).eq("effectId", args.effectId)).first();
+    if (!effect) return false;
     if (args.observation === "applied" && args.providerHeadSha !== effect.headSha) return false;
     if (effect.observation && (effect.observation !== args.observation
       || (effect.providerHeadSha ?? undefined) !== args.providerHeadSha)
       && effect.observation !== "unknown") return false;
     const now = Date.now();
-    effects[index] = {
-      ...effect, observation: args.observation, providerHeadSha: args.providerHeadSha,
-      providerResponse: args.providerResponse?.slice(0, 8_000), observedAt: now,
-    };
+    const providerResponse = args.providerResponse?.slice(0, 8_000);
+    const providerResponseDigest = args.providerResponse ? await sha256Hex(args.providerResponse) : undefined;
+    await ctx.db.patch(effect._id, {
+      observation: args.observation, providerHeadSha: args.providerHeadSha,
+      providerResponse, providerResponseDigest, observedAt: now,
+    });
     const finalEffect = effect.effectKind === "update_ref";
     await ctx.db.patch(attempt._id, {
       status: finalEffect && args.observation === "applied" ? "provider_waiting" : "prepared",
-      effects,
       ...(finalEffect ? { providerObservation: args.observation, providerObservedHeadSha: args.providerHeadSha } : {}),
       updatedAt: now,
     });
@@ -345,10 +386,12 @@ export const complete = mutation({
   args: { ...fenceArgs, effectId: v.string() },
   handler: async (ctx, args) => {
     requireWorker(args.workerToken);
+    if (args.effectId.length < 1 || args.effectId.length > 300) return false;
     const attempt: any = await ctx.db.get(args.id);
     const mission: any = attempt ? await ctx.db.get(attempt.missionId) : null;
     const job: any = attempt ? await ctx.db.get(attempt.jobId) : null;
-    const effect = (attempt?.effects ?? []).find((candidate: any) => candidate.effectId === args.effectId);
+    const effect: any = attempt ? await ctx.db.query("integrationProviderEffects")
+      .withIndex("by_attempt_effect", (q: any) => q.eq("integrationAttemptId", attempt._id).eq("effectId", args.effectId)).first() : null;
     if (!job || !exactFence(mission, attempt, args, job) || attempt.preparedEffectId !== args.effectId
       || effect?.effectKind !== "update_ref" || effect.observation !== "applied"
       || effect.providerHeadSha !== attempt.preparedIntegrationHeadSha
@@ -417,7 +460,7 @@ export const defer = mutation({
       : null;
     if (exhausted && !terminal) return false;
     await ctx.db.patch(attempt._id, {
-      status: exhausted ? "exhausted" : (attempt.preparedEffectId ? "prepared" : "queued"),
+      status: exhausted ? "exhausted" : "queued",
       outcome: exhausted ? "exhausted" : attempt.outcome,
       retryReason: `${args.reasonCode.slice(0, 80)}: ${args.reason.slice(0, 400)}`,
       cumulativeRetries: retries, leaseUntil: undefined,
@@ -569,6 +612,45 @@ export const park = mutation({
     return true;
   },
 });
+
+/** Job controls fence both controller leases in the same Convex transaction. */
+export async function controlIntegrationForJob(ctx: any, job: any, action: "pause" | "cancel" | "steer") {
+  if (!job.integrationAttemptId) return null;
+  const attempt: any = await ctx.db.get(job.integrationAttemptId);
+  if (!attempt || attempt.jobId !== job._id || TERMINAL.has(attempt.status)) return null;
+  const mission: any = await ctx.db.get(attempt.missionId);
+  const delivery: any = job.activeDeliveryAttemptId ? await ctx.db.get(job.activeDeliveryAttemptId) : null;
+  const now = Date.now();
+  if (mission?.activeIntegrationAttemptId === attempt._id) await patchMissionWithRuntime(ctx, mission, {
+    activeIntegrationAttemptId: undefined, integrationLeaseOwner: undefined, integrationLeaseToken: undefined,
+    integrationLeaseUntil: undefined, updatedAt: now,
+  });
+  if (action === "pause") {
+    await ctx.db.patch(attempt._id, {
+      status: "queued", leaseOwner: undefined, leaseToken: undefined,
+      leaseUntil: undefined, retryReason: "paused by job control", updatedAt: now,
+    });
+    if (delivery && !["done", "blocked", "abandoned"].includes(delivery.status)) await ctx.db.patch(delivery._id, {
+      status: "checkpointed", leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined,
+      retryReason: "paused by job control", heartbeatAt: now, updatedAt: now,
+    });
+    return { terminal: false };
+  }
+  const outcome = action === "steer" ? "stale" : "cancelled";
+  const reason = action === "steer" ? "signed review superseded by job steering" : "cancelled by job control";
+  const terminal = await writeIntegrationTerminalReceipt(ctx, attempt, outcome, { reason });
+  if (!terminal) throw new Error("job control integration receipt could not be canonicalized");
+  await ctx.db.patch(attempt._id, {
+    status: outcome, outcome, retryReason: reason, terminalReceiptDigest: terminal.receiptDigest,
+    leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined, completedAt: now, updatedAt: now,
+  });
+  if (delivery && !["done", "blocked", "abandoned"].includes(delivery.status)) await ctx.db.patch(delivery._id, {
+    status: "blocked", outcome, currentStep: "terminal", terminalReceiptDigest: terminal.receiptDigest,
+    leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined, completedAt: now, heartbeatAt: now, updatedAt: now,
+  });
+  await wakeNextIntegration(ctx, attempt);
+  return { terminal: true, outcome, receiptDigest: terminal.receiptDigest };
+}
 
 export const byMission = query({
   args: { missionId: v.id("missions"), ...viewerAuthArgs },
