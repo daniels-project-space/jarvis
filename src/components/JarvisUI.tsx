@@ -1,6 +1,5 @@
 "use client";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useRealtimeRun } from "@trigger.dev/react-hooks";
 import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
@@ -11,8 +10,7 @@ import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
 import { createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
 import {
   cacheCompactWorkSnapshot,
-  needsDaniel,
-  visibleCompactWork,
+  visibleWorkSnapshot,
   type CompactWorkCache,
   type CompactWorkSnapshot,
 } from "@/lib/active-work";
@@ -30,9 +28,8 @@ import {
   spectrumBandLevel,
   type LiveVadState,
 } from "@/lib/live-vad";
-import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, StructuredListView, CandlesView, MarketChartLoading, VideoListView, FleetView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView, PanelUnavailable } from "./Views";
+import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, StructuredListView, CandlesView, MarketChartLoading, VideoListView, GoalModeLauncherView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView, PanelUnavailable } from "./Views";
 import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
-import { parseTerminalOutput, type TerminalTone } from "@/lib/terminal-output";
 import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate, shouldIgnoreHandsFreeTranscript } from "@/lib/transcript";
 import { completeSpeechPrefix, isSpeaking as isTtsActuallySpeaking, unlockSpeechPlayback } from "@/lib/tts";
@@ -44,7 +41,7 @@ import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actio
 import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
 import { viewerFetch } from "@/lib/viewer-request";
 import { normalizeIncidentSignature } from "@/lib/incident-signature";
-import { CompactWorkBar } from "./CompactWorkBar";
+import { FleetCommandCenter } from "./CompactWorkBar";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -73,33 +70,6 @@ type Msg = {
   parentMessageId?: string;
   attachment?: Attachment;
   createdAt: number;
-};
-type Job = {
-  _id: string;
-  task: string;
-  label?: string;
-  agentId?: string;
-  model?: string;
-  modelReason?: string;
-  status: string;
-  stage?: string;
-  percent?: number;
-  progress?: string;
-  log?: string;
-  attempt?: number;
-  maxAttempts?: number;
-  heartbeatAt?: number;
-  progressAt?: number;
-  stalledAt?: number;
-  stallReason?: string;
-  checkpoint?: string;
-  branch?: string;
-  pullRequestUrl?: string;
-  visibility?: string;
-  incidentId?: string;
-  workerRunId?: string;
-  workerRuntime?: string;
-  startedAt: number;
 };
 type Caption = {
   who: "you" | "jarvis";
@@ -477,235 +447,6 @@ function ReactorRing({
       </svg>
     </div>
   );
-}
-
-// The agent's actual CLI session, streamed: tool calls and thoughts scroll in
-// live (auto-follows unless Daniel scrolled up to read something).
-const TERMINAL_TONE: Record<TerminalTone, string> = {
-  neutral: "text-slate-200/90",
-  muted: "text-slate-500",
-  command: "text-sky-300",
-  info: "text-blue-300",
-  accent: "text-violet-300",
-  value: "text-amber-300",
-  success: "text-emerald-300",
-  warning: "text-amber-300",
-  error: "text-rose-300",
-};
-
-function LiveSessionLog({ job }: { job: Job }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const pinned = useRef(true);
-  const [following, setFollowing] = useState(true);
-  const lines = useMemo(
-    () => parseTerminalOutput(job.log, job.progress || "starting up…"),
-    [job.log, job.progress],
-  );
-  const followTail = () => {
-    pinned.current = true;
-    setFollowing(true);
-    const el = ref.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  };
-  useEffect(() => {
-    const el = ref.current;
-    if (el && pinned.current) el.scrollTop = el.scrollHeight;
-  }, [lines]);
-  return (
-    <div
-      ref={ref}
-      onScroll={() => {
-        const el = ref.current;
-        if (!el) return;
-        const next = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-        pinned.current = next;
-        setFollowing(next);
-      }}
-      role="log"
-      aria-label={`${job.agentId ?? "agent"} live work terminal`}
-      aria-live="off"
-      className="scrollbar-thin mt-4 flex-1 overflow-auto rounded-xl border border-white/[0.08] bg-[#05070a]/95 font-mono text-[11px] leading-[1.65] shadow-[inset_0_1px_0_rgba(255,255,255,0.035),0_18px_60px_rgba(0,0,0,0.3)]"
-    >
-      <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-white/[0.07] bg-[#080b10]/95 px-3 py-2 backdrop-blur-xl">
-        <span className="flex gap-1.5" aria-hidden="true">
-          <span className="h-2 w-2 rounded-full bg-rose-400/75" />
-          <span className="h-2 w-2 rounded-full bg-amber-300/75" />
-          <span className="h-2 w-2 rounded-full bg-sky-300/75" />
-        </span>
-        <span className="min-w-0 flex-1 truncate text-[9px] uppercase tracking-[0.16em] text-slate-400">
-          agent://{job.agentId ?? "worker"}/{job.stage ?? job.status}
-        </span>
-        <button
-          type="button"
-          onClick={followTail}
-          className={`rounded px-1.5 py-0.5 text-[8px] uppercase tracking-[0.14em] transition ${following ? "text-cyan/70" : "bg-amber-300/10 text-amber-300 hover:bg-amber-300/15"}`}
-          title={following ? "Following live output" : "Resume following live output"}
-        >
-          {following ? "● follow" : "resume ↓"}
-        </button>
-      </div>
-      <ol className="min-w-full py-2" aria-label="Agent output">
-        {lines.map((line) => (
-          <li key={line.id} className="group grid min-h-[1.65em] grid-cols-[2.75rem_minmax(0,1fr)] px-3 hover:bg-white/[0.025]">
-            <span aria-hidden="true" className="select-none pr-3 text-right text-slate-700 group-hover:text-slate-600">
-              {String(line.number).padStart(2, "0")}
-            </span>
-            <span className="whitespace-pre-wrap break-words">
-              {line.spans.map((span, index) => (
-                <span key={`${line.id}:${index}`} className={TERMINAL_TONE[span.tone]}>{span.text}</span>
-              ))}
-            </span>
-          </li>
-        ))}
-        {job.status === "running" && (
-          <li className="grid min-h-[1.65em] grid-cols-[2.75rem_minmax(0,1fr)] px-3" aria-label="Agent is still working">
-            <span aria-hidden="true" className="pr-3 text-right text-slate-700">{String(lines.length + 1).padStart(2, "0")}</span>
-            <span aria-hidden="true" className="text-slate-500">› <span className="ml-1 inline-block h-3 w-1.5 animate-pulse bg-slate-300/70 align-middle" /></span>
-          </li>
-        )}
-      </ol>
-    </div>
-  );
-}
-
-type AgentLiveViewProps = {
-  job: Job;
-  now: number;
-  compact: boolean;
-  activeCount: number;
-  onCompact: () => void;
-  onClose: () => void;
-  onNext: () => void;
-};
-
-function AgentLiveSurface({
-  job,
-  now,
-  compact,
-  activeCount,
-  onCompact,
-  onClose,
-  onNext,
-}: AgentLiveViewProps) {
-  const [acting, setActing] = useState("");
-  const elapsed = Math.max(0, Math.floor((now - job.startedAt) / 1000));
-  const pct = Math.max(0, Math.min(100, job.percent ?? 0));
-  const owner = ({ paul: "Paul", atlas: "Atlas", iris: "Iris", maya: "Maya", sentry: "Sentry", jarvis: "JARVIS" } as Record<string, string>)[job.agentId ?? ""] ?? "Agent";
-  const control = async (action: "approve" | "decline" | "pause" | "resume" | "cancel") => {
-    setActing(action);
-    try {
-      await viewerFetch("/api/work-control", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jobId: job._id, action }),
-      });
-    } finally {
-      setActing("");
-    }
-  };
-  return (
-    <div data-work-overlay="active-task" className={`materialize glass relative flex h-full flex-col rounded-2xl ${compact ? "p-3" : "p-4 pt-5"}`}>
-      <div className="flex items-center justify-between">
-        <div className="flex min-w-0 items-center gap-2">
-          <ModelBadge model={job.model} />
-          <span className="hud-label truncate">{owner} · {job.stage ?? job.status} · {elapsed}s</span>
-          {(job.attempt ?? 1) > 1 && <span className="hud-label text-amber">pass {job.attempt}/{job.maxAttempts ?? 12}</span>}
-        </div>
-        <div className="flex items-center gap-1">
-          {activeCount > 1 && (
-            <button onClick={onNext} className="hud-label rounded px-2 py-1 hover:text-cyan" title="Show next active task">
-              next · {activeCount}
-            </button>
-          )}
-          <button onClick={onCompact} className="hud-label rounded px-2 py-1 hover:text-cyan">
-            {compact ? "expand" : "minimize"}
-          </button>
-          <button onClick={onClose} className="hud-label rounded px-2 py-1 hover:text-cyan">close</button>
-        </div>
-      </div>
-      <div className={`${compact ? "mt-2 truncate text-xs" : "mt-3 text-sm"} text-ice`}>{job.label ?? job.task}</div>
-      {!compact && job.label && <div className="mt-1 text-xs text-slate">{job.task}</div>}
-      <div className={`${compact ? "mt-2" : "mt-3"} flex items-center gap-2`}>
-        <div className="h-px flex-1 overflow-hidden rounded-full bg-white/10">
-        <div
-          className="h-full bg-gradient-to-r from-cyan to-sky-400 transition-all duration-1000"
-          style={{ width: `${pct}%` }}
-        />
-        </div>
-        <span className="font-mono text-[10px] text-cyan">{pct}%</span>
-      </div>
-      {!compact && (job.branch || job.pullRequestUrl || job.modelReason) && (
-        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-slate">
-          {job.branch && <span className="font-mono">branch · {job.branch}</span>}
-          {job.pullRequestUrl && <a href={job.pullRequestUrl} target="_blank" rel="noreferrer" className="text-cyan hover:underline">draft PR ↗</a>}
-          {job.modelReason && <span title={job.modelReason}>routing · {job.model ? workModelLabel(job.model) : "auto"}</span>}
-        </div>
-      )}
-      {compact
-        ? <div className="mt-2 truncate pr-28 font-mono text-[10px] text-slate">{job.progress ?? job.stage ?? "working"}</div>
-        : <LiveSessionLog job={job} />}
-      <div className={`${compact ? "absolute bottom-2 right-3" : "mt-2 justify-end"} flex gap-1.5`}>
-        {job.status === "awaiting_approval" && (
-          <>
-            <button disabled={Boolean(acting)} onClick={() => void control("approve")} className="rounded border border-cyan/35 bg-cyan/10 px-2 py-0.5 text-[8px] uppercase tracking-wider text-cyan disabled:opacity-40">approve</button>
-            <button disabled={Boolean(acting)} onClick={() => void control("decline")} className="rounded border border-white/10 px-2 py-0.5 text-[8px] uppercase tracking-wider text-slate disabled:opacity-40">decline</button>
-          </>
-        )}
-        {!needsDaniel(job) && job.status === "running" && <>
-          <button disabled={Boolean(acting)} onClick={() => void control("pause")} className="rounded px-2 py-0.5 text-[8px] uppercase tracking-wider text-slate disabled:opacity-40">pause</button>
-          <button disabled={Boolean(acting)} onClick={() => void control("cancel")} className="rounded px-2 py-0.5 text-[8px] uppercase tracking-wider text-red-300/80 disabled:opacity-40">cancel</button>
-        </>}
-        {!needsDaniel(job) && (job.status === "paused" || job.status === "stalled") && (
-          <button disabled={Boolean(acting)} onClick={() => void control("resume")} className="rounded px-2 py-0.5 text-[8px] uppercase tracking-wider text-cyan disabled:opacity-40">resume</button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function TriggerRealtimeAgentView({
-  accessToken,
-  ...props
-}: AgentLiveViewProps & { accessToken: string }) {
-  const { run } = useRealtimeRun(props.job.workerRunId ?? "", { accessToken });
-  const liveJob = useMemo(() => {
-    const data = (run?.metadata ?? {}) as Record<string, unknown>;
-    const text = (key: string) => typeof data[key] === "string" ? String(data[key]) : undefined;
-    const numeric = (key: string) => Number.isFinite(Number(data[key])) ? Number(data[key]) : undefined;
-    return {
-      ...props.job,
-      stage: text("stage") ?? props.job.stage,
-      progress: text("progress") ?? props.job.progress,
-      log: text("logTail") ?? props.job.log,
-      percent: numeric("percent") ?? props.job.percent,
-    };
-  }, [props.job, run?.metadata]);
-  return <AgentLiveSurface {...props} job={liveJob} />;
-}
-
-function AgentLiveView(props: AgentLiveViewProps) {
-  const [accessToken, setAccessToken] = useState("");
-  useEffect(() => {
-    setAccessToken("");
-    if (!props.job.workerRunId) return;
-    const abort = new AbortController();
-    void viewerFetch("/api/work-realtime", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jobId: props.job._id }),
-      signal: abort.signal,
-    })
-      .then((response) => response.ok ? response.json() : null)
-      .then((payload) => {
-        if (!abort.signal.aborted && typeof payload?.accessToken === "string") setAccessToken(payload.accessToken);
-      })
-      .catch(() => {});
-    return () => abort.abort();
-  }, [props.job._id, props.job.workerRunId]);
-
-  return accessToken && props.job.workerRunId
-    ? <TriggerRealtimeAgentView {...props} accessToken={accessToken} />
-    : <AgentLiveSurface {...props} />;
 }
 
 // Animated count-up for KPI tiles.
@@ -1177,7 +918,7 @@ function Viewport({
       ) : route.renderer === "creations" ? (
         <CreationsView value={panel.value} />
       ) : route.renderer === "fleet" ? (
-        <FleetView value={panel.value} />
+        <GoalModeLauncherView />
       ) : route.renderer === "board" ? (
         <BoardView value={panel.value} />
       ) : route.renderer === "scene" ? (
@@ -1414,7 +1155,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => {
     compactWorkCache.current = cacheCompactWorkSnapshot(compactWorkCache.current, thread, commandSnapshot);
   }, [commandSnapshot, thread]);
-  const compactWork = visibleCompactWork(compactWorkCache.current, thread, commandSnapshot);
+  const visibleCommandSnapshot = visibleWorkSnapshot(compactWorkCache.current, thread, commandSnapshot);
   const lastHostNotificationId = useRef<string | null>(null);
   useEffect(() => {
     if (!embedded) return;
@@ -1514,14 +1255,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     });
   };
   useEffect(() => () => clearCaptionTimers(), []);
-  const [detailJobId, setDetailJobId] = useState<string | null>(null);
-  const requestedDetailId = detailJobId === compactWork?.id ? detailJobId : null;
-  const detailedJobs = useJarvisQuery(api.jobs.active, requestedDetailId ? {} : "skip") as Job[] | undefined;
-  const shownJob = useMemo(
-    () => requestedDetailId ? detailedJobs?.find((job) => job._id === requestedDetailId) ?? null : null,
-    [detailedJobs, requestedDetailId],
-  );
-  const [nowTs, setNowTs] = useState(0);
+  const [commandExpanded, setCommandExpanded] = useState(false);
   // Viewport minimize: keep talking and the panel folds into a pill; the orb
   // comes back. Fresh panel content pops it open again.
   // Start folded: the first Convex snapshot may be hours old. Only content
@@ -2065,17 +1799,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     );
     return true;
   }
-
-  const shownJobId = shownJob?._id ?? null;
-  useEffect(() => {
-    if (!shownJobId) return;
-    const first = setTimeout(() => setNowTs(Date.now()), 0);
-    const t = setInterval(() => setNowTs(Date.now()), 1000);
-    return () => {
-      clearTimeout(first);
-      clearInterval(t);
-    };
-  }, [shownJobId]);
 
   const busy = sending || messages.some((m) => m.status === "pending" || (m.role === "assistant" && m.status === "streaming"));
 
@@ -3397,28 +3120,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               </button>
             </div>
           )}
-          <CompactWorkBar
-            work={compactWork}
-            hidden={overlayUp || Boolean(shownJob)}
-            onOpen={() => {
-              if (compactWork) setDetailJobId(compactWork.id);
-            }}
+          <FleetCommandCenter
+            snapshot={visibleCommandSnapshot}
+            hidden={overlayUp}
+            onExpandedChange={setCommandExpanded}
           />
-          {shownJob && !overlayUp ? (
-            <div
-              className="absolute left-2 top-12 z-30 h-[min(430px,70vh)] w-[min(620px,calc(100%-16px))] will-change-transform sm:left-4"
-            >
-              <AgentLiveView
-                job={shownJob}
-                now={nowTs}
-                compact={false}
-                activeCount={1}
-                onCompact={() => setDetailJobId(null)}
-                onClose={() => setDetailJobId(null)}
-                onNext={() => undefined}
-              />
-            </div>
-          ) : null}
           {panel && panel.type !== "video" && !panelMin && !panelFull ? (
             <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-10 md:pr-[36%] lg:pl-16" : "justify-center"}`}>
               <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${stagePanelSize}`}>
@@ -3438,14 +3144,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               compact overlay hides them too (md:opacity-100 brings them back). */}
           <ReactorRing
             active={live === "live" || orbState === "thinking" || orbState === "listening"}
-            aside={compactAside}
+            aside={compactAside || (commandExpanded && !overlayUp)}
             hidden={fullBleed}
             motionRef={orbMotionRef}
             reduceMotion={prefs.reduceMotion}
           />
           <div
             className={`h-full w-full transition-opacity duration-500 ${
-              fullBleed ? "pointer-events-none opacity-0" : compactAside ? "pointer-events-none opacity-0 md:opacity-100" : "opacity-100"
+              fullBleed ? "pointer-events-none opacity-0" : compactAside || (commandExpanded && !overlayUp) ? "pointer-events-none opacity-0 md:opacity-100" : "opacity-100"
             }`}
           >
             <ThreeOrb
@@ -3453,7 +3159,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               energyRef={energyRef}
               moodColor={moodColor}
               motionRef={orbMotionRef}
-              aside={compactAside}
+              aside={compactAside || (commandExpanded && !overlayUp)}
               reduceMotion={prefs.reduceMotion}
             />
           </div>
@@ -3463,7 +3169,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               aria-label="Interrupt Jarvis"
               title="Tap the orb to interrupt"
               onClick={stopTalking}
-              className={compactAside
+              className={compactAside || (commandExpanded && !overlayUp)
                 ? "absolute bottom-[25%] left-[69%] right-[3%] top-[25%] z-20 hidden rounded-full bg-transparent md:block"
                 : "absolute inset-[28%] z-20 rounded-full bg-transparent"}
             />
@@ -3472,7 +3178,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               finalization and narration. Compact overlays keep it beside their
               visible orb; only a truly full-screen workspace owns the surface. */}
           {caption && !fullBleed && (
-            <div className={`pointer-events-none absolute top-[52%] z-30 flex justify-center px-6 ${compactAside ? "hidden md:flex md:left-[62%] md:right-0" : "inset-x-0"}`}>
+            <div className={`pointer-events-none absolute top-[52%] z-30 flex justify-center px-6 ${compactAside || (commandExpanded && !overlayUp) ? "hidden md:flex md:left-[62%] md:right-0" : "inset-x-0"}`}>
               <SpokenCaption caption={caption} />
             </div>
           )}
