@@ -255,6 +255,10 @@ export function providerKindsForPaths(paths: readonly string[]): ProviderKind[] 
 }
 
 type AliasRule = Readonly<{ pattern: string; targets: readonly string[]; base: string }>;
+type AliasConfiguration = Readonly<{
+  local: readonly AliasRule[];
+  externalPackageImports: readonly string[];
+}>;
 
 function parseJsonConfig(source: string): Record<string, any> | null {
   let clean = "";
@@ -318,25 +322,32 @@ function stringTargets(value: unknown): string[] {
   return [];
 }
 
-function repositoryAliasRules(sources: ReadonlyMap<string, string>): AliasRule[] {
+function repositoryAliasRules(sources: ReadonlyMap<string, string>): AliasConfiguration {
   const rules: AliasRule[] = [];
+  const externalPackageImports: string[] = [];
   const tsconfig = parseJsonConfig(sources.get("tsconfig.json") ?? "");
   const compiler = tsconfig?.compilerOptions;
   if (compiler && typeof compiler === "object" && compiler.paths && typeof compiler.paths === "object") {
     const base = normalizedPath(typeof compiler.baseUrl === "string" ? compiler.baseUrl : ".");
     for (const [pattern, rawTargets] of Object.entries(compiler.paths as Record<string, unknown>)) {
-      const targets = stringTargets(rawTargets).filter((target) => target.startsWith(".") || !/^[a-z]+:/i.test(target));
+      const targets = stringTargets(rawTargets).filter(
+        (target) => (target.startsWith(".") || !/^[a-z]+:/i.test(target)) && !/^\.?\/?node_modules\//.test(target),
+      );
       if (pattern && targets.length) rules.push({ pattern, targets, base });
     }
   }
   const pkg = parseJsonConfig(sources.get("package.json") ?? "");
   if (pkg?.imports && typeof pkg.imports === "object") {
     for (const [pattern, rawTargets] of Object.entries(pkg.imports as Record<string, unknown>)) {
-      const targets = stringTargets(rawTargets).filter((target) => target.startsWith("./"));
+      const configuredTargets = stringTargets(rawTargets);
+      const targets = configuredTargets.filter((target) => target.startsWith("./"));
       if (pattern.startsWith("#") && targets.length) rules.push({ pattern, targets, base: "." });
+      if (pattern.startsWith("#") && configuredTargets.some((target) => !target.startsWith("./"))) {
+        externalPackageImports.push(pattern);
+      }
     }
   }
-  return rules;
+  return { local: rules, externalPackageImports };
 }
 
 function aliasMatch(pattern: string, specifier: string): string | null {
@@ -351,8 +362,12 @@ function aliasMatch(pattern: string, specifier: string): string | null {
 
 function existingCandidates(candidateInput: string, sources: ReadonlyMap<string, string>): string[] {
   const candidate = normalizedPath(candidateInput);
-  const explicit = extname(candidate)
-    ? [candidate]
+  const extension = extname(candidate);
+  const jsRuntimeAlternates = /\.(?:mjs|cjs|js|jsx)$/i.test(extension)
+    ? [candidate.replace(/\.(?:mjs|cjs|js|jsx)$/i, ".ts"), candidate.replace(/\.(?:mjs|cjs|js|jsx)$/i, ".tsx")]
+    : [];
+  const explicit = extension
+    ? [candidate, ...jsRuntimeAlternates]
     : [candidate, ...SOURCE_EXTENSIONS.map((extension) => `${candidate}${extension}`), ...SOURCE_EXTENSIONS.map((extension) => `${candidate}/index${extension}`)];
   const candidates = new Set(explicit);
   if (!extname(candidate)) {
@@ -367,15 +382,18 @@ function resolveLocalImports(
   from: string,
   specifier: string,
   sources: ReadonlyMap<string, string>,
-  aliases: readonly AliasRule[],
-): string[] {
+  aliases: AliasConfiguration,
+): { resolved: string[]; localExpected: boolean } {
   const candidates: string[] = [];
+  let localExpected = false;
   if (specifier.startsWith(".")) {
+    localExpected = true;
     candidates.push(posix.join(dirname(from), specifier));
   } else {
-    for (const rule of aliases) {
+    for (const rule of aliases.local) {
       const matched = aliasMatch(rule.pattern, specifier);
       if (matched === null) continue;
+      localExpected = true;
       for (const target of rule.targets) {
         const expanded = target.includes("*") ? target.replace("*", matched) : target;
         candidates.push(posix.join(rule.base, expanded));
@@ -384,26 +402,40 @@ function resolveLocalImports(
     // Preserve the repository's long-standing aliases even if an older target
     // snapshot omitted its root tsconfig from a bounded source fixture.
     if (!candidates.length && (specifier.startsWith("@/") || specifier.startsWith("~/"))) {
+      localExpected = true;
       candidates.push(`src/${specifier.slice(2)}`);
     }
+    if (specifier.startsWith("#")) {
+      const explicitlyExternal = aliases.externalPackageImports.some(
+        (pattern) => aliasMatch(pattern, specifier) !== null,
+      );
+      if (!explicitlyExternal || localExpected) localExpected = true;
+    }
+    if (specifier.startsWith("/")) localExpected = true;
   }
-  return [...new Set(candidates.flatMap((candidate) => existingCandidates(candidate, sources)))];
+  return {
+    resolved: [...new Set(candidates.flatMap((candidate) => existingCandidates(candidate, sources)))],
+    localExpected,
+  };
 }
 
 function importsFor(
   path: string,
   source: string,
   sources: ReadonlyMap<string, string>,
-  aliases: readonly AliasRule[],
-): string[] {
+  aliases: AliasConfiguration,
+): { dependencies: string[]; unresolved: string[] } {
   const imports = new Set<string>();
+  const unresolved = new Set<string>();
   for (const pattern of [IMPORT_SPECIFIER, RUNTIME_FILE_SPECIFIER]) {
     pattern.lastIndex = 0;
     for (const match of source.matchAll(pattern)) {
-      for (const resolved of resolveLocalImports(path, match[1], sources, aliases)) imports.add(resolved);
+      const resolution = resolveLocalImports(path, match[1], sources, aliases);
+      for (const resolved of resolution.resolved) imports.add(resolved);
+      if (resolution.localExpected && resolution.resolved.length === 0) unresolved.add(match[1]);
     }
   }
-  return [...imports];
+  return { dependencies: [...imports], unresolved: [...unresolved] };
 }
 
 function reachableFrom(roots: readonly string[], graph: ReadonlyMap<string, readonly string[]>): Set<string> {
@@ -439,8 +471,12 @@ export function analyseProviderImpact(
   }
   const aliases = repositoryAliasRules(sources);
   const graph = new Map<string, readonly string[]>();
+  const unresolved = new Map<string, readonly string[]>();
   for (const [path, source] of sources) {
-    if (SOURCE_LIKE.test(path)) graph.set(path, importsFor(path, source, sources, aliases));
+    if (!SOURCE_LIKE.test(path)) continue;
+    const imports = importsFor(path, source, sources, aliases);
+    graph.set(path, imports.dependencies);
+    if (imports.unresolved.length) unresolved.set(path, imports.unresolved);
   }
   const convexReachable = reachableFrom(
     [...sources.keys()].filter((path) => path.startsWith("convex/") && SOURCE_LIKE.test(path)),
@@ -450,6 +486,19 @@ export function analyseProviderImpact(
     [...sources.keys()].filter((path) => (path.startsWith("src/trigger/") || /^trigger\.config\./.test(path)) && SOURCE_LIKE.test(path)),
     graph,
   );
+  const unresolvedProviderImports = [
+    ...[...convexReachable].flatMap((path) => (unresolved.get(path) ?? []).map(
+      (specifier) => `convex:${path}:${specifier}`,
+    )),
+    ...[...triggerReachable].flatMap((path) => (unresolved.get(path) ?? []).map(
+      (specifier) => `trigger:${path}:${specifier}`,
+    )),
+  ].sort();
+  if (unresolvedProviderImports.length) {
+    throw new Error(
+      `provider impact analysis could not resolve candidate-local imports: ${unresolvedProviderImports.join(", ")}`,
+    );
+  }
   const reasons: Record<ProviderKind, string[]> = { convex: [], trigger: [] };
   const add = (kind: ProviderKind, reason: string) => {
     if (!reasons[kind].includes(reason)) reasons[kind].push(reason);

@@ -62,6 +62,22 @@ export function convexReleaseAction(phase: ProviderReleaseStep["phase"]): "local
   return phase === "premerge" ? "local-proof" : "live-deploy";
 }
 
+export function convexPremergeReceiptProvesNoMutation(result: ProviderCommandResult): boolean {
+  const receipt = result.receipt;
+  return receipt.protocol === 1
+    && receipt.candidateSandbox === true
+    && receipt.executable === "npx"
+    && receipt.capability === "CONVEX_DEPLOY_KEY"
+    && receipt.closeObserved === true
+    && receipt.timedOut === false
+    && receipt.closedAt >= receipt.startedAt
+    && /^[0-9a-f]{64}$/.test(receipt.commandDigest)
+    && receipt.argv.length === CONVEX_PREMERGE_PROOF_COMMAND.length
+    && receipt.argv.every((value, index) => value === CONVEX_PREMERGE_PROOF_COMMAND[index])
+    && receipt.argv.includes("--dry-run")
+    && !receipt.argv.includes("--yes");
+}
+
 export async function installDependenciesInPinnedCheckout(input: {
   sourceSha: string;
   verifyPinned: (sourceSha: string) => Promise<string>;
@@ -739,6 +755,9 @@ class TrustedProviderReleaseRuntime {
         capability: { name: "CONVEX_DEPLOY_KEY", value: deployKey },
       });
       const output = this.candidateOutput(result, "Convex typecheck and bundle dry-run");
+      if (!convexPremergeReceiptProvesNoMutation(result)) {
+        throw new Error("Convex premerge command receipt did not prove the exact non-mutating dry-run argv");
+      }
       const expected = `Would have deployed Convex functions to ${target.url.replace(/\/$/, "")}`;
       if (!output.includes(expected) || /(?:^|\n)\s*Deployed Convex functions to\b/i.test(output)) {
         throw new Error(`Convex dry-run did not attest exact non-mutating target ${target.deployment}`);
@@ -958,12 +977,9 @@ class TrustedProviderReleaseRuntime {
     // collision checks are all complete before either Trigger capability is
     // retrieved. Candidate config can observe its own project access token;
     // this boundary does not claim egress secrecy for that target token.
-    const [accessToken, secretKey] = await Promise.all([
-      this.capability(trigger.accessToken),
-      this.capability(trigger.secretKey),
-    ]);
-    configure({ accessToken: secretKey });
+    let accessToken: string | undefined;
     if (!version) {
+      accessToken = await this.capability(trigger.accessToken);
       const generatedPath = join(dir, attestor.relativePath);
       writeFileSync(generatedPath, attestor.source, { mode: 0o600 });
       let output = "";
@@ -989,6 +1005,12 @@ class TrustedProviderReleaseRuntime {
         data: { sourceSha, taskId: attestor.taskId, staged: true },
       }))) throw new Error("the staged Trigger version could not be persisted");
     }
+
+    // The access-token deploy namespace has emitted CLOSE and the immutable
+    // version handoff is durable before the controller retrieves/configures
+    // the separate SDK secret used to attest that staged worker.
+    const secretKey = await this.capability(trigger.secretKey);
+    configure({ accessToken: secretKey });
 
     let pinnedRunId = typeof priorData.pinnedRunId === "string" ? priorData.pinnedRunId : "";
     if (!priorData.pinnedAttested) {
@@ -1034,6 +1056,7 @@ class TrustedProviderReleaseRuntime {
       }))) throw new Error("the staged Jarvis sandbox proof could not be persisted");
     }
 
+    accessToken ??= await this.capability(trigger.accessToken);
     const promoteResult = await this.candidateCommand({
       command: "npx",
       args: triggerPromoteCommand(trigger.projectRef, version),

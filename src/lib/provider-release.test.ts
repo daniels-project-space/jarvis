@@ -104,6 +104,39 @@ describe("trusted provider release planning", () => {
       .toEqual(["trigger"]);
   });
 
+  it("fails closed on unresolved provider-local relative imports", () => {
+    expect(() => analyseProviderImpact(["src/components/OnlyWeb.tsx"], {
+      "convex/jobs.ts": 'import { missing } from "../src/lib/missing-provider"; export { missing };',
+      "src/components/OnlyWeb.tsx": "export const web = true;",
+    })).toThrow(/convex:convex\/jobs\.ts:\.\.\/src\/lib\/missing-provider/);
+  });
+
+  it("fails closed on unresolved configured tsconfig aliases", () => {
+    expect(() => analyseProviderImpact(["src/components/OnlyWeb.tsx"], {
+      "tsconfig.json": JSON.stringify({ compilerOptions: { paths: { "@provider/*": ["./src/provider/*"] } } }),
+      "src/trigger/agent-runner.ts": 'import { missing } from "@provider/missing"; export { missing };',
+      "src/components/OnlyWeb.tsx": "export const web = true;",
+    })).toThrow(/trigger:src\/trigger\/agent-runner\.ts:@provider\/missing/);
+  });
+
+  it("fails closed on unresolved local package-import aliases", () => {
+    expect(() => analyseProviderImpact(["src/components/OnlyWeb.tsx"], {
+      "package.json": JSON.stringify({ imports: { "#provider/*": "./src/provider/*" } }),
+      "convex/jobs.ts": 'import { missing } from "#provider/missing"; export { missing };',
+      "src/components/OnlyWeb.tsx": "export const web = true;",
+    })).toThrow(/convex:convex\/jobs\.ts:#provider\/missing/);
+  });
+
+  it("keeps genuinely external npm and external package-import targets external", () => {
+    const impact = analyseProviderImpact(["src/components/OnlyWeb.tsx"], {
+      "package.json": JSON.stringify({ imports: { "#sdk": "@trigger.dev/sdk/v3" } }),
+      "convex/jobs.ts": 'import { v } from "convex/values"; import sdk from "#sdk"; export { v, sdk };',
+      "src/trigger/agent-runner.ts": 'import { task } from "@trigger.dev/sdk/v3"; export { task };',
+      "src/components/OnlyWeb.tsx": "export const web = true;",
+    });
+    expect(impact.providers).toEqual([]);
+  });
+
   it("keeps web-only shared modules off both exact provider release paths", () => {
     const sources = {
       "tsconfig.json": JSON.stringify({ compilerOptions: { paths: { "@/*": ["./src/*"] } } }),

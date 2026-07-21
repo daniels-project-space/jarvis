@@ -4,10 +4,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CONVEX_PREMERGE_PROOF_COMMAND,
+  convexPremergeReceiptProvesNoMutation,
   convexReleaseAction,
+  createProviderToolSession,
   generatedTriggerAttestor,
   installDependenciesInPinnedCheckout,
-  safeProviderToolEnv,
   triggerDeployCommand,
   triggerPromoteCommand,
   triggerReleaseEnv,
@@ -83,23 +84,30 @@ export default defineConfig({
       NODE_OPTIONS: "--require=/tmp/jarvis-hook.cjs",
       NPM_CONFIG_REGISTRY: "https://registry.example/?token=jarvis",
     };
-    const env = triggerReleaseEnv(base, "dropship-target-access-token");
-    expect(env.TRIGGER_ACCESS_TOKEN).toBe("dropship-target-access-token");
-    for (const key of [
-      "VAULT_ACCESS_TOKEN", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN",
-      "CODEX_AUTH_JSON_B64", "CODEX_ACCESS_TOKEN", "GITHUB_TOKEN", "CONVEX_URL",
-      "NEXT_PUBLIC_CONVEX_URL", "CONVEX_DEPLOY_KEY_JARVIS_CANONICAL",
-      "TRIGGER_ACCESS_TOKEN_JARVIS", "NODE_OPTIONS", "NPM_CONFIG_REGISTRY",
-    ]) expect(env[key], key).toBeUndefined();
+    const session = createProviderToolSession(base);
+    try {
+      const env = triggerReleaseEnv(base, "dropship-target-access-token", session);
+      expect(env.TRIGGER_ACCESS_TOKEN).toBe("dropship-target-access-token");
+      expect(env.HOME).toBe(session.home);
+      expect(env.HOME).not.toBe(base.HOME);
+      for (const key of [
+        "VAULT_ACCESS_TOKEN", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN",
+        "CODEX_AUTH_JSON_B64", "CODEX_ACCESS_TOKEN", "GITHUB_TOKEN", "CONVEX_URL",
+        "NEXT_PUBLIC_CONVEX_URL", "CONVEX_DEPLOY_KEY_JARVIS_CANONICAL",
+        "TRIGGER_ACCESS_TOKEN_JARVIS", "NODE_OPTIONS", "NPM_CONFIG_REGISTRY",
+      ]) expect(env[key], key).toBeUndefined();
 
-    expect(triggerDeployCommand(dropshipProject)).toEqual([
-      "trigger.dev", "deploy", "--project-ref", dropshipProject,
-      "--env-file", "/dev/null", "--skip-promotion", "--skip-sync-env-vars",
-    ]);
-    expect(triggerPromoteCommand(dropshipProject, "20260720.42"))
-      .toEqual(["trigger.dev", "promote", "20260720.42", "--project-ref", dropshipProject]);
-    expect(dropshipConfig).toContain("syncEnvVars");
-    expect(env.VAULT_ACCESS_TOKEN).toBeUndefined();
+      expect(triggerDeployCommand(dropshipProject)).toEqual([
+        "--no-install", "trigger.dev", "deploy", "--project-ref", dropshipProject,
+        "--env-file", "/dev/null", "--skip-promotion", "--skip-sync-env-vars",
+      ]);
+      expect(triggerPromoteCommand(dropshipProject, "20260720.42"))
+        .toEqual(["--no-install", "trigger.dev", "promote", "20260720.42", "--project-ref", dropshipProject]);
+      expect(dropshipConfig).toContain("syncEnvVars");
+      expect(env.VAULT_ACCESS_TOKEN).toBeUndefined();
+    } finally {
+      session.cleanup();
+    }
   });
 
   it("injects a collision-resistant target-native task into Dropship's actual task directory shape", () => {
@@ -137,15 +145,40 @@ export default defineConfig({
     expect(convexReleaseAction("premerge")).toBe("local-proof");
     expect(convexReleaseAction("postmerge")).toBe("live-deploy");
     expect(CONVEX_PREMERGE_PROOF_COMMAND).toEqual([
-      "tsc", "--project", "convex/tsconfig.json", "--noEmit", "--incremental", "false",
+      "--no-install", "convex", "deploy", "--dry-run", "--typecheck", "enable",
+      "--codegen", "disable", "--env-file", "/dev/null",
     ]);
-    expect(CONVEX_PREMERGE_PROOF_COMMAND.join(" ")).not.toMatch(/convex\s+deploy|deploy\s+--/);
+    const exact = {
+      code: 0,
+      out: "Would have deployed Convex functions to https://target.convex.cloud",
+      receipt: {
+        protocol: 1 as const,
+        candidateSandbox: true as const,
+        executable: "npx" as const,
+        argv: CONVEX_PREMERGE_PROOF_COMMAND,
+        commandDigest: "a".repeat(64),
+        startedAt: 10,
+        closedAt: 20,
+        closeObserved: true as const,
+        timedOut: false,
+        capability: "CONVEX_DEPLOY_KEY" as const,
+      },
+    };
+    expect(convexPremergeReceiptProvesNoMutation(exact)).toBe(true);
+    expect(convexPremergeReceiptProvesNoMutation({
+      ...exact,
+      receipt: { ...exact.receipt, argv: [...CONVEX_PREMERGE_PROOF_COMMAND, "--yes"] },
+    })).toBe(false);
     const runtimeSource = readFileSync(join(process.cwd(), "src/trigger/provider-release-runtime.ts"), "utf8");
     expect(runtimeSource).toContain('if (step.phase !== "postmerge") throw new Error("live Convex deployment is forbidden before merge")');
+    expect(runtimeSource).not.toContain("const [accessToken, secretKey] = await Promise.all");
+    expect(runtimeSource.indexOf("this.candidateOutput(result, `Trigger ${trigger.projectRef} staged deploy`)")).toBeLessThan(
+      runtimeSource.indexOf("const secretKey = await this.capability(trigger.secretKey)"),
+    );
   });
 
   it("rejects credential-bearing proxy URLs from provider tools", () => {
-    expect(() => safeProviderToolEnv({ NODE_ENV: "test", HTTPS_PROXY: "https://u:p@proxy.example" }))
+    expect(() => createProviderToolSession({ NODE_ENV: "test", HTTPS_PROXY: "https://u:p@proxy.example" }))
       .toThrow(/credential-bearing/);
   });
 });

@@ -1,6 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
-import { createRequire } from "node:module";
 import {
   chmodSync,
   closeSync,
@@ -20,7 +19,6 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-const PINNED_CODEX_VERSION = "0.144.5";
 const PROVIDER_PATH = "/workspace/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const CONTROLLER_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const RECEIPT_PROTOCOL = 1;
@@ -34,6 +32,19 @@ const PROXY_URL_KEYS = new Set(["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "http
 const CAPABILITY_KEYS = ["CONVEX_DEPLOY_KEY", "TRIGGER_ACCESS_TOKEN"] as const;
 const REQUIRED_TOOLS = ["node", "npm", "npx", "git", "gh", "curl"] as const;
 const consumedReceiptNonces = new Set<string>();
+
+export const PROVIDER_NAMESPACE_FLAGS = Object.freeze([
+  "--user",
+  "--map-root-user",
+  "--mount",
+  "--pid",
+  "--fork",
+  "--kill-child=SIGKILL",
+  "--ipc",
+  "--uts",
+  "--propagation",
+  "unchanged",
+] as const);
 
 export type ProviderCapabilityName = typeof CAPABILITY_KEYS[number];
 
@@ -117,7 +128,6 @@ type RuntimePaths = Readonly<{
   bin: string;
   lib: string;
   lib64: string;
-  codexNative: string;
   devNull: string;
   devZero: string;
   devRandom: string;
@@ -156,9 +166,10 @@ const ETC_RUNTIME_CANDIDATES = Object.freeze([
 /**
  * Fixed setup code. Candidate text is never evaluated by this shell: every
  * command and candidate argument remains a positional argv element. The outer
- * user/mount/PID/IPC/UTS namespace builds a narrow chroot; pinned Codex then
- * applies its managed bubblewrap SandboxState and supplies the candidate's
- * final private PID namespace and /proc mount.
+ * user/mount/PID/IPC/UTS namespace builds a narrow chroot with a read-only
+ * runtime, a writable checkout, read-only controller-owned Git metadata, and
+ * a fresh /proc. The final fixed shell only assembles env -i argv before it
+ * execs the already-separated command under drop-all/no_new_privs.
  */
 export const PROVIDER_SANDBOX_SETUP = `#!/usr/bin/dash
 set -efu
@@ -168,8 +179,7 @@ usr_source=$3
 bin_source=$4
 lib_source=$5
 lib64_source=$6
-codex_source=$7
-shift 7
+shift 6
 dev_null=$1
 dev_zero=$2
 dev_random=$3
@@ -196,7 +206,6 @@ readonly_bind "$usr_source" "$rootfs/usr"
 readonly_bind "$bin_source" "$rootfs/bin"
 readonly_bind "$lib_source" "$rootfs/lib"
 readonly_bind "$lib64_source" "$rootfs/lib64"
-readonly_bind "$codex_source" "$rootfs/controller/codex"
 
 while [ "$etc_count" -gt 0 ]; do
   etc_source=$1
@@ -216,20 +225,40 @@ readonly_device_bind "$dev_zero" "$rootfs/dev/zero"
 readonly_device_bind "$dev_random" "$rootfs/dev/random"
 readonly_device_bind "$dev_urandom" "$rootfs/dev/urandom"
 
-sandbox_state=$1
-shift
 cd "$rootfs"
-exec /usr/sbin/chroot "$rootfs" /controller/codex sandbox \
-  --sandbox-state-json "$sandbox_state" -- \
+exec /usr/sbin/chroot "$rootfs" \
   /usr/sbin/capsh --drop=all --caps= --inh= --noamb --no-new-privs -- \
-  -c 'cd /workspace && exec /usr/bin/env -i \
+  -c 'cd /workspace
+    capability_name=\${JARVIS_PROVIDER_CAPABILITY_NAME-none}
+    case "$capability_name" in
+      none) ;;
+      CONVEX_DEPLOY_KEY)
+        [ -n "\${CONVEX_DEPLOY_KEY-}" ] || exit 70
+        set -- "CONVEX_DEPLOY_KEY=\${CONVEX_DEPLOY_KEY}" "$@"
+        ;;
+      TRIGGER_ACCESS_TOKEN)
+        [ -n "\${TRIGGER_ACCESS_TOKEN-}" ] || exit 70
+        set -- "TRIGGER_ACCESS_TOKEN=\${TRIGGER_ACCESS_TOKEN}" "$@"
+        ;;
+      *) exit 70 ;;
+    esac
+    if [ -n "\${JARVIS_PROVIDER_PROBE_NONCE-}" ]; then
+      set -- \
+        "JARVIS_PROVIDER_PROBE_NONCE=\${JARVIS_PROVIDER_PROBE_NONCE}" \
+        "JARVIS_PROVIDER_PROBE_RECEIPT=\${JARVIS_PROVIDER_PROBE_RECEIPT-}" \
+        "JARVIS_PROVIDER_PROBE_OUTSIDE=\${JARVIS_PROVIDER_PROBE_OUTSIDE-}" \
+        "JARVIS_PROVIDER_PROBE_CONTROLLER_PID=\${JARVIS_PROVIDER_PROBE_CONTROLLER_PID-}" \
+        "JARVIS_PROVIDER_PROBE_NETWORK_NS=\${JARVIS_PROVIDER_PROBE_NETWORK_NS-}" \
+        "$@"
+    fi
+    exec /usr/bin/env -i \
     PATH="$JARVIS_PROVIDER_PATH" \
     HOME=/home/provider \
     CODEX_HOME=/home/provider/.codex \
     XDG_CONFIG_HOME=/home/provider/.config \
     XDG_CACHE_HOME=/home/provider/.cache \
     TMPDIR=/home/provider/tmp \
-    LANG=C.UTF-8 LC_ALL=C.UTF-8 CI=1 TERM=dumb FORCE_COLOR=0 \
+    NODE_ENV=development LANG=C.UTF-8 LC_ALL=C.UTF-8 CI=1 TERM=dumb FORCE_COLOR=0 \
     NPM_CONFIG_USERCONFIG=/home/provider/.npmrc \
     NPM_CONFIG_CACHE=/home/provider/.npm-cache \
     NPM_CONFIG_IGNORE_SCRIPTS=true NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false \
@@ -243,13 +272,6 @@ exec /usr/sbin/chroot "$rootfs" /controller/codex sandbox \
     GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1 GH_CONFIG_DIR=/home/provider/.config/gh \
     HTTP_PROXY="\${HTTP_PROXY-}" HTTPS_PROXY="\${HTTPS_PROXY-}" NO_PROXY="\${NO_PROXY-}" \
     http_proxy="\${http_proxy-}" https_proxy="\${https_proxy-}" no_proxy="\${no_proxy-}" \
-    CONVEX_DEPLOY_KEY="\${CONVEX_DEPLOY_KEY-}" \
-    TRIGGER_ACCESS_TOKEN="\${TRIGGER_ACCESS_TOKEN-}" \
-    JARVIS_PROVIDER_PROBE_NONCE="\${JARVIS_PROVIDER_PROBE_NONCE-}" \
-    JARVIS_PROVIDER_PROBE_RECEIPT="\${JARVIS_PROVIDER_PROBE_RECEIPT-}" \
-    JARVIS_PROVIDER_PROBE_OUTSIDE="\${JARVIS_PROVIDER_PROBE_OUTSIDE-}" \
-    JARVIS_PROVIDER_PROBE_CONTROLLER_PID="\${JARVIS_PROVIDER_PROBE_CONTROLLER_PID-}" \
-    JARVIS_PROVIDER_PROBE_NETWORK_NS="\${JARVIS_PROVIDER_PROBE_NETWORK_NS-}" \
     "$@"' provider-sandbox "$@"
 `;
 
@@ -321,7 +343,7 @@ const freshHomeAndConfig = process.env.HOME === "/home/provider"
   && process.env.GIT_CONFIG_GLOBAL === "/home/provider/.gitconfig"
   && fs.readFileSync("/home/provider/.npmrc", "utf8") === ""
   && fs.readFileSync("/home/provider/.gitconfig", "utf8") === "";
-const ambientSecretsAbsent = ["VAULT_ACCESS_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY", "ANTHROPIC_API_KEY"].every((key) => !process.env[key]);
+const ambientSecretsAbsent = ["VAULT_ACCESS_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY", "ANTHROPIC_API_KEY", "CONVEX_DEPLOY_KEY", "TRIGGER_ACCESS_TOKEN"].every((key) => !process.env[key]);
 const runtimeInjectionAbsent = !process.env.NODE_OPTIONS && !process.env.NPM_CONFIG_REGISTRY && !process.env.npm_config_registry;
 const tools = Object.fromEntries(${JSON.stringify(REQUIRED_TOOLS)}.map((tool) => {
   const result = spawnSync(tool, ["--version"], { encoding: "utf8", timeout: 3000 });
@@ -402,6 +424,20 @@ function canonicalExisting(path: string, kind: "file" | "directory" | "device", 
   if (kind === "file" && !stat.isFile()) throw new Error(`${label} must be a regular file`);
   if (kind === "directory" && !stat.isDirectory()) throw new Error(`${label} must be a directory`);
   if (kind === "device" && !stat.isCharacterDevice()) throw new Error(`${label} must be a character device`);
+  return canonical;
+}
+
+function canonicalTrustedSystemPath(
+  path: string,
+  kind: "file" | "directory" | "device",
+  label: string,
+): string {
+  const canonical = canonicalExisting(path, kind, label);
+  const stat = lstatSync(canonical);
+  if (stat.uid !== 0) throw new Error(`${label} must be owned by root`);
+  if (kind !== "device" && (stat.mode & 0o022) !== 0) {
+    throw new Error(`${label} must not be group- or world-writable`);
+  }
   return canonical;
 }
 
@@ -511,6 +547,7 @@ export function createProviderToolSession(base: NodeJS.ProcessEnv): ProviderTool
     CI: "1",
     TERM: "dumb",
     FORCE_COLOR: "0",
+    JARVIS_PROVIDER_CAPABILITY_NAME: "none",
     NPM_CONFIG_USERCONFIG: npmrc,
     NPM_CONFIG_CACHE: npmCache,
     NPM_CONFIG_IGNORE_SCRIPTS: "true",
@@ -579,58 +616,42 @@ export function safeProviderToolEnv(base: NodeJS.ProcessEnv, session: ProviderTo
   return { ...session.env };
 }
 
-function resolvePinnedCodexNative(): string {
-  const packageName = process.arch === "arm64" ? "@openai/codex-linux-arm64" : "@openai/codex-linux-x64";
-  const require = createRequire(import.meta.url);
-  let packageJson: string;
-  try { packageJson = require.resolve(`${packageName}/package.json`); } catch {
-    throw new Error(`pinned Codex ${PINNED_CODEX_VERSION} Linux runtime is unavailable`);
-  }
-  const manifest = JSON.parse(readFileSync(packageJson, "utf8")) as { version?: string };
-  if (manifest.version !== `${PINNED_CODEX_VERSION}-linux-${process.arch === "arm64" ? "arm64" : "x64"}`) {
-    throw new Error(`provider sandbox requires exact Codex ${PINNED_CODEX_VERSION}`);
-  }
-  const target = process.arch === "arm64" ? "aarch64-unknown-linux-musl" : "x86_64-unknown-linux-musl";
-  return canonicalExisting(join(dirname(packageJson), "vendor", target, "bin", "codex"), "file", "pinned Codex sandbox executable");
-}
-
 function runtimePaths(): RuntimePaths {
   const etc: EtcRuntimeEntry[] = [];
   for (const [source, destination, kind] of ETC_RUNTIME_CANDIDATES) {
     if (!existsSync(source)) continue;
-    etc.push({ source: canonicalExisting(source, kind, `provider runtime ${source}`), destination, kind });
+    etc.push({ source: canonicalTrustedSystemPath(source, kind, `provider runtime ${source}`), destination, kind });
   }
   for (const required of ["etc/resolv.conf", "etc/hosts", "etc/passwd", "etc/group"]) {
     if (!etc.some((entry) => entry.destination === required)) throw new Error(`provider runtime ${required} is unavailable`);
   }
   return Object.freeze({
-    unshare: canonicalExisting(FIXED_RUNTIME.unshare, "file", "unshare executable"),
-    mount: canonicalExisting(FIXED_RUNTIME.mount, "file", "mount executable"),
-    chroot: canonicalExisting(FIXED_RUNTIME.chroot, "file", "chroot executable"),
-    capsh: canonicalExisting(FIXED_RUNTIME.capsh, "file", "capsh executable"),
-    env: canonicalExisting(FIXED_RUNTIME.env, "file", "env executable"),
-    shell: canonicalExisting(FIXED_RUNTIME.shell, "file", "namespace setup shell"),
-    usr: canonicalExisting(FIXED_RUNTIME.usr, "directory", "runtime /usr"),
-    bin: canonicalExisting(FIXED_RUNTIME.bin, "directory", "runtime /bin"),
-    lib: canonicalExisting(FIXED_RUNTIME.lib, "directory", "runtime /lib"),
-    lib64: canonicalExisting(FIXED_RUNTIME.lib64, "directory", "runtime /lib64"),
-    codexNative: resolvePinnedCodexNative(),
-    devNull: canonicalExisting(FIXED_RUNTIME.devNull, "device", "runtime /dev/null"),
-    devZero: canonicalExisting(FIXED_RUNTIME.devZero, "device", "runtime /dev/zero"),
-    devRandom: canonicalExisting(FIXED_RUNTIME.devRandom, "device", "runtime /dev/random"),
-    devUrandom: canonicalExisting(FIXED_RUNTIME.devUrandom, "device", "runtime /dev/urandom"),
+    unshare: canonicalTrustedSystemPath(FIXED_RUNTIME.unshare, "file", "unshare executable"),
+    mount: canonicalTrustedSystemPath(FIXED_RUNTIME.mount, "file", "mount executable"),
+    chroot: canonicalTrustedSystemPath(FIXED_RUNTIME.chroot, "file", "chroot executable"),
+    capsh: canonicalTrustedSystemPath(FIXED_RUNTIME.capsh, "file", "capsh executable"),
+    env: canonicalTrustedSystemPath(FIXED_RUNTIME.env, "file", "env executable"),
+    shell: canonicalTrustedSystemPath(FIXED_RUNTIME.shell, "file", "namespace setup shell"),
+    usr: canonicalTrustedSystemPath(FIXED_RUNTIME.usr, "directory", "runtime /usr"),
+    bin: canonicalTrustedSystemPath(FIXED_RUNTIME.bin, "directory", "runtime /bin"),
+    lib: canonicalTrustedSystemPath(FIXED_RUNTIME.lib, "directory", "runtime /lib"),
+    lib64: canonicalTrustedSystemPath(FIXED_RUNTIME.lib64, "directory", "runtime /lib64"),
+    devNull: canonicalTrustedSystemPath(FIXED_RUNTIME.devNull, "device", "runtime /dev/null"),
+    devZero: canonicalTrustedSystemPath(FIXED_RUNTIME.devZero, "device", "runtime /dev/zero"),
+    devRandom: canonicalTrustedSystemPath(FIXED_RUNTIME.devRandom, "device", "runtime /dev/random"),
+    devUrandom: canonicalTrustedSystemPath(FIXED_RUNTIME.devUrandom, "device", "runtime /dev/urandom"),
     etc: Object.freeze(etc),
   });
 }
 
 function mkdirRootfs(rootfs: string, etc: readonly EtcRuntimeEntry[]): void {
   for (const directory of [
-    "usr", "bin", "lib", "lib64", "etc", "proc", "dev", "workspace", "controller",
+    "usr", "bin", "lib", "lib64", "etc", "proc", "dev", "workspace",
     "home", "home/provider", "home/provider/.codex", "home/provider/.config",
     "home/provider/.config/gh", "home/provider/.cache", "home/provider/.npm-cache",
     "home/provider/tmp",
   ]) mkdirSync(join(rootfs, directory), { recursive: true, mode: 0o700 });
-  for (const file of ["dev/null", "dev/zero", "dev/random", "dev/urandom", "controller/codex"]) {
+  for (const file of ["dev/null", "dev/zero", "dev/random", "dev/urandom"]) {
     writeFileSync(join(rootfs, file), "", { mode: 0o600 });
   }
   for (const entry of etc) {
@@ -652,7 +673,7 @@ function toolInsidePath(command: "node" | "npm" | "npx"): string {
     npm: "/usr/local/bin/npm",
     npx: "/usr/local/bin/npx",
   } as const;
-  const canonical = canonicalExisting(paths[command], "file", `provider ${command} executable`);
+  const canonical = canonicalTrustedSystemPath(paths[command], "file", `provider ${command} executable`);
   if (!canonical.startsWith("/usr/")) throw new Error(`provider ${command} executable is outside the read-only runtime`);
   return canonical;
 }
@@ -687,6 +708,7 @@ function strictCandidateEnv(input: {
     if (!CAPABILITY_KEYS.includes(input.capability.name) || !input.capability.value.trim()) {
       throw new Error("provider sandbox capability is invalid");
     }
+    env.JARVIS_PROVIDER_CAPABILITY_NAME = input.capability.name;
     env[input.capability.name] = input.capability.value;
   }
   for (const [key, value] of Object.entries(input.probe ?? {})) {
@@ -694,27 +716,6 @@ function strictCandidateEnv(input: {
     env[key] = value;
   }
   return env;
-}
-
-function sandboxState(): string {
-  return JSON.stringify({
-    permissionProfile: {
-      type: "managed",
-      file_system: {
-        type: "restricted",
-        entries: [
-          { path: { type: "special", value: { kind: "minimal" } }, access: "read" },
-          { path: { type: "path", path: "/controller/codex" }, access: "read" },
-          { path: { type: "path", path: "/workspace" }, access: "write" },
-          { path: { type: "path", path: "/home/provider" }, access: "write" },
-        ],
-      },
-      network: "enabled",
-    },
-    codexLinuxSandboxExe: "/controller/codex",
-    sandboxCwd: "file:///workspace",
-    useLegacyLandlock: false,
-  });
 }
 
 function redact(output: string, secrets: readonly string[]): string {
@@ -851,7 +852,13 @@ export function validateProviderSandboxReceipt(input: {
 export function readProviderSandboxReceipt(path: string): string {
   let stat;
   try { stat = lstatSync(path); } catch { throw new Error("provider sandbox receipt is missing"); }
-  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("provider sandbox receipt is not a regular file");
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1) {
+    throw new Error("provider sandbox receipt is not a unique regular file");
+  }
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+    throw new Error("provider sandbox receipt has the wrong owner");
+  }
+  if ((stat.mode & 0o077) !== 0) throw new Error("provider sandbox receipt permissions are too broad");
   if (stat.size < 1) throw new Error("provider sandbox receipt is empty");
   if (stat.size > MAX_RECEIPT_BYTES) throw new Error("provider sandbox receipt is oversized");
   const fd = openSync(path, "r");
@@ -887,7 +894,6 @@ export class ProviderCandidateSandbox {
     if (!this.paths) {
       const paths = runtimePaths();
       for (const [label, path] of [
-        ["pinned Codex runtime", paths.codexNative],
         ["runtime /usr", paths.usr],
         ["runtime /bin", paths.bin],
         ["runtime /lib", paths.lib],
@@ -936,11 +942,10 @@ export class ProviderCandidateSandbox {
       const env = strictCandidateEnv({ base: this.input.baseEnv, capability: input.capability, probe: input.probe });
       const etcArgs = paths.etc.flatMap((entry) => [entry.source, entry.destination]);
       const invocationArgs = [
-        "--user", "--map-root-user", "--mount", "--pid", "--fork", "--kill-child=SIGKILL",
-        "--ipc", "--uts", "--propagation", "unchanged", "--", this.setup,
-        rootfs, this.checkout, paths.usr, paths.bin, paths.lib, paths.lib64, paths.codexNative,
+        ...PROVIDER_NAMESPACE_FLAGS, "--", this.setup,
+        rootfs, this.checkout, paths.usr, paths.bin, paths.lib, paths.lib64,
         paths.devNull, paths.devZero, paths.devRandom, paths.devUrandom,
-        String(paths.etc.length), ...etcArgs, sandboxState(), insideCommand, ...args,
+        String(paths.etc.length), ...etcArgs, insideCommand, ...args,
       ];
       const commandDigest = createHash("sha256")
         .update(paths.unshare).update("\0").update(invocationArgs.join("\0"))
@@ -1013,7 +1018,13 @@ export class ProviderCandidateSandbox {
     const probe = mkdtempSync(join(this.checkout, ".jarvis-provider-probe-"));
     const probeName = probe.slice(this.checkout.length + 1);
     const receipt = join(probe, "receipt.json");
-    const outsideRoot = mkdtempSync(join(this.input.session.root, "outside-credential-"));
+    const outsideRoot = canonicalOwnedDirectory(
+      mkdtempSync(join(canonicalExisting(tmpdir(), "directory", "system temporary directory"), "jarvis-provider-outside-")),
+      "synthetic controller credential state",
+    );
+    if (pathIsWithin(outsideRoot, this.checkout) || pathIsWithin(this.checkout, outsideRoot)) {
+      throw new Error("synthetic controller credential and candidate checkout must be disjoint");
+    }
     const outside = join(outsideRoot, "controller-credential.txt");
     const nonce = randomBytes(32).toString("hex");
     const source = join(probe, "preflight.cjs");

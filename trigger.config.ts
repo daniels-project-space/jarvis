@@ -22,11 +22,10 @@ export default defineConfig({
     external: ["@openai/codex", "web-push"],
     extensions: [
       additionalPackages({ packages: ["@openai/codex@0.144.5"] }),
-      // util-linux supplies the outer user/PID namespace. Codex 0.144.5 then
-      // uses its supported legacy Landlock fallback; system Bubblewrap is
-      // deliberately absent because this Trigger runtime cannot create its
-      // mount topology.
-      aptGet({ packages: ["curl", "git", "gh", "jq", "ca-certificates", "util-linux"] }),
+      // util-linux supplies the outer user/PID namespace. libcap2-bin supplies
+      // the provider-release chroot's fixed capsh drop-all/no_new_privs gate.
+      // Specialist Codex 0.144.5 keeps its existing legacy Landlock path.
+      aptGet({ packages: ["curl", "git", "gh", "jq", "ca-certificates", "util-linux", "libcap2-bin"] }),
       additionalFiles({ files: ["./src/trigger/codex-requirements.toml"] }),
       {
         name: "codex-system-requirements",

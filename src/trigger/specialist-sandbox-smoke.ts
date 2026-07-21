@@ -1,4 +1,5 @@
 import { task } from "@trigger.dev/sdk/v3";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { codexExecPrefix } from "./model-policy";
@@ -9,6 +10,12 @@ import {
 } from "./subscription-runtime";
 import { verifySpecialistSandboxIsolation } from "./specialist-sandbox";
 import { verifyRealNamespaceProcessLifecycle } from "./specialist-process-lifecycle";
+import {
+  ProviderCandidateSandbox,
+  createProviderToolSession,
+  verifyProviderSandboxLifecycle,
+  type ProviderToolSession,
+} from "./provider-command-sandbox";
 
 type ExactSandboxObservation = {
   readSucceeded?: boolean;
@@ -40,6 +47,58 @@ export function exactSandboxObservationPassed(observation: ExactSandboxObservati
     && observation.noSecretEchoed === true
     && observation.namespaceLifecycleSafe === true
     && REQUIRED_TOOLS.every((tool) => observation.tools?.[tool] === true);
+}
+
+/**
+ * Exercise the provider-command boundary in the deployed Trigger image, where
+ * util-linux and libcap2-bin are part of the declared task runtime. The Git
+ * checkout and credentialless tool session are both fresh synthetic state.
+ */
+export async function runProviderCommandSandboxSmoke(): Promise<
+  { ok: true } | { ok: false; reason: string }
+> {
+  mkdirSync("/tmp/work", { recursive: true });
+  const root = mkdtempSync("/tmp/work/jarvis-provider-sandbox-smoke-");
+  const checkout = join(root, "candidate");
+  const gitHome = join(root, "git-home");
+  let session: ProviderToolSession | undefined;
+  let sandbox: ProviderCandidateSandbox | undefined;
+  try {
+    mkdirSync(checkout, { recursive: true });
+    mkdirSync(gitHome, { recursive: true });
+    writeFileSync(join(checkout, "fixture.txt"), "provider sandbox smoke\n", { mode: 0o600 });
+    const gitEnv: NodeJS.ProcessEnv = {
+      PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      HOME: gitHome,
+      LANG: "C.UTF-8",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
+      NODE_ENV: "test",
+    };
+    for (const args of [
+      ["init", "--initial-branch=main"],
+      ["add", "--", "fixture.txt"],
+      ["-c", "user.name=JARVIS Sandbox", "-c", "user.email=sandbox.invalid", "commit", "-m", "synthetic sandbox fixture"],
+    ]) {
+      const result = spawnSync("/usr/bin/git", args, { cwd: checkout, env: gitEnv, encoding: "utf8", timeout: 15_000 });
+      if (result.status !== 0) {
+        return { ok: false, reason: "provider command sandbox synthetic Git fixture failed closed" };
+      }
+    }
+    session = createProviderToolSession(process.env);
+    sandbox = new ProviderCandidateSandbox({ checkout, baseEnv: process.env, session });
+    return await verifyProviderSandboxLifecycle(sandbox);
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `provider command sandbox smoke failed closed: ${String(error instanceof Error ? error.message : error)}`,
+    };
+  } finally {
+    if (sandbox) await sandbox.cleanup();
+    if (session) session.cleanup();
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 function probeSource(outsidePath: string, credentialPath: string): string {
@@ -214,6 +273,13 @@ export const specialistSandboxSmoke = task({
   run: async () => {
     const result = await runExactSpecialistSandboxSmoke();
     if (!result.ok) throw new Error(result.reason);
-    return { protocol: 1 as const, legacyLandlock: true as const, exactSmoke: true as const };
+    const provider = await runProviderCommandSandboxSmoke();
+    if (!provider.ok) throw new Error(provider.reason);
+    return {
+      protocol: 1 as const,
+      legacyLandlock: true as const,
+      exactSmoke: true as const,
+      providerCommandSandbox: true as const,
+    };
   },
 });
