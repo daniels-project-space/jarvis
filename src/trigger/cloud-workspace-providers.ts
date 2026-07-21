@@ -382,7 +382,7 @@ class Sandbox0CloudWorkspaceProvider extends ProviderBase {
     if (request.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
     const startedAt = Date.now();
     const stream = await sandbox.cmdStream(request.command, {
-      cwd: request.cwd ?? workspace.root, envVars: {}, wait: true,
+      cwd: request.cwd ?? workspace.root, envVars: {}, wait: false,
       idleTimeoutSec: Math.max(1, Math.ceil(request.timeoutMs / 1000)), ttlSec: Math.max(1, Math.ceil(request.timeoutMs / 1000)),
     });
     let stdout = "";

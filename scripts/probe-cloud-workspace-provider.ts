@@ -14,6 +14,11 @@ import {
   type CloudWorkspace,
 } from "../src/trigger/cloud-workspace";
 import { configuredCloudWorkspaceProviderForLiveProbe } from "../src/trigger/cloud-workspace-providers";
+import {
+  cloudWorkspaceCancellationProbeRemote,
+  issueAfterExactRemoteCancellation,
+  probeExactRemoteCancellation,
+} from "../src/trigger/cloud-provider-cancellation-probe";
 
 const LIVE_OPT_IN = "JARVIS_CLOUD_PROVIDER_PROBE=live";
 
@@ -152,20 +157,10 @@ async function main() {
     });
     if (networkResult.exitCode !== 0) throw new Error("network deny behavioral probe failed");
 
-    const cancellation = new AbortController();
-    const pending = provider.exec(first, {
-      command: "sleep 30",
-      cwd: first.root,
-      timeoutMs: 35_000,
-      maxOutputBytes: 4_000,
-      signal: cancellation.signal,
-    });
-    setTimeout(() => cancellation.abort(), 250).unref?.();
-    let exactCancellation = false;
-    try { await pending; } catch (error) {
-      exactCancellation = Boolean(error && typeof error === "object" && "code" in error && error.code === "cancelled");
-    }
-    if (!exactCancellation) throw new Error("exact command cancellation was not observed");
+    const cancellationEvidence = await probeExactRemoteCancellation(
+      cloudWorkspaceCancellationProbeRemote(provider, first),
+      runId,
+    );
 
     await provider.writeFile(first, "probe-identity.txt", new TextEncoder().encode(runId), 4_000);
     const checkpoint = await provider.checkpoint(first, {
@@ -205,7 +200,8 @@ async function main() {
       runId,
       nonce: randomBytes(24).toString("base64url"),
     };
-    console.log(JSON.stringify({ status: "PASS", envelope: authority.issue(receipt) }));
+    const envelope = issueAfterExactRemoteCancellation(cancellationEvidence, () => authority.issue(receipt));
+    console.log(JSON.stringify({ status: "PASS", envelope }));
   } catch {
     if (recreated) await provider.terminate(recreated, "orphan").catch(() => undefined);
     if (first) await provider.terminate(first, "orphan").catch(() => undefined);

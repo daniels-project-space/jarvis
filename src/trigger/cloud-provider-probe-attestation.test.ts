@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   CLOUD_PROVIDER_PROBE_MAX_AGE_MS,
+  actualTriggerDeploymentId,
   canonicalProviderProbeJson,
   configuredCloudProviderProbeBinding,
   createCloudProviderProbeKeyring,
@@ -25,6 +26,7 @@ function baseEnvironment(): NodeJS.ProcessEnv {
     JARVIS_CLOUD_WORKSPACE_TEMPLATE: "template-immutable-v7",
     JARVIS_CLOUD_WORKSPACE_TEMPLATE_DIGEST: DIGEST,
     JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID: "trigger-deploy-2026-07-21-a",
+    TRIGGER_DEPLOYMENT_VERSION: "trigger-deploy-2026-07-21-a",
     JARVIS_CLOUD_PROVIDER_PROBE_KEYRING: JSON.stringify({
       current: { keyId: "current", secret: SECRET }, previous: [],
     }),
@@ -97,6 +99,52 @@ describe("deployment-bound cloud provider probe authority", () => {
         code: "provider_probe_attestation_failed", disposition: "blocked",
       }));
     }
+  });
+
+  it("rejects an otherwise valid signed receipt after the actual Trigger deployment version changes", () => {
+    const env = signedEnvironment();
+    expect(() => configuredCloudWorkspaceProvider({
+      ...env,
+      TRIGGER_DEPLOYMENT_VERSION: "trigger-deploy-2026-07-21-b",
+    })).toThrow(expect.objectContaining({
+      code: "provider_probe_attestation_failed", disposition: "blocked",
+      message: expect.stringMatching(/actual Trigger worker deployment/),
+    }));
+  });
+
+  it("does not let a claimed deployment id or TRIGGER_VERSION override the actual worker version", () => {
+    const env = signedEnvironment();
+    expect(() => configuredCloudWorkspaceProvider({
+      ...env,
+      JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID: "trigger-deploy-2026-07-21-a",
+      TRIGGER_VERSION: "trigger-deploy-2026-07-21-a",
+      TRIGGER_DEPLOYMENT_VERSION: "trigger-deploy-2026-07-21-b",
+    })).toThrow(expect.objectContaining({
+      code: "provider_probe_attestation_failed", disposition: "blocked",
+    }));
+    expect(actualTriggerDeploymentId({
+      ...env,
+      TRIGGER_VERSION: "trigger-deploy-2026-07-21-a",
+      TRIGGER_DEPLOYMENT_VERSION: "trigger-deploy-2026-07-21-b",
+    })).toBe("trigger-deploy-2026-07-21-b");
+  });
+
+  it.each([
+    { runtime: { TRIGGER_DEPLOYMENT_VERSION: undefined, TRIGGER_VERSION: undefined }, label: "missing" },
+    { runtime: { TRIGGER_DEPLOYMENT_VERSION: "unversioned", TRIGGER_VERSION: undefined }, label: "unversioned" },
+    { runtime: { TRIGGER_DEPLOYMENT_VERSION: "worker-unversioned", TRIGGER_VERSION: undefined }, label: "unversioned placeholder" },
+  ])("blocks execution when the actual Trigger deployment identity is $label", ({ runtime }) => {
+    const env = signedEnvironment();
+    expect(() => configuredCloudWorkspaceProvider({ ...env, ...runtime })).toThrow(expect.objectContaining({
+      code: "provider_probe_attestation_failed", disposition: "blocked",
+    }));
+  });
+
+  it("uses the documented TRIGGER_VERSION contract only when the worker-specific version is absent", () => {
+    const env = signedEnvironment();
+    delete env.TRIGGER_DEPLOYMENT_VERSION;
+    env.TRIGGER_VERSION = env.JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID;
+    expect(configuredCloudWorkspaceProvider(env).name).toBe("sandbox0");
   });
 
   it.each(["malformed", "stale", "partial", "tampered", "wrong sdk", "wrong provider", "conflicting key ids"])(

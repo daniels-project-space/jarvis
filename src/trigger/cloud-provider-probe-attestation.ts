@@ -73,6 +73,7 @@ export type CloudProviderProbeKey = Readonly<{ keyId: string; secret: Uint8Array
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const SAFE_ID = /^[a-zA-Z0-9._:/-]{1,200}$/;
+const UNVERSIONED_DEPLOYMENT = /(?:^(?:dev|development|staging|prod|production)$|(?:^|[._:/-])(?:unversioned|unknown|latest|current)(?:$|[._:/-]))/i;
 const KEY_ID = /^[a-zA-Z0-9._-]{1,64}$/;
 const RECEIPT_KEYS = [
   "schemaVersion", "provider", "deploymentId", "sdk", "template", "runtime",
@@ -123,6 +124,7 @@ function nonemptySafe(value: string | undefined, label: string, provider: CloudW
   return normalized;
 }
 
+/** Authoring binding: the explicit live probe names the already-created target. */
 export function configuredCloudProviderProbeBinding(
   env: Readonly<Record<string, string | undefined>>,
 ): CloudProviderProbeBinding {
@@ -146,6 +148,47 @@ export function configuredCloudProviderProbeBinding(
       digest: cloudProviderRuntimeDigest(CLOUD_WORKSPACE_RUNTIME_IDENTITY, digest),
     },
   };
+}
+
+/**
+ * Resolve the immutable version of the Trigger worker that is executing this
+ * code. TRIGGER_DEPLOYMENT_VERSION is worker-owned and therefore wins over
+ * TRIGGER_VERSION, whose documented contract also allows callers to select a
+ * task version. There is deliberately no NODE_ENV escape hatch.
+ */
+export function actualTriggerDeploymentId(
+  env: Readonly<Record<string, string | undefined>>,
+  provider = selectedProvider(env),
+): string {
+  const deploymentVersion = String(env.TRIGGER_DEPLOYMENT_VERSION ?? "").trim();
+  const triggerVersion = String(env.TRIGGER_VERSION ?? "").trim();
+  const actual = deploymentVersion || triggerVersion;
+  if (!SAFE_ID.test(actual) || UNVERSIONED_DEPLOYMENT.test(actual)) {
+    throw new CloudWorkspaceError(
+      provider,
+      "provider_probe_attestation_failed",
+      "actual Trigger worker deployment identity is missing, unversioned, or malformed",
+      "blocked",
+    );
+  }
+  return actual;
+}
+
+/** Normal worker verification must bind to provider-observed runtime state. */
+export function runtimeCloudProviderProbeBinding(
+  env: Readonly<Record<string, string | undefined>>,
+): CloudProviderProbeBinding {
+  const configured = configuredCloudProviderProbeBinding(env);
+  const actualDeploymentId = actualTriggerDeploymentId(env, configured.provider);
+  if (configured.deploymentId !== actualDeploymentId) {
+    throw new CloudWorkspaceError(
+      configured.provider,
+      "provider_probe_attestation_failed",
+      "configured cloud provider deployment identity conflicts with the actual Trigger worker deployment",
+      "blocked",
+    );
+  }
+  return { ...configured, deploymentId: actualDeploymentId };
 }
 
 function isStrictReceipt(value: unknown): value is CloudProviderProbeReceipt {
@@ -281,7 +324,7 @@ export function assertCloudProviderExecutionReady(
   env: Readonly<Record<string, string | undefined>>,
   now = Date.now(),
 ): CloudProviderProbeReceipt {
-  const binding = configuredCloudProviderProbeBinding(env);
+  const binding = runtimeCloudProviderProbeBinding(env);
   if (installedCloudProviderSdkVersion(binding.provider) !== binding.sdk.version) {
     blocked(binding.provider, "installed cloud provider SDK does not match the pinned receipt tuple");
   }
