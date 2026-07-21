@@ -1,0 +1,113 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { waitForForegroundLease, type ForegroundLease } from "./foreground-lease";
+
+const LEASE_MS = 1_000;
+const TIMEOUT_MS = 5_000;
+
+function waiter(
+  touch: (runnerId: string) => Promise<boolean>,
+  listeners: Set<(lease: ForegroundLease) => void>,
+  onUnsubscribe = vi.fn(),
+) {
+  return waitForForegroundLease({
+    runnerId: crypto.randomUUID(),
+    timeoutMs: TIMEOUT_MS,
+    leaseMs: LEASE_MS,
+    touch,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); onUnsubscribe(); };
+    },
+  });
+}
+
+describe("foreground handoff lease", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("does not take an active owner", async () => {
+    const listeners = new Set<(lease: ForegroundLease) => void>();
+    const touch = vi.fn(async () => false);
+    const pending = waiter(touch, listeners);
+    for (const listener of listeners) listener({ updatedAt: Date.now() });
+    await vi.advanceTimersByTimeAsync(LEASE_MS - 1);
+    expect(touch).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(touch).toHaveBeenCalledTimes(2); // initial attempt + one stale deadline
+    await vi.advanceTimersByTimeAsync(TIMEOUT_MS);
+    await expect(pending).resolves.toBe(false);
+  });
+
+  it("lets a release elect exactly one successor", async () => {
+    const listeners = new Set<(lease: ForegroundLease) => void>();
+    let owner = "active";
+    const touch = vi.fn(async (runnerId: string) => {
+      if (owner) return false;
+      owner = runnerId;
+      return true;
+    });
+    const first = waiter(touch, listeners);
+    const second = waiter(touch, listeners);
+    for (const listener of listeners) listener({ updatedAt: Date.now() });
+    owner = "";
+    for (const listener of [...listeners]) listener(null);
+    await vi.runAllTicks();
+    const results = await Promise.all([
+      first,
+      vi.advanceTimersByTimeAsync(TIMEOUT_MS).then(() => second),
+    ]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(owner).not.toBe("");
+  });
+
+  it("lets exactly one successor claim at the single stale deadline", async () => {
+    const listeners = new Set<(lease: ForegroundLease) => void>();
+    let owner = "active";
+    const touch = vi.fn(async (runnerId: string) => {
+      if (owner && owner !== "stale") return false;
+      if (owner === "stale") owner = runnerId;
+      return owner === runnerId;
+    });
+    const first = waiter(touch, listeners);
+    const second = waiter(touch, listeners);
+    for (const listener of listeners) listener({ updatedAt: Date.now() - LEASE_MS + 1 });
+    owner = "stale";
+    await vi.advanceTimersByTimeAsync(30);
+    const one = await Promise.race([first, second]);
+    expect(one).toBe(true);
+    await vi.advanceTimersByTimeAsync(TIMEOUT_MS);
+    const all = await Promise.all([first, second]);
+    expect(all.filter(Boolean)).toHaveLength(1);
+  });
+
+  it("cleans its subscription and timers on timeout", async () => {
+    const listeners = new Set<(lease: ForegroundLease) => void>();
+    const unsubscribed = vi.fn();
+    const touch = vi.fn(async () => false);
+    const pending = waiter(touch, listeners, unsubscribed);
+    for (const listener of listeners) listener({ updatedAt: Date.now() });
+    await vi.advanceTimersByTimeAsync(TIMEOUT_MS);
+    await expect(pending).resolves.toBe(false);
+    expect(unsubscribed).toHaveBeenCalledTimes(1);
+    expect(listeners).toHaveLength(0);
+    const attempts = touch.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(10 * LEASE_MS);
+    expect(touch).toHaveBeenCalledTimes(attempts);
+  });
+
+  it("does not turn a failed stale claim into a recurring poll", async () => {
+    const listeners = new Set<(lease: ForegroundLease) => void>();
+    const touch = vi.fn(async () => false);
+    const pending = waiter(touch, listeners);
+    for (const listener of listeners) listener({ updatedAt: Date.now() });
+    await vi.advanceTimersByTimeAsync(LEASE_MS + 25);
+    expect(touch).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(LEASE_MS * 2);
+    expect(touch).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(TIMEOUT_MS);
+    await expect(pending).resolves.toBe(false);
+  });
+});

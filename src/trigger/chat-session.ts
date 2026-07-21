@@ -18,12 +18,16 @@ import {
   FOREGROUND_ADMISSION_RESERVE_MS,
   canClaimForegroundTurn,
   FOREGROUND_HANDOFF_OVERLAP_MS,
+  FOREGROUND_LANE_MAX_DURATION_SECONDS,
   FOREGROUND_MAX_DURATION_SECONDS,
   FOREGROUND_PROCESS_EXIT_RESERVE_MS,
   FOREGROUND_QUEUE,
+  FOREGROUND_RUNNER_LEASE_MS,
   FOREGROUND_TURN_TIMEOUT_MS,
   type ForegroundTurnPayload,
 } from "./foreground-policy";
+import { waitForForegroundLease } from "./foreground-lease";
+import { successorLane, taskForForegroundLane, type ForegroundLane } from "./foreground-lanes";
 import { CodexAppServer } from "./codex-app-server";
 import {
   AgentToolBridge,
@@ -53,7 +57,6 @@ const CONVEX_URL =
 // it. The finite safety reserve leaves Trigger time to cancel and clean up.
 const RUN_BUDGET_MS = FOREGROUND_MAX_DURATION_SECONDS * 1_000 - FOREGROUND_PROCESS_EXIT_RESERVE_MS;
 const HANDOFF_AFTER_MS = RUN_BUDGET_MS - FOREGROUND_HANDOFF_OVERLAP_MS;
-const RUNNER_LEASE_MS = 25_000;
 
 async function convexCall(kind: "query" | "mutation", path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
@@ -183,43 +186,17 @@ function waitForRunnerAvailability(
   runnerId: string,
   timeoutMs: number,
 ): Promise<boolean> {
-  return new Promise((resolve) => {
-    let settled = false;
-    let staleTimer: ReturnType<typeof setTimeout> | null = null;
-    let unsubscribe = () => {};
-    const finish = (value: boolean) => {
-      if (settled) return;
-      settled = true;
-      if (staleTimer) clearTimeout(staleTimer);
-      clearTimeout(timeout);
-      unsubscribe();
-      resolve(value);
-    };
-    const tryClaim = () => {
-      void convexMutation("chatQueue:touchRunner", { runnerId })
-        .then((owned) => { if (owned) finish(true); })
-        .catch(() => undefined);
-    };
-    const observe = (lease: { updatedAt?: number } | null) => {
-      if (settled) return;
-      if (staleTimer) clearTimeout(staleTimer);
-      const age = lease?.updatedAt ? Date.now() - lease.updatedAt : RUNNER_LEASE_MS;
-      if (!lease || age >= RUNNER_LEASE_MS) {
-        tryClaim();
-        return;
-      }
-      // A crashed owner does not create a reactive write at expiry. This is a
-      // single stale-lease deadline, not a periodic polling loop.
-      staleTimer = setTimeout(tryClaim, Math.max(1, RUNNER_LEASE_MS - age + 25));
-    };
-    const timeout = setTimeout(() => finish(false), timeoutMs);
-    unsubscribe = client.onUpdate(
+  return waitForForegroundLease({
+    runnerId,
+    timeoutMs,
+    leaseMs: FOREGROUND_RUNNER_LEASE_MS,
+    touch: (id) => convexMutation("chatQueue:touchRunner", { runnerId: id }) as Promise<boolean>,
+    subscribe: (observe, onError) => client.onUpdate(
       api.chatQueue.runnerLeaseForWorker,
       { workerToken },
-      (lease) => observe(lease),
-      () => finish(false),
-    );
-    tryClaim();
+      observe,
+      onError,
+    ),
   });
 }
 
@@ -281,7 +258,12 @@ async function extractAndSave(
   return n;
 }
 
-async function processChatQueue(targetMessageId?: string, source = "conversation") {
+async function processChatQueue(
+  payload: ForegroundTurnPayload = {},
+  lane: ForegroundLane = "primary",
+) {
+  let targetMessageId = payload.messageId;
+  const source = payload.source ?? "conversation";
   // Foreground Jarvis is deliberately pinned to Daniel's ChatGPT subscription.
   // The old provider lookup now always returns Codex, so querying it added a
   // network round trip to every message without changing the selected brain.
@@ -306,7 +288,7 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
   // never takes ownership from a still-serving runner.
   if (source === "warm-handoff") await server.start();
   const ownsLease = source === "warm-handoff"
-    ? await waitForRunnerAvailability(client, workerToken, runnerId, FOREGROUND_HANDOFF_OVERLAP_MS + RUNNER_LEASE_MS)
+    ? await waitForRunnerAvailability(client, workerToken, runnerId, FOREGROUND_HANDOFF_OVERLAP_MS + FOREGROUND_RUNNER_LEASE_MS)
     : await convexMutation("chatQueue:touchRunner", { runnerId }) as boolean;
   if (!ownsLease) {
     client.close();
@@ -328,10 +310,11 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
   const startHandoff = () => {
     if (handoffStarted) return;
     handoffStarted = true;
+    const successorTask = taskForForegroundLane(successorLane(lane));
     handoffPromise = tasks.trigger(
-      "jarvis-chat-handoff",
+      successorTask,
       { source: "warm-handoff" },
-      { idempotencyKey: `jarvis-warm-${runnerId}` },
+      { idempotencyKey: `jarvis-warm-${lane}-${runnerId}` },
     ).catch(() => null);
   };
   const handoffTimer = setTimeout(startHandoff, HANDOFF_AFTER_MS);
@@ -420,6 +403,15 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
       });
       if (timings.length > 12) timings.shift();
       processed += 1;
+      // Realtime metadata is deliberately per delivered turn, never per token.
+      // It contains only durations and lets the active run be monitored before
+      // its eventual four-hour cleanup path executes.
+      metadata.set("foregroundTiming", JSON.stringify({
+        turns: timings,
+        runnerAgeMs: Date.now() - started,
+        lane,
+      }));
+      await metadata.flush();
     } catch (error: unknown) {
       await convexMutation("chatQueue:finalize", {
         messageId: claim.assistantId,
@@ -432,7 +424,7 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
     // and drain rapid follow-ups. Duplicate queued wake tasks become no-ops.
     targetMessageId = undefined;
   }
-    metadata.set("foregroundTiming", JSON.stringify({ turns: timings, runnerAgeMs: Date.now() - started }));
+    metadata.set("foregroundTiming", JSON.stringify({ turns: timings, runnerAgeMs: Date.now() - started, lane }));
     await metadata.flush();
     return { processed, timings };
   } finally {
@@ -460,25 +452,25 @@ export const chatMemory = task({
   },
 });
 
-// Each committed turn starts immediately, then the worker stays warm briefly.
-// Two lanes preserve an available Jarvis if one foreground answer runs longer.
+// Initial and recovery turns enter the primary lane. Its owner prewarms the
+// alternate lane only at the four-hour handoff boundary.
 export const chatTurn = task({
   id: "jarvis-chat-turn",
   queue: { name: FOREGROUND_QUEUE, concurrencyLimit: FOREGROUND_CONCURRENCY },
   machine: "small-1x",
-  maxDuration: FOREGROUND_MAX_DURATION_SECONDS,
-  run: async (payload: ForegroundTurnPayload) => processChatQueue(payload.messageId, payload.source),
+  maxDuration: FOREGROUND_LANE_MAX_DURATION_SECONDS,
+  run: async (payload: ForegroundTurnPayload) => processChatQueue(payload, "primary"),
 });
 
-// A separate, bounded queue permits a prewarmed successor to overlap its
-// owner without claiming a second foreground lease or doubling steady-state
-// compute. It is used only at a planned handoff, not per conversation turn.
+// The alternate lane is always prewarmed by the primary lane, and then
+// prewarms the primary lane on its own handoff. Its queue is unoccupied while
+// the primary lane owns the authoritative Convex lease.
 export const chatHandoff = task({
   id: "jarvis-chat-handoff",
   queue: { name: "jarvis-foreground-handoff", concurrencyLimit: 1 },
   machine: "small-1x",
-  maxDuration: Math.ceil((FOREGROUND_HANDOFF_OVERLAP_MS + RUNNER_LEASE_MS) / 1_000) + 30,
-  run: async (payload: ForegroundTurnPayload) => processChatQueue(payload.messageId, "warm-handoff"),
+  maxDuration: FOREGROUND_LANE_MAX_DURATION_SECONDS,
+  run: async (payload: ForegroundTurnPayload) => processChatQueue({ ...payload, source: "warm-handoff" }, "handoff"),
 });
 
 // Recovery lane only: if an immediate trigger is lost between Vercel and

@@ -17,6 +17,12 @@ export const FOREGROUND_ADMISSION_RESERVE_MS = FOREGROUND_TURN_TIMEOUT_MS + 20_0
 export const FOREGROUND_HANDOFF_OVERLAP_MS = 10 * 60_000;
 // Leave headroom below Trigger's hard max for cleanup and lease release.
 export const FOREGROUND_PROCESS_EXIT_RESERVE_MS = 60_000;
+export const FOREGROUND_RUNNER_LEASE_MS = 25_000;
+// A successor spends the handoff overlap waiting before it owns its full
+// lifetime. Both alternating task lanes therefore receive the same complete
+// owner budget plus overlap and cleanup headroom.
+export const FOREGROUND_LANE_MAX_DURATION_SECONDS = FOREGROUND_MAX_DURATION_SECONDS
+  + Math.ceil((FOREGROUND_HANDOFF_OVERLAP_MS + FOREGROUND_RUNNER_LEASE_MS + FOREGROUND_PROCESS_EXIT_RESERVE_MS) / 1_000);
 
 /** A claim is safe only when its full execution-and-delivery reserve remains. */
 export const canClaimForegroundTurn = (remainingMs: number) =>

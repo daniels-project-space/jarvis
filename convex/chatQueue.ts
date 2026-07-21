@@ -217,9 +217,8 @@ async function claimPending(ctx: { db: any }, pending: any) {
     };
 }
 
-// Immediate Trigger runs claim exactly the message that woke them. This is
-// what permits parallel foreground turns without two workers racing through a
-// shared drain loop or making a new question wait behind an older slow one.
+// Immediate Trigger runs claim exactly the message that woke it. The one
+// foreground lease then prevents duplicate workers from racing a shared drain.
 export const claimMessage = mutation({
   args: { messageId: v.id("chatMessages"), workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {

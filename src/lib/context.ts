@@ -80,24 +80,36 @@ async function hubSnapshot(signal?: AbortSignal) {
   return hubRequest;
 }
 
-async function boundedSnapshot(
+export async function boundedSnapshot(
   read: (signal: AbortSignal) => Promise<any>,
   getLastKnownGood: () => { value: any; capturedAt: number } | null,
   setLastKnownGood: (snapshot: { value: any; capturedAt: number }) => void,
 ): Promise<any> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort("context deadline"), CONTEXT_INPUT_DEADLINE_MS);
+  let timedOut = false;
+  let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+  // The transport may be a shared Hub request owned by another caller. Race at
+  // this caller boundary as well as aborting the transport we own, so joining
+  // a stalled request can never extend this foreground turn past 850ms.
+  const deadline = new Promise<null>((resolve) => {
+    deadlineTimer = setTimeout(() => {
+      timedOut = true;
+      controller.abort("context deadline");
+      resolve(null);
+    }, CONTEXT_INPUT_DEADLINE_MS);
+  });
+  const result = Promise.resolve()
+    .then(() => read(controller.signal))
+    // Keep observing a late shared rejection after this caller has returned.
+    .catch(() => null);
   try {
-    const value = await read(controller.signal);
-    if (value !== null && value !== undefined) {
+    const value = await Promise.race([result, deadline]);
+    if (!timedOut && value !== null && value !== undefined) {
       setLastKnownGood({ value, capturedAt: Date.now() });
       return value;
     }
-  } catch {
-    // A failed enrichment is intentionally indistinguishable from absent
-    // context to the model. Never invent replacement state.
   } finally {
-    clearTimeout(timeout);
+    if (deadlineTimer) clearTimeout(deadlineTimer);
   }
   const previous = getLastKnownGood();
   return previous && Date.now() - previous.capturedAt <= CONTEXT_LAST_KNOWN_GOOD_MS

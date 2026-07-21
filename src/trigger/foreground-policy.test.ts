@@ -4,6 +4,7 @@ import {
   canClaimForegroundTurn,
   FOREGROUND_ADMISSION_RESERVE_MS,
   FOREGROUND_HANDOFF_OVERLAP_MS,
+  FOREGROUND_LANE_MAX_DURATION_SECONDS,
   FOREGROUND_MAX_DURATION_SECONDS,
   FOREGROUND_PROCESS_EXIT_RESERVE_MS,
   FOREGROUND_QUEUE,
@@ -19,6 +20,7 @@ describe("foreground conversation policy", () => {
     expect(FOREGROUND_ADMISSION_RESERVE_MS).toBeGreaterThan(FOREGROUND_TURN_TIMEOUT_MS);
     expect(FOREGROUND_HANDOFF_OVERLAP_MS).toBeGreaterThan(FOREGROUND_ADMISSION_RESERVE_MS);
     expect(FOREGROUND_PROCESS_EXIT_RESERVE_MS).toBeGreaterThan(0);
+    expect(FOREGROUND_LANE_MAX_DURATION_SECONDS).toBeGreaterThan(FOREGROUND_MAX_DURATION_SECONDS);
   });
 
   it("leaves a turn durable for the successor at the admission boundary", () => {

@@ -194,4 +194,22 @@ describe("single Edge neural speech queue", () => {
     expect(FakeSource.instances).toHaveLength(0);
     await reply;
   });
+
+  it("cancels the one in-flight neural request without a fallback attempt", async () => {
+    let aborted = false;
+    let started = 0;
+    vi.stubGlobal("fetch", vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      started += 1;
+      init?.signal?.addEventListener("abort", () => {
+        aborted = true;
+        reject(new DOMException("cancelled", "AbortError"));
+      }, { once: true });
+    })));
+    const reply = speak("Cancel the active neural phrase.", () => {});
+    await vi.waitFor(() => expect(started).toBe(1));
+    stopSpeaking();
+    await reply;
+    expect(aborted).toBe(true);
+    expect(started).toBe(1);
+  });
 });
