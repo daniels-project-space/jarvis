@@ -19,6 +19,9 @@ export const SAFE_SANDBOX_EXECUTION_RULES =
 
 const SOFTWARE_DELIVERY_ACTION = /^(?:deploy|merge)$/i;
 
+const LIVE_PROVIDER_DEPLOYMENT_OBJECT =
+  /^(?:(?:the|a|an|this|that)\s+)?(?:(?:live|production)\s+)?provider(?:\s+(?:change|configuration|resource|service|effect|deployment))?\b/i;
+
 // Publication is public/consequential by default. The owned-repository
 // exception is bound to the direct technical object of the verb; a Git word
 // elsewhere in the clause cannot make "publish the findings" autonomous.
@@ -44,7 +47,30 @@ const HTTP_POST_NOMINAL_LEAD =
   /\b(?:https?|api|rest|graphql|provider[-_ ]method|stage_(?:blob|tree|commit)|update_ref|response[-_ ]lost|request[-_ ]lost)\s*$/i;
 
 const HTTP_POST_NOMINAL_TAIL =
-  /^(?:$|\/[^\s]*|(?:request|method|call|operation|effect|response|receipt|evidence|idempotency|failure|result|status|body|payload|headers?|endpoint|whose|that|which|was|were|is|are|has|had|with|without|before|after|during|from|to|against)\b)/i;
+  /^(?:$|\/[^\s]*|(?:(?:may|might|could|can|should|would|will|must)\s+have\s+(?:applied|failed|returned)|request|method|call|operation|effect|response|receipt|evidence|idempotency|failure|result|status|body|payload|headers?|endpoint|whose|that|which|was|were|is|are|has|had|with|without|before|after|during|from|to|against)\b)/i;
+
+// These exact hyphenated/slash-separated forms are descriptive cloud-sandbox
+// vocabulary. Keep the exception at the matched token boundary: the ordinary
+// verbs ("email the user", "pay the provider", and so on) remain gated.
+const TECHNICAL_COMPOUND_TAIL: Partial<Record<string, RegExp>> = {
+  email: /^-verified\b/i,
+  message: /^-queue\b/i,
+  pay: /^-as-you-go\b/i,
+};
+
+const TECHNICAL_DELETE_COMPOUND_LEAD = /\bauto-stop\/archive\/$/i;
+
+const TECHNICAL_DELETE_COMPOUND_TAIL =
+  /^(?:$|(?:as|for|in|within)\b|(?:sandbox|resource|lifecycle|retention|cleanup|policy|policies|controls?|states?|transitions?|semantics|settings?|configuration|options?|behavio(?:u)?r|support|workflow|handling)\b)/i;
+
+// Root review is a controller-internal Git-ref handoff. The otherwise vague
+// object "a reviewed ref" is accepted only with both this direct object/tail
+// and a trusted controller as the publishing subject.
+const ROOT_REVIEWED_REF_PUBLICATION_OBJECT =
+  /^(?:a|the)\s+reviewed\s+(?:git\s+)?ref\s+for\s+root\s+review\b/i;
+
+const TRUSTED_CONTROLLER_PUBLICATION_LEAD =
+  /\b(?:the\s+)?trusted\s+(?:(?:delivery|integration)\s+)?controller\b[^.;!?\n]{0,80}\b(?:may|might|can|could|should|would|will|must|to)\s*$/i;
 
 // A delivery controller can move its review prompt to a local child process
 // through standard input. These patterns describe the object and transport,
@@ -232,11 +258,22 @@ function softwareDeliveryAllowed(
   actionIndex: number,
 ): boolean {
   if (!isOwnedRepository(repo)) return false;
+  const after = clause.slice(actionIndex + action.length).replace(/[`*]/g, "").trim();
+  if (action.toLocaleLowerCase("en-GB") === "deploy" && LIVE_PROVIDER_DEPLOYMENT_OBJECT.test(after)) {
+    return false;
+  }
   if (SOFTWARE_DELIVERY_ACTION.test(action)) return true;
   if (action.toLocaleLowerCase("en-GB") !== "publish") return false;
   // Markdown code/emphasis delimiters do not change the grammatical object.
-  const after = clause.slice(actionIndex + action.length).replace(/[`*]/g, "").trim();
-  if (!REVIEWED_GIT_REF_PUBLICATION_OBJECT.test(after) && !TECHNICAL_PROVIDER_PUBLICATION_OBJECT.test(after)) {
+  const before = clause.slice(0, actionIndex).replace(/[`*]/g, "").trim();
+  const controllerRootReview =
+    ROOT_REVIEWED_REF_PUBLICATION_OBJECT.test(after)
+    && TRUSTED_CONTROLLER_PUBLICATION_LEAD.test(before);
+  if (
+    !controllerRootReview
+    && !REVIEWED_GIT_REF_PUBLICATION_OBJECT.test(after)
+    && !TECHNICAL_PROVIDER_PUBLICATION_OBJECT.test(after)
+  ) {
     return false;
   }
   return !NON_REPOSITORY_PUBLICATION_CONTEXT.test(clause);
@@ -271,6 +308,13 @@ function consequentialUse(action: string, clause: string, actionIndex: number): 
   const normalized = action.toLocaleLowerCase("en-GB");
   const before = clause.slice(0, actionIndex).trim();
   const after = clause.slice(actionIndex + action.length).trim();
+  const technicalCompoundTail = TECHNICAL_COMPOUND_TAIL[normalized];
+  if (technicalCompoundTail?.test(after)) return false;
+  if (
+    normalized === "delete"
+    && TECHNICAL_DELETE_COMPOUND_LEAD.test(before)
+    && TECHNICAL_DELETE_COMPOUND_TAIL.test(after)
+  ) return false;
   if (/^(?:message|reply)$/i.test(normalized)) {
     // Chat engineering prompts use these words as data nouns (“reply
     // latency”, “message event”). An actual imperative has no determiner, and
@@ -304,7 +348,7 @@ function consequentialUse(action: string, clause: string, actionIndex: number): 
   }
   if (normalized !== "order") return true;
   if (/^(?:(?:please|can you|could you|would you)\s*)?$/i.test(before)) return true;
-  return /\b(?:place|submit|make|create|buy|purchase|pay(?:\s+for)?|want\s+(?:you|jarvis)\s+to|need\s+(?:you|jarvis)?\s*to)\s+(?:(?:a|an|the|this|that|one|real)\s+)*$/i.test(before);
+  return /\b(?:place|submit|make|create|buy|purchase|pay(?:\s+for)?|want\s+(?:you|jarvis)\s+to|need\s+(?:you|jarvis)?\s*to)\s+(?:(?:a|an|the|this|that|one|real|test|customer|supplier)(?:\s+|$))*$/i.test(before);
 }
 
 export function classifyWorkSafety(

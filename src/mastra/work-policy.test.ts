@@ -3,6 +3,7 @@ import { goalWorkApprovalPolicy, workApprovalPolicy } from "../../convex/workPol
 import { plannerTask, routeGoal, validatorTask } from "../lib/goal-mode";
 import { classifyWorkSafety, SAFE_SANDBOX_EXECUTION_RULES } from "../lib/work-safety";
 import {
+  CLOUD_SANDBOX_APPROVAL_TASK,
   INTEGRATION_FINAL_BARRIER_APPROVAL_TASK,
   WORKSPACE_ISOLATION_APPROVAL_TASK,
 } from "./fixtures/work-policy-regressions";
@@ -224,9 +225,20 @@ describe("server-side work approval policy", () => {
 
   it("keeps the full repository approval regressions autonomous in standalone and Goal Mode", () => {
     expect(WORKSPACE_ISOLATION_APPROVAL_TASK.split("\n")[10]).toContain("publish the reviewed Git worker ref");
-    expect(INTEGRATION_FINAL_BARRIER_APPROVAL_TASK.split("\n")[8]).toContain("stage_blob POST");
+    expect(INTEGRATION_FINAL_BARRIER_APPROVAL_TASK.split("\n")[8]).toBe(
+      "The deterministic final integration ref already equals the prepared synthetic head, but integrateReviewedWorker immediately prepares/observes only update_ref. A prior stage_blob POST may have applied and then lost its durable observe callback. Jarvis therefore declares integrated and releases FIFO while a prepared cold effect remains unobserved. Fix the root state machine, not the external script.",
+    );
+    expect(CLOUD_SANDBOX_APPROVAL_TASK).toContain("email-verified");
+    expect(CLOUD_SANDBOX_APPROVAL_TASK).toContain("auto-stop/archive/delete");
+    expect(CLOUD_SANDBOX_APPROVAL_TASK).toContain("pay-as-you-go");
+    expect(CLOUD_SANDBOX_APPROVAL_TASK).toContain("message-queue");
+    expect(CLOUD_SANDBOX_APPROVAL_TASK).toContain("publish a reviewed ref for root review");
 
-    for (const task of [WORKSPACE_ISOLATION_APPROVAL_TASK, INTEGRATION_FINAL_BARRIER_APPROVAL_TASK]) {
+    for (const task of [
+      WORKSPACE_ISOLATION_APPROVAL_TASK,
+      INTEGRATION_FINAL_BARRIER_APPROVAL_TASK,
+      CLOUD_SANDBOX_APPROVAL_TASK,
+    ]) {
       const standalone = workApprovalPolicy({
         task,
         repo: "daniels-project-space/jarvis",
@@ -290,6 +302,14 @@ describe("server-side work approval policy", () => {
       "Document `POST /webhook` in the API contract.",
       "Reconcile the response-lost POST before retrying the provider effect.",
       "Persist provider-method POST evidence with the effect receipt.",
+      "A prior stage_blob POST may have applied and then lost its durable observe callback.",
+      "A prior stage_blob POST might have failed before the callback.",
+      "A prior stage_blob POST could have returned without a durable observation.",
+      "A prior stage_blob POST can have applied before recovery.",
+      "A prior stage_blob POST should have failed with a receipt.",
+      "A prior stage_blob POST would have returned a provider result.",
+      "A prior stage_blob POST will have applied by reconciliation.",
+      "A prior stage_blob POST must have returned before observation.",
     ]) {
       expect(classifyWorkSafety(task), task).toEqual({ approvalRequired: false, boundary: "internal" });
     }
@@ -305,6 +325,49 @@ describe("server-side work approval policy", () => {
     ]) {
       expect(workApprovalPolicy({ task, repo: "daniels-project-space/jarvis" }).required, task).toBe(true);
     }
+  });
+
+  it("recognizes only the precise cloud-sandbox compounds and controller Git-ref handoff", () => {
+    for (const task of [
+      "Keep access bound to the email-verified identity state.",
+      "Represent auto-stop/archive/delete as sandbox lifecycle policy.",
+      "Model pay-as-you-go billing configuration.",
+      "Keep delivery behind the message-queue boundary.",
+      "Only the trusted controller may publish a reviewed ref for root review.",
+    ]) {
+      expect(classifyWorkSafety(task, { repo: "daniels-project-space/jarvis" }).approvalRequired, task).toBe(false);
+    }
+
+    for (const task of [
+      "Email the verified user.",
+      "Delete the archived customer records.",
+      "Pay the provider.",
+      "Message the queue owner.",
+      "Publish a reviewed report.",
+      "Publish a reviewed ref for root review.",
+      "Only the trusted controller may publish a reviewed ref for root review and email the customer.",
+      "Deploy the provider change to production.",
+      "Deploy the live provider configuration.",
+      "Place a real customer order.",
+      "Create a test supplier order.",
+      "Advertise the rental listing.",
+      "Trade the selected shares.",
+      "Book the selected hotel.",
+      "Rotate a secret.",
+      "Keep the email-verified state and delete the customer records.",
+      "Configure auto-stop/archive/delete customer records.",
+      "Configure auto-stop/archive/delete archived customer data.",
+      "Model pay-as-you-go billing and pay the provider.",
+      "Inspect the message-queue and message the queue owner.",
+      "Represent auto-stop/archive/delete, then publish the findings publicly.",
+    ]) {
+      expect(workApprovalPolicy({ task, repo: "daniels-project-space/jarvis" }).required, task).toBe(true);
+    }
+
+    expect(workApprovalPolicy({
+      task: "Only the trusted controller may publish a reviewed ref for root review.",
+      repo: "someone-else/jarvis",
+    }).required).toBe(true);
   });
 
   it("keeps technical temporal prefixes and communication nouns internal", () => {
