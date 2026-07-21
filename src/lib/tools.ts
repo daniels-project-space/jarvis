@@ -7,6 +7,7 @@ import { withAdminSession } from "./control-context";
 import { wakeAgentFleet } from "./agent-fleet-dispatch";
 import { SHALLOW_PROVENANCE_RULE } from "./git-delivery";
 import { workModelLabel, workModelPriority } from "./work-models";
+import { exactTextWorkOrder } from "./work-order";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
 import {
   VISUAL_BLOCK_KINDS,
@@ -3008,8 +3009,8 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
   return await withAdminSession(authTokenHash, async () => {
     switch (name) {
     case "dispatch_agent": {
-      const task = String(args.task ?? "").trim().slice(0, 6000);
-      if (!task) return "Give me the outcome you want the team to own.";
+      const task = exactTextWorkOrder(String(args.task ?? ""));
+      if (!task.trim()) return "Give me the outcome you want the team to own.";
       const repo = args.repo ? String(args.repo) : undefined;
       const [{ routeWork, suggestedAcceptanceCriteria }, { TEAM_BY_SLUG }] = await Promise.all([
         import("../mastra/routing"),

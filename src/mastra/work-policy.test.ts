@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { goalWorkApprovalPolicy, workApprovalPolicy } from "../../convex/workPolicy";
 import { plannerTask, routeGoal, validatorTask } from "../lib/goal-mode";
@@ -6,6 +8,13 @@ import {
   INTEGRATION_FINAL_BARRIER_APPROVAL_TASK,
   WORKSPACE_ISOLATION_APPROVAL_TASK,
 } from "./fixtures/work-policy-regressions";
+
+const CLOUD_SANDBOX_APPROVAL_TASK = readFileSync(
+  new URL("./fixtures/cloud-sandbox-approval-task.txt", import.meta.url),
+  "utf8",
+);
+const CLOUD_SANDBOX_APPROVAL_TASK_SHA256 =
+  "d48d26ff68ae0789b70fbc9520aefe45a3de204bfef79fef95fe3c4ef57f7130";
 
 const CHAT_LATENCY_JOB_REGRESSION = {
   id: "js73f7b1rnjfqap286193t0hcs8awpq3",
@@ -227,9 +236,14 @@ describe("server-side work approval policy", () => {
     expect(INTEGRATION_FINAL_BARRIER_APPROVAL_TASK.split("\n")[8]).toBe(
       "The deterministic final integration ref already equals the prepared synthetic head, but integrateReviewedWorker immediately prepares/observes only update_ref. A prior stage_blob POST may have applied and then lost its durable observe callback. Jarvis therefore declares integrated and releases FIFO while a prepared cold effect remains unobserved. Fix the root state machine, not the external script.",
     );
+    expect(Buffer.byteLength(CLOUD_SANDBOX_APPROVAL_TASK, "utf8")).toBe(7_876);
+    expect(createHash("sha256").update(CLOUD_SANDBOX_APPROVAL_TASK).digest("hex")).toBe(
+      CLOUD_SANDBOX_APPROVAL_TASK_SHA256,
+    );
     for (const task of [
       WORKSPACE_ISOLATION_APPROVAL_TASK,
       INTEGRATION_FINAL_BARRIER_APPROVAL_TASK,
+      CLOUD_SANDBOX_APPROVAL_TASK,
     ]) {
       const standalone = workApprovalPolicy({
         task,
@@ -319,7 +333,50 @@ describe("server-side work approval policy", () => {
     }
   });
 
-  it("recognizes only the precise cloud-sandbox compounds and controller Git-ref handoff", () => {
+  it("enforces the exact cloud-sandbox acceptance matrix through every executable policy path", () => {
+    const ownedRepo = "daniels-project-space/jarvis";
+    const matrix = [
+      { task: CLOUD_SANDBOX_APPROVAL_TASK, required: false },
+      {
+        task: "Represent auto-stop/archive/delete, snapshot identity, and persistent volumes as sandbox lifecycle configuration.",
+        required: false,
+      },
+      { task: "Email the verified user.", required: true },
+      { task: "Delete, snapshot, and export the archived customer records.", required: true },
+      { task: "Configure auto-stop/archive/delete customer records.", required: true },
+      { task: "Configure auto-stop/archive/delete archived customer data.", required: true },
+      { task: "Pay the provider.", required: true },
+      { task: "Message the queue owner.", required: true },
+      { task: "Publish a reviewed report.", required: true },
+      {
+        task: "Only the trusted controller may publish a reviewed ref for root review and email the customer.",
+        required: true,
+      },
+      {
+        task: "Only the trusted controller may publish a reviewed ref for root review.",
+        repo: "someone-else/jarvis",
+        required: true,
+      },
+      {
+        task: "Publish the public report, email the customer, pay the provider, delete production records, and deploy the live provider configuration.",
+        required: true,
+      },
+    ] as const;
+
+    for (const entry of matrix) {
+      const repo = "repo" in entry ? entry.repo : ownedRepo;
+      expect(classifyWorkSafety(entry.task, { repo }).approvalRequired, `classifier: ${entry.task}`).toBe(entry.required);
+      expect(workApprovalPolicy({ task: entry.task, repo }).required, `standalone: ${entry.task}`).toBe(entry.required);
+      for (const goalStage of ["building", "refining"] as const) {
+        expect(
+          goalWorkApprovalPolicy({ task: entry.task, repo, goalStage }).required,
+          `${goalStage}: ${entry.task}`,
+        ).toBe(entry.required);
+      }
+    }
+  });
+
+  it("keeps neighboring cloud compounds narrow", () => {
     for (const task of [
       "Keep access bound to the email-verified identity state.",
       "Represent auto-stop/archive/delete as sandbox lifecycle policy.",
@@ -332,27 +389,13 @@ describe("server-side work approval policy", () => {
     }
 
     for (const task of [
-      "Email the verified user.",
       "Delete the archived customer records.",
-      "Pay the provider.",
-      "Message the queue owner.",
-      "Publish a reviewed report.",
       "Publish a reviewed ref for root review.",
-      "Only the trusted controller may publish a reviewed ref for root review and email the customer.",
-      "Deploy the provider change to production.",
-      "Deploy the live provider configuration.",
-      "Place a real customer order.",
-      "Create a test supplier order.",
-      "Advertise the rental listing.",
-      "Trade the selected shares.",
-      "Book the selected hotel.",
-      "Rotate a secret.",
-      "Keep the email-verified state and delete the customer records.",
-      "Configure auto-stop/archive/delete customer records.",
-      "Configure auto-stop/archive/delete archived customer data.",
       "Configure stop/archive/delete, snapshot identity for customer records.",
       "Configure auto-stop/archive/delete, customer snapshot identity.",
       "Configure auto-stop/archive/delete, snapshot customer identity.",
+      "Configure auto-stop/archive/delete, snapshot identity for customer records.",
+      "Configure auto-stop/archive/delete, snapshot identity customer records.",
       "Configure auto-stop/archive/delete, snapshot identity, then delete customer records.",
       "Model pay-as-you-go billing and pay the provider.",
       "Inspect the message-queue and message the queue owner.",
@@ -360,11 +403,6 @@ describe("server-side work approval policy", () => {
     ]) {
       expect(workApprovalPolicy({ task, repo: "daniels-project-space/jarvis" }).required, task).toBe(true);
     }
-
-    expect(workApprovalPolicy({
-      task: "Only the trusted controller may publish a reviewed ref for root review.",
-      repo: "someone-else/jarvis",
-    }).required).toBe(true);
   });
 
   it("keeps technical temporal prefixes and communication nouns internal", () => {

@@ -23,6 +23,7 @@ import {
   runtimeJob,
 } from "./controlPlane";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
+import { exactTextWorkOrder } from "../src/lib/work-order";
 import { validateWorkDag, workItemIdentity } from "../src/lib/workspace-protocol";
 import { controlIntegrationForJob } from "./goalIntegration";
 
@@ -143,12 +144,13 @@ export const latestCoordinatorReceipt = query({
 });
 
 async function insertGoalJob(ctx: any, input: GoalJobInput) {
+  const task = exactTextWorkOrder(input.task);
   const now = Date.now();
   const repo = input.repo === undefined ? undefined : canonicalizeRepository(input.repo, { allowShortName: true }) ?? undefined;
   if (input.repo !== undefined && !repo) {
     throw new Error("Goal repository must be an owner/repo slug or credential-free https://github.com/owner/repo(.git) URL");
   }
-  input = { ...input, repo };
+  input = { ...input, repo, task };
   const approval = goalWorkApprovalPolicy({
     ...input,
     task: input.policyTask?.trim() || input.task,
@@ -158,7 +160,6 @@ async function insertGoalJob(ctx: any, input: GoalJobInput) {
   const { policyTask: _policyTask, ...persistedInput } = input;
   const jobId = await insertJobWithRuntime(ctx, {
     ...persistedInput,
-    task: input.task.slice(0, input.goalStage === "validating" ? GOAL_VALIDATOR_TASK_MAX_CHARS : 6_000),
     label: input.label.slice(0, 80),
     visibility: "conversation",
     status,

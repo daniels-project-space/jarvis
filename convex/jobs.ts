@@ -2,6 +2,7 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { isResumeOnlyUntouchedGoalJob } from "../src/lib/goal-job-lifecycle";
 import { workApprovalPolicy } from "./workPolicy";
+import { exactTextWorkOrder } from "../src/lib/work-order";
 import { classifyWorkSafety, isOwnedRepository } from "../src/lib/work-safety";
 import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
@@ -293,18 +294,18 @@ export const enqueue = mutation({
   handler: async (ctx, a) => {
     await requireDispatcher(ctx, a);
     const { authTokenHash: _authTokenHash, dispatchToken: _dispatchToken, workerToken: _workerToken, ...input } = a;
+    const task = exactTextWorkOrder(input.task);
     const now = Date.now();
     const repo = input.repo === undefined ? undefined : canonicalizeRepository(input.repo, { allowShortName: true }) ?? undefined;
     if (input.repo !== undefined && !repo) {
       throw new Error("Repository must be an owner/repo slug or credential-free https://github.com/owner/repo(.git) URL");
     }
-    const normalizedInput = { ...input, repo };
+    const normalizedInput = { ...input, repo, task };
     const approval = workApprovalPolicy(normalizedInput);
     const approvalRequired = approval.required;
     const status = approvalRequired ? "awaiting_approval" : "pending";
     const id = await insertJobWithRuntime(ctx, {
       ...normalizedInput,
-      task: input.task.slice(0, 6000),
       model: input.model ? normalizeWorkModelTier(input.model) : undefined,
       label: input.label?.slice(0, 80),
       priority: Math.max(0, Math.min(100, input.priority ?? 50)),
