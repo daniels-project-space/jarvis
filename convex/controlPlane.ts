@@ -8,6 +8,7 @@ function defined<T extends Record<string, unknown>>(value: T): T {
 
 export function projectJobRuntime(job: any) {
   const createdAt = Number(job.createdAt ?? job._creationTime ?? Date.now());
+  const active = ["running", "dispatching", "pending", "awaiting_approval", "paused", "stalled", "needs_input", "steering"].includes(String(job.status));
   return defined({
     jobId: job._id,
     // The overlay needs enough context to identify the task, not the full
@@ -39,6 +40,7 @@ export function projectJobRuntime(job: any) {
     stalledAt: typeof job.stalledAt === "number" ? job.stalledAt : undefined,
     stallReason: typeof job.stallReason === "string" ? job.stallReason.slice(0, 400) : undefined,
     steerRevision: Math.max(0, Number(job.steerRevision ?? 0)),
+    active,
     nextRunAt: typeof job.nextRunAt === "number" ? job.nextRunAt : undefined,
     dispatchId: typeof job.dispatchId === "string" ? job.dispatchId.slice(0, 180) : undefined,
     dispatchLeaseUntil: typeof job.dispatchLeaseUntil === "number" ? job.dispatchLeaseUntil : undefined,

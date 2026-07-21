@@ -285,11 +285,16 @@ export default defineSchema({
     stage: v.string(),
     percent: v.number(),
     progress: v.optional(v.string()),
-    progressAt: v.number(),
-    stallCount: v.number(),
+    // Optional during the first projection rollout. The bounded migration
+    // supplies these values before a later schema-tightening release.
+    progressAt: v.optional(v.number()),
+    stallCount: v.optional(v.number()),
     stalledAt: v.optional(v.number()),
     stallReason: v.optional(v.string()),
-    steerRevision: v.number(),
+    steerRevision: v.optional(v.number()),
+    // A compact one-index read model for live UI work. This stays optional in
+    // rollout one so existing runtime rows remain schema-valid.
+    active: v.optional(v.boolean()),
     attempt: v.number(),
     maxAttempts: v.number(),
     heartbeatAt: v.number(),
@@ -321,6 +326,7 @@ export default defineSchema({
     .index("by_status_heartbeat", ["status", "heartbeatAt"])
     .index("by_status_progress", ["status", "progressAt"])
     .index("by_status_dispatch_lease", ["status", "dispatchLeaseUntil"])
+    .index("by_active_priority", ["active", "priority", "createdAt"])
     .index("by_visibility_status_priority", ["visibility", "status", "priority", "createdAt"])
     .index("by_thread_visibility_status_priority", ["originThreadId", "visibility", "status", "priority", "createdAt"])
     .index("by_mission", ["missionId", "createdAt"]),
@@ -511,12 +517,16 @@ export default defineSchema({
     attempt: v.optional(v.number()),
     causationId: v.optional(v.string()),
     evidenceKind: v.optional(v.string()),
+    eventKey: v.optional(v.string()),
+    sequence: v.optional(v.number()),
+    predecessorKey: v.optional(v.string()),
     data: v.optional(v.any()),
     createdAt: v.number(),
   })
     .index("by_job", ["jobId", "createdAt"])
     .index("by_mission", ["missionId", "createdAt"])
-    .index("by_createdAt", ["createdAt"]),
+    .index("by_createdAt", ["createdAt"])
+    .index("by_job_event", ["jobId", "eventKey"]),
 
   // One immutable row per fenced Trigger attempt. Jobs remain the authority
   // for scheduling; this table makes intent → workspace → session lineage
@@ -524,10 +534,17 @@ export default defineSchema({
   workAttempts: defineTable({
     jobId: v.id("jobs"),
     attempt: v.number(),
-    status: v.string(), // running | checkpointed | stalled | done | error | cancelled
+    status: v.string(), // running | checkpointed | paused | steered | needs_input | stalled | done | error | cancelled
     workspaceKey: v.string(),
     sessionId: v.string(),
     workerRunId: v.string(),
+    dispatchId: v.optional(v.string()),
+    // The Trigger run is only delivery metadata. Sandbox/provider sessions
+    // are deliberately separate identities for the sandbox adapter workstream.
+    providerWorkspaceId: v.optional(v.string()),
+    providerSessionId: v.optional(v.string()),
+    lastEventSeq: v.optional(v.number()),
+    lastEventKey: v.optional(v.string()),
     launchedAt: v.number(),
     livenessAt: v.number(),
     progressAt: v.number(),
@@ -548,6 +565,9 @@ export default defineSchema({
     acceptanceEvidence: v.array(v.string()),
     artifacts: v.array(v.string()),
     verification: v.string(),
+    terminalEventKey: v.optional(v.string()),
+    resultDigest: v.optional(v.string()),
+    evidenceDigest: v.optional(v.string()),
     createdAt: v.number(),
   })
     .index("by_job_attempt", ["jobId", "attempt"])

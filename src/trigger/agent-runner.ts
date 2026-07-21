@@ -1,4 +1,6 @@
 import { metadata, schedules, task, timeout } from "@trigger.dev/sdk/v3";
+import { ConvexClient } from "convex/browser";
+import { api } from "../../convex/_generated/api";
 import { spawn } from "node:child_process";
 import { mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -766,8 +768,26 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       const originThread = typeof job.originThreadId === "string" && job.originThreadId ? job.originThreadId : "main";
       const expectedAttempt = Number(job.attempt ?? 1);
       const expectedSteerRevision = Number(job.steerRevision ?? 0);
+      // Control is a reactive lease subscription, not a per-boundary polling
+      // loop. The HTTP query below is only a 2-minute fail-safe if the socket
+      // has not delivered a snapshot (for example during a transient outage).
+      const controlClient = new ConvexClient(CONVEX_URL);
+      let subscribedLease: any = null;
+      let lastLeaseFallbackAt = 0;
+      const workerToken = process.env.JARVIS_WORKER_TOKEN;
+      const unsubscribeLease = controlClient.onUpdate(
+        api.jobs.executionLease,
+        { jobId: job.jobId, workerToken },
+        (lease) => { subscribedLease = lease; },
+        () => { subscribedLease = null; },
+      );
       const executionStatus = async (): Promise<string> => {
-        const lease: any = await convexQuery("jobs:executionLease", { jobId: job.jobId });
+        let lease: any = subscribedLease;
+        if (!lease && Date.now() - lastLeaseFallbackAt >= 120_000) {
+          lastLeaseFallbackAt = Date.now();
+          lease = await convexQuery("jobs:executionLease", { jobId: job.jobId });
+        }
+        if (!lease) return "unknown";
         if (!lease || Number(lease.attempt) !== expectedAttempt) return "superseded";
         if (Number(lease.steerRevision ?? 0) !== expectedSteerRevision) return "steered";
         return String(lease.status ?? "missing");
@@ -1039,7 +1059,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           const nextPercent = Number(percent ?? 0);
           const majorTransition = Boolean(stage && stage !== lastDurableStage)
             || nextPercent - lastDurablePercent >= 15;
-          const heartbeatDue = now - lastHeartbeatAt >= 30_000;
+          const heartbeatDue = now - lastHeartbeatAt >= 60_000;
           if (heartbeatDue) {
             lastHeartbeatAt = now;
             durableProgress = durableProgress
@@ -1744,6 +1764,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             threadId: originThread,
             text: `⚠️ ${job.agentId ?? "Agent"} exhausted its recovery budget: ${message.slice(0, 240)}`,
           }).catch(() => {});
+      } finally {
+        unsubscribeLease();
+        controlClient.close();
       }
     };
 
