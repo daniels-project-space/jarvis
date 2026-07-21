@@ -13,7 +13,12 @@ function claimHarness() {
   const rows = (table: string) => table === "jobs" ? [...jobs.values()] : table === "workAttempts" ? attempts : table === "workEvents" ? events : table === "jobRuntime" ? runtime : table === "deliveryAttempts" ? deliveryAttempts : [];
   const matches = (table: string, predicates: Array<{ field: string; value: unknown }>) => rows(table).filter((row) => predicates.every((p) => row[p.field] === p.value));
   const db: any = {
-    get: async (key: string) => jobs.get(String(key)) ?? rows("workAttempts").find((r) => r._id === key) ?? rows("jobRuntime").find((r) => r._id === key) ?? rows("deliveryAttempts").find((r) => r._id === key) ?? null,
+    // Convex returns immutable document snapshots. Keep this narrow harness
+    // honest: callers must re-read after patch rather than observe mutation.
+    get: async (key: string) => {
+      const found = jobs.get(String(key)) ?? rows("workAttempts").find((r) => r._id === key) ?? rows("jobRuntime").find((r) => r._id === key) ?? rows("deliveryAttempts").find((r) => r._id === key) ?? null;
+      return found ? { ...found } : null;
+    },
     normalizeId: (_table: string, key: string) => jobs.has(String(key)) ? key : null,
     insert: async (table: string, value: Row) => {
       const _id = `${table}-${++id}`;
@@ -22,11 +27,15 @@ function claimHarness() {
       return _id;
     },
     patch: async (key: string, patch: Row) => {
-      const row = await db.get(key);
+      const row = jobs.get(String(key)) ?? rows("workAttempts").find((r) => r._id === key) ?? rows("jobRuntime").find((r) => r._id === key) ?? rows("deliveryAttempts").find((r) => r._id === key);
       if (!row) throw new Error(`missing ${key}`);
       Object.assign(row, Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)));
     },
-    replace: async (key: string, value: Row) => { const row = await db.get(key); Object.assign(row, value); },
+    replace: async (key: string, value: Row) => {
+      const row = jobs.get(String(key)) ?? rows("workAttempts").find((r) => r._id === key) ?? rows("jobRuntime").find((r) => r._id === key) ?? rows("deliveryAttempts").find((r) => r._id === key);
+      if (!row) throw new Error(`missing ${key}`);
+      Object.assign(row, value);
+    },
     query: (table: string) => ({
       withIndex: (_name: string, callback: (q: any) => any) => {
         const predicates: any[] = [];
@@ -54,7 +63,7 @@ describe("claimDispatched handler", () => {
     const claim = (claimDispatched as any)._handler;
     const first = await claim(h.ctx, { jobId: "job-1", dispatchId: "dispatch-1", workerRunId: "run-a", workerToken: "test-worker" });
     expect(first.upstreamEvidence).toEqual([{ label: "Dependency", status: "done", result: "stable evidence", verificationNote: "checked" }]);
-    expect(h.job.status).toBe("running");
+    expect(h.jobs.get("job-1")?.status).toBe("running");
     expect(h.attempts[0]).toMatchObject({ status: "running", dispatchId: "dispatch-1", workerRunId: "run-a", sessionId: "run-a" });
     h.jobs.get("dep-1")!.result = "mutated after claim";
     const replay = await claim(h.ctx, { jobId: "job-1", dispatchId: "dispatch-1", workerRunId: "run-a", workerToken: "test-worker" });

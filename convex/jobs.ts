@@ -761,7 +761,12 @@ export const claimDispatched = mutation({
       await appendAttemptEvidence(ctx, j, "delivery_resumed", "Trusted controller resumed verified delivery without rerunning the specialist", {
         stage: "delivery", evidenceKind: "delivery", eventKey: `delivery-resume:${j.attempt ?? 1}:${a.dispatchId}`,
       });
-      return claimedJob(j, priorAttempt.upstreamEvidence ?? []);
+      // `ctx.db.patch` does not mutate a document returned by `get`. Build
+      // the claim from the committed authority rows so the first controller
+      // response has exactly the same fence as a lost-response replay.
+      const committedJob = await ctx.db.get(a.jobId);
+      const committedAttempt = committedJob ? await attemptFor(ctx, a.jobId, attemptNumber) : null;
+      return committedJob ? claimedJob(committedJob, committedAttempt?.upstreamEvidence ?? []) : null;
     }
     if (priorAttempt?.workerRunId || (priorAttempt?.dispatchId && priorAttempt.dispatchId !== a.dispatchId)) {
       // A stale platform redelivery must not replace the original workspace
@@ -811,7 +816,12 @@ export const claimDispatched = mutation({
       evidenceKind: "attempt_launch",
       data: { workspace: `convex:${String(a.jobId)}:attempt:${j.attempt ?? 1}`, session: a.workerRunId.slice(0, 120) },
     });
-    return claimedJob(j, upstreamEvidence);
+    // Never use the pre-patch object here. Convex documents are immutable
+    // snapshots, unlike the old unit-test fake; returning it lost the newly
+    // committed worker and delivery fence on an initial response.
+    const committedJob = await ctx.db.get(a.jobId);
+    const committedAttempt = committedJob ? await attemptFor(ctx, a.jobId, attemptNumber) : null;
+    return committedJob ? claimedJob(committedJob, committedAttempt?.upstreamEvidence ?? []) : null;
   },
 });
 
