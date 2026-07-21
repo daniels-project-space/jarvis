@@ -77,9 +77,10 @@ describe("subscription subprocess capability scope", () => {
     const env = isolateSubscriptionEnv({
       ...process.env, CODEX_HOME: process.cwd(),
       JARVIS_GIT_REVIEW_RECEIPT_SECRET: "receipt-secret", CONVEX_URL: "https://control.example",
+      JARVIS_GIT_REVIEW_RECEIPT_KEYRING: "keyring-secret-and-metadata",
       TRIGGER_SECRET_KEY: "trigger-secret", GITHUB_TOKEN: "github-secret",
     }, "spawn-scope");
-    const child = spawnSync(process.execPath, ["-e", "process.stdout.write(JSON.stringify({receipt:process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET,convex:process.env.CONVEX_URL,trigger:process.env.TRIGGER_SECRET_KEY,github:process.env.GITHUB_TOKEN}))"], { env, encoding: "utf8" });
+    const child = spawnSync(process.execPath, ["-e", "process.stdout.write(JSON.stringify({receipt:process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET,keyring:process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING,convex:process.env.CONVEX_URL,trigger:process.env.TRIGGER_SECRET_KEY,github:process.env.GITHUB_TOKEN}))"], { env, encoding: "utf8" });
     expect(child.status).toBe(0);
     expect(JSON.parse(child.stdout)).toEqual({});
   });

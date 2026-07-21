@@ -611,6 +611,16 @@ export default defineSchema({
     deliveryRunId: v.optional(v.string()),
     policy: v.string(),
     status: v.string(), // running | checkpointed | done | blocked | abandoned
+    // The controller row is the complete authority record. Job fields are
+    // projections only and cannot authorize a provider effect.
+    outcome: v.optional(v.string()),
+    sourceDispatchId: v.optional(v.string()),
+    parentDeliveryAttemptId: v.optional(v.id("deliveryAttempts")),
+    reviewLineage: v.optional(v.array(v.object({
+      sourceWorkAttempt: v.number(),
+      reviewReceiptId: v.id("reviewReceipts"),
+      reviewReceiptDigest: v.string(),
+    }))),
     reviewReceiptId: v.optional(v.id("reviewReceipts")),
     reviewReceiptDigest: v.optional(v.string()),
     reviewedHeadSha: v.optional(v.string()),
@@ -618,6 +628,21 @@ export default defineSchema({
     reviewedHeadTreeSha: v.optional(v.string()),
     reviewedDiffSha256: v.optional(v.string()),
     observedPullRequestHead: v.optional(v.string()),
+    observedPullRequestBase: v.optional(v.string()),
+    pullRequestNumber: v.optional(v.number()),
+    pullRequestUrl: v.optional(v.string()),
+    pullRequestNodeId: v.optional(v.string()),
+    pullRequestDraft: v.optional(v.boolean()),
+    preparedEffectId: v.optional(v.string()),
+    preparedEffectKind: v.optional(v.string()), // create_draft_pr | create_pr | promote_pr | merge_pr
+    preparedEffectAt: v.optional(v.number()),
+    providerObservation: v.optional(v.string()),
+    providerObservedAt: v.optional(v.number()),
+    effects: v.optional(v.array(v.object({
+      effectId: v.string(), effectKind: v.string(), preparedAt: v.number(),
+      observation: v.optional(v.string()), observedAt: v.optional(v.number()),
+    }))),
+    retryReason: v.optional(v.string()),
     leaseOwner: v.optional(v.string()),
     leaseToken: v.optional(v.string()),
     leaseVersion: v.optional(v.number()),
@@ -627,7 +652,7 @@ export default defineSchema({
     // Retry budget belongs to the immutable review lineage and is copied
     // forward; resetting it on every generation made the cap unreachable.
     cumulativeRetries: v.optional(v.number()),
-    currentStep: v.optional(v.string()), // queued | preflight | pr | merge | receipt | terminal
+    currentStep: v.optional(v.string()), // queued | preflight | prepared | observing | receipt | terminal
     terminalReceiptDigest: v.optional(v.string()),
     nextRunAt: v.optional(v.number()),
     completedAt: v.optional(v.number()),
@@ -647,6 +672,7 @@ export default defineSchema({
     acceptanceEvidence: v.array(v.string()),
     artifacts: v.array(v.string()),
     verification: v.string(),
+    deliveryOutcome: v.optional(v.string()),
     terminalEventKey: v.optional(v.string()),
     resultDigest: v.optional(v.string()),
     evidenceDigest: v.optional(v.string()),
@@ -669,6 +695,7 @@ export default defineSchema({
     receiptJson: v.string(),
     receiptDigest: v.string(),
     signature: v.string(),
+    keyId: v.optional(v.string()),
     diffSha256: v.string(),
     baseSha: v.string(),
     headSha: v.string(),

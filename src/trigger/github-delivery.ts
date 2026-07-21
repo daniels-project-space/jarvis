@@ -1,5 +1,18 @@
 type FetchLike = typeof fetch;
 
+export type DeliveryEffect = Readonly<{
+  effectId: string;
+  kind: "create_draft_pr" | "create_pr" | "promote_pr" | "merge_pr";
+  headSha: string;
+  baseSha: string;
+  pullRequestNumber?: number;
+}>;
+
+type EffectHooks = {
+  prepareEffect?: (effect: DeliveryEffect) => Promise<boolean>;
+  observeEffect?: (effect: DeliveryEffect, observation: "applied" | "not_applied" | "unknown", detail?: PullRequestDelivery) => Promise<void>;
+};
+
 export type PullRequestDelivery = {
   number: number;
   url: string;
@@ -36,8 +49,11 @@ async function markReadyForReview(
   nodeId: string,
   token: string,
   fetchImpl: FetchLike,
+  effect: DeliveryEffect,
+  hooks: EffectHooks,
 ): Promise<boolean> {
   if (!nodeId) return false;
+  if (!hooks.prepareEffect || !hooks.observeEffect || !await hooks.prepareEffect(effect)) return false;
   const response = await fetchImpl("https://api.github.com/graphql", {
     method: "POST",
     headers: apiHeaders(token),
@@ -47,13 +63,18 @@ async function markReadyForReview(
     }),
     cache: "no-store",
   }).catch(() => null);
-  if (!response?.ok) return false;
+  if (!response?.ok) {
+    await hooks.observeEffect?.(effect, response ? "not_applied" : "unknown");
+    return false;
+  }
   const payload = (await response.json().catch(() => ({}))) as {
     data?: { markPullRequestReadyForReview?: { pullRequest?: { isDraft?: boolean } } };
     errors?: unknown[];
   };
-  return !payload.errors?.length
+  const applied = !payload.errors?.length
     && payload.data?.markPullRequestReadyForReview?.pullRequest?.isDraft === false;
+  await hooks.observeEffect?.(effect, applied ? "applied" : "not_applied");
+  return applied;
 }
 
 export async function openDeliveryPullRequest(args: {
@@ -65,7 +86,7 @@ export async function openDeliveryPullRequest(args: {
   draft?: boolean;
   reviewed?: ReviewedDeliveryHead;
   fetchImpl?: FetchLike;
-}): Promise<PullRequestDelivery | null> {
+} & EffectHooks): Promise<PullRequestDelivery | null> {
   const fetchImpl = args.fetchImpl ?? fetch;
   const headers = apiHeaders(args.token);
   try {
@@ -105,8 +126,17 @@ export async function openDeliveryPullRequest(args: {
       }>;
       if (rows[0]?.number && rows[0]?.html_url) {
         if (args.reviewed && String(rows[0].head?.sha ?? "") !== args.reviewed.headSha) return null;
+        // Manual delivery recognizes only the exact protected draft. It can
+        // neither adopt a ready PR nor promote one.
+        if (args.draft === true && rows[0].draft !== true) return null;
         if (rows[0].draft === true && args.draft !== true) {
-          const ready = await markReadyForReview(String(rows[0].node_id ?? ""), args.token, fetchImpl);
+          if (!args.reviewed) return null;
+          const effect: DeliveryEffect = {
+            effectId: `promote:${rows[0].number}:${args.reviewed.headSha}:${args.reviewed.baseSha}`,
+            kind: "promote_pr", headSha: args.reviewed.headSha, baseSha: args.reviewed.baseSha,
+            pullRequestNumber: rows[0].number,
+          };
+          const ready = await markReadyForReview(String(rows[0].node_id ?? ""), args.token, fetchImpl, effect, args);
           if (!ready) return null;
         }
         return {
@@ -116,14 +146,26 @@ export async function openDeliveryPullRequest(args: {
         };
       }
     }
-    const metadata = await fetchImpl(`https://api.github.com/repos/${args.repo}`, {
-      headers,
-      cache: "no-store",
-    });
-    const repository = metadata.ok
-      ? await metadata.json() as { default_branch?: string }
-      : null;
-    const base = String(repository?.default_branch ?? "main");
+    if (!args.reviewed) return null;
+    // Repeat the exact source/base authority observation immediately before
+    // preparing the write. Earlier discovery calls are not write authority.
+    const [sourceCheck, repoCheck] = await Promise.all([
+      fetchImpl(`https://api.github.com/repos/${args.repo}/git/ref/heads/${encodeURIComponent(args.branch)}`, { headers, cache: "no-store" }),
+      fetchImpl(`https://api.github.com/repos/${args.repo}`, { headers, cache: "no-store" }),
+    ]);
+    if (!sourceCheck.ok || !repoCheck.ok) return null;
+    const sourceState = await sourceCheck.json() as { object?: { sha?: string } };
+    const repoState = await repoCheck.json() as { default_branch?: string };
+    const base = String(repoState.default_branch ?? "main");
+    const baseCheck = await fetchImpl(`https://api.github.com/repos/${args.repo}/git/ref/heads/${encodeURIComponent(base)}`, { headers, cache: "no-store" });
+    const baseState = baseCheck.ok ? await baseCheck.json() as { object?: { sha?: string } } : null;
+    if (String(sourceState.object?.sha ?? "") !== args.reviewed.headSha || String(baseState?.object?.sha ?? "") !== args.reviewed.baseSha) return null;
+    const effect: DeliveryEffect = {
+      effectId: `pr:${args.draft === true ? "draft" : "ready"}:${args.branch}:${args.reviewed.headSha}:${args.reviewed.baseSha}`,
+      kind: args.draft === true ? "create_draft_pr" : "create_pr",
+      headSha: args.reviewed.headSha, baseSha: args.reviewed.baseSha,
+    };
+    if (!args.prepareEffect || !args.observeEffect || !await args.prepareEffect(effect)) return null;
     const created = await fetchImpl(`https://api.github.com/repos/${args.repo}/pulls`, {
       method: "POST",
       headers,
@@ -135,20 +177,44 @@ export async function openDeliveryPullRequest(args: {
         draft: args.draft === true,
       }),
       cache: "no-store",
-    });
-    if (!created.ok) return null;
+    }).catch(() => null);
+    if (!created) {
+      await args.observeEffect?.(effect, "unknown");
+      const reconciled = await fetchImpl(
+        `https://api.github.com/repos/${args.repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${args.branch}`)}`,
+        { headers, cache: "no-store" },
+      ).catch(() => null);
+      const rows = reconciled?.ok ? await reconciled.json() as Array<{
+        number?: number; html_url?: string; draft?: boolean; head?: { sha?: string };
+      }> : [];
+      const exact = rows.find((row) => row.number && row.html_url
+        && String(row.head?.sha ?? "") === args.reviewed!.headSha
+        && (args.draft !== true || row.draft === true));
+      if (!exact?.number || !exact.html_url) return null;
+      const result = { number: exact.number, url: exact.html_url, headSha: String(exact.head?.sha ?? "") };
+      await args.observeEffect?.(effect, "applied", result);
+      return result;
+    }
+    if (!created.ok) {
+      await args.observeEffect?.(effect, "not_applied");
+      return null;
+    }
     const pull = (await created.json()) as {
       number?: number;
       html_url?: string;
       head?: { sha?: string };
     };
-    if (!pull.number || !pull.html_url) return null;
-    if (args.reviewed && String(pull.head?.sha ?? "") !== args.reviewed.headSha) return null;
-    return {
+    if (!pull.number || !pull.html_url || String(pull.head?.sha ?? "") !== args.reviewed.headSha) {
+      await args.observeEffect?.(effect, "unknown");
+      return null;
+    }
+    const result = {
       number: pull.number,
       url: pull.html_url,
       headSha: String(pull.head?.sha ?? ""),
     };
+    await args.observeEffect?.(effect, "applied", result);
+    return result;
   } catch {
     return null;
   }
@@ -175,7 +241,7 @@ export async function mergeVerifiedPullRequest(args: {
   reviewedHeadSha?: string;
   /** The reviewed default-branch commit; checked before every PUT. */
   reviewedBaseSha?: string;
-}): Promise<MergeDeliveryResult> {
+} & EffectHooks): Promise<MergeDeliveryResult> {
   const fetchImpl = args.fetchImpl ?? fetch;
   const sleep = args.sleep ?? wait;
   const headers = apiHeaders(args.token);
@@ -215,6 +281,12 @@ export async function mergeVerifiedPullRequest(args: {
     if (state.mergeable === false && state.mergeable_state === "dirty") return { status: "blocked", note: "the verified branch conflicts with the current default branch" };
     if (state.mergeable_state === "behind") return { status: "blocked", note: "default branch advanced after controller review; a fresh review is required" };
     if (args.shouldContinue && !(await args.shouldContinue())) return { status: "pending", note: "delivery lease ended before merge" };
+    const effect: DeliveryEffect = {
+      effectId: `merge:${args.pull.number}:${reviewedHeadSha}:${args.reviewedBaseSha ?? String(state.base?.sha ?? "")}`,
+      kind: "merge_pr", headSha: reviewedHeadSha,
+      baseSha: args.reviewedBaseSha ?? String(state.base?.sha ?? ""), pullRequestNumber: args.pull.number,
+    };
+    if (!args.prepareEffect || !args.observeEffect || !await args.prepareEffect(effect)) return { status: "pending", note: "delivery effect was not durably prepared" };
     const merged = await fetchImpl(
       `https://api.github.com/repos/${args.repo}/pulls/${args.pull.number}/merge`,
       {
@@ -236,6 +308,7 @@ export async function mergeVerifiedPullRequest(args: {
         message?: string;
       };
       if (payload.merged) {
+        await args.observeEffect?.(effect, "applied");
         return {
           status: "merged",
           sha: String(payload.sha ?? ""),
@@ -243,13 +316,15 @@ export async function mergeVerifiedPullRequest(args: {
         };
       }
       lastMessage = String(payload.message ?? lastMessage);
+      await args.observeEffect?.(effect, "not_applied");
     } else if (merged) {
       const payload = (await merged.json().catch(() => ({}))) as { message?: string };
       lastMessage = String(payload.message ?? `${merged.status} from GitHub merge`);
+      await args.observeEffect?.(effect, "not_applied");
       if (![405, 409, 422].includes(merged.status)) {
         return { status: "blocked", note: lastMessage.slice(0, 500) };
       }
-    }
+    } else await args.observeEffect?.(effect, "unknown");
 
     const observedResponse = await fetchImpl(
       `https://api.github.com/repos/${args.repo}/pulls/${args.pull.number}`,
@@ -263,7 +338,14 @@ export async function mergeVerifiedPullRequest(args: {
         mergeable?: boolean | null;
         mergeable_state?: string;
         head?: { sha?: string };
+        base?: { sha?: string };
       };
+      if (String(observed.head?.sha ?? "") !== reviewedHeadSha) {
+        return { status: "blocked", note: "pull request head changed after controller review; a fresh review is required" };
+      }
+      if (args.reviewedBaseSha && String(observed.base?.sha ?? "") !== args.reviewedBaseSha) {
+        return { status: "blocked", note: "default branch advanced after controller review; a fresh review is required" };
+      }
       if (observed.merged) {
         return {
           status: "merged",
@@ -272,9 +354,6 @@ export async function mergeVerifiedPullRequest(args: {
         };
       }
       if (observed.state === "closed") return { status: "blocked", note: "pull request closed before delivery" };
-      if (String(observed.head?.sha ?? "") !== reviewedHeadSha) {
-        return { status: "blocked", note: "pull request head changed after controller review; a fresh review is required" };
-      }
       if (observed.mergeable === false && observed.mergeable_state === "dirty") {
         return { status: "blocked", note: "the verified branch conflicts with the current default branch" };
       }

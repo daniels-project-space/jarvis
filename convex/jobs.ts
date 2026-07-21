@@ -28,7 +28,20 @@ const STALE_RUNNER_MS = 5 * 60 * 1000;
 const STALLED_PROGRESS_MS = 20 * 60 * 1000;
 const DISPATCH_LEASE_MS = 2 * 60 * 1000;
 const DELIVERY_LEASE_MS = 45_000;
+const DELIVERY_RETRY_LIMIT = 6;
 const REVIEW_RECEIPT_MAX_CHARS = 300_000;
+const DELIVERY_OUTCOMES = new Set([
+  "protected_draft", "read_only_complete", "no_change",
+  "integrated_default_branch", "blocked", "needs_attention",
+]);
+
+function outcomeAllowed(policy: string, outcome: string) {
+  if (!DELIVERY_OUTCOMES.has(outcome)) return false;
+  if (outcome === "integrated_default_branch") return policy === "auto_merge";
+  if (outcome === "protected_draft") return policy === "manual";
+  if (outcome === "read_only_complete") return policy === "read_only";
+  return true;
+}
 
 async function sha256Hex(value: string) {
   const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
@@ -66,15 +79,54 @@ async function deliveryAttemptFor(ctx: any, jobId: any, sourceWorkAttempt: numbe
     .first();
 }
 
+async function openDeliveryAttention(ctx: any, row: any, now: number) {
+  const fingerprint = `delivery-exhausted:${String(row._id)}:${row.attempt ?? 1}`;
+  const existing = await ctx.db.query("attentionItems")
+    .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", fingerprint)).first();
+  if (existing) return existing._id;
+  return await ctx.db.insert("attentionItems", {
+    fingerprint, project: row.repo,
+    title: "Verified repository delivery needs attention",
+    detail: redactSensitiveText("The controller retry budget was exhausted. The specialist receipt remains preserved; no specialist rerun was started.").slice(0, 2_000),
+    evidence: [`Job ${String(row._id)}`, `Specialist attempt ${row.attempt ?? 1}`],
+    severity: "error", impact: 85, urgency: 75, confidence: 1,
+    actionClass: "ask", status: "open", jobId: String(row._id), createdAt: now, updatedAt: now,
+  });
+}
+
+async function openStaleReviewAttention(ctx: any, row: any, now: number) {
+  const fingerprint = `delivery-stale-review:${String(row._id)}:${row.attempt ?? 1}`;
+  const existing = await ctx.db.query("attentionItems")
+    .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", fingerprint)).first();
+  if (existing) return existing._id;
+  return await ctx.db.insert("attentionItems", {
+    fingerprint, project: row.repo, title: "Repository review became stale",
+    detail: "The reviewed source, base, or pull request identity changed. Delivery stopped before another write.",
+    evidence: [`Job ${String(row._id)}`, `Specialist attempt ${row.attempt ?? 1}`],
+    severity: "warning", impact: 80, urgency: 70, confidence: 1,
+    actionClass: "ask", status: "open", jobId: String(row._id), createdAt: now, updatedAt: now,
+  });
+}
+
 function deliveryClaimMatches(row: any, attempt: any, a: any) {
   return Boolean(attempt
-    && (!row.activeDeliveryAttemptId || String(row.activeDeliveryAttemptId) === String(attempt._id))
-    && (a.deliveryAttemptId === undefined || String(a.deliveryAttemptId) === String(attempt._id))
+    && row.activeDeliveryAttemptId && String(row.activeDeliveryAttemptId) === String(attempt._id)
+    && a.deliveryAttemptId && String(a.deliveryAttemptId) === String(attempt._id)
     && Number(a.sourceWorkAttempt) === Number(attempt.sourceWorkAttempt)
     && Number(a.deliveryGeneration) === Number(attempt.generation)
     && typeof a.deliveryRunId === "string" && a.deliveryRunId === attempt.deliveryRunId
     && row.deliveryRunId === attempt.deliveryRunId
+    && row.dispatchId === attempt.dispatchId
     && Number(row.deliveryGeneration ?? 0) === Number(attempt.generation));
+}
+
+function hasLiveControllerFence(row: any, attempt: any, a: any, now = Date.now()) {
+  return deliveryClaimMatches(row, attempt, a)
+    && hasLiveDeliveryLease(row, a, now)
+    && attempt.leaseOwner === a.deliveryLeaseOwner
+    && attempt.leaseToken === a.deliveryLeaseToken
+    && Number(attempt.leaseVersion) === Number(a.deliveryLeaseVersion)
+    && Number(attempt.leaseUntil ?? 0) >= now;
 }
 
 function eventIdentity(value: unknown) {
@@ -597,6 +649,7 @@ function claimedJob(j: any, upstreamEvidence: readonly any[] = []) {
     sourceWorkAttempt: j.attempt ?? 1,
     deliveryGeneration: j.deliveryGeneration ?? null,
     deliveryRunId: j.deliveryRunId ?? null,
+    workerRunId: j.workerRunId ?? null,
     activeDeliveryAttemptId: j.activeDeliveryAttemptId ?? null,
     verificationVerdict: j.verificationVerdict ?? null,
     verificationNote: j.verificationNote ?? null,
@@ -738,6 +791,7 @@ export const claimDispatched = mutation({
     ) return null;
     const deliveryContinuation = j.verificationVerdict === "pass" && Boolean(j.reviewReceiptId);
     if (priorAttempt?.workerRunId && deliveryContinuation) {
+      if (priorAttempt.workerRunId === a.workerRunId.slice(0, 120)) return null;
       const generation = Math.max(1, Number(j.deliveryGeneration ?? 1));
       const existingDelivery = await deliveryAttemptFor(ctx, a.jobId, attemptNumber, generation);
       // A lost response may only replay the immutable generation/run binding.
@@ -747,12 +801,22 @@ export const claimDispatched = mutation({
         jobId: a.jobId, sourceWorkAttempt: attemptNumber, generation,
         dispatchId: a.dispatchId, deliveryRunId: a.workerRunId.slice(0, 120),
         policy: String(j.deliveryMode ?? "manual"), status: "running",
+        sourceDispatchId: a.dispatchId,
         reviewReceiptId: j.reviewReceiptId, reviewReceiptDigest: j.reviewReceiptDigest,
+        reviewLineage: j.reviewReceiptId && j.reviewReceiptDigest ? [{
+          sourceWorkAttempt: attemptNumber, reviewReceiptId: j.reviewReceiptId,
+          reviewReceiptDigest: j.reviewReceiptDigest,
+        }] : undefined,
         reviewedHeadSha: review?.headSha, reviewedBaseSha: review?.baseSha,
         reviewedHeadTreeSha: review?.headTreeSha, reviewedDiffSha256: review?.diffSha256,
         heartbeatAt: now, retries: 0, cumulativeRetries: 0, currentStep: "preflight", createdAt: now, updatedAt: now,
       });
-      if (existingDelivery) await ctx.db.patch(deliveryId, { dispatchId: a.dispatchId, deliveryRunId: a.workerRunId.slice(0, 120), status: "running", currentStep: "preflight", heartbeatAt: now, updatedAt: now });
+      if (existingDelivery) await ctx.db.patch(deliveryId, {
+        dispatchId: a.dispatchId, sourceDispatchId: existingDelivery.sourceDispatchId ?? a.dispatchId,
+        deliveryRunId: a.workerRunId.slice(0, 120), status: "running",
+        currentStep: existingDelivery.currentStep === "queued" ? "preflight" : existingDelivery.currentStep,
+        heartbeatAt: now, updatedAt: now,
+      });
       await patchJobWithRuntime(ctx, j, {
         status: "running", stage: "delivery", progress: "resuming verified controller delivery", startedAt: now,
         heartbeatAt: now, nextRunAt: undefined, dispatchLeaseUntil: undefined, dispatchId: a.dispatchId,
@@ -886,7 +950,13 @@ export const finalize = mutation({
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
     if (row.repo && !hasLiveDeliveryLease(row, a)) return false;
     const delivery = a.deliveryGeneration === undefined ? null : await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration));
-    if (row.repo && (!delivery || !deliveryClaimMatches(row, delivery, a))) return false;
+    if (row.repo && (!delivery || !hasLiveControllerFence(row, delivery, a))) return false;
+    if (row.repo) {
+      const successfulOutcomes = new Set(["protected_draft", "read_only_complete", "no_change", "integrated_default_branch"]);
+      const terminalOutcome = String(delivery?.outcome ?? "");
+      if (delivery?.currentStep !== "receipt" || !outcomeAllowed(String(delivery.policy), terminalOutcome)) return false;
+      if (a.status === "done" ? !successfulOutcomes.has(terminalOutcome) : !["blocked", "needs_attention"].includes(terminalOutcome)) return false;
+    }
     // A completed job is called "verified" only when the supervisor actually
     // returned pass. This invariant lives in Convex, not only in the runner.
     if (a.status === "done" && (a.verificationVerdict !== "pass" || !completionReceiptAllowed(a))) return false;
@@ -938,7 +1008,7 @@ export const finalize = mutation({
     if (delivery) await ctx.db.patch(delivery._id, {
       status: success ? "done" : "blocked",
       currentStep: "terminal",
-      terminalReceiptDigest: success ? a.resultDigest : undefined,
+      terminalReceiptDigest: success ? a.resultDigest : await sha256Hex(`${String(delivery.outcome)}:${normalizedResult}`),
       completedAt: now,
       leaseUntil: undefined,
       heartbeatAt: now,
@@ -963,6 +1033,7 @@ export const finalize = mutation({
       await ctx.db.insert("workReceipts", {
         jobId: a.jobId, attempt: a.expectedAttempt, status: "succeeded",
         acceptanceEvidence: [String(a.verificationNote).slice(0, 1_000)], artifacts, verification: "pass",
+        deliveryOutcome: delivery?.outcome,
         terminalEventKey, resultDigest: a.resultDigest, evidenceDigest: a.evidenceDigest,
         reviewReceiptSignature: a.reviewReceiptSignature, reviewDiffSha256: a.reviewDiffSha256,
         reviewReceiptId: row.reviewReceiptId, reviewReceiptDigest: row.reviewReceiptDigest, createdAt: now,
@@ -1167,19 +1238,23 @@ export const reapStale = mutation({
         const delivery = await deliveryAttemptFor(ctx, j._id, j.attempt ?? 1, Number(j.deliveryGeneration));
         if (delivery?.status === "running") {
           const retries = Number(delivery.cumulativeRetries ?? delivery.retries ?? 0) + 1;
-          const exhaustedDelivery = retries > 6;
+          const exhaustedDelivery = retries > DELIVERY_RETRY_LIMIT;
           await ctx.db.patch(delivery._id, {
             status: exhaustedDelivery ? "blocked" : "checkpointed", retries: Number(delivery.retries ?? 0) + 1, cumulativeRetries: retries, completedAt: now,
+            outcome: exhaustedDelivery ? "needs_attention" : delivery.outcome,
+            terminalReceiptDigest: exhaustedDelivery ? await sha256Hex(`needs_attention:${String(j._id)}:${j.attempt ?? 1}`) : delivery.terminalReceiptDigest,
+            currentStep: exhaustedDelivery ? "receipt" : "retry", retryReason: "controller liveness expired",
             leaseUntil: undefined, heartbeatAt: now, updatedAt: now,
           });
           const nextGeneration = Number(j.deliveryGeneration) + 1;
           const nextDeliveryId = exhaustedDelivery ? undefined : await ctx.db.insert("deliveryAttempts", {
             jobId: j._id, sourceWorkAttempt: j.attempt ?? 1, generation: nextGeneration,
             policy: String(delivery.policy), status: "checkpointed", reviewReceiptId: delivery.reviewReceiptId,
+            parentDeliveryAttemptId: delivery._id, reviewLineage: delivery.reviewLineage,
             reviewReceiptDigest: delivery.reviewReceiptDigest, reviewedHeadSha: delivery.reviewedHeadSha,
             reviewedBaseSha: delivery.reviewedBaseSha, reviewedHeadTreeSha: delivery.reviewedHeadTreeSha,
             reviewedDiffSha256: delivery.reviewedDiffSha256, heartbeatAt: now, retries: 0,
-            cumulativeRetries: retries, currentStep: "queued", createdAt: now, updatedAt: now,
+            cumulativeRetries: retries, currentStep: "queued", retryReason: "controller liveness expired", createdAt: now, updatedAt: now,
           });
           await patchJobWithRuntime(ctx, j, {
             ...invalidateDeliveryLease(j),
@@ -1199,6 +1274,7 @@ export const reapStale = mutation({
               eventKey: `delivery-recovery:${j.attempt ?? 1}:${j.deliveryGeneration}:${retries}`,
             });
           if (exhaustedDelivery) abandoned.push(j.task.slice(0, 80)); else requeued.push(j.task.slice(0, 80));
+          if (exhaustedDelivery) await openDeliveryAttention(ctx, j, now);
           continue;
         }
       }
@@ -1366,7 +1442,7 @@ export const touchDeliveryHeartbeat = mutation({
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     const delivery = await deliveryAttemptFor(ctx, a.jobId, a.sourceWorkAttempt, a.deliveryGeneration);
-    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt || !hasLiveDeliveryLease(row, a) || !deliveryClaimMatches(row, delivery, a)
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt || !hasLiveControllerFence(row, delivery, a)
       || delivery.status !== "running") return false;
     const now = Date.now();
     await ctx.db.patch(delivery._id, { heartbeatAt: now, updatedAt: now });
@@ -1401,7 +1477,7 @@ export const checkpointAndRequeue = mutation({
       return { requeued: false, exhausted: false, stale: true };
     }
     const delivery = a.deliveryGeneration === undefined ? null : await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration));
-    if (a.deliveryGeneration !== undefined && (!hasLiveDeliveryLease(row, a) || !deliveryClaimMatches(row, delivery, a))) {
+    if (a.deliveryGeneration !== undefined && (!delivery || !hasLiveControllerFence(row, delivery, a))) {
       return { requeued: false, exhausted: false, stale: true };
     }
     const requestedStatus = a.nextStatus ?? "pending";
@@ -1459,7 +1535,13 @@ export const checkpointAndRequeue = mutation({
       && row.verificationVerdict === "pass"
       && Boolean(row.reviewReceiptId);
     const attempt = (row.attempt ?? 1) + (requestedStatus === "pending" && !deliveryContinuation ? 1 : 0);
-    const delayMs = Math.max(0, Math.min(6 * 60 * 60 * 1000, a.delayMs ?? 0));
+    const requestedDelayMs = Math.max(0, Math.min(6 * 60 * 60 * 1000, a.delayMs ?? 0));
+    const retryOrdinal = deliveryContinuation && delivery
+      ? Number(delivery.cumulativeRetries ?? delivery.retries ?? 0) + 1
+      : 0;
+    const delayMs = deliveryContinuation
+      ? Math.max(requestedDelayMs, Math.min(30 * 60_000, 30_000 * 2 ** Math.max(0, retryOrdinal - 1)))
+      : requestedDelayMs;
     const exhausted =
       requestedStatus === "pending" &&
       (attempt > (row.maxAttempts ?? 12) || Date.now() - row.createdAt > 14 * 86_400_000);
@@ -1510,17 +1592,41 @@ export const checkpointAndRequeue = mutation({
     }
     if (deliveryContinuation && delivery) {
       const cumulativeRetries = Number(delivery.cumulativeRetries ?? delivery.retries ?? 0) + 1;
-      await ctx.db.patch(delivery._id, { status: "checkpointed", completedAt: Date.now(), currentStep: "retry", retries: Number(delivery.retries ?? 0) + 1, cumulativeRetries, leaseUntil: undefined, updatedAt: Date.now() });
-      if (status === "pending") {
+      const deliveryExhausted = cumulativeRetries > DELIVERY_RETRY_LIMIT;
+      const retryNow = Date.now();
+      await ctx.db.patch(delivery._id, {
+        status: deliveryExhausted ? "blocked" : "checkpointed", completedAt: retryNow,
+        currentStep: deliveryExhausted ? "receipt" : "retry",
+        outcome: deliveryExhausted ? "needs_attention" : delivery.outcome,
+        terminalReceiptDigest: deliveryExhausted ? await sha256Hex(`needs_attention:${String(row._id)}:${a.expectedAttempt}`) : delivery.terminalReceiptDigest,
+        retryReason: redactSensitiveText(a.checkpoint).slice(0, 500),
+        retries: Number(delivery.retries ?? 0) + 1, cumulativeRetries, leaseUntil: undefined, updatedAt: retryNow,
+      });
+      if (status === "pending" && !deliveryExhausted) {
         const nextGeneration = Number(row.deliveryGeneration ?? 1) + 1;
         const existing = await deliveryAttemptFor(ctx, a.jobId, a.expectedAttempt, nextGeneration);
         const nextDeliveryId = existing?._id ?? await ctx.db.insert("deliveryAttempts", {
           jobId: a.jobId, sourceWorkAttempt: a.expectedAttempt, generation: nextGeneration,
           policy: String(row.deliveryMode ?? (row.readonly ? "read_only" : "manual")), status: "checkpointed",
+          parentDeliveryAttemptId: delivery._id,
           reviewReceiptId: row.reviewReceiptId, reviewReceiptDigest: row.reviewReceiptDigest,
-          heartbeatAt: Date.now(), retries: 0, cumulativeRetries, currentStep: "queued", createdAt: Date.now(), updatedAt: Date.now(),
+          reviewLineage: delivery.reviewLineage,
+          reviewedHeadSha: delivery.reviewedHeadSha, reviewedBaseSha: delivery.reviewedBaseSha,
+          reviewedHeadTreeSha: delivery.reviewedHeadTreeSha, reviewedDiffSha256: delivery.reviewedDiffSha256,
+          heartbeatAt: retryNow, retries: 0, cumulativeRetries, currentStep: "queued",
+          retryReason: redactSensitiveText(a.checkpoint).slice(0, 500), createdAt: retryNow, updatedAt: retryNow,
         });
         await patchJobWithRuntime(ctx, row, { activeDeliveryAttemptId: nextDeliveryId });
+      } else if (deliveryExhausted) {
+        await patchJobWithRuntime(ctx, row, {
+          ...invalidateDeliveryLease(row), status: "needs_input", stage: "delivery attention",
+          progress: "verified delivery retry budget exhausted — attention required",
+          activeDeliveryAttemptId: delivery._id, deliveryGeneration: delivery.generation,
+          dispatchId: undefined, dispatchLeaseUntil: undefined, workerRunId: undefined, deliveryRunId: undefined,
+          nextRunAt: undefined,
+        });
+        await openDeliveryAttention(ctx, row, retryNow);
+        return { requeued: false, exhausted: true, stale: false };
       }
     }
     return { requeued: status === "pending", exhausted, stale: false };
@@ -1566,7 +1672,7 @@ export const reviewReceipt = query({
     if (!row || (row.attempt ?? 1) !== a.expectedAttempt || row.reviewReceiptId !== a.reviewReceiptId) return null;
     const receipt: any = await ctx.db.get(a.reviewReceiptId);
     if (!receipt || receipt.jobId !== a.jobId || receipt.attempt !== a.expectedAttempt || receipt.receiptDigest !== row.reviewReceiptDigest) return null;
-    return receipt;
+    return { ...receipt, keyId: receipt.keyId ?? "legacy-v1" };
   },
 });
 
@@ -1660,6 +1766,85 @@ export const provideInput = mutation({
   },
 });
 
+// A provider write is legal only after this exact effect is durably prepared
+// under the live controller fence. Replays return the same preparation; they
+// cannot replace it with another PR/head/effect identity.
+export const prepareDeliveryEffect = mutation({
+  args: {
+    jobId: v.id("jobs"), expectedAttempt: v.number(), deliveryAttemptId: v.id("deliveryAttempts"),
+    sourceWorkAttempt: v.number(), deliveryGeneration: v.number(), deliveryRunId: v.string(),
+    deliveryLeaseOwner: v.string(), deliveryLeaseToken: v.string(), deliveryLeaseVersion: v.number(),
+    effectId: v.string(), effectKind: v.union(v.literal("create_draft_pr"), v.literal("create_pr"), v.literal("promote_pr"), v.literal("merge_pr")),
+    reviewedHeadSha: v.string(), reviewedBaseSha: v.string(), pullRequestNumber: v.optional(v.number()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row: any = await ctx.db.get(a.jobId);
+    const delivery: any = await ctx.db.get(a.deliveryAttemptId);
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
+      || !hasLiveControllerFence(row, delivery, a) || delivery.status !== "running") return null;
+    if (a.reviewedHeadSha !== delivery.reviewedHeadSha || a.reviewedBaseSha !== delivery.reviewedBaseSha) return null;
+    if (delivery.policy === "read_only") return null;
+    if (delivery.policy === "manual" && a.effectKind !== "create_draft_pr") return null;
+    if (delivery.policy === "auto_merge" && !["create_pr", "promote_pr", "merge_pr"].includes(a.effectKind)) return null;
+    if (a.effectKind === "merge_pr" && (!a.pullRequestNumber || delivery.pullRequestNumber !== a.pullRequestNumber)) return null;
+    if (delivery.preparedEffectId && !delivery.providerObservation) {
+      return delivery.preparedEffectId === a.effectId && delivery.preparedEffectKind === a.effectKind
+        ? { effectId: delivery.preparedEffectId, replay: true }
+        : null;
+    }
+    const now = Date.now();
+    await ctx.db.patch(delivery._id, {
+      preparedEffectId: a.effectId.slice(0, 160), preparedEffectKind: a.effectKind,
+      preparedEffectAt: now, providerObservation: undefined, providerObservedAt: undefined,
+      currentStep: "prepared", heartbeatAt: now, updatedAt: now,
+      effects: [...(delivery.effects ?? []), {
+        effectId: a.effectId.slice(0, 160), effectKind: a.effectKind, preparedAt: now,
+      }],
+    });
+    return { effectId: a.effectId.slice(0, 160), replay: false };
+  },
+});
+
+export const observeDeliveryEffect = mutation({
+  args: {
+    jobId: v.id("jobs"), expectedAttempt: v.number(), deliveryAttemptId: v.id("deliveryAttempts"),
+    sourceWorkAttempt: v.number(), deliveryGeneration: v.number(), deliveryRunId: v.string(),
+    deliveryLeaseOwner: v.string(), deliveryLeaseToken: v.string(), deliveryLeaseVersion: v.number(),
+    effectId: v.string(), observation: v.union(v.literal("applied"), v.literal("not_applied"), v.literal("unknown")),
+    pullRequestNumber: v.optional(v.number()), pullRequestUrl: v.optional(v.string()),
+    pullRequestNodeId: v.optional(v.string()), pullRequestDraft: v.optional(v.boolean()),
+    observedPullRequestHead: v.optional(v.string()), observedPullRequestBase: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row: any = await ctx.db.get(a.jobId);
+    const delivery: any = await ctx.db.get(a.deliveryAttemptId);
+    if (!row || !hasLiveControllerFence(row, delivery, a) || delivery.preparedEffectId !== a.effectId) return false;
+    if (a.observedPullRequestHead && a.observedPullRequestHead !== delivery.reviewedHeadSha) return false;
+    if (a.observedPullRequestBase && a.observedPullRequestBase !== delivery.reviewedBaseSha) return false;
+    const now = Date.now();
+    const effects = [...(delivery.effects ?? [])];
+    const effectIndex = effects.findIndex((effect: any) => effect.effectId === a.effectId);
+    if (effectIndex < 0) return false;
+    effects[effectIndex] = { ...effects[effectIndex], observation: a.observation, observedAt: now };
+    await ctx.db.patch(delivery._id, {
+      providerObservation: a.observation, providerObservedAt: now,
+      pullRequestNumber: a.pullRequestNumber ?? delivery.pullRequestNumber,
+      pullRequestUrl: a.pullRequestUrl ?? delivery.pullRequestUrl,
+      pullRequestNodeId: a.pullRequestNodeId ?? delivery.pullRequestNodeId,
+      pullRequestDraft: a.pullRequestDraft ?? delivery.pullRequestDraft,
+      observedPullRequestHead: a.observedPullRequestHead ?? delivery.observedPullRequestHead,
+      observedPullRequestBase: a.observedPullRequestBase ?? delivery.observedPullRequestBase,
+      currentStep: "observing", heartbeatAt: now, updatedAt: now,
+      effects,
+    });
+    return true;
+  },
+});
+
 export const setDelivery = mutation({
   args: {
     jobId: v.id("jobs"),
@@ -1674,6 +1859,14 @@ export const setDelivery = mutation({
     )),
     mergeCommitSha: v.optional(v.string()),
     observedPullRequestHead: v.optional(v.string()),
+    observedPullRequestBase: v.optional(v.string()),
+    pullRequestNumber: v.optional(v.number()),
+    pullRequestNodeId: v.optional(v.string()),
+    pullRequestDraft: v.optional(v.boolean()),
+    outcome: v.optional(v.union(
+      v.literal("protected_draft"), v.literal("read_only_complete"), v.literal("no_change"),
+      v.literal("integrated_default_branch"), v.literal("blocked"), v.literal("needs_attention"),
+    )),
     providerCall: v.optional(v.boolean()),
     deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
     deliveryLeaseOwner: v.optional(v.string()),
@@ -1690,12 +1883,18 @@ export const setDelivery = mutation({
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
     if (!hasLiveDeliveryLease(row, a)) return false;
     const delivery = a.deliveryGeneration === undefined ? null : await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration));
-    if (!delivery || !deliveryClaimMatches(row, delivery, a)) return false;
+    if (!delivery || !hasLiveControllerFence(row, delivery, a)) return false;
     const policy = String(delivery.policy);
     if ((policy === "manual" && a.deliveryStatus === "merged")
       || (policy === "read_only" && (a.providerCall === true || a.deliveryStatus === "merged" || a.pullRequestUrl))
       || (a.deliveryStatus === "merged" && policy !== "auto_merge")) return false;
-    if (a.observedPullRequestHead && a.observedPullRequestHead !== delivery.reviewedHeadSha) return false;
+    if (a.observedPullRequestHead && a.observedPullRequestHead !== delivery.reviewedHeadSha && a.outcome !== "needs_attention") return false;
+    if (a.observedPullRequestBase && a.observedPullRequestBase !== delivery.reviewedBaseSha && a.outcome !== "needs_attention") return false;
+    if (a.outcome && !outcomeAllowed(policy, a.outcome)) return false;
+    if (a.outcome === "protected_draft" && (!a.pullRequestNumber || !a.pullRequestUrl || a.pullRequestDraft !== true
+      || a.observedPullRequestHead !== delivery.reviewedHeadSha)) return false;
+    if (a.outcome === "read_only_complete" && (a.providerCall || a.pullRequestNumber || a.pullRequestUrl)) return false;
+    if (a.outcome === "integrated_default_branch" && (!a.mergeCommitSha || a.deliveryStatus !== "merged")) return false;
     await patchJobWithRuntime(ctx, row, {
       branch: a.branch,
       pullRequestUrl: a.pullRequestUrl,
@@ -1706,9 +1905,16 @@ export const setDelivery = mutation({
     });
     await ctx.db.patch(delivery._id, {
       observedPullRequestHead: a.observedPullRequestHead ?? delivery.observedPullRequestHead,
-      currentStep: a.deliveryStatus === "merged" ? "receipt" : a.deliveryStatus === "pull_request" ? "merge" : "preflight",
+      observedPullRequestBase: a.observedPullRequestBase ?? delivery.observedPullRequestBase,
+      pullRequestNumber: a.pullRequestNumber ?? delivery.pullRequestNumber,
+      pullRequestUrl: a.pullRequestUrl ?? delivery.pullRequestUrl,
+      pullRequestNodeId: a.pullRequestNodeId ?? delivery.pullRequestNodeId,
+      pullRequestDraft: a.pullRequestDraft ?? delivery.pullRequestDraft,
+      outcome: a.outcome ?? delivery.outcome,
+      currentStep: a.outcome ? "receipt" : a.deliveryStatus === "pull_request" ? "preflight" : "preflight",
       heartbeatAt: Date.now(), updatedAt: Date.now(),
     });
+    if (a.outcome === "needs_attention") await openStaleReviewAttention(ctx, row, Date.now());
     return true;
   },
 });
@@ -1762,6 +1968,7 @@ export const markVerifiedForDelivery = mutation({
     verificationNote: v.string(),
     reviewReceiptJson: v.optional(v.string()),
     reviewReceiptSignature: v.optional(v.string()),
+    reviewReceiptKeyId: v.optional(v.string()),
     reviewDiffSha256: v.optional(v.string()),
     resultDigest: v.optional(v.string()),
     evidenceDigest: v.optional(v.string()),
@@ -1771,19 +1978,28 @@ export const markVerifiedForDelivery = mutation({
     sourceWorkAttempt: v.optional(v.number()),
     deliveryGeneration: v.optional(v.number()),
     deliveryRunId: v.optional(v.string()),
+    specialistRunId: v.string(),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
-    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
-    if (!hasLiveDeliveryLease(row, a)) return false;
-    if (a.deliveryGeneration !== undefined && !deliveryClaimMatches(row, await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration)), a)) return false;
+    if (!row || (row.attempt ?? 1) !== a.expectedAttempt) return false;
+    const sourceAttempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    if (!sourceAttempt || sourceAttempt.workerRunId !== a.specialistRunId || sourceAttempt.workerRunId !== row.workerRunId) {
+      // A response-loss replay occurs after the job projection is moved to
+      // pending, so the job no longer carries workerRunId. The immutable work
+      // attempt remains the specialist authority in that exact case.
+      if (!(row.status === "pending" && sourceAttempt?.workerRunId === a.specialistRunId && row.reviewReceiptId)) return false;
+    }
+    if (!['running', 'pending'].includes(row.status)) return false;
+    if (a.deliveryGeneration !== undefined) return false;
     // A controller review receipt is completion evidence for every scoped
     // repository job. Delivery policy separately decides whether a PR/merge
     // may happen; manual and read-only work must still be able to finish.
     if (!row.repo) return false;
-    if (!a.reviewReceiptJson || !isSha256Digest(a.reviewReceiptSignature) || !isSha256Digest(a.reviewDiffSha256)) return false;
+    if (!a.reviewReceiptJson || !isSha256Digest(a.reviewReceiptSignature) || !isSha256Digest(a.reviewDiffSha256)
+      || !/^[a-zA-Z0-9._-]{1,64}$/.test(String(a.reviewReceiptKeyId ?? ""))) return false;
     if (a.reviewReceiptJson.length > REVIEW_RECEIPT_MAX_CHARS) return false;
     const result = a.result.slice(0, 4_000);
     const verificationNote = a.verificationNote.slice(0, 1_000);
@@ -1799,11 +2015,17 @@ export const markVerifiedForDelivery = mutation({
     ) return false;
     const receiptJson = a.reviewReceiptJson;
     const receiptDigest = await sha256Hex(receiptJson);
+    if (row.status === "pending") {
+      const prior: any = row.reviewReceiptId ? await ctx.db.get(row.reviewReceiptId) : null;
+      return Boolean(prior && prior.receiptDigest === receiptDigest && prior.signature === a.reviewReceiptSignature
+        && prior.keyId === a.reviewReceiptKeyId && row.reviewReceiptDigest === receiptDigest);
+    }
     const existing = await ctx.db.query("reviewReceipts")
       .withIndex("by_job_attempt_digest", (q: any) => q.eq("jobId", a.jobId).eq("attempt", a.expectedAttempt).eq("receiptDigest", receiptDigest)).first();
     const reviewReceiptId = existing?._id ?? await ctx.db.insert("reviewReceipts", {
       jobId: a.jobId, attempt: a.expectedAttempt, repository: String(row.repo), receiptJson, receiptDigest,
       signature: a.reviewReceiptSignature, diffSha256: a.reviewDiffSha256,
+      keyId: a.reviewReceiptKeyId,
       baseSha: String(receipt.baseSha), headSha: String(receipt.headSha), baseTreeSha: String(receipt.baseTreeSha), headTreeSha: String(receipt.headTreeSha),
       agentEvidenceSha256: String(receipt.agentEvidenceSha256), createdAt: Date.now(),
     });
@@ -1811,7 +2033,6 @@ export const markVerifiedForDelivery = mutation({
     // Review is the phase boundary.  Persist the immutable cold receipt and
     // allocate exactly one queued controller generation before the specialist
     // exits.  The first GitHub effect can therefore never be untracked.
-    const sourceAttempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     const generation = Math.max(1, Number(row.deliveryGeneration ?? 0) || 1);
     const existingDelivery = await deliveryAttemptFor(ctx, a.jobId, a.expectedAttempt, generation);
     if (existingDelivery && existingDelivery.reviewReceiptDigest && existingDelivery.reviewReceiptDigest !== receiptDigest) return false;
@@ -1823,6 +2044,7 @@ export const markVerifiedForDelivery = mutation({
       status: "checkpointed",
       reviewReceiptId,
       reviewReceiptDigest: receiptDigest,
+      reviewLineage: [{ sourceWorkAttempt: a.expectedAttempt, reviewReceiptId, reviewReceiptDigest: receiptDigest }],
       reviewedHeadSha: String(receipt.headSha),
       reviewedBaseSha: String(receipt.baseSha),
       reviewedHeadTreeSha: String(receipt.headTreeSha),
@@ -1913,8 +2135,40 @@ export const control = mutation({
         deliveryLeaseUntil: undefined,
         deliveryLeaseToken: undefined,
       });
+      if (row.activeDeliveryAttemptId) {
+        const delivery: any = await ctx.db.get(row.activeDeliveryAttemptId);
+        if (delivery && delivery.status === "running") await ctx.db.patch(delivery._id, {
+          status: "checkpointed", retryReason: "paused by control", leaseUntil: undefined,
+          heartbeatAt: now, updatedAt: now,
+        });
+      }
     }
     else if (a.action === "resume" && ["paused", "stalled"].includes(row.status)) {
+      const activeDelivery: any = row.activeDeliveryAttemptId ? await ctx.db.get(row.activeDeliveryAttemptId) : null;
+      if (row.verificationVerdict === "pass" && row.reviewReceiptId && activeDelivery) {
+        const nextGeneration = Number(activeDelivery.generation) + 1;
+        const existing = await deliveryAttemptFor(ctx, a.jobId, row.attempt ?? 1, nextGeneration);
+        const nextDeliveryId = existing?._id ?? await ctx.db.insert("deliveryAttempts", {
+          jobId: a.jobId, sourceWorkAttempt: row.attempt ?? 1, generation: nextGeneration,
+          policy: activeDelivery.policy, status: "checkpointed", parentDeliveryAttemptId: activeDelivery._id,
+          reviewReceiptId: activeDelivery.reviewReceiptId, reviewReceiptDigest: activeDelivery.reviewReceiptDigest,
+          reviewLineage: activeDelivery.reviewLineage, reviewedHeadSha: activeDelivery.reviewedHeadSha,
+          reviewedBaseSha: activeDelivery.reviewedBaseSha, reviewedHeadTreeSha: activeDelivery.reviewedHeadTreeSha,
+          reviewedDiffSha256: activeDelivery.reviewedDiffSha256, heartbeatAt: now, retries: 0,
+          cumulativeRetries: Number(activeDelivery.cumulativeRetries ?? 0), currentStep: "queued",
+          retryReason: "resumed by control", createdAt: now, updatedAt: now,
+        });
+        await patchJobWithRuntime(ctx, row, {
+          ...invalidateDeliveryLease(row), status: "pending", stage: "delivery",
+          progress: "verified delivery resumed — controller queued", heartbeatAt: now, nextRunAt: now,
+          dispatchId: undefined, dispatchLeaseUntil: undefined, workerRunId: undefined, deliveryRunId: undefined,
+          deliveryGeneration: nextGeneration, activeDeliveryAttemptId: nextDeliveryId,
+        });
+        await appendAttemptEvidence(ctx, row, "delivery_resumed", "Paused delivery resumed without rerunning the specialist", {
+          stage: "delivery", evidenceKind: "control", eventKey: `control:delivery-resume:${row.attempt ?? 1}:${nextGeneration}`,
+        });
+        return true;
+      }
       const previous = await attemptFor(ctx, a.jobId, row.attempt ?? 1);
       if (previous && !previous.completedAt && previous.status !== "paused") return false;
       // A paused reservation never launched a worker and therefore must not
@@ -1939,6 +2193,14 @@ export const control = mutation({
         deliveryLeaseUntil: undefined,
         deliveryLeaseToken: undefined,
       });
+      if (row.activeDeliveryAttemptId) {
+        const delivery: any = await ctx.db.get(row.activeDeliveryAttemptId);
+        if (delivery && !["done", "blocked", "abandoned"].includes(delivery.status)) await ctx.db.patch(delivery._id, {
+          status: "blocked", outcome: "blocked", currentStep: "terminal", retryReason: "cancelled by control",
+          terminalReceiptDigest: await sha256Hex(`blocked:cancelled:${String(a.jobId)}:${row.attempt ?? 1}`),
+          completedAt: now, leaseUntil: undefined, heartbeatAt: now, updatedAt: now,
+        });
+      }
       if (nextAttempt === (row.attempt ?? 1) && previous?.status === "paused") {
         await ctx.db.patch(previous._id, { status: "queued", dispatchId: undefined, lastEventAt: now });
       } else {

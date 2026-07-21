@@ -22,8 +22,13 @@ describe("autonomous GitHub delivery", () => {
 
   it("opens a ready pull request and pins its head SHA", async () => {
     const fetchImpl = vi.fn()
-      .mockResolvedValueOnce(response(200, []))
+      .mockResolvedValueOnce(response(200, { object: { sha: "abc123" } }))
       .mockResolvedValueOnce(response(200, { default_branch: "main" }))
+      .mockResolvedValueOnce(response(200, { object: { sha: "base123" } }))
+      .mockResolvedValueOnce(response(200, []))
+      .mockResolvedValueOnce(response(200, { object: { sha: "abc123" } }))
+      .mockResolvedValueOnce(response(200, { default_branch: "main" }))
+      .mockResolvedValueOnce(response(200, { object: { sha: "base123" } }))
       .mockResolvedValueOnce(response(201, {
         number: 42,
         html_url: "https://github.com/daniels-project-space/jarvis/pull/42",
@@ -36,15 +41,23 @@ describe("autonomous GitHub delivery", () => {
       title: "Paul: fix",
       body: "Verified evidence",
       token: "token",
+      reviewed: { headSha: "abc123", baseSha: "base123" },
+      prepareEffect: async () => true,
+      observeEffect: async () => undefined,
       fetchImpl: fetchImpl as typeof fetch,
     });
 
     expect(pull).toMatchObject({ number: 42, headSha: "abc123" });
-    expect(JSON.parse(String(fetchImpl.mock.calls[2][1]?.body))).toMatchObject({ draft: false });
+    expect(fetchImpl).toHaveBeenCalledTimes(8);
+    expect(JSON.parse(String(fetchImpl.mock.calls[7][1]?.body))).toMatchObject({ draft: false });
+    expect(fetchImpl.mock.calls.filter((call) => call[1]?.method === "POST")).toHaveLength(1);
   });
 
   it("promotes a legacy draft before autonomous delivery", async () => {
     const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(response(200, { object: { sha: "legacy123" } }))
+      .mockResolvedValueOnce(response(200, { default_branch: "main" }))
+      .mockResolvedValueOnce(response(200, { object: { sha: "base123" } }))
       .mockResolvedValueOnce(response(200, [{
         number: 41,
         html_url: "https://github.com/daniels-project-space/jarvis/pull/41",
@@ -62,12 +75,57 @@ describe("autonomous GitHub delivery", () => {
       title: "Paul: legacy fix",
       body: "Verified evidence",
       token: "token",
+      reviewed: { headSha: "legacy123", baseSha: "base123" },
+      prepareEffect: async () => true,
+      observeEffect: async () => undefined,
       fetchImpl: fetchImpl as typeof fetch,
     });
 
     expect(pull).toMatchObject({ number: 41, headSha: "legacy123" });
-    expect(fetchImpl.mock.calls[1][0]).toBe("https://api.github.com/graphql");
-    expect(String(fetchImpl.mock.calls[1][1]?.body)).toContain("markPullRequestReadyForReview");
+    expect(fetchImpl.mock.calls[4][0]).toBe("https://api.github.com/graphql");
+    expect(String(fetchImpl.mock.calls[4][1]?.body)).toContain("markPullRequestReadyForReview");
+    expect(fetchImpl.mock.calls.filter((call) => call[1]?.method === "POST")).toHaveLength(1);
+  });
+
+  it("manual policy recognizes only the exact draft and performs no HTTP write", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(response(200, { object: { sha: "reviewed-head" } }))
+      .mockResolvedValueOnce(response(200, { default_branch: "main" }))
+      .mockResolvedValueOnce(response(200, { object: { sha: "reviewed-base" } }))
+      .mockResolvedValueOnce(response(200, [{
+        number: 42, html_url: "https://github.test/42", draft: true, head: { sha: "reviewed-head" },
+      }]));
+    const pull = await openDeliveryPullRequest({
+      repo: "daniels-project-space/jarvis", branch: "jarvis/manual", title: "manual", body: "reviewed",
+      token: "token", draft: true, reviewed: { headSha: "reviewed-head", baseSha: "reviewed-base" },
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    expect(pull).toMatchObject({ number: 42, headSha: "reviewed-head" });
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+    expect(fetchImpl.mock.calls.filter((call) => ["POST", "PUT", "PATCH", "DELETE"].includes(String(call[1]?.method)))).toHaveLength(0);
+  });
+
+  it("reconciles a lost PR-create response before any second HTTP write", async () => {
+    const exactRefs = [
+      response(200, { object: { sha: "reviewed-head" } }), response(200, { default_branch: "main" }),
+      response(200, { object: { sha: "reviewed-base" } }), response(200, []),
+      response(200, { object: { sha: "reviewed-head" } }), response(200, { default_branch: "main" }),
+      response(200, { object: { sha: "reviewed-base" } }),
+    ];
+    const fetchImpl = vi.fn();
+    for (const value of exactRefs) fetchImpl.mockResolvedValueOnce(value);
+    fetchImpl.mockRejectedValueOnce(new Error("response lost"));
+    fetchImpl.mockResolvedValueOnce(response(200, [{
+      number: 42, html_url: "https://github.test/42", draft: true, head: { sha: "reviewed-head" },
+    }]));
+    const pull = await openDeliveryPullRequest({
+      repo: "daniels-project-space/jarvis", branch: "jarvis/manual", title: "manual", body: "reviewed",
+      token: "token", draft: true, reviewed: { headSha: "reviewed-head", baseSha: "reviewed-base" },
+      prepareEffect: async () => true, observeEffect: async () => undefined, fetchImpl: fetchImpl as typeof fetch,
+    });
+    expect(pull).toMatchObject({ number: 42, headSha: "reviewed-head" });
+    expect(fetchImpl).toHaveBeenCalledTimes(9);
+    expect(fetchImpl.mock.calls.filter((call) => call[1]?.method === "POST")).toHaveLength(1);
   });
 
   it("merges verified work without bypassing GitHub's checks", async () => {
@@ -86,6 +144,8 @@ describe("autonomous GitHub delivery", () => {
       token: "token",
       fetchImpl: fetchImpl as typeof fetch,
       sleep: async () => undefined,
+      prepareEffect: async () => true,
+      observeEffect: async () => undefined,
     });
     expect(result).toEqual({
       status: "merged",
@@ -185,5 +245,20 @@ describe("autonomous GitHub delivery", () => {
     })).resolves.toEqual({ status: "merged", sha: "merge123", note: "Pull request was already merged" });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(fetchImpl.mock.calls[0][1]?.method).toBeUndefined();
+  });
+
+  it("rejects a mismatched completed PR without another PUT", async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(response(200, {
+      state: "closed", merged: true, merge_commit_sha: "merge123",
+      head: { sha: "different-head" }, base: { sha: "reviewed-base" },
+    }));
+    await expect(mergeVerifiedPullRequest({
+      repo: "daniels-project-space/jarvis",
+      pull: { number: 42, url: "https://github.test/42", headSha: "reviewed-head" },
+      reviewedHeadSha: "reviewed-head", reviewedBaseSha: "reviewed-base",
+      title: "Paul: fix", token: "token", fetchImpl: fetchImpl as typeof fetch,
+    })).resolves.toEqual({ status: "blocked", note: "pull request head changed after controller review; a fresh review is required" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl.mock.calls.filter((call) => call[1]?.method === "PUT")).toHaveLength(0);
   });
 });

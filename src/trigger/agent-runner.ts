@@ -75,7 +75,7 @@ import {
   type GitReviewBinding,
   type GitReviewEnvelope,
 } from "./git-review-receipt";
-import { trustedGitReviewReceiptAuthority } from "./git-review-authority";
+import { repositoryDeliveryReadiness, trustedGitReviewReceiptAuthority, verifyGitReviewReceiptEnvelope } from "./git-review-authority";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -123,6 +123,7 @@ const completionEvidence = (result: string, verificationNote: string, gitReview?
   // These values are controller-created; Convex validates their exact
   // cryptographic form before making an immutable completion receipt.
   reviewReceiptSignature: gitReview?.envelope.signature,
+  reviewReceiptKeyId: gitReview?.envelope.keyId,
   reviewDiffSha256: gitReview?.envelope.receipt.diffSha256,
   reviewReceiptJson: gitReview ? JSON.stringify(gitReview.envelope.receipt) : undefined,
   };
@@ -816,9 +817,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       const stopIfLeaseLost = async (checkpoint: string, result: string, branch?: string | null): Promise<boolean> => {
         const state = await executionStatus();
         if (state === "running") return false;
-        const checkpointMutation = deliveryFence
-          ? (args: Record<string, unknown>) => deliveryMutation("jobs:checkpointAndRequeue", args)
-          : (args: Record<string, unknown>) => convexMutation("jobs:checkpointAndRequeue", args);
         if (state === "paused" || state === "cancelled") {
           await checkpointMutation({
             jobId: job.jobId,
@@ -868,6 +866,23 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           ...(deliveryFence ?? {}),
         }).catch(() => false);
       };
+      const checkpointMutation = deliveryFence
+        ? (args: Record<string, unknown>) => deliveryMutation("jobs:checkpointAndRequeue", args)
+        : (args: Record<string, unknown>) => convexMutation("jobs:checkpointAndRequeue", args);
+      const prepareProviderEffect = async (effect: {
+        effectId: string; kind: string; headSha: string; baseSha: string; pullRequestNumber?: number;
+      }) => Boolean(await deliveryMutation("jobs:prepareDeliveryEffect", {
+        jobId: job.jobId, expectedAttempt, effectId: effect.effectId, effectKind: effect.kind,
+        reviewedHeadSha: effect.headSha, reviewedBaseSha: effect.baseSha,
+        pullRequestNumber: effect.pullRequestNumber,
+      }));
+      const observeProviderEffect = async (effect: { effectId: string }, observation: "applied" | "not_applied" | "unknown", detail?: { number: number; url: string; headSha: string }) => {
+        await deliveryMutation("jobs:observeDeliveryEffect", {
+          jobId: job.jobId, expectedAttempt, effectId: effect.effectId, observation,
+          pullRequestNumber: detail?.number, pullRequestUrl: detail?.url,
+          observedPullRequestHead: detail?.headSha,
+        });
+      };
       try {
         const jobKey = String(job.jobId).replace(/[^a-zA-Z0-9_-]/g, "_");
         const jobEnv = isolateSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}`);
@@ -885,9 +900,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           : "";
         const resumeBranch = validatedGoalBranch || persistedBranch || branch || "";
         const continuationPolicy = String(job.deliveryMode ?? (job.readonly ? "read_only" : "manual"));
-        const mayResumeControllerDelivery = Boolean(
+        const controllerContinuation = Boolean(
           repo
-          && token
           && job.verificationVerdict === "pass"
           && job.activeDeliveryAttemptId
           && deliveryFence
@@ -895,6 +909,27 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           // continuation.  Policy below decides draft/merge/no-op semantics.
           && ["auto_merge", "manual", "read_only"].includes(continuationPolicy)
         );
+        const repositoryReadiness = repositoryDeliveryReadiness(
+          controllerContinuation,
+          receiptAuthority,
+        );
+        if (!repositoryReadiness.ready) {
+          await deliveryMutation("jobs:checkpointAndRequeue", {
+            jobId: job.jobId, expectedAttempt,
+            checkpoint: `Verified repository delivery is held because ${repositoryReadiness.reason}.`,
+            result: String(job.result ?? "").slice(0, 4_000), branch: resumeBranch, delayMs: 30_000,
+          }).catch(() => null);
+          return;
+        }
+        if (controllerContinuation && continuationPolicy !== "read_only" && !token) {
+          await deliveryMutation("jobs:checkpointAndRequeue", {
+            jobId: job.jobId, expectedAttempt,
+            checkpoint: "Verified repository delivery is held because the controller repository capability is unavailable.",
+            result: String(job.result ?? "").slice(0, 4_000), branch: resumeBranch, delayMs: 30_000,
+          }).catch(() => null);
+          return;
+        }
+        const mayResumeControllerDelivery = controllerContinuation && (continuationPolicy === "read_only" || Boolean(token));
         if (mayResumeControllerDelivery) {
           // Check waits are provider time, not silence: renew the exact
           // controller generation below the 45s lease. A failed renewal is
@@ -930,11 +965,14 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               branch: resumeBranch, baseSha: String(receipt?.baseSha ?? ""),
               agentEvidenceSha256: String(receipt?.agentEvidenceSha256 ?? ""), headSha: String(receipt?.headSha ?? ""),
             };
-            const envelope = { receipt, signature: String(coldReceipt?.signature ?? "") } as GitReviewEnvelope;
+            const envelope = {
+              keyId: String(coldReceipt?.keyId ?? ""), receipt,
+              signature: String(coldReceipt?.signature ?? ""),
+            } as GitReviewEnvelope;
             if (!receiptAuthority || coldReceipt.receiptDigest !== receiptDigest
               || coldReceipt.signature !== job.reviewReceiptSignature
               || coldReceipt.receiptDigest !== job.reviewReceiptDigest
-              || !receiptAuthority.verify(envelope, binding)) throw new Error("cold receipt binding failed");
+              || !await verifyGitReviewReceiptEnvelope(envelope, binding)) throw new Error("cold receipt binding failed");
             continuationReview = { envelope, binding };
           } catch {
             await deliveryMutation("jobs:checkpointAndRequeue", {
@@ -958,6 +996,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             ? false
             : resumeBranch ? await branchHasChanges(repo, resumeBranch, token) : null;
           let pullRequestUrl = typeof job.pullRequestUrl === "string" ? job.pullRequestUrl : "";
+          let pullRequestNumber: number | undefined;
           let mergeSha = "";
           let deliveryFailure = branchChanged === null
             ? "the controller could not compare the verified branch with the default branch"
@@ -979,8 +1018,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 headSha: continuationReview.envelope.receipt.headSha,
                 baseSha: continuationReview.envelope.receipt.baseSha,
               },
+              prepareEffect: prepareProviderEffect,
+              observeEffect: observeProviderEffect,
             });
             pullRequestUrl = pull?.url ?? pullRequestUrl;
+            pullRequestNumber = pull?.number;
             if (!pull) {
               deliveryFailure = "the controller could not open or recover the verified pull request";
             } else {
@@ -991,6 +1033,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 pullRequestUrl: pull.url,
                 deliveryStatus: "pull_request",
                 observedPullRequestHead: pull.headSha,
+                observedPullRequestBase: continuationReview.envelope.receipt.baseSha,
+                pullRequestNumber: pull.number,
+                pullRequestDraft: continuationPolicy === "manual",
                 providerCall: true,
               }).catch(() => {});
               if (continuationPolicy === "manual") {
@@ -1008,6 +1053,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 reviewedHeadSha: continuationReview.envelope.receipt.headSha,
                 reviewedBaseSha: continuationReview.envelope.receipt.baseSha,
                 shouldContinue: async () => (await executionStatus()) === "running" && await linearizeDelivery(),
+                prepareEffect: prepareProviderEffect,
+                observeEffect: observeProviderEffect,
               });
               if (continuationPolicy === "manual") {
                 // The setDelivery write below records pull_request, then the
@@ -1017,13 +1064,24 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }
           }
           if (deliveryFailure) {
-            await deliveryMutation("jobs:setDelivery", {
+            const staleReview = /fresh review|required|reviewed (?:source|head|base)|exact (?:draft|effect)/i.test(deliveryFailure);
+            const staleRecorded = await deliveryMutation("jobs:setDelivery", {
               jobId: job.jobId,
               expectedAttempt,
               branch: resumeBranch,
               pullRequestUrl: pullRequestUrl || undefined,
               deliveryStatus: "blocked",
+              outcome: staleReview ? "needs_attention" : undefined,
             }).catch(() => {});
+            if (staleReview && staleRecorded) {
+              await deliveryMutation("jobs:finalize", {
+                jobId: job.jobId, expectedAttempt, status: "error",
+                result: `Verified repository review became stale: ${deliveryFailure}`.slice(0, 4_000),
+              }).catch(() => false);
+              if (job.goalStage) await drainGoalAdvances();
+              else if (job.missionId) await maybeSynthesizeMission(job.missionId);
+              return;
+            }
             await deliveryMutation("jobs:checkpointAndRequeue", {
               jobId: job.jobId,
               expectedAttempt,
@@ -1036,15 +1094,27 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }
           const protectedDraft = continuationPolicy === "manual";
           const readOnlyDelivery = continuationPolicy === "read_only";
+          const noChange = !readOnlyDelivery && branchChanged === false;
+          const outcome = readOnlyDelivery
+            ? "read_only_complete"
+            : noChange
+              ? "no_change"
+              : protectedDraft
+                ? "protected_draft"
+                : "integrated_default_branch";
           const recorded = await deliveryMutation("jobs:setDelivery", {
             jobId: job.jobId,
             expectedAttempt,
             branch: resumeBranch,
             pullRequestUrl: pullRequestUrl || undefined,
-            deliveryStatus: protectedDraft ? "pull_request" : readOnlyDelivery ? "branch" : "merged",
+            deliveryStatus: protectedDraft ? "pull_request" : readOnlyDelivery || noChange ? "branch" : "merged",
             mergeCommitSha: mergeSha || undefined,
             observedPullRequestHead: readOnlyDelivery ? undefined : continuationReview.envelope.receipt.headSha,
-            providerCall: !readOnlyDelivery,
+            observedPullRequestBase: readOnlyDelivery ? undefined : continuationReview.envelope.receipt.baseSha,
+            pullRequestNumber,
+            pullRequestDraft: protectedDraft ? true : undefined,
+            outcome,
+            providerCall: branchChanged === true,
           }).catch(() => false);
           if (!recorded) throw new Error("verified delivery completed but its durable receipt could not be recorded");
           const deliveryResult = [
@@ -1485,7 +1555,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }
             goalReview = { envelope: receiptAuthority.issue(receipt.receipt), binding: receipt.binding };
             const persisted = await deliveryMutation("jobs:markVerifiedForDelivery", {
-              jobId: job.jobId, expectedAttempt, result: result.slice(0, 4_000),
+              jobId: job.jobId, expectedAttempt, specialistRunId: String(job.workerRunId), result: result.slice(0, 4_000),
               verificationNote: `${job.goalStage === "planning" ? "Goal plan" : "Deep validation"} machine contract is structurally valid`,
               ...completionEvidence(result.slice(0, 4_000), `${job.goalStage === "planning" ? "Goal plan" : "Deep validation"} machine contract is structurally valid`, goalReview),
             }).catch(() => false);
@@ -1497,6 +1567,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               }).catch(() => null);
               return;
             }
+            return;
           }
           let goalDeliveryNote = "";
           let goalPullRequestUrl = typeof job.pullRequestUrl === "string" ? job.pullRequestUrl : undefined;
@@ -1512,7 +1583,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           if (goalNeedsControllerDelivery && job.deliveryStatus !== "merged" && !goalReview) {
             const persisted = await deliveryMutation("jobs:markVerifiedForDelivery", {
               jobId: job.jobId,
-              expectedAttempt,
+              expectedAttempt, specialistRunId: String(job.workerRunId),
               result: result.slice(0, 4_000),
               verificationNote: "Deep validation machine contract passed before controller delivery",
               ...completionEvidence(result.slice(0, 4_000), "Deep validation machine contract passed before controller delivery"),
@@ -1528,6 +1599,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               }).catch(() => null);
               return;
             }
+            return;
           }
           const goalBranchComparison = job.deliveryStatus === "merged" ? false : (
             goalNeedsControllerDelivery
@@ -1661,7 +1733,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           if (!receiptAuthority) {
             await convexMutation("jobs:checkpointAndRequeue", {
               jobId: job.jobId, expectedAttempt,
-              checkpoint: "Repository delivery is held: JARVIS_GIT_REVIEW_RECEIPT_SECRET is unavailable in the trusted controller. Do not rerun the specialist.",
+              checkpoint: "Repository delivery is held: the controller receipt signer is unavailable. Do not rerun the specialist.",
               result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: failureBackoffMs(expectedAttempt),
             }).catch(() => null);
             return;
@@ -1788,10 +1860,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           if (repo && gitReview) {
             const note = "The read-only task expressly defines a named access gap as a valid evidence boundary";
             const persisted = await deliveryMutation("jobs:markVerifiedForDelivery", {
-              jobId: job.jobId, expectedAttempt, result: result.slice(0, 4_000), verificationNote: note,
+              jobId: job.jobId, expectedAttempt, specialistRunId: String(job.workerRunId), result: result.slice(0, 4_000), verificationNote: note,
               ...completionEvidence(result.slice(0, 4_000), note, gitReview),
             }).catch(() => false);
             if (!persisted) return;
+            return;
           }
           const finalized = await deliveryMutation("jobs:finalize", {
             jobId: job.jobId,
@@ -1827,14 +1900,14 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         if (repo && gitReview) {
           const persisted = await deliveryMutation("jobs:markVerifiedForDelivery", {
             jobId: job.jobId,
-            expectedAttempt,
+            expectedAttempt, specialistRunId: String(job.workerRunId),
             result: result.slice(0, 4_000),
             verificationNote: verify.note || "Supervisor check passed",
             ...completionEvidence(result.slice(0, 4_000), verify.note || "Supervisor check passed", gitReview),
           }).catch(() => false);
           if (!persisted) {
             await convexMutation("jobs:checkpointAndRequeue", {
-              jobId: job.jobId, expectedAttempt,
+            jobId: job.jobId, expectedAttempt, specialistRunId: String(job.workerRunId),
               checkpoint: "Supervisor verification passed, but the immutable controller review receipt could not be persisted. Do not rerun the specialist.",
               result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: 30_000,
             }).catch(() => null);
@@ -1858,7 +1931,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           const title = `${profile.name}: ${(job.label ?? job.task).slice(0, 82)}`;
           const verificationPersisted = !autonomous || await deliveryMutation("jobs:markVerifiedForDelivery", {
             jobId: job.jobId,
-            expectedAttempt,
+            expectedAttempt, specialistRunId: String(job.workerRunId),
             result: result.slice(0, 4_000),
             verificationNote: verify.note || "Supervisor check passed before controller delivery",
             ...completionEvidence(result.slice(0, 4_000), verify.note || "Supervisor check passed before controller delivery", gitReview),
@@ -2000,8 +2073,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         }
         await sendPush("JARVIS", spoken.slice(0, 140), "/");
       } catch (e: any) {
-        const message = String(e?.message ?? e);
-        const recovered = await convexMutation("jobs:checkpointAndRequeue", {
+        const message = redactSensitiveText(String(e?.message ?? e), env);
+        const recovered = await checkpointMutation({
           jobId: job.jobId,
           expectedAttempt,
           checkpoint: `Runner exception on attempt ${job.attempt ?? 1}: ${message.slice(0, 1200)}. Retry from the original task with a different approach.`,
