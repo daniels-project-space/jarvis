@@ -35,6 +35,7 @@ import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, ty
 import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate, shouldIgnoreHandsFreeTranscript } from "@/lib/transcript";
 import { completeSpeechPrefix, isSpeaking as isTtsActuallySpeaking, unlockSpeechPlayback } from "@/lib/tts";
+import { finalSpeechSuffix, retainCaption, type SpeechCaption } from "@/lib/speech-ownership";
 import { NarrationLedger, narrationClaim } from "@/lib/narration";
 import { resolvePanelRoute } from "@/lib/panel-contract";
 import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
@@ -74,17 +75,13 @@ type Msg = {
   attachment?: Attachment;
   createdAt: number;
 };
-type Caption = {
-  who: "you" | "jarvis";
-  text: string;
-  phase?: "streaming" | "ready" | "speaking";
-  exiting?: boolean;
-} | null;
+type Caption = SpeechCaption;
 type StagePanel = { type: string; value: string; title?: string; updatedAt: number };
 type HostActionResult = { ok: boolean; detail?: string };
 type StreamingSpeechState = {
   id: string;
   queuedChars: number;
+  spokenPrefix: string;
   chain: Promise<void>;
   timer: ReturnType<typeof setTimeout> | null;
   pendingPrefix: string;
@@ -1280,12 +1277,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     captionEpoch.current += 1;
     clearCaptionTimers();
     setCaption((current) => {
-      if (!c) return null;
       // Preserve one DOM surface while streamed text grows and when that same
       // text hands over to TTS. Replacing the keyed element per token was the
       // visible flash-to-transparent bug.
-      if (current?.who === c.who) return { ...current, ...c, phase: c.phase ?? "ready", exiting: false };
-      return { ...c, phase: c.phase ?? "ready", exiting: false };
+      return retainCaption(current, c);
     });
   };
   useEffect(() => () => clearCaptionTimers(), []);
@@ -1350,6 +1345,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const streamingSpeechRef = useRef<StreamingSpeechState>({
     id: "",
     queuedChars: 0,
+    spokenPrefix: "",
     chain: Promise.resolve(),
     timer: null,
     pendingPrefix: "",
@@ -1820,8 +1816,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       () => {
         setSpeaking(true);
         setCaption((current) => current?.who === "jarvis" && current.text.length >= captionText.length
-          ? { ...current, phase: "speaking", exiting: false }
-          : { who: "jarvis", text: captionText, phase: "speaking", exiting: false });
+          ? retainCaption(current, { ...current, phase: "speaking" })
+          : retainCaption(current, { who: "jarvis", text: captionText, phase: "speaking" }));
       },
       () => {
         setSpeaking(false);
@@ -1927,6 +1923,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       streamState = {
         id: latestAssistant._id,
         queuedChars: 0,
+        spokenPrefix: "",
         chain: Promise.resolve(),
         timer: null,
         pendingPrefix: "",
@@ -1952,6 +1949,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const speechChunk = prefix.slice(from).trim();
       current.pendingPrefix = "";
       current.queuedChars = prefix.length;
+      current.spokenPrefix = prefix;
       if (!speechChunk) return;
       current.chain = current.chain.then(async () => {
         if (streamingSpeechRef.current.id !== latestAssistant._id) return;
@@ -2001,8 +1999,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         streamed.pendingPrefix = "";
       }
       if (streamed) await streamed.chain;
-      const from = streamed?.queuedChars ?? 0;
-      const unsaidText = spokenText.slice(from).trim();
+      const streamedPrefix = streamed?.spokenPrefix ?? "";
+      const unsaidText = finalSpeechSuffix(spokenText, streamedPrefix);
+      const from = streamedPrefix && spokenText.startsWith(streamedPrefix) ? streamedPrefix.length : 0;
       if (!unsaidText) {
         setSpeaking(false);
         fadeCaption(spokenText, 1800);
@@ -2259,6 +2258,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     streamingSpeechRef.current = {
       id: "",
       queuedChars: 0,
+      spokenPrefix: "",
       chain: Promise.resolve(),
       timer: null,
       pendingPrefix: "",
