@@ -1,14 +1,29 @@
-// Foreground conversation is deliberately a short, parallel lane. Durable
+// Foreground conversation has one authoritative warm owner. Durable
 // research/coding belongs to the independent agent fleet; a slow background
 // run must never inherit or monopolise Daniel's foreground voice lane.
 export const FOREGROUND_QUEUE = "jarvis-foreground";
-export const FOREGROUND_CONCURRENCY = 2;
+export const FOREGROUND_CONCURRENCY = 1;
 export const FOREGROUND_TURN_TIMEOUT_MS = 150_000;
-export const FOREGROUND_MAX_DURATION_SECONDS = 900;
+// Trigger v4 accepts a numeric duration in seconds. Four hours keeps one
+// authenticated Codex app-server and its thread map alive through a normal
+// active day, while retaining a finite cancellation/recovery boundary.
+export const FOREGROUND_MAX_DURATION_SECONDS = 4 * 60 * 60;
+// Do not claim unless a worst-case foreground turn can still be streamed and
+// finalized before this runner voluntarily hands over. This is intentionally
+// larger than the model timeout: context and durable delivery are included.
+export const FOREGROUND_ADMISSION_RESERVE_MS = FOREGROUND_TURN_TIMEOUT_MS + 20_000;
+// A successor starts and initializes during this bounded overlap, but cannot
+// take the Convex lease until the owner releases it.
+export const FOREGROUND_HANDOFF_OVERLAP_MS = 10 * 60_000;
+// Leave headroom below Trigger's hard max for cleanup and lease release.
+export const FOREGROUND_PROCESS_EXIT_RESERVE_MS = 60_000;
+
+/** A claim is safe only when its full execution-and-delivery reserve remains. */
+export const canClaimForegroundTurn = (remainingMs: number) =>
+  remainingMs >= FOREGROUND_ADMISSION_RESERVE_MS;
 
 export type ForegroundTurnPayload = {
   messageId?: string;
   threadId?: string;
   source?: string;
-  handoffFrom?: string;
 };

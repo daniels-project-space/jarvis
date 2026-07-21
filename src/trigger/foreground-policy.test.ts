@@ -1,16 +1,28 @@
 import { describe, expect, it } from "vitest";
 import {
   FOREGROUND_CONCURRENCY,
+  canClaimForegroundTurn,
+  FOREGROUND_ADMISSION_RESERVE_MS,
+  FOREGROUND_HANDOFF_OVERLAP_MS,
   FOREGROUND_MAX_DURATION_SECONDS,
+  FOREGROUND_PROCESS_EXIT_RESERVE_MS,
   FOREGROUND_QUEUE,
   FOREGROUND_TURN_TIMEOUT_MS,
 } from "./foreground-policy";
 
 describe("foreground conversation policy", () => {
-  it("reserves two warm bounded lanes for Jarvis conversation", () => {
+  it("keeps one authoritative warm foreground owner with a bounded handoff", () => {
     expect(FOREGROUND_QUEUE).toBe("jarvis-foreground");
-    expect(FOREGROUND_CONCURRENCY).toBe(2);
+    expect(FOREGROUND_CONCURRENCY).toBe(1);
     expect(FOREGROUND_TURN_TIMEOUT_MS).toBeLessThanOrEqual(3 * 60_000);
-    expect(FOREGROUND_MAX_DURATION_SECONDS).toBe(15 * 60);
+    expect(FOREGROUND_MAX_DURATION_SECONDS).toBe(4 * 60 * 60);
+    expect(FOREGROUND_ADMISSION_RESERVE_MS).toBeGreaterThan(FOREGROUND_TURN_TIMEOUT_MS);
+    expect(FOREGROUND_HANDOFF_OVERLAP_MS).toBeGreaterThan(FOREGROUND_ADMISSION_RESERVE_MS);
+    expect(FOREGROUND_PROCESS_EXIT_RESERVE_MS).toBeGreaterThan(0);
+  });
+
+  it("leaves a turn durable for the successor at the admission boundary", () => {
+    expect(canClaimForegroundTurn(FOREGROUND_ADMISSION_RESERVE_MS)).toBe(true);
+    expect(canClaimForegroundTurn(FOREGROUND_ADMISSION_RESERVE_MS - 1)).toBe(false);
   });
 });

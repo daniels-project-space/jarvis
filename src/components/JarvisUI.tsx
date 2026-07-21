@@ -323,7 +323,7 @@ function OptionsPanel({
               {permissionBusy ? "enabling…" : permissions.microphone === "granted" && permissions.notifications === "granted" ? "ready ✓" : "enable once"}
             </button>
           </Row>
-          <Row label="Speaking voice" hint="Voicebox Jarvis profile when its cloud worker is warm">
+          <Row label="Speaking voice" hint="Free streamed en-GB-RyanNeural">
             <span className="rounded-lg border border-white/10 bg-black/20 px-2.5 py-1 text-[11px] text-ice">Jarvis</span>
           </Row>
           <Row label="Saved work" hint="projects, inquiries, notes, emails, boards, maps and files">
@@ -1919,7 +1919,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       setSending(false);
     }
     showCaption({ who: "jarvis", text: latestAssistant.text, phase: "streaming" });
-    if (liveRef.current && !latestAssistant.model) return;
     const stablePrefix = completeSpeechPrefix(latestAssistant.text);
     if (!stablePrefix) return;
     let streamState = streamingSpeechRef.current;
@@ -1988,12 +1987,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     lastSpokenText.current = { text: last.text, ts: Date.now() };
     // Background findings never interrupt an active voice exchange. Normal
     // Codex replies do speak, then the turn-taking microphone re-arms.
-    if (liveRef.current && !last.model) return;
     const spokenText = isToolGarbage(last.text) ? sanitizeAssistantText(last.text) : last.text;
     // Streaming and finalization use the same stable caption node. Put the
     // finished text there before voice ownership/model generation, so it never
     // vanishes during the TTS handoff or when this tab is not the speaker.
     showCaption({ who: "jarvis", text: spokenText, phase: "ready" });
+    document.documentElement.dataset.jarvisFinalDeliveryMs = String(Math.round(performance.now()));
     (async () => {
       const streamed = streamingSpeechRef.current.id === last._id ? streamingSpeechRef.current : null;
       if (streamed?.timer) {
