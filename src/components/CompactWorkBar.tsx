@@ -38,9 +38,21 @@ function progressStamp(value: number | null) {
   return value ? new Date(value).toISOString().replace("T", " ").slice(0, 19) + "Z" : "not recorded";
 }
 
-function fleetNodeStateLabel(state: FleetNode["state"]) {
-  return ({ dependency_held: "held", dispatching: "dispatch", reviewing: "review", integrating: "integrate", needs_input: "input" } as Partial<Record<FleetNode["state"], string>>)[state]
-    ?? state;
+const FLEET_NODE_STATE_LABEL: Record<FleetNode["state"], string> = {
+  queued: "queue",
+  dependency_held: "held",
+  dispatching: "send",
+  running: "run",
+  reviewing: "review",
+  integrating: "merge",
+  paused: "pause",
+  done: "done",
+  blocked: "block",
+  needs_input: "input",
+};
+
+export function fleetNodeStateLabel(state: FleetNode["state"]) {
+  return FLEET_NODE_STATE_LABEL[state];
 }
 
 export function fleetDagLayout(nodes: FleetNode[], edges: FleetEdge[]) {
@@ -114,8 +126,8 @@ export function FleetDag({ nodes, edges }: { nodes: FleetNode[]; edges: FleetEdg
               const color = node.needsDaniel ? "#fbbf24" : node.state === "done" ? "#34d399" : node.state === "blocked" ? "#fb7185" : "#22d3ee";
               const cardHeight = Math.max(21, Math.min(38, 170 / point.rowCount));
               return <li key={node.id} data-fleet-node aria-label={`${agentName(node.agent)}: ${node.label}, ${node.percent}% ${node.state.replaceAll("_", " ")}`} className="absolute grid -translate-x-1/2 -translate-y-1/2 content-center rounded-md border bg-[#071019]/95 px-0.5 text-center shadow-[0_2px_10px_rgba(0,0,0,.22)]" style={{ left: `${(point.x / 600) * 100}%`, top: `${(point.y / 260) * 100}%`, width: `clamp(41px, ${nodeWidth}%, 76px)`, height: `${cardHeight}px`, borderColor: color, color }}>
-                <span className="block truncate text-[8px] font-medium leading-[9px] sm:text-[10px] sm:leading-[11px]">{agentName(node.agent)}</span>
-                <span title={node.state.replaceAll("_", " ")} className="block truncate font-mono text-[7px] leading-[8px] text-slate-300 sm:text-[8px] sm:leading-[9px]">{node.percent}% {fleetNodeStateLabel(node.state)}</span>
+                <span className="block whitespace-nowrap text-[8px] font-medium leading-[9px] sm:text-[10px] sm:leading-[11px]">{agentName(node.agent)}</span>
+                <span title={node.state.replaceAll("_", " ")} className="block whitespace-nowrap font-mono text-[6px] leading-[7px] tracking-[-0.08em] text-slate-300 sm:text-[8px] sm:leading-[9px] sm:tracking-normal">{node.percent}% {fleetNodeStateLabel(node.state)}</span>
               </li>;
             })}
           </ol>

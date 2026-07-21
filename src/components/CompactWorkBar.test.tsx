@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { CompactWorkSnapshot, FleetNode } from "../lib/active-work";
-import { FleetCommandCenter, FleetDag, fleetDagLayout } from "./CompactWorkBar";
+import { FleetCommandCenter, FleetDag, fleetDagLayout, fleetNodeStateLabel } from "./CompactWorkBar";
 
 const node = (overrides: Partial<FleetNode> = {}): FleetNode => ({
   id: "surface", jobId: "job-1", label: "Unified fleet surface", agent: "paul",
@@ -60,6 +60,18 @@ describe("FleetCommandCenter", () => {
     expect(markup).toContain(">Validation</span> · after a (ready)");
     expect(markup).toContain('aria-label="Handoff readiness legend"');
     expect(fleetDagLayout(nodes, edges)).toHaveLength(2);
+  });
+
+  it("uses complete compact state labels while preserving each full state for assistive technology", () => {
+    expect(Object.fromEntries((["queued", "dependency_held", "dispatching", "running", "reviewing", "integrating", "paused", "done", "blocked", "needs_input"] as FleetNode["state"][]).map((state) => [state, fleetNodeStateLabel(state)]))).toEqual({
+      queued: "queue", dependency_held: "held", dispatching: "send", running: "run", reviewing: "review",
+      integrating: "merge", paused: "pause", done: "done", blocked: "block", needs_input: "input",
+    });
+    const markup = renderToStaticMarkup(<FleetDag nodes={[node({ agent: "jarvis", state: "integrating", percent: 100 })]} edges={[]} />);
+    expect(markup).toContain('aria-label="JARVIS: Unified fleet surface, 100% integrating"');
+    expect(markup).toContain('title="integrating"');
+    expect(markup).toContain("JARVIS");
+    expect(markup).toContain("100% merge");
   });
 
   it("keeps dependency depths stable when input nodes arrive in another order", () => {
