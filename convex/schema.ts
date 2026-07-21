@@ -233,6 +233,8 @@ export default defineSchema({
     dispatchReason: v.optional(v.string()),
     workerRunId: v.optional(v.string()),
     workerRuntime: v.optional(v.string()),
+    providerRunState: v.optional(v.string()),
+    providerObservedAt: v.optional(v.number()),
     checkpoint: v.optional(v.string()),
     attempt: v.optional(v.number()),
     maxAttempts: v.optional(v.number()),
@@ -243,6 +245,17 @@ export default defineSchema({
     goalWave: v.optional(v.number()),
     acceptanceCriteria: v.optional(v.array(v.string())),
     modelReason: v.optional(v.string()),
+    // Immutable work-item isolation identities. `branch` remains the legacy
+    // display/transport alias for workerBranch during the rollout.
+    sourceBranch: v.optional(v.string()),
+    sourceHeadSha: v.optional(v.string()),
+    integrationBranch: v.optional(v.string()),
+    workerBranch: v.optional(v.string()),
+    workspaceLineage: v.optional(v.string()),
+    retryLineage: v.optional(v.string()),
+    integrationAttemptId: v.optional(v.id("integrationAttempts")),
+    integrationState: v.optional(v.string()),
+    evidenceSummary: v.optional(v.string()),
     branch: v.optional(v.string()),
     pullRequestUrl: v.optional(v.string()),
     // read_only = evidence only; auto_merge = the delivery controller merges
@@ -333,12 +346,23 @@ export default defineSchema({
     dispatchLeaseUntil: v.optional(v.number()),
     workerRunId: v.optional(v.string()),
     workerRuntime: v.optional(v.string()),
+    providerRunState: v.optional(v.string()),
+    providerObservedAt: v.optional(v.number()),
     readonly: v.optional(v.boolean()),
     parentJobId: v.optional(v.string()),
     dependsOn: v.optional(v.array(v.string())),
     goalStage: v.optional(v.string()),
     goalWorkstreamId: v.optional(v.string()),
     goalWave: v.optional(v.number()),
+    sourceBranch: v.optional(v.string()),
+    sourceHeadSha: v.optional(v.string()),
+    integrationBranch: v.optional(v.string()),
+    workerBranch: v.optional(v.string()),
+    workspaceLineage: v.optional(v.string()),
+    retryLineage: v.optional(v.string()),
+    integrationAttemptId: v.optional(v.id("integrationAttempts")),
+    integrationState: v.optional(v.string()),
+    evidenceSummary: v.optional(v.string()),
     branch: v.optional(v.string()),
     pullRequestUrl: v.optional(v.string()),
     deliveryMode: v.optional(v.string()),
@@ -391,6 +415,17 @@ export default defineSchema({
     planningJobId: v.optional(v.string()),
     validatorJobId: v.optional(v.string()),
     sharedBranch: v.optional(v.string()),
+    // `sharedBranch` is legacy display state. Only integrationBranch may be
+    // advanced, and only by the fenced integration queue below.
+    sourceBranch: v.optional(v.string()),
+    integrationBranch: v.optional(v.string()),
+    integrationHeadSha: v.optional(v.string()),
+    integrationGeneration: v.optional(v.number()),
+    activeIntegrationAttemptId: v.optional(v.id("integrationAttempts")),
+    integrationLeaseOwner: v.optional(v.string()),
+    integrationLeaseToken: v.optional(v.string()),
+    integrationLeaseVersion: v.optional(v.number()),
+    integrationLeaseUntil: v.optional(v.number()),
     revisionWave: v.optional(v.number()),
     maxRevisionWaves: v.optional(v.number()),
     maxBuildSessions: v.optional(v.number()),
@@ -448,6 +483,12 @@ export default defineSchema({
     maxBuildSessions: v.number(),
     planningJobId: v.optional(v.string()),
     validatorJobId: v.optional(v.string()),
+    sourceBranch: v.optional(v.string()),
+    integrationBranch: v.optional(v.string()),
+    integrationHeadSha: v.optional(v.string()),
+    integrationGeneration: v.optional(v.number()),
+    activeIntegrationAttemptId: v.optional(v.id("integrationAttempts")),
+    integrationLeaseUntil: v.optional(v.number()),
     advanceLeaseUntil: v.optional(v.number()),
     pausedPhase: v.optional(v.string()),
     failureReason: v.optional(v.string()),
@@ -574,6 +615,8 @@ export default defineSchema({
     // optional until the exact dispatch crosses the worker fence, allowing
     // every event from enqueue onward to use one causal cursor.
     workspaceKey: v.optional(v.string()),
+    workspaceLineage: v.optional(v.string()),
+    workerBranch: v.optional(v.string()),
     sessionId: v.optional(v.string()),
     workerRunId: v.optional(v.string()),
     dispatchId: v.optional(v.string()),
@@ -598,11 +641,59 @@ export default defineSchema({
     .index("by_job_attempt", ["jobId", "attempt"])
     .index("by_status_progress", ["status", "progressAt"]),
 
+  // Mission integration is distinct from specialist delivery. These rows are
+  // append-only generations around one immutable review receipt. Exactly one
+  // row per mission can hold the controller lease and advance the integration
+  // ref; conflicts create focused repair jobs instead of replaying siblings.
+  integrationAttempts: defineTable({
+    missionId: v.id("missions"),
+    jobId: v.id("jobs"),
+    workAttempt: v.number(),
+    generation: v.number(),
+    revisionWave: v.number(),
+    workstreamId: v.string(),
+    repository: v.string(),
+    sourceBranch: v.string(),
+    workerBranch: v.string(),
+    integrationBranch: v.string(),
+    reviewReceiptId: v.id("reviewReceipts"),
+    reviewReceiptDigest: v.string(),
+    reviewedBaseSha: v.string(),
+    reviewedHeadSha: v.string(),
+    reviewedHeadTreeSha: v.string(),
+    reviewedDiffSha256: v.string(),
+    status: v.string(), // queued | claimed | prepared | provider_waiting | integrated | conflict | stale | cancelled
+    controllerRunId: v.optional(v.string()),
+    leaseOwner: v.optional(v.string()),
+    leaseToken: v.optional(v.string()),
+    leaseVersion: v.number(),
+    leaseUntil: v.optional(v.number()),
+    expectedIntegrationBaseSha: v.optional(v.string()),
+    preparedEffectId: v.optional(v.string()),
+    preparedIntegrationHeadSha: v.optional(v.string()),
+    preparedIntegrationTreeSha: v.optional(v.string()),
+    providerObservation: v.optional(v.string()),
+    providerObservedHeadSha: v.optional(v.string()),
+    outcome: v.optional(v.string()),
+    retryReason: v.optional(v.string()),
+    cumulativeRetries: v.number(),
+    repairJobId: v.optional(v.id("jobs")),
+    terminalReceiptDigest: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+    completedAt: v.optional(v.number()),
+  })
+    .index("by_mission_status", ["missionId", "status", "createdAt"])
+    .index("by_mission_generation", ["missionId", "generation"])
+    .index("by_job_attempt", ["jobId", "workAttempt"])
+    .index("by_status_created", ["status", "createdAt"]),
+
   // Controller delivery has its own durable lease lineage.  It deliberately
   // points at an immutable specialist attempt rather than reusing that
   // attempt's running/liveness state while GitHub checks are pending.
   deliveryAttempts: defineTable({
     jobId: v.id("jobs"),
+    integrationAttemptId: v.optional(v.id("integrationAttempts")),
     sourceWorkAttempt: v.number(),
     generation: v.number(),
     // These are assigned only when the controller generation is dispatched.
@@ -700,6 +791,10 @@ export default defineSchema({
     jobId: v.id("jobs"),
     attempt: v.number(),
     repository: v.string(),
+    workerBranch: v.optional(v.string()),
+    sourceBranch: v.optional(v.string()),
+    workspaceLineage: v.optional(v.string()),
+    retryLineage: v.optional(v.string()),
     receiptJson: v.string(),
     receiptDigest: v.string(),
     signature: v.string(),

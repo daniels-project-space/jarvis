@@ -8,6 +8,8 @@ import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
 import { normalizeWorkModelTier } from "../src/lib/work-models";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
+import { attemptWorkspaceKey, workItemIdentity } from "../src/lib/workspace-protocol";
+import { queueReviewedIntegration } from "./goalIntegration";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
 import { hasAttemptBudget, isMeaningfulWorkProgress } from "../src/lib/work-attempt";
 import { claimDisposition, completionReceiptAllowed, isSha256Digest, replayEnvelope, shouldAdvanceAttempt } from "../src/lib/durable-attempt-protocol";
@@ -25,8 +27,8 @@ const STALE_RUNNER_MS = 5 * 60 * 1000;
 // A live process that cannot produce a causal stage/percentage advance is not
 // healthy work. Keep this comfortably above a normal Codex tool segment while
 // still surfacing a genuinely stuck attempt before its lease disappears.
-const STALLED_PROGRESS_MS = 20 * 60 * 1000;
 const DISPATCH_LEASE_MS = 2 * 60 * 1000;
+const MAX_WRITABLE_PER_MISSION_REPO = 4;
 const DELIVERY_LEASE_MS = 45_000;
 const DELIVERY_RETRY_LIMIT = 6;
 const REVIEW_RECEIPT_MAX_CHARS = 300_000;
@@ -131,6 +133,7 @@ function hasLiveControllerFence(row: any, attempt: any, a: any, now = Date.now()
 
 function carriedDeliveryAuthority(delivery: any) {
   return {
+    integrationAttemptId: delivery.integrationAttemptId,
     reviewReceiptId: delivery.reviewReceiptId,
     reviewReceiptDigest: delivery.reviewReceiptDigest,
     reviewKeyId: delivery.reviewKeyId,
@@ -233,8 +236,13 @@ async function appendAttemptEvidence(ctx: any, row: any, type: string, message: 
 async function ensureAttempt(ctx: any, jobId: any, attempt: number, status: string, now: number, patch: Record<string, unknown> = {}) {
   const existing = await attemptFor(ctx, jobId, attempt);
   if (existing) return existing;
+  const job: any = await ctx.db.get(jobId);
+  const workspaceLineage = job?.workspaceLineage;
   const id = await ctx.db.insert("workAttempts", {
     jobId, attempt, status, lastEventSeq: 0,
+    workspaceLineage,
+    workspaceKey: workspaceLineage ? attemptWorkspaceKey(workspaceLineage, attempt) : undefined,
+    workerBranch: job?.workerBranch,
     livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now, ...patch,
   });
   return { _id: id, jobId, attempt, status, ...patch };
@@ -309,11 +317,29 @@ export const enqueue = mutation({
       nextRunAt: now,
       createdAt: now,
     });
-    const queued = await ctx.db.get(id);
+    let queued: any = await ctx.db.get(id);
+    if (queued) {
+      const identity = workItemIdentity({
+        missionId: input.missionId ?? `standalone-${String(id)}`,
+        jobId: String(id), workstreamId: input.goalWorkstreamId ?? input.label,
+        readonly: Boolean(input.readonly || !repo),
+      });
+      await patchJobWithRuntime(ctx, queued, {
+        sourceBranch: input.branch,
+        workerBranch: identity.workerBranch,
+        workspaceLineage: identity.workspaceLineage,
+        retryLineage: identity.retryLineage,
+        branch: identity.workerBranch ?? input.branch,
+      });
+      queued = await ctx.db.get(id);
+    }
     // This early lifecycle row is the serialized cursor for queue, dispatch,
     // launch and terminal events. Provider identities are bound later.
     await ctx.db.insert("workAttempts", {
       jobId: id, attempt: 1, status, lastEventSeq: 0,
+      workspaceLineage: queued?.workspaceLineage,
+      workspaceKey: queued?.workspaceLineage ? attemptWorkspaceKey(queued.workspaceLineage, 1) : undefined,
+      workerBranch: queued?.workerBranch,
       livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now,
     });
     if (queued) await appendAttemptEvidence(ctx, queued, approvalRequired ? "approval_requested" : "queued",
@@ -593,6 +619,7 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
   candidates.sort((a: any, b: any) => (b.priority ?? 50) - (a.priority ?? 50) || a.createdAt - b.createdAt);
   const runnable: any[] = [];
   const missionCache = new Map<string, any>();
+  const repoActiveCache = new Map<string, number>();
   const dependencyCache = new Map<string, any>();
   for (const candidate of candidates) {
     if (candidate.approvalRequired && candidate.approvalStatus !== "approved") continue;
@@ -659,6 +686,19 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
       const mission = missionId ? await ctx.db.get(missionId) : null;
       if (!mission || !goalJobMatchesMissionPhase(job, mission)) continue;
     }
+    if (job.missionId && job.repo && !job.readonly && !job.integrationAttemptId) {
+      const key = `${job.missionId}:${job.repo}`;
+      let active = repoActiveCache.get(key);
+      if (active === undefined) {
+        const siblings = await ctx.db.query("jobRuntime")
+          .withIndex("by_mission", (q: any) => q.eq("missionId", job.missionId)).take(100);
+        active = siblings.filter((sibling: any) => sibling.repo === job.repo && !sibling.readonly
+          && ["dispatching", "running"].includes(sibling.status) && !sibling.integrationAttemptId).length;
+      }
+      const activeCount = active ?? 0;
+      if (activeCount >= MAX_WRITABLE_PER_MISSION_REPO) continue;
+      repoActiveCache.set(key, activeCount + 1);
+    }
     runnable.push(job);
     if (runnable.length >= limit) break;
   }
@@ -689,6 +729,14 @@ async function claimedJob(ctx: any, j: any, upstreamEvidence: readonly any[] = [
     checkpoint: j.checkpoint ?? null,
     result: j.result ?? null,
     branch: j.branch ?? null,
+    sourceBranch: j.sourceBranch ?? null,
+    sourceHeadSha: j.sourceHeadSha ?? null,
+    integrationBranch: j.integrationBranch ?? null,
+    workerBranch: j.workerBranch ?? null,
+    workspaceLineage: j.workspaceLineage ?? null,
+    retryLineage: j.retryLineage ?? null,
+    integrationAttemptId: j.integrationAttemptId ?? null,
+    integrationState: j.integrationState ?? null,
     deliveryMode: j.deliveryMode ?? (j.readonly ? "read_only" : "manual"),
     deliveryStatus: j.deliveryStatus ?? null,
     pullRequestUrl: j.pullRequestUrl ?? null,
@@ -699,6 +747,7 @@ async function claimedJob(ctx: any, j: any, upstreamEvidence: readonly any[] = [
     workerRunId: j.workerRunId ?? null,
     activeDeliveryAttemptId: j.activeDeliveryAttemptId ?? null,
     deliveryOutcome: delivery?.outcome ?? null,
+    deliveryPolicy: delivery?.policy ?? null,
     deliveryStep: delivery?.currentStep ?? null,
     deliveryReviewKeyId: delivery?.reviewKeyId ?? null,
     deliveryPullRequestNumber: delivery?.pullRequestNumber ?? null,
@@ -794,6 +843,8 @@ export const reserveDispatchBatch = mutation({
         // must never allocate a second number for the same controller pass.
         deliveryGeneration: deliveryContinuation ? Math.max(1, Number(j.deliveryGeneration ?? 1)) : j.deliveryGeneration,
         workerRuntime: "trigger",
+        providerRunState: "queued",
+        providerObservedAt: now,
         heartbeatAt: now,
       });
       attempt = await attemptFor(ctx, j._id, attemptNumber);
@@ -881,6 +932,7 @@ export const claimDispatched = mutation({
         status: "running", stage: "delivery", progress: "resuming verified controller delivery", startedAt: now,
         heartbeatAt: now, nextRunAt: undefined, dispatchLeaseUntil: undefined, dispatchId: a.dispatchId,
         workerRunId: a.workerRunId.slice(0, 120), deliveryRunId: a.workerRunId.slice(0, 120), deliveryGeneration: generation, activeDeliveryAttemptId: deliveryId, workerRuntime: "trigger",
+        providerRunState: "executing", providerObservedAt: now,
       });
       await appendAttemptEvidence(ctx, j, "delivery_resumed", "Trusted controller resumed verified delivery without rerunning the specialist", {
         stage: "delivery", evidenceKind: "delivery", eventKey: `delivery-resume:${j.attempt ?? 1}:${a.dispatchId}`,
@@ -918,13 +970,19 @@ export const claimDispatched = mutation({
       workerRunId: a.workerRunId.slice(0, 120),
       dispatchId: a.dispatchId,
       workerRuntime: "trigger",
+      providerRunState: "executing",
+      providerObservedAt: now,
     });
     // Bind dispatch, worker identities and the exact upstream snapshot in the
     // same transaction as running. This makes exact lost-response replay
     // reachable while fencing every competing delivery.
+    const workspaceLineage = String(j.workspaceLineage ?? `sandbox:${String(a.jobId)}:lineage:1`);
+    const workspaceKey = attemptWorkspaceKey(workspaceLineage, j.attempt ?? 1);
     await ctx.db.patch(attempt._id, {
       status: "running",
-      workspaceKey: `convex:${String(a.jobId)}:attempt:${j.attempt ?? 1}`,
+      workspaceKey,
+      workspaceLineage,
+      workerBranch: j.workerBranch,
       sessionId: a.workerRunId.slice(0, 120),
       workerRunId: a.workerRunId.slice(0, 120),
       dispatchId: a.dispatchId,
@@ -938,7 +996,7 @@ export const claimDispatched = mutation({
       stage: "starting",
       percent: Math.max(2, j.percent ?? 0),
       evidenceKind: "attempt_launch",
-      data: { workspace: `convex:${String(a.jobId)}:attempt:${j.attempt ?? 1}`, session: a.workerRunId.slice(0, 120) },
+      data: { workspace: workspaceKey, workspaceLineage, workerBranch: j.workerBranch, session: a.workerRunId.slice(0, 120) },
     });
     // Never use the pre-patch object here. Convex documents are immutable
     // snapshots, unlike the old unit-test fake; returning it lost the newly
@@ -1252,40 +1310,9 @@ export const reapStale = mutation({
     const requeued: string[] = [];
     const abandoned: string[] = [];
     const stalled: string[] = [];
-    // This pass catches the important case the old heartbeat-only design
-    // could not see: a responsive container emitting liveness ticks while no
-    // stage, percentage, or evidence has advanced.
-    const noProgress = await ctx.db
-      .query("jobRuntime")
-      .withIndex("by_status_progress", (q: any) => q.eq("status", "running").lte("progressAt", now - STALLED_PROGRESS_MS))
-      .take(100);
-    for (const activity of noProgress) {
-      if ((activity.heartbeatAt ?? 0) <= now - STALE_RUNNER_MS) continue;
-      const j = await ctx.db.get(activity.jobId);
-      if (!j || j.status !== "running" || (j.attempt ?? 1) !== activity.attempt) {
-        if (j) await upsertJobRuntime(ctx, j);
-        continue;
-      }
-      const attempt = await attemptFor(ctx, j._id, j.attempt ?? 1);
-      if (!attempt || attempt.status !== "running") continue;
-      const reason = `No causal progress for ${Math.floor((now - (activity.progressAt ?? activity.createdAt)) / 60_000)} minutes while the worker remained live`;
-      await patchJobWithRuntime(ctx, j, {
-        status: "stalled",
-        stage: "stalled",
-        progress: reason,
-        stalledAt: now,
-        stallReason: reason,
-        stallCount: (j.stallCount ?? 0) + 1,
-        nextRunAt: undefined,
-      });
-      await ctx.db.patch(attempt._id, { status: "stalled", completedAt: now, lastEventAt: now });
-      await appendAttemptEvidence(ctx, j, "stalled", reason, {
-        stage: "stalled",
-        percent: activity.percent,
-        evidenceKind: "watchdog",
-      });
-      stalled.push(j.task.slice(0, 80));
-    }
+    // A fresh heartbeat is positive mechanical evidence. Long model/tool or
+    // provider waits are never declared stalled by elapsed time alone; only a
+    // lost lease enters deterministic recovery below.
     for (const activity of [...running, ...steering]) {
       const j = await ctx.db.get(activity.jobId);
       if (!j || !["running", "steering"].includes(j.status) || (j.attempt ?? 1) !== activity.attempt) {
@@ -1430,9 +1457,9 @@ export const updateProgress = mutation({
     if (!row || row.status !== "running" || row.attempt !== a.expectedAttempt) return false;
     const now = Date.now();
     const percent = a.percent === undefined ? row.percent : Math.max(row.percent ?? 0, Math.min(99, a.percent));
-    // Heartbeats are deliberately excluded from this test. A changed stage,
-    // percentage advance, or new evidence line is causal progress; liveness
-    // traffic alone can never postpone the stall watchdog.
+    // Heartbeats are deliberately excluded from causal progress. A changed
+    // stage, percentage advance, or new evidence line updates the cold audit
+    // cursor; fresh liveness independently proves a long-running task healthy.
     const meaningful = isMeaningfulWorkProgress({
       currentStage: row.stage,
       currentPercent: row.percent,
@@ -1465,8 +1492,8 @@ export const updateProgress = mutation({
 });
 
 // Liveness is intentionally a different fenced operation from progress. It
-// is cheap enough to send every thirty seconds and cannot make a stalled job
-// look productive.
+// is cheap enough to send every thirty seconds and proves only that the exact
+// Trigger run is alive; it never invents causal progress evidence.
 export const touchHeartbeat = mutation({
   args: {
     jobId: v.id("jobs"),
@@ -1715,6 +1742,36 @@ export const executionLease = query({
     return legacy
       ? { status: legacy.status, attempt: legacy.attempt ?? 1, steerRevision: legacy.steerRevision ?? 0 }
       : { status: "missing", attempt: 0, steerRevision: 0 };
+  },
+});
+
+// The sandbox adapter binds the exact source ref/head once, after hydration
+// and before Codex starts. Planned branch names may not exist yet (the first
+// integration generation), so only this fenced observation can turn intent
+// into immutable source identity.
+export const bindWorkspaceSource = mutation({
+  args: {
+    jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
+    sourceBranch: v.string(), sourceHeadSha: v.string(), workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const row = await ctx.db.get(args.jobId);
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== args.expectedAttempt
+      || row.workerRunId !== args.workerRunId || !/^[a-zA-Z0-9._/-]{1,240}$/.test(args.sourceBranch)
+      || !/^[0-9a-f]{40,64}$/i.test(args.sourceHeadSha)) return false;
+    if (row.sourceHeadSha) return row.sourceHeadSha === args.sourceHeadSha && row.sourceBranch === args.sourceBranch;
+    await patchJobWithRuntime(ctx, row, {
+      sourceBranch: args.sourceBranch, sourceHeadSha: args.sourceHeadSha,
+      evidenceSummary: `sandbox source ${args.sourceBranch}@${args.sourceHeadSha.slice(0, 12)}`,
+    });
+    const attempt = await attemptFor(ctx, args.jobId, args.expectedAttempt);
+    if (attempt) await ctx.db.patch(attempt._id, { lastEventAt: Date.now() });
+    await appendAttemptEvidence(ctx, row, "workspace_source_bound", `Sandbox source bound to ${args.sourceBranch}@${args.sourceHeadSha}`, {
+      stage: "starting", evidenceKind: "workspace", eventKey: `workspace-source:${args.expectedAttempt}:${args.sourceHeadSha}`,
+      data: { sourceBranch: args.sourceBranch, sourceHeadSha: args.sourceHeadSha, workerBranch: row.workerBranch },
+    });
+    return true;
   },
 });
 
@@ -2115,7 +2172,12 @@ export const markVerifiedForDelivery = mutation({
       receipt?.jobId !== String(a.jobId)
       || Number(receipt?.attempt) !== a.expectedAttempt
       || receipt?.repository !== row.repo
+      || receipt?.branch !== String(row.workerBranch ?? row.branch ?? "")
       || receipt?.diffSha256 !== a.reviewDiffSha256
+      || !/^[0-9a-f]{40,64}$/i.test(String(receipt?.baseSha ?? ""))
+      || !/^[0-9a-f]{40,64}$/i.test(String(receipt?.baseTreeSha ?? ""))
+      || !/^[0-9a-f]{40,64}$/i.test(String(receipt?.headSha ?? ""))
+      || !/^[0-9a-f]{40,64}$/i.test(String(receipt?.headTreeSha ?? ""))
       || !isSha256Digest(receipt?.agentEvidenceSha256)
     ) return false;
     const receiptJson = a.reviewReceiptJson;
@@ -2131,6 +2193,10 @@ export const markVerifiedForDelivery = mutation({
       jobId: a.jobId, attempt: a.expectedAttempt, repository: String(row.repo), receiptJson, receiptDigest,
       signature: a.reviewReceiptSignature, diffSha256: a.reviewDiffSha256,
       keyId: a.reviewReceiptKeyId,
+      workerBranch: String(row.workerBranch ?? row.branch),
+      sourceBranch: row.sourceBranch,
+      workspaceLineage: row.workspaceLineage,
+      retryLineage: row.retryLineage,
       baseSha: String(receipt.baseSha), headSha: String(receipt.headSha), baseTreeSha: String(receipt.baseTreeSha), headTreeSha: String(receipt.headTreeSha),
       agentEvidenceSha256: String(receipt.agentEvidenceSha256), createdAt: Date.now(),
     });
@@ -2138,6 +2204,8 @@ export const markVerifiedForDelivery = mutation({
     // Review is the phase boundary.  Persist the immutable cold receipt and
     // allocate exactly one queued controller generation before the specialist
     // exits.  The first GitHub effect can therefore never be untracked.
+    const integration = await queueReviewedIntegration(ctx, row, receipt, reviewReceiptId, receiptDigest);
+    if (row.missionId && !row.readonly && ["building", "refining"].includes(String(row.goalStage)) && !integration) return false;
     const generation = Math.max(1, Number(row.deliveryGeneration ?? 0) || 1);
     const existingDelivery = await deliveryAttemptFor(ctx, a.jobId, a.expectedAttempt, generation);
     if (existingDelivery && existingDelivery.reviewReceiptDigest && existingDelivery.reviewReceiptDigest !== receiptDigest) return false;
@@ -2145,10 +2213,11 @@ export const markVerifiedForDelivery = mutation({
       jobId: a.jobId,
       sourceWorkAttempt: a.expectedAttempt,
       generation,
-      policy: String(row.deliveryMode ?? (row.readonly ? "read_only" : "manual")),
+      policy: integration ? "mission_integration" : String(row.deliveryMode ?? (row.readonly ? "read_only" : "manual")),
       status: "checkpointed",
       reviewReceiptId,
       reviewReceiptDigest: receiptDigest,
+      integrationAttemptId: integration?._id,
       reviewKeyId: a.reviewReceiptKeyId,
       reviewLineage: [{ sourceWorkAttempt: a.expectedAttempt, reviewReceiptId, reviewReceiptDigest: receiptDigest, keyId: a.reviewReceiptKeyId }],
       reviewedHeadSha: String(receipt.headSha),
@@ -2164,6 +2233,7 @@ export const markVerifiedForDelivery = mutation({
     });
     if (existingDelivery) await ctx.db.patch(existingDelivery._id, {
       status: "checkpointed", reviewReceiptId, reviewReceiptDigest: receiptDigest,
+      integrationAttemptId: integration?._id,
       reviewKeyId: a.reviewReceiptKeyId,
       reviewedHeadSha: String(receipt.headSha), reviewedBaseSha: String(receipt.baseSha),
       reviewedHeadTreeSha: String(receipt.headTreeSha), reviewedDiffSha256: a.reviewDiffSha256,
@@ -2188,6 +2258,9 @@ export const markVerifiedForDelivery = mutation({
       reviewReceiptSignature: a.reviewReceiptSignature,
       reviewReceiptId,
       reviewReceiptDigest: receiptDigest,
+      integrationAttemptId: integration?._id,
+      integrationState: integration ? "queued" : row.integrationState,
+      evidenceSummary: `signed review ${receiptDigest.slice(0, 12)} queued`,
       activeDeliveryAttemptId: deliveryAttemptId,
       deliveryGeneration: generation,
       deliveryRunId: undefined,

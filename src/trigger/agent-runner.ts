@@ -72,6 +72,7 @@ import {
   type GitReviewEnvelope,
 } from "./git-review-receipt";
 import { repositoryDeliveryReadiness, trustedGitReviewReceiptAuthority, verifyGitReviewReceiptEnvelope } from "./git-review-authority";
+import { integrateReviewedWorker, type IntegrationAdapter } from "./mission-integration";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -704,7 +705,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             const thread = await chatThread();
             const line = result.external
               ? `I have locked the Sol architecture and handed the build to App Factory ${externalRun?.slug ? `as ${externalRun.slug}` : ""}. I am monitoring every stage and will stop at its human gates.`
-              : `I have locked the Sol architecture. ${result.jobs} Terra/high sessions are now working through it on one durable goal branch; the final Sol review cannot pass without deep evidence.`;
+              : `I have locked the Sol architecture. ${result.jobs} Terra/high sessions are now working on isolated refs; the controller will serialize their signed receipts before the final Sol review.`;
             await convexMutation("chatQueue:postAssistant", { threadId: thread, text: line }).catch(() => {});
           }
           continue;
@@ -872,7 +873,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       try {
         const jobKey = String(job.jobId).replace(/[^a-zA-Z0-9_-]/g, "_");
         const jobEnv = isolateSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}`);
-        let cwd = `/tmp/work/scratch-${jobKey}`;
+        let cwd = `/tmp/work/scratch-${jobKey}-attempt-${expectedAttempt}`;
         mkdirSync(cwd, { recursive: true });
         const agentId = (TEAM_BY_SLUG[job.agentId as AgentSlug] ? job.agentId : routeWork(job.task, { repo: job.repo }).agentId) as AgentSlug;
         const profile = TEAM_BY_SLUG[agentId];
@@ -885,6 +886,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           ? job.branch
           : "";
         const resumeBranch = validatedGoalBranch || persistedBranch || branch || "";
+        const integrationContinuation = Boolean(job.integrationAttemptId && job.deliveryPolicy === "mission_integration");
         const continuationPolicy = String(job.deliveryMode ?? (job.readonly ? "read_only" : "manual"));
         const controllerContinuation = Boolean(
           repo
@@ -893,7 +895,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           && deliveryFence
           // The review receipt, not a delivery mode, authorizes a controller
           // continuation.  Policy below decides draft/merge/no-op semantics.
-          && ["auto_merge", "manual", "read_only"].includes(continuationPolicy)
+          && (integrationContinuation || ["auto_merge", "manual", "read_only"].includes(continuationPolicy))
         );
         const repositoryReadiness = repositoryDeliveryReadiness(
           controllerContinuation,
@@ -966,6 +968,120 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               checkpoint: "Verified delivery is held: the immutable controller review receipt could not be loaded and HMAC-verified. Do not rerun the specialist.",
               result: String(job.result ?? "").slice(0, 4_000), branch: resumeBranch, delayMs: 30_000,
             }).catch(() => null);
+            return;
+          }
+          if (integrationContinuation) {
+            const integrationOwner = `integration:${String(job.jobId)}:${randomBytes(10).toString("hex")}`;
+            const integrationToken = randomBytes(24).toString("hex");
+            const claimed: any = await convexMutation("goalIntegration:claim", {
+              id: job.integrationAttemptId,
+              controllerRunId: String(job.deliveryRunId ?? job.workerRunId),
+              leaseOwner: integrationOwner,
+              leaseToken: integrationToken,
+            }).catch(() => null);
+            if (!claimed) {
+              await deliveryMutation("jobs:checkpointAndRequeue", {
+                jobId: job.jobId, expectedAttempt,
+                checkpoint: "Another fenced controller generation owns the mission integration queue. Resume this exact reviewed receipt after that lease completes.",
+                result: String(job.result ?? "").slice(0, 4_000), branch: resumeBranch, delayMs: 30_000,
+              }).catch(() => null);
+              return;
+            }
+            const integrationFence = {
+              id: job.integrationAttemptId,
+              controllerRunId: String(job.deliveryRunId ?? job.workerRunId),
+              leaseOwner: integrationOwner,
+              leaseToken: integrationToken,
+              leaseVersion: Number(claimed.leaseVersion),
+            };
+            const integrationDir = `/tmp/work/integration-${jobKey}-${Number(claimed.generation)}`;
+            rmSync(integrationDir, { recursive: true, force: true });
+            const remote = githubRepoUrl(repo);
+            const gitEnv = githubGitEnv(env, String(token));
+            const cloned = await sh("git", ["clone", "--no-checkout", "--filter=blob:none", remote, integrationDir], gitEnv);
+            if (cloned.code !== 0) {
+              await convexMutation("goalIntegration:defer", {
+                ...integrationFence, reasonCode: "sandbox_checkout_failed", reason: cloned.out.slice(-500),
+              }).catch(() => false);
+              return;
+            }
+            await sh("git", ["-C", integrationDir, "remote", "set-url", "origin", remote], env);
+            await sh("git", ["-C", integrationDir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
+            await sh("git", ["-C", integrationDir, "config", "user.name", "JARVIS integration controller"], env);
+            const runIntegrationGit = (args: string[], commandEnv: NodeJS.ProcessEnv = gitEnv) =>
+              sh("git", ["-C", integrationDir, ...args], commandEnv);
+            const readRef = async (name: string) => {
+              const ref = await runIntegrationGit(["ls-remote", remote, `refs/heads/${name}`]);
+              return ref.code === 0 ? ref.out.trim().split(/\s+/)[0] || null : null;
+            };
+            const adapter: IntegrationAdapter = {
+              readRef,
+              prepareMerge: async ({ integrationBaseSha, workerHeadSha, workerTreeSha, generation }) => {
+                const fetchedWorker = await runIntegrationGit(["fetch", "--no-tags", remote, `refs/heads/${claimed.workerBranch}`]);
+                if (fetchedWorker.code !== 0) return { status: "conflict", reason: "reviewed worker ref could not be materialized" };
+                const fetchedBase = await runIntegrationGit(["fetch", "--no-tags", remote, integrationBaseSha]);
+                if (fetchedBase.code !== 0) return { status: "conflict", reason: "integration base commit could not be materialized" };
+                const ancestor = await runIntegrationGit(["merge-base", "--is-ancestor", integrationBaseSha, workerHeadSha]);
+                if (ancestor.code === 0) return { status: "clean", headSha: workerHeadSha, treeSha: workerTreeSha };
+                const merged = await runIntegrationGit(["merge-tree", "--write-tree", integrationBaseSha, workerHeadSha]);
+                if (merged.code !== 0) return { status: "conflict", reason: merged.out.slice(-800) || "semantic merge conflict" };
+                const treeSha = merged.out.trim().split(/\s+/)[0];
+                if (!/^[0-9a-f]{40,64}$/i.test(treeSha)) return { status: "conflict", reason: "sandbox did not produce an exact merge tree" };
+                const fixedDate = new Date(Number(claimed.createdAt ?? Date.now())).toISOString();
+                const commit = await runIntegrationGit(
+                  ["commit-tree", treeSha, "-p", integrationBaseSha, "-p", workerHeadSha, "-m", `JARVIS integration generation ${generation}`],
+                  { ...gitEnv, GIT_AUTHOR_DATE: fixedDate, GIT_COMMITTER_DATE: fixedDate },
+                );
+                const headSha = commit.out.trim().split(/\s+/)[0];
+                return /^[0-9a-f]{40,64}$/i.test(headSha)
+                  ? { status: "clean", headSha, treeSha }
+                  : { status: "conflict", reason: "sandbox could not create the deterministic merge commit" };
+              },
+              advanceRef: async ({ branch: target, newHeadSha }) => {
+                const pushed = await runIntegrationGit(["push", remote, `${newHeadSha}:refs/heads/${target}`]);
+                if (pushed.code === 0) return "applied";
+                const observed = await readRef(target);
+                return observed === newHeadSha ? "unknown" : "not_applied";
+              },
+            };
+            const result = await integrateReviewedWorker({
+              workerBranch: String(claimed.workerBranch), reviewedHeadSha: String(claimed.reviewedHeadSha),
+              reviewedHeadTreeSha: String(claimed.reviewedHeadTreeSha),
+              expectedIntegrationBaseSha: String(claimed.expectedIntegrationBaseSha),
+              integrationBranch: String(claimed.integrationBranch), generation: Number(claimed.generation),
+            }, adapter, {
+              prepare: async (effect) => await convexMutation("goalIntegration:prepare", {
+                ...integrationFence, effectId: effect.effectId,
+                expectedIntegrationBaseSha: effect.expectedBaseSha,
+                preparedIntegrationHeadSha: effect.headSha,
+                preparedIntegrationTreeSha: effect.treeSha,
+              }).catch(() => null) as any,
+              observe: async (observation) => Boolean(await convexMutation("goalIntegration:observe", {
+                ...integrationFence, effectId: observation.effectId, observation: observation.observation,
+                providerHeadSha: observation.providerHeadSha,
+              }).catch(() => false)),
+            });
+            if (result.status === "integrated") {
+              const completed = await convexMutation("goalIntegration:complete", {
+                ...integrationFence, effectId: result.effectId,
+                terminalReceiptDigest: sha256(JSON.stringify({
+                  integrationAttemptId: String(job.integrationAttemptId), receipt: job.reviewReceiptDigest,
+                  base: claimed.expectedIntegrationBaseSha, head: result.headSha, tree: result.treeSha,
+                })),
+              }).catch(() => false);
+              if (completed) await drainGoalAdvances();
+              return;
+            }
+            if (result.status === "conflict" || result.status === "stale") {
+              await convexMutation("goalIntegration:failFocused", {
+                ...integrationFence, kind: result.status, reason: result.reason,
+              }).catch(() => null);
+              await drainGoalAdvances();
+              return;
+            }
+            await convexMutation("goalIntegration:defer", {
+              ...integrationFence, reasonCode: "provider_observation_pending", reason: result.reason,
+            }).catch(() => false);
             return;
           }
           if (await stopIfLeaseLost("Delivery lease changed before resume.", String(job.result ?? ""), resumeBranch)) return;
@@ -1098,7 +1214,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         let cloneFailureReason = "";
         let checkoutSourceBranch = "";
         if (repo && token) {
-          const dir = `/tmp/work/${repo.replace(/[^a-zA-Z0-9]/g, "_")}_${jobKey}`;
+          const dir = `/tmp/work/${repo.replace(/[^a-zA-Z0-9]/g, "_")}_${jobKey}_attempt_${expectedAttempt}`;
           rmSync(dir, { recursive: true, force: true });
           const url = githubRepoUrl(repo);
           const gitEnv = githubGitEnv(env, token);
@@ -1111,6 +1227,16 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             );
             cloneReady = cloned.code === 0 && existsSync(join(dir, ".git"));
             if (cloneReady) checkoutSourceBranch = String(job.branch);
+          }
+          if (!cloneReady && typeof job.sourceBranch === "string" && job.sourceBranch && job.sourceBranch !== job.branch) {
+            rmSync(dir, { recursive: true, force: true });
+            const cloned = await sh(
+              "git",
+              ["clone", "--depth", "1", "--single-branch", "--branch", String(job.sourceBranch), url, dir],
+              gitEnv,
+            );
+            cloneReady = cloned.code === 0 && existsSync(join(dir, ".git"));
+            if (cloneReady) checkoutSourceBranch = String(job.sourceBranch);
           }
           if (!cloneReady) {
             rmSync(dir, { recursive: true, force: true });
@@ -1139,10 +1265,26 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               context = `${cloneFailureReason} Do not inspect the incomplete checkout or pretend repository work was performed.`;
             } else {
               baseSha = (await sh("git", ["-C", dir, "rev-parse", "HEAD"], env)).out.trim();
+              if (job.sourceHeadSha && checkoutSourceBranch === job.sourceBranch && baseSha !== job.sourceHeadSha) {
+                cloneFailed = true;
+                cloneFailureReason = `Pinned source head moved: expected ${job.sourceHeadSha}, observed ${baseSha || "missing"}.`;
+                context = `${cloneFailureReason} Do not validate a moving integration branch.`;
+              }
+              if (!cloneFailed && !job.sourceHeadSha) {
+                const bound = await convexMutation("jobs:bindWorkspaceSource", {
+                  jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
+                  sourceBranch: checkoutSourceBranch, sourceHeadSha: baseSha,
+                }).catch(() => false);
+                if (!bound) {
+                  cloneFailed = true;
+                  cloneFailureReason = "The sandbox source identity could not be durably bound before execution.";
+                  context = `${cloneFailureReason} Do not edit an untracked workspace.`;
+                }
+              }
               const checkedOut = branch
                 ? await sh("git", ["-C", dir, "checkout", "-B", branch], env)
                 : { code: 0, out: "" };
-              if (!baseSha || checkedOut.code !== 0) {
+              if (!cloneFailed && (!baseSha || checkedOut.code !== 0)) {
                 cloneFailed = true;
                 cloneFailureReason = `The canonical checkout tip or isolated branch ${branch || "HEAD"} could not be prepared safely.`;
                 context = `${cloneFailureReason} Do not pretend repository work was performed.`;
@@ -1356,7 +1498,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               const push = await runGit(["push", pushUrl, `HEAD:refs/heads/${branch}`]);
               if (push.code !== 0 && isNonFastForwardPush(push.out)) {
                 deliveryRetry = true;
-                pushNote = `shared branch ${branch} advanced again during delivery; retrying from the new head`;
+                pushNote = `isolated worker branch ${branch} advanced unexpectedly; retrying from its canonical head`;
               } else {
                 pushFailed = push.code !== 0;
                 pushNote = pushFailed
@@ -1415,7 +1557,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             jobId: job.jobId,
             expectedAttempt,
             checkpoint: [
-              `The next attempt must resume from the canonical shared branch. Its commits were preserved; no history was overwritten and no force push was attempted. ${SHALLOW_PROVENANCE_RULE}`,
+              `The next attempt must resume from this work item's canonical worker branch. Its commits were preserved; no history was overwritten and no force push was attempted. ${SHALLOW_PROVENANCE_RULE}`,
               pushNote,
               deliveryDiffStat ? `Local diff summary to replay only if still missing:\n${deliveryDiffStat}` : "",
               continuationCheckpoint,

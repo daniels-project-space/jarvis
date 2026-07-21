@@ -102,6 +102,30 @@ beforeEach(() => { process.env.JARVIS_WORKER_TOKEN = WORKER; vi.useRealTimers();
 afterEach(() => { delete process.env.JARVIS_WORKER_TOKEN; vi.useRealTimers(); });
 
 describe("real Convex specialist/controller race matrix", () => {
+  it("fences a steered specialist and allocates a fresh workspace attempt without accepting its late review", async () => {
+    const f = await specialistFixture();
+    expect(await f.t.mutation(api.jobs.control, {
+      jobId: f.jobId, action: "steer", input: "Keep the durable schema but change only the attribution boundary.", workerToken: WORKER,
+    })).toBe(true);
+    expect(await f.t.mutation(api.jobs.markVerifiedForDelivery, f.commitArgs)).toBe(false);
+    const state = await rows(f.t);
+    expect(state.jobs[0]).toMatchObject({ status: "steering", steerRevision: 1 });
+    expect(state.attempts).toHaveLength(2);
+    expect(state.attempts.map((attempt) => attempt.status)).toEqual(["steered", "queued"]);
+  });
+
+  it("does not stall a multi-hour task while its exact Trigger heartbeat remains fresh", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-21T12:00:00Z"));
+    const f = await specialistFixture();
+    await f.t.run(async (ctx) => {
+      const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", f.jobId)).first();
+      await ctx.db.patch(runtime!._id, { progressAt: Date.now() - 3 * 60 * 60_000, heartbeatAt: Date.now() - 1_000 });
+    });
+    expect(await f.t.mutation(api.jobs.reapStale, { workerToken: WORKER })).toMatchObject({ stalled: [], requeued: [] });
+    expect((await rows(f.t)).jobs[0].status).toBe("running");
+  });
+
   it("commits one specialist receipt, replays response loss, and never creates another specialist execution", async () => {
     const f = await specialistFixture();
     expect(await f.t.mutation(api.jobs.markVerifiedForDelivery, f.commitArgs)).toBe(true);

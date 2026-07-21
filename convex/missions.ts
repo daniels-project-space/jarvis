@@ -3,6 +3,7 @@ import { v } from "convex/values";
 import { requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { normalizeWorkModelTier } from "../src/lib/work-models";
 import { insertMissionWithRuntime, patchMissionWithRuntime, runtimeMission } from "./controlPlane";
+import { classifyFleetHealth } from "../src/lib/fleet-health";
 
 const SYNTHESIS_LEASE_MS = 20 * 60 * 1000;
 
@@ -21,6 +22,7 @@ function synthesisPayload(mission: any, jobs: any[], attempt: number) {
 }
 
 function missionJobActivity(job: any) {
+  const now = Date.now();
   return {
     _id: job.jobId,
     label: job.label ?? job.task.slice(0, 50),
@@ -37,6 +39,21 @@ function missionJobActivity(job: any) {
     goalWave: job.goalWave ?? 0,
     readonly: Boolean(job.readonly),
     dependsOn: job.dependsOn ?? [],
+    parentGoal: job.missionId ?? null,
+    currentActivity: classifyFleetHealth(job, now),
+    heartbeatAt: job.heartbeatAt ?? null,
+    heartbeatFresh: Number(job.heartbeatAt ?? 0) >= now - 5 * 60_000,
+    sourceBranch: job.sourceBranch ?? null,
+    sourceHeadSha: job.sourceHeadSha ?? null,
+    workerBranch: job.workerBranch ?? null,
+    workspaceLineage: job.workspaceLineage ?? null,
+    retryLineage: job.retryLineage ?? null,
+    retryReason: job.stallReason ?? null,
+    integrationState: job.integrationState ?? "not_applicable",
+    evidenceSummary: job.evidenceSummary ?? null,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt ?? null,
+    completedAt: job.completedAt ?? null,
     branch: job.branch ?? null,
     pullRequestUrl: job.pullRequestUrl ?? null,
     verificationNote: null,
@@ -145,6 +162,12 @@ export const active = query({
         maxRevisionWaves: m.maxRevisionWaves ?? 0,
         maxBuildSessions: m.maxBuildSessions ?? 0,
         sharedBranch: null,
+        sourceBranch: m.sourceBranch ?? null,
+        integrationBranch: m.integrationBranch ?? null,
+        integrationHeadSha: m.integrationHeadSha ?? null,
+        integrationGeneration: m.integrationGeneration ?? 0,
+        activeIntegrationAttemptId: m.activeIntegrationAttemptId ?? null,
+        integrationLeaseUntil: m.integrationLeaseUntil ?? null,
         pausedPhase: m.pausedPhase ?? null,
         externalKind: m.externalKind ?? null,
         externalRunId: m.externalRunId ?? null,

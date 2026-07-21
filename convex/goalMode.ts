@@ -23,6 +23,7 @@ import {
   runtimeJob,
 } from "./controlPlane";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
+import { validateWorkDag, workItemIdentity } from "../src/lib/workspace-protocol";
 
 const ADVANCE_LEASE_MS = 10 * 60 * 1000;
 const COORDINATOR_RECEIPT_FRESH_MS = 10 * 60 * 1000;
@@ -48,6 +49,9 @@ type GoalJobInput = {
   dependsOn?: string[];
   maxAttempts?: number;
   branch?: string;
+  sourceBranch?: string;
+  sourceHeadSha?: string;
+  integrationBranch?: string;
   goalStage: "planning" | "building" | "validating" | "refining";
   goalWorkstreamId?: string;
   goalWave: number;
@@ -168,6 +172,25 @@ async function insertGoalJob(ctx: any, input: GoalJobInput) {
     maxAttempts: Math.max(1, Math.min(48, input.maxAttempts ?? 24)),
     nextRunAt: approvalRequired ? undefined : now,
     createdAt: now,
+  });
+  const identity = workItemIdentity({
+    missionId: input.missionId,
+    jobId: String(jobId),
+    workstreamId: input.goalWorkstreamId,
+    readonly: Boolean(input.readonly || !repo),
+  });
+  const inserted: any = await ctx.db.get(jobId);
+  if (inserted) await patchJobWithRuntime(ctx, inserted, {
+    sourceBranch: input.sourceBranch,
+    sourceHeadSha: input.sourceHeadSha,
+    integrationBranch: input.integrationBranch,
+    workerBranch: identity.workerBranch,
+    workspaceLineage: identity.workspaceLineage,
+    retryLineage: identity.retryLineage,
+    // Writable jobs own only their worker ref. A read-only validator may be
+    // explicitly pinned to the immutable integration branch supplied above.
+    branch: identity.workerBranch ?? input.branch,
+    integrationState: identity.workerBranch ? "awaiting_review" : "not_applicable",
   });
   await ctx.db.insert("workEvents", {
     jobId: String(jobId),
@@ -298,7 +321,11 @@ export const create = mutation({
       goalWave: 0,
     });
     const mission = await ctx.db.get(missionId);
-    if (mission) await patchMissionWithRuntime(ctx, mission, { planningJobId: String(plannerJobId) });
+    if (mission) await patchMissionWithRuntime(ctx, mission, {
+      planningJobId: String(plannerJobId),
+      integrationBranch: route.primaryRepo ? goalBranch(goal, String(missionId)) : undefined,
+      integrationGeneration: 0,
+    });
     await recordMissionEvent(ctx, String(missionId), "goal_started", "Goal Mode started with a Sol/max planning session", "planning", 3, {
       route: route.kind,
       primaryRepo: route.primaryRepo,
@@ -313,6 +340,20 @@ function activeStageJobs(jobs: any[], mission: any) {
   const stage = mission.phase === "refining" ? "refining" : "building";
   const wave = Number(mission.revisionWave ?? 0);
   return jobs.filter((job) => job.goalStage === stage && Number(job.goalWave ?? 0) === wave);
+}
+
+async function hasTerminalReviewedOutcomes(ctx: any, jobs: any[]) {
+  for (const job of jobs) {
+    if (job.status !== "done" || job.verificationVerdict !== "pass") return false;
+    if (job.readonly || !job.repo) continue;
+    if (!job.reviewReceiptId || !job.integrationAttemptId) return false;
+    const integration: any = await ctx.db.get(job.integrationAttemptId);
+    if (!integration || integration.jobId !== job._id || !integration.terminalReceiptDigest) return false;
+    if (integration.status === "integrated") {
+      if (integration.providerObservedHeadSha !== integration.preparedIntegrationHeadSha) return false;
+    } else if (!["conflict", "stale"].includes(integration.status) || !integration.repairJobId) return false;
+  }
+  return true;
 }
 
 async function validatorAuditSnapshot(ctx: any, mission: any, jobs: any[]): Promise<string> {
@@ -433,7 +474,7 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
   // validates the external run and must not be pointed at a made-up Jarvis branch.
   const branch = mission.externalRunId
     ? undefined
-    : mission.sharedBranch || missionBranch(mission, mission.primaryRepo);
+    : mission.integrationBranch || mission.sharedBranch || missionBranch(mission, mission.primaryRepo);
   const task = await validatorTaskForMission(ctx, mission, jobs);
   const validatorJobId = await insertGoalJob(ctx, {
     task,
@@ -455,6 +496,9 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
     ],
     modelReason: "Goal Mode reserves Sol/max for skeptical end-to-end validation and refinement planning",
     branch,
+    sourceBranch: branch,
+    sourceHeadSha: mission.integrationHeadSha,
+    integrationBranch: branch,
     maxAttempts: 16,
     goalStage: "validating",
     goalWorkstreamId: `validation-${Number(mission.revisionWave ?? 0)}`,
@@ -590,6 +634,10 @@ export const claimAdvance = mutation({
           return { kind: "advanced", missionId: mission._id, phase: "blocked" };
         }
         if (authoritativeState.state !== "complete") continue;
+        // Completion text is not authority. The validator is pinned only
+        // after every leaf has a reviewed terminal result and every writable
+        // receipt has an exact terminal integration observation.
+        if (!await hasTerminalReviewedOutcomes(ctx, phaseJobs)) continue;
         await enqueueValidator(ctx, mission, jobs);
         return { kind: "advanced", missionId: mission._id, phase: "validating" };
       }
@@ -651,6 +699,7 @@ export const recordPlan = mutation({
     if (!Array.isArray(plan?.workstreams) || plan.workstreams.length < 2 || plan.workstreams.length > (mission.maxBuildSessions ?? 6)) {
       throw new Error("Goal plan workstream budget is invalid");
     }
+    validateWorkDag(plan.workstreams, Math.min(8, Number(mission.maxBuildSessions ?? 6)));
     const now = Date.now();
     if (mission.route === "app_factory") {
       if (!args.externalRun?.id) throw new Error("App Factory route requires a live factory run");
@@ -675,18 +724,16 @@ export const recordPlan = mutation({
       return { advanced: true, external: true, jobs: 0 };
     }
 
-    const branch = missionBranch(mission, mission.primaryRepo ?? plan.primaryRepo);
+    const integrationBranch = mission.integrationBranch || missionBranch(mission, mission.primaryRepo ?? plan.primaryRepo);
     const workstreamJobs = new Map<string, string>();
-    const lastWritableByRepo = new Map<string, string>();
     let waitingApprovals = 0;
     for (const stream of plan.workstreams) {
       const repo = stream.repo || mission.primaryRepo || plan.primaryRepo;
       const dependencies = stream.dependsOn
         .map((id) => workstreamJobs.get(id))
         .filter((id): id is string => Boolean(id));
-      if (!stream.readonly && repo) {
-        const prior = lastWritableByRepo.get(repo);
-        if (prior && !dependencies.includes(prior)) dependencies.push(prior);
+      if (dependencies.length !== stream.dependsOn.length) {
+        throw new Error(`Goal plan workstream ${stream.id} is not in validated topological order`);
       }
       const task = [
         stream.task,
@@ -713,7 +760,8 @@ export const recordPlan = mutation({
         acceptanceCriteria: stream.acceptanceCriteria,
         modelReason: "Goal Mode builder sessions use Terra/high for maximum implementation per token",
         dependsOn: dependencies,
-        branch: !stream.readonly && repo ? branch : undefined,
+        sourceBranch: repo ? integrationBranch : undefined,
+        integrationBranch: repo ? integrationBranch : undefined,
         maxAttempts: 24,
         goalStage: "building",
         goalWorkstreamId: stream.id,
@@ -722,14 +770,15 @@ export const recordPlan = mutation({
       const row: any = await ctx.db.get(id);
       if (row?.status === "awaiting_approval") waitingApprovals += 1;
       workstreamJobs.set(stream.id, String(id));
-      if (!stream.readonly && repo) lastWritableByRepo.set(repo, String(id));
     }
     await patchMissionWithRuntime(ctx, mission, {
       plan,
       phase: "building",
       percent: 12,
       primaryRepo: mission.primaryRepo ?? plan.primaryRepo,
-      sharedBranch: branch,
+      sharedBranch: undefined,
+      integrationBranch,
+      integrationGeneration: 0,
       agentCount: 1 + workstreamJobs.size,
       advanceLeaseUntil: undefined,
       updatedAt: now,
@@ -737,7 +786,7 @@ export const recordPlan = mutation({
     await resolveGoalAttention(ctx, args.id);
     await recordMissionEvent(ctx, String(args.id), "goal_plan_ready", `Sol plan accepted; ${workstreamJobs.size} Terra/high sessions queued`, "building", 12, {
       waitingApprovals,
-      branch,
+      integrationBranch,
     });
     return { advanced: true, external: false, jobs: workstreamJobs.size, waitingApprovals };
   },
@@ -819,15 +868,14 @@ export const releaseAdvance = mutation({
 });
 
 async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefinement[], wave: number) {
-  const branch = mission.sharedBranch || missionBranch(mission, mission.primaryRepo);
-  let previous: string | undefined;
+  const integrationBranch = mission.integrationBranch || mission.sharedBranch || missionBranch(mission, mission.primaryRepo);
   const ids: string[] = [];
   for (const refinement of refinements.slice(0, 3)) {
     const id = await insertGoalJob(ctx, {
       task: [
         refinement.task,
         `Goal Mode outcome: ${mission.goal}`,
-        `Final validator gap from wave ${wave - 1}: close only this gap, preserve the shared branch, run the relevant checks, and report exact evidence for the next Sol validation.`,
+        `Final validator gap from wave ${wave - 1}: close only this gap on your isolated worker branch, run the relevant checks, and report exact evidence for controller integration and the next Sol validation.`,
       ].join("\n\n"),
       policyTask: refinement.task,
       missionId: String(mission._id),
@@ -843,14 +891,13 @@ async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefin
       priority: 96,
       acceptanceCriteria: refinement.acceptanceCriteria,
       modelReason: "Goal Mode uses a bounded Terra/high repair wave before another Sol validation",
-      dependsOn: previous ? [previous] : undefined,
-      branch,
+      sourceBranch: integrationBranch,
+      integrationBranch,
       maxAttempts: 20,
       goalStage: "refining",
       goalWorkstreamId: refinement.id,
       goalWave: wave,
     });
-    previous = String(id);
     ids.push(String(id));
   }
   return ids;
@@ -1438,6 +1485,33 @@ export const recordExternalPollFailure = mutation({
 async function resetGoalJob(ctx: any, job: any, now: number, force = false) {
   if (!force && !["error", "cancelled", "paused"].includes(job.status)) return false;
   if (job.status === "running") return false;
+  if (job.verificationVerdict === "pass" && job.reviewReceiptId && job.integrationAttemptId) {
+    const integration: any = await ctx.db.get(job.integrationAttemptId);
+    if (!integration || ["integrated", "cancelled", "exhausted"].includes(integration.status)) return false;
+    const prior: any = job.activeDeliveryAttemptId ? await ctx.db.get(job.activeDeliveryAttemptId) : null;
+    if (!prior) return false;
+    const generation = Number(job.deliveryGeneration ?? prior.generation ?? 1) + 1;
+    const nextId = await ctx.db.insert("deliveryAttempts", {
+      jobId: job._id, integrationAttemptId: job.integrationAttemptId,
+      sourceWorkAttempt: job.attempt ?? 1, generation, policy: "mission_integration",
+      status: "checkpointed", parentDeliveryAttemptId: prior._id,
+      reviewReceiptId: prior.reviewReceiptId, reviewReceiptDigest: prior.reviewReceiptDigest,
+      reviewKeyId: prior.reviewKeyId, reviewLineage: prior.reviewLineage,
+      reviewedHeadSha: prior.reviewedHeadSha, reviewedBaseSha: prior.reviewedBaseSha,
+      reviewedHeadTreeSha: prior.reviewedHeadTreeSha, reviewedDiffSha256: prior.reviewedDiffSha256,
+      heartbeatAt: now, retries: 0, cumulativeRetries: Number(prior.cumulativeRetries ?? 0),
+      currentStep: "queued", retryReason: "mission resumed", createdAt: now, updatedAt: now,
+    });
+    await ctx.db.patch(prior._id, { status: "abandoned", completedAt: now, leaseUntil: undefined, updatedAt: now });
+    await patchJobWithRuntime(ctx, job, {
+      status: "pending", stage: "delivery", progress: "reviewed integration receipt resumed",
+      nextRunAt: now, activeDeliveryAttemptId: nextId, deliveryGeneration: generation,
+      dispatchId: undefined, dispatchLeaseUntil: undefined, workerRunId: undefined, deliveryRunId: undefined,
+      deliveryLeaseOwner: undefined, deliveryLeaseToken: undefined, deliveryLeaseUntil: undefined,
+      integrationState: "retry_due", completedAt: undefined, heartbeatAt: now,
+    });
+    return true;
+  }
   const nextAttempt = Number(job.attempt ?? 1) + 1;
   const awaitingApproval = job.approvalRequired === true && job.approvalStatus !== "approved";
   const priorResult = String(job.result ?? "").trim();
@@ -1501,7 +1575,20 @@ export const control = mutation({
     let externalControl: "pause" | "resume" | "retry" | null = null;
     if (args.action === "pause" && mission.status === "running") {
       if (mission.externalRunId && mission.externalStatus !== "shipped") externalControl = "pause";
-      await patchMissionWithRuntime(ctx, mission, { status: "paused", pausedPhase: mission.phase, phase: "paused", updatedAt: now });
+      await patchMissionWithRuntime(ctx, mission, {
+        status: "paused", pausedPhase: mission.phase, phase: "paused",
+        activeIntegrationAttemptId: undefined, integrationLeaseOwner: undefined,
+        integrationLeaseToken: undefined, integrationLeaseUntil: undefined, updatedAt: now,
+      });
+      if (mission.activeIntegrationAttemptId) {
+        const integration: any = await ctx.db.get(mission.activeIntegrationAttemptId);
+        if (integration && !["integrated", "conflict", "stale", "cancelled", "exhausted"].includes(integration.status)) {
+          await ctx.db.patch(integration._id, {
+            status: integration.preparedEffectId ? "prepared" : "queued",
+            leaseUntil: undefined, retryReason: "paused by mission control", updatedAt: now,
+          });
+        }
+      }
       for (const job of jobs) {
         if (shouldPauseGoalJob(job.status)) {
           await patchJobWithRuntime(ctx, job, {
@@ -1634,12 +1721,26 @@ export const control = mutation({
       await patchMissionWithRuntime(ctx, mission, {
         status: "cancelled",
         phase: "cancelled",
+        activeIntegrationAttemptId: undefined,
+        integrationLeaseOwner: undefined,
+        integrationLeaseToken: undefined,
+        integrationLeaseUntil: undefined,
         externalRevisionRequested: undefined,
         externalRevisionWave: undefined,
         externalRevisionUpdatedAt: now,
         completedAt: now,
         updatedAt: now,
       });
+      const integrations = await ctx.db.query("integrationAttempts")
+        .withIndex("by_mission_generation", (q: any) => q.eq("missionId", mission._id)).take(100);
+      for (const integration of integrations) {
+        if (!["integrated", "conflict", "stale", "cancelled", "exhausted"].includes(integration.status)) {
+          await ctx.db.patch(integration._id, {
+            status: "cancelled", outcome: "cancelled", leaseUntil: undefined,
+            terminalReceiptDigest: integration.reviewReceiptDigest, completedAt: now, updatedAt: now,
+          });
+        }
+      }
       for (const job of jobs) {
         if (!TERMINAL.has(job.status)) {
           await patchJobWithRuntime(ctx, job, { status: "cancelled", stage: "cancelled", progress: "Goal Mode cancelled by Daniel", completedAt: now, nextRunAt: undefined });
