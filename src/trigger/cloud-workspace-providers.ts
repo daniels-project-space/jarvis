@@ -1,8 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { Writable } from "node:stream";
 import type { Sandbox as E2BSandbox } from "e2b";
 import type { Client as Sandbox0Client, Sandbox as Sandbox0Sandbox } from "sandbox0";
-import type { Command as VercelCommand, Sandbox as VercelSandbox } from "@vercel/sandbox";
+import type { Command as VercelCommand, Sandbox as VercelSandbox, Session as VercelSession } from "@vercel/sandbox";
 import {
   CloudWorkspaceError,
   DEFAULT_WORKSPACE_LIMITS,
@@ -405,6 +404,8 @@ class Sandbox0CloudWorkspaceProvider extends ProviderBase {
 
 const VERCEL_SAFE_TTL_MS = 44 * 60_000;
 const VERCEL_NPM_POLICY = Object.freeze({ allow: ["registry.npmjs.org"] });
+/** Must never exceed the durable Trigger agent-worker fleet concurrency (8). */
+export const VERCEL_ACTIVE_SANDBOX_CAP = 8;
 const VERCEL_NAME_PREFIX = "jarvis";
 
 function vercelWorkspaceName(attemptKey: string): string {
@@ -419,6 +420,16 @@ function vercelCwd(workspace: CloudWorkspace, cwd: string | undefined): string {
     throw new CloudWorkspaceError("vercel", "unsafe_archive", "command cwd escapes the workspace root", "rejected");
   }
   return value;
+}
+
+function vercelAbsolutePath(workspace: CloudWorkspace, value: string): string {
+  if (value === workspace.root || value.startsWith(`${workspace.root}/`)) return value;
+  return safeWorkspacePath(workspace, value);
+}
+
+function decodeOutput(value: Buffer): string {
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(value); }
+  catch { throw new CloudWorkspaceError("vercel", "unsafe_patch", "sandbox emitted invalid UTF-8 output", "rejected"); }
 }
 
 function packageLockUsesOnlyNpmRegistry(bytes: Uint8Array): boolean {
@@ -462,6 +473,14 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
 
   async createWorkspace(input: { attemptKey: string; template: string; runtime: string; lockfileDigest: string; limits: WorkspaceLimits }) {
     const { Sandbox } = await import("@vercel/sandbox");
+    const listed = await Sandbox.list({ ...this.credentials(), namePrefix: VERCEL_NAME_PREFIX });
+    let active = 0;
+    for await (const item of listed) {
+      if (["pending", "running", "stopping"].includes(item.status)) active += 1;
+      if (active >= VERCEL_ACTIVE_SANDBOX_CAP) {
+        throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox controller active-attempt cap is reached", "deferred");
+      }
+    }
     const sandbox = await Sandbox.create({
       ...this.credentials(),
       name: vercelWorkspaceName(input.attemptKey),
@@ -491,97 +510,98 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
   async exec(workspace: CloudWorkspace, request: ExecRequest): Promise<ExecResult> {
     const sandbox = await this.get(workspace);
     const session = this.assertSession(workspace, sandbox);
-    if (request.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
-    const startedAt = Date.now();
-    let stdout = "";
-    let stderr = "";
-    let limitError: CloudWorkspaceError | null = null;
-    const append = (stream: "stdout" | "stderr", chunk: Buffer | string) => {
-      const next = (stream === "stdout" ? stdout : stderr) + chunk.toString();
-      try {
-        const bounded = outputLimit(next, request.maxOutputBytes, this.name);
-        if (stream === "stdout") stdout = bounded; else stderr = bounded;
-      } catch (error) { limitError = error as CloudWorkspaceError; }
-    };
-    const output = (stream: "stdout" | "stderr") => new Writable({ write(chunk, _encoding, callback) { append(stream, chunk); callback(); } });
-    let command: VercelCommand | undefined;
-    const kill = () => { if (command && "kill" in command) void command.kill("SIGKILL").catch(() => undefined); };
-    request.signal?.addEventListener("abort", kill, { once: true });
-    try {
-      command = await session.runCommand({
-        cmd: "sh", args: ["-lc", request.command], cwd: vercelCwd(workspace, request.cwd), env: {},
-        detached: true, timeoutMs: request.timeoutMs, stdout: output("stdout"), stderr: output("stderr"),
-      });
-      const poll = setInterval(() => { if (limitError || request.signal?.aborted) kill(); }, 20);
-      let finished;
-      try { finished = await command.wait(); } finally { clearInterval(poll); }
-      if (request.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
-      if (limitError) throw limitError;
-      this.assertSession(workspace, sandbox);
-      return { exitCode: finished.exitCode, stdout, stderr, providerSessionId: workspace.providerSessionId, durationMs: Date.now() - startedAt };
-    } catch (error) {
-      kill();
-      if (request.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
-      throw error;
-    } finally { request.signal?.removeEventListener("abort", kill); }
+    const result = await this.runSessionCommand(workspace, sandbox, session, {
+      command: request.command, cwd: vercelCwd(workspace, request.cwd), timeoutMs: request.timeoutMs,
+      maxOutputBytes: request.maxOutputBytes, signal: request.signal,
+    });
+    return { exitCode: result.exitCode, stdout: decodeOutput(result.stdout), stderr: decodeOutput(result.stderr), providerSessionId: workspace.providerSessionId, durationMs: result.durationMs };
   }
 
   async readFile(workspace: CloudWorkspace, path: string, maxBytes: number) { return this.readAbsolute(workspace, safeWorkspacePath(workspace, path), maxBytes); }
   protected async readAbsolute(workspace: CloudWorkspace, path: string, maxBytes: number) {
-    const sandbox = await this.get(workspace); this.assertSession(workspace, sandbox);
-    const bytes = await sandbox.fs.readFile(path);
-    if (bytes.byteLength > maxBytes) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds read limit", "rejected");
-    this.assertSession(workspace, sandbox); return Uint8Array.from(bytes);
+    const sandbox = await this.get(workspace); const session = this.assertSession(workspace, sandbox);
+    const absolute = vercelAbsolutePath(workspace, path);
+    await this.assertNoSymlink(workspace, sandbox, session, absolute, false);
+    const stream = await session.readFile({ path: absolute });
+    if (!stream) throw new CloudWorkspaceError(this.name, "provider_unavailable", "sandbox file is missing", "deferred");
+    const chunks: Buffer[] = []; let used = 0;
+    try {
+      for await (const value of stream) {
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        if (chunk.byteLength > maxBytes - used) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds read limit", "rejected");
+        chunks.push(chunk); used += chunk.byteLength;
+      }
+    } finally { (stream as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.(); }
+    this.assertSession(workspace, sandbox); return new Uint8Array(Buffer.concat(chunks, used));
   }
   async writeFile(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) { return this.writeAbsolute(workspace, safeWorkspacePath(workspace, path), data, maxBytes); }
   protected async writeAbsolute(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) {
     if (data.byteLength > maxBytes) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds write limit", "rejected");
-    const sandbox = await this.get(workspace); this.assertSession(workspace, sandbox);
-    await sandbox.fs.writeFile(path, data); this.assertSession(workspace, sandbox);
+    const sandbox = await this.get(workspace); const session = this.assertSession(workspace, sandbox);
+    const absolute = vercelAbsolutePath(workspace, path);
+    await this.assertNoSymlink(workspace, sandbox, session, absolute, true);
+    await session.writeFiles([{ path: absolute, content: data }]); this.assertSession(workspace, sandbox);
   }
   async listFiles(workspace: CloudWorkspace, path: string, maxEntries: number) {
-    const sandbox = await this.get(workspace); this.assertSession(workspace, sandbox);
-    const base = safeWorkspacePath(workspace, path);
-    const entries = await sandbox.fs.readdir(base, { withFileTypes: true });
-    if (entries.length > maxEntries) throw new CloudWorkspaceError(this.name, "resource_limit", "file listing exceeds limit", "rejected");
-    for (const entry of entries) {
-      const stat = await sandbox.fs.lstat(`${base}/${entry.name}`);
-      if (entry.isSymbolicLink() || stat.isSymbolicLink()) throw new CloudWorkspaceError(this.name, "unsafe_archive", "symlink encountered during bounded listing", "rejected");
-    }
-    this.assertSession(workspace, sandbox); return entries.map((entry) => entry.name);
+    if (!Number.isSafeInteger(maxEntries) || maxEntries < 0) throw new CloudWorkspaceError(this.name, "resource_limit", "file listing limit is invalid", "rejected");
+    const sandbox = await this.get(workspace); const session = this.assertSession(workspace, sandbox);
+    const base = vercelAbsolutePath(workspace, path);
+    await this.assertNoSymlink(workspace, sandbox, session, base, false);
+    const script = [
+      `base=${shellQuote(base)}`,
+      `count=$(find -P -- "$base" -mindepth 1 -maxdepth 1 -printf . | wc -c)`,
+      `[ "$count" -le ${maxEntries} ] || exit 42`,
+      `find -P -- "$base" -mindepth 1 -maxdepth 1 -exec sh -c 'for entry do [ ! -L "$entry" ] || exit 43; stat -c %F -- "$entry" | grep -qx "symbolic link" && exit 43; done' sh {} +`,
+      `find -P -- "$base" -mindepth 1 -maxdepth 1 -printf '%f\\0'`,
+    ].join("; ");
+    const result = await this.runSessionCommand(workspace, sandbox, session, { command: script, cwd: workspace.root, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs, maxOutputBytes: Math.max(1_024, Math.min(DEFAULT_WORKSPACE_LIMITS.maxOutputBytes, maxEntries * 512)) });
+    if (result.exitCode === 42) throw new CloudWorkspaceError(this.name, "resource_limit", "file listing exceeds limit", "rejected");
+    if (result.exitCode === 43) throw new CloudWorkspaceError(this.name, "unsafe_archive", "symlink encountered during bounded listing", "rejected");
+    if (result.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "sandbox file listing failed", "deferred");
+    const names = result.stdout.subarray(0, result.stdout.byteLength && result.stdout[result.stdout.byteLength - 1] === 0 ? -1 : result.stdout.byteLength).toString("utf8").split("\0").filter(Boolean);
+    if (names.length > maxEntries || names.some((name) => validateRelativePath(name, this.name) !== name)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "sandbox listing contains an unsafe entry", "rejected");
+    this.assertSession(workspace, sandbox); return names;
   }
 
   async hydrateDependencies(workspace: CloudWorkspace): Promise<void> {
     // Source has already been validated and uploaded. This parses only the
     // committed lockfile, opens one registry for one command, then relocks.
-    const sandbox = await this.get(workspace); this.assertSession(workspace, sandbox);
-    const hasLock = await sandbox.fs.exists(`${this.workspaceRoot}/package-lock.json`);
-    if (!hasLock) return;
-    const lock = await this.readAbsolute(workspace, `${this.workspaceRoot}/package-lock.json`, DEFAULT_WORKSPACE_LIMITS.maxFileBytes);
-    if (!packageLockUsesOnlyNpmRegistry(lock)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "package lock contains a non-npm-registry dependency", "rejected");
     try {
-      await sandbox.updateNetworkPolicy(VERCEL_NPM_POLICY);
-      this.assertSession(workspace, sandbox);
-      const installed = await this.exec(workspace, { command: "npm ci --ignore-scripts --no-audit --fund=false && git reset --hard refs/jarvis/controller-base", cwd: this.workspaceRoot, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs, maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes });
+      const sandbox = await this.get(workspace); const session = this.assertSession(workspace, sandbox);
+      try {
+      const lockPath = `${this.workspaceRoot}/package-lock.json`;
+      // A missing lock means no egress. Verify its parent/final path without
+      // following a link before deciding whether there is anything to read.
+      await this.assertNoSymlink(workspace, sandbox, session, lockPath, true);
+      const exists = await this.runSessionCommand(workspace, sandbox, session, { command: `test -f ${shellQuote(lockPath)}`, cwd: this.workspaceRoot, timeoutMs: 10_000, maxOutputBytes: 4_000 });
+      if (exists.exitCode === 1) return;
+      if (exists.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "could not inspect committed package lock", "deferred");
+      const lock = await this.readAbsolute(workspace, lockPath, DEFAULT_WORKSPACE_LIMITS.maxFileBytes);
+      if (!packageLockUsesOnlyNpmRegistry(lock)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "package lock contains a non-npm-registry dependency", "rejected");
+      await session.update({ networkPolicy: VERCEL_NPM_POLICY }); this.assertSession(workspace, sandbox);
+      const installed = await this.runSessionCommand(workspace, sandbox, session, {
+        command: "npm ci --ignore-scripts --no-audit --no-fund --cache /vercel/sandbox/.jarvis-npm-cache && git reset --hard refs/jarvis/controller-base && git clean -ffdX -e node_modules && git clean -ffd -e node_modules && rm -rf -- /vercel/sandbox/.jarvis-npm-cache",
+        cwd: this.workspaceRoot, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs, maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes,
+      });
       if (installed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "deterministic dependency hydration failed", "deferred");
-    } finally {
-      await sandbox.updateNetworkPolicy("deny-all");
+      } finally {
+        await session.update({ networkPolicy: "deny-all" });
+      }
+      this.assertSession(workspace, sandbox);
+      if (session.networkPolicy !== "deny-all") throw new CloudWorkspaceError(this.name, "provider_unavailable", "dependency hydration did not relock deny-all egress", "blocked");
+      const denied = await this.exec(workspace, { command: "node -e 'fetch(\"https://example.com\",{signal:AbortSignal.timeout(3000)}).then(()=>process.exit(9),()=>process.exit(0))'", cwd: this.workspaceRoot, timeoutMs: 8_000, maxOutputBytes: 4_000 });
+      if (denied.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "deny-all network verification failed after dependency hydration", "blocked");
+    } catch (error) {
+      await this.terminate(workspace).catch(() => undefined);
+      throw error;
     }
-    this.assertSession(workspace, sandbox);
-    if (sandbox.networkPolicy !== "deny-all" || sandbox.currentSession().networkPolicy !== "deny-all") throw new CloudWorkspaceError(this.name, "provider_unavailable", "dependency hydration did not relock deny-all egress", "blocked");
-    const denied = await this.exec(workspace, { command: "node -e 'fetch(\"https://example.com\",{signal:AbortSignal.timeout(3000)}).then(()=>process.exit(9),()=>process.exit(0))'", cwd: this.workspaceRoot, timeoutMs: 8_000, maxOutputBytes: 4_000 });
-    if (denied.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "deny-all network verification failed after dependency hydration", "blocked");
   }
 
   async terminate(workspace: CloudWorkspace) {
     try {
       const sandbox = await this.get(workspace);
-      // Never resume during cleanup. A changed session is an attempt fence
-      // violation, but deletion of the exact named sandbox is still safe.
-      const session = sandbox.currentSession();
-      if (session.sessionId !== workspace.providerSessionId && session.status === "running") {
-        throw new CloudWorkspaceError(this.name, "stale_attempt", "Vercel Sandbox session changed before cleanup", "deferred");
-      }
+      // Cleanup owns only the random attempt name. It must never start a
+      // session, and a substituted/stopped session cannot block deletion.
       await sandbox.delete();
     } catch (error) {
       if (this.absent(error)) return;
@@ -604,6 +624,97 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       throw new CloudWorkspaceError(this.name, "stale_attempt", "Vercel Sandbox session changed or stopped for this attempt", "deferred");
     }
     return session;
+  }
+
+  private async assertNoSymlink(workspace: CloudWorkspace, sandbox: VercelSandbox, session: VercelSession, path: string, writing: boolean): Promise<void> {
+    if (path !== workspace.root && !path.startsWith(`${workspace.root}/`)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "sandbox path escapes the workspace root", "rejected");
+    const parent = path.slice(0, path.lastIndexOf("/")) || "/";
+    const check = writing
+      ? `[ "$(realpath -e -- ${shellQuote(parent)})" = ${shellQuote(parent)} ] && { [ ! -e ${shellQuote(path)} ] || [ ! -L ${shellQuote(path)} ]; }`
+      : `[ "$(realpath -e -- ${shellQuote(path)})" = ${shellQuote(path)} ] && [ ! -L ${shellQuote(path)} ]`;
+    const result = await this.runSessionCommand(workspace, sandbox, session, { command: check, cwd: workspace.root, timeoutMs: 10_000, maxOutputBytes: 4_000 });
+    if (result.exitCode !== 0) throw new CloudWorkspaceError(this.name, "unsafe_archive", "sandbox path is missing, symlinked, or escapes the workspace root", "rejected");
+  }
+
+  private async runSessionCommand(
+    workspace: CloudWorkspace, sandbox: VercelSandbox, session: VercelSession,
+    request: { command: string; cwd: string; timeoutMs: number; maxOutputBytes: number; signal?: AbortSignal },
+  ): Promise<{ exitCode: number; stdout: Buffer; stderr: Buffer; durationMs: number }> {
+    this.assertSession(workspace, sandbox);
+    if (request.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
+    const startedAt = Date.now();
+    let command: VercelCommand | undefined;
+    let reason: "cancelled" | "timeout" | "resource_limit" | undefined;
+    let termination: Promise<void> | undefined;
+    const logAbort = new AbortController();
+    const stdout: Buffer[] = []; const stderr: Buffer[] = []; let bytes = 0; let stdoutBytes = 0; let stderrBytes = 0;
+    const append = (stream: "stdout" | "stderr", data: string) => {
+      const chunk = Buffer.from(data); const remaining = request.maxOutputBytes - bytes;
+      if (chunk.byteLength > remaining) {
+        if (remaining > 0) {
+          (stream === "stdout" ? stdout : stderr).push(chunk.subarray(0, remaining));
+          if (stream === "stdout") stdoutBytes += remaining; else stderrBytes += remaining;
+        }
+        bytes += Math.max(remaining, 0); reason = "resource_limit"; return;
+      }
+      (stream === "stdout" ? stdout : stderr).push(chunk);
+      if (stream === "stdout") stdoutBytes += chunk.byteLength; else stderrBytes += chunk.byteLength;
+      bytes += chunk.byteLength;
+    };
+    const killAndObserve = async () => {
+      if (!command) return;
+      await command.kill("SIGKILL");
+      await command.wait().catch(() => undefined);
+    };
+    const cancel = () => { if (!reason) reason = "cancelled"; logAbort.abort(); if (command) termination ??= killAndObserve(); };
+    request.signal?.addEventListener("abort", cancel, { once: true });
+    const timeout = setTimeout(() => { if (!reason) reason = "timeout"; logAbort.abort(); if (command) termination ??= killAndObserve(); }, Math.max(1, request.timeoutMs));
+    try {
+      // Do not pass stdout/stderr: SDK 2.8 starts an unowned log iterator for
+      // detached commands when those conveniences are supplied.
+      const creating = session.runCommand({ cmd: "sh", args: ["-lc", request.command], cwd: request.cwd, env: {}, detached: true, timeoutMs: request.timeoutMs });
+      const abortDuringCreate = new Promise<"aborted">((resolve) => {
+        if (request.signal?.aborted) resolve("aborted"); else request.signal?.addEventListener("abort", () => resolve("aborted"), { once: true });
+      });
+      const first = await Promise.race([creating.then((value) => ({ value })), abortDuringCreate]);
+      if (first === "aborted") {
+        // A create request may have crossed the provider boundary. Delete the
+        // exact random name before returning; if it later resolves, deletion
+        // has already removed any possible remote process.
+        await this.terminate(workspace).catch(() => undefined);
+        void creating.then(async (late) => { await late.kill("SIGKILL").catch(() => undefined); }).catch(() => undefined);
+        throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled while creation was in flight", "deferred");
+      }
+      command = first.value;
+      if (reason) termination ??= killAndObserve();
+      const iterator = command.logs({ signal: logAbort.signal });
+      const consume = (async () => {
+        try {
+          for await (const log of iterator) {
+            append(log.stream, log.data);
+            if (reason === "resource_limit") { logAbort.abort(); termination ??= killAndObserve(); await termination; break; }
+          }
+        } catch (error) { if (!reason) throw error; }
+        finally { iterator.close(); }
+      })();
+      const finished = await command.wait();
+      await consume;
+      if (reason) { termination ??= killAndObserve(); await termination; throw new CloudWorkspaceError(this.name, reason, reason === "timeout" ? "sandbox command timed out" : reason === "resource_limit" ? "sandbox command output exceeded its byte limit" : "command cancelled", reason === "resource_limit" ? "rejected" : "deferred"); }
+      this.assertSession(workspace, sandbox);
+      return { exitCode: finished.exitCode, stdout: Buffer.concat(stdout, stdoutBytes), stderr: Buffer.concat(stderr, stderrBytes), durationMs: Date.now() - startedAt };
+    } catch (error) {
+      if (command) {
+        try { await killAndObserve(); }
+        catch {
+          await this.terminate(workspace).catch(() => undefined);
+          throw new CloudWorkspaceError(this.name, "provider_unavailable", "could not prove exact command termination", "blocked");
+        }
+      }
+      if (request.signal?.aborted && !(error instanceof CloudWorkspaceError)) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
+      throw error;
+    } finally {
+      clearTimeout(timeout); logAbort.abort(); request.signal?.removeEventListener("abort", cancel);
+    }
   }
 }
 

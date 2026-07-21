@@ -14,6 +14,7 @@ import {
   type CloudWorkspace,
 } from "../src/trigger/cloud-workspace";
 import { configuredCloudWorkspaceProviderForLiveProbe } from "../src/trigger/cloud-workspace-providers";
+import { VERCEL_ACTIVE_SANDBOX_CAP } from "../src/trigger/cloud-workspace-providers";
 import {
   cloudWorkspaceCancellationProbeRemote,
   issueAfterExactRemoteCancellation,
@@ -90,6 +91,34 @@ async function inspectSandbox0Configuration(workspace: CloudWorkspace, templateI
   return { ttlMs, observedMemory };
 }
 
+async function inspectVercelConfiguration(workspace: CloudWorkspace): Promise<never> {
+  const { Sandbox } = await import("@vercel/sandbox");
+  const credentials = { token: process.env.VERCEL_TOKEN!, teamId: process.env.VERCEL_TEAM_ID!, projectId: process.env.VERCEL_PROJECT_ID! };
+  // This is deliberately a fresh, no-resume observation rather than cached
+  // adapter metadata. A stopped or substituted session is not proof.
+  const detail = await Sandbox.get({ ...credentials, name: workspace.providerWorkspaceId, resume: false });
+  const session = detail.currentSession();
+  if (detail.name !== workspace.providerWorkspaceId || session.sessionId !== workspace.providerSessionId || session.status !== "running") {
+    throw new Error("exact Vercel Sandbox name/session observation changed");
+  }
+  if (detail.runtime !== "node22" || detail.vcpus !== 2 || detail.memory !== 4096 || detail.routes.length !== 0
+    || detail.persistent !== false || detail.networkPolicy !== "deny-all" || session.networkPolicy !== "deny-all"
+    || !detail.expiresAt || detail.expiresAt.getTime() <= Date.now() || detail.expiresAt.getTime() - detail.createdAt.getTime() > 44 * 60_000) {
+    throw new Error("Vercel runtime, private ingress, deny policy, persistence, or TTL observation failed");
+  }
+  const listed = await Sandbox.list({ ...credentials, namePrefix: "jarvis" });
+  let active = 0; let named = false;
+  for await (const item of listed) {
+    if (item.name === workspace.providerWorkspaceId && item.currentSessionId === workspace.providerSessionId) named = true;
+    if (["pending", "running", "stopping"].includes(item.status)) active += 1;
+    if (active > VERCEL_ACTIVE_SANDBOX_CAP) throw new Error("Vercel project-scoped controller active-sandbox cap was exceeded");
+  }
+  if (!named) throw new Error("exact named Vercel Sandbox was absent from provider list observation");
+  // The Sandbox API does not expose authoritative team/project plan or spend
+  // caps. Never turn configuration/defaults into quota proof.
+  throw new Error("Vercel plan and spend-cap state is not authoritatively observable; activation remains blocked pending Daniel's compliant-plan and spend-cap decision");
+}
+
 async function main() {
   if (process.env.JARVIS_CLOUD_PROVIDER_PROBE !== "live") blocked(`real live opt-in is required (${LIVE_OPT_IN})`);
   if (!configuredCredentialAvailable(process.env)) blocked("a safe scoped credential for the selected provider is unavailable");
@@ -121,7 +150,7 @@ async function main() {
     });
     const providerObservation = binding.provider === "sandbox0"
       ? await inspectSandbox0Configuration(first, binding.template.identity, binding.template.digest)
-      : { ttlMs: DEFAULT_WORKSPACE_LIMITS.ttlMs, observedMemory: DEFAULT_WORKSPACE_LIMITS.memoryMb };
+      : await inspectVercelConfiguration(first);
 
     const bytes = probeArchive();
     await provider.uploadCredentiallessArchive(first, { baseSha: "0".repeat(40), sha256: sha256Bytes(bytes), bytes });
