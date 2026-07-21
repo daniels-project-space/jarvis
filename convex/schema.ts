@@ -561,6 +561,18 @@ export default defineSchema({
     updatedAt: v.number(),
   }).index("by_key", ["key"]),
 
+  // One-time bounded cursor for assigning indexed ownership to legacy
+  // proactive attention rows. The recurring reconciler never falls back to a
+  // whole-table scan while this rollout is incomplete.
+  attentionAuthorityMigrations: defineTable({
+    key: v.string(),
+    cursor: v.optional(v.string()),
+    complete: v.boolean(),
+    scanned: v.number(),
+    repaired: v.number(),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
+
   // Opaque, revocable browser sessions for Daniel. The raw bearer token only
   // exists in an HttpOnly cookie; Convex stores its SHA-256 digest. Privileged
   // user mutations require a live digest, while Trigger uses a separate
@@ -1071,12 +1083,14 @@ export default defineSchema({
     urgency: v.number(),
     confidence: v.number(),
     actionClass: v.string(), // inform | ask | propose | safe-auto-fix
+    authority: v.optional(v.string()),
     status: v.string(), // open | working | resolved | dismissed
     jobId: v.optional(v.string()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_status", ["status", "updatedAt"])
+    .index("by_authority_status", ["authority", "status", "updatedAt"])
     .index("by_fingerprint", ["fingerprint"])
     .index("by_jobId", ["jobId"])
     .index("by_updatedAt", ["updatedAt"]),
@@ -1139,6 +1153,7 @@ export default defineSchema({
     updatedAt: v.number(),
   })
     .index("by_status", ["status", "updatedAt"])
+    .index("by_updatedAt", ["updatedAt"])
     .index("by_signature", ["signature"]),
 
   // Everything JARVIS creates (mind maps, charts, images, PDFs, docs) lives
