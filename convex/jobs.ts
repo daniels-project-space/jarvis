@@ -1251,6 +1251,76 @@ export const finalize = mutation({
   },
 });
 
+export const JOB_LIST_COMPATIBILITY_MAX = 12;
+export const JOB_LIST_COMPATIBILITY_DEFAULT = 8;
+
+export function boundedJobListLimit(value: number | undefined): number {
+  if (!Number.isFinite(value) || !Number.isInteger(value) || Number(value) <= 0) {
+    return JOB_LIST_COMPATIBILITY_DEFAULT;
+  }
+  return Math.min(JOB_LIST_COMPATIBILITY_MAX, Number(value));
+}
+
+function compactMonitorRow(row: any) {
+  if (!row) return null;
+  return {
+    jobId: row.jobId,
+    status: String(row.status),
+    attempt: Math.max(1, Number(row.attempt ?? 1)),
+    stage: String(row.stage ?? row.status).slice(0, 80),
+    percent: Math.max(0, Math.min(100, Number(row.percent ?? 0))),
+    progress: redactSensitiveText(String(row.progress ?? "")).slice(0, 160),
+    sourceBranch: row.sourceBranch ?? null,
+    sourceHeadSha: row.sourceHeadSha ?? null,
+    integrationBranch: row.integrationBranch ?? null,
+    workerBranch: row.workerBranch ?? null,
+    branch: row.branch ?? null,
+    mergeCommitSha: row.mergeCommitSha ?? null,
+  };
+}
+
+// First-class supervision for one known job. The by_job index is unique by
+// projection invariant and the result cannot carry durable task/log/checkpoint
+// payloads or provider credentials.
+export const monitor = query({
+  args: { jobId: v.id("jobs"), ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return compactMonitorRow(await jobRuntimeFor(ctx, a.jobId));
+  },
+});
+
+// Lazy drill-down remains an exact compact projection read. Realtime log bytes
+// are separately authorized and scoped to the exact Trigger run.
+export const detail = query({
+  args: { jobId: v.id("jobs"), ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    const row = await jobRuntimeFor(ctx, a.jobId);
+    if (!row) return null;
+    return {
+      ...compactMonitorRow(row),
+      label: String(row.label ?? "Agent work").slice(0, 80),
+      agentId: row.agentId ?? null,
+      repo: row.repo ?? null,
+      progressAt: row.progressAt ?? null,
+      model: row.model ? normalizeWorkModelTier(row.model) : null,
+      reasoningEffort: row.reasoningEffort ?? null,
+      workerRuntime: row.workerRuntime ?? null,
+      workerRunId: row.workerRunId ?? null,
+      generation: Number(row.deliveryGeneration ?? row.goalWave ?? 0),
+      maxAttempts: Math.max(1, Number(row.maxAttempts ?? 1)),
+      integrationState: row.integrationState ?? null,
+      deliveryStatus: row.deliveryStatus ?? null,
+      startedAt: row.startedAt ?? null,
+      stallReason: redactSensitiveText(String(row.stallReason ?? "")).slice(0, 180) || null,
+    };
+  },
+});
+
+// Compatibility/briefing summary only. The sole repository caller counts
+// statuses, so no task, progress, branch, checkpoint, or credential-adjacent
+// fields are read back to the caller.
 export const list = query({
   args: { limit: v.optional(v.number()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
@@ -1259,11 +1329,8 @@ export const list = query({
       .query("jobRuntime")
       .withIndex("by_createdAt")
       .order("desc")
-      .take(Math.min(a.limit ?? 20, 100));
-    return rows.map((row: any) => ({
-      ...runtimeJob(row),
-      model: row.model ? normalizeWorkModelTier(row.model) : undefined,
-    }));
+      .take(boundedJobListLimit(a.limit));
+    return rows.map((row: any) => ({ _id: row.jobId, status: row.status }));
   },
 });
 
@@ -1875,7 +1942,7 @@ export const bindWorkspaceSource = mutation({
 export const bindCloudWorkspace = mutation({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
-    providerName: v.union(v.literal("e2b"), v.literal("daytona"), v.literal("sandbox0"), v.literal("cloudflare")),
+    providerName: v.union(v.literal("e2b"), v.literal("sandbox0"), v.literal("cloudflare")),
     providerWorkspaceId: v.string(), providerSessionId: v.string(), workerToken: v.optional(v.string()),
     baseSha: v.string(), runtime: v.string(), lockfileDigest: v.string(), template: v.string(),
     sourceArchiveDigest: v.string(), sourceArchiveBytes: v.number(),
@@ -2004,7 +2071,7 @@ export const recordCloudCheckpoint = mutation({
 export const cloudCheckpointForReplay = query({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
-    providerName: v.union(v.literal("e2b"), v.literal("daytona"), v.literal("sandbox0"), v.literal("cloudflare")),
+    providerName: v.union(v.literal("e2b"), v.literal("sandbox0"), v.literal("cloudflare")),
     baseSha: v.string(), runtime: v.string(), lockfileDigest: v.string(), template: v.string(),
     sourceArchiveDigest: v.string(), sourceArchiveBytes: v.number(), workerToken: v.optional(v.string()),
   },
@@ -2138,11 +2205,27 @@ export const noteCloudWorkspaceCleanupBlocked = mutation({
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (!attempt || attempt.providerWorkspaceId !== a.providerWorkspaceId
       || attempt.providerSessionId !== a.providerSessionId || attempt.providerTerminatedAt) return false;
+    const now = Date.now();
+    const reason = redactSensitiveText(a.reason).slice(0, 500);
     await ctx.db.patch(attempt._id, {
       cleanupBlockedCode: a.code.slice(0, 80),
-      cleanupBlockedReason: redactSensitiveText(a.reason).slice(0, 500),
-      cleanupBlockedAt: Date.now(), lastEventAt: Date.now(),
+      cleanupBlockedReason: reason,
+      cleanupBlockedAt: now, lastEventAt: now,
     });
+    const fingerprint = `cloud-cleanup-blocked:${String(a.jobId)}:${a.expectedAttempt}:${a.providerWorkspaceId.slice(0, 80)}`;
+    const existing = await ctx.db.query("attentionItems")
+      .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", fingerprint)).first();
+    const item = {
+      fingerprint,
+      title: `Cloud workspace cleanup blocked · ${String(attempt.providerName ?? "historical provider")}`.slice(0, 140),
+      detail: reason,
+      evidence: [`Job ${String(a.jobId)}`, `Attempt ${a.expectedAttempt}`, `Code ${a.code.slice(0, 80)}`],
+      severity: "warning", impact: 70, urgency: 55, confidence: 1,
+      actionClass: "ask", authority: "provider-cleanup", status: "open",
+      jobId: String(a.jobId), updatedAt: now,
+    };
+    if (existing) await ctx.db.patch(existing._id, item);
+    else await ctx.db.insert("attentionItems", { ...item, createdAt: now });
     return true;
   },
 });

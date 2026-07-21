@@ -1,7 +1,18 @@
 "use client";
 import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import * as THREE from "three";
-import { advanceOrbPhase, frameDamping, orbCycleSeconds, type OrbMotionFrame, type OrbState } from "@/lib/orb-motion";
+import {
+  advanceOrbMotionFrame,
+  createOrbMotionFrame,
+  createOrbParticleField,
+  createSeededRandom,
+  deriveOrbVisual,
+  frameDamping,
+  sampleOrbTimestamp,
+  type OrbMotionFrame,
+  type OrbState,
+} from "@/lib/orb-motion";
+import { OrbRuntimeController, safeOrbSize } from "@/lib/orb-runtime";
 
 // Particle-network orb — adapted from ethanplusai/jarvis (frontend/src/orb.ts),
 // free for personal use: https://github.com/ethanplusai/jarvis
@@ -52,6 +63,13 @@ export default function ThreeOrb({
   reduceMotion?: boolean;
 }) {
   const [webglUnavailable, setWebglUnavailable] = useState(false);
+  const fallbackContainerRef = useRef<HTMLDivElement>(null);
+  const fallbackSvgRef = useRef<SVGSVGElement>(null);
+  const fallbackFirstStopRef = useRef<SVGStopElement>(null);
+  const fallbackMiddleStopRef = useRef<SVGStopElement>(null);
+  const fallbackLastStopRef = useRef<SVGStopElement>(null);
+  const fallbackLinksRef = useRef<SVGGElement>(null);
+  const fallbackParticlesRef = useRef<SVGGElement>(null);
   const moodRef = useRef<string | undefined>(moodColor);
   useEffect(() => {
     moodRef.current = moodColor;
@@ -65,22 +83,76 @@ export default function ThreeOrb({
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+  const reduceMotionRef = useRef(reduceMotion);
+  useEffect(() => {
+    reduceMotionRef.current = reduceMotion;
+  }, [reduceMotion]);
 
   useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
     let destroyed = false;
     const compact = window.matchMedia("(max-width: 767px)").matches;
-    const reducedMotion = reduceMotion || window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const reducedMotionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const reducedMotion = () => reduceMotionRef.current || reducedMotionQuery.matches;
     // This is a decorative surface, not a simulation benchmark. The former
     // 1,400-particle desktop mesh repeatedly monopolised the main thread while
     // JARVIS was trying to caption/speak. A denser shader cannot compensate
     // for dropped input frames, so keep a rich cloud inside a strict frame
     // budget instead.
-    const N = reducedMotion ? 160 : compact ? 260 : 420;
-    const CONNECTION_SAMPLE = reducedMotion ? 40 : compact ? 68 : 96;
-    const W = () => mount.clientWidth || 1;
-    const H = () => mount.clientHeight || 1;
+    const N = reducedMotion() ? 160 : compact ? 260 : 420;
+    const CONNECTION_SAMPLE = reducedMotion() ? 40 : compact ? 68 : 96;
+    const size = () => safeOrbSize(mount.clientWidth, mount.clientHeight);
+    const W = () => size().width;
+    const H = () => size().height;
+    const runtime = new OrbRuntimeController(
+      (callback) => window.requestAnimationFrame(callback),
+      (handle) => window.cancelAnimationFrame(handle),
+      (mode) => queueMicrotask(() => {
+        if (!destroyed) setWebglUnavailable(mode !== "webgl");
+      }),
+    );
+    let motionFrame = { ...(motionRef?.current ?? createOrbMotionFrame(moodRef.current)) };
+    let previousTimestamp = performance.now();
+    let smoothEnergy = 0;
+    let lastRenderedAt = 0;
+
+    const paintFallback = () => {
+      const visual = deriveOrbVisual(motionFrame, reducedMotion());
+      if (fallbackContainerRef.current) {
+        fallbackContainerRef.current.style.transform = `translateX(${visual.translateXPercent}%)`;
+        fallbackContainerRef.current.style.opacity = String(0.52 + visual.intensity * 0.48);
+      }
+      if (fallbackSvgRef.current) {
+        fallbackSvgRef.current.style.transform = `rotate(${visual.rotation}rad) scale(${visual.scale})`;
+        fallbackSvgRef.current.style.color = visual.color;
+        fallbackSvgRef.current.style.filter = `drop-shadow(0 0 ${12 + visual.intensity * 12}px ${visual.color}66)`;
+      }
+      fallbackFirstStopRef.current?.setAttribute("stop-color", visual.color);
+      fallbackMiddleStopRef.current?.setAttribute("stop-color", visual.accent);
+      fallbackLastStopRef.current?.setAttribute("stop-color", visual.color);
+      fallbackLinksRef.current?.setAttribute("stroke-opacity", String(0.12 + visual.intensity * 0.18));
+      fallbackParticlesRef.current?.setAttribute("fill-opacity", String(0.55 + visual.intensity * 0.4));
+    };
+
+    const stepMotion = (timestamp: number) => {
+      const timing = sampleOrbTimestamp(previousTimestamp, timestamp);
+      previousTimestamp = timing.timestampMs;
+      const rawEnergy = Math.max(0, Math.min(1, energyRef?.current ?? 0));
+      smoothEnergy += (rawEnergy - smoothEnergy) * frameDamping(17.25, timing.physicsSeconds);
+      motionFrame = advanceOrbMotionFrame(motionFrame, {
+        state: stateRef.current,
+        motionSeconds: timing.motionSeconds,
+        easingSeconds: timing.physicsSeconds,
+        moodColor: moodRef.current,
+        aside: asideRef.current && W() >= 768,
+        energy: smoothEnergy,
+        reduceMotion: reducedMotion(),
+      });
+      if (motionRef) Object.assign(motionRef.current, motionFrame);
+      if (runtime.mode !== "webgl") paintFallback();
+      return { timing, visual: deriveOrbVisual(motionFrame, reducedMotion()), energy: smoothEnergy };
+    };
 
     let renderer: THREE.WebGLRenderer;
     try {
@@ -89,48 +161,17 @@ export default function ThreeOrb({
       // WebGL can be unavailable after a driver reset, inside a remote browser,
       // or on battery-constrained devices. The orb is decoration: it must never
       // be allowed to take the work surface down with it.
-      queueMicrotask(() => {
-        if (!destroyed) setWebglUnavailable(true);
+      runtime.useFallback();
+      runtime.start((timestamp) => {
+        if (document.hidden) return;
+        const slowFrame = reducedMotion() || stateRef.current === "idle";
+        if (timestamp - lastRenderedAt < (reducedMotion() ? 80 : slowFrame ? 33 : 21)) return;
+        lastRenderedAt = timestamp;
+        stepMotion(timestamp);
       });
-      const fallbackColor = new THREE.Color(moodRef.current ?? "#00ff88");
-      const fallbackTarget = new THREE.Color(fallbackColor);
-      const fallbackWhite = new THREE.Color(0xffffff);
-      const fallbackAccent = new THREE.Color(fallbackColor).lerp(fallbackWhite, 0.34);
-      let phase = motionRef?.current.phase ?? 0;
-      let elapsedSeconds = motionRef?.current.elapsedSeconds ?? 0;
-      let cycle = motionRef?.current.cycleSeconds ?? orbCycleSeconds("idle");
-      let asideAmount = motionRef?.current.aside ?? 0;
-      let previous = performance.now();
-      let fallbackFrame = 0;
-      const animateFallback = (now: number) => {
-        if (destroyed) return;
-        const delta = Math.min(0.25, Math.max(1 / 240, (now - previous) / 1000));
-        previous = now;
-        const currentState = stateRef.current;
-        cycle += (orbCycleSeconds(currentState) - cycle) * frameDamping(2.2, delta);
-        if (!reducedMotion) phase = advanceOrbPhase(phase, cycle, delta);
-        elapsedSeconds += delta;
-        asideAmount += ((asideRef.current && W() >= 768 ? 1 : 0) - asideAmount) * frameDamping(3.08, delta);
-        fallbackTarget.set(moodRef.current ?? "#00ff88");
-        if (currentState === "thinking") fallbackTarget.lerp(fallbackWhite, 0.3);
-        else if (currentState === "speaking") fallbackTarget.lerp(fallbackWhite, 0.15);
-        fallbackColor.lerp(fallbackTarget, frameDamping(1.8, delta));
-        fallbackAccent.copy(fallbackColor).lerp(fallbackWhite, 0.34);
-        if (motionRef) {
-          motionRef.current.phase = phase;
-          motionRef.current.elapsedSeconds = elapsedSeconds;
-          motionRef.current.cycleSeconds = cycle;
-          motionRef.current.color = `#${fallbackColor.getHexString()}`;
-          motionRef.current.accent = `#${fallbackAccent.getHexString()}`;
-          motionRef.current.intensity = currentState === "idle" ? 0.5 : 0.72;
-          motionRef.current.aside = asideAmount;
-        }
-        fallbackFrame = requestAnimationFrame(animateFallback);
-      };
-      fallbackFrame = requestAnimationFrame(animateFallback);
       return () => {
         destroyed = true;
-        cancelAnimationFrame(fallbackFrame);
+        runtime.dispose();
       };
     }
     queueMicrotask(() => {
@@ -139,16 +180,16 @@ export default function ThreeOrb({
     renderer.setPixelRatio(1);
     renderer.setSize(W(), H());
     renderer.setClearColor(0x000000, 0);
-    mount.appendChild(renderer.domElement);
+    runtime.mountCanvas(mount, renderer.domElement);
     const onContextLost = (event: Event) => {
       event.preventDefault();
-      if (!destroyed) setWebglUnavailable(true);
+      runtime.useFallback();
     };
     const onContextRestored = () => {
-      if (!destroyed) setWebglUnavailable(false);
+      runtime.contextRestored();
     };
-    renderer.domElement.addEventListener("webglcontextlost", onContextLost);
-    renderer.domElement.addEventListener("webglcontextrestored", onContextRestored);
+    runtime.listen(renderer.domElement, "webglcontextlost", onContextLost);
+    runtime.listen(renderer.domElement, "webglcontextrestored", onContextRestored);
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(45, W() / H(), 1, 1000);
@@ -156,18 +197,11 @@ export default function ThreeOrb({
 
     // ── Particles ──
     const geo = new THREE.BufferGeometry();
-    const pos = new Float32Array(N * 3);
+    const field = createOrbParticleField(N);
+    const pos = field.positions;
     const vel = new Float32Array(N * 3);
-    const phase = new Float32Array(N);
-    for (let i = 0; i < N; i++) {
-      const theta = Math.random() * Math.PI * 2;
-      const phi = Math.acos(2 * Math.random() - 1);
-      const r = Math.pow(Math.random(), 0.5) * 25;
-      pos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
-      pos[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
-      pos[i * 3 + 2] = r * Math.cos(phi);
-      phase[i] = Math.random() * 1000;
-    }
+    const phase = field.phases;
+    const electronRandom = createSeededRandom(0x454c4543);
     geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
     const mat = new THREE.PointsMaterial({
       color: BASE, size: 0.4, transparent: true, opacity: 0.6,
@@ -212,85 +246,63 @@ export default function ThreeOrb({
     // ── State ──
     let targetRadius = 25, currentRadius = 25;
     let targetSpeed = 0.3, currentSpeed = 0.3;
-    let targetBright = 0.6, currentBright = 0.6;
     let targetSize = 0.4, currentSize = 0.4;
     let lineAmount = 0, targetLineAmount = 0;
     const lineDistance = 8;
-    let sharedPhase = motionRef?.current.phase ?? 0;
-    let sharedElapsed = motionRef?.current.elapsedSeconds ?? 0;
-    let currentCycle = motionRef?.current.cycleSeconds ?? orbCycleSeconds("idle");
     let cloudZ = 0, cloudZVel = 0;
-    let smoothEnergy = 0;
-    let asideAmt = motionRef?.current.aside ?? 0; // 0 = centre stage, 1 = tucked into the right strip
     let inViewport = true;
-    let frameId = 0;
-    let lastRenderedAt = 0;
     let lastConnectionAt = 0;
-
-    const clock = new THREE.Clock();
-    const moodBase = new THREE.Color(BASE);
-    const targetColor = new THREE.Color(BASE);
-    const targetAccent = new THREE.Color(BASE);
-    const white = new THREE.Color(0xffffff);
 
     function animate(frameTime = 0) {
       if (destroyed) return;
-      frameId = requestAnimationFrame(animate);
       if (document.hidden || !inViewport) return;
-      const slowFrame = reducedMotion || stateRef.current === "idle";
+      const slowFrame = reducedMotion() || stateRef.current === "idle";
       // Active states still get a smooth 48 fps, while an idle orb uses 30 fps
       // and reduced motion uses 12.5 fps. The browser remains responsive for
       // typing, captions and panel transitions in every case.
-      if (frameTime - lastRenderedAt < (reducedMotion ? 80 : slowFrame ? 33 : 21)) return;
+      if (frameTime - lastRenderedAt < (reducedMotion() ? 80 : slowFrame ? 33 : 21)) return;
       lastRenderedAt = frameTime;
-      const rawDelta = Math.max(1 / 240, clock.getDelta());
-      // Particle physics caps recovery steps after a stalled frame; shared
-      // phase uses the real visible-frame delta so ring/orb speed never varies
-      // with display refresh rate or a briefly busy main thread.
-      const delta = Math.min(0.05, rawDelta);
-      const motionDelta = Math.min(0.25, rawDelta);
+      const { timing, visual, energy: bass } = stepMotion(frameTime);
+      // Context loss uses this same timestamp authority and publisher, but
+      // never touches invalid WebGL resources. During restoration the fallback
+      // remains visible until the first successful renderer frame below.
+      if (runtime.mode === "fallback") return;
+      const delta = timing.physicsSeconds;
       const frameScale = delta * 60;
-      sharedElapsed += motionDelta;
-      const t = sharedElapsed;
+      const t = motionFrame.elapsedSeconds;
       const st = stateRef.current;
 
       switch (st) {
         case "idle":
-          targetRadius = 28; targetSpeed = 0.2; targetBright = 0.5; targetSize = 0.35;
+          targetRadius = 28; targetSpeed = 0.2; targetSize = 0.35;
           targetLineAmount = 0.15; targetElectronRate = 0; break;
         case "listening":
-          targetRadius = 22; targetSpeed = 0.3; targetBright = 0.65; targetSize = 0.4;
+          targetRadius = 22; targetSpeed = 0.3; targetSize = 0.4;
           targetLineAmount = 0.4; targetElectronRate = 0; break;
         case "thinking":
-          targetRadius = 16; targetSpeed = 0.5; targetBright = 0.7; targetSize = 0.3;
+          targetRadius = 16; targetSpeed = 0.5; targetSize = 0.3;
           targetLineAmount = 1.0; targetElectronRate = 0.015; break;
         case "speaking":
-          targetRadius = 18; targetSpeed = 0.2; targetBright = 0.7; targetSize = 0.4;
+          targetRadius = 18; targetSpeed = 0.2; targetSize = 0.4;
           targetLineAmount = 0.8; targetElectronRate = 0; break;
       }
 
       const stateFollow = frameDamping(1.22, delta);
       currentRadius += (targetRadius - currentRadius) * stateFollow;
       currentSpeed += (targetSpeed - currentSpeed) * stateFollow;
-      currentBright += (targetBright - currentBright) * stateFollow;
       currentSize += (targetSize - currentSize) * stateFollow;
       lineAmount += (targetLineAmount - lineAmount) * stateFollow;
       electronSpawnRate += (targetElectronRate - electronSpawnRate) * stateFollow;
-      currentCycle += (orbCycleSeconds(st) - currentCycle) * frameDamping(2.2, motionDelta);
-      sharedPhase = advanceOrbPhase(sharedPhase, currentCycle, motionDelta);
 
       // State changes already ease radius, speed, brightness and line density.
       // Rotation stays continuous so typing/speaking transitions cannot kick
       // the cloud into what looks like a random animation reset.
-      const spinX = sharedPhase * 0.17;
-      const spinY = sharedPhase;
-      const spinZ = sharedPhase * 0.09;
+      const spinX = visual.rotationX;
+      const spinY = visual.rotation;
+      const spinZ = visual.rotationZ;
 
       // our live voice-amplitude signal stands in for the upstream AnalyserNode
-      const raw = Math.max(0, Math.min(1, energyRef?.current ?? 0));
-      smoothEnergy += (raw - smoothEnergy) * frameDamping(17.25, delta);
-      const bass = smoothEnergy;
-      const mid = smoothEnergy * 0.8;
+      const mid = bass * 0.8;
 
       let zTarget = Math.sin(t * 0.12) * 8;
       if (st === "thinking") zTarget = Math.sin(t * 0.3) * 15 + Math.sin(t * 0.9) * 6;
@@ -300,12 +312,10 @@ export default function ThreeOrb({
       cloudZ += cloudZVel * frameScale;
 
       // glide toward/away from the side strip (desktop only — phones dim instead)
-      const wantAside = asideRef.current && W() >= 768 ? 1 : 0;
-      asideAmt += (wantAside - asideAmt) * frameDamping(3.08, delta);
       const halfW = Math.tan((45 * Math.PI) / 360) * 80 * (W() / H());
       // aside: hug the right edge as far as the panel sits on the left
-      const offsetX = halfW * 0.66 * asideAmt;
-      const shrink = 1 - 0.22 * asideAmt;
+      const offsetX = halfW * 0.66 * motionFrame.aside;
+      const shrink = visual.scale;
       // sit a touch higher so the bottom chat bar isn't crowding it
       const liftY = 3.2;
 
@@ -394,12 +404,12 @@ export default function ThreeOrb({
 
       if (activeConnections.length > 0 && electronSpawnRate > 0.005) {
         if (activeElectrons.length < 3 && t - lastElectronSpawn > 1.0) {
-          const conn = activeConnections[Math.floor(Math.random() * activeConnections.length)];
+          const conn = activeConnections[Math.floor(electronRandom() * activeConnections.length)];
           activeElectrons.push({
             sx: conn.x1, sy: conn.y1, sz: conn.z1,
             ex: conn.x2, ey: conn.y2, ez: conn.z2,
             t: 0,
-            speed: 0.003 + Math.random() * 0.003,
+            speed: 0.003 + electronRandom() * 0.003,
           });
           lastElectronSpawn = t;
         }
@@ -426,31 +436,13 @@ export default function ThreeOrb({
       electrons.position.set(offsetX, liftY, cloudZ);
       electrons.scale.setScalar(shrink);
 
-      mat.opacity = currentBright + bass * 0.08;
+      mat.opacity = visual.intensity;
       // Geometry already scales in aside mode. Scaling the point size as well
       // made the side-view core look half-sized twice.
       mat.size = currentSize + bass * 0.05;
-      // mood-aware palette: the whole orb drifts slowly into the conversation's
-      // colour and holds it; states tint from that base
-      moodBase.set(moodRef.current ?? "#00ff88");
-      targetColor.copy(moodBase);
-      if (st === "thinking") targetColor.lerp(white, 0.3);
-      else if (st === "speaking") targetColor.lerp(white, 0.15);
-      targetAccent.copy(targetColor).lerp(white, 0.34);
-      const colorFollow = frameDamping(1.8, delta);
-      mat.color.lerp(targetColor, colorFollow);
-      lineMat.color.lerp(targetAccent, colorFollow);
-      electronMat.color.lerp(targetAccent, colorFollow);
-
-      if (motionRef) {
-        motionRef.current.phase = sharedPhase;
-        motionRef.current.elapsedSeconds = sharedElapsed;
-        motionRef.current.cycleSeconds = currentCycle;
-        motionRef.current.color = `#${mat.color.getHexString()}`;
-        motionRef.current.accent = `#${lineMat.color.getHexString()}`;
-        motionRef.current.intensity = Math.min(1, currentBright + bass * 0.2);
-        motionRef.current.aside = asideAmt;
-      }
+      mat.color.set(visual.color);
+      lineMat.color.set(visual.accent);
+      electronMat.color.set(visual.accent);
 
       // gentle, slow camera breathing — calmed right down so the orb sits
       // steady instead of drifting all over (worse when it's small and aside),
@@ -461,28 +453,25 @@ export default function ThreeOrb({
       camera.position.y = Math.cos(t * 0.018) * 1.1;
       camera.lookAt(offsetX * 0.44, 0, cloudZ * 0.2);
       renderer.render(scene, camera);
+      runtime.webglFrameReady();
     }
 
     const onResize = () => {
-      camera.aspect = W() / H();
+      const next = size();
+      camera.aspect = next.aspect;
       camera.updateProjectionMatrix();
-      renderer.setSize(W(), H());
+      renderer.setSize(next.width, next.height);
     };
-    window.addEventListener("resize", onResize);
+    runtime.listen(window, "resize", onResize);
     const ro = new ResizeObserver(onResize);
     ro.observe(mount);
+    runtime.addCleanup(() => ro.disconnect());
     const io = new IntersectionObserver(([entry]) => {
       inViewport = entry.isIntersecting;
     });
     io.observe(mount);
-    frameId = requestAnimationFrame(animate);
-
-    return () => {
-      destroyed = true;
-      cancelAnimationFrame(frameId);
-      window.removeEventListener("resize", onResize);
-      ro.disconnect();
-      io.disconnect();
+    runtime.addCleanup(() => io.disconnect());
+    runtime.addCleanup(() => {
       renderer.dispose();
       geo.dispose();
       lineGeo.dispose();
@@ -490,31 +479,44 @@ export default function ThreeOrb({
       mat.dispose();
       lineMat.dispose();
       electronMat.dispose();
-      renderer.domElement.removeEventListener("webglcontextlost", onContextLost);
-      renderer.domElement.removeEventListener("webglcontextrestored", onContextRestored);
-      if (renderer.domElement.parentElement === mount) mount.removeChild(renderer.domElement);
+    });
+    onResize();
+    runtime.start(animate);
+
+    return () => {
+      destroyed = true;
+      runtime.dispose();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reduceMotion]);
+  }, []);
 
   return (
     <div ref={mountRef} className="relative h-full w-full">
       {webglUnavailable && (
         <div
+          ref={fallbackContainerRef}
           aria-label="JARVIS visual core"
-          className={`absolute inset-0 grid place-items-center will-change-transform transition-transform duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${aside ? "translate-x-[32%]" : "translate-x-0"}`}
+          className="absolute inset-0 grid place-items-center will-change-transform"
         >
           <svg
+            ref={fallbackSvgRef}
             viewBox="0 0 100 100"
-            className={`h-[min(54vw,360px)] w-[min(54vw,360px)] min-h-44 min-w-44 overflow-visible transition-transform duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${aside ? "scale-[0.78]" : "scale-100"} ${reduceMotion ? "" : "animate-spin"}`}
-            style={{ color: moodColor ?? "#00ff88", animationDuration: "28s", filter: `drop-shadow(0 0 18px ${moodColor ?? "#00ff88"}55)` }}
+            className="h-[min(54vw,360px)] w-[min(54vw,360px)] min-h-44 min-w-44 overflow-visible will-change-transform"
+            style={{ color: moodColor ?? "#00ff88", filter: `drop-shadow(0 0 18px ${moodColor ?? "#00ff88"}55)`, transformBox: "fill-box", transformOrigin: "center" }}
           >
-            <g stroke="currentColor" strokeWidth="0.18" strokeOpacity="0.2">
+            <defs>
+              <radialGradient id="jarvis-orb-fallback-gradient" cx="50%" cy="45%" r="58%">
+                <stop ref={fallbackFirstStopRef} offset="0" stopColor="#8affc5" />
+                <stop ref={fallbackMiddleStopRef} offset="0.52" stopColor="#00ff88" />
+                <stop ref={fallbackLastStopRef} offset="1" stopColor="#00ff88" stopOpacity="0.48" />
+              </radialGradient>
+            </defs>
+            <g ref={fallbackLinksRef} stroke="url(#jarvis-orb-fallback-gradient)" strokeWidth="0.18" strokeOpacity="0.2">
               {FALLBACK_LINKS.map((link, index) => (
                 <line key={index} x1={link.from.x} y1={link.from.y} x2={link.to.x} y2={link.to.y} />
               ))}
             </g>
-            <g fill="currentColor">
+            <g ref={fallbackParticlesRef} fill="url(#jarvis-orb-fallback-gradient)">
               {FALLBACK_PARTICLES.map((particle, index) => (
                 <circle key={index} cx={particle.x} cy={particle.y} r={particle.r} opacity={0.42 + (index % 5) * 0.1} />
               ))}

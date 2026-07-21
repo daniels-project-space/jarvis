@@ -12,7 +12,6 @@
     "probe:cloud-workspace-provider": "tsx scripts/probe-cloud-workspace-provider.ts"
   },
   "dependencies": {
-    "@daytona/sdk": "0.200.0",
     "@excalidraw/excalidraw": "^0.18.1",
     "@mastra/core": "^1.51.0",
     "@openai/codex": "0.144.5",

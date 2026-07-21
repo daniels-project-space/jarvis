@@ -1,4 +1,4 @@
-import { schedules, task, tasks } from "@trigger.dev/sdk/v3";
+import { metadata, schedules, task, tasks } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { ConvexClient } from "convex/browser";
@@ -15,7 +15,11 @@ import {
 } from "./subscription-runtime";
 import {
   FOREGROUND_CONCURRENCY,
+  FOREGROUND_ADMISSION_RESERVE_MS,
+  canClaimForegroundTurn,
+  FOREGROUND_HANDOFF_OVERLAP_MS,
   FOREGROUND_MAX_DURATION_SECONDS,
+  FOREGROUND_PROCESS_EXIT_RESERVE_MS,
   FOREGROUND_QUEUE,
   FOREGROUND_TURN_TIMEOUT_MS,
   type ForegroundTurnPayload,
@@ -43,11 +47,13 @@ function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = f
 
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
-// A runner remains active for almost twelve minutes. Nine minutes in, it boots
-// its successor while the current CLI stays available; the successor takes
-// over the Convex lease only after its app-server is fully initialised.
-const RUN_BUDGET_MS = 690_000;
-const HANDOFF_AFTER_MS = 540_000;
+// A normal foreground runner lives for just under four hours. Its successor
+// initializes during the final ten-minute overlap, but the Convex lease is
+// transferred only after the active owner has stopped admissions and released
+// it. The finite safety reserve leaves Trigger time to cancel and clean up.
+const RUN_BUDGET_MS = FOREGROUND_MAX_DURATION_SECONDS * 1_000 - FOREGROUND_PROCESS_EXIT_RESERVE_MS;
+const HANDOFF_AFTER_MS = RUN_BUDGET_MS - FOREGROUND_HANDOFF_OVERLAP_MS;
+const RUNNER_LEASE_MS = 25_000;
 
 async function convexCall(kind: "query" | "mutation", path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
@@ -114,13 +120,11 @@ type QueueClaim = {
   history: Array<{ role: string; text: string }>;
 };
 
-function conversationPreamble(contextBlock: string, userText: string) {
-  const visualDirective = visualInitiativeDirective(visibleTurnText(userText));
+function conversationPreamble() {
   return PERSONA +
-    `\n\n${CAPABILITIES}\n\n${INFRA_MAP}\n\nWhat you know right now:\n${contextBlock}\n\nCurrent date: ${new Date().toDateString()}.\n\n${REMEMBER}\n\n` +
+    `\n\n${CAPABILITIES}\n\n${INFRA_MAP}\n\n${REMEMBER}\n\n` +
     JARVIS_TOOL_INSTRUCTIONS + " " +
-    `Answer first and keep the default spoken reply to one concise sentence. Never narrate context, memory, shell commands, or tool plumbing.` +
-    (visualDirective ? `\n\n${visualDirective}` : "");
+    `Answer first and keep the default spoken reply to one concise sentence. Never narrate context, memory, shell commands, or tool plumbing.`;
 }
 
 async function runTurn(
@@ -131,20 +135,34 @@ async function runTurn(
   history: { role: string; text: string }[],
   contextBlock: string,
   model: string,
+  onStage?: (stage: "codexAck" | "firstDelta" | "firstConvexPaint") => void,
 ){
-  const publisher = new StreamPublisher((text, revision) =>
-    convexMutation("chatQueue:updateStream", { messageId: assistantId, text, revision }),
+  const publisher = new StreamPublisher(
+    (text, revision) => convexMutation("chatQueue:updateStream", { messageId: assistantId, text, revision }),
+    120,
+    () => onStage?.("firstConvexPaint"),
   );
   publisher.start();
   try {
+    const visualDirective = visualInitiativeDirective(visibleTurnText(userText));
+    const freshContext = `${contextBlock}\n\nCurrent date: ${new Date().toDateString()}.` +
+      (visualDirective ? `\n\n${visualDirective}` : "");
+    let sawDelta = false;
     const result = await server.runTurn({
       conversationId,
       userText,
       history,
-      contextBlock,
-      preamble: conversationPreamble(contextBlock, userText),
+      contextBlock: freshContext,
+      preamble: conversationPreamble(),
       modelTier: model,
-      onDelta: (delta) => publisher.push(delta),
+      onTurnStarted: () => onStage?.("codexAck"),
+      onDelta: (delta) => {
+        if (!sawDelta) {
+          sawDelta = true;
+          onStage?.("firstDelta");
+        }
+        publisher.push(delta);
+      },
     });
     return { ...result, sessionId: result.threadId };
   } finally {
@@ -152,6 +170,57 @@ async function runTurn(
     // when processChatQueue writes the final answer.
     await publisher.close();
   }
+}
+
+/**
+ * A handoff candidate uses Convex's realtime lease row instead of polling. It
+ * starts its Codex app-server before this wait; only the row's release (or one
+ * bounded stale-lease deadline) permits it to become the next owner.
+ */
+function waitForRunnerAvailability(
+  client: ConvexClient,
+  workerToken: string,
+  runnerId: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let staleTimer: ReturnType<typeof setTimeout> | null = null;
+    let unsubscribe = () => {};
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (staleTimer) clearTimeout(staleTimer);
+      clearTimeout(timeout);
+      unsubscribe();
+      resolve(value);
+    };
+    const tryClaim = () => {
+      void convexMutation("chatQueue:touchRunner", { runnerId })
+        .then((owned) => { if (owned) finish(true); })
+        .catch(() => undefined);
+    };
+    const observe = (lease: { updatedAt?: number } | null) => {
+      if (settled) return;
+      if (staleTimer) clearTimeout(staleTimer);
+      const age = lease?.updatedAt ? Date.now() - lease.updatedAt : RUNNER_LEASE_MS;
+      if (!lease || age >= RUNNER_LEASE_MS) {
+        tryClaim();
+        return;
+      }
+      // A crashed owner does not create a reactive write at expiry. This is a
+      // single stale-lease deadline, not a periodic polling loop.
+      staleTimer = setTimeout(tryClaim, Math.max(1, RUNNER_LEASE_MS - age + 25));
+    };
+    const timeout = setTimeout(() => finish(false), timeoutMs);
+    unsubscribe = client.onUpdate(
+      api.chatQueue.runnerLeaseForWorker,
+      { workerToken },
+      (lease) => observe(lease),
+      () => finish(false),
+    );
+    tryClaim();
+  });
 }
 
 // Stage 0 capture: a fast Luna pass extracts durable facts from the turn and
@@ -212,7 +281,7 @@ async function extractAndSave(
   return n;
 }
 
-async function processChatQueue(targetMessageId?: string, source = "conversation", handoffFrom?: string) {
+async function processChatQueue(targetMessageId?: string, source = "conversation") {
   // Foreground Jarvis is deliberately pinned to Daniel's ChatGPT subscription.
   // The old provider lookup now always returns Codex, so querying it added a
   // network round trip to every message without changing the selected brain.
@@ -232,18 +301,18 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
     dynamicTools: JARVIS_DYNAMIC_TOOLS,
     onDynamicToolCall: (call) => bridge.invoke(call),
   });
-  // A handoff candidate pays its startup cost before taking ownership. That
-  // removes the recurring cold gap that used to appear every few minutes.
+  const client = new ConvexClient(CONVEX_URL);
+  // A handoff candidate pays startup cost inside the bounded overlap, but
+  // never takes ownership from a still-serving runner.
   if (source === "warm-handoff") await server.start();
-  const ownsLease = await convexMutation("chatQueue:touchRunner", {
-    runnerId,
-    takeoverFrom: source === "warm-handoff" ? handoffFrom : undefined,
-  }) as boolean;
+  const ownsLease = source === "warm-handoff"
+    ? await waitForRunnerAvailability(client, workerToken, runnerId, FOREGROUND_HANDOFF_OVERLAP_MS + RUNNER_LEASE_MS)
+    : await convexMutation("chatQueue:touchRunner", { runnerId }) as boolean;
   if (!ownsLease) {
+    client.close();
     server.stop();
     return { processed: 0, warmRunner: true };
   }
-  const client = new ConvexClient(CONVEX_URL);
   let leaseActive = true;
   const leaseAbort = new AbortController();
   const heartbeat = setInterval(() => void convexMutation("chatQueue:touchRunner", { runnerId })
@@ -260,8 +329,8 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
     if (handoffStarted) return;
     handoffStarted = true;
     handoffPromise = tasks.trigger(
-      "jarvis-chat-turn",
-      { source: "warm-handoff", handoffFrom: runnerId },
+      "jarvis-chat-handoff",
+      { source: "warm-handoff" },
       { idempotencyKey: `jarvis-warm-${runnerId}` },
     ).catch(() => null);
   };
@@ -271,10 +340,12 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
   const timings: Array<{
     claimMs: number;
     contextMs: number;
-    modelMs: number;
+    codexAckMs?: number;
+    firstDeltaMs?: number;
+    firstConvexPaintMs?: number;
+    completionMs: number;
     finalizeMs: number;
     deliveredMs: number;
-    memoryMs: number;
   }> = [];
   let processed = 0;
   try {
@@ -282,6 +353,12 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
     // the always-available main Jarvis, separate from durable specialist work.
     await server.start();
   while (leaseActive && Date.now() - started < RUN_BUDGET_MS) {
+    // Never claim work we cannot truthfully finish and deliver. Leaving it
+    // pending makes it immediately eligible for the prewarmed successor.
+    if (!canClaimForegroundTurn(RUN_BUDGET_MS - (Date.now() - started))) {
+      startHandoff();
+      break;
+    }
     const claimStarted = Date.now();
     const claim = (targetMessageId
       ? await convexMutation("chatQueue:claimMessage", { messageId: targetMessageId })
@@ -289,7 +366,7 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
     const claimedAt = Date.now();
     if (!claim) {
       targetMessageId = undefined;
-      const remaining = RUN_BUDGET_MS - (Date.now() - started);
+      const remaining = RUN_BUDGET_MS - (Date.now() - started) - FOREGROUND_ADMISSION_RESERVE_MS;
       if (remaining <= 0 || !(await waitForPending(client, workerToken, remaining, leaseAbort.signal))) break;
       continue;
     }
@@ -299,6 +376,7 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
       const context = await buildContext(visibleUserText);
       const contextReadyAt = Date.now();
       const model = pickConversationTier(visibleUserText);
+      const stages: Partial<Record<"codexAck" | "firstDelta" | "firstConvexPaint", number>> = {};
       const turn = await runTurn(
         server,
         claim.threadId,
@@ -307,6 +385,7 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
         claim.history,
         context,
         model,
+        (stage) => { if (stages[stage] === undefined) stages[stage] = Date.now(); },
       );
       const modelFinishedAt = Date.now();
       const finalText =
@@ -329,15 +408,17 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
         userText: visibleUserText,
         assistantText: turn.finalText,
       }).catch(() => {});
-      const memoryFinishedAt = Date.now();
       timings.push({
         claimMs: claimedAt - claimStarted,
         contextMs: contextReadyAt - contextStarted,
-        modelMs: modelFinishedAt - contextReadyAt,
+        codexAckMs: stages.codexAck ? stages.codexAck - contextReadyAt : undefined,
+        firstDeltaMs: stages.firstDelta ? stages.firstDelta - contextReadyAt : undefined,
+        firstConvexPaintMs: stages.firstConvexPaint ? stages.firstConvexPaint - contextReadyAt : undefined,
+        completionMs: modelFinishedAt - contextReadyAt,
         finalizeMs: deliveredAt - finalizeStarted,
         deliveredMs: deliveredAt - claimStarted,
-        memoryMs: memoryFinishedAt - deliveredAt,
       });
+      if (timings.length > 12) timings.shift();
       processed += 1;
     } catch (error: unknown) {
       await convexMutation("chatQueue:finalize", {
@@ -351,11 +432,13 @@ async function processChatQueue(targetMessageId?: string, source = "conversation
     // and drain rapid follow-ups. Duplicate queued wake tasks become no-ops.
     targetMessageId = undefined;
   }
+    metadata.set("foregroundTiming", JSON.stringify({ turns: timings, runnerAgeMs: Date.now() - started }));
+    await metadata.flush();
     return { processed, timings };
   } finally {
     clearInterval(heartbeat);
     clearTimeout(handoffTimer);
-    startHandoff();
+    if (!handoffStarted && leaseActive) startHandoff();
     await handoffPromise;
     client.close();
     server.stop();
@@ -384,7 +467,18 @@ export const chatTurn = task({
   queue: { name: FOREGROUND_QUEUE, concurrencyLimit: FOREGROUND_CONCURRENCY },
   machine: "small-1x",
   maxDuration: FOREGROUND_MAX_DURATION_SECONDS,
-  run: async (payload: ForegroundTurnPayload) => processChatQueue(payload.messageId, payload.source, payload.handoffFrom),
+  run: async (payload: ForegroundTurnPayload) => processChatQueue(payload.messageId, payload.source),
+});
+
+// A separate, bounded queue permits a prewarmed successor to overlap its
+// owner without claiming a second foreground lease or doubling steady-state
+// compute. It is used only at a planned handoff, not per conversation turn.
+export const chatHandoff = task({
+  id: "jarvis-chat-handoff",
+  queue: { name: "jarvis-foreground-handoff", concurrencyLimit: 1 },
+  machine: "small-1x",
+  maxDuration: Math.ceil((FOREGROUND_HANDOFF_OVERLAP_MS + RUNNER_LEASE_MS) / 1_000) + 30,
+  run: async (payload: ForegroundTurnPayload) => processChatQueue(payload.messageId, "warm-handoff"),
 });
 
 // Recovery lane only: if an immediate trigger is lost between Vercel and

@@ -367,6 +367,8 @@ describe("fail-closed cloud workspace boundary", () => {
   it("routes orphan cleanup by persisted provider identity and reports absent exact-provider credentials", () => {
     expect(() => configuredCloudWorkspaceCleanupProvider({ JARVIS_CLOUD_WORKSPACE_PROVIDER: "sandbox0", SANDBOX0_TOKEN: "configured-elsewhere" }, "e2b"))
       .toThrow(expect.objectContaining({ provider: "e2b", code: "missing_configuration" }));
+    expect(() => configuredCloudWorkspaceCleanupProvider({ E2B_API_KEY: "must-not-fallback" }, "daytona"))
+      .toThrow(expect.objectContaining({ provider: "daytona", code: "cleanup_blocked" }));
     const runner = readFileSync(join(process.cwd(), "src/trigger/agent-runner.ts"), "utf8");
     expect(runner).toContain("configuredCloudWorkspaceCleanupProvider(process.env, providerName)");
     expect(runner).toContain("jobs:noteCloudWorkspaceCleanupBlocked");
@@ -375,10 +377,7 @@ describe("fail-closed cloud workspace boundary", () => {
 
   it("reports truthful provider capability failures instead of papering them over", () => {
     expect(CLOUD_WORKSPACE_CAPABILITY_MATRIX.e2b.boundedResources).toBe(false);
-    expect(CLOUD_WORKSPACE_CAPABILITY_MATRIX.daytona).toMatchObject({
-      boundedResources: false,
-      exactCommandCancellation: false,
-    });
+    expect(CLOUD_WORKSPACE_CAPABILITY_MATRIX).not.toHaveProperty("daytona");
     expect(Object.values(CLOUD_WORKSPACE_CAPABILITY_MATRIX.cloudflare).every((value) => value === false)).toBe(true);
     const e2b = configuredCloudWorkspaceCleanupProvider({ JARVIS_CLOUD_WORKSPACE_PROVIDER: "e2b", E2B_API_KEY: "test-only" });
     expect(Object.keys(e2b).sort()).toEqual(["name", "terminate"]);
@@ -417,6 +416,5 @@ describe("fail-closed cloud workspace boundary", () => {
   });
 
   it.skip("BLOCKED: real E2B lifecycle/quota probe requires a safe scoped credential and a template proving resource bounds", () => {});
-  it.skip("BLOCKED: real Daytona lifecycle/quota/snapshot/volume/secret probe requires safe scoped managed-cloud credentials", () => {});
   it.skip("BLOCKED: real Sandbox0 lifecycle/quota/rootfs/volume/network probe requires safe scoped beta credentials", () => {});
 });

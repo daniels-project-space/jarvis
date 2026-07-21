@@ -187,12 +187,11 @@ describe("single Edge neural speech queue", () => {
     await reply;
   });
 
-  it("retries one transient neural generation failure without changing engines", async () => {
+  it("makes one bounded neural generation attempt on a transport failure", async () => {
     failNextSynthesis = true;
-    const reply = speak("Recover the same neural voice once.", () => {});
-    await vi.waitFor(() => expect(FakeSource.instances).toHaveLength(1));
-    expect(synthesisCount).toBe(2);
-    FakeSource.instances[0].onended?.();
+    const reply = speak("Surface the single request failure.", () => {});
+    await vi.waitFor(() => expect(synthesisCount).toBe(1));
+    expect(FakeSource.instances).toHaveLength(0);
     await reply;
   });
 });

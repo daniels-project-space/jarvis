@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import type { Sandbox as E2BSandbox } from "e2b";
-import type { Daytona, Sandbox as DaytonaSandbox } from "@daytona/sdk";
 import type { Client as Sandbox0Client, Sandbox as Sandbox0Sandbox } from "sandbox0";
 import {
   CloudWorkspaceError,
@@ -17,6 +16,7 @@ import {
   type CloudWorkspaceCapabilities,
   type CloudWorkspaceProvider,
   type CloudWorkspaceProviderName,
+  type HistoricalCloudWorkspaceProviderName,
   type CredentiallessArchive,
   type ExecRequest,
   type ExecResult,
@@ -48,14 +48,6 @@ const CAPABILITIES: Record<CloudWorkspaceProviderName, CloudWorkspaceCapabilitie
     emptyEnvironment: true, boundedResources: false, boundedTtl: true,
     exactCommandCancellation: true, sameWorkspaceResume: true, portableCheckpointReplay: true,
     providerSnapshots: true, persistentVolumes: true, opaqueSecretProjection: false,
-  },
-  daytona: {
-    credentiallessArchive: true, privateIngress: true, networkDenyByDefault: true,
-    // Snapshot-based create in SDK 0.200.0 has no per-sandbox resources
-    // parameter, and deleting a process session is not an exact command kill.
-    emptyEnvironment: true, boundedResources: false, boundedTtl: true,
-    exactCommandCancellation: false, sameWorkspaceResume: true, portableCheckpointReplay: true,
-    providerSnapshots: true, persistentVolumes: true, opaqueSecretProjection: true,
   },
   sandbox0: {
     credentiallessArchive: true, privateIngress: true, networkDenyByDefault: true,
@@ -337,81 +329,6 @@ class E2BCloudWorkspaceProvider extends ProviderBase {
   }
 }
 
-class DaytonaCloudWorkspaceProvider extends ProviderBase {
-  readonly name = "daytona" as const;
-  readonly capabilities = CAPABILITIES.daytona;
-  private client?: Daytona;
-  private readonly sandboxes = new Map<string, DaytonaSandbox>();
-  constructor(private readonly apiKey: string, private readonly apiUrl?: string) { super(); }
-
-  async createWorkspace(input: { attemptKey: string; template: string; runtime: string; lockfileDigest: string; limits: WorkspaceLimits }) {
-    if (!this.apiKey) throw new CloudWorkspaceError(this.name, "missing_configuration", "DAYTONA_API_KEY is not configured");
-    const client = await this.getClient();
-    const sandbox = await client.create({
-      snapshot: input.template || undefined,
-      envVars: {}, public: false, networkBlockAll: true,
-      autoStopInterval: 10, autoArchiveInterval: 60, autoDeleteInterval: 120,
-      ttlMinutes: Math.max(1, Math.ceil(input.limits.ttlMs / 60_000)),
-      labels: { owner: "jarvis", attempt: input.attemptKey.slice(0, 80), lockfile: input.lockfileDigest.slice(0, 64) },
-    });
-    const sessionId = `jarvis-${randomUUID()}`;
-    await sandbox.process.createSession(sessionId);
-    const workspace = { provider: this.name, providerWorkspaceId: sandbox.id, providerSessionId: sessionId, root: ROOT, createdAt: Date.now() } satisfies CloudWorkspace;
-    assertWorkspaceIdentity(workspace);
-    this.sandboxes.set(sandbox.id, sandbox);
-    return workspace;
-  }
-  async exec(workspace: CloudWorkspace, request: ExecRequest): Promise<ExecResult> {
-    const sandbox = await this.get(workspace);
-    if (request.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
-    const command = `cd ${shellQuote(request.cwd ?? workspace.root)} && ${request.command}`;
-    const startedAt = Date.now();
-    const pending = await sandbox.process.executeSessionCommand(workspace.providerSessionId, {
-      command, runAsync: true, suppressInputEcho: true,
-    }, Math.max(1, Math.ceil(request.timeoutMs / 1000)));
-    const commandId = String(pending.cmdId ?? "");
-    if (!commandId) throw new CloudWorkspaceError(this.name, "provider_unavailable", "Daytona did not return a command id", "deferred");
-    const abort = () => { void sandbox.process.deleteSession(workspace.providerSessionId); };
-    request.signal?.addEventListener("abort", abort, { once: true });
-    try {
-      const deadline = Date.now() + request.timeoutMs;
-      let exitCode: number | undefined;
-      while (exitCode === undefined && Date.now() < deadline && !request.signal?.aborted) {
-        const status = await sandbox.process.getSessionCommand(workspace.providerSessionId, commandId);
-        exitCode = status.exitCode ?? undefined;
-        if (exitCode === undefined) await new Promise((resolve) => setTimeout(resolve, 250));
-      }
-      if (request.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
-      if (exitCode === undefined) { await sandbox.process.deleteSession(workspace.providerSessionId); throw new CloudWorkspaceError(this.name, "timeout", "command timed out", "deferred"); }
-      const logs = await sandbox.process.getSessionCommandLogs(workspace.providerSessionId, commandId);
-      const stdout = outputLimit(String(logs.stdout ?? logs.output ?? ""), request.maxOutputBytes, this.name);
-      const stderr = outputLimit(String(logs.stderr ?? ""), request.maxOutputBytes, this.name);
-      return { exitCode, stdout, stderr, providerSessionId: workspace.providerSessionId, durationMs: Date.now() - startedAt };
-    } finally { request.signal?.removeEventListener("abort", abort); }
-  }
-  async readFile(workspace: CloudWorkspace, path: string, maxBytes: number) {
-    return this.readAbsolute(workspace, safeWorkspacePath(workspace, path), maxBytes);
-  }
-  protected async readAbsolute(workspace: CloudWorkspace, path: string, maxBytes: number) {
-    const bytes = new Uint8Array(await (await this.get(workspace)).fs.downloadFile(path, Math.ceil(DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs / 1000)));
-    if (bytes.byteLength > maxBytes) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds read limit", "rejected");
-    return bytes;
-  }
-  async writeFile(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) { return this.writeAbsolute(workspace, safeWorkspacePath(workspace, path), data, maxBytes); }
-  protected async writeAbsolute(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) {
-    if (data.byteLength > maxBytes) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds write limit", "rejected");
-    await (await this.get(workspace)).fs.uploadFile(Buffer.from(data), path, Math.ceil(DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs / 1000));
-  }
-  async listFiles(workspace: CloudWorkspace, path: string, maxEntries: number) {
-    const entries = await (await this.get(workspace)).fs.listFiles(safeWorkspacePath(workspace, path), { depth: 1 });
-    if (entries.length > maxEntries) throw new CloudWorkspaceError(this.name, "resource_limit", "file listing exceeds limit", "rejected");
-    return entries.map((entry) => String(entry.path));
-  }
-  async terminate(workspace: CloudWorkspace) { const sandbox = await this.get(workspace); await (await this.getClient()).delete(sandbox, 60, true); this.sandboxes.delete(workspace.providerWorkspaceId); }
-  private async getClient() { if (!this.client) { const { Daytona } = await import("@daytona/sdk"); this.client = new Daytona({ apiKey: this.apiKey, apiUrl: this.apiUrl, otelEnabled: false }); } return this.client; }
-  private async get(workspace: CloudWorkspace) { assertWorkspaceIdentity(workspace); const cached = this.sandboxes.get(workspace.providerWorkspaceId); if (cached) return cached; const sandbox = await (await this.getClient()).get(workspace.providerWorkspaceId); this.sandboxes.set(workspace.providerWorkspaceId, sandbox); return sandbox; }
-}
-
 class Sandbox0CloudWorkspaceProvider extends ProviderBase {
   readonly name = "sandbox0" as const;
   readonly capabilities = CAPABILITIES.sandbox0;
@@ -500,10 +417,6 @@ function configuredProviderAdapterForName(
     if (!env.E2B_API_KEY) throw new CloudWorkspaceError("e2b", "missing_configuration", "E2B_API_KEY is not configured");
     return new E2BCloudWorkspaceProvider(env.E2B_API_KEY);
   }
-  if (name === "daytona") {
-    if (!env.DAYTONA_API_KEY) throw new CloudWorkspaceError("daytona", "missing_configuration", "DAYTONA_API_KEY is not configured");
-    return new DaytonaCloudWorkspaceProvider(env.DAYTONA_API_KEY, env.DAYTONA_API_URL);
-  }
   if (name === "sandbox0") {
     if (!env.SANDBOX0_TOKEN) throw new CloudWorkspaceError("sandbox0", "missing_configuration", "SANDBOX0_TOKEN is not configured");
     return new Sandbox0CloudWorkspaceProvider(env.SANDBOX0_TOKEN, env.SANDBOX0_BASE_URL);
@@ -516,8 +429,8 @@ function configuredProviderAdapterForName(
 
 function configuredProviderAdapter(env: Readonly<Record<string, string | undefined>>): CloudWorkspaceProvider {
   const name = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
-  if (!["e2b", "daytona", "sandbox0", "cloudflare"].includes(name)) {
-    throw new CloudWorkspaceError("cloudflare", "missing_configuration", "JARVIS_CLOUD_WORKSPACE_PROVIDER must select e2b, daytona, sandbox0, or cloudflare");
+  if (!["e2b", "sandbox0", "cloudflare"].includes(name)) {
+    throw new CloudWorkspaceError("cloudflare", "missing_configuration", "JARVIS_CLOUD_WORKSPACE_PROVIDER must select e2b, sandbox0, or cloudflare");
   }
   return configuredProviderAdapterForName(env, name as CloudWorkspaceProviderName);
 }
@@ -535,8 +448,16 @@ export function configuredCloudWorkspaceProvider(
 /** Orphan cleanup never receives execution authority or exposes execution methods. */
 export function configuredCloudWorkspaceCleanupProvider(
   env: Readonly<Record<string, string | undefined>>,
-  persistedProviderName?: CloudWorkspaceProviderName,
+  persistedProviderName?: HistoricalCloudWorkspaceProviderName,
 ): CloudWorkspaceCleanupProvider {
+  if (persistedProviderName === "daytona") {
+    throw new CloudWorkspaceError(
+      "daytona",
+      "cleanup_blocked",
+      "Historical Daytona workspace cleanup is blocked because the retired provider adapter is not executable; provider-side attention is required",
+      "blocked",
+    );
+  }
   const provider = persistedProviderName
     ? configuredProviderAdapterForName(env, persistedProviderName)
     : configuredProviderAdapter(env);
@@ -552,7 +473,7 @@ export function configuredCloudWorkspaceProviderForLiveProbe(
 ): CloudWorkspaceProvider {
   const name = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
   if (env.JARVIS_CLOUD_PROVIDER_PROBE !== "live") {
-    const provider = name === "e2b" || name === "daytona" || name === "sandbox0" || name === "cloudflare" ? name : "cloudflare";
+    const provider = name === "e2b" || name === "sandbox0" || name === "cloudflare" ? name : "cloudflare";
     throw new CloudWorkspaceError(provider, "provider_probe_attestation_failed", "live provider probe authority was not explicitly enabled", "blocked");
   }
   return configuredProviderAdapter(env);

@@ -30,7 +30,6 @@ function blocked(reason: string): never {
 function configuredCredentialAvailable(env: NodeJS.ProcessEnv): boolean {
   if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "sandbox0") return Boolean(env.SANDBOX0_TOKEN);
   if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "e2b") return Boolean(env.E2B_API_KEY);
-  if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "daytona") return Boolean(env.DAYTONA_API_KEY);
   return false;
 }
 

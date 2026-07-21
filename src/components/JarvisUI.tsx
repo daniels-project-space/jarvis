@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { usePaginatedQuery } from "convex/react";
 import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
@@ -7,10 +8,11 @@ import { clientMutation } from "@/lib/client-mutation";
 import { primeMicrophone, readJarvisPermissions, type JarvisPermissionState } from "@/lib/permissions";
 import { registerSW, subscribePush } from "@/lib/push";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
-import { createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
+import { createOrbMotionFrame, deriveOrbVisual, type OrbMotionFrame } from "@/lib/orb-motion";
 import {
   cacheCompactWorkSnapshot,
   visibleWorkSnapshot,
+  type CompactJobDetail,
   type CompactWorkCache,
   type CompactWorkSnapshot,
 } from "@/lib/active-work";
@@ -42,6 +44,7 @@ import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
 import { viewerFetch } from "@/lib/viewer-request";
 import { normalizeIncidentSignature } from "@/lib/incident-signature";
 import { FleetCommandCenter } from "./CompactWorkBar";
+import { useViewerSession } from "@/lib/viewer-session";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -87,6 +90,29 @@ type StreamingSpeechState = {
   pendingPrefix: string;
   pendingCaption: string;
 };
+
+function ChatHistoryArchive({ threadId }: { threadId: string }) {
+  const viewerToken = useViewerSession();
+  const { results, status, loadMore } = usePaginatedQuery(
+    api.chatQueue.paginatedMessages,
+    viewerToken ? { threadId, viewerToken } : "skip",
+    { initialNumItems: 20 },
+  );
+  const rows = [...(results as Msg[])].reverse();
+  return <section aria-label="Paginated chat history" className="mt-2 border-t border-white/5 pt-2">
+    <div className="hud-label px-2 text-slate">current chat history</div>
+    <ol className="mt-1 space-y-1 px-2">
+      {rows.map((message) => <li key={message._id} data-history-message={message._id} data-parent-message={message.parentMessageId ?? undefined} className="rounded-lg border border-white/[0.05] bg-black/15 px-2 py-1.5 text-[10px] text-slate">
+        <div className="font-mono text-[7px] uppercase tracking-[0.1em] text-cyan/60">{message.role}</div>
+        {message.attachment
+          ? <div className="truncate text-ice">{message.attachment.title ?? message.attachment.type}</div>
+          : <div className="line-clamp-3 whitespace-pre-wrap text-ice/85">{message.role === "user" ? visibleTurnText(message.text) : sanitizeAssistantText(message.text)}</div>}
+      </li>)}
+    </ol>
+    {status === "CanLoadMore" && <button type="button" onClick={() => loadMore(20)} className="mx-2 mt-2 w-[calc(100%-16px)] rounded-lg border border-cyan/20 px-2 py-1 text-[9px] text-cyan">load older messages</button>}
+    {status === "LoadingMore" && <div className="px-2 py-2 text-center text-[9px] text-cyan">loading older messages…</div>}
+  </section>;
+}
 
 const ytId = (s: string) => {
   const m = String(s).match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([\w-]{11})/);
@@ -297,7 +323,7 @@ function OptionsPanel({
               {permissionBusy ? "enabling…" : permissions.microphone === "granted" && permissions.notifications === "granted" ? "ready ✓" : "enable once"}
             </button>
           </Row>
-          <Row label="Speaking voice" hint="Voicebox Jarvis profile when its cloud worker is warm">
+          <Row label="Speaking voice" hint="Free streamed en-GB-RyanNeural">
             <span className="rounded-lg border border-white/10 bg-black/20 px-2.5 py-1 text-[11px] text-ice">Jarvis</span>
           </Row>
           <Row label="Saved work" hint="projects, inquiries, notes, emails, boards, maps and files">
@@ -389,7 +415,8 @@ function ReactorRing({
       }),
     [],
   );
-  const opacity = hidden ? 0 : aside ? 0.32 : active ? 0.52 : 0.24;
+  const initialVisual = deriveOrbVisual(motionRef.current, reduceMotion);
+  const opacity = hidden ? 0 : (active ? 0.52 : 0.24) * (1 - 0.38 * initialVisual.aside);
   useEffect(() => {
     const ring = ringRef.current;
     const container = containerRef.current;
@@ -397,15 +424,16 @@ function ReactorRing({
     let frame = 0;
     const paint = () => {
       const motion = motionRef.current;
-      ring.style.transform = reduceMotion ? "none" : `rotate(${motion.phase}rad)`;
+      const visual = deriveOrbVisual(motion, reduceMotion);
+      ring.style.transform = visual.rotation ? `rotate(${visual.rotation}rad)` : "none";
       // The ring reads the orb's own eased aside value instead of running a
       // second CSS clock. Translation, scale, colour and rotation therefore
       // cannot lag behind or snap in a different direction.
-      container.style.transform = `translateX(${32 * motion.aside}%) translateY(-4.5%) scale(${1 - 0.22 * motion.aside})`;
-      container.style.opacity = String(hidden ? 0 : (active ? 0.52 : 0.24) * (1 - 0.38 * motion.aside));
-      firstStopRef.current?.setAttribute("stop-color", motion.color);
-      middleStopRef.current?.setAttribute("stop-color", motion.accent);
-      lastStopRef.current?.setAttribute("stop-color", motion.color);
+      container.style.transform = `translateX(${visual.translateXPercent}%) translateY(-4.5%) scale(${visual.scale})`;
+      container.style.opacity = String(hidden ? 0 : (active ? 0.52 : 0.24) * (1 - 0.38 * visual.aside));
+      firstStopRef.current?.setAttribute("stop-color", visual.color);
+      middleStopRef.current?.setAttribute("stop-color", visual.accent);
+      lastStopRef.current?.setAttribute("stop-color", visual.color);
       // Reduced motion freezes rotation but still follows the orb's slowly
       // changing conversation colour.
       frame = requestAnimationFrame(paint);
@@ -417,7 +445,7 @@ function ReactorRing({
     <div
       ref={containerRef}
       className="pointer-events-none absolute inset-0 grid place-items-center will-change-transform"
-      style={{ opacity, transform: aside ? "translateX(32%) translateY(-4.5%) scale(0.76)" : "translateY(-4.5%) scale(1)" }}
+      style={{ opacity, transform: `translateX(${initialVisual.translateXPercent}%) translateY(-4.5%) scale(${initialVisual.scale})` }}
     >
       <svg viewBox="0 0 500 500" className="h-[min(82vmin,760px)] w-[min(82vmin,760px)]">
         <defs>
@@ -1151,6 +1179,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     api.commandCenter.snapshot,
     embedded || !activeThreadReady ? "skip" : { threadId: thread },
   ) as CompactWorkSnapshot | undefined;
+  const [workDetailJobId, setWorkDetailJobId] = useState<string | null>(null);
+  const workDetail = useJarvisQuery(
+    api.jobs.detail,
+    workDetailJobId ? { jobId: workDetailJobId as never } : "skip",
+  ) as CompactJobDetail | null | undefined;
+  useEffect(() => setWorkDetailJobId(null), [thread]);
   const compactWorkCache = useRef<CompactWorkCache>(null);
   useEffect(() => {
     compactWorkCache.current = cacheCompactWorkSnapshot(compactWorkCache.current, thread, commandSnapshot);
@@ -1885,7 +1919,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       setSending(false);
     }
     showCaption({ who: "jarvis", text: latestAssistant.text, phase: "streaming" });
-    if (liveRef.current && !latestAssistant.model) return;
     const stablePrefix = completeSpeechPrefix(latestAssistant.text);
     if (!stablePrefix) return;
     let streamState = streamingSpeechRef.current;
@@ -1954,12 +1987,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     lastSpokenText.current = { text: last.text, ts: Date.now() };
     // Background findings never interrupt an active voice exchange. Normal
     // Codex replies do speak, then the turn-taking microphone re-arms.
-    if (liveRef.current && !last.model) return;
     const spokenText = isToolGarbage(last.text) ? sanitizeAssistantText(last.text) : last.text;
     // Streaming and finalization use the same stable caption node. Put the
     // finished text there before voice ownership/model generation, so it never
     // vanishes during the TTS handoff or when this tab is not the speaker.
     showCaption({ who: "jarvis", text: spokenText, phase: "ready" });
+    document.documentElement.dataset.jarvisFinalDeliveryMs = String(Math.round(performance.now()));
     (async () => {
       const streamed = streamingSpeechRef.current.id === last._id ? streamingSpeechRef.current : null;
       if (streamed?.timer) {
@@ -3122,8 +3155,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           )}
           <FleetCommandCenter
             snapshot={visibleCommandSnapshot}
+            detail={workDetail}
             hidden={overlayUp}
             onExpandedChange={setCommandExpanded}
+            onSelectedJobChange={setWorkDetailJobId}
           />
           {panel && panel.type !== "video" && !panelMin && !panelFull ? (
             <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-10 md:pr-[36%] lg:pl-16" : "justify-center"}`}>
@@ -3178,7 +3213,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               finalization and narration. Compact overlays keep it beside their
               visible orb; only a truly full-screen workspace owns the surface. */}
           {caption && !fullBleed && (
-            <div className={`pointer-events-none absolute top-[52%] z-30 flex justify-center px-6 ${compactAside || (commandExpanded && !overlayUp) ? "hidden md:flex md:left-[62%] md:right-0" : "inset-x-0"}`}>
+            <div className={`pointer-events-none absolute ${compactAside || (commandExpanded && !overlayUp) ? "top-[70%] hidden md:flex md:left-[62%] md:right-0" : "top-[52%] inset-x-0"} z-30 flex justify-center px-6`}>
               <SpokenCaption caption={caption} />
             </div>
           )}
@@ -3219,7 +3254,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               <p className="mt-10 text-center text-sm text-slate">Say the word, sir.</p>
             )}
             {messages
-              .slice(-80)
+              .slice(-20)
               .map((m) => {
                 if (m.role === "assistant" && m.text && isToolGarbage(m.text)) return { ...m, text: sanitizeAssistantText(m.text) };
                 if (m.role === "user" && m.text) return { ...m, text: visibleTurnText(m.text) };
@@ -3395,6 +3430,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 {t.title || t.id}
               </button>
             ))}
+            {drawerOpen && <ChatHistoryArchive key={thread} threadId={thread} />}
           </div>
           <div className="flex gap-2 border-t border-white/5 p-3">
             <button
