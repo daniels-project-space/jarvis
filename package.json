@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "vitest run"
+    "test": "vitest run",
+    "probe:codex-cloud-permissions": "tsx scripts/probe-codex-cloud-permissions.ts"
   },
   "dependencies": {
     "@daytona/sdk": "0.200.0",

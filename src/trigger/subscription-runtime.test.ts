@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   isolateSubscriptionEnv,
+  isolateCloudSubscriptionEnv,
   missingSubscriptionTools,
   prepareSubscriptionEnv,
   REQUIRED_AGENT_TOOLS,
@@ -68,6 +69,24 @@ describe("subscription subprocess capability scope", () => {
       expect(one.CODEX_HOME).not.toBe(two.CODEX_HOME);
       expect(readFileSync(join(String(one.CODEX_HOME), "AGENTS.md"), "utf8")).toBe("scoped briefing");
       expect(readFileSync(join(String(two.CODEX_HOME), "auth.json"), "utf8")).toContain("tokens");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("gives cloud specialists auth without inheriting user config or instructions", () => {
+    const root = mkdtempSync(join(tmpdir(), "jarvis-cloud-codex-test-"));
+    const source = join(root, "source");
+    const homes = join(root, "homes");
+    try {
+      mkdirSync(source, { recursive: true });
+      writeFileSync(join(source, "auth.json"), '{"tokens":{}}');
+      writeFileSync(join(source, "config.toml"), 'sandbox_mode = "danger-full-access"');
+      writeFileSync(join(source, "AGENTS.md"), "controller authority briefing");
+      const env = isolateCloudSubscriptionEnv({ ...process.env, CODEX_HOME: source }, "cloud-job", homes);
+      expect(readFileSync(join(String(env.CODEX_HOME), "auth.json"), "utf8")).toContain("tokens");
+      expect(() => readFileSync(join(String(env.CODEX_HOME), "config.toml"), "utf8")).toThrow();
+      expect(() => readFileSync(join(String(env.CODEX_HOME), "AGENTS.md"), "utf8")).toThrow();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -19,11 +19,11 @@ import { reviewPrompt } from "./codex-review";
 import { normalizeWorkModelTier } from "../lib/work-models";
 import { githubGitEnv, githubRepoUrl } from "./git-transport";
 import { canonicalizeRepository } from "../lib/workflow-contract";
-import { vaultService } from "../lib/vault-client";
 import { buildContinuationCheckpoint, segmentTimeoutMs } from "./continuation";
 import { runWatchSweep } from "./watch-runtime";
 import {
   missingSubscriptionTools,
+  isolateCloudSubscriptionEnv,
   isolateSubscriptionEnv,
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
@@ -74,7 +74,7 @@ import {
 import { repositoryDeliveryReadiness, trustedGitReviewReceiptAuthority, verifyGitReviewReceiptEnvelope } from "./git-review-authority";
 import { integrateReviewedWorker } from "./mission-integration";
 import { createGitHubIntegrationAdapter, GITHUB_REST_API_VERSION } from "./github-integration-adapter";
-import { assertCloudAgentExecutionReady, runCloudWorkspaceAgent } from "./cloud-agent-runner";
+import { runCloudWorkspaceAgent } from "./cloud-agent-runner";
 import {
   applyValidatedPatchToControllerCheckout,
   createCredentiallessGitArchive,
@@ -86,8 +86,8 @@ import { configuredCloudWorkspaceProvider } from "./cloud-workspace-providers";
 import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider } from "./cloud-workspace";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
-// agent in an isolated workspace (with optional repository and scoped MCP
-// access), then weaves the reviewed result back into the originating thread.
+// agent against an isolated cloud workspace through controller-owned dynamic
+// tools, then weaves the reviewed result back into the originating thread.
 
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
@@ -224,35 +224,6 @@ function pickAgentModel(task: string): string {
   return routeWork(task).model;
 }
 
-
-// MCP servers the brain can attach on demand. Browserbase = hosted browsers
-// (no local Chromium in the Trigger image); context7 = live library docs.
-async function buildMcpConfig(
-  names: string[],
-  jobKey: string,
-): Promise<{ configPath: string | null; env: Record<string, string> }> {
-  const servers: Record<string, unknown> = {};
-  const runtimeEnv: Record<string, string> = {};
-  for (const n of names) {
-    if (["playwright", "browser", "browserbase"].includes(n)) {
-      const bb = await vaultService("browserbase");
-      if (bb.BROWSERBASE_API_KEY) {
-        runtimeEnv.BROWSERBASE_API_KEY = bb.BROWSERBASE_API_KEY;
-        runtimeEnv.BROWSERBASE_PROJECT_ID = bb.BROWSERBASE_PROJECT_ID ?? "";
-        servers["browserbase"] = {
-          command: "npx",
-          args: ["-y", "@browserbasehq/mcp-server-browserbase"],
-          envVars: ["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
-        };
-      }
-    }
-    if (n === "context7") servers["context7"] = { command: "npx", args: ["-y", "@upstash/context7-mcp"] };
-  }
-  if (!Object.keys(servers).length) return { configPath: null, env: runtimeEnv };
-  const path = `/tmp/work/mcp-${jobKey.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`;
-  writeFileSync(path, JSON.stringify({ mcpServers: servers }));
-  return { configPath: path, env: runtimeEnv };
-}
 
 // The weave: a short spoken report that CONTAINS the answer — Daniel complained
 // that "it's done, sir" told him nothing after he sent an agent off to research.
@@ -1524,10 +1495,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const model = normalizeWorkModelTier(
           typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task),
         );
-        const mcp = Array.isArray(job.mcp) && job.mcp.length
-          ? await buildMcpConfig(job.mcp, jobKey)
-          : { configPath: null, env: {} };
-        const agentEnv = { ...jobEnv, ...mcp.env };
+        const agentEnv = isolateCloudSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}-cloud`);
         let lastHeartbeatAt = 0;
         let lastDurableStage = "";
         let lastDurablePercent = 0;
@@ -1571,6 +1539,14 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }))
             .catch(() => undefined);
         };
+        if (controllerCheckoutPath && existsSync(controllerCheckoutPath)) {
+          throw new CloudWorkspaceError(
+            cloudProvider.name,
+            "controller_isolation_unproven",
+            "trusted controller checkout still exists at Codex startup",
+            "blocked",
+          );
+        }
         const run = await runCloudWorkspaceAgent({
           bin,
           controllerScratch,
@@ -1587,7 +1563,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           timeoutMs: segmentTimeoutMs(model),
         });
         await durableProgress;
-        if (mcp.configPath) rmSync(mcp.configPath, { force: true });
         let result = run.text;
         const portable = await persistPortableCheckpoint({
           provider: cloudProvider,
@@ -2279,11 +2254,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     let cloudProvider: CloudWorkspaceProvider;
     try {
       cloudProvider = configuredCloudWorkspaceProvider(process.env);
-      // This must remain before processJob: processJob owns trusted controller
-      // hydration commands. A configured provider is still not authority to
-      // spawn anything until controller tool isolation and real cloud probes
-      // are evidenced in source.
-      assertCloudAgentExecutionReady(cloudProvider);
     } catch (error) {
       const failure = error instanceof CloudWorkspaceError
         ? error

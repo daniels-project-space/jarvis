@@ -1,40 +1,8 @@
-import { CodexAppServer } from "./codex-app-server";
+import { dirname } from "node:path";
+import { CodexAppServer, CodexPermissionAttestationError } from "./codex-app-server";
+import { buildCloudCodexPermissionProfile } from "./cloud-codex-permissions";
 import { CloudWorkspaceToolBridge, CLOUD_REPOSITORY_TOOLS } from "./cloud-workspace-tools";
 import { CloudWorkspaceError, type CloudWorkspace, type CloudWorkspaceProvider } from "./cloud-workspace";
-
-// Codex app-server 0.144.5 accepts controller-owned dynamic tools, but its
-// thread/start protocol has no setting that disables the built-in host
-// shell/filesystem tools. A read-only empty cwd prevents writes; it does not
-// prove that an absolute read outside that cwd is impossible. Keep the live
-// worker gate closed until both this protocol gap and each real provider probe
-// have independently passed. These are evidence flags, never env toggles.
-export const CLOUD_AGENT_EXECUTION_READINESS = Object.freeze({
-  codexAppServerBuiltInHostToolsDisabled: false,
-  realProviderLifecycleProbePassed: Object.freeze({
-    e2b: false,
-    daytona: false,
-    sandbox0: false,
-    cloudflare: false,
-  }),
-});
-
-export function assertCloudAgentExecutionReady(provider: CloudWorkspaceProvider): void {
-  const blockers: string[] = [];
-  if (!CLOUD_AGENT_EXECUTION_READINESS.codexAppServerBuiltInHostToolsDisabled) {
-    blockers.push("Codex app-server built-in host tools cannot be disabled by the pinned protocol");
-  }
-  if (!CLOUD_AGENT_EXECUTION_READINESS.realProviderLifecycleProbePassed[provider.name]) {
-    blockers.push(`${provider.name} credential/quota/lifecycle probe is unverified`);
-  }
-  if (blockers.length) {
-    throw new CloudWorkspaceError(
-      provider.name,
-      "controller_isolation_unproven",
-      blockers.join("; "),
-      "blocked",
-    );
-  }
-}
 
 export type CloudAgentRun = {
   text: string;
@@ -56,9 +24,28 @@ export async function runCloudWorkspaceAgent(input: {
   executionState?: () => Promise<string>;
   onProgress?: (line: string, log?: string, stage?: string, percent?: number) => void;
 }): Promise<CloudAgentRun> {
-  // Defense in depth for any future caller. The Trigger caller performs this
-  // check before processJob so no checkout/archive subprocess can start.
-  assertCloudAgentExecutionReady(input.provider);
+  const codexHome = String(input.controllerEnv.CODEX_HOME ?? "");
+  let permissionProfile;
+  try {
+    permissionProfile = buildCloudCodexPermissionProfile({
+      codexHome,
+      controllerScratch: input.controllerScratch,
+      controllerAuthorityRoots: [
+        dirname(input.controllerScratch),
+        process.cwd(),
+        input.controllerEnv.HOME,
+        input.controllerEnv.XDG_CONFIG_HOME,
+        input.controllerEnv.XDG_CACHE_HOME,
+      ],
+    });
+  } catch {
+    throw new CloudWorkspaceError(
+      input.provider.name,
+      "controller_isolation_unproven",
+      "Codex cloud permission profile could not be constructed from the isolated runtime",
+      "blocked",
+    );
+  }
   const abort = new AbortController();
   let stopped: CloudAgentRun["stopped"] = null;
   let log = "";
@@ -73,7 +60,7 @@ export async function runCloudWorkspaceAgent(input: {
     dynamicTools: CLOUD_REPOSITORY_TOOLS,
     onDynamicToolCall: (call) => bridge.invoke(call),
     controllerCwd: input.controllerScratch,
-    threadSandbox: "read-only",
+    permissionProfile,
     ephemeral: true,
     developerInstructions:
       "You are a background repository specialist. The controller scratch is empty and read-only. " +
@@ -116,6 +103,14 @@ export async function runCloudWorkspaceAgent(input: {
       commands: [],
     };
   } catch (error) {
+    if (error instanceof CodexPermissionAttestationError) {
+      throw new CloudWorkspaceError(
+        input.provider.name,
+        "controller_isolation_unproven",
+        error.message,
+        "blocked",
+      );
+    }
     const timedOut = !stopped && Date.now() - startedAt >= input.timeoutMs;
     return {
       text: stopped ? `(agent ${stopped})` : timedOut ? "(agent segment timed out)" : `error: ${error instanceof Error ? error.message : String(error)}`,
