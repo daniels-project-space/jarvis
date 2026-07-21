@@ -7,9 +7,11 @@ import {
   DEFAULT_WORKSPACE_LIMITS,
   assertRequiredCapabilities,
   assertWorkspaceIdentity,
+  createPortableCheckpointArchive,
   sha256Bytes,
   validateCredentiallessArchive,
   validatePatchManifest,
+  validatePortableCheckpointArchive,
   validateRelativePath,
   type CloudWorkspace,
   type CloudWorkspaceCapabilities,
@@ -29,9 +31,16 @@ import {
 
 const ROOT = "/workspace/repository";
 const ARCHIVE_PATH = "/workspace/jarvis-source.tar";
-const CHECKPOINT_PATH = `${ROOT}/.git/jarvis-checkpoint.tar`;
-const REPLAY_PATH = "/workspace/jarvis-replay.tar";
-const PATCH_PATH = `${ROOT}/.git/jarvis-output.patch`;
+const CONTROL_DIR = "/workspace/.jarvis";
+const SOURCE_PATH = `${CONTROL_DIR}/source.tar`;
+const CHECKPOINT_PATCH_PATH = `${CONTROL_DIR}/checkpoint.patch`;
+const REPLAY_STAGE = `${CONTROL_DIR}/replay-stage`;
+const REPLAY_PATH = `${CONTROL_DIR}/replay.tar`;
+const PATCH_PATH = `${CONTROL_DIR}/output.patch`;
+const CHECKPOINT_EXCLUDES = [
+  ".git", "node_modules", ".next", ".turbo", ".cache", ".npm", ".pnpm-store",
+  "coverage", "dist", "build", "tmp", "temp", ".trigger", ".vercel",
+];
 
 const CAPABILITIES: Record<CloudWorkspaceProviderName, CloudWorkspaceCapabilities> = {
   e2b: {
@@ -82,39 +91,61 @@ function shellQuote(value: string): string { return `'${value.replace(/'/g, `'"'
 
 function hydrateCommand(): string {
   return [
-    `mkdir -p ${ROOT}`,
+    `mkdir -p ${ROOT} ${CONTROL_DIR}`,
     `tar --no-same-owner --no-same-permissions -xf ${ARCHIVE_PATH} -C ${ROOT}`,
-    `rm -f ${ARCHIVE_PATH}`,
+    `mv ${ARCHIVE_PATH} ${SOURCE_PATH}`,
     `cd ${ROOT}`,
     "git init -q",
     "git config user.email jarvis-controller@example.invalid",
     "git config user.name 'JARVIS controller baseline'",
     "git add -A",
     "git commit -q --allow-empty -m 'credentialless controller baseline'",
+    "git update-ref refs/jarvis/controller-base HEAD",
   ].join(" && ");
 }
 
 async function checkpointThroughProvider(
   provider: CloudWorkspaceProvider,
   workspace: CloudWorkspace,
+  readArtifact: (path: string, maxBytes: number) => Promise<Uint8Array>,
   input: {
-    baseSha: string; runtime: string; lockfileDigest: string; template: string; attemptKey: string; causationId: string;
+    jobId: string; attempt: number; baseSha: string; sourceArchiveSha256: string; sourceArchiveBytes: number;
+    runtime: string; lockfileDigest: string; template: string; attemptKey: string; causationId: string;
   },
 ): Promise<{ manifest: WorkspaceCheckpoint; archive: Uint8Array }> {
+  const excludes = CHECKPOINT_EXCLUDES.map((path) => `':(exclude)${path}' ":(exclude)${path}/**"`).join(" ");
   const result = await provider.exec(workspace, {
-    command: `tar --format=posix -cf ${CHECKPOINT_PATH} -C ${ROOT} .`,
+    command: [
+      `mkdir -p ${CONTROL_DIR}`,
+      `rm -f ${CHECKPOINT_PATCH_PATH}`,
+      `cd ${ROOT}`,
+      `git add -N -A -- . ${excludes}`,
+      `git diff --binary --no-ext-diff --no-color --no-renames --full-index refs/jarvis/controller-base -- . ${excludes} > ${CHECKPOINT_PATCH_PATH}`,
+      `git reset -q HEAD -- .`,
+    ].join(" && "),
     cwd: ROOT,
     timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs,
     maxOutputBytes: 16_384,
   });
   if (result.exitCode !== 0) throw new CloudWorkspaceError(provider.name, "provider_unavailable", "portable checkpoint export failed", "deferred");
-  const archive = await provider.readFile(workspace, ".git/jarvis-checkpoint.tar", DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
+  const sourceBytes = await readArtifact(SOURCE_PATH, DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
+  if (sourceBytes.byteLength !== input.sourceArchiveBytes || sha256Bytes(sourceBytes) !== input.sourceArchiveSha256) {
+    throw new CloudWorkspaceError(provider.name, "checkpoint_tampered", "sandbox source archive changed before checkpoint", "rejected");
+  }
+  const patch = await readArtifact(CHECKPOINT_PATCH_PATH, DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
+  const archive = createPortableCheckpointArchive({
+    baseSha: input.baseSha, sha256: input.sourceArchiveSha256, bytes: sourceBytes,
+  }, patch);
   const manifest: WorkspaceCheckpoint = {
-    version: 1,
+    version: 2,
+    jobId: input.jobId,
+    attempt: input.attempt,
     provider: provider.name,
     providerWorkspaceId: workspace.providerWorkspaceId,
     providerSessionId: workspace.providerSessionId,
     baseSha: input.baseSha,
+    sourceArchiveSha256: input.sourceArchiveSha256,
+    sourceArchiveBytes: input.sourceArchiveBytes,
     archiveSha256: sha256Bytes(archive),
     archiveBytes: archive.byteLength,
     runtime: input.runtime,
@@ -124,23 +155,25 @@ async function checkpointThroughProvider(
     causationId: input.causationId,
     createdAt: Date.now(),
   };
+  validatePortableCheckpointArchive(archive, manifest);
   return { manifest, archive };
 }
 
 async function exportPatchThroughProvider(
   provider: CloudWorkspaceProvider,
   workspace: CloudWorkspace,
+  readArtifact: (path: string, maxBytes: number) => Promise<Uint8Array>,
   baseSha: string,
   maxBytes: number,
 ): Promise<PatchManifest> {
   const result = await provider.exec(workspace, {
-    command: `git add -N . && git diff --binary --no-ext-diff HEAD > ${PATCH_PATH}`,
+    command: `mkdir -p ${CONTROL_DIR} && rm -f ${PATCH_PATH} && git add -N . && git diff --binary --no-ext-diff refs/jarvis/controller-base > ${PATCH_PATH}`,
     cwd: ROOT,
     timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs,
     maxOutputBytes: 16_384,
   });
   if (result.exitCode !== 0) throw new CloudWorkspaceError(provider.name, "provider_unavailable", "patch export failed", "deferred");
-  const patch = await provider.readFile(workspace, ".git/jarvis-output.patch", maxBytes);
+  const patch = await readArtifact(PATCH_PATH, maxBytes);
   const manifest = { baseSha, sha256: sha256Bytes(patch), byteCount: patch.byteLength, patch };
   validatePatchManifest(manifest, baseSha, maxBytes, provider.name);
   return manifest;
@@ -167,15 +200,14 @@ abstract class ProviderBase implements CloudWorkspaceProvider {
   }
 
   async checkpoint(workspace: CloudWorkspace, input: {
-    baseSha: string; runtime: string; lockfileDigest: string; template: string; attemptKey: string; causationId: string;
-  }) { return checkpointThroughProvider(this, workspace, input); }
+    jobId: string; attempt: number; baseSha: string; sourceArchiveSha256: string; sourceArchiveBytes: number;
+    runtime: string; lockfileDigest: string; template: string; attemptKey: string; causationId: string;
+  }) { return checkpointThroughProvider(this, workspace, (path, maxBytes) => this.readAbsolute(workspace, path, maxBytes), input); }
 
-  async recreateFromCheckpoint(input: { checkpoint: WorkspaceCheckpoint; archive: Uint8Array; limits: WorkspaceLimits }) {
-    if (sha256Bytes(input.archive) !== input.checkpoint.archiveSha256 || input.archive.byteLength !== input.checkpoint.archiveBytes) {
-      throw new CloudWorkspaceError(this.name, "digest_mismatch", "portable checkpoint bytes do not match the manifest", "rejected");
-    }
+  async recreateFromCheckpoint(input: { checkpoint: WorkspaceCheckpoint; archive: Uint8Array; limits: WorkspaceLimits; attemptKey: string }) {
+    validatePortableCheckpointArchive(input.archive, input.checkpoint, input.limits);
     const workspace = await this.createWorkspace({
-      attemptKey: input.checkpoint.attemptKey,
+      attemptKey: input.attemptKey,
       template: input.checkpoint.template,
       runtime: input.checkpoint.runtime,
       lockfileDigest: input.checkpoint.lockfileDigest,
@@ -183,7 +215,22 @@ abstract class ProviderBase implements CloudWorkspaceProvider {
     });
     await this.writeAbsolute(workspace, REPLAY_PATH, input.archive, input.limits.maxArchiveBytes);
     const result = await this.exec(workspace, {
-      command: `mkdir -p ${ROOT} && tar --no-same-owner --no-same-permissions -xf ${REPLAY_PATH} -C ${ROOT} && rm -f ${REPLAY_PATH}`,
+      command: [
+        `rm -rf ${ROOT} ${REPLAY_STAGE}`,
+        `mkdir -p ${ROOT} ${REPLAY_STAGE}`,
+        `tar --no-same-owner --no-same-permissions -xf ${REPLAY_PATH} -C ${REPLAY_STAGE}`,
+        `mv ${REPLAY_STAGE}/source.tar ${SOURCE_PATH}`,
+        `tar --no-same-owner --no-same-permissions -xf ${SOURCE_PATH} -C ${ROOT}`,
+        `cd ${ROOT}`,
+        "git init -q",
+        "git config user.email jarvis-controller@example.invalid",
+        "git config user.name 'JARVIS controller baseline'",
+        "git add -A",
+        "git commit -q --allow-empty -m 'credentialless controller baseline'",
+        "git update-ref refs/jarvis/controller-base HEAD",
+        `git apply --whitespace=nowarn ${REPLAY_STAGE}/workspace.patch`,
+        `rm -rf ${REPLAY_STAGE} ${REPLAY_PATH}`,
+      ].join(" && "),
       cwd: "/workspace", timeoutMs: input.limits.commandTimeoutMs, maxOutputBytes: input.limits.maxOutputBytes,
     });
     if (result.exitCode !== 0) {
@@ -194,9 +241,10 @@ abstract class ProviderBase implements CloudWorkspaceProvider {
   }
 
   async exportPatch(workspace: CloudWorkspace, baseSha: string, maxBytes: number) {
-    return exportPatchThroughProvider(this, workspace, baseSha, maxBytes);
+    return exportPatchThroughProvider(this, workspace, (path, limit) => this.readAbsolute(workspace, path, limit), baseSha, maxBytes);
   }
 
+  protected abstract readAbsolute(workspace: CloudWorkspace, path: string, maxBytes: number): Promise<Uint8Array>;
   protected abstract writeAbsolute(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number): Promise<void>;
 }
 
@@ -258,7 +306,10 @@ class E2BCloudWorkspaceProvider extends ProviderBase {
   }
 
   async readFile(workspace: CloudWorkspace, path: string, maxBytes: number) {
-    const bytes = await (await this.get(workspace)).files.read(safeWorkspacePath(workspace, path), { format: "bytes" });
+    return this.readAbsolute(workspace, safeWorkspacePath(workspace, path), maxBytes);
+  }
+  protected async readAbsolute(workspace: CloudWorkspace, path: string, maxBytes: number) {
+    const bytes = await (await this.get(workspace)).files.read(path, { format: "bytes" });
     if (bytes.byteLength > maxBytes) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds read limit", "rejected");
     return bytes;
   }
@@ -339,7 +390,10 @@ class DaytonaCloudWorkspaceProvider extends ProviderBase {
     } finally { request.signal?.removeEventListener("abort", abort); }
   }
   async readFile(workspace: CloudWorkspace, path: string, maxBytes: number) {
-    const bytes = new Uint8Array(await (await this.get(workspace)).fs.downloadFile(safeWorkspacePath(workspace, path), Math.ceil(DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs / 1000)));
+    return this.readAbsolute(workspace, safeWorkspacePath(workspace, path), maxBytes);
+  }
+  protected async readAbsolute(workspace: CloudWorkspace, path: string, maxBytes: number) {
+    const bytes = new Uint8Array(await (await this.get(workspace)).fs.downloadFile(path, Math.ceil(DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs / 1000)));
     if (bytes.byteLength > maxBytes) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds read limit", "rejected");
     return bytes;
   }
@@ -402,7 +456,8 @@ class Sandbox0CloudWorkspaceProvider extends ProviderBase {
       return { exitCode: done.exitCode ?? -1, stdout, stderr, providerSessionId: workspace.providerSessionId, durationMs: Date.now() - startedAt };
     } finally { request.signal?.removeEventListener("abort", abort); stream.close(); }
   }
-  async readFile(workspace: CloudWorkspace, path: string, maxBytes: number) { const bytes = await (await this.get(workspace)).readFile(safeWorkspacePath(workspace, path)); if (bytes.byteLength > maxBytes) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds read limit", "rejected"); return bytes; }
+  async readFile(workspace: CloudWorkspace, path: string, maxBytes: number) { return this.readAbsolute(workspace, safeWorkspacePath(workspace, path), maxBytes); }
+  protected async readAbsolute(workspace: CloudWorkspace, path: string, maxBytes: number) { const bytes = await (await this.get(workspace)).readFile(path); if (bytes.byteLength > maxBytes) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds read limit", "rejected"); return bytes; }
   async writeFile(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) { return this.writeAbsolute(workspace, safeWorkspacePath(workspace, path), data, maxBytes); }
   protected async writeAbsolute(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) { if (data.byteLength > maxBytes) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds write limit", "rejected"); await (await this.get(workspace)).writeFile(path, data); }
   async listFiles(workspace: CloudWorkspace, path: string, maxEntries: number) { const entries = await (await this.get(workspace)).listFiles(safeWorkspacePath(workspace, path)); if (entries.length > maxEntries) throw new CloudWorkspaceError(this.name, "resource_limit", "file listing exceeds limit", "rejected"); if (entries.some((entry) => entry.isLink)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "symlink encountered during bounded listing", "rejected"); return entries.map((entry) => String(entry.path ?? entry.name ?? "")); }
@@ -437,8 +492,10 @@ export type CloudWorkspaceCleanupProvider = Readonly<{
   terminate: CloudWorkspaceProvider["terminate"];
 }>;
 
-function configuredProviderAdapter(env: Readonly<Record<string, string | undefined>>): CloudWorkspaceProvider {
-  const name = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
+function configuredProviderAdapterForName(
+  env: Readonly<Record<string, string | undefined>>,
+  name: CloudWorkspaceProviderName,
+): CloudWorkspaceProvider {
   if (name === "e2b") {
     if (!env.E2B_API_KEY) throw new CloudWorkspaceError("e2b", "missing_configuration", "E2B_API_KEY is not configured");
     return new E2BCloudWorkspaceProvider(env.E2B_API_KEY);
@@ -454,7 +511,15 @@ function configuredProviderAdapter(env: Readonly<Record<string, string | undefin
   if (name === "cloudflare") {
     throw new CloudWorkspaceError("cloudflare", "missing_configuration", "Cloudflare Sandbox-compatible client is not configured");
   }
-  throw new CloudWorkspaceError("cloudflare", "missing_configuration", "JARVIS_CLOUD_WORKSPACE_PROVIDER must select e2b, daytona, sandbox0, or cloudflare");
+  throw new CloudWorkspaceError("cloudflare", "invalid_configuration", "unknown persisted cloud workspace provider");
+}
+
+function configuredProviderAdapter(env: Readonly<Record<string, string | undefined>>): CloudWorkspaceProvider {
+  const name = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
+  if (!["e2b", "daytona", "sandbox0", "cloudflare"].includes(name)) {
+    throw new CloudWorkspaceError("cloudflare", "missing_configuration", "JARVIS_CLOUD_WORKSPACE_PROVIDER must select e2b, daytona, sandbox0, or cloudflare");
+  }
+  return configuredProviderAdapterForName(env, name as CloudWorkspaceProviderName);
 }
 
 export function configuredCloudWorkspaceProvider(
@@ -470,8 +535,11 @@ export function configuredCloudWorkspaceProvider(
 /** Orphan cleanup never receives execution authority or exposes execution methods. */
 export function configuredCloudWorkspaceCleanupProvider(
   env: Readonly<Record<string, string | undefined>>,
+  persistedProviderName?: CloudWorkspaceProviderName,
 ): CloudWorkspaceCleanupProvider {
-  const provider = configuredProviderAdapter(env);
+  const provider = persistedProviderName
+    ? configuredProviderAdapterForName(env, persistedProviderName)
+    : configuredProviderAdapter(env);
   return Object.freeze({
     name: provider.name,
     terminate: (workspace, reason) => provider.terminate(workspace, reason),

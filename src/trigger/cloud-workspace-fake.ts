@@ -2,9 +2,11 @@ import {
   CloudWorkspaceError,
   DEFAULT_WORKSPACE_LIMITS,
   assertWorkspaceIdentity,
+  createPortableCheckpointArchive,
   sha256Bytes,
   validateCredentiallessArchive,
   validateRelativePath,
+  validatePortableCheckpointArchive,
   type CloudWorkspace,
   type CloudWorkspaceCapabilities,
   type CloudWorkspaceProvider,
@@ -121,7 +123,11 @@ export class FakeCloudWorkspaceProvider implements CloudWorkspaceProvider {
   }
 
   async checkpoint(workspace: CloudWorkspace, input: {
+    jobId: string;
+    attempt: number;
     baseSha: string;
+    sourceArchiveSha256: string;
+    sourceArchiveBytes: number;
     runtime: string;
     lockfileDigest: string;
     template: string;
@@ -130,18 +136,24 @@ export class FakeCloudWorkspaceProvider implements CloudWorkspaceProvider {
   }): Promise<{ manifest: WorkspaceCheckpoint; archive: Uint8Array }> {
     this.calls.push("checkpoint");
     const state = this.state(workspace);
-    const archive = state.archive?.bytes.slice() ?? new TextEncoder().encode(JSON.stringify(
-      [...state.files].map(([path, bytes]) => [path, Buffer.from(bytes).toString("base64")]),
-    ));
+    if (!state.archive) throw new CloudWorkspaceError(this.name, "checkpoint_incompatible", "fake source archive is missing", "rejected");
+    if (state.archive.sha256 !== input.sourceArchiveSha256 || state.archive.bytes.byteLength !== input.sourceArchiveBytes) {
+      throw new CloudWorkspaceError(this.name, "checkpoint_tampered", "fake source archive binding changed", "rejected");
+    }
+    const archive = createPortableCheckpointArchive(state.archive, state.patch);
     return {
       archive,
       manifest: {
-        version: 1,
+        version: 2,
+        jobId: input.jobId,
+        attempt: input.attempt,
         provider: this.name,
         providerWorkspaceId: workspace.providerWorkspaceId,
         providerSessionId: workspace.providerSessionId,
         providerCheckpointId: `fake-checkpoint-${workspace.providerWorkspaceId}`,
         baseSha: input.baseSha,
+        sourceArchiveSha256: input.sourceArchiveSha256,
+        sourceArchiveBytes: input.sourceArchiveBytes,
         archiveSha256: sha256Bytes(archive),
         archiveBytes: archive.byteLength,
         runtime: input.runtime,
@@ -158,13 +170,12 @@ export class FakeCloudWorkspaceProvider implements CloudWorkspaceProvider {
     checkpoint: WorkspaceCheckpoint;
     archive: Uint8Array;
     limits: WorkspaceLimits;
+    attemptKey: string;
   }): Promise<CloudWorkspace> {
     this.calls.push("recreateFromCheckpoint");
-    if (sha256Bytes(input.archive) !== input.checkpoint.archiveSha256 || input.archive.byteLength !== input.checkpoint.archiveBytes) {
-      throw new CloudWorkspaceError(this.name, "digest_mismatch", "checkpoint replay bytes do not match", "rejected");
-    }
+    const restored = validatePortableCheckpointArchive(input.archive, input.checkpoint, input.limits);
     const workspace = await this.createWorkspace({
-      attemptKey: input.checkpoint.attemptKey,
+      attemptKey: input.attemptKey,
       template: input.checkpoint.template,
       runtime: input.checkpoint.runtime,
       lockfileDigest: input.checkpoint.lockfileDigest,
@@ -172,9 +183,10 @@ export class FakeCloudWorkspaceProvider implements CloudWorkspaceProvider {
     });
     this.state(workspace).archive = {
       baseSha: input.checkpoint.baseSha,
-      sha256: input.checkpoint.archiveSha256,
-      bytes: input.archive.slice(),
+      sha256: input.checkpoint.sourceArchiveSha256,
+      bytes: restored.source.bytes.slice(),
     };
+    this.state(workspace).patch = restored.patch.patch.slice();
     return workspace;
   }
 

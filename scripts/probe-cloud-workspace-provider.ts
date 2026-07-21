@@ -164,13 +164,20 @@ async function main() {
 
     await provider.writeFile(first, "probe-identity.txt", new TextEncoder().encode(runId), 4_000);
     const checkpoint = await provider.checkpoint(first, {
+      jobId: runId, attempt: 1,
       baseSha: "0".repeat(40), runtime: binding.runtime.identity, lockfileDigest: binding.runtime.digest,
+      sourceArchiveSha256: sha256Bytes(bytes), sourceArchiveBytes: bytes.byteLength,
       template: binding.template.identity, attemptKey, causationId: runId,
     });
     await provider.terminate(first, "terminal");
     const terminatedFirst = first;
     first = null;
-    recreated = await provider.recreateFromCheckpoint({ checkpoint: checkpoint.manifest, archive: checkpoint.archive, limits: DEFAULT_WORKSPACE_LIMITS });
+    recreated = await provider.recreateFromCheckpoint({
+      checkpoint: checkpoint.manifest,
+      archive: checkpoint.archive,
+      limits: DEFAULT_WORKSPACE_LIMITS,
+      attemptKey: `${runId}:2`,
+    });
     if (recreated.providerWorkspaceId === terminatedFirst.providerWorkspaceId || recreated.providerSessionId === terminatedFirst.providerSessionId) {
       throw new Error("recreated sandbox identity did not change");
     }

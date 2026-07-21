@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
 import { posix } from "node:path";
+import {
+  canonicalWorkspaceCheckpoint,
+  normalizeWorkspaceCheckpoint,
+  parseCanonicalWorkspaceCheckpoint,
+  type WorkspaceCheckpoint,
+} from "../lib/workspace-checkpoint";
+
+export type { WorkspaceCheckpoint } from "../lib/workspace-checkpoint";
 
 export type CloudWorkspaceProviderName = "e2b" | "daytona" | "sandbox0" | "cloudflare";
 export type CloudWorkspaceFailureCode =
@@ -15,7 +23,11 @@ export type CloudWorkspaceFailureCode =
   | "resource_limit"
   | "unsafe_archive"
   | "unsafe_patch"
-  | "digest_mismatch";
+  | "digest_mismatch"
+  | "checkpoint_missing"
+  | "checkpoint_incompatible"
+  | "checkpoint_tampered"
+  | "cleanup_blocked";
 
 export class CloudWorkspaceError extends Error {
   constructor(
@@ -85,23 +97,6 @@ export type PatchManifest = {
   patch: Uint8Array;
 };
 
-export type WorkspaceCheckpoint = {
-  version: 1;
-  provider: CloudWorkspaceProviderName;
-  providerWorkspaceId: string;
-  providerSessionId: string;
-  providerCheckpointId?: string;
-  baseSha: string;
-  archiveSha256: string;
-  archiveBytes: number;
-  runtime: string;
-  lockfileDigest: string;
-  template: string;
-  attemptKey: string;
-  causationId: string;
-  createdAt: number;
-};
-
 export type ExecRequest = {
   command: string;
   cwd?: string;
@@ -134,7 +129,11 @@ export interface CloudWorkspaceProvider {
   writeFile(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number): Promise<void>;
   listFiles(workspace: CloudWorkspace, path: string, maxEntries: number): Promise<string[]>;
   checkpoint(workspace: CloudWorkspace, input: {
+    jobId: string;
+    attempt: number;
     baseSha: string;
+    sourceArchiveSha256: string;
+    sourceArchiveBytes: number;
     runtime: string;
     lockfileDigest: string;
     template: string;
@@ -145,6 +144,7 @@ export interface CloudWorkspaceProvider {
     checkpoint: WorkspaceCheckpoint;
     archive: Uint8Array;
     limits: WorkspaceLimits;
+    attemptKey: string;
   }): Promise<CloudWorkspace>;
   exportPatch(workspace: CloudWorkspace, baseSha: string, maxBytes: number): Promise<PatchManifest>;
   terminate(workspace: CloudWorkspace, reason: "terminal" | "orphan" | "cancelled"): Promise<void>;
@@ -201,7 +201,7 @@ export function validateRelativePath(value: string, provider: CloudWorkspaceProv
 function tarString(bytes: Uint8Array, start: number, length: number): string {
   const raw = bytes.subarray(start, start + length);
   const zero = raw.indexOf(0);
-  return new TextDecoder().decode(zero < 0 ? raw : raw.subarray(0, zero)).trim();
+  return new TextDecoder("utf-8", { fatal: true }).decode(zero < 0 ? raw : raw.subarray(0, zero));
 }
 
 function tarOctal(bytes: Uint8Array, start: number, length: number): number {
@@ -211,13 +211,116 @@ function tarOctal(bytes: Uint8Array, start: number, length: number): number {
 }
 
 function verifyTarChecksum(bytes: Uint8Array, offset: number): boolean {
-  const expected = tarOctal(bytes, offset + 148, 8);
+  let expected;
+  try { expected = tarOctal(bytes, offset + 148, 8); }
+  catch { return false; }
   if (!Number.isFinite(expected)) return false;
   let sum = 0;
   for (let index = 0; index < 512; index += 1) {
     sum += index >= 148 && index < 156 ? 32 : bytes[offset + index];
   }
   return sum === expected;
+}
+
+export type ValidatedTarMember = { path: string; type: "0" | "5" | "g"; size: number; data: Uint8Array };
+
+function validateGlobalPax(data: Uint8Array, provider: CloudWorkspaceProviderName): void {
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(data);
+  if (!text) throw new CloudWorkspaceError(provider, "unsafe_archive", "archive has empty pax metadata", "rejected");
+  let offset = 0;
+  while (offset < text.length) {
+    const space = text.indexOf(" ", offset);
+    if (space < 1) throw new CloudWorkspaceError(provider, "unsafe_archive", "archive has malformed pax metadata", "rejected");
+    const lengthText = text.slice(offset, space);
+    if (!/^[1-9][0-9]*$/.test(lengthText)) throw new CloudWorkspaceError(provider, "unsafe_archive", "archive has malformed pax length", "rejected");
+    const length = Number(lengthText);
+    const record = text.slice(space + 1, offset + length);
+    if (!Number.isSafeInteger(length) || offset + length > text.length || !record.endsWith("\n")) {
+      throw new CloudWorkspaceError(provider, "unsafe_archive", "archive has truncated pax metadata", "rejected");
+    }
+    const equals = record.indexOf("=");
+    const key = record.slice(0, equals);
+    const value = record.slice(equals + 1, -1);
+    if (equals < 1 || key !== "comment" || !/^[0-9a-f]{40,64}$/i.test(value)) {
+      throw new CloudWorkspaceError(provider, "unsafe_archive", `archive contains an unvalidated pax override: ${key || "unknown"}`, "rejected");
+    }
+    offset += length;
+  }
+}
+
+export function validatedTarMembers(
+  bytes: Uint8Array,
+  limits: Pick<WorkspaceLimits, "maxArchiveBytes" | "maxFileBytes"> = DEFAULT_WORKSPACE_LIMITS,
+  provider: CloudWorkspaceProviderName = "cloudflare",
+): ValidatedTarMember[] {
+  if (!bytes.byteLength || bytes.byteLength > limits.maxArchiveBytes) {
+    throw new CloudWorkspaceError(provider, "resource_limit", "archive byte count is empty or exceeds the configured limit", "rejected");
+  }
+  let offset = 0;
+  let zeroBlocks = 0;
+  let expandedBytes = 0;
+  const members: ValidatedTarMember[] = [];
+  const paths = new Set<string>();
+  while (offset + 512 <= bytes.byteLength) {
+    const header = bytes.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) {
+      zeroBlocks += 1;
+      offset += 512;
+      if (zeroBlocks === 2) break;
+      continue;
+    }
+    if (zeroBlocks) throw new CloudWorkspaceError(provider, "unsafe_archive", "archive has data after its end marker", "rejected");
+    if (!verifyTarChecksum(bytes, offset)) {
+      throw new CloudWorkspaceError(provider, "unsafe_archive", "archive contains an invalid tar checksum", "rejected");
+    }
+    let name: string;
+    let prefix: string;
+    try {
+      name = tarString(bytes, offset, 100);
+      prefix = tarString(bytes, offset + 345, 155);
+    } catch {
+      throw new CloudWorkspaceError(provider, "unsafe_archive", "archive path is not valid UTF-8", "rejected");
+    }
+    const rawPath = prefix ? `${prefix}/${name}` : name;
+    const path = validateRelativePath(rawPath, provider);
+    if (path !== rawPath.replace(/^\.\//, "") || paths.has(path)) {
+      throw new CloudWorkspaceError(provider, "unsafe_archive", `archive contains a non-canonical or duplicate path: ${rawPath}`, "rejected");
+    }
+    const rawType = String.fromCharCode(bytes[offset + 156] || 48);
+    const type = rawType === "\0" ? "0" : rawType;
+    let size;
+    try { size = tarOctal(bytes, offset + 124, 12); }
+    catch { throw new CloudWorkspaceError(provider, "unsafe_archive", "archive member size is malformed", "rejected"); }
+    if (!Number.isSafeInteger(size) || size < 0 || size > limits.maxFileBytes) {
+      throw new CloudWorkspaceError(provider, "resource_limit", "archive member exceeds the configured byte limit", "rejected");
+    }
+    if (type !== "0" && type !== "5" && type !== "g") {
+      const kind = ({
+        "1": "hardlink", "2": "symlink", "3": "device", "4": "device", "6": "device",
+        "x": "pax path override", "L": "GNU long-path override", "K": "GNU long-link override",
+      } as Record<string, string>)[type] ?? "unsupported";
+      throw new CloudWorkspaceError(provider, "unsafe_archive", `archive contains a ${kind} member`, "rejected");
+    }
+    if (type === "5" && size !== 0) throw new CloudWorkspaceError(provider, "unsafe_archive", "archive directory has a payload", "rejected");
+    const dataStart = offset + 512;
+    const dataEnd = dataStart + size;
+    if (dataEnd > bytes.byteLength) {
+      throw new CloudWorkspaceError(provider, "unsafe_archive", "archive member is truncated", "rejected");
+    }
+    if (type === "g") validateGlobalPax(bytes.subarray(dataStart, dataEnd), provider);
+    expandedBytes += size;
+    if (expandedBytes > limits.maxArchiveBytes) {
+      throw new CloudWorkspaceError(provider, "resource_limit", "archive expanded content exceeds the configured limit", "rejected");
+    }
+    paths.add(path);
+    members.push({ path, type, size, data: bytes.subarray(dataStart, dataEnd) });
+    if (members.length > 10_000) throw new CloudWorkspaceError(provider, "resource_limit", "archive contains too many members", "rejected");
+    offset = dataStart + Math.ceil(size / 512) * 512;
+  }
+  if (zeroBlocks < 2 || !members.length || bytes.subarray(offset).some((byte) => byte !== 0)) {
+    throw new CloudWorkspaceError(provider, "unsafe_archive", "archive is empty, unterminated, or has trailing data", "rejected");
+  }
+  return members;
 }
 
 export function validateCredentiallessArchive(
@@ -228,48 +331,10 @@ export function validateCredentiallessArchive(
   if (!/^[0-9a-f]{40,64}$/i.test(archive.baseSha)) {
     throw new CloudWorkspaceError(provider, "unsafe_archive", "archive base SHA is invalid", "rejected");
   }
-  if (archive.bytes.byteLength > limits.maxArchiveBytes) {
-    throw new CloudWorkspaceError(provider, "resource_limit", "archive exceeds the configured byte limit", "rejected");
-  }
   if (sha256Bytes(archive.bytes) !== archive.sha256) {
     throw new CloudWorkspaceError(provider, "digest_mismatch", "archive digest does not match its bytes", "rejected");
   }
-  let offset = 0;
-  let entries = 0;
-  while (offset + 512 <= archive.bytes.byteLength) {
-    const header = archive.bytes.subarray(offset, offset + 512);
-    if (header.every((byte) => byte === 0)) break;
-    if (!verifyTarChecksum(archive.bytes, offset)) {
-      throw new CloudWorkspaceError(provider, "unsafe_archive", "archive contains an invalid tar checksum", "rejected");
-    }
-    const name = tarString(archive.bytes, offset, 100);
-    const prefix = tarString(archive.bytes, offset + 345, 155);
-    validateRelativePath(prefix ? `${prefix}/${name}` : name, provider);
-    const type = String.fromCharCode(archive.bytes[offset + 156] || 48);
-    const size = tarOctal(archive.bytes, offset + 124, 12);
-    if (!Number.isSafeInteger(size) || size < 0 || size > limits.maxFileBytes) {
-      throw new CloudWorkspaceError(provider, "resource_limit", "archive member exceeds the configured byte limit", "rejected");
-    }
-    if (!["0", "5", "g"].includes(type)) {
-      const kind = ({ "1": "hardlink", "2": "symlink", "3": "device", "4": "device", "6": "device" } as Record<string, string>)[type] ?? "unsupported";
-      throw new CloudWorkspaceError(provider, "unsafe_archive", `archive contains a ${kind} member`, "rejected");
-    }
-    const dataStart = offset + 512;
-    const dataEnd = dataStart + size;
-    if (dataEnd > archive.bytes.byteLength) {
-      throw new CloudWorkspaceError(provider, "unsafe_archive", "archive member is truncated", "rejected");
-    }
-    if (type === "g") {
-      const pax = new TextDecoder().decode(archive.bytes.subarray(dataStart, dataEnd));
-      if (/(?:^|\n)\d+\s+(?:path|linkpath)=/m.test(pax)) {
-        throw new CloudWorkspaceError(provider, "unsafe_archive", "archive contains an unvalidated pax path override", "rejected");
-      }
-    }
-    entries += 1;
-    if (entries > 10_000) throw new CloudWorkspaceError(provider, "resource_limit", "archive contains too many members", "rejected");
-    offset = dataStart + Math.ceil(size / 512) * 512;
-  }
-  if (!entries) throw new CloudWorkspaceError(provider, "unsafe_archive", "archive is empty or malformed", "rejected");
+  validatedTarMembers(archive.bytes, limits, provider);
 }
 
 const SECRET_LIKE = /(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:gh[opsu]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16})\b|(?:api[_-]?key|access[_-]?token|client[_-]?secret|private[_-]?key)\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{16,})/i;
@@ -343,18 +408,124 @@ export function validatePatchManifest(
   for (const match of text.matchAll(/^(?:rename|copy) (?:from|to) (.+)$/gm)) patchPath(match[1], provider);
 }
 
+function writeTarOctal(header: Uint8Array, start: number, length: number, value: number): void {
+  const encoded = new TextEncoder().encode(value.toString(8).padStart(length - 1, "0") + "\0");
+  header.set(encoded, start);
+}
+
+export function createDeterministicTar(entries: Array<{ path: string; data: Uint8Array }>): Uint8Array {
+  const encoder = new TextEncoder();
+  const blocks: Uint8Array[] = [];
+  for (const entry of [...entries].sort((left, right) => left.path.localeCompare(right.path))) {
+    const path = validateRelativePath(entry.path);
+    const pathBytes = encoder.encode(path);
+    if (pathBytes.byteLength > 100) throw new CloudWorkspaceError("cloudflare", "unsafe_archive", "deterministic tar path is too long", "rejected");
+    const header = new Uint8Array(512);
+    header.set(pathBytes, 0);
+    header.set(encoder.encode("0000644\0"), 100);
+    writeTarOctal(header, 108, 8, 0);
+    writeTarOctal(header, 116, 8, 0);
+    writeTarOctal(header, 124, 12, entry.data.byteLength);
+    writeTarOctal(header, 136, 12, 0);
+    header.fill(32, 148, 156);
+    header[156] = "0".charCodeAt(0);
+    header.set(encoder.encode("ustar\0"), 257);
+    header.set(encoder.encode("00"), 263);
+    const checksum = header.reduce((sum, byte) => sum + byte, 0);
+    header.set(encoder.encode(checksum.toString(8).padStart(6, "0") + "\0 "), 148);
+    blocks.push(header, entry.data, new Uint8Array((512 - entry.data.byteLength % 512) % 512));
+  }
+  blocks.push(new Uint8Array(1024));
+  return new Uint8Array(Buffer.concat(blocks.map((block) => Buffer.from(block))));
+}
+
+export function createPortableCheckpointArchive(source: CredentiallessArchive, patch: Uint8Array): Uint8Array {
+  validateCredentiallessArchive(source);
+  validatePatchManifest({ baseSha: source.baseSha, patch, sha256: sha256Bytes(patch), byteCount: patch.byteLength }, source.baseSha);
+  return createDeterministicTar([
+    { path: "source.tar", data: source.bytes },
+    { path: "workspace.patch", data: patch },
+  ]);
+}
+
+export function validatePortableCheckpointArchive(
+  archive: Uint8Array,
+  checkpoint: WorkspaceCheckpoint,
+  limits: WorkspaceLimits = DEFAULT_WORKSPACE_LIMITS,
+): { source: CredentiallessArchive; patch: PatchManifest } {
+  const manifest = normalizeWorkspaceCheckpoint(checkpoint);
+  if (archive.byteLength !== manifest.archiveBytes || sha256Bytes(archive) !== manifest.archiveSha256) {
+    throw new CloudWorkspaceError(manifest.provider, "digest_mismatch", "portable checkpoint bytes do not match the canonical manifest", "rejected");
+  }
+  const members = validatedTarMembers(archive, limits, manifest.provider);
+  if (members.length !== 2 || members.some((member) => member.type !== "0")) {
+    throw new CloudWorkspaceError(manifest.provider, "unsafe_archive", "portable checkpoint must contain exactly two regular members", "rejected");
+  }
+  const sourceMember = members.find((member) => member.path === "source.tar");
+  const patchMember = members.find((member) => member.path === "workspace.patch");
+  if (!sourceMember || !patchMember) {
+    throw new CloudWorkspaceError(manifest.provider, "unsafe_archive", "portable checkpoint member names are invalid", "rejected");
+  }
+  const source: CredentiallessArchive = {
+    baseSha: manifest.baseSha,
+    sha256: manifest.sourceArchiveSha256,
+    bytes: sourceMember.data,
+  };
+  if (sourceMember.size !== manifest.sourceArchiveBytes) {
+    throw new CloudWorkspaceError(manifest.provider, "digest_mismatch", "portable checkpoint source byte count changed", "rejected");
+  }
+  validateCredentiallessArchive(source, limits, manifest.provider);
+  const patch: PatchManifest = {
+    baseSha: manifest.baseSha,
+    patch: patchMember.data,
+    sha256: sha256Bytes(patchMember.data),
+    byteCount: patchMember.size,
+  };
+  validatePatchManifest(patch, manifest.baseSha, limits.maxArchiveBytes, manifest.provider);
+  return { source, patch };
+}
+
+export type WorkspaceCheckpointBinding = {
+  jobId: string;
+  attempt: number;
+  provider: CloudWorkspaceProviderName;
+  baseSha: string;
+  sourceArchiveSha256: string;
+  sourceArchiveBytes: number;
+  runtime: string;
+  lockfileDigest: string;
+  template: string;
+  attemptKey: string;
+  causationId: string;
+};
+
+export function assertWorkspaceCheckpointBinding(checkpoint: WorkspaceCheckpoint, expected: WorkspaceCheckpointBinding): void {
+  const item = normalizeWorkspaceCheckpoint(checkpoint);
+  for (const key of [
+    "jobId", "attempt", "provider", "baseSha", "sourceArchiveSha256", "sourceArchiveBytes",
+    "runtime", "lockfileDigest", "template", "attemptKey", "causationId",
+  ] as const) {
+    if (item[key] !== expected[key]) {
+      throw new CloudWorkspaceError(item.provider, "checkpoint_incompatible", `checkpoint ${key} binding changed`, "rejected");
+    }
+  }
+}
+
 export type CheckpointStore = {
-  put(manifest: WorkspaceCheckpoint, archive: Uint8Array): Promise<{ ref: string; digest: string; byteCount: number }>;
+  put(manifest: WorkspaceCheckpoint, archive: Uint8Array): Promise<{ ref: string; digest: string; byteCount: number; manifest: string; manifestDigest: string }>;
   get(ref: string, digest: string, byteCount: number): Promise<Uint8Array>;
 };
 
 export class ContentAddressedCheckpointStore implements CheckpointStore {
   constructor(
     private readonly write: (key: string, value: Uint8Array, metadata: Record<string, string>) => Promise<void>,
-    private readonly read: (key: string) => Promise<Uint8Array>,
+    private readonly read: (key: string) => Promise<Uint8Array | null>,
   ) {}
 
   async put(manifest: WorkspaceCheckpoint, archive: Uint8Array) {
+    const canonicalManifest = canonicalWorkspaceCheckpoint(manifest);
+    const manifestDigest = sha256Bytes(canonicalManifest);
+    validatePortableCheckpointArchive(archive, manifest);
     const digest = sha256Bytes(archive);
     if (digest !== manifest.archiveSha256 || archive.byteLength !== manifest.archiveBytes) {
       throw new CloudWorkspaceError(manifest.provider, "digest_mismatch", "checkpoint bytes do not match the immutable manifest", "rejected");
@@ -368,8 +539,9 @@ export class ContentAddressedCheckpointStore implements CheckpointStore {
       lockfile: manifest.lockfileDigest,
       attempt: manifest.attemptKey,
       causation: manifest.causationId,
+      manifest: manifestDigest,
     });
-    return { ref, digest, byteCount: archive.byteLength };
+    return { ref, digest, byteCount: archive.byteLength, manifest: canonicalManifest, manifestDigest };
   }
 
   async get(ref: string, digest: string, byteCount: number) {
@@ -377,6 +549,7 @@ export class ContentAddressedCheckpointStore implements CheckpointStore {
       throw new CloudWorkspaceError("cloudflare", "digest_mismatch", "checkpoint reference is not content addressed", "rejected");
     }
     const value = await this.read(ref);
+    if (!value) throw new CloudWorkspaceError("cloudflare", "checkpoint_missing", "R2 checkpoint object is missing", "deferred");
     if (value.byteLength !== byteCount || sha256Bytes(value) !== digest) {
       throw new CloudWorkspaceError("cloudflare", "digest_mismatch", "R2 checkpoint digest or byte count mismatch", "rejected");
     }
@@ -384,33 +557,12 @@ export class ContentAddressedCheckpointStore implements CheckpointStore {
   }
 }
 
-export type CacheTelemetry = { hits: number; misses: number; coldMs?: number; warmMs?: number; bytes?: number };
-
-export class WorkspaceLayerCache {
-  private readonly entries = new Map<string, { digest: string; bytes: number }>();
-  readonly telemetry: CacheTelemetry = { hits: 0, misses: 0 };
-
-  key(project: string, tenant: string, runtime: string, lockfileDigest: string): string {
-    return sha256Bytes(`${project}\0${tenant}\0${runtime}\0${lockfileDigest}`);
+export function parseCheckpointReceiptManifest(value: string, digest: string): WorkspaceCheckpoint {
+  if (sha256Bytes(value) !== digest) {
+    throw new CloudWorkspaceError("cloudflare", "checkpoint_tampered", "checkpoint manifest digest changed", "rejected");
   }
-
-  lookup(key: string): { digest: string; bytes: number } | null {
-    const entry = this.entries.get(key);
-    if (entry) this.telemetry.hits += 1;
-    else this.telemetry.misses += 1;
-    return entry ?? null;
-  }
-
-  populate(key: string, digest: string, bytes: number): void {
-    if (!/^[0-9a-f]{64}$/.test(key) || !/^[0-9a-f]{64}$/.test(digest) || bytes < 0) {
-      throw new Error("cache identity is invalid");
-    }
-    this.entries.set(key, { digest, bytes });
-    this.telemetry.bytes = (this.telemetry.bytes ?? 0) + bytes;
-  }
-
-  recordCold(ms: number): void { this.telemetry.coldMs = Math.max(0, ms); }
-  recordWarm(ms: number): void { this.telemetry.warmMs = Math.max(0, ms); }
+  try { return parseCanonicalWorkspaceCheckpoint(value); }
+  catch { throw new CloudWorkspaceError("cloudflare", "checkpoint_tampered", "checkpoint manifest is not canonical", "rejected"); }
 }
 
 export async function controllerApplyValidatedPatch(
