@@ -684,6 +684,10 @@ export default defineSchema({
     checkpointBytes: v.optional(v.number()),
     checkpointManifestDigest: v.optional(v.string()),
     checkpointManifest: v.optional(v.string()),
+    // This write-once marker is the replay lookup authority. It is set in
+    // the same mutation as the complete immutable receipt so replay never
+    // has to scan historical attempts or infer availability from fragments.
+    checkpointAvailable: v.optional(v.boolean()),
     cleanupBlockedCode: v.optional(v.string()),
     cleanupBlockedReason: v.optional(v.string()),
     cleanupBlockedAt: v.optional(v.number()),
@@ -697,6 +701,7 @@ export default defineSchema({
     createdAt: v.number(),
   })
     .index("by_job_attempt", ["jobId", "attempt"])
+    .index("by_job_checkpoint_available_attempt", ["jobId", "checkpointAvailable", "attempt"])
     .index("by_status_progress", ["status", "progressAt"]),
 
   // Accepted GoalPlan authority is normalized once. These compact rows map

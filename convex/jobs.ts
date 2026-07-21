@@ -1981,8 +1981,9 @@ export const recordCloudCheckpoint = mutation({
       || manifest.template !== attempt.workspaceTemplate
       || manifest.attemptKey !== `${String(a.jobId)}:${a.expectedAttempt}`
       || manifest.causationId !== `${String(row.workerRunId)}:${a.expectedAttempt}`) return false;
-    if (attempt.checkpointRef || attempt.checkpointDigest || attempt.checkpointManifest) {
-      return attempt.checkpointRef === a.checkpointRef
+    if (attempt.checkpointRef || attempt.checkpointDigest || attempt.checkpointManifest || attempt.checkpointAvailable !== undefined) {
+      return attempt.checkpointAvailable === true
+        && attempt.checkpointRef === a.checkpointRef
         && attempt.checkpointDigest === a.checkpointDigest
         && attempt.checkpointBytes === a.checkpointBytes
         && attempt.checkpointManifestDigest === a.checkpointManifestDigest
@@ -1992,7 +1993,7 @@ export const recordCloudCheckpoint = mutation({
     await ctx.db.patch(attempt._id, {
       checkpointRef: a.checkpointRef, checkpointDigest: a.checkpointDigest,
       checkpointBytes: a.checkpointBytes, checkpointManifestDigest: a.checkpointManifestDigest,
-      checkpointManifest: a.checkpointManifest,
+      checkpointManifest: a.checkpointManifest, checkpointAvailable: true,
       lastEventAt: now,
     });
     await patchJobWithRuntime(ctx, row, { providerRunState: "checkpointed", providerObservedAt: now });
@@ -2021,10 +2022,16 @@ export const cloudCheckpointForReplay = query({
       return { disposition: "reject" as const, reason: "current_binding_invalid" };
     }
     if (a.expectedAttempt <= 1) return { disposition: "hydrate" as const, reason: "first_attempt" };
-    const prior: any = (await ctx.db.query("workAttempts")
-      .withIndex("by_job_attempt", (q: any) => q.eq("jobId", a.jobId)).collect())
-      .filter((item: any) => item.attempt < a.expectedAttempt && item.checkpointRef)
-      .sort((left: any, right: any) => right.attempt - left.attempt)[0];
+    // `checkpointAvailable` is written atomically with the receipt. Legacy
+    // rows without it intentionally hydrate: replay must not reintroduce an
+    // unbounded scan or infer authority from partial historical fields.
+    const prior: any = await ctx.db.query("workAttempts")
+      .withIndex("by_job_checkpoint_available_attempt", (q: any) => q
+        .eq("jobId", a.jobId)
+        .eq("checkpointAvailable", true)
+        .lt("attempt", a.expectedAttempt))
+      .order("desc")
+      .first();
     if (!prior?.checkpointRef) return { disposition: "hydrate" as const, reason: "no_prior_checkpoint" };
     if (!prior.checkpointManifest || !prior.checkpointManifestDigest || !prior.checkpointDigest
       || !Number.isSafeInteger(prior.checkpointBytes)) {
