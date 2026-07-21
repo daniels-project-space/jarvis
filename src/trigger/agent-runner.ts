@@ -80,10 +80,11 @@ import {
   createCredentiallessGitArchive,
   persistPortableCheckpoint,
   prepareCloudWorkspaceExecution,
+  replayCloudWorkspaceExecution,
 } from "./cloud-workspace-controller";
 import { createR2CheckpointStore } from "./cloud-checkpoint-r2";
-import { configuredCloudWorkspaceProvider } from "./cloud-workspace-providers";
-import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider } from "./cloud-workspace";
+import { configuredCloudWorkspaceProvider, configuredCloudWorkspaceProviderForName } from "./cloud-workspace-providers";
+import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, createDeterministicTar, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider, type CloudWorkspaceProviderName, type CredentiallessArchive } from "./cloud-workspace";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -626,27 +627,34 @@ export async function runAgentMaintenance() {
   } catch {
     /* recovery must never block fleet dispatch */
   }
-  try {
-    const cleanupProvider = configuredCloudWorkspaceProvider(process.env, false);
-    const orphans: any[] = await convexQuery("jobs:cloudWorkspaceOrphans", { olderThan: Date.now() - 5 * 60_000 }) ?? [];
-    for (const orphan of orphans.filter((row) => row.providerName === cleanupProvider.name)) {
-      const workspace: CloudWorkspace = {
-        provider: cleanupProvider.name,
-        providerWorkspaceId: String(orphan.providerWorkspaceId),
-        providerSessionId: String(orphan.providerSessionId),
-        root: "/workspace/repository",
-        createdAt: 0,
-      };
+  const orphans: any[] = await convexQuery("jobs:cloudWorkspaceOrphans", { olderThan: Date.now() - 5 * 60_000 }).catch(() => []) ?? [];
+  for (const orphan of orphans) {
+    const providerName = String(orphan.providerName) as CloudWorkspaceProviderName;
+    const workspace: CloudWorkspace = {
+      provider: providerName,
+      providerWorkspaceId: String(orphan.providerWorkspaceId),
+      providerSessionId: String(orphan.providerSessionId),
+      root: "/workspace/repository",
+      createdAt: 0,
+    };
+    try {
+      const cleanupProvider = configuredCloudWorkspaceProviderForName(process.env, providerName, false);
       await cleanupProvider.terminate(workspace, "orphan");
       await convexMutation("jobs:markCloudWorkspaceTerminated", {
         jobId: orphan.jobId, expectedAttempt: Number(orphan.attempt),
         providerWorkspaceId: workspace.providerWorkspaceId,
         providerSessionId: workspace.providerSessionId,
       });
+    } catch (error) {
+      const failure = error instanceof CloudWorkspaceError ? error : null;
+      await convexMutation("jobs:noteCloudWorkspaceCleanupBlocked", {
+        jobId: orphan.jobId, expectedAttempt: Number(orphan.attempt),
+        providerWorkspaceId: workspace.providerWorkspaceId,
+        providerSessionId: workspace.providerSessionId,
+        code: failure?.code ?? "provider_unavailable",
+        reason: failure?.message ?? "persisted provider cleanup failed",
+      }).catch(() => false);
     }
-  } catch {
-    // Missing provider configuration is an expected blocked state. Cleanup is
-    // retried by the next scheduled Trigger supervisor; it never falls back.
   }
   try {
     const due: any[] = (await convexMutation("reminders:due", {})) ?? [];
@@ -1455,53 +1463,80 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           : sha256Bytes("no-lockfile");
         const workspaceTemplate = String(process.env.JARVIS_CLOUD_WORKSPACE_TEMPLATE ?? "node22-codex-0.144.5");
         const checkpointStore = await createR2CheckpointStore();
-        if (repoDir) {
+        const workspaceBaseSha = baseSha || sha256Bytes(String(job.jobId));
+        const sourceArchive: CredentiallessArchive = repoDir
+          ? await createCredentiallessGitArchive(repoDir, workspaceBaseSha, env)
+          : (() => {
+              const bytes = createDeterministicTar([{
+                path: ".jarvis-workspace",
+                data: new TextEncoder().encode("credentialless scratch workspace\n"),
+              }]);
+              return { baseSha: workspaceBaseSha, bytes, sha256: sha256Bytes(bytes) };
+            })();
+        const attemptKey = `${String(job.jobId)}:${expectedAttempt}`;
+        const assertCurrentWorkspace = async (_phase: string) => (await executionStatus()) === "running";
+        const bindCloudWorkspace = async (workspace: CloudWorkspace) => Boolean(await convexMutation("jobs:bindCloudWorkspace", {
+          jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
+          providerName: workspace.provider, providerWorkspaceId: workspace.providerWorkspaceId,
+          providerSessionId: workspace.providerSessionId,
+          baseSha: workspaceBaseSha, runtime: workspaceRuntime, lockfileDigest,
+          template: workspaceTemplate, sourceArchiveDigest: sourceArchive.sha256,
+          sourceArchiveBytes: sourceArchive.bytes.byteLength,
+        }).catch(() => false));
+        const recordReplayDecision = async (disposition: "replay" | "hydrate" | "reject", reason: string) => {
+          const recorded = await convexMutation("jobs:recordCloudReplayDecision", {
+            jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId), disposition, reason,
+          }).catch(() => false);
+          if (!recorded) throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt fence rejected checkpoint replay decision", "deferred");
+        };
+        const replayDecision: any = await convexQuery("jobs:cloudCheckpointForReplay", {
+          jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
+          providerName: cloudProvider.name, baseSha: workspaceBaseSha, runtime: workspaceRuntime,
+          lockfileDigest, template: workspaceTemplate, sourceArchiveDigest: sourceArchive.sha256,
+          sourceArchiveBytes: sourceArchive.bytes.byteLength,
+        });
+        if (!replayDecision || replayDecision.disposition === "reject") {
+          await recordReplayDecision("reject", String(replayDecision?.reason ?? "replay_authority_unavailable"));
+          throw new CloudWorkspaceError(cloudProvider.name, "checkpoint_tampered", `checkpoint replay rejected: ${String(replayDecision?.reason ?? "authority unavailable")}`, "rejected");
+        }
+        if (replayDecision.disposition === "replay") {
+          try {
+            const replayed = await replayCloudWorkspaceExecution({
+              provider: cloudProvider, store: checkpointStore,
+              receipt: replayDecision,
+              current: {
+                jobId: String(job.jobId), attempt: expectedAttempt, baseSha: workspaceBaseSha,
+                sourceArchiveSha256: sourceArchive.sha256, sourceArchiveBytes: sourceArchive.bytes.byteLength,
+                runtime: workspaceRuntime, lockfileDigest, template: workspaceTemplate, attemptKey,
+              },
+              assertCurrent: assertCurrentWorkspace,
+              bindWorkspace: bindCloudWorkspace,
+            });
+            providerWorkspace = replayed.workspace;
+            await recordReplayDecision("replay", "compatible_checkpoint");
+          } catch (error) {
+            if (!(error instanceof CloudWorkspaceError) || error.code !== "checkpoint_missing") throw error;
+            await recordReplayDecision("hydrate", "checkpoint_object_missing");
+          }
+        } else {
+          await recordReplayDecision("hydrate", String(replayDecision.reason));
+        }
+        if (!providerWorkspace) {
           const preparedWorkspace = await prepareCloudWorkspaceExecution({
             providerFactory: () => cloudProvider,
-            hydrateArchive: () => createCredentiallessGitArchive(repoDir!, baseSha, env),
-            attemptKey: `${String(job.jobId)}:${expectedAttempt}`,
-            template: workspaceTemplate,
-            runtime: workspaceRuntime,
-            lockfileDigest,
-            bindWorkspace: async (workspace) => Boolean(await convexMutation("jobs:bindCloudWorkspace", {
-              jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
-              providerName: workspace.provider, providerWorkspaceId: workspace.providerWorkspaceId,
-              providerSessionId: workspace.providerSessionId,
-            }).catch(() => false)),
+            hydrateArchive: async () => sourceArchive,
+            attemptKey, template: workspaceTemplate, runtime: workspaceRuntime, lockfileDigest,
+            bindWorkspace: bindCloudWorkspace,
+            assertCurrent: assertCurrentWorkspace,
           });
           providerWorkspace = preparedWorkspace.workspace;
+        }
+        if (repoDir) {
           // The trusted hydration checkout must not coexist with Codex. The
-          // app-server is started only after these bytes have been uploaded
-          // and the host copy has been removed; a fresh exact-base controller
-          // checkout is created only after the app-server has exited.
+          // app-server starts only after replay/hydration is fenced and bound.
           rmSync(repoDir, { recursive: true, force: true });
           repoDir = null;
           cwd = controllerScratch;
-        } else {
-          providerWorkspace = await cloudProvider.createWorkspace({
-            attemptKey: `${String(job.jobId)}:${expectedAttempt}`,
-            template: workspaceTemplate,
-            runtime: workspaceRuntime,
-            lockfileDigest,
-            limits: DEFAULT_WORKSPACE_LIMITS,
-          });
-          const bound = await convexMutation("jobs:bindCloudWorkspace", {
-            jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
-            providerName: providerWorkspace.provider, providerWorkspaceId: providerWorkspace.providerWorkspaceId,
-            providerSessionId: providerWorkspace.providerSessionId,
-          }).catch(() => false);
-          if (!bound) {
-            await cloudProvider.terminate(providerWorkspace, "orphan").catch(() => undefined);
-            providerWorkspace = null;
-            throw new Error("Convex rejected the provider workspace/session fence");
-          }
-          const initialized = await cloudProvider.exec(providerWorkspace, {
-            command: "mkdir -p /workspace/repository && cd /workspace/repository && git init -q && git config user.email jarvis-controller@example.invalid && git config user.name 'JARVIS controller baseline' && git commit -q --allow-empty -m baseline",
-            cwd: "/workspace",
-            timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs,
-            maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes,
-          });
-          if (initialized.exitCode !== 0) throw new Error("cloud scratch initialization failed");
         }
         const criteria = Array.isArray(job.acceptanceCriteria) && job.acceptanceCriteria.length
           ? job.acceptanceCriteria.map(String)
@@ -1593,13 +1628,21 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           provider: cloudProvider,
           workspace: providerWorkspace,
           store: checkpointStore,
-          baseSha: baseSha || sha256Bytes(String(job.jobId)),
+          jobId: String(job.jobId),
+          attempt: expectedAttempt,
+          baseSha: workspaceBaseSha,
+          sourceArchiveSha256: sourceArchive.sha256,
+          sourceArchiveBytes: sourceArchive.bytes.byteLength,
           runtime: workspaceRuntime,
           lockfileDigest,
           template: workspaceTemplate,
           attemptKey: `${String(job.jobId)}:${expectedAttempt}`,
           causationId: `${String(job.workerRunId)}:${expectedAttempt}`,
+          assertCurrent: assertCurrentWorkspace,
         });
+        if (!await assertCurrentWorkspace("checkpoint_record")) {
+          throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt fence rejected checkpoint record", "deferred");
+        }
         const checkpointRecorded = await convexMutation("jobs:recordCloudCheckpoint", {
           jobId: job.jobId, expectedAttempt,
           providerWorkspaceId: providerWorkspace.providerWorkspaceId,
@@ -1607,10 +1650,14 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           checkpointRef: portable.ref,
           checkpointDigest: portable.digest,
           checkpointBytes: portable.byteCount,
-          checkpointManifestDigest: sha256Bytes(JSON.stringify(portable.manifest)),
+          checkpointManifestDigest: portable.manifestDigest,
+          checkpointManifest: portable.canonicalManifest,
         }).catch(() => false);
         if (!checkpointRecorded) throw new Error("Convex rejected the portable checkpoint receipt");
         if (repo) {
+          if (!await assertCurrentWorkspace("patch_export")) {
+            throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt fence rejected patch export", "deferred");
+          }
           const patch = await cloudProvider.exportPatch(providerWorkspace, baseSha, DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
           if (!controllerCheckoutPath || !token) throw new Error("trusted controller checkout authority is unavailable after specialist exit");
           const url = githubRepoUrl(repo);

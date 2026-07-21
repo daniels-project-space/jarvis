@@ -30,6 +30,7 @@ export async function createR2CheckpointStore(): Promise<CheckpointStore> {
     },
     async (key) => {
       const response = await aws.fetch(`${endpoint}/${BUCKET}/${key}`);
+      if (response.status === 404) return null;
       if (!response.ok) throw new Error(`R2 checkpoint read failed (${response.status})`);
       return new Uint8Array(await response.arrayBuffer());
     },

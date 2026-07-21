@@ -5,22 +5,26 @@ import {
   CloudWorkspaceError,
   ContentAddressedCheckpointStore,
   DEFAULT_WORKSPACE_LIMITS,
-  WorkspaceLayerCache,
   assertRequiredCapabilities,
+  createPortableCheckpointArchive,
   controllerApplyValidatedPatch,
   sha256Bytes,
   validateCredentiallessArchive,
   validatePatchManifest,
+  validatePortableCheckpointArchive,
   type CredentiallessArchive,
   type PatchManifest,
 } from "./cloud-workspace";
 import { FakeCloudWorkspaceProvider } from "./cloud-workspace-fake";
 import { assertCloudAgentExecutionReady, CLOUD_AGENT_EXECUTION_READINESS } from "./cloud-agent-runner";
 import { CloudWorkspaceToolBridge } from "./cloud-workspace-tools";
-import { prepareCloudWorkspaceExecution, terminateOrphanedCloudWorkspaces } from "./cloud-workspace-controller";
-import { CLOUD_WORKSPACE_CAPABILITY_MATRIX, configuredCloudWorkspaceProvider } from "./cloud-workspace-providers";
+import { persistPortableCheckpoint, prepareCloudWorkspaceExecution, replayCloudWorkspaceExecution, terminateOrphanedCloudWorkspaces } from "./cloud-workspace-controller";
+import { CLOUD_WORKSPACE_CAPABILITY_MATRIX, configuredCloudWorkspaceProvider, configuredCloudWorkspaceProviderForName } from "./cloud-workspace-providers";
+import { canonicalWorkspaceCheckpoint } from "../lib/workspace-checkpoint";
 
 const BASE = "a".repeat(40);
+const JOB = "job-checkpoint-replay";
+const LOCK = "b".repeat(64);
 
 function tar(entries: Array<{ name: string; type?: string; data?: Uint8Array; size?: number }>): Uint8Array {
   const blocks: Uint8Array[] = [];
@@ -57,22 +61,82 @@ function patch(text: string, baseSha = BASE): PatchManifest {
   return { baseSha, sha256: sha256Bytes(bytes), byteCount: bytes.byteLength, patch: bytes };
 }
 
+async function storedCheckpointFixture() {
+  const objects = new Map<string, Uint8Array>();
+  const store = new ContentAddressedCheckpointStore(
+    async (key, value) => { objects.set(key, value.slice()); },
+    async (key) => objects.get(key)?.slice() ?? null,
+  );
+  const provider = new FakeCloudWorkspaceProvider();
+  const source = archive([{ name: "README.md", data: new TextEncoder().encode("base\n") }]);
+  const first = await provider.createWorkspace({ attemptKey: `${JOB}:1`, template: "node", runtime: "node-22", lockfileDigest: LOCK, limits: DEFAULT_WORKSPACE_LIMITS });
+  await provider.uploadCredentiallessArchive(first, source);
+  provider.setPatch(first, "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-base\n+edited\n");
+  const stored = await persistPortableCheckpoint({
+    provider, workspace: first, store, jobId: JOB, attempt: 1, baseSha: BASE,
+    sourceArchiveSha256: source.sha256, sourceArchiveBytes: source.bytes.byteLength,
+    runtime: "node-22", lockfileDigest: LOCK, template: "node",
+    attemptKey: `${JOB}:1`, causationId: "run-1:1", assertCurrent: async () => true,
+  });
+  const receipt = {
+    sourceAttempt: 1,
+    checkpointRef: stored.ref, checkpointDigest: stored.digest, checkpointBytes: stored.byteCount,
+    checkpointManifest: stored.canonicalManifest, checkpointManifestDigest: stored.manifestDigest,
+  };
+  const current = {
+    jobId: JOB, attempt: 2, baseSha: BASE, sourceArchiveSha256: source.sha256,
+    sourceArchiveBytes: source.bytes.byteLength, runtime: "node-22", lockfileDigest: LOCK,
+    template: "node", attemptKey: `${JOB}:2`,
+  };
+  return { objects, store, provider, source, first, stored, receipt, current };
+}
+
 describe("fail-closed cloud workspace boundary", () => {
-  it("runs the fake full lifecycle, same-id resume, termination, and new-id exact replay", async () => {
+  it("orchestrates attempt 1 edit -> R2 checkpoint -> termination -> attempt 2 exact replay with a safe preserved patch", async () => {
     const provider = new FakeCloudWorkspaceProvider();
     const source = archive([{ name: "README.md", data: new TextEncoder().encode("base") }]);
-    const first = await provider.createWorkspace({ attemptKey: "job:1", template: "node", runtime: "node-22", lockfileDigest: "b".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS });
+    const objects = new Map<string, Uint8Array>();
+    const store = new ContentAddressedCheckpointStore(
+      async (key, value) => { objects.set(key, value.slice()); },
+      async (key) => objects.get(key)?.slice() ?? null,
+    );
+    const first = await provider.createWorkspace({ attemptKey: `${JOB}:1`, template: "node", runtime: "node-22", lockfileDigest: LOCK, limits: DEFAULT_WORKSPACE_LIMITS });
     await provider.uploadCredentiallessArchive(first, source);
     await provider.writeFile(first, "src/value.ts", new TextEncoder().encode("export const value = 1;"), 1_000);
+    provider.setPatch(first, "diff --git a/src/value.ts b/src/value.ts\nnew file mode 100644\n--- /dev/null\n+++ b/src/value.ts\n@@ -0,0 +1 @@\n+export const value = 1;\n");
     await expect(provider.exec(first, { command: "printf ready", timeoutMs: 1_000, maxOutputBytes: 1_000 })).resolves.toMatchObject({ stdout: "ready" });
-    expect(provider.resume(first)).toEqual(first);
-    const checkpoint = await provider.checkpoint(first, { baseSha: BASE, runtime: "node-22", lockfileDigest: "b".repeat(64), template: "node", attemptKey: "job:1", causationId: "run:1" });
+    const checkpoint = await persistPortableCheckpoint({
+      provider, workspace: first, store, jobId: JOB, attempt: 1, baseSha: BASE,
+      sourceArchiveSha256: source.sha256, sourceArchiveBytes: source.bytes.byteLength,
+      runtime: "node-22", lockfileDigest: LOCK, template: "node",
+      attemptKey: `${JOB}:1`, causationId: "run-1:1", assertCurrent: async () => true,
+    });
     await provider.terminate(first, "terminal");
     expect(provider.isTerminated(first)).toBe(true);
-    const replay = await provider.recreateFromCheckpoint({ checkpoint: checkpoint.manifest, archive: checkpoint.archive, limits: DEFAULT_WORKSPACE_LIMITS });
-    expect(replay.providerWorkspaceId).not.toBe(first.providerWorkspaceId);
-    expect(replay.providerSessionId).not.toBe(first.providerSessionId);
-    expect(sha256Bytes(checkpoint.archive)).toBe(checkpoint.manifest.archiveSha256);
+    const replayed = await replayCloudWorkspaceExecution({
+      provider, store,
+      receipt: {
+        sourceAttempt: 1,
+        checkpointRef: checkpoint.ref, checkpointDigest: checkpoint.digest,
+        checkpointBytes: checkpoint.byteCount, checkpointManifest: checkpoint.canonicalManifest,
+        checkpointManifestDigest: checkpoint.manifestDigest,
+      },
+      current: {
+        jobId: JOB, attempt: 2, baseSha: BASE, sourceArchiveSha256: source.sha256,
+        sourceArchiveBytes: source.bytes.byteLength, runtime: "node-22", lockfileDigest: LOCK,
+        template: "node", attemptKey: `${JOB}:2`,
+      },
+      assertCurrent: async () => true,
+      bindWorkspace: async () => true,
+    });
+    expect(replayed.workspace.providerWorkspaceId).not.toBe(first.providerWorkspaceId);
+    expect(replayed.workspace.providerSessionId).not.toBe(first.providerSessionId);
+    const exported = await provider.exportPatch(replayed.workspace, BASE, DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
+    expect(new TextDecoder().decode(exported.patch)).toContain("export const value = 1");
+    validatePatchManifest(exported, BASE);
+    await provider.terminate(replayed.workspace, "terminal");
+    expect(provider.isTerminated(replayed.workspace)).toBe(true);
+    expect(Object.keys(checkpoint)).not.toContain("archive");
     expect(provider.calls).toEqual(expect.arrayContaining(["createWorkspace", "uploadCredentiallessArchive", "exec", "checkpoint", "terminate:terminal", "recreateFromCheckpoint"]));
   });
 
@@ -115,6 +179,10 @@ describe("fail-closed cloud workspace boundary", () => {
     ["hardlink", { name: "link", type: "1" }],
     ["character device", { name: "device", type: "3" }],
     ["block device", { name: "device", type: "4" }],
+    ["pax path override", { name: "PaxHeaders/path", type: "x" }],
+    ["empty global pax override", { name: "pax_global_header", type: "g" }],
+    ["GNU long path override", { name: "long-path", type: "L" }],
+    ["GNU long link override", { name: "long-link", type: "K" }],
   ])("rejects unsafe archive member: %s", (_label, member) => {
     expect(() => validateCredentiallessArchive(archive([member]))).toThrow(CloudWorkspaceError);
   });
@@ -172,31 +240,129 @@ describe("fail-closed cloud workspace boundary", () => {
     const objects = new Map<string, Uint8Array>();
     const store = new ContentAddressedCheckpointStore(
       async (key, value) => { objects.set(key, value.slice()); },
-      async (key) => objects.get(key)?.slice() ?? new Uint8Array(),
+      async (key) => objects.get(key)?.slice() ?? null,
     );
-    const bytes = new TextEncoder().encode("checkpoint");
     const provider = new FakeCloudWorkspaceProvider();
-    const workspace = await provider.createWorkspace({ attemptKey: "job:1", template: "node", runtime: "node-22", lockfileDigest: "b".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS });
-    const manifest = (await provider.checkpoint(workspace, { baseSha: BASE, runtime: "node-22", lockfileDigest: "b".repeat(64), template: "node", attemptKey: "job:1", causationId: "run:1" })).manifest;
-    const fixed = { ...manifest, archiveSha256: sha256Bytes(bytes), archiveBytes: bytes.byteLength };
-    const stored = await store.put(fixed, bytes);
-    await expect(store.get(stored.ref, stored.digest, stored.byteCount)).resolves.toEqual(bytes);
+    const source = archive([{ name: "safe.txt", data: new TextEncoder().encode("safe") }]);
+    const workspace = await provider.createWorkspace({ attemptKey: `${JOB}:1`, template: "node", runtime: "node-22", lockfileDigest: LOCK, limits: DEFAULT_WORKSPACE_LIMITS });
+    await provider.uploadCredentiallessArchive(workspace, source);
+    const checkpoint = await provider.checkpoint(workspace, {
+      jobId: JOB, attempt: 1, baseSha: BASE, sourceArchiveSha256: source.sha256,
+      sourceArchiveBytes: source.bytes.byteLength, runtime: "node-22", lockfileDigest: LOCK,
+      template: "node", attemptKey: `${JOB}:1`, causationId: "run:1",
+    });
+    const stored = await store.put(checkpoint.manifest, checkpoint.archive);
+    await expect(store.get(stored.ref, stored.digest, stored.byteCount)).resolves.toEqual(checkpoint.archive);
     objects.set(stored.ref, new TextEncoder().encode("tampered"));
     await expect(store.get(stored.ref, stored.digest, stored.byteCount)).rejects.toMatchObject({ code: "digest_mismatch" });
   });
 
-  it("isolates dependency caches by project, tenant, runtime, and exact lockfile digest", () => {
-    const cache = new WorkspaceLayerCache();
-    const first = cache.key("jarvis", "daniel", "node-22", "a".repeat(64));
-    const otherProject = cache.key("finance-engine-v2", "daniel", "node-22", "a".repeat(64));
-    const otherTenant = cache.key("jarvis", "other", "node-22", "a".repeat(64));
-    expect(new Set([first, otherProject, otherTenant]).size).toBe(3);
-    expect(cache.lookup(first)).toBeNull();
-    cache.populate(first, "b".repeat(64), 123);
-    expect(cache.lookup(first)).toEqual({ digest: "b".repeat(64), bytes: 123 });
-    expect(cache.lookup(otherProject)).toBeNull();
-    cache.recordCold(800); cache.recordWarm(90);
-    expect(cache.telemetry).toMatchObject({ misses: 2, hits: 1, coldMs: 800, warmMs: 90, bytes: 123 });
+  it("keeps two sequential portable checkpoints content-stable instead of recursively growing", async () => {
+    const fixture = await storedCheckpointFixture();
+    await fixture.provider.terminate(fixture.first, "terminal");
+    const replayed = await replayCloudWorkspaceExecution({
+      provider: fixture.provider, store: fixture.store, receipt: fixture.receipt,
+      current: fixture.current, assertCurrent: async () => true, bindWorkspace: async () => true,
+    });
+    const second = await persistPortableCheckpoint({
+      provider: fixture.provider, workspace: replayed.workspace, store: fixture.store,
+      jobId: JOB, attempt: 2, baseSha: BASE,
+      sourceArchiveSha256: fixture.source.sha256, sourceArchiveBytes: fixture.source.bytes.byteLength,
+      runtime: "node-22", lockfileDigest: LOCK, template: "node",
+      attemptKey: `${JOB}:2`, causationId: "run-2:2", assertCurrent: async () => true,
+    });
+    expect(second.byteCount).toBe(fixture.stored.byteCount);
+    expect(second.digest).toBe(fixture.stored.digest);
+    expect(second.canonicalManifest).not.toContain("checkpointRef");
+  });
+
+  it.each([
+    ["base", { baseSha: "c".repeat(40) }],
+    ["lockfile", { lockfileDigest: "d".repeat(64) }],
+    ["attempt", { attempt: 3 }],
+  ])("rejects a checkpoint with a tampered %s binding", async (_label, change) => {
+    const fixture = await storedCheckpointFixture();
+    const manifest = { ...fixture.stored.manifest, ...change };
+    const canonical = canonicalWorkspaceCheckpoint(manifest);
+    await expect(replayCloudWorkspaceExecution({
+      provider: fixture.provider, store: fixture.store,
+      receipt: { ...fixture.receipt, checkpointManifest: canonical, checkpointManifestDigest: sha256Bytes(canonical) },
+      current: fixture.current, assertCurrent: async () => true, bindWorkspace: async () => true,
+    })).rejects.toMatchObject({ code: "checkpoint_incompatible" });
+    expect(fixture.provider.calls.filter((call) => call === "recreateFromCheckpoint")).toHaveLength(0);
+  });
+
+  it("rejects tampered checkpoint bytes and a non-canonical or digest-conflicting manifest", async () => {
+    const bytes = await storedCheckpointFixture();
+    bytes.objects.set(bytes.stored.ref, new Uint8Array(bytes.objects.get(bytes.stored.ref)!.map((value, index) => index === 700 ? value ^ 1 : value)));
+    await expect(replayCloudWorkspaceExecution({
+      provider: bytes.provider, store: bytes.store, receipt: bytes.receipt, current: bytes.current,
+      assertCurrent: async () => true, bindWorkspace: async () => true,
+    })).rejects.toMatchObject({ code: "digest_mismatch" });
+
+    const manifest = await storedCheckpointFixture();
+    await expect(replayCloudWorkspaceExecution({
+      provider: manifest.provider, store: manifest.store,
+      receipt: { ...manifest.receipt, checkpointManifest: `${manifest.receipt.checkpointManifest} ` },
+      current: manifest.current, assertCurrent: async () => true, bindWorkspace: async () => true,
+    })).rejects.toMatchObject({ code: "checkpoint_tampered" });
+  });
+
+  it("returns a typed missing-object failure without recreating a provider workspace", async () => {
+    const fixture = await storedCheckpointFixture();
+    fixture.objects.delete(fixture.stored.ref);
+    await expect(replayCloudWorkspaceExecution({
+      provider: fixture.provider, store: fixture.store, receipt: fixture.receipt, current: fixture.current,
+      assertCurrent: async () => true, bindWorkspace: async () => true,
+    })).rejects.toMatchObject({ code: "checkpoint_missing" });
+    expect(fixture.provider.calls.filter((call) => call === "recreateFromCheckpoint")).toHaveLength(0);
+  });
+
+  it("fences stale/cancel races before recreation and before checkpoint recording", async () => {
+    const replay = await storedCheckpointFixture();
+    await expect(replayCloudWorkspaceExecution({
+      provider: replay.provider, store: replay.store, receipt: replay.receipt, current: replay.current,
+      assertCurrent: async (phase) => phase !== "checkpoint_recreation",
+      bindWorkspace: async () => true,
+    })).rejects.toMatchObject({ code: "stale_attempt" });
+    expect(replay.provider.calls.filter((call) => call === "recreateFromCheckpoint")).toHaveLength(0);
+
+    const checkpoint = await storedCheckpointFixture();
+    const putsBefore = checkpoint.objects.size;
+    await expect(persistPortableCheckpoint({
+      provider: checkpoint.provider, workspace: checkpoint.first, store: checkpoint.store,
+      jobId: JOB, attempt: 1, baseSha: BASE,
+      sourceArchiveSha256: checkpoint.source.sha256, sourceArchiveBytes: checkpoint.source.bytes.byteLength,
+      runtime: "node-22", lockfileDigest: LOCK, template: "node",
+      attemptKey: `${JOB}:1`, causationId: "run-1:1",
+      assertCurrent: async (phase) => phase !== "checkpoint_store",
+    })).rejects.toMatchObject({ code: "stale_attempt" });
+    expect(checkpoint.objects.size).toBe(putsBefore);
+  });
+
+  it("validates nested source and textual patch content and keeps hot receipts payload-free", async () => {
+    const source = archive([{ name: "safe.txt", data: new TextEncoder().encode("safe") }]);
+    const safePatch = patch("diff --git a/safe.txt b/safe.txt\n--- a/safe.txt\n+++ b/safe.txt\n@@ -1 +1 @@\n-safe\n+safer\n");
+    const bytes = createPortableCheckpointArchive(source, safePatch.patch);
+    const manifest = {
+      version: 2 as const, jobId: JOB, attempt: 1, provider: "cloudflare" as const,
+      providerWorkspaceId: "workspace-1", providerSessionId: "session-1", baseSha: BASE,
+      sourceArchiveSha256: source.sha256, sourceArchiveBytes: source.bytes.byteLength,
+      archiveSha256: sha256Bytes(bytes), archiveBytes: bytes.byteLength, runtime: "node-22",
+      lockfileDigest: LOCK, template: "node", attemptKey: `${JOB}:1`, causationId: "run-1:1", createdAt: 1,
+    };
+    expect(validatePortableCheckpointArchive(bytes, manifest).patch.byteCount).toBe(safePatch.byteCount);
+    expect(() => createPortableCheckpointArchive(source, new Uint8Array([0]))).toThrow(/binary/);
+    expect(() => createPortableCheckpointArchive(source, new TextEncoder().encode("+api_key=sk-abcdefghijklmnopqrstuvwxyz123456\n"))).toThrow(/secret-like/);
+    const hotReceipt = { checkpointRef: `sandbox-checkpoints/sha256/${manifest.archiveSha256}`, checkpointDigest: manifest.archiveSha256, checkpointBytes: bytes.byteLength, checkpointManifestDigest: sha256Bytes(canonicalWorkspaceCheckpoint(manifest)), checkpointManifest: canonicalWorkspaceCheckpoint(manifest) };
+    expect(JSON.stringify(hotReceipt)).not.toContain(Buffer.from(bytes).toString("base64"));
+    expect(Object.values(hotReceipt as Record<string, unknown>).some((value) => value instanceof Uint8Array)).toBe(false);
+  });
+
+  it("does not advertise a production dependency cache from a test-only Map", () => {
+    const source = readFileSync(join(process.cwd(), "src/trigger/cloud-workspace.ts"), "utf8");
+    expect(source).not.toContain("WorkspaceLayerCache");
+    expect(source).not.toContain("new Map<string, { digest: string; bytes: number }>");
   });
 
   it("terminates scheduled orphans without a host fallback", async () => {
@@ -206,6 +372,15 @@ describe("fail-closed cloud workspace boundary", () => {
     await expect(terminateOrphanedCloudWorkspaces([{ provider, workspace: one }, { provider, workspace: two }])).resolves.toEqual({ terminated: 2, failed: 0 });
     expect(provider.isTerminated(one)).toBe(true);
     expect(provider.isTerminated(two)).toBe(true);
+  });
+
+  it("routes orphan cleanup by persisted provider identity and reports absent exact-provider credentials", () => {
+    expect(() => configuredCloudWorkspaceProviderForName({ JARVIS_CLOUD_WORKSPACE_PROVIDER: "sandbox0", SANDBOX0_TOKEN: "configured-elsewhere" }, "e2b", false))
+      .toThrow(expect.objectContaining({ provider: "e2b", code: "missing_configuration" }));
+    const runner = readFileSync(join(process.cwd(), "src/trigger/agent-runner.ts"), "utf8");
+    expect(runner).toContain("configuredCloudWorkspaceProviderForName(process.env, providerName, false)");
+    expect(runner).toContain("jobs:noteCloudWorkspaceCleanupBlocked");
+    expect(runner).not.toContain("orphans.filter((row) => row.providerName === cleanupProvider.name)");
   });
 
   it("reports truthful provider capability failures instead of papering them over", () => {
@@ -232,6 +407,9 @@ describe("fail-closed cloud workspace boundary", () => {
     const runner = readFileSync(join(process.cwd(), "src/trigger/agent-runner.ts"), "utf8");
     const specialist = runner.slice(runner.indexOf("const processJob ="), runner.indexOf("const synthesizeMissionClaim ="));
     expect(specialist).toContain("prepareCloudWorkspaceExecution");
+    expect(specialist).toContain("jobs:cloudCheckpointForReplay");
+    expect(specialist).toContain("replayCloudWorkspaceExecution");
+    expect(readFileSync(join(process.cwd(), "src/trigger/cloud-workspace-controller.ts"), "utf8")).toContain("input.provider.recreateFromCheckpoint");
     expect(specialist).toContain("runCloudWorkspaceAgent");
     expect(specialist).toContain("controllerScratch");
     expect(specialist).toContain("applyValidatedPatchToControllerCheckout");

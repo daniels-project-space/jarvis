@@ -20,6 +20,7 @@ import { redactSensitiveText } from "../src/lib/secret-redaction";
 import { hasAttemptBudget, isMeaningfulWorkProgress } from "../src/lib/work-attempt";
 import { verifiedGoalHandoffsForJob } from "./goalMode";
 import { claimDisposition, completionReceiptAllowed, isSha256Digest, replayEnvelope, shouldAdvanceAttempt } from "../src/lib/durable-attempt-protocol";
+import { canonicalWorkspaceCheckpoint, parseCanonicalWorkspaceCheckpoint } from "../src/lib/workspace-checkpoint";
 import {
   insertJobWithRuntime,
   jobRuntimeFor,
@@ -1855,14 +1856,14 @@ export const bindWorkspaceSource = mutation({
       || attempt.parentCheckpointHeadSha !== checkoutHeadSha)) return false;
     if (row.sourceHeadSha) {
       if (row.sourceHeadSha !== args.sourceHeadSha || row.sourceBranch !== args.sourceBranch) return false;
-      if (attempt) await ctx.db.patch(attempt._id, { sourceHeadSha: args.sourceHeadSha, lastEventAt: Date.now() });
+      if (attempt) await ctx.db.patch(attempt._id, { sourceHeadSha: args.sourceHeadSha, workspaceBaseSha: checkoutHeadSha, lastEventAt: Date.now() });
       return true;
     }
     await patchJobWithRuntime(ctx, row, {
       sourceBranch: args.sourceBranch, sourceHeadSha: args.sourceHeadSha,
       evidenceSummary: `sandbox source ${args.sourceBranch}@${args.sourceHeadSha.slice(0, 12)}`,
     });
-    if (attempt) await ctx.db.patch(attempt._id, { sourceHeadSha: args.sourceHeadSha, lastEventAt: Date.now() });
+    if (attempt) await ctx.db.patch(attempt._id, { sourceHeadSha: args.sourceHeadSha, workspaceBaseSha: checkoutHeadSha, lastEventAt: Date.now() });
     await appendAttemptEvidence(ctx, row, "workspace_source_bound", `Sandbox source bound to ${args.sourceBranch}@${args.sourceHeadSha}`, {
       stage: "starting", evidenceKind: "workspace", eventKey: `workspace-source:${args.expectedAttempt}:${args.sourceHeadSha}`,
       data: { sourceBranch: args.sourceBranch, sourceHeadSha: args.sourceHeadSha, workerBranch: row.workerBranch },
@@ -1876,6 +1877,8 @@ export const bindCloudWorkspace = mutation({
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
     providerName: v.union(v.literal("e2b"), v.literal("daytona"), v.literal("sandbox0"), v.literal("cloudflare")),
     providerWorkspaceId: v.string(), providerSessionId: v.string(), workerToken: v.optional(v.string()),
+    baseSha: v.string(), runtime: v.string(), lockfileDigest: v.string(), template: v.string(),
+    sourceArchiveDigest: v.string(), sourceArchiveBytes: v.number(),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
@@ -1883,11 +1886,21 @@ export const bindCloudWorkspace = mutation({
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
       || row.workerRunId !== a.workerRunId || !attempt || attempt.status !== "running"
-      || !a.providerWorkspaceId || !a.providerSessionId || a.providerWorkspaceId === a.providerSessionId) return false;
+      || !a.providerWorkspaceId || !a.providerSessionId || a.providerWorkspaceId === a.providerSessionId
+      || !GIT_OID.test(a.baseSha) || (attempt.workspaceBaseSha && attempt.workspaceBaseSha !== a.baseSha)
+      || !/^[0-9a-f]{64}$/.test(a.lockfileDigest) || !/^[0-9a-f]{64}$/.test(a.sourceArchiveDigest)
+      || !a.runtime || a.runtime.length > 120 || !a.template || a.template.length > 240
+      || !Number.isSafeInteger(a.sourceArchiveBytes) || a.sourceArchiveBytes < 0 || a.sourceArchiveBytes > 25 * 1024 * 1024) return false;
     if (attempt.providerWorkspaceId || attempt.providerSessionId) {
       return attempt.providerName === a.providerName
         && attempt.providerWorkspaceId === a.providerWorkspaceId
-        && attempt.providerSessionId === a.providerSessionId;
+        && attempt.providerSessionId === a.providerSessionId
+        && attempt.workspaceBaseSha === a.baseSha
+        && attempt.workspaceRuntime === a.runtime
+        && attempt.workspaceLockfileDigest === a.lockfileDigest
+        && attempt.workspaceTemplate === a.template
+        && attempt.sourceArchiveDigest === a.sourceArchiveDigest
+        && attempt.sourceArchiveBytes === a.sourceArchiveBytes;
     }
     const now = Date.now();
     await ctx.db.patch(attempt._id, {
@@ -1895,6 +1908,12 @@ export const bindCloudWorkspace = mutation({
       providerWorkspaceId: a.providerWorkspaceId.slice(0, 240),
       providerSessionId: a.providerSessionId.slice(0, 240),
       providerCreatedAt: now,
+      workspaceBaseSha: a.baseSha,
+      workspaceRuntime: a.runtime.slice(0, 120),
+      workspaceLockfileDigest: a.lockfileDigest,
+      workspaceTemplate: a.template.slice(0, 240),
+      sourceArchiveDigest: a.sourceArchiveDigest,
+      sourceArchiveBytes: a.sourceArchiveBytes,
       lastEventAt: now,
     });
     await patchJobWithRuntime(ctx, row, { providerRunState: "workspace_bound", providerObservedAt: now });
@@ -1932,26 +1951,140 @@ export const recordCloudCheckpoint = mutation({
     jobId: v.id("jobs"), expectedAttempt: v.number(),
     providerWorkspaceId: v.string(), providerSessionId: v.string(),
     checkpointRef: v.string(), checkpointDigest: v.string(), checkpointBytes: v.number(),
-    checkpointManifestDigest: v.string(), workerToken: v.optional(v.string()),
+    checkpointManifestDigest: v.string(), checkpointManifest: v.string(), workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    let manifest;
+    try { manifest = parseCanonicalWorkspaceCheckpoint(a.checkpointManifest); }
+    catch { return false; }
+    const computedManifestDigest = await sha256Hex(a.checkpointManifest);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt || !attempt
       || attempt.providerWorkspaceId !== a.providerWorkspaceId || attempt.providerSessionId !== a.providerSessionId
       || !/^sandbox-checkpoints\/sha256\/[0-9a-f]{64}$/.test(a.checkpointRef)
       || !/^[0-9a-f]{64}$/.test(a.checkpointDigest)
       || a.checkpointRef !== `sandbox-checkpoints/sha256/${a.checkpointDigest}`
       || !/^[0-9a-f]{64}$/.test(a.checkpointManifestDigest)
-      || !Number.isSafeInteger(a.checkpointBytes) || a.checkpointBytes < 0) return false;
+      || computedManifestDigest !== a.checkpointManifestDigest
+      || !Number.isSafeInteger(a.checkpointBytes) || a.checkpointBytes < 0 || a.checkpointBytes > 25 * 1024 * 1024
+      || manifest.jobId !== String(a.jobId) || manifest.attempt !== a.expectedAttempt
+      || manifest.provider !== attempt.providerName
+      || manifest.providerWorkspaceId !== attempt.providerWorkspaceId
+      || manifest.providerSessionId !== attempt.providerSessionId
+      || manifest.baseSha !== attempt.workspaceBaseSha
+      || manifest.sourceArchiveSha256 !== attempt.sourceArchiveDigest
+      || manifest.sourceArchiveBytes !== attempt.sourceArchiveBytes
+      || manifest.archiveSha256 !== a.checkpointDigest || manifest.archiveBytes !== a.checkpointBytes
+      || manifest.runtime !== attempt.workspaceRuntime || manifest.lockfileDigest !== attempt.workspaceLockfileDigest
+      || manifest.template !== attempt.workspaceTemplate
+      || manifest.attemptKey !== `${String(a.jobId)}:${a.expectedAttempt}`
+      || manifest.causationId !== `${String(row.workerRunId)}:${a.expectedAttempt}`) return false;
+    if (attempt.checkpointRef || attempt.checkpointDigest || attempt.checkpointManifest) {
+      return attempt.checkpointRef === a.checkpointRef
+        && attempt.checkpointDigest === a.checkpointDigest
+        && attempt.checkpointBytes === a.checkpointBytes
+        && attempt.checkpointManifestDigest === a.checkpointManifestDigest
+        && attempt.checkpointManifest === a.checkpointManifest;
+    }
     const now = Date.now();
     await ctx.db.patch(attempt._id, {
       checkpointRef: a.checkpointRef, checkpointDigest: a.checkpointDigest,
       checkpointBytes: a.checkpointBytes, checkpointManifestDigest: a.checkpointManifestDigest,
+      checkpointManifest: a.checkpointManifest,
       lastEventAt: now,
     });
     await patchJobWithRuntime(ctx, row, { providerRunState: "checkpointed", providerObservedAt: now });
+    return true;
+  },
+});
+
+export const cloudCheckpointForReplay = query({
+  args: {
+    jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
+    providerName: v.union(v.literal("e2b"), v.literal("daytona"), v.literal("sandbox0"), v.literal("cloudflare")),
+    baseSha: v.string(), runtime: v.string(), lockfileDigest: v.string(), template: v.string(),
+    sourceArchiveDigest: v.string(), sourceArchiveBytes: v.number(), workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.get(a.jobId);
+    const current = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
+      || row.workerRunId !== a.workerRunId || !current || current.status !== "running") {
+      return { disposition: "reject" as const, reason: "stale_attempt" };
+    }
+    if (!GIT_OID.test(a.baseSha) || (current.workspaceBaseSha && current.workspaceBaseSha !== a.baseSha)
+      || !/^[0-9a-f]{64}$/.test(a.lockfileDigest) || !/^[0-9a-f]{64}$/.test(a.sourceArchiveDigest)
+      || !Number.isSafeInteger(a.sourceArchiveBytes) || a.sourceArchiveBytes < 0 || a.sourceArchiveBytes > 25 * 1024 * 1024) {
+      return { disposition: "reject" as const, reason: "current_binding_invalid" };
+    }
+    if (a.expectedAttempt <= 1) return { disposition: "hydrate" as const, reason: "first_attempt" };
+    const prior: any = (await ctx.db.query("workAttempts")
+      .withIndex("by_job_attempt", (q: any) => q.eq("jobId", a.jobId)).collect())
+      .filter((item: any) => item.attempt < a.expectedAttempt && item.checkpointRef)
+      .sort((left: any, right: any) => right.attempt - left.attempt)[0];
+    if (!prior?.checkpointRef) return { disposition: "hydrate" as const, reason: "no_prior_checkpoint" };
+    if (!prior.checkpointManifest || !prior.checkpointManifestDigest || !prior.checkpointDigest
+      || !Number.isSafeInteger(prior.checkpointBytes)) {
+      return { disposition: "reject" as const, reason: "checkpoint_receipt_incomplete" };
+    }
+    let manifest;
+    try { manifest = parseCanonicalWorkspaceCheckpoint(prior.checkpointManifest); }
+    catch { return { disposition: "reject" as const, reason: "checkpoint_manifest_tampered" }; }
+    if (await sha256Hex(prior.checkpointManifest) !== prior.checkpointManifestDigest
+      || canonicalWorkspaceCheckpoint(manifest) !== prior.checkpointManifest
+      || manifest.jobId !== String(a.jobId) || manifest.attempt !== prior.attempt
+      || manifest.provider !== prior.providerName
+      || manifest.providerWorkspaceId !== prior.providerWorkspaceId
+      || manifest.providerSessionId !== prior.providerSessionId
+      || manifest.baseSha !== prior.workspaceBaseSha
+      || manifest.sourceArchiveSha256 !== prior.sourceArchiveDigest
+      || manifest.sourceArchiveBytes !== prior.sourceArchiveBytes
+      || manifest.archiveSha256 !== prior.checkpointDigest || manifest.archiveBytes !== prior.checkpointBytes
+      || manifest.runtime !== prior.workspaceRuntime || manifest.lockfileDigest !== prior.workspaceLockfileDigest
+      || manifest.template !== prior.workspaceTemplate
+      || manifest.attemptKey !== `${String(a.jobId)}:${prior.attempt}`
+      || manifest.causationId !== `${String(prior.workerRunId)}:${prior.attempt}`
+      || prior.checkpointRef !== `sandbox-checkpoints/sha256/${prior.checkpointDigest}`) {
+      return { disposition: "reject" as const, reason: "checkpoint_manifest_tampered" };
+    }
+    const mismatch = manifest.provider !== a.providerName ? "provider_changed"
+      : manifest.baseSha !== a.baseSha ? "base_changed"
+        : manifest.sourceArchiveSha256 !== a.sourceArchiveDigest || manifest.sourceArchiveBytes !== a.sourceArchiveBytes ? "source_archive_changed"
+          : manifest.runtime !== a.runtime ? "runtime_changed"
+            : manifest.lockfileDigest !== a.lockfileDigest ? "lockfile_changed"
+              : manifest.template !== a.template ? "template_changed" : null;
+    if (mismatch) return { disposition: "hydrate" as const, reason: mismatch };
+    return {
+      disposition: "replay" as const, reason: "compatible_checkpoint",
+      sourceAttempt: prior.attempt,
+      checkpointRef: prior.checkpointRef, checkpointDigest: prior.checkpointDigest,
+      checkpointBytes: prior.checkpointBytes, checkpointManifest: prior.checkpointManifest,
+      checkpointManifestDigest: prior.checkpointManifestDigest,
+    };
+  },
+});
+
+export const recordCloudReplayDecision = mutation({
+  args: {
+    jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
+    disposition: v.union(v.literal("replay"), v.literal("hydrate"), v.literal("reject")),
+    reason: v.string(), workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.get(a.jobId);
+    const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
+      || row.workerRunId !== a.workerRunId || !attempt || attempt.status !== "running"
+      || !/^[a-z_]{1,80}$/.test(a.reason)) return false;
+    await appendAttemptEvidence(ctx, row, "cloud_checkpoint_replay", `${a.disposition}: ${a.reason}`, {
+      stage: "starting", evidenceKind: "checkpoint",
+      eventKey: `cloud-replay:${a.expectedAttempt}:${a.disposition}:${a.reason}`,
+      data: { disposition: a.disposition, reason: a.reason },
+    });
     return true;
   },
 });
@@ -1984,6 +2117,25 @@ export const markCloudWorkspaceTerminated = mutation({
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (!attempt || attempt.providerWorkspaceId !== a.providerWorkspaceId || attempt.providerSessionId !== a.providerSessionId) return false;
     await ctx.db.patch(attempt._id, { providerTerminatedAt: Date.now(), lastEventAt: Date.now() });
+    return true;
+  },
+});
+
+export const noteCloudWorkspaceCleanupBlocked = mutation({
+  args: {
+    jobId: v.id("jobs"), expectedAttempt: v.number(), providerWorkspaceId: v.string(),
+    providerSessionId: v.string(), code: v.string(), reason: v.string(), workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    if (!attempt || attempt.providerWorkspaceId !== a.providerWorkspaceId
+      || attempt.providerSessionId !== a.providerSessionId || attempt.providerTerminatedAt) return false;
+    await ctx.db.patch(attempt._id, {
+      cleanupBlockedCode: a.code.slice(0, 80),
+      cleanupBlockedReason: redactSensitiveText(a.reason).slice(0, 500),
+      cleanupBlockedAt: Date.now(), lastEventAt: Date.now(),
+    });
     return true;
   },
 });
