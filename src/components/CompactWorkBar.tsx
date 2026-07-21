@@ -38,23 +38,47 @@ function progressStamp(value: number | null) {
   return value ? new Date(value).toISOString().replace("T", " ").slice(0, 19) + "Z" : "not recorded";
 }
 
+function fleetNodeStateLabel(state: FleetNode["state"]) {
+  return ({ dependency_held: "held", dispatching: "dispatch", reviewing: "review", integrating: "integrate", needs_input: "input" } as Partial<Record<FleetNode["state"], string>>)[state]
+    ?? state;
+}
+
 export function fleetDagLayout(nodes: FleetNode[], edges: FleetEdge[]) {
-  const depths = new Map(nodes.map((node) => [node.id, 0]));
-  for (const node of nodes) {
-    const incoming = edges.filter((edge) => edge.target === node.id);
-    depths.set(node.id, incoming.length ? Math.max(...incoming.map((edge) => (depths.get(edge.source) ?? 0) + 1)) : 0);
+  // The projection is capped at eight nodes, so a bounded relaxation is both
+  // clearer than recursive traversal and safe when an old/malformed plan has a
+  // cycle. Sorting is intentional: neither persisted row order nor edge query
+  // order should move a node between columns.
+  const sortedNodes = [...nodes].sort((left, right) => left.id.localeCompare(right.id));
+  const nodeIds = new Set(sortedNodes.map((node) => node.id));
+  const depths = new Map(sortedNodes.map((node) => [node.id, 0]));
+  const orderedEdges = edges
+    .filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target))
+    .sort((left, right) => left.source.localeCompare(right.source) || left.target.localeCompare(right.target) || left.id.localeCompare(right.id));
+  const depthCap = Math.max(0, sortedNodes.length - 1);
+  for (let pass = 0; pass < depthCap; pass += 1) {
+    let changed = false;
+    for (const edge of orderedEdges) {
+      const nextDepth = Math.min(depthCap, (depths.get(edge.source) ?? 0) + 1);
+      if (nextDepth > (depths.get(edge.target) ?? 0)) {
+        depths.set(edge.target, nextDepth);
+        changed = true;
+      }
+    }
+    if (!changed) break;
   }
   const maxDepth = Math.max(0, ...depths.values());
   const byDepth = new Map<number, FleetNode[]>();
-  for (const node of nodes) byDepth.set(depths.get(node.id) ?? 0, [...(byDepth.get(depths.get(node.id) ?? 0) ?? []), node]);
-  return nodes.map((node) => {
+  for (const node of sortedNodes) byDepth.set(depths.get(node.id) ?? 0, [...(byDepth.get(depths.get(node.id) ?? 0) ?? []), node]);
+  return sortedNodes.map((node) => {
     const depth = depths.get(node.id) ?? 0;
     const column = byDepth.get(depth) ?? [node];
     const row = column.findIndex((candidate) => candidate.id === node.id);
     return {
       id: node.id,
-      x: 58 + (maxDepth ? (depth / maxDepth) * 484 : 242),
-      y: 35 + ((row + 1) / (column.length + 1)) * 190,
+      depth,
+      rowCount: column.length,
+      x: 50 + (maxDepth ? (depth / maxDepth) * 500 : 250),
+      y: 20 + ((row + 0.5) / column.length) * 220,
     };
   });
 }
@@ -62,35 +86,41 @@ export function fleetDagLayout(nodes: FleetNode[], edges: FleetEdge[]) {
 export function FleetDag({ nodes, edges }: { nodes: FleetNode[]; edges: FleetEdge[] }) {
   const positions = fleetDagLayout(nodes, edges);
   const position = new Map(positions.map((item) => [item.id, item]));
+  const maxDepth = Math.max(0, ...positions.map((item) => item.depth));
+  const nodeWidth = Math.max(10.75, Math.min(14.5, ((500 / Math.max(1, maxDepth)) - 5) / 6));
   return (
     <div className="rounded-xl border border-white/[0.07] bg-black/20 p-2">
-      <svg viewBox="0 0 600 260" role="img" aria-labelledby="fleet-dag-title fleet-dag-description" className="h-40 w-full">
-        <title id="fleet-dag-title">Live fleet dependency graph</title>
-        <desc id="fleet-dag-description">All bounded workstreams and their persisted handoff relationships.</desc>
-        <defs>
-          <marker id="fleet-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-            <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke" />
-          </marker>
-        </defs>
-        {edges.map((edge) => {
-          const source = position.get(edge.source);
-          const target = position.get(edge.target);
-          if (!source || !target) return null;
-          return <path key={edge.id} d={`M ${source.x + 38} ${source.y} C ${source.x + 70} ${source.y}, ${target.x - 70} ${target.y}, ${target.x - 38} ${target.y}`} fill="none" stroke={EDGE_STYLE[edge.readiness]} strokeWidth="2" strokeOpacity=".8" markerEnd="url(#fleet-arrow)" />;
-        })}
-        {nodes.map((node) => {
-          const point = position.get(node.id)!;
-          const color = node.needsDaniel ? "#fbbf24" : node.state === "done" ? "#34d399" : node.state === "blocked" ? "#fb7185" : "#22d3ee";
-          return (
-            <g key={node.id} role="group" aria-label={`${agentName(node.agent)}: ${node.label}, ${node.state.replace("_", " ")}`}>
-              <title>{`${agentName(node.agent)} · ${node.label} · ${node.state.replace("_", " ")}`}</title>
-              <rect x={point.x - 38} y={point.y - 19} width="76" height="38" rx="10" fill="#071019" stroke={color} strokeOpacity=".75" />
-              <text x={point.x} y={point.y - 2} textAnchor="middle" fill={color} fontSize="9" fontFamily="monospace">{agentName(node.agent).slice(0, 10)}</text>
-              <text x={point.x} y={point.y + 10} textAnchor="middle" fill="#91a3b6" fontSize="7" fontFamily="monospace">{node.percent}%</text>
-            </g>
-          );
-        })}
-      </svg>
+      <section aria-labelledby="fleet-dag-title" aria-describedby="fleet-dag-description">
+        <h3 id="fleet-dag-title" className="sr-only">Live fleet dependency graph</h3>
+        <p id="fleet-dag-description" className="sr-only">All bounded workstreams and their persisted handoff relationships.</p>
+        <div className="relative h-[200px] w-full overflow-hidden sm:h-[220px]">
+          <svg viewBox="0 0 600 260" aria-hidden="true" className="pointer-events-none absolute inset-0 h-full w-full">
+            <defs>
+              <marker id="fleet-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke" />
+              </marker>
+            </defs>
+            {edges.map((edge) => {
+              const source = position.get(edge.source);
+              const target = position.get(edge.target);
+              if (!source || !target) return null;
+              return <path key={edge.id} d={`M ${source.x} ${source.y} C ${source.x + 40} ${source.y}, ${target.x - 40} ${target.y}, ${target.x} ${target.y}`} fill="none" stroke={EDGE_STYLE[edge.readiness]} strokeWidth="2" strokeOpacity=".8" markerEnd="url(#fleet-arrow)" />;
+            })}
+          </svg>
+          <ol aria-label="Live fleet node states" className="absolute inset-0 m-0 list-none p-0">
+            {nodes.map((node) => {
+              const point = position.get(node.id);
+              if (!point) return null;
+              const color = node.needsDaniel ? "#fbbf24" : node.state === "done" ? "#34d399" : node.state === "blocked" ? "#fb7185" : "#22d3ee";
+              const cardHeight = Math.max(21, Math.min(38, 170 / point.rowCount));
+              return <li key={node.id} data-fleet-node aria-label={`${agentName(node.agent)}: ${node.label}, ${node.percent}% ${node.state.replaceAll("_", " ")}`} className="absolute grid -translate-x-1/2 -translate-y-1/2 content-center rounded-md border bg-[#071019]/95 px-0.5 text-center shadow-[0_2px_10px_rgba(0,0,0,.22)]" style={{ left: `${(point.x / 600) * 100}%`, top: `${(point.y / 260) * 100}%`, width: `clamp(41px, ${nodeWidth}%, 76px)`, height: `${cardHeight}px`, borderColor: color, color }}>
+                <span className="block truncate text-[8px] font-medium leading-[9px] sm:text-[10px] sm:leading-[11px]">{agentName(node.agent)}</span>
+                <span title={node.state.replaceAll("_", " ")} className="block truncate font-mono text-[7px] leading-[8px] text-slate-300 sm:text-[8px] sm:leading-[9px]">{node.percent}% {fleetNodeStateLabel(node.state)}</span>
+              </li>;
+            })}
+          </ol>
+        </div>
+      </section>
       <ol aria-label="Fleet dependency list" className="grid gap-1 text-[9px] text-slate sm:grid-cols-2">
         {nodes.map((node) => {
           const dependencies = edges.filter((edge) => edge.target === node.id);

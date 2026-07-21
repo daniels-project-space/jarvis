@@ -47,17 +47,54 @@ describe("FleetCommandCenter", () => {
     expect(markup).not.toContain('data-fleet-surface="expanded"');
   });
 
-  it("provides accessible DAG labels and a readable dependency-list fallback", () => {
+  it("provides server-rendered HTML labels for every DAG node and a readable dependency-list fallback", () => {
     const nodes = [node({ id: "a", jobId: "job-a", label: "Foundation" }), node({ id: "b", jobId: "job-b", label: "Validation", dependencyCount: 1 })];
     const edges = [{ id: "a->b", source: "a", target: "b", readiness: "ready" as const }];
     const markup = renderToStaticMarkup(<FleetDag nodes={nodes} edges={edges} />);
-    expect(markup).toContain('role="img"');
     expect(markup).toContain("Live fleet dependency graph");
+    expect(markup.match(/data-fleet-node/g)).toHaveLength(nodes.length);
+    expect(markup).toContain('aria-label="Paul: Foundation, 64% running"');
+    expect(markup).toContain('aria-label="Paul: Validation, 64% running"');
+    expect(markup).toContain('aria-label="Live fleet node states"');
     expect(markup).toContain('aria-label="Fleet dependency list"');
     expect(markup).toContain(">Validation</span> · after a (ready)");
     expect(markup).toContain('aria-label="Handoff readiness legend"');
-    expect(markup).toContain("Paul: Foundation, running");
     expect(fleetDagLayout(nodes, edges)).toHaveLength(2);
+  });
+
+  it("keeps dependency depths stable when input nodes arrive in another order", () => {
+    const nodes = [node({ id: "a" }), node({ id: "b" }), node({ id: "c" }), node({ id: "d" })];
+    const edges = [
+      { id: "a-c", source: "a", target: "c", readiness: "ready" as const },
+      { id: "b-c", source: "b", target: "c", readiness: "ready" as const },
+      { id: "c-d", source: "c", target: "d", readiness: "waiting" as const },
+    ];
+    expect(fleetDagLayout(nodes, edges)).toEqual(fleetDagLayout([...nodes].reverse(), [...edges].reverse()));
+    expect(Object.fromEntries(fleetDagLayout(nodes, edges).map((position) => [position.id, position.depth]))).toEqual({ a: 0, b: 0, c: 1, d: 2 });
+  });
+
+  it("lays out a branch-and-merge DAG by its longest persisted dependency path", () => {
+    const nodes = ["root", "research", "build", "review", "merge"].map((id) => node({ id }));
+    const edges = [
+      { id: "root-research", source: "root", target: "research", readiness: "delivered" as const },
+      { id: "root-build", source: "root", target: "build", readiness: "delivered" as const },
+      { id: "research-review", source: "research", target: "review", readiness: "ready" as const },
+      { id: "build-review", source: "build", target: "review", readiness: "ready" as const },
+      { id: "review-merge", source: "review", target: "merge", readiness: "waiting" as const },
+    ];
+    expect(Object.fromEntries(fleetDagLayout(nodes, edges).map((position) => [position.id, position.depth]))).toEqual({ build: 1, merge: 3, research: 1, review: 2, root: 0 });
+  });
+
+  it("bounds malformed and cyclic edges without manufacturing a node or looping", () => {
+    const nodes = [node({ id: "a" }), node({ id: "b" })];
+    const edges = [
+      { id: "a-b", source: "a", target: "b", readiness: "ready" as const },
+      { id: "b-a", source: "b", target: "a", readiness: "blocked" as const },
+      { id: "missing-b", source: "missing", target: "b", readiness: "waiting" as const },
+    ];
+    const positions = fleetDagLayout(nodes, edges);
+    expect(positions.map((position) => position.id)).toEqual(["a", "b"]);
+    expect(positions.every((position) => position.depth >= 0 && position.depth <= 1)).toBe(true);
   });
 
   it("removes the superseded AgentLiveView and flat FleetView ownership paths", () => {
