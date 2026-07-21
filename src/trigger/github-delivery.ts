@@ -173,6 +173,8 @@ export async function mergeVerifiedPullRequest(args: {
   sleep?: (ms: number) => Promise<void>;
   /** Required for receipt-bound delivery; prevents head substitution. */
   reviewedHeadSha?: string;
+  /** The reviewed default-branch commit; checked before every PUT. */
+  reviewedBaseSha?: string;
 }): Promise<MergeDeliveryResult> {
   const fetchImpl = args.fetchImpl ?? fetch;
   const sleep = args.sleep ?? wait;
@@ -189,6 +191,30 @@ export async function mergeVerifiedPullRequest(args: {
     if (args.shouldContinue && !(await args.shouldContinue())) {
       return { status: "pending", note: "delivery lease ended before merge" };
     }
+    // Preflight is intentionally before the consequential PUT, not a
+    // diagnosis after it. A response-loss replay first proves that the same
+    // PR/head was merged; it never sends a second merge request blindly.
+    const stateResponse = await fetchImpl(
+      `https://api.github.com/repos/${args.repo}/pulls/${args.pull.number}`,
+      { headers, cache: "no-store" },
+    ).catch(() => null);
+    if (!stateResponse?.ok) return { status: "blocked", note: "could not preflight the reviewed pull request" };
+    const state = (await stateResponse.json()) as {
+      state?: string; merged?: boolean; merge_commit_sha?: string;
+      mergeable?: boolean | null; mergeable_state?: string;
+      head?: { sha?: string }; base?: { sha?: string };
+    };
+    if (String(state.head?.sha ?? "") !== reviewedHeadSha) {
+      return { status: "blocked", note: "pull request head changed after controller review; a fresh review is required" };
+    }
+    if (args.reviewedBaseSha && String(state.base?.sha ?? "") !== args.reviewedBaseSha) {
+      return { status: "blocked", note: "default branch advanced after controller review; a fresh review is required" };
+    }
+    if (state.merged) return { status: "merged", sha: String(state.merge_commit_sha ?? ""), note: "Pull request was already merged" };
+    if (state.state === "closed") return { status: "blocked", note: "pull request closed before delivery" };
+    if (state.mergeable === false && state.mergeable_state === "dirty") return { status: "blocked", note: "the verified branch conflicts with the current default branch" };
+    if (state.mergeable_state === "behind") return { status: "blocked", note: "default branch advanced after controller review; a fresh review is required" };
+    if (args.shouldContinue && !(await args.shouldContinue())) return { status: "pending", note: "delivery lease ended before merge" };
     const merged = await fetchImpl(
       `https://api.github.com/repos/${args.repo}/pulls/${args.pull.number}/merge`,
       {
@@ -225,12 +251,12 @@ export async function mergeVerifiedPullRequest(args: {
       }
     }
 
-    const stateResponse = await fetchImpl(
+    const observedResponse = await fetchImpl(
       `https://api.github.com/repos/${args.repo}/pulls/${args.pull.number}`,
       { headers, cache: "no-store" },
     ).catch(() => null);
-    if (stateResponse?.ok) {
-      const state = (await stateResponse.json()) as {
+    if (observedResponse?.ok) {
+      const observed = (await observedResponse.json()) as {
         state?: string;
         merged?: boolean;
         merge_commit_sha?: string;
@@ -238,21 +264,21 @@ export async function mergeVerifiedPullRequest(args: {
         mergeable_state?: string;
         head?: { sha?: string };
       };
-      if (state.merged) {
+      if (observed.merged) {
         return {
           status: "merged",
-          sha: String(state.merge_commit_sha ?? ""),
+          sha: String(observed.merge_commit_sha ?? ""),
           note: "Pull request was already merged",
         };
       }
-      if (state.state === "closed") return { status: "blocked", note: "pull request closed before delivery" };
-      if (String(state.head?.sha ?? "") !== reviewedHeadSha) {
+      if (observed.state === "closed") return { status: "blocked", note: "pull request closed before delivery" };
+      if (String(observed.head?.sha ?? "") !== reviewedHeadSha) {
         return { status: "blocked", note: "pull request head changed after controller review; a fresh review is required" };
       }
-      if (state.mergeable === false && state.mergeable_state === "dirty") {
+      if (observed.mergeable === false && observed.mergeable_state === "dirty") {
         return { status: "blocked", note: "the verified branch conflicts with the current default branch" };
       }
-      if (state.mergeable_state === "behind") {
+      if (observed.mergeable_state === "behind") {
         return { status: "blocked", note: "default branch advanced after controller review; a fresh review is required" };
       }
     }

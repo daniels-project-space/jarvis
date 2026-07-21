@@ -816,8 +816,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       const stopIfLeaseLost = async (checkpoint: string, result: string, branch?: string | null): Promise<boolean> => {
         const state = await executionStatus();
         if (state === "running") return false;
+        const checkpointMutation = deliveryFence
+          ? (args: Record<string, unknown>) => deliveryMutation("jobs:checkpointAndRequeue", args)
+          : (args: Record<string, unknown>) => convexMutation("jobs:checkpointAndRequeue", args);
         if (state === "paused" || state === "cancelled") {
-          await convexMutation("jobs:checkpointAndRequeue", {
+          await checkpointMutation({
             jobId: job.jobId,
             expectedAttempt,
             checkpoint,
@@ -827,7 +830,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }).catch(() => null);
         }
         if (state === "unknown") {
-          await convexMutation("jobs:checkpointAndRequeue", {
+          await checkpointMutation({
             jobId: job.jobId, expectedAttempt, checkpoint, result: result.slice(0, 4000),
             branch: branch ?? undefined, delayMs: 15_000,
           }).catch(() => null);
@@ -842,9 +845,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       const deliveryOwner = `trigger:${String(job.jobId)}:${randomBytes(12).toString("hex")}`;
       const deliveryToken = randomBytes(32).toString("hex");
       const deliveryFence = Number.isFinite(Number(job.deliveryGeneration)) && typeof job.deliveryRunId === "string"
-        ? { sourceWorkAttempt: Number(job.sourceWorkAttempt ?? expectedAttempt), deliveryGeneration: Number(job.deliveryGeneration), deliveryRunId: job.deliveryRunId }
+        ? { sourceWorkAttempt: Number(job.sourceWorkAttempt ?? expectedAttempt), deliveryGeneration: Number(job.deliveryGeneration), deliveryRunId: job.deliveryRunId,
+          ...(typeof job.activeDeliveryAttemptId === "string" ? { deliveryAttemptId: job.activeDeliveryAttemptId } : {}) }
         : null;
       let deliveryLease: { owner: string; token: string; version: number; until: number } | null = null;
+      let deliveryHeartbeat: ReturnType<typeof setInterval> | undefined;
       const linearizeDelivery = async () => {
         const lease = await convexMutation("jobs:linearizeDelivery", {
           jobId: job.jobId, expectedAttempt, deliveryLeaseOwner: deliveryOwner, deliveryLeaseToken: deliveryToken,
@@ -883,14 +888,29 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const mayResumeControllerDelivery = Boolean(
           repo
           && token
-          && resumeBranch
           && job.verificationVerdict === "pass"
-          && ["pull_request", "blocked"].includes(String(job.deliveryStatus ?? ""))
+          && job.activeDeliveryAttemptId
+          && deliveryFence
           // The review receipt, not a delivery mode, authorizes a controller
           // continuation.  Policy below decides draft/merge/no-op semantics.
           && ["auto_merge", "manual", "read_only"].includes(continuationPolicy)
         );
         if (mayResumeControllerDelivery) {
+          // Check waits are provider time, not silence: renew the exact
+          // controller generation below the 45s lease. A failed renewal is
+          // deliberately not retried in a tight loop; the next effect's
+          // linearization fails closed and the reaper owns recovery.
+          deliveryHeartbeat = setInterval(() => {
+            void (async () => {
+              if (!await linearizeDelivery() || !deliveryLease) return;
+              await convexMutation("jobs:touchDeliveryHeartbeat", {
+                jobId: job.jobId, expectedAttempt,
+                deliveryLeaseOwner: deliveryLease.owner, deliveryLeaseToken: deliveryLease.token,
+                deliveryLeaseVersion: deliveryLease.version, ...(deliveryFence ?? {}),
+              }).catch(() => undefined);
+            })();
+          }, 20_000);
+          deliveryHeartbeat.unref?.();
           // A continuation is allowed only when the exact cold record named
           // by the compact claim pointer still HMAC-verifies.  It is evidence
           // from the source work attempt, not a new specialist review.
@@ -917,7 +937,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               || !receiptAuthority.verify(envelope, binding)) throw new Error("cold receipt binding failed");
             continuationReview = { envelope, binding };
           } catch {
-            await convexMutation("jobs:checkpointAndRequeue", {
+            await deliveryMutation("jobs:checkpointAndRequeue", {
               jobId: job.jobId, expectedAttempt,
               checkpoint: "Verified delivery is held: the immutable controller review receipt could not be loaded and HMAC-verified. Do not rerun the specialist.",
               result: String(job.result ?? "").slice(0, 4_000), branch: resumeBranch, delayMs: 30_000,
@@ -936,7 +956,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           // controller evidence outcome, even if a branch pointer is present.
           const branchChanged = continuationPolicy === "read_only"
             ? false
-            : await branchHasChanges(repo, resumeBranch, token);
+            : resumeBranch ? await branchHasChanges(repo, resumeBranch, token) : null;
           let pullRequestUrl = typeof job.pullRequestUrl === "string" ? job.pullRequestUrl : "";
           let mergeSha = "";
           let deliveryFailure = branchChanged === null
@@ -970,6 +990,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 branch: resumeBranch,
                 pullRequestUrl: pull.url,
                 deliveryStatus: "pull_request",
+                observedPullRequestHead: pull.headSha,
+                providerCall: true,
               }).catch(() => {});
               if (continuationPolicy === "manual") {
                 // A manual delivery is deliberately terminal after creating a
@@ -984,7 +1006,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 title,
                 token,
                 reviewedHeadSha: continuationReview.envelope.receipt.headSha,
-                shouldContinue: async () => (await executionStatus()) === "running",
+                reviewedBaseSha: continuationReview.envelope.receipt.baseSha,
+                shouldContinue: async () => (await executionStatus()) === "running" && await linearizeDelivery(),
               });
               if (continuationPolicy === "manual") {
                 // The setDelivery write below records pull_request, then the
@@ -1001,7 +1024,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               pullRequestUrl: pullRequestUrl || undefined,
               deliveryStatus: "blocked",
             }).catch(() => {});
-            await convexMutation("jobs:checkpointAndRequeue", {
+            await deliveryMutation("jobs:checkpointAndRequeue", {
               jobId: job.jobId,
               expectedAttempt,
               checkpoint: `Supervisor verification is already complete. Resume controller delivery only; do not rerun the specialist.\n\n${deliveryFailure}`,
@@ -1020,6 +1043,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             pullRequestUrl: pullRequestUrl || undefined,
             deliveryStatus: protectedDraft ? "pull_request" : readOnlyDelivery ? "branch" : "merged",
             mergeCommitSha: mergeSha || undefined,
+            observedPullRequestHead: readOnlyDelivery ? undefined : continuationReview.envelope.receipt.headSha,
+            providerCall: !readOnlyDelivery,
           }).catch(() => false);
           if (!recorded) throw new Error("verified delivery completed but its durable receipt could not be recorded");
           const deliveryResult = [
@@ -1568,6 +1593,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                   title: `JARVIS goal: ${(job.label ?? job.task).slice(0, 78)}`,
                   token,
                   reviewedHeadSha: goalReview?.envelope.receipt.headSha,
+                  reviewedBaseSha: goalReview?.envelope.receipt.baseSha,
                   shouldContinue: async () => (await executionStatus()) === "running",
                 })
               : { status: "blocked" as const, note: "the delivery controller could not open the goal pull request" };
@@ -1814,6 +1840,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }).catch(() => null);
             return;
           }
+          // The specialist phase ends at the cold receipt. A fresh,
+          // controller-only dispatch owns every provider effect (including a
+          // read-only terminal receipt); do not let this Codex process fall
+          // through into PR/merge/finalize work.
+          return;
         }
 
         let pullRequestUrl: string | null = null;
@@ -1869,6 +1900,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               title,
               token,
               reviewedHeadSha: gitReview?.envelope.receipt.headSha,
+              reviewedBaseSha: gitReview?.envelope.receipt.baseSha,
               shouldContinue: async () => (await executionStatus()) === "running",
             });
             if (merged.status === "merged") {
@@ -1986,6 +2018,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             text: `⚠️ ${job.agentId ?? "Agent"} exhausted its recovery budget: ${message.slice(0, 240)}`,
           }).catch(() => {});
       } finally {
+        if (deliveryHeartbeat) clearInterval(deliveryHeartbeat);
         unsubscribeLease();
         controlClient.close();
       }

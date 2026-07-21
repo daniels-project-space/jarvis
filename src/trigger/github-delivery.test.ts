@@ -72,6 +72,9 @@ describe("autonomous GitHub delivery", () => {
 
   it("merges verified work without bypassing GitHub's checks", async () => {
     const fetchImpl = vi.fn().mockResolvedValueOnce(response(200, {
+      state: "open", merged: false, mergeable: true, mergeable_state: "clean",
+      head: { sha: "abc123" }, base: { sha: "base123" },
+    })).mockResolvedValueOnce(response(200, {
       merged: true,
       sha: "merge123",
       message: "Pull Request successfully merged",
@@ -89,12 +92,12 @@ describe("autonomous GitHub delivery", () => {
       sha: "merge123",
       note: "Pull Request successfully merged",
     });
-    expect(JSON.parse(String(fetchImpl.mock.calls[0][1]?.body))).toMatchObject({ sha: "abc123" });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(String(fetchImpl.mock.calls[1][1]?.body))).toMatchObject({ sha: "abc123" });
   });
 
   it("stops on a real branch conflict instead of force-delivering", async () => {
     const fetchImpl = vi.fn()
-      .mockResolvedValueOnce(response(409, { message: "Head branch was modified" }))
       .mockResolvedValueOnce(response(200, {
         state: "open",
         merged: false,
@@ -114,6 +117,7 @@ describe("autonomous GitHub delivery", () => {
       status: "blocked",
       note: "pull request head changed after controller review; a fresh review is required",
     });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("refuses a PR when the reviewed source or default base moved", async () => {
@@ -138,7 +142,6 @@ describe("autonomous GitHub delivery", () => {
 
   it("never follows a PR head changed by checks or an update-branch operation", async () => {
     const fetchImpl = vi.fn()
-      .mockResolvedValueOnce(response(409, { message: "checks pending" }))
       .mockResolvedValueOnce(response(200, {
         state: "open", merged: false, mergeable: true, mergeable_state: "behind",
         head: { sha: "reviewed-head" },
@@ -153,7 +156,7 @@ describe("autonomous GitHub delivery", () => {
       sleep: async () => undefined,
     });
     expect(result).toEqual({ status: "blocked", note: "default branch advanced after controller review; a fresh review is required" });
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("rejects a merge request whose initial PR head is not the signed head", async () => {
@@ -167,5 +170,20 @@ describe("autonomous GitHub delivery", () => {
       fetchImpl: fetchImpl as typeof fetch,
     })).resolves.toEqual({ status: "blocked", note: "pull request head is not the reviewed receipt head" });
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("reconciles a lost merge response from the exact reviewed PR without another PUT", async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(response(200, {
+      state: "closed", merged: true, merge_commit_sha: "merge123",
+      head: { sha: "reviewed-head" }, base: { sha: "reviewed-base" },
+    }));
+    await expect(mergeVerifiedPullRequest({
+      repo: "daniels-project-space/jarvis",
+      pull: { number: 42, url: "https://github.test/42", headSha: "reviewed-head" },
+      reviewedHeadSha: "reviewed-head", reviewedBaseSha: "reviewed-base",
+      title: "Paul: fix", token: "token", fetchImpl: fetchImpl as typeof fetch,
+    })).resolves.toEqual({ status: "merged", sha: "merge123", note: "Pull request was already merged" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl.mock.calls[0][1]?.method).toBeUndefined();
   });
 });

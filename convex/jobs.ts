@@ -68,6 +68,8 @@ async function deliveryAttemptFor(ctx: any, jobId: any, sourceWorkAttempt: numbe
 
 function deliveryClaimMatches(row: any, attempt: any, a: any) {
   return Boolean(attempt
+    && (!row.activeDeliveryAttemptId || String(row.activeDeliveryAttemptId) === String(attempt._id))
+    && (a.deliveryAttemptId === undefined || String(a.deliveryAttemptId) === String(attempt._id))
     && Number(a.sourceWorkAttempt) === Number(attempt.sourceWorkAttempt)
     && Number(a.deliveryGeneration) === Number(attempt.generation)
     && typeof a.deliveryRunId === "string" && a.deliveryRunId === attempt.deliveryRunId
@@ -595,6 +597,7 @@ function claimedJob(j: any, upstreamEvidence: readonly any[] = []) {
     sourceWorkAttempt: j.attempt ?? 1,
     deliveryGeneration: j.deliveryGeneration ?? null,
     deliveryRunId: j.deliveryRunId ?? null,
+    activeDeliveryAttemptId: j.activeDeliveryAttemptId ?? null,
     verificationVerdict: j.verificationVerdict ?? null,
     verificationNote: j.verificationNote ?? null,
     reviewReceiptId: j.reviewReceiptId ?? null,
@@ -648,7 +651,7 @@ export const reserveDispatchBatch = mutation({
       // A malformed/legacy pending row may still point at a launched worker.
       // Never overwrite that binding into an unclaimable reservation: close
       // it first, record its terminal lineage, then reserve a fresh attempt.
-      const deliveryContinuation = j.verificationVerdict === "pass" && Boolean(j.reviewReceiptId) && Boolean(j.branch);
+      const deliveryContinuation = j.verificationVerdict === "pass" && Boolean(j.reviewReceiptId);
       if (attempt?.workerRunId && !deliveryContinuation) {
         if (!hasAttemptBudget(attemptNumber + 1, j.maxAttempts ?? 12)) continue;
         await ctx.db.patch(attempt._id, { status: "checkpointed", completedAt: now, lastEventAt: now });
@@ -674,10 +677,10 @@ export const reserveDispatchBatch = mutation({
         dispatchReason: a.reason?.slice(0, 160),
         workerRunId: undefined,
         deliveryRunId: undefined,
-        // Each Trigger controller dispatch is a new immutable delivery
-        // generation.  An expired lease may recover this generation only via
-        // its exact run; an older controller can never reacquire it.
-        deliveryGeneration: deliveryContinuation ? Math.max(1, Number(j.deliveryGeneration ?? 0) + 1) : j.deliveryGeneration,
+        // Generation one is allocated exactly once with the cold review
+        // receipt. Dispatching/recovery binds that existing generation; it
+        // must never allocate a second number for the same controller pass.
+        deliveryGeneration: deliveryContinuation ? Math.max(1, Number(j.deliveryGeneration ?? 1)) : j.deliveryGeneration,
         workerRuntime: "trigger",
         heartbeatAt: now,
       });
@@ -733,12 +736,12 @@ export const claimDispatched = mutation({
       j.dispatchId !== a.dispatchId ||
       (j.dispatchLeaseUntil ?? 0) < now
     ) return null;
-    const deliveryContinuation = j.verificationVerdict === "pass" && Boolean(j.reviewReceiptId) && Boolean(j.branch);
+    const deliveryContinuation = j.verificationVerdict === "pass" && Boolean(j.reviewReceiptId);
     if (priorAttempt?.workerRunId && deliveryContinuation) {
       const generation = Math.max(1, Number(j.deliveryGeneration ?? 1));
       const existingDelivery = await deliveryAttemptFor(ctx, a.jobId, attemptNumber, generation);
       // A lost response may only replay the immutable generation/run binding.
-      if (existingDelivery && (existingDelivery.dispatchId !== a.dispatchId || existingDelivery.deliveryRunId !== a.workerRunId.slice(0, 120))) return null;
+      if (existingDelivery && ((existingDelivery.dispatchId && existingDelivery.dispatchId !== a.dispatchId) || (existingDelivery.deliveryRunId && existingDelivery.deliveryRunId !== a.workerRunId.slice(0, 120)))) return null;
       const review: any = j.reviewReceiptId ? await ctx.db.get(j.reviewReceiptId) : null;
       const deliveryId = existingDelivery?._id ?? await ctx.db.insert("deliveryAttempts", {
         jobId: a.jobId, sourceWorkAttempt: attemptNumber, generation,
@@ -747,13 +750,13 @@ export const claimDispatched = mutation({
         reviewReceiptId: j.reviewReceiptId, reviewReceiptDigest: j.reviewReceiptDigest,
         reviewedHeadSha: review?.headSha, reviewedBaseSha: review?.baseSha,
         reviewedHeadTreeSha: review?.headTreeSha, reviewedDiffSha256: review?.diffSha256,
-        heartbeatAt: now, retries: 0, createdAt: now, updatedAt: now,
+        heartbeatAt: now, retries: 0, cumulativeRetries: 0, currentStep: "preflight", createdAt: now, updatedAt: now,
       });
-      if (existingDelivery) await ctx.db.patch(deliveryId, { status: "running", heartbeatAt: now, updatedAt: now });
+      if (existingDelivery) await ctx.db.patch(deliveryId, { dispatchId: a.dispatchId, deliveryRunId: a.workerRunId.slice(0, 120), status: "running", currentStep: "preflight", heartbeatAt: now, updatedAt: now });
       await patchJobWithRuntime(ctx, j, {
         status: "running", stage: "delivery", progress: "resuming verified controller delivery", startedAt: now,
         heartbeatAt: now, nextRunAt: undefined, dispatchLeaseUntil: undefined, dispatchId: a.dispatchId,
-        workerRunId: a.workerRunId.slice(0, 120), deliveryRunId: a.workerRunId.slice(0, 120), deliveryGeneration: generation, workerRuntime: "trigger",
+        workerRunId: a.workerRunId.slice(0, 120), deliveryRunId: a.workerRunId.slice(0, 120), deliveryGeneration: generation, activeDeliveryAttemptId: deliveryId, workerRuntime: "trigger",
       });
       await appendAttemptEvidence(ctx, j, "delivery_resumed", "Trusted controller resumed verified delivery without rerunning the specialist", {
         stage: "delivery", evidenceKind: "delivery", eventKey: `delivery-resume:${j.attempt ?? 1}:${a.dispatchId}`,
@@ -864,6 +867,7 @@ export const finalize = mutation({
     sourceWorkAttempt: v.optional(v.number()),
     deliveryGeneration: v.optional(v.number()),
     deliveryRunId: v.optional(v.string()),
+    deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
@@ -871,7 +875,8 @@ export const finalize = mutation({
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
     if (row.repo && !hasLiveDeliveryLease(row, a)) return false;
-    if (a.deliveryGeneration !== undefined && !deliveryClaimMatches(row, await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration)), a)) return false;
+    const delivery = a.deliveryGeneration === undefined ? null : await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration));
+    if (row.repo && (!delivery || !deliveryClaimMatches(row, delivery, a))) return false;
     // A completed job is called "verified" only when the supervisor actually
     // returned pass. This invariant lives in Convex, not only in the runner.
     if (a.status === "done" && (a.verificationVerdict !== "pass" || !completionReceiptAllowed(a))) return false;
@@ -920,6 +925,15 @@ export const finalize = mutation({
       if (priorReceipt) return false;
     }
     await patchJobWithRuntime(ctx, row, finalPatch);
+    if (delivery) await ctx.db.patch(delivery._id, {
+      status: success ? "done" : "blocked",
+      currentStep: "terminal",
+      terminalReceiptDigest: success ? a.resultDigest : undefined,
+      completedAt: now,
+      leaseUntil: undefined,
+      heartbeatAt: now,
+      updatedAt: now,
+    });
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (attempt) await ctx.db.patch(attempt._id, {
       status: success ? "done" : "error",
@@ -1142,11 +1156,20 @@ export const reapStale = mutation({
       if (j.stage === "delivery" && j.deliveryRunId && Number(j.deliveryGeneration ?? 0) > 0) {
         const delivery = await deliveryAttemptFor(ctx, j._id, j.attempt ?? 1, Number(j.deliveryGeneration));
         if (delivery?.status === "running") {
-          const retries = Number(delivery.retries ?? 0) + 1;
+          const retries = Number(delivery.cumulativeRetries ?? delivery.retries ?? 0) + 1;
           const exhaustedDelivery = retries > 6;
           await ctx.db.patch(delivery._id, {
-            status: exhaustedDelivery ? "blocked" : "checkpointed", retries, completedAt: now,
+            status: exhaustedDelivery ? "blocked" : "checkpointed", retries: Number(delivery.retries ?? 0) + 1, cumulativeRetries: retries, completedAt: now,
             leaseUntil: undefined, heartbeatAt: now, updatedAt: now,
+          });
+          const nextGeneration = Number(j.deliveryGeneration) + 1;
+          const nextDeliveryId = exhaustedDelivery ? undefined : await ctx.db.insert("deliveryAttempts", {
+            jobId: j._id, sourceWorkAttempt: j.attempt ?? 1, generation: nextGeneration,
+            policy: String(delivery.policy), status: "checkpointed", reviewReceiptId: delivery.reviewReceiptId,
+            reviewReceiptDigest: delivery.reviewReceiptDigest, reviewedHeadSha: delivery.reviewedHeadSha,
+            reviewedBaseSha: delivery.reviewedBaseSha, reviewedHeadTreeSha: delivery.reviewedHeadTreeSha,
+            reviewedDiffSha256: delivery.reviewedDiffSha256, heartbeatAt: now, retries: 0,
+            cumulativeRetries: retries, currentStep: "queued", createdAt: now, updatedAt: now,
           });
           await patchJobWithRuntime(ctx, j, {
             ...invalidateDeliveryLease(j),
@@ -1157,6 +1180,8 @@ export const reapStale = mutation({
               : "delivery controller stopped — retrying the same reviewed receipt",
             nextRunAt: exhaustedDelivery ? undefined : now + Math.min(30 * 60_000, 30_000 * 2 ** Math.max(0, retries - 1)),
             dispatchId: undefined, dispatchLeaseUntil: undefined, workerRunId: undefined, deliveryRunId: undefined,
+            deliveryGeneration: exhaustedDelivery ? j.deliveryGeneration : nextGeneration,
+            activeDeliveryAttemptId: exhaustedDelivery ? j.activeDeliveryAttemptId : nextDeliveryId,
           });
           await appendAttemptEvidence(ctx, j, exhaustedDelivery ? "delivery_attention" : "delivery_recovered",
             exhaustedDelivery ? "Delivery retry budget exhausted" : `Delivery generation ${j.deliveryGeneration} requeued without rerunning specialist`, {
@@ -1324,13 +1349,14 @@ export const touchHeartbeat = mutation({
 export const touchDeliveryHeartbeat = mutation({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), sourceWorkAttempt: v.number(),
-    deliveryGeneration: v.number(), deliveryRunId: v.string(), workerToken: v.optional(v.string()),
+    deliveryGeneration: v.number(), deliveryRunId: v.string(), deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
+    deliveryLeaseOwner: v.optional(v.string()), deliveryLeaseToken: v.optional(v.string()), deliveryLeaseVersion: v.optional(v.number()), workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     const delivery = await deliveryAttemptFor(ctx, a.jobId, a.sourceWorkAttempt, a.deliveryGeneration);
-    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt || !deliveryClaimMatches(row, delivery, a)
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt || !hasLiveDeliveryLease(row, a) || !deliveryClaimMatches(row, delivery, a)
       || delivery.status !== "running") return false;
     const now = Date.now();
     await ctx.db.patch(delivery._id, { heartbeatAt: now, updatedAt: now });
@@ -1349,12 +1375,23 @@ export const checkpointAndRequeue = mutation({
     branch: v.optional(v.string()),
     delayMs: v.optional(v.number()),
     nextStatus: v.optional(v.union(v.literal("pending"), v.literal("paused"), v.literal("cancelled"))),
+    deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
+    sourceWorkAttempt: v.optional(v.number()),
+    deliveryGeneration: v.optional(v.number()),
+    deliveryRunId: v.optional(v.string()),
+    deliveryLeaseOwner: v.optional(v.string()),
+    deliveryLeaseToken: v.optional(v.string()),
+    deliveryLeaseVersion: v.optional(v.number()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     if (!row || (row.attempt ?? 1) !== a.expectedAttempt) {
+      return { requeued: false, exhausted: false, stale: true };
+    }
+    const delivery = a.deliveryGeneration === undefined ? null : await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration));
+    if (a.deliveryGeneration !== undefined && (!hasLiveDeliveryLease(row, a) || !deliveryClaimMatches(row, delivery, a))) {
       return { requeued: false, exhausted: false, stale: true };
     }
     const requestedStatus = a.nextStatus ?? "pending";
@@ -1410,8 +1447,7 @@ export const checkpointAndRequeue = mutation({
     // was observed by a new specialist attempt.
     const deliveryContinuation = requestedStatus === "pending"
       && row.verificationVerdict === "pass"
-      && Boolean(row.reviewReceiptId)
-      && Boolean(row.branch);
+      && Boolean(row.reviewReceiptId);
     const attempt = (row.attempt ?? 1) + (requestedStatus === "pending" && !deliveryContinuation ? 1 : 0);
     const delayMs = Math.max(0, Math.min(6 * 60 * 60 * 1000, a.delayMs ?? 0));
     const exhausted =
@@ -1426,7 +1462,9 @@ export const checkpointAndRequeue = mutation({
       result: a.result,
       branch: a.branch ?? row.branch,
       attempt,
-      deliveryGeneration: deliveryContinuation ? Number(row.deliveryGeneration ?? 0) + 1 : row.deliveryGeneration,
+      // Allocate the next controller generation once here. reserveDispatch
+      // only dispatches it, so retries cannot double-increment.
+      deliveryGeneration: deliveryContinuation ? Number(row.deliveryGeneration ?? 1) + 1 : row.deliveryGeneration,
       startedAt: undefined,
       heartbeatAt: Date.now(),
       nextRunAt: status === "pending" ? Date.now() + delayMs : undefined,
@@ -1459,6 +1497,21 @@ export const checkpointAndRequeue = mutation({
       await appendAttemptEvidence(ctx, row, "queued", `Continuation attempt ${attempt} queued`, {
         stage: "queued", evidenceKind: "intent", eventKey: `intent:${attempt}`, attempt,
       });
+    }
+    if (deliveryContinuation && delivery) {
+      const cumulativeRetries = Number(delivery.cumulativeRetries ?? delivery.retries ?? 0) + 1;
+      await ctx.db.patch(delivery._id, { status: "checkpointed", completedAt: Date.now(), currentStep: "retry", retries: Number(delivery.retries ?? 0) + 1, cumulativeRetries, leaseUntil: undefined, updatedAt: Date.now() });
+      if (status === "pending") {
+        const nextGeneration = Number(row.deliveryGeneration ?? 1) + 1;
+        const existing = await deliveryAttemptFor(ctx, a.jobId, a.expectedAttempt, nextGeneration);
+        const nextDeliveryId = existing?._id ?? await ctx.db.insert("deliveryAttempts", {
+          jobId: a.jobId, sourceWorkAttempt: a.expectedAttempt, generation: nextGeneration,
+          policy: String(row.deliveryMode ?? (row.readonly ? "read_only" : "manual")), status: "checkpointed",
+          reviewReceiptId: row.reviewReceiptId, reviewReceiptDigest: row.reviewReceiptDigest,
+          heartbeatAt: Date.now(), retries: 0, cumulativeRetries, currentStep: "queued", createdAt: Date.now(), updatedAt: Date.now(),
+        });
+        await patchJobWithRuntime(ctx, row, { activeDeliveryAttemptId: nextDeliveryId });
+      }
     }
     return { requeued: status === "pending", exhausted, stale: false };
   },
@@ -1610,6 +1663,9 @@ export const setDelivery = mutation({
       v.literal("blocked"),
     )),
     mergeCommitSha: v.optional(v.string()),
+    observedPullRequestHead: v.optional(v.string()),
+    providerCall: v.optional(v.boolean()),
+    deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
     deliveryLeaseOwner: v.optional(v.string()),
     deliveryLeaseToken: v.optional(v.string()),
     deliveryLeaseVersion: v.optional(v.number()),
@@ -1623,7 +1679,13 @@ export const setDelivery = mutation({
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
     if (!hasLiveDeliveryLease(row, a)) return false;
-    if (a.deliveryGeneration !== undefined && !deliveryClaimMatches(row, await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration)), a)) return false;
+    const delivery = a.deliveryGeneration === undefined ? null : await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration));
+    if (!delivery || !deliveryClaimMatches(row, delivery, a)) return false;
+    const policy = String(delivery.policy);
+    if ((policy === "manual" && a.deliveryStatus === "merged")
+      || (policy === "read_only" && (a.providerCall === true || a.deliveryStatus === "merged" || a.pullRequestUrl))
+      || (a.deliveryStatus === "merged" && policy !== "auto_merge")) return false;
+    if (a.observedPullRequestHead && a.observedPullRequestHead !== delivery.reviewedHeadSha) return false;
     await patchJobWithRuntime(ctx, row, {
       branch: a.branch,
       pullRequestUrl: a.pullRequestUrl,
@@ -1631,6 +1693,11 @@ export const setDelivery = mutation({
       mergeCommitSha: a.mergeCommitSha?.slice(0, 80),
       mergedAt: a.deliveryStatus === "merged" ? Date.now() : undefined,
       heartbeatAt: Date.now(),
+    });
+    await ctx.db.patch(delivery._id, {
+      observedPullRequestHead: a.observedPullRequestHead ?? delivery.observedPullRequestHead,
+      currentStep: a.deliveryStatus === "merged" ? "receipt" : a.deliveryStatus === "pull_request" ? "merge" : "preflight",
+      heartbeatAt: Date.now(), updatedAt: Date.now(),
     });
     return true;
   },
@@ -1644,7 +1711,7 @@ export const linearizeDelivery = mutation({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), deliveryLeaseOwner: v.string(), deliveryLeaseToken: v.string(),
     deliveryLeaseVersion: v.optional(v.number()), workerToken: v.optional(v.string()),
-    sourceWorkAttempt: v.optional(v.number()), deliveryGeneration: v.optional(v.number()), deliveryRunId: v.optional(v.string()),
+    sourceWorkAttempt: v.optional(v.number()), deliveryGeneration: v.optional(v.number()), deliveryRunId: v.optional(v.string()), deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
@@ -1731,19 +1798,70 @@ export const markVerifiedForDelivery = mutation({
       agentEvidenceSha256: String(receipt.agentEvidenceSha256), createdAt: Date.now(),
     });
     const now = Date.now();
+    // Review is the phase boundary.  Persist the immutable cold receipt and
+    // allocate exactly one queued controller generation before the specialist
+    // exits.  The first GitHub effect can therefore never be untracked.
+    const sourceAttempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    const generation = Math.max(1, Number(row.deliveryGeneration ?? 0) || 1);
+    const existingDelivery = await deliveryAttemptFor(ctx, a.jobId, a.expectedAttempt, generation);
+    if (existingDelivery && existingDelivery.reviewReceiptDigest && existingDelivery.reviewReceiptDigest !== receiptDigest) return false;
+    const deliveryAttemptId = existingDelivery?._id ?? await ctx.db.insert("deliveryAttempts", {
+      jobId: a.jobId,
+      sourceWorkAttempt: a.expectedAttempt,
+      generation,
+      policy: String(row.deliveryMode ?? (row.readonly ? "read_only" : "manual")),
+      status: "checkpointed",
+      reviewReceiptId,
+      reviewReceiptDigest: receiptDigest,
+      reviewedHeadSha: String(receipt.headSha),
+      reviewedBaseSha: String(receipt.baseSha),
+      reviewedHeadTreeSha: String(receipt.headTreeSha),
+      reviewedDiffSha256: a.reviewDiffSha256,
+      heartbeatAt: now,
+      retries: 0,
+      cumulativeRetries: 0,
+      currentStep: "queued",
+      createdAt: now,
+      updatedAt: now,
+    });
+    if (existingDelivery) await ctx.db.patch(existingDelivery._id, {
+      status: "checkpointed", reviewReceiptId, reviewReceiptDigest: receiptDigest,
+      reviewedHeadSha: String(receipt.headSha), reviewedBaseSha: String(receipt.baseSha),
+      reviewedHeadTreeSha: String(receipt.headTreeSha), reviewedDiffSha256: a.reviewDiffSha256,
+      currentStep: "queued", heartbeatAt: now, updatedAt: now,
+    });
+    if (sourceAttempt && !sourceAttempt.completedAt) await ctx.db.patch(sourceAttempt._id, {
+      status: "done", completedAt: now, lastEventAt: now,
+    });
     await patchJobWithRuntime(ctx, row, {
       result,
       verificationVerdict: "pass",
       verificationNote,
       verifiedAt: now,
+      // A controller-only Trigger run will claim this cold receipt.  Do not
+      // keep the reviewing specialist alive through provider effects.
+      status: "pending",
       stage: "delivery",
-      progress: "supervisor passed — controller delivery in progress",
+      progress: "supervisor passed — controller delivery queued",
       percent: Math.max(96, row.percent ?? 0),
       heartbeatAt: now,
       reviewReceiptJson: undefined,
       reviewReceiptSignature: a.reviewReceiptSignature,
       reviewReceiptId,
       reviewReceiptDigest: receiptDigest,
+      activeDeliveryAttemptId: deliveryAttemptId,
+      deliveryGeneration: generation,
+      deliveryRunId: undefined,
+      dispatchId: undefined,
+      dispatchLeaseUntil: undefined,
+      workerRunId: undefined,
+      deliveryLeaseUntil: undefined,
+      deliveryLeaseOwner: undefined,
+      deliveryLeaseToken: undefined,
+      nextRunAt: now,
+    });
+    await appendAttemptEvidence(ctx, row, "delivery_queued", "Supervisor receipt persisted; controller-only delivery queued", {
+      stage: "delivery", evidenceKind: "delivery", eventKey: `delivery-queued:${a.expectedAttempt}:${generation}`, attempt: a.expectedAttempt,
     });
     return true;
   },

@@ -257,6 +257,9 @@ export default defineSchema({
     // a pointer to the immutable source review without relabelling it.
     deliveryGeneration: v.optional(v.number()),
     deliveryRunId: v.optional(v.string()),
+    // The active controller generation is an authority pointer, not merely
+    // display state.  A specialist never owns this row after review.
+    activeDeliveryAttemptId: v.optional(v.id("deliveryAttempts")),
     // Controller-owned delivery lease.  The opaque token never reaches an
     // agent sandbox; its version makes stale controller writes harmless.
     deliveryLeaseOwner: v.optional(v.string()),
@@ -602,8 +605,10 @@ export default defineSchema({
     jobId: v.id("jobs"),
     sourceWorkAttempt: v.number(),
     generation: v.number(),
-    dispatchId: v.string(),
-    deliveryRunId: v.string(),
+    // These are assigned only when the controller generation is dispatched.
+    // A queued cold receipt deliberately has no Trigger identity yet.
+    dispatchId: v.optional(v.string()),
+    deliveryRunId: v.optional(v.string()),
     policy: v.string(),
     status: v.string(), // running | checkpointed | done | blocked | abandoned
     reviewReceiptId: v.optional(v.id("reviewReceipts")),
@@ -619,6 +624,11 @@ export default defineSchema({
     leaseUntil: v.optional(v.number()),
     heartbeatAt: v.number(),
     retries: v.number(),
+    // Retry budget belongs to the immutable review lineage and is copied
+    // forward; resetting it on every generation made the cap unreachable.
+    cumulativeRetries: v.optional(v.number()),
+    currentStep: v.optional(v.string()), // queued | preflight | pr | merge | receipt | terminal
+    terminalReceiptDigest: v.optional(v.string()),
     nextRunAt: v.optional(v.number()),
     completedAt: v.optional(v.number()),
     createdAt: v.number(),

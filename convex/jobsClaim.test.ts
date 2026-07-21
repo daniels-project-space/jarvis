@@ -79,4 +79,23 @@ describe("claimDispatched handler", () => {
     expect(h.deliveryAttempts[0]).toMatchObject({ sourceWorkAttempt: 1, generation: 7, dispatchId: "delivery-dispatch", deliveryRunId: "controller-a", status: "running" });
     expect(await claim(h.ctx, { jobId: "job-1", dispatchId: "delivery-dispatch", workerRunId: "controller-b", workerToken: "test-worker" })).toBeNull();
   });
+
+  it("claims an already-allocated cold delivery generation once, then replays its complete envelope", async () => {
+    process.env.JARVIS_WORKER_TOKEN = "test-worker";
+    const h = claimHarness();
+    Object.assign(h.job, {
+      status: "dispatching", dispatchId: "delivery-dispatch", attempt: 1,
+      verificationVerdict: "pass", reviewReceiptId: "receipt-1", reviewReceiptDigest: "digest",
+      deliveryGeneration: 1, activeDeliveryAttemptId: "delivery-1",
+    });
+    Object.assign(h.attempts[0], {
+      status: "done", workerRunId: "specialist-run", upstreamEvidence: [{ label: "Dependency", status: "done", result: "frozen", verificationNote: "reviewed" }], completedAt: 1,
+    });
+    h.deliveryAttempts.push({ _id: "delivery-1", jobId: "job-1", sourceWorkAttempt: 1, generation: 1, policy: "manual", status: "checkpointed", heartbeatAt: 1, retries: 0, cumulativeRetries: 0, currentStep: "queued" });
+    const claim = (claimDispatched as any)._handler;
+    const first = await claim(h.ctx, { jobId: "job-1", dispatchId: "delivery-dispatch", workerRunId: "controller-a", workerToken: "test-worker" });
+    expect(h.deliveryAttempts[0]).toMatchObject({ status: "running", dispatchId: "delivery-dispatch", deliveryRunId: "controller-a", currentStep: "preflight" });
+    expect(await claim(h.ctx, { jobId: "job-1", dispatchId: "delivery-dispatch", workerRunId: "controller-a", workerToken: "test-worker" })).toEqual(first);
+    expect(await claim(h.ctx, { jobId: "job-1", dispatchId: "delivery-dispatch", workerRunId: "controller-b", workerToken: "test-worker" })).toBeNull();
+  });
 });
