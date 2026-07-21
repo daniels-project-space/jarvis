@@ -17,6 +17,7 @@ export const DEFAULT_CLOUD_WORKSPACE_TEMPLATE = "node22-codex-0.144.5";
 export const CLOUD_PROVIDER_SDKS = Object.freeze({
   e2b: { package: "e2b", version: "2.35.0" },
   sandbox0: { package: "sandbox0", version: "0.9.3" },
+  vercel: { package: "@vercel/sandbox", version: "2.8.0" },
   cloudflare: { package: "cloudflare-sandbox-compatible", version: "unconfigured" },
 } as const satisfies Record<CloudWorkspaceProviderName, { package: string; version: string }>);
 
@@ -116,8 +117,8 @@ export function cloudProviderRuntimeDigest(runtimeIdentity: string, templateDige
 
 function selectedProvider(env: Readonly<Record<string, string | undefined>>): CloudWorkspaceProviderName {
   const value = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
-  if (value === "e2b" || value === "sandbox0" || value === "cloudflare") return value;
-  throw new CloudWorkspaceError("cloudflare", "missing_configuration", "JARVIS_CLOUD_WORKSPACE_PROVIDER must select e2b, sandbox0, or cloudflare");
+  if (value === "e2b" || value === "sandbox0" || value === "vercel" || value === "cloudflare") return value;
+  throw new CloudWorkspaceError("cloudflare", "missing_configuration", "JARVIS_CLOUD_WORKSPACE_PROVIDER must select e2b, sandbox0, vercel, or cloudflare");
 }
 
 function nonemptySafe(value: string | undefined, label: string, provider: CloudWorkspaceProviderName): string {
@@ -141,6 +142,9 @@ export function configuredCloudProviderProbeBinding(
   const digest = String(env.JARVIS_CLOUD_WORKSPACE_TEMPLATE_DIGEST ?? "").trim().toLowerCase();
   if (!SHA256.test(digest)) {
     throw new CloudWorkspaceError(provider, "provider_probe_attestation_failed", "cloud workspace template digest is missing or malformed", "blocked");
+  }
+  if (provider === "vercel" && identity !== "node22") {
+    throw new CloudWorkspaceError(provider, "provider_probe_attestation_failed", "Vercel Sandbox must attest the stock node22 runtime", "blocked");
   }
   return {
     provider,
@@ -295,7 +299,7 @@ function blocked(provider: CloudWorkspaceProviderName, detail: string): never {
 
 export function installedCloudProviderSdkVersion(provider: CloudWorkspaceProviderName): string | null {
   try {
-    const packageName = provider === "e2b" ? "e2b" : provider === "sandbox0" ? "sandbox0" : null;
+    const packageName = provider === "e2b" ? "e2b" : provider === "sandbox0" ? "sandbox0" : provider === "vercel" ? "@vercel/sandbox" : null;
     if (!packageName) return null;
     let directory = dirname(fileURLToPath(import.meta.resolve(packageName)));
     for (let depth = 0; depth < 5; depth += 1) {

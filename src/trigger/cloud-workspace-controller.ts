@@ -124,6 +124,17 @@ export async function prepareCloudWorkspaceExecution(input: {
       throw new CloudWorkspaceError(provider.name, "stale_attempt", "attempt fence rejected source upload", "deferred");
     }
     await provider.uploadCredentiallessArchive(workspace, archive);
+    // Dependency hydration is a provider-specific, controller-owned phase.
+    // It must finish and relock egress before the caller can reach Codex.
+    if (provider.hydrateDependencies) {
+      if (input.assertCurrent && !await input.assertCurrent("dependency_hydration")) {
+        throw new CloudWorkspaceError(provider.name, "stale_attempt", "attempt fence rejected dependency hydration", "deferred");
+      }
+      await provider.hydrateDependencies(workspace);
+      if (input.assertCurrent && !await input.assertCurrent("dependency_relocked")) {
+        throw new CloudWorkspaceError(provider.name, "stale_attempt", "attempt fence rejected dependency relock", "deferred");
+      }
+    }
   } catch (error) {
     await provider.terminate(workspace, "terminal").catch(() => undefined);
     throw error;

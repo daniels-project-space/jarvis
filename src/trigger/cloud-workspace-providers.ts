@@ -1,6 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { Writable } from "node:stream";
 import type { Sandbox as E2BSandbox } from "e2b";
 import type { Client as Sandbox0Client, Sandbox as Sandbox0Sandbox } from "sandbox0";
+import type { Command as VercelCommand, Sandbox as VercelSandbox } from "@vercel/sandbox";
 import {
   CloudWorkspaceError,
   DEFAULT_WORKSPACE_LIMITS,
@@ -30,13 +32,6 @@ import {
 } from "./cloud-provider-probe-attestation";
 
 const ROOT = "/workspace/repository";
-const ARCHIVE_PATH = "/workspace/jarvis-source.tar";
-const CONTROL_DIR = "/workspace/.jarvis";
-const SOURCE_PATH = `${CONTROL_DIR}/source.tar`;
-const CHECKPOINT_PATCH_PATH = `${CONTROL_DIR}/checkpoint.patch`;
-const REPLAY_STAGE = `${CONTROL_DIR}/replay-stage`;
-const REPLAY_PATH = `${CONTROL_DIR}/replay.tar`;
-const PATCH_PATH = `${CONTROL_DIR}/output.patch`;
 const CHECKPOINT_EXCLUDES = [
   ".git", "node_modules", ".next", ".turbo", ".cache", ".npm", ".pnpm-store",
   "coverage", "dist", "build", "tmp", "temp", ".trigger", ".vercel",
@@ -54,6 +49,12 @@ const CAPABILITIES: Record<CloudWorkspaceProviderName, CloudWorkspaceCapabilitie
     emptyEnvironment: true, boundedResources: true, boundedTtl: true,
     exactCommandCancellation: true, sameWorkspaceResume: true, portableCheckpointReplay: true,
     providerSnapshots: true, persistentVolumes: true, opaqueSecretProjection: true,
+  },
+  vercel: {
+    credentiallessArchive: true, privateIngress: true, networkDenyByDefault: true,
+    emptyEnvironment: true, boundedResources: true, boundedTtl: true,
+    exactCommandCancellation: true, sameWorkspaceResume: false, portableCheckpointReplay: true,
+    providerSnapshots: false, persistentVolumes: false, opaqueSecretProjection: false,
   },
   cloudflare: {
     // This is deliberately only a compatibility seam until a concrete client
@@ -81,12 +82,27 @@ function outputLimit(value: string, maxBytes: number, provider: CloudWorkspacePr
 
 function shellQuote(value: string): string { return `'${value.replace(/'/g, `'"'"'`)}'`; }
 
-function hydrateCommand(): string {
+type ProviderPaths = Readonly<{
+  root: string; archivePath: string; controlDir: string; sourcePath: string;
+  checkpointPatchPath: string; replayStage: string; replayPath: string; patchPath: string;
+}>;
+
+function providerPaths(root: string): ProviderPaths {
+  const parent = root.slice(0, root.lastIndexOf("/"));
+  const controlDir = `${parent}/.jarvis`;
+  return {
+    root, archivePath: `${parent}/jarvis-source.tar`, controlDir,
+    sourcePath: `${controlDir}/source.tar`, checkpointPatchPath: `${controlDir}/checkpoint.patch`,
+    replayStage: `${controlDir}/replay-stage`, replayPath: `${controlDir}/replay.tar`, patchPath: `${controlDir}/output.patch`,
+  };
+}
+
+function hydrateCommand(paths: ProviderPaths): string {
   return [
-    `mkdir -p ${ROOT} ${CONTROL_DIR}`,
-    `tar --no-same-owner --no-same-permissions -xf ${ARCHIVE_PATH} -C ${ROOT}`,
-    `mv ${ARCHIVE_PATH} ${SOURCE_PATH}`,
-    `cd ${ROOT}`,
+    `mkdir -p ${paths.root} ${paths.controlDir}`,
+    `tar --no-same-owner --no-same-permissions -xf ${paths.archivePath} -C ${paths.root}`,
+    `mv ${paths.archivePath} ${paths.sourcePath}`,
+    `cd ${paths.root}`,
     "git init -q",
     "git config user.email jarvis-controller@example.invalid",
     "git config user.name 'JARVIS controller baseline'",
@@ -104,27 +120,28 @@ async function checkpointThroughProvider(
     jobId: string; attempt: number; baseSha: string; sourceArchiveSha256: string; sourceArchiveBytes: number;
     runtime: string; lockfileDigest: string; template: string; attemptKey: string; causationId: string;
   },
+  paths: ProviderPaths,
 ): Promise<{ manifest: WorkspaceCheckpoint; archive: Uint8Array }> {
   const excludes = CHECKPOINT_EXCLUDES.map((path) => `':(exclude)${path}' ":(exclude)${path}/**"`).join(" ");
   const result = await provider.exec(workspace, {
     command: [
-      `mkdir -p ${CONTROL_DIR}`,
-      `rm -f ${CHECKPOINT_PATCH_PATH}`,
-      `cd ${ROOT}`,
+      `mkdir -p ${paths.controlDir}`,
+      `rm -f ${paths.checkpointPatchPath}`,
+      `cd ${paths.root}`,
       `git add -N -A -- . ${excludes}`,
-      `git diff --binary --no-ext-diff --no-color --no-renames --full-index refs/jarvis/controller-base -- . ${excludes} > ${CHECKPOINT_PATCH_PATH}`,
+      `git diff --binary --no-ext-diff --no-color --no-renames --full-index refs/jarvis/controller-base -- . ${excludes} > ${paths.checkpointPatchPath}`,
       `git reset -q HEAD -- .`,
     ].join(" && "),
-    cwd: ROOT,
+    cwd: paths.root,
     timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs,
     maxOutputBytes: 16_384,
   });
   if (result.exitCode !== 0) throw new CloudWorkspaceError(provider.name, "provider_unavailable", "portable checkpoint export failed", "deferred");
-  const sourceBytes = await readArtifact(SOURCE_PATH, DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
+  const sourceBytes = await readArtifact(paths.sourcePath, DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
   if (sourceBytes.byteLength !== input.sourceArchiveBytes || sha256Bytes(sourceBytes) !== input.sourceArchiveSha256) {
     throw new CloudWorkspaceError(provider.name, "checkpoint_tampered", "sandbox source archive changed before checkpoint", "rejected");
   }
-  const patch = await readArtifact(CHECKPOINT_PATCH_PATH, DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
+  const patch = await readArtifact(paths.checkpointPatchPath, DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
   const archive = createPortableCheckpointArchive({
     baseSha: input.baseSha, sha256: input.sourceArchiveSha256, bytes: sourceBytes,
   }, patch);
@@ -157,15 +174,16 @@ async function exportPatchThroughProvider(
   readArtifact: (path: string, maxBytes: number) => Promise<Uint8Array>,
   baseSha: string,
   maxBytes: number,
+  paths: ProviderPaths,
 ): Promise<PatchManifest> {
   const result = await provider.exec(workspace, {
-    command: `mkdir -p ${CONTROL_DIR} && rm -f ${PATCH_PATH} && git add -N . && git diff --binary --no-ext-diff refs/jarvis/controller-base > ${PATCH_PATH}`,
-    cwd: ROOT,
+    command: `mkdir -p ${paths.controlDir} && rm -f ${paths.patchPath} && git add -N . && git diff --binary --no-ext-diff refs/jarvis/controller-base > ${paths.patchPath}`,
+    cwd: paths.root,
     timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs,
     maxOutputBytes: 16_384,
   });
   if (result.exitCode !== 0) throw new CloudWorkspaceError(provider.name, "provider_unavailable", "patch export failed", "deferred");
-  const patch = await readArtifact(PATCH_PATH, maxBytes);
+  const patch = await readArtifact(paths.patchPath, maxBytes);
   const manifest = { baseSha, sha256: sha256Bytes(patch), byteCount: patch.byteLength, patch };
   validatePatchManifest(manifest, baseSha, maxBytes, provider.name);
   return manifest;
@@ -180,12 +198,14 @@ abstract class ProviderBase implements CloudWorkspaceProvider {
   abstract writeFile(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number): Promise<void>;
   abstract listFiles(workspace: CloudWorkspace, path: string, maxEntries: number): Promise<string[]>;
   abstract terminate(workspace: CloudWorkspace, reason: "terminal" | "orphan" | "cancelled"): Promise<void>;
+  protected workspaceRoot = ROOT;
+  protected get paths() { return providerPaths(this.workspaceRoot); }
 
   async uploadCredentiallessArchive(workspace: CloudWorkspace, archive: CredentiallessArchive): Promise<void> {
     validateCredentiallessArchive(archive, DEFAULT_WORKSPACE_LIMITS, this.name);
-    await this.writeAbsolute(workspace, ARCHIVE_PATH, archive.bytes, DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
+    await this.writeAbsolute(workspace, this.paths.archivePath, archive.bytes, DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
     const result = await this.exec(workspace, {
-      command: hydrateCommand(), cwd: "/workspace", timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs,
+      command: hydrateCommand(this.paths), cwd: workspace.root, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs,
       maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes,
     });
     if (result.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "credentialless archive hydration failed", "deferred");
@@ -194,7 +214,7 @@ abstract class ProviderBase implements CloudWorkspaceProvider {
   async checkpoint(workspace: CloudWorkspace, input: {
     jobId: string; attempt: number; baseSha: string; sourceArchiveSha256: string; sourceArchiveBytes: number;
     runtime: string; lockfileDigest: string; template: string; attemptKey: string; causationId: string;
-  }) { return checkpointThroughProvider(this, workspace, (path, maxBytes) => this.readAbsolute(workspace, path, maxBytes), input); }
+  }) { return checkpointThroughProvider(this, workspace, (path, maxBytes) => this.readAbsolute(workspace, path, maxBytes), input, this.paths); }
 
   async recreateFromCheckpoint(input: { checkpoint: WorkspaceCheckpoint; archive: Uint8Array; limits: WorkspaceLimits; attemptKey: string }) {
     validatePortableCheckpointArchive(input.archive, input.checkpoint, input.limits);
@@ -205,25 +225,25 @@ abstract class ProviderBase implements CloudWorkspaceProvider {
       lockfileDigest: input.checkpoint.lockfileDigest,
       limits: input.limits,
     });
-    await this.writeAbsolute(workspace, REPLAY_PATH, input.archive, input.limits.maxArchiveBytes);
+    await this.writeAbsolute(workspace, this.paths.replayPath, input.archive, input.limits.maxArchiveBytes);
     const result = await this.exec(workspace, {
       command: [
-        `rm -rf ${ROOT} ${REPLAY_STAGE}`,
-        `mkdir -p ${ROOT} ${REPLAY_STAGE}`,
-        `tar --no-same-owner --no-same-permissions -xf ${REPLAY_PATH} -C ${REPLAY_STAGE}`,
-        `mv ${REPLAY_STAGE}/source.tar ${SOURCE_PATH}`,
-        `tar --no-same-owner --no-same-permissions -xf ${SOURCE_PATH} -C ${ROOT}`,
-        `cd ${ROOT}`,
+        `rm -rf ${this.paths.root} ${this.paths.replayStage}`,
+        `mkdir -p ${this.paths.root} ${this.paths.replayStage}`,
+        `tar --no-same-owner --no-same-permissions -xf ${this.paths.replayPath} -C ${this.paths.replayStage}`,
+        `mv ${this.paths.replayStage}/source.tar ${this.paths.sourcePath}`,
+        `tar --no-same-owner --no-same-permissions -xf ${this.paths.sourcePath} -C ${this.paths.root}`,
+        `cd ${this.paths.root}`,
         "git init -q",
         "git config user.email jarvis-controller@example.invalid",
         "git config user.name 'JARVIS controller baseline'",
         "git add -A",
         "git commit -q --allow-empty -m 'credentialless controller baseline'",
         "git update-ref refs/jarvis/controller-base HEAD",
-        `git apply --whitespace=nowarn ${REPLAY_STAGE}/workspace.patch`,
-        `rm -rf ${REPLAY_STAGE} ${REPLAY_PATH}`,
+        `git apply --whitespace=nowarn ${this.paths.replayStage}/workspace.patch`,
+        `rm -rf ${this.paths.replayStage} ${this.paths.replayPath}`,
       ].join(" && "),
-      cwd: "/workspace", timeoutMs: input.limits.commandTimeoutMs, maxOutputBytes: input.limits.maxOutputBytes,
+      cwd: workspace.root, timeoutMs: input.limits.commandTimeoutMs, maxOutputBytes: input.limits.maxOutputBytes,
     });
     if (result.exitCode !== 0) {
       await this.terminate(workspace, "terminal").catch(() => undefined);
@@ -233,7 +253,7 @@ abstract class ProviderBase implements CloudWorkspaceProvider {
   }
 
   async exportPatch(workspace: CloudWorkspace, baseSha: string, maxBytes: number) {
-    return exportPatchThroughProvider(this, workspace, (path, limit) => this.readAbsolute(workspace, path, limit), baseSha, maxBytes);
+    return exportPatchThroughProvider(this, workspace, (path, limit) => this.readAbsolute(workspace, path, limit), baseSha, maxBytes, this.paths);
   }
 
   protected abstract readAbsolute(workspace: CloudWorkspace, path: string, maxBytes: number): Promise<Uint8Array>;
@@ -264,7 +284,7 @@ class E2BCloudWorkspaceProvider extends ProviderBase {
     });
     const workspace: CloudWorkspace = {
       provider: this.name, providerWorkspaceId: sandbox.sandboxId,
-      providerSessionId: `e2b-session-${randomUUID()}`, root: ROOT, createdAt: Date.now(),
+      providerSessionId: `e2b-session-${randomUUID()}`, root: this.workspaceRoot, createdAt: Date.now(),
     };
     assertWorkspaceIdentity(workspace);
     this.sandboxes.set(workspace.providerWorkspaceId, sandbox);
@@ -346,7 +366,7 @@ class Sandbox0CloudWorkspaceProvider extends ProviderBase {
         network: { mode: "block-all", credentialBindings: [] }, autoResume: false, services: [],
       },
     });
-    const workspace = { provider: this.name, providerWorkspaceId: sandbox.id, providerSessionId: `sandbox0-context-${randomUUID()}`, root: ROOT, createdAt: Date.now() } satisfies CloudWorkspace;
+    const workspace = { provider: this.name, providerWorkspaceId: sandbox.id, providerSessionId: `sandbox0-context-${randomUUID()}`, root: this.workspaceRoot, createdAt: Date.now() } satisfies CloudWorkspace;
     assertWorkspaceIdentity(workspace);
     this.sandboxes.set(sandbox.id, sandbox);
     return workspace;
@@ -381,6 +401,210 @@ class Sandbox0CloudWorkspaceProvider extends ProviderBase {
   async terminate(workspace: CloudWorkspace) { await (await this.getClient()).sandboxes.delete(workspace.providerWorkspaceId); this.sandboxes.delete(workspace.providerWorkspaceId); }
   private async getClient() { if (!this.client) { const { Client } = await import("sandbox0"); this.client = new Client({ token: this.token, baseUrl: this.baseUrl }); } return this.client; }
   private async get(workspace: CloudWorkspace) { assertWorkspaceIdentity(workspace); const cached = this.sandboxes.get(workspace.providerWorkspaceId); if (cached) return cached; const sandbox = (await this.getClient()).sandbox(workspace.providerWorkspaceId); this.sandboxes.set(workspace.providerWorkspaceId, sandbox); return sandbox; }
+}
+
+const VERCEL_SAFE_TTL_MS = 44 * 60_000;
+const VERCEL_NPM_POLICY = Object.freeze({ allow: ["registry.npmjs.org"] });
+const VERCEL_NAME_PREFIX = "jarvis";
+
+function vercelWorkspaceName(attemptKey: string): string {
+  // Vercel names are persisted identities, so never derive one from an
+  // unbounded job string or reuse it after a terminated attempt.
+  return `${VERCEL_NAME_PREFIX}-${createHash("sha256").update(`${attemptKey}:${randomUUID()}`).digest("hex").slice(0, 40)}`;
+}
+
+function vercelCwd(workspace: CloudWorkspace, cwd: string | undefined): string {
+  const value = cwd ?? workspace.root;
+  if (value !== workspace.root && !value.startsWith(`${workspace.root}/`)) {
+    throw new CloudWorkspaceError("vercel", "unsafe_archive", "command cwd escapes the workspace root", "rejected");
+  }
+  return value;
+}
+
+function packageLockUsesOnlyNpmRegistry(bytes: Uint8Array): boolean {
+  let lock: unknown;
+  try { lock = JSON.parse(new TextDecoder().decode(bytes)); } catch { return false; }
+  const urls: string[] = [];
+  const collect = (value: unknown): void => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) { value.forEach(collect); return; }
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (key === "resolved" && typeof item === "string") urls.push(item);
+      else collect(item);
+    }
+  };
+  collect(lock);
+  return urls.length > 0 && urls.every((url) => {
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === "https:" && parsed.hostname === "registry.npmjs.org";
+    } catch { return false; }
+  });
+}
+
+/**
+ * Vercel Sandbox adapter. Credentials are passed only to SDK control-plane
+ * calls; neither Sandbox nor command environments receive them.
+ */
+export class VercelCloudWorkspaceProvider extends ProviderBase {
+  readonly name = "vercel" as const;
+  readonly capabilities = CAPABILITIES.vercel;
+  protected override workspaceRoot = "/vercel/sandbox/repository";
+  private readonly sandboxes = new Map<string, VercelSandbox>();
+
+  constructor(
+    private readonly token: string,
+    private readonly teamId: string,
+    private readonly projectId: string,
+  ) { super(); }
+
+  private credentials() { return { token: this.token, teamId: this.teamId, projectId: this.projectId }; }
+
+  async createWorkspace(input: { attemptKey: string; template: string; runtime: string; lockfileDigest: string; limits: WorkspaceLimits }) {
+    const { Sandbox } = await import("@vercel/sandbox");
+    const sandbox = await Sandbox.create({
+      ...this.credentials(),
+      name: vercelWorkspaceName(input.attemptKey),
+      runtime: "node22",
+      // Deliberately no source, ports, or authority-shaped environment.
+      env: {}, ports: [], networkPolicy: "deny-all", resources: { vcpus: 2 },
+      timeout: Math.min(input.limits.ttlMs, VERCEL_SAFE_TTL_MS),
+      persistent: false,
+      tags: {
+        owner: "jarvis",
+        attempt: createHash("sha256").update(input.attemptKey).digest("hex").slice(0, 32),
+        runtime: "node22",
+      },
+    });
+    const session = sandbox.currentSession();
+    if (sandbox.routes.length || sandbox.runtime !== "node22" || sandbox.vcpus !== 2 || sandbox.memory !== 4096
+      || sandbox.networkPolicy !== "deny-all" || session.networkPolicy !== "deny-all") {
+      await sandbox.delete().catch(() => undefined);
+      throw new CloudWorkspaceError(this.name, "provider_unavailable", "Vercel Sandbox creation did not preserve private bounded deny-all configuration", "blocked");
+    }
+    const workspace = { provider: this.name, providerWorkspaceId: sandbox.name, providerSessionId: session.sessionId, root: this.workspaceRoot, createdAt: Date.now() } satisfies CloudWorkspace;
+    assertWorkspaceIdentity(workspace);
+    this.sandboxes.set(workspace.providerWorkspaceId, sandbox);
+    return workspace;
+  }
+
+  async exec(workspace: CloudWorkspace, request: ExecRequest): Promise<ExecResult> {
+    const sandbox = await this.get(workspace);
+    const session = this.assertSession(workspace, sandbox);
+    if (request.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
+    const startedAt = Date.now();
+    let stdout = "";
+    let stderr = "";
+    let limitError: CloudWorkspaceError | null = null;
+    const append = (stream: "stdout" | "stderr", chunk: Buffer | string) => {
+      const next = (stream === "stdout" ? stdout : stderr) + chunk.toString();
+      try {
+        const bounded = outputLimit(next, request.maxOutputBytes, this.name);
+        if (stream === "stdout") stdout = bounded; else stderr = bounded;
+      } catch (error) { limitError = error as CloudWorkspaceError; }
+    };
+    const output = (stream: "stdout" | "stderr") => new Writable({ write(chunk, _encoding, callback) { append(stream, chunk); callback(); } });
+    let command: VercelCommand | undefined;
+    const kill = () => { if (command && "kill" in command) void command.kill("SIGKILL").catch(() => undefined); };
+    request.signal?.addEventListener("abort", kill, { once: true });
+    try {
+      command = await session.runCommand({
+        cmd: "sh", args: ["-lc", request.command], cwd: vercelCwd(workspace, request.cwd), env: {},
+        detached: true, timeoutMs: request.timeoutMs, stdout: output("stdout"), stderr: output("stderr"),
+      });
+      const poll = setInterval(() => { if (limitError || request.signal?.aborted) kill(); }, 20);
+      let finished;
+      try { finished = await command.wait(); } finally { clearInterval(poll); }
+      if (request.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
+      if (limitError) throw limitError;
+      this.assertSession(workspace, sandbox);
+      return { exitCode: finished.exitCode, stdout, stderr, providerSessionId: workspace.providerSessionId, durationMs: Date.now() - startedAt };
+    } catch (error) {
+      kill();
+      if (request.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
+      throw error;
+    } finally { request.signal?.removeEventListener("abort", kill); }
+  }
+
+  async readFile(workspace: CloudWorkspace, path: string, maxBytes: number) { return this.readAbsolute(workspace, safeWorkspacePath(workspace, path), maxBytes); }
+  protected async readAbsolute(workspace: CloudWorkspace, path: string, maxBytes: number) {
+    const sandbox = await this.get(workspace); this.assertSession(workspace, sandbox);
+    const bytes = await sandbox.fs.readFile(path);
+    if (bytes.byteLength > maxBytes) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds read limit", "rejected");
+    this.assertSession(workspace, sandbox); return Uint8Array.from(bytes);
+  }
+  async writeFile(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) { return this.writeAbsolute(workspace, safeWorkspacePath(workspace, path), data, maxBytes); }
+  protected async writeAbsolute(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) {
+    if (data.byteLength > maxBytes) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds write limit", "rejected");
+    const sandbox = await this.get(workspace); this.assertSession(workspace, sandbox);
+    await sandbox.fs.writeFile(path, data); this.assertSession(workspace, sandbox);
+  }
+  async listFiles(workspace: CloudWorkspace, path: string, maxEntries: number) {
+    const sandbox = await this.get(workspace); this.assertSession(workspace, sandbox);
+    const base = safeWorkspacePath(workspace, path);
+    const entries = await sandbox.fs.readdir(base, { withFileTypes: true });
+    if (entries.length > maxEntries) throw new CloudWorkspaceError(this.name, "resource_limit", "file listing exceeds limit", "rejected");
+    for (const entry of entries) {
+      const stat = await sandbox.fs.lstat(`${base}/${entry.name}`);
+      if (entry.isSymbolicLink() || stat.isSymbolicLink()) throw new CloudWorkspaceError(this.name, "unsafe_archive", "symlink encountered during bounded listing", "rejected");
+    }
+    this.assertSession(workspace, sandbox); return entries.map((entry) => entry.name);
+  }
+
+  async hydrateDependencies(workspace: CloudWorkspace): Promise<void> {
+    // Source has already been validated and uploaded. This parses only the
+    // committed lockfile, opens one registry for one command, then relocks.
+    const sandbox = await this.get(workspace); this.assertSession(workspace, sandbox);
+    const hasLock = await sandbox.fs.exists(`${this.workspaceRoot}/package-lock.json`);
+    if (!hasLock) return;
+    const lock = await this.readAbsolute(workspace, `${this.workspaceRoot}/package-lock.json`, DEFAULT_WORKSPACE_LIMITS.maxFileBytes);
+    if (!packageLockUsesOnlyNpmRegistry(lock)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "package lock contains a non-npm-registry dependency", "rejected");
+    try {
+      await sandbox.updateNetworkPolicy(VERCEL_NPM_POLICY);
+      this.assertSession(workspace, sandbox);
+      const installed = await this.exec(workspace, { command: "npm ci --ignore-scripts --no-audit --fund=false && git reset --hard refs/jarvis/controller-base", cwd: this.workspaceRoot, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs, maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes });
+      if (installed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "deterministic dependency hydration failed", "deferred");
+    } finally {
+      await sandbox.updateNetworkPolicy("deny-all");
+    }
+    this.assertSession(workspace, sandbox);
+    if (sandbox.networkPolicy !== "deny-all" || sandbox.currentSession().networkPolicy !== "deny-all") throw new CloudWorkspaceError(this.name, "provider_unavailable", "dependency hydration did not relock deny-all egress", "blocked");
+    const denied = await this.exec(workspace, { command: "node -e 'fetch(\"https://example.com\",{signal:AbortSignal.timeout(3000)}).then(()=>process.exit(9),()=>process.exit(0))'", cwd: this.workspaceRoot, timeoutMs: 8_000, maxOutputBytes: 4_000 });
+    if (denied.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "deny-all network verification failed after dependency hydration", "blocked");
+  }
+
+  async terminate(workspace: CloudWorkspace) {
+    try {
+      const sandbox = await this.get(workspace);
+      // Never resume during cleanup. A changed session is an attempt fence
+      // violation, but deletion of the exact named sandbox is still safe.
+      const session = sandbox.currentSession();
+      if (session.sessionId !== workspace.providerSessionId && session.status === "running") {
+        throw new CloudWorkspaceError(this.name, "stale_attempt", "Vercel Sandbox session changed before cleanup", "deferred");
+      }
+      await sandbox.delete();
+    } catch (error) {
+      if (this.absent(error)) return;
+      throw error;
+    } finally { this.sandboxes.delete(workspace.providerWorkspaceId); }
+  }
+
+  private absent(error: unknown): boolean { return /(?:not[_ -]?found|404|already deleted)/i.test(String(error)); }
+  private async get(workspace: CloudWorkspace): Promise<VercelSandbox> {
+    assertWorkspaceIdentity(workspace);
+    const cached = this.sandboxes.get(workspace.providerWorkspaceId);
+    if (cached) return cached;
+    const { Sandbox } = await import("@vercel/sandbox");
+    const sandbox = await Sandbox.get({ ...this.credentials(), name: workspace.providerWorkspaceId, resume: false });
+    this.sandboxes.set(workspace.providerWorkspaceId, sandbox); return sandbox;
+  }
+  private assertSession(workspace: CloudWorkspace, sandbox: VercelSandbox) {
+    const session = sandbox.currentSession();
+    if (session.sessionId !== workspace.providerSessionId || session.status !== "running") {
+      throw new CloudWorkspaceError(this.name, "stale_attempt", "Vercel Sandbox session changed or stopped for this attempt", "deferred");
+    }
+    return session;
+  }
 }
 
 export type CloudflareSandboxCompatibleClient = CloudWorkspaceProvider;
@@ -421,6 +645,12 @@ function configuredProviderAdapterForName(
     if (!env.SANDBOX0_TOKEN) throw new CloudWorkspaceError("sandbox0", "missing_configuration", "SANDBOX0_TOKEN is not configured");
     return new Sandbox0CloudWorkspaceProvider(env.SANDBOX0_TOKEN, env.SANDBOX0_BASE_URL);
   }
+  if (name === "vercel") {
+    if (!env.VERCEL_TOKEN || !env.VERCEL_TEAM_ID || !env.VERCEL_PROJECT_ID) {
+      throw new CloudWorkspaceError("vercel", "missing_configuration", "VERCEL_TOKEN, VERCEL_TEAM_ID, and VERCEL_PROJECT_ID are all required");
+    }
+    return new VercelCloudWorkspaceProvider(env.VERCEL_TOKEN, env.VERCEL_TEAM_ID, env.VERCEL_PROJECT_ID);
+  }
   if (name === "cloudflare") {
     throw new CloudWorkspaceError("cloudflare", "missing_configuration", "Cloudflare Sandbox-compatible client is not configured");
   }
@@ -429,8 +659,8 @@ function configuredProviderAdapterForName(
 
 function configuredProviderAdapter(env: Readonly<Record<string, string | undefined>>): CloudWorkspaceProvider {
   const name = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
-  if (!["e2b", "sandbox0", "cloudflare"].includes(name)) {
-    throw new CloudWorkspaceError("cloudflare", "missing_configuration", "JARVIS_CLOUD_WORKSPACE_PROVIDER must select e2b, sandbox0, or cloudflare");
+  if (!["e2b", "sandbox0", "vercel", "cloudflare"].includes(name)) {
+    throw new CloudWorkspaceError("cloudflare", "missing_configuration", "JARVIS_CLOUD_WORKSPACE_PROVIDER must select e2b, sandbox0, vercel, or cloudflare");
   }
   return configuredProviderAdapterForName(env, name as CloudWorkspaceProviderName);
 }
@@ -473,7 +703,7 @@ export function configuredCloudWorkspaceProviderForLiveProbe(
 ): CloudWorkspaceProvider {
   const name = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
   if (env.JARVIS_CLOUD_PROVIDER_PROBE !== "live") {
-    const provider = name === "e2b" || name === "sandbox0" || name === "cloudflare" ? name : "cloudflare";
+    const provider = name === "e2b" || name === "sandbox0" || name === "vercel" || name === "cloudflare" ? name : "cloudflare";
     throw new CloudWorkspaceError(provider, "provider_probe_attestation_failed", "live provider probe authority was not explicitly enabled", "blocked");
   }
   return configuredProviderAdapter(env);

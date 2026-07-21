@@ -9,7 +9,7 @@ import {
 
 export type { WorkspaceCheckpoint } from "../lib/workspace-checkpoint";
 
-export type CloudWorkspaceProviderName = "e2b" | "sandbox0" | "cloudflare";
+export type CloudWorkspaceProviderName = "e2b" | "sandbox0" | "vercel" | "cloudflare";
 // Persisted attempts and checkpoint manifests can still name the retired
 // provider. Historical identity is data, not execution authority.
 export type HistoricalCloudWorkspaceProviderName = CloudWorkspaceProviderName | "daytona";
@@ -127,6 +127,12 @@ export interface CloudWorkspaceProvider {
     limits: WorkspaceLimits;
   }): Promise<CloudWorkspace>;
   uploadCredentiallessArchive(workspace: CloudWorkspace, archive: CredentiallessArchive): Promise<void>;
+  /**
+   * Controller-owned dependency setup. Providers that need a narrowly opened
+   * package registry implement this after source upload and before Codex is
+   * allowed to run. It is deliberately not a general command escape hatch.
+   */
+  hydrateDependencies?(workspace: CloudWorkspace): Promise<void>;
   exec(workspace: CloudWorkspace, request: ExecRequest): Promise<ExecResult>;
   readFile(workspace: CloudWorkspace, path: string, maxBytes: number): Promise<Uint8Array>;
   writeFile(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number): Promise<void>;

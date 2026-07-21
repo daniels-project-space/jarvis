@@ -153,6 +153,22 @@ describe("fail-closed cloud workspace boundary", () => {
     expect(hydrate).not.toHaveBeenCalled();
   });
 
+  it("runs the controller-owned dependency phase after upload and terminates before an agent boundary when it fails", async () => {
+    const provider = new FakeCloudWorkspaceProvider();
+    const events: string[] = [];
+    const upload = provider.uploadCredentiallessArchive.bind(provider);
+    provider.uploadCredentiallessArchive = async (workspace, source) => { events.push("upload"); await upload(workspace, source); };
+    const dependencyProvider = provider as typeof provider & { hydrateDependencies: () => Promise<void> };
+    dependencyProvider.hydrateDependencies = async () => { events.push("dependency"); throw new CloudWorkspaceError("sandbox0", "provider_unavailable", "install failed", "deferred"); };
+    await expect(prepareCloudWorkspaceExecution({
+      providerFactory: () => provider,
+      hydrateArchive: async () => archive([{ name: "package-lock.json", data: new TextEncoder().encode("{}") }]),
+      attemptKey: "dependency-failure:1", template: "node", runtime: "node-22", lockfileDigest: LOCK,
+    })).rejects.toMatchObject({ code: "provider_unavailable" });
+    expect(events).toEqual(["upload", "dependency"]);
+    expect(provider.calls).toContain("terminate:terminal");
+  });
+
   it("never projects controller secrets or caller env into sandbox execution", async () => {
     const provider = new FakeCloudWorkspaceProvider();
     const workspace = await provider.createWorkspace({ attemptKey: "job:1", template: "node", runtime: "node-22", lockfileDigest: "b".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS });

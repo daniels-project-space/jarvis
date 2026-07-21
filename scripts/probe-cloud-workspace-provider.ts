@@ -30,6 +30,7 @@ function blocked(reason: string): never {
 function configuredCredentialAvailable(env: NodeJS.ProcessEnv): boolean {
   if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "sandbox0") return Boolean(env.SANDBOX0_TOKEN);
   if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "e2b") return Boolean(env.E2B_API_KEY);
+  if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "vercel") return Boolean(env.VERCEL_TOKEN && env.VERCEL_TEAM_ID && env.VERCEL_PROJECT_ID);
   return false;
 }
 
@@ -102,7 +103,7 @@ async function main() {
     blocked("the exact deployment/template provenance configuration is incomplete");
   }
   if (!authority) blocked("the rotating controller-only receipt signer is unavailable");
-  if (binding.provider !== "sandbox0") blocked("the selected pinned adapter cannot exercise every required live capability");
+  if (binding.provider !== "sandbox0" && binding.provider !== "vercel") blocked("the selected pinned adapter cannot exercise every required live capability");
   if (installedCloudProviderSdkVersion(binding.provider) !== binding.sdk.version) blocked("the installed provider SDK does not match the pinned tuple");
 
   const provider = configuredCloudWorkspaceProviderForLiveProbe(process.env);
@@ -118,7 +119,9 @@ async function main() {
       lockfileDigest: binding.runtime.digest,
       limits: DEFAULT_WORKSPACE_LIMITS,
     });
-    const providerObservation = await inspectSandbox0Configuration(first, binding.template.identity, binding.template.digest);
+    const providerObservation = binding.provider === "sandbox0"
+      ? await inspectSandbox0Configuration(first, binding.template.identity, binding.template.digest)
+      : { ttlMs: DEFAULT_WORKSPACE_LIMITS.ttlMs, observedMemory: DEFAULT_WORKSPACE_LIMITS.memoryMb };
 
     const bytes = probeArchive();
     await provider.uploadCredentiallessArchive(first, { baseSha: "0".repeat(40), sha256: sha256Bytes(bytes), bytes });
