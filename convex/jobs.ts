@@ -28,6 +28,7 @@ const STALE_RUNNER_MS = 5 * 60 * 1000;
 const STALLED_PROGRESS_MS = 20 * 60 * 1000;
 const DISPATCH_LEASE_MS = 2 * 60 * 1000;
 const DELIVERY_LEASE_MS = 45_000;
+const REVIEW_RECEIPT_MAX_CHARS = 300_000;
 
 async function sha256Hex(value: string) {
   const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
@@ -265,7 +266,10 @@ async function migrateLegacyJobsPage(ctx: any, migration?: any) {
     if (row.repo && row.reviewReceiptJson && row.reviewReceiptSignature && !row.reviewReceiptId) {
       try {
         const receipt = JSON.parse(row.reviewReceiptJson);
-        const receiptJson = String(row.reviewReceiptJson).slice(0, 300_000);
+        // Never truncate signed JSON: a truncated document is neither valid
+        // JSON nor the document its digest/signature describe.
+        if (String(row.reviewReceiptJson).length > REVIEW_RECEIPT_MAX_CHARS) throw new Error("legacy receipt exceeds limit");
+        const receiptJson = String(row.reviewReceiptJson);
         const digest = await sha256Hex(receiptJson);
         if (receipt?.jobId === String(row._id) && Number(receipt?.attempt) === (row.attempt ?? 1)
           && receipt?.repository === row.repo && isSha256Digest(row.reviewReceiptSignature)
@@ -285,9 +289,11 @@ async function migrateLegacyJobsPage(ctx: any, migration?: any) {
     }
     // Old rows can already contain append-only evidence. Seed the job-wide
     // cursor from it so rollout never restarts causal numbering at one.
-    const historical = await ctx.db.query("workEvents")
-      .withIndex("by_job", (q: any) => q.eq("jobId", String(row._id))).take(200);
-    const newest = [...historical].sort((a: any, b: any) => Number(b.sequence ?? 0) - Number(a.sequence ?? 0) || Number(b.createdAt ?? 0) - Number(a.createdAt ?? 0))[0];
+    // The sequence index finds the real durable maximum even for an old job
+    // with more than one migration-page worth of audit events.
+    const newest = await ctx.db.query("workEvents")
+      .withIndex("by_job_sequence", (q: any) => q.eq("jobId", String(row._id)))
+      .order("desc").first();
     if (newest && Number(row.lifecycleSequence ?? 0) < Number(newest.sequence ?? 0)) {
       await ctx.db.patch(row._id, { lifecycleSequence: Number(newest.sequence ?? 0), lifecycleEventKey: newest.eventKey });
       row.lifecycleSequence = Number(newest.sequence ?? 0);
@@ -573,6 +579,9 @@ function claimedJob(j: any, upstreamEvidence: readonly any[] = []) {
     mergeCommitSha: j.mergeCommitSha ?? null,
     verificationVerdict: j.verificationVerdict ?? null,
     verificationNote: j.verificationNote ?? null,
+    reviewReceiptId: j.reviewReceiptId ?? null,
+    reviewReceiptDigest: j.reviewReceiptDigest ?? null,
+    reviewReceiptSignature: j.reviewReceiptSignature ?? null,
     acceptanceCriteria: j.acceptanceCriteria ?? [],
     modelReason: j.modelReason ?? null,
     parentJobId: j.parentJobId ?? null,
@@ -621,7 +630,8 @@ export const reserveDispatchBatch = mutation({
       // A malformed/legacy pending row may still point at a launched worker.
       // Never overwrite that binding into an unclaimable reservation: close
       // it first, record its terminal lineage, then reserve a fresh attempt.
-      if (attempt?.workerRunId) {
+      const deliveryContinuation = j.verificationVerdict === "pass" && Boolean(j.reviewReceiptId) && Boolean(j.branch);
+      if (attempt?.workerRunId && !deliveryContinuation) {
         if (!hasAttemptBudget(attemptNumber + 1, j.maxAttempts ?? 12)) continue;
         await ctx.db.patch(attempt._id, { status: "checkpointed", completedAt: now, lastEventAt: now });
         await appendAttemptEvidence(ctx, j, "reservation_repaired", "Malformed launched reservation fenced before redispatch", {
@@ -645,6 +655,7 @@ export const reserveDispatchBatch = mutation({
         dispatchLeaseUntil: now + DISPATCH_LEASE_MS,
         dispatchReason: a.reason?.slice(0, 160),
         workerRunId: undefined,
+        deliveryRunId: undefined,
         workerRuntime: "trigger",
         heartbeatAt: now,
       });
@@ -692,12 +703,26 @@ export const claimDispatched = mutation({
     // Do not execute a dependency query on a redelivery. The original response
     // may have been lost after commit; this is an immutable replay envelope.
     if (disposition === "replay") return claimedJob(j, priorAttempt?.upstreamEvidence ?? []);
+    if (j?.status === "running" && j.dispatchId === a.dispatchId && j.deliveryRunId === a.workerRunId.slice(0, 120)
+      && j.verificationVerdict === "pass" && j.reviewReceiptId) return claimedJob(j, priorAttempt?.upstreamEvidence ?? []);
     if (
       !j ||
       j.status !== "dispatching" ||
       j.dispatchId !== a.dispatchId ||
       (j.dispatchLeaseUntil ?? 0) < now
     ) return null;
+    const deliveryContinuation = j.verificationVerdict === "pass" && Boolean(j.reviewReceiptId) && Boolean(j.branch);
+    if (priorAttempt?.workerRunId && deliveryContinuation) {
+      await patchJobWithRuntime(ctx, j, {
+        status: "running", stage: "delivery", progress: "resuming verified controller delivery", startedAt: now,
+        heartbeatAt: now, nextRunAt: undefined, dispatchLeaseUntil: undefined, dispatchId: a.dispatchId,
+        workerRunId: a.workerRunId.slice(0, 120), deliveryRunId: a.workerRunId.slice(0, 120), workerRuntime: "trigger",
+      });
+      await appendAttemptEvidence(ctx, j, "delivery_resumed", "Trusted controller resumed verified delivery without rerunning the specialist", {
+        stage: "delivery", evidenceKind: "delivery", eventKey: `delivery-resume:${j.attempt ?? 1}:${a.dispatchId}`,
+      });
+      return claimedJob(j, priorAttempt.upstreamEvidence ?? []);
+    }
     if (priorAttempt?.workerRunId || (priorAttempt?.dispatchId && priorAttempt.dispatchId !== a.dispatchId)) {
       // A stale platform redelivery must not replace the original workspace
       // or session receipt. It cannot cross the launch fence a second time.
@@ -765,6 +790,7 @@ export const rejectDispatch = mutation({
     const now = Date.now();
     const delayMs = Math.max(0, Math.min(10 * 60_000, a.delayMs ?? 30_000));
     await patchJobWithRuntime(ctx, row, {
+      ...invalidateDeliveryLease(row),
       status: "pending",
       stage: "queued",
       progress: `worker launch deferred · ${a.reason.slice(0, 240)}`,
@@ -1284,7 +1310,15 @@ export const checkpointAndRequeue = mutation({
       }
       return { requeued: false, exhausted: false, stale: true };
     }
-    const attempt = (row.attempt ?? 1) + (requestedStatus === "pending" ? 1 : 0);
+    // A controller-only delivery retry carries a signed, immutable review of
+    // this exact work attempt. Keep that work attempt stable and increment a
+    // separate delivery generation so a resume cannot pretend old evidence
+    // was observed by a new specialist attempt.
+    const deliveryContinuation = requestedStatus === "pending"
+      && row.verificationVerdict === "pass"
+      && Boolean(row.reviewReceiptId)
+      && Boolean(row.branch);
+    const attempt = (row.attempt ?? 1) + (requestedStatus === "pending" && !deliveryContinuation ? 1 : 0);
     const delayMs = Math.max(0, Math.min(6 * 60 * 60 * 1000, a.delayMs ?? 0));
     const exhausted =
       requestedStatus === "pending" &&
@@ -1298,6 +1332,7 @@ export const checkpointAndRequeue = mutation({
       result: a.result,
       branch: a.branch ?? row.branch,
       attempt,
+      deliveryGeneration: deliveryContinuation ? Number(row.deliveryGeneration ?? 0) + 1 : row.deliveryGeneration,
       startedAt: undefined,
       heartbeatAt: Date.now(),
       nextRunAt: status === "pending" ? Date.now() + delayMs : undefined,
@@ -1325,7 +1360,7 @@ export const checkpointAndRequeue = mutation({
           : `Checkpoint saved; job ${requestedStatus}`,
       { stage: exhausted ? "error" : requestedStatus === "pending" ? "checkpointed" : requestedStatus,
         percent: row.percent, evidenceKind: "checkpoint", eventKey: `checkpoint:${a.expectedAttempt}:${requestedStatus}`, attempt: a.expectedAttempt });
-    if (status === "pending") {
+    if (status === "pending" && !deliveryContinuation) {
       await ensureAttempt(ctx, a.jobId, attempt, "pending", Date.now());
       await appendAttemptEvidence(ctx, row, "queued", `Continuation attempt ${attempt} queued`, {
         stage: "queued", evidenceKind: "intent", eventKey: `intent:${attempt}`, attempt,
@@ -1360,6 +1395,21 @@ export const executionLease = query({
     return legacy
       ? { status: legacy.status, attempt: legacy.attempt ?? 1, steerRevision: legacy.steerRevision ?? 0 }
       : { status: "missing", attempt: 0, steerRevision: 0 };
+  },
+});
+
+// Cold receipt access is worker-only and returns exactly the immutable record
+// named by the compact claim pointer. It is never part of an agent prompt or
+// sandbox configuration.
+export const reviewReceipt = query({
+  args: { jobId: v.id("jobs"), expectedAttempt: v.number(), reviewReceiptId: v.id("reviewReceipts"), workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row: any = await ctx.db.get(a.jobId);
+    if (!row || (row.attempt ?? 1) !== a.expectedAttempt || row.reviewReceiptId !== a.reviewReceiptId) return null;
+    const receipt: any = await ctx.db.get(a.reviewReceiptId);
+    if (!receipt || receipt.jobId !== a.jobId || receipt.attempt !== a.expectedAttempt || receipt.receiptDigest !== row.reviewReceiptDigest) return null;
+    return receipt;
   },
 });
 
@@ -1431,6 +1481,7 @@ export const provideInput = mutation({
     });
     const nextAttempt = (row.attempt ?? 1) + 1;
     await patchJobWithRuntime(ctx, row, {
+      ...invalidateDeliveryLease(row),
       status: "pending",
       stage: "queued",
       progress: "Daniel answered — continuation queued",
@@ -1540,10 +1591,12 @@ export const markVerifiedForDelivery = mutation({
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
     if (!hasLiveDeliveryLease(row, a)) return false;
-    if (!isOwnedRepository(row.repo)) return false;
-    if (classifyWorkSafety(row.task, { repo: row.repo }).approvalRequired) return false;
-    if (row.deliveryMode !== "auto_merge" && row.goalStage !== "validating") return false;
+    // A controller review receipt is completion evidence for every scoped
+    // repository job. Delivery policy separately decides whether a PR/merge
+    // may happen; manual and read-only work must still be able to finish.
+    if (!row.repo) return false;
     if (!a.reviewReceiptJson || !isSha256Digest(a.reviewReceiptSignature) || !isSha256Digest(a.reviewDiffSha256)) return false;
+    if (a.reviewReceiptJson.length > REVIEW_RECEIPT_MAX_CHARS) return false;
     const result = a.result.slice(0, 4_000);
     const verificationNote = a.verificationNote.slice(0, 1_000);
     if (a.resultDigest !== await sha256Hex(result) || a.evidenceDigest !== await sha256Hex(verificationNote)) return false;
@@ -1556,7 +1609,7 @@ export const markVerifiedForDelivery = mutation({
       || receipt?.diffSha256 !== a.reviewDiffSha256
       || !isSha256Digest(receipt?.agentEvidenceSha256)
     ) return false;
-    const receiptJson = a.reviewReceiptJson.slice(0, 300_000);
+    const receiptJson = a.reviewReceiptJson;
     const receiptDigest = await sha256Hex(receiptJson);
     const existing = await ctx.db.query("reviewReceipts")
       .withIndex("by_job_attempt_digest", (q: any) => q.eq("jobId", a.jobId).eq("attempt", a.expectedAttempt).eq("receiptDigest", receiptDigest)).first();
@@ -1705,6 +1758,16 @@ export const control = mutation({
         deliveryLeaseToken: undefined,
       });
       await ensureAttempt(ctx, a.jobId, (row.attempt ?? 1) + 1, renewApproval ? "awaiting_approval" : "pending", now);
+      await appendAttemptEvidence(ctx, row, "retry", "Daniel requested a fresh attempt", {
+        stage: renewApproval ? "approval" : "queued", evidenceKind: "control", eventKey: `control:retry:${row.attempt ?? 1}:${now}`,
+        attempt: row.attempt ?? 1,
+      });
+      controlEventEmitted = true;
+      await appendAttemptEvidence(ctx, row, renewApproval ? "approval_requested" : "queued",
+        renewApproval ? `Fresh attempt ${(row.attempt ?? 1) + 1} awaits approval` : `Fresh attempt ${(row.attempt ?? 1) + 1} queued after retry`, {
+          stage: renewApproval ? "approval" : "queued", evidenceKind: "intent", eventKey: `intent:${(row.attempt ?? 1) + 1}`,
+          attempt: (row.attempt ?? 1) + 1,
+        });
       if (renewApproval) {
         await ctx.db.insert("approvals", {
           jobId: String(a.jobId),

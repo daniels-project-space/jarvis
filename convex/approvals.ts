@@ -3,6 +3,27 @@ import { v } from "convex/values";
 import { requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 import { patchJobWithRuntime } from "./controlPlane";
 
+async function appendApprovalLifecycle(ctx: any, job: any, type: string, message: string, stage: string, attempt: number) {
+  const durable = await ctx.db.get(job._id) ?? job;
+  const sequence = Number(durable.lifecycleSequence ?? 0) + 1;
+  const predecessorKey = durable.lifecycleEventKey;
+  const eventKey = `approval:${type}:${attempt}:${sequence}`;
+  await ctx.db.insert("workEvents", {
+    jobId: String(job._id), missionId: job.missionId, agentId: job.agentId, type, message, stage,
+    attempt, causationId: `attempt:${String(job._id)}:${attempt}`, evidenceKind: "control",
+    eventKey, sequence, predecessorKey, createdAt: Date.now(),
+  });
+  await ctx.db.patch(job._id, { lifecycleSequence: sequence, lifecycleEventKey: eventKey });
+  const workAttempt = await ctx.db.query("workAttempts")
+    .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", attempt)).first();
+  if (workAttempt) await ctx.db.patch(workAttempt._id, {
+    status: type === "approval_declined" ? "cancelled" : heldByStage(stage) ? "paused" : "queued",
+    completedAt: type === "approval_declined" ? Date.now() : undefined, lastEventSeq: sequence, lastEventKey: eventKey, lastEventAt: Date.now(),
+  });
+}
+
+function heldByStage(stage: string) { return stage === "paused"; }
+
 export const pending = query({
   args: { ...viewerAuthArgs },
   handler: async (ctx, a) => {
@@ -46,15 +67,9 @@ export const decide = mutation({
       stage: a.decision === "approved" ? (heldByGoal ? "paused" : "queued") : "cancelled",
       nextRunAt: a.decision === "approved" && !heldByGoal ? Date.now() : undefined,
     });
-    await ctx.db.insert("workEvents", {
-      jobId: a.jobId,
-      missionId: job.missionId,
-      agentId: job.agentId,
-      type: "approval_decision",
-      message: a.decision === "approved" ? "Daniel approved this work" : "Daniel declined this work",
-      stage: a.decision === "approved" ? (heldByGoal ? "paused" : "queued") : "cancelled",
-      createdAt: Date.now(),
-    });
+    await appendApprovalLifecycle(ctx, job, a.decision === "approved" ? "approval_released" : "approval_declined",
+      a.decision === "approved" ? "Daniel approved this work" : "Daniel declined this work",
+      a.decision === "approved" ? (heldByGoal ? "paused" : "queued") : "cancelled", job.attempt ?? 1);
     return true;
   },
 });

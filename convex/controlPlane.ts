@@ -58,6 +58,8 @@ export function projectJobRuntime(job: any) {
     deliveryStatus: typeof job.deliveryStatus === "string" ? job.deliveryStatus.slice(0, 32) : undefined,
     mergeCommitSha: typeof job.mergeCommitSha === "string" ? job.mergeCommitSha.slice(0, 80) : undefined,
     deliveryLeaseVersion: Math.max(0, Number(job.deliveryLeaseVersion ?? 0)),
+    deliveryGeneration: Math.max(0, Number(job.deliveryGeneration ?? 0)),
+    deliveryRunId: job.deliveryRunId,
     startedAt: typeof job.startedAt === "number" ? job.startedAt : undefined,
     completedAt: typeof job.completedAt === "number" ? job.completedAt : undefined,
     createdAt,

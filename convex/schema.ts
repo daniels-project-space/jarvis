@@ -253,6 +253,10 @@ export default defineSchema({
     mergedAt: v.optional(v.number()),
     // Monotonic controller linearization token for consequential delivery.
     deliveryLeaseVersion: v.optional(v.number()),
+    // Delivery retries are distinct from specialist work attempts. They retain
+    // a pointer to the immutable source review without relabelling it.
+    deliveryGeneration: v.optional(v.number()),
+    deliveryRunId: v.optional(v.string()),
     // Controller-owned delivery lease.  The opaque token never reaches an
     // agent sandbox; its version makes stale controller writes harmless.
     deliveryLeaseOwner: v.optional(v.string()),
@@ -338,6 +342,8 @@ export default defineSchema({
     deliveryStatus: v.optional(v.string()),
     mergeCommitSha: v.optional(v.string()),
     deliveryLeaseVersion: v.optional(v.number()),
+    deliveryGeneration: v.optional(v.number()),
+    deliveryRunId: v.optional(v.string()),
     deliveryLeaseUntil: v.optional(v.number()),
     startedAt: v.optional(v.number()),
     completedAt: v.optional(v.number()),
@@ -551,7 +557,8 @@ export default defineSchema({
     .index("by_job", ["jobId", "createdAt"])
     .index("by_mission", ["missionId", "createdAt"])
     .index("by_createdAt", ["createdAt"])
-    .index("by_job_event", ["jobId", "eventKey"]),
+    .index("by_job_event", ["jobId", "eventKey"])
+    .index("by_job_sequence", ["jobId", "sequence", "createdAt"]),
 
   // One immutable row per fenced Trigger attempt. Jobs remain the authority
   // for scheduling; this table makes intent → workspace → session lineage
