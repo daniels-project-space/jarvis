@@ -96,16 +96,20 @@ describe("foreground handoff lease", () => {
   it("cleans its subscription and timers on timeout", async () => {
     const listeners = new Set<(lease: ForegroundLease) => void>();
     const unsubscribed = vi.fn();
-    const touch = vi.fn(async () => false);
+    const claim = deferred<boolean>();
+    const touch = vi.fn().mockReturnValue(claim.promise);
     const pending = waiter(touch, listeners, unsubscribed);
+    await vi.runAllTicks();
+    expect(touch).toHaveBeenCalledTimes(1);
     for (const listener of listeners) listener({ updatedAt: Date.now() });
     await vi.advanceTimersByTimeAsync(TIMEOUT_MS);
     await expect(pending).resolves.toBe(false);
     expect(unsubscribed).toHaveBeenCalledTimes(1);
     expect(listeners).toHaveLength(0);
-    const attempts = touch.mock.calls.length;
+    claim.resolve(false);
+    await vi.runAllTicks();
     await vi.advanceTimersByTimeAsync(10 * LEASE_MS);
-    expect(touch).toHaveBeenCalledTimes(attempts);
+    expect(touch).toHaveBeenCalledTimes(1);
   });
 
   it("does not turn a failed stale claim into a recurring poll", async () => {
