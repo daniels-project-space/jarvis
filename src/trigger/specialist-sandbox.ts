@@ -1,7 +1,22 @@
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import {
+  constants as fsConstants,
+  accessSync,
+  chmodSync,
+  closeSync,
+  fchmodSync,
+  fstatSync,
+  lstatSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  type Stats,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { buildPrivateProcNamespaceInvocation } from "./codex-launcher";
 
 const SYNTHETIC_CODEX_TOKEN = "eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDI0NDQ4MDB9.synthetic";
@@ -10,7 +25,22 @@ const RECEIPT_PROTOCOL = 1;
 const RECEIPT_KIND = "jarvis-specialist-namespace-preflight";
 const MAX_RECEIPT_BYTES = 16 * 1024;
 const MAX_RECEIPT_AGE_MS = 30_000;
+export const SPECIALIST_PROBE_PRLIMIT_COMMAND = "/usr/bin/prlimit";
+export const SPECIALIST_PROBE_PRLIMIT_ARGS = Object.freeze([
+  `--fsize=${MAX_RECEIPT_BYTES}:${MAX_RECEIPT_BYTES}`,
+  "--",
+] as const);
 const consumedReceiptNonces = new Set<string>();
+
+export type NamespaceProbeLifecycleEvent =
+  | "spawn"
+  | "stdout-fd-closed"
+  | "error"
+  | "timeout"
+  | "close"
+  | "receipt-read"
+  | "receipt-validated"
+  | "receipt-cleanup";
 
 export type NamespaceProbeInvocation = {
   command: string;
@@ -108,6 +138,106 @@ function rememberNonce(nonce: string): boolean {
   return true;
 }
 
+type NamespaceReceiptFile = {
+  root: string;
+  path: string;
+  fd: number;
+  device: number;
+  inode: number;
+};
+
+function pathIsInside(parent: string, candidate: string): boolean {
+  const child = relative(parent, candidate);
+  return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !isAbsolute(child));
+}
+
+function assertControllerOwned(stat: Stats, label: string): void {
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+    throw new Error(`${label} is not controller-owned`);
+  }
+}
+
+function createNamespaceReceiptFile(childWorkspace: string): NamespaceReceiptFile {
+  const workspace = realpathSync(childWorkspace);
+  const temporaryRoot = realpathSync(tmpdir());
+  const root = mkdtempSync(join(temporaryRoot, "jarvis-namespace-receipt-"));
+  let fd = -1;
+  try {
+    chmodSync(root, 0o700);
+    const rootStat = lstatSync(root);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory() || (rootStat.mode & 0o777) !== 0o700) {
+      throw new Error("namespace receipt state must be a private non-symlink directory");
+    }
+    assertControllerOwned(rootStat, "namespace receipt state");
+    const canonicalRoot = realpathSync(root);
+    if (pathIsInside(workspace, canonicalRoot)) {
+      throw new Error("namespace receipt state must be outside the child workspace");
+    }
+
+    const path = join(canonicalRoot, "receipt.json");
+    fd = openSync(path, "wx", 0o600);
+    fchmodSync(fd, 0o600);
+    const fileStat = fstatSync(fd);
+    if (!fileStat.isFile() || fileStat.nlink !== 1 || (fileStat.mode & 0o777) !== 0o600) {
+      throw new Error("namespace receipt must be a unique mode-0600 regular file");
+    }
+    assertControllerOwned(fileStat, "namespace receipt");
+    return { root: canonicalRoot, path, fd, device: fileStat.dev, inode: fileStat.ino };
+  } catch (error) {
+    if (fd >= 0) {
+      try { closeSync(fd); } catch { /* best-effort cleanup before any child exists */ }
+    }
+    rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+export function readNamespaceProbeReceipt(
+  path: string,
+  expectedIdentity?: Readonly<{ device: number; inode: number }>,
+): string {
+  let stat: Stats;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    throw new Error("namespace preflight receipt is missing");
+  }
+  if (
+    stat.isSymbolicLink()
+    || !stat.isFile()
+    || stat.nlink !== 1
+    || (stat.mode & 0o777) !== 0o600
+  ) throw new Error("namespace preflight receipt is not a unique mode-0600 regular file");
+  assertControllerOwned(stat, "namespace preflight receipt");
+  if (expectedIdentity && (stat.dev !== expectedIdentity.device || stat.ino !== expectedIdentity.inode)) {
+    throw new Error("namespace preflight receipt identity changed");
+  }
+  if (stat.size < 1) throw new Error("namespace preflight receipt is empty");
+  if (stat.size > MAX_RECEIPT_BYTES) throw new Error("namespace preflight receipt is oversized");
+  const raw = readFileSync(path, "utf8");
+  const bytes = Buffer.byteLength(raw, "utf8");
+  if (bytes < 1) throw new Error("namespace preflight receipt is empty");
+  if (bytes > MAX_RECEIPT_BYTES) throw new Error("namespace preflight receipt is oversized");
+  return raw;
+}
+
+function boundedNamespaceProbeInvocation(invocation: NamespaceProbeInvocation): NamespaceProbeInvocation {
+  const stat = lstatSync(SPECIALIST_PROBE_PRLIMIT_COMMAND);
+  if (
+    stat.isSymbolicLink()
+    || !stat.isFile()
+    || (typeof process.getuid === "function" && stat.uid !== 0)
+    || (stat.mode & 0o022) !== 0
+    || realpathSync(SPECIALIST_PROBE_PRLIMIT_COMMAND) !== SPECIALIST_PROBE_PRLIMIT_COMMAND
+  ) throw new Error("namespace preflight prlimit boundary is unavailable");
+  accessSync(SPECIALIST_PROBE_PRLIMIT_COMMAND, fsConstants.X_OK);
+  return {
+    ...invocation,
+    command: SPECIALIST_PROBE_PRLIMIT_COMMAND,
+    args: [...SPECIALIST_PROBE_PRLIMIT_ARGS, invocation.command, ...invocation.args],
+  };
+}
+
 export function validateNamespaceProbeReceipt(input: {
   raw: string;
   expectedNonce: string;
@@ -190,64 +320,106 @@ export function validateNamespaceProbeReceipt(input: {
 async function runToClose(
   invocation: NamespaceProbeInvocation,
   timeoutMs: number,
-): Promise<{ code: number | null; stdout: string; closedAt: number; error?: Error }> {
-  const child = spawn(invocation.command, invocation.args, {
-    cwd: invocation.cwd,
-    env: invocation.env,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: process.platform !== "win32",
-  });
-  let processError: Error | undefined;
-  let timedOut = false;
-  let oversized = false;
-  let stdout = Buffer.alloc(0);
-  const appendStdout = (chunk: Buffer | string) => {
-    if (oversized) return;
-    const next = Buffer.concat([stdout, Buffer.from(chunk)]);
-    if (next.byteLength > MAX_RECEIPT_BYTES) {
-      oversized = true;
+  receipt: NamespaceReceiptFile,
+  onLifecycleEvent?: (event: NamespaceProbeLifecycleEvent) => void,
+): Promise<{
+  code: number | null;
+  stdout: string;
+  closedAt: number;
+  error?: Error;
+  receiptError?: Error;
+}> {
+  const notify = (event: NamespaceProbeLifecycleEvent) => {
+    try { onLifecycleEvent?.(event); } catch { /* observations cannot weaken the barrier */ }
+  };
+  const bounded = boundedNamespaceProbeInvocation(invocation);
+  let receiptFdOpen = true;
+  let closeObserved = false;
+  let closeBarrier: Promise<{ code: number | null; closedAt: number; error?: Error }> | undefined;
+  let child: ReturnType<typeof spawn> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    child = spawn(bounded.command, bounded.args, {
+      cwd: bounded.cwd,
+      env: bounded.env,
+      stdio: ["ignore", receipt.fd, "pipe"],
+      detached: process.platform !== "win32",
+    });
+    notify("spawn");
+    let processError: Error | undefined;
+    let timedOut = false;
+    closeBarrier = new Promise((resolve) => {
+      child!.once("error", (error) => {
+        processError = error;
+        notify("error");
+      });
+      child!.once("close", (code) => {
+        if (timer) clearTimeout(timer);
+        closeObserved = true;
+        const closedAt = Date.now();
+        notify("close");
+        resolve({
+          code: timedOut || processError ? -1 : code,
+          closedAt,
+          error: processError ?? (timedOut ? new Error("namespace preflight timed out") : undefined),
+        });
+      });
+    });
+
+    // Node duplicates this already-open regular file into child FD 1. Closing
+    // the controller copy immediately makes child CLOSE the sole read barrier.
+    closeSync(receipt.fd);
+    receiptFdOpen = false;
+    notify("stdout-fd-closed");
+
+    // stderr remains a pipe only so it can be drained. It is never receipt
+    // input and therefore cannot influence the security decision.
+    child.stderr?.on("data", () => undefined);
+    timer = setTimeout(() => {
+      timedOut = true;
+      notify("timeout");
+      if (process.platform !== "win32" && child?.pid) {
+        try { process.kill(-child.pid, "SIGKILL"); } catch { /* process group already gone */ }
+      }
+      try { child?.kill("SIGKILL"); } catch { /* CLOSE remains the barrier */ }
+    }, timeoutMs);
+    timer.unref?.();
+
+    const terminal = await closeBarrier;
+    notify("receipt-read");
+    try {
+      const stdout = readNamespaceProbeReceipt(receipt.path, {
+        device: receipt.device,
+        inode: receipt.inode,
+      });
+      return { ...terminal, stdout };
+    } catch (error) {
+      return {
+        ...terminal,
+        stdout: "",
+        receiptError: error instanceof Error ? error : new Error(String(error)),
+      };
+    }
+  } finally {
+    if (receiptFdOpen) {
+      try { closeSync(receipt.fd); } catch { /* no child inherited it if spawn failed synchronously */ }
+    }
+    if (timer) clearTimeout(timer);
+    if (child && !closeObserved && closeBarrier) {
       if (process.platform !== "win32" && child.pid) {
         try { process.kill(-child.pid, "SIGKILL"); } catch { /* process group already gone */ }
       }
-      try { child.kill("SIGKILL"); } catch { /* CLOSE remains the barrier */ }
-      return;
+      try { child.kill("SIGKILL"); } catch { /* still wait for CLOSE below */ }
+      await closeBarrier;
     }
-    stdout = next;
-  };
-  child.stdout.on("data", appendStdout);
-  // Always drain stderr so a rejected child cannot block its CLOSE event. It is
-  // deliberately not mixed into the security receipt.
-  child.stderr.on("data", () => undefined);
-  const timer = setTimeout(() => {
-    timedOut = true;
-    if (process.platform !== "win32" && child.pid) {
-      try { process.kill(-child.pid, "SIGKILL"); } catch { /* namespace group already gone */ }
-    }
-    try { child.kill("SIGKILL"); } catch { /* close remains the barrier */ }
-  }, timeoutMs);
-  timer.unref?.();
-  return await new Promise((resolve) => {
-    child.once("error", (error) => { processError = error; });
-    child.once("close", (code) => {
-      clearTimeout(timer);
-      const closedAt = Date.now();
-      resolve({
-        code: timedOut || processError || oversized ? -1 : code,
-        stdout: stdout.toString("utf8"),
-        closedAt,
-        error: processError
-          ?? (timedOut ? new Error("namespace preflight timed out") : undefined)
-          ?? (oversized ? new Error("namespace preflight receipt is oversized") : undefined),
-      });
-    });
-  });
+  }
 }
 
 /**
  * Build the deterministic preflight exactly as it runs in Trigger: fresh user,
  * mount, PID, and proc namespaces first, then pinned Codex on its existing
- * legacy-Landlock read-only path. Stdout is bounded while it is drained, and
- * the nonce-bound receipt is not parsed until the namespace emits CLOSE.
+ * legacy-Landlock read-only path. The controller supplies an inherited stdout
+ * receipt FD separately; no candidate-controlled path enters this argv.
  */
 export function buildSpecialistNamespaceProbeInvocation(input: {
   codexBin: string;
@@ -307,8 +479,10 @@ export async function verifySpecialistSandboxIsolation(input: {
   env: NodeJS.ProcessEnv;
   unshareBinary?: string;
   probeTimeoutMs?: number;
+  onLifecycleEvent?: (event: NamespaceProbeLifecycleEvent) => void;
 }): Promise<{ ok: true; observation: NamespaceObservation } | { ok: false; reason: string }> {
   let root = "";
+  let receipt: NamespaceReceiptFile | undefined;
   try {
     root = mkdtempSync(join(input.cwd, ".jarvis-namespace-probe-"));
     const invocation = buildSpecialistNamespaceProbeInvocation({
@@ -321,19 +495,22 @@ export async function verifySpecialistSandboxIsolation(input: {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 20_000) {
       throw new Error("namespace preflight timeout is invalid");
     }
-    const result = await runToClose(invocation, timeoutMs);
+    receipt = createNamespaceReceiptFile(root);
+    const result = await runToClose(invocation, timeoutMs, receipt, input.onLifecycleEvent);
     if (result.code !== 0 || result.error) {
       return {
         ok: false,
         reason: "specialist legacy-Landlock namespace is unavailable; E2B remains the unactivated provider-neutral fallback",
       };
     }
+    if (result.receiptError) throw result.receiptError;
     const observation = validateNamespaceProbeReceipt({
       raw: result.stdout,
       expectedNonce: invocation.nonce,
       startedAt,
       closedAt: result.closedAt,
     });
+    input.onLifecycleEvent?.("receipt-validated");
     return { ok: true, observation };
   } catch {
     return {
@@ -341,6 +518,10 @@ export async function verifySpecialistSandboxIsolation(input: {
       reason: "specialist legacy-Landlock namespace probe failed; E2B remains the unactivated provider-neutral fallback",
     };
   } finally {
+    if (receipt) {
+      rmSync(receipt.root, { recursive: true, force: true });
+      try { input.onLifecycleEvent?.("receipt-cleanup"); } catch { /* observation only */ }
+    }
     if (root) rmSync(root, { recursive: true, force: true });
   }
 }

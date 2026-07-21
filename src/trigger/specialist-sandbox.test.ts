@@ -9,15 +9,20 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  SPECIALIST_PROBE_PRLIMIT_ARGS,
+  SPECIALIST_PROBE_PRLIMIT_COMMAND,
   buildSpecialistNamespaceProbeInvocation,
+  readNamespaceProbeReceipt,
   validateNamespaceProbeReceipt,
   verifySpecialistSandboxIsolation,
+  type NamespaceProbeLifecycleEvent,
 } from "./specialist-sandbox";
 import { buildPrivateProcNamespaceInvocation, PRIVATE_PROC_NAMESPACE_SETUP } from "./codex-launcher";
 
@@ -100,10 +105,22 @@ else {
   const encoded = JSON.stringify(receipt);
   process.stdout.write(encoded.slice(0, Math.floor(encoded.length / 2)));
   setTimeout(() => process.stdout.write(encoded.slice(Math.floor(encoded.length / 2))), 10);
+  if (behavior === "valid") setTimeout(() => undefined, 75);
 }
 `, { mode: executable ? 0o700 : 0o600 });
   chmodSync(path, executable ? 0o700 : 0o600);
   return path;
+}
+
+function expectReceiptReadOnlyAfterClose(events: NamespaceProbeLifecycleEvent[]): void {
+  const fdClosed = events.indexOf("stdout-fd-closed");
+  const close = events.indexOf("close");
+  const read = events.indexOf("receipt-read");
+  const cleanup = events.indexOf("receipt-cleanup");
+  expect(fdClosed).toBeGreaterThan(events.indexOf("spawn"));
+  expect(close).toBeGreaterThan(fdClosed);
+  expect(read).toBeGreaterThan(close);
+  expect(cleanup).toBeGreaterThan(close);
 }
 
 afterEach(() => {
@@ -161,6 +178,8 @@ describe("specialist OS trust boundary", () => {
     expect(invocation.env.CONVEX_DEPLOY_KEY_JARVIS_CANONICAL).toBeUndefined();
     expect(invocation.args.join("\0")).not.toContain("synthetic-controller-sentinel");
     expect(invocation.args).not.toContain("--mount-proc=/proc");
+    expect(SPECIALIST_PROBE_PRLIMIT_COMMAND).toBe("/usr/bin/prlimit");
+    expect(SPECIALIST_PROBE_PRLIMIT_ARGS).toEqual(["--fsize=16384:16384", "--"]);
   });
 
   it("proves the unsandboxed same-container /proc attack is real without emitting the sentinel", () => {
@@ -247,12 +266,19 @@ describe("specialist OS trust boundary", () => {
 
   it("captures a bounded nonce receipt asynchronously and validates it only after CLOSE", async () => {
     const fixture = sandboxFixture();
-    const result = await verifySpecialistSandboxIsolation({
+    const events: NamespaceProbeLifecycleEvent[] = [];
+    let settled = false;
+    const pending = verifySpecialistSandboxIsolation({
       codexBin,
       cwd: fixture.root,
       env: fixture.env,
       unshareBinary: fakeUnshare(fixture.root, "valid"),
-    });
+      onLifecycleEvent: (event) => events.push(event),
+    }).finally(() => { settled = true; });
+    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 30));
+    expect(settled).toBe(false);
+    expect(events).not.toContain("receipt-read");
+    const result = await pending;
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.observation).toMatchObject({
@@ -263,48 +289,68 @@ describe("specialist OS trust boundary", () => {
         foreignEnvironmentVisible: false,
       });
     }
+    expect(events).toEqual([
+      "spawn",
+      "stdout-fd-closed",
+      "close",
+      "receipt-read",
+      "receipt-validated",
+      "receipt-cleanup",
+    ]);
+    expectReceiptReadOnlyAfterClose(events);
   });
 
   it.each(["empty", "malformed", "stale", "replayed", "oversized", "authority"] as const)(
     "fails closed on %s stdout receipts",
     async (behavior) => {
       const fixture = sandboxFixture();
+      const events: NamespaceProbeLifecycleEvent[] = [];
       const result = await verifySpecialistSandboxIsolation({
         codexBin,
         cwd: fixture.root,
         env: fixture.env,
         unshareBinary: fakeUnshare(fixture.root, behavior),
+        onLifecycleEvent: (event) => events.push(event),
       });
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.reason).toMatch(/unavailable|failed/);
+      expectReceiptReadOnlyAfterClose(events);
+      expect(events).not.toContain("receipt-validated");
     },
   );
 
   it("kills a timed-out probe and still waits for CLOSE", async () => {
     const fixture = sandboxFixture();
     const startedAt = Date.now();
+    const events: NamespaceProbeLifecycleEvent[] = [];
     const result = await verifySpecialistSandboxIsolation({
       codexBin,
       cwd: fixture.root,
       env: fixture.env,
       unshareBinary: fakeUnshare(fixture.root, "timeout"),
       probeTimeoutMs: 50,
+      onLifecycleEvent: (event) => events.push(event),
     });
     expect(result.ok).toBe(false);
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(40);
+    expect(events).toContain("timeout");
+    expectReceiptReadOnlyAfterClose(events);
   });
 
-  it("records a spawn error but resolves only after the failed child emits CLOSE", async () => {
+  it("fails closed when fake unshare cannot execute and reads only after the outer child emits CLOSE", async () => {
     const fixture = sandboxFixture();
+    const events: NamespaceProbeLifecycleEvent[] = [];
     const result = await verifySpecialistSandboxIsolation({
       codexBin,
       cwd: fixture.root,
       env: fixture.env,
       unshareBinary: fakeUnshare(fixture.root, "valid", false),
       probeTimeoutMs: 1_000,
+      onLifecycleEvent: (event) => events.push(event),
     });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("unavailable");
+    expectReceiptReadOnlyAfterClose(events);
   });
 
   it("either proves the real pinned boundary or fails the worker closed on this kernel", async () => {
@@ -325,6 +371,20 @@ describe("specialist OS trust boundary", () => {
 
   it("rejects empty, malformed, oversized, stale, replayed, and schema-weakened receipt bytes", () => {
     const now = Date.now();
+    const receiptRoot = mkdtempSync(join(tmpdir(), "jarvis-specialist-receipt-reader-"));
+    roots.push(receiptRoot);
+    expect(() => readNamespaceProbeReceipt(join(receiptRoot, "missing.json"))).toThrow("missing");
+    const emptyPath = join(receiptRoot, "empty.json");
+    writeFileSync(emptyPath, "", { mode: 0o600 });
+    expect(() => readNamespaceProbeReceipt(emptyPath)).toThrow("empty");
+    const oversizedPath = join(receiptRoot, "oversized.json");
+    writeFileSync(oversizedPath, "x".repeat(16 * 1024 + 1), { mode: 0o600 });
+    expect(() => readNamespaceProbeReceipt(oversizedPath)).toThrow("oversized");
+    const targetPath = join(receiptRoot, "target.json");
+    const symlinkPath = join(receiptRoot, "linked.json");
+    writeFileSync(targetPath, "{}", { mode: 0o600 });
+    symlinkSync(targetPath, symlinkPath);
+    expect(() => readNamespaceProbeReceipt(symlinkPath)).toThrow("unique mode-0600 regular file");
     const validReceipt = (nonce: string, issuedAt = now) => JSON.stringify({
       protocol: 1,
       kind: "jarvis-specialist-namespace-preflight",

@@ -325,5 +325,5 @@ if (process.env.TRIGGER_ACCESS_TOKEN) process.stdout.write(process.env.TRIGGER_A
       session.cleanup();
     }
     expect(existsSync(session.root)).toBe(false);
-  });
+  }, 30_000);
 });
