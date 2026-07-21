@@ -61,7 +61,7 @@ const TECHNICAL_COMPOUND_TAIL: Partial<Record<string, RegExp>> = {
 const TECHNICAL_DELETE_COMPOUND_LEAD = /\bauto-stop\/archive\/$/i;
 
 const TECHNICAL_DELETE_COMPOUND_TAIL =
-  /^(?:$|(?:as|for|in|within)\b|(?:sandbox|resource|lifecycle|retention|cleanup|policy|policies|controls?|states?|transitions?|semantics|settings?|configuration|options?|behavio(?:u)?r|support|workflow|handling)\b)/i;
+  /^(?:$|,\s*snapshot\s+identity\b|(?:as|for|in|within)\b|(?:sandbox|resource|lifecycle|retention|cleanup|policy|policies|controls?|states?|transitions?|semantics|settings?|configuration|options?|behavio(?:u)?r|support|workflow|handling)\b)/i;
 
 // Root review is a controller-internal Git-ref handoff. The otherwise vague
 // object "a reviewed ref" is accepted only with both this direct object/tail

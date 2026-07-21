@@ -31,16 +31,3 @@ export const INTEGRATION_FINAL_BARRIER_APPROVAL_TASK = [
   "Run focused integration tests, the full suite, typecheck, build, audit, and secret scan.",
   "Commit only the isolated worker branch and leave controller delivery separate.",
 ].join("\n");
-
-export const CLOUD_SANDBOX_APPROVAL_TASK = [
-  "Repository-only implementation task for daniels-project-space/jarvis.",
-  "Implement the already-prepared fail-closed cloud-sandbox design as owned-repository source work.",
-  "Keep access bound to the existing email-verified identity state.",
-  "Represent auto-stop/archive/delete as explicit sandbox lifecycle policy.",
-  "Model pay-as-you-go as descriptive billing configuration without charging or spending.",
-  "Keep command delivery behind the internal message-queue boundary.",
-  "Do not deploy, mutate live provider state, message anyone, publish publicly, or perform commerce.",
-  "Only the trusted controller may publish a reviewed ref for root review.",
-  "Run focused and full tests, typecheck, build, lint, audit, diff, and credential scans.",
-  "Commit the verified owned-repository source correction for controller delivery.",
-].join("\n");

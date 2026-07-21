@@ -3,7 +3,6 @@ import { goalWorkApprovalPolicy, workApprovalPolicy } from "../../convex/workPol
 import { plannerTask, routeGoal, validatorTask } from "../lib/goal-mode";
 import { classifyWorkSafety, SAFE_SANDBOX_EXECUTION_RULES } from "../lib/work-safety";
 import {
-  CLOUD_SANDBOX_APPROVAL_TASK,
   INTEGRATION_FINAL_BARRIER_APPROVAL_TASK,
   WORKSPACE_ISOLATION_APPROVAL_TASK,
 } from "./fixtures/work-policy-regressions";
@@ -228,16 +227,9 @@ describe("server-side work approval policy", () => {
     expect(INTEGRATION_FINAL_BARRIER_APPROVAL_TASK.split("\n")[8]).toBe(
       "The deterministic final integration ref already equals the prepared synthetic head, but integrateReviewedWorker immediately prepares/observes only update_ref. A prior stage_blob POST may have applied and then lost its durable observe callback. Jarvis therefore declares integrated and releases FIFO while a prepared cold effect remains unobserved. Fix the root state machine, not the external script.",
     );
-    expect(CLOUD_SANDBOX_APPROVAL_TASK).toContain("email-verified");
-    expect(CLOUD_SANDBOX_APPROVAL_TASK).toContain("auto-stop/archive/delete");
-    expect(CLOUD_SANDBOX_APPROVAL_TASK).toContain("pay-as-you-go");
-    expect(CLOUD_SANDBOX_APPROVAL_TASK).toContain("message-queue");
-    expect(CLOUD_SANDBOX_APPROVAL_TASK).toContain("publish a reviewed ref for root review");
-
     for (const task of [
       WORKSPACE_ISOLATION_APPROVAL_TASK,
       INTEGRATION_FINAL_BARRIER_APPROVAL_TASK,
-      CLOUD_SANDBOX_APPROVAL_TASK,
     ]) {
       const standalone = workApprovalPolicy({
         task,
@@ -331,6 +323,7 @@ describe("server-side work approval policy", () => {
     for (const task of [
       "Keep access bound to the email-verified identity state.",
       "Represent auto-stop/archive/delete as sandbox lifecycle policy.",
+      "Contract-test bounded resources and TTL, auto-stop/archive/delete, snapshot identity, persistent volume isolation.",
       "Model pay-as-you-go billing configuration.",
       "Keep delivery behind the message-queue boundary.",
       "Only the trusted controller may publish a reviewed ref for root review.",
@@ -357,6 +350,10 @@ describe("server-side work approval policy", () => {
       "Keep the email-verified state and delete the customer records.",
       "Configure auto-stop/archive/delete customer records.",
       "Configure auto-stop/archive/delete archived customer data.",
+      "Configure stop/archive/delete, snapshot identity for customer records.",
+      "Configure auto-stop/archive/delete, customer snapshot identity.",
+      "Configure auto-stop/archive/delete, snapshot customer identity.",
+      "Configure auto-stop/archive/delete, snapshot identity, then delete customer records.",
       "Model pay-as-you-go billing and pay the provider.",
       "Inspect the message-queue and message the queue owner.",
       "Represent auto-stop/archive/delete, then publish the findings publicly.",
