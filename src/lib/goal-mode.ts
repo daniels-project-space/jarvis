@@ -1,6 +1,7 @@
 import { PROJECT_REGISTRY, projectProviderBoundary } from "./project-registry";
 import { EVIDENCE_INTEGRITY_RULES } from "./work-verification";
 import { SAFE_SANDBOX_EXECUTION_RULES } from "./work-safety";
+import { canonicalizeRepository } from "./workflow-contract";
 
 export const GOAL_PLAN_MARKER = "GOAL_PLAN_JSON:";
 export const GOAL_VALIDATION_MARKER = "GOAL_VALIDATION_JSON:";
@@ -340,7 +341,13 @@ export function parseGoalPlan(text: string, maxBuildSessions = 6): GoalPlan {
       label: clampText(row.label, 80) || `Workstream ${index + 1}`,
       task,
       agentId,
-      repo: clampText(row.repo, 160) || undefined,
+      repo: (() => {
+        const supplied = clampText(row.repo, 160);
+        if (!supplied) return undefined;
+        const canonical = canonicalizeRepository(supplied, { allowShortName: true });
+        if (!canonical) throw new Error(`Goal plan workstream ${id} has an invalid repository scope`);
+        return canonical;
+      })(),
       readonly: row.readonly === true,
       dependsOn: strings(row.dependsOn ?? row.depends_on, 8, 48).map((dependency) => slug(dependency, "")),
       acceptanceCriteria: strings(row.acceptanceCriteria ?? row.acceptance_criteria, 8, 500).length
@@ -376,7 +383,13 @@ export function parseGoalPlan(text: string, maxBuildSessions = 6): GoalPlan {
   return {
     summary: clampText(input.summary, 1_200) || "A staged plan for the requested outcome.",
     route: normalizedRoute,
-    primaryRepo: clampText(input.primaryRepo ?? input.primary_repo, 160) || undefined,
+    primaryRepo: (() => {
+      const supplied = clampText(input.primaryRepo ?? input.primary_repo, 160);
+      if (!supplied) return undefined;
+      const canonical = canonicalizeRepository(supplied, { allowShortName: true });
+      if (!canonical) throw new Error("Goal plan has an invalid primary repository scope");
+      return canonical;
+    })(),
     assumptions: strings(input.assumptions, 8, 500),
     workstreams: topologicalWorkstreams(streams),
     validation: {

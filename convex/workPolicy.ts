@@ -1,4 +1,5 @@
 import { classifyWorkSafety, isOwnedRepository } from "../src/lib/work-safety";
+import { WORKFLOW_CONTRACT } from "../src/lib/workflow-contract";
 
 export type WorkApprovalInput = {
   task: string;
@@ -28,6 +29,11 @@ const NON_MUTATING_OUTCOME =
  * consequence policy override stale planner hints in both directions.
  */
 export function workApprovalPolicy(input: WorkApprovalInput): WorkApprovalDecision {
+  // Convex policy shares the manifest-derived trust boundary used by Mastra
+  // and the Trigger runner. Drift must fail closed.
+  if (WORKFLOW_CONTRACT.credentialBoundary !== "controller-held-only") {
+    return { required: true, reason: "workflow contract credential boundary is invalid", deliveryMode: "manual" };
+  }
   const safety = classifyWorkSafety(input.task, { repo: input.repo });
   if (safety.approvalRequired) {
     return { required: true, reason: safety.reason, deliveryMode: "manual" };

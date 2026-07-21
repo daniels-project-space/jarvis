@@ -33,6 +33,12 @@ describe("server-side work approval policy", () => {
     ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
     expect(
       workApprovalPolicy({
+        task: "Merge the verified fix and deploy it",
+        repo: "https://github.com/daniels-project-space/jarvis.git",
+      }),
+    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    expect(
+      workApprovalPolicy({
         task: "Fix the parser and run its regression suite",
         repo: "jarvis",
         approvalRequired: true,

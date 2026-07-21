@@ -22,6 +22,7 @@ import {
   patchMissionWithRuntime,
   runtimeJob,
 } from "./controlPlane";
+import { canonicalizeRepository } from "../src/lib/workflow-contract";
 
 const ADVANCE_LEASE_MS = 10 * 60 * 1000;
 const COORDINATOR_RECEIPT_FRESH_MS = 10 * 60 * 1000;
@@ -138,6 +139,11 @@ export const latestCoordinatorReceipt = query({
 
 async function insertGoalJob(ctx: any, input: GoalJobInput) {
   const now = Date.now();
+  const repo = input.repo === undefined ? undefined : canonicalizeRepository(input.repo, { allowShortName: true }) ?? undefined;
+  if (input.repo !== undefined && !repo) {
+    throw new Error("Goal repository must be an owner/repo slug or credential-free https://github.com/owner/repo(.git) URL");
+  }
+  input = { ...input, repo };
   const approval = goalWorkApprovalPolicy({
     ...input,
     task: input.policyTask?.trim() || input.task,
@@ -234,9 +240,13 @@ export const create = mutation({
     const maxBuildSessions = Math.max(2, Math.min(8, Math.floor(args.maxBuildSessions ?? 6)));
     const maxRevisionWaves = Math.max(1, Math.min(4, Math.floor(args.maxRevisionWaves ?? 2)));
     const criteria = (args.acceptanceCriteria ?? []).map((item) => item.trim().slice(0, 500)).filter(Boolean).slice(0, 10);
+    const primaryRepo = args.primaryRepo === undefined ? undefined : canonicalizeRepository(args.primaryRepo, { allowShortName: true }) ?? undefined;
+    if (args.primaryRepo !== undefined && !primaryRepo) {
+      throw new Error("Goal repository must be an owner/repo slug or credential-free https://github.com/owner/repo(.git) URL");
+    }
     const route: GoalRoute = {
       kind: args.route as GoalRoute["kind"],
-      primaryRepo: args.primaryRepo,
+      primaryRepo,
       reason: args.routeReason.slice(0, 1000),
       infrastructureContext: args.infrastructureContext.slice(0, 4000),
     };

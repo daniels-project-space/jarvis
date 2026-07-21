@@ -1,3 +1,5 @@
+import { isOwnedRepositoryScope } from "./workflow-contract";
+
 /**
  * Text-level backstop for consequential work.
  *
@@ -201,18 +203,7 @@ function quotedActionContext(clause: string, actionIndex: number): string | null
 }
 
 export function isOwnedRepository(repo: string | undefined): boolean {
-  const raw = String(repo ?? "")
-    .trim()
-    .replace(/^https?:\/\/github\.com\//i, "")
-    .replace(/^git@github\.com:/i, "")
-    .replace(/\.git$/i, "")
-    .replace(/^\/+|\/+$/g, "");
-  if (!raw) return false;
-  if (!raw.includes("/")) return /^[a-z0-9][a-z0-9._-]*$/i.test(raw);
-  const [owner, name, ...rest] = raw.split("/");
-  return rest.length === 0
-    && owner.toLocaleLowerCase("en-GB") === "daniels-project-space"
-    && /^[a-z0-9][a-z0-9._-]*$/i.test(name ?? "");
+  return isOwnedRepositoryScope(repo);
 }
 
 function softwareDeliveryAllowed(action: string, clause: string, repo: string | undefined): boolean {

@@ -15,6 +15,7 @@ import {
 import { reviewPrompt } from "./codex-review";
 import { normalizeWorkModelTier } from "../lib/work-models";
 import { githubGitEnv, githubRepoUrl } from "./git-transport";
+import { canonicalizeRepository } from "../lib/workflow-contract";
 import { vaultService } from "../lib/vault-client";
 import { buildContinuationCheckpoint, segmentTimeoutMs } from "./continuation";
 import { runWatchSweep } from "./watch-runtime";
@@ -442,33 +443,11 @@ function runAgent(
   });
 }
 
-// Bare project names silently fail to clone — resolve them to full owner/repo.
-const REPO_ALIASES: Record<string, string> = {
-  "project-hub": "daniels-project-space/project-hub",
-  "project-hub-app": "daniels-project-space/project-hub",
-  hub: "daniels-project-space/project-hub",
-  "remote-work-hub": "daniels-project-space/remote-work-hub",
-  "media-engine": "daniels-project-space/media-engine",
-  "app-factory-v2": "daniels-project-space/app-factory-v2",
-  "db-cinema-v2": "daniels-project-space/db-cinema-v2",
-  "rental-manager-v2": "daniels-project-space/rental-manager-v2",
-  rmv2: "daniels-project-space/rental-manager-v2",
-  "music-house": "daniels-project-space/music-house",
-  "youtube-studio-ai": "daniels-project-space/youtube-studio-ai",
-  "finance-engine-v2": "daniels-project-space/finance-engine-v2",
-  "dropship-ai": "daniels-project-space/dropship-ai",
-  jarvis: "daniels-project-space/jarvis",
-  "jarvis-memory": "daniels-project-space/jarvis-memory",
-};
-function resolveRepo(name: string): string {
-  const n = String(name || "")
-    .trim()
-    .replace(/\.git$/, "");
-  if (!n) return "";
-  const alias = REPO_ALIASES[n.toLowerCase()];
-  if (alias) return alias;
-  if (n.includes("/")) return n;
-  return `daniels-project-space/${n}`; // default org
+// A malformed remote must never reach git. Short product names remain a
+// convenience at the runner boundary, but persistence and transport use only
+// the canonical owner/repo identity.
+function resolveRepo(name: string | undefined): string {
+  return canonicalizeRepository(name, { allowShortName: true }) ?? "";
 }
 
 function workBranch(job: any): string {
