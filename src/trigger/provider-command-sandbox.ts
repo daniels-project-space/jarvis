@@ -1399,7 +1399,7 @@ const child = spawn(process.execPath, ["-e", childSource, process.argv[1]], { de
 child.unref();
 if (process.env.TRIGGER_ACCESS_TOKEN) process.stdout.write(process.env.TRIGGER_ACCESS_TOKEN);
 if (process.env.CONVEX_DEPLOY_KEY) process.stdout.write(process.env.CONVEX_DEPLOY_KEY);
-if (process.argv[2] === "timeout") setInterval(() => {}, 1000);
+if (process.argv[3] === "timeout") setInterval(() => {}, 1000);
 `, { mode: 0o600 });
     try {
       const result = await this.runInternal({
