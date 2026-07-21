@@ -100,4 +100,3 @@ export function topologicalGoalWorkstreams(workstreams: readonly GoalWorkstream[
 export function goalDagEdgeId(sourceNodeId: string, targetNodeId: string) {
   return `${sourceNodeId}->${targetNodeId}`;
 }
-

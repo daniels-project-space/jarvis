@@ -27,4 +27,3 @@ describe("immutable GoalPlan canonical authority", () => {
     expect(goalDagEdgeId("upstream", "downstream")).toBe("upstream->downstream");
   });
 });
-
