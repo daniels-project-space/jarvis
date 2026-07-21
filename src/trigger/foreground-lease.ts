@@ -22,6 +22,7 @@ export function waitForForegroundLease(options: ForegroundLeaseWaitOptions): Pro
   return new Promise((resolve) => {
     let settled = false;
     let claimInFlight = false;
+    let retryQueued = false;
     let staleTimer: ReturnType<typeof setTimeout> | null = null;
     let unsubscribe = () => {};
     const clearStaleTimer = () => {
@@ -37,14 +38,23 @@ export function waitForForegroundLease(options: ForegroundLeaseWaitOptions): Pro
       resolve(owned);
     };
     const tryClaim = () => {
-      if (settled || claimInFlight) return;
+      if (settled) return;
+      if (claimInFlight) {
+        retryQueued = true;
+        return;
+      }
       claimInFlight = true;
       void Promise.resolve()
         .then(() => options.touch(options.runnerId))
         .then((owned) => { if (owned) finish(true); })
-        // A later successful subscription notification remains the only retry.
         .catch(() => undefined)
-        .finally(() => { claimInFlight = false; });
+        .finally(() => {
+          claimInFlight = false;
+          if (!settled && retryQueued) {
+            retryQueued = false;
+            tryClaim();
+          }
+        });
     };
     const observe = (lease: ForegroundLease) => {
       if (settled) return;
@@ -57,10 +67,16 @@ export function waitForForegroundLease(options: ForegroundLeaseWaitOptions): Pro
       staleTimer = setTimer(tryClaim, Math.max(1, options.leaseMs - age + 25));
     };
     const timeout = setTimer(() => finish(false), options.timeoutMs);
-    const registeredUnsubscribe = options.subscribe(observe, () => finish(false));
+    let subscribing = true;
+    let observedSynchronously = false;
+    const registeredUnsubscribe = options.subscribe((lease) => {
+      if (subscribing) observedSynchronously = true;
+      observe(lease);
+    }, () => finish(false));
+    subscribing = false;
     unsubscribe = registeredUnsubscribe;
     // Some realtime clients synchronously invoke their initial subscription.
     if (settled) unsubscribe();
-    tryClaim();
+    else if (!observedSynchronously) tryClaim();
   });
 }

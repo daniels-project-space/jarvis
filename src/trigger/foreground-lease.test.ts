@@ -121,13 +121,40 @@ describe("foreground handoff lease", () => {
     await expect(pending).resolves.toBe(false);
   });
 
-  it("serializes a synchronous initial lease notification and retries after a failed claim", async () => {
+  it("makes exactly one claim for a synchronous missing initial snapshot", async () => {
+    const first = deferred<boolean>();
+    const touch = vi.fn().mockReturnValue(first.promise);
+    const pending = waitForForegroundLease({
+      runnerId: crypto.randomUUID(),
+      timeoutMs: TIMEOUT_MS,
+      leaseMs: LEASE_MS,
+      touch,
+      subscribe: (listener) => {
+        listener(null);
+        return () => {};
+      },
+    });
+
+    await vi.runAllTicks();
+    expect(touch).toHaveBeenCalledTimes(1);
+
+    first.resolve(true);
+    await expect(pending).resolves.toBe(true);
+    expect(touch).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces an eligible notification received while a claim is in flight", async () => {
     const first = deferred<boolean>();
     const second = deferred<boolean>();
     const listeners = new Set<(lease: ForegroundLease) => void>();
-    const touch = vi.fn()
-      .mockReturnValueOnce(first.promise)
-      .mockReturnValueOnce(second.promise);
+    let activeTouches = 0;
+    let maxActiveTouches = 0;
+    const touch = vi.fn(() => {
+      activeTouches += 1;
+      maxActiveTouches = Math.max(maxActiveTouches, activeTouches);
+      const next = touch.mock.calls.length === 1 ? first.promise : second.promise;
+      return next.finally(() => { activeTouches -= 1; });
+    });
     const pending = waitForForegroundLease({
       runnerId: crypto.randomUUID(),
       timeoutMs: TIMEOUT_MS,
@@ -143,13 +170,38 @@ describe("foreground handoff lease", () => {
     await vi.runAllTicks();
     expect(touch).toHaveBeenCalledTimes(1);
 
-    first.resolve(false);
-    await vi.advanceTimersByTimeAsync(0);
     for (const listener of listeners) listener(null);
     await vi.runAllTicks();
+    expect(touch).toHaveBeenCalledTimes(1);
+
+    first.resolve(false);
+    await vi.advanceTimersByTimeAsync(0);
     expect(touch).toHaveBeenCalledTimes(2);
+    expect(maxActiveTouches).toBe(1);
 
     second.resolve(true);
     await expect(pending).resolves.toBe(true);
+  });
+
+  it("waits for the stale deadline after a synchronous active snapshot", async () => {
+    const touch = vi.fn(async () => true);
+    const pending = waitForForegroundLease({
+      runnerId: crypto.randomUUID(),
+      timeoutMs: TIMEOUT_MS,
+      leaseMs: LEASE_MS,
+      touch,
+      subscribe: (listener) => {
+        listener({ updatedAt: Date.now() });
+        return () => {};
+      },
+    });
+
+    await vi.runAllTicks();
+    expect(touch).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(LEASE_MS + 24);
+    expect(touch).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pending).resolves.toBe(true);
+    expect(touch).toHaveBeenCalledTimes(1);
   });
 });
