@@ -38,6 +38,10 @@ export type CodexDynamicToolResult = {
 export type CodexAppServerOptions = {
   dynamicTools?: CodexDynamicToolSpec[];
   onDynamicToolCall?: (call: CodexDynamicToolCall) => Promise<CodexDynamicToolResult>;
+  controllerCwd?: string;
+  threadSandbox?: "danger-full-access" | "read-only" | "workspace-write";
+  developerInstructions?: string;
+  ephemeral?: boolean;
 };
 export type CodexTurnInput = {
   conversationId: string;
@@ -73,7 +77,11 @@ export class CodexAppServer {
   }
 
   private async startInner() {
-    const child = spawn(this.bin, ["app-server", "--listen", "stdio://"], { env: this.env, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(this.bin, ["app-server", "--listen", "stdio://"], {
+      env: this.env,
+      cwd: this.options.controllerCwd,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
     this.process = child;
     child.stderr.on("data", (data) => { this.stderr = (this.stderr + data.toString()).slice(-1200); });
     child.on("error", (error) => this.failAll(error));
@@ -97,11 +105,11 @@ export class CodexAppServer {
       const response = await this.request("thread/start", {
         model: selection.model,
         baseInstructions: input.preamble,
-        developerInstructions: "Remain the foreground Jarvis conversation. Give the useful answer immediately. Delegate long work instead of blocking conversation.",
-        cwd: "/tmp",
+        developerInstructions: this.options.developerInstructions ?? "Remain the foreground Jarvis conversation. Give the useful answer immediately. Delegate long work instead of blocking conversation.",
+        cwd: this.options.controllerCwd ?? "/tmp",
         approvalPolicy: "never",
-        sandbox: "danger-full-access",
-        ephemeral: false,
+        sandbox: this.options.threadSandbox ?? "danger-full-access",
+        ephemeral: this.options.ephemeral ?? false,
         dynamicTools: this.options.dynamicTools,
       }, 30_000);
       const thread = response.thread as JsonObject | undefined;

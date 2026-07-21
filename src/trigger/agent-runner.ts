@@ -74,6 +74,16 @@ import {
 import { repositoryDeliveryReadiness, trustedGitReviewReceiptAuthority, verifyGitReviewReceiptEnvelope } from "./git-review-authority";
 import { integrateReviewedWorker } from "./mission-integration";
 import { createGitHubIntegrationAdapter, GITHUB_REST_API_VERSION } from "./github-integration-adapter";
+import { runCloudWorkspaceAgent } from "./cloud-agent-runner";
+import {
+  applyValidatedPatchToControllerCheckout,
+  createCredentiallessGitArchive,
+  persistPortableCheckpoint,
+  prepareCloudWorkspaceExecution,
+} from "./cloud-workspace-controller";
+import { createR2CheckpointStore } from "./cloud-checkpoint-r2";
+import { configuredCloudWorkspaceProvider } from "./cloud-workspace-providers";
+import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider } from "./cloud-workspace";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -617,6 +627,28 @@ export async function runAgentMaintenance() {
     /* recovery must never block fleet dispatch */
   }
   try {
+    const cleanupProvider = configuredCloudWorkspaceProvider(process.env, false);
+    const orphans: any[] = await convexQuery("jobs:cloudWorkspaceOrphans", { olderThan: Date.now() - 5 * 60_000 }) ?? [];
+    for (const orphan of orphans.filter((row) => row.providerName === cleanupProvider.name)) {
+      const workspace: CloudWorkspace = {
+        provider: cleanupProvider.name,
+        providerWorkspaceId: String(orphan.providerWorkspaceId),
+        providerSessionId: String(orphan.providerSessionId),
+        root: "/workspace/repository",
+        createdAt: 0,
+      };
+      await cleanupProvider.terminate(workspace, "orphan");
+      await convexMutation("jobs:markCloudWorkspaceTerminated", {
+        jobId: orphan.jobId, expectedAttempt: Number(orphan.attempt),
+        providerWorkspaceId: workspace.providerWorkspaceId,
+        providerSessionId: workspace.providerSessionId,
+      });
+    }
+  } catch {
+    // Missing provider configuration is an expected blocked state. Cleanup is
+    // retried by the next scheduled Trigger supervisor; it never falls back.
+  }
+  try {
     const due: any[] = (await convexMutation("reminders:due", {})) ?? [];
     for (const reminder of due) {
       const minutesLate = Math.round((Date.now() - reminder.at) / 60000);
@@ -808,7 +840,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     // One permanent agent's lifecycle: clone an isolated branch, execute one
     // bounded segment, checkpoint or verify, then report to the originating
     // conversation. Mission jobs remain quiet until the reviewed synthesis.
-    const processJob = async (job: any): Promise<void> => {
+    const processJob = async (job: any, cloudProvider: CloudWorkspaceProvider): Promise<void> => {
       const originThread = typeof job.originThreadId === "string" && job.originThreadId ? job.originThreadId : "main";
       const expectedAttempt = Number(job.attempt ?? 1);
       // Resolve lazily inside the trusted controller turn. This stays outside
@@ -868,6 +900,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         : null;
       let deliveryLease: { owner: string; token: string; version: number; until: number } | null = null;
       let deliveryHeartbeat: ReturnType<typeof setInterval> | undefined;
+      let providerWorkspace: CloudWorkspace | null = null;
       const linearizeDelivery = async () => {
         const lease = await convexMutation("jobs:linearizeDelivery", {
           jobId: job.jobId, expectedAttempt, deliveryLeaseOwner: deliveryOwner, deliveryLeaseToken: deliveryToken,
@@ -909,8 +942,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       try {
         const jobKey = String(job.jobId).replace(/[^a-zA-Z0-9_-]/g, "_");
         const jobEnv = isolateSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}`);
-        let cwd = `/tmp/work/scratch-${jobKey}-attempt-${expectedAttempt}`;
-        mkdirSync(cwd, { recursive: true });
+        const controllerScratch = `/tmp/work/controller-${jobKey}-attempt-${expectedAttempt}`;
+        rmSync(controllerScratch, { recursive: true, force: true });
+        mkdirSync(controllerScratch, { recursive: true });
+        let cwd = controllerScratch;
         const agentId = (TEAM_BY_SLUG[job.agentId as AgentSlug] ? job.agentId : routeWork(job.task, { repo: job.repo }).agentId) as AgentSlug;
         const profile = TEAM_BY_SLUG[agentId];
         let context = "This is a read-only knowledge/research run. Do not edit local files or mutate external systems.";
@@ -1278,8 +1313,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         let cloneFailed = false;
         let cloneFailureReason = "";
         let checkoutSourceBranch = "";
+        let controllerCheckoutPath = "";
         if (repo && token) {
           const dir = `/tmp/work/${repo.replace(/[^a-zA-Z0-9]/g, "_")}_${jobKey}_attempt_${expectedAttempt}`;
+          controllerCheckoutPath = dir;
           rmSync(dir, { recursive: true, force: true });
           const url = githubRepoUrl(repo);
           const gitEnv = githubGitEnv(env, token);
@@ -1402,6 +1439,70 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           context = `${cloneFailureReason} Do not pretend the repository was changed.`;
         }
         if (await stopIfLeaseLost("Execution stopped while preparing the secure workspace.", "", branch)) return;
+        if (repo && (cloneFailed || !repoDir || !baseSha)) {
+          await checkpointMutation({
+            jobId: job.jobId,
+            expectedAttempt,
+            checkpoint: `Cloud workspace preparation stopped before execution: ${cloneFailureReason || "the controller checkout was unavailable"}`,
+            branch: branch ?? undefined,
+            delayMs: failureBackoffMs(expectedAttempt),
+          }).catch(() => null);
+          return;
+        }
+        const workspaceRuntime = "node-22:codex-0.144.5";
+        const lockfileDigest = repoDir && existsSync(join(repoDir, "package-lock.json"))
+          ? sha256Bytes(readFileSync(join(repoDir, "package-lock.json")))
+          : sha256Bytes("no-lockfile");
+        const workspaceTemplate = String(process.env.JARVIS_CLOUD_WORKSPACE_TEMPLATE ?? "node22-codex-0.144.5");
+        const checkpointStore = await createR2CheckpointStore();
+        if (repoDir) {
+          const preparedWorkspace = await prepareCloudWorkspaceExecution({
+            providerFactory: () => cloudProvider,
+            hydrateArchive: () => createCredentiallessGitArchive(repoDir!, baseSha, env),
+            attemptKey: `${String(job.jobId)}:${expectedAttempt}`,
+            template: workspaceTemplate,
+            runtime: workspaceRuntime,
+            lockfileDigest,
+            bindWorkspace: async (workspace) => Boolean(await convexMutation("jobs:bindCloudWorkspace", {
+              jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
+              providerName: workspace.provider, providerWorkspaceId: workspace.providerWorkspaceId,
+              providerSessionId: workspace.providerSessionId,
+            }).catch(() => false)),
+          });
+          providerWorkspace = preparedWorkspace.workspace;
+          // The trusted hydration checkout must not coexist with Codex. The
+          // app-server is started only after these bytes have been uploaded
+          // and the host copy has been removed; a fresh exact-base controller
+          // checkout is created only after the app-server has exited.
+          rmSync(repoDir, { recursive: true, force: true });
+          repoDir = null;
+          cwd = controllerScratch;
+        } else {
+          providerWorkspace = await cloudProvider.createWorkspace({
+            attemptKey: `${String(job.jobId)}:${expectedAttempt}`,
+            template: workspaceTemplate,
+            runtime: workspaceRuntime,
+            lockfileDigest,
+            limits: DEFAULT_WORKSPACE_LIMITS,
+          });
+          const bound = await convexMutation("jobs:bindCloudWorkspace", {
+            jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
+            providerName: providerWorkspace.provider, providerWorkspaceId: providerWorkspace.providerWorkspaceId,
+            providerSessionId: providerWorkspace.providerSessionId,
+          }).catch(() => false);
+          if (!bound) {
+            await cloudProvider.terminate(providerWorkspace, "orphan").catch(() => undefined);
+            providerWorkspace = null;
+            throw new Error("Convex rejected the provider workspace/session fence");
+          }
+          const initialized = await cloudProvider.exec(providerWorkspace, {
+            command: "mkdir -p /workspace/repository && cd /workspace/repository && git init -q && git config user.email jarvis-controller@example.invalid && git config user.name 'JARVIS controller baseline' && git commit -q --allow-empty -m baseline",
+            cwd: "/workspace",
+            timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs,
+            maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes,
+          });
+          if (initialized.exitCode !== 0) throw new Error("cloud scratch initialization failed");
+        }
         const criteria = Array.isArray(job.acceptanceCriteria) && job.acceptanceCriteria.length
           ? job.acceptanceCriteria.map(String)
           : ["Deliver the requested outcome with concrete evidence"];
@@ -1470,24 +1571,73 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }))
             .catch(() => undefined);
         };
-        const run = await runAgent(
+        const run = await runCloudWorkspaceAgent({
           bin,
-          cwd,
-          agentEnv,
+          controllerScratch,
+          controllerEnv: agentEnv,
+          provider: cloudProvider,
+          workspace: providerWorkspace,
           prompt,
           model,
-          reportProgress,
-          mcp.configPath,
-          async () => {
+          onProgress: reportProgress,
+          executionState: async () => {
             const state = await executionStatus();
             return state === "superseded" ? "cancelled" : state;
           },
-          segmentTimeoutMs(model),
-          job.reasoningEffort,
-        );
+          timeoutMs: segmentTimeoutMs(model),
+        });
         await durableProgress;
         if (mcp.configPath) rmSync(mcp.configPath, { force: true });
-        const result = run.text;
+        let result = run.text;
+        const portable = await persistPortableCheckpoint({
+          provider: cloudProvider,
+          workspace: providerWorkspace,
+          store: checkpointStore,
+          baseSha: baseSha || sha256Bytes(String(job.jobId)),
+          runtime: workspaceRuntime,
+          lockfileDigest,
+          template: workspaceTemplate,
+          attemptKey: `${String(job.jobId)}:${expectedAttempt}`,
+          causationId: `${String(job.workerRunId)}:${expectedAttempt}`,
+        });
+        const checkpointRecorded = await convexMutation("jobs:recordCloudCheckpoint", {
+          jobId: job.jobId, expectedAttempt,
+          providerWorkspaceId: providerWorkspace.providerWorkspaceId,
+          providerSessionId: providerWorkspace.providerSessionId,
+          checkpointRef: portable.ref,
+          checkpointDigest: portable.digest,
+          checkpointBytes: portable.byteCount,
+          checkpointManifestDigest: sha256Bytes(JSON.stringify(portable.manifest)),
+        }).catch(() => false);
+        if (!checkpointRecorded) throw new Error("Convex rejected the portable checkpoint receipt");
+        if (repo) {
+          const patch = await cloudProvider.exportPatch(providerWorkspace, baseSha, DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
+          if (!controllerCheckoutPath || !token) throw new Error("trusted controller checkout authority is unavailable after specialist exit");
+          const url = githubRepoUrl(repo);
+          const gitEnv = githubGitEnv(env, token);
+          rmSync(controllerCheckoutPath, { recursive: true, force: true });
+          const cloned = await sh("git", ["clone", "--no-checkout", "--filter=blob:none", url, controllerCheckoutPath], gitEnv, { timeoutMs: 120_000 });
+          if (cloned.code !== 0) throw new Error(`trusted controller could not rehydrate exact base: ${cloned.out.slice(-400)}`);
+          let basePresent = await sh("git", ["-C", controllerCheckoutPath, "cat-file", "-e", `${baseSha}^{commit}`], env);
+          if (basePresent.code !== 0) {
+            const fetched = await sh("git", ["-C", controllerCheckoutPath, "fetch", "--no-tags", url, baseSha], gitEnv, { timeoutMs: 120_000 });
+            basePresent = fetched.code === 0
+              ? await sh("git", ["-C", controllerCheckoutPath, "cat-file", "-e", `${baseSha}^{commit}`], env)
+              : fetched;
+          }
+          if (basePresent.code !== 0) throw new Error("trusted controller could not prove the exact patch base");
+          const checkedOut = branch
+            ? await sh("git", ["-C", controllerCheckoutPath, "checkout", "-B", branch, baseSha], env)
+            : await sh("git", ["-C", controllerCheckoutPath, "checkout", "--detach", baseSha], env);
+          if (checkedOut.code !== 0) throw new Error("trusted controller could not restore the exact worker branch base");
+          await sh("git", ["-C", controllerCheckoutPath, "remote", "set-url", "origin", url], env);
+          await sh("git", ["-C", controllerCheckoutPath, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
+          await sh("git", ["-C", controllerCheckoutPath, "config", "user.name", `${profile.name} via JARVIS`], env);
+          repoDir = controllerCheckoutPath;
+          cwd = controllerCheckoutPath;
+          await applyValidatedPatchToControllerCheckout(repoDir, baseSha, patch, env);
+        }
+        result = `${result}\n\nCloud boundary: ${cloudProvider.name} workspace ${providerWorkspace.providerWorkspaceId}; R2 checkpoint ${portable.digest} (${portable.byteCount} bytes).`;
 
         const checkpointText = buildContinuationCheckpoint({
           attempt: expectedAttempt,
@@ -2054,6 +2204,16 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             text: `⚠️ ${job.agentId ?? "Agent"} exhausted its recovery budget: ${message.slice(0, 240)}`,
           }).catch(() => {});
       } finally {
+        if (providerWorkspace) {
+          const terminalReason = await executionStatus().catch(() => "unknown") === "cancelled" ? "cancelled" : "terminal";
+          await cloudProvider.terminate(providerWorkspace, terminalReason).then(async () => {
+            await convexMutation("jobs:markCloudWorkspaceTerminated", {
+              jobId: job.jobId, expectedAttempt,
+              providerWorkspaceId: providerWorkspace!.providerWorkspaceId,
+              providerSessionId: providerWorkspace!.providerSessionId,
+            }).catch(() => false);
+          }).catch(() => undefined);
+        }
         if (deliveryHeartbeat) clearInterval(deliveryHeartbeat);
         unsubscribeLease();
         controlClient.close();
@@ -2116,6 +2276,23 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     }).catch(() => null);
     if (!job) return { processed: 0, stale: true };
     processed = 1;
+    let cloudProvider: CloudWorkspaceProvider;
+    try {
+      cloudProvider = configuredCloudWorkspaceProvider(process.env);
+    } catch (error) {
+      const failure = error instanceof CloudWorkspaceError
+        ? error
+        : new CloudWorkspaceError("cloudflare", "invalid_configuration", "cloud workspace configuration is invalid");
+      const checkpoint = `Cloud workspace ${failure.disposition} [${failure.provider}/${failure.code}]: ${failure.message}. No repository or specialist process was started on the Trigger host.`;
+      await convexMutation("jobs:noteCloudWorkspaceBlock", {
+        jobId: job.jobId, expectedAttempt: Number(job.attempt ?? 1), code: failure.code, reason: checkpoint,
+      }).catch(() => false);
+      await convexMutation("jobs:checkpointAndRequeue", {
+        jobId: job.jobId, expectedAttempt: Number(job.attempt ?? 1), checkpoint,
+        result: checkpoint, branch: job.branch ?? undefined, delayMs: 6 * 60 * 60_000,
+      }).catch(() => null);
+      return { processed: 1, blocked: true, provider: failure.provider, code: failure.code };
+    }
     options.onProgress?.({
       jobId: String(job.jobId),
       missionId: job.missionId,
@@ -2124,7 +2301,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       stage: "starting",
       percent: 2,
     });
-    await processJob(job);
+    await processJob(job, cloudProvider);
     await syncExternalGoalRuns();
     await drainGoalAdvances();
     // Approval declines/cancellations do not run processJob, so sweep terminal

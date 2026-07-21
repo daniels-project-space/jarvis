@@ -668,8 +668,15 @@ export default defineSchema({
     }))),
     // The Trigger run is only delivery metadata. Sandbox/provider sessions
     // are deliberately separate identities for the sandbox adapter workstream.
+    providerName: v.optional(v.string()),
     providerWorkspaceId: v.optional(v.string()),
     providerSessionId: v.optional(v.string()),
+    providerCreatedAt: v.optional(v.number()),
+    providerTerminatedAt: v.optional(v.number()),
+    checkpointRef: v.optional(v.string()),
+    checkpointDigest: v.optional(v.string()),
+    checkpointBytes: v.optional(v.number()),
+    checkpointManifestDigest: v.optional(v.string()),
     lastEventSeq: v.optional(v.number()),
     lastEventKey: v.optional(v.string()),
     launchedAt: v.optional(v.number()),

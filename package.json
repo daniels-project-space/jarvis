@@ -10,6 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@daytona/sdk": "0.200.0",
     "@excalidraw/excalidraw": "^0.18.1",
     "@mastra/core": "^1.51.0",
     "@openai/codex": "0.144.5",
@@ -19,6 +20,7 @@
     "@xyflow/react": "^12.11.2",
     "aws4fetch": "^1.0.20",
     "convex": "^1.42.1",
+    "e2b": "2.35.0",
     "jose": "^6.2.3",
     "maplibre-gl": "^5.24.0",
     "msedge-tts": "^2.0.7",
@@ -27,6 +29,7 @@
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "react-grid-layout": "^2.2.3",
+    "sandbox0": "0.9.3",
     "server-only": "^0.0.1",
     "three": "^0.185.1",
     "web-push": "^3.6.7",

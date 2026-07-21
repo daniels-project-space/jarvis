@@ -1871,6 +1871,123 @@ export const bindWorkspaceSource = mutation({
   },
 });
 
+export const bindCloudWorkspace = mutation({
+  args: {
+    jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
+    providerName: v.union(v.literal("e2b"), v.literal("daytona"), v.literal("sandbox0"), v.literal("cloudflare")),
+    providerWorkspaceId: v.string(), providerSessionId: v.string(), workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.get(a.jobId);
+    const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
+      || row.workerRunId !== a.workerRunId || !attempt || attempt.status !== "running"
+      || !a.providerWorkspaceId || !a.providerSessionId || a.providerWorkspaceId === a.providerSessionId) return false;
+    if (attempt.providerWorkspaceId || attempt.providerSessionId) {
+      return attempt.providerName === a.providerName
+        && attempt.providerWorkspaceId === a.providerWorkspaceId
+        && attempt.providerSessionId === a.providerSessionId;
+    }
+    const now = Date.now();
+    await ctx.db.patch(attempt._id, {
+      providerName: a.providerName,
+      providerWorkspaceId: a.providerWorkspaceId.slice(0, 240),
+      providerSessionId: a.providerSessionId.slice(0, 240),
+      providerCreatedAt: now,
+      lastEventAt: now,
+    });
+    await patchJobWithRuntime(ctx, row, { providerRunState: "workspace_bound", providerObservedAt: now });
+    await appendAttemptEvidence(ctx, row, "cloud_workspace_bound", `${a.providerName} cloud workspace bound`, {
+      stage: "starting", evidenceKind: "workspace", eventKey: `cloud-workspace:${a.expectedAttempt}:${a.providerName}`,
+      data: { provider: a.providerName, workspaceId: a.providerWorkspaceId.slice(0, 80), sessionId: a.providerSessionId.slice(0, 80) },
+    });
+    return true;
+  },
+});
+
+export const noteCloudWorkspaceBlock = mutation({
+  args: {
+    jobId: v.id("jobs"), expectedAttempt: v.number(), code: v.string(), reason: v.string(), workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.get(a.jobId);
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
+    const now = Date.now();
+    await patchJobWithRuntime(ctx, row, {
+      providerRunState: "blocked", providerObservedAt: now,
+      stage: "cloud blocked", progress: `cloud workspace blocked · ${a.code.slice(0, 80)}`,
+    });
+    await appendAttemptEvidence(ctx, row, "cloud_workspace_blocked", a.reason.slice(0, 500), {
+      stage: "cloud blocked", evidenceKind: "checkpoint", eventKey: `cloud-blocked:${a.expectedAttempt}:${a.code.slice(0, 80)}`,
+      data: { code: a.code.slice(0, 80) },
+    });
+    return true;
+  },
+});
+
+export const recordCloudCheckpoint = mutation({
+  args: {
+    jobId: v.id("jobs"), expectedAttempt: v.number(),
+    providerWorkspaceId: v.string(), providerSessionId: v.string(),
+    checkpointRef: v.string(), checkpointDigest: v.string(), checkpointBytes: v.number(),
+    checkpointManifestDigest: v.string(), workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.get(a.jobId);
+    const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt || !attempt
+      || attempt.providerWorkspaceId !== a.providerWorkspaceId || attempt.providerSessionId !== a.providerSessionId
+      || !/^sandbox-checkpoints\/sha256\/[0-9a-f]{64}$/.test(a.checkpointRef)
+      || !/^[0-9a-f]{64}$/.test(a.checkpointDigest)
+      || a.checkpointRef !== `sandbox-checkpoints/sha256/${a.checkpointDigest}`
+      || !/^[0-9a-f]{64}$/.test(a.checkpointManifestDigest)
+      || !Number.isSafeInteger(a.checkpointBytes) || a.checkpointBytes < 0) return false;
+    const now = Date.now();
+    await ctx.db.patch(attempt._id, {
+      checkpointRef: a.checkpointRef, checkpointDigest: a.checkpointDigest,
+      checkpointBytes: a.checkpointBytes, checkpointManifestDigest: a.checkpointManifestDigest,
+      lastEventAt: now,
+    });
+    await patchJobWithRuntime(ctx, row, { providerRunState: "checkpointed", providerObservedAt: now });
+    return true;
+  },
+});
+
+export const cloudWorkspaceOrphans = query({
+  args: { olderThan: v.number(), workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const rows: any[] = [];
+    for (const status of ["checkpointed", "paused", "cancelled", "done", "error", "needs_input"]) {
+      rows.push(...await ctx.db.query("workAttempts")
+        .withIndex("by_status_progress", (q: any) => q.eq("status", status).lte("progressAt", a.olderThan)).take(50));
+    }
+    return rows.filter((row) => row.providerName && row.providerWorkspaceId && row.providerSessionId && !row.providerTerminatedAt)
+      .slice(0, 100)
+      .map((row) => ({
+        jobId: row.jobId, attempt: row.attempt, providerName: row.providerName,
+        providerWorkspaceId: row.providerWorkspaceId, providerSessionId: row.providerSessionId,
+      }));
+  },
+});
+
+export const markCloudWorkspaceTerminated = mutation({
+  args: {
+    jobId: v.id("jobs"), expectedAttempt: v.number(), providerWorkspaceId: v.string(),
+    providerSessionId: v.string(), workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    if (!attempt || attempt.providerWorkspaceId !== a.providerWorkspaceId || attempt.providerSessionId !== a.providerSessionId) return false;
+    await ctx.db.patch(attempt._id, { providerTerminatedAt: Date.now(), lastEventAt: Date.now() });
+    return true;
+  },
+});
+
 // Cold receipt access is worker-only and returns exactly the immutable record
 // named by the compact claim pointer. It is never part of an agent prompt or
 // sandbox configuration.
