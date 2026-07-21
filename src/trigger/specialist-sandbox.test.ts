@@ -182,6 +182,74 @@ describe("specialist OS trust boundary", () => {
     expect(SPECIALIST_PROBE_PRLIMIT_ARGS).toEqual(["--fsize=16384:16384", "--"]);
   });
 
+  it("uses a canonical trusted identity when a successful tool wrapper emits no version output", () => {
+    const fixture = sandboxFixture();
+    const toolRoot = mkdtempSync(join(tmpdir(), "jarvis-controller-tool-path-"));
+    roots.push(toolRoot);
+    const emptyVersionTool = realpathSync("/usr/bin/test");
+    const targets = {
+      node: realpathSync(process.execPath),
+      npm: emptyVersionTool,
+      npx: emptyVersionTool,
+      git: realpathSync("/usr/bin/git"),
+      gh: realpathSync("/usr/bin/gh"),
+      curl: realpathSync("/usr/bin/curl"),
+    } as const;
+    for (const [name, target] of Object.entries(targets)) {
+      symlinkSync(target, join(toolRoot, name));
+    }
+    const invocation = buildSpecialistNamespaceProbeInvocation({
+      codexBin,
+      cwd: fixture.root,
+      env: { ...fixture.env, PATH: toolRoot },
+      controllerPid: 2_147_483_647,
+    });
+    const sourceIndex = invocation.args.lastIndexOf("-e");
+    expect(sourceIndex).toBeGreaterThan(-1);
+    const result = spawnSync(process.execPath, ["-e", invocation.args[sourceIndex + 1]!], {
+      env: {
+        PATH: toolRoot,
+        HOME: fixture.root,
+        NODE_ENV: "test",
+        JARVIS_NAMESPACE_PROBE_NONCE: invocation.nonce,
+        JARVIS_NAMESPACE_CONTROLLER_PID: "2147483647",
+      },
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    const receipt = JSON.parse(result.stdout) as {
+      tools: Record<string, { available: boolean; version: string }>;
+    };
+    expect(receipt.tools.node).toEqual({
+      available: true,
+      version: spawnSync(process.execPath, ["--version"], { encoding: "utf8" }).stdout.trim(),
+    });
+    expect(receipt.tools.npm).toEqual({ available: true, version: emptyVersionTool });
+    expect(receipt.tools.npx).toEqual({ available: true, version: emptyVersionTool });
+    expect(receipt.tools.npm.version).toBe(realpathSync(join(toolRoot, "npm")));
+    expect(receipt.tools.npm.version.length).toBeLessThanOrEqual(160);
+
+    rmSync(join(toolRoot, "npm"), { force: true });
+    writeFileSync(join(toolRoot, "npm"), "#!/bin/sh\nexit 1\n", { mode: 0o700 });
+    const failed = spawnSync(process.execPath, ["-e", invocation.args[sourceIndex + 1]!], {
+      env: {
+        PATH: toolRoot,
+        HOME: fixture.root,
+        NODE_ENV: "test",
+        JARVIS_NAMESPACE_PROBE_NONCE: invocation.nonce,
+        JARVIS_NAMESPACE_CONTROLLER_PID: "2147483647",
+      },
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    expect(failed.status, failed.stderr).toBe(0);
+    const failedReceipt = JSON.parse(failed.stdout) as {
+      tools: Record<string, { available: boolean; version: string }>;
+    };
+    expect(failedReceipt.tools.npm).toEqual({ available: false, version: "" });
+  });
+
   it("proves the unsandboxed same-container /proc attack is real without emitting the sentinel", () => {
     const adversary = `
       const fs=require("node:fs");

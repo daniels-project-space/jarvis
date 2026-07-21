@@ -71,7 +71,9 @@ export type NamespaceObservation = {
 
 const NAMESPACE_PROBE_SOURCE = String.raw`
 const fs = require("node:fs");
+const { createHash } = require("node:crypto");
 const { spawnSync } = require("node:child_process");
+const path = require("node:path");
 const nonce = String(process.env.JARVIS_NAMESPACE_PROBE_NONCE || "");
 const outerPid = String(process.env.JARVIS_NAMESPACE_CONTROLLER_PID || "");
 if (!/^[a-f0-9]{64}$/.test(nonce) || !/^[1-9][0-9]*$/.test(outerPid)) process.exit(70);
@@ -95,11 +97,47 @@ for (const pid of numericPids) {
     }
   } catch {}
 }
+const trustedToolIdentity = (tool) => {
+  const searchPath = String(process.env.PATH || "");
+  const directories = searchPath.split(path.delimiter);
+  if (!searchPath || directories.some((directory) => !directory || !path.isAbsolute(directory))) return "";
+  for (const directory of directories) {
+    const candidate = path.join(directory, tool);
+    try { fs.accessSync(candidate, fs.constants.X_OK); } catch { continue; }
+    try {
+      // Stop at the first executable PATH entry, matching spawn's lookup. An
+      // untrusted first match must fail closed rather than attest a later tool.
+      const canonical = fs.realpathSync(candidate);
+      const stat = fs.lstatSync(canonical);
+      if (
+        !path.isAbsolute(canonical)
+        || fs.realpathSync(canonical) !== canonical
+        || !stat.isFile()
+        || stat.uid !== 0
+        || (stat.mode & 0o022) !== 0
+      ) return "";
+      fs.accessSync(canonical, fs.constants.X_OK);
+      if (canonical.length <= 160) return canonical;
+      return "sha256:" + createHash("sha256").update(fs.readFileSync(canonical)).digest("hex");
+    } catch {
+      return "";
+    }
+  }
+  return "";
+};
 const tools = Object.fromEntries(${JSON.stringify(REQUIRED_TOOLS)}.map((tool) => {
   const result = spawnSync(tool, ["--version"], { encoding: "utf8", timeout: 3000 });
+  const output = [result.stdout, result.stderr]
+    .map((value) => String(value || "").trim().replace(/\s+/g, " "))
+    .find(Boolean) || "";
+  const version = output
+    ? output.slice(0, 160)
+    : result.status === 0
+      ? trustedToolIdentity(tool)
+      : "";
   return [tool, {
-    available: result.status === 0,
-    version: String(result.stdout || result.stderr || "").trim().replace(/\s+/g, " ").slice(0, 160),
+    available: result.status === 0 && version.length > 0,
+    version,
   }];
 }));
 const receipt = {
@@ -196,29 +234,51 @@ export function readNamespaceProbeReceipt(
   path: string,
   expectedIdentity?: Readonly<{ device: number; inode: number }>,
 ): string {
-  let stat: Stats;
+  if (typeof fsConstants.O_NOFOLLOW !== "number" || fsConstants.O_NOFOLLOW === 0) {
+    throw new Error("namespace preflight no-follow boundary is unavailable");
+  }
+  let fd: number;
   try {
-    stat = lstatSync(path);
-  } catch {
-    throw new Error("namespace preflight receipt is missing");
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      throw new Error("namespace preflight receipt is missing");
+    }
+    throw new Error("namespace preflight receipt is not a unique mode-0600 regular file");
   }
-  if (
-    stat.isSymbolicLink()
-    || !stat.isFile()
-    || stat.nlink !== 1
-    || (stat.mode & 0o777) !== 0o600
-  ) throw new Error("namespace preflight receipt is not a unique mode-0600 regular file");
-  assertControllerOwned(stat, "namespace preflight receipt");
-  if (expectedIdentity && (stat.dev !== expectedIdentity.device || stat.ino !== expectedIdentity.inode)) {
-    throw new Error("namespace preflight receipt identity changed");
+  try {
+    const before = fstatSync(fd);
+    if (
+      !before.isFile()
+      || before.nlink !== 1
+      || (before.mode & 0o777) !== 0o600
+    ) throw new Error("namespace preflight receipt is not a unique mode-0600 regular file");
+    assertControllerOwned(before, "namespace preflight receipt");
+    if (expectedIdentity && (before.dev !== expectedIdentity.device || before.ino !== expectedIdentity.inode)) {
+      throw new Error("namespace preflight receipt identity changed");
+    }
+    if (before.size < 1) throw new Error("namespace preflight receipt is empty");
+    if (before.size > MAX_RECEIPT_BYTES) throw new Error("namespace preflight receipt is oversized");
+    const raw = readFileSync(fd, "utf8");
+    const bytes = Buffer.byteLength(raw, "utf8");
+    const after = fstatSync(fd);
+    if (
+      before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.uid !== after.uid
+      || before.mode !== after.mode
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs
+      || bytes !== before.size
+    ) throw new Error("namespace preflight receipt changed during its read");
+    if (bytes < 1) throw new Error("namespace preflight receipt is empty");
+    if (bytes > MAX_RECEIPT_BYTES) throw new Error("namespace preflight receipt is oversized");
+    return raw;
+  } finally {
+    closeSync(fd);
   }
-  if (stat.size < 1) throw new Error("namespace preflight receipt is empty");
-  if (stat.size > MAX_RECEIPT_BYTES) throw new Error("namespace preflight receipt is oversized");
-  const raw = readFileSync(path, "utf8");
-  const bytes = Buffer.byteLength(raw, "utf8");
-  if (bytes < 1) throw new Error("namespace preflight receipt is empty");
-  if (bytes > MAX_RECEIPT_BYTES) throw new Error("namespace preflight receipt is oversized");
-  return raw;
 }
 
 function boundedNamespaceProbeInvocation(invocation: NamespaceProbeInvocation): NamespaceProbeInvocation {
