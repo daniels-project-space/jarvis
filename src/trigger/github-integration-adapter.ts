@@ -22,7 +22,8 @@ type SyntheticCandidate = {
   actor: { name: string; email: string; date: string };
 };
 
-const API_VERSION = "2022-11-28";
+export const GITHUB_REST_API_VERSION = "2026-03-10";
+const PROVIDER_REQUEST_TIMEOUT_MS = 90_000;
 const OID = /^[0-9a-f]{40,64}$/i;
 
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -64,6 +65,8 @@ export function createGitHubIntegrationAdapter(options: {
   fetchImpl?: FetchLike;
   gitEnv?: NodeJS.ProcessEnv;
   readGitObject?: (sha: string) => Promise<Buffer>;
+  signal?: AbortSignal;
+  requestTimeoutMs?: number;
 }): IntegrationAdapter {
   const { owner, name } = splitRepository(options.repository);
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -72,13 +75,27 @@ export function createGitHubIntegrationAdapter(options: {
     Accept: "application/vnd.github+json",
     Authorization: `Bearer ${options.token}`,
     "Content-Type": "application/json",
-    "X-GitHub-Api-Version": API_VERSION,
+    "X-GitHub-Api-Version": GITHUB_REST_API_VERSION,
   };
   let repositoryNodeId = options.repositoryNodeId;
 
-  const request = async (path: string, init: RequestInit = {}) => fetchImpl(`${apiRoot}${path}`, {
-    ...init,
-    headers: { ...headers, ...(init.headers ?? {}) },
+  const boundedFetch = async (input: string, init: RequestInit = {}) => {
+    const controller = new AbortController();
+    const abort = () => controller.abort(options.signal?.reason ?? new Error("integration controller cancelled"));
+    if (options.signal?.aborted) abort();
+    else options.signal?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(() => controller.abort(new Error("GitHub provider request deadline exceeded")),
+      Math.max(1, options.requestTimeoutMs ?? PROVIDER_REQUEST_TIMEOUT_MS));
+    try {
+      return await fetchImpl(input, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
+    }
+  };
+
+  const request = async (path: string, init: RequestInit = {}) => boundedFetch(`${apiRoot}${path}`, {
+    ...init, headers: { ...headers, ...(init.headers ?? {}) },
   });
 
   const identity = async () => {
@@ -142,6 +159,11 @@ export function createGitHubIntegrationAdapter(options: {
       const lost = await persist({ effectId: effect.effectId, observation: "applied", providerHeadSha: effect.headSha, providerResponse: prior.response });
       if (lost) return lost;
       return { outcome: "applied", providerHeadSha: effect.headSha, providerResponse: prior.response };
+    }
+    if (hooks.reconcileOnly) {
+      const lost = await persist({ effectId: effect.effectId, observation: "not_applied", providerResponse: "reconciled:exact-object-absent" });
+      if (lost) return lost;
+      return { outcome: "not_applied", providerResponse: "reconciled:exact-object-absent" };
     }
     let response: Response;
     try {
@@ -279,8 +301,6 @@ export function createGitHubIntegrationAdapter(options: {
       const repoId = await identity();
       for (const entry of candidate.entries) {
         if (entry.type !== "blob" || !entry.sha) continue;
-        const existing = await getObject("blobs", entry.sha);
-        if (existing.exists) continue;
         if (!options.readGitObject) throw new Error("binary-safe Git object reader is required for candidate blob staging");
         const bytes = await options.readGitObject(entry.sha);
         const body = { content: bytes.toString("base64"), encoding: "base64" };
@@ -322,7 +342,7 @@ export function createGitHubIntegrationAdapter(options: {
       const mutation = await refMutation(effectId, branch, expectedBaseSha, newHeadSha);
       let response: Response;
       try {
-        response = await fetchImpl("https://api.github.com/graphql", {
+        response = await boundedFetch("https://api.github.com/graphql", {
           method: "POST", headers, body: JSON.stringify({ query: mutation.query, variables: mutation.variables }),
         });
       } catch (error) {

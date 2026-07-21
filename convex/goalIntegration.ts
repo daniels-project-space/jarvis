@@ -5,6 +5,8 @@ import { insertJobWithRuntime, patchJobWithRuntime, patchMissionWithRuntime } fr
 import { attemptWorkspaceKey, workItemIdentity } from "../src/lib/workspace-protocol";
 
 const LEASE_MS = 45_000;
+const CONTROLLER_STATE_MS = { command: 2 * 60_000, provider: 5 * 60_000, reconcile: 2 * 60_000 } as const;
+const MAX_PROVIDER_EFFECTS = 1_024;
 const SHA = /^[0-9a-f]{40,64}$/i;
 const DIGEST = /^[0-9a-f]{64}$/i;
 const ZERO_OID = "0".repeat(40);
@@ -58,15 +60,14 @@ export async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, ou
   const effects = [...(coldEffects.length ? coldEffects : (attempt.effects ?? []))]
     .sort((left: any, right: any) => left.preparedAt - right.preparedAt || left.effectId.localeCompare(right.effectId))
     .map((effect: any) => ({
-      effectId: effect.effectId, kind: effect.effectKind, provider: effect.provider,
-      providerIdentity: effect.providerIdentity, method: effect.providerMethod, target: effect.providerTarget,
+      effectId: effect.effectId, kind: effect.effectKind, providerIdentity: effect.providerIdentity,
       requestDigest: effect.requestDigest, expectedBaseSha: effect.expectedBaseSha,
-      headSha: effect.headSha, treeSha: effect.treeSha, preparedAt: effect.preparedAt,
+      headSha: effect.headSha, treeSha: effect.treeSha,
       observation: effect.observation ?? null, providerHeadSha: effect.providerHeadSha ?? null,
-      providerResponse: effect.providerResponse ?? null,
       providerResponseDigest: effect.providerResponseDigest ?? null,
-      observedAt: effect.observedAt ?? null,
     }));
+  if (effects.length > MAX_PROVIDER_EFFECTS) return null;
+  const orderedEffectIdentityDigest = await sha256Hex(JSON.stringify(effects));
   if (outcome === "integrated" && !effects.some((effect: any) => effect.kind === "update_ref"
     && effect.observation === "applied" && effect.providerHeadSha === attempt.preparedIntegrationHeadSha)) return null;
   const receipt = canonicalValue({
@@ -123,7 +124,11 @@ export async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, ou
         cumulativeRetries: row.cumulativeRetries ?? 0, currentStep: row.currentStep ?? null,
         status: row.status, outcome: row.outcome ?? null,
       })),
-    providerEffects: effects,
+    providerEffects: {
+      count: effects.length,
+      orderedEffectIdentityDigest,
+      ordered: effects,
+    },
     terminal: {
       outcome, reason: detail?.reason?.slice(0, 500) ?? attempt.retryReason ?? null,
       deliveryStatus: outcome === "integrated" ? "done" : "blocked",
@@ -161,6 +166,74 @@ async function wakeNextIntegration(ctx: any, attempt: any) {
   if (job && job.status === "pending") await patchJobWithRuntime(ctx, job, {
     integrationState: "queued", nextRunAt: Date.now(), evidenceSummary: "signed review is next in the repository integration FIFO",
   });
+}
+
+function carriedIntegrationDelivery(delivery: any) {
+  return {
+    integrationAttemptId: delivery.integrationAttemptId,
+    reviewReceiptId: delivery.reviewReceiptId,
+    reviewReceiptDigest: delivery.reviewReceiptDigest,
+    reviewKeyId: delivery.reviewKeyId,
+    reviewLineage: delivery.reviewLineage,
+    reviewedHeadSha: delivery.reviewedHeadSha,
+    reviewedBaseSha: delivery.reviewedBaseSha,
+    reviewedHeadTreeSha: delivery.reviewedHeadTreeSha,
+    reviewedDiffSha256: delivery.reviewedDiffSha256,
+  };
+}
+
+/**
+ * One transactionally fenced watchdog path for a dead integration controller.
+ * It retains the exact review/effect identity and allocates only a delivery
+ * generation; the specialist work attempt is never reopened or incremented.
+ */
+export async function recoverExpiredIntegrationController(ctx: any, attempt: any, now = Date.now()) {
+  if (!attempt || TERMINAL.has(attempt.status) || attempt.status === "queued") return null;
+  const expiry = Math.min(Number(attempt.leaseUntil ?? 0), Number(attempt.controllerDeadlineAt ?? 0));
+  if (expiry >= now) return null;
+  const [mission, job] = await Promise.all([ctx.db.get(attempt.missionId), ctx.db.get(attempt.jobId)]);
+  const delivery: any = job?.activeDeliveryAttemptId ? await ctx.db.get(job.activeDeliveryAttemptId) : null;
+  if (!mission || !job || job.integrationAttemptId !== attempt._id
+    || delivery?.integrationAttemptId !== attempt._id || delivery.status !== "running"
+    || mission.activeIntegrationAttemptId !== attempt._id) return null;
+  const head = await fifoHead(ctx, attempt.missionId, attempt.repository);
+  if (!head || head._id !== attempt._id) return null;
+  const nextGeneration = Number(delivery.generation) + 1;
+  const existing: any = await ctx.db.query("deliveryAttempts")
+    .withIndex("by_job_source_generation", (q: any) => q.eq("jobId", job._id)
+      .eq("sourceWorkAttempt", attempt.workAttempt).eq("generation", nextGeneration)).first();
+  if (existing) return null;
+  const retries = Number(delivery.cumulativeRetries ?? 0) + 1;
+  const nextDeliveryId = await ctx.db.insert("deliveryAttempts", {
+    jobId: job._id, sourceWorkAttempt: attempt.workAttempt, generation: nextGeneration,
+    policy: "mission_integration", status: "checkpointed", parentDeliveryAttemptId: delivery._id,
+    ...carriedIntegrationDelivery(delivery), heartbeatAt: now, retries: 0,
+    cumulativeRetries: retries, currentStep: "queued", retryReason: "integration controller expired",
+    createdAt: now, updatedAt: now,
+  });
+  await ctx.db.patch(delivery._id, {
+    status: "abandoned", completedAt: now, leaseOwner: undefined, leaseToken: undefined,
+    leaseUntil: undefined, retryReason: "integration controller expired", updatedAt: now,
+  });
+  await ctx.db.patch(attempt._id, {
+    status: "queued", controllerRunId: undefined, leaseOwner: undefined, leaseToken: undefined,
+    leaseUntil: undefined, controllerHeartbeatAt: now, retryReason: "integration controller expired",
+    updatedAt: now,
+  });
+  await patchMissionWithRuntime(ctx, mission, {
+    activeIntegrationAttemptId: undefined, integrationLeaseOwner: undefined, integrationLeaseToken: undefined,
+    integrationLeaseUntil: undefined, updatedAt: now,
+  });
+  await patchJobWithRuntime(ctx, job, {
+    status: "pending", stage: "delivery", nextRunAt: now,
+    integrationState: attempt.controlRequested ? `${attempt.controlRequested}_requested` : "queued",
+    evidenceSummary: "expired controller fenced; exact reviewed receipt queued for reconciliation",
+    activeDeliveryAttemptId: nextDeliveryId, deliveryGeneration: nextGeneration,
+    dispatchId: undefined, dispatchLeaseUntil: undefined, workerRunId: undefined, deliveryRunId: undefined,
+    deliveryLeaseOwner: undefined, deliveryLeaseToken: undefined, deliveryLeaseUntil: undefined,
+    heartbeatAt: now,
+  });
+  return { integrationAttemptId: attempt._id, jobId: job._id, deliveryAttemptId: nextDeliveryId };
 }
 
 function exactFence(mission: any, attempt: any, args: any, job?: any) {
@@ -255,15 +328,17 @@ export const claim = mutation({
       && Number(attempt.leaseUntil ?? 0) >= now) return null;
     const version = Math.max(Number(mission.integrationLeaseVersion ?? 0), Number(attempt.leaseVersion ?? 0)) + 1;
     const until = now + LEASE_MS;
-    const expectedIntegrationBaseSha = String(mission.integrationHeadSha ?? attempt.reviewedBaseSha);
-    const expectedIntegrationRefSha = String(mission.integrationHeadSha ?? ZERO_OID);
+    // A recovered attempt retains its original exact CAS and reviewed cold
+    // receipt. A new generation binds them once from the authoritative head.
+    const expectedIntegrationBaseSha = String(attempt.expectedIntegrationBaseSha ?? mission.integrationHeadSha ?? attempt.reviewedBaseSha);
+    const expectedIntegrationRefSha = String(attempt.expectedIntegrationRefSha ?? mission.integrationHeadSha ?? ZERO_OID);
     await ctx.db.patch(attempt._id, {
       status: "claimed",
       controllerRunId: args.controllerRunId.slice(0, 160), leaseOwner: args.leaseOwner.slice(0, 160),
       leaseToken: args.leaseToken.slice(0, 160), leaseVersion: version, leaseUntil: until,
       expectedIntegrationBaseSha, expectedIntegrationRefSha, updatedAt: now,
       controllerState: "command", controllerStateSince: now,
-      controllerDeadlineAt: now + 10 * 60_000, controllerHeartbeatAt: now,
+      controllerDeadlineAt: now + CONTROLLER_STATE_MS.command, controllerHeartbeatAt: now,
     });
     await patchMissionWithRuntime(ctx, mission, {
       activeIntegrationAttemptId: attempt._id, integrationLeaseOwner: args.leaseOwner.slice(0, 160),
@@ -281,6 +356,8 @@ export const heartbeat = mutation({
   args: {
     ...fenceArgs,
     state: v.optional(v.union(v.literal("command"), v.literal("provider"), v.literal("reconcile"))),
+    // Retained for rolling workers, but callers cannot choose or extend a
+    // state deadline. The server owns the fixed budget below.
     deadlineAt: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
@@ -290,15 +367,24 @@ export const heartbeat = mutation({
     const job: any = attempt ? await ctx.db.get(attempt.jobId) : null;
     if (!exactFence(mission, attempt, args, job)) return false;
     const now = Date.now();
-    if (args.deadlineAt !== undefined && (args.deadlineAt < now || args.deadlineAt > now + 6 * 60 * 60_000)) return false;
+    if (Number(attempt.controllerDeadlineAt ?? 0) <= now) return false;
+    const current = String(attempt.controllerState ?? "command") as keyof typeof CONTROLLER_STATE_MS;
+    const requested = args.state ?? current;
+    const allowed = current === requested
+      || (current === "command" && requested === "provider")
+      || (current === "provider" && requested === "reconcile");
+    if (!allowed) return false;
+    const transitioned = requested !== current;
     const until = now + LEASE_MS;
     await ctx.db.patch(attempt._id, {
       leaseUntil: until, controllerHeartbeatAt: now,
-      ...(args.state && args.state !== attempt.controllerState ? { controllerState: args.state, controllerStateSince: now } : {}),
-      ...(args.deadlineAt !== undefined ? { controllerDeadlineAt: args.deadlineAt } : {}),
+      ...(transitioned ? { controllerState: requested, controllerStateSince: now,
+        controllerDeadlineAt: now + CONTROLLER_STATE_MS[requested] } : {}),
       updatedAt: now,
     });
-    await patchMissionWithRuntime(ctx, mission, { integrationLeaseUntil: until, updatedAt: now });
+    // The mission document is controller authority. Avoid rewriting its rich
+    // runtime projection on every compact lease pulse.
+    await ctx.db.patch(mission._id, { integrationLeaseUntil: until, updatedAt: now });
     return true;
   },
 });
@@ -320,6 +406,8 @@ export const prepare = mutation({
       || args.effectId.length < 1 || args.effectId.length > 300
       || !SHA.test(args.preparedIntegrationHeadSha) || !SHA.test(args.preparedIntegrationTreeSha)
       || !DIGEST.test(args.requestDigest)
+      || attempt.controlRequested && !await ctx.db.query("integrationProviderEffects")
+        .withIndex("by_attempt_effect", (q: any) => q.eq("integrationAttemptId", attempt._id).eq("effectId", args.effectId)).first()
       || (args.effectKind === "update_ref" && args.expectedIntegrationRefSha !== attempt.expectedIntegrationRefSha)) return null;
     const existing: any = await ctx.db.query("integrationProviderEffects")
       .withIndex("by_attempt_effect", (q: any) => q.eq("integrationAttemptId", attempt._id).eq("effectId", args.effectId)).first();
@@ -331,6 +419,7 @@ export const prepare = mutation({
         && existing.headSha === args.preparedIntegrationHeadSha && existing.treeSha === args.preparedIntegrationTreeSha;
       return same ? { replay: true, observation: existing.observation ?? null } : null;
     }
+    if (Number(attempt.providerEffectCount ?? 0) >= MAX_PROVIDER_EFFECTS) return null;
     const now = Date.now();
     await ctx.db.insert("integrationProviderEffects", {
       integrationAttemptId: attempt._id,
@@ -382,6 +471,133 @@ export const observe = mutation({
   },
 });
 
+async function queueSteeredContinuation(ctx: any, job: any, now: number) {
+  const nextAttempt = Number(job.attempt ?? 1) + 1;
+  const existing = await ctx.db.query("workAttempts")
+    .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", nextAttempt)).first();
+  if (!existing) await ctx.db.insert("workAttempts", {
+    jobId: job._id, attempt: nextAttempt, parentAttempt: job.attempt ?? 1, status: "pending",
+    workspaceLineage: job.workspaceLineage,
+    workspaceKey: job.workspaceLineage ? attemptWorkspaceKey(job.workspaceLineage, nextAttempt) : undefined,
+    workerBranch: job.workerBranch, sourceHeadSha: job.sourceHeadSha,
+    lastEventSeq: 0, livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now,
+  });
+  await patchJobWithRuntime(ctx, job, {
+    status: "pending", stage: "queued", progress: "provider truth reconciled — steering continuation queued",
+    attempt: nextAttempt, startedAt: undefined, completedAt: undefined, nextRunAt: now,
+    integrationAttemptId: undefined, integrationState: undefined, activeDeliveryAttemptId: undefined,
+    reviewReceiptId: undefined, reviewReceiptDigest: undefined, reviewReceiptSignature: undefined,
+    verificationVerdict: undefined, verificationNote: undefined, verifiedAt: undefined,
+    dispatchId: undefined, dispatchLeaseUntil: undefined, workerRunId: undefined, deliveryRunId: undefined,
+    deliveryLeaseOwner: undefined, deliveryLeaseToken: undefined, deliveryLeaseUntil: undefined,
+    heartbeatAt: now,
+  });
+}
+
+async function finalizeMissionControlIfSettled(ctx: any, mission: any) {
+  const requested = mission?.controlRequested as "pause" | "cancel" | undefined;
+  if (!requested) return;
+  const attempts = await ctx.db.query("integrationAttempts")
+    .withIndex("by_mission_generation", (q: any) => q.eq("missionId", mission._id)).take(100);
+  if (attempts.some((attempt: any) => attempt.controlRequested)) return;
+  const now = Date.now();
+  const jobs = await ctx.db.query("jobs").withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id))).take(100);
+  for (const child of jobs) {
+    if (["done", "error", "cancelled"].includes(child.status)) continue;
+    await patchJobWithRuntime(ctx, child, requested === "pause" ? {
+      status: "paused", stage: "paused", progress: "Goal Mode paused after provider reconciliation",
+      nextRunAt: undefined, deliveryLeaseOwner: undefined, deliveryLeaseToken: undefined, deliveryLeaseUntil: undefined,
+    } : {
+      status: "cancelled", stage: "cancelled", progress: "Goal Mode cancelled after provider reconciliation",
+      completedAt: now, nextRunAt: undefined, deliveryLeaseOwner: undefined, deliveryLeaseToken: undefined, deliveryLeaseUntil: undefined,
+    });
+  }
+  await patchMissionWithRuntime(ctx, mission, requested === "pause" ? {
+    status: "paused", phase: "paused", controlRequested: undefined, controlRequestedAt: undefined,
+    activeIntegrationAttemptId: undefined, integrationLeaseOwner: undefined, integrationLeaseToken: undefined,
+    integrationLeaseUntil: undefined, updatedAt: now,
+  } : {
+    status: "cancelled", phase: "cancelled", controlRequested: undefined, controlRequestedAt: undefined,
+    activeIntegrationAttemptId: undefined, integrationLeaseOwner: undefined, integrationLeaseToken: undefined,
+    integrationLeaseUntil: undefined, completedAt: now, updatedAt: now,
+  });
+}
+
+async function settleRequestedControlWithoutRef(ctx: any, attempt: any, mission: any, job: any) {
+  const control = attempt.controlRequested as "pause" | "cancel" | "steer" | undefined;
+  if (!control) return false;
+  const effects = await ctx.db.query("integrationProviderEffects")
+    .withIndex("by_attempt_prepared", (q: any) => q.eq("integrationAttemptId", attempt._id)).collect();
+  if (effects.some((effect: any) => !effect.observation || effect.observation === "unknown")) return false;
+  if (effects.some((effect: any) => effect.effectKind === "update_ref" && effect.observation === "applied")) return false;
+  const now = Date.now();
+  const delivery: any = job.activeDeliveryAttemptId ? await ctx.db.get(job.activeDeliveryAttemptId) : null;
+  if (control === "pause") {
+    await ctx.db.patch(attempt._id, {
+      status: "queued", controlRequested: undefined, controlRequestedAt: undefined,
+      reconcileAfter: undefined,
+      controllerRunId: undefined, leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined,
+      retryReason: "paused after exact provider reconciliation", updatedAt: now,
+    });
+    if (delivery?.integrationAttemptId === attempt._id) await ctx.db.patch(delivery._id, {
+      status: "checkpointed", leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined,
+      retryReason: "paused after exact provider reconciliation", heartbeatAt: now, updatedAt: now,
+    });
+    await patchJobWithRuntime(ctx, job, {
+      status: "paused", stage: "paused", progress: "paused after exact provider reconciliation",
+      integrationState: "queued", nextRunAt: undefined, deliveryRunId: undefined,
+      deliveryLeaseOwner: undefined, deliveryLeaseToken: undefined, deliveryLeaseUntil: undefined,
+      heartbeatAt: now,
+    });
+    await patchMissionWithRuntime(ctx, mission, {
+      activeIntegrationAttemptId: undefined, integrationLeaseOwner: undefined, integrationLeaseToken: undefined,
+      integrationLeaseUntil: undefined, updatedAt: now,
+    });
+    await finalizeMissionControlIfSettled(ctx, { ...mission, activeIntegrationAttemptId: undefined });
+    return true;
+  }
+  const outcome = control === "cancel" ? "cancelled" : "stale";
+  const terminal = await writeIntegrationTerminalReceipt(ctx, attempt, outcome, {
+    reason: control === "cancel" ? "cancelled after exact provider reconciliation" : "superseded after exact provider reconciliation",
+  });
+  if (!terminal) return false;
+  await ctx.db.patch(attempt._id, {
+    status: outcome, outcome, terminalReceiptDigest: terminal.receiptDigest,
+    controlRequested: undefined, controlRequestedAt: undefined, reconcileAfter: undefined, controllerRunId: undefined,
+    leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined, completedAt: now, updatedAt: now,
+  });
+  if (delivery?.integrationAttemptId === attempt._id) await ctx.db.patch(delivery._id, {
+    status: "blocked", outcome, currentStep: "terminal", terminalReceiptDigest: terminal.receiptDigest,
+    leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined,
+    completedAt: now, heartbeatAt: now, updatedAt: now,
+  });
+  await patchMissionWithRuntime(ctx, mission, {
+    activeIntegrationAttemptId: undefined, integrationLeaseOwner: undefined, integrationLeaseToken: undefined,
+    integrationLeaseUntil: undefined, updatedAt: now,
+  });
+  if (control === "steer") await queueSteeredContinuation(ctx, job, now);
+  else await patchJobWithRuntime(ctx, job, {
+    status: "cancelled", stage: "cancelled", completedAt: now, nextRunAt: undefined,
+    integrationState: "cancelled", progress: "cancelled after exact provider reconciliation",
+    deliveryLeaseOwner: undefined, deliveryLeaseToken: undefined, deliveryLeaseUntil: undefined,
+  });
+  await wakeNextIntegration(ctx, attempt);
+  await finalizeMissionControlIfSettled(ctx, mission);
+  return true;
+}
+
+export const settleControl = mutation({
+  args: { ...fenceArgs },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const attempt: any = await ctx.db.get(args.id);
+    const mission: any = attempt ? await ctx.db.get(attempt.missionId) : null;
+    const job: any = attempt ? await ctx.db.get(attempt.jobId) : null;
+    if (!job || !exactFence(mission, attempt, args, job)) return false;
+    return await settleRequestedControlWithoutRef(ctx, attempt, mission, job);
+  },
+});
+
 export const complete = mutation({
   args: { ...fenceArgs, effectId: v.string() },
   handler: async (ctx, args) => {
@@ -396,17 +612,23 @@ export const complete = mutation({
       || effect?.effectKind !== "update_ref" || effect.observation !== "applied"
       || effect.providerHeadSha !== attempt.preparedIntegrationHeadSha
       || String(mission.integrationHeadSha ?? ZERO_OID) !== attempt.expectedIntegrationRefSha) return false;
-    const terminal = await writeIntegrationTerminalReceipt(ctx, attempt, "integrated");
+    const requestedControl = attempt.controlRequested as "pause" | "cancel" | "steer" | undefined;
+    const terminalOutcome = requestedControl === "cancel" ? "cancelled" : requestedControl === "steer" ? "stale" : "integrated";
+    const terminal = await writeIntegrationTerminalReceipt(ctx, attempt, terminalOutcome, requestedControl
+      ? { reason: `${requestedControl} requested during the applied final CAS; provider truth reconciled first` }
+      : undefined);
     if (!terminal) return false;
     const now = Date.now();
     await ctx.db.patch(attempt._id, {
-      status: "integrated", outcome: "integrated", terminalReceiptDigest: terminal.receiptDigest,
+      status: terminalOutcome, outcome: terminalOutcome, terminalReceiptDigest: terminal.receiptDigest,
+      controlRequested: undefined, controlRequestedAt: undefined, reconcileAfter: undefined,
       leaseUntil: undefined, completedAt: now, updatedAt: now,
     });
     if (job.activeDeliveryAttemptId) {
       const delivery: any = await ctx.db.get(job.activeDeliveryAttemptId);
       if (delivery?.integrationAttemptId === attempt._id) await ctx.db.patch(delivery._id, {
-        status: "done", outcome: "mission_integrated", currentStep: "terminal",
+        status: requestedControl && requestedControl !== "pause" ? "blocked" : "done",
+        outcome: requestedControl === "cancel" ? "cancelled" : requestedControl === "steer" ? "stale" : "mission_integrated", currentStep: "terminal",
         terminalReceiptDigest: terminal.receiptDigest, completedAt: now,
         leaseUntil: undefined, updatedAt: now,
       });
@@ -417,19 +639,23 @@ export const complete = mutation({
       activeIntegrationAttemptId: undefined, integrationLeaseOwner: undefined, integrationLeaseToken: undefined,
       integrationLeaseUntil: undefined, updatedAt: now,
     });
-    await patchJobWithRuntime(ctx, job, {
-      status: "done", stage: "integrated", percent: 100, completedAt: now, heartbeatAt: now,
-      integrationState: "integrated", deliveryStatus: "merged", mergeCommitSha: attempt.preparedIntegrationHeadSha,
-      evidenceSummary: `review ${attempt.reviewReceiptDigest.slice(0, 12)} integrated at ${attempt.preparedIntegrationHeadSha.slice(0, 12)}`,
-      progress: "reviewed worker receipt integrated into the mission head",
+    if (requestedControl === "steer") await queueSteeredContinuation(ctx, job, now);
+    else await patchJobWithRuntime(ctx, job, {
+      status: requestedControl === "pause" ? "paused" : requestedControl === "cancel" ? "cancelled" : "done",
+      stage: requestedControl === "pause" ? "paused" : requestedControl === "cancel" ? "cancelled" : "integrated",
+      percent: requestedControl ? job.percent : 100, completedAt: requestedControl === "pause" ? undefined : now, heartbeatAt: now,
+      nextRunAt: undefined, integrationState: requestedControl === "cancel" ? "cancelled" : "integrated",
+      deliveryStatus: "merged", mergeCommitSha: attempt.preparedIntegrationHeadSha,
+      evidenceSummary: `review ${attempt.reviewReceiptDigest.slice(0, 12)} reconciled at ${attempt.preparedIntegrationHeadSha.slice(0, 12)}`,
+      progress: requestedControl ? `${requestedControl} preserved after the applied provider ref was reconciled` : "reviewed worker receipt integrated into the mission head",
     });
     const prior = await ctx.db.query("workReceipts")
       .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", attempt.workAttempt)).first();
     if (!prior) await ctx.db.insert("workReceipts", {
-      jobId: job._id, attempt: attempt.workAttempt, status: "succeeded",
+      jobId: job._id, attempt: attempt.workAttempt, status: terminalOutcome === "integrated" ? "succeeded" : terminalOutcome,
       acceptanceEvidence: [String(job.verificationNote ?? "controller review passed")],
       artifacts: [attempt.workerBranch, attempt.integrationBranch, attempt.preparedIntegrationHeadSha],
-      verification: "pass", deliveryOutcome: "mission_integrated",
+      verification: "pass", deliveryOutcome: terminalOutcome === "integrated" ? "mission_integrated" : terminalOutcome,
       terminalEventKey: `integration:${String(attempt._id)}:integrated`,
       resultDigest: terminal.receiptDigest, evidenceDigest: attempt.reviewReceiptDigest,
       reviewReceiptSignature: job.reviewReceiptSignature, reviewDiffSha256: attempt.reviewedDiffSha256,
@@ -440,6 +666,7 @@ export const complete = mutation({
       workerHead: attempt.reviewedHeadSha,
     });
     await wakeNextIntegration(ctx, attempt);
+    await finalizeMissionControlIfSettled(ctx, mission);
     return true;
   },
 });
@@ -621,10 +848,48 @@ export async function controlIntegrationForJob(ctx: any, job: any, action: "paus
   const mission: any = await ctx.db.get(attempt.missionId);
   const delivery: any = job.activeDeliveryAttemptId ? await ctx.db.get(job.activeDeliveryAttemptId) : null;
   const now = Date.now();
+  const effects = await ctx.db.query("integrationProviderEffects")
+    .withIndex("by_attempt_prepared", (q: any) => q.eq("integrationAttemptId", attempt._id)).collect();
+  const requiresReconciliation = effects.some((effect: any) => !effect.observation || effect.observation === "unknown"
+    || (effect.effectKind === "update_ref" && effect.observation === "applied"));
   if (mission?.activeIntegrationAttemptId === attempt._id) await patchMissionWithRuntime(ctx, mission, {
     activeIntegrationAttemptId: undefined, integrationLeaseOwner: undefined, integrationLeaseToken: undefined,
     integrationLeaseUntil: undefined, updatedAt: now,
   });
+  if (requiresReconciliation) {
+    const reconcileAfter = Math.max(now + 90_000,
+      Math.min(now + CONTROLLER_STATE_MS.provider, Number(attempt.controllerDeadlineAt ?? now)));
+    let nextDeliveryId = delivery?._id;
+    let nextGeneration = Number(delivery?.generation ?? job.deliveryGeneration ?? 1);
+    if (delivery && !["done", "blocked", "abandoned"].includes(delivery.status)) {
+      nextGeneration += 1;
+      nextDeliveryId = await ctx.db.insert("deliveryAttempts", {
+        jobId: job._id, sourceWorkAttempt: attempt.workAttempt, generation: nextGeneration,
+        policy: "mission_integration", status: "checkpointed", parentDeliveryAttemptId: delivery._id,
+        ...carriedIntegrationDelivery(delivery), heartbeatAt: now, retries: 0,
+        cumulativeRetries: Number(delivery.cumulativeRetries ?? 0), currentStep: "queued",
+        retryReason: `${action} requested; provider reconciliation required`, createdAt: now, updatedAt: now,
+      });
+      await ctx.db.patch(delivery._id, {
+        status: "abandoned", completedAt: now, leaseOwner: undefined, leaseToken: undefined,
+        leaseUntil: undefined, retryReason: `${action} requested during provider effect`, updatedAt: now,
+      });
+    }
+    await ctx.db.patch(attempt._id, {
+      status: "queued", controlRequested: action, controlRequestedAt: now, reconcileAfter,
+      leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined,
+      retryReason: `${action} requested; exact provider reconciliation pending`, updatedAt: now,
+    });
+    await patchJobWithRuntime(ctx, job, {
+      status: "pending", stage: `${action} requested`, progress: `${action} requested — reconciling an in-flight provider effect`,
+      integrationState: `${action}_requested`, nextRunAt: reconcileAfter,
+      activeDeliveryAttemptId: nextDeliveryId, deliveryGeneration: nextGeneration,
+      dispatchId: undefined, dispatchLeaseUntil: undefined, workerRunId: undefined, deliveryRunId: undefined,
+      deliveryLeaseOwner: undefined, deliveryLeaseToken: undefined, deliveryLeaseUntil: undefined,
+      heartbeatAt: now,
+    });
+    return { terminal: false, reconcile: true, outcome: `${action}_requested` };
+  }
   if (action === "pause") {
     await ctx.db.patch(attempt._id, {
       status: "queued", leaseOwner: undefined, leaseToken: undefined,
@@ -634,7 +899,7 @@ export async function controlIntegrationForJob(ctx: any, job: any, action: "paus
       status: "checkpointed", leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined,
       retryReason: "paused by job control", heartbeatAt: now, updatedAt: now,
     });
-    return { terminal: false };
+    return { terminal: false, reconcile: false };
   }
   const outcome = action === "steer" ? "stale" : "cancelled";
   const reason = action === "steer" ? "signed review superseded by job steering" : "cancelled by job control";

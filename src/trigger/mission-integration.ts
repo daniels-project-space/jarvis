@@ -49,6 +49,7 @@ export type ProviderWriteResult = Readonly<{
 export type IntegrationHooks = Readonly<{
   prepare(effect: ProviderEffect): Promise<{ replay: boolean; observation?: string | null } | null>;
   observe(observation: ProviderObservation): Promise<boolean>;
+  reconcileOnly?: boolean;
 }>;
 
 export type IntegrationAdapter = Readonly<{
@@ -112,11 +113,11 @@ export async function integrateReviewedWorker(
       return { status: "pending", reason: merged.reason ?? "integration sandbox could not prepare the exact merge" };
     }
 
-    if (merged.synthetic) {
-      const staged = await adapter.stageCandidate(merged, hooks);
-      if (staged.outcome !== "applied" || staged.providerHeadSha !== merged.headSha) {
-        return { status: "pending", reason: "synthetic integration object is not yet durably observable at its exact identity" };
-      }
+    // Deterministic preparation is read-only.  Fence a stale provider ref
+    // before creating any synthetic object or durable staging-effect row.
+    if (observedIntegration !== expectedRef && observedIntegration !== merged.headSha) {
+      if (hooks.reconcileOnly && merged.synthetic) await adapter.stageCandidate(merged, hooks);
+      return { status: "stale", reason: `integration ref changed: expected ${expectedRef ?? "absent"}, observed ${observedIntegration ?? "absent"}` };
     }
 
     const effectId = `update-ref:${receipt.integrationAttemptId}:${merged.headSha}`;
@@ -127,6 +128,26 @@ export async function integrateReviewedWorker(
       newHeadSha: merged.headSha,
       treeSha: merged.treeSha,
     });
+
+    // A prior controller may have advanced the exact deterministic head and
+    // crashed before durable observation. Reconstruct only that final effect;
+    // immutable staging objects need no second write in this path.
+    if (observedIntegration === merged.headSha) {
+      const prepared = await hooks.prepare(effect);
+      if (!prepared) return { status: "pending", reason: "final ref effect was not durably prepared" };
+      if (!await hooks.observe({ effectId, observation: "applied", providerHeadSha: merged.headSha, providerResponse: "reconciled:exact-ref" })) {
+        return { status: "pending", reason: "exact ref replay was observed but its durable observation fence was lost" };
+      }
+      return { status: "integrated", effectId, headSha: merged.headSha, treeSha: merged.treeSha };
+    }
+
+    if (merged.synthetic) {
+      const staged = await adapter.stageCandidate(merged, hooks);
+      if (staged.outcome !== "applied" || staged.providerHeadSha !== merged.headSha) {
+        return { status: "pending", reason: "synthetic integration object is not yet durably observable at its exact identity" };
+      }
+    }
+
     const prepared = await hooks.prepare(effect);
     if (!prepared) return { status: "pending", reason: "final ref effect was not durably prepared" };
 
@@ -144,11 +165,13 @@ export async function integrateReviewedWorker(
       if (current !== expectedRef) {
         return { status: "stale", reason: `prepared updateRefs CAS lost: observed ${current ?? "absent"}` };
       }
+      if (hooks.reconcileOnly) {
+        if (!await hooks.observe({ effectId, observation: "not_applied", providerResponse: "reconciled:exact-ref-still-at-base" })) {
+          return { status: "pending", reason: "control reconciliation could not persist the exact base observation" };
+        }
+        return { status: "pending", reason: "prepared updateRefs was exactly observed as not applied after control fencing" };
+      }
     }
-    if (observedIntegration !== expectedRef) {
-      return { status: "stale", reason: `integration ref changed: expected ${expectedRef ?? "absent"}, observed ${observedIntegration ?? "absent"}` };
-    }
-
     const workerImmediatelyBefore = await adapter.readRef(receipt.workerBranch);
     const integrationImmediatelyBefore = await adapter.readRef(receipt.integrationBranch);
     if (workerImmediatelyBefore !== receipt.reviewedHeadSha) {

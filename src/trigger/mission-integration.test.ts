@@ -106,4 +106,65 @@ describe("serialized integration provider protocol", () => {
     expect(result).toMatchObject({ status: "conflict", reason: "content conflict" });
     expect(h.calls).not.toContain("GRAPHQL");
   });
+
+  it("prechecks a stale integration ref before synthetic staging or effect preparation", async () => {
+    const h = harness({ integration: "f".repeat(40) });
+    vi.mocked(h.adapter.prepareMerge).mockResolvedValue({
+      status: "clean", headSha: MERGED, treeSha: MERGED_TREE, synthetic: true, candidate: {},
+    });
+    const prepare = vi.fn();
+    await expect(integrateReviewedWorker(receipt, h.adapter, { prepare, observe: vi.fn() })).resolves.toMatchObject({ status: "stale" });
+    expect(h.adapter.stageCandidate).not.toHaveBeenCalled();
+    expect(h.adapter.prepareRefEffect).not.toHaveBeenCalled();
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it("reconstructs and observes only the final effect when the deterministic head already exists", async () => {
+    const h = harness({ integration: MERGED });
+    vi.mocked(h.adapter.prepareMerge).mockResolvedValue({
+      status: "clean", headSha: MERGED, treeSha: MERGED_TREE, synthetic: true, candidate: {},
+    });
+    const prepare = vi.fn().mockResolvedValue({ replay: true, observation: "unknown" });
+    const observe = vi.fn().mockResolvedValue(true);
+    await expect(integrateReviewedWorker(receipt, h.adapter, { prepare, observe })).resolves.toMatchObject({ status: "integrated" });
+    expect(h.adapter.stageCandidate).not.toHaveBeenCalled();
+    expect(h.adapter.advanceRef).not.toHaveBeenCalled();
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(observe).toHaveBeenCalledWith(expect.objectContaining({ observation: "applied", providerHeadSha: MERGED }));
+  });
+
+  it("reconcile-only control observes a prepared final effect at the base without resending it", async () => {
+    const h = harness();
+    const observe = vi.fn().mockResolvedValue(true);
+    await expect(integrateReviewedWorker(receipt, h.adapter, {
+      reconcileOnly: true, prepare: vi.fn().mockResolvedValue({ replay: true, observation: "unknown" }), observe,
+    })).resolves.toMatchObject({ status: "pending" });
+    expect(h.adapter.advanceRef).not.toHaveBeenCalled();
+    expect(observe).toHaveBeenCalledWith(expect.objectContaining({ observation: "not_applied" }));
+  });
+
+  it("reconciles a provider callback barrier race without a second final write", async () => {
+    const h = harness();
+    let release!: () => void;
+    let applied!: () => void;
+    const providerApplied = new Promise<void>((resolve) => { applied = resolve; });
+    const callbackBarrier = new Promise<void>((resolve) => { release = resolve; });
+    vi.mocked(h.adapter.advanceRef).mockImplementation(async ({ newHeadSha }) => {
+      h.refs.set(receipt.integrationBranch, newHeadSha);
+      applied();
+      await callbackBarrier;
+      return { outcome: "applied", providerHeadSha: newHeadSha };
+    });
+    const first = integrateReviewedWorker(receipt, h.adapter, {
+      prepare: vi.fn().mockResolvedValue({ replay: false }), observe: vi.fn().mockResolvedValue(false),
+    });
+    await providerApplied;
+    const reconciled = await integrateReviewedWorker(receipt, h.adapter, {
+      reconcileOnly: true, prepare: vi.fn().mockResolvedValue({ replay: true, observation: null }), observe: vi.fn().mockResolvedValue(true),
+    });
+    expect(reconciled).toMatchObject({ status: "integrated", headSha: MERGED });
+    expect(h.adapter.advanceRef).toHaveBeenCalledTimes(1);
+    release();
+    await expect(first).resolves.toMatchObject({ status: "pending" });
+  });
 });

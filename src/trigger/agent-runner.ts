@@ -73,7 +73,7 @@ import {
 } from "./git-review-receipt";
 import { repositoryDeliveryReadiness, trustedGitReviewReceiptAuthority, verifyGitReviewReceiptEnvelope } from "./git-review-authority";
 import { integrateReviewedWorker } from "./mission-integration";
-import { createGitHubIntegrationAdapter } from "./github-integration-adapter";
+import { createGitHubIntegrationAdapter, GITHUB_REST_API_VERSION } from "./github-integration-adapter";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent in an isolated workspace (with optional repository and scoped MCP
@@ -164,26 +164,47 @@ async function chatThread(): Promise<string> {
   const t = await convexQuery("ui:getActiveThread", {});
   return typeof t === "string" && t ? t : "main";
 }
-function sh(cmd: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number | null; out: string }> {
+type BoundedProcess = { signal?: AbortSignal; timeoutMs?: number };
+
+function sh(cmd: string, args: string[], env: NodeJS.ProcessEnv, options: BoundedProcess = {}): Promise<{ code: number | null; out: string }> {
   return new Promise((res) => {
     const p = spawn(cmd, args, { env, stdio: ["ignore", "pipe", "pipe"] });
     let o = "";
+    let settled = false;
+    const finish = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
+      res({ code, out: o });
+    };
+    const abort = () => { try { p.kill("SIGKILL"); } catch { /* already exited */ } };
+    if (options.signal?.aborted) abort();
+    else options.signal?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(abort, Math.max(1, options.timeoutMs ?? 24 * 60 * 60_000));
+    timer.unref?.();
     p.stdout.on("data", (d) => (o += d.toString()));
     p.stderr.on("data", (d) => (o += d.toString()));
-    p.on("close", (code) => res({ code, out: o }));
-    p.on("error", () => res({ code: -1, out: o }));
+    p.on("close", (code) => finish(code));
+    p.on("error", () => finish(-1));
   });
 }
 
-function readGitObject(cwd: string, sha: string, env: NodeJS.ProcessEnv): Promise<Buffer> {
+function readGitObject(cwd: string, sha: string, env: NodeJS.ProcessEnv, options: BoundedProcess = {}): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const p = spawn("git", ["-C", cwd, "cat-file", "blob", sha], { env, stdio: ["ignore", "pipe", "pipe"] });
     const chunks: Buffer[] = [];
     let error = "";
+    const abort = () => { try { p.kill("SIGKILL"); } catch { /* already exited */ } };
+    if (options.signal?.aborted) abort();
+    else options.signal?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(abort, Math.max(1, options.timeoutMs ?? 90_000));
+    timer.unref?.();
+    const cleanup = () => { clearTimeout(timer); options.signal?.removeEventListener("abort", abort); };
     p.stdout.on("data", (data: Buffer) => chunks.push(Buffer.from(data)));
     p.stderr.on("data", (data) => { error += data.toString(); });
-    p.on("close", (code) => code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`git cat-file ${sha} failed (${String(code)}): ${error.slice(-500)}`)));
-    p.on("error", reject);
+    p.on("close", (code) => { cleanup(); code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`git cat-file ${sha} failed (${String(code)}): ${error.slice(-500)}`)); });
+    p.on("error", (error) => { cleanup(); reject(error); });
   });
 }
 
@@ -501,7 +522,7 @@ async function branchHasChanges(repo: string, branch: string, token: string): Pr
   const headers = {
     authorization: `Bearer ${token}`,
     accept: "application/vnd.github+json",
-    "x-github-api-version": "2022-11-28",
+    "x-github-api-version": GITHUB_REST_API_VERSION,
   };
   try {
     const metadata = await fetch(`https://api.github.com/repos/${repo}`, { headers });
@@ -938,7 +959,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           // controller generation below the 45s lease. A failed renewal is
           // deliberately not retried in a tight loop; the next effect's
           // linearization fails closed and the reaper owns recovery.
-          deliveryHeartbeat = setInterval(() => {
+          if (!integrationContinuation) deliveryHeartbeat = setInterval(() => {
             void (async () => {
               if (!await linearizeDelivery() || !deliveryLease) return;
               await convexMutation("jobs:touchDeliveryHeartbeat", {
@@ -948,7 +969,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               }).catch(() => undefined);
             })();
           }, 20_000);
-          deliveryHeartbeat.unref?.();
+          deliveryHeartbeat?.unref?.();
           // A continuation is allowed only when the exact cold record named
           // by the compact claim pointer still HMAC-verifies.  It is evidence
           // from the source work attempt, not a new specialist review.
@@ -1008,19 +1029,25 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               leaseVersion: Number(claimed.leaseVersion),
             };
             let integrationControllerState: "command" | "provider" | "reconcile" = "command";
-            let integrationDeadlineAt = Date.now() + 10 * 60_000;
+            const integrationAbort = new AbortController();
+            let stateTimer = setTimeout(() => integrationAbort.abort(new Error("integration command deadline exceeded")), 2 * 60_000);
+            stateTimer.unref?.();
             const heartbeatIntegration = () => convexMutation("goalIntegration:heartbeat", {
-              ...integrationFence, state: integrationControllerState, deadlineAt: integrationDeadlineAt,
-            }).catch(() => false);
+              ...integrationFence, state: integrationControllerState,
+            }).then((alive) => {
+              if (!alive) integrationAbort.abort(new Error("integration controller fence lost"));
+              return alive;
+            }).catch(() => { integrationAbort.abort(new Error("integration heartbeat failed")); return false; });
             if (!await heartbeatIntegration()) return;
-            const integrationHeartbeat = setInterval(() => { void heartbeatIntegration(); }, 15_000);
+            const integrationHeartbeat = setInterval(() => { void heartbeatIntegration(); }, 30_000);
             integrationHeartbeat.unref?.();
             try {
             const integrationDir = `/tmp/work/integration-${jobKey}-${Number(claimed.generation)}`;
             rmSync(integrationDir, { recursive: true, force: true });
             const remote = githubRepoUrl(repo);
             const gitEnv = githubGitEnv(env, String(token));
-            const cloned = await sh("git", ["clone", "--no-checkout", "--filter=blob:none", remote, integrationDir], gitEnv);
+            const cloned = await sh("git", ["clone", "--no-checkout", "--filter=blob:none", remote, integrationDir], gitEnv,
+              { signal: integrationAbort.signal, timeoutMs: 90_000 });
             if (cloned.code !== 0) {
               await convexMutation("goalIntegration:defer", {
                 ...integrationFence, reasonCode: "sandbox_checkout_failed", reason: cloned.out.slice(-500),
@@ -1031,7 +1058,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             await sh("git", ["-C", integrationDir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
             await sh("git", ["-C", integrationDir, "config", "user.name", "JARVIS integration controller"], env);
             const runIntegrationGit = (args: string[], commandEnv: NodeJS.ProcessEnv = gitEnv) =>
-              sh("git", ["-C", integrationDir, ...args], commandEnv);
+              sh("git", ["-C", integrationDir, ...args], commandEnv, { signal: integrationAbort.signal, timeoutMs: 90_000 });
             const adapter = createGitHubIntegrationAdapter({
               repository: repo,
               remote,
@@ -1040,11 +1067,15 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               createdAt: Number(claimed.createdAt ?? Date.now()),
               token: String(token),
               runGit: runIntegrationGit,
-              readGitObject: (sha) => readGitObject(integrationDir, sha, gitEnv),
+              readGitObject: (sha) => readGitObject(integrationDir, sha, gitEnv, { signal: integrationAbort.signal, timeoutMs: 90_000 }),
+              signal: integrationAbort.signal,
+              requestTimeoutMs: 90_000,
               gitEnv,
             });
             integrationControllerState = "provider";
-            integrationDeadlineAt = Date.now() + 6 * 60 * 60_000;
+            clearTimeout(stateTimer);
+            stateTimer = setTimeout(() => integrationAbort.abort(new Error("integration provider deadline exceeded")), 5 * 60_000);
+            stateTimer.unref?.();
             if (!await heartbeatIntegration()) return;
             const result = await integrateReviewedWorker({
               integrationAttemptId: String(job.integrationAttemptId),
@@ -1054,6 +1085,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               expectedIntegrationRefSha: String(claimed.expectedIntegrationRefSha),
               integrationBranch: String(claimed.integrationBranch), generation: Number(claimed.generation),
             }, adapter, {
+              reconcileOnly: Boolean(claimed.controlRequested),
               prepare: async (effect) => await convexMutation("goalIntegration:prepare", {
                 ...integrationFence, effectId: effect.effectId,
                 effectKind: effect.kind, provider: effect.provider,
@@ -1069,8 +1101,17 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               }).catch(() => false)),
             });
             integrationControllerState = "reconcile";
-            integrationDeadlineAt = Date.now() + 10 * 60_000;
+            clearTimeout(stateTimer);
+            stateTimer = setTimeout(() => integrationAbort.abort(new Error("integration reconciliation deadline exceeded")), 2 * 60_000);
+            stateTimer.unref?.();
             if (!await heartbeatIntegration()) return;
+            if (claimed.controlRequested) {
+              const settled = await convexMutation("goalIntegration:settleControl", integrationFence).catch(() => false);
+              if (settled) {
+                await drainGoalAdvances();
+                return;
+              }
+            }
             if (result.status === "integrated") {
               const completed = await convexMutation("goalIntegration:complete", {
                 ...integrationFence, effectId: result.effectId,
@@ -1090,6 +1131,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }).catch(() => false);
             return;
             } finally {
+              clearTimeout(stateTimer);
               clearInterval(integrationHeartbeat);
             }
           }

@@ -58,6 +58,24 @@ async function goalAwaitingPlan() {
   return { t, missionId: created.missionId };
 }
 
+async function splitGoal() {
+  const f = await goalAwaitingPlan();
+  const other = "daniels-project-space/jarvis";
+  const plan = {
+    summary: "Cross-project plan", route: "existing_project", primaryRepo: REPO, assumptions: [],
+    workstreams: [
+      { id: "catalog", label: "Catalog", task: "Edit catalog", agentId: "paul", repo: REPO, readonly: false, dependsOn: [], acceptanceCriteria: ["done"], mcp: [] },
+      { id: "jarvis", label: "Jarvis", task: "Edit Jarvis", agentId: "paul", repo: other, readonly: false, dependsOn: [], acceptanceCriteria: ["done"], mcp: [] },
+    ],
+    validation: { criteria: ["split"], tests: [], liveChecks: [] },
+  };
+  const result = await f.t.mutation(api.goalMode.recordPlan, {
+    id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
+  });
+  const parent: any = await f.t.run(async (ctx) => ctx.db.get(f.missionId));
+  return { ...f, plan, result, childIds: parent.splitChildMissionIds as any[] };
+}
+
 async function dispatch(t: ReturnType<typeof convexTest>, count: number, prefix: string) {
   const batches = await Promise.all([
     t.mutation(api.jobs.reserveDispatchBatch, { limit: count, reason: `${prefix}-a`, workerToken: TOKEN }),
@@ -153,6 +171,69 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(children).toHaveLength(2);
     expect(new Set(children.map((row) => row.primaryRepo))).toEqual(new Set([REPO, other]));
     expect(children.every((row) => row.status === "running" && row.phase === "planning" && row.planningJobId)).toBe(true);
+    expect(await f.t.mutation(api.goalMode.recordPlan, {
+      id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
+    })).toMatchObject({ advanced: false, stale: true });
+    expect((await f.t.run(async (ctx) => ctx.db.query("missions").collect())).filter((row) => row.parentMissionId === f.missionId)).toHaveLength(2);
+  });
+
+  it("durably rolls an all-done split into one bounded parent summary exactly once", async () => {
+    const f = await splitGoal();
+    await f.t.run(async (ctx) => {
+      for (const [index, childId] of f.childIds.entries()) await ctx.db.patch(childId, {
+        status: "done", phase: "complete", percent: 100, summary: `repository ${index + 1} passed independently`,
+        completedAt: Date.now(), updatedAt: Date.now(),
+      });
+    });
+    expect(await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN })).toMatchObject({ kind: "split_rollup", missionId: f.missionId });
+    const first: any = await f.t.run(async (ctx) => ({
+      parent: await ctx.db.get(f.missionId),
+      events: (await ctx.db.query("workEvents").collect()).filter((event) => event.missionId === String(f.missionId) && event.type === "goal_split_rollup"),
+    }));
+    expect(first.parent).toMatchObject({ status: "done", phase: "complete", percent: 100 });
+    expect(first.parent?.summary).toContain("repository 1 passed independently");
+    expect(first.parent?.summary).toContain("repository 2 passed independently");
+    await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN });
+    expect((await f.t.run(async (ctx) => ctx.db.query("workEvents").collect()))
+      .filter((event) => event.missionId === String(f.missionId) && event.type === "goal_split_rollup")).toHaveLength(1);
+  });
+
+  it("rolls one needs-input child into parent attention without combining repository heads", async () => {
+    const f = await splitGoal();
+    await f.t.run(async (ctx) => {
+      await ctx.db.patch(f.childIds[0], { status: "needs_input", phase: "blocked", percent: 40,
+        failureReason: "repository-specific human gate", updatedAt: Date.now() });
+    });
+    expect(await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN })).toMatchObject({ kind: "split_rollup" });
+    const parent: any = await f.t.run(async (ctx) => ctx.db.get(f.missionId));
+    expect(parent).toMatchObject({ status: "needs_input", phase: "blocked" });
+    expect(parent.failureReason).toContain("repository-specific human gate");
+    expect(parent.integrationHeadSha).toBeUndefined();
+    const children: any[] = await f.t.run(async (ctx) => Promise.all(f.childIds.map((id) => ctx.db.get(id))));
+    expect(children.map((child: any) => child?.integrationBranch)).toEqual([
+      expect.stringMatching(/^jarvis\/goal-/), expect.stringMatching(/^jarvis\/goal-/),
+    ]);
+    expect(new Set(children.map((child: any) => `${child.primaryRepo}:${child.integrationBranch}`)).size).toBe(2);
+    expect(new Set(children.map((child: any) => child.primaryRepo)).size).toBe(2);
+  });
+
+  it("propagates split-parent pause, resume and cancel idempotently to repository children", async () => {
+    const f = await splitGoal();
+    expect(await f.t.mutation(api.goalMode.control, { id: f.missionId, action: "pause", workerToken: TOKEN })).toBe(true);
+    expect(await f.t.mutation(api.goalMode.control, { id: f.missionId, action: "pause", workerToken: TOKEN })).toBe(true);
+    let state = await f.t.run(async (ctx) => ({ parent: await ctx.db.get(f.missionId), children: await Promise.all(f.childIds.map((id) => ctx.db.get(id))) }));
+    expect(state.parent).toMatchObject({ status: "paused", phase: "paused" });
+    expect(state.children.every((child: any) => child?.status === "paused")).toBe(true);
+    expect(await f.t.mutation(api.goalMode.control, { id: f.missionId, action: "resume", workerToken: TOKEN })).toBe(true);
+    expect(await f.t.mutation(api.goalMode.control, { id: f.missionId, action: "resume", workerToken: TOKEN })).toBe(true);
+    state = await f.t.run(async (ctx) => ({ parent: await ctx.db.get(f.missionId), children: await Promise.all(f.childIds.map((id) => ctx.db.get(id))) }));
+    expect(state.parent).toMatchObject({ status: "split", phase: "split" });
+    expect(state.children.every((child: any) => child?.status === "running")).toBe(true);
+    expect(await f.t.mutation(api.goalMode.control, { id: f.missionId, action: "cancel", workerToken: TOKEN })).toBe(true);
+    expect(await f.t.mutation(api.goalMode.control, { id: f.missionId, action: "cancel", workerToken: TOKEN })).toBe(true);
+    state = await f.t.run(async (ctx) => ({ parent: await ctx.db.get(f.missionId), children: await Promise.all(f.childIds.map((id) => ctx.db.get(id))) }));
+    expect(state.parent).toMatchObject({ status: "cancelled", phase: "cancelled" });
+    expect(state.children.every((child: any) => child?.status === "cancelled")).toBe(true);
   });
 
   it("fails closed when a mission review substitutes a source base other than the first bound head", async () => {
@@ -341,7 +422,9 @@ describe("real Convex multi-agent workspace and integration races", () => {
       expect(sha256(terminal.receiptJson)).toBe(terminal.receiptDigest);
       const canonical = JSON.parse(terminal.receiptJson);
       expect(canonical).toMatchObject({ outcome: "integrated", review: { digest: expect.stringMatching(/^[0-9a-f]{64}$/) } });
-      expect(canonical.providerEffects[0]).toMatchObject({ kind: "update_ref", observation: "applied" });
+      expect(canonical.providerEffects).toMatchObject({ count: 1, orderedEffectIdentityDigest: expect.stringMatching(/^[0-9a-f]{64}$/) });
+      expect(canonical.providerEffects.ordered[0]).toMatchObject({ kind: "update_ref", observation: "applied" });
+      expect(canonical.providerEffects.ordered[0]).not.toHaveProperty("providerResponse");
       expect(terminal.receiptDigest).not.toBe(canonical.review.digest);
       expect(terminal.receiptJson).not.toContain("lease-one");
       expect(terminal.receiptJson).not.toContain("lease-two-retry");
@@ -457,9 +540,10 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(await f.t.mutation(api.goalIntegration.complete, { ...fence, effectId })).toBe(true);
     const terminal = (await f.t.run(async (ctx) => ctx.db.query("integrationTerminalReceipts").collect()))[0];
     expect(terminal.receiptJson).not.toContain("lost-secret-token");
-    expect(JSON.parse(terminal.receiptJson).providerEffects).toEqual([
-      expect.objectContaining({ effectId, observation: "applied", providerResponse: "reconciled:exact-ref" }),
-    ]);
+    expect(JSON.parse(terminal.receiptJson).providerEffects).toMatchObject({
+      count: 1,
+      ordered: [expect.objectContaining({ effectId, observation: "applied", providerResponseDigest: sha256("reconciled:exact-ref") })],
+    });
   });
 
   it("charges only genuine ambiguous provider retries and emits an exhausted terminal receipt", async () => {
@@ -515,6 +599,8 @@ describe("real Convex multi-agent workspace and integration races", () => {
     ["steer", "response-lost"],
     ["cancel", "observed"],
   ] as const)("fences job-level %s control at %s integration state", async (action, stage) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-21T09:00:00Z"));
     const f = await plannedGoal();
     const specialists = await dispatch(f.t, 2, `control-${action}-${stage}-specialist`);
     const byId = new Map(f.jobs.map((job) => [String(job._id), job]));
@@ -551,27 +637,66 @@ describe("real Convex multi-agent workspace and integration races", () => {
       jobId: current.jobId, action, input: action === "steer" ? "replace the obsolete signed change" : undefined, workerToken: TOKEN,
     })).toBe(true);
     expect(await f.t.mutation(api.goalIntegration.complete, { ...fence, effectId })).toBe(false);
-    const state = await f.t.run(async (ctx) => ({
+    const fenced = await f.t.run(async (ctx) => ({
       attempt: await ctx.db.get(current._id), mission: await ctx.db.get(f.missionId), job: await ctx.db.get(current.jobId),
-      delivery: controller.claim!.activeDeliveryAttemptId ? await ctx.db.get(controller.claim!.activeDeliveryAttemptId) : null,
+      runtime: await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", current.jobId)).first(),
       next: await ctx.db.get(integrations[1].jobId), terminals: await ctx.db.query("integrationTerminalReceipts").collect(),
     }));
-    expect((state.attempt as any)?.leaseUntil).toBeUndefined();
-    expect((state.mission as any)?.activeIntegrationAttemptId).toBeUndefined();
+    expect((fenced.attempt as any)?.leaseUntil).toBeUndefined();
+    expect((fenced.mission as any)?.activeIntegrationAttemptId).toBeUndefined();
     if (action === "pause") {
-      expect(state.attempt).toMatchObject({ status: "queued" });
-      expect(state.job).toMatchObject({ status: "paused" });
-      expect(state.terminals).toHaveLength(0);
-    } else {
-      expect(state.attempt).toMatchObject({ status: action === "steer" ? "stale" : "cancelled" });
-      expect(state.delivery).toMatchObject({ status: "blocked", currentStep: "terminal" });
-      expect(state.next).toMatchObject({ integrationState: "queued" });
-      expect(state.terminals).toHaveLength(1);
-      expect(state.terminals[0].receiptJson).not.toContain(`secret-${action}-${stage}`);
+      expect(fenced.attempt).toMatchObject({ status: "queued" });
+      expect(fenced.job).toMatchObject({ status: "paused" });
+      expect(fenced.terminals).toHaveLength(0);
+      return;
     }
+    expect(fenced.attempt).toMatchObject({ status: "queued", controlRequested: action });
+    expect(fenced.job).toMatchObject({ status: "pending", integrationState: `${action}_requested`, attempt: 1 });
+    expect(fenced.runtime).toMatchObject({ status: "pending", nextRunAt: expect.any(Number), integrationAttemptId: current._id });
+    expect(fenced.next).toMatchObject({ integrationState: "provider_waiting" });
+    expect(fenced.terminals).toHaveLength(0);
+
+    vi.setSystemTime(Number((fenced.job as any).nextRunAt));
+    const [reconciler] = await dispatch(f.t, 2, `control-${action}-${stage}-reconciler`);
+    expect(String(reconciler.reservation.jobId)).toBe(String(current.jobId));
+    const recovered = await f.t.mutation(api.goalIntegration.claim, {
+      id: current._id, controllerRunId: String(reconciler.claim!.deliveryRunId),
+      leaseOwner: `reconcile-owner-${action}-${stage}`, leaseToken: `reconcile-token-${action}-${stage}`, workerToken: TOKEN,
+    });
+    const recoveredFence = { id: current._id, controllerRunId: recovered!.controllerRunId,
+      leaseOwner: recovered!.leaseOwner, leaseToken: recovered!.leaseToken,
+      leaseVersion: recovered!.leaseVersion, workerToken: TOKEN };
+    if (stage === "prepared") {
+      expect(await f.t.mutation(api.goalIntegration.observe, {
+        ...recoveredFence, effectId, observation: "not_applied", providerResponse: "reconciled:exact-ref-still-at-base",
+      })).toBe(true);
+      expect(await f.t.mutation(api.goalIntegration.settleControl, recoveredFence)).toBe(true);
+    } else {
+      if (stage === "response-lost") expect(await f.t.mutation(api.goalIntegration.observe, {
+        ...recoveredFence, effectId, observation: "applied", providerHeadSha: "a".repeat(40),
+        providerResponse: "reconciled:provider-callback-barrier",
+      })).toBe(true);
+      expect(await f.t.mutation(api.goalIntegration.complete, { ...recoveredFence, effectId })).toBe(true);
+    }
+    const state = await f.t.run(async (ctx) => {
+      const job: any = await ctx.db.get(current.jobId);
+      return { attempt: await ctx.db.get(current._id), mission: await ctx.db.get(f.missionId), job,
+        delivery: job?.activeDeliveryAttemptId ? await ctx.db.get(job.activeDeliveryAttemptId) : null,
+        next: await ctx.db.get(integrations[1].jobId), terminals: await ctx.db.query("integrationTerminalReceipts").collect(),
+        workAttempts: await ctx.db.query("workAttempts").collect() };
+    });
+    expect(state.attempt).toMatchObject({ status: action === "steer" ? "stale" : "cancelled" });
+    expect(state.next).toMatchObject({ integrationState: "queued" });
+    expect(state.terminals).toHaveLength(1);
+    expect(state.terminals[0].receiptJson).not.toContain(`secret-${action}-${stage}`);
+    if (stage !== "prepared") expect((state.mission as any).integrationHeadSha).toBe("a".repeat(40));
+    if (action === "steer") {
+      expect(state.job).toMatchObject({ status: "pending", attempt: 2 });
+      expect(state.workAttempts.filter((attempt) => attempt.jobId === current.jobId)).toHaveLength(2);
+    } else expect(state.job).toMatchObject({ status: "cancelled", attempt: 1 });
   });
 
-  it("keeps a healthy long provider wait leased only while causal heartbeats arrive", async () => {
+  it("uses a fixed server provider deadline and lets the public watchdog recover the same receipt", async () => {
     const f = await plannedGoal();
     const specialists = await dispatch(f.t, 2, "heartbeat-specialist");
     const byId = new Map(f.jobs.map((job) => [String(job._id), job]));
@@ -590,19 +715,111 @@ describe("real Convex multi-agent workspace and integration races", () => {
     });
     const fence = { id: integration._id, controllerRunId: claim!.controllerRunId, leaseOwner: claim!.leaseOwner,
       leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
-    for (let pulse = 0; pulse < 181; pulse += 1) {
+    expect(await f.t.mutation(api.goalIntegration.heartbeat, {
+      ...fence, state: "provider", deadlineAt: Date.now() + 5 * 60 * 60_000,
+    })).toBe(true);
+    const fixedDeadline = (await f.t.run(async (ctx) => ctx.db.get(integration._id)))!.controllerDeadlineAt;
+    expect(fixedDeadline).toBe(Date.now() + 5 * 60_000);
+    for (let pulse = 0; pulse < 6; pulse += 1) {
       vi.setSystemTime(Date.now() + 40_000);
       expect(await f.t.mutation(api.goalIntegration.heartbeat, {
         ...fence, state: "provider", deadlineAt: Date.now() + 5 * 60 * 60_000,
       })).toBe(true);
     }
     expect(await f.t.run(async (ctx) => ctx.db.get(integration._id))).toMatchObject({
-      controllerState: "provider", controllerHeartbeatAt: Date.now(),
+      controllerState: "provider", controllerHeartbeatAt: Date.now(), controllerDeadlineAt: fixedDeadline,
     });
-    vi.setSystemTime(Date.now() + 46_000);
+    vi.setSystemTime(Number(fixedDeadline) + 1);
     expect(await f.t.mutation(api.goalIntegration.heartbeat, {
-      ...fence, state: "provider", deadlineAt: Date.now() + 60_000,
+      ...fence, state: "provider", deadlineAt: Date.now() + 5 * 60 * 60_000,
     })).toBe(false);
+    const reaped = await f.t.mutation(api.jobs.reapStale, { workerToken: TOKEN });
+    expect(reaped.expiredControllers).toEqual([String(integration._id)]);
+    const recovered = await f.t.run(async (ctx) => ({
+      attempt: await ctx.db.get(integration._id), job: await ctx.db.get(integration.jobId),
+      deliveries: await ctx.db.query("deliveryAttempts").withIndex("by_job", (q) => q.eq("jobId", integration.jobId)).collect(),
+      workAttempts: await ctx.db.query("workAttempts").withIndex("by_job_attempt", (q) => q.eq("jobId", integration.jobId)).collect(),
+    }));
+    expect(recovered.attempt).toMatchObject({ status: "queued", expectedIntegrationRefSha: claim!.expectedIntegrationRefSha });
+    expect(recovered.job).toMatchObject({ status: "pending", deliveryGeneration: 2, attempt: 1, integrationAttemptId: integration._id });
+    expect(recovered.deliveries).toHaveLength(2);
+    expect(recovered.deliveries[1]).toMatchObject({ integrationAttemptId: integration._id, parentDeliveryAttemptId: recovered.deliveries[0]._id });
+    expect(recovered.workAttempts).toHaveLength(1);
+  });
+
+  it.each([
+    ["claimed", null, null],
+    ["stage-blob-prepared", "stage_blob", null],
+    ["stage-tree-prepared", "stage_tree", null],
+    ["stage-commit-prepared", "stage_commit", null],
+    ["final-prepared", "update_ref", null],
+    ["final-response-lost", "update_ref", "unknown"],
+    ["final-observed", "update_ref", "applied"],
+  ] as const)("recovers a controller crash at %s through jobs.reapStale without a specialist rerun", async (label, kind, observation) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-21T08:00:00Z"));
+    const f = await plannedGoal();
+    const specialists = await dispatch(f.t, 2, `${label}-specialist`);
+    const byId = new Map(f.jobs.map((job) => [String(job._id), job]));
+    for (let index = 0; index < specialists.length; index += 1) {
+      const entry = specialists[index];
+      await review(f.t, byId.get(String(entry.reservation.jobId))!, String(entry.claim!.workerRunId), String(index + 6).repeat(40), String(index + 8).repeat(40));
+    }
+    const integration = (await f.t.run(async (ctx) => ctx.db.query("integrationAttempts").collect()))
+      .sort((left, right) => left.generation - right.generation)[0];
+    const [controller] = await dispatch(f.t, 2, `${label}-controller`);
+    const firstClaim = await f.t.mutation(api.goalIntegration.claim, {
+      id: integration._id, controllerRunId: String(controller.claim!.deliveryRunId),
+      leaseOwner: `${label}-owner`, leaseToken: `${label}-token`, workerToken: TOKEN,
+    });
+    const firstFence = { id: integration._id, controllerRunId: firstClaim!.controllerRunId,
+      leaseOwner: firstClaim!.leaseOwner, leaseToken: firstClaim!.leaseToken,
+      leaseVersion: firstClaim!.leaseVersion, workerToken: TOKEN };
+    const effectId = `${label}-effect`;
+    const effectArgs = kind ? {
+      ...firstFence, effectId, effectKind: kind, provider: "github" as const,
+      providerIdentity: kind === "update_ref" ? "repo-node:refs/heads/integration" : `repo-node:${kind}:${"a".repeat(40)}`,
+      providerMethod: "POST" as const, providerTarget: kind === "update_ref" ? "https://api.github.com/graphql#updateRefs" : `/git/${kind}`,
+      requestDigest: "9".repeat(64), expectedIntegrationRefSha: kind === "update_ref" ? firstClaim!.expectedIntegrationRefSha : undefined,
+      preparedIntegrationHeadSha: "a".repeat(40), preparedIntegrationTreeSha: "b".repeat(40),
+    } : null;
+    if (effectArgs) expect(await f.t.mutation(api.goalIntegration.prepare, effectArgs)).toMatchObject({ replay: false });
+    if (effectArgs && observation) expect(await f.t.mutation(api.goalIntegration.observe, {
+      ...firstFence, effectId, observation,
+      providerHeadSha: observation === "applied" ? "a".repeat(40) : undefined,
+      providerResponse: observation === "unknown" ? "network:response-lost" : "exact-provider-response",
+    })).toBe(true);
+
+    vi.setSystemTime(Date.now() + 2 * 60_000 + 1);
+    expect((await f.t.mutation(api.jobs.reapStale, { workerToken: TOKEN })).expiredControllers).toEqual([String(integration._id)]);
+    const [reconciler] = await dispatch(f.t, 2, `${label}-reconciler`);
+    expect(String(reconciler.reservation.jobId)).toBe(String(integration.jobId));
+    const recovered = await f.t.mutation(api.goalIntegration.claim, {
+      id: integration._id, controllerRunId: String(reconciler.claim!.deliveryRunId),
+      leaseOwner: `${label}-owner-2`, leaseToken: `${label}-token-2`, workerToken: TOKEN,
+    });
+    const recoveredFence = { id: integration._id, controllerRunId: recovered!.controllerRunId,
+      leaseOwner: recovered!.leaseOwner, leaseToken: recovered!.leaseToken,
+      leaseVersion: recovered!.leaseVersion, workerToken: TOKEN };
+    if (effectArgs) {
+      expect(await f.t.mutation(api.goalIntegration.prepare, { ...effectArgs, ...recoveredFence })).toMatchObject({ replay: true, observation });
+      if (kind === "update_ref") {
+        if (observation !== "applied") expect(await f.t.mutation(api.goalIntegration.observe, {
+          ...recoveredFence, effectId, observation: "applied", providerHeadSha: "a".repeat(40), providerResponse: "reconciled:exact-ref",
+        })).toBe(true);
+        expect(await f.t.mutation(api.goalIntegration.complete, { ...recoveredFence, effectId })).toBe(true);
+      } else expect(await f.t.mutation(api.goalIntegration.observe, {
+        ...recoveredFence, effectId, observation: "applied", providerHeadSha: "a".repeat(40), providerResponse: "reconciled:exact-object",
+      })).toBe(true);
+    }
+    const state = await f.t.run(async (ctx) => ({
+      effects: await ctx.db.query("integrationProviderEffects").withIndex("by_attempt_prepared", (q) => q.eq("integrationAttemptId", integration._id)).collect(),
+      deliveries: await ctx.db.query("deliveryAttempts").withIndex("by_job", (q) => q.eq("jobId", integration.jobId)).collect(),
+      attempts: await ctx.db.query("workAttempts").withIndex("by_job_attempt", (q) => q.eq("jobId", integration.jobId)).collect(),
+    }));
+    expect(state.effects).toHaveLength(kind ? 1 : 0);
+    expect(state.deliveries).toHaveLength(2);
+    expect(state.attempts).toHaveLength(1);
   });
 
   it("fences stale controllers and creates one focused conflict repair without replaying siblings", async () => {
@@ -634,6 +851,22 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(await f.t.mutation(api.goalIntegration.observe, {
       ...fence, effectId: "prepared", observation: "applied", providerHeadSha: "a".repeat(40),
     })).toBe(false);
+    const pauseJob: any = await f.t.run(async (ctx) => ctx.db.get(integration.jobId));
+    vi.useFakeTimers();
+    vi.setSystemTime(Number(pauseJob.nextRunAt));
+    const [pauseReconciler] = await dispatch(f.t, 2, "pause-reconciler");
+    const pauseClaim = await f.t.mutation(api.goalIntegration.claim, {
+      id: integration._id, controllerRunId: String(pauseReconciler.claim!.deliveryRunId),
+      leaseOwner: "pause-reconcile-owner", leaseToken: "pause-reconcile-token", workerToken: TOKEN,
+    });
+    const pauseFence = { id: integration._id, controllerRunId: pauseClaim!.controllerRunId,
+      leaseOwner: pauseClaim!.leaseOwner, leaseToken: pauseClaim!.leaseToken,
+      leaseVersion: pauseClaim!.leaseVersion, workerToken: TOKEN };
+    expect(await f.t.mutation(api.goalIntegration.observe, {
+      ...pauseFence, effectId: "prepared", observation: "not_applied", providerResponse: "exact ref stayed at base",
+    })).toBe(true);
+    expect(await f.t.mutation(api.goalIntegration.settleControl, pauseFence)).toBe(true);
+    expect(await f.t.run(async (ctx) => ctx.db.get(f.missionId))).toMatchObject({ status: "paused" });
     expect(await f.t.mutation(api.goalMode.control, { id: f.missionId, action: "resume", workerToken: TOKEN })).toBe(true);
     const [resumedController] = await dispatch(f.t, 2, "controller-resumed");
     const resumedClaim = await f.t.mutation(api.goalIntegration.claim, {

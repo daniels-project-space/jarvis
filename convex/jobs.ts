@@ -9,7 +9,7 @@ import { normalizeWorkModelTier } from "../src/lib/work-models";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
 import { attemptWorkspaceKey, workItemIdentity } from "../src/lib/workspace-protocol";
-import { controlIntegrationForJob, queueReviewedIntegration } from "./goalIntegration";
+import { controlIntegrationForJob, queueReviewedIntegration, recoverExpiredIntegrationController } from "./goalIntegration";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
 import { hasAttemptBudget, isMeaningfulWorkProgress } from "../src/lib/work-attempt";
 import { claimDisposition, completionReceiptAllowed, isSha256Digest, replayEnvelope, shouldAdvanceAttempt } from "../src/lib/durable-attempt-protocol";
@@ -1277,6 +1277,15 @@ export const reapStale = mutation({
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const now = Date.now();
+    const expiredControllers: string[] = [];
+    for (const status of ["claimed", "prepared", "provider_waiting"] as const) {
+      const attempts = await ctx.db.query("integrationAttempts")
+        .withIndex("by_status_created", (q: any) => q.eq("status", status)).take(100);
+      for (const attempt of attempts) {
+        const recovered = await recoverExpiredIntegrationController(ctx, attempt, now);
+        if (recovered) expiredControllers.push(String(recovered.integrationAttemptId));
+      }
+    }
     const dispatching = await ctx.db
       .query("jobRuntime")
       .withIndex("by_status_dispatch_lease", (q: any) => q.eq("status", "dispatching").lte("dispatchLeaseUntil", now))
@@ -1430,7 +1439,7 @@ export const reapStale = mutation({
         nextAttempt > (j.maxAttempts ?? 12) ? "Retry budget exhausted" : `Recovered as attempt ${nextAttempt}`,
         { stage: nextAttempt > (j.maxAttempts ?? 12) ? "error" : "queued", evidenceKind: "watchdog", eventKey: `recovery:${j.attempt ?? 1}:${nextAttempt}` });
     }
-    return { requeued, abandoned, stalled, releasedDispatches };
+    return { requeued, abandoned, stalled, releasedDispatches, expiredControllers };
   },
 });
 
@@ -1539,6 +1548,14 @@ export const touchDeliveryHeartbeat = mutation({
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt || !hasLiveControllerFence(row, delivery, a)
       || delivery.status !== "running") return false;
     const now = Date.now();
+    if (delivery.integrationAttemptId) {
+      const integration: any = await ctx.db.get(delivery.integrationAttemptId);
+      const mission: any = integration ? await ctx.db.get(integration.missionId) : null;
+      if (!integration || !mission || integration.controllerRunId !== delivery.deliveryRunId
+        || Number(integration.leaseUntil ?? 0) < now || Number(integration.controllerDeadlineAt ?? 0) <= now
+        || integration.controlRequested || mission.activeIntegrationAttemptId !== integration._id
+        || Number(mission.integrationLeaseUntil ?? 0) < now) return false;
+    }
     await ctx.db.patch(delivery._id, { heartbeatAt: now, updatedAt: now });
     const runtime = await jobRuntimeFor(ctx, a.jobId);
     if (runtime) await ctx.db.patch(runtime._id, { heartbeatAt: now, updatedAt: now });
@@ -2160,6 +2177,14 @@ export const linearizeDelivery = mutation({
     );
     if (a.deliveryGeneration !== undefined && !deliveryClaimMatches(row, deliveryAttempt, a)) return null;
     const now = Date.now();
+    if (deliveryAttempt?.integrationAttemptId) {
+      const integration: any = await ctx.db.get(deliveryAttempt.integrationAttemptId);
+      const mission: any = integration ? await ctx.db.get(integration.missionId) : null;
+      if (!integration || !mission || integration.controllerRunId !== deliveryAttempt.deliveryRunId
+        || Number(integration.leaseUntil ?? 0) < now || Number(integration.controllerDeadlineAt ?? 0) <= now
+        || integration.controlRequested || mission.activeIntegrationAttemptId !== integration._id
+        || Number(mission.integrationLeaseUntil ?? 0) < now) return null;
+    }
     const sameOwner = row.deliveryLeaseOwner === a.deliveryLeaseOwner && row.deliveryLeaseToken === a.deliveryLeaseToken;
     const requestedVersion = Number(a.deliveryLeaseVersion ?? 0);
     const live = sameOwner && Number(row.deliveryLeaseUntil ?? 0) >= now && requestedVersion === Number(row.deliveryLeaseVersion);
@@ -2361,7 +2386,8 @@ export const control = mutation({
       return attempt;
     };
     if (a.action === "pause" && ["pending", "dispatching", "running", "steering"].includes(row.status)) {
-      await controlIntegrationForJob(ctx, row, "pause");
+      const integrationControl = await controlIntegrationForJob(ctx, row, "pause");
+      if (integrationControl?.reconcile) return true;
       if (["running", "steering"].includes(row.status) && !await closeAttempt("paused")) return false;
       if (["pending", "dispatching"].includes(row.status)) {
         const attempt = await ensureAttempt(ctx, a.jobId, row.attempt ?? 1, "queued", now);
@@ -2457,7 +2483,8 @@ export const control = mutation({
       }
     }
     else if (a.action === "cancel" && !["done", "error", "cancelled"].includes(row.status)) {
-      await controlIntegrationForJob(ctx, row, "cancel");
+      const integrationControl = await controlIntegrationForJob(ctx, row, "cancel");
+      if (integrationControl?.reconcile) return true;
       if (["running", "steering"].includes(row.status) && !await closeAttempt("cancelled")) return false;
       if (["pending", "dispatching", "paused"].includes(row.status)) await closeAttempt("cancelled");
       await patchJobWithRuntime(ctx, row, {
@@ -2525,7 +2552,15 @@ export const control = mutation({
     } else if (a.action === "steer" && ["pending", "dispatching", "running", "paused", "stalled", "steering"].includes(row.status)) {
       const steer = String(a.input ?? "").trim().slice(0, 2_000);
       if (!steer) return false;
-      await controlIntegrationForJob(ctx, row, "steer");
+      const integrationControl = await controlIntegrationForJob(ctx, row, "steer");
+      if (integrationControl?.reconcile) {
+        const reconciling: any = await ctx.db.get(row._id) ?? row;
+        await patchJobWithRuntime(ctx, reconciling, {
+          steer, steerRevision: (row.steerRevision ?? 0) + 1,
+          checkpoint: `${row.checkpoint ?? ""}\n\nDaniel steering instruction:\n${steer}`.trim().slice(-6_000),
+        });
+        return true;
+      }
       const running = row.status === "running";
       if (running && !await closeAttempt("steered")) return false;
       await patchJobWithRuntime(ctx, row, {

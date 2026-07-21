@@ -402,6 +402,8 @@ export default defineSchema({
     managerAgentId: v.optional(v.string()),
     parentMissionId: v.optional(v.id("missions")),
     splitChildMissionIds: v.optional(v.array(v.id("missions"))),
+    controlRequested: v.optional(v.string()),
+    controlRequestedAt: v.optional(v.number()),
     priority: v.optional(v.number()),
     risk: v.optional(v.string()),
     phase: v.optional(v.string()),
@@ -688,6 +690,9 @@ export default defineSchema({
     controllerStateSince: v.optional(v.number()),
     controllerDeadlineAt: v.optional(v.number()),
     controllerHeartbeatAt: v.optional(v.number()),
+    controlRequested: v.optional(v.string()), // pause | cancel | steer
+    controlRequestedAt: v.optional(v.number()),
+    reconcileAfter: v.optional(v.number()),
     effects: v.optional(v.array(v.object({
       effectId: v.string(),
       effectKind: v.string(),

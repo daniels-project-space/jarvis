@@ -1,3 +1,5 @@
+import { GITHUB_REST_API_VERSION } from "./github-integration-adapter";
+
 type FetchLike = typeof fetch;
 
 export type DeliveryEffect = Readonly<{
@@ -64,7 +66,7 @@ const apiHeaders = (token: string) => ({
   authorization: `Bearer ${token}`,
   accept: "application/vnd.github+json",
   "content-type": "application/json",
-  "x-github-api-version": "2022-11-28",
+  "x-github-api-version": GITHUB_REST_API_VERSION,
 });
 
 type PullPayload = {

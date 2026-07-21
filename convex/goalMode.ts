@@ -24,7 +24,7 @@ import {
 } from "./controlPlane";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { validateWorkDag, workItemIdentity } from "../src/lib/workspace-protocol";
-import { writeIntegrationTerminalReceipt } from "./goalIntegration";
+import { controlIntegrationForJob, writeIntegrationTerminalReceipt } from "./goalIntegration";
 
 const ADVANCE_LEASE_MS = 10 * 60 * 1000;
 const COORDINATOR_RECEIPT_FRESH_MS = 10 * 60 * 1000;
@@ -237,6 +237,49 @@ async function recordMissionEvent(ctx: any, missionId: string, type: string, mes
     data,
     createdAt: Date.now(),
   });
+}
+
+async function rollupSplitParent(ctx: any, parentOrId: any) {
+  const parent: any = typeof parentOrId === "object" ? parentOrId : await ctx.db.get(parentOrId);
+  if (!parent || !Array.isArray(parent.splitChildMissionIds) || !parent.splitChildMissionIds.length
+    || ["done", "cancelled"].includes(parent.status)) return false;
+  const children = (await Promise.all(parent.splitChildMissionIds.map((id: any) => ctx.db.get(id))))
+    .filter((child: any) => child && child.parentMissionId === parent._id);
+  if (children.length !== parent.splitChildMissionIds.length) return false;
+  const now = Date.now();
+  const percent = Math.round(children.reduce((sum: number, child: any) => sum + Number(child.percent ?? 0), 0) / children.length);
+  const summary = children.map((child: any) =>
+    `${child.primaryRepo ?? child.goal}: ${child.status}${child.summary ? ` — ${String(child.summary).slice(0, 700)}` : ""}`,
+  ).join("\n").slice(0, 4_000);
+  const requested = parent.controlRequested as "pause" | "cancel" | undefined;
+  let patch: Record<string, unknown>;
+  if (requested === "cancel" && children.every((child: any) => ["done", "cancelled"].includes(child.status))) {
+    patch = { status: "cancelled", phase: "cancelled", percent, summary, controlRequested: undefined,
+      controlRequestedAt: undefined, completedAt: now, updatedAt: now };
+  } else if (requested === "pause" && children.every((child: any) => ["paused", "done", "cancelled"].includes(child.status))) {
+    patch = { status: "paused", phase: "paused", percent, summary, controlRequested: undefined,
+      controlRequestedAt: undefined, pausedPhase: "split", updatedAt: now };
+  } else if (children.every((child: any) => child.status === "done")) {
+    patch = { status: "done", phase: "complete", percent: 100, summary, failureReason: undefined,
+      completedAt: now, updatedAt: now };
+  } else {
+    const blocked = children.filter((child: any) => ["needs_input", "failed", "error"].includes(child.status));
+    if (blocked.length) {
+      const reason = blocked.map((child: any) => `${child.primaryRepo ?? child.goal}: ${child.failureReason ?? child.summary ?? child.status}`).join("; ").slice(0, 2_000);
+      patch = { status: "needs_input", phase: "blocked", pausedPhase: "split", percent, summary,
+        failureReason: reason, updatedAt: now };
+    } else {
+      patch = { status: "split", phase: "split", percent, summary, updatedAt: now };
+    }
+  }
+  const changed = Object.entries(patch).some(([key, value]) => key !== "updatedAt" && parent[key] !== value);
+  if (!changed) return false;
+  await patchMissionWithRuntime(ctx, parent, patch);
+  await recordMissionEvent(ctx, String(parent._id), "goal_split_rollup",
+    `Repository child missions rolled up as ${String(patch.status)}`, String(patch.phase), Number(patch.percent), {
+      children: children.map((child: any) => ({ id: String(child._id), repository: child.primaryRepo, status: child.status })),
+    });
+  return true;
 }
 
 export const create = mutation({
@@ -570,6 +613,10 @@ export const claimAdvance = mutation({
   handler: async (ctx, args) => {
     requireWorker(args.workerToken);
     const now = Date.now();
+    const splitParents = await ctx.db.query("missions").withIndex("by_status", (q: any) => q.eq("status", "split")).take(100);
+    for (const parent of splitParents) {
+      if (await rollupSplitParent(ctx, parent)) return { kind: "split_rollup", missionId: parent._id };
+    }
     const running = await ctx.db
       .query("missionRuntime")
       .withIndex("by_status", (q: any) => q.eq("status", "running"))
@@ -1074,6 +1121,7 @@ export const recordValidation = mutation({
       await recordMissionEvent(ctx, String(args.id), "goal_complete", "Sol validation passed the complete outcome", "complete", 100, {
         evidence: validation.evidence,
       });
+      if (mission.parentMissionId) await rollupSplitParent(ctx, mission.parentMissionId);
       return { advanced: true, status: "done", summary: validation.summary };
     }
     const nextWave = Number(mission.revisionWave ?? 0) + 1;
@@ -1119,6 +1167,7 @@ export const recordValidation = mutation({
     });
     await upsertGoalAttention(ctx, mission, reason);
     await recordMissionEvent(ctx, String(args.id), "goal_needs_input", reason, "needs Daniel", mission.percent);
+    if (mission.parentMissionId) await rollupSplitParent(ctx, mission.parentMissionId);
     return { advanced: true, status: "needs_input", reason };
   },
 });
@@ -1635,7 +1684,94 @@ export const control = mutation({
       .withIndex("by_mission", (q: any) => q.eq("missionId", String(args.id)))
       .take(100);
     const now = Date.now();
+    if (Array.isArray(mission.splitChildMissionIds) && mission.splitChildMissionIds.length) {
+      if ((args.action === "pause" && mission.status === "paused")
+        || (args.action === "resume" && mission.status === "split")
+        || (args.action === "cancel" && mission.status === "cancelled")) return true;
+      let reconciliationPending = false;
+      for (const childId of mission.splitChildMissionIds) {
+        const child: any = await ctx.db.get(childId);
+        if (!child || child.parentMissionId !== mission._id) return false;
+        const childJobs = await ctx.db.query("jobs")
+          .withIndex("by_mission", (q: any) => q.eq("missionId", String(child._id))).take(100);
+        if (args.action === "resume") {
+          if (child.status !== "paused") continue;
+          for (const childJob of childJobs) if (childJob.status === "paused") await resetGoalJob(ctx, childJob, now);
+          await patchMissionWithRuntime(ctx, child, {
+            status: "running", phase: child.pausedPhase ?? "planning", pausedPhase: undefined,
+            failureReason: undefined, updatedAt: now,
+          });
+          continue;
+        }
+        let childReconciliation = false;
+        for (const childJob of childJobs) {
+          const result = await controlIntegrationForJob(ctx, childJob, args.action);
+          childReconciliation ||= Boolean(result?.reconcile);
+        }
+        reconciliationPending ||= childReconciliation;
+        for (const childJob of childJobs) {
+          const current: any = await ctx.db.get(childJob._id);
+          if (!current || current.integrationState === `${args.action}_requested` || TERMINAL.has(current.status)) continue;
+          await patchJobWithRuntime(ctx, current, args.action === "pause" ? {
+            status: "paused", stage: "paused", progress: "split parent paused", nextRunAt: undefined,
+          } : {
+            status: "cancelled", stage: "cancelled", progress: "split parent cancelled", completedAt: now, nextRunAt: undefined,
+          });
+        }
+        await patchMissionWithRuntime(ctx, child, childReconciliation ? {
+          controlRequested: args.action, controlRequestedAt: now, pausedPhase: child.pausedPhase ?? child.phase,
+          activeIntegrationAttemptId: undefined, integrationLeaseOwner: undefined, integrationLeaseToken: undefined,
+          integrationLeaseUntil: undefined, updatedAt: now,
+        } : args.action === "pause" ? {
+          status: "paused", phase: "paused", pausedPhase: child.phase, updatedAt: now,
+        } : {
+          status: "cancelled", phase: "cancelled", completedAt: now, updatedAt: now,
+        });
+      }
+      await patchMissionWithRuntime(ctx, mission, args.action === "resume" ? {
+        status: "split", phase: "split", pausedPhase: undefined, controlRequested: undefined,
+        controlRequestedAt: undefined, failureReason: undefined, updatedAt: now,
+      } : reconciliationPending ? {
+        status: "split", phase: "split", controlRequested: args.action, controlRequestedAt: now,
+        pausedPhase: "split", updatedAt: now,
+      } : args.action === "pause" ? {
+        status: "paused", phase: "paused", pausedPhase: "split", updatedAt: now,
+      } : {
+        status: "cancelled", phase: "cancelled", completedAt: now, updatedAt: now,
+      });
+      await recordMissionEvent(ctx, String(mission._id), `goal_split_${args.action}`,
+        `Split parent ${args.action} propagated to ${mission.splitChildMissionIds.length} repository child missions`,
+        args.action, mission.percent, { reconciliationPending });
+      return true;
+    }
     let externalControl: "pause" | "resume" | "retry" | null = null;
+    if ((args.action === "pause" || args.action === "cancel") && !["done", "cancelled"].includes(mission.status)) {
+      let reconciliationPending = false;
+      for (const job of jobs) {
+        const result = await controlIntegrationForJob(ctx, job, args.action);
+        reconciliationPending ||= Boolean(result?.reconcile);
+      }
+      if (reconciliationPending) {
+        for (const job of jobs) {
+          const current: any = await ctx.db.get(job._id);
+          if (!current || current.integrationState === `${args.action}_requested` || TERMINAL.has(current.status)) continue;
+          await patchJobWithRuntime(ctx, current, args.action === "pause" ? {
+            status: "paused", stage: "paused", progress: "Goal Mode pause requested", nextRunAt: undefined,
+          } : {
+            status: "cancelled", stage: "cancelled", progress: "Goal Mode cancel requested", completedAt: now, nextRunAt: undefined,
+          });
+        }
+        await patchMissionWithRuntime(ctx, mission, {
+          controlRequested: args.action, controlRequestedAt: now,
+          pausedPhase: mission.pausedPhase ?? mission.phase,
+          activeIntegrationAttemptId: undefined, integrationLeaseOwner: undefined,
+          integrationLeaseToken: undefined, integrationLeaseUntil: undefined, updatedAt: now,
+        });
+        await recordMissionEvent(ctx, String(args.id), `${args.action}_requested`,
+          `Goal Mode ${args.action} is reconciling an in-flight provider effect`, String(mission.phase ?? "goal"), mission.percent);
+        return true;
+      }
+    }
     if (args.action === "pause" && mission.status === "running") {
       if (mission.externalRunId && mission.externalStatus !== "shipped") externalControl = "pause";
       await patchMissionWithRuntime(ctx, mission, {
