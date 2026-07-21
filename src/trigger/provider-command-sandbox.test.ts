@@ -19,6 +19,7 @@ import {
   PROVIDER_SANDBOX_SETUP,
   ProviderCandidateSandbox,
   createProviderToolSession,
+  providerSandboxRuntimeAvailable,
   readProviderSandboxReceipt,
   safeProviderToolEnv,
   validateProviderSandboxReceipt,
@@ -121,6 +122,10 @@ function gitMetadataReceipt(checkout: string): Record<string, string> {
 }
 
 describe("provider candidate command boundary", () => {
+  it("resolves the complete fixed system toolchain before reporting runtime availability", () => {
+    expect(providerSandboxRuntimeAvailable()).toBe(true);
+  });
+
   it("uses exact fixed argv namespaces, a narrow chroot, private proc, and no nested Codex or shell-evaluated candidate text", () => {
     expect(PROVIDER_NAMESPACE_FLAGS).toEqual([
       "--user", "--map-root-user", "--mount", "--pid", "--fork", "--kill-child=SIGKILL",

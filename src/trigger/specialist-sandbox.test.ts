@@ -1,6 +1,17 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -15,14 +26,27 @@ const codexBin = realpathSync(join(process.cwd(), "node_modules/.bin/codex"));
 
 function sandboxFixture() {
   const root = mkdtempSync(join(tmpdir(), "jarvis-sandbox-test-"));
-  roots.push(root);
+  const controllerHome = realpathSync(homedir());
+  const temporaryRoot = realpathSync(tmpdir());
+  if (controllerHome === temporaryRoot || controllerHome.startsWith(`${temporaryRoot}/`)) {
+    throw new Error("specialist test CODEX_HOME must model the non-temporary production wrapper home");
+  }
+  const codexHome = mkdtempSync(join(controllerHome, ".jarvis-specialist-test-codex-"));
+  const codexHomeStat = lstatSync(codexHome);
+  if (
+    codexHomeStat.isSymbolicLink()
+    || !codexHomeStat.isDirectory()
+    || (typeof process.getuid === "function" && codexHomeStat.uid !== process.getuid())
+  ) throw new Error("specialist test CODEX_HOME must be a fresh controller-owned directory");
+  roots.push(root, codexHome);
   return {
     root,
+    codexHome,
     env: {
       PATH: process.env.PATH,
       NODE_ENV: "test",
-      HOME: root,
-      CODEX_HOME: root,
+      HOME: codexHome,
+      CODEX_HOME: codexHome,
       CODEX_ACCESS_TOKEN: "synthetic-never-live",
       VAULT_ACCESS_TOKEN: "synthetic-controller-sentinel",
       CONVEX_DEPLOY_KEY_JARVIS_CANONICAL: "synthetic-controller-sentinel",
@@ -131,6 +155,8 @@ describe("specialist OS trust boundary", () => {
     ]);
     expect(invocation.env.CODEX_ACCESS_TOKEN).toMatch(/^eyJ/);
     expect(invocation.env.CODEX_ACCESS_TOKEN).not.toBe(fixture.env.CODEX_ACCESS_TOKEN);
+    expect(invocation.env.CODEX_HOME).toBe(fixture.codexHome);
+    expect(String(invocation.env.CODEX_HOME).startsWith(`${realpathSync(tmpdir())}/`)).toBe(false);
     expect(invocation.env.VAULT_ACCESS_TOKEN).toBeUndefined();
     expect(invocation.env.CONVEX_DEPLOY_KEY_JARVIS_CANONICAL).toBeUndefined();
     expect(invocation.args.join("\0")).not.toContain("synthetic-controller-sentinel");
@@ -163,30 +189,48 @@ describe("specialist OS trust boundary", () => {
 
   it("runs the pinned CLI's supported read-only legacy-Landlock profile", () => {
     const fixture = sandboxFixture();
-    const result = spawnSync(codexBin, [
-      "sandbox",
-      "-P",
-      ":read-only",
-      "-c",
-      "features.use_legacy_landlock=true",
-      "-C",
-      fixture.root,
-      "--",
-      "/usr/bin/env",
-      "-i",
-      `PATH=${String(process.env.PATH ?? "")}`,
-      `HOME=${fixture.root}`,
-      "node",
-      "-e",
-      'process.stdout.write("PINNED_READ_ONLY_OK")',
-    ], {
-      cwd: fixture.root,
-      env: { NODE_ENV: "test", PATH: process.env.PATH, HOME: fixture.root, CODEX_HOME: fixture.root },
-      encoding: "utf8",
-      timeout: 10_000,
-    });
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toBe("PINNED_READ_ONLY_OK");
+    const stdoutPath = join(fixture.root, "pinned-read-only.stdout");
+    const stderrPath = join(fixture.root, "pinned-read-only.stderr");
+    const stdout = openSync(stdoutPath, "wx", 0o600);
+    const stderr = openSync(stderrPath, "wx", 0o600);
+    let result: ReturnType<typeof spawnSync>;
+    try {
+      result = spawnSync(codexBin, [
+        "sandbox",
+        "-P",
+        ":read-only",
+        "-c",
+        "features.use_legacy_landlock=true",
+        "-C",
+        fixture.root,
+        "--",
+        "/usr/bin/env",
+        "-i",
+        `PATH=${String(process.env.PATH ?? "")}`,
+        `HOME=${fixture.root}`,
+        "node",
+        "-e",
+        'process.stdout.write("PINNED_READ_ONLY_OK")',
+      ], {
+        cwd: fixture.root,
+        env: {
+          NODE_ENV: "test",
+          PATH: process.env.PATH,
+          HOME: fixture.codexHome,
+          CODEX_HOME: fixture.codexHome,
+        },
+        stdio: ["ignore", stdout, stderr],
+        timeout: 10_000,
+      });
+    } finally {
+      closeSync(stdout);
+      closeSync(stderr);
+    }
+    const stderrReceipt = readFileSync(stderrPath, "utf8");
+    const stdoutReceipt = readFileSync(stdoutPath, "utf8");
+    expect(result.status, stderrReceipt).toBe(0);
+    expect(stderrReceipt).not.toContain("Refusing to create helper binaries under temporary dir");
+    expect(stdoutReceipt).toBe("PINNED_READ_ONLY_OK");
   });
 
   it("fails closed when the namespace executable is unavailable", async () => {

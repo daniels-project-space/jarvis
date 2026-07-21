@@ -37,6 +37,52 @@ const CAPABILITY_KEYS = ["CONVEX_DEPLOY_KEY", "TRIGGER_ACCESS_TOKEN"] as const;
 const REQUIRED_TOOLS = ["node", "npm", "npx", "git", "gh", "curl"] as const;
 const consumedReceiptNonces = new Set<string>();
 
+type ProviderCommandName = "node" | "npm" | "npx";
+
+type ProviderToolInvocation = Readonly<{
+  executable: string;
+  argvPrefix: readonly string[];
+}>;
+
+type ProviderToolchain = Readonly<Record<ProviderCommandName, ProviderToolInvocation>>;
+
+type ProviderToolCandidate = Readonly<{
+  lexical: string;
+  canonical: readonly string[];
+}>;
+
+/**
+ * These are system-image contracts, not search paths. In particular, npm and
+ * npx are accepted only when their fixed public alias resolves to the matching
+ * fixed npm CLI. The candidate's PATH is never consulted for discovery.
+ */
+const PROVIDER_TOOL_CANDIDATES: Readonly<Record<ProviderCommandName, readonly ProviderToolCandidate[]>> = Object.freeze({
+  node: Object.freeze([
+    Object.freeze({ lexical: "/usr/local/bin/node", canonical: Object.freeze(["/usr/local/bin/node"]) }),
+    Object.freeze({ lexical: "/usr/bin/node", canonical: Object.freeze(["/usr/bin/node"]) }),
+  ]),
+  npm: Object.freeze([
+    Object.freeze({
+      lexical: "/usr/local/bin/npm",
+      canonical: Object.freeze(["/usr/local/lib/node_modules/npm/bin/npm-cli.js"]),
+    }),
+    Object.freeze({
+      lexical: "/usr/bin/npm",
+      canonical: Object.freeze(["/usr/lib/node_modules/npm/bin/npm-cli.js"]),
+    }),
+  ]),
+  npx: Object.freeze([
+    Object.freeze({
+      lexical: "/usr/local/bin/npx",
+      canonical: Object.freeze(["/usr/local/lib/node_modules/npm/bin/npx-cli.js"]),
+    }),
+    Object.freeze({
+      lexical: "/usr/bin/npx",
+      canonical: Object.freeze(["/usr/lib/node_modules/npm/bin/npx-cli.js"]),
+    }),
+  ]),
+});
+
 export const PROVIDER_NAMESPACE_FLAGS = Object.freeze([
   "--user",
   "--map-root-user",
@@ -139,6 +185,7 @@ type RuntimePaths = Readonly<{
   devUrandom: string;
   etc: readonly EtcRuntimeEntry[];
   snapshotRoot: string;
+  tools: ProviderToolchain;
 }>;
 
 const FIXED_RUNTIME = Object.freeze({
@@ -459,6 +506,83 @@ function canonicalTrustedSystemPath(
     throw new Error(`${label} must not be group- or world-writable`);
   }
   return canonical;
+}
+
+function assertTrustedSystemParents(path: string, label: string): void {
+  if (!pathIsWithin(path, "/usr")) throw new Error(`${label} must remain beneath /usr`);
+  let cursor = "/";
+  for (const component of dirname(path).split("/").filter(Boolean)) {
+    cursor = join(cursor, component);
+    const stat = lstatSync(cursor);
+    if (
+      stat.isSymbolicLink()
+      || !stat.isDirectory()
+      || stat.uid !== 0
+      || (stat.mode & 0o022) !== 0
+    ) throw new Error(`${label} traverses an untrusted system directory`);
+  }
+}
+
+function resolveTrustedProviderTool(
+  command: ProviderCommandName,
+  readOnlyRuntimeRoots: readonly string[],
+): string {
+  for (const candidate of PROVIDER_TOOL_CANDIDATES[command]) {
+    let lexical;
+    try {
+      lexical = lstatSync(candidate.lexical);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw new Error(`provider ${command} executable could not be inspected`);
+    }
+    if (
+      (!lexical.isFile() && !lexical.isSymbolicLink())
+      || lexical.uid !== 0
+      || (lexical.isFile() && (lexical.mode & 0o022) !== 0)
+    ) throw new Error(`provider ${command} lexical executable is not root-owned and immutable`);
+    assertTrustedSystemParents(candidate.lexical, `provider ${command} lexical executable`);
+
+    const canonical = canonicalTrustedSystemPath(candidate.lexical, "file", `provider ${command} executable`);
+    if (!candidate.canonical.includes(canonical)) {
+      throw new Error(`provider ${command} executable resolved outside its exact system allowlist`);
+    }
+    assertTrustedSystemParents(canonical, `provider ${command} canonical executable`);
+    const canonicalStat = lstatSync(canonical);
+    if ((canonicalStat.mode & 0o111) === 0) throw new Error(`provider ${command} executable is not executable`);
+    if (!readOnlyRuntimeRoots.some((root) => pathIsWithin(canonical, root))) {
+      throw new Error(`provider ${command} executable is outside the read-only runtime`);
+    }
+    return canonical;
+  }
+  throw new Error(`provider ${command} executable is unavailable in every supported system location`);
+}
+
+function resolveProviderToolchain(paths: Pick<RuntimePaths, "usr" | "bin" | "lib" | "lib64">): ProviderToolchain {
+  const readOnlyRuntimeRoots = Object.freeze([paths.usr, paths.bin, paths.lib, paths.lib64]);
+  const node = resolveTrustedProviderTool("node", readOnlyRuntimeRoots);
+  const npm = resolveTrustedProviderTool("npm", readOnlyRuntimeRoots);
+  const npx = resolveTrustedProviderTool("npx", readOnlyRuntimeRoots);
+  // npm/npx are JavaScript entrypoints. Invoke them with the independently
+  // validated node binary so their shebang cannot resolve `node` through the
+  // candidate-controlled portion of PATH.
+  return Object.freeze({
+    node: Object.freeze({ executable: node, argvPrefix: Object.freeze([]) }),
+    npm: Object.freeze({ executable: node, argvPrefix: Object.freeze([npm]) }),
+    npx: Object.freeze({ executable: node, argvPrefix: Object.freeze([npx]) }),
+  });
+}
+
+function assertProviderToolchain(paths: RuntimePaths): void {
+  const current = resolveProviderToolchain(paths);
+  for (const command of ["node", "npm", "npx"] as const) {
+    const expected = paths.tools[command];
+    const observed = current[command];
+    if (
+      observed.executable !== expected.executable
+      || observed.argvPrefix.length !== expected.argvPrefix.length
+      || observed.argvPrefix.some((value, index) => value !== expected.argvPrefix[index])
+    ) throw new Error(`provider ${command} executable changed before launch`);
+  }
 }
 
 function canonicalOwnedDirectory(path: string, label: string): string {
@@ -783,7 +907,7 @@ function runtimePaths(sessionRoot: string): RuntimePaths {
     for (const required of ["etc/resolv.conf", "etc/hosts", "etc/nsswitch.conf", "etc/passwd", "etc/group"]) {
       if (!etc.some((entry) => entry.destination === required)) throw new Error(`provider runtime ${required} is unavailable`);
     }
-    const paths = Object.freeze({
+    const runtime = Object.freeze({
       unshare: canonicalTrustedSystemPath(FIXED_RUNTIME.unshare, "file", "unshare executable"),
       mount: canonicalTrustedSystemPath(FIXED_RUNTIME.mount, "file", "mount executable"),
       chroot: canonicalTrustedSystemPath(FIXED_RUNTIME.chroot, "file", "chroot executable"),
@@ -800,6 +924,10 @@ function runtimePaths(sessionRoot: string): RuntimePaths {
       devUrandom: canonicalTrustedSystemPath(FIXED_RUNTIME.devUrandom, "device", "runtime /dev/urandom"),
       etc: Object.freeze(etc),
       snapshotRoot: snapshot.root,
+    });
+    const paths: RuntimePaths = Object.freeze({
+      ...runtime,
+      tools: resolveProviderToolchain(runtime),
     });
     assertRuntimeSnapshots(paths);
     return paths;
@@ -830,17 +958,6 @@ function mkdirRootfs(rootfs: string, etc: readonly EtcRuntimeEntry[]): void {
   }
   writeFileSync(join(rootfs, "home/provider/.npmrc"), "", { mode: 0o600 });
   writeFileSync(join(rootfs, "home/provider/.gitconfig"), "", { mode: 0o600 });
-}
-
-function toolInsidePath(command: "node" | "npm" | "npx"): string {
-  const paths = {
-    node: "/usr/local/bin/node",
-    npm: "/usr/local/bin/npm",
-    npx: "/usr/local/bin/npx",
-  } as const;
-  const canonical = canonicalTrustedSystemPath(paths[command], "file", `provider ${command} executable`);
-  if (!canonical.startsWith("/usr/")) throw new Error(`provider ${command} executable is outside the read-only runtime`);
-  return canonical;
 }
 
 function strictCandidateEnv(input: {
@@ -1069,11 +1186,12 @@ export class ProviderCandidateSandbox {
       this.paths = paths;
     }
     assertRuntimeSnapshots(this.paths);
+    assertProviderToolchain(this.paths);
     return this.paths;
   }
 
   private runInternal(input: {
-    command: "node" | "npm" | "npx";
+    command: ProviderCommandName;
     args: readonly string[];
     timeoutMs: number;
     capability?: { name: ProviderCapabilityName; value: string };
@@ -1104,14 +1222,14 @@ export class ProviderCandidateSandbox {
         throw new Error("provider sandbox rootfs and candidate checkout must be disjoint");
       }
       mkdirRootfs(rootfs, paths.etc);
-      const insideCommand = toolInsidePath(input.command);
+      const tool = paths.tools[input.command];
       const env = strictCandidateEnv({ base: this.input.baseEnv, capability: input.capability, probe: input.probe });
       const etcArgs = paths.etc.flatMap((entry) => [entry.source, entry.destination]);
       const invocationArgs = [
         ...PROVIDER_NAMESPACE_FLAGS, "--", this.setup,
         rootfs, this.checkout, paths.usr, paths.bin, paths.lib, paths.lib64,
         paths.devNull, paths.devZero, paths.devRandom, paths.devUrandom,
-        String(paths.etc.length), ...etcArgs, insideCommand, ...args,
+        String(paths.etc.length), ...etcArgs, tool.executable, ...tool.argvPrefix, ...args,
       ];
       const commandDigest = createHash("sha256")
         .update(paths.unshare).update("\0").update(invocationArgs.join("\0"))
@@ -1244,7 +1362,7 @@ export class ProviderCandidateSandbox {
   }
 
   async run(input: {
-    command: "node" | "npm" | "npx";
+    command: ProviderCommandName;
     args: readonly string[];
     timeoutMs: number;
     capability?: { name: ProviderCapabilityName; value: string };
@@ -1321,6 +1439,7 @@ export function providerSandboxRuntimeAvailable(): boolean {
     );
     const paths = runtimePaths(root);
     assertRuntimeSnapshots(paths);
+    assertProviderToolchain(paths);
     return true;
   } catch {
     return false;
