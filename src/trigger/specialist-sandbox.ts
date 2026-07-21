@@ -1,13 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
-import {
-  closeSync,
-  lstatSync,
-  mkdtempSync,
-  openSync,
-  readFileSync,
-  rmSync,
-} from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { buildPrivateProcNamespaceInvocation } from "./codex-launcher";
 
@@ -15,7 +8,6 @@ const SYNTHETIC_CODEX_TOKEN = "eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDI0NDQ4MDB9.synt
 const REQUIRED_TOOLS = ["node", "npm", "npx", "git", "gh", "curl"] as const;
 const RECEIPT_PROTOCOL = 1;
 const RECEIPT_KIND = "jarvis-specialist-namespace-preflight";
-const RECEIPT_NAME = "namespace-preflight-receipt.json";
 const MAX_RECEIPT_BYTES = 16 * 1024;
 const MAX_RECEIPT_AGE_MS = 30_000;
 const consumedReceiptNonces = new Set<string>();
@@ -49,10 +41,9 @@ export type NamespaceObservation = {
 const NAMESPACE_PROBE_SOURCE = String.raw`
 const fs = require("node:fs");
 const { spawnSync } = require("node:child_process");
-const receiptName = String(process.env.JARVIS_NAMESPACE_PROBE_RECEIPT || "");
 const nonce = String(process.env.JARVIS_NAMESPACE_PROBE_NONCE || "");
 const outerPid = String(process.env.JARVIS_NAMESPACE_CONTROLLER_PID || "");
-if (!/^[a-f0-9]{64}$/.test(nonce) || !/^[a-z0-9.-]+$/.test(receiptName)) process.exit(70);
+if (!/^[a-f0-9]{64}$/.test(nonce) || !/^[1-9][0-9]*$/.test(outerPid)) process.exit(70);
 const numericPids = fs.readdirSync("/proc").filter((entry) => /^\d+$/.test(entry)).map(Number).sort((a, b) => a - b);
 let controllerVisible = false;
 try { fs.accessSync("/proc/" + outerPid + "/environ"); controllerVisible = true; } catch {}
@@ -93,17 +84,7 @@ const receipt = {
   selfPid: process.pid,
   tools,
 };
-const temporary = receiptName + ".tmp-" + nonce;
-const fd = fs.openSync(temporary, "wx", 0o600);
-try {
-  fs.writeFileSync(fd, JSON.stringify(receipt), "utf8");
-  fs.fsyncSync(fd);
-} finally {
-  fs.closeSync(fd);
-}
-fs.renameSync(temporary, receiptName);
-const directory = fs.openSync(".", "r");
-try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+process.stdout.write(JSON.stringify(receipt));
 `;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -130,6 +111,9 @@ export function validateNamespaceProbeReceipt(input: {
   startedAt: number;
   closedAt: number;
 }): NamespaceObservation {
+  const receiptBytes = Buffer.byteLength(input.raw, "utf8");
+  if (receiptBytes < 1) throw new Error("namespace preflight receipt is empty");
+  if (receiptBytes > MAX_RECEIPT_BYTES) throw new Error("namespace preflight receipt is oversized");
   let parsed: unknown;
   try {
     parsed = JSON.parse(input.raw);
@@ -200,35 +184,32 @@ export function validateNamespaceProbeReceipt(input: {
   return parsed as NamespaceObservation;
 }
 
-function readBoundedReceipt(path: string): string {
-  let stat;
-  try {
-    stat = lstatSync(path);
-  } catch {
-    throw new Error("namespace preflight receipt is missing");
-  }
-  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("namespace preflight receipt is not a regular file");
-  if (stat.size < 1) throw new Error("namespace preflight receipt is empty");
-  if (stat.size > MAX_RECEIPT_BYTES) throw new Error("namespace preflight receipt is oversized");
-  const fd = openSync(path, "r");
-  try {
-    return readFileSync(fd, "utf8");
-  } finally {
-    closeSync(fd);
-  }
-}
-
 async function runToClose(
   invocation: NamespaceProbeInvocation,
   timeoutMs: number,
-): Promise<{ code: number | null; error?: Error }> {
+): Promise<{ code: number | null; stdout: string; error?: Error }> {
   const child = spawn(invocation.command, invocation.args, {
     cwd: invocation.cwd,
     env: invocation.env,
-    stdio: ["ignore", "ignore", "ignore"],
+    stdio: ["ignore", "pipe", "pipe"],
   });
   let processError: Error | undefined;
   let timedOut = false;
+  let oversized = false;
+  let stdout = Buffer.alloc(0);
+  const appendStdout = (chunk: Buffer | string) => {
+    if (oversized) return;
+    const next = Buffer.concat([stdout, Buffer.from(chunk)]);
+    if (next.byteLength > MAX_RECEIPT_BYTES) {
+      oversized = true;
+      try { child.kill("SIGKILL"); } catch { /* close remains the barrier */ }
+      return;
+    }
+    stdout = next;
+  };
+  child.stdout.on("data", appendStdout);
+  // Always drain stderr so a rejected child cannot block its CLOSE event.
+  child.stderr.on("data", () => undefined);
   const timer = setTimeout(() => {
     timedOut = true;
     try { child.kill("SIGKILL"); } catch { /* close remains the barrier */ }
@@ -240,7 +221,10 @@ async function runToClose(
       clearTimeout(timer);
       resolve({
         code: timedOut ? -1 : code,
-        error: processError ?? (timedOut ? new Error("namespace preflight timed out") : undefined),
+        stdout: stdout.toString("utf8"),
+        error: processError
+          ?? (timedOut ? new Error("namespace preflight timed out") : undefined)
+          ?? (oversized ? new Error("namespace preflight receipt is oversized") : undefined),
       });
     });
   });
@@ -249,7 +233,8 @@ async function runToClose(
 /**
  * Build the deterministic preflight exactly as it runs in Trigger: fresh user,
  * mount, PID, and proc namespaces first, then pinned Codex on its existing
- * legacy-Landlock path. The probe may write only its fresh workspace receipt.
+ * legacy-Landlock read-only path. The bounded receipt is captured from stdout
+ * but is never parsed until the namespace process has emitted CLOSE.
  */
 export function buildSpecialistNamespaceProbeInvocation(input: {
   codexBin: string;
@@ -279,11 +264,9 @@ export function buildSpecialistNamespaceProbeInvocation(input: {
     args: [
       "sandbox",
       "-P",
-      ":workspace",
+      ":read-only",
       "-c",
       "features.use_legacy_landlock=true",
-      "-c",
-      "sandbox_workspace_write.network_access=false",
       "-C",
       cwd,
       "--",
@@ -291,7 +274,6 @@ export function buildSpecialistNamespaceProbeInvocation(input: {
       "-i",
       `PATH=${path}`,
       `HOME=${cwd}`,
-      `JARVIS_NAMESPACE_PROBE_RECEIPT=${RECEIPT_NAME}`,
       `JARVIS_NAMESPACE_PROBE_NONCE=${nonce}`,
       `JARVIS_NAMESPACE_CONTROLLER_PID=${String(input.controllerPid ?? process.pid)}`,
       "node",
@@ -330,8 +312,12 @@ export async function verifySpecialistSandboxIsolation(input: {
         reason: "specialist legacy-Landlock namespace is unavailable; E2B remains the unactivated provider-neutral fallback",
       };
     }
-    const raw = readBoundedReceipt(join(root, RECEIPT_NAME));
-    const observation = validateNamespaceProbeReceipt({ raw, expectedNonce: nonce, startedAt, closedAt });
+    const observation = validateNamespaceProbeReceipt({
+      raw: result.stdout,
+      expectedNonce: nonce,
+      startedAt,
+      closedAt,
+    });
     return { ok: true, observation };
   } catch {
     return {
