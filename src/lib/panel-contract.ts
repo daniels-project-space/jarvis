@@ -95,5 +95,8 @@ export function resolvePanelRoute(panel: PanelInput): PanelRoute {
   // Unknown future panel types intentionally use the markdown renderer. Give
   // that safe fallback the same side-stage geometry instead of hiding Jarvis.
   if (size === "h-full w-full" && renderer === "markdown") size = "w-[min(980px,97%)] h-[min(760px,94%)]";
-  return { renderer, semanticKind, size, keepOrbVisible: size !== "h-full w-full" && panel.type !== "video" };
+  // A chosen workspace never gets the whole cockpit: boards, travel, library
+  // and briefing surfaces compose with the particle core. Video is the one
+  // intentional full-bleed exception because its playback canvas needs it.
+  return { renderer, semanticKind, size, keepOrbVisible: panel.type !== "video" };
 }

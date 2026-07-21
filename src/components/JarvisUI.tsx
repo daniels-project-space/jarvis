@@ -3185,8 +3185,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             reduceMotion={prefs.reduceMotion}
           />
           <div
-            className={`h-full w-full transition-opacity duration-500 ${
-              fullBleed ? "pointer-events-none opacity-0" : compactAside || (commandExpanded && !overlayUp) ? "pointer-events-none opacity-0 md:opacity-100" : "opacity-100"
+            className={`transition-opacity duration-500 ${
+              fullBleed ? "pointer-events-none h-full w-full opacity-0" : compactAside ? "pointer-events-none absolute bottom-2 right-2 z-30 h-28 w-28 overflow-hidden rounded-full border border-cyan/25 bg-[#061019]/85 shadow-[0_0_34px_rgba(0,255,136,.18)] opacity-100 md:static md:h-full md:w-full md:overflow-visible md:rounded-none md:border-0 md:bg-transparent md:shadow-none" : commandExpanded && !overlayUp ? "pointer-events-none h-full w-full opacity-0 md:opacity-100" : "h-full w-full opacity-100"
             }`}
           >
             <ThreeOrb

@@ -45,7 +45,7 @@ type FakeElement = {
   type?: string;
 };
 
-function createLoader(options: { denyFirstRecognition?: boolean } = {}) {
+function createLoader(options: { denyFirstRecognition?: boolean; hostNodes?: unknown[] } = {}) {
   const messages: unknown[] = [];
   const listeners = new Map<string, LoaderListener[]>();
   const frameWindow = { postMessage: vi.fn((message: unknown) => messages.push(message)) };
@@ -89,7 +89,7 @@ function createLoader(options: { denyFirstRecognition?: boolean } = {}) {
       return node;
     }),
     querySelector: vi.fn(() => null),
-    querySelectorAll: vi.fn(() => []),
+    querySelectorAll: vi.fn(() => options.hostNodes ?? []),
     addEventListener: vi.fn((name: string, listener: LoaderListener) => {
       listeners.set(name, [...(listeners.get(name) ?? []), listener]);
     }),
@@ -183,6 +183,7 @@ describe("Project Hub Jarvis loader", () => {
     controls?.children[1].onclick?.();
     const editCard = harness.createdElements.find((element) => element.dataset.jarvisEditUi === "card");
     expect(editCard?.style.cssText).toContain("bottom:72px");
+    expect(controls?.children[1].attributes["aria-pressed"]).toBe("true");
   });
 
   it("captures the wake word in the top-level page and forwards the command", () => {
@@ -220,6 +221,31 @@ describe("Project Hub Jarvis loader", () => {
         elements: [],
       }),
     });
+  });
+
+  it("keeps password and payment controls out of the host-context contract", () => {
+    const secret = {
+      tagName: "INPUT",
+      type: "password",
+      name: "payment_card_number",
+      id: "checkout-card",
+      dataset: {},
+      closest: () => null,
+      getAttribute: (name: string) => name === "name" ? "payment_card_number" : null,
+    };
+    const harness = createLoader({ hostNodes: [secret] });
+    harness.listeners.get("message")?.[0]?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "ready" },
+    });
+
+    const contextMessage = harness.messages.find((message: any) => message?.jarvis === "host-context") as any;
+    expect(contextMessage.context.elements).toEqual([]);
+    expect(contextMessage.context.text).toBe("");
+    expect(loaderSource).not.toContain("document.body ? document.body.innerText");
+    expect(loaderSource).toContain("function isSensitiveElement(element)");
+    expect(loaderSource).toContain("tab to it and press Enter");
   });
 
   it("executes an app navigation, acknowledges it, and supports interruption", async () => {

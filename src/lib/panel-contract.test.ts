@@ -24,7 +24,7 @@ describe("semantic panel routing", () => {
     expect(route.keepOrbVisible).toBe(true);
   });
 
-  it.each(["trip", "fleet", "pdf", "site", "url", "code", "markdown"])(
+  it.each(["board", "canvas", "scene", "creations", "trip", "fleet", "pdf", "site", "url", "code", "markdown"])(
     "keeps Jarvis visible beside %s",
     (type) => {
       expect(resolvePanelRoute({ type, value: "" }).keepOrbVisible).toBe(true);

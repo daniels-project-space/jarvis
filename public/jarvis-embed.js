@@ -104,6 +104,11 @@
     wakeDot.style.boxShadow = awake
       ? "0 0 0 4px rgba(103,232,249,.1),0 0 16px rgba(103,232,249,.7)"
       : "0 0 0 4px rgba(148,163,184,.08)";
+    var selecting = Boolean(editSession);
+    selectorButton.setAttribute("aria-pressed", selecting ? "true" : "false");
+    selectorButton.title = selecting ? "Selection mode is on — point or tab to an element, then confirm" : "Select an element for Jarvis";
+    selectorButton.style.background = selecting ? "rgba(34,211,238,.18)" : "rgba(255,255,255,.045)";
+    selectorButton.style.boxShadow = selecting ? "inset 0 0 0 1px rgba(103,232,249,.42),0 0 18px rgba(34,211,238,.16)" : "none";
   }
 
   jarvisButton.onclick = function () {
@@ -160,8 +165,28 @@
     return parts.join(" > ");
   }
 
+  // Host context is useful only when it is safe to share. Never include a
+  // credential, payment or private field in the element index, selection or
+  // freeform page summary. Hosts can also opt an entire region out.
+  function isSensitiveElement(element) {
+    if (!element) return true;
+    if (element.closest && element.closest("[data-jarvis-private], [data-jarvis-no-context]")) return true;
+    var type = compact(element.type || (element.getAttribute && element.getAttribute("type")), 80).toLowerCase();
+    var autocomplete = compact(element.autocomplete || (element.getAttribute && element.getAttribute("autocomplete")), 120).toLowerCase();
+    var identity = compact([
+      element.name,
+      element.id,
+      element.getAttribute && element.getAttribute("name"),
+      element.getAttribute && element.getAttribute("aria-label"),
+      element.getAttribute && element.getAttribute("placeholder"),
+    ].join(" "), 500).toLowerCase();
+    return type === "password"
+      || /(?:password|passcode|secret|token|api[ _-]?key|auth|otp|one[ _-]?time)/.test(autocomplete)
+      || /(?:password|passcode|secret|token|api[ _-]?key|auth|otp|one[ _-]?time|credit[ _-]?card|card[ _-]?number|cvv|cvc|iban|payment|billing|bank[ _-]?account)/.test(identity);
+  }
+
   function elementLabel(element) {
-    if (!element) return "";
+    if (!element || isSensitiveElement(element)) return "";
     var dataLabel = element.dataset && element.dataset.jarvisLabel;
     return compact(
       dataLabel
@@ -176,6 +201,7 @@
   }
 
   function describeElement(element, index) {
+    if (isSensitiveElement(element)) return null;
     var sourceOwner = element && element.closest ? element.closest("[data-jarvis-source]") : null;
     var role = element && element.getAttribute ? element.getAttribute("role") : "";
     if (!role && element && element.tagName) {
@@ -206,8 +232,9 @@
       var nodes = document.querySelectorAll(selectors[group]);
       for (var i = 0; i < nodes.length && rows.length < 48; i++) {
         var node = nodes[i];
-        if (node === f || (node.closest && node.closest("[data-jarvis-edit-ui]"))) continue;
+        if (node === f || isSensitiveElement(node) || (node.closest && node.closest("[data-jarvis-edit-ui]"))) continue;
         var row = describeElement(node, i);
+        if (!row) continue;
         var key = row.id + "|" + row.label;
         if (!row.label || seen[key]) continue;
         seen[key] = true;
@@ -222,8 +249,19 @@
     var text = "";
     var app = "";
     try {
-      selection = compact(window.getSelection ? window.getSelection() : "", 1800);
-      text = compact(document.body ? document.body.innerText : "", 4500);
+      // A browser selection has no reliable field provenance across every
+      // host (a selected token can look exactly like a heading). Keep it out
+      // of the cross-origin contract; the safe element index below is the
+      // bounded context contract for editable controls.
+      var contextNodes = document.querySelectorAll ? document.querySelectorAll("[data-jarvis-context],main h1,main h2,main h3,main p,main [role='heading']") : [];
+      var textParts = [];
+      for (var i = 0; i < contextNodes.length && textParts.length < 24; i++) {
+        var node = contextNodes[i];
+        if (isSensitiveElement(node) || (node.closest && node.closest("[data-jarvis-edit-ui]"))) continue;
+        var part = compact(node.innerText || node.textContent, 260);
+        if (part) textParts.push(part);
+      }
+      text = compact(textParts.join(" · "), 2400);
       var appNode = document.querySelector ? document.querySelector("[data-jarvis-app]") : null;
       app = compact((appNode && appNode.dataset && appNode.dataset.jarvisApp) || configuredApp, 120);
     } catch {}
@@ -374,6 +412,7 @@
 
   function editCandidate(target) {
     if (!target || target === f) return null;
+    if (isSensitiveElement(target)) return null;
     if (target.closest && target.closest("[data-jarvis-edit-ui]")) return null;
     return target.closest
       ? target.closest("[data-jarvis-editable],[data-jarvis-source],button,a,input,textarea,select,[role],section,article,header,main")
@@ -388,6 +427,7 @@
     if (editSession.outline && editSession.outline.remove) editSession.outline.remove();
     if (editSession.card && editSession.card.remove) editSession.card.remove();
     editSession = null;
+    paintUniversalControls();
   }
 
   function startEditMode(instruction) {
@@ -421,7 +461,7 @@
       eyebrow.textContent = confirming ? "CONFIRM EDIT TARGET" : "JARVIS VISUAL EDIT";
       eyebrow.style.cssText = "color:#67e8f9;font:700 10px/1.2 ui-monospace,monospace;letter-spacing:.16em;margin-bottom:7px";
       var title = document.createElement("div");
-      title.textContent = selected ? elementLabel(selected) || "Selected element" : "Point at the exact element, then click it";
+      title.textContent = selected ? elementLabel(selected) || "Selected element" : "Point at the exact element, click it, or tab to it and press Enter";
       title.style.cssText = "font-size:14px;font-weight:650;color:#f2fbff;margin-bottom:4px";
       var meta = document.createElement("div");
       var descriptor = selected ? describeElement(selected, 0) : null;
@@ -473,25 +513,35 @@
       var candidate = editCandidate(event.target);
       if (candidate) paint(candidate);
     };
-    var click = function (event) {
-      if (event.target && event.target.closest && event.target.closest("[data-jarvis-edit-ui]")) return;
-      var candidate = editCandidate(event.target);
+    var selectCandidate = function (candidate, event) {
       if (!candidate) return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+      }
       selected = candidate;
       paint(selected);
       render(true);
     };
+    var click = function (event) {
+      if (event.target && event.target.closest && event.target.closest("[data-jarvis-edit-ui]")) return;
+      var candidate = editCandidate(event.target);
+      selectCandidate(candidate, event);
+    };
     var key = function (event) {
       if (event.key === "Escape") clearEditMode();
+      if ((event.key === "Enter" || event.key === " ") && !selected) {
+        var target = document.activeElement;
+        if (target && !(target.closest && target.closest("[data-jarvis-edit-ui]"))) selectCandidate(editCandidate(target), event);
+      }
     };
     editSession = { outline: outline, card: card, move: move, click: click, key: key };
     document.addEventListener("pointermove", move, true);
     document.addEventListener("click", click, true);
     document.addEventListener("keydown", key, true);
     render(false);
+    paintUniversalControls();
     return true;
   }
 
