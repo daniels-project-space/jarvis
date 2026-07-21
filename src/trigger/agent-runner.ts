@@ -66,6 +66,7 @@ import {
 import { wakeAgentFleet } from "../lib/agent-fleet-dispatch";
 import { upstreamEvidencePrompt } from "../lib/upstream-evidence";
 import { drainControlPlaneMigration } from "./control-plane-migration";
+import { ExecutionLeaseMonitor } from "./execution-lease-monitor";
 import {
   buildGitReviewReceipt,
   commandEvidenceFromCodexEvent,
@@ -106,16 +107,37 @@ function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, tier: 
   });
 }
 
-const gitReviewReceiptAuthority = createGitReviewReceiptAuthority();
+// This secret exists only in the controller worker environment and is removed
+// by isolateSubscriptionEnv before Codex is spawned. Random module keys make
+// resumed delivery receipts unverifiable, so repository delivery fails closed
+// if the stable controller authority is absent.
+const gitReviewReceiptAuthority = process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET
+  ? createGitReviewReceiptAuthority(process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET)
+  : null;
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
-const completionEvidence = (result: string, verificationNote: string, gitReview?: { envelope: GitReviewEnvelope; binding: GitReviewBinding }) => ({
-  resultDigest: sha256(result),
-  evidenceDigest: sha256(verificationNote),
+const normalizeCompletion = (result: string, verificationNote: string) => ({
+  result: String(result).slice(0, 4_000),
+  verificationNote: String(verificationNote).slice(0, 1_000),
+});
+const completionEvidence = (result: string, verificationNote: string, gitReview?: { envelope: GitReviewEnvelope; binding: GitReviewBinding }) => {
+  const normalized = normalizeCompletion(result, verificationNote);
+  // This recomputes SHA-256 from the exact post-truncation strings sent to
+  // Convex. A caller cannot reuse a digest computed for a longer/tampered body.
+  return {
+  resultDigest: sha256(normalized.result),
+  evidenceDigest: sha256(normalized.verificationNote),
   // These values are controller-created; Convex validates their exact
   // cryptographic form before making an immutable completion receipt.
   reviewReceiptSignature: gitReview?.envelope.signature,
   reviewDiffSha256: gitReview?.envelope.receipt.diffSha256,
-});
+  reviewReceiptJson: gitReview ? JSON.stringify(gitReview.envelope.receipt) : undefined,
+  };
+};
+const deliveryReceipt = (gitReview?: { envelope: GitReviewEnvelope; binding: GitReviewBinding }) => gitReview ? ({
+  reviewReceiptJson: JSON.stringify(gitReview.envelope.receipt),
+  reviewReceiptSignature: gitReview.envelope.signature,
+  reviewDiffSha256: gitReview.envelope.receipt.diffSha256,
+}) : null;
 async function convexMutation(path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
   if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
@@ -230,6 +252,7 @@ async function verifyWork(
 ): Promise<{ verdict: "pass" | "concerns" | "needs_input"; note: string; answer: string } | null> {
   let repositoryEvidence = "No repository checkout was in scope for this work.";
   if (gitReview) {
+    if (!gitReviewReceiptAuthority) return { verdict: "concerns", note: "The stable controller Git receipt authority is unavailable.", answer: "" };
     try {
       repositoryEvidence =
         "The following receipt was generated from the controller-owned hydrated checkout after the specialist exited, " +
@@ -782,35 +805,21 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       // loop. The HTTP query below is only a 2-minute fail-safe if the socket
       // has not delivered a snapshot (for example during a transient outage).
       const controlClient = new ConvexClient(CONVEX_URL);
-      let subscribedLease: any = null;
-      let lastKnownLease: any = null;
-      let lastKnownLeaseAt = 0;
-      let lastLeaseFallbackAt = 0;
       const workerToken = process.env.JARVIS_WORKER_TOKEN;
+      const leaseMonitor = new ExecutionLeaseMonitor(
+        expectedAttempt,
+        expectedSteerRevision,
+        async () => await convexQuery("jobs:executionLease", { jobId: job.jobId }),
+      );
       const unsubscribeLease = controlClient.onUpdate(
         api.jobs.executionLease,
         { jobId: job.jobId, workerToken },
         (lease) => {
-          subscribedLease = lease;
-          if (lease) { lastKnownLease = lease; lastKnownLeaseAt = Date.now(); }
+          leaseMonitor.observe(lease);
         },
-        () => { subscribedLease = null; },
+        () => { /* monitor retains only its bounded known-good snapshot */ },
       );
-      const executionStatus = async (): Promise<string> => {
-        let lease: any = subscribedLease ?? lastKnownLease;
-        const leaseFresh = Boolean(lease) && Date.now() - lastKnownLeaseAt <= 30_000;
-        if (!leaseFresh && Date.now() - lastLeaseFallbackAt >= 15_000) {
-          lastLeaseFallbackAt = Date.now();
-          try {
-            lease = await convexQuery("jobs:executionLease", { jobId: job.jobId });
-            if (lease) { lastKnownLease = lease; lastKnownLeaseAt = Date.now(); }
-          } catch { return "unknown"; }
-        }
-        if (!lease || (!leaseFresh && Date.now() - lastKnownLeaseAt > 30_000)) return "unknown";
-        if (!lease || Number(lease.attempt) !== expectedAttempt) return "superseded";
-        if (Number(lease.steerRevision ?? 0) !== expectedSteerRevision) return "steered";
-        return String(lease.status ?? "missing");
-      };
+      const executionStatus = async (): Promise<string> => await leaseMonitor.status();
       const stopIfLeaseLost = async (checkpoint: string, result: string, branch?: string | null): Promise<boolean> => {
         const state = await executionStatus();
         if (state === "running") return false;
@@ -1497,6 +1506,14 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const reviewEvidence = cumulativeWorkEvidence(job.checkpoint, result);
         let gitReview: { envelope: GitReviewEnvelope; binding: GitReviewBinding } | undefined;
         if (repoDir) {
+          if (!gitReviewReceiptAuthority) {
+            await convexMutation("jobs:checkpointAndRequeue", {
+              jobId: job.jobId, expectedAttempt,
+              checkpoint: "Repository delivery is held: JARVIS_GIT_REVIEW_RECEIPT_SECRET is unavailable in the trusted controller. Do not rerun the specialist.",
+              result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: failureBackoffMs(expectedAttempt),
+            }).catch(() => null);
+            return;
+          }
           const receipt = await buildGitReviewReceipt({
             runGit: (args) => sh("git", ["-C", repoDir!, ...args], env),
             jobId: String(job.jobId),
@@ -1657,6 +1674,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             expectedAttempt,
             result: result.slice(0, 4_000),
             verificationNote: verify.note || "Supervisor check passed before controller delivery",
+            ...(deliveryReceipt(gitReview) ?? {}),
           }).catch(() => false);
           if (!verificationPersisted) {
             deliveryBlocked = "the supervisor verdict could not be stored before delivery";

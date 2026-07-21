@@ -10,7 +10,7 @@ import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
 import { hasAttemptBudget, isMeaningfulWorkProgress } from "../src/lib/work-attempt";
-import { claimDisposition, completionReceiptAllowed, replayEnvelope, shouldAdvanceAttempt } from "../src/lib/durable-attempt-protocol";
+import { claimDisposition, completionReceiptAllowed, isSha256Digest, replayEnvelope, shouldAdvanceAttempt } from "../src/lib/durable-attempt-protocol";
 import {
   insertJobWithRuntime,
   jobRuntimeFor,
@@ -50,8 +50,14 @@ async function appendAttemptEvidence(ctx: any, row: any, type: string, message: 
   causationId?: string;
   data?: unknown;
   eventKey?: string;
+  attempt?: number;
 } = {}) {
-  const attemptNumber = row.attempt ?? 1;
+  // Mutations are serialized by Convex, but callers can hold a deliberately
+  // stale job object after a state transition. Read the authority row here so
+  // one job-wide cursor, rather than a per-attempt counter, orders every
+  // queue/launch/control/terminal event.
+  const durable = await ctx.db.get(row._id) ?? row;
+  const attemptNumber = options.attempt ?? row.attempt ?? 1;
   const causationId = options.causationId ?? `attempt:${String(row._id)}:${attemptNumber}`;
   const eventKey = options.eventKey ?? `${attemptNumber}:${type}:${eventIdentity(`${causationId}|${message}|${JSON.stringify(options.data ?? null)}`)}`;
   const existing = await ctx.db
@@ -60,8 +66,8 @@ async function appendAttemptEvidence(ctx: any, row: any, type: string, message: 
     .first();
   if (existing) return existing._id;
   const attempt = await attemptFor(ctx, row._id, attemptNumber);
-  const sequence = (attempt?.lastEventSeq ?? 0) + 1;
-  const predecessorKey = attempt?.lastEventKey;
+  const sequence = Number(durable.lifecycleSequence ?? 0) + 1;
+  const predecessorKey = durable.lifecycleEventKey;
   const id = await ctx.db.insert("workEvents", {
     jobId: String(row._id),
     missionId: row.missionId,
@@ -79,8 +85,19 @@ async function appendAttemptEvidence(ctx: any, row: any, type: string, message: 
     predecessorKey,
     createdAt: Date.now(),
   });
+  await ctx.db.patch(row._id, { lifecycleSequence: sequence, lifecycleEventKey: eventKey });
   if (attempt) await ctx.db.patch(attempt._id, { lastEventSeq: sequence, lastEventKey: eventKey, lastEventAt: Date.now() });
   return id;
+}
+
+async function ensureAttempt(ctx: any, jobId: any, attempt: number, status: string, now: number, patch: Record<string, unknown> = {}) {
+  const existing = await attemptFor(ctx, jobId, attempt);
+  if (existing) return existing;
+  const id = await ctx.db.insert("workAttempts", {
+    jobId, attempt, status, lastEventSeq: 0,
+    livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now, ...patch,
+  });
+  return { _id: id, jobId, attempt, status, ...patch };
 }
 
 const enqueueArgs = {
@@ -511,16 +528,14 @@ function claimedJob(j: any, upstreamEvidence: readonly any[] = []) {
 }
 
 async function upstreamEvidenceForClaim(ctx: any, j: any) {
-  const upstreamRows = j.missionId
-    ? await ctx.db.query("jobs").withIndex("by_mission", (q: any) => q.eq("missionId", j.missionId)).take(100)
-    : await Promise.all((j.dependsOn ?? []).slice(0, 8).map(async (dependency: string) => {
-        const id = ctx.db.normalizeId("jobs", dependency);
-        return id ? await ctx.db.get(id) : null;
-      }));
+  // Dependencies are an explicit contract, not an invitation to read all
+  // mission siblings. Preserve declared order so the claim snapshot is stable.
+  const upstreamRows = await Promise.all((j.dependsOn ?? []).slice(0, 8).map(async (dependency: string) => {
+    const id = ctx.db.normalizeId("jobs", dependency);
+    return id ? await ctx.db.get(id) : null;
+  }));
   return upstreamRows
     .filter((row: any) => row && row._id !== j._id && row.status === "done" && String(row.result ?? "").trim())
-    .sort((left: any, right: any) => Number(left.completedAt ?? left.createdAt ?? 0) - Number(right.completedAt ?? right.createdAt ?? 0))
-    .slice(-8)
     .map((row: any) => ({
       label: String(row.label ?? row.task ?? "Upstream workstream").slice(0, 120), status: row.status,
       result: String(row.result).slice(0, 1_400), verificationNote: String(row.verificationNote ?? "").slice(0, 300),
@@ -557,10 +572,7 @@ export const reserveDispatchBatch = mutation({
       });
       const attempt = await attemptFor(ctx, j._id, j.attempt ?? 1);
       if (attempt && !attempt.workerRunId) await ctx.db.patch(attempt._id, { status: "dispatching", dispatchId, lastEventAt: now });
-      else if (!attempt) await ctx.db.insert("workAttempts", {
-        jobId: j._id, attempt: j.attempt ?? 1, status: "dispatching", dispatchId,
-        lastEventSeq: 0, livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now,
-      });
+      else if (!attempt) await ensureAttempt(ctx, j._id, j.attempt ?? 1, "dispatching", now, { dispatchId });
       await appendAttemptEvidence(ctx, j, "dispatched", `Independent Trigger worker reserved${a.reason ? ` · ${a.reason.slice(0, 120)}` : ""}`, {
         stage: "dispatching", percent: Math.max(1, j.percent ?? 0), evidenceKind: "dispatch", eventKey: `dispatch:${j.attempt ?? 1}:${dispatchId}`,
       });
@@ -599,18 +611,25 @@ export const claimDispatched = mutation({
       jobStatus: j?.status ?? "missing", jobDispatchId: j?.dispatchId,
       requestDispatchId: a.dispatchId, requestWorkerRunId: a.workerRunId, attempt: priorAttempt,
     });
-    if (disposition === "replay") return claimedJob(j, replayEnvelope(priorAttempt?.upstreamEvidence, await upstreamEvidenceForClaim(ctx, j)));
+    // Do not execute a dependency query on a redelivery. The original response
+    // may have been lost after commit; this is an immutable replay envelope.
+    if (disposition === "replay") return claimedJob(j, priorAttempt?.upstreamEvidence ?? []);
     if (
       !j ||
       j.status !== "dispatching" ||
       j.dispatchId !== a.dispatchId ||
       (j.dispatchLeaseUntil ?? 0) < now
     ) return null;
-    if (priorAttempt?.workerRunId || priorAttempt?.dispatchId !== a.dispatchId) {
+    if (priorAttempt?.workerRunId || (priorAttempt?.dispatchId && priorAttempt.dispatchId !== a.dispatchId)) {
       // A stale platform redelivery must not replace the original workspace
       // or session receipt. It cannot cross the launch fence a second time.
       return null;
     }
+    // Legacy rows may have been reserved before attempt rows existed. Create
+    // that missing causal record before changing jobs to running; otherwise a
+    // lost response could strand a running job with no replay binding.
+    const attempt = priorAttempt ?? await ensureAttempt(ctx, a.jobId, attemptNumber, "dispatching", now, { dispatchId: a.dispatchId });
+    if (attempt.dispatchId && attempt.dispatchId !== a.dispatchId) return null;
     const upstreamEvidence = await upstreamEvidenceForClaim(ctx, j);
     await patchJobWithRuntime(ctx, j, {
       status: "running",
@@ -628,10 +647,10 @@ export const claimDispatched = mutation({
       dispatchId: a.dispatchId,
       workerRuntime: "trigger",
     });
-    // Bind dispatch and worker identities in the same transaction as the
-    // running transition. This makes an exact lost-response replay reachable.
-    if (!priorAttempt) return null; // only legacy rows without queue lineage
-    await ctx.db.patch(priorAttempt._id, {
+    // Bind dispatch, worker identities and the exact upstream snapshot in the
+    // same transaction as running. This makes exact lost-response replay
+    // reachable while fencing every competing delivery.
+    await ctx.db.patch(attempt._id, {
       status: "running",
       workspaceKey: `convex:${String(a.jobId)}:attempt:${j.attempt ?? 1}`,
       sessionId: a.workerRunId.slice(0, 120),
@@ -697,6 +716,7 @@ export const finalize = mutation({
     evidenceDigest: v.optional(v.string()),
     reviewReceiptSignature: v.optional(v.string()),
     reviewDiffSha256: v.optional(v.string()),
+    reviewReceiptJson: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
@@ -706,6 +726,11 @@ export const finalize = mutation({
     // A completed job is called "verified" only when the supervisor actually
     // returned pass. This invariant lives in Convex, not only in the runner.
     if (a.status === "done" && (a.verificationVerdict !== "pass" || !completionReceiptAllowed(a))) return false;
+    // Repository completion is impossible unless the controller persisted its
+    // signed checkout review before any delivery continuation. Convex checks
+    // immutable binding fields; the Trigger controller validates the HMAC with
+    // its private stable authority before it ever sends this mutation.
+    if (a.status === "done" && row.repo && (!row.reviewReceiptJson || !row.reviewReceiptSignature)) return false;
     const now = Date.now();
     const success = a.status === "done";
     const delivered = success && row.deliveryStatus === "merged";
@@ -988,6 +1013,10 @@ export const reapStale = mutation({
         requeued.push(j.task.slice(0, 80));
         const attempt = await attemptFor(ctx, j._id, j.attempt ?? 1);
         if (attempt) await ctx.db.patch(attempt._id, { status: "checkpointed", completedAt: now, lastEventAt: now });
+        await ensureAttempt(ctx, j._id, nextAttempt, "pending", now);
+        await appendAttemptEvidence(ctx, j, "queued", `Recovered attempt ${nextAttempt} queued`, {
+          stage: "queued", evidenceKind: "intent", eventKey: `intent:${nextAttempt}`, attempt: nextAttempt,
+        });
       }
       await appendAttemptEvidence(ctx, j, nextAttempt > (j.maxAttempts ?? 12) ? "abandoned" : "recovered",
         nextAttempt > (j.maxAttempts ?? 12) ? "Retry budget exhausted" : `Recovered as attempt ${nextAttempt}`,
@@ -1120,7 +1149,11 @@ export const checkpointAndRequeue = mutation({
           progress: `steering checkpoint saved · fresh attempt ${nextAttempt} queued`,
         });
         await appendAttemptEvidence(ctx, row, "steering_checkpoint", "Steering checkpoint saved before fresh scoped attempt", {
-          stage: "checkpointed", percent: row.percent, evidenceKind: "checkpoint", eventKey: `steering-checkpoint:${a.expectedAttempt}`,
+          stage: "checkpointed", percent: row.percent, evidenceKind: "checkpoint", eventKey: `steering-checkpoint:${a.expectedAttempt}`, attempt: a.expectedAttempt,
+        });
+        await ensureAttempt(ctx, a.jobId, nextAttempt, "pending", now);
+        await appendAttemptEvidence(ctx, row, "queued", `Fresh attempt ${nextAttempt} queued after steering`, {
+          stage: "queued", evidenceKind: "intent", eventKey: `intent:${nextAttempt}`, attempt: nextAttempt,
         });
         return { requeued: true, exhausted: false, stale: false };
       }
@@ -1184,7 +1217,13 @@ export const checkpointAndRequeue = mutation({
           ? `Checkpoint saved; attempt ${attempt}${delayMs ? ` eligible in ${Math.max(1, Math.ceil(delayMs / 60_000))}m` : " queued"}`
           : `Checkpoint saved; job ${requestedStatus}`,
       { stage: exhausted ? "error" : requestedStatus === "pending" ? "checkpointed" : requestedStatus,
-        percent: row.percent, evidenceKind: "checkpoint", eventKey: `checkpoint:${a.expectedAttempt}:${requestedStatus}` });
+        percent: row.percent, evidenceKind: "checkpoint", eventKey: `checkpoint:${a.expectedAttempt}:${requestedStatus}`, attempt: a.expectedAttempt });
+    if (status === "pending") {
+      await ensureAttempt(ctx, a.jobId, attempt, "pending", Date.now());
+      await appendAttemptEvidence(ctx, row, "queued", `Continuation attempt ${attempt} queued`, {
+        stage: "queued", evidenceKind: "intent", eventKey: `intent:${attempt}`, attempt,
+      });
+    }
     return { requeued: status === "pending", exhausted, stale: false };
   },
 });
@@ -1356,6 +1395,9 @@ export const markVerifiedForDelivery = mutation({
     expectedAttempt: v.number(),
     result: v.string(),
     verificationNote: v.string(),
+    reviewReceiptJson: v.optional(v.string()),
+    reviewReceiptSignature: v.optional(v.string()),
+    reviewDiffSha256: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
@@ -1365,6 +1407,16 @@ export const markVerifiedForDelivery = mutation({
     if (!isOwnedRepository(row.repo)) return false;
     if (classifyWorkSafety(row.task, { repo: row.repo }).approvalRequired) return false;
     if (row.deliveryMode !== "auto_merge" && row.goalStage !== "validating") return false;
+    if (!a.reviewReceiptJson || !isSha256Digest(a.reviewReceiptSignature) || !isSha256Digest(a.reviewDiffSha256)) return false;
+    let receipt: any;
+    try { receipt = JSON.parse(a.reviewReceiptJson); } catch { return false; }
+    if (
+      receipt?.jobId !== String(a.jobId)
+      || Number(receipt?.attempt) !== a.expectedAttempt
+      || receipt?.repository !== row.repo
+      || receipt?.diffSha256 !== a.reviewDiffSha256
+      || !isSha256Digest(receipt?.agentEvidenceSha256)
+    ) return false;
     const now = Date.now();
     await patchJobWithRuntime(ctx, row, {
       result: a.result.slice(0, 4_000),
@@ -1375,6 +1427,8 @@ export const markVerifiedForDelivery = mutation({
       progress: "supervisor passed — controller delivery in progress",
       percent: Math.max(96, row.percent ?? 0),
       heartbeatAt: now,
+      reviewReceiptJson: a.reviewReceiptJson.slice(0, 300_000),
+      reviewReceiptSignature: a.reviewReceiptSignature,
     });
     return true;
   },
@@ -1400,6 +1454,10 @@ export const control = mutation({
     };
     if (a.action === "pause" && ["pending", "dispatching", "running", "steering"].includes(row.status)) {
       if (["running", "steering"].includes(row.status) && !await closeAttempt("paused")) return false;
+      if (["pending", "dispatching"].includes(row.status)) {
+        const attempt = await ensureAttempt(ctx, a.jobId, row.attempt ?? 1, "queued", now);
+        await ctx.db.patch(attempt._id, { status: "paused", dispatchId: undefined, lastEventAt: now });
+      }
       await patchJobWithRuntime(ctx, row, {
         status: "paused",
         stage: "paused",
@@ -1407,11 +1465,13 @@ export const control = mutation({
         nextRunAt: undefined,
         dispatchId: undefined,
         dispatchLeaseUntil: undefined,
+        deliveryLeaseUntil: undefined,
+        deliveryLeaseToken: undefined,
       });
     }
     else if (a.action === "resume" && ["paused", "stalled"].includes(row.status)) {
       const previous = await attemptFor(ctx, a.jobId, row.attempt ?? 1);
-      if (previous && !previous.completedAt) return false;
+      if (previous && !previous.completedAt && previous.status !== "paused") return false;
       // A paused reservation never launched a worker and therefore must not
       // consume a retry budget. A closed launched workspace gets a fresh id.
       const nextAttempt = (row.attempt ?? 1) + (shouldAdvanceAttempt(Boolean(previous?.workerRunId)) ? 1 : 0);
@@ -1430,16 +1490,29 @@ export const control = mutation({
         dispatchId: undefined,
         dispatchLeaseUntil: undefined,
         workerRunId: undefined,
+        deliveryLeaseUntil: undefined,
+        deliveryLeaseToken: undefined,
       });
+      if (nextAttempt === (row.attempt ?? 1) && previous?.status === "paused") {
+        await ctx.db.patch(previous._id, { status: "queued", dispatchId: undefined, lastEventAt: now });
+      } else {
+        await ensureAttempt(ctx, a.jobId, nextAttempt, "pending", now);
+        await appendAttemptEvidence(ctx, row, "queued", `Fresh attempt ${nextAttempt} queued after ${row.status}`, {
+          stage: "queued", evidenceKind: "intent", eventKey: `intent:${nextAttempt}`, attempt: nextAttempt,
+        });
+      }
     }
     else if (a.action === "cancel" && !["done", "error", "cancelled"].includes(row.status)) {
       if (["running", "steering"].includes(row.status) && !await closeAttempt("cancelled")) return false;
+      if (["pending", "dispatching", "paused"].includes(row.status)) await closeAttempt("cancelled");
       await patchJobWithRuntime(ctx, row, {
         status: "cancelled",
         stage: "cancelled",
         completedAt: now,
         progress: "cancelled by Daniel",
         nextRunAt: undefined,
+        deliveryLeaseUntil: undefined,
+        deliveryLeaseToken: undefined,
       });
       const approvals = await ctx.db
         .query("approvals")
@@ -1467,7 +1540,10 @@ export const control = mutation({
         dispatchId: undefined,
         dispatchLeaseUntil: undefined,
         workerRunId: undefined,
+        deliveryLeaseUntil: undefined,
+        deliveryLeaseToken: undefined,
       });
+      await ensureAttempt(ctx, a.jobId, (row.attempt ?? 1) + 1, renewApproval ? "awaiting_approval" : "pending", now);
       if (renewApproval) {
         await ctx.db.insert("approvals", {
           jobId: String(a.jobId),
@@ -1479,7 +1555,7 @@ export const control = mutation({
           requestedAt: now,
         });
       }
-    } else if (a.action === "steer" && ["pending", "dispatching", "running", "paused", "stalled"].includes(row.status)) {
+    } else if (a.action === "steer" && ["pending", "dispatching", "running", "paused", "stalled", "steering"].includes(row.status)) {
       const steer = String(a.input ?? "").trim().slice(0, 2_000);
       if (!steer) return false;
       const running = row.status === "running";
@@ -1491,7 +1567,16 @@ export const control = mutation({
         steerRevision: (row.steerRevision ?? 0) + 1,
         checkpoint: `${row.checkpoint ?? ""}\n\nDaniel steering instruction:\n${steer}`.trim().slice(-6_000),
         progress: "Daniel supplied steering — the current attempt will checkpoint into a fresh scoped session",
+        deliveryLeaseUntil: undefined,
+        deliveryLeaseToken: undefined,
       });
+      if (running) {
+        const nextAttempt = (row.attempt ?? 1) + 1;
+        await ensureAttempt(ctx, a.jobId, nextAttempt, "queued", now);
+        await appendAttemptEvidence(ctx, row, "queued", `Fresh attempt ${nextAttempt} reserved for steering continuation`, {
+          stage: "queued", evidenceKind: "intent", eventKey: `intent:${nextAttempt}`, attempt: nextAttempt,
+        });
+      }
     } else return false;
     const retryNeedsApproval =
       a.action === "retry" && row.approvalRequired === true && row.approvalStatus !== "approved";

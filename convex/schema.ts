@@ -253,6 +253,18 @@ export default defineSchema({
     mergedAt: v.optional(v.number()),
     // Monotonic controller linearization token for consequential delivery.
     deliveryLeaseVersion: v.optional(v.number()),
+    // Controller-owned delivery lease.  The opaque token never reaches an
+    // agent sandbox; its version makes stale controller writes harmless.
+    deliveryLeaseOwner: v.optional(v.string()),
+    deliveryLeaseToken: v.optional(v.string()),
+    deliveryLeaseUntil: v.optional(v.number()),
+    // One job-wide causal cursor. Attempt cursors are retained for rolling
+    // compatibility, but new events are ordered against this single cursor.
+    lifecycleSequence: v.optional(v.number()),
+    lifecycleEventKey: v.optional(v.string()),
+    // A signed controller receipt is persisted before repository delivery.
+    reviewReceiptJson: v.optional(v.string()),
+    reviewReceiptSignature: v.optional(v.string()),
     verificationVerdict: v.optional(v.string()), // pass | unavailable
     verificationNote: v.optional(v.string()),
     verifiedAt: v.optional(v.number()),
@@ -322,6 +334,7 @@ export default defineSchema({
     deliveryStatus: v.optional(v.string()),
     mergeCommitSha: v.optional(v.string()),
     deliveryLeaseVersion: v.optional(v.number()),
+    deliveryLeaseUntil: v.optional(v.number()),
     startedAt: v.optional(v.number()),
     completedAt: v.optional(v.number()),
     createdAt: v.number(),
@@ -550,6 +563,11 @@ export default defineSchema({
     sessionId: v.optional(v.string()),
     workerRunId: v.optional(v.string()),
     dispatchId: v.optional(v.string()),
+    // Immutable claim envelope. Exact Trigger redelivery returns this exact
+    // snapshot and must never re-read changing dependencies.
+    upstreamEvidence: v.optional(v.array(v.object({
+      label: v.string(), status: v.string(), result: v.string(), verificationNote: v.string(),
+    }))),
     // The Trigger run is only delivery metadata. Sandbox/provider sessions
     // are deliberately separate identities for the sandbox adapter workstream.
     providerWorkspaceId: v.optional(v.string()),

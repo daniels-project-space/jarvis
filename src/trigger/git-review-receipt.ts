@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { redactSensitiveText } from "../lib/secret-redaction";
 import type { GitCommandResult, GitCommandRunner } from "../lib/git-delivery";
 
@@ -236,7 +236,12 @@ export async function buildGitReviewReceipt(input: BuildReceiptInput): Promise<B
   }
 }
 
-export function createGitReviewReceiptAuthority(secret: Uint8Array = randomBytes(32)) {
+/**
+ * The authority is controller configuration, never per-process randomness.
+ * Callers must fail closed when the Trigger-only secret is unavailable; a
+ * random key would make a resumed delivery unverifiable.
+ */
+export function createGitReviewReceiptAuthority(secret: Uint8Array | string) {
   const key = Buffer.from(secret);
   if (key.length < 32) throw new Error("Git review receipt authority requires at least 32 bytes");
 
