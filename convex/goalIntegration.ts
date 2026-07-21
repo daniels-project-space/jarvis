@@ -25,6 +25,24 @@ async function sha256Hex(value: string) {
   return Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+export async function integrationEffectManifest(effect: any) {
+  return {
+    // Effect ids and provider identities may each be hundreds of bytes. Their
+    // collision-resistant digests are exact cold-row lookup evidence without
+    // making the terminal document scale with caller-controlled strings.
+    effectIdDigest: await sha256Hex(String(effect.effectId)),
+    kind: effect.effectKind,
+    providerIdentityDigest: await sha256Hex(String(effect.providerIdentity)),
+    requestDigest: effect.requestDigest,
+    expectedBaseSha: effect.expectedBaseSha,
+    headSha: effect.headSha,
+    treeSha: effect.treeSha,
+    observation: effect.observation ?? null,
+    providerHeadSha: effect.providerHeadSha ?? null,
+    providerResponseDigest: effect.providerResponseDigest ?? null,
+  };
+}
+
 /** Build and insert a canonical terminal receipt only from authoritative rows. */
 export async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, outcome: string, detail?: { reason?: string; repairJobId?: any; cumulativeRetries?: number }) {
   const existing: any = await ctx.db.query("integrationTerminalReceipts")
@@ -57,15 +75,12 @@ export async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, ou
     || delivery.reviewedHeadTreeSha !== attempt.reviewedHeadTreeSha
     || delivery.reviewedDiffSha256 !== attempt.reviewedDiffSha256) return null;
   const repair: any = detail?.repairJobId ? await ctx.db.get(detail.repairJobId) : null;
-  const effects = [...(coldEffects.length ? coldEffects : (attempt.effects ?? []))]
-    .sort((left: any, right: any) => left.preparedAt - right.preparedAt || left.effectId.localeCompare(right.effectId))
-    .map((effect: any) => ({
-      effectId: effect.effectId, kind: effect.effectKind, providerIdentity: effect.providerIdentity,
-      requestDigest: effect.requestDigest, expectedBaseSha: effect.expectedBaseSha,
-      headSha: effect.headSha, treeSha: effect.treeSha,
-      observation: effect.observation ?? null, providerHeadSha: effect.providerHeadSha ?? null,
-      providerResponseDigest: effect.providerResponseDigest ?? null,
-    }));
+  const orderedEffects = [...(coldEffects.length ? coldEffects : (attempt.effects ?? []))]
+    .sort((left: any, right: any) => left.preparedAt - right.preparedAt || left.effectId.localeCompare(right.effectId));
+  // Full provider ids/responses remain in one cold row. The terminal manifest
+  // carries exact digests, so its size is independent of response bodies,
+  // provider URLs, and caller-sized effect ids.
+  const effects = await Promise.all(orderedEffects.map(integrationEffectManifest));
   if (effects.length > MAX_PROVIDER_EFFECTS) return null;
   const orderedEffectIdentityDigest = await sha256Hex(JSON.stringify(effects));
   if (outcome === "integrated" && !effects.some((effect: any) => effect.kind === "update_ref"
@@ -312,6 +327,12 @@ export const claim = mutation({
     requireWorker(args.workerToken);
     const attempt: any = await ctx.db.get(args.id);
     if (!attempt || TERMINAL.has(attempt.status)) return null;
+    const now = Date.now();
+    // Control may fence an in-flight provider request before its callback
+    // returns. Even a correctly reconcile-only replacement must not classify
+    // an exact object/ref as absent until the original server-owned state
+    // deadline and bounded provider request have both elapsed.
+    if (Number(attempt.reconcileAfter ?? 0) > now) return null;
     const mission: any = await ctx.db.get(attempt.missionId);
     const job: any = await ctx.db.get(attempt.jobId);
     const delivery: any = job?.activeDeliveryAttemptId ? await ctx.db.get(job.activeDeliveryAttemptId) : null;
@@ -321,7 +342,6 @@ export const claim = mutation({
       || delivery?.policy !== "mission_integration" || !["pending", "running"].includes(job.status)) return null;
     const head = await fifoHead(ctx, mission._id, attempt.repository);
     if (!head || head._id !== attempt._id) return null;
-    const now = Date.now();
     if (mission.activeIntegrationAttemptId && mission.activeIntegrationAttemptId !== attempt._id
       && Number(mission.integrationLeaseUntil ?? 0) >= now) return null;
     if (attempt.controllerRunId && attempt.controllerRunId !== args.controllerRunId
@@ -364,8 +384,10 @@ export const heartbeat = mutation({
     requireWorker(args.workerToken);
     const attempt: any = await ctx.db.get(args.id);
     const mission: any = attempt ? await ctx.db.get(attempt.missionId) : null;
-    const job: any = attempt ? await ctx.db.get(attempt.jobId) : null;
-    if (!exactFence(mission, attempt, args, job)) return false;
+    // Job controls clear these two authority leases transactionally. Reading
+    // the large job document on every pulse adds no fence that the mission and
+    // attempt documents do not already provide.
+    if (!exactFence(mission, attempt, args)) return false;
     const now = Date.now();
     if (Number(attempt.controllerDeadlineAt ?? 0) <= now) return false;
     const current = String(attempt.controllerState ?? "command") as keyof typeof CONTROLLER_STATE_MS;
@@ -857,8 +879,11 @@ export async function controlIntegrationForJob(ctx: any, job: any, action: "paus
     integrationLeaseUntil: undefined, updatedAt: now,
   });
   if (requiresReconciliation) {
-    const reconcileAfter = Math.max(now + 90_000,
-      Math.min(now + CONTROLLER_STATE_MS.provider, Number(attempt.controllerDeadlineAt ?? now)));
+    const originalDeadline = Math.max(now, Math.min(
+      now + CONTROLLER_STATE_MS.provider,
+      Number(attempt.controllerDeadlineAt ?? now),
+    ));
+    const reconcileAfter = Math.max(now + 90_000, originalDeadline + 1);
     let nextDeliveryId = delivery?._id;
     let nextGeneration = Number(delivery?.generation ?? job.deliveryGeneration ?? 1);
     if (delivery && !["done", "blocked", "abandoned"].includes(delivery.status)) {

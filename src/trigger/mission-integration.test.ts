@@ -167,4 +167,42 @@ describe("serialized integration provider protocol", () => {
     release();
     await expect(first).resolves.toMatchObject({ status: "pending" });
   });
+
+  it("never resends while the first provider callback drains and later reconciles the exact head", async () => {
+    const h = harness();
+    let release!: () => void;
+    let entered!: () => void;
+    const providerEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const callbackBarrier = new Promise<void>((resolve) => { release = resolve; });
+    vi.mocked(h.adapter.advanceRef).mockImplementation(async ({ newHeadSha }) => {
+      entered();
+      await callbackBarrier;
+      h.refs.set(receipt.integrationBranch, newHeadSha);
+      return { outcome: "applied", providerHeadSha: newHeadSha };
+    });
+    const first = integrateReviewedWorker(receipt, h.adapter, {
+      prepare: vi.fn().mockResolvedValue({ replay: false }), observe: vi.fn().mockResolvedValue(false),
+    });
+    await providerEntered;
+
+    const earlyObserve = vi.fn().mockResolvedValue(true);
+    const early = await integrateReviewedWorker(receipt, h.adapter, {
+      reconcileOnly: true,
+      prepare: vi.fn().mockResolvedValue({ replay: true, observation: null }),
+      observe: earlyObserve,
+    });
+    expect(early).toMatchObject({ status: "pending" });
+    expect(earlyObserve).toHaveBeenCalledWith(expect.objectContaining({ observation: "not_applied" }));
+    expect(h.adapter.advanceRef).toHaveBeenCalledTimes(1);
+
+    release();
+    await expect(first).resolves.toMatchObject({ status: "pending" });
+    const settled = await integrateReviewedWorker(receipt, h.adapter, {
+      reconcileOnly: true,
+      prepare: vi.fn().mockResolvedValue({ replay: true, observation: "unknown" }),
+      observe: vi.fn().mockResolvedValue(true),
+    });
+    expect(settled).toMatchObject({ status: "integrated", headSha: MERGED });
+    expect(h.adapter.advanceRef).toHaveBeenCalledTimes(1);
+  });
 });

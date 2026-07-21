@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
+import { integrationEffectManifest } from "./goalIntegration";
 import schema from "./schema";
 
 declare global {
@@ -453,7 +454,8 @@ describe("real Convex multi-agent workspace and integration races", () => {
   });
 
   it("keeps eight reviewed receipts cold while dispatching exactly one FIFO controller", async () => {
-    const t = convexTest(schema, modules);
+    const fifoTransactionBounds = { documentsRead: 128, documentsWritten: 64, databaseQueries: 128 };
+    const t = convexTest({ schema, modules, transactionLimits: fifoTransactionBounds });
     const created = await t.mutation(api.goalMode.create, {
       goal: "Integrate eight independent durable repository workstreams safely",
       route: "existing_project", routeReason: "owned product", primaryRepo: REPO,
@@ -497,6 +499,9 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(state.deliveries).toHaveLength(8);
     expect(state.deliveries.every((row) => row.generation === 1 && row.cumulativeRetries === 0)).toBe(true);
     expect(state.jobs.filter((row) => row.goalStage === "building" && row.deliveryRunId)).toHaveLength(1);
+    // convex-test enforces these per-transaction ceilings throughout the
+    // eight-receipt setup, queueing and parallel dispatch calls above.
+    expect(fifoTransactionBounds).toEqual({ documentsRead: 128, documentsWritten: 64, databaseQueries: 128 });
   });
 
   it("reconciles an unknown provider observation and rechecks the authoritative head at completion", async () => {
@@ -542,7 +547,28 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(terminal.receiptJson).not.toContain("lost-secret-token");
     expect(JSON.parse(terminal.receiptJson).providerEffects).toMatchObject({
       count: 1,
-      ordered: [expect.objectContaining({ effectId, observation: "applied", providerResponseDigest: sha256("reconciled:exact-ref") })],
+      ordered: [expect.objectContaining({ effectIdDigest: sha256(effectId), observation: "applied", providerResponseDigest: sha256("reconciled:exact-ref") })],
+    });
+  });
+
+  it("bounds a worst-case terminal effect manifest independently of cold provider bodies", async () => {
+    const providerBody = `unique-provider-body:${"x".repeat(8_000)}`;
+    const ordered = await Promise.all(Array.from({ length: 1_024 }, (_, index) => integrationEffectManifest({
+      effectId: `${index}:${"e".repeat(296)}`,
+      effectKind: index === 1_023 ? "update_ref" : "stage_blob",
+      providerIdentity: `${index}:${"p".repeat(496)}`,
+      requestDigest: "1".repeat(64), expectedBaseSha: "2".repeat(40), headSha: "3".repeat(40),
+      treeSha: "4".repeat(40), observation: "applied", providerHeadSha: "3".repeat(40),
+      providerResponse: providerBody, providerResponseDigest: sha256(providerBody),
+    })));
+    const manifest = JSON.stringify({ count: ordered.length, orderedEffectIdentityDigest: sha256(JSON.stringify(ordered)), ordered });
+    expect(Buffer.byteLength(manifest)).toBeLessThan(700_000);
+    expect(manifest).not.toContain("unique-provider-body");
+    expect(ordered).toHaveLength(1_024);
+    expect(ordered[0]).toMatchObject({
+      effectIdDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      providerIdentityDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      providerResponseDigest: sha256(providerBody),
     });
   });
 
@@ -620,6 +646,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
     const effectId = `effect-${action}-${stage}`;
     if (stage !== "claimed") {
+      expect(await f.t.mutation(api.goalIntegration.heartbeat, { ...fence, state: "provider" })).toBe(true);
       expect(await f.t.mutation(api.goalIntegration.prepare, {
         ...fence, effectId, effectKind: "update_ref", provider: "github",
         providerIdentity: "repo-node:refs/heads/integration", providerMethod: "POST",
@@ -656,13 +683,24 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(fenced.next).toMatchObject({ integrationState: "provider_waiting" });
     expect(fenced.terminals).toHaveLength(0);
 
+    const originalDeadline = Number((fenced.attempt as any).controllerDeadlineAt);
+    expect((fenced.job as any).nextRunAt).toBe(originalDeadline + 1);
+    vi.setSystemTime(originalDeadline);
+    expect(await dispatch(f.t, 2, `control-${action}-${stage}-too-early`)).toHaveLength(0);
+
     vi.setSystemTime(Number((fenced.job as any).nextRunAt));
     const [reconciler] = await dispatch(f.t, 2, `control-${action}-${stage}-reconciler`);
     expect(String(reconciler.reservation.jobId)).toBe(String(current.jobId));
-    const recovered = await f.t.mutation(api.goalIntegration.claim, {
+    const reconcileClaimArgs = {
       id: current._id, controllerRunId: String(reconciler.claim!.deliveryRunId),
       leaseOwner: `reconcile-owner-${action}-${stage}`, leaseToken: `reconcile-token-${action}-${stage}`, workerToken: TOKEN,
-    });
+    };
+    // The claim mutation is an authority fence too; a stale/early caller
+    // cannot bypass the dispatcher timestamp and classify an in-flight write.
+    vi.setSystemTime(Number((fenced.job as any).nextRunAt) - 1);
+    expect(await f.t.mutation(api.goalIntegration.claim, reconcileClaimArgs)).toBeNull();
+    vi.setSystemTime(Number((fenced.job as any).nextRunAt));
+    const recovered = await f.t.mutation(api.goalIntegration.claim, reconcileClaimArgs);
     const recoveredFence = { id: current._id, controllerRunId: recovered!.controllerRunId,
       leaseOwner: recovered!.leaseOwner, leaseToken: recovered!.leaseToken,
       leaseVersion: recovered!.leaseVersion, workerToken: TOKEN };
@@ -745,6 +783,59 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(recovered.deliveries).toHaveLength(2);
     expect(recovered.deliveries[1]).toMatchObject({ integrationAttemptId: integration._id, parentDeliveryAttemptId: recovered.deliveries[0]._id });
     expect(recovered.workAttempts).toHaveLength(1);
+  });
+
+  it("keeps a long provider-wait heartbeat to four authority document reads and two compact writes", async () => {
+    const t = convexTest({
+      schema, modules,
+      // convex-test counts each patch's old-document read as well as the two
+      // explicit authority gets: 2 gets + 2 compact patches, with 2 writes.
+      transactionLimits: { documentsRead: 4, documentsWritten: 2, databaseQueries: 2 },
+    });
+    const now = Date.parse("2026-07-21T10:00:00Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const ids: any = await t.run(async (ctx) => {
+      const missionId = await ctx.db.insert("missions", {
+        goal: "measure compact integration liveness", status: "running", mode: "goal", agentCount: 1,
+        integrationLeaseOwner: "compact-owner", integrationLeaseToken: "compact-token",
+        integrationLeaseVersion: 1, integrationLeaseUntil: now + 45_000, createdAt: now, updatedAt: now,
+      });
+      const jobId = await ctx.db.insert("jobs", {
+        task: "already reviewed integration", status: "running", missionId: String(missionId), createdAt: now,
+      });
+      return { missionId, jobId };
+    });
+    const reviewReceiptId: any = await t.run(async (ctx) => await ctx.db.insert("reviewReceipts", {
+      jobId: ids.jobId, attempt: 1, repository: REPO, receiptJson: "{}", receiptDigest: "1".repeat(64),
+      signature: "2".repeat(64), diffSha256: "3".repeat(64), baseSha: BASE, headSha: "4".repeat(40),
+      baseTreeSha: "5".repeat(40), headTreeSha: "6".repeat(40), agentEvidenceSha256: "7".repeat(64), createdAt: now,
+    }));
+    const integrationId: any = await t.run(async (ctx) => await ctx.db.insert("integrationAttempts", {
+      missionId: ids.missionId, jobId: ids.jobId, workAttempt: 1, generation: 1, revisionWave: 0,
+      workstreamId: "compact", repository: REPO, sourceBranch: "main", workerBranch: "jarvis/work/compact",
+      integrationBranch: "jarvis/goal/compact", reviewReceiptId, reviewReceiptDigest: "1".repeat(64),
+      reviewedBaseSha: BASE, reviewedHeadSha: "4".repeat(40), reviewedHeadTreeSha: "6".repeat(40),
+      reviewedDiffSha256: "3".repeat(64), status: "claimed", controllerRunId: "compact-run",
+      leaseOwner: "compact-owner", leaseToken: "compact-token", leaseVersion: 1, leaseUntil: now + 45_000,
+      controllerState: "provider", controllerStateSince: now, controllerDeadlineAt: now + 5 * 60_000,
+      controllerHeartbeatAt: now, cumulativeRetries: 0, createdAt: now, updatedAt: now,
+    }));
+    await t.run(async (ctx) => {
+      await ctx.db.patch(ids.missionId, { activeIntegrationAttemptId: integrationId });
+      await ctx.db.patch(ids.jobId, { integrationAttemptId: integrationId });
+    });
+    const fence = {
+      id: integrationId, controllerRunId: "compact-run", leaseOwner: "compact-owner",
+      leaseToken: "compact-token", leaseVersion: 1, state: "provider" as const,
+      deadlineAt: now + 5 * 60 * 60_000, workerToken: TOKEN,
+    };
+    for (let pulse = 1; pulse <= 6; pulse += 1) {
+      vi.setSystemTime(now + pulse * 30_000);
+      expect(await t.mutation(api.goalIntegration.heartbeat, fence)).toBe(true);
+    }
+    const authority: any = await t.run(async (ctx) => ctx.db.get(integrationId));
+    expect(authority.controllerDeadlineAt).toBe(now + 5 * 60_000);
   });
 
   it.each([

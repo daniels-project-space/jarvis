@@ -1054,11 +1054,17 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               }).catch(() => false);
               return;
             }
-            await sh("git", ["-C", integrationDir, "remote", "set-url", "origin", remote], env);
-            await sh("git", ["-C", integrationDir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
-            await sh("git", ["-C", integrationDir, "config", "user.name", "JARVIS integration controller"], env);
             const runIntegrationGit = (args: string[], commandEnv: NodeJS.ProcessEnv = gitEnv) =>
               sh("git", ["-C", integrationDir, ...args], commandEnv, { signal: integrationAbort.signal, timeoutMs: 90_000 });
+            if ((await runIntegrationGit(["remote", "set-url", "origin", remote], env)).code !== 0
+              || (await runIntegrationGit(["config", "user.email", "jarvis@daniels-project-space.dev"], env)).code !== 0
+              || (await runIntegrationGit(["config", "user.name", "JARVIS integration controller"], env)).code !== 0) {
+              await convexMutation("goalIntegration:defer", {
+                ...integrationFence, reasonCode: "sandbox_configuration_failed",
+                reason: "bounded integration git configuration failed",
+              }).catch(() => false);
+              return;
+            }
             const adapter = createGitHubIntegrationAdapter({
               repository: repo,
               remote,
