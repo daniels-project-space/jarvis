@@ -3,6 +3,8 @@ import {
   gitReviewReceiptAuthorityHealth,
   loadGitReviewReceiptAuthority,
   repositoryDeliveryReadiness,
+  resetGitReviewReceiptAuthorityForTest,
+  trustedGitReviewReceiptAuthority,
   verifyGitReviewReceiptEnvelope,
 } from "./git-review-authority";
 import { createGitReviewReceiptKeyring } from "./git-review-receipt";
@@ -82,6 +84,58 @@ describe("trusted Git review receipt authority", () => {
       },
     })).toBe(false);
     expect(calls).toBe(2);
+  });
+
+  it("honors key retirement in a warm controller and issues only with the fresh current key", async () => {
+    const originalKeyring = process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING;
+    const originalLegacy = process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET;
+    const oldEnvelope = createGitReviewReceiptKeyring({ keyId: "old", secret: "o".repeat(32) }).issue(receipt);
+    try {
+      delete process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET;
+      process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING = JSON.stringify({
+        current: { keyId: "current", secret: "c".repeat(32) },
+        previous: [{ keyId: "old", secret: "o".repeat(32) }],
+      });
+      resetGitReviewReceiptAuthorityForTest();
+      expect((await trustedGitReviewReceiptAuthority())?.configuration).toBe("rotating");
+      expect(await verifyGitReviewReceiptEnvelope(oldEnvelope, binding)).toBe(true);
+
+      process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING = JSON.stringify({
+        current: { keyId: "next", secret: "n".repeat(32) },
+        previous: [{ keyId: "current", secret: "c".repeat(32) }],
+      });
+      expect(await verifyGitReviewReceiptEnvelope(oldEnvelope, binding)).toBe(false);
+      expect(await verifyGitReviewReceiptEnvelope({ ...oldEnvelope, keyId: "unknown" }, binding)).toBe(false);
+      expect((await trustedGitReviewReceiptAuthority())?.issue(receipt).keyId).toBe("next");
+    } finally {
+      if (originalKeyring === undefined) delete process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING;
+      else process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING = originalKeyring;
+      if (originalLegacy === undefined) delete process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET;
+      else process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET = originalLegacy;
+      resetGitReviewReceiptAuthorityForTest();
+    }
+  });
+
+  it("uses one fresh issuance load and at most two verification loads", async () => {
+    let calls = 0;
+    let keyId = "current";
+    const options = {
+      environment: {} as NodeJS.ProcessEnv,
+      loadVault: async () => {
+        calls += 1;
+        return { JARVIS_GIT_REVIEW_RECEIPT_KEYRING: JSON.stringify({
+          current: { keyId, secret: (keyId === "current" ? "c" : "n").repeat(32) }, previous: [],
+        }) };
+      },
+    };
+    expect((await trustedGitReviewReceiptAuthority(options))?.issue(receipt).keyId).toBe("current");
+    expect(calls).toBe(1);
+    keyId = "next";
+    const nextEnvelope = createGitReviewReceiptKeyring({ keyId: "next", secret: "n".repeat(32) }).issue(receipt);
+    expect(await verifyGitReviewReceiptEnvelope(nextEnvelope, binding, options)).toBe(true);
+    expect(calls).toBe(2);
+    expect(await verifyGitReviewReceiptEnvelope({ ...nextEnvelope, keyId: "unknown" }, binding, options)).toBe(false);
+    expect(calls).toBe(4);
   });
 
   it("exposes only a secret-free readiness signal for release preflight", async () => {

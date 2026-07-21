@@ -13,7 +13,10 @@ type LoadOptions = {
   loadVault?: (service: string) => Promise<Record<string, string>>;
 };
 
-let cached: Promise<Authority> | null = null;
+// A warm copy is only a diagnostic/performance hint. It is never consulted as
+// authority at an issuance or verification boundary because a key may have
+// been retired while this Trigger worker remained warm.
+let cached: Authority | null = null;
 
 function configuredAuthority(environment: NodeJS.ProcessEnv): Authority | null {
   const serialized = environment.JARVIS_GIT_REVIEW_RECEIPT_KEYRING;
@@ -67,11 +70,13 @@ export async function loadGitReviewReceiptAuthority(options: LoadOptions = {}): 
  * Cache only a successful authority.  A vault outage is an availability
  * signal, not a permanent identity decision for a warm controller process.
  */
-export async function trustedGitReviewReceiptAuthority(): Promise<Authority | null> {
-  if (cached) return cached;
-  const loaded = await loadGitReviewReceiptAuthority();
-  if (!loaded) return null;
-  cached = Promise.resolve(loaded);
+export async function trustedGitReviewReceiptAuthority(options: LoadOptions = {}): Promise<Authority | null> {
+  const loaded = await loadGitReviewReceiptAuthority(options);
+  if (!loaded) {
+    cached = null;
+    return null;
+  }
+  cached = loaded;
   return loaded;
 }
 
@@ -84,21 +89,29 @@ export function repositoryDeliveryReadiness(required: boolean, authority: Author
 }
 
 /**
- * Verify with the warm keyring, then reload configuration at most once. This
- * closes the normal rotation window without turning arbitrary failures into a
- * vault polling loop. Unknown or retired ids remain rejected after reload.
+ * Read authoritative configuration at every verification boundary, then
+ * reload at most once when a valid snapshot does not know the presented key.
+ * This closes a normal rotation race without polling. A missing/invalid fresh
+ * snapshot fails closed and can never fall back to a cached retired key.
  */
 export async function verifyGitReviewReceiptEnvelope(
   envelope: GitReviewEnvelope,
   binding: GitReviewBinding,
   options: LoadOptions = {},
 ): Promise<boolean> {
-  const first = options.environment || options.loadVault
-    ? await loadGitReviewReceiptAuthority(options)
-    : await trustedGitReviewReceiptAuthority();
+  const first = await loadGitReviewReceiptAuthority(options);
+  if (!first) {
+    cached = null;
+    return false;
+  }
+  cached = first;
   if (first?.verify(envelope, binding)) return true;
   const reloaded = await loadGitReviewReceiptAuthority(options);
-  if (!options.environment && !options.loadVault && reloaded) cached = Promise.resolve(reloaded);
+  if (!reloaded) {
+    cached = null;
+    return false;
+  }
+  cached = reloaded;
   return Boolean(reloaded?.verify(envelope, binding));
 }
 

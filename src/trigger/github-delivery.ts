@@ -232,8 +232,9 @@ export async function openDeliveryPullRequest(args: {
   const fetchImpl = args.fetchImpl ?? fetch;
   const headers = apiHeaders(args.token);
   const [owner] = args.repo.split("/");
-  const initialRefs = await readReviewedRefs({ ...args, fetchImpl });
-  if (!initialRefs) return null;
+  // Discovery is read-only and precedes write authorization so a previously
+  // prepared CREATE/PROMOTE can be reconciled even after the base ref moves.
+  // A genuinely new provider write still gets fresh exact ref checks below.
   const listed = await fetchImpl(
     `https://api.github.com/repos/${args.repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${args.branch}`)}`,
     { headers, cache: "no-store" },
@@ -409,6 +410,27 @@ export async function continueRepositoryDelivery(args: {
   }
   if (!args.branchChanged && !args.reconcileMerge) {
     return { ok: true, outcome: "no_change", deliveryStatus: "branch", providerCall: false };
+  }
+  if (args.reconcileMerge) {
+    // A prepared merge is reconciled only through the complete immutable PR
+    // identity already held by the delivery attempt. Do not rediscover open
+    // PRs or authorize a new write from the now-advanced default branch.
+    const expected = args.expectedPull;
+    if (args.policy !== "auto_merge" || !expected
+      || !Number.isSafeInteger(expected.number) || expected.number <= 0
+      || !expected.url || !expected.nodeId || expected.draft
+      || !exactPull(expected, args.reviewed)) {
+      return { ok: false, note: "prepared merge is missing the exact reviewed pull request identity" };
+    }
+    const reconciled = await mergeVerifiedPullRequest({
+      ...args, pull: expected,
+      reviewedHeadSha: args.reviewed.headSha, reviewedBaseSha: args.reviewed.baseSha,
+    });
+    if (reconciled.status !== "merged") return { ok: false, note: reconciled.note };
+    return {
+      ok: true, outcome: "merged", deliveryStatus: "merged", providerCall: false,
+      pull: reconciled.pull, mergeCommitSha: reconciled.sha,
+    };
   }
   const pull = await openDeliveryPullRequest({
     ...args, draft: args.policy === "manual",

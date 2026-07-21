@@ -41,21 +41,10 @@ describe("exact GitHub delivery adapter", () => {
   it.each([
     ["source", "moved-head", BASE],
     ["base", HEAD, "moved-base"],
-  ])("rejects a moved %s ref before listing or writing", async (_label, head, base) => {
+  ])("rejects a moved %s ref before a new write", async (_label, head, base) => {
     const fetchImpl = vi.fn();
+    fetchImpl.mockResolvedValueOnce(response(200, []));
     refs(fetchImpl, head, base);
-    await expect(openDeliveryPullRequest({
-      repo: "daniels-project-space/jarvis", branch: "jarvis/work", title: "work", body: "evidence",
-      token: "token", reviewed: { headSha: HEAD, baseSha: BASE }, fetchImpl: fetchImpl as typeof fetch,
-    })).resolves.toBeNull();
-    expect(fetchImpl).toHaveBeenCalledTimes(3);
-    expect(writes(fetchImpl)).toHaveLength(0);
-  });
-
-  it("rejects an existing PR whose base is not the signed base", async () => {
-    const fetchImpl = vi.fn();
-    refs(fetchImpl);
-    fetchImpl.mockResolvedValueOnce(response(200, [payload({ base: { sha: "other-base" } })]));
     await expect(openDeliveryPullRequest({
       repo: "daniels-project-space/jarvis", branch: "jarvis/work", title: "work", body: "evidence",
       token: "token", reviewed: { headSha: HEAD, baseSha: BASE }, fetchImpl: fetchImpl as typeof fetch,
@@ -64,9 +53,19 @@ describe("exact GitHub delivery adapter", () => {
     expect(writes(fetchImpl)).toHaveLength(0);
   });
 
+  it("rejects an existing PR whose base is not the signed base", async () => {
+    const fetchImpl = vi.fn();
+    fetchImpl.mockResolvedValueOnce(response(200, [payload({ base: { sha: "other-base" } })]));
+    await expect(openDeliveryPullRequest({
+      repo: "daniels-project-space/jarvis", branch: "jarvis/work", title: "work", body: "evidence",
+      token: "token", reviewed: { headSha: HEAD, baseSha: BASE }, fetchImpl: fetchImpl as typeof fetch,
+    })).resolves.toBeNull();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(writes(fetchImpl)).toHaveLength(0);
+  });
+
   it("refuses to adopt an unrelated ready PR even when its refs happen to match", async () => {
     const fetchImpl = vi.fn();
-    refs(fetchImpl);
     fetchImpl.mockResolvedValueOnce(response(200, [payload()]));
     const prepareEffect = vi.fn().mockResolvedValue(null);
     await expect(openDeliveryPullRequest({
@@ -76,13 +75,12 @@ describe("exact GitHub delivery adapter", () => {
     })).resolves.toBeNull();
     expect(prepareEffect).toHaveBeenCalledTimes(2);
     expect(prepareEffect.mock.calls.every((call) => call[1]?.reconcileOnly === true)).toBe(true);
-    expect(fetchImpl).toHaveBeenCalledTimes(4);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(writes(fetchImpl)).toHaveLength(0);
   });
 
   it("recognizes an exact manual draft through a durable applied observation and never promotes it", async () => {
     const fetchImpl = vi.fn();
-    refs(fetchImpl);
     fetchImpl.mockResolvedValueOnce(response(200, [payload({ draft: true })]));
     const prepareEffect = vi.fn().mockResolvedValue({ replay: false });
     const observeEffect = vi.fn();
@@ -93,13 +91,13 @@ describe("exact GitHub delivery adapter", () => {
     })).resolves.toEqual(pull({ draft: true }));
     expect(prepareEffect.mock.calls[0][0]).toMatchObject({ kind: "create_draft_pr" });
     expect(observeEffect).toHaveBeenCalledWith(expect.anything(), "applied", pull({ draft: true }));
-    expect(fetchImpl).toHaveBeenCalledTimes(4);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(writes(fetchImpl)).toHaveLength(0);
   });
 
   it("reconciles a lost create response with one POST and exact full identity", async () => {
     const fetchImpl = vi.fn();
-    refs(fetchImpl); fetchImpl.mockResolvedValueOnce(response(200, [])); refs(fetchImpl);
+    fetchImpl.mockResolvedValueOnce(response(200, [])); refs(fetchImpl);
     fetchImpl.mockRejectedValueOnce(new Error("response lost"));
     fetchImpl.mockResolvedValueOnce(response(200, [payload({ draft: true })]));
     const observeEffect = vi.fn();
@@ -108,14 +106,14 @@ describe("exact GitHub delivery adapter", () => {
       token: "token", draft: true, reviewed: { headSha: HEAD, baseSha: BASE },
       prepareEffect: async () => ({ replay: false }), observeEffect, fetchImpl: fetchImpl as typeof fetch,
     })).resolves.toEqual(pull({ draft: true }));
-    expect(fetchImpl).toHaveBeenCalledTimes(9);
+    expect(fetchImpl).toHaveBeenCalledTimes(6);
     expect(writes(fetchImpl)).toHaveLength(1);
     expect(observeEffect).toHaveBeenLastCalledWith(expect.anything(), "applied", pull({ draft: true }));
   });
 
   it("rejects a lost-create recovery whose observed PR base does not match", async () => {
     const fetchImpl = vi.fn();
-    refs(fetchImpl); fetchImpl.mockResolvedValueOnce(response(200, [])); refs(fetchImpl);
+    fetchImpl.mockResolvedValueOnce(response(200, [])); refs(fetchImpl);
     fetchImpl.mockRejectedValueOnce(new Error("response lost"));
     fetchImpl.mockResolvedValueOnce(response(200, [payload({ draft: true, base: { sha: "other-base" } })]));
     await expect(openDeliveryPullRequest({
@@ -123,13 +121,13 @@ describe("exact GitHub delivery adapter", () => {
       token: "token", draft: true, reviewed: { headSha: HEAD, baseSha: BASE },
       prepareEffect: async () => ({ replay: false }), observeEffect: vi.fn(), fetchImpl: fetchImpl as typeof fetch,
     })).resolves.toBeNull();
-    expect(fetchImpl).toHaveBeenCalledTimes(9);
+    expect(fetchImpl).toHaveBeenCalledTimes(6);
     expect(writes(fetchImpl)).toHaveLength(1);
   });
 
   it("reconciles a lost promote response with one POST and no duplicate promotion", async () => {
     const fetchImpl = vi.fn();
-    refs(fetchImpl); fetchImpl.mockResolvedValueOnce(response(200, [payload({ draft: true })]));
+    fetchImpl.mockResolvedValueOnce(response(200, [payload({ draft: true })]));
     refs(fetchImpl); fetchImpl.mockResolvedValueOnce(response(200, payload({ draft: true })));
     fetchImpl.mockRejectedValueOnce(new Error("response lost"));
     fetchImpl.mockResolvedValueOnce(response(200, payload({ draft: false })));
@@ -139,7 +137,7 @@ describe("exact GitHub delivery adapter", () => {
       token: "token", reviewed: { headSha: HEAD, baseSha: BASE },
       prepareEffect: async () => ({ replay: false }), observeEffect, fetchImpl: fetchImpl as typeof fetch,
     })).resolves.toEqual(pull());
-    expect(fetchImpl).toHaveBeenCalledTimes(10);
+    expect(fetchImpl).toHaveBeenCalledTimes(7);
     expect(writes(fetchImpl)).toHaveLength(1);
     expect(String(writes(fetchImpl)[0][0])).toContain("graphql");
     expect(observeEffect).toHaveBeenLastCalledWith(expect.anything(), "applied", pull());
@@ -199,8 +197,8 @@ describe("exact GitHub delivery adapter", () => {
     const observeEffect = vi.fn(async () => {
       if (rejectObservation) throw new Error("Convex observation rejected");
     });
-    const firstFetch = vi.fn();
-    refs(firstFetch); firstFetch.mockResolvedValueOnce(response(200, [])); refs(firstFetch);
+    const firstFetch = vi.fn().mockResolvedValueOnce(response(200, []));
+    refs(firstFetch);
     firstFetch.mockResolvedValueOnce(response(201, payload()));
     await expect(openDeliveryPullRequest({
       repo: "daniels-project-space/jarvis", branch: "jarvis/work", title: "work", body: "evidence",
@@ -210,8 +208,7 @@ describe("exact GitHub delivery adapter", () => {
     expect(writes(firstFetch)).toHaveLength(1);
 
     rejectObservation = false;
-    const replayFetch = vi.fn(); refs(replayFetch);
-    replayFetch.mockResolvedValueOnce(response(200, [payload()]));
+    const replayFetch = vi.fn().mockResolvedValueOnce(response(200, [payload()]));
     await expect(openDeliveryPullRequest({
       repo: "daniels-project-space/jarvis", branch: "jarvis/work", title: "work", body: "evidence",
       token: "token", reviewed: { headSha: HEAD, baseSha: BASE }, prepareEffect, observeEffect,
@@ -224,8 +221,7 @@ describe("exact GitHub delivery adapter", () => {
 
 describe("real controller continuation caller", () => {
   it("supplies preparation and observation for a protected draft write", async () => {
-    const fetchImpl = vi.fn(); refs(fetchImpl);
-    fetchImpl.mockResolvedValueOnce(response(200, [])); refs(fetchImpl);
+    const fetchImpl = vi.fn().mockResolvedValueOnce(response(200, [])); refs(fetchImpl);
     fetchImpl.mockResolvedValueOnce(response(201, payload({ draft: true })));
     const events: string[] = [];
     await expect(continueRepositoryDelivery({
@@ -236,13 +232,13 @@ describe("real controller continuation caller", () => {
       observeEffect: async (effect, observation) => { events.push(`observe:${effect.kind}:${observation}`); },
     })).resolves.toMatchObject({ ok: true, outcome: "protected_draft" });
     expect(events).toEqual(["prepare:create_draft_pr", "observe:create_draft_pr:applied"]);
-    expect(fetchImpl).toHaveBeenCalledTimes(8);
+    expect(fetchImpl).toHaveBeenCalledTimes(5);
     expect(writes(fetchImpl).map((call) => call[1]?.method)).toEqual(["POST"]);
   });
 
   it("supplies preparation and observation for create and merge writes", async () => {
     const fetchImpl = vi.fn();
-    refs(fetchImpl); fetchImpl.mockResolvedValueOnce(response(200, [])); refs(fetchImpl);
+    fetchImpl.mockResolvedValueOnce(response(200, [])); refs(fetchImpl);
     fetchImpl.mockResolvedValueOnce(response(201, payload()));
     fetchImpl.mockResolvedValueOnce(response(200, payload()));
     fetchImpl.mockResolvedValueOnce(response(200, { merged: true, sha: "merge-sha" }));
@@ -260,16 +256,16 @@ describe("real controller continuation caller", () => {
       "prepare:create_pr", "observe:create_pr:applied",
       "prepare:merge_pr", "observe:merge_pr:applied",
     ]);
-    expect(fetchImpl).toHaveBeenCalledTimes(11);
+    expect(fetchImpl).toHaveBeenCalledTimes(8);
     expect(writes(fetchImpl).map((call) => call[1]?.method)).toEqual(["POST", "PUT"]);
   });
 
-  it("reconciles a prepared merge after the default branch moved, without another write", async () => {
-    const fetchImpl = vi.fn(); refs(fetchImpl);
-    fetchImpl.mockResolvedValueOnce(response(200, [payload()]));
-    fetchImpl.mockResolvedValueOnce(response(200, payload({
-      state: "closed", merged: true, merge_commit_sha: "merge-sha",
-    })));
+  it("reconciles a prepared merge by exact PR number after the default branch moved", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("https://api.github.com/repos/daniels-project-space/jarvis/pulls/42");
+      expect(init?.method).toBeUndefined();
+      return response(200, payload({ state: "closed", merged: true, merge_commit_sha: "merge-sha" }));
+    });
     const observeEffect = vi.fn();
     await expect(continueRepositoryDelivery({
       policy: "auto_merge", branchChanged: false, reconcileMerge: true,
@@ -279,14 +275,55 @@ describe("real controller continuation caller", () => {
       prepareEffect: async (_effect, options) => options?.reconcileOnly ? { replay: true, observation: "unknown" } : null,
       observeEffect,
     })).resolves.toMatchObject({ ok: true, outcome: "merged", mergeCommitSha: "merge-sha" });
-    expect(fetchImpl).toHaveBeenCalledTimes(5);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(writes(fetchImpl)).toHaveLength(0);
+    expect(observeEffect).toHaveBeenCalledTimes(1);
     expect(observeEffect).toHaveBeenCalledWith(expect.objectContaining({ kind: "merge_pr" }), "applied", pull({ mergeCommitSha: "merge-sha" }));
   });
 
+  it.each([
+    ["missing", undefined],
+    ["wrong head", pull({ headSha: "wrong-head" })],
+    ["wrong base", pull({ baseSha: "wrong-base" })],
+    ["draft", pull({ draft: true })],
+    ["wrong url", pull({ url: "https://github.test/pulls/other" })],
+    ["wrong node", pull({ nodeId: "wrong-node" })],
+    ["wrong number", pull({ number: 41 })],
+  ] as const)("fails closed for %s prepared-merge identity with zero writes", async (_label, expectedPull) => {
+    const fetchImpl = vi.fn().mockResolvedValue(response(200, payload({
+      state: "closed", merged: true, merge_commit_sha: "merge-sha",
+    })));
+    await expect(continueRepositoryDelivery({
+      policy: "auto_merge", branchChanged: false, reconcileMerge: true,
+      repo: "daniels-project-space/jarvis", branch: "jarvis/work", title: "work", body: "evidence",
+      token: "token", reviewed: { headSha: HEAD, baseSha: BASE }, expectedPull,
+      fetchImpl: fetchImpl as typeof fetch,
+      prepareEffect: async () => ({ replay: true, observation: "unknown" }), observeEffect: vi.fn(),
+    })).resolves.toMatchObject({ ok: false });
+    expect(writes(fetchImpl)).toHaveLength(0);
+  });
+
+  it("replays the same prepared merge response without any provider write", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(response(200, payload({ state: "closed", merged: true, merge_commit_sha: "merge-sha" })))
+      .mockResolvedValueOnce(response(200, payload({ state: "closed", merged: true, merge_commit_sha: "merge-sha" })));
+    const prepareEffect = vi.fn(async () => ({ replay: true, observation: "applied" as const }));
+    const observeEffect = vi.fn();
+    const args = {
+      policy: "auto_merge" as const, branchChanged: false, reconcileMerge: true,
+      repo: "daniels-project-space/jarvis", branch: "jarvis/work", title: "work", body: "evidence",
+      token: "token", reviewed: { headSha: HEAD, baseSha: BASE }, expectedPull: pull(),
+      fetchImpl: fetchImpl as typeof fetch, prepareEffect, observeEffect,
+    };
+    await expect(continueRepositoryDelivery(args)).resolves.toMatchObject({ ok: true, outcome: "merged" });
+    await expect(continueRepositoryDelivery(args)).resolves.toMatchObject({ ok: true, outcome: "merged" });
+    expect(prepareEffect).toHaveBeenCalledTimes(2);
+    expect(observeEffect).toHaveBeenCalledTimes(2);
+    expect(writes(fetchImpl)).toHaveLength(0);
+  });
+
   it("supplies preparation and observation for promotion and merge writes", async () => {
-    const fetchImpl = vi.fn(); refs(fetchImpl);
-    fetchImpl.mockResolvedValueOnce(response(200, [payload({ draft: true })]));
+    const fetchImpl = vi.fn().mockResolvedValueOnce(response(200, [payload({ draft: true })]));
     refs(fetchImpl);
     fetchImpl.mockResolvedValueOnce(response(200, payload({ draft: true })));
     fetchImpl.mockResolvedValueOnce(response(200, { data: { markPullRequestReadyForReview: { pullRequest: { isDraft: false } } } }));
@@ -306,7 +343,7 @@ describe("real controller continuation caller", () => {
       "prepare:promote_pr", "observe:promote_pr:applied",
       "prepare:merge_pr", "observe:merge_pr:applied",
     ]);
-    expect(fetchImpl).toHaveBeenCalledTimes(13);
+    expect(fetchImpl).toHaveBeenCalledTimes(10);
     expect(writes(fetchImpl).map((call) => call[1]?.method)).toEqual(["POST", "PUT"]);
   });
 

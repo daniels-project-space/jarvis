@@ -1475,14 +1475,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }
           let goalReview: { envelope: GitReviewEnvelope; binding: GitReviewBinding } | undefined;
           if (repoDir) {
-            if (!receiptAuthority || !repositoryDeliveryReadiness(true, receiptAuthority).ready) {
-              await convexMutation("jobs:checkpointAndRequeue", {
-                jobId: job.jobId, expectedAttempt,
-                checkpoint: "Repository completion is held: the trusted controller receipt authority is unavailable. Do not rerun the specialist.",
-                result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: failureBackoffMs(expectedAttempt),
-              }).catch(() => null);
-              return;
-            }
             const receipt = await buildGitReviewReceipt({
               runGit: (args) => sh("git", ["-C", repoDir!, ...args], env), jobId: String(job.jobId), attempt: expectedAttempt,
               repository: repo!, expectedBranch: branch || checkoutSourceBranch, baseSha,
@@ -1496,7 +1488,16 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               }).catch(() => null);
               return;
             }
-            goalReview = { envelope: receiptAuthority.issue(receipt.receipt), binding: receipt.binding };
+            const signingAuthority = await trustedGitReviewReceiptAuthority();
+            if (!signingAuthority || !repositoryDeliveryReadiness(true, signingAuthority).ready) {
+              await convexMutation("jobs:checkpointAndRequeue", {
+                jobId: job.jobId, expectedAttempt,
+                checkpoint: "Repository completion is held: the trusted controller receipt authority is unavailable. Do not rerun the specialist.",
+                result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: failureBackoffMs(expectedAttempt),
+              }).catch(() => null);
+              return;
+            }
+            goalReview = { envelope: signingAuthority.issue(receipt.receipt), binding: receipt.binding };
             const persisted = await deliveryMutation("jobs:markVerifiedForDelivery", {
               jobId: job.jobId, expectedAttempt, specialistRunId: String(job.workerRunId), result: result.slice(0, 4_000),
               verificationNote: `${job.goalStage === "planning" ? "Goal plan" : "Deep validation"} machine contract is structurally valid`,
@@ -1536,15 +1537,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
 
         const reviewEvidence = cumulativeWorkEvidence(job.checkpoint, result);
         let gitReview: { envelope: GitReviewEnvelope; binding: GitReviewBinding } | undefined;
+        let reviewAuthority = receiptAuthority;
         if (repoDir) {
-          if (!receiptAuthority || !repositoryDeliveryReadiness(true, receiptAuthority).ready) {
-            await convexMutation("jobs:checkpointAndRequeue", {
-              jobId: job.jobId, expectedAttempt,
-              checkpoint: "Repository delivery is held: the controller receipt signer is unavailable. Do not rerun the specialist.",
-              result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: failureBackoffMs(expectedAttempt),
-            }).catch(() => null);
-            return;
-          }
           const receipt = await buildGitReviewReceipt({
             runGit: (args) => sh("git", ["-C", repoDir!, ...args], env),
             jobId: String(job.jobId),
@@ -1579,8 +1573,18 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }
             return;
           }
+          const signingAuthority = await trustedGitReviewReceiptAuthority();
+          if (!signingAuthority || !repositoryDeliveryReadiness(true, signingAuthority).ready) {
+            await convexMutation("jobs:checkpointAndRequeue", {
+              jobId: job.jobId, expectedAttempt,
+              checkpoint: "Repository delivery is held: the controller receipt signer is unavailable. Do not rerun the specialist.",
+              result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: failureBackoffMs(expectedAttempt),
+            }).catch(() => null);
+            return;
+          }
+          reviewAuthority = signingAuthority;
           gitReview = {
-            envelope: receiptAuthority.issue(receipt.receipt),
+            envelope: signingAuthority.issue(receipt.receipt),
             binding: receipt.binding,
           };
         }
@@ -1599,7 +1603,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           reviewEvidence,
           job.goalStage,
           gitReview,
-          receiptAuthority,
+          reviewAuthority,
         ).catch(() => null);
         if (await stopIfLeaseLost(`Supervisor review interrupted.\n\n${continuationCheckpoint}`, result, branch)) return;
         if (!verify) {
