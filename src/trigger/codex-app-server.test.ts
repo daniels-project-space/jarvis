@@ -117,10 +117,15 @@ describe("Codex app-server dynamic tools", () => {
       preamble: "test", modelTier: "luna", onDelta: () => {},
     });
     await vi.waitFor(() => expect(writes).toHaveLength(1));
-    expect(writes[0].params).toMatchObject({ sandbox: "danger-full-access" });
-    expect(writes[0].params).not.toHaveProperty("permissions");
-    expect(writes[0].params).not.toHaveProperty("config");
-    expect(writes[0].params).not.toHaveProperty("environments");
+    expect(writes[0].params).toEqual({
+      model: "gpt-5.6-luna",
+      baseInstructions: "test",
+      developerInstructions: "Remain the foreground Jarvis conversation. Give the useful answer immediately. Delegate long work instead of blocking conversation.",
+      cwd: "/tmp",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+      ephemeral: false,
+    });
     internals.receive(JSON.stringify({ id: writes[0].id, result: { thread: { id: "foreground-thread" } } }));
     await vi.waitFor(() => expect(writes).toHaveLength(2));
     internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "foreground-turn" } } }));

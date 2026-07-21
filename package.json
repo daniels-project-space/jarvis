@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
-    "probe:codex-cloud-permissions": "tsx scripts/probe-codex-cloud-permissions.ts"
+    "probe:codex-cloud-permissions": "tsx scripts/probe-codex-cloud-permissions.ts",
+    "probe:cloud-workspace-provider": "tsx scripts/probe-cloud-workspace-provider.ts"
   },
   "dependencies": {
     "@daytona/sdk": "0.200.0",

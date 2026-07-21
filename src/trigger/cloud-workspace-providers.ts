@@ -22,6 +22,7 @@ import {
   type WorkspaceCheckpoint,
   type WorkspaceLimits,
 } from "./cloud-workspace";
+import { assertCloudProviderExecutionReady } from "./cloud-provider-probe-attestation";
 
 const ROOT = "/workspace/repository";
 const ARCHIVE_PATH = "/workspace/jarvis-source.tar";
@@ -196,7 +197,7 @@ abstract class ProviderBase implements CloudWorkspaceProvider {
   protected abstract writeAbsolute(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number): Promise<void>;
 }
 
-export class E2BCloudWorkspaceProvider extends ProviderBase {
+class E2BCloudWorkspaceProvider extends ProviderBase {
   readonly name = "e2b" as const;
   readonly capabilities = CAPABILITIES.e2b;
   private readonly sandboxes = new Map<string, E2BSandbox>();
@@ -282,7 +283,7 @@ export class E2BCloudWorkspaceProvider extends ProviderBase {
   }
 }
 
-export class DaytonaCloudWorkspaceProvider extends ProviderBase {
+class DaytonaCloudWorkspaceProvider extends ProviderBase {
   readonly name = "daytona" as const;
   readonly capabilities = CAPABILITIES.daytona;
   private client?: Daytona;
@@ -354,7 +355,7 @@ export class DaytonaCloudWorkspaceProvider extends ProviderBase {
   private async get(workspace: CloudWorkspace) { assertWorkspaceIdentity(workspace); const cached = this.sandboxes.get(workspace.providerWorkspaceId); if (cached) return cached; const sandbox = await (await this.getClient()).get(workspace.providerWorkspaceId); this.sandboxes.set(workspace.providerWorkspaceId, sandbox); return sandbox; }
 }
 
-export class Sandbox0CloudWorkspaceProvider extends ProviderBase {
+class Sandbox0CloudWorkspaceProvider extends ProviderBase {
   readonly name = "sandbox0" as const;
   readonly capabilities = CAPABILITIES.sandbox0;
   private client?: Sandbox0Client;
@@ -428,26 +429,76 @@ export class CloudflareSandboxCompatibleProvider implements CloudWorkspaceProvid
   terminate: CloudWorkspaceProvider["terminate"] = (workspace, reason) => this.require().terminate(workspace, reason);
 }
 
+class CleanupOnlyCloudWorkspaceProvider implements CloudWorkspaceProvider {
+  readonly name: CloudWorkspaceProviderName;
+  readonly capabilities = CAPABILITIES.cloudflare;
+  constructor(private readonly provider: CloudWorkspaceProvider) { this.name = provider.name; }
+  private denied(): never {
+    throw new CloudWorkspaceError(this.name, "provider_probe_attestation_failed", "cleanup authority cannot start or operate a cloud workspace", "blocked");
+  }
+  createWorkspace: CloudWorkspaceProvider["createWorkspace"] = async () => this.denied();
+  uploadCredentiallessArchive: CloudWorkspaceProvider["uploadCredentiallessArchive"] = async () => this.denied();
+  exec: CloudWorkspaceProvider["exec"] = async () => this.denied();
+  readFile: CloudWorkspaceProvider["readFile"] = async () => this.denied();
+  writeFile: CloudWorkspaceProvider["writeFile"] = async () => this.denied();
+  listFiles: CloudWorkspaceProvider["listFiles"] = async () => this.denied();
+  checkpoint: CloudWorkspaceProvider["checkpoint"] = async () => this.denied();
+  recreateFromCheckpoint: CloudWorkspaceProvider["recreateFromCheckpoint"] = async () => this.denied();
+  exportPatch: CloudWorkspaceProvider["exportPatch"] = async () => this.denied();
+  terminate: CloudWorkspaceProvider["terminate"] = (workspace, reason) => this.provider.terminate(workspace, reason);
+}
+
+function configuredProviderAdapter(env: Readonly<Record<string, string | undefined>>): CloudWorkspaceProvider {
+  const name = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
+  if (name === "e2b") {
+    if (!env.E2B_API_KEY) throw new CloudWorkspaceError("e2b", "missing_configuration", "E2B_API_KEY is not configured");
+    return new E2BCloudWorkspaceProvider(env.E2B_API_KEY);
+  }
+  if (name === "daytona") {
+    if (!env.DAYTONA_API_KEY) throw new CloudWorkspaceError("daytona", "missing_configuration", "DAYTONA_API_KEY is not configured");
+    return new DaytonaCloudWorkspaceProvider(env.DAYTONA_API_KEY, env.DAYTONA_API_URL);
+  }
+  if (name === "sandbox0") {
+    if (!env.SANDBOX0_TOKEN) throw new CloudWorkspaceError("sandbox0", "missing_configuration", "SANDBOX0_TOKEN is not configured");
+    return new Sandbox0CloudWorkspaceProvider(env.SANDBOX0_TOKEN, env.SANDBOX0_BASE_URL);
+  }
+  if (name === "cloudflare") {
+    throw new CloudWorkspaceError("cloudflare", "missing_configuration", "Cloudflare Sandbox-compatible client is not configured");
+  }
+  throw new CloudWorkspaceError("cloudflare", "missing_configuration", "JARVIS_CLOUD_WORKSPACE_PROVIDER must select e2b, daytona, sandbox0, or cloudflare");
+}
+
 export function configuredCloudWorkspaceProvider(
   env: Readonly<Record<string, string | undefined>>,
   requireExecutionCapabilities = true,
 ): CloudWorkspaceProvider {
   const name = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
-  let provider: CloudWorkspaceProvider;
   if (name === "e2b") {
     if (!env.E2B_API_KEY) throw new CloudWorkspaceError("e2b", "missing_configuration", "E2B_API_KEY is not configured");
-    provider = new E2BCloudWorkspaceProvider(env.E2B_API_KEY);
   } else if (name === "daytona") {
     if (!env.DAYTONA_API_KEY) throw new CloudWorkspaceError("daytona", "missing_configuration", "DAYTONA_API_KEY is not configured");
-    provider = new DaytonaCloudWorkspaceProvider(env.DAYTONA_API_KEY, env.DAYTONA_API_URL);
   } else if (name === "sandbox0") {
     if (!env.SANDBOX0_TOKEN) throw new CloudWorkspaceError("sandbox0", "missing_configuration", "SANDBOX0_TOKEN is not configured");
-    provider = new Sandbox0CloudWorkspaceProvider(env.SANDBOX0_TOKEN, env.SANDBOX0_BASE_URL);
   }
   else if (name === "cloudflare") {
     throw new CloudWorkspaceError("cloudflare", "missing_configuration", "Cloudflare Sandbox-compatible client is not configured");
   }
   else throw new CloudWorkspaceError("cloudflare", "missing_configuration", "JARVIS_CLOUD_WORKSPACE_PROVIDER must select e2b, daytona, sandbox0, or cloudflare");
-  if (requireExecutionCapabilities) assertRequiredCapabilities(provider);
+  if (requireExecutionCapabilities) assertCloudProviderExecutionReady(env);
+  const provider = configuredProviderAdapter(env);
+  if (!requireExecutionCapabilities) return new CleanupOnlyCloudWorkspaceProvider(provider);
+  assertRequiredCapabilities(provider);
   return provider;
+}
+
+/** Live-probe authority is explicit and never available to normal execution or cleanup callers. */
+export function configuredCloudWorkspaceProviderForLiveProbe(
+  env: Readonly<Record<string, string | undefined>>,
+): CloudWorkspaceProvider {
+  const name = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
+  if (env.JARVIS_CLOUD_PROVIDER_PROBE !== "live") {
+    const provider = name === "e2b" || name === "daytona" || name === "sandbox0" || name === "cloudflare" ? name : "cloudflare";
+    throw new CloudWorkspaceError(provider, "provider_probe_attestation_failed", "live provider probe authority was not explicitly enabled", "blocked");
+  }
+  return configuredProviderAdapter(env);
 }

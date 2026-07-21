@@ -23,7 +23,7 @@ describe("cloud Codex permission construction", () => {
     });
     expect(filesystem).toMatchObject({
       ":minimal": "read", ":workspace_roots": { ".": "read" },
-      "/authority/codex-job-7": "deny", "/proc": "deny", "/tmp/work": "deny",
+      "/authority/codex-job-7": "deny", "/proc": "deny", "/tmp": "deny", "/tmp/work": "deny",
       "/authority": "deny", "/app": "deny", "/tmp/work/controller-job-7": "read",
     });
     expect(permissions[CLOUD_CODEX_PERMISSION_PROFILE_ID].network.enabled).toBe(false);
@@ -45,7 +45,7 @@ describe("cloud Codex permission construction", () => {
     });
     expect(CLOUD_CODEX_SENSITIVE_ENV_PATTERNS).toEqual([
       "*_KEY", "*_TOKEN", "*_SECRET", "*_PASSWORD", "CODEX_*", "OPENAI_*", "AWS_*",
-      "GITHUB_*", "CONVEX_*", "TRIGGER_*",
+      "GITHUB_*", "CONVEX_*", "TRIGGER_*", "*KEYRING*", "*RECEIPT*", "*PROVIDER*",
     ]);
     expect(profile.config.features).toMatchObject({ shell_tool: false, unified_exec: false });
     expect(profile.config.web_search).toBe("disabled");
@@ -54,5 +54,10 @@ describe("cloud Codex permission construction", () => {
   it("refuses relative or absent authority paths", () => {
     expect(() => buildCloudCodexPermissionProfile({ codexHome: "relative", controllerScratch: "/scratch" })).toThrow(/absolute/);
     expect(() => buildCloudCodexPermissionProfile({ codexHome: "/auth", controllerScratch: "relative" })).toThrow(/absolute/);
+    expect(() => buildCloudCodexPermissionProfile({
+      codexHome: "/auth", controllerScratch: "/scratch", controllerAuthorityRoots: ["relative-root"],
+    })).toThrow(/controller authority root must be an absolute path/);
+    expect(() => buildCloudCodexPermissionProfile({ codexHome: "/auth", controllerScratch: "/auth" })).toThrow(/outside isolated CODEX_HOME/);
+    expect(() => buildCloudCodexPermissionProfile({ codexHome: "/auth", controllerScratch: "/tmp" })).toThrow(/exact child workspace/);
   });
 });

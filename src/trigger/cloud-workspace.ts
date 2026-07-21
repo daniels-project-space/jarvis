@@ -5,6 +5,7 @@ export type CloudWorkspaceProviderName = "e2b" | "daytona" | "sandbox0" | "cloud
 export type CloudWorkspaceFailureCode =
   | "missing_configuration"
   | "invalid_configuration"
+  | "provider_probe_attestation_failed"
   | "controller_isolation_unproven"
   | "capability_unsupported"
   | "provider_unavailable"
@@ -161,8 +162,7 @@ export function assertWorkspaceIdentity(workspace: CloudWorkspace): void {
   }
 }
 
-export function assertRequiredCapabilities(provider: CloudWorkspaceProvider): void {
-  const required: Array<keyof CloudWorkspaceCapabilities> = [
+export const REQUIRED_CLOUD_WORKSPACE_CAPABILITIES = Object.freeze([
     "credentiallessArchive",
     "privateIngress",
     "networkDenyByDefault",
@@ -171,8 +171,10 @@ export function assertRequiredCapabilities(provider: CloudWorkspaceProvider): vo
     "boundedTtl",
     "exactCommandCancellation",
     "portableCheckpointReplay",
-  ];
-  const missing = required.filter((capability) => !provider.capabilities[capability]);
+] as const satisfies readonly (keyof CloudWorkspaceCapabilities)[]);
+
+export function assertRequiredCapabilities(provider: CloudWorkspaceProvider): void {
+  const missing = REQUIRED_CLOUD_WORKSPACE_CAPABILITIES.filter((capability) => !provider.capabilities[capability]);
   if (missing.length) {
     throw new CloudWorkspaceError(
       provider.name,

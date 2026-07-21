@@ -1,3 +1,4 @@
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 export const CLOUD_CODEX_PERMISSION_PROFILE_ID = "jarvis_cloud_bridge";
@@ -13,6 +14,9 @@ export const CLOUD_CODEX_SENSITIVE_ENV_PATTERNS = Object.freeze([
   "GITHUB_*",
   "CONVEX_*",
   "TRIGGER_*",
+  "*KEYRING*",
+  "*RECEIPT*",
+  "*PROVIDER*",
 ]);
 
 export type CloudCodexPermissionProfile = {
@@ -38,16 +42,21 @@ export function buildCloudCodexPermissionProfile(input: {
 }): CloudCodexPermissionProfile {
   const codexHome = absolutePath(input.codexHome, "isolated CODEX_HOME");
   const controllerScratch = absolutePath(input.controllerScratch, "controller scratch");
+  const tempAuthorityRoot = resolve(tmpdir());
+  if (controllerScratch === tempAuthorityRoot || controllerScratch === codexHome || controllerScratch.startsWith(`${codexHome}/`)) {
+    throw new Error("controller scratch must be an exact child workspace outside isolated CODEX_HOME");
+  }
+  const authorityRoots = (input.controllerAuthorityRoots ?? [])
+    .filter((value): value is string => value !== undefined && value.trim().length > 0)
+    .map((value) => absolutePath(value, "controller authority root"));
   const denied = new Set<string>([
     codexHome,
     "/proc",
+    tempAuthorityRoot,
     dirname(controllerScratch),
-    ...input.controllerAuthorityRoots
-      ?.filter((value): value is string => Boolean(value && isAbsolute(value)))
-      .map((value) => resolve(value)) ?? [],
+    ...authorityRoots,
   ]);
   denied.delete(controllerScratch);
-  denied.delete("/");
 
   const filesystem: Record<string, unknown> = {
     ":minimal": "read",

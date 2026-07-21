@@ -201,7 +201,8 @@ describe("fail-closed cloud workspace boundary", () => {
       exactCommandCancellation: false,
     });
     expect(Object.values(CLOUD_WORKSPACE_CAPABILITY_MATRIX.cloudflare).every((value) => value === false)).toBe(true);
-    expect(() => configuredCloudWorkspaceProvider({ JARVIS_CLOUD_WORKSPACE_PROVIDER: "e2b", E2B_API_KEY: "test-only" })).toThrow(/boundedResources/);
+    const e2b = configuredCloudWorkspaceProvider({ JARVIS_CLOUD_WORKSPACE_PROVIDER: "e2b", E2B_API_KEY: "test-only" }, false);
+    expect(() => assertRequiredCapabilities(e2b)).toThrow(/boundedResources/);
     const fake = new FakeCloudWorkspaceProvider();
     fake.capabilities.exactCommandCancellation = false;
     expect(() => assertRequiredCapabilities(fake)).toThrow(/exactCommandCancellation/);

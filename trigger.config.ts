@@ -23,15 +23,16 @@ export default defineConfig({
         "e2b@2.35.0",
         "sandbox0@0.9.3",
       ] }),
-      // Git and archive utilities are controller-only. Background Codex work
-      // remains blocked until the pinned protocol can disable built-in host
-      // tools; repository commands will then cross only the provider adapter.
+      // Git and archive utilities are controller-only. The pinned protocol's
+      // live permission attestation disables built-in host tools, so cloud
+      // repository commands cross only the provider adapter.
       aptGet({ packages: ["curl", "git", "gh", "jq", "ca-certificates"] }),
       syncEnvVars(() => {
         const values = Object.fromEntries(
           [
             "CODEX_AUTH_JSON_B64", "CONVEX_URL", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN", "GITHUB_TOKEN", "VAULT_ACCESS_TOKEN",
-            "JARVIS_CLOUD_WORKSPACE_PROVIDER", "JARVIS_CLOUD_WORKSPACE_TEMPLATE",
+            "JARVIS_CLOUD_WORKSPACE_PROVIDER", "JARVIS_CLOUD_WORKSPACE_TEMPLATE", "JARVIS_CLOUD_WORKSPACE_TEMPLATE_DIGEST",
+            "JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID", "JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT", "JARVIS_CLOUD_PROVIDER_PROBE_KEYRING",
             "E2B_API_KEY", "DAYTONA_API_KEY", "DAYTONA_API_URL", "SANDBOX0_TOKEN", "SANDBOX0_BASE_URL",
           ]
             .map((key) => [key, process.env[key]])

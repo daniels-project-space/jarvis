@@ -83,6 +83,10 @@ import {
 } from "./cloud-workspace-controller";
 import { createR2CheckpointStore } from "./cloud-checkpoint-r2";
 import { configuredCloudWorkspaceProvider } from "./cloud-workspace-providers";
+import {
+  CLOUD_WORKSPACE_RUNTIME_IDENTITY,
+  DEFAULT_CLOUD_WORKSPACE_TEMPLATE,
+} from "./cloud-provider-probe-attestation";
 import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider } from "./cloud-workspace";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
@@ -1420,11 +1424,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }).catch(() => null);
           return;
         }
-        const workspaceRuntime = "node-22:codex-0.144.5";
+        const workspaceRuntime = CLOUD_WORKSPACE_RUNTIME_IDENTITY;
         const lockfileDigest = repoDir && existsSync(join(repoDir, "package-lock.json"))
           ? sha256Bytes(readFileSync(join(repoDir, "package-lock.json")))
           : sha256Bytes("no-lockfile");
-        const workspaceTemplate = String(process.env.JARVIS_CLOUD_WORKSPACE_TEMPLATE ?? "node22-codex-0.144.5");
+        const workspaceTemplate = String(process.env.JARVIS_CLOUD_WORKSPACE_TEMPLATE ?? DEFAULT_CLOUD_WORKSPACE_TEMPLATE);
         const checkpointStore = await createR2CheckpointStore();
         if (repoDir) {
           const preparedWorkspace = await prepareCloudWorkspaceExecution({

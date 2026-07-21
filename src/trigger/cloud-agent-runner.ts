@@ -1,4 +1,5 @@
 import { dirname } from "node:path";
+import { readdirSync } from "node:fs";
 import { CodexAppServer, CodexPermissionAttestationError } from "./codex-app-server";
 import { buildCloudCodexPermissionProfile } from "./cloud-codex-permissions";
 import { CloudWorkspaceToolBridge, CLOUD_REPOSITORY_TOOLS } from "./cloud-workspace-tools";
@@ -27,6 +28,9 @@ export async function runCloudWorkspaceAgent(input: {
   const codexHome = String(input.controllerEnv.CODEX_HOME ?? "");
   let permissionProfile;
   try {
+    if (readdirSync(input.controllerScratch).length !== 0) {
+      throw new Error("controller scratch must be empty");
+    }
     permissionProfile = buildCloudCodexPermissionProfile({
       codexHome,
       controllerScratch: input.controllerScratch,
