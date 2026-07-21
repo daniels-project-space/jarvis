@@ -7,7 +7,7 @@ type LoadOptions = {
   loadVault?: (service: string) => Promise<Record<string, string>>;
 };
 
-let cached: Promise<Authority | null> | null = null;
+let cached: Promise<Authority> | null = null;
 
 /**
  * The HMAC key belongs only to the Trigger controller.  Do not resolve this
@@ -30,10 +30,26 @@ export async function loadGitReviewReceiptAuthority(options: LoadOptions = {}): 
   try { return createGitReviewReceiptAuthority(secret); } catch { return null; }
 }
 
-/** Cached only in the trusted controller process; never expose the key. */
-export function trustedGitReviewReceiptAuthority(): Promise<Authority | null> {
-  cached ??= loadGitReviewReceiptAuthority();
-  return cached;
+/**
+ * Cache only a successful authority.  A vault outage is an availability
+ * signal, not a permanent identity decision for a warm controller process.
+ */
+export async function trustedGitReviewReceiptAuthority(): Promise<Authority | null> {
+  if (cached) return cached;
+  const loaded = await loadGitReviewReceiptAuthority();
+  if (!loaded) return null;
+  cached = Promise.resolve(loaded);
+  return loaded;
 }
 
 export function resetGitReviewReceiptAuthorityForTest() { cached = null; }
+
+/** Secret-free release/readiness signal for the controller health surface. */
+export async function gitReviewReceiptAuthorityHealth(options: LoadOptions = {}) {
+  const authority = await loadGitReviewReceiptAuthority(options);
+  return {
+    ready: Boolean(authority),
+    // Never reveal source, value, length, digest, or any vault metadata.
+    reason: authority ? "ready" : "JARVIS_GIT_REVIEW_RECEIPT_SECRET is unavailable or too short",
+  } as const;
+}

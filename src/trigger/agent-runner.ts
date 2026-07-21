@@ -841,11 +841,15 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       // it or advance to the next consequential call.
       const deliveryOwner = `trigger:${String(job.jobId)}:${randomBytes(12).toString("hex")}`;
       const deliveryToken = randomBytes(32).toString("hex");
+      const deliveryFence = Number.isFinite(Number(job.deliveryGeneration)) && typeof job.deliveryRunId === "string"
+        ? { sourceWorkAttempt: Number(job.sourceWorkAttempt ?? expectedAttempt), deliveryGeneration: Number(job.deliveryGeneration), deliveryRunId: job.deliveryRunId }
+        : null;
       let deliveryLease: { owner: string; token: string; version: number; until: number } | null = null;
       const linearizeDelivery = async () => {
         const lease = await convexMutation("jobs:linearizeDelivery", {
           jobId: job.jobId, expectedAttempt, deliveryLeaseOwner: deliveryOwner, deliveryLeaseToken: deliveryToken,
           deliveryLeaseVersion: deliveryLease?.version,
+          ...(deliveryFence ?? {}),
         }).catch(() => null);
         if (!lease || typeof lease !== "object" || typeof lease.version !== "number") return false;
         deliveryLease = lease as typeof deliveryLease;
@@ -856,6 +860,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         return await convexMutation(path, {
           ...args, deliveryLeaseOwner: deliveryLease.owner, deliveryLeaseToken: deliveryLease.token,
           deliveryLeaseVersion: deliveryLease.version,
+          ...(deliveryFence ?? {}),
         }).catch(() => false);
       };
       try {
@@ -874,16 +879,16 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           ? job.branch
           : "";
         const resumeBranch = validatedGoalBranch || persistedBranch || branch || "";
+        const continuationPolicy = String(job.deliveryMode ?? (job.readonly ? "read_only" : "manual"));
         const mayResumeControllerDelivery = Boolean(
           repo
           && token
           && resumeBranch
           && job.verificationVerdict === "pass"
           && ["pull_request", "blocked"].includes(String(job.deliveryStatus ?? ""))
-          && (
-            autonomousRepositoryDelivery(job, repo)
-            || Boolean(validatedGoalBranch && isOwnedRepository(repo))
-          )
+          // The review receipt, not a delivery mode, authorizes a controller
+          // continuation.  Policy below decides draft/merge/no-op semantics.
+          && ["auto_merge", "manual", "read_only"].includes(continuationPolicy)
         );
         if (mayResumeControllerDelivery) {
           // A continuation is allowed only when the exact cold record named
@@ -927,7 +932,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             stage: "delivery",
             percent: 97,
           }).catch(() => {});
-          const branchChanged = await branchHasChanges(repo, resumeBranch, token);
+          // Read-only receipt completion never calls GitHub.  It is a pure
+          // controller evidence outcome, even if a branch pointer is present.
+          const branchChanged = continuationPolicy === "read_only"
+            ? false
+            : await branchHasChanges(repo, resumeBranch, token);
           let pullRequestUrl = typeof job.pullRequestUrl === "string" ? job.pullRequestUrl : "";
           let mergeSha = "";
           let deliveryFailure = branchChanged === null
@@ -945,6 +954,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               title,
               body: `## JARVIS verified delivery continuation\n${String(job.result ?? "Supervisor verification passed.")}`,
               token,
+              draft: continuationPolicy !== "auto_merge",
+              reviewed: {
+                headSha: continuationReview.envelope.receipt.headSha,
+                baseSha: continuationReview.envelope.receipt.baseSha,
+              },
             });
             pullRequestUrl = pull?.url ?? pullRequestUrl;
             if (!pull) {
@@ -957,15 +971,25 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 pullRequestUrl: pull.url,
                 deliveryStatus: "pull_request",
               }).catch(() => {});
-              if (!await linearizeDelivery()) return;
-              const merge = await mergeVerifiedPullRequest({
+              if (continuationPolicy === "manual") {
+                // A manual delivery is deliberately terminal after creating a
+                // protected draft.  Retries may recover that same draft but
+                // must never promote or merge it.
+              } else if (!await linearizeDelivery()) return;
+              const merge = continuationPolicy === "manual"
+                ? { status: "pending" as const, note: "protected draft PR ready for Daniel" }
+                : await mergeVerifiedPullRequest({
                 repo,
                 pull,
                 title,
                 token,
+                reviewedHeadSha: continuationReview.envelope.receipt.headSha,
                 shouldContinue: async () => (await executionStatus()) === "running",
               });
-              if (merge.status === "merged") mergeSha = merge.sha;
+              if (continuationPolicy === "manual") {
+                // The setDelivery write below records pull_request, then the
+                // receipt-backed finalize records the protected-draft result.
+              } else if (merge.status === "merged") mergeSha = merge.sha;
               else deliveryFailure = merge.note;
             }
           }
@@ -987,18 +1011,24 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }).catch(() => null);
             return;
           }
+          const protectedDraft = continuationPolicy === "manual";
+          const readOnlyDelivery = continuationPolicy === "read_only";
           const recorded = await deliveryMutation("jobs:setDelivery", {
             jobId: job.jobId,
             expectedAttempt,
             branch: resumeBranch,
             pullRequestUrl: pullRequestUrl || undefined,
-            deliveryStatus: "merged",
+            deliveryStatus: protectedDraft ? "pull_request" : readOnlyDelivery ? "branch" : "merged",
             mergeCommitSha: mergeSha || undefined,
           }).catch(() => false);
           if (!recorded) throw new Error("verified delivery completed but its durable receipt could not be recorded");
           const deliveryResult = [
             String(job.result ?? "Supervisor verification passed."),
-            `Delivery: verified branch ${resumeBranch} is on the default branch${pullRequestUrl ? ` via ${pullRequestUrl}` : ""}${mergeSha ? ` at ${mergeSha}` : ""}.`,
+            protectedDraft
+              ? `Delivery: protected draft PR ready for Daniel at ${pullRequestUrl ?? resumeBranch}.`
+              : readOnlyDelivery
+                ? "Delivery: read-only controller receipt finalized without a GitHub mutation."
+              : `Delivery: verified branch ${resumeBranch} is on the default branch${pullRequestUrl ? ` via ${pullRequestUrl}` : ""}${mergeSha ? ` at ${mergeSha}` : ""}.`,
           ].filter(Boolean).join("\n\n").slice(0, 4_000);
           const finalized = await deliveryMutation("jobs:finalize", {
             jobId: job.jobId,
@@ -1153,7 +1183,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             lastHeartbeatAt = now;
             durableProgress = durableProgress
               .catch(() => undefined)
-              .then(() => convexMutation("jobs:touchHeartbeat", { jobId: job.jobId, expectedAttempt }))
+              .then(() => convexMutation(
+                deliveryFence ? "jobs:touchDeliveryHeartbeat" : "jobs:touchHeartbeat",
+                { jobId: job.jobId, expectedAttempt, ...(deliveryFence ?? {}) },
+              ))
               .catch(() => undefined);
           }
           if (!majorTransition) return;
@@ -1512,6 +1545,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               title: `JARVIS goal: ${(job.label ?? job.task).slice(0, 78)}`,
               body: `## Goal Mode final validation\n${result}`,
               token,
+              reviewed: goalReview ? {
+                headSha: goalReview.envelope.receipt.headSha,
+                baseSha: goalReview.envelope.receipt.baseSha,
+              } : undefined,
             });
             goalPullRequestUrl = pull?.url;
             if (pull) {
@@ -1530,6 +1567,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                   pull,
                   title: `JARVIS goal: ${(job.label ?? job.task).slice(0, 78)}`,
                   token,
+                  reviewedHeadSha: goalReview?.envelope.receipt.headSha,
                   shouldContinue: async () => (await executionStatus()) === "running",
                 })
               : { status: "blocked" as const, note: "the delivery controller could not open the goal pull request" };
@@ -1807,6 +1845,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 body: `## JARVIS work order\n${job.task}\n\n## Acceptance criteria\n${criteria.map((item: string) => `- ${item}`).join("\n")}\n\n## Agent evidence\n${result}`,
                 token,
                 draft: !autonomous,
+                reviewed: gitReview ? {
+                  headSha: gitReview.envelope.receipt.headSha,
+                  baseSha: gitReview.envelope.receipt.baseSha,
+                } : undefined,
               })
             : null;
           pullRequestUrl = pull?.url ?? null;
@@ -1826,6 +1868,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               pull,
               title,
               token,
+              reviewedHeadSha: gitReview?.envelope.receipt.headSha,
               shouldContinue: async () => (await executionStatus()) === "running",
             });
             if (merged.status === "merged") {

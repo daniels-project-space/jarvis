@@ -595,6 +595,38 @@ export default defineSchema({
     .index("by_job_attempt", ["jobId", "attempt"])
     .index("by_status_progress", ["status", "progressAt"]),
 
+  // Controller delivery has its own durable lease lineage.  It deliberately
+  // points at an immutable specialist attempt rather than reusing that
+  // attempt's running/liveness state while GitHub checks are pending.
+  deliveryAttempts: defineTable({
+    jobId: v.id("jobs"),
+    sourceWorkAttempt: v.number(),
+    generation: v.number(),
+    dispatchId: v.string(),
+    deliveryRunId: v.string(),
+    policy: v.string(),
+    status: v.string(), // running | checkpointed | done | blocked | abandoned
+    reviewReceiptId: v.optional(v.id("reviewReceipts")),
+    reviewReceiptDigest: v.optional(v.string()),
+    reviewedHeadSha: v.optional(v.string()),
+    reviewedBaseSha: v.optional(v.string()),
+    reviewedHeadTreeSha: v.optional(v.string()),
+    reviewedDiffSha256: v.optional(v.string()),
+    observedPullRequestHead: v.optional(v.string()),
+    leaseOwner: v.optional(v.string()),
+    leaseToken: v.optional(v.string()),
+    leaseVersion: v.optional(v.number()),
+    leaseUntil: v.optional(v.number()),
+    heartbeatAt: v.number(),
+    retries: v.number(),
+    nextRunAt: v.optional(v.number()),
+    completedAt: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_job_source_generation", ["jobId", "sourceWorkAttempt", "generation"])
+    .index("by_status_heartbeat", ["status", "heartbeatAt"]),
+
   // Receipts are only inserted by terminal authority transitions and are
   // never patched. They bind acceptance evidence and artifacts to one exact
   // attempt, closing the replay/substitution gap at completion.

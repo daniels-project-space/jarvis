@@ -8,16 +8,17 @@ function claimHarness() {
   const attempts: Row[] = [];
   const events: Row[] = [];
   const runtime: Row[] = [];
+  const deliveryAttempts: Row[] = [];
   let id = 0;
-  const rows = (table: string) => table === "jobs" ? [...jobs.values()] : table === "workAttempts" ? attempts : table === "workEvents" ? events : table === "jobRuntime" ? runtime : [];
+  const rows = (table: string) => table === "jobs" ? [...jobs.values()] : table === "workAttempts" ? attempts : table === "workEvents" ? events : table === "jobRuntime" ? runtime : table === "deliveryAttempts" ? deliveryAttempts : [];
   const matches = (table: string, predicates: Array<{ field: string; value: unknown }>) => rows(table).filter((row) => predicates.every((p) => row[p.field] === p.value));
   const db: any = {
-    get: async (key: string) => jobs.get(String(key)) ?? rows("workAttempts").find((r) => r._id === key) ?? rows("jobRuntime").find((r) => r._id === key) ?? null,
+    get: async (key: string) => jobs.get(String(key)) ?? rows("workAttempts").find((r) => r._id === key) ?? rows("jobRuntime").find((r) => r._id === key) ?? rows("deliveryAttempts").find((r) => r._id === key) ?? null,
     normalizeId: (_table: string, key: string) => jobs.has(String(key)) ? key : null,
     insert: async (table: string, value: Row) => {
       const _id = `${table}-${++id}`;
       const record = { ...value, _id };
-      if (table === "jobs") jobs.set(_id, record); else if (table === "workAttempts") attempts.push(record); else if (table === "workEvents") events.push(record); else if (table === "jobRuntime") runtime.push(record);
+      if (table === "jobs") jobs.set(_id, record); else if (table === "workAttempts") attempts.push(record); else if (table === "workEvents") events.push(record); else if (table === "jobRuntime") runtime.push(record); else if (table === "deliveryAttempts") deliveryAttempts.push(record);
       return _id;
     },
     patch: async (key: string, patch: Row) => {
@@ -29,7 +30,8 @@ function claimHarness() {
     query: (table: string) => ({
       withIndex: (_name: string, callback: (q: any) => any) => {
         const predicates: any[] = [];
-        callback({ eq: (field: string, value: unknown) => (predicates.push({ field, value }), { eq: (f: string, v: unknown) => (predicates.push({ field: f, value: v }), {}) }) });
+        const query = { eq: (field: string, value: unknown) => { predicates.push({ field, value }); return query; } };
+        callback(query);
         const selected = () => matches(table, predicates);
         return { first: async () => selected()[0] ?? null, take: async (n: number) => selected().slice(0, n), order: () => ({ take: async (n: number) => selected().slice(0, n) }) };
       },
@@ -39,7 +41,7 @@ function claimHarness() {
   const dep: Row = { _id: "dep-1", task: "dependency", label: "Dependency", status: "done", result: "stable evidence", verificationNote: "checked", createdAt: 0 };
   jobs.set(job._id, job); jobs.set(dep._id, dep);
   attempts.push({ _id: "attempt-1", jobId: "job-1", attempt: 1, status: "dispatching", dispatchId: "dispatch-1", lastEventSeq: 1, livenessAt: 1, progressAt: 1, lastEventAt: 1, createdAt: 1 });
-  return { ctx: { db }, job, attempts, events, jobs };
+  return { ctx: { db }, job, attempts, events, jobs, deliveryAttempts };
 }
 
 const previousToken = process.env.JARVIS_WORKER_TOKEN;
@@ -59,5 +61,22 @@ describe("claimDispatched handler", () => {
     expect(replay).toEqual(first);
     expect(await claim(h.ctx, { jobId: "job-1", dispatchId: "dispatch-1", workerRunId: "run-b", workerToken: "test-worker" })).toBeNull();
     expect(h.events.map((event) => event.sequence)).toEqual([1]);
+  });
+
+  it("binds a delivery continuation to one generation/run and fences a competing controller", async () => {
+    process.env.JARVIS_WORKER_TOKEN = "test-worker";
+    const h = claimHarness();
+    Object.assign(h.job, {
+      status: "dispatching", dispatchId: "delivery-dispatch", attempt: 1,
+      verificationVerdict: "pass", reviewReceiptId: "receipt-1", reviewReceiptDigest: "digest",
+      branch: "jarvis/verified", deliveryGeneration: 7,
+    });
+    Object.assign(h.attempts[0], { status: "checkpointed", workerRunId: "specialist-run", upstreamEvidence: [] });
+    const claim = (claimDispatched as any)._handler;
+    const first = await claim(h.ctx, { jobId: "job-1", dispatchId: "delivery-dispatch", workerRunId: "controller-a", workerToken: "test-worker" });
+    expect(first).toMatchObject({ sourceWorkAttempt: 1, deliveryGeneration: 7, deliveryRunId: "controller-a" });
+    expect(h.deliveryAttempts).toHaveLength(1);
+    expect(h.deliveryAttempts[0]).toMatchObject({ sourceWorkAttempt: 1, generation: 7, dispatchId: "delivery-dispatch", deliveryRunId: "controller-a", status: "running" });
+    expect(await claim(h.ctx, { jobId: "job-1", dispatchId: "delivery-dispatch", workerRunId: "controller-b", workerToken: "test-worker" })).toBeNull();
   });
 });

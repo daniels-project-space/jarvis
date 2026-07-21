@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { loadGitReviewReceiptAuthority } from "./git-review-authority";
+import { gitReviewReceiptAuthorityHealth, loadGitReviewReceiptAuthority } from "./git-review-authority";
 
 describe("trusted Git review receipt authority", () => {
   it("loads the stable named controller-vault secret when a warm worker lacks an environment value", async () => {
@@ -19,5 +19,12 @@ describe("trusted Git review receipt authority", () => {
   it("fails closed for a missing or undersized authority", async () => {
     await expect(loadGitReviewReceiptAuthority({ environment: {} as NodeJS.ProcessEnv, loadVault: async () => ({}) })).resolves.toBeNull();
     await expect(loadGitReviewReceiptAuthority({ environment: { JARVIS_GIT_REVIEW_RECEIPT_SECRET: "short" } as unknown as NodeJS.ProcessEnv })).resolves.toBeNull();
+  });
+
+  it("exposes only a secret-free readiness signal for release preflight", async () => {
+    await expect(gitReviewReceiptAuthorityHealth({
+      environment: {} as NodeJS.ProcessEnv,
+      loadVault: async () => ({}),
+    })).resolves.toEqual({ ready: false, reason: "JARVIS_GIT_REVIEW_RECEIPT_SECRET is unavailable or too short" });
   });
 });

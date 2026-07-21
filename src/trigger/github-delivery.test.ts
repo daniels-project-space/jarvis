@@ -112,7 +112,60 @@ describe("autonomous GitHub delivery", () => {
     });
     expect(result).toEqual({
       status: "blocked",
-      note: "the verified branch conflicts with the current default branch",
+      note: "pull request head changed after controller review; a fresh review is required",
     });
+  });
+
+  it("refuses a PR when the reviewed source or default base moved", async () => {
+    const fetchImpl = vi.fn()
+      // source ref no longer equals the signed receipt head
+      .mockResolvedValueOnce(response(200, { object: { sha: "unreviewed-head" } }))
+      .mockResolvedValueOnce(response(200, { default_branch: "main" }))
+      .mockResolvedValueOnce(response(200, { object: { sha: "reviewed-base" } }));
+    const pull = await openDeliveryPullRequest({
+      repo: "daniels-project-space/jarvis",
+      branch: "jarvis/paul-fix",
+      title: "Paul: fix",
+      body: "Verified evidence",
+      token: "token",
+      reviewed: { headSha: "reviewed-head", baseSha: "reviewed-base" },
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    expect(pull).toBeNull();
+    // It did not list/create a pull request after the authority check failed.
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("never follows a PR head changed by checks or an update-branch operation", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(response(409, { message: "checks pending" }))
+      .mockResolvedValueOnce(response(200, {
+        state: "open", merged: false, mergeable: true, mergeable_state: "behind",
+        head: { sha: "reviewed-head" },
+      }));
+    const result = await mergeVerifiedPullRequest({
+      repo: "daniels-project-space/jarvis",
+      pull: { number: 42, url: "https://github.test/42", headSha: "reviewed-head" },
+      reviewedHeadSha: "reviewed-head",
+      title: "Paul: fix",
+      token: "token",
+      fetchImpl: fetchImpl as typeof fetch,
+      sleep: async () => undefined,
+    });
+    expect(result).toEqual({ status: "blocked", note: "default branch advanced after controller review; a fresh review is required" });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a merge request whose initial PR head is not the signed head", async () => {
+    const fetchImpl = vi.fn();
+    await expect(mergeVerifiedPullRequest({
+      repo: "daniels-project-space/jarvis",
+      pull: { number: 42, url: "https://github.test/42", headSha: "new-head" },
+      reviewedHeadSha: "reviewed-head",
+      title: "Paul: fix",
+      token: "token",
+      fetchImpl: fetchImpl as typeof fetch,
+    })).resolves.toEqual({ status: "blocked", note: "pull request head is not the reviewed receipt head" });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });

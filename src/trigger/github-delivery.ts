@@ -6,6 +6,13 @@ export type PullRequestDelivery = {
   headSha: string;
 };
 
+export type ReviewedDeliveryHead = {
+  /** The exact source commit authenticated by the controller receipt. */
+  headSha: string;
+  /** The default-branch commit used when that receipt was reviewed. */
+  baseSha: string;
+};
+
 export type MergeDeliveryResult =
   | { status: "merged"; sha: string; note: string }
   | { status: "blocked" | "pending"; note: string };
@@ -56,12 +63,34 @@ export async function openDeliveryPullRequest(args: {
   body: string;
   token: string;
   draft?: boolean;
+  reviewed?: ReviewedDeliveryHead;
   fetchImpl?: FetchLike;
 }): Promise<PullRequestDelivery | null> {
   const fetchImpl = args.fetchImpl ?? fetch;
   const headers = apiHeaders(args.token);
   try {
     const [owner] = args.repo.split("/");
+    // The receipt is an authority, not a best-effort annotation.  Refuse to
+    // create/reuse a PR when either side of the reviewed relationship moved.
+    // In particular, never let GitHub's update-branch operation manufacture a
+    // new head that the controller did not review and sign.
+    if (args.reviewed) {
+      const [sourceRef, repository] = await Promise.all([
+        fetchImpl(`https://api.github.com/repos/${args.repo}/git/ref/heads/${encodeURIComponent(args.branch)}`, { headers, cache: "no-store" }),
+        fetchImpl(`https://api.github.com/repos/${args.repo}`, { headers, cache: "no-store" }),
+      ]);
+      if (!sourceRef.ok || !repository.ok) return null;
+      const source = await sourceRef.json() as { object?: { sha?: string } };
+      const metadata = await repository.json() as { default_branch?: string };
+      const defaultBranch = String(metadata.default_branch ?? "main");
+      const baseRef = await fetchImpl(
+        `https://api.github.com/repos/${args.repo}/git/ref/heads/${encodeURIComponent(defaultBranch)}`,
+        { headers, cache: "no-store" },
+      );
+      const base = baseRef.ok ? await baseRef.json() as { object?: { sha?: string } } : null;
+      if (String(source.object?.sha ?? "") !== args.reviewed.headSha
+        || String(base?.object?.sha ?? "") !== args.reviewed.baseSha) return null;
+    }
     const existing = await fetchImpl(
       `https://api.github.com/repos/${args.repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${args.branch}`)}`,
       { headers, cache: "no-store" },
@@ -75,6 +104,7 @@ export async function openDeliveryPullRequest(args: {
         head?: { sha?: string };
       }>;
       if (rows[0]?.number && rows[0]?.html_url) {
+        if (args.reviewed && String(rows[0].head?.sha ?? "") !== args.reviewed.headSha) return null;
         if (rows[0].draft === true && args.draft !== true) {
           const ready = await markReadyForReview(String(rows[0].node_id ?? ""), args.token, fetchImpl);
           if (!ready) return null;
@@ -113,6 +143,7 @@ export async function openDeliveryPullRequest(args: {
       head?: { sha?: string };
     };
     if (!pull.number || !pull.html_url) return null;
+    if (args.reviewed && String(pull.head?.sha ?? "") !== args.reviewed.headSha) return null;
     return {
       number: pull.number,
       url: pull.html_url,
@@ -140,12 +171,18 @@ export async function mergeVerifiedPullRequest(args: {
   shouldContinue?: () => Promise<boolean>;
   fetchImpl?: FetchLike;
   sleep?: (ms: number) => Promise<void>;
+  /** Required for receipt-bound delivery; prevents head substitution. */
+  reviewedHeadSha?: string;
 }): Promise<MergeDeliveryResult> {
   const fetchImpl = args.fetchImpl ?? fetch;
   const sleep = args.sleep ?? wait;
   const headers = apiHeaders(args.token);
   const attempts = Math.max(1, Math.min(90, args.attempts ?? 60));
-  let headSha = args.pull.headSha;
+  const reviewedHeadSha = args.reviewedHeadSha ?? args.pull.headSha;
+  if (!reviewedHeadSha || args.pull.headSha !== reviewedHeadSha) {
+    return { status: "blocked", note: "pull request head is not the reviewed receipt head" };
+  }
+  let headSha = reviewedHeadSha;
   let lastMessage = "GitHub checks have not completed yet";
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -209,20 +246,14 @@ export async function mergeVerifiedPullRequest(args: {
         };
       }
       if (state.state === "closed") return { status: "blocked", note: "pull request closed before delivery" };
-      headSha = String(state.head?.sha ?? headSha);
+      if (String(state.head?.sha ?? "") !== reviewedHeadSha) {
+        return { status: "blocked", note: "pull request head changed after controller review; a fresh review is required" };
+      }
       if (state.mergeable === false && state.mergeable_state === "dirty") {
         return { status: "blocked", note: "the verified branch conflicts with the current default branch" };
       }
       if (state.mergeable_state === "behind") {
-        await fetchImpl(
-          `https://api.github.com/repos/${args.repo}/pulls/${args.pull.number}/update-branch`,
-          {
-            method: "PUT",
-            headers,
-            body: JSON.stringify(headSha ? { expected_head_sha: headSha } : {}),
-            cache: "no-store",
-          },
-        ).catch(() => null);
+        return { status: "blocked", note: "default branch advanced after controller review; a fresh review is required" };
       }
     }
     if (attempt + 1 < attempts) await sleep(Math.max(0, args.intervalMs ?? 10_000));
