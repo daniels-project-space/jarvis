@@ -130,9 +130,18 @@ export async function integrateReviewedWorker(
     });
 
     // A prior controller may have advanced the exact deterministic head and
-    // crashed before durable observation. Reconstruct only that final effect;
-    // immutable staging objects need no second write in this path.
+    // crashed before one or more durable staging observations. The ref proves
+    // the immutable object graph exists, but it does not prove that every cold
+    // prepare row crossed its durable observe fence. Replay the normal staging
+    // boundary read-only before the final ref observation; reconcileOnly keeps
+    // this path incapable of issuing a duplicate provider write.
     if (observedIntegration === merged.headSha) {
+      if (merged.synthetic) {
+        const staged = await adapter.stageCandidate(merged, { ...hooks, reconcileOnly: true });
+        if (staged.outcome !== "applied" || staged.providerHeadSha !== merged.headSha) {
+          return { status: "pending", reason: "exact final ref is applied but its synthetic object observations are not fully durable" };
+        }
+      }
       const prepared = await hooks.prepare(effect);
       if (!prepared) return { status: "pending", reason: "final ref effect was not durably prepared" };
       if (!await hooks.observe({ effectId, observation: "applied", providerHeadSha: merged.headSha, providerResponse: "reconciled:exact-ref" })) {

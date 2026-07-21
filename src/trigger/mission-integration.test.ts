@@ -78,6 +78,49 @@ describe("serialized integration provider protocol", () => {
     expect(h.calls.filter((call) => call === "GRAPHQL")).toHaveLength(0);
   });
 
+  it("drains a lost synthetic-blob observation before an already-applied final ref", async () => {
+    const h = harness({ integration: MERGED });
+    const blobSha = "1".repeat(40);
+    const blobEffect: ProviderEffect = {
+      effectId: `stage-blob:${receipt.integrationAttemptId}:${blobSha}`,
+      kind: "stage_blob", provider: "github", providerIdentity: `R:blob:${blobSha}`,
+      method: "POST", target: "/git/blobs", requestDigest: "8".repeat(64),
+      headSha: blobSha, treeSha: MERGED_TREE,
+    };
+    vi.mocked(h.adapter.prepareMerge).mockResolvedValue({
+      status: "clean", synthetic: true, headSha: MERGED, treeSha: MERGED_TREE, candidate: { blobSha },
+    });
+    let providerWrites = 0;
+    vi.mocked(h.adapter.stageCandidate).mockImplementation(async (_prepared, hooks) => {
+      const durable = await hooks.prepare(blobEffect);
+      if (!durable) return { outcome: "unknown" };
+      if (!hooks.reconcileOnly) providerWrites += 1;
+      const observed = await hooks.observe({
+        effectId: blobEffect.effectId, observation: "applied", providerHeadSha: blobSha,
+        providerResponse: "reconciled:exact-object",
+      });
+      return observed
+        ? { outcome: "applied", providerHeadSha: MERGED }
+        : { outcome: "unknown", providerResponse: "durable-observation-fence-lost" };
+    });
+    const observations = new Map<string, string | null>([[blobEffect.effectId, null]]);
+    const prepare = vi.fn(async (effect: ProviderEffect) => ({
+      replay: observations.has(effect.effectId), observation: observations.get(effect.effectId) ?? null,
+    }));
+    const observe = vi.fn(async (observation: { effectId: string; observation: string }) => {
+      observations.set(observation.effectId, observation.observation);
+      return true;
+    });
+
+    await expect(integrateReviewedWorker(receipt, h.adapter, { prepare, observe })).resolves.toMatchObject({
+      status: "integrated", headSha: MERGED,
+    });
+    expect(h.adapter.stageCandidate).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ reconcileOnly: true }));
+    expect(observations.get(blobEffect.effectId)).toBe("applied");
+    expect(h.calls.filter((call) => call === "GRAPHQL")).toHaveLength(0);
+    expect(providerWrites).toBe(0);
+  });
+
   it("fails closed when a reconciled provider observation cannot be persisted", async () => {
     const h = harness({ integration: MERGED });
     const result = await integrateReviewedWorker(receipt, h.adapter, {
@@ -119,7 +162,7 @@ describe("serialized integration provider protocol", () => {
     expect(prepare).not.toHaveBeenCalled();
   });
 
-  it("reconstructs and observes only the final effect when the deterministic head already exists", async () => {
+  it("drains synthetic staging read-only before observing an existing deterministic final ref", async () => {
     const h = harness({ integration: MERGED });
     vi.mocked(h.adapter.prepareMerge).mockResolvedValue({
       status: "clean", headSha: MERGED, treeSha: MERGED_TREE, synthetic: true, candidate: {},
@@ -127,7 +170,7 @@ describe("serialized integration provider protocol", () => {
     const prepare = vi.fn().mockResolvedValue({ replay: true, observation: "unknown" });
     const observe = vi.fn().mockResolvedValue(true);
     await expect(integrateReviewedWorker(receipt, h.adapter, { prepare, observe })).resolves.toMatchObject({ status: "integrated" });
-    expect(h.adapter.stageCandidate).not.toHaveBeenCalled();
+    expect(h.adapter.stageCandidate).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ reconcileOnly: true }));
     expect(h.adapter.advanceRef).not.toHaveBeenCalled();
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(observe).toHaveBeenCalledWith(expect.objectContaining({ observation: "applied", providerHeadSha: MERGED }));

@@ -693,6 +693,9 @@ export default defineSchema({
     controlRequested: v.optional(v.string()), // pause | cancel | steer
     controlRequestedAt: v.optional(v.number()),
     reconcileAfter: v.optional(v.number()),
+    // Set only when bounded automatic reconciliation yields to Daniel. The
+    // attempt remains a nonterminal FIFO head and resume clears this marker.
+    reconciliationAttentionAt: v.optional(v.number()),
     effects: v.optional(v.array(v.object({
       effectId: v.string(),
       effectKind: v.string(),

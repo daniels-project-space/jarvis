@@ -9,7 +9,12 @@ import { normalizeWorkModelTier } from "../src/lib/work-models";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
 import { attemptWorkspaceKey, workItemIdentity } from "../src/lib/workspace-protocol";
-import { controlIntegrationForJob, queueReviewedIntegration, recoverExpiredIntegrationController } from "./goalIntegration";
+import {
+  controlIntegrationForJob,
+  queueReviewedIntegration,
+  recoverExpiredIntegrationController,
+  resumeIntegrationReconciliation,
+} from "./goalIntegration";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
 import { hasAttemptBudget, isMeaningfulWorkProgress } from "../src/lib/work-attempt";
 import { claimDisposition, completionReceiptAllowed, isSha256Digest, replayEnvelope, shouldAdvanceAttempt } from "../src/lib/durable-attempt-protocol";
@@ -1554,7 +1559,9 @@ export const touchDeliveryHeartbeat = mutation({
       if (!integration || !mission || integration.controllerRunId !== delivery.deliveryRunId
         || Number(integration.leaseUntil ?? 0) < now || Number(integration.controllerDeadlineAt ?? 0) <= now
         || integration.controlRequested || mission.activeIntegrationAttemptId !== integration._id
-        || Number(mission.integrationLeaseUntil ?? 0) < now) return false;
+        || mission.integrationLeaseOwner !== integration.leaseOwner
+        || mission.integrationLeaseToken !== integration.leaseToken
+        || Number(mission.integrationLeaseVersion) !== Number(integration.leaseVersion)) return false;
     }
     await ctx.db.patch(delivery._id, { heartbeatAt: now, updatedAt: now });
     const runtime = await jobRuntimeFor(ctx, a.jobId);
@@ -2183,7 +2190,9 @@ export const linearizeDelivery = mutation({
       if (!integration || !mission || integration.controllerRunId !== deliveryAttempt.deliveryRunId
         || Number(integration.leaseUntil ?? 0) < now || Number(integration.controllerDeadlineAt ?? 0) <= now
         || integration.controlRequested || mission.activeIntegrationAttemptId !== integration._id
-        || Number(mission.integrationLeaseUntil ?? 0) < now) return null;
+        || mission.integrationLeaseOwner !== integration.leaseOwner
+        || mission.integrationLeaseToken !== integration.leaseToken
+        || Number(mission.integrationLeaseVersion) !== Number(integration.leaseVersion)) return null;
     }
     const sameOwner = row.deliveryLeaseOwner === a.deliveryLeaseOwner && row.deliveryLeaseToken === a.deliveryLeaseToken;
     const requestedVersion = Number(a.deliveryLeaseVersion ?? 0);
@@ -2411,6 +2420,9 @@ export const control = mutation({
           heartbeatAt: now, updatedAt: now,
         });
       }
+    }
+    else if (a.action === "resume" && row.status === "needs_input" && row.integrationState === "needs_attention") {
+      return await resumeIntegrationReconciliation(ctx, row, now);
     }
     else if (a.action === "resume" && ["paused", "stalled"].includes(row.status)) {
       const activeDelivery: any = row.activeDeliveryAttemptId ? await ctx.db.get(row.activeDeliveryAttemptId) : null;
