@@ -35,7 +35,7 @@ export default defineConfig({
             id: "codex-system-requirements",
             image: {
               instructions: [
-                "RUN mkdir -p /etc/codex && cp /app/src/trigger/codex-requirements.toml /etc/codex/requirements.toml && chmod 0444 /etc/codex/requirements.toml",
+                "COPY --chmod=0444 src/trigger/codex-requirements.toml /etc/codex/requirements.toml",
               ],
             },
           });

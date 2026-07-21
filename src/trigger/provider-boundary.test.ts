@@ -37,4 +37,13 @@ describe("intelligence provider boundary", () => {
     expect(isolation).toContain('env.OPENAI_API_KEY = ""');
     expect(isolation).not.toMatch(/VAULT_ACCESS_TOKEN.*allow/i);
   });
+
+  it("copies the Codex requirements from the Trigger build context as read-only", () => {
+    const config = readFileSync(join(process.cwd(), "trigger.config.ts"), "utf8");
+    expect(config).toContain('additionalFiles({ files: ["./src/trigger/codex-requirements.toml"] })');
+    expect(config).toContain(
+      '"COPY --chmod=0444 src/trigger/codex-requirements.toml /etc/codex/requirements.toml"',
+    );
+    expect(config).not.toContain("cp /app/src/trigger/codex-requirements.toml");
+  });
 });
