@@ -119,7 +119,7 @@ export const active = query({
     // repeatedly scanning a large mission history on every reactive UI update.
     const [recent, ...openGroups] = await Promise.all([
       ctx.db.query("missionRuntime").withIndex("by_createdAt").order("desc").take(20),
-      ...["running", "synthesizing", "paused", "needs_input"].map((status) =>
+      ...["running", "split", "synthesizing", "paused", "needs_input"].map((status) =>
         ctx.db.query("missionRuntime").withIndex("by_status", (q: any) => q.eq("status", status)).order("desc").take(20),
       ),
     ]);
@@ -127,7 +127,7 @@ export const active = query({
       .filter((mission: any, index: number, all: any[]) => all.findIndex((candidate: any) => candidate.missionId === mission.missionId) === index)
       .sort((left: any, right: any) => right.createdAt - left.createdAt);
     const live = rows.filter(
-      (m: any) => ["running", "synthesizing", "paused", "needs_input"].includes(m.status) || Date.now() - m.updatedAt < 14 * 86_400_000,
+      (m: any) => ["running", "split", "synthesizing", "paused", "needs_input"].includes(m.status) || Date.now() - m.updatedAt < 14 * 86_400_000,
     );
     const out = [];
     for (const m of live) {

@@ -104,7 +104,7 @@ async function review(t: ReturnType<typeof convexTest>, job: any, workerRunId: s
   const result = `specialist result for ${job.goalWorkstreamId}`;
   const note = `review passed for ${job.workerBranch}`;
   const receipt = JSON.stringify({
-    version: 1, jobId: String(job._id), attempt: 1, repository: REPO,
+    version: 1, jobId: String(job._id), attempt: 1, repository: job.repo,
     branch: job.workerBranch, baseSha: BASE, baseTreeSha: "2".repeat(40), headSha: head,
     headTreeSha: tree, diffSha256: "3".repeat(64), agentEvidenceSha256: "4".repeat(64),
   });
@@ -119,6 +119,32 @@ async function review(t: ReturnType<typeof convexTest>, job: any, workerRunId: s
     reviewDiffSha256: "3".repeat(64), resultDigest: sha256(result), evidenceDigest: sha256(note),
     workerToken: TOKEN,
   })).toBe(true);
+}
+
+async function finalizeReadonly(t: ReturnType<typeof convexTest>, job: any, result: string, note: string) {
+  expect(await t.mutation(api.jobs.finalize, {
+    jobId: job._id, expectedAttempt: Number(job.attempt ?? 1), status: "done",
+    result, verificationVerdict: "pass", verificationNote: note,
+    resultDigest: sha256(result), evidenceDigest: sha256(note), workerToken: TOKEN,
+  })).toBe(true);
+}
+
+async function finishIntegration(t: ReturnType<typeof convexTest>, row: any, claim: any, head: string, tree: string, suffix: string) {
+  const fence = { id: row._id, controllerRunId: claim.controllerRunId, leaseOwner: claim.leaseOwner,
+    leaseToken: claim.leaseToken, leaseVersion: claim.leaseVersion, workerToken: TOKEN };
+  const effectId = `effect-${suffix}`;
+  expect(await t.mutation(api.goalIntegration.prepare, {
+    ...fence, effectId, effectKind: "update_ref", provider: "github",
+    providerIdentity: `repo-node:refs/heads/${claim.integrationBranch}`, providerMethod: "POST",
+    providerTarget: "https://api.github.com/graphql#updateRefs", requestDigest: "9".repeat(64),
+    expectedIntegrationRefSha: claim.expectedIntegrationRefSha,
+    preparedIntegrationHeadSha: head, preparedIntegrationTreeSha: tree,
+  })).toMatchObject({ replay: false });
+  expect(await t.mutation(api.goalIntegration.observe, {
+    ...fence, effectId, observation: "applied", providerHeadSha: head,
+    providerResponse: JSON.stringify({ data: { updateRefs: { clientMutationId: effectId } } }),
+  })).toBe(true);
+  expect(await t.mutation(api.goalIntegration.complete, { ...fence, effectId })).toBe(true);
 }
 
 async function claimedFirstIntegration(prefix: string) {
@@ -186,7 +212,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     await expect(f.t.mutation(api.goalMode.recordPlan, {
       id: f.missionId, expectedAdvanceAttempt: 1,
       plan: plan(Array.from({ length: 5 }, (_, index) => ({ id: `fanout-${index}`, dependsOn: [] }))), workerToken: TOKEN,
-    })).rejects.toThrow(/budget/);
+    })).rejects.toThrow(/bounded/);
     const buildJobs = await f.t.run(async (ctx) => (await ctx.db.query("jobs")
       .withIndex("by_mission", (q) => q.eq("missionId", String(f.missionId))).collect())
       .filter((job) => job.goalStage === "building"));
@@ -223,16 +249,23 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(state.integrations).toHaveLength(0);
     expect(state.mission).toMatchObject({ status: "split", phase: "split", integrationGeneration: 0 });
     const children = state.missions.filter((row) => String((row as any).parentMissionId) === String(f.missionId));
-    expect(children).toHaveLength(2);
-    expect(new Set(children.map((row) => row.primaryRepo))).toEqual(new Set([REPO, other]));
-    expect(children.every((row) => row.status === "running" && row.phase === "planning" && row.planningJobId)).toBe(true);
+    expect(children).toHaveLength(3);
+    expect(new Set(children.map((row) => row.primaryRepo))).toEqual(new Set([REPO, other, "daniels-project-space/music-house"]));
+    expect(children.every((row) => row.status === "running" && row.phase === "building" && !row.planningJobId)).toBe(true);
+    const authority = await f.t.run(async (ctx) => ({
+      nodes: await ctx.db.query("goalPlanNodes").collect(), edges: await ctx.db.query("goalPlanEdges").collect(),
+      jobs: await ctx.db.query("jobs").collect(),
+    }));
+    expect(authority.nodes.map((node) => node.nodeId).sort()).toEqual(["catalog", "jarvis", "research"]);
+    expect(authority.edges).toHaveLength(0);
+    expect(authority.nodes.every((node) => authority.jobs.some((job) => job._id === node.jobId && job.planDigest === node.planDigest))).toBe(true);
     expect(await f.t.mutation(api.goalMode.recordPlan, {
       id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
-    })).toMatchObject({ advanced: false, stale: true });
-    expect((await f.t.run(async (ctx) => ctx.db.query("missions").collect())).filter((row) => row.parentMissionId === f.missionId)).toHaveLength(2);
+    })).toMatchObject({ advanced: true, stale: false, replay: true, jobs: 3 });
+    expect((await f.t.run(async (ctx) => ctx.db.query("missions").collect())).filter((row) => row.parentMissionId === f.missionId)).toHaveLength(3);
   });
 
-  it("durably rolls an all-done split into one bounded parent summary exactly once", async () => {
+  it("refuses to roll a split parent done from child summaries without node handoffs and Sol validation", async () => {
     const f = await splitGoal();
     await f.t.run(async (ctx) => {
       for (const [index, childId] of f.childIds.entries()) await ctx.db.patch(childId, {
@@ -240,14 +273,13 @@ describe("real Convex multi-agent workspace and integration races", () => {
         completedAt: Date.now(), updatedAt: Date.now(),
       });
     });
-    expect(await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN })).toMatchObject({ kind: "split_rollup", missionId: f.missionId });
+    expect(await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN })).toMatchObject({ kind: "split_rollup" });
     const first: any = await f.t.run(async (ctx) => ({
       parent: await ctx.db.get(f.missionId),
       events: (await ctx.db.query("workEvents").collect()).filter((event) => event.missionId === String(f.missionId) && event.type === "goal_split_rollup"),
     }));
-    expect(first.parent).toMatchObject({ status: "done", phase: "complete", percent: 100 });
-    expect(first.parent?.summary).toContain("repository 1 passed independently");
-    expect(first.parent?.summary).toContain("repository 2 passed independently");
+    expect(first.parent).toMatchObject({ status: "split", phase: "split" });
+    expect(first.parent?.validatorJobId).toBeUndefined();
     await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN });
     expect((await f.t.run(async (ctx) => ctx.db.query("workEvents").collect()))
       .filter((event) => event.missionId === String(f.missionId) && event.type === "goal_split_rollup")).toHaveLength(1);
@@ -256,8 +288,10 @@ describe("real Convex multi-agent workspace and integration races", () => {
   it("rolls one needs-input child into parent attention without combining repository heads", async () => {
     const f = await splitGoal();
     await f.t.run(async (ctx) => {
-      await ctx.db.patch(f.childIds[0], { status: "needs_input", phase: "blocked", percent: 40,
-        failureReason: "repository-specific human gate", updatedAt: Date.now() });
+      const node = (await ctx.db.query("goalPlanNodes").collect())[0];
+      await ctx.db.patch(node.jobId, { status: "needs_input", progress: "repository-specific human gate" });
+      const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", node.jobId)).first();
+      if (runtime) await ctx.db.patch(runtime._id, { status: "needs_input", progress: "repository-specific human gate" });
     });
     expect(await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN })).toMatchObject({ kind: "split_rollup" });
     const parent: any = await f.t.run(async (ctx) => ctx.db.get(f.missionId));
@@ -274,6 +308,12 @@ describe("real Convex multi-agent workspace and integration races", () => {
 
   it("propagates split-parent pause, resume and cancel idempotently to repository children", async () => {
     const f = await splitGoal();
+    const parentBefore: any = await f.t.run(async (ctx) => ctx.db.get(f.missionId));
+    expect(await f.t.mutation(api.goalMode.control, { id: f.missionId, action: "steer", input: "Preserve ids and add one focused regression assertion.", workerToken: TOKEN })).toBe(true);
+    expect(await f.t.mutation(api.goalMode.control, { id: f.missionId, action: "steer", input: "Preserve ids and add one focused regression assertion.", workerToken: TOKEN })).toBe(true);
+    const steered: any = await f.t.run(async (ctx) => ({ parent: await ctx.db.get(f.missionId), nodes: await ctx.db.query("goalPlanNodes").collect(), jobs: await ctx.db.query("jobs").collect() }));
+    expect(steered.parent).toMatchObject({ planDigest: parentBefore.planDigest, planGeneration: 1, steerRevision: 1 });
+    expect(steered.nodes.every((node: any) => steered.jobs.find((job: any) => job._id === node.jobId)?.steerRevision === 1)).toBe(true);
     expect(await f.t.mutation(api.goalMode.control, { id: f.missionId, action: "pause", workerToken: TOKEN })).toBe(true);
     expect(await f.t.mutation(api.goalMode.control, { id: f.missionId, action: "pause", workerToken: TOKEN })).toBe(true);
     let state = await f.t.run(async (ctx) => ({ parent: await ctx.db.get(f.missionId), children: await Promise.all(f.childIds.map((id) => ctx.db.get(id))) }));
@@ -289,6 +329,159 @@ describe("real Convex multi-agent workspace and integration races", () => {
     state = await f.t.run(async (ctx) => ({ parent: await ctx.db.get(f.missionId), children: await Promise.all(f.childIds.map((id) => ctx.db.get(id))) }));
     expect(state.parent).toMatchObject({ status: "cancelled", phase: "cancelled" });
     expect(state.children.every((child: any) => child?.status === "cancelled")).toBe(true);
+  });
+
+  it("fails closed on a stale or invalid generation-bound handoff", async () => {
+    const f = await goalAwaitingPlan();
+    const other = "daniels-project-space/jarvis";
+    const plan = {
+      summary: "Fail-closed handoff chain", route: "existing_project", primaryRepo: REPO, assumptions: [],
+      workstreams: [
+        { id: "research", label: "Research", task: "Produce verified read-only evidence.", agentId: "iris", readonly: true, dependsOn: [], acceptanceCriteria: ["evidence"], mcp: [] },
+        { id: "catalog", label: "Catalog", task: "Use only a current research handoff.", agentId: "paul", repo: REPO, readonly: false, dependsOn: ["research"], acceptanceCriteria: ["tests"], mcp: [] },
+        { id: "consumer", label: "Consumer", task: "Consume the integrated catalog contract.", agentId: "paul", repo: other, readonly: false, dependsOn: ["catalog"], acceptanceCriteria: ["tests"], mcp: [] },
+      ], validation: { criteria: ["done"], tests: [], liveChecks: [] },
+    };
+    const recorded: any = await f.t.mutation(api.goalMode.recordPlan, {
+      id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
+    });
+    const [researchRun] = await dispatch(f.t, 8, "stale-handoff-research");
+    expect(researchRun.claim?.planNodeId).toBe("research");
+    const research: any = await f.t.run(async (ctx) => ctx.db.get(researchRun.reservation.jobId as any));
+    await finalizeReadonly(f.t, research, "verified research", "verified evidence");
+    await f.t.run(async (ctx) => ctx.db.insert("goalHandoffs", {
+      parentMissionId: f.missionId, planDigest: "f".repeat(64), planGeneration: 1,
+      sourceNodeId: "research", sourceJobId: research._id, sourceAttempt: 1, sourceSteerRevision: 99,
+      artifactRefs: ["convex://forged/stale"], resultDigest: "e".repeat(64), summary: "stale evidence", createdAt: Date.now(),
+    }));
+    expect(await dispatch(f.t, 8, "stale-handoff-held")).toHaveLength(0);
+    const catalogAttempts = await f.t.run(async (ctx) => {
+      const node = await ctx.db.query("goalPlanNodes").withIndex("by_parent_generation_node", (q) =>
+        q.eq("parentMissionId", f.missionId).eq("planGeneration", 1).eq("nodeId", "catalog")).first();
+      return node ? await ctx.db.query("workAttempts").withIndex("by_job_attempt", (q) => q.eq("jobId", node.jobId)).collect() : [];
+    });
+    expect(catalogAttempts).toHaveLength(0);
+    expect(recorded.planDigest).not.toBe("f".repeat(64));
+  });
+
+  it("executes the exact cross-project DAG with typed handoffs and a parent Sol gate", async () => {
+    const f = await goalAwaitingPlan();
+    const other = "daniels-project-space/jarvis";
+    const plan = {
+      summary: "Research-gated cross-project chain with an independent same-repository sibling",
+      route: "existing_project", primaryRepo: REPO, assumptions: [],
+      workstreams: [
+        { id: "research", label: "Research", task: "Inspect the shared contract read-only and record exact evidence.", agentId: "iris", readonly: true, dependsOn: [], acceptanceCriteria: ["evidence captured"], mcp: [] },
+        { id: "catalog", label: "Catalog", task: "Implement the catalog contract after verified research evidence exists.", agentId: "paul", repo: REPO, readonly: false, dependsOn: ["research"], acceptanceCriteria: ["catalog tests pass"], mcp: [] },
+        { id: "metrics", label: "Metrics", task: "Implement the independent metrics branch without waiting for research.", agentId: "paul", repo: REPO, readonly: false, dependsOn: [], acceptanceCriteria: ["metrics tests pass"], mcp: [] },
+        { id: "jarvis", label: "Jarvis", task: "Consume the integrated catalog handoff in the Jarvis repository.", agentId: "paul", repo: other, readonly: false, dependsOn: ["catalog"], acceptanceCriteria: ["consumer tests pass"], mcp: [] },
+      ],
+      validation: { criteria: ["cross-project outcome works"], tests: ["npm test"], liveChecks: ["verify declared live contract"] },
+    };
+    const recorded: any = await f.t.mutation(api.goalMode.recordPlan, {
+      id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
+    });
+    expect(recorded).toMatchObject({ advanced: true, jobs: 4, planGeneration: 1 });
+    expect(recorded.planDigest).toMatch(/^[0-9a-f]{64}$/);
+    const authority: any = await f.t.run(async (ctx) => ({
+      parent: await ctx.db.get(f.missionId), nodes: await ctx.db.query("goalPlanNodes").collect(),
+      edges: await ctx.db.query("goalPlanEdges").collect(), jobs: await ctx.db.query("jobs").collect(),
+    }));
+    expect(authority.nodes).toHaveLength(4);
+    expect(authority.edges.map((edge: any) => edge.edgeId).sort()).toEqual(["catalog->jarvis", "research->catalog"]);
+    expect(new Set(authority.nodes.map((node: any) => node.nodeId)).size).toBe(4);
+    const jobByNode = new Map<string, any>(authority.nodes.map((node: any) => [node.nodeId, authority.jobs.find((job: any) => job._id === node.jobId)]));
+    expect(new Set([jobByNode.get("catalog")!.workerBranch, jobByNode.get("metrics")!.workerBranch]).size).toBe(2);
+    const initialProjection: any = await f.t.query(api.goalMode.dagProjection, { id: f.missionId, workerToken: TOKEN });
+    expect(initialProjection).toMatchObject({ nodeCount: 4, maxNodes: 8, planDigest: recorded.planDigest, planGeneration: 1 });
+    expect(initialProjection.nodes.every((node: any) => Object.keys(node).sort().join(",") ===
+      ["agent", "attention", "dependenciesSatisfied", "dependencyCount", "id", "label", "progress", "progressText", "repository", "status"].sort().join(","))).toBe(true);
+
+    const firstWave = await dispatch(f.t, 8, "dag-first");
+    expect(firstWave.map((entry) => entry.claim?.planNodeId).sort()).toEqual(["metrics", "research"]);
+    const researchRun = firstWave.find((entry) => entry.claim?.planNodeId === "research")!;
+    await finalizeReadonly(f.t, await f.t.run(async (ctx) => ctx.db.get(researchRun.reservation.jobId as any)) as any,
+      "Read-only contract evidence is complete.", "Research receipt verified.");
+
+    const secondWave = await dispatch(f.t, 8, "dag-second");
+    expect(secondWave.map((entry) => entry.claim?.planNodeId)).toEqual(["catalog"]);
+    expect(secondWave[0].claim?.upstreamEvidence?.[0]).toMatchObject({
+      planDigest: recorded.planDigest, planGeneration: 1, sourceNodeId: "research", sourceAttempt: 1,
+    });
+    expect(secondWave[0].claim?.upstreamEvidence?.[0].integrationReceiptDigest).toBeUndefined();
+    expect(secondWave[0].claim?.upstreamEvidence?.[0].resultDigest).toMatch(/^[0-9a-f]{64}$/);
+
+    const metricRun = firstWave.find((entry) => entry.claim?.planNodeId === "metrics")!;
+    const catalogRun = secondWave[0];
+    await review(f.t, jobByNode.get("catalog"), String(catalogRun.claim!.workerRunId), "6".repeat(40), "7".repeat(40));
+    await review(f.t, jobByNode.get("metrics"), String(metricRun.claim!.workerRunId), "8".repeat(40), "9".repeat(40));
+    expect(await dispatch(f.t, 8, "dag-held")).toHaveLength(1); // only the repository FIFO head; Jarvis is still held
+    const integrations: any[] = await f.t.run(async (ctx) => (await ctx.db.query("integrationAttempts").collect())
+      .filter((row) => row.repository === REPO).sort((a, b) => a.generation - b.generation));
+    expect(integrations).toHaveLength(2);
+    expect(integrations.map((row) => row.status)).toEqual(["queued", "provider_waiting"]);
+    const controllerJob: any = await f.t.run(async (ctx) => ctx.db.get(integrations[0].jobId));
+    const firstControllerClaim: any = await f.t.mutation(api.goalIntegration.claim, {
+      id: integrations[0]._id, controllerRunId: controllerJob.deliveryRunId,
+      leaseOwner: "dag-controller-one", leaseToken: "dag-controller-token-one", workerToken: TOKEN,
+    });
+    await finishIntegration(f.t, integrations[0], firstControllerClaim, "a".repeat(40), "b".repeat(40), "dag-catalog");
+
+    const concurrent = await dispatch(f.t, 8, "dag-cross");
+    expect(new Set(concurrent.map((entry) => entry.claim?.planNodeId))).toEqual(new Set(["metrics", "jarvis"]));
+    const jarvisRun = concurrent.find((entry) => entry.claim?.planNodeId === "jarvis")!;
+    expect(jarvisRun.claim?.upstreamEvidence?.[0]).toMatchObject({
+      sourceNodeId: "catalog", repository: REPO, integrationHeadSha: "a".repeat(40),
+      planDigest: recorded.planDigest, sourceAttempt: 1,
+    });
+    expect(jarvisRun.claim?.upstreamEvidence?.[0].integrationReceiptDigest).toMatch(/^[0-9a-f]{64}$/);
+    await review(f.t, jobByNode.get("jarvis"), String(jarvisRun.claim!.workerRunId), "c".repeat(40), "d".repeat(40));
+
+    const controllers = concurrent.filter((entry) => entry.claim?.deliveryRunId);
+    for (const entry of controllers) {
+      const row: any = await f.t.run(async (ctx) => ctx.db.get(entry.claim!.integrationAttemptId));
+      const claim: any = await f.t.mutation(api.goalIntegration.claim, {
+        id: row._id, controllerRunId: entry.claim!.deliveryRunId,
+        leaseOwner: `owner-${row.workstreamId}`, leaseToken: `token-${row.workstreamId}`, workerToken: TOKEN,
+      });
+      await finishIntegration(f.t, row, claim, row.workstreamId === "metrics" ? "e".repeat(40) : "f".repeat(40),
+        row.workstreamId === "metrics" ? "1".repeat(40) : "2".repeat(40), `dag-${row.workstreamId}`);
+    }
+    // Jarvis review was queued after its specialist completed and needs its own
+    // repository controller if it was not part of the prior controller batch.
+    const remainingControllers = await dispatch(f.t, 8, "dag-final-integrations");
+    for (const entry of remainingControllers) {
+      if (!entry.claim?.integrationAttemptId) continue;
+      const row: any = await f.t.run(async (ctx) => ctx.db.get(entry.claim!.integrationAttemptId));
+      const claim: any = await f.t.mutation(api.goalIntegration.claim, {
+        id: row._id, controllerRunId: entry.claim!.deliveryRunId,
+        leaseOwner: `final-${row.workstreamId}`, leaseToken: `final-token-${row.workstreamId}`, workerToken: TOKEN,
+      });
+      await finishIntegration(f.t, row, claim, "f".repeat(40), "2".repeat(40), `dag-final-${row.workstreamId}`);
+    }
+
+    expect(await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN })).toMatchObject({ kind: "split_rollup" });
+    const beforeValidation: any = await f.t.run(async (ctx) => ctx.db.get(f.missionId));
+    expect(beforeValidation).toMatchObject({ status: "running", phase: "validating" });
+    expect(beforeValidation.validatorJobId).toBeTruthy();
+    expect(await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN })).toBeNull();
+    expect((await f.t.run(async (ctx) => ctx.db.query("jobs").collect())).filter((job) => job.goalStage === "validating")).toHaveLength(1);
+    const handoffs = await f.t.run(async (ctx) => ctx.db.query("goalHandoffs").collect());
+    expect(handoffs).toHaveLength(4);
+    expect(handoffs.every((handoff) => handoff.planDigest === recorded.planDigest && handoff.planGeneration === 1)).toBe(true);
+
+    const [validatorRun] = await dispatch(f.t, 8, "dag-validator");
+    expect(validatorRun.claim).toMatchObject({ goalStage: "validating", reasoningEffort: "max", readonly: true, repo: null });
+    const validationResult = `GOAL_VALIDATION_JSON:${JSON.stringify({ verdict: "pass", summary: "Original cross-project goal proved", evidence: ["four generation-bound handoffs"], gaps: [], refinements: [] })}`;
+    const validatorJob: any = await f.t.run(async (ctx) => ctx.db.get(validatorRun.reservation.jobId as any));
+    await finalizeReadonly(f.t, validatorJob, validationResult, "Parent Sol validator checked original plan, handoffs, child heads, and live checks.");
+    const validationClaim: any = await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN });
+    expect(validationClaim).toMatchObject({ kind: "validation", missionId: f.missionId });
+    expect(await f.t.mutation(api.goalMode.recordValidation, {
+      id: f.missionId, expectedAdvanceAttempt: validationClaim.expectedAdvanceAttempt,
+      validation: { verdict: "pass", summary: "Original cross-project goal proved", evidence: ["four generation-bound handoffs"], gaps: [], refinements: [] },
+      workerToken: TOKEN,
+    })).toMatchObject({ status: "done" });
   });
 
   it("fails closed when a mission review substitutes a source base other than the first bound head", async () => {

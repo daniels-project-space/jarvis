@@ -26,6 +26,15 @@ import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { exactTextWorkOrder } from "../src/lib/work-order";
 import { validateWorkDag, workItemIdentity } from "../src/lib/workspace-protocol";
 import { controlIntegrationForJob } from "./goalIntegration";
+import {
+  canonicalGoalPlan,
+  canonicalGoalPlanJson,
+  GOAL_DAG_MAX_NODES,
+  GOAL_HANDOFF_ARTIFACT_MAX,
+  GOAL_HANDOFF_SUMMARY_MAX_CHARS,
+  goalDagEdgeId,
+  topologicalGoalWorkstreams,
+} from "../src/lib/goal-dag";
 
 const ADVANCE_LEASE_MS = 10 * 60 * 1000;
 const COORDINATOR_RECEIPT_FRESH_MS = 10 * 60 * 1000;
@@ -49,6 +58,10 @@ type GoalJobInput = {
   acceptanceCriteria: string[];
   modelReason: string;
   dependsOn?: string[];
+  planParentMissionId?: any;
+  planDigest?: string;
+  planGeneration?: number;
+  planNodeId?: string;
   maxAttempts?: number;
   branch?: string;
   sourceBranch?: string;
@@ -58,6 +71,16 @@ type GoalJobInput = {
   goalWorkstreamId?: string;
   goalWave: number;
 };
+
+async function sha256Hex(value: string) {
+  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function acceptedPlan(value: GoalPlan, maxNodes: number) {
+  const canonical = canonicalGoalPlan(value, maxNodes);
+  return { plan: canonical, digest: await sha256Hex(canonicalGoalPlanJson(canonical, maxNodes)) };
+}
 
 function receiptError(value: unknown): string | undefined {
   if (!value) return undefined;
@@ -240,33 +263,196 @@ async function recordMissionEvent(ctx: any, missionId: string, type: string, mes
   });
 }
 
+function handoffEnvelope(row: any) {
+  return {
+    label: String(row.sourceNodeId),
+    status: "done",
+    result: String(row.summary),
+    verificationNote: [
+      row.reviewReceiptDigest ? `review:${row.reviewReceiptDigest}` : "review:not-applicable",
+      row.integrationReceiptDigest ? `integration:${row.integrationReceiptDigest}` : "integration:not-applicable",
+      `result:${row.resultDigest}`,
+    ].join(" · ").slice(0, 300),
+    planDigest: row.planDigest,
+    planGeneration: row.planGeneration,
+    sourceNodeId: row.sourceNodeId,
+    sourceJobId: String(row.sourceJobId),
+    sourceAttempt: row.sourceAttempt,
+    sourceSteerRevision: row.sourceSteerRevision,
+    reviewReceiptDigest: row.reviewReceiptDigest,
+    integrationReceiptDigest: row.integrationReceiptDigest,
+    repository: row.repository,
+    sourceBranch: row.sourceBranch,
+    sourceHeadSha: row.sourceHeadSha,
+    integrationBranch: row.integrationBranch,
+    integrationHeadSha: row.integrationHeadSha,
+    artifactRefs: row.artifactRefs,
+    resultDigest: row.resultDigest,
+  };
+}
+
+/**
+ * Materialize one immutable, generation-bound handoff from cold controller
+ * authority. A job result or child summary alone can never satisfy an edge.
+ */
+export async function ensureGoalNodeHandoff(ctx: any, source: any) {
+  if (!source?.planParentMissionId || !source.planDigest || !source.planGeneration || !source.planNodeId
+    || source.status !== "done" || source.verificationVerdict !== "pass") return null;
+  const sourceAttempt = Number(source.attempt ?? 1);
+  const sourceSteerRevision = Number(source.steerRevision ?? 0);
+  const existing: any = await ctx.db.query("goalHandoffs")
+    .withIndex("by_source_attempt", (q: any) => q.eq("sourceJobId", source._id)
+      .eq("sourceAttempt", sourceAttempt).eq("planGeneration", Number(source.planGeneration))).first();
+  if (existing) return existing.planDigest === source.planDigest
+    && existing.sourceNodeId === source.planNodeId
+    && Number(existing.sourceSteerRevision) === sourceSteerRevision ? existing : null;
+
+  const receipt: any = await ctx.db.query("workReceipts")
+    .withIndex("by_job_attempt", (q: any) => q.eq("jobId", source._id).eq("attempt", sourceAttempt)).first();
+  if (!receipt || receipt.status !== "succeeded" || receipt.verification !== "pass") return null;
+  const review: any = source.reviewReceiptId ? await ctx.db.get(source.reviewReceiptId) : null;
+  if (source.repo && (!review || review.jobId !== source._id || review.attempt !== sourceAttempt
+    || review.receiptDigest !== source.reviewReceiptDigest || receipt.reviewReceiptDigest !== review.receiptDigest)) return null;
+
+  let integration: any = null;
+  let terminal: any = null;
+  if (source.repo && !source.readonly) {
+    integration = source.integrationAttemptId ? await ctx.db.get(source.integrationAttemptId) : null;
+    terminal = integration ? await ctx.db.query("integrationTerminalReceipts")
+      .withIndex("by_attempt", (q: any) => q.eq("integrationAttemptId", integration._id)).first() : null;
+    if (!integration || integration.jobId !== source._id || integration.workAttempt !== sourceAttempt
+      || integration.status !== "integrated" || !integration.terminalReceiptDigest
+      || integration.reviewReceiptDigest !== source.reviewReceiptDigest
+      || integration.providerObservedHeadSha !== integration.preparedIntegrationHeadSha
+      || !terminal || terminal.receiptDigest !== integration.terminalReceiptDigest || terminal.outcome !== "integrated") return null;
+  }
+
+  const summary = String(source.result ?? source.progress ?? "Verified upstream node completed")
+    .trim().slice(0, GOAL_HANDOFF_SUMMARY_MAX_CHARS);
+  if (!summary) return null;
+  const resultDigest = await sha256Hex(summary);
+  const artifactRefs = [...new Set([
+    ...(Array.isArray(receipt.artifacts) ? receipt.artifacts : []),
+    source.workerBranch, source.integrationBranch, integration?.preparedIntegrationHeadSha,
+  ].filter((item): item is string => typeof item === "string" && item.length > 0))]
+    .slice(0, GOAL_HANDOFF_ARTIFACT_MAX).map((item) => item.slice(0, 500));
+  const id = await ctx.db.insert("goalHandoffs", {
+    parentMissionId: source.planParentMissionId,
+    planDigest: source.planDigest,
+    planGeneration: Number(source.planGeneration),
+    sourceNodeId: source.planNodeId,
+    sourceJobId: source._id,
+    sourceAttempt,
+    sourceSteerRevision,
+    reviewReceiptDigest: review?.receiptDigest,
+    integrationReceiptDigest: terminal?.receiptDigest,
+    repository: source.repo,
+    sourceBranch: source.sourceBranch,
+    sourceHeadSha: review?.baseSha ?? source.sourceHeadSha,
+    integrationBranch: integration?.integrationBranch,
+    integrationHeadSha: integration?.preparedIntegrationHeadSha,
+    artifactRefs,
+    resultDigest,
+    summary,
+    createdAt: Date.now(),
+  });
+  return await ctx.db.get(id);
+}
+
+export async function verifiedGoalHandoffsForJob(ctx: any, target: any) {
+  if (!target?.planParentMissionId || !target.planDigest || !target.planGeneration || !target.planNodeId) return null;
+  const edges = await ctx.db.query("goalPlanEdges")
+    .withIndex("by_target", (q: any) => q.eq("targetJobId", target._id).eq("planGeneration", Number(target.planGeneration)))
+    .take(GOAL_DAG_MAX_NODES);
+  if (edges.length !== (target.dependsOn ?? []).length) return null;
+  const handoffs = [];
+  for (const edge of edges) {
+    if (edge.parentMissionId !== target.planParentMissionId || edge.planDigest !== target.planDigest
+      || edge.targetNodeId !== target.planNodeId || !(target.dependsOn ?? []).includes(String(edge.sourceJobId))) return null;
+    const source: any = await ctx.db.get(edge.sourceJobId);
+    if (!source || source.planParentMissionId !== target.planParentMissionId || source.planDigest !== target.planDigest
+      || Number(source.planGeneration) !== Number(target.planGeneration) || source.planNodeId !== edge.sourceNodeId) return null;
+    const handoff = await ensureGoalNodeHandoff(ctx, source);
+    if (!handoff || handoff.planDigest !== target.planDigest || Number(handoff.planGeneration) !== Number(target.planGeneration)
+      || handoff.sourceJobId !== source._id || Number(handoff.sourceAttempt) !== Number(source.attempt ?? 1)
+      || Number(handoff.sourceSteerRevision) !== Number(source.steerRevision ?? 0)) return null;
+    handoffs.push(handoffEnvelope(handoff));
+  }
+  return handoffs;
+}
+
 async function rollupSplitParent(ctx: any, parentOrId: any) {
   const parent: any = typeof parentOrId === "object" ? parentOrId : await ctx.db.get(parentOrId);
   if (!parent || !Array.isArray(parent.splitChildMissionIds) || !parent.splitChildMissionIds.length
     || ["done", "cancelled"].includes(parent.status)) return false;
-  const children = (await Promise.all(parent.splitChildMissionIds.map((id: any) => ctx.db.get(id))))
-    .filter((child: any) => child && child.parentMissionId === parent._id);
-  if (children.length !== parent.splitChildMissionIds.length) return false;
+  const generation = Number(parent.planGeneration ?? 0);
+  const nodes = generation ? await ctx.db.query("goalPlanNodes")
+    .withIndex("by_parent_generation", (q: any) => q.eq("parentMissionId", parent._id).eq("planGeneration", generation))
+    .take(GOAL_DAG_MAX_NODES + 1) : [];
+  if (!parent.planDigest || nodes.length !== Number(parent.planNodeCount ?? 0) || nodes.length > GOAL_DAG_MAX_NODES) return false;
+  const [children, jobs] = await Promise.all([
+    Promise.all(parent.splitChildMissionIds.slice(0, GOAL_DAG_MAX_NODES).map((id: any) => ctx.db.get(id))),
+    Promise.all(nodes.map((node: any) => ctx.db.get(node.jobId))),
+  ]);
+  const validChildren = children.filter((child: any) => child && child.parentMissionId === parent._id
+    && child.planDigest === parent.planDigest && Number(child.planGeneration) === generation);
+  if (validChildren.length !== parent.splitChildMissionIds.length || jobs.some((job: any) => !job)) return false;
   const now = Date.now();
-  const percent = Math.round(children.reduce((sum: number, child: any) => sum + Number(child.percent ?? 0), 0) / children.length);
-  const summary = children.map((child: any) =>
-    `${child.primaryRepo ?? child.goal}: ${child.status}${child.summary ? ` — ${String(child.summary).slice(0, 700)}` : ""}`,
-  ).join("\n").slice(0, 4_000);
+  const handoffs = new Map<string, any>();
+  for (const job of jobs) {
+    if (job.status === "done") {
+      const handoff = await ensureGoalNodeHandoff(ctx, job);
+      if (handoff) handoffs.set(String(job._id), handoff);
+    }
+  }
+  const weight = nodes.reduce((sum: number, node: any) => sum + Number(node.weight ?? 1), 0) || 1;
+  const percent = Math.min(96, Math.round(nodes.reduce((sum: number, node: any, index: number) => {
+    const job = jobs[index];
+    const nodePercent = handoffs.has(String(job._id)) ? 100 : Number(job.percent ?? 0);
+    return sum + Math.max(0, Math.min(100, nodePercent)) * Number(node.weight ?? 1);
+  }, 0) / weight));
+  const childSummaries: string[] = [];
+  for (const child of validChildren) {
+    const childIndexes = nodes.map((node: any, index: number) => node.childMissionId === child._id ? index : -1).filter((index: number) => index >= 0);
+    const childJobs = childIndexes.map((index: number) => jobs[index]);
+    const childDone = childJobs.length > 0 && childJobs.every((job: any) => handoffs.has(String(job._id)));
+    const childBlocked = childJobs.find((job: any) => ["needs_input", "error", "cancelled"].includes(job.status));
+    const childAttention = childJobs.find((job: any) => job.status === "awaiting_approval" || job.approvalStatus === "pending");
+    const childPercent = Math.round(childJobs.reduce((sum: number, job: any) =>
+      sum + (handoffs.has(String(job._id)) ? 100 : Number(job.percent ?? 0)), 0) / Math.max(1, childJobs.length));
+    const childStatus = childBlocked ? "needs_input" : childDone ? "done" : "running";
+    const childPhase = childBlocked ? "blocked" : childDone ? "complete" : "building";
+    const failureReason = childBlocked
+      ? String(childBlocked.failureReason ?? childBlocked.progress ?? `${childBlocked.label ?? childBlocked.planNodeId} needs attention`).slice(0, 2_000)
+      : childAttention ? `${childAttention.label ?? childAttention.planNodeId} is waiting for approval` : undefined;
+    if (child.status !== childStatus || child.phase !== childPhase || Number(child.percent ?? 0) !== childPercent
+      || child.failureReason !== failureReason) await patchMissionWithRuntime(ctx, child, {
+      status: childStatus, phase: childPhase, percent: childPercent,
+      summary: `${childJobs.filter((job: any) => handoffs.has(String(job._id))).length}/${childJobs.length} immutable node handoffs complete`,
+      failureReason, completedAt: childDone ? (child.completedAt ?? now) : undefined, updatedAt: now,
+    });
+    childSummaries.push(`${child.primaryRepo ?? "read-only evidence"}: ${childStatus} · ${childJobs.filter((job: any) => handoffs.has(String(job._id))).length}/${childJobs.length} nodes`);
+  }
+  const summary = childSummaries.join("\n").slice(0, 4_000);
   const requested = parent.controlRequested as "pause" | "cancel" | undefined;
   let patch: Record<string, unknown>;
-  if (requested === "cancel" && children.every((child: any) => ["done", "cancelled"].includes(child.status))) {
+  if (requested === "cancel" && jobs.every((job: any) => ["done", "cancelled"].includes(job.status))) {
     patch = { status: "cancelled", phase: "cancelled", percent, summary, controlRequested: undefined,
       controlRequestedAt: undefined, completedAt: now, updatedAt: now };
-  } else if (requested === "pause" && children.every((child: any) => ["paused", "done", "cancelled"].includes(child.status))) {
+  } else if (requested === "pause" && jobs.every((job: any) => ["paused", "done", "cancelled"].includes(job.status))) {
     patch = { status: "paused", phase: "paused", percent, summary, controlRequested: undefined,
       controlRequestedAt: undefined, pausedPhase: "split", updatedAt: now };
-  } else if (children.every((child: any) => child.status === "done")) {
-    patch = { status: "done", phase: "complete", percent: 100, summary, failureReason: undefined,
-      completedAt: now, updatedAt: now };
+  } else if (jobs.every((job: any) => handoffs.has(String(job._id)))) {
+    if (!parent.validatorJobId) {
+      await enqueueValidator(ctx, parent, jobs);
+      return true;
+    }
+    patch = { status: "running", phase: "validating", percent: Math.max(96, percent), summary,
+      failureReason: undefined, updatedAt: now };
   } else {
-    const blocked = children.filter((child: any) => ["needs_input", "failed", "error"].includes(child.status));
+    const blocked = jobs.filter((job: any) => ["needs_input", "failed", "error", "cancelled"].includes(job.status));
     if (blocked.length) {
-      const reason = blocked.map((child: any) => `${child.primaryRepo ?? child.goal}: ${child.failureReason ?? child.summary ?? child.status}`).join("; ").slice(0, 2_000);
+      const reason = blocked.map((job: any) => `${job.label ?? job.planNodeId}: ${job.failureReason ?? job.progress ?? job.status}`).join("; ").slice(0, 2_000);
       patch = { status: "needs_input", phase: "blocked", pausedPhase: "split", percent, summary,
         failureReason: reason, updatedAt: now };
     } else {
@@ -278,7 +464,7 @@ async function rollupSplitParent(ctx: any, parentOrId: any) {
   await patchMissionWithRuntime(ctx, parent, patch);
   await recordMissionEvent(ctx, String(parent._id), "goal_split_rollup",
     `Repository child missions rolled up as ${String(patch.status)}`, String(patch.phase), Number(patch.percent), {
-      children: children.map((child: any) => ({ id: String(child._id), repository: child.primaryRepo, status: child.status })),
+      children: validChildren.map((child: any) => ({ id: String(child._id), repository: child.primaryRepo, status: child.status })),
     });
   return true;
 }
@@ -486,20 +672,57 @@ async function validatorAuditSnapshot(ctx: any, mission: any, jobs: any[]): Prom
 
 async function validatorTaskForMission(ctx: any, mission: any, jobs: any[]): Promise<string> {
   const plan = mission.plan as GoalPlan;
-  const buildEvidence = jobs
+  let buildEvidence = jobs
     .filter((job) => job.goalStage === "building" || job.goalStage === "refining")
-    .map((job) => ({
-      label: job.label ?? job.task.slice(0, 80),
-      status: job.status,
-      result: String(job.result ?? job.progress ?? "").slice(0, 2_000),
-    }));
+    .map((job) => ({ label: job.label ?? job.task.slice(0, 80), status: job.status,
+      result: String(job.result ?? job.progress ?? "").slice(0, 2_000) }));
+  let auditSnapshot = await validatorAuditSnapshot(ctx, mission, jobs);
+  if (Array.isArray(mission.splitChildMissionIds) && mission.planDigest && mission.planGeneration) {
+    const [nodes, handoffs, children] = await Promise.all([
+      ctx.db.query("goalPlanNodes").withIndex("by_parent_generation", (q: any) =>
+        q.eq("parentMissionId", mission._id).eq("planGeneration", Number(mission.planGeneration))).take(GOAL_DAG_MAX_NODES + 1),
+      ctx.db.query("goalHandoffs").withIndex("by_parent_generation", (q: any) =>
+        q.eq("parentMissionId", mission._id).eq("planGeneration", Number(mission.planGeneration))).take(GOAL_DAG_MAX_NODES + 1),
+      Promise.all(mission.splitChildMissionIds.slice(0, GOAL_DAG_MAX_NODES).map((id: any) => ctx.db.get(id))),
+    ]);
+    if (nodes.length !== mission.planNodeCount || handoffs.length !== nodes.length
+      || nodes.length > GOAL_DAG_MAX_NODES || handoffs.some((row: any) => row.planDigest !== mission.planDigest)) {
+      throw new Error("Parent validation requires one current immutable handoff per accepted plan node");
+    }
+    const byNode = new Map(handoffs.map((row: any) => [row.sourceNodeId, row]));
+    buildEvidence = nodes.map((node: any) => {
+      const handoff: any = byNode.get(node.nodeId);
+      return {
+        label: `${node.label} [${node.repository ?? "read-only"}]`, status: "done",
+        result: `${handoff.summary}\nReceipts: review=${handoff.reviewReceiptDigest ?? "n/a"}; integration=${handoff.integrationReceiptDigest ?? "n/a"}; result=${handoff.resultDigest}`,
+      };
+    });
+    auditSnapshot = JSON.stringify({
+      authority: "Convex immutable split-parent validation snapshot",
+      parent: { id: String(mission._id), planDigest: mission.planDigest, planGeneration: mission.planGeneration,
+        originalGoal: mission.goal, declaredLiveChecks: plan.validation.liveChecks },
+      nodes: nodes.map((node: any) => ({ id: node.nodeId, jobId: String(node.jobId), childMissionId: String(node.childMissionId),
+        repository: node.repository ?? null, readonly: node.readonly, dependencyCount: node.dependencyCount,
+        handoff: byNode.get(node.nodeId) ? {
+          attempt: (byNode.get(node.nodeId) as any).sourceAttempt,
+          steerRevision: (byNode.get(node.nodeId) as any).sourceSteerRevision,
+          reviewReceiptDigest: (byNode.get(node.nodeId) as any).reviewReceiptDigest ?? null,
+          integrationReceiptDigest: (byNode.get(node.nodeId) as any).integrationReceiptDigest ?? null,
+          integrationHeadSha: (byNode.get(node.nodeId) as any).integrationHeadSha ?? null,
+          artifacts: (byNode.get(node.nodeId) as any).artifactRefs,
+          resultDigest: (byNode.get(node.nodeId) as any).resultDigest,
+        } : null })),
+      children: children.filter(Boolean).map((child: any) => ({ id: String(child._id), repository: child.primaryRepo ?? null,
+        status: child.status, integrationBranch: child.integrationBranch ?? null, integrationHeadSha: child.integrationHeadSha ?? null })),
+    });
+  }
   return validatorTask({
     goal: mission.goal,
     plan,
     acceptanceCriteria: mission.acceptanceCriteria ?? [],
     buildEvidence,
     revisionWave: Number(mission.revisionWave ?? 0),
-    auditSnapshot: await validatorAuditSnapshot(ctx, mission, jobs),
+    auditSnapshot,
     externalContext: mission.externalRunId
       ? [
           `App Factory run ${mission.externalRunId}${mission.externalSlug ? ` (${mission.externalSlug})` : ""}.`,
@@ -517,7 +740,8 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
   const plan = mission.plan as GoalPlan;
   // App Factory owns its own repository/build lifecycle. Its final Sol session
   // validates the external run and must not be pointed at a made-up Jarvis branch.
-  const branch = mission.externalRunId
+  const splitParent = Array.isArray(mission.splitChildMissionIds) && mission.splitChildMissionIds.length > 0;
+  const branch = mission.externalRunId || splitParent
     ? undefined
     : mission.integrationBranch || mission.sharedBranch || missionBranch(mission, mission.primaryRepo);
   const task = await validatorTaskForMission(ctx, mission, jobs);
@@ -525,7 +749,7 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
     task,
     missionId: String(mission._id),
     label: `JARVIS · deep validation ${Number(mission.revisionWave ?? 0) + 1}`,
-    repo: mission.primaryRepo ?? plan.primaryRepo,
+    repo: splitParent ? undefined : mission.primaryRepo ?? plan.primaryRepo,
     readonly: true,
     model: "sol",
     reasoningEffort: "max",
@@ -548,9 +772,16 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
     goalStage: "validating",
     goalWorkstreamId: `validation-${Number(mission.revisionWave ?? 0)}`,
     goalWave: Number(mission.revisionWave ?? 0),
+    ...(splitParent ? {
+      planParentMissionId: mission._id,
+      planDigest: mission.planDigest,
+      planGeneration: mission.planGeneration,
+      planNodeId: `parent-validation-${Number(mission.revisionWave ?? 0)}`,
+    } : {}),
   });
   const now = Date.now();
   await patchMissionWithRuntime(ctx, mission, {
+    status: "running",
     phase: "validating",
     percent: Math.min(96, 82 + Number(mission.revisionWave ?? 0) * 5),
     validatorJobId: String(validatorJobId),
@@ -740,65 +971,129 @@ export const recordPlan = mutation({
   handler: async (ctx, args) => {
     requireWorker(args.workerToken);
     const mission = await ctx.db.get(args.id);
+    const maxNodes = Math.min(GOAL_DAG_MAX_NODES, Number(mission?.maxBuildSessions ?? 6));
+    const accepted = mission ? await acceptedPlan(args.plan as GoalPlan, maxNodes) : null;
+    if (mission?.planDigest) {
+      if (!accepted || mission.planDigest !== accepted.digest) return { advanced: false, stale: true, conflict: true };
+      const nodes = await ctx.db.query("goalPlanNodes")
+        .withIndex("by_parent_generation", (q: any) => q.eq("parentMissionId", mission._id)
+          .eq("planGeneration", Number(mission.planGeneration ?? 1))).take(GOAL_DAG_MAX_NODES + 1);
+      if (nodes.length !== Number(mission.planNodeCount ?? 0) || nodes.length > GOAL_DAG_MAX_NODES) {
+        throw new Error("Stored GoalPlan authority is incomplete");
+      }
+      return {
+        advanced: true, stale: false, replay: true,
+        splitRequired: Array.isArray(mission.splitChildMissionIds) && mission.splitChildMissionIds.length > 0,
+        parentMissionId: String(mission._id), planDigest: mission.planDigest,
+        planGeneration: mission.planGeneration, jobs: nodes.length,
+        childMissionIds: (mission.splitChildMissionIds ?? []).map(String),
+      };
+    }
     if (
       !mission || mission.mode !== "goal" || mission.status !== "running" || mission.phase !== "planning" ||
       Number(mission.advanceAttempt ?? 0) !== args.expectedAdvanceAttempt
     ) return { advanced: false, stale: true };
-    const plan = args.plan as GoalPlan;
+    const { plan, digest: planDigest } = accepted!;
+    const planGeneration = 1;
     if (!Array.isArray(plan?.workstreams) || plan.workstreams.length < 2 || plan.workstreams.length > (mission.maxBuildSessions ?? 6)) {
       throw new Error("Goal plan workstream budget is invalid");
     }
-    validateWorkDag(plan.workstreams, Math.min(8, Number(mission.maxBuildSessions ?? 6)));
+    validateWorkDag(plan.workstreams, maxNodes);
     const writableRepositories = new Set<string>();
+    const repositoryByNode = new Map<string, string | undefined>();
     for (const stream of plan.workstreams) {
-      if (stream.readonly) continue;
-      const requested = stream.repo || mission.primaryRepo || plan.primaryRepo;
+      const requested = stream.repo || (!stream.readonly ? mission.primaryRepo || plan.primaryRepo : undefined);
       const canonical = requested ? canonicalizeRepository(requested, { allowShortName: true }) : null;
-      if (!canonical) throw new Error(`Writable goal workstream ${stream.id} requires one canonical repository`);
-      writableRepositories.add(canonical);
+      if (!stream.readonly && !canonical) throw new Error(`Writable goal workstream ${stream.id} requires one canonical repository`);
+      repositoryByNode.set(stream.id, canonical ?? undefined);
+      if (!stream.readonly && canonical) writableRepositories.add(canonical);
     }
     if (writableRepositories.size > 1) {
       const now = Date.now();
       const childMissionIds: any[] = [];
-      for (const repository of [...writableRepositories].sort()) {
-        const childGoal = `${mission.goal} [project scope: ${repository}]`;
+      const groups = new Map<string, typeof plan.workstreams>();
+      for (const stream of plan.workstreams) {
+        const repository = repositoryByNode.get(stream.id);
+        const key = repository ? `repo:${repository}` : "evidence:read-only";
+        groups.set(key, [...(groups.get(key) ?? []), stream]);
+      }
+      const childByNode = new Map<string, any>();
+      const integrationByChild = new Map<string, string | undefined>();
+      for (const [key, streams] of [...groups.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+        const repository = key.startsWith("repo:") ? key.slice(5) : undefined;
+        const writable = streams.some((stream) => !stream.readonly);
+        const childGoal = `${mission.goal} [${repository ? `project scope: ${repository}` : "read-only evidence"}]`;
         const childId = await insertMissionWithRuntime(ctx, {
-          goal: childGoal.slice(0, 500), mode: "goal", status: "running", agentCount: 1,
+          goal: childGoal.slice(0, 500), mode: "goal", status: "running", agentCount: streams.length,
           parentMissionId: mission._id, originThreadId: mission.originThreadId, managerAgentId: "jarvis",
-          priority: mission.priority ?? 95, risk: mission.risk ?? "high", phase: "planning", percent: 3,
-          acceptanceCriteria: mission.acceptanceCriteria ?? [], route: "existing_project",
-          routeReason: `Writable multi-project goal split atomically from parent ${String(mission._id)}`,
+          splitChildKind: writable ? "repository" : "evidence",
+          plan, planDigest, planGeneration, planNodeCount: streams.length,
+          priority: mission.priority ?? 95, risk: mission.risk ?? "high", phase: "building", percent: 0,
+          acceptanceCriteria: streams.flatMap((stream) => stream.acceptanceCriteria).slice(0, 10), route: "existing_project",
+          routeReason: `Immutable executable projection of parent ${String(mission._id)}`,
           primaryRepo: repository,
-          infrastructureContext: `${mission.infrastructureContext ?? ""}\nThis child owns only ${repository}; coordinate results through parent ${String(mission._id)}.`.trim().slice(0, 4_000),
+          infrastructureContext: `${mission.infrastructureContext ?? ""}\nExecute only parent plan ${planDigest} generation ${planGeneration}; ids, dependencies, scope, acceptance and consequence policy are immutable.`.trim().slice(0, 4_000),
           revisionWave: 0, maxRevisionWaves: mission.maxRevisionWaves ?? 2,
           maxBuildSessions: mission.maxBuildSessions ?? 6, advanceAttempt: 0, createdAt: now, updatedAt: now,
         });
-        const route: GoalRoute = {
-          kind: "existing_project", primaryRepo: repository,
-          reason: `Atomic child scope of parent ${String(mission._id)}`,
-          infrastructureContext: `Work only in ${repository}; preserve the parent goal and return independently integrable evidence.`,
-        };
-        const plannerJobId = await insertGoalJob(ctx, {
-          task: plannerTask(childGoal, route, mission.acceptanceCriteria ?? [], mission.maxBuildSessions ?? 6),
-          missionId: String(childId), label: `JARVIS · ${repository.split("/").pop()} architecture`, repo: repository,
-          readonly: true, model: "sol", reasoningEffort: "max", mcp: ["context7"],
-          originThreadId: mission.originThreadId, agentId: "jarvis", risk: "low", priority: 100,
-          acceptanceCriteria: ["Plan only this canonical repository scope", "Return a valid GOAL_PLAN_JSON contract"],
-          modelReason: "A cross-project parent is split into independently serialized repository missions",
-          maxAttempts: 16, goalStage: "planning", goalWorkstreamId: "goal-plan", goalWave: 0,
-        });
-        const child: any = await ctx.db.get(childId);
-        if (child) await patchMissionWithRuntime(ctx, child, {
-          planningJobId: String(plannerJobId), integrationBranch: goalBranch(childGoal, String(childId)), integrationGeneration: 0,
-        });
+        const integrationBranch = writable && repository ? goalBranch(childGoal, String(childId)) : undefined;
+        if (integrationBranch) {
+          const child: any = await ctx.db.get(childId);
+          if (child) await patchMissionWithRuntime(ctx, child, { integrationBranch, integrationGeneration: 0 });
+        }
+        integrationByChild.set(String(childId), integrationBranch);
+        for (const stream of streams) childByNode.set(stream.id, childId);
         childMissionIds.push(childId);
       }
+      const workstreamJobs = new Map<string, string>();
+      let waitingApprovals = 0;
+      for (const stream of topologicalGoalWorkstreams(plan.workstreams)) {
+        const childId = childByNode.get(stream.id);
+        const repository = repositoryByNode.get(stream.id);
+        const dependencies = stream.dependsOn.map((id) => workstreamJobs.get(id)).filter((id): id is string => Boolean(id));
+        if (dependencies.length !== stream.dependsOn.length) throw new Error(`Goal plan workstream ${stream.id} lost an executable dependency`);
+        const integrationBranch = integrationByChild.get(String(childId));
+        const id = await insertGoalJob(ctx, {
+          task: [stream.task, `Original Goal Mode outcome: ${mission.goal}`,
+            `Immutable parent plan: ${planDigest} generation ${planGeneration}; node ${stream.id}.`,
+            "Repository inspection may enrich context but cannot change this node id, scope, dependencies, acceptance criteria, or consequence policy."].join("\n\n"),
+          policyTask: stream.task, missionId: String(childId), label: stream.label, repo: repository,
+          readonly: stream.readonly, model: "terra", reasoningEffort: "high", mcp: stream.mcp,
+          originThreadId: mission.originThreadId, agentId: stream.agentId, risk: "high", priority: 92,
+          acceptanceCriteria: stream.acceptanceCriteria,
+          modelReason: "Goal Mode executes the accepted parent DAG node without child replanning",
+          dependsOn: dependencies, sourceBranch: !stream.readonly ? integrationBranch : undefined,
+          integrationBranch: !stream.readonly ? integrationBranch : undefined,
+          maxAttempts: 24, goalStage: "building", goalWorkstreamId: stream.id, goalWave: 0,
+          planParentMissionId: mission._id, planDigest, planGeneration, planNodeId: stream.id,
+        });
+        const row: any = await ctx.db.get(id);
+        if (row?.status === "awaiting_approval") waitingApprovals += 1;
+        workstreamJobs.set(stream.id, String(id));
+        await ctx.db.insert("goalPlanNodes", {
+          parentMissionId: mission._id, planDigest, planGeneration, nodeId: stream.id,
+          childMissionId: childId, jobId: id, label: stream.label, agentId: stream.agentId,
+          repository, readonly: stream.readonly, dependencyCount: stream.dependsOn.length,
+          weight: Math.max(1, stream.acceptanceCriteria.length), createdAt: now,
+        });
+      }
+      for (const stream of plan.workstreams) for (const dependency of stream.dependsOn) {
+        await ctx.db.insert("goalPlanEdges", {
+          parentMissionId: mission._id, planDigest, planGeneration,
+          edgeId: goalDagEdgeId(dependency, stream.id), sourceNodeId: dependency, targetNodeId: stream.id,
+          sourceJobId: ctx.db.normalizeId("jobs", workstreamJobs.get(dependency)!)!,
+          targetJobId: ctx.db.normalizeId("jobs", workstreamJobs.get(stream.id)!)!, createdAt: now,
+        });
+      }
       await patchMissionWithRuntime(ctx, mission, {
-        status: "split", phase: "split", plan, splitChildMissionIds: childMissionIds,
-        summary: `Writable work split into ${childMissionIds.length} canonical repository child missions`,
+        status: "split", phase: "split", plan, planDigest, planGeneration, planNodeCount: plan.workstreams.length,
+        splitChildMissionIds: childMissionIds, integrationGeneration: 0,
+        summary: `${plan.workstreams.length} immutable DAG nodes projected into ${childMissionIds.length} bounded children`,
         advanceLeaseUntil: undefined, updatedAt: now,
       });
-      await recordMissionEvent(ctx, String(args.id), "goal_split", `Writable plan split into ${childMissionIds.length} repository child missions`, "split", mission.percent, {
+      await recordMissionEvent(ctx, String(args.id), "goal_split", `Accepted plan ${planDigest.slice(0, 12)} projected without replanning`, "split", mission.percent, {
+        planDigest, planGeneration, nodeCount: plan.workstreams.length,
+        edgeCount: plan.workstreams.reduce((sum, stream) => sum + stream.dependsOn.length, 0),
         repositories: [...writableRepositories].sort(), childMissionIds: childMissionIds.map(String),
       });
       return {
@@ -809,13 +1104,14 @@ export const recordPlan = mutation({
         repositories: [...writableRepositories].sort(),
         parentMissionId: String(args.id),
         childMissionIds: childMissionIds.map(String),
+        planDigest, planGeneration, jobs: workstreamJobs.size, waitingApprovals,
       };
     }
     const now = Date.now();
     if (mission.route === "app_factory") {
       if (!args.externalRun?.id) throw new Error("App Factory route requires a live factory run");
       await patchMissionWithRuntime(ctx, mission, {
-        plan,
+        plan, planDigest, planGeneration, planNodeCount: 0,
         phase: "building",
         percent: 12,
         externalKind: args.externalRun.kind,
@@ -838,7 +1134,7 @@ export const recordPlan = mutation({
     const integrationBranch = mission.integrationBranch || missionBranch(mission, mission.primaryRepo ?? plan.primaryRepo);
     const workstreamJobs = new Map<string, string>();
     let waitingApprovals = 0;
-    for (const stream of plan.workstreams) {
+    for (const stream of topologicalGoalWorkstreams(plan.workstreams)) {
       const repo = stream.repo || mission.primaryRepo || plan.primaryRepo;
       const dependencies = stream.dependsOn
         .map((id) => workstreamJobs.get(id))
@@ -871,6 +1167,10 @@ export const recordPlan = mutation({
         acceptanceCriteria: stream.acceptanceCriteria,
         modelReason: "Goal Mode builder sessions use Terra/high for maximum implementation per token",
         dependsOn: dependencies,
+        planParentMissionId: mission._id,
+        planDigest,
+        planGeneration,
+        planNodeId: stream.id,
         sourceBranch: repo ? integrationBranch : undefined,
         integrationBranch: repo ? integrationBranch : undefined,
         maxAttempts: 24,
@@ -881,9 +1181,21 @@ export const recordPlan = mutation({
       const row: any = await ctx.db.get(id);
       if (row?.status === "awaiting_approval") waitingApprovals += 1;
       workstreamJobs.set(stream.id, String(id));
+      await ctx.db.insert("goalPlanNodes", {
+        parentMissionId: mission._id, planDigest, planGeneration, nodeId: stream.id,
+        childMissionId: mission._id, jobId: id, label: stream.label, agentId: stream.agentId,
+        repository: repo, readonly: stream.readonly, dependencyCount: stream.dependsOn.length,
+        weight: Math.max(1, stream.acceptanceCriteria.length), createdAt: now,
+      });
     }
+    for (const stream of plan.workstreams) for (const dependency of stream.dependsOn) await ctx.db.insert("goalPlanEdges", {
+      parentMissionId: mission._id, planDigest, planGeneration, edgeId: goalDagEdgeId(dependency, stream.id),
+      sourceNodeId: dependency, targetNodeId: stream.id,
+      sourceJobId: ctx.db.normalizeId("jobs", workstreamJobs.get(dependency)!)!,
+      targetJobId: ctx.db.normalizeId("jobs", workstreamJobs.get(stream.id)!)!, createdAt: now,
+    });
     await patchMissionWithRuntime(ctx, mission, {
-      plan,
+      plan, planDigest, planGeneration, planNodeCount: plan.workstreams.length,
       phase: "building",
       percent: 12,
       primaryRepo: mission.primaryRepo ?? plan.primaryRepo,
@@ -899,7 +1211,50 @@ export const recordPlan = mutation({
       waitingApprovals,
       integrationBranch,
     });
-    return { advanced: true, external: false, jobs: workstreamJobs.size, waitingApprovals };
+    return { advanced: true, external: false, jobs: workstreamJobs.size, waitingApprovals, planDigest, planGeneration };
+  },
+});
+
+// Compact bounded fleet/UI projection. Full plans, prompts, reviews, terminal
+// receipts and artifacts stay cold and no heartbeat writes this graph.
+export const dagProjection = query({
+  args: { id: v.id("missions"), ...viewerAuthArgs },
+  handler: async (ctx, args) => {
+    await requireViewer(ctx, args);
+    const mission: any = await ctx.db.get(args.id);
+    if (!mission?.planDigest || !mission.planGeneration) return null;
+    const [nodes, handoffs] = await Promise.all([
+      ctx.db.query("goalPlanNodes").withIndex("by_parent_generation", (q: any) =>
+        q.eq("parentMissionId", mission._id).eq("planGeneration", Number(mission.planGeneration))).take(GOAL_DAG_MAX_NODES + 1),
+      ctx.db.query("goalHandoffs").withIndex("by_parent_generation", (q: any) =>
+        q.eq("parentMissionId", mission._id).eq("planGeneration", Number(mission.planGeneration))).take(GOAL_DAG_MAX_NODES + 1),
+    ]);
+    if (nodes.length > GOAL_DAG_MAX_NODES || handoffs.length > GOAL_DAG_MAX_NODES) throw new Error("Goal DAG projection exceeds its hot-data bound");
+    const activities = await Promise.all(nodes.map((node: any) => ctx.db.query("jobRuntime")
+      .withIndex("by_job", (q: any) => q.eq("jobId", node.jobId)).first()));
+    const validHandoffs = new Set(handoffs.filter((handoff: any) => {
+      const activity = activities.find((row: any) => row?.jobId === handoff.sourceJobId);
+      return activity && handoff.planDigest === mission.planDigest
+        && Number(handoff.sourceAttempt) === Number(activity.attempt ?? 1)
+        && Number(handoff.sourceSteerRevision) === Number(activity.steerRevision ?? 0);
+    }).map((handoff: any) => String(handoff.sourceJobId)));
+    return {
+      missionId: String(mission._id), planDigest: mission.planDigest, planGeneration: mission.planGeneration,
+      nodeCount: nodes.length, maxNodes: GOAL_DAG_MAX_NODES,
+      nodes: nodes.map((node: any, index: number) => {
+        const activity: any = activities[index];
+        const dependencies = activity?.dependsOn ?? [];
+        const attention = Boolean(activity && (["awaiting_approval", "needs_input", "error", "cancelled", "stalled"].includes(activity.status)
+          || activity.integrationState === "needs_attention"));
+        return {
+          id: node.nodeId, label: node.label, agent: node.agentId, repository: node.repository ?? null,
+          status: activity?.status ?? "missing", dependencyCount: node.dependencyCount,
+          dependenciesSatisfied: dependencies.filter((id: string) => validHandoffs.has(String(id))).length,
+          progress: Math.max(0, Math.min(100, Number(activity?.percent ?? 0))),
+          progressText: String(activity?.progress ?? "").slice(0, 160), attention,
+        };
+      }),
+    };
   },
 });
 
@@ -1124,6 +1479,20 @@ export const recordValidation = mutation({
       });
       if (mission.parentMissionId) await rollupSplitParent(ctx, mission.parentMissionId);
       return { advanced: true, status: "done", summary: validation.summary };
+    }
+    if (Array.isArray(mission.splitChildMissionIds) && mission.splitChildMissionIds.length) {
+      const reason = validation.verdict === "blocked"
+        ? validation.blocker || validation.summary
+        : `Parent Sol validation did not prove the original accepted plan: ${validation.gaps.join("; ") || validation.summary}`;
+      await patchMissionWithRuntime(ctx, mission, {
+        status: "needs_input", phase: "needs Daniel", pausedPhase: "validating",
+        validation, validationHistory: history, failureReason: reason.slice(0, 2_000),
+        advanceLeaseUntil: undefined, updatedAt: now,
+      });
+      await upsertGoalAttention(ctx, mission, reason);
+      await recordMissionEvent(ctx, String(args.id), "goal_parent_validation_failed",
+        reason, "needs Daniel", mission.percent, { planDigest: mission.planDigest, planGeneration: mission.planGeneration });
+      return { advanced: true, status: "needs_input", reason };
     }
     const nextWave = Number(mission.revisionWave ?? 0) + 1;
     if (validation.verdict === "refine" && nextWave <= Number(mission.maxRevisionWaves ?? 2)) {
@@ -1672,7 +2041,8 @@ async function resetGoalJob(ctx: any, job: any, now: number, force = false) {
 export const control = mutation({
   args: {
     id: v.id("missions"),
-    action: v.union(v.literal("pause"), v.literal("resume"), v.literal("cancel")),
+    action: v.union(v.literal("pause"), v.literal("resume"), v.literal("cancel"), v.literal("steer")),
+    input: v.optional(v.string()),
     authTokenHash: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
@@ -1686,6 +2056,109 @@ export const control = mutation({
       .take(100);
     const now = Date.now();
     if (Array.isArray(mission.splitChildMissionIds) && mission.splitChildMissionIds.length) {
+      if (mission.planDigest && mission.planGeneration) {
+        if (mission.status === "done") return false;
+        if (mission.status === "cancelled") return args.action === "cancel";
+        const nodes = await ctx.db.query("goalPlanNodes")
+          .withIndex("by_parent_generation", (q: any) => q.eq("parentMissionId", mission._id)
+            .eq("planGeneration", Number(mission.planGeneration))).take(GOAL_DAG_MAX_NODES + 1);
+        if (nodes.length !== Number(mission.planNodeCount ?? 0) || nodes.length > GOAL_DAG_MAX_NODES) return false;
+        const nodeJobs: any[] = await Promise.all(nodes.map((node: any) => ctx.db.get(node.jobId)));
+        if (nodeJobs.some((job) => !job)) return false;
+        if (mission.validatorJobId) {
+          const validatorId = ctx.db.normalizeId("jobs", mission.validatorJobId);
+          const validator: any = validatorId ? await ctx.db.get(validatorId) : null;
+          if (validator && !nodeJobs.some((job) => job._id === validator._id)) nodeJobs.push(validator);
+        }
+        if (args.action === "steer") {
+          const steer = String(args.input ?? "").trim().slice(0, 2_000);
+          if (!steer) return false;
+          if (mission.steer === steer && Number(mission.steerRevision ?? 0) > 0) return true;
+          let reconciliationPending = false;
+          for (const job of nodeJobs) {
+            if (["done", "error", "cancelled"].includes(job.status)) continue;
+            const integrationControl = await controlIntegrationForJob(ctx, job, "steer");
+            reconciliationPending ||= Boolean(integrationControl?.reconcile);
+            const current: any = await ctx.db.get(job._id);
+            if (!current) return false;
+            const jobSteerRevision = Number(current.steerRevision ?? 0) + 1;
+            const steerPatch = {
+              steer, steerRevision: jobSteerRevision,
+              checkpoint: `${current.checkpoint ?? ""}\n\nDaniel steering instruction:\n${steer}`.trim().slice(-6_000),
+              progress: "Split-parent steering preserved this node scope and queued a fresh execution generation",
+            };
+            if (integrationControl?.reconcile) {
+              await patchJobWithRuntime(ctx, current, steerPatch);
+            } else if (current.status === "running") {
+              const attempt = await ctx.db.query("workAttempts")
+                .withIndex("by_job_attempt", (q: any) => q.eq("jobId", current._id).eq("attempt", Number(current.attempt ?? 1))).first();
+              if (!attempt || attempt.completedAt) return false;
+              await ctx.db.patch(attempt._id, { status: "steered", completedAt: now, lastEventAt: now });
+              await patchJobWithRuntime(ctx, current, { ...steerPatch, status: "steering", stage: "steering" });
+            } else {
+              await patchJobWithRuntime(ctx, current, steerPatch);
+            }
+          }
+          await patchMissionWithRuntime(ctx, mission, {
+            steer, steerRevision: Number(mission.steerRevision ?? 0) + 1,
+            controlRequested: reconciliationPending ? "steer" : undefined,
+            controlRequestedAt: reconciliationPending ? now : undefined, updatedAt: now,
+          });
+          await recordMissionEvent(ctx, String(mission._id), "goal_split_steer",
+            "Split-parent steering reached every unfinished immutable node", "steering", mission.percent,
+            { planDigest: mission.planDigest, planGeneration: mission.planGeneration, reconciliationPending });
+          return true;
+        }
+        if ((args.action === "pause" && mission.status === "paused")
+          || (args.action === "resume" && (mission.status === "split" || (mission.status === "running" && mission.phase === "validating")))
+          || (args.action === "cancel" && mission.status === "cancelled")) return true;
+        let reconciliationPending = false;
+        for (const job of nodeJobs) {
+          if (args.action === "resume") {
+            const retryCompletedValidator = String(job._id) === mission.validatorJobId && mission.status === "needs_input" && job.status === "done";
+            if (["paused", "error", "needs_input"].includes(job.status) || retryCompletedValidator) {
+              await resetGoalJob(ctx, job, now, job.status === "needs_input" || retryCompletedValidator);
+            }
+            continue;
+          }
+          const result = await controlIntegrationForJob(ctx, job, args.action);
+          reconciliationPending ||= Boolean(result?.reconcile);
+          const current: any = await ctx.db.get(job._id);
+          if (!current || current.integrationState === `${args.action}_requested` || TERMINAL.has(current.status)) continue;
+          await patchJobWithRuntime(ctx, current, args.action === "pause" ? {
+            status: "paused", stage: "paused", progress: "split parent paused", nextRunAt: undefined,
+          } : {
+            status: "cancelled", stage: "cancelled", progress: "split parent cancelled", completedAt: now, nextRunAt: undefined,
+          });
+        }
+        for (const childId of mission.splitChildMissionIds.slice(0, GOAL_DAG_MAX_NODES)) {
+          const child: any = await ctx.db.get(childId);
+          if (!child || child.parentMissionId !== mission._id || child.planDigest !== mission.planDigest) return false;
+          if (child.status === "done") continue;
+          await patchMissionWithRuntime(ctx, child, args.action === "resume" ? {
+            status: "running", phase: "building", pausedPhase: undefined, failureReason: undefined, updatedAt: now,
+          } : reconciliationPending ? {
+            controlRequested: args.action, controlRequestedAt: now, pausedPhase: child.phase, updatedAt: now,
+          } : args.action === "pause" ? {
+            status: "paused", phase: "paused", pausedPhase: "building", updatedAt: now,
+          } : { status: "cancelled", phase: "cancelled", completedAt: now, updatedAt: now });
+        }
+        await patchMissionWithRuntime(ctx, mission, args.action === "resume" ? {
+          status: mission.pausedPhase === "validating" ? "running" : "split",
+          phase: mission.pausedPhase === "validating" ? "validating" : "split", pausedPhase: undefined, controlRequested: undefined,
+          controlRequestedAt: undefined, failureReason: undefined, updatedAt: now,
+        } : reconciliationPending ? {
+          status: "split", phase: "split", controlRequested: args.action, controlRequestedAt: now,
+          pausedPhase: "split", updatedAt: now,
+        } : args.action === "pause" ? {
+          status: "paused", phase: "paused", pausedPhase: mission.phase === "validating" ? "validating" : "split", updatedAt: now,
+        } : { status: "cancelled", phase: "cancelled", completedAt: now, updatedAt: now });
+        await recordMissionEvent(ctx, String(mission._id), `goal_split_${args.action}`,
+          `Split parent ${args.action} applied to ${nodeJobs.length} immutable nodes`, args.action, mission.percent,
+          { planDigest: mission.planDigest, planGeneration: mission.planGeneration, reconciliationPending });
+        return true;
+      }
+      if (args.action === "steer") return false;
       if ((args.action === "pause" && mission.status === "paused")
         || (args.action === "resume" && mission.status === "split")
         || (args.action === "cancel" && mission.status === "cancelled")) return true;

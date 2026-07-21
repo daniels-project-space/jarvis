@@ -80,9 +80,10 @@ export const TOOL_DEFS = [
     parameters: {
       type: "object",
       properties: {
-        action: { type: "string", enum: ["start", "status", "pause", "resume", "cancel"] },
+        action: { type: "string", enum: ["start", "status", "pause", "resume", "cancel", "steer"] },
         goal: { type: "string", description: "Concrete observable outcome; required for start" },
         mission_id: { type: "string", description: "Goal Mode mission id; required for pause/resume/cancel and optional for status" },
+        input: { type: "string", description: "Steering instruction when action=steer; preserves accepted node scope and creates fresh execution generations" },
         repo: { type: "string", description: "Known owner/repo only when the goal explicitly belongs there" },
         acceptance_criteria: { type: "array", items: { type: "string" }, description: "Observable goal-level truths the final Sol validator must prove" },
         build_sessions: { type: "number", description: "Maximum bounded Terra/high implementation sessions, 2-8; default 6" },
@@ -3059,7 +3060,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         const missions: any[] = (await convexQuery("missions:active", {})) ?? [];
         const goal = missionId
           ? missions.find((mission) => String(mission._id) === missionId && mission.mode === "goal")
-          : missions.find((mission) => mission.mode === "goal" && ["running", "paused", "needs_input"].includes(mission.status));
+          : missions.find((mission) => mission.mode === "goal" && ["running", "split", "paused", "needs_input"].includes(mission.status));
         await convexMutation("ui:setPanel", {
           type: "fleet",
           value: JSON.stringify(goal ? { missionId: String(goal._id), mode: "goal" } : { mode: "goal" }),
@@ -3069,15 +3070,17 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           ? `Goal ${goal._id} is ${goal.status}, phase ${goal.phase}, ${goal.percent}% complete${goal.failureReason ? ` — ${goal.failureReason}` : ""}. Its durable sessions and evidence are on screen.`
           : "There is no active Goal Mode outcome. The Goal Mode command deck is open.";
       }
-      if (action === "pause" || action === "resume" || action === "cancel") {
+      if (action === "pause" || action === "resume" || action === "cancel" || action === "steer") {
         if (!missionId) return `Choose the Goal Mode outcome to ${action}.`;
-        const ok = await convexMutation("goalMode:control", { id: missionId, action, authTokenHash });
-        let shouldWake = action === "resume";
+        const input = action === "steer" ? String(args.input ?? "").trim() : undefined;
+        if (action === "steer" && !input) return "Tell me the new direction for the unfinished Goal Mode nodes.";
+        const ok = await convexMutation("goalMode:control", { id: missionId, action, input, authTokenHash });
+        let shouldWake = action === "resume" || action === "steer";
         if (ok) {
           const { goalCoordinationDemand, syncExternalGoalControls, syncExternalGoalRevisions } = await import("../trigger/goal-runtime");
           await syncExternalGoalControls().catch(() => null);
           await syncExternalGoalRevisions().catch(() => null);
-          if (action === "resume") {
+          if (action === "resume" || action === "steer") {
             const demand = await goalCoordinationDemand().catch(() => null);
             if (demand) shouldWake = demand.needed === true;
           }

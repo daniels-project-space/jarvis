@@ -18,8 +18,10 @@ export async function POST(req: NextRequest) {
   let ok: unknown = false;
   let shouldWake = false;
   if (missionId) {
-    if (!new Set(["pause", "resume", "cancel"]).has(action)) return Response.json({ ok: false }, { status: 400 });
-    ok = await controlMutation("goalMode:control", { id: missionId, action, ...credentials });
+    if (!new Set(["pause", "resume", "cancel", "steer"]).has(action)) return Response.json({ ok: false }, { status: 400 });
+    const input = action === "steer" ? String(body?.input ?? "").trim() : undefined;
+    if (action === "steer" && !input) return Response.json({ ok: false }, { status: 400 });
+    ok = await controlMutation("goalMode:control", { id: missionId, action, input, ...credentials });
   } else if (action === "approve" || action === "decline") {
     ok = await controlMutation("approvals:decide", {
       jobId,
@@ -39,7 +41,7 @@ export async function POST(req: NextRequest) {
     const { goalCoordinationDemand, syncExternalGoalControls, syncExternalGoalRevisions } = await import("@/trigger/goal-runtime");
     await syncExternalGoalControls().catch(() => null);
     await syncExternalGoalRevisions().catch(() => null);
-    if (action === "resume") {
+    if (action === "resume" || action === "steer") {
       shouldWake = true;
       const demand = await goalCoordinationDemand().catch(() => null);
       if (demand) shouldWake = demand.needed === true;

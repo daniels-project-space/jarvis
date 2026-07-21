@@ -228,6 +228,13 @@ export default defineSchema({
     // this immutable envelope rather than re-reading changing upstream work.
     upstreamEvidence: v.optional(v.array(v.object({
       label: v.string(), status: v.string(), result: v.string(), verificationNote: v.string(),
+      planDigest: v.optional(v.string()), planGeneration: v.optional(v.number()),
+      sourceNodeId: v.optional(v.string()), sourceJobId: v.optional(v.string()),
+      sourceAttempt: v.optional(v.number()), sourceSteerRevision: v.optional(v.number()),
+      reviewReceiptDigest: v.optional(v.string()), integrationReceiptDigest: v.optional(v.string()),
+      repository: v.optional(v.string()), sourceBranch: v.optional(v.string()), sourceHeadSha: v.optional(v.string()),
+      integrationBranch: v.optional(v.string()), integrationHeadSha: v.optional(v.string()),
+      artifactRefs: v.optional(v.array(v.string())), resultDigest: v.optional(v.string()),
     }))),
     dispatchLeaseUntil: v.optional(v.number()),
     dispatchReason: v.optional(v.string()),
@@ -240,6 +247,12 @@ export default defineSchema({
     maxAttempts: v.optional(v.number()),
     parentJobId: v.optional(v.string()),
     dependsOn: v.optional(v.array(v.string())),
+    // Immutable parent-plan binding for executable Goal Mode DAG nodes. A job
+    // may live in a repository child mission, but this authority never moves.
+    planParentMissionId: v.optional(v.id("missions")),
+    planDigest: v.optional(v.string()),
+    planGeneration: v.optional(v.number()),
+    planNodeId: v.optional(v.string()),
     goalStage: v.optional(v.string()), // planning | building | validating | refining
     goalWorkstreamId: v.optional(v.string()),
     goalWave: v.optional(v.number()),
@@ -351,6 +364,10 @@ export default defineSchema({
     readonly: v.optional(v.boolean()),
     parentJobId: v.optional(v.string()),
     dependsOn: v.optional(v.array(v.string())),
+    planParentMissionId: v.optional(v.id("missions")),
+    planDigest: v.optional(v.string()),
+    planGeneration: v.optional(v.number()),
+    planNodeId: v.optional(v.string()),
     goalStage: v.optional(v.string()),
     goalWorkstreamId: v.optional(v.string()),
     goalWave: v.optional(v.number()),
@@ -402,8 +419,14 @@ export default defineSchema({
     managerAgentId: v.optional(v.string()),
     parentMissionId: v.optional(v.id("missions")),
     splitChildMissionIds: v.optional(v.array(v.id("missions"))),
+    splitChildKind: v.optional(v.string()),
+    planDigest: v.optional(v.string()),
+    planGeneration: v.optional(v.number()),
+    planNodeCount: v.optional(v.number()),
     controlRequested: v.optional(v.string()),
     controlRequestedAt: v.optional(v.number()),
+    steer: v.optional(v.string()),
+    steerRevision: v.optional(v.number()),
     priority: v.optional(v.number()),
     risk: v.optional(v.string()),
     phase: v.optional(v.string()),
@@ -487,6 +510,9 @@ export default defineSchema({
     maxBuildSessions: v.number(),
     planningJobId: v.optional(v.string()),
     validatorJobId: v.optional(v.string()),
+    planDigest: v.optional(v.string()),
+    planGeneration: v.optional(v.number()),
+    planNodeCount: v.optional(v.number()),
     sourceBranch: v.optional(v.string()),
     integrationBranch: v.optional(v.string()),
     integrationHeadSha: v.optional(v.string()),
@@ -632,6 +658,13 @@ export default defineSchema({
     // snapshot and must never re-read changing dependencies.
     upstreamEvidence: v.optional(v.array(v.object({
       label: v.string(), status: v.string(), result: v.string(), verificationNote: v.string(),
+      planDigest: v.optional(v.string()), planGeneration: v.optional(v.number()),
+      sourceNodeId: v.optional(v.string()), sourceJobId: v.optional(v.string()),
+      sourceAttempt: v.optional(v.number()), sourceSteerRevision: v.optional(v.number()),
+      reviewReceiptDigest: v.optional(v.string()), integrationReceiptDigest: v.optional(v.string()),
+      repository: v.optional(v.string()), sourceBranch: v.optional(v.string()), sourceHeadSha: v.optional(v.string()),
+      integrationBranch: v.optional(v.string()), integrationHeadSha: v.optional(v.string()),
+      artifactRefs: v.optional(v.array(v.string())), resultDigest: v.optional(v.string()),
     }))),
     // The Trigger run is only delivery metadata. Sandbox/provider sessions
     // are deliberately separate identities for the sandbox adapter workstream.
@@ -648,6 +681,70 @@ export default defineSchema({
   })
     .index("by_job_attempt", ["jobId", "attempt"])
     .index("by_status_progress", ["status", "progressAt"]),
+
+  // Accepted GoalPlan authority is normalized once. These compact rows map
+  // every original id exactly once to its executable job and repository/evidence
+  // child without making mission summaries or heartbeats authoritative.
+  goalPlanNodes: defineTable({
+    parentMissionId: v.id("missions"),
+    planDigest: v.string(),
+    planGeneration: v.number(),
+    nodeId: v.string(),
+    childMissionId: v.id("missions"),
+    jobId: v.id("jobs"),
+    label: v.string(),
+    agentId: v.string(),
+    repository: v.optional(v.string()),
+    readonly: v.boolean(),
+    dependencyCount: v.number(),
+    weight: v.number(),
+    createdAt: v.number(),
+  })
+    .index("by_parent_generation", ["parentMissionId", "planGeneration", "nodeId"])
+    .index("by_parent_generation_node", ["parentMissionId", "planGeneration", "nodeId"])
+    .index("by_child", ["childMissionId", "nodeId"])
+    .index("by_job", ["jobId"]),
+
+  goalPlanEdges: defineTable({
+    parentMissionId: v.id("missions"),
+    planDigest: v.string(),
+    planGeneration: v.number(),
+    edgeId: v.string(),
+    sourceNodeId: v.string(),
+    targetNodeId: v.string(),
+    sourceJobId: v.id("jobs"),
+    targetJobId: v.id("jobs"),
+    createdAt: v.number(),
+  })
+    .index("by_parent_generation", ["parentMissionId", "planGeneration", "edgeId"])
+    .index("by_target", ["targetJobId", "planGeneration", "sourceNodeId"])
+    .index("by_source", ["sourceJobId", "planGeneration", "targetNodeId"]),
+
+  // One compact immutable receipt per successful node execution generation.
+  // Full reviews, integration manifests and artifacts remain in their cold
+  // authority tables and are loaded only by validators or explicit detail UI.
+  goalHandoffs: defineTable({
+    parentMissionId: v.id("missions"),
+    planDigest: v.string(),
+    planGeneration: v.number(),
+    sourceNodeId: v.string(),
+    sourceJobId: v.id("jobs"),
+    sourceAttempt: v.number(),
+    sourceSteerRevision: v.number(),
+    reviewReceiptDigest: v.optional(v.string()),
+    integrationReceiptDigest: v.optional(v.string()),
+    repository: v.optional(v.string()),
+    sourceBranch: v.optional(v.string()),
+    sourceHeadSha: v.optional(v.string()),
+    integrationBranch: v.optional(v.string()),
+    integrationHeadSha: v.optional(v.string()),
+    artifactRefs: v.array(v.string()),
+    resultDigest: v.string(),
+    summary: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_source_attempt", ["sourceJobId", "sourceAttempt", "planGeneration"])
+    .index("by_parent_generation", ["parentMissionId", "planGeneration", "sourceNodeId"]),
 
   // Mission integration is distinct from specialist delivery. These rows are
   // append-only generations around one immutable review receipt. Exactly one

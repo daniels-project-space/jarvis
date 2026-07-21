@@ -18,6 +18,7 @@ import {
 } from "./goalIntegration";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
 import { hasAttemptBudget, isMeaningfulWorkProgress } from "../src/lib/work-attempt";
+import { verifiedGoalHandoffsForJob } from "./goalMode";
 import { claimDisposition, completionReceiptAllowed, isSha256Digest, replayEnvelope, shouldAdvanceAttempt } from "../src/lib/durable-attempt-protocol";
 import {
   insertJobWithRuntime,
@@ -694,6 +695,10 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
       const mission = missionId ? await ctx.db.get(missionId) : null;
       if (!mission || !goalJobMatchesMissionPhase(job, mission)) continue;
     }
+    if (job.planParentMissionId) {
+      const verifiedHandoffs = await verifiedGoalHandoffsForJob(ctx, job);
+      if (!verifiedHandoffs) continue;
+    }
     if (job.integrationAttemptId && job.missionId && job.repo) {
       const integration: any = await ctx.db.get(job.integrationAttemptId);
       // Queue maintenance exposes exactly one head as queued. Later cold
@@ -781,6 +786,10 @@ async function claimedJob(ctx: any, j: any, upstreamEvidence: readonly any[] = [
     acceptanceCriteria: j.acceptanceCriteria ?? [],
     modelReason: j.modelReason ?? null,
     parentJobId: j.parentJobId ?? null,
+    planParentMissionId: j.planParentMissionId ?? null,
+    planDigest: j.planDigest ?? null,
+    planGeneration: j.planGeneration ?? null,
+    planNodeId: j.planNodeId ?? null,
     goalStage: j.goalStage ?? null,
     goalWorkstreamId: j.goalWorkstreamId ?? null,
     goalWave: j.goalWave ?? 0,
@@ -791,6 +800,7 @@ async function claimedJob(ctx: any, j: any, upstreamEvidence: readonly any[] = [
 }
 
 async function upstreamEvidenceForClaim(ctx: any, j: any) {
+  if (j.planParentMissionId) return await verifiedGoalHandoffsForJob(ctx, j);
   // Dependencies are an explicit contract, not an invitation to read all
   // mission siblings. Preserve declared order so the claim snapshot is stable.
   const upstreamRows = await Promise.all((j.dependsOn ?? []).slice(0, 8).map(async (dependency: string) => {
@@ -969,6 +979,7 @@ export const claimDispatched = mutation({
     const attempt = priorAttempt ?? await ensureAttempt(ctx, a.jobId, attemptNumber, "dispatching", now, { dispatchId: a.dispatchId });
     if (attempt.dispatchId && attempt.dispatchId !== a.dispatchId) return null;
     const upstreamEvidence = await upstreamEvidenceForClaim(ctx, j);
+    if (!upstreamEvidence) return null;
     await patchJobWithRuntime(ctx, j, {
       status: "running",
       stage: "starting",
