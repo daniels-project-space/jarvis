@@ -7,7 +7,7 @@ import { clientMutation } from "@/lib/client-mutation";
 import { primeMicrophone, readJarvisPermissions, type JarvisPermissionState } from "@/lib/permissions";
 import { registerSW, subscribePush } from "@/lib/push";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
-import { createOrbMotionFrame, type OrbMotionFrame } from "@/lib/orb-motion";
+import { createOrbMotionFrame, deriveOrbVisual, type OrbMotionFrame } from "@/lib/orb-motion";
 import {
   cacheCompactWorkSnapshot,
   visibleWorkSnapshot,
@@ -389,7 +389,8 @@ function ReactorRing({
       }),
     [],
   );
-  const opacity = hidden ? 0 : aside ? 0.32 : active ? 0.52 : 0.24;
+  const initialVisual = deriveOrbVisual(motionRef.current, reduceMotion);
+  const opacity = hidden ? 0 : (active ? 0.52 : 0.24) * (1 - 0.38 * initialVisual.aside);
   useEffect(() => {
     const ring = ringRef.current;
     const container = containerRef.current;
@@ -397,15 +398,16 @@ function ReactorRing({
     let frame = 0;
     const paint = () => {
       const motion = motionRef.current;
-      ring.style.transform = reduceMotion ? "none" : `rotate(${motion.phase}rad)`;
+      const visual = deriveOrbVisual(motion, reduceMotion);
+      ring.style.transform = `rotate(${visual.rotation}rad)`;
       // The ring reads the orb's own eased aside value instead of running a
       // second CSS clock. Translation, scale, colour and rotation therefore
       // cannot lag behind or snap in a different direction.
-      container.style.transform = `translateX(${32 * motion.aside}%) translateY(-4.5%) scale(${1 - 0.22 * motion.aside})`;
-      container.style.opacity = String(hidden ? 0 : (active ? 0.52 : 0.24) * (1 - 0.38 * motion.aside));
-      firstStopRef.current?.setAttribute("stop-color", motion.color);
-      middleStopRef.current?.setAttribute("stop-color", motion.accent);
-      lastStopRef.current?.setAttribute("stop-color", motion.color);
+      container.style.transform = `translateX(${visual.translateXPercent}%) translateY(-4.5%) scale(${visual.scale})`;
+      container.style.opacity = String(hidden ? 0 : (active ? 0.52 : 0.24) * (1 - 0.38 * visual.aside));
+      firstStopRef.current?.setAttribute("stop-color", visual.color);
+      middleStopRef.current?.setAttribute("stop-color", visual.accent);
+      lastStopRef.current?.setAttribute("stop-color", visual.color);
       // Reduced motion freezes rotation but still follows the orb's slowly
       // changing conversation colour.
       frame = requestAnimationFrame(paint);
@@ -417,7 +419,7 @@ function ReactorRing({
     <div
       ref={containerRef}
       className="pointer-events-none absolute inset-0 grid place-items-center will-change-transform"
-      style={{ opacity, transform: aside ? "translateX(32%) translateY(-4.5%) scale(0.76)" : "translateY(-4.5%) scale(1)" }}
+      style={{ opacity, transform: `translateX(${initialVisual.translateXPercent}%) translateY(-4.5%) scale(${initialVisual.scale})` }}
     >
       <svg viewBox="0 0 500 500" className="h-[min(82vmin,760px)] w-[min(82vmin,760px)]">
         <defs>
@@ -3178,7 +3180,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               finalization and narration. Compact overlays keep it beside their
               visible orb; only a truly full-screen workspace owns the surface. */}
           {caption && !fullBleed && (
-            <div className={`pointer-events-none absolute top-[52%] z-30 flex justify-center px-6 ${compactAside || (commandExpanded && !overlayUp) ? "hidden md:flex md:left-[62%] md:right-0" : "inset-x-0"}`}>
+            <div className={`pointer-events-none absolute z-30 flex justify-center px-6 ${compactAside || (commandExpanded && !overlayUp) ? "top-[70%] hidden md:flex md:left-[62%] md:right-0" : "inset-x-0 top-[52%]"}`}>
               <SpokenCaption caption={caption} />
             </div>
           )}
