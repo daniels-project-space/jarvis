@@ -65,7 +65,7 @@ describe("specialist OS trust boundary", () => {
       "--pid",
       "--fork",
       "--kill-child=SIGKILL",
-      "/bin/sh",
+      realpathSync("/bin/sh"),
       "-c",
       PRIVATE_PROC_NAMESPACE_SETUP,
       "sandbox",

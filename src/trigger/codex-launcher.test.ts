@@ -57,7 +57,7 @@ describe("central Codex process launcher", () => {
       "--propagation",
       "unchanged",
       "--",
-      "/bin/sh",
+      realpathSync("/bin/sh"),
       "-c",
       PRIVATE_PROC_NAMESPACE_SETUP,
       "sh",

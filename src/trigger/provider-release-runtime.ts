@@ -35,6 +35,15 @@ import type {
 import { githubGitEnv, githubRepoUrl } from "./git-transport";
 import type { ProviderMergeGate, PullRequestChange } from "./github-delivery";
 import { vaultService } from "../lib/vault-client";
+import {
+  ProviderCandidateSandbox,
+  createProviderToolSession,
+  safeProviderToolEnv,
+  type ProviderCommandResult,
+  type ProviderToolSession,
+} from "./provider-command-sandbox";
+
+export { createProviderToolSession, safeProviderToolEnv } from "./provider-command-sandbox";
 
 type ConvexMutation = (path: string, args: unknown) => Promise<any>;
 type CommandResult = { code: number | null; out: string };
@@ -45,7 +54,8 @@ type CommandRunner = (
 ) => Promise<CommandResult>;
 
 export const CONVEX_PREMERGE_PROOF_COMMAND = [
-  "tsc", "--project", "convex/tsconfig.json", "--noEmit", "--incremental", "false",
+  "--no-install", "convex", "deploy", "--dry-run", "--typecheck", "enable",
+  "--codegen", "disable", "--env-file", "/dev/null",
 ] as const;
 
 export function convexReleaseAction(phase: ProviderReleaseStep["phase"]): "local-proof" | "live-deploy" {
@@ -99,7 +109,7 @@ function oneLine(value: string, limit = 500): string {
   return value.trim().replace(/\s+/g, " ").slice(-limit);
 }
 
-function defaultCommandRunner(
+export function defaultCommandRunner(
   command: string,
   args: string[],
   options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number },
@@ -109,81 +119,50 @@ function defaultCommandRunner(
       cwd: options.cwd,
       env: options.env,
       stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
     });
     let output = "";
+    let processError: Error | undefined;
+    let timedOut = false;
     const outputLimit = command === "git" && args[0] === "ls-files" ? 10 * 1024 * 1024 : 30_000;
     const timer = setTimeout(() => {
+      timedOut = true;
+      if (process.platform !== "win32" && child.pid) {
+        try { process.kill(-child.pid, "SIGKILL"); } catch { /* process group already gone */ }
+      }
       try { child.kill("SIGKILL"); } catch { /* already gone */ }
     }, options.timeoutMs);
+    timer.unref?.();
     const append = (chunk: unknown) => {
       output = `${output}${String(chunk)}`.slice(-outputLimit);
     };
     child.stdout.on("data", append);
     child.stderr.on("data", append);
     child.on("error", (error) => {
-      clearTimeout(timer);
-      resolve({ code: -1, out: `${output}\n${String(error)}` });
+      processError = error;
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      resolve({ code, out: output });
+      if (processError) output = `${output}\n${processError.message}`;
+      resolve({ code: timedOut || processError ? -1 : code, out: output });
     });
   });
-}
-
-export function safeProviderToolEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const env = {} as NodeJS.ProcessEnv;
-  for (const key of [
-    "PATH",
-    "HOME",
-    "LANG",
-    "LC_ALL",
-    "TMPDIR",
-    "NODE_EXTRA_CA_CERTS",
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
-    "CI",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "no_proxy",
-  ]) {
-    const value = base[key];
-    if (value === undefined) continue;
-    if (["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"].includes(key) && value) {
-      let proxy: URL;
-      try { proxy = new URL(value); } catch { throw new Error(`invalid provider tool proxy URL ${key}`); }
-      if (
-        !["http:", "https:"].includes(proxy.protocol)
-        || proxy.username
-        || proxy.password
-        || proxy.search
-        || proxy.hash
-      ) throw new Error(`credential-bearing or non-canonical provider tool proxy URL ${key} is forbidden`);
-    }
-    env[key] = value;
-  }
-  env.PATH = base.PATH?.trim() || "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-  env.CI = "1";
-  env.GIT_TERMINAL_PROMPT = "0";
-  env.GH_PROMPT_DISABLED = "1";
-  return env;
 }
 
 export function triggerReleaseEnv(
   base: NodeJS.ProcessEnv,
   accessToken: string,
+  session: ProviderToolSession,
 ): NodeJS.ProcessEnv {
   return {
-    ...safeProviderToolEnv(base),
+    ...safeProviderToolEnv(base, session),
     TRIGGER_ACCESS_TOKEN: accessToken,
   };
 }
 
 export function triggerDeployCommand(projectRef: string): string[] {
   return [
+    "--no-install",
     "trigger.dev",
     "deploy",
     "--project-ref",
@@ -196,7 +175,7 @@ export function triggerDeployCommand(projectRef: string): string[] {
 }
 
 export function triggerPromoteCommand(projectRef: string, version: string): string[] {
-  return ["trigger.dev", "promote", version, "--project-ref", projectRef];
+  return ["--no-install", "trigger.dev", "promote", version, "--project-ref", projectRef];
 }
 
 export type GeneratedTriggerAttestor = Readonly<{
@@ -280,12 +259,14 @@ class TrustedProviderReleaseRuntime {
   private readonly fetchImpl: typeof fetch;
   private readonly runCommand: CommandRunner;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly toolSession: ProviderToolSession;
   private readonly leaseToken = randomBytes(24).toString("hex");
   private readonly services = new Map<string, Promise<Record<string, string>>>();
   private checkoutDir: string | null = null;
   private checkoutSourceSha = "";
   private dependenciesSourceSha = "";
-  private convexProofSourceSha = "";
+  private readonly convexProofs = new Map<string, { commandDigest: string }>();
+  private candidateSandbox: ProviderCandidateSandbox | null = null;
   private releaseLeaseBegun = false;
   private currentState: ProviderReleaseState | undefined;
   private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
@@ -301,6 +282,7 @@ class TrustedProviderReleaseRuntime {
     this.fetchImpl = args.fetchImpl ?? fetch;
     this.runCommand = args.runCommand ?? defaultCommandRunner;
     this.sleep = args.sleep ?? delay;
+    this.toolSession = createProviderToolSession(args.baseEnv);
   }
 
   async cleanup(): Promise<void> {
@@ -308,8 +290,11 @@ class TrustedProviderReleaseRuntime {
     this.cleaned = true;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     await this.heartbeatPromise?.catch(() => false);
+    await this.candidateSandbox?.cleanup();
+    this.candidateSandbox = null;
     if (this.checkoutDir) rmSync(resolve(this.checkoutDir, ".."), { recursive: true, force: true });
     this.checkoutDir = null;
+    this.toolSession.cleanup();
   }
 
   private async continuing(): Promise<void> {
@@ -328,13 +313,59 @@ class TrustedProviderReleaseRuntime {
     return pending;
   }
 
+  private toolEnv(): NodeJS.ProcessEnv {
+    return safeProviderToolEnv(this.args.baseEnv, this.toolSession);
+  }
+
+  private async ensureCandidatePreflight(): Promise<ProviderCandidateSandbox> {
+    const dir = this.checkoutDir ?? await this.checkout();
+    if (!this.candidateSandbox) {
+      this.candidateSandbox = new ProviderCandidateSandbox({
+        checkout: dir,
+        baseEnv: this.args.baseEnv,
+        session: this.toolSession,
+      });
+    }
+    await this.candidateSandbox.preflight();
+    return this.candidateSandbox;
+  }
+
   private async capability(reference: ReleaseCapabilityRef): Promise<string> {
+    // No target authority is loaded until the real namespace/chroot preflight
+    // has closed and its atomic receipt has been validated.
+    await this.ensureCandidatePreflight();
     const fromEnv = reference.env ? this.args.baseEnv[reference.env] : undefined;
     if (fromEnv?.trim()) return fromEnv.trim();
     const values = await this.service(reference.service).catch(() => ({} as Record<string, string>));
     const value = values[reference.key]?.trim();
     if (!value) throw new Error(`trusted release capability ${reference.service}.${reference.key} is unavailable`);
     return value;
+  }
+
+  private async candidateCommand(input: {
+    command: "npm" | "npx";
+    args: readonly string[];
+    timeoutMs: number;
+    capability?: { name: "CONVEX_DEPLOY_KEY" | "TRIGGER_ACCESS_TOKEN"; value: string };
+  }): Promise<ProviderCommandResult> {
+    await this.continuing();
+    const sandbox = await this.ensureCandidatePreflight();
+    const result = await sandbox.run(input);
+    await this.continuing();
+    return result;
+  }
+
+  private candidateOutput(result: ProviderCommandResult, label: string): string {
+    if (
+      result.code !== 0
+      || result.receipt.protocol !== 1
+      || result.receipt.candidateSandbox !== true
+      || result.receipt.closeObserved !== true
+      || result.receipt.timedOut
+    ) {
+      throw new Error(`${label} failed inside the candidate sandbox: ${oneLine(result.out) || `exit ${String(result.code)}`}`);
+    }
+    return result.out;
   }
 
   private async command(
@@ -357,7 +388,7 @@ class TrustedProviderReleaseRuntime {
     if (this.checkoutDir) return this.checkoutDir;
     const root = mkdtempSync(join(tmpdir(), "jarvis-provider-release-"));
     const dir = join(root, "repository");
-    const gitEnv = githubGitEnv(safeProviderToolEnv(this.args.baseEnv), this.args.githubToken);
+    const gitEnv = githubGitEnv(this.toolEnv(), this.args.githubToken);
     try {
       await this.command(
         "git",
@@ -365,11 +396,11 @@ class TrustedProviderReleaseRuntime {
         root,
         gitEnv,
       );
-      await this.command("git", ["remote", "set-url", "origin", githubRepoUrl(this.args.repository)], dir, safeProviderToolEnv(this.args.baseEnv));
-      const head = oneLine(await this.command("git", ["rev-parse", "HEAD"], dir, safeProviderToolEnv(this.args.baseEnv)), 80);
-      const branch = oneLine(await this.command("git", ["branch", "--show-current"], dir, safeProviderToolEnv(this.args.baseEnv)), 240);
-      const shallow = oneLine(await this.command("git", ["rev-parse", "--is-shallow-repository"], dir, safeProviderToolEnv(this.args.baseEnv)), 20);
-      const status = (await this.command("git", ["status", "--porcelain=v1", "--untracked-files=all"], dir, safeProviderToolEnv(this.args.baseEnv))).trim();
+      await this.command("git", ["remote", "set-url", "origin", githubRepoUrl(this.args.repository)], dir, this.toolEnv());
+      const head = oneLine(await this.command("git", ["rev-parse", "HEAD"], dir, this.toolEnv()), 80);
+      const branch = oneLine(await this.command("git", ["branch", "--show-current"], dir, this.toolEnv()), 240);
+      const shallow = oneLine(await this.command("git", ["rev-parse", "--is-shallow-repository"], dir, this.toolEnv()), 20);
+      const status = (await this.command("git", ["status", "--porcelain=v1", "--untracked-files=all"], dir, this.toolEnv())).trim();
       if (head !== expectedSha || branch !== initialBranch || shallow !== "false" || status) {
         throw new Error("the trusted provider checkout is not the exact clean, complete-history source candidate");
       }
@@ -384,7 +415,7 @@ class TrustedProviderReleaseRuntime {
 
   private async remoteRefs(): Promise<Map<string, string>> {
     const dir = this.checkoutDir ?? await this.checkout();
-    const env = safeProviderToolEnv(this.args.baseEnv);
+    const env = this.toolEnv();
     const output = await this.command(
       "git",
       [
@@ -424,9 +455,9 @@ class TrustedProviderReleaseRuntime {
     const dir = this.checkoutDir
       ?? await this.checkout(postmerge ? this.change.baseBranch : this.args.branch, sourceSha);
     if (this.checkoutSourceSha !== sourceSha) {
-      const env = githubGitEnv(safeProviderToolEnv(this.args.baseEnv), this.args.githubToken);
+      const env = githubGitEnv(this.toolEnv(), this.args.githubToken);
       await this.command("git", ["fetch", "--no-tags", "origin", sourceSha], dir, env);
-      await this.command("git", ["checkout", "--detach", sourceSha], dir, safeProviderToolEnv(this.args.baseEnv));
+      await this.command("git", ["checkout", "--detach", sourceSha], dir, this.toolEnv());
       this.checkoutSourceSha = sourceSha;
       this.dependenciesSourceSha = "";
     }
@@ -435,7 +466,7 @@ class TrustedProviderReleaseRuntime {
 
   private async verifyCheckoutStillPinned(sourceSha = this.plan.headSha): Promise<string> {
     const dir = await this.switchToSource(sourceSha);
-    const env = safeProviderToolEnv(this.args.baseEnv);
+    const env = this.toolEnv();
     const head = oneLine(await this.command("git", ["rev-parse", "HEAD"], dir, env), 80);
     const shallow = oneLine(await this.command("git", ["rev-parse", "--is-shallow-repository"], dir, env), 20);
     const status = (await this.command("git", ["status", "--porcelain=v1", "--untracked-files=all"], dir, env)).trim();
@@ -448,16 +479,16 @@ class TrustedProviderReleaseRuntime {
 
   private async verifyPinnedBaseIsIncluded(): Promise<void> {
     const dir = await this.verifyCheckoutStillPinned(this.plan.headSha);
-    const env = githubGitEnv(safeProviderToolEnv(this.args.baseEnv), this.args.githubToken);
+    const env = githubGitEnv(this.toolEnv(), this.args.githubToken);
     const known = await this.runCommand("git", ["cat-file", "-e", `${this.plan.baseSha}^{commit}`], {
       cwd: dir,
-      env: safeProviderToolEnv(this.args.baseEnv),
+      env: this.toolEnv(),
       timeoutMs: 30_000,
     });
     if (known.code !== 0) await this.command("git", ["fetch", "--no-tags", "origin", this.plan.baseSha], dir, env);
     const ancestry = await this.runCommand("git", ["merge-base", "--is-ancestor", this.plan.baseSha, this.plan.headSha], {
       cwd: dir,
-      env: safeProviderToolEnv(this.args.baseEnv),
+      env: this.toolEnv(),
       timeoutMs: 30_000,
     });
     if (ancestry.code !== 0) {
@@ -467,7 +498,7 @@ class TrustedProviderReleaseRuntime {
 
   private async sourceSnapshot(): Promise<Map<string, string>> {
     const dir = await this.verifyCheckoutStillPinned(this.plan.headSha);
-    const listed = await this.command("git", ["ls-files", "-z"], dir, safeProviderToolEnv(this.args.baseEnv), 60_000);
+    const listed = await this.command("git", ["ls-files", "-z"], dir, this.toolEnv(), 60_000);
     const sources = new Map<string, string>();
     let totalBytes = 0;
     for (const path of listed.split("\0").filter(Boolean)) {
@@ -500,7 +531,10 @@ class TrustedProviderReleaseRuntime {
       changedPaths: this.change.changedPaths,
       impact: analyseProviderImpact(this.change.changedPaths, sources),
     });
-    if (this.plan.required) await this.verifyPinnedBaseIsIncluded();
+    if (this.plan.required) {
+      await this.verifyPinnedBaseIsIncluded();
+      await this.ensureCandidatePreflight();
+    }
     return this.plan;
   }
 
@@ -513,10 +547,17 @@ class TrustedProviderReleaseRuntime {
     await installDependenciesInPinnedCheckout({
       sourceSha,
       verifyPinned: (sha) => this.verifyCheckoutStillPinned(sha),
-      runNpmCi: async (cwd) => {
-        await this.command("npm", ["ci"], cwd, safeProviderToolEnv(this.args.baseEnv), 20 * 60_000);
+      runNpmCi: async () => {
+        const result = await this.candidateCommand({
+          command: "npm",
+          args: ["ci", "--ignore-scripts"],
+          timeoutMs: 20 * 60_000,
+        });
+        this.candidateOutput(result, "npm ci --ignore-scripts");
       },
     });
+    const sandbox = await this.ensureCandidatePreflight();
+    await sandbox.verifyPinnedToolchain();
     this.dependenciesSourceSha = sourceSha;
     return dir;
   }
@@ -678,20 +719,47 @@ class TrustedProviderReleaseRuntime {
     sourceSha: string,
   ): Promise<ProviderStepReceipt> {
     if (step.phase !== "premerge") throw new Error("local Convex proof is restricted to the pre-merge phase");
+    const target = targetForStep(this.plan, step);
     const dir = await this.prepareDependencies(sourceSha);
-    if (this.convexProofSourceSha !== sourceSha) {
-      await this.command(
-        "npx",
-        [...CONVEX_PREMERGE_PROOF_COMMAND],
-        dir,
-        safeProviderToolEnv(this.args.baseEnv),
-        20 * 60_000,
-      );
+    const proofKey = `${sourceSha}\0${target.deployment}`;
+    let proof = this.convexProofs.get(proofKey);
+    if (!proof) {
+      // The deploy key is the sole target selector. It is loaded only after
+      // dependency and toolchain preflights have closed, and is exposed only
+      // to this target-native dry-run process.
+      const deployKey = await this.capability(target.deployKey);
+      const keyTarget = deploymentFromConvexKey(deployKey);
+      if (keyTarget?.type !== target.deploymentType || keyTarget.deployment !== target.deployment) {
+        throw new Error(`Convex dry-run key does not belong to exact ${target.deploymentType}:${target.deployment}`);
+      }
+      const result = await this.candidateCommand({
+        command: "npx",
+        args: CONVEX_PREMERGE_PROOF_COMMAND,
+        timeoutMs: 20 * 60_000,
+        capability: { name: "CONVEX_DEPLOY_KEY", value: deployKey },
+      });
+      const output = this.candidateOutput(result, "Convex typecheck and bundle dry-run");
+      const expected = `Would have deployed Convex functions to ${target.url.replace(/\/$/, "")}`;
+      if (!output.includes(expected) || /(?:^|\n)\s*Deployed Convex functions to\b/i.test(output)) {
+        throw new Error(`Convex dry-run did not attest exact non-mutating target ${target.deployment}`);
+      }
       await this.verifyCheckoutStillPinned(sourceSha);
-      this.convexProofSourceSha = sourceSha;
+      proof = { commandDigest: result.receipt.commandDigest };
+      this.convexProofs.set(proofKey, proof);
     }
-    return verifiedReceipt(step, `Convex source for ${step.target} passed pinned local typecheck without a live deployment`, {
-      data: { sourceSha, localProof: true, liveMutation: false },
+    return verifiedReceipt(step, `Convex ${target.deployment} passed exact typecheck and bundle dry-run with zero live mutation`, {
+      data: {
+        sourceSha,
+        deployment: target.deployment,
+        localProof: true,
+        dryRun: true,
+        typecheck: true,
+        bundle: true,
+        codegen: false,
+        liveMutation: false,
+        commandDigest: proof.commandDigest,
+        candidateSandbox: true,
+      },
     });
   }
 
@@ -702,15 +770,15 @@ class TrustedProviderReleaseRuntime {
   ): Promise<ProviderStepReceipt> {
     if (step.phase !== "postmerge") throw new Error("live Convex deployment is forbidden before merge");
     const target = targetForStep(this.plan, step);
+    const dir = await this.prepareDependencies(sourceSha);
     const deployKey = await this.capability(target.deployKey);
     const keyTarget = deploymentFromConvexKey(deployKey);
     if (keyTarget?.type !== target.deploymentType || keyTarget.deployment !== target.deployment) {
       throw new Error(`Convex deploy key does not belong to exact ${target.deploymentType}:${target.deployment}`);
     }
-    const dir = await this.prepareDependencies(sourceSha);
     const tracked = await this.runCommand("git", ["ls-files", "--error-unmatch", CONVEX_ATTESTOR_FILE], {
       cwd: dir,
-      env: safeProviderToolEnv(this.args.baseEnv),
+      env: this.toolEnv(),
       timeoutMs: 30_000,
     });
     if (tracked.code === 0 || existsSync(join(dir, CONVEX_ATTESTOR_FILE))) {
@@ -724,17 +792,18 @@ class TrustedProviderReleaseRuntime {
         proof: `publishing exact source to Convex ${target.deployment}`,
         data: { deployment: target.deployment, sourceSha },
       }))) throw new Error("the Convex deployment checkpoint could not be persisted");
-      await this.command(
-        "npx",
-        ["convex", "deploy", "--yes", "--codegen", "disable", "--message", `JARVIS ${this.plan.releaseId}`],
-        dir,
-        { ...safeProviderToolEnv(this.args.baseEnv), CONVEX_DEPLOY_KEY: deployKey },
-        20 * 60_000,
-      );
-      return await this.verifyConvexAttestation(step, target, sourceSha);
+      const result = await this.candidateCommand({
+        command: "npx",
+        args: ["--no-install", "convex", "deploy", "--yes", "--codegen", "disable", "--message", `JARVIS ${this.plan.releaseId}`],
+        timeoutMs: 20 * 60_000,
+        capability: { name: "CONVEX_DEPLOY_KEY", value: deployKey },
+      });
+      this.candidateOutput(result, `Convex ${target.deployment} deployment`);
     } finally {
       rmSync(join(dir, CONVEX_ATTESTOR_FILE), { force: true });
     }
+    await this.verifyCheckoutStillPinned(sourceSha);
+    return await this.verifyConvexAttestation(step, target, sourceSha);
   }
 
   private validateTriggerOutput(
@@ -824,6 +893,7 @@ class TrustedProviderReleaseRuntime {
           || output?.protocol !== 1
           || output?.legacyLandlock !== true
           || output?.exactSmoke !== true
+          || output?.providerCommandSandbox !== true
         ) throw new Error(`Trigger staged sandbox smoke ${runId} failed closed`);
         return runId;
       }
@@ -844,13 +914,13 @@ class TrustedProviderReleaseRuntime {
     const file = join(dir, attestor.relativePath);
     const tracked = await this.runCommand("git", ["ls-files", "--error-unmatch", attestor.relativePath], {
       cwd: dir,
-      env: safeProviderToolEnv(this.args.baseEnv),
+      env: this.toolEnv(),
       timeoutMs: 30_000,
     });
     if (tracked.code === 0 || existsSync(file)) throw new Error(`${attestor.relativePath} collides with target source`);
     const idCollision = await this.runCommand("git", ["grep", "-F", "--", attestor.taskId, "--", "src/trigger"], {
       cwd: dir,
-      env: safeProviderToolEnv(this.args.baseEnv),
+      env: this.toolEnv(),
       timeoutMs: 30_000,
     });
     if (idCollision.code === 0) throw new Error(`generated Trigger task id ${attestor.taskId} collides with target source`);
@@ -864,11 +934,6 @@ class TrustedProviderReleaseRuntime {
     sourceSha: string,
   ): Promise<ProviderStepReceipt> {
     const trigger = this.plan.boundary!.trigger!;
-    const [accessToken, secretKey] = await Promise.all([
-      this.capability(trigger.accessToken),
-      this.capability(trigger.secretKey),
-    ]);
-    configure({ accessToken: secretKey });
     const dir = await this.prepareDependencies(sourceSha);
     const config = readFileSync(join(dir, "trigger.config.ts"), "utf8");
     if (!config.includes(trigger.projectRef)) {
@@ -887,17 +952,29 @@ class TrustedProviderReleaseRuntime {
     if (!version) {
       await this.verifyCheckoutStillPinned(sourceSha);
       await this.assertTriggerAttestorCollisionFree(dir, attestor);
+    }
+
+    // Candidate preflight, npm, pinned CLI checks, config inspection, and
+    // collision checks are all complete before either Trigger capability is
+    // retrieved. Candidate config can observe its own project access token;
+    // this boundary does not claim egress secrecy for that target token.
+    const [accessToken, secretKey] = await Promise.all([
+      this.capability(trigger.accessToken),
+      this.capability(trigger.secretKey),
+    ]);
+    configure({ accessToken: secretKey });
+    if (!version) {
       const generatedPath = join(dir, attestor.relativePath);
       writeFileSync(generatedPath, attestor.source, { mode: 0o600 });
       let output = "";
       try {
-        output = await this.command(
-          "npx",
-          triggerDeployCommand(trigger.projectRef),
-          dir,
-          triggerReleaseEnv(this.args.baseEnv, accessToken),
-          25 * 60_000,
-        );
+        const result = await this.candidateCommand({
+          command: "npx",
+          args: triggerDeployCommand(trigger.projectRef),
+          timeoutMs: 25 * 60_000,
+          capability: { name: "TRIGGER_ACCESS_TOKEN", value: accessToken },
+        });
+        output = this.candidateOutput(result, `Trigger ${trigger.projectRef} staged deploy`);
       } finally {
         rmSync(generatedPath, { force: true });
       }
@@ -957,13 +1034,13 @@ class TrustedProviderReleaseRuntime {
       }))) throw new Error("the staged Jarvis sandbox proof could not be persisted");
     }
 
-    await this.command(
-      "npx",
-      triggerPromoteCommand(trigger.projectRef, version),
-      dir,
-      triggerReleaseEnv(this.args.baseEnv, accessToken),
-      10 * 60_000,
-    );
+    const promoteResult = await this.candidateCommand({
+      command: "npx",
+      args: triggerPromoteCommand(trigger.projectRef, version),
+      timeoutMs: 10 * 60_000,
+      capability: { name: "TRIGGER_ACCESS_TOKEN", value: accessToken },
+    });
+    this.candidateOutput(promoteResult, `Trigger ${trigger.projectRef} promotion`);
     if (!(await checkpoint({
       id: step.id,
       status: "deploying",

@@ -640,7 +640,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     }
     const env = prepared.env;
     mkdirSync("/tmp/work", { recursive: true });
-    const isolation = verifySpecialistSandboxIsolation({ codexBin: bin, cwd: "/tmp/work", env });
+    const isolation = await verifySpecialistSandboxIsolation({ codexBin: bin, cwd: "/tmp/work", env });
     if (!isolation.ok) return rejectReservation(isolation.reason);
     const token = process.env.GITHUB_TOKEN ?? "";
 

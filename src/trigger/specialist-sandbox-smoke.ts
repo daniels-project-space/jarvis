@@ -139,7 +139,7 @@ export async function runExactSpecialistSandboxSmoke(): Promise<
       },
     });
     if (!lifecycle.ok) return lifecycle;
-    const namespace = verifySpecialistSandboxIsolation({
+    const namespace = await verifySpecialistSandboxIsolation({
       codexBin: bin,
       cwd: workspace,
       env: prepared.env,
