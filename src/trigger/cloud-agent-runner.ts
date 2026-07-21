@@ -1,6 +1,40 @@
 import { CodexAppServer } from "./codex-app-server";
 import { CloudWorkspaceToolBridge, CLOUD_REPOSITORY_TOOLS } from "./cloud-workspace-tools";
-import type { CloudWorkspace, CloudWorkspaceProvider } from "./cloud-workspace";
+import { CloudWorkspaceError, type CloudWorkspace, type CloudWorkspaceProvider } from "./cloud-workspace";
+
+// Codex app-server 0.144.5 accepts controller-owned dynamic tools, but its
+// thread/start protocol has no setting that disables the built-in host
+// shell/filesystem tools. A read-only empty cwd prevents writes; it does not
+// prove that an absolute read outside that cwd is impossible. Keep the live
+// worker gate closed until both this protocol gap and each real provider probe
+// have independently passed. These are evidence flags, never env toggles.
+export const CLOUD_AGENT_EXECUTION_READINESS = Object.freeze({
+  codexAppServerBuiltInHostToolsDisabled: false,
+  realProviderLifecycleProbePassed: Object.freeze({
+    e2b: false,
+    daytona: false,
+    sandbox0: false,
+    cloudflare: false,
+  }),
+});
+
+export function assertCloudAgentExecutionReady(provider: CloudWorkspaceProvider): void {
+  const blockers: string[] = [];
+  if (!CLOUD_AGENT_EXECUTION_READINESS.codexAppServerBuiltInHostToolsDisabled) {
+    blockers.push("Codex app-server built-in host tools cannot be disabled by the pinned protocol");
+  }
+  if (!CLOUD_AGENT_EXECUTION_READINESS.realProviderLifecycleProbePassed[provider.name]) {
+    blockers.push(`${provider.name} credential/quota/lifecycle probe is unverified`);
+  }
+  if (blockers.length) {
+    throw new CloudWorkspaceError(
+      provider.name,
+      "controller_isolation_unproven",
+      blockers.join("; "),
+      "blocked",
+    );
+  }
+}
 
 export type CloudAgentRun = {
   text: string;
@@ -22,6 +56,9 @@ export async function runCloudWorkspaceAgent(input: {
   executionState?: () => Promise<string>;
   onProgress?: (line: string, log?: string, stage?: string, percent?: number) => void;
 }): Promise<CloudAgentRun> {
+  // Defense in depth for any future caller. The Trigger caller performs this
+  // check before processJob so no checkout/archive subprocess can start.
+  assertCloudAgentExecutionReady(input.provider);
   const abort = new AbortController();
   let stopped: CloudAgentRun["stopped"] = null;
   let log = "";

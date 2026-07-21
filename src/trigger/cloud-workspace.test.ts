@@ -15,6 +15,7 @@ import {
   type PatchManifest,
 } from "./cloud-workspace";
 import { FakeCloudWorkspaceProvider } from "./cloud-workspace-fake";
+import { assertCloudAgentExecutionReady, CLOUD_AGENT_EXECUTION_READINESS } from "./cloud-agent-runner";
 import { CloudWorkspaceToolBridge } from "./cloud-workspace-tools";
 import { prepareCloudWorkspaceExecution, terminateOrphanedCloudWorkspaces } from "./cloud-workspace-controller";
 import { CLOUD_WORKSPACE_CAPABILITY_MATRIX, configuredCloudWorkspaceProvider } from "./cloud-workspace-providers";
@@ -85,6 +86,19 @@ describe("fail-closed cloud workspace boundary", () => {
     expect(hydrate).not.toHaveBeenCalled();
   });
 
+  it("keeps configured providers blocked before any controller or Codex spawn while isolation and real probes are unproven", () => {
+    const provider = new FakeCloudWorkspaceProvider();
+    expect(CLOUD_AGENT_EXECUTION_READINESS.codexAppServerBuiltInHostToolsDisabled).toBe(false);
+    expect(Object.values(CLOUD_AGENT_EXECUTION_READINESS.realProviderLifecycleProbePassed)).toEqual([
+      false, false, false, false,
+    ]);
+    expect(() => assertCloudAgentExecutionReady(provider)).toThrow(expect.objectContaining({
+      code: "controller_isolation_unproven",
+      disposition: "blocked",
+    }));
+    expect(provider.calls).toEqual([]);
+  });
+
   it("never projects controller secrets or caller env into sandbox execution", async () => {
     const provider = new FakeCloudWorkspaceProvider();
     const workspace = await provider.createWorkspace({ attemptKey: "job:1", template: "node", runtime: "node-22", lockfileDigest: "b".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS });
@@ -118,6 +132,9 @@ describe("fail-closed cloud workspace boundary", () => {
     ["absolute", patch("--- /etc/passwd\n+++ /etc/passwd\n")],
     ["binary marker", patch("diff --git a/image.png b/image.png\nGIT binary patch\n")],
     ["binary bytes", { baseSha: BASE, patch: new Uint8Array([0]), sha256: sha256Bytes(new Uint8Array([0])), byteCount: 1 }],
+    ["symlink mode", patch("diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n")],
+    ["gitlink mode", patch("diff --git a/nested b/nested\nnew file mode 160000\n--- /dev/null\n+++ b/nested\n")],
+    ["device-like mode", patch("diff --git a/device b/device\nnew file mode 060000\n--- /dev/null\n+++ b/device\n")],
     ["changed base", patch("", "b".repeat(40))],
     ["secret", patch("diff --git a/.env b/.env\n+api_key=sk-abcdefghijklmnopqrstuvwxyz123456\n")],
   ])("rejects unsafe patch output: %s", (_label, manifest) => {
@@ -193,6 +210,11 @@ describe("fail-closed cloud workspace boundary", () => {
 
   it("reports truthful provider capability failures instead of papering them over", () => {
     expect(CLOUD_WORKSPACE_CAPABILITY_MATRIX.e2b.boundedResources).toBe(false);
+    expect(CLOUD_WORKSPACE_CAPABILITY_MATRIX.daytona).toMatchObject({
+      boundedResources: false,
+      exactCommandCancellation: false,
+    });
+    expect(Object.values(CLOUD_WORKSPACE_CAPABILITY_MATRIX.cloudflare).every((value) => value === false)).toBe(true);
     expect(() => configuredCloudWorkspaceProvider({ JARVIS_CLOUD_WORKSPACE_PROVIDER: "e2b", E2B_API_KEY: "test-only" })).toThrow(/boundedResources/);
     const fake = new FakeCloudWorkspaceProvider();
     fake.capabilities.exactCommandCancellation = false;
@@ -215,6 +237,7 @@ describe("fail-closed cloud workspace boundary", () => {
     expect(specialist).toContain("applyValidatedPatchToControllerCheckout");
     expect(specialist).not.toMatch(/await runAgent\s*\(/);
     expect(runner.indexOf("configuredCloudWorkspaceProvider(process.env)")).toBeLessThan(runner.indexOf("await processJob(job, cloudProvider)"));
+    expect(runner.indexOf("assertCloudAgentExecutionReady(cloudProvider)")).toBeLessThan(runner.indexOf("await processJob(job, cloudProvider)"));
   });
 
   it.skip("BLOCKED: real E2B lifecycle/quota probe requires a safe scoped credential and a template proving resource bounds", () => {});

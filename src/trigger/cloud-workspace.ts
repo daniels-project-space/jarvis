@@ -5,6 +5,7 @@ export type CloudWorkspaceProviderName = "e2b" | "daytona" | "sandbox0" | "cloud
 export type CloudWorkspaceFailureCode =
   | "missing_configuration"
   | "invalid_configuration"
+  | "controller_isolation_unproven"
   | "capability_unsupported"
   | "provider_unavailable"
   | "stale_attempt"
@@ -322,11 +323,22 @@ export function validatePatchManifest(
   if (SECRET_LIKE.test(text)) {
     throw new CloudWorkspaceError(provider, "unsafe_patch", "secret-like material detected in patch output", "rejected");
   }
+  for (const match of text.matchAll(/^(?:old|new|new file|deleted file) mode\s+([0-7]+)$/gm)) {
+    if (!/^(?:100644|100755)$/.test(match[1])) {
+      throw new CloudWorkspaceError(
+        provider,
+        "unsafe_patch",
+        `non-regular patch mode is not accepted: ${match[1]}`,
+        "rejected",
+      );
+    }
+  }
   for (const match of text.matchAll(/^(?:---|\+\+\+)\s+([^\t\r\n]+)/gm)) patchPath(match[1], provider);
   for (const match of text.matchAll(/^diff --git\s+(\S+)\s+(\S+)$/gm)) {
     patchPath(match[1], provider);
     patchPath(match[2], provider);
   }
+  for (const match of text.matchAll(/^(?:rename|copy) (?:from|to) (.+)$/gm)) patchPath(match[1], provider);
 }
 
 export type CheckpointStore = {

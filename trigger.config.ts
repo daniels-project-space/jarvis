@@ -23,8 +23,9 @@ export default defineConfig({
         "e2b@2.35.0",
         "sandbox0@0.9.3",
       ] }),
-      // The Codex CLI receives a normal engineering shell in every isolated
-      // worker. Credentials remain in the parent delivery controller.
+      // Git and archive utilities are controller-only. Background Codex work
+      // remains blocked until the pinned protocol can disable built-in host
+      // tools; repository commands will then cross only the provider adapter.
       aptGet({ packages: ["curl", "git", "gh", "jq", "ca-certificates"] }),
       syncEnvVars(() => {
         const values = Object.fromEntries(

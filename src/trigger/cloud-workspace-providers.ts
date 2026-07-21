@@ -38,8 +38,10 @@ const CAPABILITIES: Record<CloudWorkspaceProviderName, CloudWorkspaceCapabilitie
   },
   daytona: {
     credentiallessArchive: true, privateIngress: true, networkDenyByDefault: true,
-    emptyEnvironment: true, boundedResources: true, boundedTtl: true,
-    exactCommandCancellation: true, sameWorkspaceResume: true, portableCheckpointReplay: true,
+    // Snapshot-based create in SDK 0.200.0 has no per-sandbox resources
+    // parameter, and deleting a process session is not an exact command kill.
+    emptyEnvironment: true, boundedResources: false, boundedTtl: true,
+    exactCommandCancellation: false, sameWorkspaceResume: true, portableCheckpointReplay: true,
     providerSnapshots: true, persistentVolumes: true, opaqueSecretProjection: true,
   },
   sandbox0: {
@@ -49,9 +51,11 @@ const CAPABILITIES: Record<CloudWorkspaceProviderName, CloudWorkspaceCapabilitie
     providerSnapshots: true, persistentVolumes: true, opaqueSecretProjection: true,
   },
   cloudflare: {
-    credentiallessArchive: true, privateIngress: true, networkDenyByDefault: true,
-    emptyEnvironment: true, boundedResources: true, boundedTtl: true,
-    exactCommandCancellation: true, sameWorkspaceResume: false, portableCheckpointReplay: true,
+    // This is deliberately only a compatibility seam until a concrete client
+    // is injected and probed; an absent seam must not advertise capabilities.
+    credentiallessArchive: false, privateIngress: false, networkDenyByDefault: false,
+    emptyEnvironment: false, boundedResources: false, boundedTtl: false,
+    exactCommandCancellation: false, sameWorkspaceResume: false, portableCheckpointReplay: false,
     providerSnapshots: false, persistentVolumes: false, opaqueSecretProjection: false,
   },
 };
@@ -407,8 +411,10 @@ export type CloudflareSandboxCompatibleClient = CloudWorkspaceProvider;
 
 export class CloudflareSandboxCompatibleProvider implements CloudWorkspaceProvider {
   readonly name = "cloudflare" as const;
-  readonly capabilities = CAPABILITIES.cloudflare;
-  constructor(private readonly client?: CloudflareSandboxCompatibleClient) {}
+  readonly capabilities: CloudWorkspaceCapabilities;
+  constructor(private readonly client?: CloudflareSandboxCompatibleClient) {
+    this.capabilities = client?.capabilities ?? CAPABILITIES.cloudflare;
+  }
   private require(): CloudWorkspaceProvider { if (!this.client) throw new CloudWorkspaceError(this.name, "missing_configuration", "Cloudflare Sandbox-compatible client is not configured"); return this.client; }
   createWorkspace: CloudWorkspaceProvider["createWorkspace"] = (input) => this.require().createWorkspace(input);
   uploadCredentiallessArchive: CloudWorkspaceProvider["uploadCredentiallessArchive"] = (workspace, archive) => this.require().uploadCredentiallessArchive(workspace, archive);
@@ -422,7 +428,10 @@ export class CloudflareSandboxCompatibleProvider implements CloudWorkspaceProvid
   terminate: CloudWorkspaceProvider["terminate"] = (workspace, reason) => this.require().terminate(workspace, reason);
 }
 
-export function configuredCloudWorkspaceProvider(env: NodeJS.ProcessEnv, requireExecutionCapabilities = true): CloudWorkspaceProvider {
+export function configuredCloudWorkspaceProvider(
+  env: Readonly<Record<string, string | undefined>>,
+  requireExecutionCapabilities = true,
+): CloudWorkspaceProvider {
   const name = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
   let provider: CloudWorkspaceProvider;
   if (name === "e2b") {

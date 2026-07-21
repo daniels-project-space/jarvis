@@ -74,7 +74,7 @@ import {
 import { repositoryDeliveryReadiness, trustedGitReviewReceiptAuthority, verifyGitReviewReceiptEnvelope } from "./git-review-authority";
 import { integrateReviewedWorker } from "./mission-integration";
 import { createGitHubIntegrationAdapter, GITHUB_REST_API_VERSION } from "./github-integration-adapter";
-import { runCloudWorkspaceAgent } from "./cloud-agent-runner";
+import { assertCloudAgentExecutionReady, runCloudWorkspaceAgent } from "./cloud-agent-runner";
 import {
   applyValidatedPatchToControllerCheckout,
   createCredentiallessGitArchive,
@@ -2279,6 +2279,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     let cloudProvider: CloudWorkspaceProvider;
     try {
       cloudProvider = configuredCloudWorkspaceProvider(process.env);
+      // This must remain before processJob: processJob owns trusted controller
+      // hydration commands. A configured provider is still not authority to
+      // spawn anything until controller tool isolation and real cloud probes
+      // are evidenced in source.
+      assertCloudAgentExecutionReady(cloudProvider);
     } catch (error) {
       const failure = error instanceof CloudWorkspaceError
         ? error
