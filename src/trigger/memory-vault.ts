@@ -72,7 +72,7 @@ export const memoryVault = schedules.task({
     await sh("git", ["-C", dir, "config", "user.name", "JARVIS"], env);
 
     const mem = ((await q("memory:recent", { limit: 60 })) as MemoryRow[] | null) ?? [];
-    const attention = ((await q("attention:list", { limit: 10 })) as AttentionRow[] | null) ?? [];
+    const attention = ((await q("attention:list", { status: "open", limit: 10 })) as AttentionRow[] | null) ?? [];
     const biz = ((await q("business:list", {})) as BusinessRow[] | null) ?? [];
     const stack = ((await q("projectState:list", {})) as ProjectRow[] | null) ?? [];
     const date = new Date().toISOString().slice(0, 10);

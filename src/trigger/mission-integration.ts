@@ -9,6 +9,9 @@ export type IntegrationReceipt = Readonly<{
   expectedIntegrationRefSha: string;
   integrationBranch: string;
   generation: number;
+  preparedEffectId?: string;
+  preparedIntegrationHeadSha?: string;
+  preparedIntegrationTreeSha?: string;
 }>;
 
 export type ProviderEffect = Readonly<{
@@ -95,11 +98,45 @@ export async function integrateReviewedWorker(
   hooks: IntegrationHooks,
 ): Promise<IntegrationResult> {
   try {
+    const expectedRef = expectedObservedRef(receipt.expectedIntegrationRefSha);
     const workerHead = await adapter.readRef(receipt.workerBranch);
     if (workerHead !== receipt.reviewedHeadSha) {
+      if (receipt.preparedEffectId && receipt.preparedIntegrationHeadSha && receipt.preparedIntegrationTreeSha) {
+        const current = await adapter.readRef(receipt.integrationBranch);
+        const effect = await adapter.prepareRefEffect({
+          effectId: receipt.preparedEffectId,
+          branch: receipt.integrationBranch,
+          expectedBaseSha: receipt.expectedIntegrationRefSha,
+          newHeadSha: receipt.preparedIntegrationHeadSha,
+          treeSha: receipt.preparedIntegrationTreeSha,
+        });
+        const prepared = await hooks.prepare(effect);
+        if (!prepared) return { status: "pending", reason: "prepared final ref effect could not be reloaded after the worker moved" };
+        if (prepared.observation === "applied" || current === receipt.preparedIntegrationHeadSha) {
+          if (prepared.observation !== "applied" && !await hooks.observe({
+            effectId: receipt.preparedEffectId, observation: "applied",
+            providerHeadSha: receipt.preparedIntegrationHeadSha, providerResponse: "reconciled:exact-ref-after-worker-move",
+          })) return { status: "pending", reason: "applied ref observation after worker movement could not be persisted" };
+          return {
+            status: "integrated", effectId: receipt.preparedEffectId,
+            headSha: receipt.preparedIntegrationHeadSha, treeSha: receipt.preparedIntegrationTreeSha,
+          };
+        }
+        if (prepared.observation === "not_applied" || current === expectedRef || !prepared.replay) {
+          if (prepared.observation !== "not_applied" && !await hooks.observe({
+            effectId: receipt.preparedEffectId, observation: "not_applied",
+            providerResponse: "preflight:worker-ref-moved-before-provider-call",
+          })) return { status: "pending", reason: "worker-move non-application observation could not be persisted" };
+          return { status: "stale", reason: `reviewed worker head moved after final preparation: observed ${workerHead ?? "missing"}` };
+        }
+        if (!await hooks.observe({
+          effectId: receipt.preparedEffectId, observation: "unknown", providerHeadSha: current ?? undefined,
+          providerResponse: "reconciled:prepared-ref-at-third-head-after-worker-move",
+        })) return { status: "pending", reason: "ambiguous worker-move replay observation could not be persisted" };
+        return { status: "pending", reason: "worker moved and the prepared updateRefs replay is ambiguous at a third head" };
+      }
       return { status: "stale", reason: `reviewed worker head moved: expected ${receipt.reviewedHeadSha}, observed ${workerHead ?? "missing"}` };
     }
-    const expectedRef = expectedObservedRef(receipt.expectedIntegrationRefSha);
     const observedIntegration = await adapter.readRef(receipt.integrationBranch);
     const merged = await adapter.prepareMerge({
       integrationBaseSha: receipt.expectedIntegrationBaseSha,
@@ -113,13 +150,6 @@ export async function integrateReviewedWorker(
       return { status: "pending", reason: merged.reason ?? "integration sandbox could not prepare the exact merge" };
     }
 
-    // Deterministic preparation is read-only.  Fence a stale provider ref
-    // before creating any synthetic object or durable staging-effect row.
-    if (observedIntegration !== expectedRef && observedIntegration !== merged.headSha) {
-      if (hooks.reconcileOnly && merged.synthetic) await adapter.stageCandidate(merged, hooks);
-      return { status: "stale", reason: `integration ref changed: expected ${expectedRef ?? "absent"}, observed ${observedIntegration ?? "absent"}` };
-    }
-
     const effectId = `update-ref:${receipt.integrationAttemptId}:${merged.headSha}`;
     const effect = await adapter.prepareRefEffect({
       effectId,
@@ -128,6 +158,38 @@ export async function integrateReviewedWorker(
       newHeadSha: merged.headSha,
       treeSha: merged.treeSha,
     });
+
+    // A moved ref is terminally stale only when this invocation first prepares
+    // the exact CAS and therefore proves it was never called. A replay may have
+    // applied and then moved again, so a third head is ambiguous provider truth.
+    if (observedIntegration !== expectedRef && observedIntegration !== merged.headSha) {
+      const prepared = await hooks.prepare(effect);
+      if (!prepared) return { status: "pending", reason: "final ref effect was not durably prepared" };
+      if (prepared.replay) {
+        if (prepared.observation === "applied") {
+          if (merged.synthetic) {
+            const staged = await adapter.stageCandidate(merged, { ...hooks, reconcileOnly: true });
+            if (staged.outcome !== "applied" || staged.providerHeadSha !== merged.headSha) {
+              return { status: "pending", reason: "applied final ref has incomplete synthetic object observations" };
+            }
+          }
+          return { status: "integrated", effectId, headSha: merged.headSha, treeSha: merged.treeSha };
+        }
+        if (prepared.observation === "not_applied") {
+          return { status: "stale", reason: `prepared updateRefs CAS was proven not applied before the ref moved to ${observedIntegration ?? "absent"}` };
+        }
+        if (!await hooks.observe({
+          effectId, observation: "unknown", providerHeadSha: observedIntegration ?? undefined,
+          providerResponse: "reconciled:prepared-ref-at-third-head",
+        })) return { status: "pending", reason: "ambiguous replay observation could not be persisted" };
+        return { status: "pending", reason: `prepared updateRefs CAS is ambiguous at ${observedIntegration ?? "absent"}` };
+      }
+      if (!await hooks.observe({
+        effectId, observation: "not_applied", providerHeadSha: observedIntegration ?? undefined,
+        providerResponse: "preflight:integration-ref-moved-before-provider-call",
+      })) return { status: "pending", reason: "pre-call non-application observation could not be persisted" };
+      return { status: "stale", reason: `integration ref changed before updateRefs: expected ${expectedRef ?? "absent"}, observed ${observedIntegration ?? "absent"}` };
+    }
 
     // A prior controller may have advanced the exact deterministic head and
     // crashed before one or more durable staging observations. The ref proves
@@ -161,6 +223,9 @@ export async function integrateReviewedWorker(
     if (!prepared) return { status: "pending", reason: "final ref effect was not durably prepared" };
 
     if (prepared.replay) {
+      if (prepared.observation === "applied") {
+        return { status: "integrated", effectId, headSha: merged.headSha, treeSha: merged.treeSha };
+      }
       if (prepared.observation === "not_applied") {
         return { status: "stale", reason: "the prepared GitHub updateRefs CAS was already rejected" };
       }
@@ -172,7 +237,11 @@ export async function integrateReviewedWorker(
         return { status: "integrated", effectId, headSha: merged.headSha, treeSha: merged.treeSha };
       }
       if (current !== expectedRef) {
-        return { status: "stale", reason: `prepared updateRefs CAS lost: observed ${current ?? "absent"}` };
+        if (!await hooks.observe({
+          effectId, observation: "unknown", providerHeadSha: current ?? undefined,
+          providerResponse: "reconciled:prepared-ref-at-third-head",
+        })) return { status: "pending", reason: "ambiguous replay observation could not be persisted" };
+        return { status: "pending", reason: `prepared updateRefs CAS is ambiguous at ${current ?? "absent"}` };
       }
       if (hooks.reconcileOnly) {
         if (!await hooks.observe({ effectId, observation: "not_applied", providerResponse: "reconciled:exact-ref-still-at-base" })) {
@@ -183,10 +252,31 @@ export async function integrateReviewedWorker(
     }
     const workerImmediatelyBefore = await adapter.readRef(receipt.workerBranch);
     const integrationImmediatelyBefore = await adapter.readRef(receipt.integrationBranch);
+    if (integrationImmediatelyBefore === merged.headSha) {
+      if (!await hooks.observe({
+        effectId, observation: "applied", providerHeadSha: merged.headSha,
+        providerResponse: "reconciled:exact-ref-before-provider-call",
+      })) return { status: "pending", reason: "pre-call applied observation could not be persisted" };
+      return { status: "integrated", effectId, headSha: merged.headSha, treeSha: merged.treeSha };
+    }
+    if (integrationImmediatelyBefore !== expectedRef && prepared.replay) {
+      if (!await hooks.observe({
+        effectId, observation: "unknown", providerHeadSha: integrationImmediatelyBefore ?? undefined,
+        providerResponse: "reconciled:prepared-ref-moved-before-retry",
+      })) return { status: "pending", reason: "ambiguous pre-retry observation could not be persisted" };
+      return { status: "pending", reason: "prepared updateRefs replay became ambiguous before the provider call" };
+    }
     if (workerImmediatelyBefore !== receipt.reviewedHeadSha) {
+      if (!await hooks.observe({
+        effectId, observation: "not_applied", providerResponse: "preflight:worker-ref-moved-before-provider-call",
+      })) return { status: "pending", reason: "worker-move non-application observation could not be persisted" };
       return { status: "stale", reason: "worker head moved after durable preparation" };
     }
     if (integrationImmediatelyBefore !== expectedRef) {
+      if (!await hooks.observe({
+        effectId, observation: "not_applied", providerHeadSha: integrationImmediatelyBefore ?? undefined,
+        providerResponse: "preflight:integration-ref-moved-before-provider-call",
+      })) return { status: "pending", reason: "ref-move non-application observation could not be persisted" };
       return { status: "stale", reason: "integration ref changed after durable preparation" };
     }
     const outcome = await adapter.advanceRef({

@@ -1090,6 +1090,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               expectedIntegrationBaseSha: String(claimed.expectedIntegrationBaseSha),
               expectedIntegrationRefSha: String(claimed.expectedIntegrationRefSha),
               integrationBranch: String(claimed.integrationBranch), generation: Number(claimed.generation),
+              preparedEffectId: typeof claimed.preparedEffectId === "string" ? claimed.preparedEffectId : undefined,
+              preparedIntegrationHeadSha: typeof claimed.preparedIntegrationHeadSha === "string" ? claimed.preparedIntegrationHeadSha : undefined,
+              preparedIntegrationTreeSha: typeof claimed.preparedIntegrationTreeSha === "string" ? claimed.preparedIntegrationTreeSha : undefined,
             }, adapter, {
               reconcileOnly: Boolean(claimed.controlRequested),
               prepare: async (effect) => await convexMutation("goalIntegration:prepare", {
@@ -1126,10 +1129,14 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               return;
             }
             if (result.status === "conflict" || result.status === "stale") {
-              await convexMutation("goalIntegration:failFocused", {
+              const terminalized = await convexMutation("goalIntegration:failFocused", {
                 ...integrationFence, kind: result.status, reason: result.reason,
               }).catch(() => null);
-              await drainGoalAdvances();
+              if (terminalized) await drainGoalAdvances();
+              else await convexMutation("goalIntegration:defer", {
+                ...integrationFence, reasonCode: "terminal_release_barrier",
+                reason: `Focused ${result.status} outcome is waiting for exact provider-effect reconciliation: ${result.reason}`,
+              }).catch(() => false);
               return;
             }
             await convexMutation("goalIntegration:defer", {

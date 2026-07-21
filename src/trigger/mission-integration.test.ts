@@ -137,7 +137,7 @@ describe("serialized integration provider protocol", () => {
     const h = harness({ integration: state.integration });
     h.refs.set(receipt.workerBranch, state.worker);
     const result = await integrateReviewedWorker(receipt, h.adapter, {
-      prepare: vi.fn().mockResolvedValue({ replay: false }), observe: vi.fn(),
+      prepare: vi.fn().mockResolvedValue({ replay: false }), observe: vi.fn().mockResolvedValue(true),
     });
     expect(result.status).toBe(expected);
     expect(h.calls).not.toContain("GRAPHQL");
@@ -150,16 +150,91 @@ describe("serialized integration provider protocol", () => {
     expect(h.calls).not.toContain("GRAPHQL");
   });
 
-  it("prechecks a stale integration ref before synthetic staging or effect preparation", async () => {
+  it("records a fresh stale integration ref as not-applied before synthetic staging", async () => {
     const h = harness({ integration: "f".repeat(40) });
     vi.mocked(h.adapter.prepareMerge).mockResolvedValue({
       status: "clean", headSha: MERGED, treeSha: MERGED_TREE, synthetic: true, candidate: {},
     });
-    const prepare = vi.fn();
-    await expect(integrateReviewedWorker(receipt, h.adapter, { prepare, observe: vi.fn() })).resolves.toMatchObject({ status: "stale" });
+    const prepare = vi.fn().mockResolvedValue({ replay: false, observation: null });
+    const observe = vi.fn().mockResolvedValue(true);
+    await expect(integrateReviewedWorker(receipt, h.adapter, { prepare, observe })).resolves.toMatchObject({ status: "stale" });
     expect(h.adapter.stageCandidate).not.toHaveBeenCalled();
-    expect(h.adapter.prepareRefEffect).not.toHaveBeenCalled();
-    expect(prepare).not.toHaveBeenCalled();
+    expect(h.adapter.prepareRefEffect).toHaveBeenCalledTimes(1);
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(observe).toHaveBeenCalledWith(expect.objectContaining({ observation: "not_applied", providerHeadSha: "f".repeat(40) }));
+  });
+
+  it("durably observes not-applied when the worker moves after final preparation but before updateRefs", async () => {
+    const h = harness();
+    const observe = vi.fn().mockResolvedValue(true);
+    const prepare = vi.fn(async () => {
+      h.refs.set(receipt.workerBranch, "f".repeat(40));
+      return { replay: false, observation: null };
+    });
+    await expect(integrateReviewedWorker(receipt, h.adapter, { prepare, observe })).resolves.toMatchObject({
+      status: "stale", reason: "worker head moved after durable preparation",
+    });
+    expect(observe).toHaveBeenCalledWith(expect.objectContaining({ observation: "not_applied" }));
+    expect(h.adapter.advanceRef).not.toHaveBeenCalled();
+  });
+
+  it("reloads a prior final preparation and records not-applied when the worker moved before replay", async () => {
+    const h = harness();
+    h.refs.set(receipt.workerBranch, "f".repeat(40));
+    const observe = vi.fn().mockResolvedValue(true);
+    const preparedReceipt = {
+      ...receipt, preparedEffectId: `update-ref:${receipt.integrationAttemptId}:${MERGED}`,
+      preparedIntegrationHeadSha: MERGED, preparedIntegrationTreeSha: MERGED_TREE,
+    };
+    await expect(integrateReviewedWorker(preparedReceipt, h.adapter, {
+      prepare: vi.fn().mockResolvedValue({ replay: true, observation: "unknown" }), observe,
+    })).resolves.toMatchObject({ status: "stale", reason: expect.stringContaining("after final preparation") });
+    expect(observe).toHaveBeenCalledWith(expect.objectContaining({ observation: "not_applied" }));
+    expect(h.adapter.advanceRef).not.toHaveBeenCalled();
+  });
+
+  it("holds a prior final preparation when both the worker and provider ref moved ambiguously", async () => {
+    const third = "f".repeat(40);
+    const h = harness({ integration: third });
+    h.refs.set(receipt.workerBranch, "1".repeat(40));
+    const observe = vi.fn().mockResolvedValue(true);
+    const preparedReceipt = {
+      ...receipt, preparedEffectId: `update-ref:${receipt.integrationAttemptId}:${MERGED}`,
+      preparedIntegrationHeadSha: MERGED, preparedIntegrationTreeSha: MERGED_TREE,
+    };
+    await expect(integrateReviewedWorker(preparedReceipt, h.adapter, {
+      prepare: vi.fn().mockResolvedValue({ replay: true, observation: "unknown" }), observe,
+    })).resolves.toMatchObject({ status: "pending", reason: expect.stringContaining("ambiguous") });
+    expect(observe).toHaveBeenCalledWith(expect.objectContaining({ observation: "unknown", providerHeadSha: third }));
+    expect(h.adapter.advanceRef).not.toHaveBeenCalled();
+  });
+
+  it("durably observes not-applied when the integration ref moves after fresh final preparation", async () => {
+    const h = harness();
+    const third = "f".repeat(40);
+    const observe = vi.fn().mockResolvedValue(true);
+    const prepare = vi.fn(async () => {
+      h.refs.set(receipt.integrationBranch, third);
+      return { replay: false, observation: null };
+    });
+    await expect(integrateReviewedWorker(receipt, h.adapter, { prepare, observe })).resolves.toMatchObject({ status: "stale" });
+    expect(observe).toHaveBeenCalledWith(expect.objectContaining({ observation: "not_applied", providerHeadSha: third }));
+    expect(h.adapter.advanceRef).not.toHaveBeenCalled();
+  });
+
+  it("holds an ambiguous replay whose ref moves to neither base nor prepared head", async () => {
+    const h = harness();
+    const third = "f".repeat(40);
+    const observe = vi.fn().mockResolvedValue(true);
+    const prepare = vi.fn(async () => {
+      h.refs.set(receipt.integrationBranch, third);
+      return { replay: true, observation: "unknown" };
+    });
+    await expect(integrateReviewedWorker(receipt, h.adapter, { prepare, observe })).resolves.toMatchObject({
+      status: "pending", reason: expect.stringContaining("ambiguous"),
+    });
+    expect(observe).toHaveBeenCalledWith(expect.objectContaining({ observation: "unknown", providerHeadSha: third }));
+    expect(h.adapter.advanceRef).not.toHaveBeenCalled();
   });
 
   it("drains synthetic staging read-only before observing an existing deterministic final ref", async () => {

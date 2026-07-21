@@ -9,6 +9,7 @@ import {
   INTEGRATION_TERMINAL_RECEIPT_MAX_BYTES,
   integrationTerminalReceiptByteGuard,
   integrationEffectManifest,
+  integrationTerminalReleaseDecision,
 } from "./goalIntegration";
 import schema from "./schema";
 
@@ -120,7 +121,53 @@ async function review(t: ReturnType<typeof convexTest>, job: any, workerRunId: s
   })).toBe(true);
 }
 
+async function claimedFirstIntegration(prefix: string) {
+  const f = await plannedGoal();
+  const specialists = await dispatch(f.t, 2, `${prefix}-specialist`);
+  const byId = new Map(f.jobs.map((job) => [String(job._id), job]));
+  for (let index = 0; index < specialists.length; index += 1) {
+    const entry = specialists[index];
+    await review(f.t, byId.get(String(entry.reservation.jobId))!, String(entry.claim!.workerRunId), String(index + 6).repeat(40), String(index + 8).repeat(40));
+  }
+  const integrations = (await f.t.run(async (ctx) => ctx.db.query("integrationAttempts").collect()))
+    .sort((left, right) => left.generation - right.generation);
+  const [controller] = await dispatch(f.t, 2, `${prefix}-controller`);
+  const current = integrations[0];
+  const claim = await f.t.mutation(api.goalIntegration.claim, {
+    id: current._id, controllerRunId: String(controller.claim!.deliveryRunId),
+    leaseOwner: `${prefix}-owner`, leaseToken: `${prefix}-token`, workerToken: TOKEN,
+  });
+  const fence = { id: current._id, controllerRunId: claim!.controllerRunId, leaseOwner: claim!.leaseOwner,
+    leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
+  return { ...f, integrations, current, claim, fence };
+}
+
 describe("real Convex multi-agent workspace and integration races", () => {
+  it("defines one terminal-release truth table for every outcome path", () => {
+    const effect = (observation?: "applied" | "not_applied" | "unknown", providerHeadSha?: string) => ({
+      effectId: "final", effectKind: "update_ref", expectedBaseSha: BASE,
+      headSha: "a".repeat(40), treeSha: "b".repeat(40), observation, providerHeadSha,
+    });
+    const attempt = {
+      providerEffectCount: 1, preparedEffectId: "final", expectedIntegrationRefSha: BASE,
+      preparedIntegrationHeadSha: "a".repeat(40), preparedIntegrationTreeSha: "b".repeat(40),
+    };
+    expect(integrationTerminalReleaseDecision({ providerEffectCount: 0 }, [])).toMatchObject({
+      releasable: true, state: "resolved_without_applied_final",
+    });
+    expect(integrationTerminalReleaseDecision(attempt, [effect()])).toMatchObject({ releasable: false, state: "unresolved" });
+    expect(integrationTerminalReleaseDecision(attempt, [effect("unknown")])).toMatchObject({ releasable: false, state: "unresolved" });
+    expect(integrationTerminalReleaseDecision(attempt, [effect("not_applied")])).toMatchObject({
+      releasable: true, state: "resolved_without_applied_final",
+    });
+    expect(integrationTerminalReleaseDecision(attempt, [effect("applied", "a".repeat(40))])).toMatchObject({
+      releasable: true, state: "applied_final", finalEffectId: "final", appliedHeadSha: "a".repeat(40),
+    });
+    expect(integrationTerminalReleaseDecision(attempt, [effect("applied", "f".repeat(40))])).toMatchObject({
+      releasable: false, state: "unresolved",
+    });
+  });
+
   it("rejects invalid DAG authority records before dispatch creates a specialist", async () => {
     const f = await goalAwaitingPlan();
     const plan = (workstreams: Array<{ id: string; dependsOn: string[] }>) => ({ workstreams });
@@ -618,7 +665,90 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(state.terminals).toHaveLength(0);
   });
 
-  it("bounds the whole worst-case receipt including maximum work and delivery lineages", async () => {
+  it.each(["park", "failFocused"] as const)("blocks public %s across an unknown final effect, then terminalizes once after proven non-application", async (action) => {
+    const f = await claimedFirstIntegration(`terminal-barrier-${action}`);
+    const effectId = `terminal-barrier-${action}-ref`;
+    expect(await f.t.mutation(api.goalIntegration.prepare, {
+      ...f.fence, effectId, effectKind: "update_ref", provider: "github",
+      providerIdentity: "repo-node:refs/heads/integration", providerMethod: "POST",
+      providerTarget: "https://api.github.com/graphql#updateRefs", requestDigest: "9".repeat(64),
+      expectedIntegrationRefSha: f.claim!.expectedIntegrationRefSha,
+      preparedIntegrationHeadSha: "a".repeat(40), preparedIntegrationTreeSha: "b".repeat(40),
+    })).toMatchObject({ replay: false });
+    expect(await f.t.mutation(api.goalIntegration.observe, {
+      ...f.fence, effectId, observation: "unknown", providerResponse: "network:response-lost",
+    })).toBe(true);
+
+    const invoke = () => action === "park"
+      ? f.t.mutation(api.goalIntegration.park, { ...f.fence, reason: "manual park requested" })
+      : f.t.mutation(api.goalIntegration.failFocused, { ...f.fence, kind: "conflict", reason: "focused repair requested" });
+    expect(await invoke()).toBe(action === "park" ? false : null);
+    let state: any = await f.t.run(async (ctx) => ({
+      attempt: await ctx.db.get(f.current._id), mission: await ctx.db.get(f.missionId),
+      job: await ctx.db.get(f.current.jobId), next: await ctx.db.get(f.integrations[1].jobId),
+      terminals: await ctx.db.query("integrationTerminalReceipts").collect(),
+      repairs: (await ctx.db.query("jobs").withIndex("by_mission", (q) => q.eq("missionId", String(f.missionId))).collect())
+        .filter((job) => job.parentJobId === String(f.current.jobId)),
+    }));
+    expect(state.attempt).toMatchObject({ status: "prepared", providerObservation: "unknown" });
+    expect(state.mission.integrationHeadSha).toBeUndefined();
+    expect(state.job).toMatchObject({ status: "running" });
+    expect(state.next).toMatchObject({ integrationState: "provider_waiting" });
+    expect(state.terminals).toHaveLength(0);
+    expect(state.repairs).toHaveLength(0);
+
+    expect(await f.t.mutation(api.goalIntegration.observe, {
+      ...f.fence, effectId, observation: "not_applied", providerResponse: "reconciled:exact-ref-still-at-base",
+    })).toBe(true);
+    const settled: any = await invoke();
+    if (action === "park") expect(settled).toBe(true);
+    else expect(settled?.repairJobId).toBeTruthy();
+    expect(await invoke()).toBe(action === "park" ? false : null);
+    state = await f.t.run(async (ctx) => ({
+      attempt: await ctx.db.get(f.current._id), mission: await ctx.db.get(f.missionId),
+      next: await ctx.db.get(f.integrations[1].jobId), terminals: await ctx.db.query("integrationTerminalReceipts").collect(),
+      repairs: (await ctx.db.query("jobs").withIndex("by_mission", (q) => q.eq("missionId", String(f.missionId))).collect())
+        .filter((job) => job.parentJobId === String(f.current.jobId)),
+    }));
+    expect(state.attempt).toMatchObject({ status: action === "park" ? "parked" : "conflict" });
+    expect(state.mission.integrationHeadSha).toBeUndefined();
+    expect(state.next).toMatchObject({ integrationState: "queued" });
+    expect(state.terminals).toHaveLength(1);
+    expect(state.repairs).toHaveLength(action === "park" ? 0 : 1);
+  });
+
+  it.each(["park", "failFocused"] as const)("routes an applied final ref through complete before %s can settle", async (action) => {
+    const f = await claimedFirstIntegration(`applied-barrier-${action}`);
+    const effectId = `applied-barrier-${action}-ref`;
+    expect(await f.t.mutation(api.goalIntegration.prepare, {
+      ...f.fence, effectId, effectKind: "update_ref", provider: "github",
+      providerIdentity: "repo-node:refs/heads/integration", providerMethod: "POST",
+      providerTarget: "https://api.github.com/graphql#updateRefs", requestDigest: "9".repeat(64),
+      expectedIntegrationRefSha: f.claim!.expectedIntegrationRefSha,
+      preparedIntegrationHeadSha: "a".repeat(40), preparedIntegrationTreeSha: "b".repeat(40),
+    })).toMatchObject({ replay: false });
+    expect(await f.t.mutation(api.goalIntegration.observe, {
+      ...f.fence, effectId, observation: "applied", providerHeadSha: "a".repeat(40),
+    })).toBe(true);
+    const bypass = action === "park"
+      ? await f.t.mutation(api.goalIntegration.park, { ...f.fence, reason: "do not bypass completion" })
+      : await f.t.mutation(api.goalIntegration.failFocused, { ...f.fence, kind: "stale", reason: "do not bypass completion" });
+    expect(bypass).toBe(action === "park" ? false : null);
+    expect(await f.t.mutation(api.goalIntegration.complete, { ...f.fence, effectId })).toBe(true);
+    const state: any = await f.t.run(async (ctx) => ({
+      attempt: await ctx.db.get(f.current._id), mission: await ctx.db.get(f.missionId),
+      terminals: await ctx.db.query("integrationTerminalReceipts").collect(),
+      repairs: (await ctx.db.query("jobs").withIndex("by_mission", (q) => q.eq("missionId", String(f.missionId))).collect())
+        .filter((job) => job.parentJobId === String(f.current.jobId)),
+    }));
+    expect(state.attempt).toMatchObject({ status: "integrated" });
+    expect(state.mission.integrationHeadSha).toBe("a".repeat(40));
+    expect(state.terminals).toHaveLength(1);
+    expect(state.terminals[0]).toMatchObject({ outcome: "integrated" });
+    expect(state.repairs).toHaveLength(0);
+  });
+
+  it("keeps the compact worst-case manifest comfortably below the hard schema regression guard", async () => {
     const providerBody = `unique-provider-body:${"x".repeat(8_000)}`;
     const ordered = await Promise.all(Array.from({ length: 1_024 }, (_, index) => integrationEffectManifest({
       effectId: `${index}:${"e".repeat(296)}`,
@@ -629,15 +759,20 @@ describe("real Convex multi-agent workspace and integration races", () => {
       providerResponse: providerBody, providerResponseDigest: sha256(providerBody),
     })));
     const compactEffects = ordered.map((effect) => INTEGRATION_EFFECT_COLUMNS.map((column) => (effect as any)[column] ?? null));
+    const workSummary = (index: number) => ({
+      attempt: index + 1, parentAttempt: index || null,
+      sourceHeadSha: "1".repeat(40), checkpointHeadSha: "3".repeat(40),
+    });
+    const deliverySummary = (index: number) => ({
+      id: `d${index}`.padEnd(32, "d"), generation: index + 1, sourceWorkAttempt: 32,
+      cumulativeRetries: index, status: "abandoned", outcome: "needs_attention",
+    });
     const receipt = JSON.stringify({
-      version: 1, kind: "mission_integration_terminal", outcome: "integrated",
+      version: 2, kind: "mission_integration_terminal", outcome: "integrated", lineageMode: "compact_manifest",
       mission: { id: "m".repeat(32), repository: "r".repeat(240), primaryRepository: "r".repeat(240), workstreamId: "w".repeat(160), revisionWave: 999 },
       job: { id: "j".repeat(32), workAttempt: 32, parentJobId: "p".repeat(160), retryLineage: "l".repeat(240), workspaceLineage: "l".repeat(240) },
-      workspaceAttempts: Array.from({ length: 32 }, (_, index) => ({
-        attempt: index + 1, parentAttempt: index || null, workspaceKey: "k".repeat(240), workspaceLineage: "l".repeat(240),
-        workerBranch: "b".repeat(240), sourceHeadSha: "1".repeat(40), parentCheckpointHeadSha: "2".repeat(40),
-        checkpointHeadSha: "3".repeat(40), workerRunId: "w".repeat(160), providerWorkspaceId: "p".repeat(160), providerSessionId: "s".repeat(160),
-      })),
+      workspaceAttempts: { count: 10_000, orderedDigest: "f".repeat(64),
+        head: [workSummary(0), workSummary(1)], tail: [workSummary(9_998), workSummary(9_999)] },
       review: { id: "v".repeat(32), digest: "4".repeat(64), keyId: "k".repeat(64), signature: "5".repeat(64), agentEvidenceSha256: "6".repeat(64) },
       source: { branch: "s".repeat(240), headSha: "7".repeat(40) },
       worker: { branch: "w".repeat(240), reviewedBaseSha: "7".repeat(40), reviewedHeadSha: "8".repeat(40), reviewedHeadTreeSha: "9".repeat(40), reviewedDiffSha256: "a".repeat(64) },
@@ -645,19 +780,16 @@ describe("real Convex multi-agent workspace and integration races", () => {
         cumulativeRetries: INTEGRATION_RECONCILIATION_LIMIT + 1, expectedBaseSha: "1".repeat(40), expectedRefSha: "1".repeat(40),
         preparedHeadSha: "3".repeat(40), preparedTreeSha: "4".repeat(40) },
       controller: { runId: "r".repeat(160), leaseVersion: 999, deliveryRunId: "d".repeat(160) },
-      deliveryLineage: Array.from({ length: 64 }, (_, index) => ({
-        id: `d${index}`.padEnd(32, "d"), generation: index + 1, parentDeliveryAttemptId: index ? `d${index - 1}`.padEnd(32, "d") : null,
-        sourceWorkAttempt: 32, deliveryRunId: "r".repeat(160), reviewReceiptId: "v".repeat(32), reviewReceiptDigest: "4".repeat(64),
-        reviewKeyId: "k".repeat(64), cumulativeRetries: index, currentStep: "observing", status: "abandoned", outcome: "needs_attention",
-      })),
+      deliveryLineage: { count: 10_000, orderedDigest: "e".repeat(64),
+        head: [deliverySummary(0), deliverySummary(1)], tail: [deliverySummary(9_998), deliverySummary(9_999)] },
       providerEffects: {
         count: ordered.length, orderedEffectIdentityDigest: sha256(JSON.stringify(ordered)),
-        columns: INTEGRATION_EFFECT_COLUMNS, ordered: compactEffects,
+        columns: INTEGRATION_EFFECT_COLUMNS, mode: "compact_manifest",
+        head: compactEffects.slice(0, 2), tail: compactEffects.slice(-2), final: compactEffects.at(-1),
       },
       terminal: { outcome: "integrated", reason: "x".repeat(500), deliveryStatus: "done", deliveryOutcome: "mission_integrated", focusedRepair: null },
     });
-    expect(Buffer.byteLength(receipt)).toBe(571_540);
-    expect(Buffer.byteLength(receipt)).toBeLessThanOrEqual(INTEGRATION_TERMINAL_RECEIPT_MAX_BYTES);
+    expect(Buffer.byteLength(receipt)).toBeLessThan(16_000);
     expect(integrationTerminalReceiptByteGuard(receipt)).toEqual({
       blocked: false, serializedBytes: Buffer.byteLength(receipt), byteLimit: INTEGRATION_TERMINAL_RECEIPT_MAX_BYTES,
     });
@@ -672,6 +804,104 @@ describe("real Convex multi-agent workspace and integration races", () => {
       providerIdentityDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
       providerResponseDigest: sha256(providerBody),
     });
+  });
+
+  it("terminalizes a valid long manual-reconciliation lineage into one bounded verifiable receipt", async () => {
+    const f = await claimedFirstIntegration("compact-lineage");
+    await f.t.run(async (ctx) => {
+      for (let attempt = 2; attempt <= 40; attempt += 1) await ctx.db.insert("workAttempts", {
+        jobId: f.current.jobId, attempt, parentAttempt: attempt - 1, status: "abandoned",
+        workspaceLineage: `lineage-${attempt}`, workspaceKey: `workspace-${attempt}`,
+        workerBranch: `jarvis/work/manual-${attempt}`, sourceHeadSha: BASE,
+        checkpointHeadSha: String(attempt % 10).repeat(40), lastEventSeq: 0,
+        livenessAt: attempt, progressAt: attempt, lastEventAt: attempt, createdAt: attempt,
+      });
+      const job: any = await ctx.db.get(f.current.jobId);
+      let parent = job.activeDeliveryAttemptId;
+      for (let generation = 2; generation <= 80; generation += 1) {
+        parent = await ctx.db.insert("deliveryAttempts", {
+          jobId: f.current.jobId, integrationAttemptId: f.current._id, sourceWorkAttempt: 1,
+          generation, policy: "mission_integration", status: "abandoned", parentDeliveryAttemptId: parent,
+          reviewReceiptId: f.current.reviewReceiptId, reviewReceiptDigest: f.current.reviewReceiptDigest,
+          reviewedHeadSha: f.current.reviewedHeadSha, reviewedBaseSha: f.current.reviewedBaseSha,
+          reviewedHeadTreeSha: f.current.reviewedHeadTreeSha, reviewedDiffSha256: f.current.reviewedDiffSha256,
+          heartbeatAt: generation, retries: 0, cumulativeRetries: generation - 1,
+          currentStep: "observing", retryReason: "manual reconciliation generation", createdAt: generation, updatedAt: generation,
+        });
+      }
+    });
+    const effectId = "compact-lineage-final";
+    expect(await f.t.mutation(api.goalIntegration.prepare, {
+      ...f.fence, effectId, effectKind: "update_ref", provider: "github",
+      providerIdentity: "repo-node:refs/heads/integration", providerMethod: "POST",
+      providerTarget: "https://api.github.com/graphql#updateRefs", requestDigest: "9".repeat(64),
+      expectedIntegrationRefSha: f.claim!.expectedIntegrationRefSha,
+      preparedIntegrationHeadSha: "a".repeat(40), preparedIntegrationTreeSha: "b".repeat(40),
+    })).toMatchObject({ replay: false });
+    expect(await f.t.mutation(api.goalIntegration.observe, {
+      ...f.fence, effectId, observation: "applied", providerHeadSha: "a".repeat(40),
+    })).toBe(true);
+    expect(await f.t.mutation(api.goalIntegration.complete, { ...f.fence, effectId })).toBe(true);
+    const receipts = await f.t.run(async (ctx) => ctx.db.query("integrationTerminalReceipts").collect());
+    expect(receipts).toHaveLength(1);
+    const receipt = JSON.parse(receipts[0].receiptJson);
+    expect(receipt).toMatchObject({
+      version: 2, lineageMode: "compact_manifest",
+      workspaceAttempts: { count: 40, orderedDigest: expect.stringMatching(/^[0-9a-f]{64}$/) },
+      deliveryLineage: { count: 80, orderedDigest: expect.stringMatching(/^[0-9a-f]{64}$/) },
+      providerEffects: { count: 1, mode: "compact_manifest", final: expect.any(Array) },
+    });
+    expect(receipt.workspaceAttempts.head).toHaveLength(2);
+    expect(receipt.workspaceAttempts.tail).toHaveLength(2);
+    expect(receipt.deliveryLineage.head).toHaveLength(2);
+    expect(receipt.deliveryLineage.tail).toHaveLength(2);
+    expect(Buffer.byteLength(receipts[0].receiptJson)).toBeLessThan(16_000);
+    expect(sha256(receipts[0].receiptJson)).toBe(receipts[0].receiptDigest);
+  });
+
+  it("resolves reconciliation attention only on resume and reopens the same item on another exhaustion", async () => {
+    const f = await claimedFirstIntegration("attention-truth");
+    const effectId = "attention-truth-final";
+    expect(await f.t.mutation(api.goalIntegration.prepare, {
+      ...f.fence, effectId, effectKind: "update_ref", provider: "github",
+      providerIdentity: "repo-node:refs/heads/integration", providerMethod: "POST",
+      providerTarget: "https://api.github.com/graphql#updateRefs", requestDigest: "9".repeat(64),
+      expectedIntegrationRefSha: f.claim!.expectedIntegrationRefSha,
+      preparedIntegrationHeadSha: "a".repeat(40), preparedIntegrationTreeSha: "b".repeat(40),
+    })).toMatchObject({ replay: false });
+    expect(await f.t.mutation(api.goalIntegration.observe, {
+      ...f.fence, effectId, observation: "unknown", providerResponse: "network:response-lost",
+    })).toBe(true);
+    await f.t.run(async (ctx) => ctx.db.patch(f.current._id, { cumulativeRetries: INTEGRATION_RECONCILIATION_LIMIT }));
+    expect(await f.t.mutation(api.goalIntegration.defer, {
+      ...f.fence, reasonCode: "provider_observation_pending", reason: "truth still unresolved",
+    })).toBe(true);
+    const first: any = await f.t.run(async (ctx) => ({
+      attention: await ctx.db.query("attentionItems").collect(), events: await ctx.db.query("workEvents").collect(),
+    }));
+    expect(first.attention).toEqual([expect.objectContaining({ status: "open" })]);
+    const recommendation = first.events.find((event: any) => event.type === "integration_attention")?.data?.sentryRecommendationScope;
+    expect(recommendation).toEqual(["resume", "escalate"]);
+    expect(recommendation).not.toContain("park");
+
+    expect(await f.t.mutation(api.jobs.control, { jobId: f.current.jobId, action: "resume", workerToken: TOKEN })).toBe(true);
+    expect((await f.t.run(async (ctx) => ctx.db.query("attentionItems").collect()))[0]).toMatchObject({ status: "resolved" });
+    expect(await f.t.query(api.attention.list, { workerToken: TOKEN })).toHaveLength(0);
+    const [controller] = await dispatch(f.t, 2, "attention-truth-resumed");
+    const claim = await f.t.mutation(api.goalIntegration.claim, {
+      id: f.current._id, controllerRunId: String(controller.claim!.deliveryRunId),
+      leaseOwner: "attention-truth-owner-2", leaseToken: "attention-truth-token-2", workerToken: TOKEN,
+    });
+    const fence = { id: f.current._id, controllerRunId: claim!.controllerRunId, leaseOwner: claim!.leaseOwner,
+      leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
+    await f.t.run(async (ctx) => ctx.db.patch(f.current._id, { cumulativeRetries: INTEGRATION_RECONCILIATION_LIMIT }));
+    expect(await f.t.mutation(api.goalIntegration.defer, {
+      ...fence, reasonCode: "provider_observation_pending", reason: "truth unresolved again",
+    })).toBe(true);
+    const reopened = await f.t.run(async (ctx) => ctx.db.query("attentionItems").collect());
+    expect(reopened).toHaveLength(1);
+    expect(reopened[0]).toMatchObject({ _id: first.attention[0]._id, status: "open" });
+    expect(await f.t.query(api.attention.list, { workerToken: TOKEN })).toHaveLength(1);
   });
 
   it("holds an unknown effect as a resumable FIFO head when defer exhausts its bounded budget", async () => {

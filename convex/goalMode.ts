@@ -24,7 +24,7 @@ import {
 } from "./controlPlane";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { validateWorkDag, workItemIdentity } from "../src/lib/workspace-protocol";
-import { controlIntegrationForJob, writeIntegrationTerminalReceipt } from "./goalIntegration";
+import { controlIntegrationForJob } from "./goalIntegration";
 
 const ADVANCE_LEASE_MS = 10 * 60 * 1000;
 const COORDINATOR_RECEIPT_FRESH_MS = 10 * 60 * 1000;
@@ -1941,18 +1941,6 @@ export const control = mutation({
         completedAt: now,
         updatedAt: now,
       });
-      const integrations = await ctx.db.query("integrationAttempts")
-        .withIndex("by_mission_generation", (q: any) => q.eq("missionId", mission._id)).take(100);
-      for (const integration of integrations) {
-        if (!["integrated", "conflict", "stale", "cancelled", "exhausted", "parked"].includes(integration.status)) {
-          const terminal = await writeIntegrationTerminalReceipt(ctx, integration, "cancelled", { reason: "cancelled by mission control" });
-          if (!terminal) throw new Error("cancelled integration terminal receipt could not be canonicalized");
-          await ctx.db.patch(integration._id, {
-            status: "cancelled", outcome: "cancelled", leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined,
-            terminalReceiptDigest: terminal.receiptDigest, completedAt: now, updatedAt: now,
-          });
-        }
-      }
       for (const job of jobs) {
         if (!TERMINAL.has(job.status)) {
           await patchJobWithRuntime(ctx, job, { status: "cancelled", stage: "cancelled", progress: "Goal Mode cancelled by Daniel", completedAt: now, nextRunAt: undefined });
