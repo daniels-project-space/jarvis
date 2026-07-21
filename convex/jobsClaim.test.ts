@@ -112,6 +112,9 @@ describe("real Convex specialist/controller race matrix", () => {
     expect(state.attempts).toHaveLength(1);
     expect(state.attempts[0]).toMatchObject({ workerRunId: "specialist-run", status: "done" });
     expect(state.jobs[0]).toMatchObject({ status: "pending", attempt: 1 });
+    expect(state.reviews[0]).toMatchObject({ keyId: "current-2026-07" });
+    expect(state.deliveries[0]).toMatchObject({ reviewKeyId: "current-2026-07" });
+    expect(state.deliveries[0].reviewLineage).toEqual([expect.objectContaining({ keyId: "current-2026-07" })]);
   });
 
   it("serializes two dispatchers, gives a distinct controller one claim, and replays only that run", async () => {
@@ -148,7 +151,8 @@ describe("real Convex specialist/controller race matrix", () => {
     const state = await rows(f.t);
     expect(state.attempts).toHaveLength(1);
     expect(state.deliveries).toHaveLength(2);
-    expect(state.deliveries[1]).toMatchObject({ generation: 2, cumulativeRetries: 0, parentDeliveryAttemptId: state.deliveries[0]._id });
+    expect(state.deliveries[1]).toMatchObject({ generation: 2, cumulativeRetries: 0, parentDeliveryAttemptId: state.deliveries[0]._id, reviewKeyId: "current-2026-07" });
+    expect(state.deliveries[1].effects).toEqual(state.deliveries[0].effects);
     expect(state.jobs[0]).toMatchObject({ status: "pending", attempt: 1, activeDeliveryAttemptId: state.deliveries[1]._id });
   });
 
@@ -164,7 +168,7 @@ describe("real Convex specialist/controller race matrix", () => {
     const state = await rows(f.t);
     expect(state.attempts).toHaveLength(1);
     expect(state.deliveries).toHaveLength(2);
-    expect(state.deliveries[1]).toMatchObject({ generation: 2, cumulativeRetries: 1, parentDeliveryAttemptId: state.deliveries[0]._id });
+    expect(state.deliveries[1]).toMatchObject({ generation: 2, cumulativeRetries: 1, parentDeliveryAttemptId: state.deliveries[0]._id, reviewKeyId: "current-2026-07" });
     expect(state.deliveries[1].reviewLineage).toEqual(state.deliveries[0].reviewLineage);
   });
 
@@ -196,13 +200,71 @@ describe("real Convex specialist/controller race matrix", () => {
     const state = await rows(f.t);
     expect(state.attempts).toHaveLength(1);
     expect(state.deliveries).toHaveLength(1);
-    expect(state.deliveries[0]).toMatchObject({ outcome: "needs_attention", cumulativeRetries: 7, currentStep: "receipt" });
+    expect(state.deliveries[0]).toMatchObject({ outcome: "needs_attention", cumulativeRetries: 7, currentStep: "terminal" });
     expect(state.attention).toHaveLength(1);
     expect(JSON.stringify(state.attention)).not.toContain("never-store-this-value");
   });
 });
 
 describe("real Convex delivery policy outcomes", () => {
+  it("rejects invented provider identity and an applied observation with a mismatched base", async () => {
+    const f = await committedAndClaimed("manual");
+    expect(await f.t.mutation(api.jobs.prepareDeliveryEffect, {
+      ...f.fence, effectId: "draft:exact", effectKind: "create_draft_pr", reviewedHeadSha: HEAD, reviewedBaseSha: BASE,
+    })).toMatchObject({ replay: false });
+    expect(await f.t.mutation(api.jobs.setDelivery, {
+      ...f.fence, deliveryStatus: "pull_request", pullRequestUrl: "https://github.test/pull/42",
+      pullRequestNumber: 42, pullRequestNodeId: "PR_42", pullRequestDraft: true,
+      observedPullRequestHead: HEAD, observedPullRequestBase: BASE, outcome: "protected_draft", providerCall: true,
+    })).toBe(false);
+    expect(await f.t.mutation(api.jobs.observeDeliveryEffect, {
+      ...f.fence, effectId: "draft:exact", observation: "applied", pullRequestNumber: 42,
+      pullRequestUrl: "https://github.test/pull/42", pullRequestNodeId: "PR_42", pullRequestDraft: true,
+      observedPullRequestHead: HEAD, observedPullRequestBase: "8".repeat(40),
+    })).toBe(false);
+    expect(await f.t.mutation(api.jobs.observeDeliveryEffect, {
+      ...f.fence, effectId: "draft:exact", observation: "applied", pullRequestNumber: 42,
+      pullRequestUrl: "https://github.test/pull/42", pullRequestNodeId: "PR_42", pullRequestDraft: true,
+      observedPullRequestHead: HEAD, observedPullRequestBase: BASE,
+    })).toBe(true);
+  });
+
+  it.each(["pause", "cancel"] as const)("fences a controller %s after provider observation", async (action) => {
+    const f = await committedAndClaimed("manual");
+    await f.t.mutation(api.jobs.prepareDeliveryEffect, {
+      ...f.fence, effectId: "draft:control", effectKind: "create_draft_pr", reviewedHeadSha: HEAD, reviewedBaseSha: BASE,
+    });
+    await f.t.mutation(api.jobs.observeDeliveryEffect, {
+      ...f.fence, effectId: "draft:control", observation: "applied", pullRequestNumber: 42,
+      pullRequestUrl: "https://github.test/pull/42", pullRequestNodeId: "PR_42", pullRequestDraft: true,
+      observedPullRequestHead: HEAD, observedPullRequestBase: BASE,
+    });
+    expect(await f.t.mutation(api.jobs.control, { jobId: f.jobId, action, workerToken: WORKER })).toBe(true);
+    expect(await f.t.mutation(api.jobs.setDelivery, {
+      ...f.fence, deliveryStatus: "pull_request", pullRequestUrl: "https://github.test/pull/42",
+      pullRequestNumber: 42, pullRequestNodeId: "PR_42", pullRequestDraft: true,
+      observedPullRequestHead: HEAD, observedPullRequestBase: BASE, outcome: "protected_draft", providerCall: true,
+    })).toBe(false);
+    expect((await rows(f.t)).attempts).toHaveLength(1);
+  });
+
+  it("fences finalize after a control arrives between outcome and terminal receipt", async () => {
+    const f = await committedAndClaimed("read_only");
+    expect(await f.t.mutation(api.jobs.setDelivery, {
+      ...f.fence, deliveryStatus: "branch", outcome: "read_only_complete", providerCall: false,
+    })).toBe(true);
+    expect(await f.t.mutation(api.jobs.control, { jobId: f.jobId, action: "pause", workerToken: WORKER })).toBe(true);
+    expect(await f.t.mutation(api.jobs.finalize, {
+      ...f.fence, status: "done", result: f.result, verificationVerdict: "pass", verificationNote: f.note,
+      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE, reviewDiffSha256: DIFF,
+    })).toBe(false);
+    expect(await f.t.mutation(api.jobs.control, { jobId: f.jobId, action: "resume", workerToken: WORKER })).toBe(true);
+    const state = await rows(f.t);
+    expect(state.deliveries).toHaveLength(2);
+    expect(state.deliveries[1]).toMatchObject({ outcome: "read_only_complete", currentStep: "receipt", reviewKeyId: "current-2026-07" });
+    expect(state.attempts).toHaveLength(1);
+  });
+
   it.each([
     ["read_only", "read_only_complete"],
     ["manual", "no_change"],
@@ -231,7 +293,7 @@ describe("real Convex delivery policy outcomes", () => {
     })).toMatchObject({ replay: false });
     expect(await f.t.mutation(api.jobs.observeDeliveryEffect, {
       ...f.fence, effectId: "draft:42", observation: "applied", pullRequestNumber: 42,
-      pullRequestUrl: "https://github.test/pull/42", pullRequestDraft: true,
+      pullRequestUrl: "https://github.test/pull/42", pullRequestNodeId: "PR_42", pullRequestDraft: true,
       observedPullRequestHead: HEAD, observedPullRequestBase: BASE,
     })).toBe(true);
     expect(await f.t.mutation(api.jobs.prepareDeliveryEffect, {
@@ -239,17 +301,18 @@ describe("real Convex delivery policy outcomes", () => {
     })).toBeNull();
     expect(await f.t.mutation(api.jobs.setDelivery, {
       ...f.fence, deliveryStatus: "pull_request", pullRequestUrl: "https://github.test/pull/42",
-      pullRequestNumber: 42, pullRequestDraft: true, observedPullRequestHead: HEAD,
+      pullRequestNumber: 42, pullRequestNodeId: "PR_42", pullRequestDraft: true, observedPullRequestHead: HEAD,
       observedPullRequestBase: BASE, outcome: "protected_draft", providerCall: true,
     })).toBe(true);
   });
 
-  it("allows only automatic policy to record exact integrated default-branch delivery", async () => {
+  it("allows only automatic policy to record the exact merged outcome", async () => {
     const f = await committedAndClaimed("auto_merge");
     for (const [effectId, effectKind] of [["pr:42", "create_pr"], ["merge:42", "merge_pr"]] as const) {
       if (effectKind === "merge_pr") await f.t.mutation(api.jobs.setDelivery, {
         ...f.fence, deliveryStatus: "pull_request", pullRequestUrl: "https://github.test/pull/42",
-        pullRequestNumber: 42, observedPullRequestHead: HEAD, observedPullRequestBase: BASE, providerCall: true,
+        pullRequestNumber: 42, pullRequestNodeId: "PR_42", pullRequestDraft: false,
+        observedPullRequestHead: HEAD, observedPullRequestBase: BASE, providerCall: true,
       });
       expect(await f.t.mutation(api.jobs.prepareDeliveryEffect, {
         ...f.fence, effectId, effectKind, reviewedHeadSha: HEAD, reviewedBaseSha: BASE,
@@ -257,13 +320,15 @@ describe("real Convex delivery policy outcomes", () => {
       })).not.toBeNull();
       expect(await f.t.mutation(api.jobs.observeDeliveryEffect, {
         ...f.fence, effectId, observation: "applied", pullRequestNumber: 42,
-        pullRequestUrl: "https://github.test/pull/42", observedPullRequestHead: HEAD, observedPullRequestBase: BASE,
+        pullRequestUrl: "https://github.test/pull/42", pullRequestNodeId: "PR_42", pullRequestDraft: false,
+        observedPullRequestHead: HEAD, observedPullRequestBase: BASE,
+        mergeCommitSha: effectKind === "merge_pr" ? "1".repeat(40) : undefined,
       })).toBe(true);
     }
     expect(await f.t.mutation(api.jobs.setDelivery, {
       ...f.fence, deliveryStatus: "merged", pullRequestUrl: "https://github.test/pull/42", pullRequestNumber: 42,
-      mergeCommitSha: "1".repeat(40), observedPullRequestHead: HEAD, observedPullRequestBase: BASE,
-      outcome: "integrated_default_branch", providerCall: true,
+      pullRequestNodeId: "PR_42", pullRequestDraft: false, mergeCommitSha: "1".repeat(40),
+      observedPullRequestHead: HEAD, observedPullRequestBase: BASE, outcome: "merged", providerCall: true,
     })).toBe(true);
   });
 
@@ -280,6 +345,17 @@ describe("real Convex delivery policy outcomes", () => {
     expect(state.attention).toHaveLength(1);
     expect(state.deliveries[0]).toMatchObject({ outcome: "needs_attention", status: "blocked", currentStep: "terminal" });
     expect(state.deliveries[0].terminalReceiptDigest).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it.each(["manual", "read_only", "auto_merge"] as const)("records an explicit blocked terminal outcome for %s", async (policy) => {
+    const f = await committedAndClaimed(policy);
+    expect(await f.t.mutation(api.jobs.setDelivery, {
+      ...f.fence, deliveryStatus: "blocked", outcome: "blocked", providerCall: false,
+    })).toBe(true);
+    expect(await f.t.mutation(api.jobs.finalize, {
+      ...f.fence, status: "error", result: "provider policy gate blocked delivery",
+    })).toBe(true);
+    expect((await rows(f.t)).deliveries[0]).toMatchObject({ outcome: "blocked", currentStep: "terminal", status: "blocked" });
   });
 
   it("does not complete a validating goal until its active attempt has a terminal receipt", async () => {

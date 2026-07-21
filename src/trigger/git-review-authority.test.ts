@@ -20,7 +20,7 @@ const binding = {
 };
 
 describe("trusted Git review receipt authority", () => {
-  it("loads the stable named controller-vault secret when a warm worker lacks an environment value", async () => {
+  it("loads the legacy verifier for migration but does not treat it as delivery-ready", async () => {
     let calls = 0;
     const authority = await loadGitReviewReceiptAuthority({
       environment: {} as NodeJS.ProcessEnv,
@@ -32,6 +32,9 @@ describe("trusted Git review receipt authority", () => {
     });
     expect(authority).not.toBeNull();
     expect(calls).toBe(1);
+    expect(repositoryDeliveryReadiness(true, authority)).toEqual({
+      ready: false, reason: "rotating controller receipt signer unavailable",
+    });
   });
 
   it("fails closed for a missing or undersized authority", async () => {
@@ -85,7 +88,12 @@ describe("trusted Git review receipt authority", () => {
     await expect(gitReviewReceiptAuthorityHealth({
       environment: {} as NodeJS.ProcessEnv,
       loadVault: async () => ({}),
-    })).resolves.toEqual({ ready: false, reason: "controller receipt signer unavailable" });
-    expect(repositoryDeliveryReadiness(true, null)).toEqual({ ready: false, reason: "controller receipt signer unavailable" });
+    })).resolves.toEqual({ ready: false, reason: "rotating controller receipt signer unavailable" });
+    expect(repositoryDeliveryReadiness(true, null)).toEqual({ ready: false, reason: "rotating controller receipt signer unavailable" });
+    await expect(gitReviewReceiptAuthorityHealth({
+      environment: { JARVIS_GIT_REVIEW_RECEIPT_KEYRING: JSON.stringify({
+        current: { keyId: "current", secret: "c".repeat(32) }, previous: [],
+      }) } as unknown as NodeJS.ProcessEnv,
+    })).resolves.toEqual({ ready: true, reason: "ready" });
   });
 });

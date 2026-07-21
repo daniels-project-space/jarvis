@@ -32,12 +32,12 @@ const DELIVERY_RETRY_LIMIT = 6;
 const REVIEW_RECEIPT_MAX_CHARS = 300_000;
 const DELIVERY_OUTCOMES = new Set([
   "protected_draft", "read_only_complete", "no_change",
-  "integrated_default_branch", "blocked", "needs_attention",
+  "merged", "blocked", "needs_attention",
 ]);
 
 function outcomeAllowed(policy: string, outcome: string) {
   if (!DELIVERY_OUTCOMES.has(outcome)) return false;
-  if (outcome === "integrated_default_branch") return policy === "auto_merge";
+  if (outcome === "merged") return policy === "auto_merge";
   if (outcome === "protected_draft") return policy === "manual";
   if (outcome === "read_only_complete") return policy === "read_only";
   return true;
@@ -127,6 +127,52 @@ function hasLiveControllerFence(row: any, attempt: any, a: any, now = Date.now()
     && attempt.leaseToken === a.deliveryLeaseToken
     && Number(attempt.leaseVersion) === Number(a.deliveryLeaseVersion)
     && Number(attempt.leaseUntil ?? 0) >= now;
+}
+
+function carriedDeliveryAuthority(delivery: any) {
+  return {
+    reviewReceiptId: delivery.reviewReceiptId,
+    reviewReceiptDigest: delivery.reviewReceiptDigest,
+    reviewKeyId: delivery.reviewKeyId,
+    reviewLineage: delivery.reviewLineage,
+    reviewedHeadSha: delivery.reviewedHeadSha,
+    reviewedBaseSha: delivery.reviewedBaseSha,
+    reviewedHeadTreeSha: delivery.reviewedHeadTreeSha,
+    reviewedDiffSha256: delivery.reviewedDiffSha256,
+    observedPullRequestHead: delivery.observedPullRequestHead,
+    observedPullRequestBase: delivery.observedPullRequestBase,
+    pullRequestNumber: delivery.pullRequestNumber,
+    pullRequestUrl: delivery.pullRequestUrl,
+    pullRequestNodeId: delivery.pullRequestNodeId,
+    pullRequestDraft: delivery.pullRequestDraft,
+    preparedEffectId: delivery.preparedEffectId,
+    preparedEffectKind: delivery.preparedEffectKind,
+    preparedEffectAt: delivery.preparedEffectAt,
+    providerObservation: delivery.providerObservation,
+    providerObservedAt: delivery.providerObservedAt,
+    effects: delivery.effects,
+    mergeCommitSha: delivery.mergeCommitSha,
+    outcome: delivery.outcome,
+  };
+}
+
+function matchingAppliedEffect(delivery: any, kinds: readonly string[], args: any) {
+  const effect = [...(delivery.effects ?? [])].reverse().find((candidate: any) =>
+    kinds.includes(String(candidate.effectKind))
+    && candidate.observation === "applied"
+    && candidate.reviewedHeadSha === delivery.reviewedHeadSha
+    && candidate.reviewedBaseSha === delivery.reviewedBaseSha
+    && (!args.pullRequestNumber || candidate.pullRequestNumber === args.pullRequestNumber)
+  );
+  if (!effect) return null;
+  if (effect.observedPullRequestHead !== delivery.reviewedHeadSha
+    || effect.observedPullRequestBase !== delivery.reviewedBaseSha) return null;
+  if (args.pullRequestNumber && effect.pullRequestNumber !== args.pullRequestNumber) return null;
+  if (args.pullRequestUrl && effect.pullRequestUrl !== args.pullRequestUrl) return null;
+  if (args.pullRequestNodeId && effect.pullRequestNodeId !== args.pullRequestNodeId) return null;
+  if (args.pullRequestDraft !== undefined && effect.pullRequestDraft !== args.pullRequestDraft) return null;
+  if (args.mergeCommitSha && effect.mergeCommitSha !== args.mergeCommitSha) return null;
+  return effect;
 }
 
 function eventIdentity(value: unknown) {
@@ -619,7 +665,8 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
   return runnable;
 }
 
-function claimedJob(j: any, upstreamEvidence: readonly any[] = []) {
+async function claimedJob(ctx: any, j: any, upstreamEvidence: readonly any[] = []) {
+  const delivery: any = j.activeDeliveryAttemptId ? await ctx.db.get(j.activeDeliveryAttemptId) : null;
   return {
     jobId: j._id,
     task: j.task,
@@ -651,6 +698,18 @@ function claimedJob(j: any, upstreamEvidence: readonly any[] = []) {
     deliveryRunId: j.deliveryRunId ?? null,
     workerRunId: j.workerRunId ?? null,
     activeDeliveryAttemptId: j.activeDeliveryAttemptId ?? null,
+    deliveryOutcome: delivery?.outcome ?? null,
+    deliveryStep: delivery?.currentStep ?? null,
+    deliveryReviewKeyId: delivery?.reviewKeyId ?? null,
+    deliveryPullRequestNumber: delivery?.pullRequestNumber ?? null,
+    deliveryPullRequestUrl: delivery?.pullRequestUrl ?? null,
+    deliveryPullRequestNodeId: delivery?.pullRequestNodeId ?? null,
+    deliveryPullRequestDraft: delivery?.pullRequestDraft ?? null,
+    deliveryObservedHeadSha: delivery?.observedPullRequestHead ?? null,
+    deliveryObservedBaseSha: delivery?.observedPullRequestBase ?? null,
+    deliveryMergeCommitSha: delivery?.mergeCommitSha ?? null,
+    deliveryPreparedEffectKind: delivery?.preparedEffectKind ?? null,
+    deliveryProviderObservation: delivery?.providerObservation ?? null,
     verificationVerdict: j.verificationVerdict ?? null,
     verificationNote: j.verificationNote ?? null,
     reviewReceiptId: j.reviewReceiptId ?? null,
@@ -780,9 +839,9 @@ export const claimDispatched = mutation({
     });
     // Do not execute a dependency query on a redelivery. The original response
     // may have been lost after commit; this is an immutable replay envelope.
-    if (disposition === "replay") return claimedJob(j, priorAttempt?.upstreamEvidence ?? []);
+    if (disposition === "replay") return await claimedJob(ctx, j, priorAttempt?.upstreamEvidence ?? []);
     if (j?.status === "running" && j.dispatchId === a.dispatchId && j.deliveryRunId === a.workerRunId.slice(0, 120)
-      && j.verificationVerdict === "pass" && j.reviewReceiptId) return claimedJob(j, priorAttempt?.upstreamEvidence ?? []);
+      && j.verificationVerdict === "pass" && j.reviewReceiptId) return await claimedJob(ctx, j, priorAttempt?.upstreamEvidence ?? []);
     if (
       !j ||
       j.status !== "dispatching" ||
@@ -803,9 +862,10 @@ export const claimDispatched = mutation({
         policy: String(j.deliveryMode ?? "manual"), status: "running",
         sourceDispatchId: a.dispatchId,
         reviewReceiptId: j.reviewReceiptId, reviewReceiptDigest: j.reviewReceiptDigest,
+        reviewKeyId: review?.keyId,
         reviewLineage: j.reviewReceiptId && j.reviewReceiptDigest ? [{
           sourceWorkAttempt: attemptNumber, reviewReceiptId: j.reviewReceiptId,
-          reviewReceiptDigest: j.reviewReceiptDigest,
+          reviewReceiptDigest: j.reviewReceiptDigest, keyId: review?.keyId,
         }] : undefined,
         reviewedHeadSha: review?.headSha, reviewedBaseSha: review?.baseSha,
         reviewedHeadTreeSha: review?.headTreeSha, reviewedDiffSha256: review?.diffSha256,
@@ -830,7 +890,7 @@ export const claimDispatched = mutation({
       // response has exactly the same fence as a lost-response replay.
       const committedJob = await ctx.db.get(a.jobId);
       const committedAttempt = committedJob ? await attemptFor(ctx, a.jobId, attemptNumber) : null;
-      return committedJob ? claimedJob(committedJob, committedAttempt?.upstreamEvidence ?? []) : null;
+      return committedJob ? await claimedJob(ctx, committedJob, committedAttempt?.upstreamEvidence ?? []) : null;
     }
     if (priorAttempt?.workerRunId || (priorAttempt?.dispatchId && priorAttempt.dispatchId !== a.dispatchId)) {
       // A stale platform redelivery must not replace the original workspace
@@ -885,7 +945,7 @@ export const claimDispatched = mutation({
     // committed worker and delivery fence on an initial response.
     const committedJob = await ctx.db.get(a.jobId);
     const committedAttempt = committedJob ? await attemptFor(ctx, a.jobId, attemptNumber) : null;
-    return committedJob ? claimedJob(committedJob, committedAttempt?.upstreamEvidence ?? []) : null;
+    return committedJob ? await claimedJob(ctx, committedJob, committedAttempt?.upstreamEvidence ?? []) : null;
   },
 });
 
@@ -952,7 +1012,7 @@ export const finalize = mutation({
     const delivery = a.deliveryGeneration === undefined ? null : await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration));
     if (row.repo && (!delivery || !hasLiveControllerFence(row, delivery, a))) return false;
     if (row.repo) {
-      const successfulOutcomes = new Set(["protected_draft", "read_only_complete", "no_change", "integrated_default_branch"]);
+      const successfulOutcomes = new Set(["protected_draft", "read_only_complete", "no_change", "merged"]);
       const terminalOutcome = String(delivery?.outcome ?? "");
       if (delivery?.currentStep !== "receipt" || !outcomeAllowed(String(delivery.policy), terminalOutcome)) return false;
       if (a.status === "done" ? !successfulOutcomes.has(terminalOutcome) : !["blocked", "needs_attention"].includes(terminalOutcome)) return false;
@@ -969,7 +1029,8 @@ export const finalize = mutation({
       const review: any = await ctx.db.get(row.reviewReceiptId as any);
       if (!review || review.jobId !== a.jobId || review.attempt !== a.expectedAttempt
         || review.receiptDigest !== row.reviewReceiptDigest || review.signature !== row.reviewReceiptSignature
-        || review.diffSha256 !== a.reviewDiffSha256 || review.signature !== a.reviewReceiptSignature) return false;
+        || review.diffSha256 !== a.reviewDiffSha256 || review.signature !== a.reviewReceiptSignature
+        || delivery?.reviewKeyId !== review.keyId) return false;
     }
     const normalizedResult = String(a.result ?? "").slice(0, 4_000);
     const normalizedNote = String(a.verificationNote ?? "").slice(0, 1_000);
@@ -1243,18 +1304,16 @@ export const reapStale = mutation({
             status: exhaustedDelivery ? "blocked" : "checkpointed", retries: Number(delivery.retries ?? 0) + 1, cumulativeRetries: retries, completedAt: now,
             outcome: exhaustedDelivery ? "needs_attention" : delivery.outcome,
             terminalReceiptDigest: exhaustedDelivery ? await sha256Hex(`needs_attention:${String(j._id)}:${j.attempt ?? 1}`) : delivery.terminalReceiptDigest,
-            currentStep: exhaustedDelivery ? "receipt" : "retry", retryReason: "controller liveness expired",
+            currentStep: exhaustedDelivery ? "terminal" : "retry", retryReason: "controller liveness expired",
             leaseUntil: undefined, heartbeatAt: now, updatedAt: now,
           });
           const nextGeneration = Number(j.deliveryGeneration) + 1;
           const nextDeliveryId = exhaustedDelivery ? undefined : await ctx.db.insert("deliveryAttempts", {
             jobId: j._id, sourceWorkAttempt: j.attempt ?? 1, generation: nextGeneration,
-            policy: String(delivery.policy), status: "checkpointed", reviewReceiptId: delivery.reviewReceiptId,
-            parentDeliveryAttemptId: delivery._id, reviewLineage: delivery.reviewLineage,
-            reviewReceiptDigest: delivery.reviewReceiptDigest, reviewedHeadSha: delivery.reviewedHeadSha,
-            reviewedBaseSha: delivery.reviewedBaseSha, reviewedHeadTreeSha: delivery.reviewedHeadTreeSha,
-            reviewedDiffSha256: delivery.reviewedDiffSha256, heartbeatAt: now, retries: 0,
-            cumulativeRetries: retries, currentStep: "queued", retryReason: "controller liveness expired", createdAt: now, updatedAt: now,
+            policy: String(delivery.policy), status: "checkpointed", parentDeliveryAttemptId: delivery._id,
+            ...carriedDeliveryAuthority(delivery), heartbeatAt: now, retries: 0,
+            cumulativeRetries: retries, currentStep: delivery.currentStep === "receipt" ? "receipt" : "queued",
+            retryReason: "controller liveness expired", createdAt: now, updatedAt: now,
           });
           await patchJobWithRuntime(ctx, j, {
             ...invalidateDeliveryLease(j),
@@ -1596,7 +1655,7 @@ export const checkpointAndRequeue = mutation({
       const retryNow = Date.now();
       await ctx.db.patch(delivery._id, {
         status: deliveryExhausted ? "blocked" : "checkpointed", completedAt: retryNow,
-        currentStep: deliveryExhausted ? "receipt" : "retry",
+        currentStep: deliveryExhausted ? "terminal" : "retry",
         outcome: deliveryExhausted ? "needs_attention" : delivery.outcome,
         terminalReceiptDigest: deliveryExhausted ? await sha256Hex(`needs_attention:${String(row._id)}:${a.expectedAttempt}`) : delivery.terminalReceiptDigest,
         retryReason: redactSensitiveText(a.checkpoint).slice(0, 500),
@@ -1609,11 +1668,9 @@ export const checkpointAndRequeue = mutation({
           jobId: a.jobId, sourceWorkAttempt: a.expectedAttempt, generation: nextGeneration,
           policy: String(row.deliveryMode ?? (row.readonly ? "read_only" : "manual")), status: "checkpointed",
           parentDeliveryAttemptId: delivery._id,
-          reviewReceiptId: row.reviewReceiptId, reviewReceiptDigest: row.reviewReceiptDigest,
-          reviewLineage: delivery.reviewLineage,
-          reviewedHeadSha: delivery.reviewedHeadSha, reviewedBaseSha: delivery.reviewedBaseSha,
-          reviewedHeadTreeSha: delivery.reviewedHeadTreeSha, reviewedDiffSha256: delivery.reviewedDiffSha256,
-          heartbeatAt: retryNow, retries: 0, cumulativeRetries, currentStep: "queued",
+          ...carriedDeliveryAuthority(delivery),
+          heartbeatAt: retryNow, retries: 0, cumulativeRetries,
+          currentStep: delivery.currentStep === "receipt" ? "receipt" : "queued",
           retryReason: redactSensitiveText(a.checkpoint).slice(0, 500), createdAt: retryNow, updatedAt: retryNow,
         });
         await patchJobWithRuntime(ctx, row, { activeDeliveryAttemptId: nextDeliveryId });
@@ -1776,6 +1833,7 @@ export const prepareDeliveryEffect = mutation({
     deliveryLeaseOwner: v.string(), deliveryLeaseToken: v.string(), deliveryLeaseVersion: v.number(),
     effectId: v.string(), effectKind: v.union(v.literal("create_draft_pr"), v.literal("create_pr"), v.literal("promote_pr"), v.literal("merge_pr")),
     reviewedHeadSha: v.string(), reviewedBaseSha: v.string(), pullRequestNumber: v.optional(v.number()),
+    reconcileOnly: v.optional(v.boolean()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
@@ -1789,11 +1847,20 @@ export const prepareDeliveryEffect = mutation({
     if (delivery.policy === "manual" && a.effectKind !== "create_draft_pr") return null;
     if (delivery.policy === "auto_merge" && !["create_pr", "promote_pr", "merge_pr"].includes(a.effectKind)) return null;
     if (a.effectKind === "merge_pr" && (!a.pullRequestNumber || delivery.pullRequestNumber !== a.pullRequestNumber)) return null;
-    if (delivery.preparedEffectId && !delivery.providerObservation) {
-      return delivery.preparedEffectId === a.effectId && delivery.preparedEffectKind === a.effectKind
-        ? { effectId: delivery.preparedEffectId, replay: true }
-        : null;
+    const prior = (delivery.effects ?? []).find((effect: any) => effect.effectId === a.effectId);
+    if (prior) {
+      if (prior.effectKind !== a.effectKind || prior.reviewedHeadSha !== a.reviewedHeadSha
+        || prior.reviewedBaseSha !== a.reviewedBaseSha
+        || Number(prior.pullRequestNumber ?? 0) !== Number(a.pullRequestNumber ?? 0)) return null;
+      await ctx.db.patch(delivery._id, {
+        preparedEffectId: prior.effectId, preparedEffectKind: prior.effectKind,
+        preparedEffectAt: prior.preparedAt, providerObservation: prior.observation,
+        providerObservedAt: prior.observedAt, currentStep: "prepared",
+        heartbeatAt: Date.now(), updatedAt: Date.now(),
+      });
+      return { effectId: prior.effectId, replay: true, observation: prior.observation ?? null };
     }
+    if (a.reconcileOnly || (delivery.preparedEffectId && !delivery.providerObservation)) return null;
     const now = Date.now();
     await ctx.db.patch(delivery._id, {
       preparedEffectId: a.effectId.slice(0, 160), preparedEffectKind: a.effectKind,
@@ -1801,6 +1868,8 @@ export const prepareDeliveryEffect = mutation({
       currentStep: "prepared", heartbeatAt: now, updatedAt: now,
       effects: [...(delivery.effects ?? []), {
         effectId: a.effectId.slice(0, 160), effectKind: a.effectKind, preparedAt: now,
+        reviewedHeadSha: a.reviewedHeadSha, reviewedBaseSha: a.reviewedBaseSha,
+        pullRequestNumber: a.pullRequestNumber,
       }],
     });
     return { effectId: a.effectId.slice(0, 160), replay: false };
@@ -1816,20 +1885,39 @@ export const observeDeliveryEffect = mutation({
     pullRequestNumber: v.optional(v.number()), pullRequestUrl: v.optional(v.string()),
     pullRequestNodeId: v.optional(v.string()), pullRequestDraft: v.optional(v.boolean()),
     observedPullRequestHead: v.optional(v.string()), observedPullRequestBase: v.optional(v.string()),
+    mergeCommitSha: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const row: any = await ctx.db.get(a.jobId);
     const delivery: any = await ctx.db.get(a.deliveryAttemptId);
-    if (!row || !hasLiveControllerFence(row, delivery, a) || delivery.preparedEffectId !== a.effectId) return false;
+    if (!row || row.status !== "running" || delivery.status !== "running"
+      || !hasLiveControllerFence(row, delivery, a) || delivery.preparedEffectId !== a.effectId) return false;
     if (a.observedPullRequestHead && a.observedPullRequestHead !== delivery.reviewedHeadSha) return false;
     if (a.observedPullRequestBase && a.observedPullRequestBase !== delivery.reviewedBaseSha) return false;
     const now = Date.now();
     const effects = [...(delivery.effects ?? [])];
     const effectIndex = effects.findIndex((effect: any) => effect.effectId === a.effectId);
     if (effectIndex < 0) return false;
-    effects[effectIndex] = { ...effects[effectIndex], observation: a.observation, observedAt: now };
+    const prepared = effects[effectIndex];
+    if (a.observation === "applied") {
+      if (!a.pullRequestNumber || !a.pullRequestUrl || !a.pullRequestNodeId
+        || typeof a.pullRequestDraft !== "boolean"
+        || a.observedPullRequestHead !== delivery.reviewedHeadSha
+        || a.observedPullRequestBase !== delivery.reviewedBaseSha) return false;
+      if (prepared.pullRequestNumber && prepared.pullRequestNumber !== a.pullRequestNumber) return false;
+      if (prepared.effectKind === "create_draft_pr" && a.pullRequestDraft !== true) return false;
+      if (["create_pr", "promote_pr", "merge_pr"].includes(prepared.effectKind) && a.pullRequestDraft !== false) return false;
+      if (prepared.effectKind === "merge_pr" && !a.mergeCommitSha) return false;
+    }
+    effects[effectIndex] = {
+      ...prepared, observation: a.observation, observedAt: now,
+      pullRequestNumber: a.pullRequestNumber ?? prepared.pullRequestNumber,
+      pullRequestUrl: a.pullRequestUrl, pullRequestNodeId: a.pullRequestNodeId,
+      pullRequestDraft: a.pullRequestDraft, observedPullRequestHead: a.observedPullRequestHead,
+      observedPullRequestBase: a.observedPullRequestBase, mergeCommitSha: a.mergeCommitSha,
+    };
     await ctx.db.patch(delivery._id, {
       providerObservation: a.observation, providerObservedAt: now,
       pullRequestNumber: a.pullRequestNumber ?? delivery.pullRequestNumber,
@@ -1838,6 +1926,7 @@ export const observeDeliveryEffect = mutation({
       pullRequestDraft: a.pullRequestDraft ?? delivery.pullRequestDraft,
       observedPullRequestHead: a.observedPullRequestHead ?? delivery.observedPullRequestHead,
       observedPullRequestBase: a.observedPullRequestBase ?? delivery.observedPullRequestBase,
+      mergeCommitSha: a.mergeCommitSha ?? delivery.mergeCommitSha,
       currentStep: "observing", heartbeatAt: now, updatedAt: now,
       effects,
     });
@@ -1865,7 +1954,7 @@ export const setDelivery = mutation({
     pullRequestDraft: v.optional(v.boolean()),
     outcome: v.optional(v.union(
       v.literal("protected_draft"), v.literal("read_only_complete"), v.literal("no_change"),
-      v.literal("integrated_default_branch"), v.literal("blocked"), v.literal("needs_attention"),
+      v.literal("merged"), v.literal("blocked"), v.literal("needs_attention"),
     )),
     providerCall: v.optional(v.boolean()),
     deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
@@ -1892,9 +1981,24 @@ export const setDelivery = mutation({
     if (a.observedPullRequestBase && a.observedPullRequestBase !== delivery.reviewedBaseSha && a.outcome !== "needs_attention") return false;
     if (a.outcome && !outcomeAllowed(policy, a.outcome)) return false;
     if (a.outcome === "protected_draft" && (!a.pullRequestNumber || !a.pullRequestUrl || a.pullRequestDraft !== true
-      || a.observedPullRequestHead !== delivery.reviewedHeadSha)) return false;
+      || !a.pullRequestNodeId || a.observedPullRequestHead !== delivery.reviewedHeadSha
+      || a.observedPullRequestBase !== delivery.reviewedBaseSha)) return false;
     if (a.outcome === "read_only_complete" && (a.providerCall || a.pullRequestNumber || a.pullRequestUrl)) return false;
-    if (a.outcome === "integrated_default_branch" && (!a.mergeCommitSha || a.deliveryStatus !== "merged")) return false;
+    if (a.outcome === "merged" && (!a.mergeCommitSha || a.deliveryStatus !== "merged" || a.pullRequestDraft !== false)) return false;
+    const providerBacked = a.providerCall === true || a.outcome === "protected_draft" || a.outcome === "merged"
+      || a.deliveryStatus === "pull_request" || a.deliveryStatus === "merged";
+    if (providerBacked) {
+      const kinds = a.deliveryStatus === "merged" || a.outcome === "merged"
+        ? ["merge_pr"]
+        : policy === "manual" ? ["create_draft_pr"] : ["create_pr", "promote_pr"];
+      const applied = matchingAppliedEffect(delivery, kinds, a);
+      if (!applied) return false;
+      if (a.pullRequestNumber !== applied.pullRequestNumber || a.pullRequestUrl !== applied.pullRequestUrl
+        || a.pullRequestNodeId !== applied.pullRequestNodeId || a.pullRequestDraft !== applied.pullRequestDraft
+        || a.observedPullRequestHead !== applied.observedPullRequestHead
+        || a.observedPullRequestBase !== applied.observedPullRequestBase) return false;
+      if (a.deliveryStatus === "merged" && a.mergeCommitSha !== applied.mergeCommitSha) return false;
+    }
     await patchJobWithRuntime(ctx, row, {
       branch: a.branch,
       pullRequestUrl: a.pullRequestUrl,
@@ -1910,6 +2014,7 @@ export const setDelivery = mutation({
       pullRequestUrl: a.pullRequestUrl ?? delivery.pullRequestUrl,
       pullRequestNodeId: a.pullRequestNodeId ?? delivery.pullRequestNodeId,
       pullRequestDraft: a.pullRequestDraft ?? delivery.pullRequestDraft,
+      mergeCommitSha: a.mergeCommitSha ?? delivery.mergeCommitSha,
       outcome: a.outcome ?? delivery.outcome,
       currentStep: a.outcome ? "receipt" : a.deliveryStatus === "pull_request" ? "preflight" : "preflight",
       heartbeatAt: Date.now(), updatedAt: Date.now(),
@@ -2044,7 +2149,8 @@ export const markVerifiedForDelivery = mutation({
       status: "checkpointed",
       reviewReceiptId,
       reviewReceiptDigest: receiptDigest,
-      reviewLineage: [{ sourceWorkAttempt: a.expectedAttempt, reviewReceiptId, reviewReceiptDigest: receiptDigest }],
+      reviewKeyId: a.reviewReceiptKeyId,
+      reviewLineage: [{ sourceWorkAttempt: a.expectedAttempt, reviewReceiptId, reviewReceiptDigest: receiptDigest, keyId: a.reviewReceiptKeyId }],
       reviewedHeadSha: String(receipt.headSha),
       reviewedBaseSha: String(receipt.baseSha),
       reviewedHeadTreeSha: String(receipt.headTreeSha),
@@ -2058,6 +2164,7 @@ export const markVerifiedForDelivery = mutation({
     });
     if (existingDelivery) await ctx.db.patch(existingDelivery._id, {
       status: "checkpointed", reviewReceiptId, reviewReceiptDigest: receiptDigest,
+      reviewKeyId: a.reviewReceiptKeyId,
       reviewedHeadSha: String(receipt.headSha), reviewedBaseSha: String(receipt.baseSha),
       reviewedHeadTreeSha: String(receipt.headTreeSha), reviewedDiffSha256: a.reviewDiffSha256,
       currentStep: "queued", heartbeatAt: now, updatedAt: now,
@@ -2151,11 +2258,9 @@ export const control = mutation({
         const nextDeliveryId = existing?._id ?? await ctx.db.insert("deliveryAttempts", {
           jobId: a.jobId, sourceWorkAttempt: row.attempt ?? 1, generation: nextGeneration,
           policy: activeDelivery.policy, status: "checkpointed", parentDeliveryAttemptId: activeDelivery._id,
-          reviewReceiptId: activeDelivery.reviewReceiptId, reviewReceiptDigest: activeDelivery.reviewReceiptDigest,
-          reviewLineage: activeDelivery.reviewLineage, reviewedHeadSha: activeDelivery.reviewedHeadSha,
-          reviewedBaseSha: activeDelivery.reviewedBaseSha, reviewedHeadTreeSha: activeDelivery.reviewedHeadTreeSha,
-          reviewedDiffSha256: activeDelivery.reviewedDiffSha256, heartbeatAt: now, retries: 0,
-          cumulativeRetries: Number(activeDelivery.cumulativeRetries ?? 0), currentStep: "queued",
+          ...carriedDeliveryAuthority(activeDelivery), heartbeatAt: now, retries: 0,
+          cumulativeRetries: Number(activeDelivery.cumulativeRetries ?? 0),
+          currentStep: activeDelivery.currentStep === "receipt" ? "receipt" : "queued",
           retryReason: "resumed by control", createdAt: now, updatedAt: now,
         });
         await patchJobWithRuntime(ctx, row, {

@@ -6,7 +6,8 @@ import {
   type GitReviewEnvelope,
 } from "./git-review-receipt";
 
-type Authority = ReturnType<typeof createGitReviewReceiptAuthority>;
+type ReceiptAuthority = ReturnType<typeof createGitReviewReceiptAuthority>;
+type Authority = ReceiptAuthority & { configuration: "rotating" | "legacy" };
 type LoadOptions = {
   environment?: NodeJS.ProcessEnv;
   loadVault?: (service: string) => Promise<Record<string, string>>;
@@ -25,16 +26,16 @@ function configuredAuthority(environment: NodeJS.ProcessEnv): Authority | null {
       if (typeof value.current?.keyId !== "string" || typeof value.current.secret !== "string") return null;
       if (!Array.isArray(value.previous)) return null;
       if (value.previous.some((entry) => typeof entry?.keyId !== "string" || typeof entry?.secret !== "string")) return null;
-      return createGitReviewReceiptKeyring(
+      return Object.assign(createGitReviewReceiptKeyring(
         { keyId: value.current.keyId, secret: value.current.secret },
         value.previous.map((entry) => ({ keyId: String(entry.keyId), secret: String(entry.secret) })),
-      );
+      ), { configuration: "rotating" as const });
     } catch {
       return null;
     }
   }
   const legacy = environment.JARVIS_GIT_REVIEW_RECEIPT_SECRET;
-  return legacy ? createGitReviewReceiptAuthority(legacy) : null;
+  return legacy ? Object.assign(createGitReviewReceiptAuthority(legacy), { configuration: "legacy" as const }) : null;
 }
 
 /**
@@ -54,7 +55,7 @@ export async function loadGitReviewReceiptAuthority(options: LoadOptions = {}): 
       const authority = configuredAuthority(values as NodeJS.ProcessEnv);
       if (authority) return authority;
       const secret = values.GIT_REVIEW_RECEIPT_SECRET;
-      return secret ? createGitReviewReceiptAuthority(secret) : null;
+      return secret ? Object.assign(createGitReviewReceiptAuthority(secret), { configuration: "legacy" as const }) : null;
     } catch {
       return null;
     }
@@ -77,8 +78,8 @@ export async function trustedGitReviewReceiptAuthority(): Promise<Authority | nu
 export function resetGitReviewReceiptAuthorityForTest() { cached = null; }
 
 export function repositoryDeliveryReadiness(required: boolean, authority: Authority | null) {
-  return required && !authority
-    ? { ready: false as const, reason: "controller receipt signer unavailable" }
+  return required && authority?.configuration !== "rotating"
+    ? { ready: false as const, reason: "rotating controller receipt signer unavailable" }
     : { ready: true as const };
 }
 
@@ -105,8 +106,8 @@ export async function verifyGitReviewReceiptEnvelope(
 export async function gitReviewReceiptAuthorityHealth(options: LoadOptions = {}) {
   const authority = await loadGitReviewReceiptAuthority(options);
   return {
-    ready: Boolean(authority),
+    ready: authority?.configuration === "rotating",
     // Never reveal source, value, length, digest, or any vault metadata.
-    reason: authority ? "ready" : "controller receipt signer unavailable",
+    reason: authority?.configuration === "rotating" ? "ready" : "rotating controller receipt signer unavailable",
   } as const;
 }

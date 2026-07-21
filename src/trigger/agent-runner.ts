@@ -53,14 +53,10 @@ import {
   SHALLOW_PROVENANCE_RULE,
 } from "../lib/git-delivery";
 import { repairPrompt } from "../lib/repair-prompt";
+import { SAFE_SANDBOX_EXECUTION_RULES } from "../lib/work-safety";
 import {
-  isOwnedRepository,
-  requestsConsequentialAction,
-  SAFE_SANDBOX_EXECUTION_RULES,
-} from "../lib/work-safety";
-import {
-  mergeVerifiedPullRequest,
-  openDeliveryPullRequest,
+  continueRepositoryDelivery,
+  type PullRequestDelivery,
   validatedGoalDeliveryBranch,
 } from "./github-delivery";
 import { wakeAgentFleet } from "../lib/agent-fleet-dispatch";
@@ -487,19 +483,6 @@ function workBranch(job: any): string {
   return `jarvis/${owner}-${label || "work"}-${String(job.jobId).slice(-6)}`;
 }
 
-function autonomousRepositoryDelivery(job: {
-  readonly?: unknown;
-  task?: unknown;
-  deliveryMode?: unknown;
-}, repo: string): boolean {
-  if (!repo || !isOwnedRepository(repo) || job.readonly === true) return false;
-  if (requestsConsequentialAction(String(job.task ?? ""), { repo })) return false;
-  // New jobs persist the policy decision. The fallback makes safe jobs queued
-  // just before this deployment autonomous too, without touching an explicit
-  // manual/protected delivery mode.
-  return job.deliveryMode === "auto_merge" || job.deliveryMode == null;
-}
-
 async function branchHasChanges(repo: string, branch: string, token: string): Promise<boolean | null> {
   const headers = {
     authorization: `Bearer ${token}`,
@@ -871,17 +854,20 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         : (args: Record<string, unknown>) => convexMutation("jobs:checkpointAndRequeue", args);
       const prepareProviderEffect = async (effect: {
         effectId: string; kind: string; headSha: string; baseSha: string; pullRequestNumber?: number;
-      }) => Boolean(await deliveryMutation("jobs:prepareDeliveryEffect", {
+      }, options?: { reconcileOnly?: boolean }) => await deliveryMutation("jobs:prepareDeliveryEffect", {
         jobId: job.jobId, expectedAttempt, effectId: effect.effectId, effectKind: effect.kind,
         reviewedHeadSha: effect.headSha, reviewedBaseSha: effect.baseSha,
-        pullRequestNumber: effect.pullRequestNumber,
-      }));
-      const observeProviderEffect = async (effect: { effectId: string }, observation: "applied" | "not_applied" | "unknown", detail?: { number: number; url: string; headSha: string }) => {
-        await deliveryMutation("jobs:observeDeliveryEffect", {
+        pullRequestNumber: effect.pullRequestNumber, reconcileOnly: options?.reconcileOnly,
+      }) as { replay: boolean; observation?: "applied" | "not_applied" | "unknown" | null } | false;
+      const observeProviderEffect = async (effect: { effectId: string }, observation: "applied" | "not_applied" | "unknown", detail?: PullRequestDelivery) => {
+        const observed = await deliveryMutation("jobs:observeDeliveryEffect", {
           jobId: job.jobId, expectedAttempt, effectId: effect.effectId, observation,
           pullRequestNumber: detail?.number, pullRequestUrl: detail?.url,
-          observedPullRequestHead: detail?.headSha,
+          pullRequestNodeId: detail?.nodeId, pullRequestDraft: detail?.draft,
+          observedPullRequestHead: detail?.headSha, observedPullRequestBase: detail?.baseSha,
+          mergeCommitSha: detail?.mergeCommitSha,
         });
+        if (!observed) throw new Error("controller lease rejected the provider observation");
       };
       try {
         const jobKey = String(job.jobId).replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -983,100 +969,66 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             return;
           }
           if (await stopIfLeaseLost("Delivery lease changed before resume.", String(job.result ?? ""), resumeBranch)) return;
-          await convexMutation("jobs:updateProgress", {
-            jobId: job.jobId,
-            expectedAttempt,
-            progress: "Resuming verified delivery without rerunning the specialist",
-            stage: "delivery",
-            percent: 97,
-          }).catch(() => {});
-          // Read-only receipt completion never calls GitHub.  It is a pure
-          // controller evidence outcome, even if a branch pointer is present.
-          const branchChanged = continuationPolicy === "read_only"
+          const existingPull = Number(job.deliveryPullRequestNumber) > 0
+            && typeof job.deliveryPullRequestUrl === "string"
+            && typeof job.deliveryPullRequestNodeId === "string"
+            && typeof job.deliveryPullRequestDraft === "boolean"
+            && typeof job.deliveryObservedHeadSha === "string"
+            && typeof job.deliveryObservedBaseSha === "string"
+            ? {
+                number: Number(job.deliveryPullRequestNumber), url: job.deliveryPullRequestUrl,
+                nodeId: job.deliveryPullRequestNodeId, draft: job.deliveryPullRequestDraft,
+                headSha: job.deliveryObservedHeadSha, baseSha: job.deliveryObservedBaseSha,
+                ...(typeof job.deliveryMergeCommitSha === "string" ? { mergeCommitSha: job.deliveryMergeCommitSha } : {}),
+              } satisfies PullRequestDelivery
+            : undefined;
+          const terminalOutcomes = new Set(["protected_draft", "read_only_complete", "no_change", "merged"]);
+          const priorTerminal = job.deliveryStep === "receipt" && terminalOutcomes.has(String(job.deliveryOutcome));
+          const reconcileMerge = !priorTerminal && job.deliveryPreparedEffectKind === "merge_pr";
+          const branchChanged = priorTerminal || continuationPolicy === "read_only"
             ? false
-            : resumeBranch ? await branchHasChanges(repo, resumeBranch, token) : null;
-          let pullRequestUrl = typeof job.pullRequestUrl === "string" ? job.pullRequestUrl : "";
-          let pullRequestNumber: number | undefined;
-          let mergeSha = "";
-          let deliveryFailure = branchChanged === null
-            ? "the controller could not compare the verified branch with the default branch"
-            : "";
-          if (branchChanged === true) {
-            if (await stopIfLeaseLost("Delivery lease changed before pull request.", String(job.result ?? ""), resumeBranch)) return;
-            if (!await linearizeDelivery()) return;
-            const title = validatedGoalBranch
-              ? `JARVIS goal: ${(job.label ?? job.task).slice(0, 78)}`
-              : `${profile.name}: ${(job.label ?? job.task).slice(0, 82)}`;
-            const pull = await openDeliveryPullRequest({
-              repo,
-              branch: resumeBranch,
-              title,
-              body: `## JARVIS verified delivery continuation\n${String(job.result ?? "Supervisor verification passed.")}`,
-              token,
-              draft: continuationPolicy !== "auto_merge",
-              reviewed: {
-                headSha: continuationReview.envelope.receipt.headSha,
-                baseSha: continuationReview.envelope.receipt.baseSha,
-              },
-              prepareEffect: prepareProviderEffect,
-              observeEffect: observeProviderEffect,
-            });
-            pullRequestUrl = pull?.url ?? pullRequestUrl;
-            pullRequestNumber = pull?.number;
-            if (!pull) {
-              deliveryFailure = "the controller could not open or recover the verified pull request";
-            } else {
-              await deliveryMutation("jobs:setDelivery", {
-                jobId: job.jobId,
-                expectedAttempt,
-                branch: resumeBranch,
-                pullRequestUrl: pull.url,
-                deliveryStatus: "pull_request",
-                observedPullRequestHead: pull.headSha,
-                observedPullRequestBase: continuationReview.envelope.receipt.baseSha,
-                pullRequestNumber: pull.number,
-                pullRequestDraft: continuationPolicy === "manual",
-                providerCall: true,
-              }).catch(() => {});
-              if (continuationPolicy === "manual") {
-                // A manual delivery is deliberately terminal after creating a
-                // protected draft.  Retries may recover that same draft but
-                // must never promote or merge it.
-              } else if (!await linearizeDelivery()) return;
-              const merge = continuationPolicy === "manual"
-                ? { status: "pending" as const, note: "protected draft PR ready for Daniel" }
-                : await mergeVerifiedPullRequest({
-                repo,
-                pull,
-                title,
-                token,
-                reviewedHeadSha: continuationReview.envelope.receipt.headSha,
-                reviewedBaseSha: continuationReview.envelope.receipt.baseSha,
-                shouldContinue: async () => (await executionStatus()) === "running" && await linearizeDelivery(),
-                prepareEffect: prepareProviderEffect,
-                observeEffect: observeProviderEffect,
-              });
-              if (continuationPolicy === "manual") {
-                // The setDelivery write below records pull_request, then the
-                // receipt-backed finalize records the protected-draft result.
-              } else if (merge.status === "merged") mergeSha = merge.sha;
-              else deliveryFailure = merge.note;
-            }
-          }
-          if (deliveryFailure) {
-            const staleReview = /fresh review|required|reviewed (?:source|head|base)|exact (?:draft|effect)/i.test(deliveryFailure);
+            : reconcileMerge ? false
+              : resumeBranch ? await branchHasChanges(repo, resumeBranch, token) : null;
+          const title = validatedGoalBranch
+            ? `JARVIS goal: ${(job.label ?? job.task).slice(0, 78)}`
+            : `${profile.name}: ${(job.label ?? job.task).slice(0, 82)}`;
+          const delivery = priorTerminal
+            ? {
+                ok: true as const, outcome: job.deliveryOutcome as "protected_draft" | "read_only_complete" | "no_change" | "merged",
+                deliveryStatus: job.deliveryOutcome === "protected_draft" ? "pull_request" as const
+                  : job.deliveryOutcome === "merged" ? "merged" as const : "branch" as const,
+                providerCall: ["protected_draft", "merged"].includes(String(job.deliveryOutcome)),
+                pull: existingPull, mergeCommitSha: typeof job.deliveryMergeCommitSha === "string" ? job.deliveryMergeCommitSha : undefined,
+              }
+            : branchChanged === null
+              ? { ok: false as const, note: "the controller could not compare the verified branch with the default branch" }
+              : await continueRepositoryDelivery({
+                  policy: continuationPolicy as "manual" | "read_only" | "auto_merge",
+                  branchChanged, reconcileMerge, repo, branch: resumeBranch, title,
+                  body: `## JARVIS verified delivery continuation\n${String(job.result ?? "Supervisor verification passed.")}`,
+                  token: String(token ?? ""),
+                  reviewed: {
+                    headSha: continuationReview.envelope.receipt.headSha,
+                    baseSha: continuationReview.envelope.receipt.baseSha,
+                  },
+                  expectedPull: existingPull,
+                  shouldContinue: async () => (await executionStatus()) === "running" && await linearizeDelivery(),
+                  prepareEffect: prepareProviderEffect,
+                  observeEffect: observeProviderEffect,
+                });
+          if (!delivery.ok) {
+            const staleReview = /fresh review|required|reviewed|exact|identity changed|matching prepared/i.test(delivery.note);
             const staleRecorded = await deliveryMutation("jobs:setDelivery", {
               jobId: job.jobId,
               expectedAttempt,
               branch: resumeBranch,
-              pullRequestUrl: pullRequestUrl || undefined,
               deliveryStatus: "blocked",
               outcome: staleReview ? "needs_attention" : undefined,
             }).catch(() => {});
             if (staleReview && staleRecorded) {
               await deliveryMutation("jobs:finalize", {
                 jobId: job.jobId, expectedAttempt, status: "error",
-                result: `Verified repository review became stale: ${deliveryFailure}`.slice(0, 4_000),
+                result: `Verified repository review became stale: ${delivery.note}`.slice(0, 4_000),
               }).catch(() => false);
               if (job.goalStage) await drainGoalAdvances();
               else if (job.missionId) await maybeSynthesizeMission(job.missionId);
@@ -1085,38 +1037,31 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             await deliveryMutation("jobs:checkpointAndRequeue", {
               jobId: job.jobId,
               expectedAttempt,
-              checkpoint: `Supervisor verification is already complete. Resume controller delivery only; do not rerun the specialist.\n\n${deliveryFailure}`,
+              checkpoint: `Supervisor verification is already complete. Resume controller delivery only; do not rerun the specialist.\n\n${delivery.note}`,
               result: String(job.result ?? "").slice(0, 4_000),
               branch: resumeBranch,
               delayMs: 30_000,
             }).catch(() => null);
             return;
           }
-          const protectedDraft = continuationPolicy === "manual";
-          const readOnlyDelivery = continuationPolicy === "read_only";
-          const noChange = !readOnlyDelivery && branchChanged === false;
-          const outcome = readOnlyDelivery
-            ? "read_only_complete"
-            : noChange
-              ? "no_change"
-              : protectedDraft
-                ? "protected_draft"
-                : "integrated_default_branch";
-          const recorded = await deliveryMutation("jobs:setDelivery", {
-            jobId: job.jobId,
-            expectedAttempt,
-            branch: resumeBranch,
-            pullRequestUrl: pullRequestUrl || undefined,
-            deliveryStatus: protectedDraft ? "pull_request" : readOnlyDelivery || noChange ? "branch" : "merged",
-            mergeCommitSha: mergeSha || undefined,
-            observedPullRequestHead: readOnlyDelivery ? undefined : continuationReview.envelope.receipt.headSha,
-            observedPullRequestBase: readOnlyDelivery ? undefined : continuationReview.envelope.receipt.baseSha,
-            pullRequestNumber,
-            pullRequestDraft: protectedDraft ? true : undefined,
-            outcome,
-            providerCall: branchChanged === true,
-          }).catch(() => false);
-          if (!recorded) throw new Error("verified delivery completed but its durable receipt could not be recorded");
+          if (!priorTerminal) {
+            const recorded = await deliveryMutation("jobs:setDelivery", {
+              jobId: job.jobId, expectedAttempt, branch: resumeBranch,
+              pullRequestUrl: delivery.pull?.url, deliveryStatus: delivery.deliveryStatus,
+              mergeCommitSha: delivery.mergeCommitSha,
+              observedPullRequestHead: delivery.pull?.headSha,
+              observedPullRequestBase: delivery.pull?.baseSha,
+              pullRequestNumber: delivery.pull?.number,
+              pullRequestNodeId: delivery.pull?.nodeId,
+              pullRequestDraft: delivery.pull?.draft,
+              outcome: delivery.outcome, providerCall: delivery.providerCall,
+            }).catch(() => false);
+            if (!recorded) throw new Error("verified delivery completed but its durable receipt could not be recorded");
+          }
+          const protectedDraft = delivery.outcome === "protected_draft";
+          const readOnlyDelivery = delivery.outcome === "read_only_complete";
+          const pullRequestUrl = delivery.pull?.url ?? "";
+          const mergeSha = delivery.mergeCommitSha ?? "";
           const deliveryResult = [
             String(job.result ?? "Supervisor verification passed."),
             protectedDraft
@@ -1345,7 +1290,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         let pushFailed = false;
         let deliveryRetry = false;
         let deliveryDiffStat = "";
-        let changed = false;
         if (repoDir && token && branch && !job.readonly) {
           const deliveryDir = repoDir;
           const pushUrl = githubRepoUrl(repo);
@@ -1423,7 +1367,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }
           if (!pushFailed && !deliveryRetry) {
             const compared = await branchHasChanges(repo, branch, token);
-            changed = compared ?? (needsPush || Boolean(remote && job.branch));
+            const changed = compared ?? (needsPush || Boolean(remote && job.branch));
             if (!changed && needsPush) pushNote = "branch matches the repository default after verification";
           }
         }
@@ -1513,10 +1457,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         }
 
         if (job.goalStage === "planning" || job.goalStage === "validating") {
-          let validation: ReturnType<typeof parseGoalValidation> | null = null;
           try {
             if (job.goalStage === "planning") parseGoalPlan(result, 8);
-            else validation = parseGoalValidation(result);
+            else parseGoalValidation(result);
           } catch (error) {
             await convexMutation("jobs:checkpointAndRequeue", {
               jobId: job.jobId,
@@ -1532,7 +1475,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }
           let goalReview: { envelope: GitReviewEnvelope; binding: GitReviewBinding } | undefined;
           if (repoDir) {
-            if (!receiptAuthority) {
+            if (!receiptAuthority || !repositoryDeliveryReadiness(true, receiptAuthority).ready) {
               await convexMutation("jobs:checkpointAndRequeue", {
                 jobId: job.jobId, expectedAttempt,
                 checkpoint: "Repository completion is held: the trusted controller receipt authority is unavailable. Do not rerun the specialist.",
@@ -1569,147 +1512,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }
             return;
           }
-          let goalDeliveryNote = "";
-          let goalPullRequestUrl = typeof job.pullRequestUrl === "string" ? job.pullRequestUrl : undefined;
-          const goalBranch = validatedGoalDeliveryBranch(job);
-          const goalNeedsControllerDelivery = Boolean(
-            job.goalStage === "validating"
-            && validation?.verdict === "pass"
-            && repo
-            && goalBranch
-            && token
-            && isOwnedRepository(repo)
-          );
-          if (goalNeedsControllerDelivery && job.deliveryStatus !== "merged" && !goalReview) {
-            const persisted = await deliveryMutation("jobs:markVerifiedForDelivery", {
-              jobId: job.jobId,
-              expectedAttempt, specialistRunId: String(job.workerRunId),
-              result: result.slice(0, 4_000),
-              verificationNote: "Deep validation machine contract passed before controller delivery",
-              ...completionEvidence(result.slice(0, 4_000), "Deep validation machine contract passed before controller delivery"),
-            }).catch(() => false);
-            if (!persisted) {
-              await convexMutation("jobs:checkpointAndRequeue", {
-                jobId: job.jobId,
-                expectedAttempt,
-                checkpoint: `Final validation passed, but its durable delivery receipt could not be stored. Preserve the validation and retry safely.\n\n${result}`.slice(0, 6_000),
-                result: result.slice(0, 4_000),
-                branch: goalBranch,
-                delayMs: 30_000,
-              }).catch(() => null);
-              return;
-            }
-            return;
-          }
-          const goalBranchComparison = job.deliveryStatus === "merged" ? false : (
-            goalNeedsControllerDelivery
-          ) ? await branchHasChanges(repo, goalBranch, token) : false;
-          if (goalBranchComparison === null) {
-            await deliveryMutation("jobs:setDelivery", {
-              jobId: job.jobId,
-              expectedAttempt,
-              branch: goalBranch,
-              pullRequestUrl: goalPullRequestUrl,
-              deliveryStatus: "blocked",
-            }).catch(() => {});
-            await convexMutation("jobs:checkpointAndRequeue", {
-              jobId: job.jobId,
-              expectedAttempt,
-              checkpoint: `Final validation passed, but the delivery controller could not verify the shared branch against the default branch. Preserve the validation and retry delivery only.\n\n${result}`.slice(0, 6_000),
-              result: result.slice(0, 4_000),
-              branch: goalBranch,
-              delayMs: 30_000,
-            }).catch(() => null);
-            return;
-          }
-          if (
-            goalBranchComparison === true
-            && repo
-            && token
-          ) {
-            if (await stopIfLeaseLost("Delivery lease changed before goal pull request.", result, goalBranch)) return;
-            if (!await linearizeDelivery()) return;
-            await convexMutation("jobs:updateProgress", {
-              jobId: job.jobId,
-              expectedAttempt,
-              progress: "Final validation passed — delivering the goal branch",
-              stage: "delivery",
-              percent: 97,
-            }).catch(() => {});
-            const pull = await openDeliveryPullRequest({
-              repo,
-              branch: goalBranch,
-              title: `JARVIS goal: ${(job.label ?? job.task).slice(0, 78)}`,
-              body: `## Goal Mode final validation\n${result}`,
-              token,
-              reviewed: goalReview ? {
-                headSha: goalReview.envelope.receipt.headSha,
-                baseSha: goalReview.envelope.receipt.baseSha,
-              } : undefined,
-            });
-            goalPullRequestUrl = pull?.url;
-            if (pull) {
-              await deliveryMutation("jobs:setDelivery", {
-                jobId: job.jobId,
-                expectedAttempt,
-                branch: goalBranch,
-                pullRequestUrl: pull.url,
-                deliveryStatus: "pull_request",
-              }).catch(() => {});
-            }
-            if (pull && !await linearizeDelivery()) return;
-            const merge = pull
-              ? await mergeVerifiedPullRequest({
-                  repo,
-                  pull,
-                  title: `JARVIS goal: ${(job.label ?? job.task).slice(0, 78)}`,
-                  token,
-                  reviewedHeadSha: goalReview?.envelope.receipt.headSha,
-                  reviewedBaseSha: goalReview?.envelope.receipt.baseSha,
-                  shouldContinue: async () => (await executionStatus()) === "running",
-                })
-              : { status: "blocked" as const, note: "the delivery controller could not open the goal pull request" };
-            if (merge.status !== "merged") {
-              await deliveryMutation("jobs:setDelivery", {
-                jobId: job.jobId,
-                expectedAttempt,
-                branch: goalBranch,
-                pullRequestUrl: pull?.url,
-                deliveryStatus: "blocked",
-              }).catch(() => {});
-              await convexMutation("jobs:checkpointAndRequeue", {
-                jobId: job.jobId,
-                expectedAttempt,
-                checkpoint: `Final validation passed. Do not redo completed implementation. Re-check the goal branch and delivery controller state, then retry verified delivery.\n\n${merge.note}\n\n${result}`.slice(0, 6_000),
-                result: result.slice(0, 4_000),
-                branch: goalBranch,
-                delayMs: 30_000,
-              }).catch(() => null);
-              return;
-            }
-            goalDeliveryNote = `\n\nDelivery: merged ${pull?.url ?? goalBranch}${merge.sha ? ` at ${merge.sha}` : ""}.`;
-            const recorded = await deliveryMutation("jobs:setDelivery", {
-              jobId: job.jobId,
-              expectedAttempt,
-              branch: goalBranch,
-              pullRequestUrl: pull?.url,
-              deliveryStatus: "merged",
-              mergeCommitSha: merge.sha,
-            }).catch(() => false);
-            if (!recorded) throw new Error("goal branch merged but its durable delivery receipt could not be recorded");
-          } else if (job.deliveryStatus === "merged") {
-            goalDeliveryNote = `\n\nDelivery: the validated goal branch is already merged${goalPullRequestUrl ? ` via ${goalPullRequestUrl}` : ""}.`;
-          } else if (goalBranchComparison === false && goalPullRequestUrl && repo && goalBranch) {
-            goalDeliveryNote = `\n\nDelivery: the validated goal branch already matches the default branch via ${goalPullRequestUrl}.`;
-            const recorded = await deliveryMutation("jobs:setDelivery", {
-              jobId: job.jobId,
-              expectedAttempt,
-              branch: goalBranch,
-              pullRequestUrl: goalPullRequestUrl,
-              deliveryStatus: "merged",
-            }).catch(() => false);
-            if (!recorded) throw new Error("goal branch is delivered but its durable receipt could not be recorded");
-          }
+          // Repository-backed goal validation returned immediately after the
+          // immutable receipt above. Only non-repository goal work reaches this
+          // direct finalization path.
+          const goalDeliveryNote = "";
+          const goalPullRequestUrl = undefined;
           const finalized = await deliveryMutation("jobs:finalize", {
             jobId: job.jobId,
             expectedAttempt,
@@ -1730,7 +1537,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const reviewEvidence = cumulativeWorkEvidence(job.checkpoint, result);
         let gitReview: { envelope: GitReviewEnvelope; binding: GitReviewBinding } | undefined;
         if (repoDir) {
-          if (!receiptAuthority) {
+          if (!receiptAuthority || !repositoryDeliveryReadiness(true, receiptAuthority).ready) {
             await convexMutation("jobs:checkpointAndRequeue", {
               jobId: job.jobId, expectedAttempt,
               checkpoint: "Repository delivery is held: the controller receipt signer is unavailable. Do not rerun the specialist.",
@@ -1920,104 +1727,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           return;
         }
 
-        let pullRequestUrl: string | null = null;
-        let deliveryBlocked: string | null = null;
-        // Goal Mode deliberately accumulates building/refinement sessions on
-        // one shared branch. Its final Sol validator owns the single merge;
-        // ordinary verified repository jobs deliver immediately here.
-        if (changed && repo && branch && token && !["building", "refining"].includes(String(job.goalStage ?? ""))) {
-          if (await stopIfLeaseLost(`Delivery interrupted.\n\n${continuationCheckpoint}`, result, branch)) return;
-          const autonomous = autonomousRepositoryDelivery(job, repo);
-          const title = `${profile.name}: ${(job.label ?? job.task).slice(0, 82)}`;
-          const verificationPersisted = !autonomous || await deliveryMutation("jobs:markVerifiedForDelivery", {
-            jobId: job.jobId,
-            expectedAttempt, specialistRunId: String(job.workerRunId),
-            result: result.slice(0, 4_000),
-            verificationNote: verify.note || "Supervisor check passed before controller delivery",
-            ...completionEvidence(result.slice(0, 4_000), verify.note || "Supervisor check passed before controller delivery", gitReview),
-          }).catch(() => false);
-          if (!verificationPersisted) {
-            deliveryBlocked = "the supervisor verdict could not be stored before delivery";
-          }
-          if (verificationPersisted && await stopIfLeaseLost(`Delivery lease changed before pull request.\n\n${continuationCheckpoint}`, result, branch)) return;
-          if (verificationPersisted && !await linearizeDelivery()) return;
-          const pull = verificationPersisted
-            ? await openDeliveryPullRequest({
-                repo,
-                branch,
-                title,
-                body: `## JARVIS work order\n${job.task}\n\n## Acceptance criteria\n${criteria.map((item: string) => `- ${item}`).join("\n")}\n\n## Agent evidence\n${result}`,
-                token,
-                draft: !autonomous,
-                reviewed: gitReview ? {
-                  headSha: gitReview.envelope.receipt.headSha,
-                  baseSha: gitReview.envelope.receipt.baseSha,
-                } : undefined,
-              })
-            : null;
-          pullRequestUrl = pull?.url ?? null;
-          await deliveryMutation("jobs:setDelivery", {
-            jobId: job.jobId,
-            expectedAttempt,
-            branch,
-            pullRequestUrl: pullRequestUrl ?? undefined,
-            deliveryStatus: pull ? "pull_request" : "blocked",
-          }).catch(() => {});
-          if (!pull) {
-            deliveryBlocked ??= "the delivery controller could not open a pull request";
-          } else if (autonomous) {
-            if (!await linearizeDelivery()) return;
-            const merged = await mergeVerifiedPullRequest({
-              repo,
-              pull,
-              title,
-              token,
-              reviewedHeadSha: gitReview?.envelope.receipt.headSha,
-              reviewedBaseSha: gitReview?.envelope.receipt.baseSha,
-              shouldContinue: async () => (await executionStatus()) === "running",
-            });
-            if (merged.status === "merged") {
-              const recorded = await deliveryMutation("jobs:setDelivery", {
-                jobId: job.jobId,
-                expectedAttempt,
-                branch,
-                pullRequestUrl: pull.url,
-                deliveryStatus: "merged",
-                mergeCommitSha: merged.sha,
-              }).catch(() => false);
-              if (!recorded) throw new Error("verified branch merged but its durable delivery receipt could not be recorded");
-              pushNote = `verified PR merged automatically: ${pull.url}${merged.sha ? ` · ${merged.sha}` : ""}`;
-            } else {
-              deliveryBlocked = merged.note;
-              await deliveryMutation("jobs:setDelivery", {
-                jobId: job.jobId,
-                expectedAttempt,
-                branch,
-                pullRequestUrl: pull.url,
-                deliveryStatus: "blocked",
-              }).catch(() => {});
-            }
-          } else {
-            pushNote = `protected draft PR ready: ${pull.url}`;
-          }
-        }
-        if (deliveryBlocked) {
-          const continuation = await convexMutation("jobs:checkpointAndRequeue", {
-            jobId: job.jobId,
-            expectedAttempt,
-            checkpoint: [
-              "Implementation and supervisor verification are complete. Do not restart discovery or discard the branch.",
-              `Automatic delivery is waiting on: ${deliveryBlocked}`,
-              pullRequestUrl ? `Pull request: ${pullRequestUrl}` : "",
-              continuationCheckpoint,
-            ].filter(Boolean).join("\n\n").slice(0, 6_000),
-            result: result.slice(0, 4_000),
-            branch,
-            delayMs: 30_000,
-          }).catch(() => null);
-          if (!continuation?.requeued && job.missionId) await maybeSynthesizeMission(job.missionId).catch(() => {});
-          return;
-        }
+        // All repository jobs returned at markVerifiedForDelivery. This path is
+        // intentionally non-repository only and cannot perform provider work.
+        const pullRequestUrl: string | null = null;
         const deliveryResult = `${result}${pushNote ? `\n\nDelivery: ${pushNote}` : ""}`;
         if (await stopIfLeaseLost(`Finalization interrupted.\n\n${continuationCheckpoint}`, deliveryResult, branch)) return;
         if (!await linearizeDelivery()) return;
