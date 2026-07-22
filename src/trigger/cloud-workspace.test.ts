@@ -169,6 +169,30 @@ describe("fail-closed cloud workspace boundary", () => {
     expect(provider.calls).toContain("terminate:terminal");
   });
 
+  it.each([
+    ["post-create lease loss", "lease"],
+    ["durable binding rejection", "binding"],
+    ["preparation failure", "preparation"],
+  ] as const)("surfaces cleanup_blocked with bounded workspace evidence after %s", async (_label, branch) => {
+    const provider = new FakeCloudWorkspaceProvider();
+    if (branch === "preparation") {
+      vi.spyOn(provider, "uploadCredentiallessArchive").mockRejectedValue(new Error("upload rejected"));
+    }
+    const terminate = vi.spyOn(provider, "terminate").mockRejectedValue(new Error("termination rejected"));
+    const failure = await prepareCloudWorkspaceExecution({
+      providerFactory: () => provider,
+      hydrateArchive: async () => archive([{ name: "safe.txt", data: new TextEncoder().encode("safe") }]),
+      attemptKey: `prepare-${branch}:1`, template: "node", runtime: "node-22", lockfileDigest: LOCK,
+      assertCurrent: async (phase) => branch !== "lease" || phase !== "workspace_binding",
+      bindWorkspace: async () => branch !== "binding",
+    }).catch((error) => error);
+    const [workspace, reason] = terminate.mock.calls[0]!;
+    expect(failure).toMatchObject({ provider: provider.name, code: "cleanup_blocked", disposition: "blocked" });
+    expect(failure.message).toContain(workspace.providerWorkspaceId);
+    expect(failure.message.length).toBeLessThan(240);
+    expect(reason).toBe(branch === "preparation" ? "terminal" : "orphan");
+  });
+
   it("never projects controller secrets or caller env into sandbox execution", async () => {
     const provider = new FakeCloudWorkspaceProvider();
     const workspace = await provider.createWorkspace({ attemptKey: "job:1", template: "node", runtime: "node-22", lockfileDigest: "b".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS });
@@ -280,6 +304,30 @@ describe("fail-closed cloud workspace boundary", () => {
     expect(second.byteCount).toBe(fixture.stored.byteCount);
     expect(second.digest).toBe(fixture.stored.digest);
     expect(second.canonicalManifest).not.toContain("checkpointRef");
+  });
+
+  it.each([
+    ["terminal identity reuse", "identity"],
+    ["replay lease rejection", "lease"],
+    ["replay durable binding rejection", "binding"],
+  ] as const)("surfaces cleanup_blocked with bounded workspace evidence after %s", async (_label, branch) => {
+    const fixture = await storedCheckpointFixture();
+    if (branch === "identity") {
+      vi.spyOn(fixture.provider, "recreateFromCheckpoint").mockResolvedValue(fixture.first);
+    }
+    const terminate = vi.spyOn(fixture.provider, "terminate").mockRejectedValue(new Error("termination rejected"));
+    const bindWorkspace = vi.fn(async () => branch !== "binding");
+    const failure = await replayCloudWorkspaceExecution({
+      provider: fixture.provider, store: fixture.store, receipt: fixture.receipt, current: fixture.current,
+      assertCurrent: async (phase) => branch !== "lease" || phase !== "replay_binding",
+      bindWorkspace,
+    }).catch((error) => error);
+    const [workspace, reason] = terminate.mock.calls[0]!;
+    expect(failure).toMatchObject({ provider: fixture.provider.name, code: "cleanup_blocked", disposition: "blocked" });
+    expect(failure.message).toContain(workspace.providerWorkspaceId);
+    expect(failure.message.length).toBeLessThan(240);
+    expect(reason).toBe("orphan");
+    expect(bindWorkspace).toHaveBeenCalledTimes(branch === "binding" ? 1 : 0);
   });
 
   it.each([
