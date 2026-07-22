@@ -11,6 +11,7 @@ import {
 import {
   GENERATED_DIRECT_ACTION_MATRIX,
   GENERATED_GATED_ACTION_MATRIX,
+  HOW_SCOPE_DIRECT_ACTION_FIXTURES,
   REPRODUCED_MIXED_ACTION_EXPLOITS,
   SAFE_ANALYTICAL_ACTION_FIXTURES,
 } from "./fixtures/action-scope-regressions";
@@ -501,6 +502,31 @@ describe("server-side work approval policy", () => {
         required: false,
         deliveryMode: "auto_merge",
       });
+    }
+  });
+
+  it("resets how-scoped analysis at every direct-action boundary", () => {
+    const repo = "daniels-project-space/jarvis";
+    expect(HOW_SCOPE_DIRECT_ACTION_FIXTURES).toHaveLength(9);
+    for (const task of HOW_SCOPE_DIRECT_ACTION_FIXTURES) {
+      expect(classifyWorkSafety(task, { repo }).approvalRequired, `classifier: ${task}`).toBe(true);
+      expect(workApprovalPolicy({
+        task,
+        repo,
+        readonly: true,
+        risk: "low",
+        approvalRequired: false,
+      }).required, `standalone: ${task}`).toBe(true);
+      for (const goalStage of ["building", "refining"] as const) {
+        expect(goalWorkApprovalPolicy({
+          task,
+          repo,
+          readonly: true,
+          risk: "low",
+          approvalRequired: false,
+          goalStage,
+        }).required, `${goalStage}: ${task}`).toBe(true);
+      }
     }
   });
 

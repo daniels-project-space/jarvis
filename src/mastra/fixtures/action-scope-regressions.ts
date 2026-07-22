@@ -59,4 +59,17 @@ export const SAFE_ANALYTICAL_ACTION_FIXTURES = [
   "Audit whether a worker can send a tenant reply without actually sending it.",
   "Inspect the fake-provider trace for an attempted exact-name delete.",
   "Test Sandbox.get({ resume: false }); if it exists, exact-name delete it.",
+  "Investigate how the fake sandbox can delete its exact generated attempt without a live provider call.",
+] as const;
+
+export const HOW_SCOPE_DIRECT_ACTION_FIXTURES = [
+  "Investigate how the worker can send replies, send the tenant reply.",
+  "Investigate how the worker can send replies: send the tenant reply.",
+  "Investigate how the worker can send replies — send the tenant reply.",
+  "Investigate how the worker can send replies – send the tenant reply.",
+  "Investigate how the worker can send replies; send the tenant reply.",
+  "Investigate how the worker can send replies\nsend the tenant reply.",
+  "Investigate how the worker can send replies then send the tenant reply.",
+  "Investigate how the worker can send replies and then send the tenant reply.",
+  "Investigate how the worker can send replies but send the tenant reply.",
 ] as const;

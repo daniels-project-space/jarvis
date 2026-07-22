@@ -130,7 +130,7 @@ export type WorkSafetyDecision = {
 const ANALYTICAL_ACTION_SCOPE_BOUNDARY = /[,:–—]/g;
 
 const ANALYTICAL_RELATIVE_ACTION_SCOPE =
-  /^(?:(?:please\s+)?(?:research|investigate|inspect|audit|review|analyse|analyze|compare|summari[sz]e|report|recommend|brainstorm|plan|draft|design|draw|illustrat|write|explain|calculate|model|prototype|test|verify|locate|list)\b[^,:–—]*\b)?(?:that|which|where)\b[^,:–—]*?(?:(?:can|could|may|might|would|will|does|do)\s+)?$/i;
+  /^(?:(?:please\s+)?(?:research|investigate|inspect|audit|review|analyse|analyze|compare|summari[sz]e|report|recommend|brainstorm|plan|draft|design|draw|illustrat|write|explain|calculate|model|prototype|test|verify|locate|list)\b[^,:–—]*\b)?(?:that|which|where|how)\b[^,:–—]*?(?:(?:can|could|may|might|would|will|does|do)\s+)?$/i;
 
 const ANALYTICAL_NOMINAL_ACTION_SCOPE =
   /^(?:please\s+)?(?:research|investigate|inspect|audit|review|analyse|analyze|compare|summari[sz]e|report|recommend|brainstorm|plan|draft|design|draw|illustrat|write|explain|calculate|model|prototype|test|verify|locate|list)\b[^,:–—]*\b(?:ability|capability|permission|path|trace)\b[^,:–—]*\bto\s*$/i;
