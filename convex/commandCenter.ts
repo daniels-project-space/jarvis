@@ -25,6 +25,14 @@ type PlanNodeRow = Record<string, any>;
 type PlanEdgeRow = Record<string, any>;
 type HandoffRow = Record<string, any>;
 
+type CompactTruth = {
+  nodes: PlanNodeRow[];
+  edges: PlanEdgeRow[];
+  activities: RuntimeRow[];
+  handoffs: HandoffRow[];
+  warnings: string[];
+};
+
 export function isUserRelevantWork(row: RuntimeRow, threadId: string): boolean {
   if (!RELEVANT.has(String(row.status ?? ""))) return false;
   if (row.visibility !== "conversation" || row.originThreadId !== threadId) return false;
@@ -138,6 +146,96 @@ function mergeState(row: RuntimeRow): string {
   return row.readonly ? "evidence only" : "not started";
 }
 
+function duplicateKeys(rows: readonly Record<string, any>[], key: (row: Record<string, any>) => string) {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    const value = key(row);
+    counts.set(value, (counts.get(value) ?? 0) + 1);
+  }
+  return new Set([...counts].filter(([, count]) => count > 1).map(([value]) => value));
+}
+
+function boundedWarning(warnings: string[], message: string) {
+  if (!warnings.includes(message) && warnings.length < 4) warnings.push(message);
+}
+
+/**
+ * Indexed reads can observe a partial historical repair. Do not pick an
+ * arbitrary winner when two rows claim the same durable identity: omit the
+ * ambiguous record, retain a compact warning, and wait for the controller to
+ * reconcile it. This prevents a duplicate card or a fabricated handoff.
+ */
+function compactGoalTruth(input: {
+  mission?: RuntimeRow | null;
+  nodes: PlanNodeRow[];
+  edges: PlanEdgeRow[];
+  handoffs: HandoffRow[];
+  activities: RuntimeRow[];
+}): CompactTruth {
+  const warnings: string[] = [];
+  const planDigest = input.mission?.planDigest;
+  const bound = <T extends Record<string, any>>(rows: T[], label: string, allowLegacyActivity = false) => {
+    if (!planDigest) return rows;
+    const accepted = rows.filter((row) => row.planDigest === planDigest || (allowLegacyActivity && !row.planDigest));
+    if (accepted.length !== rows.length) boundedWarning(warnings, `Ignored stale ${label} outside the accepted plan`);
+    return accepted;
+  };
+
+  const candidateNodes = bound(input.nodes, "node bindings");
+  const duplicateNodeIds = duplicateKeys(candidateNodes, (row) => String(row.nodeId));
+  const duplicateNodeJobs = duplicateKeys(candidateNodes, (row) => String(row.jobId));
+  if (duplicateNodeIds.size || duplicateNodeJobs.size) boundedWarning(warnings, "Conflicting plan-node bindings need controller reconciliation");
+  const nodes = candidateNodes.filter((node) => !duplicateNodeIds.has(String(node.nodeId)) && !duplicateNodeJobs.has(String(node.jobId)));
+  const nodeById = new Map(nodes.map((node) => [String(node.nodeId), node]));
+  const nodeByJob = new Map(nodes.map((node) => [String(node.jobId), node]));
+
+  const candidateEdges = bound(input.edges, "dependency edges").filter((edge) => {
+    const source = nodeById.get(String(edge.sourceNodeId));
+    const target = nodeById.get(String(edge.targetNodeId));
+    const valid = source && target && String(source.jobId) === String(edge.sourceJobId) && String(target.jobId) === String(edge.targetJobId);
+    if (!valid) boundedWarning(warnings, "Ignored dependency edge outside the accepted node bindings");
+    return Boolean(valid);
+  });
+  const duplicateEdges = duplicateKeys(candidateEdges, (edge) => `${edge.sourceNodeId}->${edge.targetNodeId}`);
+  if (duplicateEdges.size) boundedWarning(warnings, "Conflicting dependency edges need controller reconciliation");
+  const edges = candidateEdges.filter((edge) => !duplicateEdges.has(`${edge.sourceNodeId}->${edge.targetNodeId}`));
+
+  // Runtime rows predate immutable plan bindings, so a legacy activity can
+  // remain visible; normalized plan rows, edges, and handoffs never get that
+  // exception.
+  const candidateActivities = bound(input.activities, "work activity", true);
+  const duplicateActivities = duplicateKeys(candidateActivities, (row) => String(row.jobId));
+  if (duplicateActivities.size) boundedWarning(warnings, "Conflicting work activity needs controller reconciliation");
+  const activities = candidateActivities.filter((row) => !duplicateActivities.has(String(row.jobId)));
+  const activityByJob = new Map(activities.map((row) => [String(row.jobId), row]));
+
+  const candidateHandoffs = bound(input.handoffs, "handoff receipts").filter((handoff) => {
+    const node = nodeById.get(String(handoff.sourceNodeId));
+    const activity = activityByJob.get(String(handoff.sourceJobId));
+    const valid = node && activity
+      && String(node.jobId) === String(handoff.sourceJobId)
+      && Number(handoff.sourceAttempt) === Number(activity.attempt ?? 1)
+      && Number(handoff.sourceSteerRevision) === Number(activity.steerRevision ?? 0);
+    if (!valid) boundedWarning(warnings, "Ignored receipt not bound to the current node attempt");
+    return Boolean(valid);
+  });
+  const duplicateHandoffs = duplicateKeys(candidateHandoffs, (handoff) => String(handoff.sourceJobId));
+  if (duplicateHandoffs.size) boundedWarning(warnings, "Conflicting handoff receipts need controller reconciliation");
+  const handoffs = candidateHandoffs.filter((handoff) => !duplicateHandoffs.has(String(handoff.sourceJobId)));
+
+  return { nodes, edges, activities, handoffs, warnings };
+}
+
+function decisionTruth(row: RuntimeRow) {
+  const status = String(row.status ?? "");
+  if (status === "awaiting_approval") return { kind: "approval" as const, detail: "Approval is required before this consequential work can continue" };
+  if (status === "needs_input") return { kind: "input" as const, detail: String(row.stallReason ?? row.progress ?? "JARVIS needs a decision").slice(0, 180) };
+  if (status === "stalled" || status === "error" || /\b(?:blocked|failed|conflict)\b/i.test(`${row.stage ?? ""} ${row.integrationState ?? ""}`)) {
+    return { kind: "blocked" as const, detail: String(row.stallReason ?? row.progress ?? row.stage ?? "Work is blocked").slice(0, 180) };
+  }
+  return { kind: "none" as const, detail: null };
+}
+
 export function buildFleetSnapshot(input: {
   threadId: string;
   activeRows: RuntimeRow[];
@@ -151,17 +249,24 @@ export function buildFleetSnapshot(input: {
   const primary = relevant[0];
   if (!primary) return { active: null, fleet: null };
 
-  const rawNodes = input.nodes?.length
-    ? [...input.nodes]
-    : (input.activities?.length ? input.activities : relevant).slice(0, FLEET_MAX_NODES).map((row) => ({
+  const truth = input.nodes?.length || input.edges?.length || input.handoffs?.length || input.activities?.length
+    ? compactGoalTruth({ mission: input.mission, nodes: input.nodes ?? [], edges: input.edges ?? [], handoffs: input.handoffs ?? [], activities: input.activities ?? [] })
+    : { nodes: [], edges: [], handoffs: [], activities: [], warnings: [] };
+  // Once a persisted plan projection was supplied, an empty validated result
+  // is meaningful: do not fall back to arbitrary active jobs after rejecting
+  // conflicting bindings.
+  const hasPersistedPlanProjection = Boolean(input.nodes?.length || input.edges?.length || input.handoffs?.length);
+  const rawNodes = hasPersistedPlanProjection
+    ? [...truth.nodes]
+    : (truth.activities.length ? truth.activities : relevant).slice(0, FLEET_MAX_NODES).map((row) => ({
         nodeId: String(row.planNodeId ?? row.jobId), jobId: row.jobId,
         label: row.label ?? row.task, agentId: row.agentId, repository: row.repo,
         dependencyCount: Array.isArray(row.dependsOn) ? row.dependsOn.length : 0,
       }));
-  const rawEdges = input.edges?.length
-    ? [...input.edges]
+  const rawEdges = hasPersistedPlanProjection
+    ? [...truth.edges]
     : rawNodes.flatMap((node) => {
-        const activity = (input.activities ?? relevant).find((row) => String(row.jobId) === String(node.jobId));
+        const activity = (truth.activities.length ? truth.activities : relevant).find((row) => String(row.jobId) === String(node.jobId));
         return (Array.isArray(activity?.dependsOn) ? activity.dependsOn : []).map((sourceJobId: string) => ({
           edgeId: `${sourceJobId}->${String(node.jobId)}`,
           sourceNodeId: rawNodes.find((candidate) => String(candidate.jobId) === String(sourceJobId))?.nodeId ?? sourceJobId,
@@ -174,15 +279,10 @@ export function buildFleetSnapshot(input: {
   if (rawNodes.length > FLEET_MAX_NODES) throw new Error(`Fleet projection exceeds ${FLEET_MAX_NODES} nodes`);
   if (rawEdges.length > FLEET_MAX_EDGES) throw new Error(`Fleet projection exceeds ${FLEET_MAX_EDGES} edges`);
 
-  const activities = input.activities?.length ? input.activities : relevant;
+  const activities = truth.activities.length ? truth.activities : relevant;
   const activityByJob = new Map(activities.map((row) => [String(row.jobId), row]));
-  const validHandoffs = new Set((input.handoffs ?? []).filter((handoff) => {
-    const activity = activityByJob.get(String(handoff.sourceJobId));
-    return activity
-      && (!input.mission?.planDigest || handoff.planDigest === input.mission.planDigest)
-      && Number(handoff.sourceAttempt) === Number(activity.attempt ?? 1)
-      && Number(handoff.sourceSteerRevision) === Number(activity.steerRevision ?? 0);
-  }).map((handoff) => String(handoff.sourceJobId)));
+  const handoffByJob = new Map(truth.handoffs.map((handoff) => [String(handoff.sourceJobId), handoff]));
+  const validHandoffs = new Set(handoffByJob.keys());
 
   const orderedRawNodes = topologicalNodes(rawNodes, rawEdges);
   const projectedEdges = rawEdges
@@ -209,6 +309,8 @@ export function buildFleetSnapshot(input: {
     const incoming = rawEdges.filter((edge) => String(edge.targetNodeId) === String(node.nodeId));
     const dependenciesReady = incoming.filter((edge) => validHandoffs.has(String(edge.sourceJobId))).length;
     const attention = needsAttention(row);
+    const handoff = handoffByJob.get(jobId);
+    const decision = decisionTruth(row);
     return {
       id: String(node.nodeId), jobId,
       label: String(node.label ?? row.label ?? row.task ?? "Agent work").slice(0, 120),
@@ -226,6 +328,18 @@ export function buildFleetSnapshot(input: {
       dependencyCount: Number(node.dependencyCount ?? incoming.length), dependenciesReady,
       integrationState: String(row.integrationState ?? "not_applicable"),
       deliveryStatus: row.deliveryStatus ?? null, mergeState: mergeState(row),
+      receipt: {
+        state: handoff?.integrationReceiptDigest ? "integrated" : handoff?.reviewReceiptDigest ? "reviewed" : handoff ? "verified" : "none",
+        reviewDigest: handoff?.reviewReceiptDigest ?? null,
+        integrationDigest: handoff?.integrationReceiptDigest ?? null,
+        resultDigest: handoff?.resultDigest ?? null,
+      },
+      stall: {
+        count: Math.max(0, Number(row.stallCount ?? 0)),
+        at: typeof row.stalledAt === "number" ? row.stalledAt : null,
+        reason: typeof row.stallReason === "string" ? row.stallReason.slice(0, 180) : null,
+      },
+      decision,
       recoverySummary: recoverySummary(row), needsDaniel: attention,
       attentionReason: attention ? String(row.stallReason ?? row.progress ?? row.stage ?? row.status).slice(0, 180) : null,
       controls: controlsFor(row), startedAt: typeof row.startedAt === "number" ? row.startedAt : null,
@@ -235,7 +349,7 @@ export function buildFleetSnapshot(input: {
   const missionId = input.mission ? String(input.mission.missionId ?? input.mission._id) : null;
   const liveNodes = projectedNodes.filter((node) => !["done"].includes(node.state));
   const primaryNode = projectedNodes.find((node) => node.jobId === String(primary.jobId)) ?? liveNodes[0] ?? projectedNodes[0];
-  const attentionCount = projectedNodes.filter((node) => node.needsDaniel).length;
+  const attentionCount = projectedNodes.filter((node) => node.needsDaniel).length + truth.warnings.length;
   const fleet = {
     id: missionId ?? `work:${String(primary.jobId)}`,
     goal: String(input.mission?.goal ?? primary.label ?? primary.task ?? "Live work").slice(0, 500),
@@ -246,7 +360,7 @@ export function buildFleetSnapshot(input: {
     planDigest: input.mission?.planDigest ?? null,
     planGeneration: typeof input.mission?.planGeneration === "number" ? input.mission.planGeneration : null,
     integrationState: input.mission?.activeIntegrationAttemptId ? "integrating" : String(input.mission?.phase ?? "not started"),
-    attentionCount, controls: missionControls(input.mission ?? null), nodes: projectedNodes, edges: projectedEdges,
+    attentionCount, truthWarnings: truth.warnings, controls: missionControls(input.mission ?? null), nodes: projectedNodes, edges: projectedEdges,
   };
   return {
     active: primaryNode ? {

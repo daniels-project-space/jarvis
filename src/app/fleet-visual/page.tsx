@@ -18,6 +18,9 @@ const nodes: FleetNode[] = labels.map((label, index) => ({
   dependencyCount: index === 0 ? 0 : index < 3 ? 1 : 2, dependenciesReady: index < 3 ? Math.min(index, 1) : index < 6 ? 1 : 2,
   integrationState: states[index] === "integrating" ? "integrating" : states[index] === "needs_input" ? "needs_attention" : "not_applicable",
   deliveryStatus: states[index] === "done" ? "merged" : null, mergeState: states[index] === "done" ? "merged" : states[index] === "integrating" ? "integrating" : "not started",
+  receipt: { state: states[index] === "done" ? "integrated" : "none", reviewDigest: null, integrationDigest: null, resultDigest: null },
+  stall: { count: index === 6 ? 1 : 0, at: index === 6 ? Date.UTC(2026, 6, 21, 17, 46) : null, reason: index === 6 ? "Integration conflict needs Daniel's repository boundary decision" : null },
+  decision: { kind: states[index] === "needs_input" ? "input" : "none", detail: states[index] === "needs_input" ? "Choose the safe integration boundary" : null },
   recoverySummary: index === 5 ? "Recovered execution · attempt 2" : null, needsDaniel: states[index] === "needs_input",
   attentionReason: states[index] === "needs_input" ? "Integration conflict needs Daniel's repository boundary decision" : null,
   controls: states[index] === "needs_input" ? ["resume", "cancel", "steer"] : states[index] === "running" ? ["pause", "cancel", "steer"] : [], startedAt: Date.UTC(2026, 6, 21, 17, 30),
@@ -28,7 +31,7 @@ const snapshot: CompactWorkSnapshot = {
   fleet: {
     id: "mission-preview", goal: "Build the unified live JARVIS fleet surface", mode: "goal", status: "needs_input", phase: "integration", percent: 78,
     repository: "daniels-project-space/jarvis", planDigest: "c7d706a42db3547f3216862c95ef7894e68ac40fbfeae356d03577c8cbb71942", planGeneration: 3,
-    integrationState: "integrating", attentionCount: 1, controls: ["resume", "cancel", "steer"], nodes,
+    integrationState: "integrating", attentionCount: 1, truthWarnings: [], controls: ["resume", "cancel", "steer"], nodes,
     edges: [
       { id: "1-3", source: "node-1", target: "node-3", readiness: "delivered" },
       { id: "2-3", source: "node-2", target: "node-3", readiness: "delivered" },

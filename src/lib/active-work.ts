@@ -30,6 +30,27 @@ export type FleetEdge = {
   readiness: "waiting" | "ready" | "delivered" | "blocked";
 };
 
+// The fleet surface deliberately carries only compact, immutable evidence
+// pointers. Full receipts and event payloads stay in their cold authority
+// tables and are opened only from a dedicated detail flow.
+export type FleetReceipt = {
+  state: "none" | "verified" | "reviewed" | "integrated";
+  reviewDigest: string | null;
+  integrationDigest: string | null;
+  resultDigest: string | null;
+};
+
+export type FleetStall = {
+  count: number;
+  at: number | null;
+  reason: string | null;
+};
+
+export type FleetDecision = {
+  kind: "none" | "approval" | "input" | "blocked";
+  detail: string | null;
+};
+
 export type FleetNode = {
   id: string;
   jobId: string;
@@ -54,6 +75,9 @@ export type FleetNode = {
   integrationState: string;
   deliveryStatus: string | null;
   mergeState: string;
+  receipt: FleetReceipt;
+  stall: FleetStall;
+  decision: FleetDecision;
   recoverySummary: string | null;
   needsDaniel: boolean;
   attentionReason: string | null;
@@ -73,6 +97,7 @@ export type FleetMission = {
   planGeneration: number | null;
   integrationState: string;
   attentionCount: number;
+  truthWarnings: string[];
   controls: FleetControl[];
   nodes: FleetNode[];
   edges: FleetEdge[];

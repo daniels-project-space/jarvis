@@ -14,13 +14,14 @@ function snapshot(stage = "dispatching"): CompactWorkSnapshot {
     fleet: {
       id: "mission-1", goal: "Repair this request", mode: "goal", status: "running", phase: stage,
       percent: 64, repository: "daniels-project-space/jarvis", planDigest: "digest", planGeneration: 2,
-      integrationState: "building", attentionCount: 0, controls: ["pause", "cancel", "steer"], edges: [],
+      integrationState: "building", attentionCount: 0, truthWarnings: [], controls: ["pause", "cancel", "steer"], edges: [],
       nodes: [{
         id: "surface", jobId: "job-1", label: "Paul · current repair", agent: "paul", repository: "daniels-project-space/jarvis",
         state: "running", status: "running", stage, percent: 64, progress: "Testing", progressAt: 1,
         model: "terra", reasoningEffort: "high", workerRuntime: "trigger", workerRunId: "run-1", generation: 2,
         attempt: 1, maxAttempts: 12, dependencyCount: 0, dependenciesReady: 0, integrationState: "not_applicable",
-        deliveryStatus: null, mergeState: "not started", recoverySummary: null, needsDaniel: false, attentionReason: null,
+        deliveryStatus: null, mergeState: "not started", receipt: { state: "none", reviewDigest: null, integrationDigest: null, resultDigest: null },
+        stall: { count: 0, at: null, reason: null }, decision: { kind: "none", detail: null }, recoverySummary: null, needsDaniel: false, attentionReason: null,
         controls: ["pause", "cancel", "steer"], startedAt: 1,
       }],
     },

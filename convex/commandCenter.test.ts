@@ -28,7 +28,7 @@ function planNodes(count = FLEET_MAX_NODES) {
     nodeId: String.fromCharCode(97 + index), jobId: `job-${String.fromCharCode(97 + index)}`,
     label: `Node ${String.fromCharCode(65 + index)}`, agentId: index % 2 ? "atlas" : "paul",
     repository: index < 4 ? "daniels-project-space/jarvis" : "daniels-project-space/project-hub",
-    dependencyCount: index,
+    dependencyCount: index, planDigest: "digest",
   }));
 }
 
@@ -36,7 +36,7 @@ function completeEdges(count = FLEET_MAX_NODES) {
   const nodes = planNodes(count);
   return nodes.flatMap((target, targetIndex) => nodes.slice(0, targetIndex).map((source) => ({
     edgeId: `${source.nodeId}->${target.nodeId}`, sourceNodeId: source.nodeId, targetNodeId: target.nodeId,
-    sourceJobId: source.jobId, targetJobId: target.jobId,
+    sourceJobId: source.jobId, targetJobId: target.jobId, planDigest: "digest",
   })));
 }
 
@@ -80,7 +80,7 @@ describe("commandCenter relevance and bounded projection", () => {
     expect(projected.fleet?.nodes).toHaveLength(8);
     expect(projected.fleet?.edges).toHaveLength(28);
     expect(() => buildFleetSnapshot({ ...input, nodes: planNodes(9) })).toThrow("8 nodes");
-    expect(() => buildFleetSnapshot({ ...input, edges: [...completeEdges(), { edgeId: "overflow", sourceNodeId: "a", targetNodeId: "b" }] })).toThrow("28 edges");
+    expect(() => buildFleetSnapshot({ ...input, edges: [...completeEdges(), { edgeId: "overflow", sourceNodeId: "b", targetNodeId: "a", sourceJobId: "job-b", targetJobId: "job-a" }] })).toThrow("28 edges");
   });
 
   it("keeps topological DAG order stable across persisted row order", () => {
@@ -106,7 +106,7 @@ describe("commandCenter relevance and bounded projection", () => {
         runtime({ jobId: "job-a", status: "done", deliveryStatus: "merged", attempt: 2, steerRevision: 1, workerRuntime: "trigger" }),
         runtime({ jobId: "job-b", status: "needs_input", integrationState: "needs_attention", stallReason: "Merge conflict needs a decision", approvalRequired: true, approvalStatus: "pending", risk: "high", task: "x".repeat(1000), log: "private", checkpoint: "private" }),
       ],
-      handoffs: [{ sourceJobId: "job-a", sourceAttempt: 2, sourceSteerRevision: 1, planDigest: "digest" }],
+      handoffs: [{ sourceNodeId: "a", sourceJobId: "job-a", sourceAttempt: 2, sourceSteerRevision: 1, planDigest: "digest" }],
     });
     expect(result.active).toMatchObject({ needsDaniel: true, extraCount: 0 });
     expect(result.fleet).toMatchObject({ planDigest: "digest", planGeneration: 3, attentionCount: 1 });
@@ -124,6 +124,45 @@ describe("commandCenter relevance and bounded projection", () => {
       threadId, activeRows: [runtime({ status: "awaiting_approval", approvalRequired: true, approvalStatus: "pending", risk: "consequential", deliveryMode: "manual" })],
     });
     expect(result.fleet?.nodes[0].controls).toEqual(expect.arrayContaining(["approve", "decline"]));
+  });
+
+  it("projects one compact receipt, stall and decision truth per current node", () => {
+    const result = buildFleetSnapshot({
+      threadId,
+      activeRows: [runtime({ status: "needs_input", stallCount: 2, stalledAt: 444, stallReason: "Pick a safe provider gate" })],
+      mission: { missionId: "mission-1", planDigest: "digest", planGeneration: 2 },
+      nodes: [planNodes(1)[0]],
+      activities: [runtime({ planDigest: "digest", status: "needs_input", stallCount: 2, stalledAt: 444, stallReason: "Pick a safe provider gate" })],
+      handoffs: [{ sourceNodeId: "a", sourceJobId: "job-a", sourceAttempt: 1, sourceSteerRevision: 0, planDigest: "digest", reviewReceiptDigest: "r".repeat(64), integrationReceiptDigest: "i".repeat(64), resultDigest: "d".repeat(64) }],
+    });
+    expect(result.fleet?.nodes[0]).toMatchObject({
+      receipt: { state: "integrated", reviewDigest: "r".repeat(64), integrationDigest: "i".repeat(64), resultDigest: "d".repeat(64) },
+      stall: { count: 2, at: 444, reason: "Pick a safe provider gate" },
+      decision: { kind: "input", detail: "Pick a safe provider gate" },
+    });
+  });
+
+  it("omits conflicting same-generation bindings instead of rendering duplicate work or receipts", () => {
+    const duplicatedNode = planNodes(1)[0];
+    const duplicatedEdge = { edgeId: "a->b", sourceNodeId: "a", targetNodeId: "b", sourceJobId: "job-a", targetJobId: "job-b", planDigest: "digest" };
+    const result = buildFleetSnapshot({
+      threadId,
+      activeRows: [runtime({ planDigest: "digest" })],
+      mission: { missionId: "mission-1", planDigest: "digest", planGeneration: 2 },
+      nodes: [duplicatedNode, { ...duplicatedNode, createdAt: 2 }],
+      edges: [duplicatedEdge, { ...duplicatedEdge, edgeId: "same-relation" }],
+      activities: [runtime({ planDigest: "digest" }), { ...runtime({ planDigest: "digest" }), createdAt: 2 }],
+      handoffs: [
+        { sourceNodeId: "a", sourceJobId: "job-a", sourceAttempt: 1, sourceSteerRevision: 0, planDigest: "digest", resultDigest: "a".repeat(64) },
+        { sourceNodeId: "a", sourceJobId: "job-a", sourceAttempt: 1, sourceSteerRevision: 0, planDigest: "digest", resultDigest: "b".repeat(64) },
+      ],
+    });
+    expect(result.fleet?.nodes).toEqual([]);
+    expect(result.fleet?.edges).toEqual([]);
+    expect(result.fleet?.truthWarnings).toEqual(expect.arrayContaining([
+      "Conflicting plan-node bindings need controller reconciliation",
+      "Conflicting work activity needs controller reconciliation",
+    ]));
   });
 });
 

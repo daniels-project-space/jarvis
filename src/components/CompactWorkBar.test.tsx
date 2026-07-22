@@ -10,7 +10,8 @@ const node = (overrides: Partial<FleetNode> = {}): FleetNode => ({
   percent: 64, progress: "Running focused tests", progressAt: 1, model: "terra", reasoningEffort: "high",
   workerRuntime: "trigger", workerRunId: "run-1", generation: 1, attempt: 1, maxAttempts: 12,
   dependencyCount: 0, dependenciesReady: 0, integrationState: "not_applicable", deliveryStatus: null,
-  mergeState: "not started", recoverySummary: null, needsDaniel: false, attentionReason: null,
+  mergeState: "not started", receipt: { state: "none", reviewDigest: null, integrationDigest: null, resultDigest: null },
+  stall: { count: 0, at: null, reason: null }, decision: { kind: "none", detail: null }, recoverySummary: null, needsDaniel: false, attentionReason: null,
   controls: ["pause", "cancel", "steer"], startedAt: 1, ...overrides,
 });
 
@@ -19,7 +20,7 @@ const work: CompactWorkSnapshot = {
   fleet: {
     id: "mission-1", goal: "Build one live fleet surface", mode: "goal", status: "running", phase: "building",
     percent: 64, repository: "daniels-project-space/jarvis", planDigest: "abcdef0123456789", planGeneration: 2,
-    integrationState: "building", attentionCount: 0, controls: ["pause", "cancel", "steer"],
+    integrationState: "building", attentionCount: 0, truthWarnings: [], controls: ["pause", "cancel", "steer"],
     nodes: [node()], edges: [],
   },
 };
@@ -45,6 +46,27 @@ describe("FleetCommandCenter", () => {
     const markup = renderToStaticMarkup(<FleetCommandCenter snapshot={work} />);
     expect(markup).toContain('aria-expanded="false"');
     expect(markup).not.toContain('data-fleet-surface="expanded"');
+  });
+
+  it("renders compact receipt, stall, and decision truth in the one expanded work surface", () => {
+    const snapshot: CompactWorkSnapshot = {
+      ...work,
+      fleet: {
+        ...work.fleet!,
+        nodes: [node({
+          receipt: { state: "integrated", reviewDigest: "r".repeat(64), integrationDigest: "i".repeat(64), resultDigest: "d".repeat(64) },
+          stall: { count: 2, at: 10, reason: "Awaiting a provider decision" },
+          decision: { kind: "input", detail: "Choose the safe provider gate" },
+          needsDaniel: true,
+        })],
+        attentionCount: 1,
+      },
+    };
+    const markup = renderToStaticMarkup(<FleetCommandCenter snapshot={snapshot} initialExpanded />);
+    expect(markup.match(/data-fleet-surface/g)).toHaveLength(1);
+    expect(markup).toContain("receipt integrated");
+    expect(markup).toContain("decision input");
+    expect(markup).toContain("Needs Daniel · 1");
   });
 
   it("provides server-rendered HTML labels for every DAG node and a readable dependency-list fallback", () => {
