@@ -61,6 +61,7 @@ import {
   validatedGoalDeliveryBranch,
 } from "./github-delivery";
 import { wakeAgentFleet } from "../lib/agent-fleet-dispatch";
+import { BACKGROUND_CONCURRENCY_LIMIT, BACKGROUND_QUEUE } from "../lib/work-scheduler";
 import { upstreamEvidencePrompt } from "../lib/upstream-evidence";
 import { drainControlPlaneMigration } from "./control-plane-migration";
 import { ExecutionLeaseMonitor } from "./execution-lease-monitor";
@@ -2397,7 +2398,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
 export const agentWorker = task({
   id: "jarvis-agent-worker",
   machine: "medium-2x",
-  queue: { concurrencyLimit: 8 },
+  queue: { name: BACKGROUND_QUEUE, concurrencyLimit: BACKGROUND_CONCURRENCY_LIMIT },
   maxDuration: timeout.None,
   run: async (payload: AgentWorkerPayload, { ctx }) => {
     metadata

@@ -256,6 +256,14 @@ export default defineSchema({
     goalStage: v.optional(v.string()), // planning | building | validating | refining
     goalWorkstreamId: v.optional(v.string()),
     goalWave: v.optional(v.number()),
+    // Immutable scheduler admission. missionGroupId is the top-level request;
+    // projectGroupId is its executable repository/evidence child. The group
+    // key also includes projectRepository and is never derived from a label,
+    // UI selection, branch, or latest pointer during dispatch.
+    missionGroupId: v.optional(v.string()),
+    projectGroupId: v.optional(v.string()),
+    projectRepository: v.optional(v.string()),
+    schedulingGroupKey: v.optional(v.string()),
     acceptanceCriteria: v.optional(v.array(v.string())),
     modelReason: v.optional(v.string()),
     // Immutable work-item isolation identities. `branch` remains the legacy
@@ -371,6 +379,10 @@ export default defineSchema({
     goalStage: v.optional(v.string()),
     goalWorkstreamId: v.optional(v.string()),
     goalWave: v.optional(v.number()),
+    missionGroupId: v.optional(v.string()),
+    projectGroupId: v.optional(v.string()),
+    projectRepository: v.optional(v.string()),
+    schedulingGroupKey: v.optional(v.string()),
     sourceBranch: v.optional(v.string()),
     sourceHeadSha: v.optional(v.string()),
     integrationBranch: v.optional(v.string()),
@@ -407,6 +419,41 @@ export default defineSchema({
     .index("by_thread_visibility_active_priority", ["originThreadId", "visibility", "active", "priority", "createdAt"])
     .index("by_plan_parent_generation_node", ["planParentMissionId", "planGeneration", "planNodeId"])
     .index("by_mission", ["missionId", "createdAt"]),
+
+  // Durable fair-queue state for one immutable executable project group.
+  // Rows are admitted atomically with jobs and survive worker/controller
+  // retries; the scheduler never treats a mutable "latest" row as authority.
+  workGroupScheduling: defineTable({
+    groupKey: v.string(),
+    missionGroupId: v.string(),
+    projectGroupId: v.string(),
+    projectRepository: v.optional(v.string()),
+    lastServedSequence: v.number(),
+    reservationCount: v.number(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_group", ["groupKey"]),
+
+  // Per-job immutable admission prevents a wholesale rewrite of the mutable
+  // job document from moving work to another mission or repository group.
+  jobSchedulingAdmissions: defineTable({
+    jobId: v.id("jobs"),
+    missionGroupId: v.string(),
+    projectGroupId: v.string(),
+    projectRepository: v.optional(v.string()),
+    schedulingGroupKey: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_job", ["jobId"])
+    .index("by_group", ["schedulingGroupKey", "jobId"]),
+
+  // One optimistic-concurrency fence allocates monotonically increasing fair
+  // service tickets across every background mission/project group.
+  dispatchSchedulerState: defineTable({
+    key: v.string(),
+    nextSequence: v.number(),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
 
   // Orchestrated agent fleets: one mission = a decomposed goal running as
   // parallel jobs; when the last one lands, a synthesis pass merges the

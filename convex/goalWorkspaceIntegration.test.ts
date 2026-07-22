@@ -864,14 +864,40 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const jobs = await t.run(async (ctx) => (await ctx.db.query("jobs")
       .withIndex("by_mission", (q) => q.eq("missionId", String(created.missionId))).collect())
       .filter((job) => job.goalStage === "building"));
-    const specialists = await dispatch(t, 8, "fifo-eight-specialist");
-    expect(specialists).toHaveLength(8);
     const byId = new Map(jobs.map((job) => [String(job._id), job]));
-    for (let index = 0; index < specialists.length; index += 1) {
-      const entry = specialists[index];
+    const firstWave = await dispatch(t, 8, "fifo-eight-specialist-first");
+    expect(firstWave).toHaveLength(6);
+    for (let index = 0; index < firstWave.length; index += 1) {
+      const entry = firstWave[index];
       await review(t, byId.get(String(entry.reservation.jobId))!, String(entry.claim!.workerRunId),
         "12345678"[index].repeat(40), "9abcdef0"[index].repeat(40));
     }
+    // Keep the integration head cold while the per-group reservation cap
+    // admits the final two unique worker lineages in a second bounded wave.
+    const heldHead = await t.run(async (ctx) => (await ctx.db.query("integrationAttempts").collect())
+      .find((row) => row.status === "queued"));
+    if (!heldHead) throw new Error("FIFO integration head was not queued");
+    await t.run(async (ctx) => {
+      const headJob = await ctx.db.get(heldHead.jobId);
+      const heldUntil = Date.now() + 60_000;
+      await ctx.db.patch(heldHead.jobId, { nextRunAt: heldUntil });
+      const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", heldHead.jobId)).first();
+      if (runtime) await ctx.db.patch(runtime._id, { nextRunAt: heldUntil });
+      expect(headJob).toMatchObject({ status: "pending", integrationAttemptId: heldHead._id });
+    });
+    const secondWave = await dispatch(t, 8, "fifo-eight-specialist-second");
+    expect(secondWave).toHaveLength(2);
+    for (let index = 0; index < secondWave.length; index += 1) {
+      const entry = secondWave[index];
+      const receiptIndex = firstWave.length + index;
+      await review(t, byId.get(String(entry.reservation.jobId))!, String(entry.claim!.workerRunId),
+        "12345678"[receiptIndex].repeat(40), "9abcdef0"[receiptIndex].repeat(40));
+    }
+    await t.run(async (ctx) => {
+      await ctx.db.patch(heldHead.jobId, { nextRunAt: Date.now() });
+      const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", heldHead.jobId)).first();
+      if (runtime) await ctx.db.patch(runtime._id, { nextRunAt: Date.now() });
+    });
     const controllers = await dispatch(t, 8, "fifo-eight-controller");
     expect(controllers).toHaveLength(1);
     const state = await t.run(async (ctx) => ({

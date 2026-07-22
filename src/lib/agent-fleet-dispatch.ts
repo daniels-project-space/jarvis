@@ -1,15 +1,20 @@
 import { tasks } from "@trigger.dev/sdk/v3";
 import type { agentWorker } from "../trigger/agent-runner";
 import { resolveConvexUrl } from "./convex-url";
+import { BACKGROUND_CONCURRENCY_LIMIT } from "./work-scheduler";
 
 const CONVEX_URL = resolveConvexUrl(process.env.CONVEX_URL, process.env.NEXT_PUBLIC_CONVEX_URL);
-const DEFAULT_FAN_OUT = 8;
+const DEFAULT_FAN_OUT = BACKGROUND_CONCURRENCY_LIMIT;
 
 type Reservation = {
   jobId: string;
   dispatchId: string;
   attempt: number;
   missionId: string | null;
+  missionGroupId?: string;
+  projectGroupId?: string;
+  projectRepository?: string | null;
+  schedulingGroupKey?: string;
   agentId: string | null;
   label: string;
 };
@@ -41,7 +46,7 @@ async function workerMutation<T>(path: string, args: Record<string, unknown>): P
  */
 export async function wakeAgentFleet(reason: string, fanOut = DEFAULT_FAN_OUT): Promise<boolean> {
   const cleanReason = reason.trim().replace(/\s+/g, " ").slice(0, 160) || "work-available";
-  const limit = Math.max(1, Math.min(12, Math.floor(fanOut)));
+  const limit = Math.max(1, Math.min(BACKGROUND_CONCURRENCY_LIMIT, Math.floor(fanOut)));
   const reserved = await workerMutation<{ reservations?: Reservation[] }>("jobs:reserveDispatchBatch", {
     limit,
     reason: cleanReason,
@@ -68,6 +73,9 @@ export async function wakeAgentFleet(reason: string, fanOut = DEFAULT_FAN_OUT): 
           metadata: {
             jobId: reservation.jobId,
             missionId: reservation.missionId,
+            missionGroupId: reservation.missionGroupId ?? null,
+            projectGroupId: reservation.projectGroupId ?? null,
+            projectRepository: reservation.projectRepository ?? null,
             agentId: reservation.agentId,
             label: reservation.label.slice(0, 120),
             reason: cleanReason,

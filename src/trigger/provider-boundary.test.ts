@@ -29,11 +29,14 @@ describe("intelligence provider boundary", () => {
 
   it("ships Trigger workers with the pinned Codex subscription boundary", () => {
     const runner = readFileSync(join(process.cwd(), "src/trigger/agent-runner.ts"), "utf8");
+    const foreground = readFileSync(join(process.cwd(), "src/trigger/chat-session.ts"), "utf8");
     const config = readFileSync(join(process.cwd(), "trigger.config.ts"), "utf8");
     const isolation = readFileSync(join(process.cwd(), "src/trigger/subscription-runtime.ts"), "utf8");
     expect(`${runner}\n${config}`).not.toMatch(/CLAUDE|ANTHROPIC/i);
     expect(config).toContain("@openai/codex@0.144.5");
     expect(runner).toContain('id: "jarvis-agent-worker"');
+    expect(runner).toContain("queue: { name: BACKGROUND_QUEUE, concurrencyLimit: BACKGROUND_CONCURRENCY_LIMIT }");
+    expect(foreground).toContain("queue: { name: FOREGROUND_QUEUE, concurrencyLimit: FOREGROUND_CONCURRENCY }");
     expect(isolation).toContain('env.OPENAI_API_KEY = ""');
     expect(isolation).not.toMatch(/VAULT_ACCESS_TOKEN.*allow/i);
   });

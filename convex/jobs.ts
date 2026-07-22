@@ -22,6 +22,7 @@ import { verifiedGoalHandoffsForJob } from "./goalMode";
 import { claimDisposition, completionReceiptAllowed, isSha256Digest, replayEnvelope, shouldAdvanceAttempt } from "../src/lib/durable-attempt-protocol";
 import { canonicalWorkspaceCheckpoint, parseCanonicalWorkspaceCheckpoint } from "../src/lib/workspace-checkpoint";
 import {
+  ensureJobSchedulingAuthority,
   insertJobWithRuntime,
   jobRuntimeFor,
   patchMissionWithRuntime,
@@ -30,13 +31,20 @@ import {
   upsertJobRuntime,
   upsertMissionRuntime,
 } from "./controlPlane";
+import {
+  BACKGROUND_CONCURRENCY_LIMIT,
+  DISPATCH_SCHEDULER_KEY,
+  immutableLineageIsValid,
+  schedulingAuthorityMatches,
+  selectFairWork,
+  writeLineageKey,
+} from "../src/lib/work-scheduler";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
 // A live process that cannot produce a causal stage/percentage advance is not
 // healthy work. Keep this comfortably above a normal Codex tool segment while
 // still surfacing a genuinely stuck attempt before its lease disappears.
 const DISPATCH_LEASE_MS = 2 * 60 * 1000;
-const MAX_WRITABLE_PER_MISSION_REPO = 8;
 const DELIVERY_LEASE_MS = 45_000;
 const DELIVERY_RETRY_LIMIT = 6;
 const REVIEW_RECEIPT_MAX_CHARS = 300_000;
@@ -621,16 +629,56 @@ export const reconcileGoalWorkstreamModes = mutation({
   },
 });
 
-async function runnableCandidates(ctx: any, now: number, limit: number): Promise<any[]> {
-  const candidates = await ctx.db
+/* eslint-disable @typescript-eslint/no-explicit-any -- scheduler authority joins rollout-compatible Convex documents from several tables */
+async function activeBackgroundRows(ctx: any) {
+  const rows = (await Promise.all(["dispatching", "running"].map((status) => ctx.db
+    .query("jobRuntime")
+    .withIndex("by_status_priority", (q: any) => q.eq("status", status))
+    .take(BACKGROUND_CONCURRENCY_LIMIT + 1)))).flat();
+  return [...new Map(rows.map((row: any) => [String(row.jobId), row])).values()];
+}
+
+async function runnableCandidates(ctx: any, now: number, requestedLimit: number): Promise<any[]> {
+  const activeRows = await activeBackgroundRows(ctx);
+  const available = Math.max(0, BACKGROUND_CONCURRENCY_LIMIT - activeRows.length);
+  const limit = Math.min(requestedLimit, available);
+  if (!limit) return [];
+
+  const activeByGroup = new Map<string, number>();
+  const activeWriteLineages = new Set<string>();
+  const blockedWriteGroups = new Set<string>();
+  for (const runtime of activeRows) {
+    let active: any = runtime;
+    if (!schedulingAuthorityMatches(active)) {
+      const durable = await ctx.db.get(runtime.jobId);
+      const admitted = durable ? await ensureJobSchedulingAuthority(ctx, durable) : null;
+      if (!admitted) continue;
+      active = { ...runtime, ...admitted.job, _id: admitted.job._id, jobId: admitted.job._id };
+      await upsertJobRuntime(ctx, admitted.job);
+    }
+    const groupKey = String(active.schedulingGroupKey ?? "");
+    if (!groupKey) continue;
+    activeByGroup.set(groupKey, (activeByGroup.get(groupKey) ?? 0) + 1);
+    const lineage = writeLineageKey(active);
+    if (lineage && immutableLineageIsValid(active)) activeWriteLineages.add(lineage);
+    else if (!active.readonly && active.repo) blockedWriteGroups.add(groupKey);
+  }
+
+  const candidateWindow = Math.max(24, Math.min(96, limit * 8));
+  const sampleSize = Math.ceil(candidateWindow / 2);
+  // Sample both ends of the due index. A deep old backlog from one group must
+  // not hide a newly spoken mission beyond the bounded hot read window.
+  const [oldestDue, newestDue] = await Promise.all(["asc", "desc"].map((order) => ctx.db
     .query("jobRuntime")
     .withIndex("by_status_next_run", (q: any) => q.eq("status", "pending").lte("nextRunAt", now))
-    .take(Math.max(24, Math.min(96, limit * 8)));
-  candidates.sort((a: any, b: any) => (b.priority ?? 50) - (a.priority ?? 50) || a.createdAt - b.createdAt);
+    .order(order)
+    .take(sampleSize)));
+  const candidates = [...new Map([...oldestDue, ...newestDue]
+    .map((candidate: any) => [String(candidate.jobId), candidate])).values()];
   const runnable: any[] = [];
   const missionCache = new Map<string, any>();
-  const repoActiveCache = new Map<string, number>();
   const dependencyCache = new Map<string, any>();
+  const schedulingByGroup = new Map<string, any>();
   for (const candidate of candidates) {
     if (candidate.approvalRequired && candidate.approvalStatus !== "approved") continue;
     if (candidate.missionId) {
@@ -666,11 +714,36 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
     if (blocked) continue;
     // The projection selects exact candidates; the one bounded authority read
     // below fences dispatch against any stale rollout row without scanning jobs.
-    const job = await ctx.db.get(candidate.jobId);
+    let job: any = await ctx.db.get(candidate.jobId);
     if (!job || job.status !== "pending" || (job.attempt ?? 1) !== candidate.attempt || (job.nextRunAt ?? 0) > now) {
       if (job) await upsertJobRuntime(ctx, job);
       continue;
     }
+    const admitted = await ensureJobSchedulingAuthority(ctx, job);
+    if (!admitted) continue;
+    job = admitted.job;
+    if (!schedulingAuthorityMatches(candidate) || candidate.schedulingGroupKey !== job.schedulingGroupKey) {
+      await upsertJobRuntime(ctx, job);
+    }
+    const expectedIdentity = workItemIdentity({
+      missionId: job.missionId ?? `standalone-${String(job._id)}`,
+      jobId: String(job._id),
+      workstreamId: job.goalWorkstreamId ?? job.label,
+      readonly: Boolean(job.readonly || !job.repo),
+    });
+    if ((job.workspaceLineage !== undefined && job.workspaceLineage !== expectedIdentity.workspaceLineage)
+      || (job.retryLineage !== undefined && job.retryLineage !== expectedIdentity.retryLineage)) continue;
+    if (!job.workspaceLineage || !job.retryLineage || (!job.readonly && job.repo && !job.workerBranch)) {
+      const lineagePatch = {
+        workspaceLineage: job.workspaceLineage ?? expectedIdentity.workspaceLineage,
+        retryLineage: job.retryLineage ?? expectedIdentity.retryLineage,
+        workerBranch: job.workerBranch ?? expectedIdentity.workerBranch,
+        branch: job.branch ?? expectedIdentity.workerBranch,
+      };
+      await patchJobWithRuntime(ctx, job, lineagePatch);
+      job = { ...job, ...lineagePatch };
+    }
+    if (!immutableLineageIsValid(job)) continue;
     // The projection carries the common bounded dependency prefix. If a
     // legacy/general job has more, the selected authority document must fence
     // every remaining dependency before dispatch; oversized graphs stay held
@@ -706,24 +779,57 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
       // receipts have no nextRunAt and cannot consume a Trigger reservation.
       if (!integration || integration.jobId !== job._id || integration.status !== "queued") continue;
     }
-    if (job.missionId && job.repo && !job.readonly && !job.integrationAttemptId) {
-      const key = `${job.missionId}:${job.repo}`;
-      let active = repoActiveCache.get(key);
-      if (active === undefined) {
-        const siblings = await ctx.db.query("jobRuntime")
-          .withIndex("by_mission", (q: any) => q.eq("missionId", job.missionId)).take(100);
-        active = siblings.filter((sibling: any) => sibling.repo === job.repo && !sibling.readonly
-          && ["dispatching", "running"].includes(sibling.status) && !sibling.integrationAttemptId).length;
-      }
-      const activeCount = active ?? 0;
-      if (activeCount >= MAX_WRITABLE_PER_MISSION_REPO) continue;
-      repoActiveCache.set(key, activeCount + 1);
-    }
+    const groupKey = String(job.schedulingGroupKey);
+    const lineage = writeLineageKey(job);
+    if (lineage && blockedWriteGroups.has(groupKey)) continue;
+    schedulingByGroup.set(groupKey, admitted.scheduling);
     runnable.push(job);
-    if (runnable.length >= limit) break;
   }
-  return runnable;
+  const fairCandidates = runnable.map((job) => ({
+    id: String(job._id),
+    groupKey: String(job.schedulingGroupKey),
+    priority: Number(job.priority ?? 50),
+    createdAt: Number(job.createdAt ?? job._creationTime ?? 0),
+    writeLineage: writeLineageKey(job),
+  }));
+  const groupStates = new Map([...schedulingByGroup.entries()].map(([groupKey, state]) => [groupKey, {
+    lastServedSequence: Number(state.lastServedSequence ?? 0),
+    activeCount: activeByGroup.get(groupKey) ?? 0,
+  }]));
+  const runnableById = new Map(runnable.map((job) => [String(job._id), job]));
+  return selectFairWork(fairCandidates, groupStates, activeWriteLineages, limit)
+    .map((candidate) => runnableById.get(candidate.id))
+    .filter(Boolean);
 }
+
+async function recordSchedulingReservations(ctx: any, jobs: any[], now: number) {
+  if (!jobs.length) return;
+  const scheduler = await ctx.db.query("dispatchSchedulerState")
+    .withIndex("by_key", (q: any) => q.eq("key", DISPATCH_SCHEDULER_KEY)).first();
+  let sequence = Number(scheduler?.nextSequence ?? 0);
+  const groupUpdates = new Map<string, { lastServedSequence: number; count: number }>();
+  for (const job of jobs) {
+    sequence += 1;
+    const groupKey = String(job.schedulingGroupKey);
+    const current = groupUpdates.get(groupKey) ?? { lastServedSequence: sequence, count: 0 };
+    current.lastServedSequence = sequence;
+    current.count += 1;
+    groupUpdates.set(groupKey, current);
+  }
+  for (const [groupKey, update] of groupUpdates) {
+    const group = await ctx.db.query("workGroupScheduling")
+      .withIndex("by_group", (q: any) => q.eq("groupKey", groupKey)).first();
+    if (!group) throw new Error("Reserved work lost its immutable scheduling group");
+    await ctx.db.patch(group._id, {
+      lastServedSequence: update.lastServedSequence,
+      reservationCount: Number(group.reservationCount ?? 0) + update.count,
+      updatedAt: now,
+    });
+  }
+  if (scheduler) await ctx.db.patch(scheduler._id, { nextSequence: sequence, updatedAt: now });
+  else await ctx.db.insert("dispatchSchedulerState", { key: DISPATCH_SCHEDULER_KEY, nextSequence: sequence, updatedAt: now });
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 async function claimedJob(ctx: any, j: any, upstreamEvidence: readonly any[] = []) {
   const delivery: any = j.activeDeliveryAttemptId ? await ctx.db.get(j.activeDeliveryAttemptId) : null;
@@ -738,6 +844,10 @@ async function claimedJob(ctx: any, j: any, upstreamEvidence: readonly any[] = [
     incidentId: j.incidentId ?? null,
     retried: j.retried ?? false,
     missionId: j.missionId ?? null,
+    missionGroupId: j.missionGroupId ?? null,
+    projectGroupId: j.projectGroupId ?? null,
+    projectRepository: j.projectRepository ?? null,
+    schedulingGroupKey: j.schedulingGroupKey ?? null,
     label: j.label ?? null,
     originThreadId: j.originThreadId ?? "main",
     originTurnId: j.originTurnId ?? null,
@@ -831,6 +941,7 @@ export const reserveDispatchBatch = mutation({
     const limit = Math.max(1, Math.min(12, Math.floor(a.limit)));
     const candidates = await runnableCandidates(ctx, now, limit);
     const reservations = [];
+    const reservedJobs = [];
     for (const j of candidates) {
       let attemptNumber = j.attempt ?? 1;
       let attempt = await attemptFor(ctx, j._id, attemptNumber);
@@ -883,10 +994,16 @@ export const reserveDispatchBatch = mutation({
         dispatchId,
         attempt: attemptNumber,
         missionId: j.missionId ?? null,
+        missionGroupId: j.missionGroupId,
+        projectGroupId: j.projectGroupId,
+        projectRepository: j.projectRepository ?? null,
+        schedulingGroupKey: j.schedulingGroupKey,
         agentId: j.agentId ?? null,
         label: j.label ?? j.task.slice(0, 80),
       });
+      reservedJobs.push(j);
     }
+    await recordSchedulingReservations(ctx, reservedJobs, now);
     return { reservations };
   },
 });

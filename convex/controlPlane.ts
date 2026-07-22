@@ -2,6 +2,13 @@
 // this file are intentionally database-only so every durable writer can use
 // them in the same Convex transaction without calling another function.
 
+import {
+  DISPATCH_SCHEDULER_KEY,
+  schedulingAuthorityMatches,
+  workGroupAuthority,
+  type WorkGroupAuthority,
+} from "../src/lib/work-scheduler";
+
 function defined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
 }
@@ -58,6 +65,10 @@ export function projectJobRuntime(job: any) {
     goalStage: typeof job.goalStage === "string" ? job.goalStage.slice(0, 40) : undefined,
     goalWorkstreamId: typeof job.goalWorkstreamId === "string" ? job.goalWorkstreamId.slice(0, 120) : undefined,
     goalWave: typeof job.goalWave === "number" ? job.goalWave : undefined,
+    missionGroupId: typeof job.missionGroupId === "string" ? job.missionGroupId.slice(0, 240) : undefined,
+    projectGroupId: typeof job.projectGroupId === "string" ? job.projectGroupId.slice(0, 240) : undefined,
+    projectRepository: typeof job.projectRepository === "string" ? job.projectRepository.slice(0, 120) : undefined,
+    schedulingGroupKey: typeof job.schedulingGroupKey === "string" ? job.schedulingGroupKey.slice(0, 1_200) : undefined,
     sourceBranch: typeof job.sourceBranch === "string" ? job.sourceBranch.slice(0, 240) : undefined,
     sourceHeadSha: typeof job.sourceHeadSha === "string" ? job.sourceHeadSha.slice(0, 80) : undefined,
     integrationBranch: typeof job.integrationBranch === "string" ? job.integrationBranch.slice(0, 240) : undefined,
@@ -192,16 +203,99 @@ export async function upsertMissionRuntime(ctx: any, mission: any) {
   else await ctx.db.insert("missionRuntime", projected);
 }
 
+/* eslint-disable @typescript-eslint/no-explicit-any -- shared internal Convex document helpers follow this module's rollout-compatible shape */
+function persistedAuthorityConflicts(job: any, expected: WorkGroupAuthority) {
+  return (["missionGroupId", "projectGroupId", "projectRepository", "schedulingGroupKey"] as const)
+    .some((field) => job[field] !== undefined && job[field] !== expected[field]);
+}
+
+/**
+ * Bind a legacy or newly inserted job to one immutable fair-scheduling group.
+ * Any later repository/mission substitution conflicts with this admission and
+ * fails closed before a worker reservation exists.
+ */
+export async function ensureJobSchedulingAuthority(ctx: any, job: any, persistJobBinding = true) {
+  const derived = workGroupAuthority(job);
+  const admission = await ctx.db.query("jobSchedulingAdmissions")
+    .withIndex("by_job", (q: any) => q.eq("jobId", job._id)).first();
+  const expected: WorkGroupAuthority = admission ? {
+    missionGroupId: admission.missionGroupId,
+    projectGroupId: admission.projectGroupId,
+    projectRepository: admission.projectRepository,
+    schedulingGroupKey: admission.schedulingGroupKey,
+  } : derived;
+  if (admission && (
+    admission.missionGroupId !== derived.missionGroupId
+    || admission.projectGroupId !== derived.projectGroupId
+    || admission.projectRepository !== derived.projectRepository
+    || admission.schedulingGroupKey !== derived.schedulingGroupKey
+  )) return null;
+  if (persistedAuthorityConflicts(job, expected)) return null;
+  const existing = await ctx.db.query("workGroupScheduling")
+    .withIndex("by_group", (q: any) => q.eq("groupKey", expected.schedulingGroupKey)).first();
+  if (existing && (
+    existing.missionGroupId !== expected.missionGroupId
+    || existing.projectGroupId !== expected.projectGroupId
+    || existing.projectRepository !== expected.projectRepository
+  )) return null;
+  const now = Date.now();
+  const boundJob = { ...job, ...expected };
+  if (!admission) await ctx.db.insert("jobSchedulingAdmissions", {
+    jobId: job._id,
+    missionGroupId: expected.missionGroupId,
+    projectGroupId: expected.projectGroupId,
+    projectRepository: expected.projectRepository,
+    schedulingGroupKey: expected.schedulingGroupKey,
+    createdAt: now,
+  });
+  if (persistJobBinding && !schedulingAuthorityMatches(job, expected)) await ctx.db.patch(job._id, expected);
+  const scheduler = existing ? null : await ctx.db.query("dispatchSchedulerState")
+    .withIndex("by_key", (q: any) => q.eq("key", DISPATCH_SCHEDULER_KEY)).first();
+  const initialServiceSequence = Number(scheduler?.nextSequence ?? 0);
+  const scheduling = existing ?? {
+    _id: await ctx.db.insert("workGroupScheduling", {
+      groupKey: expected.schedulingGroupKey,
+      missionGroupId: expected.missionGroupId,
+      projectGroupId: expected.projectGroupId,
+      projectRepository: expected.projectRepository,
+      lastServedSequence: initialServiceSequence,
+      reservationCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    }),
+    groupKey: expected.schedulingGroupKey,
+    missionGroupId: expected.missionGroupId,
+    projectGroupId: expected.projectGroupId,
+    projectRepository: expected.projectRepository,
+    lastServedSequence: initialServiceSequence,
+    reservationCount: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+  return { job: boundJob, scheduling };
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
 export async function insertJobWithRuntime(ctx: any, value: any) {
   const jobId = await ctx.db.insert("jobs", value);
-  await upsertJobRuntime(ctx, { ...value, _id: jobId });
+  const admitted = await ensureJobSchedulingAuthority(ctx, { ...value, _id: jobId }, false);
+  if (!admitted) throw new Error("Job scheduling authority could not be admitted");
+  await upsertJobRuntime(ctx, admitted.job);
   return jobId;
 }
 
 export async function patchJobWithRuntime(ctx: any, job: any, patch: Record<string, unknown>) {
+  const prospective = { ...job, ...patch };
+  const currentAuthority = workGroupAuthority(job);
+  if (job.schedulingGroupKey && (
+    !schedulingAuthorityMatches(job, currentAuthority)
+    || workGroupAuthority(prospective).schedulingGroupKey !== currentAuthority.schedulingGroupKey
+    || persistedAuthorityConflicts(prospective, currentAuthority)
+  )) throw new Error("Immutable job scheduling authority cannot be changed");
+  const committedPatch = job.schedulingGroupKey ? patch : { ...patch, ...currentAuthority };
   const existing = await jobRuntimeFor(ctx, job._id);
-  await ctx.db.patch(job._id, patch);
-  const projected = projectJobRuntime(mergeJobRuntimeSource(job, patch, existing));
+  await ctx.db.patch(job._id, committedPatch);
+  const projected = projectJobRuntime(mergeJobRuntimeSource(job, committedPatch, existing));
   if (existing) await ctx.db.replace(existing._id, projected);
   else await ctx.db.insert("jobRuntime", projected);
 }
