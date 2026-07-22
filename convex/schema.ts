@@ -271,8 +271,8 @@ export default defineSchema({
     evidenceSummary: v.optional(v.string()),
     branch: v.optional(v.string()),
     pullRequestUrl: v.optional(v.string()),
-    // read_only = evidence only; auto_merge = the delivery controller merges
-    // a verified branch in Daniel's org; manual = protected external action.
+    // read_only = evidence only; branch_only = verified work remains on its
+    // isolated branch; auto_merge is legacy; manual = protected draft PR.
     deliveryMode: v.optional(v.string()),
     deliveryStatus: v.optional(v.string()), // branch | pull_request | merged | blocked
     mergeCommitSha: v.optional(v.string()),

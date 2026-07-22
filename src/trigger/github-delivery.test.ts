@@ -349,6 +349,7 @@ describe("real controller continuation caller", () => {
 
   it.each([
     ["read_only", true, "read_only_complete"],
+    ["branch_only", true, "branch_only_complete"],
     ["manual", false, "no_change"],
     ["auto_merge", false, "no_change"],
   ] as const)("enforces %s without any GitHub call when branchChanged=%s", async (policy, branchChanged, outcome) => {
@@ -359,5 +360,23 @@ describe("real controller continuation caller", () => {
       fetchImpl: fetchImpl as typeof fetch,
     })).resolves.toMatchObject({ ok: true, outcome, providerCall: false });
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("completes branch-only delivery before every provider-effect hook", async () => {
+    const fetchImpl = vi.fn();
+    const prepareEffect = vi.fn();
+    const observeEffect = vi.fn();
+    await expect(continueRepositoryDelivery({
+      policy: "branch_only", branchChanged: true, reconcileMerge: true,
+      repo: "daniels-project-space/jarvis", branch: "jarvis/work",
+      title: "work", body: "evidence", token: "",
+      reviewed: { headSha: HEAD, baseSha: BASE }, expectedPull: pull(),
+      fetchImpl: fetchImpl as typeof fetch, prepareEffect, observeEffect,
+    })).resolves.toEqual({
+      ok: true, outcome: "branch_only_complete", deliveryStatus: "branch", providerCall: false,
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(prepareEffect).not.toHaveBeenCalled();
+    expect(observeEffect).not.toHaveBeenCalled();
   });
 });

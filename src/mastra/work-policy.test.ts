@@ -57,26 +57,26 @@ describe("server-side work approval policy", () => {
     expect(SAFE_SANDBOX_EXECUTION_RULES).toContain("never authorizes live-effect flags");
   });
 
-  it("lets verified delivery run autonomously inside Daniel's repository", () => {
+  it("keeps safe owned-repository work autonomous but branch-only", () => {
     expect(
       workApprovalPolicy({
         task: "Deploy the release to production",
         repo: "jarvis",
         approvalRequired: false,
       }),
-    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    ).toMatchObject({ required: false, deliveryMode: "branch_only" });
     expect(
       workApprovalPolicy({
         task: "Merge the verified fix and deploy it",
         repo: "daniels-project-space/jarvis",
       }),
-    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    ).toMatchObject({ required: false, deliveryMode: "branch_only" });
     expect(
       workApprovalPolicy({
         task: "Merge the verified fix and deploy it",
         repo: "https://github.com/daniels-project-space/jarvis.git",
       }),
-    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    ).toMatchObject({ required: false, deliveryMode: "branch_only" });
     expect(
       workApprovalPolicy({
         task: "Fix the parser and run its regression suite",
@@ -84,7 +84,7 @@ describe("server-side work approval policy", () => {
         approvalRequired: true,
         risk: "consequential",
       }),
-    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    ).toMatchObject({ required: false, deliveryMode: "branch_only" });
   });
 
   it("gates messaging, money, booking and destructive actions", () => {
@@ -155,7 +155,7 @@ describe("server-side work approval policy", () => {
     ).toBe(false);
     expect(workApprovalPolicy({ task: "Fix the parser and run tests", repo: "jarvis" })).toMatchObject({
       required: false,
-      deliveryMode: "auto_merge",
+      deliveryMode: "branch_only",
     });
     expect(workApprovalPolicy({ task: "Research current orchestration patterns" }).required).toBe(false);
     expect(
@@ -165,13 +165,13 @@ describe("server-side work approval policy", () => {
         repo: "jarvis",
         risk: "high",
       }),
-    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    ).toMatchObject({ required: false, deliveryMode: "branch_only" });
     expect(
       workApprovalPolicy({
         task: "Wire the Shopify order/fulfillment pipeline and make its webhook idempotent",
         repo: "daniels-project-space/dropship-ai",
       }),
-    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    ).toMatchObject({ required: false, deliveryMode: "branch_only" });
   });
 
   it("does not classify persisted conversational engineering evidence as consequential", () => {
@@ -219,7 +219,7 @@ describe("server-side work approval policy", () => {
       });
       expect(workApprovalPolicy({ task, repo: "jarvis", risk: "high" })).toMatchObject({
         required: false,
-        deliveryMode: "auto_merge",
+        deliveryMode: "branch_only",
       });
     }
 
@@ -247,7 +247,7 @@ describe("server-side work approval policy", () => {
       });
       expect(workApprovalPolicy({ task, repo: "jarvis", risk: "high" })).toMatchObject({
         required: false,
-        deliveryMode: "auto_merge",
+        deliveryMode: "branch_only",
       });
     }
     expect(
@@ -285,7 +285,7 @@ describe("server-side work approval policy", () => {
         approvalRequired: true,
         goalStage: "building",
       });
-      expect(standalone).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+      expect(standalone).toMatchObject({ required: false, deliveryMode: "branch_only" });
       expect(goalMode).toEqual(standalone);
     }
   });
@@ -422,7 +422,7 @@ describe("server-side work approval policy", () => {
       repo,
       risk: "consequential",
       approvalRequired: true,
-    })).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    })).toMatchObject({ required: false, deliveryMode: "branch_only" });
     for (const goalStage of ["building", "refining"] as const) {
       expect(goalWorkApprovalPolicy({
         task: VERCEL_TECHNICAL_LIFECYCLE_REGRESSION,
@@ -430,7 +430,7 @@ describe("server-side work approval policy", () => {
         risk: "consequential",
         approvalRequired: true,
         goalStage,
-      })).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+      })).toMatchObject({ required: false, deliveryMode: "branch_only" });
     }
   });
 
@@ -500,7 +500,7 @@ describe("server-side work approval policy", () => {
       });
       expect(workApprovalPolicy({ task, repo }), task).toMatchObject({
         required: false,
-        deliveryMode: "auto_merge",
+        deliveryMode: "branch_only",
       });
     }
   });
@@ -623,7 +623,7 @@ describe("server-side work approval policy", () => {
       });
       expect(workApprovalPolicy({ task, repo: "jarvis", risk: "high" })).toMatchObject({
         required: false,
-        deliveryMode: "auto_merge",
+        deliveryMode: "branch_only",
       });
     }
   });
@@ -665,13 +665,13 @@ describe("server-side work approval policy", () => {
         task: "Do not send the delivery-controller review prompt to the reviewer. Send the delivery-controller review prompt through stdin only.",
         repo: "jarvis",
       }),
-    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    ).toMatchObject({ required: false, deliveryMode: "branch_only" });
     expect(
       workApprovalPolicy({
         task: "Do not post the index-stage findings publicly. Add only the post-index filter.",
         repo: "jarvis",
       }),
-    ).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    ).toMatchObject({ required: false, deliveryMode: "branch_only" });
   });
 
   it("does not deadlock Goal Mode on its own generated planner safety contract", () => {

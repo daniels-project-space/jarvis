@@ -49,7 +49,7 @@ export type MergeDeliveryResult =
 export type ControllerDeliveryResult =
   | {
       ok: true;
-      outcome: "protected_draft" | "read_only_complete" | "no_change" | "merged";
+      outcome: "protected_draft" | "read_only_complete" | "branch_only_complete" | "no_change" | "merged";
       deliveryStatus: "branch" | "pull_request" | "merged";
       providerCall: boolean;
       pull?: PullRequestDelivery;
@@ -393,7 +393,7 @@ export async function mergeVerifiedPullRequest(args: {
 
 /** The one executable provider-delivery path used by Trigger continuations. */
 export async function continueRepositoryDelivery(args: {
-  policy: "manual" | "read_only" | "auto_merge";
+  policy: "manual" | "read_only" | "branch_only" | "auto_merge";
   branchChanged: boolean;
   reconcileMerge?: boolean;
   repo: string;
@@ -409,6 +409,12 @@ export async function continueRepositoryDelivery(args: {
 } & EffectHooks): Promise<ControllerDeliveryResult> {
   if (args.policy === "read_only") {
     return { ok: true, outcome: "read_only_complete", deliveryStatus: "branch", providerCall: false };
+  }
+  // Branch-only completion is intentionally decided before every ref read,
+  // PR lookup, effect preparation, and token-dependent provider path. The
+  // signed review receipt already binds the exact base/head and worker branch.
+  if (args.policy === "branch_only") {
+    return { ok: true, outcome: "branch_only_complete", deliveryStatus: "branch", providerCall: false };
   }
   if (!args.branchChanged && !args.reconcileMerge) {
     return { ok: true, outcome: "no_change", deliveryStatus: "branch", providerCall: false };

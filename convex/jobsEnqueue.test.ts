@@ -95,7 +95,9 @@ describe("bounded exact textual work orders", () => {
       runtime: await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", jobId)).first(),
     }));
 
-    expect(stored.job).toMatchObject({ task: fixture, approvalRequired: false, status: "pending" });
+    expect(stored.job).toMatchObject({
+      task: fixture, approvalRequired: false, status: "pending", deliveryMode: "branch_only",
+    });
     const durableTask = (stored.job as { task: string } | null)?.task;
     expect(durableTask).toBe(fixture);
     expect(textWorkOrderByteLength(durableTask!)).toBe(7_876);

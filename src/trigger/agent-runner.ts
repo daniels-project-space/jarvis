@@ -954,7 +954,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           && deliveryFence
           // The review receipt, not a delivery mode, authorizes a controller
           // continuation.  Policy below decides draft/merge/no-op semantics.
-          && (integrationContinuation || ["auto_merge", "manual", "read_only"].includes(continuationPolicy))
+          && (integrationContinuation || ["auto_merge", "manual", "read_only", "branch_only"].includes(continuationPolicy))
         );
         const repositoryReadiness = repositoryDeliveryReadiness(
           controllerContinuation,
@@ -968,7 +968,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }).catch(() => null);
           return;
         }
-        if (controllerContinuation && continuationPolicy !== "read_only" && !token) {
+        if (controllerContinuation && !["read_only", "branch_only"].includes(continuationPolicy) && !token) {
           await deliveryMutation("jobs:checkpointAndRequeue", {
             jobId: job.jobId, expectedAttempt,
             checkpoint: "Verified repository delivery is held because the controller repository capability is unavailable.",
@@ -976,7 +976,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }).catch(() => null);
           return;
         }
-        const mayResumeControllerDelivery = controllerContinuation && (continuationPolicy === "read_only" || Boolean(token));
+        const mayResumeControllerDelivery = controllerContinuation
+          && (["read_only", "branch_only"].includes(continuationPolicy) || Boolean(token));
         if (mayResumeControllerDelivery) {
           // Check waits are provider time, not silence: renew the exact
           // controller generation below the 45s lease. A failed renewal is
@@ -1185,10 +1186,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 ...(typeof job.deliveryMergeCommitSha === "string" ? { mergeCommitSha: job.deliveryMergeCommitSha } : {}),
               } satisfies PullRequestDelivery
             : undefined;
-          const terminalOutcomes = new Set(["protected_draft", "read_only_complete", "no_change", "merged"]);
+          const terminalOutcomes = new Set(["protected_draft", "read_only_complete", "branch_only_complete", "no_change", "merged"]);
           const priorTerminal = job.deliveryStep === "receipt" && terminalOutcomes.has(String(job.deliveryOutcome));
           const reconcileMerge = !priorTerminal && job.deliveryPreparedEffectKind === "merge_pr";
-          const branchChanged = priorTerminal || continuationPolicy === "read_only"
+          const branchChanged = priorTerminal || ["read_only", "branch_only"].includes(continuationPolicy)
             ? false
             : reconcileMerge ? false
               : resumeBranch ? await branchHasChanges(repo, resumeBranch, token) : null;
@@ -1197,7 +1198,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             : `${profile.name}: ${(job.label ?? job.task).slice(0, 82)}`;
           const delivery = priorTerminal
             ? {
-                ok: true as const, outcome: job.deliveryOutcome as "protected_draft" | "read_only_complete" | "no_change" | "merged",
+                ok: true as const, outcome: job.deliveryOutcome as "protected_draft" | "read_only_complete" | "branch_only_complete" | "no_change" | "merged",
                 deliveryStatus: job.deliveryOutcome === "protected_draft" ? "pull_request" as const
                   : job.deliveryOutcome === "merged" ? "merged" as const : "branch" as const,
                 providerCall: ["protected_draft", "merged"].includes(String(job.deliveryOutcome)),
@@ -1206,7 +1207,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             : branchChanged === null
               ? { ok: false as const, note: "the controller could not compare the verified branch with the default branch" }
               : await continueRepositoryDelivery({
-                  policy: continuationPolicy as "manual" | "read_only" | "auto_merge",
+                  policy: continuationPolicy as "manual" | "read_only" | "branch_only" | "auto_merge",
                   branchChanged, reconcileMerge, repo, branch: resumeBranch, title,
                   body: `## JARVIS verified delivery continuation\n${String(job.result ?? "Supervisor verification passed.")}`,
                   token: String(token ?? ""),
@@ -1263,6 +1264,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }
           const protectedDraft = delivery.outcome === "protected_draft";
           const readOnlyDelivery = delivery.outcome === "read_only_complete";
+          const branchOnlyDelivery = delivery.outcome === "branch_only_complete";
           const pullRequestUrl = delivery.pull?.url ?? "";
           const mergeSha = delivery.mergeCommitSha ?? "";
           const deliveryResult = [
@@ -1271,6 +1273,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               ? `Delivery: protected draft PR ready for Daniel at ${pullRequestUrl ?? resumeBranch}.`
               : readOnlyDelivery
                 ? "Delivery: read-only controller receipt finalized without a GitHub mutation."
+              : branchOnlyDelivery
+                ? `Delivery: verified source work is complete on isolated branch ${resumeBranch}; no PR, merge, default-branch update, or deployment was attempted.`
               : `Delivery: verified branch ${resumeBranch} is on the default branch${pullRequestUrl ? ` via ${pullRequestUrl}` : ""}${mergeSha ? ` at ${mergeSha}` : ""}.`,
           ].filter(Boolean).join("\n\n").slice(0, 4_000);
           const finalized = await deliveryMutation("jobs:finalize", {
@@ -1290,7 +1294,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           if (job.goalStage) await drainGoalAdvances();
           else if (job.missionId) await maybeSynthesizeMission(job.missionId);
           else {
-            const line = `${profile.name}'s verified branch is merged; the controller finished delivery without rerunning the work.`;
+            const line = branchOnlyDelivery
+              ? `${profile.name}'s verified work is complete on its isolated branch; no release action was taken.`
+              : `${profile.name}'s verified branch is merged; the controller finished delivery without rerunning the work.`;
             await convexMutation("chatQueue:postAssistant", { threadId: originThread, text: line }).catch(() => {});
             await sendPush("JARVIS", line, "/").catch(() => {});
           }

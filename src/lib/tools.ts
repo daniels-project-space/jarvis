@@ -25,7 +25,7 @@ export const TOOL_DEFS = [
   {
     name: "dispatch_agent",
     description:
-      "Delegate durable work to JARVIS's permanent team. The same specialist can own multiple concurrent jobs, so dispatch a follow-up without pausing earlier work and link it with parent_job_id when known. The manager chooses Paul (development), Atlas (research/strategy), Iris (creative), Maya (travel), or Sentry (reliability), selects Luna/Terra/Sol intelligence, binds it to this conversation, and returns immediately. Work can checkpoint and continue for hours or days. Verified code changes in Daniel's repositories are merged automatically by the delivery controller; only protected external actions wait for Daniel. Do not delegate quick lookups.",
+      "Delegate durable work to JARVIS's permanent team. The same specialist can own multiple concurrent jobs, so dispatch a follow-up without pausing earlier work and link it with parent_job_id when known. The manager chooses Paul (development), Atlas (research/strategy), Iris (creative), Maya (travel), or Sentry (reliability), selects Luna/Terra/Sol intelligence, binds it to this conversation, and returns immediately. Work can checkpoint and continue for hours or days. Verified code changes in Daniel's repositories finish on their isolated worker branches; source-work authorization never opens a PR, merges a default branch, or deploys. Protected external actions wait for Daniel. Do not delegate quick lookups.",
     parameters: {
       type: "object",
       properties: {

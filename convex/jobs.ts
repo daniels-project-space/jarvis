@@ -43,7 +43,7 @@ const DELIVERY_RETRY_LIMIT = 6;
 const REVIEW_RECEIPT_MAX_CHARS = 300_000;
 const GIT_OID = /^[0-9a-f]{40,64}$/i;
 const DELIVERY_OUTCOMES = new Set([
-  "protected_draft", "read_only_complete", "no_change",
+  "protected_draft", "read_only_complete", "branch_only_complete", "no_change",
   "merged", "blocked", "needs_attention",
 ]);
 
@@ -52,7 +52,13 @@ function outcomeAllowed(policy: string, outcome: string) {
   if (outcome === "merged") return policy === "auto_merge";
   if (outcome === "protected_draft") return policy === "manual";
   if (outcome === "read_only_complete") return policy === "read_only";
+  if (outcome === "branch_only_complete") return policy === "branch_only";
   return true;
+}
+
+export function reconciledLegacyDeliveryMode(readonly: boolean, current?: string) {
+  if (readonly) return "read_only" as const;
+  return current === "auto_merge" ? "auto_merge" as const : "branch_only" as const;
 }
 
 async function sha256Hex(value: string) {
@@ -459,9 +465,11 @@ async function migrateLegacyJobsPage(ctx: any, migration?: any) {
         approvalRequired: false,
         approvalReason: undefined,
         approvalStatus: "superseded",
-        deliveryMode: row.readonly === true ? "read_only" : "auto_merge",
+        // Existing automatic rows may already name prepared provider effects.
+        // Preserve that reconciliation identity; never mint the legacy mode.
+        deliveryMode: reconciledLegacyDeliveryMode(row.readonly === true, row.deliveryMode),
         stage: "queued",
-        progress: "autonomous software delivery enabled — queued",
+        progress: "autonomous branch-only software work enabled — queued",
         nextRunAt: now,
       };
       await patchJobWithRuntime(ctx, row, patch);
@@ -472,7 +480,7 @@ async function migrateLegacyJobsPage(ctx: any, migration?: any) {
       for (const approval of approvals) {
         if (approval.status === "pending") await ctx.db.patch(approval._id, { status: "superseded", resolvedAt: now });
       }
-      await appendAttemptEvidence(ctx, row, "autonomy_reconciled", "Legacy software-delivery approval removed; verified delivery is automatic", {
+      await appendAttemptEvidence(ctx, row, "autonomy_reconciled", "Legacy software-work approval removed; verified work remains on its isolated branch", {
         stage: "queued", percent: row.percent ?? 0, evidenceKind: "reconcile", eventKey: `autonomy-reconciled:${row.attempt ?? 1}`,
       });
       repaired += 1;
@@ -525,7 +533,10 @@ async function migrateLegacyMissionsPage(ctx: any, migration?: any) {
         const stream = byId.get(String(job.goalWorkstreamId));
         if (stream) {
           const readonly = stream.readonly === true;
-          const deliveryMode = readonly ? "read_only" : "auto_merge";
+          // A persisted automatic job may already own provider-effect
+          // reconciliation state. Keep its policy identity while ensuring
+          // every previously unclassified writable stream becomes branch-only.
+          const deliveryMode = reconciledLegacyDeliveryMode(readonly, job.deliveryMode);
           if (job.readonly !== readonly || job.deliveryMode !== deliveryMode || (readonly && job.branch)) {
             patch.readonly = readonly;
             patch.deliveryMode = deliveryMode;
@@ -1097,7 +1108,7 @@ export const finalize = mutation({
     const delivery = a.deliveryGeneration === undefined ? null : await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration));
     if (row.repo && (!delivery || !hasLiveControllerFence(row, delivery, a))) return false;
     if (row.repo) {
-      const successfulOutcomes = new Set(["protected_draft", "read_only_complete", "no_change", "merged"]);
+      const successfulOutcomes = new Set(["protected_draft", "read_only_complete", "branch_only_complete", "no_change", "merged"]);
       const terminalOutcome = String(delivery?.outcome ?? "");
       if (delivery?.currentStep !== "receipt" || !outcomeAllowed(String(delivery.policy), terminalOutcome)) return false;
       if (a.status === "done" ? !successfulOutcomes.has(terminalOutcome) : !["blocked", "needs_attention"].includes(terminalOutcome)) return false;
@@ -2356,9 +2367,10 @@ export const prepareDeliveryEffect = mutation({
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
       || !hasLiveControllerFence(row, delivery, a) || delivery.status !== "running") return null;
     if (a.reviewedHeadSha !== delivery.reviewedHeadSha || a.reviewedBaseSha !== delivery.reviewedBaseSha) return null;
-    if (delivery.policy === "read_only") return null;
+    if (delivery.policy === "read_only" || delivery.policy === "branch_only") return null;
     if (delivery.policy === "manual" && a.effectKind !== "create_draft_pr") return null;
-    if (delivery.policy === "auto_merge" && !["create_pr", "promote_pr", "merge_pr"].includes(a.effectKind)) return null;
+    else if (delivery.policy === "auto_merge" && !["create_pr", "promote_pr", "merge_pr"].includes(a.effectKind)) return null;
+    else if (!["manual", "auto_merge"].includes(String(delivery.policy))) return null;
     if (a.effectKind === "merge_pr" && (!a.pullRequestNumber || delivery.pullRequestNumber !== a.pullRequestNumber)) return null;
     const prior = (delivery.effects ?? []).find((effect: any) => effect.effectId === a.effectId);
     if (prior) {
@@ -2466,7 +2478,7 @@ export const setDelivery = mutation({
     pullRequestNodeId: v.optional(v.string()),
     pullRequestDraft: v.optional(v.boolean()),
     outcome: v.optional(v.union(
-      v.literal("protected_draft"), v.literal("read_only_complete"), v.literal("no_change"),
+      v.literal("protected_draft"), v.literal("read_only_complete"), v.literal("branch_only_complete"), v.literal("no_change"),
       v.literal("merged"), v.literal("blocked"), v.literal("needs_attention"),
     )),
     providerCall: v.optional(v.boolean()),
@@ -2489,6 +2501,7 @@ export const setDelivery = mutation({
     const policy = String(delivery.policy);
     if ((policy === "manual" && a.deliveryStatus === "merged")
       || (policy === "read_only" && (a.providerCall === true || a.deliveryStatus === "merged" || a.pullRequestUrl))
+      || (policy === "branch_only" && (a.providerCall === true || !["branch", "blocked"].includes(String(a.deliveryStatus)) || a.pullRequestUrl || a.pullRequestNumber || a.pullRequestNodeId || a.mergeCommitSha))
       || (a.deliveryStatus === "merged" && policy !== "auto_merge")) return false;
     if (a.observedPullRequestHead && a.observedPullRequestHead !== delivery.reviewedHeadSha && a.outcome !== "needs_attention") return false;
     if (a.observedPullRequestBase && a.observedPullRequestBase !== delivery.reviewedBaseSha && a.outcome !== "needs_attention") return false;
@@ -2497,6 +2510,7 @@ export const setDelivery = mutation({
       || !a.pullRequestNodeId || a.observedPullRequestHead !== delivery.reviewedHeadSha
       || a.observedPullRequestBase !== delivery.reviewedBaseSha)) return false;
     if (a.outcome === "read_only_complete" && (a.providerCall || a.pullRequestNumber || a.pullRequestUrl)) return false;
+    if (a.outcome === "branch_only_complete" && (a.providerCall || a.deliveryStatus !== "branch" || a.pullRequestNumber || a.pullRequestUrl || a.pullRequestNodeId || a.mergeCommitSha)) return false;
     if (a.outcome === "merged" && (!a.mergeCommitSha || a.deliveryStatus !== "merged" || a.pullRequestDraft !== false)) return false;
     const providerBacked = a.providerCall === true || a.outcome === "protected_draft" || a.outcome === "merged"
       || a.deliveryStatus === "pull_request" || a.deliveryStatus === "merged";

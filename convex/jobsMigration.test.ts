@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { migrateControlPlaneStep } from "./jobs";
+import { migrateControlPlaneStep, reconciledLegacyDeliveryMode } from "./jobs";
 
 type MigrationState = {
   _id: string;
@@ -91,6 +91,14 @@ function migrationHarness(input?: {
 }
 
 describe("control-plane projection migration", () => {
+  it("mints branch-only policy while preserving persisted automatic reconciliation", () => {
+    expect(reconciledLegacyDeliveryMode(false)).toBe("branch_only");
+    expect(reconciledLegacyDeliveryMode(false, "manual")).toBe("branch_only");
+    expect(reconciledLegacyDeliveryMode(false, "branch_only")).toBe("branch_only");
+    expect(reconciledLegacyDeliveryMode(false, "auto_merge")).toBe("auto_merge");
+    expect(reconciledLegacyDeliveryMode(true, "auto_merge")).toBe("read_only");
+  });
+
   it("performs at most one real pagination call in each mutation invocation", async () => {
     const harness = migrationHarness({
       jobs: [{ page: [], isDone: true, continueCursor: "jobs-done" }],

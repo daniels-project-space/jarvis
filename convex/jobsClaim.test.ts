@@ -19,7 +19,7 @@ const DIFF = "d".repeat(64);
 const SIGNATURE = "e".repeat(64);
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 
-type Policy = "manual" | "read_only" | "auto_merge";
+type Policy = "manual" | "read_only" | "branch_only" | "auto_merge";
 
 async function specialistFixture(policy: Policy = "manual", goalStage?: "validating") {
   const t = convexTest(schema, modules);
@@ -291,6 +291,7 @@ describe("real Convex delivery policy outcomes", () => {
 
   it.each([
     ["read_only", "read_only_complete"],
+    ["branch_only", "branch_only_complete"],
     ["manual", "no_change"],
     ["auto_merge", "no_change"],
   ] as const)("finalizes %s as %s without a provider effect", async (policy, outcome) => {
@@ -328,6 +329,36 @@ describe("real Convex delivery policy outcomes", () => {
       pullRequestNumber: 42, pullRequestNodeId: "PR_42", pullRequestDraft: true, observedPullRequestHead: HEAD,
       observedPullRequestBase: BASE, outcome: "protected_draft", providerCall: true,
     })).toBe(true);
+  });
+
+  it("makes branch-only completion provider-effect-free and identity preserving", async () => {
+    const f = await committedAndClaimed("branch_only");
+    expect(f.claim).toMatchObject({
+      deliveryMode: "branch_only",
+      deliveryPolicy: "branch_only",
+      deliveryObservedHeadSha: null,
+      deliveryObservedBaseSha: null,
+    });
+    expect(await f.t.mutation(api.jobs.prepareDeliveryEffect, {
+      ...f.fence, effectId: "pr:forbidden", effectKind: "create_pr",
+      reviewedHeadSha: HEAD, reviewedBaseSha: BASE,
+    })).toBeNull();
+    expect(await f.t.mutation(api.jobs.setDelivery, {
+      ...f.fence, branch: "jarvis/reviewed", deliveryStatus: "pull_request",
+      pullRequestUrl: "https://github.test/pull/42", pullRequestNumber: 42,
+      pullRequestNodeId: "PR_42", pullRequestDraft: true,
+      outcome: "branch_only_complete", providerCall: true,
+    })).toBe(false);
+    expect(await f.t.mutation(api.jobs.setDelivery, {
+      ...f.fence, branch: "jarvis/reviewed", deliveryStatus: "branch",
+      outcome: "branch_only_complete", providerCall: false,
+    })).toBe(true);
+    const state = await rows(f.t);
+    expect(state.deliveries[0]).toMatchObject({
+      policy: "branch_only", reviewedHeadSha: HEAD, reviewedBaseSha: BASE,
+      outcome: "branch_only_complete", currentStep: "receipt",
+    });
+    expect(state.deliveries[0].effects ?? []).toHaveLength(0);
   });
 
   it("allows only automatic policy to record the exact merged outcome", async () => {
@@ -371,7 +402,7 @@ describe("real Convex delivery policy outcomes", () => {
     expect(state.deliveries[0].terminalReceiptDigest).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it.each(["manual", "read_only", "auto_merge"] as const)("records an explicit blocked terminal outcome for %s", async (policy) => {
+  it.each(["manual", "read_only", "branch_only", "auto_merge"] as const)("records an explicit blocked terminal outcome for %s", async (policy) => {
     const f = await committedAndClaimed(policy);
     expect(await f.t.mutation(api.jobs.setDelivery, {
       ...f.fence, deliveryStatus: "blocked", outcome: "blocked", providerCall: false,

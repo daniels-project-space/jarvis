@@ -9,7 +9,7 @@ export type WorkApprovalInput = {
   approvalRequired?: boolean;
 };
 
-export type WorkDeliveryMode = "read_only" | "auto_merge" | "manual";
+export type WorkDeliveryMode = "read_only" | "branch_only" | "auto_merge" | "manual";
 
 export type WorkApprovalDecision = {
   required: boolean;
@@ -44,7 +44,7 @@ export function workApprovalPolicy(input: WorkApprovalInput): WorkApprovalDecisi
   // recreate Daniel-facing approval cards for safe repository work.
   if (input.readonly === true) return { required: false, deliveryMode: "read_only" };
   if (input.repo?.trim()) {
-    if (isOwnedRepository(input.repo)) return { required: false, deliveryMode: "auto_merge" };
+    if (isOwnedRepository(input.repo)) return { required: false, deliveryMode: "branch_only" };
     return {
       required: true,
       reason: "repository is outside Daniel's autonomous portfolio",
