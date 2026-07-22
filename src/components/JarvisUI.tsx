@@ -43,8 +43,9 @@ import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actio
 import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
 import { viewerFetch } from "@/lib/viewer-request";
 import { normalizeIncidentSignature } from "@/lib/incident-signature";
+import { isForegroundBusy } from "@/lib/foreground-state";
 import { FleetCommandCenter } from "./CompactWorkBar";
-import { useViewerSession } from "@/lib/viewer-session";
+import { isGuestViewerSession, useViewerSession } from "@/lib/viewer-session";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -1098,6 +1099,8 @@ function SpokenCaption({ caption }: { caption: NonNullable<Caption> }) {
 
 export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const orbMotionRef = useRef<OrbMotionFrame>(createOrbMotionFrame());
+  const viewerToken = useViewerSession();
+  const guest = isGuestViewerSession(viewerToken);
   useEffect(() => {
     if (!embedded) return;
     document.documentElement.classList.add("jarvis-embedded-document");
@@ -1107,10 +1110,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       document.body.classList.remove("jarvis-embedded-document");
     };
   }, [embedded]);
-  const activeThreadQuery = useJarvisQuery(api.ui.getActiveThread, {});
-  const activeThreadReady = activeThreadQuery !== undefined;
-  const thread = (activeThreadQuery ?? "main") as string;
-  const threads = (useJarvisQuery(api.ui.getThreads, embedded ? "skip" : {}) ?? []) as { id: string; title: string; at: number }[];
+  const activeThreadQuery = useJarvisQuery(api.ui.getActiveThread, guest ? "skip" : {});
+  // A guest never reads the shared UI row. Its conversation query derives a
+  // private guest:<id> thread server-side, so "main" is only a local label.
+  const activeThreadReady = guest || activeThreadQuery !== undefined;
+  const thread = (guest ? "main" : activeThreadQuery ?? "main") as string;
+  const threads = (useJarvisQuery(api.ui.getThreads, embedded || guest ? "skip" : {}) ?? []) as { id: string; title: string; at: number }[];
   const setActiveThread = (args: { thread: string; title?: string }) =>
     viewerFetch("/api/client-state", {
       method: "POST",
@@ -1146,7 +1151,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const fullMessages = useJarvisQuery(api.chatQueue.listMessages, embedded ? "skip" : { threadId: thread });
   const embeddedMessages = useJarvisQuery(api.chatQueue.listRecentMessages, embedded ? { threadId: thread } : "skip");
   const messages = ((embedded ? embeddedMessages : fullMessages) ?? []) as Msg[];
-  const remotePanel = useJarvisQuery(api.ui.getPanel, embedded ? "skip" : {}) as
+  const remotePanel = useJarvisQuery(api.ui.getPanel, embedded || guest ? "skip" : {}) as
     | StagePanel
     | null
     | undefined;
@@ -1157,32 +1162,37 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const panel = instantPanel ?? remotePanel;
   const panelRoute = useMemo(() => (panel ? resolvePanelRoute(panel) : null), [panel]);
   const stagePanelSize = panelRoute?.size ?? "";
-  const clearPanel = (args: Record<string, unknown>) => clientMutation("ui:clearPanel", args);
-  const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);
+  // Guests have no panel, work, capability, or control plane. Keeping these
+  // as local no-ops avoids turning harmless UI transitions into rejected
+  // privileged requests while their voice/text lane stays available.
+  const privateMutation = <T,>(path: string, args: Record<string, unknown>) =>
+    guest ? Promise.resolve(undefined as T) : clientMutation<T>(path, args);
+  const clearPanel = (args: Record<string, unknown>) => privateMutation("ui:clearPanel", args);
+  const setPanel = (args: Record<string, unknown>) => privateMutation("ui:setPanel", args);
   const logTurn = (args: { threadId?: string; role: string; text: string; model?: string }) =>
     viewerFetch("/api/client-state", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "log_turn", ...args }),
     });
-  const saveSub = (args: Record<string, unknown>) => clientMutation("push:saveSub", args);
-  const claimVoice = (args: Record<string, unknown>) => clientMutation("ui:claimVoice", args);
-  const electVoice = (args: Record<string, unknown>) => clientMutation("ui:electVoice", args);
-  const setLiveOn = (args: Record<string, unknown>) => clientMutation("ui:setLiveOn", args);
-  const voiceRow = useJarvisQuery(api.ui.getVoice, {}) as { value: string; updatedAt: number } | null | undefined;
-  const liveOnRow = useJarvisQuery(api.ui.getLiveOn, {}) as { value: string; updatedAt: number } | null | undefined;
+  const saveSub = (args: Record<string, unknown>) => privateMutation("push:saveSub", args);
+  const claimVoice = (args: Record<string, unknown>) => privateMutation("ui:claimVoice", args);
+  const electVoice = (args: Record<string, unknown>) => privateMutation<boolean>("ui:electVoice", args);
+  const setLiveOn = (args: Record<string, unknown>) => privateMutation<boolean>("ui:setLiveOn", args);
+  const voiceRow = useJarvisQuery(api.ui.getVoice, guest ? "skip" : {}) as { value: string; updatedAt: number } | null | undefined;
+  const liveOnRow = useJarvisQuery(api.ui.getLiveOn, guest ? "skip" : {}) as { value: string; updatedAt: number } | null | undefined;
   const hostActionRow = useJarvisQuery(api.ui.getHostAction, embedded ? {} : "skip") as
     | { value: string; updatedAt: number }
     | null
     | undefined;
   const commandSnapshot = useJarvisQuery(
     api.commandCenter.snapshot,
-    embedded || !activeThreadReady ? "skip" : { threadId: thread },
+    embedded || guest || !activeThreadReady ? "skip" : { threadId: thread },
   ) as CompactWorkSnapshot | undefined;
   const [workDetailJobId, setWorkDetailJobId] = useState<string | null>(null);
   const workDetail = useJarvisQuery(
     api.jobs.detail,
-    workDetailJobId ? { jobId: workDetailJobId as never } : "skip",
+    !guest && workDetailJobId ? { jobId: workDetailJobId as never } : "skip",
   ) as CompactJobDetail | null | undefined;
   useEffect(() => setWorkDetailJobId(null), [thread]);
   const compactWorkCache = useRef<CompactWorkCache>(null);
@@ -1369,6 +1379,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const localVoiceLeaseUntilRef = useRef(0);
   const localVoiceClaimedAtRef = useRef(0);
   const ownVoice = () => {
+    if (guest) return Promise.resolve(undefined);
     // A direct interaction is authoritative locally. Waiting for the Convex
     // subscription to echo this claim back added ~650 ms before buffered
     // audio could start.
@@ -1392,7 +1403,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // The colour changes locally on the first keystroke/word, rather than
   // waiting for a streamed model reply or a Convex write. A deliberate manual
   // choice remains authoritative until Daniel returns it to automatic mode.
-  const moodRow = useJarvisQuery(api.ui.getMood, {}) as { value: string; title?: string; updatedAt: number } | null | undefined;
+  const moodRow = useJarvisQuery(api.ui.getMood, guest ? "skip" : {}) as { value: string; title?: string; updatedAt: number } | null | undefined;
   const [contextMood, setContextMood] = useState<OrbMood>("calm");
   const manualMood = moodRow?.title === "manual" && moodRow.value in MOOD_COLORS ? (moodRow.value as OrbMood) : null;
   const activeMood = manualMood ?? contextMood;
@@ -1407,7 +1418,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // Speech deliberately has no engine or voice switch: every device uses the
   // same neural Jarvis identity.
   const [optionsOpen, setOptionsOpen] = useState(false);
-  const setMoodMut = (args: Record<string, unknown>) => clientMutation("ui:setMood", args);
+  const setMoodMut = (args: Record<string, unknown>) => privateMutation("ui:setMood", args);
   const [prefs, setPrefs] = useState<JarvisPrefs>({ reduceMotion: false, liveDefault: true });
   const [permissions, setPermissions] = useState<JarvisPermissionState>({ microphone: "prompt", notifications: "prompt" });
   const [permissionBusy, setPermissionBusy] = useState(false);
@@ -1784,6 +1795,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // two visible tabs used to both optimistically claim and voice the same
   // sentence in stereo.
   async function ensureVoice(): Promise<boolean> {
+    if (guest) return true;
     if (Date.now() < localVoiceLeaseUntilRef.current) return true;
     const v = voiceRef.current;
     if (v && Date.now() - v.updatedAt <= 3 * 60 * 1000) return v.value === me.current;
@@ -1834,7 +1846,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     return true;
   }
 
-  const busy = sending || messages.some((m) => m.status === "pending" || (m.role === "assistant" && m.status === "streaming"));
+  const busy = sending || isForegroundBusy(messages);
 
   useEffect(() => {
     // scroll the message CONTAINER only — scrollIntoView reaches into the
@@ -2302,7 +2314,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // follow-up keeps the current visual; a topic switch clears it immediately
     // instead of leaving a stale chart/widget behind while the next turn runs.
     if (panel?.type === "video") setVideoPip(true);
-    else if (panel && !isPanelFollowUp(t, panel)) {
+    else if (!guest && panel && !isPanelFollowUp(t, panel)) {
       closedPanelRef.current = {
         key: `${panel.title ?? ""}|${panel.value.slice(0, 160)}`,
         ts: Date.now(),
@@ -2312,17 +2324,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       setPanelMin(true); // hide locally during the authenticated clear round-trip
       void clearPanel({});
     }
-    const fastDispatch = parseFastAgentDispatch(t);
+    const fastDispatch = guest ? null : parseFastAgentDispatch(t);
     if (fastDispatch) {
       void openFastAgentDispatch(fastDispatch, t);
       return;
     }
-    const fastChart = !liveRef.current ? parseFastChartIntent(t) : null;
+    const fastChart = !guest && !liveRef.current ? parseFastChartIntent(t) : null;
     if (fastChart) {
       void openFastChart(fastChart, t);
       return;
     }
-    const fastNetWorth = parseFastNetWorthIntent(t);
+    const fastNetWorth = guest ? null : parseFastNetWorthIntent(t);
     if (fastNetWorth) {
       void openFastNetWorth(fastNetWorth, t);
       return;

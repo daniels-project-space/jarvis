@@ -166,9 +166,9 @@ export const logTurn = mutation({
     ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
-    await requireActor(ctx, a);
+    const identity = await conversationIdentity(ctx, a);
     await ctx.db.insert("chatMessages", {
-      threadId: a.threadId ?? "main",
+      threadId: scopedConversationThread(identity, a.threadId),
       role: a.role,
       text: a.text,
       status: "done",

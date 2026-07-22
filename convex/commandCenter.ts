@@ -28,6 +28,10 @@ type HandoffRow = Record<string, any>;
 export function isUserRelevantWork(row: RuntimeRow, threadId: string): boolean {
   if (!RELEVANT.has(String(row.status ?? ""))) return false;
   if (row.visibility !== "conversation" || row.originThreadId !== threadId) return false;
+  // A pending child with prerequisites is represented inside its parent's DAG
+  // as dependency-held. It has no lease and must not make the foreground read
+  // "busy" merely because historical plan leaves still exist.
+  if (row.status === "pending" && Array.isArray(row.dependsOn) && row.dependsOn.length > 0) return false;
   const identity = [row.label, row.task, row.stage, row.agentId].filter(Boolean).join(" ");
   return !ROUTINE_WORK.test(identity);
 }
