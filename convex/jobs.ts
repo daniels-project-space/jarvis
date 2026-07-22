@@ -1140,7 +1140,7 @@ export const finalize = mutation({
     const activity = success ? null : await jobRuntimeFor(ctx, a.jobId);
     const finalPercent = success ? 100 : activity?.percent ?? row.percent;
     const finalProgress = success
-      ? delivered ? "verified, merged and handed to deployment" : "verified and complete"
+      ? delivered ? "verified; gated controller observed the source merge; provider release remains separate" : "verified and complete"
       : activity?.progress ?? row.progress;
     const finalPatch = {
       status: a.status,
@@ -1178,7 +1178,7 @@ export const finalize = mutation({
       lastEventAt: now,
     });
     await appendAttemptEvidence(ctx, row, a.status,
-      success ? delivered ? "Work verified and merged automatically" : "Work verified and complete" : (a.result ?? a.status),
+      success ? delivered ? "Work verified; gated controller observed the source merge" : "Work verified and complete" : (a.result ?? a.status),
       { stage: success ? (delivered ? "delivered" : "verified") : a.status, percent: finalPercent, evidenceKind: success ? "completion_receipt" : "terminal", eventKey: terminalEventKey },
     );
     if (success) {

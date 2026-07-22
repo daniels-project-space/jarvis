@@ -11,6 +11,29 @@ import {
 import { PERMANENT_TEAM } from "../mastra/team";
 
 describe("versioned durable-work contract", () => {
+  it("does not restore stale automatic source-release promises", () => {
+    const forbiddenByFile = new Map<string, string[]>([
+      ["convex/jobs.ts", [
+        ["verified, merged", " and handed to deployment"].join(""),
+        ["Work verified and merged", " automatically"].join(""),
+      ]],
+      ["src/trigger/github-delivery.ts", [
+        ["Verified and delivered", " automatically by JARVIS."].join(""),
+      ]],
+      ["src/lib/tools.ts", [
+        ["Convex preserves checkpoints,", " automatic delivery"].join(""),
+      ]],
+      ["src/lib/goal-mode.ts", [
+        ["hands the branch to the", " automatic delivery controller"].join(""),
+      ]],
+    ]);
+
+    for (const [path, forbiddenPhrases] of forbiddenByFile) {
+      const source = readFileSync(join(process.cwd(), path), "utf8");
+      for (const phrase of forbiddenPhrases) expect(source, `${path}: ${phrase}`).not.toContain(phrase);
+    }
+  });
+
   it("uses one secret-free scoped manifest for Mastra and the durable runtime", () => {
     expect(WORKFLOW_CONTRACT.version).toBe("1.0");
     expect(WORKFLOW_CONTRACT.scope).toMatchObject({

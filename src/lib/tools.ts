@@ -44,7 +44,7 @@ export const TOOL_DEFS = [
   {
     name: "orchestrate",
     description:
-      "Ask the Mastra JARVIS supervisor to plan and run a durable mission with the permanent team. You may supply 2-6 genuinely independent workstreams, or omit them and let the supervisor consult specialists and decompose the goal. Independent Trigger workers run pinned subscription Codex CLI sessions with repository-scoped tools; Trigger Realtime streams activity while Convex preserves checkpoints, automatic delivery and protected external decisions. One coherent reviewed result returns to the originating conversation.",
+      "Ask the Mastra JARVIS supervisor to plan and run a durable mission with the permanent team. You may supply 2-6 genuinely independent workstreams, or omit them and let the supervisor consult specialists and decompose the goal. Independent Trigger workers run pinned subscription Codex CLI sessions with repository-scoped tools; Trigger Realtime streams activity while Convex preserves checkpoints. Source integration is explicitly controller-gated, provider release remains separate, and protected external decisions stay gated. One coherent reviewed result returns to the originating conversation.",
     parameters: {
       type: "object",
       properties: {

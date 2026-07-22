@@ -34,7 +34,10 @@ function harness(options: { integration?: string | null; advance?: "applied" | "
       return options.conflict ? { status: "conflict" as const, reason: "content conflict" }
         : { status: "clean" as const, headSha: MERGED, treeSha: MERGED_TREE, synthetic: false };
     }),
-    stageCandidate: vi.fn(async () => ({ outcome: "applied" as const, providerHeadSha: MERGED })),
+    stageCandidate: vi.fn(async () => {
+      calls.push("STAGE");
+      return { outcome: "applied" as const, providerHeadSha: MERGED };
+    }),
     prepareRefEffect: vi.fn(async (input) => refEffect(input)),
     advanceRef: vi.fn(async ({ newHeadSha }) => {
       calls.push("GRAPHQL");
@@ -60,6 +63,30 @@ describe("serialized integration provider protocol", () => {
     expect(h.calls.indexOf("ATTEST")).toBeLessThan(h.calls.indexOf("GRAPHQL"));
     expect(prepare).toHaveBeenCalledWith(expect.objectContaining({ kind: "update_ref", expectedBaseSha: BASE, headSha: MERGED }));
     expect(observe).toHaveBeenCalledWith(expect.objectContaining({ observation: "applied", providerHeadSha: MERGED }));
+  });
+
+  it("attests the exact synthetic candidate before staging it and advancing the ref", async () => {
+    const h = harness();
+    const candidate = { headSha: MERGED, treeSha: MERGED_TREE };
+    vi.mocked(h.adapter.prepareMerge).mockImplementation(async () => {
+      h.calls.push("SANDBOX_MERGE");
+      return { status: "clean", headSha: MERGED, treeSha: MERGED_TREE, synthetic: true, candidate };
+    });
+    const prepare = vi.fn().mockResolvedValue({ replay: false });
+    const observe = vi.fn().mockResolvedValue(true);
+
+    await expect(integrateReviewedWorker(receipt, h.adapter, { prepare, observe })).resolves.toMatchObject({
+      status: "integrated", headSha: MERGED, treeSha: MERGED_TREE,
+    });
+
+    expect(h.adapter.attestDeploymentFence).toHaveBeenCalledWith({ headSha: MERGED, treeSha: MERGED_TREE });
+    expect(h.adapter.stageCandidate).toHaveBeenCalledWith(
+      expect.objectContaining({ synthetic: true, headSha: MERGED, treeSha: MERGED_TREE, candidate }),
+      { prepare, observe },
+    );
+    expect(h.adapter.advanceRef).toHaveBeenCalledTimes(1);
+    expect(h.calls.indexOf("ATTEST")).toBeLessThan(h.calls.indexOf("STAGE"));
+    expect(h.calls.indexOf("STAGE")).toBeLessThan(h.calls.indexOf("GRAPHQL"));
   });
 
   it("reconciles a lost ref response and never sends a second write", async () => {
@@ -153,8 +180,12 @@ describe("serialized integration provider protocol", () => {
     expect(h.calls).not.toContain("GRAPHQL");
   });
 
-  it("fails closed before effect preparation, staging, or updateRefs when the exact candidate tree is unfenced", async () => {
+  it("rejects an unfenced synthetic candidate with zero effect preparation, staging, or ref advancement", async () => {
     const h = harness();
+    vi.mocked(h.adapter.prepareMerge).mockResolvedValue({
+      status: "clean", headSha: MERGED, treeSha: MERGED_TREE, synthetic: true,
+      candidate: { headSha: MERGED, treeSha: MERGED_TREE },
+    });
     vi.mocked(h.adapter.attestDeploymentFence).mockRejectedValue(new Error("candidate vercel.json is missing"));
     const prepare = vi.fn();
     const result = await integrateReviewedWorker(receipt, h.adapter, { prepare, observe: vi.fn() });

@@ -363,7 +363,7 @@ export async function mergeVerifiedPullRequest(args: {
       headers,
       body: JSON.stringify({
         sha: reviewed.headSha, merge_method: "squash", commit_title: args.title.slice(0, 120),
-        commit_message: "Verified and delivered automatically by JARVIS.",
+        commit_message: "Verified source merge performed by the explicitly gated JARVIS controller. Provider release is separate.",
       }),
       cache: "no-store",
     }).catch(() => null);
