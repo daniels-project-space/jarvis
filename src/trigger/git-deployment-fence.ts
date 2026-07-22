@@ -26,6 +26,8 @@ export class GitDeploymentFenceError extends Error {
       | "invalid_git"
       | "unsafe_path"
       | "write_failed"
+      | "staging_failed"
+      | "commit_failed"
       | "verification_failed",
     readonly repair: string,
   ) {
@@ -183,4 +185,112 @@ export async function attestCommittedGitDeploymentFence(
     );
   }
   return attestGitDeploymentFenceContent(config.out);
+}
+
+/** Attest root configuration from one exact Git tree and blob, never worktree bytes. */
+export async function attestGitDeploymentFenceTree(
+  runGit: GitCommandRunner,
+  readGitObject: (sha: string) => Promise<Buffer>,
+  treeSha: string,
+): Promise<GitDeploymentFenceAttestation> {
+  if (!/^[0-9a-f]{40,64}$/i.test(treeSha)) {
+    throw new GitDeploymentFenceError("verification_failed", "the candidate tree identity is invalid");
+  }
+  const listed = await runGit(["ls-tree", "-z", treeSha, "--", "vercel.json", "vercel.ts"]);
+  if (listed.code !== 0) {
+    throw new GitDeploymentFenceError(
+      "verification_failed",
+      "the controller could not inspect the exact candidate tree for deployment configuration",
+    );
+  }
+  const entries = listed.out.split("\0").filter(Boolean).map((line) => {
+    const match = /^(\d{6}) (blob|tree|commit) ([0-9a-f]{40,64})\t(vercel\.json|vercel\.ts)$/.exec(line);
+    if (!match) {
+      throw new GitDeploymentFenceError("verification_failed", "the candidate deployment configuration entry is malformed");
+    }
+    return { mode: match[1], type: match[2], sha: match[3], path: match[4] };
+  });
+  if (entries.some((entry) => entry.path === "vercel.ts")) {
+    throw new GitDeploymentFenceError(
+      "programmatic_config",
+      "remove or explicitly reconcile the competing root vercel.ts configuration in the candidate tree",
+    );
+  }
+  const config = entries.find((entry) => entry.path === "vercel.json");
+  if (!config || config.type !== "blob" || !["100644", "100755"].includes(config.mode)) {
+    throw new GitDeploymentFenceError(
+      "verification_failed",
+      "the candidate tree must contain a regular root vercel.json blob",
+    );
+  }
+  let bytes: Buffer;
+  try {
+    bytes = await readGitObject(config.sha);
+  } catch (error) {
+    throw new GitDeploymentFenceError(
+      "verification_failed",
+      `the exact candidate vercel.json blob is unreadable (${String(error).slice(0, 180)})`,
+    );
+  }
+  return attestGitDeploymentFenceContent(bytes);
+}
+
+export type GitDeploymentFenceGate = Readonly<{
+  headSha: string;
+  observeRemote(args: string[]): Promise<Awaited<ReturnType<GitCommandRunner>>>;
+  push(args: string[]): Promise<Awaited<ReturnType<GitCommandRunner>>>;
+}>;
+
+/**
+ * Materialize, stage, commit, and attest the fence before exposing either
+ * executable remote-observation or push capability to the delivery caller.
+ */
+export async function withGitDeploymentFence<T>(input: {
+  checkout: string;
+  runGit: GitCommandRunner;
+  commitMessage: string;
+  deliver(gate: GitDeploymentFenceGate): Promise<T>;
+}): Promise<T> {
+  ensureGitDeploymentFence(input.checkout);
+  const staged = await input.runGit(["add", "-A"]);
+  if (staged.code !== 0) {
+    throw new GitDeploymentFenceError(
+      "staging_failed",
+      `repair the controller Git index before delivery (${staged.out.slice(-300)})`,
+    );
+  }
+  const stagedDiff = await input.runGit(["diff", "--cached", "--quiet"]);
+  if (stagedDiff.code === 1) {
+    const committed = await input.runGit(["commit", "-m", input.commitMessage]);
+    if (committed.code !== 0) {
+      throw new GitDeploymentFenceError(
+        "commit_failed",
+        `repair the disposable controller commit failure before delivery (${committed.out.slice(-300)})`,
+      );
+    }
+  } else if (stagedDiff.code !== 0) {
+    throw new GitDeploymentFenceError(
+      "staging_failed",
+      `the controller could not inspect its staged diff (${stagedDiff.out.slice(-300)})`,
+    );
+  }
+  const head = await input.runGit(["rev-parse", "HEAD"]);
+  const headSha = head.out.trim();
+  if (head.code !== 0 || !/^[0-9a-f]{40,64}$/i.test(headSha)) {
+    throw new GitDeploymentFenceError("verification_failed", "the exact committed controller HEAD could not be attested");
+  }
+  await attestCommittedGitDeploymentFence(input.runGit);
+
+  const runAttested = async (kind: "ls-remote" | "push", args: string[]) => {
+    if (args[0] !== kind) {
+      throw new GitDeploymentFenceError("verification_failed", `the ${kind} gate received an unexpected Git command`);
+    }
+    await attestCommittedGitDeploymentFence(input.runGit);
+    return await input.runGit(args);
+  };
+  return await input.deliver({
+    headSha,
+    observeRemote: (args) => runAttested("ls-remote", args),
+    push: (args) => runAttested("push", args),
+  });
 }

@@ -28,6 +28,7 @@ function harness(options: { integration?: string | null; advance?: "applied" | "
   if (options.integration !== null) refs.set(receipt.integrationBranch, options.integration ?? BASE);
   const adapter: IntegrationAdapter = {
     readRef: vi.fn(async (branch: string) => { calls.push("GET"); return refs.get(branch) ?? null; }),
+    attestDeploymentFence: vi.fn(async () => { calls.push("ATTEST"); }),
     prepareMerge: vi.fn(async () => {
       calls.push("SANDBOX_MERGE");
       return options.conflict ? { status: "conflict" as const, reason: "content conflict" }
@@ -54,7 +55,9 @@ describe("serialized integration provider protocol", () => {
       headSha: MERGED, treeSha: MERGED_TREE,
     });
     expect(h.calls.filter((call) => call === "GET")).toHaveLength(4);
+    expect(h.calls.filter((call) => call === "ATTEST")).toHaveLength(1);
     expect(h.calls.filter((call) => call === "GRAPHQL")).toHaveLength(1);
+    expect(h.calls.indexOf("ATTEST")).toBeLessThan(h.calls.indexOf("GRAPHQL"));
     expect(prepare).toHaveBeenCalledWith(expect.objectContaining({ kind: "update_ref", expectedBaseSha: BASE, headSha: MERGED }));
     expect(observe).toHaveBeenCalledWith(expect.objectContaining({ observation: "applied", providerHeadSha: MERGED }));
   });
@@ -147,6 +150,19 @@ describe("serialized integration provider protocol", () => {
     const h = harness({ conflict: true });
     const result = await integrateReviewedWorker(receipt, h.adapter, { prepare: vi.fn(), observe: vi.fn() });
     expect(result).toMatchObject({ status: "conflict", reason: "content conflict" });
+    expect(h.calls).not.toContain("GRAPHQL");
+  });
+
+  it("fails closed before effect preparation, staging, or updateRefs when the exact candidate tree is unfenced", async () => {
+    const h = harness();
+    vi.mocked(h.adapter.attestDeploymentFence).mockRejectedValue(new Error("candidate vercel.json is missing"));
+    const prepare = vi.fn();
+    const result = await integrateReviewedWorker(receipt, h.adapter, { prepare, observe: vi.fn() });
+    expect(result).toMatchObject({ status: "pending", reason: expect.stringContaining("failed closed") });
+    expect(h.adapter.prepareRefEffect).not.toHaveBeenCalled();
+    expect(h.adapter.stageCandidate).not.toHaveBeenCalled();
+    expect(h.adapter.advanceRef).not.toHaveBeenCalled();
+    expect(prepare).not.toHaveBeenCalled();
     expect(h.calls).not.toContain("GRAPHQL");
   });
 

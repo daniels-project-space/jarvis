@@ -95,8 +95,7 @@ import {
 import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, createDeterministicTar, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider, type HistoricalCloudWorkspaceProviderName, type CredentiallessArchive } from "./cloud-workspace";
 import {
   GitDeploymentFenceError,
-  attestCommittedGitDeploymentFence,
-  ensureGitDeploymentFence,
+  withGitDeploymentFence,
 } from "./git-deployment-fence";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
@@ -1680,15 +1679,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           repoDir = controllerCheckoutPath;
           cwd = controllerCheckoutPath;
           await applyValidatedPatchToControllerCheckout(repoDir, baseSha, patch, env);
-          if (!job.readonly && isOwnedRepositoryScope(repo)) {
-            try {
-              ensureGitDeploymentFence(repoDir);
-            } catch (error) {
-              deploymentFenceFailure = error instanceof GitDeploymentFenceError
-                ? `${error.code}: ${error.repair}`
-                : `verification_failed: ${String(error).slice(0, 500)}`;
-            }
-          }
         }
         result = `${result}\n\nCloud boundary: ${cloudProvider.name} workspace ${providerWorkspace.providerWorkspaceId}; R2 checkpoint ${portable.digest} (${portable.byteCount} bytes).`;
 
@@ -1706,7 +1696,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             `Git delivery was blocked ${phase} because the deployment fence did not attest.`,
             `Exact repair: ${deploymentFenceFailure}`,
             `Portable checkpoint preserved: ${portable.ref} · sha256 ${portable.digest} · ${portable.byteCount} bytes.`,
-            "No repository ref or deployment-provider state was mutated.",
+            "No remote repository ref or deployment-provider state was mutated; the disposable local controller branch may contain a fence commit.",
           ].join("\n\n");
           const finalized = await deliveryMutation("jobs:finalize", {
             jobId: job.jobId,
@@ -1744,129 +1734,114 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         let deliveryRetry = false;
         let deliveryDiffStat = "";
         let checkpointHeadSha = "";
+        let deliveryStopped = false;
         if (repoDir && token && branch && !job.readonly) {
           const deliveryDir = repoDir;
           const pushUrl = githubRepoUrl(repo);
           const gitEnv = githubGitEnv(env, token);
           const runGit = (args: string[]) => sh("git", ["-C", deliveryDir, ...args], gitEnv);
-          const staged = await sh("git", ["-C", deliveryDir, "add", "-A"], env);
-          if (staged.code !== 0) {
-            deploymentFenceFailure = `staging_failed: repair the controller Git index before delivery (${staged.out.slice(-300)})`;
-          }
-          const stagedDiff = deploymentFenceFailure
-            ? { code: 2, out: "" }
-            : await sh("git", ["-C", deliveryDir, "diff", "--cached", "--quiet"], env);
-          if (!deploymentFenceFailure && stagedDiff.code === 1) {
-            const committed = await sh(
-              "git",
-              ["-C", deliveryDir, "commit", "-m", `chore: ${profile.name.toLowerCase()} — ${job.task.slice(0, 60).replace(/"/g, "'")}`],
-              env,
-            );
-            if (committed.code !== 0) {
-              deploymentFenceFailure = `commit_failed: repair the controller Git commit failure before delivery (${committed.out.slice(-300)})`;
-            }
-          } else if (!deploymentFenceFailure && stagedDiff.code !== 0) {
-            deploymentFenceFailure = `staging_failed: the controller could not inspect its staged diff (${stagedDiff.out.slice(-300)})`;
-          }
-          let local = (await sh("git", ["-C", deliveryDir, "rev-parse", "HEAD"], env)).out.trim();
-          checkpointHeadSha = local;
-          if ((reviewBaseSha || baseSha) && local && local !== (reviewBaseSha || baseSha)) {
-            deliveryDiffStat = (await sh("git", ["-C", deliveryDir, "diff", "--stat", `${reviewBaseSha || baseSha}..${local}`], env)).out
-              .trim()
-              .slice(0, 1_500);
-          }
-          if (!deploymentFenceFailure && isOwnedRepositoryScope(repo)) {
+          if (!isOwnedRepositoryScope(repo)) {
+            deploymentFenceFailure = "verification_failed: writable delivery is restricted to Daniel's owned repository scope";
+          } else {
             try {
-              await attestCommittedGitDeploymentFence(runGit);
+              await withGitDeploymentFence({
+                checkout: deliveryDir,
+                runGit,
+                commitMessage: `chore: ${profile.name.toLowerCase()} — ${job.task.slice(0, 60).replace(/"/g, "'")}`,
+                deliver: async (deploymentGate) => {
+                  let local = deploymentGate.headSha;
+                  checkpointHeadSha = local;
+                  if ((reviewBaseSha || baseSha) && local !== (reviewBaseSha || baseSha)) {
+                    deliveryDiffStat = (await runGit(["diff", "--stat", `${reviewBaseSha || baseSha}..${local}`])).out
+                      .trim()
+                      .slice(0, 1_500);
+                  }
+                  const history = await ensureCompleteRepositoryHistory({
+                    runGit,
+                    remote: pushUrl,
+                    sourceBranch: checkoutSourceBranch,
+                  });
+                  if (!history.ok) {
+                    deliveryRetry = true;
+                    pushNote = `${SHALLOW_PROVENANCE_RULE} ${history.note}; retrying from canonical branch ${branch}`;
+                  }
+                  const remoteObservation = await deploymentGate.observeRemote(["ls-remote", pushUrl, `refs/heads/${branch}`]);
+                  if (remoteObservation.code !== 0) {
+                    deliveryRetry = true;
+                    pushNote = `worker ref observation failed (${String(remoteObservation.code)}): ${remoteObservation.out.slice(-300)}`;
+                  }
+                  const remote = remoteObservation.code === 0 ? remoteObservation.out.split(/\s/)[0]?.trim() : undefined;
+                  let needsPush = gitDeliveryDisposition({ baseSha, localSha: local, remoteSha: remote }) !== "noop";
+                  if (deliveryRetry) {
+                    // An incomplete graph is never used to judge or modify lineage.
+                  } else if (!needsPush) {
+                    pushNote = remote && remote !== baseSha
+                      ? `newer checkpoint branch ${branch} retained without overwrite`
+                      : remote ? `existing checkpoint branch ${branch} retained` : "no repository changes were needed";
+                  } else {
+                    if (remote) {
+                      const reconciliation = await reconcileSharedBranch({
+                        runGit,
+                        remote: pushUrl,
+                        branch,
+                        historySourceBranch: checkoutSourceBranch,
+                        baseSha,
+                        localSha: local,
+                      });
+                      local = reconciliation.localSha;
+                      checkpointHeadSha = local;
+                      pushNote = reconciliation.note;
+                      if (reconciliation.status === "already_delivered") {
+                        needsPush = false;
+                      } else if (reconciliation.status === "retry") {
+                        deliveryRetry = true;
+                      }
+                    } else {
+                      const continuesFromBase = await gitCommitIsAncestor(runGit, baseSha, local);
+                      if (continuesFromBase !== true) {
+                        deliveryRetry = true;
+                        pushNote = continuesFromBase === null
+                          ? `local lineage could not be verified; retrying from canonical base ${baseSha}`
+                          : `local history does not descend from canonical base ${baseSha}; replacement history will not be pushed`;
+                      }
+                    }
+                    if (needsPush && !deliveryRetry) {
+                      if (await stopIfLeaseLost(checkpointText, result, branch)) {
+                        deliveryStopped = true;
+                        return;
+                      }
+                      if (!await linearizeDelivery()) {
+                        deliveryStopped = true;
+                        return;
+                      }
+                      const push = await deploymentGate.push(["push", pushUrl, `HEAD:refs/heads/${branch}`]);
+                      if (push.code !== 0 && isNonFastForwardPush(push.out)) {
+                        deliveryRetry = true;
+                        pushNote = `isolated worker branch ${branch} advanced unexpectedly; retrying from its canonical head`;
+                      } else {
+                        pushFailed = push.code !== 0;
+                        pushNote = pushFailed
+                          ? `branch push failed: ${push.out.slice(-180).replace(/\s+/g, " ")}`
+                          : `${pushNote ? `${pushNote}; ` : ""}checkpoint branch ${branch} pushed`;
+                      }
+                    }
+                  }
+                  if (!pushFailed && !deliveryRetry) {
+                    const compared = await branchHasChanges(repo, branch, token);
+                    const changed = compared ?? (needsPush || Boolean(remote && job.branch));
+                    if (!changed && needsPush) pushNote = "branch matches the repository default after verification";
+                  }
+                },
+              });
             } catch (error) {
               deploymentFenceFailure = error instanceof GitDeploymentFenceError
                 ? `${error.code}: ${error.repair}`
                 : `verification_failed: ${String(error).slice(0, 500)}`;
             }
           }
-          const history = deploymentFenceFailure ? null : await ensureCompleteRepositoryHistory({
-            runGit,
-            remote: pushUrl,
-            sourceBranch: checkoutSourceBranch,
-          });
-          if (history && !history.ok) {
-            deliveryRetry = true;
-            pushNote = `${SHALLOW_PROVENANCE_RULE} ${history.note}; retrying from canonical branch ${branch}`;
-          }
-          const remoteObservation = deploymentFenceFailure
-            ? { code: 2, out: "" }
-            : await runGit(["ls-remote", pushUrl, `refs/heads/${branch}`]);
-          if (remoteObservation.code !== 0) {
-            deliveryRetry = true;
-            pushNote = `worker ref observation failed (${String(remoteObservation.code)}): ${remoteObservation.out.slice(-300)}`;
-          }
-          const remote = remoteObservation.code === 0 ? remoteObservation.out.split(/\s/)[0]?.trim() : undefined;
-          let needsPush = gitDeliveryDisposition({ baseSha, localSha: local, remoteSha: remote }) !== "noop";
-          if (deliveryRetry) {
-            // An incomplete graph is never used to judge or modify lineage.
-          } else if (!needsPush) {
-            pushNote = remote && remote !== baseSha
-              ? `newer checkpoint branch ${branch} retained without overwrite`
-              : remote ? `existing checkpoint branch ${branch} retained` : "no repository changes were needed";
-          } else {
-            if (remote) {
-              const reconciliation = await reconcileSharedBranch({
-                runGit,
-                remote: pushUrl,
-                branch,
-                historySourceBranch: checkoutSourceBranch,
-                baseSha,
-                localSha: local,
-              });
-              local = reconciliation.localSha;
-              checkpointHeadSha = local;
-              pushNote = reconciliation.note;
-              if (reconciliation.status === "already_delivered") {
-                needsPush = false;
-              } else if (reconciliation.status === "retry") {
-                deliveryRetry = true;
-              }
-            } else {
-              const continuesFromBase = await gitCommitIsAncestor(runGit, baseSha, local);
-              if (continuesFromBase !== true) {
-                deliveryRetry = true;
-                pushNote = continuesFromBase === null
-                  ? `local lineage could not be verified; retrying from canonical base ${baseSha}`
-                  : `local history does not descend from canonical base ${baseSha}; replacement history will not be pushed`;
-              }
-            }
-            if (needsPush && !deliveryRetry) {
-              if (isOwnedRepositoryScope(repo)) {
-                try {
-                  await attestCommittedGitDeploymentFence(runGit);
-                } catch (error) {
-                  deploymentFenceFailure = error instanceof GitDeploymentFenceError
-                    ? `${error.code}: ${error.repair}`
-                    : `verification_failed: ${String(error).slice(0, 500)}`;
-                }
-              }
-              if (!deploymentFenceFailure) {
-                if (await stopIfLeaseLost(checkpointText, result, branch)) return;
-                if (!await linearizeDelivery()) return;
-                const push = await runGit(["push", pushUrl, `HEAD:refs/heads/${branch}`]);
-                if (push.code !== 0 && isNonFastForwardPush(push.out)) {
-                  deliveryRetry = true;
-                  pushNote = `isolated worker branch ${branch} advanced unexpectedly; retrying from its canonical head`;
-                } else {
-                  pushFailed = push.code !== 0;
-                  pushNote = pushFailed
-                    ? `branch push failed: ${push.out.slice(-180).replace(/\s+/g, " ")}`
-                    : `${pushNote ? `${pushNote}; ` : ""}checkpoint branch ${branch} pushed`;
-                }
-              }
-            }
-          }
-          if (!deploymentFenceFailure && !pushFailed && !deliveryRetry) {
-            const compared = await branchHasChanges(repo, branch, token);
-            const changed = compared ?? (needsPush || Boolean(remote && job.branch));
-            if (!changed && needsPush) pushNote = "branch matches the repository default after verification";
-          }
         }
+
+        if (deliveryStopped) return;
 
         if (await finalizeDeploymentFenceFailure("before remote push")) return;
 

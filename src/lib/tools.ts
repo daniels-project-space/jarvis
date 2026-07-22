@@ -3626,7 +3626,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         label: `Paul · repair ${problem.slice(0, 48)}`,
       });
       await wakeAgentFleet(`repair:${String(incidentId)}`).catch(() => false);
-      return "Paul owns the repair on an isolated branch. He'll reproduce it and verify the fix; the delivery controller will merge it automatically once the evidence and repository checks pass.";
+      return "Paul owns the repair on an isolated branch. He'll reproduce it and verify the fix; the delivery controller may update only that verified worker branch. No pull request, default-branch merge, or deployment is implied.";
     }
     case "self_improve": {
       const request = String(args.request ?? "").slice(0, 1500);
@@ -3641,12 +3641,12 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         agentId: "paul",
         risk: "high",
         priority: 80,
-        acceptanceCriteria: ["Connected implementation, not placeholder UI", "Typecheck/tests/build pass", "Verified repository delivery completes without a manual approval"],
+        acceptanceCriteria: ["Connected implementation, not placeholder UI", "Typecheck/tests/build pass", "Verified isolated-worker-branch delivery completes without a manual approval"],
         modelReason: "Paul + Sol: JARVIS self-modification is complex Codex engineering",
         label: `Paul · upgrade ${request.slice(0, 46)}`,
       });
       await wakeAgentFleet("self-improve").catch(() => false);
-      return "Paul has the upgrade on an isolated branch with validation gates; verified delivery will complete automatically and progress is live in the command deck.";
+      return "Paul has the upgrade on an isolated branch with validation gates; the controller may update only that verified worker branch, never merge or deploy it, and progress is live in the command deck.";
     }
     case "agent_status": {
       const [active, recent, missions, team, attention, approvals] = await Promise.all([

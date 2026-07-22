@@ -6,6 +6,7 @@ import type {
   ProviderEffect,
   ProviderWriteResult,
 } from "./mission-integration";
+import { attestGitDeploymentFenceTree } from "./git-deployment-fence";
 
 type GitResult = { code: number | null; out: string };
 type GitRunner = (args: string[], env?: NodeJS.ProcessEnv) => Promise<GitResult>;
@@ -255,6 +256,23 @@ export function createGitHubIntegrationAdapter(options: {
       const sha = parsed.body?.object?.sha;
       if (!OID.test(String(sha ?? ""))) throw new GitHubProviderError("GitHub ref response did not contain an exact object identity");
       return String(sha);
+    },
+    attestDeploymentFence: async ({ headSha, treeSha }) => {
+      if (!options.readGitObject) throw new Error("binary-safe Git object reader is required for candidate deployment-fence attestation");
+      let committedTree = await options.runGit(["rev-parse", `${headSha}^{tree}`], options.gitEnv);
+      if (committedTree.code !== 0) {
+        const fetched = await options.runGit(["fetch", "--no-tags", options.remote, headSha], options.gitEnv);
+        if (fetched.code !== 0) throw new Error("exact prepared candidate commit could not be materialized for deployment-fence attestation");
+        committedTree = await options.runGit(["rev-parse", `${headSha}^{tree}`], options.gitEnv);
+      }
+      if (committedTree.code !== 0 || committedTree.out.trim() !== treeSha) {
+        throw new Error(`prepared candidate commit ${headSha} does not attest exact tree ${treeSha}`);
+      }
+      await attestGitDeploymentFenceTree(
+        (args) => options.runGit(args, options.gitEnv),
+        options.readGitObject,
+        treeSha,
+      );
     },
     prepareMerge: async ({ integrationBaseSha, workerHeadSha, workerTreeSha, generation }) => {
       const fetchedWorker = await options.runGit(["fetch", "--no-tags", options.remote, `refs/heads/${options.workerBranch}`], options.gitEnv);

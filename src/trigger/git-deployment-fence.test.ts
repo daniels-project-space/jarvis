@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -7,7 +7,9 @@ import {
   GitDeploymentFenceError,
   VERCEL_CONFIG_SCHEMA,
   attestCommittedGitDeploymentFence,
+  attestGitDeploymentFenceTree,
   ensureGitDeploymentFence,
+  withGitDeploymentFence,
 } from "./git-deployment-fence";
 
 function fixture(): string {
@@ -21,6 +23,10 @@ function git(cwd: string, args: string[]): { code: number; out: string } {
     const failed = error as { status?: number; stdout?: string; stderr?: string };
     return { code: failed.status ?? 1, out: `${failed.stdout ?? ""}${failed.stderr ?? ""}` };
   }
+}
+
+function gitObject(cwd: string, sha: string): Promise<Buffer> {
+  return Promise.resolve(execFileSync("git", ["cat-file", "blob", sha], { cwd, stdio: ["ignore", "pipe", "pipe"] }));
 }
 
 describe("controller Git-to-deployment fence", () => {
@@ -94,13 +100,9 @@ describe("controller Git-to-deployment fence", () => {
     const root = fixture();
     const original = JSON.stringify({ framework: "nextjs" });
     writeFileSync(join(root, "vercel.json"), original);
-    chmodSync(root, 0o555);
-    try {
-      expect(() => ensureGitDeploymentFence(root)).toThrow(expect.objectContaining({ code: "write_failed" }));
-      expect(readFileSync(join(root, "vercel.json"), "utf8")).toBe(original);
-    } finally {
-      chmodSync(root, 0o755);
-    }
+    mkdirSync(join(root, `.vercel.json.jarvis-fence-${process.pid}`));
+    expect(() => ensureGitDeploymentFence(root)).toThrow(expect.objectContaining({ code: "write_failed" }));
+    expect(readFileSync(join(root, "vercel.json"), "utf8")).toBe(original);
   });
 
   it("attests the exact committed blob and rejects a later conflicting head", async () => {
@@ -122,20 +124,104 @@ describe("controller Git-to-deployment fence", () => {
       .rejects.toMatchObject({ code: "programmatic_config" });
   });
 
-  it("orders materialization and committed-tree attestation before every delivery observation", () => {
-    const runner = readFileSync(join(process.cwd(), "src/trigger/agent-runner.ts"), "utf8");
-    const apply = runner.indexOf("await applyValidatedPatchToControllerCheckout(");
-    const materialize = runner.indexOf("ensureGitDeploymentFence(repoDir)", apply);
-    const add = runner.indexOf('["-C", deliveryDir, "add", "-A"]', materialize);
-    const committed = runner.indexOf("attestCommittedGitDeploymentFence(runGit)", add);
-    const observe = runner.indexOf('["ls-remote", pushUrl', committed);
-    const push = runner.indexOf('["push", pushUrl', observe);
-    expect(apply).toBeGreaterThan(-1);
-    expect(apply).toBeLessThan(materialize);
-    expect(materialize).toBeLessThan(add);
-    expect(add).toBeLessThan(committed);
-    expect(committed).toBeLessThan(observe);
-    expect(observe).toBeLessThan(push);
-    expect(runner).toContain("if (!deploymentFenceFailure)");
+  it("executes the controller delivery seam only after committing and attesting the exact HEAD", async () => {
+    const root = fixture();
+    git(root, ["init"]);
+    git(root, ["config", "user.email", "test@example.test"]);
+    git(root, ["config", "user.name", "Test"]);
+    writeFileSync(join(root, "proof.txt"), "validated patch\n");
+    const calls: string[] = [];
+    const runner = async (args: string[]) => {
+      calls.push(args.join(" "));
+      if (args[0] === "ls-remote" || args[0] === "push") return { code: 0, out: "" };
+      return git(root, args);
+    };
+    await withGitDeploymentFence({
+      checkout: root,
+      runGit: runner,
+      commitMessage: "fenced delivery",
+      deliver: async (gate) => {
+        await gate.observeRemote(["ls-remote", "fixture", "refs/heads/worker"]);
+        await gate.push(["push", "fixture", "HEAD:refs/heads/worker"]);
+      },
+    });
+    const commit = calls.indexOf("commit -m fenced delivery");
+    const firstAttestation = calls.indexOf("show HEAD:vercel.json", commit);
+    const observe = calls.indexOf("ls-remote fixture refs/heads/worker");
+    const finalAttestation = calls.lastIndexOf("show HEAD:vercel.json");
+    const push = calls.indexOf("push fixture HEAD:refs/heads/worker");
+    expect(commit).toBeGreaterThan(-1);
+    expect(commit).toBeLessThan(firstAttestation);
+    expect(firstAttestation).toBeLessThan(observe);
+    expect(observe).toBeLessThan(finalAttestation);
+    expect(finalAttestation).toBeLessThan(push);
+    expect(JSON.parse(git(root, ["show", "HEAD:vercel.json"]).out).git.deploymentEnabled).toBe(false);
+  });
+
+  it("makes zero remote observations and zero pushes when materialization or committed-tree attestation fails", async () => {
+    for (const failure of ["materialization", "attestation"] as const) {
+      const root = fixture();
+      git(root, ["init"]);
+      git(root, ["config", "user.email", "test@example.test"]);
+      git(root, ["config", "user.name", "Test"]);
+      writeFileSync(join(root, "proof.txt"), "validated patch\n");
+      if (failure === "materialization") mkdirSync(join(root, `.vercel.json.jarvis-fence-${process.pid}`));
+      let observations = 0;
+      let pushes = 0;
+      const runner = async (args: string[]) => {
+        if (args[0] === "ls-remote") observations += 1;
+        if (args[0] === "push") pushes += 1;
+        if (failure === "attestation" && args[0] === "show" && args[1] === "HEAD:vercel.json") {
+          return { code: 1, out: "injected exact-tree read failure" };
+        }
+        return git(root, args);
+      };
+      await expect(withGitDeploymentFence({
+        checkout: root,
+        runGit: runner,
+        commitMessage: "fenced delivery",
+        deliver: async (gate) => {
+          await gate.observeRemote(["ls-remote", "fixture", "refs/heads/worker"]);
+          await gate.push(["push", "fixture", "HEAD:refs/heads/worker"]);
+        },
+      })).rejects.toBeInstanceOf(GitDeploymentFenceError);
+      expect({ observations, pushes }).toEqual({ observations: 0, pushes: 0 });
+    }
+  });
+
+  it("attests exact candidate tree/blob objects and rejects missing, invalid, conflicting, or unreadable configuration", async () => {
+    const root = fixture();
+    git(root, ["init"]);
+    git(root, ["config", "user.email", "test@example.test"]);
+    git(root, ["config", "user.name", "Test"]);
+    git(root, ["commit", "--allow-empty", "-m", "missing"]);
+    const missingTree = git(root, ["rev-parse", "HEAD^{tree}"]).out.trim();
+    const runner = (args: string[]) => Promise.resolve(git(root, args));
+    await expect(attestGitDeploymentFenceTree(runner, (sha) => gitObject(root, sha), missingTree))
+      .rejects.toMatchObject({ code: "verification_failed" });
+
+    ensureGitDeploymentFence(root);
+    git(root, ["add", "vercel.json"]);
+    git(root, ["commit", "-m", "valid"]);
+    const validTree = git(root, ["rev-parse", "HEAD^{tree}"]).out.trim();
+    await expect(attestGitDeploymentFenceTree(runner, (sha) => gitObject(root, sha), validTree))
+      .resolves.toMatchObject({ schemaVersion: 1 });
+    await expect(attestGitDeploymentFenceTree(runner, async () => { throw new Error("unreadable"); }, validTree))
+      .rejects.toMatchObject({ code: "verification_failed" });
+
+    writeFileSync(join(root, "vercel.json"), JSON.stringify({ git: { deploymentEnabled: true } }));
+    git(root, ["add", "vercel.json"]);
+    git(root, ["commit", "-m", "invalid"]);
+    const invalidTree = git(root, ["rev-parse", "HEAD^{tree}"]).out.trim();
+    await expect(attestGitDeploymentFenceTree(runner, (sha) => gitObject(root, sha), invalidTree))
+      .rejects.toMatchObject({ code: "verification_failed" });
+
+    writeFileSync(join(root, "vercel.json"), readFileSync(join(root, "vercel.json"), "utf8").replace("true", "false"));
+    writeFileSync(join(root, "vercel.ts"), "export default {}\n");
+    git(root, ["add", "vercel.json", "vercel.ts"]);
+    git(root, ["commit", "-m", "conflict"]);
+    const conflictingTree = git(root, ["rev-parse", "HEAD^{tree}"]).out.trim();
+    await expect(attestGitDeploymentFenceTree(runner, (sha) => gitObject(root, sha), conflictingTree))
+      .rejects.toMatchObject({ code: "programmatic_config" });
   });
 });

@@ -57,6 +57,7 @@ export type IntegrationHooks = Readonly<{
 
 export type IntegrationAdapter = Readonly<{
   readRef(branch: string): Promise<string | null>;
+  attestDeploymentFence(candidate: { headSha: string; treeSha: string }): Promise<void>;
   prepareMerge(input: {
     integrationBaseSha: string;
     workerHeadSha: string;
@@ -103,6 +104,10 @@ export async function integrateReviewedWorker(
     if (workerHead !== receipt.reviewedHeadSha) {
       if (receipt.preparedEffectId && receipt.preparedIntegrationHeadSha && receipt.preparedIntegrationTreeSha) {
         const current = await adapter.readRef(receipt.integrationBranch);
+        await adapter.attestDeploymentFence({
+          headSha: receipt.preparedIntegrationHeadSha,
+          treeSha: receipt.preparedIntegrationTreeSha,
+        });
         const effect = await adapter.prepareRefEffect({
           effectId: receipt.preparedEffectId,
           branch: receipt.integrationBranch,
@@ -149,6 +154,7 @@ export async function integrateReviewedWorker(
     if (merged.status === "deferred" || !merged.headSha || !merged.treeSha) {
       return { status: "pending", reason: merged.reason ?? "integration sandbox could not prepare the exact merge" };
     }
+    await adapter.attestDeploymentFence({ headSha: merged.headSha, treeSha: merged.treeSha });
 
     const effectId = `update-ref:${receipt.integrationAttemptId}:${merged.headSha}`;
     const effect = await adapter.prepareRefEffect({

@@ -1,3 +1,7 @@
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createGitHubIntegrationAdapter, GITHUB_REST_API_VERSION } from "./github-integration-adapter";
 
@@ -18,6 +22,37 @@ function adapter(fetchImpl: typeof fetch, readGitObject?: (sha: string) => Promi
 }
 
 describe("GitHub integration fetch contract", () => {
+  it("attests the exact local candidate commit/tree without a provider call", async () => {
+    const root = mkdtempSync(join(tmpdir(), "jarvis-goal-fence-"));
+    const localGit = (args: string[]) => {
+      try {
+        return { code: 0, out: execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }) };
+      } catch (error) {
+        const failed = error as { status?: number; stdout?: string; stderr?: string };
+        return { code: failed.status ?? 1, out: `${failed.stdout ?? ""}${failed.stderr ?? ""}` };
+      }
+    };
+    localGit(["init"]);
+    localGit(["config", "user.email", "test@example.test"]);
+    localGit(["config", "user.name", "Test"]);
+    writeFileSync(join(root, "vercel.json"), JSON.stringify({ $schema: "schema", git: { deploymentEnabled: false } }));
+    localGit(["add", "vercel.json"]);
+    localGit(["commit", "-m", "candidate"]);
+    const headSha = localGit(["rev-parse", "HEAD"]).out.trim();
+    const treeSha = localGit(["rev-parse", "HEAD^{tree}"]).out.trim();
+    const provider = vi.fn(async () => { throw new Error("provider call forbidden"); }) as unknown as typeof fetch;
+    const github = createGitHubIntegrationAdapter({
+      repository: "daniels-project-space/jarvis", repositoryNodeId: REPOSITORY_ID,
+      remote: "fixture", workerBranch: "jarvis/work/x", integrationAttemptId: "fence",
+      createdAt: 1, token: "test", fetchImpl: provider,
+      runGit: vi.fn(async (args) => localGit(args)),
+      readGitObject: async (sha) => execFileSync("git", ["cat-file", "blob", sha], { cwd: root }),
+    });
+    await expect(github.attestDeploymentFence({ headSha, treeSha })).resolves.toBeUndefined();
+    await expect(github.attestDeploymentFence({ headSha, treeSha: "f".repeat(40) })).rejects.toThrow("does not attest exact tree");
+    expect(provider).not.toHaveBeenCalled();
+  });
+
   it("uses one updateRefs GraphQL POST with exact beforeOid/afterOid and force false", async () => {
     const calls: Array<{ url: string; method: string; body?: any }> = [];
     const mockFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
