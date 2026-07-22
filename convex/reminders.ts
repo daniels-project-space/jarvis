@@ -61,7 +61,8 @@ export const cancel = mutation({
     const rows = await ctx.db
       .query("reminders")
       .withIndex("by_status", (q: any) => q.eq("status", "pending"))
-      .collect();
+      .order("asc")
+      .take(100);
     const m = a.match.toLowerCase();
     const hit = rows.find((r: any) => r.text.toLowerCase().includes(m));
     if (!hit) return false;
@@ -77,7 +78,8 @@ export const upcoming = query({
     const rows = await ctx.db
       .query("reminders")
       .withIndex("by_status", (q: any) => q.eq("status", "pending"))
-      .collect();
-    return rows.sort((x: any, y: any) => x.at - y.at).slice(0, 20);
+      .order("asc")
+      .take(20);
+    return rows;
   },
 });

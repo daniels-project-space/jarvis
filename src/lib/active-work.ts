@@ -83,6 +83,35 @@ export type CompactWorkSnapshot = {
   fleet: FleetMission | null;
 };
 
+export type CompactJobDetail = {
+  jobId: string;
+  status: string;
+  attempt: number;
+  stage: string;
+  percent: number;
+  progress: string;
+  sourceBranch: string | null;
+  sourceHeadSha: string | null;
+  integrationBranch: string | null;
+  workerBranch: string | null;
+  branch: string | null;
+  mergeCommitSha: string | null;
+  label: string;
+  agentId: string | null;
+  repo: string | null;
+  progressAt: number | null;
+  model: string | null;
+  reasoningEffort: string | null;
+  workerRuntime: string | null;
+  workerRunId: string | null;
+  generation: number;
+  maxAttempts: number;
+  integrationState: string | null;
+  deliveryStatus: string | null;
+  startedAt: number | null;
+  stallReason: string | null;
+};
+
 export type CompactWorkCache = {
   threadId: string;
   snapshot: CompactWorkSnapshot;

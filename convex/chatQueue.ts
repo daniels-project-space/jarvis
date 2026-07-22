@@ -1,5 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { paginationOptsValidator } from "convex/server";
 import { actorAuthArgs, requireActor, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 
 const HOST_CONTEXT_BLOCK = /\s*\[JARVIS_HOST_CONTEXT\][\s\S]*?\[\/JARVIS_HOST_CONTEXT\]\s*/g;
@@ -68,11 +69,32 @@ export const listMessages = query({
       .query("chatMessages")
       .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
       .order("desc")
-      // The chat surface renders the latest 80 rows. Keep a small hand-over
-      // margin for paired cards/turns without re-reading 240 documents on
-      // every streamed token.
-      .take(100);
+      // The always-mounted foreground surface needs only the newest visible
+      // turns. A streamed token therefore re-reads at most twenty rows.
+      .take(20);
     return rows.reverse();
+  },
+});
+
+export const HISTORY_PAGE_MAX = 20;
+
+// Older rows are loaded only by the explicitly mounted history drawer. Clamp
+// every cursor request server-side: pagination's numItems is advisory for a
+// reactive query, while maximumRowsRead is the actual database read ceiling.
+export const paginatedMessages = query({
+  args: { threadId: v.optional(v.string()), paginationOpts: paginationOptsValidator, ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return await ctx.db
+      .query("chatMessages")
+      .withIndex("by_thread", (q: any) => q.eq("threadId", a.threadId ?? "main"))
+      .order("desc")
+      .paginate({
+        ...a.paginationOpts,
+        numItems: Math.min(HISTORY_PAGE_MAX, Math.max(1, Math.floor(a.paginationOpts.numItems || HISTORY_PAGE_MAX))),
+        maximumRowsRead: HISTORY_PAGE_MAX,
+        maximumBytesRead: 256 * 1024,
+      });
   },
 });
 
@@ -195,9 +217,8 @@ async function claimPending(ctx: { db: any }, pending: any) {
     };
 }
 
-// Immediate Trigger runs claim exactly the message that woke them. This is
-// what permits parallel foreground turns without two workers racing through a
-// shared drain loop or making a new question wait behind an older slow one.
+// Immediate Trigger runs claim exactly the message that woke it. The one
+// foreground lease then prevents duplicate workers from racing a shared drain.
 export const claimMessage = mutation({
   args: { messageId: v.id("chatMessages"), workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {

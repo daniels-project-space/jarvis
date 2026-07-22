@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRealtimeRun } from "@trigger.dev/react-hooks";
 import { parseTerminalOutput, type TerminalTone } from "../lib/terminal-output";
 import { viewerFetch } from "../lib/viewer-request";
-import type { CompactWorkSnapshot, FleetControl, FleetEdge, FleetNode } from "../lib/active-work";
+import type { CompactJobDetail, CompactWorkSnapshot, FleetControl, FleetEdge, FleetNode } from "../lib/active-work";
 
 const TONE: Record<TerminalTone, string> = {
   neutral: "text-slate-200/90", muted: "text-slate-500", command: "text-sky-300",
@@ -254,14 +254,26 @@ function WorkerDetail({ node, onBack }: { node: FleetNode; onBack: () => void })
   </section>;
 }
 
-export function FleetCommandCenter({ snapshot, hidden = false, onExpandedChange, initialExpanded = false }: { snapshot: CompactWorkSnapshot; hidden?: boolean; onExpandedChange?: (expanded: boolean) => void; initialExpanded?: boolean }) {
+export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpandedChange, onSelectedJobChange, initialExpanded = false }: { snapshot: CompactWorkSnapshot; detail?: CompactJobDetail | null; hidden?: boolean; onExpandedChange?: (expanded: boolean) => void; onSelectedJobChange?: (jobId: string | null) => void; initialExpanded?: boolean }) {
   const [expanded, setExpanded] = useState(initialExpanded);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [controlError, setControlError] = useState("");
   const active = snapshot.active;
   const fleet = snapshot.fleet;
-  const selected = selectedId ? fleet?.nodes.find((node) => node.jobId === selectedId) ?? null : null;
-  const setOpen = (next: boolean) => { setExpanded(next); if (!next) setSelectedId(null); onExpandedChange?.(next); };
+  const selectedSummary = selectedId ? fleet?.nodes.find((node) => node.jobId === selectedId) ?? null : null;
+  const selected = selectedSummary && detail?.jobId === selectedId ? {
+    ...selectedSummary,
+    jobId: detail.jobId, label: detail.label, agent: detail.agentId ?? selectedSummary.agent,
+    repository: detail.repo, status: detail.status, stage: detail.stage, percent: detail.percent,
+    progress: detail.progress, progressAt: detail.progressAt, model: detail.model,
+    reasoningEffort: detail.reasoningEffort, workerRuntime: detail.workerRuntime,
+    workerRunId: detail.workerRunId, generation: detail.generation, attempt: detail.attempt,
+    maxAttempts: detail.maxAttempts, integrationState: detail.integrationState ?? selectedSummary.integrationState,
+    deliveryStatus: detail.deliveryStatus, startedAt: detail.startedAt,
+    recoverySummary: detail.stallReason ?? selectedSummary.recoverySummary,
+  } : null;
+  const selectJob = (jobId: string | null) => { setSelectedId(jobId); onSelectedJobChange?.(jobId); };
+  const setOpen = (next: boolean) => { setExpanded(next); if (!next) selectJob(null); onExpandedChange?.(next); };
   if (!active || !fleet || hidden) return null;
   if (!expanded) return (
     <aside data-fleet-surface="collapsed" data-work-id={active.id} aria-live="polite" className="absolute left-2 top-2 z-30 w-[min(350px,calc(100%-16px))] sm:left-3">
@@ -282,16 +294,16 @@ export function FleetCommandCenter({ snapshot, hidden = false, onExpandedChange,
         <button type="button" onClick={() => setOpen(false)} className="rounded-lg px-2 py-1 text-[9px] text-slate hover:text-cyan" aria-label="Collapse live fleet">minimize</button>
       </header>
       <div className="mt-2 flex min-h-0 flex-1 gap-2 overflow-hidden">
-        {selected ? <WorkerDetail node={selected} onBack={() => setSelectedId(null)} /> : <div className="scrollbar-thin min-h-0 flex-1 space-y-2 overflow-auto pr-0.5">
-          {attention.length > 0 && <section aria-labelledby="needs-daniel-heading" className="rounded-xl border border-amber/25 bg-amber/[0.06] p-2"><div id="needs-daniel-heading" className="hud-label text-amber">Needs Daniel · {attention.length}</div><ul className="mt-1 space-y-1">{attention.map((node) => <li key={node.id}><button type="button" onClick={() => setSelectedId(node.jobId)} className="flex w-full min-w-0 items-center gap-2 rounded-lg px-1 py-1 text-left hover:bg-white/[0.04]"><span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber"/><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{agentName(node.agent)} · {node.label}</span><span className="shrink-0 text-[8px] text-amber">{node.state.replace("_", " ")}</span></button></li>)}</ul></section>}
+        {selectedId ? (selected ? <WorkerDetail node={selected} onBack={() => selectJob(null)} /> : <div data-fleet-detail-loading className="flex flex-1 items-center justify-center text-xs text-cyan">loading exact work detail…</div>) : <div className="scrollbar-thin min-h-0 flex-1 space-y-2 overflow-auto pr-0.5">
+          {attention.length > 0 && <section aria-labelledby="needs-daniel-heading" className="rounded-xl border border-amber/25 bg-amber/[0.06] p-2"><div id="needs-daniel-heading" className="hud-label text-amber">Needs Daniel · {attention.length}</div><ul className="mt-1 space-y-1">{attention.map((node) => <li key={node.id}><button type="button" onClick={() => selectJob(node.jobId)} className="flex w-full min-w-0 items-center gap-2 rounded-lg px-1 py-1 text-left hover:bg-white/[0.04]"><span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber"/><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{agentName(node.agent)} · {node.label}</span><span className="shrink-0 text-[8px] text-amber">{node.state.replace("_", " ")}</span></button></li>)}</ul></section>}
           <FleetDag nodes={fleet.nodes} edges={fleet.edges} />
           {repositories.length > 0 && <div className="flex flex-wrap gap-1" aria-label="Repository groups">{repositories.map((repo) => <span key={repo} className="rounded-full border border-white/10 px-2 py-0.5 font-mono text-[8px] text-slate">{repo} · {fleet.nodes.filter((node) => node.repository === repo).length}</span>)}</div>}
           <section aria-label="Fleet workstreams" className="grid gap-1.5 sm:grid-cols-2">
-            {fleet.nodes.map((node) => <button type="button" key={node.id} onClick={() => setSelectedId(node.jobId)} className={`min-w-0 rounded-xl border p-2 text-left transition hover:border-cyan/40 ${STATE_STYLE[node.state]}`} aria-label={`Open ${agentName(node.agent)} detail for ${node.label}`}><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{agentName(node.agent)} · {node.label}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.1em] opacity-75">{node.stage} · {node.model ?? "auto"}/g{node.generation}/a{node.attempt} · handoff {node.dependenciesReady}/{node.dependencyCount}</div>{node.progress && <div className="mt-1 truncate text-[9px] text-slate">{node.progress}</div>}<div className="mt-1 truncate font-mono text-[7px] text-slate/65">{node.mergeState} · progress {progressStamp(node.progressAt)}</div></button>)}
+            {fleet.nodes.map((node) => <button type="button" key={node.id} onClick={() => selectJob(node.jobId)} className={`min-w-0 rounded-xl border p-2 text-left transition hover:border-cyan/40 ${STATE_STYLE[node.state]}`} aria-label={`Open ${agentName(node.agent)} detail for ${node.label}`}><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{agentName(node.agent)} · {node.label}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.1em] opacity-75">{node.stage} · {node.model ?? "auto"}/g{node.generation}/a{node.attempt} · handoff {node.dependenciesReady}/{node.dependencyCount}</div>{node.progress && <div className="mt-1 truncate text-[9px] text-slate">{node.progress}</div>}<div className="mt-1 truncate font-mono text-[7px] text-slate/65">{node.mergeState} · progress {progressStamp(node.progressAt)}</div></button>)}
           </section>
         </div>}
       </div>
-      {!selected && <footer className="mt-2 shrink-0 border-t border-white/[0.07] pt-2">{controlError && <div role="alert" data-control-error className="mb-2 rounded-lg border border-rose-400/25 bg-rose-400/[0.07] px-2 py-1 text-[9px] text-rose-300">{controlError}</div>}<Controls controls={fleet.controls} target={fleet.id.startsWith("work:") ? { jobId: active.id } : { missionId: fleet.id }} onError={setControlError} /></footer>}
+      {!selectedId && <footer className="mt-2 shrink-0 border-t border-white/[0.07] pt-2">{controlError && <div role="alert" data-control-error className="mb-2 rounded-lg border border-rose-400/25 bg-rose-400/[0.07] px-2 py-1 text-[9px] text-rose-300">{controlError}</div>}<Controls controls={fleet.controls} target={fleet.id.startsWith("work:") ? { jobId: active.id } : { missionId: fleet.id }} onError={setControlError} /></footer>}
     </aside>
   );
 }
