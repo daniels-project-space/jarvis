@@ -46,6 +46,7 @@ import { normalizeIncidentSignature } from "@/lib/incident-signature";
 import { isForegroundBusy } from "@/lib/foreground-state";
 import { FleetCommandCenter } from "./CompactWorkBar";
 import { isGuestViewerSession, useViewerSession } from "@/lib/viewer-session";
+import { canRenderPersistentAttachment } from "@/lib/guest-attachment";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -94,6 +95,7 @@ type StreamingSpeechState = {
 
 function ChatHistoryArchive({ threadId }: { threadId: string }) {
   const viewerToken = useViewerSession();
+  const guest = isGuestViewerSession(viewerToken);
   const { results, status, loadMore } = usePaginatedQuery(
     api.chatQueue.paginatedMessages,
     viewerToken ? { threadId, viewerToken } : "skip",
@@ -105,7 +107,7 @@ function ChatHistoryArchive({ threadId }: { threadId: string }) {
     <ol className="mt-1 space-y-1 px-2">
       {rows.map((message) => <li key={message._id} data-history-message={message._id} data-parent-message={message.parentMessageId ?? undefined} className="rounded-lg border border-white/[0.05] bg-black/15 px-2 py-1.5 text-[10px] text-slate">
         <div className="font-mono text-[7px] uppercase tracking-[0.1em] text-cyan/60">{message.role}</div>
-        {message.attachment
+        {canRenderPersistentAttachment(guest, message.attachment)
           ? <div className="truncate text-ice">{message.attachment.title ?? message.attachment.type}</div>
           : <div className="line-clamp-3 whitespace-pre-wrap text-ice/85">{message.role === "user" ? visibleTurnText(message.text) : sanitizeAssistantText(message.text)}</div>}
       </li>)}
@@ -3282,7 +3284,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               .filter((m) => m.text || (!guest && m.attachment) || m.status === "streaming")
               .map((m) => (
               <div key={m._id} className={`rise ${m.role === "user" ? "text-right" : "text-left"}`}>
-                {m.attachment ? (
+                {canRenderPersistentAttachment(guest, m.attachment) ? (
                   <MediaCard
                     a={m.attachment}
                     onShow={(a) => {
