@@ -46,7 +46,7 @@ import { normalizeIncidentSignature } from "@/lib/incident-signature";
 import { isForegroundBusy } from "@/lib/foreground-state";
 import { FleetCommandCenter } from "./CompactWorkBar";
 import { isGuestViewerSession, useViewerSession } from "@/lib/viewer-session";
-import { canRenderPersistentAttachment } from "@/lib/guest-attachment";
+import { GuestSafeAttachment } from "./GuestSafeAttachment";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -107,9 +107,13 @@ function ChatHistoryArchive({ threadId }: { threadId: string }) {
     <ol className="mt-1 space-y-1 px-2">
       {rows.map((message) => <li key={message._id} data-history-message={message._id} data-parent-message={message.parentMessageId ?? undefined} className="rounded-lg border border-white/[0.05] bg-black/15 px-2 py-1.5 text-[10px] text-slate">
         <div className="font-mono text-[7px] uppercase tracking-[0.1em] text-cyan/60">{message.role}</div>
-        {canRenderPersistentAttachment(guest, message.attachment)
-          ? <div className="truncate text-ice">{message.attachment.title ?? message.attachment.type}</div>
-          : <div className="line-clamp-3 whitespace-pre-wrap text-ice/85">{message.role === "user" ? visibleTurnText(message.text) : sanitizeAssistantText(message.text)}</div>}
+        <GuestSafeAttachment
+          guest={guest}
+          attachment={message.attachment}
+          renderAttachment={(attachment) => <div className="truncate text-ice">{attachment.title ?? attachment.type}</div>}
+        >
+          <div className="line-clamp-3 whitespace-pre-wrap text-ice/85">{message.role === "user" ? visibleTurnText(message.text) : sanitizeAssistantText(message.text)}</div>
+        </GuestSafeAttachment>
       </li>)}
     </ol>
     {status === "CanLoadMore" && <button type="button" onClick={() => loadMore(20)} className="mx-2 mt-2 w-[calc(100%-16px)] rounded-lg border border-cyan/20 px-2 py-1 text-[9px] text-cyan">load older messages</button>}
@@ -3284,15 +3288,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               .filter((m) => m.text || (!guest && m.attachment) || m.status === "streaming")
               .map((m) => (
               <div key={m._id} className={`rise ${m.role === "user" ? "text-right" : "text-left"}`}>
-                {canRenderPersistentAttachment(guest, m.attachment) ? (
-                  <MediaCard
-                    a={m.attachment}
-                    onShow={(a) => {
-                      setPanelMin(false);
-                      void setPanel({ type: a.type, value: a.value, title: a.title });
-                    }}
-                  />
-                ) : (
+                <GuestSafeAttachment
+                  guest={guest}
+                  attachment={m.attachment}
+                  renderAttachment={(attachment) => (
+                    <MediaCard
+                      a={attachment}
+                      onShow={(a) => {
+                        setPanelMin(false);
+                        void setPanel({ type: a.type, value: a.value, title: a.title });
+                      }}
+                    />
+                  )}
+                >
                   <span
                     className={`inline-block max-w-[88%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-[15px] leading-relaxed md:text-sm ${
                       m.role === "user"
@@ -3311,7 +3319,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                         ""
                       ))}
                   </span>
-                )}
+                </GuestSafeAttachment>
                 {m.role === "assistant" && m.model && (
                   <div className="mt-0.5 pl-1">
                     <ModelBadge model={m.model} />

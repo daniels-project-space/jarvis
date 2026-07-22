@@ -33,6 +33,12 @@ describe("reactive IO surfaces", () => {
     expect(chat).toContain("maximumRowsRead: HISTORY_PAGE_MAX");
   });
 
+  it("uses the guest-safe attachment boundary for both live and paginated rows", () => {
+    const jarvis = source("src/components/JarvisUI.tsx");
+    expect(jarvis.match(/<GuestSafeAttachment/g)).toHaveLength(2);
+    expect(jarvis).toContain(".filter((m) => m.text || (!guest && m.attachment) || m.status === \"streaming\")");
+  });
+
   it("loads exact job detail lazily without a second fleet subscription", () => {
     const jarvis = source("src/components/JarvisUI.tsx");
     expect(jarvis.match(/api\.jobs\.detail/g)).toHaveLength(1);
