@@ -4,6 +4,7 @@ import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
 import { viewerFetch } from "@/lib/viewer-request";
+import { creationLibraryFilter } from "@/lib/creation-library";
 
 // The richer panel views: frosted-glass calendar, live mind-map canvas,
 // app launcher, PDF viewer, creations library.
@@ -1711,16 +1712,20 @@ type CreationRow = {
 };
 
 export function CreationsView({ value }: { value: string }) {
-  let filter: { kind: string | null; folder?: string | null } = { kind: null, folder: null };
-  try {
-    filter = JSON.parse(value);
-  } catch {
-    /* noop */
-  }
+  const filter = creationLibraryFilter(value);
   const [kind, setKind] = useState<string | null>(filter.kind);
-  const [folder, setFolder] = useState<string | null>(filter.folder ?? null);
+  const [folder, setFolder] = useState<string | null>(filter.folder);
   const [search, setSearch] = useState("");
   const [editing, setEditing] = useState<{ id: string; title: string; folder: string } | null>(null);
+  useEffect(() => {
+    // A routed panel update is a new file request, not an instruction to keep
+    // filters/search from whichever library view happened to be open before.
+    const next = creationLibraryFilter(value);
+    setKind(next.kind);
+    setFolder(next.folder);
+    setSearch("");
+    setEditing(null);
+  }, [value]);
   const queriedRows = useJarvisQuery(api.creations.list, { limit: 100 }) as CreationRow[] | undefined;
   const rows = useMemo(() => queriedRows ?? [], [queriedRows]);
   const setPanel = (args: Record<string, unknown>) => clientMutation("ui:setPanel", args);

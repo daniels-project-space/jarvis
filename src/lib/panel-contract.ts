@@ -1,4 +1,4 @@
-export type PanelInput = { type: string; value: string };
+export type PanelInput = { type: string; value: string; title?: string };
 
 export type PanelRenderer =
   | "site"
@@ -31,6 +31,18 @@ function widgetKind(value: string): string {
   } catch {
     return "generic";
   }
+}
+
+/**
+ * Identity for short-lived local panel decisions (close suppression, restore).
+ *
+ * Do not truncate the value here: visual scenes and files commonly share a
+ * title and JSON prefix while differing later in their payload. Treating those
+ * as the same panel made a newly updated visual disappear after its predecessor
+ * had been closed.
+ */
+export function panelIdentity(panel: PanelInput): string {
+  return JSON.stringify([panel.type, panel.title ?? "", panel.value]);
 }
 
 export function resolvePanelRoute(panel: PanelInput): PanelRoute {

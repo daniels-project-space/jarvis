@@ -36,7 +36,7 @@ import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate, shouldIgnoreHandsFreeTranscript } from "@/lib/transcript";
 import { completeSpeechPrefix, isSpeaking as isTtsActuallySpeaking, unlockSpeechPlayback } from "@/lib/tts";
 import { NarrationLedger, narrationClaim } from "@/lib/narration";
-import { resolvePanelRoute } from "@/lib/panel-contract";
+import { panelIdentity, resolvePanelRoute } from "@/lib/panel-contract";
 import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
 import { needsHostContext, visibleTurnText, withHostContext, type JarvisHostContext } from "@/lib/host-context";
 import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actions";
@@ -1301,7 +1301,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // bikini search, say), kill it server-side instead of displaying it.
   const closedPanelRef = useRef<{ key: string; ts: number } | null>(null);
   const closeStage = () => {
-    if (panel) closedPanelRef.current = { key: `${panel.title ?? ""}|${panel.value.slice(0, 160)}`, ts: Date.now() };
+    if (panel) closedPanelRef.current = { key: panelIdentity(panel), ts: Date.now() };
     setInstantPanel(null);
     setPanelFull(false);
     void clearPanel({});
@@ -1322,7 +1322,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       }
       lastPanelAt.current = panel.updatedAt;
       const cp = closedPanelRef.current;
-      if (cp && cp.key === `${panel.title ?? ""}|${panel.value.slice(0, 160)}` && Date.now() - cp.ts < 12_000) {
+      if (cp && cp.key === panelIdentity(panel) && Date.now() - cp.ts < 12_000) {
         void clearPanel({});
         return;
       }
@@ -1790,7 +1790,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     try {
       return (await electVoice({ client: me.current })) !== false;
     } catch {
-      return true; // convex hiccup: better one voice too many than silence
+      // Captions preserve continuity while the election control plane recovers.
+      // Letting every tab speak here recreates the stereo-voice regression.
+      return false;
     }
   }
 
@@ -2304,7 +2306,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (panel?.type === "video") setVideoPip(true);
     else if (panel && !isPanelFollowUp(t, panel)) {
       closedPanelRef.current = {
-        key: `${panel.title ?? ""}|${panel.value.slice(0, 160)}`,
+        key: panelIdentity(panel),
         ts: Date.now(),
       };
       setInstantPanel(null);

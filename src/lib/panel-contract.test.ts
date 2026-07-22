@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolvePanelRoute } from "./panel-contract";
+import { panelIdentity, resolvePanelRoute } from "./panel-contract";
 
 describe("semantic panel routing", () => {
   it.each([
@@ -33,5 +33,11 @@ describe("semantic panel routing", () => {
 
   it("reserves the full stage only for video playback", () => {
     expect(resolvePanelRoute({ type: "video", value: "https://example.com" }).keepOrbVisible).toBe(false);
+  });
+
+  it("does not confuse visual revisions that only differ after a long JSON prefix", () => {
+    const prefix = "{" + "x".repeat(200);
+    expect(panelIdentity({ type: "scene", title: "Launch board", value: `${prefix}A` }))
+      .not.toBe(panelIdentity({ type: "scene", title: "Launch board", value: `${prefix}B` }));
   });
 });
