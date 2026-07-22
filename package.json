@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
+    "harness:codex-session": "tsx scripts/codex-session-concurrency-harness.ts",
     "probe:codex-cloud-permissions": "tsx scripts/probe-codex-cloud-permissions.ts",
     "probe:cloud-workspace-provider": "tsx scripts/probe-cloud-workspace-provider.ts"
   },

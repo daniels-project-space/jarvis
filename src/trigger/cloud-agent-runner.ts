@@ -4,6 +4,7 @@ import { CodexAppServer, CodexPermissionAttestationError } from "./codex-app-ser
 import { buildCloudCodexPermissionProfile } from "./cloud-codex-permissions";
 import { CloudWorkspaceToolBridge, CLOUD_REPOSITORY_TOOLS } from "./cloud-workspace-tools";
 import { CloudWorkspaceError, type CloudWorkspace, type CloudWorkspaceProvider } from "./cloud-workspace";
+import { consumeSubscriptionAuth, isCodexUnauthorizedError } from "./subscription-runtime";
 
 export type CloudAgentRun = {
   text: string;
@@ -66,6 +67,7 @@ export async function runCloudWorkspaceAgent(input: {
     controllerCwd: input.controllerScratch,
     permissionProfile,
     ephemeral: true,
+    onAuthConsumed: () => consumeSubscriptionAuth(input.controllerEnv),
     developerInstructions:
       "You are a background repository specialist. The controller scratch is empty and read-only. " +
       "All repository reads, writes, listings, and commands MUST use the repository_* dynamic tools. " +
@@ -99,6 +101,9 @@ export async function runCloudWorkspaceAgent(input: {
         input.onProgress?.(delta.trim().replace(/\s+/g, " ").slice(-160) || "working", log, "executing", 60);
       },
     });
+    if (turn.code !== 0 && isCodexUnauthorizedError(turn.stderr)) {
+      throw new Error("Codex subscription authorization was rejected");
+    }
     return {
       text: turn.finalText || (turn.code === 0 ? "(no output)" : `error: ${turn.stderr}`),
       timedOut: Date.now() - startedAt >= input.timeoutMs,
@@ -107,6 +112,7 @@ export async function runCloudWorkspaceAgent(input: {
       commands: [],
     };
   } catch (error) {
+    if (isCodexUnauthorizedError(error)) throw error;
     if (error instanceof CodexPermissionAttestationError) {
       throw new CloudWorkspaceError(
         input.provider.name,

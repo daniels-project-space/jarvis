@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { codexModelFor } from "./model-policy";
 import { appendAgentMessageDelta } from "./codex-stream";
+import { redactSensitiveText } from "../lib/secret-redaction";
 
 type JsonObject = Record<string, unknown>;
 type PendingRequest = { resolve: (value: JsonObject) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
@@ -53,6 +54,8 @@ export type CodexAppServerOptions = {
   permissionProfile?: CodexPermissionProfileOptions;
   developerInstructions?: string;
   ephemeral?: boolean;
+  onAuthConsumed?: () => void;
+  dynamicToolsOnly?: boolean;
 };
 
 export class CodexPermissionAttestationError extends Error {
@@ -100,6 +103,7 @@ export class CodexAppServer {
   private threads = new Map<string, string>();
   private stderr = "";
   private ready: Promise<void> | null = null;
+  private authConsumed = false;
 
   constructor(
     private readonly bin: string,
@@ -120,7 +124,9 @@ export class CodexAppServer {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.process = child;
-    child.stderr.on("data", (data) => { this.stderr = (this.stderr + data.toString()).slice(-1200); });
+    child.stderr.on("data", (data) => {
+      this.stderr = (this.stderr + redactSensitiveText(data.toString(), this.env)).slice(-1200);
+    });
     child.on("error", (error) => this.failAll(error));
     child.on("close", (code) => this.failAll(new Error(`Codex app-server exited (${code ?? "unknown"})`)));
     createInterface({ input: child.stdout }).on("line", (line) => this.receive(line));
@@ -155,6 +161,23 @@ export class CodexAppServer {
             runtimeWorkspaceRoots: permissionProfile.runtimeWorkspaceRoots,
           } : {
             sandbox: this.options.threadSandbox ?? "danger-full-access",
+            ...(this.options.dynamicToolsOnly ? {
+              config: {
+                web_search: "disabled",
+                shell_environment_policy: { inherit: "none" },
+                features: {
+                  shell_tool: false,
+                  unified_exec: false,
+                  apps: false,
+                  plugins: false,
+                  hooks: false,
+                  browser_use: false,
+                  computer_use: false,
+                  multi_agent: false,
+                },
+              },
+              environments: [],
+            } : {}),
           }),
           ephemeral: this.options.ephemeral ?? false,
           dynamicTools: input.allowTools === false ? [] : this.options.dynamicTools,
@@ -194,6 +217,10 @@ export class CodexAppServer {
     const turn = started.turn as JsonObject | undefined;
     const turnId = typeof turn?.id === "string" ? turn.id : "";
     if (!turnId) throw new Error("Codex app-server did not return a turn id");
+    if (!this.authConsumed) {
+      this.authConsumed = true;
+      this.options.onAuthConsumed?.();
+    }
     input.onTurnStarted?.();
     return new Promise<CodexTurnResult>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -299,8 +326,9 @@ export class CodexAppServer {
     this.process.stdin.write(`${JSON.stringify(message)}\n`);
   }
   private errorText(value: unknown): string {
-    if (typeof value === "string") return value;
-    try { return JSON.stringify(value).slice(0, 500); } catch { return String(value).slice(0, 500); }
+    if (typeof value === "string") return redactSensitiveText(value, this.env).slice(0, 500);
+    try { return redactSensitiveText(JSON.stringify(value), this.env).slice(0, 500); }
+    catch { return redactSensitiveText(String(value), this.env).slice(0, 500); }
   }
   private failAll(error: Error) {
     const detail = new Error(`${error.message}${this.stderr ? `: ${this.stderr.slice(-400)}` : ""}`);

@@ -24,7 +24,7 @@ type Pending = {
 };
 
 async function main() {
-const prepared = prepareSubscriptionEnv("codex");
+const prepared = await prepareSubscriptionEnv("codex", { scope: "permission-probe" });
 const baseEnv = prepared.env;
 const sourceHome = String(baseEnv.CODEX_HOME ?? "");
 const bin = resolveSubscriptionAgentBin("codex");

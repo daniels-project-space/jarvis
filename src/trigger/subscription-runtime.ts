@@ -1,129 +1,26 @@
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { accessSync, chmodSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
+import {
+  canonicalAuthJson,
+  parseChatgptSubscriptionAuthText,
+} from "./subscription-auth";
+import {
+  SubscriptionSessionError,
+  subscriptionOperatorSignal,
+  type AcquiredSubscriptionSession,
+  type ManagedSubscriptionSessionController,
+} from "./subscription-session";
+import { productionSubscriptionSessionController } from "./subscription-session-r2";
+
+export { parseChatgptSubscriptionAuth } from "./subscription-auth";
 
 export type AgentProvider = "codex";
 
-const AUTH_OUTER_KEYS = ["auth_mode", "tokens"] as const;
-const AUTH_TOKEN_KEYS = ["access_token", "refresh_token", "id_token", "account_id"] as const;
 export const PINNED_CODEX_VERSION = "codex-cli 0.144.5";
 export const CHATGPT_LOGIN_STATUS_RECEIPT = "Logged in using ChatGPT";
-
-type ChatgptSubscriptionAuth = {
-  auth_mode: "chatgpt";
-  tokens: Record<(typeof AUTH_TOKEN_KEYS)[number], string>;
-};
-
-type JsonObject = Record<string, unknown>;
-
-function isObject(value: unknown): value is JsonObject {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function sameKeys(value: JsonObject, expected: readonly string[]): boolean {
-  const actual = Object.keys(value).sort();
-  return actual.length === expected.length && actual.every((key, index) => key === [...expected].sort()[index]);
-}
-
-// JSON.parse intentionally accepts duplicate object keys (using the last one),
-// which makes a schema check ambiguous. Walk the JSON grammar first so a
-// duplicate credential field cannot be smuggled through that behavior.
-function rejectDuplicateJsonKeys(input: string): void {
-  let index = 0;
-  const whitespace = () => { while (/\s/.test(input[index] ?? "")) index++; };
-  const fail = (): never => { throw new Error("invalid JSON"); };
-  const string = (): string => {
-    if (input[index++] !== '"') fail();
-    const start = index - 1;
-    while (index < input.length) {
-      const char = input[index++];
-      if (char === '"') return JSON.parse(input.slice(start, index)) as string;
-      if (char === "\\") {
-        const escape = input[index++];
-        if (!escape || !'"\\/bfnrtu'.includes(escape)) fail();
-        if (escape === "u") {
-          if (!/^[0-9a-fA-F]{4}$/.test(input.slice(index, index + 4))) fail();
-          index += 4;
-        }
-      } else if (char.charCodeAt(0) < 0x20) fail();
-    }
-    return fail();
-  };
-  const value = (): void => {
-    whitespace();
-    if (input[index] === '"') { string(); return; }
-    if (input[index] === "{") {
-      index++; whitespace();
-      const keys = new Set<string>();
-      if (input[index] === "}") { index++; return; }
-      while (true) {
-        whitespace();
-        const key = string();
-        if (keys.has(key)) throw new Error("duplicate JSON key");
-        keys.add(key);
-        whitespace();
-        if (input[index++] !== ":") fail();
-        value(); whitespace();
-        if (input[index] === "}") { index++; return; }
-        if (input[index++] !== ",") fail();
-      }
-    }
-    if (input[index] === "[") {
-      index++; whitespace();
-      if (input[index] === "]") { index++; return; }
-      while (true) {
-        value(); whitespace();
-        if (input[index] === "]") { index++; return; }
-        if (input[index++] !== ",") fail();
-      }
-    }
-    const start = index;
-    while (index < input.length && !/[\s,}\]]/.test(input[index])) index++;
-    if (start === index) fail();
-    JSON.parse(input.slice(start, index));
-  };
-  value(); whitespace();
-  if (index !== input.length) fail();
-}
-
-function apiKeyShaped(value: string): boolean {
-  return /^(?:sk|rk|pk|api)[_-]/i.test(value) || /(?:^|[_-])api[_-]?key/i.test(value);
-}
-
-function parseChatgptSubscriptionAuthText(json: string): ChatgptSubscriptionAuth {
-  rejectDuplicateJsonKeys(json);
-  const parsed: unknown = JSON.parse(json);
-  if (!isObject(parsed) || !sameKeys(parsed, AUTH_OUTER_KEYS) || parsed.auth_mode !== "chatgpt" || !isObject(parsed.tokens) || !sameKeys(parsed.tokens, AUTH_TOKEN_KEYS)) {
-    throw new Error("invalid Codex ChatGPT subscription auth schema");
-  }
-  const tokens = {} as ChatgptSubscriptionAuth["tokens"];
-  for (const key of AUTH_TOKEN_KEYS) {
-    const value = parsed.tokens[key];
-    if (typeof value !== "string" || !value.trim() || apiKeyShaped(value)) {
-      throw new Error("invalid Codex ChatGPT subscription token");
-    }
-    tokens[key] = value;
-  }
-  return { auth_mode: "chatgpt", tokens };
-}
-
-export function parseChatgptSubscriptionAuth(encoded: string): ChatgptSubscriptionAuth {
-  // Accept only standard, padded base64. Buffer otherwise accepts whitespace,
-  // URL-safe alphabets, and truncated payloads, none of which are canonical.
-  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
-    throw new Error("invalid canonical Codex subscription auth encoding");
-  }
-  const json = Buffer.from(encoded, "base64").toString("utf8");
-  if (Buffer.from(json, "utf8").toString("base64") !== encoded) {
-    throw new Error("invalid canonical Codex subscription auth encoding");
-  }
-  return parseChatgptSubscriptionAuthText(json);
-}
-
-function canonicalAuthJson(auth: ChatgptSubscriptionAuth): string {
-  return JSON.stringify({ auth_mode: auth.auth_mode, tokens: auth.tokens });
-}
 
 const nodeRequire = createRequire(import.meta.url);
 
@@ -219,76 +116,77 @@ function scopedSubscriptionEnv(
   return env;
 }
 
-function authFromEnvironment(env: Readonly<NodeJS.ProcessEnv>): ChatgptSubscriptionAuth {
-  // There is deliberately no migration path here. A raw JSON document or
-  // bearer token can silently select a different Codex auth mode, so reject it
-  // before creating a home directory or starting any child process.
-  if (env.CODEX_ACCESS_TOKEN !== undefined || env.CODEX_AUTH_JSON !== undefined) {
-    throw new Error("legacy raw Codex credentials are not accepted");
-  }
-  const encoded = env.CODEX_AUTH_JSON_B64;
-  if (!encoded) throw new Error("Codex ChatGPT subscription auth is not configured");
-  return parseChatgptSubscriptionAuth(encoded);
-}
+type SessionAcquirer = Pick<ManagedSubscriptionSessionController, "acquire">;
 
-function writableCodexHome(): string | null {
-  const candidates = [
-    process.env.JARVIS_CODEX_HOME,
-    process.env.HOME && !process.env.HOME.startsWith("/tmp") ? join(process.env.HOME, ".codex") : undefined,
-    "/home/node/.codex",
-  ].filter((value): value is string => Boolean(value));
-  for (const candidate of [...new Set(candidates)]) {
-    if (candidate.startsWith("/tmp")) continue;
-    try {
-      mkdirSync(candidate, { recursive: true });
-      return candidate;
-    } catch {
-      /* try the next non-temporary home */
-    }
-  }
-  return null;
-}
+export type PreparedSubscriptionEnv = {
+  env: NodeJS.ProcessEnv;
+  snapshotVersion?: number;
+  snapshotExpiresAt?: number;
+  snapshotFence?: number;
+  error?: string;
+};
 
-export function prepareSubscriptionEnv(
+export async function prepareSubscriptionEnv(
   provider: AgentProvider,
-): { env: NodeJS.ProcessEnv; error?: string } {
+  options: {
+    controller?: SessionAcquirer;
+    root?: string;
+    scope?: string;
+    minimumValidityMs?: number;
+    afterUnauthorizedVersion?: number;
+  } = {},
+): Promise<PreparedSubscriptionEnv> {
   if (provider !== "codex") {
     return { env: {} as NodeJS.ProcessEnv, error: "Jarvis permits only the Codex CLI runtime" };
   }
-  let auth: ChatgptSubscriptionAuth;
+  if (process.env.CODEX_AUTH_JSON_B64 !== undefined
+    || process.env.CODEX_AUTH_JSON !== undefined
+    || process.env.CODEX_ACCESS_TOKEN !== undefined) {
+    return {
+      env: scopedSubscriptionEnv(process.env, provider),
+      error: subscriptionOperatorSignal(new SubscriptionSessionError("configuration_missing")),
+    };
+  }
+  let snapshot: AcquiredSubscriptionSession;
   try {
-    // Validate the sole accepted controller input before touching the
-    // filesystem. This is the root boundary for every foreground and durable
-    // Codex caller.
-    auth = authFromEnvironment(process.env);
+    const bin = resolveSubscriptionAgentBin(provider);
+    if (!bin) return { env: scopedSubscriptionEnv(process.env, provider), error: "codex binary not found" };
+    const controller = options.controller ?? await productionSubscriptionSessionController(bin);
+    snapshot = await controller.acquire({
+      minimumValidityMs: options.minimumValidityMs,
+      afterUnauthorizedVersion: options.afterUnauthorizedVersion,
+    });
+  } catch (error) {
+    return {
+      env: scopedSubscriptionEnv(process.env, provider),
+      error: subscriptionOperatorSignal(error),
+    };
+  }
+
+  try {
+    const root = options.root ?? "/home/node/.jarvis-codex-consumers";
+    if (root.startsWith("/tmp/work") || root === process.cwd()) throw new Error("unsafe consumer root");
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const safeScope = (options.scope ?? "runtime").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 60) || "runtime";
+    const home = mkdtempSync(join(root, `${safeScope}-`));
+    const authPath = join(home, "auth.json");
+    writeFileSync(authPath, canonicalAuthJson(snapshot.auth), { mode: 0o600 });
+    chmodSync(authPath, 0o600);
+    return {
+      env: scopedSubscriptionEnv(
+        { ...process.env, HOME: dirname(home), CODEX_HOME: home },
+        provider,
+      ),
+      snapshotVersion: snapshot.version,
+      snapshotExpiresAt: snapshot.expiresAt,
+      snapshotFence: snapshot.fence,
+    };
   } catch {
     return {
       env: scopedSubscriptionEnv(process.env, provider),
-      error: "invalid Codex ChatGPT subscription auth",
+      error: "Codex subscription consumer home is unavailable",
     };
   }
-  const home = writableCodexHome();
-  if (!home) {
-    return {
-      env: scopedSubscriptionEnv(process.env, provider),
-      error: "a writable non-temporary Codex home is unavailable",
-    };
-  }
-
-  const authPath = join(home, "auth.json");
-  writeFileSync(authPath, canonicalAuthJson(auth), { mode: 0o600 });
-  chmodSync(authPath, 0o600);
-
-  return {
-    env: scopedSubscriptionEnv(
-      {
-        ...process.env,
-        HOME: process.env.HOME && !process.env.HOME.startsWith("/tmp") ? process.env.HOME : dirname(home),
-        CODEX_HOME: home,
-      },
-      provider,
-    ),
-  };
 }
 
 export function isolateSubscriptionEnv(
@@ -303,7 +201,7 @@ export function isolateSubscriptionEnv(
   // CODEX_HOME. Keep each lease isolated beside the non-temporary source home
   // so its CLI toolchain initializes fully on both GitHub and Trigger workers.
   const isolationRoot = root ?? (sourceHome ? join(dirname(sourceHome), ".jarvis-codex-homes") : "/tmp/work/codex-homes");
-  const isolatedHome = join(isolationRoot, safeScope);
+  const isolatedHome = join(isolationRoot, `${safeScope}-${randomUUID()}`);
   mkdirSync(isolatedHome, { recursive: true });
   // Authentication and Daniel's scoped briefing are read-only inputs. System
   // skills are intentionally not copied: every concurrent Codex process gets
@@ -327,6 +225,23 @@ export function isolateSubscriptionEnv(
   // controller environment: it carries receipt, vault, Convex, Trigger and
   // GitHub authority that a Codex specialist must never inherit.
   return scopedSubscriptionEnv({ ...base, CODEX_HOME: isolatedHome }, "codex");
+}
+
+/** Delete the access snapshot once the trusted Codex parent has loaded it. */
+export function consumeSubscriptionAuth(env: Readonly<NodeJS.ProcessEnv>): void {
+  const home = String(env.CODEX_HOME ?? "");
+  if (!home) return;
+  const authPath = join(home, "auth.json");
+  if (!existsSync(authPath)) return;
+  // Validate before deletion so this helper cannot be redirected at an
+  // arbitrary file through a malformed home prepared outside this module.
+  parseChatgptSubscriptionAuthText(readFileSync(authPath, "utf8"));
+  unlinkSync(authPath);
+}
+
+export function isCodexUnauthorizedError(error: unknown): boolean {
+  const value = error instanceof Error ? error.message : String(error ?? "");
+  return /(?:\b401\b|unauthori[sz]ed|authentication (?:failed|required)|refresh[_ -]?token[_ -]?reused|login required)/i.test(value);
 }
 
 export function isolateCloudSubscriptionEnv(

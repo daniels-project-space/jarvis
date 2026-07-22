@@ -11,8 +11,8 @@ import { projectProviderBoundary } from "../lib/project-registry";
 import { routeWork } from "../mastra/routing";
 import { TEAM_BY_SLUG, type AgentSlug } from "../mastra/team";
 import {
-  codexExecPrefix,
   codexModelFor,
+  codexReviewExecPrefix,
   normalizeReasoningEffort,
 } from "./model-policy";
 import { reviewPrompt } from "./codex-review";
@@ -23,6 +23,7 @@ import { buildContinuationCheckpoint, segmentTimeoutMs } from "./continuation";
 import { runWatchSweep } from "./watch-runtime";
 import {
   missingSubscriptionTools,
+  isCodexUnauthorizedError,
   isolateCloudSubscriptionEnv,
   isolateSubscriptionEnv,
   prepareSubscriptionEnv,
@@ -37,7 +38,6 @@ import {
   type GoalPlan,
 } from "../lib/goal-mode";
 import { startAppFactoryGoal, syncExternalGoalRevisions, syncExternalGoalRuns } from "./goal-runtime";
-import { codexMcpConfigArgs, type CodexMcpConfig } from "../lib/codex-mcp";
 import { redactSensitiveText } from "../lib/secret-redaction";
 import {
   cumulativeWorkEvidence,
@@ -102,27 +102,15 @@ import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, createDeterministicTar, 
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
 
-function promptArgs(prompt: string, tier: string, json = false, mcpConfig?: string | null, reasoningEffort?: unknown): string[] {
-  const args = codexExecPrefix(tier, reasoningEffort);
-  if (json) args.push("--json");
-  if (mcpConfig) {
-    try {
-      const cfg = JSON.parse(readFileSync(mcpConfig, "utf8")) as CodexMcpConfig;
-      args.push(...codexMcpConfigArgs(cfg));
-    } catch { /* run without an invalid optional MCP config */ }
-  }
-  args.push(prompt);
-  return args;
-}
-
 function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, tier: string, timeoutMs: number): Promise<string> {
   return new Promise((resolve) => {
-    const p = spawn(bin, promptArgs(prompt, tier), { env, stdio: ["ignore", "pipe", "pipe"] });
+    const p = spawn(bin, [...codexReviewExecPrefix(tier), "-"], { env, stdio: ["pipe", "pipe", "pipe"] });
     let output = "";
     const timer = setTimeout(() => { try { p.kill("SIGKILL"); } catch { /* gone */ } resolve(output); }, timeoutMs);
     p.stdout.on("data", (d) => (output += d.toString()));
     p.on("close", () => { clearTimeout(timer); resolve(output); });
     p.on("error", () => { clearTimeout(timer); resolve(""); });
+    p.stdin.end(prompt, "utf8");
   });
 }
 
@@ -313,7 +301,7 @@ function runAgent(
   prompt: string,
   model: string,
   onProgress?: (s: string, log?: string, stage?: string, percent?: number) => void,
-  mcpConfig?: string | null,
+  _mcpConfig?: string | null,
   executionState?: () => Promise<string>,
   timeoutMs = 900_000,
   reasoningEffort?: unknown,
@@ -325,10 +313,14 @@ function runAgent(
   commands: GitCommandEvidence[];
 }> {
   return new Promise((resolve) => {
-    const args = promptArgs(prompt, model, true, mcpConfig, reasoningEffort);
+    // Mission synthesis is controller reasoning, not repository execution.
+    // Its model process has no shell, web, apps, plugins, hooks, MCP, or child
+    // agents, keeping the access snapshot inside the trusted Codex parent.
+    const args = [...codexReviewExecPrefix(model, reasoningEffort), "--json", "-"];
     const codexSelection = codexModelFor(model);
     const runtimeLabel = `${codexSelection.model} · ${normalizeReasoningEffort(reasoningEffort, codexSelection.effort)}`;
-    const p = spawn(bin, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    const p = spawn(bin, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    p.stdin.end(prompt, "utf8");
     let buf = "";
     let stderr = "";
     let finalText = "";
@@ -680,7 +672,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     const provider: AgentProvider = "codex";
     const bin = resolveSubscriptionAgentBin(provider);
     if (!bin) return rejectReservation(`no ${provider} binary`);
-    const prepared = prepareSubscriptionEnv(provider);
+    const prepared = await prepareSubscriptionEnv(provider, {
+      scope: `agent-${options.reservation.workerRunId}`,
+    });
     if (prepared.error) return rejectReservation(prepared.error);
     const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
     if (preflight.error) return rejectReservation(preflight.error);
@@ -1587,7 +1581,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const model = normalizeWorkModelTier(
           typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task),
         );
-        const agentEnv = isolateCloudSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}-cloud`);
+        let agentEnv = isolateCloudSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}-cloud`);
         let lastHeartbeatAt = 0;
         let lastDurableStage = "";
         let lastDurablePercent = 0;
@@ -1639,21 +1633,40 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             "blocked",
           );
         }
-        const run = await runCloudWorkspaceAgent({
-          bin,
-          controllerScratch,
-          controllerEnv: agentEnv,
-          provider: cloudProvider,
-          workspace: providerWorkspace,
-          prompt,
-          model,
-          onProgress: reportProgress,
-          executionState: async () => {
-            const state = await executionStatus();
-            return state === "superseded" ? "cancelled" : state;
-          },
-          timeoutMs: segmentTimeoutMs(model),
-        });
+        const executeCloudAgent = () => runCloudWorkspaceAgent({
+            bin,
+            controllerScratch,
+            controllerEnv: agentEnv,
+            provider: cloudProvider!,
+            workspace: providerWorkspace!,
+            prompt,
+            model,
+            onProgress: reportProgress,
+            executionState: async () => {
+              const state = await executionStatus();
+              return state === "superseded" ? "cancelled" : state;
+            },
+            timeoutMs: segmentTimeoutMs(model),
+          });
+        let run;
+        try {
+          run = await executeCloudAgent();
+        } catch (error) {
+          if (!isCodexUnauthorizedError(error) || prepared.snapshotVersion === undefined) throw error;
+          const renewed = await prepareSubscriptionEnv(provider, {
+            scope: `agent-${options.reservation.workerRunId}-unauthorized`,
+            minimumValidityMs: segmentTimeoutMs(model) + 2 * 60_000,
+            afterUnauthorizedVersion: prepared.snapshotVersion,
+          });
+          if (renewed.error) throw new Error(renewed.error);
+          const renewedPreflight = verifyCodexSubscriptionPreflight(bin, renewed.env);
+          if (renewedPreflight.error) throw new Error(renewedPreflight.error);
+          agentEnv = isolateCloudSubscriptionEnv(
+            renewed.env,
+            `${jobKey}-attempt-${expectedAttempt}-cloud-unauthorized`,
+          );
+          run = await executeCloudAgent();
+        }
         await durableProgress;
         let result = run.text;
         const portable = await persistPortableCheckpoint({

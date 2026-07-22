@@ -13,6 +13,7 @@ import {
   resolveSubscriptionAgentBin,
   verifyCodexSubscriptionPreflight,
 } from "./subscription-runtime";
+import { consumerAuth } from "./subscription-auth";
 
 const validAuth = {
   auth_mode: "chatgpt",
@@ -22,33 +23,53 @@ const validAuth = {
     id_token: "eyJ.id.subscription",
     account_id: "acct_subscription",
   },
-};
+} as const;
 const validAuthJson = JSON.stringify(validAuth);
 const validAuthB64 = Buffer.from(validAuthJson, "utf8").toString("base64");
 
 describe("subscription subprocess capability scope", () => {
+  let consumerRoot: string;
+  const controller = {
+    acquire: vi.fn(async () => ({
+      auth: consumerAuth(validAuth),
+      version: 7,
+      expiresAt: Date.now() + 60 * 60_000,
+      fence: 3,
+    })),
+  };
+  const prepare = () => prepareSubscriptionEnv("codex", {
+    controller,
+    root: consumerRoot,
+    scope: "test",
+  });
+
   beforeEach(() => {
-    vi.stubEnv("CODEX_AUTH_JSON_B64", validAuthB64);
+    consumerRoot = mkdtempSync(join(tmpdir(), "jarvis-consumer-root-"));
+    controller.acquire.mockClear();
+    vi.stubEnv("CODEX_AUTH_JSON_B64", undefined);
     vi.stubEnv("CODEX_AUTH_JSON", undefined);
     vi.stubEnv("CODEX_ACCESS_TOKEN", undefined);
   });
-  afterEach(() => vi.unstubAllEnvs());
+  afterEach(() => {
+    rmSync(consumerRoot, { recursive: true, force: true });
+    vi.unstubAllEnvs();
+  });
 
-  it("withholds dispatcher, worker and GitHub authority from specialists", () => {
+  it("withholds dispatcher, worker and GitHub authority from specialists", async () => {
     vi.stubEnv("JARVIS_DISPATCH_TOKEN", "dispatch-capability");
     vi.stubEnv("JARVIS_WORKER_TOKEN", "worker-capability");
     vi.stubEnv("GITHUB_TOKEN", "github-capability");
-    const specialist = prepareSubscriptionEnv("codex").env;
+    const specialist = (await prepare()).env;
     expect(specialist.JARVIS_DISPATCH_TOKEN).toBeUndefined();
     expect(specialist.JARVIS_WORKER_TOKEN).toBeUndefined();
     expect(specialist.GITHUB_TOKEN).toBeUndefined();
     expect(specialist.GH_TOKEN).toBeUndefined();
   });
 
-  it("preserves the executable and network runtime without passing application authority", () => {
+  it("preserves the executable and network runtime without passing application authority", async () => {
     vi.stubEnv("PATH", process.env.PATH ?? "/usr/bin:/bin");
     vi.stubEnv("HTTPS_PROXY", "http://proxy.internal:8080");
-    const specialist = prepareSubscriptionEnv("codex").env;
+    const specialist = (await prepare()).env;
     expect(specialist.PATH).toBe(process.env.PATH);
     expect(specialist.HTTPS_PROXY).toBe("http://proxy.internal:8080");
     expect(specialist.GIT_TERMINAL_PROMPT).toBe("0");
@@ -65,10 +86,10 @@ describe("subscription subprocess capability scope", () => {
     expect(missingSubscriptionTools({ PATH: "/definitely/missing" }, ["curl", "git"])).toEqual(["curl", "git"]);
   });
 
-  it("keeps bridge authentication in the Trigger host instead of every Codex child", () => {
+  it("keeps bridge authentication in the Trigger host instead of every Codex child", async () => {
     vi.stubEnv("JARVIS_DISPATCH_TOKEN", "dispatch-capability");
     vi.stubEnv("JARVIS_WORKER_TOKEN", "worker-capability");
-    const supervisor = prepareSubscriptionEnv("codex").env;
+    const supervisor = (await prepare()).env;
     expect(supervisor.JARVIS_DISPATCH_TOKEN).toBeUndefined();
     expect(supervisor.JARVIS_WORKER_TOKEN).toBeUndefined();
   });
@@ -77,19 +98,21 @@ describe("subscription subprocess capability scope", () => {
     expect(resolveSubscriptionAgentBin("codex")).toMatch(/codex/);
   });
 
-  it("gives concurrent agents separate Codex homes with shared auth only", () => {
+  it("gives concurrent agents separate writable homes without a real refresh token", () => {
     const root = mkdtempSync(join(tmpdir(), "jarvis-codex-test-"));
     const source = join(root, "source");
     const homes = join(root, "homes");
     try {
       mkdirSync(source, { recursive: true });
-      writeFileSync(join(source, "auth.json"), validAuthJson);
+      const workerAuthJson = JSON.stringify(consumerAuth(validAuth));
+      writeFileSync(join(source, "auth.json"), workerAuthJson);
       writeFileSync(join(source, "AGENTS.md"), "scoped briefing");
       const one = isolateSubscriptionEnv({ ...process.env, CODEX_HOME: source }, "job-one", homes);
       const two = isolateSubscriptionEnv({ ...process.env, CODEX_HOME: source }, "job-two", homes);
       expect(one.CODEX_HOME).not.toBe(two.CODEX_HOME);
       expect(readFileSync(join(String(one.CODEX_HOME), "AGENTS.md"), "utf8")).toBe("scoped briefing");
-      expect(readFileSync(join(String(two.CODEX_HOME), "auth.json"), "utf8")).toBe(validAuthJson);
+      expect(readFileSync(join(String(two.CODEX_HOME), "auth.json"), "utf8")).toBe(workerAuthJson);
+      expect(readFileSync(join(String(two.CODEX_HOME), "auth.json"), "utf8")).not.toContain("refresh_subscription");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -101,11 +124,12 @@ describe("subscription subprocess capability scope", () => {
     const homes = join(root, "homes");
     try {
       mkdirSync(source, { recursive: true });
-      writeFileSync(join(source, "auth.json"), validAuthJson);
+      const workerAuthJson = JSON.stringify(consumerAuth(validAuth));
+      writeFileSync(join(source, "auth.json"), workerAuthJson);
       writeFileSync(join(source, "config.toml"), 'sandbox_mode = "danger-full-access"');
       writeFileSync(join(source, "AGENTS.md"), "controller authority briefing");
       const env = isolateCloudSubscriptionEnv({ ...process.env, CODEX_HOME: source }, "cloud-job", homes);
-      expect(readFileSync(join(String(env.CODEX_HOME), "auth.json"), "utf8")).toBe(validAuthJson);
+      expect(readFileSync(join(String(env.CODEX_HOME), "auth.json"), "utf8")).toBe(workerAuthJson);
       expect(() => readFileSync(join(String(env.CODEX_HOME), "config.toml"), "utf8")).toThrow();
       expect(() => readFileSync(join(String(env.CODEX_HOME), "AGENTS.md"), "utf8")).toThrow();
     } finally {
@@ -139,17 +163,18 @@ describe("subscription subprocess capability scope", () => {
     expect(() => parseChatgptSubscriptionAuth(Buffer.from(JSON.stringify({ ...validAuth, tokens: { ...validAuth.tokens, access_token: "sk-proj-api-key" } })).toString("base64"))).toThrow();
   });
 
-  it("rejects legacy raw credential inputs before a Codex home is prepared", () => {
+  it("rejects copied raw credential inputs before a Codex home is prepared", async () => {
     vi.stubEnv("CODEX_ACCESS_TOKEN", "raw-access-token");
-    expect(prepareSubscriptionEnv("codex").error).toBe("invalid Codex ChatGPT subscription auth");
+    expect((await prepare()).error).toContain("configuration_missing");
     vi.stubEnv("CODEX_ACCESS_TOKEN", undefined);
     vi.stubEnv("CODEX_AUTH_JSON", validAuthJson);
-    expect(prepareSubscriptionEnv("codex").error).toBe("invalid Codex ChatGPT subscription auth");
+    expect((await prepare()).error).toContain("configuration_missing");
+    expect(controller.acquire).not.toHaveBeenCalled();
   });
 
-  it("requires exact non-generating version and ChatGPT login receipts from either stream", () => {
+  it("requires exact non-generating version and ChatGPT login receipts from either stream", async () => {
     const calls: string[][] = [];
-    const receipt = verifyCodexSubscriptionPreflight("/pinned/codex", prepareSubscriptionEnv("codex").env, (_bin, args) => {
+    const receipt = verifyCodexSubscriptionPreflight("/pinned/codex", (await prepare()).env, (_bin, args) => {
       calls.push([...args]);
       return args[0] === "--version"
         ? { status: 0, stdout: "", stderr: "codex-cli 0.144.5\n" }
@@ -157,7 +182,7 @@ describe("subscription subprocess capability scope", () => {
     });
     expect(receipt.receipt).toEqual({ version: "codex-cli 0.144.5", loginStatus: "Logged in using ChatGPT" });
     expect(calls).toEqual([["--version"], ["login", "status"]]);
-    const rejected = verifyCodexSubscriptionPreflight("/pinned/codex", prepareSubscriptionEnv("codex").env, () =>
+    const rejected = verifyCodexSubscriptionPreflight("/pinned/codex", (await prepare()).env, () =>
       ({ status: 0, stdout: "codex-cli 0.144.5", stderr: "unexpected auth warning" }));
     expect(rejected.error).toBe("pinned Codex version receipt failed");
   });

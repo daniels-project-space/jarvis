@@ -7,8 +7,10 @@ import { CAPABILITIES, INFRA_MAP, PERSONA, REMEMBER } from "../lib/persona";
 import { visualInitiativeDirective } from "../lib/visual-initiative";
 import { visibleTurnText } from "../lib/host-context";
 import { buildContext } from "../lib/context";
-import { codexConversationExecPrefix, codexModelFor, pickConversationTier } from "./model-policy";
+import { codexModelFor, codexReviewExecPrefix, pickConversationTier } from "./model-policy";
 import {
+  consumeSubscriptionAuth,
+  isCodexUnauthorizedError,
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
   verifyCodexSubscriptionPreflight,
@@ -37,14 +39,6 @@ import {
   JARVIS_TOOL_INSTRUCTIONS,
 } from "./agent-tool-bridge";
 import { StreamPublisher } from "./stream-publisher";
-
-function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = false): string[] {
-  if (provider !== "codex") throw new Error("Jarvis permits only the Codex CLI runtime");
-  const args = codexConversationExecPrefix(tier);
-  if (json) args.push("--json");
-  args.push(prompt);
-  return args;
-}
 
 // Subscription brain: each queued chat turn runs the Codex CLI headlessly,
 // with metered API keys blanked and only the subscription
@@ -225,9 +219,9 @@ async function extractAndSave(
     "Output [] if nothing is worth remembering. No prose, JSON only.\n\n" +
     `User: ${userText}\nAssistant: ${assistantText}`;
   const out = await new Promise<string>((resolve) => {
-    const p = spawn(bin, cliArgs(provider, prompt, "luna"), {
+    const p = spawn(bin, [...codexReviewExecPrefix("luna"), "-"], {
       env,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
     let o = "";
     const timeout = setTimeout(() => p.kill("SIGKILL"), 90_000);
@@ -240,6 +234,7 @@ async function extractAndSave(
       clearTimeout(timeout);
       resolve("");
     });
+    p.stdin.end(prompt, "utf8");
   });
   const m = out.match(/\[[\s\S]*\]/);
   if (!m) return 0;
@@ -278,9 +273,12 @@ async function processChatQueue(
   const provider: AgentProvider = "codex";
   const dispatchToken = process.env.JARVIS_DISPATCH_TOKEN;
   if (!dispatchToken) return { processed: 0, error: "JARVIS_DISPATCH_TOKEN is not configured" };
-  const prepared = prepareSubscriptionEnv(provider);
+  let prepared = await prepareSubscriptionEnv(provider, {
+    scope: `foreground-${lane}`,
+    minimumValidityMs: FOREGROUND_TURN_TIMEOUT_MS + 2 * 60_000,
+  });
   if (prepared.error) return { processed: 0, error: prepared.error };
-  const env = prepared.env;
+  let env = prepared.env;
   const bin = resolveSubscriptionAgentBin(provider);
   if (!bin) return { processed: 0, error: `${provider} binary not found` };
   const preflight = verifyCodexSubscriptionPreflight(bin, env);
@@ -289,10 +287,13 @@ async function processChatQueue(
   if (!workerToken) return { processed: 0, error: "JARVIS_WORKER_TOKEN is not configured" };
   const runnerId = randomUUID();
   const bridge = new AgentToolBridge(dispatchToken);
-  const server = new CodexAppServer(bin, env, FOREGROUND_TURN_TIMEOUT_MS, {
-    dynamicTools: JARVIS_DYNAMIC_TOOLS,
-    onDynamicToolCall: (call) => bridge.invoke(call),
-  });
+  const createServer = (serverEnv: NodeJS.ProcessEnv) => new CodexAppServer(bin, serverEnv, FOREGROUND_TURN_TIMEOUT_MS, {
+      dynamicTools: JARVIS_DYNAMIC_TOOLS,
+      dynamicToolsOnly: true,
+      onDynamicToolCall: (call) => bridge.invoke(call),
+      onAuthConsumed: () => consumeSubscriptionAuth(serverEnv),
+    });
+  let server = createServer(env);
   const client = new ConvexClient(CONVEX_URL);
   // A handoff candidate pays startup cost inside the bounded overlap, but
   // never takes ownership from a still-serving runner.
@@ -363,17 +364,50 @@ async function processChatQueue(
       const contextReadyAt = Date.now();
       const model = pickConversationTier(visibleUserText);
       const stages: Partial<Record<"codexAck" | "firstDelta" | "firstConvexPaint", number>> = {};
-      const turn = await runTurn(
-        server,
-        claim.threadId,
-        claim.assistantId,
-        claim.userText,
-        claim.history,
-        context,
-        model,
-        Boolean(claim.guest),
-        (stage) => { if (stages[stage] === undefined) stages[stage] = Date.now(); },
-      );
+      const executeTurn = () => runTurn(
+          server,
+          claim.threadId,
+          claim.assistantId,
+          claim.userText,
+          claim.history,
+          context,
+          model,
+          Boolean(claim.guest),
+          (stage) => { if (stages[stage] === undefined) stages[stage] = Date.now(); },
+        );
+      const renewUnauthorizedSession = async () => {
+        if (prepared.snapshotVersion === undefined) throw new Error("Codex subscription snapshot version is unavailable");
+        const renewed = await prepareSubscriptionEnv(provider, {
+          scope: `foreground-${lane}-unauthorized`,
+          minimumValidityMs: FOREGROUND_TURN_TIMEOUT_MS + 2 * 60_000,
+          afterUnauthorizedVersion: prepared.snapshotVersion,
+        });
+        if (renewed.error) throw new Error(renewed.error);
+        const renewedPreflight = verifyCodexSubscriptionPreflight(bin, renewed.env);
+        if (renewedPreflight.error) throw new Error(renewedPreflight.error);
+        server.stop();
+        prepared = renewed;
+        env = renewed.env;
+        server = createServer(env);
+      };
+      let turn;
+      let retriedUnauthorized = false;
+      try {
+        turn = await executeTurn();
+      } catch (error) {
+        if (!isCodexUnauthorizedError(error) || prepared.snapshotVersion === undefined) throw error;
+        // A consumer never retries a refresh token. Ask the fenced controller
+        // for a snapshot newer than the one that received 401, restart only
+        // this app-server, and replay the still-claimed turn exactly once.
+        await renewUnauthorizedSession();
+        retriedUnauthorized = true;
+        turn = await executeTurn();
+      }
+      if (!retriedUnauthorized && turn.code !== 0 && isCodexUnauthorizedError(turn.stderr)) {
+        await renewUnauthorizedSession();
+        retriedUnauthorized = true;
+        turn = await executeTurn();
+      }
       const modelFinishedAt = Date.now();
       const finalText =
         turn.finalText.trim() ||
@@ -450,7 +484,7 @@ export const chatMemory = task({
   maxDuration: 180,
   run: async (payload: { userText: string; assistantText: string }) => {
     const provider: AgentProvider = "codex";
-    const prepared = prepareSubscriptionEnv(provider);
+    const prepared = await prepareSubscriptionEnv(provider, { scope: "memory" });
     const bin = resolveSubscriptionAgentBin(provider);
     if (prepared.error || !bin) return { saved: 0, error: prepared.error ?? "Codex binary unavailable" };
     const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);

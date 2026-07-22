@@ -134,6 +134,38 @@ describe("Codex app-server dynamic tools", () => {
     await expect(turn).resolves.toMatchObject({ code: 0 });
   });
 
+  it("limits foreground execution to dynamic tools and consumes auth before model tools can run", async () => {
+    const onAuthConsumed = vi.fn();
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000, {
+      dynamicToolsOnly: true,
+      onAuthConsumed,
+    });
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = { stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } } };
+    internals.ready = Promise.resolve();
+    const turn = server.runTurn({
+      conversationId: "foreground", userText: "hello", history: [], contextBlock: "",
+      preamble: "test", modelTier: "luna", onDelta: () => {},
+    });
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0].params).toMatchObject({
+      environments: [],
+      config: {
+        web_search: "disabled",
+        shell_environment_policy: { inherit: "none" },
+        features: { shell_tool: false, unified_exec: false, apps: false, plugins: false, multi_agent: false },
+      },
+    });
+    internals.receive(JSON.stringify({ id: writes[0].id, result: { thread: { id: "foreground-thread" } } }));
+    await vi.waitFor(() => expect(writes).toHaveLength(2));
+    expect(onAuthConsumed).not.toHaveBeenCalled();
+    internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "foreground-turn" } } }));
+    await vi.waitFor(() => expect(onAuthConsumed).toHaveBeenCalledTimes(1));
+    internals.receive(JSON.stringify({ method: "turn/completed", params: { turnId: "foreground-turn", turn: { id: "foreground-turn", status: "completed" } } }));
+    await expect(turn).resolves.toMatchObject({ code: 0 });
+  });
+
   it("sends named permissions without legacy sandbox and starts a turn only after exact attestation", async () => {
     const permissionProfile: CodexPermissionProfileOptions = {
       id: "jarvis_cloud_bridge",

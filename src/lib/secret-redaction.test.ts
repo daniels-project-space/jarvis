@@ -16,4 +16,13 @@ describe("agent output secret redaction", () => {
   it("leaves ordinary evidence untouched", () => {
     expect(redactSensitiveText("tests 25/25 · production HTTP 200")).toBe("tests 25/25 · production HTTP 200");
   });
+
+  it("redacts managed-session JWTs and refresh-token assignments", () => {
+    const jwt = "eyJhbGciOiJub25lIn0.eyJleHAiOjE4MDAwMDAwMDB9.signature123";
+    const refresh = "managed-refresh-value-123456";
+    const output = redactSensitiveText(`access_token=${jwt} refresh_token=${refresh}`);
+    expect(output).not.toContain(jwt);
+    expect(output).not.toContain(refresh);
+    expect(output).toContain("REDACTED");
+  });
 });
