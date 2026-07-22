@@ -71,6 +71,19 @@ async function terminateOrCleanupBlocked(
   }
 }
 
+async function invokePostCreateCallback<T>(
+  provider: CloudWorkspaceProvider,
+  workspace: CloudWorkspace,
+  callback: () => Promise<T>,
+  context: string,
+): Promise<T> {
+  try { return await callback(); }
+  catch (error) {
+    await terminateOrCleanupBlocked(provider, workspace, "orphan", context);
+    throw error;
+  }
+}
+
 export async function createCredentiallessGitArchive(
   checkout: string,
   baseSha: string,
@@ -132,11 +145,27 @@ export async function prepareCloudWorkspaceExecution(input: {
     lockfileDigest: input.lockfileDigest,
     limits,
   });
-  if (input.assertCurrent && !await input.assertCurrent("workspace_binding")) {
+  const bindingLeaseCurrent = input.assertCurrent
+    ? await invokePostCreateCallback(
+        provider,
+        workspace,
+        () => input.assertCurrent!("workspace_binding"),
+        "could not clean workspace after the binding lease check failed",
+      )
+    : true;
+  if (!bindingLeaseCurrent) {
     await terminateOrCleanupBlocked(provider, workspace, "orphan", "could not clean workspace after the binding lease was lost");
     throw new CloudWorkspaceError(provider.name, "stale_attempt", "attempt fence rejected workspace binding", "deferred");
   }
-  if (input.bindWorkspace && !await input.bindWorkspace(workspace)) {
+  const workspaceBound = input.bindWorkspace
+    ? await invokePostCreateCallback(
+        provider,
+        workspace,
+        () => input.bindWorkspace!(workspace),
+        "could not clean workspace after durable binding failed",
+      )
+    : true;
+  if (!workspaceBound) {
     await terminateOrCleanupBlocked(provider, workspace, "orphan", "could not clean workspace after durable binding was rejected");
     throw new Error("Convex rejected the provider workspace/session fence");
   }
@@ -232,7 +261,23 @@ export async function replayCloudWorkspaceExecution(input: {
     await terminateOrCleanupBlocked(input.provider, workspace, "orphan", "could not clean replay workspace after terminal identity reuse");
     throw new CloudWorkspaceError(input.provider.name, "checkpoint_tampered", "checkpoint replay reused a terminal provider identity", "rejected");
   }
-  if (!await input.assertCurrent("replay_binding") || !await input.bindWorkspace(workspace)) {
+  const replayLeaseCurrent = await invokePostCreateCallback(
+    input.provider,
+    workspace,
+    () => input.assertCurrent("replay_binding"),
+    "could not clean replay workspace after the binding lease check failed",
+  );
+  if (!replayLeaseCurrent) {
+    await terminateOrCleanupBlocked(input.provider, workspace, "orphan", "could not clean replay workspace after binding was rejected");
+    throw new CloudWorkspaceError(input.provider.name, "stale_attempt", "attempt fence rejected replay workspace binding", "deferred");
+  }
+  const replayWorkspaceBound = await invokePostCreateCallback(
+    input.provider,
+    workspace,
+    () => input.bindWorkspace(workspace),
+    "could not clean replay workspace after durable binding failed",
+  );
+  if (!replayWorkspaceBound) {
     await terminateOrCleanupBlocked(input.provider, workspace, "orphan", "could not clean replay workspace after binding was rejected");
     throw new CloudWorkspaceError(input.provider.name, "stale_attempt", "attempt fence rejected replay workspace binding", "deferred");
   }

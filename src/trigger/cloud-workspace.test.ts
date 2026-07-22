@@ -193,6 +193,61 @@ describe("fail-closed cloud workspace boundary", () => {
     expect(reason).toBe(branch === "preparation" ? "terminal" : "orphan");
   });
 
+  it.each([
+    ["thrown post-create lease check", "lease"],
+    ["thrown durable binding", "binding"],
+  ] as const)("exact-terminates and preserves the original prepare callback error after %s", async (_label, branch) => {
+    const provider = new FakeCloudWorkspaceProvider();
+    const original = new Error(`prepare ${branch} callback failed`);
+    const terminate = vi.spyOn(provider, "terminate");
+    const bindWorkspace = vi.fn(async () => {
+      if (branch === "binding") throw original;
+      return true;
+    });
+    const failure = await prepareCloudWorkspaceExecution({
+      providerFactory: () => provider,
+      hydrateArchive: async () => archive([{ name: "safe.txt", data: new TextEncoder().encode("safe") }]),
+      attemptKey: `prepare-thrown-${branch}:1`, template: "node", runtime: "node-22", lockfileDigest: LOCK,
+      assertCurrent: async (phase) => {
+        if (branch === "lease" && phase === "workspace_binding") throw original;
+        return true;
+      },
+      bindWorkspace,
+    }).catch((error) => error);
+    expect(failure).toBe(original);
+    expect(terminate).toHaveBeenCalledOnce();
+    expect(terminate.mock.calls[0]?.[1]).toBe("orphan");
+    expect(bindWorkspace).toHaveBeenCalledTimes(branch === "binding" ? 1 : 0);
+  });
+
+  it.each([
+    ["thrown post-create lease check", "lease"],
+    ["thrown durable binding", "binding"],
+  ] as const)("surfaces bounded cleanup_blocked when prepare cleanup fails after %s", async (_label, branch) => {
+    const provider = new FakeCloudWorkspaceProvider();
+    const terminate = vi.spyOn(provider, "terminate").mockRejectedValue(new Error("termination rejected"));
+    const bindWorkspace = vi.fn(async () => {
+      if (branch === "binding") throw new Error("binding callback failed");
+      return true;
+    });
+    const failure = await prepareCloudWorkspaceExecution({
+      providerFactory: () => provider,
+      hydrateArchive: async () => archive([{ name: "safe.txt", data: new TextEncoder().encode("safe") }]),
+      attemptKey: `prepare-thrown-cleanup-${branch}:1`, template: "node", runtime: "node-22", lockfileDigest: LOCK,
+      assertCurrent: async (phase) => {
+        if (branch === "lease" && phase === "workspace_binding") throw new Error("lease callback failed");
+        return true;
+      },
+      bindWorkspace,
+    }).catch((error) => error);
+    const [workspace, reason] = terminate.mock.calls[0]!;
+    expect(failure).toMatchObject({ provider: provider.name, code: "cleanup_blocked", disposition: "blocked" });
+    expect(failure.message).toContain(workspace.providerWorkspaceId);
+    expect(failure.message.length).toBeLessThan(240);
+    expect(reason).toBe("orphan");
+    expect(bindWorkspace).toHaveBeenCalledTimes(branch === "binding" ? 1 : 0);
+  });
+
   it("never projects controller secrets or caller env into sandbox execution", async () => {
     const provider = new FakeCloudWorkspaceProvider();
     const workspace = await provider.createWorkspace({ attemptKey: "job:1", template: "node", runtime: "node-22", lockfileDigest: "b".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS });
@@ -320,6 +375,57 @@ describe("fail-closed cloud workspace boundary", () => {
     const failure = await replayCloudWorkspaceExecution({
       provider: fixture.provider, store: fixture.store, receipt: fixture.receipt, current: fixture.current,
       assertCurrent: async (phase) => branch !== "lease" || phase !== "replay_binding",
+      bindWorkspace,
+    }).catch((error) => error);
+    const [workspace, reason] = terminate.mock.calls[0]!;
+    expect(failure).toMatchObject({ provider: fixture.provider.name, code: "cleanup_blocked", disposition: "blocked" });
+    expect(failure.message).toContain(workspace.providerWorkspaceId);
+    expect(failure.message.length).toBeLessThan(240);
+    expect(reason).toBe("orphan");
+    expect(bindWorkspace).toHaveBeenCalledTimes(branch === "binding" ? 1 : 0);
+  });
+
+  it.each([
+    ["thrown replay lease check", "lease"],
+    ["thrown replay durable binding", "binding"],
+  ] as const)("exact-terminates and preserves the original replay callback error after %s", async (_label, branch) => {
+    const fixture = await storedCheckpointFixture();
+    const original = new Error(`replay ${branch} callback failed`);
+    const terminate = vi.spyOn(fixture.provider, "terminate");
+    const bindWorkspace = vi.fn(async () => {
+      if (branch === "binding") throw original;
+      return true;
+    });
+    const failure = await replayCloudWorkspaceExecution({
+      provider: fixture.provider, store: fixture.store, receipt: fixture.receipt, current: fixture.current,
+      assertCurrent: async (phase) => {
+        if (branch === "lease" && phase === "replay_binding") throw original;
+        return true;
+      },
+      bindWorkspace,
+    }).catch((error) => error);
+    expect(failure).toBe(original);
+    expect(terminate).toHaveBeenCalledOnce();
+    expect(terminate.mock.calls[0]?.[1]).toBe("orphan");
+    expect(bindWorkspace).toHaveBeenCalledTimes(branch === "binding" ? 1 : 0);
+  });
+
+  it.each([
+    ["thrown replay lease check", "lease"],
+    ["thrown replay durable binding", "binding"],
+  ] as const)("surfaces bounded cleanup_blocked when replay cleanup fails after %s", async (_label, branch) => {
+    const fixture = await storedCheckpointFixture();
+    const terminate = vi.spyOn(fixture.provider, "terminate").mockRejectedValue(new Error("termination rejected"));
+    const bindWorkspace = vi.fn(async () => {
+      if (branch === "binding") throw new Error("binding callback failed");
+      return true;
+    });
+    const failure = await replayCloudWorkspaceExecution({
+      provider: fixture.provider, store: fixture.store, receipt: fixture.receipt, current: fixture.current,
+      assertCurrent: async (phase) => {
+        if (branch === "lease" && phase === "replay_binding") throw new Error("lease callback failed");
+        return true;
+      },
       bindWorkspace,
     }).catch((error) => error);
     const [workspace, reason] = terminate.mock.calls[0]!;

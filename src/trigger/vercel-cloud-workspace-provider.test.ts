@@ -12,7 +12,7 @@ const observed: {
   create?: Record<string, unknown>; get?: Record<string, unknown>; commands: Record<string, unknown>[];
   deletes: string[]; updates: unknown[]; updateSessions: string[]; kills: string[]; waits: string[]; logConsumers: string[]; logsClosed: number; files: Map<string, Buffer>; mkdirs: string[]; reads: string[]; readSessions: string[]; writeSessions: string[];
   logs: Log[]; createGate?: Promise<void>; waitGate?: Promise<void>; releaseWaitOnKill?: () => void; logCloseGate?: Promise<void>; waitFailure?: unknown; fenceWaitFailure?: unknown;
-  createFailure?: unknown; getFailure?: unknown | ((input: Record<string, unknown>) => unknown); deleteFailure?: unknown | ((name: string) => unknown); createdRoutes?: unknown[]; currentSessionFailure?: unknown;
+  createFailure?: unknown; createReturnedName?: string; getFailure?: unknown | ((input: Record<string, unknown>) => unknown); getReturnedName?: string; deleteFailure?: unknown | ((name: string) => unknown); createdRoutes?: unknown[]; currentSessionFailure?: unknown;
   exitCode: number; commandExit?: (input: Record<string, unknown>) => number; commandExecutor?: (input: Record<string, unknown>) => CommandOutcome | undefined;
   updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; runCommandHook?: (input: Record<string, unknown>, session: FakeSession) => void;
   listed: Array<{ status: string }>; listedPages?: Array<Array<{ status: string }>>; listedPageNext?: Array<string | null>; listInputs: Record<string, unknown>[];
@@ -80,12 +80,12 @@ class FakeSandbox {
   static async create(input: Record<string, unknown>) {
     observed.create = input;
     if (observed.createFailure) throw observed.createFailure;
-    return new FakeSandbox(String(input.name));
+    return new FakeSandbox(observed.createReturnedName ?? String(input.name));
   }
   static async get(input: Record<string, unknown>) {
     observed.get = input;
     if (observed.getFailure) throw typeof observed.getFailure === "function" ? observed.getFailure(input) : observed.getFailure;
-    return new FakeSandbox(String(input.name));
+    return new FakeSandbox(observed.getReturnedName ?? String(input.name));
   }
   get routes(): unknown[] { return observed.createdRoutes ?? []; }
   readonly runtime = "node22";
@@ -140,7 +140,7 @@ function executeExactListingProgram(input: Record<string, unknown>): CommandOutc
 
 beforeEach(() => {
   observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.updateSessions = []; observed.kills = []; observed.waits = []; observed.logConsumers = []; observed.logsClosed = 0;
-  observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.readSessions = []; observed.writeSessions = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.releaseWaitOnKill = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.fenceWaitFailure = undefined; observed.createFailure = undefined; observed.getFailure = undefined; observed.deleteFailure = undefined; observed.createdRoutes = undefined; observed.currentSessionFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
+  observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.readSessions = []; observed.writeSessions = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.releaseWaitOnKill = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.fenceWaitFailure = undefined; observed.createFailure = undefined; observed.createReturnedName = undefined; observed.getFailure = undefined; observed.getReturnedName = undefined; observed.deleteFailure = undefined; observed.createdRoutes = undefined; observed.currentSessionFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
   observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.runCommandHook = undefined; observed.commandExecutor = undefined; observed.listed = []; observed.listedPages = undefined; observed.listedPageNext = undefined; observed.listInputs = []; FakeSandbox.current = new FakeSession();
 });
 
@@ -275,6 +275,64 @@ describe("VercelCloudWorkspaceProvider", () => {
     const failure = await provider.createWorkspace(createInput("create-cleanup-failure:1")).catch((error) => error);
     expect(failure).toMatchObject({ code: "cleanup_blocked", disposition: "blocked" });
     expect(failure.message).toContain(String(observed.create?.name));
+  });
+
+  it("reconciles and exact-deletes only the retained requested name after create returns an unowned identity", async () => {
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    const wrongName = "jarvis-unowned-returned-name";
+    observed.createReturnedName = wrongName;
+    const failure = await provider.createWorkspace(createInput("wrong-returned-present:1")).catch((error) => error);
+    const expectedName = String(observed.create?.name);
+    expect(failure).toMatchObject({ code: "cleanup_blocked", disposition: "blocked" });
+    expect(failure.message).toContain(expectedName);
+    expect(observed.get).toMatchObject({ name: expectedName, resume: false });
+    expect(observed.deletes).toEqual([expectedName]);
+    expect(observed.deletes).not.toContain(wrongName);
+  });
+
+  it("keeps an unowned create response blocked after exact SDK proof that the requested name is absent", async () => {
+    const { APIError } = await import("@vercel/sandbox");
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    const wrongName = "jarvis-unowned-returned-name";
+    observed.createReturnedName = wrongName;
+    observed.getFailure = (input: Record<string, unknown>) => new APIError(new Response("{}", { status: 404 }), { sandboxName: String(input.name) });
+    const failure = await provider.createWorkspace(createInput("wrong-returned-absent:1")).catch((error) => error);
+    expect(failure).toMatchObject({ code: "cleanup_blocked", disposition: "blocked" });
+    expect(observed.get).toMatchObject({ name: observed.create?.name, resume: false });
+    expect(observed.deletes).toEqual([]);
+    expect(observed.deletes).not.toContain(wrongName);
+  });
+
+  it("keeps an unowned create response blocked when exact requested-name cleanup fails", async () => {
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    const wrongName = "jarvis-unowned-returned-name";
+    observed.createReturnedName = wrongName;
+    observed.deleteFailure = new Error("expected-name delete refused");
+    const failure = await provider.createWorkspace(createInput("wrong-returned-cleanup-failure:1")).catch((error) => error);
+    const expectedName = String(observed.create?.name);
+    expect(failure).toMatchObject({ code: "cleanup_blocked", disposition: "blocked" });
+    expect(failure.message).toContain(expectedName);
+    expect(observed.get).toMatchObject({ name: expectedName, resume: false });
+    expect(observed.deletes).toEqual([expectedName]);
+    expect(observed.deletes).not.toContain(wrongName);
+  });
+
+  it("never acts on either unowned identity when requested-name reconciliation returns a substituted object", async () => {
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    const wrongReturnedName = "jarvis-unowned-returned-name";
+    const wrongLookupName = "jarvis-unowned-lookup-name";
+    observed.createReturnedName = wrongReturnedName;
+    observed.getReturnedName = wrongLookupName;
+    const failure = await provider.createWorkspace(createInput("wrong-returned-substituted-get:1")).catch((error) => error);
+    expect(failure).toMatchObject({ code: "cleanup_blocked", disposition: "blocked" });
+    expect(observed.get).toMatchObject({ name: observed.create?.name, resume: false });
+    expect(observed.deletes).toEqual([]);
+    expect(observed.deletes).not.toContain(wrongReturnedName);
+    expect(observed.deletes).not.toContain(wrongLookupName);
   });
 
   it("blocks cleanup when create reconciliation receives wrong-name or malformed 404 errors", async () => {

@@ -753,6 +753,8 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       throw new CloudWorkspaceError(this.name, "provider_unavailable", "Vercel Sandbox creation returned a malformed identity", "blocked");
     }
     if (returnedName !== name) {
+      try { await this.deleteExactSandbox(name); }
+      catch { throw this.cleanupBlocked(name, "could not reconcile the exact requested sandbox after an unowned identity response"); }
       throw this.cleanupBlocked(name, "sandbox creation returned an unowned identity");
     }
     let session: VercelSession;
