@@ -2,16 +2,18 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID }
 import {
   canonicalAuthJson,
   consumerAuth,
+  isUsableManagedSessionRotation,
   parseChatgptSubscriptionAuthText,
   subscriptionAccessTokenExpiresAt,
   subscriptionAuthDigest,
   type ChatgptSubscriptionAuth,
 } from "./subscription-auth";
+import { DEFAULT_SUBSCRIPTION_VALIDITY_MS } from "./subscription-validity";
 
 export const SESSION_STATE_SCHEMA = 1 as const;
 export const DEFAULT_SESSION_LEASE_MS = 45_000;
 export const DEFAULT_SESSION_WAIT_MS = 120_000;
-export const DEFAULT_MINIMUM_VALIDITY_MS = 5 * 60_000;
+export const DEFAULT_MINIMUM_VALIDITY_MS = DEFAULT_SUBSCRIPTION_VALIDITY_MS;
 
 export type SubscriptionSessionErrorCode =
   | "configuration_missing"
@@ -151,7 +153,7 @@ export class AesGcmSessionSnapshotCipher implements SessionSnapshotCipher {
 
 export type SessionRotator = (
   current: ChatgptSubscriptionAuth,
-  context: { reason: SessionRotationReason; fence: number },
+  context: { reason: SessionRotationReason; fence: number; requiredUntil: number },
 ) => Promise<ChatgptSubscriptionAuth>;
 
 export type SessionBootstrap = () => Promise<ChatgptSubscriptionAuth>;
@@ -197,6 +199,7 @@ function validateState(state: SessionState): void {
     || !Number.isSafeInteger(state.rotationAttempt.fence) || state.rotationAttempt.fence < 1
     || !Number.isSafeInteger(state.rotationAttempt.startedAt)
     || !["bootstrap_stale", "expired", "unauthorized"].includes(state.rotationAttempt.reason)
+    || state.rotationAttempt.sourceVersion !== (state.snapshot?.version ?? 0)
   )) throw new SubscriptionSessionError("snapshot_corrupt");
   const pointer = state.snapshot;
   if (pointer && (
@@ -255,30 +258,34 @@ export class ManagedSubscriptionSessionController {
     while (this.clock.now() - startedAt <= this.waitMs) {
       const observed = await this.ensureState();
       const pointer = observed.value.snapshot;
+      const sourceVersion = pointer?.version ?? 0;
+      const attempted = observed.value.rotationAttempt;
+      if (attempted?.sourceVersion === sourceVersion) {
+        const activeWriter = observed.value.writer;
+        if (!activeWriter || activeWriter.expiresAt <= this.clock.now()
+          || activeWriter.fence !== attempted.fence) {
+          // The provider may have consumed the source refresh token before the
+          // writer disappeared. Recovery must never replay it.
+          throw new SubscriptionSessionError("rotation_uncertain");
+        }
+        const remaining = Math.max(1, activeWriter.expiresAt - this.clock.now());
+        await this.clock.sleep(Math.min(100, remaining));
+        continue;
+      }
       const supersedesUnauthorized = input.afterUnauthorizedVersion === undefined
-        || (pointer?.version ?? 0) > input.afterUnauthorizedVersion;
+        || sourceVersion > input.afterUnauthorizedVersion;
       if (pointer && supersedesUnauthorized && pointer.tokenExpiresAt >= requiredUntil()) {
         const loaded = await this.loadCurrent(observed);
         if (loaded) return loaded;
         continue;
       }
 
-      const sourceVersion = pointer?.version ?? 0;
-      const attempted = observed.value.rotationAttempt;
-      if (attempted?.sourceVersion === sourceVersion
-        && (!observed.value.writer
-          || observed.value.writer.expiresAt <= this.clock.now()
-          || observed.value.writer.fence !== attempted.fence)) {
-        // Once a one-time refresh may have crossed the provider boundary, no
-        // recovered container is allowed to submit that source state again.
-        throw new SubscriptionSessionError("rotation_uncertain");
-      }
-
-      const lease = await this.tryAcquireWriter(observed);
+      const unauthorized = input.afterUnauthorizedVersion !== undefined
+        && sourceVersion <= input.afterUnauthorizedVersion;
+      const lease = await this.tryAcquireWriter(observed, unauthorized ? "unauthorized" : undefined);
       if (lease) {
         await this.writeFreshSnapshot(lease, {
-          unauthorized: input.afterUnauthorizedVersion !== undefined
-            && (pointer?.version ?? 0) <= input.afterUnauthorizedVersion,
+          unauthorized,
           requiredUntil: requiredUntil(),
         });
         continue;
@@ -311,6 +318,7 @@ export class ManagedSubscriptionSessionController {
 
   private async tryAcquireWriter(
     observed: { value: SessionState; etag: string },
+    rotationIntent?: "unauthorized",
   ): Promise<{ writer: SessionWriter; state: SessionState; etag: string } | null> {
     const now = this.clock.now();
     if (observed.value.writer && observed.value.writer.expiresAt > now) return null;
@@ -321,6 +329,17 @@ export class ManagedSubscriptionSessionController {
       revision: observed.value.revision + 1,
       fence,
       writer,
+      ...(rotationIntent ? {
+        // Linearize the unauthorized intent with writer acquisition. A fresh
+        // reader can no longer load the rejected source version in the gap
+        // before the provider request starts.
+        rotationAttempt: {
+          sourceVersion: observed.value.snapshot?.version ?? 0,
+          fence,
+          startedAt: now,
+          reason: rotationIntent,
+        },
+      } : {}),
     };
     const result = await this.options.store.compareExchangeState(observed.etag, next);
     return result.ok && result.etag ? { writer, state: next, etag: result.etag } : null;
@@ -382,7 +401,11 @@ export class ManagedSubscriptionSessionController {
       if (reason) {
         await this.markRotationAttempt(lease.writer, reason, currentPointer?.version ?? 0);
         try {
-          nextAuth = await this.options.rotate(currentAuth, { reason, fence: lease.writer.fence });
+          nextAuth = await this.options.rotate(currentAuth, {
+            reason,
+            fence: lease.writer.fence,
+            requiredUntil: request.requiredUntil,
+          });
         } catch (error) {
           if (error instanceof SubscriptionSessionError) throw error;
           throw new SubscriptionSessionError("rotation_failed");
@@ -390,7 +413,7 @@ export class ManagedSubscriptionSessionController {
       }
       const nextExpiry = subscriptionAccessTokenExpiresAt(nextAuth);
       if (nextExpiry < request.requiredUntil) throw new SubscriptionSessionError("snapshot_stale");
-      if (reason === "unauthorized" && subscriptionAuthDigest(nextAuth) === subscriptionAuthDigest(currentAuth)) {
+      if (reason && !isUsableManagedSessionRotation(currentAuth, nextAuth, request.requiredUntil)) {
         throw new SubscriptionSessionError("rotation_failed");
       }
 
@@ -462,7 +485,13 @@ export class ManagedSubscriptionSessionController {
       || current.value.writer.fence !== writer.fence || current.value.writer.expiresAt <= this.clock.now()) {
       throw new SubscriptionSessionError("writer_fence_lost");
     }
-    if (current.value.rotationAttempt?.sourceVersion === sourceVersion) {
+    const existing = current.value.rotationAttempt;
+    if (existing?.sourceVersion === sourceVersion
+      && existing.fence === writer.fence
+      && existing.reason === reason) {
+      return;
+    }
+    if (existing?.sourceVersion === sourceVersion) {
       throw new SubscriptionSessionError("rotation_uncertain");
     }
     const result = await this.options.store.compareExchangeState(current.etag, {
@@ -492,7 +521,8 @@ export class ManagedSubscriptionSessionController {
     const auth = await this.loadSnapshot(pointer);
     const after = await this.options.store.readState();
     if (!after.value || after.value.snapshot?.objectDigest !== pointer.objectDigest
-      || after.value.snapshot.version !== pointer.version) return null;
+      || after.value.snapshot.version !== pointer.version
+      || after.value.rotationAttempt?.sourceVersion === pointer.version) return null;
     return {
       auth: consumerAuth(auth),
       version: pointer.version,

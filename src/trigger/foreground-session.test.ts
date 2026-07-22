@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  FOREGROUND_ADMISSION_RESERVE_MS,
   FOREGROUND_SESSION_RENEWAL_RESERVE_MS,
+  FOREGROUND_TURN_VALIDITY_RESERVE_MS,
 } from "./foreground-policy";
 import {
   ForegroundSessionOwner,
@@ -111,7 +111,7 @@ describe("foreground subscription hot-swap", () => {
   it("never admits a turn whose full validity window crosses snapshot expiry", async () => {
     const operatorSignal = "JARVIS_CODEX_SESSION_UNAVAILABLE[snapshot_stale]: renew the managed session";
     const h = harness({
-      initialExpiresAt: START + FOREGROUND_ADMISSION_RESERVE_MS - 1,
+      initialExpiresAt: START + FOREGROUND_TURN_VALIDITY_RESERVE_MS - 1,
       prepare: async () => ({ env: { NODE_ENV: "test" }, error: operatorSignal }),
     });
     const execute = vi.fn();

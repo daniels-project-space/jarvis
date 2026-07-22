@@ -178,6 +178,34 @@ export function subscriptionAuthDigest(auth: ChatgptSubscriptionAuth): string {
 export const CONTROLLER_REFRESH_SENTINEL = "jarvis-controller-refresh-required";
 
 /**
+ * Codex 0.144.5's managed refresh endpoint may update `last_refresh` even when
+ * a response omits one or more token fields. A controller publication needs a
+ * stronger receipt: the same account, a strictly newer access credential, and
+ * a new one-time refresh credential that covers the caller's whole window.
+ */
+export function isUsableManagedSessionRotation(
+  current: ChatgptSubscriptionAuth,
+  updated: ChatgptSubscriptionAuth,
+  requiredUntil: number,
+): boolean {
+  if (!Number.isSafeInteger(requiredUntil) || requiredUntil <= 0) return false;
+  let currentExpiry: number;
+  let updatedExpiry: number;
+  try {
+    currentExpiry = subscriptionAccessTokenExpiresAt(current);
+    updatedExpiry = subscriptionAccessTokenExpiresAt(updated);
+  } catch {
+    return false;
+  }
+  return updated.tokens.account_id === current.tokens.account_id
+    && updated.tokens.access_token !== current.tokens.access_token
+    && updatedExpiry > currentExpiry
+    && updatedExpiry >= requiredUntil
+    && updated.tokens.refresh_token !== current.tokens.refresh_token
+    && updated.tokens.refresh_token !== CONTROLLER_REFRESH_SENTINEL;
+}
+
+/**
  * Workers receive a usable access snapshot but never the one-time refresh
  * state. If Codex reaches refresh, the sentinel fails harmlessly and the host
  * controller must reacquire a newer snapshot.

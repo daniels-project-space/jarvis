@@ -34,6 +34,8 @@ describe("intelligence provider boundary", () => {
     expect(`${runner}\n${config}`).not.toMatch(/CLAUDE|ANTHROPIC/i);
     expect(config).toContain("@openai/codex@0.144.5");
     expect(runner).toContain('id: "jarvis-agent-worker"');
+    expect(runner).toContain("afterUnauthorizedVersion: executionPrepared.snapshotVersion");
+    expect(runner).not.toContain("afterUnauthorizedVersion: prepared.snapshotVersion");
     expect(isolation).toContain('env.OPENAI_API_KEY = ""');
     expect(isolation).not.toMatch(/VAULT_ACCESS_TOKEN.*allow/i);
   });

@@ -18,20 +18,30 @@ between runs. Jarvis implements that contract as a controller boundary:
    early (or once after a 401/403), so a cached controller never outlives its
    S3 session token.
 3. The elected writer alone materializes the real refresh token in a mode-0600
-   controller directory outside repository workspaces. It runs a pinned,
-   no-tools Codex parent, re-reads `auth.json` even after a child crash, seals
-   the result with AES-256-GCM, writes an immutable version, and only then
-   advances the state pointer.
+   controller directory outside repository workspaces. It asks the pinned
+   Codex app-server to run `account/read` with `refreshToken: true`; no model
+   turn, prompt, tool, plugin, or repository is involved. The controller
+   re-reads `auth.json` even after a lost response or child crash and accepts a
+   rotation only when the account is unchanged, the access token and one-time
+   refresh token have genuinely advanced, and the new access expiry covers the
+   requesting consumer. It then seals the result with AES-256-GCM, writes an immutable
+   version, and only then advances the state pointer.
 4. Concurrent workers receive separate writable `CODEX_HOME` directories with
    the current access/identity snapshot and
    `jarvis-controller-refresh-required` in place of the refresh token. After an
    app-server loads that snapshot, the host deletes the file before model tools
    can run.
 5. A 401 causes one reacquisition for a version newer than the rejected one.
-   Other workers wait or continue with a still-valid snapshot; none submits the
-   controller refresh token.
+   The writer lease and unauthorized intent are one atomic CAS. From that
+   instant, every fresh acquire waits for the new committed pointer; even a
+   reader that had begun loading the old object rechecks the intent before it
+   can return. An already-loaded process remains independent, and none submits
+   the controller refresh token.
 6. A four-hour foreground owner renews before the snapshot's remaining window
-   can no longer cover both candidate startup and one full admitted turn. It
+   can no longer cover candidate startup, one full admitted turn, and Codex
+   0.144.5's five-minute internal refresh guard. Background and memory workers
+   likewise reserve startup, their complete execution/finalization bound, and
+   that guard before any consumer process starts. The foreground owner
    preflights and initializes one single-flight candidate while the current
    app-server keeps serving, publishes the candidate only between turns, then
    retires the old process. A pre-`turn/start` 401 may replay once; an accepted
@@ -61,6 +71,9 @@ are withheld from Codex and unrelated Git children. Static `R2_ACCESS_KEY_ID`,
 `R2_SECRET_ACCESS_KEY`, and `R2_SESSION_TOKEN` values are rejected by the
 session controller. Session objects are never written to Convex, Trigger
 metadata, checkpoints, application APIs, Git, or the public artifacts bucket.
+The vault client accepts only the canonical HTTPS
+`fantastic-roadrunner-485.convex.cloud` origin, rejects redirects, and applies a
+bounded request timeout before placing the vault capability in a POST body.
 
 The closed failure signal is:
 

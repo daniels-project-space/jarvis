@@ -35,6 +35,7 @@ import { successorLane, taskForForegroundLane, type ForegroundLane } from "./for
 import { buildForegroundTiming, type ForegroundTurnTiming } from "./foreground-timing";
 import { CodexAppServer } from "./codex-app-server";
 import { ForegroundSessionOwner } from "./foreground-session";
+import { MEMORY_SUBSCRIPTION_VALIDITY_MS } from "./subscription-validity";
 import {
   AgentToolBridge,
   JARVIS_DYNAMIC_TOOLS,
@@ -492,7 +493,10 @@ export const chatMemory = task({
   maxDuration: 180,
   run: async (payload: { userText: string; assistantText: string }) => {
     const provider: AgentProvider = "codex";
-    const prepared = await prepareSubscriptionEnv(provider, { scope: "memory" });
+    const prepared = await prepareSubscriptionEnv(provider, {
+      scope: "memory",
+      minimumValidityMs: MEMORY_SUBSCRIPTION_VALIDITY_MS,
+    });
     try {
       const bin = resolveSubscriptionAgentBin(provider);
       if (prepared.error || !bin) return { saved: 0, error: prepared.error ?? "Codex binary unavailable" };

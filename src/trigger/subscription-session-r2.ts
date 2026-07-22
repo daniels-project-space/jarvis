@@ -1,16 +1,16 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { AwsClient } from "aws4fetch";
 import { vaultService } from "../lib/vault-client";
-import { codexReviewExecPrefix } from "./model-policy";
 import { requireVaultBrokerSubscriptionSource } from "./subscription-source";
 import {
   canonicalAuthJson,
+  isUsableManagedSessionRotation,
   parseChatgptSubscriptionAuth,
   parseChatgptSubscriptionAuthText,
   subscriptionAccessTokenExpiresAt,
-  subscriptionAuthDigest,
   type ChatgptSubscriptionAuth,
 } from "./subscription-auth";
 import {
@@ -447,7 +447,7 @@ type RotationSpawn = (
 
 function rotationEnv(codexHome: string): NodeJS.ProcessEnv {
   const allow = [
-    "PATH", "LANG", "LC_ALL", "NODE_PATH", "NODE_OPTIONS", "NODE_EXTRA_CA_CERTS",
+    "PATH", "LANG", "LC_ALL", "NODE_EXTRA_CA_CERTS",
     "SSL_CERT_FILE", "SSL_CERT_DIR", "TERM", "CI", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "no_proxy",
   ];
@@ -473,7 +473,12 @@ function rotationEnv(codexHome: string): NodeJS.ProcessEnv {
 export async function rotateManagedSessionWithCodex(
   bin: string,
   current: ChatgptSubscriptionAuth,
-  options: { root?: string; spawnProcess?: RotationSpawn; timeoutMs?: number } = {},
+  options: {
+    root?: string;
+    spawnProcess?: RotationSpawn;
+    timeoutMs?: number;
+    requiredUntil?: number;
+  } = {},
 ): Promise<ChatgptSubscriptionAuth> {
   const root = options.root ?? "/home/node/.jarvis-codex-session-controller";
   mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -481,31 +486,99 @@ export async function rotateManagedSessionWithCodex(
   const authPath = join(home, "auth.json");
   writeFileSync(authPath, canonicalAuthJson(current), { mode: 0o600 });
   const spawnProcess = options.spawnProcess ?? ((command, args, spawnOptions) => spawn(command, args, spawnOptions));
-  let stderr = "";
+  let refreshTokenReused = false;
+  let diagnosticTail = "";
+  const observeDiagnostic = (value: unknown) => {
+    const text = `${diagnosticTail}${String(value ?? "")}`;
+    if (/refresh[_ -]?token[_ -]?reused|refresh token (?:was )?(?:already )?used/i.test(text)) {
+      refreshTokenReused = true;
+    }
+    // Retain only enough boundary text to recognize a split error code. This
+    // buffer is never emitted or persisted.
+    diagnosticTail = text.slice(-80);
+  };
   try {
     await new Promise<void>((resolve) => {
+      let settled = false;
       let child: ChildProcessWithoutNullStreams;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      let terminationTimer: ReturnType<typeof setTimeout> | null = null;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (terminationTimer) clearTimeout(terminationTimer);
+        resolve();
+      };
       try {
-        child = spawnProcess(bin, [...codexReviewExecPrefix("luna"), "-"], {
+        child = spawnProcess(bin, ["app-server", "--listen", "stdio://"], {
           cwd: home,
           env: rotationEnv(home),
           stdio: ["pipe", "pipe", "pipe"],
         });
       } catch {
-        resolve();
+        finish();
         return;
       }
-      const timer = setTimeout(() => {
-        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      const stop = (signal: NodeJS.Signals) => {
+        try { child.kill(signal); } catch { /* already gone */ }
+        if (!terminationTimer) {
+          terminationTimer = setTimeout(() => {
+            try { child.kill("SIGKILL"); } catch { /* already gone */ }
+            finish();
+          }, 1_000);
+        }
+      };
+      timer = setTimeout(() => {
+        stop("SIGKILL");
       }, options.timeoutMs ?? ROTATION_TIMEOUT_MS);
-      child.stdout.resume();
-      child.stderr.on("data", (data) => { stderr = (stderr + data.toString()).slice(-2_000); });
-      child.once("error", () => { clearTimeout(timer); resolve(); });
-      child.once("close", () => { clearTimeout(timer); resolve(); });
+      child.stderr.on("data", observeDiagnostic);
+      child.stdin.on("error", () => stop("SIGKILL"));
+      child.once("error", finish);
+      child.once("close", finish);
+      createInterface({ input: child.stdout }).on("line", (line) => {
+        let message: Record<string, unknown>;
+        try {
+          message = JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          return;
+        }
+        if (message.id === 1) {
+          if (message.error) {
+            observeDiagnostic(JSON.stringify(message.error));
+            stop("SIGTERM");
+            return;
+          }
+          try {
+            child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
+            child.stdin.write(`${JSON.stringify({
+              id: 2,
+              method: "account/read",
+              params: { refreshToken: true },
+            })}\n`);
+          } catch {
+            stop("SIGKILL");
+          }
+          return;
+        }
+        if (message.id === 2) {
+          if (message.error) observeDiagnostic(JSON.stringify(message.error));
+          // account/read persists managed auth before replying. A lost reply or
+          // crash is also handled below by reading the file unconditionally.
+          stop("SIGTERM");
+        }
+      });
       try {
-        child.stdin.end("Reply with exactly READY. Do not call tools.\n", "utf8");
+        child.stdin.write(`${JSON.stringify({
+          id: 1,
+          method: "initialize",
+          params: {
+            clientInfo: { name: "jarvis-session-controller", title: "Jarvis Session Controller", version: "1.0.0" },
+            capabilities: { experimentalApi: false },
+          },
+        })}\n`);
       } catch {
-        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+        stop("SIGKILL");
       }
     });
 
@@ -516,10 +589,12 @@ export async function rotateManagedSessionWithCodex(
     } catch {
       throw new SubscriptionSessionError("rotation_failed");
     }
-    if (subscriptionAuthDigest(updated) !== subscriptionAuthDigest(current)) return updated;
-    if (/refresh[_ -]?token[_ -]?reused|refresh token (?:was )?reused/i.test(stderr)) {
+    if (refreshTokenReused) {
       throw new SubscriptionSessionError("refresh_token_reused");
     }
+    const requiredUntil = options.requiredUntil
+      ?? Math.max(Date.now() + 1, subscriptionAccessTokenExpiresAt(current) + 1);
+    if (isUsableManagedSessionRotation(current, updated, requiredUntil)) return updated;
     throw new SubscriptionSessionError("rotation_failed");
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -572,7 +647,9 @@ export function productionSubscriptionSessionController(
       store,
       cipher: new AesGcmSessionSnapshotCipher(key),
       bootstrap: async () => parseChatgptSubscriptionAuth(secrets.CODEX_AUTH_JSON_B64),
-      rotate: (auth) => rotateManagedSessionWithCodex(bin, auth),
+      rotate: (auth, context) => rotateManagedSessionWithCodex(bin, auth, {
+        requiredUntil: context.requiredUntil,
+      }),
     });
   })().catch((error) => {
     controllerPromise = null;

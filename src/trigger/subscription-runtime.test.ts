@@ -17,6 +17,10 @@ import {
 } from "./subscription-runtime";
 import { CONTROLLER_REFRESH_SENTINEL, canonicalAuthJson, consumerAuth } from "./subscription-auth";
 import { CODEX_SESSION_SOURCE, CODEX_SESSION_SOURCE_ENV } from "./subscription-source";
+import {
+  DEFAULT_SUBSCRIPTION_VALIDITY_MS,
+  PINNED_CODEX_INTERNAL_REFRESH_GUARD_MS,
+} from "./subscription-validity";
 
 const validAuth = {
   OPENAI_API_KEY: null,
@@ -103,6 +107,22 @@ describe("subscription subprocess capability scope", () => {
 
   it("ships the pinned Codex CLI that Trigger conversation workers resolve", () => {
     expect(resolveSubscriptionAgentBin("codex")).toMatch(/codex/);
+  });
+
+  it("requests a safe default and refuses to start a consumer inside the CLI refresh guard", async () => {
+    await prepare();
+    expect(controller.acquire).toHaveBeenLastCalledWith({
+      minimumValidityMs: DEFAULT_SUBSCRIPTION_VALIDITY_MS,
+      afterUnauthorizedVersion: undefined,
+    });
+    controller.acquire.mockClear();
+    const rejected = await prepareSubscriptionEnv("codex", {
+      controller,
+      root: consumerRoot,
+      minimumValidityMs: PINNED_CODEX_INTERNAL_REFRESH_GUARD_MS,
+    });
+    expect(rejected.error).toContain("snapshot_stale");
+    expect(controller.acquire).not.toHaveBeenCalled();
   });
 
   it("gives concurrent agents separate writable homes without a real refresh token", () => {

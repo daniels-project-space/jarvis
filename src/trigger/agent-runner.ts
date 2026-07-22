@@ -33,6 +33,10 @@ import {
   type AgentProvider,
 } from "./subscription-runtime";
 import {
+  DEFAULT_SUBSCRIPTION_VALIDITY_MS,
+  backgroundSubscriptionValidityMs,
+} from "./subscription-validity";
+import {
   GOAL_PLAN_RESULT_MAX_CHARS,
   parseGoalPlan,
   parseGoalValidation,
@@ -676,6 +680,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     if (!bin) return rejectReservation(`no ${provider} binary`);
     const prepared = await prepareSubscriptionEnv(provider, {
       scope: `agent-${options.reservation.workerRunId}`,
+      minimumValidityMs: DEFAULT_SUBSCRIPTION_VALIDITY_MS,
     });
     if (prepared.error) return rejectReservation(prepared.error);
     const subscriptionEnvs = new Set<NodeJS.ProcessEnv>([prepared.env]);
@@ -690,7 +695,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     if (missingTools.length) {
       return rejectReservation(`Codex worker toolchain unavailable: missing ${missingTools.join(", ")} on PATH`);
     }
-    const env = prepared.env;
+    let env = prepared.env;
     const hostChildEnv = environmentWithoutSubscriptionController(env);
     hostChildEnv.HOME = "/tmp/jarvis-controller-child-home";
     hostChildEnv.GIT_CONFIG_NOSYSTEM = "1";
@@ -982,7 +987,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       };
       try {
         const jobKey = String(job.jobId).replace(/[^a-zA-Z0-9_-]/g, "_");
-        const jobEnv = trackSubscriptionEnv(isolateSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}`));
+        let jobEnv = trackSubscriptionEnv(isolateSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}`));
         const controllerScratch = `/tmp/work/controller-${jobKey}-attempt-${expectedAttempt}`;
         rmSync(controllerScratch, { recursive: true, force: true });
         mkdirSync(controllerScratch, { recursive: true });
@@ -1593,6 +1598,22 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const model = normalizeWorkModelTier(
           typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task),
         );
+        // Setup may consume part of the initial controller window. Reacquire at
+        // the actual process boundary so this exact segment plus verification
+        // and delivery finishes before Codex's internal refresh guard.
+        const executionPrepared = await prepareSubscriptionEnv(provider, {
+          scope: `agent-${options.reservation.workerRunId}-execution`,
+          minimumValidityMs: backgroundSubscriptionValidityMs(segmentTimeoutMs(model)),
+        });
+        subscriptionEnvs.add(executionPrepared.env);
+        if (executionPrepared.error) throw new Error(executionPrepared.error);
+        const executionPreflight = verifyCodexSubscriptionPreflight(bin, executionPrepared.env);
+        if (executionPreflight.error) throw new Error(executionPreflight.error);
+        env = executionPrepared.env;
+        jobEnv = trackSubscriptionEnv(isolateSubscriptionEnv(
+          env,
+          `${jobKey}-attempt-${expectedAttempt}-controller-finalization`,
+        ));
         let agentEnv = trackSubscriptionEnv(isolateCloudSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}-cloud`));
         let lastHeartbeatAt = 0;
         let lastDurableStage = "";
@@ -1664,16 +1685,21 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         try {
           run = await executeCloudAgent();
         } catch (error) {
-          if (!isCodexUnauthorizedError(error) || prepared.snapshotVersion === undefined) throw error;
+          if (!isCodexUnauthorizedError(error) || executionPrepared.snapshotVersion === undefined) throw error;
           const renewed = await prepareSubscriptionEnv(provider, {
             scope: `agent-${options.reservation.workerRunId}-unauthorized`,
-            minimumValidityMs: segmentTimeoutMs(model) + 2 * 60_000,
-            afterUnauthorizedVersion: prepared.snapshotVersion,
+            minimumValidityMs: backgroundSubscriptionValidityMs(segmentTimeoutMs(model)),
+            afterUnauthorizedVersion: executionPrepared.snapshotVersion,
           });
           subscriptionEnvs.add(renewed.env);
           if (renewed.error) throw new Error(renewed.error);
           const renewedPreflight = verifyCodexSubscriptionPreflight(bin, renewed.env);
           if (renewedPreflight.error) throw new Error(renewedPreflight.error);
+          env = renewed.env;
+          jobEnv = trackSubscriptionEnv(isolateSubscriptionEnv(
+            renewed.env,
+            `${jobKey}-attempt-${expectedAttempt}-controller-finalization-unauthorized`,
+          ));
           agentEnv = trackSubscriptionEnv(isolateCloudSubscriptionEnv(
             renewed.env,
             `${jobKey}-attempt-${expectedAttempt}-cloud-unauthorized`,
@@ -2330,6 +2356,18 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     const synthesizeMissionClaim = async (synth: any): Promise<void> => {
       if (!synth?.id) return;
       const missionId = String(synth.id);
+      const synthesisPrepared = await prepareSubscriptionEnv(provider, {
+        scope: `mission-${missionId}-synthesis`,
+        minimumValidityMs: backgroundSubscriptionValidityMs(segmentTimeoutMs("terra")),
+      });
+      subscriptionEnvs.add(synthesisPrepared.env);
+      if (synthesisPrepared.error) throw new Error(synthesisPrepared.error);
+      const synthesisPreflight = verifyCodexSubscriptionPreflight(bin, synthesisPrepared.env);
+      if (synthesisPreflight.error) throw new Error(synthesisPreflight.error);
+      const synthesisEnv = trackSubscriptionEnv(isolateSubscriptionEnv(
+        synthesisPrepared.env,
+        `mission-${missionId}-synthesis`,
+      ));
       const failedAll = synth.results.every((r: any) => r.status !== "done");
       const body = synth.results
         .map((r: any) => `### ${r.label} [${r.status}]\n${r.result || "(no output)"}`)
@@ -2337,7 +2375,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       const merged = await runAgent(
         bin,
         "/tmp/work",
-        env,
+        synthesisEnv,
         `You are JARVIS's mission synthesizer. A fleet of agents just finished parallel work on ONE mission. ` +
           `Merge their results into a single coherent markdown report: start with "## Mission" and a 2-sentence outcome, ` +
           `then "## Findings" (the substance, deduplicated, agent labels only where they add clarity), then "## Next moves" ` +
@@ -2357,7 +2395,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       if (!finished) return;
       const thread = typeof synth.originThreadId === "string" && synth.originThreadId ? synth.originThreadId : "main";
       const spoken =
-        (await weaveLine(bin, env, `MISSION: ${synth.goal}`, report)) ||
+        (await weaveLine(bin, synthesisEnv, `MISSION: ${synth.goal}`, report)) ||
         (failedAll ? "The fleet came back empty-handed, sir — mission report is on your screen." : "Mission complete, sir — the fleet's full report is on your screen.");
       await convexMutation("chatQueue:postAssistant", { threadId: thread, text: spoken });
       await convexMutation("chatQueue:postCard", {

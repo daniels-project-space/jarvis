@@ -1,7 +1,7 @@
 import type { CodexTurnResult } from "./codex-app-server";
 import {
-  FOREGROUND_ADMISSION_RESERVE_MS,
   FOREGROUND_SESSION_RENEWAL_RESERVE_MS,
+  FOREGROUND_TURN_VALIDITY_RESERVE_MS,
 } from "./foreground-policy";
 import {
   isCodexUnauthorizedError,
@@ -102,7 +102,7 @@ export class ForegroundSessionOwner<Server extends ForegroundSessionServer> {
   }
 
   canAdmitTurn(at = this.now()): boolean {
-    return this.snapshotExpiresAt - at >= FOREGROUND_ADMISSION_RESERVE_MS;
+    return this.snapshotExpiresAt - at >= FOREGROUND_TURN_VALIDITY_RESERVE_MS;
   }
 
   async start(): Promise<void> {
@@ -244,7 +244,7 @@ export class ForegroundSessionOwner<Server extends ForegroundSessionServer> {
       this.buildingCandidate = candidate;
       await candidate.server.start();
       if (this.closed) throw new Error("Codex foreground session owner closed during readiness attestation");
-      if (candidate.prepared.snapshotExpiresAt - this.now() < FOREGROUND_ADMISSION_RESERVE_MS) {
+      if (candidate.prepared.snapshotExpiresAt - this.now() < FOREGROUND_TURN_VALIDITY_RESERVE_MS) {
         throw new SubscriptionSessionError("snapshot_stale");
       }
       this.buildingCandidate = null;

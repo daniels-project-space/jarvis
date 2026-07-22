@@ -8,6 +8,7 @@ import {
   parseChatgptSubscriptionAuthText,
 } from "./subscription-auth";
 import {
+  DEFAULT_MINIMUM_VALIDITY_MS,
   SubscriptionSessionError,
   subscriptionOperatorSignal,
   type AcquiredSubscriptionSession,
@@ -15,6 +16,7 @@ import {
 } from "./subscription-session";
 import { productionSubscriptionSessionController } from "./subscription-session-r2";
 import { requireVaultBrokerSubscriptionSource } from "./subscription-source";
+import { PINNED_CODEX_INTERNAL_REFRESH_GUARD_MS } from "./subscription-validity";
 
 export { parseChatgptSubscriptionAuth } from "./subscription-auth";
 
@@ -178,11 +180,16 @@ export async function prepareSubscriptionEnv(
   }
   let snapshot: AcquiredSubscriptionSession;
   try {
+    const minimumValidityMs = options.minimumValidityMs ?? DEFAULT_MINIMUM_VALIDITY_MS;
+    if (!Number.isSafeInteger(minimumValidityMs)
+      || minimumValidityMs <= PINNED_CODEX_INTERNAL_REFRESH_GUARD_MS) {
+      throw new SubscriptionSessionError("snapshot_stale");
+    }
     const bin = resolveSubscriptionAgentBin(provider);
     if (!bin) return { env: scopedSubscriptionEnv(process.env, provider), error: "codex binary not found" };
     const controller = options.controller ?? await productionSubscriptionSessionController(bin);
     snapshot = await controller.acquire({
-      minimumValidityMs: options.minimumValidityMs,
+      minimumValidityMs,
       afterUnauthorizedVersion: options.afterUnauthorizedVersion,
     });
   } catch (error) {
