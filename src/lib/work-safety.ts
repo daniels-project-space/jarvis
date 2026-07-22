@@ -124,8 +124,16 @@ export type WorkSafetyDecision = {
   reason?: string;
 };
 
-const NON_MUTATING_LEAD =
-  /^(?:please\s+)?(?:research|investigate|inspect|audit|review|analyse|analyze|compare|summari[sz]e|report|recommend|brainstorm|plan|draft|design|draw|illustrat|write|explain|calculate|model|prototype|test|verify|locate|list)\b/i;
+// A read-only lead describes a consequential verb only when that particular
+// occurrence is inside analytical grammar. It must not waive a later direct
+// instruction merely because both happen to share a comma, colon, or dash.
+const ANALYTICAL_ACTION_SCOPE_BOUNDARY = /[,:–—]/g;
+
+const ANALYTICAL_RELATIVE_ACTION_SCOPE =
+  /^(?:(?:please\s+)?(?:research|investigate|inspect|audit|review|analyse|analyze|compare|summari[sz]e|report|recommend|brainstorm|plan|draft|design|draw|illustrat|write|explain|calculate|model|prototype|test|verify|locate|list)\b[^,:–—]*\b)?(?:that|which|where)\b[^,:–—]*?(?:(?:can|could|may|might|would|will|does|do)\s+)?$/i;
+
+const ANALYTICAL_NOMINAL_ACTION_SCOPE =
+  /^(?:please\s+)?(?:research|investigate|inspect|audit|review|analyse|analyze|compare|summari[sz]e|report|recommend|brainstorm|plan|draft|design|draw|illustrat|write|explain|calculate|model|prototype|test|verify|locate|list)\b[^,:–—]*\b(?:ability|capability|permission|path|trace)\b[^,:–—]*\bto\s*$/i;
 
 const NEGATED_LEAD =
   /^(?:do\s+not|don't|never|must\s+not|should\s+not|may\s+not|cannot|can't|without|avoid|forbid(?:den)?|prohibit(?:ed)?|no\b)/i;
@@ -293,6 +301,22 @@ function quotedActionContext(clause: string, actionIndex: number): string | null
   return null;
 }
 
+function analyticalActionContext(clause: string, actionIndex: number): string {
+  const beforeAction = clause.slice(0, actionIndex);
+  let boundary = -1;
+  for (const match of beforeAction.matchAll(ANALYTICAL_ACTION_SCOPE_BOUNDARY)) {
+    boundary = match.index ?? boundary;
+  }
+  return beforeAction.slice(boundary + 1).trim();
+}
+
+function analyticalActionUse(clause: string, actionIndex: number): boolean {
+  const context = analyticalActionContext(clause, actionIndex);
+  if (REPORTED_ACTION_TAIL.test(context)) return true;
+  if (ANALYTICAL_RELATIVE_ACTION_SCOPE.test(context)) return true;
+  return ANALYTICAL_NOMINAL_ACTION_SCOPE.test(context);
+}
+
 export function isOwnedRepository(repo: string | undefined): boolean {
   return isOwnedRepositoryScope(repo);
 }
@@ -430,7 +454,7 @@ export function classifyWorkSafety(
 
       const beforeAction = clause.slice(0, actionIndex);
       if (NEGATED_TAIL.test(beforeAction)) continue;
-      if (REPORTED_ACTION_TAIL.test(beforeAction)) continue;
+      if (analyticalActionUse(clause, actionIndex)) continue;
 
       // "Audit whether X can send" describes a read-only outcome. A mixed
       // instruction such as "research options and purchase one" is split at
@@ -438,7 +462,6 @@ export function classifyWorkSafety(
       // “Test delete customer records” is still an instruction to delete;
       // test matrices rely on the exact technical noun grammar above rather
       // than a broad test-verb waiver.
-      if (quoteContext === null && NON_MUTATING_LEAD.test(clause) && !/^\s*tests?(?:ing)?\b/i.test(clause)) continue;
       if (softwareDeliveryAllowed(action, clause, options?.repo, actionIndex)) {
         continue;
       }

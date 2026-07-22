@@ -8,6 +8,12 @@ import {
   INTEGRATION_FINAL_BARRIER_APPROVAL_TASK,
   WORKSPACE_ISOLATION_APPROVAL_TASK,
 } from "./fixtures/work-policy-regressions";
+import {
+  GENERATED_DIRECT_ACTION_MATRIX,
+  GENERATED_GATED_ACTION_MATRIX,
+  REPRODUCED_MIXED_ACTION_EXPLOITS,
+  SAFE_ANALYTICAL_ACTION_FIXTURES,
+} from "./fixtures/action-scope-regressions";
 
 const CLOUD_SANDBOX_APPROVAL_TASK = readFileSync(
   new URL("./fixtures/cloud-sandbox-approval-task.txt", import.meta.url),
@@ -448,6 +454,53 @@ describe("server-side work approval policy", () => {
           goalStage,
         }).required, `${goalStage}: ${task}`).toBe(true);
       }
+    }
+  });
+
+  it("gates all 320 generated direct-action scopes through every producer policy", () => {
+    const repo = "daniels-project-space/jarvis";
+    expect(GENERATED_DIRECT_ACTION_MATRIX).toHaveLength(315);
+    expect(GENERATED_GATED_ACTION_MATRIX).toHaveLength(320);
+    expect(new Set(GENERATED_GATED_ACTION_MATRIX).size).toBe(320);
+
+    for (const task of GENERATED_GATED_ACTION_MATRIX) {
+      expect(classifyWorkSafety(task, { repo }).approvalRequired, `classifier: ${task}`).toBe(true);
+      expect(workApprovalPolicy({
+        task,
+        repo,
+        readonly: true,
+        risk: "low",
+        approvalRequired: false,
+      }).required, `standalone: ${task}`).toBe(true);
+      for (const goalStage of ["building", "refining"] as const) {
+        expect(goalWorkApprovalPolicy({
+          task,
+          repo,
+          readonly: true,
+          risk: "low",
+          approvalRequired: false,
+          goalStage,
+        }).required, `${goalStage}: ${task}`).toBe(true);
+      }
+    }
+  });
+
+  it("decides mixed direct actions independently from analytical actions", () => {
+    const repo = "daniels-project-space/jarvis";
+    expect(REPRODUCED_MIXED_ACTION_EXPLOITS).toHaveLength(8);
+    for (const task of REPRODUCED_MIXED_ACTION_EXPLOITS) {
+      expect(classifyWorkSafety(task, { repo }).approvalRequired, task).toBe(true);
+      expect(workApprovalPolicy({ task, repo, readonly: true }).required, task).toBe(true);
+    }
+    for (const task of SAFE_ANALYTICAL_ACTION_FIXTURES) {
+      expect(classifyWorkSafety(task, { repo }), task).toEqual({
+        approvalRequired: false,
+        boundary: "internal",
+      });
+      expect(workApprovalPolicy({ task, repo }), task).toMatchObject({
+        required: false,
+        deliveryMode: "auto_merge",
+      });
     }
   });
 

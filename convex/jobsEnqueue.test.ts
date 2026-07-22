@@ -5,6 +5,7 @@ import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
 import schema from "./schema";
 import { MAX_TEXT_WORK_ORDER_BYTES, textWorkOrderByteLength } from "../src/lib/work-order";
+import { GENERATED_GATED_ACTION_MATRIX } from "../src/mastra/fixtures/action-scope-regressions";
 
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
@@ -41,6 +42,27 @@ describe("bounded exact textual work orders", () => {
   it("persists every reproduced policy exploit behind the approval gate", async () => {
     const t = convexTest(schema, modules);
     for (const task of CLAUSE_BOUNDARY_AND_LIFECYCLE_EXPLOITS) {
+      const jobId = await t.mutation(api.jobs.enqueue, {
+        task,
+        repo: REPO,
+        readonly: true,
+        risk: "low",
+        approvalRequired: false,
+        workerToken: WORKER,
+      });
+      expect(await t.run(async (ctx) => await ctx.db.get(jobId)), task).toMatchObject({
+        task,
+        approvalRequired: true,
+        status: "awaiting_approval",
+        deliveryMode: "manual",
+      });
+    }
+  });
+
+  it("persists the complete 320-case action-scope matrix behind the gate despite caller hints", async () => {
+    expect(GENERATED_GATED_ACTION_MATRIX).toHaveLength(320);
+    const t = convexTest(schema, modules);
+    for (const task of GENERATED_GATED_ACTION_MATRIX) {
       const jobId = await t.mutation(api.jobs.enqueue, {
         task,
         repo: REPO,

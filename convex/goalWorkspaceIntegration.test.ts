@@ -12,6 +12,8 @@ import {
   integrationTerminalReleaseDecision,
 } from "./goalIntegration";
 import schema from "./schema";
+import { GENERATED_GATED_ACTION_MATRIX } from "../src/mastra/fixtures/action-scope-regressions";
+import { goalWorkApprovalPolicy } from "./workPolicy";
 
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
@@ -177,6 +179,22 @@ async function claimedFirstIntegration(prefix: string) {
 }
 
 describe("real Convex multi-agent workspace and integration races", () => {
+  it("projects all 320 action-scope decisions identically into Goal Mode producers", async () => {
+    expect(GENERATED_GATED_ACTION_MATRIX).toHaveLength(320);
+    for (const [index, task] of GENERATED_GATED_ACTION_MATRIX.entries()) {
+      const goalStage = index % 2 === 0 ? "building" : "refining";
+      const decision = goalWorkApprovalPolicy({
+        task,
+        repo: REPO,
+        readonly: true,
+        risk: "low",
+        approvalRequired: false,
+        goalStage,
+      });
+      expect(decision, task).toMatchObject({ required: true, deliveryMode: "manual" });
+    }
+  });
+
   it("gates every reproduced exploit in Goal Mode building and refining producers", async () => {
     const building = await goalAwaitingPlan(8);
     const plan = {
