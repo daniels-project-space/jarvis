@@ -36,7 +36,7 @@ import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate, shouldIgnoreHandsFreeTranscript } from "@/lib/transcript";
 import { completeSpeechPrefix, isSpeaking as isTtsActuallySpeaking, unlockSpeechPlayback } from "@/lib/tts";
 import { NarrationLedger, narrationClaim } from "@/lib/narration";
-import { resolvePanelRoute } from "@/lib/panel-contract";
+import { resolvePanelRoute, shouldHideOrbForPanel } from "@/lib/panel-contract";
 import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
 import { needsHostContext, visibleTurnText, withHostContext, type JarvisHostContext } from "@/lib/host-context";
 import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actions";
@@ -2957,12 +2957,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // How the stage shares with an overlay:
   //  • compactAside — a sized widget (weather/shop/places/ranking/…): the panel
   //    takes the left, the orb SHRINKS INTO THE RIGHT CORNER (still visible).
-  //  • fullBleed — a page/video/full panel: it owns everything, orb+ring gone.
+  //  • fullBleed — only a route that explicitly opts out (video) owns the
+  //    cockpit. Expanding a kept-visible workspace never changes that contract.
   // A deliberately opened visual owns the stage even while durable work is
   // running. The compact work widget stays live underneath and returns when
   // the visual is folded/closed; it must never suppress boards or the library.
   const overlayUp = !!panel && !panelMin;
-  const fullBleed = overlayUp && (panelFull || !panelRoute?.keepOrbVisible);
+  const fullBleed = overlayUp && shouldHideOrbForPanel(panel);
   const compactAside = overlayUp && !fullBleed && panel!.type !== "video";
 
   if (embedded) {
@@ -3181,7 +3182,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           <div
             data-jarvis-orb-zone={compactAside ? "compact" : "stage"}
             className={`absolute inset-0 transition-opacity duration-500 ${
-              fullBleed ? "pointer-events-none opacity-0" : compactAside ? "jarvis-compact-orb-zone pointer-events-none z-30 overflow-hidden rounded-full border border-cyan/25 bg-[#061019]/85 shadow-[0_0_34px_rgba(0,255,136,.18)] opacity-100 md:overflow-visible md:rounded-none md:border-0 md:bg-transparent md:shadow-none" : commandExpanded && !overlayUp ? "pointer-events-none opacity-0 md:opacity-100" : "opacity-100"
+              fullBleed ? "pointer-events-none opacity-0" : compactAside ? `jarvis-compact-orb-zone pointer-events-none ${panelFull ? "z-[60]" : "z-30"} overflow-hidden rounded-full border border-cyan/25 bg-[#061019]/85 shadow-[0_0_34px_rgba(0,255,136,.18)] opacity-100 md:overflow-visible md:rounded-none md:border-0 md:bg-transparent md:shadow-none` : commandExpanded && !overlayUp ? "pointer-events-none opacity-0 md:opacity-100" : "opacity-100"
             }`}
           >
             <ReactorRing

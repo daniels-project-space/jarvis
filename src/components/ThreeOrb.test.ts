@@ -104,5 +104,7 @@ describe("orb side-mode layout contracts", () => {
     expect(jarvisSource).toContain("jarvis-compact-orb-zone");
     expect(jarvisSource).toContain("jarvis-mobile-orb-safe-panel");
     expect(jarvisSource).toContain("compact={compactAside}");
+    expect(jarvisSource).toContain("shouldHideOrbForPanel(panel)");
+    expect(jarvisSource).toContain('panelFull ? "z-[60]" : "z-30"');
   });
 });

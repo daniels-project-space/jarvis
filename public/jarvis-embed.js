@@ -194,9 +194,10 @@
     // still not available for remote spotlight, activation or edit selection.
     if (element.closest && element.closest("[data-jarvis-private], [data-jarvis-no-context]")) return true;
     var node = element;
-    for (var depth = 0; node && depth < 16; depth++) {
+    // Walk the complete ancestor chain. A deep nested card is still private
+    // when an outer checkout/secret region opts out of Jarvis interaction.
+    for (; node; node = node.parentElement) {
       if (isSensitiveNode(node)) return true;
-      node = node.parentElement;
     }
     return false;
   }

@@ -320,6 +320,59 @@ describe("Project Hub Jarvis loader", () => {
     expect(harness.messages).not.toContainEqual(expect.objectContaining({ jarvis: "host-command" }));
   });
 
+  it("fails closed for an exact id nested deeply inside a hidden private region", async () => {
+    let ancestor: any = {
+      tagName: "SECTION",
+      hidden: true,
+      dataset: {},
+      getAttribute: () => null,
+      parentElement: null,
+    };
+    // A fixed shallow traversal would make this control reachable after a
+    // host adds ordinary layout wrappers around a private checkout section.
+    for (let index = 0; index < 20; index++) {
+      ancestor = {
+        tagName: "DIV",
+        dataset: {},
+        getAttribute: () => null,
+        parentElement: ancestor,
+      };
+    }
+    const privateButton = {
+      tagName: "BUTTON",
+      id: "deep-private-action",
+      dataset: {},
+      click: vi.fn(),
+      getAttribute: () => null,
+      parentElement: ancestor,
+    };
+    const harness = createLoader({ hostById: { "deep-private-action": privateButton } });
+    const receive = harness.listeners.get("message")?.[0];
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: {
+        jarvis: "host-action",
+        action: {
+          id: "deep-private-focus",
+          action: "focus",
+          target: "deep-private-action",
+          expectedUrl: "https://project-hub.test/dashboard?view=work#today",
+        },
+      },
+    });
+    await Promise.resolve();
+
+    expect(harness.messages).toContainEqual({
+      jarvis: "host-action-result",
+      id: "deep-private-focus",
+      ok: false,
+      detail: "I cannot act on that private control.",
+    });
+    expect(privateButton.click).not.toHaveBeenCalled();
+  });
+
   it("executes an app navigation, acknowledges it, and supports interruption", async () => {
     vi.useFakeTimers();
     const harness = createLoader();

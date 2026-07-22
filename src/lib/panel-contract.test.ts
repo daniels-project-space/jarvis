@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolvePanelRoute } from "./panel-contract";
+import { resolvePanelRoute, shouldHideOrbForPanel } from "./panel-contract";
 
 describe("semantic panel routing", () => {
   it.each([
@@ -33,5 +33,13 @@ describe("semantic panel routing", () => {
 
   it("reserves the full stage only for video playback", () => {
     expect(resolvePanelRoute({ type: "video", value: "https://example.com" }).keepOrbVisible).toBe(false);
+  });
+
+  it("keeps the orb contract when a workspace is expanded", () => {
+    // Fullscreen is intentionally not an argument: it is a layout state and
+    // cannot override a route's keepOrbVisible promise.
+    expect(shouldHideOrbForPanel({ type: "creations", value: "" })).toBe(false);
+    expect(shouldHideOrbForPanel({ type: "board", value: "" })).toBe(false);
+    expect(shouldHideOrbForPanel({ type: "video", value: "" })).toBe(true);
   });
 });

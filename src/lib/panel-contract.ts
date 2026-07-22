@@ -100,3 +100,10 @@ export function resolvePanelRoute(panel: PanelInput): PanelRoute {
   // intentional full-bleed exception because its playback canvas needs it.
   return { renderer, semanticKind, size, keepOrbVisible: panel.type !== "video" };
 }
+
+// Fullscreen is a presentation choice, not an exception to a panel's visual
+// contract. The stage uses this single predicate so a kept-visible workspace
+// cannot accidentally make the permanent particle core disappear.
+export function shouldHideOrbForPanel(panel: PanelInput | null | undefined): boolean {
+  return Boolean(panel && !resolvePanelRoute(panel).keepOrbVisible);
+}
