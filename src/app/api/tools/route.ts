@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { reportIncident } from "@/lib/context";
-import { actorAdminHash, controlActor } from "@/lib/request-auth";
+import { actorAdminHash, controlActor, isOwnerActor } from "@/lib/request-auth";
 import { TOOL_DEFS, executeTool } from "@/lib/tools";
 import { TOOL_BELTS, slimToolDefinition } from "@/lib/tool-belts";
 
@@ -30,6 +30,7 @@ export async function POST(req: NextRequest) {
   let toolName = "unknown";
   const actor = await controlActor(req);
   if (!actor) return Response.json({ error: "unauthorized" }, { status: 401 });
+  if (!isOwnerActor(actor)) return Response.json({ error: "owner enrollment required" }, { status: 403 });
   const authTokenHash = actorAdminHash(actor);
   try {
     const { name, args } = await req.json();

@@ -5,10 +5,14 @@ const SESSION_LIFETIME_MS = 365 * 24 * 60 * 60 * 1000;
 const VIEWER_LIFETIME_MS = 6 * 60 * 60 * 1000;
 const VIEWER_ISSUER = "https://jarvis-orcin-six.vercel.app";
 const VIEWER_SUBJECT = "daniel-owner";
+const GUEST_SUBJECT_PREFIX = "jarvis-guest:";
 
 export const actorAuthArgs = {
   authTokenHash: v.optional(v.string()),
   workerToken: v.optional(v.string()),
+  // An opaque, non-privileged browser partition. It is accepted only by the
+  // conversation transport, which derives the actual thread from this value.
+  guestId: v.optional(v.string()),
 };
 
 export const dispatcherAuthArgs = {
@@ -43,7 +47,7 @@ export async function isAdminSession(ctx: any, tokenHash: string | undefined): P
     .query("adminSessions")
     .withIndex("by_token", (q: any) => q.eq("tokenHash", tokenHash.toLowerCase()))
     .first();
-  return Boolean(session && session.expiresAt > Date.now());
+  return Boolean(session && typeof session.enrolledAt === "number" && session.expiresAt > Date.now());
 }
 
 export async function requireAdmin(ctx: any, tokenHash: string | undefined): Promise<void> {
@@ -87,7 +91,41 @@ export async function requireViewer(
     .query("viewerSessions")
     .withIndex("by_token", (q: any) => q.eq("token", token.toLowerCase()))
     .first();
-  if (!session || session.expiresAt <= Date.now()) throw new Error("Authentication required");
+  if (!session || session.expiresAt <= Date.now() || !(await isAdminSession(ctx, session.adminTokenHash))) {
+    throw new Error("Authentication required");
+  }
+}
+
+export function guestThreadId(guestId: string): string {
+  return `guest:${guestId}`;
+}
+
+export function validGuestId(value: string | undefined): value is string {
+  return Boolean(value && /^[A-Za-z0-9_-]{32,128}$/.test(value));
+}
+
+export async function conversationIdentity(ctx: any, credentials: { guestId?: string; authTokenHash?: string; workerToken?: string }) {
+  if (validGuestId(credentials.guestId)) return { kind: "guest" as const, guestId: credentials.guestId };
+  await requireActor(ctx, credentials);
+  return { kind: "owner" as const };
+}
+
+export async function conversationViewerIdentity(ctx: any, credentials: { authTokenHash?: string; workerToken?: string }) {
+  const identity = await ctx.auth?.getUserIdentity?.();
+  if (identity?.issuer === VIEWER_ISSUER && identity?.subject === VIEWER_SUBJECT) return { kind: "owner" as const };
+  if (identity?.issuer === VIEWER_ISSUER && typeof identity?.subject === "string" && identity.subject.startsWith(GUEST_SUBJECT_PREFIX)) {
+    const guestId = identity.subject.slice(GUEST_SUBJECT_PREFIX.length);
+    if (validGuestId(guestId)) return { kind: "guest" as const, guestId };
+  }
+  if (await isAdminSession(ctx, credentials.authTokenHash)) return { kind: "owner" as const };
+  const worker = process.env.JARVIS_WORKER_TOKEN;
+  if (worker && constantTimeEqual(credentials.workerToken, worker)) return { kind: "owner" as const };
+  throw new Error("Authentication required");
+}
+
+export function scopedConversationThread(identity: { kind: "owner" } | { kind: "guest"; guestId: string }, requested: string | undefined): string {
+  if (identity.kind === "guest") return guestThreadId(identity.guestId);
+  return requested?.trim() || "main";
 }
 
 export const validateSession = query({
@@ -103,7 +141,7 @@ export const sessionStatus = query({
       .query("adminSessions")
       .withIndex("by_token", (q: any) => q.eq("tokenHash", args.tokenHash.toLowerCase()))
       .first();
-    if (!session || session.expiresAt <= Date.now()) return { valid: false };
+    if (!session || typeof session.enrolledAt !== "number" || session.expiresAt <= Date.now()) return { valid: false };
     return { valid: true, expiresAt: session.expiresAt };
   },
 });
@@ -123,10 +161,9 @@ export const refreshSession = mutation({
   },
 });
 
-// Jarvis deliberately opens without an interactive sign-in, so browsers receive
-// their opaque admin session automatically on first load. The public Convex
-// mutation still cannot mint a session by itself: only the server-held worker
-// capability may bootstrap one, and the raw cookie never leaves Vercel.
+// Guest conversation opens without a sign-in. Owner authority is different:
+// this mutation is reachable only from the server-side enrollment gate and
+// never from the ordinary viewer bootstrap.
 export const createOpenSession = mutation({
   args: {
     ownerTokenHash: v.string(),
@@ -144,12 +181,13 @@ export const createOpenSession = mutation({
       .first();
     const expiresAt = now + SESSION_LIFETIME_MS;
     if (existing) {
-      await ctx.db.patch(existing._id, { userAgent: args.userAgent?.slice(0, 240), expiresAt });
+      await ctx.db.patch(existing._id, { userAgent: args.userAgent?.slice(0, 240), enrolledAt: now, expiresAt });
     } else {
       await ctx.db.insert("adminSessions", {
         tokenHash: ownerTokenHash,
         userAgent: args.userAgent?.slice(0, 240),
         createdAt: now,
+        enrolledAt: now,
         expiresAt,
       });
     }

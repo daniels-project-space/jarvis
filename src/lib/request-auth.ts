@@ -4,8 +4,8 @@ import { adminSessionHash, validateAdminSession } from "./control-session";
 import { verifyViewerToken } from "./viewer-jwt";
 
 export type ControlActor =
-  | { kind: "admin"; authTokenHash: string }
-  | { kind: "viewer" };
+  | { kind: "owner"; authTokenHash: string }
+  | { kind: "guest"; guestId: string };
 
 export function bearerToken(header: string | null): string | null {
   const match = header?.match(/^Bearer\s+([^\s]+)$/i);
@@ -13,26 +13,26 @@ export function bearerToken(header: string | null): string | null {
 }
 
 export async function controlActor(req: NextRequest): Promise<ControlActor | null> {
-  // Every interactive client already has this locally verifiable six-hour
-  // capability. Check it first so speech does not pay a Convex session query
-  // in both Proxy and the route handler before STT can even begin.
-  if (await verifyViewerToken(bearerToken(req.headers.get("authorization")))) {
-    return { kind: "viewer" };
-  }
+  // A browser capability is deliberately never an owner-control credential.
+  // Check the HttpOnly enrolled session first; a copied Convex read token must
+  // not turn into authority over work, files, or third-party actions.
   const authTokenHash = await adminSessionHash(req);
   if (authTokenHash && await validateAdminSession(authTokenHash)) {
-    return { kind: "admin", authTokenHash };
+    return { kind: "owner", authTokenHash };
   }
+  const identity = await verifyViewerToken(bearerToken(req.headers.get("authorization")));
+  if (identity?.kind === "guest") return identity;
   return null;
 }
 
 /** Server-to-Convex credentials. Nothing privileged is returned to the UI. */
-export function controlCredentials(actor: ControlActor): { authTokenHash: string } | { workerToken: string } {
-  if (actor.kind === "admin") return { authTokenHash: actor.authTokenHash };
-  const workerToken = process.env.JARVIS_WORKER_TOKEN;
-  if (!workerToken) throw new Error("Jarvis worker capability is unavailable");
-  return { workerToken };
+export function controlCredentials(actor: Extract<ControlActor, { kind: "owner" }>): { authTokenHash: string } {
+  return { authTokenHash: actor.authTokenHash };
 }
 
 export const actorAdminHash = (actor: ControlActor): string | undefined =>
-  actor.kind === "admin" ? actor.authTokenHash : undefined;
+  actor.kind === "owner" ? actor.authTokenHash : undefined;
+
+export function isOwnerActor(actor: ControlActor): actor is Extract<ControlActor, { kind: "owner" }> {
+  return actor.kind === "owner";
+}

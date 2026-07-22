@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/lib/request-auth", () => ({
   controlActor: vi.fn(),
   controlCredentials: vi.fn(() => ({ authTokenHash: "scoped" })),
+  isOwnerActor: (actor: { kind?: string }) => actor.kind === "owner",
 }));
 vi.mock("@/lib/control-session", () => ({ controlMutation: vi.fn() }));
 vi.mock("@/lib/agent-fleet-dispatch", () => ({ wakeAgentFleet: vi.fn() }));
@@ -28,14 +29,14 @@ describe("authenticated work-control errors", () => {
     expect(controlMutation).not.toHaveBeenCalled();
   });
 
-  it("reports a stale or missing control capability as a conflict, never success", async () => {
-    vi.mocked(controlActor).mockResolvedValue({ kind: "viewer" } as any);
-    vi.mocked(controlMutation).mockResolvedValue(false as any);
+  it("rejects a guest before reading or mutating privileged control", async () => {
+    vi.mocked(controlActor).mockResolvedValue({ kind: "guest", guestId: "g".repeat(32) } as any);
     const response = await POST(request({ jobId: "job-1", action: "pause" }));
-    expect(response.status).toBe(409);
+    expect(response.status).toBe(403);
     expect(await response.json()).toEqual({
       ok: false,
-      error: "That work item cannot apply this control from its current state.",
+      error: "owner enrollment required",
     });
+    expect(controlMutation).not.toHaveBeenCalled();
   });
 });

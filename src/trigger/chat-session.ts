@@ -119,12 +119,16 @@ function waitForPending(
 
 type QueueClaim = {
   threadId: string;
+  guest?: boolean;
   userText: string;
   assistantId: string;
   history: Array<{ role: string; text: string }>;
 };
 
-function conversationPreamble() {
+function conversationPreamble(guest = false) {
+  if (guest) {
+    return `${PERSONA}\n\nYou are speaking with an unpaired guest. Keep this conversation isolated: do not access or mention Daniel's memory, projects, work, files, panels, capabilities, or other conversations. Do not call tools, create artifacts, or perform actions. Give a helpful conversational answer only.`;
+  }
   return PERSONA +
     `\n\n${CAPABILITIES}\n\n${INFRA_MAP}\n\n${REMEMBER}\n\n` +
     JARVIS_TOOL_INSTRUCTIONS + " " +
@@ -139,6 +143,7 @@ async function runTurn(
   history: { role: string; text: string }[],
   contextBlock: string,
   model: string,
+  guest: boolean,
   onStage?: (stage: "codexAck" | "firstDelta" | "firstConvexPaint") => void,
 ){
   const publisher = new StreamPublisher(
@@ -148,7 +153,7 @@ async function runTurn(
   );
   publisher.start();
   try {
-    const visualDirective = visualInitiativeDirective(visibleTurnText(userText));
+    const visualDirective = guest ? "" : visualInitiativeDirective(visibleTurnText(userText));
     const freshContext = `${contextBlock}\n\nCurrent date: ${new Date().toDateString()}.` +
       (visualDirective ? `\n\n${visualDirective}` : "");
     let sawDelta = false;
@@ -157,8 +162,9 @@ async function runTurn(
       userText,
       history,
       contextBlock: freshContext,
-      preamble: conversationPreamble(),
+      preamble: conversationPreamble(guest),
       modelTier: model,
+      allowTools: !guest,
       onTurnStarted: () => onStage?.("codexAck"),
       onDelta: (delta) => {
         if (!sawDelta) {
@@ -348,7 +354,9 @@ async function processChatQueue(
     try {
       const visibleUserText = visibleTurnText(claim.userText);
       const contextStarted = Date.now();
-      const context = await buildContext(visibleUserText);
+      const context = claim.guest
+        ? "No private context is available for a guest conversation."
+        : await buildContext(visibleUserText);
       const contextReadyAt = Date.now();
       const model = pickConversationTier(visibleUserText);
       const stages: Partial<Record<"codexAck" | "firstDelta" | "firstConvexPaint", number>> = {};
@@ -360,6 +368,7 @@ async function processChatQueue(
         claim.history,
         context,
         model,
+        Boolean(claim.guest),
         (stage) => { if (stages[stage] === undefined) stages[stage] = Date.now(); },
       );
       const modelFinishedAt = Date.now();
@@ -379,7 +388,7 @@ async function processChatQueue(
       const deliveredAt = Date.now();
       // Memory capture is a separate background task. It must never hold the
       // warm conversational worker hostage after Daniel already has a reply.
-      if (turn.finalText.trim()) void tasks.trigger("jarvis-chat-memory", {
+      if (!claim.guest && turn.finalText.trim()) void tasks.trigger("jarvis-chat-memory", {
         userText: visibleUserText,
         assistantText: turn.finalText,
       }).catch(() => {});

@@ -2,13 +2,14 @@ import type { NextRequest } from "next/server";
 import { wakeAgentFleet } from "@/lib/agent-fleet-dispatch";
 import { controlMutation, controlQuery } from "@/lib/control-session";
 import { routeGoal } from "@/lib/goal-mode";
-import { controlActor, controlCredentials } from "@/lib/request-auth";
+import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
 
 export const runtime = "nodejs";
 
 export async function POST(req: NextRequest) {
   const actor = await controlActor(req);
   if (!actor) return Response.json({ ok: false }, { status: 401 });
+  if (!isOwnerActor(actor)) return Response.json({ ok: false, error: "owner enrollment required" }, { status: 403 });
   const body = await req.json().catch(() => ({}));
   const goal = String(body?.goal ?? "").trim().slice(0, 500);
   if (goal.length < 12) {

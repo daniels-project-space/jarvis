@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { r2Put } from "@/lib/r2";
-import { controlActor } from "@/lib/request-auth";
+import { controlActor, isOwnerActor } from "@/lib/request-auth";
 
 // Sight transport only. The frame is stored in Jarvis R2 and passed to the
 // subscription Codex app-server as a real image input; Vercel never calls a
@@ -9,7 +9,9 @@ export const runtime = "nodejs";
 export const maxDuration = 30;
 
 export async function POST(req: NextRequest) {
-  if (!(await controlActor(req))) return Response.json({ error: "unauthorized" }, { status: 401 });
+  const actor = await controlActor(req);
+  if (!actor) return Response.json({ error: "unauthorized" }, { status: 401 });
+  if (!isOwnerActor(actor)) return Response.json({ error: "owner enrollment required" }, { status: 403 });
   let image = "";
   let mode = "screen";
   try {

@@ -85,6 +85,7 @@ export type CodexTurnInput = {
   contextBlock: string;
   preamble: string;
   modelTier: string;
+  allowTools?: boolean;
   onDelta: (delta: string) => void;
   onTurnStarted?: () => void;
 };
@@ -156,7 +157,7 @@ export class CodexAppServer {
             sandbox: this.options.threadSandbox ?? "danger-full-access",
           }),
           ephemeral: this.options.ephemeral ?? false,
-          dynamicTools: this.options.dynamicTools,
+          dynamicTools: input.allowTools === false ? [] : this.options.dynamicTools,
         }, 30_000);
       } catch (error) {
         if (permissionProfile) {
@@ -171,15 +172,16 @@ export class CodexAppServer {
       this.threads.set(input.conversationId, threadId);
     }
 
+    const speaker = input.allowTools === false ? "Guest" : "Daniel";
     const history = isNewThread && input.history.length
-      ? `Recent conversation:\n${input.history.map((item) => `${item.role === "user" ? "Daniel" : "Jarvis"}: ${item.text}`).join("\n")}\n\n`
+      ? `Recent conversation:\n${input.history.map((item) => `${item.role === "user" ? speaker : "Jarvis"}: ${item.text}`).join("\n")}\n\n`
       : "";
     const marker = input.userText.match(/\[JARVIS_IMAGE_URL:([^\]]+)\]/);
     const cleanText = input.userText.replace(/\s*\[JARVIS_IMAGE_URL:[^\]]+\]\s*/g, " ").trim();
     // Thread instructions hold static identity and policy. Fresh context is
     // deliberately present only in this one turn item so a cold thread does
     // not pay for the same snapshot in both protocol fields.
-    const text = `${history}Current live context (use only what is relevant):\n${input.contextBlock}\n\nDaniel: ${cleanText}`;
+    const text = `${history}Current live context (use only what is relevant):\n${input.contextBlock}\n\n${speaker}: ${cleanText}`;
     const userInput: JsonObject[] = [{ type: "text", text }];
     if (marker?.[1]) userInput.push({ type: "image", url: marker[1].trim(), detail: "high" });
     const started = await this.request("turn/start", {

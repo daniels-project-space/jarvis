@@ -21,6 +21,8 @@ declare global {
 const modules = import.meta.glob("./**/*.ts");
 const WORKER = "io-contract-worker";
 const VIEWER = { issuer: "https://jarvis-orcin-six.vercel.app", subject: "daniel-owner" };
+const GUEST_ID = "g".repeat(32);
+const GUEST = { issuer: "https://jarvis-orcin-six.vercel.app", subject: `jarvis-guest:${GUEST_ID}` };
 
 function handlerOf(value: unknown) {
   return (value as { _handler: (ctx: any, args: any) => Promise<any> })._handler;
@@ -171,6 +173,23 @@ describe("streaming and paginated history behavior", () => {
     expect(fetched.some((row) => row.text === "alpha-0")).toBe(true);
     expect(fetched.find((row) => row.attachment?.title === "card")?.parentMessageId).toBe(ids.parent);
     expect(fetched.some((row) => row.threadId === "beta")).toBe(false);
+  });
+
+  it("partitions a guest conversation even when it asks for Daniel's thread", async () => {
+    const t = convexTest(schema, modules);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("chatMessages", { threadId: "main", role: "assistant", text: "owner-only", status: "done", delivery: "foreground", createdAt: 1 });
+      await ctx.db.insert("chatMessages", { threadId: `guest:${GUEST_ID}`, role: "assistant", text: "guest-only", status: "done", delivery: "foreground", createdAt: 2 });
+    });
+    const guest = t.withIdentity(GUEST);
+    const visible = await guest.query(api.chatQueue.listMessages, { threadId: "main" });
+    expect(visible.map((row) => row.text)).toEqual(["guest-only"]);
+
+    const id = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "main", text: "hello", requestId: "guest-request", guestId: GUEST_ID,
+    });
+    const row = await t.run(async (ctx) => await ctx.db.get(id));
+    expect(row?.threadId).toBe(`guest:${GUEST_ID}`);
   });
 
   it("reconciles proactive ownership through bounded indexed pages despite unrelated rows", async () => {

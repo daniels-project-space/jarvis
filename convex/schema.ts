@@ -591,6 +591,9 @@ export default defineSchema({
     tokenHash: v.string(),
     userAgent: v.optional(v.string()),
     createdAt: v.number(),
+    // Old auto-minted rows have no enrollment receipt and are intentionally
+    // invalid. New rows are created only through the fail-closed route gate.
+    enrolledAt: v.optional(v.number()),
     expiresAt: v.number(),
   })
     .index("by_token", ["tokenHash"])
