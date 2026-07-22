@@ -1,14 +1,14 @@
 import { Readable } from "node:stream";
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { DEFAULT_WORKSPACE_LIMITS } from "./cloud-workspace";
+import { createDeterministicTar, DEFAULT_WORKSPACE_LIMITS, sha256Bytes } from "./cloud-workspace";
 
 type Log = { stream: "stdout" | "stderr"; data: string };
 const observed: {
   create?: Record<string, unknown>; get?: Record<string, unknown>; commands: Record<string, unknown>[];
-  deletes: string[]; updates: unknown[]; kills: string[]; logsClosed: number; files: Map<string, Buffer>;
+  deletes: string[]; updates: unknown[]; kills: string[]; logsClosed: number; files: Map<string, Buffer>; mkdirs: string[]; reads: string[];
   logs: Log[]; createGate?: Promise<void>; exitCode: number; commandExit?: (input: Record<string, unknown>) => number;
-  updateFailure?: unknown; listed: Array<{ status: string }>;
-} = { commands: [], deletes: [], updates: [], kills: [], logsClosed: 0, files: new Map(), logs: [], exitCode: 0, listed: [] };
+  updateFailure?: unknown; updateHook?: (policy: unknown) => void; listed: Array<{ status: string }>;
+} = { commands: [], deletes: [], updates: [], kills: [], logsClosed: 0, files: new Map(), mkdirs: [], reads: [], logs: [], exitCode: 0, listed: [] };
 
 class FakeCommand {
   readonly cmdId = `cmd-${observed.commands.length}`;
@@ -34,11 +34,12 @@ class FakeSession {
     await observed.createGate;
     return new FakeCommand(input);
   }
-  async readFile({ path }: { path: string }) { return observed.files.has(path) ? Readable.from([observed.files.get(path)!]) : null; }
+  async mkDir(path: string) { observed.mkdirs.push(path); }
+  async readFile({ path }: { path: string }) { observed.reads.push(path); return observed.files.has(path) ? Readable.from([observed.files.get(path)!]) : null; }
   async writeFiles(files: Array<{ path: string; content: Uint8Array }>) { for (const file of files) observed.files.set(file.path, Buffer.from(file.content)); }
   async update({ networkPolicy }: { networkPolicy?: unknown }) {
     if (observed.updateFailure === networkPolicy) throw new Error("policy transition failed");
-    this.networkPolicy = networkPolicy; observed.updates.push(networkPolicy);
+    this.networkPolicy = networkPolicy; observed.updates.push(networkPolicy); observed.updateHook?.(networkPolicy);
   }
 }
 
@@ -68,8 +69,8 @@ async function providerAndWorkspace() {
 
 beforeEach(() => {
   observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.kills = []; observed.logsClosed = 0;
-  observed.files = new Map(); observed.logs = []; observed.createGate = undefined; observed.exitCode = 0; observed.commandExit = undefined;
-  observed.updateFailure = undefined; observed.listed = []; FakeSandbox.current = new FakeSession();
+  observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.logs = []; observed.createGate = undefined; observed.exitCode = 0; observed.commandExit = undefined;
+  observed.updateFailure = undefined; observed.updateHook = undefined; observed.listed = []; FakeSandbox.current = new FakeSession();
 });
 
 describe("VercelCloudWorkspaceProvider", () => {
@@ -87,6 +88,7 @@ describe("VercelCloudWorkspaceProvider", () => {
     const { provider, workspace } = await providerAndWorkspace();
     const result = await provider.exec(workspace, { command: "printf safe", cwd: workspace.root, timeoutMs: 1_000, maxOutputBytes: 1_000 });
     expect(result).toMatchObject({ exitCode: 0, stdout: "safe-out", stderr: "safe-err", providerSessionId: "vercel-session-a" });
+    expect(observed.get).toMatchObject({ name: workspace.providerWorkspaceId, resume: false, token: "controller-token", teamId: "team_1", projectId: "prj_1" });
     expect(observed.commands[0]).toMatchObject({ cmd: "sh", args: ["-lc", "printf safe"], cwd: workspace.root, env: {}, detached: true, timeoutMs: 1_000 });
     expect(observed.commands[0]).not.toHaveProperty("stdout");
     expect(observed.logsClosed).toBe(1);
@@ -99,6 +101,13 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.commands).toEqual([]);
     await provider.terminate(workspace);
     expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
+  });
+
+  it("treats a stopped exact session as stale before a filesystem read", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    FakeSandbox.current.status = "stopped";
+    await expect(provider.readFile(workspace, "safe.txt", 10)).rejects.toMatchObject({ code: "stale_attempt" });
+    expect(observed.reads).toEqual([]);
   });
 
   it("kills and observes the exact command on cancellation and output overflow", async () => {
@@ -119,6 +128,16 @@ describe("VercelCloudWorkspaceProvider", () => {
     await expect(provider.readFile(workspace, "../../escape", 10)).rejects.toMatchObject({ code: "unsafe_archive" });
     observed.files.set(file, Buffer.from("0123456789"));
     await expect(provider.readFile(workspace, "safe.txt", 4)).rejects.toMatchObject({ code: "resource_limit" });
+    observed.commandExit = (input) => String(input.args).includes("realpath") ? 1 : 0;
+    await expect(provider.readFile(workspace, "safe.txt", 10)).rejects.toMatchObject({ code: "unsafe_archive" });
+  });
+
+  it("creates only the fenced repository root through the exact Session before controller writes", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    const bytes = createDeterministicTar([{ path: "package.json", data: new TextEncoder().encode("{}") }]);
+    await provider.uploadCredentiallessArchive(workspace, { baseSha: "0".repeat(40), sha256: sha256Bytes(bytes), bytes });
+    expect(observed.mkdirs).toEqual([workspace.root]);
+    expect(observed.files.has(`${workspace.root}/.jarvis-controller-${workspace.providerWorkspaceId}/source-upload.tar`)).toBe(true);
   });
 
   it("relocks deny-all and deletes the workspace before a failed hydration can reach Codex", async () => {
@@ -130,11 +149,37 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.commands.some((command) => String(command.args).includes("npm ci"))).toBe(false);
   });
 
+  it("treats a policy-transition session substitution as stale before npm can start", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.files.set(`${workspace.root}/package-lock.json`, Buffer.from(JSON.stringify({ lockfileVersion: 3, packages: {} })));
+    observed.updateHook = (policy) => {
+      if (typeof policy === "object") FakeSandbox.current = Object.assign(new FakeSession(), { sessionId: "replaced-after-policy" });
+    };
+    await expect(provider.hydrateDependencies(workspace)).rejects.toMatchObject({ code: "stale_attempt" });
+    expect(observed.commands.some((command) => String(command.args).includes("npm ci"))).toBe(false);
+    expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
+  });
+
   it("fails closed and deletes the exact attempt when command creation times out", async () => {
     let release!: () => void;
     observed.createGate = new Promise<void>((resolve) => { release = resolve; });
     const { provider, workspace } = await providerAndWorkspace();
     await expect(provider.exec(workspace, { command: "sleep 1", timeoutMs: 5, maxOutputBytes: 1_000 })).rejects.toMatchObject({ code: "timeout" });
+    expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
+    release();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(observed.kills).toContain("cmd-1:SIGKILL");
+  });
+
+  it("fails closed and deletes the exact attempt when cancellation races command creation", async () => {
+    let release!: () => void;
+    observed.createGate = new Promise<void>((resolve) => { release = resolve; });
+    const { provider, workspace } = await providerAndWorkspace();
+    const controller = new AbortController();
+    const running = provider.exec(workspace, { command: "sleep 1", timeoutMs: 1_000, maxOutputBytes: 1_000, signal: controller.signal });
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+    await expect(running).rejects.toMatchObject({ code: "cancelled" });
     expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
     release();
     await new Promise((resolve) => setImmediate(resolve));
@@ -156,6 +201,25 @@ describe("VercelCloudWorkspaceProvider", () => {
     await expect(provider.hydrateDependencies(workspace)).rejects.toMatchObject({ code: "provider_unavailable" });
     expect(observed.updates).toContain("deny-all");
     expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
+  });
+
+  it("keeps the npm cache and cleanup path inside the attempt-fenced repository", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.files.set(`${workspace.root}/package-lock.json`, Buffer.from(JSON.stringify({ lockfileVersion: 3, packages: {} })));
+    await provider.hydrateDependencies(workspace);
+    const install = observed.commands.find((command) => String(command.args).includes("npm ci"));
+    expect(String(install?.args)).toContain(`${workspace.root}/.jarvis-controller-${workspace.providerWorkspaceId}/npm-cache`);
+    expect(String(install?.args)).not.toContain("/vercel/sandbox/.jarvis-npm-cache");
+    expect(String(install?.args)).toContain("git clean -ffd -e node_modules");
+    expect(observed.updates).toEqual([{ allow: ["registry.npmjs.org"] }, "deny-all"]);
+  });
+
+  it("rejects unbounded command and listing requests before a session data-plane call", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    await expect(provider.exec(workspace, { command: "true", timeoutMs: 45 * 60_000, maxOutputBytes: 1_000 })).rejects.toMatchObject({ code: "resource_limit" });
+    await expect(provider.exec(workspace, { command: "true", timeoutMs: 1_000, maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes + 1 })).rejects.toMatchObject({ code: "resource_limit" });
+    await expect(provider.listFiles(workspace, ".", 10_001)).rejects.toMatchObject({ code: "resource_limit" });
+    expect(observed.commands).toEqual([]);
   });
 
   it("enforces the project-scoped active-attempt controller cap before create", async () => {

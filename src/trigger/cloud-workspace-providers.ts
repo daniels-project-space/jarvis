@@ -438,6 +438,7 @@ const VERCEL_SAFE_TTL_MS = 44 * 60_000;
 const VERCEL_NPM_POLICY = Object.freeze({ allow: ["registry.npmjs.org"] });
 /** Must never exceed the durable Trigger agent-worker fleet concurrency (8). */
 export const VERCEL_ACTIVE_SANDBOX_CAP = 8;
+const VERCEL_MAX_LIST_ENTRIES = 10_000;
 const VERCEL_NAME_PREFIX = "jarvis";
 
 function vercelWorkspaceName(attemptKey: string): string {
@@ -464,6 +465,44 @@ function vercelAbsolutePath(workspace: CloudWorkspace, value: string): string {
 function decodeOutput(value: Buffer): string {
   try { return new TextDecoder("utf-8", { fatal: true }).decode(value); }
   catch { throw new CloudWorkspaceError("vercel", "unsafe_patch", "sandbox emitted invalid UTF-8 output", "rejected"); }
+}
+
+function boundedUtf8Prefix(value: string, maxBytes: number): Buffer {
+  if (maxBytes <= 0) return Buffer.alloc(0);
+  if (Buffer.byteLength(value) <= maxBytes) return Buffer.from(value);
+  // Do not copy a provider-controlled giant log chunk just to truncate it.
+  // Advance over complete Unicode code points so the retained bytes are valid
+  // UTF-8 and at most the caller's cumulative byte budget.
+  let chars = 0;
+  let bytes = 0;
+  for (const codePoint of value) {
+    const next = Buffer.byteLength(codePoint);
+    if (bytes + next > maxBytes) break;
+    bytes += next;
+    chars += codePoint.length;
+  }
+  return Buffer.from(value.slice(0, chars));
+}
+
+function assertVercelCommandBounds(timeoutMs: number, maxOutputBytes: number): void {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > VERCEL_SAFE_TTL_MS) {
+    throw new CloudWorkspaceError("vercel", "resource_limit", "command timeout is outside the bounded Vercel attempt lifetime", "rejected");
+  }
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 0 || maxOutputBytes > DEFAULT_WORKSPACE_LIMITS.maxOutputBytes) {
+    throw new CloudWorkspaceError("vercel", "resource_limit", "command output limit is outside the controller byte bound", "rejected");
+  }
+}
+
+function assertVercelFileBound(maxBytes: number): void {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > DEFAULT_WORKSPACE_LIMITS.maxFileBytes) {
+    throw new CloudWorkspaceError("vercel", "resource_limit", "file byte limit is outside the controller bound", "rejected");
+  }
+}
+
+function assertVercelWriteBound(maxBytes: number): void {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes) {
+    throw new CloudWorkspaceError("vercel", "resource_limit", "write byte limit is outside the controller archive bound", "rejected");
+  }
 }
 
 function packageLockUsesOnlyNpmRegistry(bytes: Uint8Array): boolean {
@@ -495,7 +534,6 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
   readonly name = "vercel" as const;
   readonly capabilities = CAPABILITIES.vercel;
   protected override workspaceRoot = "/vercel/sandbox/repository";
-  private readonly sandboxes = new Map<string, VercelSandbox>();
 
   constructor(
     private readonly token: string,
@@ -517,9 +555,11 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     const sandbox = await this.get(workspace);
     const session = this.assertSession(workspace, sandbox);
     const paths = this.pathsFor(workspace);
-    // This is the only mkdir in the Vercel data plane. It is a direct,
-    // attempt-random child of a realpath-checked repository root, then is
-    // itself realpath/lstat checked before any upload can use it.
+    // These are direct session calls: neither can resume a stopped Sandbox.
+    // The root is established before it becomes a command cwd, and every
+    // subsequent data-plane path is realpath/lstat checked below it.
+    await session.mkDir(workspace.root);
+    this.assertSession(workspace, sandbox);
     await this.assertNoSymlink(workspace, sandbox, session, workspace.root, false);
     const result = await this.runSessionCommand(workspace, sandbox, session, {
       command: `mkdir -- ${shellQuote(paths.controlDir)} && [ "$(realpath -e -- ${shellQuote(paths.controlDir)})" = ${shellQuote(paths.controlDir)} ] && [ ! -L ${shellQuote(paths.controlDir)} ]`,
@@ -563,7 +603,6 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     }
     const workspace = { provider: this.name, providerWorkspaceId: sandbox.name, providerSessionId: session.sessionId, root: this.workspaceRoot, createdAt: Date.now() } satisfies CloudWorkspace;
     assertWorkspaceIdentity(workspace);
-    this.sandboxes.set(workspace.providerWorkspaceId, sandbox);
     return workspace;
   }
 
@@ -579,6 +618,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
 
   async readFile(workspace: CloudWorkspace, path: string, maxBytes: number) { return this.readAbsolute(workspace, safeWorkspacePath(workspace, path), maxBytes); }
   protected async readAbsolute(workspace: CloudWorkspace, path: string, maxBytes: number) {
+    assertVercelFileBound(maxBytes);
     const sandbox = await this.get(workspace); const session = this.assertSession(workspace, sandbox);
     const absolute = vercelAbsolutePath(workspace, path);
     await this.assertNoSymlink(workspace, sandbox, session, absolute, false);
@@ -587,8 +627,11 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     const chunks: Buffer[] = []; let used = 0;
     try {
       for await (const value of stream) {
-        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
-        if (chunk.byteLength > maxBytes - used) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds read limit", "rejected");
+        const bytes = typeof value === "string" ? Buffer.byteLength(value) : value.byteLength;
+        if (bytes > maxBytes - used) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds read limit", "rejected");
+        const chunk = Buffer.isBuffer(value)
+          ? value
+          : Buffer.from(value);
         chunks.push(chunk); used += chunk.byteLength;
       }
     } finally { (stream as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.(); }
@@ -596,6 +639,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
   }
   async writeFile(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) { return this.writeAbsolute(workspace, safeWorkspacePath(workspace, path), data, maxBytes); }
   protected async writeAbsolute(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) {
+    assertVercelWriteBound(maxBytes);
     if (data.byteLength > maxBytes) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds write limit", "rejected");
     const sandbox = await this.get(workspace); const session = this.assertSession(workspace, sandbox);
     const absolute = vercelAbsolutePath(workspace, path);
@@ -603,7 +647,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     await session.writeFiles([{ path: absolute, content: data }]); this.assertSession(workspace, sandbox);
   }
   async listFiles(workspace: CloudWorkspace, path: string, maxEntries: number) {
-    if (!Number.isSafeInteger(maxEntries) || maxEntries < 0) throw new CloudWorkspaceError(this.name, "resource_limit", "file listing limit is invalid", "rejected");
+    if (!Number.isSafeInteger(maxEntries) || maxEntries < 0 || maxEntries > VERCEL_MAX_LIST_ENTRIES) throw new CloudWorkspaceError(this.name, "resource_limit", "file listing limit is invalid", "rejected");
     const sandbox = await this.get(workspace); const session = this.assertSession(workspace, sandbox);
     const base = vercelAbsolutePath(workspace, path);
     await this.assertNoSymlink(workspace, sandbox, session, base, false);
@@ -630,6 +674,8 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       const sandbox = await this.get(workspace); const session = this.assertSession(workspace, sandbox);
       try {
       const lockPath = `${this.workspaceRoot}/package-lock.json`;
+      const paths = this.pathsFor(workspace);
+      const cachePath = `${paths.controlDir}/npm-cache`;
       // A missing lock means no egress. Verify its parent/final path without
       // following a link before deciding whether there is anything to read.
       await this.assertNoSymlink(workspace, sandbox, session, lockPath, true);
@@ -642,7 +688,15 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       await session.update({ networkPolicy: VERCEL_NPM_POLICY });
       this.assertSession(workspace, sandbox);
       const installed = await this.runSessionCommand(workspace, sandbox, session, {
-        command: "npm ci --ignore-scripts --no-audit --no-fund --cache /vercel/sandbox/.jarvis-npm-cache && git reset --hard refs/jarvis/controller-base && git clean -ffdX -e node_modules && git clean -ffd -e node_modules && rm -rf -- /vercel/sandbox/.jarvis-npm-cache",
+        command: [
+          `npm ci --ignore-scripts --no-audit --no-fund --cache ${shellQuote(cachePath)}`,
+          "git reset --hard refs/jarvis/controller-base",
+          // Preserve only dependencies and the controller-owned control
+          // directory while removing install-created source mutations.
+          `git clean -ffdX -e node_modules -e ${shellQuote(paths.controlDir.slice(this.workspaceRoot.length + 1))}`,
+          `git clean -ffd -e node_modules -e ${shellQuote(paths.controlDir.slice(this.workspaceRoot.length + 1))}`,
+          `rm -rf -- ${shellQuote(cachePath)}`,
+        ].join(" && "),
         cwd: this.workspaceRoot, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs, maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes,
       });
       if (installed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "deterministic dependency hydration failed", "deferred");
@@ -662,6 +716,10 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
   }
 
   async terminate(workspace: CloudWorkspace) {
+    // Termination is authorized only for the random, attempt-owned name. It
+    // deliberately does not read or resume a session, so a stopped/replaced
+    // session cannot make cleanup start compute or skip deletion.
+    this.pathsFor(workspace);
     try {
       const sandbox = await this.get(workspace);
       // Cleanup owns only the random attempt name. It must never start a
@@ -670,17 +728,18 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     } catch (error) {
       if (this.absent(error)) return;
       throw error;
-    } finally { this.sandboxes.delete(workspace.providerWorkspaceId); }
+    } finally { /* deletion is name-scoped; no session cache is retained */ }
   }
 
   private absent(error: unknown): boolean { return /(?:not[_ -]?found|404|already deleted)/i.test(String(error)); }
   private async get(workspace: CloudWorkspace): Promise<VercelSandbox> {
     assertWorkspaceIdentity(workspace);
-    const cached = this.sandboxes.get(workspace.providerWorkspaceId);
-    if (cached) return cached;
+    this.pathsFor(workspace);
     const { Sandbox } = await import("@vercel/sandbox");
+    // Never trust a stale SDK object here. This is a control-plane read with
+    // resume:false, followed by a fence on its freshly observed Session.
     const sandbox = await Sandbox.get({ ...this.credentials(), name: workspace.providerWorkspaceId, resume: false });
-    this.sandboxes.set(workspace.providerWorkspaceId, sandbox); return sandbox;
+    return sandbox;
   }
   private assertSession(workspace: CloudWorkspace, sandbox: VercelSandbox) {
     const session = sandbox.currentSession();
@@ -704,6 +763,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     workspace: CloudWorkspace, sandbox: VercelSandbox, session: VercelSession,
     request: { command: string; cwd: string; timeoutMs: number; maxOutputBytes: number; signal?: AbortSignal },
   ): Promise<{ exitCode: number; stdout: Buffer; stderr: Buffer; durationMs: number }> {
+    assertVercelCommandBounds(request.timeoutMs, request.maxOutputBytes);
     this.assertSession(workspace, sandbox);
     if (request.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
     const startedAt = Date.now();
@@ -713,14 +773,16 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     const logAbort = new AbortController();
     const stdout: Buffer[] = []; const stderr: Buffer[] = []; let bytes = 0; let stdoutBytes = 0; let stderrBytes = 0;
     const append = (stream: "stdout" | "stderr", data: string) => {
-      const chunk = Buffer.from(data); const remaining = request.maxOutputBytes - bytes;
-      if (chunk.byteLength > remaining) {
+      const chunkBytes = Buffer.byteLength(data); const remaining = request.maxOutputBytes - bytes;
+      if (chunkBytes > remaining) {
         if (remaining > 0) {
-          (stream === "stdout" ? stdout : stderr).push(chunk.subarray(0, remaining));
-          if (stream === "stdout") stdoutBytes += remaining; else stderrBytes += remaining;
+          const prefix = boundedUtf8Prefix(data, remaining);
+          (stream === "stdout" ? stdout : stderr).push(prefix);
+          if (stream === "stdout") stdoutBytes += prefix.byteLength; else stderrBytes += prefix.byteLength;
         }
         bytes += Math.max(remaining, 0); reason = "resource_limit"; return;
       }
+      const chunk = Buffer.from(data);
       (stream === "stdout" ? stdout : stderr).push(chunk);
       if (stream === "stdout") stdoutBytes += chunk.byteLength; else stderrBytes += chunk.byteLength;
       bytes += chunk.byteLength;
@@ -748,13 +810,17 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     try {
       // Do not pass stdout/stderr: SDK 2.8 starts an unowned log iterator for
       // detached commands when those conveniences are supplied.
+      this.assertSession(workspace, sandbox);
       const creating = session.runCommand({ cmd: "sh", args: ["-lc", request.command], cwd: request.cwd, env: {}, detached: true, timeoutMs: request.timeoutMs });
       const first = await Promise.race([creating.then((value) => ({ value })), creationInterrupted]);
       if (first === "interrupted") {
         // A create request may have crossed the provider boundary. Delete the
         // exact random name before returning; if it later resolves, deletion
         // has already removed any possible remote process.
-        await this.terminate(workspace).catch(() => undefined);
+        try { await this.terminate(workspace); }
+        catch {
+          throw new CloudWorkspaceError(this.name, "cleanup_blocked", "could not delete the exact sandbox after interrupted command creation", "blocked");
+        }
         void creating.then(async (late) => { await late.kill("SIGKILL").catch(() => undefined); }).catch(() => undefined);
         if (reason === "timeout") {
           throw new CloudWorkspaceError(this.name, "timeout", "sandbox command timed out while creation was in flight", "deferred");
@@ -762,6 +828,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
         throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled while creation was in flight", "deferred");
       }
       command = first.value;
+      this.assertSession(workspace, sandbox);
       if (reason) termination ??= killAndObserve();
       const iterator = command.logs({ signal: logAbort.signal });
       const consume = (async () => {
@@ -771,7 +838,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
             if (reason === "resource_limit") { logAbort.abort(); termination ??= killAndObserve(); await termination; break; }
           }
         } catch (error) { if (!reason) throw error; }
-        finally { iterator.close(); }
+        finally { await Promise.resolve(iterator.close()); }
       })();
       const finished = await command.wait();
       await consume;
