@@ -5,6 +5,7 @@ import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
 import schema from "./schema";
 import { MAX_TEXT_WORK_ORDER_BYTES, textWorkOrderByteLength } from "../src/lib/work-order";
+import { GENERATED_GATED_ACTION_MATRIX } from "../src/mastra/fixtures/action-scope-regressions";
 
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
@@ -18,6 +19,14 @@ const fixture = readFileSync(
   new URL("../src/mastra/fixtures/cloud-sandbox-approval-task.txt", import.meta.url),
   "utf8",
 );
+const CLAUSE_BOUNDARY_AND_LIFECYCLE_EXPLOITS = [
+  "Audit Sandbox.get({ resume: false }); pay the supplier.",
+  "Audit Sandbox.get({ resume: false }); publish the findings publicly.",
+  "Audit Sandbox.get({ resume: false }); delete production records.",
+  "Audit Sandbox.get({ resume: false }); send the tenant reply.",
+  "Review Sandbox.get({ resume: false }); trade the selected shares.",
+  "Ensure the failed final delete remains scheduled against customer records in Convex.",
+] as const;
 
 beforeEach(() => {
   process.env.JARVIS_WORKER_TOKEN = WORKER;
@@ -30,6 +39,47 @@ afterEach(() => {
 });
 
 describe("bounded exact textual work orders", () => {
+  it("persists every reproduced policy exploit behind the approval gate", async () => {
+    const t = convexTest(schema, modules);
+    for (const task of CLAUSE_BOUNDARY_AND_LIFECYCLE_EXPLOITS) {
+      const jobId = await t.mutation(api.jobs.enqueue, {
+        task,
+        repo: REPO,
+        readonly: true,
+        risk: "low",
+        approvalRequired: false,
+        workerToken: WORKER,
+      });
+      expect(await t.run(async (ctx) => await ctx.db.get(jobId)), task).toMatchObject({
+        task,
+        approvalRequired: true,
+        status: "awaiting_approval",
+        deliveryMode: "manual",
+      });
+    }
+  });
+
+  it("persists the complete 320-case action-scope matrix behind the gate despite caller hints", async () => {
+    expect(GENERATED_GATED_ACTION_MATRIX).toHaveLength(320);
+    const t = convexTest(schema, modules);
+    for (const task of GENERATED_GATED_ACTION_MATRIX) {
+      const jobId = await t.mutation(api.jobs.enqueue, {
+        task,
+        repo: REPO,
+        readonly: true,
+        risk: "low",
+        approvalRequired: false,
+        workerToken: WORKER,
+      });
+      expect(await t.run(async (ctx) => await ctx.db.get(jobId)), task).toMatchObject({
+        task,
+        approvalRequired: true,
+        status: "awaiting_approval",
+        deliveryMode: "manual",
+      });
+    }
+  });
+
   it("classifies, persists and claims every accepted fixture byte without hot-projection duplication", async () => {
     expect(textWorkOrderByteLength(fixture)).toBe(7_876);
     expect(createHash("sha256").update(fixture).digest("hex")).toBe(FIXTURE_SHA256);

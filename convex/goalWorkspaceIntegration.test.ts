@@ -12,6 +12,8 @@ import {
   integrationTerminalReleaseDecision,
 } from "./goalIntegration";
 import schema from "./schema";
+import { GENERATED_GATED_ACTION_MATRIX } from "../src/mastra/fixtures/action-scope-regressions";
+import { goalWorkApprovalPolicy } from "./workPolicy";
 
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
@@ -22,6 +24,14 @@ const TOKEN = "goal-integration-test-worker";
 const REPO = "daniels-project-space/dropship-ai";
 const BASE = "1".repeat(40);
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+const CLAUSE_BOUNDARY_AND_LIFECYCLE_EXPLOITS = [
+  "Audit Sandbox.get({ resume: false }); pay the supplier.",
+  "Audit Sandbox.get({ resume: false }); publish the findings publicly.",
+  "Audit Sandbox.get({ resume: false }); delete production records.",
+  "Audit Sandbox.get({ resume: false }); send the tenant reply.",
+  "Review Sandbox.get({ resume: false }); trade the selected shares.",
+  "Ensure the failed final delete remains scheduled against customer records in Convex.",
+] as const;
 
 beforeEach(() => { process.env.JARVIS_WORKER_TOKEN = TOKEN; vi.useRealTimers(); });
 afterEach(() => { delete process.env.JARVIS_WORKER_TOKEN; vi.useRealTimers(); });
@@ -169,6 +179,91 @@ async function claimedFirstIntegration(prefix: string) {
 }
 
 describe("real Convex multi-agent workspace and integration races", () => {
+  it("projects all 320 action-scope decisions identically into Goal Mode producers", async () => {
+    expect(GENERATED_GATED_ACTION_MATRIX).toHaveLength(320);
+    for (const [index, task] of GENERATED_GATED_ACTION_MATRIX.entries()) {
+      const goalStage = index % 2 === 0 ? "building" : "refining";
+      const decision = goalWorkApprovalPolicy({
+        task,
+        repo: REPO,
+        readonly: true,
+        risk: "low",
+        approvalRequired: false,
+        goalStage,
+      });
+      expect(decision, task).toMatchObject({ required: true, deliveryMode: "manual" });
+    }
+  });
+
+  it("gates every reproduced exploit in Goal Mode building and refining producers", async () => {
+    const building = await goalAwaitingPlan(8);
+    const plan = {
+      summary: "Adversarial consequence boundary projection",
+      route: "existing_project",
+      primaryRepo: REPO,
+      assumptions: [],
+      workstreams: CLAUSE_BOUNDARY_AND_LIFECYCLE_EXPLOITS.map((task, index) => ({
+        id: `exploit-${index + 1}`,
+        label: `Exploit ${index + 1}`,
+        task,
+        agentId: "paul",
+        repo: REPO,
+        readonly: true,
+        dependsOn: [],
+        acceptanceCriteria: ["approval gate retained"],
+        mcp: [],
+      })),
+      validation: { criteria: ["all effects gated"], tests: [], liveChecks: [] },
+    };
+    expect(await building.t.mutation(api.goalMode.recordPlan, {
+      id: building.missionId,
+      expectedAdvanceAttempt: 1,
+      plan,
+      workerToken: TOKEN,
+    })).toMatchObject({ advanced: true, jobs: 6, waitingApprovals: 6 });
+    const builders = await building.t.run(async (ctx) => (await ctx.db.query("jobs")
+      .withIndex("by_mission", (q) => q.eq("missionId", String(building.missionId))).collect())
+      .filter((job) => job.goalStage === "building"));
+    expect(builders).toHaveLength(6);
+    expect(builders.every((job) => job.approvalRequired === true
+      && job.status === "awaiting_approval"
+      && job.deliveryMode === "manual")).toBe(true);
+
+    for (const [chunkIndex, tasks] of [
+      CLAUSE_BOUNDARY_AND_LIFECYCLE_EXPLOITS.slice(0, 3),
+      CLAUSE_BOUNDARY_AND_LIFECYCLE_EXPLOITS.slice(3),
+    ].entries()) {
+      const refining = await goalAwaitingPlan();
+      await refining.t.run(async (ctx) => {
+        await ctx.db.patch(refining.missionId, { phase: "validating", advanceAttempt: 1 });
+      });
+      expect(await refining.t.mutation(api.goalMode.recordValidation, {
+        id: refining.missionId,
+        expectedAdvanceAttempt: 1,
+        validation: {
+          verdict: "refine",
+          summary: `Adversarial refinement chunk ${chunkIndex + 1}`,
+          evidence: [],
+          gaps: ["policy gate"],
+          refinements: tasks.map((task, index) => ({
+            id: `refine-${chunkIndex + 1}-${index + 1}`,
+            label: `Refine exploit ${chunkIndex + 1}-${index + 1}`,
+            task,
+            acceptanceCriteria: ["approval gate retained"],
+          })),
+        },
+        workerToken: TOKEN,
+      })).toMatchObject({ advanced: true, status: "refining", jobs: 3 });
+      const refinements = await refining.t.run(async (ctx) => (await ctx.db.query("jobs")
+        .withIndex("by_mission", (q) => q.eq("missionId", String(refining.missionId))).collect())
+        .filter((job) => job.goalStage === "refining"));
+      expect(refinements).toHaveLength(3);
+      expect(refinements.every((job) => job.approvalRequired === true
+        && job.status === "awaiting_approval"
+        && job.deliveryMode === "manual")).toBe(true);
+    }
+  });
+
   it("defines one terminal-release truth table for every outcome path", () => {
     const effect = (observation?: "applied" | "not_applied" | "unknown", providerHeadSha?: string) => ({
       effectId: "final", effectKind: "update_ref", expectedBaseSha: BASE,

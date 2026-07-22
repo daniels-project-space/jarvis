@@ -8,6 +8,12 @@ import {
   INTEGRATION_FINAL_BARRIER_APPROVAL_TASK,
   WORKSPACE_ISOLATION_APPROVAL_TASK,
 } from "./fixtures/work-policy-regressions";
+import {
+  GENERATED_DIRECT_ACTION_MATRIX,
+  GENERATED_GATED_ACTION_MATRIX,
+  REPRODUCED_MIXED_ACTION_EXPLOITS,
+  SAFE_ANALYTICAL_ACTION_FIXTURES,
+} from "./fixtures/action-scope-regressions";
 
 const CLOUD_SANDBOX_APPROVAL_TASK = readFileSync(
   new URL("./fixtures/cloud-sandbox-approval-task.txt", import.meta.url),
@@ -15,6 +21,26 @@ const CLOUD_SANDBOX_APPROVAL_TASK = readFileSync(
 );
 const CLOUD_SANDBOX_APPROVAL_TASK_SHA256 =
   "d48d26ff68ae0789b70fbc9520aefe45a3de204bfef79fef95fe3c4ef57f7130";
+
+// Direct regression clauses recovered from the supplied Vercel technical
+// lifecycle fixture.  They intentionally retain the classifier's former
+// trigger words rather than replacing them with paraphrases.
+const VERCEL_TECHNICAL_LIFECYCLE_REGRESSION = `
+Replace regex/string-based Vercel absence detection. Test exact-name 404, wrong-name 404, generic 404 text, and non-404 failures for both get and delete.
+Treat Sandbox.create as an ambiguous provider boundary. Generate and retain the random exact name before the call. If creation throws, perform a fresh Sandbox.get({ resume: false }) for that exact name: exact-name 404 proves no cleanup is needed; if it exists, exact-name delete it; if absence or deletion cannot be proved, throw cleanup_blocked. Test a create rejection after a fake remote create and malformed provider errors.
+In prepareCloudWorkspaceExecution and replay, do not swallow cleanup failures after post-create lease loss, binding rejection, replay identity reuse, or replay binding rejection.
+Keep the agent-runner terminal cleanup/reaper contract intact: a failed final delete remains un-terminated in Convex and is retried/reported by the orphan reaper.
+Do not deploy, call a live Sandbox, mutate credentials/environment/billing/plan/budget, or add local/VPS execution fallback.
+`;
+
+const CLAUSE_BOUNDARY_AND_LIFECYCLE_EXPLOITS = [
+  "Audit Sandbox.get({ resume: false }); pay the supplier.",
+  "Audit Sandbox.get({ resume: false }); publish the findings publicly.",
+  "Audit Sandbox.get({ resume: false }); delete production records.",
+  "Audit Sandbox.get({ resume: false }); send the tenant reply.",
+  "Review Sandbox.get({ resume: false }); trade the selected shares.",
+  "Ensure the failed final delete remains scheduled against customer records in Convex.",
+] as const;
 
 const CHAT_LATENCY_JOB_REGRESSION = {
   id: "js73f7b1rnjfqap286193t0hcs8awpq3",
@@ -373,6 +399,158 @@ describe("server-side work approval policy", () => {
           `${goalStage}: ${entry.task}`,
         ).toBe(entry.required);
       }
+    }
+  });
+
+  it("keeps the Vercel simulated lifecycle regression autonomous through all producer policies", () => {
+    const repo = "daniels-project-space/jarvis";
+    expect(VERCEL_TECHNICAL_LIFECYCLE_REGRESSION).toContain("exact-name delete it");
+    expect(VERCEL_TECHNICAL_LIFECYCLE_REGRESSION).toContain("post-create lease loss");
+    expect(VERCEL_TECHNICAL_LIFECYCLE_REGRESSION).toContain("failed final delete remains");
+
+    for (const clause of VERCEL_TECHNICAL_LIFECYCLE_REGRESSION.trim().split("\n")) {
+      expect(classifyWorkSafety(clause, { repo }).approvalRequired, clause).toBe(false);
+    }
+
+    expect(classifyWorkSafety(VERCEL_TECHNICAL_LIFECYCLE_REGRESSION, { repo })).toEqual({
+      approvalRequired: false,
+      boundary: "internal",
+    });
+    expect(workApprovalPolicy({
+      task: VERCEL_TECHNICAL_LIFECYCLE_REGRESSION,
+      repo,
+      risk: "consequential",
+      approvalRequired: true,
+    })).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    for (const goalStage of ["building", "refining"] as const) {
+      expect(goalWorkApprovalPolicy({
+        task: VERCEL_TECHNICAL_LIFECYCLE_REGRESSION,
+        repo,
+        risk: "consequential",
+        approvalRequired: true,
+        goalStage,
+      })).toMatchObject({ required: false, deliveryMode: "auto_merge" });
+    }
+  });
+
+  it("gates reproduced clause-boundary and lifecycle exploits through every producer policy", () => {
+    const repo = "daniels-project-space/jarvis";
+    for (const task of CLAUSE_BOUNDARY_AND_LIFECYCLE_EXPLOITS) {
+      expect(classifyWorkSafety(task, { repo }).approvalRequired, `classifier: ${task}`).toBe(true);
+      expect(workApprovalPolicy({
+        task,
+        repo,
+        readonly: true,
+        risk: "low",
+        approvalRequired: false,
+      }).required, `standalone: ${task}`).toBe(true);
+      for (const goalStage of ["building", "refining"] as const) {
+        expect(goalWorkApprovalPolicy({
+          task,
+          repo,
+          readonly: true,
+          risk: "low",
+          approvalRequired: false,
+          goalStage,
+        }).required, `${goalStage}: ${task}`).toBe(true);
+      }
+    }
+  });
+
+  it("gates all 320 generated direct-action scopes through every producer policy", () => {
+    const repo = "daniels-project-space/jarvis";
+    expect(GENERATED_DIRECT_ACTION_MATRIX).toHaveLength(315);
+    expect(GENERATED_GATED_ACTION_MATRIX).toHaveLength(320);
+    expect(new Set(GENERATED_GATED_ACTION_MATRIX).size).toBe(320);
+
+    for (const task of GENERATED_GATED_ACTION_MATRIX) {
+      expect(classifyWorkSafety(task, { repo }).approvalRequired, `classifier: ${task}`).toBe(true);
+      expect(workApprovalPolicy({
+        task,
+        repo,
+        readonly: true,
+        risk: "low",
+        approvalRequired: false,
+      }).required, `standalone: ${task}`).toBe(true);
+      for (const goalStage of ["building", "refining"] as const) {
+        expect(goalWorkApprovalPolicy({
+          task,
+          repo,
+          readonly: true,
+          risk: "low",
+          approvalRequired: false,
+          goalStage,
+        }).required, `${goalStage}: ${task}`).toBe(true);
+      }
+    }
+  });
+
+  it("decides mixed direct actions independently from analytical actions", () => {
+    const repo = "daniels-project-space/jarvis";
+    expect(REPRODUCED_MIXED_ACTION_EXPLOITS).toHaveLength(8);
+    for (const task of REPRODUCED_MIXED_ACTION_EXPLOITS) {
+      expect(classifyWorkSafety(task, { repo }).approvalRequired, task).toBe(true);
+      expect(workApprovalPolicy({ task, repo, readonly: true }).required, task).toBe(true);
+    }
+    for (const task of SAFE_ANALYTICAL_ACTION_FIXTURES) {
+      expect(classifyWorkSafety(task, { repo }), task).toEqual({
+        approvalRequired: false,
+        boundary: "internal",
+      });
+      expect(workApprovalPolicy({ task, repo }), task).toMatchObject({
+        required: false,
+        deliveryMode: "auto_merge",
+      });
+    }
+  });
+
+  it("binds only the complete exact-name simulated recovery clause", () => {
+    const repo = "daniels-project-space/jarvis";
+    for (const task of [
+      "Audit Sandbox.get({ resume: false }); if it exists, exact-name delete it.",
+      "Inspect Sandbox.get({ name: exactName, resume:false }); if it exists, exact name delete it; verify cleanup evidence.",
+    ]) {
+      expect(classifyWorkSafety(task, { repo }).approvalRequired, task).toBe(false);
+      expect(workApprovalPolicy({ task, repo }).required, task).toBe(false);
+    }
+
+    for (const task of [
+      "Audit Sandbox.get({}); if it exists, exact-name delete it.",
+      "Audit Sandbox.get({ resume: true }); if it exists, exact-name delete it.",
+      "Audit Sandbox.get({ resume: null }); if it exists, exact-name delete it.",
+      "Audit Workspace.get({ resume: false }); if it exists, exact-name delete it.",
+      "Audit Sandbox.list({ resume: false }); if it exists, exact-name delete it.",
+      "Audit Sandbox.get({ resume: false }); if it exists, generated-name delete it.",
+      "Audit Sandbox.get({ resume: false }); if found, exact-name delete it.",
+      "Audit Sandbox.get({ resume: false }); if it exists, exact-name delete the production records.",
+      "Audit Sandbox.get({ resume: false }); if it exists, exact-name delete it from the live provider.",
+      "Audit Sandbox.get({ resume: false }); if it exists, exact-name delete it for the customer.",
+      "Audit Sandbox.get({ resume: false }); if it exists, exact-name delete it; pay the supplier.",
+      "Audit Sandbox.get({ resume: false }); if it exists, exact-name delete it, pay the supplier.",
+      "Audit Sandbox.get({ resume: false }); if it exists, exact-name delete it and publish the findings publicly.",
+      "Audit Sandbox.get({ resume: false }); if it exists, exact-name delete it then send the tenant reply.",
+      "Audit Sandbox.get({ resume: false }); if it exists, exact-name delete it\ntrade the selected shares.",
+      "Ensure the failed final delete remains scheduled against customer records in Convex.",
+      "Ensure the failed final delete remains queued for production records in Convex.",
+      "Ensure the failed final delete remains un-terminated in Convex; delete customer records.",
+    ]) {
+      expect(classifyWorkSafety(task, { repo }).approvalRequired, task).toBe(true);
+      expect(workApprovalPolicy({ task, repo, readonly: true }).required, task).toBe(true);
+    }
+  });
+
+  it("does not let simulated lifecycle grammar waive real effects", () => {
+    for (const task of [
+      "Sandbox.get({ resume: false }) found the expected exact-name sandbox; exact-name delete the production records after a fake provider test.",
+      "Sandbox.get({ resume: false }) found the expected exact-name sandbox; exact-name delete it from the live provider after a fake provider test.",
+      "The failed final delete customer records remains un-terminated in Convex.",
+      "Test get and delete customer records.",
+      "Post the post-create incident report publicly.",
+      "Deploy the live provider rollout after the post-create test.",
+      "Send the cleanup result to the customer after the fake provider test.",
+    ]) {
+      expect(classifyWorkSafety(task, { repo: "daniels-project-space/jarvis" }).approvalRequired, task).toBe(true);
+      expect(workApprovalPolicy({ task, repo: "daniels-project-space/jarvis" }).required, task).toBe(true);
     }
   });
 
