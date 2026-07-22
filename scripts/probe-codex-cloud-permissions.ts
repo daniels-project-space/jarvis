@@ -1,5 +1,5 @@
-import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -13,6 +13,7 @@ import {
   isolateCloudSubscriptionEnv,
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
+  verifyCodexSubscriptionPreflight,
 } from "../src/trigger/subscription-runtime";
 
 type JsonObject = Record<string, unknown>;
@@ -23,19 +24,11 @@ type Pending = {
 };
 
 async function main() {
-let baseEnv = process.env;
-let sourceHome = String(baseEnv.CODEX_HOME ?? "");
-let authAvailable = Boolean(sourceHome && existsSync(join(sourceHome, "auth.json")));
-if (!authAvailable && (process.env.CODEX_ACCESS_TOKEN || process.env.CODEX_AUTH_JSON || process.env.CODEX_AUTH_JSON_B64)) {
-  const prepared = prepareSubscriptionEnv("codex");
-  if (!prepared.error) {
-    baseEnv = prepared.env;
-    sourceHome = String(baseEnv.CODEX_HOME ?? "");
-    authAvailable = Boolean(baseEnv.CODEX_ACCESS_TOKEN || (sourceHome && existsSync(join(sourceHome, "auth.json"))));
-  }
-}
+const prepared = prepareSubscriptionEnv("codex");
+const baseEnv = prepared.env;
+const sourceHome = String(baseEnv.CODEX_HOME ?? "");
 const bin = resolveSubscriptionAgentBin("codex");
-if (!bin || !authAvailable) {
+if (!bin || prepared.error || !sourceHome) {
   console.log("BLOCKED: pinned Codex subscription auth is unavailable; external permission probe did not run");
   process.exit(2);
 }
@@ -53,9 +46,9 @@ const profile = buildCloudCodexPermissionProfile({
   controllerScratch: scratch,
   controllerAuthorityRoots: [dirname(scratch), process.cwd(), env.HOME, env.XDG_CONFIG_HOME, env.XDG_CACHE_HOME],
 });
-const version = spawnSync(bin, ["--version"], { env, encoding: "utf8" }).stdout.trim();
-if (version !== "codex-cli 0.144.5") {
-  console.log(JSON.stringify({ status: "BLOCKED", reason: "pinned Codex version mismatch", version }));
+const preflight = verifyCodexSubscriptionPreflight(bin, env);
+if (preflight.error) {
+  console.log(JSON.stringify({ status: "BLOCKED", reason: preflight.error }));
   rmSync(root, { recursive: true, force: true });
   process.exit(2);
 }
@@ -193,7 +186,7 @@ try {
     && !finalText.includes("SAFE_SIBLING_CANARY_MUST_NOT_BE_READ");
   console.log(JSON.stringify({
     status: passed ? "PASS" : "FAIL",
-    version,
+    version: preflight.receipt!.version,
     activePermissionProfile: profile.id,
     sandbox: profile.expected.sandbox,
     dynamicCalls,

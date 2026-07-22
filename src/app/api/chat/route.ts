@@ -24,14 +24,16 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
   }
   if (!text) return Response.json({ error: "empty" }, { status: 400 });
 
-  const credentials = controlCredentials(actor);
+  const credentials = actor.kind === "guest" ? { guestId: actor.guestId } : controlCredentials(actor);
   const messageId = await convexMutation("chatQueue:sendMessage", {
     threadId,
     text: text.slice(0, 12_000),
     requestId: requestId || undefined,
     ...credentials,
   });
-  const lease = await convexQuery("chatQueue:runnerLease", credentials).catch(() => null) as { updatedAt?: number } | null;
+  const lease = actor.kind === "guest"
+    ? null
+    : await convexQuery("chatQueue:runnerLease", credentials).catch(() => null) as { updatedAt?: number } | null;
   const warm = Boolean(lease?.updatedAt && Date.now() - lease.updatedAt < 25_000);
   const handle = warm ? null : await tasks
     .trigger(

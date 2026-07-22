@@ -497,7 +497,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     }));
     expect(await dispatch(f.t, 8, "stale-handoff-held")).toHaveLength(0);
     const catalogAttempts = await f.t.run(async (ctx) => {
-      const node = await ctx.db.query("goalPlanNodes").withIndex("by_parent_generation_node", (q) =>
+      const node = await ctx.db.query("goalPlanNodes").withIndex("by_parent_generation", (q) =>
         q.eq("parentMissionId", f.missionId).eq("planGeneration", 1).eq("nodeId", "catalog")).first();
       return node ? await ctx.db.query("workAttempts").withIndex("by_job_attempt", (q) => q.eq("jobId", node.jobId)).collect() : [];
     });
@@ -1796,5 +1796,99 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(repairJob?.workerBranch).not.toBe(integration.workerBranch);
     expect(rows.jobs.filter((job) => job.goalStage === "building")).toHaveLength(3);
     expect(rows.attempts.filter((attempt) => attempt.workerRunId?.startsWith("specialist"))).toHaveLength(2);
+  });
+
+  it("renews an output-quiet advance, recovers a lost wake, and fences stale plan replay", async () => {
+    const { t, missionId } = await goalAwaitingPlan();
+    const planner: any = await t.run(async (ctx) => (await ctx.db.query("jobs")
+      .withIndex("by_mission", (q) => q.eq("missionId", String(missionId))).collect())
+      .find((job) => job.goalStage === "planning"));
+    await t.run(async (ctx) => {
+      await ctx.db.patch(planner._id, { status: "done", result: "quiet planner result", completedAt: Date.now() });
+      const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", planner._id)).first();
+      if (runtime) await ctx.db.patch(runtime._id, { status: "done", active: false, completedAt: Date.now(), updatedAt: Date.now() });
+    });
+
+    // This is the crash/lost-wake backstop: durable terminal work remains
+    // demand even when no worker is currently processing the transition.
+    expect(await t.query(api.goalMode.coordinationDemand, { workerToken: TOKEN }))
+      .toMatchObject({ needed: true, reasons: [expect.stringContaining(`plan:${missionId}`)] });
+
+    const [left, right] = await Promise.all([
+      t.mutation(api.goalMode.claimAdvance, { advanceLeaseOwner: "worker-a", advanceLeaseToken: "token-a", workerToken: TOKEN }),
+      t.mutation(api.goalMode.claimAdvance, { advanceLeaseOwner: "worker-b", advanceLeaseToken: "token-b", workerToken: TOKEN }),
+    ]);
+    const first: any = left ?? right;
+    expect(first).toMatchObject({ kind: "plan", advanceLeaseVersion: 1 });
+    expect(["worker-a", "worker-b"]).toContain(first.advanceLeaseOwner);
+    expect(left && right).toBeFalsy();
+    const firstFence = {
+      advanceLeaseOwner: first.advanceLeaseOwner, advanceLeaseToken: first.advanceLeaseToken,
+      advanceLeaseVersion: first.advanceLeaseVersion,
+    };
+    expect(await t.mutation(api.goalMode.renewAdvance, {
+      id: missionId, expectedAdvanceAttempt: first.expectedAdvanceAttempt, ...firstFence, workerToken: TOKEN,
+    })).toBe(true);
+    expect(await t.mutation(api.goalMode.claimAdvance, {
+      advanceLeaseOwner: "worker-b", advanceLeaseToken: "token-b", workerToken: TOKEN,
+    })).toBeNull();
+
+    // Simulate a quiet worker dying after its last renewal. A fresh worker
+    // owns the expired lease; its predecessor can no longer write output.
+    await t.run(async (ctx) => {
+      await ctx.db.patch(missionId, { advanceLeaseUntil: Date.now() - 1 });
+      const runtime = await ctx.db.query("missionRuntime").withIndex("by_mission", (q) => q.eq("missionId", missionId)).first();
+      if (runtime) await ctx.db.patch(runtime._id, { advanceLeaseUntil: Date.now() - 1, updatedAt: Date.now() });
+    });
+    const recovered: any = await t.mutation(api.goalMode.claimAdvance, {
+      advanceLeaseOwner: "worker-b", advanceLeaseToken: "token-b", workerToken: TOKEN,
+    });
+    expect(recovered).toMatchObject({ kind: "plan", advanceLeaseOwner: "worker-b", advanceLeaseVersion: 2 });
+
+    const plan = {
+      summary: "Recoverable two-leaf plan", route: "existing_project", primaryRepo: REPO, assumptions: [],
+      workstreams: [
+        { id: "one", label: "One", task: "Implement one durable recovery assertion.", agentId: "paul", repo: REPO, readonly: false, dependsOn: [], acceptanceCriteria: ["one"], mcp: [] },
+        { id: "two", label: "Two", task: "Implement two durable recovery assertions.", agentId: "paul", repo: REPO, readonly: false, dependsOn: [], acceptanceCriteria: ["two"], mcp: [] },
+      ],
+      validation: { criteria: ["recovered"], tests: [], liveChecks: [] },
+    };
+    expect(await t.mutation(api.goalMode.recordPlan, {
+      id: missionId, expectedAdvanceAttempt: first.expectedAdvanceAttempt, ...firstFence, plan, workerToken: TOKEN,
+    })).toMatchObject({ advanced: false, stale: true });
+    const recoveredFence = {
+      advanceLeaseOwner: recovered.advanceLeaseOwner, advanceLeaseToken: recovered.advanceLeaseToken,
+      advanceLeaseVersion: recovered.advanceLeaseVersion,
+    };
+    expect(await t.mutation(api.goalMode.recordPlan, {
+      id: missionId, expectedAdvanceAttempt: recovered.expectedAdvanceAttempt, ...recoveredFence, plan, workerToken: TOKEN,
+    })).toMatchObject({ advanced: true, jobs: 2 });
+    // A crash after the write returns the same receipt without enqueuing a
+    // second graph; this is the only replay accepted after the lease closes.
+    expect(await t.mutation(api.goalMode.recordPlan, {
+      id: missionId, expectedAdvanceAttempt: recovered.expectedAdvanceAttempt, ...recoveredFence, plan, workerToken: TOKEN,
+    })).toMatchObject({ advanced: true, replay: true, jobs: 2 });
+    const builds = await t.run(async (ctx) => (await ctx.db.query("jobs")
+      .withIndex("by_mission", (q) => q.eq("missionId", String(missionId))).collect())
+      .filter((job) => job.goalStage === "building"));
+    expect(builds).toHaveLength(2);
+  });
+
+  it("recovers a needs-input leaf without pausing its independent sibling", async () => {
+    const f = await plannedGoal();
+    const [failed, sibling] = f.jobs;
+    await f.t.run(async (ctx) => {
+      await ctx.db.patch(failed._id, { status: "needs_input", progress: "worker stopped after a checkpoint", completedAt: Date.now() });
+      const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", failed._id)).first();
+      if (runtime) await ctx.db.patch(runtime._id, { status: "needs_input", active: true, updatedAt: Date.now() });
+    });
+    expect(await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN }))
+      .toMatchObject({ kind: "advanced", phase: "building_recovered" });
+    const state = await f.t.run(async (ctx) => ({
+      mission: await ctx.db.get(f.missionId), failed: await ctx.db.get(failed._id), sibling: await ctx.db.get(sibling._id),
+    }));
+    expect(state.mission).toMatchObject({ status: "running", phase: "building" });
+    expect(state.failed).toMatchObject({ status: "pending", attempt: 2, progress: "Goal Mode recovery queued" });
+    expect(state.sibling).toMatchObject({ status: "pending", attempt: 1 });
   });
 });

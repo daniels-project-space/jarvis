@@ -40,6 +40,29 @@ const ADVANCE_LEASE_MS = 10 * 60 * 1000;
 const COORDINATOR_RECEIPT_FRESH_MS = 10 * 60 * 1000;
 const TERMINAL = new Set(["done", "error", "cancelled"]);
 
+type AdvanceLeaseFence = {
+  advanceLeaseOwner?: string;
+  advanceLeaseToken?: string;
+  advanceLeaseVersion?: number;
+};
+
+// Older rows had only an expiry timestamp. Keep those rows recoverable, but
+// once a modern owner has claimed an advance every write must carry its exact
+// fence. An expired owner cannot turn a late model/external response into a
+// second plan or validation transition.
+function ownsAdvanceLease(mission: any, fence: AdvanceLeaseFence, now = Date.now(), requireFresh = true) {
+  if (!mission.advanceLeaseToken) return true;
+  return Boolean(
+    fence.advanceLeaseOwner &&
+    fence.advanceLeaseToken &&
+    Number.isFinite(fence.advanceLeaseVersion) &&
+    mission.advanceLeaseOwner === fence.advanceLeaseOwner &&
+    mission.advanceLeaseToken === fence.advanceLeaseToken &&
+    Number(mission.advanceLeaseVersion ?? 0) === Number(fence.advanceLeaseVersion) &&
+    (!requireFresh || Number(mission.advanceLeaseUntil ?? 0) >= now),
+  );
+}
+
 type GoalJobInput = {
   task: string;
   /** Internally-owned executable scope, excluding quoted goal/evidence context. */
@@ -841,7 +864,13 @@ async function blockGoalForPhaseFailure(ctx: any, mission: any, phaseJobs: any[]
 }
 
 export const claimAdvance = mutation({
-  args: { workerToken: v.optional(v.string()) },
+  args: {
+    // Trigger supplies a run-scoped owner/token. They are optional only to
+    // preserve recovery of pre-fence rows during a rolling deployment.
+    advanceLeaseOwner: v.optional(v.string()),
+    advanceLeaseToken: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
   handler: async (ctx, args) => {
     requireWorker(args.workerToken);
     const now = Date.now();
@@ -874,13 +903,21 @@ export const claimAdvance = mutation({
         ]);
         if (!mission || mission.status !== "running" || mission.phase !== "planning" || !planner || !TERMINAL.has(planner.status)) continue;
         if (planner.status !== "done") {
+          if (await recoverGoalPhaseLeaves(ctx, mission, [planner], "planning")) {
+            return { kind: "advanced", missionId: mission._id, phase: "planning_recovered" };
+          }
           await blockGoalForPhaseFailure(ctx, mission, [planner], "planning");
           continue;
         }
         if ((mission.advanceLeaseUntil ?? 0) > now) continue;
         const advanceAttempt = Number(mission.advanceAttempt ?? 0) + 1;
+        const advanceLeaseVersion = Number(mission.advanceLeaseVersion ?? 0) + 1;
         await patchMissionWithRuntime(ctx, mission, {
           advanceAttempt,
+          advanceLeaseOwner: args.advanceLeaseOwner?.slice(0, 160),
+          advanceLeaseToken: args.advanceLeaseToken?.slice(0, 240),
+          advanceLeaseVersion,
+          advanceLeaseHeartbeatAt: now,
           advanceLeaseUntil: now + ADVANCE_LEASE_MS,
           updatedAt: now,
         });
@@ -894,6 +931,9 @@ export const claimAdvance = mutation({
           primaryRepo: mission.primaryRepo,
           infrastructureContext: mission.infrastructureContext,
           expectedAdvanceAttempt: advanceAttempt,
+          advanceLeaseOwner: args.advanceLeaseOwner,
+          advanceLeaseToken: args.advanceLeaseToken,
+          advanceLeaseVersion,
           maxBuildSessions: mission.maxBuildSessions ?? 6,
         };
       }
@@ -910,6 +950,9 @@ export const claimAdvance = mutation({
         const phaseJobs = activeStageJobs(jobs, mission);
         const authoritativeState = summarizeGoalPhase(phaseJobs);
         if (authoritativeState.state === "blocked") {
+          if (await recoverGoalPhaseLeaves(ctx, mission, phaseJobs, mission.phase)) {
+            return { kind: "advanced", missionId: mission._id, phase: `${mission.phase}_recovered` };
+          }
           await blockGoalForPhaseFailure(ctx, mission, phaseJobs, mission.phase);
           return { kind: "advanced", missionId: mission._id, phase: "blocked" };
         }
@@ -933,13 +976,21 @@ export const claimAdvance = mutation({
         ]);
         if (!mission || mission.status !== "running" || mission.phase !== "validating" || !validator || !TERMINAL.has(validator.status)) continue;
         if (validator.status !== "done") {
+          if (await recoverGoalPhaseLeaves(ctx, mission, [validator], "validating")) {
+            return { kind: "advanced", missionId: mission._id, phase: "validation_recovered" };
+          }
           await blockGoalForPhaseFailure(ctx, mission, [validator], "validating");
           continue;
         }
         if ((mission.advanceLeaseUntil ?? 0) > now) continue;
         const advanceAttempt = Number(mission.advanceAttempt ?? 0) + 1;
+        const advanceLeaseVersion = Number(mission.advanceLeaseVersion ?? 0) + 1;
         await patchMissionWithRuntime(ctx, mission, {
           advanceAttempt,
+          advanceLeaseOwner: args.advanceLeaseOwner?.slice(0, 160),
+          advanceLeaseToken: args.advanceLeaseToken?.slice(0, 240),
+          advanceLeaseVersion,
+          advanceLeaseHeartbeatAt: now,
           advanceLeaseUntil: now + ADVANCE_LEASE_MS,
           updatedAt: now,
         });
@@ -949,6 +1000,9 @@ export const claimAdvance = mutation({
           jobId: validator._id,
           result: String(validator.result ?? ""),
           expectedAdvanceAttempt: advanceAttempt,
+          advanceLeaseOwner: args.advanceLeaseOwner,
+          advanceLeaseToken: args.advanceLeaseToken,
+          advanceLeaseVersion,
           externalKind: mission.externalKind,
           externalRunId: mission.externalRunId,
           revisionWave: Number(mission.revisionWave ?? 0),
@@ -964,6 +1018,9 @@ export const recordPlan = mutation({
   args: {
     id: v.id("missions"),
     expectedAdvanceAttempt: v.number(),
+    advanceLeaseOwner: v.optional(v.string()),
+    advanceLeaseToken: v.optional(v.string()),
+    advanceLeaseVersion: v.optional(v.number()),
     plan: v.any(),
     externalRun: v.optional(v.object({ kind: v.string(), id: v.string(), slug: v.optional(v.string()) })),
     workerToken: v.optional(v.string()),
@@ -974,6 +1031,10 @@ export const recordPlan = mutation({
     const maxNodes = Math.min(GOAL_DAG_MAX_NODES, Number(mission?.maxBuildSessions ?? 6));
     const accepted = mission ? await acceptedPlan(args.plan as GoalPlan, maxNodes) : null;
     if (mission?.planDigest) {
+      // A completed plan's exact fingerprint is safe to acknowledge again
+      // after a crash; it has no remaining side effect. Still require the
+      // original owner/version so an unrelated stale worker cannot probe it.
+      if (!ownsAdvanceLease(mission, args, Date.now(), false)) return { advanced: false, stale: true };
       if (!accepted || mission.planDigest !== accepted.digest) return { advanced: false, stale: true, conflict: true };
       const nodes = await ctx.db.query("goalPlanNodes")
         .withIndex("by_parent_generation", (q: any) => q.eq("parentMissionId", mission._id)
@@ -991,7 +1052,7 @@ export const recordPlan = mutation({
     }
     if (
       !mission || mission.mode !== "goal" || mission.status !== "running" || mission.phase !== "planning" ||
-      Number(mission.advanceAttempt ?? 0) !== args.expectedAdvanceAttempt
+      Number(mission.advanceAttempt ?? 0) !== args.expectedAdvanceAttempt || !ownsAdvanceLease(mission, args)
     ) return { advanced: false, stale: true };
     const { plan, digest: planDigest } = accepted!;
     const planGeneration = 1;
@@ -1263,6 +1324,9 @@ export const rejectAdvance = mutation({
     id: v.id("missions"),
     jobId: v.id("jobs"),
     expectedAdvanceAttempt: v.number(),
+    advanceLeaseOwner: v.optional(v.string()),
+    advanceLeaseToken: v.optional(v.string()),
+    advanceLeaseVersion: v.optional(v.number()),
     error: v.string(),
     workerToken: v.optional(v.string()),
   },
@@ -1273,6 +1337,7 @@ export const rejectAdvance = mutation({
     if (
       !mission || mission.mode !== "goal" || mission.status !== "running" ||
       Number(mission.advanceAttempt ?? 0) !== args.expectedAdvanceAttempt ||
+      !ownsAdvanceLease(mission, args) ||
       !job || job.missionId !== String(args.id) || job.status !== "done"
     ) return { requeued: false, stale: true };
     const nextAttempt = Number(job.attempt ?? 1) + 1;
@@ -1315,6 +1380,9 @@ export const releaseAdvance = mutation({
   args: {
     id: v.id("missions"),
     expectedAdvanceAttempt: v.number(),
+    advanceLeaseOwner: v.optional(v.string()),
+    advanceLeaseToken: v.optional(v.string()),
+    advanceLeaseVersion: v.optional(v.number()),
     error: v.string(),
     delayMs: v.optional(v.number()),
     workerToken: v.optional(v.string()),
@@ -1322,12 +1390,41 @@ export const releaseAdvance = mutation({
   handler: async (ctx, args) => {
     requireWorker(args.workerToken);
     const mission = await ctx.db.get(args.id);
-    if (!mission || mission.mode !== "goal" || Number(mission.advanceAttempt ?? 0) !== args.expectedAdvanceAttempt) return false;
+    if (!mission || mission.mode !== "goal" || Number(mission.advanceAttempt ?? 0) !== args.expectedAdvanceAttempt || !ownsAdvanceLease(mission, args)) return false;
     const delay = Math.max(10_000, Math.min(30 * 60_000, args.delayMs ?? 60_000));
     await patchMissionWithRuntime(ctx, mission, {
       advanceLeaseUntil: Date.now() + delay,
+      advanceLeaseHeartbeatAt: Date.now(),
       failureReason: `Temporary Goal Mode integration error: ${args.error.slice(0, 800)}`,
       updatedAt: Date.now(),
+    });
+    return true;
+  },
+});
+
+// Renewal deliberately accepts no model output. A long parse, provider poll,
+// or idempotent external create therefore keeps the exact claim alive even
+// while it has nothing new to report. Late writers are fenced by the version.
+export const renewAdvance = mutation({
+  args: {
+    id: v.id("missions"),
+    expectedAdvanceAttempt: v.number(),
+    advanceLeaseOwner: v.string(),
+    advanceLeaseToken: v.string(),
+    advanceLeaseVersion: v.number(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const mission = await ctx.db.get(args.id);
+    const now = Date.now();
+    if (!mission || mission.mode !== "goal" || Number(mission.advanceAttempt ?? 0) !== args.expectedAdvanceAttempt || !ownsAdvanceLease(mission, args, now)) {
+      return false;
+    }
+    await patchMissionWithRuntime(ctx, mission, {
+      advanceLeaseUntil: now + ADVANCE_LEASE_MS,
+      advanceLeaseHeartbeatAt: now,
+      updatedAt: now,
     });
     return true;
   },
@@ -1447,6 +1544,9 @@ export const recordValidation = mutation({
   args: {
     id: v.id("missions"),
     expectedAdvanceAttempt: v.number(),
+    advanceLeaseOwner: v.optional(v.string()),
+    advanceLeaseToken: v.optional(v.string()),
+    advanceLeaseVersion: v.optional(v.number()),
     validation: v.any(),
     workerToken: v.optional(v.string()),
   },
@@ -1455,7 +1555,7 @@ export const recordValidation = mutation({
     const mission = await ctx.db.get(args.id);
     if (
       !mission || mission.mode !== "goal" || mission.status !== "running" || mission.phase !== "validating" ||
-      Number(mission.advanceAttempt ?? 0) !== args.expectedAdvanceAttempt
+      Number(mission.advanceAttempt ?? 0) !== args.expectedAdvanceAttempt || !ownsAdvanceLease(mission, args)
     ) return { advanced: false, stale: true };
     const validation = args.validation as GoalValidation;
     const now = Date.now();
@@ -1964,7 +2064,7 @@ export const recordExternalPollFailure = mutation({
   },
 });
 
-async function resetGoalJob(ctx: any, job: any, now: number, force = false) {
+async function resetGoalJob(ctx: any, job: any, now: number, force = false, extendAttemptBudget = true) {
   if (!force && !["error", "cancelled", "paused"].includes(job.status)) return false;
   if (job.status === "running") return false;
   if (job.verificationVerdict === "pass" && job.reviewReceiptId && job.integrationAttemptId) {
@@ -2025,7 +2125,9 @@ async function resetGoalJob(ctx: any, job: any, now: number, force = false) {
     ].filter(Boolean).join("\n\n").slice(0, 6000),
     result: undefined,
     attempt: nextAttempt,
-    maxAttempts: Math.min(48, Math.max(Number(job.maxAttempts ?? 12), nextAttempt + 4)),
+    maxAttempts: extendAttemptBudget
+      ? Math.min(48, Math.max(Number(job.maxAttempts ?? 12), nextAttempt + 4))
+      : Number(job.maxAttempts ?? 12),
     approvalStatus: awaitingApproval ? "pending" : job.approvalStatus,
     completedAt: undefined,
     startedAt: undefined,
@@ -2035,6 +2137,33 @@ async function resetGoalJob(ctx: any, job: any, now: number, force = false) {
     verificationNote: undefined,
     verifiedAt: undefined,
   });
+  return true;
+}
+
+// A worker crash, stale provider result, or lost Trigger wake is not an
+// operator decision. Recover bounded terminal leaves in place and preserve
+// independent siblings; only an exhausted leaf can turn the parent into a
+// genuine attention state. Manual resume still uses resetGoalJob's extensible
+// budget, while autonomous recovery cannot grow its own retry ceiling.
+async function recoverGoalPhaseLeaves(ctx: any, mission: any, phaseJobs: any[], phase: string) {
+  const now = Date.now();
+  const candidates = phaseJobs.filter((job: any) => ["error", "cancelled", "needs_input"].includes(job.status));
+  const recoverable = candidates.filter((job: any) => Number(job.attempt ?? 1) < Number(job.maxAttempts ?? 12));
+  if (!recoverable.length) return false;
+  const recovered: string[] = [];
+  for (const job of recoverable) {
+    if (await resetGoalJob(ctx, job, now, true, false)) recovered.push(String(job._id));
+  }
+  if (!recovered.length) return false;
+  await patchMissionWithRuntime(ctx, mission, {
+    status: "running", phase, pausedPhase: undefined, failureReason: undefined,
+    advanceLeaseUntil: undefined, advanceLeaseOwner: undefined, advanceLeaseToken: undefined,
+    advanceLeaseHeartbeatAt: undefined, updatedAt: now,
+  });
+  await resolveGoalAttention(ctx, mission._id);
+  await recordMissionEvent(ctx, String(mission._id), "goal_leaf_recovered",
+    `Recovered ${recovered.length} terminal Goal Mode ${recovered.length === 1 ? "leaf" : "leaves"} without pausing independent siblings`,
+    phase, mission.percent, { jobIds: recovered, phase });
   return true;
 }
 

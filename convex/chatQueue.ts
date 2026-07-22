@@ -1,7 +1,15 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
-import { actorAuthArgs, requireActor, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
+import {
+  actorAuthArgs,
+  conversationIdentity,
+  conversationViewerIdentity,
+  requireActor,
+  requireWorker,
+  scopedConversationThread,
+  viewerAuthArgs,
+} from "./controlAuth";
 
 const HOST_CONTEXT_BLOCK = /\s*\[JARVIS_HOST_CONTEXT\][\s\S]*?\[\/JARVIS_HOST_CONTEXT\]\s*/g;
 const visibleTurnText = (text: string) => text.replace(HOST_CONTEXT_BLOCK, " ").replace(/\s{2,}/g, " ").trim();
@@ -33,8 +41,8 @@ export const sendMessage = mutation({
     ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
-    await requireActor(ctx, a);
-    const threadId = a.threadId ?? "main";
+    const identity = await conversationIdentity(ctx, a);
+    const threadId = scopedConversationThread(identity, a.threadId);
     if (a.requestId) {
       const prior = await ctx.db
         .query("chatMessages")
@@ -63,8 +71,8 @@ export const sendMessage = mutation({
 export const listMessages = query({
   args: { threadId: v.optional(v.string()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
-    await requireViewer(ctx, a);
-    const threadId = a.threadId ?? "main";
+    const identity = await conversationViewerIdentity(ctx, a);
+    const threadId = scopedConversationThread(identity, a.threadId);
     const rows = await ctx.db
       .query("chatMessages")
       .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
@@ -84,10 +92,10 @@ export const HISTORY_PAGE_MAX = 20;
 export const paginatedMessages = query({
   args: { threadId: v.optional(v.string()), paginationOpts: paginationOptsValidator, ...viewerAuthArgs },
   handler: async (ctx, a) => {
-    await requireViewer(ctx, a);
+    const identity = await conversationViewerIdentity(ctx, a);
     return await ctx.db
       .query("chatMessages")
-      .withIndex("by_thread", (q: any) => q.eq("threadId", a.threadId ?? "main"))
+      .withIndex("by_thread", (q: any) => q.eq("threadId", scopedConversationThread(identity, a.threadId)))
       .order("desc")
       .paginate({
         ...a.paginationOpts,
@@ -104,10 +112,10 @@ export const paginatedMessages = query({
 export const listRecentMessages = query({
   args: { threadId: v.optional(v.string()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
-    await requireViewer(ctx, a);
+    const identity = await conversationViewerIdentity(ctx, a);
     const rows = await ctx.db
       .query("chatMessages")
-      .withIndex("by_thread", (q: any) => q.eq("threadId", a.threadId ?? "main"))
+      .withIndex("by_thread", (q: any) => q.eq("threadId", scopedConversationThread(identity, a.threadId)))
       .order("desc")
       .take(8);
     return rows.reverse();
@@ -117,8 +125,8 @@ export const listRecentMessages = query({
 export const sessionState = query({
   args: { threadId: v.optional(v.string()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
-    await requireViewer(ctx, a);
-    const threadId = a.threadId ?? "main";
+    const identity = await conversationViewerIdentity(ctx, a);
+    const threadId = scopedConversationThread(identity, a.threadId);
     return await ctx.db
       .query("chatSessions")
       .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
@@ -158,9 +166,9 @@ export const logTurn = mutation({
     ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
-    await requireActor(ctx, a);
+    const identity = await conversationIdentity(ctx, a);
     await ctx.db.insert("chatMessages", {
-      threadId: a.threadId ?? "main",
+      threadId: scopedConversationThread(identity, a.threadId),
       role: a.role,
       text: a.text,
       status: "done",
@@ -211,6 +219,7 @@ async function claimPending(ctx: { db: any }, pending: any) {
 
     return {
       threadId: pending.threadId,
+      guest: pending.threadId.startsWith("guest:"),
       userText: pending.text,
       assistantId,
       history,

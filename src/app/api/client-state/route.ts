@@ -1,11 +1,10 @@
 import type { NextRequest } from "next/server";
 import { controlMutation } from "@/lib/control-session";
-import { controlActor, controlCredentials } from "@/lib/request-auth";
+import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
 
 export async function POST(req: NextRequest) {
   const actor = await controlActor(req);
   if (!actor) return Response.json({ ok: false }, { status: 401 });
-  const credentials = controlCredentials(actor);
   const body = await req.json().catch(() => ({}));
   const action = String(body?.action ?? "");
 
@@ -18,10 +17,13 @@ export async function POST(req: NextRequest) {
       role,
       text,
       model: body?.model ? String(body.model) : undefined,
-      ...credentials,
+      ...(isOwnerActor(actor) ? controlCredentials(actor) : { guestId: actor.guestId }),
     });
     return Response.json({ ok: true });
   }
+
+  if (!isOwnerActor(actor)) return Response.json({ ok: false, error: "owner enrollment required" }, { status: 403 });
+  const credentials = controlCredentials(actor);
 
   if (action === "clear_thread") {
     const count = await controlMutation("chatQueue:clearThread", {

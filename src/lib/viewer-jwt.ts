@@ -5,6 +5,11 @@ export const VIEWER_ISSUER = "https://jarvis-orcin-six.vercel.app";
 export const VIEWER_AUDIENCE = "jarvis-convex";
 export const VIEWER_SUBJECT = "daniel-owner";
 export const VIEWER_TOKEN_SECONDS = 6 * 60 * 60;
+export const GUEST_SUBJECT_PREFIX = "jarvis-guest:";
+
+export type BrowserIdentity =
+  | { kind: "owner" }
+  | { kind: "guest"; guestId: string };
 
 let signingKey: Promise<CryptoKey> | null = null;
 let verificationKey: Promise<CryptoKey> | null = null;
@@ -41,15 +46,19 @@ async function getVerificationKey(): Promise<CryptoKey> {
   return await verificationKey;
 }
 
-export async function issueViewerToken(nowMs = Date.now()): Promise<{ token: string; expiresAt: number }> {
+export async function issueViewerToken(
+  identity: BrowserIdentity = { kind: "owner" },
+  nowMs = Date.now(),
+): Promise<{ token: string; expiresAt: number }> {
   const issuedAt = Math.floor(nowMs / 1000);
   const expiresAtSeconds = issuedAt + VIEWER_TOKEN_SECONDS;
   const jwk = configuredJwk();
-  const token = await new SignJWT({ role: "viewer", project: "jarvis" })
+  const subject = identity.kind === "owner" ? VIEWER_SUBJECT : `${GUEST_SUBJECT_PREFIX}${identity.guestId}`;
+  const token = await new SignJWT({ role: identity.kind, project: "jarvis" })
     .setProtectedHeader({ alg: "ES256", typ: "JWT", kid: String(jwk.kid ?? "jarvis-viewer") })
     .setIssuer(VIEWER_ISSUER)
     .setAudience(VIEWER_AUDIENCE)
-    .setSubject(VIEWER_SUBJECT)
+    .setSubject(subject)
     .setIssuedAt(issuedAt)
     .setExpirationTime(expiresAtSeconds)
     .sign(await getSigningKey());
@@ -62,18 +71,27 @@ export async function issueViewerToken(nowMs = Date.now()): Promise<{ token: str
  * identity also authenticates Jarvis's same-origin API calls without exposing
  * an admin cookie or a worker capability to the browser.
  */
-export async function verifyViewerToken(token: string | null | undefined, nowMs = Date.now()): Promise<boolean> {
-  if (!token) return false;
+export async function verifyViewerToken(token: string | null | undefined, nowMs = Date.now()): Promise<BrowserIdentity | null> {
+  if (!token) return null;
   try {
     const { payload } = await jwtVerify(token, await getVerificationKey(), {
       algorithms: ["ES256"],
       issuer: VIEWER_ISSUER,
       audience: VIEWER_AUDIENCE,
-      subject: VIEWER_SUBJECT,
       currentDate: new Date(nowMs),
     });
-    return payload.role === "viewer" && payload.project === "jarvis";
+    if (payload.project !== "jarvis") return null;
+    if (payload.role === "owner" && payload.sub === VIEWER_SUBJECT) return { kind: "owner" };
+    if (
+      payload.role === "guest"
+      && typeof payload.sub === "string"
+      && payload.sub.startsWith(GUEST_SUBJECT_PREFIX)
+    ) {
+      const guestId = payload.sub.slice(GUEST_SUBJECT_PREFIX.length);
+      if (/^[A-Za-z0-9_-]{32,128}$/.test(guestId)) return { kind: "guest", guestId };
+    }
+    return null;
   } catch {
-    return false;
+    return null;
   }
 }

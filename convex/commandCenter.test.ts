@@ -55,6 +55,7 @@ describe("commandCenter relevance and bounded projection", () => {
     { label: "nightly cron job" },
     { task: "background monitor sweep" },
     { agentId: "execution reaper" },
+    { status: "pending", dependsOn: ["upstream-job"] },
     { visibility: "system" },
     { originThreadId: "another-thread" },
   ])("excludes routine or out-of-thread work %#", (overrides) => {

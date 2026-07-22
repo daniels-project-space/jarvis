@@ -1,7 +1,7 @@
 import { auth } from "@trigger.dev/sdk/v3";
 import type { NextRequest } from "next/server";
 import { controlQuery } from "@/lib/control-session";
-import { controlActor, controlCredentials } from "@/lib/request-auth";
+import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
 
 export const runtime = "nodejs";
 
@@ -11,6 +11,7 @@ export const runtime = "nodejs";
 export async function POST(req: NextRequest) {
   const actor = await controlActor(req);
   if (!actor) return Response.json({ ok: false }, { status: 401 });
+  if (!isOwnerActor(actor)) return Response.json({ ok: false, error: "owner enrollment required" }, { status: 403 });
   const body = await req.json().catch(() => ({}));
   const jobId = String(body?.jobId ?? "");
   if (!jobId) return Response.json({ ok: false }, { status: 400 });
