@@ -9,6 +9,7 @@ import { SHALLOW_PROVENANCE_RULE } from "./git-delivery";
 import { workModelLabel, workModelPriority } from "./work-models";
 import { exactTextWorkOrder } from "./work-order";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
+import { createICloudEvent, deleteICloudEvent, findICloudEvents, listICloudEvents } from "./icloud-calendar";
 import {
   VISUAL_BLOCK_KINDS,
   VISUAL_CAPABILITIES,
@@ -471,7 +472,7 @@ export const TOOL_DEFS = [
   {
     name: "calendar_add",
     description:
-      "ACTUALLY add an event to Daniel's real calendar on the project hub. Use for ANY 'put X in my calendar / schedule / I have a meeting'. Never claim an event was added without calling this. Times are Europe/London.",
+      "ACTUALLY add an event, schedule or calendar reminder to Daniel's live iCloud Calendar. Use for ANY 'put X in my calendar / schedule / I have a meeting'. Never claim an event was added without calling this. Times are Europe/London.",
     parameters: {
       type: "object",
       properties: {
@@ -481,19 +482,20 @@ export const TOOL_DEFS = [
         end_time: { type: "string", description: "HH:MM if he gave one" },
         location: { type: "string" },
         notes: { type: "string" },
+        reminder_minutes_before: { type: "number", description: "Optional iCloud Calendar alert, in minutes before the event" },
       },
       required: ["title", "date"],
     },
   },
   {
     name: "calendar_remove",
-    description: "Delete an event from Daniel's hub calendar. Pass a few words from its title.",
+    description: "Delete an event from Daniel's live iCloud Calendar. Pass a few words from its title.",
     parameters: { type: "object", properties: { match: { type: "string" } }, required: ["match"] },
   },
   {
     name: "calendar_view",
     description:
-      "Show Daniel's calendar as a beautiful visual widget: his hub events PLUS rental pickups/returns merged, as a day plan, week, or month view. Use for 'what's my day/week/month look like', 'show my calendar', 'what's on Friday'.",
+      "Read Daniel's live iCloud Calendar and show it as a beautiful visual widget, merged with legacy hub events and rental pickups/returns, as a day plan, week, or month view. Use for 'what's my day/week/month look like', 'show my calendar', 'what's on Friday'.",
     parameters: {
       type: "object",
       properties: {
@@ -1668,11 +1670,12 @@ async function cryptoSparks(): Promise<Record<string, number[]>> {
 
 async function briefingWidget(): Promise<string> {
   const today = new Date().toISOString().slice(0, 10);
-  const [w, strip, todos, events, wealth, markets, sparks] = await Promise.all([
+  const [w, strip, todos, events, iCloudEvents, wealth, markets, sparks] = await Promise.all([
     fetchWeatherData("London").catch(() => null),
     rentalQuery("calendar:getCalendarStrip", { accountSlug: null, startDate: today, days: 1 }),
     q_hub("todos:list"),
     q_hub("events:list"),
+    listICloudEvents(Date.now() - 60_000, Date.now() + 14 * 86_400_000).catch(() => []),
     q_hub("wealth:getWealth"),
     fetchMarketData(["bitcoin", "ethereum"], ["GC=F"]).catch(() => []),
     cryptoSparks(),
@@ -1699,7 +1702,10 @@ async function briefingWidget(): Promise<string> {
       why: todo.dueAt ? "due soon" : todo.priority ? "high priority" : "open next action",
     }));
   const now = Date.now();
-  const upcoming = (Array.isArray(events) ? events : []).filter((e: any) => (e.start ?? 0) >= now).sort((a: any, b: any) => a.start - b.start).slice(0, 4);
+  const upcoming = [...(Array.isArray(events) ? events : []), ...iCloudEvents]
+    .filter((e: any) => (e.start ?? 0) >= now)
+    .sort((a: any, b: any) => a.start - b.start)
+    .slice(0, 4);
   const widget = {
     kind: "briefing2",
     date: new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" }),
@@ -1811,34 +1817,50 @@ async function calendarAdd(args: any): Promise<string> {
   const title = String(args.title ?? "").trim();
   const date = String(args.date ?? "");
   if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return "I need a title and a date (YYYY-MM-DD).";
+  if (args.time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(args.time))) return "I need the start time as HH:MM (24-hour).";
+  if (args.end_time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(args.end_time))) return "I need the end time as HH:MM (24-hour).";
   const allDay = !args.time;
   const start = londonMs(date, args.time ? String(args.time) : "09:00");
-  const end = args.end_time ? londonMs(date, String(args.end_time)) : undefined;
-  await m_hub("events:create", {
+  let end = args.end_time ? londonMs(date, String(args.end_time)) : undefined;
+  if (end && end <= start) end += 86_400_000;
+  const reminderMinutesBefore = Number(args.reminder_minutes_before);
+  if (args.reminder_minutes_before != null && (!Number.isFinite(reminderMinutesBefore) || reminderMinutesBefore <= 0))
+    return "The calendar alert needs to be a positive number of minutes before the event.";
+  await createICloudEvent({
     title: title.slice(0, 140),
     start,
     end,
     allDay,
-    color: "brass",
     location: args.location ? String(args.location).slice(0, 140) : undefined,
     notes: args.notes ? String(args.notes).slice(0, 500) : undefined,
+    reminderMinutesBefore: reminderMinutesBefore || undefined,
   });
-  return `In the calendar: "${title}" on ${date}${args.time ? ` at ${args.time}` : " (all day)"}. It'll show in briefings too. Confirm casually in one line.`;
+  return `In iCloud Calendar: "${title}" on ${date}${args.time ? ` at ${args.time}` : " (all day)"}${reminderMinutesBefore ? `, with an alert ${Math.round(reminderMinutesBefore)} minutes before` : ""}. It is live in the overlay and briefings. Confirm casually in one line.`;
 }
 
 async function calendarRemove(args: any): Promise<string> {
-  const events: any[] = (await q_hub("events:list")) ?? [];
   const m = String(args.match ?? "").toLowerCase().trim();
-  const hits = events.filter((e: any) => String(e.title).toLowerCase().includes(m));
+  if (!m) return "Which calendar event should I remove?";
+  const [iCloudEvents, legacyEvents] = await Promise.all([
+    findICloudEvents(m, Date.now() - 86_400_000, Date.now() + 366 * 86_400_000),
+    q_hub("events:list"),
+  ]);
+  const hits = [
+    ...iCloudEvents.map((event) => ({ ...event, storage: "icloud" as const })),
+    ...(Array.isArray(legacyEvents) ? legacyEvents : [])
+      .filter((event: any) => String(event.title).toLowerCase().includes(m))
+      .map((event: any) => ({ ...event, storage: "hub" as const })),
+  ];
   if (hits.length === 0) return `No event matches "${args.match}".`;
   if (hits.length > 1)
     return `Several events match: ${hits.slice(0, 5).map((e: any) => `"${e.title}" (${londonDateStr(e.start)})`).join(", ")} — ask which.`;
-  await m_hub("events:remove", { id: hits[0]._id });
-  return `Deleted "${hits[0].title}" from the calendar.`;
+  if (hits[0].storage === "icloud") await deleteICloudEvent(hits[0].eventUrl);
+  else await m_hub("events:remove", { id: hits[0]._id });
+  return `Deleted "${hits[0].title}" from ${hits[0].storage === "icloud" ? "iCloud Calendar" : "the legacy hub calendar"}.`;
 }
 
-// The frosted-glass calendar widget: hub events + rental pickups/returns in
-// one day / week / month view.
+// The frosted-glass calendar widget: live iCloud events + legacy hub events +
+// rental pickups/returns in one day / week / month view.
 async function calendarView(args: any): Promise<string> {
   const view = ["day", "week", "month"].includes(String(args.view)) ? String(args.view) : "week";
   const anchor = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date ?? "")) ? String(args.date) : londonDateStr(Date.now());
@@ -1861,18 +1883,20 @@ async function calendarView(args: any): Promise<string> {
     count = Math.ceil((dow + daysInMonth) / 7) * 7;
   }
   const stripStart = londonDateStr(startMs);
-  const [events, strip] = await Promise.all([
+  const [events, iCloudEvents, strip] = await Promise.all([
     q_hub("events:list"),
+    listICloudEvents(startMs, startMs + count * DAY).catch(() => []),
     rentalQuery("calendar:getCalendarStrip", { accountSlug: null, startDate: stripStart, days: Math.min(count, 30) }),
   ]);
   const byDate: Record<string, any[]> = {};
-  for (const e of Array.isArray(events) ? events : []) {
+  for (const e of [...(Array.isArray(events) ? events : []), ...iCloudEvents]) {
     const d = londonDateStr(e.start);
     (byDate[d] ??= []).push({
       title: String(e.title).slice(0, 60),
       time: e.allDay ? "" : londonTimeStr(e.start),
       kind: "event",
       location: e.location ? String(e.location).slice(0, 40) : undefined,
+      source: e.source === "icloud" ? "iCloud" : "hub",
     });
   }
   const short = (s: string) => String(s || "").split(/[|,]/)[0].split(/\s+/).slice(0, 3).join(" ");
