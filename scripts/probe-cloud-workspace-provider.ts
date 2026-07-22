@@ -27,6 +27,7 @@ import {
   issueAfterExactRemoteCancellation,
   probeExactRemoteCancellation,
 } from "../src/trigger/cloud-provider-cancellation-probe";
+import { issueAfterFreshAuthenticatedVercelHobbyTeamObservation } from "./vercel-hobby-team-observation";
 
 const LIVE_OPT_IN = "JARVIS_CLOUD_PROVIDER_PROBE=live";
 
@@ -131,17 +132,10 @@ async function inspectVercelConfiguration(workspace: CloudWorkspace): Promise<{ 
   }
   if (!complete) throw new Error("Vercel Sandbox history completeness could not be proved");
   if (!named) throw new Error("exact named Vercel Sandbox was absent from provider list observation");
-  // The Sandbox API does not expose authoritative team/project plan or spend
-  // caps. The caller completes the safe lifecycle observation, then fails
-  // before it can construct a Vercel receipt from an assumption.
+  // The Sandbox API does not expose authoritative team plan or spend state.
+  // The caller observes that separately through Vercel's authenticated Team
+  // API after completing the safe sandbox lifecycle.
   return { ttlMs: detail.expiresAt.getTime() - detail.createdAt.getTime(), observedMemory: detail.memory };
-}
-
-function requireAuthoritativeVercelPlanAndSpendObservation(): never {
-  // @vercel/sandbox 2.8.0 has no authoritative team/project plan or spend-cap
-  // endpoint. Do not synthesize this proof from a configured cap, billing plan,
-  // or controller active-attempt count.
-  throw new Error("Vercel plan and spend-cap state is not authoritatively observable; activation remains blocked pending Daniel's compliant-plan and spend-cap decision");
 }
 
 async function main() {
@@ -255,12 +249,6 @@ async function main() {
     await provider.terminate(recreated, "terminal");
     recreated = null;
 
-    // Vercel's required plan/spend evidence is unavailable through an
-    // authoritative provider API. This is intentionally after the bounded
-    // provider exercise so it remains useful operational evidence, but before
-    // receipt construction: no quota proof is ever optimistic.
-    if (binding.provider === "vercel") requireAuthoritativeVercelPlanAndSpendObservation();
-
     const probeTime = Date.now();
     const receipt: CloudProviderProbeReceipt = {
       schemaVersion: 1,
@@ -282,7 +270,17 @@ async function main() {
       runId,
       nonce: randomBytes(24).toString("base64url"),
     };
-    const envelope = issueAfterExactRemoteCancellation(cancellationEvidence, () => authority.issue(receipt));
+    const issueReceipt = () => issueAfterExactRemoteCancellation(cancellationEvidence, () => authority.issue(receipt));
+    // This fresh provider-team read remains after the entire lifecycle probe.
+    // Its callback makes signing unreachable for paid, unknown, malformed,
+    // mismatched, cached/redirected, or unavailable team observations.
+    const envelope = binding.provider === "vercel"
+      ? await issueAfterFreshAuthenticatedVercelHobbyTeamObservation({
+        teamId: process.env.VERCEL_TEAM_ID!,
+        token: process.env.VERCEL_TOKEN!,
+        issue: issueReceipt,
+      })
+      : issueReceipt();
     console.log(JSON.stringify({ status: "PASS", envelope }));
   } catch {
     if (recreated) await provider.terminate(recreated, "orphan").catch(() => undefined);
