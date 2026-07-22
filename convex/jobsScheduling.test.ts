@@ -3,9 +3,12 @@ import { convexTest, type TestConvex } from "convex-test";
 import { api } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 import schema from "./schema";
+import { projectedDispatchCandidates } from "./jobs";
 import {
   BACKGROUND_CONCURRENCY_LIMIT,
+  DISPATCH_CANDIDATE_WINDOW_MAX,
   MAX_ACTIVE_PER_WORK_GROUP,
+  SCHEDULING_PROTOCOL_VERSION,
   workGroupAuthority,
 } from "../src/lib/work-scheduler";
 
@@ -63,6 +66,61 @@ async function finishReservations(t: SchedulerTest, reservations: Array<{ jobId:
 }
 
 describe("project-group fair reservation authority", () => {
+  it("selects a 96-row window using only bounded compact projections before authority validation", async () => {
+    const rows = Array.from({ length: DISPATCH_CANDIDATE_WINDOW_MAX }, (_, index) => {
+      const jobId = `job-${index}`;
+      const missionId = `mission-${index % 12}`;
+      const authority = workGroupAuthority({ jobId, missionId });
+      return {
+        jobId, missionId, task: "compact", status: "pending", priority: 50,
+        stage: "queued", percent: 0, attempt: 1, maxAttempts: 12,
+        heartbeatAt: 1, createdAt: index + 1, updatedAt: index + 1, nextRunAt: 1,
+        readonly: true, workspaceLineage: `sandbox:${jobId}:lineage:1`,
+        retryLineage: `job:${jobId}:lineage:1`, ...authority,
+        schedulingProtocolVersion: SCHEDULING_PROTOCOL_VERSION,
+        schedulingAdmissionId: `admission-${index}`,
+        schedulingBindingDigest: "a".repeat(64), schedulingBound: true, dispatchReady: true,
+      };
+    });
+    const reads: Array<{ table: string; index?: string; limit?: number; order?: string }> = [];
+    const ctx = {
+      db: {
+        get: async () => { throw new Error("candidate selection must not point-read durable authority"); },
+        query(table: string) {
+          const read: { table: string; index?: string; limit?: number; order?: string } = { table };
+          reads.push(read);
+          const builder = {
+            withIndex(index: string, apply?: (q: any) => unknown) {
+              read.index = index;
+              const q: any = { eq: () => q, lte: () => q };
+              apply?.(q);
+              return builder;
+            },
+            order(order: string) { read.order = order; return builder; },
+            async take(limit: number) {
+              read.limit = limit;
+              if (read.index === "by_status_scheduling_bound") return [];
+              return read.order === "desc" ? rows.slice(-limit).reverse() : rows.slice(0, limit);
+            },
+            async first() { return null; },
+          };
+          return builder;
+        },
+      },
+    };
+
+    const result = await projectedDispatchCandidates(ctx, 2, BACKGROUND_CONCURRENCY_LIMIT);
+    expect(result.selected).toHaveLength(BACKGROUND_CONCURRENCY_LIMIT);
+    expect(reads).toEqual([
+      { table: "jobRuntime", index: "by_status_scheduling_bound", limit: BACKGROUND_CONCURRENCY_LIMIT + 1 },
+      { table: "jobRuntime", index: "by_status_scheduling_bound", limit: BACKGROUND_CONCURRENCY_LIMIT + 1 },
+      { table: "jobRuntime", index: "by_dispatch_ready", order: "asc", limit: DISPATCH_CANDIDATE_WINDOW_MAX / 2 },
+      { table: "jobRuntime", index: "by_dispatch_ready", order: "desc", limit: DISPATCH_CANDIDATE_WINDOW_MAX / 2 },
+      { table: "dispatchSchedulerState", index: "by_key" },
+    ]);
+    expect(reads.some((read) => ["jobs", "jobSchedulingAdmissions", "workGroupScheduling"].includes(read.table))).toBe(false);
+  });
+
   it("fills the first bounded wave across an oversized old group and two newly spoken groups", async () => {
     const t = convexTest(schema, modules);
     // Eighty old rows exceed the scheduler's bounded candidate window; the
@@ -161,5 +219,41 @@ describe("project-group fair reservation authority", () => {
     }));
     expect(fenced.job).toMatchObject({ repo: "daniels-project-space/dropship-ai", status: "pending" });
     expect(fenced.admission).toMatchObject({ projectRepository: REPO });
+  });
+
+  it("repairs a forged compact projection but never reserves it as authority", async () => {
+    const t = convexTest(schema, modules);
+    const jobId = await enqueue(t, { missionId: "mission-runtime-forge", readonly: false, repo: REPO });
+    await t.run(async (ctx) => {
+      const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", jobId)).first();
+      const injected = "daniels-project-space/dropship-ai";
+      const forged = workGroupAuthority({ jobId, missionId: "mission-runtime-forge", repo: injected });
+      await ctx.db.patch(runtime!._id, { repo: injected, ...forged });
+    });
+
+    expect(await t.mutation(api.jobs.reserveDispatchBatch, { limit: 1, workerToken: WORKER }))
+      .toMatchObject({ reservations: [] });
+    const runtime = await t.run(async (ctx) => ctx.db.query("jobRuntime")
+      .withIndex("by_job", (q) => q.eq("jobId", jobId)).first());
+    expect(runtime).toMatchObject({ repo: REPO, schedulingBound: true, dispatchReady: true });
+  });
+
+  it("keeps historical unbound rows non-executable without admitting them in a poll", async () => {
+    const t = convexTest(schema, modules);
+    await t.run(async (ctx) => {
+      const now = Date.now();
+      const jobId = await ctx.db.insert("jobs", {
+        task: "legacy unbound row", status: "pending", priority: 50, stage: "queued",
+        percent: 0, attempt: 1, maxAttempts: 3, nextRunAt: now, createdAt: now,
+      });
+      await ctx.db.insert("jobRuntime", {
+        jobId, task: "legacy unbound row", status: "pending", priority: 50, stage: "queued",
+        percent: 0, attempt: 1, maxAttempts: 3, heartbeatAt: now, nextRunAt: now,
+        createdAt: now, updatedAt: now,
+      });
+    });
+    expect(await t.mutation(api.jobs.reserveDispatchBatch, { limit: 1, workerToken: WORKER }))
+      .toMatchObject({ reservations: [] });
+    expect(await t.run(async (ctx) => ctx.db.query("jobSchedulingAdmissions").collect())).toHaveLength(0);
   });
 });

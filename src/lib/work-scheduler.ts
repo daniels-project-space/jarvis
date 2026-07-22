@@ -1,6 +1,8 @@
 export const BACKGROUND_QUEUE = "jarvis-background-agents";
 export const BACKGROUND_CONCURRENCY_LIMIT = 8;
 export const DISPATCH_SCHEDULER_KEY = "background-fair-v1";
+export const SCHEDULING_PROTOCOL_VERSION = 2;
+export const DISPATCH_CANDIDATE_WINDOW_MAX = 96;
 
 // A single executable project group may use most of the background fleet, but
 // never all of it. Two reservations remain available for newly admitted work
@@ -13,6 +15,15 @@ export type WorkGroupAuthority = Readonly<{
   projectGroupId: string;
   projectRepository?: string;
   schedulingGroupKey: string;
+}>;
+
+export type SchedulingBinding = WorkGroupAuthority & Readonly<{
+  protocolVersion: typeof SCHEDULING_PROTOCOL_VERSION;
+  jobId: string;
+  readonly: boolean;
+  workerBranch?: string;
+  workspaceLineage: string;
+  retryLineage: string;
 }>;
 
 type WorkLedgerIdentity = {
@@ -57,6 +68,70 @@ export function schedulingAuthorityMatches(
     && job.projectGroupId === expected.projectGroupId
     && job.projectRepository === expected.projectRepository
     && job.schedulingGroupKey === expected.schedulingGroupKey;
+}
+
+/**
+ * Canonical bytes hashed into the immutable admission ledger. The branch and
+ * workspace values were already allocated from the durable job id; mutable
+ * labels, UI state, source refs and "latest" pointers are intentionally absent.
+ */
+export function canonicalSchedulingBinding(binding: SchedulingBinding): string {
+  return JSON.stringify({
+    protocolVersion: binding.protocolVersion,
+    jobId: binding.jobId,
+    missionGroupId: binding.missionGroupId,
+    projectGroupId: binding.projectGroupId,
+    projectRepository: binding.projectRepository ?? null,
+    schedulingGroupKey: binding.schedulingGroupKey,
+    readonly: binding.readonly,
+    workerBranch: binding.workerBranch ?? null,
+    workspaceLineage: binding.workspaceLineage,
+    retryLineage: binding.retryLineage,
+  });
+}
+
+export function schedulingBindingForJob(job: WorkLedgerIdentity & {
+  readonly?: unknown;
+  workerBranch?: unknown;
+  workspaceLineage?: unknown;
+  retryLineage?: unknown;
+}): SchedulingBinding | null {
+  const jobId = String(job.jobId ?? job._id ?? "").trim();
+  if (!jobId || typeof job.workspaceLineage !== "string" || typeof job.retryLineage !== "string") return null;
+  const authority = workGroupAuthority(job);
+  const readonly = Boolean(job.readonly || !authority.projectRepository);
+  const workerBranch = typeof job.workerBranch === "string" && job.workerBranch ? job.workerBranch : undefined;
+  if (!readonly && !workerBranch) return null;
+  return {
+    protocolVersion: SCHEDULING_PROTOCOL_VERSION,
+    jobId,
+    ...authority,
+    readonly,
+    workerBranch,
+    workspaceLineage: job.workspaceLineage,
+    retryLineage: job.retryLineage,
+  };
+}
+
+export function projectedSchedulingBindingMatches(
+  row: WorkLedgerIdentity & Partial<SchedulingBinding> & {
+    schedulingProtocolVersion?: unknown;
+    schedulingAdmissionId?: unknown;
+    schedulingBindingDigest?: unknown;
+  },
+  binding: SchedulingBinding,
+  admissionId: unknown,
+  bindingDigest: string,
+): boolean {
+  return row.schedulingProtocolVersion === SCHEDULING_PROTOCOL_VERSION
+    && String(row.schedulingAdmissionId ?? "") === String(admissionId ?? "")
+    && row.schedulingBindingDigest === bindingDigest
+    && schedulingAuthorityMatches(row, binding)
+    && String(row.jobId ?? row._id ?? "") === binding.jobId
+    && Boolean(row.readonly || !row.repo) === binding.readonly
+    && row.workerBranch === binding.workerBranch
+    && row.workspaceLineage === binding.workspaceLineage
+    && row.retryLineage === binding.retryLineage;
 }
 
 export function immutableLineageIsValid(job: {
@@ -105,22 +180,22 @@ export type FairWorkCandidate = Readonly<{
 }>;
 
 export type FairWorkGroupState = Readonly<{
-  lastServedSequence: number;
   activeCount: number;
 }>;
 
 /**
- * Strict bounded round-robin across executable project groups. The oldest
- * service sequence wins; priority, creation time and the immutable key are
- * deterministic tie-breakers. Priority orders work inside a group and among
- * equally served groups, so urgent work is prompt but can never permanently
- * starve a lower-priority group.
+ * Strict bounded round-robin across executable project groups. A single
+ * durable cursor names the last group served, so candidate selection never
+ * needs an admission/group join for every row. Priority orders work inside a
+ * group and chooses the first group only when no cursor exists; after that the
+ * immutable group-key ring prevents permanent priority starvation.
  */
 export function selectFairWork(
   candidates: readonly FairWorkCandidate[],
   groupStates: ReadonlyMap<string, FairWorkGroupState>,
   activeWriteLineages: ReadonlySet<string>,
   limit: number,
+  lastServedGroupKey?: string,
 ): FairWorkCandidate[] {
   const boundedLimit = Math.max(0, Math.min(BACKGROUND_CONCURRENCY_LIMIT, Math.floor(limit)));
   if (!boundedLimit) return [];
@@ -140,13 +215,20 @@ export function selectFairWork(
     rows,
     maxPriority: rows[0]?.priority ?? 0,
     oldestCreatedAt: Math.min(...rows.map((row) => row.createdAt)),
-    state: groupStates.get(groupKey) ?? { lastServedSequence: 0, activeCount: 0 },
+    state: groupStates.get(groupKey) ?? { activeCount: 0 },
   })).filter((group) => group.state.activeCount < MAX_ACTIVE_PER_WORK_GROUP)
-    .sort((left, right) =>
-      left.state.lastServedSequence - right.state.lastServedSequence
-        || right.maxPriority - left.maxPriority
+    .sort((left, right) => left.groupKey.localeCompare(right.groupKey));
+
+  if (!lastServedGroupKey) {
+    groups.sort((left, right) =>
+      right.maxPriority - left.maxPriority
         || left.oldestCreatedAt - right.oldestCreatedAt
         || left.groupKey.localeCompare(right.groupKey));
+  } else {
+    const afterCursor = groups.findIndex((group) => group.groupKey.localeCompare(lastServedGroupKey) > 0);
+    const start = afterCursor < 0 ? 0 : afterCursor;
+    groups.push(...groups.splice(0, start));
+  }
 
   const selected: FairWorkCandidate[] = [];
   const selectedByGroup = new Map<string, number>();

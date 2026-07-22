@@ -24,7 +24,7 @@ import {
 } from "./controlPlane";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { exactTextWorkOrder } from "../src/lib/work-order";
-import { validateWorkDag, workItemIdentity } from "../src/lib/workspace-protocol";
+import { validateWorkDag } from "../src/lib/workspace-protocol";
 import { controlIntegrationForJob } from "./goalIntegration";
 import {
   canonicalGoalPlan,
@@ -219,26 +219,8 @@ async function insertGoalJob(ctx: any, input: GoalJobInput) {
     attempt: 1,
     maxAttempts: Math.max(1, Math.min(48, input.maxAttempts ?? 24)),
     nextRunAt: approvalRequired ? undefined : now,
+    integrationState: !input.readonly && repo ? "awaiting_review" : "not_applicable",
     createdAt: now,
-  });
-  const identity = workItemIdentity({
-    missionId: input.missionId,
-    jobId: String(jobId),
-    workstreamId: input.goalWorkstreamId,
-    readonly: Boolean(input.readonly || !repo),
-  });
-  const inserted: any = await ctx.db.get(jobId);
-  if (inserted) await patchJobWithRuntime(ctx, inserted, {
-    sourceBranch: input.sourceBranch,
-    sourceHeadSha: input.sourceHeadSha,
-    integrationBranch: input.integrationBranch,
-    workerBranch: identity.workerBranch,
-    workspaceLineage: identity.workspaceLineage,
-    retryLineage: identity.retryLineage,
-    // Writable jobs own only their worker ref. A read-only validator may be
-    // explicitly pinned to the immutable integration branch supplied above.
-    branch: identity.workerBranch ?? input.branch,
-    integrationState: identity.workerBranch ? "awaiting_review" : "not_applicable",
   });
   await ctx.db.insert("workEvents", {
     jobId: String(jobId),
@@ -1060,6 +1042,13 @@ export const recordPlan = mutation({
       throw new Error("Goal plan workstream budget is invalid");
     }
     validateWorkDag(plan.workstreams, maxNodes);
+    if (mission.planningJobId) {
+      const plannerId = ctx.db.normalizeId("jobs", mission.planningJobId);
+      const planner: any = plannerId ? await ctx.db.get(plannerId) : null;
+      if (planner?.status === "pending" && planner.dispatchReady === true) {
+        await patchJobWithRuntime(ctx, planner, { dispatchReady: false, nextRunAt: undefined });
+      }
+    }
     const writableRepositories = new Set<string>();
     const repositoryByNode = new Map<string, string | undefined>();
     for (const stream of plan.workstreams) {

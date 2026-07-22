@@ -55,9 +55,9 @@ describe("durable fair work scheduling", () => {
     const first = selectFairWork(ready, new Map(), new Set(), 1);
     expect(first.map((row) => row.id)).toEqual(["high-1"]);
     const second = selectFairWork(ready.filter((row) => row.id !== "high-1"), new Map([
-      ["high", { lastServedSequence: 1, activeCount: 0 }],
-      ["low", { lastServedSequence: 0, activeCount: 0 }],
-    ]), new Set(), 1);
+      ["high", { activeCount: 0 }],
+      ["low", { activeCount: 0 }],
+    ]), new Set(), 1, "high");
     expect(second.map((row) => row.id)).toEqual(["low-1"]);
   });
 

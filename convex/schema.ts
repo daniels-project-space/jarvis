@@ -264,6 +264,13 @@ export default defineSchema({
     projectGroupId: v.optional(v.string()),
     projectRepository: v.optional(v.string()),
     schedulingGroupKey: v.optional(v.string()),
+    schedulingProtocolVersion: v.optional(v.number()),
+    schedulingAdmissionId: v.optional(v.id("jobSchedulingAdmissions")),
+    schedulingBindingDigest: v.optional(v.string()),
+    schedulingBound: v.optional(v.boolean()),
+    // False keeps dependency-blocked and historical unbound work out of the
+    // hot due index; completion/migration explicitly promotes it.
+    dispatchReady: v.optional(v.boolean()),
     acceptanceCriteria: v.optional(v.array(v.string())),
     modelReason: v.optional(v.string()),
     // Immutable work-item isolation identities. `branch` remains the legacy
@@ -383,6 +390,11 @@ export default defineSchema({
     projectGroupId: v.optional(v.string()),
     projectRepository: v.optional(v.string()),
     schedulingGroupKey: v.optional(v.string()),
+    schedulingProtocolVersion: v.optional(v.number()),
+    schedulingAdmissionId: v.optional(v.id("jobSchedulingAdmissions")),
+    schedulingBindingDigest: v.optional(v.string()),
+    schedulingBound: v.optional(v.boolean()),
+    dispatchReady: v.optional(v.boolean()),
     sourceBranch: v.optional(v.string()),
     sourceHeadSha: v.optional(v.string()),
     integrationBranch: v.optional(v.string()),
@@ -410,6 +422,8 @@ export default defineSchema({
     .index("by_createdAt", ["createdAt"])
     .index("by_status_priority", ["status", "priority", "createdAt"])
     .index("by_status_next_run", ["status", "nextRunAt", "createdAt"])
+    .index("by_dispatch_ready", ["status", "schedulingBound", "dispatchReady", "nextRunAt", "createdAt"])
+    .index("by_status_scheduling_bound", ["status", "schedulingBound", "priority", "createdAt"])
     .index("by_status_heartbeat", ["status", "heartbeatAt"])
     .index("by_status_progress", ["status", "progressAt"])
     .index("by_status_dispatch_lease", ["status", "dispatchLeaseUntil"])
@@ -438,10 +452,16 @@ export default defineSchema({
   // job document from moving work to another mission or repository group.
   jobSchedulingAdmissions: defineTable({
     jobId: v.id("jobs"),
+    protocolVersion: v.optional(v.number()),
     missionGroupId: v.string(),
     projectGroupId: v.string(),
     projectRepository: v.optional(v.string()),
     schedulingGroupKey: v.string(),
+    readonly: v.optional(v.boolean()),
+    workerBranch: v.optional(v.string()),
+    workspaceLineage: v.optional(v.string()),
+    retryLineage: v.optional(v.string()),
+    bindingDigest: v.optional(v.string()),
     createdAt: v.number(),
   })
     .index("by_job", ["jobId"])
@@ -452,6 +472,7 @@ export default defineSchema({
   dispatchSchedulerState: defineTable({
     key: v.string(),
     nextSequence: v.number(),
+    lastGroupKey: v.optional(v.string()),
     updatedAt: v.number(),
   }).index("by_key", ["key"]),
 

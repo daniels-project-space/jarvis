@@ -1,8 +1,8 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
-import { insertJobWithRuntime, patchJobWithRuntime, patchMissionWithRuntime } from "./controlPlane";
-import { attemptWorkspaceKey, workItemIdentity } from "../src/lib/workspace-protocol";
+import { insertJobWithRuntime, patchJobWithRuntime, patchMissionWithRuntime, promoteCompletedJobDependents } from "./controlPlane";
+import { attemptWorkspaceKey } from "../src/lib/workspace-protocol";
 
 const LEASE_MS = 45_000;
 const CONTROLLER_STATE_MS = { command: 2 * 60_000, provider: 5 * 60_000, reconcile: 2 * 60_000 } as const;
@@ -604,7 +604,9 @@ export const claim = mutation({
     await patchJobWithRuntime(ctx, job, { integrationState: "integrating", evidenceSummary: "signed worker receipt claimed by controller" });
     await appendEvent(ctx, { ...job, integrationAttemptId: attempt._id }, "integration_claimed", `Controller claimed integration generation ${attempt.generation}`);
     return { ...attempt, status: "claimed", controllerRunId: args.controllerRunId, leaseOwner: args.leaseOwner,
-      leaseToken: args.leaseToken, leaseVersion: version, leaseUntil: until, expectedIntegrationBaseSha, expectedIntegrationRefSha };
+      leaseToken: args.leaseToken, leaseVersion: version, leaseUntil: until, expectedIntegrationBaseSha, expectedIntegrationRefSha,
+      controllerState: "command", controllerStateSince: now,
+      controllerDeadlineAt: now + CONTROLLER_STATE_MS.command, controllerHeartbeatAt: now };
   },
 });
 
@@ -931,6 +933,9 @@ export const complete = mutation({
       reviewReceiptSignature: job.reviewReceiptSignature, reviewDiffSha256: attempt.reviewedDiffSha256,
       reviewReceiptId: attempt.reviewReceiptId, reviewReceiptDigest: attempt.reviewReceiptDigest, createdAt: now,
     });
+    if (!requestedControl && terminalOutcome === "integrated") {
+      await promoteCompletedJobDependents(ctx, { ...job, status: "done" }, now);
+    }
     await appendEvent(ctx, job, "integration_completed", `Mission integration advanced once to ${attempt.preparedIntegrationHeadSha}`, {
       integrationBase: attempt.expectedIntegrationBaseSha, integrationHead: attempt.preparedIntegrationHeadSha,
       workerHead: attempt.reviewedHeadSha,
@@ -1094,12 +1099,11 @@ export const failFocused = mutation({
       sourceBranch: attempt.integrationBranch, integrationBranch: attempt.integrationBranch,
       integrationState: "awaiting_review", createdAt: now,
     });
-    const identity = workItemIdentity({ missionId: String(mission._id), jobId: String(repairId), workstreamId: `${attempt.workstreamId}-repair`, readonly: false });
     const repair: any = await ctx.db.get(repairId);
-    if (repair) await patchJobWithRuntime(ctx, repair, { ...identity, branch: identity.workerBranch, workerBranch: identity.workerBranch });
+    if (!repair?.workspaceLineage) throw new Error("Focused repair lost its immutable workspace admission");
     await ctx.db.insert("workAttempts", {
-      jobId: repairId, attempt: 1, status: "pending", workspaceLineage: identity.workspaceLineage,
-      workerBranch: identity.workerBranch, workspaceKey: attemptWorkspaceKey(identity.workspaceLineage, 1),
+      jobId: repairId, attempt: 1, status: "pending", workspaceLineage: repair?.workspaceLineage,
+      workerBranch: repair?.workerBranch, workspaceKey: attemptWorkspaceKey(repair.workspaceLineage, 1),
       lastEventSeq: 0, livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now,
     });
     const terminal = await writeIntegrationTerminalReceipt(ctx, attempt, args.kind, { reason: args.reason, repairJobId: repairId });

@@ -9,7 +9,7 @@ import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
 import { normalizeWorkModelTier } from "../src/lib/work-models";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
-import { attemptWorkspaceKey, workItemIdentity } from "../src/lib/workspace-protocol";
+import { attemptWorkspaceKey } from "../src/lib/workspace-protocol";
 import {
   controlIntegrationForJob,
   queueReviewedIntegration,
@@ -27,15 +27,21 @@ import {
   jobRuntimeFor,
   patchMissionWithRuntime,
   patchJobWithRuntime,
+  promoteCompletedJobDependents,
+  quarantineJobRuntime,
+  readJobSchedulingAuthority,
+  runtimeMatchesSchedulingAuthority,
   runtimeJob,
   upsertJobRuntime,
   upsertMissionRuntime,
 } from "./controlPlane";
 import {
   BACKGROUND_CONCURRENCY_LIMIT,
+  DISPATCH_CANDIDATE_WINDOW_MAX,
   DISPATCH_SCHEDULER_KEY,
   immutableLineageIsValid,
   schedulingAuthorityMatches,
+  SCHEDULING_PROTOCOL_VERSION,
   selectFairWork,
   writeLineageKey,
 } from "../src/lib/work-scheduler";
@@ -335,22 +341,7 @@ export const enqueue = mutation({
       nextRunAt: now,
       createdAt: now,
     });
-    let queued: any = await ctx.db.get(id);
-    if (queued) {
-      const identity = workItemIdentity({
-        missionId: input.missionId ?? `standalone-${String(id)}`,
-        jobId: String(id), workstreamId: input.goalWorkstreamId ?? input.label,
-        readonly: Boolean(input.readonly || !repo),
-      });
-      await patchJobWithRuntime(ctx, queued, {
-        sourceBranch: input.branch,
-        workerBranch: identity.workerBranch,
-        workspaceLineage: identity.workspaceLineage,
-        retryLineage: identity.retryLineage,
-        branch: identity.workerBranch ?? input.branch,
-      });
-      queued = await ctx.db.get(id);
-    }
+    const queued: any = await ctx.db.get(id);
     // This early lifecycle row is the serialized cursor for queue, dispatch,
     // launch and terminal events. Provider identities are bound later.
     await ctx.db.insert("workAttempts", {
@@ -378,10 +369,9 @@ export const enqueue = mutation({
   },
 });
 
-// v1 completed in production before active/priority became a required live
-// projection. Never reuse its completed cursor: v2 deliberately reprojects
-// every durable job and is the only gate for retiring compatibility reads.
-const CONTROL_PLANE_MIGRATION = "active-projection-v2";
+// v3 is the explicit, bounded owner of historical scheduler admission. Hot
+// polls never infer or repair authority for legacy rows.
+const CONTROL_PLANE_MIGRATION = "scheduling-admission-v3";
 
 async function migrationState(ctx: any) {
   const existing = await ctx.db
@@ -418,7 +408,8 @@ async function migrateLegacyJobsPage(ctx: any, migration?: any) {
     .paginate({ cursor: state.jobsCursor ?? null, numItems: 12, maximumRowsRead: 12 });
   const now = Date.now();
   let repaired = 0;
-  for (const row of page.page) {
+  for (const persisted of page.page) {
+    let row: any = persisted;
     // v1 placed the full review patch on the hot jobs document. Re-home only
     // structurally complete legacy receipts into the immutable cold table;
     // malformed values stay unavailable rather than becoming delivery proof.
@@ -442,7 +433,7 @@ async function migrateLegacyJobsPage(ctx: any, migration?: any) {
             agentEvidenceSha256: receipt.agentEvidenceSha256, createdAt: now,
           });
           await ctx.db.patch(row._id, { reviewReceiptId, reviewReceiptDigest: digest, reviewReceiptJson: undefined });
-          row.reviewReceiptId = reviewReceiptId; row.reviewReceiptDigest = digest; row.reviewReceiptJson = undefined;
+          row = { ...row, reviewReceiptId, reviewReceiptDigest: digest, reviewReceiptJson: undefined };
         }
       } catch { /* fail closed; a malformed old row is not a review receipt */ }
     }
@@ -472,6 +463,7 @@ async function migrateLegacyJobsPage(ctx: any, migration?: any) {
         nextRunAt: now,
       };
       await patchJobWithRuntime(ctx, row, patch);
+      row = { ...row, ...patch };
       const approvals = await ctx.db
         .query("approvals")
         .withIndex("by_job", (q: any) => q.eq("jobId", String(row._id)))
@@ -483,8 +475,23 @@ async function migrateLegacyJobsPage(ctx: any, migration?: any) {
         stage: "queued", percent: row.percent ?? 0, evidenceKind: "reconcile", eventKey: `autonomy-reconciled:${row.attempt ?? 1}`,
       });
       repaired += 1;
+    }
+    const dependencies = Array.isArray(row.dependsOn) ? row.dependsOn.slice(0, 16) : [];
+    const dependencyRows = dependencies.length === (row.dependsOn ?? []).length
+      ? await Promise.all(dependencies.map((dependency: string) => {
+          const id = ctx.db.normalizeId("jobs", dependency);
+          return id ? ctx.db.get(id) : null;
+        }))
+      : [];
+    const dispatchReady = dependencies.length === 0
+      || (dependencyRows.length === dependencies.length && dependencyRows.every((dependency: any) => dependency?.status === "done"));
+    const admitted = await ensureJobSchedulingAuthority(ctx, row, dispatchReady);
+    if (admitted) {
+      row = admitted.job;
+      repaired += 1;
     } else {
       await upsertJobRuntime(ctx, row);
+      await quarantineJobRuntime(ctx, row);
     }
   }
   const complete = page.isDone;
@@ -629,183 +636,164 @@ export const reconcileGoalWorkstreamModes = mutation({
   },
 });
 
-/* eslint-disable @typescript-eslint/no-explicit-any -- scheduler authority joins rollout-compatible Convex documents from several tables */
+/* eslint-disable @typescript-eslint/no-explicit-any -- scheduler validation joins only the bounded selected authority rows */
+function boundRuntimeProjection(row: any) {
+  try {
+    return row?.schedulingBound === true
+      && Number(row.schedulingProtocolVersion) === SCHEDULING_PROTOCOL_VERSION
+      && Boolean(row.schedulingAdmissionId)
+      && /^[0-9a-f]{64}$/.test(String(row.schedulingBindingDigest ?? ""))
+      && schedulingAuthorityMatches(row)
+      && immutableLineageIsValid(row);
+  } catch {
+    return false;
+  }
+}
+
+export function executableRuntimeProjection(row: any) {
+  return boundRuntimeProjection(row)
+    && row.dispatchReady === true
+    && (!row.approvalRequired || row.approvalStatus === "approved");
+}
+
 async function activeBackgroundRows(ctx: any) {
   const rows = (await Promise.all(["dispatching", "running"].map((status) => ctx.db
     .query("jobRuntime")
-    .withIndex("by_status_priority", (q: any) => q.eq("status", status))
+    .withIndex("by_status_scheduling_bound", (q: any) => q.eq("status", status).eq("schedulingBound", true))
     .take(BACKGROUND_CONCURRENCY_LIMIT + 1)))).flat();
-  return [...new Map(rows.map((row: any) => [String(row.jobId), row])).values()];
+  return [...new Map(rows.filter(boundRuntimeProjection).map((row: any) => [String(row.jobId), row])).values()];
 }
 
-async function runnableCandidates(ctx: any, now: number, requestedLimit: number): Promise<any[]> {
+export async function projectedDispatchCandidates(ctx: any, now: number, requestedLimit: number) {
   const activeRows = await activeBackgroundRows(ctx);
   const available = Math.max(0, BACKGROUND_CONCURRENCY_LIMIT - activeRows.length);
   const limit = Math.min(requestedLimit, available);
-  if (!limit) return [];
+  if (!limit) return { selected: [], scheduler: null };
 
   const activeByGroup = new Map<string, number>();
   const activeWriteLineages = new Set<string>();
-  const blockedWriteGroups = new Set<string>();
   for (const runtime of activeRows) {
-    let active: any = runtime;
-    if (!schedulingAuthorityMatches(active)) {
-      const durable = await ctx.db.get(runtime.jobId);
-      const admitted = durable ? await ensureJobSchedulingAuthority(ctx, durable) : null;
-      if (!admitted) continue;
-      active = { ...runtime, ...admitted.job, _id: admitted.job._id, jobId: admitted.job._id };
-      await upsertJobRuntime(ctx, admitted.job);
-    }
-    const groupKey = String(active.schedulingGroupKey ?? "");
+    const groupKey = String(runtime.schedulingGroupKey ?? "");
     if (!groupKey) continue;
     activeByGroup.set(groupKey, (activeByGroup.get(groupKey) ?? 0) + 1);
-    const lineage = writeLineageKey(active);
-    if (lineage && immutableLineageIsValid(active)) activeWriteLineages.add(lineage);
-    else if (!active.readonly && active.repo) blockedWriteGroups.add(groupKey);
+    const lineage = writeLineageKey(runtime);
+    if (lineage) activeWriteLineages.add(lineage);
   }
 
-  const candidateWindow = Math.max(24, Math.min(96, limit * 8));
+  const candidateWindow = DISPATCH_CANDIDATE_WINDOW_MAX;
   const sampleSize = Math.ceil(candidateWindow / 2);
   // Sample both ends of the due index. A deep old backlog from one group must
   // not hide a newly spoken mission beyond the bounded hot read window.
   const [oldestDue, newestDue] = await Promise.all(["asc", "desc"].map((order) => ctx.db
     .query("jobRuntime")
-    .withIndex("by_status_next_run", (q: any) => q.eq("status", "pending").lte("nextRunAt", now))
+    .withIndex("by_dispatch_ready", (q: any) => q.eq("status", "pending")
+      .eq("schedulingBound", true).eq("dispatchReady", true).lte("nextRunAt", now))
     .order(order)
     .take(sampleSize)));
   const candidates = [...new Map([...oldestDue, ...newestDue]
-    .map((candidate: any) => [String(candidate.jobId), candidate])).values()];
-  const runnable: any[] = [];
-  const missionCache = new Map<string, any>();
-  const dependencyCache = new Map<string, any>();
-  const schedulingByGroup = new Map<string, any>();
-  for (const candidate of candidates) {
-    if (candidate.approvalRequired && candidate.approvalStatus !== "approved") continue;
-    if (candidate.missionId) {
-      let mission = missionCache.get(candidate.missionId);
-      if (mission === undefined) {
-        const missionId = ctx.db.normalizeId("missions", candidate.missionId);
-        mission = missionId
-          ? await ctx.db
-              .query("missionRuntime")
-              .withIndex("by_mission", (q: any) => q.eq("missionId", missionId))
-              .first()
-          : null;
-        missionCache.set(candidate.missionId, mission ?? null);
-      }
-      // A paused/blocked/cancelled Goal Mode mission owns the lease. This
-      // server-side fence prevents a manually approved or retried child job
-      // from escaping while the parent goal is stopped.
-      if (candidate.goalStage && (!mission || !goalJobMatchesMissionPhase(candidate, mission))) continue;
-    }
-    let blocked = false;
-    for (const dependency of candidate.dependsOn ?? []) {
-      let dep = dependencyCache.get(dependency);
-      if (dep === undefined) {
-        const id = ctx.db.normalizeId("jobs", dependency);
-        dep = id ? await jobRuntimeFor(ctx, id) : null;
-        dependencyCache.set(dependency, dep ?? null);
-      }
-      if (!dep || dep.status !== "done") {
-        blocked = true;
-        break;
-      }
-    }
-    if (blocked) continue;
-    // The projection selects exact candidates; the one bounded authority read
-    // below fences dispatch against any stale rollout row without scanning jobs.
-    let job: any = await ctx.db.get(candidate.jobId);
-    if (!job || job.status !== "pending" || (job.attempt ?? 1) !== candidate.attempt || (job.nextRunAt ?? 0) > now) {
-      if (job) await upsertJobRuntime(ctx, job);
-      continue;
-    }
-    const admitted = await ensureJobSchedulingAuthority(ctx, job);
-    if (!admitted) continue;
-    job = admitted.job;
-    if (!schedulingAuthorityMatches(candidate) || candidate.schedulingGroupKey !== job.schedulingGroupKey) {
-      await upsertJobRuntime(ctx, job);
-    }
-    const expectedIdentity = workItemIdentity({
-      missionId: job.missionId ?? `standalone-${String(job._id)}`,
-      jobId: String(job._id),
-      workstreamId: job.goalWorkstreamId ?? job.label,
-      readonly: Boolean(job.readonly || !job.repo),
-    });
-    if ((job.workspaceLineage !== undefined && job.workspaceLineage !== expectedIdentity.workspaceLineage)
-      || (job.retryLineage !== undefined && job.retryLineage !== expectedIdentity.retryLineage)) continue;
-    if (!job.workspaceLineage || !job.retryLineage || (!job.readonly && job.repo && !job.workerBranch)) {
-      const lineagePatch = {
-        workspaceLineage: job.workspaceLineage ?? expectedIdentity.workspaceLineage,
-        retryLineage: job.retryLineage ?? expectedIdentity.retryLineage,
-        workerBranch: job.workerBranch ?? expectedIdentity.workerBranch,
-        branch: job.branch ?? expectedIdentity.workerBranch,
-      };
-      await patchJobWithRuntime(ctx, job, lineagePatch);
-      job = { ...job, ...lineagePatch };
-    }
-    if (!immutableLineageIsValid(job)) continue;
-    // The projection carries the common bounded dependency prefix. If a
-    // legacy/general job has more, the selected authority document must fence
-    // every remaining dependency before dispatch; oversized graphs stay held
-    // for explicit recovery instead of silently dropping an edge.
-    const projectedDependencyCount = Array.isArray(candidate.dependsOn) ? candidate.dependsOn.length : 0;
-    const authorityDependencies = Array.isArray(job.dependsOn) ? job.dependsOn : [];
-    if (authorityDependencies.length > 100) continue;
-    for (const dependency of authorityDependencies.slice(projectedDependencyCount)) {
-      let dep = dependencyCache.get(dependency);
-      if (dep === undefined) {
-        const id = ctx.db.normalizeId("jobs", dependency);
-        dep = id ? await jobRuntimeFor(ctx, id) : null;
-        dependencyCache.set(dependency, dep ?? null);
-      }
-      if (!dep || dep.status !== "done") {
-        blocked = true;
-        break;
-      }
-    }
-    if (blocked) continue;
-    if (job.goalStage && job.missionId) {
-      const missionId = ctx.db.normalizeId("missions", job.missionId);
-      const mission = missionId ? await ctx.db.get(missionId) : null;
-      if (!mission || !goalJobMatchesMissionPhase(job, mission)) continue;
-    }
-    if (job.planParentMissionId) {
-      const verifiedHandoffs = await verifiedGoalHandoffsForJob(ctx, job);
-      if (!verifiedHandoffs) continue;
-    }
-    if (job.integrationAttemptId && job.missionId && job.repo) {
-      const integration: any = await ctx.db.get(job.integrationAttemptId);
-      // Queue maintenance exposes exactly one head as queued. Later cold
-      // receipts have no nextRunAt and cannot consume a Trigger reservation.
-      if (!integration || integration.jobId !== job._id || integration.status !== "queued") continue;
-    }
-    const groupKey = String(job.schedulingGroupKey);
-    const lineage = writeLineageKey(job);
-    if (lineage && blockedWriteGroups.has(groupKey)) continue;
-    schedulingByGroup.set(groupKey, admitted.scheduling);
-    runnable.push(job);
-  }
-  const fairCandidates = runnable.map((job) => ({
-    id: String(job._id),
-    groupKey: String(job.schedulingGroupKey),
-    priority: Number(job.priority ?? 50),
-    createdAt: Number(job.createdAt ?? job._creationTime ?? 0),
-    writeLineage: writeLineageKey(job),
+    .map((candidate: any) => [String(candidate.jobId), candidate])).values()]
+    .filter((candidate: any) => executableRuntimeProjection(candidate)
+      && typeof candidate.nextRunAt === "number" && candidate.nextRunAt <= now);
+  const fairCandidates = candidates.map((candidate: any) => ({
+    id: String(candidate.jobId),
+    groupKey: String(candidate.schedulingGroupKey),
+    priority: Number(candidate.priority ?? 50),
+    createdAt: Number(candidate.createdAt ?? candidate._creationTime ?? 0),
+    writeLineage: writeLineageKey(candidate),
   }));
-  const groupStates = new Map([...schedulingByGroup.entries()].map(([groupKey, state]) => [groupKey, {
-    lastServedSequence: Number(state.lastServedSequence ?? 0),
+  const groupStates = new Map([...new Set(fairCandidates.map((candidate) => candidate.groupKey))].map((groupKey) => [groupKey, {
     activeCount: activeByGroup.get(groupKey) ?? 0,
   }]));
-  const runnableById = new Map(runnable.map((job) => [String(job._id), job]));
-  return selectFairWork(fairCandidates, groupStates, activeWriteLineages, limit)
-    .map((candidate) => runnableById.get(candidate.id))
-    .filter(Boolean);
-}
-
-async function recordSchedulingReservations(ctx: any, jobs: any[], now: number) {
-  if (!jobs.length) return;
   const scheduler = await ctx.db.query("dispatchSchedulerState")
     .withIndex("by_key", (q: any) => q.eq("key", DISPATCH_SCHEDULER_KEY)).first();
+  const runtimeById = new Map(candidates.map((candidate: any) => [String(candidate.jobId), candidate]));
+  const selected = selectFairWork(fairCandidates, groupStates, activeWriteLineages, limit, scheduler?.lastGroupKey)
+    .map((candidate) => runtimeById.get(candidate.id)).filter(Boolean);
+  return { selected, scheduler };
+}
+
+async function validateSelectedDispatchCandidate(ctx: any, runtime: any, now: number) {
+  const job: any = await ctx.db.get(runtime.jobId);
+  if (!job) return null;
+  if (job.status !== "pending" || job.dispatchReady !== true || (job.attempt ?? 1) !== runtime.attempt
+    || Number(job.nextRunAt ?? 0) > now) {
+    await upsertJobRuntime(ctx, job);
+    return null;
+  }
+  const authority = await readJobSchedulingAuthority(ctx, job);
+  if (!authority) {
+    await quarantineJobRuntime(ctx, job, runtime);
+    return null;
+  }
+  if (!runtimeMatchesSchedulingAuthority(runtime, authority)
+    || runtime.status !== job.status || Number(runtime.nextRunAt ?? 0) !== Number(job.nextRunAt ?? 0)) {
+    await upsertJobRuntime(ctx, job);
+    return null;
+  }
+  if ((job.approvalRequired && job.approvalStatus !== "approved") || !immutableLineageIsValid(job)) return null;
+  if (job.goalStage && job.missionId) {
+    const missionId = ctx.db.normalizeId("missions", job.missionId);
+    const mission = missionId ? await ctx.db.get(missionId) : null;
+    if (!mission || !goalJobMatchesMissionPhase(job, mission)) return null;
+  }
+  if (job.planParentMissionId) {
+    const verifiedHandoffs = await verifiedGoalHandoffsForJob(ctx, job);
+    if (!verifiedHandoffs) {
+      await patchJobWithRuntime(ctx, job, { dispatchReady: false });
+      return null;
+    }
+  } else if (Array.isArray(job.dependsOn) && job.dependsOn.length) {
+    if (job.dependsOn.length > 16) {
+      await patchJobWithRuntime(ctx, job, { dispatchReady: false });
+      return null;
+    }
+    const dependencies = await Promise.all(job.dependsOn.map((dependency: string) => {
+      const id = ctx.db.normalizeId("jobs", dependency);
+      return id ? ctx.db.get(id) : null;
+    }));
+    if (dependencies.some((dependency: any) => dependency?.status !== "done")) {
+      await patchJobWithRuntime(ctx, job, { dispatchReady: false });
+      return null;
+    }
+  }
+  if (job.integrationAttemptId && job.missionId && job.repo) {
+    const integration: any = await ctx.db.get(job.integrationAttemptId);
+    if (!integration || integration.jobId !== job._id || integration.status !== "queued") return null;
+  }
+  return { job, authority };
+}
+
+async function runnableCandidates(ctx: any, now: number, requestedLimit: number) {
+  const projected = await projectedDispatchCandidates(ctx, now, requestedLimit);
+  const validated = [];
+  for (const runtime of projected.selected) {
+    const candidate = await validateSelectedDispatchCandidate(ctx, runtime, now);
+    if (candidate) validated.push(candidate);
+  }
+  const authoritiesByGroup = new Map<string, any>();
+  for (const candidate of validated) {
+    const groupKey = candidate.authority.binding.schedulingGroupKey;
+    if (!authoritiesByGroup.has(groupKey)) authoritiesByGroup.set(groupKey, candidate.authority.binding);
+  }
+  const groupRows = new Map<string, any>();
+  for (const [groupKey, binding] of authoritiesByGroup) {
+    const rows = await ctx.db.query("workGroupScheduling")
+      .withIndex("by_group", (q: any) => q.eq("groupKey", groupKey)).take(2);
+    const group = rows.length === 1 ? rows[0] : null;
+    if (group && group.missionGroupId === binding.missionGroupId
+      && group.projectGroupId === binding.projectGroupId
+      && group.projectRepository === binding.projectRepository) groupRows.set(groupKey, group);
+  }
+  return {
+    jobs: validated.filter((candidate) => groupRows.has(candidate.authority.binding.schedulingGroupKey))
+      .map((candidate) => candidate.job),
+    groupRows,
+    scheduler: projected.scheduler,
+  };
+}
+
+async function recordSchedulingReservations(ctx: any, jobs: any[], now: number, groupRows: Map<string, any>, scheduler: any) {
+  if (!jobs.length) return;
   let sequence = Number(scheduler?.nextSequence ?? 0);
   const groupUpdates = new Map<string, { lastServedSequence: number; count: number }>();
   for (const job of jobs) {
@@ -817,8 +805,7 @@ async function recordSchedulingReservations(ctx: any, jobs: any[], now: number) 
     groupUpdates.set(groupKey, current);
   }
   for (const [groupKey, update] of groupUpdates) {
-    const group = await ctx.db.query("workGroupScheduling")
-      .withIndex("by_group", (q: any) => q.eq("groupKey", groupKey)).first();
+    const group = groupRows.get(groupKey);
     if (!group) throw new Error("Reserved work lost its immutable scheduling group");
     await ctx.db.patch(group._id, {
       lastServedSequence: update.lastServedSequence,
@@ -826,8 +813,9 @@ async function recordSchedulingReservations(ctx: any, jobs: any[], now: number) 
       updatedAt: now,
     });
   }
-  if (scheduler) await ctx.db.patch(scheduler._id, { nextSequence: sequence, updatedAt: now });
-  else await ctx.db.insert("dispatchSchedulerState", { key: DISPATCH_SCHEDULER_KEY, nextSequence: sequence, updatedAt: now });
+  const lastGroupKey = String(jobs[jobs.length - 1].schedulingGroupKey);
+  if (scheduler) await ctx.db.patch(scheduler._id, { nextSequence: sequence, lastGroupKey, updatedAt: now });
+  else await ctx.db.insert("dispatchSchedulerState", { key: DISPATCH_SCHEDULER_KEY, nextSequence: sequence, lastGroupKey, updatedAt: now });
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
@@ -938,11 +926,11 @@ export const reserveDispatchBatch = mutation({
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const now = Date.now();
-    const limit = Math.max(1, Math.min(12, Math.floor(a.limit)));
+    const limit = Math.max(1, Math.min(BACKGROUND_CONCURRENCY_LIMIT, Math.floor(a.limit)));
     const candidates = await runnableCandidates(ctx, now, limit);
     const reservations = [];
     const reservedJobs = [];
-    for (const j of candidates) {
+    for (const j of candidates.jobs) {
       let attemptNumber = j.attempt ?? 1;
       let attempt = await attemptFor(ctx, j._id, attemptNumber);
       // A malformed/legacy pending row may still point at a launched worker.
@@ -1003,7 +991,7 @@ export const reserveDispatchBatch = mutation({
       });
       reservedJobs.push(j);
     }
-    await recordSchedulingReservations(ctx, reservedJobs, now);
+    await recordSchedulingReservations(ctx, reservedJobs, now, candidates.groupRows, candidates.scheduler);
     return { reservations };
   },
 });
@@ -1021,6 +1009,10 @@ export const claimDispatched = mutation({
     requireWorker(a.workerToken);
     const now = Date.now();
     const j: any = await ctx.db.get(a.jobId);
+    if (j && !await readJobSchedulingAuthority(ctx, j)) {
+      await quarantineJobRuntime(ctx, j);
+      return null;
+    }
     const attemptNumber = j?.attempt ?? 1;
     const priorAttempt = j ? await attemptFor(ctx, a.jobId, attemptNumber) : null;
     // Trigger can redeliver after Convex committed the claim but before the
@@ -1300,6 +1292,7 @@ export const finalize = mutation({
         reviewReceiptSignature: a.reviewReceiptSignature, reviewDiffSha256: a.reviewDiffSha256,
         reviewReceiptId: row.reviewReceiptId, reviewReceiptDigest: row.reviewReceiptDigest, createdAt: now,
       });
+      await promoteCompletedJobDependents(ctx, row, now);
     }
     if (row.missionId) {
       const missionId = ctx.db.normalizeId("missions", row.missionId);

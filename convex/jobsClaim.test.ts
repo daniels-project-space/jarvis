@@ -24,33 +24,38 @@ type Policy = "manual" | "read_only" | "auto_merge";
 async function specialistFixture(policy: Policy = "manual", goalStage?: "validating") {
   const t = convexTest(schema, modules);
   const now = Date.now();
-  const jobId = await t.run(async (ctx) => {
-    const id = await ctx.db.insert("jobs", {
-      repo: "daniels-project-space/jarvis", task: "verified repository work", status: "running",
-      deliveryMode: policy, readonly: policy === "read_only", workerRunId: "specialist-run",
-      dispatchId: "specialist-dispatch", attempt: 1, maxAttempts: 3, priority: 50,
-      stage: goalStage ?? "building", percent: 90, branch: "jarvis/reviewed", goalStage,
-      createdAt: now, heartbeatAt: now,
+  const jobId = await t.mutation(api.jobs.enqueue, {
+    repo: "daniels-project-space/jarvis", task: "verified repository work",
+    readonly: policy === "read_only", branch: policy === "read_only" ? "jarvis/reviewed" : undefined,
+    maxAttempts: 3, goalStage, workerToken: WORKER,
+  });
+  const branch = await t.run(async (ctx) => {
+    const job: any = await ctx.db.get(jobId);
+    if (!job) throw new Error("admitted specialist fixture missing");
+    await ctx.db.patch(jobId, {
+      status: "running", deliveryMode: policy, workerRunId: "specialist-run",
+      dispatchId: "specialist-dispatch", stage: goalStage ?? "building", percent: 90,
+      heartbeatAt: now,
     });
-    await ctx.db.insert("workAttempts", {
-      jobId: id, attempt: 1, status: "running", workerRunId: "specialist-run",
-      dispatchId: "specialist-dispatch", lastEventSeq: 0, livenessAt: now,
-      progressAt: now, lastEventAt: now, createdAt: now,
+    const attempt = await ctx.db.query("workAttempts")
+      .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1)).first();
+    await ctx.db.patch(attempt!._id, {
+      status: "running", workerRunId: "specialist-run", dispatchId: "specialist-dispatch",
+      livenessAt: now, progressAt: now, lastEventAt: now,
     });
-    await ctx.db.insert("jobRuntime", {
-      jobId: id, task: "verified repository work", repo: "daniels-project-space/jarvis",
-      status: "running", priority: 50, stage: goalStage ?? "building", percent: 90,
-      active: true, attempt: 1, maxAttempts: 3, heartbeatAt: now, progressAt: now,
-      workerRunId: "specialist-run", readonly: policy === "read_only", deliveryMode: policy,
-      goalStage, branch: "jarvis/reviewed", createdAt: now, updatedAt: now,
+    const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", jobId)).first();
+    await ctx.db.patch(runtime!._id, {
+      status: "running", active: true, deliveryMode: policy, workerRunId: "specialist-run",
+      dispatchId: "specialist-dispatch", stage: goalStage ?? "building", percent: 90,
+      heartbeatAt: now, progressAt: now, updatedAt: now,
     });
-    return id;
+    return String(job.workerBranch ?? job.branch ?? "");
   });
   const result = "specialist executed once";
   const note = "supervisor pass";
   const receipt = JSON.stringify({
     version: 1, jobId: String(jobId), attempt: 1, repository: "daniels-project-space/jarvis",
-    branch: "jarvis/reviewed", baseSha: BASE, baseTreeSha: TREE, headSha: HEAD,
+    branch, baseSha: BASE, baseTreeSha: TREE, headSha: HEAD,
     headTreeSha: TREE, diffSha256: DIFF, agentEvidenceSha256: "f".repeat(64),
   });
   const commitArgs = {

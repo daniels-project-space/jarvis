@@ -3,11 +3,17 @@
 // them in the same Convex transaction without calling another function.
 
 import {
+  canonicalSchedulingBinding,
   DISPATCH_SCHEDULER_KEY,
+  projectedSchedulingBindingMatches,
+  schedulingBindingForJob,
   schedulingAuthorityMatches,
+  SCHEDULING_PROTOCOL_VERSION,
   workGroupAuthority,
+  type SchedulingBinding,
   type WorkGroupAuthority,
 } from "../src/lib/work-scheduler";
+import { workItemIdentity } from "../src/lib/workspace-protocol";
 
 function defined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
@@ -69,6 +75,11 @@ export function projectJobRuntime(job: any) {
     projectGroupId: typeof job.projectGroupId === "string" ? job.projectGroupId.slice(0, 240) : undefined,
     projectRepository: typeof job.projectRepository === "string" ? job.projectRepository.slice(0, 120) : undefined,
     schedulingGroupKey: typeof job.schedulingGroupKey === "string" ? job.schedulingGroupKey.slice(0, 1_200) : undefined,
+    schedulingProtocolVersion: typeof job.schedulingProtocolVersion === "number" ? job.schedulingProtocolVersion : undefined,
+    schedulingAdmissionId: job.schedulingAdmissionId,
+    schedulingBindingDigest: typeof job.schedulingBindingDigest === "string" ? job.schedulingBindingDigest.slice(0, 64) : undefined,
+    schedulingBound: job.schedulingBound === true,
+    dispatchReady: job.dispatchReady === true,
     sourceBranch: typeof job.sourceBranch === "string" ? job.sourceBranch.slice(0, 240) : undefined,
     sourceHeadSha: typeof job.sourceHeadSha === "string" ? job.sourceHeadSha.slice(0, 80) : undefined,
     integrationBranch: typeof job.integrationBranch === "string" ? job.integrationBranch.slice(0, 240) : undefined,
@@ -209,95 +220,287 @@ function persistedAuthorityConflicts(job: any, expected: WorkGroupAuthority) {
     .some((field) => job[field] !== undefined && job[field] !== expected[field]);
 }
 
+const IMMUTABLE_JOB_BINDING_FIELDS = [
+  "repo", "readonly", "missionId", "planParentMissionId",
+  "missionGroupId", "projectGroupId", "projectRepository", "schedulingGroupKey",
+  "schedulingProtocolVersion", "schedulingAdmissionId", "schedulingBindingDigest", "schedulingBound",
+  "workerBranch", "workspaceLineage", "retryLineage",
+] as const;
+
+async function sha256Hex(value: string) {
+  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function identityForJob(job: any) {
+  const jobId = String(job._id);
+  return workItemIdentity({
+    missionId: job.missionId ?? `standalone-${jobId}`,
+    jobId,
+    workstreamId: job.goalWorkstreamId ?? job.label,
+    readonly: Boolean(job.readonly || !job.repo),
+  });
+}
+
+function admissionMatchesBinding(admission: any, binding: SchedulingBinding, digest: string) {
+  return admission
+    && Number(admission.protocolVersion) === SCHEDULING_PROTOCOL_VERSION
+    && String(admission.jobId) === binding.jobId
+    && admission.missionGroupId === binding.missionGroupId
+    && admission.projectGroupId === binding.projectGroupId
+    && admission.projectRepository === binding.projectRepository
+    && admission.schedulingGroupKey === binding.schedulingGroupKey
+    && Boolean(admission.readonly) === binding.readonly
+    && admission.workerBranch === binding.workerBranch
+    && admission.workspaceLineage === binding.workspaceLineage
+    && admission.retryLineage === binding.retryLineage
+    && admission.bindingDigest === digest;
+}
+
+async function schedulingGroupForBinding(ctx: any, binding: SchedulingBinding) {
+  const rows = await ctx.db.query("workGroupScheduling")
+    .withIndex("by_group", (q: any) => q.eq("groupKey", binding.schedulingGroupKey)).take(2);
+  if (rows.length > 1) return null;
+  const existing = rows[0];
+  if (existing && (
+    existing.missionGroupId !== binding.missionGroupId
+    || existing.projectGroupId !== binding.projectGroupId
+    || existing.projectRepository !== binding.projectRepository
+  )) return null;
+  if (existing) return existing;
+  const scheduler = await ctx.db.query("dispatchSchedulerState")
+    .withIndex("by_key", (q: any) => q.eq("key", DISPATCH_SCHEDULER_KEY)).first();
+  const now = Date.now();
+  const value = {
+    groupKey: binding.schedulingGroupKey,
+    missionGroupId: binding.missionGroupId,
+    projectGroupId: binding.projectGroupId,
+    projectRepository: binding.projectRepository,
+    lastServedSequence: Number(scheduler?.nextSequence ?? 0),
+    reservationCount: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const id = await ctx.db.insert("workGroupScheduling", value);
+  return { ...value, _id: id };
+}
+
+/** Point-read the one immutable admission bound to this durable job. */
+export async function readJobSchedulingAuthority(ctx: any, job: any) {
+  if (!job?.schedulingBound || Number(job.schedulingProtocolVersion) !== SCHEDULING_PROTOCOL_VERSION
+    || !job.schedulingAdmissionId || typeof job.schedulingBindingDigest !== "string") return null;
+  const binding = schedulingBindingForJob(job);
+  if (!binding || !schedulingAuthorityMatches(job, binding)) return null;
+  const digest = await sha256Hex(canonicalSchedulingBinding(binding));
+  if (digest !== job.schedulingBindingDigest) return null;
+  const admission = await ctx.db.get(job.schedulingAdmissionId);
+  if (!admissionMatchesBinding(admission, binding, digest)) return null;
+  return { binding, admission, digest };
+}
+
+export function runtimeMatchesSchedulingAuthority(runtime: any, authority: {
+  binding: SchedulingBinding;
+  admission: any;
+  digest: string;
+}) {
+  return runtime?.schedulingBound === true
+    && runtime?.dispatchReady === true
+    && projectedSchedulingBindingMatches(
+      runtime,
+      authority.binding,
+      authority.admission._id,
+      authority.digest,
+    );
+}
+
 /**
  * Bind a legacy or newly inserted job to one immutable fair-scheduling group.
  * Any later repository/mission substitution conflicts with this admission and
  * fails closed before a worker reservation exists.
  */
-export async function ensureJobSchedulingAuthority(ctx: any, job: any, persistJobBinding = true) {
+export async function ensureJobSchedulingAuthority(ctx: any, job: any, dispatchReady?: boolean) {
   const derived = workGroupAuthority(job);
-  const admission = await ctx.db.query("jobSchedulingAdmissions")
-    .withIndex("by_job", (q: any) => q.eq("jobId", job._id)).first();
-  const expected: WorkGroupAuthority = admission ? {
-    missionGroupId: admission.missionGroupId,
-    projectGroupId: admission.projectGroupId,
-    projectRepository: admission.projectRepository,
-    schedulingGroupKey: admission.schedulingGroupKey,
-  } : derived;
-  if (admission && (
-    admission.missionGroupId !== derived.missionGroupId
-    || admission.projectGroupId !== derived.projectGroupId
-    || admission.projectRepository !== derived.projectRepository
-    || admission.schedulingGroupKey !== derived.schedulingGroupKey
-  )) return null;
-  if (persistedAuthorityConflicts(job, expected)) return null;
-  const existing = await ctx.db.query("workGroupScheduling")
-    .withIndex("by_group", (q: any) => q.eq("groupKey", expected.schedulingGroupKey)).first();
-  if (existing && (
-    existing.missionGroupId !== expected.missionGroupId
-    || existing.projectGroupId !== expected.projectGroupId
-    || existing.projectRepository !== expected.projectRepository
-  )) return null;
-  const now = Date.now();
-  const boundJob = { ...job, ...expected };
-  if (!admission) await ctx.db.insert("jobSchedulingAdmissions", {
-    jobId: job._id,
-    missionGroupId: expected.missionGroupId,
-    projectGroupId: expected.projectGroupId,
-    projectRepository: expected.projectRepository,
-    schedulingGroupKey: expected.schedulingGroupKey,
-    createdAt: now,
-  });
-  if (persistJobBinding && !schedulingAuthorityMatches(job, expected)) await ctx.db.patch(job._id, expected);
-  const scheduler = existing ? null : await ctx.db.query("dispatchSchedulerState")
-    .withIndex("by_key", (q: any) => q.eq("key", DISPATCH_SCHEDULER_KEY)).first();
-  const initialServiceSequence = Number(scheduler?.nextSequence ?? 0);
-  const scheduling = existing ?? {
-    _id: await ctx.db.insert("workGroupScheduling", {
-      groupKey: expected.schedulingGroupKey,
-      missionGroupId: expected.missionGroupId,
-      projectGroupId: expected.projectGroupId,
-      projectRepository: expected.projectRepository,
-      lastServedSequence: initialServiceSequence,
-      reservationCount: 0,
-      createdAt: now,
-      updatedAt: now,
-    }),
-    groupKey: expected.schedulingGroupKey,
-    missionGroupId: expected.missionGroupId,
-    projectGroupId: expected.projectGroupId,
-    projectRepository: expected.projectRepository,
-    lastServedSequence: initialServiceSequence,
-    reservationCount: 0,
-    createdAt: now,
-    updatedAt: now,
+  if (persistedAuthorityConflicts(job, derived)) return null;
+  const identity = identityForJob(job);
+  if ((job.workspaceLineage !== undefined && job.workspaceLineage !== identity.workspaceLineage)
+    || (job.retryLineage !== undefined && job.retryLineage !== identity.retryLineage)
+    || (identity.workerBranch && job.workerBranch !== undefined && job.workerBranch !== identity.workerBranch)) return null;
+  const normalized = {
+    ...job,
+    ...derived,
+    readonly: Boolean(job.readonly || !job.repo),
+    workerBranch: identity.workerBranch,
+    workspaceLineage: identity.workspaceLineage,
+    retryLineage: identity.retryLineage,
+    sourceBranch: job.sourceBranch ?? job.branch,
+    branch: identity.workerBranch ?? job.branch,
+    dispatchReady: dispatchReady ?? job.dispatchReady ?? (!Array.isArray(job.dependsOn) || job.dependsOn.length === 0),
   };
-  return { job: boundJob, scheduling };
+  const binding = schedulingBindingForJob(normalized);
+  if (!binding) return null;
+  const digest = await sha256Hex(canonicalSchedulingBinding(binding));
+  const admissions = await ctx.db.query("jobSchedulingAdmissions")
+    .withIndex("by_job", (q: any) => q.eq("jobId", job._id)).take(2);
+  if (admissions.length > 1) return null;
+  let admission = admissions[0];
+  if (admission) {
+    const authorityCompatible = admission.missionGroupId === binding.missionGroupId
+      && admission.projectGroupId === binding.projectGroupId
+      && admission.projectRepository === binding.projectRepository
+      && admission.schedulingGroupKey === binding.schedulingGroupKey;
+    if (!authorityCompatible || (admission.protocolVersion !== undefined && !admissionMatchesBinding(admission, binding, digest))) return null;
+    if (admission.protocolVersion === undefined) {
+      await ctx.db.patch(admission._id, {
+        protocolVersion: SCHEDULING_PROTOCOL_VERSION,
+        readonly: binding.readonly,
+        workerBranch: binding.workerBranch,
+        workspaceLineage: binding.workspaceLineage,
+        retryLineage: binding.retryLineage,
+        bindingDigest: digest,
+      });
+      admission = { ...admission, protocolVersion: SCHEDULING_PROTOCOL_VERSION, readonly: binding.readonly,
+        workerBranch: binding.workerBranch, workspaceLineage: binding.workspaceLineage,
+        retryLineage: binding.retryLineage, bindingDigest: digest };
+    }
+  } else {
+    const value = {
+      protocolVersion: SCHEDULING_PROTOCOL_VERSION,
+      jobId: job._id,
+      missionGroupId: binding.missionGroupId,
+      projectGroupId: binding.projectGroupId,
+      projectRepository: binding.projectRepository,
+      schedulingGroupKey: binding.schedulingGroupKey,
+      readonly: binding.readonly,
+      workerBranch: binding.workerBranch,
+      workspaceLineage: binding.workspaceLineage,
+      retryLineage: binding.retryLineage,
+      bindingDigest: digest,
+      createdAt: Date.now(),
+    };
+    const id = await ctx.db.insert("jobSchedulingAdmissions", value);
+    admission = { ...value, _id: id };
+  }
+  const scheduling = await schedulingGroupForBinding(ctx, binding);
+  if (!scheduling) return null;
+  const boundJob = { ...normalized,
+    schedulingProtocolVersion: SCHEDULING_PROTOCOL_VERSION,
+    schedulingAdmissionId: admission._id,
+    schedulingBindingDigest: digest,
+    schedulingBound: true,
+  };
+  const boundPatch = { ...boundJob };
+  delete boundPatch._id;
+  delete boundPatch._creationTime;
+  await ctx.db.patch(job._id, boundPatch);
+  await upsertJobRuntime(ctx, boundJob);
+  return { job: boundJob, admission, binding, scheduling };
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
 export async function insertJobWithRuntime(ctx: any, value: any) {
-  const jobId = await ctx.db.insert("jobs", value);
-  const admitted = await ensureJobSchedulingAuthority(ctx, { ...value, _id: jobId }, false);
-  if (!admitted) throw new Error("Job scheduling authority could not be admitted");
-  await upsertJobRuntime(ctx, admitted.job);
+  const normalized = {
+    ...value,
+    readonly: Boolean(value.readonly || !value.repo),
+    dispatchReady: value.dispatchReady ?? (!Array.isArray(value.dependsOn) || value.dependsOn.length === 0),
+  };
+  const jobId = await ctx.db.insert("jobs", normalized);
+  const provisional = { ...normalized, _id: jobId };
+  const identity = identityForJob(provisional);
+  const authority = workGroupAuthority(provisional);
+  const isolated = {
+    ...provisional,
+    ...authority,
+    sourceBranch: provisional.sourceBranch ?? provisional.branch,
+    workerBranch: identity.workerBranch,
+    workspaceLineage: identity.workspaceLineage,
+    retryLineage: identity.retryLineage,
+    branch: identity.workerBranch ?? provisional.branch,
+  };
+  const binding = schedulingBindingForJob(isolated);
+  if (!binding) throw new Error("Job scheduling authority could not be derived");
+  const digest = await sha256Hex(canonicalSchedulingBinding(binding));
+  const admissionValue = {
+    protocolVersion: SCHEDULING_PROTOCOL_VERSION,
+    jobId,
+    missionGroupId: binding.missionGroupId,
+    projectGroupId: binding.projectGroupId,
+    projectRepository: binding.projectRepository,
+    schedulingGroupKey: binding.schedulingGroupKey,
+    readonly: binding.readonly,
+    workerBranch: binding.workerBranch,
+    workspaceLineage: binding.workspaceLineage,
+    retryLineage: binding.retryLineage,
+    bindingDigest: digest,
+    createdAt: Date.now(),
+  };
+  const admissionId = await ctx.db.insert("jobSchedulingAdmissions", admissionValue);
+  const scheduling = await schedulingGroupForBinding(ctx, binding);
+  if (!scheduling) throw new Error("Job scheduling group conflicts with immutable admission");
+  const admitted = {
+    ...isolated,
+    schedulingProtocolVersion: SCHEDULING_PROTOCOL_VERSION,
+    schedulingAdmissionId: admissionId,
+    schedulingBindingDigest: digest,
+    schedulingBound: true,
+  };
+  const admittedPatch = { ...admitted };
+  delete admittedPatch._id;
+  delete admittedPatch._creationTime;
+  await ctx.db.patch(jobId, admittedPatch);
+  await ctx.db.insert("jobRuntime", projectJobRuntime(admitted));
   return jobId;
 }
 
 export async function patchJobWithRuntime(ctx: any, job: any, patch: Record<string, unknown>) {
   const prospective = { ...job, ...patch };
-  const currentAuthority = workGroupAuthority(job);
-  if (job.schedulingGroupKey && (
-    !schedulingAuthorityMatches(job, currentAuthority)
-    || workGroupAuthority(prospective).schedulingGroupKey !== currentAuthority.schedulingGroupKey
-    || persistedAuthorityConflicts(prospective, currentAuthority)
-  )) throw new Error("Immutable job scheduling authority cannot be changed");
-  const committedPatch = job.schedulingGroupKey ? patch : { ...patch, ...currentAuthority };
+  if (job.schedulingBound && IMMUTABLE_JOB_BINDING_FIELDS.some((field) => field in patch && patch[field] !== job[field])) {
+    throw new Error("Immutable job scheduling authority cannot be changed");
+  }
+  if (job.schedulingBound && (!schedulingAuthorityMatches(job) || !schedulingAuthorityMatches(prospective))) {
+    throw new Error("Immutable job scheduling authority is invalid");
+  }
+  const committedPatch = patch;
   const existing = await jobRuntimeFor(ctx, job._id);
   await ctx.db.patch(job._id, committedPatch);
   const projected = projectJobRuntime(mergeJobRuntimeSource(job, committedPatch, existing));
   if (existing) await ctx.db.replace(existing._id, projected);
   else await ctx.db.insert("jobRuntime", projected);
+}
+
+export async function quarantineJobRuntime(ctx: any, job: any, runtime?: any) {
+  const existing = runtime ?? await jobRuntimeFor(ctx, job._id);
+  if (!existing) return;
+  const quarantined = defined({
+    ...projectJobRuntime(job),
+    schedulingBound: false,
+    dispatchReady: false,
+    nextRunAt: undefined,
+  });
+  await ctx.db.replace(existing._id, quarantined);
+}
+
+export async function promoteCompletedJobDependents(ctx: any, source: any, now = Date.now()) {
+  if (!source.planParentMissionId || !source.planGeneration) return;
+  const edges = await ctx.db.query("goalPlanEdges")
+    .withIndex("by_source", (q: any) => q.eq("sourceJobId", source._id)
+      .eq("planGeneration", Number(source.planGeneration))).take(9);
+  const targetIds = [...new Set(edges.map((edge: any) => String(edge.targetJobId)))];
+  for (const targetId of targetIds) {
+    const id = ctx.db.normalizeId("jobs", targetId);
+    const target: any = id ? await ctx.db.get(id) : null;
+    if (!target || target.status !== "pending" || target.dispatchReady === true) continue;
+    const dependencies = await Promise.all((target.dependsOn ?? []).map((dependency: string) => {
+      const dependencyId = ctx.db.normalizeId("jobs", dependency);
+      return dependencyId ? ctx.db.get(dependencyId) : null;
+    }));
+    if (dependencies.length !== (target.dependsOn ?? []).length
+      || dependencies.some((dependency: any) => dependency?.status !== "done")) continue;
+    await patchJobWithRuntime(ctx, target, {
+      dispatchReady: true,
+      nextRunAt: target.nextRunAt ?? now,
+      progress: target.progress === "Queued · waiting for dependencies" ? "Queued · dependencies verified" : target.progress,
+    });
+  }
 }
 
 export async function insertMissionWithRuntime(ctx: any, value: any) {
