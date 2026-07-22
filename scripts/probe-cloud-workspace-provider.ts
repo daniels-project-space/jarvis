@@ -109,7 +109,8 @@ async function inspectVercelConfiguration(workspace: CloudWorkspace): Promise<{ 
   }
   if (!named) throw new Error("exact named Vercel Sandbox was absent from provider list observation");
   // The Sandbox API does not expose authoritative team/project plan or spend
-  // caps. Never turn configuration/defaults into quota proof.
+  // caps. The caller completes the safe lifecycle observation, then fails
+  // before it can construct a Vercel receipt from an assumption.
   return { ttlMs: detail.expiresAt.getTime() - detail.createdAt.getTime(), observedMemory: detail.memory };
 }
 
@@ -158,7 +159,12 @@ async function main() {
     if (binding.provider === "vercel") {
       if (!provider.hydrateDependencies) throw new Error("Vercel dependency lifecycle adapter is unavailable");
       await provider.hydrateDependencies(first);
-      await inspectVercelConfiguration(first);
+    }
+    // This reads the uploaded provider file through the fenced data plane;
+    // it proves the exact sandbox's file lifecycle rather than inferring it
+    // from the configured archive.
+    if (new TextDecoder().decode(await provider.readFile(first, "PROBE.txt", 4_000)) !== "provider-probe\n") {
+      throw new Error("provider file lifecycle observation failed");
     }
     const envResult = await provider.exec(first, {
       command: "node -e 'process.stdout.write(JSON.stringify(process.env))'",
@@ -223,10 +229,10 @@ async function main() {
     await provider.terminate(recreated, "terminal");
     recreated = null;
 
-    // Every provider-observable Vercel property above was freshly checked from
-    // the exact name/session, including dependency allow/relock and behavioral
-    // deny. A receipt still cannot be minted without the provider's own plan
-    // and spend-cap observation.
+    // Vercel's required plan/spend evidence is unavailable through an
+    // authoritative provider API. This is intentionally after the bounded
+    // provider exercise so it remains useful operational evidence, but before
+    // receipt construction: no quota proof is ever optimistic.
     if (binding.provider === "vercel") requireAuthoritativeVercelPlanAndSpendObservation();
 
     const probeTime = Date.now();

@@ -120,6 +120,14 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.logsClosed).toBeGreaterThan(0);
   });
 
+  it("applies one cumulative byte budget across stdout and stderr", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.logs = [{ stream: "stdout", data: "12345" }, { stream: "stderr", data: "67890" }];
+    await expect(provider.exec(workspace, { command: "printf mixed", timeoutMs: 1_000, maxOutputBytes: 8 })).rejects.toMatchObject({ code: "resource_limit" });
+    expect(observed.kills).toContain("cmd-1:SIGKILL");
+    expect(observed.logsClosed).toBe(1);
+  });
+
   it("fences filesystem access and bounds streaming reads without sandbox.fs helpers", async () => {
     const { provider, workspace } = await providerAndWorkspace();
     const file = `${workspace.root}/safe.txt`; observed.files.set(file, Buffer.from("hello"));
@@ -147,6 +155,16 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.updates).toContain("deny-all");
     expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
     expect(observed.commands.some((command) => String(command.args).includes("npm ci"))).toBe(false);
+  });
+
+  it("accepts only the exact HTTPS npm registry authority in a committed lock", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.files.set(`${workspace.root}/package-lock.json`, Buffer.from(JSON.stringify({ packages: {
+      "node_modules/a": { resolved: "http://registry.npmjs.org/a.tgz" },
+    } })));
+    await expect(provider.hydrateDependencies(workspace)).rejects.toMatchObject({ code: "unsafe_archive" });
+    expect(observed.commands.some((command) => String(command.args).includes("npm ci"))).toBe(false);
+    expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
   });
 
   it("treats a policy-transition session substitution as stale before npm can start", async () => {

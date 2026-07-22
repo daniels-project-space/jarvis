@@ -521,7 +521,11 @@ function packageLockUsesOnlyNpmRegistry(bytes: Uint8Array): boolean {
   return urls.every((url) => {
     try {
       const parsed = new URL(url);
-      return parsed.origin === "https://registry.npmjs.org" && !parsed.username && !parsed.password;
+      // `origin` normalizes an explicit default port. Keep the authority
+      // check deliberately narrow nonetheless: npm ci must not gain egress
+      // to a look-alike host, a credential-bearing URL, or a non-HTTPS URL.
+      return parsed.protocol === "https:" && parsed.hostname === "registry.npmjs.org"
+        && (parsed.port === "" || parsed.port === "443") && !parsed.username && !parsed.password;
     } catch { return false; }
   });
 }
@@ -572,6 +576,9 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
   private credentials() { return { token: this.token, teamId: this.teamId, projectId: this.projectId }; }
 
   async createWorkspace(input: { attemptKey: string; template: string; runtime: string; lockfileDigest: string; limits: WorkspaceLimits }) {
+    if (!Number.isSafeInteger(input.limits.ttlMs) || input.limits.ttlMs < 1) {
+      throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox attempt TTL must be a positive safe integer", "rejected");
+    }
     const { Sandbox } = await import("@vercel/sandbox");
     const listed = await Sandbox.list({ ...this.credentials(), namePrefix: VERCEL_NAME_PREFIX });
     let active = 0;
@@ -662,7 +669,8 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     if (result.exitCode === 42) throw new CloudWorkspaceError(this.name, "resource_limit", "file listing exceeds limit", "rejected");
     if (result.exitCode === 43) throw new CloudWorkspaceError(this.name, "unsafe_archive", "symlink encountered during bounded listing", "rejected");
     if (result.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "sandbox file listing failed", "deferred");
-    const names = result.stdout.subarray(0, result.stdout.byteLength && result.stdout[result.stdout.byteLength - 1] === 0 ? -1 : result.stdout.byteLength).toString("utf8").split("\0").filter(Boolean);
+    const listing = result.stdout.subarray(0, result.stdout.byteLength && result.stdout[result.stdout.byteLength - 1] === 0 ? -1 : result.stdout.byteLength);
+    const names = decodeOutput(listing).split("\0").filter(Boolean);
     if (names.length > maxEntries || names.some((name) => validateRelativePath(name, this.name) !== name)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "sandbox listing contains an unsafe entry", "rejected");
     this.assertSession(workspace, sandbox); return names;
   }
