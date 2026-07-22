@@ -284,6 +284,7 @@ export type FairWorkCandidate = Readonly<{
 
 export type FairWorkGroupState = Readonly<{
   activeCount: number;
+  lastServedSequence?: number;
 }>;
 
 /**
@@ -320,14 +321,25 @@ export function selectFairWork(
     oldestCreatedAt: Math.min(...rows.map((row) => row.createdAt)),
     state: groupStates.get(groupKey) ?? { activeCount: 0 },
   })).filter((group) => group.state.activeCount < MAX_ACTIVE_PER_WORK_GROUP)
-    .sort((left, right) => left.groupKey.localeCompare(right.groupKey));
+    .sort((left, right) => {
+      const leftSequence = left.state.lastServedSequence;
+      const rightSequence = right.state.lastServedSequence;
+      if (leftSequence !== undefined || rightSequence !== undefined) {
+        return Number(leftSequence ?? 0) - Number(rightSequence ?? 0)
+          || right.maxPriority - left.maxPriority
+          || left.oldestCreatedAt - right.oldestCreatedAt
+          || left.groupKey.localeCompare(right.groupKey);
+      }
+      return left.groupKey.localeCompare(right.groupKey);
+    });
 
-  if (!lastServedGroupKey) {
+  const hasServiceTickets = groups.some((group) => group.state.lastServedSequence !== undefined);
+  if (!lastServedGroupKey && !hasServiceTickets) {
     groups.sort((left, right) =>
       right.maxPriority - left.maxPriority
         || left.oldestCreatedAt - right.oldestCreatedAt
         || left.groupKey.localeCompare(right.groupKey));
-  } else {
+  } else if (lastServedGroupKey && !hasServiceTickets) {
     const afterCursor = groups.findIndex((group) => group.groupKey.localeCompare(lastServedGroupKey) > 0);
     const start = afterCursor < 0 ? 0 : afterCursor;
     groups.push(...groups.splice(0, start));

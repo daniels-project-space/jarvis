@@ -449,6 +449,7 @@ export default defineSchema({
     .index("by_status_priority", ["status", "priority", "createdAt"])
     .index("by_status_next_run", ["status", "nextRunAt", "createdAt"])
     .index("by_dispatch_ready", ["status", "schedulingBound", "dispatchReady", "nextRunAt", "createdAt"])
+    .index("by_group_dispatch_ready", ["schedulingGroupKey", "status", "schedulingBound", "dispatchReady", "nextRunAt", "createdAt"])
     .index("by_status_scheduling_bound", ["status", "schedulingBound", "priority", "createdAt"])
     .index("by_status_heartbeat", ["status", "heartbeatAt"])
     .index("by_status_progress", ["status", "progressAt"])
@@ -469,11 +470,21 @@ export default defineSchema({
     projectGroupId: v.string(),
     canonicalProjectId: v.optional(v.string()),
     projectRepository: v.optional(v.string()),
+    // One indexed queue head per immutable group replaces sampling arbitrary
+    // ends of the global jobs index. `queueEligible` is a durable time cursor:
+    // future heads become eligible in bounded due pages, and reservations
+    // move the group behind every not-yet-served peer.
+    queueHeadJobId: v.optional(v.id("jobs")),
+    queueHeadNextRunAt: v.optional(v.number()),
+    queueEligible: v.optional(v.boolean()),
     lastServedSequence: v.number(),
     reservationCount: v.number(),
     createdAt: v.number(),
     updatedAt: v.number(),
-  }).index("by_group", ["groupKey"]),
+  })
+    .index("by_group", ["groupKey"])
+    .index("by_queue_due", ["queueEligible", "queueHeadNextRunAt", "groupKey"])
+    .index("by_queue_service", ["queueEligible", "lastServedSequence", "groupKey"]),
 
   // Per-job immutable admission prevents a wholesale rewrite of the mutable
   // job document from moving work to another mission or repository group.
@@ -955,6 +966,10 @@ export default defineSchema({
     leaseVersion: v.number(),
     leaseUntil: v.optional(v.number()),
     expectedIntegrationBaseSha: v.optional(v.string()),
+    // Timestamp of the exact earlier provider observation that proved the
+    // expected base. Focused repair inherits it; Convex never fabricates a
+    // fresh observation timestamp for an unobserved ref.
+    expectedIntegrationBaseObservedAt: v.optional(v.number()),
     // Exact persisted old ref identity for GitHub updateRefs. The zero OID is
     // used only when the mission integration ref was intentionally absent.
     expectedIntegrationRefSha: v.optional(v.string()),

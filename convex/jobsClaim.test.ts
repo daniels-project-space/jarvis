@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
 import schema from "./schema";
+import { testMissionAdmission } from "./testSourceAdmission";
 
 declare global {
   interface ImportMeta {
@@ -24,12 +25,19 @@ type Policy = "manual" | "read_only" | "auto_merge";
 async function specialistFixture(policy: Policy = "manual", goalStage?: "validating") {
   const t = convexTest(schema, modules);
   const now = Date.now();
+  const admitted = await testMissionAdmission(t, {
+    key: `specialist-${policy}-${goalStage ?? "work"}`,
+    workerToken: WORKER,
+    repository: "daniels-project-space/jarvis",
+    sourceHeadSha: BASE,
+  });
   const jobId = await t.mutation(api.jobs.enqueue, {
     repo: "daniels-project-space/jarvis", task: "verified repository work",
     readonly: policy === "read_only", branch: policy === "read_only" ? "jarvis/reviewed" : undefined,
-    maxAttempts: 3, goalStage, workerToken: WORKER,
+    maxAttempts: 3, goalStage, missionId: String(admitted.missionId),
+    projectAdmission: admitted.projectAdmission, workerToken: WORKER,
   });
-  const branch = await t.run(async (ctx) => {
+  const authority = await t.run(async (ctx) => {
     const job: any = await ctx.db.get(jobId);
     if (!job) throw new Error("admitted specialist fixture missing");
     await ctx.db.patch(jobId, {
@@ -49,21 +57,25 @@ async function specialistFixture(policy: Policy = "manual", goalStage?: "validat
       dispatchId: "specialist-dispatch", stage: goalStage ?? "building", percent: 90,
       heartbeatAt: now, progressAt: now, updatedAt: now,
     });
-    return String(job.workerBranch ?? job.branch ?? "");
+    return {
+      branch: String(job.workerBranch ?? job.branch ?? ""),
+      authorityDigest: String(attempt!.authorityDigest),
+    };
   });
   const result = "specialist executed once";
   const note = "supervisor pass";
   const receipt = JSON.stringify({
     version: 1, jobId: String(jobId), attempt: 1, repository: "daniels-project-space/jarvis",
-    branch, baseSha: BASE, baseTreeSha: TREE, headSha: HEAD,
+    branch: authority.branch, baseSha: BASE, baseTreeSha: TREE, headSha: HEAD,
     headTreeSha: TREE, diffSha256: DIFF, agentEvidenceSha256: "f".repeat(64),
   });
   const commitArgs = {
-    jobId, expectedAttempt: 1, specialistRunId: "specialist-run", result, verificationNote: note,
+    jobId, expectedAttempt: 1, authorityDigest: authority.authorityDigest,
+    specialistRunId: "specialist-run", result, verificationNote: note,
     reviewReceiptJson: receipt, reviewReceiptSignature: SIGNATURE, reviewReceiptKeyId: "current-2026-07",
     reviewDiffSha256: DIFF, resultDigest: sha256(result), evidenceDigest: sha256(note), workerToken: WORKER,
   } as const;
-  return { t, jobId, result, note, receipt, commitArgs };
+  return { t, jobId, result, note, receipt, authorityDigest: authority.authorityDigest, commitArgs };
 }
 
 async function committedAndClaimed(policy: Policy = "manual", goalStage?: "validating") {
@@ -81,13 +93,15 @@ async function committedAndClaimed(policy: Policy = "manual", goalStage?: "valid
   });
   expect(claim).toMatchObject({ sourceWorkAttempt: 1, deliveryGeneration: 1, deliveryRunId: "controller-run" });
   const lease = await fixture.t.mutation(api.jobs.linearizeDelivery, {
-    jobId: fixture.jobId, expectedAttempt: 1, sourceWorkAttempt: 1, deliveryGeneration: 1,
+    jobId: fixture.jobId, expectedAttempt: 1, authorityDigest: fixture.authorityDigest,
+    sourceWorkAttempt: 1, deliveryGeneration: 1,
     deliveryRunId: "controller-run", deliveryAttemptId: claim!.activeDeliveryAttemptId,
     deliveryLeaseOwner: "controller-owner", deliveryLeaseToken: "controller-lease", workerToken: WORKER,
   });
   expect(lease).not.toBeNull();
   const fence = {
-    jobId: fixture.jobId, expectedAttempt: 1, sourceWorkAttempt: 1, deliveryGeneration: 1,
+    jobId: fixture.jobId, expectedAttempt: 1, authorityDigest: fixture.authorityDigest,
+    sourceWorkAttempt: 1, deliveryGeneration: 1,
     deliveryRunId: "controller-run", deliveryAttemptId: claim!.activeDeliveryAttemptId,
     deliveryLeaseOwner: "controller-owner", deliveryLeaseToken: "controller-lease",
     deliveryLeaseVersion: lease!.version, workerToken: WORKER,
@@ -114,9 +128,10 @@ describe("real Convex specialist/controller race matrix", () => {
     })).toBe(true);
     expect(await f.t.mutation(api.jobs.markVerifiedForDelivery, f.commitArgs)).toBe(false);
     const state = await rows(f.t);
-    expect(state.jobs[0]).toMatchObject({ status: "steering", steerRevision: 1 });
+    expect(state.jobs[0]).toMatchObject({ status: "pending", attempt: 2, steerRevision: 1 });
     expect(state.attempts).toHaveLength(2);
-    expect(state.attempts.map((attempt) => attempt.status)).toEqual(["steered", "queued"]);
+    expect(state.attempts.map((attempt) => attempt.status)).toEqual(["steered", "pending"]);
+    expect(state.attempts[1].authorityDigest).not.toBe(state.attempts[0].authorityDigest);
   });
 
   it("does not stall a multi-hour task while its exact Trigger heartbeat remains fresh", async () => {

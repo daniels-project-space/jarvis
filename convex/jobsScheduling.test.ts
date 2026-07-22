@@ -3,12 +3,11 @@ import { convexTest, type TestConvex } from "convex-test";
 import { api } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 import schema from "./schema";
-import { projectedDispatchCandidates } from "./jobs";
+import { testMissionAdmission } from "./testSourceAdmission";
 import {
   BACKGROUND_CONCURRENCY_LIMIT,
   DISPATCH_CANDIDATE_WINDOW_MAX,
   MAX_ACTIVE_PER_WORK_GROUP,
-  SCHEDULING_PROTOCOL_VERSION,
   workGroupAuthority,
 } from "../src/lib/work-scheduler";
 
@@ -39,11 +38,17 @@ async function enqueue(t: SchedulerTest, options: {
   repo?: string;
   label?: string;
 }): Promise<Id<"jobs">> {
+  const admitted = await testMissionAdmission(t, {
+    key: options.missionId,
+    workerToken: WORKER,
+    repository: options.repo,
+  });
   return await t.mutation(api.jobs.enqueue, {
     task: options.readonly === false
       ? "Implement the isolated scheduler fixture and verify its exact branch lineage."
       : "Inspect the isolated scheduler fixture and report bounded evidence.",
-    missionId: options.missionId,
+    missionId: String(admitted.missionId),
+    projectAdmission: admitted.projectAdmission,
     priority: options.priority ?? 50,
     readonly: options.readonly ?? true,
     repo: options.repo,
@@ -66,63 +71,33 @@ async function finishReservations(t: SchedulerTest, reservations: Array<{ jobId:
 }
 
 describe("project-group fair reservation authority", () => {
-  it("selects a 96-row window using only bounded compact projections before authority validation", async () => {
-    const rows = Array.from({ length: DISPATCH_CANDIDATE_WINDOW_MAX }, (_, index) => {
-      const jobId = `job-${index}`;
-      const missionId = `mission-${index % 12}`;
-      const authority = workGroupAuthority({ jobId, missionId });
-      return {
-        jobId, missionId, task: "compact", status: "pending", priority: 50,
-        stage: "queued", percent: 0, attempt: 1, maxAttempts: 12,
-        heartbeatAt: 1, createdAt: index + 1, updatedAt: index + 1, nextRunAt: 1,
-        readonly: true, workspaceLineage: `sandbox:${jobId}:lineage:1`,
-        retryLineage: `job:${jobId}:lineage:1`, ...authority,
-        schedulingProtocolVersion: SCHEDULING_PROTOCOL_VERSION,
-        schedulingAdmissionId: `admission-${index}`,
-        schedulingBindingDigest: "a".repeat(64), schedulingBound: true, dispatchReady: true,
-      };
-    });
-    const reads: Array<{ table: string; index?: string; limit?: number; order?: string }> = [];
-    const ctx = {
-      db: {
-        get: async () => { throw new Error("candidate selection must not point-read durable authority"); },
-        query(table: string) {
-          const read: { table: string; index?: string; limit?: number; order?: string } = { table };
-          reads.push(read);
-          const builder = {
-            withIndex(index: string, apply?: (q: any) => unknown) {
-              read.index = index;
-              const q: any = { eq: () => q, lte: () => q };
-              apply?.(q);
-              return builder;
-            },
-            order(order: string) { read.order = order; return builder; },
-            async take(limit: number) {
-              read.limit = limit;
-              if (read.index === "by_status_scheduling_bound") return [];
-              return read.order === "desc" ? rows.slice(-limit).reverse() : rows.slice(0, limit);
-            },
-            async first() { return null; },
-          };
-          return builder;
-        },
-      },
-    };
+  it("keeps a middle project group visible through more than three legacy sampling windows", async () => {
+    const t = convexTest(schema, modules);
+    const backlog = DISPATCH_CANDIDATE_WINDOW_MAX * 3 + 1;
+    for (let index = 0; index < 110; index += 1) {
+      await enqueue(t, { missionId: "mission-deep-old", priority: 50 });
+    }
+    const middle = await enqueue(t, { missionId: "mission-middle", priority: 100 });
+    for (let index = 111; index < backlog; index += 1) {
+      await enqueue(t, { missionId: "mission-deep-new", priority: 50 });
+    }
 
-    const result = await projectedDispatchCandidates(ctx, 2, BACKGROUND_CONCURRENCY_LIMIT);
-    expect(result.selected).toHaveLength(BACKGROUND_CONCURRENCY_LIMIT);
-    expect(reads).toEqual([
-      { table: "jobRuntime", index: "by_status_scheduling_bound", limit: BACKGROUND_CONCURRENCY_LIMIT + 1 },
-      { table: "jobRuntime", index: "by_status_scheduling_bound", limit: BACKGROUND_CONCURRENCY_LIMIT + 1 },
-      { table: "jobRuntime", index: "by_dispatch_ready", order: "asc", limit: DISPATCH_CANDIDATE_WINDOW_MAX / 2 },
-      { table: "jobRuntime", index: "by_dispatch_ready", order: "desc", limit: DISPATCH_CANDIDATE_WINDOW_MAX / 2 },
-      { table: "dispatchSchedulerState", index: "by_key" },
-    ]);
-    expect(reads.some((read) => ["jobs", "jobSchedulingAdmissions", "workGroupScheduling"].includes(read.table))).toBe(false);
+    const batch = await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: BACKGROUND_CONCURRENCY_LIMIT,
+      reason: "durable-group-head-starvation-proof",
+      workerToken: WORKER,
+    });
+    expect(batch.reservations.map((reservation) => reservation.jobId)).toContain(String(middle));
+    const projection = await t.run(async (ctx) => await ctx.db.query("workGroupScheduling").collect());
+    expect(projection).toHaveLength(3);
+    expect(projection.every((group) => group.queueHeadJobId || group.queueEligible === false)).toBe(true);
   });
 
   it("fills the first bounded wave across an oversized old group and two newly spoken groups", async () => {
     const t = convexTest(schema, modules);
+    const old = await testMissionAdmission(t, { key: "mission-old", workerToken: WORKER });
+    const newerB = await testMissionAdmission(t, { key: "mission-new-b", workerToken: WORKER });
+    const newerC = await testMissionAdmission(t, { key: "mission-new-c", workerToken: WORKER });
     // Eighty old rows exceed the scheduler's bounded candidate window; the
     // newest-side sample must still admit both later mission groups.
     for (let index = 0; index < 80; index += 1) await enqueue(t, { missionId: "mission-old" });
@@ -139,9 +114,9 @@ describe("project-group fair reservation authority", () => {
     }, {});
     expect(first.reservations).toHaveLength(BACKGROUND_CONCURRENCY_LIMIT);
     expect(counts).toEqual({
-      "mission-old": MAX_ACTIVE_PER_WORK_GROUP,
-      "mission-new-b": 1,
-      "mission-new-c": 1,
+      [String(old.missionId)]: MAX_ACTIVE_PER_WORK_GROUP,
+      [String(newerB.missionId)]: 1,
+      [String(newerC.missionId)]: 1,
     });
     expect(await t.mutation(api.jobs.reserveDispatchBatch, {
       limit: BACKGROUND_CONCURRENCY_LIMIT, reason: "already-saturated", workerToken: WORKER,
@@ -152,25 +127,30 @@ describe("project-group fair reservation authority", () => {
       limit: BACKGROUND_CONCURRENCY_LIMIT, reason: "bounded-second-wave", workerToken: WORKER,
     });
     expect(second.reservations).toHaveLength(MAX_ACTIVE_PER_WORK_GROUP);
-    expect(second.reservations.every((reservation) => reservation.missionGroupId === "mission-old")).toBe(true);
+    expect(second.reservations.every((reservation) => reservation.missionGroupId === String(old.missionId))).toBe(true);
   });
 
   it("serves a low-priority group in the next turn instead of allowing priority starvation", async () => {
     const t = convexTest(schema, modules);
+    const high = await testMissionAdmission(t, { key: "mission-high", workerToken: WORKER });
+    const low = await testMissionAdmission(t, { key: "mission-low", workerToken: WORKER });
     await enqueue(t, { missionId: "mission-high", priority: 100 });
     await enqueue(t, { missionId: "mission-high", priority: 100 });
     await enqueue(t, { missionId: "mission-low", priority: 1 });
 
     const first = await t.mutation(api.jobs.reserveDispatchBatch, { limit: 1, workerToken: WORKER });
-    expect(first.reservations[0]?.missionGroupId).toBe("mission-high");
-    await enqueue(t, { missionId: "mission-new-urgent", priority: 100 });
+    expect(first.reservations[0]?.missionGroupId).toBe(String(high.missionId));
+    // A newly arriving urgent project starts behind the already-due low group.
+    await enqueue(t, { missionId: "mission-new-urgent-0", priority: 100 });
     await finishReservations(t, first.reservations);
     const second = await t.mutation(api.jobs.reserveDispatchBatch, { limit: 1, workerToken: WORKER });
-    expect(second.reservations[0]?.missionGroupId).toBe("mission-low");
+    expect(second.reservations[0]?.missionGroupId).toBe(String(low.missionId));
   });
 
   it("dispatches same-repository writers from distinct missions in separate immutable lineages", async () => {
     const t = convexTest(schema, modules);
+    const firstMission = await testMissionAdmission(t, { key: "mission-repo-a", workerToken: WORKER, repository: REPO });
+    const secondMission = await testMissionAdmission(t, { key: "mission-repo-b", workerToken: WORKER, repository: REPO });
     const firstId = await enqueue(t, { missionId: "mission-repo-a", readonly: false, repo: REPO });
     const secondId = await enqueue(t, { missionId: "mission-repo-b", readonly: false, repo: REPO });
     const jobs = await t.run(async (ctx) => Promise.all([ctx.db.get(firstId), ctx.db.get(secondId)]));
@@ -180,7 +160,7 @@ describe("project-group fair reservation authority", () => {
     const batch = await t.mutation(api.jobs.reserveDispatchBatch, { limit: 2, workerToken: WORKER });
     expect(batch.reservations).toHaveLength(2);
     expect(new Set(batch.reservations.map((reservation) => reservation.missionGroupId)))
-      .toEqual(new Set(["mission-repo-a", "mission-repo-b"]));
+      .toEqual(new Set([String(firstMission.missionId), String(secondMission.missionId)]));
   });
 
   it("fails a same-mission shared-workspace injection closed before overlapping dispatch", async () => {
@@ -205,7 +185,8 @@ describe("project-group fair reservation authority", () => {
     const jobId = await enqueue(t, { missionId: "mission-repo-fence", readonly: false, repo: REPO });
     await t.run(async (ctx) => {
       const injected = "daniels-project-space/dropship-ai";
-      const forgedAuthority = workGroupAuthority({ _id: jobId, missionId: "mission-repo-fence", repo: injected });
+      const persisted = await ctx.db.get(jobId);
+      const forgedAuthority = workGroupAuthority({ _id: jobId, missionId: persisted?.missionId, repo: injected });
       await ctx.db.patch(jobId, { repo: injected, ...forgedAuthority });
       const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", jobId)).first();
       if (runtime) await ctx.db.patch(runtime._id, { repo: injected, ...forgedAuthority });
@@ -227,7 +208,8 @@ describe("project-group fair reservation authority", () => {
     await t.run(async (ctx) => {
       const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", jobId)).first();
       const injected = "daniels-project-space/dropship-ai";
-      const forged = workGroupAuthority({ jobId, missionId: "mission-runtime-forge", repo: injected });
+      const persisted = await ctx.db.get(jobId);
+      const forged = workGroupAuthority({ jobId, missionId: persisted?.missionId, repo: injected });
       await ctx.db.patch(runtime!._id, { repo: injected, ...forged });
     });
 

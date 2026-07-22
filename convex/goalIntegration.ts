@@ -1,8 +1,14 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
-import { attemptAuthorityFields, insertJobWithRuntime, patchJobWithRuntime, patchMissionWithRuntime, promoteCompletedJobDependents } from "./controlPlane";
-import { attemptWorkspaceKey } from "../src/lib/workspace-protocol";
+import {
+  ensureWorkAttempt,
+  insertJobWithRuntime,
+  patchJobWithRuntime,
+  patchMissionWithRuntime,
+  promoteCompletedJobDependents,
+  readAttemptExecutionAuthority,
+} from "./controlPlane";
 import { sealProjectSourceAdmission } from "../src/lib/source-admission";
 
 const LEASE_MS = 45_000;
@@ -253,6 +259,7 @@ async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, outcome: 
       deliveryGeneration: delivery?.generation ?? job.deliveryGeneration ?? null,
       cumulativeRetries: detail?.cumulativeRetries ?? attempt.cumulativeRetries,
       expectedBaseSha: attempt.expectedIntegrationBaseSha ?? null,
+      expectedBaseObservedAt: attempt.expectedIntegrationBaseObservedAt ?? null,
       expectedRefSha: attempt.expectedIntegrationRefSha ?? null,
       preparedHeadSha: attempt.preparedIntegrationHeadSha ?? null,
       preparedTreeSha: attempt.preparedIntegrationTreeSha ?? null,
@@ -420,8 +427,16 @@ export async function recoverExpiredIntegrationController(ctx: any, attempt: any
   const expiry = Math.min(Number(attempt.leaseUntil ?? 0), Number(attempt.controllerDeadlineAt ?? 0));
   if (expiry >= now) return null;
   const [mission, job] = await Promise.all([ctx.db.get(attempt.missionId), ctx.db.get(attempt.jobId)]);
+  const executionAuthority = job
+    ? await readAttemptExecutionAuthority(ctx, job, Number(attempt.workAttempt))
+    : null;
   const delivery: any = job?.activeDeliveryAttemptId ? await ctx.db.get(job.activeDeliveryAttemptId) : null;
-  if (!mission || !job || job.integrationAttemptId !== attempt._id
+  if (!mission || !job || !executionAuthority
+    || attempt.authorityDigest !== executionAuthority.authorityDigest
+    || attempt.schedulingBindingDigest !== executionAuthority.schedulingBindingDigest
+    || attempt.repository !== executionAuthority.repository
+    || attempt.integrationLineage !== executionAuthority.integrationLineage
+    || job.integrationAttemptId !== attempt._id
     || delivery?.integrationAttemptId !== attempt._id || delivery.status !== "running"
     || mission.activeIntegrationAttemptId !== attempt._id) return null;
   const head = await fifoHead(ctx, attempt.missionId, attempt.repository);
@@ -492,6 +507,7 @@ function exactFence(mission: any, attempt: any, args: any, job?: any) {
     && attempt.leaseOwner === args.leaseOwner
     && attempt.leaseToken === args.leaseToken
     && attempt.leaseVersion === args.leaseVersion
+    && attempt.authorityDigest === args.authorityDigest
     && Number(attempt.leaseUntil ?? 0) >= Date.now()
     && mission.integrationLeaseVersion === args.leaseVersion
     && mission.integrationLeaseOwner === args.leaseOwner
@@ -522,6 +538,9 @@ export async function queueReviewedIntegration(ctx: any, job: any, review: any, 
   const missionId = ctx.db.normalizeId("missions", job.missionId);
   const mission: any = missionId ? await ctx.db.get(missionId) : null;
   if (!mission || mission.mode !== "goal") return null;
+  const executionAuthority = await readAttemptExecutionAuthority(ctx, job, Number(job.attempt ?? 1));
+  if (!executionAuthority || executionAuthority.repository !== job.repo
+    || executionAuthority.integrationLineage !== job.integrationLineage) return null;
   const existing = await ctx.db.query("integrationAttempts")
     .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("workAttempt", job.attempt ?? 1)).first();
   if (existing) return existing.reviewReceiptDigest === reviewReceiptDigest ? existing : null;
@@ -533,6 +552,12 @@ export async function queueReviewedIntegration(ctx: any, job: any, review: any, 
     revisionWave: Number(job.goalWave ?? 0), workstreamId: String(job.goalWorkstreamId ?? job._id),
     repository: job.repo, sourceBranch: String(job.sourceBranch ?? mission.sourceBranch ?? "main"),
     workerBranch: job.workerBranch, integrationBranch: job.integrationBranch,
+    authorityDigest: executionAuthority.authorityDigest,
+    schedulingBindingDigest: executionAuthority.schedulingBindingDigest,
+    canonicalProjectId: executionAuthority.canonicalProjectId,
+    missionGroupId: executionAuthority.missionGroupId,
+    projectGroupId: executionAuthority.projectGroupId,
+    integrationLineage: executionAuthority.integrationLineage,
     reviewReceiptId, reviewReceiptDigest, reviewedBaseSha: String(review.baseSha),
     reviewedHeadSha: String(review.headSha), reviewedHeadTreeSha: String(review.headTreeSha),
     reviewedDiffSha256: String(review.diffSha256), status: waiting ? "provider_waiting" : "queued", leaseVersion: 0,
@@ -545,6 +570,7 @@ export async function queueReviewedIntegration(ctx: any, job: any, review: any, 
 const fenceArgs = {
   id: v.id("integrationAttempts"),
   controllerRunId: v.string(), leaseOwner: v.string(), leaseToken: v.string(), leaseVersion: v.number(),
+  authorityDigest: v.string(),
   workerToken: v.optional(v.string()),
 };
 
@@ -553,6 +579,7 @@ const fenceArgs = {
 export const claim = mutation({
   args: {
     id: v.id("integrationAttempts"), controllerRunId: v.string(), leaseOwner: v.string(), leaseToken: v.string(),
+    authorityDigest: v.string(),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
@@ -567,8 +594,19 @@ export const claim = mutation({
     if (Number(attempt.reconcileAfter ?? 0) > now) return null;
     const mission: any = await ctx.db.get(attempt.missionId);
     const job: any = await ctx.db.get(attempt.jobId);
+    const executionAuthority = job
+      ? await readAttemptExecutionAuthority(ctx, job, Number(attempt.workAttempt))
+      : null;
     const delivery: any = job?.activeDeliveryAttemptId ? await ctx.db.get(job.activeDeliveryAttemptId) : null;
     if (!mission || mission.mode !== "goal" || mission.status !== "running" || !job
+      || !executionAuthority || args.authorityDigest !== executionAuthority.authorityDigest
+      || attempt.authorityDigest !== executionAuthority.authorityDigest
+      || attempt.schedulingBindingDigest !== executionAuthority.schedulingBindingDigest
+      || attempt.canonicalProjectId !== executionAuthority.canonicalProjectId
+      || attempt.missionGroupId !== executionAuthority.missionGroupId
+      || attempt.projectGroupId !== executionAuthority.projectGroupId
+      || attempt.integrationLineage !== executionAuthority.integrationLineage
+      || attempt.repository !== executionAuthority.repository
       || job.integrationAttemptId !== attempt._id || job.deliveryRunId !== args.controllerRunId
       || delivery?.integrationAttemptId !== attempt._id || delivery?.deliveryRunId !== args.controllerRunId
       || delivery?.policy !== "mission_integration" || !["pending", "running"].includes(job.status)) return null;
@@ -587,13 +625,28 @@ export const claim = mutation({
     const until = now + LEASE_MS;
     // A recovered attempt retains its original exact CAS and reviewed cold
     // receipt. A new generation binds them once from the authoritative head.
-    const expectedIntegrationBaseSha = String(attempt.expectedIntegrationBaseSha ?? mission.integrationHeadSha ?? attempt.reviewedBaseSha);
+    let expectedIntegrationBaseSha = String(attempt.expectedIntegrationBaseSha ?? "");
+    let expectedIntegrationBaseObservedAt = Number(attempt.expectedIntegrationBaseObservedAt ?? 0);
+    if (!expectedIntegrationBaseSha) {
+      if (mission.integrationHeadSha) {
+        expectedIntegrationBaseSha = String(mission.integrationHeadSha);
+        expectedIntegrationBaseObservedAt = Number(mission.integrationObservedAt ?? 0);
+      } else {
+        expectedIntegrationBaseSha = String(attempt.reviewedBaseSha);
+        expectedIntegrationBaseObservedAt = Number(job.sourceObservedAt ?? 0);
+      }
+    }
+    if (!SHA.test(expectedIntegrationBaseSha) || !Number.isSafeInteger(expectedIntegrationBaseObservedAt)
+      || expectedIntegrationBaseObservedAt <= 0
+      || (mission.integrationHeadSha
+        ? expectedIntegrationBaseSha !== mission.integrationHeadSha
+        : expectedIntegrationBaseSha !== attempt.reviewedBaseSha || expectedIntegrationBaseSha !== job.sourceHeadSha)) return null;
     const expectedIntegrationRefSha = String(attempt.expectedIntegrationRefSha ?? mission.integrationHeadSha ?? ZERO_OID);
     await ctx.db.patch(attempt._id, {
       status: "claimed",
       controllerRunId: args.controllerRunId.slice(0, 160), leaseOwner: args.leaseOwner.slice(0, 160),
       leaseToken: args.leaseToken.slice(0, 160), leaseVersion: version, leaseUntil: until,
-      expectedIntegrationBaseSha, expectedIntegrationRefSha, updatedAt: now,
+      expectedIntegrationBaseSha, expectedIntegrationBaseObservedAt, expectedIntegrationRefSha, updatedAt: now,
       controllerState: "command", controllerStateSince: now,
       controllerDeadlineAt: now + CONTROLLER_STATE_MS.command, controllerHeartbeatAt: now,
     });
@@ -605,7 +658,8 @@ export const claim = mutation({
     await patchJobWithRuntime(ctx, job, { integrationState: "integrating", evidenceSummary: "signed worker receipt claimed by controller" });
     await appendEvent(ctx, { ...job, integrationAttemptId: attempt._id }, "integration_claimed", `Controller claimed integration generation ${attempt.generation}`);
     return { ...attempt, status: "claimed", controllerRunId: args.controllerRunId, leaseOwner: args.leaseOwner,
-      leaseToken: args.leaseToken, leaseVersion: version, leaseUntil: until, expectedIntegrationBaseSha, expectedIntegrationRefSha,
+      leaseToken: args.leaseToken, leaseVersion: version, leaseUntil: until,
+      expectedIntegrationBaseSha, expectedIntegrationBaseObservedAt, expectedIntegrationRefSha,
       controllerState: "command", controllerStateSince: now,
       controllerDeadlineAt: now + CONTROLLER_STATE_MS.command, controllerHeartbeatAt: now };
   },
@@ -734,16 +788,7 @@ export const observe = mutation({
 
 async function queueSteeredContinuation(ctx: any, job: any, now: number) {
   const nextAttempt = Number(job.attempt ?? 1) + 1;
-  const existing = await ctx.db.query("workAttempts")
-    .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", nextAttempt)).first();
-  if (!existing) await ctx.db.insert("workAttempts", {
-    jobId: job._id, attempt: nextAttempt, parentAttempt: job.attempt ?? 1, status: "pending",
-    ...await attemptAuthorityFields(ctx, job, nextAttempt),
-    workspaceLineage: job.workspaceLineage,
-    workspaceKey: job.workspaceLineage ? attemptWorkspaceKey(job.workspaceLineage, nextAttempt) : undefined,
-    workerBranch: job.workerBranch, sourceHeadSha: job.sourceHeadSha,
-    lastEventSeq: 0, livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now,
-  });
+  await ensureWorkAttempt(ctx, job, nextAttempt, "pending", now, { parentAttempt: job.attempt ?? 1 });
   await patchJobWithRuntime(ctx, job, {
     status: "pending", stage: "queued", progress: "provider truth reconciled — steering continuation queued",
     attempt: nextAttempt, startedAt: undefined, completedAt: undefined, nextRunAt: now,
@@ -751,6 +796,8 @@ async function queueSteeredContinuation(ctx: any, job: any, now: number) {
     reviewReceiptId: undefined, reviewReceiptDigest: undefined, reviewReceiptSignature: undefined,
     verificationVerdict: undefined, verificationNote: undefined, verifiedAt: undefined,
     dispatchId: undefined, dispatchLeaseUntil: undefined, workerRunId: undefined, deliveryRunId: undefined,
+    workerRuntime: undefined, providerRunState: undefined, providerObservedAt: undefined,
+    deliveryLeaseVersion: Math.max(0, Number(job.deliveryLeaseVersion ?? 0)) + 1,
     deliveryLeaseOwner: undefined, deliveryLeaseToken: undefined, deliveryLeaseUntil: undefined,
     heartbeatAt: now,
   });
@@ -1083,7 +1130,9 @@ export const failFocused = mutation({
     const release = await terminalReleaseDecisionForAttempt(ctx, attempt);
     if (!release.releasable || release.state === "applied_final") return null;
     const now = Date.now();
-    if (!job.canonicalProjectId || !SHA.test(String(attempt.expectedIntegrationBaseSha ?? ""))) return null;
+    if (!job.canonicalProjectId || !SHA.test(String(attempt.expectedIntegrationBaseSha ?? ""))
+      || !Number.isSafeInteger(attempt.expectedIntegrationBaseObservedAt)
+      || Number(attempt.expectedIntegrationBaseObservedAt) <= 0) return null;
     const projectAdmission = await sealProjectSourceAdmission({
       protocolVersion: 2,
       canonicalProjectId: job.canonicalProjectId,
@@ -1092,7 +1141,7 @@ export const failFocused = mutation({
       sourceBranch: attempt.integrationBranch,
       sourceRef: `refs/heads/${attempt.integrationBranch}`,
       sourceHeadSha: String(attempt.expectedIntegrationBaseSha),
-      sourceObservedAt: now,
+      sourceObservedAt: Number(attempt.expectedIntegrationBaseObservedAt),
     });
     const repairId = await insertJobWithRuntime(ctx, {
       repo: attempt.repository,
@@ -1115,12 +1164,6 @@ export const failFocused = mutation({
     });
     const repair: any = await ctx.db.get(repairId);
     if (!repair?.workspaceLineage) throw new Error("Focused repair lost its immutable workspace admission");
-    await ctx.db.insert("workAttempts", {
-      jobId: repairId, attempt: 1, status: "pending", workspaceLineage: repair?.workspaceLineage,
-      ...await attemptAuthorityFields(ctx, repair, 1),
-      workerBranch: repair?.workerBranch, workspaceKey: attemptWorkspaceKey(repair.workspaceLineage, 1),
-      lastEventSeq: 0, livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now,
-    });
     const terminal = await writeIntegrationTerminalReceipt(ctx, attempt, args.kind, { reason: args.reason, repairJobId: repairId });
     if (!storedTerminalReceipt(terminal)) throw new Error("focused integration terminal receipt could not be canonicalized");
     await ctx.db.patch(attempt._id, {
@@ -1190,6 +1233,11 @@ export async function controlIntegrationForJob(ctx: any, job: any, action: "paus
   if (!job.integrationAttemptId) return null;
   const attempt: any = await ctx.db.get(job.integrationAttemptId);
   if (!attempt || attempt.jobId !== job._id || TERMINAL.has(attempt.status)) return null;
+  const executionAuthority = await readAttemptExecutionAuthority(ctx, job, Number(attempt.workAttempt));
+  if (!executionAuthority || attempt.authorityDigest !== executionAuthority.authorityDigest
+    || attempt.schedulingBindingDigest !== executionAuthority.schedulingBindingDigest
+    || attempt.repository !== executionAuthority.repository
+    || attempt.integrationLineage !== executionAuthority.integrationLineage) return null;
   const mission: any = await ctx.db.get(attempt.missionId);
   const delivery: any = job.activeDeliveryAttemptId ? await ctx.db.get(job.activeDeliveryAttemptId) : null;
   const now = Date.now();

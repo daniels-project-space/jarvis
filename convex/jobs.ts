@@ -1,9 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { isResumeOnlyUntouchedGoalJob } from "../src/lib/goal-job-lifecycle";
 import { workApprovalPolicy } from "./workPolicy";
 import { exactTextWorkOrder } from "../src/lib/work-order";
-import { classifyWorkSafety, isOwnedRepository } from "../src/lib/work-safety";
 import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
 import { normalizeWorkModelTier } from "../src/lib/work-models";
@@ -22,7 +20,7 @@ import { verifiedGoalHandoffsForJob } from "./goalMode";
 import { claimDisposition, completionReceiptAllowed, isSha256Digest, replayEnvelope, shouldAdvanceAttempt } from "../src/lib/durable-attempt-protocol";
 import { canonicalWorkspaceCheckpoint, parseCanonicalWorkspaceCheckpoint } from "../src/lib/workspace-checkpoint";
 import {
-  attemptAuthorityFields,
+  ensureWorkAttempt,
   insertJobWithRuntime,
   jobRuntimeFor,
   patchMissionWithRuntime,
@@ -31,6 +29,7 @@ import {
   quarantineJobRuntime,
   readAttemptExecutionAuthority,
   readJobSchedulingAuthority,
+  refreshWorkGroupQueueProjection,
   runtimeMatchesSchedulingAuthority,
   runtimeJob,
   upsertJobRuntime,
@@ -41,6 +40,7 @@ import {
   DISPATCH_CANDIDATE_WINDOW_MAX,
   DISPATCH_SCHEDULER_KEY,
   immutableLineageIsValid,
+  MAX_ACTIVE_PER_WORK_GROUP,
   schedulingAuthorityMatches,
   SCHEDULING_PROTOCOL_VERSION,
   selectFairWork,
@@ -270,22 +270,9 @@ async function appendAttemptEvidence(ctx: any, row: any, type: string, message: 
 }
 
 async function ensureAttempt(ctx: any, jobId: any, attempt: number, status: string, now: number, patch: Record<string, unknown> = {}) {
-  const existing = await attemptFor(ctx, jobId, attempt);
-  if (existing) return existing;
   const job: any = await ctx.db.get(jobId);
   if (!job) throw new Error("Attempt job no longer exists");
-  const authority = await attemptAuthorityFields(ctx, job, attempt);
-  const workspaceLineage = job?.workspaceLineage;
-  const id = await ctx.db.insert("workAttempts", {
-    jobId, attempt, status, lastEventSeq: 0,
-    ...authority,
-    workspaceLineage,
-    workspaceKey: workspaceLineage ? attemptWorkspaceKey(workspaceLineage, attempt) : undefined,
-    workerBranch: job?.workerBranch,
-    sourceHeadSha: job?.sourceHeadSha,
-    livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now, ...patch,
-  });
-  return { _id: id, jobId, attempt, status, ...patch };
+  return await ensureWorkAttempt(ctx, job, attempt, status, now, patch);
 }
 
 const enqueueArgs = {
@@ -366,16 +353,8 @@ export const enqueue = mutation({
       createdAt: now,
     });
     const queued: any = await ctx.db.get(id);
-    // This early lifecycle row is the serialized cursor for queue, dispatch,
-    // launch and terminal events. Provider identities are bound later.
-    await ctx.db.insert("workAttempts", {
-      jobId: id, attempt: 1, status, lastEventSeq: 0,
-      ...await attemptAuthorityFields(ctx, queued, 1),
-      workspaceLineage: queued?.workspaceLineage,
-      workspaceKey: queued?.workspaceLineage ? attemptWorkspaceKey(queued.workspaceLineage, 1) : undefined,
-      workerBranch: queued?.workerBranch,
-      livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now,
-    });
+    // insertJobWithRuntime creates the immutable attempt-one envelope in the
+    // same transaction for every producer (fleet, Goal Mode and repair).
     if (queued) await appendAttemptEvidence(ctx, queued, approvalRequired ? "approval_requested" : "queued",
       approvalRequired ? `Waiting for Daniel's approval${approval.reason ? ` · ${approval.reason}` : ""}` : "Work queued",
       { stage: approvalRequired ? "approval" : "queued", percent: 0, evidenceKind: "intent", eventKey: `intent:${String(id)}` });
@@ -396,7 +375,7 @@ export const enqueue = mutation({
 
 // v3 is the explicit, bounded owner of historical scheduler admission. Hot
 // polls never infer or repair authority for legacy rows.
-const CONTROL_PLANE_MIGRATION = "scheduling-admission-v4-quarantine";
+const CONTROL_PLANE_MIGRATION = "scheduling-admission-v5-readonly-history";
 
 async function migrationState(ctx: any) {
   const existing = await ctx.db
@@ -418,9 +397,11 @@ async function migrationState(ctx: any) {
   return { ...value, _id: id };
 }
 
-// One bounded page both backfills the compact runtime row and repairs the old
-// false-positive software approval policy. The cursor is durable, so completed
-// history is never scanned again by the minute supervisor.
+// One bounded page builds only the compact display/scheduling projection. V1
+// jobs are durable history: rollout must never reinterpret their task, source,
+// approval, delivery, retry, attempt or status authority. The only supported
+// way to run that work again is an explicit owner-controlled enqueue that
+// creates a new v2 mission/job from a fresh provider observation.
 async function migrateLegacyJobsPage(ctx: any, migration?: any) {
   const state = migration ?? await migrationState(ctx);
   if (state.jobsComplete) return { scanned: 0, repaired: 0, complete: true };
@@ -434,78 +415,13 @@ async function migrateLegacyJobsPage(ctx: any, migration?: any) {
   const now = Date.now();
   let repaired = 0;
   for (const persisted of page.page) {
-    let row: any = persisted;
-    // v1 placed the full review patch on the hot jobs document. Re-home only
-    // structurally complete legacy receipts into the immutable cold table;
-    // malformed values stay unavailable rather than becoming delivery proof.
-    if (row.repo && row.reviewReceiptJson && row.reviewReceiptSignature && !row.reviewReceiptId) {
-      try {
-        const receipt = JSON.parse(row.reviewReceiptJson);
-        // Never truncate signed JSON: a truncated document is neither valid
-        // JSON nor the document its digest/signature describe.
-        if (String(row.reviewReceiptJson).length > REVIEW_RECEIPT_MAX_CHARS) throw new Error("legacy receipt exceeds limit");
-        const receiptJson = String(row.reviewReceiptJson);
-        const digest = await sha256Hex(receiptJson);
-        if (receipt?.jobId === String(row._id) && Number(receipt?.attempt) === (row.attempt ?? 1)
-          && receipt?.repository === row.repo && isSha256Digest(row.reviewReceiptSignature)
-          && isSha256Digest(receipt?.diffSha256) && isSha256Digest(receipt?.agentEvidenceSha256)) {
-          const existingReceipt = await ctx.db.query("reviewReceipts")
-            .withIndex("by_job_attempt_digest", (q: any) => q.eq("jobId", row._id).eq("attempt", row.attempt ?? 1).eq("receiptDigest", digest)).first();
-          const reviewReceiptId = existingReceipt?._id ?? await ctx.db.insert("reviewReceipts", {
-            jobId: row._id, attempt: row.attempt ?? 1, repository: row.repo, receiptJson, receiptDigest: digest,
-            signature: row.reviewReceiptSignature, diffSha256: receipt.diffSha256,
-            baseSha: String(receipt.baseSha ?? ""), headSha: String(receipt.headSha ?? ""), baseTreeSha: String(receipt.baseTreeSha ?? ""), headTreeSha: String(receipt.headTreeSha ?? ""),
-            agentEvidenceSha256: receipt.agentEvidenceSha256, createdAt: now,
-          });
-          await ctx.db.patch(row._id, { reviewReceiptId, reviewReceiptDigest: digest, reviewReceiptJson: undefined });
-          row = { ...row, reviewReceiptId, reviewReceiptDigest: digest, reviewReceiptJson: undefined };
-        }
-      } catch { /* fail closed; a malformed old row is not a review receipt */ }
-    }
-    // Old rows can already contain append-only evidence. Seed the job-wide
-    // cursor from it so rollout never restarts causal numbering at one.
-    // The sequence index finds the real durable maximum even for an old job
-    // with more than one migration-page worth of audit events.
-    const newest = await ctx.db.query("workEvents")
-      .withIndex("by_job_sequence", (q: any) => q.eq("jobId", String(row._id)))
-      .order("desc").first();
-    if (newest && Number(row.lifecycleSequence ?? 0) < Number(newest.sequence ?? 0)) {
-      await ctx.db.patch(row._id, { lifecycleSequence: Number(newest.sequence ?? 0), lifecycleEventKey: newest.eventKey });
-      row.lifecycleSequence = Number(newest.sequence ?? 0);
-      row.lifecycleEventKey = newest.eventKey;
-    }
-    const safety = row.status === "awaiting_approval" ? classifyWorkSafety(row.task, { repo: row.repo }) : null;
-    if (safety && !safety.approvalRequired && isOwnedRepository(row.repo)) {
-      const patch = {
-        status: "pending",
-        risk: row.risk === "consequential" ? "high" : row.risk,
-        approvalRequired: false,
-        approvalReason: undefined,
-        approvalStatus: "superseded",
-        deliveryMode: row.readonly === true ? "read_only" : "auto_merge",
-        stage: "queued",
-        progress: "autonomous software delivery enabled — queued",
-        nextRunAt: now,
-      };
-      await patchJobWithRuntime(ctx, row, patch);
-      row = { ...row, ...patch };
-      const approvals = await ctx.db
-        .query("approvals")
-        .withIndex("by_job", (q: any) => q.eq("jobId", String(row._id)))
-        .take(20);
-      for (const approval of approvals) {
-        if (approval.status === "pending") await ctx.db.patch(approval._id, { status: "superseded", resolvedAt: now });
-      }
-      await appendAttemptEvidence(ctx, row, "autonomy_reconciled", "Legacy software-delivery approval removed; verified delivery is automatic", {
-        stage: "queued", percent: row.percent ?? 0, evidenceKind: "reconcile", eventKey: `autonomy-reconciled:${row.attempt ?? 1}`,
-      });
+    // Projection writes are deliberately confined to jobRuntime. No write to
+    // the historical job, approval, event, receipt or attempt tables occurs.
+    await upsertJobRuntime(ctx, persisted);
+    if (!await readJobSchedulingAuthority(ctx, persisted)) {
+      await quarantineJobRuntime(ctx, persisted);
       repaired += 1;
     }
-    // Historical rows stay readable but maintenance never manufactures source
-    // or scheduling authority for them. Owner-selected legacy work must be
-    // re-enqueued as a new v2 ledger job with a fresh provider observation.
-    await upsertJobRuntime(ctx, row);
-    if (!await readJobSchedulingAuthority(ctx, row)) await quarantineJobRuntime(ctx, row);
   }
   const complete = page.isDone;
   await ctx.db.patch(state._id, {
@@ -519,8 +435,10 @@ async function migrateLegacyJobsPage(ctx: any, migration?: any) {
   return { scanned: page.page.length, repaired, complete };
 }
 
-// Goal workstream mode repair is similarly cursor-bound. One mission (and at
-// most the architecture's bounded 100 child rows) is examined per invocation.
+// Goal history follows the same read-only rollout rule as standalone jobs.
+// This phase builds display projections only; it never repairs an old job in
+// place because doing so would manufacture current execution authority from a
+// historical plan rather than a fresh source observation.
 async function migrateLegacyMissionsPage(ctx: any, migration?: any) {
   const state = migration ?? await migrationState(ctx);
   if (state.missionsComplete) return { scanned: 0, repaired: 0, complete: true };
@@ -532,39 +450,15 @@ async function migrateLegacyMissionsPage(ctx: any, migration?: any) {
   let repaired = 0;
   for (const mission of page.page) {
     await upsertMissionRuntime(ctx, mission);
-    const streams = mission.mode === "goal" && Array.isArray((mission.plan as any)?.workstreams)
-      ? (mission.plan as any).workstreams as Array<{ id?: string; readonly?: boolean }>
-      : [];
-    if (!streams.length) continue;
-    const byId = new Map(streams.map((stream) => [String(stream.id ?? ""), stream]));
     const jobs = await ctx.db
       .query("jobs")
       .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
       .take(100);
     for (const job of jobs) {
-      const patch: Record<string, unknown> = {};
-      if (isResumeOnlyUntouchedGoalJob(job)) {
-        patch.attempt = 1;
-        patch.checkpoint = undefined;
-        patch.progress = "Queued · waiting for dependencies";
-      }
-      if (job.goalStage === "building" && job.goalWorkstreamId) {
-        const stream = byId.get(String(job.goalWorkstreamId));
-        if (stream) {
-          const readonly = stream.readonly === true;
-          const deliveryMode = readonly ? "read_only" : "auto_merge";
-          if (job.readonly !== readonly || job.deliveryMode !== deliveryMode || (readonly && job.branch)) {
-            patch.readonly = readonly;
-            patch.deliveryMode = deliveryMode;
-            if (readonly) patch.branch = undefined;
-          }
-        }
-      }
-      if (Object.keys(patch).length) {
-        await patchJobWithRuntime(ctx, job, patch);
+      await upsertJobRuntime(ctx, job);
+      if (!await readJobSchedulingAuthority(ctx, job)) {
+        await quarantineJobRuntime(ctx, job);
         repaired += 1;
-      } else {
-        await upsertJobRuntime(ctx, job);
       }
     }
   }
@@ -693,20 +587,54 @@ export async function projectedDispatchCandidates(ctx: any, now: number, request
     if (lineage) activeWriteLineages.add(lineage);
   }
 
-  const candidateWindow = DISPATCH_CANDIDATE_WINDOW_MAX;
-  const sampleSize = Math.ceil(candidateWindow / 2);
-  // Sample both ends of the due index. A deep old backlog from one group must
-  // not hide a newly spoken mission beyond the bounded hot read window.
-  const [oldestDue, newestDue] = await Promise.all(["asc", "desc"].map((order) => ctx.db
-    .query("jobRuntime")
-    .withIndex("by_dispatch_ready", (q: any) => q.eq("status", "pending")
-      .eq("schedulingBound", true).eq("dispatchReady", true).lte("nextRunAt", now))
-    .order(order)
-    .take(sampleSize)));
-  const candidates = [...new Map([...oldestDue, ...newestDue]
-    .map((candidate: any) => [String(candidate.jobId), candidate])).values()]
-    .filter((candidate: any) => executableRuntimeProjection(candidate)
+  // Future queue heads are their own durable cursor. Each bounded promotion
+  // removes rows from this due page, so even more than three windows of newly
+  // due groups eventually become visible without scanning the jobs table.
+  const newlyDueGroups = await ctx.db.query("workGroupScheduling")
+    .withIndex("by_queue_due", (q: any) => q.eq("queueEligible", false).lte("queueHeadNextRunAt", now))
+    .take(DISPATCH_CANDIDATE_WINDOW_MAX);
+  for (const group of newlyDueGroups) await ctx.db.patch(group._id, { queueEligible: true, updatedAt: now });
+
+  // One row per immutable project group is ordered by its durable service
+  // ticket. A deep project backlog therefore occupies one window slot, not 96,
+  // and continuously arriving high-priority groups begin behind already-due
+  // unserved groups.
+  const dueGroups = await ctx.db.query("workGroupScheduling")
+    .withIndex("by_queue_service", (q: any) => q.eq("queueEligible", true))
+    .order("asc")
+    .take(DISPATCH_CANDIDATE_WINDOW_MAX);
+  const groupRows = new Map<string, any>();
+  const candidates: any[] = [];
+  for (const group of dueGroups) {
+    const groupKey = String(group.groupKey);
+    if ((activeByGroup.get(groupKey) ?? 0) >= MAX_ACTIVE_PER_WORK_GROUP) continue;
+    const rows = await ctx.db.query("jobRuntime")
+      .withIndex("by_group_dispatch_ready", (q: any) => q
+        .eq("schedulingGroupKey", groupKey)
+        .eq("status", "pending")
+        .eq("schedulingBound", true)
+        .eq("dispatchReady", true)
+        .lte("nextRunAt", now))
+      .order("asc")
+      .take(BACKGROUND_CONCURRENCY_LIMIT);
+    const executable = rows.filter((candidate: any) => executableRuntimeProjection(candidate)
       && typeof candidate.nextRunAt === "number" && candidate.nextRunAt <= now);
+    if (!executable.length) {
+      // A malformed or stale compact row must not pin the oldest service
+      // window forever. Disabling only its non-authoritative projection keeps
+      // execution fail-closed; an explicit authoritative transition can
+      // rebuild it later.
+      for (const candidate of rows) {
+        if (!executableRuntimeProjection(candidate)) {
+          await ctx.db.patch(candidate._id, { dispatchReady: false, updatedAt: now });
+        }
+      }
+      await refreshWorkGroupQueueProjection(ctx, groupKey, now);
+      continue;
+    }
+    groupRows.set(groupKey, group);
+    candidates.push(...executable);
+  }
   const fairCandidates = candidates.map((candidate: any) => ({
     id: String(candidate.jobId),
     groupKey: String(candidate.schedulingGroupKey),
@@ -716,13 +644,14 @@ export async function projectedDispatchCandidates(ctx: any, now: number, request
   }));
   const groupStates = new Map([...new Set(fairCandidates.map((candidate) => candidate.groupKey))].map((groupKey) => [groupKey, {
     activeCount: activeByGroup.get(groupKey) ?? 0,
+    lastServedSequence: Number(groupRows.get(groupKey)?.lastServedSequence ?? 0),
   }]));
   const scheduler = await ctx.db.query("dispatchSchedulerState")
     .withIndex("by_key", (q: any) => q.eq("key", DISPATCH_SCHEDULER_KEY)).first();
   const runtimeById = new Map(candidates.map((candidate: any) => [String(candidate.jobId), candidate]));
-  const selected = selectFairWork(fairCandidates, groupStates, activeWriteLineages, limit, scheduler?.lastGroupKey)
+  const selected = selectFairWork(fairCandidates, groupStates, activeWriteLineages, limit)
     .map((candidate) => runtimeById.get(candidate.id)).filter(Boolean);
-  return { selected, scheduler };
+  return { selected, scheduler, groupRows };
 }
 
 async function validateSelectedDispatchCandidate(ctx: any, runtime: any, now: number) {
@@ -787,23 +716,17 @@ async function runnableCandidates(ctx: any, now: number, requestedLimit: number)
     const candidate = await validateSelectedDispatchCandidate(ctx, runtime, now);
     if (candidate) validated.push(candidate);
   }
-  const authoritiesByGroup = new Map<string, any>();
-  for (const candidate of validated) {
-    const groupKey = candidate.authority.binding.schedulingGroupKey;
-    if (!authoritiesByGroup.has(groupKey)) authoritiesByGroup.set(groupKey, candidate.authority.binding);
-  }
-  const groupRows = new Map<string, any>();
-  for (const [groupKey, binding] of authoritiesByGroup) {
-    const rows = await ctx.db.query("workGroupScheduling")
-      .withIndex("by_group", (q: any) => q.eq("groupKey", groupKey)).take(2);
-    const group = rows.length === 1 ? rows[0] : null;
-    if (group && group.missionGroupId === binding.missionGroupId
+  const groupRows = projected.groupRows as Map<string, any>;
+  const authorized = validated.filter((candidate) => {
+    const binding = candidate.authority.binding;
+    const group = groupRows.get(binding.schedulingGroupKey);
+    return group && group.missionGroupId === binding.missionGroupId
       && group.projectGroupId === binding.projectGroupId
-      && group.projectRepository === binding.projectRepository) groupRows.set(groupKey, group);
-  }
+      && group.canonicalProjectId === binding.canonicalProjectId
+      && group.projectRepository === binding.projectRepository;
+  });
   return {
-    jobs: validated.filter((candidate) => groupRows.has(candidate.authority.binding.schedulingGroupKey))
-      .map((candidate) => candidate.job),
+    jobs: authorized.map((candidate) => candidate.job),
     groupRows,
     scheduler: projected.scheduler,
   };
@@ -1774,7 +1697,7 @@ export const touchHeartbeat = mutation({
 // without reopening or consuming specialist work.
 export const touchDeliveryHeartbeat = mutation({
   args: {
-    jobId: v.id("jobs"), expectedAttempt: v.number(), sourceWorkAttempt: v.number(),
+    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.string(), sourceWorkAttempt: v.number(),
     deliveryGeneration: v.number(), deliveryRunId: v.string(), deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
     deliveryLeaseOwner: v.optional(v.string()), deliveryLeaseToken: v.optional(v.string()), deliveryLeaseVersion: v.optional(v.number()), workerToken: v.optional(v.string()),
   },
@@ -1782,7 +1705,9 @@ export const touchDeliveryHeartbeat = mutation({
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     const delivery = await deliveryAttemptFor(ctx, a.jobId, a.sourceWorkAttempt, a.deliveryGeneration);
-    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt || !hasLiveControllerFence(row, delivery, a)
+    if (!row || !delivery || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
+      || !await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest)
+      || !hasLiveControllerFence(row, delivery, a)
       || delivery.status !== "running") return false;
     const now = Date.now();
     if (delivery.integrationAttemptId) {
@@ -1807,7 +1732,7 @@ export const touchDeliveryHeartbeat = mutation({
 // attempt, delivery generation, provider budget or attention item.
 export const releaseIntegrationQueueWait = mutation({
   args: {
-    jobId: v.id("jobs"), expectedAttempt: v.number(), sourceWorkAttempt: v.number(),
+    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.string(), sourceWorkAttempt: v.number(),
     deliveryGeneration: v.number(), deliveryRunId: v.string(), deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
     deliveryLeaseOwner: v.optional(v.string()), deliveryLeaseToken: v.optional(v.string()), deliveryLeaseVersion: v.optional(v.number()),
     workerToken: v.optional(v.string()),
@@ -1817,6 +1742,7 @@ export const releaseIntegrationQueueWait = mutation({
     const row: any = await ctx.db.get(a.jobId);
     const delivery: any = await deliveryAttemptFor(ctx, a.jobId, a.sourceWorkAttempt, a.deliveryGeneration);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
+      || !await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest)
       || !delivery || delivery.policy !== "mission_integration" || !hasLiveControllerFence(row, delivery, a)) return false;
     const now = Date.now();
     await ctx.db.patch(delivery._id, {
@@ -2543,7 +2469,7 @@ export const provideInput = mutation({
 // cannot replace it with another PR/head/effect identity.
 export const prepareDeliveryEffect = mutation({
   args: {
-    jobId: v.id("jobs"), expectedAttempt: v.number(), deliveryAttemptId: v.id("deliveryAttempts"),
+    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.string(), deliveryAttemptId: v.id("deliveryAttempts"),
     sourceWorkAttempt: v.number(), deliveryGeneration: v.number(), deliveryRunId: v.string(),
     deliveryLeaseOwner: v.string(), deliveryLeaseToken: v.string(), deliveryLeaseVersion: v.number(),
     effectId: v.string(), effectKind: v.union(v.literal("create_draft_pr"), v.literal("create_pr"), v.literal("promote_pr"), v.literal("merge_pr")),
@@ -2556,6 +2482,7 @@ export const prepareDeliveryEffect = mutation({
     const row: any = await ctx.db.get(a.jobId);
     const delivery: any = await ctx.db.get(a.deliveryAttemptId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
+      || !await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest)
       || !hasLiveControllerFence(row, delivery, a) || delivery.status !== "running") return null;
     if (a.reviewedHeadSha !== delivery.reviewedHeadSha || a.reviewedBaseSha !== delivery.reviewedBaseSha) return null;
     if (delivery.policy === "read_only") return null;
@@ -2593,7 +2520,7 @@ export const prepareDeliveryEffect = mutation({
 
 export const observeDeliveryEffect = mutation({
   args: {
-    jobId: v.id("jobs"), expectedAttempt: v.number(), deliveryAttemptId: v.id("deliveryAttempts"),
+    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.string(), deliveryAttemptId: v.id("deliveryAttempts"),
     sourceWorkAttempt: v.number(), deliveryGeneration: v.number(), deliveryRunId: v.string(),
     deliveryLeaseOwner: v.string(), deliveryLeaseToken: v.string(), deliveryLeaseVersion: v.number(),
     effectId: v.string(), observation: v.union(v.literal("applied"), v.literal("not_applied"), v.literal("unknown")),
@@ -2607,7 +2534,8 @@ export const observeDeliveryEffect = mutation({
     requireWorker(a.workerToken);
     const row: any = await ctx.db.get(a.jobId);
     const delivery: any = await ctx.db.get(a.deliveryAttemptId);
-    if (!row || row.status !== "running" || delivery.status !== "running"
+    if (!row || !delivery || row.status !== "running" || delivery.status !== "running"
+      || !await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest)
       || !hasLiveControllerFence(row, delivery, a) || delivery.preparedEffectId !== a.effectId) return false;
     if (a.observedPullRequestHead && a.observedPullRequestHead !== delivery.reviewedHeadSha) return false;
     if (a.observedPullRequestBase && a.observedPullRequestBase !== delivery.reviewedBaseSha) return false;
@@ -2653,6 +2581,7 @@ export const setDelivery = mutation({
   args: {
     jobId: v.id("jobs"),
     expectedAttempt: v.number(),
+    authorityDigest: v.string(),
     branch: v.optional(v.string()),
     pullRequestUrl: v.optional(v.string()),
     deliveryStatus: v.optional(v.union(
@@ -2684,7 +2613,8 @@ export const setDelivery = mutation({
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
-    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
+      || !await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest)) return false;
     if (!hasLiveDeliveryLease(row, a)) return false;
     const delivery = a.deliveryGeneration === undefined ? null : await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration));
     if (!delivery || !hasLiveControllerFence(row, delivery, a)) return false;
@@ -2745,14 +2675,15 @@ export const setDelivery = mutation({
 // writer rechecks status/attempt and never resurrects the old lease.
 export const linearizeDelivery = mutation({
   args: {
-    jobId: v.id("jobs"), expectedAttempt: v.number(), deliveryLeaseOwner: v.string(), deliveryLeaseToken: v.string(),
+    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.string(), deliveryLeaseOwner: v.string(), deliveryLeaseToken: v.string(),
     deliveryLeaseVersion: v.optional(v.number()), workerToken: v.optional(v.string()),
     sourceWorkAttempt: v.optional(v.number()), deliveryGeneration: v.optional(v.number()), deliveryRunId: v.optional(v.string()), deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
-    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return null;
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
+      || !await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest)) return null;
     const deliveryAttempt = a.deliveryGeneration === undefined ? null : await deliveryAttemptFor(
       ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration),
     );
@@ -2794,6 +2725,7 @@ export const markVerifiedForDelivery = mutation({
   args: {
     jobId: v.id("jobs"),
     expectedAttempt: v.number(),
+    authorityDigest: v.string(),
     result: v.string(),
     verificationNote: v.string(),
     reviewReceiptJson: v.optional(v.string()),
@@ -2814,7 +2746,8 @@ export const markVerifiedForDelivery = mutation({
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
-    if (!row || (row.attempt ?? 1) !== a.expectedAttempt) return false;
+    if (!row || (row.attempt ?? 1) !== a.expectedAttempt
+      || !await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest)) return false;
     const sourceAttempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (!sourceAttempt || sourceAttempt.workerRunId !== a.specialistRunId || sourceAttempt.workerRunId !== row.workerRunId) {
       // A response-loss replay occurs after the job projection is moved to
@@ -3138,6 +3071,9 @@ export const control = mutation({
     } else if (a.action === "steer" && ["pending", "dispatching", "running", "paused", "stalled", "steering"].includes(row.status)) {
       const steer = String(a.input ?? "").trim().slice(0, 2_000);
       if (!steer) return false;
+      // HTTP/Trigger retries of the same explicit user command are idempotent:
+      // they must not allocate successive workspaces or consume retry budget.
+      if (row.steer === steer && Number(row.steerRevision ?? 0) > 0) return true;
       const integrationControl = await controlIntegrationForJob(ctx, row, "steer");
       if (integrationControl?.reconcile) {
         const reconciling: any = await ctx.db.get(row._id) ?? row;
@@ -3147,31 +3083,73 @@ export const control = mutation({
         });
         return true;
       }
-      const running = row.status === "running";
-      if (running && !await closeAttempt("steered")) return false;
-      await patchJobWithRuntime(ctx, row, {
-        ...invalidateDeliveryLease(row),
-        status: running ? "steering" : row.status,
-        stage: running ? "steering" : row.stage,
-        steer,
-        steerRevision: (row.steerRevision ?? 0) + 1,
-        checkpoint: `${row.checkpoint ?? ""}\n\nDaniel steering instruction:\n${steer}`.trim().slice(-6_000),
-        progress: "Daniel supplied steering — the current attempt will checkpoint into a fresh scoped session",
-        deliveryLeaseUntil: undefined,
-        deliveryLeaseToken: undefined,
+      const nextAttempt = (row.attempt ?? 1) + 1;
+      if (!hasAttemptBudget(nextAttempt, row.maxAttempts ?? 12)) return false;
+      const priorAttempt = await ensureAttempt(ctx, a.jobId, row.attempt ?? 1, row.status, now);
+      if (!priorAttempt.completedAt) await ctx.db.patch(priorAttempt._id, {
+        status: "steered", completedAt: now, dispatchId: undefined, lastEventAt: now,
       });
-      if (running) {
-        await appendAttemptEvidence(ctx, row, "steer", `Daniel steering: ${steer.slice(0, 500)}`, {
-          stage: "steering", evidenceKind: "steering", eventKey: `control:steer:${row.attempt ?? 1}:${row.steerRevision ?? 0}`,
-          attempt: row.attempt ?? 1,
-        });
-        controlEventEmitted = true;
-        const nextAttempt = (row.attempt ?? 1) + 1;
-        await ensureAttempt(ctx, a.jobId, nextAttempt, "queued", now);
-        await appendAttemptEvidence(ctx, row, "queued", `Fresh attempt ${nextAttempt} reserved for steering continuation`, {
-          stage: "queued", evidenceKind: "intent", eventKey: `intent:${nextAttempt}`, attempt: nextAttempt,
+      const activeDelivery: any = row.activeDeliveryAttemptId ? await ctx.db.get(row.activeDeliveryAttemptId) : null;
+      if (activeDelivery && !["done", "blocked", "abandoned"].includes(activeDelivery.status)) {
+        await ctx.db.patch(activeDelivery._id, {
+          status: "abandoned", outcome: "stale", currentStep: "terminal",
+          retryReason: "superseded by fresh user steering", completedAt: now,
+          leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined,
+          heartbeatAt: now, updatedAt: now,
         });
       }
+      const steerRevision = (row.steerRevision ?? 0) + 1;
+      await appendAttemptEvidence(ctx, row, "steer", `Daniel steering: ${steer.slice(0, 500)}`, {
+        stage: "steering", evidenceKind: "steering",
+        eventKey: `control:steer:${row.attempt ?? 1}:${steerRevision}`,
+        attempt: row.attempt ?? 1,
+      });
+      await patchJobWithRuntime(ctx, row, {
+        ...invalidateDeliveryLease(row),
+        status: "pending",
+        stage: "queued",
+        attempt: nextAttempt,
+        steer,
+        steerRevision,
+        checkpoint: `${row.checkpoint ?? ""}\n\nDaniel steering instruction:\n${steer}`.trim().slice(-6_000),
+        progress: `Daniel supplied steering — fresh attempt ${nextAttempt} is immediately eligible`,
+        startedAt: undefined,
+        completedAt: undefined,
+        heartbeatAt: now,
+        progressAt: now,
+        nextRunAt: now,
+        dispatchId: undefined,
+        dispatchLeaseUntil: undefined,
+        workerRunId: undefined,
+        workerRuntime: undefined,
+        providerRunState: undefined,
+        providerObservedAt: undefined,
+        deliveryRunId: undefined,
+        activeDeliveryAttemptId: undefined,
+        deliveryGeneration: undefined,
+        deliveryLeaseUntil: undefined,
+        deliveryLeaseToken: undefined,
+        integrationAttemptId: undefined,
+        integrationState: undefined,
+        reviewReceiptId: undefined,
+        reviewReceiptDigest: undefined,
+        reviewReceiptSignature: undefined,
+        verificationVerdict: undefined,
+        verificationNote: undefined,
+        verifiedAt: undefined,
+        deliveryStatus: undefined,
+        pullRequestUrl: undefined,
+        mergeCommitSha: undefined,
+      });
+      await ensureAttempt(ctx, a.jobId, nextAttempt, "pending", now, {
+        parentAttempt: row.attempt ?? 1,
+        sourceHeadSha: row.sourceHeadSha,
+        parentCheckpointHeadSha: priorAttempt.checkpointHeadSha,
+      });
+      await appendAttemptEvidence(ctx, row, "queued", `Fresh attempt ${nextAttempt} queued immediately after steering`, {
+        stage: "queued", evidenceKind: "intent", eventKey: `intent:${nextAttempt}`, attempt: nextAttempt,
+      });
+      controlEventEmitted = true;
     } else return false;
     const retryNeedsApproval =
       a.action === "retry" && row.approvalRequired === true && row.approvalStatus !== "approved";

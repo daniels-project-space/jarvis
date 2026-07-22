@@ -1102,7 +1102,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             void (async () => {
               if (!await linearizeDelivery() || !deliveryLease) return;
               await convexMutation("jobs:touchDeliveryHeartbeat", {
-                jobId: job.jobId, expectedAttempt,
+                jobId: job.jobId, expectedAttempt, authorityDigest,
                 deliveryLeaseOwner: deliveryLease.owner, deliveryLeaseToken: deliveryLease.token,
                 deliveryLeaseVersion: deliveryLease.version, ...(deliveryFence ?? {}),
               }).catch(() => undefined);
@@ -1153,6 +1153,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               controllerRunId: String(job.deliveryRunId ?? job.workerRunId),
               leaseOwner: integrationOwner,
               leaseToken: integrationToken,
+              authorityDigest,
             }).catch(() => null);
             if (!claimed) {
               await deliveryMutation("jobs:releaseIntegrationQueueWait", {
@@ -1166,6 +1167,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               leaseOwner: integrationOwner,
               leaseToken: integrationToken,
               leaseVersion: Number(claimed.leaseVersion),
+              authorityDigest,
             };
             let integrationControllerState: "command" | "provider" | "reconcile" = "command";
             const integrationAbort = new AbortController();
@@ -1181,6 +1183,21 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             const integrationHeartbeat = setInterval(() => { void heartbeatIntegration(); }, 30_000);
             integrationHeartbeat.unref?.();
             try {
+            const integrationAuthority: any = await authorizeBoundary("integration");
+            const integrationAuthorityValid = integrationAuthority
+              && integrationAuthority.authorityDigest === authorityDigest
+              && claimed.authorityDigest === authorityDigest
+              && claimed.schedulingBindingDigest === job.schedulingBindingDigest
+              && claimed.canonicalProjectId === job.canonicalProjectId
+              && claimed.missionGroupId === job.missionGroupId
+              && claimed.projectGroupId === job.projectGroupId
+              && claimed.integrationLineage === job.integrationLineage
+              && claimed.repository === repo
+              && job.projectRepository === repo
+              && integrationAuthority.repository === repo
+              && integrationAuthority.integrationLineage === job.integrationLineage
+              && claimed.integrationBranch === job.integrationBranch;
+            if (!integrationAuthorityValid) return;
             const integrationDir = `/tmp/work/integration-${jobKey}-${Number(claimed.generation)}`;
             rmSync(integrationDir, { recursive: true, force: true });
             const remote = githubRepoUrl(repo);
@@ -1814,7 +1831,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         });
         if (run.stopped) {
           if (run.stopped === "steered") {
-            await convexMutation("jobs:checkpointAndRequeue", {
+            await checkpointMutation({
               jobId: job.jobId,
               expectedAttempt,
               checkpoint: `${checkpointText}\n\nA steering instruction arrived. Start a fresh scoped session from this checkpoint.`,
@@ -1933,7 +1950,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         });
         const failedRun = /^error:/i.test(result) || result === "(no output)";
         if ((run.timedOut || failedRun) && !cloneFailed && !pushFailed) {
-          const continuation = await convexMutation("jobs:checkpointAndRequeue", {
+          const continuation = await checkpointMutation({
             jobId: job.jobId,
             expectedAttempt,
             checkpoint: continuationCheckpoint,
@@ -1962,7 +1979,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         }
 
         if (deliveryRetry) {
-          const continuation = await convexMutation("jobs:checkpointAndRequeue", {
+          const continuation = await checkpointMutation({
             jobId: job.jobId,
             expectedAttempt,
             checkpoint: [
@@ -2013,7 +2030,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             if (job.goalStage === "planning") parseGoalPlan(result, 8);
             else parseGoalValidation(result);
           } catch (error) {
-            await convexMutation("jobs:checkpointAndRequeue", {
+            await checkpointMutation({
               jobId: job.jobId,
               expectedAttempt,
               checkpoint:
@@ -2034,7 +2051,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               agentEvidence: cumulativeWorkEvidence(job.checkpoint, result), commands: run.commands,
             });
             if (!receipt.ok) {
-              await convexMutation("jobs:checkpointAndRequeue", {
+              await checkpointMutation({
                 jobId: job.jobId, expectedAttempt,
                 checkpoint: `Goal evidence is complete, but the controller could not bind its immutable Git receipt: ${receipt.note}`,
                 checkpointHeadSha: checkpointHeadSha || undefined,
@@ -2044,7 +2061,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }
             const signingAuthority = await trustedGitReviewReceiptAuthority();
             if (!signingAuthority || !repositoryDeliveryReadiness(true, signingAuthority).ready) {
-              await convexMutation("jobs:checkpointAndRequeue", {
+              await checkpointMutation({
                 jobId: job.jobId, expectedAttempt,
                 checkpoint: "Repository completion is held: the trusted controller receipt authority is unavailable. Do not rerun the specialist.",
                 checkpointHeadSha: checkpointHeadSha || undefined,
@@ -2059,7 +2076,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               ...completionEvidence(result.slice(0, 4_000), `${job.goalStage === "planning" ? "Goal plan" : "Deep validation"} machine contract is structurally valid`, goalReview),
             }).catch(() => false);
             if (!persisted) {
-              await convexMutation("jobs:checkpointAndRequeue", {
+              await checkpointMutation({
                 jobId: job.jobId, expectedAttempt,
                 checkpoint: "Goal completion is held because its controller review receipt could not be persisted. Do not rerun the specialist.",
                 checkpointHeadSha: checkpointHeadSha || undefined,
@@ -2106,7 +2123,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             commands: run.commands,
           });
           if (!receipt.ok) {
-            const continuation = await convexMutation("jobs:checkpointAndRequeue", {
+            const continuation = await checkpointMutation({
               jobId: job.jobId,
               expectedAttempt,
               checkpoint: [
@@ -2132,7 +2149,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }
           const signingAuthority = await trustedGitReviewReceiptAuthority();
           if (!signingAuthority || !repositoryDeliveryReadiness(true, signingAuthority).ready) {
-            await convexMutation("jobs:checkpointAndRequeue", {
+            await checkpointMutation({
               jobId: job.jobId, expectedAttempt,
               checkpoint: "Repository delivery is held: the controller receipt signer is unavailable. Do not rerun the specialist.",
               checkpointHeadSha: checkpointHeadSha || undefined,
@@ -2165,7 +2182,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         ).catch(() => null);
         if (await stopIfLeaseLost(`Supervisor review interrupted.\n\n${continuationCheckpoint}`, result, branch)) return;
         if (!verify) {
-          const continuation = await convexMutation("jobs:checkpointAndRequeue", {
+          const continuation = await checkpointMutation({
             jobId: job.jobId,
             expectedAttempt,
             checkpoint:
@@ -2186,7 +2203,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           return;
         }
         if (verify.verdict === "concerns") {
-          const continuation = await convexMutation("jobs:checkpointAndRequeue", {
+          const continuation = await checkpointMutation({
             jobId: job.jobId,
             expectedAttempt,
             checkpoint:
@@ -2206,7 +2223,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           return;
         }
         if (verify?.verdict === "needs_input" && verify.answer) {
-          const continuation = await convexMutation("jobs:checkpointAndRequeue", {
+          const continuation = await checkpointMutation({
             jobId: job.jobId,
             expectedAttempt,
             checkpoint:
@@ -2278,8 +2295,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             ...completionEvidence(result.slice(0, 4_000), verify.note || "Supervisor check passed", gitReview),
           }).catch(() => false);
           if (!persisted) {
-            await convexMutation("jobs:checkpointAndRequeue", {
-            jobId: job.jobId, expectedAttempt, specialistRunId: String(job.workerRunId),
+            await checkpointMutation({
+              jobId: job.jobId, expectedAttempt,
               checkpoint: "Supervisor verification passed, but the immutable controller review receipt could not be persisted. Do not rerun the specialist.",
               checkpointHeadSha: checkpointHeadSha || undefined,
               result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: 30_000,

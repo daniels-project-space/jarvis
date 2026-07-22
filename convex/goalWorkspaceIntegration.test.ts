@@ -14,6 +14,7 @@ import {
 import schema from "./schema";
 import { GENERATED_GATED_ACTION_MATRIX } from "../src/mastra/fixtures/action-scope-regressions";
 import { goalWorkApprovalPolicy } from "./workPolicy";
+import { testProjectSourceAdmission } from "./testSourceAdmission";
 
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
@@ -36,6 +37,37 @@ const CLAUSE_BOUNDARY_AND_LIFECYCLE_EXPLOITS = [
 beforeEach(() => { process.env.JARVIS_WORKER_TOKEN = TOKEN; vi.useRealTimers(); });
 afterEach(() => { delete process.env.JARVIS_WORKER_TOKEN; vi.useRealTimers(); });
 
+async function createGoalFixture(t: ReturnType<typeof convexTest>, args: any) {
+  return await t.mutation(api.goalMode.create, {
+    ...args,
+    projectAdmission: await testProjectSourceAdmission(args.primaryRepo, BASE),
+  });
+}
+
+async function recordPlanFixture(t: ReturnType<typeof convexTest>, args: any) {
+  const mission: any = await t.run(async (ctx) => ctx.db.get(args.id));
+  const repositories = new Set<string | undefined>();
+  for (const stream of args.plan?.workstreams ?? []) {
+    repositories.add(stream.repo || (!stream.readonly ? mission?.primaryRepo || args.plan?.primaryRepo : undefined));
+  }
+  const projectAdmissions = await Promise.all([...repositories].map((repository) =>
+    testProjectSourceAdmission(repository, BASE)));
+  return await t.mutation(api.goalMode.recordPlan, { ...args, projectAdmissions });
+}
+
+async function claimIntegrationFixture(t: ReturnType<typeof convexTest>, args: any) {
+  const row: any = await t.run(async (ctx) => ctx.db.get(args.id));
+  return await t.mutation(api.goalIntegration.claim, {
+    ...args,
+    authorityDigest: row?.authorityDigest,
+  });
+}
+
+async function jobAuthorityDigest(t: ReturnType<typeof convexTest>, jobId: any, attempt: number) {
+  return await t.run(async (ctx) => String((await ctx.db.query("workAttempts")
+    .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", attempt)).first())?.authorityDigest ?? ""));
+}
+
 async function plannedGoal() {
   const { t, missionId } = await goalAwaitingPlan();
   const plan = {
@@ -49,7 +81,7 @@ async function plannedGoal() {
     ],
     validation: { criteria: ["Integrated result works"], tests: ["npm test"], liveChecks: [] },
   };
-  expect(await t.mutation(api.goalMode.recordPlan, {
+  expect(await recordPlanFixture(t, {
     id: missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
   })).toMatchObject({ advanced: true, jobs: 2 });
   const jobs = await t.run(async (ctx) => (await ctx.db.query("jobs")
@@ -60,7 +92,7 @@ async function plannedGoal() {
 
 async function goalAwaitingPlan(maxBuildSessions = 4) {
   const t = convexTest(schema, modules);
-  const created = await t.mutation(api.goalMode.create, {
+  const created = await createGoalFixture(t, {
     goal: "Make the Dropship catalogue and content metrics durable in parallel",
     route: "existing_project", routeReason: "owned product", primaryRepo: REPO,
     infrastructureContext: "Preserve the owned Dropship infrastructure.", maxBuildSessions,
@@ -88,7 +120,7 @@ async function splitGoal() {
     ],
     validation: { criteria: ["split"], tests: [], liveChecks: [] },
   };
-  const result = await f.t.mutation(api.goalMode.recordPlan, {
+  const result = await recordPlanFixture(f.t, {
     id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
   });
   const parent: any = await f.t.run(async (ctx) => ctx.db.get(f.missionId));
@@ -111,6 +143,7 @@ async function dispatch(t: ReturnType<typeof convexTest>, count: number, prefix:
 }
 
 async function review(t: ReturnType<typeof convexTest>, job: any, workerRunId: string, head: string, tree: string) {
+  const authorityDigest = await jobAuthorityDigest(t, job._id, 1);
   const result = `specialist result for ${job.goalWorkstreamId}`;
   const note = `review passed for ${job.workerBranch}`;
   const receipt = JSON.stringify({
@@ -119,11 +152,11 @@ async function review(t: ReturnType<typeof convexTest>, job: any, workerRunId: s
     headTreeSha: tree, diffSha256: "3".repeat(64), agentEvidenceSha256: "4".repeat(64),
   });
   expect(await t.mutation(api.jobs.bindWorkspaceSource, {
-    jobId: job._id, expectedAttempt: 1, workerRunId,
+    jobId: job._id, expectedAttempt: 1, authorityDigest, workerRunId,
     sourceBranch: job.sourceBranch, sourceHeadSha: BASE, workerToken: TOKEN,
   })).toBe(true);
   expect(await t.mutation(api.jobs.markVerifiedForDelivery, {
-    jobId: job._id, expectedAttempt: 1, specialistRunId: workerRunId,
+    jobId: job._id, expectedAttempt: 1, authorityDigest, specialistRunId: workerRunId,
     result, verificationNote: note, reviewReceiptJson: receipt,
     reviewReceiptSignature: "5".repeat(64), reviewReceiptKeyId: "test-key",
     reviewDiffSha256: "3".repeat(64), resultDigest: sha256(result), evidenceDigest: sha256(note),
@@ -132,8 +165,9 @@ async function review(t: ReturnType<typeof convexTest>, job: any, workerRunId: s
 }
 
 async function finalizeReadonly(t: ReturnType<typeof convexTest>, job: any, result: string, note: string) {
+  const authorityDigest = await jobAuthorityDigest(t, job._id, Number(job.attempt ?? 1));
   expect(await t.mutation(api.jobs.finalize, {
-    jobId: job._id, expectedAttempt: Number(job.attempt ?? 1), status: "done",
+    jobId: job._id, expectedAttempt: Number(job.attempt ?? 1), authorityDigest, status: "done",
     result, verificationVerdict: "pass", verificationNote: note,
     resultDigest: sha256(result), evidenceDigest: sha256(note), workerToken: TOKEN,
   })).toBe(true);
@@ -141,7 +175,8 @@ async function finalizeReadonly(t: ReturnType<typeof convexTest>, job: any, resu
 
 async function finishIntegration(t: ReturnType<typeof convexTest>, row: any, claim: any, head: string, tree: string, suffix: string) {
   const fence = { id: row._id, controllerRunId: claim.controllerRunId, leaseOwner: claim.leaseOwner,
-    leaseToken: claim.leaseToken, leaseVersion: claim.leaseVersion, workerToken: TOKEN };
+    leaseToken: claim.leaseToken, leaseVersion: claim.leaseVersion,
+    authorityDigest: row.authorityDigest, workerToken: TOKEN };
   const effectId = `effect-${suffix}`;
   expect(await t.mutation(api.goalIntegration.prepare, {
     ...fence, effectId, effectKind: "update_ref", provider: "github",
@@ -169,12 +204,13 @@ async function claimedFirstIntegration(prefix: string) {
     .sort((left, right) => left.generation - right.generation);
   const [controller] = await dispatch(f.t, 2, `${prefix}-controller`);
   const current = integrations[0];
-  const claim = await f.t.mutation(api.goalIntegration.claim, {
+  const claim = await claimIntegrationFixture(f.t, {
     id: current._id, controllerRunId: String(controller.claim!.deliveryRunId),
     leaseOwner: `${prefix}-owner`, leaseToken: `${prefix}-token`, workerToken: TOKEN,
   });
   const fence = { id: current._id, controllerRunId: claim!.controllerRunId, leaseOwner: claim!.leaseOwner,
-    leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
+    leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion,
+    authorityDigest: current.authorityDigest, workerToken: TOKEN };
   return { ...f, integrations, current, claim, fence };
 }
 
@@ -215,7 +251,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       })),
       validation: { criteria: ["all effects gated"], tests: [], liveChecks: [] },
     };
-    expect(await building.t.mutation(api.goalMode.recordPlan, {
+    expect(await recordPlanFixture(building.t, {
       id: building.missionId,
       expectedAdvanceAttempt: 1,
       plan,
@@ -292,19 +328,19 @@ describe("real Convex multi-agent workspace and integration races", () => {
   it("rejects invalid DAG authority records before dispatch creates a specialist", async () => {
     const f = await goalAwaitingPlan();
     const plan = (workstreams: Array<{ id: string; dependsOn: string[] }>) => ({ workstreams });
-    await expect(f.t.mutation(api.goalMode.recordPlan, {
+    await expect(recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1,
       plan: plan([{ id: "same", dependsOn: [] }, { id: "same", dependsOn: [] }]), workerToken: TOKEN,
     })).rejects.toThrow(/duplicate workstream id/);
-    await expect(f.t.mutation(api.goalMode.recordPlan, {
+    await expect(recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1,
       plan: plan([{ id: "a", dependsOn: ["missing"] }, { id: "b", dependsOn: [] }]), workerToken: TOKEN,
     })).rejects.toThrow(/unknown workstream/);
-    await expect(f.t.mutation(api.goalMode.recordPlan, {
+    await expect(recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1,
       plan: plan([{ id: "a", dependsOn: ["b"] }, { id: "b", dependsOn: ["a"] }]), workerToken: TOKEN,
     })).rejects.toThrow(/cycle/);
-    await expect(f.t.mutation(api.goalMode.recordPlan, {
+    await expect(recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1,
       plan: plan(Array.from({ length: 5 }, (_, index) => ({ id: `fanout-${index}`, dependsOn: [] }))), workerToken: TOKEN,
     })).rejects.toThrow(/bounded/);
@@ -326,7 +362,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       ],
       validation: { criteria: ["split"], tests: [], liveChecks: [] },
     };
-    await expect(f.t.mutation(api.goalMode.recordPlan, {
+    await expect(recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     })).resolves.toMatchObject({
       advanced: true, stale: false, splitRequired: true,
@@ -354,7 +390,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(authority.nodes.map((node) => node.nodeId).sort()).toEqual(["catalog", "jarvis", "research"]);
     expect(authority.edges).toHaveLength(0);
     expect(authority.nodes.every((node) => authority.jobs.some((job) => job._id === node.jobId && job.planDigest === node.planDigest))).toBe(true);
-    expect(await f.t.mutation(api.goalMode.recordPlan, {
+    expect(await recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     })).toMatchObject({ advanced: true, stale: false, replay: true, jobs: 3 });
     expect((await f.t.run(async (ctx) => ctx.db.query("missions").collect())).filter((row) => row.parentMissionId === f.missionId)).toHaveLength(3);
@@ -377,7 +413,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       summary: "Worst-case bounded parent DAG", route: "existing_project", primaryRepo: REPO, assumptions: [],
       workstreams, validation: { criteria: ["bounded"], tests: [], liveChecks: [] },
     };
-    const recorded: any = await f.t.mutation(api.goalMode.recordPlan, {
+    const recorded: any = await recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     });
     expect(recorded).toMatchObject({ advanced: true, jobs: 8, planGeneration: 1 });
@@ -394,7 +430,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(new Set(authority.edges.map((edge) => edge.edgeId)).size).toBe(28);
     expect(await f.t.query(api.goalMode.dagProjection, { id: f.missionId, workerToken: TOKEN }))
       .toMatchObject({ nodeCount: 8, maxNodes: 8, planDigest: recorded.planDigest, planGeneration: 1 });
-    expect(await f.t.mutation(api.goalMode.recordPlan, {
+    expect(await recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     })).toMatchObject({ replay: true, jobs: 8, planDigest: recorded.planDigest, planGeneration: 1 });
     const replayCounts = await f.t.run(async (ctx) => ({
@@ -483,7 +519,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
         { id: "consumer", label: "Consumer", task: "Consume the integrated catalog contract.", agentId: "paul", repo: other, readonly: false, dependsOn: ["catalog"], acceptanceCriteria: ["tests"], mcp: [] },
       ], validation: { criteria: ["done"], tests: [], liveChecks: [] },
     };
-    const recorded: any = await f.t.mutation(api.goalMode.recordPlan, {
+    const recorded: any = await recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     });
     const [researchRun] = await dispatch(f.t, 8, "stale-handoff-research");
@@ -519,7 +555,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       ],
       validation: { criteria: ["cross-project outcome works"], tests: ["npm test"], liveChecks: ["verify declared live contract"] },
     };
-    const recorded: any = await f.t.mutation(api.goalMode.recordPlan, {
+    const recorded: any = await recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     });
     expect(recorded).toMatchObject({ advanced: true, jobs: 4, planGeneration: 1 });
@@ -562,7 +598,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(integrations).toHaveLength(2);
     expect(integrations.map((row) => row.status)).toEqual(["queued", "provider_waiting"]);
     const controllerJob: any = await f.t.run(async (ctx) => ctx.db.get(integrations[0].jobId));
-    const firstControllerClaim: any = await f.t.mutation(api.goalIntegration.claim, {
+    const firstControllerClaim: any = await claimIntegrationFixture(f.t, {
       id: integrations[0]._id, controllerRunId: controllerJob.deliveryRunId,
       leaseOwner: "dag-controller-one", leaseToken: "dag-controller-token-one", workerToken: TOKEN,
     });
@@ -581,7 +617,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const controllers = concurrent.filter((entry) => entry.claim?.deliveryRunId);
     for (const entry of controllers) {
       const row: any = await f.t.run(async (ctx) => ctx.db.get(entry.claim!.integrationAttemptId));
-      const claim: any = await f.t.mutation(api.goalIntegration.claim, {
+      const claim: any = await claimIntegrationFixture(f.t, {
         id: row._id, controllerRunId: entry.claim!.deliveryRunId,
         leaseOwner: `owner-${row.workstreamId}`, leaseToken: `token-${row.workstreamId}`, workerToken: TOKEN,
       });
@@ -594,7 +630,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     for (const entry of remainingControllers) {
       if (!entry.claim?.integrationAttemptId) continue;
       const row: any = await f.t.run(async (ctx) => ctx.db.get(entry.claim!.integrationAttemptId));
-      const claim: any = await f.t.mutation(api.goalIntegration.claim, {
+      const claim: any = await claimIntegrationFixture(f.t, {
         id: row._id, controllerRunId: entry.claim!.deliveryRunId,
         leaseOwner: `final-${row.workstreamId}`, leaseToken: `final-token-${row.workstreamId}`, workerToken: TOKEN,
       });
@@ -758,7 +794,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       id: row._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: `owner-${suffix}`, leaseToken: `lease-${suffix}`, workerToken: TOKEN,
     });
-    const firstClaim = await f.t.mutation(api.goalIntegration.claim, claimArgs(first, controllers[0], "one"));
+    const firstClaim = await claimIntegrationFixture(f.t, claimArgs(first, controllers[0], "one"));
     expect(firstClaim).not.toBeNull();
     const queuedBefore = await f.t.run(async (ctx) => ctx.db.get(second.jobId));
     expect(queuedBefore).toMatchObject({ status: "pending", integrationState: "provider_waiting", deliveryGeneration: 1 });
@@ -787,7 +823,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const secondControllers = await dispatch(f.t, 2, "controller-two");
     expect(secondControllers).toHaveLength(1);
     expect(String(secondControllers[0].reservation.jobId)).toBe(String(second.jobId));
-    const secondClaim = await f.t.mutation(api.goalIntegration.claim, claimArgs(second, secondControllers[0], "two-retry"));
+    const secondClaim = await claimIntegrationFixture(f.t, claimArgs(second, secondControllers[0], "two-retry"));
     expect(secondClaim).toMatchObject({ expectedIntegrationBaseSha: "a".repeat(40) });
     await finishIntegration(second, secondClaim, "c".repeat(40), "d".repeat(40), "two");
 
@@ -844,7 +880,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
   it("keeps eight reviewed receipts cold while dispatching exactly one FIFO controller", async () => {
     const fifoTransactionBounds = { documentsRead: 128, documentsWritten: 64, databaseQueries: 128 };
     const t = convexTest({ schema, modules, transactionLimits: fifoTransactionBounds });
-    const created = await t.mutation(api.goalMode.create, {
+    const created = await createGoalFixture(t, {
       goal: "Integrate eight independent durable repository workstreams safely",
       route: "existing_project", routeReason: "owned product", primaryRepo: REPO,
       infrastructureContext: "Preserve repository isolation.", maxBuildSessions: 8, workerToken: TOKEN,
@@ -858,7 +894,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       })),
       validation: { criteria: ["all integrated"], tests: ["npm test"], liveChecks: [] },
     };
-    expect(await t.mutation(api.goalMode.recordPlan, {
+    expect(await recordPlanFixture(t, {
       id: created.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     })).toMatchObject({ advanced: true, jobs: 8 });
     const jobs = await t.run(async (ctx) => (await ctx.db.query("jobs")
@@ -929,7 +965,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const [controller] = await dispatch(f.t, 2, "lost-controller");
     const integration = (await f.t.run(async (ctx) => ctx.db.query("integrationAttempts").collect()))
       .sort((left, right) => left.generation - right.generation)[0];
-    const claim = await f.t.mutation(api.goalIntegration.claim, {
+    const claim = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: "lost-owner", leaseToken: "lost-secret-token", workerToken: TOKEN,
     });
@@ -993,7 +1029,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const integration = (await f.t.run(async (ctx) => ctx.db.query("integrationAttempts").collect()))
       .sort((left, right) => left.generation - right.generation)[0];
     const [controller] = await dispatch(f.t, 2, "inconsistent-controller");
-    const claim = await f.t.mutation(api.goalIntegration.claim, {
+    const claim = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: "inconsistent-owner", leaseToken: "inconsistent-token", workerToken: TOKEN,
     });
@@ -1248,7 +1284,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect((await f.t.run(async (ctx) => ctx.db.query("attentionItems").collect()))[0]).toMatchObject({ status: "resolved" });
     expect(await f.t.query(api.attention.list, { workerToken: TOKEN })).toHaveLength(0);
     const [controller] = await dispatch(f.t, 2, "attention-truth-resumed");
-    const claim = await f.t.mutation(api.goalIntegration.claim, {
+    const claim = await claimIntegrationFixture(f.t, {
       id: f.current._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: "attention-truth-owner-2", leaseToken: "attention-truth-token-2", workerToken: TOKEN,
     });
@@ -1279,7 +1315,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     vi.setSystemTime(Date.now());
     const effectId = "retry-unknown-ref";
     for (let retry = 1; retry <= INTEGRATION_RECONCILIATION_LIMIT + 1; retry += 1) {
-      const claim = await f.t.mutation(api.goalIntegration.claim, {
+      const claim = await claimIntegrationFixture(f.t, {
         id: integrations[0]._id, controllerRunId: String(controller.claim!.deliveryRunId),
         leaseOwner: `retry-owner-${retry}`, leaseToken: `retry-token-${retry}`, workerToken: TOKEN,
       });
@@ -1338,7 +1374,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     })).toBe(true);
     const [resumedController] = await dispatch(f.t, 2, "retry-controller-resumed");
     expect(String(resumedController.reservation.jobId)).toBe(String(integrations[0].jobId));
-    const resumed = await f.t.mutation(api.goalIntegration.claim, {
+    const resumed = await claimIntegrationFixture(f.t, {
       id: integrations[0]._id, controllerRunId: String(resumedController.claim!.deliveryRunId),
       leaseOwner: "retry-resumed-owner", leaseToken: "retry-resumed-token", workerToken: TOKEN,
     });
@@ -1378,7 +1414,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       .sort((left, right) => left.generation - right.generation);
     const [controller] = await dispatch(f.t, 2, `control-${action}-${stage}-controller`);
     const current = integrations[0];
-    const claim = await f.t.mutation(api.goalIntegration.claim, {
+    const claim = await claimIntegrationFixture(f.t, {
       id: current._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: `owner-${action}-${stage}`, leaseToken: `secret-${action}-${stage}`, workerToken: TOKEN,
     });
@@ -1438,9 +1474,9 @@ describe("real Convex multi-agent workspace and integration races", () => {
     // The claim mutation is an authority fence too; a stale/early caller
     // cannot bypass the dispatcher timestamp and classify an in-flight write.
     vi.setSystemTime(Number((fenced.job as any).nextRunAt) - 1);
-    expect(await f.t.mutation(api.goalIntegration.claim, reconcileClaimArgs)).toBeNull();
+    expect(await claimIntegrationFixture(f.t, reconcileClaimArgs)).toBeNull();
     vi.setSystemTime(Number((fenced.job as any).nextRunAt));
-    const recovered = await f.t.mutation(api.goalIntegration.claim, reconcileClaimArgs);
+    const recovered = await claimIntegrationFixture(f.t, reconcileClaimArgs);
     const recoveredFence = { id: current._id, controllerRunId: recovered!.controllerRunId,
       leaseOwner: recovered!.leaseOwner, leaseToken: recovered!.leaseToken,
       leaseVersion: recovered!.leaseVersion, workerToken: TOKEN };
@@ -1487,7 +1523,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const [controller] = await dispatch(f.t, 2, "heartbeat-controller");
     vi.useFakeTimers();
     vi.setSystemTime(Date.now());
-    const claim = await f.t.mutation(api.goalIntegration.claim, {
+    const claim = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: "heartbeat-owner", leaseToken: "heartbeat-secret", workerToken: TOKEN,
     });
@@ -1538,7 +1574,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const integrations = (await f.t.run(async (ctx) => ctx.db.query("integrationAttempts").collect()))
       .sort((left, right) => left.generation - right.generation);
     let [controller] = await dispatch(f.t, 2, "watchdog-budget-controller-1");
-    let claim = await f.t.mutation(api.goalIntegration.claim, {
+    let claim = await claimIntegrationFixture(f.t, {
       id: integrations[0]._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: "watchdog-budget-owner-1", leaseToken: "watchdog-budget-token-1", workerToken: TOKEN,
     });
@@ -1568,7 +1604,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(state.attempt).toMatchObject({ status: "queued", cumulativeRetries: INTEGRATION_RECONCILIATION_LIMIT });
     vi.setSystemTime(Number(state.job.nextRunAt));
     [controller] = await dispatch(f.t, 2, "watchdog-budget-controller-2");
-    claim = await f.t.mutation(api.goalIntegration.claim, {
+    claim = await claimIntegrationFixture(f.t, {
       id: integrations[0]._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: "watchdog-budget-owner-2", leaseToken: "watchdog-budget-token-2", workerToken: TOKEN,
     });
@@ -1595,7 +1631,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
 
     expect(await f.t.mutation(api.jobs.control, { jobId: integrations[0].jobId, action: "resume", workerToken: TOKEN })).toBe(true);
     const [resumedController] = await dispatch(f.t, 2, "watchdog-budget-resumed");
-    const resumed = await f.t.mutation(api.goalIntegration.claim, {
+    const resumed = await claimIntegrationFixture(f.t, {
       id: integrations[0]._id, controllerRunId: String(resumedController.claim!.deliveryRunId),
       leaseOwner: "watchdog-budget-owner-3", leaseToken: "watchdog-budget-token-3", workerToken: TOKEN,
     });
@@ -1699,7 +1735,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const integration = (await f.t.run(async (ctx) => ctx.db.query("integrationAttempts").collect()))
       .sort((left, right) => left.generation - right.generation)[0];
     const [controller] = await dispatch(f.t, 2, `${label}-controller`);
-    const firstClaim = await f.t.mutation(api.goalIntegration.claim, {
+    const firstClaim = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: `${label}-owner`, leaseToken: `${label}-token`, workerToken: TOKEN,
     });
@@ -1727,7 +1763,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     vi.setSystemTime(Number(recoveredJob.nextRunAt));
     const [reconciler] = await dispatch(f.t, 2, `${label}-reconciler`);
     expect(String(reconciler.reservation.jobId)).toBe(String(integration.jobId));
-    const recovered = await f.t.mutation(api.goalIntegration.claim, {
+    const recovered = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(reconciler.claim!.deliveryRunId),
       leaseOwner: `${label}-owner-2`, leaseToken: `${label}-token-2`, workerToken: TOKEN,
     });
@@ -1767,7 +1803,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const integration = (await f.t.run(async (ctx) => await ctx.db.query("integrationAttempts").collect()))
       .sort((left, right) => left.generation - right.generation)[0];
     const controller = controllers.find((entry) => String(entry.reservation.jobId) === String(integration.jobId))!;
-    const claim = await f.t.mutation(api.goalIntegration.claim, {
+    const claim = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: "owner", leaseToken: "lease", workerToken: TOKEN,
     });
@@ -1788,7 +1824,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     vi.useFakeTimers();
     vi.setSystemTime(Number(pauseJob.nextRunAt));
     const [pauseReconciler] = await dispatch(f.t, 2, "pause-reconciler");
-    const pauseClaim = await f.t.mutation(api.goalIntegration.claim, {
+    const pauseClaim = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(pauseReconciler.claim!.deliveryRunId),
       leaseOwner: "pause-reconcile-owner", leaseToken: "pause-reconcile-token", workerToken: TOKEN,
     });
@@ -1802,7 +1838,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(await f.t.run(async (ctx) => ctx.db.get(f.missionId))).toMatchObject({ status: "paused" });
     expect(await f.t.mutation(api.goalMode.control, { id: f.missionId, action: "resume", workerToken: TOKEN })).toBe(true);
     const [resumedController] = await dispatch(f.t, 2, "controller-resumed");
-    const resumedClaim = await f.t.mutation(api.goalIntegration.claim, {
+    const resumedClaim = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(resumedController.claim!.deliveryRunId),
       leaseOwner: "owner-resumed", leaseToken: "lease-resumed", workerToken: TOKEN,
     });
@@ -1879,19 +1915,19 @@ describe("real Convex multi-agent workspace and integration races", () => {
       ],
       validation: { criteria: ["recovered"], tests: [], liveChecks: [] },
     };
-    expect(await t.mutation(api.goalMode.recordPlan, {
+    expect(await recordPlanFixture(t, {
       id: missionId, expectedAdvanceAttempt: first.expectedAdvanceAttempt, ...firstFence, plan, workerToken: TOKEN,
     })).toMatchObject({ advanced: false, stale: true });
     const recoveredFence = {
       advanceLeaseOwner: recovered.advanceLeaseOwner, advanceLeaseToken: recovered.advanceLeaseToken,
       advanceLeaseVersion: recovered.advanceLeaseVersion,
     };
-    expect(await t.mutation(api.goalMode.recordPlan, {
+    expect(await recordPlanFixture(t, {
       id: missionId, expectedAdvanceAttempt: recovered.expectedAdvanceAttempt, ...recoveredFence, plan, workerToken: TOKEN,
     })).toMatchObject({ advanced: true, jobs: 2 });
     // A crash after the write returns the same receipt without enqueuing a
     // second graph; this is the only replay accepted after the lease closes.
-    expect(await t.mutation(api.goalMode.recordPlan, {
+    expect(await recordPlanFixture(t, {
       id: missionId, expectedAdvanceAttempt: recovered.expectedAdvanceAttempt, ...recoveredFence, plan, workerToken: TOKEN,
     })).toMatchObject({ advanced: true, replay: true, jobs: 2 });
     const builds = await t.run(async (ctx) => (await ctx.db.query("jobs")

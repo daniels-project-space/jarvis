@@ -15,7 +15,7 @@ import {
   type SchedulingBinding,
   type WorkGroupAuthority,
 } from "../src/lib/work-scheduler";
-import { workItemIdentity } from "../src/lib/workspace-protocol";
+import { attemptWorkspaceKey, workItemIdentity } from "../src/lib/workspace-protocol";
 import {
   isSafeSourceBranch,
   projectSourceAdmissionIsValid,
@@ -185,6 +185,44 @@ export async function jobRuntimeFor(ctx: any, jobId: any) {
     .first();
 }
 
+/**
+ * Rebuild the one bounded queue head for an immutable project group. The
+ * projection is never execution authority; selected jobs are still checked
+ * against their admission and attempt ledgers before reservation. Keeping one
+ * row per group makes every due group index-visible regardless of backlog
+ * depth in another group.
+ */
+export async function refreshWorkGroupQueueProjection(ctx: any, groupKey: unknown, now = Date.now()) {
+  if (typeof groupKey !== "string" || !groupKey) return null;
+  const groups = await ctx.db.query("workGroupScheduling")
+    .withIndex("by_group", (q: any) => q.eq("groupKey", groupKey)).take(2);
+  if (groups.length !== 1) return null;
+  const group = groups[0];
+  const head = await ctx.db.query("jobRuntime")
+    .withIndex("by_group_dispatch_ready", (q: any) => q
+      .eq("schedulingGroupKey", groupKey)
+      .eq("status", "pending")
+      .eq("schedulingBound", true)
+      .eq("dispatchReady", true)
+      .gte("nextRunAt", 0))
+    .order("asc")
+    .first();
+  const queueHeadNextRunAt = typeof head?.nextRunAt === "number" ? head.nextRunAt : undefined;
+  const patch = head && queueHeadNextRunAt !== undefined ? {
+    queueHeadJobId: head.jobId,
+    queueHeadNextRunAt,
+    queueEligible: queueHeadNextRunAt <= now,
+    updatedAt: now,
+  } : {
+    queueHeadJobId: undefined,
+    queueHeadNextRunAt: undefined,
+    queueEligible: false,
+    updatedAt: now,
+  };
+  await ctx.db.patch(group._id, patch);
+  return { ...group, ...patch };
+}
+
 export async function missionRuntimeFor(ctx: any, missionId: any) {
   return await ctx.db
     .query("missionRuntime")
@@ -203,6 +241,7 @@ export async function upsertJobRuntime(ctx: any, job: any) {
   const projected = projectJobRuntime(source);
   if (existing) await ctx.db.replace(existing._id, projected);
   else await ctx.db.insert("jobRuntime", projected);
+  await refreshWorkGroupQueueProjection(ctx, projected.schedulingGroupKey);
 }
 
 const LIVE_JOB_ACTIVITY_FIELDS = ["stage", "percent", "progress", "heartbeatAt", "progressAt", "providerRunState", "providerObservedAt", "updatedAt"] as const;
@@ -301,6 +340,7 @@ async function schedulingGroupForBinding(ctx: any, binding: SchedulingBinding) {
     projectGroupId: binding.projectGroupId,
     canonicalProjectId: binding.canonicalProjectId,
     projectRepository: binding.projectRepository,
+    queueEligible: false,
     lastServedSequence: Number(scheduler?.nextSequence ?? 0),
     reservationCount: 0,
     createdAt: now,
@@ -348,6 +388,40 @@ export async function attemptAuthorityFields(ctx: any, job: any, attempt: number
     retryLineage: authority.binding.retryLineage,
     integrationLineage: authority.binding.integrationLineage,
   };
+}
+
+/** Allocate one immutable attempt envelope for any admitted job producer. */
+export async function ensureWorkAttempt(
+  ctx: any,
+  job: any,
+  attempt: number,
+  status: string,
+  now = Date.now(),
+  patch: Record<string, unknown> = {},
+) {
+  const existing = await ctx.db.query("workAttempts")
+    .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", attempt))
+    .first();
+  if (existing) return existing;
+  const workspaceLineage = job.workspaceLineage;
+  const value = {
+    jobId: job._id,
+    attempt,
+    status,
+    ...await attemptAuthorityFields(ctx, job, attempt),
+    workspaceLineage,
+    workspaceKey: workspaceLineage ? attemptWorkspaceKey(workspaceLineage, attempt) : undefined,
+    workerBranch: job.workerBranch,
+    sourceHeadSha: job.sourceHeadSha,
+    lastEventSeq: 0,
+    livenessAt: now,
+    progressAt: now,
+    lastEventAt: now,
+    createdAt: now,
+    ...patch,
+  };
+  const id = await ctx.db.insert("workAttempts", value);
+  return { ...value, _id: id };
 }
 
 /**
@@ -463,7 +537,11 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
   delete admittedPatch._id;
   delete admittedPatch._creationTime;
   await ctx.db.patch(jobId, admittedPatch);
-  await ctx.db.insert("jobRuntime", projectJobRuntime(admitted));
+  const runtime = projectJobRuntime(admitted);
+  await ctx.db.insert("jobRuntime", runtime);
+  await refreshWorkGroupQueueProjection(ctx, runtime.schedulingGroupKey);
+  const attempt = Math.max(1, Number(admitted.attempt ?? 1));
+  await ensureWorkAttempt(ctx, admitted, attempt, String(admitted.status ?? "pending"), Number(admitted.createdAt ?? Date.now()));
   return jobId;
 }
 
@@ -481,6 +559,10 @@ export async function patchJobWithRuntime(ctx: any, job: any, patch: Record<stri
   const projected = projectJobRuntime(mergeJobRuntimeSource(job, committedPatch, existing));
   if (existing) await ctx.db.replace(existing._id, projected);
   else await ctx.db.insert("jobRuntime", projected);
+  const queueFields = new Set(["status", "nextRunAt", "dispatchReady", "schedulingBound", "priority"]);
+  if (Object.keys(patch).some((field) => queueFields.has(field))) {
+    await refreshWorkGroupQueueProjection(ctx, projected.schedulingGroupKey);
+  }
 }
 
 export async function quarantineJobRuntime(ctx: any, job: any, runtime?: any) {
@@ -493,6 +575,7 @@ export async function quarantineJobRuntime(ctx: any, job: any, runtime?: any) {
     nextRunAt: undefined,
   });
   await ctx.db.replace(existing._id, quarantined);
+  await refreshWorkGroupQueueProjection(ctx, quarantined.schedulingGroupKey);
 }
 
 export async function promoteCompletedJobDependents(ctx: any, source: any, now = Date.now()) {

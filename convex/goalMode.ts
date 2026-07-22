@@ -16,6 +16,7 @@ import {
   type GoalValidation,
 } from "../src/lib/goal-mode";
 import {
+  ensureWorkAttempt,
   insertJobWithRuntime,
   insertMissionWithRuntime,
   patchJobWithRuntime,
@@ -1427,6 +1428,7 @@ export const rejectAdvance = mutation({
       verificationNote: undefined,
       verifiedAt: undefined,
     });
+    await ensureWorkAttempt(ctx, job, nextAttempt, "pending", now, { parentAttempt: Number(job.attempt ?? 1) });
     await patchMissionWithRuntime(ctx, mission, { advanceLeaseUntil: undefined, updatedAt: now });
     await recordMissionEvent(ctx, String(args.id), "goal_contract_rejected", args.error, mission.phase ?? "goal", mission.percent, {
       attempt: nextAttempt,
@@ -2198,6 +2200,9 @@ async function resetGoalJob(ctx: any, job: any, now: number, force = false, exte
     verificationNote: undefined,
     verifiedAt: undefined,
   });
+  await ensureWorkAttempt(ctx, job, nextAttempt, awaitingApproval ? "awaiting_approval" : "pending", now, {
+    parentAttempt: Number(job.attempt ?? 1),
+  });
   return true;
 }
 
@@ -2279,14 +2284,41 @@ export const control = mutation({
             };
             if (integrationControl?.reconcile) {
               await patchJobWithRuntime(ctx, current, steerPatch);
-            } else if (current.status === "running") {
+            } else {
+              const nextAttempt = Number(current.attempt ?? 1) + 1;
+              if (nextAttempt > Number(current.maxAttempts ?? 12)) return false;
               const attempt = await ctx.db.query("workAttempts")
                 .withIndex("by_job_attempt", (q: any) => q.eq("jobId", current._id).eq("attempt", Number(current.attempt ?? 1))).first();
-              if (!attempt || attempt.completedAt) return false;
-              await ctx.db.patch(attempt._id, { status: "steered", completedAt: now, lastEventAt: now });
-              await patchJobWithRuntime(ctx, current, { ...steerPatch, status: "steering", stage: "steering" });
-            } else {
-              await patchJobWithRuntime(ctx, current, steerPatch);
+              if (!attempt) return false;
+              if (!attempt.completedAt) await ctx.db.patch(attempt._id, {
+                status: "steered", completedAt: now, dispatchId: undefined, lastEventAt: now,
+              });
+              const activeDelivery: any = current.activeDeliveryAttemptId ? await ctx.db.get(current.activeDeliveryAttemptId) : null;
+              if (activeDelivery && !["done", "blocked", "abandoned"].includes(activeDelivery.status)) {
+                await ctx.db.patch(activeDelivery._id, {
+                  status: "abandoned", outcome: "stale", currentStep: "terminal",
+                  retryReason: "superseded by parent mission steering", completedAt: now,
+                  leaseOwner: undefined, leaseToken: undefined, leaseUntil: undefined,
+                  heartbeatAt: now, updatedAt: now,
+                });
+              }
+              await patchJobWithRuntime(ctx, current, {
+                ...steerPatch,
+                status: "pending", stage: "queued", attempt: nextAttempt,
+                startedAt: undefined, completedAt: undefined, heartbeatAt: now, progressAt: now, nextRunAt: now,
+                dispatchId: undefined, dispatchLeaseUntil: undefined, workerRunId: undefined, workerRuntime: undefined,
+                providerRunState: undefined, providerObservedAt: undefined,
+                deliveryLeaseVersion: Math.max(0, Number(current.deliveryLeaseVersion ?? 0)) + 1,
+                deliveryLeaseOwner: undefined, deliveryLeaseToken: undefined, deliveryLeaseUntil: undefined,
+                deliveryRunId: undefined, activeDeliveryAttemptId: undefined, deliveryGeneration: undefined,
+                integrationAttemptId: undefined, integrationState: undefined,
+                reviewReceiptId: undefined, reviewReceiptDigest: undefined, reviewReceiptSignature: undefined,
+                verificationVerdict: undefined, verificationNote: undefined, verifiedAt: undefined,
+              });
+              await ensureWorkAttempt(ctx, current, nextAttempt, "pending", now, {
+                parentAttempt: Number(current.attempt ?? 1),
+                parentCheckpointHeadSha: attempt.checkpointHeadSha,
+              });
             }
           }
           await patchMissionWithRuntime(ctx, mission, {
