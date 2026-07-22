@@ -94,6 +94,7 @@ import {
   type CloudProviderRuntimeAttestation,
 } from "./cloud-provider-probe-attestation";
 import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, createDeterministicTar, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider, type HistoricalCloudWorkspaceProviderName, type CredentiallessArchive } from "./cloud-workspace";
+import { environmentWithoutSubscriptionController } from "./subscription-source";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent against an isolated cloud workspace through controller-owned dynamic
@@ -683,6 +684,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       return rejectReservation(`Codex worker toolchain unavailable: missing ${missingTools.join(", ")} on PATH`);
     }
     const env = prepared.env;
+    const hostChildEnv = environmentWithoutSubscriptionController(env);
+    hostChildEnv.HOME = "/tmp/jarvis-controller-child-home";
+    hostChildEnv.GIT_CONFIG_NOSYSTEM = "1";
+    mkdirSync(hostChildEnv.HOME, { recursive: true, mode: 0o700 });
     mkdirSync("/tmp/work", { recursive: true });
     const token = process.env.GITHUB_TOKEN ?? "";
 
@@ -1109,7 +1114,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             const integrationDir = `/tmp/work/integration-${jobKey}-${Number(claimed.generation)}`;
             rmSync(integrationDir, { recursive: true, force: true });
             const remote = githubRepoUrl(repo);
-            const gitEnv = githubGitEnv(env, String(token));
+            const gitEnv = githubGitEnv(hostChildEnv, String(token));
             const cloned = await sh("git", ["clone", "--no-checkout", "--filter=blob:none", remote, integrationDir], gitEnv,
               { signal: integrationAbort.signal, timeoutMs: 90_000 });
             if (cloned.code !== 0) {
@@ -1120,9 +1125,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }
             const runIntegrationGit = (args: string[], commandEnv: NodeJS.ProcessEnv = gitEnv) =>
               sh("git", ["-C", integrationDir, ...args], commandEnv, { signal: integrationAbort.signal, timeoutMs: 90_000 });
-            if ((await runIntegrationGit(["remote", "set-url", "origin", remote], env)).code !== 0
-              || (await runIntegrationGit(["config", "user.email", "jarvis@daniels-project-space.dev"], env)).code !== 0
-              || (await runIntegrationGit(["config", "user.name", "JARVIS integration controller"], env)).code !== 0) {
+            if ((await runIntegrationGit(["remote", "set-url", "origin", remote], hostChildEnv)).code !== 0
+              || (await runIntegrationGit(["config", "user.email", "jarvis@daniels-project-space.dev"], hostChildEnv)).code !== 0
+              || (await runIntegrationGit(["config", "user.name", "JARVIS integration controller"], hostChildEnv)).code !== 0) {
               await convexMutation("goalIntegration:defer", {
                 ...integrationFence, reasonCode: "sandbox_configuration_failed",
                 reason: "bounded integration git configuration failed",
@@ -1348,7 +1353,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           controllerCheckoutPath = dir;
           rmSync(dir, { recursive: true, force: true });
           const url = githubRepoUrl(repo);
-          const gitEnv = githubGitEnv(env, token);
+          const gitEnv = githubGitEnv(hostChildEnv, token);
           let cloneReady = false;
           if (job.branch) {
             const cloned = await sh(
@@ -1377,12 +1382,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           if (cloneReady) {
             // Defense in depth: the subprocess only ever sees a credential-free
             // remote even if Git changes clone credential persistence behavior.
-            await sh("git", ["-C", dir, "remote", "set-url", "origin", url], env);
-            await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
-            await sh("git", ["-C", dir, "config", "user.name", `${profile.name} via JARVIS`], env);
+            await sh("git", ["-C", dir, "remote", "set-url", "origin", url], hostChildEnv);
+            await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], hostChildEnv);
+            await sh("git", ["-C", dir, "config", "user.name", `${profile.name} via JARVIS`], hostChildEnv);
             if (!checkoutSourceBranch) {
               checkoutSourceBranch = (
-                await sh("git", ["-C", dir, "branch", "--show-current"], env)
+                await sh("git", ["-C", dir, "branch", "--show-current"], hostChildEnv)
               ).out.trim();
             }
             const history = await ensureCompleteRepositoryHistory({
@@ -1395,18 +1400,18 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               cloneFailureReason = `${SHALLOW_PROVENANCE_RULE} Safe checkout preparation failed: ${history.note}`;
               context = `${cloneFailureReason} Do not inspect the incomplete checkout or pretend repository work was performed.`;
             } else {
-              baseSha = (await sh("git", ["-C", dir, "rev-parse", "HEAD"], env)).out.trim();
+              baseSha = (await sh("git", ["-C", dir, "rev-parse", "HEAD"], hostChildEnv)).out.trim();
               if (job.sourceHeadSha) {
                 const sourceHeadSha = String(job.sourceHeadSha);
-                let sourceExists = await sh("git", ["-C", dir, "cat-file", "-e", `${sourceHeadSha}^{commit}`], env);
+                let sourceExists = await sh("git", ["-C", dir, "cat-file", "-e", `${sourceHeadSha}^{commit}`], hostChildEnv);
                 if (sourceExists.code !== 0) {
                   const hydratedSource = await sh("git", ["-C", dir, "fetch", "--no-tags", url, sourceHeadSha], gitEnv);
                   sourceExists = hydratedSource.code === 0
-                    ? await sh("git", ["-C", dir, "cat-file", "-e", `${sourceHeadSha}^{commit}`], env)
+                    ? await sh("git", ["-C", dir, "cat-file", "-e", `${sourceHeadSha}^{commit}`], hostChildEnv)
                     : { code: hydratedSource.code, out: hydratedSource.out };
                 }
                 const cumulativeAncestry = sourceExists.code === 0
-                  ? await sh("git", ["-C", dir, "merge-base", "--is-ancestor", sourceHeadSha, baseSha], env)
+                  ? await sh("git", ["-C", dir, "merge-base", "--is-ancestor", sourceHeadSha, baseSha], hostChildEnv)
                   : { code: sourceExists.code, out: sourceExists.out };
                 if (sourceExists.code !== 0 || cumulativeAncestry.code !== 0) {
                   cloneFailed = true;
@@ -1433,7 +1438,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 }
               }
               const checkedOut = branch
-                ? await sh("git", ["-C", dir, "checkout", "-B", branch], env)
+                ? await sh("git", ["-C", dir, "checkout", "-B", branch], hostChildEnv)
                 : { code: 0, out: "" };
               if (!cloneFailed && (!baseSha || checkedOut.code !== 0)) {
                 cloneFailed = true;
@@ -1486,7 +1491,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const checkpointStore = await createR2CheckpointStore();
         const workspaceBaseSha = baseSha || sha256Bytes(String(job.jobId));
         const sourceArchive: CredentiallessArchive = repoDir
-          ? await createCredentiallessGitArchive(repoDir, workspaceBaseSha, env)
+          ? await createCredentiallessGitArchive(repoDir, workspaceBaseSha, hostChildEnv)
           : (() => {
               const bytes = createDeterministicTar([{
                 path: ".jarvis-workspace",
@@ -1706,28 +1711,28 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           const patch = await cloudProvider.exportPatch(providerWorkspace, baseSha, DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
           if (!controllerCheckoutPath || !token) throw new Error("trusted controller checkout authority is unavailable after specialist exit");
           const url = githubRepoUrl(repo);
-          const gitEnv = githubGitEnv(env, token);
+          const gitEnv = githubGitEnv(hostChildEnv, token);
           rmSync(controllerCheckoutPath, { recursive: true, force: true });
           const cloned = await sh("git", ["clone", "--no-checkout", "--filter=blob:none", url, controllerCheckoutPath], gitEnv, { timeoutMs: 120_000 });
           if (cloned.code !== 0) throw new Error(`trusted controller could not rehydrate exact base: ${cloned.out.slice(-400)}`);
-          let basePresent = await sh("git", ["-C", controllerCheckoutPath, "cat-file", "-e", `${baseSha}^{commit}`], env);
+          let basePresent = await sh("git", ["-C", controllerCheckoutPath, "cat-file", "-e", `${baseSha}^{commit}`], hostChildEnv);
           if (basePresent.code !== 0) {
             const fetched = await sh("git", ["-C", controllerCheckoutPath, "fetch", "--no-tags", url, baseSha], gitEnv, { timeoutMs: 120_000 });
             basePresent = fetched.code === 0
-              ? await sh("git", ["-C", controllerCheckoutPath, "cat-file", "-e", `${baseSha}^{commit}`], env)
+              ? await sh("git", ["-C", controllerCheckoutPath, "cat-file", "-e", `${baseSha}^{commit}`], hostChildEnv)
               : fetched;
           }
           if (basePresent.code !== 0) throw new Error("trusted controller could not prove the exact patch base");
           const checkedOut = branch
-            ? await sh("git", ["-C", controllerCheckoutPath, "checkout", "-B", branch, baseSha], env)
-            : await sh("git", ["-C", controllerCheckoutPath, "checkout", "--detach", baseSha], env);
+            ? await sh("git", ["-C", controllerCheckoutPath, "checkout", "-B", branch, baseSha], hostChildEnv)
+            : await sh("git", ["-C", controllerCheckoutPath, "checkout", "--detach", baseSha], hostChildEnv);
           if (checkedOut.code !== 0) throw new Error("trusted controller could not restore the exact worker branch base");
-          await sh("git", ["-C", controllerCheckoutPath, "remote", "set-url", "origin", url], env);
-          await sh("git", ["-C", controllerCheckoutPath, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
-          await sh("git", ["-C", controllerCheckoutPath, "config", "user.name", `${profile.name} via JARVIS`], env);
+          await sh("git", ["-C", controllerCheckoutPath, "remote", "set-url", "origin", url], hostChildEnv);
+          await sh("git", ["-C", controllerCheckoutPath, "config", "user.email", "jarvis@daniels-project-space.dev"], hostChildEnv);
+          await sh("git", ["-C", controllerCheckoutPath, "config", "user.name", `${profile.name} via JARVIS`], hostChildEnv);
           repoDir = controllerCheckoutPath;
           cwd = controllerCheckoutPath;
-          await applyValidatedPatchToControllerCheckout(repoDir, baseSha, patch, env);
+          await applyValidatedPatchToControllerCheckout(repoDir, baseSha, patch, hostChildEnv);
         }
         result = `${result}\n\nCloud boundary: ${cloudProvider.name} workspace ${providerWorkspace.providerWorkspaceId}; R2 checkpoint ${portable.digest} (${portable.byteCount} bytes).`;
 
@@ -1763,18 +1768,18 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         if (repoDir && token && branch && !job.readonly) {
           const deliveryDir = repoDir;
           const pushUrl = githubRepoUrl(repo);
-          const gitEnv = githubGitEnv(env, token);
+          const gitEnv = githubGitEnv(hostChildEnv, token);
           const runGit = (args: string[]) => sh("git", ["-C", deliveryDir, ...args], gitEnv);
-          await sh("git", ["-C", deliveryDir, "add", "-A"], env);
+          await sh("git", ["-C", deliveryDir, "add", "-A"], hostChildEnv);
           await sh(
             "git",
             ["-C", deliveryDir, "commit", "-m", `chore: ${profile.name.toLowerCase()} — ${job.task.slice(0, 60).replace(/"/g, "'")}`],
-            env,
+            hostChildEnv,
           );
-          let local = (await sh("git", ["-C", deliveryDir, "rev-parse", "HEAD"], env)).out.trim();
+          let local = (await sh("git", ["-C", deliveryDir, "rev-parse", "HEAD"], hostChildEnv)).out.trim();
           checkpointHeadSha = local;
           if ((reviewBaseSha || baseSha) && local && local !== (reviewBaseSha || baseSha)) {
-            deliveryDiffStat = (await sh("git", ["-C", deliveryDir, "diff", "--stat", `${reviewBaseSha || baseSha}..${local}`], env)).out
+            deliveryDiffStat = (await sh("git", ["-C", deliveryDir, "diff", "--stat", `${reviewBaseSha || baseSha}..${local}`], hostChildEnv)).out
               .trim()
               .slice(0, 1_500);
           }
@@ -1956,7 +1961,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           let goalReview: { envelope: GitReviewEnvelope; binding: GitReviewBinding } | undefined;
           if (repoDir) {
             const receipt = await buildGitReviewReceipt({
-              runGit: (args) => sh("git", ["-C", repoDir!, ...args], env), jobId: String(job.jobId), attempt: expectedAttempt,
+              runGit: (args) => sh("git", ["-C", repoDir!, ...args], hostChildEnv), jobId: String(job.jobId), attempt: expectedAttempt,
               repository: repo!, expectedBranch: branch || checkoutSourceBranch, baseSha: reviewBaseSha || baseSha,
               agentEvidence: cumulativeWorkEvidence(job.checkpoint, result), commands: run.commands,
             });
@@ -2023,7 +2028,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         let reviewAuthority = receiptAuthority;
         if (repoDir) {
           const receipt = await buildGitReviewReceipt({
-            runGit: (args) => sh("git", ["-C", repoDir!, ...args], env),
+            runGit: (args) => sh("git", ["-C", repoDir!, ...args], hostChildEnv),
             jobId: String(job.jobId),
             attempt: expectedAttempt,
             repository: repo,

@@ -25,4 +25,16 @@ describe("agent output secret redaction", () => {
     expect(output).not.toContain(refresh);
     expect(output).toContain("REDACTED");
   });
+
+  it("redacts temporary R2 session credentials and parent access identifiers", () => {
+    const session = "temporary-session-credential-123456";
+    const parent = "parent-access-key-identifier-123456";
+    const output = redactSensitiveText(
+      `session_token=${session} access_key_id=${parent}`,
+      { AWS_SESSION_TOKEN: session, R2_PARENT_ACCESS_KEY_ID: parent },
+    );
+    expect(output).not.toContain(session);
+    expect(output).not.toContain(parent);
+    expect(output.match(/REDACTED/g)?.length).toBeGreaterThanOrEqual(2);
+  });
 });

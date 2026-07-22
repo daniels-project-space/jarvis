@@ -15,6 +15,9 @@ export const DEFAULT_MINIMUM_VALIDITY_MS = 5 * 60_000;
 
 export type SubscriptionSessionErrorCode =
   | "configuration_missing"
+  | "source_rejected"
+  | "credential_broker_unavailable"
+  | "session_store_unavailable"
   | "snapshot_corrupt"
   | "snapshot_stale"
   | "writer_timeout"
@@ -23,14 +26,28 @@ export type SubscriptionSessionErrorCode =
   | "rotation_failed"
   | "refresh_token_reused";
 
-const OPERATOR_ACTION = "re-enrol the controller-managed ChatGPT session; do not add an API key";
+function operatorAction(code: SubscriptionSessionErrorCode): string {
+  if (code === "configuration_missing") {
+    return "repair the trusted controller configuration; do not copy session state or add an API key";
+  }
+  if (code === "source_rejected") {
+    return "set JARVIS_CODEX_SESSION_SOURCE=vault-broker on the trusted host; do not copy session state into workers";
+  }
+  if (code === "credential_broker_unavailable") {
+    return "restore the controller R2 temporary-credential broker; do not add static R2 keys or an API key";
+  }
+  if (code === "session_store_unavailable") {
+    return "restore the private controller session store; do not copy session state into workers";
+  }
+  return "re-enrol the controller-managed ChatGPT session; do not add an API key";
+}
 
 export class SubscriptionSessionError extends Error {
   readonly name = "SubscriptionSessionError";
   readonly operatorSignal: string;
 
   constructor(readonly code: SubscriptionSessionErrorCode) {
-    super(`JARVIS_CODEX_SESSION_UNAVAILABLE[${code}]: ${OPERATOR_ACTION}`);
+    super(`JARVIS_CODEX_SESSION_UNAVAILABLE[${code}]: ${operatorAction(code)}`);
     this.operatorSignal = this.message;
   }
 }
@@ -313,7 +330,6 @@ export class ManagedSubscriptionSessionController {
     lease: { writer: SessionWriter; state: SessionState; etag: string },
     request: { unauthorized: boolean; requiredUntil: number },
   ): Promise<void> {
-    let heartbeat: ReturnType<typeof setInterval> | undefined;
     let heartbeatChain = Promise.resolve();
     let fenceLive = true;
     const renew = async () => {
@@ -337,7 +353,7 @@ export class ManagedSubscriptionSessionController {
           && latest.value.writer.fence === lease.writer.fence;
       }
     };
-    heartbeat = setInterval(() => {
+    const heartbeat = setInterval(() => {
       heartbeatChain = heartbeatChain.then(renew).catch(() => { fenceLive = false; });
     }, Math.max(10, Math.floor(this.leaseMs / 3)));
     heartbeat.unref?.();
@@ -378,12 +394,12 @@ export class ManagedSubscriptionSessionController {
         throw new SubscriptionSessionError("rotation_failed");
       }
 
-      if (heartbeat) clearInterval(heartbeat);
+      clearInterval(heartbeat);
       await heartbeatChain;
       if (!fenceLive) throw new SubscriptionSessionError("writer_fence_lost");
       await this.commitSnapshot(lease.writer, nextAuth);
     } finally {
-      if (heartbeat) clearInterval(heartbeat);
+      clearInterval(heartbeat);
       await heartbeatChain.catch(() => undefined);
       await this.releaseWriter(lease.writer).catch(() => undefined);
     }

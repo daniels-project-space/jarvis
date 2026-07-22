@@ -12,9 +12,14 @@ import {
   MemorySessionStateStore,
 } from "../src/trigger/subscription-session";
 import { prepareSubscriptionEnv } from "../src/trigger/subscription-runtime";
+import { CODEX_SESSION_SOURCE, CODEX_SESSION_SOURCE_ENV } from "../src/trigger/subscription-source";
 
 const WORKERS = 24;
 const now = Date.now();
+
+// The synthetic harness exercises the same explicit production source gate;
+// it does not install any credential material in the environment.
+process.env[CODEX_SESSION_SOURCE_ENV] = CODEX_SESSION_SOURCE;
 
 function token(expiresAt: number, marker: string) {
   const header = Buffer.from('{"alg":"none","typ":"JWT"}').toString("base64url");

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { AwsClient } from "aws4fetch";
 import { vaultService } from "../lib/vault-client";
 import { codexReviewExecPrefix } from "./model-policy";
+import { requireVaultBrokerSubscriptionSource } from "./subscription-source";
 import {
   canonicalAuthJson,
   parseChatgptSubscriptionAuth,
@@ -24,32 +25,67 @@ import {
 const SESSION_SERVICE = "codex-session";
 const STATE_KEY = "managed-codex-session/state.json";
 const ROTATION_TIMEOUT_MS = 90_000;
+export const R2_TEMPORARY_CREDENTIAL_TTL_SECONDS = 6 * 60 * 60;
+export const R2_TEMPORARY_CREDENTIAL_RENEWAL_SKEW_MS = 5 * 60_000;
+const R2_BROKER_TIMEOUT_MS = 10_000;
 
 type SessionSecrets = {
-  R2_ACCESS_KEY_ID: string;
-  R2_SECRET_ACCESS_KEY: string;
+  R2_ACCOUNT_ID: string;
+  R2_PARENT_API_TOKEN: string;
+  R2_PARENT_ACCESS_KEY_ID: string;
   R2_ENDPOINT: string;
   R2_BUCKET: string;
   SESSION_ENCRYPTION_KEY_B64: string;
   CODEX_AUTH_JSON_B64: string;
 };
 
-function requiredSecrets(value: Record<string, string>): SessionSecrets {
+export function parseSessionControllerSecrets(value: Record<string, string>): SessionSecrets {
   const keys = [
-    "R2_ACCESS_KEY_ID",
-    "R2_SECRET_ACCESS_KEY",
+    "R2_ACCOUNT_ID",
+    "R2_PARENT_API_TOKEN",
+    "R2_PARENT_ACCESS_KEY_ID",
     "R2_ENDPOINT",
     "R2_BUCKET",
     "SESSION_ENCRYPTION_KEY_B64",
     "CODEX_AUTH_JSON_B64",
   ] as const;
   if (keys.some((key) => !value[key])) throw new SubscriptionSessionError("configuration_missing");
+  // Ambiguous legacy S3 credentials are rejected even when the broker fields
+  // are present. The production path must never silently fall back to them.
+  if (value.R2_ACCESS_KEY_ID || value.R2_SECRET_ACCESS_KEY || value.R2_SESSION_TOKEN) {
+    throw new SubscriptionSessionError("configuration_missing");
+  }
   // The existing `jarvis` bucket has a public r2.dev domain. Session ciphertext
   // belongs in a dedicated private bucket with a bucket-scoped token.
   if (value.R2_BUCKET === "jarvis" || /r2\.dev/i.test(value.R2_ENDPOINT)) {
     throw new SubscriptionSessionError("configuration_missing");
   }
-  return value as SessionSecrets;
+  if (!/^[a-f0-9]{32}$/i.test(value.R2_ACCOUNT_ID)) {
+    throw new SubscriptionSessionError("configuration_missing");
+  }
+  let endpoint: URL;
+  try {
+    endpoint = new URL(value.R2_ENDPOINT);
+  } catch {
+    throw new SubscriptionSessionError("configuration_missing");
+  }
+  const storageSuffix = ".r2.cloudflarestorage.com";
+  if (endpoint.protocol !== "https:"
+    || endpoint.username || endpoint.password || endpoint.search || endpoint.hash
+    || (endpoint.pathname !== "/" && endpoint.pathname !== "")
+    || !endpoint.hostname.endsWith(storageSuffix)
+    || endpoint.hostname.split(".")[0] !== value.R2_ACCOUNT_ID.toLowerCase()) {
+    throw new SubscriptionSessionError("configuration_missing");
+  }
+  return {
+    R2_ACCOUNT_ID: value.R2_ACCOUNT_ID,
+    R2_PARENT_API_TOKEN: value.R2_PARENT_API_TOKEN,
+    R2_PARENT_ACCESS_KEY_ID: value.R2_PARENT_ACCESS_KEY_ID,
+    R2_ENDPOINT: endpoint.origin,
+    R2_BUCKET: value.R2_BUCKET,
+    SESSION_ENCRYPTION_KEY_B64: value.SESSION_ENCRYPTION_KEY_B64,
+    CODEX_AUTH_JSON_B64: value.CODEX_AUTH_JSON_B64,
+  };
 }
 
 function canonicalBase64Bytes(value: string, expectedLength: number): Uint8Array {
@@ -83,7 +119,7 @@ export class R2SessionStateStore implements SessionStateStore {
       headers: { "cache-control": "no-store" },
     });
     if (response.status === 404) return { value: null, etag: null };
-    if (!response.ok) throw new SubscriptionSessionError("configuration_missing");
+    assertR2Response(response);
     const etag = response.headers.get("etag");
     if (!etag) throw new SubscriptionSessionError("snapshot_corrupt");
     try {
@@ -109,7 +145,7 @@ export class R2SessionStateStore implements SessionStateStore {
       body: body as unknown as BodyInit,
     });
     if (response.status === 409 || response.status === 412) return { ok: false };
-    if (!response.ok) throw new SubscriptionSessionError("configuration_missing");
+    assertR2Response(response);
     const etag = response.headers.get("etag");
     if (!etag) throw new SubscriptionSessionError("snapshot_corrupt");
     return { ok: true, etag };
@@ -127,7 +163,7 @@ export class R2SessionStateStore implements SessionStateStore {
       body: value as unknown as BodyInit,
     });
     if (response.status === 409 || response.status === 412) return false;
-    if (!response.ok) throw new SubscriptionSessionError("configuration_missing");
+    assertR2Response(response);
     return true;
   }
 
@@ -136,8 +172,265 @@ export class R2SessionStateStore implements SessionStateStore {
       headers: { "cache-control": "no-store" },
     });
     if (response.status === 404) return null;
-    if (!response.ok) throw new SubscriptionSessionError("configuration_missing");
+    assertR2Response(response);
     return new Uint8Array(await response.arrayBuffer());
+  }
+}
+
+/** Internal signal used only to replace a rejected temporary S3 client. */
+export class R2SessionCredentialRejectedError extends Error {
+  readonly name = "R2SessionCredentialRejectedError";
+  constructor() {
+    super("R2 session temporary credential was rejected");
+  }
+}
+
+function assertR2Response(response: Response): asserts response is Response {
+  if (response.ok) return;
+  if (response.status === 401 || response.status === 403) {
+    throw new R2SessionCredentialRejectedError();
+  }
+  // Never include a provider response body, request URL, signed headers, or
+  // credential fields in an exception that can reach a Trigger result.
+  throw new SubscriptionSessionError("session_store_unavailable");
+}
+
+export type TemporaryR2Credentials = {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken: string;
+  expiresAt: number;
+};
+
+export interface TemporaryR2CredentialBroker {
+  issue(): Promise<TemporaryR2Credentials>;
+}
+
+type BrokerFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+type MillisecondClock = { now(): number };
+
+function validCredentialPart(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 16_384 && !/[\r\n\0]/.test(value);
+}
+
+/** Trusted-host Cloudflare broker. Its parent token never enters an AwsClient. */
+export class CloudflareTemporaryR2CredentialBroker implements TemporaryR2CredentialBroker {
+  private readonly ttlSeconds: number;
+  private readonly fetcher: BrokerFetch;
+  private readonly clock: MillisecondClock;
+  private readonly timeoutMs: number;
+
+  constructor(private readonly config: {
+    accountId: string;
+    parentApiToken: string;
+    parentAccessKeyId: string;
+    bucket: string;
+  }, options: {
+    ttlSeconds?: number;
+    fetcher?: BrokerFetch;
+    clock?: MillisecondClock;
+    timeoutMs?: number;
+  } = {}) {
+    this.ttlSeconds = options.ttlSeconds ?? R2_TEMPORARY_CREDENTIAL_TTL_SECONDS;
+    this.fetcher = options.fetcher ?? fetch;
+    this.clock = options.clock ?? { now: () => Date.now() };
+    this.timeoutMs = options.timeoutMs ?? R2_BROKER_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.ttlSeconds) || this.ttlSeconds < 60 || this.ttlSeconds > 604_800) {
+      throw new SubscriptionSessionError("configuration_missing");
+    }
+  }
+
+  async issue(): Promise<TemporaryR2Credentials> {
+    const issuedAt = this.clock.now();
+    let response: Response;
+    try {
+      response = await this.fetcher(
+        `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(this.config.accountId)}/r2/temp-access-credentials`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${this.config.parentApiToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            bucket: this.config.bucket,
+            parentAccessKeyId: this.config.parentAccessKeyId,
+            permission: "object-read-write",
+            ttlSeconds: this.ttlSeconds,
+            prefixes: ["managed-codex-session/"],
+          }),
+          cache: "no-store",
+          signal: AbortSignal.timeout(this.timeoutMs),
+        },
+      );
+    } catch {
+      throw new SubscriptionSessionError("credential_broker_unavailable");
+    }
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new SubscriptionSessionError("credential_broker_unavailable");
+    }
+    const envelope = payload as {
+      success?: unknown;
+      result?: { accessKeyId?: unknown; secretAccessKey?: unknown; sessionToken?: unknown };
+    } | null;
+    const result = envelope?.result;
+    if (!response.ok || envelope?.success !== true
+      || !validCredentialPart(result?.accessKeyId)
+      || !validCredentialPart(result?.secretAccessKey)
+      || !validCredentialPart(result?.sessionToken)) {
+      throw new SubscriptionSessionError("credential_broker_unavailable");
+    }
+    return {
+      accessKeyId: result.accessKeyId,
+      secretAccessKey: result.secretAccessKey,
+      sessionToken: result.sessionToken,
+      // The API response has no expiry field. Measuring from request start is
+      // conservative even if Cloudflare begins the TTL before responding.
+      expiresAt: issuedAt + this.ttlSeconds * 1_000,
+    };
+  }
+}
+
+type R2StoreLease = {
+  generation: number;
+  expiresAt: number;
+  store: SessionStateStore;
+};
+
+type R2StoreFactory = (credentials: TemporaryR2Credentials) => SessionStateStore;
+
+/**
+ * Stable controller store facade backed by replaceable short-lived clients.
+ * Valid clients remain usable during proactive renewal. At expiry, all local
+ * callers share one renewal promise; an auth rejection gets exactly one retry
+ * through the same single-flight path.
+ */
+export class RenewingR2SessionStateStore implements SessionStateStore {
+  private current: R2StoreLease | null = null;
+  private renewal: Promise<R2StoreLease> | null = null;
+  private nextGeneration = 1;
+  private readonly clock: MillisecondClock;
+  private readonly renewalSkewMs: number;
+
+  constructor(
+    private readonly broker: TemporaryR2CredentialBroker,
+    private readonly createStore: R2StoreFactory,
+    options: { clock?: MillisecondClock; renewalSkewMs?: number } = {},
+  ) {
+    this.clock = options.clock ?? { now: () => Date.now() };
+    this.renewalSkewMs = options.renewalSkewMs ?? R2_TEMPORARY_CREDENTIAL_RENEWAL_SKEW_MS;
+    if (!Number.isSafeInteger(this.renewalSkewMs) || this.renewalSkewMs < 0) {
+      throw new SubscriptionSessionError("configuration_missing");
+    }
+  }
+
+  private startRenewal(): Promise<R2StoreLease> {
+    if (this.renewal) return this.renewal;
+    const pending = (async () => {
+      let credentials: TemporaryR2Credentials;
+      try {
+        credentials = await this.broker.issue();
+      } catch {
+        throw new SubscriptionSessionError("credential_broker_unavailable");
+      }
+      if (!Number.isSafeInteger(credentials.expiresAt) || credentials.expiresAt <= this.clock.now()
+        || !validCredentialPart(credentials.accessKeyId)
+        || !validCredentialPart(credentials.secretAccessKey)
+        || !validCredentialPart(credentials.sessionToken)) {
+        throw new SubscriptionSessionError("credential_broker_unavailable");
+      }
+      let store: SessionStateStore;
+      try {
+        store = this.createStore(credentials);
+      } catch {
+        throw new SubscriptionSessionError("credential_broker_unavailable");
+      }
+      const lease = { generation: this.nextGeneration++, expiresAt: credentials.expiresAt, store };
+      this.current = lease;
+      return lease;
+    })();
+    this.renewal = pending;
+    void pending.then(
+      () => { if (this.renewal === pending) this.renewal = null; },
+      () => { if (this.renewal === pending) this.renewal = null; },
+    );
+    return pending;
+  }
+
+  private async storeForRequest(): Promise<R2StoreLease> {
+    const current = this.current;
+    const now = this.clock.now();
+    if (current && current.expiresAt > now) {
+      if (current.expiresAt <= now + this.renewalSkewMs && !this.renewal) {
+        // Do not pause an acquire while its existing credential is still
+        // valid. A failure is retried synchronously once expiry is reached.
+        void this.startRenewal().catch(() => undefined);
+      }
+      return current;
+    }
+    return await this.startRenewal();
+  }
+
+  private async replacementForRejected(rejected: R2StoreLease): Promise<R2StoreLease> {
+    const current = this.current;
+    if (current && current.generation !== rejected.generation && current.expiresAt > this.clock.now()) {
+      return current;
+    }
+    if (current?.generation === rejected.generation) this.current = null;
+    return await this.startRenewal();
+  }
+
+  private boundedStoreError(error: unknown): never {
+    if (error instanceof SubscriptionSessionError) throw error;
+    throw new SubscriptionSessionError("session_store_unavailable");
+  }
+
+  private async execute<T>(operation: (store: SessionStateStore) => Promise<T>): Promise<T> {
+    let lease: R2StoreLease;
+    try {
+      lease = await this.storeForRequest();
+    } catch (error) {
+      return this.boundedStoreError(error);
+    }
+    try {
+      return await operation(lease.store);
+    } catch (error) {
+      if (!(error instanceof R2SessionCredentialRejectedError)) return this.boundedStoreError(error);
+    }
+    let replacement: R2StoreLease;
+    try {
+      replacement = await this.replacementForRejected(lease);
+    } catch {
+      throw new SubscriptionSessionError("credential_broker_unavailable");
+    }
+    try {
+      return await operation(replacement.store);
+    } catch (error) {
+      if (error instanceof R2SessionCredentialRejectedError) {
+        if (this.current?.generation === replacement.generation) this.current = null;
+        throw new SubscriptionSessionError("credential_broker_unavailable");
+      }
+      return this.boundedStoreError(error);
+    }
+  }
+
+  readState(): Promise<VersionedSessionState> {
+    return this.execute((store) => store.readState());
+  }
+
+  compareExchangeState(expectedEtag: string | null, value: SessionState): Promise<{ ok: boolean; etag?: string }> {
+    return this.execute((store) => store.compareExchangeState(expectedEtag, value));
+  }
+
+  putSnapshotIfAbsent(key: string, value: Uint8Array): Promise<boolean> {
+    return this.execute((store) => store.putSnapshotIfAbsent(key, value));
+  }
+
+  getSnapshot(key: string): Promise<Uint8Array | null> {
+    return this.execute((store) => store.getSnapshot(key));
   }
 }
 
@@ -233,6 +526,10 @@ let controllerPromise: Promise<ManagedSubscriptionSessionController> | null = nu
 export function productionSubscriptionSessionController(
   bin: string,
 ): Promise<ManagedSubscriptionSessionController> {
+  // Check on every call, including after the singleton has warmed. A host
+  // cannot inherit or reuse this controller unless its deployment explicitly
+  // selected the brokered source.
+  requireVaultBrokerSubscriptionSource();
   if (controllerPromise) return controllerPromise;
   controllerPromise = (async () => {
     // Old Trigger deployments may still carry this copied secret. Refuse it:
@@ -242,15 +539,30 @@ export function productionSubscriptionSessionController(
       || process.env.CODEX_ACCESS_TOKEN !== undefined) {
       throw new SubscriptionSessionError("configuration_missing");
     }
-    const secrets = requiredSecrets(await vaultService(SESSION_SERVICE));
+    let values: Record<string, string>;
+    try {
+      values = await vaultService(SESSION_SERVICE);
+    } catch {
+      throw new SubscriptionSessionError("configuration_missing");
+    }
+    const secrets = parseSessionControllerSecrets(values);
     const key = canonicalBase64Bytes(secrets.SESSION_ENCRYPTION_KEY_B64, 32);
-    const aws = new AwsClient({
-      accessKeyId: secrets.R2_ACCESS_KEY_ID,
-      secretAccessKey: secrets.R2_SECRET_ACCESS_KEY,
-      service: "s3",
-      region: "auto",
+    const broker = new CloudflareTemporaryR2CredentialBroker({
+      accountId: secrets.R2_ACCOUNT_ID,
+      parentApiToken: secrets.R2_PARENT_API_TOKEN,
+      parentAccessKeyId: secrets.R2_PARENT_ACCESS_KEY_ID,
+      bucket: secrets.R2_BUCKET,
     });
-    const store = new R2SessionStateStore(aws, secrets.R2_ENDPOINT, secrets.R2_BUCKET);
+    const store = new RenewingR2SessionStateStore(broker, (credentials) => {
+      const aws = new AwsClient({
+        accessKeyId: credentials.accessKeyId,
+        secretAccessKey: credentials.secretAccessKey,
+        sessionToken: credentials.sessionToken,
+        service: "s3",
+        region: "auto",
+      });
+      return new R2SessionStateStore(aws, secrets.R2_ENDPOINT, secrets.R2_BUCKET);
+    });
     return new ManagedSubscriptionSessionController({
       store,
       cipher: new AesGcmSessionSnapshotCipher(key),
@@ -259,7 +571,8 @@ export function productionSubscriptionSessionController(
     });
   })().catch((error) => {
     controllerPromise = null;
-    throw error;
+    if (error instanceof SubscriptionSessionError) throw error;
+    throw new SubscriptionSessionError("configuration_missing");
   });
   return controllerPromise;
 }

@@ -14,6 +14,7 @@ import {
   verifyCodexSubscriptionPreflight,
 } from "./subscription-runtime";
 import { consumerAuth } from "./subscription-auth";
+import { CODEX_SESSION_SOURCE, CODEX_SESSION_SOURCE_ENV } from "./subscription-source";
 
 const validAuth = {
   auth_mode: "chatgpt",
@@ -49,6 +50,7 @@ describe("subscription subprocess capability scope", () => {
     vi.stubEnv("CODEX_AUTH_JSON_B64", undefined);
     vi.stubEnv("CODEX_AUTH_JSON", undefined);
     vi.stubEnv("CODEX_ACCESS_TOKEN", undefined);
+    vi.stubEnv(CODEX_SESSION_SOURCE_ENV, CODEX_SESSION_SOURCE);
   });
   afterEach(() => {
     rmSync(consumerRoot, { recursive: true, force: true });
@@ -64,6 +66,7 @@ describe("subscription subprocess capability scope", () => {
     expect(specialist.JARVIS_WORKER_TOKEN).toBeUndefined();
     expect(specialist.GITHUB_TOKEN).toBeUndefined();
     expect(specialist.GH_TOKEN).toBeUndefined();
+    expect(specialist[CODEX_SESSION_SOURCE_ENV]).toBeUndefined();
   });
 
   it("preserves the executable and network runtime without passing application authority", async () => {
@@ -146,8 +149,12 @@ describe("subscription subprocess capability scope", () => {
       JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT: "signed-provider-probe-envelope",
       SANDBOX0_TOKEN: "sandbox-provider-secret",
       TRIGGER_SECRET_KEY: "trigger-secret", GITHUB_TOKEN: "github-secret",
+      R2_PARENT_API_TOKEN: "parent-r2-api-token",
+      R2_PARENT_ACCESS_KEY_ID: "parent-r2-access-id",
+      AWS_SESSION_TOKEN: "temporary-r2-session-token",
+      JARVIS_CODEX_SESSION_SOURCE: "vault-broker",
     }, "spawn-scope");
-    const child = spawnSync(process.execPath, ["-e", "process.stdout.write(JSON.stringify({receipt:process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET,keyring:process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING,providerProbeKeyring:process.env.JARVIS_CLOUD_PROVIDER_PROBE_KEYRING,providerProbeReceipt:process.env.JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT,providerToken:process.env.SANDBOX0_TOKEN,convex:process.env.CONVEX_URL,trigger:process.env.TRIGGER_SECRET_KEY,github:process.env.GITHUB_TOKEN,openai:process.env.OPENAI_API_KEY,codex:process.env.CODEX_API_KEY}))"], { env, encoding: "utf8" });
+    const child = spawnSync(process.execPath, ["-e", "process.stdout.write(JSON.stringify({receipt:process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET,keyring:process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING,providerProbeKeyring:process.env.JARVIS_CLOUD_PROVIDER_PROBE_KEYRING,providerProbeReceipt:process.env.JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT,providerToken:process.env.SANDBOX0_TOKEN,convex:process.env.CONVEX_URL,trigger:process.env.TRIGGER_SECRET_KEY,github:process.env.GITHUB_TOKEN,parentApi:process.env.R2_PARENT_API_TOKEN,parentId:process.env.R2_PARENT_ACCESS_KEY_ID,session:process.env.AWS_SESSION_TOKEN,source:process.env.JARVIS_CODEX_SESSION_SOURCE,openai:process.env.OPENAI_API_KEY,codex:process.env.CODEX_API_KEY}))"], { env, encoding: "utf8" });
     expect(child.status).toBe(0);
     expect(JSON.parse(child.stdout)).toEqual({ openai: "", codex: "" });
   });
@@ -169,6 +176,15 @@ describe("subscription subprocess capability scope", () => {
     vi.stubEnv("CODEX_ACCESS_TOKEN", undefined);
     vi.stubEnv("CODEX_AUTH_JSON", validAuthJson);
     expect((await prepare()).error).toContain("configuration_missing");
+    expect(controller.acquire).not.toHaveBeenCalled();
+  });
+
+  it("rejects acquisition before the controller when the broker selector is absent", async () => {
+    vi.stubEnv(CODEX_SESSION_SOURCE_ENV, undefined);
+    const rejected = await prepare();
+    expect(rejected.error).toContain("source_rejected");
+    expect(rejected.env.CODEX_HOME).toBeUndefined();
+    expect(rejected.env.HOME).toBeUndefined();
     expect(controller.acquire).not.toHaveBeenCalled();
   });
 

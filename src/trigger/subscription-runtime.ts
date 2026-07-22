@@ -14,6 +14,7 @@ import {
   type ManagedSubscriptionSessionController,
 } from "./subscription-session";
 import { productionSubscriptionSessionController } from "./subscription-session-r2";
+import { requireVaultBrokerSubscriptionSource } from "./subscription-source";
 
 export { parseChatgptSubscriptionAuth } from "./subscription-auth";
 
@@ -75,8 +76,6 @@ function scopedSubscriptionEnv(
 ): NodeJS.ProcessEnv {
   const allow = [
     "PATH",
-    "HOME",
-    "CODEX_HOME",
     "LANG",
     "LC_ALL",
     "TMPDIR",
@@ -139,6 +138,14 @@ export async function prepareSubscriptionEnv(
   if (provider !== "codex") {
     return { env: {} as NodeJS.ProcessEnv, error: "Jarvis permits only the Codex CLI runtime" };
   }
+  try {
+    requireVaultBrokerSubscriptionSource();
+  } catch (error) {
+    return {
+      env: scopedSubscriptionEnv(process.env, provider),
+      error: subscriptionOperatorSignal(error),
+    };
+  }
   if (process.env.CODEX_AUTH_JSON_B64 !== undefined
     || process.env.CODEX_AUTH_JSON !== undefined
     || process.env.CODEX_ACCESS_TOKEN !== undefined) {
@@ -172,11 +179,11 @@ export async function prepareSubscriptionEnv(
     const authPath = join(home, "auth.json");
     writeFileSync(authPath, canonicalAuthJson(snapshot.auth), { mode: 0o600 });
     chmodSync(authPath, 0o600);
+    const env = scopedSubscriptionEnv(process.env, provider);
+    env.HOME = home;
+    env.CODEX_HOME = home;
     return {
-      env: scopedSubscriptionEnv(
-        { ...process.env, HOME: dirname(home), CODEX_HOME: home },
-        provider,
-      ),
+      env,
       snapshotVersion: snapshot.version,
       snapshotExpiresAt: snapshot.expiresAt,
       snapshotFence: snapshot.fence,
@@ -224,7 +231,10 @@ export function isolateSubscriptionEnv(
   // This is the final boundary before spawn(). Do not re-expand the
   // controller environment: it carries receipt, vault, Convex, Trigger and
   // GitHub authority that a Codex specialist must never inherit.
-  return scopedSubscriptionEnv({ ...base, CODEX_HOME: isolatedHome }, "codex");
+  const env = scopedSubscriptionEnv(base, "codex");
+  env.HOME = isolatedHome;
+  env.CODEX_HOME = isolatedHome;
+  return env;
 }
 
 /** Delete the access snapshot once the trusted Codex parent has loaded it. */
