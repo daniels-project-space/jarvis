@@ -1,6 +1,10 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import { issueAfterFreshAuthenticatedVercelHobbyTeamObservation } from "./vercel-hobby-team-observation";
+import {
+  blockUnscopedVercelHobbyActivation,
+  observeFreshAuthenticatedVercelHobbyTeam,
+  type VercelWorkloadEligibility,
+} from "./vercel-hobby-team-observation";
 
 const TEAM_ID = "team_exact";
 const TOKEN = "controller-only-vercel-token";
@@ -13,11 +17,12 @@ function attempt(
   fetchImpl: typeof fetch,
   issue = vi.fn(() => "signed-provider-probe-envelope"),
   teamId = TEAM_ID,
+  workloadEligibility: VercelWorkloadEligibility = "unknown",
 ) {
   return {
     issue,
-    result: issueAfterFreshAuthenticatedVercelHobbyTeamObservation(
-      { teamId, token: TOKEN, issue },
+    result: blockUnscopedVercelHobbyActivation(
+      { teamId, token: TOKEN, workloadEligibility, issue },
       fetchImpl,
     ),
   };
@@ -34,25 +39,31 @@ describe("Vercel live-provider probe source contract", () => {
     expect(source).not.toContain("for await (const item of listed)");
   });
 
-  it("keeps the authenticated Hobby gate after checkpoint replay and final cleanup", () => {
+  it("keeps the authenticated Hobby observation and unscoped-receipt block after replay and final cleanup", () => {
     const source = readFileSync(new URL("./probe-cloud-workspace-provider.ts", import.meta.url), "utf8");
     const replay = source.indexOf("if (marker !== runId)");
     const finalCleanup = source.indexOf('await provider.terminate(recreated, "terminal")', replay);
-    const hobbyGate = source.indexOf("issueAfterFreshAuthenticatedVercelHobbyTeamObservation({", finalCleanup);
+    const receipt = source.indexOf("const receipt: CloudProviderProbeReceipt", finalCleanup);
+    const issue = source.indexOf("const issueReceipt =", receipt);
+    const hobbyGate = source.indexOf("blockUnscopedVercelHobbyActivation({", issue);
+    const pass = source.indexOf("console.log(JSON.stringify({ status: \"PASS\", envelope }))", hobbyGate);
     expect(replay).toBeGreaterThan(-1);
     expect(finalCleanup).toBeGreaterThan(replay);
-    expect(hobbyGate).toBeGreaterThan(finalCleanup);
+    expect(receipt).toBeGreaterThan(finalCleanup);
+    expect(issue).toBeGreaterThan(receipt);
+    expect(hobbyGate).toBeGreaterThan(issue);
+    expect(pass).toBeGreaterThan(hobbyGate);
     expect(source).not.toContain("requireAuthoritativeVercelPlanAndSpendObservation");
+    expect(source).not.toContain("issueAfterFreshAuthenticatedVercelHobbyTeamObservation");
   });
 });
 
 describe("fresh authenticated Vercel Hobby team observation", () => {
-  it("issues only after the exact team is freshly observed as Hobby", async () => {
+  it("returns credential-free evidence only after the exact team is freshly observed as Hobby", async () => {
     let resolveResponse!: (response: Response) => void;
     const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => { resolveResponse = resolve; })) as unknown as typeof fetch;
-    const { issue, result } = attempt(fetchImpl);
+    const result = observeFreshAuthenticatedVercelHobbyTeam({ teamId: TEAM_ID, token: TOKEN }, fetchImpl);
 
-    expect(issue).not.toHaveBeenCalled();
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     const [url, init] = vi.mocked(fetchImpl).mock.calls[0];
     expect(url).toBe(`https://api.vercel.com/v2/teams/${TEAM_ID}`);
@@ -61,8 +72,30 @@ describe("fresh authenticated Vercel Hobby team observation", () => {
     expect(init?.signal).toBeInstanceOf(AbortSignal);
 
     resolveResponse(json({ id: TEAM_ID, billing: { plan: "hobby" } }));
-    await expect(result).resolves.toBe("signed-provider-probe-envelope");
-    expect(issue).toHaveBeenCalledTimes(1);
+    const observation = await result;
+    expect(observation).toEqual({ teamId: TEAM_ID, plan: "hobby" });
+    expect(Object.isFrozen(observation)).toBe(true);
+    expect(JSON.stringify(observation)).not.toContain(TOKEN);
+  });
+
+  it.each(["commercial", "unknown"] as const)(
+    "blocks workload eligibility %s from issuance even when the exact team is Hobby",
+    async (workloadEligibility) => {
+      const fetchImpl = vi.fn(async () => json({ id: TEAM_ID, billing: { plan: "hobby" } })) as unknown as typeof fetch;
+      const { issue, result } = attempt(fetchImpl, vi.fn(() => "receipt"), TEAM_ID, workloadEligibility);
+      await expect(result).rejects.toThrow("immutable receipt-bound personal_noncommercial workload eligibility");
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(issue).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not trust an unbound personal_noncommercial label or issue from partial evidence", async () => {
+    const fetchImpl = vi.fn(async () => json({ id: TEAM_ID, billing: { plan: "hobby" } })) as unknown as typeof fetch;
+    const { issue, result } = attempt(fetchImpl, vi.fn(() => "receipt"), TEAM_ID, "personal_noncommercial");
+    const error = await result.catch((caught: unknown) => caught);
+    expect(String(error)).toContain("immutable receipt-bound personal_noncommercial workload eligibility");
+    expect(String(error)).not.toContain(TOKEN);
+    expect(issue).not.toHaveBeenCalled();
   });
 
   it.each(["pro", "enterprise", "unknown"])("rejects the %s plan without issuing a receipt", async (plan) => {

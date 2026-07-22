@@ -27,7 +27,7 @@ import {
   issueAfterExactRemoteCancellation,
   probeExactRemoteCancellation,
 } from "../src/trigger/cloud-provider-cancellation-probe";
-import { issueAfterFreshAuthenticatedVercelHobbyTeamObservation } from "./vercel-hobby-team-observation";
+import { blockUnscopedVercelHobbyActivation } from "./vercel-hobby-team-observation";
 
 const LIVE_OPT_IN = "JARVIS_CLOUD_PROVIDER_PROBE=live";
 
@@ -272,12 +272,14 @@ async function main() {
     };
     const issueReceipt = () => issueAfterExactRemoteCancellation(cancellationEvidence, () => authority.issue(receipt));
     // This fresh provider-team read remains after the entire lifecycle probe.
-    // Its callback makes signing unreachable for paid, unknown, malformed,
-    // mismatched, cached/redirected, or unavailable team observations.
+    // Vercel Hobby is restricted to personal, non-commercial use. This probe
+    // receipt is deployment-wide rather than workload-bound, so even an exact
+    // Hobby observation cannot authorize signing for the general fleet.
     const envelope = binding.provider === "vercel"
-      ? await issueAfterFreshAuthenticatedVercelHobbyTeamObservation({
+      ? await blockUnscopedVercelHobbyActivation({
         teamId: process.env.VERCEL_TEAM_ID!,
         token: process.env.VERCEL_TOKEN!,
+        workloadEligibility: "unknown",
         issue: issueReceipt,
       })
       : issueReceipt();
