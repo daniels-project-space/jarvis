@@ -148,6 +148,14 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.files.has(`${workspace.root}/.jarvis-controller-${workspace.providerWorkspaceId}/source-upload.tar`)).toBe(true);
   });
 
+  it("deletes a partially hydrated attempt when upload or baseline creation fails", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    const bytes = createDeterministicTar([{ path: "package.json", data: new TextEncoder().encode("{}") }]);
+    observed.commandExit = (input) => String(input.args).includes("git init -q") ? 1 : 0;
+    await expect(provider.uploadCredentiallessArchive(workspace, { baseSha: "0".repeat(40), sha256: sha256Bytes(bytes), bytes })).rejects.toMatchObject({ code: "provider_unavailable" });
+    expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
+  });
+
   it("relocks deny-all and deletes the workspace before a failed hydration can reach Codex", async () => {
     const { provider, workspace } = await providerAndWorkspace();
     observed.files.set(`${workspace.root}/package-lock.json`, Buffer.from(JSON.stringify({ packages: { "node_modules/a": { resolved: "https://evil.example/a.tgz" } } })));
@@ -230,6 +238,15 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(String(install?.args)).not.toContain("/vercel/sandbox/.jarvis-npm-cache");
     expect(String(install?.args)).toContain("git clean -ffd -e node_modules");
     expect(observed.updates).toEqual([{ allow: ["registry.npmjs.org"] }, "deny-all"]);
+  });
+
+  it("keeps a lockfile-free attempt deny-all and proves egress is blocked before returning", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.commandExit = (input) => String(input.args).includes("test -f") ? 1 : 0;
+    await provider.hydrateDependencies(workspace);
+    expect(observed.commands.some((command) => String(command.args).includes("npm ci"))).toBe(false);
+    expect(observed.updates).toEqual(["deny-all"]);
+    expect(observed.commands.some((command) => String(command.args).includes("fetch("))).toBe(true);
   });
 
   it("rejects unbounded command and listing requests before a session data-plane call", async () => {

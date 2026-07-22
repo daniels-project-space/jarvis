@@ -576,6 +576,9 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
   private credentials() { return { token: this.token, teamId: this.teamId, projectId: this.projectId }; }
 
   async createWorkspace(input: { attemptKey: string; template: string; runtime: string; lockfileDigest: string; limits: WorkspaceLimits }) {
+    if (![this.token, this.teamId, this.projectId].every((value) => value.trim().length > 0)) {
+      throw new CloudWorkspaceError(this.name, "missing_configuration", "Vercel Sandbox requires controller token, team, and project identifiers", "blocked");
+    }
     if (!Number.isSafeInteger(input.limits.ttlMs) || input.limits.ttlMs < 1) {
       throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox attempt TTL must be a positive safe integer", "rejected");
     }
@@ -603,7 +606,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       },
     });
     const session = sandbox.currentSession();
-    if (sandbox.routes.length || sandbox.runtime !== "node22" || sandbox.vcpus !== 2 || sandbox.memory !== 4096
+    if (session.status !== "running" || sandbox.routes.length || sandbox.runtime !== "node22" || sandbox.vcpus !== 2 || sandbox.memory !== 4096
       || sandbox.networkPolicy !== "deny-all" || session.networkPolicy !== "deny-all") {
       await sandbox.delete().catch(() => undefined);
       throw new CloudWorkspaceError(this.name, "provider_unavailable", "Vercel Sandbox creation did not preserve private bounded deny-all configuration", "blocked");
@@ -611,6 +614,18 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     const workspace = { provider: this.name, providerWorkspaceId: sandbox.name, providerSessionId: session.sessionId, root: this.workspaceRoot, createdAt: Date.now() } satisfies CloudWorkspace;
     assertWorkspaceIdentity(workspace);
     return workspace;
+  }
+
+  override async uploadCredentiallessArchive(workspace: CloudWorkspace, archive: CredentiallessArchive): Promise<void> {
+    // The controller normally performs the same cleanup, but source upload is
+    // itself an agent boundary. Keep this adapter independently fail-closed so
+    // a direct caller cannot leave a session with partially hydrated source.
+    try {
+      await super.uploadCredentiallessArchive(workspace, archive);
+    } catch (error) {
+      await this.terminate(workspace, "terminal").catch(() => undefined);
+      throw error;
+    }
   }
 
   async exec(workspace: CloudWorkspace, request: ExecRequest): Promise<ExecResult> {
@@ -681,33 +696,35 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     try {
       const sandbox = await this.get(workspace); const session = this.assertSession(workspace, sandbox);
       try {
-      const lockPath = `${this.workspaceRoot}/package-lock.json`;
-      const paths = this.pathsFor(workspace);
-      const cachePath = `${paths.controlDir}/npm-cache`;
-      // A missing lock means no egress. Verify its parent/final path without
-      // following a link before deciding whether there is anything to read.
-      await this.assertNoSymlink(workspace, sandbox, session, lockPath, true);
-      const exists = await this.runSessionCommand(workspace, sandbox, session, { command: `test -f ${shellQuote(lockPath)}`, cwd: this.workspaceRoot, timeoutMs: 10_000, maxOutputBytes: 4_000 });
-      if (exists.exitCode === 1) return;
-      if (exists.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "could not inspect committed package lock", "deferred");
-      const lock = await this.readAbsolute(workspace, lockPath, DEFAULT_WORKSPACE_LIMITS.maxFileBytes);
-      if (!packageLockUsesOnlyNpmRegistry(lock)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "package lock contains a non-npm-registry dependency", "rejected");
-      this.assertSession(workspace, sandbox);
-      await session.update({ networkPolicy: VERCEL_NPM_POLICY });
-      this.assertSession(workspace, sandbox);
-      const installed = await this.runSessionCommand(workspace, sandbox, session, {
-        command: [
-          `npm ci --ignore-scripts --no-audit --no-fund --cache ${shellQuote(cachePath)}`,
-          "git reset --hard refs/jarvis/controller-base",
-          // Preserve only dependencies and the controller-owned control
-          // directory while removing install-created source mutations.
-          `git clean -ffdX -e node_modules -e ${shellQuote(paths.controlDir.slice(this.workspaceRoot.length + 1))}`,
-          `git clean -ffd -e node_modules -e ${shellQuote(paths.controlDir.slice(this.workspaceRoot.length + 1))}`,
-          `rm -rf -- ${shellQuote(cachePath)}`,
-        ].join(" && "),
-        cwd: this.workspaceRoot, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs, maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes,
-      });
-      if (installed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "deterministic dependency hydration failed", "deferred");
+        const lockPath = `${this.workspaceRoot}/package-lock.json`;
+        const paths = this.pathsFor(workspace);
+        const cachePath = `${paths.controlDir}/npm-cache`;
+        // A missing lock means no egress. It still proceeds through the
+        // tracked deny-all update and behavioral probe below; an early return
+        // here could accidentally make a future policy regression invisible.
+        await this.assertNoSymlink(workspace, sandbox, session, lockPath, true);
+        const exists = await this.runSessionCommand(workspace, sandbox, session, { command: `test -f ${shellQuote(lockPath)}`, cwd: this.workspaceRoot, timeoutMs: 10_000, maxOutputBytes: 4_000 });
+        if (exists.exitCode !== 1) {
+          if (exists.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "could not inspect committed package lock", "deferred");
+          const lock = await this.readAbsolute(workspace, lockPath, DEFAULT_WORKSPACE_LIMITS.maxFileBytes);
+          if (!packageLockUsesOnlyNpmRegistry(lock)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "package lock contains a non-npm-registry dependency", "rejected");
+          this.assertSession(workspace, sandbox);
+          await session.update({ networkPolicy: VERCEL_NPM_POLICY });
+          this.assertSession(workspace, sandbox);
+          const installed = await this.runSessionCommand(workspace, sandbox, session, {
+            command: [
+              `npm ci --ignore-scripts --no-audit --no-fund --cache ${shellQuote(cachePath)}`,
+              "git reset --hard refs/jarvis/controller-base",
+              // Preserve only dependencies and the controller-owned control
+              // directory while removing install-created source mutations.
+              `git clean -ffdX -e node_modules -e ${shellQuote(paths.controlDir.slice(this.workspaceRoot.length + 1))}`,
+              `git clean -ffd -e node_modules -e ${shellQuote(paths.controlDir.slice(this.workspaceRoot.length + 1))}`,
+              `rm -rf -- ${shellQuote(cachePath)}`,
+            ].join(" && "),
+            cwd: this.workspaceRoot, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs, maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes,
+          });
+          if (installed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "deterministic dependency hydration failed", "deferred");
+        }
       } finally {
         this.assertSession(workspace, sandbox);
         await session.update({ networkPolicy: "deny-all" });
@@ -718,12 +735,12 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       const denied = await this.exec(workspace, { command: "node -e 'fetch(\"https://example.com\",{signal:AbortSignal.timeout(3000)}).then(()=>process.exit(9),()=>process.exit(0))'", cwd: this.workspaceRoot, timeoutMs: 8_000, maxOutputBytes: 4_000 });
       if (denied.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "deny-all network verification failed after dependency hydration", "blocked");
     } catch (error) {
-      await this.terminate(workspace).catch(() => undefined);
+      await this.terminate(workspace, "terminal").catch(() => undefined);
       throw error;
     }
   }
 
-  async terminate(workspace: CloudWorkspace) {
+  async terminate(workspace: CloudWorkspace, _reason: "terminal" | "orphan" | "cancelled" = "terminal") {
     // Termination is authorized only for the random, attempt-owned name. It
     // deliberately does not read or resume a session, so a stopped/replaced
     // session cannot make cleanup start compute or skip deletion.
@@ -825,7 +842,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
         // A create request may have crossed the provider boundary. Delete the
         // exact random name before returning; if it later resolves, deletion
         // has already removed any possible remote process.
-        try { await this.terminate(workspace); }
+        try { await this.terminate(workspace, "cancelled"); }
         catch {
           throw new CloudWorkspaceError(this.name, "cleanup_blocked", "could not delete the exact sandbox after interrupted command creation", "blocked");
         }
@@ -857,7 +874,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       if (command) {
         try { await killAndObserve(); }
         catch {
-          await this.terminate(workspace).catch(() => undefined);
+          await this.terminate(workspace, "terminal").catch(() => undefined);
           throw new CloudWorkspaceError(this.name, "provider_unavailable", "could not prove exact command termination", "blocked");
         }
       }

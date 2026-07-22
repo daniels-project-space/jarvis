@@ -150,7 +150,7 @@ async function main() {
       lockfileDigest: binding.runtime.digest,
       limits: DEFAULT_WORKSPACE_LIMITS,
     });
-    const providerObservation = binding.provider === "sandbox0"
+    let providerObservation = binding.provider === "sandbox0"
       ? await inspectSandbox0Configuration(first, binding.template.identity, binding.template.digest)
       : await inspectVercelConfiguration(first);
 
@@ -159,6 +159,9 @@ async function main() {
     if (binding.provider === "vercel") {
       if (!provider.hydrateDependencies) throw new Error("Vercel dependency lifecycle adapter is unavailable");
       await provider.hydrateDependencies(first);
+      // Re-fetch after the allow-only install phase. This is an authoritative
+      // provider observation of the relock, not a copy of controller intent.
+      providerObservation = await inspectVercelConfiguration(first);
     }
     // This reads the uploaded provider file through the fenced data plane;
     // it proves the exact sandbox's file lifecycle rather than inferring it
