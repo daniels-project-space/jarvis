@@ -16,10 +16,10 @@ export function repairPrompt(incident: RepairIncident, repo: string): string {
     `Incident (source: ${incident.source}, seen ${incident.count}x): ${incident.message}\n\n` +
     `Method: 1) REPRODUCE — hit the live endpoints (e.g. curl https://jarvis-orcin-six.vercel.app/api/...) ` +
     `or read the failing path until you can explain the error. 2) Trace to the underlying cause in the code of ${repo}. ` +
-    `3) Apply the MINIMAL correct fix. 4) VALIDATE proportionally: for a small single-file change, re-read your full diff line by line instead of building (the clone has no node_modules; Vercel's build is the gate and a failed provider build auto-files an incident straight back to you). For multi-file or risky changes, run "npm install" then "npx tsc --noEmit" and "npm run build" — they must pass. ` +
+    `3) Apply the MINIMAL correct fix. 4) VALIDATE proportionally: for a small single-file change, re-read your full diff line by line. For multi-file or risky changes, run "npm install" then "npx tsc --noEmit" and "npm run build" — they must pass. Do not treat a provider build as the source-work gate. ` +
     `5) Commit ONLY working code with a title starting "self-repair:". ` +
     `${SHALLOW_PROVENANCE_RULE} Never replace or reparent a persisted shared branch based on a truncated revision walk. ` +
-    `If the true fix needs convex/ or src/trigger/ redeploy (you cannot deploy those), still commit and SAY SO plainly. ` +
+    `Source work ends on the attested isolated worker branch; it never opens a PR, merges, or deploys. If the true fix needs a separate gated provider release, still commit and SAY SO plainly. ` +
     `If you cannot find the root cause, do NOT guess-edit — say exactly what you ruled out and what you suspect.`
   );
 }

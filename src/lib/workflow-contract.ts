@@ -9,7 +9,7 @@ export type TeamManifestAgent = {
   description: string;
   capabilities: string[];
   defaultModel: "luna" | "terra" | "sol";
-  autonomy: "supervised" | "read-only" | "verified-auto-delivery" | "draft-only" | "safe-auto-fix";
+  autonomy: "supervised" | "read-only" | "verified-branch-delivery" | "draft-only" | "safe-auto-fix";
   instructions: string;
 };
 

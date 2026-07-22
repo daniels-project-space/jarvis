@@ -14,7 +14,8 @@ describe("self-repair prompt", () => {
       attempts: 1,
     }, "jarvis");
     expect(workApprovalPolicy({ task, repo: "jarvis", risk: "high" }).required).toBe(false);
-    expect(task).toContain("you cannot deploy those");
+    expect(task).toContain("Source work ends on the attested isolated worker branch");
+    expect(task).toContain("separate gated provider release");
     expect(task).toContain(SHALLOW_PROVENANCE_RULE);
     expect(TEAM_BY_SLUG.paul.instructions).toContain(SHALLOW_PROVENANCE_RULE);
   });

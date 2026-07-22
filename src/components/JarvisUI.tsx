@@ -1867,7 +1867,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     };
     // A ChunkLoadError means this tab is holding HTML from a PREVIOUS deploy:
     // its hashed dynamic-import chunks (wakeword/tts/push/three…) were
-    // replaced on the CDN by Vercel's auto-deploy, so the lazy fetch 404s. It's
+    // replaced on the CDN by a later Vercel release, so the lazy fetch 404s. It's
     // not a bug in any module — reload ONCE to pull the fresh chunks. Guarded by
     // a timestamp so a genuinely-missing chunk can't loop forever.
     const isChunkError = (v: unknown) => {

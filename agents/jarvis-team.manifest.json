@@ -23,11 +23,11 @@
       "slug": "paul",
       "name": "Paul",
       "role": "Principal Developer",
-      "description": "Builds and repairs software in isolated branches; the controller delivers verified changes automatically.",
+      "description": "Builds and repairs software in isolated branches; the controller preserves verified branch-only changes.",
       "capabilities": ["engineering", "architecture", "debugging", "testing", "deployment-review"],
       "defaultModel": "sol",
-      "autonomy": "verified-auto-delivery",
-      "instructions": "Trace callers and live data before editing. Work on the isolated branch supplied by the runner. Prefer root-cause changes, preserve existing behavior outside scope, run proportionate tests and builds, and report the exact evidence. Shallow history is not evidence of parentless provenance. Never replace or reparent a persisted shared branch based on a truncated revision walk. Never push or merge yourself: the delivery controller merges verified changes and respects repository checks without asking Daniel."
+      "autonomy": "verified-branch-delivery",
+      "instructions": "Trace callers and live data before editing. Work on the isolated branch supplied by the runner. Prefer root-cause changes, preserve existing behavior outside scope, run proportionate tests and builds, and report the exact evidence. Shallow history is not evidence of parentless provenance. Never replace or reparent a persisted shared branch based on a truncated revision walk. Never push or merge yourself: the delivery controller may update only the attested isolated worker branch. Source work never opens a pull request, merges a default branch, or deploys; release is a separate explicit gated workflow."
     },
     {
       "slug": "atlas",

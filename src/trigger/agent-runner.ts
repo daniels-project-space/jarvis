@@ -18,7 +18,7 @@ import {
 import { reviewPrompt } from "./codex-review";
 import { normalizeWorkModelTier } from "../lib/work-models";
 import { githubGitEnv, githubRepoUrl } from "./git-transport";
-import { canonicalizeRepository } from "../lib/workflow-contract";
+import { canonicalizeRepository, isOwnedRepositoryScope } from "../lib/workflow-contract";
 import { buildContinuationCheckpoint, segmentTimeoutMs } from "./continuation";
 import { runWatchSweep } from "./watch-runtime";
 import {
@@ -93,6 +93,11 @@ import {
   type CloudProviderRuntimeAttestation,
 } from "./cloud-provider-probe-attestation";
 import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, createDeterministicTar, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider, type HistoricalCloudWorkspaceProviderName, type CredentiallessArchive } from "./cloud-workspace";
+import {
+  GitDeploymentFenceError,
+  attestCommittedGitDeploymentFence,
+  ensureGitDeploymentFence,
+} from "./git-deployment-fence";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent against an isolated cloud workspace through controller-owned dynamic
@@ -696,7 +701,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       briefingPath,
       `# You are a scoped JARVIS permanent-team agent working for Daniel.\n\n${INFRA_MAP}\n\n` +
         `## Capability boundary\n` +
-        `You run inside an isolated worktree with no general secrets-vault access. Use only the repository and explicitly attached MCP capabilities. Fully implement and verify scoped software work; the delivery controller merges verified branches automatically. Never seek credentials, publish publicly, message people, spend money, or perform destructive actions. If one is required, stop with the exact approval needed.\n\n` +
+        `You run inside an isolated worktree with no general secrets-vault access. Use only the repository and explicitly attached MCP capabilities. Fully implement and verify scoped software work; the delivery controller may update only the attested isolated worker branch. Source-work authorization never opens a pull request, merges a default branch, or deploys; release is a separate explicit gated workflow. Never seek credentials, publish publicly, message people, spend money, or perform destructive actions. If one is required, stop with the exact approval needed.\n\n` +
         `## Conventions\n- The runner supplies the repository when one is in scope; do not clone or push another repository.\n` +
         `- Toolchain: curl, git, node, npm, npx and gh were verified before this lease. Use them through Codex's shell tool. Live web search is enabled for current information.\n` +
         `- The repository is already checked out for you. GitHub credentials remain with the delivery controller; use gh only for public/read-only inspection and report if a remote authenticated operation is required.\n` +
@@ -1615,6 +1620,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         });
         await durableProgress;
         let result = run.text;
+        let deploymentFenceFailure = "";
         const portable = await persistPortableCheckpoint({
           provider: cloudProvider,
           workspace: providerWorkspace,
@@ -1674,6 +1680,15 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           repoDir = controllerCheckoutPath;
           cwd = controllerCheckoutPath;
           await applyValidatedPatchToControllerCheckout(repoDir, baseSha, patch, env);
+          if (!job.readonly && isOwnedRepositoryScope(repo)) {
+            try {
+              ensureGitDeploymentFence(repoDir);
+            } catch (error) {
+              deploymentFenceFailure = error instanceof GitDeploymentFenceError
+                ? `${error.code}: ${error.repair}`
+                : `verification_failed: ${String(error).slice(0, 500)}`;
+            }
+          }
         }
         result = `${result}\n\nCloud boundary: ${cloudProvider.name} workspace ${providerWorkspace.providerWorkspaceId}; R2 checkpoint ${portable.digest} (${portable.byteCount} bytes).`;
 
@@ -1685,6 +1700,29 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           narrative: result,
           trace: run.checkpointLog,
         });
+        const finalizeDeploymentFenceFailure = async (phase: string) => {
+          if (!deploymentFenceFailure) return false;
+          const failure = [
+            `Git delivery was blocked ${phase} because the deployment fence did not attest.`,
+            `Exact repair: ${deploymentFenceFailure}`,
+            `Portable checkpoint preserved: ${portable.ref} · sha256 ${portable.digest} · ${portable.byteCount} bytes.`,
+            "No repository ref or deployment-provider state was mutated.",
+          ].join("\n\n");
+          const finalized = await deliveryMutation("jobs:finalize", {
+            jobId: job.jobId,
+            expectedAttempt,
+            status: "error",
+            result: failure.slice(0, 4_000),
+          });
+          if (finalized && !job.missionId) {
+            await convexMutation("chatQueue:postAssistant", {
+              threadId: originThread,
+              text: `${profile.name} preserved the portable checkpoint but blocked Git delivery: ${deploymentFenceFailure.slice(0, 220)}`,
+            }).catch(() => {});
+          } else if (finalized && job.missionId) await maybeSynthesizeMission(job.missionId).catch(() => {});
+          return true;
+        };
+        if (await finalizeDeploymentFenceFailure("before staging, committing, remote observation, or push")) return;
         if (run.stopped) {
           if (run.stopped === "steered") {
             await convexMutation("jobs:checkpointAndRequeue", {
@@ -1711,12 +1749,25 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           const pushUrl = githubRepoUrl(repo);
           const gitEnv = githubGitEnv(env, token);
           const runGit = (args: string[]) => sh("git", ["-C", deliveryDir, ...args], gitEnv);
-          await sh("git", ["-C", deliveryDir, "add", "-A"], env);
-          await sh(
-            "git",
-            ["-C", deliveryDir, "commit", "-m", `chore: ${profile.name.toLowerCase()} — ${job.task.slice(0, 60).replace(/"/g, "'")}`],
-            env,
-          );
+          const staged = await sh("git", ["-C", deliveryDir, "add", "-A"], env);
+          if (staged.code !== 0) {
+            deploymentFenceFailure = `staging_failed: repair the controller Git index before delivery (${staged.out.slice(-300)})`;
+          }
+          const stagedDiff = deploymentFenceFailure
+            ? { code: 2, out: "" }
+            : await sh("git", ["-C", deliveryDir, "diff", "--cached", "--quiet"], env);
+          if (!deploymentFenceFailure && stagedDiff.code === 1) {
+            const committed = await sh(
+              "git",
+              ["-C", deliveryDir, "commit", "-m", `chore: ${profile.name.toLowerCase()} — ${job.task.slice(0, 60).replace(/"/g, "'")}`],
+              env,
+            );
+            if (committed.code !== 0) {
+              deploymentFenceFailure = `commit_failed: repair the controller Git commit failure before delivery (${committed.out.slice(-300)})`;
+            }
+          } else if (!deploymentFenceFailure && stagedDiff.code !== 0) {
+            deploymentFenceFailure = `staging_failed: the controller could not inspect its staged diff (${stagedDiff.out.slice(-300)})`;
+          }
           let local = (await sh("git", ["-C", deliveryDir, "rev-parse", "HEAD"], env)).out.trim();
           checkpointHeadSha = local;
           if ((reviewBaseSha || baseSha) && local && local !== (reviewBaseSha || baseSha)) {
@@ -1724,16 +1775,27 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               .trim()
               .slice(0, 1_500);
           }
-          const history = await ensureCompleteRepositoryHistory({
+          if (!deploymentFenceFailure && isOwnedRepositoryScope(repo)) {
+            try {
+              await attestCommittedGitDeploymentFence(runGit);
+            } catch (error) {
+              deploymentFenceFailure = error instanceof GitDeploymentFenceError
+                ? `${error.code}: ${error.repair}`
+                : `verification_failed: ${String(error).slice(0, 500)}`;
+            }
+          }
+          const history = deploymentFenceFailure ? null : await ensureCompleteRepositoryHistory({
             runGit,
             remote: pushUrl,
             sourceBranch: checkoutSourceBranch,
           });
-          if (!history.ok) {
+          if (history && !history.ok) {
             deliveryRetry = true;
             pushNote = `${SHALLOW_PROVENANCE_RULE} ${history.note}; retrying from canonical branch ${branch}`;
           }
-          const remoteObservation = await runGit(["ls-remote", pushUrl, `refs/heads/${branch}`]);
+          const remoteObservation = deploymentFenceFailure
+            ? { code: 2, out: "" }
+            : await runGit(["ls-remote", pushUrl, `refs/heads/${branch}`]);
           if (remoteObservation.code !== 0) {
             deliveryRetry = true;
             pushNote = `worker ref observation failed (${String(remoteObservation.code)}): ${remoteObservation.out.slice(-300)}`;
@@ -1773,27 +1835,40 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                   : `local history does not descend from canonical base ${baseSha}; replacement history will not be pushed`;
               }
             }
-          if (needsPush && !deliveryRetry) {
-              if (await stopIfLeaseLost(checkpointText, result, branch)) return;
-              if (!await linearizeDelivery()) return;
-              const push = await runGit(["push", pushUrl, `HEAD:refs/heads/${branch}`]);
-              if (push.code !== 0 && isNonFastForwardPush(push.out)) {
-                deliveryRetry = true;
-                pushNote = `isolated worker branch ${branch} advanced unexpectedly; retrying from its canonical head`;
-              } else {
-                pushFailed = push.code !== 0;
-                pushNote = pushFailed
-                  ? `branch push failed: ${push.out.slice(-180).replace(/\s+/g, " ")}`
-                  : `${pushNote ? `${pushNote}; ` : ""}checkpoint branch ${branch} pushed`;
+            if (needsPush && !deliveryRetry) {
+              if (isOwnedRepositoryScope(repo)) {
+                try {
+                  await attestCommittedGitDeploymentFence(runGit);
+                } catch (error) {
+                  deploymentFenceFailure = error instanceof GitDeploymentFenceError
+                    ? `${error.code}: ${error.repair}`
+                    : `verification_failed: ${String(error).slice(0, 500)}`;
+                }
+              }
+              if (!deploymentFenceFailure) {
+                if (await stopIfLeaseLost(checkpointText, result, branch)) return;
+                if (!await linearizeDelivery()) return;
+                const push = await runGit(["push", pushUrl, `HEAD:refs/heads/${branch}`]);
+                if (push.code !== 0 && isNonFastForwardPush(push.out)) {
+                  deliveryRetry = true;
+                  pushNote = `isolated worker branch ${branch} advanced unexpectedly; retrying from its canonical head`;
+                } else {
+                  pushFailed = push.code !== 0;
+                  pushNote = pushFailed
+                    ? `branch push failed: ${push.out.slice(-180).replace(/\s+/g, " ")}`
+                    : `${pushNote ? `${pushNote}; ` : ""}checkpoint branch ${branch} pushed`;
+                }
               }
             }
           }
-          if (!pushFailed && !deliveryRetry) {
+          if (!deploymentFenceFailure && !pushFailed && !deliveryRetry) {
             const compared = await branchHasChanges(repo, branch, token);
             const changed = compared ?? (needsPush || Boolean(remote && job.branch));
             if (!changed && needsPush) pushNote = "branch matches the repository default after verification";
           }
         }
+
+        if (await finalizeDeploymentFenceFailure("before remote push")) return;
 
         const continuationCheckpoint = buildContinuationCheckpoint({
           attempt: expectedAttempt,

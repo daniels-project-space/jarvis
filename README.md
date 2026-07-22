@@ -32,8 +32,9 @@ agents to build and repair Daniel's other projects. One personality
 - **Screen** — `ui:setPanel` (url | video | image | code | markdown) drives the
   materializing viewport in `src/components/JarvisUI.tsx`.
 - **Self-maintenance** — the brain's `self_repair` and `self_improve` tools, plus
-  automatic incident reports, dispatch root-cause repair and engineering agents; validated
-  commits to `main` auto-deploy via Vercel.
+  automatic incident reports, dispatch root-cause repair and engineering agents. Validated
+  source changes finish on attested isolated worker branches; they do not open pull requests,
+  merge the default branch, or deploy.
 
 ## Development
 
@@ -42,8 +43,9 @@ npm install
 npm run dev
 ```
 
-Deploy: push to `main` → Vercel. `npx convex deploy` for `convex/`;
-`npx trigger.dev deploy` for `src/trigger/`. Missing env vars are pulled from the secrets
-vault at runtime (`src/lib/vault.ts`).
+Release is a separate explicit gated provider workflow. Git-triggered Vercel deployment is
+disabled by `vercel.json`; a source branch update is never evidence of a Vercel, Convex, or
+Trigger release. Missing env vars are pulled from the secrets vault at runtime
+(`src/lib/vault.ts`).
 
 See [`AGENTS.md`](./AGENTS.md) for the full architecture and self-modification checklist.

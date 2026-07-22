@@ -1048,7 +1048,7 @@ export const TOOL_DEFS = [
   {
     name: "self_improve",
     description:
-      "Upgrade JARVIS himself: add a new tool/capability, improve the UI or design, extend behaviour. Dispatches an engineer on the jarvis repo; validated changes go live automatically within ~5 minutes. Use when Daniel asks for an ability you don't have, or you keep missing one.",
+      "Upgrade JARVIS himself: add a new tool/capability, improve the UI or design, extend behaviour. Dispatches an engineer whose validated source changes finish on an attested isolated worker branch; release remains a separate explicit gated workflow. Use when Daniel asks for an ability you don't have, or you keep missing one.",
     parameters: {
       type: "object",
       properties: {
@@ -1065,12 +1065,11 @@ const SELF_IMPROVE_RULES =
   "and design language (cockpit HUD, cyan/amber, Chakra Petch/Sora). New abilities usually mean: a tool in src/lib/tools.ts " +
   "(add to TOOL_DEFS + executeTool — both lanes pick it up automatically), a route in src/app/api/, or UI in " +
   "src/components/JarvisUI.tsx. VALIDATE proportionally before committing: for a small single-file change, re-read your " +
-  "full diff line by line (the clone has no node_modules; Vercel's build is the gate and a failed deploy auto-files an " +
-  "incident straight back to a repair agent). For multi-file or risky changes, run 'npm install' then 'npx tsc --noEmit' " +
-  "and 'npm run build' — they must pass. Commit only working code, message starting 'self-improve:'. Work on the runner's isolated branch; the controller owns verified merge and delivery, so never push directly to main or claim production is live. " +
+  "full diff line by line. For multi-file or risky changes, run 'npm install' then 'npx tsc --noEmit' " +
+  "and 'npm run build' — they must pass. Commit only working code, message starting 'self-improve:'. Work on the runner's isolated branch; source delivery stops on that attested branch and never opens a PR, merges a default branch, or deploys. Release is a separate explicit gated workflow, so never claim production is live. " +
   `${SHALLOW_PROVENANCE_RULE} Never replace or reparent a persisted shared branch based on a truncated revision walk. ` +
   "If the change truly requires convex/ schema or src/trigger/ edits, keep them minimal and state clearly in your final " +
-  "answer which provider deployment remains to be verified; the controller continues delivery without asking Daniel. Never remove existing capabilities.";
+  "answer which separate provider release remains to be verified; the controller preserves only the attested isolated branch. Never remove existing capabilities.";
 
 // Method scaffolds appended to fleet/agent tasks (adapted from the
 // ethanplusai/jarvis prompt-template library) — they raise output quality by
