@@ -13,8 +13,10 @@ agents to build and repair Daniel's other projects. One personality
   local model download or inference warm-up. The microphone is closed while Jarvis
   speaks, so speaker echo cannot cut him off.
   Tools run through the private agent bridge; finished turns live in Convex history.
-- **Text lane** — `/api/chat` commits each turn to Convex and wakes one of two warm
-  Trigger workers. The same Codex subscription app-server streams deltas every 120 ms;
+- **Text lane** — `/api/chat` commits each turn to Convex and wakes the available
+  long-lived foreground owner. The primary and handoff Trigger tasks alternate
+  only at the four-hour handoff boundary; exactly one holds the Convex lease.
+  The same Codex subscription app-server streams deltas every 120 ms;
   Luna/Terra/Sol are selected by complexity. The minute dispatcher only checks the
   runner lease and starts a replacement; it never occupies the recovery queue.
 
