@@ -1,8 +1,8 @@
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { accessSync, chmodSync, constants, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { delimiter, dirname, join } from "node:path";
+import { accessSync, chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { delimiter, dirname, join, resolve, sep } from "node:path";
 import {
   canonicalAuthJson,
   parseChatgptSubscriptionAuthText,
@@ -24,6 +24,27 @@ export const PINNED_CODEX_VERSION = "codex-cli 0.144.5";
 export const CHATGPT_LOGIN_STATUS_RECEIPT = "Logged in using ChatGPT";
 
 const nodeRequire = createRequire(import.meta.url);
+const DEFAULT_CONSUMER_ROOT = "/home/node/.jarvis-codex-consumers";
+const DEFAULT_ISOLATION_ROOT = "/home/node/.jarvis-codex-isolations";
+const ownedSubscriptionHomes = new Map<string, string>();
+
+function directChild(root: string, path: string): boolean {
+  return dirname(path) === root && path.startsWith(`${root}${sep}`);
+}
+
+function registerSubscriptionHome(root: string, home: string): void {
+  const canonicalRoot = realpathSync(root);
+  const absoluteHome = resolve(home);
+  if (!directChild(canonicalRoot, absoluteHome)) throw new Error("unsafe subscription consumer home");
+  ownedSubscriptionHomes.set(absoluteHome, canonicalRoot);
+}
+
+function unsafeConsumerRoot(root: string): boolean {
+  const workspaceRoot = resolve("/tmp/work");
+  const checkoutRoot = resolve(process.cwd());
+  return root === workspaceRoot || root.startsWith(`${workspaceRoot}${sep}`)
+    || root === checkoutRoot || root.startsWith(`${checkoutRoot}${sep}`);
+}
 
 export const REQUIRED_AGENT_TOOLS = ["curl", "git", "node", "npm", "npx", "gh"] as const;
 
@@ -138,6 +159,7 @@ export async function prepareSubscriptionEnv(
   if (provider !== "codex") {
     return { env: {} as NodeJS.ProcessEnv, error: "Jarvis permits only the Codex CLI runtime" };
   }
+  let consumerHome = "";
   try {
     requireVaultBrokerSubscriptionSource();
   } catch (error) {
@@ -171,11 +193,16 @@ export async function prepareSubscriptionEnv(
   }
 
   try {
-    const root = options.root ?? "/home/node/.jarvis-codex-consumers";
-    if (root.startsWith("/tmp/work") || root === process.cwd()) throw new Error("unsafe consumer root");
+    const root = resolve(options.root ?? DEFAULT_CONSUMER_ROOT);
+    if (unsafeConsumerRoot(root)) throw new Error("unsafe consumer root");
     mkdirSync(root, { recursive: true, mode: 0o700 });
+    chmodSync(root, 0o700);
+    const canonicalRoot = realpathSync(root);
+    if (unsafeConsumerRoot(canonicalRoot)) throw new Error("unsafe consumer root");
     const safeScope = (options.scope ?? "runtime").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 60) || "runtime";
-    const home = mkdtempSync(join(root, `${safeScope}-`));
+    const home = mkdtempSync(join(canonicalRoot, `${safeScope}-`));
+    consumerHome = home;
+    registerSubscriptionHome(canonicalRoot, home);
     const authPath = join(home, "auth.json");
     writeFileSync(authPath, canonicalAuthJson(snapshot.auth), { mode: 0o600 });
     chmodSync(authPath, 0o600);
@@ -189,6 +216,7 @@ export async function prepareSubscriptionEnv(
       snapshotFence: snapshot.fence,
     };
   } catch {
+    if (consumerHome) cleanupSubscriptionHome({ CODEX_HOME: consumerHome });
     return {
       env: scopedSubscriptionEnv(process.env, provider),
       error: "Codex subscription consumer home is unavailable",
@@ -204,27 +232,35 @@ export function isolateSubscriptionEnv(
 ): NodeJS.ProcessEnv {
   const sourceHome = String(base.CODEX_HOME ?? "");
   const safeScope = scope.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120) || "agent";
-  // Codex deliberately refuses to create helper aliases inside a temporary
-  // CODEX_HOME. Keep each lease isolated beside the non-temporary source home
-  // so its CLI toolchain initializes fully on both GitHub and Trigger workers.
-  const isolationRoot = root ?? (sourceHome ? join(dirname(sourceHome), ".jarvis-codex-homes") : "/tmp/work/codex-homes");
-  const isolatedHome = join(isolationRoot, `${safeScope}-${randomUUID()}`);
-  mkdirSync(isolatedHome, { recursive: true });
+  // Each worker uses a non-temporary authority root outside every repository
+  // sandbox. No consumer home is derived from a model-visible checkout path.
+  const isolationRoot = resolve(root ?? DEFAULT_ISOLATION_ROOT);
+  mkdirSync(isolationRoot, { recursive: true, mode: 0o700 });
+  chmodSync(isolationRoot, 0o700);
+  const canonicalIsolationRoot = realpathSync(isolationRoot);
+  if (unsafeConsumerRoot(canonicalIsolationRoot)) throw new Error("unsafe isolation root");
+  const isolatedHome = mkdtempSync(join(canonicalIsolationRoot, `${safeScope}-${randomUUID()}-`));
+  registerSubscriptionHome(canonicalIsolationRoot, isolatedHome);
   // Authentication and Daniel's scoped briefing are read-only inputs. System
   // skills are intentionally not copied: every concurrent Codex process gets
   // its own install directory, removing the shared `skills/` startup race.
-  for (const file of copiedFiles) {
-    const source = join(sourceHome, file);
-    if (!sourceHome || !existsSync(source)) continue;
-    if (file === "auth.json") {
-      // The source home is populated only by prepareSubscriptionEnv. Validate
-      // again at this process boundary so an arbitrary pre-existing auth.json
-      // can never be copied into a specialist home.
-      const auth = parseChatgptSubscriptionAuthText(readFileSync(source, "utf8"));
-      writeFileSync(join(isolatedHome, file), canonicalAuthJson(auth), { mode: 0o600 });
-    } else {
-      copyFileSync(source, join(isolatedHome, file));
+  try {
+    for (const file of copiedFiles) {
+      const source = join(sourceHome, file);
+      if (!sourceHome || !existsSync(source)) continue;
+      if (file === "auth.json") {
+        // The source home is populated only by prepareSubscriptionEnv. Validate
+        // again at this process boundary so an arbitrary pre-existing auth.json
+        // can never be copied into a specialist home.
+        const auth = parseChatgptSubscriptionAuthText(readFileSync(source, "utf8"));
+        writeFileSync(join(isolatedHome, file), canonicalAuthJson(auth), { mode: 0o600 });
+      } else {
+        copyFileSync(source, join(isolatedHome, file));
+      }
     }
+  } catch (error) {
+    cleanupSubscriptionHome({ CODEX_HOME: isolatedHome });
+    throw error;
   }
   const authPath = join(isolatedHome, "auth.json");
   if (existsSync(authPath)) chmodSync(authPath, 0o600);
@@ -239,14 +275,44 @@ export function isolateSubscriptionEnv(
 
 /** Delete the access snapshot once the trusted Codex parent has loaded it. */
 export function consumeSubscriptionAuth(env: Readonly<NodeJS.ProcessEnv>): void {
-  const home = String(env.CODEX_HOME ?? "");
-  if (!home) return;
+  const home = resolve(String(env.CODEX_HOME ?? ""));
+  if (!ownedSubscriptionHomes.has(home)) return;
   const authPath = join(home, "auth.json");
   if (!existsSync(authPath)) return;
   // Validate before deletion so this helper cannot be redirected at an
   // arbitrary file through a malformed home prepared outside this module.
   parseChatgptSubscriptionAuthText(readFileSync(authPath, "utf8"));
   unlinkSync(authPath);
+}
+
+/** Remove only an exact consumer home created by this process. */
+export function cleanupSubscriptionHome(env: Readonly<Record<string, string | undefined>>): boolean {
+  const rawHome = String(env.CODEX_HOME ?? "");
+  if (!rawHome) return false;
+  const home = resolve(rawHome);
+  const root = ownedSubscriptionHomes.get(home);
+  if (!root || !directChild(root, home)) return false;
+  try {
+    let homeStat;
+    try {
+      homeStat = lstatSync(home);
+    } catch {
+      ownedSubscriptionHomes.delete(home);
+      return true;
+    }
+    if (realpathSync(dirname(home)) !== root) return false;
+    if (homeStat.isSymbolicLink()) {
+      unlinkSync(home);
+    } else {
+      const authPath = join(home, "auth.json");
+      if (existsSync(authPath) && !lstatSync(authPath).isDirectory()) unlinkSync(authPath);
+      rmSync(home, { recursive: true, force: true, maxRetries: 2 });
+    }
+    ownedSubscriptionHomes.delete(home);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function isCodexUnauthorizedError(error: unknown): boolean {

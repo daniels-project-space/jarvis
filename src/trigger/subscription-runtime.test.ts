@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  cleanupSubscriptionHome,
+  consumeSubscriptionAuth,
   isolateSubscriptionEnv,
   isolateCloudSubscriptionEnv,
   missingSubscriptionTools,
@@ -13,11 +15,13 @@ import {
   resolveSubscriptionAgentBin,
   verifyCodexSubscriptionPreflight,
 } from "./subscription-runtime";
-import { consumerAuth } from "./subscription-auth";
+import { CONTROLLER_REFRESH_SENTINEL, canonicalAuthJson, consumerAuth } from "./subscription-auth";
 import { CODEX_SESSION_SOURCE, CODEX_SESSION_SOURCE_ENV } from "./subscription-source";
 
 const validAuth = {
+  OPENAI_API_KEY: null,
   auth_mode: "chatgpt",
+  last_refresh: "2026-07-22T12:34:56.789Z",
   tokens: {
     access_token: "eyJ.access.subscription",
     refresh_token: "refresh_subscription",
@@ -140,6 +144,54 @@ describe("subscription subprocess capability scope", () => {
     }
   });
 
+  it("unlinks auth and removes each exact prepared or isolated consumer home", async () => {
+    const source = await prepare();
+    const isolated = isolateCloudSubscriptionEnv(
+      source.env,
+      "cleanup-test",
+      join(consumerRoot, "isolated"),
+    );
+    const sourceHome = String(source.env.CODEX_HOME);
+    const isolatedHome = String(isolated.CODEX_HOME);
+
+    expect(existsSync(join(sourceHome, "auth.json"))).toBe(true);
+    expect(existsSync(join(isolatedHome, "auth.json"))).toBe(true);
+    consumeSubscriptionAuth(isolated);
+    expect(existsSync(join(isolatedHome, "auth.json"))).toBe(false);
+    writeFileSync(join(isolatedHome, "runtime-state"), "disposable");
+
+    expect(cleanupSubscriptionHome(isolated)).toBe(true);
+    expect(cleanupSubscriptionHome(source.env)).toBe(true);
+    expect(existsSync(isolatedHome)).toBe(false);
+    expect(existsSync(sourceHome)).toBe(false);
+  });
+
+  it("refuses to remove an arbitrary directory that was not created as a consumer home", () => {
+    const arbitrary = join(consumerRoot, "operator-files");
+    mkdirSync(arbitrary, { recursive: true });
+    writeFileSync(join(arbitrary, "auth.json"), "not a managed consumer");
+
+    expect(cleanupSubscriptionHome({ CODEX_HOME: arbitrary })).toBe(false);
+    expect(readFileSync(join(arbitrary, "auth.json"), "utf8")).toBe("not a managed consumer");
+  });
+
+  it("unlinks a replaced home symlink without following it", async () => {
+    const source = await prepare();
+    const home = String(source.env.CODEX_HOME);
+    const external = mkdtempSync(join(tmpdir(), "jarvis-cleanup-canary-"));
+    try {
+      writeFileSync(join(external, "canary"), "must remain");
+      rmSync(home, { recursive: true, force: true });
+      symlinkSync(external, home, "dir");
+
+      expect(cleanupSubscriptionHome(source.env)).toBe(true);
+      expect(existsSync(home)).toBe(false);
+      expect(readFileSync(join(external, "canary"), "utf8")).toBe("must remain");
+    } finally {
+      rmSync(external, { recursive: true, force: true });
+    }
+  });
+
   it("strips controller authority from an actual spawned specialist environment", () => {
     const env = isolateCloudSubscriptionEnv({
       ...process.env, CODEX_HOME: process.cwd(),
@@ -153,7 +205,7 @@ describe("subscription subprocess capability scope", () => {
       R2_PARENT_ACCESS_KEY_ID: "parent-r2-access-id",
       AWS_SESSION_TOKEN: "temporary-r2-session-token",
       JARVIS_CODEX_SESSION_SOURCE: "vault-broker",
-    }, "spawn-scope");
+    }, "spawn-scope", join(consumerRoot, "spawn-homes"));
     const child = spawnSync(process.execPath, ["-e", "process.stdout.write(JSON.stringify({receipt:process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET,keyring:process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING,providerProbeKeyring:process.env.JARVIS_CLOUD_PROVIDER_PROBE_KEYRING,providerProbeReceipt:process.env.JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT,providerToken:process.env.SANDBOX0_TOKEN,convex:process.env.CONVEX_URL,trigger:process.env.TRIGGER_SECRET_KEY,github:process.env.GITHUB_TOKEN,parentApi:process.env.R2_PARENT_API_TOKEN,parentId:process.env.R2_PARENT_ACCESS_KEY_ID,session:process.env.AWS_SESSION_TOKEN,source:process.env.JARVIS_CODEX_SESSION_SOURCE,openai:process.env.OPENAI_API_KEY,codex:process.env.CODEX_API_KEY}))"], { env, encoding: "utf8" });
     expect(child.status).toBe(0);
     expect(JSON.parse(child.stdout)).toEqual({ openai: "", codex: "" });
@@ -161,11 +213,19 @@ describe("subscription subprocess capability scope", () => {
 
   it("accepts only canonical base64 ChatGPT subscription auth", () => {
     expect(parseChatgptSubscriptionAuth(validAuthB64)).toEqual(validAuth);
+    expect(canonicalAuthJson(parseChatgptSubscriptionAuth(validAuthB64))).toBe(JSON.stringify(validAuth));
+    expect(consumerAuth(validAuth)).toEqual({
+      ...validAuth,
+      tokens: { ...validAuth.tokens, refresh_token: CONTROLLER_REFRESH_SENTINEL },
+    });
     expect(() => parseChatgptSubscriptionAuth(`${validAuthB64}=`)).toThrow();
     expect(() => parseChatgptSubscriptionAuth(`${validAuthB64}\n`)).toThrow();
     expect(() => parseChatgptSubscriptionAuth(Buffer.from('{"auth_mode":"chatgpt","auth_mode":"chatgpt","tokens":{}}').toString("base64"))).toThrow();
     expect(() => parseChatgptSubscriptionAuth(Buffer.from(JSON.stringify({ ...validAuth, auth_mode: "chat-gpt" })).toString("base64"))).toThrow();
     expect(() => parseChatgptSubscriptionAuth(Buffer.from(JSON.stringify({ ...validAuth, api_key: "sk-live-never" })).toString("base64"))).toThrow();
+    expect(() => parseChatgptSubscriptionAuth(Buffer.from(JSON.stringify({ ...validAuth, OPENAI_API_KEY: "sk-live-never" })).toString("base64"))).toThrow();
+    expect(() => parseChatgptSubscriptionAuth(Buffer.from(JSON.stringify({ ...validAuth, last_refresh: "2026-02-30T12:34:56Z" })).toString("base64"))).toThrow();
+    expect(() => parseChatgptSubscriptionAuth(Buffer.from(JSON.stringify({ ...validAuth, last_refresh: "x".repeat(41) })).toString("base64"))).toThrow();
     expect(() => parseChatgptSubscriptionAuth(Buffer.from(JSON.stringify({ ...validAuth, tokens: { ...validAuth.tokens, accessToken: "fuzzy" } })).toString("base64"))).toThrow();
     expect(() => parseChatgptSubscriptionAuth(Buffer.from(JSON.stringify({ ...validAuth, tokens: { ...validAuth.tokens, access_token: "sk-proj-api-key" } })).toString("base64"))).toThrow();
   });

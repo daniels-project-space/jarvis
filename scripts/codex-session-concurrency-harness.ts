@@ -29,7 +29,9 @@ function token(expiresAt: number, marker: string) {
 
 function auth(expiresAt: number, version: number): ChatgptSubscriptionAuth {
   return {
+    OPENAI_API_KEY: null,
     auth_mode: "chatgpt",
+    last_refresh: new Date(now - version * 1_000).toISOString(),
     tokens: {
       access_token: token(expiresAt, `access-${version}`),
       refresh_token: `synthetic-refresh-${version}`,

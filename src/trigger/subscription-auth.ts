@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 
-const AUTH_OUTER_KEYS = ["auth_mode", "tokens"] as const;
+const AUTH_OUTER_KEYS = ["OPENAI_API_KEY", "auth_mode", "last_refresh", "tokens"] as const;
 const AUTH_TOKEN_KEYS = ["access_token", "refresh_token", "id_token", "account_id"] as const;
 
 export type ChatgptSubscriptionAuth = {
+  OPENAI_API_KEY: null;
   auth_mode: "chatgpt";
+  last_refresh: string;
   tokens: Record<(typeof AUTH_TOKEN_KEYS)[number], string>;
 };
 
@@ -84,10 +86,27 @@ function apiKeyShaped(value: string): boolean {
   return /^(?:sk|rk|pk|api)[_-]/i.test(value) || /(?:^|[_-])api[_-]?key/i.test(value);
 }
 
+function validLastRefresh(value: unknown): value is string {
+  if (typeof value !== "string" || value.length < 20 || value.length > 40) return false;
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?Z$/);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const parsed = Date.parse(value);
+  if (year < 2020 || year > 2100 || !Number.isFinite(parsed)) return false;
+  // Date.parse normalizes impossible calendar values such as February 30.
+  return new Date(parsed).toISOString().startsWith(
+    `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}`,
+  );
+}
+
 export function parseChatgptSubscriptionAuthText(json: string): ChatgptSubscriptionAuth {
   rejectDuplicateJsonKeys(json);
   const parsed: unknown = JSON.parse(json);
-  if (!isObject(parsed) || !sameKeys(parsed, AUTH_OUTER_KEYS) || parsed.auth_mode !== "chatgpt" || !isObject(parsed.tokens) || !sameKeys(parsed.tokens, AUTH_TOKEN_KEYS)) {
+  if (!isObject(parsed) || !sameKeys(parsed, AUTH_OUTER_KEYS)
+    || parsed.OPENAI_API_KEY !== null
+    || parsed.auth_mode !== "chatgpt"
+    || !validLastRefresh(parsed.last_refresh)
+    || !isObject(parsed.tokens) || !sameKeys(parsed.tokens, AUTH_TOKEN_KEYS)) {
     throw new Error("invalid Codex ChatGPT subscription auth schema");
   }
   const tokens = {} as ChatgptSubscriptionAuth["tokens"];
@@ -98,7 +117,12 @@ export function parseChatgptSubscriptionAuthText(json: string): ChatgptSubscript
     }
     tokens[key] = value;
   }
-  return { auth_mode: "chatgpt", tokens };
+  return {
+    OPENAI_API_KEY: null,
+    auth_mode: "chatgpt",
+    last_refresh: parsed.last_refresh,
+    tokens,
+  };
 }
 
 export function parseChatgptSubscriptionAuth(encoded: string): ChatgptSubscriptionAuth {
@@ -115,7 +139,17 @@ export function parseChatgptSubscriptionAuth(encoded: string): ChatgptSubscripti
 }
 
 export function canonicalAuthJson(auth: ChatgptSubscriptionAuth): string {
-  return JSON.stringify({ auth_mode: auth.auth_mode, tokens: auth.tokens });
+  return JSON.stringify({
+    OPENAI_API_KEY: null,
+    auth_mode: auth.auth_mode,
+    last_refresh: auth.last_refresh,
+    tokens: {
+      access_token: auth.tokens.access_token,
+      refresh_token: auth.tokens.refresh_token,
+      id_token: auth.tokens.id_token,
+      account_id: auth.tokens.account_id,
+    },
+  });
 }
 
 function decodeJwtPayload(token: string): JsonObject | null {
@@ -150,7 +184,9 @@ export const CONTROLLER_REFRESH_SENTINEL = "jarvis-controller-refresh-required";
  */
 export function consumerAuth(auth: ChatgptSubscriptionAuth): ChatgptSubscriptionAuth {
   return {
+    OPENAI_API_KEY: null,
     auth_mode: "chatgpt",
+    last_refresh: auth.last_refresh,
     tokens: { ...auth.tokens, refresh_token: CONTROLLER_REFRESH_SENTINEL },
   };
 }

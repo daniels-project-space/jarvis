@@ -22,6 +22,7 @@ import { canonicalizeRepository } from "../lib/workflow-contract";
 import { buildContinuationCheckpoint, segmentTimeoutMs } from "./continuation";
 import { runWatchSweep } from "./watch-runtime";
 import {
+  cleanupSubscriptionHome,
   missingSubscriptionTools,
   isCodexUnauthorizedError,
   isolateCloudSubscriptionEnv,
@@ -677,6 +678,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       scope: `agent-${options.reservation.workerRunId}`,
     });
     if (prepared.error) return rejectReservation(prepared.error);
+    const subscriptionEnvs = new Set<NodeJS.ProcessEnv>([prepared.env]);
+    const trackSubscriptionEnv = <T extends NodeJS.ProcessEnv>(value: T): T => {
+      subscriptionEnvs.add(value);
+      return value;
+    };
+    try {
     const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
     if (preflight.error) return rejectReservation(preflight.error);
     const missingTools = missingSubscriptionTools(prepared.env);
@@ -975,7 +982,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       };
       try {
         const jobKey = String(job.jobId).replace(/[^a-zA-Z0-9_-]/g, "_");
-        const jobEnv = isolateSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}`);
+        const jobEnv = trackSubscriptionEnv(isolateSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}`));
         const controllerScratch = `/tmp/work/controller-${jobKey}-attempt-${expectedAttempt}`;
         rmSync(controllerScratch, { recursive: true, force: true });
         mkdirSync(controllerScratch, { recursive: true });
@@ -1586,7 +1593,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const model = normalizeWorkModelTier(
           typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task),
         );
-        let agentEnv = isolateCloudSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}-cloud`);
+        let agentEnv = trackSubscriptionEnv(isolateCloudSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}-cloud`));
         let lastHeartbeatAt = 0;
         let lastDurableStage = "";
         let lastDurablePercent = 0;
@@ -1663,13 +1670,14 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             minimumValidityMs: segmentTimeoutMs(model) + 2 * 60_000,
             afterUnauthorizedVersion: prepared.snapshotVersion,
           });
+          subscriptionEnvs.add(renewed.env);
           if (renewed.error) throw new Error(renewed.error);
           const renewedPreflight = verifyCodexSubscriptionPreflight(bin, renewed.env);
           if (renewedPreflight.error) throw new Error(renewedPreflight.error);
-          agentEnv = isolateCloudSubscriptionEnv(
+          agentEnv = trackSubscriptionEnv(isolateCloudSubscriptionEnv(
             renewed.env,
             `${jobKey}-attempt-${expectedAttempt}-cloud-unauthorized`,
-          );
+          ));
           run = await executeCloudAgent();
         }
         await durableProgress;
@@ -2409,7 +2417,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       if (!ready) break;
       await synthesizeMissionClaim(ready);
     }
-  return { processed };
+    return { processed };
+    } finally {
+      for (const consumerEnv of [...subscriptionEnvs].reverse()) {
+        if (!cleanupSubscriptionHome(consumerEnv)) cleanupSubscriptionHome(consumerEnv);
+      }
+    }
 }
 
 export const agentWorker = task({

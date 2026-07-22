@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   CloudflareTemporaryR2CredentialBroker,
+  R2SessionStateStore,
   R2SessionCredentialRejectedError,
   R2_TEMPORARY_CREDENTIAL_TTL_SECONDS,
   RenewingR2SessionStateStore,
@@ -74,6 +75,7 @@ describe("Cloudflare R2 temporary credential broker", () => {
     const [url, init] = fetcher.mock.calls[0];
     expect(String(url)).toBe(`https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/r2/temp-access-credentials`);
     expect(init?.headers).toMatchObject({ authorization: "Bearer parent-api-token-never-forwarded" });
+    expect(init?.redirect).toBe("error");
     expect(JSON.parse(String(init?.body))).toEqual({
       bucket: "jarvis-codex-session-private",
       parentAccessKeyId: "parent-access-id-never-forwarded",
@@ -119,6 +121,28 @@ describe("Cloudflare R2 temporary credential broker", () => {
     try { await broker.issue(); } catch (caught) { error = caught; }
     expect(error).toMatchObject({ code: "credential_broker_unavailable" });
     expect(String(error)).not.toContain(leaked);
+  });
+});
+
+describe("R2 session request transport", () => {
+  it("refuses redirects for every signed state and snapshot request", async () => {
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PUT") return new Response(null, { status: 412 });
+      return new Response(null, { status: 404 });
+    });
+    const store = new R2SessionStateStore(
+      { fetch: fetcher } as never,
+      `https://${ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      "jarvis-codex-session-private",
+    );
+
+    await store.readState();
+    await store.compareExchangeState(null, STATE);
+    await store.putSnapshotIfAbsent("managed-codex-session/snapshots/test", new Uint8Array([1]));
+    await store.getSnapshot("managed-codex-session/snapshots/test");
+
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(fetcher.mock.calls.every(([, init]) => init?.redirect === "error")).toBe(true);
   });
 });
 

@@ -117,6 +117,7 @@ export class R2SessionStateStore implements SessionStateStore {
   async readState(): Promise<VersionedSessionState> {
     const response = await this.aws.fetch(this.url(STATE_KEY), {
       headers: { "cache-control": "no-store" },
+      redirect: "error",
     });
     if (response.status === 404) return { value: null, etag: null };
     assertR2Response(response);
@@ -143,6 +144,7 @@ export class R2SessionStateStore implements SessionStateStore {
         [expectedEtag === null ? "if-none-match" : "if-match"]: expectedEtag ?? "*",
       },
       body: body as unknown as BodyInit,
+      redirect: "error",
     });
     if (response.status === 409 || response.status === 412) return { ok: false };
     assertR2Response(response);
@@ -161,6 +163,7 @@ export class R2SessionStateStore implements SessionStateStore {
         "if-none-match": "*",
       },
       body: value as unknown as BodyInit,
+      redirect: "error",
     });
     if (response.status === 409 || response.status === 412) return false;
     assertR2Response(response);
@@ -170,6 +173,7 @@ export class R2SessionStateStore implements SessionStateStore {
   async getSnapshot(key: string): Promise<Uint8Array | null> {
     const response = await this.aws.fetch(this.url(key), {
       headers: { "cache-control": "no-store" },
+      redirect: "error",
     });
     if (response.status === 404) return null;
     assertR2Response(response);
@@ -260,6 +264,7 @@ export class CloudflareTemporaryR2CredentialBroker implements TemporaryR2Credent
             prefixes: ["managed-codex-session/"],
           }),
           cache: "no-store",
+          redirect: "error",
           signal: AbortSignal.timeout(this.timeoutMs),
         },
       );

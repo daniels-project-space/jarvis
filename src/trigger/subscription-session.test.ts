@@ -28,7 +28,9 @@ function jwt(expiresAt: number, marker: string): string {
 
 function auth(expiresAt: number, generation: number): ChatgptSubscriptionAuth {
   return {
+    OPENAI_API_KEY: null,
     auth_mode: "chatgpt",
+    last_refresh: new Date(NOW - generation * 1_000).toISOString(),
     tokens: {
       access_token: jwt(expiresAt, `access-${generation}`),
       refresh_token: `managed-refresh-${generation}`,

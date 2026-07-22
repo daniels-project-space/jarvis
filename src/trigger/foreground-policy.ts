@@ -12,6 +12,13 @@ export const FOREGROUND_MAX_DURATION_SECONDS = 4 * 60 * 60;
 // finalized before this runner voluntarily hands over. This is intentionally
 // larger than the model timeout: context and durable delivery are included.
 export const FOREGROUND_ADMISSION_RESERVE_MS = FOREGROUND_TURN_TIMEOUT_MS + 20_000;
+// A replacement snapshot is requested early enough to complete the bounded
+// CLI preflight and app-server initialization while the current process can
+// still admit one complete turn. Consumers never rely on the access token's
+// final minutes for either startup or model execution.
+export const FOREGROUND_SESSION_STARTUP_RESERVE_MS = 2 * 60_000;
+export const FOREGROUND_SESSION_RENEWAL_RESERVE_MS =
+  FOREGROUND_ADMISSION_RESERVE_MS + FOREGROUND_SESSION_STARTUP_RESERVE_MS;
 // A successor starts and initializes during this bounded overlap, but cannot
 // take the Convex lease until the owner releases it.
 export const FOREGROUND_HANDOFF_OVERLAP_MS = 10 * 60_000;

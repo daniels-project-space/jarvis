@@ -30,6 +30,14 @@ between runs. Jarvis implements that contract as a controller boundary:
 5. A 401 causes one reacquisition for a version newer than the rejected one.
    Other workers wait or continue with a still-valid snapshot; none submits the
    controller refresh token.
+6. A four-hour foreground owner renews before the snapshot's remaining window
+   can no longer cover both candidate startup and one full admitted turn. It
+   preflights and initializes one single-flight candidate while the current
+   app-server keeps serving, publishes the candidate only between turns, then
+   retires the old process. A pre-`turn/start` 401 may replay once; an accepted
+   turn is never interrupted or replayed. Retired and final consumer homes are
+   removed through an exact process-owned path registry after `auth.json` is
+   unlinked.
 
 ## Provider handoff
 
