@@ -1,6 +1,6 @@
 export const WORKSPACE_CHECKPOINT_VERSION = 2 as const;
 
-export type WorkspaceCheckpointProvider = "e2b" | "daytona" | "sandbox0" | "cloudflare";
+export type WorkspaceCheckpointProvider = "e2b" | "daytona" | "sandbox0" | "vercel" | "cloudflare";
 
 export type WorkspaceCheckpoint = {
   version: typeof WORKSPACE_CHECKPOINT_VERSION;
@@ -25,7 +25,7 @@ export type WorkspaceCheckpoint = {
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const GIT_OID = /^[0-9a-f]{40,64}$/;
-const PROVIDERS = new Set<WorkspaceCheckpointProvider>(["e2b", "daytona", "sandbox0", "cloudflare"]);
+const PROVIDERS = new Set<WorkspaceCheckpointProvider>(["e2b", "daytona", "sandbox0", "vercel", "cloudflare"]);
 const MAX_ARCHIVE_BYTES = 25 * 1024 * 1024;
 
 function boundedString(value: unknown, name: string, max: number): string {

@@ -86,6 +86,7 @@ export type CodexTurnInput = {
   preamble: string;
   modelTier: string;
   onDelta: (delta: string) => void;
+  onTurnStarted?: () => void;
 };
 
 // One long-lived subscription CLI process for foreground conversation. The
@@ -175,6 +176,9 @@ export class CodexAppServer {
       : "";
     const marker = input.userText.match(/\[JARVIS_IMAGE_URL:([^\]]+)\]/);
     const cleanText = input.userText.replace(/\s*\[JARVIS_IMAGE_URL:[^\]]+\]\s*/g, " ").trim();
+    // Thread instructions hold static identity and policy. Fresh context is
+    // deliberately present only in this one turn item so a cold thread does
+    // not pay for the same snapshot in both protocol fields.
     const text = `${history}Current live context (use only what is relevant):\n${input.contextBlock}\n\nDaniel: ${cleanText}`;
     const userInput: JsonObject[] = [{ type: "text", text }];
     if (marker?.[1]) userInput.push({ type: "image", url: marker[1].trim(), detail: "high" });
@@ -188,6 +192,7 @@ export class CodexAppServer {
     const turn = started.turn as JsonObject | undefined;
     const turnId = typeof turn?.id === "string" ? turn.id : "";
     if (!turnId) throw new Error("Codex app-server did not return a turn id");
+    input.onTurnStarted?.();
     return new Promise<CodexTurnResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.notify("turn/interrupt", { threadId, turnId });

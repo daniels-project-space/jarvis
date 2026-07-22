@@ -102,6 +102,33 @@ describe("deployment-bound cloud provider probe authority", () => {
     expect(runner.lastIndexOf("cloudProvider = configuredCloudWorkspaceProvider(process.env, options.runtimeAttestation)")).toBeLessThan(runner.indexOf("await processJob(job, cloudProvider)"));
   });
 
+  it("keeps VERCEL_TOKEN alone blocked before adapter construction, hydration, or model execution", async () => {
+    const env: NodeJS.ProcessEnv = {
+      ...baseEnvironment(),
+      JARVIS_CLOUD_WORKSPACE_PROVIDER: "vercel",
+      JARVIS_CLOUD_WORKSPACE_TEMPLATE: "node22",
+      VERCEL_TOKEN: "synthetic-vercel-token",
+      SANDBOX0_TOKEN: undefined,
+    };
+    const hydrate = vi.fn();
+    await expect(prepareCloudWorkspaceExecution({
+      providerFactory: () => configuredCloudWorkspaceProvider(env, RUNTIME_ATTESTATION),
+      hydrateArchive: hydrate,
+      attemptKey: "blocked-vercel:1", template: "node22",
+      runtime: "node-22:codex-0.144.5", lockfileDigest: "0".repeat(64),
+    })).rejects.toMatchObject({ code: "provider_probe_attestation_failed", provider: "vercel", disposition: "blocked" });
+    expect(hydrate).not.toHaveBeenCalled();
+
+    const signed = signedEnvironment({ ...env, VERCEL_TEAM_ID: "team_test", VERCEL_PROJECT_ID: "prj_test" });
+    expect(configuredCloudWorkspaceProvider(signed, RUNTIME_ATTESTATION).name).toBe("vercel");
+    for (const missing of ["VERCEL_TOKEN", "VERCEL_TEAM_ID", "VERCEL_PROJECT_ID"] as const) {
+      const candidate = { ...signed, [missing]: undefined };
+      expect(() => configuredCloudWorkspaceProvider(candidate, RUNTIME_ATTESTATION)).toThrow(expect.objectContaining({
+        code: "missing_configuration", provider: "vercel",
+      }));
+    }
+  });
+
   it("opens execution for the exact ctx.deployment.version and a fresh signed provider tuple", () => {
     const env = signedEnvironment();
     expect(configuredCloudWorkspaceProvider(env, RUNTIME_ATTESTATION).name).toBe("sandbox0");

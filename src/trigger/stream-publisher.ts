@@ -13,10 +13,12 @@ export class StreamPublisher {
   private chain: Promise<void> = Promise.resolve();
   private timer: ReturnType<typeof setInterval> | null = null;
   private closed = false;
+  private hasPublished = false;
 
   constructor(
     private readonly publish: (text: string, revision: number) => Promise<unknown>,
     private readonly intervalMs = 120,
+    private readonly onFirstPublished?: () => void,
   ) {}
 
   start() {
@@ -38,7 +40,11 @@ export class StreamPublisher {
       // A failed interim paint is harmless: finalize writes the authoritative
       // complete answer. Most importantly, no rejected write can fork a second
       // chain or escape the close barrier.
-      await this.publish(snapshot, revision).catch(() => undefined);
+      const published = await this.publish(snapshot, revision).catch(() => undefined);
+      if (published === true && !this.hasPublished) {
+        this.hasPublished = true;
+        this.onFirstPublished?.();
+      }
     });
     return this.chain;
   }

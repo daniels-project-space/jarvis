@@ -117,7 +117,8 @@ export const claimForRepair = mutation({
     const open = await ctx.db
       .query("incidents")
       .withIndex("by_status", (q: any) => q.eq("status", "open"))
-      .collect();
+      .order("asc")
+      .take(50);
     const claims: any[] = [];
     const escalations: any[] = [];
     const max = a.maxAttempts ?? 2;
@@ -177,7 +178,7 @@ export const list = query({
   args: { limit: v.optional(v.number()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    const rows = await ctx.db.query("incidents").collect();
-    return rows.sort((x: any, y: any) => y.updatedAt - x.updatedAt).slice(0, a.limit ?? 10);
+    const limit = Number.isSafeInteger(a.limit) && Number(a.limit) > 0 ? Math.min(24, Number(a.limit)) : 10;
+    return await ctx.db.query("incidents").withIndex("by_updatedAt").order("desc").take(limit);
   },
 });

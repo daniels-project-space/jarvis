@@ -92,7 +92,7 @@ import {
   DEFAULT_CLOUD_WORKSPACE_TEMPLATE,
   type CloudProviderRuntimeAttestation,
 } from "./cloud-provider-probe-attestation";
-import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, createDeterministicTar, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider, type CloudWorkspaceProviderName, type CredentiallessArchive } from "./cloud-workspace";
+import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, createDeterministicTar, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider, type HistoricalCloudWorkspaceProviderName, type CredentiallessArchive } from "./cloud-workspace";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent against an isolated cloud workspace through controller-owned dynamic
@@ -609,28 +609,28 @@ export async function runAgentMaintenance() {
   }
   const orphans: any[] = await convexQuery("jobs:cloudWorkspaceOrphans", { olderThan: Date.now() - 5 * 60_000 }).catch(() => []) ?? [];
   for (const orphan of orphans) {
-    const providerName = String(orphan.providerName) as CloudWorkspaceProviderName;
-    const workspace: CloudWorkspace = {
-      provider: providerName,
-      providerWorkspaceId: String(orphan.providerWorkspaceId),
-      providerSessionId: String(orphan.providerSessionId),
-      root: "/workspace/repository",
-      createdAt: 0,
-    };
+    const providerName = String(orphan.providerName) as HistoricalCloudWorkspaceProviderName;
     try {
       const cleanupProvider = configuredCloudWorkspaceCleanupProvider(process.env, providerName);
+      const workspace: CloudWorkspace = {
+        provider: cleanupProvider.name,
+        providerWorkspaceId: String(orphan.providerWorkspaceId),
+        providerSessionId: String(orphan.providerSessionId),
+        root: "/workspace/repository",
+        createdAt: 0,
+      };
       await cleanupProvider.terminate(workspace, "orphan");
       await convexMutation("jobs:markCloudWorkspaceTerminated", {
         jobId: orphan.jobId, expectedAttempt: Number(orphan.attempt),
-        providerWorkspaceId: workspace.providerWorkspaceId,
-        providerSessionId: workspace.providerSessionId,
+        providerWorkspaceId: String(orphan.providerWorkspaceId),
+        providerSessionId: String(orphan.providerSessionId),
       });
     } catch (error) {
       const failure = error instanceof CloudWorkspaceError ? error : null;
       await convexMutation("jobs:noteCloudWorkspaceCleanupBlocked", {
         jobId: orphan.jobId, expectedAttempt: Number(orphan.attempt),
-        providerWorkspaceId: workspace.providerWorkspaceId,
-        providerSessionId: workspace.providerSessionId,
+        providerWorkspaceId: String(orphan.providerWorkspaceId),
+        providerSessionId: String(orphan.providerSessionId),
         code: failure?.code ?? "provider_unavailable",
         reason: failure?.message ?? "persisted provider cleanup failed",
       }).catch(() => false);
