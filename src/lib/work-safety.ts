@@ -38,7 +38,7 @@ const NON_REPOSITORY_PUBLICATION_CONTEXT =
 // Keep the allowlist technical and exact so "post the findings" remains an
 // external publication action.
 const TECHNICAL_TEMPORAL_POST_PREFIX =
-  /^-(?:index(?:ed|ing)?(?:-stage)?|merge)\b/i;
+  /^-(?:create(?:d|ion)?|index(?:ed|ing)?(?:-stage)?|merge)\b/i;
 
 // Uppercase POST is an HTTP/provider-method noun only when either its direct
 // left-hand qualifier or its direct path-shaped object makes that grammar
@@ -62,6 +62,37 @@ const TECHNICAL_DELETE_COMPOUND_LEAD = /\bauto-stop\/archive\/$/i;
 
 const TECHNICAL_DELETE_COMPOUND_TAIL =
   /^(?:$|,\s*snapshot\s+identity(?=\s*(?:,|$))|(?:as|for|in|within)\b|(?:sandbox|resource|lifecycle|retention|cleanup|policy|policies|controls?|states?|transitions?|semantics|settings?|configuration|options?|behavio(?:u)?r|support|workflow|handling)\b)/i;
+
+// A lifecycle test can describe the exact-name recovery branch as “If it
+// exists, exact-name delete it”. This is deliberately not a general sandbox
+// exception: it requires an explicit non-resuming SDK lookup and the
+// generated-name/pronoun grammar. “Delete the production sandbox”, a data
+// object, and a live-provider target all retain a non-matching tail.
+const EXACT_NAME_DELETE_OBJECT = /^(?:it|the\s+(?:exact\s+)?sandbox)\s*$/i;
+
+const EXACT_NAME_RECOVERY_DELETE_LEAD = /\bif\s+it\s+exists,\s+exact[- ]name\s*$/i;
+
+const NON_RESUMING_SANDBOX_LOOKUP =
+  /\bSandbox\.get\s*\([^)]*\bresume\s*:\s*false[^)]*\)/i;
+
+// “failed final delete remains un-terminated in Convex” names a lifecycle
+// event rather than ordering a deletion.  Restrict this to a state predicate
+// and controller/provider vocabulary; an imperative such as “final delete
+// customer records” has a different tail and remains gated.
+const TECHNICAL_LIFECYCLE_DELETE_NOUN_LEAD =
+  /\b(?:final|failed|exact[- ]name|sandbox)\s*$/i;
+
+const TECHNICAL_LIFECYCLE_DELETE_NOUN_TAIL =
+  /^(?:remains?|failed|fails?|failure|is|was|will\s+be|cannot\s+be)\b/i;
+
+const TECHNICAL_LIFECYCLE_DELETE_CONTEXT =
+  /\b(?:convex|provider|sandbox|cleanup|reaper|termination|orphan)\b/i;
+
+const TECHNICAL_TEST_MATRIX_DELETE_LEAD =
+  /\b(?:get|create|terminate|delete)\s+and\s*$/i;
+
+const TECHNICAL_TEST_MATRIX_CONJUNCTION_LEAD =
+  /^\s*tests?(?:ing)?\b/i;
 
 // Root review is a controller-internal Git-ref handoff. The otherwise vague
 // object "a reviewed ref" is accepted only with both this direct object/tail
@@ -195,7 +226,21 @@ function clauses(task: string): string[] {
       continue;
     }
 
-    if (character === "\n" || character === "\r" || /[.;!?]/.test(character)) {
+    // Keep the member separator in SDK calls such as Sandbox.get intact. A
+    // sentence terminator still wins for every other period.
+    const sdkMemberSeparator =
+      character === "."
+      && /[a-z0-9_$]/i.test(task[index - 1] ?? "")
+      && /[a-z_$]/i.test(task[index + 1] ?? "");
+    // A semicolon inside the exact-name Sandbox.get recovery grammar remains
+    // part of one simulated lifecycle branch.  That lets its test/fake
+    // provider qualifier constrain “exact-name delete it”; ordinary
+    // semicolon-separated instructions still split and fail closed.
+    const simulatedSandboxRecoverySeparator =
+      character === ";"
+      && /\bSandbox\.get\s*\([^)]*\bresume\s*:\s*false[^)]*\)/i.test(current)
+      && !/\bexact[- ]name\s+delete\s+it\s*$/i.test(current);
+    if (!sdkMemberSeparator && !simulatedSandboxRecoverySeparator && (character === "\n" || character === "\r" || /[.;!?]/.test(character))) {
       finish();
       if (character === "\r" && task[index + 1] === "\n") index += 1;
       continue;
@@ -210,7 +255,11 @@ function clauses(task: string): string[] {
         // A leading prohibition scopes over coordinated verbs: “do not send
         // and publish” prohibits both. Positive clauses still split here so
         // “research and purchase” cannot borrow the read-only lead.
-        if (!contrast && (NEGATED_LEAD.test(clause) || NEGATED_TAIL.test(clause))) {
+        if (!contrast && (
+          NEGATED_LEAD.test(clause)
+          || NEGATED_TAIL.test(clause)
+          || TECHNICAL_TEST_MATRIX_CONJUNCTION_LEAD.test(clause)
+        )) {
           current += ` ${conjunction[0]} `;
         } else {
           finish();
@@ -308,6 +357,7 @@ function consequentialUse(action: string, clause: string, actionIndex: number): 
   const normalized = action.toLocaleLowerCase("en-GB");
   const before = clause.slice(0, actionIndex).trim();
   const after = clause.slice(actionIndex + action.length).trim();
+  const unformattedBefore = before.replace(/[`*]/g, "").trim();
   const technicalCompoundTail = TECHNICAL_COMPOUND_TAIL[normalized];
   if (technicalCompoundTail?.test(after)) return false;
   if (
@@ -315,6 +365,23 @@ function consequentialUse(action: string, clause: string, actionIndex: number): 
     && TECHNICAL_DELETE_COMPOUND_LEAD.test(before)
     && TECHNICAL_DELETE_COMPOUND_TAIL.test(after)
   ) return false;
+  if (normalized === "delete") {
+    if (
+      EXACT_NAME_DELETE_OBJECT.test(after)
+      && EXACT_NAME_RECOVERY_DELETE_LEAD.test(unformattedBefore)
+      && NON_RESUMING_SANDBOX_LOOKUP.test(clause)
+    ) return false;
+    if (
+      TECHNICAL_LIFECYCLE_DELETE_NOUN_LEAD.test(unformattedBefore)
+      && TECHNICAL_LIFECYCLE_DELETE_NOUN_TAIL.test(after)
+      && TECHNICAL_LIFECYCLE_DELETE_CONTEXT.test(clause)
+    ) return false;
+    if (
+      TECHNICAL_TEST_MATRIX_DELETE_LEAD.test(unformattedBefore)
+      && /\btest(?:s|ing)?\b/i.test(clause)
+      && /^(?:$|(?:for|with|against)\b)/i.test(after)
+    ) return false;
+  }
   if (/^(?:message|reply)$/i.test(normalized)) {
     // Chat engineering prompts use these words as data nouns (“reply
     // latency”, “message event”). An actual imperative has no determiner, and
@@ -372,7 +439,10 @@ export function classifyWorkSafety(
       // "Audit whether X can send" describes a read-only outcome. A mixed
       // instruction such as "research options and purchase one" is split at
       // the conjunction, so its purchase clause still reaches the gate.
-      if (quoteContext === null && NON_MUTATING_LEAD.test(clause)) continue;
+      // “Test delete customer records” is still an instruction to delete;
+      // test matrices rely on the exact technical noun grammar above rather
+      // than a broad test-verb waiver.
+      if (quoteContext === null && NON_MUTATING_LEAD.test(clause) && !/^\s*tests?(?:ing)?\b/i.test(clause)) continue;
       if (softwareDeliveryAllowed(action, clause, options?.repo, actionIndex)) {
         continue;
       }
@@ -385,6 +455,8 @@ export function classifyWorkSafety(
   }
   const asksForSoftwareDelivery = clauses(task).some((clause) => {
     const match = CONSEQUENTIAL_ACTION.exec(clause);
+    if (NEGATED_LEAD.test(clause)) return false;
+    if (match && NEGATED_TAIL.test(clause.slice(0, match.index ?? 0))) return false;
     return Boolean(match && softwareDeliveryAllowed(match[0], clause, options?.repo, match.index));
   });
   return {
