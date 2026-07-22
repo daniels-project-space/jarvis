@@ -7,7 +7,7 @@ const observed: {
   create?: Record<string, unknown>; get?: Record<string, unknown>; commands: Record<string, unknown>[];
   deletes: string[]; updates: unknown[]; kills: string[]; logsClosed: number; files: Map<string, Buffer>; mkdirs: string[]; reads: string[];
   logs: Log[]; createGate?: Promise<void>; exitCode: number; commandExit?: (input: Record<string, unknown>) => number;
-  updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; listed: Array<{ status: string }>;
+  updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; getFailure?: unknown; listed: Array<{ status: string }>;
 } = { commands: [], deletes: [], updates: [], kills: [], logsClosed: 0, files: new Map(), mkdirs: [], reads: [], logs: [], exitCode: 0, listed: [] };
 
 class FakeCommand {
@@ -50,7 +50,11 @@ class FakeSandbox {
   static current = new FakeSession();
   static async list() { return { [Symbol.asyncIterator]: async function* () { yield* observed.listed; } }; }
   static async create(input: Record<string, unknown>) { observed.create = input; return new FakeSandbox(`jarvis-${"a".repeat(40)}`); }
-  static async get(input: Record<string, unknown>) { observed.get = input; return new FakeSandbox(String(input.name)); }
+  static async get(input: Record<string, unknown>) {
+    observed.get = input;
+    if (observed.getFailure) throw observed.getFailure;
+    return new FakeSandbox(String(input.name));
+  }
   readonly routes: unknown[] = [];
   readonly runtime = "node22";
   readonly vcpus = 2;
@@ -74,7 +78,7 @@ async function providerAndWorkspace() {
 beforeEach(() => {
   observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.kills = []; observed.logsClosed = 0;
   observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.logs = []; observed.createGate = undefined; observed.exitCode = 0; observed.commandExit = undefined;
-  observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.listed = []; FakeSandbox.current = new FakeSession();
+  observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.getFailure = undefined; observed.listed = []; FakeSandbox.current = new FakeSession();
 });
 
 describe("VercelCloudWorkspaceProvider", () => {
@@ -112,6 +116,14 @@ describe("VercelCloudWorkspaceProvider", () => {
     FakeSandbox.current.status = "stopped";
     await expect(provider.readFile(workspace, "safe.txt", 10)).rejects.toMatchObject({ code: "stale_attempt" });
     expect(observed.reads).toEqual([]);
+  });
+
+  it("treats a missing named session as stale without a data-plane call", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.getFailure = new Error("404 not found");
+    await expect(provider.exec(workspace, { command: "true", timeoutMs: 1_000, maxOutputBytes: 1_000 })).rejects.toMatchObject({ code: "stale_attempt" });
+    expect(observed.commands).toEqual([]);
+    await expect(provider.terminate(workspace)).resolves.toBeUndefined();
   });
 
   it("re-fetches without resume after a session data-plane write and rejects a replacement", async () => {

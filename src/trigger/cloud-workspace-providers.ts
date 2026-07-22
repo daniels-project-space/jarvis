@@ -760,7 +760,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       // session, and a substituted/stopped session cannot block deletion.
       await sandbox.delete();
     } catch (error) {
-      if (this.absent(error)) return;
+      if ((error instanceof CloudWorkspaceError && error.code === "stale_attempt") || this.absent(error)) return;
       throw error;
     } finally { /* deletion is name-scoped; no session cache is retained */ }
   }
@@ -772,8 +772,17 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     const { Sandbox } = await import("@vercel/sandbox");
     // Never trust a stale SDK object here. This is a control-plane read with
     // resume:false, followed by a fence on its freshly observed Session.
-    const sandbox = await Sandbox.get({ ...this.credentials(), name: workspace.providerWorkspaceId, resume: false });
-    return sandbox;
+    try {
+      return await Sandbox.get({ ...this.credentials(), name: workspace.providerWorkspaceId, resume: false });
+    } catch (error) {
+      // A missing named attempt is not an invitation to create or resume one.
+      // Classify it exactly like a stopped or substituted session before any
+      // data-plane action can be attempted.
+      if (this.absent(error)) {
+        throw new CloudWorkspaceError(this.name, "stale_attempt", "Vercel Sandbox attempt is missing for this session fence", "deferred");
+      }
+      throw error;
+    }
   }
   private assertSession(workspace: CloudWorkspace, sandbox: VercelSandbox) {
     const session = sandbox.currentSession();
