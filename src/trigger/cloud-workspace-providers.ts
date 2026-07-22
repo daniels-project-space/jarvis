@@ -563,14 +563,14 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     // The root is established before it becomes a command cwd, and every
     // subsequent data-plane path is realpath/lstat checked below it.
     await session.mkDir(workspace.root);
-    this.assertSession(workspace, sandbox);
+    await this.assertFreshSession(workspace);
     await this.assertNoSymlink(workspace, sandbox, session, workspace.root, false);
     const result = await this.runSessionCommand(workspace, sandbox, session, {
       command: `mkdir -- ${shellQuote(paths.controlDir)} && [ "$(realpath -e -- ${shellQuote(paths.controlDir)})" = ${shellQuote(paths.controlDir)} ] && [ ! -L ${shellQuote(paths.controlDir)} ]`,
       cwd: workspace.root, timeoutMs: 10_000, maxOutputBytes: 4_000,
     });
     if (result.exitCode !== 0) throw new CloudWorkspaceError(this.name, "unsafe_archive", "could not establish a fenced sandbox control directory", "rejected");
-    this.assertSession(workspace, sandbox);
+    await this.assertFreshSession(workspace);
   }
 
   private credentials() { return { token: this.token, teamId: this.teamId, projectId: this.projectId }; }
@@ -657,7 +657,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
         chunks.push(chunk); used += chunk.byteLength;
       }
     } finally { (stream as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.(); }
-    this.assertSession(workspace, sandbox); return new Uint8Array(Buffer.concat(chunks, used));
+    await this.assertFreshSession(workspace); return new Uint8Array(Buffer.concat(chunks, used));
   }
   async writeFile(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) { return this.writeAbsolute(workspace, safeWorkspacePath(workspace, path), data, maxBytes); }
   protected async writeAbsolute(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) {
@@ -666,7 +666,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     const sandbox = await this.get(workspace); const session = this.assertSession(workspace, sandbox);
     const absolute = vercelAbsolutePath(workspace, path);
     await this.assertNoSymlink(workspace, sandbox, session, absolute, true);
-    await session.writeFiles([{ path: absolute, content: data }]); this.assertSession(workspace, sandbox);
+    await session.writeFiles([{ path: absolute, content: data }]); await this.assertFreshSession(workspace);
   }
   async listFiles(workspace: CloudWorkspace, path: string, maxEntries: number) {
     if (!Number.isSafeInteger(maxEntries) || maxEntries < 0 || maxEntries > VERCEL_MAX_LIST_ENTRIES) throw new CloudWorkspaceError(this.name, "resource_limit", "file listing limit is invalid", "rejected");
@@ -687,7 +687,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     const listing = result.stdout.subarray(0, result.stdout.byteLength && result.stdout[result.stdout.byteLength - 1] === 0 ? -1 : result.stdout.byteLength);
     const names = decodeOutput(listing).split("\0").filter(Boolean);
     if (names.length > maxEntries || names.some((name) => validateRelativePath(name, this.name) !== name)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "sandbox listing contains an unsafe entry", "rejected");
-    this.assertSession(workspace, sandbox); return names;
+    await this.assertFreshSession(workspace); return names;
   }
 
   async hydrateDependencies(workspace: CloudWorkspace): Promise<void> {
@@ -706,11 +706,20 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
         const exists = await this.runSessionCommand(workspace, sandbox, session, { command: `test -f ${shellQuote(lockPath)}`, cwd: this.workspaceRoot, timeoutMs: 10_000, maxOutputBytes: 4_000 });
         if (exists.exitCode !== 1) {
           if (exists.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "could not inspect committed package lock", "deferred");
+          // The source working tree must be byte-for-byte the controller base
+          // before its lock is parsed. This makes the streamed read below an
+          // observation of refs/jarvis/controller-base, not a mutable file a
+          // prior sandbox action could have substituted.
+          const committed = await this.runSessionCommand(workspace, sandbox, session, {
+            command: "git ls-files --error-unmatch -- package-lock.json >/dev/null && git diff --quiet refs/jarvis/controller-base -- package-lock.json && git diff --cached --quiet refs/jarvis/controller-base -- package-lock.json",
+            cwd: this.workspaceRoot, timeoutMs: 10_000, maxOutputBytes: 4_000,
+          });
+          if (committed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "unsafe_archive", "package lock is not the committed controller baseline", "rejected");
           const lock = await this.readAbsolute(workspace, lockPath, DEFAULT_WORKSPACE_LIMITS.maxFileBytes);
           if (!packageLockUsesOnlyNpmRegistry(lock)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "package lock contains a non-npm-registry dependency", "rejected");
-          this.assertSession(workspace, sandbox);
+          await this.assertFreshSession(workspace);
           await session.update({ networkPolicy: VERCEL_NPM_POLICY });
-          this.assertSession(workspace, sandbox);
+          await this.assertFreshSession(workspace);
           const installed = await this.runSessionCommand(workspace, sandbox, session, {
             command: [
               `npm ci --ignore-scripts --no-audit --no-fund --cache ${shellQuote(cachePath)}`,
@@ -726,12 +735,12 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
           if (installed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "deterministic dependency hydration failed", "deferred");
         }
       } finally {
-        this.assertSession(workspace, sandbox);
+        await this.assertFreshSession(workspace);
         await session.update({ networkPolicy: "deny-all" });
-        this.assertSession(workspace, sandbox);
+        await this.assertFreshSession(workspace);
       }
-      this.assertSession(workspace, sandbox);
-      if (session.networkPolicy !== "deny-all") throw new CloudWorkspaceError(this.name, "provider_unavailable", "dependency hydration did not relock deny-all egress", "blocked");
+      const relocked = await this.assertFreshSession(workspace);
+      if (relocked.networkPolicy !== "deny-all") throw new CloudWorkspaceError(this.name, "provider_unavailable", "dependency hydration did not relock deny-all egress", "blocked");
       const denied = await this.exec(workspace, { command: "node -e 'fetch(\"https://example.com\",{signal:AbortSignal.timeout(3000)}).then(()=>process.exit(9),()=>process.exit(0))'", cwd: this.workspaceRoot, timeoutMs: 8_000, maxOutputBytes: 4_000 });
       if (denied.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "deny-all network verification failed after dependency hydration", "blocked");
     } catch (error) {
@@ -772,6 +781,16 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       throw new CloudWorkspaceError(this.name, "stale_attempt", "Vercel Sandbox session changed or stopped for this attempt", "deferred");
     }
     return session;
+  }
+
+  /**
+   * A Session object is a snapshot. Re-reading the named sandbox without
+   * resume is the only post-operation identity check that can observe a
+   * provider-side stop or replacement; inspecting the object used for the
+   * data-plane call again would merely repeat stale local metadata.
+   */
+  private async assertFreshSession(workspace: CloudWorkspace): Promise<VercelSession> {
+    return this.assertSession(workspace, await this.get(workspace));
   }
 
   private async assertNoSymlink(workspace: CloudWorkspace, sandbox: VercelSandbox, session: VercelSession, path: string, writing: boolean): Promise<void> {
@@ -868,7 +887,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       const finished = await command.wait();
       await consume;
       if (reason) { termination ??= killAndObserve(); await termination; throw new CloudWorkspaceError(this.name, reason, reason === "timeout" ? "sandbox command timed out" : reason === "resource_limit" ? "sandbox command output exceeded its byte limit" : "command cancelled", reason === "resource_limit" ? "rejected" : "deferred"); }
-      this.assertSession(workspace, sandbox);
+      await this.assertFreshSession(workspace);
       return { exitCode: finished.exitCode, stdout: Buffer.concat(stdout, stdoutBytes), stderr: Buffer.concat(stderr, stderrBytes), durationMs: Date.now() - startedAt };
     } catch (error) {
       if (command) {

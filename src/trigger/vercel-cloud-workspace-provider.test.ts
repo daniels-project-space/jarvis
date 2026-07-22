@@ -7,7 +7,7 @@ const observed: {
   create?: Record<string, unknown>; get?: Record<string, unknown>; commands: Record<string, unknown>[];
   deletes: string[]; updates: unknown[]; kills: string[]; logsClosed: number; files: Map<string, Buffer>; mkdirs: string[]; reads: string[];
   logs: Log[]; createGate?: Promise<void>; exitCode: number; commandExit?: (input: Record<string, unknown>) => number;
-  updateFailure?: unknown; updateHook?: (policy: unknown) => void; listed: Array<{ status: string }>;
+  updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; listed: Array<{ status: string }>;
 } = { commands: [], deletes: [], updates: [], kills: [], logsClosed: 0, files: new Map(), mkdirs: [], reads: [], logs: [], exitCode: 0, listed: [] };
 
 class FakeCommand {
@@ -36,7 +36,10 @@ class FakeSession {
   }
   async mkDir(path: string) { observed.mkdirs.push(path); }
   async readFile({ path }: { path: string }) { observed.reads.push(path); return observed.files.has(path) ? Readable.from([observed.files.get(path)!]) : null; }
-  async writeFiles(files: Array<{ path: string; content: Uint8Array }>) { for (const file of files) observed.files.set(file.path, Buffer.from(file.content)); }
+  async writeFiles(files: Array<{ path: string; content: Uint8Array }>) {
+    for (const file of files) observed.files.set(file.path, Buffer.from(file.content));
+    observed.writeHook?.();
+  }
   async update({ networkPolicy }: { networkPolicy?: unknown }) {
     if (observed.updateFailure === networkPolicy) throw new Error("policy transition failed");
     this.networkPolicy = networkPolicy; observed.updates.push(networkPolicy); observed.updateHook?.(networkPolicy);
@@ -53,8 +56,9 @@ class FakeSandbox {
   readonly vcpus = 2;
   readonly memory = 4096;
   get networkPolicy() { return FakeSandbox.current.networkPolicy; }
+  private readonly snapshot = FakeSandbox.current;
   constructor(readonly name: string) {}
-  currentSession() { return FakeSandbox.current; }
+  currentSession() { return this.snapshot; }
   async delete() { observed.deletes.push(this.name); }
 }
 
@@ -70,7 +74,7 @@ async function providerAndWorkspace() {
 beforeEach(() => {
   observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.kills = []; observed.logsClosed = 0;
   observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.logs = []; observed.createGate = undefined; observed.exitCode = 0; observed.commandExit = undefined;
-  observed.updateFailure = undefined; observed.updateHook = undefined; observed.listed = []; FakeSandbox.current = new FakeSession();
+  observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.listed = []; FakeSandbox.current = new FakeSession();
 });
 
 describe("VercelCloudWorkspaceProvider", () => {
@@ -108,6 +112,16 @@ describe("VercelCloudWorkspaceProvider", () => {
     FakeSandbox.current.status = "stopped";
     await expect(provider.readFile(workspace, "safe.txt", 10)).rejects.toMatchObject({ code: "stale_attempt" });
     expect(observed.reads).toEqual([]);
+  });
+
+  it("re-fetches without resume after a session data-plane write and rejects a replacement", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.writeHook = () => {
+      FakeSandbox.current = Object.assign(new FakeSession(), { sessionId: "replaced-after-write" });
+    };
+    await expect(provider.writeFile(workspace, "safe.txt", new TextEncoder().encode("safe"), 10)).rejects.toMatchObject({ code: "stale_attempt" });
+    expect(observed.files.get(`${workspace.root}/safe.txt`)?.toString()).toBe("safe");
+    expect(observed.get).toMatchObject({ name: workspace.providerWorkspaceId, resume: false });
   });
 
   it("kills and observes the exact command on cancellation and output overflow", async () => {
@@ -171,6 +185,16 @@ describe("VercelCloudWorkspaceProvider", () => {
       "node_modules/a": { resolved: "http://registry.npmjs.org/a.tgz" },
     } })));
     await expect(provider.hydrateDependencies(workspace)).rejects.toMatchObject({ code: "unsafe_archive" });
+    expect(observed.commands.some((command) => String(command.args).includes("npm ci"))).toBe(false);
+    expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
+  });
+
+  it("rejects a lock that is present but no longer matches the committed controller baseline", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.files.set(`${workspace.root}/package-lock.json`, Buffer.from(JSON.stringify({ lockfileVersion: 3, packages: {} })));
+    observed.commandExit = (input) => String(input.args).includes("git ls-files --error-unmatch") ? 1 : 0;
+    await expect(provider.hydrateDependencies(workspace)).rejects.toMatchObject({ code: "unsafe_archive" });
+    expect(observed.updates).toContain("deny-all");
     expect(observed.commands.some((command) => String(command.args).includes("npm ci"))).toBe(false);
     expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
   });
