@@ -497,7 +497,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     }));
     expect(await dispatch(f.t, 8, "stale-handoff-held")).toHaveLength(0);
     const catalogAttempts = await f.t.run(async (ctx) => {
-      const node = await ctx.db.query("goalPlanNodes").withIndex("by_parent_generation_node", (q) =>
+      const node = await ctx.db.query("goalPlanNodes").withIndex("by_parent_generation", (q) =>
         q.eq("parentMissionId", f.missionId).eq("planGeneration", 1).eq("nodeId", "catalog")).first();
       return node ? await ctx.db.query("workAttempts").withIndex("by_job_attempt", (q) => q.eq("jobId", node.jobId)).collect() : [];
     });

@@ -750,7 +750,6 @@ export default defineSchema({
     createdAt: v.number(),
   })
     .index("by_parent_generation", ["parentMissionId", "planGeneration", "nodeId"])
-    .index("by_parent_generation_node", ["parentMissionId", "planGeneration", "nodeId"])
     .index("by_child", ["childMissionId", "nodeId"])
     .index("by_job", ["jobId"]),
 
