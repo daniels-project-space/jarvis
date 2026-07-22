@@ -12,7 +12,7 @@ import { isOwnedRepositoryScope } from "./workflow-contract";
  */
 
 export const CONSEQUENTIAL_ACTION =
-  /\b(send|email|message|reply|contact|publish|post|advertis(?:e|ing)|deploy|merge|book|reserve|buy|purchase|order|pay|spend|transfer|trade|withdraw|refund|charge|invoice|delete|destroy|drop|truncate|rotate (?:a )?(?:key|secret)|change (?:a )?(?:password|credential)|cancel (?:a )?(?:booking|subscription|account))\b/i;
+  /\b(send|email|message|reply|contact|publish|post|advertis(?:e|ing)|deploy|merge|book|reserve|buy|purchase|order|pay|spend|transfer|trade|withdraw|refund|charge|invoice|delete|destroy|drop|truncate|rotate (?:(?:a|the) )?(?:key|secret)s?|change (?:(?:a|the) )?(?:password|credential)s?|cancel (?:a )?(?:booking|subscription|account))\b/i;
 
 export const SAFE_SANDBOX_EXECUTION_RULES =
   "When the task or its acceptance criteria explicitly require provider sandbox/test-mode validation, an isolated non-billable test artifact is already authorized if it cannot pay or charge, message anyone, publish publicly, reserve real inventory, create a real supplier/customer order, or start fulfillment. Do not ask Daniel to approve that bounded test again. This never authorizes live-effect flags, credential changes, real commerce, outreach, publication, or spend. A specialist without scoped test credentials must preserve the safe controller handoff instead of requesting broader credentials or pretending the provider trace ran.";
@@ -135,11 +135,18 @@ const ANALYTICAL_RELATIVE_ACTION_SCOPE =
 const ANALYTICAL_NOMINAL_ACTION_SCOPE =
   /^(?:please\s+)?(?:research|investigate|inspect|audit|review|analyse|analyze|compare|summari[sz]e|report|recommend|brainstorm|plan|draft|design|draw|illustrat|write|explain|calculate|model|prototype|test|verify|locate|list)\b[^,:–—]*\b(?:ability|capability|permission|path|trace)\b[^,:–—]*\bto\s*$/i;
 
-const NEGATED_LEAD =
-  /^(?:do\s+not|don't|never|must\s+not|should\s+not|may\s+not|cannot|can't|without|avoid|forbid(?:den)?|prohibit(?:ed)?|no\b)/i;
-
 const NEGATED_TAIL =
   /\b(?:do\s+not|don't|never|must\s+not|should\s+not|may\s+not|cannot|can't|without|avoid|no)\b[^.;!?\n]{0,160}$/i;
+
+const LEADING_PROHIBITION =
+  /^(?:(?:read[- ]only)\s*:\s*)?(?:do\s+not|don't|never|must\s+not|should\s+not|may\s+not|cannot|can't|without|avoid|forbid(?:den)?|prohibit(?:ed)?|no\b)/i;
+
+const CLAUSE_TRANSITION =
+  /^(?:and\s+instead|and\s+then|then|but|however|yet|nevertheless|instead)\b/i;
+
+function hasLeadingProhibition(clause: string): boolean {
+  return LEADING_PROHIBITION.test(clause);
+}
 
 // Security reviews often include past-tense evidence such as “the job asked
 // to send a reply”. That is a description of the tested instruction, not a
@@ -253,15 +260,17 @@ function clauses(task: string): string[] {
 
     const previous = task[index - 1] ?? "";
     if (!/[a-z0-9_]/i.test(previous)) {
-      const conjunction = task.slice(index).match(/^(?:and\s+instead|and\s+then|then|but|and)\b/i);
+      const conjunction = task.slice(index).match(/^(?:and\s+instead|and\s+then|then|but|however|yet|nevertheless|instead|and)\b/i);
       if (conjunction) {
         const clause = cleanClause(current);
-        const contrast = /^(?:but|and\s+instead)$/i.test(conjunction[0]);
+        const transition = CLAUSE_TRANSITION.test(conjunction[0]);
         // A leading prohibition scopes over coordinated verbs: “do not send
-        // and publish” prohibits both. Positive clauses still split here so
-        // “research and purchase” cannot borrow the read-only lead.
-        if (!contrast && (
-          NEGATED_LEAD.test(clause)
+        // and publish” prohibits both, irrespective of the list's character
+        // length. Sequential and contrastive transitions always start a new
+        // clause, while positive clauses still split at ordinary “and”, so a
+        // later imperative cannot borrow the prohibition.
+        if (!transition && (
+          hasLeadingProhibition(clause)
           || NEGATED_TAIL.test(clause)
           || TECHNICAL_TEST_MATRIX_CONJUNCTION_LEAD.test(clause)
         )) {
@@ -450,7 +459,7 @@ export function classifyWorkSafety(
       if (!consequentialUse(action, clause, actionIndex)) continue;
       const quoteContext = quotedActionContext(clause, actionIndex);
       if (quoteContext !== null && REPORTED_CONVERSATION_CONTEXT.test(quoteContext)) continue;
-      if (NEGATED_LEAD.test(clause)) continue;
+      if (hasLeadingProhibition(clause)) continue;
 
       const beforeAction = clause.slice(0, actionIndex);
       if (NEGATED_TAIL.test(beforeAction)) continue;
@@ -474,7 +483,7 @@ export function classifyWorkSafety(
   }
   const asksForSoftwareDelivery = clauses(task).some((clause) => {
     const match = CONSEQUENTIAL_ACTION.exec(clause);
-    if (NEGATED_LEAD.test(clause)) return false;
+    if (hasLeadingProhibition(clause)) return false;
     if (match && NEGATED_TAIL.test(clause.slice(0, match.index ?? 0))) return false;
     return Boolean(match && softwareDeliveryAllowed(match[0], clause, options?.repo, match.index));
   });

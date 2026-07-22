@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { routeWork, suggestedAcceptanceCriteria } from "./routing";
+import {
+  DROPSHIP_READ_ONLY_AUDIT_PROMPTS,
+  PROHIBITION_FOLLOWED_BY_CONSEQUENTIAL_ACTION,
+} from "./fixtures/read-only-prohibition-regressions";
 
 describe("routeWork", () => {
   it("routes complex engineering to Paul at the deep tier", () => {
@@ -44,6 +48,29 @@ describe("routeWork", () => {
     );
     expect(route.approvalRequired).toBe(false);
     expect(route.readonly).toBe(true);
+  });
+
+  it("keeps long coordinated read-only audit prohibitions autonomous", () => {
+    for (const task of DROPSHIP_READ_ONLY_AUDIT_PROMPTS) {
+      const route = routeWork(task, {
+        repo: "daniels-project-space/dropship-ai",
+        readonly: true,
+      });
+      expect(route.approvalRequired, task).toBe(false);
+      expect(route.readonly, task).toBe(true);
+      expect(route.risk, task).not.toBe("consequential");
+    }
+  });
+
+  it("does not let a long prohibition or readonly waive a later imperative", () => {
+    for (const task of PROHIBITION_FOLLOWED_BY_CONSEQUENTIAL_ACTION) {
+      const route = routeWork(task, {
+        repo: "daniels-project-space/dropship-ai",
+        readonly: true,
+      });
+      expect(route.approvalRequired, task).toBe(true);
+      expect(route.risk, task).toBe("consequential");
+    }
   });
 
   it("does not mistake reported audit evidence for a new action", () => {

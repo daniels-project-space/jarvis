@@ -15,6 +15,11 @@ import {
   REPRODUCED_MIXED_ACTION_EXPLOITS,
   SAFE_ANALYTICAL_ACTION_FIXTURES,
 } from "./fixtures/action-scope-regressions";
+import {
+  DROPSHIP_READ_ONLY_AUDIT_PROMPTS,
+  LONG_COORDINATED_READ_ONLY_PROHIBITION,
+  PROHIBITION_FOLLOWED_BY_CONSEQUENTIAL_ACTION,
+} from "./fixtures/read-only-prohibition-regressions";
 
 const CLOUD_SANDBOX_APPROVAL_TASK = readFileSync(
   new URL("./fixtures/cloud-sandbox-approval-task.txt", import.meta.url),
@@ -204,6 +209,40 @@ describe("server-side work approval policy", () => {
       "Audit the broken \"reply transcript. Purchase the selected product.",
     ]) {
       expect(classifyWorkSafety(task, { repo: "jarvis" }).approvalRequired, task).toBe(true);
+    }
+  });
+
+  it("scopes a leading prohibition over the complete coordinated action list", () => {
+    const safeTasks = [
+      LONG_COORDINATED_READ_ONLY_PROHIBITION,
+      ...DROPSHIP_READ_ONLY_AUDIT_PROMPTS,
+    ];
+    for (const task of safeTasks) {
+      expect(classifyWorkSafety(task, {
+        repo: "daniels-project-space/dropship-ai",
+      }), task).toEqual({ approvalRequired: false, boundary: "internal" });
+      expect(workApprovalPolicy({
+        task,
+        repo: "daniels-project-space/dropship-ai",
+        readonly: true,
+        risk: "low",
+        approvalRequired: false,
+      }), task).toMatchObject({ required: false, deliveryMode: "read_only" });
+    }
+  });
+
+  it("ends coordinated prohibition scope before a later consequential imperative", () => {
+    for (const task of PROHIBITION_FOLLOWED_BY_CONSEQUENTIAL_ACTION) {
+      expect(classifyWorkSafety(task, {
+        repo: "daniels-project-space/dropship-ai",
+      }).approvalRequired, task).toBe(true);
+      expect(workApprovalPolicy({
+        task,
+        repo: "daniels-project-space/dropship-ai",
+        readonly: true,
+        risk: "low",
+        approvalRequired: false,
+      }).required, task).toBe(true);
     }
   });
 

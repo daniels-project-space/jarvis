@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
-import { planManagedMission } from "./supervisor";
+import {
+  DROPSHIP_READ_ONLY_AUDIT_PROMPTS,
+} from "./fixtures/read-only-prohibition-regressions";
+import { normalizeWorkstream, planManagedMission } from "./supervisor";
 
 describe("managed mission workflow", () => {
   it("runs explicit workstreams through the committed Mastra graph", async () => {
@@ -53,5 +56,38 @@ describe("managed mission workflow", () => {
       risk: "consequential",
       model: "sol",
     });
+  });
+
+  it("keeps supplied long-prohibition audits read-only through normalization and Mastra", async () => {
+    for (const task of DROPSHIP_READ_ONLY_AUDIT_PROMPTS) {
+      expect(normalizeWorkstream({
+        task,
+        repo: "daniels-project-space/dropship-ai",
+        readonly: true,
+        approvalRequired: false,
+        risk: "low",
+      }), task).toMatchObject({
+        readonly: true,
+        approvalRequired: false,
+      });
+    }
+
+    const plan = await planManagedMission("Run three independent read-only Dropship audits", {
+      repo: "daniels-project-space/dropship-ai",
+      workstreams: DROPSHIP_READ_ONLY_AUDIT_PROMPTS.map((task, index) => ({
+        label: `Audit ${index + 1}`,
+        task,
+        agentId: "sentry",
+        readonly: true,
+        approvalRequired: false,
+        risk: "low",
+      })),
+    });
+
+    expect(plan.plannedBy).toBe("mastra");
+    expect(plan.workstreams).toHaveLength(3);
+    expect(plan.workstreams.every((stream) => (
+      stream.readonly && !stream.approvalRequired && stream.risk !== "consequential"
+    ))).toBe(true);
   });
 });
