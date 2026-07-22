@@ -1,34 +1,40 @@
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { Readable } from "node:stream";
 import { describe, expect, it, beforeEach, vi } from "vitest";
 import { createDeterministicTar, DEFAULT_WORKSPACE_LIMITS, sha256Bytes } from "./cloud-workspace";
 
 type Log = { stream: "stdout" | "stderr"; data: string };
+type CommandOutcome = { exitCode: number; logs: Log[] };
 const observed: {
   create?: Record<string, unknown>; get?: Record<string, unknown>; commands: Record<string, unknown>[];
   deletes: string[]; updates: unknown[]; updateSessions: string[]; kills: string[]; waits: string[]; logConsumers: string[]; logsClosed: number; files: Map<string, Buffer>; mkdirs: string[]; reads: string[]; readSessions: string[]; writeSessions: string[];
   logs: Log[]; createGate?: Promise<void>; waitGate?: Promise<void>; releaseWaitOnKill?: () => void; logCloseGate?: Promise<void>; waitFailure?: unknown; fenceWaitFailure?: unknown; deleteFailure?: unknown;
-  exitCode: number; commandExit?: (input: Record<string, unknown>) => number;
+  exitCode: number; commandExit?: (input: Record<string, unknown>) => number; commandExecutor?: (input: Record<string, unknown>) => CommandOutcome | undefined;
   updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; runCommandHook?: (input: Record<string, unknown>, session: FakeSession) => void; getFailure?: unknown;
-  listed: Array<{ status: string }>; listedPages?: Array<Array<{ status: string }>>; listInputs: Record<string, unknown>[];
+  listed: Array<{ status: string }>; listedPages?: Array<Array<{ status: string }>>; listedPageNext?: Array<string | null>; listInputs: Record<string, unknown>[];
 } = { commands: [], deletes: [], updates: [], updateSessions: [], kills: [], waits: [], logConsumers: [], logsClosed: 0, files: new Map(), mkdirs: [], reads: [], readSessions: [], writeSessions: [], logs: [], exitCode: 0, listed: [], listInputs: [] };
 
 class FakeCommand {
   readonly cmdId = `cmd-${observed.commands.length}`;
   exitCode: number | null = null;
-  constructor(private readonly input: Record<string, unknown>) {}
+  constructor(private readonly input: Record<string, unknown>, private readonly outcome?: CommandOutcome) {}
   async wait() {
     observed.waits.push(this.cmdId);
     await observed.waitGate;
     if (observed.fenceWaitFailure && String(this.input.args).includes("realpath")) throw observed.fenceWaitFailure;
     if (observed.waitFailure && String(this.input.args).includes("true")) throw observed.waitFailure;
-    this.exitCode = this.exitCode ?? observed.commandExit?.(this.input) ?? observed.exitCode;
+    this.exitCode = this.exitCode ?? this.outcome?.exitCode ?? observed.commandExit?.(this.input) ?? observed.exitCode;
     return { exitCode: this.exitCode, durationMs: 1 };
   }
   async kill(signal?: string) { observed.kills.push(`${this.cmdId}:${signal}`); this.exitCode = 137; observed.releaseWaitOnKill?.(); }
   logs(_opts?: { signal?: AbortSignal }) {
     observed.logConsumers.push(this.cmdId);
     let closed = false;
-    return Object.assign((async function* () { for (const log of observed.logs) { if (!closed) yield log; } })(), {
+    const logs = this.outcome?.logs ?? observed.logs;
+    return Object.assign((async function* () { for (const log of logs) { if (!closed) yield log; } })(), {
       close: async () => { await observed.logCloseGate; closed = true; observed.logsClosed += 1; },
       [Symbol.dispose]: () => { closed = true; observed.logsClosed += 1; },
     });
@@ -42,7 +48,7 @@ class FakeSession {
   async runCommand(input: Record<string, unknown>) {
     observed.commands.push(input);
     if (String(input.args).includes("sleep 1")) await observed.createGate;
-    const command = new FakeCommand(input);
+    const command = new FakeCommand(input, observed.commandExecutor?.(input));
     observed.runCommandHook?.(input, this);
     return command;
   }
@@ -64,7 +70,7 @@ class FakeSandbox {
   static async list(input: Record<string, unknown>) {
     observed.listInputs.push(input);
     const pages = observed.listedPages ?? [observed.listed];
-    const materialized = pages.map((sandboxes, index) => ({ sandboxes, pagination: { count: sandboxes.length, next: index + 1 < pages.length ? `cursor-${index + 1}` : null } }));
+    const materialized = pages.map((sandboxes, index) => ({ sandboxes, pagination: { count: sandboxes.length, next: observed.listedPageNext?.[index] ?? (index + 1 < pages.length ? `cursor-${index + 1}` : null) } }));
     return Object.assign(materialized[0]!, {
       pages: async function* () { yield* materialized; },
       [Symbol.asyncIterator]: async function* () { for (const page of materialized) yield* page.sandboxes; },
@@ -96,10 +102,30 @@ async function providerAndWorkspace() {
   return { provider, workspace };
 }
 
+/** Execute only the exact generated listing program on the host's temporary
+ * directory. The surrounding Session is still fake, but its listing exit code
+ * and base64 log data come from the real child process, never a substring
+ * based mock exit hook. */
+function executeExactListingProgram(input: Record<string, unknown>): CommandOutcome | undefined {
+  const args = input.args;
+  const command = Array.isArray(args) ? args[1] : undefined;
+  if (typeof command !== "string" || !command.startsWith("node -e ")) return undefined;
+  const completed = spawnSync("sh", ["-lc", command], { encoding: "buffer" });
+  const stdout = Buffer.from(completed.stdout ?? "").toString("utf8");
+  const stderr = Buffer.from(completed.stderr ?? "").toString("utf8");
+  return {
+    exitCode: completed.status ?? 1,
+    logs: [
+      ...(stdout ? [{ stream: "stdout" as const, data: stdout }] : []),
+      ...(stderr ? [{ stream: "stderr" as const, data: stderr }] : []),
+    ],
+  };
+}
+
 beforeEach(() => {
   observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.updateSessions = []; observed.kills = []; observed.waits = []; observed.logConsumers = []; observed.logsClosed = 0;
   observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.readSessions = []; observed.writeSessions = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.releaseWaitOnKill = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.fenceWaitFailure = undefined; observed.deleteFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
-  observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.runCommandHook = undefined; observed.getFailure = undefined; observed.listed = []; observed.listedPages = undefined; observed.listInputs = []; FakeSandbox.current = new FakeSession();
+  observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.runCommandHook = undefined; observed.commandExecutor = undefined; observed.getFailure = undefined; observed.listed = []; observed.listedPages = undefined; observed.listedPageNext = undefined; observed.listInputs = []; FakeSandbox.current = new FakeSession();
 });
 
 describe("VercelCloudWorkspaceProvider", () => {
@@ -334,12 +360,61 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.logConsumers).toHaveLength(2);
   });
 
-  it("rejects bounded lists and symlink findings from the session-scoped lstat command", async () => {
+  it("runs the exact listing program against real byte-named directories and preserves exit classifications", async () => {
     const { provider, workspace } = await providerAndWorkspace();
-    observed.commandExit = (input) => String(input.args).includes("find -P") ? 42 : 0;
-    await expect(provider.listFiles(workspace, ".", 1)).rejects.toMatchObject({ code: "resource_limit" });
-    observed.commandExit = (input) => String(input.args).includes("find -P") ? 43 : 0;
-    await expect(provider.listFiles(workspace, ".", 1)).rejects.toMatchObject({ code: "unsafe_archive" });
+    const listingExitCodes: number[] = [];
+    observed.commandExecutor = (input) => {
+      const outcome = executeExactListingProgram(input);
+      if (outcome) listingExitCodes.push(outcome.exitCode);
+      return outcome;
+    };
+    const roots: string[] = [];
+    const makeWorkspace = () => {
+      const root = mkdtempSync(join(tmpdir(), "jarvis-vercel-listing-"));
+      roots.push(root);
+      return { ...workspace, root };
+    };
+    try {
+      await expect(provider.listFiles(makeWorkspace(), ".", 2)).resolves.toEqual([]);
+
+      const one = makeWorkspace();
+      writeFileSync(join(one.root, "only"), "safe");
+      await expect(provider.listFiles(one, ".", 1)).resolves.toEqual(["only"]);
+
+      const exact = makeWorkspace();
+      writeFileSync(join(exact.root, "one"), "safe");
+      writeFileSync(join(exact.root, "two"), "safe");
+      await expect(provider.listFiles(exact, ".", 2)).resolves.toEqual(expect.arrayContaining(["one", "two"]));
+
+      const overflow = makeWorkspace();
+      writeFileSync(join(overflow.root, "one"), "safe");
+      writeFileSync(join(overflow.root, "two"), "safe");
+      await expect(provider.listFiles(overflow, ".", 1)).rejects.toMatchObject({ code: "resource_limit" });
+
+      const linked = makeWorkspace();
+      writeFileSync(join(linked.root, "target"), "safe");
+      symlinkSync("target", join(linked.root, "link"));
+      await expect(provider.listFiles(linked, ".", 2)).rejects.toMatchObject({ code: "unsafe_archive" });
+
+      const broken = makeWorkspace();
+      symlinkSync("missing-target", join(broken.root, "broken-link"));
+      await expect(provider.listFiles(broken, ".", 2)).rejects.toMatchObject({ code: "unsafe_archive" });
+
+      if (process.platform !== "win32") {
+        const invalid = makeWorkspace();
+        const invalidName = Buffer.concat([Buffer.from(invalid.root), Buffer.from("/"), Buffer.from([0xff])]);
+        writeFileSync(invalidName, "safe");
+        await expect(provider.listFiles(invalid, ".", 1)).rejects.toMatchObject({ code: "unsafe_patch" });
+      }
+      const listingCommands = observed.commands
+        .map((command) => Array.isArray(command.args) ? command.args[1] : "")
+        .filter((command): command is string => typeof command === "string" && command.startsWith("node -e "));
+      expect(listingCommands).toHaveLength(process.platform === "win32" ? 6 : 7);
+      expect(listingCommands.every((command) => !/find -P|wc -c|base64 -w|\|\s*(?:find|wc|base64)/.test(command))).toBe(true);
+      expect(listingExitCodes).toEqual(process.platform === "win32" ? [0, 0, 0, 42, 43, 43] : [0, 0, 0, 42, 43, 43, 0]);
+    } finally {
+      for (const root of roots) rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("strictly decodes NUL listings and accepts exactly the requested entry limit", async () => {
@@ -361,9 +436,7 @@ describe("VercelCloudWorkspaceProvider", () => {
     await expect(provider.listFiles(workspace, ".", 1)).rejects.toMatchObject({ code: "unsafe_patch" });
     observed.logs = [{ stream: "stdout", data: Buffer.from("one\0two\0").toString("base64") }];
     await expect(provider.listFiles(workspace, ".", 1)).rejects.toMatchObject({ code: "resource_limit" });
-    observed.commandExit = (input) => String(input.args).includes("find -P") ? 43 : 0;
-    await expect(provider.listFiles(workspace, ".", 1)).rejects.toMatchObject({ code: "unsafe_archive" });
-    expect(observed.commands.some((command) => String(command.args).includes("base64 -w 0"))).toBe(true);
+    expect(observed.commands.some((command) => String(command.args).includes("node -e"))).toBe(true);
   });
 
   it("relocks and terminates on install failure before any later command boundary", async () => {
@@ -411,6 +484,15 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.create).toBeUndefined();
     observed.listed = Array.from({ length: 8 }, () => ({ status: "snapshotting" }));
     await expect(provider.createWorkspace({ attemptKey: "job:snapshot-cap", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS })).rejects.toMatchObject({ code: "resource_limit" });
+    expect(observed.create).toBeUndefined();
+  });
+
+  it("fails closed when a history paginator ends while its last page advertises another cursor", async () => {
+    observed.listedPages = [[{ status: "stopped" }]];
+    observed.listedPageNext = ["cursor-that-was-not-observed"];
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    await expect(provider.createWorkspace({ attemptKey: "job:incomplete-history", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS })).rejects.toMatchObject({ code: "provider_unavailable" });
     expect(observed.create).toBeUndefined();
   });
 

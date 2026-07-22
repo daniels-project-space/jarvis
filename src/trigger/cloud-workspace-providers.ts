@@ -490,7 +490,7 @@ function decodeOutput(value: Buffer): string {
 /** The command log transport is text, while POSIX names are bytes.  Keep the
  * on-sandbox frame as canonical standard base64 and validate every property
  * before converting an individual name to text. */
-function decodeVercelListing(value: Buffer, maxEntries: number): string[] {
+export function decodeVercelListing(value: Buffer, maxEntries: number): string[] {
   const encoded = decodeOutput(value);
   if (encoded === "") return [];
   if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
@@ -519,6 +519,44 @@ function decodeVercelListing(value: Buffer, maxEntries: number): string[] {
   // start exactly at the byte length only for a complete canonical frame.
   if (start !== bytes.length) throw new CloudWorkspaceError("vercel", "unsafe_archive", "sandbox listing frame is unterminated", "rejected");
   return names;
+}
+
+/**
+ * The Sandbox command transport turns stdout into text, but POSIX directory
+ * names are bytes.  This is deliberately one Node process rather than a shell
+ * sequence: it completes every observation and lstat before it writes the
+ * base64 frame, so a later encoder can never hide an earlier safety failure.
+ */
+const VERCEL_LISTING_PROGRAM = String.raw`
+"use strict";
+const fs = require("node:fs");
+const base = process.argv[1];
+const maxEntries = Number(process.argv[2]);
+const failure = (exitCode) => { const error = new Error("listing rejected"); error.exitCode = exitCode; throw error; };
+try {
+  if (!Number.isSafeInteger(maxEntries) || maxEntries < 0) failure(1);
+  const resolvedBase = fs.realpathSync.native(base);
+  const baseStat = fs.lstatSync(base);
+  if (resolvedBase !== base || baseStat.isSymbolicLink() || !baseStat.isDirectory()) failure(43);
+  const names = fs.readdirSync(base, { encoding: "buffer" });
+  if (names.length > maxEntries) failure(42);
+  const baseBytes = Buffer.from(resolvedBase);
+  for (const name of names) {
+    if (!Buffer.isBuffer(name) || name.length === 0 || name.includes(0) || name.includes(47)) failure(1);
+    const child = Buffer.concat([baseBytes, Buffer.from("/"), name]);
+    if (fs.lstatSync(child).isSymbolicLink()) failure(43);
+  }
+  const frame = names.length === 0 ? Buffer.alloc(0) : Buffer.concat(names.flatMap((name) => [name, Buffer.from([0])]));
+  process.stdout.write(frame.toString("base64"));
+} catch (error) {
+  process.exitCode = error && (error.exitCode === 42 || error.exitCode === 43) ? error.exitCode : 1;
+}
+`;
+
+/** Exported so the behavioral test runs the exact command transported to a
+ * Sandbox, rather than a synthetic exit-code hook. */
+export function buildVercelListingCommand(base: string, maxEntries: number): string {
+  return `node -e ${shellQuote(VERCEL_LISTING_PROGRAM)} -- ${shellQuote(base)} ${maxEntries}`;
 }
 
 function boundedUtf8Prefix(value: string, maxBytes: number): Buffer {
@@ -651,6 +689,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     let active = 0;
     let pages = 0;
     let total = 0;
+    let complete = false;
     // Do not use the paginator's item iterator: it silently follows stopped
     // history forever. The page metadata is the proof that every active
     // project-scoped Jarvis attempt was counted within the hard ceiling.
@@ -666,10 +705,19 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
           throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox controller active-attempt cap is reached", "deferred");
         }
       }
-      if (page.pagination.next === null) break;
+      if (page.pagination.next === null) {
+        complete = true;
+        break;
+      }
       if (pages === VERCEL_HISTORY_PAGE_CEILING) {
         throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox history completeness cannot be proved within the controller page ceiling", "deferred");
       }
+    }
+    // A paginator which simply stops while advertising another cursor is not
+    // proof that active attempts were fully counted. Creation is allowed only
+    // after observing the terminal page metadata itself.
+    if (!complete) {
+      throw new CloudWorkspaceError(this.name, "provider_unavailable", "Vercel Sandbox history paginator ended before its advertised terminal page", "deferred");
     }
     const sandbox = await Sandbox.create({
       ...this.credentials(),
@@ -777,16 +825,8 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     let observed = await this.observeFreshSession(workspace);
     const base = vercelAbsolutePath(workspace, path);
     observed = await this.assertNoSymlink(workspace, observed.sandbox, observed.session, base, false);
-    const script = [
-      `base=${shellQuote(base)}`,
-      `count=$(find -P -- "$base" -mindepth 1 -maxdepth 1 -printf . | wc -c)`,
-      `[ "$count" -le ${maxEntries} ] || exit 42`,
-      `find -P -- "$base" -mindepth 1 -maxdepth 1 -exec sh -c 'for entry do [ ! -L "$entry" ] || exit 43; stat -c %F -- "$entry" | grep -qx "symbolic link" && exit 43; done' sh {} +`,
-      // The SDK transports logs as text. Canonical base64 preserves raw POSIX
-      // filename bytes, including names which are not valid UTF-8.
-      `LC_ALL=C find -P -- "$base" -mindepth 1 -maxdepth 1 -printf '%f\\0' | base64 -w 0`,
-    ].join("; ");
-    const result = await this.runSessionCommand(workspace, observed.sandbox, observed.session, { command: script, cwd: workspace.root, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs, maxOutputBytes: Math.max(1_024, Math.min(DEFAULT_WORKSPACE_LIMITS.maxOutputBytes, maxEntries * 512)) });
+    const command = buildVercelListingCommand(base, maxEntries);
+    const result = await this.runSessionCommand(workspace, observed.sandbox, observed.session, { command, cwd: workspace.root, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs, maxOutputBytes: Math.max(1_024, Math.min(DEFAULT_WORKSPACE_LIMITS.maxOutputBytes, maxEntries * 512)) });
     if (result.exitCode === 42) throw new CloudWorkspaceError(this.name, "resource_limit", "file listing exceeds limit", "rejected");
     if (result.exitCode === 43) throw new CloudWorkspaceError(this.name, "unsafe_archive", "symlink encountered during bounded listing", "rejected");
     if (result.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "sandbox file listing failed", "deferred");
