@@ -2573,7 +2573,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // a document, a label, a whiteboard, a product — and JARVIS reads it.
   const [camSeeing, setCamSeeing] = useState(false);
   async function lookAtCamera() {
-    if (camSeeing) return;
+    // A guest conversation is intentionally text/voice only. Keep this guard
+    // alongside the hidden control so a stale event handler cannot upload a
+    // camera frame during a session transition.
+    if (guest || camSeeing) return;
     setCamSeeing(true);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -2611,7 +2614,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }
 
   async function lookAtScreen() {
-    if (seeing) return;
+    // Screen frames are an owner capability: they are persisted to R2 before
+    // the foreground worker can inspect them.
+    if (guest || seeing) return;
     setSeeing(true);
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 5 } });
@@ -3272,7 +3277,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 if (m.role === "user" && m.text) return { ...m, text: visibleTurnText(m.text) };
                 return m;
               })
-              .filter((m) => m.text || m.attachment || m.status === "streaming")
+              // A guest never receives a card through the normal worker path,
+              // but do not materialize one if a legacy row is ever present.
+              .filter((m) => m.text || (!guest && m.attachment) || m.status === "streaming")
               .map((m) => (
               <div key={m._id} className={`rise ${m.role === "user" ? "text-right" : "text-left"}`}>
                 {m.attachment ? (
@@ -3343,20 +3350,22 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             >
               <span className="max-sm:hidden">{live === "live" ? "mic on" : recording ? "■ done" : "mic"}</span><span className="sm:hidden">{recording ? "■" : "●"}</span>
             </button>
-            <button
-              onClick={() => void lookAtScreen()}
-              title="show JARVIS your screen (one frame)"
-              className={`hidden shrink-0 rounded-xl px-3 text-sm transition sm:block ${seeing ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50 animate-pulse" : "glass text-slate hover:text-ice"}`}
-            >
-              👁
-            </button>
-            <button
-              onClick={() => void lookAtCamera()}
-              title="point your camera at something — JARVIS reads it"
-              className={`hidden shrink-0 rounded-xl px-3 text-sm transition sm:block ${camSeeing ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50 animate-pulse" : "glass text-slate hover:text-ice"}`}
-            >
-              📷
-            </button>
+            {!guest && <>
+              <button
+                onClick={() => void lookAtScreen()}
+                title="show JARVIS your screen (one frame)"
+                className={`hidden shrink-0 rounded-xl px-3 text-sm transition sm:block ${seeing ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50 animate-pulse" : "glass text-slate hover:text-ice"}`}
+              >
+                👁
+              </button>
+              <button
+                onClick={() => void lookAtCamera()}
+                title="point your camera at something — JARVIS reads it"
+                className={`hidden shrink-0 rounded-xl px-3 text-sm transition sm:block ${camSeeing ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50 animate-pulse" : "glass text-slate hover:text-ice"}`}
+              >
+                📷
+              </button>
+            </>}
             {(speaking || (live === "live" && caption?.who === "jarvis")) && (
               <button
                 onClick={stopTalking}

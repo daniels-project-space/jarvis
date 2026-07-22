@@ -12,6 +12,12 @@ import { TOOL_BELTS, slimToolDefinition } from "@/lib/tool-belts";
 // the conversation enters work, creative, travel or business territory. This
 // keeps every ordinary voice turn from reconsidering ~70 JSON schemas.
 export async function GET(req: NextRequest) {
+  const actor = await controlActor(req);
+  if (!actor) return Response.json({ error: "unauthorized" }, { status: 401 });
+  // Definitions describe owner-only capabilities (including consequential
+  // actions). Guests use the isolated chat lane and must not receive that
+  // capability catalogue merely by opening the conversation surface.
+  if (!isOwnerActor(actor)) return Response.json({ error: "owner enrollment required" }, { status: 403 });
   const live = new URL(req.url).searchParams.get("live");
   if (live) {
     const belt = TOOL_BELTS[live === "1" ? "core" : live] ?? TOOL_BELTS.core;
