@@ -16,7 +16,7 @@ type LoaderWindow = {
   JARVIS: JarvisApi;
   SpeechRecognition: unknown;
   addEventListener: (name: string, listener: LoaderListener) => void;
-  dispatchEvent: (event: unknown) => void;
+  dispatchEvent: ReturnType<typeof vi.fn>;
   getSelection: () => string;
   history: { state: null };
   location: { href: string; origin: string; assign: ReturnType<typeof vi.fn> };
@@ -45,7 +45,7 @@ type FakeElement = {
   type?: string;
 };
 
-function createLoader(options: { denyFirstRecognition?: boolean } = {}) {
+function createLoader(options: { denyFirstRecognition?: boolean; hostNodes?: unknown[]; hostById?: Record<string, unknown> } = {}) {
   const messages: unknown[] = [];
   const listeners = new Map<string, LoaderListener[]>();
   const frameWindow = { postMessage: vi.fn((message: unknown) => messages.push(message)) };
@@ -63,7 +63,7 @@ function createLoader(options: { denyFirstRecognition?: boolean } = {}) {
       isConnected: false,
       remove: vi.fn(),
       setAttribute: vi.fn((name: string, value: string) => { attributes[name] = value; }),
-      style: {},
+      style: {} as Record<string, string>,
     } as FakeElement;
     return element;
   };
@@ -88,8 +88,9 @@ function createLoader(options: { denyFirstRecognition?: boolean } = {}) {
       createdElements.push(node);
       return node;
     }),
+    getElementById: vi.fn((id: string) => options.hostById?.[id] ?? null),
     querySelector: vi.fn(() => null),
-    querySelectorAll: vi.fn(() => []),
+    querySelectorAll: vi.fn(() => options.hostNodes ?? []),
     addEventListener: vi.fn((name: string, listener: LoaderListener) => {
       listeners.set(name, [...(listeners.get(name) ?? []), listener]);
     }),
@@ -138,7 +139,10 @@ function createLoader(options: { denyFirstRecognition?: boolean } = {}) {
     addEventListener: vi.fn((name: string, listener: LoaderListener) => {
       listeners.set(name, [...(listeners.get(name) ?? []), listener]);
     }),
-    dispatchEvent: vi.fn(),
+    dispatchEvent: vi.fn((event: { type?: string }) => {
+      for (const listener of listeners.get(event?.type ?? "") ?? []) listener(event);
+      return true;
+    }),
     getSelection: () => "",
     history: { state: null },
     location: {
@@ -150,7 +154,12 @@ function createLoader(options: { denyFirstRecognition?: boolean } = {}) {
   } as unknown as LoaderWindow;
   windowObject.window = windowObject;
   const context = {
-    CustomEvent: class { constructor(public type: string, public init: unknown) {} },
+    CustomEvent: class {
+      detail: unknown;
+      constructor(public type: string, init: { detail?: unknown }) {
+        this.detail = init?.detail;
+      }
+    },
     URL,
     clearTimeout,
     document,
@@ -183,6 +192,7 @@ describe("Project Hub Jarvis loader", () => {
     controls?.children[1].onclick?.();
     const editCard = harness.createdElements.find((element) => element.dataset.jarvisEditUi === "card");
     expect(editCard?.style.cssText).toContain("bottom:72px");
+    expect(controls?.children[1].attributes["aria-pressed"]).toBe("true");
   });
 
   it("captures the wake word in the top-level page and forwards the command", () => {
@@ -220,6 +230,264 @@ describe("Project Hub Jarvis loader", () => {
         elements: [],
       }),
     });
+  });
+
+  it("keeps password and payment controls out of the host-context contract", () => {
+    const secret = {
+      tagName: "INPUT",
+      type: "password",
+      name: "payment_card_number",
+      id: "checkout-card",
+      dataset: {},
+      closest: () => null,
+      getAttribute: (name: string) => name === "name" ? "payment_card_number" : null,
+    };
+    const harness = createLoader({ hostNodes: [secret] });
+    harness.listeners.get("message")?.[0]?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "ready" },
+    });
+
+    const contextMessage = harness.messages.find((message: any) => message?.jarvis === "host-context") as any;
+    expect(contextMessage.context.elements).toEqual([]);
+    expect(contextMessage.context.text).toBe("");
+    expect(loaderSource).not.toContain("document.body ? document.body.innerText");
+    expect(loaderSource).toContain("function isSensitiveElement(element)");
+    expect(loaderSource).toContain("tab to it and press Enter");
+  });
+
+  it("rejects sensitive exact targets and their ancestors before any host-local or generic action path", async () => {
+    const paymentForm = {
+      tagName: "FORM",
+      dataset: {},
+      getAttribute: (name: string) => name === "aria-label" ? "Bank payment" : null,
+      parentElement: null,
+    };
+    const submit = {
+      tagName: "BUTTON",
+      id: "billing-submit",
+      dataset: {},
+      click: vi.fn(),
+      style: {} as Record<string, string>,
+      closest: () => null,
+      getAttribute: () => null,
+      parentElement: paymentForm,
+    };
+    const harness = createLoader({ hostById: { "billing-submit": submit } });
+    const receive = harness.listeners.get("message")?.[0];
+    const localHandler = vi.fn((event: any) => {
+      event.detail.handled = true;
+      event.detail.result = { ok: true, detail: "This must never run." };
+    });
+    harness.listeners.set("jarvis:host-action", [localHandler]);
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "ready" } });
+    const hostContext = harness.messages.find((message: any) => message?.jarvis === "host-context") as any;
+    harness.window.dispatchEvent.mockClear();
+
+    for (const action of ["focus", "activate", "show_widget"]) {
+      receive?.({
+        origin: JARVIS_ORIGIN,
+        source: harness.frameWindow,
+        data: {
+          jarvis: "host-action",
+          action: {
+            id: `private-${action}`,
+            action,
+            target: "billing-submit",
+            hostId: hostContext.context.hostId,
+            expectedUrl: "https://project-hub.test/dashboard?view=work#today",
+          },
+        },
+      });
+    }
+    await Promise.resolve();
+
+    for (const action of ["focus", "activate", "show_widget"]) {
+      expect(harness.messages).toContainEqual({
+        jarvis: "host-action-result",
+        id: `private-${action}`,
+        ok: false,
+        detail: "I cannot act on that private control.",
+      });
+    }
+    expect(submit.click).not.toHaveBeenCalled();
+    expect(localHandler).not.toHaveBeenCalled();
+    expect(harness.window.dispatchEvent).not.toHaveBeenCalled();
+    expect(submit.style.outline).toBeUndefined();
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: {
+        jarvis: "host-action",
+        action: {
+          id: "private-edit",
+          action: "edit",
+          instruction: "edit this payment button",
+          expectedUrl: "https://project-hub.test/dashboard?view=work#today",
+        },
+      },
+    });
+    const preventDefault = vi.fn();
+    harness.listeners.get("click")?.[0]?.({
+      target: submit,
+      preventDefault,
+      stopPropagation: vi.fn(),
+      stopImmediatePropagation: vi.fn(),
+    });
+    await Promise.resolve();
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(harness.messages).not.toContainEqual(expect.objectContaining({ jarvis: "host-command" }));
+  });
+
+  it("lets a host synchronously restore an allowlisted missing widget without opening generic target paths", async () => {
+    const harness = createLoader();
+    const receive = harness.listeners.get("message")?.[0];
+    const restored = vi.fn();
+    harness.listeners.set("jarvis:host-action", [(event: any) => {
+      if (event.detail.action.action !== "show_widget" || event.detail.action.target !== "wealth") return;
+      restored();
+      event.detail.handled = true;
+      event.detail.result = { ok: true, detail: "Wealth restored." };
+    }]);
+
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "ready" } });
+    const hostContext = harness.messages.find((message: any) => message?.jarvis === "host-context") as any;
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: {
+        jarvis: "host-action",
+        action: {
+          id: "restore-wealth",
+          action: "show_widget",
+          target: "wealth",
+          hostId: hostContext.context.hostId,
+          expectedUrl: "https://project-hub.test/dashboard?view=work#today",
+        },
+      },
+    });
+    await Promise.resolve();
+
+    expect(restored).toHaveBeenCalledOnce();
+    expect(harness.messages).toContainEqual({
+      jarvis: "host-action-result",
+      id: "restore-wealth",
+      ok: true,
+      detail: "Wealth restored.",
+    });
+  });
+
+  it("does not offer the missing-target extension to focus, activate, or sensitive widget names", async () => {
+    const harness = createLoader();
+    const receive = harness.listeners.get("message")?.[0];
+    const localHandler = vi.fn((event: any) => {
+      event.detail.handled = true;
+    });
+    harness.listeners.set("jarvis:host-action", [localHandler]);
+
+    for (const [id, action, target] of [
+      ["missing-focus", "focus", "wealth"],
+      ["missing-activate", "activate", "wealth"],
+      ["missing-payment", "show_widget", "payment_card"],
+    ]) {
+      receive?.({
+        origin: JARVIS_ORIGIN,
+        source: harness.frameWindow,
+        data: { jarvis: "host-action", action: { id, action, target, expectedUrl: "https://project-hub.test/dashboard?view=work#today" } },
+      });
+    }
+    await Promise.resolve();
+
+    expect(localHandler).not.toHaveBeenCalled();
+    expect(harness.messages).toContainEqual({ jarvis: "host-action-result", id: "missing-focus", ok: false, detail: "I could not find that control on this page." });
+    expect(harness.messages).toContainEqual({ jarvis: "host-action-result", id: "missing-activate", ok: false, detail: "I could not find that control on this page." });
+    expect(harness.messages).toContainEqual({ jarvis: "host-action-result", id: "missing-payment", ok: false, detail: "I could not find that control on this page." });
+  });
+
+  it("requires a synchronous local acknowledgement for a missing allowlisted widget", async () => {
+    const harness = createLoader();
+    const receive = harness.listeners.get("message")?.[0];
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "ready" } });
+    const hostContext = harness.messages.find((message: any) => message?.jarvis === "host-context") as any;
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: {
+        jarvis: "host-action",
+        action: {
+          id: "unhandled-wealth",
+          action: "show_widget",
+          target: "wealth",
+          hostId: hostContext.context.hostId,
+          expectedUrl: "https://project-hub.test/dashboard?view=work#today",
+        },
+      },
+    });
+    await Promise.resolve();
+
+    expect(harness.messages).toContainEqual({
+      jarvis: "host-action-result",
+      id: "unhandled-wealth",
+      ok: false,
+      detail: "I could not find that control on this page.",
+    });
+  });
+
+  it("fails closed for an exact id nested deeply inside a hidden private region", async () => {
+    let ancestor: any = {
+      tagName: "SECTION",
+      hidden: true,
+      dataset: {},
+      getAttribute: () => null,
+      parentElement: null,
+    };
+    // A fixed shallow traversal would make this control reachable after a
+    // host adds ordinary layout wrappers around a private checkout section.
+    for (let index = 0; index < 20; index++) {
+      ancestor = {
+        tagName: "DIV",
+        dataset: {},
+        getAttribute: () => null,
+        parentElement: ancestor,
+      };
+    }
+    const privateButton = {
+      tagName: "BUTTON",
+      id: "deep-private-action",
+      dataset: {},
+      click: vi.fn(),
+      getAttribute: () => null,
+      parentElement: ancestor,
+    };
+    const harness = createLoader({ hostById: { "deep-private-action": privateButton } });
+    const receive = harness.listeners.get("message")?.[0];
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: {
+        jarvis: "host-action",
+        action: {
+          id: "deep-private-focus",
+          action: "focus",
+          target: "deep-private-action",
+          expectedUrl: "https://project-hub.test/dashboard?view=work#today",
+        },
+      },
+    });
+    await Promise.resolve();
+
+    expect(harness.messages).toContainEqual({
+      jarvis: "host-action-result",
+      id: "deep-private-focus",
+      ok: false,
+      detail: "I cannot act on that private control.",
+    });
+    expect(privateButton.click).not.toHaveBeenCalled();
   });
 
   it("executes an app navigation, acknowledges it, and supports interruption", async () => {

@@ -719,29 +719,67 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     if (!complete) {
       throw new CloudWorkspaceError(this.name, "provider_unavailable", "Vercel Sandbox history paginator ended before its advertised terminal page", "deferred");
     }
-    const sandbox = await Sandbox.create({
-      ...this.credentials(),
-      name: vercelWorkspaceName(input.attemptKey),
-      runtime: "node22",
-      // Deliberately no source, ports, or authority-shaped environment.
-      env: {}, ports: [], networkPolicy: "deny-all", resources: { vcpus: 2 },
-      timeout: Math.min(input.limits.ttlMs, VERCEL_SAFE_TTL_MS),
-      persistent: false,
-      tags: {
-        owner: "jarvis",
-        attempt: createHash("sha256").update(input.attemptKey).digest("hex").slice(0, 32),
+    // Creation is an ambiguous provider boundary: the request can commit
+    // remotely before its response is lost. Retain this one-use random name
+    // before crossing that boundary so a rejection can be reconciled without
+    // creating, resuming, or deleting any other sandbox.
+    const name = vercelWorkspaceName(input.attemptKey);
+    let sandbox: VercelSandbox;
+    try {
+      sandbox = await Sandbox.create({
+        ...this.credentials(),
+        name,
         runtime: "node22",
-      },
-    });
-    const session = sandbox.currentSession();
-    if (session.status !== "running" || sandbox.routes.length || sandbox.runtime !== "node22" || sandbox.vcpus !== 2 || sandbox.memory !== 4096
-      || sandbox.networkPolicy !== "deny-all" || session.networkPolicy !== "deny-all") {
-      try { await sandbox.delete(); }
-      catch { throw new CloudWorkspaceError(this.name, "cleanup_blocked", "could not delete the exact misconfigured sandbox attempt", "blocked"); }
+        // Deliberately no source, ports, or authority-shaped environment.
+        env: {}, ports: [], networkPolicy: "deny-all", resources: { vcpus: 2 },
+        timeout: Math.min(input.limits.ttlMs, VERCEL_SAFE_TTL_MS),
+        persistent: false,
+        tags: {
+          owner: "jarvis",
+          attempt: createHash("sha256").update(input.attemptKey).digest("hex").slice(0, 32),
+          runtime: "node22",
+        },
+      });
+    } catch (error) {
+      try { await this.deleteExactSandbox(name); }
+      catch { throw this.cleanupBlocked(name, "could not prove cleanup after ambiguous sandbox creation"); }
+      throw error;
+    }
+    let returnedName: string;
+    try { returnedName = sandbox.name; }
+    catch {
+      try { await this.deleteExactSandbox(name); }
+      catch { throw this.cleanupBlocked(name, "could not reconcile a malformed sandbox creation response"); }
+      throw new CloudWorkspaceError(this.name, "provider_unavailable", "Vercel Sandbox creation returned a malformed identity", "blocked");
+    }
+    if (returnedName !== name) {
+      try { await this.deleteExactSandbox(name); }
+      catch { throw this.cleanupBlocked(name, "could not reconcile the exact requested sandbox after an unowned identity response"); }
+      throw this.cleanupBlocked(name, "sandbox creation returned an unowned identity");
+    }
+    let session: VercelSession;
+    let configurationMatches: boolean;
+    try {
+      session = sandbox.currentSession();
+      configurationMatches = session.status === "running" && sandbox.routes.length === 0 && sandbox.runtime === "node22" && sandbox.vcpus === 2 && sandbox.memory === 4096
+        && sandbox.networkPolicy === "deny-all" && session.networkPolicy === "deny-all";
+    } catch {
+      try { await this.deleteExactSandbox(name, sandbox); }
+      catch { throw this.cleanupBlocked(name, "could not delete the exact sandbox after a malformed creation response"); }
+      throw new CloudWorkspaceError(this.name, "provider_unavailable", "Vercel Sandbox creation returned malformed configuration", "blocked");
+    }
+    if (!configurationMatches) {
+      try { await this.deleteExactSandbox(name, sandbox); }
+      catch { throw this.cleanupBlocked(name, "could not delete the exact misconfigured sandbox attempt"); }
       throw new CloudWorkspaceError(this.name, "provider_unavailable", "Vercel Sandbox creation did not preserve private bounded deny-all configuration", "blocked");
     }
     const workspace = { provider: this.name, providerWorkspaceId: sandbox.name, providerSessionId: session.sessionId, root: this.workspaceRoot, createdAt: Date.now() } satisfies CloudWorkspace;
-    assertWorkspaceIdentity(workspace);
+    try { assertWorkspaceIdentity(workspace); }
+    catch {
+      try { await this.deleteExactSandbox(name, sandbox); }
+      catch { throw this.cleanupBlocked(name, "could not delete the exact sandbox after invalid identity binding"); }
+      throw new CloudWorkspaceError(this.name, "provider_unavailable", "Vercel Sandbox creation returned invalid identity metadata", "blocked");
+    }
     return workspace;
   }
 
@@ -897,27 +935,49 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     // deliberately does not read or resume a session, so a stopped/replaced
     // session cannot make cleanup start compute or skip deletion.
     this.pathsFor(workspace);
-    try {
-      const sandbox = await this.get(workspace);
-      // Cleanup owns only the random attempt name. It must never start a
-      // session, and a substituted/stopped session cannot block deletion.
-      await sandbox.delete();
-    } catch (error) {
-      if ((error instanceof CloudWorkspaceError && error.code === "stale_attempt") || this.absent(error)) return;
-      throw error;
-    } finally { /* deletion is name-scoped; no session cache is retained */ }
+    try { await this.deleteExactSandbox(workspace.providerWorkspaceId); }
+    catch { throw this.cleanupBlocked(workspace.providerWorkspaceId, "could not prove exact sandbox deletion"); }
   }
 
-  private absent(error: unknown): boolean { return /(?:not[_ -]?found|404|already deleted)/i.test(String(error)); }
   protected override async cleanupOrBlock(workspace: CloudWorkspace, original: unknown, message: string): Promise<never> {
     try { await this.terminate(workspace, "terminal"); }
-    catch { throw new CloudWorkspaceError(this.name, "cleanup_blocked", message, "blocked"); }
+    catch { throw this.cleanupBlocked(workspace.providerWorkspaceId, message); }
     throw original;
+  }
+  private cleanupBlocked(name: string, message: string): CloudWorkspaceError {
+    return new CloudWorkspaceError(this.name, "cleanup_blocked", `${message}: ${name}`, "blocked");
+  }
+  private exactNameNotFound(
+    error: unknown,
+    name: string,
+    APIError: typeof import("@vercel/sandbox")["APIError"],
+  ): boolean {
+    return error instanceof APIError
+      && error.response instanceof Response
+      && error.response.status === 404
+      && error.sandboxName === name;
+  }
+  private async deleteExactSandbox(name: string, known?: VercelSandbox): Promise<void> {
+    const { APIError, Sandbox } = await import("@vercel/sandbox");
+    let sandbox = known;
+    if (!sandbox) {
+      try { sandbox = await Sandbox.get({ ...this.credentials(), name, resume: false }); }
+      catch (error) {
+        if (this.exactNameNotFound(error, name, APIError)) return;
+        throw error;
+      }
+    }
+    if (sandbox.name !== name) throw new Error("Vercel Sandbox lookup returned a different identity");
+    try { await sandbox.delete(); }
+    catch (error) {
+      if (this.exactNameNotFound(error, name, APIError)) return;
+      throw error;
+    }
   }
   private async get(workspace: CloudWorkspace): Promise<VercelSandbox> {
     assertWorkspaceIdentity(workspace);
     this.pathsFor(workspace);
-    const { Sandbox } = await import("@vercel/sandbox");
+    const { APIError, Sandbox } = await import("@vercel/sandbox");
     // Never trust a stale SDK object here. This is a control-plane read with
     // resume:false, followed by a fence on its freshly observed Session.
     try {
@@ -926,7 +986,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       // A missing named attempt is not an invitation to create or resume one.
       // Classify it exactly like a stopped or substituted session before any
       // data-plane action can be attempted.
-      if (this.absent(error)) {
+      if (this.exactNameNotFound(error, workspace.providerWorkspaceId, APIError)) {
         throw new CloudWorkspaceError(this.name, "stale_attempt", "Vercel Sandbox attempt is missing for this session fence", "deferred");
       }
       throw error;
@@ -1060,7 +1120,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
         // kill/observe chain so it cannot become an unobserved remote process.
         void creating.then(async (late) => {
           const lateWait = late.wait();
-          try { await late.kill("SIGKILL"); await lateWait; } catch { /* exact attempt was already deleted above */ }
+          try { await late.kill("SIGKILL"); await lateWait; } catch { /* exact attempt deletion was proved above */ }
         }).catch(() => undefined);
         if (reason === "timeout") {
           throw new CloudWorkspaceError(this.name, "timeout", "sandbox command timed out while creation was in flight", "deferred");

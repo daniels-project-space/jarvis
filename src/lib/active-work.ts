@@ -1,3 +1,10 @@
+import {
+  isWorkControlAction,
+  workControlLabel,
+  workControlPendingLabel,
+  type WorkControlAction,
+} from "./work-control-language";
+
 export type FleetNodeState =
   | "queued"
   | "dependency_held"
@@ -10,7 +17,20 @@ export type FleetNodeState =
   | "blocked"
   | "needs_input";
 
-export type FleetControl = "pause" | "resume" | "cancel" | "steer" | "approve" | "decline";
+export type FleetControl = WorkControlAction | "approve" | "decline";
+
+const DECISION_CONTROL_LANGUAGE = {
+  approve: { label: "approve", pendingLabel: "approving…" },
+  decline: { label: "decline", pendingLabel: "declining…" },
+} satisfies Record<Exclude<FleetControl, WorkControlAction>, { label: string; pendingLabel: string }>;
+
+export function fleetControlLabel(action: FleetControl): string {
+  return isWorkControlAction(action) ? workControlLabel(action) : DECISION_CONTROL_LANGUAGE[action].label;
+}
+
+export function fleetControlPendingLabel(action: FleetControl): string {
+  return isWorkControlAction(action) ? workControlPendingLabel(action) : DECISION_CONTROL_LANGUAGE[action].pendingLabel;
+}
 
 export type CompactWorkItem = {
   id: string;

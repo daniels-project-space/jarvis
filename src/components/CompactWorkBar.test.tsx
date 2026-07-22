@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import type { CompactWorkSnapshot, FleetNode } from "../lib/active-work";
+import { fleetControlLabel, fleetControlPendingLabel, type CompactWorkSnapshot, type FleetControl, type FleetNode } from "../lib/active-work";
 import { FleetCommandCenter, FleetDag, fleetDagLayout, fleetNodeStateLabel } from "./CompactWorkBar";
 
 const node = (overrides: Partial<FleetNode> = {}): FleetNode => ({
@@ -25,6 +25,14 @@ const work: CompactWorkSnapshot = {
 };
 
 describe("FleetCommandCenter", () => {
+  it("uses exhaustive valid wording for every compact control", () => {
+    const controls: FleetControl[] = ["pause", "resume", "cancel", "retry", "steer", "approve", "decline"];
+    expect(Object.fromEntries(controls.map((control) => [control, [fleetControlLabel(control), fleetControlPendingLabel(control)]]))).toEqual({
+      pause: ["pause", "pausing…"], resume: ["resume", "resuming…"], cancel: ["cancel", "cancelling…"],
+      retry: ["retry", "retrying…"], steer: ["steer", "steering…"], approve: ["approve", "approving…"], decline: ["decline", "declining…"],
+    });
+  });
+
   it("renders nothing for an empty or hidden result", () => {
     expect(renderToStaticMarkup(<FleetCommandCenter snapshot={{ active: null, fleet: null }} />)).toBe("");
     expect(renderToStaticMarkup(<FleetCommandCenter snapshot={work} hidden />)).toBe("");

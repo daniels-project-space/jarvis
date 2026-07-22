@@ -53,6 +53,67 @@ body {
   overflow-x: hidden;
 }
 
+/* A kept-visible workspace gives the particle core its own intentional mobile
+   berth. The panel reserves the same footprint, so the core, work surface and
+   bottom composer never compete for the last few touch targets. */
+.jarvis-compact-orb-zone {
+  bottom: 12px;
+  height: 152px;
+  left: auto;
+  right: 12px;
+  top: auto;
+  width: 152px;
+}
+
+.jarvis-mobile-orb-safe-panel {
+  /* 152px core + 12px edge + 20px visual/touch clearance. */
+  bottom: 184px;
+}
+
+/* Full workspaces keep the same dedicated berth on phones. The 268px reserve
+   covers the stage-relative 152px core, its ring/touch clearance and the
+   composer; Saved Work therefore grows up to the berth instead of under it. */
+.jarvis-full-orb-safe-workspace {
+  bottom: 268px;
+}
+
+@media (max-height: 700px) and (max-width: 767px) {
+  .jarvis-compact-orb-zone {
+    bottom: 8px;
+    height: 136px;
+    right: 8px;
+    width: 136px;
+  }
+
+  .jarvis-mobile-orb-safe-panel {
+    /* 136px compact core + 8px edge + 20px clearance. */
+    bottom: 164px;
+  }
+
+  .jarvis-full-orb-safe-workspace {
+    bottom: 220px;
+  }
+}
+
+@media (min-width: 768px) {
+  .jarvis-compact-orb-zone {
+    bottom: auto;
+    height: 100%;
+    inset: 0;
+    right: auto;
+    width: 100%;
+  }
+
+  .jarvis-mobile-orb-safe-panel {
+    bottom: 64px;
+  }
+
+  /* Desktop deliberately ends before the permanent right-side orb. */
+  .jarvis-full-orb-safe-workspace {
+    bottom: 0;
+  }
+}
+
 /* faint instrument grid behind everything */
 .hud-grid {
   background-image:
@@ -176,9 +237,10 @@ body {
   box-shadow: 0 8px 26px rgba(0, 0, 0, 0.45);
 }
 
-.scrollbar-thin::-webkit-scrollbar { width: 4px; }
-.scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(0, 255, 136, 0.2); border-radius: 4px; }
-.scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+.scrollbar-thin { scrollbar-width: thin; scrollbar-color: rgba(0, 255, 136, 0.42) rgba(0, 255, 136, 0.05); }
+.scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+.scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(0, 255, 136, 0.42); border: 1px solid rgba(5, 7, 13, 0.8); border-radius: 999px; }
+.scrollbar-thin::-webkit-scrollbar-track { background: rgba(0, 255, 136, 0.05); border-radius: 999px; }
 
 /* Phones: iOS zooms the whole page toward any input under 16px — that zoom is
    the "camera dragging off to the side" when sending. 16px kills it. Also make

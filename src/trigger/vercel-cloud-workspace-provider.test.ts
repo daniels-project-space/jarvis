@@ -11,9 +11,10 @@ type CommandOutcome = { exitCode: number; logs: Log[] };
 const observed: {
   create?: Record<string, unknown>; get?: Record<string, unknown>; commands: Record<string, unknown>[];
   deletes: string[]; updates: unknown[]; updateSessions: string[]; kills: string[]; waits: string[]; logConsumers: string[]; logsClosed: number; files: Map<string, Buffer>; mkdirs: string[]; reads: string[]; readSessions: string[]; writeSessions: string[];
-  logs: Log[]; createGate?: Promise<void>; waitGate?: Promise<void>; releaseWaitOnKill?: () => void; logCloseGate?: Promise<void>; waitFailure?: unknown; fenceWaitFailure?: unknown; deleteFailure?: unknown;
+  logs: Log[]; createGate?: Promise<void>; waitGate?: Promise<void>; releaseWaitOnKill?: () => void; logCloseGate?: Promise<void>; waitFailure?: unknown; fenceWaitFailure?: unknown;
+  createFailure?: unknown; createReturnedName?: string; getFailure?: unknown | ((input: Record<string, unknown>) => unknown); getReturnedName?: string; deleteFailure?: unknown | ((name: string) => unknown); createdRoutes?: unknown[]; currentSessionFailure?: unknown;
   exitCode: number; commandExit?: (input: Record<string, unknown>) => number; commandExecutor?: (input: Record<string, unknown>) => CommandOutcome | undefined;
-  updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; runCommandHook?: (input: Record<string, unknown>, session: FakeSession) => void; getFailure?: unknown;
+  updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; runCommandHook?: (input: Record<string, unknown>, session: FakeSession) => void;
   listed: Array<{ status: string }>; listedPages?: Array<Array<{ status: string }>>; listedPageNext?: Array<string | null>; listInputs: Record<string, unknown>[];
 } = { commands: [], deletes: [], updates: [], updateSessions: [], kills: [], waits: [], logConsumers: [], logsClosed: 0, files: new Map(), mkdirs: [], reads: [], readSessions: [], writeSessions: [], logs: [], exitCode: 0, listed: [], listInputs: [] };
 
@@ -76,24 +77,34 @@ class FakeSandbox {
       [Symbol.asyncIterator]: async function* () { for (const page of materialized) yield* page.sandboxes; },
     });
   }
-  static async create(input: Record<string, unknown>) { observed.create = input; return new FakeSandbox(`jarvis-${"a".repeat(40)}`); }
+  static async create(input: Record<string, unknown>) {
+    observed.create = input;
+    if (observed.createFailure) throw observed.createFailure;
+    return new FakeSandbox(observed.createReturnedName ?? String(input.name));
+  }
   static async get(input: Record<string, unknown>) {
     observed.get = input;
-    if (observed.getFailure) throw observed.getFailure;
-    return new FakeSandbox(String(input.name));
+    if (observed.getFailure) throw typeof observed.getFailure === "function" ? observed.getFailure(input) : observed.getFailure;
+    return new FakeSandbox(observed.getReturnedName ?? String(input.name));
   }
-  readonly routes: unknown[] = [];
+  get routes(): unknown[] { return observed.createdRoutes ?? []; }
   readonly runtime = "node22";
   readonly vcpus = 2;
   readonly memory = 4096;
   get networkPolicy() { return FakeSandbox.current.networkPolicy; }
   private readonly snapshot = FakeSandbox.current;
   constructor(readonly name: string) {}
-  currentSession() { return this.snapshot; }
-  async delete() { observed.deletes.push(this.name); if (observed.deleteFailure) throw observed.deleteFailure; }
+  currentSession() { if (observed.currentSessionFailure) throw observed.currentSessionFailure; return this.snapshot; }
+  async delete() {
+    observed.deletes.push(this.name);
+    if (observed.deleteFailure) throw typeof observed.deleteFailure === "function" ? observed.deleteFailure(this.name) : observed.deleteFailure;
+  }
 }
 
-vi.mock("@vercel/sandbox", () => ({ Sandbox: FakeSandbox }));
+vi.mock("@vercel/sandbox", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@vercel/sandbox")>(),
+  Sandbox: FakeSandbox,
+}));
 
 async function providerAndWorkspace() {
   const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
@@ -101,6 +112,11 @@ async function providerAndWorkspace() {
   const workspace = await provider.createWorkspace({ attemptKey: "job:1", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS });
   return { provider, workspace };
 }
+
+const createInput = (attemptKey: string) => ({
+  attemptKey, template: "node22", runtime: "node-22",
+  lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS,
+});
 
 /** Execute only the exact generated listing program on the host's temporary
  * directory. The surrounding Session is still fake, but its listing exit code
@@ -124,14 +140,15 @@ function executeExactListingProgram(input: Record<string, unknown>): CommandOutc
 
 beforeEach(() => {
   observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.updateSessions = []; observed.kills = []; observed.waits = []; observed.logConsumers = []; observed.logsClosed = 0;
-  observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.readSessions = []; observed.writeSessions = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.releaseWaitOnKill = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.fenceWaitFailure = undefined; observed.deleteFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
-  observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.runCommandHook = undefined; observed.commandExecutor = undefined; observed.getFailure = undefined; observed.listed = []; observed.listedPages = undefined; observed.listedPageNext = undefined; observed.listInputs = []; FakeSandbox.current = new FakeSession();
+  observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.readSessions = []; observed.writeSessions = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.releaseWaitOnKill = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.fenceWaitFailure = undefined; observed.createFailure = undefined; observed.createReturnedName = undefined; observed.getFailure = undefined; observed.getReturnedName = undefined; observed.deleteFailure = undefined; observed.createdRoutes = undefined; observed.currentSessionFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
+  observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.runCommandHook = undefined; observed.commandExecutor = undefined; observed.listed = []; observed.listedPages = undefined; observed.listedPageNext = undefined; observed.listInputs = []; FakeSandbox.current = new FakeSession();
 });
 
 describe("VercelCloudWorkspaceProvider", () => {
   it("uses explicit control-plane credentials and a private node22 deny-all session", async () => {
     const { provider, workspace } = await providerAndWorkspace();
-    expect(workspace).toMatchObject({ providerWorkspaceId: `jarvis-${"a".repeat(40)}`, providerSessionId: "vercel-session-a" });
+    expect(workspace.providerWorkspaceId).toMatch(/^jarvis-[0-9a-f]{40}$/);
+    expect(workspace.providerSessionId).toBe("vercel-session-a");
     expect(observed.create).toMatchObject({ token: "controller-token", teamId: "team_1", projectId: "prj_1", runtime: "node22", env: {}, ports: [], networkPolicy: "deny-all", resources: { vcpus: 2 }, persistent: false });
     expect((observed.create?.timeout as number) <= 44 * 60_000).toBe(true);
     await provider.terminate(workspace);
@@ -168,12 +185,194 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.reads).toEqual([]);
   });
 
-  it("treats a missing named session as stale without a data-plane call", async () => {
+  it("treats only an SDK exact-name HTTP 404 from get as absence", async () => {
     const { provider, workspace } = await providerAndWorkspace();
-    observed.getFailure = new Error("404 not found");
+    const { APIError } = await import("@vercel/sandbox");
+    observed.getFailure = (input: Record<string, unknown>) => new APIError(new Response("{}", { status: 404 }), { sandboxName: String(input.name) });
     await expect(provider.exec(workspace, { command: "true", timeoutMs: 1_000, maxOutputBytes: 1_000 })).rejects.toMatchObject({ code: "stale_attempt" });
     expect(observed.commands).toEqual([]);
     await expect(provider.terminate(workspace)).resolves.toBeUndefined();
+  });
+
+  it("never normalizes wrong-name, textual, malformed, non-404, or network get failures to absence", async () => {
+    const { APIError } = await import("@vercel/sandbox");
+    const cases: Array<[string, (name: string) => unknown]> = [
+      ["wrong-name 404", () => new APIError(new Response("{}", { status: 404 }), { sandboxName: "jarvis-wrong-name" })],
+      ["generic 404 text", () => new Error("404 not found")],
+      ["authentication", (name) => new APIError(new Response("{}", { status: 401 }), { sandboxName: name })],
+      ["gone", (name) => new APIError(new Response("{}", { status: 410 }), { sandboxName: name })],
+      ["unprocessable", (name) => new APIError(new Response("{}", { status: 422 }), { sandboxName: name })],
+      ["malformed", (name) => ({ response: { status: 404 }, sandboxName: name })],
+      ["network", () => new TypeError("network failed")],
+    ];
+    for (const [label, failure] of cases) {
+      const { provider, workspace } = await providerAndWorkspace();
+      observed.getFailure = (input: Record<string, unknown>) => failure(String(input.name));
+      const readFailure = await provider.exec(workspace, { command: "true", timeoutMs: 1_000, maxOutputBytes: 1_000 }).catch((error) => error);
+      expect(readFailure, label).not.toMatchObject({ code: "stale_attempt" });
+      await expect(provider.terminate(workspace), label).rejects.toMatchObject({
+        code: "cleanup_blocked", disposition: "blocked", message: expect.stringContaining(workspace.providerWorkspaceId),
+      });
+    }
+  });
+
+  it("treats only an SDK exact-name HTTP 404 from delete as successful cleanup", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    const { APIError } = await import("@vercel/sandbox");
+    observed.deleteFailure = (name: string) => new APIError(new Response("{}", { status: 404 }), { sandboxName: name });
+    await expect(provider.terminate(workspace)).resolves.toBeUndefined();
+    expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
+  });
+
+  it("never normalizes wrong-name, textual, malformed, non-404, or network delete failures to absence", async () => {
+    const { APIError } = await import("@vercel/sandbox");
+    const cases: Array<[string, (name: string) => unknown]> = [
+      ["wrong-name 404", () => new APIError(new Response("{}", { status: 404 }), { sandboxName: "jarvis-wrong-name" })],
+      ["generic 404 text", () => new Error("404 already deleted")],
+      ["authentication", (name) => new APIError(new Response("{}", { status: 403 }), { sandboxName: name })],
+      ["gone", (name) => new APIError(new Response("{}", { status: 410 }), { sandboxName: name })],
+      ["unprocessable", (name) => new APIError(new Response("{}", { status: 422 }), { sandboxName: name })],
+      ["malformed", (name) => ({ response: { status: 404 }, sandboxName: name })],
+      ["network", () => new TypeError("network failed")],
+    ];
+    for (const [label, failure] of cases) {
+      const { provider, workspace } = await providerAndWorkspace();
+      observed.deleteFailure = (name: string) => failure(name);
+      await expect(provider.terminate(workspace), label).rejects.toMatchObject({
+        code: "cleanup_blocked", disposition: "blocked", message: expect.stringContaining(workspace.providerWorkspaceId),
+      });
+      observed.deleteFailure = undefined;
+    }
+  });
+
+  it("reconciles an ambiguous create rejection and proves exact absence without deletion", async () => {
+    const { APIError } = await import("@vercel/sandbox");
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    const original = new Error("create response was lost before remote creation");
+    observed.createFailure = original;
+    observed.getFailure = (input: Record<string, unknown>) => new APIError(new Response("{}", { status: 404 }), { sandboxName: String(input.name) });
+    await expect(provider.createWorkspace(createInput("create-before:1"))).rejects.toBe(original);
+    expect(observed.get).toMatchObject({ name: observed.create?.name, resume: false });
+    expect(observed.deletes).toEqual([]);
+  });
+
+  it("reconciles and exact-deletes a remotely committed sandbox after create rejects", async () => {
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    const original = new Error("create response was lost after remote creation");
+    observed.createFailure = original;
+    await expect(provider.createWorkspace(createInput("create-after:1"))).rejects.toBe(original);
+    expect(observed.get).toMatchObject({ name: observed.create?.name, resume: false });
+    expect(observed.deletes).toEqual([observed.create?.name]);
+  });
+
+  it("surfaces cleanup_blocked with the retained create name when reconciliation deletion fails", async () => {
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    observed.createFailure = new Error("ambiguous create");
+    observed.deleteFailure = new Error("delete refused");
+    const failure = await provider.createWorkspace(createInput("create-cleanup-failure:1")).catch((error) => error);
+    expect(failure).toMatchObject({ code: "cleanup_blocked", disposition: "blocked" });
+    expect(failure.message).toContain(String(observed.create?.name));
+  });
+
+  it("reconciles and exact-deletes only the retained requested name after create returns an unowned identity", async () => {
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    const wrongName = "jarvis-unowned-returned-name";
+    observed.createReturnedName = wrongName;
+    const failure = await provider.createWorkspace(createInput("wrong-returned-present:1")).catch((error) => error);
+    const expectedName = String(observed.create?.name);
+    expect(failure).toMatchObject({ code: "cleanup_blocked", disposition: "blocked" });
+    expect(failure.message).toContain(expectedName);
+    expect(observed.get).toMatchObject({ name: expectedName, resume: false });
+    expect(observed.deletes).toEqual([expectedName]);
+    expect(observed.deletes).not.toContain(wrongName);
+  });
+
+  it("keeps an unowned create response blocked after exact SDK proof that the requested name is absent", async () => {
+    const { APIError } = await import("@vercel/sandbox");
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    const wrongName = "jarvis-unowned-returned-name";
+    observed.createReturnedName = wrongName;
+    observed.getFailure = (input: Record<string, unknown>) => new APIError(new Response("{}", { status: 404 }), { sandboxName: String(input.name) });
+    const failure = await provider.createWorkspace(createInput("wrong-returned-absent:1")).catch((error) => error);
+    expect(failure).toMatchObject({ code: "cleanup_blocked", disposition: "blocked" });
+    expect(observed.get).toMatchObject({ name: observed.create?.name, resume: false });
+    expect(observed.deletes).toEqual([]);
+    expect(observed.deletes).not.toContain(wrongName);
+  });
+
+  it("keeps an unowned create response blocked when exact requested-name cleanup fails", async () => {
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    const wrongName = "jarvis-unowned-returned-name";
+    observed.createReturnedName = wrongName;
+    observed.deleteFailure = new Error("expected-name delete refused");
+    const failure = await provider.createWorkspace(createInput("wrong-returned-cleanup-failure:1")).catch((error) => error);
+    const expectedName = String(observed.create?.name);
+    expect(failure).toMatchObject({ code: "cleanup_blocked", disposition: "blocked" });
+    expect(failure.message).toContain(expectedName);
+    expect(observed.get).toMatchObject({ name: expectedName, resume: false });
+    expect(observed.deletes).toEqual([expectedName]);
+    expect(observed.deletes).not.toContain(wrongName);
+  });
+
+  it("never acts on either unowned identity when requested-name reconciliation returns a substituted object", async () => {
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    const wrongReturnedName = "jarvis-unowned-returned-name";
+    const wrongLookupName = "jarvis-unowned-lookup-name";
+    observed.createReturnedName = wrongReturnedName;
+    observed.getReturnedName = wrongLookupName;
+    const failure = await provider.createWorkspace(createInput("wrong-returned-substituted-get:1")).catch((error) => error);
+    expect(failure).toMatchObject({ code: "cleanup_blocked", disposition: "blocked" });
+    expect(observed.get).toMatchObject({ name: observed.create?.name, resume: false });
+    expect(observed.deletes).toEqual([]);
+    expect(observed.deletes).not.toContain(wrongReturnedName);
+    expect(observed.deletes).not.toContain(wrongLookupName);
+  });
+
+  it("blocks cleanup when create reconciliation receives wrong-name or malformed 404 errors", async () => {
+    const { APIError } = await import("@vercel/sandbox");
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const failures: Array<[string, (name: string) => unknown]> = [
+      ["wrong-name", () => new APIError(new Response("{}", { status: 404 }), { sandboxName: "jarvis-wrong-name" })],
+      ["malformed", (name) => ({ response: new Response("{}", { status: 404 }), sandboxName: name })],
+    ];
+    for (const [label, getFailure] of failures) {
+      const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+      observed.createFailure = new Error(`ambiguous create ${label}`);
+      observed.getFailure = (input: Record<string, unknown>) => getFailure(String(input.name));
+      const failure = await provider.createWorkspace(createInput(`create-${label}:1`)).catch((error) => error);
+      expect(failure, label).toMatchObject({ code: "cleanup_blocked", disposition: "blocked" });
+      expect(failure.message).toContain(String(observed.create?.name));
+      observed.getFailure = undefined;
+    }
+  });
+
+  it("uses exact-name 404 semantics while deleting a configuration-mismatched creation", async () => {
+    const { APIError } = await import("@vercel/sandbox");
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    observed.createdRoutes = [{}];
+    observed.deleteFailure = (name: string) => new APIError(new Response("{}", { status: 404 }), { sandboxName: name });
+    await expect(provider.createWorkspace(createInput("misconfigured-absent:1"))).rejects.toMatchObject({ code: "provider_unavailable" });
+
+    observed.deleteFailure = new Error("404 not found");
+    const blocked = await provider.createWorkspace(createInput("misconfigured-unproved:1")).catch((error) => error);
+    expect(blocked).toMatchObject({ code: "cleanup_blocked", disposition: "blocked" });
+    expect(blocked.message).toContain(String(observed.create?.name));
+  });
+
+  it("exact-deletes a remotely created sandbox when its creation response is malformed", async () => {
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    observed.currentSessionFailure = new Error("malformed session response");
+    await expect(provider.createWorkspace(createInput("malformed-response:1"))).rejects.toMatchObject({ code: "provider_unavailable" });
+    expect(observed.deletes).toEqual([observed.create?.name]);
   });
 
   it("re-fetches without resume after a session data-plane write and rejects a replacement", async () => {

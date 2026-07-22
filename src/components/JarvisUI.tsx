@@ -35,8 +35,9 @@ import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, ty
 import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate, shouldIgnoreHandsFreeTranscript } from "@/lib/transcript";
 import { completeSpeechPrefix, isSpeaking as isTtsActuallySpeaking, unlockSpeechPlayback } from "@/lib/tts";
+import { finalSpeechSuffix, retainCaption, type SpeechCaption } from "@/lib/speech-ownership";
 import { NarrationLedger, narrationClaim } from "@/lib/narration";
-import { resolvePanelRoute } from "@/lib/panel-contract";
+import { resolvePanelRoute, shouldHideOrbForPanel } from "@/lib/panel-contract";
 import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
 import { needsHostContext, visibleTurnText, withHostContext, type JarvisHostContext } from "@/lib/host-context";
 import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actions";
@@ -74,17 +75,13 @@ type Msg = {
   attachment?: Attachment;
   createdAt: number;
 };
-type Caption = {
-  who: "you" | "jarvis";
-  text: string;
-  phase?: "streaming" | "ready" | "speaking";
-  exiting?: boolean;
-} | null;
+type Caption = SpeechCaption;
 type StagePanel = { type: string; value: string; title?: string; updatedAt: number };
 type HostActionResult = { ok: boolean; detail?: string };
 type StreamingSpeechState = {
   id: string;
   queuedChars: number;
+  spokenPrefix: string;
   chain: Promise<void>;
   timer: ReturnType<typeof setTimeout> | null;
   pendingPrefix: string;
@@ -394,12 +391,14 @@ function ReactorRing({
   hidden,
   motionRef,
   reduceMotion,
+  compact = false,
 }: {
   active: boolean;
   aside: boolean;
   hidden: boolean;
   motionRef: { current: OrbMotionFrame };
   reduceMotion: boolean;
+  compact?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const ringRef = useRef<SVGGElement>(null);
@@ -447,7 +446,7 @@ function ReactorRing({
       className="pointer-events-none absolute inset-0 grid place-items-center will-change-transform"
       style={{ opacity, transform: `translateX(${initialVisual.translateXPercent}%) translateY(-4.5%) scale(${initialVisual.scale})` }}
     >
-      <svg viewBox="0 0 500 500" className="h-[min(82vmin,760px)] w-[min(82vmin,760px)]">
+      <svg viewBox="0 0 500 500" className={compact ? "h-full w-full md:h-[min(82vmin,760px)] md:w-[min(82vmin,760px)]" : "h-[min(82vmin,760px)] w-[min(82vmin,760px)]"}>
         <defs>
           <linearGradient id="jarvis-orb-gradient" x1="65" y1="65" x2="435" y2="435" gradientUnits="userSpaceOnUse">
             <stop ref={firstStopRef} offset="0" stopColor="#00ff88" />
@@ -1280,12 +1279,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     captionEpoch.current += 1;
     clearCaptionTimers();
     setCaption((current) => {
-      if (!c) return null;
       // Preserve one DOM surface while streamed text grows and when that same
       // text hands over to TTS. Replacing the keyed element per token was the
       // visible flash-to-transparent bug.
-      if (current?.who === c.who) return { ...current, ...c, phase: c.phase ?? "ready", exiting: false };
-      return { ...c, phase: c.phase ?? "ready", exiting: false };
+      return retainCaption(current, c);
     });
   };
   useEffect(() => () => clearCaptionTimers(), []);
@@ -1350,6 +1347,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const streamingSpeechRef = useRef<StreamingSpeechState>({
     id: "",
     queuedChars: 0,
+    spokenPrefix: "",
     chain: Promise.resolve(),
     timer: null,
     pendingPrefix: "",
@@ -1820,8 +1818,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       () => {
         setSpeaking(true);
         setCaption((current) => current?.who === "jarvis" && current.text.length >= captionText.length
-          ? { ...current, phase: "speaking", exiting: false }
-          : { who: "jarvis", text: captionText, phase: "speaking", exiting: false });
+          ? retainCaption(current, { ...current, phase: "speaking" })
+          : retainCaption(current, { who: "jarvis", text: captionText, phase: "speaking" }));
       },
       () => {
         setSpeaking(false);
@@ -1927,6 +1925,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       streamState = {
         id: latestAssistant._id,
         queuedChars: 0,
+        spokenPrefix: "",
         chain: Promise.resolve(),
         timer: null,
         pendingPrefix: "",
@@ -1952,6 +1951,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const speechChunk = prefix.slice(from).trim();
       current.pendingPrefix = "";
       current.queuedChars = prefix.length;
+      current.spokenPrefix = prefix;
       if (!speechChunk) return;
       current.chain = current.chain.then(async () => {
         if (streamingSpeechRef.current.id !== latestAssistant._id) return;
@@ -2001,8 +2001,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         streamed.pendingPrefix = "";
       }
       if (streamed) await streamed.chain;
-      const from = streamed?.queuedChars ?? 0;
-      const unsaidText = spokenText.slice(from).trim();
+      const streamedPrefix = streamed?.spokenPrefix ?? "";
+      const unsaidText = finalSpeechSuffix(spokenText, streamedPrefix);
+      const from = streamedPrefix && spokenText.startsWith(streamedPrefix) ? streamedPrefix.length : 0;
       if (!unsaidText) {
         setSpeaking(false);
         fadeCaption(spokenText, 1800);
@@ -2259,6 +2260,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     streamingSpeechRef.current = {
       id: "",
       queuedChars: 0,
+      spokenPrefix: "",
       chain: Promise.resolve(),
       timer: null,
       pendingPrefix: "",
@@ -2955,12 +2957,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // How the stage shares with an overlay:
   //  • compactAside — a sized widget (weather/shop/places/ranking/…): the panel
   //    takes the left, the orb SHRINKS INTO THE RIGHT CORNER (still visible).
-  //  • fullBleed — a page/video/full panel: it owns everything, orb+ring gone.
+  //  • fullBleed — only a route that explicitly opts out (video) owns the
+  //    cockpit. Expanding a kept-visible workspace never changes that contract.
   // A deliberately opened visual owns the stage even while durable work is
   // running. The compact work widget stays live underneath and returns when
   // the visual is folded/closed; it must never suppress boards or the library.
   const overlayUp = !!panel && !panelMin;
-  const fullBleed = overlayUp && (panelFull || !panelRoute?.keepOrbVisible);
+  const fullBleed = overlayUp && shouldHideOrbForPanel(panel);
   const compactAside = overlayUp && !fullBleed && panel!.type !== "video";
 
   if (embedded) {
@@ -3161,7 +3164,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             onSelectedJobChange={setWorkDetailJobId}
           />
           {panel && panel.type !== "video" && !panelMin && !panelFull ? (
-            <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-10 md:pr-[36%] lg:pl-16" : "justify-center"}`}>
+            <div data-jarvis-panel-surface className={`jarvis-mobile-orb-safe-panel absolute inset-x-0 top-0 z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-10 md:pr-[36%] lg:pl-16" : "justify-center"}`}>
               <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${stagePanelSize}`}>
                 <Viewport
                   panel={panel}
@@ -3173,22 +3176,23 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               </div>
             </div>
           ) : null}
-          {/* arc-reactor HUD ring + orb — for a compact overlay they glide into
-              the right corner (orb stays visible, small); a full-bleed panel
-              hides them entirely. On phones there's no room for a corner, so a
-              compact overlay hides them too (md:opacity-100 brings them back). */}
-          <ReactorRing
-            active={live === "live" || orbState === "thinking" || orbState === "listening"}
-            aside={compactAside || (commandExpanded && !overlayUp)}
-            hidden={fullBleed}
-            motionRef={orbMotionRef}
-            reduceMotion={prefs.reduceMotion}
-          />
+          {/* The reactor and particle core share one mounted surface and the
+              ThreeOrb-published motion frame. Kept-visible phone panels use a
+              deliberate 152px berth rather than hiding or duplicating either. */}
           <div
-            className={`h-full w-full transition-opacity duration-500 ${
-              fullBleed ? "pointer-events-none opacity-0" : compactAside || (commandExpanded && !overlayUp) ? "pointer-events-none opacity-0 md:opacity-100" : "opacity-100"
+            data-jarvis-orb-zone={compactAside ? "compact" : "stage"}
+            className={`absolute inset-0 transition-opacity duration-500 ${
+              fullBleed ? "pointer-events-none opacity-0" : compactAside ? `jarvis-compact-orb-zone pointer-events-none ${panelFull ? "z-[60]" : "z-30"} overflow-hidden rounded-full border border-cyan/25 bg-[#061019]/85 shadow-[0_0_34px_rgba(0,255,136,.18)] opacity-100 md:overflow-visible md:rounded-none md:border-0 md:bg-transparent md:shadow-none` : commandExpanded && !overlayUp ? "pointer-events-none opacity-0 md:opacity-100" : "opacity-100"
             }`}
           >
+            <ReactorRing
+              active={live === "live" || orbState === "thinking" || orbState === "listening"}
+              aside={compactAside || (commandExpanded && !overlayUp)}
+              hidden={fullBleed}
+              motionRef={orbMotionRef}
+              reduceMotion={prefs.reduceMotion}
+              compact={compactAside}
+            />
             <ThreeOrb
               state={orbState}
               energyRef={energyRef}
@@ -3205,7 +3209,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               title="Tap the orb to interrupt"
               onClick={stopTalking}
               className={compactAside || (commandExpanded && !overlayUp)
-                ? "absolute bottom-[25%] left-[69%] right-[3%] top-[25%] z-20 hidden rounded-full bg-transparent md:block"
+                ? "absolute bottom-4 right-4 z-40 hidden h-36 w-36 rounded-full bg-transparent md:bottom-[25%] md:left-[69%] md:right-[3%] md:top-[25%] md:h-auto md:w-auto md:block"
                 : "absolute inset-[28%] z-20 rounded-full bg-transparent"}
             />
           )}
@@ -3525,7 +3529,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
 
       {/* full-screen viewport — keeps a floating composer so Daniel can still talk */}
       {panel && panelFull && (
-        <div className="fixed inset-y-0 left-0 right-0 z-50 flex flex-col bg-black/80 p-3 backdrop-blur-sm md:right-[236px] md:p-6 md:pr-3">
+        <div data-jarvis-full-orb-safe-workspace className="jarvis-full-orb-safe-workspace fixed left-0 right-0 top-0 z-50 flex flex-col bg-black/80 p-3 backdrop-blur-sm md:inset-y-0 md:right-[236px] md:p-6 md:pr-3">
           <div className="min-h-0 flex-1">
             <Viewport
               panel={panel}

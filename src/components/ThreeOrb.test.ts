@@ -95,11 +95,16 @@ describe("orb side-mode layout contracts", () => {
     expect(jarvisSource).toContain('"top-[70%] hidden md:flex md:left-[62%] md:right-0"');
   });
 
-  it("retains the existing mobile hide/non-aside collision policy at 390x844", () => {
+  it("keeps a compact mobile core above a visual workspace without re-running aside motion", () => {
     const mobile = deriveOrbVisual(createOrbMotionFrame());
     expect(mobile.translateXPercent).toBe(0);
     expect(mobile.scale).toBe(1);
     expect(orbSource).toContain("asideRef.current && W() >= 768");
-    expect(jarvisSource).toContain("pointer-events-none opacity-0 md:opacity-100");
+    expect(jarvisSource).toContain("data-jarvis-orb-zone={compactAside ? \"compact\" : \"stage\"}");
+    expect(jarvisSource).toContain("jarvis-compact-orb-zone");
+    expect(jarvisSource).toContain("jarvis-mobile-orb-safe-panel");
+    expect(jarvisSource).toContain("compact={compactAside}");
+    expect(jarvisSource).toContain("shouldHideOrbForPanel(panel)");
+    expect(jarvisSource).toContain('panelFull ? "z-[60]" : "z-30"');
   });
 });
