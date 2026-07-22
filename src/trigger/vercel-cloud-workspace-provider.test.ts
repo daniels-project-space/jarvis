@@ -5,26 +5,28 @@ import { createDeterministicTar, DEFAULT_WORKSPACE_LIMITS, sha256Bytes } from ".
 type Log = { stream: "stdout" | "stderr"; data: string };
 const observed: {
   create?: Record<string, unknown>; get?: Record<string, unknown>; commands: Record<string, unknown>[];
-  deletes: string[]; updates: unknown[]; kills: string[]; logsClosed: number; files: Map<string, Buffer>; mkdirs: string[]; reads: string[];
-  logs: Log[]; createGate?: Promise<void>; waitGate?: Promise<void>; logCloseGate?: Promise<void>; waitFailure?: unknown; fenceWaitFailure?: unknown; deleteFailure?: unknown;
+  deletes: string[]; updates: unknown[]; updateSessions: string[]; kills: string[]; waits: string[]; logConsumers: string[]; logsClosed: number; files: Map<string, Buffer>; mkdirs: string[]; reads: string[]; readSessions: string[]; writeSessions: string[];
+  logs: Log[]; createGate?: Promise<void>; waitGate?: Promise<void>; releaseWaitOnKill?: () => void; logCloseGate?: Promise<void>; waitFailure?: unknown; fenceWaitFailure?: unknown; deleteFailure?: unknown;
   exitCode: number; commandExit?: (input: Record<string, unknown>) => number;
-  updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; getFailure?: unknown;
+  updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; runCommandHook?: (input: Record<string, unknown>, session: FakeSession) => void; getFailure?: unknown;
   listed: Array<{ status: string }>; listedPages?: Array<Array<{ status: string }>>; listInputs: Record<string, unknown>[];
-} = { commands: [], deletes: [], updates: [], kills: [], logsClosed: 0, files: new Map(), mkdirs: [], reads: [], logs: [], exitCode: 0, listed: [], listInputs: [] };
+} = { commands: [], deletes: [], updates: [], updateSessions: [], kills: [], waits: [], logConsumers: [], logsClosed: 0, files: new Map(), mkdirs: [], reads: [], readSessions: [], writeSessions: [], logs: [], exitCode: 0, listed: [], listInputs: [] };
 
 class FakeCommand {
   readonly cmdId = `cmd-${observed.commands.length}`;
   exitCode: number | null = null;
   constructor(private readonly input: Record<string, unknown>) {}
   async wait() {
+    observed.waits.push(this.cmdId);
     await observed.waitGate;
     if (observed.fenceWaitFailure && String(this.input.args).includes("realpath")) throw observed.fenceWaitFailure;
     if (observed.waitFailure && String(this.input.args).includes("true")) throw observed.waitFailure;
     this.exitCode = this.exitCode ?? observed.commandExit?.(this.input) ?? observed.exitCode;
     return { exitCode: this.exitCode, durationMs: 1 };
   }
-  async kill(signal?: string) { observed.kills.push(`${this.cmdId}:${signal}`); this.exitCode = 137; }
+  async kill(signal?: string) { observed.kills.push(`${this.cmdId}:${signal}`); this.exitCode = 137; observed.releaseWaitOnKill?.(); }
   logs(_opts?: { signal?: AbortSignal }) {
+    observed.logConsumers.push(this.cmdId);
     let closed = false;
     return Object.assign((async function* () { for (const log of observed.logs) { if (!closed) yield log; } })(), {
       close: async () => { await observed.logCloseGate; closed = true; observed.logsClosed += 1; },
@@ -40,17 +42,20 @@ class FakeSession {
   async runCommand(input: Record<string, unknown>) {
     observed.commands.push(input);
     if (String(input.args).includes("sleep 1")) await observed.createGate;
-    return new FakeCommand(input);
+    const command = new FakeCommand(input);
+    observed.runCommandHook?.(input, this);
+    return command;
   }
   async mkDir(path: string) { observed.mkdirs.push(path); }
-  async readFile({ path }: { path: string }) { observed.reads.push(path); return observed.files.has(path) ? Readable.from([observed.files.get(path)!]) : null; }
+  async readFile({ path }: { path: string }) { observed.reads.push(path); observed.readSessions.push(this.sessionId); return observed.files.has(path) ? Readable.from([observed.files.get(path)!]) : null; }
   async writeFiles(files: Array<{ path: string; content: Uint8Array }>) {
+    observed.writeSessions.push(this.sessionId);
     for (const file of files) observed.files.set(file.path, Buffer.from(file.content));
     observed.writeHook?.();
   }
   async update({ networkPolicy }: { networkPolicy?: unknown }) {
     if (observed.updateFailure === networkPolicy) throw new Error("policy transition failed");
-    this.networkPolicy = networkPolicy; observed.updates.push(networkPolicy); observed.updateHook?.(networkPolicy);
+    this.networkPolicy = networkPolicy; observed.updates.push(networkPolicy); observed.updateSessions.push(this.sessionId); observed.updateHook?.(networkPolicy);
   }
 }
 
@@ -92,9 +97,9 @@ async function providerAndWorkspace() {
 }
 
 beforeEach(() => {
-  observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.kills = []; observed.logsClosed = 0;
-  observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.fenceWaitFailure = undefined; observed.deleteFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
-  observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.getFailure = undefined; observed.listed = []; observed.listedPages = undefined; observed.listInputs = []; FakeSandbox.current = new FakeSession();
+  observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.updateSessions = []; observed.kills = []; observed.waits = []; observed.logConsumers = []; observed.logsClosed = 0;
+  observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.readSessions = []; observed.writeSessions = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.releaseWaitOnKill = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.fenceWaitFailure = undefined; observed.deleteFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
+  observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.runCommandHook = undefined; observed.getFailure = undefined; observed.listed = []; observed.listedPages = undefined; observed.listInputs = []; FakeSandbox.current = new FakeSession();
 });
 
 describe("VercelCloudWorkspaceProvider", () => {
@@ -117,6 +122,8 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(command).toMatchObject({ cmd: "sh", args: ["-lc", "printf safe"], cwd: workspace.root, env: {}, detached: true, timeoutMs: 1_000 });
     expect(command).not.toHaveProperty("stdout");
     expect(observed.logsClosed).toBe(2);
+    expect(observed.waits).toHaveLength(2);
+    expect(observed.logConsumers).toHaveLength(2);
   });
 
   it("fails stale before data-plane work and cleanup still deletes the exact named attempt", async () => {
@@ -151,6 +158,40 @@ describe("VercelCloudWorkspaceProvider", () => {
     await expect(provider.writeFile(workspace, "safe.txt", new TextEncoder().encode("safe"), 10)).rejects.toMatchObject({ code: "stale_attempt" });
     expect(observed.files.get(`${workspace.root}/safe.txt`)?.toString()).toBe("safe");
     expect(observed.get).toMatchObject({ name: workspace.providerWorkspaceId, resume: false });
+    expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
+  });
+
+  it("treats every command creation as a substitution boundary before logs or a later command", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.runCommandHook = (input) => {
+      if (String(input.args).includes("realpath")) {
+        FakeSandbox.current = Object.assign(new FakeSession(), { sessionId: "replaced-after-cwd-fence" });
+      }
+    };
+    await expect(provider.exec(workspace, { command: "echo requested", cwd: workspace.root, timeoutMs: 1_000, maxOutputBytes: 1_000 })).rejects.toMatchObject({ code: "stale_attempt" });
+    expect(observed.commands).toHaveLength(1);
+    expect(observed.commands.some((command) => String(command.args).includes("echo requested"))).toBe(false);
+    expect(observed.waits).toHaveLength(1);
+    expect(observed.logConsumers).toHaveLength(0);
+    expect(observed.kills).toHaveLength(1);
+    expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
+  });
+
+  it("kills, waits, and exact-deletes once when the requested command is replaced", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.runCommandHook = (input) => {
+      if (String(input.args).includes("echo requested")) {
+        FakeSandbox.current = Object.assign(new FakeSession(), { sessionId: "replaced-after-request" });
+      }
+    };
+    await expect(provider.exec(workspace, { command: "echo requested", cwd: workspace.root, timeoutMs: 1_000, maxOutputBytes: 1_000 })).rejects.toMatchObject({ code: "stale_attempt" });
+    // The cwd fence completes normally; the requested command is never given
+    // a log consumer once its post-create identity observation fails.
+    expect(observed.commands).toHaveLength(2);
+    expect(observed.waits).toHaveLength(2);
+    expect(observed.logConsumers).toHaveLength(1);
+    expect(observed.kills).toHaveLength(1);
+    expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
   });
 
   it("kills and observes the exact command on cancellation and output overflow", async () => {
@@ -161,6 +202,7 @@ describe("VercelCloudWorkspaceProvider", () => {
     await expect(provider.exec(workspace, { command: "printf x", timeoutMs: 1_000, maxOutputBytes: 8 })).rejects.toMatchObject({ code: "resource_limit" });
     expect(observed.kills.some((value) => value.endsWith(":SIGKILL"))).toBe(true);
     expect(observed.logsClosed).toBeGreaterThan(0);
+    expect(observed.kills).toHaveLength(1);
   });
 
   it("applies one cumulative byte budget across stdout and stderr", async () => {
@@ -169,6 +211,7 @@ describe("VercelCloudWorkspaceProvider", () => {
     await expect(provider.exec(workspace, { command: "printf mixed", timeoutMs: 1_000, maxOutputBytes: 8 })).rejects.toMatchObject({ code: "resource_limit" });
     expect(observed.kills.some((value) => value.endsWith(":SIGKILL"))).toBe(true);
     expect(observed.logsClosed).toBe(2);
+    expect(observed.kills).toHaveLength(1);
   });
 
   it("fences filesystem access and bounds streaming reads without sandbox.fs helpers", async () => {
@@ -249,6 +292,8 @@ describe("VercelCloudWorkspaceProvider", () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(observed.kills).toHaveLength(1);
     expect(observed.kills[0]).toMatch(/:SIGKILL$/);
+    expect(observed.waits).toHaveLength(2);
+    expect(observed.logConsumers).toHaveLength(1);
   });
 
   it("fails closed and deletes the exact attempt when cancellation races command creation", async () => {
@@ -265,6 +310,28 @@ describe("VercelCloudWorkspaceProvider", () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(observed.kills).toHaveLength(1);
     expect(observed.kills[0]).toMatch(/:SIGKILL$/);
+    expect(observed.waits).toHaveLength(2);
+    expect(observed.logConsumers).toHaveLength(1);
+  });
+
+  it("coalesces repeated termination signals into one kill and one wait for the requested command", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    let release!: () => void;
+    observed.runCommandHook = (input) => {
+      if (String(input.args).includes("sleep 1")) {
+        observed.waitGate = new Promise<void>((resolve) => { release = resolve; });
+        observed.releaseWaitOnKill = release;
+      }
+    };
+    const controller = new AbortController();
+    const running = provider.exec(workspace, { command: "sleep 1", cwd: workspace.root, timeoutMs: 1_000, maxOutputBytes: 1_000, signal: controller.signal });
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+    controller.abort();
+    await expect(running).rejects.toMatchObject({ code: "cancelled" });
+    expect(observed.kills).toHaveLength(1);
+    expect(observed.waits).toHaveLength(2);
+    expect(observed.logConsumers).toHaveLength(2);
   });
 
   it("rejects bounded lists and symlink findings from the session-scoped lstat command", async () => {
@@ -277,10 +344,26 @@ describe("VercelCloudWorkspaceProvider", () => {
 
   it("strictly decodes NUL listings and accepts exactly the requested entry limit", async () => {
     const { provider, workspace } = await providerAndWorkspace();
-    observed.logs = [{ stream: "stdout", data: "only\0" }];
+    observed.logs = [{ stream: "stdout", data: Buffer.from("only\0").toString("base64") }];
     await expect(provider.listFiles(workspace, ".", 1)).resolves.toEqual(["only"]);
-    observed.logs = [{ stream: "stdout", data: Buffer.from([0xff]) as unknown as string }];
+    const malformed = [
+      "b25seQ", // non-canonical missing padding
+      Buffer.from("only").toString("base64"), // unterminated NUL frame
+      Buffer.from("\0only\0").toString("base64"), // initial empty field
+      Buffer.from("one\0\0two\0").toString("base64"), // repeated NUL
+      "@@@@", // malformed base64 alphabet
+    ];
+    for (const data of malformed) {
+      observed.logs = [{ stream: "stdout", data }];
+      await expect(provider.listFiles(workspace, ".", 1)).rejects.toMatchObject({ code: "unsafe_archive" });
+    }
+    observed.logs = [{ stream: "stdout", data: Buffer.from([0xff, 0]).toString("base64") }];
     await expect(provider.listFiles(workspace, ".", 1)).rejects.toMatchObject({ code: "unsafe_patch" });
+    observed.logs = [{ stream: "stdout", data: Buffer.from("one\0two\0").toString("base64") }];
+    await expect(provider.listFiles(workspace, ".", 1)).rejects.toMatchObject({ code: "resource_limit" });
+    observed.commandExit = (input) => String(input.args).includes("find -P") ? 43 : 0;
+    await expect(provider.listFiles(workspace, ".", 1)).rejects.toMatchObject({ code: "unsafe_archive" });
+    expect(observed.commands.some((command) => String(command.args).includes("base64 -w 0"))).toBe(true);
   });
 
   it("relocks and terminates on install failure before any later command boundary", async () => {
@@ -325,6 +408,9 @@ describe("VercelCloudWorkspaceProvider", () => {
     const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
     const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
     await expect(provider.createWorkspace({ attemptKey: "job:cap", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS })).rejects.toMatchObject({ code: "resource_limit" });
+    expect(observed.create).toBeUndefined();
+    observed.listed = Array.from({ length: 8 }, () => ({ status: "snapshotting" }));
+    await expect(provider.createWorkspace({ attemptKey: "job:snapshot-cap", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS })).rejects.toMatchObject({ code: "resource_limit" });
     expect(observed.create).toBeUndefined();
   });
 
@@ -380,6 +466,8 @@ describe("VercelCloudWorkspaceProvider", () => {
     await new Promise((resolve) => setImmediate(resolve));
     releaseClose();
     await expect(closing).resolves.toMatchObject({ exitCode: 0 });
+    expect(observed.waits).toHaveLength(4);
+    expect(observed.logConsumers).toHaveLength(4);
   });
 
   it("kills once, deletes the exact attempt after a throwing wait, and reports blocked cleanup during creation", async () => {
@@ -387,6 +475,7 @@ describe("VercelCloudWorkspaceProvider", () => {
     observed.waitFailure = new Error("wait failed");
     await expect(provider.exec(workspace, { command: "true", timeoutMs: 1_000, maxOutputBytes: 1_000 })).rejects.toThrow("wait failed");
     expect(observed.kills).toHaveLength(1);
+    expect(observed.waits).toHaveLength(2);
     expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
 
     let release!: () => void;

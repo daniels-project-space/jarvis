@@ -456,10 +456,10 @@ const VERCEL_NPM_POLICY = Object.freeze({ allow: ["registry.npmjs.org"] });
 /** Must never exceed the durable Trigger agent-worker fleet concurrency (8). */
 export const VERCEL_ACTIVE_SANDBOX_CAP = 8;
 const VERCEL_MAX_LIST_ENTRIES = 10_000;
-const VERCEL_NAME_PREFIX = "jarvis";
-const VERCEL_HISTORY_PAGE_LIMIT = 50;
-const VERCEL_HISTORY_PAGE_CEILING = 8;
-const VERCEL_HISTORY_TOTAL_CEILING = VERCEL_HISTORY_PAGE_LIMIT * VERCEL_HISTORY_PAGE_CEILING;
+export const VERCEL_NAME_PREFIX = "jarvis";
+export const VERCEL_HISTORY_PAGE_LIMIT = 50;
+export const VERCEL_HISTORY_PAGE_CEILING = 8;
+export const VERCEL_HISTORY_TOTAL_CEILING = VERCEL_HISTORY_PAGE_LIMIT * VERCEL_HISTORY_PAGE_CEILING;
 
 function vercelWorkspaceName(attemptKey: string): string {
   // Vercel names are persisted identities, so never derive one from an
@@ -485,6 +485,40 @@ function vercelAbsolutePath(workspace: CloudWorkspace, value: string): string {
 function decodeOutput(value: Buffer): string {
   try { return new TextDecoder("utf-8", { fatal: true }).decode(value); }
   catch { throw new CloudWorkspaceError("vercel", "unsafe_patch", "sandbox emitted invalid UTF-8 output", "rejected"); }
+}
+
+/** The command log transport is text, while POSIX names are bytes.  Keep the
+ * on-sandbox frame as canonical standard base64 and validate every property
+ * before converting an individual name to text. */
+function decodeVercelListing(value: Buffer, maxEntries: number): string[] {
+  const encoded = decodeOutput(value);
+  if (encoded === "") return [];
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+    throw new CloudWorkspaceError("vercel", "unsafe_archive", "sandbox listing encoding is malformed or non-canonical", "rejected");
+  }
+  const bytes = Buffer.from(encoded, "base64");
+  if (bytes.toString("base64") !== encoded || bytes.length === 0 || bytes[bytes.length - 1] !== 0) {
+    throw new CloudWorkspaceError("vercel", "unsafe_archive", "sandbox listing frame is malformed or unterminated", "rejected");
+  }
+  const names: string[] = [];
+  let start = 0;
+  for (let index = 0; index < bytes.length; index += 1) {
+    if (bytes[index] !== 0) continue;
+    // A NUL is a frame delimiter, never data. Empty fields cover an initial,
+    // repeated, or otherwise fabricated terminal delimiter.
+    if (index === start) throw new CloudWorkspaceError("vercel", "unsafe_archive", "sandbox listing contains an empty NUL field", "rejected");
+    const name = decodeOutput(bytes.subarray(start, index));
+    if (validateRelativePath(name, "vercel") !== name) {
+      throw new CloudWorkspaceError("vercel", "unsafe_archive", "sandbox listing contains an unsafe entry", "rejected");
+    }
+    names.push(name);
+    if (names.length > maxEntries) throw new CloudWorkspaceError("vercel", "resource_limit", "sandbox listing exceeds limit", "rejected");
+    start = index + 1;
+  }
+  // The terminal NUL must be the sole trailing delimiter; the loop ends with
+  // start exactly at the byte length only for a complete canonical frame.
+  if (start !== bytes.length) throw new CloudWorkspaceError("vercel", "unsafe_archive", "sandbox listing frame is unterminated", "rejected");
+  return names;
 }
 
 function boundedUtf8Prefix(value: string, maxBytes: number): Buffer {
@@ -584,21 +618,20 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     ];
   }
   protected override async prepareWorkspace(workspace: CloudWorkspace): Promise<void> {
-    const sandbox = await this.get(workspace);
-    const session = this.assertSession(workspace, sandbox);
+    let observed = await this.observeFreshSession(workspace);
     const paths = this.pathsFor(workspace);
     // These are direct session calls: neither can resume a stopped Sandbox.
     // The root is established before it becomes a command cwd, and every
     // subsequent data-plane path is realpath/lstat checked below it.
-    await session.mkDir(workspace.root);
-    await this.assertFreshSession(workspace);
-    await this.assertNoSymlink(workspace, sandbox, session, workspace.root, false);
-    const result = await this.runSessionCommand(workspace, sandbox, session, {
+    await observed.session.mkDir(workspace.root);
+    observed = await this.observeFreshSession(workspace);
+    observed = await this.assertNoSymlink(workspace, observed.sandbox, observed.session, workspace.root, false);
+    const result = await this.runSessionCommand(workspace, observed.sandbox, observed.session, {
       command: `mkdir -- ${shellQuote(paths.controlDir)} && [ "$(realpath -e -- ${shellQuote(paths.controlDir)})" = ${shellQuote(paths.controlDir)} ] && [ ! -L ${shellQuote(paths.controlDir)} ]`,
       cwd: workspace.root, timeoutMs: 10_000, maxOutputBytes: 4_000,
     });
     if (result.exitCode !== 0) throw new CloudWorkspaceError(this.name, "unsafe_archive", "could not establish a fenced sandbox control directory", "rejected");
-    await this.assertFreshSession(workspace);
+    await this.observeFreshSession(workspace);
   }
 
   private credentials() { return { token: this.token, teamId: this.teamId, projectId: this.projectId }; }
@@ -628,7 +661,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
         throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox history exceeds the bounded controller enumeration ceiling", "deferred");
       }
       for (const item of page.sandboxes) {
-        if (["pending", "running", "stopping"].includes(item.status)) active += 1;
+        if (["pending", "running", "snapshotting", "stopping"].includes(item.status)) active += 1;
         if (active >= VERCEL_ACTIVE_SANDBOX_CAP) {
           throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox controller active-attempt cap is reached", "deferred");
         }
@@ -701,10 +734,12 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
   }
   protected async readAbsolute(workspace: CloudWorkspace, path: string, maxBytes: number) {
     assertVercelArtifactBound(maxBytes);
-    const sandbox = await this.get(workspace); const session = this.assertSession(workspace, sandbox);
+    let observed = await this.observeFreshSession(workspace);
     const absolute = vercelAbsolutePath(workspace, path);
-    await this.assertNoSymlink(workspace, sandbox, session, absolute, false);
-    const stream = await session.readFile({ path: absolute });
+    observed = await this.assertNoSymlink(workspace, observed.sandbox, observed.session, absolute, false);
+    // Never read through the pre-lstat Session snapshot. The lstat command is
+    // itself a substitution boundary and returns this freshly observed one.
+    const stream = await observed.session.readFile({ path: absolute });
     if (!stream) throw new CloudWorkspaceError(this.name, "provider_unavailable", "sandbox file is missing", "deferred");
     const chunks: Buffer[] = []; let used = 0;
     try {
@@ -717,44 +752,53 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
         chunks.push(chunk); used += chunk.byteLength;
       }
     } finally { (stream as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.(); }
-    await this.assertFreshSession(workspace); return new Uint8Array(Buffer.concat(chunks, used));
+    await this.observeFreshSession(workspace); return new Uint8Array(Buffer.concat(chunks, used));
   }
   async writeFile(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) { return this.writeAbsolute(workspace, safeWorkspacePath(workspace, path), data, maxBytes); }
   protected async writeAbsolute(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) {
     assertVercelWriteBound(maxBytes);
     if (data.byteLength > maxBytes) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds write limit", "rejected");
-    const sandbox = await this.get(workspace); const session = this.assertSession(workspace, sandbox);
+    let observed = await this.observeFreshSession(workspace);
     const absolute = vercelAbsolutePath(workspace, path);
-    await this.assertNoSymlink(workspace, sandbox, session, absolute, true);
-    await session.writeFiles([{ path: absolute, content: data }]); await this.assertFreshSession(workspace);
+    observed = await this.assertNoSymlink(workspace, observed.sandbox, observed.session, absolute, true);
+    try {
+      // The write must use the Session returned by the realpath observation.
+      await observed.session.writeFiles([{ path: absolute, content: data }]);
+      await this.observeFreshSession(workspace);
+    } catch (error) {
+      if (error instanceof CloudWorkspaceError && error.code === "stale_attempt") {
+        await this.cleanupOrBlock(workspace, error, "could not delete the exact sandbox after a substituted file write");
+      }
+      throw error;
+    }
   }
   async listFiles(workspace: CloudWorkspace, path: string, maxEntries: number) {
     if (!Number.isSafeInteger(maxEntries) || maxEntries < 0 || maxEntries > VERCEL_MAX_LIST_ENTRIES) throw new CloudWorkspaceError(this.name, "resource_limit", "file listing limit is invalid", "rejected");
-    const sandbox = await this.get(workspace); const session = this.assertSession(workspace, sandbox);
+    let observed = await this.observeFreshSession(workspace);
     const base = vercelAbsolutePath(workspace, path);
-    await this.assertNoSymlink(workspace, sandbox, session, base, false);
+    observed = await this.assertNoSymlink(workspace, observed.sandbox, observed.session, base, false);
     const script = [
       `base=${shellQuote(base)}`,
       `count=$(find -P -- "$base" -mindepth 1 -maxdepth 1 -printf . | wc -c)`,
       `[ "$count" -le ${maxEntries} ] || exit 42`,
       `find -P -- "$base" -mindepth 1 -maxdepth 1 -exec sh -c 'for entry do [ ! -L "$entry" ] || exit 43; stat -c %F -- "$entry" | grep -qx "symbolic link" && exit 43; done' sh {} +`,
-      `find -P -- "$base" -mindepth 1 -maxdepth 1 -printf '%f\\0'`,
+      // The SDK transports logs as text. Canonical base64 preserves raw POSIX
+      // filename bytes, including names which are not valid UTF-8.
+      `LC_ALL=C find -P -- "$base" -mindepth 1 -maxdepth 1 -printf '%f\\0' | base64 -w 0`,
     ].join("; ");
-    const result = await this.runSessionCommand(workspace, sandbox, session, { command: script, cwd: workspace.root, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs, maxOutputBytes: Math.max(1_024, Math.min(DEFAULT_WORKSPACE_LIMITS.maxOutputBytes, maxEntries * 512)) });
+    const result = await this.runSessionCommand(workspace, observed.sandbox, observed.session, { command: script, cwd: workspace.root, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs, maxOutputBytes: Math.max(1_024, Math.min(DEFAULT_WORKSPACE_LIMITS.maxOutputBytes, maxEntries * 512)) });
     if (result.exitCode === 42) throw new CloudWorkspaceError(this.name, "resource_limit", "file listing exceeds limit", "rejected");
     if (result.exitCode === 43) throw new CloudWorkspaceError(this.name, "unsafe_archive", "symlink encountered during bounded listing", "rejected");
     if (result.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "sandbox file listing failed", "deferred");
-    const listing = result.stdout.subarray(0, result.stdout.byteLength && result.stdout[result.stdout.byteLength - 1] === 0 ? -1 : result.stdout.byteLength);
-    const names = decodeOutput(listing).split("\0").filter(Boolean);
-    if (names.length > maxEntries || names.some((name) => validateRelativePath(name, this.name) !== name)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "sandbox listing contains an unsafe entry", "rejected");
-    await this.assertFreshSession(workspace); return names;
+    const names = decodeVercelListing(result.stdout, maxEntries);
+    await this.observeFreshSession(workspace); return names;
   }
 
   async hydrateDependencies(workspace: CloudWorkspace): Promise<void> {
     // Source has already been validated and uploaded. This parses only the
     // committed lockfile, opens one registry for one command, then relocks.
     try {
-      const sandbox = await this.get(workspace); const session = this.assertSession(workspace, sandbox);
+      let observed = await this.observeFreshSession(workspace);
       try {
         const lockPath = `${this.workspaceRoot}/package-lock.json`;
         const paths = this.pathsFor(workspace);
@@ -762,25 +806,27 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
         // A missing lock means no egress. It still proceeds through the
         // tracked deny-all update and behavioral probe below; an early return
         // here could accidentally make a future policy regression invisible.
-        await this.assertNoSymlink(workspace, sandbox, session, lockPath, true);
-        const exists = await this.runSessionCommand(workspace, sandbox, session, { command: `test -f ${shellQuote(lockPath)}`, cwd: this.workspaceRoot, timeoutMs: 10_000, maxOutputBytes: 4_000 });
+        observed = await this.assertNoSymlink(workspace, observed.sandbox, observed.session, lockPath, true);
+        const exists = await this.runSessionCommand(workspace, observed.sandbox, observed.session, { command: `test -f ${shellQuote(lockPath)}`, cwd: this.workspaceRoot, timeoutMs: 10_000, maxOutputBytes: 4_000 });
         if (exists.exitCode !== 1) {
           if (exists.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "could not inspect committed package lock", "deferred");
           // The source working tree must be byte-for-byte the controller base
           // before its lock is parsed. This makes the streamed read below an
           // observation of refs/jarvis/controller-base, not a mutable file a
           // prior sandbox action could have substituted.
-          const committed = await this.runSessionCommand(workspace, sandbox, session, {
+          observed = await this.observeFreshSession(workspace);
+          const committed = await this.runSessionCommand(workspace, observed.sandbox, observed.session, {
             command: "git ls-files --error-unmatch -- package-lock.json >/dev/null && git diff --quiet refs/jarvis/controller-base -- package-lock.json && git diff --cached --quiet refs/jarvis/controller-base -- package-lock.json",
             cwd: this.workspaceRoot, timeoutMs: 10_000, maxOutputBytes: 4_000,
           });
           if (committed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "unsafe_archive", "package lock is not the committed controller baseline", "rejected");
           const lock = await this.readAbsolute(workspace, lockPath, DEFAULT_WORKSPACE_LIMITS.maxFileBytes);
           if (!packageLockUsesOnlyNpmRegistry(lock)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "package lock contains a non-npm-registry dependency", "rejected");
-          await this.assertFreshSession(workspace);
-          await session.update({ networkPolicy: VERCEL_NPM_POLICY });
-          await this.assertFreshSession(workspace);
-          const installed = await this.runSessionCommand(workspace, sandbox, session, {
+          // Do not invoke update on the snapshot which preceded the lock read.
+          // A fresh no-resume observation is the policy-transition capability.
+          await this.transitionNetworkPolicy(workspace, VERCEL_NPM_POLICY);
+          observed = await this.observeFreshSession(workspace);
+          const installed = await this.runSessionCommand(workspace, observed.sandbox, observed.session, {
             command: [
               `npm ci --ignore-scripts --no-audit --no-fund --cache ${shellQuote(cachePath)}`,
               "git reset --hard refs/jarvis/controller-base",
@@ -795,9 +841,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
           if (installed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "deterministic dependency hydration failed", "deferred");
         }
       } finally {
-        await this.assertFreshSession(workspace);
-        await session.update({ networkPolicy: "deny-all" });
-        await this.assertFreshSession(workspace);
+        await this.transitionNetworkPolicy(workspace, "deny-all");
       }
       const relocked = await this.assertFreshSession(workspace);
       if (relocked.networkPolicy !== "deny-all") throw new CloudWorkspaceError(this.name, "provider_unavailable", "dependency hydration did not relock deny-all egress", "blocked");
@@ -866,7 +910,20 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     return this.assertSession(workspace, await this.get(workspace));
   }
 
-  private async assertNoSymlink(workspace: CloudWorkspace, sandbox: VercelSandbox, session: VercelSession, path: string, writing: boolean): Promise<void> {
+  private async observeFreshSession(workspace: CloudWorkspace): Promise<{ sandbox: VercelSandbox; session: VercelSession }> {
+    const sandbox = await this.get(workspace);
+    return { sandbox, session: this.assertSession(workspace, sandbox) };
+  }
+
+  private async transitionNetworkPolicy(workspace: CloudWorkspace, networkPolicy: "deny-all" | typeof VERCEL_NPM_POLICY): Promise<{ sandbox: VercelSandbox; session: VercelSession }> {
+    const observed = await this.observeFreshSession(workspace);
+    await observed.session.update({ networkPolicy });
+    // update is a provider-side transition, so preserve a fresh post-boundary
+    // observation rather than trusting the object that submitted it.
+    return this.observeFreshSession(workspace);
+  }
+
+  private async assertNoSymlink(workspace: CloudWorkspace, sandbox: VercelSandbox, session: VercelSession, path: string, writing: boolean): Promise<{ sandbox: VercelSandbox; session: VercelSession }> {
     if (path !== workspace.root && !path.startsWith(`${workspace.root}/`)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "sandbox path escapes the workspace root", "rejected");
     const parent = path.slice(0, path.lastIndexOf("/")) || "/";
     const check = writing
@@ -874,6 +931,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       : `[ "$(realpath -e -- ${shellQuote(path)})" = ${shellQuote(path)} ] && [ ! -L ${shellQuote(path)} ]`;
     const result = await this.runSessionCommand(workspace, sandbox, session, { command: check, cwd: workspace.root, timeoutMs: 10_000, maxOutputBytes: 4_000 });
     if (result.exitCode !== 0) throw new CloudWorkspaceError(this.name, "unsafe_archive", "sandbox path is missing, symlinked, or escapes the workspace root", "rejected");
+    return this.observeFreshSession(workspace);
   }
 
   /** A lexical prefix is never a cwd fence. Re-observe the exact named
@@ -971,7 +1029,11 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       }
       command = first.value;
       waitPromise = command.wait();
-      this.assertSession(workspace, sandbox);
+      // Command creation is a provider-side session-substitution boundary.
+      // Do not consume logs or regard a created command as authoritative until
+      // the exact name has been re-read with resume:false and its Session is
+      // still the identity recorded in the workspace.
+      ({ sandbox, session } = await this.observeFreshSession(workspace));
       if (reason) termination = killAndObserve();
       const iterator = command.logs({ signal: logAbort.signal });
       logPromise = (async () => {
@@ -996,7 +1058,17 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     } catch (error) {
       if (command) {
         logAbort.abort();
-        try { await logPromise?.catch(() => undefined); await killAndObserve(); }
+        try {
+          await logPromise?.catch(() => undefined);
+          await killAndObserve();
+          // A failed fresh observation after command creation means the
+          // command belonged to an uncertain/substituted provider session.
+          // It has one wait promise and one kill; now exact-name deletion is
+          // mandatory so no later command or Codex boundary can be reached.
+          if (error instanceof CloudWorkspaceError && error.code === "stale_attempt") {
+            await this.terminate(workspace, "terminal");
+          }
+        }
         catch {
           await this.cleanupOrBlock(workspace, error, "could not delete the exact sandbox after uncertain command termination");
         }

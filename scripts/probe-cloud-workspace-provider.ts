@@ -15,7 +15,13 @@ import {
   type CloudWorkspace,
 } from "../src/trigger/cloud-workspace";
 import { configuredCloudWorkspaceProviderForLiveProbe } from "../src/trigger/cloud-workspace-providers";
-import { VERCEL_ACTIVE_SANDBOX_CAP } from "../src/trigger/cloud-workspace-providers";
+import {
+  VERCEL_ACTIVE_SANDBOX_CAP,
+  VERCEL_HISTORY_PAGE_CEILING,
+  VERCEL_HISTORY_PAGE_LIMIT,
+  VERCEL_HISTORY_TOTAL_CEILING,
+  VERCEL_NAME_PREFIX,
+} from "../src/trigger/cloud-workspace-providers";
 import {
   cloudWorkspaceCancellationProbeRemote,
   issueAfterExactRemoteCancellation,
@@ -100,13 +106,30 @@ async function inspectVercelConfiguration(workspace: CloudWorkspace): Promise<{ 
     || !detail.expiresAt || detail.expiresAt.getTime() <= Date.now() || detail.expiresAt.getTime() - detail.createdAt.getTime() > 44 * 60_000) {
     throw new Error("Vercel runtime, private ingress, deny policy, persistence, or TTL observation failed");
   }
-  const listed = await Sandbox.list({ ...credentials, namePrefix: "jarvis" });
-  let active = 0; let named = false;
-  for await (const item of listed) {
-    if (item.name === workspace.providerWorkspaceId && item.currentSessionId === workspace.providerSessionId) named = true;
-    if (["pending", "running", "stopping"].includes(item.status)) active += 1;
-    if (active > VERCEL_ACTIVE_SANDBOX_CAP) throw new Error("Vercel project-scoped controller active-sandbox cap was exceeded");
+  const listed = await Sandbox.list({
+    ...credentials, namePrefix: VERCEL_NAME_PREFIX, tags: { owner: "jarvis" },
+    limit: VERCEL_HISTORY_PAGE_LIMIT,
+  });
+  let active = 0; let named = false; let pages = 0; let total = 0; let complete = false;
+  // The item iterator can traverse indefinite stopped history.  Page metadata
+  // gives the only finite completeness proof for all owner-scoped attempts.
+  for await (const page of listed.pages()) {
+    pages += 1;
+    total += page.sandboxes.length;
+    if (pages > VERCEL_HISTORY_PAGE_CEILING || total > VERCEL_HISTORY_TOTAL_CEILING) {
+      throw new Error("Vercel Sandbox history exceeds the bounded controller enumeration ceiling");
+    }
+    for (const item of page.sandboxes) {
+      if (item.name === workspace.providerWorkspaceId && item.currentSessionId === workspace.providerSessionId) named = true;
+      if (["pending", "running", "snapshotting", "stopping"].includes(item.status)) active += 1;
+      if (active > VERCEL_ACTIVE_SANDBOX_CAP) throw new Error("Vercel project-scoped controller active-sandbox cap was exceeded");
+    }
+    if (page.pagination.next === null) { complete = true; break; }
+    if (pages === VERCEL_HISTORY_PAGE_CEILING) {
+      throw new Error("Vercel Sandbox history completeness cannot be proved within the controller page ceiling");
+    }
   }
+  if (!complete) throw new Error("Vercel Sandbox history completeness could not be proved");
   if (!named) throw new Error("exact named Vercel Sandbox was absent from provider list observation");
   // The Sandbox API does not expose authoritative team/project plan or spend
   // caps. The caller completes the safe lifecycle observation, then fails
