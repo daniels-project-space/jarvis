@@ -10,10 +10,12 @@ import {
 import {
   DEFAULT_WORKSPACE_LIMITS,
   REQUIRED_CLOUD_WORKSPACE_CAPABILITIES,
+  createDeterministicTar,
   sha256Bytes,
   type CloudWorkspace,
 } from "../src/trigger/cloud-workspace";
 import { configuredCloudWorkspaceProviderForLiveProbe } from "../src/trigger/cloud-workspace-providers";
+import { VERCEL_ACTIVE_SANDBOX_CAP } from "../src/trigger/cloud-workspace-providers";
 import {
   cloudWorkspaceCancellationProbeRemote,
   issueAfterExactRemoteCancellation,
@@ -30,27 +32,20 @@ function blocked(reason: string): never {
 function configuredCredentialAvailable(env: NodeJS.ProcessEnv): boolean {
   if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "sandbox0") return Boolean(env.SANDBOX0_TOKEN);
   if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "e2b") return Boolean(env.E2B_API_KEY);
-  if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "daytona") return Boolean(env.DAYTONA_API_KEY);
+  if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "vercel") return Boolean(env.VERCEL_TOKEN && env.VERCEL_TEAM_ID && env.VERCEL_PROJECT_ID);
   return false;
 }
 
 function probeArchive(): Uint8Array {
-  const header = new Uint8Array(512);
   const encoder = new TextEncoder();
-  const data = encoder.encode("provider-probe\n");
-  header.set(encoder.encode("PROBE.txt"), 0);
-  header.set(encoder.encode("0000644\0"), 100);
-  header.set(encoder.encode("0000000\0"), 108);
-  header.set(encoder.encode("0000000\0"), 116);
-  header.set(encoder.encode(data.byteLength.toString(8).padStart(11, "0") + "\0"), 124);
-  header.set(encoder.encode("00000000000\0"), 136);
-  header.fill(32, 148, 156);
-  header[156] = "0".charCodeAt(0);
-  header.set(encoder.encode("ustar\0"), 257);
-  header.set(encoder.encode("00"), 263);
-  const checksum = header.reduce((sum, byte) => sum + byte, 0);
-  header.set(encoder.encode(checksum.toString(8).padStart(6, "0") + "\0 "), 148);
-  return Buffer.concat([header, data, new Uint8Array(512 - data.byteLength), new Uint8Array(1024)]);
+  // The empty dependency graph still exercises the Vercel adapter's exact
+  // allow-only npm policy transition, cleanup, relock, and deny probe without
+  // downloading a package or relying on a package-manager script.
+  return createDeterministicTar([
+    { path: "PROBE.txt", data: encoder.encode("provider-probe\n") },
+    { path: "package.json", data: encoder.encode('{"name":"jarvis-provider-probe","version":"0.0.0","private":true}') },
+    { path: "package-lock.json", data: encoder.encode('{"name":"jarvis-provider-probe","version":"0.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"jarvis-provider-probe","version":"0.0.0"}}}') },
+  ]);
 }
 
 function finiteQuota(value: { unlimited?: boolean; limitValue?: number | null; remaining?: number | null } | undefined): boolean {
@@ -90,6 +85,42 @@ async function inspectSandbox0Configuration(workspace: CloudWorkspace, templateI
   return { ttlMs, observedMemory };
 }
 
+async function inspectVercelConfiguration(workspace: CloudWorkspace): Promise<{ ttlMs: number; observedMemory: number }> {
+  const { Sandbox } = await import("@vercel/sandbox");
+  const credentials = { token: process.env.VERCEL_TOKEN!, teamId: process.env.VERCEL_TEAM_ID!, projectId: process.env.VERCEL_PROJECT_ID! };
+  // This is deliberately a fresh, no-resume observation rather than cached
+  // adapter metadata. A stopped or substituted session is not proof.
+  const detail = await Sandbox.get({ ...credentials, name: workspace.providerWorkspaceId, resume: false });
+  const session = detail.currentSession();
+  if (detail.name !== workspace.providerWorkspaceId || session.sessionId !== workspace.providerSessionId || session.status !== "running") {
+    throw new Error("exact Vercel Sandbox name/session observation changed");
+  }
+  if (detail.runtime !== "node22" || detail.vcpus !== 2 || detail.memory !== 4096 || detail.routes.length !== 0
+    || detail.persistent !== false || detail.networkPolicy !== "deny-all" || session.networkPolicy !== "deny-all"
+    || !detail.expiresAt || detail.expiresAt.getTime() <= Date.now() || detail.expiresAt.getTime() - detail.createdAt.getTime() > 44 * 60_000) {
+    throw new Error("Vercel runtime, private ingress, deny policy, persistence, or TTL observation failed");
+  }
+  const listed = await Sandbox.list({ ...credentials, namePrefix: "jarvis" });
+  let active = 0; let named = false;
+  for await (const item of listed) {
+    if (item.name === workspace.providerWorkspaceId && item.currentSessionId === workspace.providerSessionId) named = true;
+    if (["pending", "running", "stopping"].includes(item.status)) active += 1;
+    if (active > VERCEL_ACTIVE_SANDBOX_CAP) throw new Error("Vercel project-scoped controller active-sandbox cap was exceeded");
+  }
+  if (!named) throw new Error("exact named Vercel Sandbox was absent from provider list observation");
+  // The Sandbox API does not expose authoritative team/project plan or spend
+  // caps. The caller completes the safe lifecycle observation, then fails
+  // before it can construct a Vercel receipt from an assumption.
+  return { ttlMs: detail.expiresAt.getTime() - detail.createdAt.getTime(), observedMemory: detail.memory };
+}
+
+function requireAuthoritativeVercelPlanAndSpendObservation(): never {
+  // @vercel/sandbox 2.8.0 has no authoritative team/project plan or spend-cap
+  // endpoint. Do not synthesize this proof from a configured cap, billing plan,
+  // or controller active-attempt count.
+  throw new Error("Vercel plan and spend-cap state is not authoritatively observable; activation remains blocked pending Daniel's compliant-plan and spend-cap decision");
+}
+
 async function main() {
   if (process.env.JARVIS_CLOUD_PROVIDER_PROBE !== "live") blocked(`real live opt-in is required (${LIVE_OPT_IN})`);
   if (!configuredCredentialAvailable(process.env)) blocked("a safe scoped credential for the selected provider is unavailable");
@@ -103,7 +134,7 @@ async function main() {
     blocked("the exact deployment/template provenance configuration is incomplete");
   }
   if (!authority) blocked("the rotating controller-only receipt signer is unavailable");
-  if (binding.provider !== "sandbox0") blocked("the selected pinned adapter cannot exercise every required live capability");
+  if (binding.provider !== "sandbox0" && binding.provider !== "vercel") blocked("the selected pinned adapter cannot exercise every required live capability");
   if (installedCloudProviderSdkVersion(binding.provider) !== binding.sdk.version) blocked("the installed provider SDK does not match the pinned tuple");
 
   const provider = configuredCloudWorkspaceProviderForLiveProbe(process.env);
@@ -119,10 +150,25 @@ async function main() {
       lockfileDigest: binding.runtime.digest,
       limits: DEFAULT_WORKSPACE_LIMITS,
     });
-    const providerObservation = await inspectSandbox0Configuration(first, binding.template.identity, binding.template.digest);
+    let providerObservation = binding.provider === "sandbox0"
+      ? await inspectSandbox0Configuration(first, binding.template.identity, binding.template.digest)
+      : await inspectVercelConfiguration(first);
 
     const bytes = probeArchive();
     await provider.uploadCredentiallessArchive(first, { baseSha: "0".repeat(40), sha256: sha256Bytes(bytes), bytes });
+    if (binding.provider === "vercel") {
+      if (!provider.hydrateDependencies) throw new Error("Vercel dependency lifecycle adapter is unavailable");
+      await provider.hydrateDependencies(first);
+      // Re-fetch after the allow-only install phase. This is an authoritative
+      // provider observation of the relock, not a copy of controller intent.
+      providerObservation = await inspectVercelConfiguration(first);
+    }
+    // This reads the uploaded provider file through the fenced data plane;
+    // it proves the exact sandbox's file lifecycle rather than inferring it
+    // from the configured archive.
+    if (new TextDecoder().decode(await provider.readFile(first, "PROBE.txt", 4_000)) !== "provider-probe\n") {
+      throw new Error("provider file lifecycle observation failed");
+    }
     const envResult = await provider.exec(first, {
       command: "node -e 'process.stdout.write(JSON.stringify(process.env))'",
       cwd: first.root,
@@ -185,6 +231,12 @@ async function main() {
     if (marker !== runId) throw new Error("portable checkpoint replay identity failed");
     await provider.terminate(recreated, "terminal");
     recreated = null;
+
+    // Vercel's required plan/spend evidence is unavailable through an
+    // authoritative provider API. This is intentionally after the bounded
+    // provider exercise so it remains useful operational evidence, but before
+    // receipt construction: no quota proof is ever optimistic.
+    if (binding.provider === "vercel") requireAuthoritativeVercelPlanAndSpendObservation();
 
     const probeTime = Date.now();
     const receipt: CloudProviderProbeReceipt = {

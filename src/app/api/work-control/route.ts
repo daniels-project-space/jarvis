@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { controlMutation } from "@/lib/control-session";
+import { controlMutation, controlQuery } from "@/lib/control-session";
 import { wakeAgentFleet } from "@/lib/agent-fleet-dispatch";
 import { controlActor, controlCredentials } from "@/lib/request-auth";
 
@@ -52,8 +52,13 @@ export async function POST(req: NextRequest) {
   if (shouldWake) {
     await wakeAgentFleet(`${missionId ? "goal" : "job"}-${action}:${missionId || jobId}`).catch(() => false);
   }
+  // A successful exact-job control returns the bounded supervision contract,
+  // never the compatibility list or durable job payload.
+  const monitoring = ok === true && jobId
+    ? await controlQuery("jobs:monitor", { jobId, ...credentials }).catch(() => null)
+    : null;
   return Response.json(
-    { ok: ok === true, ...(ok === true ? {} : { error: "That work item cannot apply this control from its current state." }) },
+    { ok: ok === true, ...(monitoring ? { monitoring } : {}), ...(ok === true ? {} : { error: "That work item cannot apply this control from its current state." }) },
     { status: ok === true ? 200 : 409 },
   );
 }

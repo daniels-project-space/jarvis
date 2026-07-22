@@ -42,4 +42,14 @@ describe("StreamPublisher", () => {
     expect(writes).toEqual([{ text: "One", revision: 1 }]);
     expect(publisher.value).toBe("One");
   });
+
+  it("records only the first durable Convex paint", async () => {
+    let painted = 0;
+    const publisher = new StreamPublisher(async () => true, 120, () => { painted += 1; });
+    publisher.push("One");
+    await publisher.flush();
+    publisher.push(" two");
+    await publisher.flush();
+    expect(painted).toBe(1);
+  });
 });

@@ -14,11 +14,11 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({}));
   const jobId = String(body?.jobId ?? "");
   if (!jobId) return Response.json({ ok: false }, { status: 400 });
-  const worker: any = await controlQuery("jobs:workerRun", {
+  const worker: any = await controlQuery("jobs:detail", {
     jobId,
     ...controlCredentials(actor),
   }).catch(() => null);
-  const runId = typeof worker?.runId === "string" ? worker.runId : "";
+  const runId = typeof worker?.workerRunId === "string" ? worker.workerRunId : "";
   if (!runId) return Response.json({ ok: false, pending: true }, { status: 404 });
   const accessToken = await auth.createPublicToken({
     scopes: { read: { runs: [runId] } },
@@ -29,4 +29,3 @@ export async function POST(req: NextRequest) {
     { headers: { "cache-control": "private, no-store" } },
   );
 }
-

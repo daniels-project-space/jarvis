@@ -9,7 +9,10 @@ import {
 
 export type { WorkspaceCheckpoint } from "../lib/workspace-checkpoint";
 
-export type CloudWorkspaceProviderName = "e2b" | "daytona" | "sandbox0" | "cloudflare";
+export type CloudWorkspaceProviderName = "e2b" | "sandbox0" | "vercel" | "cloudflare";
+// Persisted attempts and checkpoint manifests can still name the retired
+// provider. Historical identity is data, not execution authority.
+export type HistoricalCloudWorkspaceProviderName = CloudWorkspaceProviderName | "daytona";
 export type CloudWorkspaceFailureCode =
   | "missing_configuration"
   | "invalid_configuration"
@@ -31,7 +34,7 @@ export type CloudWorkspaceFailureCode =
 
 export class CloudWorkspaceError extends Error {
   constructor(
-    readonly provider: CloudWorkspaceProviderName,
+    readonly provider: HistoricalCloudWorkspaceProviderName,
     readonly code: CloudWorkspaceFailureCode,
     message: string,
     readonly disposition: "blocked" | "deferred" | "rejected" = "blocked",
@@ -124,6 +127,12 @@ export interface CloudWorkspaceProvider {
     limits: WorkspaceLimits;
   }): Promise<CloudWorkspace>;
   uploadCredentiallessArchive(workspace: CloudWorkspace, archive: CredentiallessArchive): Promise<void>;
+  /**
+   * Controller-owned dependency setup. Providers that need a narrowly opened
+   * package registry implement this after source upload and before Codex is
+   * allowed to run. It is deliberately not a general command escape hatch.
+   */
+  hydrateDependencies?(workspace: CloudWorkspace): Promise<void>;
   exec(workspace: CloudWorkspace, request: ExecRequest): Promise<ExecResult>;
   readFile(workspace: CloudWorkspace, path: string, maxBytes: number): Promise<Uint8Array>;
   writeFile(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number): Promise<void>;
@@ -186,7 +195,7 @@ export function assertRequiredCapabilities(provider: CloudWorkspaceProvider): vo
 
 const WINDOWS_ABSOLUTE = /^[a-zA-Z]:[\\/]/;
 
-export function validateRelativePath(value: string, provider: CloudWorkspaceProviderName = "cloudflare"): string {
+export function validateRelativePath(value: string, provider: HistoricalCloudWorkspaceProviderName = "cloudflare"): string {
   const path = value.replace(/\\/g, "/");
   if (!path || path.includes("\0") || path.startsWith("/") || WINDOWS_ABSOLUTE.test(value)) {
     throw new CloudWorkspaceError(provider, "unsafe_archive", `unsafe absolute or empty path: ${value}`, "rejected");
@@ -224,7 +233,7 @@ function verifyTarChecksum(bytes: Uint8Array, offset: number): boolean {
 
 export type ValidatedTarMember = { path: string; type: "0" | "5" | "g"; size: number; data: Uint8Array };
 
-function validateGlobalPax(data: Uint8Array, provider: CloudWorkspaceProviderName): void {
+function validateGlobalPax(data: Uint8Array, provider: HistoricalCloudWorkspaceProviderName): void {
   const text = new TextDecoder("utf-8", { fatal: true }).decode(data);
   if (!text) throw new CloudWorkspaceError(provider, "unsafe_archive", "archive has empty pax metadata", "rejected");
   let offset = 0;
@@ -251,7 +260,8 @@ function validateGlobalPax(data: Uint8Array, provider: CloudWorkspaceProviderNam
 export function validatedTarMembers(
   bytes: Uint8Array,
   limits: Pick<WorkspaceLimits, "maxArchiveBytes" | "maxFileBytes"> = DEFAULT_WORKSPACE_LIMITS,
-  provider: CloudWorkspaceProviderName = "cloudflare",
+  provider: HistoricalCloudWorkspaceProviderName = "cloudflare",
+  memberMaxBytes = limits.maxFileBytes,
 ): ValidatedTarMember[] {
   if (!bytes.byteLength || bytes.byteLength > limits.maxArchiveBytes) {
     throw new CloudWorkspaceError(provider, "resource_limit", "archive byte count is empty or exceeds the configured limit", "rejected");
@@ -291,7 +301,7 @@ export function validatedTarMembers(
     let size;
     try { size = tarOctal(bytes, offset + 124, 12); }
     catch { throw new CloudWorkspaceError(provider, "unsafe_archive", "archive member size is malformed", "rejected"); }
-    if (!Number.isSafeInteger(size) || size < 0 || size > limits.maxFileBytes) {
+    if (!Number.isSafeInteger(size) || size < 0 || size > memberMaxBytes) {
       throw new CloudWorkspaceError(provider, "resource_limit", "archive member exceeds the configured byte limit", "rejected");
     }
     if (type !== "0" && type !== "5" && type !== "g") {
@@ -326,7 +336,7 @@ export function validatedTarMembers(
 export function validateCredentiallessArchive(
   archive: CredentiallessArchive,
   limits: Pick<WorkspaceLimits, "maxArchiveBytes" | "maxFileBytes"> = DEFAULT_WORKSPACE_LIMITS,
-  provider: CloudWorkspaceProviderName = "cloudflare",
+  provider: HistoricalCloudWorkspaceProviderName = "cloudflare",
 ): void {
   if (!/^[0-9a-f]{40,64}$/i.test(archive.baseSha)) {
     throw new CloudWorkspaceError(provider, "unsafe_archive", "archive base SHA is invalid", "rejected");
@@ -342,7 +352,7 @@ const SECRET_LIKE = /(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:gh[opsu]_[A-Za-z
 export function validateSandboxOutput(
   value: string,
   maxBytes: number,
-  provider: CloudWorkspaceProviderName = "cloudflare",
+  provider: HistoricalCloudWorkspaceProviderName = "cloudflare",
 ): string {
   if (Buffer.byteLength(value) > maxBytes) {
     throw new CloudWorkspaceError(provider, "resource_limit", "sandbox output exceeds its byte limit", "rejected");
@@ -356,7 +366,7 @@ export function validateSandboxOutput(
   return value;
 }
 
-function patchPath(raw: string, provider: CloudWorkspaceProviderName): string {
+function patchPath(raw: string, provider: HistoricalCloudWorkspaceProviderName): string {
   if (raw === "/dev/null") return raw;
   if (raw.startsWith("\"") || /\s/.test(raw)) {
     throw new CloudWorkspaceError(provider, "unsafe_patch", "quoted or whitespace-bearing patch paths are not accepted", "rejected");
@@ -369,7 +379,7 @@ export function validatePatchManifest(
   manifest: PatchManifest,
   expectedBaseSha: string,
   maxBytes = DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes,
-  provider: CloudWorkspaceProviderName = "cloudflare",
+  provider: HistoricalCloudWorkspaceProviderName = "cloudflare",
 ): void {
   if (manifest.baseSha !== expectedBaseSha) {
     throw new CloudWorkspaceError(provider, "unsafe_patch", "patch base SHA changed during execution", "rejected");
@@ -457,7 +467,11 @@ export function validatePortableCheckpointArchive(
   if (archive.byteLength !== manifest.archiveBytes || sha256Bytes(archive) !== manifest.archiveSha256) {
     throw new CloudWorkspaceError(manifest.provider, "digest_mismatch", "portable checkpoint bytes do not match the canonical manifest", "rejected");
   }
-  const members = validatedTarMembers(archive, limits, manifest.provider);
+  // A portable checkpoint carries controller-owned source.tar and patch
+  // artifacts, not public files. Their members may be up to the archive cap;
+  // the nested credentialless source archive is still validated at 5 MiB per
+  // public source file below.
+  const members = validatedTarMembers(archive, limits, manifest.provider, limits.maxArchiveBytes);
   if (members.length !== 2 || members.some((member) => member.type !== "0")) {
     throw new CloudWorkspaceError(manifest.provider, "unsafe_archive", "portable checkpoint must contain exactly two regular members", "rejected");
   }

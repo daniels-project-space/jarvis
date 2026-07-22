@@ -2,9 +2,8 @@
 
 import { viewerFetch } from "./viewer-request";
 
-// One speech route and one queue. The authenticated server can use the private
-// Voicebox profile when its cloud GPU is warm, with a free neural no-silence
-// fallback. The browser only decodes audio; it never loads a model.
+// One speech route and one queue: free streamed en-GB-RyanNeural. The browser
+// only decodes audio; it never loads a model or falls back to SpeechSynthesis.
 
 type SpeechBatch = {
   generation: number;
@@ -20,7 +19,7 @@ type SpeechBatch = {
 type AudioResult = { audio: ArrayBuffer };
 
 const ECHO_GUARD_TAIL_MS = 45_000;
-const REQUEST_TIMEOUT_MS = 7_000;
+const REQUEST_TIMEOUT_MS = 4_000;
 // Edge handles sentence rhythm better than a browser-side chain of tiny MP3s.
 // Keep ordinary replies in one request and split only genuinely long speech.
 // The old 56-character ceiling created a network/decode seam every few words.
@@ -210,10 +209,11 @@ function speechSpeed(text: string): number {
   return 1.1;
 }
 
-async function requestAudio(text: string, expectedGeneration: number, attempt = 0): Promise<AudioResult> {
+async function requestAudio(text: string, expectedGeneration: number): Promise<AudioResult> {
   if (expectedGeneration !== generation) throw new Error("speech cancelled");
   const controller = new AbortController();
   pendingRequests.add(controller);
+  if (typeof document !== "undefined") document.documentElement.dataset.jarvisTtsRequestMs = String(Math.round(performance.now()));
   const timeout = window.setTimeout(() => controller.abort("TTS timed out"), REQUEST_TIMEOUT_MS);
   try {
     const response = await viewerFetch("/api/tts", {
@@ -232,12 +232,6 @@ async function requestAudio(text: string, expectedGeneration: number, attempt = 
     const audio = await response.arrayBuffer();
     if (audio.byteLength < 512) throw new Error("TTS returned empty audio");
     return { audio };
-  } catch (error) {
-    if (attempt === 0 && expectedGeneration === generation) {
-      await new Promise((resolve) => setTimeout(resolve, 60));
-      return requestAudio(text, expectedGeneration, 1);
-    }
-    throw error;
   } finally {
     window.clearTimeout(timeout);
     pendingRequests.delete(controller);
@@ -276,6 +270,7 @@ async function playAudio(result: AudioResult, expectedGeneration: number, onEner
   if (context.state === "suspended") await context.resume();
   const buffer = await context.decodeAudioData(result.audio.slice(0));
   if (expectedGeneration !== generation) return false;
+  if (typeof document !== "undefined") document.documentElement.dataset.jarvisTtsFirstPlayableMs = String(Math.round(performance.now()));
   const source = context.createBufferSource();
   const analyser = context.createAnalyser();
   analyser.fftSize = 128;
