@@ -99,6 +99,26 @@ export type WorkSafetyDecision = {
 const NON_MUTATING_LEAD =
   /^(?:please\s+)?(?:research|investigate|inspect|audit|review|analyse|analyze|compare|summari[sz]e|report|recommend|brainstorm|plan|draft|design|draw|illustrat|write|explain|calculate|model|prototype|test|verify|locate|list)\b/i;
 
+// A read-only verb is context, not authority for the rest of its clause. Only
+// an explicit analytical complement ("audit whether/how/why ...") may make a
+// matched action the object of analysis. Punctuation and direct coordination
+// deliberately end that relationship.
+const ANALYTICAL_COMPLEMENT_LEAD =
+  /^(?:(?:why|how)\b|(?:whether|if|when|where|which|what)\b.*\b(?:can|could|may|might|would|should|will|to)\s*$)/i;
+
+const ANALYTICAL_NOMINAL_ACTION_TAIL =
+  /^(?:association|behavio(?:u)?r|boundary|case|code|contract|flow|handler|handling|idempotency|logic|path|pipeline|policy|procedure|request|semantics|simulation|state|test|trace|transition)\b/i;
+
+// Vercel cleanup recovery is a deliberately exact, non-resuming simulation:
+// read the named sandbox without starting it, then delete only that same name.
+// Bind the exception to both complete clauses so a suffix action or a changed
+// object cannot borrow the safe recovery context.
+const NON_RESUMING_SANDBOX_READ =
+  /^(?:please\s+)?test\s+Sandbox\.get\(\{\s*resume\s*:\s*false\s*\}\)$/i;
+
+const EXACT_NAME_SANDBOX_DELETE =
+  /^if\s+it\s+exists\s*,\s*exact-name\s+delete\s+it$/i;
+
 const NEGATED_LEAD =
   /^(?:do\s+not|don't|never|must\s+not|should\s+not|may\s+not|cannot|can't|without|avoid|forbid(?:den)?|prohibit(?:ed)?|no\b)/i;
 
@@ -169,6 +189,10 @@ function cleanClause(value: string): string {
   return value.trim().replace(/^[-*•]+\s*/, "");
 }
 
+function cleanGrammar(value: string): string {
+  return cleanClause(value).replace(/[`*_]/g, "").trim();
+}
+
 function clauses(task: string): string[] {
   const result: string[] = [];
   let current = "";
@@ -195,7 +219,10 @@ function clauses(task: string): string[] {
       continue;
     }
 
-    if (character === "\n" || character === "\r" || /[.;!?]/.test(character)) {
+    const identifierMemberDot = character === "."
+      && /[a-z0-9_$]/i.test(task[index - 1] ?? "")
+      && /[a-z0-9_$]/i.test(task[index + 1] ?? "");
+    if (character === "\n" || character === "\r" || (!identifierMemberDot && /[.;!?]/.test(character))) {
       finish();
       if (character === "\r" && task[index + 1] === "\n") index += 1;
       continue;
@@ -224,6 +251,29 @@ function clauses(task: string): string[] {
   }
   finish();
   return result;
+}
+
+function nonMutatingActionObject(clause: string, actionIndex: number, actionLength: number): boolean {
+  const before = cleanGrammar(clause.slice(0, actionIndex));
+  const lead = before.match(NON_MUTATING_LEAD);
+  if (!lead) return false;
+  const complement = before.slice(lead[0].length).trim();
+  if (/[,;:\u2013\u2014]/.test(complement)) return false;
+  if (ANALYTICAL_COMPLEMENT_LEAD.test(complement)) return true;
+
+  // Compact technical phrases such as "review delete handling" use the
+  // action word as a noun modifier. Keep the tail allowlist grammatical and
+  // technical; external objects such as "the tenant" or "the supplier" do
+  // not qualify.
+  if (complement.length > 0) return false;
+  return ANALYTICAL_NOMINAL_ACTION_TAIL.test(
+    cleanGrammar(clause.slice(actionIndex + actionLength)),
+  );
+}
+
+function exactNonResumingRecoveryDelete(allClauses: string[], clauseIndex: number, clause: string): boolean {
+  if (clauseIndex === 0 || !EXACT_NAME_SANDBOX_DELETE.test(cleanGrammar(clause))) return false;
+  return NON_RESUMING_SANDBOX_READ.test(cleanGrammar(allClauses[clauseIndex - 1]));
 }
 
 function quotedActionContext(clause: string, actionIndex: number): string | null {
@@ -355,7 +405,9 @@ export function classifyWorkSafety(
   task: string,
   options?: { repo?: string },
 ): WorkSafetyDecision {
-  for (const clause of clauses(task)) {
+  const taskClauses = clauses(task);
+  for (let clauseIndex = 0; clauseIndex < taskClauses.length; clauseIndex += 1) {
+    const clause = taskClauses[clauseIndex];
     const matcher = new RegExp(CONSEQUENTIAL_ACTION.source, "gi");
     for (const match of clause.matchAll(matcher)) {
       const action = match[0];
@@ -369,10 +421,14 @@ export function classifyWorkSafety(
       if (NEGATED_TAIL.test(beforeAction)) continue;
       if (REPORTED_ACTION_TAIL.test(beforeAction)) continue;
 
-      // "Audit whether X can send" describes a read-only outcome. A mixed
-      // instruction such as "research options and purchase one" is split at
-      // the conjunction, so its purchase clause still reaches the gate.
-      if (quoteContext === null && NON_MUTATING_LEAD.test(clause)) continue;
+      if (
+        quoteContext === null
+        && (
+          nonMutatingActionObject(clause, actionIndex, action.length)
+          || (action.toLocaleLowerCase("en-GB") === "delete"
+            && exactNonResumingRecoveryDelete(taskClauses, clauseIndex, clause))
+        )
+      ) continue;
       if (softwareDeliveryAllowed(action, clause, options?.repo, actionIndex)) {
         continue;
       }

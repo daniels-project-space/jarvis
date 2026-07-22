@@ -31,3 +31,25 @@ export const INTEGRATION_FINAL_BARRIER_APPROVAL_TASK = [
   "Run focused integration tests, the full suite, typecheck, build, audit, and secret scan.",
   "Commit only the isolated worker branch and leave controller delivery separate.",
 ].join("\n");
+
+export const READ_ONLY_PREFIX_APPROVAL_TASKS = [
+  "Audit the provider, pay the supplier.",
+  "Audit the provider: pay the supplier.",
+  "Review the sandbox, publish the findings publicly.",
+  "Investigate the failure, send the tenant reply.",
+  "Test the cleanup, delete production records.",
+  "Verify the result, trade the selected shares.",
+  "Inspect Sandbox.get({ resume: false }), pay the supplier.",
+  "Audit Sandbox.get({ resume: false }): delete production records.",
+  "Audit Sandbox.get({ resume: false }) — send the tenant reply.",
+  "Audit Sandbox.get({ resume: false }) then pay the supplier.",
+  "Audit Sandbox.get({ resume: false }); if it exists, exact-name delete it, pay the supplier.",
+  "Audit Sandbox.get({ resume: false }); if it exists, exact-name delete it: publish publicly.",
+] as const;
+
+export const READ_ONLY_PREFIX_AUTONOMOUS_TASKS = [
+  "Audit whether a worker can send a tenant reply without actually sending it.",
+  "Review the test proving that public publishing remains blocked.",
+  "Inspect the fake-provider trace for an attempted exact-name delete.",
+  "Test Sandbox.get({ resume: false }); if it exists, exact-name delete it.",
+] as const;

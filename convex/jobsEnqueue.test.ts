@@ -5,6 +5,10 @@ import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
 import schema from "./schema";
 import { MAX_TEXT_WORK_ORDER_BYTES, textWorkOrderByteLength } from "../src/lib/work-order";
+import {
+  READ_ONLY_PREFIX_APPROVAL_TASKS,
+  READ_ONLY_PREFIX_AUTONOMOUS_TASKS,
+} from "../src/mastra/fixtures/work-policy-regressions";
 
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
@@ -101,5 +105,27 @@ describe("bounded exact textual work orders", () => {
       status: "awaiting_approval",
       deliveryMode: "manual",
     });
+  });
+
+  it("persists read-only-prefix exploits behind approval and bounded simulations as runnable", async () => {
+    const t = convexTest(schema, modules);
+    for (const task of READ_ONLY_PREFIX_APPROVAL_TASKS) {
+      const jobId = await t.mutation(api.jobs.enqueue, { task, repo: REPO, workerToken: WORKER });
+      expect(await t.run(async (ctx) => await ctx.db.get(jobId)), task).toMatchObject({
+        task,
+        approvalRequired: true,
+        status: "awaiting_approval",
+        deliveryMode: "manual",
+      });
+    }
+    for (const task of READ_ONLY_PREFIX_AUTONOMOUS_TASKS) {
+      const jobId = await t.mutation(api.jobs.enqueue, { task, repo: REPO, workerToken: WORKER });
+      expect(await t.run(async (ctx) => await ctx.db.get(jobId)), task).toMatchObject({
+        task,
+        approvalRequired: false,
+        status: "pending",
+        deliveryMode: "auto_merge",
+      });
+    }
   });
 });

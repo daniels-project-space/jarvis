@@ -6,6 +6,8 @@ import { plannerTask, routeGoal, validatorTask } from "../lib/goal-mode";
 import { classifyWorkSafety, SAFE_SANDBOX_EXECUTION_RULES } from "../lib/work-safety";
 import {
   INTEGRATION_FINAL_BARRIER_APPROVAL_TASK,
+  READ_ONLY_PREFIX_APPROVAL_TASKS,
+  READ_ONLY_PREFIX_AUTONOMOUS_TASKS,
   WORKSPACE_ISOLATION_APPROVAL_TASK,
 } from "./fixtures/work-policy-regressions";
 
@@ -97,6 +99,74 @@ describe("server-side work approval policy", () => {
         readonly: true,
       }).required,
     ).toBe(true);
+  });
+
+  it("binds a read-only lead to its analytical object through every executable policy", () => {
+    const repo = "daniels-project-space/jarvis";
+    for (const task of READ_ONLY_PREFIX_APPROVAL_TASKS) {
+      expect(classifyWorkSafety(task, { repo }).approvalRequired, `classifier: ${task}`).toBe(true);
+      expect(
+        workApprovalPolicy({ task, repo, readonly: true, risk: "low", approvalRequired: false }).required,
+        `standalone: ${task}`,
+      ).toBe(true);
+      for (const goalStage of ["building", "refining"] as const) {
+        expect(
+          goalWorkApprovalPolicy({ task, repo, readonly: true, risk: "low", approvalRequired: false, goalStage }).required,
+          `${goalStage}: ${task}`,
+        ).toBe(true);
+      }
+    }
+
+    for (const task of READ_ONLY_PREFIX_AUTONOMOUS_TASKS) {
+      expect(classifyWorkSafety(task, { repo }).approvalRequired, `classifier: ${task}`).toBe(false);
+      expect(workApprovalPolicy({ task, repo }).required, `standalone: ${task}`).toBe(false);
+      for (const goalStage of ["building", "refining"] as const) {
+        expect(goalWorkApprovalPolicy({ task, repo, goalStage }).required, `${goalStage}: ${task}`).toBe(false);
+      }
+    }
+  });
+
+  it("handles punctuation, formatting, hypotheses, reports, and consequence families without hints", () => {
+    const unsafe = [
+      "Please audit the provider, pay the supplier.",
+      "AUDIT THE PROVIDER: PAY THE SUPPLIER.",
+      "- **Review** the sandbox — **publish** the findings publicly.",
+      "* Investigate   the failure,   send the tenant reply.",
+      "Test the cleanup,\r\ndelete production records.",
+      "Verify the result – trade the selected shares.",
+      "Inspect the credential plan: rotate a key.",
+      "Review the release, deploy the live provider change.",
+      "Analyse the invoice, charge the customer.",
+      "Summarize the findings, post them publicly.",
+      "List the errors, contact the tenant.",
+      "Audit the itinerary; reserve the room.",
+      "Audit when ready pay the supplier.",
+      "\"Audit the provider, pay the supplier.\"",
+    ];
+    for (const task of unsafe) {
+      expect(
+        workApprovalPolicy({
+          task,
+          repo: "daniels-project-space/jarvis",
+          readonly: true,
+          risk: "low",
+          approvalRequired: false,
+        }).required,
+        task,
+      ).toBe(true);
+    }
+
+    const autonomous = [
+      "Please audit how to send a tenant reply without sending it.",
+      "**Review** delete handling in the recovery state machine.",
+      "- Test `Sandbox.get({ resume: false })`;\r\n  if it exists, exact-name delete it.",
+      "The instruction was \"Audit the provider, pay the supplier.\"",
+      "Audit the provider. Do not pay the supplier.",
+    ];
+    for (const task of autonomous) {
+      expect(classifyWorkSafety(task, { repo: "jarvis" }).approvalRequired, task).toBe(false);
+      expect(workApprovalPolicy({ task, repo: "jarvis" }).required, task).toBe(false);
+    }
   });
 
   it("does not grant autonomous writes outside Daniel's portfolio", () => {
