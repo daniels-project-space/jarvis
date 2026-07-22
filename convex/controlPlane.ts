@@ -3,8 +3,10 @@
 // them in the same Convex transaction without calling another function.
 
 import {
+  canonicalAttemptAuthority,
   canonicalSchedulingBinding,
   DISPATCH_SCHEDULER_KEY,
+  integrationLineageForAuthority,
   projectedSchedulingBindingMatches,
   schedulingBindingForJob,
   schedulingAuthorityMatches,
@@ -14,6 +16,11 @@ import {
   type WorkGroupAuthority,
 } from "../src/lib/work-scheduler";
 import { workItemIdentity } from "../src/lib/workspace-protocol";
+import {
+  isSafeSourceBranch,
+  projectSourceAdmissionIsValid,
+  type ProjectSourceAdmission,
+} from "../src/lib/source-admission";
 
 function defined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
@@ -73,6 +80,7 @@ export function projectJobRuntime(job: any) {
     goalWave: typeof job.goalWave === "number" ? job.goalWave : undefined,
     missionGroupId: typeof job.missionGroupId === "string" ? job.missionGroupId.slice(0, 240) : undefined,
     projectGroupId: typeof job.projectGroupId === "string" ? job.projectGroupId.slice(0, 240) : undefined,
+    canonicalProjectId: typeof job.canonicalProjectId === "string" ? job.canonicalProjectId.slice(0, 120) : undefined,
     projectRepository: typeof job.projectRepository === "string" ? job.projectRepository.slice(0, 120) : undefined,
     schedulingGroupKey: typeof job.schedulingGroupKey === "string" ? job.schedulingGroupKey.slice(0, 1_200) : undefined,
     schedulingProtocolVersion: typeof job.schedulingProtocolVersion === "number" ? job.schedulingProtocolVersion : undefined,
@@ -80,12 +88,18 @@ export function projectJobRuntime(job: any) {
     schedulingBindingDigest: typeof job.schedulingBindingDigest === "string" ? job.schedulingBindingDigest.slice(0, 64) : undefined,
     schedulingBound: job.schedulingBound === true,
     dispatchReady: job.dispatchReady === true,
+    sourceProvider: typeof job.sourceProvider === "string" ? job.sourceProvider.slice(0, 24) : undefined,
     sourceBranch: typeof job.sourceBranch === "string" ? job.sourceBranch.slice(0, 240) : undefined,
+    sourceRef: typeof job.sourceRef === "string" ? job.sourceRef.slice(0, 260) : undefined,
     sourceHeadSha: typeof job.sourceHeadSha === "string" ? job.sourceHeadSha.slice(0, 80) : undefined,
+    sourceObservedAt: typeof job.sourceObservedAt === "number" ? job.sourceObservedAt : undefined,
+    sourceAdmissionDigest: typeof job.sourceAdmissionDigest === "string" ? job.sourceAdmissionDigest.slice(0, 64) : undefined,
     integrationBranch: typeof job.integrationBranch === "string" ? job.integrationBranch.slice(0, 240) : undefined,
     workerBranch: typeof job.workerBranch === "string" ? job.workerBranch.slice(0, 240) : undefined,
+    workerLineage: typeof job.workerLineage === "string" ? job.workerLineage.slice(0, 240) : undefined,
     workspaceLineage: typeof job.workspaceLineage === "string" ? job.workspaceLineage.slice(0, 240) : undefined,
     retryLineage: typeof job.retryLineage === "string" ? job.retryLineage.slice(0, 240) : undefined,
+    integrationLineage: typeof job.integrationLineage === "string" ? job.integrationLineage.slice(0, 1_200) : undefined,
     integrationAttemptId: job.integrationAttemptId,
     integrationState: typeof job.integrationState === "string" ? job.integrationState.slice(0, 40) : undefined,
     evidenceSummary: typeof job.evidenceSummary === "string" ? job.evidenceSummary.slice(0, 500) : undefined,
@@ -125,6 +139,7 @@ export function projectMissionRuntime(mission: any) {
     percent: Math.max(0, Math.min(100, Number(mission.percent ?? 0))),
     route: typeof mission.route === "string" ? mission.route.slice(0, 80) : undefined,
     primaryRepo: typeof mission.primaryRepo === "string" ? mission.primaryRepo.slice(0, 120) : undefined,
+    canonicalProjectId: typeof mission.canonicalProjectId === "string" ? mission.canonicalProjectId.slice(0, 120) : undefined,
     revisionWave: Math.max(0, Number(mission.revisionWave ?? 0)),
     maxRevisionWaves: Math.max(0, Number(mission.maxRevisionWaves ?? 0)),
     maxBuildSessions: Math.max(0, Number(mission.maxBuildSessions ?? 0)),
@@ -134,8 +149,10 @@ export function projectMissionRuntime(mission: any) {
     planGeneration: typeof mission.planGeneration === "number" ? mission.planGeneration : undefined,
     planNodeCount: typeof mission.planNodeCount === "number" ? mission.planNodeCount : undefined,
     sourceBranch: typeof mission.sourceBranch === "string" ? mission.sourceBranch.slice(0, 240) : undefined,
+    sourceHeadSha: typeof mission.sourceHeadSha === "string" ? mission.sourceHeadSha.slice(0, 80) : undefined,
     integrationBranch: typeof mission.integrationBranch === "string" ? mission.integrationBranch.slice(0, 240) : undefined,
     integrationHeadSha: typeof mission.integrationHeadSha === "string" ? mission.integrationHeadSha.slice(0, 80) : undefined,
+    integrationObservedAt: typeof mission.integrationObservedAt === "number" ? mission.integrationObservedAt : undefined,
     integrationGeneration: Math.max(0, Number(mission.integrationGeneration ?? 0)),
     activeIntegrationAttemptId: mission.activeIntegrationAttemptId,
     integrationLeaseUntil: typeof mission.integrationLeaseUntil === "number" ? mission.integrationLeaseUntil : undefined,
@@ -215,16 +232,12 @@ export async function upsertMissionRuntime(ctx: any, mission: any) {
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any -- shared internal Convex document helpers follow this module's rollout-compatible shape */
-function persistedAuthorityConflicts(job: any, expected: WorkGroupAuthority) {
-  return (["missionGroupId", "projectGroupId", "projectRepository", "schedulingGroupKey"] as const)
-    .some((field) => job[field] !== undefined && job[field] !== expected[field]);
-}
-
 const IMMUTABLE_JOB_BINDING_FIELDS = [
   "repo", "readonly", "missionId", "planParentMissionId",
-  "missionGroupId", "projectGroupId", "projectRepository", "schedulingGroupKey",
+  "missionGroupId", "projectGroupId", "canonicalProjectId", "projectRepository", "schedulingGroupKey",
   "schedulingProtocolVersion", "schedulingAdmissionId", "schedulingBindingDigest", "schedulingBound",
-  "workerBranch", "workspaceLineage", "retryLineage",
+  "sourceProvider", "sourceBranch", "sourceRef", "sourceHeadSha", "sourceObservedAt", "sourceAdmissionDigest",
+  "workerBranch", "workerLineage", "workspaceLineage", "retryLineage", "integrationBranch", "integrationLineage",
 ] as const;
 
 async function sha256Hex(value: string) {
@@ -237,7 +250,7 @@ function identityForJob(job: any) {
   return workItemIdentity({
     missionId: job.missionId ?? `standalone-${jobId}`,
     jobId,
-    workstreamId: job.goalWorkstreamId ?? job.label,
+    workstreamId: job.goalWorkstreamId,
     readonly: Boolean(job.readonly || !job.repo),
   });
 }
@@ -248,12 +261,22 @@ function admissionMatchesBinding(admission: any, binding: SchedulingBinding, dig
     && String(admission.jobId) === binding.jobId
     && admission.missionGroupId === binding.missionGroupId
     && admission.projectGroupId === binding.projectGroupId
+    && admission.canonicalProjectId === binding.canonicalProjectId
     && admission.projectRepository === binding.projectRepository
     && admission.schedulingGroupKey === binding.schedulingGroupKey
     && Boolean(admission.readonly) === binding.readonly
+    && admission.sourceProvider === binding.sourceProvider
+    && admission.sourceBranch === binding.sourceBranch
+    && admission.sourceRef === binding.sourceRef
+    && admission.sourceHeadSha === binding.sourceHeadSha
+    && admission.sourceObservedAt === binding.sourceObservedAt
+    && admission.sourceAdmissionDigest === binding.sourceAdmissionDigest
     && admission.workerBranch === binding.workerBranch
+    && admission.workerLineage === binding.workerLineage
     && admission.workspaceLineage === binding.workspaceLineage
     && admission.retryLineage === binding.retryLineage
+    && admission.integrationBranch === binding.integrationBranch
+    && admission.integrationLineage === binding.integrationLineage
     && admission.bindingDigest === digest;
 }
 
@@ -265,6 +288,7 @@ async function schedulingGroupForBinding(ctx: any, binding: SchedulingBinding) {
   if (existing && (
     existing.missionGroupId !== binding.missionGroupId
     || existing.projectGroupId !== binding.projectGroupId
+    || existing.canonicalProjectId !== binding.canonicalProjectId
     || existing.projectRepository !== binding.projectRepository
   )) return null;
   if (existing) return existing;
@@ -275,6 +299,7 @@ async function schedulingGroupForBinding(ctx: any, binding: SchedulingBinding) {
     groupKey: binding.schedulingGroupKey,
     missionGroupId: binding.missionGroupId,
     projectGroupId: binding.projectGroupId,
+    canonicalProjectId: binding.canonicalProjectId,
     projectRepository: binding.projectRepository,
     lastServedSequence: Number(scheduler?.nextSequence ?? 0),
     reservationCount: 0,
@@ -298,6 +323,50 @@ export async function readJobSchedulingAuthority(ctx: any, job: any) {
   return { binding, admission, digest };
 }
 
+export async function attemptAuthorityFields(ctx: any, job: any, attempt: number) {
+  const authority = await readJobSchedulingAuthority(ctx, job);
+  if (!authority || !Number.isSafeInteger(attempt) || attempt < 1) {
+    throw new Error("Attempt authority requires one admitted job and positive attempt");
+  }
+  const authorityDigest = await sha256Hex(canonicalAttemptAuthority({
+    binding: authority.binding,
+    bindingDigest: authority.digest,
+    attempt,
+  }));
+  return {
+    authorityDigest,
+    schedulingBindingDigest: authority.digest,
+    canonicalProjectId: authority.binding.canonicalProjectId,
+    repository: authority.binding.projectRepository,
+    missionGroupId: authority.binding.missionGroupId,
+    projectGroupId: authority.binding.projectGroupId,
+    sourceBranch: authority.binding.sourceBranch,
+    sourceHeadSha: authority.binding.sourceHeadSha,
+    sourceAdmissionDigest: authority.binding.sourceAdmissionDigest,
+    workerLineage: authority.binding.workerLineage,
+    workspaceLineage: authority.binding.workspaceLineage,
+    retryLineage: authority.binding.retryLineage,
+    integrationLineage: authority.binding.integrationLineage,
+  };
+}
+
+/**
+ * Point-read and re-hash the exact job/admission/attempt ledger envelope.
+ * Historical rows without this v2 envelope remain visible but cannot execute.
+ */
+export async function readAttemptExecutionAuthority(ctx: any, job: any, attemptNumber: number) {
+  let expected;
+  try { expected = await attemptAuthorityFields(ctx, job, attemptNumber); }
+  catch { return null; }
+  const attempt = await ctx.db.query("workAttempts")
+    .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", attemptNumber))
+    .first();
+  if (!attempt) return null;
+  const fields = Object.keys(expected) as Array<keyof typeof expected>;
+  if (fields.some((field) => attempt[field] !== expected[field])) return null;
+  return { attempt, ...expected };
+}
+
 export function runtimeMatchesSchedulingAuthority(runtime: any, authority: {
   binding: SchedulingBinding;
   admission: any;
@@ -313,95 +382,31 @@ export function runtimeMatchesSchedulingAuthority(runtime: any, authority: {
     );
 }
 
-/**
- * Bind a legacy or newly inserted job to one immutable fair-scheduling group.
- * Any later repository/mission substitution conflicts with this admission and
- * fails closed before a worker reservation exists.
- */
-export async function ensureJobSchedulingAuthority(ctx: any, job: any, dispatchReady?: boolean) {
-  const derived = workGroupAuthority(job);
-  if (persistedAuthorityConflicts(job, derived)) return null;
-  const identity = identityForJob(job);
-  if ((job.workspaceLineage !== undefined && job.workspaceLineage !== identity.workspaceLineage)
-    || (job.retryLineage !== undefined && job.retryLineage !== identity.retryLineage)
-    || (identity.workerBranch && job.workerBranch !== undefined && job.workerBranch !== identity.workerBranch)) return null;
-  const normalized = {
-    ...job,
-    ...derived,
-    readonly: Boolean(job.readonly || !job.repo),
-    workerBranch: identity.workerBranch,
-    workspaceLineage: identity.workspaceLineage,
-    retryLineage: identity.retryLineage,
-    sourceBranch: job.sourceBranch ?? job.branch,
-    branch: identity.workerBranch ?? job.branch,
-    dispatchReady: dispatchReady ?? job.dispatchReady ?? (!Array.isArray(job.dependsOn) || job.dependsOn.length === 0),
-  };
-  const binding = schedulingBindingForJob(normalized);
-  if (!binding) return null;
-  const digest = await sha256Hex(canonicalSchedulingBinding(binding));
-  const admissions = await ctx.db.query("jobSchedulingAdmissions")
-    .withIndex("by_job", (q: any) => q.eq("jobId", job._id)).take(2);
-  if (admissions.length > 1) return null;
-  let admission = admissions[0];
-  if (admission) {
-    const authorityCompatible = admission.missionGroupId === binding.missionGroupId
-      && admission.projectGroupId === binding.projectGroupId
-      && admission.projectRepository === binding.projectRepository
-      && admission.schedulingGroupKey === binding.schedulingGroupKey;
-    if (!authorityCompatible || (admission.protocolVersion !== undefined && !admissionMatchesBinding(admission, binding, digest))) return null;
-    if (admission.protocolVersion === undefined) {
-      await ctx.db.patch(admission._id, {
-        protocolVersion: SCHEDULING_PROTOCOL_VERSION,
-        readonly: binding.readonly,
-        workerBranch: binding.workerBranch,
-        workspaceLineage: binding.workspaceLineage,
-        retryLineage: binding.retryLineage,
-        bindingDigest: digest,
-      });
-      admission = { ...admission, protocolVersion: SCHEDULING_PROTOCOL_VERSION, readonly: binding.readonly,
-        workerBranch: binding.workerBranch, workspaceLineage: binding.workspaceLineage,
-        retryLineage: binding.retryLineage, bindingDigest: digest };
-    }
-  } else {
-    const value = {
-      protocolVersion: SCHEDULING_PROTOCOL_VERSION,
-      jobId: job._id,
-      missionGroupId: binding.missionGroupId,
-      projectGroupId: binding.projectGroupId,
-      projectRepository: binding.projectRepository,
-      schedulingGroupKey: binding.schedulingGroupKey,
-      readonly: binding.readonly,
-      workerBranch: binding.workerBranch,
-      workspaceLineage: binding.workspaceLineage,
-      retryLineage: binding.retryLineage,
-      bindingDigest: digest,
-      createdAt: Date.now(),
-    };
-    const id = await ctx.db.insert("jobSchedulingAdmissions", value);
-    admission = { ...value, _id: id };
-  }
-  const scheduling = await schedulingGroupForBinding(ctx, binding);
-  if (!scheduling) return null;
-  const boundJob = { ...normalized,
-    schedulingProtocolVersion: SCHEDULING_PROTOCOL_VERSION,
-    schedulingAdmissionId: admission._id,
-    schedulingBindingDigest: digest,
-    schedulingBound: true,
-  };
-  const boundPatch = { ...boundJob };
-  delete boundPatch._id;
-  delete boundPatch._creationTime;
-  await ctx.db.patch(job._id, boundPatch);
-  await upsertJobRuntime(ctx, boundJob);
-  return { job: boundJob, admission, binding, scheduling };
-}
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
 export async function insertJobWithRuntime(ctx: any, value: any) {
+  const projectAdmission = value.projectAdmission as ProjectSourceAdmission | undefined;
+  const requireFreshSourceAdmission = value.requireFreshSourceAdmission === true;
+  const { projectAdmission: _projectAdmission, requireFreshSourceAdmission: _fresh, ...persistedValue } = value;
+  if (!persistedValue.missionId) throw new Error("Executable work requires an immutable mission group id");
+  if (!projectAdmission || !await projectSourceAdmissionIsValid(projectAdmission, {
+    expectedRepository: persistedValue.repo,
+    requireFresh: requireFreshSourceAdmission,
+  })) throw new Error("Job requires one valid canonical project source admission");
+  if (persistedValue.integrationBranch !== undefined && !isSafeSourceBranch(persistedValue.integrationBranch)) {
+    throw new Error("Job integration branch is invalid");
+  }
   const normalized = {
-    ...value,
-    readonly: Boolean(value.readonly || !value.repo),
-    dispatchReady: value.dispatchReady ?? (!Array.isArray(value.dependsOn) || value.dependsOn.length === 0),
+    ...persistedValue,
+    readonly: Boolean(persistedValue.readonly || !persistedValue.repo),
+    canonicalProjectId: projectAdmission.canonicalProjectId,
+    sourceProvider: projectAdmission.sourceProvider,
+    sourceBranch: projectAdmission.sourceBranch,
+    sourceRef: projectAdmission.sourceRef,
+    sourceHeadSha: projectAdmission.sourceHeadSha,
+    sourceObservedAt: projectAdmission.sourceObservedAt,
+    sourceAdmissionDigest: projectAdmission.sourceAdmissionDigest,
+    dispatchReady: persistedValue.dispatchReady ?? (!Array.isArray(persistedValue.dependsOn) || persistedValue.dependsOn.length === 0),
   };
   const jobId = await ctx.db.insert("jobs", normalized);
   const provisional = { ...normalized, _id: jobId };
@@ -410,11 +415,12 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
   const isolated = {
     ...provisional,
     ...authority,
-    sourceBranch: provisional.sourceBranch ?? provisional.branch,
     workerBranch: identity.workerBranch,
+    workerLineage: identity.workerLineage,
     workspaceLineage: identity.workspaceLineage,
     retryLineage: identity.retryLineage,
-    branch: identity.workerBranch ?? provisional.branch,
+    integrationLineage: integrationLineageForAuthority(authority),
+    branch: identity.workerBranch,
   };
   const binding = schedulingBindingForJob(isolated);
   if (!binding) throw new Error("Job scheduling authority could not be derived");
@@ -424,12 +430,22 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
     jobId,
     missionGroupId: binding.missionGroupId,
     projectGroupId: binding.projectGroupId,
+    canonicalProjectId: binding.canonicalProjectId,
     projectRepository: binding.projectRepository,
     schedulingGroupKey: binding.schedulingGroupKey,
     readonly: binding.readonly,
+    sourceProvider: binding.sourceProvider,
+    sourceBranch: binding.sourceBranch,
+    sourceRef: binding.sourceRef,
+    sourceHeadSha: binding.sourceHeadSha,
+    sourceObservedAt: binding.sourceObservedAt,
+    sourceAdmissionDigest: binding.sourceAdmissionDigest,
     workerBranch: binding.workerBranch,
+    workerLineage: binding.workerLineage,
     workspaceLineage: binding.workspaceLineage,
     retryLineage: binding.retryLineage,
+    integrationBranch: binding.integrationBranch,
+    integrationLineage: binding.integrationLineage,
     bindingDigest: digest,
     createdAt: Date.now(),
   };

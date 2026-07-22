@@ -3,6 +3,7 @@ import { wakeAgentFleet } from "@/lib/agent-fleet-dispatch";
 import { controlMutation, controlQuery } from "@/lib/control-session";
 import { routeGoal } from "@/lib/goal-mode";
 import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
+import { resolveProjectSourceAdmission } from "@/lib/source-admission-server";
 
 export const runtime = "nodejs";
 
@@ -17,6 +18,15 @@ export async function POST(req: NextRequest) {
   }
   const credentials = controlCredentials(actor);
   const route = routeGoal(goal, body?.repo ? String(body.repo) : undefined);
+  let projectAdmission;
+  try {
+    projectAdmission = await resolveProjectSourceAdmission(route.primaryRepo);
+  } catch (error) {
+    return Response.json({
+      ok: false,
+      error: error instanceof Error ? error.message : "Project source admission failed.",
+    }, { status: 400 });
+  }
   const originThreadId = String(
     await controlQuery("ui:getActiveThread", credentials).catch(() => "main"),
   ) || "main";
@@ -25,7 +35,8 @@ export async function POST(req: NextRequest) {
     goal,
     route: route.kind,
     routeReason: route.reason,
-    primaryRepo: route.primaryRepo,
+    primaryRepo: projectAdmission.repository,
+    projectAdmission,
     infrastructureContext: route.infrastructureContext,
     originThreadId,
     priority: 98,

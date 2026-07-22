@@ -150,9 +150,22 @@ export const PROJECT_REGISTRY: ProjectProfile[] = [
     invariants: ["Repos are allowlisted", "Credentials stay in the trusted parent", "Workspace progress must be inspectable"],
     related: ["jarvis", "project-hub"],
   },
+  {
+    slug: "jarvis-memory",
+    name: "Jarvis Memory",
+    repo: "daniels-project-space/jarvis-memory",
+    purpose: "The git-backed Obsidian memory vault for durable JARVIS context.",
+    vision: "Keep consolidated memory inspectable, portable and separate from the live Convex recall path.",
+    objectives: ["Preserve durable consolidated memory", "Keep memory provenance reviewable", "Avoid credentials in model-readable notes"],
+    invariants: ["No secrets in notes", "Convex remains the live recall authority", "Vault writes keep exact repository provenance"],
+    related: ["jarvis", "project-hub"],
+  },
 ];
 
 export const PROJECT_BY_SLUG = new Map(PROJECT_REGISTRY.map((project) => [project.slug, project]));
+export const PROJECT_BY_REPOSITORY = new Map(
+  PROJECT_REGISTRY.map((project) => [project.repo.toLowerCase(), project]),
+);
 
 export function projectProviderBoundary(repo: string): string | null {
   const normalized = repo.trim().replace(/\.git$/, "").toLowerCase();

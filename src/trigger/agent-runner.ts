@@ -95,6 +95,13 @@ import {
   type CloudProviderRuntimeAttestation,
 } from "./cloud-provider-probe-attestation";
 import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, createDeterministicTar, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider, type HistoricalCloudWorkspaceProviderName, type CredentiallessArchive } from "./cloud-workspace";
+import {
+  evidenceProjectSourceAdmission,
+  isSafeSourceBranch,
+  observeGitHubProjectSource,
+  projectSourceAdmissionIsValid,
+  type ProjectSourceAdmission,
+} from "../lib/source-admission";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent against an isolated cloud workspace through controller-owned dynamic
@@ -499,15 +506,28 @@ function resolveRepo(name: string | undefined): string {
   return canonicalizeRepository(name, { allowShortName: true }) ?? "";
 }
 
+async function goalPlanProjectAdmissions(
+  plan: GoalPlan,
+  primaryRepo: string | undefined,
+  token: string,
+): Promise<ProjectSourceAdmission[]> {
+  const repositories = new Set<string>();
+  let needsEvidence = false;
+  for (const stream of plan.workstreams) {
+    const requested = stream.repo || (!stream.readonly ? primaryRepo || plan.primaryRepo : undefined);
+    if (requested) repositories.add(requested);
+    else needsEvidence = true;
+  }
+  const admitted = await Promise.all([...repositories].map((repository) =>
+    observeGitHubProjectSource({ repository, token: token || undefined })));
+  if (needsEvidence || admitted.length === 0) admitted.push(await evidenceProjectSourceAdmission());
+  return admitted;
+}
+
 function workBranch(job: any): string {
-  if (typeof job.branch === "string" && /^jarvis\/[a-z0-9._/-]+$/i.test(job.branch)) return job.branch;
-  const owner = String(job.agentId ?? "agent").toLowerCase().replace(/[^a-z0-9-]/g, "-");
-  const label = String(job.label ?? job.task ?? "work")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 34);
-  return `jarvis/${owner}-${label || "work"}-${String(job.jobId).slice(-6)}`;
+  if (typeof job.workerBranch === "string" && /^jarvis\/work\/[a-z0-9._/-]+$/i.test(job.workerBranch)
+    && job.branch === job.workerBranch) return job.workerBranch;
+  return "";
 }
 
 async function branchHasChanges(repo: string, branch: string, token: string): Promise<boolean | null> {
@@ -578,15 +598,32 @@ export async function runAgentMaintenance() {
     repairs = Number(healer?.claims?.length ?? 0);
     for (const inc of healer?.claims ?? []) {
       const repo = inc.app && inc.app !== "jarvis" ? inc.app : "jarvis";
+      const projectAdmission = await observeGitHubProjectSource({
+        repository: repo,
+        token: process.env.GITHUB_TOKEN || undefined,
+      });
+      const originThreadId = await chatThread();
+      const missionId = await convexMutation("missions:create", {
+        goal: `Repair ${String(inc.message ?? inc.signature ?? "production incident")}`.slice(0, 500),
+        agentCount: 1,
+        mode: "single",
+        projectAdmissions: [projectAdmission],
+        originThreadId,
+        managerAgentId: "jarvis",
+        priority: 90,
+        risk: "high",
+      });
       const repairJobId = await convexMutation("jobs:enqueue", {
         task: repairPrompt(inc, repo),
-        repo,
+        repo: projectAdmission.repository,
+        missionId: String(missionId),
+        projectAdmission,
         model: "sol",
         modelReason: "Paul uses the highest tier for production root-cause repair",
         agentId: "paul",
         risk: "high",
         priority: 90,
-        originThreadId: await chatThread(),
+        originThreadId,
         visibility: "system",
         acceptanceCriteria: [
           "Reproduce or evidence the root cause before editing",
@@ -669,25 +706,53 @@ export async function runAgentMaintenance() {
 // Multi-hour goals continue through checkpointed jobs, never by monopolising a
 // global orchestrator or preventing Jarvis from answering in the foreground.
 export async function runAgentHarness(options: AgentHarnessOptions) {
-    const rejectReservation = async (error: string) => {
-      await convexMutation("jobs:rejectDispatch", {
-        jobId: options.reservation.jobId,
-        dispatchId: options.reservation.dispatchId,
-        reason: error,
+    // Claim first. No provider selection, checkout, Codex binary invocation,
+    // or controller filesystem is allowed to precede the immutable attempt
+    // fence returned by Convex.
+    const job: any = await convexMutation("jobs:claimDispatched", {
+      jobId: options.reservation.jobId,
+      dispatchId: options.reservation.dispatchId,
+      workerRunId: options.reservation.workerRunId,
+    }).catch(() => null);
+    if (!job) return { processed: 0, stale: true };
+    let processed = 1;
+    const expectedAttempt = Number(job.attempt ?? 1);
+    const authorityDigest = typeof job.authorityDigest === "string" ? job.authorityDigest : "";
+    const authorizeBoundary = async (phase:
+      "source_checkout" | "provider_create" | "codex_start" | "codex_resume"
+      | "checkpoint" | "review_receipt" | "integration" | "delivery",
+    ) => await convexMutation("jobs:authorizeExecutionBoundary", {
+      jobId: job.jobId,
+      expectedAttempt,
+      workerRunId: options.reservation.workerRunId,
+      authorityDigest,
+      phase,
+    }).catch(() => null);
+    const failClaimed = async (error: string) => {
+      await convexMutation("jobs:checkpointAndRequeue", {
+        jobId: job.jobId,
+        expectedAttempt,
+        authorityDigest,
+        checkpoint: error,
+        result: error,
+        branch: job.workerBranch ?? undefined,
         delayMs: 60_000,
       }).catch(() => false);
-      return { processed: 0, error };
+      return { processed: 1, error };
     };
+    if (!authorityDigest || !await authorizeBoundary("codex_start")) {
+      return { processed: 1, stale: true, error: "immutable attempt authority rejected before Codex preflight" };
+    }
     const provider: AgentProvider = "codex";
     const bin = resolveSubscriptionAgentBin(provider);
-    if (!bin) return rejectReservation(`no ${provider} binary`);
+    if (!bin) return failClaimed(`no ${provider} binary`);
     const prepared = prepareSubscriptionEnv(provider);
-    if (prepared.error) return rejectReservation(prepared.error);
+    if (prepared.error) return failClaimed(prepared.error);
     const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
-    if (preflight.error) return rejectReservation(preflight.error);
+    if (preflight.error) return failClaimed(preflight.error);
     const missingTools = missingSubscriptionTools(prepared.env);
     if (missingTools.length) {
-      return rejectReservation(`Codex worker toolchain unavailable: missing ${missingTools.join(", ")} on PATH`);
+      return failClaimed(`Codex worker toolchain unavailable: missing ${missingTools.join(", ")} on PATH`);
     }
     const env = prepared.env;
     mkdirSync("/tmp/work", { recursive: true });
@@ -709,7 +774,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         `- Final answer style: plain text, the key outcome first, under 300 words.\n`,
     );
 
-    let processed = 0;
     const failureBackoffMs = (attempt: number) =>
       Math.min(6 * 60 * 60 * 1000, 60_000 * 2 ** Math.max(0, Math.min(12, attempt - 1)));
 
@@ -778,12 +842,14 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           let externalRun: { kind: string; id: string; slug?: string } | undefined;
           let handoffError: unknown;
           const handoff = await withGoalAdvanceRenewal(claim, async () => {
+            const projectAdmissions = await goalPlanProjectAdmissions(plan, claim.primaryRepo, token);
             if (claim.route === "app_factory") externalRun = await startAppFactoryGoal(plan, String(claim.missionId));
             return await convexMutation("goalMode:recordPlan", {
               id: claim.missionId,
               expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
               ...advanceFence(claim),
               plan,
+              projectAdmissions,
               externalRun,
             });
           }).catch((error) => { handoffError = error; return { live: true, value: null }; });
@@ -939,7 +1005,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       let providerWorkspace: CloudWorkspace | null = null;
       const linearizeDelivery = async () => {
         const lease = await convexMutation("jobs:linearizeDelivery", {
-          jobId: job.jobId, expectedAttempt, deliveryLeaseOwner: deliveryOwner, deliveryLeaseToken: deliveryToken,
+          jobId: job.jobId, expectedAttempt, authorityDigest,
+          deliveryLeaseOwner: deliveryOwner, deliveryLeaseToken: deliveryToken,
           deliveryLeaseVersion: deliveryLease?.version,
           ...(deliveryFence ?? {}),
         }).catch(() => null);
@@ -950,14 +1017,15 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       const deliveryMutation = async (path: string, args: Record<string, unknown>) => {
         if (!await linearizeDelivery() || !deliveryLease) return false;
         return await convexMutation(path, {
-          ...args, deliveryLeaseOwner: deliveryLease.owner, deliveryLeaseToken: deliveryLease.token,
+          ...args, authorityDigest,
+          deliveryLeaseOwner: deliveryLease.owner, deliveryLeaseToken: deliveryLease.token,
           deliveryLeaseVersion: deliveryLease.version,
           ...(deliveryFence ?? {}),
         }).catch(() => false);
       };
       const checkpointMutation = deliveryFence
         ? (args: Record<string, unknown>) => deliveryMutation("jobs:checkpointAndRequeue", args)
-        : (args: Record<string, unknown>) => convexMutation("jobs:checkpointAndRequeue", args);
+        : (args: Record<string, unknown>) => convexMutation("jobs:checkpointAndRequeue", { ...args, authorityDigest });
       const prepareProviderEffect = async (effect: {
         effectId: string; kind: string; headSha: string; baseSha: string; pullRequestNumber?: number;
       }, options?: { reconcileOnly?: boolean }) => await deliveryMutation("jobs:prepareDeliveryEffect", {
@@ -1350,129 +1418,136 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         let cloneFailureReason = "";
         let checkoutSourceBranch = "";
         let controllerCheckoutPath = "";
-        if (repo && token) {
+        if (repo) {
+          checkoutSourceBranch = typeof job.sourceBranch === "string" ? job.sourceBranch : "";
+          const admittedSource = {
+            protocolVersion: 2 as const,
+            canonicalProjectId: String(job.canonicalProjectId ?? ""),
+            repository: repo,
+            sourceProvider: job.sourceProvider,
+            sourceBranch: checkoutSourceBranch,
+            sourceRef: job.sourceRef,
+            sourceHeadSha: job.sourceHeadSha,
+            sourceObservedAt: Number(job.sourceObservedAt),
+            sourceAdmissionDigest: job.sourceAdmissionDigest,
+          } as ProjectSourceAdmission;
+          const projectAuthorityValid = job.projectRepository === repo
+            && job.repo === repo
+            && job.sourceProvider === "github"
+            && isSafeSourceBranch(checkoutSourceBranch)
+            && job.sourceRef === `refs/heads/${checkoutSourceBranch}`
+            && (job.readonly || Boolean(branch))
+            && (!branch || branch === job.workerBranch)
+            && await projectSourceAdmissionIsValid(admittedSource, { expectedRepository: repo });
+          if (!projectAuthorityValid) {
+            cloneFailed = true;
+            cloneFailureReason = "Canonical project/repository/source authority did not match the claimed job.";
+            context = `${cloneFailureReason} No Git command or specialist process was started.`;
+          } else if (!token) {
+            cloneFailed = true;
+            cloneFailureReason = `Repository work was requested for ${repo}, but the runner has no GitHub transport credential.`;
+            context = `${cloneFailureReason} Do not pretend the repository was changed.`;
+          } else if (!await authorizeBoundary("source_checkout")) {
+            cloneFailed = true;
+            cloneFailureReason = "The immutable source-checkout authority fence was rejected.";
+            context = `${cloneFailureReason} No Git command or specialist process was started.`;
+          } else {
           const dir = `/tmp/work/${repo.replace(/[^a-zA-Z0-9]/g, "_")}_${jobKey}_attempt_${expectedAttempt}`;
           controllerCheckoutPath = dir;
           rmSync(dir, { recursive: true, force: true });
           const url = githubRepoUrl(repo);
           const gitEnv = githubGitEnv(env, token);
-          let cloneReady = false;
-          if (job.branch) {
-            const cloned = await sh(
-              "git",
-              ["clone", "--depth", "1", "--single-branch", "--branch", String(job.branch), url, dir],
-              gitEnv,
-            );
-            cloneReady = cloned.code === 0 && existsSync(join(dir, ".git"));
-            if (cloneReady) checkoutSourceBranch = String(job.branch);
-          }
-          if (!cloneReady && typeof job.sourceBranch === "string" && job.sourceBranch && job.sourceBranch !== job.branch) {
-            rmSync(dir, { recursive: true, force: true });
-            const cloned = await sh(
-              "git",
-              ["clone", "--depth", "1", "--single-branch", "--branch", String(job.sourceBranch), url, dir],
-              gitEnv,
-            );
-            cloneReady = cloned.code === 0 && existsSync(join(dir, ".git"));
-            if (cloneReady) checkoutSourceBranch = String(job.sourceBranch);
-          }
+          mkdirSync(dir, { recursive: true });
+          const initialized = await sh("git", ["init", "--initial-branch=jarvis-admitted-source", dir], env);
+          const remoteAdded = initialized.code === 0
+            ? await sh("git", ["-C", dir, "remote", "add", "origin", url], env)
+            : { code: initialized.code, out: initialized.out };
+          const fetchedSource = remoteAdded.code === 0
+            ? await sh("git", ["-C", dir, "fetch", "--no-tags", "origin", `+${String(job.sourceRef)}:refs/remotes/origin/jarvis-admitted-source`], gitEnv)
+            : { code: remoteAdded.code, out: remoteAdded.out };
+          const sourceHeadSha = String(job.sourceHeadSha).toLowerCase();
+          const fetchedSourceTip = fetchedSource.code === 0
+            ? (await sh("git", ["-C", dir, "rev-parse", "refs/remotes/origin/jarvis-admitted-source^{commit}"], env)).out.trim().toLowerCase()
+            : "";
+          const sourceExists = fetchedSource.code === 0
+            ? await sh("git", ["-C", dir, "cat-file", "-e", `${sourceHeadSha}^{commit}`], env)
+            : { code: fetchedSource.code, out: fetchedSource.out };
+          const sourceBelongsToBranch = sourceExists.code === 0 && /^[0-9a-f]{40}$/.test(fetchedSourceTip)
+            ? await sh("git", ["-C", dir, "merge-base", "--is-ancestor", sourceHeadSha, fetchedSourceTip], env)
+            : { code: 1, out: sourceExists.out };
+          const shallow = fetchedSource.code === 0
+            ? (await sh("git", ["-C", dir, "rev-parse", "--is-shallow-repository"], env)).out.trim()
+            : "true";
+          let checkoutBaseSha = sourceHeadSha;
+          const cloneReady = fetchedSource.code === 0 && sourceExists.code === 0
+            && sourceBelongsToBranch.code === 0 && shallow === "false";
           if (!cloneReady) {
-            rmSync(dir, { recursive: true, force: true });
-            const cloned = await sh("git", ["clone", "--depth", "1", url, dir], gitEnv);
-            cloneReady = cloned.code === 0 && existsSync(join(dir, ".git"));
+            cloneFailureReason = sourceBelongsToBranch.code === 1
+              ? `Provider-observed source ${sourceHeadSha} is not reachable from explicit allowed branch ${checkoutSourceBranch}.`
+              : `${SHALLOW_PROVENANCE_RULE} Exact source hydration failed: ${(fetchedSource.out || sourceExists.out).slice(-300)}`;
           }
           if (cloneReady) {
-            // Defense in depth: the subprocess only ever sees a credential-free
-            // remote even if Git changes clone credential persistence behavior.
-            await sh("git", ["-C", dir, "remote", "set-url", "origin", url], env);
-            await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
-            await sh("git", ["-C", dir, "config", "user.name", `${profile.name} via JARVIS`], env);
-            if (!checkoutSourceBranch) {
-              checkoutSourceBranch = (
-                await sh("git", ["-C", dir, "branch", "--show-current"], env)
-              ).out.trim();
-            }
-            const history = await ensureCompleteRepositoryHistory({
-              runGit: (args) => sh("git", ["-C", dir, ...args], gitEnv),
-              remote: url,
-              sourceBranch: checkoutSourceBranch,
-            });
-            if (!history.ok) {
-              cloneFailed = true;
-              cloneFailureReason = `${SHALLOW_PROVENANCE_RULE} Safe checkout preparation failed: ${history.note}`;
-              context = `${cloneFailureReason} Do not inspect the incomplete checkout or pretend repository work was performed.`;
-            } else {
-              baseSha = (await sh("git", ["-C", dir, "rev-parse", "HEAD"], env)).out.trim();
-              if (job.sourceHeadSha) {
-                const sourceHeadSha = String(job.sourceHeadSha);
-                let sourceExists = await sh("git", ["-C", dir, "cat-file", "-e", `${sourceHeadSha}^{commit}`], env);
-                if (sourceExists.code !== 0) {
-                  const hydratedSource = await sh("git", ["-C", dir, "fetch", "--no-tags", url, sourceHeadSha], gitEnv);
-                  sourceExists = hydratedSource.code === 0
-                    ? await sh("git", ["-C", dir, "cat-file", "-e", `${sourceHeadSha}^{commit}`], env)
-                    : { code: hydratedSource.code, out: hydratedSource.out };
-                }
-                const cumulativeAncestry = sourceExists.code === 0
-                  ? await sh("git", ["-C", dir, "merge-base", "--is-ancestor", sourceHeadSha, baseSha], env)
-                  : { code: sourceExists.code, out: sourceExists.out };
-                if (sourceExists.code !== 0 || cumulativeAncestry.code !== 0) {
+            if (branch) {
+              const workerRemote = await sh("git", ["-C", dir, "ls-remote", "--exit-code", "origin", `refs/heads/${branch}`], gitEnv);
+              if (workerRemote.code === 0) {
+                const workerHead = workerRemote.out.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+                const workerFetch = /^[0-9a-f]{40}$/.test(workerHead)
+                  ? await sh("git", ["-C", dir, "fetch", "--no-tags", "origin", `+refs/heads/${branch}:refs/remotes/origin/jarvis-admitted-worker`], gitEnv)
+                  : { code: 1, out: "invalid worker ref" };
+                const fetchedWorkerHead = workerFetch.code === 0
+                  ? (await sh("git", ["-C", dir, "rev-parse", "refs/remotes/origin/jarvis-admitted-worker^{commit}"], env)).out.trim().toLowerCase()
+                  : "";
+                const workerDescends = fetchedWorkerHead === workerHead
+                  ? await sh("git", ["-C", dir, "merge-base", "--is-ancestor", sourceHeadSha, workerHead], env)
+                  : { code: 1, out: "worker ref changed while fetching" };
+                if (workerFetch.code !== 0 || workerDescends.code !== 0) {
                   cloneFailed = true;
-                  cloneFailureReason = cumulativeAncestry.code === 1
-                    ? `Worker checkpoint ${baseSha || "missing"} no longer descends from immutable source ${sourceHeadSha}.`
-                    : `Immutable source ${sourceHeadSha} could not be hydrated and verified: ${cumulativeAncestry.out.slice(-300)}`;
-                  context = `${cloneFailureReason} Do not review or replace this worker lineage.`;
-                } else {
-                  reviewBaseSha = sourceHeadSha;
-                }
-              }
-              if (!cloneFailed) {
-                const bound = await convexMutation("jobs:bindWorkspaceSource", {
-                  jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
-                  sourceBranch: checkoutSourceBranch,
-                  sourceHeadSha: String(job.sourceHeadSha ?? baseSha), checkoutHeadSha: baseSha,
-                }).catch(() => false);
-                if (!bound) {
-                  cloneFailed = true;
-                  cloneFailureReason = "The sandbox source/checkpoint lineage could not be durably bound before execution.";
-                  context = `${cloneFailureReason} Do not edit an untracked workspace.`;
-                } else if (!job.sourceHeadSha) {
-                  reviewBaseSha = baseSha;
-                }
-              }
-              const checkedOut = branch
-                ? await sh("git", ["-C", dir, "checkout", "-B", branch], env)
-                : { code: 0, out: "" };
-              if (!cloneFailed && (!baseSha || checkedOut.code !== 0)) {
+                  cloneFailureReason = `Immutable worker branch ${branch} does not descend from admitted source ${sourceHeadSha}.`;
+                } else checkoutBaseSha = workerHead;
+              } else if (workerRemote.code !== 2) {
                 cloneFailed = true;
-                cloneFailureReason = `The canonical checkout tip or isolated branch ${branch || "HEAD"} could not be prepared safely.`;
-                context = `${cloneFailureReason} Do not pretend repository work was performed.`;
+                cloneFailureReason = `Immutable worker branch ${branch} could not be observed safely: ${workerRemote.out.slice(-300)}`;
+              }
+            }
+            const detached = !cloneFailed
+              ? await sh("git", ["-C", dir, "checkout", "--detach", checkoutBaseSha], env)
+              : { code: 1, out: cloneFailureReason };
+            const checkedOut = detached.code === 0 && branch
+              ? await sh("git", ["-C", dir, "checkout", "-B", branch, checkoutBaseSha], env)
+              : detached;
+            if (checkedOut.code !== 0) {
+              cloneFailed = true;
+              cloneFailureReason ||= `Exact admitted checkout ${checkoutBaseSha} could not be prepared.`;
+            }
+            if (!cloneFailed) {
+              baseSha = checkoutBaseSha;
+              reviewBaseSha = sourceHeadSha;
+              await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
+              await sh("git", ["-C", dir, "config", "user.name", `${profile.name} via JARVIS`], env);
+              const bound = await convexMutation("jobs:bindWorkspaceSource", {
+                jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId), authorityDigest,
+                sourceBranch: checkoutSourceBranch, sourceHeadSha, checkoutHeadSha: baseSha,
+              }).catch(() => false);
+              if (!bound) {
+                cloneFailed = true;
+                cloneFailureReason = "The exact admitted checkout could not be confirmed before execution.";
               } else {
                 cwd = dir;
                 repoDir = dir;
-                if (branch)
-                  await deliveryMutation("jobs:setDelivery", {
-                    jobId: job.jobId,
-                    expectedAttempt,
-                    branch,
-                    deliveryStatus: "branch",
-                  }).catch(() => {});
                 context = job.readonly
                   ? `Your working directory is a read-only checkout of ${repo}. Inspect it deeply, but do not edit or commit.`
                   : `Your working directory is an isolated checkout of ${repo} on branch ${branch}. Actually perform the scoped task. You may edit and commit here; never push, merge, deploy, or switch branches because the runner owns delivery.`;
-                context += `\n\nRepository lineage rule: ${SHALLOW_PROVENANCE_RULE} The runner hydrated the exact ancestry for ${checkoutSourceBranch} before this session. Treat a persisted shared branch as canonical; never manufacture replacement commits from a truncated revision walk.`;
+                context += `\n\nRepository lineage rule: ${SHALLOW_PROVENANCE_RULE} The runner fetched explicit ${checkoutSourceBranch}, proved ${sourceHeadSha} belongs to it, and checked out that exact admitted lineage.`;
                 const providerBoundary = projectProviderBoundary(repo);
                 if (providerBoundary) context += `\n\n${providerBoundary}`;
               }
             }
           } else {
             cloneFailed = true;
-            cloneFailureReason = `The scoped repository ${repo} could not be cloned.`;
-            context = `${cloneFailureReason} Do not pretend you edited it. State the access/repository failure and what remains blocked.`;
+            cloneFailureReason ||= `The scoped repository ${repo} could not be hydrated from its explicit admitted ref.`;
           }
-        } else if (repo && !token) {
-          cloneFailed = true;
-          cloneFailureReason = `Repository work was requested for ${repo}, but the runner has no GitHub transport credential.`;
-          context = `${cloneFailureReason} Do not pretend the repository was changed.`;
+          if (cloneFailed) context = `${cloneFailureReason} Do not inspect or edit this unauthorised checkout.`;
+          }
         }
         if (await stopIfLeaseLost("Execution stopped while preparing the secure workspace.", "", branch)) return;
         if (repo && (cloneFailed || !repoDir || !baseSha)) {
@@ -1502,9 +1577,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               return { baseSha: workspaceBaseSha, bytes, sha256: sha256Bytes(bytes) };
             })();
         const attemptKey = `${String(job.jobId)}:${expectedAttempt}`;
-        const assertCurrentWorkspace = async (_phase: string) => (await executionStatus()) === "running";
+        const assertCurrentWorkspace = async (_phase: string) =>
+          (await executionStatus()) === "running" && Boolean(await authorizeBoundary("provider_create"));
         const bindCloudWorkspace = async (workspace: CloudWorkspace) => Boolean(await convexMutation("jobs:bindCloudWorkspace", {
-          jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
+          jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId), authorityDigest,
           providerName: workspace.provider, providerWorkspaceId: workspace.providerWorkspaceId,
           providerSessionId: workspace.providerSessionId,
           baseSha: workspaceBaseSha, runtime: workspaceRuntime, lockfileDigest,
@@ -1513,12 +1589,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         }).catch(() => false));
         const recordReplayDecision = async (disposition: "replay" | "hydrate" | "reject", reason: string) => {
           const recorded = await convexMutation("jobs:recordCloudReplayDecision", {
-            jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId), disposition, reason,
+            jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId), authorityDigest, disposition, reason,
           }).catch(() => false);
           if (!recorded) throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt fence rejected checkpoint replay decision", "deferred");
         };
         const replayDecision: any = await convexQuery("jobs:cloudCheckpointForReplay", {
-          jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
+          jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId), authorityDigest,
           providerName: cloudProvider.name, baseSha: workspaceBaseSha, runtime: workspaceRuntime,
           lockfileDigest, template: workspaceTemplate, sourceArchiveDigest: sourceArchive.sha256,
           sourceArchiveBytes: sourceArchive.bytes.byteLength,
@@ -1551,6 +1627,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           await recordReplayDecision("hydrate", String(replayDecision.reason));
         }
         if (!providerWorkspace) {
+          if (!await authorizeBoundary("provider_create")) {
+            throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt authority rejected provider creation", "rejected");
+          }
           const preparedWorkspace = await prepareCloudWorkspaceExecution({
             providerFactory: () => cloudProvider,
             hydrateArchive: async () => sourceArchive,
@@ -1640,6 +1719,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             "blocked",
           );
         }
+        if (!await authorizeBoundary(expectedAttempt > 1 ? "codex_resume" : "codex_start")) {
+          throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt authority rejected Codex execution", "rejected");
+        }
         const run = await runCloudWorkspaceAgent({
           bin,
           controllerScratch,
@@ -1657,6 +1739,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         });
         await durableProgress;
         let result = run.text;
+        if (!await authorizeBoundary("checkpoint")) {
+          throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt authority rejected checkpoint creation", "rejected");
+        }
         const portable = await persistPortableCheckpoint({
           provider: cloudProvider,
           workspace: providerWorkspace,
@@ -1677,7 +1762,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt fence rejected checkpoint record", "deferred");
         }
         const checkpointRecorded = await convexMutation("jobs:recordCloudCheckpoint", {
-          jobId: job.jobId, expectedAttempt,
+          jobId: job.jobId, expectedAttempt, authorityDigest,
           providerWorkspaceId: providerWorkspace.providerWorkspaceId,
           providerSessionId: providerWorkspace.providerSessionId,
           checkpointRef: portable.ref,
@@ -2349,13 +2434,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       if (synth) await synthesizeMissionClaim(synth);
     };
 
-    const job: any = await convexMutation("jobs:claimDispatched", {
-      jobId: options.reservation.jobId,
-      dispatchId: options.reservation.dispatchId,
-      workerRunId: options.reservation.workerRunId,
-    }).catch(() => null);
-    if (!job) return { processed: 0, stale: true };
-    processed = 1;
     let cloudProvider: CloudWorkspaceProvider;
     try {
       cloudProvider = configuredCloudWorkspaceProvider(process.env, options.runtimeAttestation);
@@ -2365,10 +2443,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         : new CloudWorkspaceError("cloudflare", "invalid_configuration", "cloud workspace configuration is invalid");
       const checkpoint = `Cloud workspace ${failure.disposition} [${failure.provider}/${failure.code}]: ${failure.message}. No repository or specialist process was started on the Trigger host.`;
       await convexMutation("jobs:noteCloudWorkspaceBlock", {
-        jobId: job.jobId, expectedAttempt: Number(job.attempt ?? 1), code: failure.code, reason: checkpoint,
+        jobId: job.jobId, expectedAttempt, authorityDigest, code: failure.code, reason: checkpoint,
       }).catch(() => false);
       await convexMutation("jobs:checkpointAndRequeue", {
-        jobId: job.jobId, expectedAttempt: Number(job.attempt ?? 1), checkpoint,
+        jobId: job.jobId, expectedAttempt, authorityDigest, checkpoint,
         result: checkpoint, branch: job.branch ?? undefined, delayMs: 6 * 60 * 60_000,
       }).catch(() => null);
       return { processed: 1, blocked: true, provider: failure.provider, code: failure.code };

@@ -35,6 +35,16 @@ import {
   goalDagEdgeId,
   topologicalGoalWorkstreams,
 } from "../src/lib/goal-dag";
+import {
+  admissionForRepository,
+  projectSourceAdmissionValidator,
+  validProjectAdmissions,
+} from "./sourceAdmission";
+import {
+  evidenceProjectSourceAdmission,
+  sealProjectSourceAdmission,
+  type ProjectSourceAdmission,
+} from "../src/lib/source-admission";
 
 const ADVANCE_LEASE_MS = 10 * 60 * 1000;
 const COORDINATOR_RECEIPT_FRESH_MS = 10 * 60 * 1000;
@@ -93,6 +103,7 @@ type GoalJobInput = {
   goalStage: "planning" | "building" | "validating" | "refining";
   goalWorkstreamId?: string;
   goalWave: number;
+  projectAdmission: ProjectSourceAdmission;
 };
 
 async function sha256Hex(value: string) {
@@ -253,6 +264,30 @@ function missionBranch(mission: any, repo?: string) {
   if (!repo) return undefined;
   if (mission.sharedBranch) return String(mission.sharedBranch);
   return goalBranch(mission.goal, String(mission._id));
+}
+
+async function missionProjectAdmission(
+  mission: any,
+  repository?: string,
+  preferIntegration = false,
+): Promise<ProjectSourceAdmission> {
+  const canonicalRepository = repository
+    ? canonicalizeRepository(repository, { allowShortName: true }) ?? undefined
+    : undefined;
+  const inherited = admissionForRepository(mission.projectAdmissions, canonicalRepository);
+  if (!canonicalRepository) return inherited ?? await evidenceProjectSourceAdmission(Number(mission.createdAt ?? Date.now()));
+  if (!inherited) throw new Error(`Mission has no immutable source admission for ${canonicalRepository}`);
+  if (!preferIntegration || !mission.integrationBranch || !mission.integrationHeadSha || !mission.integrationObservedAt) return inherited;
+  return await sealProjectSourceAdmission({
+    protocolVersion: 2,
+    canonicalProjectId: inherited.canonicalProjectId,
+    repository: canonicalRepository,
+    sourceProvider: "github",
+    sourceBranch: String(mission.integrationBranch),
+    sourceRef: `refs/heads/${String(mission.integrationBranch)}`,
+    sourceHeadSha: String(mission.integrationHeadSha),
+    sourceObservedAt: Number(mission.integrationObservedAt),
+  });
 }
 
 async function recordMissionEvent(ctx: any, missionId: string, type: string, message: string, stage: string, percent?: number, data?: unknown) {
@@ -487,6 +522,7 @@ export const create = mutation({
     acceptanceCriteria: v.optional(v.array(v.string())),
     maxBuildSessions: v.optional(v.number()),
     maxRevisionWaves: v.optional(v.number()),
+    projectAdmission: projectSourceAdmissionValidator,
     authTokenHash: v.optional(v.string()),
     dispatchToken: v.optional(v.string()),
     workerToken: v.optional(v.string()),
@@ -509,6 +545,10 @@ export const create = mutation({
       reason: args.routeReason.slice(0, 1000),
       infrastructureContext: args.infrastructureContext.slice(0, 4000),
     };
+    if (!await validProjectAdmissions([args.projectAdmission], { requireFresh: true })
+      || args.projectAdmission.repository !== primaryRepo) {
+      throw new Error("Goal Mode requires one fresh canonical project source admission");
+    }
     const missionId = await insertMissionWithRuntime(ctx, {
       goal,
       mode: "goal",
@@ -524,6 +564,14 @@ export const create = mutation({
       route: route.kind,
       routeReason: route.reason,
       primaryRepo: route.primaryRepo,
+      projectAdmissions: [args.projectAdmission],
+      canonicalProjectId: args.projectAdmission.canonicalProjectId,
+      sourceProvider: args.projectAdmission.sourceProvider,
+      sourceBranch: args.projectAdmission.sourceBranch,
+      sourceRef: args.projectAdmission.sourceRef,
+      sourceHeadSha: args.projectAdmission.sourceHeadSha,
+      sourceObservedAt: args.projectAdmission.sourceObservedAt,
+      sourceAdmissionDigest: args.projectAdmission.sourceAdmissionDigest,
       infrastructureContext: route.infrastructureContext,
       revisionWave: 0,
       maxRevisionWaves,
@@ -555,6 +603,7 @@ export const create = mutation({
       goalStage: "planning",
       goalWorkstreamId: "goal-plan",
       goalWave: 0,
+      projectAdmission: args.projectAdmission,
     });
     const mission = await ctx.db.get(missionId);
     if (mission) await patchMissionWithRuntime(ctx, mission, {
@@ -750,11 +799,13 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
     ? undefined
     : mission.integrationBranch || mission.sharedBranch || missionBranch(mission, mission.primaryRepo);
   const task = await validatorTaskForMission(ctx, mission, jobs);
+  const repository = splitParent ? undefined : mission.primaryRepo ?? plan.primaryRepo;
+  const projectAdmission = await missionProjectAdmission(mission, repository, true);
   const validatorJobId = await insertGoalJob(ctx, {
     task,
     missionId: String(mission._id),
     label: `JARVIS · deep validation ${Number(mission.revisionWave ?? 0) + 1}`,
-    repo: splitParent ? undefined : mission.primaryRepo ?? plan.primaryRepo,
+    repo: repository,
     readonly: true,
     model: "sol",
     reasoningEffort: "max",
@@ -769,14 +820,12 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
       "Return a valid GOAL_VALIDATION_JSON verdict",
     ],
     modelReason: "Goal Mode reserves Sol/max for skeptical end-to-end validation and refinement planning",
-    branch,
-    sourceBranch: branch,
-    sourceHeadSha: mission.integrationHeadSha,
     integrationBranch: branch,
     maxAttempts: 16,
     goalStage: "validating",
     goalWorkstreamId: `validation-${Number(mission.revisionWave ?? 0)}`,
     goalWave: Number(mission.revisionWave ?? 0),
+    projectAdmission,
     ...(splitParent ? {
       planParentMissionId: mission._id,
       planDigest: mission.planDigest,
@@ -1004,6 +1053,7 @@ export const recordPlan = mutation({
     advanceLeaseToken: v.optional(v.string()),
     advanceLeaseVersion: v.optional(v.number()),
     plan: v.any(),
+    projectAdmissions: v.array(projectSourceAdmissionValidator),
     externalRun: v.optional(v.object({ kind: v.string(), id: v.string(), slug: v.optional(v.string()) })),
     workerToken: v.optional(v.string()),
   },
@@ -1037,6 +1087,9 @@ export const recordPlan = mutation({
       Number(mission.advanceAttempt ?? 0) !== args.expectedAdvanceAttempt || !ownsAdvanceLease(mission, args)
     ) return { advanced: false, stale: true };
     const { plan, digest: planDigest } = accepted!;
+    if (!await validProjectAdmissions(args.projectAdmissions, { requireFresh: true })) {
+      throw new Error("Accepted GoalPlan requires fresh canonical project source admissions");
+    }
     const planGeneration = 1;
     if (!Array.isArray(plan?.workstreams) || plan.workstreams.length < 2 || plan.workstreams.length > (mission.maxBuildSessions ?? 6)) {
       throw new Error("Goal plan workstream budget is invalid");
@@ -1055,6 +1108,9 @@ export const recordPlan = mutation({
       const requested = stream.repo || (!stream.readonly ? mission.primaryRepo || plan.primaryRepo : undefined);
       const canonical = requested ? canonicalizeRepository(requested, { allowShortName: true }) : null;
       if (!stream.readonly && !canonical) throw new Error(`Writable goal workstream ${stream.id} requires one canonical repository`);
+      if (!admissionForRepository(args.projectAdmissions, canonical ?? undefined)) {
+        throw new Error(`Goal plan workstream ${stream.id} has no admitted canonical project source`);
+      }
       repositoryByNode.set(stream.id, canonical ?? undefined);
       if (!stream.readonly && canonical) writableRepositories.add(canonical);
     }
@@ -1072,6 +1128,8 @@ export const recordPlan = mutation({
       for (const [key, streams] of [...groups.entries()].sort(([left], [right]) => left.localeCompare(right))) {
         const repository = key.startsWith("repo:") ? key.slice(5) : undefined;
         const writable = streams.some((stream) => !stream.readonly);
+        const projectAdmission = admissionForRepository(args.projectAdmissions, repository);
+        if (!projectAdmission) throw new Error(`Goal project ${repository ?? "evidence"} lost its source admission`);
         const childGoal = `${mission.goal} [${repository ? `project scope: ${repository}` : "read-only evidence"}]`;
         const childId = await insertMissionWithRuntime(ctx, {
           goal: childGoal.slice(0, 500), mode: "goal", status: "running", agentCount: streams.length,
@@ -1082,6 +1140,10 @@ export const recordPlan = mutation({
           acceptanceCriteria: streams.flatMap((stream) => stream.acceptanceCriteria).slice(0, 10), route: "existing_project",
           routeReason: `Immutable executable projection of parent ${String(mission._id)}`,
           primaryRepo: repository,
+          projectAdmissions: [projectAdmission], canonicalProjectId: projectAdmission.canonicalProjectId,
+          sourceProvider: projectAdmission.sourceProvider, sourceBranch: projectAdmission.sourceBranch,
+          sourceRef: projectAdmission.sourceRef, sourceHeadSha: projectAdmission.sourceHeadSha,
+          sourceObservedAt: projectAdmission.sourceObservedAt, sourceAdmissionDigest: projectAdmission.sourceAdmissionDigest,
           infrastructureContext: `${mission.infrastructureContext ?? ""}\nExecute only parent plan ${planDigest} generation ${planGeneration}; ids, dependencies, scope, acceptance and consequence policy are immutable.`.trim().slice(0, 4_000),
           revisionWave: 0, maxRevisionWaves: mission.maxRevisionWaves ?? 2,
           maxBuildSessions: mission.maxBuildSessions ?? 6, advanceAttempt: 0, createdAt: now, updatedAt: now,
@@ -1103,6 +1165,8 @@ export const recordPlan = mutation({
         const dependencies = stream.dependsOn.map((id) => workstreamJobs.get(id)).filter((id): id is string => Boolean(id));
         if (dependencies.length !== stream.dependsOn.length) throw new Error(`Goal plan workstream ${stream.id} lost an executable dependency`);
         const integrationBranch = integrationByChild.get(String(childId));
+        const projectAdmission = admissionForRepository(args.projectAdmissions, repository);
+        if (!projectAdmission) throw new Error(`Goal workstream ${stream.id} lost its source admission`);
         const id = await insertGoalJob(ctx, {
           task: [stream.task, `Original Goal Mode outcome: ${mission.goal}`,
             `Immutable parent plan: ${planDigest} generation ${planGeneration}; node ${stream.id}.`,
@@ -1112,10 +1176,11 @@ export const recordPlan = mutation({
           originThreadId: mission.originThreadId, agentId: stream.agentId, risk: "high", priority: 92,
           acceptanceCriteria: stream.acceptanceCriteria,
           modelReason: "Goal Mode executes the accepted parent DAG node without child replanning",
-          dependsOn: dependencies, sourceBranch: !stream.readonly ? integrationBranch : undefined,
+          dependsOn: dependencies,
           integrationBranch: !stream.readonly ? integrationBranch : undefined,
           maxAttempts: 24, goalStage: "building", goalWorkstreamId: stream.id, goalWave: 0,
           planParentMissionId: mission._id, planDigest, planGeneration, planNodeId: stream.id,
+          projectAdmission,
         });
         const row: any = await ctx.db.get(id);
         if (row?.status === "awaiting_approval") waitingApprovals += 1;
@@ -1138,6 +1203,7 @@ export const recordPlan = mutation({
       await patchMissionWithRuntime(ctx, mission, {
         status: "split", phase: "split", plan, planDigest, planGeneration, planNodeCount: plan.workstreams.length,
         splitChildMissionIds: childMissionIds, integrationGeneration: 0,
+        projectAdmissions: args.projectAdmissions,
         summary: `${plan.workstreams.length} immutable DAG nodes projected into ${childMissionIds.length} bounded children`,
         advanceLeaseUntil: undefined, updatedAt: now,
       });
@@ -1186,6 +1252,9 @@ export const recordPlan = mutation({
     let waitingApprovals = 0;
     for (const stream of topologicalGoalWorkstreams(plan.workstreams)) {
       const repo = stream.repo || mission.primaryRepo || plan.primaryRepo;
+      const canonicalRepo = repo ? canonicalizeRepository(repo, { allowShortName: true }) ?? undefined : undefined;
+      const projectAdmission = admissionForRepository(args.projectAdmissions, canonicalRepo);
+      if (!projectAdmission) throw new Error(`Goal workstream ${stream.id} lost its source admission`);
       const dependencies = stream.dependsOn
         .map((id) => workstreamJobs.get(id))
         .filter((id): id is string => Boolean(id));
@@ -1205,7 +1274,7 @@ export const recordPlan = mutation({
         policyTask: stream.task,
         missionId: String(args.id),
         label: stream.label,
-        repo,
+        repo: canonicalRepo,
         readonly: stream.readonly,
         model: "terra",
         reasoningEffort: "high",
@@ -1221,12 +1290,12 @@ export const recordPlan = mutation({
         planDigest,
         planGeneration,
         planNodeId: stream.id,
-        sourceBranch: repo ? integrationBranch : undefined,
-        integrationBranch: repo ? integrationBranch : undefined,
+        integrationBranch: canonicalRepo && !stream.readonly ? integrationBranch : undefined,
         maxAttempts: 24,
         goalStage: "building",
         goalWorkstreamId: stream.id,
         goalWave: 0,
+        projectAdmission,
       });
       const row: any = await ctx.db.get(id);
       if (row?.status === "awaiting_approval") waitingApprovals += 1;
@@ -1249,6 +1318,7 @@ export const recordPlan = mutation({
       phase: "building",
       percent: 12,
       primaryRepo: mission.primaryRepo ?? plan.primaryRepo,
+      projectAdmissions: args.projectAdmissions,
       sharedBranch: undefined,
       integrationBranch,
       integrationGeneration: 0,
@@ -1422,6 +1492,7 @@ export const renewAdvance = mutation({
 async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefinement[], wave: number) {
   const integrationBranch = mission.integrationBranch || mission.sharedBranch || missionBranch(mission, mission.primaryRepo);
   const ids: string[] = [];
+  const projectAdmission = await missionProjectAdmission(mission, mission.primaryRepo, true);
   for (const refinement of refinements.slice(0, 3)) {
     const id = await insertGoalJob(ctx, {
       task: [
@@ -1449,6 +1520,7 @@ async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefin
       goalStage: "refining",
       goalWorkstreamId: refinement.id,
       goalWave: wave,
+      projectAdmission,
     });
     ids.push(String(id));
   }

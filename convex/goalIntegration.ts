@@ -1,8 +1,9 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
-import { insertJobWithRuntime, patchJobWithRuntime, patchMissionWithRuntime, promoteCompletedJobDependents } from "./controlPlane";
+import { attemptAuthorityFields, insertJobWithRuntime, patchJobWithRuntime, patchMissionWithRuntime, promoteCompletedJobDependents } from "./controlPlane";
 import { attemptWorkspaceKey } from "../src/lib/workspace-protocol";
+import { sealProjectSourceAdmission } from "../src/lib/source-admission";
 
 const LEASE_MS = 45_000;
 const CONTROLLER_STATE_MS = { command: 2 * 60_000, provider: 5 * 60_000, reconcile: 2 * 60_000 } as const;
@@ -737,6 +738,7 @@ async function queueSteeredContinuation(ctx: any, job: any, now: number) {
     .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", nextAttempt)).first();
   if (!existing) await ctx.db.insert("workAttempts", {
     jobId: job._id, attempt: nextAttempt, parentAttempt: job.attempt ?? 1, status: "pending",
+    ...await attemptAuthorityFields(ctx, job, nextAttempt),
     workspaceLineage: job.workspaceLineage,
     workspaceKey: job.workspaceLineage ? attemptWorkspaceKey(job.workspaceLineage, nextAttempt) : undefined,
     workerBranch: job.workerBranch, sourceHeadSha: job.sourceHeadSha,
@@ -907,6 +909,7 @@ export const complete = mutation({
     }
     await patchMissionWithRuntime(ctx, mission, {
       integrationHeadSha: attempt.preparedIntegrationHeadSha,
+      integrationObservedAt: now,
       integrationGeneration: Math.max(Number(mission.integrationGeneration ?? 0), Number(attempt.generation)),
       activeIntegrationAttemptId: undefined, integrationLeaseOwner: undefined, integrationLeaseToken: undefined,
       integrationLeaseUntil: undefined, updatedAt: now,
@@ -1080,6 +1083,17 @@ export const failFocused = mutation({
     const release = await terminalReleaseDecisionForAttempt(ctx, attempt);
     if (!release.releasable || release.state === "applied_final") return null;
     const now = Date.now();
+    if (!job.canonicalProjectId || !SHA.test(String(attempt.expectedIntegrationBaseSha ?? ""))) return null;
+    const projectAdmission = await sealProjectSourceAdmission({
+      protocolVersion: 2,
+      canonicalProjectId: job.canonicalProjectId,
+      repository: attempt.repository,
+      sourceProvider: "github",
+      sourceBranch: attempt.integrationBranch,
+      sourceRef: `refs/heads/${attempt.integrationBranch}`,
+      sourceHeadSha: String(attempt.expectedIntegrationBaseSha),
+      sourceObservedAt: now,
+    });
     const repairId = await insertJobWithRuntime(ctx, {
       repo: attempt.repository,
       task: [
@@ -1096,13 +1110,14 @@ export const failFocused = mutation({
       attempt: 1, maxAttempts: 8, nextRunAt: now, parentJobId: String(job._id),
       goalStage: job.goalStage, goalWorkstreamId: `${attempt.workstreamId}-repair-${attempt.generation}`,
       goalWave: attempt.revisionWave, acceptanceCriteria: ["Produce a fresh exact signed receipt against the current integration head"],
-      sourceBranch: attempt.integrationBranch, integrationBranch: attempt.integrationBranch,
+      projectAdmission, integrationBranch: attempt.integrationBranch,
       integrationState: "awaiting_review", createdAt: now,
     });
     const repair: any = await ctx.db.get(repairId);
     if (!repair?.workspaceLineage) throw new Error("Focused repair lost its immutable workspace admission");
     await ctx.db.insert("workAttempts", {
       jobId: repairId, attempt: 1, status: "pending", workspaceLineage: repair?.workspaceLineage,
+      ...await attemptAuthorityFields(ctx, repair, 1),
       workerBranch: repair?.workerBranch, workspaceKey: attemptWorkspaceKey(repair.workspaceLineage, 1),
       lastEventSeq: 0, livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now,
     });

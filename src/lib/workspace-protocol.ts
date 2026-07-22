@@ -15,6 +15,7 @@ const immutableId = (value: string) => /^[A-Za-z0-9_-]{1,96}$/.test(value)
 
 export type WorkItemIdentity = Readonly<{
   workerBranch?: string;
+  workerLineage: string;
   workspaceLineage: string;
   retryLineage: string;
 }>;
@@ -33,10 +34,10 @@ export function workItemIdentity(args: {
 }): WorkItemIdentity {
   const mission = safe(args.missionId, "mission", 16);
   const job = immutableId(args.jobId);
-  const stream = safe(args.workstreamId, "work", 24);
   const retryLineage = `job:${args.jobId}:lineage:1`;
   return {
-    workerBranch: args.readonly ? undefined : `jarvis/work/${mission}/${stream}-${job}`,
+    workerBranch: args.readonly ? undefined : `jarvis/work/${mission}/${job}`,
+    workerLineage: `worker:${args.jobId}:lineage:1`,
     workspaceLineage: `sandbox:${args.jobId}:lineage:1`,
     retryLineage,
   };

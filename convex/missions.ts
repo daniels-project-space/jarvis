@@ -4,6 +4,7 @@ import { requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from 
 import { normalizeWorkModelTier } from "../src/lib/work-models";
 import { insertMissionWithRuntime, patchMissionWithRuntime, runtimeMission } from "./controlPlane";
 import { classifyFleetHealth } from "../src/lib/fleet-health";
+import { projectSourceAdmissionValidator, validProjectAdmissions } from "./sourceAdmission";
 
 const SYNTHESIS_LEASE_MS = 20 * 60 * 1000;
 
@@ -76,16 +77,22 @@ export const create = mutation({
     priority: v.optional(v.number()),
     risk: v.optional(v.string()),
     acceptanceCriteria: v.optional(v.array(v.string())),
+    mode: v.optional(v.union(v.literal("fleet"), v.literal("single"))),
+    projectAdmissions: v.array(projectSourceAdmissionValidator),
     authTokenHash: v.optional(v.string()),
     dispatchToken: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     await requireDispatcher(ctx, a);
+    if (!await validProjectAdmissions(a.projectAdmissions, { requireFresh: true })) {
+      throw new Error("Mission requires fresh canonical project source admissions");
+    }
     const { authTokenHash: _authTokenHash, dispatchToken: _dispatchToken, workerToken: _workerToken, ...mission } = a;
+    const repositoryAdmission = mission.projectAdmissions.length === 1 ? mission.projectAdmissions[0] : undefined;
     return await insertMissionWithRuntime(ctx, {
       goal: mission.goal.slice(0, 500),
-      mode: "fleet",
+      mode: mission.mode ?? "fleet",
       status: "running",
       agentCount: mission.agentCount,
       originThreadId: mission.originThreadId,
@@ -95,6 +102,15 @@ export const create = mutation({
       phase: "delegating",
       percent: 0,
       acceptanceCriteria: mission.acceptanceCriteria,
+      projectAdmissions: mission.projectAdmissions,
+      canonicalProjectId: repositoryAdmission?.canonicalProjectId,
+      primaryRepo: repositoryAdmission?.repository,
+      sourceProvider: repositoryAdmission?.sourceProvider,
+      sourceBranch: repositoryAdmission?.sourceBranch,
+      sourceRef: repositoryAdmission?.sourceRef,
+      sourceHeadSha: repositoryAdmission?.sourceHeadSha,
+      sourceObservedAt: repositoryAdmission?.sourceObservedAt,
+      sourceAdmissionDigest: repositoryAdmission?.sourceAdmissionDigest,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
