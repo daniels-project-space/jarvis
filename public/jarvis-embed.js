@@ -383,31 +383,50 @@
     return detail;
   }
 
+  // A missing widget is not automatically private: Project Hub deliberately
+  // restores an allowlisted widget through its local action handler. Keep that
+  // escape hatch narrow enough that it cannot become a second generic control
+  // path for credentials, payments, or arbitrary DOM targets.
+  function isRestorableWidgetTarget(target) {
+    if (typeof target !== "string" || target.length === 0 || target.length > 64) return false;
+    if (!/^[a-z][a-z0-9_-]*$/i.test(target)) return false;
+    var identity = normal(target);
+    return !/(?:password|passcode|secret|token|api[ _-]?key|auth|login|sign[ _-]?in|credential|otp|one[ _-]?time|credit|card|cvv|cvc|iban|payment|billing|bank|account)/.test(identity);
+  }
+
   function findHostElement(target, widgetOnly) {
     var wanted = normal(target);
-    if (!wanted) return null;
+    if (!wanted) return { element: null, blocked: false };
     if (document.getElementById) {
       var exact = document.getElementById("w-" + target) || document.getElementById(target);
-      if (exact && !isSensitiveElement(exact)) return exact;
+      // Do not fall through to a similarly named target when the exact
+      // destination is private. This is also what distinguishes an absent
+      // widget (which a host may restore) from a hidden/private one.
+      if (exact) return { element: isSensitiveElement(exact) ? null : exact, blocked: isSensitiveElement(exact) };
     }
-    if (!document.querySelectorAll) return null;
+    if (!document.querySelectorAll) return { element: null, blocked: false };
     var selector = widgetOnly
       ? "[id^='w-'],[data-jarvis-id*='widget']"
       : "[data-jarvis-id],[data-jarvis-editable],button,a[href],input,textarea,select,[role='button'],[role='link'],[role='region']";
     var nodes = document.querySelectorAll(selector);
     var best = null;
     var bestScore = 0;
+    var blockedScore = 0;
     for (var i = 0; i < nodes.length; i++) {
       var node = nodes[i];
-      if (node === f || isSensitiveElement(node) || (node.closest && node.closest("[data-jarvis-edit-ui]"))) continue;
+      if (node === f || (node.closest && node.closest("[data-jarvis-edit-ui]"))) continue;
       var hay = normal(((node.dataset && node.dataset.jarvisId) || "") + " " + elementLabel(node) + " " + (node.id || ""));
       var score = hay === wanted ? 5 : hay.indexOf(wanted) >= 0 ? 3 : wanted.indexOf(hay) >= 0 && hay.length > 2 ? 2 : 0;
+      if (isSensitiveElement(node)) {
+        if (score > blockedScore) blockedScore = score;
+        continue;
+      }
       if (score > bestScore) {
         best = node;
         bestScore = score;
       }
     }
-    return best;
+    return { element: best, blocked: blockedScore > 0 && bestScore === 0 };
   }
 
   function spotlight(element) {
@@ -580,7 +599,14 @@
         return Promise.resolve({ ok: false, detail: "The page guard was invalid." });
       }
     }
+    // An edit instruction normally starts the explicit picker. If a host
+    // supplied an exact target, however, reject it before the picker is armed
+    // when that target is inside a private/hidden region.
     if (action.action === "edit") {
+      if (action.target) {
+        var editTarget = findHostElement(action.target, false);
+        if (editTarget.blocked) return Promise.resolve({ ok: false, detail: "I cannot act on that private control." });
+      }
       return Promise.resolve(startEditMode(action.instruction || "")
         ? { ok: true, detail: "Pick the exact element; I’ll link it to its code." }
         : { ok: false, detail: "Visual edit mode could not start on this page." });
@@ -603,8 +629,19 @@
         return Promise.resolve({ ok: false, detail: "Only a route inside this app can be opened here." });
       }
     }
-    var element = findHostElement(action.target, action.action === "show_widget");
-    if (!element || isSensitiveElement(element)) return Promise.resolve({ ok: false, detail: "I cannot act on that private control." });
+    var target = findHostElement(action.target, action.action === "show_widget");
+    if (target.blocked) return Promise.resolve({ ok: false, detail: "I cannot act on that private control." });
+    var element = target.element;
+    if (!element) {
+      // This is intentionally the only missing-target extension. It lets a
+      // host restore a known widget, but never grants focus/activation/edit
+      // access to an element that was not first resolved and checked here.
+      if (action.action === "show_widget" && isRestorableWidgetTarget(action.target)) {
+        var restored = notifyHostAction(action);
+        if (restored.handled) return Promise.resolve(restored.result || { ok: true, detail: "Done on this page." });
+      }
+      return Promise.resolve({ ok: false, detail: "I could not find that control on this page." });
+    }
     var custom = notifyHostAction(action);
     if (custom.handled) return Promise.resolve(custom.result || { ok: true, detail: "Done on this page." });
     spotlight(element);

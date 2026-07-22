@@ -3529,7 +3529,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
 
       {/* full-screen viewport — keeps a floating composer so Daniel can still talk */}
       {panel && panelFull && (
-        <div className="fixed inset-y-0 left-0 right-0 z-50 flex flex-col bg-black/80 p-3 backdrop-blur-sm md:right-[236px] md:p-6 md:pr-3">
+        <div data-jarvis-full-orb-safe-workspace className="jarvis-full-orb-safe-workspace fixed left-0 right-0 top-0 z-50 flex flex-col bg-black/80 p-3 backdrop-blur-sm md:inset-y-0 md:right-[236px] md:p-6 md:pr-3">
           <div className="min-h-0 flex-1">
             <Viewport
               panel={panel}

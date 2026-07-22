@@ -16,7 +16,7 @@ type LoaderWindow = {
   JARVIS: JarvisApi;
   SpeechRecognition: unknown;
   addEventListener: (name: string, listener: LoaderListener) => void;
-  dispatchEvent: (event: unknown) => void;
+  dispatchEvent: ReturnType<typeof vi.fn>;
   getSelection: () => string;
   history: { state: null };
   location: { href: string; origin: string; assign: ReturnType<typeof vi.fn> };
@@ -63,7 +63,7 @@ function createLoader(options: { denyFirstRecognition?: boolean; hostNodes?: unk
       isConnected: false,
       remove: vi.fn(),
       setAttribute: vi.fn((name: string, value: string) => { attributes[name] = value; }),
-      style: {},
+      style: {} as Record<string, string>,
     } as FakeElement;
     return element;
   };
@@ -139,7 +139,10 @@ function createLoader(options: { denyFirstRecognition?: boolean; hostNodes?: unk
     addEventListener: vi.fn((name: string, listener: LoaderListener) => {
       listeners.set(name, [...(listeners.get(name) ?? []), listener]);
     }),
-    dispatchEvent: vi.fn(),
+    dispatchEvent: vi.fn((event: { type?: string }) => {
+      for (const listener of listeners.get(event?.type ?? "") ?? []) listener(event);
+      return true;
+    }),
     getSelection: () => "",
     history: { state: null },
     location: {
@@ -151,7 +154,12 @@ function createLoader(options: { denyFirstRecognition?: boolean; hostNodes?: unk
   } as unknown as LoaderWindow;
   windowObject.window = windowObject;
   const context = {
-    CustomEvent: class { constructor(public type: string, public init: unknown) {} },
+    CustomEvent: class {
+      detail: unknown;
+      constructor(public type: string, init: { detail?: unknown }) {
+        this.detail = init?.detail;
+      }
+    },
     URL,
     clearTimeout,
     document,
@@ -249,7 +257,7 @@ describe("Project Hub Jarvis loader", () => {
     expect(loaderSource).toContain("tab to it and press Enter");
   });
 
-  it("rejects sensitive exact targets and their ancestors before focus, activation, or widget handling", async () => {
+  it("rejects sensitive exact targets and their ancestors before any host-local or generic action path", async () => {
     const paymentForm = {
       tagName: "FORM",
       dataset: {},
@@ -261,12 +269,21 @@ describe("Project Hub Jarvis loader", () => {
       id: "billing-submit",
       dataset: {},
       click: vi.fn(),
+      style: {} as Record<string, string>,
       closest: () => null,
       getAttribute: () => null,
       parentElement: paymentForm,
     };
     const harness = createLoader({ hostById: { "billing-submit": submit } });
     const receive = harness.listeners.get("message")?.[0];
+    const localHandler = vi.fn((event: any) => {
+      event.detail.handled = true;
+      event.detail.result = { ok: true, detail: "This must never run." };
+    });
+    harness.listeners.set("jarvis:host-action", [localHandler]);
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "ready" } });
+    const hostContext = harness.messages.find((message: any) => message?.jarvis === "host-context") as any;
+    harness.window.dispatchEvent.mockClear();
 
     for (const action of ["focus", "activate", "show_widget"]) {
       receive?.({
@@ -278,6 +295,7 @@ describe("Project Hub Jarvis loader", () => {
             id: `private-${action}`,
             action,
             target: "billing-submit",
+            hostId: hostContext.context.hostId,
             expectedUrl: "https://project-hub.test/dashboard?view=work#today",
           },
         },
@@ -294,6 +312,9 @@ describe("Project Hub Jarvis loader", () => {
       });
     }
     expect(submit.click).not.toHaveBeenCalled();
+    expect(localHandler).not.toHaveBeenCalled();
+    expect(harness.window.dispatchEvent).not.toHaveBeenCalled();
+    expect(submit.style.outline).toBeUndefined();
 
     receive?.({
       origin: JARVIS_ORIGIN,
@@ -318,6 +339,102 @@ describe("Project Hub Jarvis loader", () => {
     await Promise.resolve();
     expect(preventDefault).not.toHaveBeenCalled();
     expect(harness.messages).not.toContainEqual(expect.objectContaining({ jarvis: "host-command" }));
+  });
+
+  it("lets a host synchronously restore an allowlisted missing widget without opening generic target paths", async () => {
+    const harness = createLoader();
+    const receive = harness.listeners.get("message")?.[0];
+    const restored = vi.fn();
+    harness.listeners.set("jarvis:host-action", [(event: any) => {
+      if (event.detail.action.action !== "show_widget" || event.detail.action.target !== "wealth") return;
+      restored();
+      event.detail.handled = true;
+      event.detail.result = { ok: true, detail: "Wealth restored." };
+    }]);
+
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "ready" } });
+    const hostContext = harness.messages.find((message: any) => message?.jarvis === "host-context") as any;
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: {
+        jarvis: "host-action",
+        action: {
+          id: "restore-wealth",
+          action: "show_widget",
+          target: "wealth",
+          hostId: hostContext.context.hostId,
+          expectedUrl: "https://project-hub.test/dashboard?view=work#today",
+        },
+      },
+    });
+    await Promise.resolve();
+
+    expect(restored).toHaveBeenCalledOnce();
+    expect(harness.messages).toContainEqual({
+      jarvis: "host-action-result",
+      id: "restore-wealth",
+      ok: true,
+      detail: "Wealth restored.",
+    });
+  });
+
+  it("does not offer the missing-target extension to focus, activate, or sensitive widget names", async () => {
+    const harness = createLoader();
+    const receive = harness.listeners.get("message")?.[0];
+    const localHandler = vi.fn((event: any) => {
+      event.detail.handled = true;
+    });
+    harness.listeners.set("jarvis:host-action", [localHandler]);
+
+    for (const [id, action, target] of [
+      ["missing-focus", "focus", "wealth"],
+      ["missing-activate", "activate", "wealth"],
+      ["missing-payment", "show_widget", "payment_card"],
+    ]) {
+      receive?.({
+        origin: JARVIS_ORIGIN,
+        source: harness.frameWindow,
+        data: { jarvis: "host-action", action: { id, action, target, expectedUrl: "https://project-hub.test/dashboard?view=work#today" } },
+      });
+    }
+    await Promise.resolve();
+
+    expect(localHandler).not.toHaveBeenCalled();
+    expect(harness.messages).toContainEqual({ jarvis: "host-action-result", id: "missing-focus", ok: false, detail: "I could not find that control on this page." });
+    expect(harness.messages).toContainEqual({ jarvis: "host-action-result", id: "missing-activate", ok: false, detail: "I could not find that control on this page." });
+    expect(harness.messages).toContainEqual({ jarvis: "host-action-result", id: "missing-payment", ok: false, detail: "I could not find that control on this page." });
+  });
+
+  it("requires a synchronous local acknowledgement for a missing allowlisted widget", async () => {
+    const harness = createLoader();
+    const receive = harness.listeners.get("message")?.[0];
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "ready" } });
+    const hostContext = harness.messages.find((message: any) => message?.jarvis === "host-context") as any;
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: {
+        jarvis: "host-action",
+        action: {
+          id: "unhandled-wealth",
+          action: "show_widget",
+          target: "wealth",
+          hostId: hostContext.context.hostId,
+          expectedUrl: "https://project-hub.test/dashboard?view=work#today",
+        },
+      },
+    });
+    await Promise.resolve();
+
+    expect(harness.messages).toContainEqual({
+      jarvis: "host-action-result",
+      id: "unhandled-wealth",
+      ok: false,
+      detail: "I could not find that control on this page.",
+    });
   });
 
   it("fails closed for an exact id nested deeply inside a hidden private region", async () => {

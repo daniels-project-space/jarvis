@@ -1799,7 +1799,7 @@ export function CreationsView({ value }: { value: string }) {
             <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search saved work…" className="min-w-0 w-full flex-1 rounded-lg border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-ice outline-none placeholder:text-slate/60 focus:border-cyan/40 md:min-w-[150px]" />
             <span className="hud-label shrink-0 !text-[9px]">{visible.length} item{visible.length === 1 ? "" : "s"}</span>
           </div>
-          <div className="mt-2 flex gap-1.5 overflow-x-auto overscroll-x-contain pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          <div className="mt-2 flex flex-wrap gap-1.5 pb-1">
             {[null, "board", "scene", "canvas", "list", "doc", "chart", "image", "pdf", "trip"].map((k) => (
               <button key={k ?? "all"} onClick={() => setKind(k)} className={`shrink-0 rounded-full px-2.5 py-1 text-[9px] uppercase tracking-widest transition ${kind === k ? "bg-cyan/15 text-cyan ring-1 ring-cyan/35" : "bg-white/[0.025] text-slate hover:text-ice"}`}>
                 {k === "canvas" ? "mind maps" : k === "doc" ? "writing" : k ?? "all"}
