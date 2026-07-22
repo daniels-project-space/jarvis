@@ -75,18 +75,15 @@ const EXACT_NAME_RECOVERY_DELETE_LEAD = /\bif\s+it\s+exists,\s+exact[- ]name\s*$
 const NON_RESUMING_SANDBOX_LOOKUP =
   /\bSandbox\.get\s*\([^)]*\bresume\s*:\s*false[^)]*\)/i;
 
-// “failed final delete remains un-terminated in Convex” names a lifecycle
-// event rather than ordering a deletion.  Restrict this to a state predicate
-// and controller/provider vocabulary; an imperative such as “final delete
-// customer records” has a different tail and remains gated.
+// “a failed final delete remains un-terminated in Convex” names one exact
+// lifecycle state rather than ordering a deletion. Keep the complete noun
+// grammar bounded: a data object or scheduled future effect must not borrow a
+// lifecycle word elsewhere in the clause.
 const TECHNICAL_LIFECYCLE_DELETE_NOUN_LEAD =
-  /\b(?:final|failed|exact[- ]name|sandbox)\s*$/i;
+  /\b(?:a|the)\s+failed\s+final\s*$/i;
 
 const TECHNICAL_LIFECYCLE_DELETE_NOUN_TAIL =
-  /^(?:remains?|failed|fails?|failure|is|was|will\s+be|cannot\s+be)\b/i;
-
-const TECHNICAL_LIFECYCLE_DELETE_CONTEXT =
-  /\b(?:convex|provider|sandbox|cleanup|reaper|termination|orphan)\b/i;
+  /^remains\s+un-terminated\s+in\s+Convex\s*$/i;
 
 const TECHNICAL_TEST_MATRIX_DELETE_LEAD =
   /\b(?:get|create|terminate|delete)\s+and\s*$/i;
@@ -232,14 +229,14 @@ function clauses(task: string): string[] {
       character === "."
       && /[a-z0-9_$]/i.test(task[index - 1] ?? "")
       && /[a-z_$]/i.test(task[index + 1] ?? "");
-    // A semicolon inside the exact-name Sandbox.get recovery grammar remains
-    // part of one simulated lifecycle branch.  That lets its test/fake
-    // provider qualifier constrain “exact-name delete it”; ordinary
-    // semicolon-separated instructions still split and fail closed.
+    // Preserve only the semicolon whose complete immediate right-hand clause
+    // is the exact simulated recovery branch. This carries the non-resuming
+    // lookup into “if it exists, exact-name delete it” without merging any
+    // independent instruction that follows it.
     const simulatedSandboxRecoverySeparator =
       character === ";"
-      && /\bSandbox\.get\s*\([^)]*\bresume\s*:\s*false[^)]*\)/i.test(current)
-      && !/\bexact[- ]name\s+delete\s+it\s*$/i.test(current);
+      && NON_RESUMING_SANDBOX_LOOKUP.test(current)
+      && /^;\s*if\s+it\s+exists,\s+exact[- ]name\s+delete\s+it\s*(?=$|[.;!?\r\n]|(?:and\s+instead|and\s+then|then|but|and)\b)/i.test(task.slice(index));
     if (!sdkMemberSeparator && !simulatedSandboxRecoverySeparator && (character === "\n" || character === "\r" || /[.;!?]/.test(character))) {
       finish();
       if (character === "\r" && task[index + 1] === "\n") index += 1;
@@ -374,7 +371,6 @@ function consequentialUse(action: string, clause: string, actionIndex: number): 
     if (
       TECHNICAL_LIFECYCLE_DELETE_NOUN_LEAD.test(unformattedBefore)
       && TECHNICAL_LIFECYCLE_DELETE_NOUN_TAIL.test(after)
-      && TECHNICAL_LIFECYCLE_DELETE_CONTEXT.test(clause)
     ) return false;
     if (
       TECHNICAL_TEST_MATRIX_DELETE_LEAD.test(unformattedBefore)
