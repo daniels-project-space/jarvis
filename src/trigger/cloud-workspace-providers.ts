@@ -882,25 +882,26 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
   private async assertSafeCommandCwd(workspace: CloudWorkspace, cwd: string): Promise<{ sandbox: VercelSandbox; session: VercelSession }> {
     const sandbox = await this.get(workspace);
     const session = this.assertSession(workspace, sandbox);
-    const check = await session.runCommand({
-      cmd: "sh",
-      args: ["-lc", `[ "$(realpath -e -- ${shellQuote(cwd)})" = ${shellQuote(cwd)} ] && [ ! -L ${shellQuote(cwd)} ]`],
-      cwd: workspace.root,
-      env: {}, detached: true, timeoutMs: 10_000,
-    });
-    // This bounded fence has no data output. It owns exactly one terminal
-    // observation and never starts the SDK's detached log convenience.
-    const observed = await check.wait();
+    // The fence is a provider command too.  It must not be allowed to retain
+    // an unowned wait if a provider stalls it, so run it through the same
+    // single wait/kill/iterator lifecycle as caller commands.  `skipCwdFence`
+    // is safe only here: this exact fresh Session is establishing the fence.
+    const observed = await this.runSessionCommand(workspace, sandbox, session, {
+      command: `[ "$(realpath -e -- ${shellQuote(cwd)})" = ${shellQuote(cwd)} ] && [ ! -L ${shellQuote(cwd)} ]`,
+      cwd: workspace.root, timeoutMs: 10_000, maxOutputBytes: 4_000,
+    }, true);
     if (observed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "unsafe_archive", "command cwd is missing, symlinked, or escapes the workspace root", "rejected");
-    return { sandbox: await this.get(workspace), session: await this.assertFreshSession(workspace) };
+    const freshSandbox = await this.get(workspace);
+    return { sandbox: freshSandbox, session: this.assertSession(workspace, freshSandbox) };
   }
 
   private async runSessionCommand(
     workspace: CloudWorkspace, sandbox: VercelSandbox, session: VercelSession,
     request: { command: string; cwd: string; timeoutMs: number; maxOutputBytes: number; signal?: AbortSignal },
+    skipCwdFence = false,
   ): Promise<{ exitCode: number; stdout: Buffer; stderr: Buffer; durationMs: number }> {
     assertVercelCommandBounds(request.timeoutMs, request.maxOutputBytes);
-    ({ sandbox, session } = await this.assertSafeCommandCwd(workspace, request.cwd));
+    if (!skipCwdFence) ({ sandbox, session } = await this.assertSafeCommandCwd(workspace, request.cwd));
     if (request.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
     const startedAt = Date.now();
     let command: VercelCommand | undefined;

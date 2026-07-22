@@ -6,7 +6,7 @@ type Log = { stream: "stdout" | "stderr"; data: string };
 const observed: {
   create?: Record<string, unknown>; get?: Record<string, unknown>; commands: Record<string, unknown>[];
   deletes: string[]; updates: unknown[]; kills: string[]; logsClosed: number; files: Map<string, Buffer>; mkdirs: string[]; reads: string[];
-  logs: Log[]; createGate?: Promise<void>; waitGate?: Promise<void>; logCloseGate?: Promise<void>; waitFailure?: unknown; deleteFailure?: unknown;
+  logs: Log[]; createGate?: Promise<void>; waitGate?: Promise<void>; logCloseGate?: Promise<void>; waitFailure?: unknown; fenceWaitFailure?: unknown; deleteFailure?: unknown;
   exitCode: number; commandExit?: (input: Record<string, unknown>) => number;
   updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; getFailure?: unknown;
   listed: Array<{ status: string }>; listedPages?: Array<Array<{ status: string }>>; listInputs: Record<string, unknown>[];
@@ -16,7 +16,13 @@ class FakeCommand {
   readonly cmdId = `cmd-${observed.commands.length}`;
   exitCode: number | null = null;
   constructor(private readonly input: Record<string, unknown>) {}
-  async wait() { await observed.waitGate; if (observed.waitFailure && String(this.input.args).includes("true")) throw observed.waitFailure; this.exitCode = this.exitCode ?? observed.commandExit?.(this.input) ?? observed.exitCode; return { exitCode: this.exitCode, durationMs: 1 }; }
+  async wait() {
+    await observed.waitGate;
+    if (observed.fenceWaitFailure && String(this.input.args).includes("realpath")) throw observed.fenceWaitFailure;
+    if (observed.waitFailure && String(this.input.args).includes("true")) throw observed.waitFailure;
+    this.exitCode = this.exitCode ?? observed.commandExit?.(this.input) ?? observed.exitCode;
+    return { exitCode: this.exitCode, durationMs: 1 };
+  }
   async kill(signal?: string) { observed.kills.push(`${this.cmdId}:${signal}`); this.exitCode = 137; }
   logs(_opts?: { signal?: AbortSignal }) {
     let closed = false;
@@ -87,7 +93,7 @@ async function providerAndWorkspace() {
 
 beforeEach(() => {
   observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.kills = []; observed.logsClosed = 0;
-  observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.deleteFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
+  observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.fenceWaitFailure = undefined; observed.deleteFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
   observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.getFailure = undefined; observed.listed = []; observed.listedPages = undefined; observed.listInputs = []; FakeSandbox.current = new FakeSession();
 });
 
@@ -110,7 +116,7 @@ describe("VercelCloudWorkspaceProvider", () => {
     const command = observed.commands.find((candidate) => String(candidate.args).includes("printf safe"));
     expect(command).toMatchObject({ cmd: "sh", args: ["-lc", "printf safe"], cwd: workspace.root, env: {}, detached: true, timeoutMs: 1_000 });
     expect(command).not.toHaveProperty("stdout");
-    expect(observed.logsClosed).toBe(1);
+    expect(observed.logsClosed).toBe(2);
   });
 
   it("fails stale before data-plane work and cleanup still deletes the exact named attempt", async () => {
@@ -162,7 +168,7 @@ describe("VercelCloudWorkspaceProvider", () => {
     observed.logs = [{ stream: "stdout", data: "12345" }, { stream: "stderr", data: "67890" }];
     await expect(provider.exec(workspace, { command: "printf mixed", timeoutMs: 1_000, maxOutputBytes: 8 })).rejects.toMatchObject({ code: "resource_limit" });
     expect(observed.kills.some((value) => value.endsWith(":SIGKILL"))).toBe(true);
-    expect(observed.logsClosed).toBe(1);
+    expect(observed.logsClosed).toBe(2);
   });
 
   it("fences filesystem access and bounds streaming reads without sandbox.fs helpers", async () => {
@@ -346,6 +352,17 @@ describe("VercelCloudWorkspaceProvider", () => {
     observed.commandExit = (input) => String(input.args).includes("realpath") ? 1 : 0;
     await expect(provider.exec(workspace, { command: "echo should-not-run", cwd: `${workspace.root}/linked`, timeoutMs: 1_000, maxOutputBytes: 1_000 })).rejects.toMatchObject({ code: "unsafe_archive" });
     expect(observed.commands.some((input) => String(input.args).includes("echo should-not-run"))).toBe(false);
+  });
+
+  it("owns, kills, and cleans up a failed cwd-fence wait before creating the requested command", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.fenceWaitFailure = new Error("cwd fence wait failed");
+    await expect(provider.exec(workspace, { command: "echo should-not-run", cwd: workspace.root, timeoutMs: 1_000, maxOutputBytes: 1_000 })).rejects.toThrow("cwd fence wait failed");
+    expect(observed.kills).toHaveLength(1);
+    expect(observed.kills[0]).toMatch(/:SIGKILL$/);
+    expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
+    expect(observed.commands.some((input) => String(input.args).includes("echo should-not-run"))).toBe(false);
+    expect(observed.logsClosed).toBe(1);
   });
 
   it("owns one terminal wait and one kill/observe chain when wait or iterator close is delayed", async () => {
