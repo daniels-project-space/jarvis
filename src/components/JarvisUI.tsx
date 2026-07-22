@@ -394,12 +394,14 @@ function ReactorRing({
   hidden,
   motionRef,
   reduceMotion,
+  compact = false,
 }: {
   active: boolean;
   aside: boolean;
   hidden: boolean;
   motionRef: { current: OrbMotionFrame };
   reduceMotion: boolean;
+  compact?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const ringRef = useRef<SVGGElement>(null);
@@ -447,7 +449,7 @@ function ReactorRing({
       className="pointer-events-none absolute inset-0 grid place-items-center will-change-transform"
       style={{ opacity, transform: `translateX(${initialVisual.translateXPercent}%) translateY(-4.5%) scale(${initialVisual.scale})` }}
     >
-      <svg viewBox="0 0 500 500" className="h-[min(82vmin,760px)] w-[min(82vmin,760px)]">
+      <svg viewBox="0 0 500 500" className={compact ? "h-full w-full md:h-[min(82vmin,760px)] md:w-[min(82vmin,760px)]" : "h-[min(82vmin,760px)] w-[min(82vmin,760px)]"}>
         <defs>
           <linearGradient id="jarvis-orb-gradient" x1="65" y1="65" x2="435" y2="435" gradientUnits="userSpaceOnUse">
             <stop ref={firstStopRef} offset="0" stopColor="#00ff88" />
@@ -3161,7 +3163,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             onSelectedJobChange={setWorkDetailJobId}
           />
           {panel && panel.type !== "video" && !panelMin && !panelFull ? (
-            <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-10 md:pr-[36%] lg:pl-16" : "justify-center"}`}>
+            <div data-jarvis-panel-surface className={`jarvis-mobile-orb-safe-panel absolute inset-x-0 top-0 z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-10 md:pr-[36%] lg:pl-16" : "justify-center"}`}>
               <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${stagePanelSize}`}>
                 <Viewport
                   panel={panel}
@@ -3173,22 +3175,23 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               </div>
             </div>
           ) : null}
-          {/* arc-reactor HUD ring + orb — for a compact overlay they glide into
-              the right corner (orb stays visible, small); a full-bleed panel
-              hides them entirely. On phones there's no room for a corner, so a
-              compact overlay hides them too (md:opacity-100 brings them back). */}
-          <ReactorRing
-            active={live === "live" || orbState === "thinking" || orbState === "listening"}
-            aside={compactAside || (commandExpanded && !overlayUp)}
-            hidden={fullBleed}
-            motionRef={orbMotionRef}
-            reduceMotion={prefs.reduceMotion}
-          />
+          {/* The reactor and particle core share one mounted surface and the
+              ThreeOrb-published motion frame. Kept-visible phone panels use a
+              deliberate 152px berth rather than hiding or duplicating either. */}
           <div
-            className={`transition-opacity duration-500 ${
-              fullBleed ? "pointer-events-none h-full w-full opacity-0" : compactAside ? "pointer-events-none absolute bottom-2 right-2 z-30 h-28 w-28 overflow-hidden rounded-full border border-cyan/25 bg-[#061019]/85 shadow-[0_0_34px_rgba(0,255,136,.18)] opacity-100 md:static md:h-full md:w-full md:overflow-visible md:rounded-none md:border-0 md:bg-transparent md:shadow-none" : commandExpanded && !overlayUp ? "pointer-events-none h-full w-full opacity-0 md:opacity-100" : "h-full w-full opacity-100"
+            data-jarvis-orb-zone={compactAside ? "compact" : "stage"}
+            className={`absolute inset-0 transition-opacity duration-500 ${
+              fullBleed ? "pointer-events-none opacity-0" : compactAside ? "jarvis-compact-orb-zone pointer-events-none z-30 overflow-hidden rounded-full border border-cyan/25 bg-[#061019]/85 shadow-[0_0_34px_rgba(0,255,136,.18)] opacity-100 md:overflow-visible md:rounded-none md:border-0 md:bg-transparent md:shadow-none" : commandExpanded && !overlayUp ? "pointer-events-none opacity-0 md:opacity-100" : "opacity-100"
             }`}
           >
+            <ReactorRing
+              active={live === "live" || orbState === "thinking" || orbState === "listening"}
+              aside={compactAside || (commandExpanded && !overlayUp)}
+              hidden={fullBleed}
+              motionRef={orbMotionRef}
+              reduceMotion={prefs.reduceMotion}
+              compact={compactAside}
+            />
             <ThreeOrb
               state={orbState}
               energyRef={energyRef}
@@ -3205,7 +3208,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               title="Tap the orb to interrupt"
               onClick={stopTalking}
               className={compactAside || (commandExpanded && !overlayUp)
-                ? "absolute bottom-[25%] left-[69%] right-[3%] top-[25%] z-20 hidden rounded-full bg-transparent md:block"
+                ? "absolute bottom-4 right-4 z-40 hidden h-36 w-36 rounded-full bg-transparent md:bottom-[25%] md:left-[69%] md:right-[3%] md:top-[25%] md:h-auto md:w-auto md:block"
                 : "absolute inset-[28%] z-20 rounded-full bg-transparent"}
             />
           )}

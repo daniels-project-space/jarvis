@@ -100,6 +100,9 @@ describe("orb side-mode layout contracts", () => {
     expect(mobile.translateXPercent).toBe(0);
     expect(mobile.scale).toBe(1);
     expect(orbSource).toContain("asideRef.current && W() >= 768");
-    expect(jarvisSource).toContain("absolute bottom-2 right-2 z-30 h-28 w-28");
+    expect(jarvisSource).toContain("data-jarvis-orb-zone={compactAside ? \"compact\" : \"stage\"}");
+    expect(jarvisSource).toContain("jarvis-compact-orb-zone");
+    expect(jarvisSource).toContain("jarvis-mobile-orb-safe-panel");
+    expect(jarvisSource).toContain("compact={compactAside}");
   });
 });

@@ -168,9 +168,8 @@
   // Host context is useful only when it is safe to share. Never include a
   // credential, payment or private field in the element index, selection or
   // freeform page summary. Hosts can also opt an entire region out.
-  function isSensitiveElement(element) {
+  function isSensitiveNode(element) {
     if (!element) return true;
-    if (element.closest && element.closest("[data-jarvis-private], [data-jarvis-no-context]")) return true;
     var type = compact(element.type || (element.getAttribute && element.getAttribute("type")), 80).toLowerCase();
     var autocomplete = compact(element.autocomplete || (element.getAttribute && element.getAttribute("autocomplete")), 120).toLowerCase();
     var identity = compact([
@@ -179,10 +178,27 @@
       element.getAttribute && element.getAttribute("name"),
       element.getAttribute && element.getAttribute("aria-label"),
       element.getAttribute && element.getAttribute("placeholder"),
+      element.getAttribute && element.getAttribute("data-jarvis-id"),
     ].join(" "), 500).toLowerCase();
+    var hidden = element.hidden === true || type === "hidden" || (element.getAttribute && element.getAttribute("aria-hidden") === "true");
     return type === "password"
+      || hidden
       || /(?:password|passcode|secret|token|api[ _-]?key|auth|otp|one[ _-]?time)/.test(autocomplete)
       || /(?:password|passcode|secret|token|api[ _-]?key|auth|otp|one[ _-]?time|credit[ _-]?card|card[ _-]?number|cvv|cvc|iban|payment|billing|bank[ _-]?account)/.test(identity);
+  }
+
+  function isSensitiveElement(element) {
+    if (!element) return true;
+    // The opt-out predicates are inherited by every action path, not just
+    // context extraction. A safe-looking child of a payment/private region is
+    // still not available for remote spotlight, activation or edit selection.
+    if (element.closest && element.closest("[data-jarvis-private], [data-jarvis-no-context]")) return true;
+    var node = element;
+    for (var depth = 0; node && depth < 16; depth++) {
+      if (isSensitiveNode(node)) return true;
+      node = node.parentElement;
+    }
+    return false;
   }
 
   function elementLabel(element) {
@@ -371,7 +387,7 @@
     if (!wanted) return null;
     if (document.getElementById) {
       var exact = document.getElementById("w-" + target) || document.getElementById(target);
-      if (exact) return exact;
+      if (exact && !isSensitiveElement(exact)) return exact;
     }
     if (!document.querySelectorAll) return null;
     var selector = widgetOnly
@@ -382,7 +398,7 @@
     var bestScore = 0;
     for (var i = 0; i < nodes.length; i++) {
       var node = nodes[i];
-      if (node === f || (node.closest && node.closest("[data-jarvis-edit-ui]"))) continue;
+      if (node === f || isSensitiveElement(node) || (node.closest && node.closest("[data-jarvis-edit-ui]"))) continue;
       var hay = normal(((node.dataset && node.dataset.jarvisId) || "") + " " + elementLabel(node) + " " + (node.id || ""));
       var score = hay === wanted ? 5 : hay.indexOf(wanted) >= 0 ? 3 : wanted.indexOf(hay) >= 0 && hay.length > 2 ? 2 : 0;
       if (score > bestScore) {
@@ -394,7 +410,7 @@
   }
 
   function spotlight(element) {
-    if (!element) return;
+    if (!element || isSensitiveElement(element)) return false;
     try { element.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" }); } catch {}
     if (!element.style) return;
     var outline = element.style.outline;
@@ -408,15 +424,17 @@
       element.style.outlineOffset = offset;
       element.style.boxShadow = shadow;
     }, 2200);
+    return true;
   }
 
   function editCandidate(target) {
     if (!target || target === f) return null;
     if (isSensitiveElement(target)) return null;
     if (target.closest && target.closest("[data-jarvis-edit-ui]")) return null;
-    return target.closest
+    var candidate = target.closest
       ? target.closest("[data-jarvis-editable],[data-jarvis-source],button,a,input,textarea,select,[role],section,article,header,main")
       : target;
+    return isSensitiveElement(candidate) ? null : candidate;
   }
 
   function clearEditMode() {
@@ -561,8 +579,6 @@
         return Promise.resolve({ ok: false, detail: "The page guard was invalid." });
       }
     }
-    var custom = notifyHostAction(action);
-    if (custom.handled) return Promise.resolve(custom.result || { ok: true, detail: "Done on this page." });
     if (action.action === "edit") {
       return Promise.resolve(startEditMode(action.instruction || "")
         ? { ok: true, detail: "Pick the exact element; I’ll link it to its code." }
@@ -587,7 +603,9 @@
       }
     }
     var element = findHostElement(action.target, action.action === "show_widget");
-    if (!element) return Promise.resolve({ ok: false, detail: "I cannot find that element on this page." });
+    if (!element || isSensitiveElement(element)) return Promise.resolve({ ok: false, detail: "I cannot act on that private control." });
+    var custom = notifyHostAction(action);
+    if (custom.handled) return Promise.resolve(custom.result || { ok: true, detail: "Done on this page." });
     spotlight(element);
     if (action.action === "activate") {
       setTimeout(function () { try { element.click(); } catch {} }, 120);

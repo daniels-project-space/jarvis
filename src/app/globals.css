@@ -53,6 +53,49 @@ body {
   overflow-x: hidden;
 }
 
+/* A kept-visible workspace gives the particle core its own intentional mobile
+   berth. The panel reserves the same footprint, so the core, work surface and
+   bottom composer never compete for the last few touch targets. */
+.jarvis-compact-orb-zone {
+  bottom: 12px;
+  height: 152px;
+  left: auto;
+  right: 12px;
+  top: auto;
+  width: 152px;
+}
+
+.jarvis-mobile-orb-safe-panel {
+  bottom: 172px;
+}
+
+@media (max-height: 700px) and (max-width: 767px) {
+  .jarvis-compact-orb-zone {
+    bottom: 8px;
+    height: 136px;
+    right: 8px;
+    width: 136px;
+  }
+
+  .jarvis-mobile-orb-safe-panel {
+    bottom: 152px;
+  }
+}
+
+@media (min-width: 768px) {
+  .jarvis-compact-orb-zone {
+    bottom: auto;
+    height: 100%;
+    inset: 0;
+    right: auto;
+    width: 100%;
+  }
+
+  .jarvis-mobile-orb-safe-panel {
+    bottom: 64px;
+  }
+}
+
 /* faint instrument grid behind everything */
 .hud-grid {
   background-image:

@@ -1791,15 +1791,15 @@ export function CreationsView({ value }: { value: string }) {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="border-b border-white/7 px-3 py-3 sm:px-4">
-          <div className="flex flex-wrap items-center gap-2">
-            <select value={folder ?? ""} onChange={(event) => setFolder(event.target.value || null)} className="max-w-[48%] rounded-lg border border-white/10 bg-[#0c1524] px-2 py-1.5 text-xs text-ice outline-none md:hidden">
+          <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 md:flex md:flex-wrap">
+            <select value={folder ?? ""} onChange={(event) => setFolder(event.target.value || null)} className="col-span-2 w-full min-w-0 rounded-lg border border-white/10 bg-[#0c1524] px-2 py-1.5 text-xs text-ice outline-none md:hidden">
               <option value="">All files</option>
               {folders.map(([name, count]) => <option key={name} value={name}>{name} ({count})</option>)}
             </select>
-            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search saved work…" className="min-w-[150px] flex-1 rounded-lg border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-ice outline-none placeholder:text-slate/60 focus:border-cyan/40" />
+            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search saved work…" className="min-w-0 w-full flex-1 rounded-lg border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-ice outline-none placeholder:text-slate/60 focus:border-cyan/40 md:min-w-[150px]" />
             <span className="hud-label shrink-0 !text-[9px]">{visible.length} item{visible.length === 1 ? "" : "s"}</span>
           </div>
-          <div className="scrollbar-thin mt-2 flex gap-1.5 overflow-x-auto pb-0.5">
+          <div className="mt-2 flex gap-1.5 overflow-x-auto overscroll-x-contain pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
             {[null, "board", "scene", "canvas", "list", "doc", "chart", "image", "pdf", "trip"].map((k) => (
               <button key={k ?? "all"} onClick={() => setKind(k)} className={`shrink-0 rounded-full px-2.5 py-1 text-[9px] uppercase tracking-widest transition ${kind === k ? "bg-cyan/15 text-cyan ring-1 ring-cyan/35" : "bg-white/[0.025] text-slate hover:text-ice"}`}>
                 {k === "canvas" ? "mind maps" : k === "doc" ? "writing" : k ?? "all"}
@@ -1814,7 +1814,7 @@ export function CreationsView({ value }: { value: string }) {
             {groups.map(([name, items]) => (
               <section key={name}>
                 <div className="mb-2 flex items-center gap-2"><span className="hud-label !text-cyan-dim">{name}</span><span className="h-px flex-1 bg-white/5" /></div>
-                <div className="grid grid-cols-2 gap-2 2xl:grid-cols-3">
+                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 2xl:grid-cols-3">
                   {items.map((r) => (
                     <div key={r._id} className="card-lift glass group relative flex min-w-0 flex-col overflow-hidden rounded-xl">
                       <button onClick={() => open(r)} className="min-w-0 text-left" title={`Open ${r.title}`}>
@@ -1828,19 +1828,19 @@ export function CreationsView({ value }: { value: string }) {
                           </div>
                         )}
                         <div className="p-2.5 pb-2">
-                          <div className="truncate text-xs text-ice">{r.title}</div>
+                          <div className="line-clamp-2 min-h-8 break-words text-xs leading-4 text-ice">{r.title}</div>
                           <div className="mt-1 truncate text-[9px] uppercase tracking-[0.12em] text-slate">{r.category} · {new Date(r.updatedAt).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}</div>
                         </div>
                       </button>
-                      <div className="flex items-center justify-between gap-1 border-t border-white/5 px-2.5 py-1.5">
-                        <button onClick={() => open(r)} className="text-[9px] uppercase tracking-wider text-cyan-dim hover:text-cyan">open / edit</button>
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t border-white/5 px-2.5 py-2">
+                        <button onClick={() => open(r)} className="whitespace-nowrap text-[9px] uppercase tracking-wider text-cyan-dim hover:text-cyan">open / edit</button>
                         <button
                           onClick={() => setEditing({ id: r._id, title: r.title, folder: r.folder })}
-                          className="text-[9px] uppercase tracking-wider text-slate hover:text-cyan"
+                          className="whitespace-nowrap text-[9px] uppercase tracking-wider text-slate hover:text-cyan"
                         >
                           organize
                         </button>
-                        <a href={`/api/creation-download?id=${encodeURIComponent(r._id)}`} className="text-[9px] uppercase tracking-wider text-slate hover:text-cyan">download ↓</a>
+                        <a href={`/api/creation-download?id=${encodeURIComponent(r._id)}`} className="whitespace-nowrap text-[9px] uppercase tracking-wider text-slate hover:text-cyan">download ↓</a>
                       </div>
                     </div>
                   ))}

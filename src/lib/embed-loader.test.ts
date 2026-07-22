@@ -45,7 +45,7 @@ type FakeElement = {
   type?: string;
 };
 
-function createLoader(options: { denyFirstRecognition?: boolean; hostNodes?: unknown[] } = {}) {
+function createLoader(options: { denyFirstRecognition?: boolean; hostNodes?: unknown[]; hostById?: Record<string, unknown> } = {}) {
   const messages: unknown[] = [];
   const listeners = new Map<string, LoaderListener[]>();
   const frameWindow = { postMessage: vi.fn((message: unknown) => messages.push(message)) };
@@ -88,6 +88,7 @@ function createLoader(options: { denyFirstRecognition?: boolean; hostNodes?: unk
       createdElements.push(node);
       return node;
     }),
+    getElementById: vi.fn((id: string) => options.hostById?.[id] ?? null),
     querySelector: vi.fn(() => null),
     querySelectorAll: vi.fn(() => options.hostNodes ?? []),
     addEventListener: vi.fn((name: string, listener: LoaderListener) => {
@@ -246,6 +247,77 @@ describe("Project Hub Jarvis loader", () => {
     expect(loaderSource).not.toContain("document.body ? document.body.innerText");
     expect(loaderSource).toContain("function isSensitiveElement(element)");
     expect(loaderSource).toContain("tab to it and press Enter");
+  });
+
+  it("rejects sensitive exact targets and their ancestors before focus, activation, or widget handling", async () => {
+    const paymentForm = {
+      tagName: "FORM",
+      dataset: {},
+      getAttribute: (name: string) => name === "aria-label" ? "Bank payment" : null,
+      parentElement: null,
+    };
+    const submit = {
+      tagName: "BUTTON",
+      id: "billing-submit",
+      dataset: {},
+      click: vi.fn(),
+      closest: () => null,
+      getAttribute: () => null,
+      parentElement: paymentForm,
+    };
+    const harness = createLoader({ hostById: { "billing-submit": submit } });
+    const receive = harness.listeners.get("message")?.[0];
+
+    for (const action of ["focus", "activate", "show_widget"]) {
+      receive?.({
+        origin: JARVIS_ORIGIN,
+        source: harness.frameWindow,
+        data: {
+          jarvis: "host-action",
+          action: {
+            id: `private-${action}`,
+            action,
+            target: "billing-submit",
+            expectedUrl: "https://project-hub.test/dashboard?view=work#today",
+          },
+        },
+      });
+    }
+    await Promise.resolve();
+
+    for (const action of ["focus", "activate", "show_widget"]) {
+      expect(harness.messages).toContainEqual({
+        jarvis: "host-action-result",
+        id: `private-${action}`,
+        ok: false,
+        detail: "I cannot act on that private control.",
+      });
+    }
+    expect(submit.click).not.toHaveBeenCalled();
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: {
+        jarvis: "host-action",
+        action: {
+          id: "private-edit",
+          action: "edit",
+          instruction: "edit this payment button",
+          expectedUrl: "https://project-hub.test/dashboard?view=work#today",
+        },
+      },
+    });
+    const preventDefault = vi.fn();
+    harness.listeners.get("click")?.[0]?.({
+      target: submit,
+      preventDefault,
+      stopPropagation: vi.fn(),
+      stopImmediatePropagation: vi.fn(),
+    });
+    await Promise.resolve();
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(harness.messages).not.toContainEqual(expect.objectContaining({ jarvis: "host-command" }));
   });
 
   it("executes an app navigation, acknowledges it, and supports interruption", async () => {
