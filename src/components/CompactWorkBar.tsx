@@ -4,7 +4,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRealtimeRun } from "@trigger.dev/react-hooks";
 import { parseTerminalOutput, type TerminalTone } from "../lib/terminal-output";
 import { viewerFetch } from "../lib/viewer-request";
-import type { CompactJobDetail, CompactWorkSnapshot, FleetControl, FleetEdge, FleetNode } from "../lib/active-work";
+import {
+  fleetControlLabel,
+  fleetControlPendingLabel,
+  type CompactJobDetail,
+  type CompactWorkSnapshot,
+  type FleetControl,
+  type FleetEdge,
+  type FleetNode,
+} from "../lib/active-work";
 
 const TONE: Record<TerminalTone, string> = {
   neutral: "text-slate-200/90", muted: "text-slate-500", command: "text-sky-300",
@@ -232,7 +240,7 @@ function Controls({ controls, target, onError }: { controls: FleetControl[]; tar
   return <div className="space-y-2">
     {steering && <div className="flex gap-1"><input aria-label="Steering instruction" value={input} onChange={(event) => setInput(event.target.value)} maxLength={2000} placeholder="Adjust the unfinished boundary…" className="min-w-0 flex-1 rounded-lg border border-white/10 bg-black/25 px-2 py-1 text-[10px] text-ice outline-none focus:border-cyan/40" /><button type="button" disabled={!input.trim() || Boolean(acting)} onClick={() => void apply("steer")} className="rounded-lg border border-cyan/25 px-2 text-[9px] text-cyan disabled:opacity-40">send</button></div>}
     <div className="flex flex-wrap justify-end gap-1">
-      {controls.map((control) => <button key={control} type="button" disabled={Boolean(acting)} onClick={() => void apply(control)} className={`rounded-lg border px-2 py-1 text-[8px] uppercase tracking-[0.12em] disabled:opacity-40 ${control === "cancel" || control === "decline" ? "border-rose-400/20 text-rose-300" : "border-white/10 text-slate hover:border-cyan/30 hover:text-cyan"}`}>{acting === control ? "working…" : control}</button>)}
+      {controls.map((control) => <button key={control} type="button" disabled={Boolean(acting)} onClick={() => void apply(control)} className={`rounded-lg border px-2 py-1 text-[8px] uppercase tracking-[0.12em] disabled:opacity-40 ${control === "cancel" || control === "decline" ? "border-rose-400/20 text-rose-300" : "border-white/10 text-slate hover:border-cyan/30 hover:text-cyan"}`}>{acting === control ? fleetControlPendingLabel(control) : fleetControlLabel(control)}</button>)}
     </div>
   </div>;
 }

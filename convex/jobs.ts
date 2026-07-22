@@ -18,6 +18,7 @@ import {
 } from "./goalIntegration";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
 import { hasAttemptBudget, isMeaningfulWorkProgress } from "../src/lib/work-attempt";
+import { workControlEventStage } from "../src/lib/work-control-language";
 import { verifiedGoalHandoffsForJob } from "./goalMode";
 import { claimDisposition, completionReceiptAllowed, isSha256Digest, replayEnvelope, shouldAdvanceAttempt } from "../src/lib/durable-attempt-protocol";
 import { canonicalWorkspaceCheckpoint, parseCanonicalWorkspaceCheckpoint } from "../src/lib/workspace-checkpoint";
@@ -2974,7 +2975,7 @@ export const control = mutation({
       a.action === "retry" && row.approvalRequired === true && row.approvalStatus !== "approved";
     if (!controlEventEmitted) await appendAttemptEvidence(ctx, row, a.action,
       a.action === "steer" ? `Daniel steering: ${String(a.input ?? "").trim().slice(0, 500)}` : `${a.action} requested by Daniel`,
-      { stage: retryNeedsApproval ? "approval" : a.action === "resume" || a.action === "retry" ? "queued" : a.action === "steer" ? "steering" : `${a.action}d`,
+      { stage: retryNeedsApproval ? "approval" : workControlEventStage(a.action),
         evidenceKind: a.action === "steer" ? "steering" : "control", eventKey: `control:${a.action}:${row.attempt ?? 1}:${a.action === "steer" ? row.steerRevision ?? 0 : now}` });
     return true;
   },

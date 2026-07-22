@@ -8,6 +8,7 @@ import { wakeAgentFleet } from "./agent-fleet-dispatch";
 import { SHALLOW_PROVENANCE_RULE } from "./git-delivery";
 import { workModelLabel, workModelPriority } from "./work-models";
 import { exactTextWorkOrder } from "./work-order";
+import { formatWorkControlResult, isWorkControlAction } from "./work-control-language";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
 import {
   VISUAL_BLOCK_KINDS,
@@ -3086,7 +3087,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           }
         }
         if (ok && shouldWake) await wakeAgentFleet(`goal-resume:${missionId}`).catch(() => false);
-        return ok ? `Goal Mode ${missionId} ${action} request applied.` : `That goal cannot be ${action}d from its current state.`;
+        return formatWorkControlResult(ok ? `Goal Mode ${missionId}` : "That goal", action, Boolean(ok));
       }
       if (action !== "start") return "Unknown Goal Mode action.";
       const goal = String(args.goal ?? "").trim();
@@ -3207,11 +3208,12 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       }
       const input = action === "steer" ? String(args.input ?? "").trim() : undefined;
       if (action === "steer" && !input) return "Tell me the new direction you want the specialist to follow.";
+      if (!isWorkControlAction(action)) return "Unknown work control action.";
       const ok = await convexMutation("jobs:control", { jobId, action, input, authTokenHash });
       if (ok && (action === "resume" || action === "retry" || action === "steer")) {
         await wakeAgentFleet(`${action}:${jobId}`).catch(() => false);
       }
-      return ok ? `Job ${jobId} ${action} request applied.` : `That job cannot be ${action}d from its current state.`;
+      return formatWorkControlResult(ok ? `Job ${jobId}` : "That job", action, Boolean(ok));
     }
     case "creative_sprint": {
       const brief = String(args.brief ?? "").trim();
