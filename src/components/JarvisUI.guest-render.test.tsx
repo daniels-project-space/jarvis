@@ -45,11 +45,11 @@ vi.mock("next/dynamic", () => ({
   default: () => () => <div data-orb-renderer />,
 }));
 
-import JarvisUI from "./JarvisUI";
+import Home from "../app/page";
 
-describe("JarvisUI guest application render", () => {
-  it("keeps text visible while suppressing a legacy persistent card in the live application tree", () => {
-    const markup = renderToStaticMarkup(<JarvisUI />);
+describe("guest Home application render", () => {
+  it("keeps text visible while suppressing a legacy persistent card in the actual page tree", () => {
+    const markup = renderToStaticMarkup(<Home />);
 
     expect(markup).toContain("This text remains visible to the guest.");
     expect(markup).not.toContain("owner-only legacy card");
