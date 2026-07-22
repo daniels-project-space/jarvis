@@ -6,20 +6,22 @@ type Log = { stream: "stdout" | "stderr"; data: string };
 const observed: {
   create?: Record<string, unknown>; get?: Record<string, unknown>; commands: Record<string, unknown>[];
   deletes: string[]; updates: unknown[]; kills: string[]; logsClosed: number; files: Map<string, Buffer>; mkdirs: string[]; reads: string[];
-  logs: Log[]; createGate?: Promise<void>; exitCode: number; commandExit?: (input: Record<string, unknown>) => number;
-  updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; getFailure?: unknown; listed: Array<{ status: string }>;
-} = { commands: [], deletes: [], updates: [], kills: [], logsClosed: 0, files: new Map(), mkdirs: [], reads: [], logs: [], exitCode: 0, listed: [] };
+  logs: Log[]; createGate?: Promise<void>; waitGate?: Promise<void>; logCloseGate?: Promise<void>; waitFailure?: unknown; deleteFailure?: unknown;
+  exitCode: number; commandExit?: (input: Record<string, unknown>) => number;
+  updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; getFailure?: unknown;
+  listed: Array<{ status: string }>; listedPages?: Array<Array<{ status: string }>>; listInputs: Record<string, unknown>[];
+} = { commands: [], deletes: [], updates: [], kills: [], logsClosed: 0, files: new Map(), mkdirs: [], reads: [], logs: [], exitCode: 0, listed: [], listInputs: [] };
 
 class FakeCommand {
   readonly cmdId = `cmd-${observed.commands.length}`;
   exitCode: number | null = null;
   constructor(private readonly input: Record<string, unknown>) {}
-  async wait() { this.exitCode = this.exitCode ?? observed.commandExit?.(this.input) ?? observed.exitCode; return { exitCode: this.exitCode, durationMs: 1 }; }
+  async wait() { await observed.waitGate; if (observed.waitFailure && String(this.input.args).includes("true")) throw observed.waitFailure; this.exitCode = this.exitCode ?? observed.commandExit?.(this.input) ?? observed.exitCode; return { exitCode: this.exitCode, durationMs: 1 }; }
   async kill(signal?: string) { observed.kills.push(`${this.cmdId}:${signal}`); this.exitCode = 137; }
   logs(_opts?: { signal?: AbortSignal }) {
     let closed = false;
     return Object.assign((async function* () { for (const log of observed.logs) { if (!closed) yield log; } })(), {
-      close: () => { closed = true; observed.logsClosed += 1; },
+      close: async () => { await observed.logCloseGate; closed = true; observed.logsClosed += 1; },
       [Symbol.dispose]: () => { closed = true; observed.logsClosed += 1; },
     });
   }
@@ -31,7 +33,7 @@ class FakeSession {
   networkPolicy: unknown = "deny-all";
   async runCommand(input: Record<string, unknown>) {
     observed.commands.push(input);
-    await observed.createGate;
+    if (String(input.args).includes("sleep 1")) await observed.createGate;
     return new FakeCommand(input);
   }
   async mkDir(path: string) { observed.mkdirs.push(path); }
@@ -48,7 +50,15 @@ class FakeSession {
 
 class FakeSandbox {
   static current = new FakeSession();
-  static async list() { return { [Symbol.asyncIterator]: async function* () { yield* observed.listed; } }; }
+  static async list(input: Record<string, unknown>) {
+    observed.listInputs.push(input);
+    const pages = observed.listedPages ?? [observed.listed];
+    const materialized = pages.map((sandboxes, index) => ({ sandboxes, pagination: { count: sandboxes.length, next: index + 1 < pages.length ? `cursor-${index + 1}` : null } }));
+    return Object.assign(materialized[0]!, {
+      pages: async function* () { yield* materialized; },
+      [Symbol.asyncIterator]: async function* () { for (const page of materialized) yield* page.sandboxes; },
+    });
+  }
   static async create(input: Record<string, unknown>) { observed.create = input; return new FakeSandbox(`jarvis-${"a".repeat(40)}`); }
   static async get(input: Record<string, unknown>) {
     observed.get = input;
@@ -63,7 +73,7 @@ class FakeSandbox {
   private readonly snapshot = FakeSandbox.current;
   constructor(readonly name: string) {}
   currentSession() { return this.snapshot; }
-  async delete() { observed.deletes.push(this.name); }
+  async delete() { observed.deletes.push(this.name); if (observed.deleteFailure) throw observed.deleteFailure; }
 }
 
 vi.mock("@vercel/sandbox", () => ({ Sandbox: FakeSandbox }));
@@ -77,8 +87,8 @@ async function providerAndWorkspace() {
 
 beforeEach(() => {
   observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.kills = []; observed.logsClosed = 0;
-  observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.logs = []; observed.createGate = undefined; observed.exitCode = 0; observed.commandExit = undefined;
-  observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.getFailure = undefined; observed.listed = []; FakeSandbox.current = new FakeSession();
+  observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.deleteFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
+  observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.getFailure = undefined; observed.listed = []; observed.listedPages = undefined; observed.listInputs = []; FakeSandbox.current = new FakeSession();
 });
 
 describe("VercelCloudWorkspaceProvider", () => {
@@ -97,8 +107,9 @@ describe("VercelCloudWorkspaceProvider", () => {
     const result = await provider.exec(workspace, { command: "printf safe", cwd: workspace.root, timeoutMs: 1_000, maxOutputBytes: 1_000 });
     expect(result).toMatchObject({ exitCode: 0, stdout: "safe-out", stderr: "safe-err", providerSessionId: "vercel-session-a" });
     expect(observed.get).toMatchObject({ name: workspace.providerWorkspaceId, resume: false, token: "controller-token", teamId: "team_1", projectId: "prj_1" });
-    expect(observed.commands[0]).toMatchObject({ cmd: "sh", args: ["-lc", "printf safe"], cwd: workspace.root, env: {}, detached: true, timeoutMs: 1_000 });
-    expect(observed.commands[0]).not.toHaveProperty("stdout");
+    const command = observed.commands.find((candidate) => String(candidate.args).includes("printf safe"));
+    expect(command).toMatchObject({ cmd: "sh", args: ["-lc", "printf safe"], cwd: workspace.root, env: {}, detached: true, timeoutMs: 1_000 });
+    expect(command).not.toHaveProperty("stdout");
     expect(observed.logsClosed).toBe(1);
   });
 
@@ -150,7 +161,7 @@ describe("VercelCloudWorkspaceProvider", () => {
     const { provider, workspace } = await providerAndWorkspace();
     observed.logs = [{ stream: "stdout", data: "12345" }, { stream: "stderr", data: "67890" }];
     await expect(provider.exec(workspace, { command: "printf mixed", timeoutMs: 1_000, maxOutputBytes: 8 })).rejects.toMatchObject({ code: "resource_limit" });
-    expect(observed.kills).toContain("cmd-1:SIGKILL");
+    expect(observed.kills.some((value) => value.endsWith(":SIGKILL"))).toBe(true);
     expect(observed.logsClosed).toBe(1);
   });
 
@@ -230,7 +241,8 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
     release();
     await new Promise((resolve) => setImmediate(resolve));
-    expect(observed.kills).toContain("cmd-1:SIGKILL");
+    expect(observed.kills).toHaveLength(1);
+    expect(observed.kills[0]).toMatch(/:SIGKILL$/);
   });
 
   it("fails closed and deletes the exact attempt when cancellation races command creation", async () => {
@@ -245,7 +257,8 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
     release();
     await new Promise((resolve) => setImmediate(resolve));
-    expect(observed.kills).toContain("cmd-1:SIGKILL");
+    expect(observed.kills).toHaveLength(1);
+    expect(observed.kills[0]).toMatch(/:SIGKILL$/);
   });
 
   it("rejects bounded lists and symlink findings from the session-scoped lstat command", async () => {
@@ -254,6 +267,14 @@ describe("VercelCloudWorkspaceProvider", () => {
     await expect(provider.listFiles(workspace, ".", 1)).rejects.toMatchObject({ code: "resource_limit" });
     observed.commandExit = (input) => String(input.args).includes("find -P") ? 43 : 0;
     await expect(provider.listFiles(workspace, ".", 1)).rejects.toMatchObject({ code: "unsafe_archive" });
+  });
+
+  it("strictly decodes NUL listings and accepts exactly the requested entry limit", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.logs = [{ stream: "stdout", data: "only\0" }];
+    await expect(provider.listFiles(workspace, ".", 1)).resolves.toEqual(["only"]);
+    observed.logs = [{ stream: "stdout", data: Buffer.from([0xff]) as unknown as string }];
+    await expect(provider.listFiles(workspace, ".", 1)).rejects.toMatchObject({ code: "unsafe_patch" });
   });
 
   it("relocks and terminates on install failure before any later command boundary", async () => {
@@ -299,5 +320,90 @@ describe("VercelCloudWorkspaceProvider", () => {
     const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
     await expect(provider.createWorkspace({ attemptKey: "job:cap", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS })).rejects.toMatchObject({ code: "resource_limit" });
     expect(observed.create).toBeUndefined();
+  });
+
+  it("uses the archive limit only for controller artifacts and round-trips a source archive above the public file cap", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    const source = createDeterministicTar(Array.from({ length: 6 }, (_, index) => ({ path: `src/${index}.txt`, data: new Uint8Array(1024 * 1024).fill(index) })));
+    expect(source.byteLength).toBeGreaterThan(DEFAULT_WORKSPACE_LIMITS.maxFileBytes);
+    const control = `${workspace.root}/.jarvis-controller-${workspace.providerWorkspaceId}`;
+    observed.files.set(`${control}/source.tar`, Buffer.from(source));
+    observed.files.set(`${control}/checkpoint.patch`, Buffer.alloc(0));
+    await expect(provider.readFile(workspace, "safe.txt", source.byteLength)).rejects.toMatchObject({ code: "resource_limit" });
+    const checkpoint = await provider.checkpoint(workspace, {
+      jobId: "job", attempt: 1, baseSha: "0".repeat(40), sourceArchiveSha256: sha256Bytes(source), sourceArchiveBytes: source.byteLength,
+      runtime: "node-22", lockfileDigest: "a".repeat(64), template: "node22", attemptKey: "job:1", causationId: "cause",
+    });
+    expect(checkpoint.archive.byteLength).toBeGreaterThan(DEFAULT_WORKSPACE_LIMITS.maxFileBytes);
+    const recreated = await provider.recreateFromCheckpoint({ checkpoint: checkpoint.manifest, archive: checkpoint.archive, limits: DEFAULT_WORKSPACE_LIMITS, attemptKey: "job:2" });
+    expect(observed.files.get(`${recreated.root}/.jarvis-controller-${recreated.providerWorkspaceId}/replay.tar`)?.byteLength).toBe(checkpoint.archive.byteLength);
+    observed.files.set(`${control}/output.patch`, Buffer.alloc(0));
+    await expect(provider.exportPatch(workspace, "0".repeat(40), DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes)).resolves.toMatchObject({ byteCount: 0 });
+  });
+
+  it("realpath-fences a symlink cwd before the requested command is created", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.commandExit = (input) => String(input.args).includes("realpath") ? 1 : 0;
+    await expect(provider.exec(workspace, { command: "echo should-not-run", cwd: `${workspace.root}/linked`, timeoutMs: 1_000, maxOutputBytes: 1_000 })).rejects.toMatchObject({ code: "unsafe_archive" });
+    expect(observed.commands.some((input) => String(input.args).includes("echo should-not-run"))).toBe(false);
+  });
+
+  it("owns one terminal wait and one kill/observe chain when wait or iterator close is delayed", async () => {
+    let releaseWait!: () => void;
+    observed.waitGate = new Promise<void>((resolve) => { releaseWait = resolve; });
+    const { provider, workspace } = await providerAndWorkspace();
+    const running = provider.exec(workspace, { command: "sleep 1", timeoutMs: 1_000, maxOutputBytes: 1_000 });
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseWait();
+    await expect(running).resolves.toMatchObject({ exitCode: 0 });
+    expect(observed.kills).toEqual([]);
+    let releaseClose!: () => void;
+    observed.logCloseGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+    const closing = provider.exec(workspace, { command: "true", timeoutMs: 1_000, maxOutputBytes: 1_000 });
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseClose();
+    await expect(closing).resolves.toMatchObject({ exitCode: 0 });
+  });
+
+  it("kills once, deletes the exact attempt after a throwing wait, and reports blocked cleanup during creation", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.waitFailure = new Error("wait failed");
+    await expect(provider.exec(workspace, { command: "true", timeoutMs: 1_000, maxOutputBytes: 1_000 })).rejects.toThrow("wait failed");
+    expect(observed.kills).toHaveLength(1);
+    expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
+
+    let release!: () => void;
+    observed.createGate = new Promise<void>((resolve) => { release = resolve; });
+    observed.waitFailure = undefined; observed.deleteFailure = new Error("delete refused");
+    const controller = new AbortController();
+    const aborted = provider.exec(workspace, { command: "sleep 1", timeoutMs: 1_000, maxOutputBytes: 1_000, signal: controller.signal });
+    await new Promise((resolve) => setImmediate(resolve)); controller.abort();
+    await expect(aborted).rejects.toMatchObject({ code: "cleanup_blocked" });
+    release();
+  });
+
+  it("bounds history pages, includes an active later page, and fails closed when completeness exceeds the ceiling", async () => {
+    observed.listedPages = [Array.from({ length: 50 }, () => ({ status: "stopped" })), [{ status: "running" }]];
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    await provider.createWorkspace({ attemptKey: "later-page", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS });
+    expect(observed.listInputs[0]).toMatchObject({ namePrefix: "jarvis", tags: { owner: "jarvis" }, limit: 50 });
+    observed.listedPages = Array.from({ length: 9 }, () => []);
+    await expect(provider.createWorkspace({ attemptKey: "too-many-pages", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS })).rejects.toMatchObject({ code: "resource_limit" });
+  });
+
+  it("excludes the exact controller directory from baseline, checkpoint, replay, and exported patch commands", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    const control = `.jarvis-controller-${workspace.providerWorkspaceId}`;
+    const bytes = createDeterministicTar([{ path: "package.json", data: new TextEncoder().encode("{}") }]);
+    await provider.uploadCredentiallessArchive(workspace, { baseSha: "0".repeat(40), sha256: sha256Bytes(bytes), bytes });
+    observed.files.set(`${workspace.root}/${control}/source.tar`, Buffer.from(bytes));
+    observed.files.set(`${workspace.root}/${control}/checkpoint.patch`, Buffer.alloc(0));
+    await provider.checkpoint(workspace, { jobId: "job", attempt: 1, baseSha: "0".repeat(40), sourceArchiveSha256: sha256Bytes(bytes), sourceArchiveBytes: bytes.byteLength, runtime: "node-22", lockfileDigest: "a".repeat(64), template: "node22", attemptKey: "job", causationId: "cause" });
+    observed.files.set(`${workspace.root}/${control}/output.patch`, Buffer.alloc(0));
+    await provider.exportPatch(workspace, "0".repeat(40), DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
+    const gitCommands = observed.commands.filter((command) => /git (?:add|diff)/.test(String(command.args))).map((command) => String(command.args));
+    expect(gitCommands).not.toHaveLength(0);
+    expect(gitCommands.every((command) => command.includes(`:(exclude)${control}`))).toBe(true);
   });
 });

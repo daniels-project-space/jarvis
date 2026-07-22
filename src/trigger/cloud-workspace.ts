@@ -261,6 +261,7 @@ export function validatedTarMembers(
   bytes: Uint8Array,
   limits: Pick<WorkspaceLimits, "maxArchiveBytes" | "maxFileBytes"> = DEFAULT_WORKSPACE_LIMITS,
   provider: HistoricalCloudWorkspaceProviderName = "cloudflare",
+  memberMaxBytes = limits.maxFileBytes,
 ): ValidatedTarMember[] {
   if (!bytes.byteLength || bytes.byteLength > limits.maxArchiveBytes) {
     throw new CloudWorkspaceError(provider, "resource_limit", "archive byte count is empty or exceeds the configured limit", "rejected");
@@ -300,7 +301,7 @@ export function validatedTarMembers(
     let size;
     try { size = tarOctal(bytes, offset + 124, 12); }
     catch { throw new CloudWorkspaceError(provider, "unsafe_archive", "archive member size is malformed", "rejected"); }
-    if (!Number.isSafeInteger(size) || size < 0 || size > limits.maxFileBytes) {
+    if (!Number.isSafeInteger(size) || size < 0 || size > memberMaxBytes) {
       throw new CloudWorkspaceError(provider, "resource_limit", "archive member exceeds the configured byte limit", "rejected");
     }
     if (type !== "0" && type !== "5" && type !== "g") {
@@ -466,7 +467,11 @@ export function validatePortableCheckpointArchive(
   if (archive.byteLength !== manifest.archiveBytes || sha256Bytes(archive) !== manifest.archiveSha256) {
     throw new CloudWorkspaceError(manifest.provider, "digest_mismatch", "portable checkpoint bytes do not match the canonical manifest", "rejected");
   }
-  const members = validatedTarMembers(archive, limits, manifest.provider);
+  // A portable checkpoint carries controller-owned source.tar and patch
+  // artifacts, not public files. Their members may be up to the archive cap;
+  // the nested credentialless source archive is still validated at 5 MiB per
+  // public source file below.
+  const members = validatedTarMembers(archive, limits, manifest.provider, limits.maxArchiveBytes);
   if (members.length !== 2 || members.some((member) => member.type !== "0")) {
     throw new CloudWorkspaceError(manifest.provider, "unsafe_archive", "portable checkpoint must contain exactly two regular members", "rejected");
   }
