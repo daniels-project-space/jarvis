@@ -709,10 +709,46 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     const failureBackoffMs = (attempt: number) =>
       Math.min(6 * 60 * 60 * 1000, 60_000 * 2 ** Math.max(0, Math.min(12, attempt - 1)));
 
+    // Goal advancement can be quiet for minutes while parsing a large result
+    // or waiting for an idempotent external handoff. Keep that control lease
+    // alive independently of model output; a stale Trigger redelivery must be
+    // unable to commit after a newer coordinator has recovered the mission.
+    const advanceLeaseOwner = `trigger:${options.reservation.workerRunId}`.slice(0, 160);
+    const advanceLeaseToken = randomBytes(24).toString("hex");
+    const advanceFence = (claim: any) => ({
+      advanceLeaseOwner: claim.advanceLeaseOwner,
+      advanceLeaseToken: claim.advanceLeaseToken,
+      advanceLeaseVersion: Number(claim.advanceLeaseVersion),
+    });
+    const renewGoalAdvance = async (claim: any) => {
+      if (!claim.advanceLeaseOwner || !claim.advanceLeaseToken || !Number.isFinite(Number(claim.advanceLeaseVersion))) return true;
+      return await convexMutation("goalMode:renewAdvance", {
+        id: claim.missionId,
+        expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
+        ...advanceFence(claim),
+      }).catch(() => false) === true;
+    };
+    const withGoalAdvanceRenewal = async <T,>(claim: any, work: () => Promise<T>) => {
+      let live = await renewGoalAdvance(claim);
+      let renewal = Promise.resolve();
+      const timer = setInterval(() => {
+        renewal = renewal.then(async () => { live = live && await renewGoalAdvance(claim); });
+      }, 60_000);
+      try {
+        if (!live) return { live: false, value: undefined as T | undefined };
+        const value = await work();
+        await renewal;
+        live = live && await renewGoalAdvance(claim);
+        return { live, value };
+      } finally {
+        clearInterval(timer);
+      }
+    };
+
     const drainGoalAdvances = async (): Promise<number> => {
       let advanced = 0;
       for (let index = 0; index < 12; index += 1) {
-        const claim: any = await convexMutation("goalMode:claimAdvance", {}).catch(() => null);
+        const claim: any = await convexMutation("goalMode:claimAdvance", { advanceLeaseOwner, advanceLeaseToken }).catch(() => null);
         if (!claim) break;
         if (claim.kind === "advanced") {
           advanced += 1;
@@ -729,31 +765,35 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               id: claim.missionId,
               jobId: claim.jobId,
               expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
+              ...advanceFence(claim),
               error: String(error),
             }).catch(() => null);
             advanced += 1;
             continue;
           }
           let externalRun: { kind: string; id: string; slug?: string } | undefined;
-          if (claim.route === "app_factory") {
-            try {
-              externalRun = await startAppFactoryGoal(plan, String(claim.missionId));
-            } catch (error) {
-              await convexMutation("goalMode:releaseAdvance", {
-                id: claim.missionId,
-                expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
-                error: String(error),
-                delayMs: 60_000,
-              }).catch(() => null);
-              break;
-            }
+          let handoffError: unknown;
+          const handoff = await withGoalAdvanceRenewal(claim, async () => {
+            if (claim.route === "app_factory") externalRun = await startAppFactoryGoal(plan, String(claim.missionId));
+            return await convexMutation("goalMode:recordPlan", {
+              id: claim.missionId,
+              expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
+              ...advanceFence(claim),
+              plan,
+              externalRun,
+            });
+          }).catch((error) => { handoffError = error; return { live: true, value: null }; });
+          if (handoffError) {
+            await convexMutation("goalMode:releaseAdvance", {
+              id: claim.missionId,
+              expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
+              ...advanceFence(claim),
+              error: String(handoffError), delayMs: 60_000,
+            }).catch(() => null);
+            break;
           }
-          const result: any = await convexMutation("goalMode:recordPlan", {
-            id: claim.missionId,
-            expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
-            plan,
-            externalRun,
-          }).catch(() => null);
+          if (!handoff.live) continue;
+          const result: any = handoff.value;
           if (result?.advanced) {
             advanced += 1;
             const thread = await chatThread();
@@ -775,16 +815,20 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               id: claim.missionId,
               jobId: claim.jobId,
               expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
+              ...advanceFence(claim),
               error: String(error),
             }).catch(() => null);
             advanced += 1;
             continue;
           }
-          const result: any = await convexMutation("goalMode:recordValidation", {
+          const validationWrite = await withGoalAdvanceRenewal(claim, async () => await convexMutation("goalMode:recordValidation", {
             id: claim.missionId,
             expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
+            ...advanceFence(claim),
             validation,
-          }).catch(() => null);
+          }).catch(() => null));
+          if (!validationWrite.live) continue;
+          const result: any = validationWrite.value;
           if (!result?.advanced) continue;
           advanced += 1;
           if (result.status === "done") {

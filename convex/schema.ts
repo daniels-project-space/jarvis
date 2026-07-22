@@ -459,6 +459,13 @@ export default defineSchema({
     maxRevisionWaves: v.optional(v.number()),
     maxBuildSessions: v.optional(v.number()),
     advanceAttempt: v.optional(v.number()),
+    // Goal result parsing and external handoff are a separate durable control
+    // boundary.  Fence its owner just like delivery/integration so a quiet or
+    // restarted Trigger turn cannot commit an old planner/validator output.
+    advanceLeaseOwner: v.optional(v.string()),
+    advanceLeaseToken: v.optional(v.string()),
+    advanceLeaseVersion: v.optional(v.number()),
+    advanceLeaseHeartbeatAt: v.optional(v.number()),
     advanceLeaseUntil: v.optional(v.number()),
     pausedPhase: v.optional(v.string()),
     pendingRefinements: v.optional(v.any()),
@@ -521,6 +528,9 @@ export default defineSchema({
     integrationGeneration: v.optional(v.number()),
     activeIntegrationAttemptId: v.optional(v.id("integrationAttempts")),
     integrationLeaseUntil: v.optional(v.number()),
+    advanceLeaseOwner: v.optional(v.string()),
+    advanceLeaseVersion: v.optional(v.number()),
+    advanceLeaseHeartbeatAt: v.optional(v.number()),
     advanceLeaseUntil: v.optional(v.number()),
     pausedPhase: v.optional(v.string()),
     failureReason: v.optional(v.string()),

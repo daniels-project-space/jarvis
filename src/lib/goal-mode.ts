@@ -96,7 +96,10 @@ export type GoalMissionLease = {
 };
 
 export function summarizeGoalPhase(jobs: GoalPhaseJob[]) {
-  const failed = jobs.filter((job) => job.status === "error" || job.status === "cancelled");
+  // `needs_input` is a terminal attempt state, not proof that the whole
+  // outcome needs Daniel. Goal Mode's recovery controller decides whether it
+  // is an automatic retry or a genuine protected gate.
+  const failed = jobs.filter((job) => job.status === "error" || job.status === "cancelled" || job.status === "needs_input");
   return {
     state: jobs.length === 0
       ? "empty" as const
