@@ -27,6 +27,7 @@ import {
   isolateSubscriptionEnv,
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
+  verifyCodexSubscriptionPreflight,
   type AgentProvider,
 } from "./subscription-runtime";
 import {
@@ -681,6 +682,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     if (!bin) return rejectReservation(`no ${provider} binary`);
     const prepared = prepareSubscriptionEnv(provider);
     if (prepared.error) return rejectReservation(prepared.error);
+    const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
+    if (preflight.error) return rejectReservation(preflight.error);
     const missingTools = missingSubscriptionTools(prepared.env);
     if (missingTools.length) {
       return rejectReservation(`Codex worker toolchain unavailable: missing ${missingTools.join(", ")} on PATH`);

@@ -11,6 +11,7 @@ import { codexConversationExecPrefix, codexModelFor, pickConversationTier } from
 import {
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
+  verifyCodexSubscriptionPreflight,
   type AgentProvider,
 } from "./subscription-runtime";
 import {
@@ -282,6 +283,8 @@ async function processChatQueue(
   const env = prepared.env;
   const bin = resolveSubscriptionAgentBin(provider);
   if (!bin) return { processed: 0, error: `${provider} binary not found` };
+  const preflight = verifyCodexSubscriptionPreflight(bin, env);
+  if (preflight.error) return { processed: 0, error: preflight.error };
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
   if (!workerToken) return { processed: 0, error: "JARVIS_WORKER_TOKEN is not configured" };
   const runnerId = randomUUID();
@@ -450,6 +453,8 @@ export const chatMemory = task({
     const prepared = prepareSubscriptionEnv(provider);
     const bin = resolveSubscriptionAgentBin(provider);
     if (prepared.error || !bin) return { saved: 0, error: prepared.error ?? "Codex binary unavailable" };
+    const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
+    if (preflight.error) return { saved: 0, error: preflight.error };
     return { saved: await extractAndSave(provider, bin, prepared.env, payload.userText, payload.assistantText) };
   },
 });
