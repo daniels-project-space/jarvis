@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolvePanelRoute } from "./panel-contract";
+import { resolvePanelRoute, shouldHideOrbForPanel } from "./panel-contract";
 
 describe("semantic panel routing", () => {
   it.each([
@@ -24,7 +24,7 @@ describe("semantic panel routing", () => {
     expect(route.keepOrbVisible).toBe(true);
   });
 
-  it.each(["trip", "fleet", "pdf", "site", "url", "code", "markdown"])(
+  it.each(["board", "canvas", "scene", "creations", "trip", "fleet", "pdf", "site", "url", "code", "markdown"])(
     "keeps Jarvis visible beside %s",
     (type) => {
       expect(resolvePanelRoute({ type, value: "" }).keepOrbVisible).toBe(true);
@@ -33,5 +33,13 @@ describe("semantic panel routing", () => {
 
   it("reserves the full stage only for video playback", () => {
     expect(resolvePanelRoute({ type: "video", value: "https://example.com" }).keepOrbVisible).toBe(false);
+  });
+
+  it("keeps the orb contract when a workspace is expanded", () => {
+    // Fullscreen is intentionally not an argument: it is a layout state and
+    // cannot override a route's keepOrbVisible promise.
+    expect(shouldHideOrbForPanel({ type: "creations", value: "" })).toBe(false);
+    expect(shouldHideOrbForPanel({ type: "board", value: "" })).toBe(false);
+    expect(shouldHideOrbForPanel({ type: "video", value: "" })).toBe(true);
   });
 });

@@ -104,6 +104,11 @@
     wakeDot.style.boxShadow = awake
       ? "0 0 0 4px rgba(103,232,249,.1),0 0 16px rgba(103,232,249,.7)"
       : "0 0 0 4px rgba(148,163,184,.08)";
+    var selecting = Boolean(editSession);
+    selectorButton.setAttribute("aria-pressed", selecting ? "true" : "false");
+    selectorButton.title = selecting ? "Selection mode is on — point or tab to an element, then confirm" : "Select an element for Jarvis";
+    selectorButton.style.background = selecting ? "rgba(34,211,238,.18)" : "rgba(255,255,255,.045)";
+    selectorButton.style.boxShadow = selecting ? "inset 0 0 0 1px rgba(103,232,249,.42),0 0 18px rgba(34,211,238,.16)" : "none";
   }
 
   jarvisButton.onclick = function () {
@@ -160,8 +165,45 @@
     return parts.join(" > ");
   }
 
+  // Host context is useful only when it is safe to share. Never include a
+  // credential, payment or private field in the element index, selection or
+  // freeform page summary. Hosts can also opt an entire region out.
+  function isSensitiveNode(element) {
+    if (!element) return true;
+    var type = compact(element.type || (element.getAttribute && element.getAttribute("type")), 80).toLowerCase();
+    var autocomplete = compact(element.autocomplete || (element.getAttribute && element.getAttribute("autocomplete")), 120).toLowerCase();
+    var identity = compact([
+      element.name,
+      element.id,
+      element.getAttribute && element.getAttribute("name"),
+      element.getAttribute && element.getAttribute("aria-label"),
+      element.getAttribute && element.getAttribute("placeholder"),
+      element.getAttribute && element.getAttribute("data-jarvis-id"),
+    ].join(" "), 500).toLowerCase();
+    var hidden = element.hidden === true || type === "hidden" || (element.getAttribute && element.getAttribute("aria-hidden") === "true");
+    return type === "password"
+      || hidden
+      || /(?:password|passcode|secret|token|api[ _-]?key|auth|otp|one[ _-]?time)/.test(autocomplete)
+      || /(?:password|passcode|secret|token|api[ _-]?key|auth|otp|one[ _-]?time|credit[ _-]?card|card[ _-]?number|cvv|cvc|iban|payment|billing|bank[ _-]?account)/.test(identity);
+  }
+
+  function isSensitiveElement(element) {
+    if (!element) return true;
+    // The opt-out predicates are inherited by every action path, not just
+    // context extraction. A safe-looking child of a payment/private region is
+    // still not available for remote spotlight, activation or edit selection.
+    if (element.closest && element.closest("[data-jarvis-private], [data-jarvis-no-context]")) return true;
+    var node = element;
+    // Walk the complete ancestor chain. A deep nested card is still private
+    // when an outer checkout/secret region opts out of Jarvis interaction.
+    for (; node; node = node.parentElement) {
+      if (isSensitiveNode(node)) return true;
+    }
+    return false;
+  }
+
   function elementLabel(element) {
-    if (!element) return "";
+    if (!element || isSensitiveElement(element)) return "";
     var dataLabel = element.dataset && element.dataset.jarvisLabel;
     return compact(
       dataLabel
@@ -176,6 +218,7 @@
   }
 
   function describeElement(element, index) {
+    if (isSensitiveElement(element)) return null;
     var sourceOwner = element && element.closest ? element.closest("[data-jarvis-source]") : null;
     var role = element && element.getAttribute ? element.getAttribute("role") : "";
     if (!role && element && element.tagName) {
@@ -206,8 +249,9 @@
       var nodes = document.querySelectorAll(selectors[group]);
       for (var i = 0; i < nodes.length && rows.length < 48; i++) {
         var node = nodes[i];
-        if (node === f || (node.closest && node.closest("[data-jarvis-edit-ui]"))) continue;
+        if (node === f || isSensitiveElement(node) || (node.closest && node.closest("[data-jarvis-edit-ui]"))) continue;
         var row = describeElement(node, i);
+        if (!row) continue;
         var key = row.id + "|" + row.label;
         if (!row.label || seen[key]) continue;
         seen[key] = true;
@@ -222,8 +266,19 @@
     var text = "";
     var app = "";
     try {
-      selection = compact(window.getSelection ? window.getSelection() : "", 1800);
-      text = compact(document.body ? document.body.innerText : "", 4500);
+      // A browser selection has no reliable field provenance across every
+      // host (a selected token can look exactly like a heading). Keep it out
+      // of the cross-origin contract; the safe element index below is the
+      // bounded context contract for editable controls.
+      var contextNodes = document.querySelectorAll ? document.querySelectorAll("[data-jarvis-context],main h1,main h2,main h3,main p,main [role='heading']") : [];
+      var textParts = [];
+      for (var i = 0; i < contextNodes.length && textParts.length < 24; i++) {
+        var node = contextNodes[i];
+        if (isSensitiveElement(node) || (node.closest && node.closest("[data-jarvis-edit-ui]"))) continue;
+        var part = compact(node.innerText || node.textContent, 260);
+        if (part) textParts.push(part);
+      }
+      text = compact(textParts.join(" · "), 2400);
       var appNode = document.querySelector ? document.querySelector("[data-jarvis-app]") : null;
       app = compact((appNode && appNode.dataset && appNode.dataset.jarvisApp) || configuredApp, 120);
     } catch {}
@@ -328,35 +383,54 @@
     return detail;
   }
 
+  // A missing widget is not automatically private: Project Hub deliberately
+  // restores an allowlisted widget through its local action handler. Keep that
+  // escape hatch narrow enough that it cannot become a second generic control
+  // path for credentials, payments, or arbitrary DOM targets.
+  function isRestorableWidgetTarget(target) {
+    if (typeof target !== "string" || target.length === 0 || target.length > 64) return false;
+    if (!/^[a-z][a-z0-9_-]*$/i.test(target)) return false;
+    var identity = normal(target);
+    return !/(?:password|passcode|secret|token|api[ _-]?key|auth|login|sign[ _-]?in|credential|otp|one[ _-]?time|credit|card|cvv|cvc|iban|payment|billing|bank|account)/.test(identity);
+  }
+
   function findHostElement(target, widgetOnly) {
     var wanted = normal(target);
-    if (!wanted) return null;
+    if (!wanted) return { element: null, blocked: false };
     if (document.getElementById) {
       var exact = document.getElementById("w-" + target) || document.getElementById(target);
-      if (exact) return exact;
+      // Do not fall through to a similarly named target when the exact
+      // destination is private. This is also what distinguishes an absent
+      // widget (which a host may restore) from a hidden/private one.
+      if (exact) return { element: isSensitiveElement(exact) ? null : exact, blocked: isSensitiveElement(exact) };
     }
-    if (!document.querySelectorAll) return null;
+    if (!document.querySelectorAll) return { element: null, blocked: false };
     var selector = widgetOnly
       ? "[id^='w-'],[data-jarvis-id*='widget']"
       : "[data-jarvis-id],[data-jarvis-editable],button,a[href],input,textarea,select,[role='button'],[role='link'],[role='region']";
     var nodes = document.querySelectorAll(selector);
     var best = null;
     var bestScore = 0;
+    var blockedScore = 0;
     for (var i = 0; i < nodes.length; i++) {
       var node = nodes[i];
       if (node === f || (node.closest && node.closest("[data-jarvis-edit-ui]"))) continue;
       var hay = normal(((node.dataset && node.dataset.jarvisId) || "") + " " + elementLabel(node) + " " + (node.id || ""));
       var score = hay === wanted ? 5 : hay.indexOf(wanted) >= 0 ? 3 : wanted.indexOf(hay) >= 0 && hay.length > 2 ? 2 : 0;
+      if (isSensitiveElement(node)) {
+        if (score > blockedScore) blockedScore = score;
+        continue;
+      }
       if (score > bestScore) {
         best = node;
         bestScore = score;
       }
     }
-    return best;
+    return { element: best, blocked: blockedScore > 0 && bestScore === 0 };
   }
 
   function spotlight(element) {
-    if (!element) return;
+    if (!element || isSensitiveElement(element)) return false;
     try { element.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" }); } catch {}
     if (!element.style) return;
     var outline = element.style.outline;
@@ -370,14 +444,17 @@
       element.style.outlineOffset = offset;
       element.style.boxShadow = shadow;
     }, 2200);
+    return true;
   }
 
   function editCandidate(target) {
     if (!target || target === f) return null;
+    if (isSensitiveElement(target)) return null;
     if (target.closest && target.closest("[data-jarvis-edit-ui]")) return null;
-    return target.closest
+    var candidate = target.closest
       ? target.closest("[data-jarvis-editable],[data-jarvis-source],button,a,input,textarea,select,[role],section,article,header,main")
       : target;
+    return isSensitiveElement(candidate) ? null : candidate;
   }
 
   function clearEditMode() {
@@ -388,6 +465,7 @@
     if (editSession.outline && editSession.outline.remove) editSession.outline.remove();
     if (editSession.card && editSession.card.remove) editSession.card.remove();
     editSession = null;
+    paintUniversalControls();
   }
 
   function startEditMode(instruction) {
@@ -421,7 +499,7 @@
       eyebrow.textContent = confirming ? "CONFIRM EDIT TARGET" : "JARVIS VISUAL EDIT";
       eyebrow.style.cssText = "color:#67e8f9;font:700 10px/1.2 ui-monospace,monospace;letter-spacing:.16em;margin-bottom:7px";
       var title = document.createElement("div");
-      title.textContent = selected ? elementLabel(selected) || "Selected element" : "Point at the exact element, then click it";
+      title.textContent = selected ? elementLabel(selected) || "Selected element" : "Point at the exact element, click it, or tab to it and press Enter";
       title.style.cssText = "font-size:14px;font-weight:650;color:#f2fbff;margin-bottom:4px";
       var meta = document.createElement("div");
       var descriptor = selected ? describeElement(selected, 0) : null;
@@ -473,25 +551,35 @@
       var candidate = editCandidate(event.target);
       if (candidate) paint(candidate);
     };
-    var click = function (event) {
-      if (event.target && event.target.closest && event.target.closest("[data-jarvis-edit-ui]")) return;
-      var candidate = editCandidate(event.target);
+    var selectCandidate = function (candidate, event) {
       if (!candidate) return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+      }
       selected = candidate;
       paint(selected);
       render(true);
     };
+    var click = function (event) {
+      if (event.target && event.target.closest && event.target.closest("[data-jarvis-edit-ui]")) return;
+      var candidate = editCandidate(event.target);
+      selectCandidate(candidate, event);
+    };
     var key = function (event) {
       if (event.key === "Escape") clearEditMode();
+      if ((event.key === "Enter" || event.key === " ") && !selected) {
+        var target = document.activeElement;
+        if (target && !(target.closest && target.closest("[data-jarvis-edit-ui]"))) selectCandidate(editCandidate(target), event);
+      }
     };
     editSession = { outline: outline, card: card, move: move, click: click, key: key };
     document.addEventListener("pointermove", move, true);
     document.addEventListener("click", click, true);
     document.addEventListener("keydown", key, true);
     render(false);
+    paintUniversalControls();
     return true;
   }
 
@@ -511,9 +599,14 @@
         return Promise.resolve({ ok: false, detail: "The page guard was invalid." });
       }
     }
-    var custom = notifyHostAction(action);
-    if (custom.handled) return Promise.resolve(custom.result || { ok: true, detail: "Done on this page." });
+    // An edit instruction normally starts the explicit picker. If a host
+    // supplied an exact target, however, reject it before the picker is armed
+    // when that target is inside a private/hidden region.
     if (action.action === "edit") {
+      if (action.target) {
+        var editTarget = findHostElement(action.target, false);
+        if (editTarget.blocked) return Promise.resolve({ ok: false, detail: "I cannot act on that private control." });
+      }
       return Promise.resolve(startEditMode(action.instruction || "")
         ? { ok: true, detail: "Pick the exact element; I’ll link it to its code." }
         : { ok: false, detail: "Visual edit mode could not start on this page." });
@@ -536,8 +629,21 @@
         return Promise.resolve({ ok: false, detail: "Only a route inside this app can be opened here." });
       }
     }
-    var element = findHostElement(action.target, action.action === "show_widget");
-    if (!element) return Promise.resolve({ ok: false, detail: "I cannot find that element on this page." });
+    var target = findHostElement(action.target, action.action === "show_widget");
+    if (target.blocked) return Promise.resolve({ ok: false, detail: "I cannot act on that private control." });
+    var element = target.element;
+    if (!element) {
+      // This is intentionally the only missing-target extension. It lets a
+      // host restore a known widget, but never grants focus/activation/edit
+      // access to an element that was not first resolved and checked here.
+      if (action.action === "show_widget" && isRestorableWidgetTarget(action.target)) {
+        var restored = notifyHostAction(action);
+        if (restored.handled) return Promise.resolve(restored.result || { ok: true, detail: "Done on this page." });
+      }
+      return Promise.resolve({ ok: false, detail: "I could not find that control on this page." });
+    }
+    var custom = notifyHostAction(action);
+    if (custom.handled) return Promise.resolve(custom.result || { ok: true, detail: "Done on this page." });
     spotlight(element);
     if (action.action === "activate") {
       setTimeout(function () { try { element.click(); } catch {} }, 120);
