@@ -22,10 +22,14 @@ describe("cloud Codex runner attestation boundary", () => {
     await expect(runCloudWorkspaceAgent({
       bin: "unused", controllerScratch: "/tmp/work/controller-job-1",
       controllerEnv: { NODE_ENV: "test", CODEX_HOME: "/authority/codex-job-1", HOME: "/authority" },
-      provider, workspace, prompt: "work", model: "terra", timeoutMs: 2_000,
+      provider, workspace, prompt: "work", model: "terra", reasoningEffort: "high", timeoutMs: 2_000,
     })).rejects.toMatchObject({
       name: "CloudWorkspaceError", code: "controller_isolation_unproven", disposition: "blocked",
     });
+    expect(CodexAppServer.prototype.runTurn).toHaveBeenCalledWith(expect.objectContaining({
+      modelTier: "terra",
+      reasoningEffort: "high",
+    }));
   });
 
   it("does not reach a model turn when the isolated CODEX_HOME cannot be attested", async () => {
@@ -37,7 +41,7 @@ describe("cloud Codex runner attestation boundary", () => {
     const runTurn = vi.spyOn(CodexAppServer.prototype, "runTurn");
     await expect(runCloudWorkspaceAgent({
       bin: "unused", controllerScratch: "/tmp/work/controller-job-2",
-      controllerEnv: { NODE_ENV: "test" }, provider, workspace, prompt: "work", model: "terra", timeoutMs: 2_000,
+      controllerEnv: { NODE_ENV: "test" }, provider, workspace, prompt: "work", model: "terra", reasoningEffort: "high", timeoutMs: 2_000,
     })).rejects.toMatchObject({ code: "controller_isolation_unproven", disposition: "blocked" });
     expect(runTurn).not.toHaveBeenCalled();
   });
@@ -56,7 +60,7 @@ describe("cloud Codex runner attestation boundary", () => {
       await expect(runCloudWorkspaceAgent({
         bin: "unused", controllerScratch: scratch,
         controllerEnv: { NODE_ENV: "test", CODEX_HOME: "/authority/codex-job-3", HOME: "/authority" },
-        provider, workspace, prompt: "work", model: "terra", timeoutMs: 2_000,
+        provider, workspace, prompt: "work", model: "terra", reasoningEffort: "high", timeoutMs: 2_000,
       })).rejects.toMatchObject({ code: "controller_isolation_unproven", disposition: "blocked" });
       expect(runTurn).not.toHaveBeenCalled();
     } finally {

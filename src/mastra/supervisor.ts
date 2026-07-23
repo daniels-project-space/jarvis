@@ -10,6 +10,8 @@ const workstreamSchema = z.object({
   agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]),
   repo: z.string().nullable(),
   model: z.enum(["luna", "terra", "sol"]),
+  reasoningEffort: z.enum(["low", "medium", "high", "max"]),
+  modelReason: z.string().min(5).max(300),
   readonly: z.boolean(),
   approvalRequired: z.boolean(),
   risk: z.enum(["low", "medium", "high", "consequential"]),
@@ -31,6 +33,7 @@ const candidateSchema = z.object({
   label: z.string().optional(),
   repo: z.string().optional(),
   model: z.string().optional(),
+  reasoningEffort: z.string().optional(),
   agentId: z.string().optional(),
   readonly: z.boolean().optional(),
   approvalRequired: z.boolean().optional(),
@@ -65,6 +68,8 @@ function deterministicPlan(goal: string, repo?: string, context?: string): Manag
         agentId: route.agentId === "jarvis" ? "atlas" : route.agentId,
         repo: repo ?? null,
         model: route.model,
+        reasoningEffort: route.reasoningEffort,
+        modelReason: route.modelReason,
         readonly: route.readonly,
         approvalRequired: route.approvalRequired,
         risk: route.risk,
@@ -80,19 +85,25 @@ export function normalizeWorkstream(input: {
   label?: string;
   repo?: string;
   model?: string;
+  reasoningEffort?: string;
   agentId?: string;
   readonly?: boolean;
   approvalRequired?: boolean;
   risk?: string;
   acceptanceCriteria?: string[];
 }): ManagedWorkstream {
+  const requestedAgent = input.agentId as AgentSlug | undefined;
+  const routedAgent = requestedAgent && requestedAgent !== "jarvis" && TEAM_BY_SLUG[requestedAgent]
+    ? requestedAgent
+    : undefined;
   const route = routeWork(input.task, {
     repo: input.repo,
     requestedModel: input.model,
+    requestedReasoningEffort: input.reasoningEffort,
     readonly: input.readonly,
+    role: routedAgent,
   });
-  const requestedAgent = input.agentId as AgentSlug | undefined;
-  const agentId = requestedAgent && requestedAgent !== "jarvis" && TEAM_BY_SLUG[requestedAgent] ? requestedAgent : route.agentId === "jarvis" ? "atlas" : route.agentId;
+  const agentId = routedAgent ?? (route.agentId === "jarvis" ? "atlas" : route.agentId);
   const approvalRequired = input.approvalRequired === true || route.approvalRequired || input.risk === "consequential";
   const risk = (approvalRequired
     ? "consequential"
@@ -105,6 +116,8 @@ export function normalizeWorkstream(input: {
     agentId,
     repo: input.repo ?? null,
     model: route.model as ModelTier,
+    reasoningEffort: route.reasoningEffort,
+    modelReason: route.modelReason,
     readonly: input.readonly ?? route.readonly,
     approvalRequired,
     risk,
@@ -166,12 +179,15 @@ const enforceMissionPolicyStep = createStep({
       const route = routeWork(stream.task, {
         repo: stream.repo ?? undefined,
         requestedModel: stream.model,
+        requestedReasoningEffort: stream.reasoningEffort,
         readonly: stream.readonly,
       });
       const approvalRequired = stream.approvalRequired || route.approvalRequired || stream.risk === "consequential";
       return {
         ...stream,
         model: route.model,
+        reasoningEffort: route.reasoningEffort,
+        modelReason: route.modelReason,
         readonly: approvalRequired ? true : stream.readonly,
         approvalRequired,
         risk: approvalRequired ? ("consequential" as const) : stream.risk,

@@ -224,6 +224,7 @@ export function buildFleetSnapshot(input: {
       progress: String(row.progress ?? "").slice(0, 180),
       progressAt: typeof row.progressAt === "number" ? row.progressAt : null,
       model: row.model ?? null, reasoningEffort: row.reasoningEffort ?? null,
+      modelReason: String(row.modelReason ?? "").slice(0, 300) || null,
       workerRuntime: row.workerRuntime ?? null, workerRunId: row.workerRunId ?? null,
       generation: Number(row.deliveryGeneration ?? row.goalWave ?? 0),
       attempt: Math.max(1, Number(row.attempt ?? 1)), maxAttempts: Math.max(1, Number(row.maxAttempts ?? 1)),
@@ -256,6 +257,8 @@ export function buildFleetSnapshot(input: {
     active: primaryNode ? {
       id: primaryNode.jobId, missionId, label: primaryNode.label, status: primaryNode.state,
       stage: primaryNode.stage, percent: primaryNode.percent,
+      model: primaryNode.model, reasoningEffort: primaryNode.reasoningEffort,
+      modelReason: primaryNode.modelReason,
       extraCount: Math.max(0, liveNodes.length - 1), needsDaniel: attentionCount > 0,
     } : null,
     fleet,

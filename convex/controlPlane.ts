@@ -1,6 +1,10 @@
 // Atomic compact projections for the live agent control plane. The helpers in
 // this file are intentionally database-only so every durable writer can use
 // them in the same Convex transaction without calling another function.
+import {
+  selectCodexWorkPolicy,
+  type CodexWorkPolicyInput,
+} from "../src/lib/codex-work-router";
 
 function defined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
@@ -25,6 +29,8 @@ export function projectJobRuntime(job: any) {
     model: typeof job.model === "string" ? job.model.slice(0, 24) : undefined,
     reasoningEffort: typeof job.reasoningEffort === "string" ? job.reasoningEffort.slice(0, 24) : undefined,
     modelReason: typeof job.modelReason === "string" ? job.modelReason.slice(0, 300) : undefined,
+    modelQualityFailures: Math.max(0, Number(job.modelQualityFailures ?? 0)),
+    modelEscalations: Math.max(0, Number(job.modelEscalations ?? 0)),
     risk: typeof job.risk === "string" ? job.risk.slice(0, 24) : undefined,
     priority: Math.max(0, Math.min(100, Number(job.priority ?? 50))),
     approvalRequired: typeof job.approvalRequired === "boolean" ? job.approvalRequired : undefined,
@@ -192,9 +198,36 @@ export async function upsertMissionRuntime(ctx: any, mission: any) {
   else await ctx.db.insert("missionRuntime", projected);
 }
 
-export async function insertJobWithRuntime(ctx: any, value: any) {
-  const jobId = await ctx.db.insert("jobs", value);
-  await upsertJobRuntime(ctx, { ...value, _id: jobId });
+export type CodexJobPolicyContext = Omit<Partial<CodexWorkPolicyInput>, "task"> & { task?: string };
+
+export async function insertJobWithRuntime(ctx: any, value: any, policyContext: CodexJobPolicyContext = {}) {
+  const policy = selectCodexWorkPolicy({
+    task: policyContext.task ?? String(value.task ?? "Agent work"),
+    role: policyContext.role ?? value.agentId,
+    repo: policyContext.repo ?? value.repo,
+    readonly: policyContext.readonly ?? value.readonly,
+    risk: policyContext.risk ?? value.risk,
+    tools: policyContext.tools ?? value.mcp,
+    workType: policyContext.workType,
+    complexity: policyContext.complexity,
+    uncertainty: policyContext.uncertainty,
+    productionRisk: policyContext.productionRisk,
+    expectedDuration: policyContext.expectedDuration,
+    toolBreadth: policyContext.toolBreadth,
+    crossProject: policyContext.crossProject,
+    requestedModel: policyContext.requestedModel ?? value.model,
+    requestedReasoningEffort: policyContext.requestedReasoningEffort ?? value.reasoningEffort,
+  });
+  const routedValue = {
+    ...value,
+    model: policy.model,
+    reasoningEffort: policy.reasoningEffort,
+    modelReason: policy.modelReason,
+    modelQualityFailures: Math.max(0, Number(value.modelQualityFailures ?? 0)),
+    modelEscalations: Math.max(0, Number(value.modelEscalations ?? 0)),
+  };
+  const jobId = await ctx.db.insert("jobs", routedValue);
+  await upsertJobRuntime(ctx, { ...routedValue, _id: jobId });
   return jobId;
 }
 

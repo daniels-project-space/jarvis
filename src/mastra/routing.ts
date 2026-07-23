@@ -1,10 +1,15 @@
 import type { AgentSlug, ModelTier, WorkRisk } from "./team";
 import { isOwnedRepository, requestsConsequentialAction } from "../lib/work-safety";
-import { parseWorkModelTier } from "../lib/work-models";
+import {
+  selectCodexWorkPolicy,
+  type CodexReasoningEffort,
+} from "../lib/codex-work-router";
 
 export type WorkRoute = {
   agentId: AgentSlug;
   model: ModelTier;
+  reasoningEffort: CodexReasoningEffort;
+  modelReason: string;
   risk: WorkRisk;
   readonly: boolean;
   approvalRequired: boolean;
@@ -19,9 +24,15 @@ const creative = /\b(draw|illustrat|image|visual|diagram|mind ?map|storyboard|br
 const travel = /\b(travel|trip|flight|hotel|stay|itinerary|airport|destination|holiday|booking\.com)\b/i;
 const research = /\b(research|compare|analyse|analyze|strategy|brainstorm|investigate|audit|learn|find out|market|competitor)\b/i;
 const complex = /\b(architecture|root cause|multi[- ]?(repo|project|file)|migration|redesign|overhaul|security|performance|production|end[- ]to[- ]end)\b/i;
-const trivial = /\b(status|list|locate|read|summari[sz]e|quick check|one[- ]line|rename|copy)\b/i;
 
-export function routeWork(task: string, options?: { repo?: string; requestedModel?: string; readonly?: boolean }): WorkRoute {
+export function routeWork(task: string, options?: {
+  repo?: string;
+  requestedModel?: string;
+  requestedReasoningEffort?: string;
+  readonly?: boolean;
+  tools?: readonly unknown[];
+  role?: AgentSlug;
+}): WorkRoute {
   const text = `${task} ${options?.repo ?? ""}`.trim();
   const repoOutsidePortfolio = Boolean(options?.repo && options.readonly !== true && !isOwnedRepository(options.repo));
   const isConsequential = repoOutsidePortfolio || requestsConsequentialAction(task, { repo: options?.repo });
@@ -33,20 +44,32 @@ export function routeWork(task: string, options?: { repo?: string; requestedMode
   else if (research.test(text)) agentId = "atlas";
 
   const hard = complex.test(text) || (engineering.test(text) && text.length > 500);
-  const easy = text.length < 140 && trivial.test(text) && !isConsequential;
-  let model: ModelTier = hard ? "sol" : easy ? "luna" : "terra";
-  const requestedModel = parseWorkModelTier(options?.requestedModel);
-  if (requestedModel) model = requestedModel;
-  // Never allow an explicit cheap tier to silently reduce high-risk or hard
-  // engineering quality; Daniel's workspace standard prioritizes correctness.
-  if ((hard || isConsequential) && model !== "sol") model = "sol";
-
   const readonly = options?.readonly ?? (agentId === "atlas" || isConsequential);
   const risk: WorkRisk = isConsequential ? "consequential" : hard ? "high" : agentId === "paul" ? "medium" : "low";
   const approvalRequired = isConsequential;
+  const policy = selectCodexWorkPolicy({
+    task,
+    role: options?.role ?? agentId,
+    repo: options?.repo,
+    readonly,
+    risk,
+    tools: options?.tools,
+    requestedModel: options?.requestedModel,
+    requestedReasoningEffort: options?.requestedReasoningEffort,
+  });
   const priority = Math.min(100, 45 + (hard ? 25 : 0) + (isConsequential ? 20 : 0) + (operations.test(text) ? 10 : 0));
-  const reason = `${agentId} matches ${agentId === "paul" ? "engineering" : agentId === "maya" ? "travel" : agentId === "iris" ? "creative" : agentId === "sentry" ? "operations/review" : "research/strategy"}; ${model} selected for ${hard ? "complex" : easy ? "bounded" : "normal"} work${approvalRequired ? "; execution waits for explicit approval" : ""}`;
-  return { agentId, model, risk, readonly, approvalRequired, priority, reason };
+  const reason = `${agentId} matches ${agentId === "paul" ? "engineering" : agentId === "maya" ? "travel" : agentId === "iris" ? "creative" : agentId === "sentry" ? "operations/review" : "research/strategy"}; ${policy.modelReason}${approvalRequired ? "; execution waits for explicit approval" : ""}`;
+  return {
+    agentId,
+    model: policy.model,
+    reasoningEffort: policy.reasoningEffort,
+    modelReason: policy.modelReason,
+    risk,
+    readonly,
+    approvalRequired,
+    priority,
+    reason,
+  };
 }
 
 export function suggestedAcceptanceCriteria(task: string, route: WorkRoute): string[] {

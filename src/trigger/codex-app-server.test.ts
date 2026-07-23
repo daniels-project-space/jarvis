@@ -149,7 +149,7 @@ describe("Codex app-server dynamic tools", () => {
     internals.ready = Promise.resolve();
     const turn = server.runTurn({
       conversationId: "cloud", userText: "work", history: [], contextBlock: "",
-      preamble: "test", modelTier: "terra", onDelta: () => {},
+      preamble: "test", modelTier: "terra", reasoningEffort: "high", onDelta: () => {},
     });
 
     await vi.waitFor(() => expect(writes).toHaveLength(1));
@@ -164,6 +164,7 @@ describe("Codex app-server dynamic tools", () => {
     } }));
     await vi.waitFor(() => expect(writes).toHaveLength(2));
     expect(writes[1].method).toBe("turn/start");
+    expect(writes[1].params).toMatchObject({ model: "gpt-5.6-terra", effort: "high" });
     internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "cloud-turn" } } }));
     await Promise.resolve();
     internals.receive(JSON.stringify({ method: "turn/completed", params: { turnId: "cloud-turn", turn: { id: "cloud-turn", status: "completed" } } }));

@@ -18,7 +18,8 @@ function runtime(overrides: Record<string, unknown> = {}) {
     status: "running", visibility: "conversation", originThreadId: threadId,
     stage: "testing", percent: 64, progress: "Running focused tests", progressAt: 120,
     priority: 80, createdAt: 100, active: true, agentId: "paul", model: "terra",
-    reasoningEffort: "high", attempt: 1, maxAttempts: 12, steerRevision: 0,
+    reasoningEffort: "high", modelReason: "Complex implementation with medium production risk",
+    attempt: 1, maxAttempts: 12, steerRevision: 0,
     ...overrides,
   };
 }

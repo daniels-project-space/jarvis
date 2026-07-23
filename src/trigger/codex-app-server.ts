@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
-import { codexModelFor } from "./model-policy";
+import { codexModelFor, normalizeReasoningEffort } from "./model-policy";
 import { appendAgentMessageDelta } from "./codex-stream";
 
 type JsonObject = Record<string, unknown>;
@@ -85,6 +85,7 @@ export type CodexTurnInput = {
   contextBlock: string;
   preamble: string;
   modelTier: string;
+  reasoningEffort?: unknown;
   allowTools?: boolean;
   onDelta: (delta: string) => void;
   onTurnStarted?: () => void;
@@ -188,7 +189,7 @@ export class CodexAppServer {
       threadId,
       input: userInput,
       model: selection.model,
-      effort: selection.effort,
+      effort: normalizeReasoningEffort(input.reasoningEffort, selection.effort),
       approvalPolicy: "never",
     }, 30_000);
     const turn = started.turn as JsonObject | undefined;

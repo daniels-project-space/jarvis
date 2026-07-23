@@ -15,6 +15,7 @@ function synthesisPayload(mission: any, jobs: any[], attempt: number) {
     synthesisAttempt: attempt,
     results: jobs.map((job: any) => ({
       label: job.label ?? job.task.slice(0, 60),
+      repo: job.repo ?? null,
       status: job.status,
       result: (job.result ?? "").slice(0, 6000),
     })),
@@ -34,6 +35,7 @@ function missionJobActivity(job: any) {
     attempt: job.attempt ?? 1,
     model: job.model ? normalizeWorkModelTier(job.model) : null,
     reasoningEffort: job.reasoningEffort ?? null,
+    modelReason: job.modelReason ?? null,
     goalStage: job.goalStage ?? null,
     goalWorkstreamId: job.goalWorkstreamId ?? null,
     goalWave: job.goalWave ?? 0,

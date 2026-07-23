@@ -6,6 +6,8 @@ describe("routeWork", () => {
     const route = routeWork("Trace the root cause and redesign this multi-repo Convex architecture", { repo: "jarvis" });
     expect(route.agentId).toBe("paul");
     expect(route.model).toBe("sol");
+    expect(route.reasoningEffort).toBe("max");
+    expect(route.modelReason).toMatch(/root-cause|architecture/i);
     expect(route.approvalRequired).toBe(false);
     expect(suggestedAcceptanceCriteria("deploy it", route)).toContain(
       "Do not call it live until the production alias is verified",
@@ -61,6 +63,19 @@ describe("routeWork", () => {
   });
 
   it("does not honour a cheap override for hard work", () => {
-    expect(routeWork("Production security architecture migration", { requestedModel: "luna" }).model).toBe("sol");
+    expect(routeWork("Production security architecture migration", {
+      requestedModel: "luna",
+      requestedReasoningEffort: "low",
+    })).toMatchObject({ model: "sol", reasoningEffort: "max" });
+  });
+
+  it("uses Luna for a bounded research specialist while persisting a rationale", () => {
+    const route = routeWork("Research current primary sources for the bounded comparison", {
+      role: "atlas",
+      readonly: true,
+    });
+    expect(route).toMatchObject({ agentId: "atlas", model: "luna" });
+    expect(["medium", "high"]).toContain(route.reasoningEffort);
+    expect(route.modelReason).toMatch(/research/i);
   });
 });

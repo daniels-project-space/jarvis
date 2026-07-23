@@ -7,6 +7,7 @@ import { classifyWorkSafety, isOwnedRepository } from "../src/lib/work-safety";
 import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
 import { normalizeWorkModelTier } from "../src/lib/work-models";
+import { selectCodexRetryPolicy, selectCodexWorkPolicy } from "../src/lib/codex-work-router";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
 import { attemptWorkspaceKey, workItemIdentity } from "../src/lib/workspace-protocol";
@@ -666,10 +667,34 @@ async function runnableCandidates(ctx: any, now: number, limit: number): Promise
     if (blocked) continue;
     // The projection selects exact candidates; the one bounded authority read
     // below fences dispatch against any stale rollout row without scanning jobs.
-    const job = await ctx.db.get(candidate.jobId);
+    let job = await ctx.db.get(candidate.jobId);
     if (!job || job.status !== "pending" || (job.attempt ?? 1) !== candidate.attempt || (job.nextRunAt ?? 0) > now) {
       if (job) await upsertJobRuntime(ctx, job);
       continue;
+    }
+    // One bounded authority read also upgrades pre-policy pending rows. New
+    // writers always persist this triplet at insert time; this keeps a rolling
+    // deployment from launching a legacy job with an implicit runtime default.
+    if (!job.model || !job.reasoningEffort || !job.modelReason) {
+      const policy = selectCodexWorkPolicy({
+        task: String(job.task ?? "Agent work"),
+        role: job.agentId,
+        repo: job.repo,
+        readonly: job.readonly,
+        risk: job.risk,
+        tools: job.mcp,
+        requestedModel: job.model,
+        requestedReasoningEffort: job.reasoningEffort,
+      });
+      const routePatch = {
+        model: policy.model,
+        reasoningEffort: policy.reasoningEffort,
+        modelReason: policy.modelReason,
+        modelQualityFailures: Math.max(0, Number(job.modelQualityFailures ?? 0)),
+        modelEscalations: Math.max(0, Number(job.modelEscalations ?? 0)),
+      };
+      await patchJobWithRuntime(ctx, job, routePatch);
+      job = { ...job, ...routePatch };
     }
     // The projection carries the common bounded dependency prefix. If a
     // legacy/general job has more, the selected authority document must fence
@@ -1306,6 +1331,7 @@ export const detail = query({
       progressAt: row.progressAt ?? null,
       model: row.model ? normalizeWorkModelTier(row.model) : null,
       reasoningEffort: row.reasoningEffort ?? null,
+      modelReason: String(row.modelReason ?? "").slice(0, 300) || null,
       workerRuntime: row.workerRuntime ?? null,
       workerRunId: row.workerRunId ?? null,
       generation: Number(row.deliveryGeneration ?? row.goalWave ?? 0),
@@ -1699,6 +1725,10 @@ export const checkpointAndRequeue = mutation({
     deliveryLeaseOwner: v.optional(v.string()),
     deliveryLeaseToken: v.optional(v.string()),
     deliveryLeaseVersion: v.optional(v.number()),
+    // Present only when a supervisor or machine-contract validator produced a
+    // concrete output-quality concern. Provider/runtime retries omit it and
+    // therefore cannot change the persisted model decision.
+    modelQualityFailure: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
@@ -1784,8 +1814,28 @@ export const checkpointAndRequeue = mutation({
       requestedStatus === "pending" &&
       (attempt > (row.maxAttempts ?? 12) || Date.now() - row.createdAt > 14 * 86_400_000);
     const status = exhausted ? "error" : requestedStatus;
+    const priorModel = normalizeWorkModelTier(row.model);
+    const priorEffort = row.reasoningEffort;
+    const qualityFailureCount = a.modelQualityFailure
+      ? Math.max(0, Number(row.modelQualityFailures ?? 0)) + 1
+      : Math.max(0, Number(row.modelQualityFailures ?? 0));
+    const retryPolicy = selectCodexRetryPolicy({
+      model: priorModel,
+      reasoningEffort: priorEffort,
+      modelReason: row.modelReason,
+      qualityFailureCount,
+      evidence: a.modelQualityFailure,
+    });
+    const modelPatch = a.modelQualityFailure ? {
+      model: retryPolicy.model,
+      reasoningEffort: retryPolicy.reasoningEffort,
+      modelReason: retryPolicy.modelReason,
+      modelQualityFailures: retryPolicy.escalated ? 0 : qualityFailureCount,
+      modelEscalations: Math.max(0, Number(row.modelEscalations ?? 0)) + (retryPolicy.escalated ? 1 : 0),
+    } : {};
     await patchJobWithRuntime(ctx, row, {
       ...invalidateDeliveryLease(row),
+      ...modelPatch,
       status,
       stage: exhausted ? "error" : requestedStatus === "pending" ? "checkpointed" : requestedStatus,
       checkpoint: a.checkpoint.slice(0, 6000),
@@ -1823,6 +1873,14 @@ export const checkpointAndRequeue = mutation({
           : `Checkpoint saved; job ${requestedStatus}`,
       { stage: exhausted ? "error" : requestedStatus === "pending" ? "checkpointed" : requestedStatus,
         percent: row.percent, evidenceKind: "checkpoint", eventKey: `checkpoint:${a.expectedAttempt}:${requestedStatus}`, attempt: a.expectedAttempt });
+    if (retryPolicy.escalated) {
+      await appendAttemptEvidence(ctx, row, "model_escalated",
+        `Adaptive Codex route escalated ${priorModel}/${String(priorEffort ?? "default")} to ${retryPolicy.model}/${retryPolicy.reasoningEffort}`,
+        { stage: "checkpointed", percent: row.percent, evidenceKind: "model_policy",
+          eventKey: `model-escalation:${a.expectedAttempt}:${Number(row.modelEscalations ?? 0) + 1}`, attempt: a.expectedAttempt,
+          data: { fromModel: priorModel, fromEffort: priorEffort, toModel: retryPolicy.model,
+            toEffort: retryPolicy.reasoningEffort, evidence: a.modelQualityFailure?.slice(0, 180) } });
+    }
     if (status === "pending" && !deliveryContinuation) {
       await ensureAttempt(ctx, a.jobId, attempt, "pending", Date.now(), {
         parentAttempt: a.expectedAttempt, sourceHeadSha: row.sourceHeadSha,
@@ -1869,7 +1927,14 @@ export const checkpointAndRequeue = mutation({
         return { requeued: false, exhausted: true, stale: false };
       }
     }
-    return { requeued: status === "pending", exhausted, stale: false };
+    return {
+      requeued: status === "pending",
+      exhausted,
+      stale: false,
+      escalation: retryPolicy.escalated
+        ? { model: retryPolicy.model, reasoningEffort: retryPolicy.reasoningEffort, modelReason: retryPolicy.modelReason }
+        : null,
+    };
   },
 });
 

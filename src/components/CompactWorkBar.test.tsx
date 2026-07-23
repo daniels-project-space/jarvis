@@ -2,12 +2,13 @@ import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { CompactWorkSnapshot, FleetNode } from "../lib/active-work";
-import { FleetCommandCenter, FleetDag, fleetDagLayout, fleetNodeStateLabel } from "./CompactWorkBar";
+import { FleetCommandCenter, FleetDag, WorkerDetail, fleetDagLayout, fleetNodeStateLabel } from "./CompactWorkBar";
 
 const node = (overrides: Partial<FleetNode> = {}): FleetNode => ({
   id: "surface", jobId: "job-1", label: "Unified fleet surface", agent: "paul",
   repository: "daniels-project-space/jarvis", state: "running", status: "running", stage: "testing",
   percent: 64, progress: "Running focused tests", progressAt: 1, model: "terra", reasoningEffort: "high",
+  modelReason: "Complex implementation with medium production risk",
   workerRuntime: "trigger", workerRunId: "run-1", generation: 1, attempt: 1, maxAttempts: 12,
   dependencyCount: 0, dependenciesReady: 0, integrationState: "not_applicable", deliveryStatus: null,
   mergeState: "not started", recoverySummary: null, needsDaniel: false, attentionReason: null,
@@ -15,7 +16,7 @@ const node = (overrides: Partial<FleetNode> = {}): FleetNode => ({
 });
 
 const work: CompactWorkSnapshot = {
-  active: { id: "job-1", missionId: "mission-1", label: "Unified fleet surface", status: "running", stage: "testing", percent: 64, extraCount: 2, needsDaniel: false },
+  active: { id: "job-1", missionId: "mission-1", label: "Unified fleet surface", status: "running", stage: "testing", percent: 64, model: "terra", reasoningEffort: "high", modelReason: "Complex implementation with medium production risk", extraCount: 2, needsDaniel: false },
   fleet: {
     id: "mission-1", goal: "Build one live fleet surface", mode: "goal", status: "running", phase: "building",
     percent: 64, repository: "daniels-project-space/jarvis", planDigest: "abcdef0123456789", planGeneration: 2,
@@ -36,9 +37,17 @@ describe("FleetCommandCenter", () => {
     expect(markup).toContain('data-fleet-surface="collapsed"');
     expect(markup).toContain('data-work-id="job-1"');
     expect(markup).toContain("Unified fleet surface");
+    expect(markup).toContain("terra/high");
+    expect(markup).toContain("Complex implementation with medium production risk");
     expect(markup).toContain("+2");
     expect(markup).not.toContain("data-fleet-worker-detail");
     expect(markup).not.toContain("live work terminal");
+  });
+
+  it("shows the persisted tier, effort and concise rationale in exact worker detail", () => {
+    const markup = renderToStaticMarkup(<WorkerDetail node={node()} onBack={() => {}} />);
+    expect(markup).toContain("terra/high");
+    expect(markup).toContain("Complex implementation with medium production risk");
   });
 
   it("does not auto-open a resolved mission from before this browser session", () => {

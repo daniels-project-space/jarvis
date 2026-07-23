@@ -24,13 +24,13 @@ export const TOOL_DEFS = [
   {
     name: "dispatch_agent",
     description:
-      "Delegate durable work to JARVIS's permanent team. The same specialist can own multiple concurrent jobs, so dispatch a follow-up without pausing earlier work and link it with parent_job_id when known. The manager chooses Paul (development), Atlas (research/strategy), Iris (creative), Maya (travel), or Sentry (reliability), selects Luna/Terra/Sol intelligence, binds it to this conversation, and returns immediately. Work can checkpoint and continue for hours or days. Verified code changes in Daniel's repositories are merged automatically by the delivery controller; only protected external actions wait for Daniel. Do not delegate quick lookups.",
+      "Delegate durable work to JARVIS's permanent team. The same specialist can own multiple concurrent jobs, so dispatch a follow-up without pausing earlier work and link it with parent_job_id when known. The manager chooses Paul (development), Atlas (research/strategy), Iris (creative), Maya (travel), or Sentry (reliability), adaptively selects the Codex tier and reasoning effort, binds it to this conversation, and returns immediately. Work can checkpoint and continue for hours or days. Verified code changes in Daniel's repositories are merged automatically by the delivery controller; only protected external actions wait for Daniel. Do not delegate quick lookups.",
     parameters: {
       type: "object",
       properties: {
         task: { type: "string", description: "Clear, self-contained task including all context the agent needs (URLs, video IDs, what to find out)" },
         repo: { type: "string", description: "owner/repo or short name if the task is about a specific repo, else omit" },
-        model: { type: "string", enum: ["luna", "terra", "sol"], description: "Terra for research/summaries/normal code (default), Sol for hard multi-file engineering or consequential reasoning, Luna for bounded lookups" },
+        model: { type: "string", enum: ["luna", "terra", "sol"], description: "Optional minimum quality tier; the adaptive router may raise it for complexity or safety and never lowers an explicit quality request" },
         agent_id: { type: "string", enum: ["paul", "atlas", "iris", "maya", "sentry"], description: "Optional permanent specialist; omit to let JARVIS route it" },
         parent_job_id: { type: "string", description: "Optional earlier job this follow-up extends. The follow-up starts independently and does not wait for the parent." },
         readonly: { type: "boolean", description: "Force a read-only run" },
@@ -76,7 +76,7 @@ export const TOOL_DEFS = [
   {
     name: "goal_mode",
     description:
-      "Start or control one durable long-running outcome. Goal Mode uses one Sol/max architecture session, 2-8 dependency-aware Terra/high build sessions with persistent checkpoints, then Sol/max deep validation and bounded repair waves. It routes new apps through App Factory, video work through YouTube Studio AI, existing products into their own repo, and genuinely new infrastructure through Daniel's isolated cloud standard. Use for outcomes that may take hours or days; use orchestrate for a short parallel fleet.",
+      "Start or control one durable long-running outcome. Goal Mode adaptively routes architecture, 2-8 dependency-aware workstreams, deep validation, and bounded repair waves by complexity, uncertainty, production risk, duration, and tool breadth. It routes new apps through App Factory, video work through YouTube Studio AI, existing products into their own repo, and genuinely new infrastructure through Daniel's isolated cloud standard. Use for outcomes that may take hours or days; use orchestrate for a short parallel fleet.",
     parameters: {
       type: "object",
       properties: {
@@ -85,9 +85,9 @@ export const TOOL_DEFS = [
         mission_id: { type: "string", description: "Goal Mode mission id; required for pause/resume/cancel and optional for status" },
         input: { type: "string", description: "Steering instruction when action=steer; preserves accepted node scope and creates fresh execution generations" },
         repo: { type: "string", description: "Known owner/repo only when the goal explicitly belongs there" },
-        acceptance_criteria: { type: "array", items: { type: "string" }, description: "Observable goal-level truths the final Sol validator must prove" },
-        build_sessions: { type: "number", description: "Maximum bounded Terra/high implementation sessions, 2-8; default 6" },
-        revision_waves: { type: "number", description: "Maximum automatic Terra repair waves after final validation, 1-4; default 2" },
+        acceptance_criteria: { type: "array", items: { type: "string" }, description: "Observable goal-level truths the final adaptive validator must prove" },
+        build_sessions: { type: "number", description: "Maximum bounded adaptive implementation sessions, 2-8; default 6" },
+        revision_waves: { type: "number", description: "Maximum automatic adaptive repair waves after final validation, 1-4; default 2" },
       },
       required: ["action"],
     },
@@ -3017,15 +3017,19 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         import("../mastra/routing"),
         import("../mastra/team"),
       ]);
+      const requested = String(args.agent_id ?? "");
+      const requestedAgent = ["paul", "atlas", "iris", "maya", "sentry"].includes(requested)
+        ? (requested as keyof typeof TEAM_BY_SLUG)
+        : undefined;
+      const requestedTools = Array.isArray(args.mcp) ? args.mcp.map(String) : undefined;
       const route = routeWork(task, {
         repo,
         requestedModel: args.model ? String(args.model) : undefined,
         readonly: typeof args.readonly === "boolean" ? args.readonly : undefined,
+        tools: requestedTools,
+        role: requestedAgent,
       });
-      const requested = String(args.agent_id ?? "");
-      const agentId = ["paul", "atlas", "iris", "maya", "sentry"].includes(requested)
-        ? (requested as keyof typeof TEAM_BY_SLUG)
-        : route.agentId;
+      const agentId = requestedAgent ?? route.agentId;
       const originThreadId = await activeThread();
       const criteria = Array.isArray(args.acceptance_criteria) && args.acceptance_criteria.length
         ? args.acceptance_criteria.map(String).slice(0, 8)
@@ -3036,7 +3040,8 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         repo,
         readonly: route.readonly,
         model: route.model,
-        mcp: Array.isArray(args.mcp) ? args.mcp.map(String) : undefined,
+        reasoningEffort: route.reasoningEffort,
+        mcp: requestedTools,
         originThreadId,
         visibility: "conversation",
         agentId,
@@ -3044,7 +3049,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         priority: route.priority,
         approvalRequired: route.approvalRequired,
         acceptanceCriteria: criteria,
-        modelReason: route.reason,
+        modelReason: route.modelReason,
         parentJobId: args.parent_job_id ? String(args.parent_job_id) : undefined,
         label: `${TEAM_BY_SLUG[agentId].name} · ${task.slice(0, 58)}`,
       });
@@ -3116,7 +3121,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         value: JSON.stringify({ missionId: id, mode: "goal" }),
         title: `goal · ${goal.slice(0, 44)}`,
       }).catch(() => {});
-      return `Goal Mode ${id} is live. Route: ${route.kind}${route.primaryRepo ? ` in ${route.primaryRepo}` : ""} — ${route.reason} One Sol/max planner is working now; it will hand bounded work to Terra/high, preserve checkpoints for days if needed, and only finish after a Sol/max deep validation passes.`;
+      return `Goal Mode ${id} is live. Route: ${route.kind}${route.primaryRepo ? ` in ${route.primaryRepo}` : ""} — ${route.reason} Its planner, bounded workstreams, repair waves, and deep validator now carry one persisted adaptive Codex tier/effort decision each, with evidence-only escalation across retries.`;
     }
     case "orchestrate": {
       const mission = String(args.mission ?? "").trim();
@@ -3162,6 +3167,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           repo: a.repo ?? undefined,
           readonly: a.readonly,
           model: a.model,
+          reasoningEffort: a.reasoningEffort,
           missionId: String(missionId),
           label: a.label,
           originThreadId,
@@ -3171,7 +3177,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           priority: workModelPriority(a.model),
           approvalRequired: a.approvalRequired,
           acceptanceCriteria: a.acceptanceCriteria,
-          modelReason: `${a.agentId} owns this Mastra-managed workstream; ${workModelLabel(a.model)} is the planned Codex execution tier`,
+          modelReason: a.modelReason,
         });
       }
       if (plan.workstreams.some((stream) => !stream.approvalRequired)) {
@@ -3224,7 +3230,6 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           {
             label: "Atlas · directions",
             agent_id: "atlas",
-            model: "terra",
             readonly: true,
             template: "research_report",
             task: `Develop 3 genuinely distinct creative directions for this brief: ${brief}. For each, give the core idea, audience logic, reference territory, risks, and what would make it visually unmistakable. Recommend one without flattening the alternatives.`,
@@ -3233,7 +3238,6 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           {
             label: "Iris · visual system",
             agent_id: "iris",
-            model: "terra",
             readonly: true,
             task: `Turn this brief into a production-ready ${output} system: ${brief}. Specify composition, visual hierarchy, palette, typography or mark-making, scene/shot structure where relevant, and final image-generation or drawing prompts. Include an editable construction plan, not only adjectives.`,
             acceptance_criteria: ["Production-ready visual specification", "Editable construction steps and exact generation/drawing prompts"],
@@ -3608,7 +3612,6 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           `5) Commit only working code ("self-repair: ..."). ${SHALLOW_PROVENANCE_RULE} Never replace or reparent a persisted shared branch based on a truncated revision walk. ` +
           `If it needs convex/ or src/trigger/ redeploy, commit and say so plainly.`,
         repo: app ?? "jarvis",
-        model: "sol",
         incidentId: String(incidentId),
         originThreadId: await activeThread(),
         visibility: "conversation",
@@ -3621,7 +3624,6 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           "Run relevant typecheck/tests/build",
           "Verify the actual user-visible or provider surface",
         ],
-        modelReason: "Paul + Sol: production repair requires deep Codex engineering and verification",
         label: `Paul · repair ${problem.slice(0, 48)}`,
       });
       await wakeAgentFleet(`repair:${String(incidentId)}`).catch(() => false);
@@ -3634,14 +3636,12 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         authTokenHash,
         task: `${SELF_IMPROVE_RULES}\n\nThe upgrade Daniel wants: ${request}`,
         repo: "jarvis",
-        model: "sol",
         originThreadId: await activeThread(),
         visibility: "conversation",
         agentId: "paul",
         risk: "high",
         priority: 80,
         acceptanceCriteria: ["Connected implementation, not placeholder UI", "Typecheck/tests/build pass", "Verified repository delivery completes without a manual approval"],
-        modelReason: "Paul + Sol: JARVIS self-modification is complex Codex engineering",
         label: `Paul · upgrade ${request.slice(0, 46)}`,
       });
       await wakeAgentFleet("self-improve").catch(() => false);

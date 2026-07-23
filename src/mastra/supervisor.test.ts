@@ -20,6 +20,7 @@ describe("managed mission workflow", () => {
     expect(plan.workstreams).toHaveLength(2);
     expect(plan.workstreams.map((stream) => stream.agentId)).toEqual(["paul", "iris"]);
     expect(plan.workstreams.every((stream) => stream.acceptanceCriteria.length > 0)).toBe(true);
+    expect(plan.workstreams.every((stream) => Boolean(stream.reasoningEffort && stream.modelReason))).toBe(true);
   });
 
   it("deduplicates identical leases before enqueue", async () => {
@@ -30,6 +31,9 @@ describe("managed mission workflow", () => {
 
     expect(plan.plannedBy).toBe("mastra");
     expect(plan.workstreams).toHaveLength(1);
+    expect(plan.workstreams[0]).toMatchObject({ agentId: "atlas", model: "luna" });
+    expect(["medium", "high"]).toContain(plan.workstreams[0].reasoningEffort);
+    expect(plan.workstreams[0].modelReason).toMatch(/research/i);
   });
 
   it("cannot weaken the approval gate for consequential work", async () => {
@@ -52,6 +56,7 @@ describe("managed mission workflow", () => {
       readonly: true,
       risk: "consequential",
       model: "sol",
+      reasoningEffort: "max",
     });
   });
 });

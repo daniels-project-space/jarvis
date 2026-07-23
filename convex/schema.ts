@@ -258,6 +258,11 @@ export default defineSchema({
     goalWave: v.optional(v.number()),
     acceptanceCriteria: v.optional(v.array(v.string())),
     modelReason: v.optional(v.string()),
+    // Only supervisor-evidenced output-quality failures increment this
+    // counter. Runtime/provider retries leave the route untouched; two quality
+    // failures permit one recorded tier/effort escalation.
+    modelQualityFailures: v.optional(v.number()),
+    modelEscalations: v.optional(v.number()),
     // Immutable work-item isolation identities. `branch` remains the legacy
     // display/transport alias for workerBranch during the rollout.
     sourceBranch: v.optional(v.string()),
@@ -334,6 +339,8 @@ export default defineSchema({
     model: v.optional(v.string()),
     reasoningEffort: v.optional(v.string()),
     modelReason: v.optional(v.string()),
+    modelQualityFailures: v.optional(v.number()),
+    modelEscalations: v.optional(v.number()),
     risk: v.optional(v.string()),
     priority: v.number(),
     approvalRequired: v.optional(v.boolean()),

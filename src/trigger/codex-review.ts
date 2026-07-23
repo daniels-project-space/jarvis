@@ -16,6 +16,11 @@ export type CodexReviewSpawn = (
   options: ReviewSpawnOptions,
 ) => ChildProcessWithoutNullStreams;
 
+export type CodexReviewRoute = {
+  model: string;
+  reasoningEffort?: unknown;
+};
+
 const spawnCodexReview: CodexReviewSpawn = (command, args, options) =>
   spawn(command, args, options);
 
@@ -27,10 +32,12 @@ export function reviewPrompt(
   env: NodeJS.ProcessEnv,
   prompt: string,
   timeoutMs: number,
-  spawnReview: CodexReviewSpawn = spawnCodexReview,
+  routeOrSpawn: CodexReviewRoute | CodexReviewSpawn = { model: "terra" },
 ): Promise<string> {
   return new Promise((resolve) => {
-    const args = [...codexReviewExecPrefix("terra"), "-"];
+    const spawnReview = typeof routeOrSpawn === "function" ? routeOrSpawn : spawnCodexReview;
+    const route = typeof routeOrSpawn === "function" ? { model: "terra" } : routeOrSpawn;
+    const args = [...codexReviewExecPrefix(route.model, route.reasoningEffort), "-"];
     let child: ChildProcessWithoutNullStreams | undefined;
     let output = "";
     let settled = false;

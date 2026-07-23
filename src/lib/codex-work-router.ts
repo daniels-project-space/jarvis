@@ -1,0 +1,303 @@
+import {
+  normalizeWorkModelTier,
+  parseWorkModelTier,
+  workModelLabel,
+  type WorkModelTier,
+} from "./work-models";
+
+export const CODEX_REASONING_EFFORTS = ["low", "medium", "high", "max"] as const;
+
+export type CodexReasoningEffort = (typeof CODEX_REASONING_EFFORTS)[number];
+export type CodexWorkType = "research" | "architecture" | "implementation" | "verification" | "synthesis";
+export type CodexWorkComplexity = "bounded" | "standard" | "complex" | "intense";
+export type CodexWorkUncertainty = "low" | "medium" | "high";
+export type CodexProductionRisk = "low" | "medium" | "high" | "critical";
+export type CodexExpectedDuration = "short" | "medium" | "long";
+export type CodexToolBreadth = "narrow" | "moderate" | "broad";
+
+export type CodexWorkPolicyInput = {
+  task: string;
+  role?: string;
+  repo?: string | null;
+  readonly?: boolean;
+  risk?: string;
+  tools?: readonly unknown[];
+  workType?: CodexWorkType;
+  complexity?: CodexWorkComplexity;
+  uncertainty?: CodexWorkUncertainty;
+  productionRisk?: CodexProductionRisk;
+  expectedDuration?: CodexExpectedDuration;
+  toolBreadth?: CodexToolBreadth;
+  crossProject?: boolean;
+  requestedModel?: unknown;
+  requestedReasoningEffort?: unknown;
+};
+
+export type CodexWorkSelection = {
+  model: WorkModelTier;
+  reasoningEffort: CodexReasoningEffort;
+  modelReason: string;
+  workType: CodexWorkType;
+  complexity: CodexWorkComplexity;
+  uncertainty: CodexWorkUncertainty;
+  productionRisk: CodexProductionRisk;
+  expectedDuration: CodexExpectedDuration;
+  toolBreadth: CodexToolBreadth;
+  crossProject: boolean;
+};
+
+export type CodexRetrySelection = Pick<CodexWorkSelection, "model" | "reasoningEffort" | "modelReason"> & {
+  escalated: boolean;
+};
+
+const TIER_RANK: Record<WorkModelTier, number> = { luna: 0, terra: 1, sol: 2 };
+const EFFORT_RANK: Record<CodexReasoningEffort, number> = { low: 0, medium: 1, high: 2, max: 3 };
+
+const RESEARCH = /\b(research|compare|survey|primary sources?|literature|market|competitor|find out|summari[sz]e|analyse|analyze)\b/i;
+const ARCHITECTURE = /\b(architecture|architectural|system design|redesign|platform design|migration plan|technical strategy)\b/i;
+const IMPLEMENTATION = /\b(implement|build|code|fix|repair|refactor|migrat|edit|change|feature|bug|schema|api|database|typescript|react|next\.?js|convex|trigger)\b/i;
+const VERIFICATION = /\b(verify|validate|verification|test|review|audit|check|prove|quality assurance|qa)\b/i;
+const SYNTHESIS = /\b(synthesi[sz]e|synthesis|weave|merge findings|consolidate|roll up|cross-project brief)\b/i;
+const BOUNDED = /\b(bounded|deterministic|one[- ]file|single[- ]file|small|routine|straightforward|exact|known fix|typo|rename|mechanical)\b/i;
+const COMPLEX = /\b(multi[- ]file|end[- ]to[- ]end|distributed|concurrent|race condition|state machine|integration|large refactor|redesign|migration)\b/i;
+const INTENSE = /\b(core architecture|system[- ]wide|cross[- ]project|multi[- ]repo|cross[- ]repo|deep root cause|difficult root cause|recurring root cause|production outage|security incident|privacy incident|overhaul|from first principles)\b/i;
+const UNCERTAIN = /\b(unknown|unclear|ambiguous|intermittent|novel|exploratory|investigate|root cause|trade[- ]offs?|compare|current landscape)\b/i;
+const CERTAIN = /\b(deterministic|exact|known|mechanical|typo|rename|contract[- ]defined|reproduce the supplied|fixed fixture)\b/i;
+const LONG = /\b(long[- ]running|multi[- ]hour|hours|days|multi[- ]day|end[- ]to[- ]end|cross[- ]project|multi[- ]repo|overhaul)\b/i;
+const SHORT = /\b(quick|brief|bounded|one[- ]file|single[- ]file|small|routine|deterministic|mechanical)\b/i;
+const SECURITY = /\b(security|privacy|authentication|authorization|permissions?|credentials?|secrets?|tenant isolation|customer data|personal data|pii|payment)\b/i;
+const PRODUCTION = /\b(production|live|deploy|release|customer-facing|user data|data loss|outage|incident)\b/i;
+const BROAD_TOOLS = /\b(browser|playwright|provider|production logs?|web search|multiple repositories|cross[- ]project|multi[- ]repo)\b/i;
+const EXPLICIT_MAX_QUALITY = /\b(max(?:imum)? quality|highest quality|best available (?:model|reasoning)|use sol(?:\/max)?|sol\/max|deepest reasoning|think (?:very |really )?hard|do not economi[sz]e)\b/i;
+const DIFFICULT_ROOT_CAUSE = /\b(?:deep|difficult|recurring|intermittent|unknown|production) root cause\b|\broot cause\b.*\b(?:production|security|privacy|cross[- ]project|multi[- ]repo)\b/i;
+
+function boundedText(value: unknown, max = 120): string {
+  return String(value ?? "").trim().replace(/\s+/g, " ").slice(0, max);
+}
+
+export function parseCodexReasoningEffort(value: unknown): CodexReasoningEffort | null {
+  const effort = String(value ?? "").trim().toLowerCase();
+  return (CODEX_REASONING_EFFORTS as readonly string[]).includes(effort)
+    ? effort as CodexReasoningEffort
+    : null;
+}
+
+export function normalizeCodexReasoningEffort(
+  value: unknown,
+  fallback: CodexReasoningEffort,
+): CodexReasoningEffort {
+  return parseCodexReasoningEffort(value) ?? fallback;
+}
+
+function maxTier(left: WorkModelTier, right: WorkModelTier): WorkModelTier {
+  return TIER_RANK[left] >= TIER_RANK[right] ? left : right;
+}
+
+function maxEffort(left: CodexReasoningEffort, right: CodexReasoningEffort): CodexReasoningEffort {
+  return EFFORT_RANK[left] >= EFFORT_RANK[right] ? left : right;
+}
+
+function inferWorkType(task: string, role: string): CodexWorkType {
+  if (/planner|architect/.test(role)) return "architecture";
+  if (/validator|verifier|reviewer/.test(role)) return "verification";
+  if (/synthesi[sz]er/.test(role)) return "synthesis";
+  if (/^(?:research|compare|survey|find|summari[sz]e|analyse|analyze)\b/i.test(task.trim())) return "research";
+  if (SYNTHESIS.test(task)) return "synthesis";
+  if (ARCHITECTURE.test(task)) return "architecture";
+  if (IMPLEMENTATION.test(task)) return "implementation";
+  if (RESEARCH.test(task) || role === "atlas") return "research";
+  if (VERIFICATION.test(task) || role === "sentry") return "verification";
+  if (role === "iris") return "implementation";
+  return "research";
+}
+
+function inferComplexity(task: string, workType: CodexWorkType, crossProject: boolean): CodexWorkComplexity {
+  if (crossProject || INTENSE.test(task) || task.length > 2_000) return "intense";
+  if (BOUNDED.test(task) && task.length < 900) return "bounded";
+  if (COMPLEX.test(task) || workType === "architecture" || task.length > 700) return "complex";
+  return "standard";
+}
+
+function inferUncertainty(task: string, workType: CodexWorkType, complexity: CodexWorkComplexity): CodexWorkUncertainty {
+  if (CERTAIN.test(task) && complexity === "bounded") return "low";
+  if (UNCERTAIN.test(task) || complexity === "intense") return "high";
+  if (workType === "research" || workType === "architecture") return "medium";
+  return complexity === "bounded" ? "low" : "medium";
+}
+
+function inferProductionRisk(task: string, repo: string, readonly: boolean, risk: string): CodexProductionRisk {
+  if (risk === "consequential") return "critical";
+  const security = SECURITY.test(task);
+  const production = PRODUCTION.test(task);
+  if (security && production) return "critical";
+  if (security || production || risk === "high") return "high";
+  if (risk === "medium" || (repo && !readonly) || /\b(database|schema|migration|api)\b/i.test(task)) return "medium";
+  return "low";
+}
+
+function inferDuration(task: string, workType: CodexWorkType, complexity: CodexWorkComplexity): CodexExpectedDuration {
+  if (LONG.test(task) || complexity === "intense") return "long";
+  if (SHORT.test(task) && complexity === "bounded") return "short";
+  if (complexity === "complex" || workType === "architecture" || task.length > 500) return "medium";
+  return task.length < 220 ? "short" : "medium";
+}
+
+function inferToolBreadth(task: string, tools: readonly unknown[], crossProject: boolean): CodexToolBreadth {
+  if (crossProject || tools.length >= 3 || (tools.length >= 2 && BROAD_TOOLS.test(task))) return "broad";
+  if (tools.length >= 2 || BROAD_TOOLS.test(task)) return "moderate";
+  return "narrow";
+}
+
+function selectionLead(input: {
+  task: string;
+  workType: CodexWorkType;
+  complexity: CodexWorkComplexity;
+  productionRisk: CodexProductionRisk;
+  expectedDuration: CodexExpectedDuration;
+  crossProject: boolean;
+  explicitQuality: boolean;
+  model: WorkModelTier;
+}): string {
+  if (input.explicitQuality) return "Explicit quality floor retained";
+  if (input.productionRisk === "critical") return "Security/privacy safety floor";
+  if (DIFFICULT_ROOT_CAUSE.test(input.task)) return "Difficult root-cause work";
+  if (input.workType === "synthesis" && input.crossProject) return "Cross-project synthesis";
+  if (input.workType === "architecture" && input.model === "sol") return "Long or high-risk architecture";
+  if (input.workType === "research" && input.model === "luna") return "Bounded research specialist";
+  if (input.workType === "implementation" && input.complexity === "bounded") return "Deterministic bounded implementation";
+  if (input.workType === "verification" && input.model === "luna") return "Routine deterministic verification";
+  if (input.expectedDuration === "long") return "Long-running supervised work";
+  return `${input.workType[0].toUpperCase()}${input.workType.slice(1)} workload`;
+}
+
+/**
+ * The one deterministic durable-work router. It treats caller model/effort
+ * values as quality floors, never ceilings, so an explicit high-quality choice
+ * is retained while security and production safety can still raise a cheap
+ * request.
+ */
+export function selectCodexWorkPolicy(input: CodexWorkPolicyInput): CodexWorkSelection {
+  const task = String(input.task ?? "").trim();
+  const role = boundedText(input.role || "jarvis", 40).toLowerCase() || "jarvis";
+  const repo = boundedText(input.repo, 160);
+  const readonly = input.readonly === true;
+  const crossProject = input.crossProject === true
+    || /\b(cross[- ]project|multi[- ]repo|cross[- ]repo|across (?:several|multiple|all) (?:projects|repositories))\b/i.test(task);
+  const workType = input.workType ?? inferWorkType(task, role);
+  const complexity = input.complexity ?? inferComplexity(task, workType, crossProject);
+  const uncertainty = input.uncertainty ?? inferUncertainty(task, workType, complexity);
+  const productionRisk = input.productionRisk
+    ?? inferProductionRisk(task, repo, readonly, boundedText(input.risk, 24).toLowerCase());
+  const expectedDuration = input.expectedDuration ?? inferDuration(task, workType, complexity);
+  const tools = Array.isArray(input.tools) ? input.tools : [];
+  const toolBreadth = input.toolBreadth ?? inferToolBreadth(task, tools, crossProject);
+  const explicitQuality = EXPLICIT_MAX_QUALITY.test(task);
+  const difficultRootCause = DIFFICULT_ROOT_CAUSE.test(task);
+
+  let model: WorkModelTier;
+  if (workType === "research") {
+    model = complexity === "intense" || (crossProject && expectedDuration === "long")
+      ? "sol"
+      : complexity === "complex" || toolBreadth === "broad"
+        ? "terra"
+        : "luna";
+  } else if (workType === "architecture") {
+    model = complexity === "complex" || complexity === "intense" || expectedDuration === "long"
+      || productionRisk === "high" || crossProject ? "sol" : "terra";
+  } else if (workType === "implementation") {
+    model = complexity === "bounded" && productionRisk !== "high" && productionRisk !== "critical" && toolBreadth !== "broad"
+      ? "luna"
+      : complexity === "intense" || (complexity === "complex" && expectedDuration === "long")
+        || (difficultRootCause && productionRisk === "high")
+        ? "sol"
+        : "terra";
+  } else if (workType === "verification") {
+    model = complexity === "intense" || productionRisk === "critical" || (crossProject && expectedDuration === "long")
+      ? "sol"
+      : complexity === "complex" || productionRisk === "high" || toolBreadth === "broad"
+        ? "terra"
+        : "luna";
+  } else {
+    model = crossProject || complexity === "intense" || expectedDuration === "long" ? "sol" : "terra";
+  }
+
+  if (productionRisk === "critical" || (SECURITY.test(task) && productionRisk === "high") || difficultRootCause) {
+    model = "sol";
+  }
+  if (explicitQuality) model = "sol";
+
+  const requestedModel = parseWorkModelTier(input.requestedModel);
+  if (requestedModel) model = maxTier(model, requestedModel);
+
+  let reasoningEffort: CodexReasoningEffort;
+  if (model === "luna") {
+    reasoningEffort = workType === "research"
+      ? uncertainty === "high" ? "high" : "medium"
+      : workType === "verification" && complexity === "bounded" && uncertainty === "low"
+        ? "low"
+        : "medium";
+  } else if (model === "terra") {
+    reasoningEffort = complexity === "complex" || uncertainty === "high" || productionRisk === "high"
+      || workType === "architecture" || toolBreadth === "broad" ? "high" : "medium";
+  } else {
+    reasoningEffort = explicitQuality || productionRisk === "critical" || complexity === "intense"
+      || (workType === "architecture" && expectedDuration === "long") || difficultRootCause
+      || (workType === "synthesis" && crossProject) ? "max" : "high";
+  }
+  if (requestedModel === "sol") reasoningEffort = "max";
+  const requestedEffort = parseCodexReasoningEffort(input.requestedReasoningEffort);
+  if (requestedEffort) reasoningEffort = maxEffort(reasoningEffort, requestedEffort);
+
+  const lead = selectionLead({
+    task, workType, complexity, productionRisk, expectedDuration, crossProject, explicitQuality, model,
+  });
+  const requestedFloor = requestedModel || requestedEffort
+    ? `; requested ${requestedModel ? workModelLabel(requestedModel) : "tier"}/${requestedEffort ?? "default"} floor`
+    : "";
+  const modelReason = (
+    `${lead}; ${complexity} complexity, ${uncertainty} uncertainty, ${productionRisk} production risk, `
+    + `${expectedDuration} duration, ${toolBreadth} tools${crossProject ? ", cross-project" : ""}; ${role}${requestedFloor}`
+  ).slice(0, 300);
+
+  return {
+    model,
+    reasoningEffort,
+    modelReason,
+    workType,
+    complexity,
+    uncertainty,
+    productionRisk,
+    expectedDuration,
+    toolBreadth,
+    crossProject,
+  };
+}
+
+/** Preserve retries exactly unless two explicit quality failures justify one step up. */
+export function selectCodexRetryPolicy(input: {
+  model: unknown;
+  reasoningEffort: unknown;
+  modelReason: unknown;
+  qualityFailureCount: number;
+  evidence?: unknown;
+}): CodexRetrySelection {
+  const model = normalizeWorkModelTier(input.model);
+  const fallbackEffort: CodexReasoningEffort = model === "luna" ? "medium" : model === "sol" ? "max" : "medium";
+  const reasoningEffort = normalizeCodexReasoningEffort(input.reasoningEffort, fallbackEffort);
+  const modelReason = boundedText(input.modelReason, 300) || "Persisted adaptive Codex route";
+  if (Math.max(0, Math.floor(input.qualityFailureCount)) < 2 || model === "sol") {
+    return { model, reasoningEffort, modelReason, escalated: false };
+  }
+  const escalatedModel: WorkModelTier = model === "luna" ? "terra" : "sol";
+  const escalatedEffort: CodexReasoningEffort = escalatedModel === "terra" ? "high" : "max";
+  const evidence = boundedText(input.evidence, 100) || "repeated supervisor-evidenced quality gaps";
+  return {
+    model: escalatedModel,
+    reasoningEffort: maxEffort(reasoningEffort, escalatedEffort),
+    modelReason: (
+      `Escalated ${workModelLabel(model)}/${reasoningEffort} to ${workModelLabel(escalatedModel)}/${escalatedEffort} `
+      + `after ${Math.floor(input.qualityFailureCount)} evidenced quality failures: ${evidence}. Prior: ${modelReason}`
+    ).slice(0, 300),
+    escalated: true,
+  };
+}

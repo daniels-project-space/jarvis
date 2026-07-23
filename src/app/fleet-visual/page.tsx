@@ -13,7 +13,9 @@ const nodes: FleetNode[] = labels.map((label, index) => ({
   stage: states[index].replace("_", " "), percent: states[index] === "done" ? 100 : 24 + index * 9,
   progress: index === 6 ? "Confirm the integration conflict boundary" : `${label} · meaningful update persisted`,
   progressAt: Date.UTC(2026, 6, 21, 17, 40 + index), model: index === 6 ? "sol" : "terra",
-  reasoningEffort: index === 6 ? "max" : "high", workerRuntime: "trigger", workerRunId: null,
+  reasoningEffort: index === 6 ? "max" : "high",
+  modelReason: index === 6 ? "Production integration risk requires the Sol/max safety floor" : "Complex implementation with medium production risk",
+  workerRuntime: "trigger", workerRunId: null,
   generation: index > 4 ? 2 : 1, attempt: index === 5 ? 2 : 1, maxAttempts: 12,
   dependencyCount: index === 0 ? 0 : index < 3 ? 1 : 2, dependenciesReady: index < 3 ? Math.min(index, 1) : index < 6 ? 1 : 2,
   integrationState: states[index] === "integrating" ? "integrating" : states[index] === "needs_input" ? "needs_attention" : "not_applicable",
@@ -24,7 +26,7 @@ const nodes: FleetNode[] = labels.map((label, index) => ({
 }));
 
 const snapshot: CompactWorkSnapshot = {
-  active: { id: "job-7", missionId: "mission-preview", label: "Decision boundary", status: "needs_input", stage: "needs input", percent: 78, extraCount: 4, needsDaniel: true },
+  active: { id: "job-7", missionId: "mission-preview", label: "Decision boundary", status: "needs_input", stage: "needs input", percent: 78, model: "sol", reasoningEffort: "max", modelReason: "Production integration risk requires the Sol/max safety floor", extraCount: 4, needsDaniel: true },
   fleet: {
     id: "mission-preview", goal: "Build the unified live JARVIS fleet surface", mode: "goal", status: "needs_input", phase: "integration", percent: 78,
     repository: "daniels-project-space/jarvis", planDigest: "c7d706a42db3547f3216862c95ef7894e68ac40fbfeae356d03577c8cbb71942", planGeneration: 3,

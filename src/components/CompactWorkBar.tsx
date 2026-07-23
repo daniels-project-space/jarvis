@@ -237,13 +237,16 @@ function Controls({ controls, target, onError }: { controls: FleetControl[]; tar
   </div>;
 }
 
-function WorkerDetail({ node, onBack }: { node: FleetNode; onBack: () => void }) {
+export function WorkerDetail({ node, onBack }: { node: FleetNode; onBack: () => void }) {
   const [error, setError] = useState("");
   return <section data-fleet-worker-detail className="flex min-h-0 flex-1 flex-col gap-2 rounded-xl border border-white/[0.08] bg-black/20 p-3">
     <div className="flex min-w-0 items-start gap-2">
       <button type="button" onClick={onBack} className="shrink-0 text-xs text-cyan" aria-label="Back to fleet">←</button>
       <div className="min-w-0 flex-1"><div className="truncate text-xs text-ice">{agentName(node.agent)} · {node.label}</div><div className="mt-0.5 truncate font-mono text-[8px] uppercase tracking-[0.12em] text-slate">{node.model ?? "auto"}/{node.reasoningEffort ?? "default"} · gen {node.generation} · attempt {node.attempt}/{node.maxAttempts}</div></div>
       <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[8px] ${STATE_STYLE[node.state]}`}>{node.state.replace("_", " ")}</span>
+    </div>
+    <div className="rounded-lg border border-cyan/15 bg-cyan/[0.04] px-2 py-1 text-[9px] text-slate">
+      route · <span className="font-mono text-cyan">{node.model ?? "auto"}/{node.reasoningEffort ?? "default"}</span> · <span className="text-ice">{node.modelReason ?? "Legacy route awaiting adaptive projection"}</span>
     </div>
     <div className="grid grid-cols-2 gap-1 text-[9px] text-slate"><div className="truncate">stage · <span className="text-ice">{node.stage}</span></div><div className="truncate">merge · <span className="text-ice">{node.mergeState}</span></div><div className="truncate">handoffs · <span className="text-ice">{node.dependenciesReady}/{node.dependencyCount}</span></div><div className="truncate">runtime · <span className="text-ice">{node.workerRuntime ?? "not assigned"}</span></div><div className="col-span-2 truncate">last meaningful progress · <span className="font-mono text-ice">{progressStamp(node.progressAt)}</span></div></div>
     {node.recoverySummary && <div className="rounded-lg border border-blue-400/15 bg-blue-400/[0.05] px-2 py-1 text-[9px] text-blue-200">recovery · {node.recoverySummary}</div>}
@@ -266,7 +269,8 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
     jobId: detail.jobId, label: detail.label, agent: detail.agentId ?? selectedSummary.agent,
     repository: detail.repo, status: detail.status, stage: detail.stage, percent: detail.percent,
     progress: detail.progress, progressAt: detail.progressAt, model: detail.model,
-    reasoningEffort: detail.reasoningEffort, workerRuntime: detail.workerRuntime,
+    reasoningEffort: detail.reasoningEffort, modelReason: detail.modelReason,
+    workerRuntime: detail.workerRuntime,
     workerRunId: detail.workerRunId, generation: detail.generation, attempt: detail.attempt,
     maxAttempts: detail.maxAttempts, integrationState: detail.integrationState ?? selectedSummary.integrationState,
     deliveryStatus: detail.deliveryStatus, startedAt: detail.startedAt,
@@ -279,7 +283,7 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
     <aside data-fleet-surface="collapsed" data-work-id={active.id} aria-live="polite" className="absolute left-2 top-2 z-30 w-[min(350px,calc(100%-16px))] sm:left-3">
       <button type="button" onClick={() => setOpen(true)} aria-expanded="false" aria-label={`Open live fleet for ${active.label}`} className="glass group grid h-11 w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 overflow-hidden rounded-xl !border-cyan/25 bg-[#071019]/92 px-3 text-left shadow-[0_8px_30px_rgba(0,0,0,.32)] hover:!border-cyan/45">
         <span aria-hidden="true" className={`h-1.5 w-1.5 rounded-full ${active.needsDaniel ? "bg-amber" : "bg-cyan animate-pulse"}`} />
-        <span className="min-w-0"><span className="block truncate text-[11px] text-ice">{active.label}</span><span className="block truncate font-mono text-[8px] uppercase tracking-[0.12em] text-cyan/65">{active.needsDaniel ? "Needs Daniel" : active.stage}</span></span>
+        <span className="min-w-0"><span className="block truncate text-[11px] text-ice">{active.label}</span><span title={active.modelReason ?? active.stage} className="block truncate font-mono text-[8px] uppercase tracking-[0.12em] text-cyan/65">{active.needsDaniel ? "Needs Daniel · " : ""}{active.model ?? "auto"}/{active.reasoningEffort ?? "default"} · {active.modelReason ?? active.stage}</span></span>
         <span className="flex items-center gap-1 font-mono text-[9px] text-cyan"><span>{active.percent}%</span>{active.extraCount > 0 && <span className="rounded-full border border-white/10 px-1.5 py-0.5 text-slate">+{active.extraCount}</span>}</span>
       </button>
     </aside>
@@ -299,7 +303,7 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
           <FleetDag nodes={fleet.nodes} edges={fleet.edges} />
           {repositories.length > 0 && <div className="flex flex-wrap gap-1" aria-label="Repository groups">{repositories.map((repo) => <span key={repo} className="rounded-full border border-white/10 px-2 py-0.5 font-mono text-[8px] text-slate">{repo} · {fleet.nodes.filter((node) => node.repository === repo).length}</span>)}</div>}
           <section aria-label="Fleet workstreams" className="grid gap-1.5 sm:grid-cols-2">
-            {fleet.nodes.map((node) => <button type="button" key={node.id} onClick={() => selectJob(node.jobId)} className={`min-w-0 rounded-xl border p-2 text-left transition hover:border-cyan/40 ${STATE_STYLE[node.state]}`} aria-label={`Open ${agentName(node.agent)} detail for ${node.label}`}><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{agentName(node.agent)} · {node.label}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.1em] opacity-75">{node.stage} · {node.model ?? "auto"}/g{node.generation}/a{node.attempt} · handoff {node.dependenciesReady}/{node.dependencyCount}</div>{node.progress && <div className="mt-1 truncate text-[9px] text-slate">{node.progress}</div>}<div className="mt-1 truncate font-mono text-[7px] text-slate/65">{node.mergeState} · progress {progressStamp(node.progressAt)}</div></button>)}
+            {fleet.nodes.map((node) => <button type="button" key={node.id} onClick={() => selectJob(node.jobId)} className={`min-w-0 rounded-xl border p-2 text-left transition hover:border-cyan/40 ${STATE_STYLE[node.state]}`} aria-label={`Open ${agentName(node.agent)} detail for ${node.label}`}><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{agentName(node.agent)} · {node.label}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.1em] opacity-75">{node.stage} · {node.model ?? "auto"}/{node.reasoningEffort ?? "default"}/g{node.generation}/a{node.attempt} · handoff {node.dependenciesReady}/{node.dependencyCount}</div>{node.progress && <div className="mt-1 truncate text-[9px] text-slate">{node.progress}</div>}<div className="mt-1 truncate font-mono text-[7px] text-slate/65">{node.mergeState} · progress {progressStamp(node.progressAt)}</div></button>)}
           </section>
         </div>}
       </div>

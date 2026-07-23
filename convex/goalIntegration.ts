@@ -1084,15 +1084,22 @@ export const failFocused = mutation({
         `Repair only this receipt against the current integration head. Do not rerun or modify unrelated workstreams.`,
         args.reason.slice(0, 1_000),
       ].join("\n\n"),
-      status: "pending", readonly: false, model: "terra", reasoningEffort: "high", mcp: ["context7"],
+      status: "pending", readonly: false, mcp: ["context7"],
       missionId: String(mission._id), label: `${args.kind} repair · ${attempt.workstreamId}`.slice(0, 80),
       visibility: "conversation", originThreadId: mission.originThreadId, agentId: job.agentId ?? "paul",
-      risk: "high", priority: 99, stage: "queued", percent: 0, progressAt: now, heartbeatAt: now,
+      risk: "medium", priority: 99, stage: "queued", percent: 0, progressAt: now, heartbeatAt: now,
       attempt: 1, maxAttempts: 8, nextRunAt: now, parentJobId: String(job._id),
       goalStage: job.goalStage, goalWorkstreamId: `${attempt.workstreamId}-repair-${attempt.generation}`,
       goalWave: attempt.revisionWave, acceptanceCriteria: ["Produce a fresh exact signed receipt against the current integration head"],
       sourceBranch: attempt.integrationBranch, integrationBranch: attempt.integrationBranch,
       integrationState: "awaiting_review", createdAt: now,
+    }, {
+      workType: "implementation",
+      complexity: "bounded",
+      uncertainty: "low",
+      productionRisk: "medium",
+      expectedDuration: "short",
+      toolBreadth: "narrow",
     });
     const identity = workItemIdentity({ missionId: String(mission._id), jobId: String(repairId), workstreamId: `${attempt.workstreamId}-repair`, readonly: false });
     const repair: any = await ctx.db.get(repairId);

@@ -10,7 +10,7 @@ import {
 
 function snapshot(stage = "dispatching"): CompactWorkSnapshot {
   return {
-    active: { id: "job-1", missionId: "mission-1", label: "Paul · current repair", status: stage === "dispatching" ? "dispatching" : "running", stage, percent: stage === "dispatching" ? 2 : 64, extraCount: 2, needsDaniel: false },
+    active: { id: "job-1", missionId: "mission-1", label: "Paul · current repair", status: stage === "dispatching" ? "dispatching" : "running", stage, percent: stage === "dispatching" ? 2 : 64, model: "terra", reasoningEffort: "high", modelReason: "Standard implementation route", extraCount: 2, needsDaniel: false },
     fleet: {
       id: "mission-1", goal: "Repair this request", mode: "goal", status: "running", phase: stage,
       percent: 64, repository: "daniels-project-space/jarvis", planDigest: "digest", planGeneration: 2,
@@ -18,7 +18,7 @@ function snapshot(stage = "dispatching"): CompactWorkSnapshot {
       nodes: [{
         id: "surface", jobId: "job-1", label: "Paul · current repair", agent: "paul", repository: "daniels-project-space/jarvis",
         state: "running", status: "running", stage, percent: 64, progress: "Testing", progressAt: 1,
-        model: "terra", reasoningEffort: "high", workerRuntime: "trigger", workerRunId: "run-1", generation: 2,
+        model: "terra", reasoningEffort: "high", modelReason: "Standard implementation route", workerRuntime: "trigger", workerRunId: "run-1", generation: 2,
         attempt: 1, maxAttempts: 12, dependencyCount: 0, dependenciesReady: 0, integrationState: "not_applicable",
         deliveryStatus: null, mergeState: "not started", recoverySummary: null, needsDaniel: false, attentionReason: null,
         controls: ["pause", "cancel", "steer"], startedAt: 1,

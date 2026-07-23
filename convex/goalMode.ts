@@ -21,6 +21,7 @@ import {
   patchJobWithRuntime,
   patchMissionWithRuntime,
   runtimeJob,
+  type CodexJobPolicyContext,
 } from "./controlPlane";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { exactTextWorkOrder } from "../src/lib/work-order";
@@ -71,15 +72,13 @@ type GoalJobInput = {
   label: string;
   repo?: string;
   readonly?: boolean;
-  model: "terra" | "sol";
-  reasoningEffort: "high" | "max";
   mcp?: string[];
   originThreadId?: string;
   agentId: string;
   risk?: string;
   priority: number;
   acceptanceCriteria: string[];
-  modelReason: string;
+  modelPolicy?: CodexJobPolicyContext;
   dependsOn?: string[];
   planParentMissionId?: any;
   planDigest?: string;
@@ -203,7 +202,9 @@ async function insertGoalJob(ctx: any, input: GoalJobInput) {
   });
   const approvalRequired = approval.required;
   const status = approvalRequired ? "awaiting_approval" : "pending";
-  const { policyTask: _policyTask, ...persistedInput } = input;
+  const { policyTask: _policyTask, modelPolicy: _modelPolicy, ...persistedInput } = input;
+  void _policyTask;
+  void _modelPolicy;
   const jobId = await insertJobWithRuntime(ctx, {
     ...persistedInput,
     label: input.label.slice(0, 80),
@@ -220,6 +221,14 @@ async function insertGoalJob(ctx: any, input: GoalJobInput) {
     maxAttempts: Math.max(1, Math.min(48, input.maxAttempts ?? 24)),
     nextRunAt: approvalRequired ? undefined : now,
     createdAt: now,
+  }, {
+    task: input.policyTask?.trim() || input.task,
+    role: input.agentId,
+    repo,
+    readonly: input.readonly,
+    risk: input.risk,
+    tools: input.mcp,
+    ...input.modelPolicy,
   });
   const identity = workItemIdentity({
     missionId: input.missionId,
@@ -250,7 +259,13 @@ async function insertGoalJob(ctx: any, input: GoalJobInput) {
       : `Goal Mode ${input.goalStage} session queued`,
     stage: approvalRequired ? "approval" : "queued",
     percent: 0,
-    data: { goalStage: input.goalStage, goalWave: input.goalWave, reasoningEffort: input.reasoningEffort },
+    data: {
+      goalStage: input.goalStage,
+      goalWave: input.goalWave,
+      model: inserted?.model,
+      reasoningEffort: inserted?.reasoningEffort,
+      modelReason: inserted?.modelReason,
+    },
     createdAt: now,
   });
   if (approvalRequired) {
@@ -556,8 +571,6 @@ export const create = mutation({
       label: "JARVIS · goal architecture",
       repo: route.primaryRepo,
       readonly: true,
-      model: "sol",
-      reasoningEffort: "max",
       mcp: ["context7"],
       originThreadId: args.originThreadId,
       agentId: "jarvis",
@@ -568,7 +581,13 @@ export const create = mutation({
         `Return a valid 2-${maxBuildSessions} session GOAL_PLAN_JSON contract`,
         "Keep consequential actions explicitly gated",
       ],
-      modelReason: "Goal Mode uses exactly one Sol/max architecture session before implementation",
+      modelPolicy: {
+        workType: "architecture",
+        complexity: "intense",
+        uncertainty: "high",
+        expectedDuration: "long",
+        toolBreadth: "broad",
+      },
       maxAttempts: 16,
       goalStage: "planning",
       goalWorkstreamId: "goal-plan",
@@ -580,11 +599,14 @@ export const create = mutation({
       integrationBranch: route.primaryRepo ? goalBranch(goal, String(missionId)) : undefined,
       integrationGeneration: 0,
     });
-    await recordMissionEvent(ctx, String(missionId), "goal_started", "Goal Mode started with a Sol/max planning session", "planning", 3, {
+    const plannerJob: any = await ctx.db.get(plannerJobId);
+    await recordMissionEvent(ctx, String(missionId), "goal_started",
+      `Goal Mode started with ${String(plannerJob?.model ?? "adaptive")}/${String(plannerJob?.reasoningEffort ?? "adaptive")} planning`, "planning", 3, {
       route: route.kind,
       primaryRepo: route.primaryRepo,
       maxBuildSessions,
       maxRevisionWaves,
+      modelReason: plannerJob?.modelReason,
     });
     return { missionId, plannerJobId, route: route.kind };
   },
@@ -761,7 +783,7 @@ async function validatorTaskForMission(ctx: any, mission: any, jobs: any[]): Pro
 
 async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
   const plan = mission.plan as GoalPlan;
-  // App Factory owns its own repository/build lifecycle. Its final Sol session
+  // App Factory owns its own repository/build lifecycle. Its final adaptive validator
   // validates the external run and must not be pointed at a made-up Jarvis branch.
   const splitParent = Array.isArray(mission.splitChildMissionIds) && mission.splitChildMissionIds.length > 0;
   const branch = mission.externalRunId || splitParent
@@ -774,8 +796,6 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
     label: `JARVIS · deep validation ${Number(mission.revisionWave ?? 0) + 1}`,
     repo: splitParent ? undefined : mission.primaryRepo ?? plan.primaryRepo,
     readonly: true,
-    model: "sol",
-    reasoningEffort: "max",
     mcp: mission.externalRunId || plan.validation.liveChecks.length ? ["playwright", "context7"] : ["context7"],
     originThreadId: mission.originThreadId,
     agentId: "jarvis",
@@ -786,7 +806,14 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
       "Validate the end-to-end outcome and relevant live/provider surfaces",
       "Return a valid GOAL_VALIDATION_JSON verdict",
     ],
-    modelReason: "Goal Mode reserves Sol/max for skeptical end-to-end validation and refinement planning",
+    modelPolicy: {
+      workType: "verification",
+      complexity: "intense",
+      uncertainty: "high",
+      expectedDuration: "long",
+      toolBreadth: mission.externalRunId || plan.validation.liveChecks.length || splitParent ? "broad" : "moderate",
+      crossProject: splitParent,
+    },
     branch,
     sourceBranch: branch,
     sourceHeadSha: mission.integrationHeadSha,
@@ -812,8 +839,11 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
     advanceLeaseUntil: undefined,
     updatedAt: now,
   });
-  await recordMissionEvent(ctx, String(mission._id), "goal_validation_queued", "Sol/max deep validation queued", "validating", 82, {
+  const validatorJob: any = await ctx.db.get(validatorJobId);
+  await recordMissionEvent(ctx, String(mission._id), "goal_validation_queued",
+    `${String(validatorJob?.model ?? "adaptive")}/${String(validatorJob?.reasoningEffort ?? "adaptive")} deep validation queued`, "validating", 82, {
     revisionWave: Number(mission.revisionWave ?? 0),
+    modelReason: validatorJob?.modelReason,
   });
   return validatorJobId;
 }
@@ -885,7 +915,7 @@ export const claimAdvance = mutation({
       .take(100);
     for (const activity of running) {
       if (activity.mode !== "goal") continue;
-      // External factories own their build loop, but their completed Sol
+      // External factories own their build loop, but their completed adaptive
       // validator still returns through this same durable contract parser.
       if (activity.externalRunId && activity.phase !== "validating") continue;
       const projectedJobs = await ctx.db
@@ -1119,10 +1149,9 @@ export const recordPlan = mutation({
             `Immutable parent plan: ${planDigest} generation ${planGeneration}; node ${stream.id}.`,
             "Repository inspection may enrich context but cannot change this node id, scope, dependencies, acceptance criteria, or consequence policy."].join("\n\n"),
           policyTask: stream.task, missionId: String(childId), label: stream.label, repo: repository,
-          readonly: stream.readonly, model: "terra", reasoningEffort: "high", mcp: stream.mcp,
-          originThreadId: mission.originThreadId, agentId: stream.agentId, risk: "high", priority: 92,
+          readonly: stream.readonly, mcp: stream.mcp,
+          originThreadId: mission.originThreadId, agentId: stream.agentId, risk: "medium", priority: 92,
           acceptanceCriteria: stream.acceptanceCriteria,
-          modelReason: "Goal Mode executes the accepted parent DAG node without child replanning",
           dependsOn: dependencies, sourceBranch: !stream.readonly ? integrationBranch : undefined,
           integrationBranch: !stream.readonly ? integrationBranch : undefined,
           maxAttempts: 24, goalStage: "building", goalWorkstreamId: stream.id, goalWave: 0,
@@ -1185,7 +1214,7 @@ export const recordPlan = mutation({
         updatedAt: now,
       });
       await resolveGoalAttention(ctx, args.id);
-      await recordMissionEvent(ctx, String(args.id), "goal_plan_ready", "Sol plan accepted; App Factory now owns the build lifecycle", "building", 12, {
+      await recordMissionEvent(ctx, String(args.id), "goal_plan_ready", "Adaptive architecture plan accepted; App Factory now owns the build lifecycle", "building", 12, {
         externalRunId: args.externalRun.id,
         externalSlug: args.externalRun.slug,
       });
@@ -1207,7 +1236,7 @@ export const recordPlan = mutation({
         stream.task,
         `Goal Mode outcome: ${mission.goal}`,
         `Reuse/ownership boundary: ${mission.infrastructureContext ?? "Inspect the current project boundary before editing."}`,
-        `This is Terra/high implementation session ${workstreamJobs.size + 1} of ${plan.workstreams.length}. Preserve completed branch work, stay inside this workstream, and leave a compact evidence-rich checkpoint for the final Sol validator.`,
+        `This is bounded implementation session ${workstreamJobs.size + 1} of ${plan.workstreams.length}. Preserve completed branch work, stay inside this workstream, and leave a compact evidence-rich checkpoint for the final validator.`,
       ].join("\n\n");
       const id = await insertGoalJob(ctx, {
         task,
@@ -1218,15 +1247,12 @@ export const recordPlan = mutation({
         label: stream.label,
         repo,
         readonly: stream.readonly,
-        model: "terra",
-        reasoningEffort: "high",
         mcp: stream.mcp,
         originThreadId: mission.originThreadId,
         agentId: stream.agentId,
-        risk: "high",
+        risk: "medium",
         priority: 92,
         acceptanceCriteria: stream.acceptanceCriteria,
-        modelReason: "Goal Mode builder sessions use Terra/high for maximum implementation per token",
         dependsOn: dependencies,
         planParentMissionId: mission._id,
         planDigest,
@@ -1268,7 +1294,7 @@ export const recordPlan = mutation({
       updatedAt: now,
     });
     await resolveGoalAttention(ctx, args.id);
-    await recordMissionEvent(ctx, String(args.id), "goal_plan_ready", `Sol plan accepted; ${workstreamJobs.size} Terra/high sessions queued`, "building", 12, {
+    await recordMissionEvent(ctx, String(args.id), "goal_plan_ready", `Adaptive architecture plan accepted; ${workstreamJobs.size} routed sessions queued`, "building", 12, {
       waitingApprovals,
       integrationBranch,
     });
@@ -1438,22 +1464,23 @@ async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefin
       task: [
         refinement.task,
         `Goal Mode outcome: ${mission.goal}`,
-        `Final validator gap from wave ${wave - 1}: close only this gap on your isolated worker branch, run the relevant checks, and report exact evidence for controller integration and the next Sol validation.`,
+        `Final validator gap from wave ${wave - 1}: close only this gap on your isolated worker branch, run the relevant checks, and report exact evidence for controller integration and the next adaptive validation.`,
       ].join("\n\n"),
       policyTask: refinement.task,
       missionId: String(mission._id),
       label: refinement.label,
       repo: mission.primaryRepo,
       readonly: false,
-      model: "terra",
-      reasoningEffort: "high",
       mcp: ["context7"],
       originThreadId: mission.originThreadId,
       agentId: "paul",
-      risk: "high",
+      risk: "medium",
       priority: 96,
       acceptanceCriteria: refinement.acceptanceCriteria,
-      modelReason: "Goal Mode uses a bounded Terra/high repair wave before another Sol validation",
+      modelPolicy: {
+        workType: "implementation",
+        expectedDuration: "short",
+      },
       sourceBranch: integrationBranch,
       integrationBranch,
       maxAttempts: 20,
@@ -1533,7 +1560,7 @@ async function queueExternalRevision(
     options.eventType,
     options.extendBudget
       ? `Daniel approved App Factory repair wave ${wave}; the durable revision outbox is applying it to the same generated app`
-      : `Sol validation queued repair wave ${wave} for the same App Factory run`,
+      : `Adaptive validation queued repair wave ${wave} for the same App Factory run`,
     "factory refinement",
     Math.min(94, 84 + wave * 4),
     { wave, gaps: validation.gaps, externalRunId: mission.externalRunId },
@@ -1574,7 +1601,7 @@ export const recordValidation = mutation({
         updatedAt: now,
       });
       await resolveGoalAttention(ctx, args.id);
-      await recordMissionEvent(ctx, String(args.id), "goal_complete", "Sol validation passed the complete outcome", "complete", 100, {
+      await recordMissionEvent(ctx, String(args.id), "goal_complete", "Adaptive validation passed the complete outcome", "complete", 100, {
         evidence: validation.evidence,
       });
       if (mission.parentMissionId) await rollupSplitParent(ctx, mission.parentMissionId);
@@ -1583,7 +1610,7 @@ export const recordValidation = mutation({
     if (Array.isArray(mission.splitChildMissionIds) && mission.splitChildMissionIds.length) {
       const reason = validation.verdict === "blocked"
         ? validation.blocker || validation.summary
-        : `Parent Sol validation did not prove the original accepted plan: ${validation.gaps.join("; ") || validation.summary}`;
+        : `Parent adaptive validation did not prove the original accepted plan: ${validation.gaps.join("; ") || validation.summary}`;
       await patchMissionWithRuntime(ctx, mission, {
         status: "needs_input", phase: "needs Daniel", pausedPhase: "validating",
         validation, validationHistory: history, failureReason: reason.slice(0, 2_000),
@@ -1615,7 +1642,7 @@ export const recordValidation = mutation({
         advanceLeaseUntil: undefined,
         updatedAt: now,
       });
-      await recordMissionEvent(ctx, String(args.id), "goal_refinement_queued", `${ids.length} Terra/high refinement session${ids.length === 1 ? "" : "s"} queued`, "refining", 88, {
+      await recordMissionEvent(ctx, String(args.id), "goal_refinement_queued", `${ids.length} adaptive refinement session${ids.length === 1 ? "" : "s"} queued`, "refining", 88, {
         wave: nextWave,
         gaps: validation.gaps,
       });

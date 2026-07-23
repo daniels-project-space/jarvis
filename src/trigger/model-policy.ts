@@ -1,5 +1,11 @@
 import { normalizeWorkModelTier, type WorkModelTier } from "../lib/work-models";
 import { visibleTurnText } from "../lib/host-context";
+import {
+  normalizeCodexReasoningEffort,
+  type CodexReasoningEffort,
+} from "../lib/codex-work-router";
+
+export type { CodexReasoningEffort } from "../lib/codex-work-router";
 
 export const CODEX_MODEL_POLICY = {
   luna: { model: "gpt-5.6-luna", effort: "low" },
@@ -11,10 +17,9 @@ export const CODEX_MODEL_POLICY = {
 } as const;
 
 export type CodexModelSelection = (typeof CODEX_MODEL_POLICY)[WorkModelTier];
-export type CodexReasoningEffort = "low" | "medium" | "high" | "max";
 
 export function normalizeReasoningEffort(value: unknown, fallback: CodexReasoningEffort): CodexReasoningEffort {
-  return value === "low" || value === "medium" || value === "high" || value === "max" ? value : fallback;
+  return normalizeCodexReasoningEffort(value, fallback);
 }
 
 export function codexModelFor(tier: string): CodexModelSelection {

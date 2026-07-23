@@ -19,6 +19,9 @@ export type CompactWorkItem = {
   status: FleetNodeState;
   stage: string;
   percent: number;
+  model: string | null;
+  reasoningEffort: string | null;
+  modelReason: string | null;
   extraCount: number;
   needsDaniel: boolean;
 };
@@ -44,6 +47,7 @@ export type FleetNode = {
   progressAt: number | null;
   model: string | null;
   reasoningEffort: string | null;
+  modelReason: string | null;
   workerRuntime: string | null;
   workerRunId: string | null;
   generation: number;
@@ -102,6 +106,7 @@ export type CompactJobDetail = {
   progressAt: number | null;
   model: string | null;
   reasoningEffort: string | null;
+  modelReason: string | null;
   workerRuntime: string | null;
   workerRunId: string | null;
   generation: number;
