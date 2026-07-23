@@ -81,11 +81,30 @@ describe("mission supervisor schema index contract", () => {
     const indexes = indexesForTable(
       schema,
       "missionSupervisorControls",
-      "controlPlaneMigrations",
+      "missionSupervisorSupersessions",
     );
     expect(indexes).toEqual([
       { name: "by_key", fields: ["requestKey"] },
       { name: "by_mission_created", fields: ["missionId", "createdAt"] },
+    ]);
+    expect(() => assertUniqueFieldTuples(indexes)).not.toThrow();
+  });
+
+  it("keeps recovery lineage lookups exact and bounded", () => {
+    const indexes = indexesForTable(
+      schema,
+      "missionSupervisorSupersessions",
+      "controlPlaneMigrations",
+    );
+    expect(indexes).toEqual([
+      { name: "by_key", fields: ["supersessionKey"] },
+      { name: "by_mission_created", fields: ["missionId", "createdAt"] },
+      { name: "by_predecessor", fields: ["predecessorJobId"] },
+      { name: "by_successor", fields: ["successorJobId"] },
+      {
+        name: "by_root_generation",
+        fields: ["rootJobId", "generation"],
+      },
     ]);
     expect(() => assertUniqueFieldTuples(indexes)).not.toThrow();
   });

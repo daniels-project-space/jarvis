@@ -60,6 +60,10 @@ import {
 } from "../src/lib/work-scheduler";
 import { admissionForRepository } from "./sourceAdmission";
 import { WORK_ORDER_MACHINE_RUNTIME, WORK_ORDER_MACHINE_TEMPLATE } from "../src/lib/work-order-revision";
+import {
+  insertFreshTerminalWorkReceipt,
+  type RecoveryDisposition,
+} from "./workReceiptAuthority";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
 // A live process that cannot produce a causal stage/percentage advance is not
@@ -87,6 +91,18 @@ function outcomeAllowed(policy: string, outcome: string) {
 async function sha256Hex(value: string) {
   const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function isSupervisorOwnedJob(row: {
+  missionId?: unknown;
+  supervisorEpoch?: unknown;
+  supervisorDecisionKey?: unknown;
+  supervisorJobOrdinal?: unknown;
+}): boolean {
+  return typeof row.missionId === "string"
+    && Number.isSafeInteger(row.supervisorEpoch)
+    && typeof row.supervisorDecisionKey === "string"
+    && Number.isSafeInteger(row.supervisorJobOrdinal);
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any -- Convex documents are validated against the immutable receipt fields before use */
@@ -1805,6 +1821,13 @@ export const finalize = mutation({
     expectedAttempt: v.number(),
     authorityDigest: v.optional(v.string()),
     status: v.union(v.literal("done"), v.literal("error")),
+    terminalCode: v.optional(v.union(
+      v.literal("transient_provider_error"),
+      v.literal("transient_network_error"),
+      v.literal("verification_exhausted"),
+      v.literal("worker_terminal_error"),
+      v.literal("delivery_blocked"),
+    )),
     result: v.optional(v.string()),
     pullRequestUrl: v.optional(v.string()),
     verificationVerdict: v.optional(v.union(v.literal("pass"), v.literal("unavailable"))),
@@ -1885,11 +1908,58 @@ export const finalize = mutation({
       verifiedAt: success ? now : undefined,
     };
     const terminalEventKey = `terminal:${a.expectedAttempt}:${a.status}:${a.status === "done" ? a.resultDigest : eventIdentity(`${a.result ?? ""}|${a.verificationNote ?? ""}`)}`;
-    if (success) {
-      const priorReceipt = await ctx.db.query("workReceipts")
-        .withIndex("by_job_attempt", (q: any) => q.eq("jobId", a.jobId).eq("attempt", a.expectedAttempt)).first();
-      if (priorReceipt) return false;
+    const priorReceipts = await ctx.db.query("workReceipts")
+      .withIndex("by_job_attempt", (q) =>
+        q.eq("jobId", a.jobId).eq("attempt", a.expectedAttempt)
+      )
+      .take(2);
+    const artifacts = [row.branch, a.pullRequestUrl ?? row.pullRequestUrl, row.mergeCommitSha]
+      .filter((value): value is string => typeof value === "string" && value.length > 0)
+      .slice(0, 8);
+    // Read-only and failure outcomes still retain one concrete reference to
+    // the exact durable attempt rather than treating result prose as evidence.
+    if (!artifacts.length) {
+      artifacts.push(
+        `convex://jobs/${String(a.jobId)}/attempt/${a.expectedAttempt}/result`,
+      );
     }
+    const terminalCode = success
+      ? "verified_success"
+      : a.terminalCode ?? (row.repo ? "delivery_blocked" : "worker_terminal_error");
+    const recoveryDisposition: RecoveryDisposition = success
+      ? "none"
+      : ["transient_provider_error", "transient_network_error"].includes(
+          terminalCode,
+        )
+        ? "retryable"
+        : terminalCode === "verification_exhausted"
+          ? "remediable"
+          : "operator_stop";
+    if (priorReceipts.length > 0 && !isSupervisorOwnedJob(row)) return false;
+    await insertFreshTerminalWorkReceipt(
+      ctx,
+      row,
+      a.expectedAttempt,
+      {
+        status: success ? "succeeded" : "failed",
+        terminalCode,
+        recoveryDisposition,
+        acceptanceEvidence: success && normalizedNote
+          ? [normalizedNote]
+          : [],
+        artifacts,
+        verification: success ? "pass" : a.verificationVerdict ?? "unavailable",
+        deliveryOutcome: delivery?.outcome,
+        terminalEventKey,
+        result: normalizedResult,
+        evidence: normalizedNote,
+        reviewReceiptSignature: a.reviewReceiptSignature,
+        reviewDiffSha256: a.reviewDiffSha256,
+        reviewReceiptId: row.reviewReceiptId,
+        reviewReceiptDigest: row.reviewReceiptDigest,
+      },
+      now,
+    );
     await patchJobWithRuntime(ctx, row, finalPatch);
     if (delivery) await ctx.db.patch(delivery._id, {
       status: success ? "done" : "blocked",
@@ -1918,26 +1988,6 @@ export const finalize = mutation({
       { stage: success ? (delivered ? "delivered" : "verified") : a.status, percent: finalPercent, evidenceKind: success ? "completion_receipt" : "terminal", eventKey: terminalEventKey },
     );
     if (success) {
-      const artifacts = [row.branch, a.pullRequestUrl ?? row.pullRequestUrl, row.mergeCommitSha]
-        .filter((value): value is string => typeof value === "string" && value.length > 0).slice(0, 8);
-      // Read-only results remain concrete immutable references to the exact
-      // durable attempt record, never arbitrary result text masquerading as an artifact.
-      if (!artifacts.length) artifacts.push(`convex://jobs/${String(a.jobId)}/attempt/${a.expectedAttempt}/result`);
-      await ctx.db.insert("workReceipts", {
-        jobId: a.jobId, attempt: a.expectedAttempt, status: "succeeded",
-        authorityDigest: executionAuthority.authorityDigest,
-        schedulingBindingDigest: executionAuthority.schedulingBindingDigest,
-        workOrderRevisionId: executionAuthority.workOrderRevisionId,
-        workOrderRevision: executionAuthority.workOrderRevision,
-        workOrderRevisionDigest: executionAuthority.workOrderRevisionDigest,
-        canonicalProjectId: executionAuthority.canonicalProjectId,
-        repository: executionAuthority.repository,
-        acceptanceEvidence: [String(a.verificationNote).slice(0, 1_000)], artifacts, verification: "pass",
-        deliveryOutcome: delivery?.outcome,
-        terminalEventKey, resultDigest: a.resultDigest, evidenceDigest: a.evidenceDigest,
-        reviewReceiptSignature: a.reviewReceiptSignature, reviewDiffSha256: a.reviewDiffSha256,
-        reviewReceiptId: row.reviewReceiptId, reviewReceiptDigest: row.reviewReceiptDigest, createdAt: now,
-      });
       const completed = { ...row, ...finalPatch };
       await ensureGoalNodeHandoff(ctx, completed);
       await promoteCompletedJobDependents(ctx, completed, now);
@@ -2207,6 +2257,22 @@ export const reapStale = mutation({
         if (delivery?.status === "running") {
           const retries = Number(delivery.cumulativeRetries ?? delivery.retries ?? 0) + 1;
           const exhaustedDelivery = retries > DELIVERY_RETRY_LIMIT;
+          if (exhaustedDelivery && isSupervisorOwnedJob(j)) {
+            await insertFreshTerminalWorkReceipt(ctx, j, j.attempt ?? 1, {
+              status: "needs_input",
+              terminalCode: "delivery_retry_budget_exhausted",
+              recoveryDisposition: "needs_input",
+              acceptanceEvidence: [],
+              artifacts: [
+                `convex://deliveryAttempts/${String(delivery._id)}`,
+              ],
+              verification: "needs_input",
+              terminalEventKey:
+                `delivery-exhausted:${j.attempt ?? 1}:${j.deliveryGeneration}`,
+              result: "Verified delivery retry budget exhausted.",
+              evidence: delivery.retryReason,
+            }, now);
+          }
           await ctx.db.patch(delivery._id, {
             status: exhaustedDelivery ? "blocked" : "checkpointed", retries: Number(delivery.retries ?? 0) + 1, cumulativeRetries: retries, completedAt: now,
             outcome: exhaustedDelivery ? "needs_attention" : delivery.outcome,
@@ -2251,6 +2317,21 @@ export const reapStale = mutation({
       const nextAttempt = (j.attempt ?? 1) + 1;
       let recoveryEventEmitted = false;
       if (now - j.createdAt > 14 * 86_400_000 || nextAttempt > (j.maxAttempts ?? 12)) {
+        if (isSupervisorOwnedJob(j)) {
+          await insertFreshTerminalWorkReceipt(ctx, j, j.attempt ?? 1, {
+            status: "failed",
+            terminalCode: "stale_runner_budget_exhausted",
+            recoveryDisposition: "remediable",
+            acceptanceEvidence: [],
+            artifacts: [
+              `convex://jobs/${String(j._id)}/attempt/${j.attempt ?? 1}/watchdog`,
+            ],
+            verification: "unavailable",
+            terminalEventKey: `stale-runner-exhausted:${j.attempt ?? 1}`,
+            result: "Runner repeatedly stopped without a checkpoint.",
+            evidence: activity.progress ?? j.progress,
+          }, now);
+        }
         await patchJobWithRuntime(ctx, j, {
           status: "error",
           stage: "error",
@@ -2566,7 +2647,9 @@ export const checkpointAndRequeue = mutation({
     const deliveryContinuation = requestedStatus === "pending"
       && row.verificationVerdict === "pass"
       && Boolean(row.reviewReceiptId);
-    const attempt = (row.attempt ?? 1) + (requestedStatus === "pending" && !deliveryContinuation ? 1 : 0);
+    const nextAttempt =
+      (row.attempt ?? 1)
+      + (requestedStatus === "pending" && !deliveryContinuation ? 1 : 0);
     const requestedDelayMs = Math.max(0, Math.min(6 * 60 * 60 * 1000, a.delayMs ?? 0));
     const retryOrdinal = deliveryContinuation && delivery
       ? Number(delivery.cumulativeRetries ?? delivery.retries ?? 0) + 1
@@ -2576,8 +2659,45 @@ export const checkpointAndRequeue = mutation({
       : requestedDelayMs;
     const exhausted =
       requestedStatus === "pending" &&
-      (attempt > (row.maxAttempts ?? 12) || Date.now() - row.createdAt > 14 * 86_400_000);
+      (nextAttempt > (row.maxAttempts ?? 12)
+        || Date.now() - row.createdAt > 14 * 86_400_000);
     const status = exhausted ? "error" : requestedStatus;
+    // There is no next attempt when the continuation budget is exhausted.
+    // Keeping the terminal job on the completed attempt lets recovery bind one
+    // exact authority envelope instead of pointing at an unallocated attempt.
+    const attempt = exhausted && isSupervisorOwnedJob(row)
+      ? a.expectedAttempt
+      : nextAttempt;
+    if (exhausted && isSupervisorOwnedJob(row)) {
+      await insertFreshTerminalWorkReceipt(ctx, row, a.expectedAttempt, {
+        status: "failed",
+        terminalCode: "continuation_budget_exhausted",
+        recoveryDisposition: "remediable",
+        acceptanceEvidence: [],
+        artifacts: [
+          `convex://jobs/${String(a.jobId)}/attempt/${a.expectedAttempt}/checkpoint`,
+        ],
+        verification: "unavailable",
+        terminalEventKey: `continuation-exhausted:${a.expectedAttempt}`,
+        result: a.result,
+        evidence: a.checkpoint,
+      });
+    }
+    if (requestedStatus === "cancelled" && isSupervisorOwnedJob(row)) {
+      await insertFreshTerminalWorkReceipt(ctx, row, a.expectedAttempt, {
+        status: "cancelled",
+        terminalCode: "worker_observed_operator_cancel",
+        recoveryDisposition: "operator_stop",
+        acceptanceEvidence: [],
+        artifacts: [
+          `convex://jobs/${String(a.jobId)}/attempt/${a.expectedAttempt}/checkpoint`,
+        ],
+        verification: "cancelled",
+        terminalEventKey: `checkpoint-cancelled:${a.expectedAttempt}`,
+        result: a.result,
+        evidence: a.checkpoint,
+      });
+    }
     await patchJobWithRuntime(ctx, row, {
       ...invalidateDeliveryLease(row),
       status,
@@ -2658,6 +2778,20 @@ export const checkpointAndRequeue = mutation({
         });
         await patchJobWithRuntime(ctx, row, { activeDeliveryAttemptId: nextDeliveryId });
       } else if (deliveryExhausted) {
+        if (isSupervisorOwnedJob(row)) {
+          await insertFreshTerminalWorkReceipt(ctx, row, a.expectedAttempt, {
+            status: "needs_input",
+            terminalCode: "delivery_retry_budget_exhausted",
+            recoveryDisposition: "needs_input",
+            acceptanceEvidence: [],
+            artifacts: [`convex://deliveryAttempts/${String(delivery._id)}`],
+            verification: "needs_input",
+            terminalEventKey:
+              `delivery-exhausted:${a.expectedAttempt}:${delivery.generation}`,
+            result: "Verified delivery retry budget exhausted.",
+            evidence: a.checkpoint,
+          }, retryNow);
+        }
         await patchJobWithRuntime(ctx, row, {
           ...invalidateDeliveryLease(row), status: "needs_input", stage: "delivery attention",
           progress: "verified delivery retry budget exhausted — attention required",
@@ -3255,6 +3389,21 @@ export const requestInput = mutation({
     const now = Date.now();
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (!attempt || attempt.status !== "running") return false;
+    if (isSupervisorOwnedJob(row)) {
+      await insertFreshTerminalWorkReceipt(ctx, row, a.expectedAttempt, {
+        status: "needs_input",
+        terminalCode: "agent_input_required",
+        recoveryDisposition: "needs_input",
+        acceptanceEvidence: [],
+        artifacts: [
+          `convex://jobs/${String(a.jobId)}/attempt/${a.expectedAttempt}/input`,
+        ],
+        verification: "needs_input",
+        terminalEventKey: `needs-input:${a.expectedAttempt}`,
+        result: a.question,
+        evidence: a.checkpoint,
+      }, now);
+    }
     await ctx.db.patch(attempt._id, { status: "needs_input", completedAt: now, lastEventAt: now });
     await patchJobWithRuntime(ctx, row, {
       status: "needs_input",
@@ -3298,6 +3447,12 @@ export const provideInput = mutation({
     await requireActor(ctx, a);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "needs_input") return false;
+    // Supervisor work is append-only once it asks for input. Daniel's answer
+    // is consumed by a fenced supervisor recovery that creates a new job.
+    // Fail closed even when the historical receipt is missing, duplicated, or
+    // corrupt: receipt repair and successor creation are separate operations;
+    // this legacy continuation must never revive the terminal row in place.
+    if (isSupervisorOwnedJob(row)) return false;
     const now = Date.now();
     const previousAttempt = await attemptFor(ctx, a.jobId, row.attempt ?? 1);
     if (!previousAttempt || previousAttempt.status !== "needs_input") return false;
@@ -3792,6 +3947,21 @@ export const control = mutation({
     await requireActor(ctx, a);
     const row = await ctx.db.get(a.jobId);
     if (!row) return false;
+    const wouldResurrectSupervisorTerminal =
+      isSupervisorOwnedJob(row)
+      && (
+        (a.action === "retry" && ["error", "cancelled"].includes(row.status))
+        || (a.action === "resume" && ["needs_input", "stalled"].includes(row.status))
+        || (a.action === "steer" && row.status === "stalled")
+        || (a.action === "cancel" && row.status === "needs_input")
+      );
+    if (wouldResurrectSupervisorTerminal) {
+      // Recovery of a supervisor-owned terminal leaf is append-only and goes
+      // through missionSupervisor:commitV1, which creates a receipt-fenced
+      // successor. Missing, ambiguous, and corrupt receipts fail closed here;
+      // Goal Mode and other legacy jobs retain their in-place controls.
+      return false;
+    }
     const now = Date.now();
     let controlEventEmitted = false;
     const closeAttempt = async (status: string) => {
@@ -3904,6 +4074,28 @@ export const control = mutation({
       if (integrationControl?.reconcile) return true;
       if (["running", "steering"].includes(row.status) && !await closeAttempt("cancelled")) return false;
       if (["pending", "dispatching", "paused"].includes(row.status)) await closeAttempt("cancelled");
+      if (isSupervisorOwnedJob(row)) {
+        await ensureAttempt(
+          ctx,
+          a.jobId,
+          row.attempt ?? 1,
+          row.status,
+          now,
+        );
+        await insertFreshTerminalWorkReceipt(ctx, row, row.attempt ?? 1, {
+          status: "cancelled",
+          terminalCode: "operator_cancelled",
+          recoveryDisposition: "operator_stop",
+          acceptanceEvidence: [],
+          artifacts: [
+            `convex://jobs/${String(a.jobId)}/attempt/${row.attempt ?? 1}/control`,
+          ],
+          verification: "cancelled",
+          terminalEventKey: `operator-cancelled:${row.attempt ?? 1}`,
+          result: "Daniel cancelled the work.",
+          evidence: row.checkpoint,
+        }, now);
+      }
       await patchJobWithRuntime(ctx, row, {
         ...invalidateDeliveryLease(row),
         status: "cancelled",

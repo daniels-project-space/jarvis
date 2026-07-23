@@ -13,6 +13,8 @@ import {
   insertMissionWithRuntime,
   patchMissionWithRuntime,
   readAttemptExecutionAuthority,
+  readJobSchedulingAuthority,
+  readJobWorkOrderAuthority,
 } from "./controlPlane";
 import {
   admissionForRepository,
@@ -26,11 +28,17 @@ import {
 } from "../src/lib/source-admission";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
+import {
+  exactTerminalWorkReceipt,
+  terminalWorkReceiptDigest,
+} from "./workReceiptAuthority";
 
 export const MISSION_SUPERVISOR_LEASE_MS = 10 * 60_000;
 export const MISSION_SUPERVISOR_MAX_JOBS = 24;
 export const MISSION_SUPERVISOR_MAX_DECISIONS = 64;
 export const MISSION_SUPERVISOR_MAX_DUE = 8;
+export const MISSION_SUPERVISOR_MAX_RECOVERY_GENERATION = 4;
+export const MISSION_SUPERVISOR_MAX_AUTONOMOUS_RECOVERIES = 2;
 
 const REQUEST_PAYLOAD_MAX_BYTES = 16 * 1024;
 const DECISION_PAYLOAD_MAX_BYTES = 48 * 1024;
@@ -49,7 +57,12 @@ const FAILURE_BACKOFF_MAX_MS = 15 * 60_000;
 const SAFE_KEY = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$/;
 const SAFE_LEASE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._~:/+=-]{15,239}$/;
 const SAFE_ERROR_CODE = /^[a-z][a-z0-9_:-]{0,79}$/;
-const TERMINAL_JOB_STATUSES = new Set(["done", "error", "cancelled"]);
+const TERMINAL_JOB_STATUSES = new Set([
+  "done",
+  "error",
+  "cancelled",
+  "needs_input",
+]);
 
 const profileValidator = v.union(
   v.literal("short_fleet"),
@@ -117,10 +130,42 @@ const delegatedWorkstreamValidator = v.object({
   risk: riskValidator,
   acceptanceCriteria: v.array(v.string()),
 });
+const retryRecoveryValidator = v.object({
+  mode: v.literal("retry"),
+  predecessorJobId: v.id("jobs"),
+  predecessorReceiptDigest: v.string(),
+});
+const revisedRecoveryFields = {
+  predecessorJobId: v.id("jobs"),
+  predecessorReceiptDigest: v.string(),
+  task: v.string(),
+  label: v.string(),
+  model: modelTierValidator,
+  agentId: agentValidator,
+  risk: riskValidator,
+  acceptanceCriteria: v.array(v.string()),
+};
+const remediateRecoveryValidator = v.object({
+  mode: v.literal("remediate"),
+  ...revisedRecoveryFields,
+});
+const inputRevisionRecoveryValidator = v.object({
+  mode: v.literal("input_revision"),
+  ...revisedRecoveryFields,
+});
+const recoveryValidator = v.union(
+  retryRecoveryValidator,
+  remediateRecoveryValidator,
+  inputRevisionRecoveryValidator,
+);
 const supervisorDecisionValidator = v.union(
   v.object({
     kind: v.literal("delegate"),
     workstreams: v.array(delegatedWorkstreamValidator),
+  }),
+  v.object({
+    kind: v.literal("recover"),
+    recoveries: v.array(recoveryValidator),
   }),
   v.object({
     kind: v.literal("wait"),
@@ -131,6 +176,10 @@ const supervisorDecisionValidator = v.union(
     kind: v.literal("request_input"),
     question: v.string(),
     reason: v.string(),
+    target: v.optional(v.object({
+      predecessorJobId: v.id("jobs"),
+      predecessorReceiptDigest: v.string(),
+    })),
   }),
   v.object({
     kind: v.literal("replan"),
@@ -200,10 +249,36 @@ type DelegatedWorkstreamInput = {
   risk: WorkRisk;
   acceptanceCriteria: string[];
 };
+type RetryRecoveryInput = {
+  mode: "retry";
+  predecessorJobId: Id<"jobs">;
+  predecessorReceiptDigest: string;
+};
+type RevisedRecoveryInput = {
+  mode: "remediate" | "input_revision";
+  predecessorJobId: Id<"jobs">;
+  predecessorReceiptDigest: string;
+  task: string;
+  label: string;
+  model: ModelTier;
+  agentId: PermanentAgent;
+  risk: WorkRisk;
+  acceptanceCriteria: string[];
+};
+type RecoveryInput = RetryRecoveryInput | RevisedRecoveryInput;
 type SupervisorDecisionInput =
   | { kind: "delegate"; workstreams: DelegatedWorkstreamInput[] }
+  | { kind: "recover"; recoveries: RecoveryInput[] }
   | { kind: "wait"; delayMs: number; reason: string }
-  | { kind: "request_input"; question: string; reason: string }
+  | {
+      kind: "request_input";
+      question: string;
+      reason: string;
+      target?: {
+        predecessorJobId: Id<"jobs">;
+        predecessorReceiptDigest: string;
+      };
+    }
   | { kind: "replan"; reason: string }
   | { kind: "synthesize"; summary: string }
   | { kind: "fail"; reason: string };
@@ -421,6 +496,71 @@ function normalizeDelegatedWorkstreams(
   return normalized;
 }
 
+function normalizeRecoveries(
+  recoveries: readonly RecoveryInput[],
+): RecoveryInput[] {
+  if (recoveries.length < 1 || recoveries.length > 4) {
+    throw new Error("recover.recoveries must contain between 1 and 4 items");
+  }
+  const normalized = recoveries.map((recovery, index): RecoveryInput => {
+    const predecessorReceiptDigest = requireSha256Digest(
+      recovery.predecessorReceiptDigest,
+      `decision.recoveries[${index}].predecessorReceiptDigest`,
+    );
+    if (recovery.mode === "retry") {
+      return {
+        mode: "retry",
+        predecessorJobId: recovery.predecessorJobId,
+        predecessorReceiptDigest,
+      };
+    }
+    const acceptanceCriteria = boundedCriteria(
+      recovery.acceptanceCriteria,
+      `decision.recoveries[${index}].acceptanceCriteria`,
+      8,
+    );
+    if (acceptanceCriteria.length === 0) {
+      throw new Error(
+        `decision.recoveries[${index}].acceptanceCriteria must contain at least 1 item`,
+      );
+    }
+    return {
+      mode: recovery.mode,
+      predecessorJobId: recovery.predecessorJobId,
+      predecessorReceiptDigest,
+      task: boundedText(
+        recovery.task,
+        `decision.recoveries[${index}].task`,
+        12,
+        4_000,
+      ),
+      label: boundedText(
+        recovery.label,
+        `decision.recoveries[${index}].label`,
+        3,
+        80,
+      ),
+      model: recovery.model,
+      agentId: recovery.agentId,
+      risk: recovery.risk,
+      acceptanceCriteria,
+    };
+  });
+  const predecessorIds = normalized.map((recovery) =>
+    String(recovery.predecessorJobId)
+  );
+  if (new Set(predecessorIds).size !== predecessorIds.length) {
+    throw new Error("recover.recoveries contains duplicate predecessors");
+  }
+  const hasRetry = normalized.some((recovery) => recovery.mode === "retry");
+  if (hasRetry && normalized.some((recovery) => recovery.mode !== "retry")) {
+    throw new Error(
+      "recover.recoveries cannot mix policy retries with model revisions",
+    );
+  }
+  return normalized;
+}
+
 function normalizeSupervisorDecision(
   decision: SupervisorDecisionInput,
 ): SupervisorDecisionInput {
@@ -429,6 +569,11 @@ function normalizeSupervisorDecision(
       return {
         kind: "delegate",
         workstreams: normalizeDelegatedWorkstreams(decision.workstreams),
+      };
+    case "recover":
+      return {
+        kind: "recover",
+        recoveries: normalizeRecoveries(decision.recoveries),
       };
     case "wait":
       return {
@@ -462,6 +607,15 @@ function normalizeSupervisorDecision(
           1,
           500,
         ),
+        target: decision.target
+          ? {
+            predecessorJobId: decision.target.predecessorJobId,
+            predecessorReceiptDigest: requireSha256Digest(
+              decision.target.predecessorReceiptDigest,
+              "decision.target.predecessorReceiptDigest",
+            ),
+          }
+          : undefined,
       };
     case "replan":
       return {
@@ -520,8 +674,12 @@ function normalizeCommitMetadata(
       160,
     ),
   };
-  const policyKind = ["wait", "replan"].includes(decision.kind);
-  const modelKind = ["delegate", "synthesize"].includes(decision.kind);
+  const policyKind = ["wait", "replan"].includes(decision.kind)
+    || (decision.kind === "recover"
+      && decision.recoveries.every((recovery) => recovery.mode === "retry"));
+  const modelKind = ["delegate", "synthesize"].includes(decision.kind)
+    || (decision.kind === "recover"
+      && decision.recoveries.every((recovery) => recovery.mode !== "retry"));
   if (
     metadata.decisionOrigin === "model"
       ? metadata.modelProvider !== "codex-subscription"
@@ -756,7 +914,7 @@ async function terminalAuthorityAndReceipt(
   ctx: Pick<MutationCtx, "db">,
   job: Doc<"jobs">,
 ): Promise<{ authorityDigest: string | null; receipt: JsonValue }> {
-  if (job.status !== "done") {
+  if (!TERMINAL_JOB_STATUSES.has(job.status)) {
     return { authorityDigest: null, receipt: null };
   }
   const attempt = Number(job.attempt ?? 1);
@@ -784,12 +942,22 @@ async function terminalAuthorityAndReceipt(
     receipt: {
       jobId: String(receipt.jobId),
       attempt: receipt.attempt,
+      protocolVersion: receipt.protocolVersion ?? null,
+      receiptDigest: receipt.receiptDigest ?? null,
+      terminalCode: receipt.terminalCode ?? null,
+      recoveryDisposition: receipt.recoveryDisposition ?? null,
+      observedInputRevision: receipt.observedInputRevision ?? null,
       status: receipt.status,
       verification: receipt.verification,
       authorityDigest: receipt.authorityDigest ?? null,
       schedulingBindingDigest: receipt.schedulingBindingDigest ?? null,
+      workOrderRevisionId: receipt.workOrderRevisionId
+        ? String(receipt.workOrderRevisionId)
+        : null,
       workOrderRevision: receipt.workOrderRevision ?? null,
       workOrderRevisionDigest: receipt.workOrderRevisionDigest ?? null,
+      canonicalProjectId: receipt.canonicalProjectId ?? null,
+      repository: receipt.repository ?? null,
       resultDigest: receipt.resultDigest ?? null,
       evidenceDigest: receipt.evidenceDigest ?? null,
       acceptanceEvidence: boundedSnapshotList(receipt.acceptanceEvidence),
@@ -868,6 +1036,81 @@ async function snapshotJob(
   };
 }
 
+async function pendingInputAuthority(
+  ctx: Pick<MutationCtx, "db">,
+  mission: Mission,
+  state: MissionSupervisorState,
+  jobs: Doc<"jobs">[],
+  supersessions: Doc<"missionSupervisorSupersessions">[],
+): Promise<JsonValue> {
+  if (typeof state.lastDecisionKey !== "string") return null;
+  const decisions = await ctx.db
+    .query("missionSupervisorDecisions")
+    .withIndex("by_key", (q) => q.eq("decisionKey", state.lastDecisionKey!))
+    .take(2);
+  const decision = decisions.length === 1 ? decisions[0] : null;
+  if (
+    !decision
+    || decision.kind !== "request_input"
+    || !decision.inputTargetJobId
+    || !decision.inputTargetReceiptDigest
+  ) return null;
+  const target = jobs.find((job) =>
+    String(job._id) === String(decision.inputTargetJobId)
+  );
+  if (
+    !target
+    || supersessions.some((edge) =>
+      String(edge.predecessorJobId) === String(target._id)
+    )
+  ) return null;
+  const terminal = await exactTerminalWorkReceipt(ctx, target);
+  if (
+    !terminal
+    || terminal.receipt.receiptDigest !== decision.inputTargetReceiptDigest
+  ) return null;
+  const controls = await ctx.db
+    .query("missionSupervisorControls")
+    .withIndex("by_mission_created", (q) => q.eq("missionId", mission._id))
+    .order("desc")
+    .take(8);
+  const steerDigest = typeof mission.steer === "string"
+    ? await sha256Hex(mission.steer)
+    : null;
+  const control = controls.find((receipt) =>
+    receipt.action === "provide_input"
+    && receipt.applied
+    && !receipt.noop
+    && receipt.scope === `terminal_leaf_recovery_input:${String(target._id)}`
+    && receipt.expectedInputRevision === decision.observedInputRevision
+    && receipt.resultInputRevision === state.inputRevision
+    && state.inputRevision === decision.observedInputRevision + 1
+    && typeof receipt.inputDigest === "string"
+    && receipt.inputDigest === steerDigest
+  );
+  return {
+    requestDecisionKey: decision.decisionKey,
+    requestObservedInputRevision: decision.observedInputRevision,
+    predecessorJobId: String(target._id),
+    predecessorAttempt: terminal.receipt.attempt,
+    predecessorReceiptId: String(terminal.receipt._id),
+    predecessorReceiptDigest: terminal.receipt.receiptDigest,
+    terminalCode: terminal.receipt.terminalCode ?? null,
+    recoveryDisposition: terminal.receipt.recoveryDisposition ?? null,
+    controlReceiptId: control ? String(control._id) : null,
+    controlRequestDigest: control?.requestDigest ?? null,
+    controlExpectedInputRevision: control?.expectedInputRevision ?? null,
+    controlInputDigest: control?.inputDigest ?? null,
+    controlResultInputRevision: control?.resultInputRevision ?? null,
+    steerDigest,
+    steerDigestMatchesControl: Boolean(
+      control?.inputDigest
+      && steerDigest
+      && control.inputDigest === steerDigest,
+    ),
+  };
+}
+
 async function authoritativeSnapshot(
   ctx: Pick<MutationCtx, "db">,
   mission: Mission,
@@ -882,12 +1125,34 @@ async function authoritativeSnapshot(
     typeof mission.failureReason === "string" ? mission.failureReason : undefined;
   const orderedJobs = [...jobs]
     .sort((left, right) => String(left._id).localeCompare(String(right._id)));
-  const terminalBindings = await Promise.all(
-    orderedJobs.map((job) => terminalAuthorityAndReceipt(ctx, job)),
-  );
+  const [terminalBindings, supersessionRows] = await Promise.all([
+    Promise.all(
+      orderedJobs.map((job) => terminalAuthorityAndReceipt(ctx, job)),
+    ),
+    ctx.db
+      .query("missionSupervisorSupersessions")
+      .withIndex("by_mission_created", (q) =>
+        q.eq("missionId", mission._id)
+      )
+      .take(MISSION_SUPERVISOR_MAX_JOBS + 1),
+  ]);
+  if (supersessionRows.length > MISSION_SUPERVISOR_MAX_JOBS - 1) {
+    throw new Error("supervisor_supersession_ledger_too_large");
+  }
   const jobSnapshots = await Promise.all(
     orderedJobs.map((job, index) => snapshotJob(job, terminalBindings[index])),
   );
+  const pendingInput =
+    state.inputRevision > state.handledInputRevision
+      && typeof mission.steer === "string"
+    ? await pendingInputAuthority(
+      ctx,
+      mission,
+      state,
+      orderedJobs,
+      supersessionRows,
+    )
+    : null;
   const snapshot: JsonValue = {
     protocolVersion: 1,
     mission: {
@@ -927,6 +1192,42 @@ async function authoritativeSnapshot(
       lastDecisionDigest: state.lastDecisionDigest ?? null,
     },
     jobs: jobSnapshots,
+    pendingInputAuthority: pendingInput,
+    supersessions: supersessionRows
+      .sort((left, right) =>
+        left.createdAt - right.createdAt
+        || String(left._id).localeCompare(String(right._id))
+      )
+      .map((row) => ({
+        supersessionId: String(row._id),
+        supersessionKey: row.supersessionKey,
+        supersessionDigest: row.supersessionDigest,
+        decisionKey: row.decisionKey,
+        decisionOrdinal: row.decisionOrdinal,
+        mode: row.mode,
+        rootJobId: String(row.rootJobId),
+        generation: row.generation,
+        autonomousRecoveryCount: row.autonomousRecoveryCount,
+        predecessorJobId: String(row.predecessorJobId),
+        predecessorAttempt: row.predecessorAttempt,
+        predecessorReceiptDigest: row.predecessorReceiptDigest,
+        successorJobId: String(row.successorJobId),
+        successorSchedulingBindingDigest:
+          row.successorSchedulingBindingDigest,
+        successorWorkOrderRevisionId:
+          String(row.successorWorkOrderRevisionId),
+        successorWorkOrderRevisionDigest:
+          row.successorWorkOrderRevisionDigest,
+        successorCanonicalProjectId: row.successorCanonicalProjectId,
+        successorRepository: row.successorRepository ?? null,
+        successorSourceAdmissionDigest: row.successorSourceAdmissionDigest,
+        observedInputRevision: row.observedInputRevision,
+        inputControlReceiptId: row.inputControlReceiptId
+          ? String(row.inputControlReceiptId)
+          : null,
+        inputControlRequestDigest: row.inputControlRequestDigest ?? null,
+        inputControlDigest: row.inputControlDigest ?? null,
+      })),
   };
   const snapshotJson = canonicalJson(snapshot);
   if (utf8Bytes(snapshotJson) > SNAPSHOT_MAX_BYTES) {
@@ -1056,6 +1357,7 @@ type NormalizedControlRequest = {
   action: SupervisorControlAction;
   expectedInputRevision: number;
   input?: string;
+  inputDigest?: string;
 };
 
 type SupervisorControlOutcome = {
@@ -1101,6 +1403,7 @@ async function normalizedControlRequest(args: {
     action: args.action,
     expectedInputRevision: args.expectedInputRevision,
     input,
+    inputDigest: input === undefined ? undefined : await sha256Hex(input),
   };
 }
 
@@ -1139,6 +1442,8 @@ function supervisorControlResult(
     missionId: receipt.missionId,
     action: receipt.action,
     requestDigest: receipt.requestDigest,
+    controlReceiptId: receipt._id,
+    inputDigest: receipt.inputDigest,
     state: receipt.resultState,
     inputRevision: receipt.resultInputRevision,
     wakeTicket: wakeTicketFromControlReceipt(receipt),
@@ -1160,6 +1465,7 @@ async function recordSupervisorControl(
     requestDigest: request.requestDigest,
     action: request.action,
     expectedInputRevision: request.expectedInputRevision,
+    inputDigest: request.inputDigest,
     applied: outcome.applied,
     noop: outcome.noop,
     reason: outcome.reason,
@@ -1441,9 +1747,60 @@ export const controlV1 = mutation({
     if (jobs.length !== state.totalJobs) {
       return await reject("job_ledger_mismatch", { state });
     }
+    let terminalInputTarget: Doc<"jobs"> | undefined;
+    if (request.action === "provide_input" && jobs.length > 0) {
+      const [supersessions, inputDecisions] = await Promise.all([
+        ctx.db
+          .query("missionSupervisorSupersessions")
+          .withIndex("by_mission_created", (q) =>
+            q.eq("missionId", args.missionId)
+          )
+          .take(MISSION_SUPERVISOR_MAX_JOBS + 1),
+        typeof state.lastDecisionKey === "string"
+          ? ctx.db
+            .query("missionSupervisorDecisions")
+            .withIndex("by_key", (q) =>
+              q.eq("decisionKey", state.lastDecisionKey!)
+            )
+            .take(2)
+          : Promise.resolve([]),
+      ]);
+      if (supersessions.length > MISSION_SUPERVISOR_MAX_JOBS - 1) {
+        return await reject("recovery_lineage_too_large", { state });
+      }
+      const superseded = new Set(
+        supersessions.map((edge) => String(edge.predecessorJobId)),
+      );
+      const inputDecision = inputDecisions.length === 1
+        ? inputDecisions[0]
+        : undefined;
+      const candidate = inputDecision?.kind === "request_input"
+        && inputDecision.inputTargetJobId
+        && inputDecision.inputTargetReceiptDigest
+        ? jobs.find((job) =>
+          String(job._id) === String(inputDecision.inputTargetJobId)
+        )
+        : undefined;
+      const terminal = candidate
+        && !superseded.has(String(candidate._id))
+        ? await exactTerminalWorkReceipt(ctx, candidate)
+        : null;
+      if (
+        candidate
+        && terminal
+        && terminal.receipt.receiptDigest
+          === inputDecision?.inputTargetReceiptDigest
+        && ["retryable", "remediable", "needs_input", "operator_stop"].includes(
+          terminal.receipt.recoveryDisposition ?? "",
+        )
+      ) {
+        terminalInputTarget = candidate;
+      }
+    }
     if (
       (request.action === "steer" || request.action === "provide_input")
       && jobs.length > 0
+      && !terminalInputTarget
     ) {
       // Planning input is intentionally limited to the zero-job question
       // phase. Existing terminal/error work needs a real revision primitive;
@@ -1645,7 +2002,9 @@ export const controlV1 = mutation({
       applied: true,
       noop: false,
       reason: "applied",
-      scope: "planning_only_zero_jobs",
+      scope: terminalInputTarget
+        ? `terminal_leaf_recovery_input:${String(terminalInputTarget._id)}`
+        : "planning_only_zero_jobs",
       resultState: "ready",
       resultInputRevision: inputRevision,
       wakeTicket: supervisorWakeTicket(nextState),
@@ -2148,8 +2507,436 @@ function committedDecisionResult(
     resultState: receipt.resultState,
     nextTickAt: receipt.nextTickAt,
     createdJobIds: receipt.createdJobIds,
+    supersessionIds: receipt.supersessionIds ?? [],
     attentionItemId: receipt.attentionItemId,
     chatMessageIds: receipt.chatMessageIds,
+  };
+}
+
+type RecoveryLineageNode = {
+  rootJobId: Id<"jobs">;
+  generation: number;
+  autonomousRecoveryCount: number;
+};
+
+type RecoveryLedger = {
+  nodes: Map<string, RecoveryLineageNode>;
+  incoming: Map<string, Doc<"missionSupervisorSupersessions">>;
+  outgoing: Map<string, Doc<"missionSupervisorSupersessions">>;
+  terminalReceipts: Map<
+    string,
+    Awaited<ReturnType<typeof exactTerminalWorkReceipt>>
+  >;
+  leaves: Doc<"jobs">[];
+};
+
+type RecoveryLedgerResult =
+  | { ok: true; ledger: RecoveryLedger }
+  | { ok: false; reason: string; jobId?: Id<"jobs"> };
+
+function sameStrings(left: unknown, right: readonly string[]): boolean {
+  return Array.isArray(left)
+    && left.length === right.length
+    && left.every((value, index) => value === right[index]);
+}
+
+function modelRank(model: unknown): number {
+  return ["luna", "terra", "sol"].indexOf(String(model));
+}
+
+function riskRank(risk: unknown): number {
+  return ["low", "medium", "high", "consequential"].indexOf(String(risk));
+}
+
+function supersessionDigestPayload(
+  row: Omit<
+    Doc<"missionSupervisorSupersessions">,
+    "_id" | "_creationTime" | "createdAt" | "supersessionDigest"
+  >,
+) {
+  return {
+    protocolVersion: row.protocolVersion,
+    supersessionKey: row.supersessionKey,
+    missionId: String(row.missionId),
+    decisionKey: row.decisionKey,
+    decisionOrdinal: row.decisionOrdinal,
+    mode: row.mode,
+    rootJobId: String(row.rootJobId),
+    generation: row.generation,
+    autonomousRecoveryCount: row.autonomousRecoveryCount,
+    predecessorJobId: String(row.predecessorJobId),
+    predecessorAttempt: row.predecessorAttempt,
+    predecessorReceiptId: String(row.predecessorReceiptId),
+    predecessorReceiptDigest: row.predecessorReceiptDigest,
+    successorJobId: String(row.successorJobId),
+    successorSchedulingBindingDigest: row.successorSchedulingBindingDigest,
+    successorWorkOrderRevisionId: String(row.successorWorkOrderRevisionId),
+    successorWorkOrderRevisionDigest: row.successorWorkOrderRevisionDigest,
+    successorCanonicalProjectId: row.successorCanonicalProjectId,
+    successorRepository: row.successorRepository ?? null,
+    successorSourceAdmissionDigest: row.successorSourceAdmissionDigest,
+    observedInputRevision: row.observedInputRevision,
+    inputControlReceiptId: row.inputControlReceiptId
+      ? String(row.inputControlReceiptId)
+      : null,
+    inputControlRequestDigest: row.inputControlRequestDigest ?? null,
+    inputControlDigest: row.inputControlDigest ?? null,
+  };
+}
+
+export async function supersessionDigest(
+  row: Parameters<typeof supersessionDigestPayload>[0],
+): Promise<string> {
+  return await sha256Hex(canonicalJson(supersessionDigestPayload(row)));
+}
+
+function sourceAdmissionMatchesAuthority(
+  admission: ProjectSourceAdmission,
+  authority: NonNullable<Awaited<ReturnType<typeof readJobSchedulingAuthority>>>,
+): boolean {
+  const binding = authority.binding;
+  return admission.canonicalProjectId === binding.canonicalProjectId
+    && admission.repository === binding.projectRepository
+    && admission.sourceProvider === binding.sourceProvider
+    && admission.sourceBranch === binding.sourceBranch
+    && admission.sourceRef === binding.sourceRef
+    && admission.sourceHeadSha === binding.sourceHeadSha
+    && admission.sourceObservedAt === binding.sourceObservedAt
+    && admission.sourceAdmissionDigest === binding.sourceAdmissionDigest;
+}
+
+async function exactAppliedInputControl(
+  ctx: Pick<MutationCtx, "db">,
+  missionId: Id<"missions">,
+  predecessorJobId: Id<"jobs">,
+  observedInputRevision: number,
+  missionInput: unknown,
+): Promise<Doc<"missionSupervisorControls"> | null> {
+  if (typeof missionInput !== "string" || !missionInput.trim()) return null;
+  const inputDigest = await sha256Hex(missionInput);
+  const controls = await ctx.db
+    .query("missionSupervisorControls")
+    .withIndex("by_mission_created", (q) => q.eq("missionId", missionId))
+    .order("desc")
+    .take(8);
+  const exact = controls.filter((control) =>
+    control.protocolVersion === 1
+    && control.action === "provide_input"
+    && control.applied
+    && !control.noop
+    && control.scope
+      === `terminal_leaf_recovery_input:${String(predecessorJobId)}`
+    && control.expectedInputRevision + 1 === observedInputRevision
+    && control.resultState === "ready"
+    && control.resultInputRevision === observedInputRevision
+    && control.inputDigest === inputDigest
+  );
+  return exact.length === 1 ? exact[0] : null;
+}
+
+async function validateRecoveryLedger(
+  ctx: Pick<MutationCtx, "db">,
+  missionId: Id<"missions">,
+  jobs: Doc<"jobs">[],
+  supersessions: Doc<"missionSupervisorSupersessions">[],
+): Promise<RecoveryLedgerResult> {
+  // Let the structural pass name a one-edge fork/cycle precisely. Anything
+  // denser than one outgoing edge per physical job is impossible even before
+  // lineage validation.
+  if (supersessions.length > jobs.length) {
+    return { ok: false, reason: "recovery_lineage_too_large" };
+  }
+  const jobsById = new Map(jobs.map((job) => [String(job._id), job]));
+  if (jobsById.size !== jobs.length) {
+    return { ok: false, reason: "recovery_job_ledger_ambiguous" };
+  }
+  const incoming = new Map<
+    string,
+    Doc<"missionSupervisorSupersessions">
+  >();
+  const outgoing = new Map<
+    string,
+    Doc<"missionSupervisorSupersessions">
+  >();
+  const keys = new Set<string>();
+  const rootGenerations = new Set<string>();
+
+  for (const job of jobs) {
+    if (
+      job.missionId !== String(missionId)
+      || !Number.isSafeInteger(job.supervisorEpoch)
+      || typeof job.supervisorDecisionKey !== "string"
+      || !Number.isSafeInteger(job.supervisorJobOrdinal)
+    ) {
+      return {
+        ok: false,
+        reason: "recovery_job_provenance_invalid",
+        jobId: job._id,
+      };
+    }
+  }
+
+  for (const edge of supersessions) {
+    const predecessorKey = String(edge.predecessorJobId);
+    const successorKey = String(edge.successorJobId);
+    const predecessor = jobsById.get(predecessorKey);
+    const successor = jobsById.get(successorKey);
+    const rootGeneration = `${String(edge.rootJobId)}:${edge.generation}`;
+    if (
+      edge.protocolVersion !== 1
+      || String(edge.missionId) !== String(missionId)
+      || !predecessor
+      || !successor
+      || predecessorKey === successorKey
+      || !Number.isSafeInteger(edge.decisionOrdinal)
+      || edge.decisionOrdinal < 0
+      || !Number.isSafeInteger(edge.generation)
+      || edge.generation < 1
+      || edge.generation > MISSION_SUPERVISOR_MAX_RECOVERY_GENERATION
+      || !Number.isSafeInteger(edge.autonomousRecoveryCount)
+      || edge.autonomousRecoveryCount < 0
+      || edge.autonomousRecoveryCount
+        > MISSION_SUPERVISOR_MAX_AUTONOMOUS_RECOVERIES
+      || keys.has(edge.supersessionKey)
+      || rootGenerations.has(rootGeneration)
+    ) {
+      return {
+        ok: false,
+        reason: "recovery_lineage_binding_invalid",
+        jobId: predecessor?._id ?? successor?._id,
+      };
+    }
+    if (outgoing.has(predecessorKey)) {
+      return {
+        ok: false,
+        reason: "recovery_lineage_fork",
+        jobId: predecessor._id,
+      };
+    }
+    if (incoming.has(successorKey)) {
+      return {
+        ok: false,
+        reason: "recovery_lineage_merge",
+        jobId: successor._id,
+      };
+    }
+    if (
+      successor.supervisorDecisionKey !== edge.decisionKey
+      || successor.supervisorJobOrdinal !== edge.decisionOrdinal
+      || successor.schedulingBindingDigest
+        !== edge.successorSchedulingBindingDigest
+      || successor.workOrderRevisionId !== edge.successorWorkOrderRevisionId
+      || successor.workOrderRevisionDigest
+        !== edge.successorWorkOrderRevisionDigest
+      || successor.canonicalProjectId !== edge.successorCanonicalProjectId
+      || successor.repo !== edge.successorRepository
+      || successor.sourceAdmissionDigest
+        !== edge.successorSourceAdmissionDigest
+      || edge.supersessionDigest !== await supersessionDigest(edge)
+    ) {
+      return {
+        ok: false,
+        reason: "recovery_successor_binding_mismatch",
+        jobId: successor._id,
+      };
+    }
+    keys.add(edge.supersessionKey);
+    rootGenerations.add(rootGeneration);
+    outgoing.set(predecessorKey, edge);
+    incoming.set(successorKey, edge);
+  }
+
+  const nodes = new Map<string, RecoveryLineageNode>();
+  const visiting = new Set<string>();
+  const resolve = (jobKey: string): RecoveryLineageNode | null => {
+    const resolved = nodes.get(jobKey);
+    if (resolved) return resolved;
+    if (visiting.has(jobKey)) return null;
+    visiting.add(jobKey);
+    const edge = incoming.get(jobKey);
+    let node: RecoveryLineageNode;
+    if (!edge) {
+      const job = jobsById.get(jobKey);
+      if (!job) return null;
+      node = {
+        rootJobId: job._id,
+        generation: 0,
+        autonomousRecoveryCount: 0,
+      };
+    } else {
+      const parent = resolve(String(edge.predecessorJobId));
+      if (!parent) return null;
+      node = {
+        rootJobId: parent.rootJobId,
+        generation: parent.generation + 1,
+        autonomousRecoveryCount:
+          parent.autonomousRecoveryCount
+          + (edge.mode === "input_revision" ? 0 : 1),
+      };
+      if (
+        String(edge.rootJobId) !== String(node.rootJobId)
+        || edge.generation !== node.generation
+        || edge.autonomousRecoveryCount !== node.autonomousRecoveryCount
+      ) {
+        return null;
+      }
+    }
+    visiting.delete(jobKey);
+    nodes.set(jobKey, node);
+    return node;
+  };
+  for (const job of jobs) {
+    if (!resolve(String(job._id))) {
+      return {
+        ok: false,
+        reason: "recovery_lineage_cycle_or_cap_reset",
+        jobId: job._id,
+      };
+    }
+  }
+
+  const decisions = await ctx.db
+    .query("missionSupervisorDecisions")
+    .withIndex("by_mission_epoch_sequence", (q) =>
+      q.eq("missionId", missionId)
+    )
+    .take(MISSION_SUPERVISOR_MAX_DECISIONS + 1);
+  if (decisions.length > MISSION_SUPERVISOR_MAX_DECISIONS) {
+    return { ok: false, reason: "recovery_decision_ledger_too_large" };
+  }
+  const decisionsByKey = new Map<string, Doc<"missionSupervisorDecisions">>();
+  for (const decision of decisions) {
+    if (decisionsByKey.has(decision.decisionKey)) {
+      return { ok: false, reason: "recovery_decision_ledger_ambiguous" };
+    }
+    decisionsByKey.set(decision.decisionKey, decision);
+  }
+  for (const job of jobs) {
+    const decision = decisionsByKey.get(job.supervisorDecisionKey!);
+    const ordinal = Number(job.supervisorJobOrdinal);
+    const edge = incoming.get(String(job._id));
+    if (
+      !decision
+      || decision.epoch !== job.supervisorEpoch
+      || ordinal < 0
+      || ordinal >= decision.createdJobIds.length
+      || String(decision.createdJobIds[ordinal]) !== String(job._id)
+      || (edge ? decision.kind !== "recover" : decision.kind !== "delegate")
+      || (edge && (
+        !decision.supersessionIds
+        || ordinal >= decision.supersessionIds.length
+        || String(decision.supersessionIds[ordinal]) !== String(edge._id)
+      ))
+    ) {
+      return {
+        ok: false,
+        reason: "recovery_creation_provenance_mismatch",
+        jobId: job._id,
+      };
+    }
+  }
+
+  const terminalReceipts = new Map<
+    string,
+    Awaited<ReturnType<typeof exactTerminalWorkReceipt>>
+  >();
+  for (const edge of supersessions) {
+    const predecessor = jobsById.get(String(edge.predecessorJobId))!;
+    const successor = jobsById.get(String(edge.successorJobId))!;
+    const [terminal, predecessorScheduling, successorScheduling, successorOrder] =
+      await Promise.all([
+        exactTerminalWorkReceipt(ctx, predecessor),
+        readJobSchedulingAuthority(ctx, predecessor),
+        readJobSchedulingAuthority(ctx, successor),
+        readJobWorkOrderAuthority(ctx, successor),
+      ]);
+    if (
+      !terminal
+      || !predecessorScheduling
+      || !successorScheduling
+      || !successorOrder
+      || terminal.receipt._id !== edge.predecessorReceiptId
+      || terminal.receipt.receiptDigest !== edge.predecessorReceiptDigest
+      || terminal.receipt.attempt !== edge.predecessorAttempt
+      || predecessorScheduling.binding.canonicalProjectId
+        !== successorScheduling.binding.canonicalProjectId
+      || predecessorScheduling.binding.projectRepository
+        !== successorScheduling.binding.projectRepository
+      || predecessorScheduling.binding.sourceAdmissionDigest
+        !== successorScheduling.binding.sourceAdmissionDigest
+      || successorOrder.digest !== edge.successorWorkOrderRevisionDigest
+      || successorScheduling.digest !== edge.successorSchedulingBindingDigest
+    ) {
+      return {
+        ok: false,
+        reason: "recovery_receipt_or_authority_mismatch",
+        jobId: predecessor._id,
+      };
+    }
+    const disposition = terminal.receipt.recoveryDisposition;
+    const decision = decisionsByKey.get(edge.decisionKey);
+    if (
+      !decision
+      || edge.observedInputRevision !== decision.observedInputRevision
+    ) {
+      return {
+        ok: false,
+        reason: "recovery_input_fence_mismatch",
+        jobId: predecessor._id,
+      };
+    }
+    const inputControl = edge.inputControlReceiptId
+      ? await ctx.db.get(edge.inputControlReceiptId)
+      : null;
+    const inputControlValid = edge.mode === "input_revision"
+      ? Boolean(
+        inputControl
+        && inputControl.missionId === missionId
+        && inputControl.action === "provide_input"
+        && inputControl.applied
+        && !inputControl.noop
+        && inputControl.scope
+          === `terminal_leaf_recovery_input:${String(predecessor._id)}`
+        && inputControl.requestDigest === edge.inputControlRequestDigest
+        && inputControl.inputDigest === edge.inputControlDigest
+        && inputControl.resultInputRevision === edge.observedInputRevision
+        && inputControl.expectedInputRevision + 1
+          === edge.observedInputRevision,
+      )
+      : !edge.inputControlReceiptId
+        && !edge.inputControlRequestDigest
+        && !edge.inputControlDigest;
+    const permitted =
+      (edge.mode === "retry" && disposition === "retryable")
+      || (edge.mode === "remediate"
+        && (disposition === "retryable" || disposition === "remediable"))
+      || (edge.mode === "input_revision"
+        && ["retryable", "remediable", "needs_input", "operator_stop"].includes(
+          disposition ?? "",
+        )
+        && inputControlValid
+        && Number.isSafeInteger(terminal.receipt.observedInputRevision)
+        && edge.observedInputRevision
+          > Number(terminal.receipt.observedInputRevision));
+    if (!permitted) {
+      return {
+        ok: false,
+        reason: "recovery_disposition_mismatch",
+        jobId: predecessor._id,
+      };
+    }
+    terminalReceipts.set(String(predecessor._id), terminal);
+  }
+
+  return {
+    ok: true,
+    ledger: {
+      nodes,
+      incoming,
+      outgoing,
+      terminalReceipts,
+      leaves: jobs.filter((job) => !outgoing.has(String(job._id))),
+    },
   };
 }
 
@@ -2159,13 +2946,31 @@ type SynthesisGate =
 
 async function synthesisEvidence(
   ctx: Pick<MutationCtx, "db">,
+  missionId: Id<"missions">,
   jobs: Doc<"jobs">[],
 ): Promise<SynthesisGate> {
   if (jobs.length === 0) {
     return { ok: false, reason: "synthesis_requires_jobs" };
   }
+  const supersessions = await ctx.db
+    .query("missionSupervisorSupersessions")
+    .withIndex("by_mission_created", (q) => q.eq("missionId", missionId))
+    .take(MISSION_SUPERVISOR_MAX_JOBS + 1);
+  if (supersessions.length > MISSION_SUPERVISOR_MAX_JOBS - 1) {
+    return { ok: false, reason: "recovery_lineage_too_large" };
+  }
+  const recovery = await validateRecoveryLedger(
+    ctx,
+    missionId,
+    jobs,
+    supersessions,
+  );
+  if (!recovery.ok) return recovery;
   const evidence: string[] = [];
-  for (const job of jobs) {
+  const leaves = [...recovery.ledger.leaves].sort((left, right) =>
+    String(left._id).localeCompare(String(right._id))
+  );
+  for (const job of leaves) {
     const attempt = Number(job.attempt ?? 1);
     if (
       job.status !== "done"
@@ -2214,6 +3019,9 @@ async function synthesisEvidence(
       || receipt.resultDigest !== resultDigest
       || receipt.evidenceDigest !== evidenceDigest
       || receipt.acceptanceEvidence.length < 1
+      || receipt.protocolVersion !== 2
+      || typeof receipt.receiptDigest !== "string"
+      || receipt.receiptDigest !== await terminalWorkReceiptDigest(receipt)
     ) {
       return {
         ok: false,
@@ -2232,6 +3040,28 @@ async function synthesisEvidence(
         500,
       ),
     );
+  }
+  const recoveries = [...supersessions].sort((left, right) =>
+    String(left.rootJobId).localeCompare(String(right.rootJobId))
+    || left.generation - right.generation
+  );
+  for (const edge of recoveries) {
+    const predecessor = jobs.find((job) =>
+      String(job._id) === String(edge.predecessorJobId)
+    );
+    const successor = jobs.find((job) =>
+      String(job._id) === String(edge.successorJobId)
+    );
+    if (!predecessor || !successor) {
+      return { ok: false, reason: "recovery_lineage_binding_invalid" };
+    }
+    evidence.push(truncateUtf8(
+      `${truncateUtf8(predecessor.label ?? predecessor.task, 70)} · `
+        + `${edge.mode} recovery g${edge.generation} · terminal `
+        + `${edge.predecessorReceiptDigest.slice(0, 16)} · successor `
+        + `${String(successor._id).slice(-12)}`,
+      500,
+    ));
   }
   return { ok: true, evidence };
 }
@@ -2394,8 +3224,11 @@ export const commitV1 = mutation({
     }
 
     const createdJobIds: Id<"jobs">[] = [];
+    const supersessionIds: Id<"missionSupervisorSupersessions">[] = [];
     const chatMessageIds: Id<"chatMessages">[] = [];
     let attentionItemId: Id<"attentionItems"> | undefined;
+    let inputTargetJobId: Id<"jobs"> | undefined;
+    let inputTargetReceiptDigest: string | undefined;
     let nextTickAt: number | undefined;
     let resultState:
       | "ready"
@@ -2546,11 +3379,493 @@ export const commitV1 = mutation({
         phase: "executing",
         updatedAt: now,
       };
+    } else if (envelope.decision.kind === "recover") {
+      const [existingJobs, existingSupersessions] = await Promise.all([
+        ctx.db
+          .query("jobs")
+          .withIndex("by_mission", (q) =>
+            q.eq("missionId", String(args.missionId))
+          )
+          .take(MISSION_SUPERVISOR_MAX_JOBS + 1),
+        ctx.db
+          .query("missionSupervisorSupersessions")
+          .withIndex("by_mission_created", (q) =>
+            q.eq("missionId", args.missionId)
+          )
+          .take(MISSION_SUPERVISOR_MAX_JOBS + 1),
+      ]);
+      if (
+        existingJobs.length > MISSION_SUPERVISOR_MAX_JOBS
+        || existingJobs.length !== state.totalJobs
+      ) {
+        return {
+          committed: false as const,
+          replayed: false,
+          reason: "job_ledger_mismatch",
+        };
+      }
+      if (
+        existingJobs.length + envelope.decision.recoveries.length
+          > Math.min(MISSION_SUPERVISOR_MAX_JOBS, state.maxJobs)
+      ) {
+        return {
+          committed: false as const,
+          replayed: false,
+          reason: "job_limit_reached",
+        };
+      }
+      if (existingSupersessions.length > MISSION_SUPERVISOR_MAX_JOBS - 1) {
+        return {
+          committed: false as const,
+          replayed: false,
+          reason: "recovery_lineage_too_large",
+        };
+      }
+      const lineage = await validateRecoveryLedger(
+        ctx,
+        args.missionId,
+        existingJobs,
+        existingSupersessions,
+      );
+      if (!lineage.ok) {
+        return {
+          committed: false as const,
+          replayed: false,
+          reason: lineage.reason,
+          jobId: lineage.jobId,
+        };
+      }
+      const admissions = mission.projectAdmissions ?? [];
+      if (!await validProjectAdmissions(admissions)) {
+        throw new Error("Supervisor mission project admission ledger is invalid");
+      }
+
+      for (
+        let ordinal = 0;
+        ordinal < envelope.decision.recoveries.length;
+        ordinal += 1
+      ) {
+        const recovery = envelope.decision.recoveries[ordinal];
+        const predecessor = existingJobs.find((job) =>
+          String(job._id) === String(recovery.predecessorJobId)
+        );
+        if (!predecessor) {
+          throw new Error(
+            `decision.recoveries[${ordinal}] is outside the mission job ledger`,
+          );
+        }
+        if (lineage.ledger.outgoing.has(String(predecessor._id))) {
+          return {
+            committed: false as const,
+            replayed: false,
+            reason: "recovery_predecessor_not_leaf",
+            jobId: predecessor._id,
+          };
+        }
+        const node = lineage.ledger.nodes.get(String(predecessor._id));
+        const terminal = await exactTerminalWorkReceipt(ctx, predecessor);
+        const [scheduling, workOrder] = await Promise.all([
+          readJobSchedulingAuthority(ctx, predecessor),
+          readJobWorkOrderAuthority(ctx, predecessor),
+        ]);
+        if (
+          !node
+          || !terminal
+          || !scheduling
+          || !workOrder
+          || terminal.receipt.receiptDigest
+            !== recovery.predecessorReceiptDigest
+        ) {
+          return {
+            committed: false as const,
+            replayed: false,
+            reason: "recovery_receipt_or_authority_mismatch",
+            jobId: predecessor._id,
+          };
+        }
+        const disposition = terminal.receipt.recoveryDisposition;
+        if (
+          (recovery.mode === "retry" && disposition !== "retryable")
+          || (recovery.mode === "remediate"
+            && disposition !== "retryable"
+            && disposition !== "remediable")
+          || (recovery.mode === "input_revision"
+            && !["retryable", "remediable", "needs_input", "operator_stop"]
+              .includes(disposition ?? ""))
+        ) {
+          return {
+            committed: false as const,
+            replayed: false,
+            reason: "recovery_disposition_mismatch",
+            jobId: predecessor._id,
+          };
+        }
+        const generation = node.generation + 1;
+        const autonomousRecoveryCount =
+          node.autonomousRecoveryCount
+          + (recovery.mode === "input_revision" ? 0 : 1);
+        if (generation > MISSION_SUPERVISOR_MAX_RECOVERY_GENERATION) {
+          return {
+            committed: false as const,
+            replayed: false,
+            reason: "recovery_generation_limit_reached",
+            jobId: predecessor._id,
+          };
+        }
+        if (
+          autonomousRecoveryCount
+            > MISSION_SUPERVISOR_MAX_AUTONOMOUS_RECOVERIES
+        ) {
+          return {
+            committed: false as const,
+            replayed: false,
+            reason: "autonomous_recovery_limit_reached",
+            jobId: predecessor._id,
+          };
+        }
+        const projectAdmission = admissionForRepository(
+          admissions,
+          predecessor.repo,
+        );
+        if (
+          !projectAdmission
+          || !sourceAdmissionMatchesAuthority(projectAdmission, scheduling)
+        ) {
+          return {
+            committed: false as const,
+            replayed: false,
+            reason: "recovery_project_authority_mismatch",
+            jobId: predecessor._id,
+          };
+        }
+        const predecessorOrder = workOrder.binding;
+        const revised = recovery.mode === "retry" ? null : recovery;
+        if (
+          revised
+          && (
+            modelRank(revised.model) < modelRank(predecessorOrder.minimumModel)
+            || riskRank(revised.risk) < riskRank(predecessorOrder.risk)
+            || predecessorOrder.acceptanceCriteria.some((criterion) =>
+              !revised.acceptanceCriteria.includes(criterion)
+            )
+          )
+        ) {
+          return {
+            committed: false as const,
+            replayed: false,
+            reason: "recovery_authority_downgrade",
+            jobId: predecessor._id,
+          };
+        }
+        const inputControl = recovery.mode === "input_revision"
+          ? await exactAppliedInputControl(
+            ctx,
+            args.missionId,
+            predecessor._id,
+            args.expectedInputRevision,
+            mission.steer,
+          )
+          : null;
+        if (recovery.mode === "input_revision" && !inputControl) {
+          return {
+            committed: false as const,
+            replayed: false,
+            reason: "recovery_input_control_missing_or_ambiguous",
+            jobId: predecessor._id,
+          };
+        }
+        const task = revised?.task ?? predecessorOrder.executableTask;
+        const label = revised?.label
+          ?? predecessor.label
+          ?? truncateUtf8(predecessorOrder.executableTask, 80);
+        const model = revised?.model ?? predecessorOrder.minimumModel;
+        const agentId = revised?.agentId ?? predecessorOrder.agentId;
+        const risk = revised?.risk as WorkRisk | undefined
+          ?? predecessorOrder.risk as WorkRisk;
+        const acceptanceCriteria = revised?.acceptanceCriteria
+          ?? [...predecessorOrder.acceptanceCriteria];
+        const approval = workApprovalPolicy({
+          task,
+          repo: predecessorOrder.repository,
+          readonly: predecessorOrder.readonly,
+          risk,
+          // Every consequential successor receives a fresh approval; an
+          // approval on the predecessor never transfers across job identity.
+          approvalRequired: predecessorOrder.approvalRequired,
+        });
+        const approvalRequired = approval.required;
+        const successorId = await insertJobWithRuntime(ctx, {
+          admissionProtocolVersion: 2,
+          projectAdmission,
+          requireFreshSourceAdmission: false,
+          missionId: String(args.missionId),
+          supervisorEpoch: args.expectedEpoch,
+          supervisorDecisionKey: envelope.decisionKey,
+          supervisorJobOrdinal: ordinal,
+          task,
+          policyTask: recovery.mode === "retry"
+            ? predecessorOrder.policyTask
+            : task,
+          label,
+          repo: predecessorOrder.repository,
+          model,
+          reasoningEffort: predecessorOrder.minimumReasoningEffort,
+          mcp: [...predecessorOrder.mcpScope],
+          agentId,
+          readonly: predecessorOrder.readonly,
+          approvalRequired,
+          approvalReason: approval.reason,
+          approvalStatus: approvalRequired ? "pending" : undefined,
+          deliveryMode: approval.deliveryMode,
+          risk: approvalRequired ? "consequential" : risk,
+          priority: predecessor.priority ?? mission.priority ?? 50,
+          acceptanceCriteria,
+          dependsOn: [],
+          dispatchReady: true,
+          originThreadId: mission.originThreadId ?? "main",
+          visibility: "conversation",
+          status: approvalRequired ? "awaiting_approval" : "pending",
+          stage: approvalRequired ? "approval" : "queued",
+          percent: 0,
+          progressAt: now,
+          stallCount: 0,
+          steerRevision: 0,
+          attempt: 1,
+          maxAttempts: 4,
+          nextRunAt: approvalRequired ? undefined : now,
+          createdAt: now,
+        });
+        const successor = await ctx.db.get(successorId);
+        if (!successor) {
+          throw new Error("Recovery successor was not persisted");
+        }
+        const [successorScheduling, successorOrder] = await Promise.all([
+          readJobSchedulingAuthority(ctx, successor),
+          readJobWorkOrderAuthority(ctx, successor),
+        ]);
+        if (
+          !successorScheduling
+          || !successorOrder
+          || !sourceAdmissionMatchesAuthority(
+            projectAdmission,
+            successorScheduling,
+          )
+        ) {
+          throw new Error("Recovery successor authority was not admitted");
+        }
+        if (recovery.mode === "retry") {
+          const clone = successorOrder.binding;
+          if (
+            clone.executableTask !== predecessorOrder.executableTask
+            || clone.policyTask !== predecessorOrder.policyTask
+            || !sameStrings(
+              clone.acceptanceCriteria,
+              predecessorOrder.acceptanceCriteria,
+            )
+            || clone.readonly !== predecessorOrder.readonly
+            || !sameStrings(clone.toolScope, predecessorOrder.toolScope)
+            || !sameStrings(clone.mcpScope, predecessorOrder.mcpScope)
+            || clone.deliveryPolicy !== predecessorOrder.deliveryPolicy
+            || clone.risk !== predecessorOrder.risk
+            || clone.approvalRequired !== predecessorOrder.approvalRequired
+            || clone.approvalReason !== predecessorOrder.approvalReason
+            || clone.agentId !== predecessorOrder.agentId
+            || clone.minimumModel !== predecessorOrder.minimumModel
+            || clone.minimumReasoningEffort
+              !== predecessorOrder.minimumReasoningEffort
+          ) {
+            throw new Error("Policy retry did not clone immutable work authority");
+          }
+        }
+        const supersessionKey = await sha256Hex(canonicalJson({
+          protocolVersion: 1,
+          missionId: String(args.missionId),
+          decisionKey: envelope.decisionKey,
+          decisionOrdinal: ordinal,
+          predecessorJobId: String(predecessor._id),
+          predecessorReceiptDigest: recovery.predecessorReceiptDigest,
+        }));
+        const [priorKey, priorPredecessor, priorGeneration] =
+          await Promise.all([
+            ctx.db
+              .query("missionSupervisorSupersessions")
+              .withIndex("by_key", (q) =>
+                q.eq("supersessionKey", supersessionKey)
+              )
+              .take(2),
+            ctx.db
+              .query("missionSupervisorSupersessions")
+              .withIndex("by_predecessor", (q) =>
+                q.eq("predecessorJobId", predecessor._id)
+              )
+              .take(2),
+            ctx.db
+              .query("missionSupervisorSupersessions")
+              .withIndex("by_root_generation", (q) =>
+                q
+                  .eq("rootJobId", node.rootJobId)
+                  .eq("generation", generation)
+              )
+              .take(2),
+          ]);
+        if (
+          priorKey.length
+          || priorPredecessor.length
+          || priorGeneration.length
+        ) {
+          throw new Error("Recovery supersession authority conflicts");
+        }
+        const supersession = {
+          protocolVersion: 1 as const,
+          supersessionKey,
+          missionId: args.missionId,
+          decisionKey: envelope.decisionKey,
+          decisionOrdinal: ordinal,
+          mode: recovery.mode,
+          rootJobId: node.rootJobId,
+          generation,
+          autonomousRecoveryCount,
+          predecessorJobId: predecessor._id,
+          predecessorAttempt: terminal.receipt.attempt,
+          predecessorReceiptId: terminal.receipt._id,
+          predecessorReceiptDigest: recovery.predecessorReceiptDigest,
+          successorJobId: successorId,
+          successorSchedulingBindingDigest: successorScheduling.digest,
+          successorWorkOrderRevisionId: successorOrder.row._id,
+          successorWorkOrderRevisionDigest: successorOrder.digest,
+          successorCanonicalProjectId:
+            successorScheduling.binding.canonicalProjectId,
+          successorRepository:
+            successorScheduling.binding.projectRepository,
+          successorSourceAdmissionDigest:
+            successorScheduling.binding.sourceAdmissionDigest,
+          observedInputRevision: args.expectedInputRevision,
+          inputControlReceiptId: inputControl?._id,
+          inputControlRequestDigest: inputControl?.requestDigest,
+          inputControlDigest: inputControl?.inputDigest,
+        };
+        const supersessionId = await ctx.db.insert(
+          "missionSupervisorSupersessions",
+          {
+            ...supersession,
+            supersessionDigest: await supersessionDigest(supersession),
+            createdAt: now,
+          },
+        );
+        createdJobIds.push(successorId);
+        supersessionIds.push(supersessionId);
+        if (approvalRequired) {
+          await ctx.db.insert("approvals", {
+            jobId: String(successorId),
+            kind: "consequential-work-recovery",
+            summary: label.slice(0, 240),
+            risk: "consequential",
+            payload: {
+              repo: predecessorOrder.repository,
+              agentId,
+              reason: approval.reason,
+              predecessorJobId: String(predecessor._id),
+            },
+            status: "pending",
+            requestedAt: now,
+          });
+        }
+      }
+      totalJobs = existingJobs.length + createdJobIds.length;
+      nextTickAt = now + SUPERVISOR_DELEGATE_RECHECK_MS;
+      resultState = "waiting";
+      missionPatch = {
+        agentCount: totalJobs,
+        phase: "executing",
+        failureReason: undefined,
+        updatedAt: now,
+      };
     } else if (envelope.decision.kind === "wait") {
       nextTickAt = now + envelope.decision.delayMs;
       resultState = "waiting";
       missionPatch = { phase: "supervising", updatedAt: now };
     } else if (envelope.decision.kind === "request_input") {
+      const [jobs, supersessions] = await Promise.all([
+        ctx.db
+          .query("jobs")
+          .withIndex("by_mission", (q) =>
+            q.eq("missionId", String(args.missionId))
+          )
+          .take(MISSION_SUPERVISOR_MAX_JOBS + 1),
+        ctx.db
+          .query("missionSupervisorSupersessions")
+          .withIndex("by_mission_created", (q) =>
+            q.eq("missionId", args.missionId)
+          )
+          .take(MISSION_SUPERVISOR_MAX_JOBS + 1),
+      ]);
+      if (
+        jobs.length > MISSION_SUPERVISOR_MAX_JOBS
+        || jobs.length !== state.totalJobs
+      ) {
+        return {
+          committed: false as const,
+          replayed: false,
+          reason: "job_ledger_mismatch",
+        };
+      }
+      if (jobs.length > 0 && !envelope.decision.target) {
+        return {
+          committed: false as const,
+          replayed: false,
+          reason: "request_input_target_required",
+        };
+      }
+      if (jobs.length === 0 && envelope.decision.target) {
+        return {
+          committed: false as const,
+          replayed: false,
+          reason: "request_input_target_not_allowed",
+        };
+      }
+      if (envelope.decision.target) {
+        const decisionTarget = envelope.decision.target;
+        const lineage = await validateRecoveryLedger(
+          ctx,
+          args.missionId,
+          jobs,
+          supersessions,
+        );
+        if (!lineage.ok) {
+          return {
+            committed: false as const,
+            replayed: false,
+            reason: lineage.reason,
+            jobId: lineage.jobId,
+          };
+        }
+        const target = jobs.find((job) =>
+          String(job._id)
+            === String(decisionTarget.predecessorJobId)
+        );
+        const terminal = target
+          ? await exactTerminalWorkReceipt(ctx, target)
+          : null;
+        if (
+          !target
+          || lineage.ledger.outgoing.has(String(target._id))
+          || !terminal
+          || terminal.receipt.receiptDigest
+            !== decisionTarget.predecessorReceiptDigest
+          || !["retryable", "remediable", "needs_input", "operator_stop"].includes(
+            terminal.receipt.recoveryDisposition ?? "",
+          )
+        ) {
+          return {
+            committed: false as const,
+            replayed: false,
+            reason: "request_input_target_invalid",
+            jobId: target?._id,
+          };
+        }
+        inputTargetJobId = target._id;
+        inputTargetReceiptDigest = terminal.receipt.receiptDigest;
+      }
       attentionItemId = await upsertSupervisorAttention(
         ctx,
         mission,
@@ -2600,7 +3915,7 @@ export const commitV1 = mutation({
           reason: "job_ledger_mismatch",
         };
       }
-      const gate = await synthesisEvidence(ctx, jobs);
+      const gate = await synthesisEvidence(ctx, args.missionId, jobs);
       if (!gate.ok) {
         return {
           committed: false as const,
@@ -2689,6 +4004,9 @@ export const commitV1 = mutation({
       triggerRunId: envelope.metadata.triggerRunId,
       deploymentVersion: envelope.metadata.deploymentVersion,
       createdJobIds,
+      supersessionIds,
+      inputTargetJobId,
+      inputTargetReceiptDigest,
       attentionItemId,
       chatMessageIds,
       resultState,

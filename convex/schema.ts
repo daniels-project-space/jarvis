@@ -24,6 +24,7 @@ const missionSupervisorStateValidator = v.union(
 
 const missionSupervisorDecisionKindValidator = v.union(
   v.literal("delegate"),
+  v.literal("recover"),
   v.literal("wait"),
   v.literal("request_input"),
   v.literal("replan"),
@@ -912,6 +913,9 @@ export default defineSchema({
     triggerRunId: v.string(),
     deploymentVersion: v.optional(v.string()),
     createdJobIds: v.array(v.id("jobs")),
+    supersessionIds: v.optional(v.array(v.id("missionSupervisorSupersessions"))),
+    inputTargetJobId: v.optional(v.id("jobs")),
+    inputTargetReceiptDigest: v.optional(v.string()),
     attentionItemId: v.optional(v.id("attentionItems")),
     chatMessageIds: v.array(v.id("chatMessages")),
     resultState: v.string(),
@@ -931,6 +935,7 @@ export default defineSchema({
     requestDigest: v.string(),
     action: missionSupervisorControlActionValidator,
     expectedInputRevision: v.number(),
+    inputDigest: v.optional(v.string()),
     applied: v.boolean(),
     noop: v.boolean(),
     reason: v.string(),
@@ -946,6 +951,48 @@ export default defineSchema({
   })
     .index("by_key", ["requestKey"])
     .index("by_mission_created", ["missionId", "createdAt"]),
+
+  // Append-only recovery lineage. A terminal supervisor job is never revived
+  // in place: one exact receipt-bound leaf may point to exactly one freshly
+  // admitted successor, with generation and autonomous-recovery counts derived
+  // from the preceding ledger rather than supplied by a caller.
+  missionSupervisorSupersessions: defineTable({
+    protocolVersion: v.literal(1),
+    supersessionKey: v.string(),
+    supersessionDigest: v.string(),
+    missionId: v.id("missions"),
+    decisionKey: v.string(),
+    decisionOrdinal: v.number(),
+    mode: v.union(
+      v.literal("retry"),
+      v.literal("remediate"),
+      v.literal("input_revision"),
+    ),
+    rootJobId: v.id("jobs"),
+    generation: v.number(),
+    autonomousRecoveryCount: v.number(),
+    predecessorJobId: v.id("jobs"),
+    predecessorAttempt: v.number(),
+    predecessorReceiptId: v.id("workReceipts"),
+    predecessorReceiptDigest: v.string(),
+    successorJobId: v.id("jobs"),
+    successorSchedulingBindingDigest: v.string(),
+    successorWorkOrderRevisionId: v.id("workOrderRevisions"),
+    successorWorkOrderRevisionDigest: v.string(),
+    successorCanonicalProjectId: v.string(),
+    successorRepository: v.optional(v.string()),
+    successorSourceAdmissionDigest: v.string(),
+    observedInputRevision: v.number(),
+    inputControlReceiptId: v.optional(v.id("missionSupervisorControls")),
+    inputControlRequestDigest: v.optional(v.string()),
+    inputControlDigest: v.optional(v.string()),
+    createdAt: v.number(),
+  })
+    .index("by_key", ["supersessionKey"])
+    .index("by_mission_created", ["missionId", "createdAt"])
+    .index("by_predecessor", ["predecessorJobId"])
+    .index("by_successor", ["successorJobId"])
+    .index("by_root_generation", ["rootJobId", "generation"]),
 
   // Resumable cursors make the legacy backfill and policy repairs one-time,
   // bounded work. Once both cursors finish, minute maintenance reads this one
@@ -1493,8 +1540,19 @@ export default defineSchema({
   // never patched. They bind acceptance evidence and artifacts to one exact
   // attempt, closing the replay/substitution gap at completion.
   workReceipts: defineTable({
+    protocolVersion: v.optional(v.literal(2)),
     jobId: v.id("jobs"),
     attempt: v.number(),
+    receiptDigest: v.optional(v.string()),
+    terminalCode: v.optional(v.string()),
+    recoveryDisposition: v.optional(v.union(
+      v.literal("none"),
+      v.literal("retryable"),
+      v.literal("remediable"),
+      v.literal("needs_input"),
+      v.literal("operator_stop"),
+    )),
+    observedInputRevision: v.optional(v.number()),
     authorityDigest: v.optional(v.string()),
     schedulingBindingDigest: v.optional(v.string()),
     workOrderRevisionId: v.optional(v.id("workOrderRevisions")),

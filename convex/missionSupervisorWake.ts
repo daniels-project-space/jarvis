@@ -258,7 +258,7 @@ export async function signalMissionSupervisorForJobPatch(
   const decision = decisions[0];
   if (
     decision.protocolVersion !== 1 ||
-    decision.kind !== "delegate" ||
+    !["delegate", "recover"].includes(decision.kind) ||
     String(decision.missionId) !== String(missionId) ||
     decision.epoch !== provenance.epoch ||
     decision.decisionKey !== provenance.decisionKey ||

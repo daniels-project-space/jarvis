@@ -1,7 +1,8 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
-import { patchJobWithRuntime } from "./controlPlane";
+import { ensureWorkAttempt, patchJobWithRuntime } from "./controlPlane";
+import { insertFreshTerminalWorkReceipt } from "./workReceiptAuthority";
 
 async function appendApprovalLifecycle(ctx: any, job: any, type: string, message: string, stage: string, attempt: number) {
   const durable = await ctx.db.get(job._id) ?? job;
@@ -56,11 +57,31 @@ export const decide = mutation({
     const missionId = job.missionId ? ctx.db.normalizeId("missions", job.missionId) : null;
     const mission = missionId ? await ctx.db.get(missionId) : null;
     const heldByGoal = mission?.mode === "goal" && mission.status !== "running";
-    await ctx.db.patch(approval._id, { status: a.decision, resolvedAt: Date.now() });
+    const now = Date.now();
+    const supervisorOwned =
+      typeof job.missionId === "string"
+      && Number.isSafeInteger(job.supervisorEpoch)
+      && typeof job.supervisorDecisionKey === "string"
+      && Number.isSafeInteger(job.supervisorJobOrdinal);
+    if (a.decision === "declined" && supervisorOwned) {
+      const attempt = job.attempt ?? 1;
+      await ensureWorkAttempt(ctx, job, attempt, "awaiting_approval", now);
+      await insertFreshTerminalWorkReceipt(ctx, job, attempt, {
+        status: "cancelled",
+        terminalCode: "approval_declined",
+        recoveryDisposition: "operator_stop",
+        acceptanceEvidence: [],
+        artifacts: [`convex://approvals/${String(approval._id)}`],
+        verification: "cancelled",
+        terminalEventKey: `approval-declined:${attempt}`,
+        result: "Daniel declined the protected recovery.",
+      }, now);
+    }
+    await ctx.db.patch(approval._id, { status: a.decision, resolvedAt: now });
     await patchJobWithRuntime(ctx, job, {
       approvalStatus: a.decision,
       status: a.decision === "approved" ? (heldByGoal ? "paused" : "pending") : "cancelled",
-      completedAt: a.decision === "declined" ? Date.now() : undefined,
+      completedAt: a.decision === "declined" ? now : undefined,
       progress: a.decision === "approved"
         ? heldByGoal ? "approved — held until Goal Mode resumes" : "approved — queued"
         : "declined by Daniel",

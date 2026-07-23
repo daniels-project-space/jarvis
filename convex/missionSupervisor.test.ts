@@ -14,9 +14,14 @@ import {
   readAttemptExecutionAuthority,
 } from "./controlPlane";
 import {
+  insertFreshTerminalWorkReceipt,
+  insertTerminalWorkReceipt,
+} from "./workReceiptAuthority";
+import {
   MISSION_SUPERVISOR_LEASE_MS,
   MISSION_SUPERVISOR_MAX_DUE,
   MISSION_SUPERVISOR_MAX_JOBS,
+  supersessionDigest,
 } from "./missionSupervisor";
 
 declare global {
@@ -39,6 +44,15 @@ const supervisorApi = {
     "missionSupervisor:releaseFailureV1",
   ),
   commitV1: makeFunctionReference<"mutation">("missionSupervisor:commitV1"),
+};
+const jobsApi = {
+  requestInput: makeFunctionReference<"mutation">("jobs:requestInput"),
+  provideInput: makeFunctionReference<"mutation">("jobs:provideInput"),
+  control: makeFunctionReference<"mutation">("jobs:control"),
+  reapStale: makeFunctionReference<"mutation">("jobs:reapStale"),
+};
+const approvalsApi = {
+  decide: makeFunctionReference<"mutation">("approvals:decide"),
 };
 
 type SupervisorTest = TestConvex<typeof schema>;
@@ -119,8 +133,37 @@ type CommitDecision =
         acceptanceCriteria: string[];
       }>;
     }
+  | {
+      kind: "recover";
+      recoveries: Array<
+        | {
+            mode: "retry";
+            predecessorJobId: Id<"jobs">;
+            predecessorReceiptDigest: string;
+          }
+        | {
+            mode: "remediate" | "input_revision";
+            predecessorJobId: Id<"jobs">;
+            predecessorReceiptDigest: string;
+            task: string;
+            label: string;
+            model: "luna" | "terra" | "sol";
+            agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
+            risk: "low" | "medium" | "high" | "consequential";
+            acceptanceCriteria: string[];
+          }
+      >;
+    }
   | { kind: "wait"; delayMs: number; reason: string }
-  | { kind: "request_input"; question: string; reason: string }
+  | {
+      kind: "request_input";
+      question: string;
+      reason: string;
+      target?: {
+        predecessorJobId: Id<"jobs">;
+        predecessorReceiptDigest: string;
+      };
+    }
   | { kind: "replan"; reason: string }
   | { kind: "synthesize"; summary: string }
   | { kind: "fail"; reason: string };
@@ -343,6 +386,22 @@ async function seedVerifiedReceipt(
     const note = options.note ?? "All acceptance checks passed.";
     const resultDigest = await sha256Hex(result);
     const evidenceDigest = await sha256Hex(note);
+    const terminal = await insertTerminalWorkReceipt(ctx, job, attempt, {
+      status: "succeeded",
+      terminalCode: "verified_success",
+      recoveryDisposition: "none",
+      acceptanceEvidence: options.acceptanceEvidence
+        ?? ["All acceptance checks passed."],
+      artifacts: [`convex://jobs/${String(jobId)}/attempt/${attempt}/result`],
+      verification: "pass",
+      result,
+      evidence: note,
+    });
+    if (options.tamperAuthorityDigest) {
+      await ctx.db.patch(terminal.receiptId, {
+        authorityDigest: "f".repeat(64),
+      });
+    }
     await ctx.db.patch(jobId, {
       status: "done",
       result,
@@ -364,28 +423,80 @@ async function seedVerifiedReceipt(
         updatedAt: Date.now(),
       });
     }
-    const receiptId = await ctx.db.insert("workReceipts", {
-      jobId,
-      attempt,
-      status: "succeeded",
-      authorityDigest: options.tamperAuthorityDigest
-        ? "f".repeat(64)
-        : authority.authorityDigest,
-      schedulingBindingDigest: authority.schedulingBindingDigest,
-      workOrderRevisionId: authority.workOrderRevisionId,
-      workOrderRevision: authority.workOrderRevision,
-      workOrderRevisionDigest: authority.workOrderRevisionDigest,
-      canonicalProjectId: authority.canonicalProjectId,
-      repository: authority.repository,
-      acceptanceEvidence: options.acceptanceEvidence
-        ?? ["All acceptance checks passed."],
-      artifacts: [`convex://jobs/${String(jobId)}/attempt/${attempt}/result`],
-      verification: "pass",
+    return {
+      receiptId: terminal.receiptId,
+      authority,
       resultDigest,
       evidenceDigest,
-      createdAt: Date.now(),
+    };
+  });
+}
+
+async function seedRecoveryTerminal(
+  t: SupervisorTest,
+  jobId: Id<"jobs">,
+  options: {
+    status?: "failed" | "needs_input";
+    terminalCode?: string;
+    recoveryDisposition?: "retryable" | "remediable" | "needs_input" | "operator_stop";
+  } = {},
+) {
+  return await t.run(async (ctx) => {
+    const job = await ctx.db.get(jobId);
+    if (!job) throw new Error("Test recovery job is missing");
+    const attempt = Number(job.attempt ?? 1);
+    const status = options.status ?? "failed";
+    await ensureWorkAttempt(ctx, job, attempt, "running", Date.now());
+    const terminal = await insertTerminalWorkReceipt(ctx, job, attempt, {
+      status,
+      terminalCode: options.terminalCode
+        ?? (status === "needs_input"
+          ? "agent_input_required"
+          : "transient_provider_error"),
+      recoveryDisposition: options.recoveryDisposition
+        ?? (status === "needs_input" ? "needs_input" : "retryable"),
+      acceptanceEvidence: [],
+      artifacts: [
+        `convex://jobs/${String(jobId)}/attempt/${attempt}/terminal`,
+      ],
+      verification: status === "needs_input" ? "needs_input" : "unavailable",
+      result: status === "needs_input"
+        ? "Which exact recovery boundary should be used?"
+        : "Transient provider failure.",
+      evidence: "Exact terminal fixture evidence.",
     });
-    return { receiptId, authority, resultDigest, evidenceDigest };
+    const jobStatus = status === "needs_input" ? "needs_input" : "error";
+    await ctx.db.patch(jobId, {
+      status: jobStatus,
+      stage: jobStatus,
+      completedAt: Date.now(),
+    });
+    const attemptRow = await ctx.db
+      .query("workAttempts")
+      .withIndex("by_job_attempt", (q) =>
+        q.eq("jobId", jobId).eq("attempt", attempt)
+      )
+      .unique();
+    if (attemptRow) {
+      await ctx.db.patch(attemptRow._id, {
+        status: jobStatus,
+        completedAt: Date.now(),
+      });
+    }
+    const runtime = await ctx.db
+      .query("jobRuntime")
+      .withIndex("by_job", (q) => q.eq("jobId", jobId))
+      .unique();
+    if (runtime) {
+      await ctx.db.patch(runtime._id, {
+        status: jobStatus,
+        stage: jobStatus,
+        active: false,
+        completedAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    }
+    return terminal;
   });
 }
 
@@ -2087,5 +2198,988 @@ describe("dormant mission supervisor authority", () => {
     );
     expect(persisted.notification?.delivery).toBe("notification");
     expect(persisted.decisions).toHaveLength(2);
+  });
+
+  it("replays exact receipts, clones policy retries, and never resets the two-recovery cap", async () => {
+    const t = convexTest(schema, modules);
+    const admission = await testProjectSourceAdmission(
+      "daniels-project-space/jarvis",
+    );
+    const started = await start(t, "recover-policy-chain", {
+      repo: admission.repository,
+      projectAdmissions: [admission],
+    });
+    const firstClaim = await claimSuccess(t, started.missionId, 0);
+    const delegated = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      firstClaim,
+      {
+        kind: "delegate",
+        workstreams: [delegatedWorkstream({
+          repo: admission.repository,
+          acceptanceCriteria: [
+            "The immutable retry authority remains exactly bound.",
+          ],
+        })],
+      },
+      MODEL_METADATA,
+    ));
+    const rootJobId = delegated.createdJobIds[0] as Id<"jobs">;
+    const rootTerminal = await seedRecoveryTerminal(t, rootJobId);
+
+    const receiptReplay = await t.run(async (ctx) => {
+      const job = (await ctx.db.get(rootJobId))!;
+      return await insertTerminalWorkReceipt(ctx, job, 1, {
+        status: "failed",
+        terminalCode: "transient_provider_error",
+        recoveryDisposition: "retryable",
+        acceptanceEvidence: [],
+        artifacts: [`convex://jobs/${String(rootJobId)}/attempt/1/terminal`],
+        verification: "unavailable",
+        result: "Transient provider failure.",
+        evidence: "Exact terminal fixture evidence.",
+      });
+    });
+    expect(receiptReplay).toMatchObject({
+      replayed: true,
+      receiptId: rootTerminal.receiptId,
+      receiptDigest: rootTerminal.receiptDigest,
+    });
+    await expect(t.run(async (ctx) => {
+      const job = (await ctx.db.get(rootJobId))!;
+      return await insertFreshTerminalWorkReceipt(ctx, job, 1, {
+        status: "failed",
+        terminalCode: "transient_provider_error",
+        recoveryDisposition: "retryable",
+        acceptanceEvidence: [],
+        artifacts: [`convex://jobs/${String(rootJobId)}/attempt/1/terminal`],
+        verification: "unavailable",
+        result: "Transient provider failure.",
+        evidence: "Exact terminal fixture evidence.",
+      });
+    })).rejects.toThrow("exists before terminal job transition");
+    await expect(t.run(async (ctx) => {
+      const job = (await ctx.db.get(rootJobId))!;
+      return await insertTerminalWorkReceipt(ctx, job, 1, {
+        status: "failed",
+        terminalCode: "transient_network_error",
+        recoveryDisposition: "retryable",
+        acceptanceEvidence: [],
+        artifacts: [`convex://jobs/${String(rootJobId)}/attempt/1/terminal`],
+        verification: "unavailable",
+        result: "Transient provider failure.",
+        evidence: "Exact terminal fixture evidence.",
+      });
+    })).rejects.toThrow("conflicts with immutable authority");
+
+    vi.setSystemTime(delegated.nextTickAt);
+    const secondClaim = await claimSuccess(t, started.missionId, 1);
+    const recoveryDecision: CommitDecision = {
+      kind: "recover",
+      recoveries: [{
+        mode: "retry",
+        predecessorJobId: rootJobId,
+        predecessorReceiptDigest: rootTerminal.receiptDigest,
+      }],
+    };
+    await expect(t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      secondClaim,
+      recoveryDecision,
+      MODEL_METADATA,
+    ))).rejects.toThrow("recover must use deterministic policy authorship");
+    const firstRecoveryInput = commitInput(
+      started.missionId,
+      secondClaim,
+      recoveryDecision,
+      POLICY_METADATA,
+    );
+    const firstRecovery = await t.mutation(
+      supervisorApi.commitV1,
+      firstRecoveryInput,
+    );
+    expect(firstRecovery).toMatchObject({
+      committed: true,
+      replayed: false,
+      kind: "recover",
+      resultState: "waiting",
+    });
+    expect(firstRecovery.createdJobIds).toHaveLength(1);
+    expect(firstRecovery.supersessionIds).toHaveLength(1);
+    const replay = await t.mutation(supervisorApi.commitV1, {
+      ...firstRecoveryInput,
+      leaseVersion: secondClaim.leaseVersion + 99,
+      triggerRunId: "policy-recovery-replay",
+      rationale: "Transport replay metadata cannot change the effect.",
+    });
+    expect(replay).toMatchObject({
+      replayed: true,
+      decisionId: firstRecovery.decisionId,
+      createdJobIds: firstRecovery.createdJobIds,
+      supersessionIds: firstRecovery.supersessionIds,
+    });
+
+    const firstSuccessorId = firstRecovery.createdJobIds[0] as Id<"jobs">;
+    const firstPersisted = await t.run(async (ctx) => ({
+      root: await ctx.db.get(rootJobId),
+      successor: await ctx.db.get(firstSuccessorId),
+      edge: await ctx.db.get(
+        firstRecovery.supersessionIds[0] as Id<"missionSupervisorSupersessions">,
+      ),
+      mission: await ctx.db.get(started.missionId),
+    }));
+    expect(firstPersisted.successor).toMatchObject({
+      task: firstPersisted.root?.task,
+      policyTask: firstPersisted.root?.policyTask,
+      repo: firstPersisted.root?.repo,
+      readonly: firstPersisted.root?.readonly,
+      agentId: firstPersisted.root?.agentId,
+      model: firstPersisted.root?.model,
+      reasoningEffort: firstPersisted.root?.reasoningEffort,
+      acceptanceCriteria: firstPersisted.root?.acceptanceCriteria,
+      maxAttempts: 4,
+      attempt: 1,
+      status: "pending",
+    });
+    expect(firstPersisted.successor?.workerBranch)
+      .not.toBe(firstPersisted.root?.workerBranch);
+    expect(firstPersisted.edge).toMatchObject({
+      rootJobId,
+      predecessorJobId: rootJobId,
+      successorJobId: firstSuccessorId,
+      predecessorReceiptDigest: rootTerminal.receiptDigest,
+      generation: 1,
+      autonomousRecoveryCount: 1,
+      mode: "retry",
+    });
+    expect(firstPersisted.mission?.agentCount).toBe(2);
+
+    const firstSuccessorTerminal = await seedRecoveryTerminal(
+      t,
+      firstSuccessorId,
+    );
+    vi.setSystemTime(firstRecovery.nextTickAt);
+    const thirdClaim = await claimSuccess(t, started.missionId, 2);
+    const secondRecovery = await t.mutation(
+      supervisorApi.commitV1,
+      commitInput(
+        started.missionId,
+        thirdClaim,
+        {
+          kind: "recover",
+          recoveries: [{
+            mode: "retry",
+            predecessorJobId: firstSuccessorId,
+            predecessorReceiptDigest: firstSuccessorTerminal.receiptDigest,
+          }],
+        },
+        POLICY_METADATA,
+      ),
+    );
+    const secondSuccessorId = secondRecovery.createdJobIds[0] as Id<"jobs">;
+    const secondEdge = await t.run(async (ctx) =>
+      await ctx.db.get(
+        secondRecovery.supersessionIds[0] as Id<"missionSupervisorSupersessions">,
+      )
+    );
+    expect(secondEdge).toMatchObject({
+      rootJobId,
+      generation: 2,
+      autonomousRecoveryCount: 2,
+    });
+
+    const secondSuccessorTerminal = await seedRecoveryTerminal(
+      t,
+      secondSuccessorId,
+    );
+    vi.setSystemTime(secondRecovery.nextTickAt);
+    const fourthClaim = await claimSuccess(t, started.missionId, 3);
+    expect(await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      fourthClaim,
+      {
+        kind: "recover",
+        recoveries: [{
+          mode: "retry",
+          predecessorJobId: secondSuccessorId,
+          predecessorReceiptDigest: secondSuccessorTerminal.receiptDigest,
+        }],
+      },
+      POLICY_METADATA,
+    ))).toMatchObject({
+      committed: false,
+      reason: "autonomous_recovery_limit_reached",
+      jobId: secondSuccessorId,
+    });
+    const counts = await t.run(async (ctx) => ({
+      jobs: (await ctx.db
+        .query("jobs")
+        .withIndex("by_mission", (q) =>
+          q.eq("missionId", String(started.missionId))
+        )
+        .collect()).length,
+      edges: (await ctx.db
+        .query("missionSupervisorSupersessions")
+        .withIndex("by_mission_created", (q) =>
+          q.eq("missionId", started.missionId)
+        )
+        .collect()).length,
+    }));
+    expect(counts).toEqual({ jobs: 3, edges: 2 });
+  });
+
+  it("requires criteria-preserving model remediation, creates fresh approval, and synthesizes only the verified leaf", async () => {
+    const t = convexTest(schema, modules);
+    const admission = await testProjectSourceAdmission(
+      "daniels-project-space/jarvis",
+    );
+    const rootCriterion = "The original acceptance boundary remains mandatory.";
+    const started = await start(t, "recover-remediate-synthesis", {
+      repo: admission.repository,
+      projectAdmissions: [admission],
+    });
+    const firstClaim = await claimSuccess(t, started.missionId, 0);
+    const delegated = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      firstClaim,
+      {
+        kind: "delegate",
+        workstreams: [delegatedWorkstream({
+          repo: admission.repository,
+          acceptanceCriteria: [rootCriterion],
+        })],
+      },
+      MODEL_METADATA,
+    ));
+    const rootJobId = delegated.createdJobIds[0] as Id<"jobs">;
+    const terminal = await seedRecoveryTerminal(t, rootJobId, {
+      terminalCode: "verification_exhausted",
+      recoveryDisposition: "remediable",
+    });
+    vi.setSystemTime(delegated.nextTickAt);
+    const secondClaim = await claimSuccess(t, started.missionId, 1);
+    const revisedBase = {
+      mode: "remediate" as const,
+      predecessorJobId: rootJobId,
+      predecessorReceiptDigest: terminal.receiptDigest,
+      task: "Send a production customer reply immediately after deleting the stale record.",
+      label: "Protected remediation",
+      model: "terra" as const,
+      agentId: "paul" as const,
+      risk: "high" as const,
+    };
+    expect(await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      secondClaim,
+      {
+        kind: "recover",
+        recoveries: [{
+          ...revisedBase,
+          acceptanceCriteria: ["A weaker replacement criterion."],
+        }],
+      },
+      MODEL_METADATA,
+    ))).toMatchObject({
+      committed: false,
+      reason: "recovery_authority_downgrade",
+      jobId: rootJobId,
+    });
+
+    const recovered = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      secondClaim,
+      {
+        kind: "recover",
+        recoveries: [{
+          ...revisedBase,
+          acceptanceCriteria: [
+            rootCriterion,
+            "Daniel explicitly approves any consequential delivery.",
+          ],
+        }],
+      },
+      {
+        ...MODEL_METADATA,
+        triggerRunId: "model-remediation-valid",
+      },
+    ));
+    const successorId = recovered.createdJobIds[0] as Id<"jobs">;
+    const protectedResult = await t.run(async (ctx) => ({
+      successor: await ctx.db.get(successorId),
+      approvals: await ctx.db
+        .query("approvals")
+        .withIndex("by_job", (q) => q.eq("jobId", String(successorId)))
+        .collect(),
+    }));
+    expect(protectedResult.successor).toMatchObject({
+      status: "awaiting_approval",
+      approvalRequired: true,
+      approvalStatus: "pending",
+      maxAttempts: 4,
+      acceptanceCriteria: [
+        rootCriterion,
+        "Daniel explicitly approves any consequential delivery.",
+      ],
+    });
+    expect(protectedResult.approvals).toHaveLength(1);
+    expect(protectedResult.approvals[0]).toMatchObject({
+      kind: "consequential-work-recovery",
+      status: "pending",
+      jobId: String(successorId),
+    });
+
+    const verified = await seedVerifiedReceipt(t, successorId, {
+      acceptanceEvidence: ["The remediated leaf passed exact verification."],
+    });
+    vi.setSystemTime(recovered.nextTickAt);
+    const thirdClaim = await claimSuccess(t, started.missionId, 2);
+    const synthesized = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      thirdClaim,
+      {
+        kind: "synthesize",
+        summary: "The recovered workstream completed under exact authority.",
+      },
+      {
+        ...MODEL_METADATA,
+        triggerRunId: "model-recovered-synthesis",
+      },
+    ));
+    expect(synthesized).toMatchObject({
+      committed: true,
+      resultState: "terminal",
+      kind: "synthesize",
+    });
+    const mission = await t.run(async (ctx) =>
+      await ctx.db.get(started.missionId)
+    );
+    expect(mission).toMatchObject({ status: "done", phase: "done" });
+    expect(mission?.summary).toContain("remediate recovery g1");
+    expect(mission?.summary).toContain(terminal.receiptDigest.slice(0, 16));
+    expect(mission?.summary).toContain(verified.resultDigest.slice(0, 16));
+  });
+
+  it("binds Daniel input to the exact requested terminal leaf before input-revision recovery", async () => {
+    const t = convexTest(schema, modules);
+    const admission = await testProjectSourceAdmission(
+      "daniels-project-space/jarvis",
+    );
+    const criterion = "Daniel's exact answer remains part of the recovery boundary.";
+    const started = await start(t, "recover-targeted-input", {
+      repo: admission.repository,
+      projectAdmissions: [admission],
+    });
+    const firstClaim = await claimSuccess(t, started.missionId, 0);
+    const delegated = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      firstClaim,
+      {
+        kind: "delegate",
+        workstreams: [delegatedWorkstream({
+          repo: admission.repository,
+          acceptanceCriteria: [criterion],
+        })],
+      },
+      MODEL_METADATA,
+    ));
+    const rootJobId = delegated.createdJobIds[0] as Id<"jobs">;
+    const terminal = await seedRecoveryTerminal(t, rootJobId, {
+      status: "needs_input",
+      terminalCode: "agent_input_required",
+      recoveryDisposition: "needs_input",
+    });
+    vi.setSystemTime(delegated.nextTickAt);
+    const secondClaim = await claimSuccess(t, started.missionId, 1);
+    const inputRevisionDecision: CommitDecision = {
+      kind: "recover",
+      recoveries: [{
+        mode: "input_revision",
+        predecessorJobId: rootJobId,
+        predecessorReceiptDigest: terminal.receiptDigest,
+        task: "Continue with Daniel's exact selected recovery boundary.",
+        label: "Daniel-directed continuation",
+        model: "terra",
+        agentId: "paul",
+        risk: "low",
+        acceptanceCriteria: [criterion],
+      }],
+    };
+    expect(await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      secondClaim,
+      inputRevisionDecision,
+      MODEL_METADATA,
+    ))).toMatchObject({
+      committed: false,
+      reason: "recovery_input_control_missing_or_ambiguous",
+      jobId: rootJobId,
+    });
+    expect(await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      secondClaim,
+      {
+        kind: "request_input",
+        question: "Which exact implementation boundary should Paul use?",
+        reason: "The worker stopped at a protected ambiguity.",
+      },
+      MODEL_METADATA,
+    ))).toMatchObject({
+      committed: false,
+      reason: "request_input_target_required",
+    });
+    const requested = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      secondClaim,
+      {
+        kind: "request_input",
+        question: "Which exact implementation boundary should Paul use?",
+        reason: "The worker stopped at a protected ambiguity.",
+        target: {
+          predecessorJobId: rootJobId,
+          predecessorReceiptDigest: terminal.receiptDigest,
+        },
+      },
+      {
+        ...MODEL_METADATA,
+        triggerRunId: "model-targeted-input-request",
+      },
+    ));
+    expect(requested).toMatchObject({
+      committed: true,
+      resultState: "needs_input",
+    });
+    const answer =
+      "Use the isolated backend recovery boundary; do not alter deployment.";
+    const provided = await control(
+      t,
+      started.missionId,
+      "targeted-terminal-input",
+      "provide_input",
+      secondClaim.inputRevision,
+      answer,
+    );
+    expect(provided).toMatchObject({
+      applied: true,
+      scope: `terminal_leaf_recovery_input:${String(rootJobId)}`,
+      state: "ready",
+      inputRevision: secondClaim.inputRevision + 1,
+    });
+    expect(provided.inputDigest).toBe(await sha256Hex(answer));
+
+    const thirdClaim = await claimSuccess(t, started.missionId, 2);
+    expect(thirdClaim.snapshot).toMatchObject({
+      pendingInputAuthority: {
+        requestDecisionKey: requested.decisionKey,
+        predecessorJobId: String(rootJobId),
+        predecessorReceiptDigest: terminal.receiptDigest,
+        controlReceiptId: String(provided.controlReceiptId),
+        controlRequestDigest: provided.requestDigest,
+        controlInputDigest: provided.inputDigest,
+        controlResultInputRevision: secondClaim.inputRevision + 1,
+        steerDigest: provided.inputDigest,
+        steerDigestMatchesControl: true,
+      },
+    });
+    const recovered = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      thirdClaim,
+      inputRevisionDecision,
+      {
+        ...MODEL_METADATA,
+        triggerRunId: "model-targeted-input-recovery",
+      },
+    ));
+    expect(recovered).toMatchObject({
+      committed: true,
+      kind: "recover",
+      resultState: "waiting",
+    });
+    const edge = await t.run(async (ctx) =>
+      await ctx.db.get(
+        recovered.supersessionIds[0] as Id<"missionSupervisorSupersessions">,
+      )
+    );
+    expect(edge).toMatchObject({
+      mode: "input_revision",
+      predecessorJobId: rootJobId,
+      predecessorReceiptDigest: terminal.receiptDigest,
+      inputControlReceiptId: provided.controlReceiptId,
+      inputControlRequestDigest: provided.requestDigest,
+      inputControlDigest: provided.inputDigest,
+      generation: 1,
+      autonomousRecoveryCount: 0,
+    });
+  });
+
+  it("writes terminal receipts and fails closed on every supervisor in-place resurrection path", async () => {
+    const t = convexTest(schema, modules);
+    const admission = await testProjectSourceAdmission(
+      "daniels-project-space/jarvis",
+    );
+    const started = await start(t, "supervisor-terminal-writer-guards", {
+      repo: admission.repository,
+      projectAdmissions: [admission],
+    });
+    const claimed = await claimSuccess(t, started.missionId, 0);
+    const delegated = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      claimed,
+      {
+        kind: "delegate",
+        workstreams: [
+          delegatedWorkstream({
+            repo: admission.repository,
+            task: "Inspect the exact input receipt terminal transition.",
+            label: "Input receipt",
+          }),
+          delegatedWorkstream({
+            repo: admission.repository,
+            task: "Inspect the exact failed receipt retry guard.",
+            label: "Retry guard",
+          }),
+          delegatedWorkstream({
+            repo: admission.repository,
+            task: "Send a rental reply to the customer immediately.",
+            label: "Protected decline",
+            agentId: "atlas",
+          }),
+          delegatedWorkstream({
+            repo: admission.repository,
+            task: "Inspect bounded stale-runner terminal recovery.",
+            label: "Stale runner",
+            agentId: "sentry",
+          }),
+          delegatedWorkstream({
+            repo: admission.repository,
+            task: "Inspect direct operator cancellation receipts.",
+            label: "Direct cancel",
+            agentId: "sentry",
+          }),
+        ],
+      },
+      MODEL_METADATA,
+    ));
+    const inputJobId = delegated.createdJobIds[0] as Id<"jobs">;
+    const errorJobId = delegated.createdJobIds[1] as Id<"jobs">;
+    const approvalJobId = delegated.createdJobIds[2] as Id<"jobs">;
+    const staleJobId = delegated.createdJobIds[3] as Id<"jobs">;
+    const cancelJobId = delegated.createdJobIds[4] as Id<"jobs">;
+    await t.run(async (ctx) => {
+      const job = (await ctx.db.get(inputJobId))!;
+      await ensureWorkAttempt(ctx, job, 1, "running", Date.now());
+      await ctx.db.patch(inputJobId, {
+        status: "running",
+        stage: "running",
+        startedAt: Date.now(),
+      });
+      const runtime = await ctx.db
+        .query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", inputJobId))
+        .unique();
+      if (runtime) {
+        await ctx.db.patch(runtime._id, {
+          status: "running",
+          stage: "running",
+          active: true,
+          updatedAt: Date.now(),
+        });
+      }
+    });
+    expect(await t.mutation(jobsApi.requestInput, {
+      jobId: inputJobId,
+      expectedAttempt: 1,
+      question: "Which exact safe continuation should be used?",
+      checkpoint: "Durable input checkpoint.",
+      workerToken: WORKER,
+    })).toBe(true);
+    const inputReceipt = await t.run(async (ctx) =>
+      await ctx.db
+        .query("workReceipts")
+        .withIndex("by_job_attempt", (q) =>
+          q.eq("jobId", inputJobId).eq("attempt", 1)
+        )
+        .unique()
+    );
+    expect(inputReceipt).toMatchObject({
+      protocolVersion: 2,
+      status: "needs_input",
+      terminalCode: "agent_input_required",
+      recoveryDisposition: "needs_input",
+    });
+    expect(await t.mutation(jobsApi.provideInput, {
+      jobId: inputJobId,
+      answer: "Do not revive this row.",
+      workerToken: WORKER,
+    })).toBe(false);
+    await t.run(async (ctx) => {
+      await ctx.db.patch(inputReceipt!._id, {
+        receiptDigest: "corrupt-input-receipt-digest",
+      });
+    });
+    expect(await t.mutation(jobsApi.provideInput, {
+      jobId: inputJobId,
+      answer: "A corrupt receipt still must not revive this row.",
+      workerToken: WORKER,
+    })).toBe(false);
+    await t.run(async (ctx) => {
+      await ctx.db.delete(inputReceipt!._id);
+    });
+    expect(await t.mutation(jobsApi.provideInput, {
+      jobId: inputJobId,
+      answer: "A missing receipt still must not revive this row.",
+      workerToken: WORKER,
+    })).toBe(false);
+    await t.run(async (ctx) => {
+      const {
+        _id: receiptId,
+        _creationTime: receiptCreationTime,
+        ...duplicate
+      } = inputReceipt!;
+      void receiptId;
+      void receiptCreationTime;
+      duplicate.receiptDigest = "ambiguous-input-receipt-digest";
+      await ctx.db.insert("workReceipts", duplicate);
+      await ctx.db.insert("workReceipts", duplicate);
+    });
+    expect(await t.mutation(jobsApi.provideInput, {
+      jobId: inputJobId,
+      answer: "Ambiguous receipts still must not revive this row.",
+      workerToken: WORKER,
+    })).toBe(false);
+    expect(await t.run(async (ctx) => ctx.db.get(inputJobId))).toMatchObject({
+      status: "needs_input",
+      attempt: 1,
+    });
+
+    const failed = await seedRecoveryTerminal(t, errorJobId);
+    const failedReceipt = await t.run(async (ctx) =>
+      await ctx.db.get(failed.receiptId)
+    );
+    expect(await t.mutation(jobsApi.control, {
+      jobId: errorJobId,
+      action: "retry",
+      workerToken: WORKER,
+    })).toBe(false);
+    expect(await t.run(async (ctx) => ctx.db.get(errorJobId))).toMatchObject({
+      status: "error",
+      attempt: 1,
+    });
+    await t.run(async (ctx) => {
+      await ctx.db.patch(failed.receiptId, {
+        receiptDigest: "corrupt-terminal-receipt-digest",
+      });
+    });
+    expect(await t.mutation(jobsApi.control, {
+      jobId: errorJobId,
+      action: "retry",
+      workerToken: WORKER,
+    })).toBe(false);
+    await t.run(async (ctx) => {
+      await ctx.db.delete(failed.receiptId);
+    });
+    expect(await t.mutation(jobsApi.control, {
+      jobId: errorJobId,
+      action: "retry",
+      workerToken: WORKER,
+    })).toBe(false);
+    await t.run(async (ctx) => {
+      const {
+        _id: receiptId,
+        _creationTime: receiptCreationTime,
+        ...duplicate
+      } = failedReceipt!;
+      void receiptId;
+      void receiptCreationTime;
+      duplicate.receiptDigest = "ambiguous-terminal-receipt-digest";
+      await ctx.db.insert("workReceipts", duplicate);
+      await ctx.db.insert("workReceipts", duplicate);
+    });
+    expect(await t.mutation(jobsApi.control, {
+      jobId: errorJobId,
+      action: "retry",
+      workerToken: WORKER,
+    })).toBe(false);
+    expect(await t.run(async (ctx) => ctx.db.get(errorJobId))).toMatchObject({
+      status: "error",
+      attempt: 1,
+    });
+
+    expect(await t.mutation(jobsApi.control, {
+      jobId: cancelJobId,
+      action: "cancel",
+      workerToken: WORKER,
+    })).toBe(true);
+    const cancelledReceipt = await t.run(async (ctx) =>
+      await ctx.db
+        .query("workReceipts")
+        .withIndex("by_job_attempt", (q) =>
+          q.eq("jobId", cancelJobId).eq("attempt", 1)
+        )
+        .unique()
+    );
+    expect(cancelledReceipt).toMatchObject({
+      protocolVersion: 2,
+      status: "cancelled",
+      terminalCode: "operator_cancelled",
+      recoveryDisposition: "operator_stop",
+    });
+
+    expect(await t.mutation(approvalsApi.decide, {
+      jobId: String(approvalJobId),
+      decision: "declined",
+      workerToken: WORKER,
+    })).toBe(true);
+    const declined = await t.run(async (ctx) => ({
+      job: await ctx.db.get(approvalJobId),
+      receipt: await ctx.db
+        .query("workReceipts")
+        .withIndex("by_job_attempt", (q) =>
+          q.eq("jobId", approvalJobId).eq("attempt", 1)
+        )
+        .unique(),
+    }));
+    expect(declined.job).toMatchObject({
+      status: "cancelled",
+      approvalStatus: "declined",
+    });
+    expect(declined.receipt).toMatchObject({
+      protocolVersion: 2,
+      status: "cancelled",
+      terminalCode: "approval_declined",
+      recoveryDisposition: "operator_stop",
+    });
+
+    await t.run(async (ctx) => {
+      const job = (await ctx.db.get(staleJobId))!;
+      await ensureWorkAttempt(ctx, job, 1, "running", Date.now());
+      await ctx.db.patch(staleJobId, {
+        status: "running",
+        stage: "running",
+        maxAttempts: 1,
+        heartbeatAt: Date.now() - 10 * 60_000,
+      });
+      const runtime = await ctx.db
+        .query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", staleJobId))
+        .unique();
+      if (runtime) {
+        await ctx.db.patch(runtime._id, {
+          status: "running",
+          stage: "running",
+          active: true,
+          attempt: 1,
+          maxAttempts: 1,
+          heartbeatAt: Date.now() - 10 * 60_000,
+          updatedAt: Date.now() - 10 * 60_000,
+        });
+      }
+    });
+    expect(await t.mutation(jobsApi.reapStale, {
+      workerToken: WORKER,
+    })).toMatchObject({
+      abandoned: expect.arrayContaining([
+        "Inspect bounded stale-runner terminal recovery.",
+      ]),
+    });
+    const staleTerminal = await t.run(async (ctx) => ({
+      job: await ctx.db.get(staleJobId),
+      receipt: await ctx.db
+        .query("workReceipts")
+        .withIndex("by_job_attempt", (q) =>
+          q.eq("jobId", staleJobId).eq("attempt", 1)
+        )
+        .unique(),
+    }));
+    expect(staleTerminal.job).toMatchObject({ status: "error", attempt: 1 });
+    expect(staleTerminal.receipt).toMatchObject({
+      protocolVersion: 2,
+      status: "failed",
+      terminalCode: "stale_runner_budget_exhausted",
+      recoveryDisposition: "remediable",
+    });
+  });
+
+  it("rejects forged recovery forks and cycles before considering leaf results", async () => {
+    const establishRecovery = async (
+      t: SupervisorTest,
+      requestKey: string,
+    ) => {
+      const admission = await testProjectSourceAdmission(
+        "daniels-project-space/jarvis",
+      );
+      const started = await start(t, requestKey, {
+        repo: admission.repository,
+        projectAdmissions: [admission],
+      });
+      const firstClaim = await claimSuccess(t, started.missionId, 0);
+      const delegated = await t.mutation(supervisorApi.commitV1, commitInput(
+        started.missionId,
+        firstClaim,
+        {
+          kind: "delegate",
+          workstreams: [delegatedWorkstream({
+            repo: admission.repository,
+          })],
+        },
+        MODEL_METADATA,
+      ));
+      const rootJobId = delegated.createdJobIds[0] as Id<"jobs">;
+      const terminal = await seedRecoveryTerminal(t, rootJobId);
+      vi.setSystemTime(delegated.nextTickAt);
+      const secondClaim = await claimSuccess(t, started.missionId, 1);
+      const recovered = await t.mutation(
+        supervisorApi.commitV1,
+        commitInput(
+          started.missionId,
+          secondClaim,
+          {
+            kind: "recover",
+            recoveries: [{
+              mode: "retry",
+              predecessorJobId: rootJobId,
+              predecessorReceiptDigest: terminal.receiptDigest,
+            }],
+          },
+          POLICY_METADATA,
+        ),
+      );
+      return {
+        started,
+        rootJobId,
+        successorJobId: recovered.createdJobIds[0] as Id<"jobs">,
+        edgeId:
+          recovered.supersessionIds[0] as Id<"missionSupervisorSupersessions">,
+        nextTickAt: recovered.nextTickAt as number,
+      };
+    };
+
+    const forkTest = convexTest(schema, modules);
+    const fork = await establishRecovery(forkTest, "recover-forged-fork");
+    await forkTest.run(async (ctx) => {
+      const edge = (await ctx.db.get(fork.edgeId))!;
+      const {
+        _id: _edgeId,
+        _creationTime: _edgeCreated,
+        supersessionDigest: _edgeDigest,
+        createdAt: _edgeCreatedAt,
+        ...authority
+      } = edge;
+      void _edgeId;
+      void _edgeCreated;
+      void _edgeDigest;
+      void _edgeCreatedAt;
+      const forged = {
+        ...authority,
+        supersessionKey: await sha256Hex("forged-fork-edge"),
+        generation: 2,
+        autonomousRecoveryCount: 2,
+      };
+      await ctx.db.insert("missionSupervisorSupersessions", {
+        ...forged,
+        supersessionDigest: await supersessionDigest(forged),
+        createdAt: Date.now() + 1,
+      });
+    });
+    vi.setSystemTime(fork.nextTickAt);
+    const forkClaim = await claimSuccess(
+      forkTest,
+      fork.started.missionId,
+      2,
+    );
+    expect(await forkTest.mutation(
+      supervisorApi.commitV1,
+      commitInput(
+        fork.started.missionId,
+        forkClaim,
+        {
+          kind: "synthesize",
+          summary: "This forged fork must never be accepted.",
+        },
+        MODEL_METADATA,
+      ),
+    )).toMatchObject({
+      committed: false,
+      reason: "recovery_lineage_fork",
+      jobId: fork.rootJobId,
+    });
+
+    const cycleTest = convexTest(schema, modules);
+    const cycle = await establishRecovery(cycleTest, "recover-forged-cycle");
+    const successorTerminal = await seedRecoveryTerminal(
+      cycleTest,
+      cycle.successorJobId,
+    );
+    await cycleTest.run(async (ctx) => {
+      const [root, edge, state] = await Promise.all([
+        ctx.db.get(cycle.rootJobId),
+        ctx.db.get(cycle.edgeId),
+        ctx.db
+          .query("missionSupervisorState")
+          .withIndex("by_mission", (q) =>
+            q.eq("missionId", cycle.started.missionId)
+          )
+          .unique(),
+      ]);
+      if (
+        !root
+        || !edge
+        || !state
+        || !root.supervisorDecisionKey
+        || !root.workOrderRevisionId
+        || !root.workOrderRevisionDigest
+        || !root.schedulingBindingDigest
+        || !root.canonicalProjectId
+        || !root.sourceAdmissionDigest
+      ) throw new Error("Cycle fixture authority is incomplete");
+      const forged = {
+        protocolVersion: 1 as const,
+        supersessionKey: await sha256Hex("forged-cycle-edge"),
+        missionId: cycle.started.missionId,
+        decisionKey: root.supervisorDecisionKey,
+        decisionOrdinal: Number(root.supervisorJobOrdinal),
+        mode: "retry" as const,
+        rootJobId: cycle.rootJobId,
+        generation: 2,
+        autonomousRecoveryCount: 2,
+        predecessorJobId: cycle.successorJobId,
+        predecessorAttempt: 1,
+        predecessorReceiptId: successorTerminal.receiptId,
+        predecessorReceiptDigest: successorTerminal.receiptDigest,
+        successorJobId: cycle.rootJobId,
+        successorSchedulingBindingDigest: root.schedulingBindingDigest,
+        successorWorkOrderRevisionId: root.workOrderRevisionId,
+        successorWorkOrderRevisionDigest: root.workOrderRevisionDigest,
+        successorCanonicalProjectId: root.canonicalProjectId,
+        successorRepository: root.repo,
+        successorSourceAdmissionDigest: root.sourceAdmissionDigest,
+        observedInputRevision: state.inputRevision,
+      };
+      await ctx.db.insert("missionSupervisorSupersessions", {
+        ...forged,
+        supersessionDigest: await supersessionDigest(forged),
+        createdAt: Date.now() + 1,
+      });
+    });
+    vi.setSystemTime(cycle.nextTickAt);
+    const cycleClaim = await claimSuccess(
+      cycleTest,
+      cycle.started.missionId,
+      2,
+    );
+    expect(await cycleTest.mutation(
+      supervisorApi.commitV1,
+      commitInput(
+        cycle.started.missionId,
+        cycleClaim,
+        {
+          kind: "synthesize",
+          summary: "This forged cycle must never be accepted.",
+        },
+        MODEL_METADATA,
+      ),
+    )).toMatchObject({
+      committed: false,
+      reason: "recovery_lineage_cycle_or_cap_reset",
+    });
   });
 });
