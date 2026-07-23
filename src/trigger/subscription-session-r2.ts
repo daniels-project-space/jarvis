@@ -153,12 +153,12 @@ export class R2SessionStateStore implements SessionStateStore {
 
   async readState(): Promise<VersionedSessionState> {
     return await this.request(STATE_KEY, {
-      headers: { "cache-control": "no-store" }, redirect: "error",
+      headers: { "cache-control": "no-store", "accept-encoding": "identity" }, redirect: "error",
     }, async (response) => {
       if (response.status === 404) return { value: null, etag: null };
       assertR2Response(response);
       const etag = response.headers.get("etag");
-      if (!etag) throw new SubscriptionSessionError("snapshot_corrupt");
+      if (!isStrongR2Etag(etag)) throw new SubscriptionSessionError("snapshot_corrupt");
       try {
         const value = await readBoundedResponseJson(response, R2_STATE_MAX_BYTES) as SessionState;
         validateSessionState(value);
@@ -173,6 +173,9 @@ export class R2SessionStateStore implements SessionStateStore {
     expectedEtag: string | null,
     value: SessionState,
   ): Promise<{ ok: boolean; etag?: string }> {
+    if (expectedEtag !== null && !isStrongR2Etag(expectedEtag)) {
+      throw new SubscriptionSessionError("snapshot_corrupt");
+    }
     const body = Buffer.from(JSON.stringify(value), "utf8");
     if (body.byteLength > R2_STATE_MAX_BYTES) throw new SubscriptionSessionError("snapshot_corrupt");
     validateSessionState(value);
@@ -190,7 +193,7 @@ export class R2SessionStateStore implements SessionStateStore {
       if (response.status === 409 || response.status === 412) return { ok: false };
       assertR2Response(response);
       const etag = response.headers.get("etag");
-      if (!etag) throw new SubscriptionSessionError("snapshot_corrupt");
+      if (!isStrongR2Etag(etag)) throw new SubscriptionSessionError("snapshot_corrupt");
       return { ok: true, etag };
     });
   }
@@ -216,7 +219,7 @@ export class R2SessionStateStore implements SessionStateStore {
 
   async getSnapshot(key: string): Promise<Uint8Array | null> {
     return await this.request(key, {
-      headers: { "cache-control": "no-store" },
+      headers: { "cache-control": "no-store", "accept-encoding": "identity" },
       redirect: "error",
     }, async (response) => {
       if (response.status === 404) return null;
@@ -249,6 +252,10 @@ export class R2SessionStateStore implements SessionStateStore {
       throw new SubscriptionSessionError("session_store_unavailable");
     }
   }
+}
+
+function isStrongR2Etag(value: string | null): value is string {
+  return value !== null && /^"[\x21\x23-\x7e\x80-\xff]+"$/.test(value);
 }
 
 /** Internal signal used only to replace a rejected temporary S3 client. */

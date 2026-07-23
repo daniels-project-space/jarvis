@@ -194,25 +194,87 @@ describe("R2 session request transport", () => {
     expect(fetcher.mock.calls.every(([, init]) => init?.signal instanceof AbortSignal)).toBe(true);
   });
 
+  it("forces identity representations for state and snapshot reads", async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      void init;
+      if (String(input).endsWith("/managed-codex-session/state.json")) {
+        return responseAt(String(input), JSON.stringify(STATE), {
+          status: 200,
+          headers: { etag: "\"state-etag\"", "content-type": "application/json" },
+        });
+      }
+      return responseAt(String(input), new Uint8Array([1]), { status: 200 });
+    });
+    const store = new R2SessionStateStore(
+      { fetch: fetcher } as never,
+      R2_ORIGIN,
+      "jarvis-codex-session-private",
+    );
+
+    await store.readState();
+    await store.getSnapshot("managed-codex-session/snapshots/test");
+
+    expect(fetcher.mock.calls).toHaveLength(2);
+    expect(String(fetcher.mock.calls[0][0])).toBe(
+      `${R2_ORIGIN}/jarvis-codex-session-private/managed-codex-session/state.json`,
+    );
+    expect(new Headers(fetcher.mock.calls[0][1]?.headers).get("accept-encoding")).toBe("identity");
+    expect(new Headers(fetcher.mock.calls[1][1]?.headers).get("accept-encoding")).toBe("identity");
+  });
+
+  it("rejects weak or malformed state ETags before CAS can use them", async () => {
+    for (const etag of ["W/\"gzip-etag\"", "gzip-etag", "\"unterminated", "\"\"", ""]) {
+      const store = new R2SessionStateStore({
+        fetch: async (input: RequestInfo | URL) => responseAt(
+          String(input),
+          JSON.stringify(STATE),
+          { status: 200, headers: { etag, "content-type": "application/json" } },
+        ),
+      } as never, R2_ORIGIN, "jarvis-codex-session-private");
+
+      await expect(store.readState()).rejects.toMatchObject({ code: "snapshot_corrupt" });
+    }
+  });
+
+  it("rejects invalid state ETags supplied to or returned from compare-exchange", async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => responseAt(
+      String(input),
+      null,
+      { status: 200, headers: { etag: "W/\"gzip-etag\"" } },
+    ));
+    const store = new R2SessionStateStore(
+      { fetch: fetcher } as never,
+      R2_ORIGIN,
+      "jarvis-codex-session-private",
+    );
+
+    await expect(store.compareExchangeState("W/\"gzip-etag\"", STATE))
+      .rejects.toMatchObject({ code: "snapshot_corrupt" });
+    expect(fetcher).not.toHaveBeenCalled();
+
+    await expect(store.compareExchangeState("\"current-etag\"", STATE))
+      .rejects.toMatchObject({ code: "snapshot_corrupt" });
+  });
+
   it("rejects wrong-origin, duplicate, oversized and stalled state responses", async () => {
     const stateBody = JSON.stringify(STATE);
     const wrongOrigin = new R2SessionStateStore({ fetch: async () => responseAt(
       "https://hostile.example/state.json",
       stateBody,
-      { status: 200, headers: { etag: "one", "content-type": "application/json" } },
+      { status: 200, headers: { etag: "\"one\"", "content-type": "application/json" } },
     ) } as never, R2_ORIGIN, "jarvis-codex-session-private");
     await expect(wrongOrigin.readState()).rejects.toMatchObject({ code: "session_store_unavailable" });
 
     const duplicate = new R2SessionStateStore({ fetch: async (input: RequestInfo | URL) => responseAt(
       String(input),
       stateBody.replace('"revision":1', '"revision":1,"revision":2'),
-      { status: 200, headers: { etag: "two", "content-type": "application/json" } },
+      { status: 200, headers: { etag: "\"two\"", "content-type": "application/json" } },
     ) } as never, R2_ORIGIN, "jarvis-codex-session-private");
     await expect(duplicate.readState()).rejects.toMatchObject({ code: "snapshot_corrupt" });
 
     const oversized = new R2SessionStateStore({ fetch: async (input: RequestInfo | URL) => responseAt(
       String(input), null,
-      { status: 200, headers: { etag: "three", "content-type": "application/json", "content-length": String(33 * 1_024) } },
+      { status: 200, headers: { etag: "\"three\"", "content-type": "application/json", "content-length": String(33 * 1_024) } },
     ) } as never, R2_ORIGIN, "jarvis-codex-session-private");
     await expect(oversized.readState()).rejects.toMatchObject({ code: "snapshot_corrupt" });
 
