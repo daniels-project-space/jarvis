@@ -1,6 +1,18 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 
+const projectSourceAdmission = v.object({
+  protocolVersion: v.literal(2),
+  canonicalProjectId: v.string(),
+  repository: v.optional(v.string()),
+  sourceProvider: v.union(v.literal("github"), v.literal("none")),
+  sourceBranch: v.optional(v.string()),
+  sourceRef: v.optional(v.string()),
+  sourceHeadSha: v.optional(v.string()),
+  sourceObservedAt: v.number(),
+  sourceAdmissionDigest: v.string(),
+});
+
 // JARVIS memory index. Full markdown bodies live in R2 (bucket `jarvis`);
 // Convex holds the reactive index for search/recall. Multi-stage consolidation
 // (daily -> weekly -> long-term) is driven by Trigger.dev tasks.
@@ -179,14 +191,20 @@ export default defineSchema({
   }).index("by_status", ["status", "at"]),
 
   jobs: defineTable({
+    admissionProtocolVersion: v.optional(v.number()),
+    protocolHoldReason: v.optional(v.string()),
     repo: v.optional(v.string()),
     task: v.string(),
+    policyTask: v.optional(v.string()),
     status: v.string(), // pending | dispatching | running | done | error
     result: v.optional(v.string()),
     readonly: v.optional(v.boolean()), // if true, runner never commits/pushes
     model: v.optional(v.string()), // optional Codex tier override (luna|terra|sol)
     reasoningEffort: v.optional(v.string()), // optional per-job override (low|medium|high|max)
     mcp: v.optional(v.array(v.string())), // MCP servers to attach (playwright, context7)
+    toolScope: v.optional(v.array(v.string())),
+    agentRole: v.optional(v.string()),
+    machineClass: v.optional(v.string()),
     incidentId: v.optional(v.string()), // set on self-repair jobs → resolves the incident on success
     retried: v.optional(v.boolean()), // failed once already — no second retry
     missionId: v.optional(v.string()), // part of an orchestrated fleet
@@ -231,10 +249,12 @@ export default defineSchema({
       planDigest: v.optional(v.string()), planGeneration: v.optional(v.number()),
       sourceNodeId: v.optional(v.string()), sourceJobId: v.optional(v.string()),
       sourceAttempt: v.optional(v.number()), sourceSteerRevision: v.optional(v.number()),
+      workOrderRevisionDigest: v.optional(v.string()),
       reviewReceiptDigest: v.optional(v.string()), integrationReceiptDigest: v.optional(v.string()),
       repository: v.optional(v.string()), sourceBranch: v.optional(v.string()), sourceHeadSha: v.optional(v.string()),
       integrationBranch: v.optional(v.string()), integrationHeadSha: v.optional(v.string()),
       artifactRefs: v.optional(v.array(v.string())), resultDigest: v.optional(v.string()),
+      handoffPayloadDigest: v.optional(v.string()),
     }))),
     dispatchLeaseUntil: v.optional(v.number()),
     dispatchReason: v.optional(v.string()),
@@ -256,16 +276,44 @@ export default defineSchema({
     goalStage: v.optional(v.string()), // planning | building | validating | refining
     goalWorkstreamId: v.optional(v.string()),
     goalWave: v.optional(v.number()),
+    // Immutable scheduler admission. missionGroupId is the top-level request;
+    // projectGroupId is its executable repository/evidence child. The group
+    // key also includes projectRepository and is never derived from a label,
+    // UI selection, branch, or latest pointer during dispatch.
+    missionGroupId: v.optional(v.string()),
+    projectGroupId: v.optional(v.string()),
+    canonicalProjectId: v.optional(v.string()),
+    projectRepository: v.optional(v.string()),
+    schedulingGroupKey: v.optional(v.string()),
+    schedulingProtocolVersion: v.optional(v.number()),
+    schedulingAdmissionId: v.optional(v.id("jobSchedulingAdmissions")),
+    schedulingBindingDigest: v.optional(v.string()),
+    schedulingBound: v.optional(v.boolean()),
+    workOrderProtocolVersion: v.optional(v.number()),
+    workOrderRevision: v.optional(v.number()),
+    workOrderRevisionId: v.optional(v.id("workOrderRevisions")),
+    workOrderRevisionDigest: v.optional(v.string()),
+    pendingWorkOrderRevisionId: v.optional(v.id("workOrderRevisions")),
+    pendingWorkOrderRevisionDigest: v.optional(v.string()),
+    // False keeps dependency-blocked and historical unbound work out of the
+    // hot due index; completion/migration explicitly promotes it.
+    dispatchReady: v.optional(v.boolean()),
     acceptanceCriteria: v.optional(v.array(v.string())),
     modelReason: v.optional(v.string()),
     // Immutable work-item isolation identities. `branch` remains the legacy
     // display/transport alias for workerBranch during the rollout.
+    sourceProvider: v.optional(v.string()),
     sourceBranch: v.optional(v.string()),
+    sourceRef: v.optional(v.string()),
     sourceHeadSha: v.optional(v.string()),
+    sourceObservedAt: v.optional(v.number()),
+    sourceAdmissionDigest: v.optional(v.string()),
     integrationBranch: v.optional(v.string()),
     workerBranch: v.optional(v.string()),
+    workerLineage: v.optional(v.string()),
     workspaceLineage: v.optional(v.string()),
     retryLineage: v.optional(v.string()),
+    integrationLineage: v.optional(v.string()),
     integrationAttemptId: v.optional(v.id("integrationAttempts")),
     integrationState: v.optional(v.string()),
     evidenceSummary: v.optional(v.string()),
@@ -322,6 +370,8 @@ export default defineSchema({
   // transitions still commit to jobs and update this projection atomically.
   jobRuntime: defineTable({
     jobId: v.id("jobs"),
+    admissionProtocolVersion: v.optional(v.number()),
+    protocolHoldReason: v.optional(v.string()),
     task: v.string(),
     label: v.optional(v.string()),
     repo: v.optional(v.string()),
@@ -334,6 +384,8 @@ export default defineSchema({
     model: v.optional(v.string()),
     reasoningEffort: v.optional(v.string()),
     modelReason: v.optional(v.string()),
+    agentRole: v.optional(v.string()),
+    machineClass: v.optional(v.string()),
     risk: v.optional(v.string()),
     priority: v.number(),
     approvalRequired: v.optional(v.boolean()),
@@ -371,12 +423,30 @@ export default defineSchema({
     goalStage: v.optional(v.string()),
     goalWorkstreamId: v.optional(v.string()),
     goalWave: v.optional(v.number()),
+    missionGroupId: v.optional(v.string()),
+    projectGroupId: v.optional(v.string()),
+    canonicalProjectId: v.optional(v.string()),
+    projectRepository: v.optional(v.string()),
+    schedulingGroupKey: v.optional(v.string()),
+    schedulingProtocolVersion: v.optional(v.number()),
+    schedulingAdmissionId: v.optional(v.id("jobSchedulingAdmissions")),
+    schedulingBindingDigest: v.optional(v.string()),
+    schedulingBound: v.optional(v.boolean()),
+    workOrderRevision: v.optional(v.number()),
+    workOrderRevisionDigest: v.optional(v.string()),
+    dispatchReady: v.optional(v.boolean()),
+    sourceProvider: v.optional(v.string()),
     sourceBranch: v.optional(v.string()),
+    sourceRef: v.optional(v.string()),
     sourceHeadSha: v.optional(v.string()),
+    sourceObservedAt: v.optional(v.number()),
+    sourceAdmissionDigest: v.optional(v.string()),
     integrationBranch: v.optional(v.string()),
     workerBranch: v.optional(v.string()),
+    workerLineage: v.optional(v.string()),
     workspaceLineage: v.optional(v.string()),
     retryLineage: v.optional(v.string()),
+    integrationLineage: v.optional(v.string()),
     integrationAttemptId: v.optional(v.id("integrationAttempts")),
     integrationState: v.optional(v.string()),
     evidenceSummary: v.optional(v.string()),
@@ -398,6 +468,9 @@ export default defineSchema({
     .index("by_createdAt", ["createdAt"])
     .index("by_status_priority", ["status", "priority", "createdAt"])
     .index("by_status_next_run", ["status", "nextRunAt", "createdAt"])
+    .index("by_dispatch_ready", ["status", "schedulingBound", "dispatchReady", "nextRunAt", "createdAt"])
+    .index("by_group_dispatch_ready", ["schedulingGroupKey", "status", "schedulingBound", "dispatchReady", "nextRunAt", "createdAt"])
+    .index("by_status_scheduling_bound", ["status", "schedulingBound", "priority", "createdAt"])
     .index("by_status_heartbeat", ["status", "heartbeatAt"])
     .index("by_status_progress", ["status", "progressAt"])
     .index("by_status_dispatch_lease", ["status", "dispatchLeaseUntil"])
@@ -408,10 +481,117 @@ export default defineSchema({
     .index("by_plan_parent_generation_node", ["planParentMissionId", "planGeneration", "planNodeId"])
     .index("by_mission", ["missionId", "createdAt"]),
 
+  // Durable fair-queue state for one immutable executable project group.
+  // Rows are admitted atomically with jobs and survive worker/controller
+  // retries; the scheduler never treats a mutable "latest" row as authority.
+  workGroupScheduling: defineTable({
+    groupKey: v.string(),
+    missionGroupId: v.string(),
+    projectGroupId: v.string(),
+    canonicalProjectId: v.optional(v.string()),
+    projectRepository: v.optional(v.string()),
+    // One indexed queue head per immutable group replaces sampling arbitrary
+    // ends of the global jobs index. `queueEligible` is a durable time cursor:
+    // future heads become eligible in bounded due pages, and reservations
+    // move the group behind every not-yet-served peer.
+    queueHeadJobId: v.optional(v.id("jobs")),
+    queueHeadNextRunAt: v.optional(v.number()),
+    queueEligible: v.optional(v.boolean()),
+    lastServedSequence: v.number(),
+    reservationCount: v.number(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_group", ["groupKey"])
+    .index("by_queue_due", ["queueEligible", "queueHeadNextRunAt", "groupKey"])
+    .index("by_queue_service", ["queueEligible", "lastServedSequence", "groupKey"]),
+
+  // Per-job immutable admission prevents a wholesale rewrite of the mutable
+  // job document from moving work to another mission or repository group.
+  jobSchedulingAdmissions: defineTable({
+    jobId: v.id("jobs"),
+    protocolVersion: v.optional(v.number()),
+    missionGroupId: v.string(),
+    projectGroupId: v.string(),
+    canonicalProjectId: v.optional(v.string()),
+    projectRepository: v.optional(v.string()),
+    schedulingGroupKey: v.string(),
+    readonly: v.optional(v.boolean()),
+    sourceProvider: v.optional(v.string()),
+    sourceBranch: v.optional(v.string()),
+    sourceRef: v.optional(v.string()),
+    sourceHeadSha: v.optional(v.string()),
+    sourceObservedAt: v.optional(v.number()),
+    sourceAdmissionDigest: v.optional(v.string()),
+    workerBranch: v.optional(v.string()),
+    workerLineage: v.optional(v.string()),
+    workspaceLineage: v.optional(v.string()),
+    retryLineage: v.optional(v.string()),
+    integrationBranch: v.optional(v.string()),
+    integrationLineage: v.optional(v.string()),
+    bindingDigest: v.optional(v.string()),
+    initialWorkOrderRevisionId: v.optional(v.id("workOrderRevisions")),
+    initialWorkOrderRevisionDigest: v.optional(v.string()),
+    createdAt: v.number(),
+  })
+    .index("by_job", ["jobId"])
+    .index("by_group", ["schedulingGroupKey", "jobId"]),
+
+  // Append-only executable authority. Mutable progress, logs, results,
+  // checkpoints and provider observations are deliberately excluded.
+  workOrderRevisions: defineTable({
+    protocolVersion: v.number(),
+    jobId: v.id("jobs"),
+    revision: v.number(),
+    parentRevisionId: v.optional(v.id("workOrderRevisions")),
+    parentRevisionDigest: v.optional(v.string()),
+    executableTask: v.string(),
+    policyTask: v.string(),
+    steeringInstruction: v.optional(v.string()),
+    acceptanceCriteria: v.array(v.string()),
+    schedulingBindingDigest: v.string(),
+    canonicalProjectId: v.string(),
+    repository: v.optional(v.string()),
+    sourceProvider: v.string(),
+    sourceBranch: v.optional(v.string()),
+    sourceRef: v.optional(v.string()),
+    sourceHeadSha: v.optional(v.string()),
+    sourceObservedAt: v.number(),
+    sourceAdmissionDigest: v.string(),
+    readonly: v.boolean(),
+    toolScope: v.array(v.string()),
+    mcpScope: v.array(v.string()),
+    deliveryPolicy: v.string(),
+    risk: v.string(),
+    approvalRequired: v.boolean(),
+    approvalReason: v.optional(v.string()),
+    approvalResult: v.string(),
+    agentId: v.string(),
+    agentRole: v.string(),
+    minimumModel: v.string(),
+    minimumReasoningEffort: v.string(),
+    machineClass: v.string(),
+    revisionDigest: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_job_revision", ["jobId", "revision"])
+    .index("by_job_digest", ["jobId", "revisionDigest"]),
+
+  // One optimistic-concurrency fence allocates monotonically increasing fair
+  // service tickets across every background mission/project group.
+  dispatchSchedulerState: defineTable({
+    key: v.string(),
+    nextSequence: v.number(),
+    lastGroupKey: v.optional(v.string()),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
+
   // Orchestrated agent fleets: one mission = a decomposed goal running as
   // parallel jobs; when the last one lands, a synthesis pass merges the
   // results into ONE coherent report back to Daniel.
   missions: defineTable({
+    admissionProtocolVersion: v.optional(v.number()),
+    protocolHoldReason: v.optional(v.string()),
     goal: v.string(),
     status: v.string(), // running | synthesizing | done | failed
     mode: v.optional(v.string()), // fleet | goal
@@ -425,6 +605,10 @@ export default defineSchema({
     planDigest: v.optional(v.string()),
     planGeneration: v.optional(v.number()),
     planNodeCount: v.optional(v.number()),
+    materializationStatus: v.optional(v.string()),
+    materializationCursor: v.optional(v.number()),
+    materializationWaitingApprovals: v.optional(v.number()),
+    materializationCompletedAt: v.optional(v.number()),
     controlRequested: v.optional(v.string()),
     controlRequestedAt: v.optional(v.number()),
     steer: v.optional(v.string()),
@@ -437,6 +621,13 @@ export default defineSchema({
     route: v.optional(v.string()),
     routeReason: v.optional(v.string()),
     primaryRepo: v.optional(v.string()),
+    projectAdmissions: v.optional(v.array(projectSourceAdmission)),
+    canonicalProjectId: v.optional(v.string()),
+    sourceProvider: v.optional(v.string()),
+    sourceRef: v.optional(v.string()),
+    sourceHeadSha: v.optional(v.string()),
+    sourceObservedAt: v.optional(v.number()),
+    sourceAdmissionDigest: v.optional(v.string()),
     infrastructureContext: v.optional(v.string()),
     plan: v.optional(v.any()),
     validation: v.optional(v.any()),
@@ -449,6 +640,7 @@ export default defineSchema({
     sourceBranch: v.optional(v.string()),
     integrationBranch: v.optional(v.string()),
     integrationHeadSha: v.optional(v.string()),
+    integrationObservedAt: v.optional(v.number()),
     integrationGeneration: v.optional(v.number()),
     activeIntegrationAttemptId: v.optional(v.id("integrationAttempts")),
     integrationLeaseOwner: v.optional(v.string()),
@@ -503,6 +695,8 @@ export default defineSchema({
   // query, so a job heartbeat cannot amplify into a reread of those payloads.
   missionRuntime: defineTable({
     missionId: v.id("missions"),
+    admissionProtocolVersion: v.optional(v.number()),
+    protocolHoldReason: v.optional(v.string()),
     goal: v.string(),
     mode: v.string(),
     status: v.string(),
@@ -514,6 +708,7 @@ export default defineSchema({
     percent: v.number(),
     route: v.optional(v.string()),
     primaryRepo: v.optional(v.string()),
+    canonicalProjectId: v.optional(v.string()),
     revisionWave: v.number(),
     maxRevisionWaves: v.number(),
     maxBuildSessions: v.number(),
@@ -522,9 +717,15 @@ export default defineSchema({
     planDigest: v.optional(v.string()),
     planGeneration: v.optional(v.number()),
     planNodeCount: v.optional(v.number()),
+    materializationStatus: v.optional(v.string()),
+    materializationCursor: v.optional(v.number()),
+    materializationWaitingApprovals: v.optional(v.number()),
+    materializationCompletedAt: v.optional(v.number()),
     sourceBranch: v.optional(v.string()),
+    sourceHeadSha: v.optional(v.string()),
     integrationBranch: v.optional(v.string()),
     integrationHeadSha: v.optional(v.string()),
+    integrationObservedAt: v.optional(v.number()),
     integrationGeneration: v.optional(v.number()),
     activeIntegrationAttemptId: v.optional(v.id("integrationAttempts")),
     integrationLeaseUntil: v.optional(v.number()),
@@ -672,8 +873,22 @@ export default defineSchema({
     // optional until the exact dispatch crosses the worker fence, allowing
     // every event from enqueue onward to use one causal cursor.
     workspaceKey: v.optional(v.string()),
+    authorityDigest: v.optional(v.string()),
+    schedulingBindingDigest: v.optional(v.string()),
+    workOrderRevisionId: v.optional(v.id("workOrderRevisions")),
+    workOrderRevision: v.optional(v.number()),
+    workOrderRevisionDigest: v.optional(v.string()),
+    canonicalProjectId: v.optional(v.string()),
+    repository: v.optional(v.string()),
+    missionGroupId: v.optional(v.string()),
+    projectGroupId: v.optional(v.string()),
+    sourceBranch: v.optional(v.string()),
+    sourceAdmissionDigest: v.optional(v.string()),
     workspaceLineage: v.optional(v.string()),
+    workerLineage: v.optional(v.string()),
     workerBranch: v.optional(v.string()),
+    retryLineage: v.optional(v.string()),
+    integrationLineage: v.optional(v.string()),
     sessionId: v.optional(v.string()),
     workerRunId: v.optional(v.string()),
     dispatchId: v.optional(v.string()),
@@ -689,10 +904,12 @@ export default defineSchema({
       planDigest: v.optional(v.string()), planGeneration: v.optional(v.number()),
       sourceNodeId: v.optional(v.string()), sourceJobId: v.optional(v.string()),
       sourceAttempt: v.optional(v.number()), sourceSteerRevision: v.optional(v.number()),
+      workOrderRevisionDigest: v.optional(v.string()),
       reviewReceiptDigest: v.optional(v.string()), integrationReceiptDigest: v.optional(v.string()),
       repository: v.optional(v.string()), sourceBranch: v.optional(v.string()), sourceHeadSha: v.optional(v.string()),
       integrationBranch: v.optional(v.string()), integrationHeadSha: v.optional(v.string()),
       artifactRefs: v.optional(v.array(v.string())), resultDigest: v.optional(v.string()),
+      handoffPayloadDigest: v.optional(v.string()),
     }))),
     // The Trigger run is only delivery metadata. Sandbox/provider sessions
     // are deliberately separate identities for the sandbox adapter workstream.
@@ -778,6 +995,7 @@ export default defineSchema({
   // Full reviews, integration manifests and artifacts remain in their cold
   // authority tables and are loaded only by validators or explicit detail UI.
   goalHandoffs: defineTable({
+    handoffProtocolVersion: v.optional(v.number()),
     parentMissionId: v.id("missions"),
     planDigest: v.string(),
     planGeneration: v.number(),
@@ -785,14 +1003,36 @@ export default defineSchema({
     sourceJobId: v.id("jobs"),
     sourceAttempt: v.number(),
     sourceSteerRevision: v.number(),
+    authorityDigest: v.optional(v.string()),
+    schedulingBindingDigest: v.optional(v.string()),
+    workOrderRevisionId: v.optional(v.id("workOrderRevisions")),
+    workOrderRevision: v.optional(v.number()),
+    workOrderRevisionDigest: v.optional(v.string()),
+    workReceiptId: v.optional(v.id("workReceipts")),
+    workReceiptDigest: v.optional(v.string()),
+    acceptedResultDigest: v.optional(v.string()),
+    evidenceDigest: v.optional(v.string()),
+    terminalEventKey: v.optional(v.string()),
+    reviewReceiptId: v.optional(v.id("reviewReceipts")),
     reviewReceiptDigest: v.optional(v.string()),
+    integrationAttemptId: v.optional(v.id("integrationAttempts")),
+    integrationAttempt: v.optional(v.number()),
+    integrationGeneration: v.optional(v.number()),
+    integrationEffectId: v.optional(v.string()),
+    integrationBindingDigest: v.optional(v.string()),
+    integrationTerminalReceiptId: v.optional(v.id("integrationTerminalReceipts")),
+    integrationTerminalReceiptDigest: v.optional(v.string()),
     integrationReceiptDigest: v.optional(v.string()),
+    canonicalProjectId: v.optional(v.string()),
     repository: v.optional(v.string()),
+    sourceAdmissionDigest: v.optional(v.string()),
     sourceBranch: v.optional(v.string()),
     sourceHeadSha: v.optional(v.string()),
     integrationBranch: v.optional(v.string()),
     integrationHeadSha: v.optional(v.string()),
     artifactRefs: v.array(v.string()),
+    acceptedResultProjectionDigest: v.optional(v.string()),
+    handoffPayloadDigest: v.optional(v.string()),
     resultDigest: v.string(),
     summary: v.string(),
     createdAt: v.number(),
@@ -812,6 +1052,15 @@ export default defineSchema({
     revisionWave: v.number(),
     workstreamId: v.string(),
     repository: v.string(),
+    authorityDigest: v.optional(v.string()),
+    schedulingBindingDigest: v.optional(v.string()),
+    workOrderRevisionId: v.optional(v.id("workOrderRevisions")),
+    workOrderRevision: v.optional(v.number()),
+    workOrderRevisionDigest: v.optional(v.string()),
+    canonicalProjectId: v.optional(v.string()),
+    missionGroupId: v.optional(v.string()),
+    projectGroupId: v.optional(v.string()),
+    integrationLineage: v.optional(v.string()),
     sourceBranch: v.string(),
     workerBranch: v.string(),
     integrationBranch: v.string(),
@@ -828,6 +1077,10 @@ export default defineSchema({
     leaseVersion: v.number(),
     leaseUntil: v.optional(v.number()),
     expectedIntegrationBaseSha: v.optional(v.string()),
+    // Timestamp of the exact earlier provider observation that proved the
+    // expected base. Focused repair inherits it; Convex never fabricates a
+    // fresh observation timestamp for an unobserved ref.
+    expectedIntegrationBaseObservedAt: v.optional(v.number()),
     // Exact persisted old ref identity for GitHub updateRefs. The zero OID is
     // used only when the mission integration ref was intentionally absent.
     expectedIntegrationRefSha: v.optional(v.string()),
@@ -910,6 +1163,7 @@ export default defineSchema({
     missionId: v.id("missions"),
     jobId: v.id("jobs"),
     integrationAttemptId: v.id("integrationAttempts"),
+    workOrderRevisionDigest: v.optional(v.string()),
     outcome: v.string(),
     receiptJson: v.string(),
     receiptDigest: v.string(),
@@ -924,6 +1178,14 @@ export default defineSchema({
   // attempt's running/liveness state while GitHub checks are pending.
   deliveryAttempts: defineTable({
     jobId: v.id("jobs"),
+    authorityDigest: v.optional(v.string()),
+    schedulingBindingDigest: v.optional(v.string()),
+    workOrderRevisionId: v.optional(v.id("workOrderRevisions")),
+    workOrderRevision: v.optional(v.number()),
+    workOrderRevisionDigest: v.optional(v.string()),
+    canonicalProjectId: v.optional(v.string()),
+    repository: v.optional(v.string()),
+    missionGroupId: v.optional(v.string()),
     integrationAttemptId: v.optional(v.id("integrationAttempts")),
     sourceWorkAttempt: v.number(),
     generation: v.number(),
@@ -999,6 +1261,13 @@ export default defineSchema({
   workReceipts: defineTable({
     jobId: v.id("jobs"),
     attempt: v.number(),
+    authorityDigest: v.optional(v.string()),
+    schedulingBindingDigest: v.optional(v.string()),
+    workOrderRevisionId: v.optional(v.id("workOrderRevisions")),
+    workOrderRevision: v.optional(v.number()),
+    workOrderRevisionDigest: v.optional(v.string()),
+    canonicalProjectId: v.optional(v.string()),
+    repository: v.optional(v.string()),
     status: v.string(),
     acceptanceEvidence: v.array(v.string()),
     artifacts: v.array(v.string()),
@@ -1022,6 +1291,12 @@ export default defineSchema({
   reviewReceipts: defineTable({
     jobId: v.id("jobs"),
     attempt: v.number(),
+    authorityDigest: v.optional(v.string()),
+    schedulingBindingDigest: v.optional(v.string()),
+    workOrderRevisionId: v.optional(v.id("workOrderRevisions")),
+    workOrderRevision: v.optional(v.number()),
+    workOrderRevisionDigest: v.optional(v.string()),
+    canonicalProjectId: v.optional(v.string()),
     repository: v.string(),
     workerBranch: v.optional(v.string()),
     sourceBranch: v.optional(v.string()),

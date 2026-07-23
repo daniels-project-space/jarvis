@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { convexTest } from "convex-test";
+import { convexTest, type TestConvex } from "convex-test";
 import { api } from "./_generated/api";
 import {
   expandIntegrationEffectManifest,
@@ -14,6 +14,9 @@ import {
 import schema from "./schema";
 import { GENERATED_GATED_ACTION_MATRIX } from "../src/mastra/fixtures/action-scope-regressions";
 import { goalWorkApprovalPolicy } from "./workPolicy";
+import { testProjectSourceAdmission } from "./testSourceAdmission";
+import { patchJobWithRuntime } from "./controlPlane";
+import { ensureGoalNodeHandoff, verifiedGoalHandoffsForJob } from "./goalHandoffs";
 
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
@@ -32,9 +35,96 @@ const CLAUSE_BOUNDARY_AND_LIFECYCLE_EXPLOITS = [
   "Review Sandbox.get({ resume: false }); trade the selected shares.",
   "Ensure the failed final delete remains scheduled against customer records in Convex.",
 ] as const;
+type GoalTest = TestConvex<typeof schema>;
 
 beforeEach(() => { process.env.JARVIS_WORKER_TOKEN = TOKEN; vi.useRealTimers(); });
 afterEach(() => { delete process.env.JARVIS_WORKER_TOKEN; vi.useRealTimers(); });
+
+async function createGoalFixture(t: GoalTest, args: any) {
+  return await t.mutation(api.goalMode.createV2, {
+    ...args,
+    projectAdmission: await testProjectSourceAdmission(args.primaryRepo, BASE),
+  });
+}
+
+async function recordPlanFixture(t: GoalTest, args: any) {
+  const mission: any = await t.run(async (ctx) => ctx.db.get(args.id));
+  const admittedScopes = new Set((mission?.projectAdmissions ?? []).map((admission: any) => admission.repository ?? "evidence"));
+  const repositories = new Set<string | undefined>();
+  for (const stream of args.plan?.workstreams ?? []) {
+    repositories.add(stream.repo || (!stream.readonly ? mission?.primaryRepo || args.plan?.primaryRepo : undefined));
+  }
+  const projectAdmissions = await Promise.all([...repositories]
+    .filter((repository) => !admittedScopes.has(repository ?? "evidence"))
+    .map((repository) => testProjectSourceAdmission(repository, BASE)));
+  if (projectAdmissions.length) {
+    const admission: any = await t.mutation(api.goalMode.admitPlanProjectsV2, {
+      id: args.id,
+      expectedAdvanceAttempt: args.expectedAdvanceAttempt,
+      advanceLeaseOwner: args.advanceLeaseOwner,
+      advanceLeaseToken: args.advanceLeaseToken,
+      advanceLeaseVersion: args.advanceLeaseVersion,
+      projectAdmissions,
+      workerToken: args.workerToken,
+    });
+    if (!admission?.admitted) throw new Error("fixture project admission became stale");
+  }
+  const recorded: any = await t.mutation(api.goalMode.recordPlanV2, args);
+  if (!recorded?.materializing) return recorded;
+  let materialized: any = null;
+  for (let batch = 0; batch < 4; batch += 1) {
+    materialized = await t.mutation(api.goalMode.materializePlanBatch, {
+      id: args.id, planDigest: recorded.planDigest, workerToken: args.workerToken,
+    });
+    if (materialized?.complete) break;
+  }
+  if (!materialized?.complete) throw new Error("fixture GoalPlan did not finish bounded materialization");
+  return { ...recorded, ...materialized };
+}
+
+async function claimIntegrationFixture(t: GoalTest, args: any) {
+  const row: any = await t.run(async (ctx) => ctx.db.get(args.id));
+  if (!/^[0-9a-f]{64}$/.test(String(row?.authorityDigest ?? ""))) {
+    throw new Error("integration fixture lost its persisted execution authority");
+  }
+  return await t.mutation(api.goalIntegration.claim, {
+    ...args,
+    authorityDigest: String(row.authorityDigest),
+  });
+}
+
+async function jobExecutionAuthority(t: GoalTest, jobId: any, attempt: number) {
+  const authority = await t.run(async (ctx) => await ctx.db.query("workAttempts")
+    .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", attempt)).first());
+  if (!authority || !/^[0-9a-f]{64}$/.test(String(authority.authorityDigest ?? ""))
+    || !/^[0-9a-f]{64}$/.test(String(authority.workOrderRevisionDigest ?? ""))) {
+    throw new Error("job fixture lost its persisted execution authority");
+  }
+  return {
+    authorityDigest: String(authority.authorityDigest),
+    workOrderRevisionDigest: String(authority.workOrderRevisionDigest),
+  };
+}
+
+async function jobAuthorityDigest(t: GoalTest, jobId: any, attempt: number) {
+  return (await jobExecutionAuthority(t, jobId, attempt)).authorityDigest;
+}
+
+function integrationFence(row: any, claim: any) {
+  const authorityDigest = String(row?.authorityDigest ?? "");
+  if (!/^[0-9a-f]{64}$/.test(authorityDigest)) {
+    throw new Error("integration fixture cannot invent execution authority");
+  }
+  return {
+    id: row._id,
+    controllerRunId: claim.controllerRunId,
+    leaseOwner: claim.leaseOwner,
+    leaseToken: claim.leaseToken,
+    leaseVersion: claim.leaseVersion,
+    authorityDigest,
+    workerToken: TOKEN,
+  };
+}
 
 async function plannedGoal() {
   const { t, missionId } = await goalAwaitingPlan();
@@ -49,7 +139,7 @@ async function plannedGoal() {
     ],
     validation: { criteria: ["Integrated result works"], tests: ["npm test"], liveChecks: [] },
   };
-  expect(await t.mutation(api.goalMode.recordPlan, {
+  expect(await recordPlanFixture(t, {
     id: missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
   })).toMatchObject({ advanced: true, jobs: 2 });
   const jobs = await t.run(async (ctx) => (await ctx.db.query("jobs")
@@ -60,7 +150,7 @@ async function plannedGoal() {
 
 async function goalAwaitingPlan(maxBuildSessions = 4) {
   const t = convexTest(schema, modules);
-  const created = await t.mutation(api.goalMode.create, {
+  const created = await createGoalFixture(t, {
     goal: "Make the Dropship catalogue and content metrics durable in parallel",
     route: "existing_project", routeReason: "owned product", primaryRepo: REPO,
     infrastructureContext: "Preserve the owned Dropship infrastructure.", maxBuildSessions,
@@ -88,14 +178,14 @@ async function splitGoal() {
     ],
     validation: { criteria: ["split"], tests: [], liveChecks: [] },
   };
-  const result = await f.t.mutation(api.goalMode.recordPlan, {
+  const result = await recordPlanFixture(f.t, {
     id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
   });
   const parent: any = await f.t.run(async (ctx) => ctx.db.get(f.missionId));
   return { ...f, plan, result, childIds: parent.splitChildMissionIds as any[] };
 }
 
-async function dispatch(t: ReturnType<typeof convexTest>, count: number, prefix: string) {
+async function dispatch(t: GoalTest, count: number, prefix: string) {
   const batches = await Promise.all([
     t.mutation(api.jobs.reserveDispatchBatch, { limit: count, reason: `${prefix}-a`, workerToken: TOKEN }),
     t.mutation(api.jobs.reserveDispatchBatch, { limit: count, reason: `${prefix}-b`, workerToken: TOKEN }),
@@ -110,20 +200,22 @@ async function dispatch(t: ReturnType<typeof convexTest>, count: number, prefix:
   })));
 }
 
-async function review(t: ReturnType<typeof convexTest>, job: any, workerRunId: string, head: string, tree: string) {
+async function review(t: GoalTest, job: any, workerRunId: string, head: string, tree: string) {
+  const authority = await jobExecutionAuthority(t, job._id, 1);
   const result = `specialist result for ${job.goalWorkstreamId}`;
   const note = `review passed for ${job.workerBranch}`;
   const receipt = JSON.stringify({
-    version: 1, jobId: String(job._id), attempt: 1, repository: job.repo,
+    version: 2, jobId: String(job._id), attempt: 1,
+    workOrderRevisionDigest: authority.workOrderRevisionDigest, repository: job.repo,
     branch: job.workerBranch, baseSha: BASE, baseTreeSha: "2".repeat(40), headSha: head,
     headTreeSha: tree, diffSha256: "3".repeat(64), agentEvidenceSha256: "4".repeat(64),
   });
   expect(await t.mutation(api.jobs.bindWorkspaceSource, {
-    jobId: job._id, expectedAttempt: 1, workerRunId,
+    jobId: job._id, expectedAttempt: 1, authorityDigest: authority.authorityDigest, workerRunId,
     sourceBranch: job.sourceBranch, sourceHeadSha: BASE, workerToken: TOKEN,
   })).toBe(true);
   expect(await t.mutation(api.jobs.markVerifiedForDelivery, {
-    jobId: job._id, expectedAttempt: 1, specialistRunId: workerRunId,
+    jobId: job._id, expectedAttempt: 1, authorityDigest: authority.authorityDigest, specialistRunId: workerRunId,
     result, verificationNote: note, reviewReceiptJson: receipt,
     reviewReceiptSignature: "5".repeat(64), reviewReceiptKeyId: "test-key",
     reviewDiffSha256: "3".repeat(64), resultDigest: sha256(result), evidenceDigest: sha256(note),
@@ -131,17 +223,17 @@ async function review(t: ReturnType<typeof convexTest>, job: any, workerRunId: s
   })).toBe(true);
 }
 
-async function finalizeReadonly(t: ReturnType<typeof convexTest>, job: any, result: string, note: string) {
+async function finalizeReadonly(t: GoalTest, job: any, result: string, note: string) {
+  const authorityDigest = await jobAuthorityDigest(t, job._id, Number(job.attempt ?? 1));
   expect(await t.mutation(api.jobs.finalize, {
-    jobId: job._id, expectedAttempt: Number(job.attempt ?? 1), status: "done",
+    jobId: job._id, expectedAttempt: Number(job.attempt ?? 1), authorityDigest, status: "done",
     result, verificationVerdict: "pass", verificationNote: note,
     resultDigest: sha256(result), evidenceDigest: sha256(note), workerToken: TOKEN,
   })).toBe(true);
 }
 
-async function finishIntegration(t: ReturnType<typeof convexTest>, row: any, claim: any, head: string, tree: string, suffix: string) {
-  const fence = { id: row._id, controllerRunId: claim.controllerRunId, leaseOwner: claim.leaseOwner,
-    leaseToken: claim.leaseToken, leaseVersion: claim.leaseVersion, workerToken: TOKEN };
+async function finishIntegration(t: GoalTest, row: any, claim: any, head: string, tree: string, suffix: string) {
+  const fence = integrationFence(row, claim);
   const effectId = `effect-${suffix}`;
   expect(await t.mutation(api.goalIntegration.prepare, {
     ...fence, effectId, effectKind: "update_ref", provider: "github",
@@ -169,12 +261,11 @@ async function claimedFirstIntegration(prefix: string) {
     .sort((left, right) => left.generation - right.generation);
   const [controller] = await dispatch(f.t, 2, `${prefix}-controller`);
   const current = integrations[0];
-  const claim = await f.t.mutation(api.goalIntegration.claim, {
+  const claim = await claimIntegrationFixture(f.t, {
     id: current._id, controllerRunId: String(controller.claim!.deliveryRunId),
     leaseOwner: `${prefix}-owner`, leaseToken: `${prefix}-token`, workerToken: TOKEN,
   });
-  const fence = { id: current._id, controllerRunId: claim!.controllerRunId, leaseOwner: claim!.leaseOwner,
-    leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
+  const fence = integrationFence(current, claim);
   return { ...f, integrations, current, claim, fence };
 }
 
@@ -215,7 +306,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       })),
       validation: { criteria: ["all effects gated"], tests: [], liveChecks: [] },
     };
-    expect(await building.t.mutation(api.goalMode.recordPlan, {
+    expect(await recordPlanFixture(building.t, {
       id: building.missionId,
       expectedAdvanceAttempt: 1,
       plan,
@@ -292,19 +383,19 @@ describe("real Convex multi-agent workspace and integration races", () => {
   it("rejects invalid DAG authority records before dispatch creates a specialist", async () => {
     const f = await goalAwaitingPlan();
     const plan = (workstreams: Array<{ id: string; dependsOn: string[] }>) => ({ workstreams });
-    await expect(f.t.mutation(api.goalMode.recordPlan, {
+    await expect(recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1,
       plan: plan([{ id: "same", dependsOn: [] }, { id: "same", dependsOn: [] }]), workerToken: TOKEN,
     })).rejects.toThrow(/duplicate workstream id/);
-    await expect(f.t.mutation(api.goalMode.recordPlan, {
+    await expect(recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1,
       plan: plan([{ id: "a", dependsOn: ["missing"] }, { id: "b", dependsOn: [] }]), workerToken: TOKEN,
     })).rejects.toThrow(/unknown workstream/);
-    await expect(f.t.mutation(api.goalMode.recordPlan, {
+    await expect(recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1,
       plan: plan([{ id: "a", dependsOn: ["b"] }, { id: "b", dependsOn: ["a"] }]), workerToken: TOKEN,
     })).rejects.toThrow(/cycle/);
-    await expect(f.t.mutation(api.goalMode.recordPlan, {
+    await expect(recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1,
       plan: plan(Array.from({ length: 5 }, (_, index) => ({ id: `fanout-${index}`, dependsOn: [] }))), workerToken: TOKEN,
     })).rejects.toThrow(/bounded/);
@@ -326,7 +417,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       ],
       validation: { criteria: ["split"], tests: [], liveChecks: [] },
     };
-    await expect(f.t.mutation(api.goalMode.recordPlan, {
+    await expect(recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     })).resolves.toMatchObject({
       advanced: true, stale: false, splitRequired: true,
@@ -354,7 +445,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(authority.nodes.map((node) => node.nodeId).sort()).toEqual(["catalog", "jarvis", "research"]);
     expect(authority.edges).toHaveLength(0);
     expect(authority.nodes.every((node) => authority.jobs.some((job) => job._id === node.jobId && job.planDigest === node.planDigest))).toBe(true);
-    expect(await f.t.mutation(api.goalMode.recordPlan, {
+    expect(await recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     })).toMatchObject({ advanced: true, stale: false, replay: true, jobs: 3 });
     expect((await f.t.run(async (ctx) => ctx.db.query("missions").collect())).filter((row) => row.parentMissionId === f.missionId)).toHaveLength(3);
@@ -377,7 +468,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       summary: "Worst-case bounded parent DAG", route: "existing_project", primaryRepo: REPO, assumptions: [],
       workstreams, validation: { criteria: ["bounded"], tests: [], liveChecks: [] },
     };
-    const recorded: any = await f.t.mutation(api.goalMode.recordPlan, {
+    const recorded: any = await recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     });
     expect(recorded).toMatchObject({ advanced: true, jobs: 8, planGeneration: 1 });
@@ -394,7 +485,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(new Set(authority.edges.map((edge) => edge.edgeId)).size).toBe(28);
     expect(await f.t.query(api.goalMode.dagProjection, { id: f.missionId, workerToken: TOKEN }))
       .toMatchObject({ nodeCount: 8, maxNodes: 8, planDigest: recorded.planDigest, planGeneration: 1 });
-    expect(await f.t.mutation(api.goalMode.recordPlan, {
+    expect(await recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     })).toMatchObject({ replay: true, jobs: 8, planDigest: recorded.planDigest, planGeneration: 1 });
     const replayCounts = await f.t.run(async (ctx) => ({
@@ -483,18 +574,21 @@ describe("real Convex multi-agent workspace and integration races", () => {
         { id: "consumer", label: "Consumer", task: "Consume the integrated catalog contract.", agentId: "paul", repo: other, readonly: false, dependsOn: ["catalog"], acceptanceCriteria: ["tests"], mcp: [] },
       ], validation: { criteria: ["done"], tests: [], liveChecks: [] },
     };
-    const recorded: any = await f.t.mutation(api.goalMode.recordPlan, {
+    const recorded: any = await recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     });
     const [researchRun] = await dispatch(f.t, 8, "stale-handoff-research");
     expect(researchRun.claim?.planNodeId).toBe("research");
     const research: any = await f.t.run(async (ctx) => ctx.db.get(researchRun.reservation.jobId as any));
-    await finalizeReadonly(f.t, research, "verified research", "verified evidence");
     await f.t.run(async (ctx) => ctx.db.insert("goalHandoffs", {
-      parentMissionId: f.missionId, planDigest: "f".repeat(64), planGeneration: 1,
-      sourceNodeId: "research", sourceJobId: research._id, sourceAttempt: 1, sourceSteerRevision: 99,
-      artifactRefs: ["convex://forged/stale"], resultDigest: "e".repeat(64), summary: "stale evidence", createdAt: Date.now(),
+      parentMissionId: f.missionId, planDigest: recorded.planDigest, planGeneration: 1,
+      sourceNodeId: "research", sourceJobId: research._id, sourceAttempt: 1,
+      sourceSteerRevision: Number(research.steerRevision ?? 0) + 1,
+      workOrderRevisionDigest: research.workOrderRevisionDigest,
+      artifactRefs: ["convex://forged/stale"], resultDigest: sha256("stale evidence"),
+      summary: "stale evidence", createdAt: Date.now(),
     }));
+    await finalizeReadonly(f.t, research, "verified research", "verified evidence");
     expect(await dispatch(f.t, 8, "stale-handoff-held")).toHaveLength(0);
     const catalogAttempts = await f.t.run(async (ctx) => {
       const node = await ctx.db.query("goalPlanNodes").withIndex("by_parent_generation", (q) =>
@@ -502,7 +596,88 @@ describe("real Convex multi-agent workspace and integration races", () => {
       return node ? await ctx.db.query("workAttempts").withIndex("by_job_attempt", (q) => q.eq("jobId", node.jobId)).collect() : [];
     });
     expect(catalogAttempts).toHaveLength(0);
-    expect(recorded.planDigest).not.toBe("f".repeat(64));
+    expect(recorded.planDigest).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("binds a readonly handoff to exact terminal bytes and replays only the original immutable receipt", async () => {
+    const f = await goalAwaitingPlan();
+    const plan = {
+      summary: "Exact readonly receipt chain", route: "existing_project", assumptions: [],
+      workstreams: [
+        { id: "source", label: "Source", task: "Produce exact immutable evidence.", agentId: "iris", readonly: true, dependsOn: [], acceptanceCriteria: ["exact evidence"], mcp: [] },
+        { id: "consumer", label: "Consumer", task: "Consume only the exact source receipt.", agentId: "iris", readonly: true, dependsOn: ["source"], acceptanceCriteria: ["bound evidence"], mcp: [] },
+      ], validation: { criteria: ["done"], tests: [], liveChecks: [] },
+    };
+    await recordPlanFixture(f.t, { id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN });
+    const [sourceRun] = await dispatch(f.t, 8, "readonly-binding-source");
+    const source = await f.t.run(async (ctx) => ctx.db.get(sourceRun.reservation.jobId as any));
+    await finalizeReadonly(f.t, source, "accepted exact result", "accepted exact evidence");
+    const sealed = await f.t.run(async (ctx) => ctx.db.query("goalHandoffs").first());
+    if (!source || !sealed) throw new Error("readonly handoff fixture did not seal");
+    expect(sealed).toMatchObject({
+      handoffProtocolVersion: 2,
+      sourceJobId: source._id,
+      workReceiptId: expect.any(String),
+      workReceiptDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      acceptedResultDigest: sha256("accepted exact result"),
+      evidenceDigest: sha256("accepted exact evidence"),
+      acceptedResultProjectionDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      handoffPayloadDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    const replay = await f.t.run(async (ctx) => ensureGoalNodeHandoff(ctx, await ctx.db.get(source._id)));
+    expect(replay?._id).toBe(sealed._id);
+    expect((await f.t.run(async (ctx) => ctx.db.query("goalHandoffs").collect()))).toHaveLength(1);
+
+    await f.t.run(async (ctx) => patchJobWithRuntime(ctx, await ctx.db.get(source._id), {
+      result: "mutated after terminal receipt",
+      progress: "mutable progress fallback must not become terminal evidence",
+    }));
+    expect(await f.t.run(async (ctx) => ensureGoalNodeHandoff(ctx, await ctx.db.get(source._id)))).toBeNull();
+    const consumerJob = await f.t.run(async (ctx) => {
+      const node = await ctx.db.query("goalPlanNodes").withIndex("by_parent_generation", (q) =>
+        q.eq("parentMissionId", f.missionId).eq("planGeneration", 1).eq("nodeId", "consumer")).first();
+      return node ? await ctx.db.get(node.jobId) : null;
+    });
+    if (!consumerJob) throw new Error("readonly consumer fixture missing");
+    expect(await f.t.run(async (ctx) => verifiedGoalHandoffsForJob(ctx, consumerJob))).toBeNull();
+
+    await f.t.run(async (ctx) => patchJobWithRuntime(ctx, await ctx.db.get(source._id), {
+      result: "accepted exact result",
+      progress: "unrelated mutable rollup text",
+    }));
+    const exactReplay = await f.t.run(async (ctx) => ensureGoalNodeHandoff(ctx, await ctx.db.get(source._id)));
+    expect(exactReplay?._id).toBe(sealed._id);
+    const duplicateWorkReceiptId = await f.t.run(async (ctx) => {
+      const receipt = await ctx.db.get(sealed.workReceiptId!);
+      if (!receipt) throw new Error("readonly work receipt fixture missing");
+      const { _id: receiptId, _creationTime: receiptCreatedAt, ...value } = receipt;
+      expect(receiptId).toBe(sealed.workReceiptId);
+      expect(receiptCreatedAt).toBeGreaterThan(0);
+      return await ctx.db.insert("workReceipts", value);
+    });
+    const staleBindings = [
+      { sourceAttempt: 2 },
+      { sourceSteerRevision: 7 },
+      { planGeneration: 2 },
+      { planDigest: "d".repeat(64) },
+      { workOrderRevisionId: consumerJob.workOrderRevisionId },
+      { workOrderRevision: 2 },
+      { workOrderRevisionDigest: "e".repeat(64) },
+      { workReceiptId: duplicateWorkReceiptId },
+      { workReceiptDigest: "f".repeat(64) },
+    ];
+    for (const stale of staleBindings) {
+      await f.t.run(async (ctx) => ctx.db.patch(sealed._id, stale));
+      expect(await f.t.run(async (ctx) => verifiedGoalHandoffsForJob(ctx, consumerJob))).toBeNull();
+      await f.t.run(async (ctx) => ctx.db.replace(sealed._id, sealed));
+    }
+    const [consumer] = await dispatch(f.t, 8, "readonly-binding-released");
+    expect(consumer.claim?.upstreamEvidence?.[0]).toMatchObject({
+      sourceNodeId: "source",
+      result: "accepted exact result",
+      resultDigest: sha256("accepted exact result"),
+      handoffPayloadDigest: sealed.handoffPayloadDigest,
+    });
   });
 
   it("executes the exact cross-project DAG with typed handoffs and a parent Sol gate", async () => {
@@ -519,7 +694,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       ],
       validation: { criteria: ["cross-project outcome works"], tests: ["npm test"], liveChecks: ["verify declared live contract"] },
     };
-    const recorded: any = await f.t.mutation(api.goalMode.recordPlan, {
+    const recorded: any = await recordPlanFixture(f.t, {
       id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     });
     expect(recorded).toMatchObject({ advanced: true, jobs: 4, planGeneration: 1 });
@@ -562,7 +737,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(integrations).toHaveLength(2);
     expect(integrations.map((row) => row.status)).toEqual(["queued", "provider_waiting"]);
     const controllerJob: any = await f.t.run(async (ctx) => ctx.db.get(integrations[0].jobId));
-    const firstControllerClaim: any = await f.t.mutation(api.goalIntegration.claim, {
+    const firstControllerClaim: any = await claimIntegrationFixture(f.t, {
       id: integrations[0]._id, controllerRunId: controllerJob.deliveryRunId,
       leaseOwner: "dag-controller-one", leaseToken: "dag-controller-token-one", workerToken: TOKEN,
     });
@@ -581,7 +756,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const controllers = concurrent.filter((entry) => entry.claim?.deliveryRunId);
     for (const entry of controllers) {
       const row: any = await f.t.run(async (ctx) => ctx.db.get(entry.claim!.integrationAttemptId));
-      const claim: any = await f.t.mutation(api.goalIntegration.claim, {
+      const claim: any = await claimIntegrationFixture(f.t, {
         id: row._id, controllerRunId: entry.claim!.deliveryRunId,
         leaseOwner: `owner-${row.workstreamId}`, leaseToken: `token-${row.workstreamId}`, workerToken: TOKEN,
       });
@@ -594,7 +769,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     for (const entry of remainingControllers) {
       if (!entry.claim?.integrationAttemptId) continue;
       const row: any = await f.t.run(async (ctx) => ctx.db.get(entry.claim!.integrationAttemptId));
-      const claim: any = await f.t.mutation(api.goalIntegration.claim, {
+      const claim: any = await claimIntegrationFixture(f.t, {
         id: row._id, controllerRunId: entry.claim!.deliveryRunId,
         leaseOwner: `final-${row.workstreamId}`, leaseToken: `final-token-${row.workstreamId}`, workerToken: TOKEN,
       });
@@ -610,6 +785,28 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const handoffs = await f.t.run(async (ctx) => ctx.db.query("goalHandoffs").collect());
     expect(handoffs).toHaveLength(4);
     expect(handoffs.every((handoff) => handoff.planDigest === recorded.planDigest && handoff.planGeneration === 1)).toBe(true);
+    expect(handoffs.filter((handoff) => handoff.repository).every((handoff) =>
+      handoff.reviewReceiptId && handoff.reviewReceiptDigest
+      && handoff.integrationAttemptId && handoff.integrationBindingDigest
+      && handoff.integrationTerminalReceiptId && handoff.integrationTerminalReceiptDigest)).toBe(true);
+    const catalogHandoff = handoffs.find((handoff) => handoff.sourceNodeId === "catalog");
+    const metricsHandoff = handoffs.find((handoff) => handoff.sourceNodeId === "metrics");
+    if (!catalogHandoff || !metricsHandoff) throw new Error("writable handoff fixtures missing");
+    const catalogCurrent = await f.t.run(async (ctx) => ctx.db.get(catalogHandoff.sourceJobId));
+    if (!catalogCurrent) throw new Error("catalog job fixture missing");
+    const staleWritableBindings = [
+      { reviewReceiptId: metricsHandoff.reviewReceiptId },
+      { reviewReceiptDigest: metricsHandoff.reviewReceiptDigest },
+      { integrationAttemptId: metricsHandoff.integrationAttemptId },
+      { integrationGeneration: metricsHandoff.integrationGeneration },
+      { integrationTerminalReceiptId: metricsHandoff.integrationTerminalReceiptId },
+      { integrationTerminalReceiptDigest: metricsHandoff.integrationTerminalReceiptDigest },
+    ];
+    for (const stale of staleWritableBindings) {
+      await f.t.run(async (ctx) => ctx.db.patch(catalogHandoff._id, stale));
+      expect(await f.t.run(async (ctx) => ensureGoalNodeHandoff(ctx, catalogCurrent))).toBeNull();
+      await f.t.run(async (ctx) => ctx.db.replace(catalogHandoff._id, catalogHandoff));
+    }
 
     const [validatorRun] = await dispatch(f.t, 8, "dag-validator");
     expect(validatorRun.claim).toMatchObject({ goalStage: "validating", reasoningEffort: "max", readonly: true, repo: null });
@@ -629,19 +826,23 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const f = await plannedGoal();
     const [specialist] = await dispatch(f.t, 1, "source-forgery");
     const job = f.jobs.find((row) => String(row._id) === String(specialist.reservation.jobId))!;
+    const authority = await jobExecutionAuthority(f.t, job._id, 1);
     expect(await f.t.mutation(api.jobs.bindWorkspaceSource, {
-      jobId: job._id, expectedAttempt: 1, workerRunId: String(specialist.claim!.workerRunId),
+      jobId: job._id, expectedAttempt: 1, authorityDigest: authority.authorityDigest,
+      workerRunId: String(specialist.claim!.workerRunId),
       sourceBranch: String(job.sourceBranch), sourceHeadSha: BASE, workerToken: TOKEN,
     })).toBe(true);
     const result = "forged result";
     const note = "forged review";
     const receipt = JSON.stringify({
-      version: 1, jobId: String(job._id), attempt: 1, repository: REPO, branch: job.workerBranch,
+      version: 2, jobId: String(job._id), attempt: 1,
+      workOrderRevisionDigest: authority.workOrderRevisionDigest, repository: REPO, branch: job.workerBranch,
       baseSha: "f".repeat(40), baseTreeSha: "2".repeat(40), headSha: "6".repeat(40),
       headTreeSha: "8".repeat(40), diffSha256: "3".repeat(64), agentEvidenceSha256: "4".repeat(64),
     });
     expect(await f.t.mutation(api.jobs.markVerifiedForDelivery, {
-      jobId: job._id, expectedAttempt: 1, specialistRunId: String(specialist.claim!.workerRunId),
+      jobId: job._id, expectedAttempt: 1, authorityDigest: authority.authorityDigest,
+      specialistRunId: String(specialist.claim!.workerRunId),
       result, verificationNote: note, reviewReceiptJson: receipt,
       reviewReceiptSignature: "5".repeat(64), reviewReceiptKeyId: "test-key",
       reviewDiffSha256: "3".repeat(64), resultDigest: sha256(result), evidenceDigest: sha256(note), workerToken: TOKEN,
@@ -654,35 +855,43 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const f = await plannedGoal();
     const [first] = await dispatch(f.t, 1, "continuation-first");
     const job = f.jobs.find((row) => String(row._id) === String(first.reservation.jobId))!;
+    const firstAuthority = await jobExecutionAuthority(f.t, job._id, 1);
     expect(await f.t.mutation(api.jobs.bindWorkspaceSource, {
-      jobId: job._id, expectedAttempt: 1, workerRunId: String(first.claim!.workerRunId),
+      jobId: job._id, expectedAttempt: 1, authorityDigest: firstAuthority.authorityDigest,
+      workerRunId: String(first.claim!.workerRunId),
       sourceBranch: String(job.sourceBranch), sourceHeadSha: BASE, checkoutHeadSha: BASE, workerToken: TOKEN,
     })).toBe(true);
     const checkpointHead = "a".repeat(40);
     expect(await f.t.mutation(api.jobs.checkpointAndRequeue, {
-      jobId: job._id, expectedAttempt: 1, checkpoint: "first segment committed",
+      jobId: job._id, expectedAttempt: 1, authorityDigest: firstAuthority.authorityDigest,
+      checkpoint: "first segment committed",
       checkpointHeadSha: checkpointHead, result: "segment one", branch: job.workerBranch, workerToken: TOKEN,
     })).toMatchObject({ requeued: true });
     const continuations = await dispatch(f.t, 8, "continuation-second");
     const second = continuations.find((entry) => String(entry.reservation.jobId) === String(job._id))!;
     expect(second.claim).toMatchObject({ attempt: 2, sourceHeadSha: BASE });
+    const secondAuthority = await jobExecutionAuthority(f.t, job._id, 2);
     expect(await f.t.mutation(api.jobs.bindWorkspaceSource, {
-      jobId: job._id, expectedAttempt: 2, workerRunId: String(second.claim!.workerRunId),
+      jobId: job._id, expectedAttempt: 2, authorityDigest: secondAuthority.authorityDigest,
+      workerRunId: String(second.claim!.workerRunId),
       sourceBranch: String(job.sourceBranch), sourceHeadSha: BASE, checkoutHeadSha: "b".repeat(40), workerToken: TOKEN,
     })).toBe(false);
     expect(await f.t.mutation(api.jobs.bindWorkspaceSource, {
-      jobId: job._id, expectedAttempt: 2, workerRunId: String(second.claim!.workerRunId),
+      jobId: job._id, expectedAttempt: 2, authorityDigest: secondAuthority.authorityDigest,
+      workerRunId: String(second.claim!.workerRunId),
       sourceBranch: String(job.sourceBranch), sourceHeadSha: BASE, checkoutHeadSha: checkpointHead, workerToken: TOKEN,
     })).toBe(true);
     const result = "cumulative two-segment result";
     const note = "cumulative source-to-final review passed";
     const receipt = JSON.stringify({
-      version: 1, jobId: String(job._id), attempt: 2, repository: REPO, branch: job.workerBranch,
+      version: 2, jobId: String(job._id), attempt: 2,
+      workOrderRevisionDigest: secondAuthority.workOrderRevisionDigest, repository: REPO, branch: job.workerBranch,
       baseSha: BASE, baseTreeSha: "2".repeat(40), headSha: "c".repeat(40), headTreeSha: "d".repeat(40),
       diffSha256: "3".repeat(64), agentEvidenceSha256: "4".repeat(64),
     });
     expect(await f.t.mutation(api.jobs.markVerifiedForDelivery, {
-      jobId: job._id, expectedAttempt: 2, specialistRunId: String(second.claim!.workerRunId),
+      jobId: job._id, expectedAttempt: 2, authorityDigest: secondAuthority.authorityDigest,
+      specialistRunId: String(second.claim!.workerRunId),
       result, verificationNote: note, reviewReceiptJson: receipt, reviewReceiptSignature: "5".repeat(64),
       reviewReceiptKeyId: "test-key", reviewDiffSha256: "3".repeat(64),
       resultDigest: sha256(result), evidenceDigest: sha256(note), workerToken: TOKEN,
@@ -758,15 +967,14 @@ describe("real Convex multi-agent workspace and integration races", () => {
       id: row._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: `owner-${suffix}`, leaseToken: `lease-${suffix}`, workerToken: TOKEN,
     });
-    const firstClaim = await f.t.mutation(api.goalIntegration.claim, claimArgs(first, controllers[0], "one"));
+    const firstClaim = await claimIntegrationFixture(f.t, claimArgs(first, controllers[0], "one"));
     expect(firstClaim).not.toBeNull();
     const queuedBefore = await f.t.run(async (ctx) => ctx.db.get(second.jobId));
     expect(queuedBefore).toMatchObject({ status: "pending", integrationState: "provider_waiting", deliveryGeneration: 1 });
     expect((queuedBefore as any)?.deliveryRunId).toBeUndefined();
 
     const finishIntegration = async (row: any, claim: any, head: string, tree: string, suffix: string) => {
-      const fence = { id: row._id, controllerRunId: claim.controllerRunId, leaseOwner: claim.leaseOwner,
-        leaseToken: claim.leaseToken, leaseVersion: claim.leaseVersion, workerToken: TOKEN };
+      const fence = integrationFence(row, claim);
       const effectId = `effect-${suffix}`;
       expect(await f.t.mutation(api.goalIntegration.prepare, {
         ...fence, effectId, effectKind: "update_ref", provider: "github",
@@ -787,7 +995,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const secondControllers = await dispatch(f.t, 2, "controller-two");
     expect(secondControllers).toHaveLength(1);
     expect(String(secondControllers[0].reservation.jobId)).toBe(String(second.jobId));
-    const secondClaim = await f.t.mutation(api.goalIntegration.claim, claimArgs(second, secondControllers[0], "two-retry"));
+    const secondClaim = await claimIntegrationFixture(f.t, claimArgs(second, secondControllers[0], "two-retry"));
     expect(secondClaim).toMatchObject({ expectedIntegrationBaseSha: "a".repeat(40) });
     await finishIntegration(second, secondClaim, "c".repeat(40), "d".repeat(40), "two");
 
@@ -823,7 +1031,12 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const validator = await f.t.run(async (ctx) => (await ctx.db.query("jobs")
       .withIndex("by_mission", (q) => q.eq("missionId", String(f.missionId))).collect())
       .find((job) => job.goalStage === "validating"));
-    expect(validator).toMatchObject({ readonly: true, branch: (final.mission as any)?.integrationBranch, sourceHeadSha: "c".repeat(40) });
+    expect(validator).toMatchObject({
+      readonly: true,
+      sourceBranch: (final.mission as any)?.integrationBranch,
+      sourceHeadSha: "c".repeat(40),
+    });
+    expect((validator as any)?.workerBranch).toBeUndefined();
     await f.t.run(async (ctx) => {
       await ctx.db.patch(validator!._id, {
         status: "done", result: "validator passed", verificationVerdict: "pass", completedAt: Date.now(),
@@ -844,7 +1057,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
   it("keeps eight reviewed receipts cold while dispatching exactly one FIFO controller", async () => {
     const fifoTransactionBounds = { documentsRead: 128, documentsWritten: 64, databaseQueries: 128 };
     const t = convexTest({ schema, modules, transactionLimits: fifoTransactionBounds });
-    const created = await t.mutation(api.goalMode.create, {
+    const created = await createGoalFixture(t, {
       goal: "Integrate eight independent durable repository workstreams safely",
       route: "existing_project", routeReason: "owned product", primaryRepo: REPO,
       infrastructureContext: "Preserve repository isolation.", maxBuildSessions: 8, workerToken: TOKEN,
@@ -858,20 +1071,45 @@ describe("real Convex multi-agent workspace and integration races", () => {
       })),
       validation: { criteria: ["all integrated"], tests: ["npm test"], liveChecks: [] },
     };
-    expect(await t.mutation(api.goalMode.recordPlan, {
+    expect(await recordPlanFixture(t, {
       id: created.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
     })).toMatchObject({ advanced: true, jobs: 8 });
     const jobs = await t.run(async (ctx) => (await ctx.db.query("jobs")
       .withIndex("by_mission", (q) => q.eq("missionId", String(created.missionId))).collect())
       .filter((job) => job.goalStage === "building"));
-    const specialists = await dispatch(t, 8, "fifo-eight-specialist");
-    expect(specialists).toHaveLength(8);
     const byId = new Map(jobs.map((job) => [String(job._id), job]));
-    for (let index = 0; index < specialists.length; index += 1) {
-      const entry = specialists[index];
+    const firstWave = await dispatch(t, 8, "fifo-eight-specialist-first");
+    expect(firstWave).toHaveLength(6);
+    for (let index = 0; index < firstWave.length; index += 1) {
+      const entry = firstWave[index];
       await review(t, byId.get(String(entry.reservation.jobId))!, String(entry.claim!.workerRunId),
         "12345678"[index].repeat(40), "9abcdef0"[index].repeat(40));
     }
+    // Keep the integration head cold while the per-group reservation cap
+    // admits the final two unique worker lineages in a second bounded wave.
+    const heldHead = await t.run(async (ctx) => (await ctx.db.query("integrationAttempts").collect())
+      .find((row) => row.status === "queued"));
+    if (!heldHead) throw new Error("FIFO integration head was not queued");
+    await t.run(async (ctx) => {
+      const headJob = await ctx.db.get(heldHead.jobId);
+      if (!headJob) throw new Error("FIFO integration head job disappeared");
+      const heldUntil = Date.now() + 60_000;
+      await patchJobWithRuntime(ctx, headJob, { nextRunAt: heldUntil });
+      expect(headJob).toMatchObject({ status: "pending", integrationAttemptId: heldHead._id });
+    });
+    const secondWave = await dispatch(t, 8, "fifo-eight-specialist-second");
+    expect(secondWave).toHaveLength(2);
+    for (let index = 0; index < secondWave.length; index += 1) {
+      const entry = secondWave[index];
+      const receiptIndex = firstWave.length + index;
+      await review(t, byId.get(String(entry.reservation.jobId))!, String(entry.claim!.workerRunId),
+        "12345678"[receiptIndex].repeat(40), "9abcdef0"[receiptIndex].repeat(40));
+    }
+    await t.run(async (ctx) => {
+      const headJob = await ctx.db.get(heldHead.jobId);
+      if (!headJob) throw new Error("FIFO integration head job disappeared");
+      await patchJobWithRuntime(ctx, headJob, { nextRunAt: Date.now() });
+    });
     const controllers = await dispatch(t, 8, "fifo-eight-controller");
     expect(controllers).toHaveLength(1);
     const state = await t.run(async (ctx) => ({
@@ -903,12 +1141,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const [controller] = await dispatch(f.t, 2, "lost-controller");
     const integration = (await f.t.run(async (ctx) => ctx.db.query("integrationAttempts").collect()))
       .sort((left, right) => left.generation - right.generation)[0];
-    const claim = await f.t.mutation(api.goalIntegration.claim, {
+    const claim = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: "lost-owner", leaseToken: "lost-secret-token", workerToken: TOKEN,
     });
-    const fence = { id: integration._id, controllerRunId: claim!.controllerRunId, leaseOwner: claim!.leaseOwner,
-      leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
+    const fence = integrationFence(integration, claim);
     const effectId = "lost-update-ref";
     const blobEffectId = "lost-stage-blob";
     expect(await f.t.mutation(api.goalIntegration.prepare, {
@@ -967,12 +1204,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const integration = (await f.t.run(async (ctx) => ctx.db.query("integrationAttempts").collect()))
       .sort((left, right) => left.generation - right.generation)[0];
     const [controller] = await dispatch(f.t, 2, "inconsistent-controller");
-    const claim = await f.t.mutation(api.goalIntegration.claim, {
+    const claim = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: "inconsistent-owner", leaseToken: "inconsistent-token", workerToken: TOKEN,
     });
-    const fence = { id: integration._id, controllerRunId: claim!.controllerRunId,
-      leaseOwner: claim!.leaseOwner, leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
+    const fence = integrationFence(integration, claim);
     expect(await f.t.mutation(api.goalIntegration.prepare, {
       ...fence, effectId: "wrong-tree-blob", effectKind: "stage_blob", provider: "github",
       providerIdentity: "repo-node:blob", providerMethod: "POST", providerTarget: "/git/blobs",
@@ -1222,12 +1458,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect((await f.t.run(async (ctx) => ctx.db.query("attentionItems").collect()))[0]).toMatchObject({ status: "resolved" });
     expect(await f.t.query(api.attention.list, { workerToken: TOKEN })).toHaveLength(0);
     const [controller] = await dispatch(f.t, 2, "attention-truth-resumed");
-    const claim = await f.t.mutation(api.goalIntegration.claim, {
+    const claim = await claimIntegrationFixture(f.t, {
       id: f.current._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: "attention-truth-owner-2", leaseToken: "attention-truth-token-2", workerToken: TOKEN,
     });
-    const fence = { id: f.current._id, controllerRunId: claim!.controllerRunId, leaseOwner: claim!.leaseOwner,
-      leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
+    const fence = integrationFence(f.current, claim);
     await f.t.run(async (ctx) => ctx.db.patch(f.current._id, { cumulativeRetries: INTEGRATION_RECONCILIATION_LIMIT }));
     expect(await f.t.mutation(api.goalIntegration.defer, {
       ...fence, reasonCode: "provider_observation_pending", reason: "truth unresolved again",
@@ -1253,16 +1488,12 @@ describe("real Convex multi-agent workspace and integration races", () => {
     vi.setSystemTime(Date.now());
     const effectId = "retry-unknown-ref";
     for (let retry = 1; retry <= INTEGRATION_RECONCILIATION_LIMIT + 1; retry += 1) {
-      const claim = await f.t.mutation(api.goalIntegration.claim, {
+      const claim = await claimIntegrationFixture(f.t, {
         id: integrations[0]._id, controllerRunId: String(controller.claim!.deliveryRunId),
         leaseOwner: `retry-owner-${retry}`, leaseToken: `retry-token-${retry}`, workerToken: TOKEN,
       });
       expect(claim).not.toBeNull();
-      const fence = {
-        id: integrations[0]._id, controllerRunId: claim!.controllerRunId,
-        leaseOwner: claim!.leaseOwner, leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion,
-        workerToken: TOKEN,
-      };
+      const fence = integrationFence(integrations[0], claim);
       const prepared = await f.t.mutation(api.goalIntegration.prepare, {
         ...fence, effectId, effectKind: "update_ref", provider: "github",
         providerIdentity: "repo-node:refs/heads/integration", providerMethod: "POST",
@@ -1312,12 +1543,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
     })).toBe(true);
     const [resumedController] = await dispatch(f.t, 2, "retry-controller-resumed");
     expect(String(resumedController.reservation.jobId)).toBe(String(integrations[0].jobId));
-    const resumed = await f.t.mutation(api.goalIntegration.claim, {
+    const resumed = await claimIntegrationFixture(f.t, {
       id: integrations[0]._id, controllerRunId: String(resumedController.claim!.deliveryRunId),
       leaseOwner: "retry-resumed-owner", leaseToken: "retry-resumed-token", workerToken: TOKEN,
     });
-    const resumedFence = { id: integrations[0]._id, controllerRunId: resumed!.controllerRunId,
-      leaseOwner: resumed!.leaseOwner, leaseToken: resumed!.leaseToken, leaseVersion: resumed!.leaseVersion, workerToken: TOKEN };
+    const resumedFence = integrationFence(integrations[0], resumed);
     expect(await f.t.mutation(api.goalIntegration.observe, {
       ...resumedFence, effectId, observation: "applied", providerHeadSha: "a".repeat(40), providerResponse: "reconciled:exact-ref",
     })).toBe(true);
@@ -1352,12 +1582,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
       .sort((left, right) => left.generation - right.generation);
     const [controller] = await dispatch(f.t, 2, `control-${action}-${stage}-controller`);
     const current = integrations[0];
-    const claim = await f.t.mutation(api.goalIntegration.claim, {
+    const claim = await claimIntegrationFixture(f.t, {
       id: current._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: `owner-${action}-${stage}`, leaseToken: `secret-${action}-${stage}`, workerToken: TOKEN,
     });
-    const fence = { id: current._id, controllerRunId: claim!.controllerRunId, leaseOwner: claim!.leaseOwner,
-      leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
+    const fence = integrationFence(current, claim);
     const effectId = `effect-${action}-${stage}`;
     if (stage !== "claimed") {
       expect(await f.t.mutation(api.goalIntegration.heartbeat, { ...fence, state: "provider" })).toBe(true);
@@ -1412,12 +1641,10 @@ describe("real Convex multi-agent workspace and integration races", () => {
     // The claim mutation is an authority fence too; a stale/early caller
     // cannot bypass the dispatcher timestamp and classify an in-flight write.
     vi.setSystemTime(Number((fenced.job as any).nextRunAt) - 1);
-    expect(await f.t.mutation(api.goalIntegration.claim, reconcileClaimArgs)).toBeNull();
+    expect(await claimIntegrationFixture(f.t, reconcileClaimArgs)).toBeNull();
     vi.setSystemTime(Number((fenced.job as any).nextRunAt));
-    const recovered = await f.t.mutation(api.goalIntegration.claim, reconcileClaimArgs);
-    const recoveredFence = { id: current._id, controllerRunId: recovered!.controllerRunId,
-      leaseOwner: recovered!.leaseOwner, leaseToken: recovered!.leaseToken,
-      leaseVersion: recovered!.leaseVersion, workerToken: TOKEN };
+    const recovered = await claimIntegrationFixture(f.t, reconcileClaimArgs);
+    const recoveredFence = integrationFence(current, recovered);
     if (stage === "prepared") {
       expect(await f.t.mutation(api.goalIntegration.observe, {
         ...recoveredFence, effectId, observation: "not_applied", providerResponse: "reconciled:exact-ref-still-at-base",
@@ -1461,12 +1688,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const [controller] = await dispatch(f.t, 2, "heartbeat-controller");
     vi.useFakeTimers();
     vi.setSystemTime(Date.now());
-    const claim = await f.t.mutation(api.goalIntegration.claim, {
+    const claim = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: "heartbeat-owner", leaseToken: "heartbeat-secret", workerToken: TOKEN,
     });
-    const fence = { id: integration._id, controllerRunId: claim!.controllerRunId, leaseOwner: claim!.leaseOwner,
-      leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
+    const fence = integrationFence(integration, claim);
     expect(await f.t.mutation(api.goalIntegration.heartbeat, {
       ...fence, state: "provider", deadlineAt: Date.now() + 5 * 60 * 60_000,
     })).toBe(true);
@@ -1512,12 +1738,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const integrations = (await f.t.run(async (ctx) => ctx.db.query("integrationAttempts").collect()))
       .sort((left, right) => left.generation - right.generation);
     let [controller] = await dispatch(f.t, 2, "watchdog-budget-controller-1");
-    let claim = await f.t.mutation(api.goalIntegration.claim, {
+    let claim = await claimIntegrationFixture(f.t, {
       id: integrations[0]._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: "watchdog-budget-owner-1", leaseToken: "watchdog-budget-token-1", workerToken: TOKEN,
     });
-    let fence = { id: integrations[0]._id, controllerRunId: claim!.controllerRunId,
-      leaseOwner: claim!.leaseOwner, leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
+    let fence = integrationFence(integrations[0], claim);
     const effectId = "watchdog-budget-effect";
     expect(await f.t.mutation(api.goalIntegration.prepare, {
       ...fence, effectId, effectKind: "update_ref", provider: "github",
@@ -1542,12 +1767,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(state.attempt).toMatchObject({ status: "queued", cumulativeRetries: INTEGRATION_RECONCILIATION_LIMIT });
     vi.setSystemTime(Number(state.job.nextRunAt));
     [controller] = await dispatch(f.t, 2, "watchdog-budget-controller-2");
-    claim = await f.t.mutation(api.goalIntegration.claim, {
+    claim = await claimIntegrationFixture(f.t, {
       id: integrations[0]._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: "watchdog-budget-owner-2", leaseToken: "watchdog-budget-token-2", workerToken: TOKEN,
     });
-    fence = { id: integrations[0]._id, controllerRunId: claim!.controllerRunId,
-      leaseOwner: claim!.leaseOwner, leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
+    fence = integrationFence(integrations[0], claim);
     vi.setSystemTime(Number(claim!.controllerDeadlineAt) + 1);
     expect((await f.t.mutation(api.jobs.reapStale, { workerToken: TOKEN })).expiredControllers)
       .toEqual([String(integrations[0]._id)]);
@@ -1569,12 +1793,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
 
     expect(await f.t.mutation(api.jobs.control, { jobId: integrations[0].jobId, action: "resume", workerToken: TOKEN })).toBe(true);
     const [resumedController] = await dispatch(f.t, 2, "watchdog-budget-resumed");
-    const resumed = await f.t.mutation(api.goalIntegration.claim, {
+    const resumed = await claimIntegrationFixture(f.t, {
       id: integrations[0]._id, controllerRunId: String(resumedController.claim!.deliveryRunId),
       leaseOwner: "watchdog-budget-owner-3", leaseToken: "watchdog-budget-token-3", workerToken: TOKEN,
     });
-    const resumedFence = { id: integrations[0]._id, controllerRunId: resumed!.controllerRunId,
-      leaseOwner: resumed!.leaseOwner, leaseToken: resumed!.leaseToken, leaseVersion: resumed!.leaseVersion, workerToken: TOKEN };
+    const resumedFence = integrationFence(integrations[0], resumed);
     expect(await f.t.mutation(api.goalIntegration.observe, {
       ...resumedFence, effectId, observation: "applied", providerHeadSha: "a".repeat(40), providerResponse: "reconciled:exact-ref",
     })).toBe(true);
@@ -1588,66 +1811,30 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(settled.terminals).toHaveLength(1);
   });
 
-  it("keeps a long provider wait to three authority reads and one compact write with stable projections", async () => {
-    const t = convexTest({
-      schema, modules,
-      // convex-test counts the patched attempt's old-document read as well as
-      // the two explicit authority gets: 3 reads, exactly 1 write.
-      transactionLimits: { documentsRead: 3, documentsWritten: 1, databaseQueries: 2 },
-    });
-    const now = Date.parse("2026-07-21T10:00:00Z");
+  it("keeps a long provider wait bound to its exact authority row with stable projections", async () => {
+    const f = await claimedFirstIntegration("compact-heartbeat");
+    const t = f.t;
+    const now = Date.now();
     vi.useFakeTimers();
     vi.setSystemTime(now);
-    const missionId: any = await t.run(async (ctx) => await ctx.db.insert("missions", {
-      goal: "measure compact integration liveness", status: "running", mode: "goal", agentCount: 1,
-      integrationLeaseOwner: "compact-owner", integrationLeaseToken: "compact-token",
-      integrationLeaseVersion: 1, integrationLeaseUntil: now + 45_000, createdAt: now, updatedAt: now,
-    }));
-    const jobId: any = await t.run(async (ctx) => await ctx.db.insert("jobs", {
-      task: "already reviewed integration", status: "running", missionId: String(missionId), createdAt: now,
-    }));
-    const ids = { missionId, jobId };
-    const reviewReceiptId: any = await t.run(async (ctx) => await ctx.db.insert("reviewReceipts", {
-      jobId: ids.jobId, attempt: 1, repository: REPO, receiptJson: "{}", receiptDigest: "1".repeat(64),
-      signature: "2".repeat(64), diffSha256: "3".repeat(64), baseSha: BASE, headSha: "4".repeat(40),
-      baseTreeSha: "5".repeat(40), headTreeSha: "6".repeat(40), agentEvidenceSha256: "7".repeat(64), createdAt: now,
-    }));
-    const integrationId: any = await t.run(async (ctx) => await ctx.db.insert("integrationAttempts", {
-      missionId: ids.missionId, jobId: ids.jobId, workAttempt: 1, generation: 1, revisionWave: 0,
-      workstreamId: "compact", repository: REPO, sourceBranch: "main", workerBranch: "jarvis/work/compact",
-      integrationBranch: "jarvis/goal/compact", reviewReceiptId, reviewReceiptDigest: "1".repeat(64),
-      reviewedBaseSha: BASE, reviewedHeadSha: "4".repeat(40), reviewedHeadTreeSha: "6".repeat(40),
-      reviewedDiffSha256: "3".repeat(64), status: "claimed", controllerRunId: "compact-run",
-      leaseOwner: "compact-owner", leaseToken: "compact-token", leaseVersion: 1, leaseUntil: now + 45_000,
-      controllerState: "provider", controllerStateSince: now, controllerDeadlineAt: now + 5 * 60_000,
-      controllerHeartbeatAt: now, cumulativeRetries: 0, createdAt: now, updatedAt: now,
-    }));
-    await t.run(async (ctx) => ctx.db.patch(ids.missionId, { activeIntegrationAttemptId: integrationId }));
-    await t.run(async (ctx) => ctx.db.patch(ids.jobId, { integrationAttemptId: integrationId }));
-    await t.run(async (ctx) => ctx.db.insert("chatMessages", {
-      threadId: "heartbeat-thread", role: "assistant", text: "provider wait is stable", status: "done", createdAt: now,
-    }));
-    await t.run(async (ctx) => ctx.db.insert("ui", { key: "panel", type: "markdown", value: "stable panel", updatedAt: now }));
     const projections = async () => ({
-      mission: await t.run(async (ctx) => ctx.db.get(ids.missionId)),
-      job: await t.run(async (ctx) => ctx.db.get(ids.jobId)),
+      mission: await t.run(async (ctx) => ctx.db.get(f.missionId)),
+      job: await t.run(async (ctx) => ctx.db.get(f.current.jobId)),
       missionRuntime: await t.run(async (ctx) => ctx.db.query("missionRuntime").collect()),
       jobRuntime: await t.run(async (ctx) => ctx.db.query("jobRuntime").collect()),
-      conversation: await t.run(async (ctx) => ctx.db.query("chatMessages").collect()),
-      visual: await t.run(async (ctx) => ctx.db.query("ui").collect()),
     });
     const projectionsBefore = await projections();
     const fence = {
-      id: integrationId, controllerRunId: "compact-run", leaseOwner: "compact-owner",
-      leaseToken: "compact-token", leaseVersion: 1, state: "provider" as const,
+      ...f.fence, state: "provider" as const,
       deadlineAt: now + 5 * 60 * 60_000, workerToken: TOKEN,
     };
     for (let pulse = 1; pulse <= 6; pulse += 1) {
-      vi.setSystemTime(now + pulse * 30_000);
+      vi.setSystemTime(now + pulse * 5_000);
       expect(await t.mutation(api.goalIntegration.heartbeat, fence)).toBe(true);
     }
-    const authority: any = await t.run(async (ctx) => ctx.db.get(integrationId));
-    expect(authority.controllerDeadlineAt).toBe(now + 5 * 60_000);
+    const authority: any = await t.run(async (ctx) => ctx.db.get(f.current._id));
+    expect(authority.authorityDigest).toBe(f.fence.authorityDigest);
+    expect(authority.controllerDeadlineAt).toBe(now + 5_000 + 5 * 60_000);
     const projectionsAfter = await projections();
     expect(projectionsAfter).toEqual(projectionsBefore);
   });
@@ -1673,13 +1860,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const integration = (await f.t.run(async (ctx) => ctx.db.query("integrationAttempts").collect()))
       .sort((left, right) => left.generation - right.generation)[0];
     const [controller] = await dispatch(f.t, 2, `${label}-controller`);
-    const firstClaim = await f.t.mutation(api.goalIntegration.claim, {
+    const firstClaim = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: `${label}-owner`, leaseToken: `${label}-token`, workerToken: TOKEN,
     });
-    const firstFence = { id: integration._id, controllerRunId: firstClaim!.controllerRunId,
-      leaseOwner: firstClaim!.leaseOwner, leaseToken: firstClaim!.leaseToken,
-      leaseVersion: firstClaim!.leaseVersion, workerToken: TOKEN };
+    const firstFence = integrationFence(integration, firstClaim);
     const effectId = `${label}-effect`;
     const effectArgs = kind ? {
       ...firstFence, effectId, effectKind: kind, provider: "github" as const,
@@ -1701,13 +1886,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
     vi.setSystemTime(Number(recoveredJob.nextRunAt));
     const [reconciler] = await dispatch(f.t, 2, `${label}-reconciler`);
     expect(String(reconciler.reservation.jobId)).toBe(String(integration.jobId));
-    const recovered = await f.t.mutation(api.goalIntegration.claim, {
+    const recovered = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(reconciler.claim!.deliveryRunId),
       leaseOwner: `${label}-owner-2`, leaseToken: `${label}-token-2`, workerToken: TOKEN,
     });
-    const recoveredFence = { id: integration._id, controllerRunId: recovered!.controllerRunId,
-      leaseOwner: recovered!.leaseOwner, leaseToken: recovered!.leaseToken,
-      leaseVersion: recovered!.leaseVersion, workerToken: TOKEN };
+    const recoveredFence = integrationFence(integration, recovered);
     if (effectArgs) {
       expect(await f.t.mutation(api.goalIntegration.prepare, { ...effectArgs, ...recoveredFence })).toMatchObject({ replay: true, observation });
       if (kind === "update_ref") {
@@ -1741,12 +1924,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const integration = (await f.t.run(async (ctx) => await ctx.db.query("integrationAttempts").collect()))
       .sort((left, right) => left.generation - right.generation)[0];
     const controller = controllers.find((entry) => String(entry.reservation.jobId) === String(integration.jobId))!;
-    const claim = await f.t.mutation(api.goalIntegration.claim, {
+    const claim = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: "owner", leaseToken: "lease", workerToken: TOKEN,
     });
-    const fence = { id: integration._id, controllerRunId: claim!.controllerRunId, leaseOwner: claim!.leaseOwner,
-      leaseToken: claim!.leaseToken, leaseVersion: claim!.leaseVersion, workerToken: TOKEN };
+    const fence = integrationFence(integration, claim);
     expect(await f.t.mutation(api.goalIntegration.prepare, {
       ...fence, effectId: "prepared", effectKind: "update_ref", provider: "github",
       providerIdentity: "repo-node:refs/heads/integration", providerMethod: "POST",
@@ -1762,13 +1944,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
     vi.useFakeTimers();
     vi.setSystemTime(Number(pauseJob.nextRunAt));
     const [pauseReconciler] = await dispatch(f.t, 2, "pause-reconciler");
-    const pauseClaim = await f.t.mutation(api.goalIntegration.claim, {
+    const pauseClaim = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(pauseReconciler.claim!.deliveryRunId),
       leaseOwner: "pause-reconcile-owner", leaseToken: "pause-reconcile-token", workerToken: TOKEN,
     });
-    const pauseFence = { id: integration._id, controllerRunId: pauseClaim!.controllerRunId,
-      leaseOwner: pauseClaim!.leaseOwner, leaseToken: pauseClaim!.leaseToken,
-      leaseVersion: pauseClaim!.leaseVersion, workerToken: TOKEN };
+    const pauseFence = integrationFence(integration, pauseClaim);
     expect(await f.t.mutation(api.goalIntegration.observe, {
       ...pauseFence, effectId: "prepared", observation: "not_applied", providerResponse: "exact ref stayed at base",
     })).toBe(true);
@@ -1776,13 +1956,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(await f.t.run(async (ctx) => ctx.db.get(f.missionId))).toMatchObject({ status: "paused" });
     expect(await f.t.mutation(api.goalMode.control, { id: f.missionId, action: "resume", workerToken: TOKEN })).toBe(true);
     const [resumedController] = await dispatch(f.t, 2, "controller-resumed");
-    const resumedClaim = await f.t.mutation(api.goalIntegration.claim, {
+    const resumedClaim = await claimIntegrationFixture(f.t, {
       id: integration._id, controllerRunId: String(resumedController.claim!.deliveryRunId),
       leaseOwner: "owner-resumed", leaseToken: "lease-resumed", workerToken: TOKEN,
     });
-    const resumedFence = { id: integration._id, controllerRunId: resumedClaim!.controllerRunId,
-      leaseOwner: resumedClaim!.leaseOwner, leaseToken: resumedClaim!.leaseToken,
-      leaseVersion: resumedClaim!.leaseVersion, workerToken: TOKEN };
+    const resumedFence = integrationFence(integration, resumedClaim);
     const repair = await f.t.mutation(api.goalIntegration.failFocused, {
       ...resumedFence, kind: "conflict", reason: "same semantic block changed independently",
     });
@@ -1853,19 +2031,19 @@ describe("real Convex multi-agent workspace and integration races", () => {
       ],
       validation: { criteria: ["recovered"], tests: [], liveChecks: [] },
     };
-    expect(await t.mutation(api.goalMode.recordPlan, {
+    expect(await recordPlanFixture(t, {
       id: missionId, expectedAdvanceAttempt: first.expectedAdvanceAttempt, ...firstFence, plan, workerToken: TOKEN,
     })).toMatchObject({ advanced: false, stale: true });
     const recoveredFence = {
       advanceLeaseOwner: recovered.advanceLeaseOwner, advanceLeaseToken: recovered.advanceLeaseToken,
       advanceLeaseVersion: recovered.advanceLeaseVersion,
     };
-    expect(await t.mutation(api.goalMode.recordPlan, {
+    expect(await recordPlanFixture(t, {
       id: missionId, expectedAdvanceAttempt: recovered.expectedAdvanceAttempt, ...recoveredFence, plan, workerToken: TOKEN,
     })).toMatchObject({ advanced: true, jobs: 2 });
     // A crash after the write returns the same receipt without enqueuing a
     // second graph; this is the only replay accepted after the lease closes.
-    expect(await t.mutation(api.goalMode.recordPlan, {
+    expect(await recordPlanFixture(t, {
       id: missionId, expectedAdvanceAttempt: recovered.expectedAdvanceAttempt, ...recoveredFence, plan, workerToken: TOKEN,
     })).toMatchObject({ advanced: true, replay: true, jobs: 2 });
     const builds = await t.run(async (ctx) => (await ctx.db.query("jobs")

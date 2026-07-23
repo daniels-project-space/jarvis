@@ -4,6 +4,7 @@ import { requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from 
 import { normalizeWorkModelTier } from "../src/lib/work-models";
 import { insertMissionWithRuntime, patchMissionWithRuntime, runtimeMission } from "./controlPlane";
 import { classifyFleetHealth } from "../src/lib/fleet-health";
+import { projectSourceAdmissionValidator, validProjectAdmissions } from "./sourceAdmission";
 
 const SYNTHESIS_LEASE_MS = 20 * 60 * 1000;
 
@@ -67,6 +68,11 @@ function missionJobActivity(job: any) {
 // LAST one to land flips the mission to "synthesizing" exactly once, and the
 // runner then merges all results into a single report.
 
+const LEGACY_ADMISSION_HOLD = "protocol_v1_admission_held";
+
+// Kept byte-for-byte compatible with the pre-v2 caller contract. Once the
+// additive Convex release lands, old producers still receive a durable mission
+// id, but cannot accidentally create executable work without source authority.
 export const create = mutation({
   args: {
     goal: v.string(),
@@ -82,10 +88,54 @@ export const create = mutation({
   },
   handler: async (ctx, a) => {
     await requireDispatcher(ctx, a);
+    const now = Date.now();
+    return await insertMissionWithRuntime(ctx, {
+      goal: a.goal.slice(0, 500),
+      mode: "fleet",
+      status: "needs_input",
+      agentCount: Math.max(0, Math.floor(a.agentCount)),
+      originThreadId: a.originThreadId,
+      managerAgentId: a.managerAgentId ?? "jarvis",
+      priority: Math.max(0, Math.min(100, a.priority ?? 50)),
+      risk: a.risk ?? "low",
+      phase: "protocol_hold",
+      percent: 0,
+      acceptanceCriteria: a.acceptanceCriteria,
+      admissionProtocolVersion: 1,
+      protocolHoldReason: LEGACY_ADMISSION_HOLD,
+      failureReason: "Legacy mission admission is durably held until the v2 source-authority rollout is active",
+      createdAt: now,
+      updatedAt: now,
+    });
+  },
+});
+
+export const createV2 = mutation({
+  args: {
+    goal: v.string(),
+    agentCount: v.number(),
+    originThreadId: v.optional(v.string()),
+    managerAgentId: v.optional(v.string()),
+    priority: v.optional(v.number()),
+    risk: v.optional(v.string()),
+    acceptanceCriteria: v.optional(v.array(v.string())),
+    mode: v.optional(v.union(v.literal("fleet"), v.literal("single"))),
+    projectAdmissions: v.array(projectSourceAdmissionValidator),
+    authTokenHash: v.optional(v.string()),
+    dispatchToken: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    await requireDispatcher(ctx, a);
+    if (!await validProjectAdmissions(a.projectAdmissions, { requireFresh: true })) {
+      throw new Error("Mission requires fresh canonical project source admissions");
+    }
     const { authTokenHash: _authTokenHash, dispatchToken: _dispatchToken, workerToken: _workerToken, ...mission } = a;
+    const repositoryAdmission = mission.projectAdmissions.length === 1 ? mission.projectAdmissions[0] : undefined;
     return await insertMissionWithRuntime(ctx, {
       goal: mission.goal.slice(0, 500),
-      mode: "fleet",
+      admissionProtocolVersion: 2,
+      mode: mission.mode ?? "fleet",
       status: "running",
       agentCount: mission.agentCount,
       originThreadId: mission.originThreadId,
@@ -95,6 +145,15 @@ export const create = mutation({
       phase: "delegating",
       percent: 0,
       acceptanceCriteria: mission.acceptanceCriteria,
+      projectAdmissions: mission.projectAdmissions,
+      canonicalProjectId: repositoryAdmission?.canonicalProjectId,
+      primaryRepo: repositoryAdmission?.repository,
+      sourceProvider: repositoryAdmission?.sourceProvider,
+      sourceBranch: repositoryAdmission?.sourceBranch,
+      sourceRef: repositoryAdmission?.sourceRef,
+      sourceHeadSha: repositoryAdmission?.sourceHeadSha,
+      sourceObservedAt: repositoryAdmission?.sourceObservedAt,
+      sourceAdmissionDigest: repositoryAdmission?.sourceAdmissionDigest,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });

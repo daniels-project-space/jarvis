@@ -14,9 +14,10 @@ export type GitCommandEvidence = Readonly<{
 }>;
 
 export type GitReviewReceipt = Readonly<{
-  version: 1;
+  version: 2;
   jobId: string;
   attempt: number;
+  workOrderRevisionDigest: string;
   repository: string;
   branch: string;
   baseSha: string;
@@ -41,6 +42,7 @@ export type GitReviewReceipt = Readonly<{
 export type GitReviewBinding = Readonly<{
   jobId: string;
   attempt: number;
+  workOrderRevisionDigest: string;
   repository: string;
   branch: string;
   baseSha: string;
@@ -64,6 +66,7 @@ type BuildReceiptInput = {
   runGit: GitCommandRunner;
   jobId: string;
   attempt: number;
+  workOrderRevisionDigest: string;
   repository: string;
   expectedBranch: string;
   baseSha: string;
@@ -133,6 +136,9 @@ export function commandEvidenceFromCodexEvent(
  */
 export async function buildGitReviewReceipt(input: BuildReceiptInput): Promise<BuildReceiptResult> {
   try {
+    if (!/^[0-9a-f]{64}$/.test(input.workOrderRevisionDigest)) {
+      return { ok: false, note: "work-order revision digest is invalid" };
+    }
     const shallow = await requiredGit(input.runGit, ["rev-parse", "--is-shallow-repository"], "history depth");
     if (shallow.value !== "false") {
       return { ok: false, note: "review checkout history is shallow; parent and ancestry claims are unverifiable" };
@@ -205,9 +211,10 @@ export async function buildGitReviewReceipt(input: BuildReceiptInput): Promise<B
 
     const safeEvidence = redactSensitiveText(input.agentEvidence);
     const receipt: GitReviewReceipt = deepFreeze({
-      version: 1,
+      version: 2,
       jobId: input.jobId.slice(0, 160),
       attempt: Math.max(1, Math.floor(input.attempt)),
+      workOrderRevisionDigest: input.workOrderRevisionDigest,
       repository: input.repository.slice(0, 160),
       branch: branch.value.slice(0, 240),
       baseSha,
@@ -231,6 +238,7 @@ export async function buildGitReviewReceipt(input: BuildReceiptInput): Promise<B
     const binding: GitReviewBinding = deepFreeze({
       jobId: receipt.jobId,
       attempt: receipt.attempt,
+      workOrderRevisionDigest: receipt.workOrderRevisionDigest,
       repository: receipt.repository,
       branch: receipt.branch,
       baseSha: receipt.baseSha,
@@ -269,6 +277,7 @@ export function createGitReviewReceiptKeyring(
   const matchesBinding = (receipt: GitReviewReceipt, expected: GitReviewBinding) =>
     receipt.jobId === expected.jobId
     && receipt.attempt === expected.attempt
+    && receipt.workOrderRevisionDigest === expected.workOrderRevisionDigest
     && receipt.repository === expected.repository
     && receipt.branch === expected.branch
     && receipt.baseSha === expected.baseSha

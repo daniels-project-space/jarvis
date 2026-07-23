@@ -18,12 +18,13 @@ export const USER_RELEVANT_STATUSES = [
 ] as const;
 
 const RELEVANT = new Set<string>(USER_RELEVANT_STATUSES);
+const HIERARCHY_ACTIVE = new Set(["dispatching", "running", "paused", "stalled", "needs_input", "awaiting_approval", "steering"]);
 const ROUTINE_WORK = /\b(?:health[ -]?(?:check|audit)|cloud health|heartbeat|uptime|stack poll|sentry sweep|provider health|lease reaper|execution reaper|reaper|control-plane migration|runtime migration|cron(?:job)?|routine (?:monitor|poll)|background (?:monitor|poll)|system monitor|stack monitor)\b/i;
 
-type RuntimeRow = Record<string, any>;
-type PlanNodeRow = Record<string, any>;
-type PlanEdgeRow = Record<string, any>;
-type HandoffRow = Record<string, any>;
+type RuntimeRow = Record<string, unknown>;
+type PlanNodeRow = Record<string, unknown>;
+type PlanEdgeRow = Record<string, unknown>;
+type HandoffRow = Record<string, unknown>;
 
 export function isUserRelevantWork(row: RuntimeRow, threadId: string): boolean {
   if (!RELEVANT.has(String(row.status ?? ""))) return false;
@@ -142,6 +143,112 @@ function mergeState(row: RuntimeRow): string {
   return row.readonly ? "evidence only" : "not started";
 }
 
+function runtimeRepository(row: RuntimeRow): string | null {
+  if (typeof row.projectRepository === "string") return row.projectRepository.slice(0, 120);
+  if (typeof row.repo === "string") return row.repo.slice(0, 120);
+  return null;
+}
+
+function hierarchyRuntimeNode(row: RuntimeRow) {
+  const attention = needsAttention(row);
+  return {
+    id: String(row.planNodeId ?? row.jobId),
+    jobId: String(row.jobId),
+    label: String(row.label ?? row.task ?? "Agent work").slice(0, 120),
+    agent: String(row.agentId ?? "jarvis").slice(0, 40),
+    repository: runtimeRepository(row),
+    state: nodeState(row, 0, 0),
+    status: String(row.status),
+    stage: String(row.stage ?? row.status).slice(0, 80),
+    percent: Math.max(0, Math.min(100, Number(row.percent ?? 0))),
+    progress: String(row.progress ?? "").slice(0, 180),
+    progressAt: typeof row.progressAt === "number" ? row.progressAt : null,
+    model: row.model ?? null,
+    reasoningEffort: row.reasoningEffort ?? null,
+    modelReason: typeof row.modelReason === "string" ? row.modelReason.slice(0, 300) : null,
+    workerRuntime: row.workerRuntime ?? null,
+    workerRunId: row.workerRunId ?? null,
+    generation: Number(row.deliveryGeneration ?? row.goalWave ?? 0),
+    attempt: Math.max(1, Number(row.attempt ?? 1)),
+    maxAttempts: Math.max(1, Number(row.maxAttempts ?? 1)),
+    dependencyCount: Array.isArray(row.dependsOn) ? row.dependsOn.length : 0,
+    dependenciesReady: 0,
+    integrationState: String(row.integrationState ?? "not_applicable"),
+    deliveryStatus: row.deliveryStatus ?? null,
+    mergeState: mergeState(row),
+    recoverySummary: recoverySummary(row),
+    needsDaniel: attention,
+    attentionReason: attention ? String(row.stallReason ?? row.progress ?? row.stage ?? row.status).slice(0, 180) : null,
+    controls: controlsFor(row),
+    startedAt: typeof row.startedAt === "number" ? row.startedAt : null,
+  };
+}
+
+type HierarchyJob = ReturnType<typeof hierarchyRuntimeNode>;
+type HierarchyProject = {
+  id: string;
+  canonicalProjectId: string;
+  repository: string | null;
+  jobs: HierarchyJob[];
+};
+type HierarchyMission = {
+  id: string;
+  label: string;
+  status: string;
+  phase: string;
+  projects: HierarchyProject[];
+};
+type HierarchyMissionAccumulator = Omit<HierarchyMission, "projects"> & {
+  projects: Map<string, HierarchyProject>;
+};
+
+/**
+ * One compact ownership tree for every genuinely live worker in the thread.
+ * Persisted mission/project ids are the grouping keys; labels and repository
+ * names are display-only and can never merge two authority groups.
+ */
+export function buildActiveWorkHierarchy(rows: readonly RuntimeRow[], threadId: string, mission?: RuntimeRow | null) {
+  const missions = new Map<string, HierarchyMissionAccumulator>();
+  const seenJobs = new Set<string>();
+  for (const row of selectRelevantWork(rows, threadId)) {
+    if (!HIERARCHY_ACTIVE.has(String(row.status))) continue;
+    const jobId = String(row.jobId ?? "");
+    if (!jobId || seenJobs.has(jobId)) continue;
+    seenJobs.add(jobId);
+    const missionId = String(row.missionGroupId ?? row.planParentMissionId ?? row.missionId ?? `work:${jobId}`);
+    const projectId = String(row.projectGroupId ?? row.missionId ?? `project:${jobId}`);
+    const missionMatches = mission
+      && String(mission.missionId ?? mission._id ?? "") === missionId;
+    let missionGroup = missions.get(missionId);
+    if (!missionGroup) {
+      missionGroup = {
+        id: missionId,
+        label: String(missionMatches ? mission.goal : row.label ?? row.task ?? "Live mission").slice(0, 500),
+        status: String(missionMatches ? mission.status : row.status),
+        phase: String(missionMatches ? mission.phase : row.stage ?? row.status),
+        projects: new Map<string, HierarchyProject>(),
+      };
+      missions.set(missionId, missionGroup);
+    }
+    let project = missionGroup.projects.get(projectId);
+    if (!project) {
+      const created: HierarchyProject = {
+        id: projectId,
+        canonicalProjectId: String(row.canonicalProjectId ?? (row.projectRepository ?? row.repo) ?? "evidence").slice(0, 120),
+        repository: runtimeRepository(row),
+        jobs: [],
+      };
+      missionGroup.projects.set(projectId, created);
+      project = created;
+    }
+    project.jobs.push(hierarchyRuntimeNode(row));
+  }
+  return [...missions.values()].map((group) => ({
+    ...group,
+    projects: [...group.projects.values()],
+  }));
+}
+
 export function buildFleetSnapshot(input: {
   threadId: string;
   activeRows: RuntimeRow[];
@@ -153,7 +260,8 @@ export function buildFleetSnapshot(input: {
 }) {
   const relevant = selectRelevantWork(input.activeRows, input.threadId);
   const primary = relevant[0];
-  if (!primary) return { active: null, fleet: null };
+  const hierarchy = buildActiveWorkHierarchy(input.activeRows, input.threadId, input.mission);
+  if (!primary) return { active: null, fleet: null, hierarchy };
 
   const rawNodes = input.nodes?.length
     ? [...input.nodes]
@@ -183,6 +291,9 @@ export function buildFleetSnapshot(input: {
   const validHandoffs = new Set((input.handoffs ?? []).filter((handoff) => {
     const activity = activityByJob.get(String(handoff.sourceJobId));
     return activity
+      && handoff.handoffProtocolVersion === 2
+      && typeof handoff.handoffPayloadDigest === "string"
+      && typeof handoff.workReceiptDigest === "string"
       && (!input.mission?.planDigest || handoff.planDigest === input.mission.planDigest)
       && Number(handoff.sourceAttempt) === Number(activity.attempt ?? 1)
       && Number(handoff.sourceSteerRevision) === Number(activity.steerRevision ?? 0);
@@ -224,6 +335,7 @@ export function buildFleetSnapshot(input: {
       progress: String(row.progress ?? "").slice(0, 180),
       progressAt: typeof row.progressAt === "number" ? row.progressAt : null,
       model: row.model ?? null, reasoningEffort: row.reasoningEffort ?? null,
+      modelReason: typeof row.modelReason === "string" ? row.modelReason.slice(0, 300) : null,
       workerRuntime: row.workerRuntime ?? null, workerRunId: row.workerRunId ?? null,
       generation: Number(row.deliveryGeneration ?? row.goalWave ?? 0),
       attempt: Math.max(1, Number(row.attempt ?? 1)), maxAttempts: Math.max(1, Number(row.maxAttempts ?? 1)),
@@ -239,7 +351,8 @@ export function buildFleetSnapshot(input: {
   const missionId = input.mission ? String(input.mission.missionId ?? input.mission._id) : null;
   const liveNodes = projectedNodes.filter((node) => !["done"].includes(node.state));
   const primaryNode = projectedNodes.find((node) => node.jobId === String(primary.jobId)) ?? liveNodes[0] ?? projectedNodes[0];
-  const attentionCount = projectedNodes.filter((node) => node.needsDaniel).length;
+  const hierarchyJobs = hierarchy.flatMap((group) => group.projects.flatMap((project) => project.jobs));
+  const attentionCount = hierarchyJobs.filter((node) => node.needsDaniel).length;
   const fleet = {
     id: missionId ?? `work:${String(primary.jobId)}`,
     goal: String(input.mission?.goal ?? primary.label ?? primary.task ?? "Live work").slice(0, 500),
@@ -256,9 +369,10 @@ export function buildFleetSnapshot(input: {
     active: primaryNode ? {
       id: primaryNode.jobId, missionId, label: primaryNode.label, status: primaryNode.state,
       stage: primaryNode.stage, percent: primaryNode.percent,
-      extraCount: Math.max(0, liveNodes.length - 1), needsDaniel: attentionCount > 0,
+      extraCount: Math.max(0, hierarchyJobs.length - 1), needsDaniel: attentionCount > 0,
     } : null,
     fleet,
+    hierarchy,
   };
 }
 
@@ -275,7 +389,7 @@ export const snapshot = query({
       const activeThread = await ctx.db.query("ui").withIndex("by_key", (q) => q.eq("key", "activeThread")).first();
       threadId = activeThread?.value.trim() || "main";
     }
-    if (!threadId) return { active: null, fleet: null };
+    if (!threadId) return { active: null, fleet: null, hierarchy: [] };
 
     const candidates = await ctx.db.query("jobRuntime")
       .withIndex("by_thread_visibility_active_priority", (q) => q
@@ -286,7 +400,7 @@ export const snapshot = query({
       .take(ACTIVE_CANDIDATE_LIMIT);
     const relevant = selectRelevantWork(candidates, threadId);
     const primary = relevant[0];
-    if (!primary) return { active: null, fleet: null };
+    if (!primary) return { active: null, fleet: null, hierarchy: [] };
 
     const rawMissionId = primary.planParentMissionId ?? primary.missionId;
     const missionId = rawMissionId ? ctx.db.normalizeId("missions", String(rawMissionId)) : null;

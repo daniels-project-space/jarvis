@@ -11,6 +11,10 @@ import { exactTextWorkOrder } from "./work-order";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
 import { createICloudEvent, deleteICloudEvent, findICloudEvents, listICloudEvents } from "./icloud-calendar";
 import { scanGmailBookingConfirmations } from "./booking-email";
+import { resolveProjectSourceAdmission } from "./source-admission-server";
+import type { ProjectSourceAdmission } from "./source-admission";
+import { canonicalizeRepository } from "./workflow-contract";
+import { admissionMutationName, v2AdmissionEnabled } from "./mission-protocol-rollout";
 import {
   VISUAL_BLOCK_KINDS,
   VISUAL_CAPABILITIES,
@@ -3089,6 +3093,29 @@ async function activeThread(): Promise<string> {
   return typeof t === "string" && t ? t : "main";
 }
 
+async function resolveMissionProjectAdmissions(
+  repositories: readonly (string | null | undefined)[],
+): Promise<ProjectSourceAdmission[]> {
+  const scopes = new Map<string, string | undefined>();
+  for (const repository of repositories.length ? repositories : [undefined]) {
+    const raw = repository?.trim();
+    const canonical = raw ? canonicalizeRepository(raw, { allowShortName: true }) : null;
+    if (raw && !canonical) throw new Error("Repository is not a canonical JARVIS project");
+    scopes.set(canonical ?? "evidence", canonical ?? undefined);
+  }
+  return await Promise.all([...scopes.values()].map((repository) => resolveProjectSourceAdmission(repository)));
+}
+
+function admittedProject(
+  admissions: readonly ProjectSourceAdmission[],
+  repository?: string | null,
+): ProjectSourceAdmission {
+  const canonical = repository ? canonicalizeRepository(repository, { allowShortName: true }) : null;
+  const admission = admissions.find((candidate) => candidate.repository === (canonical ?? undefined));
+  if (!admission) throw new Error(`Mission lost project admission for ${canonical ?? "evidence"}`);
+  return admission;
+}
+
 async function creationFiling(args: any, category?: string): Promise<{
   category?: string;
   project?: string;
@@ -3124,10 +3151,24 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       const criteria = Array.isArray(args.acceptance_criteria) && args.acceptance_criteria.length
         ? args.acceptance_criteria.map(String).slice(0, 8)
         : suggestedAcceptanceCriteria(task, route);
-      const jobId = await convexMutation("jobs:enqueue", {
+      const protocolV2 = v2AdmissionEnabled();
+      const [projectAdmission] = protocolV2 ? await resolveMissionProjectAdmissions([repo]) : [undefined];
+      const missionId = await convexMutation(admissionMutationName("mission"), {
+        authTokenHash,
+        goal: task,
+        agentCount: 1,
+        ...(protocolV2 ? { mode: "single", projectAdmissions: [projectAdmission!] } : {}),
+        originThreadId,
+        managerAgentId: "jarvis",
+        priority: route.priority,
+        risk: route.risk,
+        acceptanceCriteria: criteria,
+      });
+      const jobId = await convexMutation(admissionMutationName("job"), {
         authTokenHash,
         task,
-        repo,
+        repo: projectAdmission?.repository ?? repo,
+        missionId: String(missionId),
         readonly: route.readonly,
         model: route.model,
         mcp: Array.isArray(args.mcp) ? args.mcp.map(String) : undefined,
@@ -3188,12 +3229,15 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       const { routeGoal } = await import("./goal-mode");
       const route = routeGoal(goal, args.repo ? String(args.repo) : undefined);
       const originThreadId = await activeThread();
-      const created = await convexMutation("goalMode:create", {
+      const protocolV2 = v2AdmissionEnabled();
+      const [projectAdmission] = protocolV2 ? await resolveMissionProjectAdmissions([route.primaryRepo]) : [undefined];
+      const created = await convexMutation(admissionMutationName("goal"), {
         authTokenHash,
         goal,
         route: route.kind,
         routeReason: route.reason,
-        primaryRepo: route.primaryRepo,
+        primaryRepo: projectAdmission?.repository ?? route.primaryRepo,
+        ...(protocolV2 ? { projectAdmission } : {}),
         infrastructureContext: route.infrastructureContext,
         originThreadId,
         priority: 98,
@@ -3204,13 +3248,15 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       });
       const id = String(created?.missionId ?? "");
       if (!id) throw new Error("Goal Mode did not create a durable mission");
-      await wakeAgentFleet(`goal:${id}`).catch(() => false);
+      if (!created?.held) await wakeAgentFleet(`goal:${id}`).catch(() => false);
       await convexMutation("ui:setPanel", {
         type: "fleet",
         value: JSON.stringify({ missionId: id, mode: "goal" }),
         title: `goal · ${goal.slice(0, 44)}`,
       }).catch(() => {});
-      return `Goal Mode ${id} is live. Route: ${route.kind}${route.primaryRepo ? ` in ${route.primaryRepo}` : ""} — ${route.reason} One Sol/max planner is working now; it will hand bounded work to Terra/high, preserve checkpoints for days if needed, and only finish after a Sol/max deep validation passes.`;
+      return created?.held
+        ? `Goal Mode ${id} is durably held while the mission protocol rollout is dormant; no planner or repository workspace was started.`
+        : `Goal Mode ${id} is live. Route: ${route.kind}${route.primaryRepo ? ` in ${route.primaryRepo}` : ""} — ${route.reason} One Sol/max planner is working now; it will hand bounded work to Terra/high, preserve checkpoints for days if needed, and only finish after a Sol/max deep validation passes.`;
     }
     case "orchestrate": {
       const mission = String(args.mission ?? "").trim();
@@ -3236,7 +3282,11 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         (highest, stream) => (riskOrder[stream.risk] > riskOrder[highest] ? stream.risk : highest),
         "low" as keyof typeof riskOrder,
       );
-      const missionId = await convexMutation("missions:create", {
+      const protocolV2 = v2AdmissionEnabled();
+      const projectAdmissions = protocolV2
+        ? await resolveMissionProjectAdmissions(plan.workstreams.map((stream) => stream.repo))
+        : [];
+      const missionId = await convexMutation(admissionMutationName("mission"), {
         authTokenHash,
         goal: mission,
         agentCount: plan.workstreams.length,
@@ -3244,16 +3294,18 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         managerAgentId: "jarvis",
         priority: Math.max(...plan.workstreams.map((stream) => workModelPriority(stream.model))),
         risk: missionRisk,
+        ...(protocolV2 ? { projectAdmissions } : {}),
         acceptanceCriteria: Array.isArray(args.acceptance_criteria) ? args.acceptance_criteria.map(String).slice(0, 8) : undefined,
       });
       for (const a of plan.workstreams) {
+        const projectAdmission = protocolV2 ? admittedProject(projectAdmissions, a.repo) : undefined;
         const suppliedAgent = supplied.find((candidate: any) => String(candidate.task) === a.task);
         const scaffold = TASK_TEMPLATES[String(suppliedAgent?.template ?? "")] ?? "";
         const sharedContext = plan.context ? `\n\nShared mission context:\n${plan.context}` : "";
-        await convexMutation("jobs:enqueue", {
+        await convexMutation(admissionMutationName("job"), {
           authTokenHash,
           task: `${a.task}${scaffold}${sharedContext}\n\nYou are ${a.agentId}, one permanent specialist on a ${plan.workstreams.length}-workstream mission: "${mission}". Own only this workstream, preserve the mission context, checkpoint useful progress, and stop only when the acceptance criteria are evidenced.`,
-          repo: a.repo ?? undefined,
+          repo: projectAdmission?.repository ?? a.repo,
           readonly: a.readonly,
           model: a.model,
           missionId: String(missionId),
@@ -3687,6 +3739,9 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       const problem = String(args.problem ?? "").slice(0, 1200);
       if (!problem) return "Tell me what's broken first.";
       const app = args.app ? String(args.app) : undefined;
+      const protocolV2 = v2AdmissionEnabled();
+      const [projectAdmission] = protocolV2 ? await resolveMissionProjectAdmissions([app ?? "jarvis"]) : [undefined];
+      const originThreadId = await activeThread();
       const incidentId = await convexMutation("incidents:report", {
         source: "brain",
         app,
@@ -3695,7 +3750,17 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       });
       // Dispatch immediately — don't wait for the healer sweep.
       await convexMutation("incidents:setStatus", { id: incidentId, status: "dispatched" }).catch(() => {});
-      await convexMutation("jobs:enqueue", {
+      const missionId = await convexMutation(admissionMutationName("mission"), {
+        authTokenHash,
+        goal: `Repair ${problem}`.slice(0, 500),
+        agentCount: 1,
+        ...(protocolV2 ? { mode: "single", projectAdmissions: [projectAdmission!] } : {}),
+        originThreadId,
+        managerAgentId: "jarvis",
+        priority: 95,
+        risk: "high",
+      });
+      await convexMutation(admissionMutationName("job"), {
         authTokenHash,
         task:
           `SELF-REPAIR: trace the ROOT CAUSE and fix it — never paper over symptoms. Daniel reports: ${problem}\n` +
@@ -3703,10 +3768,11 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           `3) Minimal correct fix. 4) VALIDATE: 'npm install' + 'npx tsc --noEmit' must pass; 'npm run build' must pass for app code. ` +
           `5) Commit only working code ("self-repair: ..."). ${SHALLOW_PROVENANCE_RULE} Never replace or reparent a persisted shared branch based on a truncated revision walk. ` +
           `If it needs convex/ or src/trigger/ redeploy, commit and say so plainly.`,
-        repo: app ?? "jarvis",
+        repo: projectAdmission?.repository ?? app ?? "jarvis",
+        missionId: String(missionId),
         model: "sol",
         incidentId: String(incidentId),
-        originThreadId: await activeThread(),
+        originThreadId,
         visibility: "conversation",
         agentId: "paul",
         risk: "high",
@@ -3726,12 +3792,26 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
     case "self_improve": {
       const request = String(args.request ?? "").slice(0, 1500);
       if (!request) return "Tell me what ability to build first.";
-      await convexMutation("jobs:enqueue", {
+      const protocolV2 = v2AdmissionEnabled();
+      const [projectAdmission] = protocolV2 ? await resolveMissionProjectAdmissions(["jarvis"]) : [undefined];
+      const originThreadId = await activeThread();
+      const missionId = await convexMutation(admissionMutationName("mission"), {
+        authTokenHash,
+        goal: `Improve JARVIS: ${request}`.slice(0, 500),
+        agentCount: 1,
+        ...(protocolV2 ? { mode: "single", projectAdmissions: [projectAdmission!] } : {}),
+        originThreadId,
+        managerAgentId: "jarvis",
+        priority: 80,
+        risk: "high",
+      });
+      await convexMutation(admissionMutationName("job"), {
         authTokenHash,
         task: `${SELF_IMPROVE_RULES}\n\nThe upgrade Daniel wants: ${request}`,
-        repo: "jarvis",
+        repo: projectAdmission?.repository ?? "jarvis",
+        missionId: String(missionId),
         model: "sol",
-        originThreadId: await activeThread(),
+        originThreadId,
         visibility: "conversation",
         agentId: "paul",
         risk: "high",

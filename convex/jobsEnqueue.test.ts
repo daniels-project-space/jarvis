@@ -6,6 +6,7 @@ import { api } from "./_generated/api";
 import schema from "./schema";
 import { MAX_TEXT_WORK_ORDER_BYTES, textWorkOrderByteLength } from "../src/lib/work-order";
 import { GENERATED_GATED_ACTION_MATRIX } from "../src/mastra/fixtures/action-scope-regressions";
+import { testMissionAdmission } from "./testSourceAdmission";
 
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
@@ -38,11 +39,30 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+async function enqueueFixture(t: ReturnType<typeof convexTest>, input: {
+  task: string;
+  repo?: string;
+  readonly?: boolean;
+  risk?: string;
+  approvalRequired?: boolean;
+  workerToken: string;
+}) {
+  const admitted = await testMissionAdmission(t, {
+    key: "bounded-exact-work-orders",
+    workerToken: WORKER,
+    repository: input.repo,
+  });
+  return await t.mutation(api.jobs.enqueueV2, {
+    ...input,
+    missionId: String(admitted.missionId),
+  });
+}
+
 describe("bounded exact textual work orders", () => {
   it("persists every reproduced policy exploit behind the approval gate", async () => {
     const t = convexTest(schema, modules);
     for (const task of CLAUSE_BOUNDARY_AND_LIFECYCLE_EXPLOITS) {
-      const jobId = await t.mutation(api.jobs.enqueue, {
+      const jobId = await enqueueFixture(t, {
         task,
         repo: REPO,
         readonly: true,
@@ -63,7 +83,7 @@ describe("bounded exact textual work orders", () => {
     expect(GENERATED_GATED_ACTION_MATRIX).toHaveLength(320);
     const t = convexTest(schema, modules);
     for (const task of GENERATED_GATED_ACTION_MATRIX) {
-      const jobId = await t.mutation(api.jobs.enqueue, {
+      const jobId = await enqueueFixture(t, {
         task,
         repo: REPO,
         readonly: true,
@@ -85,7 +105,7 @@ describe("bounded exact textual work orders", () => {
     expect(createHash("sha256").update(fixture).digest("hex")).toBe(FIXTURE_SHA256);
 
     const t = convexTest(schema, modules);
-    const jobId = await t.mutation(api.jobs.enqueue, {
+    const jobId = await enqueueFixture(t, {
       task: fixture,
       repo: REPO,
       workerToken: WORKER,
@@ -124,7 +144,7 @@ describe("bounded exact textual work orders", () => {
     const oversized = `Email the verified user.\n${"é".repeat(MAX_TEXT_WORK_ORDER_BYTES / 2)}`;
     expect(textWorkOrderByteLength(oversized)).toBeGreaterThan(MAX_TEXT_WORK_ORDER_BYTES);
 
-    await expect(t.mutation(api.jobs.enqueue, {
+    await expect(enqueueFixture(t, {
       task: oversized,
       repo: REPO,
       workerToken: WORKER,
@@ -139,7 +159,7 @@ describe("bounded exact textual work orders", () => {
     const task = `Inspect the repository context.\n${"technical context ".repeat(420)}\nEmail the verified user.`;
     expect(textWorkOrderByteLength(task)).toBeGreaterThan(6_000);
 
-    const jobId = await t.mutation(api.jobs.enqueue, {
+    const jobId = await enqueueFixture(t, {
       task,
       repo: REPO,
       workerToken: WORKER,

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
 import schema from "./schema";
+import { testMissionAdmission } from "./testSourceAdmission";
 
 declare global {
   interface ImportMeta {
@@ -17,48 +18,62 @@ const BASE = "b".repeat(40);
 const TREE = "c".repeat(40);
 const DIFF = "d".repeat(64);
 const SIGNATURE = "e".repeat(64);
+const REVIEW_KEY_ID = "current-2026-07";
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 
 type Policy = "manual" | "read_only" | "auto_merge";
 
 async function specialistFixture(policy: Policy = "manual", goalStage?: "validating") {
   const t = convexTest(schema, modules);
-  const now = Date.now();
-  const jobId = await t.run(async (ctx) => {
-    const id = await ctx.db.insert("jobs", {
-      repo: "daniels-project-space/jarvis", task: "verified repository work", status: "running",
-      deliveryMode: policy, readonly: policy === "read_only", workerRunId: "specialist-run",
-      dispatchId: "specialist-dispatch", attempt: 1, maxAttempts: 3, priority: 50,
-      stage: goalStage ?? "building", percent: 90, branch: "jarvis/reviewed", goalStage,
-      createdAt: now, heartbeatAt: now,
-    });
-    await ctx.db.insert("workAttempts", {
-      jobId: id, attempt: 1, status: "running", workerRunId: "specialist-run",
-      dispatchId: "specialist-dispatch", lastEventSeq: 0, livenessAt: now,
-      progressAt: now, lastEventAt: now, createdAt: now,
-    });
-    await ctx.db.insert("jobRuntime", {
-      jobId: id, task: "verified repository work", repo: "daniels-project-space/jarvis",
-      status: "running", priority: 50, stage: goalStage ?? "building", percent: 90,
-      active: true, attempt: 1, maxAttempts: 3, heartbeatAt: now, progressAt: now,
-      workerRunId: "specialist-run", readonly: policy === "read_only", deliveryMode: policy,
-      goalStage, branch: "jarvis/reviewed", createdAt: now, updatedAt: now,
-    });
-    return id;
+  const admitted = await testMissionAdmission(t, {
+    key: `specialist-${policy}-${goalStage ?? "work"}`,
+    workerToken: WORKER,
+    repository: "daniels-project-space/jarvis",
+    sourceHeadSha: BASE,
+  });
+  const task = policy === "manual"
+    ? "Publish verified repository work to the reviewed Git ref"
+    : "verified repository work";
+  const jobId = await t.mutation(api.jobs.enqueueV2, {
+    repo: "daniels-project-space/jarvis", task,
+    readonly: policy === "read_only",
+    maxAttempts: 3, goalStage, missionId: String(admitted.missionId),
+    workerToken: WORKER,
+  });
+  if (policy === "manual") {
+    expect(await t.mutation(api.approvals.decide, {
+      jobId: String(jobId), decision: "approved", workerToken: WORKER,
+    })).toBe(true);
+  }
+  const batch = await t.mutation(api.jobs.reserveDispatchBatch, {
+    limit: 1, reason: "specialist-fixture", workerToken: WORKER,
+  });
+  expect(batch.reservations).toHaveLength(1);
+  const claim: any = await t.mutation(api.jobs.claimDispatched, {
+    jobId, dispatchId: batch.reservations[0].dispatchId,
+    workerRunId: "specialist-run", workerToken: WORKER,
+  });
+  expect(claim).toMatchObject({
+    jobId, authorityDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    workOrderRevisionDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    deliveryMode: policy,
   });
   const result = "specialist executed once";
   const note = "supervisor pass";
   const receipt = JSON.stringify({
-    version: 1, jobId: String(jobId), attempt: 1, repository: "daniels-project-space/jarvis",
-    branch: "jarvis/reviewed", baseSha: BASE, baseTreeSha: TREE, headSha: HEAD,
+    version: 2, jobId: String(jobId), attempt: 1,
+    workOrderRevisionDigest: claim.workOrderRevisionDigest,
+    repository: "daniels-project-space/jarvis",
+    branch: String(claim.workerBranch ?? claim.branch ?? ""), baseSha: BASE, baseTreeSha: TREE, headSha: HEAD,
     headTreeSha: TREE, diffSha256: DIFF, agentEvidenceSha256: "f".repeat(64),
   });
   const commitArgs = {
-    jobId, expectedAttempt: 1, specialistRunId: "specialist-run", result, verificationNote: note,
-    reviewReceiptJson: receipt, reviewReceiptSignature: SIGNATURE, reviewReceiptKeyId: "current-2026-07",
+    jobId, expectedAttempt: 1, authorityDigest: claim.authorityDigest,
+    specialistRunId: "specialist-run", result, verificationNote: note,
+    reviewReceiptJson: receipt, reviewReceiptSignature: SIGNATURE, reviewReceiptKeyId: REVIEW_KEY_ID,
     reviewDiffSha256: DIFF, resultDigest: sha256(result), evidenceDigest: sha256(note), workerToken: WORKER,
   } as const;
-  return { t, jobId, result, note, receipt, commitArgs };
+  return { t, jobId, result, note, receipt, authorityDigest: claim.authorityDigest, commitArgs };
 }
 
 async function committedAndClaimed(policy: Policy = "manual", goalStage?: "validating") {
@@ -76,13 +91,15 @@ async function committedAndClaimed(policy: Policy = "manual", goalStage?: "valid
   });
   expect(claim).toMatchObject({ sourceWorkAttempt: 1, deliveryGeneration: 1, deliveryRunId: "controller-run" });
   const lease = await fixture.t.mutation(api.jobs.linearizeDelivery, {
-    jobId: fixture.jobId, expectedAttempt: 1, sourceWorkAttempt: 1, deliveryGeneration: 1,
+    jobId: fixture.jobId, expectedAttempt: 1, authorityDigest: fixture.authorityDigest,
+    sourceWorkAttempt: 1, deliveryGeneration: 1,
     deliveryRunId: "controller-run", deliveryAttemptId: claim!.activeDeliveryAttemptId,
     deliveryLeaseOwner: "controller-owner", deliveryLeaseToken: "controller-lease", workerToken: WORKER,
   });
   expect(lease).not.toBeNull();
   const fence = {
-    jobId: fixture.jobId, expectedAttempt: 1, sourceWorkAttempt: 1, deliveryGeneration: 1,
+    jobId: fixture.jobId, expectedAttempt: 1, authorityDigest: fixture.authorityDigest,
+    sourceWorkAttempt: 1, deliveryGeneration: 1,
     deliveryRunId: "controller-run", deliveryAttemptId: claim!.activeDeliveryAttemptId,
     deliveryLeaseOwner: "controller-owner", deliveryLeaseToken: "controller-lease",
     deliveryLeaseVersion: lease!.version, workerToken: WORKER,
@@ -109,9 +126,10 @@ describe("real Convex specialist/controller race matrix", () => {
     })).toBe(true);
     expect(await f.t.mutation(api.jobs.markVerifiedForDelivery, f.commitArgs)).toBe(false);
     const state = await rows(f.t);
-    expect(state.jobs[0]).toMatchObject({ status: "steering", steerRevision: 1 });
+    expect(state.jobs[0]).toMatchObject({ status: "awaiting_approval", attempt: 2, steerRevision: 1 });
     expect(state.attempts).toHaveLength(2);
-    expect(state.attempts.map((attempt) => attempt.status)).toEqual(["steered", "queued"]);
+    expect(state.attempts.map((attempt) => attempt.status)).toEqual(["steered", "awaiting_approval"]);
+    expect(state.attempts[1].authorityDigest).not.toBe(state.attempts[0].authorityDigest);
   });
 
   it("does not stall a multi-hour task while its exact Trigger heartbeat remains fresh", async () => {
@@ -280,13 +298,38 @@ describe("real Convex delivery policy outcomes", () => {
     expect(await f.t.mutation(api.jobs.control, { jobId: f.jobId, action: "pause", workerToken: WORKER })).toBe(true);
     expect(await f.t.mutation(api.jobs.finalize, {
       ...f.fence, status: "done", result: f.result, verificationVerdict: "pass", verificationNote: f.note,
-      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE, reviewDiffSha256: DIFF,
+      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE,
+      reviewReceiptKeyId: REVIEW_KEY_ID, reviewDiffSha256: DIFF,
     })).toBe(false);
     expect(await f.t.mutation(api.jobs.control, { jobId: f.jobId, action: "resume", workerToken: WORKER })).toBe(true);
     const state = await rows(f.t);
     expect(state.deliveries).toHaveLength(2);
     expect(state.deliveries[1]).toMatchObject({ outcome: "read_only_complete", currentStep: "receipt", reviewKeyId: "current-2026-07" });
     expect(state.attempts).toHaveLength(1);
+  });
+
+  it("requires the exact immutable signed review key before repository finalization", async () => {
+    const f = await committedAndClaimed("read_only");
+    expect(await f.t.mutation(api.jobs.setDelivery, {
+      ...f.fence, branch: "jarvis/reviewed", deliveryStatus: "branch",
+      outcome: "read_only_complete", providerCall: false,
+    })).toBe(true);
+    const finalArgs = {
+      ...f.fence, status: "done" as const, result: f.result,
+      verificationVerdict: "pass" as const, verificationNote: f.note,
+      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note),
+      reviewReceiptSignature: SIGNATURE, reviewDiffSha256: DIFF,
+    };
+    expect(await f.t.mutation(api.jobs.finalize, finalArgs)).toBe(false);
+    expect(await f.t.mutation(api.jobs.finalize, {
+      ...finalArgs, reviewReceiptKeyId: "stale-review-key",
+    })).toBe(false);
+    expect((await rows(f.t)).deliveries[0]).toMatchObject({
+      currentStep: "receipt", status: "running", reviewKeyId: REVIEW_KEY_ID,
+    });
+    expect(await f.t.mutation(api.jobs.finalize, {
+      ...finalArgs, reviewReceiptKeyId: REVIEW_KEY_ID,
+    })).toBe(true);
   });
 
   it.each([
@@ -302,7 +345,7 @@ describe("real Convex delivery policy outcomes", () => {
     expect(await f.t.mutation(api.jobs.finalize, {
       ...f.fence, status: "done", result: finalResult, verificationVerdict: "pass", verificationNote: f.note,
       resultDigest: sha256(finalResult), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE,
-      reviewDiffSha256: DIFF,
+      reviewReceiptKeyId: REVIEW_KEY_ID, reviewDiffSha256: DIFF,
     })).toBe(true);
     const state = await rows(f.t);
     expect(state.receipts[0]).toMatchObject({ deliveryOutcome: outcome });
@@ -387,14 +430,16 @@ describe("real Convex delivery policy outcomes", () => {
     expect((await rows(f.t)).jobs[0].status).toBe("running");
     expect(await f.t.mutation(api.jobs.finalize, {
       ...f.fence, status: "done", result: f.result, verificationVerdict: "pass", verificationNote: f.note,
-      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE, reviewDiffSha256: DIFF,
+      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE,
+      reviewReceiptKeyId: REVIEW_KEY_ID, reviewDiffSha256: DIFF,
     })).toBe(false);
     await f.t.mutation(api.jobs.setDelivery, {
       ...f.fence, branch: "jarvis/reviewed", deliveryStatus: "branch", outcome: "read_only_complete", providerCall: false,
     });
     expect(await f.t.mutation(api.jobs.finalize, {
       ...f.fence, status: "done", result: f.result, verificationVerdict: "pass", verificationNote: f.note,
-      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE, reviewDiffSha256: DIFF,
+      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE,
+      reviewReceiptKeyId: REVIEW_KEY_ID, reviewDiffSha256: DIFF,
     })).toBe(true);
     expect((await rows(f.t)).jobs[0].status).toBe("done");
   });

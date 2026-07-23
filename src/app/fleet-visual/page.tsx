@@ -13,7 +13,9 @@ const nodes: FleetNode[] = labels.map((label, index) => ({
   stage: states[index].replace("_", " "), percent: states[index] === "done" ? 100 : 24 + index * 9,
   progress: index === 6 ? "Confirm the integration conflict boundary" : `${label} · meaningful update persisted`,
   progressAt: Date.UTC(2026, 6, 21, 17, 40 + index), model: index === 6 ? "sol" : "terra",
-  reasoningEffort: index === 6 ? "max" : "high", workerRuntime: "trigger", workerRunId: null,
+  reasoningEffort: index === 6 ? "max" : "high",
+  modelReason: index === 6 ? "Sol/max for a protected integration decision" : "Terra/high for bounded implementation work",
+  workerRuntime: "trigger", workerRunId: null,
   generation: index > 4 ? 2 : 1, attempt: index === 5 ? 2 : 1, maxAttempts: 12,
   dependencyCount: index === 0 ? 0 : index < 3 ? 1 : 2, dependenciesReady: index < 3 ? Math.min(index, 1) : index < 6 ? 1 : 2,
   integrationState: states[index] === "integrating" ? "integrating" : states[index] === "needs_input" ? "needs_attention" : "not_applicable",
@@ -40,6 +42,19 @@ const snapshot: CompactWorkSnapshot = {
       { id: "7-8", source: "node-7", target: "node-8", readiness: "waiting" },
     ],
   },
+  hierarchy: [{
+    id: "mission-preview", label: "Build the unified live JARVIS fleet surface", status: "needs_input", phase: "integration",
+    projects: [
+      {
+        id: "project-preview-jarvis", canonicalProjectId: "jarvis", repository: "daniels-project-space/jarvis",
+        jobs: nodes.filter((node) => node.repository === "daniels-project-space/jarvis" && !["done", "dependency_held", "queued"].includes(node.state)),
+      },
+      {
+        id: "project-preview-hub", canonicalProjectId: "project-hub", repository: "daniels-project-space/project-hub",
+        jobs: nodes.filter((node) => node.repository === "daniels-project-space/project-hub" && !["done", "dependency_held", "queued"].includes(node.state)),
+      },
+    ],
+  }],
 };
 
 export default function FleetVisualPage() {

@@ -44,6 +44,7 @@ export type FleetNode = {
   progressAt: number | null;
   model: string | null;
   reasoningEffort: string | null;
+  modelReason: string | null;
   workerRuntime: string | null;
   workerRunId: string | null;
   generation: number;
@@ -78,9 +79,25 @@ export type FleetMission = {
   edges: FleetEdge[];
 };
 
+export type FleetProjectGroup = {
+  id: string;
+  canonicalProjectId: string;
+  repository: string | null;
+  jobs: FleetNode[];
+};
+
+export type FleetMissionGroup = {
+  id: string;
+  label: string;
+  status: string;
+  phase: string;
+  projects: FleetProjectGroup[];
+};
+
 export type CompactWorkSnapshot = {
   active: CompactWorkItem | null;
   fleet: FleetMission | null;
+  hierarchy: FleetMissionGroup[];
 };
 
 export type CompactJobDetail = {
@@ -102,6 +119,7 @@ export type CompactJobDetail = {
   progressAt: number | null;
   model: string | null;
   reasoningEffort: string | null;
+  modelReason: string | null;
   workerRuntime: string | null;
   workerRunId: string | null;
   generation: number;
@@ -128,7 +146,7 @@ export function visibleWorkSnapshot(
   snapshot: CompactWorkSnapshot | undefined,
 ): CompactWorkSnapshot {
   if (snapshot !== undefined) return snapshot;
-  return cache?.threadId === threadId ? cache.snapshot : { active: null, fleet: null };
+  return cache?.threadId === threadId ? cache.snapshot : { active: null, fleet: null, hierarchy: [] };
 }
 
 export function visibleCompactWork(
@@ -150,7 +168,9 @@ export function cacheCompactWorkSnapshot(
 /** A selection is explicit browser-session state; snapshots never choose it. */
 export function retainedFleetSelection(selectedJobId: string | null, snapshot: CompactWorkSnapshot): string | null {
   if (!selectedJobId) return null;
-  return snapshot.fleet?.nodes.some((node) => node.jobId === selectedJobId) ? selectedJobId : null;
+  const inHierarchy = snapshot.hierarchy?.some((mission) => mission.projects
+    .some((project) => project.jobs.some((node) => node.jobId === selectedJobId))) ?? false;
+  return inHierarchy || snapshot.fleet?.nodes.some((node) => node.jobId === selectedJobId) ? selectedJobId : null;
 }
 
 export function needsDaniel(job: { status?: string; needsDaniel?: boolean }): boolean {
