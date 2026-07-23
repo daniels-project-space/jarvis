@@ -1,6 +1,8 @@
+/* eslint-disable @typescript-eslint/no-explicit-any -- this production Trigger runner validates dynamic Convex envelopes at each authority boundary */
 import { metadata, schedules, task, timeout } from "@trigger.dev/sdk/v3";
 import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
+import type { Id } from "../../convex/_generated/dataModel";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -232,7 +234,11 @@ function readGitObject(cwd: string, sha: string, env: NodeJS.ProcessEnv, options
     const cleanup = () => { clearTimeout(timer); options.signal?.removeEventListener("abort", abort); };
     p.stdout.on("data", (data: Buffer) => chunks.push(Buffer.from(data)));
     p.stderr.on("data", (data) => { error += data.toString(); });
-    p.on("close", (code) => { cleanup(); code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`git cat-file ${sha} failed (${String(code)}): ${error.slice(-500)}`)); });
+    p.on("close", (code) => {
+      cleanup();
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`git cat-file ${sha} failed (${String(code)}): ${error.slice(-500)}`));
+    });
     p.on("error", (error) => { cleanup(); reject(error); });
   });
 }
@@ -573,14 +579,17 @@ type AgentProgress = {
   percent?: number;
 };
 
-type AgentHarnessOptions = {
-  reservation: AgentWorkerPayload & { workerRunId: string };
-  runtimeAttestation: CloudProviderRuntimeAttestation;
-  onProgress?: (progress: AgentProgress) => void;
-};
+export type AgentRunnerAuthorityPhase =
+  | "source_checkout" | "provider_create" | "codex_start" | "codex_resume"
+  | "checkpoint" | "review_receipt" | "integration" | "delivery";
+
+export type AgentRunnerEffectBoundary =
+  | "subscription_acquire" | "source_checkout" | "provider_create"
+  | "codex_process" | "checkpoint_persist" | "review_receipt"
+  | "integration_effect" | "delivery_effect";
 
 export type AgentRunnerBoundaryObservation = Readonly<{
-  phase: string;
+  phase: AgentRunnerAuthorityPhase;
   authorityDigest: string;
   workOrderRevisionId: string;
   workOrderRevision: number;
@@ -591,14 +600,100 @@ export type AgentRunnerBoundaryObservation = Readonly<{
   sourceHeadSha: string | null;
 }>;
 
-// Production calls this no-op observer at the exact claim/effect seam. Tests
-// may replace it with an in-memory transport; it receives no credentials and
-// cannot authorize or perform an effect.
-let authorityBoundaryObserver: (observation: AgentRunnerBoundaryObservation) => void = () => {};
-export function setAgentRunnerBoundaryObserverForTest(
-  observer?: (observation: AgentRunnerBoundaryObservation) => void,
-) {
-  authorityBoundaryObserver = observer ?? (() => {});
+type ExecutionLeaseControl = Readonly<{
+  status: () => Promise<string>;
+  close: () => void;
+}>;
+
+export type AgentRunnerDependencies = Readonly<{
+  onAuthorityBoundary: (
+    effect: AgentRunnerEffectBoundary,
+    authority: AgentRunnerBoundaryObservation,
+  ) => void;
+  resolveSubscriptionAgentBin: typeof resolveSubscriptionAgentBin;
+  prepareSubscriptionEnv: typeof prepareSubscriptionEnv;
+  verifyCodexSubscriptionPreflight: typeof verifyCodexSubscriptionPreflight;
+  missingSubscriptionTools: typeof missingSubscriptionTools;
+  configuredCloudWorkspaceProvider: typeof configuredCloudWorkspaceProvider;
+  runCommand: typeof sh;
+  readGitObject: typeof readGitObject;
+  createCredentiallessGitArchive: typeof createCredentiallessGitArchive;
+  createR2CheckpointStore: typeof createR2CheckpointStore;
+  prepareCloudWorkspaceExecution: typeof prepareCloudWorkspaceExecution;
+  replayCloudWorkspaceExecution: typeof replayCloudWorkspaceExecution;
+  runCloudWorkspaceAgent: typeof runCloudWorkspaceAgent;
+  persistPortableCheckpoint: typeof persistPortableCheckpoint;
+  applyValidatedPatchToControllerCheckout: typeof applyValidatedPatchToControllerCheckout;
+  trustedGitReviewReceiptAuthority: typeof trustedGitReviewReceiptAuthority;
+  verifyGitReviewReceiptEnvelope: typeof verifyGitReviewReceiptEnvelope;
+  buildGitReviewReceipt: typeof buildGitReviewReceipt;
+  verifyWork: typeof verifyWork;
+  branchHasChanges: typeof branchHasChanges;
+  continueRepositoryDelivery: typeof continueRepositoryDelivery;
+  providerFetch: typeof fetch;
+  syncExternalGoalRuns: typeof syncExternalGoalRuns;
+  createExecutionLeaseControl: (options: {
+    jobId: string;
+    expectedAttempt: number;
+    expectedSteerRevision: number;
+    workerToken?: string;
+  }) => ExecutionLeaseControl;
+}>;
+
+export type AgentHarnessOptions = {
+  reservation: AgentWorkerPayload & { workerRunId: string };
+  runtimeAttestation: CloudProviderRuntimeAttestation;
+  onProgress?: (progress: AgentProgress) => void;
+  dependencies?: AgentRunnerDependencies;
+};
+
+export function createProductionAgentRunnerDependencies(): AgentRunnerDependencies {
+  return {
+    onAuthorityBoundary: () => {},
+    resolveSubscriptionAgentBin,
+    prepareSubscriptionEnv,
+    verifyCodexSubscriptionPreflight,
+    missingSubscriptionTools,
+    configuredCloudWorkspaceProvider,
+    runCommand: sh,
+    readGitObject,
+    createCredentiallessGitArchive,
+    createR2CheckpointStore,
+    prepareCloudWorkspaceExecution,
+    replayCloudWorkspaceExecution,
+    runCloudWorkspaceAgent,
+    persistPortableCheckpoint,
+    applyValidatedPatchToControllerCheckout,
+    trustedGitReviewReceiptAuthority,
+    verifyGitReviewReceiptEnvelope,
+    buildGitReviewReceipt,
+    verifyWork,
+    branchHasChanges,
+    continueRepositoryDelivery,
+    providerFetch: fetch,
+    syncExternalGoalRuns,
+    createExecutionLeaseControl: ({ jobId, expectedAttempt, expectedSteerRevision, workerToken }) => {
+      const controlClient = new ConvexClient(CONVEX_URL);
+      const leaseMonitor = new ExecutionLeaseMonitor(
+        expectedAttempt,
+        expectedSteerRevision,
+        async () => await convexQuery("jobs:executionLease", { jobId }),
+      );
+      const unsubscribe = controlClient.onUpdate(
+        api.jobs.executionLease,
+        { jobId: jobId as Id<"jobs">, workerToken },
+        (lease) => leaseMonitor.observe(lease),
+        () => { /* monitor retains only its bounded known-good snapshot */ },
+      );
+      return {
+        status: async () => await leaseMonitor.status(),
+        close: () => {
+          unsubscribe();
+          controlClient.close();
+        },
+      };
+    },
+  };
 }
 
 // Cheap controller duties run once per minute, independently of specialist
@@ -731,6 +826,32 @@ export async function runAgentMaintenance() {
 // Multi-hour goals continue through checkpointed jobs, never by monopolising a
 // global orchestrator or preventing Jarvis from answering in the foreground.
 export async function runAgentHarness(options: AgentHarnessOptions) {
+    const dependencies = options.dependencies ?? createProductionAgentRunnerDependencies();
+    // These aliases make every stateful boundary per-invocation while keeping
+    // the production implementation on the same transports.
+    const {
+      resolveSubscriptionAgentBin,
+      prepareSubscriptionEnv,
+      verifyCodexSubscriptionPreflight,
+      missingSubscriptionTools,
+      configuredCloudWorkspaceProvider,
+      runCommand: sh,
+      readGitObject,
+      createCredentiallessGitArchive,
+      createR2CheckpointStore,
+      prepareCloudWorkspaceExecution,
+      replayCloudWorkspaceExecution,
+      runCloudWorkspaceAgent,
+      persistPortableCheckpoint,
+      applyValidatedPatchToControllerCheckout,
+      trustedGitReviewReceiptAuthority,
+      verifyGitReviewReceiptEnvelope,
+      buildGitReviewReceipt,
+      verifyWork,
+      branchHasChanges,
+      continueRepositoryDelivery,
+      syncExternalGoalRuns,
+    } = dependencies;
     // Claim first. No provider selection, checkout, Codex binary invocation,
     // or controller filesystem is allowed to precede the immutable attempt
     // fence returned by Convex.
@@ -746,13 +867,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       held: true,
       code: String(job.code ?? "authority_held"),
     };
-    let processed = 1;
+    const processed = 1;
     const expectedAttempt = Number(job.attempt ?? 1);
     const authorityDigest = typeof job.authorityDigest === "string" ? job.authorityDigest : "";
-    const authorizeBoundary = async (phase:
-      "source_checkout" | "provider_create" | "codex_start" | "codex_resume"
-      | "checkpoint" | "review_receipt" | "integration" | "delivery",
-    ) => {
+    const authorizeBoundary = async (phase: AgentRunnerAuthorityPhase) => {
       const boundary: any = await convexMutation("jobs:authorizeExecutionBoundary", {
         jobId: job.jobId,
         expectedAttempt,
@@ -770,18 +888,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         || boundary.repository !== (job.repo ?? null)
         || boundary.sourceBranch !== (job.sourceBranch ?? null)
         || boundary.sourceHeadSha !== (job.sourceHeadSha ?? null)) return null;
-      authorityBoundaryObserver({
-        phase,
-        authorityDigest: boundary.authorityDigest,
-        schedulingBindingDigest: boundary.schedulingBindingDigest,
-        workOrderRevisionId: String(boundary.workOrderRevisionId),
-        workOrderRevision: Number(boundary.workOrderRevision),
-        workOrderRevisionDigest: boundary.workOrderRevisionDigest,
-        repository: boundary.repository,
-        sourceBranch: boundary.sourceBranch,
-        sourceHeadSha: boundary.sourceHeadSha,
-      });
-      return boundary;
+      // Return the server-authored object itself. Effect observers receive this
+      // exact envelope; the runner never re-hashes or reconstructs authority.
+      return boundary as AgentRunnerBoundaryObservation;
     };
     const failClaimed = async (error: string) => {
       await convexMutation("jobs:checkpointAndRequeue", {
@@ -795,9 +904,13 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       }).catch(() => false);
       return { processed: 1, error };
     };
-    if (!authorityDigest || !await authorizeBoundary("codex_start")) {
+    const subscriptionAuthority = authorityDigest
+      ? await authorizeBoundary("codex_start")
+      : null;
+    if (!subscriptionAuthority) {
       return { processed: 1, stale: true, error: "immutable attempt authority rejected before Codex preflight" };
     }
+    dependencies.onAuthorityBoundary("subscription_acquire", subscriptionAuthority);
     const provider: AgentProvider = "codex";
     const bin = resolveSubscriptionAgentBin(provider);
     if (!bin) return failClaimed(`no ${provider} binary`);
@@ -1034,22 +1147,14 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       // Control is a reactive lease subscription, not a per-boundary polling
       // loop. The HTTP query below is only a 2-minute fail-safe if the socket
       // has not delivered a snapshot (for example during a transient outage).
-      const controlClient = new ConvexClient(CONVEX_URL);
       const workerToken = process.env.JARVIS_WORKER_TOKEN;
-      const leaseMonitor = new ExecutionLeaseMonitor(
+      const leaseControl = dependencies.createExecutionLeaseControl({
+        jobId: String(job.jobId),
         expectedAttempt,
         expectedSteerRevision,
-        async () => await convexQuery("jobs:executionLease", { jobId: job.jobId }),
-      );
-      const unsubscribeLease = controlClient.onUpdate(
-        api.jobs.executionLease,
-        { jobId: job.jobId, workerToken },
-        (lease) => {
-          leaseMonitor.observe(lease);
-        },
-        () => { /* monitor retains only its bounded known-good snapshot */ },
-      );
-      const executionStatus = async (): Promise<string> => await leaseMonitor.status();
+        workerToken,
+      });
+      const executionStatus = leaseControl.status;
       const stopIfLeaseLost = async (checkpoint: string, result: string, branch?: string | null): Promise<boolean> => {
         const state = await executionStatus();
         if (state === "running") return false;
@@ -1131,7 +1236,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const controllerScratch = `/tmp/work/controller-${jobKey}-attempt-${expectedAttempt}`;
         rmSync(controllerScratch, { recursive: true, force: true });
         mkdirSync(controllerScratch, { recursive: true });
-        let cwd = controllerScratch;
         const agentId = (TEAM_BY_SLUG[job.agentId as AgentSlug] ? job.agentId : routeWork(job.task, { repo: job.repo }).agentId) as AgentSlug;
         const profile = TEAM_BY_SLUG[agentId];
         let context = "This is a read-only knowledge/research run. Do not edit local files or mutate external systems.";
@@ -1283,6 +1387,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               && integrationAuthority.integrationLineage === job.integrationLineage
               && claimed.integrationBranch === job.integrationBranch;
             if (!integrationAuthorityValid) return;
+            dependencies.onAuthorityBoundary("integration_effect", integrationAuthority);
             const integrationDir = `/tmp/work/integration-${jobKey}-${Number(claimed.generation)}`;
             rmSync(integrationDir, { recursive: true, force: true });
             const remote = githubRepoUrl(repo);
@@ -1413,6 +1518,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           const title = validatedGoalBranch
             ? `JARVIS goal: ${(job.label ?? job.task).slice(0, 78)}`
             : `${profile.name}: ${(job.label ?? job.task).slice(0, 82)}`;
+          const deliveryAuthority = priorTerminal ? null : await authorizeBoundary("delivery");
+          if (!priorTerminal && !deliveryAuthority) return;
+          if (deliveryAuthority) dependencies.onAuthorityBoundary("delivery_effect", deliveryAuthority);
           const delivery = priorTerminal
             ? {
                 ok: true as const, outcome: job.deliveryOutcome as "protected_draft" | "read_only_complete" | "no_change" | "merged",
@@ -1433,6 +1541,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                     baseSha: continuationReview.envelope.receipt.baseSha,
                   },
                   expectedPull: existingPull,
+                  fetchImpl: dependencies.providerFetch,
                   shouldContinue: async () => (await executionStatus()) === "running" && await linearizeDelivery(),
                   prepareEffect: prepareProviderEffect,
                   observeEffect: observeProviderEffect,
@@ -1549,11 +1658,14 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             cloneFailed = true;
             cloneFailureReason = `Repository work was requested for ${repo}, but the runner has no GitHub transport credential.`;
             context = `${cloneFailureReason} Do not pretend the repository was changed.`;
-          } else if (!await authorizeBoundary("source_checkout")) {
+          } else {
+          const sourceAuthority = await authorizeBoundary("source_checkout");
+          if (!sourceAuthority) {
             cloneFailed = true;
             cloneFailureReason = "The immutable source-checkout authority fence was rejected.";
             context = `${cloneFailureReason} No Git command or specialist process was started.`;
           } else {
+          dependencies.onAuthorityBoundary("source_checkout", sourceAuthority);
           const dir = `/tmp/work/${repo.replace(/[^a-zA-Z0-9]/g, "_")}_${jobKey}_attempt_${expectedAttempt}`;
           controllerCheckoutPath = dir;
           rmSync(dir, { recursive: true, force: true });
@@ -1634,7 +1746,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 cloneFailed = true;
                 cloneFailureReason = "The exact admitted checkout could not be confirmed before execution.";
               } else {
-                cwd = dir;
                 repoDir = dir;
                 context = job.readonly
                   ? `Your working directory is a read-only checkout of ${repo}. Inspect it deeply, but do not edit or commit.`
@@ -1649,6 +1760,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             cloneFailureReason ||= `The scoped repository ${repo} could not be hydrated from its explicit admitted ref.`;
           }
           if (cloneFailed) context = `${cloneFailureReason} Do not inspect or edit this unauthorised checkout.`;
+          }
           }
         }
         if (await stopIfLeaseLost("Execution stopped while preparing the secure workspace.", "", branch)) return;
@@ -1679,8 +1791,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               return { baseSha: workspaceBaseSha, bytes, sha256: sha256Bytes(bytes) };
             })();
         const attemptKey = `${String(job.jobId)}:${expectedAttempt}`;
-        const assertCurrentWorkspace = async (_phase: string) =>
-          (await executionStatus()) === "running" && Boolean(await authorizeBoundary("provider_create"));
+        const assertCurrentWorkspace = async (phase: string) => {
+          void phase;
+          return (await executionStatus()) === "running" && Boolean(await authorizeBoundary("provider_create"));
+        };
         const bindCloudWorkspace = async (workspace: CloudWorkspace) => Boolean(await convexMutation("jobs:bindCloudWorkspace", {
           jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId), authorityDigest,
           providerName: workspace.provider, providerWorkspaceId: workspace.providerWorkspaceId,
@@ -1729,9 +1843,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           await recordReplayDecision("hydrate", String(replayDecision.reason));
         }
         if (!providerWorkspace) {
-          if (!await authorizeBoundary("provider_create")) {
+          const providerAuthority = await authorizeBoundary("provider_create");
+          if (!providerAuthority) {
             throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt authority rejected provider creation", "rejected");
           }
+          dependencies.onAuthorityBoundary("provider_create", providerAuthority);
           const preparedWorkspace = await prepareCloudWorkspaceExecution({
             providerFactory: () => cloudProvider,
             hydrateArchive: async () => sourceArchive,
@@ -1746,7 +1862,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           // app-server starts only after replay/hydration is fenced and bound.
           rmSync(repoDir, { recursive: true, force: true });
           repoDir = null;
-          cwd = controllerScratch;
         }
         const criteria = Array.isArray(job.acceptanceCriteria) && job.acceptanceCriteria.length
           ? job.acceptanceCriteria.map(String)
@@ -1821,9 +1936,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             "blocked",
           );
         }
-        if (!await authorizeBoundary(expectedAttempt > 1 ? "codex_resume" : "codex_start")) {
+        const codexAuthority = await authorizeBoundary(expectedAttempt > 1 ? "codex_resume" : "codex_start");
+        if (!codexAuthority) {
           throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt authority rejected Codex execution", "rejected");
         }
+        dependencies.onAuthorityBoundary("codex_process", codexAuthority);
         const run = await runCloudWorkspaceAgent({
           bin,
           controllerScratch,
@@ -1841,9 +1958,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         });
         await durableProgress;
         let result = run.text;
-        if (!await authorizeBoundary("checkpoint")) {
+        const checkpointAuthority = await authorizeBoundary("checkpoint");
+        if (!checkpointAuthority) {
           throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt authority rejected checkpoint creation", "rejected");
         }
+        dependencies.onAuthorityBoundary("checkpoint_persist", checkpointAuthority);
         const portable = await persistPortableCheckpoint({
           provider: cloudProvider,
           workspace: providerWorkspace,
@@ -1901,7 +2020,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           await sh("git", ["-C", controllerCheckoutPath, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
           await sh("git", ["-C", controllerCheckoutPath, "config", "user.name", `${profile.name} via JARVIS`], env);
           repoDir = controllerCheckoutPath;
-          cwd = controllerCheckoutPath;
           await applyValidatedPatchToControllerCheckout(repoDir, baseSha, patch, env);
         }
         result = `${result}\n\nCloud boundary: ${cloudProvider.name} workspace ${providerWorkspace.providerWorkspaceId}; R2 checkpoint ${portable.digest} (${portable.byteCount} bytes).`;
@@ -2130,7 +2248,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }
           let goalReview: { envelope: GitReviewEnvelope; binding: GitReviewBinding } | undefined;
           if (repoDir) {
-            if (!await authorizeBoundary("review_receipt")) throw new Error("work-order authority changed before goal review receipt");
+            const reviewAuthorityBoundary = await authorizeBoundary("review_receipt");
+            if (!reviewAuthorityBoundary) throw new Error("work-order authority changed before goal review receipt");
+            dependencies.onAuthorityBoundary("review_receipt", reviewAuthorityBoundary);
             const receipt = await buildGitReviewReceipt({
               runGit: (args) => sh("git", ["-C", repoDir!, ...args], env), jobId: String(job.jobId), attempt: expectedAttempt,
               workOrderRevisionDigest: String(job.workOrderRevisionDigest ?? ""),
@@ -2199,7 +2319,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         let gitReview: { envelope: GitReviewEnvelope; binding: GitReviewBinding } | undefined;
         let reviewAuthority = receiptAuthority;
         if (repoDir) {
-          if (!await authorizeBoundary("review_receipt")) throw new Error("work-order authority changed before review receipt");
+          const reviewAuthorityBoundary = await authorizeBoundary("review_receipt");
+          if (!reviewAuthorityBoundary) throw new Error("work-order authority changed before review receipt");
+          dependencies.onAuthorityBoundary("review_receipt", reviewAuthorityBoundary);
           const receipt = await buildGitReviewReceipt({
             runGit: (args) => sh("git", ["-C", repoDir!, ...args], env),
             jobId: String(job.jobId),
@@ -2486,8 +2608,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }).catch(() => undefined);
         }
         if (deliveryHeartbeat) clearInterval(deliveryHeartbeat);
-        unsubscribeLease();
-        controlClient.close();
+        leaseControl.close();
       }
     };
 

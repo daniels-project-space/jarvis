@@ -1382,6 +1382,7 @@ export const finalize = mutation({
     resultDigest: v.optional(v.string()),
     evidenceDigest: v.optional(v.string()),
     reviewReceiptSignature: v.optional(v.string()),
+    reviewReceiptKeyId: v.optional(v.string()),
     reviewDiffSha256: v.optional(v.string()),
     reviewReceiptJson: v.optional(v.string()),
     deliveryLeaseOwner: v.optional(v.string()),
@@ -1423,7 +1424,7 @@ export const finalize = mutation({
         || review.authorityDigest !== executionAuthority.authorityDigest
         || review.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest
         || review.diffSha256 !== a.reviewDiffSha256 || review.signature !== a.reviewReceiptSignature
-        || delivery?.reviewKeyId !== review.keyId) return false;
+        || a.reviewReceiptKeyId !== review.keyId || delivery?.reviewKeyId !== review.keyId) return false;
     }
     const normalizedResult = String(a.result ?? "").slice(0, 4_000);
     const normalizedNote = String(a.verificationNote ?? "").slice(0, 1_000);
@@ -2528,6 +2529,7 @@ export const cloudCheckpointForReplay = query({
 export const recordCloudReplayDecision = mutation({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
+    authorityDigest: v.string(),
     disposition: v.union(v.literal("replay"), v.literal("hydrate"), v.literal("reject")),
     reason: v.string(), workerToken: v.optional(v.string()),
   },
@@ -2537,6 +2539,7 @@ export const recordCloudReplayDecision = mutation({
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
       || row.workerRunId !== a.workerRunId || !attempt || attempt.status !== "running"
+      || !await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest)
       || !/^[a-z_]{1,80}$/.test(a.reason)) return false;
     await appendAttemptEvidence(ctx, row, "cloud_checkpoint_replay", `${a.disposition}: ${a.reason}`, {
       stage: "starting", evidenceKind: "checkpoint",

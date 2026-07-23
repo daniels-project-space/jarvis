@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { convexTest, type TestConvex } from "convex-test";
+import { createHash } from "node:crypto";
+import { mkdirSync } from "node:fs";
 import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
 import schema from "../../convex/schema";
 import { testMissionAdmission } from "../../convex/testSourceAdmission";
 import { workGroupAuthority } from "../lib/work-scheduler";
+import { canonicalWorkspaceCheckpoint } from "../lib/workspace-checkpoint";
 
 /* eslint-disable @typescript-eslint/no-explicit-any -- the Trigger task registration and convex-test bridge expose dynamic production handler boundaries */
 
@@ -58,7 +61,14 @@ vi.mock("./cloud-workspace-providers", async (importOriginal) => ({
   configuredCloudWorkspaceProvider: boundaries.configuredCloudWorkspaceProvider,
 }));
 
-import { agentWorker, setAgentRunnerBoundaryObserverForTest } from "./agent-runner";
+import {
+  agentWorker,
+  createProductionAgentRunnerDependencies,
+  runAgentHarness,
+  type AgentRunnerBoundaryObservation,
+  type AgentRunnerDependencies,
+  type AgentRunnerEffectBoundary,
+} from "./agent-runner";
 
 const modules = import.meta.glob("../../convex/**/*.ts");
 const WORKER = "production-runner-authority-worker";
@@ -67,7 +77,11 @@ type HarnessConvex = TestConvex<typeof schema>;
 
 type MutationTrace = { path: string; args: Record<string, unknown> };
 
-function bridgeProductionRunnerToConvex(t: HarnessConvex, beforeCall?: (call: MutationTrace) => Promise<void>) {
+function bridgeProductionRunnerToConvex(
+  t: HarnessConvex,
+  beforeCall?: (call: MutationTrace) => Promise<void>,
+  afterCall?: (call: MutationTrace, value: unknown) => Promise<void>,
+) {
   const trace: MutationTrace[] = [];
   const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body ?? "{}")) as MutationTrace;
@@ -87,9 +101,62 @@ function bridgeProductionRunnerToConvex(t: HarnessConvex, beforeCall?: (call: Mu
       case "jobs:reserveDispatchBatch":
         value = await t.mutation(api.jobs.reserveDispatchBatch, body.args as any);
         break;
+      case "jobs:bindWorkspaceSource":
+        value = await t.mutation(api.jobs.bindWorkspaceSource, body.args as any);
+        break;
+      case "jobs:cloudCheckpointForReplay":
+        value = await t.query(api.jobs.cloudCheckpointForReplay, body.args as any);
+        break;
+      case "jobs:recordCloudReplayDecision":
+        value = await t.mutation(api.jobs.recordCloudReplayDecision, body.args as any);
+        break;
+      case "jobs:bindCloudWorkspace":
+        value = await t.mutation(api.jobs.bindCloudWorkspace, body.args as any);
+        break;
+      case "jobs:recordCloudCheckpoint":
+        value = await t.mutation(api.jobs.recordCloudCheckpoint, body.args as any);
+        break;
+      case "jobs:markCloudWorkspaceTerminated":
+        value = await t.mutation(api.jobs.markCloudWorkspaceTerminated, body.args as any);
+        break;
+      case "jobs:touchHeartbeat":
+        value = await t.mutation(api.jobs.touchHeartbeat, body.args as any);
+        break;
+      case "jobs:updateProgress":
+        value = await t.mutation(api.jobs.updateProgress, body.args as any);
+        break;
+      case "jobs:linearizeDelivery":
+        value = await t.mutation(api.jobs.linearizeDelivery, body.args as any);
+        break;
+      case "jobs:markVerifiedForDelivery":
+        value = await t.mutation(api.jobs.markVerifiedForDelivery, body.args as any);
+        break;
+      case "jobs:reviewReceipt":
+        value = await t.query(api.jobs.reviewReceipt, body.args as any);
+        break;
+      case "jobs:prepareDeliveryEffect":
+        value = await t.mutation(api.jobs.prepareDeliveryEffect, body.args as any);
+        break;
+      case "jobs:observeDeliveryEffect":
+        value = await t.mutation(api.jobs.observeDeliveryEffect, body.args as any);
+        break;
+      case "jobs:setDelivery":
+        value = await t.mutation(api.jobs.setDelivery, body.args as any);
+        break;
+      case "jobs:finalize":
+        value = await t.mutation(api.jobs.finalize, body.args as any);
+        break;
+      case "goalMode:externalPending":
+        value = [];
+        break;
+      case "goalMode:claimAdvance":
+      case "missions:claimReady":
+        value = null;
+        break;
       default:
         throw new Error(`Unexpected production runner Convex call: ${body.path}`);
     }
+    await afterCall?.(body, value);
     return new Response(JSON.stringify({ status: "success", value }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -124,6 +191,257 @@ async function invokeProductionWorker(payload: Record<string, unknown>, runId: s
   });
 }
 
+async function invokeHarness(
+  reservation: { jobId: string; dispatchId: string },
+  runId: string,
+  dependencies: AgentRunnerDependencies,
+) {
+  return await runAgentHarness({
+    reservation: { ...reservation, workerRunId: runId },
+    runtimeAttestation: { triggerDeploymentVersion: "runner-authority-test" },
+    dependencies,
+  });
+}
+
+const sha256 = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
+const SOURCE_SHA = "a".repeat(40);
+const TREE_SHA = "b".repeat(40);
+const CHECKPOINT_SHA = "c".repeat(64);
+
+type BoundaryTrace = {
+  effect: AgentRunnerEffectBoundary;
+  authority: AgentRunnerBoundaryObservation;
+};
+
+function injectedRunnerDependencies(options: {
+  boundaries?: BoundaryTrace[];
+  providerEffect?: ReturnType<typeof vi.fn>;
+  runProcess?: ReturnType<typeof vi.fn>;
+  runGit?: ReturnType<typeof vi.fn>;
+  providerFetch?: typeof fetch;
+} = {}): AgentRunnerDependencies {
+  const codexHome = "/tmp/work/jarvis-runner-authority-codex-home";
+  mkdirSync(codexHome, { recursive: true });
+  const workspace = {
+    provider: "cloudflare" as const,
+    providerWorkspaceId: "fake-cloud-workspace",
+    providerSessionId: "fake-cloud-session",
+    root: "/workspace/repository",
+    createdAt: Date.now(),
+  };
+  const provider = {
+    name: "cloudflare" as const,
+    createWorkspace: vi.fn(async () => workspace),
+    uploadCredentiallessArchive: vi.fn(async () => undefined),
+    run: vi.fn(async () => ({ code: 0, stdout: "", stderr: "" })),
+    checkpoint: vi.fn(),
+    restore: vi.fn(),
+    exportPatch: vi.fn(async () => ({
+      baseSha: SOURCE_SHA,
+      patch: new Uint8Array(),
+      sha256: sha256(new Uint8Array()),
+      byteCount: 0,
+    })),
+    terminate: vi.fn(async () => undefined),
+  };
+  const runGit = options.runGit ?? vi.fn(async (_cmd: string, args: string[]) => {
+    const command = args.join(" ");
+    if (command.includes("rev-parse refs/remotes/origin/jarvis-admitted-source")) return { code: 0, out: SOURCE_SHA };
+    if (command.includes("rev-parse refs/remotes/origin/jarvis-admitted-worker")) return { code: 0, out: SOURCE_SHA };
+    if (command.includes("rev-parse --is-shallow-repository")) return { code: 0, out: "false" };
+    if (command.includes("ls-remote")) return { code: 0, out: `${SOURCE_SHA}\trefs/heads/worker` };
+    if (command.includes("rev-parse HEAD^{tree}") || command.includes(`rev-parse ${SOURCE_SHA}^{tree}`)) return { code: 0, out: TREE_SHA };
+    if (command.includes("rev-parse HEAD")) return { code: 0, out: SOURCE_SHA };
+    if (command.includes("branch --show-current")) return { code: 0, out: args.at(-1) ?? "" };
+    if (command.includes("rev-list --count")) return { code: 0, out: "0" };
+    return { code: 0, out: "" };
+  });
+  const runProcess = options.runProcess ?? vi.fn(async (input: any) => {
+    expect(input.controllerEnv.GITHUB_TOKEN).toBeUndefined();
+    expect(input.controllerEnv.JARVIS_WORKER_TOKEN).toBeUndefined();
+    return {
+      text: "Production runner completed the bounded fake repository work.",
+      timedOut: false,
+      stopped: null,
+      checkpointLog: "fake process completed",
+      commands: [],
+    };
+  });
+  const defaults = createProductionAgentRunnerDependencies();
+  return {
+    ...defaults,
+    onAuthorityBoundary: (effect, authority) => {
+      options.boundaries?.push({ effect, authority });
+    },
+    resolveSubscriptionAgentBin: vi.fn(() => "/fake/subscription/codex"),
+    prepareSubscriptionEnv: vi.fn(() => ({
+      env: {
+        PATH: process.env.PATH,
+        CODEX_HOME: codexHome,
+        CODEX_API_KEY: "must-not-reach-child",
+      } as unknown as NodeJS.ProcessEnv,
+    })),
+    verifyCodexSubscriptionPreflight: vi.fn(() => ({})),
+    missingSubscriptionTools: vi.fn(() => []),
+    configuredCloudWorkspaceProvider: vi.fn(() => provider as any),
+    runCommand: runGit as any,
+    readGitObject: vi.fn(async () => Buffer.from("")),
+    createCredentiallessGitArchive: vi.fn(async (_checkout, baseSha) => ({
+      baseSha,
+      bytes: new Uint8Array([1]),
+      sha256: sha256(new Uint8Array([1])),
+    })),
+    createR2CheckpointStore: vi.fn(async () => ({ put: vi.fn(), get: vi.fn() }) as any),
+    replayCloudWorkspaceExecution: vi.fn(async () => {
+      throw new Error("first attempt must hydrate, not replay");
+    }),
+    prepareCloudWorkspaceExecution: vi.fn(async (input: any) => {
+      if (!await input.bindWorkspace(workspace)) throw new Error("fake workspace binding rejected");
+      return { provider, workspace, archive: await input.hydrateArchive() };
+    }) as any,
+    runCloudWorkspaceAgent: runProcess as any,
+    persistPortableCheckpoint: vi.fn(async (input: any) => {
+      const manifest = {
+        version: 2 as const,
+        jobId: input.jobId,
+        attempt: input.attempt,
+        provider: "cloudflare" as const,
+        providerWorkspaceId: workspace.providerWorkspaceId,
+        providerSessionId: workspace.providerSessionId,
+        baseSha: input.baseSha,
+        sourceArchiveSha256: input.sourceArchiveSha256,
+        sourceArchiveBytes: input.sourceArchiveBytes,
+        archiveSha256: CHECKPOINT_SHA,
+        archiveBytes: 1,
+        runtime: input.runtime,
+        lockfileDigest: input.lockfileDigest,
+        template: input.template,
+        attemptKey: input.attemptKey,
+        causationId: input.causationId,
+        createdAt: Date.now(),
+      };
+      const canonicalManifest = canonicalWorkspaceCheckpoint(manifest);
+      return {
+        manifest,
+        ref: `sandbox-checkpoints/sha256/${CHECKPOINT_SHA}`,
+        digest: CHECKPOINT_SHA,
+        byteCount: 1,
+        canonicalManifest,
+        manifestDigest: sha256(canonicalManifest),
+      };
+    }),
+    applyValidatedPatchToControllerCheckout: vi.fn(async () => undefined),
+    buildGitReviewReceipt: vi.fn(async (input: any) => {
+      const evidenceDigest = sha256(input.agentEvidence);
+      const receipt = {
+        version: 2 as const,
+        jobId: input.jobId,
+        attempt: input.attempt,
+        workOrderRevisionDigest: input.workOrderRevisionDigest,
+        repository: input.repository,
+        branch: input.expectedBranch,
+        baseSha: input.baseSha,
+        baseTreeSha: TREE_SHA,
+        headSha: SOURCE_SHA,
+        headTreeSha: TREE_SHA,
+        parentShas: [] as string[],
+        historyComplete: true as const,
+        baseIsAncestor: true as const,
+        commitCount: 0,
+        commits: "",
+        clean: true as const,
+        diffStat: "",
+        changedPaths: "",
+        diffPatch: "",
+        diffSha256: sha256(""),
+        diffChars: 0,
+        agentEvidenceSha256: evidenceDigest,
+        commands: [],
+      };
+      return {
+        ok: true as const,
+        receipt,
+        binding: {
+          jobId: input.jobId,
+          attempt: input.attempt,
+          workOrderRevisionDigest: input.workOrderRevisionDigest,
+          repository: input.repository,
+          branch: input.expectedBranch,
+          baseSha: input.baseSha,
+          agentEvidenceSha256: evidenceDigest,
+          headSha: SOURCE_SHA,
+        },
+      };
+    }),
+    verifyWork: vi.fn(async () => ({ verdict: "pass" as const, note: "fake review passed", answer: "" })),
+    branchHasChanges: vi.fn(async () => true),
+    providerFetch: options.providerFetch ?? (vi.fn(async () => {
+      throw new Error("provider transport was not expected");
+    }) as unknown as typeof fetch),
+    syncExternalGoalRuns: vi.fn(async () => ({ checked: 0, updated: 0, blocked: 0, wake: false })),
+    createExecutionLeaseControl: vi.fn(() => ({
+      status: vi.fn(async () => "running"),
+      close: vi.fn(),
+    })),
+  };
+}
+
+function configureFakeControllerAuthority() {
+  process.env.GITHUB_TOKEN = "fake-controller-github-transport";
+  process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING = JSON.stringify({
+    current: { keyId: "runner-authority-v2", secret: "fixed-test-only-receipt-secret-at-least-32-bytes" },
+    previous: [],
+  });
+}
+
+function fakeGitHubDeliveryTransport(providerEffects: string[]) {
+  let pullExists = false;
+  let merged = false;
+  const pull = {
+    number: 42,
+    html_url: "https://github.test/daniels-project-space/jarvis/pull/42",
+    node_id: "PR_fake_42",
+    draft: false,
+    state: "open",
+    merged: false,
+    mergeable: true,
+    mergeable_state: "clean",
+    head: { sha: SOURCE_SHA },
+    base: { sha: SOURCE_SHA },
+  };
+  return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes("/pulls?state=open")) {
+      return new Response(JSON.stringify(pullExists ? [pull] : []), { status: 200 });
+    }
+    if (url.includes("/git/ref/heads/")) {
+      return new Response(JSON.stringify({ object: { sha: SOURCE_SHA } }), { status: 200 });
+    }
+    if (url === `https://api.github.com/repos/${REPO}`) {
+      return new Response(JSON.stringify({ default_branch: "main" }), { status: 200 });
+    }
+    if (url === `https://api.github.com/repos/${REPO}/pulls/42` && init?.method !== "PUT") {
+      return new Response(JSON.stringify({
+        ...pull,
+        state: merged ? "closed" : "open",
+        merged,
+        merge_commit_sha: merged ? "d".repeat(40) : undefined,
+      }), { status: 200 });
+    }
+    if (url === `https://api.github.com/repos/${REPO}/pulls` && init?.method === "POST") {
+      providerEffects.push("create_pr");
+      pullExists = true;
+      return new Response(JSON.stringify(pull), { status: 201 });
+    }
+    if (url === `https://api.github.com/repos/${REPO}/pulls/42/merge` && init?.method === "PUT") {
+      providerEffects.push("merge_pr");
+      merged = true;
+      return new Response(JSON.stringify({ merged: true, sha: "d".repeat(40) }), { status: 200 });
+    }
+    throw new Error(`Unexpected fake GitHub request: ${String(init?.method ?? "GET")} ${url}`);
+  }) as unknown as typeof fetch;
+}
+
 beforeEach(() => {
   process.env.JARVIS_WORKER_TOKEN = WORKER;
   boundaries.resolveSubscriptionAgentBin.mockReset();
@@ -132,13 +450,13 @@ beforeEach(() => {
   trigger.batchTrigger.mockClear();
   trigger.metadata.set.mockClear();
   trigger.metadata.flush.mockClear();
-  setAgentRunnerBoundaryObserverForTest();
 });
 
 afterEach(() => {
   delete process.env.JARVIS_WORKER_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  delete process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING;
   vi.unstubAllGlobals();
-  setAgentRunnerBoundaryObserverForTest();
 });
 
 describe("production Trigger worker authority harness", () => {
@@ -189,8 +507,6 @@ describe("production Trigger worker authority harness", () => {
     const { jobId, reservation } = await reservedWritableJob(t, "runner-payload-forgery");
     const before = await t.run(async (ctx) => ctx.db.get(jobId));
     const bridge = bridgeProductionRunnerToConvex(t);
-    const boundariesSeen: Array<Record<string, unknown>> = [];
-    setAgentRunnerBoundaryObserverForTest((boundary) => boundariesSeen.push(boundary));
 
     const result = await invokeProductionWorker({
       jobId: String(jobId),
@@ -243,17 +559,6 @@ describe("production Trigger worker authority harness", () => {
       workerRunId: "trigger-authoritative-run",
       status: "checkpointed",
     });
-    expect(boundariesSeen).toEqual([{
-      phase: "codex_start",
-      authorityDigest: state.attempts[0]?.authorityDigest,
-      schedulingBindingDigest: state.attempts[0]?.schedulingBindingDigest,
-      workOrderRevisionId: String(state.attempts[0]?.workOrderRevisionId),
-      workOrderRevision: state.attempts[0]?.workOrderRevision,
-      workOrderRevisionDigest: state.attempts[0]?.workOrderRevisionDigest,
-      repository: REPO,
-      sourceBranch: state.attempts[0]?.sourceBranch,
-      sourceHeadSha: state.attempts[0]?.sourceHeadSha,
-    }]);
     expect(state.attempts[1]).toMatchObject({ attempt: 2, status: "pending" });
     expect(state.attempts[1]?.workerRunId).toBeUndefined();
   });
@@ -325,5 +630,293 @@ describe("production Trigger worker authority harness", () => {
     }));
     expect(state.job).toMatchObject({ status: "running", workerRunId: "trigger-source-head-race" });
     expect(state.attempt).toMatchObject({ status: "running", workerRunId: "trigger-source-head-race" });
+  });
+
+  it("runs the real specialist and delivery lifecycle with exact server authority and reconciles a lost observation response", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-full-authority-lifecycle");
+    const trace: BoundaryTrace[] = [];
+    const specialistBridge = bridgeProductionRunnerToConvex(t);
+    const specialistDependencies = injectedRunnerDependencies({ boundaries: trace });
+
+    const specialist = await invokeHarness({
+      jobId: String(jobId),
+      dispatchId: reservation.dispatchId,
+    }, "specialist-authority-run", specialistDependencies);
+
+    expect(specialist).toEqual({ processed: 1 });
+    const sealed = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      attempt: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1)).first(),
+      reviews: await ctx.db.query("reviewReceipts")
+        .withIndex("by_job_attempt_digest", (q) => q.eq("jobId", jobId).eq("attempt", 1)).collect(),
+    }));
+    expect(sealed.job).toMatchObject({
+      status: "pending",
+      verificationVerdict: "pass",
+      reviewReceiptId: sealed.reviews[0]?._id,
+      reviewReceiptDigest: sealed.reviews[0]?.receiptDigest,
+    });
+    expect(sealed.attempt).toMatchObject({
+      workerRunId: "specialist-authority-run",
+      checkpointDigest: CHECKPOINT_SHA,
+      providerWorkspaceId: "fake-cloud-workspace",
+      providerSessionId: "fake-cloud-session",
+    });
+    expect(trace.map((item) => item.effect)).toEqual([
+      "subscription_acquire",
+      "source_checkout",
+      "provider_create",
+      "codex_process",
+      "checkpoint_persist",
+      "review_receipt",
+    ]);
+    for (const { authority } of trace) {
+      expect(authority).toMatchObject({
+        authorityDigest: sealed.attempt?.authorityDigest,
+        schedulingBindingDigest: sealed.attempt?.schedulingBindingDigest,
+        workOrderRevisionId: sealed.attempt?.workOrderRevisionId,
+        workOrderRevision: sealed.attempt?.workOrderRevision,
+        workOrderRevisionDigest: sealed.attempt?.workOrderRevisionDigest,
+        repository: REPO,
+        sourceBranch: sealed.attempt?.sourceBranch,
+        sourceHeadSha: sealed.attempt?.sourceHeadSha,
+      });
+    }
+    expect(specialistBridge.trace.filter((call) => call.path === "jobs:markVerifiedForDelivery")).toHaveLength(1);
+
+    const firstControllerBatch = await t.mutation(api.jobs.reserveDispatchBatch, { limit: 1, workerToken: WORKER });
+    const firstControllerReservation = firstControllerBatch.reservations[0];
+    expect(firstControllerReservation).toBeTruthy();
+    const providerEffects: string[] = [];
+    const providerFetch = fakeGitHubDeliveryTransport(providerEffects);
+    let loseObservationResponse = true;
+    const firstControllerBridge = bridgeProductionRunnerToConvex(t, undefined, async (call) => {
+      if (call.path === "jobs:observeDeliveryEffect" && loseObservationResponse) {
+        loseObservationResponse = false;
+        throw new Error("simulated response loss after durable provider observation");
+      }
+    });
+    const firstControllerTrace: BoundaryTrace[] = [];
+    const firstControllerDependencies = injectedRunnerDependencies({
+      boundaries: firstControllerTrace,
+      providerFetch,
+    });
+
+    expect(await invokeHarness({
+      jobId: String(jobId),
+      dispatchId: firstControllerReservation.dispatchId,
+    }, "delivery-controller-run-1", firstControllerDependencies)).toEqual({ processed: 1 });
+    expect(providerEffects).toEqual(["create_pr"]);
+    expect(firstControllerTrace.map((item) => item.effect)).toEqual([
+      "subscription_acquire",
+      "delivery_effect",
+    ]);
+    expect((firstControllerDependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
+    expect(firstControllerBridge.trace.filter((call) => call.path === "jobs:prepareDeliveryEffect")).toHaveLength(1);
+    expect(firstControllerBridge.trace.filter((call) => call.path === "jobs:observeDeliveryEffect")).toHaveLength(1);
+
+    await t.run(async (ctx) => ctx.db.patch(jobId, { nextRunAt: Date.now() }));
+    const replayBatch = await t.mutation(api.jobs.reserveDispatchBatch, { limit: 1, workerToken: WORKER });
+    const replayReservation = replayBatch.reservations[0];
+    expect(replayReservation).toBeTruthy();
+    const replayTrace: BoundaryTrace[] = [];
+    const replayBridge = bridgeProductionRunnerToConvex(t);
+    const replayDependencies = injectedRunnerDependencies({ boundaries: replayTrace, providerFetch });
+
+    expect(await invokeHarness({
+      jobId: String(jobId),
+      dispatchId: replayReservation.dispatchId,
+    }, "delivery-controller-run-2", replayDependencies)).toEqual({ processed: 1 });
+    expect(providerEffects).toEqual(["create_pr", "merge_pr"]);
+    expect((replayDependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
+    expect(replayTrace.map((item) => item.effect)).toEqual([
+      "subscription_acquire",
+      "delivery_effect",
+    ]);
+    const finished = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      attempt: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1)).first(),
+      reviews: await ctx.db.query("reviewReceipts")
+        .withIndex("by_job_attempt_digest", (q) => q.eq("jobId", jobId).eq("attempt", 1)).collect(),
+      deliveries: await ctx.db.query("deliveryAttempts")
+        .withIndex("by_job_source_generation", (q) => q.eq("jobId", jobId).eq("sourceWorkAttempt", 1)).collect(),
+      workReceipts: await ctx.db.query("workReceipts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1)).collect(),
+      integrations: await ctx.db.query("integrationAttempts").collect(),
+    }));
+    expect({
+      status: finished.job?.status,
+      deliveryStatus: finished.job?.deliveryStatus,
+      pullRequestUrl: finished.job?.pullRequestUrl,
+    }).toMatchObject({
+      status: "done",
+      deliveryStatus: "merged",
+      pullRequestUrl: "https://github.test/daniels-project-space/jarvis/pull/42",
+    });
+    expect(finished.reviews).toHaveLength(1);
+    expect(finished.deliveries).toHaveLength(2);
+    expect(finished.deliveries.map((delivery) => delivery.generation)).toEqual([1, 2]);
+    expect(finished.workReceipts).toHaveLength(1);
+    expect(finished.integrations).toHaveLength(0);
+    expect(finished.attempt?.checkpointDigest).toBe(CHECKPOINT_SHA);
+    expect(new Set(finished.deliveries.flatMap((delivery) =>
+      (delivery.effects ?? []).map((effect: any) => effect.effectId),
+    ))).toEqual(new Set([
+      `pr:ready:${sealed.job?.workerBranch}:${SOURCE_SHA}:${SOURCE_SHA}`,
+      `merge:42:${SOURCE_SHA}:${SOURCE_SHA}`,
+    ]));
+    expect(finished.deliveries.every((delivery) =>
+      delivery.authorityDigest === sealed.attempt?.authorityDigest
+      && delivery.schedulingBindingDigest === sealed.attempt?.schedulingBindingDigest
+      && delivery.workOrderRevisionId === sealed.attempt?.workOrderRevisionId
+      && delivery.workOrderRevisionDigest === sealed.attempt?.workOrderRevisionDigest
+      && delivery.reviewReceiptId === sealed.reviews[0]?._id
+      && delivery.reviewReceiptDigest === sealed.reviews[0]?.receiptDigest
+    )).toBe(true);
+    expect(replayBridge.trace.filter((call) => call.path === "jobs:prepareDeliveryEffect")).toHaveLength(1);
+    expect(replayBridge.trace.filter((call) => call.path === "jobs:observeDeliveryEffect")).toHaveLength(1);
+    expect(replayBridge.trace.filter((call) => call.path === "jobs:markVerifiedForDelivery")).toHaveLength(0);
+  });
+
+  it("does not start any injected transport when the immutable claim is stale", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-no-effect-before-claim");
+    const bridge = bridgeProductionRunnerToConvex(t);
+    const boundariesSeen: BoundaryTrace[] = [];
+    const dependencies = injectedRunnerDependencies({ boundaries: boundariesSeen });
+
+    const result = await invokeHarness({
+      jobId: String(jobId),
+      dispatchId: `${reservation.dispatchId}-stale`,
+    }, "stale-claim-run", dependencies);
+
+    expect(result).toEqual({ processed: 0, stale: true });
+    expect(boundariesSeen).toEqual([]);
+    expect((dependencies.resolveSubscriptionAgentBin as any)).not.toHaveBeenCalled();
+    expect((dependencies.configuredCloudWorkspaceProvider as any)).not.toHaveBeenCalled();
+    expect((dependencies.runCommand as any)).not.toHaveBeenCalled();
+    expect((dependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
+    expect((dependencies.persistPortableCheckpoint as any)).not.toHaveBeenCalled();
+    expect((dependencies.buildGitReviewReceipt as any)).not.toHaveBeenCalled();
+    expect((dependencies.providerFetch as any)).not.toHaveBeenCalled();
+    expect(bridge.trace.map((call) => call.path)).toEqual(["jobs:claimDispatched"]);
+    const effects = await t.run(async (ctx) => ({
+      reviews: await ctx.db.query("reviewReceipts").collect(),
+      deliveries: await ctx.db.query("deliveryAttempts").collect(),
+      integrations: await ctx.db.query("integrationAttempts").collect(),
+      receipts: await ctx.db.query("workReceipts").collect(),
+    }));
+    expect(effects).toEqual({ reviews: [], deliveries: [], integrations: [], receipts: [] });
+  });
+
+  it("rejects a new steering work order before the next source checkout transport", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-steering-boundary");
+    let steered = false;
+    bridgeProductionRunnerToConvex(t, async (call) => {
+      if (call.path !== "jobs:authorizeExecutionBoundary"
+        || call.args.phase !== "source_checkout"
+        || steered) return;
+      steered = true;
+      await t.mutation(api.jobs.control, {
+        jobId,
+        action: "steer",
+        input: "Use the newly admitted work-order revision.",
+        workerToken: WORKER,
+      });
+    });
+    const trace: BoundaryTrace[] = [];
+    const dependencies = injectedRunnerDependencies({ boundaries: trace });
+
+    expect(await invokeHarness({
+      jobId: String(jobId),
+      dispatchId: reservation.dispatchId,
+    }, "steered-between-boundaries", dependencies)).toEqual({ processed: 1 });
+    expect(trace.map((item) => item.effect)).toEqual(["subscription_acquire"]);
+    expect((dependencies.resolveSubscriptionAgentBin as any)).toHaveBeenCalledTimes(1);
+    expect((dependencies.runCommand as any)).not.toHaveBeenCalled();
+    expect((dependencies.configuredCloudWorkspaceProvider as any)).toHaveBeenCalledTimes(1);
+    expect((dependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
+    const state = await t.run(async (ctx) => ctx.db.get(jobId));
+    expect(state).toMatchObject({ status: "pending", attempt: 2, steerRevision: 1 });
+    expect(state?.workOrderRevision).toBeGreaterThan(1);
+  });
+
+  it.each([
+    {
+      phase: "provider_create",
+      occurrence: 1,
+      effects: ["subscription_acquire", "source_checkout"],
+      prepareWorkspace: 0,
+      process: 0,
+      checkpoint: 0,
+      review: 0,
+    },
+    {
+      phase: "codex_start",
+      occurrence: 2,
+      effects: ["subscription_acquire", "source_checkout", "provider_create"],
+      prepareWorkspace: 1,
+      process: 0,
+      checkpoint: 0,
+      review: 0,
+    },
+    {
+      phase: "checkpoint",
+      occurrence: 1,
+      effects: ["subscription_acquire", "source_checkout", "provider_create", "codex_process"],
+      prepareWorkspace: 1,
+      process: 1,
+      checkpoint: 0,
+      review: 0,
+    },
+    {
+      phase: "review_receipt",
+      occurrence: 1,
+      effects: ["subscription_acquire", "source_checkout", "provider_create", "codex_process", "checkpoint_persist"],
+      prepareWorkspace: 1,
+      process: 1,
+      checkpoint: 1,
+      review: 0,
+    },
+  ])("fences a new work order before the $phase effect", async (fixture) => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, `runner-stale-${fixture.phase}`);
+    let occurrences = 0;
+    let steered = false;
+    bridgeProductionRunnerToConvex(t, async (call) => {
+      if (call.path !== "jobs:authorizeExecutionBoundary" || call.args.phase !== fixture.phase) return;
+      occurrences += 1;
+      if (occurrences !== fixture.occurrence || steered) return;
+      steered = true;
+      await t.mutation(api.jobs.control, {
+        jobId,
+        action: "steer",
+        input: `Replace authority immediately before ${fixture.phase}.`,
+        workerToken: WORKER,
+      });
+    });
+    const trace: BoundaryTrace[] = [];
+    const dependencies = injectedRunnerDependencies({ boundaries: trace });
+
+    expect(await invokeHarness({
+      jobId: String(jobId),
+      dispatchId: reservation.dispatchId,
+    }, `stale-${fixture.phase}-run`, dependencies)).toEqual({ processed: 1 });
+    expect(trace.map((item) => item.effect)).toEqual(fixture.effects);
+    expect((dependencies.prepareCloudWorkspaceExecution as any)).toHaveBeenCalledTimes(fixture.prepareWorkspace);
+    expect((dependencies.runCloudWorkspaceAgent as any)).toHaveBeenCalledTimes(fixture.process);
+    expect((dependencies.persistPortableCheckpoint as any)).toHaveBeenCalledTimes(fixture.checkpoint);
+    expect((dependencies.buildGitReviewReceipt as any)).toHaveBeenCalledTimes(fixture.review);
+    expect((dependencies.providerFetch as any)).not.toHaveBeenCalled();
+    const state = await t.run(async (ctx) => ctx.db.get(jobId));
+    expect(state).toMatchObject({ status: "pending", attempt: 2, steerRevision: 1 });
   });
 });
