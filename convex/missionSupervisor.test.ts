@@ -13,6 +13,8 @@ import {
 } from "../src/lib/source-admission";
 import {
   ensureWorkAttempt,
+  patchJobWithRuntime,
+  projectJobRuntime,
   readAttemptExecutionAuthority,
 } from "./controlPlane";
 import {
@@ -25,6 +27,7 @@ import {
   MISSION_SUPERVISOR_MAX_JOBS,
   supersessionDigest,
 } from "./missionSupervisor";
+import { triggerClaimAuthority } from "../src/lib/trigger-machine";
 
 declare global {
   interface ImportMeta {
@@ -52,6 +55,25 @@ const jobsApi = {
   provideInput: makeFunctionReference<"mutation">("jobs:provideInput"),
   control: makeFunctionReference<"mutation">("jobs:control"),
   reapStale: makeFunctionReference<"mutation">("jobs:reapStale"),
+  reserveDispatchBatch: makeFunctionReference<"mutation">(
+    "jobs:reserveDispatchBatch",
+  ),
+  claimDispatched: makeFunctionReference<"mutation">("jobs:claimDispatched"),
+  checkpointAndRequeue: makeFunctionReference<"mutation">(
+    "jobs:checkpointAndRequeue",
+  ),
+  markVerifiedForDelivery: makeFunctionReference<"mutation">(
+    "jobs:markVerifiedForDelivery",
+  ),
+  linearizeDelivery: makeFunctionReference<"mutation">(
+    "jobs:linearizeDelivery",
+  ),
+  prepareDeliveryEffect: makeFunctionReference<"mutation">(
+    "jobs:prepareDeliveryEffect",
+  ),
+  observeDeliveryEffect: makeFunctionReference<"mutation">(
+    "jobs:observeDeliveryEffect",
+  ),
 };
 const approvalsApi = {
   decide: makeFunctionReference<"mutation">("approvals:decide"),
@@ -119,6 +141,10 @@ type CommitMetadata = {
   supervisorPromptVersion: string;
   triggerRunId: string;
   deploymentVersion?: string;
+};
+type DispatchReservation = Parameters<typeof triggerClaimAuthority>[0] & {
+  jobId: Id<"jobs">;
+  dispatchId: string;
 };
 type CommitDecision =
   | {
@@ -393,6 +419,38 @@ function delegatedWorkstream(
     risk: "low",
     acceptanceCriteria: ["The exact bounded behavior is verified."],
     ...overrides,
+  };
+}
+
+async function startAndDelegate(
+  t: SupervisorTest,
+  requestKey: string,
+  workstreams: Array<ReturnType<typeof delegatedWorkstream>>,
+  options: StartOptions = {},
+) {
+  const started = await start(t, requestKey, options);
+  const leased = await claimSuccess(t, started.missionId, 0);
+  const delegated = await t.mutation(
+    supervisorApi.commitV1,
+    commitInput(
+      started.missionId,
+      leased,
+      { kind: "delegate", workstreams },
+      {
+        ...MODEL_METADATA,
+        triggerRunId: `trigger-${requestKey}`,
+      },
+    ),
+  );
+  expect(delegated).toMatchObject({
+    committed: true,
+    resultState: "waiting",
+  });
+  return {
+    started,
+    leased,
+    delegated,
+    jobIds: delegated.createdJobIds as Id<"jobs">[],
   };
 }
 
@@ -1458,7 +1516,7 @@ describe("dormant mission supervisor authority", () => {
     });
   });
 
-  it("fails mission controls closed while existing work needs a fenced batch primitive", async () => {
+  it("keeps active-job cancel, steer, and input closed until their batch phases land", async () => {
     const t = convexTest(schema, modules);
     const started = await start(t, "control-active-job-gate");
     const leased = await claimSuccess(t, started.missionId, 0);
@@ -1481,7 +1539,6 @@ describe("dormant mission supervisor authority", () => {
     const jobId = delegated.createdJobIds[0] as Id<"jobs">;
 
     for (const [requestKey, action, input] of [
-      ["control-active-pause", "pause", undefined],
       [
         "control-active-steer",
         "steer",
@@ -1537,7 +1594,834 @@ describe("dormant mission supervisor authority", () => {
       status: "pending",
       steerRevision: 0,
     });
-    expect(persisted.controls).toHaveLength(4);
+    expect(persisted.controls).toHaveLength(3);
+  });
+
+  it("atomically pauses and resumes only its persisted cohort with replay-safe receipts", async () => {
+    const t = convexTest(schema, modules);
+    const fixture = await startAndDelegate(t, "control-active-pause-resume", [
+      delegatedWorkstream({
+        task: "Implement the queued member of atomic pause cohort coverage.",
+        label: "queued member",
+      }),
+      delegatedWorkstream({
+        task:
+          "Send the protected customer message only after Daniel explicitly approves it.",
+        label: "approval member",
+        approvalRequired: true,
+        risk: "consequential",
+      }),
+      delegatedWorkstream({
+        task: "Implement the manually paused exclusion member of cohort coverage.",
+        label: "manual pause member",
+      }),
+    ]);
+    const [queuedId, approvalId, manualPausedId] = fixture.jobIds;
+
+    // A resolved historical approval must not make the one current pending
+    // approval ambiguous.
+    await t.run(async (ctx) => {
+      await ctx.db.insert("approvals", {
+        jobId: String(approvalId),
+        kind: "historical-protected-work",
+        summary: "Previously approved authority retained for audit.",
+        risk: "consequential",
+        status: "approved",
+        requestedAt: Date.now() - 10_000,
+        resolvedAt: Date.now() - 9_000,
+      });
+    });
+    expect(await t.mutation(jobsApi.control, {
+      jobId: manualPausedId,
+      action: "pause",
+      workerToken: WORKER,
+    })).toBe(true);
+    const beforePause = await supervisorState(t, fixture.started.missionId);
+    expect(beforePause).toMatchObject({
+      state: "ready",
+      inputRevision: 2,
+      totalJobs: 3,
+      nonterminalJobCount: 3,
+    });
+
+    const paused = await control(
+      t,
+      fixture.started.missionId,
+      "control-active-pause-v1",
+      "pause",
+      beforePause!.inputRevision,
+    );
+    const expectedCohort = [queuedId, approvalId].sort((left, right) =>
+      String(left).localeCompare(String(right))
+    );
+    expect(paused).toMatchObject({
+      applied: true,
+      replayed: false,
+      state: "paused",
+      inputRevision: 3,
+      scope: "supervisor_active_job_batch",
+      batchProtocolVersion: 1,
+      affectedJobIds: expectedCohort,
+      affectedJobCount: 2,
+      batchDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      wakeTicket: null,
+    });
+    expect(await control(
+      t,
+      fixture.started.missionId,
+      "control-active-pause-v1",
+      "pause",
+      beforePause!.inputRevision,
+    )).toEqual({ ...paused, replayed: true });
+
+    const pauseRows = await t.run(async (ctx) => ({
+      state: await ctx.db.get(fixture.started.stateId),
+      command: await ctx.db
+        .query("missionSupervisorCommand")
+        .withIndex("by_mission", (q) =>
+          q.eq("missionId", fixture.started.missionId)
+        )
+        .unique(),
+      jobs: await Promise.all(
+        fixture.jobIds.map((jobId) => ctx.db.get(jobId)),
+      ),
+      attempts: await ctx.db.query("workAttempts").collect(),
+      controls: await ctx.db
+        .query("missionSupervisorControls")
+        .withIndex("by_mission_created", (q) =>
+          q.eq("missionId", fixture.started.missionId)
+        )
+        .collect(),
+    }));
+    expect(pauseRows.jobs.map((job) => job?.status)).toEqual([
+      "paused",
+      "paused",
+      "paused",
+    ]);
+    expect(pauseRows.state).toMatchObject({
+      state: "paused",
+      inputRevision: 3,
+      nonterminalJobCount: 3,
+      pauseCohortProtocolVersion: 1,
+      pauseCohortJobCount: 2,
+      pauseCohortDigest: paused.batchDigest,
+    });
+    expect(pauseRows.state?.pauseCohortControlReceiptId)
+      .toBe(paused.controlReceiptId);
+    expect(pauseRows.command).toMatchObject({
+      nonterminalJobCount: 3,
+      activeJobControlProtocolVersion: 1,
+      activeJobControlActions: ["pause", "resume"],
+      controlAffordanceProtocolVersion: 1,
+      supportedControlActions: ["resume"],
+      pauseCohortProtocolVersion: 1,
+      pauseCohortJobCount: 2,
+    });
+    expect(pauseRows.controls).toHaveLength(1);
+    expect(pauseRows.attempts).toHaveLength(3);
+
+    const resumed = await control(
+      t,
+      fixture.started.missionId,
+      "control-active-resume-v1",
+      "resume",
+      3,
+    );
+    expect(resumed).toMatchObject({
+      applied: true,
+      replayed: false,
+      state: "ready",
+      inputRevision: 4,
+      scope: "supervisor_active_job_batch",
+      batchProtocolVersion: 1,
+      affectedJobIds: expectedCohort,
+      affectedJobCount: 2,
+      sourcePauseControlReceiptId: paused.controlReceiptId,
+      wakeTicket: {
+        expectedInputRevision: 4,
+      },
+    });
+    const resumedRows = await t.run(async (ctx) => ({
+      state: await ctx.db.get(fixture.started.stateId),
+      command: await ctx.db
+        .query("missionSupervisorCommand")
+        .withIndex("by_mission", (q) =>
+          q.eq("missionId", fixture.started.missionId)
+        )
+        .unique(),
+      jobs: await Promise.all(
+        fixture.jobIds.map((jobId) => ctx.db.get(jobId)),
+      ),
+      attempts: await ctx.db.query("workAttempts").collect(),
+    }));
+    expect(resumedRows.jobs.map((job) => job?.status)).toEqual([
+      "pending",
+      "awaiting_approval",
+      "paused",
+    ]);
+    expect(resumedRows.jobs.map((job) => job?.attempt)).toEqual([1, 1, 1]);
+    expect(resumedRows.attempts).toHaveLength(3);
+    expect(resumedRows.state).toMatchObject({
+      state: "ready",
+      inputRevision: 4,
+      nonterminalJobCount: 3,
+    });
+    expect(resumedRows.state?.pauseCohortControlReceiptId).toBeUndefined();
+    expect(resumedRows.command).toMatchObject({
+      supportedControlActions: ["pause"],
+      nonterminalJobCount: 3,
+    });
+    expect(resumedRows.command?.pauseCohortProtocolVersion).toBeUndefined();
+  });
+
+  it("preflights the full ledger before writing any earlier pause member", async () => {
+    const t = convexTest(schema, modules);
+    const fixture = await startAndDelegate(t, "control-pause-atomic-reject", [
+      delegatedWorkstream({
+        task: "Implement the valid earlier member before atomic rejection.",
+        label: "valid earlier member",
+      }),
+      delegatedWorkstream({
+        task: "Implement the invalid later integration member for rejection.",
+        label: "invalid later integration",
+      }),
+    ]);
+    await t.run(async (ctx) => {
+      await ctx.db.patch(fixture.jobIds[1], {
+        integrationState: "provider_waiting",
+      });
+    });
+
+    expect(await control(
+      t,
+      fixture.started.missionId,
+      "control-pause-integration-reject",
+      "pause",
+      1,
+    )).toMatchObject({
+      applied: false,
+      replayed: false,
+      reason: "supervisor_integration_requires_reconciliation",
+      state: "waiting",
+      inputRevision: 1,
+    });
+    const persisted = await t.run(async (ctx) => ({
+      state: await ctx.db.get(fixture.started.stateId),
+      mission: await ctx.db.get(fixture.started.missionId),
+      jobs: await Promise.all(
+        fixture.jobIds.map((jobId) => ctx.db.get(jobId)),
+      ),
+      attempts: await ctx.db.query("workAttempts").collect(),
+      controls: await ctx.db
+        .query("missionSupervisorControls")
+        .withIndex("by_mission_created", (q) =>
+          q.eq("missionId", fixture.started.missionId)
+        )
+        .collect(),
+    }));
+    expect(persisted.state).toMatchObject({
+      state: "waiting",
+      inputRevision: 1,
+      nonterminalJobCount: 2,
+    });
+    expect(persisted.mission).toMatchObject({
+      status: "running",
+      phase: "executing",
+    });
+    expect(persisted.jobs.map((job) => job?.status)).toEqual([
+      "pending",
+      "pending",
+    ]);
+    expect(persisted.attempts).toHaveLength(0);
+    expect(persisted.controls).toHaveLength(1);
+  });
+
+  it("rejects an unresolved provider effect before any pause write", async () => {
+    const t = convexTest(schema, modules);
+    const repository = "daniels-project-space/jarvis";
+    const admission = await testProjectSourceAdmission(repository);
+    const fixture = await startAndDelegate(
+      t,
+      "control-pause-unresolved-provider",
+      [delegatedWorkstream({
+        task: "Implement verified repository delivery effect pause coverage.",
+        label: "provider effect pause",
+        repo: repository,
+      })],
+      {
+        repo: repository,
+        projectAdmissions: [admission],
+      },
+    );
+    const jobId = fixture.jobIds[0];
+    const specialistReservation = (await t.mutation(
+      jobsApi.reserveDispatchBatch,
+      {
+        limit: 1,
+        reason: "provider effect specialist",
+        workerToken: WORKER,
+      },
+    )).reservations[0];
+    const specialist = await t.mutation(jobsApi.claimDispatched, {
+      jobId,
+      dispatchId: specialistReservation.dispatchId,
+      ...triggerClaimAuthority(specialistReservation),
+      workerRunId: "provider-effect-specialist",
+      workerToken: WORKER,
+    });
+    const head = "a".repeat(40);
+    const base = "b".repeat(40);
+    const tree = "c".repeat(40);
+    const diff = "d".repeat(64);
+    const result = "Specialist completed the exact repository change.";
+    const note = "The exact diff passed supervisor verification.";
+    const reviewReceiptJson = JSON.stringify({
+      version: 2,
+      jobId: String(jobId),
+      attempt: 1,
+      workOrderRevisionDigest: specialist.workOrderRevisionDigest,
+      repository: specialist.projectRepository,
+      branch: String(specialist.workerBranch ?? specialist.branch ?? ""),
+      baseSha: base,
+      baseTreeSha: tree,
+      headSha: head,
+      headTreeSha: tree,
+      diffSha256: diff,
+      agentEvidenceSha256: "e".repeat(64),
+    });
+    expect(await t.mutation(jobsApi.markVerifiedForDelivery, {
+      jobId,
+      expectedAttempt: 1,
+      authorityDigest: specialist.authorityDigest,
+      specialistRunId: "provider-effect-specialist",
+      result,
+      verificationNote: note,
+      reviewReceiptJson,
+      reviewReceiptSignature: "f".repeat(64),
+      reviewReceiptKeyId: "current-test-key",
+      reviewDiffSha256: diff,
+      resultDigest: await sha256Hex(result),
+      evidenceDigest: await sha256Hex(note),
+      workerToken: WORKER,
+    })).toBe(true);
+    const controllerReservation = (await t.mutation(
+      jobsApi.reserveDispatchBatch,
+      {
+        limit: 1,
+        reason: "provider effect controller",
+        workerToken: WORKER,
+      },
+    )).reservations[0];
+    const controller = await t.mutation(jobsApi.claimDispatched, {
+      jobId,
+      dispatchId: controllerReservation.dispatchId,
+      ...triggerClaimAuthority(controllerReservation),
+      workerRunId: "provider-effect-controller",
+      workerToken: WORKER,
+    });
+    const lease = await t.mutation(jobsApi.linearizeDelivery, {
+      jobId,
+      expectedAttempt: 1,
+      authorityDigest: specialist.authorityDigest,
+      sourceWorkAttempt: 1,
+      deliveryGeneration: 1,
+      deliveryRunId: "provider-effect-controller",
+      deliveryAttemptId: controller.activeDeliveryAttemptId,
+      deliveryLeaseOwner: "provider-effect-owner",
+      deliveryLeaseToken: "provider-effect-lease-token",
+      workerToken: WORKER,
+    });
+    expect(lease).not.toBeNull();
+    const deliveryFence = {
+      jobId,
+      expectedAttempt: 1,
+      authorityDigest: specialist.authorityDigest,
+      sourceWorkAttempt: 1,
+      deliveryGeneration: 1,
+      deliveryRunId: "provider-effect-controller",
+      deliveryAttemptId: controller.activeDeliveryAttemptId,
+      deliveryLeaseOwner: "provider-effect-owner",
+      deliveryLeaseToken: "provider-effect-lease-token",
+      deliveryLeaseVersion: lease.version,
+      workerToken: WORKER,
+    };
+    expect(await t.mutation(jobsApi.prepareDeliveryEffect, {
+      ...deliveryFence,
+      effectId: "pr:unresolved-pause",
+      effectKind: "create_pr",
+      reviewedHeadSha: head,
+      reviewedBaseSha: base,
+    })).toMatchObject({ replay: false });
+
+    const beforePause = await supervisorState(t, fixture.started.missionId);
+    expect(await control(
+      t,
+      fixture.started.missionId,
+      "control-unresolved-provider-pause",
+      "pause",
+      beforePause!.inputRevision,
+    )).toMatchObject({
+      applied: false,
+      reason: "unresolved_provider_effect",
+      state: beforePause!.state,
+      inputRevision: beforePause!.inputRevision,
+    });
+    const rejectedRows = await t.run(async (ctx) => ({
+      state: await ctx.db.get(fixture.started.stateId),
+      job: await ctx.db.get(jobId),
+      delivery: await ctx.db.get(
+        controller.activeDeliveryAttemptId as Id<"deliveryAttempts">,
+      ),
+    }));
+    expect(rejectedRows.state).toEqual(beforePause);
+    expect(rejectedRows.job).toMatchObject({
+      status: "running",
+      deliveryRunId: "provider-effect-controller",
+    });
+    expect(rejectedRows.delivery).toMatchObject({
+      status: "running",
+      preparedEffectId: "pr:unresolved-pause",
+    });
+    expect(rejectedRows.delivery?.providerObservation).toBeUndefined();
+
+    expect(await t.mutation(jobsApi.observeDeliveryEffect, {
+      ...deliveryFence,
+      effectId: "pr:unresolved-pause",
+      observation: "not_applied",
+    })).toBe(true);
+    expect(await control(
+      t,
+      fixture.started.missionId,
+      "control-resolved-provider-pause",
+      "pause",
+      beforePause!.inputRevision,
+    )).toMatchObject({
+      applied: true,
+      reason: "applied",
+      state: "paused",
+      inputRevision: beforePause!.inputRevision + 1,
+      affectedJobCount: 1,
+    });
+  });
+
+  it("rejects a terminalized cohort member without v2 authority, then skips it once exact", async () => {
+    const t = convexTest(schema, modules);
+    const fixture = await startAndDelegate(t, "control-resume-terminal-cohort", [
+      delegatedWorkstream({
+        task: "Implement the earlier resume cohort member atomically.",
+        label: "resume earlier member",
+      }),
+      delegatedWorkstream({
+        task: "Implement the later terminalized resume cohort member.",
+        label: "terminal later member",
+      }),
+    ]);
+    const paused = await control(
+      t,
+      fixture.started.missionId,
+      "control-terminal-cohort-pause",
+      "pause",
+      1,
+    );
+    expect(paused).toMatchObject({
+      applied: true,
+      inputRevision: 2,
+      affectedJobCount: 2,
+    });
+    const [, terminalJobId] = fixture.jobIds;
+    await t.run(async (ctx) => {
+      const job = await ctx.db.get(terminalJobId);
+      if (!job) throw new Error("terminal cohort fixture missing");
+      await patchJobWithRuntime(ctx, job, {
+        status: "done",
+        stage: "verified",
+        result: "A forged terminal projection without its receipt.",
+        verificationVerdict: "pass",
+        completedAt: Date.now(),
+      });
+    });
+    const beforeRejectedResume = await t.run(async (ctx) => ({
+      state: await ctx.db.get(fixture.started.stateId),
+      firstJob: await ctx.db.get(fixture.jobIds[0]),
+      firstAttempt: await ctx.db
+        .query("workAttempts")
+        .withIndex("by_job_attempt", (q) =>
+          q.eq("jobId", fixture.jobIds[0]).eq("attempt", 1)
+        )
+        .unique(),
+    }));
+    expect(beforeRejectedResume.state).toMatchObject({
+      state: "paused",
+      inputRevision: 3,
+      nonterminalJobCount: 1,
+      pauseCohortJobCount: 2,
+    });
+
+    expect(await control(
+      t,
+      fixture.started.missionId,
+      "control-terminal-cohort-invalid-resume",
+      "resume",
+      3,
+    )).toMatchObject({
+      applied: false,
+      reason: "invalid_terminal_authority",
+      state: "paused",
+      inputRevision: 3,
+    });
+    const afterRejectedResume = await t.run(async (ctx) => ({
+      state: await ctx.db.get(fixture.started.stateId),
+      firstJob: await ctx.db.get(fixture.jobIds[0]),
+      firstAttempt: await ctx.db
+        .query("workAttempts")
+        .withIndex("by_job_attempt", (q) =>
+          q.eq("jobId", fixture.jobIds[0]).eq("attempt", 1)
+        )
+        .unique(),
+    }));
+    expect(afterRejectedResume).toEqual(beforeRejectedResume);
+
+    await t.run(async (ctx) => {
+      const job = await ctx.db.get(terminalJobId);
+      if (!job) throw new Error("terminal cohort fixture missing");
+      await insertFreshTerminalWorkReceipt(ctx, job, 1, {
+        status: "succeeded",
+        terminalCode: "verified_success",
+        recoveryDisposition: "none",
+        acceptanceEvidence: ["Exact terminal cohort evidence."],
+        artifacts: [
+          `convex://jobs/${String(terminalJobId)}/attempt/1/result`,
+        ],
+        verification: "pass",
+        terminalEventKey: "terminalized-cohort:1",
+        result: String(job.result ?? ""),
+        evidence: "Exact terminal cohort evidence.",
+      });
+      const attempt = await ctx.db
+        .query("workAttempts")
+        .withIndex("by_job_attempt", (q) =>
+          q.eq("jobId", terminalJobId).eq("attempt", 1)
+        )
+        .unique();
+      if (!attempt) throw new Error("terminal cohort attempt missing");
+      await ctx.db.patch(attempt._id, {
+        status: "done",
+        completedAt: Date.now(),
+        lastEventAt: Date.now(),
+      });
+    });
+    const resumed = await control(
+      t,
+      fixture.started.missionId,
+      "control-terminal-cohort-valid-resume",
+      "resume",
+      3,
+    );
+    expect(resumed).toMatchObject({
+      applied: true,
+      state: "ready",
+      inputRevision: 4,
+      affectedJobIds: [fixture.jobIds[0]],
+      affectedJobCount: 1,
+      sourcePauseControlReceiptId: paused.controlReceiptId,
+    });
+    const finalRows = await t.run(async (ctx) => ({
+      state: await ctx.db.get(fixture.started.stateId),
+      jobs: await Promise.all(
+        fixture.jobIds.map((jobId) => ctx.db.get(jobId)),
+      ),
+    }));
+    expect(finalRows.jobs.map((job) => job?.status)).toEqual([
+      "pending",
+      "done",
+    ]);
+    expect(finalRows.state).toMatchObject({
+      state: "ready",
+      nonterminalJobCount: 1,
+      inputRevision: 4,
+    });
+  });
+
+  it("preserves one claimed binding for the worker's final paused checkpoint", async () => {
+    const t = convexTest(schema, modules);
+    const fixture = await startAndDelegate(
+      t,
+      "control-pause-final-checkpoint",
+      [delegatedWorkstream({
+        task: "Persist the one exact final checkpoint after supervisor pause.",
+        label: "final pause checkpoint",
+      })],
+    );
+    const reservation = (await t.mutation(jobsApi.reserveDispatchBatch, {
+      limit: 1,
+      reason: "final paused checkpoint",
+      workerToken: WORKER,
+    })).reservations[0] as DispatchReservation;
+    const claimed = await t.mutation(jobsApi.claimDispatched, {
+      jobId: reservation.jobId,
+      dispatchId: reservation.dispatchId,
+      ...triggerClaimAuthority(reservation),
+      workerRunId: "final-paused-checkpoint-worker",
+      workerToken: WORKER,
+    });
+    const runningState = await supervisorState(t, fixture.started.missionId);
+    const paused = await control(
+      t,
+      fixture.started.missionId,
+      "control-final-checkpoint-pause",
+      "pause",
+      runningState!.inputRevision,
+    );
+    expect(paused).toMatchObject({
+      applied: true,
+      state: "paused",
+      affectedJobCount: 1,
+    });
+    expect(await t.mutation(jobsApi.checkpointAndRequeue, {
+      jobId: reservation.jobId,
+      expectedAttempt: 1,
+      authorityDigest: claimed.authorityDigest,
+      checkpoint: "Exact final branch checkpoint persisted after pause.",
+      result: "Worker observed the pause fence and stopped.",
+      nextStatus: "paused",
+      workerRunId: "final-paused-checkpoint-worker",
+      workerToken: WORKER,
+    })).toEqual({
+      requeued: false,
+      exhausted: false,
+      stale: false,
+    });
+    const checkpointed = await t.run(async (ctx) => ({
+      state: await ctx.db.get(fixture.started.stateId),
+      job: await ctx.db.get(reservation.jobId),
+      attempt: await ctx.db
+        .query("workAttempts")
+        .withIndex("by_job_attempt", (q) =>
+          q.eq("jobId", reservation.jobId).eq("attempt", 1)
+        )
+        .unique(),
+      receipt: await ctx.db
+        .query("dispatchReceipts")
+        .withIndex("by_job_generation", (q) =>
+          q.eq("jobId", reservation.jobId).eq("generation", 1)
+        )
+        .unique(),
+    }));
+    expect(checkpointed.job).toMatchObject({
+      status: "paused",
+      checkpoint: "Exact final branch checkpoint persisted after pause.",
+    });
+    expect(checkpointed.attempt).toMatchObject({
+      status: "paused",
+      completedAt: expect.any(Number),
+    });
+    expect(checkpointed.receipt).toMatchObject({ status: "closed" });
+    expect(await control(
+      t,
+      fixture.started.missionId,
+      "control-final-checkpoint-resume",
+      "resume",
+      checkpointed.state!.inputRevision,
+    )).toMatchObject({
+      applied: true,
+      state: "ready",
+      affectedJobCount: 1,
+    });
+    expect(await t.run(async (ctx) =>
+      await ctx.db.get(reservation.jobId)
+    )).toMatchObject({
+      status: "pending",
+      attempt: 2,
+      checkpoint: "Exact final branch checkpoint persisted after pause.",
+    });
+  });
+
+  it("reconciles only exact stale paused claims without starvation, then resumes fresh attempts", async () => {
+    const t = convexTest(schema, modules);
+    const fixture = await startAndDelegate(t, "control-pause-claimed-reaper", [
+      delegatedWorkstream({
+        task: "Implement the first claimed worker pause checkpoint race.",
+        label: "claimed worker one",
+      }),
+      delegatedWorkstream({
+        task: "Implement the second claimed worker pause checkpoint race.",
+        label: "claimed worker two",
+      }),
+    ]);
+    const dispatch = await t.mutation(jobsApi.reserveDispatchBatch, {
+      limit: 2,
+      reason: "claimed pause race",
+      workerToken: WORKER,
+    });
+    expect(dispatch.reservations).toHaveLength(2);
+    const reservations = dispatch.reservations as DispatchReservation[];
+    const workerIds = ["paused-claimed-worker-one", "paused-claimed-worker-two"];
+    for (let index = 0; index < reservations.length; index += 1) {
+      const reservation = reservations[index];
+      expect(await t.mutation(jobsApi.claimDispatched, {
+        jobId: reservation.jobId,
+        dispatchId: reservation.dispatchId,
+        ...triggerClaimAuthority(reservation),
+        workerRunId: workerIds[index],
+        workerToken: WORKER,
+      })).toMatchObject({
+        jobId: reservation.jobId,
+        workerRunId: workerIds[index],
+      });
+    }
+    const runningState = await supervisorState(t, fixture.started.missionId);
+    expect(runningState).toMatchObject({
+      state: "ready",
+      inputRevision: 5,
+      nonterminalJobCount: 2,
+    });
+    const paused = await control(
+      t,
+      fixture.started.missionId,
+      "control-claimed-workers-pause",
+      "pause",
+      runningState!.inputRevision,
+    );
+    expect(paused).toMatchObject({
+      applied: true,
+      state: "paused",
+      inputRevision: 6,
+      affectedJobCount: 2,
+    });
+    expect(await control(
+      t,
+      fixture.started.missionId,
+      "control-claimed-workers-resume-too-soon",
+      "resume",
+      6,
+    )).toMatchObject({
+      applied: false,
+      reason: "pause_checkpoint_pending",
+      inputRevision: 6,
+    });
+    expect(await t.mutation(jobsApi.reapStale, {
+      workerToken: WORKER,
+    })).toMatchObject({
+      reconciledPausedClaims: [],
+    });
+
+    const secondClaim = await t.run(async (ctx) => {
+      const job = await ctx.db.get(reservations[1].jobId);
+      const receipt = job?.dispatchReceiptId
+        ? await ctx.db.get(job.dispatchReceiptId)
+        : null;
+      if (!job || !receipt) throw new Error("claimed pause receipt missing");
+      await ctx.db.patch(receipt._id, {
+        workerRunId: "mismatched-stale-worker",
+      });
+      return {
+        receiptId: receipt._id,
+        expectedWorkerRunId: job.workerRunId,
+      };
+    });
+
+    vi.advanceTimersByTime(6 * 60_000);
+    await t.run(async (ctx) => {
+      const old = Date.now() - 20 * 60_000;
+      const dummyId = await ctx.db.insert("jobs", {
+        task: "Irrelevant manually paused history.",
+        status: "paused",
+        stage: "paused",
+        attempt: 1,
+        maxAttempts: 12,
+        heartbeatAt: old,
+        createdAt: old,
+      });
+      const dummy = await ctx.db.get(dummyId);
+      if (!dummy) throw new Error("dummy paused history missing");
+      const runtime = projectJobRuntime(dummy);
+      expect(runtime.pauseCheckpointPending).toBeUndefined();
+      for (let index = 0; index < 101; index += 1) {
+        await ctx.db.insert("jobRuntime", {
+          ...runtime,
+          heartbeatAt: old - index,
+          createdAt: old - index,
+          updatedAt: old - index,
+        });
+      }
+    });
+
+    const firstReap = await t.mutation(jobsApi.reapStale, {
+      workerToken: WORKER,
+    });
+    expect(firstReap.reconciledPausedClaims).toHaveLength(1);
+    let pausedRows = await t.run(async (ctx) =>
+      await Promise.all(
+        reservations.map((reservation) =>
+          ctx.db.get(reservation.jobId)
+        ),
+      )
+    );
+    expect(pausedRows.filter((job) => job?.workerRunId)).toHaveLength(1);
+
+    await t.run(async (ctx) => {
+      await ctx.db.patch(secondClaim.receiptId, {
+        workerRunId: secondClaim.expectedWorkerRunId,
+      });
+    });
+    const secondReap = await t.mutation(jobsApi.reapStale, {
+      workerToken: WORKER,
+    });
+    expect(secondReap.reconciledPausedClaims).toHaveLength(1);
+    pausedRows = await t.run(async (ctx) =>
+      await Promise.all(
+        reservations.map((reservation) =>
+          ctx.db.get(reservation.jobId)
+        ),
+      )
+    );
+    expect(pausedRows.every((job) =>
+      job?.status === "paused"
+      && job.workerRunId === undefined
+      && job.dispatchId === undefined
+    )).toBe(true);
+
+    const resumed = await control(
+      t,
+      fixture.started.missionId,
+      "control-claimed-workers-resume-after-reap",
+      "resume",
+      6,
+    );
+    expect(resumed).toMatchObject({
+      applied: true,
+      state: "ready",
+      inputRevision: 7,
+      affectedJobCount: 2,
+    });
+    const finalRows = await t.run(async (ctx) => ({
+      state: await ctx.db.get(fixture.started.stateId),
+      jobs: await Promise.all(
+        reservations.map((reservation) =>
+          ctx.db.get(reservation.jobId)
+        ),
+      ),
+      attempts: await ctx.db.query("workAttempts").collect(),
+      dispatches: await ctx.db.query("dispatchReceipts").collect(),
+    }));
+    expect(finalRows.state).toMatchObject({
+      state: "ready",
+      inputRevision: 7,
+    });
+    expect(finalRows.jobs.every((job) =>
+      job?.status === "pending" && job.attempt === 2
+    )).toBe(true);
+    expect(finalRows.attempts.filter((attempt) =>
+      attempt.attempt === 1
+      && attempt.status === "paused"
+      && attempt.completedAt
+    )).toHaveLength(2);
+    expect(finalRows.attempts.filter((attempt) =>
+      attempt.attempt === 2 && attempt.status === "pending"
+    )).toHaveLength(2);
+    expect(finalRows.dispatches.every((receipt) =>
+      receipt.status === "closed"
+    )).toBe(true);
   });
 
   it("returns at most eight exact ready, waiting, or expired-lease rows", async () => {
@@ -3425,7 +4309,7 @@ describe("dormant mission supervisor authority", () => {
     });
   });
 
-  it("rejects forged recovery forks and cycles before considering leaf results", async () => {
+  it("rejects corrupt or incomplete recovery lineage before control or synthesis writes", async () => {
     const establishRecovery = async (
       t: SupervisorTest,
       requestKey: string,
@@ -3478,6 +4362,73 @@ describe("dormant mission supervisor authority", () => {
         nextTickAt: recovered.nextTickAt as number,
       };
     };
+
+    const digestTest = convexTest(schema, modules);
+    const digest = await establishRecovery(
+      digestTest,
+      "recover-control-corrupt-digest",
+    );
+    await digestTest.run(async (ctx) => {
+      await ctx.db.patch(digest.edgeId, {
+        supersessionDigest: "f".repeat(64),
+      });
+    });
+    const digestState = await supervisorState(
+      digestTest,
+      digest.started.missionId,
+    );
+    expect(await control(
+      digestTest,
+      digest.started.missionId,
+      "recover-control-corrupt-digest-pause",
+      "pause",
+      digestState!.inputRevision,
+    )).toMatchObject({
+      applied: false,
+      reason: "invalid_terminal_authority",
+      inputRevision: digestState!.inputRevision,
+    });
+    expect(await digestTest.run(async (ctx) =>
+      await ctx.db
+        .query("workAttempts")
+        .withIndex("by_job_attempt", (q) =>
+          q.eq("jobId", digest.successorJobId).eq("attempt", 1)
+        )
+        .take(2)
+    )).toHaveLength(0);
+
+    const missingTest = convexTest(schema, modules);
+    const missing = await establishRecovery(
+      missingTest,
+      "recover-control-missing-successor",
+    );
+    await missingTest.run(async (ctx) => {
+      const runtime = await ctx.db
+        .query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", missing.successorJobId))
+        .unique();
+      if (runtime) await ctx.db.delete(runtime._id);
+      await ctx.db.delete(missing.successorJobId);
+      await ctx.db.patch(missing.started.stateId, {
+        totalJobs: 1,
+        nonterminalJobCount: 0,
+      });
+    });
+    const missingState = await supervisorState(
+      missingTest,
+      missing.started.missionId,
+    );
+    expect(await control(
+      missingTest,
+      missing.started.missionId,
+      "recover-control-missing-successor-pause",
+      "pause",
+      missingState!.inputRevision,
+    )).toMatchObject({
+      applied: false,
+      reason: "invalid_terminal_authority",
+      inputRevision: missingState!.inputRevision,
+    });
 
     const forkTest = convexTest(schema, modules);
     const fork = await establishRecovery(forkTest, "recover-forged-fork");

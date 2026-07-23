@@ -33,13 +33,25 @@ import {
   terminalWorkReceiptDigest,
 } from "./workReceiptAuthority";
 import { syncMissionSupervisorCommand } from "./missionSupervisorCommand";
+import {
+  applySupervisorPauseBatch,
+  applySupervisorResumeBatch,
+  preflightSupervisorPauseResumeBatch,
+  refreshSupervisorJobControlGroups,
+} from "./supervisorJobControl";
+import {
+  MISSION_SUPERVISOR_MAX_AUTONOMOUS_RECOVERIES,
+  MISSION_SUPERVISOR_MAX_RECOVERY_GENERATION,
+} from "./missionSupervisorProtocol";
+export {
+  MISSION_SUPERVISOR_MAX_AUTONOMOUS_RECOVERIES,
+  MISSION_SUPERVISOR_MAX_RECOVERY_GENERATION,
+} from "./missionSupervisorProtocol";
 
 export const MISSION_SUPERVISOR_LEASE_MS = 10 * 60_000;
 export const MISSION_SUPERVISOR_MAX_JOBS = 24;
 export const MISSION_SUPERVISOR_MAX_DECISIONS = 64;
 export const MISSION_SUPERVISOR_MAX_DUE = 8;
-export const MISSION_SUPERVISOR_MAX_RECOVERY_GENERATION = 4;
-export const MISSION_SUPERVISOR_MAX_AUTONOMOUS_RECOVERIES = 2;
 
 const REQUEST_PAYLOAD_MAX_BYTES = 16 * 1024;
 const DECISION_PAYLOAD_MAX_BYTES = 48 * 1024;
@@ -1390,6 +1402,11 @@ type SupervisorControlOutcome = {
   resultState?: MissionSupervisorState["state"];
   resultInputRevision?: number;
   wakeTicket?: SupervisorWakeTicket | null;
+  batchProtocolVersion?: 1;
+  affectedJobIds?: Id<"jobs">[];
+  affectedJobCount?: number;
+  batchDigest?: string;
+  sourcePauseControlReceiptId?: Id<"missionSupervisorControls">;
 };
 
 async function normalizedControlRequest(args: {
@@ -1426,6 +1443,123 @@ async function normalizedControlRequest(args: {
     expectedInputRevision: args.expectedInputRevision,
     input,
     inputDigest: input === undefined ? undefined : await sha256Hex(input),
+  };
+}
+
+function canonicalControlJobIds(
+  jobIds: readonly Id<"jobs">[],
+): Id<"jobs">[] {
+  const sorted = [...jobIds].sort((left, right) =>
+    String(left).localeCompare(String(right))
+  );
+  if (
+    sorted.length > MISSION_SUPERVISOR_MAX_JOBS
+    || new Set(sorted.map(String)).size !== sorted.length
+  ) {
+    throw new Error("Supervisor control batch membership is invalid");
+  }
+  return sorted;
+}
+
+async function supervisorControlBatchDigest(args: {
+  missionId: Id<"missions">;
+  action: "pause" | "resume";
+  requestKey: string;
+  requestDigest: string;
+  expectedInputRevision: number;
+  resultInputRevision: number;
+  affectedJobIds: readonly Id<"jobs">[];
+  sourcePauseControlReceiptId?: Id<"missionSupervisorControls">;
+}): Promise<string> {
+  return await sha256Hex(canonicalJson({
+    protocolVersion: 1,
+    missionId: String(args.missionId),
+    action: args.action,
+    requestKey: args.requestKey,
+    requestDigest: args.requestDigest,
+    expectedInputRevision: args.expectedInputRevision,
+    resultInputRevision: args.resultInputRevision,
+    affectedJobIds: canonicalControlJobIds(args.affectedJobIds).map(String),
+    sourcePauseControlReceiptId:
+      args.sourcePauseControlReceiptId === undefined
+        ? null
+        : String(args.sourcePauseControlReceiptId),
+  }));
+}
+
+type PauseCohortAuthority =
+  | {
+      ok: true;
+      receipt: MissionSupervisorControl;
+      affectedJobIds: Id<"jobs">[];
+    }
+  | { ok: false; reason: "missing_or_invalid_pause_cohort" };
+
+async function pauseCohortAuthority(
+  ctx: Pick<MutationCtx, "db">,
+  state: MissionSupervisorState,
+): Promise<PauseCohortAuthority | null> {
+  const fields = [
+    state.pauseCohortProtocolVersion,
+    state.pauseCohortControlReceiptId,
+    state.pauseCohortInputRevision,
+    state.pauseCohortJobCount,
+    state.pauseCohortDigest,
+  ];
+  if (fields.every((field) => field === undefined)) return null;
+  if (
+    state.pauseCohortProtocolVersion !== 1
+    || !state.pauseCohortControlReceiptId
+    || !Number.isSafeInteger(state.pauseCohortInputRevision)
+    || Number(state.pauseCohortInputRevision) < 0
+    || !Number.isSafeInteger(state.pauseCohortJobCount)
+    || Number(state.pauseCohortJobCount) < 1
+    || Number(state.pauseCohortJobCount) > MISSION_SUPERVISOR_MAX_JOBS
+    || typeof state.pauseCohortDigest !== "string"
+    || !/^[0-9a-f]{64}$/.test(state.pauseCohortDigest)
+  ) {
+    return { ok: false, reason: "missing_or_invalid_pause_cohort" };
+  }
+  const receipt = await ctx.db.get(state.pauseCohortControlReceiptId);
+  if (
+    !receipt
+    || receipt.protocolVersion !== 1
+    || String(receipt.missionId) !== String(state.missionId)
+    || receipt.action !== "pause"
+    || !receipt.applied
+    || receipt.noop
+    || receipt.scope !== "supervisor_active_job_batch"
+    || receipt.resultState !== "paused"
+    || receipt.batchProtocolVersion !== 1
+    || receipt.resultInputRevision !== state.pauseCohortInputRevision
+    || receipt.expectedInputRevision + 1 !== receipt.resultInputRevision
+    || receipt.resultInputRevision! > state.inputRevision
+    || receipt.affectedJobCount !== state.pauseCohortJobCount
+    || receipt.batchDigest !== state.pauseCohortDigest
+    || !receipt.affectedJobIds
+    || receipt.affectedJobIds.length !== receipt.affectedJobCount
+    || canonicalControlJobIds(receipt.affectedJobIds).some((jobId, index) =>
+      String(jobId) !== String(receipt.affectedJobIds![index])
+    )
+  ) {
+    return { ok: false, reason: "missing_or_invalid_pause_cohort" };
+  }
+  const digest = await supervisorControlBatchDigest({
+    missionId: receipt.missionId,
+    action: "pause",
+    requestKey: receipt.requestKey,
+    requestDigest: receipt.requestDigest,
+    expectedInputRevision: receipt.expectedInputRevision,
+    resultInputRevision: receipt.resultInputRevision,
+    affectedJobIds: receipt.affectedJobIds,
+  });
+  if (digest !== receipt.batchDigest) {
+    return { ok: false, reason: "missing_or_invalid_pause_cohort" };
+  }
+  return {
+    ok: true,
+    receipt,
+    affectedJobIds: receipt.affectedJobIds,
   };
 }
 
@@ -1468,11 +1602,16 @@ function supervisorControlResult(
     inputDigest: receipt.inputDigest,
     state: receipt.resultState,
     inputRevision: receipt.resultInputRevision,
+    batchProtocolVersion: receipt.batchProtocolVersion,
+    affectedJobIds: receipt.affectedJobIds,
+    affectedJobCount: receipt.affectedJobCount,
+    batchDigest: receipt.batchDigest,
+    sourcePauseControlReceiptId: receipt.sourcePauseControlReceiptId,
     wakeTicket: wakeTicketFromControlReceipt(receipt),
   };
 }
 
-async function recordSupervisorControl(
+async function persistSupervisorControl(
   ctx: Pick<MutationCtx, "db">,
   missionId: Id<"missions">,
   request: NormalizedControlRequest,
@@ -1494,6 +1633,11 @@ async function recordSupervisorControl(
     scope: outcome.scope,
     resultState: outcome.resultState,
     resultInputRevision: outcome.resultInputRevision,
+    batchProtocolVersion: outcome.batchProtocolVersion,
+    affectedJobIds: outcome.affectedJobIds,
+    affectedJobCount: outcome.affectedJobCount,
+    batchDigest: outcome.batchDigest,
+    sourcePauseControlReceiptId: outcome.sourcePauseControlReceiptId,
     wakeRequested: Boolean(ticket),
     ticketLeaseVersion: ticket?.expectedLeaseVersion,
     ticketEpoch: ticket?.expectedEpoch,
@@ -1503,6 +1647,23 @@ async function recordSupervisorControl(
   });
   const receipt = await ctx.db.get(receiptId);
   if (!receipt) throw new Error("Supervisor control receipt was not persisted");
+  return receipt;
+}
+
+async function recordSupervisorControl(
+  ctx: Pick<MutationCtx, "db">,
+  missionId: Id<"missions">,
+  request: NormalizedControlRequest,
+  outcome: SupervisorControlOutcome,
+  now: number,
+) {
+  const receipt = await persistSupervisorControl(
+    ctx,
+    missionId,
+    request,
+    outcome,
+    now,
+  );
   return supervisorControlResult(receipt, false);
 }
 
@@ -1657,6 +1818,12 @@ export const startV1 = mutation({
       nextTickAt: now,
       leaseVersion: 0,
       totalJobs: 0,
+      nonterminalJobCount: 0,
+      activeJobControlProtocolVersion: 1 as const,
+      activeJobControlActions: [
+        "pause" as const,
+        "resume" as const,
+      ],
       maxJobs: MISSION_SUPERVISOR_MAX_JOBS,
       decisionCount: 0,
       maxDecisions: MISSION_SUPERVISOR_MAX_DECISIONS,
@@ -1798,17 +1965,6 @@ export const controlV1 = mutation({
     if (jobs.length > MISSION_SUPERVISOR_MAX_JOBS) {
       return await reject("supervisor_job_limit", { state });
     }
-    const activeJobs = jobs.filter((job) =>
-      !TERMINAL_JOB_STATUSES.has(job.status)
-    );
-    if (activeJobs.length > 0) {
-      // A supervisor state transition alone cannot pause, cancel, resume, or
-      // revise an already-running execution/delivery lineage. Until the
-      // existing fenced job control is available as one atomic bounded batch,
-      // fail closed rather than report a half-applied mission control.
-      return await reject("active_jobs_require_batch_control", { state });
-    }
-
     if (state.state === "terminal") {
       if (request.action === "cancel" && mission.status === "cancelled") {
         return await reject("terminal_noop", { noop: true, state });
@@ -1817,6 +1973,21 @@ export const controlV1 = mutation({
     }
     if (jobs.length !== state.totalJobs) {
       return await reject("job_ledger_mismatch", { state });
+    }
+    const nonterminalJobCount = jobs.filter((job) =>
+      !TERMINAL_JOB_STATUSES.has(job.status)
+    ).length;
+    if (
+      state.nonterminalJobCount !== undefined
+      && state.nonterminalJobCount !== nonterminalJobCount
+    ) {
+      return await reject("nonterminal_job_count_mismatch", { state });
+    }
+    if (
+      !["pause", "resume"].includes(request.action)
+      && nonterminalJobCount > 0
+    ) {
+      return await reject("active_jobs_require_batch_control", { state });
     }
     let terminalInputTarget: Doc<"jobs"> | undefined;
     if (request.action === "provide_input" && jobs.length > 0) {
@@ -1889,12 +2060,99 @@ export const controlV1 = mutation({
       ) {
         return await reject("invalid_transition", { state });
       }
+      const preflight = await preflightSupervisorPauseResumeBatch(ctx, {
+        missionId: args.missionId,
+        action: "pause",
+        jobs,
+        expectedTotalJobs: state.totalJobs,
+      });
+      if (!preflight.ok) {
+        return await reject(preflight.reason, { state });
+      }
+      const affectedJobIds = canonicalControlJobIds(
+        preflight.plan.control.affectedJobIds,
+      );
+      if (affectedJobIds.length > 0) {
+        const applied = await applySupervisorPauseBatch(
+          ctx,
+          preflight.plan,
+          now,
+        );
+        if (
+          applied.patchedJobIds.length !== affectedJobIds.length
+          || new Set(applied.patchedJobIds.map(String)).size
+            !== affectedJobIds.length
+        ) {
+          throw new Error("Supervisor pause batch apply was incomplete");
+        }
+        await refreshSupervisorJobControlGroups(
+          ctx,
+          applied.touchedSchedulingGroupKeys,
+          now,
+        );
+      }
       const inputRevision = state.inputRevision + 1;
+      const batchDigest = affectedJobIds.length > 0
+        ? await supervisorControlBatchDigest({
+          missionId: args.missionId,
+          action: "pause",
+          requestKey: request.requestKey,
+          requestDigest: request.requestDigest,
+          expectedInputRevision: request.expectedInputRevision,
+          resultInputRevision: inputRevision,
+          affectedJobIds,
+        })
+        : undefined;
+      const outcome: SupervisorControlOutcome = {
+        applied: true,
+        noop: false,
+        reason: "applied",
+        scope: affectedJobIds.length > 0
+          ? "supervisor_active_job_batch"
+          : "supervisor_only_no_active_jobs",
+        resultState: "paused",
+        resultInputRevision: inputRevision,
+        ...(batchDigest === undefined
+          ? {}
+          : {
+            batchProtocolVersion: 1,
+            affectedJobIds,
+            affectedJobCount: affectedJobIds.length,
+            batchDigest,
+          }),
+        wakeTicket: null,
+      };
+      const receipt = await persistSupervisorControl(
+        ctx,
+        args.missionId,
+        request,
+        outcome,
+        now,
+      );
       const statePatch = {
         state: "paused",
         inputRevision,
+        ...(affectedJobIds.length > 0
+          ? { dirtyJobIds: affectedJobIds }
+          : {}),
         nextTickAt: undefined,
         ...clearLease(),
+        nonterminalJobCount,
+        ...(batchDigest === undefined
+          ? {
+            pauseCohortProtocolVersion: undefined,
+            pauseCohortControlReceiptId: undefined,
+            pauseCohortInputRevision: undefined,
+            pauseCohortJobCount: undefined,
+            pauseCohortDigest: undefined,
+          }
+          : {
+            pauseCohortProtocolVersion: 1 as const,
+            pauseCohortControlReceiptId: receipt._id,
+            pauseCohortInputRevision: inputRevision,
+            pauseCohortJobCount: affectedJobIds.length,
+            pauseCohortDigest: batchDigest,
+          }),
         updatedAt: now,
       } as const;
       const missionPatch = {
@@ -1913,15 +2171,7 @@ export const controlV1 = mutation({
         { ...state, ...statePatch },
         { mode: "clear" },
       );
-      return await record({
-        applied: true,
-        noop: false,
-        reason: "applied",
-        scope: "supervisor_only_no_active_jobs",
-        resultState: "paused",
-        resultInputRevision: inputRevision,
-        wakeTicket: null,
-      });
+      return supervisorControlResult(receipt, false);
     }
 
     if (request.action === "resume") {
@@ -1936,19 +2186,74 @@ export const controlV1 = mutation({
       if (state.state !== "paused" || mission.status !== "paused") {
         return await reject("invalid_transition", { state });
       }
+      const pauseCohort = await pauseCohortAuthority(ctx, state);
+      if (pauseCohort && !pauseCohort.ok) {
+        return await reject(pauseCohort.reason, { state });
+      }
+      const targetJobIds = pauseCohort?.affectedJobIds ?? [];
+      const preflight = await preflightSupervisorPauseResumeBatch(ctx, {
+        missionId: args.missionId,
+        action: "resume",
+        jobs,
+        expectedTotalJobs: state.totalJobs,
+        targetJobIds,
+      });
+      if (!preflight.ok) {
+        return await reject(preflight.reason, { state });
+      }
+      const affectedJobIds = canonicalControlJobIds(
+        preflight.plan.control.affectedJobIds,
+      );
+      if (affectedJobIds.length > 0) {
+        const applied = await applySupervisorResumeBatch(
+          ctx,
+          preflight.plan,
+          now,
+        );
+        if (
+          applied.patchedJobIds.length !== affectedJobIds.length
+          || new Set(applied.patchedJobIds.map(String)).size
+            !== affectedJobIds.length
+        ) {
+          throw new Error("Supervisor resume batch apply was incomplete");
+        }
+        await refreshSupervisorJobControlGroups(
+          ctx,
+          applied.touchedSchedulingGroupKeys,
+          now,
+        );
+      }
       const inputRevision = state.inputRevision + 1;
-      const nextState = {
-        ...state,
-        state: "ready" as const,
-        inputRevision,
-      };
+      const sourcePauseControlReceiptId = pauseCohort?.receipt._id;
+      const batchDigest = sourcePauseControlReceiptId
+        ? await supervisorControlBatchDigest({
+          missionId: args.missionId,
+          action: "resume",
+          requestKey: request.requestKey,
+          requestDigest: request.requestDigest,
+          expectedInputRevision: request.expectedInputRevision,
+          resultInputRevision: inputRevision,
+          affectedJobIds,
+          sourcePauseControlReceiptId,
+        })
+        : undefined;
       const statePatch = {
         state: "ready",
         inputRevision,
+        ...(affectedJobIds.length > 0
+          ? { dirtyJobIds: affectedJobIds }
+          : {}),
         nextTickAt: now,
         ...clearLease(),
+        nonterminalJobCount,
+        pauseCohortProtocolVersion: undefined,
+        pauseCohortControlReceiptId: undefined,
+        pauseCohortInputRevision: undefined,
+        pauseCohortJobCount: undefined,
+        pauseCohortDigest: undefined,
         updatedAt: now,
       } as const;
+      const nextState = { ...state, ...statePatch };
       const missionPatch = {
         status: "running",
         phase: mission.pausedPhase ?? "supervising",
@@ -1969,9 +2274,20 @@ export const controlV1 = mutation({
         applied: true,
         noop: false,
         reason: "applied",
-        scope: "supervisor_only_no_active_jobs",
+        scope: sourcePauseControlReceiptId
+          ? "supervisor_active_job_batch"
+          : "supervisor_only_no_active_jobs",
         resultState: "ready",
         resultInputRevision: inputRevision,
+        ...(batchDigest === undefined
+          ? {}
+          : {
+            batchProtocolVersion: 1,
+            affectedJobIds,
+            affectedJobCount: affectedJobIds.length,
+            batchDigest,
+            sourcePauseControlReceiptId,
+          }),
         wakeTicket: supervisorWakeTicket(nextState),
       });
     }
@@ -3391,6 +3707,7 @@ export const commitV1 = mutation({
       | "needs_input"
       | "terminal";
     let totalJobs = state.totalJobs;
+    let nonterminalJobCount = state.nonterminalJobCount;
     let missionPatch: Record<string, unknown> = { updatedAt: now };
 
     if (envelope.decision.kind === "delegate") {
@@ -3527,6 +3844,9 @@ export const commitV1 = mutation({
         }
       }
       totalJobs = existingJobs.length + createdJobIds.length;
+      nonterminalJobCount = existingJobs.filter((job) =>
+        !TERMINAL_JOB_STATUSES.has(job.status)
+      ).length + createdJobIds.length;
       nextTickAt = now + SUPERVISOR_DELEGATE_RECHECK_MS;
       resultState = "waiting";
       missionPatch = {
@@ -3927,6 +4247,9 @@ export const commitV1 = mutation({
         }
       }
       totalJobs = existingJobs.length + createdJobIds.length;
+      nonterminalJobCount = existingJobs.filter((job) =>
+        !TERMINAL_JOB_STATUSES.has(job.status)
+      ).length + createdJobIds.length;
       nextTickAt = now + SUPERVISOR_DELEGATE_RECHECK_MS;
       resultState = "waiting";
       missionPatch = {
@@ -3964,6 +4287,9 @@ export const commitV1 = mutation({
           reason: "job_ledger_mismatch",
         };
       }
+      nonterminalJobCount = jobs.filter((job) =>
+        !TERMINAL_JOB_STATUSES.has(job.status)
+      ).length;
       if (jobs.length > 0 && !envelope.decision.target) {
         return {
           committed: false as const,
@@ -4079,6 +4405,9 @@ export const commitV1 = mutation({
           jobId: gate.jobId,
         };
       }
+      nonterminalJobCount = jobs.filter((job) =>
+        !TERMINAL_JOB_STATUSES.has(job.status)
+      ).length;
       const summary = boundedSynthesisSummary(
         envelope.decision.summary,
         gate.evidence,
@@ -4179,6 +4508,9 @@ export const commitV1 = mutation({
       nextTickAt,
       ...clearLease(),
       totalJobs,
+      ...(nonterminalJobCount === undefined
+        ? {}
+        : { nonterminalJobCount }),
       decisionCount: state.decisionCount + 1,
       lastDecisionKey: envelope.decisionKey,
       lastDecisionDigest: envelope.payloadDigest,

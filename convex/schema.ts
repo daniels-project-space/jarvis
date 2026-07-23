@@ -482,6 +482,10 @@ export default defineSchema({
     // A compact one-index read model for live UI work. This stays optional in
     // rollout one so existing runtime rows remain schema-valid.
     active: v.optional(v.boolean()),
+    // True only while a paused specialist still owns the one claimed dispatch
+    // allowed to submit a final checkpoint. This prevents ordinary paused
+    // history from starving the bounded liveness reconciler.
+    pauseCheckpointPending: v.optional(v.boolean()),
     attempt: v.number(),
     maxAttempts: v.number(),
     heartbeatAt: v.number(),
@@ -556,6 +560,11 @@ export default defineSchema({
     .index("by_group_dispatch_ready", ["schedulingGroupKey", "status", "schedulingBound", "dispatchReady", "nextRunAt", "createdAt"])
     .index("by_status_scheduling_bound", ["status", "schedulingBound", "priority", "createdAt"])
     .index("by_status_heartbeat", ["status", "heartbeatAt"])
+    .index("by_pause_checkpoint_heartbeat", [
+      "status",
+      "pauseCheckpointPending",
+      "heartbeatAt",
+    ])
     .index("by_status_progress", ["status", "progressAt"])
     .index("by_status_dispatch_lease", ["status", "dispatchLeaseUntil"])
     .index("by_active_priority", ["active", "priority", "createdAt"])
@@ -563,7 +572,13 @@ export default defineSchema({
     .index("by_thread_visibility_status_priority", ["originThreadId", "visibility", "status", "priority", "createdAt"])
     .index("by_thread_visibility_active_priority", ["originThreadId", "visibility", "active", "priority", "createdAt"])
     .index("by_plan_parent_generation_node", ["planParentMissionId", "planGeneration", "planNodeId"])
-    .index("by_mission", ["missionId", "createdAt"]),
+    .index("by_mission", ["missionId", "createdAt"])
+    .index("by_mission_active_priority", [
+      "missionId",
+      "active",
+      "priority",
+      "createdAt",
+    ]),
 
   // Durable fair-queue state for one immutable executable project group.
   // Rows are admitted atomically with jobs and survive worker/controller
@@ -870,6 +885,27 @@ export default defineSchema({
     lastDecisionDigest: v.optional(v.string()),
     lastDecisionAt: v.optional(v.number()),
     totalJobs: v.number(),
+    // Optional during rolling backfill. New supervisor writes maintain this
+    // exact counter so command-center reads never infer active controls from
+    // historical terminal rows included in totalJobs.
+    nonterminalJobCount: v.optional(v.number()),
+    // Rollout-safe capability advertisement. Protocol 1 intentionally
+    // supports only atomic pause/resume; cancel and steer stay hidden until
+    // their own full-ledger transactions exist.
+    activeJobControlProtocolVersion: v.optional(v.literal(1)),
+    activeJobControlActions: v.optional(v.array(v.union(
+      v.literal("pause"),
+      v.literal("resume"),
+    ))),
+    // The active pause cohort is one immutable control receipt, not every job
+    // that happens to be paused when a later resume arrives.
+    pauseCohortProtocolVersion: v.optional(v.literal(1)),
+    pauseCohortControlReceiptId: v.optional(
+      v.id("missionSupervisorControls"),
+    ),
+    pauseCohortInputRevision: v.optional(v.number()),
+    pauseCohortJobCount: v.optional(v.number()),
+    pauseCohortDigest: v.optional(v.string()),
     maxJobs: v.number(),
     decisionCount: v.number(),
     maxDecisions: v.number(),
@@ -906,6 +942,22 @@ export default defineSchema({
     steerRevision: v.number(),
     deadlineAt: v.number(),
     totalJobs: v.number(),
+    nonterminalJobCount: v.optional(v.number()),
+    activeJobControlProtocolVersion: v.optional(v.literal(1)),
+    activeJobControlActions: v.optional(v.array(v.union(
+      v.literal("pause"),
+      v.literal("resume"),
+    ))),
+    controlAffordanceProtocolVersion: v.optional(v.literal(1)),
+    supportedControlActions: v.optional(v.array(v.union(
+      v.literal("pause"),
+      v.literal("resume"),
+      v.literal("cancel"),
+      v.literal("steer"),
+      v.literal("provide_input"),
+    ))),
+    pauseCohortProtocolVersion: v.optional(v.literal(1)),
+    pauseCohortJobCount: v.optional(v.number()),
     inputTargeted: v.boolean(),
     nextTickAt: v.optional(v.number()),
     leaseUntil: v.optional(v.number()),
@@ -979,6 +1031,13 @@ export default defineSchema({
     scope: v.string(),
     resultState: v.optional(missionSupervisorStateValidator),
     resultInputRevision: v.optional(v.number()),
+    batchProtocolVersion: v.optional(v.literal(1)),
+    affectedJobIds: v.optional(v.array(v.id("jobs"))),
+    affectedJobCount: v.optional(v.number()),
+    batchDigest: v.optional(v.string()),
+    sourcePauseControlReceiptId: v.optional(
+      v.id("missionSupervisorControls"),
+    ),
     wakeRequested: v.boolean(),
     ticketLeaseVersion: v.optional(v.number()),
     ticketEpoch: v.optional(v.number()),
@@ -1690,7 +1749,8 @@ export default defineSchema({
     resolvedAt: v.optional(v.number()),
   })
     .index("by_status", ["status", "requestedAt"])
-    .index("by_job", ["jobId"]),
+    .index("by_job", ["jobId"])
+    .index("by_job_status", ["jobId", "status"]),
 
   // Ranked, evidence-carrying attention queue. This replaces generic insight
   // spam with a small list of decisions, blockers and safe suggested fixes.

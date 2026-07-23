@@ -67,6 +67,11 @@ function supervisorReceipt(overrides: Record<string, unknown> = {}) {
     action: "steer",
     requestDigest: "must-not-leak",
     controlReceiptId: "must-not-leak",
+    batchProtocolVersion: 1,
+    affectedJobIds: ["must-not-leak-job"],
+    affectedJobCount: 1,
+    batchDigest: "must-not-leak-batch-digest",
+    sourcePauseControlReceiptId: "must-not-leak-pause-receipt",
     state: "ready",
     inputRevision: 8,
     wakeTicket,
@@ -202,6 +207,11 @@ describe("authenticated work controls", () => {
     expect(JSON.stringify(payload)).not.toContain("wakeTicket");
     expect(JSON.stringify(payload)).not.toContain("requestDigest");
     expect(JSON.stringify(payload)).not.toContain("controlReceiptId");
+    expect(JSON.stringify(payload)).not.toContain("affectedJobIds");
+    expect(JSON.stringify(payload)).not.toContain("batchDigest");
+    expect(JSON.stringify(payload)).not.toContain(
+      "sourcePauseControlReceiptId",
+    );
   });
 
   it("returns retryable 503 for a receipt bound to another mission or action even without a wake", async () => {

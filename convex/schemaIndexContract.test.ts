@@ -125,3 +125,33 @@ describe("mission supervisor schema index contract", () => {
     expect(() => assertUniqueFieldTuples(indexes)).not.toThrow();
   });
 });
+
+describe("supervisor batch lookup index contract", () => {
+  const schema = readFileSync(new URL("./schema.ts", import.meta.url), "utf8");
+
+  it("keeps mission activity and paused-claim reconciliation on compact projections", () => {
+    const indexes = indexesForTable(
+      schema,
+      "jobRuntime",
+      "workGroupScheduling",
+    );
+    expect(indexes).toContainEqual({
+      name: "by_mission_active_priority",
+      fields: ["missionId", "active", "priority", "createdAt"],
+    });
+    expect(indexes).toContainEqual({
+      name: "by_pause_checkpoint_heartbeat",
+      fields: ["status", "pauseCheckpointPending", "heartbeatAt"],
+    });
+    expect(() => assertUniqueFieldTuples(indexes)).not.toThrow();
+  });
+
+  it("resolves the one pending approval without scanning approval history", () => {
+    const indexes = indexesForTable(schema, "approvals", "attentionItems");
+    expect(indexes).toContainEqual({
+      name: "by_job_status",
+      fields: ["jobId", "status"],
+    });
+    expect(() => assertUniqueFieldTuples(indexes)).not.toThrow();
+  });
+});

@@ -58,6 +58,79 @@ function projectedQuestion(value: string | undefined): string | undefined {
   return truncateUtf8(redactSensitiveText(value), 1_000);
 }
 
+function activeJobControlCapability(state: SupervisorState) {
+  return state.activeJobControlProtocolVersion === 1
+    && state.activeJobControlActions?.length === 2
+    && state.activeJobControlActions[0] === "pause"
+    && state.activeJobControlActions[1] === "resume"
+    ? {
+      activeJobControlProtocolVersion: 1 as const,
+      activeJobControlActions: [
+        "pause" as const,
+        "resume" as const,
+      ],
+    }
+    : null;
+}
+
+type SupervisorControlAction =
+  | "pause"
+  | "resume"
+  | "cancel"
+  | "steer"
+  | "provide_input";
+
+function supportedControlActions(
+  state: SupervisorState,
+  missionStatus: string,
+  inputTargeted: boolean,
+): SupervisorControlAction[] {
+  const capability = activeJobControlCapability(state);
+  const count = state.nonterminalJobCount;
+  if (
+    !capability
+    || !Number.isSafeInteger(count)
+    || Number(count) < 0
+    || Number(count) > state.totalJobs
+    || Number(count) > 24
+  ) {
+    return [];
+  }
+  if (
+    state.state === "terminal"
+    || TERMINAL_MISSION_STATUSES.has(missionStatus)
+  ) {
+    return [];
+  }
+  if (Number(count) > 0) {
+    if (
+      ["ready", "waiting", "leased"].includes(state.state)
+      && missionStatus === "running"
+    ) {
+      return ["pause"];
+    }
+    if (state.state === "paused" && missionStatus === "paused") {
+      return ["resume"];
+    }
+    return [];
+  }
+  if (
+    ["ready", "waiting", "leased"].includes(state.state)
+    && missionStatus === "running"
+  ) {
+    return ["pause", "cancel", "steer"];
+  }
+  if (state.state === "paused" && missionStatus === "paused") {
+    return ["resume", "cancel"];
+  }
+  if (state.state === "needs_input" && missionStatus === "needs_input") {
+    return state.totalJobs === 0 || inputTargeted
+      ? ["cancel", "provide_input"]
+      : ["cancel"];
+  }
+  return [];
+}
+
 export function projectMissionSupervisorCommand(
   mission: SupervisorMission,
   state: SupervisorState,
@@ -86,6 +159,12 @@ export function projectMissionSupervisorCommand(
   );
   const createdAt = Math.min(missionCreatedAt, stateCreatedAt);
   const safeQuestion = projectedQuestion(question);
+  const activeJobControl = activeJobControlCapability(state);
+  const actions = supportedControlActions(
+    state,
+    String(mission.status),
+    inputTargeted,
+  );
   return {
     protocolVersion: 1 as const,
     missionId: mission._id,
@@ -125,6 +204,31 @@ export function projectMissionSupervisorCommand(
       createdAt,
     ),
     totalJobs: boundedInteger(state.totalJobs, 0, 24, 0),
+    ...(state.nonterminalJobCount === undefined
+      ? {}
+      : {
+        nonterminalJobCount: boundedInteger(
+          state.nonterminalJobCount,
+          0,
+          24,
+          0,
+        ),
+      }),
+    ...(activeJobControl ?? {}),
+    controlAffordanceProtocolVersion: 1 as const,
+    supportedControlActions: actions,
+    ...(state.pauseCohortProtocolVersion === 1
+      && state.pauseCohortJobCount !== undefined
+      ? {
+        pauseCohortProtocolVersion: 1 as const,
+        pauseCohortJobCount: boundedInteger(
+          state.pauseCohortJobCount,
+          0,
+          24,
+          0,
+        ),
+      }
+      : {}),
     inputTargeted,
     ...(typeof state.nextTickAt === "number"
       ? { nextTickAt: state.nextTickAt }
@@ -240,6 +344,12 @@ export async function syncMissionSupervisorCommandForJobWake(
     Number.MAX_SAFE_INTEGER - 1,
     existing.updatedAt,
   );
+  const activeJobControl = activeJobControlCapability(state);
+  const actions = supportedControlActions(
+    state,
+    existing.status,
+    existing.inputTargeted,
+  );
   await ctx.db.patch(existing._id, {
     state: state.state,
     inputRevision: boundedInteger(
@@ -255,6 +365,37 @@ export async function syncMissionSupervisorCommandForJobWake(
       existing.deadlineAt,
     ),
     totalJobs: boundedInteger(state.totalJobs, 0, 24, existing.totalJobs),
+    ...(state.nonterminalJobCount === undefined
+      ? {}
+      : {
+        nonterminalJobCount: boundedInteger(
+          state.nonterminalJobCount,
+          0,
+          24,
+          existing.nonterminalJobCount ?? 0,
+        ),
+      }),
+    ...(activeJobControl ?? {
+      activeJobControlProtocolVersion: undefined,
+      activeJobControlActions: undefined,
+    }),
+    controlAffordanceProtocolVersion: 1,
+    supportedControlActions: actions,
+    ...(state.pauseCohortProtocolVersion === 1
+      && state.pauseCohortJobCount !== undefined
+      ? {
+        pauseCohortProtocolVersion: 1 as const,
+        pauseCohortJobCount: boundedInteger(
+          state.pauseCohortJobCount,
+          0,
+          24,
+          existing.pauseCohortJobCount ?? 0,
+        ),
+      }
+      : {
+        pauseCohortProtocolVersion: undefined,
+        pauseCohortJobCount: undefined,
+      }),
     nextTickAt: typeof state.nextTickAt === "number"
       ? state.nextTickAt
       : undefined,

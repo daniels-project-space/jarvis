@@ -542,6 +542,48 @@ describe("mission supervisor authoritative job wake", () => {
     },
   );
 
+  it("maintains the exact nonterminal counter with the authoritative status wake", async () => {
+    const activeJob = supervisorJob({ status: "running" });
+    const activeState = supervisorState({ nonterminalJobCount: 1 });
+    const terminalHarness = ioHarness({
+      decisions: [decision(activeJob)],
+      states: [activeState],
+    });
+    expect(await signalMissionSupervisorForJobPatch(
+      terminalHarness.ctx,
+      activeJob,
+      { status: "done", completedAt: 2_000 },
+      2_000,
+    )).toMatchObject({
+      signaled: true,
+      inputRevision: 8,
+    });
+    expect(terminalHarness.writes[0]?.patch).toMatchObject({
+      inputRevision: 8,
+      nonterminalJobCount: 0,
+    });
+
+    const terminalJob = supervisorJob({ status: "done" });
+    const terminalState = supervisorState({ nonterminalJobCount: 0 });
+    const recoveryHarness = ioHarness({
+      decisions: [decision(terminalJob)],
+      states: [terminalState],
+    });
+    expect(await signalMissionSupervisorForJobPatch(
+      recoveryHarness.ctx,
+      terminalJob,
+      { status: "pending", completedAt: undefined },
+      3_000,
+    )).toMatchObject({
+      signaled: true,
+      inputRevision: 8,
+    });
+    expect(recoveryHarness.writes[0]?.patch).toMatchObject({
+      inputRevision: 8,
+      nonterminalJobCount: 1,
+    });
+  });
+
   it("does not patch a terminal supervisor state", async () => {
     const job = supervisorJob();
     const harness = ioHarness({

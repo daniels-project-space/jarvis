@@ -93,4 +93,71 @@ describe("mission supervisor command projection", () => {
       totalJobs: 24,
     });
   });
+
+  it("projects exact rollout-safe controls instead of inferring from total jobs", () => {
+    const capability = {
+      activeJobControlProtocolVersion: 1 as const,
+      activeJobControlActions: ["pause" as const, "resume" as const],
+    };
+    expect(projectMissionSupervisorCommand(
+      mission(),
+      state({
+        ...capability,
+        state: "ready",
+        totalJobs: 3,
+        nonterminalJobCount: 2,
+      }),
+    ).supportedControlActions).toEqual(["pause"]);
+    expect(projectMissionSupervisorCommand(
+      mission({ status: "paused" }),
+      state({
+        ...capability,
+        state: "paused",
+        totalJobs: 3,
+        nonterminalJobCount: 2,
+      }),
+    ).supportedControlActions).toEqual(["resume"]);
+    expect(projectMissionSupervisorCommand(
+      mission(),
+      state({
+        ...capability,
+        state: "ready",
+        totalJobs: 0,
+        nonterminalJobCount: 0,
+      }),
+    ).supportedControlActions).toEqual(["pause", "cancel", "steer"]);
+    expect(projectMissionSupervisorCommand(
+      mission({ status: "needs_input" }),
+      state({
+        ...capability,
+        state: "needs_input",
+        totalJobs: 1,
+        nonterminalJobCount: 0,
+      }),
+      "Choose the exact recovery.",
+      false,
+    ).supportedControlActions).toEqual(["cancel"]);
+    expect(projectMissionSupervisorCommand(
+      mission({ status: "needs_input" }),
+      state({
+        ...capability,
+        state: "needs_input",
+        totalJobs: 1,
+        nonterminalJobCount: 0,
+      }),
+      "Choose the exact recovery.",
+      true,
+    ).supportedControlActions).toEqual(["cancel", "provide_input"]);
+    expect(projectMissionSupervisorCommand(
+      mission(),
+      state({
+        state: "ready",
+        totalJobs: 3,
+        nonterminalJobCount: 2,
+      }),
+    )).toMatchObject({
+      controlAffordanceProtocolVersion: 1,
+      supportedControlActions: [],
+    });
+  });
 });

@@ -49,6 +49,15 @@ function defined<T extends Record<string, unknown>>(value: T): T {
 export function projectJobRuntime(job: any) {
   const createdAt = Number(job.createdAt ?? job._creationTime ?? Date.now());
   const active = ["running", "dispatching", "pending", "awaiting_approval", "paused", "stalled", "needs_input", "steering"].includes(String(job.status));
+  const pauseCheckpointPending = (
+    job.status === "paused"
+    && job.dispatchPhase === "specialist"
+    && typeof job.dispatchId === "string"
+    && typeof job.workerRunId === "string"
+    && Boolean(job.dispatchReceiptId)
+    && typeof job.dispatchReceiptDigest === "string"
+    && typeof job.dispatchPayloadDigest === "string"
+  ) ? true : undefined;
   return defined({
     jobId: job._id,
     admissionProtocolVersion: typeof job.admissionProtocolVersion === "number" ? job.admissionProtocolVersion : undefined,
@@ -90,6 +99,7 @@ export function projectJobRuntime(job: any) {
     stallReason: typeof job.stallReason === "string" ? job.stallReason.slice(0, 400) : undefined,
     steerRevision: Math.max(0, Number(job.steerRevision ?? 0)),
     active,
+    pauseCheckpointPending,
     nextRunAt: typeof job.nextRunAt === "number" ? job.nextRunAt : undefined,
     dispatchId: typeof job.dispatchId === "string" ? job.dispatchId.slice(0, 180) : undefined,
     dispatchGeneration: typeof job.dispatchGeneration === "number" ? job.dispatchGeneration : undefined,

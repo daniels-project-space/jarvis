@@ -2246,6 +2246,104 @@ export const reapStale = mutation({
       .query("jobRuntime")
       .withIndex("by_status_heartbeat", (q: any) => q.eq("status", "steering").lte("heartbeatAt", now - STALE_RUNNER_MS))
       .take(100);
+    // Atomic mission pause deliberately preserves one claimed specialist
+    // binding so a live worker can save its final checkpoint. If that worker
+    // disappears, paused rows no longer participate in the running reaper.
+    // Reconcile only the exact stale receipt/attempt fence, without queueing
+    // or otherwise resurrecting work; resume can then allocate its fresh
+    // bounded attempt.
+    const paused = await ctx.db
+      .query("jobRuntime")
+      .withIndex("by_pause_checkpoint_heartbeat", (q) =>
+        q
+          .eq("status", "paused")
+          .eq("pauseCheckpointPending", true)
+          .lte("heartbeatAt", now - STALE_RUNNER_MS)
+      )
+      .take(100);
+    const reconciledPausedClaims: string[] = [];
+    for (const activity of paused) {
+      const job = await ctx.db.get(activity.jobId);
+      const attemptNumber = Number(job?.attempt ?? 0);
+      if (
+        !job
+        || job.status !== "paused"
+        || job.dispatchPhase !== "specialist"
+        || typeof job.workerRunId !== "string"
+        || typeof job.dispatchId !== "string"
+        || Number(job.heartbeatAt ?? 0) > now - STALE_RUNNER_MS
+        || activity.attempt !== attemptNumber
+        || activity.dispatchId !== job.dispatchId
+        || activity.workerRunId !== job.workerRunId
+      ) {
+        continue;
+      }
+      const [attemptLookup, authority, receipt] = await Promise.all([
+        readExactWorkAttempt(ctx, job._id, attemptNumber),
+        readAttemptExecutionAuthority(ctx, job, attemptNumber),
+        claimedDispatchReceiptForRow(ctx, job, job.workerRunId),
+      ]);
+      if (
+        attemptLookup.kind !== "exact"
+        || !authority
+        || !receipt
+        || receipt.attempt !== attemptNumber
+        || receipt.phase !== "specialist"
+        || receipt.authorityDigest !== authority.authorityDigest
+        || receipt.workOrderRevisionDigest
+          !== authority.workOrderRevisionDigest
+        || attemptLookup.attempt.status !== "paused"
+        || attemptLookup.attempt.completedAt
+        || attemptLookup.attempt.workerRunId !== job.workerRunId
+        || attemptLookup.attempt.dispatchId !== job.dispatchId
+        || attemptLookup.attempt.dispatchReceiptId !== job.dispatchReceiptId
+        || attemptLookup.attempt.dispatchReceiptDigest
+          !== job.dispatchReceiptDigest
+        || attemptLookup.attempt.dispatchPayloadDigest
+          !== job.dispatchPayloadDigest
+      ) {
+        continue;
+      }
+      await ctx.db.patch(attemptLookup.attempt._id, {
+        status: "paused",
+        dispatchId: undefined,
+        completedAt: now,
+        livenessAt: now,
+        lastEventAt: now,
+      });
+      if (!await closeClaimedDispatchReceipt(
+        ctx,
+        job,
+        job.workerRunId,
+        "paused worker liveness expired before final checkpoint",
+        now,
+      )) {
+        throw new Error("Paused claim changed after exact reconciliation");
+      }
+      await patchJobWithRuntime(ctx, job, {
+        dispatchId: undefined,
+        dispatchLeaseUntil: undefined,
+        workerRunId: undefined,
+        deliveryRunId: undefined,
+        heartbeatAt: now,
+        progress:
+          "paused worker stopped before final checkpoint — claim safely closed",
+      });
+      await appendAttemptEvidence(
+        ctx,
+        job,
+        "paused_claim_reconciled",
+        "Paused worker liveness expired; exact claim closed without resuming",
+        {
+          stage: "paused",
+          percent: job.percent,
+          evidenceKind: "watchdog",
+          eventKey: `paused-claim-reconciled:${attemptNumber}:${receipt.dispatchId}`,
+          attempt: attemptNumber,
+        },
+      );
+      reconciledPausedClaims.push(job.task.slice(0, 80));
+    }
     const requeued: string[] = [];
     const abandoned: string[] = [];
     const stalled: string[] = [];
@@ -2392,7 +2490,14 @@ export const reapStale = mutation({
         nextAttempt > (j.maxAttempts ?? 12) ? "Retry budget exhausted" : `Recovered as attempt ${nextAttempt}`,
         { stage: nextAttempt > (j.maxAttempts ?? 12) ? "error" : "queued", evidenceKind: "watchdog", eventKey: `recovery:${j.attempt ?? 1}:${nextAttempt}` });
     }
-    return { requeued, abandoned, stalled, releasedDispatches, expiredControllers };
+    return {
+      requeued,
+      abandoned,
+      stalled,
+      releasedDispatches,
+      expiredControllers,
+      reconciledPausedClaims,
+    };
   },
 });
 

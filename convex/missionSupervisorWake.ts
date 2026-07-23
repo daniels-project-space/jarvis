@@ -96,6 +96,12 @@ export type MissionSupervisorWakeResult =
     };
 
 const authoritativeJobFields = new Set<string>(AUTHORITATIVE_JOB_FIELDS);
+const TERMINAL_JOB_STATUSES = new Set([
+  "done",
+  "error",
+  "cancelled",
+  "needs_input",
+]);
 
 function excerpt(value: unknown, maximum: number): string | null {
   return typeof value === "string" ? value.slice(0, maximum) : null;
@@ -343,7 +349,16 @@ export async function signalMissionSupervisorForJobPatch(
     state.maxJobs > MISSION_SUPERVISOR_WAKE_MAX_JOBS ||
     !Number.isSafeInteger(state.inputRevision) ||
     state.inputRevision < 0 ||
-    state.inputRevision >= Number.MAX_SAFE_INTEGER
+    state.inputRevision >= Number.MAX_SAFE_INTEGER ||
+    (
+      state.nonterminalJobCount !== undefined
+      && (
+        !Number.isSafeInteger(state.nonterminalJobCount)
+        || state.nonterminalJobCount < 0
+        || state.nonterminalJobCount > state.totalJobs
+        || state.nonterminalJobCount > state.maxJobs
+      )
+    )
   ) {
     return { signaled: false, reason: "invalid_state_bounds" };
   }
@@ -354,9 +369,32 @@ export async function signalMissionSupervisorForJobPatch(
     state.maxJobs,
   );
   const inputRevision = state.inputRevision + 1;
+  const previousTerminal = TERMINAL_JOB_STATUSES.has(String(job.status));
+  const nextTerminal = TERMINAL_JOB_STATUSES.has(
+    String(patch.status ?? job.status),
+  );
+  const nonterminalDelta = previousTerminal === nextTerminal
+    ? 0
+    : previousTerminal
+      ? 1
+      : -1;
+  const nonterminalJobCount = state.nonterminalJobCount === undefined
+    ? undefined
+    : state.nonterminalJobCount + nonterminalDelta;
+  if (
+    nonterminalJobCount !== undefined
+    && (
+      nonterminalJobCount < 0
+      || nonterminalJobCount > state.totalJobs
+      || nonterminalJobCount > state.maxJobs
+    )
+  ) {
+    return { signaled: false, reason: "invalid_state_bounds" };
+  }
   const wakePatch = {
     inputRevision,
     dirtyJobIds,
+    ...(nonterminalJobCount === undefined ? {} : { nonterminalJobCount }),
     updatedAt: now,
     ...(state.state === "ready" || state.state === "waiting"
       ? { state: "ready" as const, nextTickAt: now }
