@@ -242,7 +242,7 @@ function WorkerDetail({ node, onBack }: { node: FleetNode; onBack: () => void })
   return <section data-fleet-worker-detail className="flex min-h-0 flex-1 flex-col gap-2 rounded-xl border border-white/[0.08] bg-black/20 p-3">
     <div className="flex min-w-0 items-start gap-2">
       <button type="button" onClick={onBack} className="shrink-0 text-xs text-cyan" aria-label="Back to fleet">←</button>
-      <div className="min-w-0 flex-1"><div className="truncate text-xs text-ice">{agentName(node.agent)} · {node.label}</div><div className="mt-0.5 truncate font-mono text-[8px] uppercase tracking-[0.12em] text-slate">{node.model ?? "auto"}/{node.reasoningEffort ?? "default"} · gen {node.generation} · attempt {node.attempt}/{node.maxAttempts}</div></div>
+      <div className="min-w-0 flex-1"><div className="truncate text-xs text-ice">{agentName(node.agent)} · {node.label}</div><div className="mt-0.5 truncate font-mono text-[8px] uppercase tracking-[0.12em] text-slate">{node.model ?? "auto"}/{node.reasoningEffort ?? "default"} · gen {node.generation} · attempt {node.attempt}/{node.maxAttempts}</div>{node.modelReason && <div className="mt-1 text-[9px] leading-snug text-slate">route · {node.modelReason}</div>}</div>
       <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[8px] ${STATE_STYLE[node.state]}`}>{node.state.replace("_", " ")}</span>
     </div>
     <div className="grid grid-cols-2 gap-1 text-[9px] text-slate"><div className="truncate">stage · <span className="text-ice">{node.stage}</span></div><div className="truncate">merge · <span className="text-ice">{node.mergeState}</span></div><div className="truncate">handoffs · <span className="text-ice">{node.dependenciesReady}/{node.dependencyCount}</span></div><div className="truncate">runtime · <span className="text-ice">{node.workerRuntime ?? "not assigned"}</span></div><div className="col-span-2 truncate">last meaningful progress · <span className="font-mono text-ice">{progressStamp(node.progressAt)}</span></div></div>
@@ -260,13 +260,31 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
   const [controlError, setControlError] = useState("");
   const active = snapshot.active;
   const fleet = snapshot.fleet;
-  const selectedSummary = selectedId ? fleet?.nodes.find((node) => node.jobId === selectedId) ?? null : null;
+  // Old Convex and new application releases may overlap briefly. Keep one
+  // hierarchy surface during that additive rollout, but never render both the
+  // legacy flat nodes and the canonical mission/project tree.
+  const hierarchy = snapshot.hierarchy?.length ? snapshot.hierarchy : fleet ? [{
+    id: fleet.id,
+    label: fleet.goal,
+    status: fleet.status,
+    phase: fleet.phase,
+    projects: [...new Set(fleet.nodes.filter((node) => node.state !== "done").map((node) => node.repository ?? "evidence"))].map((repository) => ({
+      id: `legacy:${repository}`,
+      canonicalProjectId: repository,
+      repository: repository === "evidence" ? null : repository,
+      jobs: fleet.nodes.filter((node) => node.state !== "done" && (node.repository ?? "evidence") === repository),
+    })),
+  }] : [];
+  const hierarchyJobs = hierarchy.flatMap((mission) => mission.projects.flatMap((project) => project.jobs));
+  const selectedSummary = selectedId ? hierarchyJobs.find((node) => node.jobId === selectedId)
+    ?? fleet?.nodes.find((node) => node.jobId === selectedId) ?? null : null;
   const selected = selectedSummary && detail?.jobId === selectedId ? {
     ...selectedSummary,
     jobId: detail.jobId, label: detail.label, agent: detail.agentId ?? selectedSummary.agent,
     repository: detail.repo, status: detail.status, stage: detail.stage, percent: detail.percent,
     progress: detail.progress, progressAt: detail.progressAt, model: detail.model,
-    reasoningEffort: detail.reasoningEffort, workerRuntime: detail.workerRuntime,
+    reasoningEffort: detail.reasoningEffort, modelReason: detail.modelReason,
+    workerRuntime: detail.workerRuntime,
     workerRunId: detail.workerRunId, generation: detail.generation, attempt: detail.attempt,
     maxAttempts: detail.maxAttempts, integrationState: detail.integrationState ?? selectedSummary.integrationState,
     deliveryStatus: detail.deliveryStatus, startedAt: detail.startedAt,
@@ -285,21 +303,23 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
     </aside>
   );
 
-  const attention = fleet.nodes.filter((node) => node.needsDaniel);
-  const repositories = [...new Set(fleet.nodes.map((node) => node.repository).filter(Boolean))] as string[];
+  const projectCount = hierarchy.reduce((count, mission) => count + mission.projects.length, 0);
   return (
     <aside data-fleet-surface="expanded" aria-label="Live Jarvis fleet" className="materialize glass absolute inset-x-1 bottom-1 z-40 flex h-[min(78vh,680px)] min-h-0 flex-col overflow-hidden rounded-2xl !border-cyan/25 bg-[#071019]/96 p-3 shadow-2xl md:inset-y-2 md:left-2 md:right-auto md:h-auto md:w-[min(760px,62%)]">
       <header className="flex min-w-0 shrink-0 items-start gap-2 border-b border-white/[0.07] pb-2">
-        <div className="min-w-0 flex-1"><div className="hud-label text-cyan">live fleet · {fleet.mode}</div><h2 className="mt-0.5 truncate text-sm text-ice">{fleet.goal}</h2><div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[8px] uppercase tracking-[0.1em] text-slate"><span>{fleet.phase} · {fleet.percent}%</span><span>integration · {fleet.integrationState}</span><span>{fleet.nodes.length}/8 nodes · {fleet.edges.length}/28 edges</span></div>{fleet.planGeneration !== null && <div className="mt-1 break-all font-mono text-[7px] leading-tight text-slate">persisted plan g{fleet.planGeneration} · {fleet.planDigest}</div>}</div>
+        <div className="min-w-0 flex-1"><div className="hud-label text-cyan">live work · immutable groups</div><h2 className="mt-0.5 truncate text-sm text-ice">{fleet.goal}</h2><div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[8px] uppercase tracking-[0.1em] text-slate"><span>{fleet.phase} · {fleet.percent}%</span><span>{hierarchy.length} missions · {projectCount} projects · {hierarchyJobs.length} active jobs</span></div></div>
         <button type="button" onClick={() => setOpen(false)} className="rounded-lg px-2 py-1 text-[9px] text-slate hover:text-cyan" aria-label="Collapse live fleet">minimize</button>
       </header>
       <div className="mt-2 flex min-h-0 flex-1 gap-2 overflow-hidden">
         {selectedId ? (selected ? <WorkerDetail node={selected} onBack={() => selectJob(null)} /> : <div data-fleet-detail-loading className="flex flex-1 items-center justify-center text-xs text-cyan">loading exact work detail…</div>) : <div className="scrollbar-thin min-h-0 flex-1 space-y-2 overflow-auto pr-0.5">
-          {attention.length > 0 && <section aria-labelledby="needs-daniel-heading" className="rounded-xl border border-amber/25 bg-amber/[0.06] p-2"><div id="needs-daniel-heading" className="hud-label text-amber">Needs Daniel · {attention.length}</div><ul className="mt-1 space-y-1">{attention.map((node) => <li key={node.id}><button type="button" onClick={() => selectJob(node.jobId)} className="flex w-full min-w-0 items-center gap-2 rounded-lg px-1 py-1 text-left hover:bg-white/[0.04]"><span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber"/><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{agentName(node.agent)} · {node.label}</span><span className="shrink-0 text-[8px] text-amber">{node.state.replace("_", " ")}</span></button></li>)}</ul></section>}
-          <FleetDag nodes={fleet.nodes} edges={fleet.edges} />
-          {repositories.length > 0 && <div className="flex flex-wrap gap-1" aria-label="Repository groups">{repositories.map((repo) => <span key={repo} className="rounded-full border border-white/10 px-2 py-0.5 font-mono text-[8px] text-slate">{repo} · {fleet.nodes.filter((node) => node.repository === repo).length}</span>)}</div>}
-          <section aria-label="Fleet workstreams" className="grid gap-1.5 sm:grid-cols-2">
-            {fleet.nodes.map((node) => <button type="button" key={node.id} onClick={() => selectJob(node.jobId)} className={`min-w-0 rounded-xl border p-2 text-left transition hover:border-cyan/40 ${STATE_STYLE[node.state]}`} aria-label={`Open ${agentName(node.agent)} detail for ${node.label}`}><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{agentName(node.agent)} · {node.label}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.1em] opacity-75">{node.stage} · {node.model ?? "auto"}/g{node.generation}/a{node.attempt} · handoff {node.dependenciesReady}/{node.dependencyCount}</div>{node.progress && <div className="mt-1 truncate text-[9px] text-slate">{node.progress}</div>}<div className="mt-1 truncate font-mono text-[7px] text-slate/65">{node.mergeState} · progress {progressStamp(node.progressAt)}</div></button>)}
+          <section data-work-hierarchy aria-label="Active mission and project hierarchy" className="space-y-2">
+            {hierarchy.map((mission) => <article key={mission.id} data-mission-group={mission.id} className="rounded-xl border border-cyan/15 bg-cyan/[0.025] p-2">
+              <header className="flex min-w-0 items-start gap-2"><div className="min-w-0 flex-1"><div className="truncate text-[11px] text-ice">{mission.label}</div><div className="truncate font-mono text-[7px] text-cyan/55" title={mission.id}>mission · {mission.id}</div></div><span className="shrink-0 font-mono text-[8px] uppercase text-slate">{mission.phase}</span></header>
+              <div className="mt-2 space-y-1.5">{mission.projects.map((project) => <section key={project.id} data-project-group={project.id} className="rounded-lg border border-white/[0.07] bg-black/20 p-1.5">
+                <header className="flex min-w-0 items-center gap-2 px-0.5"><div className="min-w-0 flex-1 truncate font-mono text-[8px] text-sky-200">{project.repository ?? "read-only evidence"}</div><span className="shrink-0 font-mono text-[7px] text-slate">{project.canonicalProjectId} · {project.jobs.length}</span></header>
+                <div className="mt-1 grid gap-1 sm:grid-cols-2">{project.jobs.map((node) => <button type="button" key={node.jobId} data-active-job={node.jobId} onClick={() => selectJob(node.jobId)} className={`min-w-0 rounded-lg border p-2 text-left transition hover:border-cyan/40 ${STATE_STYLE[node.state]}`} aria-label={`Open ${agentName(node.agent)} detail for ${node.label}`}><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{agentName(node.agent)} · {node.label}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.08em] opacity-75">{node.stage} · {node.model ?? "auto"}/{node.reasoningEffort ?? "default"}</div><div className="mt-1 truncate text-[8px] text-slate" title={node.modelReason ?? "Policy route"}>route · {node.modelReason ?? "policy default"}</div>{node.needsDaniel && <div className="mt-1 text-[8px] text-amber">Needs Daniel</div>}</button>)}</div>
+              </section>)}</div>
+            </article>)}
           </section>
         </div>}
       </div>

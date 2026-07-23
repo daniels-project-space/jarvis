@@ -7,6 +7,7 @@ import { testMissionAdmission } from "./testSourceAdmission";
 import {
   BACKGROUND_CONCURRENCY_LIMIT,
   DISPATCH_CANDIDATE_WINDOW_MAX,
+  integrationLineageForAuthority,
   MAX_ACTIVE_PER_WORK_GROUP,
   workGroupAuthority,
 } from "../src/lib/work-scheduler";
@@ -274,6 +275,92 @@ describe("project-group fair reservation authority", () => {
     const runtime = await t.run(async (ctx) => ctx.db.query("jobRuntime")
       .withIndex("by_job", (q) => q.eq("jobId", jobId)).first());
     expect(runtime).toMatchObject({ repo: REPO, schedulingBound: true, dispatchReady: true });
+  });
+
+  it("counts a full poisoned active page before bounded repair can reveal saturated real workers", async () => {
+    const t = convexTest(schema, modules);
+    for (let index = 0; index < MAX_ACTIVE_PER_WORK_GROUP; index += 1) {
+      await enqueue(t, { missionId: "mission-real-active-a" });
+    }
+    for (let index = MAX_ACTIVE_PER_WORK_GROUP; index < BACKGROUND_CONCURRENCY_LIMIT; index += 1) {
+      await enqueue(t, { missionId: "mission-real-active-b" });
+    }
+    const active = await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: BACKGROUND_CONCURRENCY_LIMIT,
+      reason: "fill-real-background-capacity",
+      workerToken: WORKER,
+    });
+    expect(active.reservations).toHaveLength(BACKGROUND_CONCURRENCY_LIMIT);
+
+    const poisonedIds: Id<"jobs">[] = [];
+    for (let index = 0; index < BACKGROUND_CONCURRENCY_LIMIT + 1; index += 1) {
+      poisonedIds.push(await enqueue(t, { missionId: `mission-poison-${index}`, priority: 0 }));
+    }
+    const waiting = await enqueue(t, { missionId: "mission-must-stay-waiting", priority: 100 });
+    await t.run(async (ctx) => {
+      for (const [index, jobId] of poisonedIds.entries()) {
+        const job = await ctx.db.get(jobId);
+        const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", jobId)).first();
+        if (!job || !runtime) throw new Error("poisoned capacity fixture was not admitted");
+        const activeProjection = {
+          status: "dispatching",
+          active: true,
+          priority: 0,
+          dispatchId: `forged-dispatch-${index}`,
+          workerRunId: `forged-worker-${index}`,
+          updatedAt: Date.now(),
+        };
+        if (index === 0) {
+          // This row is locally self-consistent, including its immutable-looking
+          // group and lineage fields. Only the admission point-read proves that
+          // the alternate repository/group never had execution authority.
+          const injected = "daniels-project-space/dropship-ai";
+          const forged = workGroupAuthority({
+            jobId,
+            missionId: job.missionId,
+            repo: injected,
+            canonicalProjectId: "dropship-ai",
+          });
+          await ctx.db.patch(runtime._id, {
+            ...activeProjection,
+            repo: injected,
+            ...forged,
+            integrationLineage: integrationLineageForAuthority(forged),
+          });
+        } else {
+          // Syntactically bound rows that fail their local projection hash used
+          // to be filtered out before the bounded page was counted.
+          await ctx.db.patch(runtime._id, {
+            ...activeProjection,
+            schedulingBindingDigest: "not-an-authority-digest",
+          });
+        }
+      }
+    });
+
+    const remainingPoisoned = async () => await t.run(async (ctx) => {
+      const rows = await Promise.all(poisonedIds.map((jobId) => ctx.db.query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", jobId)).first()));
+      return rows.filter((row) => row?.status === "dispatching").length;
+    });
+
+    expect(await remainingPoisoned()).toBe(BACKGROUND_CONCURRENCY_LIMIT + 1);
+    for (const expectedRemaining of [6, 3, 0, 0]) {
+      const batch = await t.mutation(api.jobs.reserveDispatchBatch, {
+        limit: BACKGROUND_CONCURRENCY_LIMIT,
+        reason: "projection-poison-capacity-audit",
+        workerToken: WORKER,
+      });
+      expect(batch.reservations).toEqual([]);
+      expect(await remainingPoisoned()).toBe(expectedRemaining);
+    }
+    const state = await t.run(async (ctx) => ({
+      waiting: await ctx.db.get(waiting),
+      activeRuntimes: (await ctx.db.query("jobRuntime").collect())
+        .filter((row) => row.status === "dispatching" && row.workerRunId === undefined),
+    }));
+    expect(state.waiting?.status).toBe("pending");
+    expect(state.activeRuntimes).toHaveLength(BACKGROUND_CONCURRENCY_LIMIT);
   });
 
   it("keeps historical unbound rows non-executable without admitting them in a poll", async () => {

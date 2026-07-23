@@ -24,6 +24,7 @@ import {
   activateStagedJobWorkOrderRevision,
   insertJobWithRuntime,
   jobRuntimeFor,
+  projectJobRuntime,
   patchMissionWithRuntime,
   patchJobWithRuntime,
   patchJobWithRuntimeDeferredQueue,
@@ -60,6 +61,7 @@ const STALE_RUNNER_MS = 5 * 60 * 1000;
 const DISPATCH_LEASE_MS = 2 * 60 * 1000;
 const DELIVERY_LEASE_MS = 45_000;
 const DELIVERY_RETRY_LIMIT = 6;
+const ACTIVE_RUNTIME_REPAIR_LIMIT = 3;
 const REVIEW_RECEIPT_MAX_CHARS = 300_000;
 const GIT_OID = /^[0-9a-f]{40,64}$/i;
 const DELIVERY_OUTCOMES = new Set([
@@ -669,12 +671,88 @@ export function executableRuntimeProjection(row: any) {
     && (!row.approvalRequired || row.approvalStatus === "approved");
 }
 
-async function activeBackgroundRows(ctx: any) {
+async function repairIndexedActiveRuntime(ctx: any, runtime: any, job: any, now: number) {
+  let repaired: any;
+  if (job) {
+    repaired = projectJobRuntime(job);
+    // An active durable row with broken admission remains visible to capacity
+    // accounting until a separate authoritative transition makes it inactive.
+    // Quarantining only its executable projection cannot free a worker slot.
+    if (["dispatching", "running"].includes(String(job.status))
+      && !await readJobSchedulingAuthority(ctx, job)) {
+      repaired.schedulingBound = false;
+      repaired.dispatchReady = false;
+      delete repaired.nextRunAt;
+    }
+  } else {
+    // A missing durable job is authoritative proof that this compact row is
+    // not a live worker. Move the orphan out of the active index without ever
+    // treating its mutable identity fields as repair authority.
+    repaired = {
+      ...runtime,
+      status: "projection_quarantined",
+      stage: "projection_quarantined",
+      active: false,
+      schedulingBound: false,
+      dispatchReady: false,
+      updatedAt: now,
+    };
+    delete repaired.nextRunAt;
+    delete repaired.dispatchLeaseUntil;
+  }
+  await ctx.db.replace(runtime._id, repaired);
+  const groupKeys = new Set([runtime.schedulingGroupKey, repaired.schedulingGroupKey]
+    .filter((value): value is string => typeof value === "string" && value.length > 0));
+  for (const groupKey of groupKeys) await refreshWorkGroupQueueProjection(ctx, groupKey, now);
+}
+
+async function activeBackgroundRows(ctx: any, now: number) {
+  // Status is the conservative capacity index. `schedulingBound` and every
+  // other compact field are mutable projections: they may withhold capacity,
+  // but can never make an indexed active row disappear from the global count.
+  // Taking limit + 1 is sufficient to close admission; deeper history cannot
+  // change the answer and is deliberately never scanned.
   const rows = (await Promise.all(["dispatching", "running"].map((status) => ctx.db
     .query("jobRuntime")
-    .withIndex("by_status_scheduling_bound", (q: any) => q.eq("status", status).eq("schedulingBound", true))
+    .withIndex("by_status_priority", (q: any) => q.eq("status", status))
     .take(BACKGROUND_CONCURRENCY_LIMIT + 1)))).flat();
-  return [...new Map(rows.filter(boundRuntimeProjection).map((row: any) => [String(row.jobId), row])).values()];
+  const authoritativeRows = [];
+  let repairs = 0;
+  let uncertainActiveAuthority = false;
+  for (const runtime of rows) {
+    const job: any = await ctx.db.get(runtime.jobId);
+    const durableActive = job && ["dispatching", "running"].includes(String(job.status));
+    const authority = durableActive ? await readJobSchedulingAuthority(ctx, job) : null;
+    if (durableActive && authority && immutableLineageIsValid(job)) {
+      // Group and write-lineage occupancy come only from the durable admission,
+      // never from the compact row. This preserves per-group bounds even when
+      // a projection is forged into a locally self-consistent alternate group.
+      authoritativeRows.push({ ...job, ...authority.binding });
+    } else if (durableActive) {
+      // A live-looking durable row whose admission cannot be proven may reduce
+      // availability, but it can never grant another dispatch.
+      uncertainActiveAuthority = true;
+    }
+    const current = Boolean(durableActive && authority
+      && boundRuntimeProjection(runtime)
+      && runtimeMatchesSchedulingAuthority(runtime, authority)
+      && runtime.status === job.status
+      && Number(runtime.attempt) === Number(job.attempt ?? 1)
+      && runtime.dispatchId === job.dispatchId
+      && runtime.workerRunId === job.workerRunId);
+    if (!current && repairs < ACTIVE_RUNTIME_REPAIR_LIMIT) {
+      await repairIndexedActiveRuntime(ctx, runtime, job, now);
+      repairs += 1;
+    }
+  }
+  return {
+    // Count physical index matches, including duplicates and rows repaired in
+    // this transaction. A later poll observes the bounded repair; this poll can
+    // never turn corrupted projection data into fresh execution capacity.
+    capacityCount: rows.length,
+    authoritativeRows,
+    uncertainActiveAuthority,
+  };
 }
 
 async function protectedApprovalAllowsExecution(ctx: any, job: any) {
@@ -687,14 +765,16 @@ async function protectedApprovalAllowsExecution(ctx: any, job: any) {
 }
 
 export async function projectedDispatchCandidates(ctx: any, now: number, requestedLimit: number) {
-  const activeRows = await activeBackgroundRows(ctx);
-  const available = Math.max(0, BACKGROUND_CONCURRENCY_LIMIT - activeRows.length);
+  const active = await activeBackgroundRows(ctx, now);
+  const available = active.uncertainActiveAuthority
+    ? 0
+    : Math.max(0, BACKGROUND_CONCURRENCY_LIMIT - active.capacityCount);
   const limit = Math.min(requestedLimit, available);
   if (!limit) return { selected: [], scheduler: null };
 
   const activeByGroup = new Map<string, number>();
   const activeWriteLineages = new Set<string>();
-  for (const runtime of activeRows) {
+  for (const runtime of active.authoritativeRows) {
     const groupKey = String(runtime.schedulingGroupKey ?? "");
     if (!groupKey) continue;
     activeByGroup.set(groupKey, (activeByGroup.get(groupKey) ?? 0) + 1);
@@ -1539,6 +1619,7 @@ export const detail = query({
       progressAt: row.progressAt ?? null,
       model: row.model ? normalizeWorkModelTier(row.model) : null,
       reasoningEffort: row.reasoningEffort ?? null,
+      modelReason: row.modelReason ?? null,
       workerRuntime: row.workerRuntime ?? null,
       workerRunId: row.workerRunId ?? null,
       generation: Number(row.deliveryGeneration ?? row.goalWave ?? 0),

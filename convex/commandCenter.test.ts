@@ -4,6 +4,7 @@ import {
   ACTIVE_CANDIDATE_LIMIT,
   FLEET_MAX_EDGES,
   FLEET_MAX_NODES,
+  buildActiveWorkHierarchy,
   buildFleetSnapshot,
   isUserRelevantWork,
   selectRelevantWork,
@@ -18,7 +19,8 @@ function runtime(overrides: Record<string, unknown> = {}) {
     status: "running", visibility: "conversation", originThreadId: threadId,
     stage: "testing", percent: 64, progress: "Running focused tests", progressAt: 120,
     priority: 80, createdAt: 100, active: true, agentId: "paul", model: "terra",
-    reasoningEffort: "high", attempt: 1, maxAttempts: 12, steerRevision: 0,
+    reasoningEffort: "high", modelReason: "Terra/high for bounded implementation",
+    attempt: 1, maxAttempts: 12, steerRevision: 0,
     ...overrides,
   };
 }
@@ -75,11 +77,40 @@ describe("commandCenter relevance and bounded projection", () => {
     expect(rows.map((row) => row.jobId)).toEqual(["input", "paused", "running"]);
   });
 
+  it("groups active jobs by immutable mission and project ids without merging identical labels or repositories", () => {
+    const rows = [
+      runtime({
+        jobId: "job-one", label: "identical mutable label", missionGroupId: "mission-group-one",
+        projectGroupId: "project-group-one", canonicalProjectId: "jarvis", projectRepository: "daniels-project-space/jarvis",
+      }),
+      runtime({
+        jobId: "job-two", label: "identical mutable label", missionGroupId: "mission-group-two",
+        projectGroupId: "project-group-two", canonicalProjectId: "jarvis", projectRepository: "daniels-project-space/jarvis",
+        model: "sol", reasoningEffort: "max", modelReason: "Sol/max for integration authority review",
+      }),
+      runtime({
+        jobId: "job-done", status: "done", missionGroupId: "mission-group-one", projectGroupId: "project-group-one",
+      }),
+      runtime({
+        jobId: "job-queued", status: "pending", missionGroupId: "mission-group-one", projectGroupId: "project-group-one",
+      }),
+    ];
+    const hierarchy = buildActiveWorkHierarchy(rows, threadId);
+    expect(hierarchy.map((mission) => mission.id)).toEqual(["mission-group-one", "mission-group-two"]);
+    expect(hierarchy.map((mission) => mission.projects[0].id)).toEqual(["project-group-one", "project-group-two"]);
+    expect(hierarchy.flatMap((mission) => mission.projects.flatMap((project) => project.jobs.map((job) => job.jobId))))
+      .toEqual(["job-one", "job-two"]);
+    expect(hierarchy[0].projects[0]).toMatchObject({ canonicalProjectId: "jarvis", repository: "daniels-project-space/jarvis" });
+    expect(hierarchy[1].projects[0].jobs[0]).toMatchObject({
+      model: "sol", reasoningEffort: "max", modelReason: "Sol/max for integration authority review",
+    });
+  });
+
   it("accepts exactly 8 nodes and 28 edges, then rejects either overflow", () => {
     const input = { threadId, activeRows: [runtime()], nodes: planNodes(), edges: completeEdges(), activities: activities() };
     const projected = buildFleetSnapshot(input);
     expect(projected.fleet?.nodes).toHaveLength(8);
-    expect(projected.fleet?.edges).toHaveLength(28);
+    expect(projected.fleet?.edges).toHaveLength(FLEET_MAX_EDGES);
     expect(() => buildFleetSnapshot({ ...input, nodes: planNodes(9) })).toThrow("8 nodes");
     expect(() => buildFleetSnapshot({ ...input, edges: [...completeEdges(), { edgeId: "overflow", sourceNodeId: "a", targetNodeId: "b" }] })).toThrow("28 edges");
   });
@@ -114,6 +145,9 @@ describe("commandCenter relevance and bounded projection", () => {
     expect(result.fleet?.edges[0].readiness).toBe("delivered");
     expect(result.fleet?.nodes[0]).toMatchObject({ attempt: 2, workerRuntime: "trigger", mergeState: "merged" });
     expect(result.fleet?.nodes[1]).toMatchObject({ state: "needs_input", recoverySummary: "Merge conflict needs a decision" });
+    expect(result.fleet?.nodes[1]).toMatchObject({
+      model: "terra", reasoningEffort: "high", modelReason: "Terra/high for bounded implementation",
+    });
     expect(result.fleet?.nodes[1].controls).not.toContain("approve");
     expect(result.fleet?.nodes[1]).not.toHaveProperty("task");
     expect(result.fleet?.nodes[1]).not.toHaveProperty("log");
@@ -139,7 +173,7 @@ describe("commandCenter.snapshot indexed IO", () => {
   it("uses six bounded indexed reads for an exact persisted GoalPlan", async () => {
     const reads: Array<{ table: string; index?: string; equalities: Record<string, unknown>; limit?: number; first?: boolean; order?: string }> = [];
     const primary = runtime({ planParentMissionId: "mission-1" });
-    const responses: Record<string, any[]> = {
+    const responses: Record<string, unknown[]> = {
       jobRuntime: [primary], goalPlanNodes: planNodes(2), goalPlanEdges: completeEdges(2),
       goalHandoffs: [],
     };
@@ -169,7 +203,9 @@ describe("commandCenter.snapshot indexed IO", () => {
         },
       },
     };
-    const handler = (snapshot as unknown as { _handler: (context: unknown, args: { threadId?: string }) => Promise<any> })._handler;
+    const handler = (snapshot as unknown as {
+      _handler: (context: unknown, args: { threadId?: string }) => Promise<{ fleet: unknown }>;
+    })._handler;
     const result = await handler(ctx, { threadId });
     expect(result.fleet).toMatchObject({ id: "mission-1", planDigest: "digest", planGeneration: 1 });
     expect(reads).toEqual([

@@ -8,6 +8,7 @@ const node = (overrides: Partial<FleetNode> = {}): FleetNode => ({
   id: "surface", jobId: "job-1", label: "Unified fleet surface", agent: "paul",
   repository: "daniels-project-space/jarvis", state: "running", status: "running", stage: "testing",
   percent: 64, progress: "Running focused tests", progressAt: 1, model: "terra", reasoningEffort: "high",
+  modelReason: "Terra/high for bounded implementation and validation",
   workerRuntime: "trigger", workerRunId: "run-1", generation: 1, attempt: 1, maxAttempts: 12,
   dependencyCount: 0, dependenciesReady: 0, integrationState: "not_applicable", deliveryStatus: null,
   mergeState: "not started", recoverySummary: null, needsDaniel: false, attentionReason: null,
@@ -22,12 +23,56 @@ const work: CompactWorkSnapshot = {
     integrationState: "building", attentionCount: 0, controls: ["pause", "cancel", "steer"],
     nodes: [node()], edges: [],
   },
+  hierarchy: [{
+    id: "mission-group-1", label: "Build one live fleet surface", status: "running", phase: "building",
+    projects: [{
+      id: "project-group-1", canonicalProjectId: "jarvis", repository: "daniels-project-space/jarvis",
+      jobs: [node()],
+    }],
+  }],
 };
 
 describe("FleetCommandCenter", () => {
   it("renders nothing for an empty or hidden result", () => {
-    expect(renderToStaticMarkup(<FleetCommandCenter snapshot={{ active: null, fleet: null }} />)).toBe("");
+    expect(renderToStaticMarkup(<FleetCommandCenter snapshot={{ active: null, fleet: null, hierarchy: [] }} />)).toBe("");
     expect(renderToStaticMarkup(<FleetCommandCenter snapshot={work} hidden />)).toBe("");
+  });
+
+  it("renders one immutable mission-project hierarchy with active jobs and routing reasons only once", () => {
+    const second = node({
+      id: "second", jobId: "job-2", label: "Concurrent same-repository mission", agent: "atlas",
+      model: "sol", reasoningEffort: "max", modelReason: "Sol/max for integration authority review",
+    });
+    const completed = node({ id: "done", jobId: "job-done", label: "Legacy completed tile", state: "done", status: "done" });
+    const snapshot: CompactWorkSnapshot = {
+      ...work,
+      fleet: { ...work.fleet!, nodes: [node(), second, completed] },
+      hierarchy: [
+        work.hierarchy[0],
+        {
+          id: "mission-group-2", label: "Second mission", status: "running", phase: "reviewing",
+          projects: [{
+            id: "project-group-2", canonicalProjectId: "jarvis", repository: "daniels-project-space/jarvis",
+            jobs: [second],
+          }],
+        },
+      ],
+    };
+    const markup = renderToStaticMarkup(<FleetCommandCenter snapshot={snapshot} initialExpanded />);
+    expect(markup.match(/data-mission-group=/g)).toHaveLength(2);
+    expect(markup.match(/data-project-group=/g)).toHaveLength(2);
+    expect(markup.match(/data-active-job=/g)).toHaveLength(2);
+    expect(markup).toContain('data-mission-group="mission-group-1"');
+    expect(markup).toContain('data-mission-group="mission-group-2"');
+    expect(markup).toContain('data-project-group="project-group-1"');
+    expect(markup).toContain('data-project-group="project-group-2"');
+    expect(markup).toContain("terra/high");
+    expect(markup).toContain("Terra/high for bounded implementation and validation");
+    expect(markup).toContain("sol/max");
+    expect(markup).toContain("Sol/max for integration authority review");
+    expect(markup).not.toContain("Legacy completed tile");
+    expect(markup).not.toContain("Live fleet dependency graph");
+    expect(markup).not.toContain("Fleet workstreams");
   });
 
   it("starts as exactly one compact ownership surface with the extra-worker count", () => {

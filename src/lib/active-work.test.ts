@@ -6,24 +6,31 @@ import {
   visibleWorkSnapshot,
   type CompactWorkCache,
   type CompactWorkSnapshot,
+  type FleetNode,
 } from "./active-work";
 
 function snapshot(stage = "dispatching"): CompactWorkSnapshot {
+  const job: FleetNode = {
+    id: "surface", jobId: "job-1", label: "Paul · current repair", agent: "paul", repository: "daniels-project-space/jarvis",
+    state: "running", status: "running", stage, percent: 64, progress: "Testing", progressAt: 1,
+    model: "terra", reasoningEffort: "high", modelReason: "Terra/high for bounded implementation",
+    workerRuntime: "trigger", workerRunId: "run-1", generation: 2,
+    attempt: 1, maxAttempts: 12, dependencyCount: 0, dependenciesReady: 0, integrationState: "not_applicable",
+    deliveryStatus: null, mergeState: "not started", recoverySummary: null, needsDaniel: false, attentionReason: null,
+    controls: ["pause", "cancel", "steer"], startedAt: 1,
+  };
   return {
     active: { id: "job-1", missionId: "mission-1", label: "Paul · current repair", status: stage === "dispatching" ? "dispatching" : "running", stage, percent: stage === "dispatching" ? 2 : 64, extraCount: 2, needsDaniel: false },
     fleet: {
       id: "mission-1", goal: "Repair this request", mode: "goal", status: "running", phase: stage,
       percent: 64, repository: "daniels-project-space/jarvis", planDigest: "digest", planGeneration: 2,
       integrationState: "building", attentionCount: 0, controls: ["pause", "cancel", "steer"], edges: [],
-      nodes: [{
-        id: "surface", jobId: "job-1", label: "Paul · current repair", agent: "paul", repository: "daniels-project-space/jarvis",
-        state: "running", status: "running", stage, percent: 64, progress: "Testing", progressAt: 1,
-        model: "terra", reasoningEffort: "high", workerRuntime: "trigger", workerRunId: "run-1", generation: 2,
-        attempt: 1, maxAttempts: 12, dependencyCount: 0, dependenciesReady: 0, integrationState: "not_applicable",
-        deliveryStatus: null, mergeState: "not started", recoverySummary: null, needsDaniel: false, attentionReason: null,
-        controls: ["pause", "cancel", "steer"], startedAt: 1,
-      }],
+      nodes: [job],
     },
+    hierarchy: [{
+      id: "mission-group-1", label: "Repair this request", status: "running", phase: stage,
+      projects: [{ id: "project-group-1", canonicalProjectId: "jarvis", repository: "daniels-project-space/jarvis", jobs: [job] }],
+    }],
   };
 }
 
@@ -42,7 +49,7 @@ describe("fleet snapshot continuity", () => {
 
   it("honours an explicit empty result and never carries a snapshot across conversations", () => {
     let cache: CompactWorkCache = cacheCompactWorkSnapshot(null, "thread-a", snapshot());
-    const empty: CompactWorkSnapshot = { active: null, fleet: null };
+    const empty: CompactWorkSnapshot = { active: null, fleet: null, hierarchy: [] };
     expect(visibleWorkSnapshot(cache, "thread-a", empty)).toEqual(empty);
     cache = cacheCompactWorkSnapshot(cache, "thread-a", empty);
     expect(visibleWorkSnapshot(cache, "thread-a", undefined)).toEqual(empty);
@@ -53,6 +60,18 @@ describe("fleet snapshot continuity", () => {
     expect(retainedFleetSelection(null, snapshot())).toBeNull();
     expect(retainedFleetSelection("job-1", snapshot())).toBe("job-1");
     expect(retainedFleetSelection("job-from-old-session", snapshot())).toBeNull();
+  });
+
+  it("retains an explicit selection from a concurrent mission outside the primary fleet DAG", () => {
+    const current = snapshot();
+    current.hierarchy.push({
+      id: "mission-group-2", label: "Concurrent mission", status: "running", phase: "building",
+      projects: [{
+        id: "project-group-2", canonicalProjectId: "jarvis", repository: "daniels-project-space/jarvis",
+        jobs: [{ ...current.hierarchy[0].projects[0].jobs[0], id: "second", jobId: "job-2", label: "Second mission work" }],
+      }],
+    });
+    expect(retainedFleetSelection("job-2", current)).toBe("job-2");
   });
 
   it("classifies explicit attention states", () => {
