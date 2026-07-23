@@ -6,8 +6,10 @@ import schema from "./schema";
 import { testProjectSourceAdmission } from "./testSourceAdmission";
 import {
   evidenceProjectSourceAdmission,
+  sealProjectSourceAdmission,
   sha256Hex,
   type ProjectSourceAdmission,
+  type ProjectSourceAdmissionCore,
 } from "../src/lib/source-admission";
 import {
   ensureWorkAttempt,
@@ -237,6 +239,23 @@ async function start(
       ? {}
       : { deadlineMs: options.deadlineMs }),
   }) as StartResult;
+}
+
+async function resealAdmission(
+  admission: ProjectSourceAdmission,
+  overrides: Partial<ProjectSourceAdmissionCore>,
+): Promise<ProjectSourceAdmission> {
+  return await sealProjectSourceAdmission({
+    protocolVersion: admission.protocolVersion,
+    canonicalProjectId: admission.canonicalProjectId,
+    repository: admission.repository,
+    sourceProvider: admission.sourceProvider,
+    sourceBranch: admission.sourceBranch,
+    sourceRef: admission.sourceRef,
+    sourceHeadSha: admission.sourceHeadSha,
+    sourceObservedAt: admission.sourceObservedAt,
+    ...overrides,
+  });
 }
 
 async function supervisorState(
@@ -538,7 +557,10 @@ describe("dormant mission supervisor authority", () => {
       dispatchToken: DISPATCHER,
     };
 
-    const first = await t.mutation(supervisorApi.startV1, request);
+    const first = await t.mutation(
+      supervisorApi.startV1,
+      request,
+    ) as StartResult;
     expect(first).toMatchObject({
       replayed: false,
       wakeTicket: {
@@ -566,12 +588,16 @@ describe("dormant mission supervisor authority", () => {
     expect(state).toMatchObject({
       requestKey: request.requestKey,
       requestDigest: first.requestDigest,
+      idempotencyDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
       state: "ready",
       maxJobs: 24,
       maxDecisions: 64,
       totalJobs: 0,
       decisionCount: 0,
     });
+    expect(state?.requestDigest).toBe(
+      await sha256Hex(state?.requestPayloadJson ?? ""),
+    );
     expect(persisted.mission).toMatchObject({
       mode: "supervised",
       status: "running",
@@ -607,6 +633,216 @@ describe("dormant mission supervisor authority", () => {
       jobs: (await ctx.db.query("jobs").collect()).length,
     }));
     expect(counts).toEqual({ missions: 1, states: 1, jobs: 0 });
+  });
+
+  it("replays resealed stable scopes while preserving exact persisted authority", async () => {
+    const t = convexTest(schema, modules);
+    const [jarvis, rentals] = await Promise.all([
+      testProjectSourceAdmission(
+        "daniels-project-space/jarvis",
+        "a".repeat(40),
+      ),
+      testProjectSourceAdmission(
+        "daniels-project-space/rental-manager-v2",
+        "b".repeat(40),
+      ),
+    ]);
+    const request = {
+      requestKey: "semantic-start-replay",
+      goal: "Coordinate one stable cross-project supervisor intent",
+      profile: "durable_goal" as const,
+      repo: "daniels-project-space/jarvis",
+      desiredWorkstreams: 2,
+      requestedWorkstreams: [{
+        task: "Inspect the stable Jarvis scope and return exact evidence.",
+        repo: "daniels-project-space/jarvis",
+        model: "terra" as const,
+        agentId: "paul" as const,
+        readonly: true,
+        acceptanceCriteria: ["Return the exact bounded evidence."],
+      }],
+      acceptanceCriteria: ["Keep consequential actions gated."],
+      projectAdmissions: [jarvis, rentals],
+      dispatchToken: DISPATCHER,
+    };
+    const first = await t.mutation(
+      supervisorApi.startV1,
+      request,
+    ) as StartResult;
+    const initialState = await supervisorState(t, first.missionId);
+    expect(initialState?.requestDigest).toBe(
+      await sha256Hex(initialState?.requestPayloadJson ?? ""),
+    );
+
+    vi.advanceTimersByTime(11 * 60_000);
+    const resealed = await Promise.all([
+      resealAdmission(jarvis, { sourceObservedAt: Date.now() }),
+      resealAdmission(rentals, { sourceObservedAt: Date.now() }),
+    ]);
+    expect(resealed[0].sourceAdmissionDigest)
+      .not.toBe(jarvis.sourceAdmissionDigest);
+    expect(await t.mutation(supervisorApi.startV1, {
+      ...request,
+      projectAdmissions: [...resealed].reverse(),
+    })).toMatchObject({
+      replayed: true,
+      missionId: first.missionId,
+      stateId: first.stateId,
+      requestDigest: first.requestDigest,
+      wakeTicket: first.wakeTicket,
+    });
+
+    const movedJarvis = await resealAdmission(resealed[0], {
+      sourceHeadSha: "c".repeat(40),
+      sourceObservedAt: Date.now() + 1,
+    });
+    expect(await t.mutation(supervisorApi.startV1, {
+      ...request,
+      projectAdmissions: [movedJarvis, resealed[1]],
+    })).toMatchObject({
+      replayed: true,
+      missionId: first.missionId,
+      stateId: first.stateId,
+      requestDigest: first.requestDigest,
+    });
+
+    const persisted = await t.run(async (ctx) => ({
+      mission: await ctx.db.get(first.missionId),
+      state: await ctx.db.get(first.stateId),
+      missionCount: (await ctx.db.query("missions").collect()).length,
+      stateCount:
+        (await ctx.db.query("missionSupervisorState").collect()).length,
+    }));
+    expect(persisted.mission?.sourceHeadSha).toBe(jarvis.sourceHeadSha);
+    expect(persisted.mission?.projectAdmissions).toEqual([jarvis, rentals]);
+    expect(persisted.state).toMatchObject({
+      requestDigest: first.requestDigest,
+      idempotencyDigest: initialState?.idempotencyDigest,
+      requestPayloadJson: initialState?.requestPayloadJson,
+    });
+    expect(persisted.state?.requestDigest).toBe(
+      await sha256Hex(persisted.state?.requestPayloadJson ?? ""),
+    );
+    expect(persisted).toMatchObject({ missionCount: 1, stateCount: 1 });
+  });
+
+  it("rejects semantic replay conflicts and invalid resealed admissions", async () => {
+    const t = convexTest(schema, modules);
+    const [jarvis, rentals] = await Promise.all([
+      testProjectSourceAdmission("daniels-project-space/jarvis"),
+      testProjectSourceAdmission("daniels-project-space/rental-manager-v2"),
+    ]);
+    const request = {
+      requestKey: "semantic-start-conflicts",
+      goal: "Coordinate one exact cross-project supervisor boundary",
+      profile: "durable_goal" as const,
+      repo: "daniels-project-space/jarvis",
+      desiredWorkstreams: 2,
+      requestedWorkstreams: [{
+        task: "Inspect the exact Jarvis boundary and return evidence.",
+        repo: "daniels-project-space/jarvis",
+        model: "terra" as const,
+        agentId: "paul" as const,
+        readonly: true,
+        acceptanceCriteria: ["Return exact bounded evidence."],
+      }],
+      acceptanceCriteria: ["Keep consequential actions gated."],
+      projectAdmissions: [jarvis, rentals],
+      dispatchToken: DISPATCHER,
+    };
+    await t.mutation(supervisorApi.startV1, request);
+
+    const conflicts = [
+      {
+        ...request,
+        goal: `${request.goal} with a changed goal`,
+      },
+      {
+        ...request,
+        requestedWorkstreams: [{
+          ...request.requestedWorkstreams[0],
+          task: "Inspect a materially different workstream boundary.",
+        }],
+      },
+      {
+        ...request,
+        repo: "daniels-project-space/rental-manager-v2",
+      },
+      {
+        ...request,
+        projectAdmissions: [
+          await resealAdmission(jarvis, {
+            sourceBranch: "feature/replay-boundary",
+            sourceRef: "refs/heads/feature/replay-boundary",
+          }),
+          rentals,
+        ],
+      },
+    ];
+    for (const conflicting of conflicts) {
+      await expect(
+        t.mutation(supervisorApi.startV1, conflicting),
+      ).rejects.toThrow("conflicts with a different payload");
+    }
+
+    await expect(t.mutation(supervisorApi.startV1, {
+      ...request,
+      projectAdmissions: [{
+        ...jarvis,
+        sourceAdmissionDigest: "0".repeat(64),
+      }, rentals],
+    })).rejects.toThrow(
+      "replay requires valid canonical project admissions",
+    );
+  });
+
+  it("backfills semantic replay authority only from an exact legacy payload", async () => {
+    const t = convexTest(schema, modules);
+    const exactAdmission = await testProjectSourceAdmission();
+    const exactRequest = {
+      requestKey: "legacy-semantic-backfill",
+      goal: "Backfill one exact legacy supervisor replay safely",
+      projectAdmissions: [exactAdmission],
+      dispatchToken: DISPATCHER,
+    };
+    const exact = await t.mutation(supervisorApi.startV1, exactRequest);
+    await t.run(async (ctx) => {
+      await ctx.db.patch(exact.stateId, { idempotencyDigest: undefined });
+    });
+    expect(await t.mutation(supervisorApi.startV1, exactRequest)).toMatchObject({
+      replayed: true,
+      missionId: exact.missionId,
+      requestDigest: exact.requestDigest,
+    });
+    expect(await supervisorState(t, exact.missionId)).toMatchObject({
+      idempotencyDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      requestDigest: exact.requestDigest,
+    });
+
+    const volatileAdmission = await testProjectSourceAdmission();
+    const volatileRequest = {
+      requestKey: "legacy-semantic-reseal",
+      goal: "Reject a non-exact legacy supervisor replay safely",
+      projectAdmissions: [volatileAdmission],
+      dispatchToken: DISPATCHER,
+    };
+    const volatile = await t.mutation(
+      supervisorApi.startV1,
+      volatileRequest,
+    );
+    await t.run(async (ctx) => {
+      await ctx.db.patch(volatile.stateId, { idempotencyDigest: undefined });
+    });
+    vi.advanceTimersByTime(1_000);
+    const resealed = await resealAdmission(volatileAdmission, {
+      sourceObservedAt: Date.now(),
+    });
+    await expect(t.mutation(supervisorApi.startV1, {
+      ...volatileRequest,
+      projectAdmissions: [resealed],
+    })).rejects.toThrow("conflicts with a different payload");
+    expect((await supervisorState(t, volatile.missionId))?.idempotencyDigest)
+      .toBeUndefined();
   });
 
   it("maintains one exact command projection across controls, leases, release, input, and terminal commit", async () => {

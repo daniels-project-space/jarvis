@@ -830,6 +830,17 @@ function normalizedStartRequest(args: {
     deadlineMs,
   };
   const requestPayloadJson = canonicalJson(payload);
+  const idempotencyPayloadJson = canonicalJson({
+    ...payload,
+    projectAdmissions: projectAdmissions.map((admission) => ({
+      protocolVersion: admission.protocolVersion,
+      canonicalProjectId: admission.canonicalProjectId,
+      repository: admission.repository ?? null,
+      sourceProvider: admission.sourceProvider,
+      sourceBranch: admission.sourceBranch ?? null,
+      sourceRef: admission.sourceRef ?? null,
+    })),
+  });
   if (utf8Bytes(requestPayloadJson) > REQUEST_PAYLOAD_MAX_BYTES) {
     throw new Error(`Canonical request payload exceeds ${REQUEST_PAYLOAD_MAX_BYTES} UTF-8 bytes`);
   }
@@ -837,6 +848,7 @@ function normalizedStartRequest(args: {
     requestKey,
     payload,
     requestPayloadJson,
+    idempotencyPayloadJson,
   };
 }
 
@@ -1515,6 +1527,9 @@ export const startV1 = mutation({
     await requireDispatcher(ctx, args);
     const normalized = normalizedStartRequest(args);
     const requestDigest = await sha256Hex(normalized.requestPayloadJson);
+    const idempotencyDigest = await sha256Hex(
+      normalized.idempotencyPayloadJson,
+    );
     const prior = await ctx.db
       .query("missionSupervisorState")
       .withIndex("by_request", (q) =>
@@ -1523,8 +1538,31 @@ export const startV1 = mutation({
       .take(2);
     if (prior.length > 1) throw new Error("Supervisor request key is not unique");
     if (prior[0]) {
-      if (prior[0].requestDigest !== requestDigest) {
+      if (!await validProjectAdmissions(
+        normalized.payload.projectAdmissions,
+        { requireFresh: false },
+      )) {
+        throw new Error(
+          "Supervisor request replay requires valid canonical project admissions",
+        );
+      }
+      if (
+        prior[0].requestDigest
+          !== await sha256Hex(prior[0].requestPayloadJson)
+      ) {
+        throw new Error(
+          "Supervisor request replay references invalid persisted authority",
+        );
+      }
+      if (
+        prior[0].idempotencyDigest === undefined
+          ? prior[0].requestDigest !== requestDigest
+          : prior[0].idempotencyDigest !== idempotencyDigest
+      ) {
         throw new Error("Supervisor request key conflicts with a different payload");
+      }
+      if (prior[0].idempotencyDigest === undefined) {
+        await ctx.db.patch(prior[0]._id, { idempotencyDigest });
       }
       const mission = await ctx.db.get(prior[0].missionId);
       if (!mission || mission.mode !== "supervised") {
@@ -1543,7 +1581,7 @@ export const startV1 = mutation({
         replayed: true,
         missionId: prior[0].missionId,
         stateId: prior[0]._id,
-        requestDigest,
+        requestDigest: prior[0].requestDigest,
         deadlineAt: prior[0].deadlineAt,
         wakeTicket: isDue(prior[0], Date.now())
           ? supervisorWakeTicket(prior[0])
@@ -1609,6 +1647,7 @@ export const startV1 = mutation({
       requestKey: normalized.requestKey,
       requestDigest,
       requestPayloadJson: normalized.requestPayloadJson,
+      idempotencyDigest,
       state: "ready" as const,
       epoch: 1,
       nextDecisionSequence: 1,

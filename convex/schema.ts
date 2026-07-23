@@ -852,6 +852,7 @@ export default defineSchema({
     requestKey: v.string(),
     requestDigest: v.string(),
     requestPayloadJson: v.string(),
+    idempotencyDigest: v.optional(v.string()),
     state: missionSupervisorStateValidator,
     epoch: v.number(),
     nextDecisionSequence: v.number(),
