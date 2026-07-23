@@ -48,6 +48,8 @@ export function projectJobRuntime(job: any) {
   const active = ["running", "dispatching", "pending", "awaiting_approval", "paused", "stalled", "needs_input", "steering"].includes(String(job.status));
   return defined({
     jobId: job._id,
+    admissionProtocolVersion: typeof job.admissionProtocolVersion === "number" ? job.admissionProtocolVersion : undefined,
+    protocolHoldReason: typeof job.protocolHoldReason === "string" ? job.protocolHoldReason.slice(0, 240) : undefined,
     // The overlay needs enough context to identify the task, not the full
     // multi-thousand-character specialist prompt.
     task: String(job.task ?? "Agent work").slice(0, 600),
@@ -149,6 +151,8 @@ export function projectMissionRuntime(mission: any) {
   const createdAt = Number(mission.createdAt ?? mission._creationTime ?? Date.now());
   return defined({
     missionId: mission._id,
+    admissionProtocolVersion: typeof mission.admissionProtocolVersion === "number" ? mission.admissionProtocolVersion : undefined,
+    protocolHoldReason: typeof mission.protocolHoldReason === "string" ? mission.protocolHoldReason.slice(0, 240) : undefined,
     goal: String(mission.goal ?? "Agent mission").slice(0, 500),
     mode: String(mission.mode ?? "fleet").slice(0, 24),
     status: String(mission.status ?? "running").slice(0, 40),
@@ -169,6 +173,10 @@ export function projectMissionRuntime(mission: any) {
     planDigest: typeof mission.planDigest === "string" ? mission.planDigest.slice(0, 64) : undefined,
     planGeneration: typeof mission.planGeneration === "number" ? mission.planGeneration : undefined,
     planNodeCount: typeof mission.planNodeCount === "number" ? mission.planNodeCount : undefined,
+    materializationStatus: typeof mission.materializationStatus === "string" ? mission.materializationStatus.slice(0, 40) : undefined,
+    materializationCursor: typeof mission.materializationCursor === "number" ? mission.materializationCursor : undefined,
+    materializationWaitingApprovals: typeof mission.materializationWaitingApprovals === "number" ? mission.materializationWaitingApprovals : undefined,
+    materializationCompletedAt: typeof mission.materializationCompletedAt === "number" ? mission.materializationCompletedAt : undefined,
     sourceBranch: typeof mission.sourceBranch === "string" ? mission.sourceBranch.slice(0, 240) : undefined,
     sourceHeadSha: typeof mission.sourceHeadSha === "string" ? mission.sourceHeadSha.slice(0, 80) : undefined,
     integrationBranch: typeof mission.integrationBranch === "string" ? mission.integrationBranch.slice(0, 240) : undefined,
@@ -219,7 +227,7 @@ export async function refreshWorkGroupQueueProjection(ctx: any, groupKey: unknow
     .withIndex("by_group", (q: any) => q.eq("groupKey", groupKey)).take(2);
   if (groups.length !== 1) return null;
   const group = groups[0];
-  const head = await ctx.db.query("jobRuntime")
+  let head = await ctx.db.query("jobRuntime")
     .withIndex("by_group_dispatch_ready", (q: any) => q
       .eq("schedulingGroupKey", groupKey)
       .eq("status", "pending")
@@ -228,6 +236,22 @@ export async function refreshWorkGroupQueueProjection(ctx: any, groupKey: unknow
       .gte("nextRunAt", 0))
     .order("asc")
     .first();
+  // A compact row is not authority. If it was corrupted wholesale (including
+  // its group key), the authoritative group's durable head is still the one
+  // immutable pointer that can locate and repair it. Never discover work by
+  // scanning another group or by trusting a mutable label/latest pointer.
+  if (!head && group.queueHeadJobId) {
+    const durable: any = await ctx.db.get(group.queueHeadJobId);
+    const authority = durable ? await readJobSchedulingAuthority(ctx, durable) : null;
+    if (durable?.status === "pending" && durable.dispatchReady === true
+      && authority?.binding.schedulingGroupKey === groupKey) {
+      const repaired = projectJobRuntime(durable);
+      const existing = await jobRuntimeFor(ctx, durable._id);
+      if (existing) await ctx.db.replace(existing._id, repaired);
+      else await ctx.db.insert("jobRuntime", repaired);
+      head = repaired;
+    }
+  }
   const queueHeadNextRunAt = typeof head?.nextRunAt === "number" ? head.nextRunAt : undefined;
   const patch = head && queueHeadNextRunAt !== undefined ? {
     queueHeadJobId: head.jobId,

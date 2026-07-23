@@ -52,10 +52,9 @@ async function enqueueFixture(t: ReturnType<typeof convexTest>, input: {
     workerToken: WORKER,
     repository: input.repo,
   });
-  return await t.mutation(api.jobs.enqueue, {
+  return await t.mutation(api.jobs.enqueueV2, {
     ...input,
     missionId: String(admitted.missionId),
-    projectAdmission: admitted.projectAdmission,
   });
 }
 

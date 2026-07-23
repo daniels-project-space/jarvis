@@ -51,7 +51,7 @@ export async function testMissionAdmission(
   if (!pending) {
     pending = (async () => {
       const projectAdmission = await testProjectSourceAdmission(args.repository, args.sourceHeadSha);
-      const missionId = await t.mutation(api.missions.create, {
+      const missionId = await t.mutation(api.missions.createV2, {
         goal: `Test mission ${args.key}`,
         agentCount: 1,
         mode: "fleet",

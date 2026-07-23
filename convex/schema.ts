@@ -191,6 +191,8 @@ export default defineSchema({
   }).index("by_status", ["status", "at"]),
 
   jobs: defineTable({
+    admissionProtocolVersion: v.optional(v.number()),
+    protocolHoldReason: v.optional(v.string()),
     repo: v.optional(v.string()),
     task: v.string(),
     policyTask: v.optional(v.string()),
@@ -367,6 +369,8 @@ export default defineSchema({
   // transitions still commit to jobs and update this projection atomically.
   jobRuntime: defineTable({
     jobId: v.id("jobs"),
+    admissionProtocolVersion: v.optional(v.number()),
+    protocolHoldReason: v.optional(v.string()),
     task: v.string(),
     label: v.optional(v.string()),
     repo: v.optional(v.string()),
@@ -585,6 +589,8 @@ export default defineSchema({
   // parallel jobs; when the last one lands, a synthesis pass merges the
   // results into ONE coherent report back to Daniel.
   missions: defineTable({
+    admissionProtocolVersion: v.optional(v.number()),
+    protocolHoldReason: v.optional(v.string()),
     goal: v.string(),
     status: v.string(), // running | synthesizing | done | failed
     mode: v.optional(v.string()), // fleet | goal
@@ -598,6 +604,10 @@ export default defineSchema({
     planDigest: v.optional(v.string()),
     planGeneration: v.optional(v.number()),
     planNodeCount: v.optional(v.number()),
+    materializationStatus: v.optional(v.string()),
+    materializationCursor: v.optional(v.number()),
+    materializationWaitingApprovals: v.optional(v.number()),
+    materializationCompletedAt: v.optional(v.number()),
     controlRequested: v.optional(v.string()),
     controlRequestedAt: v.optional(v.number()),
     steer: v.optional(v.string()),
@@ -684,6 +694,8 @@ export default defineSchema({
   // query, so a job heartbeat cannot amplify into a reread of those payloads.
   missionRuntime: defineTable({
     missionId: v.id("missions"),
+    admissionProtocolVersion: v.optional(v.number()),
+    protocolHoldReason: v.optional(v.string()),
     goal: v.string(),
     mode: v.string(),
     status: v.string(),
@@ -704,6 +716,10 @@ export default defineSchema({
     planDigest: v.optional(v.string()),
     planGeneration: v.optional(v.number()),
     planNodeCount: v.optional(v.number()),
+    materializationStatus: v.optional(v.string()),
+    materializationCursor: v.optional(v.number()),
+    materializationWaitingApprovals: v.optional(v.number()),
+    materializationCompletedAt: v.optional(v.number()),
     sourceBranch: v.optional(v.string()),
     sourceHeadSha: v.optional(v.string()),
     integrationBranch: v.optional(v.string()),

@@ -4,6 +4,7 @@ import { controlMutation, controlQuery } from "@/lib/control-session";
 import { routeGoal } from "@/lib/goal-mode";
 import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
 import { resolveProjectSourceAdmission } from "@/lib/source-admission-server";
+import { admissionMutationName, v2AdmissionEnabled } from "@/lib/mission-protocol-rollout";
 
 export const runtime = "nodejs";
 
@@ -18,25 +19,28 @@ export async function POST(req: NextRequest) {
   }
   const credentials = controlCredentials(actor);
   const route = routeGoal(goal, body?.repo ? String(body.repo) : undefined);
+  const protocolV2 = v2AdmissionEnabled();
   let projectAdmission;
-  try {
-    projectAdmission = await resolveProjectSourceAdmission(route.primaryRepo);
-  } catch (error) {
-    return Response.json({
-      ok: false,
-      error: error instanceof Error ? error.message : "Project source admission failed.",
-    }, { status: 400 });
+  if (protocolV2) {
+    try {
+      projectAdmission = await resolveProjectSourceAdmission(route.primaryRepo);
+    } catch (error) {
+      return Response.json({
+        ok: false,
+        error: error instanceof Error ? error.message : "Project source admission failed.",
+      }, { status: 400 });
+    }
   }
   const originThreadId = String(
     await controlQuery("ui:getActiveThread", credentials).catch(() => "main"),
   ) || "main";
-  const created: any = await controlMutation("goalMode:create", {
+  const created: any = await controlMutation(admissionMutationName("goal"), {
     ...credentials,
     goal,
     route: route.kind,
     routeReason: route.reason,
-    primaryRepo: projectAdmission.repository,
-    projectAdmission,
+    primaryRepo: projectAdmission?.repository ?? route.primaryRepo,
+    ...(protocolV2 ? { projectAdmission } : {}),
     infrastructureContext: route.infrastructureContext,
     originThreadId,
     priority: 98,
@@ -55,6 +59,13 @@ export async function POST(req: NextRequest) {
     value: JSON.stringify({ missionId, mode: "goal" }),
     title: `goal · ${goal.slice(0, 44)}`,
   }).catch(() => null);
-  const woken = await wakeAgentFleet(`goal:${missionId}`).catch(() => false);
-  return Response.json({ ok: true, missionId, route: route.kind, woken }, { status: 201 });
+  const woken = created?.held ? false : await wakeAgentFleet(`goal:${missionId}`).catch(() => false);
+  return Response.json({
+    ok: true,
+    missionId,
+    route: route.kind,
+    woken,
+    held: created?.held === true,
+    holdReason: created?.held ? String(created.reason ?? "protocol_v1_admission_held") : undefined,
+  }, { status: created?.held ? 202 : 201 });
 }

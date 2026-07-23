@@ -60,7 +60,12 @@ export function workGroupAuthority(job: WorkLedgerIdentity): WorkGroupAuthority 
   const canonicalProjectId = typeof job.canonicalProjectId === "string" && job.canonicalProjectId.trim()
     ? job.canonicalProjectId.trim()
     : repository ? "unadmitted" : "evidence";
-  const executableProject = `${String(job.missionId ?? admittedMission)}:project:${canonicalProjectId}`;
+  // missionId is itself the immutable executable child-group ledger id. For a
+  // cross-project Goal plan it names the repository child mission; for a
+  // single-project mission the top-level mission is also its project group.
+  // The canonical project/repository remain separate signed binding fields,
+  // so no human label or synthetic "latest project" alias participates.
+  const executableProject = String(job.missionId ?? admittedMission);
   const repositoryScope = repository ?? "read-only-evidence";
   return {
     missionGroupId: admittedMission,

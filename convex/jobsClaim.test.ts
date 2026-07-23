@@ -31,11 +31,11 @@ async function specialistFixture(policy: Policy = "manual", goalStage?: "validat
     repository: "daniels-project-space/jarvis",
     sourceHeadSha: BASE,
   });
-  const jobId = await t.mutation(api.jobs.enqueue, {
+  const jobId = await t.mutation(api.jobs.enqueueV2, {
     repo: "daniels-project-space/jarvis", task: "verified repository work",
-    readonly: policy === "read_only", branch: policy === "read_only" ? "jarvis/reviewed" : undefined,
+    readonly: policy === "read_only",
     maxAttempts: 3, goalStage, missionId: String(admitted.missionId),
-    projectAdmission: admitted.projectAdmission, workerToken: WORKER,
+    workerToken: WORKER,
   });
   const authority = await t.run(async (ctx) => {
     const job: any = await ctx.db.get(jobId);

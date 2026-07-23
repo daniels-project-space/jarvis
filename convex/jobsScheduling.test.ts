@@ -43,12 +43,11 @@ async function enqueue(t: SchedulerTest, options: {
     workerToken: WORKER,
     repository: options.repo,
   });
-  return await t.mutation(api.jobs.enqueue, {
+  return await t.mutation(api.jobs.enqueueV2, {
     task: options.readonly === false
       ? "Implement the isolated scheduler fixture and verify its exact branch lineage."
       : "Inspect the isolated scheduler fixture and report bounded evidence.",
     missionId: String(admitted.missionId),
-    projectAdmission: admitted.projectAdmission,
     priority: options.priority ?? 50,
     readonly: options.readonly ?? true,
     repo: options.repo,

@@ -1120,7 +1120,7 @@ export const defer = mutation({
       if (prior?.integrationAttemptId === attempt._id) {
         nextDeliveryGeneration += 1;
         nextDeliveryId = await ctx.db.insert("deliveryAttempts", {
-          jobId: job._id, integrationAttemptId: attempt._id, sourceWorkAttempt: attempt.workAttempt,
+          jobId: job._id, sourceWorkAttempt: attempt.workAttempt,
           generation: nextDeliveryGeneration, policy: "mission_integration", status: "checkpointed",
           parentDeliveryAttemptId: prior._id, ...carriedIntegrationDelivery(prior),
           heartbeatAt: now, retries: 0,

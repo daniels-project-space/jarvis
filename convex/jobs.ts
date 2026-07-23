@@ -49,7 +49,7 @@ import {
   selectFairWork,
   writeLineageKey,
 } from "../src/lib/work-scheduler";
-import { admissionForRepository, projectSourceAdmissionValidator } from "./sourceAdmission";
+import { admissionForRepository } from "./sourceAdmission";
 import { WORK_ORDER_MACHINE_RUNTIME, WORK_ORDER_MACHINE_TEMPLATE } from "../src/lib/work-order-revision";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
@@ -289,7 +289,40 @@ async function ensureAttempt(ctx: any, jobId: any, attempt: number, status: stri
   return await ensureWorkAttempt(ctx, job, attempt, status, now, patch);
 }
 
-const enqueueArgs = {
+const legacyEnqueueArgs = {
+  task: v.string(),
+  repo: v.optional(v.string()),
+  readonly: v.optional(v.boolean()),
+  model: v.optional(v.string()),
+  reasoningEffort: v.optional(v.string()),
+  mcp: v.optional(v.array(v.string())),
+  incidentId: v.optional(v.string()),
+  retried: v.optional(v.boolean()),
+  missionId: v.optional(v.string()),
+  label: v.optional(v.string()),
+  originThreadId: v.optional(v.string()),
+  originTurnId: v.optional(v.string()),
+  visibility: v.optional(v.union(v.literal("conversation"), v.literal("system"))),
+  agentId: v.optional(v.string()),
+  risk: v.optional(v.string()),
+  priority: v.optional(v.number()),
+  approvalRequired: v.optional(v.boolean()),
+  acceptanceCriteria: v.optional(v.array(v.string())),
+  modelReason: v.optional(v.string()),
+  parentJobId: v.optional(v.string()),
+  dependsOn: v.optional(v.array(v.string())),
+  goalStage: v.optional(v.string()),
+  goalWorkstreamId: v.optional(v.string()),
+  goalWave: v.optional(v.number()),
+  maxAttempts: v.optional(v.number()),
+  branch: v.optional(v.string()),
+  checkpoint: v.optional(v.string()),
+  authTokenHash: v.optional(v.string()),
+  dispatchToken: v.optional(v.string()),
+  workerToken: v.optional(v.string()),
+};
+
+const enqueueV2Args = {
   task: v.string(),
   repo: v.optional(v.string()),
   readonly: v.optional(v.boolean()),
@@ -299,7 +332,6 @@ const enqueueArgs = {
   incidentId: v.optional(v.string()),
   retried: v.optional(v.boolean()),
   missionId: v.string(),
-  projectAdmission: projectSourceAdmissionValidator,
   label: v.optional(v.string()),
   originThreadId: v.optional(v.string()),
   originTurnId: v.optional(v.string()),
@@ -323,7 +355,65 @@ const enqueueArgs = {
 };
 
 export const enqueue = mutation({
-  args: enqueueArgs,
+  args: legacyEnqueueArgs,
+  handler: async (ctx, a) => {
+    await requireDispatcher(ctx, a);
+    const now = Date.now();
+    const repo = a.repo === undefined ? undefined : canonicalizeRepository(a.repo, { allowShortName: true }) ?? undefined;
+    if (a.repo !== undefined && !repo) {
+      throw new Error("Repository must be an owner/repo slug or credential-free https://github.com/owner/repo(.git) URL");
+    }
+    const task = exactTextWorkOrder(a.task);
+    const id = await ctx.db.insert("jobs", {
+      task,
+      repo,
+      readonly: Boolean(a.readonly || !repo),
+      model: a.model ? normalizeWorkModelTier(a.model) : undefined,
+      reasoningEffort: a.reasoningEffort,
+      mcp: a.mcp,
+      incidentId: a.incidentId,
+      retried: a.retried,
+      missionId: a.missionId,
+      label: a.label?.slice(0, 80),
+      originThreadId: a.originThreadId,
+      originTurnId: a.originTurnId,
+      visibility: a.visibility,
+      agentId: a.agentId,
+      risk: a.risk,
+      priority: Math.max(0, Math.min(100, a.priority ?? 50)),
+      acceptanceCriteria: a.acceptanceCriteria,
+      modelReason: a.modelReason,
+      parentJobId: a.parentJobId,
+      dependsOn: a.dependsOn,
+      goalStage: a.goalStage,
+      goalWorkstreamId: a.goalWorkstreamId,
+      goalWave: a.goalWave,
+      checkpoint: a.checkpoint,
+      status: "protocol_held",
+      stage: "protocol_hold",
+      percent: 0,
+      attempt: 1,
+      maxAttempts: Math.max(1, Math.min(48, a.maxAttempts ?? 12)),
+      schedulingBound: false,
+      dispatchReady: false,
+      admissionProtocolVersion: 1,
+      protocolHoldReason: "protocol_v1_admission_held",
+      createdAt: now,
+    });
+    const held = await ctx.db.get(id);
+    if (held) await upsertJobRuntime(ctx, held);
+    await ctx.db.insert("workEvents", {
+      jobId: String(id), missionId: a.missionId, agentId: a.agentId,
+      type: "protocol_hold", message: "Legacy job admission held before execution authority",
+      stage: "protocol_hold", percent: 0,
+      data: { reason: "protocol_v1_admission_held", requestedBranchIgnored: Boolean(a.branch) }, createdAt: now,
+    });
+    return id;
+  },
+});
+
+export const enqueueV2 = mutation({
+  args: enqueueV2Args,
   handler: async (ctx, a) => {
     await requireDispatcher(ctx, a);
     const { authTokenHash: _authTokenHash, dispatchToken: _dispatchToken, workerToken: _workerToken, ...input } = a;
@@ -337,8 +427,7 @@ export const enqueue = mutation({
     const missionId = ctx.db.normalizeId("missions", input.missionId);
     const mission: any = missionId ? await ctx.db.get(missionId) : null;
     const admittedProject = admissionForRepository(mission?.projectAdmissions, repo);
-    if (!mission || !admittedProject
-      || admittedProject.sourceAdmissionDigest !== input.projectAdmission.sourceAdmissionDigest) {
+    if (!mission || mission.admissionProtocolVersion !== 2 || !admittedProject) {
       throw new Error("Job project admission is not inherited from its immutable mission group");
     }
     const approval = workApprovalPolicy(normalizedInput);
@@ -346,6 +435,8 @@ export const enqueue = mutation({
     const status = approvalRequired ? "awaiting_approval" : "pending";
     const id = await insertJobWithRuntime(ctx, {
       ...normalizedInput,
+      admissionProtocolVersion: 2,
+      projectAdmission: admittedProject,
       requireFreshSourceAdmission: true,
       model: input.model ? normalizeWorkModelTier(input.model) : undefined,
       label: input.label?.slice(0, 80),

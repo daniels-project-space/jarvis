@@ -62,6 +62,7 @@ import {
 } from "./github-delivery";
 import { wakeAgentFleet } from "../lib/agent-fleet-dispatch";
 import { BACKGROUND_CONCURRENCY_LIMIT, BACKGROUND_QUEUE } from "../lib/work-scheduler";
+import { admissionMutationName, v2AdmissionEnabled } from "../lib/mission-protocol-rollout";
 import { upstreamEvidencePrompt } from "../lib/upstream-evidence";
 import { drainControlPlaneMigration } from "./control-plane-migration";
 import { ExecutionLeaseMonitor } from "./execution-lease-monitor";
@@ -510,17 +511,21 @@ async function goalPlanProjectAdmissions(
   plan: GoalPlan,
   primaryRepo: string | undefined,
   token: string,
+  alreadyAdmitted: readonly string[] = [],
 ): Promise<ProjectSourceAdmission[]> {
+  const existing = new Set(alreadyAdmitted);
   const repositories = new Set<string>();
   let needsEvidence = false;
   for (const stream of plan.workstreams) {
     const requested = stream.repo || (!stream.readonly ? primaryRepo || plan.primaryRepo : undefined);
-    if (requested) repositories.add(requested);
-    else needsEvidence = true;
+    if (requested) {
+      const canonical = canonicalizeRepository(requested, { allowShortName: true });
+      if (canonical && !existing.has(canonical)) repositories.add(canonical);
+    } else if (!existing.has("evidence")) needsEvidence = true;
   }
   const admitted = await Promise.all([...repositories].map((repository) =>
     observeGitHubProjectSource({ repository, token: token || undefined })));
-  if (needsEvidence || admitted.length === 0) admitted.push(await evidenceProjectSourceAdmission());
+  if (needsEvidence) admitted.push(await evidenceProjectSourceAdmission());
   return admitted;
 }
 
@@ -598,26 +603,24 @@ export async function runAgentMaintenance() {
     repairs = Number(healer?.claims?.length ?? 0);
     for (const inc of healer?.claims ?? []) {
       const repo = inc.app && inc.app !== "jarvis" ? inc.app : "jarvis";
-      const projectAdmission = await observeGitHubProjectSource({
-        repository: repo,
-        token: process.env.GITHUB_TOKEN || undefined,
-      });
+      const protocolV2 = v2AdmissionEnabled();
+      const projectAdmission = protocolV2
+        ? await observeGitHubProjectSource({ repository: repo, token: process.env.GITHUB_TOKEN || undefined })
+        : undefined;
       const originThreadId = await chatThread();
-      const missionId = await convexMutation("missions:create", {
+      const missionId = await convexMutation(admissionMutationName("mission"), {
         goal: `Repair ${String(inc.message ?? inc.signature ?? "production incident")}`.slice(0, 500),
         agentCount: 1,
-        mode: "single",
-        projectAdmissions: [projectAdmission],
+        ...(protocolV2 ? { mode: "single", projectAdmissions: [projectAdmission!] } : {}),
         originThreadId,
         managerAgentId: "jarvis",
         priority: 90,
         risk: "high",
       });
-      const repairJobId = await convexMutation("jobs:enqueue", {
+      const repairJobId = await convexMutation(admissionMutationName("job"), {
         task: repairPrompt(inc, repo),
-        repo: projectAdmission.repository,
+        repo: projectAdmission?.repository ?? repo,
         missionId: String(missionId),
-        projectAdmission,
         model: "sol",
         modelReason: "Paul uses the highest tier for production root-cause repair",
         agentId: "paul",
@@ -822,6 +825,15 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           advanced += 1;
           continue;
         }
+        if (claim.kind === "materialize") {
+          const result: any = await convexMutation("goalMode:materializePlanBatch", {
+            id: claim.missionId,
+            planDigest: String(claim.planDigest),
+          }).catch(() => null);
+          if (!result?.advanced) break;
+          advanced += 1;
+          continue;
+        }
         if (claim.kind === "plan") {
           let plan: GoalPlan;
           try {
@@ -842,14 +854,30 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           let externalRun: { kind: string; id: string; slug?: string } | undefined;
           let handoffError: unknown;
           const handoff = await withGoalAdvanceRenewal(claim, async () => {
-            const projectAdmissions = await goalPlanProjectAdmissions(plan, claim.primaryRepo, token);
+            const protocolV2 = v2AdmissionEnabled();
+            if (protocolV2) {
+              const projectAdmissions = await goalPlanProjectAdmissions(
+                plan,
+                claim.primaryRepo,
+                token,
+                Array.isArray(claim.admittedProjectScopes) ? claim.admittedProjectScopes.map(String) : [],
+              );
+              if (projectAdmissions.length) {
+                const admission: any = await convexMutation("goalMode:admitPlanProjectsV2", {
+                  id: claim.missionId,
+                  expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
+                  ...advanceFence(claim),
+                  projectAdmissions,
+                });
+                if (!admission?.admitted) throw new Error("Goal plan project admission became stale");
+              }
+            }
             if (claim.route === "app_factory") externalRun = await startAppFactoryGoal(plan, String(claim.missionId));
-            return await convexMutation("goalMode:recordPlan", {
+            return await convexMutation(protocolV2 ? "goalMode:recordPlanV2" : "goalMode:recordPlan", {
               id: claim.missionId,
               expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
               ...advanceFence(claim),
               plan,
-              projectAdmissions,
               externalRun,
             });
           }).catch((error) => { handoffError = error; return { live: true, value: null }; });
@@ -871,6 +899,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               ? `I split the cross-project plan into ${Number(result.childMissionIds?.length ?? result.repositories?.length ?? 0)} durable repository-scoped child missions. Each now has its own integration head and controller queue under the parent goal.`
               : result.external
               ? `I have locked the Sol architecture and handed the build to App Factory ${externalRun?.slug ? `as ${externalRun.slug}` : ""}. I am monitoring every stage and will stop at its human gates.`
+              : result.materializing
+              ? `I have locked the Sol architecture. Its immutable DAG is being materialized in bounded durable batches before any Terra workspace starts.`
               : `I have locked the Sol architecture. ${result.jobs} Terra/high sessions are now working on isolated refs; the controller will serialize their signed receipts before the final Sol review.`;
             await convexMutation("chatQueue:postAssistant", { threadId: thread, text: line }).catch(() => {});
           }

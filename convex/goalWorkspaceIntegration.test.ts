@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { convexTest } from "convex-test";
+import { convexTest, type TestConvex } from "convex-test";
 import { api } from "./_generated/api";
 import {
   expandIntegrationEffectManifest,
@@ -33,29 +33,54 @@ const CLAUSE_BOUNDARY_AND_LIFECYCLE_EXPLOITS = [
   "Review Sandbox.get({ resume: false }); trade the selected shares.",
   "Ensure the failed final delete remains scheduled against customer records in Convex.",
 ] as const;
+type GoalTest = TestConvex<typeof schema>;
 
 beforeEach(() => { process.env.JARVIS_WORKER_TOKEN = TOKEN; vi.useRealTimers(); });
 afterEach(() => { delete process.env.JARVIS_WORKER_TOKEN; vi.useRealTimers(); });
 
-async function createGoalFixture(t: ReturnType<typeof convexTest>, args: any) {
-  return await t.mutation(api.goalMode.create, {
+async function createGoalFixture(t: GoalTest, args: any) {
+  return await t.mutation(api.goalMode.createV2, {
     ...args,
     projectAdmission: await testProjectSourceAdmission(args.primaryRepo, BASE),
   });
 }
 
-async function recordPlanFixture(t: ReturnType<typeof convexTest>, args: any) {
+async function recordPlanFixture(t: GoalTest, args: any) {
   const mission: any = await t.run(async (ctx) => ctx.db.get(args.id));
+  const admittedScopes = new Set((mission?.projectAdmissions ?? []).map((admission: any) => admission.repository ?? "evidence"));
   const repositories = new Set<string | undefined>();
   for (const stream of args.plan?.workstreams ?? []) {
     repositories.add(stream.repo || (!stream.readonly ? mission?.primaryRepo || args.plan?.primaryRepo : undefined));
   }
-  const projectAdmissions = await Promise.all([...repositories].map((repository) =>
-    testProjectSourceAdmission(repository, BASE)));
-  return await t.mutation(api.goalMode.recordPlan, { ...args, projectAdmissions });
+  const projectAdmissions = await Promise.all([...repositories]
+    .filter((repository) => !admittedScopes.has(repository ?? "evidence"))
+    .map((repository) => testProjectSourceAdmission(repository, BASE)));
+  if (projectAdmissions.length) {
+    const admission: any = await t.mutation(api.goalMode.admitPlanProjectsV2, {
+      id: args.id,
+      expectedAdvanceAttempt: args.expectedAdvanceAttempt,
+      advanceLeaseOwner: args.advanceLeaseOwner,
+      advanceLeaseToken: args.advanceLeaseToken,
+      advanceLeaseVersion: args.advanceLeaseVersion,
+      projectAdmissions,
+      workerToken: args.workerToken,
+    });
+    if (!admission?.admitted) throw new Error("fixture project admission became stale");
+  }
+  const recorded: any = await t.mutation(api.goalMode.recordPlanV2, args);
+  if (!recorded?.materializing) return recorded;
+  let materialized: any = null;
+  for (let batch = 0; batch < 4; batch += 1) {
+    materialized = await t.mutation(api.goalMode.materializePlanBatch, {
+      id: args.id, planDigest: recorded.planDigest, workerToken: args.workerToken,
+    });
+    if (materialized?.complete) break;
+  }
+  if (!materialized?.complete) throw new Error("fixture GoalPlan did not finish bounded materialization");
+  return { ...recorded, ...materialized };
 }
 
-async function claimIntegrationFixture(t: ReturnType<typeof convexTest>, args: any) {
+async function claimIntegrationFixture(t: GoalTest, args: any) {
   const row: any = await t.run(async (ctx) => ctx.db.get(args.id));
   return await t.mutation(api.goalIntegration.claim, {
     ...args,
@@ -63,7 +88,7 @@ async function claimIntegrationFixture(t: ReturnType<typeof convexTest>, args: a
   });
 }
 
-async function jobAuthorityDigest(t: ReturnType<typeof convexTest>, jobId: any, attempt: number) {
+async function jobAuthorityDigest(t: GoalTest, jobId: any, attempt: number) {
   return await t.run(async (ctx) => String((await ctx.db.query("workAttempts")
     .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", attempt)).first())?.authorityDigest ?? ""));
 }
@@ -127,7 +152,7 @@ async function splitGoal() {
   return { ...f, plan, result, childIds: parent.splitChildMissionIds as any[] };
 }
 
-async function dispatch(t: ReturnType<typeof convexTest>, count: number, prefix: string) {
+async function dispatch(t: GoalTest, count: number, prefix: string) {
   const batches = await Promise.all([
     t.mutation(api.jobs.reserveDispatchBatch, { limit: count, reason: `${prefix}-a`, workerToken: TOKEN }),
     t.mutation(api.jobs.reserveDispatchBatch, { limit: count, reason: `${prefix}-b`, workerToken: TOKEN }),
@@ -142,7 +167,7 @@ async function dispatch(t: ReturnType<typeof convexTest>, count: number, prefix:
   })));
 }
 
-async function review(t: ReturnType<typeof convexTest>, job: any, workerRunId: string, head: string, tree: string) {
+async function review(t: GoalTest, job: any, workerRunId: string, head: string, tree: string) {
   const authorityDigest = await jobAuthorityDigest(t, job._id, 1);
   const result = `specialist result for ${job.goalWorkstreamId}`;
   const note = `review passed for ${job.workerBranch}`;
@@ -164,7 +189,7 @@ async function review(t: ReturnType<typeof convexTest>, job: any, workerRunId: s
   })).toBe(true);
 }
 
-async function finalizeReadonly(t: ReturnType<typeof convexTest>, job: any, result: string, note: string) {
+async function finalizeReadonly(t: GoalTest, job: any, result: string, note: string) {
   const authorityDigest = await jobAuthorityDigest(t, job._id, Number(job.attempt ?? 1));
   expect(await t.mutation(api.jobs.finalize, {
     jobId: job._id, expectedAttempt: Number(job.attempt ?? 1), authorityDigest, status: "done",
@@ -173,7 +198,7 @@ async function finalizeReadonly(t: ReturnType<typeof convexTest>, job: any, resu
   })).toBe(true);
 }
 
-async function finishIntegration(t: ReturnType<typeof convexTest>, row: any, claim: any, head: string, tree: string, suffix: string) {
+async function finishIntegration(t: GoalTest, row: any, claim: any, head: string, tree: string, suffix: string) {
   const fence = { id: row._id, controllerRunId: claim.controllerRunId, leaseOwner: claim.leaseOwner,
     leaseToken: claim.leaseToken, leaseVersion: claim.leaseVersion,
     authorityDigest: row.authorityDigest, workerToken: TOKEN };

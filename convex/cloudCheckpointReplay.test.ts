@@ -28,10 +28,9 @@ async function runningFixture(
     key: options.task,
     workerToken: WORKER,
   });
-  const jobId = await t.mutation(api.jobs.enqueue, {
+  const jobId = await t.mutation(api.jobs.enqueueV2, {
     task: options.task,
     missionId: String(admitted.missionId),
-    projectAdmission: admitted.projectAdmission,
     maxAttempts: options.maxAttempts,
     workerToken: WORKER,
   });
