@@ -13,6 +13,30 @@ const projectSourceAdmission = v.object({
   sourceAdmissionDigest: v.string(),
 });
 
+const missionSupervisorStateValidator = v.union(
+  v.literal("ready"),
+  v.literal("leased"),
+  v.literal("waiting"),
+  v.literal("paused"),
+  v.literal("needs_input"),
+  v.literal("terminal"),
+);
+
+const missionSupervisorDecisionKindValidator = v.union(
+  v.literal("delegate"),
+  v.literal("wait"),
+  v.literal("request_input"),
+  v.literal("replan"),
+  v.literal("synthesize"),
+  v.literal("fail"),
+);
+
+const missionSupervisorModelTierValidator = v.union(
+  v.literal("luna"),
+  v.literal("terra"),
+  v.literal("sol"),
+);
+
 // JARVIS memory index. Full markdown bodies live in R2 (bucket `jarvis`);
 // Convex holds the reactive index for search/recall. Multi-stage consolidation
 // (daily -> weekly -> long-term) is driven by Trigger.dev tasks.
@@ -234,6 +258,11 @@ export default defineSchema({
     incidentId: v.optional(v.string()), // set on self-repair jobs → resolves the incident on success
     retried: v.optional(v.boolean()), // failed once already — no second retry
     missionId: v.optional(v.string()), // part of an orchestrated fleet
+    // Additive provenance only. Future supervisor mutations bind each admitted
+    // job to the exact epoch and immutable decision receipt that created it.
+    supervisorEpoch: v.optional(v.number()),
+    supervisorDecisionKey: v.optional(v.string()),
+    supervisorJobOrdinal: v.optional(v.number()),
     label: v.optional(v.string()), // short fleet-view label ("pricing research")
     progress: v.optional(v.string()), // live activity line the runner streams
     log: v.optional(v.string()), // rolling CLI session transcript tail (pill live view)
@@ -799,6 +828,81 @@ export default defineSchema({
     .index("by_status", ["status", "createdAt"])
     .index("by_external_control", ["externalControlRequested", "createdAt"])
     .index("by_external_revision", ["externalRevisionRequested", "createdAt"]),
+
+  // Compact, authoritative scheduler state for a future re-entrant Mastra
+  // supervisor. Convex owns every lease/revision fence; model calls remain
+  // stateless workers operating on one bounded snapshot at a time.
+  missionSupervisorState: defineTable({
+    protocolVersion: v.literal(1),
+    missionId: v.id("missions"),
+    requestKey: v.string(),
+    requestDigest: v.string(),
+    requestPayloadJson: v.string(),
+    state: missionSupervisorStateValidator,
+    epoch: v.number(),
+    nextDecisionSequence: v.number(),
+    inputRevision: v.number(),
+    handledInputRevision: v.number(),
+    dirtyJobIds: v.array(v.id("jobs")),
+    nextTickAt: v.optional(v.number()),
+    leaseOwner: v.optional(v.string()),
+    leaseToken: v.optional(v.string()),
+    leaseVersion: v.number(),
+    leaseHeartbeatAt: v.optional(v.number()),
+    leaseUntil: v.optional(v.number()),
+    lastSnapshotDigest: v.optional(v.string()),
+    lastDecisionKey: v.optional(v.string()),
+    lastDecisionDigest: v.optional(v.string()),
+    lastDecisionAt: v.optional(v.number()),
+    totalJobs: v.number(),
+    maxJobs: v.number(),
+    decisionCount: v.number(),
+    maxDecisions: v.number(),
+    deadlineAt: v.number(),
+    consecutiveFailures: v.number(),
+    lastErrorCode: v.optional(v.string()),
+    lastErrorAt: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_mission", ["missionId"])
+    .index("by_request", ["requestKey"])
+    .index("by_state_due", ["state", "nextTickAt"])
+    .index("by_state_lease", ["state", "leaseUntil"]),
+
+  // Append-only model decision receipts. A future commit mutation checks this
+  // ledger before its live lease so a lost response can replay the exact prior
+  // result without creating duplicate jobs, attention items, or chat delivery.
+  missionSupervisorDecisions: defineTable({
+    protocolVersion: v.literal(1),
+    missionId: v.id("missions"),
+    epoch: v.number(),
+    sequence: v.number(),
+    decisionKey: v.string(),
+    observedInputRevision: v.number(),
+    snapshotDigest: v.string(),
+    kind: missionSupervisorDecisionKindValidator,
+    payloadJson: v.string(),
+    payloadDigest: v.string(),
+    rationale: v.string(),
+    modelProvider: v.literal("codex-subscription"),
+    modelTier: missionSupervisorModelTierValidator,
+    modelId: v.string(),
+    reasoningEffort: v.string(),
+    tierReason: v.string(),
+    supervisorPromptVersion: v.string(),
+    leaseVersion: v.number(),
+    triggerRunId: v.string(),
+    deploymentVersion: v.optional(v.string()),
+    createdJobIds: v.array(v.id("jobs")),
+    attentionItemId: v.optional(v.id("attentionItems")),
+    chatMessageIds: v.array(v.id("chatMessages")),
+    resultState: v.string(),
+    nextTickAt: v.optional(v.number()),
+    createdAt: v.number(),
+  })
+    .index("by_key", ["decisionKey"])
+    .index("by_mission_epoch_sequence", ["missionId", "epoch", "sequence"]),
 
   // Resumable cursors make the legacy backfill and policy repairs one-time,
   // bounded work. Once both cursors finish, minute maintenance reads this one

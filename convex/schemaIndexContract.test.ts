@@ -42,3 +42,38 @@ describe("goalPlanNodes schema index contract", () => {
     ])).toThrow(/duplicates by_parent_generation/);
   });
 });
+
+describe("mission supervisor schema index contract", () => {
+  const schema = readFileSync(new URL("./schema.ts", import.meta.url), "utf8");
+
+  it("keeps one compact current-state lookup and two bounded due-lease cursors", () => {
+    const indexes = indexesForTable(
+      schema,
+      "missionSupervisorState",
+      "missionSupervisorDecisions",
+    );
+    expect(indexes).toEqual([
+      { name: "by_mission", fields: ["missionId"] },
+      { name: "by_request", fields: ["requestKey"] },
+      { name: "by_state_due", fields: ["state", "nextTickAt"] },
+      { name: "by_state_lease", fields: ["state", "leaseUntil"] },
+    ]);
+    expect(() => assertUniqueFieldTuples(indexes)).not.toThrow();
+  });
+
+  it("keeps decision replay and ordered mission history on distinct tuples", () => {
+    const indexes = indexesForTable(
+      schema,
+      "missionSupervisorDecisions",
+      "controlPlaneMigrations",
+    );
+    expect(indexes).toEqual([
+      { name: "by_key", fields: ["decisionKey"] },
+      {
+        name: "by_mission_epoch_sequence",
+        fields: ["missionId", "epoch", "sequence"],
+      },
+    ]);
+    expect(() => assertUniqueFieldTuples(indexes)).not.toThrow();
+  });
+});

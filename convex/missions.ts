@@ -8,6 +8,13 @@ import { projectSourceAdmissionValidator, validProjectAdmissions } from "./sourc
 
 const SYNTHESIS_LEASE_MS = 20 * 60 * 1000;
 
+// Legacy fleet synthesis is an explicit allowlist. Goal Mode and every future
+// supervisor protocol own their own leases, receipts, and terminal delivery;
+// they must never enter this historical raw-result synthesizer by omission.
+export function isLegacySynthesisMode(mode: unknown): mode is undefined | "fleet" | "single" {
+  return mode === undefined || mode === "fleet" || mode === "single";
+}
+
 function synthesisPayload(mission: any, jobs: any[], attempt: number) {
   return {
     id: mission._id,
@@ -267,7 +274,7 @@ export const checkComplete = mutation({
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const m = await ctx.db.get(a.id);
-    if (!m || m.status !== "running" || m.mode === "goal") return null;
+    if (!m || m.status !== "running" || !isLegacySynthesisMode(m.mode)) return null;
     const jobs = await ctx.db
       .query("jobs")
       .withIndex("by_mission", (q: any) => q.eq("missionId", a.id))
@@ -307,9 +314,10 @@ export const claimReady = mutation({
       .order("asc")
       .take(30);
     for (const activity of synthesizing) {
-      if (activity.mode === "goal" || activity.updatedAt + SYNTHESIS_LEASE_MS > now) continue;
+      if (!isLegacySynthesisMode(activity.mode) || activity.updatedAt + SYNTHESIS_LEASE_MS > now) continue;
       const mission = await ctx.db.get(activity.missionId);
-      if (!mission || mission.status !== "synthesizing" || (mission.synthesisLeaseUntil ?? mission.updatedAt + SYNTHESIS_LEASE_MS) > now) continue;
+      if (!mission || mission.status !== "synthesizing" || !isLegacySynthesisMode(mission.mode)
+        || (mission.synthesisLeaseUntil ?? mission.updatedAt + SYNTHESIS_LEASE_MS) > now) continue;
       const jobs = await ctx.db
         .query("jobs")
         .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
@@ -328,14 +336,14 @@ export const claimReady = mutation({
       .order("asc")
       .take(30);
     for (const activity of missions) {
-      if (activity.mode === "goal") continue;
+      if (!isLegacySynthesisMode(activity.mode)) continue;
       const projectedJobs = await ctx.db
         .query("jobRuntime")
         .withIndex("by_mission", (q: any) => q.eq("missionId", String(activity.missionId)))
         .take(100);
       if (!projectedJobs.length || projectedJobs.some((job: any) => !["done", "error", "cancelled"].includes(job.status))) continue;
       const mission = await ctx.db.get(activity.missionId);
-      if (!mission || mission.status !== "running" || mission.mode === "goal") continue;
+      if (!mission || mission.status !== "running" || !isLegacySynthesisMode(mission.mode)) continue;
       const jobs = await ctx.db
         .query("jobs")
         .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
@@ -367,7 +375,8 @@ export const finish = mutation({
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const mission = await ctx.db.get(a.id);
-    if (!mission || mission.status !== "synthesizing" || (mission.synthesisAttempt ?? 0) !== a.expectedSynthesisAttempt) {
+    if (!mission || mission.status !== "synthesizing" || !isLegacySynthesisMode(mission.mode)
+      || (mission.synthesisAttempt ?? 0) !== a.expectedSynthesisAttempt) {
       return false;
     }
     await patchMissionWithRuntime(ctx, mission, {
