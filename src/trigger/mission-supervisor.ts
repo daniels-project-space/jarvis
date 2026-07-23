@@ -11,6 +11,13 @@ import {
 import { z } from "zod";
 
 import {
+  MISSION_SUPERVISOR_TICK_TASK_ID,
+  missionSupervisorDispatchIdentity,
+  parseMissionSupervisorTickPayload,
+  type MissionSupervisorDispatchOptions,
+  type MissionSupervisorTickPayload,
+} from "../lib/mission-supervisor-dispatch";
+import {
   SUPERVISOR_PLANNING_CONTEXT_MAX_BYTES,
   runSupervisorPlanningNetwork,
   type SupervisorPlanningTickInput,
@@ -20,7 +27,14 @@ import { createCodexSubscriptionLanguageModel } from "../mastra/codex-subscripti
 import { TEAM_BY_SLUG, type ModelTier } from "../mastra/team";
 import { codexModelFor } from "./model-policy";
 
-export const MISSION_SUPERVISOR_TICK_TASK_ID = "jarvis-mission-supervisor-tick";
+export {
+  MISSION_SUPERVISOR_TICK_TASK_ID,
+  missionSupervisorDispatchIdentity,
+  parseMissionSupervisorTickPayload,
+  type MissionSupervisorDispatchOptions,
+  type MissionSupervisorTickPayload,
+} from "../lib/mission-supervisor-dispatch";
+
 export const MISSION_SUPERVISOR_SWEEP_TASK_ID = "jarvis-mission-supervisor-sweep";
 export const MISSION_SUPERVISOR_MAX_DUE = 8;
 export const MISSION_SUPERVISOR_ACTIVE_WAIT_MS = 15 * 60_000;
@@ -85,26 +99,10 @@ type ModelMetadata = {
 };
 type DecisionMetadata = PolicyMetadata | ModelMetadata;
 
-export type MissionSupervisorTickPayload = {
-  protocolVersion: 1;
-  missionId: string;
-  expectedLeaseVersion: number;
-  expectedEpoch: number;
-  expectedDecisionSequence: number;
-  expectedInputRevision: number;
-};
-
 export type MissionSupervisorRunContext = {
   runId: string;
   deploymentVersion?: string;
   signal: AbortSignal;
-};
-
-export type MissionSupervisorDispatchOptions = {
-  idempotencyKey: string;
-  idempotencyKeyTTL: "1m";
-  concurrencyKey: string;
-  tags: string[];
 };
 
 type SupervisorLeaseFence = {
@@ -396,15 +394,6 @@ const dueEntrySchema = z.object({
   leaseUntil: nonNegativeInteger.optional(),
 }).strict();
 
-const tickPayloadSchema = z.object({
-  protocolVersion: z.literal(1),
-  missionId: boundedString(160).regex(SAFE_ID),
-  expectedLeaseVersion: nonNegativeInteger,
-  expectedEpoch: positiveInteger,
-  expectedDecisionSequence: positiveInteger,
-  expectedInputRevision: nonNegativeInteger,
-}).strict();
-
 const claimSuccessSchema = z.object({
   claimed: z.literal(true),
   missionId: boundedString(160),
@@ -684,43 +673,6 @@ function parseAuthoritativeSnapshot(
     );
   }
   return { snapshot, request: parseRequestPayload(snapshot) };
-}
-
-export function parseMissionSupervisorTickPayload(
-  value: unknown,
-): MissionSupervisorTickPayload {
-  return parseWithCode(
-    tickPayloadSchema,
-    value,
-    "invalid_payload",
-    "Mission supervisor tick payload is invalid",
-  );
-}
-
-export function missionSupervisorDispatchIdentity(
-  payload: MissionSupervisorTickPayload,
-): MissionSupervisorDispatchOptions {
-  const parsed = parseMissionSupervisorTickPayload(payload);
-  const material = [
-    parsed.missionId,
-    parsed.expectedEpoch,
-    parsed.expectedDecisionSequence,
-    parsed.expectedInputRevision,
-    parsed.expectedLeaseVersion,
-  ].join(":");
-  const digestValue = sha256Hex(material);
-  return {
-    idempotencyKey: `mission-supervisor:${digestValue}`,
-    // A claimed run is removed from the due set. Pre-claim platform/HTTP
-    // failures must recover on the next minute sweep; Convex fences and this
-    // per-mission queue remain the durable duplicate authority.
-    idempotencyKeyTTL: "1m",
-    concurrencyKey: `mission-supervisor:${sha256Hex(parsed.missionId).slice(0, 32)}`,
-    tags: [
-      "mission-supervisor",
-      `mission:${sha256Hex(parsed.missionId).slice(0, 24)}`,
-    ],
-  };
 }
 
 export function missionSupervisorLeaseOwner(runId: string): string {
@@ -1783,10 +1735,14 @@ function productionSweepDependencies(): MissionSupervisorSweepDependencies {
   return {
     convex: createSupervisorConvexClient(),
     dispatchTick: async (payload, options) => {
-      const { idempotencyKey, ...dispatchOptions } = options;
+      const {
+        idempotencyKey,
+        idempotencyKeyScope,
+        ...dispatchOptions
+      } = options;
       const globalIdempotencyKey = await idempotencyKeys.create(
         idempotencyKey,
-        { scope: "global" },
+        { scope: idempotencyKeyScope },
       );
       return await tasks.trigger<typeof missionSupervisorTick>(
         MISSION_SUPERVISOR_TICK_TASK_ID,

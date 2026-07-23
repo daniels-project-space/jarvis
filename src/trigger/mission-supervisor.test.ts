@@ -1587,7 +1587,14 @@ describe("tool-less receipt synthesis and Convex transport", () => {
       /OPENAI_API_KEY|CODEX_API_KEY|api\.openai\.com|provider[_ -]?router/i,
     );
     expect(source).not.toContain("tangible-goose-318");
-    expect(source).toContain('{ scope: "global" }');
+    expect(source).toContain("scope: idempotencyKeyScope");
+    const dispatchSource = readFileSync(
+      new URL("../lib/mission-supervisor-dispatch.ts", import.meta.url),
+      "utf8",
+    );
+    expect(dispatchSource).toContain(
+      'MISSION_SUPERVISOR_IDEMPOTENCY_KEY_SCOPE = "global"',
+    );
   });
 
   it("keeps payload parsing and dispatch identities exact and stable", () => {
