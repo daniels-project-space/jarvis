@@ -60,6 +60,7 @@ export type FleetNode = {
   attentionReason: string | null;
   controls: FleetControl[];
   startedAt: number | null;
+  projectionKind?: "supervisor_planning";
 };
 
 export type FleetMission = {

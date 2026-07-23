@@ -303,10 +303,12 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
   );
 
   const projectCount = hierarchy.reduce((count, mission) => count + mission.projects.length, 0);
+  const planningCount = hierarchyJobs.filter((node) => node.projectionKind === "supervisor_planning").length;
+  const activeJobCount = hierarchyJobs.length - planningCount;
   return (
     <aside data-fleet-surface="expanded" aria-label="Live Jarvis fleet" className="materialize glass absolute inset-x-1 bottom-1 z-40 flex h-[min(78vh,680px)] min-h-0 flex-col overflow-hidden rounded-2xl !border-cyan/25 bg-[#071019]/96 p-3 shadow-2xl md:inset-y-2 md:left-2 md:right-auto md:h-auto md:w-[min(760px,62%)]">
       <header className="flex min-w-0 shrink-0 items-start gap-2 border-b border-white/[0.07] pb-2">
-        <div className="min-w-0 flex-1"><div className="hud-label text-cyan">live work · immutable groups</div><h2 className="mt-0.5 truncate text-sm text-ice">{fleet.goal}</h2><div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[8px] uppercase tracking-[0.1em] text-slate"><span>{fleet.phase} · {fleet.percent}%</span><span>{hierarchy.length} missions · {projectCount} projects · {hierarchyJobs.length} active jobs</span></div></div>
+        <div className="min-w-0 flex-1"><div className="hud-label text-cyan">live work · immutable groups</div><h2 className="mt-0.5 truncate text-sm text-ice">{fleet.goal}</h2><div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[8px] uppercase tracking-[0.1em] text-slate"><span>{fleet.phase} · {fleet.percent}%</span><span>{hierarchy.length} missions · {projectCount} projects · {activeJobCount} active jobs{planningCount > 0 ? ` · ${planningCount} planning` : ""}</span></div></div>
         <button type="button" onClick={() => setOpen(false)} className="rounded-lg px-2 py-1 text-[9px] text-slate hover:text-cyan" aria-label="Collapse live fleet">minimize</button>
       </header>
       <div className="mt-2 flex min-h-0 flex-1 gap-2 overflow-hidden">
@@ -316,13 +318,19 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
               <header className="flex min-w-0 items-start gap-2"><div className="min-w-0 flex-1"><div className="truncate text-[11px] text-ice">{mission.label}</div><div className="truncate font-mono text-[7px] text-cyan/55" title={mission.id}>mission · {mission.id}</div></div><span className="shrink-0 font-mono text-[8px] uppercase text-slate">{mission.phase}</span></header>
               <div className="mt-2 space-y-1.5">{mission.projects.map((project) => <section key={project.id} data-project-group={project.id} className="rounded-lg border border-white/[0.07] bg-black/20 p-1.5">
                 <header className="flex min-w-0 items-center gap-2 px-0.5"><div className="min-w-0 flex-1 truncate font-mono text-[8px] text-sky-200">{project.repository ?? "read-only evidence"}</div><span className="shrink-0 font-mono text-[7px] text-slate">{project.canonicalProjectId} · {project.jobs.length}</span></header>
-                <div className="mt-1 grid gap-1 sm:grid-cols-2">{project.jobs.map((node) => <button type="button" key={node.jobId} data-active-job={node.jobId} onClick={() => selectJob(node.jobId)} className={`min-w-0 rounded-lg border p-2 text-left transition hover:border-cyan/40 ${STATE_STYLE[node.state]}`} aria-label={`Open ${agentName(node.agent)} detail for ${node.label}`}><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{agentName(node.agent)} · {node.label}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.08em] opacity-75">{node.stage} · {node.model ?? "auto"}/{node.reasoningEffort ?? "default"}</div><div className="mt-1 truncate text-[8px] text-slate" title={node.modelReason ?? "Policy route"}>route · {node.modelReason ?? "policy default"}</div>{node.needsDaniel && <div className="mt-1 text-[8px] text-amber">Needs Daniel</div>}</button>)}</div>
+                <div className="mt-1 grid gap-1 sm:grid-cols-2">{project.jobs.map((node) => {
+                  const planning = node.projectionKind === "supervisor_planning";
+                  const content = <><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{agentName(node.agent)} · {node.label}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.08em] opacity-75">{node.stage} · {node.model ?? "auto"}/{node.reasoningEffort ?? "default"}</div><div className="mt-1 truncate text-[8px] text-slate" title={node.modelReason ?? (planning ? "Supervisor authority" : "Policy route")}>{planning ? "authority" : "route"} · {node.modelReason ?? (planning ? "durable supervisor state" : "policy default")}</div>{node.needsDaniel && <div className="mt-1 text-[8px] text-amber">Needs Daniel</div>}</>;
+                  return planning
+                    ? <div key={node.jobId} data-supervisor-planning={node.jobId} role="status" className={`min-w-0 rounded-lg border p-2 text-left ${STATE_STYLE[node.state]}`} aria-label={`${agentName(node.agent)} planning ${node.label}`}>{content}</div>
+                    : <button type="button" key={node.jobId} data-active-job={node.jobId} onClick={() => selectJob(node.jobId)} className={`min-w-0 rounded-lg border p-2 text-left transition hover:border-cyan/40 ${STATE_STYLE[node.state]}`} aria-label={`Open ${agentName(node.agent)} detail for ${node.label}`}>{content}</button>;
+                })}</div>
               </section>)}</div>
             </article>)}
           </section>
         </div>}
       </div>
-      {!selectedId && <footer className="mt-2 shrink-0 border-t border-white/[0.07] pt-2">{controlError && <div role="alert" data-control-error className="mb-2 rounded-lg border border-rose-400/25 bg-rose-400/[0.07] px-2 py-1 text-[9px] text-rose-300">{controlError}</div>}<Controls controls={fleet.controls} target={fleet.id.startsWith("work:") ? { jobId: active.id } : { missionId: fleet.id }} onError={setControlError} /></footer>}
+      {!selectedId && fleet.controls.length > 0 && <footer className="mt-2 shrink-0 border-t border-white/[0.07] pt-2">{controlError && <div role="alert" data-control-error className="mb-2 rounded-lg border border-rose-400/25 bg-rose-400/[0.07] px-2 py-1 text-[9px] text-rose-300">{controlError}</div>}<Controls controls={fleet.controls} target={fleet.id.startsWith("work:") ? { jobId: active.id } : { missionId: fleet.id }} onError={setControlError} /></footer>}
     </aside>
   );
 }

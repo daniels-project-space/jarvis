@@ -171,8 +171,16 @@ describe("commandCenter.snapshot indexed IO", () => {
     expect(jobRuntime).toContain('.index("by_plan_parent_generation_node", ["planParentMissionId", "planGeneration", "planNodeId"])');
   });
 
-  it("uses six bounded indexed reads for an exact persisted GoalPlan", async () => {
-    const reads: Array<{ table: string; index?: string; equalities: Record<string, unknown>; limit?: number; first?: boolean; order?: string }> = [];
+  it("uses eight bounded indexed reads for supervisor authority plus an exact persisted GoalPlan", async () => {
+    const reads: Array<{
+      table: string;
+      index?: string;
+      equalities: Record<string, unknown>;
+      ranges?: Record<string, { operator: string; value: unknown }>;
+      limit?: number;
+      first?: boolean;
+      order?: string;
+    }> = [];
     const primary = runtime({ planParentMissionId: "mission-1" });
     const responses: Record<string, unknown[]> = {
       jobRuntime: [primary], goalPlanNodes: planNodes(2), goalPlanEdges: completeEdges(2),
@@ -185,7 +193,17 @@ describe("commandCenter.snapshot indexed IO", () => {
         query: (table: string) => {
           const read = { table, equalities: {} } as (typeof reads)[number];
           reads.push(read);
-          const indexQuery = { eq(field: string, value: unknown) { read.equalities[field] = value; return indexQuery; } };
+          const indexQuery = {
+            eq(field: string, value: unknown) { read.equalities[field] = value; return indexQuery; },
+            lte(field: string, value: unknown) {
+              (read.ranges ??= {})[field] = { operator: "lte", value };
+              return indexQuery;
+            },
+            gt(field: string, value: unknown) {
+              (read.ranges ??= {})[field] = { operator: "gt", value };
+              return indexQuery;
+            },
+          };
           const builder = {
             withIndex(index: string, apply: (q: typeof indexQuery) => unknown) { read.index = index; apply(indexQuery); return builder; },
             order(order: string) { read.order = order; return builder; },
@@ -211,6 +229,8 @@ describe("commandCenter.snapshot indexed IO", () => {
     expect(result.fleet).toMatchObject({ id: "mission-1", planDigest: "digest", planGeneration: 1 });
     expect(reads).toEqual([
       { table: "jobRuntime", index: "by_thread_visibility_active_priority", equalities: { originThreadId: threadId, visibility: "conversation", active: true }, order: "desc", limit: ACTIVE_CANDIDATE_LIMIT },
+      { table: "missionSupervisorState", index: "by_state_due", equalities: { state: "ready" }, ranges: { nextTickAt: { operator: "lte", value: expect.any(Number) } }, order: "asc", limit: 8 },
+      { table: "missionSupervisorState", index: "by_state_lease", equalities: { state: "leased" }, ranges: { leaseUntil: { operator: "gt", value: expect.any(Number) } }, order: "desc", limit: 8 },
       { table: "missionRuntime", index: "by_mission", equalities: { missionId: "mission-1" }, first: true },
       { table: "goalPlanNodes", index: "by_parent_generation", equalities: { parentMissionId: "mission-1", planGeneration: 1 }, limit: 9 },
       { table: "goalPlanEdges", index: "by_parent_generation", equalities: { parentMissionId: "mission-1", planGeneration: 1 }, limit: 29 },
@@ -218,5 +238,97 @@ describe("commandCenter.snapshot indexed IO", () => {
       { table: "jobRuntime", index: "by_plan_parent_generation_node", equalities: { planParentMissionId: "mission-1", planGeneration: 1 }, limit: 9 },
     ]);
     expect(reads.some((read) => ["jobs", "approvals", "attentionItems", "workEvents"].includes(read.table))).toBe(false);
+  });
+
+  it("bounds supervised discovery to two state indexes and eight mission-runtime lookups without scans", async () => {
+    const reads: Array<{
+      table: string;
+      index?: string;
+      equalities: Record<string, unknown>;
+      limit?: number;
+      first?: boolean;
+      order?: string;
+    }> = [];
+    const now = Date.now();
+    const ready = Array.from({ length: 8 }, (_, index) => ({
+      missionId: `mission-ready-${index}`,
+      state: "ready",
+      nextTickAt: now - index,
+      deadlineAt: now + 60_000,
+      updatedAt: now,
+    }));
+    const leased = Array.from({ length: 8 }, (_, index) => ({
+      missionId: `mission-leased-${index}`,
+      state: "leased",
+      leaseOwner: "trigger:supervisor",
+      leaseToken: `lease-${index}`,
+      leaseVersion: 1,
+      leaseUntil: now + 60_000,
+      deadlineAt: now + 60_000,
+      updatedAt: now,
+    }));
+    const ctx = {
+      auth: { getUserIdentity: async () => ({ issuer: "https://jarvis-orcin-six.vercel.app", subject: "daniel-owner" }) },
+      db: {
+        normalizeId: (_table: string, id: string) => id,
+        query: (table: string) => {
+          const read = { table, equalities: {} } as (typeof reads)[number];
+          reads.push(read);
+          const indexQuery = {
+            eq(field: string, value: unknown) { read.equalities[field] = value; return indexQuery; },
+            lte() { return indexQuery; },
+            gt() { return indexQuery; },
+          };
+          const builder = {
+            withIndex(index: string, apply: (q: typeof indexQuery) => unknown) {
+              read.index = index;
+              apply(indexQuery);
+              return builder;
+            },
+            order(order: string) { read.order = order; return builder; },
+            async take(limit: number) {
+              read.limit = limit;
+              if (table === "jobRuntime") return [];
+              if (table === "missionSupervisorState" && read.index === "by_state_due") return ready;
+              if (table === "missionSupervisorState" && read.index === "by_state_lease") return leased;
+              return [];
+            },
+            async first() {
+              read.first = true;
+              const missionId = String(read.equalities.missionId);
+              return {
+                missionId,
+                goal: `Plan ${missionId}`,
+                mode: "supervised",
+                status: "running",
+                originThreadId: threadId,
+                priority: 90,
+                phase: "planning",
+                percent: 0,
+                createdAt: now,
+                updatedAt: now,
+              };
+            },
+          };
+          return builder;
+        },
+      },
+    };
+    const handler = (snapshot as unknown as {
+      _handler: (context: unknown, args: { threadId?: string }) => Promise<{ hierarchy: unknown[] }>;
+    })._handler;
+
+    const result = await handler(ctx, { threadId });
+    const stateReads = reads.filter((read) => read.table === "missionSupervisorState");
+    const missionReads = reads.filter((read) => read.table === "missionRuntime");
+
+    expect(result.hierarchy).toHaveLength(8);
+    expect(stateReads).toEqual([
+      expect.objectContaining({ index: "by_state_due", limit: 8 }),
+      expect.objectContaining({ index: "by_state_lease", limit: 8 }),
+    ]);
+    expect(missionReads).toHaveLength(8);
+    expect(missionReads.every((read) => read.index === "by_mission" && read.first === true)).toBe(true);
+    expect(reads.every((read) => Boolean(read.index))).toBe(true);
   });
 });

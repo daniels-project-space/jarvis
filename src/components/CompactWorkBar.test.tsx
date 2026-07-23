@@ -86,6 +86,74 @@ describe("FleetCommandCenter", () => {
     expect(markup).not.toContain("live work terminal");
   });
 
+  it("renders supervised planning in the same one surface without a fake selectable job", () => {
+    const planning = node({
+      id: "supervisor:mission-planning",
+      jobId: "supervisor:mission-planning",
+      label: "Planning · Upgrade Jarvis",
+      agent: "jarvis",
+      state: "queued",
+      status: "pending",
+      stage: "ready to plan",
+      percent: 0,
+      progress: "",
+      progressAt: null,
+      model: null,
+      reasoningEffort: null,
+      modelReason: "Durable supervisor state is ready",
+      workerRuntime: null,
+      workerRunId: null,
+      controls: [],
+      projectionKind: "supervisor_planning",
+    });
+    const planningSnapshot: CompactWorkSnapshot = {
+      active: {
+        id: planning.jobId,
+        missionId: "mission-planning",
+        label: planning.label,
+        status: "queued",
+        stage: planning.stage,
+        percent: 0,
+        extraCount: 0,
+        needsDaniel: false,
+      },
+      fleet: {
+        ...work.fleet!,
+        id: "mission-planning",
+        goal: "Upgrade Jarvis",
+        mode: "supervised",
+        phase: "planning",
+        percent: 0,
+        controls: [],
+        nodes: [planning],
+        edges: [],
+      },
+      hierarchy: [{
+        id: "mission-planning",
+        label: "Upgrade Jarvis",
+        status: "running",
+        phase: "planning",
+        projects: [{
+          id: "mission-planning:planning",
+          canonicalProjectId: "planning",
+          repository: null,
+          jobs: [planning],
+        }],
+      }],
+    };
+
+    const collapsed = renderToStaticMarkup(<FleetCommandCenter snapshot={planningSnapshot} />);
+    const expanded = renderToStaticMarkup(<FleetCommandCenter snapshot={planningSnapshot} initialExpanded />);
+    expect(collapsed.match(/data-fleet-surface/g)).toHaveLength(1);
+    expect(collapsed).toContain('data-fleet-surface="collapsed"');
+    expect(collapsed).toContain("Planning · Upgrade Jarvis");
+    expect(expanded.match(/data-fleet-surface/g)).toHaveLength(1);
+    expect(expanded.match(/data-supervisor-planning/g)).toHaveLength(1);
+    expect(expanded).toContain("0 active jobs · 1 planning");
+    expect(expanded).not.toContain("data-active-job");
+    expect(expanded).not.toContain("loading exact work detail");
+  });
+
   it("does not auto-open a resolved mission from before this browser session", () => {
     const markup = renderToStaticMarkup(<FleetCommandCenter snapshot={work} />);
     expect(markup).toContain('aria-expanded="false"');
@@ -162,5 +230,15 @@ describe("FleetCommandCenter", () => {
     expect(views).not.toContain("export function FleetView");
     expect(views).not.toContain("api.missions.activity");
     expect(jarvis.match(/<FleetCommandCenter/g)).toHaveLength(1);
+  });
+
+  it("keeps the one work surface in the compact top-left or expanded side slot and yields to explicit panels", () => {
+    const workBar = readFileSync(new URL("./CompactWorkBar.tsx", import.meta.url), "utf8");
+    const jarvis = readFileSync(new URL("./JarvisUI.tsx", import.meta.url), "utf8");
+    expect(workBar).toMatch(/data-fleet-surface="collapsed"[\s\S]{0,180}absolute left-2 top-2/);
+    expect(workBar).toMatch(/data-fleet-surface="expanded"[\s\S]{0,260}md:left-2 md:right-auto/);
+    expect(jarvis).toMatch(/<FleetCommandCenter[\s\S]{0,220}hidden=\{overlayUp\}/);
+    expect(jarvis.match(/setPanel\(\{ type: "fleet"/g)).toHaveLength(1);
+    expect(jarvis).toMatch(/onOpenGoals[\s\S]{0,300}setPanel\(\{ type: "fleet"/);
   });
 });
