@@ -40,7 +40,6 @@ export function reviewPrompt(
     let child: ChildProcessWithoutNullStreams | undefined;
     let output = "";
     let settled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
 
     const finish = (value: string, terminate = false) => {
       if (settled) return;
@@ -55,6 +54,7 @@ export function reviewPrompt(
       }
       resolve(value);
     };
+    const timer = setTimeout(() => finish(output, true), timeoutMs);
 
     try {
       child = spawnReview(bin, args, {
@@ -75,7 +75,6 @@ export function reviewPrompt(
     child.once("close", () => finish(output));
     child.once("error", () => finish("", true));
 
-    timer = setTimeout(() => finish(output, true), timeoutMs);
     try {
       child.stdin.end(prompt, "utf8");
     } catch {

@@ -5,6 +5,9 @@ import {
   selectCodexWorkPolicy,
   type CodexWorkPolicyInput,
 } from "../src/lib/codex-work-router";
+import type { WithoutSystemFields } from "convex/server";
+import type { Doc } from "./_generated/dataModel";
+import type { MutationCtx } from "./_generated/server";
 
 function defined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
@@ -199,8 +202,13 @@ export async function upsertMissionRuntime(ctx: any, mission: any) {
 }
 
 export type CodexJobPolicyContext = Omit<Partial<CodexWorkPolicyInput>, "task"> & { task?: string };
+type NewJob = WithoutSystemFields<Doc<"jobs">>;
 
-export async function insertJobWithRuntime(ctx: any, value: any, policyContext: CodexJobPolicyContext = {}) {
+export async function insertJobWithRuntime(
+  ctx: MutationCtx,
+  value: NewJob,
+  policyContext: CodexJobPolicyContext = {},
+) {
   const policy = selectCodexWorkPolicy({
     task: policyContext.task ?? String(value.task ?? "Agent work"),
     role: policyContext.role ?? value.agentId,

@@ -600,7 +600,7 @@ export const create = mutation({
       integrationBranch: route.primaryRepo ? goalBranch(goal, String(missionId)) : undefined,
       integrationGeneration: 0,
     });
-    const plannerJob: any = await ctx.db.get(plannerJobId);
+    const plannerJob = await ctx.db.get(plannerJobId);
     await recordMissionEvent(ctx, String(missionId), "goal_started",
       `Goal Mode started with ${String(plannerJob?.model ?? "adaptive")}/${String(plannerJob?.reasoningEffort ?? "adaptive")} planning`, "planning", 3, {
       route: route.kind,
@@ -841,7 +841,7 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
     advanceLeaseUntil: undefined,
     updatedAt: now,
   });
-  const validatorJob: any = await ctx.db.get(validatorJobId);
+  const validatorJob = await ctx.db.get(validatorJobId);
   await recordMissionEvent(ctx, String(mission._id), "goal_validation_queued",
     `${String(validatorJob?.model ?? "adaptive")}/${String(validatorJob?.reasoningEffort ?? "adaptive")} deep validation queued`, "validating", 82, {
     revisionWave: Number(mission.revisionWave ?? 0),

@@ -103,6 +103,19 @@ import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, createDeterministicTar, 
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
 
+type MissionSynthesisClaim = {
+  id: string;
+  goal: string;
+  originThreadId?: string;
+  synthesisAttempt: number;
+  results: Array<{
+    label: string;
+    repo?: string | null;
+    status: string;
+    result?: string | null;
+  }>;
+};
+
 function promptArgs(prompt: string, tier: string, json = false, mcpConfig?: string | null, reasoningEffort?: unknown): string[] {
   const args = codexExecPrefix(tier, reasoningEffort);
   if (json) args.push("--json");
@@ -2334,15 +2347,15 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
 
     // When the last fleet agent lands—or a pending job is declined—the atomic
     // mission claim is merged exactly once into one reviewed report.
-    const synthesizeMissionClaim = async (synth: any): Promise<void> => {
+    const synthesizeMissionClaim = async (synth: MissionSynthesisClaim): Promise<void> => {
       if (!synth?.id) return;
       const missionId = String(synth.id);
-      const failedAll = synth.results.every((r: any) => r.status !== "done");
+      const failedAll = synth.results.every((result) => result.status !== "done");
       const body = synth.results
-        .map((r: any) => `### ${r.label} [${r.status}]\n${r.result || "(no output)"}`)
+        .map((result) => `### ${result.label} [${result.status}]\n${result.result || "(no output)"}`)
         .join("\n\n");
       const repositories = new Set(
-        synth.results.map((result: any) => String(result.repo ?? "").trim()).filter(Boolean),
+        synth.results.map((result) => String(result.repo ?? "").trim()).filter(Boolean),
       );
       const synthesisRoute = selectCodexWorkPolicy({
         task: String(synth.goal ?? "Synthesize mission findings"),
@@ -2395,7 +2408,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     };
     const maybeSynthesizeMission = async (missionId: string): Promise<void> => {
       await drainGoalAdvances();
-      const synth: any = await convexMutation("missions:checkComplete", { id: missionId }).catch(() => null);
+      const synth = await convexMutation("missions:checkComplete", { id: missionId })
+        .catch(() => null) as MissionSynthesisClaim | null;
       if (synth) await synthesizeMissionClaim(synth);
     };
 
@@ -2438,7 +2452,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     // missions after normal work. Each claim flips running → synthesizing in
     // Convex, preventing another cron invocation from reporting it twice.
     for (let i = 0; i < 3; i += 1) {
-      const ready: any = await convexMutation("missions:claimReady", {}).catch(() => null);
+      const ready = await convexMutation("missions:claimReady", {})
+        .catch(() => null) as MissionSynthesisClaim | null;
       if (!ready) break;
       await synthesizeMissionClaim(ready);
     }
