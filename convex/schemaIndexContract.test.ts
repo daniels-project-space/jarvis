@@ -50,13 +50,29 @@ describe("mission supervisor schema index contract", () => {
     const indexes = indexesForTable(
       schema,
       "missionSupervisorState",
-      "missionSupervisorDecisions",
+      "missionSupervisorCommand",
     );
     expect(indexes).toEqual([
       { name: "by_mission", fields: ["missionId"] },
       { name: "by_request", fields: ["requestKey"] },
       { name: "by_state_due", fields: ["state", "nextTickAt"] },
       { name: "by_state_lease", fields: ["state", "leaseUntil"] },
+    ]);
+    expect(() => assertUniqueFieldTuples(indexes)).not.toThrow();
+  });
+
+  it("keeps one thread-scoped command projection cursor and exact mission owner", () => {
+    const indexes = indexesForTable(
+      schema,
+      "missionSupervisorCommand",
+      "missionSupervisorDecisions",
+    );
+    expect(indexes).toEqual([
+      { name: "by_mission", fields: ["missionId"] },
+      {
+        name: "by_thread_active_priority",
+        fields: ["originThreadId", "active", "priority", "updatedAt"],
+      },
     ]);
     expect(() => assertUniqueFieldTuples(indexes)).not.toThrow();
   });

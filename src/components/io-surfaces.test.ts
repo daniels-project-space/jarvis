@@ -15,7 +15,12 @@ describe("reactive IO surfaces", () => {
     const command = source("convex/commandCenter.ts");
     expect(command.match(/\.first\(\)/g)?.length ?? 0).toBeLessThanOrEqual(2);
     expect(command).toContain('withIndex("by_thread_visibility_active_priority"');
+    expect(command).toContain('withIndex("by_thread_active_priority"');
     expect(command).toContain('withIndex("by_mission"');
+    expect(command.match(/query\("missionSupervisorCommand"\)/g)).toHaveLength(1);
+    expect(command).not.toContain('query("missionSupervisorState")');
+    expect(command).not.toContain('"by_state_due"');
+    expect(command).not.toContain('"by_state_lease"');
   });
 
   it("mounts twenty live rows, eight embedded rows, and cursor history only in the open drawer", () => {

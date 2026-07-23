@@ -1,5 +1,8 @@
 import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx } from "./_generated/server";
+import {
+  syncMissionSupervisorCommandForJobWake,
+} from "./missionSupervisorCommand";
 
 export const MISSION_SUPERVISOR_WAKE_MAX_JOBS = 24;
 
@@ -306,6 +309,11 @@ export async function signalMissionSupervisorForJobPatch(
       : {}),
   };
   await ctx.db.patch(state._id, wakePatch);
+  await syncMissionSupervisorCommandForJobWake(
+    ctx,
+    missionId,
+    { ...state, ...wakePatch },
+  );
   return {
     signaled: true,
     reason: "authoritative_change",

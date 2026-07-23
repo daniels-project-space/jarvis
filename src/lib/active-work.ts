@@ -23,6 +23,8 @@ export type FleetSupervisorAuthority = {
   protocolVersion: 1;
   state: "ready" | "leased" | "waiting" | "paused" | "needs_input" | "terminal";
   inputRevision: number;
+  steerRevision: number;
+  deadlineAt: number;
   question?: string;
 };
 

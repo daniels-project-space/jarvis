@@ -41,6 +41,8 @@ describe("fleet snapshot continuity", () => {
       protocolVersion: 1,
       state: "needs_input",
       inputRevision: 7,
+      steerRevision: 3,
+      deadlineAt: 1_800_000_000_000,
       question: "Which acceptance boundary should Jarvis use?",
     };
     let cache: CompactWorkCache = cacheCompactWorkSnapshot(null, "thread-a", dispatching);
@@ -49,6 +51,8 @@ describe("fleet snapshot continuity", () => {
       protocolVersion: 1,
       state: "needs_input",
       inputRevision: 7,
+      steerRevision: 3,
+      deadlineAt: 1_800_000_000_000,
       question: "Which acceptance boundary should Jarvis use?",
     });
 

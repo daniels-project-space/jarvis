@@ -32,6 +32,7 @@ import {
   exactTerminalWorkReceipt,
   terminalWorkReceiptDigest,
 } from "./workReceiptAuthority";
+import { syncMissionSupervisorCommand } from "./missionSupervisorCommand";
 
 export const MISSION_SUPERVISOR_LEASE_MS = 10 * 60_000;
 export const MISSION_SUPERVISOR_MAX_JOBS = 24;
@@ -1333,7 +1334,7 @@ async function holdMissionForInput(
     detail,
     now,
   );
-  await ctx.db.patch(state._id, {
+  const statePatch = {
     state: "needs_input",
     nextTickAt: undefined,
     ...clearLease(),
@@ -1341,13 +1342,22 @@ async function holdMissionForInput(
     lastErrorCode: code,
     lastErrorAt: now,
     updatedAt: now,
-  });
-  await patchMissionWithRuntime(ctx, mission, {
+  } as const;
+  const missionPatch = {
     status: "needs_input",
     phase: "needs_input",
     failureReason: detail.slice(0, 600),
     updatedAt: now,
-  });
+  };
+  await ctx.db.patch(state._id, statePatch);
+  await patchMissionWithRuntime(ctx, mission, missionPatch);
+  await syncMissionSupervisorCommand(
+    ctx,
+    { ...mission, ...missionPatch },
+    { ...state, ...statePatch },
+    { mode: "set", question: detail },
+    false,
+  );
   return attentionItemId;
 }
 
@@ -1520,6 +1530,15 @@ export const startV1 = mutation({
       if (!mission || mission.mode !== "supervised") {
         throw new Error("Supervisor request replay references invalid authority");
       }
+      await syncMissionSupervisorCommand(
+        ctx,
+        mission,
+        prior[0],
+        prior[0].state === "needs_input"
+          && typeof mission.failureReason === "string"
+          ? { mode: "set", question: mission.failureReason }
+          : { mode: "preserve" },
+      );
       return {
         replayed: true,
         missionId: prior[0].missionId,
@@ -1558,7 +1577,7 @@ export const startV1 = mutation({
       : normalized.payload.projectAdmissions.length === 1
         ? normalized.payload.projectAdmissions[0]
         : undefined;
-    const missionId = await insertMissionWithRuntime(ctx, {
+    const missionId: Id<"missions"> = await insertMissionWithRuntime(ctx, {
       goal: normalized.payload.goal,
       admissionProtocolVersion: 2,
       mode: "supervised",
@@ -1608,6 +1627,19 @@ export const startV1 = mutation({
       updatedAt: now,
     };
     const stateId = await ctx.db.insert("missionSupervisorState", initialState);
+    const [mission, state] = await Promise.all([
+      ctx.db.get(missionId),
+      ctx.db.get(stateId),
+    ]);
+    if (!mission || !state) {
+      throw new Error("Supervisor command projection source was not persisted");
+    }
+    await syncMissionSupervisorCommand(
+      ctx,
+      mission,
+      state,
+      { mode: "clear" },
+    );
     return {
       replayed: false,
       missionId,
@@ -1819,21 +1851,29 @@ export const controlV1 = mutation({
         return await reject("invalid_transition", { state });
       }
       const inputRevision = state.inputRevision + 1;
-      await ctx.db.patch(state._id, {
+      const statePatch = {
         state: "paused",
         inputRevision,
         nextTickAt: undefined,
         ...clearLease(),
         updatedAt: now,
-      });
-      await patchMissionWithRuntime(ctx, mission, {
+      } as const;
+      const missionPatch = {
         status: "paused",
         pausedPhase: mission.phase ?? "supervising",
         phase: "paused",
         controlRequested: undefined,
         controlRequestedAt: undefined,
         updatedAt: now,
-      });
+      };
+      await ctx.db.patch(state._id, statePatch);
+      await patchMissionWithRuntime(ctx, mission, missionPatch);
+      await syncMissionSupervisorCommand(
+        ctx,
+        { ...mission, ...missionPatch },
+        { ...state, ...statePatch },
+        { mode: "clear" },
+      );
       return await record({
         applied: true,
         noop: false,
@@ -1863,21 +1903,29 @@ export const controlV1 = mutation({
         state: "ready" as const,
         inputRevision,
       };
-      await ctx.db.patch(state._id, {
+      const statePatch = {
         state: "ready",
         inputRevision,
         nextTickAt: now,
         ...clearLease(),
         updatedAt: now,
-      });
-      await patchMissionWithRuntime(ctx, mission, {
+      } as const;
+      const missionPatch = {
         status: "running",
         phase: mission.pausedPhase ?? "supervising",
         pausedPhase: undefined,
         controlRequested: undefined,
         controlRequestedAt: undefined,
         updatedAt: now,
-      });
+      };
+      await ctx.db.patch(state._id, statePatch);
+      await patchMissionWithRuntime(ctx, mission, missionPatch);
+      await syncMissionSupervisorCommand(
+        ctx,
+        { ...mission, ...missionPatch },
+        { ...state, ...statePatch },
+        { mode: "clear" },
+      );
       return await record({
         applied: true,
         noop: false,
@@ -1891,14 +1939,14 @@ export const controlV1 = mutation({
 
     if (request.action === "cancel") {
       const inputRevision = state.inputRevision + 1;
-      await ctx.db.patch(state._id, {
+      const statePatch = {
         state: "terminal",
         inputRevision,
         nextTickAt: undefined,
         ...clearLease(),
         updatedAt: now,
-      });
-      await patchMissionWithRuntime(ctx, mission, {
+      } as const;
+      const missionPatch = {
         status: "cancelled",
         phase: "cancelled",
         pausedPhase: undefined,
@@ -1906,7 +1954,15 @@ export const controlV1 = mutation({
         controlRequestedAt: undefined,
         completedAt: now,
         updatedAt: now,
-      });
+      };
+      await ctx.db.patch(state._id, statePatch);
+      await patchMissionWithRuntime(ctx, mission, missionPatch);
+      await syncMissionSupervisorCommand(
+        ctx,
+        { ...mission, ...missionPatch },
+        { ...state, ...statePatch },
+        { mode: "clear" },
+      );
       await resolveSupervisorAttention(ctx, args.missionId, now, true);
       return await record({
         applied: true,
@@ -1936,21 +1992,29 @@ export const controlV1 = mutation({
         state: "ready" as const,
         inputRevision,
       };
-      await ctx.db.patch(state._id, {
-        state: "ready",
+      const statePatch = {
+        state: "ready" as const,
         inputRevision,
         dirtyJobIds: [],
         nextTickAt: now,
         ...clearLease(),
         updatedAt: now,
-      });
-      await patchMissionWithRuntime(ctx, mission, {
+      };
+      const missionPatch = {
         steer: request.input,
         steerRevision,
         phase: "planning",
         failureReason: undefined,
         updatedAt: now,
-      });
+      };
+      await ctx.db.patch(state._id, statePatch);
+      await patchMissionWithRuntime(ctx, mission, missionPatch);
+      await syncMissionSupervisorCommand(
+        ctx,
+        { ...mission, ...missionPatch },
+        { ...state, ...statePatch },
+        { mode: "clear" },
+      );
       return await record({
         applied: true,
         noop: false,
@@ -1978,8 +2042,8 @@ export const controlV1 = mutation({
       state: "ready" as const,
       inputRevision,
     };
-    await ctx.db.patch(state._id, {
-      state: "ready",
+    const statePatch = {
+      state: "ready" as const,
       inputRevision,
       dirtyJobIds: [],
       nextTickAt: now,
@@ -1988,15 +2052,23 @@ export const controlV1 = mutation({
       lastErrorCode: undefined,
       lastErrorAt: undefined,
       updatedAt: now,
-    });
-    await patchMissionWithRuntime(ctx, mission, {
+    };
+    const missionPatch = {
       status: "running",
       phase: "planning",
       steer: request.input,
       steerRevision,
       failureReason: undefined,
       updatedAt: now,
-    });
+    };
+    await ctx.db.patch(state._id, statePatch);
+    await patchMissionWithRuntime(ctx, mission, missionPatch);
+    await syncMissionSupervisorCommand(
+      ctx,
+      { ...mission, ...missionPatch },
+      { ...state, ...statePatch },
+      { mode: "clear" },
+    );
     await resolveSupervisorAttention(ctx, args.missionId, now, false);
     return await record({
       applied: true,
@@ -2173,7 +2245,7 @@ export const claimV1 = mutation({
 
     const leaseVersion = state.leaseVersion + 1;
     const leaseUntil = now + MISSION_SUPERVISOR_LEASE_MS;
-    await ctx.db.patch(state._id, {
+    const statePatch = {
       state: "leased",
       nextTickAt: undefined,
       leaseOwner: args.leaseOwner,
@@ -2183,7 +2255,14 @@ export const claimV1 = mutation({
       leaseUntil,
       lastSnapshotDigest: snapshotResult.snapshotDigest,
       updatedAt: now,
-    });
+    } as const;
+    await ctx.db.patch(state._id, statePatch);
+    await syncMissionSupervisorCommand(
+      ctx,
+      mission,
+      { ...state, ...statePatch },
+      { mode: "clear" },
+    );
     return {
       claimed: true as const,
       missionId: args.missionId,
@@ -2254,12 +2333,22 @@ export const renewV1 = mutation({
     }
     const now = Date.now();
     if (state.inputRevision !== args.expectedInputRevision) {
-      await ctx.db.patch(state._id, {
+      const statePatch = {
         state: "ready",
         nextTickAt: now,
         ...clearLease(),
         updatedAt: now,
-      });
+      } as const;
+      await ctx.db.patch(state._id, statePatch);
+      const mission = await ctx.db.get(args.missionId);
+      if (mission?.mode === "supervised") {
+        await syncMissionSupervisorCommand(
+          ctx,
+          mission,
+          { ...state, ...statePatch },
+          { mode: "clear" },
+        );
+      }
       return {
         renewed: false as const,
         reason: "input_revision_changed",
@@ -2272,12 +2361,22 @@ export const renewV1 = mutation({
       return { renewed: false as const, reason: "lease_expired" };
     }
     if (state.deadlineAt <= now) {
-      await ctx.db.patch(state._id, {
+      const statePatch = {
         state: "ready",
         nextTickAt: now,
         ...clearLease(),
         updatedAt: now,
-      });
+      } as const;
+      await ctx.db.patch(state._id, statePatch);
+      const mission = await ctx.db.get(args.missionId);
+      if (mission?.mode === "supervised") {
+        await syncMissionSupervisorCommand(
+          ctx,
+          mission,
+          { ...state, ...statePatch },
+          { mode: "clear" },
+        );
+      }
       return {
         renewed: false as const,
         reason: "deadline_reached",
@@ -2319,12 +2418,22 @@ export const releaseFailureV1 = mutation({
     }
     const now = Date.now();
     if (state.inputRevision !== args.expectedInputRevision) {
-      await ctx.db.patch(state._id, {
+      const statePatch = {
         state: "ready",
         nextTickAt: now,
         ...clearLease(),
         updatedAt: now,
-      });
+      } as const;
+      await ctx.db.patch(state._id, statePatch);
+      const mission = await ctx.db.get(args.missionId);
+      if (mission?.mode === "supervised") {
+        await syncMissionSupervisorCommand(
+          ctx,
+          mission,
+          { ...state, ...statePatch },
+          { mode: "clear" },
+        );
+      }
       return {
         released: true as const,
         stale: true,
@@ -2368,7 +2477,7 @@ export const releaseFailureV1 = mutation({
       FAILURE_BACKOFF_BASE_MS * (2 ** exponent),
     );
     const nextTickAt = now + backoffMs;
-    await ctx.db.patch(state._id, {
+    const statePatch = {
       state: "waiting",
       nextTickAt,
       ...clearLease(),
@@ -2376,7 +2485,14 @@ export const releaseFailureV1 = mutation({
       lastErrorCode: args.errorCode,
       lastErrorAt: now,
       updatedAt: now,
-    });
+    } as const;
+    await ctx.db.patch(state._id, statePatch);
+    await syncMissionSupervisorCommand(
+      ctx,
+      mission,
+      { ...state, ...statePatch },
+      { mode: "clear" },
+    );
     return {
       released: true as const,
       stale: false,
@@ -4013,7 +4129,7 @@ export const commitV1 = mutation({
       nextTickAt,
       createdAt: now,
     });
-    await ctx.db.patch(state._id, {
+    const statePatch = {
       state: resultState,
       epoch: envelope.decision.kind === "replan"
         ? state.epoch + 1
@@ -4032,8 +4148,20 @@ export const commitV1 = mutation({
       lastErrorCode: undefined,
       lastErrorAt: undefined,
       updatedAt: now,
-    });
+    };
+    await ctx.db.patch(state._id, statePatch);
     await patchMissionWithRuntime(ctx, mission, missionPatch);
+    await syncMissionSupervisorCommand(
+      ctx,
+      { ...mission, ...missionPatch } as Mission,
+      { ...state, ...statePatch },
+      envelope.decision.kind === "request_input"
+        ? { mode: "set", question: envelope.decision.question }
+        : { mode: "clear" },
+      envelope.decision.kind === "request_input"
+        ? Boolean(envelope.decision.target)
+        : false,
+    );
     const receipt = await ctx.db.get(decisionId);
     if (!receipt) throw new Error("Supervisor decision receipt was not persisted");
     return committedDecisionResult(receipt, false);

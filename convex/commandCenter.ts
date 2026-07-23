@@ -5,7 +5,7 @@ import { requireViewer, viewerAuthArgs } from "./controlAuth";
 export const FLEET_MAX_NODES = 8;
 export const FLEET_MAX_EDGES = 28;
 export const ACTIVE_CANDIDATE_LIMIT = 33;
-export const SUPERVISOR_CANDIDATE_LIMIT = 8;
+export const SUPERVISOR_CANDIDATE_LIMIT = ACTIVE_CANDIDATE_LIMIT;
 export const SUPERVISOR_PLANNING_PROJECTION = "supervisor_planning";
 
 export const USER_RELEVANT_STATUSES = [
@@ -21,7 +21,6 @@ export const USER_RELEVANT_STATUSES = [
 
 const RELEVANT = new Set<string>(USER_RELEVANT_STATUSES);
 const HIERARCHY_ACTIVE = new Set(["dispatching", "running", "paused", "stalled", "needs_input", "awaiting_approval", "steering"]);
-const SUPERVISED_MISSION_ACTIVE = new Set(["running", "split", "synthesizing"]);
 const ROUTINE_WORK = /\b(?:health[ -]?(?:check|audit)|cloud health|heartbeat|uptime|stack poll|sentry sweep|provider health|lease reaper|execution reaper|reaper|control-plane migration|runtime migration|cron(?:job)?|routine (?:monitor|poll)|background (?:monitor|poll)|system monitor|stack monitor)\b/i;
 
 type RuntimeRow = Record<string, unknown>;
@@ -29,111 +28,153 @@ type PlanNodeRow = Record<string, unknown>;
 type PlanEdgeRow = Record<string, unknown>;
 type HandoffRow = Record<string, unknown>;
 
-export function isActionableSupervisorState(row: RuntimeRow, now: number): boolean {
-  if (Number(row.deadlineAt ?? 0) <= now) return false;
-  if (row.state === "ready") {
-    return typeof row.nextTickAt !== "number" || row.nextTickAt <= now;
-  }
-  return row.state === "leased"
-    && typeof row.leaseOwner === "string"
-    && row.leaseOwner.length > 0
-    && typeof row.leaseToken === "string"
-    && row.leaseToken.length > 0
-    && Number(row.leaseVersion ?? 0) > 0
-    && Number(row.leaseUntil ?? 0) > now;
-}
-
 function missionIdForRow(row: RuntimeRow): string {
   return String(row.missionGroupId ?? row.planParentMissionId ?? row.missionId ?? "");
 }
 
+function supervisorPlanningStage(
+  command: RuntimeRow,
+  now: number,
+): { status: string; stage: string; modelReason: string } {
+  if (command.state === "leased") {
+    const expired = Number(command.leaseUntil ?? 0) <= now;
+    return {
+      status: "running",
+      stage: expired ? "lease expired · recovery due" : "planning",
+      modelReason: expired
+        ? "Durable supervisor lease expired; bounded recovery is due"
+        : "Durable supervisor lease is active",
+    };
+  }
+  if (command.state === "waiting") {
+    const due = Number(command.nextTickAt ?? 0) <= now;
+    return {
+      status: "pending",
+      stage: due ? "retry ready" : "waiting to retry",
+      modelReason: due
+        ? "Durable supervisor backoff elapsed"
+        : "Durable supervisor is waiting for its bounded retry",
+    };
+  }
+  if (command.state === "paused") {
+    return {
+      status: "paused",
+      stage: "paused",
+      modelReason: "Durable supervisor is paused by Daniel",
+    };
+  }
+  if (command.state === "needs_input") {
+    return {
+      status: "needs_input",
+      stage: "waiting for Daniel",
+      modelReason: "Durable supervisor requires Daniel's exact input",
+    };
+  }
+  const future = Number(command.nextTickAt ?? 0) > now;
+  return {
+    status: "pending",
+    stage: future ? "planning scheduled" : "ready to plan",
+    modelReason: future
+      ? "Durable supervisor is scheduled for a future tick"
+      : "Durable supervisor state is ready",
+  };
+}
+
 function supervisedPlanningRuntime(
-  mission: RuntimeRow,
-  supervisor: RuntimeRow,
+  command: RuntimeRow,
   threadId: string,
   now: number,
 ): RuntimeRow | null {
-  const missionId = String(mission.missionId ?? mission._id ?? "");
+  const missionId = String(command.missionId ?? "");
   if (!missionId
-    || mission.mode !== "supervised"
-    || !SUPERVISED_MISSION_ACTIVE.has(String(mission.status ?? ""))
-    || String(mission.originThreadId ?? "main") !== threadId
-    || !isActionableSupervisorState(supervisor, now)) {
+    || command.mode !== "supervised"
+    || command.active !== true
+    || command.state === "terminal"
+    || String(command.originThreadId ?? "main") !== threadId) {
     return null;
   }
-  const leased = supervisor.state === "leased";
-  const goal = String(mission.goal ?? "Supervised mission").slice(0, 500);
+  const projected = supervisorPlanningStage(command, now);
+  const goal = String(command.goal ?? "Supervised mission").slice(0, 500);
   return {
     jobId: `supervisor:${missionId}`,
     missionId,
     missionGroupId: missionId,
     projectGroupId: `${missionId}:planning`,
-    canonicalProjectId: String(mission.canonicalProjectId ?? mission.primaryRepo ?? "planning").slice(0, 120),
-    projectRepository: typeof mission.primaryRepo === "string" ? mission.primaryRepo.slice(0, 120) : undefined,
-    repo: typeof mission.primaryRepo === "string" ? mission.primaryRepo.slice(0, 120) : undefined,
+    canonicalProjectId: String(command.canonicalProjectId ?? command.primaryRepo ?? "planning").slice(0, 120),
+    projectRepository: typeof command.primaryRepo === "string" ? command.primaryRepo.slice(0, 120) : undefined,
+    repo: typeof command.primaryRepo === "string" ? command.primaryRepo.slice(0, 120) : undefined,
     task: goal,
     label: `Planning · ${goal}`.slice(0, 120),
-    status: leased ? "running" : "pending",
+    status: projected.status,
     visibility: "conversation",
     originThreadId: threadId,
     agentId: "jarvis",
-    priority: Math.max(0, Math.min(100, Number(mission.priority ?? 50))),
-    stage: leased ? "planning" : "ready to plan",
-    percent: Math.max(0, Math.min(100, Number(mission.percent ?? 0))),
+    priority: Math.max(0, Math.min(100, Number(command.priority ?? 50))),
+    stage: projected.stage,
+    percent: Math.max(0, Math.min(100, Number(command.percent ?? 0))),
     progress: "",
-    modelReason: leased
-      ? "Durable supervisor lease is active"
-      : "Durable supervisor state is ready",
-    workerRuntime: leased ? "mission-supervisor" : undefined,
+    modelReason: projected.modelReason,
+    workerRuntime: command.state === "leased"
+      ? "mission-supervisor"
+      : undefined,
     integrationState: "not_applicable",
     attempt: 1,
     maxAttempts: 1,
     active: true,
     dependsOn: [],
     projectionKind: SUPERVISOR_PLANNING_PROJECTION,
-    createdAt: Number(mission.createdAt ?? supervisor.createdAt ?? 0),
-    updatedAt: Number(supervisor.updatedAt ?? mission.updatedAt ?? 0),
+    createdAt: Number(command.createdAt ?? 0),
+    updatedAt: Number(command.updatedAt ?? 0),
   };
 }
 
-async function actionableSupervisorPlanningRows(
+function missionRuntimeFromSupervisorCommand(command: RuntimeRow): RuntimeRow {
+  return {
+    missionId: command.missionId,
+    goal: command.goal,
+    mode: command.mode,
+    status: command.status,
+    originThreadId: command.originThreadId,
+    priority: command.priority,
+    phase: command.phase,
+    percent: command.percent,
+    primaryRepo: command.primaryRepo,
+    canonicalProjectId: command.canonicalProjectId,
+    agentCount: command.totalJobs,
+    createdAt: command.createdAt,
+    updatedAt: command.updatedAt,
+  };
+}
+
+async function supervisorCommandPlanningRows(
   ctx: QueryCtx,
   threadId: string,
   realRows: readonly RuntimeRow[],
-  missionLookupLimit: number,
-): Promise<{ rows: RuntimeRow[]; missionsById: Map<string, RuntimeRow> }> {
+): Promise<{
+  rows: RuntimeRow[];
+  commandsByMission: Map<string, RuntimeRow>;
+}> {
   const now = Date.now();
-  const [ready, leased] = await Promise.all([
-    ctx.db.query("missionSupervisorState")
-      .withIndex("by_state_due", (q) => q.eq("state", "ready").lte("nextTickAt", now))
-      .order("asc")
-      .take(SUPERVISOR_CANDIDATE_LIMIT),
-    ctx.db.query("missionSupervisorState")
-      .withIndex("by_state_lease", (q) => q.eq("state", "leased").gt("leaseUntil", now))
-      .order("desc")
-      .take(SUPERVISOR_CANDIDATE_LIMIT),
-  ]);
+  const commands = await ctx.db
+    .query("missionSupervisorCommand")
+    .withIndex("by_thread_active_priority", (q) =>
+      q
+        .eq("originThreadId", threadId)
+        .eq("active", true)
+    )
+    .order("desc")
+    .take(SUPERVISOR_CANDIDATE_LIMIT);
   const representedMissionIds = new Set(realRows.map(missionIdForRow).filter(Boolean));
-  const byMission = new Map<string, (typeof ready)[number]>();
-  for (const row of [...leased, ...ready]) {
-    const missionId = String(row.missionId ?? "");
-    if (!missionId || representedMissionIds.has(missionId) || byMission.has(missionId)
-      || !isActionableSupervisorState(row, now)) continue;
-    byMission.set(missionId, row);
-    if (byMission.size >= missionLookupLimit) break;
-  }
-  const candidates = [...byMission.entries()];
-  const missions = await Promise.all(candidates.map(([, supervisor]) =>
-    ctx.db.query("missionRuntime").withIndex("by_mission", (q) => q.eq("missionId", supervisor.missionId)).first(),
-  ));
-  const missionsById = new Map<string, RuntimeRow>();
-  const rows = missions.flatMap((mission, index) => {
-    if (!mission) return [];
-    missionsById.set(candidates[index][0], mission);
-    const planning = supervisedPlanningRuntime(mission, candidates[index][1], threadId, now);
+  const commandsByMission = new Map<string, RuntimeRow>();
+  const rows = commands.flatMap((command) => {
+    const missionId = String(command.missionId ?? "");
+    if (!missionId || commandsByMission.has(missionId)) return [];
+    commandsByMission.set(missionId, command);
+    if (representedMissionIds.has(missionId)) return [];
+    const planning = supervisedPlanningRuntime(command, threadId, now);
     return planning ? [planning] : [];
   });
-  return { rows, missionsById };
+  return { rows, commandsByMission };
 }
 
 export function isUserRelevantWork(row: RuntimeRow, threadId: string): boolean {
@@ -205,9 +246,47 @@ function controlsFor(row: RuntimeRow) {
   return controls;
 }
 
-function missionControls(mission: RuntimeRow | null) {
+function supervisorAuthority(command: RuntimeRow | null) {
+  if (!command) return undefined;
+  return {
+    protocolVersion: 1 as const,
+    state: String(command.state),
+    inputRevision: Number(command.inputRevision),
+    steerRevision: Number(command.steerRevision),
+    deadlineAt: Number(command.deadlineAt),
+    ...(typeof command.question === "string"
+      ? { question: command.question }
+      : {}),
+  };
+}
+
+function supervisorControls(command: RuntimeRow | null) {
+  if (
+    !command
+    || command.active !== true
+    || command.state === "terminal"
+  ) {
+    return [];
+  }
+  if (command.state === "needs_input") {
+    return Number(command.totalJobs) === 0 || command.inputTargeted === true
+      ? ["provide_input", "cancel"]
+      : [];
+  }
+  if (Number(command.totalJobs) !== 0) return [];
+  if (command.state === "paused") return ["resume", "cancel"];
+  if (["ready", "waiting", "leased"].includes(String(command.state))) {
+    return ["pause", "cancel", "steer"];
+  }
+  return [];
+}
+
+function missionControls(
+  mission: RuntimeRow | null,
+  command: RuntimeRow | null,
+) {
   if (!mission) return [];
-  if (mission.mode === "supervised") return [];
+  if (mission.mode === "supervised") return supervisorControls(command);
   const status = String(mission.status ?? "");
   if (["done", "failed", "cancelled"].includes(status)) return [];
   if (["paused", "needs_input"].includes(status)) return ["resume", "cancel", "steer"];
@@ -367,6 +446,7 @@ export function buildFleetSnapshot(input: {
   threadId: string;
   activeRows: RuntimeRow[];
   mission?: RuntimeRow | null;
+  supervisorCommand?: RuntimeRow | null;
   nodes?: PlanNodeRow[];
   edges?: PlanEdgeRow[];
   handoffs?: HandoffRow[];
@@ -471,6 +551,7 @@ export function buildFleetSnapshot(input: {
   const primaryNode = projectedNodes.find((node) => node.jobId === String(primary.jobId)) ?? liveNodes[0] ?? projectedNodes[0];
   const hierarchyJobs = hierarchy.flatMap((group) => group.projects.flatMap((project) => project.jobs));
   const attentionCount = hierarchyJobs.filter((node) => node.needsDaniel).length;
+  const supervisor = supervisorAuthority(input.supervisorCommand ?? null);
   const fleet = {
     id: missionId ?? `work:${String(primary.jobId)}`,
     goal: String(input.mission?.goal ?? primary.label ?? primary.task ?? "Live work").slice(0, 500),
@@ -481,7 +562,14 @@ export function buildFleetSnapshot(input: {
     planDigest: input.mission?.planDigest ?? null,
     planGeneration: typeof input.mission?.planGeneration === "number" ? input.mission.planGeneration : null,
     integrationState: input.mission?.activeIntegrationAttemptId ? "integrating" : String(input.mission?.phase ?? "not started"),
-    attentionCount, controls: missionControls(input.mission ?? null), nodes: projectedNodes, edges: projectedEdges,
+    attentionCount,
+    controls: missionControls(
+      input.mission ?? null,
+      input.supervisorCommand ?? null,
+    ),
+    ...(supervisor ? { supervisor } : {}),
+    nodes: projectedNodes,
+    edges: projectedEdges,
   };
   return {
     active: primaryNode ? {
@@ -517,13 +605,10 @@ export const snapshot = query({
       .order("desc")
       .take(ACTIVE_CANDIDATE_LIMIT);
     const relevantJobs = selectRelevantWork(candidates, threadId);
-    // Preserve an absolute eight-read missionRuntime budget. A real primary job
-    // needs one lookup below; a planning-only result reuses the lookup made here.
-    const supervisorProjection = await actionableSupervisorPlanningRows(
+    const supervisorProjection = await supervisorCommandPlanningRows(
       ctx,
       threadId,
       relevantJobs,
-      Math.max(0, SUPERVISOR_CANDIDATE_LIMIT - (relevantJobs[0] ? 1 : 0)),
     );
     const relevant = selectRelevantWork([...relevantJobs, ...supervisorProjection.rows], threadId);
     const primary = relevant[0];
@@ -532,9 +617,23 @@ export const snapshot = query({
     const rawMissionId = primary.planParentMissionId ?? primary.missionId;
     const missionId = rawMissionId ? ctx.db.normalizeId("missions", String(rawMissionId)) : null;
     if (!missionId) return buildFleetSnapshot({ threadId, activeRows: relevant });
-    const mission = supervisorProjection.missionsById.get(String(missionId))
-      ?? await ctx.db.query("missionRuntime").withIndex("by_mission", (q) => q.eq("missionId", missionId)).first();
+    const supervisorCommand =
+      supervisorProjection.commandsByMission.get(String(missionId)) ?? null;
+    const mission = supervisorCommand
+      ? missionRuntimeFromSupervisorCommand(supervisorCommand)
+      : await ctx.db
+        .query("missionRuntime")
+        .withIndex("by_mission", (q) => q.eq("missionId", missionId))
+        .first();
     if (!mission) return buildFleetSnapshot({ threadId, activeRows: relevant });
+    if (primary.projectionKind === SUPERVISOR_PLANNING_PROJECTION) {
+      return buildFleetSnapshot({
+        threadId,
+        activeRows: relevant,
+        mission,
+        supervisorCommand,
+      });
+    }
 
     const generation = Number(mission.planGeneration ?? 0);
     if (mission.planDigest && generation > 0) {
@@ -552,13 +651,28 @@ export const snapshot = query({
         throw new Error("Fleet projection exceeds its 8-node hot bound");
       }
       if (edges.length > FLEET_MAX_EDGES) throw new Error("Fleet projection exceeds its 28-edge hot bound");
-      return buildFleetSnapshot({ threadId, activeRows: relevant, mission, nodes, edges, handoffs, activities });
+      return buildFleetSnapshot({
+        threadId,
+        activeRows: relevant,
+        mission,
+        supervisorCommand,
+        nodes,
+        edges,
+        handoffs,
+        activities,
+      });
     }
 
     const activities = await ctx.db.query("jobRuntime")
       .withIndex("by_mission", (q) => q.eq("missionId", String(missionId)))
       .take(FLEET_MAX_NODES + 1);
     if (activities.length > FLEET_MAX_NODES) throw new Error("Fleet projection exceeds its 8-node hot bound");
-    return buildFleetSnapshot({ threadId, activeRows: relevant, mission, activities });
+    return buildFleetSnapshot({
+      threadId,
+      activeRows: relevant,
+      mission,
+      supervisorCommand,
+      activities,
+    });
   },
 });

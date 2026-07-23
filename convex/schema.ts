@@ -884,6 +884,42 @@ export default defineSchema({
     .index("by_state_due", ["state", "nextTickAt"])
     .index("by_state_lease", ["state", "leaseUntil"]),
 
+  // One atomically maintained command-center row per supervised mission.
+  // The UI reads this compact projection by thread and never discovers
+  // supervisor state through global scheduler indexes or mission N+1 reads.
+  missionSupervisorCommand: defineTable({
+    protocolVersion: v.literal(1),
+    missionId: v.id("missions"),
+    originThreadId: v.string(),
+    active: v.boolean(),
+    priority: v.number(),
+    goal: v.string(),
+    mode: v.literal("supervised"),
+    status: v.string(),
+    phase: v.string(),
+    percent: v.number(),
+    primaryRepo: v.optional(v.string()),
+    canonicalProjectId: v.optional(v.string()),
+    state: missionSupervisorStateValidator,
+    inputRevision: v.number(),
+    steerRevision: v.number(),
+    deadlineAt: v.number(),
+    totalJobs: v.number(),
+    inputTargeted: v.boolean(),
+    nextTickAt: v.optional(v.number()),
+    leaseUntil: v.optional(v.number()),
+    question: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_mission", ["missionId"])
+    .index("by_thread_active_priority", [
+      "originThreadId",
+      "active",
+      "priority",
+      "updatedAt",
+    ]),
+
   // Append-only model decision receipts. A future commit mutation checks this
   // ledger before its live lease so a lost response can replay the exact prior
   // result without creating duplicate jobs, attention items, or chat delivery.

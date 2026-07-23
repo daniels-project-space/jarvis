@@ -171,7 +171,7 @@ describe("commandCenter.snapshot indexed IO", () => {
     expect(jobRuntime).toContain('.index("by_plan_parent_generation_node", ["planParentMissionId", "planGeneration", "planNodeId"])');
   });
 
-  it("uses eight bounded indexed reads for supervisor authority plus an exact persisted GoalPlan", async () => {
+  it("uses seven bounded indexed reads for command authority plus an exact persisted GoalPlan", async () => {
     const reads: Array<{
       table: string;
       index?: string;
@@ -229,8 +229,7 @@ describe("commandCenter.snapshot indexed IO", () => {
     expect(result.fleet).toMatchObject({ id: "mission-1", planDigest: "digest", planGeneration: 1 });
     expect(reads).toEqual([
       { table: "jobRuntime", index: "by_thread_visibility_active_priority", equalities: { originThreadId: threadId, visibility: "conversation", active: true }, order: "desc", limit: ACTIVE_CANDIDATE_LIMIT },
-      { table: "missionSupervisorState", index: "by_state_due", equalities: { state: "ready" }, ranges: { nextTickAt: { operator: "lte", value: expect.any(Number) } }, order: "asc", limit: 8 },
-      { table: "missionSupervisorState", index: "by_state_lease", equalities: { state: "leased" }, ranges: { leaseUntil: { operator: "gt", value: expect.any(Number) } }, order: "desc", limit: 8 },
+      { table: "missionSupervisorCommand", index: "by_thread_active_priority", equalities: { originThreadId: threadId, active: true }, order: "desc", limit: ACTIVE_CANDIDATE_LIMIT },
       { table: "missionRuntime", index: "by_mission", equalities: { missionId: "mission-1" }, first: true },
       { table: "goalPlanNodes", index: "by_parent_generation", equalities: { parentMissionId: "mission-1", planGeneration: 1 }, limit: 9 },
       { table: "goalPlanEdges", index: "by_parent_generation", equalities: { parentMissionId: "mission-1", planGeneration: 1 }, limit: 29 },
@@ -240,7 +239,7 @@ describe("commandCenter.snapshot indexed IO", () => {
     expect(reads.some((read) => ["jobs", "approvals", "attentionItems", "workEvents"].includes(read.table))).toBe(false);
   });
 
-  it("bounds supervised discovery to two state indexes and eight mission-runtime lookups without scans", async () => {
+  it("discovers every bounded supervisor command through one thread index without N+1 reads", async () => {
     const reads: Array<{
       table: string;
       index?: string;
@@ -250,21 +249,27 @@ describe("commandCenter.snapshot indexed IO", () => {
       order?: string;
     }> = [];
     const now = Date.now();
-    const ready = Array.from({ length: 8 }, (_, index) => ({
-      missionId: `mission-ready-${index}`,
-      state: "ready",
-      nextTickAt: now - index,
+    const commands = Array.from({ length: 8 }, (_, index) => ({
+      protocolVersion: 1,
+      missionId: `mission-command-${index}`,
+      originThreadId: threadId,
+      active: true,
+      priority: 90 - index,
+      goal: `Plan command ${index}`,
+      mode: "supervised",
+      status: "running",
+      phase: "planning",
+      percent: 0,
+      state: index % 2 === 0 ? "waiting" : "leased",
+      inputRevision: index,
+      steerRevision: 0,
       deadlineAt: now + 60_000,
-      updatedAt: now,
-    }));
-    const leased = Array.from({ length: 8 }, (_, index) => ({
-      missionId: `mission-leased-${index}`,
-      state: "leased",
-      leaseOwner: "trigger:supervisor",
-      leaseToken: `lease-${index}`,
-      leaseVersion: 1,
-      leaseUntil: now + 60_000,
-      deadlineAt: now + 60_000,
+      totalJobs: 0,
+      inputTargeted: false,
+      ...(index % 2 === 0
+        ? { nextTickAt: now + 60_000 }
+        : { leaseUntil: now - 1 }),
+      createdAt: now - index,
       updatedAt: now,
     }));
     const ctx = {
@@ -289,25 +294,12 @@ describe("commandCenter.snapshot indexed IO", () => {
             async take(limit: number) {
               read.limit = limit;
               if (table === "jobRuntime") return [];
-              if (table === "missionSupervisorState" && read.index === "by_state_due") return ready;
-              if (table === "missionSupervisorState" && read.index === "by_state_lease") return leased;
+              if (table === "missionSupervisorCommand") return commands;
               return [];
             },
             async first() {
               read.first = true;
-              const missionId = String(read.equalities.missionId);
-              return {
-                missionId,
-                goal: `Plan ${missionId}`,
-                mode: "supervised",
-                status: "running",
-                originThreadId: threadId,
-                priority: 90,
-                phase: "planning",
-                percent: 0,
-                createdAt: now,
-                updatedAt: now,
-              };
+              return null;
             },
           };
           return builder;
@@ -319,16 +311,23 @@ describe("commandCenter.snapshot indexed IO", () => {
     })._handler;
 
     const result = await handler(ctx, { threadId });
-    const stateReads = reads.filter((read) => read.table === "missionSupervisorState");
+    const commandReads = reads.filter((read) =>
+      read.table === "missionSupervisorCommand"
+    );
     const missionReads = reads.filter((read) => read.table === "missionRuntime");
 
     expect(result.hierarchy).toHaveLength(8);
-    expect(stateReads).toEqual([
-      expect.objectContaining({ index: "by_state_due", limit: 8 }),
-      expect.objectContaining({ index: "by_state_lease", limit: 8 }),
+    expect(commandReads).toEqual([
+      {
+        table: "missionSupervisorCommand",
+        index: "by_thread_active_priority",
+        equalities: { originThreadId: threadId, active: true },
+        order: "desc",
+        limit: ACTIVE_CANDIDATE_LIMIT,
+      },
     ]);
-    expect(missionReads).toHaveLength(8);
-    expect(missionReads.every((read) => read.index === "by_mission" && read.first === true)).toBe(true);
+    expect(missionReads).toEqual([]);
+    expect(reads).toHaveLength(2);
     expect(reads.every((read) => Boolean(read.index))).toBe(true);
   });
 });

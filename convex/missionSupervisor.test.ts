@@ -251,6 +251,18 @@ async function supervisorState(
   );
 }
 
+async function supervisorCommand(
+  t: SupervisorTest,
+  missionId: Id<"missions">,
+) {
+  return await t.run(async (ctx) =>
+    await ctx.db
+      .query("missionSupervisorCommand")
+      .withIndex("by_mission", (q) => q.eq("missionId", missionId))
+      .unique()
+  );
+}
+
 async function control(
   t: SupervisorTest,
   missionId: Id<"missions">,
@@ -595,6 +607,165 @@ describe("dormant mission supervisor authority", () => {
       jobs: (await ctx.db.query("jobs").collect()).length,
     }));
     expect(counts).toEqual({ missions: 1, states: 1, jobs: 0 });
+  });
+
+  it("maintains one exact command projection across controls, leases, release, input, and terminal commit", async () => {
+    const t = convexTest(schema, modules);
+    const started = await start(t, "command-transition-ledger", {
+      originThreadId: "command-thread",
+      priority: 87,
+    });
+    expect(await supervisorCommand(t, started.missionId)).toMatchObject({
+      missionId: started.missionId,
+      originThreadId: "command-thread",
+      active: true,
+      priority: 87,
+      state: "ready",
+      inputRevision: 1,
+      steerRevision: 0,
+      totalJobs: 0,
+      inputTargeted: false,
+    });
+
+    expect(await control(
+      t,
+      started.missionId,
+      "command-pause",
+      "pause",
+      1,
+    )).toMatchObject({ applied: true, state: "paused", inputRevision: 2 });
+    expect(await supervisorCommand(t, started.missionId)).toMatchObject({
+      state: "paused",
+      status: "paused",
+      inputRevision: 2,
+      inputTargeted: false,
+    });
+
+    expect(await control(
+      t,
+      started.missionId,
+      "command-resume",
+      "resume",
+      2,
+    )).toMatchObject({ applied: true, state: "ready", inputRevision: 3 });
+    const leased = await claimSuccess(t, started.missionId, 0);
+    expect(await supervisorCommand(t, started.missionId)).toMatchObject({
+      state: "leased",
+      inputRevision: 3,
+      leaseUntil: leased.leaseUntil,
+    });
+
+    const released = await t.mutation(
+      supervisorApi.releaseFailureV1,
+      {
+        ...exactFence(started.missionId, leased),
+        errorCode: "bounded_projection_test",
+      },
+    );
+    expect(released).toMatchObject({
+      released: true,
+      stale: false,
+      escalated: false,
+      nextTickAt: expect.any(Number),
+    });
+    expect(await supervisorCommand(t, started.missionId)).toMatchObject({
+      state: "waiting",
+      inputRevision: 3,
+      nextTickAt: released.nextTickAt,
+      inputTargeted: false,
+    });
+
+    vi.setSystemTime(Number(released.nextTickAt));
+    const reclaimed = await claimSuccess(t, started.missionId, 1);
+    const question =
+      "Which exact acceptance boundary should Jarvis use for this mission?";
+    expect(await t.mutation(
+      supervisorApi.commitV1,
+      commitInput(
+        started.missionId,
+        reclaimed,
+        {
+          kind: "request_input",
+          question,
+          reason: "The bounded planner needs one exact boundary.",
+        },
+        MODEL_METADATA,
+      ),
+    )).toMatchObject({
+      committed: true,
+      resultState: "needs_input",
+    });
+    expect(await supervisorCommand(t, started.missionId)).toMatchObject({
+      state: "needs_input",
+      status: "needs_input",
+      inputRevision: 3,
+      question,
+      inputTargeted: false,
+    });
+
+    expect(await control(
+      t,
+      started.missionId,
+      "command-provide-input",
+      "provide_input",
+      3,
+      "Use the isolated backend acceptance boundary.",
+    )).toMatchObject({ applied: true, state: "ready", inputRevision: 4 });
+    const answered = await supervisorCommand(t, started.missionId);
+    expect(answered).toMatchObject({
+      state: "ready",
+      status: "running",
+      inputRevision: 4,
+      steerRevision: 1,
+      inputTargeted: false,
+    });
+    expect(answered).not.toHaveProperty("question");
+
+    const finalClaim = await claimSuccess(t, started.missionId, 2);
+    expect(await t.mutation(
+      supervisorApi.commitV1,
+      commitInput(
+        started.missionId,
+        finalClaim,
+        {
+          kind: "fail",
+          reason: "Stop this bounded projection test safely.",
+        },
+        POLICY_METADATA,
+      ),
+    )).toMatchObject({
+      committed: true,
+      resultState: "terminal",
+    });
+    expect(await supervisorCommand(t, started.missionId)).toMatchObject({
+      state: "terminal",
+      status: "failed",
+      active: false,
+      inputRevision: 4,
+      inputTargeted: false,
+    });
+  });
+
+  it("projects a bounded claim hold as an exact input question", async () => {
+    const t = convexTest(schema, modules);
+    const started = await start(t, "command-deadline-hold", {
+      deadlineMs: 10 * 60_000,
+    });
+    vi.setSystemTime(START_AT + 10 * 60_000 + 1);
+
+    expect(await claim(t, started.missionId, 0)).toMatchObject({
+      claimed: false,
+      reason: "supervisor_deadline_reached",
+      escalated: true,
+    });
+    expect(await supervisorCommand(t, started.missionId)).toMatchObject({
+      state: "needs_input",
+      status: "needs_input",
+      active: true,
+      inputTargeted: false,
+      question:
+        "The supervised mission reached its bounded deadline and needs Daniel to continue or stop it.",
+    });
   });
 
   it("rejects stale, invalid, and aggregate-oversized admission payloads without partial rows", async () => {
@@ -956,6 +1127,12 @@ describe("dormant mission supervisor authority", () => {
     expect(requested).toMatchObject({
       committed: true,
       resultState: "needs_input",
+    });
+    expect(await supervisorCommand(t, started.missionId)).toMatchObject({
+      state: "needs_input",
+      totalJobs: 0,
+      inputTargeted: false,
+      question: "Which deployment boundary should this mission prioritize?",
     });
 
     const provided = await control(
@@ -2648,6 +2825,12 @@ describe("dormant mission supervisor authority", () => {
       committed: true,
       resultState: "needs_input",
     });
+    expect(await supervisorCommand(t, started.missionId)).toMatchObject({
+      state: "needs_input",
+      totalJobs: 1,
+      inputTargeted: true,
+      question: "Which exact implementation boundary should Paul use?",
+    });
     const answer =
       "Use the isolated backend recovery boundary; do not alter deployment.";
     const provided = await control(
@@ -2665,6 +2848,13 @@ describe("dormant mission supervisor authority", () => {
       inputRevision: secondClaim.inputRevision + 1,
     });
     expect(provided.inputDigest).toBe(await sha256Hex(answer));
+    const answeredCommand = await supervisorCommand(t, started.missionId);
+    expect(answeredCommand).toMatchObject({
+      state: "ready",
+      inputRevision: secondClaim.inputRevision + 1,
+      inputTargeted: false,
+    });
+    expect(answeredCommand).not.toHaveProperty("question");
 
     const thirdClaim = await claimSuccess(t, started.missionId, 2);
     expect(thirdClaim.snapshot).toMatchObject({

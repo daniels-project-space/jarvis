@@ -44,6 +44,27 @@ function stateId(value: string): Id<"missionSupervisorState"> {
   return value as Id<"missionSupervisorState">;
 }
 
+function supervisorMission(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    _id: missionId("mission-supervised"),
+    _creationTime: 1,
+    goal: "Supervise one bounded workstream.",
+    mode: "supervised",
+    status: "running",
+    agentCount: 1,
+    originThreadId: "main",
+    priority: 80,
+    phase: "executing",
+    percent: 25,
+    steerRevision: 2,
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  };
+}
+
 function supervisorJob(
   overrides: Record<string, unknown> = {},
 ): WakeJob {
@@ -88,7 +109,39 @@ function supervisorState(
     inputRevision: 7,
     dirtyJobIds: [],
     maxJobs: 4,
+    totalJobs: 1,
+    deadlineAt: 10_000,
     nextTickAt: 9_000,
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  };
+}
+
+function supervisorCommand(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    _id: "command-supervised",
+    _creationTime: 1,
+    protocolVersion: 1,
+    missionId: missionId("mission-supervised"),
+    originThreadId: "main",
+    active: true,
+    priority: 80,
+    goal: "Supervise one bounded workstream.",
+    mode: "supervised",
+    status: "running",
+    phase: "executing",
+    percent: 25,
+    state: "ready",
+    inputRevision: 7,
+    steerRevision: 2,
+    deadlineAt: 10_000,
+    totalJobs: 1,
+    inputTargeted: false,
+    nextTickAt: 9_000,
+    createdAt: 1,
     updatedAt: 1,
     ...overrides,
   };
@@ -97,11 +150,21 @@ function supervisorState(
 function ioHarness(options: {
   decisions?: Array<Record<string, unknown>>;
   states?: Array<Record<string, unknown>>;
+  missions?: Array<Record<string, unknown>>;
+  commands?: Array<Record<string, unknown>>;
 } = {}) {
   const decisions = options.decisions ?? [];
   const states = options.states ?? [];
+  const missions = options.missions ?? [supervisorMission()];
+  const commands = options.commands ?? [];
   const reads: Read[] = [];
+  const gets: string[] = [];
   const writes: Write[] = [];
+  const commandWrites: Array<{
+    operation: "insert" | "patch" | "replace";
+    id: string;
+    value: Record<string, unknown>;
+  }> = [];
 
   const db = {
     normalizeId(table: string, value: string) {
@@ -136,25 +199,68 @@ function ioHarness(options: {
               ? decisions
               : table === "missionSupervisorState"
                 ? states
+                : table === "missionSupervisorCommand"
+                  ? commands
                 : [];
           return source.slice(0, limit);
         },
       };
       return builder;
     },
+    async get(id: unknown) {
+      gets.push(String(id));
+      return missions.find((candidate) =>
+        String(candidate._id) === String(id)
+      ) ?? null;
+    },
     async patch(id: unknown, patch: Record<string, unknown>) {
-      writes.push({ id: String(id), patch: { ...patch } });
       const state = states.find((candidate) => String(candidate._id) === String(id));
-      if (state) Object.assign(state, patch);
+      if (state) {
+        writes.push({ id: String(id), patch: { ...patch } });
+        Object.assign(state, patch);
+      }
+      const command = commands.find((candidate) =>
+        String(candidate._id) === String(id)
+      );
+      if (command) {
+        Object.assign(command, patch);
+        commandWrites.push({
+          operation: "patch",
+          id: String(id),
+          value: { ...patch },
+        });
+      }
+    },
+    async insert(table: string, value: Record<string, unknown>) {
+      const id = `command-${commands.length + 1}`;
+      if (table === "missionSupervisorCommand") {
+        commands.push({ ...value, _id: id, _creationTime: 1 });
+        commandWrites.push({ operation: "insert", id, value: { ...value } });
+      }
+      return id;
+    },
+    async replace(id: unknown, value: Record<string, unknown>) {
+      const command = commands.find((candidate) =>
+        String(candidate._id) === String(id)
+      );
+      if (command) Object.assign(command, value);
+      commandWrites.push({
+        operation: "replace",
+        id: String(id),
+        value: { ...value },
+      });
     },
   };
 
   return {
     ctx: { db } as unknown as WakeContext,
     reads,
+    gets,
     writes,
     decisions,
     states,
+    commands,
+    commandWrites,
   };
 }
 
@@ -260,6 +366,7 @@ describe("mission supervisor authoritative job wake", () => {
     const harness = ioHarness({
       decisions: [decision(job)],
       states: [state],
+      commands: [supervisorCommand()],
     });
 
     expect(await signalMissionSupervisorForJobPatch(
@@ -286,6 +393,12 @@ describe("mission supervisor authoritative job wake", () => {
         equalities: { missionId: missionId("mission-supervised") },
         limit: 2,
       },
+      {
+        table: "missionSupervisorCommand",
+        index: "by_mission",
+        equalities: { missionId: missionId("mission-supervised") },
+        limit: 2,
+      },
     ]);
     expect(harness.writes).toEqual([
       {
@@ -299,6 +412,25 @@ describe("mission supervisor authoritative job wake", () => {
         },
       },
     ]);
+    expect(harness.gets).toEqual([]);
+    expect(harness.commandWrites).toHaveLength(1);
+    expect(harness.commandWrites[0]).toMatchObject({
+      operation: "patch",
+      id: "command-supervised",
+      value: {
+        state: "ready",
+        inputRevision: 8,
+        totalJobs: 1,
+      },
+    });
+    expect(harness.commands[0]).toMatchObject({
+      missionId: missionId("mission-supervised"),
+      state: "ready",
+      inputRevision: 8,
+      steerRevision: 2,
+      totalJobs: 1,
+      active: true,
+    });
 
     const changedJob = { ...job, status: "done" } as WakeJob;
     expect(await signalMissionSupervisorForJobPatch(
@@ -317,6 +449,10 @@ describe("mission supervisor authoritative job wake", () => {
     expect(new Set(
       (harness.writes[1]?.patch.dirtyJobIds as Id<"jobs">[]).map(String),
     ).size).toBe(2);
+    expect(harness.commandWrites[1]).toMatchObject({
+      operation: "patch",
+      value: { state: "ready", inputRevision: 9 },
+    });
   });
 
   it("invalidates a leased input fence without releasing or mutating its lease", async () => {
@@ -362,6 +498,11 @@ describe("mission supervisor authoritative job wake", () => {
       leaseUntil: 5_000,
     });
     expect(state.inputRevision).not.toBe(7);
+    expect(harness.commandWrites[0]?.value).toMatchObject({
+      state: "leased",
+      inputRevision: 8,
+      leaseUntil: 5_000,
+    });
   });
 
   it.each(["paused", "needs_input"] as const)(
@@ -394,6 +535,10 @@ describe("mission supervisor authoritative job wake", () => {
       });
       expect(state.state).toBe(stateName);
       expect(state.nextTickAt).toBeUndefined();
+      expect(harness.commandWrites[0]?.value).toMatchObject({
+        state: stateName,
+        inputRevision: 8,
+      });
     },
   );
 
@@ -550,6 +695,10 @@ describe("mission supervisor authoritative job wake", () => {
         .query("jobRuntime")
         .withIndex("by_job", (q) => q.eq("jobId", seeded.job))
         .unique(),
+      command: await ctx.db
+        .query("missionSupervisorCommand")
+        .withIndex("by_mission", (q) => q.eq("missionId", seeded.mission))
+        .unique(),
     }));
     expect(persisted.state).toMatchObject({
       state: "ready",
@@ -559,5 +708,12 @@ describe("mission supervisor authoritative job wake", () => {
     expect(persisted.state?.nextTickAt).toBeTypeOf("number");
     expect(persisted.job?.result).toBe("New authoritative evidence.");
     expect(persisted.runtime?.status).toBe("running");
+    expect(persisted.command).toMatchObject({
+      missionId: seeded.mission,
+      state: "ready",
+      inputRevision: 5,
+      totalJobs: 1,
+      active: true,
+    });
   });
 });
