@@ -49,6 +49,33 @@ type AuthoritativeJobField = (typeof AUTHORITATIVE_JOB_FIELDS)[number];
 type SupervisorState = Doc<"missionSupervisorState">;
 type WakeContext = Pick<MutationCtx, "db">;
 
+export type SupervisorJobDecisionProvenance = {
+  missionId: string;
+  epoch: number;
+  decisionKey: string;
+  ordinal: number;
+};
+
+export type ExactSupervisorJobDecisionProvenance =
+  | {
+      ok: true;
+      missionId: Id<"missions">;
+      provenance: SupervisorJobDecisionProvenance;
+      decision: Doc<"missionSupervisorDecisions">;
+    }
+  | {
+      ok: false;
+      reason:
+        | "legacy_or_invalid_provenance"
+        | "missing_or_ambiguous_decision"
+        | "provenance_mismatch";
+    };
+
+export type SupervisorDecisionProvenanceCache = Map<
+  string,
+  readonly Doc<"missionSupervisorDecisions">[]
+>;
+
 export type MissionSupervisorWakeResult =
   | {
       signaled: true;
@@ -175,12 +202,9 @@ export function supervisorAuthoritativePatchChanges(
   );
 }
 
-function provenanceFor(job: Doc<"jobs">): {
-  missionId: string;
-  epoch: number;
-  decisionKey: string;
-  ordinal: number;
-} | null {
+export function supervisorJobDecisionProvenance(
+  job: Doc<"jobs">,
+): SupervisorJobDecisionProvenance | null {
   if (
     typeof job.missionId !== "string" ||
     job.missionId.length === 0 ||
@@ -201,6 +225,55 @@ function provenanceFor(job: Doc<"jobs">): {
     decisionKey: job.supervisorDecisionKey,
     ordinal: Number(job.supervisorJobOrdinal),
   };
+}
+
+/**
+ * Resolve one job's exact append-only delegate/recover creation receipt.
+ * Optional provenance on the mutable job is never authority by itself.
+ *
+ * A caller validating a bounded mission batch may pass a transaction-local
+ * cache so sibling jobs created by the same decision share one indexed read.
+ */
+export async function readExactSupervisorJobDecisionProvenance(
+  ctx: WakeContext,
+  job: Doc<"jobs">,
+  cache?: SupervisorDecisionProvenanceCache,
+): Promise<ExactSupervisorJobDecisionProvenance> {
+  const provenance = supervisorJobDecisionProvenance(job);
+  if (!provenance) {
+    return { ok: false, reason: "legacy_or_invalid_provenance" };
+  }
+  const missionId = ctx.db.normalizeId("missions", provenance.missionId);
+  if (!missionId) {
+    return { ok: false, reason: "legacy_or_invalid_provenance" };
+  }
+  let decisions = cache?.get(provenance.decisionKey);
+  if (!decisions) {
+    decisions = await ctx.db
+      .query("missionSupervisorDecisions")
+      .withIndex("by_key", (q) =>
+        q.eq("decisionKey", provenance.decisionKey)
+      )
+      .take(2);
+    cache?.set(provenance.decisionKey, decisions);
+  }
+  if (decisions.length !== 1) {
+    return { ok: false, reason: "missing_or_ambiguous_decision" };
+  }
+  const decision = decisions[0];
+  if (
+    decision.protocolVersion !== 1 ||
+    !["delegate", "recover"].includes(decision.kind) ||
+    String(decision.missionId) !== String(missionId) ||
+    decision.epoch !== provenance.epoch ||
+    decision.decisionKey !== provenance.decisionKey ||
+    decision.createdJobIds.length > MISSION_SUPERVISOR_WAKE_MAX_JOBS ||
+    provenance.ordinal >= decision.createdJobIds.length ||
+    String(decision.createdJobIds[provenance.ordinal]) !== String(job._id)
+  ) {
+    return { ok: false, reason: "provenance_mismatch" };
+  }
+  return { ok: true, missionId, provenance, decision };
 }
 
 function boundedDirtyJobIds(
@@ -234,7 +307,7 @@ export async function signalMissionSupervisorForJobPatch(
   patch: Record<string, unknown>,
   now = Date.now(),
 ): Promise<MissionSupervisorWakeResult> {
-  const provenance = provenanceFor(job);
+  const provenance = supervisorJobDecisionProvenance(job);
   if (!provenance) {
     return { signaled: false, reason: "legacy_or_invalid_provenance" };
   }
@@ -244,33 +317,14 @@ export async function signalMissionSupervisorForJobPatch(
     return { signaled: false, reason: "unchanged_snapshot" };
   }
 
-  const missionId = ctx.db.normalizeId("missions", provenance.missionId);
-  if (!missionId) {
-    return { signaled: false, reason: "legacy_or_invalid_provenance" };
+  const exactProvenance = await readExactSupervisorJobDecisionProvenance(
+    ctx,
+    job,
+  );
+  if (!exactProvenance.ok) {
+    return { signaled: false, reason: exactProvenance.reason };
   }
-
-  const decisions = await ctx.db
-    .query("missionSupervisorDecisions")
-    .withIndex("by_key", (q) =>
-      q.eq("decisionKey", provenance.decisionKey)
-    )
-    .take(2);
-  if (decisions.length !== 1) {
-    return { signaled: false, reason: "missing_or_ambiguous_decision" };
-  }
-  const decision = decisions[0];
-  if (
-    decision.protocolVersion !== 1 ||
-    !["delegate", "recover"].includes(decision.kind) ||
-    String(decision.missionId) !== String(missionId) ||
-    decision.epoch !== provenance.epoch ||
-    decision.decisionKey !== provenance.decisionKey ||
-    decision.createdJobIds.length > MISSION_SUPERVISOR_WAKE_MAX_JOBS ||
-    provenance.ordinal >= decision.createdJobIds.length ||
-    String(decision.createdJobIds[provenance.ordinal]) !== String(job._id)
-  ) {
-    return { signaled: false, reason: "provenance_mismatch" };
-  }
+  const { missionId } = exactProvenance;
 
   const states = await ctx.db
     .query("missionSupervisorState")

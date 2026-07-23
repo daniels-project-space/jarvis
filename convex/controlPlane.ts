@@ -40,6 +40,7 @@ import {
 } from "../src/lib/work-order-revision";
 import { admittedTriggerMachine } from "../src/lib/trigger-machine";
 import { signalMissionSupervisorForJobPatch } from "./missionSupervisorWake";
+import type { Doc, Id } from "./_generated/dataModel";
 
 function defined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
@@ -498,6 +499,35 @@ export async function attemptAuthorityFields(ctx: any, job: any, attempt: number
   return (await attemptAuthorityEnvelope(ctx, job, attempt)).fields;
 }
 
+export type ExactWorkAttemptLookup =
+  | { kind: "missing" }
+  | { kind: "ambiguous" }
+  | { kind: "exact"; attempt: Doc<"workAttempts"> };
+
+/**
+ * Resolve one immutable attempt slot without allowing a duplicate row to win
+ * by index order. Callers that mint or execute authority must distinguish a
+ * genuinely empty slot from a corrupt/ambiguous one.
+ */
+export async function readExactWorkAttempt(
+  ctx: any,
+  jobId: Id<"jobs">,
+  attempt: number,
+): Promise<ExactWorkAttemptLookup> {
+  if (!Number.isSafeInteger(attempt) || attempt < 1) {
+    return { kind: "ambiguous" };
+  }
+  const rows = await ctx.db
+    .query("workAttempts")
+    .withIndex("by_job_attempt", (q: any) =>
+      q.eq("jobId", jobId).eq("attempt", attempt)
+    )
+    .take(2);
+  if (rows.length === 0) return { kind: "missing" };
+  if (rows.length !== 1) return { kind: "ambiguous" };
+  return { kind: "exact", attempt: rows[0] };
+}
+
 /** Allocate one immutable attempt envelope for any admitted job producer. */
 export async function ensureWorkAttempt(
   ctx: any,
@@ -507,11 +537,14 @@ export async function ensureWorkAttempt(
   now = Date.now(),
   patch: Record<string, unknown> = {},
   knownMissing = false,
-) {
-  const existing = knownMissing ? null : await ctx.db.query("workAttempts")
-    .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", attempt))
-    .first();
-  if (existing) return existing;
+): Promise<Doc<"workAttempts">> {
+  if (!knownMissing) {
+    const existing = await readExactWorkAttempt(ctx, job._id, attempt);
+    if (existing.kind === "ambiguous") {
+      throw new Error("Work attempt authority is ambiguous");
+    }
+    if (existing.kind === "exact") return existing.attempt;
+  }
   const workspaceLineage = job.workspaceLineage;
   const value = {
     jobId: job._id,
@@ -530,25 +563,45 @@ export async function ensureWorkAttempt(
     ...patch,
   };
   const id = await ctx.db.insert("workAttempts", value);
-  return { ...value, _id: id };
+  // Convex supplies `_creationTime` on the committed document. Callers only
+  // consume the schema fields assembled above within this same transaction.
+  return { ...value, _id: id } as unknown as Doc<"workAttempts">;
 }
 
 /**
  * Point-read and re-hash the exact job/admission/attempt ledger envelope.
  * Historical rows without this v2 envelope remain visible but cannot execute.
  */
-export async function readAttemptExecutionAuthority(ctx: any, job: any, attemptNumber: number) {
+export async function validateExactWorkAttemptExecutionAuthority(
+  ctx: any,
+  job: any,
+  attempt: Doc<"workAttempts">,
+) {
+  const attemptNumber = Number(attempt.attempt);
+  if (
+    String(attempt.jobId) !== String(job._id)
+    || !Number.isSafeInteger(attemptNumber)
+    || attemptNumber < 1
+  ) {
+    return null;
+  }
   let envelope;
   try { envelope = await attemptAuthorityEnvelope(ctx, job, attemptNumber); }
   catch { return null; }
   const expected = envelope.fields;
-  const attempt = await ctx.db.query("workAttempts")
-    .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", attemptNumber))
-    .first();
-  if (!attempt) return null;
   const fields = Object.keys(expected) as Array<keyof typeof expected>;
   if (fields.some((field) => attempt[field] !== expected[field])) return null;
   return { attempt, ...expected, workOrder: envelope.workOrder };
+}
+
+export async function readAttemptExecutionAuthority(ctx: any, job: any, attemptNumber: number) {
+  const lookup = await readExactWorkAttempt(ctx, job._id, attemptNumber);
+  if (lookup.kind !== "exact") return null;
+  return await validateExactWorkAttemptExecutionAuthority(
+    ctx,
+    job,
+    lookup.attempt,
+  );
 }
 
 export function runtimeMatchesSchedulingAuthority(runtime: any, authority: {
@@ -699,13 +752,29 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
   return jobId;
 }
 
+export type JobRuntimePatchOptions = {
+  supervisorSignal?: "emit" | "suppress";
+  queueRefresh?: "immediate" | "deferred";
+};
+
+type InternalJobRuntimePatchOptions = JobRuntimePatchOptions & {
+  allowWorkOrderTransition?: boolean;
+};
+
+export type SupervisorBatchJobPatchResult = {
+  job: Record<string, unknown>;
+  queueRefreshRequired: boolean;
+  schedulingGroupKey?: string;
+};
+
 async function patchJobWithRuntimeInternal(
   ctx: any,
   job: any,
   patch: Record<string, unknown>,
-  allowWorkOrderTransition = false,
-  refreshQueue = true,
-) {
+  options: InternalJobRuntimePatchOptions = {},
+): Promise<SupervisorBatchJobPatchResult> {
+  const allowWorkOrderTransition = options.allowWorkOrderTransition ?? false;
+  const refreshQueue = (options.queueRefresh ?? "immediate") === "immediate";
   const prospective = { ...job, ...patch };
   if (job.schedulingBound && IMMUTABLE_JOB_BINDING_FIELDS.some((field) => field in patch && patch[field] !== job[field])) {
     throw new Error("Immutable job scheduling authority cannot be changed");
@@ -718,16 +787,28 @@ async function patchJobWithRuntimeInternal(
     throw new Error("Active work-order authority can change only through an append-only revision");
   }
   const committedPatch = patch;
-  await signalMissionSupervisorForJobPatch(ctx, job, committedPatch);
+  if ((options.supervisorSignal ?? "emit") === "emit") {
+    await signalMissionSupervisorForJobPatch(ctx, job, committedPatch);
+  }
   const existing = await jobRuntimeFor(ctx, job._id);
   await ctx.db.patch(job._id, committedPatch);
   const projected = projectJobRuntime(mergeJobRuntimeSource(job, committedPatch, existing));
   if (existing) await ctx.db.replace(existing._id, projected);
   else await ctx.db.insert("jobRuntime", projected);
   const queueFields = new Set(["status", "nextRunAt", "dispatchReady", "schedulingBound", "priority"]);
-  if (refreshQueue && Object.keys(patch).some((field) => queueFields.has(field))) {
+  const queueRefreshRequired = Object.keys(patch).some((field) =>
+    queueFields.has(field)
+  );
+  if (refreshQueue && queueRefreshRequired) {
     await refreshWorkGroupQueueProjection(ctx, projected.schedulingGroupKey);
   }
+  return {
+    job: prospective,
+    queueRefreshRequired,
+    schedulingGroupKey: typeof projected.schedulingGroupKey === "string"
+      ? projected.schedulingGroupKey
+      : undefined,
+  };
 }
 
 export async function patchJobWithRuntime(ctx: any, job: any, patch: Record<string, unknown>) {
@@ -740,7 +821,25 @@ export async function patchJobWithRuntime(ctx: any, job: any, patch: Record<stri
  * once before committing the batch.
  */
 export async function patchJobWithRuntimeDeferredQueue(ctx: any, job: any, patch: Record<string, unknown>) {
-  await patchJobWithRuntimeInternal(ctx, job, patch, false, false);
+  await patchJobWithRuntimeInternal(ctx, job, patch, {
+    queueRefresh: "deferred",
+  });
+}
+
+/**
+ * Apply one member of a mission-level supervisor control transaction. The
+ * outer mutation owns the single supervisor input revision and refreshes each
+ * affected queue group once after every member has been patched.
+ */
+export async function patchJobWithRuntimeForSupervisorBatch(
+  ctx: any,
+  job: any,
+  patch: Record<string, unknown>,
+): Promise<SupervisorBatchJobPatchResult> {
+  return await patchJobWithRuntimeInternal(ctx, job, patch, {
+    supervisorSignal: "suppress",
+    queueRefresh: "deferred",
+  });
 }
 
 function activeWorkOrderPatch(
@@ -784,6 +883,7 @@ export async function stageJobWorkOrderRevision(
   ctx: any,
   job: any,
   changes: Record<string, unknown>,
+  options: JobRuntimePatchOptions = {},
 ) {
   const current = await readJobWorkOrderAuthority(ctx, job);
   if (!current) throw new Error("Cannot append a revision to an invalid work order");
@@ -839,7 +939,7 @@ export async function stageJobWorkOrderRevision(
     createdAt: Date.now(),
   });
   const pendingPatch = { pendingWorkOrderRevisionId: revisionId, pendingWorkOrderRevisionDigest: digest };
-  await patchJobWithRuntimeInternal(ctx, job, pendingPatch);
+  await patchJobWithRuntimeInternal(ctx, job, pendingPatch, options);
   return { job: { ...job, ...pendingPatch }, row: { ...binding, _id: revisionId, revisionDigest: digest }, binding, digest };
 }
 
@@ -848,6 +948,7 @@ export async function activateStagedJobWorkOrderRevision(
   ctx: any,
   job: any,
   statePatch: Record<string, unknown> = {},
+  options: JobRuntimePatchOptions = {},
 ) {
   const current = await readJobWorkOrderAuthority(ctx, job);
   const revision: any = job.pendingWorkOrderRevisionId ? await ctx.db.get(job.pendingWorkOrderRevisionId) : null;
@@ -859,7 +960,10 @@ export async function activateStagedJobWorkOrderRevision(
     throw new Error("Staged work-order revision failed its immutable parent fence");
   }
   const patch = { ...statePatch, ...activeWorkOrderPatch(binding, revision._id, revision.revisionDigest) };
-  await patchJobWithRuntimeInternal(ctx, job, patch, true);
+  await patchJobWithRuntimeInternal(ctx, job, patch, {
+    ...options,
+    allowWorkOrderTransition: true,
+  });
   return { ...job, ...patch };
 }
 
@@ -868,9 +972,15 @@ export async function transitionJobWorkOrderRevision(
   job: any,
   changes: Record<string, unknown>,
   statePatch: Record<string, unknown> = {},
+  options: JobRuntimePatchOptions = {},
 ) {
-  const staged = await stageJobWorkOrderRevision(ctx, job, changes);
-  return await activateStagedJobWorkOrderRevision(ctx, staged.job, statePatch);
+  const staged = await stageJobWorkOrderRevision(ctx, job, changes, options);
+  return await activateStagedJobWorkOrderRevision(
+    ctx,
+    staged.job,
+    statePatch,
+    options,
+  );
 }
 
 export async function quarantineJobRuntime(ctx: any, job: any, runtime?: any) {

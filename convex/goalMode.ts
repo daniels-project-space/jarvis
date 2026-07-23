@@ -21,6 +21,7 @@ import {
   insertMissionWithRuntime,
   patchJobWithRuntime,
   patchMissionWithRuntime,
+  readExactWorkAttempt,
   runtimeJob,
   stageJobWorkOrderRevision,
   transitionJobWorkOrderRevision,
@@ -2376,8 +2377,15 @@ export const control = mutation({
               await stageJobWorkOrderRevision(ctx, current, revision.changes);
               await patchJobWithRuntime(ctx, current, steerPatch);
             } else {
-              const attempt = await ctx.db.query("workAttempts")
-                .withIndex("by_job_attempt", (q: any) => q.eq("jobId", current._id).eq("attempt", Number(current.attempt ?? 1))).first();
+              const attemptLookup = await readExactWorkAttempt(
+                ctx,
+                current._id,
+                Number(current.attempt ?? 1),
+              );
+              if (attemptLookup.kind === "ambiguous") return false;
+              const attempt = attemptLookup.kind === "exact"
+                ? attemptLookup.attempt
+                : null;
               // Steering an admitted but never-dispatched node revises the
               // sealed work order in place; it cannot manufacture a spent
               // execution generation. Once a worker lineage exists, steering

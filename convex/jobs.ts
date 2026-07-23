@@ -38,6 +38,7 @@ import {
   promoteCompletedJobDependents,
   quarantineJobRuntime,
   readAttemptExecutionAuthority,
+  readExactWorkAttempt,
   readJobSchedulingAuthority,
   stageJobWorkOrderRevision,
   transitionJobWorkOrderRevision,
@@ -299,10 +300,11 @@ function hasLiveDeliveryLease(row: any, a: any, now = Date.now()) {
 }
 
 async function attemptFor(ctx: any, jobId: any, attempt: number) {
-  return await ctx.db
+  const rows = await ctx.db
     .query("workAttempts")
     .withIndex("by_job_attempt", (q: any) => q.eq("jobId", jobId).eq("attempt", attempt))
-    .first();
+    .take(2);
+  return rows.length === 1 ? rows[0] : null;
 }
 
 async function attemptExecutionAuthorityFor(
@@ -1101,9 +1103,16 @@ async function validateSelectedDispatchCandidate(ctx: any, runtime: any, now: nu
     if (!integration || integration.jobId !== job._id || integration.status !== "queued") return null;
   }
   const attemptNumber = Math.max(1, Number(job.attempt ?? 1));
-  const existingAttempt = await ctx.db.query("workAttempts")
-    .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", attemptNumber)).first();
-  if (!existingAttempt) {
+  const existingAttempt = await readExactWorkAttempt(
+    ctx,
+    job._id,
+    attemptNumber,
+  );
+  if (existingAttempt.kind === "ambiguous") {
+    await quarantineJobRuntime(ctx, job, runtime);
+    return null;
+  }
+  if (existingAttempt.kind === "missing") {
     // Mint execution authority only after approval, mission phase, exact DAG
     // handoffs and integration admission have all passed. Invalid/stale work
     // therefore leaves no executable catalog lineage behind.
