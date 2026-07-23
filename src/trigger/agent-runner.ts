@@ -1,7 +1,6 @@
 import { metadata, schedules, task, timeout } from "@trigger.dev/sdk/v3";
 import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
-import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -100,6 +99,13 @@ import {
   type CloudProviderRuntimeAttestation,
 } from "./cloud-provider-probe-attestation";
 import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, createDeterministicTar, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider, type HistoricalCloudWorkspaceProviderName, type CredentiallessArchive } from "./cloud-workspace";
+import {
+  BoundedProcessError,
+  runBoundedProcess,
+  type BoundedStreamLimits,
+} from "./agent-process-bounds";
+import { BoundedAgentRunnerDecoder, type AgentRunnerEvent } from "./agent-runner-protocol";
+import { isJsonRecord } from "../lib/bounded-json";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent against an isolated cloud workspace through controller-owned dynamic
@@ -108,16 +114,39 @@ import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, createDeterministicTar, 
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
 
-function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, tier: string, timeoutMs: number): Promise<string> {
-  return new Promise((resolve) => {
-    const p = spawn(bin, [...codexReviewExecPrefix(tier), "-"], { env, stdio: ["pipe", "pipe", "pipe"] });
-    let output = "";
-    const timer = setTimeout(() => { try { p.kill("SIGKILL"); } catch { /* gone */ } resolve(output); }, timeoutMs);
-    p.stdout.on("data", (d) => (output += d.toString()));
-    p.on("close", () => { clearTimeout(timer); resolve(output); });
-    p.on("error", () => { clearTimeout(timer); resolve(""); });
-    p.stdin.end(prompt, "utf8");
+const kib = 1_024;
+const mib = 1_024 * kib;
+const DEFAULT_GIT_PROCESS_TIMEOUT_MS = 2 * 60_000;
+const streamLimits = (
+  maxBytes: number,
+  maxChunks: number,
+  maxLines: number,
+  retain: BoundedStreamLimits["retain"],
+): BoundedStreamLimits => Object.freeze({ maxBytes, maxChunks, maxLines, retain });
+const AGENT_CHILD_LIMITS = Object.freeze({
+  plainStdout: streamLimits(512 * kib, 4_096, 8_192, "all"),
+  plainStderr: streamLimits(256 * kib, 2_048, 8_192, Object.freeze({ tailBytes: 4 * kib })),
+  shellStdout: streamLimits(2 * mib, 32_768, 262_144, "all"),
+  shellStderr: streamLimits(512 * kib, 8_192, 65_536, Object.freeze({ tailBytes: 32 * kib })),
+  gitObjectStdout: streamLimits(DEFAULT_WORKSPACE_LIMITS.maxFileBytes, 16_384, DEFAULT_WORKSPACE_LIMITS.maxFileBytes, "all"),
+  gitObjectStderr: streamLimits(64 * kib, 2_048, 8_192, Object.freeze({ tailBytes: 4 * kib })),
+  agentStdout: streamLimits(64 * mib, 65_536, 200_000, "none"),
+  agentStderr: streamLimits(4 * mib, 32_768, 100_000, Object.freeze({ tailBytes: 4 * kib })),
+});
+
+async function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, tier: string, timeoutMs: number): Promise<string> {
+  const result = await runBoundedProcess({
+    command: bin,
+    args: [...codexReviewExecPrefix(tier), "-"],
+    env,
+    input: prompt,
+    maxInputBytes: 64 * kib,
+    timeoutMs,
+    stdout: AGENT_CHILD_LIMITS.plainStdout,
+    stderr: AGENT_CHILD_LIMITS.plainStderr,
   });
+  if (result.code !== 0) throw new BoundedProcessError("process_exit");
+  return redactSensitiveText(result.stdout.toString("utf8"), env);
 }
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -180,46 +209,36 @@ async function chatThread(): Promise<string> {
 }
 type BoundedProcess = { signal?: AbortSignal; timeoutMs?: number };
 
-function sh(cmd: string, args: string[], env: NodeJS.ProcessEnv, options: BoundedProcess = {}): Promise<{ code: number | null; out: string }> {
-  return new Promise((res) => {
-    const p = spawn(cmd, args, { env, stdio: ["ignore", "pipe", "pipe"] });
-    let o = "";
-    let settled = false;
-    const finish = (code: number | null) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      options.signal?.removeEventListener("abort", abort);
-      res({ code, out: o });
-    };
-    const abort = () => { try { p.kill("SIGKILL"); } catch { /* already exited */ } };
-    if (options.signal?.aborted) abort();
-    else options.signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(abort, Math.max(1, options.timeoutMs ?? 24 * 60 * 60_000));
-    timer.unref?.();
-    p.stdout.on("data", (d) => (o += d.toString()));
-    p.stderr.on("data", (d) => (o += d.toString()));
-    p.on("close", (code) => finish(code));
-    p.on("error", () => finish(-1));
+async function sh(cmd: string, args: string[], env: NodeJS.ProcessEnv, options: BoundedProcess = {}): Promise<{ code: number | null; out: string }> {
+  const result = await runBoundedProcess({
+    command: cmd,
+    args,
+    env,
+    maxInputBytes: 0,
+    timeoutMs: Math.max(1, options.timeoutMs ?? DEFAULT_GIT_PROCESS_TIMEOUT_MS),
+    signal: options.signal,
+    stdout: AGENT_CHILD_LIMITS.shellStdout,
+    stderr: AGENT_CHILD_LIMITS.shellStderr,
   });
+  return {
+    code: result.code,
+    out: result.stdout.toString("utf8") + result.stderr.toString("utf8"),
+  };
 }
 
-function readGitObject(cwd: string, sha: string, env: NodeJS.ProcessEnv, options: BoundedProcess = {}): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const p = spawn("git", ["-C", cwd, "cat-file", "blob", sha], { env, stdio: ["ignore", "pipe", "pipe"] });
-    const chunks: Buffer[] = [];
-    let error = "";
-    const abort = () => { try { p.kill("SIGKILL"); } catch { /* already exited */ } };
-    if (options.signal?.aborted) abort();
-    else options.signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(abort, Math.max(1, options.timeoutMs ?? 90_000));
-    timer.unref?.();
-    const cleanup = () => { clearTimeout(timer); options.signal?.removeEventListener("abort", abort); };
-    p.stdout.on("data", (data: Buffer) => chunks.push(Buffer.from(data)));
-    p.stderr.on("data", (data) => { error += data.toString(); });
-    p.on("close", (code) => { cleanup(); code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`git cat-file ${sha} failed (${String(code)}): ${error.slice(-500)}`)); });
-    p.on("error", (error) => { cleanup(); reject(error); });
+async function readGitObject(cwd: string, sha: string, env: NodeJS.ProcessEnv, options: BoundedProcess = {}): Promise<Buffer> {
+  const result = await runBoundedProcess({
+    command: "git",
+    args: ["-C", cwd, "cat-file", "blob", sha],
+    env,
+    maxInputBytes: 0,
+    timeoutMs: Math.max(1, options.timeoutMs ?? 90_000),
+    signal: options.signal,
+    stdout: AGENT_CHILD_LIMITS.gitObjectStdout,
+    stderr: AGENT_CHILD_LIMITS.gitObjectStderr,
   });
+  if (result.code !== 0) throw new BoundedProcessError("process_exit");
+  return result.stdout;
 }
 
 // Sub-agent model routing uses the same Codex subscription tiers as the
@@ -300,7 +319,7 @@ async function verifyWork(
   }
 }
 
-function runAgent(
+async function runAgent(
   bin: string,
   cwd: string,
   env: NodeJS.ProcessEnv,
@@ -318,175 +337,179 @@ function runAgent(
   checkpointLog: string;
   commands: GitCommandEvidence[];
 }> {
-  return new Promise((resolve) => {
-    // Mission synthesis is controller reasoning, not repository execution.
-    // Its model process has no shell, web, apps, plugins, hooks, MCP, or child
-    // agents, keeping the access snapshot inside the trusted Codex parent.
-    const args = [...codexReviewExecPrefix(model, reasoningEffort), "--json", "-"];
-    const codexSelection = codexModelFor(model);
-    const runtimeLabel = `${codexSelection.model} · ${normalizeReasoningEffort(reasoningEffort, codexSelection.effort)}`;
-    const p = spawn(bin, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
-    p.stdin.end(prompt, "utf8");
-    let buf = "";
-    let stderr = "";
-    let finalText = "";
-    let latest = "starting up…";
-    let stage = "starting";
-    let percent = 4;
-    let workUnits = 0;
-    let dirty = false;
-    let settled = false;
-    const commands: GitCommandEvidence[] = [];
-    // full session transcript tail — streamed into the job row so the pill's
-    // live view shows the agent actually working, not one opaque line
-    const logLines: string[] = [];
-    const pushLog = (line: string) => {
-      logLines.push(line);
-      if (logLines.length > 120) logLines.shift();
-      dirty = true;
-    };
-    let lastHeartbeat = Date.now();
-    const timer = onProgress
-      ? setInterval(() => {
-          if (dirty || Date.now() - lastHeartbeat >= 30_000) {
-            dirty = false;
-            lastHeartbeat = Date.now();
-            onProgress(latest, logLines.join("\n").slice(-12_000), stage, percent);
-          }
-        }, 1500)
-      : null;
-    const finish = (timedOut: boolean, stopped: "paused" | "cancelled" | "stalled" | "steered" | null = null) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(to);
-      if (timer) clearInterval(timer);
-      if (controlTimer) clearInterval(controlTimer);
-      resolve({
-        text: finalText || (timedOut ? "(agent segment timed out)" : stopped ? `(agent ${stopped})` : "(no output)"),
-        timedOut,
-        stopped,
-        checkpointLog: logLines.join("\n").slice(-12_000),
-        commands,
-      });
-    };
-    const to = setTimeout(() => {
-      try {
-        p.kill("SIGKILL");
-      } catch {
-        /* already gone */
+  // Mission synthesis is controller reasoning, not repository execution. Its
+  // model process has no tools, hooks, or child agents; the bounded protocol
+  // below keeps its access snapshot inside the trusted Codex parent.
+  const args = [...codexReviewExecPrefix(model, reasoningEffort), "--json", "-"];
+  const codexSelection = codexModelFor(model);
+  const runtimeLabel = `${codexSelection.model} · ${normalizeReasoningEffort(reasoningEffort, codexSelection.effort)}`;
+  const protocol = new BoundedAgentRunnerDecoder();
+  const controlAbort = new AbortController();
+  let stopped: "paused" | "cancelled" | "stalled" | "steered" | null = null;
+  let finalText = "";
+  let latest = "starting up…";
+  let stage = "starting";
+  let percent = 4;
+  let workUnits = 0;
+  let dirty = false;
+  const commands: GitCommandEvidence[] = [];
+  const logLines: string[] = [];
+  const pushLog = (line: string) => {
+    const safe = redactSensitiveText(line, env).replace(/\0/g, "").slice(-600);
+    if (!safe) return;
+    logLines.push(safe);
+    if (logLines.length > 120) logLines.shift();
+    dirty = true;
+  };
+  const safeText = (value: string) => redactSensitiveText(value, env);
+  const oneLine = (value: string, maximum: number) => safeText(value).trim().replace(/\s+/g, " ").slice(-maximum);
+  const itemOf = (event: AgentRunnerEvent) => isJsonRecord(event.item) ? event.item : null;
+  const handleEvent = (event: AgentRunnerEvent) => {
+    const item = itemOf(event);
+    if (event.type === "thread.started") {
+      latest = `session started · ${runtimeLabel}`;
+      stage = "understanding";
+      percent = Math.max(percent, 8);
+      pushLog(`▸ ${runtimeLabel} session started`);
+    } else if (event.type === "item.started" && item?.type === "command_execution") {
+      latest = `Running ${oneLine(String(item.command ?? "command"), 120)}`;
+      stage = "executing";
+      workUnits += 1;
+      percent = Math.max(percent, Math.min(78, 14 + workUnits * 5));
+      pushLog(`▸ ${latest}`);
+    } else if (event.type === "item.completed" && item?.type === "command_execution") {
+      const evidence = commandEvidenceFromCodexEvent(event, env);
+      if (evidence) {
+        commands.push(evidence);
+        if (commands.length > 64) commands.shift();
+        const exit = evidence.exitCode === null ? evidence.status : `exit ${evidence.exitCode}`;
+        pushLog(`${evidence.exitCode === 0 ? "✓" : "!"} ${exit} · ${evidence.command.slice(0, 140)}`);
+        if (evidence.output) pushLog(evidence.output.slice(-400));
       }
-      finish(true);
-    }, timeoutMs); // bounded below Trigger's one-hour task ceiling
-    let controlBusy = false;
-    const controlTimer = executionState
-      ? setInterval(async () => {
-          if (controlBusy || settled) return;
-          controlBusy = true;
-          try {
-            const state = await executionState();
-            if (state === "paused" || state === "cancelled" || state === "stalled" || state === "steered") {
-              try {
-                p.kill("SIGTERM");
-                setTimeout(() => {
-                  if (p.exitCode === null) p.kill("SIGKILL");
-                }, 3000);
-              } catch {
-                /* already gone */
-              }
-              finish(false, state);
-            }
-          } finally {
-            controlBusy = false;
-          }
-        }, 12_000)
-      : null;
-    p.stdout.on("data", (d) => {
-      buf += redactSensitiveText(d.toString(), env);
-      let nl: number;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        if (!line) continue;
-        let ev: any;
-        try {
-          ev = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (ev.type === "thread.started") {
-          latest = `session started · ${runtimeLabel}`;
-          stage = "understanding";
-          percent = Math.max(percent, 8);
-          pushLog(`▸ ${runtimeLabel} session started`);
-        } else if (ev.type === "item.started" && ev.item?.type === "command_execution") {
-          latest = `Running ${String(ev.item.command ?? "command").slice(0, 120)}`;
+    } else if (event.type === "item.completed" && item?.type === "agent_message") {
+      if (typeof item.text === "string") {
+        finalText = safeText(item.text);
+        latest = oneLine(item.text, 160);
+        stage = "reviewing";
+        percent = Math.max(percent, 84);
+        pushLog(item.text.trim().slice(0, 400));
+      }
+    } else if (event.type === "assistant" && isJsonRecord(event.message) && Array.isArray(event.message.content)) {
+      for (const block of event.message.content) {
+        if (!isJsonRecord(block)) continue;
+        if (block.type === "tool_use") {
+          const input = isJsonRecord(block.input) ? block.input : {};
+          const name = oneLine(String(block.name ?? "tool"), 80);
+          const detail = input.command
+            ? `: ${oneLine(String(input.command), 80)}`
+            : input.file_path
+              ? `: ${oneLine(String(input.file_path), 120)}`
+              : "";
+          latest = `Using ${name}${detail}`;
           stage = "executing";
           workUnits += 1;
           percent = Math.max(percent, Math.min(78, 14 + workUnits * 5));
           pushLog(`▸ ${latest}`);
-        } else if (ev.type === "item.completed" && ev.item?.type === "command_execution") {
-          const evidence = commandEvidenceFromCodexEvent(ev, env);
-          if (evidence) {
-            commands.push(evidence);
-            if (commands.length > 64) commands.shift();
-            const exit = evidence.exitCode === null ? evidence.status : `exit ${evidence.exitCode}`;
-            pushLog(`${evidence.exitCode === 0 ? "✓" : "!"} ${exit} · ${evidence.command.slice(0, 140)}`);
-            if (evidence.output) pushLog(evidence.output.slice(-400));
-          }
-        } else if (ev.type === "item.completed" && ev.item?.type === "agent_message") {
-          if (typeof ev.item.text === "string") {
-            finalText = ev.item.text;
-            latest = ev.item.text.trim().replace(/\s+/g, " ").slice(-160);
-            stage = "reviewing";
-            percent = Math.max(percent, 84);
-            pushLog(ev.item.text.trim().slice(0, 400));
-          }
-        } else if (ev.type === "assistant" && ev.message?.content) {
-          for (const b of ev.message.content) {
-            if (b.type === "tool_use") {
-              latest = `Using ${b.name}${b.input?.command ? ": " + String(b.input.command).slice(0, 80) : b.input?.file_path ? ": " + b.input.file_path : ""}`;
-              stage = "executing";
-              workUnits += 1;
-              percent = Math.max(percent, Math.min(78, 14 + workUnits * 5));
-              pushLog(`▸ ${b.name}${b.input?.command ? "  $ " + String(b.input.command).slice(0, 140) : b.input?.file_path ? "  " + String(b.input.file_path).slice(0, 140) : ""}`);
-            } else if (b.type === "text" && b.text?.trim()) {
-              latest = b.text.trim().replace(/\s+/g, " ").slice(-160);
-              stage = "reasoning";
-              percent = Math.max(percent, Math.min(80, 18 + workUnits * 5));
-              pushLog(b.text.trim().slice(0, 400));
-            }
-          }
-        } else if (ev.type === "result" && typeof ev.result === "string") {
-          finalText = ev.result;
-          stage = "reviewing";
-          percent = Math.max(percent, 88);
-        } else if (ev.type === "turn.failed" || ev.type === "error") {
-          const message = String(ev.error?.message ?? ev.message ?? ev.error ?? "agent turn failed").slice(0, 2000);
-          finalText = `error: ${message}`;
-          latest = message.slice(-180);
-          stage = "error";
-          pushLog(`! ${message}`);
+        } else if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
+          latest = oneLine(block.text, 160);
+          stage = "reasoning";
+          percent = Math.max(percent, Math.min(80, 18 + workUnits * 5));
+          pushLog(block.text.trim().slice(0, 400));
         }
       }
+    } else if (event.type === "result" && typeof event.result === "string") {
+      finalText = safeText(event.result);
+      stage = "reviewing";
+      percent = Math.max(percent, 88);
+    } else if (event.type === "turn.failed" || event.type === "error") {
+      const error = isJsonRecord(event.error) ? event.error.message : event.error;
+      const message = oneLine(String(error ?? event.message ?? "agent turn failed"), 2_000);
+      finalText = `error: ${message}`;
+      latest = message.slice(-180);
+      stage = "error";
+      pushLog(`! ${message}`);
+    }
+  };
+
+  let lastHeartbeat = Date.now();
+  const progressTimer = onProgress
+    ? setInterval(() => {
+        if (dirty || Date.now() - lastHeartbeat >= 30_000) {
+          dirty = false;
+          lastHeartbeat = Date.now();
+          try { onProgress(latest, logLines.join("\n").slice(-12_000), stage, percent); }
+          catch { /* progress reporting cannot escape the bounded controller */ }
+        }
+      }, 1_500)
+    : undefined;
+  progressTimer?.unref?.();
+
+  let controlBusy = false;
+  const controlTimer = executionState
+    ? setInterval(async () => {
+        if (controlBusy || controlAbort.signal.aborted) return;
+        controlBusy = true;
+        try {
+          const state = await executionState().catch(() => "unknown");
+          if (state === "paused" || state === "cancelled" || state === "stalled" || state === "steered") {
+            stopped = state;
+            controlAbort.abort();
+          }
+        } finally {
+          controlBusy = false;
+        }
+      }, 12_000)
+    : undefined;
+  controlTimer?.unref?.();
+
+  try {
+    const result = await runBoundedProcess({
+      command: bin,
+      args,
+      cwd,
+      env,
+      input: prompt,
+      maxInputBytes: 512 * kib,
+      timeoutMs,
+      signal: controlAbort.signal,
+      stdout: AGENT_CHILD_LIMITS.agentStdout,
+      stderr: AGENT_CHILD_LIMITS.agentStderr,
+      onStdoutChunk: (chunk) => {
+        for (const event of protocol.push(chunk)) handleEvent(event);
+      },
+      onStdoutEnd: () => protocol.finish(),
+      onStderrChunk: (chunk) => {
+        const tail = chunk.subarray(Math.max(0, chunk.byteLength - 4 * kib));
+        const line = oneLine(tail.toString("utf8"), 180);
+        if (line) {
+          latest = line;
+          pushLog(`! ${line}`);
+        }
+      },
     });
-    p.stderr.on("data", (data) => {
-      const safe = redactSensitiveText(data.toString(), env);
-      stderr = (stderr + safe).slice(-4000);
-      const line = safe.trim().replace(/\s+/g, " ").slice(-180);
-      if (line) {
-        latest = line;
-        pushLog(`! ${line}`);
-      }
-    });
-    p.on("close", (code) => {
-      if (code !== 0 && !finalText) finalText = `error: ${stderr.trim() || `agent exited ${code}`}`;
-      finish(false);
-    });
-    p.on("error", (e) => {
-      finalText = "error: " + e.message;
-      finish(false);
-    });
-  });
+    if (result.code !== 0) throw new BoundedProcessError("process_exit");
+    return {
+      text: finalText || "(no output)",
+      timedOut: false,
+      stopped: null,
+      checkpointLog: logLines.join("\n").slice(-12_000),
+      commands,
+    };
+  } catch (error) {
+    if (stopped && error instanceof BoundedProcessError && error.reason === "aborted") {
+      return {
+        text: finalText || `(agent ${stopped})`,
+        timedOut: false,
+        stopped,
+        checkpointLog: logLines.join("\n").slice(-12_000),
+        commands,
+      };
+    }
+    throw error;
+  } finally {
+    if (progressTimer) clearInterval(progressTimer);
+    if (controlTimer) clearInterval(controlTimer);
+  }
 }
 
 // A malformed remote must never reach git. Short product names remain a
