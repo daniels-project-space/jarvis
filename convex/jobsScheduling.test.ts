@@ -92,6 +92,63 @@ describe("project-group fair reservation authority", () => {
     expect(projection.every((group) => group.queueHeadJobId || group.queueEligible === false)).toBe(true);
   });
 
+  it("excludes drained groups at the due index boundary before taking the bounded page", async () => {
+    const t = convexTest(schema, modules);
+    const liveJobId = await enqueue(t, { missionId: "mission-live-future-head" });
+    const now = Date.now();
+    const dueAt = now + 60_000;
+    const historicalUpdatedAt = now - 60_000;
+
+    await t.run(async (ctx) => {
+      const job = await ctx.db.get(liveJobId);
+      const runtime = await ctx.db.query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", liveJobId)).first();
+      const group = job?.schedulingGroupKey
+        ? await ctx.db.query("workGroupScheduling")
+          .withIndex("by_group", (q) => q.eq("groupKey", job.schedulingGroupKey!)).first()
+        : null;
+      if (!job || !runtime || !group) throw new Error("live scheduler fixture was not fully admitted");
+
+      await ctx.db.patch(liveJobId, { nextRunAt: dueAt });
+      await ctx.db.patch(runtime._id, { nextRunAt: dueAt, updatedAt: now });
+      await ctx.db.patch(group._id, {
+        queueHeadJobId: liveJobId,
+        queueHeadNextRunAt: dueAt,
+        queueEligible: false,
+        updatedAt: now,
+      });
+      for (let index = 0; index < 100; index += 1) {
+        const suffix = String(index).padStart(3, "0");
+        await ctx.db.insert("workGroupScheduling", {
+          groupKey: `empty-${suffix}`,
+          missionGroupId: `drained-mission-${suffix}`,
+          projectGroupId: `drained-project-${suffix}`,
+          canonicalProjectId: "evidence",
+          queueEligible: false,
+          lastServedSequence: 0,
+          reservationCount: 0,
+          createdAt: historicalUpdatedAt,
+          updatedAt: historicalUpdatedAt,
+        });
+      }
+    });
+
+    vi.setSystemTime(dueAt + 1);
+    const batch = await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      reason: "empty-due-page-starvation-proof",
+      workerToken: WORKER,
+    });
+    expect(batch.reservations.map((reservation) => reservation.jobId)).toEqual([String(liveJobId)]);
+
+    const drained = await t.run(async (ctx) => (await ctx.db.query("workGroupScheduling").collect())
+      .filter((group) => group.groupKey.startsWith("empty-")));
+    expect(drained).toHaveLength(100);
+    expect(drained.every((group) => group.queueEligible === false
+      && group.queueHeadNextRunAt === undefined
+      && group.updatedAt === historicalUpdatedAt)).toBe(true);
+  });
+
   it("fills the first bounded wave across an oversized old group and two newly spoken groups", async () => {
     const t = convexTest(schema, modules);
     const old = await testMissionAdmission(t, { key: "mission-old", workerToken: WORKER });

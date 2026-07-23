@@ -706,7 +706,12 @@ export async function projectedDispatchCandidates(ctx: any, now: number, request
   // removes rows from this due page, so even more than three windows of newly
   // due groups eventually become visible without scanning the jobs table.
   const newlyDueGroups = await ctx.db.query("workGroupScheduling")
-    .withIndex("by_queue_due", (q: any) => q.eq("queueEligible", false).lte("queueHeadNextRunAt", now))
+    .withIndex("by_queue_due", (q: any) => q
+      .eq("queueEligible", false)
+      // Missing optional values sort before numbers in Convex indexes. The
+      // lower bound excludes drained projections before the bounded take.
+      .gte("queueHeadNextRunAt", 0)
+      .lte("queueHeadNextRunAt", now))
     .take(DISPATCH_CANDIDATE_WINDOW_MAX);
   for (const group of newlyDueGroups) await ctx.db.patch(group._id, { queueEligible: true, updatedAt: now });
 
