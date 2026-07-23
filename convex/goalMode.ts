@@ -22,6 +22,9 @@ import {
   patchJobWithRuntime,
   patchMissionWithRuntime,
   runtimeJob,
+  stageJobWorkOrderRevision,
+  transitionJobWorkOrderRevision,
+  readAttemptExecutionAuthority,
 } from "./controlPlane";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { exactTextWorkOrder } from "../src/lib/work-order";
@@ -215,9 +218,8 @@ async function insertGoalJob(ctx: any, input: GoalJobInput) {
   });
   const approvalRequired = approval.required;
   const status = approvalRequired ? "awaiting_approval" : "pending";
-  const { policyTask: _policyTask, ...persistedInput } = input;
   const jobId = await insertJobWithRuntime(ctx, {
-    ...persistedInput,
+    ...input,
     label: input.label.slice(0, 80),
     visibility: "conversation",
     status,
@@ -320,6 +322,7 @@ function handoffEnvelope(row: any) {
     sourceJobId: String(row.sourceJobId),
     sourceAttempt: row.sourceAttempt,
     sourceSteerRevision: row.sourceSteerRevision,
+    workOrderRevisionDigest: row.workOrderRevisionDigest,
     reviewReceiptDigest: row.reviewReceiptDigest,
     integrationReceiptDigest: row.integrationReceiptDigest,
     repository: row.repository,
@@ -346,14 +349,20 @@ export async function ensureGoalNodeHandoff(ctx: any, source: any) {
       .eq("sourceAttempt", sourceAttempt).eq("planGeneration", Number(source.planGeneration))).first();
   if (existing) return existing.planDigest === source.planDigest
     && existing.sourceNodeId === source.planNodeId
+    && existing.workOrderRevisionDigest === source.workOrderRevisionDigest
     && Number(existing.sourceSteerRevision) === sourceSteerRevision ? existing : null;
 
   const receipt: any = await ctx.db.query("workReceipts")
     .withIndex("by_job_attempt", (q: any) => q.eq("jobId", source._id).eq("attempt", sourceAttempt)).first();
-  if (!receipt || receipt.status !== "succeeded" || receipt.verification !== "pass") return null;
+  const executionAuthority = await readAttemptExecutionAuthority(ctx, source, sourceAttempt);
+  if (!executionAuthority || !receipt || receipt.status !== "succeeded" || receipt.verification !== "pass"
+    || receipt.authorityDigest !== executionAuthority.authorityDigest
+    || receipt.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest) return null;
   const review: any = source.reviewReceiptId ? await ctx.db.get(source.reviewReceiptId) : null;
   if (source.repo && (!review || review.jobId !== source._id || review.attempt !== sourceAttempt
-    || review.receiptDigest !== source.reviewReceiptDigest || receipt.reviewReceiptDigest !== review.receiptDigest)) return null;
+    || review.receiptDigest !== source.reviewReceiptDigest || receipt.reviewReceiptDigest !== review.receiptDigest
+    || review.authorityDigest !== executionAuthority.authorityDigest
+    || review.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest)) return null;
 
   let integration: any = null;
   let terminal: any = null;
@@ -364,8 +373,11 @@ export async function ensureGoalNodeHandoff(ctx: any, source: any) {
     if (!integration || integration.jobId !== source._id || integration.workAttempt !== sourceAttempt
       || integration.status !== "integrated" || !integration.terminalReceiptDigest
       || integration.reviewReceiptDigest !== source.reviewReceiptDigest
+      || integration.authorityDigest !== executionAuthority.authorityDigest
+      || integration.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest
       || integration.providerObservedHeadSha !== integration.preparedIntegrationHeadSha
-      || !terminal || terminal.receiptDigest !== integration.terminalReceiptDigest || terminal.outcome !== "integrated") return null;
+      || !terminal || terminal.receiptDigest !== integration.terminalReceiptDigest || terminal.outcome !== "integrated"
+      || terminal.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest) return null;
   }
 
   const summary = String(source.result ?? source.progress ?? "Verified upstream node completed")
@@ -385,6 +397,7 @@ export async function ensureGoalNodeHandoff(ctx: any, source: any) {
     sourceJobId: source._id,
     sourceAttempt,
     sourceSteerRevision,
+    workOrderRevisionDigest: executionAuthority.workOrderRevisionDigest,
     reviewReceiptDigest: review?.receiptDigest,
     integrationReceiptDigest: terminal?.receiptDigest,
     repository: source.repo,
@@ -416,6 +429,7 @@ export async function verifiedGoalHandoffsForJob(ctx: any, target: any) {
     const handoff = await ensureGoalNodeHandoff(ctx, source);
     if (!handoff || handoff.planDigest !== target.planDigest || Number(handoff.planGeneration) !== Number(target.planGeneration)
       || handoff.sourceJobId !== source._id || Number(handoff.sourceAttempt) !== Number(source.attempt ?? 1)
+      || handoff.workOrderRevisionDigest !== source.workOrderRevisionDigest
       || Number(handoff.sourceSteerRevision) !== Number(source.steerRevision ?? 0)) return null;
     handoffs.push(handoffEnvelope(handoff));
   }
@@ -2140,6 +2154,14 @@ async function resetGoalJob(ctx: any, job: any, now: number, force = false, exte
       jobId: job._id, integrationAttemptId: job.integrationAttemptId,
       sourceWorkAttempt: job.attempt ?? 1, generation, policy: "mission_integration",
       status: "checkpointed", parentDeliveryAttemptId: prior._id,
+      authorityDigest: prior.authorityDigest,
+      schedulingBindingDigest: prior.schedulingBindingDigest,
+      workOrderRevisionId: prior.workOrderRevisionId,
+      workOrderRevision: prior.workOrderRevision,
+      workOrderRevisionDigest: prior.workOrderRevisionDigest,
+      canonicalProjectId: prior.canonicalProjectId,
+      repository: prior.repository,
+      missionGroupId: prior.missionGroupId,
       reviewReceiptId: prior.reviewReceiptId, reviewReceiptDigest: prior.reviewReceiptDigest,
       reviewKeyId: prior.reviewKeyId, reviewLineage: prior.reviewLineage,
       reviewedHeadSha: prior.reviewedHeadSha, reviewedBaseSha: prior.reviewedBaseSha,
@@ -2204,6 +2226,45 @@ async function resetGoalJob(ctx: any, job: any, now: number, force = false, exte
     parentAttempt: Number(job.attempt ?? 1),
   });
   return true;
+}
+
+function goalSteeringRevision(job: any, steer: string) {
+  const policyTask = exactTextWorkOrder(`${String(job.policyTask ?? job.task)}\n\nDaniel steering instruction:\n${steer}`);
+  const goalStage = ["planning", "building", "validating", "refining"].includes(String(job.goalStage))
+    ? job.goalStage as GoalJobInput["goalStage"]
+    : "building";
+  const approval = goalWorkApprovalPolicy({
+    task: policyTask,
+    repo: job.repo,
+    readonly: job.readonly,
+    risk: job.risk,
+    approvalRequired: job.approvalRequired,
+    goalStage,
+  });
+  return {
+    changes: {
+      steer,
+      policyTask,
+      approvalRequired: approval.required,
+      approvalReason: approval.reason,
+      deliveryMode: approval.deliveryMode,
+      risk: approval.required ? "consequential" : String(job.risk ?? "high"),
+    },
+    approval,
+  };
+}
+
+async function ensureGoalSteeringApproval(ctx: any, job: any, steer: string, now: number) {
+  if (!job.approvalRequired) return;
+  const approvals = await ctx.db.query("approvals")
+    .withIndex("by_job", (q: any) => q.eq("jobId", String(job._id))).take(20);
+  if (approvals.some((approval: any) => approval.status === "pending")) return;
+  await ctx.db.insert("approvals", {
+    jobId: String(job._id), kind: "goal-mode-steering",
+    summary: (job.label || job.task).slice(0, 240), risk: job.risk ?? "consequential",
+    payload: { repo: job.repo, agentId: job.agentId, reason: job.approvalReason, steer: steer.slice(0, 500) },
+    status: "pending", requestedAt: now,
+  });
 }
 
 // A worker crash, stale provider result, or lost Trigger wake is not an
@@ -2277,12 +2338,14 @@ export const control = mutation({
             const current: any = await ctx.db.get(job._id);
             if (!current) return false;
             const jobSteerRevision = Number(current.steerRevision ?? 0) + 1;
+            const revision = goalSteeringRevision(current, steer);
             const steerPatch = {
-              steer, steerRevision: jobSteerRevision,
+              steerRevision: jobSteerRevision,
               checkpoint: `${current.checkpoint ?? ""}\n\nDaniel steering instruction:\n${steer}`.trim().slice(-6_000),
               progress: "Split-parent steering preserved this node scope and queued a fresh execution generation",
             };
             if (integrationControl?.reconcile) {
+              await stageJobWorkOrderRevision(ctx, current, revision.changes);
               await patchJobWithRuntime(ctx, current, steerPatch);
             } else {
               const nextAttempt = Number(current.attempt ?? 1) + 1;
@@ -2302,10 +2365,13 @@ export const control = mutation({
                   heartbeatAt: now, updatedAt: now,
                 });
               }
-              await patchJobWithRuntime(ctx, current, {
+              const revised = await transitionJobWorkOrderRevision(ctx, current, revision.changes, {
                 ...steerPatch,
-                status: "pending", stage: "queued", attempt: nextAttempt,
-                startedAt: undefined, completedAt: undefined, heartbeatAt: now, progressAt: now, nextRunAt: now,
+                status: revision.approval.required ? "awaiting_approval" : "pending",
+                approvalStatus: revision.approval.required ? "pending" : undefined,
+                stage: revision.approval.required ? "approval" : "queued", attempt: nextAttempt,
+                startedAt: undefined, completedAt: undefined, heartbeatAt: now, progressAt: now,
+                nextRunAt: revision.approval.required ? undefined : now,
                 dispatchId: undefined, dispatchLeaseUntil: undefined, workerRunId: undefined, workerRuntime: undefined,
                 providerRunState: undefined, providerObservedAt: undefined,
                 deliveryLeaseVersion: Math.max(0, Number(current.deliveryLeaseVersion ?? 0)) + 1,
@@ -2315,10 +2381,11 @@ export const control = mutation({
                 reviewReceiptId: undefined, reviewReceiptDigest: undefined, reviewReceiptSignature: undefined,
                 verificationVerdict: undefined, verificationNote: undefined, verifiedAt: undefined,
               });
-              await ensureWorkAttempt(ctx, current, nextAttempt, "pending", now, {
+              await ensureWorkAttempt(ctx, revised, nextAttempt, revision.approval.required ? "awaiting_approval" : "pending", now, {
                 parentAttempt: Number(current.attempt ?? 1),
                 parentCheckpointHeadSha: attempt.checkpointHeadSha,
               });
+              await ensureGoalSteeringApproval(ctx, revised, steer, now);
             }
           }
           await patchMissionWithRuntime(ctx, mission, {
@@ -2560,12 +2627,12 @@ export const control = mutation({
         const jobId = phase === "planning" ? mission.planningJobId : mission.validatorJobId;
         const job = jobs.find((candidate) => String(candidate._id) === jobId);
         if (!job) return false;
+        let resetJob = job;
         if (phase === "validating") {
-          await patchJobWithRuntime(ctx, job, {
-            task: (await validatorTaskForMission(ctx, mission, jobs)).slice(0, GOAL_VALIDATOR_TASK_MAX_CHARS),
-          });
+          const nextTask = (await validatorTaskForMission(ctx, mission, jobs)).slice(0, GOAL_VALIDATOR_TASK_MAX_CHARS);
+          resetJob = await transitionJobWorkOrderRevision(ctx, job, { task: nextTask, policyTask: nextTask });
         }
-        if (!(await resetGoalJob(ctx, job, now, true))) return false;
+        if (!(await resetGoalJob(ctx, resetJob, now, true))) return false;
         await patchMissionWithRuntime(ctx, mission, {
           status: "running",
           phase,

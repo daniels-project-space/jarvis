@@ -234,11 +234,17 @@ export function immutableLineageIsValid(job: {
 export function canonicalAttemptAuthority(args: {
   binding: SchedulingBinding;
   bindingDigest: string;
+  workOrderRevisionId: string;
+  workOrderRevision: number;
+  workOrderRevisionDigest: string;
   attempt: number;
 }): string {
   return JSON.stringify({
     protocolVersion: args.binding.protocolVersion,
     bindingDigest: args.bindingDigest,
+    workOrderRevisionId: args.workOrderRevisionId,
+    workOrderRevision: Math.max(1, Math.floor(args.workOrderRevision)),
+    workOrderRevisionDigest: args.workOrderRevisionDigest,
     missionGroupId: args.binding.missionGroupId,
     projectGroupId: args.binding.projectGroupId,
     canonicalProjectId: args.binding.canonicalProjectId,

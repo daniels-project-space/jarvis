@@ -1125,6 +1125,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             const receiptDigest = coldReceipt && sha256(String(coldReceipt.receiptJson));
             const binding: GitReviewBinding = {
               jobId: String(job.jobId), attempt: expectedAttempt, repository: repo,
+              workOrderRevisionDigest: String(job.workOrderRevisionDigest ?? ""),
               branch: resumeBranch, baseSha: String(receipt?.baseSha ?? ""),
               agentEvidenceSha256: String(receipt?.agentEvidenceSha256 ?? ""), headSha: String(receipt?.headSha ?? ""),
             };
@@ -1133,6 +1134,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               signature: String(coldReceipt?.signature ?? ""),
             } as GitReviewEnvelope;
             if (!receiptAuthority || coldReceipt.receiptDigest !== receiptDigest
+              || coldReceipt.workOrderRevisionDigest !== job.workOrderRevisionDigest
+              || receipt?.workOrderRevisionDigest !== job.workOrderRevisionDigest
               || coldReceipt.signature !== job.reviewReceiptSignature
               || coldReceipt.receiptDigest !== job.reviewReceiptDigest
               || !await verifyGitReviewReceiptEnvelope(envelope, binding)) throw new Error("cold receipt binding failed");
@@ -2045,8 +2048,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }
           let goalReview: { envelope: GitReviewEnvelope; binding: GitReviewBinding } | undefined;
           if (repoDir) {
+            if (!await authorizeBoundary("review_receipt")) throw new Error("work-order authority changed before goal review receipt");
             const receipt = await buildGitReviewReceipt({
               runGit: (args) => sh("git", ["-C", repoDir!, ...args], env), jobId: String(job.jobId), attempt: expectedAttempt,
+              workOrderRevisionDigest: String(job.workOrderRevisionDigest ?? ""),
               repository: repo!, expectedBranch: branch || checkoutSourceBranch, baseSha: reviewBaseSha || baseSha,
               agentEvidence: cumulativeWorkEvidence(job.checkpoint, result), commands: run.commands,
             });
@@ -2112,10 +2117,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         let gitReview: { envelope: GitReviewEnvelope; binding: GitReviewBinding } | undefined;
         let reviewAuthority = receiptAuthority;
         if (repoDir) {
+          if (!await authorizeBoundary("review_receipt")) throw new Error("work-order authority changed before review receipt");
           const receipt = await buildGitReviewReceipt({
             runGit: (args) => sh("git", ["-C", repoDir!, ...args], env),
             jobId: String(job.jobId),
             attempt: expectedAttempt,
+            workOrderRevisionDigest: String(job.workOrderRevisionDigest ?? ""),
             repository: repo,
             expectedBranch: branch || checkoutSourceBranch,
             baseSha: reviewBaseSha || baseSha,

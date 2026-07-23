@@ -2,6 +2,7 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import {
+  activateStagedJobWorkOrderRevision,
   ensureWorkAttempt,
   insertJobWithRuntime,
   patchJobWithRuntime,
@@ -185,6 +186,18 @@ async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, outcome: 
     || review.baseSha !== attempt.reviewedBaseSha || review.headSha !== attempt.reviewedHeadSha
     || review.headTreeSha !== attempt.reviewedHeadTreeSha || review.diffSha256 !== attempt.reviewedDiffSha256
     || !SHA.test(String(job.sourceHeadSha ?? "")) || review.baseSha !== job.sourceHeadSha) return null;
+  const executionAuthority = await readAttemptExecutionAuthority(ctx, job, Number(attempt.workAttempt));
+  if (!executionAuthority
+    || attempt.authorityDigest !== executionAuthority.authorityDigest
+    || attempt.schedulingBindingDigest !== executionAuthority.schedulingBindingDigest
+    || attempt.workOrderRevisionId !== executionAuthority.workOrderRevisionId
+    || attempt.workOrderRevision !== executionAuthority.workOrderRevision
+    || attempt.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest
+    || review.authorityDigest !== executionAuthority.authorityDigest
+    || review.schedulingBindingDigest !== executionAuthority.schedulingBindingDigest
+    || review.workOrderRevisionId !== executionAuthority.workOrderRevisionId
+    || review.workOrderRevision !== executionAuthority.workOrderRevision
+    || review.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest) return null;
   const delivery: any = job.activeDeliveryAttemptId ? await ctx.db.get(job.activeDeliveryAttemptId) : null;
   if (!delivery || delivery.integrationAttemptId !== attempt._id
     || delivery.sourceWorkAttempt !== attempt.workAttempt
@@ -192,6 +205,11 @@ async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, outcome: 
     || delivery.reviewReceiptDigest !== attempt.reviewReceiptDigest
     || delivery.reviewedBaseSha !== attempt.reviewedBaseSha
     || delivery.reviewedHeadSha !== attempt.reviewedHeadSha
+    || delivery.authorityDigest !== executionAuthority.authorityDigest
+    || delivery.schedulingBindingDigest !== executionAuthority.schedulingBindingDigest
+    || delivery.workOrderRevisionId !== executionAuthority.workOrderRevisionId
+    || delivery.workOrderRevision !== executionAuthority.workOrderRevision
+    || delivery.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest
     || delivery.reviewedHeadTreeSha !== attempt.reviewedHeadTreeSha
     || delivery.reviewedDiffSha256 !== attempt.reviewedDiffSha256) return null;
   const repair: any = detail?.repairJobId ? await ctx.db.get(detail.repairJobId) : null;
@@ -211,13 +229,18 @@ async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, outcome: 
     blocked: true, code: "applied_final_requires_completion", byteLimit: INTEGRATION_TERMINAL_RECEIPT_MAX_BYTES,
   } satisfies ReceiptWriteBlocked;
   if (outcome === "integrated" && release.state !== "applied_final") return null;
-  if (existing) return existing.outcome === outcome ? existing : null;
+  if (existing) return existing.outcome === outcome
+    && existing.workOrderRevisionDigest === executionAuthority.workOrderRevisionDigest ? existing : null;
+  const sourceAttempt = workAttempts.find((row: any) => row.attempt === attempt.workAttempt);
+  if (!sourceAttempt || sourceAttempt.authorityDigest !== executionAuthority.authorityDigest
+    || sourceAttempt.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest) return null;
   const orderedWorkAttempts = workAttempts.sort((a: any, b: any) => a.attempt - b.attempt || String(a._id).localeCompare(String(b._id)));
   const orderedDeliveries = deliveryAttempts
     .filter((row: any) => row.jobId === attempt.jobId && row.integrationAttemptId === attempt._id)
     .sort((left: any, right: any) => left.generation - right.generation || String(left._id).localeCompare(String(right._id)));
   const workspaceAttemptManifests = orderedWorkAttempts.map((row: any) => ({
     id: String(row._id), attempt: row.attempt, parentAttempt: row.parentAttempt ?? null, workspaceKey: row.workspaceKey ?? null,
+    workOrderRevisionDigest: row.workOrderRevisionDigest ?? null,
     workspaceLineage: row.workspaceLineage ?? null, workerBranch: row.workerBranch ?? null,
     sourceHeadSha: row.sourceHeadSha ?? null, parentCheckpointHeadSha: row.parentCheckpointHeadSha ?? null,
     checkpointHeadSha: row.checkpointHeadSha ?? null, workerRunId: row.workerRunId ?? null,
@@ -225,6 +248,7 @@ async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, outcome: 
   }));
   const deliveryManifests = orderedDeliveries.map((row: any) => ({
     id: String(row._id), generation: row.generation,
+    workOrderRevisionDigest: row.workOrderRevisionDigest ?? null,
     parentDeliveryAttemptId: row.parentDeliveryAttemptId ? String(row.parentDeliveryAttemptId) : null,
     sourceWorkAttempt: row.sourceWorkAttempt, deliveryRunId: row.deliveryRunId ?? null,
     reviewReceiptId: row.reviewReceiptId ? String(row.reviewReceiptId) : null,
@@ -243,6 +267,8 @@ async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, outcome: 
     job: {
       id: String(job._id), workAttempt: attempt.workAttempt, parentJobId: job.parentJobId ?? null,
       retryLineage: job.retryLineage ?? null, workspaceLineage: job.workspaceLineage ?? null,
+      workOrderRevision: executionAuthority.workOrderRevision,
+      workOrderRevisionDigest: executionAuthority.workOrderRevisionDigest,
     },
     review: {
       id: String(review._id), digest: review.receiptDigest, keyId: review.keyId ?? "legacy-v1",
@@ -330,6 +356,7 @@ async function writeIntegrationTerminalReceipt(ctx: any, attempt: any, outcome: 
   const receiptDigest = await sha256Hex(receiptJson);
   const id = await ctx.db.insert("integrationTerminalReceipts", {
     missionId: attempt.missionId, jobId: attempt.jobId, integrationAttemptId: attempt._id,
+    workOrderRevisionDigest: executionAuthority.workOrderRevisionDigest,
     outcome, receiptJson, receiptDigest, createdAt: Date.now(),
   });
   return { _id: id, outcome, receiptJson, receiptDigest };
@@ -380,6 +407,14 @@ async function wakeNextIntegration(ctx: any, attempt: any) {
 
 function carriedIntegrationDelivery(delivery: any) {
   return {
+    authorityDigest: delivery.authorityDigest,
+    schedulingBindingDigest: delivery.schedulingBindingDigest,
+    workOrderRevisionId: delivery.workOrderRevisionId,
+    workOrderRevision: delivery.workOrderRevision,
+    workOrderRevisionDigest: delivery.workOrderRevisionDigest,
+    canonicalProjectId: delivery.canonicalProjectId,
+    repository: delivery.repository,
+    missionGroupId: delivery.missionGroupId,
     integrationAttemptId: delivery.integrationAttemptId,
     reviewReceiptId: delivery.reviewReceiptId,
     reviewReceiptDigest: delivery.reviewReceiptDigest,
@@ -434,10 +469,15 @@ export async function recoverExpiredIntegrationController(ctx: any, attempt: any
   if (!mission || !job || !executionAuthority
     || attempt.authorityDigest !== executionAuthority.authorityDigest
     || attempt.schedulingBindingDigest !== executionAuthority.schedulingBindingDigest
+    || attempt.workOrderRevisionId !== executionAuthority.workOrderRevisionId
+    || attempt.workOrderRevision !== executionAuthority.workOrderRevision
+    || attempt.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest
     || attempt.repository !== executionAuthority.repository
     || attempt.integrationLineage !== executionAuthority.integrationLineage
     || job.integrationAttemptId !== attempt._id
     || delivery?.integrationAttemptId !== attempt._id || delivery.status !== "running"
+    || delivery.authorityDigest !== executionAuthority.authorityDigest
+    || delivery.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest
     || mission.activeIntegrationAttemptId !== attempt._id) return null;
   const head = await fifoHead(ctx, attempt.missionId, attempt.repository);
   if (!head || head._id !== attempt._id) return null;
@@ -499,15 +539,27 @@ export async function recoverExpiredIntegrationController(ctx: any, attempt: any
   return { integrationAttemptId: attempt._id, jobId: job._id, deliveryAttemptId: nextDeliveryId, attention: budget.exhausted };
 }
 
-function exactFence(mission: any, attempt: any, args: any, job?: any) {
+async function exactFence(ctx: any, mission: any, attempt: any, args: any, suppliedJob?: any) {
+  const job = suppliedJob ?? (attempt?.jobId ? await ctx.db.get(attempt.jobId) : null);
+  const executionAuthority = job
+    ? await readAttemptExecutionAuthority(ctx, job, Number(attempt?.workAttempt))
+    : null;
   return mission?.status === "running"
-    && (!job || job.status === "running")
+    && job?.status === "running"
+    && executionAuthority
     && mission?.activeIntegrationAttemptId === attempt?._id
     && attempt.controllerRunId === args.controllerRunId
     && attempt.leaseOwner === args.leaseOwner
     && attempt.leaseToken === args.leaseToken
     && attempt.leaseVersion === args.leaseVersion
     && attempt.authorityDigest === args.authorityDigest
+    && attempt.authorityDigest === executionAuthority.authorityDigest
+    && attempt.schedulingBindingDigest === executionAuthority.schedulingBindingDigest
+    && attempt.workOrderRevisionId === executionAuthority.workOrderRevisionId
+    && attempt.workOrderRevision === executionAuthority.workOrderRevision
+    && attempt.workOrderRevisionDigest === executionAuthority.workOrderRevisionDigest
+    && attempt.repository === executionAuthority.repository
+    && attempt.integrationLineage === executionAuthority.integrationLineage
     && Number(attempt.leaseUntil ?? 0) >= Date.now()
     && mission.integrationLeaseVersion === args.leaseVersion
     && mission.integrationLeaseOwner === args.leaseOwner
@@ -543,7 +595,9 @@ export async function queueReviewedIntegration(ctx: any, job: any, review: any, 
     || executionAuthority.integrationLineage !== job.integrationLineage) return null;
   const existing = await ctx.db.query("integrationAttempts")
     .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("workAttempt", job.attempt ?? 1)).first();
-  if (existing) return existing.reviewReceiptDigest === reviewReceiptDigest ? existing : null;
+  if (existing) return existing.reviewReceiptDigest === reviewReceiptDigest
+    && existing.authorityDigest === executionAuthority.authorityDigest
+    && existing.workOrderRevisionDigest === executionAuthority.workOrderRevisionDigest ? existing : null;
   const generation = Number(mission.integrationGeneration ?? 0) + 1;
   const now = Date.now();
   const waiting = Boolean(await fifoHead(ctx, missionId, job.repo));
@@ -554,6 +608,9 @@ export async function queueReviewedIntegration(ctx: any, job: any, review: any, 
     workerBranch: job.workerBranch, integrationBranch: job.integrationBranch,
     authorityDigest: executionAuthority.authorityDigest,
     schedulingBindingDigest: executionAuthority.schedulingBindingDigest,
+    workOrderRevisionId: executionAuthority.workOrderRevisionId,
+    workOrderRevision: executionAuthority.workOrderRevision,
+    workOrderRevisionDigest: executionAuthority.workOrderRevisionDigest,
     canonicalProjectId: executionAuthority.canonicalProjectId,
     missionGroupId: executionAuthority.missionGroupId,
     projectGroupId: executionAuthority.projectGroupId,
@@ -602,6 +659,9 @@ export const claim = mutation({
       || !executionAuthority || args.authorityDigest !== executionAuthority.authorityDigest
       || attempt.authorityDigest !== executionAuthority.authorityDigest
       || attempt.schedulingBindingDigest !== executionAuthority.schedulingBindingDigest
+      || attempt.workOrderRevisionId !== executionAuthority.workOrderRevisionId
+      || attempt.workOrderRevision !== executionAuthority.workOrderRevision
+      || attempt.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest
       || attempt.canonicalProjectId !== executionAuthority.canonicalProjectId
       || attempt.missionGroupId !== executionAuthority.missionGroupId
       || attempt.projectGroupId !== executionAuthority.projectGroupId
@@ -609,6 +669,8 @@ export const claim = mutation({
       || attempt.repository !== executionAuthority.repository
       || job.integrationAttemptId !== attempt._id || job.deliveryRunId !== args.controllerRunId
       || delivery?.integrationAttemptId !== attempt._id || delivery?.deliveryRunId !== args.controllerRunId
+      || delivery?.authorityDigest !== executionAuthority.authorityDigest
+      || delivery?.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest
       || delivery?.policy !== "mission_integration" || !["pending", "running"].includes(job.status)) return null;
     const head = await fifoHead(ctx, mission._id, attempt.repository);
     if (!head || head._id !== attempt._id) return null;
@@ -680,7 +742,7 @@ export const heartbeat = mutation({
     // Job controls clear these two authority leases transactionally. Reading
     // the large job document on every pulse adds no fence that the mission and
     // attempt documents do not already provide.
-    if (!exactFence(mission, attempt, args)) return false;
+    if (!await exactFence(ctx, mission, attempt, args)) return false;
     const now = Date.now();
     if (Number(attempt.controllerDeadlineAt ?? 0) <= now) return false;
     const current = String(attempt.controllerState ?? "command") as keyof typeof CONTROLLER_STATE_MS;
@@ -717,7 +779,7 @@ export const prepare = mutation({
     const attempt: any = await ctx.db.get(args.id);
     const mission: any = attempt ? await ctx.db.get(attempt.missionId) : null;
     const job: any = attempt ? await ctx.db.get(attempt.jobId) : null;
-    if (!exactFence(mission, attempt, args, job)
+    if (!await exactFence(ctx, mission, attempt, args, job)
       || args.effectId.length < 1 || args.effectId.length > 300
       || !SHA.test(args.preparedIntegrationHeadSha) || !SHA.test(args.preparedIntegrationTreeSha)
       || !DIGEST.test(args.requestDigest)
@@ -761,7 +823,7 @@ export const observe = mutation({
     const attempt: any = await ctx.db.get(args.id);
     const mission: any = attempt ? await ctx.db.get(attempt.missionId) : null;
     const job: any = attempt ? await ctx.db.get(attempt.jobId) : null;
-    if (!exactFence(mission, attempt, args, job) || args.effectId.length < 1 || args.effectId.length > 300) return false;
+    if (!await exactFence(ctx, mission, attempt, args, job) || args.effectId.length < 1 || args.effectId.length > 300) return false;
     const effect: any = await ctx.db.query("integrationProviderEffects")
       .withIndex("by_attempt_effect", (q: any) => q.eq("integrationAttemptId", attempt._id).eq("effectId", args.effectId)).first();
     if (!effect) return false;
@@ -788,10 +850,22 @@ export const observe = mutation({
 
 async function queueSteeredContinuation(ctx: any, job: any, now: number) {
   const nextAttempt = Number(job.attempt ?? 1) + 1;
-  await ensureWorkAttempt(ctx, job, nextAttempt, "pending", now, { parentAttempt: job.attempt ?? 1 });
-  await patchJobWithRuntime(ctx, job, {
-    status: "pending", stage: "queued", progress: "provider truth reconciled — steering continuation queued",
-    attempt: nextAttempt, startedAt: undefined, completedAt: undefined, nextRunAt: now,
+  if (!job.pendingWorkOrderRevisionId || !job.pendingWorkOrderRevisionDigest) {
+    throw new Error("Steering continuation requires an append-only staged work-order revision");
+  }
+  const pending: any = await ctx.db.get(job.pendingWorkOrderRevisionId);
+  if (!pending || pending.revisionDigest !== job.pendingWorkOrderRevisionDigest) {
+    throw new Error("Steering continuation lost its staged revision authority");
+  }
+  const awaitingApproval = pending.approvalRequired === true;
+  const revised = await activateStagedJobWorkOrderRevision(ctx, job, {
+    status: awaitingApproval ? "awaiting_approval" : "pending",
+    approvalStatus: awaitingApproval ? "pending" : undefined,
+    stage: awaitingApproval ? "approval" : "queued",
+    progress: awaitingApproval
+      ? "provider truth reconciled — steering continuation awaits protected approval"
+      : "provider truth reconciled — steering continuation queued",
+    attempt: nextAttempt, startedAt: undefined, completedAt: undefined, nextRunAt: awaitingApproval ? undefined : now,
     integrationAttemptId: undefined, integrationState: undefined, activeDeliveryAttemptId: undefined,
     reviewReceiptId: undefined, reviewReceiptDigest: undefined, reviewReceiptSignature: undefined,
     verificationVerdict: undefined, verificationNote: undefined, verifiedAt: undefined,
@@ -801,6 +875,17 @@ async function queueSteeredContinuation(ctx: any, job: any, now: number) {
     deliveryLeaseOwner: undefined, deliveryLeaseToken: undefined, deliveryLeaseUntil: undefined,
     heartbeatAt: now,
   });
+  await ensureWorkAttempt(ctx, revised, nextAttempt, awaitingApproval ? "awaiting_approval" : "pending", now, { parentAttempt: job.attempt ?? 1 });
+  if (awaitingApproval) {
+    const approvals = await ctx.db.query("approvals")
+      .withIndex("by_job", (q: any) => q.eq("jobId", String(job._id))).take(20);
+    if (!approvals.some((approval: any) => approval.status === "pending")) await ctx.db.insert("approvals", {
+      jobId: String(job._id), kind: "steering",
+      summary: (revised.label || revised.task).slice(0, 240), risk: revised.risk ?? "consequential",
+      payload: { repo: revised.repo, agentId: revised.agentId, reason: revised.approvalReason },
+      status: "pending", requestedAt: now,
+    });
+  }
 }
 
 async function finalizeMissionControlIfSettled(ctx: any, mission: any) {
@@ -902,7 +987,7 @@ export const settleControl = mutation({
     const attempt: any = await ctx.db.get(args.id);
     const mission: any = attempt ? await ctx.db.get(attempt.missionId) : null;
     const job: any = attempt ? await ctx.db.get(attempt.jobId) : null;
-    if (!job || !exactFence(mission, attempt, args, job)) return false;
+    if (!job || !await exactFence(ctx, mission, attempt, args, job)) return false;
     return await settleRequestedControlWithoutRef(ctx, attempt, mission, job);
   },
 });
@@ -919,7 +1004,7 @@ export const complete = mutation({
       .withIndex("by_attempt_effect", (q: any) => q.eq("integrationAttemptId", attempt._id).eq("effectId", args.effectId)).first() : null;
     const effects: any[] = attempt ? await ctx.db.query("integrationProviderEffects")
       .withIndex("by_attempt_prepared", (q: any) => q.eq("integrationAttemptId", attempt._id)).collect() : [];
-    if (!job || !exactFence(mission, attempt, args, job) || attempt.preparedEffectId !== args.effectId
+    if (!job || !await exactFence(ctx, mission, attempt, args, job) || attempt.preparedEffectId !== args.effectId
       || effect?.effectKind !== "update_ref" || effect.observation !== "applied"
       || effect.providerHeadSha !== attempt.preparedIntegrationHeadSha
       || !integratedEffectChainMatches(attempt, effects, args.effectId)
@@ -975,6 +1060,13 @@ export const complete = mutation({
       .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", attempt.workAttempt)).first();
     if (!prior) await ctx.db.insert("workReceipts", {
       jobId: job._id, attempt: attempt.workAttempt, status: terminalOutcome === "integrated" ? "succeeded" : terminalOutcome,
+      authorityDigest: attempt.authorityDigest,
+      schedulingBindingDigest: attempt.schedulingBindingDigest,
+      workOrderRevisionId: attempt.workOrderRevisionId,
+      workOrderRevision: attempt.workOrderRevision,
+      workOrderRevisionDigest: attempt.workOrderRevisionDigest,
+      canonicalProjectId: attempt.canonicalProjectId,
+      repository: attempt.repository,
       acceptanceEvidence: [String(job.verificationNote ?? "controller review passed")],
       artifacts: [attempt.workerBranch, attempt.integrationBranch, attempt.preparedIntegrationHeadSha],
       verification: "pass", deliveryOutcome: terminalOutcome === "integrated" ? "mission_integrated" : terminalOutcome,
@@ -1003,7 +1095,7 @@ export const defer = mutation({
     const attempt: any = await ctx.db.get(args.id);
     const mission: any = attempt ? await ctx.db.get(attempt.missionId) : null;
     const job: any = attempt ? await ctx.db.get(attempt.jobId) : null;
-    if (!job || !exactFence(mission, attempt, args, job)) return false;
+    if (!job || !await exactFence(ctx, mission, attempt, args, job)) return false;
     const now = Date.now();
     const budget = reconciliationBudget(attempt, now);
     await ctx.db.patch(attempt._id, {
@@ -1030,11 +1122,8 @@ export const defer = mutation({
         nextDeliveryId = await ctx.db.insert("deliveryAttempts", {
           jobId: job._id, integrationAttemptId: attempt._id, sourceWorkAttempt: attempt.workAttempt,
           generation: nextDeliveryGeneration, policy: "mission_integration", status: "checkpointed",
-          parentDeliveryAttemptId: prior._id, reviewReceiptId: prior.reviewReceiptId,
-          reviewReceiptDigest: prior.reviewReceiptDigest, reviewKeyId: prior.reviewKeyId,
-          reviewLineage: prior.reviewLineage, reviewedHeadSha: prior.reviewedHeadSha,
-          reviewedBaseSha: prior.reviewedBaseSha, reviewedHeadTreeSha: prior.reviewedHeadTreeSha,
-          reviewedDiffSha256: prior.reviewedDiffSha256, heartbeatAt: now, retries: 0,
+          parentDeliveryAttemptId: prior._id, ...carriedIntegrationDelivery(prior),
+          heartbeatAt: now, retries: 0,
           cumulativeRetries: budget.retries, currentStep: "queued", retryReason: args.reasonCode.slice(0, 80),
           createdAt: now, updatedAt: now,
         });
@@ -1078,8 +1167,13 @@ export async function resumeIntegrationReconciliation(ctx: any, job: any, now = 
   const attempt: any = await ctx.db.get(job.integrationAttemptId);
   const mission: any = attempt ? await ctx.db.get(attempt.missionId) : null;
   const delivery: any = job.activeDeliveryAttemptId ? await ctx.db.get(job.activeDeliveryAttemptId) : null;
+  const executionAuthority = await readAttemptExecutionAuthority(ctx, job, Number(attempt?.workAttempt));
   if (!attempt || TERMINAL.has(attempt.status) || !attempt.reconciliationAttentionAt
     || !mission || mission.mode !== "goal" || mission.status !== "running"
+    || !executionAuthority || attempt.authorityDigest !== executionAuthority.authorityDigest
+    || attempt.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest
+    || delivery?.authorityDigest !== executionAuthority.authorityDigest
+    || delivery?.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest
     || delivery?.integrationAttemptId !== attempt._id || delivery.status !== "checkpointed") return false;
   const head = await fifoHead(ctx, attempt.missionId, attempt.repository);
   if (!head || head._id !== attempt._id) return false;
@@ -1126,7 +1220,7 @@ export const failFocused = mutation({
     const attempt: any = await ctx.db.get(args.id);
     const mission: any = attempt ? await ctx.db.get(attempt.missionId) : null;
     const job: any = attempt ? await ctx.db.get(attempt.jobId) : null;
-    if (!job || !exactFence(mission, attempt, args, job)) return null;
+    if (!job || !await exactFence(ctx, mission, attempt, args, job)) return null;
     const release = await terminalReleaseDecisionForAttempt(ctx, attempt);
     if (!release.releasable || release.state === "applied_final") return null;
     const now = Date.now();
@@ -1199,7 +1293,7 @@ export const park = mutation({
     const attempt: any = await ctx.db.get(args.id);
     const mission: any = attempt ? await ctx.db.get(attempt.missionId) : null;
     const job: any = attempt ? await ctx.db.get(attempt.jobId) : null;
-    if (!job || !exactFence(mission, attempt, args, job)) return false;
+    if (!job || !await exactFence(ctx, mission, attempt, args, job)) return false;
     const terminal = await writeIntegrationTerminalReceipt(ctx, attempt, "parked", { reason: args.reason });
     if (!storedTerminalReceipt(terminal)) return false;
     const now = Date.now();
@@ -1236,6 +1330,9 @@ export async function controlIntegrationForJob(ctx: any, job: any, action: "paus
   const executionAuthority = await readAttemptExecutionAuthority(ctx, job, Number(attempt.workAttempt));
   if (!executionAuthority || attempt.authorityDigest !== executionAuthority.authorityDigest
     || attempt.schedulingBindingDigest !== executionAuthority.schedulingBindingDigest
+    || attempt.workOrderRevisionId !== executionAuthority.workOrderRevisionId
+    || attempt.workOrderRevision !== executionAuthority.workOrderRevision
+    || attempt.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest
     || attempt.repository !== executionAuthority.repository
     || attempt.integrationLineage !== executionAuthority.integrationLineage) return null;
   const mission: any = await ctx.db.get(attempt.missionId);

@@ -21,6 +21,23 @@ import {
   projectSourceAdmissionIsValid,
   type ProjectSourceAdmission,
 } from "../src/lib/source-admission";
+import { routeWork } from "../src/mastra/routing";
+import { normalizeWorkModelTier } from "../src/lib/work-models";
+import { exactTextWorkOrder } from "../src/lib/work-order";
+import {
+  canonicalWorkOrderRevision,
+  normalizeMinimumReasoningEffort,
+  normalizeWorkOrderAcceptanceCriteria,
+  normalizeWorkOrderMcpScope,
+  workOrderAgent,
+  workOrderProjectionMatches,
+  workOrderRevisionForJob,
+  workOrderRevisionRowBinding,
+  workOrderToolScope,
+  WORK_ORDER_MACHINE_CLASS,
+  WORK_ORDER_REVISION_PROTOCOL_VERSION,
+  type WorkOrderRevisionBinding,
+} from "../src/lib/work-order-revision";
 
 function defined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
@@ -45,6 +62,8 @@ export function projectJobRuntime(job: any) {
     model: typeof job.model === "string" ? job.model.slice(0, 24) : undefined,
     reasoningEffort: typeof job.reasoningEffort === "string" ? job.reasoningEffort.slice(0, 24) : undefined,
     modelReason: typeof job.modelReason === "string" ? job.modelReason.slice(0, 300) : undefined,
+    agentRole: typeof job.agentRole === "string" ? job.agentRole.slice(0, 120) : undefined,
+    machineClass: typeof job.machineClass === "string" ? job.machineClass.slice(0, 160) : undefined,
     risk: typeof job.risk === "string" ? job.risk.slice(0, 24) : undefined,
     priority: Math.max(0, Math.min(100, Number(job.priority ?? 50))),
     approvalRequired: typeof job.approvalRequired === "boolean" ? job.approvalRequired : undefined,
@@ -87,6 +106,8 @@ export function projectJobRuntime(job: any) {
     schedulingAdmissionId: job.schedulingAdmissionId,
     schedulingBindingDigest: typeof job.schedulingBindingDigest === "string" ? job.schedulingBindingDigest.slice(0, 64) : undefined,
     schedulingBound: job.schedulingBound === true,
+    workOrderRevision: typeof job.workOrderRevision === "number" ? job.workOrderRevision : undefined,
+    workOrderRevisionDigest: typeof job.workOrderRevisionDigest === "string" ? job.workOrderRevisionDigest.slice(0, 64) : undefined,
     dispatchReady: job.dispatchReady === true,
     sourceProvider: typeof job.sourceProvider === "string" ? job.sourceProvider.slice(0, 24) : undefined,
     sourceBranch: typeof job.sourceBranch === "string" ? job.sourceBranch.slice(0, 240) : undefined,
@@ -279,6 +300,13 @@ const IMMUTABLE_JOB_BINDING_FIELDS = [
   "workerBranch", "workerLineage", "workspaceLineage", "retryLineage", "integrationBranch", "integrationLineage",
 ] as const;
 
+const ACTIVE_WORK_ORDER_FIELDS = [
+  "task", "policyTask", "steer", "acceptanceCriteria", "repo", "readonly",
+  "model", "reasoningEffort", "mcp", "toolScope", "deliveryMode", "risk",
+  "approvalRequired", "approvalReason", "agentId", "agentRole", "machineClass",
+  "workOrderProtocolVersion", "workOrderRevision", "workOrderRevisionId", "workOrderRevisionDigest",
+] as const;
+
 async function sha256Hex(value: string) {
   const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -316,7 +344,9 @@ function admissionMatchesBinding(admission: any, binding: SchedulingBinding, dig
     && admission.retryLineage === binding.retryLineage
     && admission.integrationBranch === binding.integrationBranch
     && admission.integrationLineage === binding.integrationLineage
-    && admission.bindingDigest === digest;
+    && admission.bindingDigest === digest
+    && admission.initialWorkOrderRevisionId
+    && /^[0-9a-f]{64}$/.test(String(admission.initialWorkOrderRevisionDigest ?? ""));
 }
 
 async function schedulingGroupForBinding(ctx: any, binding: SchedulingBinding) {
@@ -360,22 +390,58 @@ export async function readJobSchedulingAuthority(ctx: any, job: any) {
   if (digest !== job.schedulingBindingDigest) return null;
   const admission = await ctx.db.get(job.schedulingAdmissionId);
   if (!admissionMatchesBinding(admission, binding, digest)) return null;
+  const initialRevision: any = await ctx.db.get(admission.initialWorkOrderRevisionId);
+  const initialBinding = initialRevision ? workOrderRevisionRowBinding(initialRevision) : null;
+  if (!initialBinding || initialBinding.jobId !== binding.jobId || initialBinding.revision !== 1
+    || initialBinding.parentRevisionId || initialBinding.parentRevisionDigest
+    || initialBinding.schedulingBindingDigest !== digest
+    || initialRevision.revisionDigest !== admission.initialWorkOrderRevisionDigest
+    || await sha256Hex(canonicalWorkOrderRevision(initialBinding)) !== admission.initialWorkOrderRevisionDigest) return null;
   return { binding, admission, digest };
 }
 
-export async function attemptAuthorityFields(ctx: any, job: any, attempt: number) {
+/** Re-hash the active append-only executable revision and its direct parent. */
+export async function readJobWorkOrderAuthority(ctx: any, job: any) {
+  if (Number(job?.workOrderProtocolVersion) !== WORK_ORDER_REVISION_PROTOCOL_VERSION
+    || !job?.workOrderRevisionId || !Number.isSafeInteger(job.workOrderRevision)
+    || typeof job.workOrderRevisionDigest !== "string") return null;
+  const row: any = await ctx.db.get(job.workOrderRevisionId);
+  const binding = row ? workOrderRevisionRowBinding(row) : null;
+  if (!binding || binding.jobId !== String(job._id) || binding.revision !== job.workOrderRevision
+    || row.revisionDigest !== job.workOrderRevisionDigest
+    || await sha256Hex(canonicalWorkOrderRevision(binding)) !== job.workOrderRevisionDigest
+    || !workOrderProjectionMatches(job, binding)) return null;
+  if (binding.revision > 1) {
+    const parent: any = binding.parentRevisionId ? await ctx.db.get(binding.parentRevisionId as any) : null;
+    const parentBinding = parent ? workOrderRevisionRowBinding(parent) : null;
+    if (!parentBinding || parentBinding.jobId !== binding.jobId || parentBinding.revision !== binding.revision - 1
+      || parent.revisionDigest !== binding.parentRevisionDigest
+      || await sha256Hex(canonicalWorkOrderRevision(parentBinding)) !== binding.parentRevisionDigest) return null;
+  }
+  return { row, binding, digest: job.workOrderRevisionDigest };
+}
+
+async function attemptAuthorityEnvelope(ctx: any, job: any, attempt: number) {
   const authority = await readJobSchedulingAuthority(ctx, job);
-  if (!authority || !Number.isSafeInteger(attempt) || attempt < 1) {
+  const workOrder = await readJobWorkOrderAuthority(ctx, job);
+  if (!authority || !workOrder || workOrder.binding.schedulingBindingDigest !== authority.digest
+    || !Number.isSafeInteger(attempt) || attempt < 1) {
     throw new Error("Attempt authority requires one admitted job and positive attempt");
   }
   const authorityDigest = await sha256Hex(canonicalAttemptAuthority({
     binding: authority.binding,
     bindingDigest: authority.digest,
+    workOrderRevisionId: String(workOrder.row._id),
+    workOrderRevision: workOrder.binding.revision,
+    workOrderRevisionDigest: workOrder.digest,
     attempt,
   }));
-  return {
+  const fields = {
     authorityDigest,
     schedulingBindingDigest: authority.digest,
+    workOrderRevisionId: workOrder.row._id,
+    workOrderRevision: workOrder.binding.revision,
+    workOrderRevisionDigest: workOrder.digest,
     canonicalProjectId: authority.binding.canonicalProjectId,
     repository: authority.binding.projectRepository,
     missionGroupId: authority.binding.missionGroupId,
@@ -388,6 +454,11 @@ export async function attemptAuthorityFields(ctx: any, job: any, attempt: number
     retryLineage: authority.binding.retryLineage,
     integrationLineage: authority.binding.integrationLineage,
   };
+  return { fields, workOrder: workOrder.binding };
+}
+
+export async function attemptAuthorityFields(ctx: any, job: any, attempt: number) {
+  return (await attemptAuthorityEnvelope(ctx, job, attempt)).fields;
 }
 
 /** Allocate one immutable attempt envelope for any admitted job producer. */
@@ -429,16 +500,17 @@ export async function ensureWorkAttempt(
  * Historical rows without this v2 envelope remain visible but cannot execute.
  */
 export async function readAttemptExecutionAuthority(ctx: any, job: any, attemptNumber: number) {
-  let expected;
-  try { expected = await attemptAuthorityFields(ctx, job, attemptNumber); }
+  let envelope;
+  try { envelope = await attemptAuthorityEnvelope(ctx, job, attemptNumber); }
   catch { return null; }
+  const expected = envelope.fields;
   const attempt = await ctx.db.query("workAttempts")
     .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", attemptNumber))
     .first();
   if (!attempt) return null;
   const fields = Object.keys(expected) as Array<keyof typeof expected>;
   if (fields.some((field) => attempt[field] !== expected[field])) return null;
-  return { attempt, ...expected };
+  return { attempt, ...expected, workOrder: envelope.workOrder };
 }
 
 export function runtimeMatchesSchedulingAuthority(runtime: any, authority: {
@@ -470,9 +542,33 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
   if (persistedValue.integrationBranch !== undefined && !isSafeSourceBranch(persistedValue.integrationBranch)) {
     throw new Error("Job integration branch is invalid");
   }
+  const task = exactTextWorkOrder(String(persistedValue.task ?? ""));
+  const policyTask = exactTextWorkOrder(String(persistedValue.policyTask ?? task));
+  const routed = routeWork(task, {
+    repo: persistedValue.repo,
+    requestedModel: persistedValue.model,
+    readonly: persistedValue.readonly,
+  });
+  const agent = workOrderAgent(persistedValue.agentId) ?? workOrderAgent(routed.agentId);
+  if (!agent) throw new Error("Job requires one canonical permanent-agent role");
+  const model = normalizeWorkModelTier(persistedValue.model, agent.defaultModel);
+  const readonly = Boolean(persistedValue.readonly || !persistedValue.repo);
   const normalized = {
     ...persistedValue,
-    readonly: Boolean(persistedValue.readonly || !persistedValue.repo),
+    task,
+    policyTask,
+    readonly,
+    model,
+    reasoningEffort: normalizeMinimumReasoningEffort(persistedValue.reasoningEffort, model),
+    mcp: normalizeWorkOrderMcpScope(persistedValue.mcp),
+    toolScope: workOrderToolScope(readonly),
+    acceptanceCriteria: normalizeWorkOrderAcceptanceCriteria(persistedValue.acceptanceCriteria),
+    agentId: agent.agentId,
+    agentRole: agent.agentRole,
+    machineClass: WORK_ORDER_MACHINE_CLASS,
+    risk: String(persistedValue.risk ?? "low"),
+    approvalRequired: persistedValue.approvalRequired === true,
+    deliveryMode: String(persistedValue.deliveryMode ?? (readonly ? "read_only" : "manual")),
     canonicalProjectId: projectAdmission.canonicalProjectId,
     sourceProvider: projectAdmission.sourceProvider,
     sourceBranch: projectAdmission.sourceBranch,
@@ -499,6 +595,18 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
   const binding = schedulingBindingForJob(isolated);
   if (!binding) throw new Error("Job scheduling authority could not be derived");
   const digest = await sha256Hex(canonicalSchedulingBinding(binding));
+  const initialWorkOrderBinding = workOrderRevisionForJob(
+    { ...isolated, schedulingBindingDigest: digest },
+    { revision: 1 },
+  );
+  if (!initialWorkOrderBinding) throw new Error("Job work-order authority could not be derived");
+  const initialWorkOrderDigest = await sha256Hex(canonicalWorkOrderRevision(initialWorkOrderBinding));
+  const initialWorkOrderRevisionId = await ctx.db.insert("workOrderRevisions", {
+    ...initialWorkOrderBinding,
+    jobId,
+    revisionDigest: initialWorkOrderDigest,
+    createdAt: Date.now(),
+  });
   const admissionValue = {
     protocolVersion: SCHEDULING_PROTOCOL_VERSION,
     jobId,
@@ -521,6 +629,8 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
     integrationBranch: binding.integrationBranch,
     integrationLineage: binding.integrationLineage,
     bindingDigest: digest,
+    initialWorkOrderRevisionId,
+    initialWorkOrderRevisionDigest: initialWorkOrderDigest,
     createdAt: Date.now(),
   };
   const admissionId = await ctx.db.insert("jobSchedulingAdmissions", admissionValue);
@@ -532,6 +642,10 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
     schedulingAdmissionId: admissionId,
     schedulingBindingDigest: digest,
     schedulingBound: true,
+    workOrderProtocolVersion: WORK_ORDER_REVISION_PROTOCOL_VERSION,
+    workOrderRevision: 1,
+    workOrderRevisionId: initialWorkOrderRevisionId,
+    workOrderRevisionDigest: initialWorkOrderDigest,
   };
   const admittedPatch = { ...admitted };
   delete admittedPatch._id;
@@ -545,13 +659,22 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
   return jobId;
 }
 
-export async function patchJobWithRuntime(ctx: any, job: any, patch: Record<string, unknown>) {
+async function patchJobWithRuntimeInternal(
+  ctx: any,
+  job: any,
+  patch: Record<string, unknown>,
+  allowWorkOrderTransition = false,
+) {
   const prospective = { ...job, ...patch };
   if (job.schedulingBound && IMMUTABLE_JOB_BINDING_FIELDS.some((field) => field in patch && patch[field] !== job[field])) {
     throw new Error("Immutable job scheduling authority cannot be changed");
   }
   if (job.schedulingBound && (!schedulingAuthorityMatches(job) || !schedulingAuthorityMatches(prospective))) {
     throw new Error("Immutable job scheduling authority is invalid");
+  }
+  if (!allowWorkOrderTransition && job.workOrderRevisionId
+    && ACTIVE_WORK_ORDER_FIELDS.some((field) => field in patch && patch[field] !== job[field])) {
+    throw new Error("Active work-order authority can change only through an append-only revision");
   }
   const committedPatch = patch;
   const existing = await jobRuntimeFor(ctx, job._id);
@@ -563,6 +686,130 @@ export async function patchJobWithRuntime(ctx: any, job: any, patch: Record<stri
   if (Object.keys(patch).some((field) => queueFields.has(field))) {
     await refreshWorkGroupQueueProjection(ctx, projected.schedulingGroupKey);
   }
+}
+
+export async function patchJobWithRuntime(ctx: any, job: any, patch: Record<string, unknown>) {
+  await patchJobWithRuntimeInternal(ctx, job, patch);
+}
+
+function activeWorkOrderPatch(
+  binding: WorkOrderRevisionBinding,
+  revisionId: any,
+  revisionDigest: string,
+) {
+  return {
+    task: binding.executableTask,
+    policyTask: binding.policyTask,
+    steer: binding.steeringInstruction,
+    acceptanceCriteria: [...binding.acceptanceCriteria],
+    readonly: binding.readonly,
+    model: binding.minimumModel,
+    reasoningEffort: binding.minimumReasoningEffort,
+    mcp: [...binding.mcpScope],
+    toolScope: [...binding.toolScope],
+    deliveryMode: binding.deliveryPolicy,
+    risk: binding.risk,
+    approvalRequired: binding.approvalRequired,
+    approvalReason: binding.approvalReason,
+    agentId: binding.agentId,
+    agentRole: binding.agentRole,
+    machineClass: binding.machineClass,
+    workOrderProtocolVersion: WORK_ORDER_REVISION_PROTOCOL_VERSION,
+    workOrderRevision: binding.revision,
+    workOrderRevisionId: revisionId,
+    workOrderRevisionDigest: revisionDigest,
+    pendingWorkOrderRevisionId: undefined,
+    pendingWorkOrderRevisionDigest: undefined,
+  };
+}
+
+/**
+ * Append a child revision without activating it. Integration steering uses
+ * this while an earlier provider effect is reconciled under its old order.
+ */
+export async function stageJobWorkOrderRevision(
+  ctx: any,
+  job: any,
+  changes: Record<string, unknown>,
+) {
+  const current = await readJobWorkOrderAuthority(ctx, job);
+  if (!current) throw new Error("Cannot append a revision to an invalid work order");
+  const agent = workOrderAgent(changes.agentId ?? job.agentId);
+  if (!agent) throw new Error("Work-order revision requires one canonical permanent-agent role");
+  const model = normalizeWorkModelTier(changes.model ?? job.model, agent.defaultModel);
+  const prospective = {
+    ...job,
+    ...changes,
+    task: exactTextWorkOrder(String(changes.task ?? job.task)),
+    policyTask: exactTextWorkOrder(String(changes.policyTask ?? job.policyTask ?? changes.task ?? job.task)),
+    steer: typeof changes.steer === "string" && changes.steer.trim()
+      ? changes.steer.trim().slice(0, 2_000)
+      : changes.steer === undefined ? job.steer : undefined,
+    acceptanceCriteria: normalizeWorkOrderAcceptanceCriteria(changes.acceptanceCriteria ?? job.acceptanceCriteria),
+    model,
+    reasoningEffort: normalizeMinimumReasoningEffort(changes.reasoningEffort ?? job.reasoningEffort, model),
+    mcp: normalizeWorkOrderMcpScope(changes.mcp ?? job.mcp),
+    toolScope: workOrderToolScope(Boolean(job.readonly || !job.repo)),
+    agentId: agent.agentId,
+    agentRole: agent.agentRole,
+    machineClass: WORK_ORDER_MACHINE_CLASS,
+  };
+  const binding = workOrderRevisionForJob(prospective, {
+    revision: current.binding.revision + 1,
+    parentRevisionId: current.row._id,
+    parentRevisionDigest: current.digest,
+  });
+  if (!binding || binding.schedulingBindingDigest !== current.binding.schedulingBindingDigest
+    || binding.repository !== current.binding.repository || binding.sourceAdmissionDigest !== current.binding.sourceAdmissionDigest) {
+    throw new Error("Work-order revision attempted to cross its immutable scheduling/source admission");
+  }
+  const digest = await sha256Hex(canonicalWorkOrderRevision(binding));
+  if (job.pendingWorkOrderRevisionId && job.pendingWorkOrderRevisionDigest) {
+    const pending: any = await ctx.db.get(job.pendingWorkOrderRevisionId);
+    const pendingBinding = pending ? workOrderRevisionRowBinding(pending) : null;
+    if (pendingBinding && pending.revisionDigest === digest
+      && await sha256Hex(canonicalWorkOrderRevision(pendingBinding)) === digest) return { job, row: pending, binding: pendingBinding, digest };
+  }
+  const revisionId = await ctx.db.insert("workOrderRevisions", {
+    ...binding,
+    jobId: job._id,
+    parentRevisionId: current.row._id,
+    revisionDigest: digest,
+    createdAt: Date.now(),
+  });
+  const pendingPatch = { pendingWorkOrderRevisionId: revisionId, pendingWorkOrderRevisionDigest: digest };
+  await patchJobWithRuntimeInternal(ctx, job, pendingPatch);
+  return { job: { ...job, ...pendingPatch }, row: { ...binding, _id: revisionId, revisionDigest: digest }, binding, digest };
+}
+
+/** Activate exactly the staged child revision together with a fresh state/attempt transition. */
+export async function activateStagedJobWorkOrderRevision(
+  ctx: any,
+  job: any,
+  statePatch: Record<string, unknown> = {},
+) {
+  const current = await readJobWorkOrderAuthority(ctx, job);
+  const revision: any = job.pendingWorkOrderRevisionId ? await ctx.db.get(job.pendingWorkOrderRevisionId) : null;
+  const binding = revision ? workOrderRevisionRowBinding(revision) : null;
+  if (!current || !binding || revision.revisionDigest !== job.pendingWorkOrderRevisionDigest
+    || binding.jobId !== String(job._id) || binding.revision !== current.binding.revision + 1
+    || binding.parentRevisionId !== String(current.row._id) || binding.parentRevisionDigest !== current.digest
+    || await sha256Hex(canonicalWorkOrderRevision(binding)) !== revision.revisionDigest) {
+    throw new Error("Staged work-order revision failed its immutable parent fence");
+  }
+  const patch = { ...statePatch, ...activeWorkOrderPatch(binding, revision._id, revision.revisionDigest) };
+  await patchJobWithRuntimeInternal(ctx, job, patch, true);
+  return { ...job, ...patch };
+}
+
+export async function transitionJobWorkOrderRevision(
+  ctx: any,
+  job: any,
+  changes: Record<string, unknown>,
+  statePatch: Record<string, unknown> = {},
+) {
+  const staged = await stageJobWorkOrderRevision(ctx, job, changes);
+  return await activateStagedJobWorkOrderRevision(ctx, staged.job, statePatch);
 }
 
 export async function quarantineJobRuntime(ctx: any, job: any, runtime?: any) {
