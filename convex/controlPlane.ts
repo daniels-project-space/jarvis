@@ -39,6 +39,7 @@ import {
   type WorkOrderRevisionBinding,
 } from "../src/lib/work-order-revision";
 import { admittedTriggerMachine } from "../src/lib/trigger-machine";
+import { signalMissionSupervisorForJobPatch } from "./missionSupervisorWake";
 
 function defined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
@@ -717,6 +718,7 @@ async function patchJobWithRuntimeInternal(
     throw new Error("Active work-order authority can change only through an append-only revision");
   }
   const committedPatch = patch;
+  await signalMissionSupervisorForJobPatch(ctx, job, committedPatch);
   const existing = await jobRuntimeFor(ctx, job._id);
   await ctx.db.patch(job._id, committedPatch);
   const projected = projectJobRuntime(mergeJobRuntimeSource(job, committedPatch, existing));
