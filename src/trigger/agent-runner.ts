@@ -1312,6 +1312,35 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           authorityDigest,
           workerRunId: options.reservation.workerRunId,
         });
+      const reportPreparationStage = async (stage: string, progress: string, percent: number) => {
+        options.onProgress?.({
+          jobId: String(job.jobId),
+          missionId: job.missionId,
+          agentId: job.agentId,
+          progress,
+          stage,
+          percent,
+        });
+        const live = await convexMutation(
+          deliveryFence ? "jobs:touchDeliveryHeartbeat" : "jobs:touchHeartbeat",
+          { jobId: job.jobId, expectedAttempt, ...(deliveryFence ?? {}) },
+        ).catch(() => false);
+        const recorded = live && await convexMutation("jobs:updateProgress", {
+          jobId: job.jobId,
+          expectedAttempt,
+          progress,
+          stage,
+          percent,
+        }).catch(() => false);
+        if (!recorded) {
+          throw new CloudWorkspaceError(
+            cloudProvider.name,
+            "stale_attempt",
+            `attempt fence rejected secure-workspace preparation stage ${stage}`,
+            "deferred",
+          );
+        }
+      };
       const prepareProviderEffect = async (effect: {
         effectId: string; kind: string; headSha: string; baseSha: string; pullRequestNumber?: number;
       }, options?: { reconcileOnly?: boolean }) => await deliveryMutation("jobs:prepareDeliveryEffect", {
@@ -1728,6 +1757,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         let cloneFailureReason = "";
         let checkoutSourceBranch = "";
         let controllerCheckoutPath = "";
+        await reportPreparationStage("source clone", "preparing exact admitted source", 3);
         if (repo) {
           checkoutSourceBranch = typeof job.sourceBranch === "string" ? job.sourceBranch : "";
           const admittedSource = {
@@ -1878,8 +1908,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           ? sha256Bytes(readFileSync(join(repoDir, "package-lock.json")))
           : sha256Bytes("no-lockfile");
         const workspaceTemplate = String(process.env.JARVIS_CLOUD_WORKSPACE_TEMPLATE ?? DEFAULT_CLOUD_WORKSPACE_TEMPLATE);
+        await reportPreparationStage("checkpoint store", "acquiring scoped checkpoint store", 5);
         const checkpointStore = await createR2CheckpointStore();
         const workspaceBaseSha = baseSha || sha256Bytes(String(job.jobId));
+        await reportPreparationStage("source archive", "materializing bounded credentialless source archive", 7);
         const sourceArchive: CredentiallessArchive = repoDir
           ? await createCredentiallessGitArchive(repoDir, workspaceBaseSha, hostChildEnv)
           : (() => {
@@ -1919,6 +1951,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           throw new CloudWorkspaceError(cloudProvider.name, "checkpoint_tampered", `checkpoint replay rejected: ${String(replayDecision?.reason ?? "authority unavailable")}`, "rejected");
         }
         if (replayDecision.disposition === "replay") {
+          await reportPreparationStage("checkpoint replay", "replaying exact portable checkpoint", 9);
           try {
             const replayed = await replayCloudWorkspaceExecution({
               provider: cloudProvider, store: checkpointStore,
@@ -1939,6 +1972,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             throw error;
           }
         } else {
+          await reportPreparationStage("workspace hydrate", "preparing a fresh secure workspace", 9);
           await recordReplayDecision("hydrate", String(replayDecision.reason));
         }
         if (!providerWorkspace) {
@@ -1953,6 +1987,16 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             attemptKey, template: workspaceTemplate, runtime: workspaceRuntime, lockfileDigest,
             bindWorkspace: bindCloudWorkspace,
             assertCurrent: assertCurrentWorkspace,
+            onStage: async (stage) => {
+              const stages = {
+                provider_list: ["provider list", "enumerating bounded provider workspace history", 11],
+                provider_create: ["provider create", "creating exact private provider workspace", 13],
+                source_upload: ["source upload", "hydrating validated source into private workspace", 15],
+                dependency_hydration: ["dependency hydrate", "hydrating locked dependencies before relocking egress", 17],
+              } as const;
+              const [durableStage, progress, percent] = stages[stage];
+              await reportPreparationStage(durableStage, progress, percent);
+            },
           });
           providerWorkspace = preparedWorkspace.workspace;
         }

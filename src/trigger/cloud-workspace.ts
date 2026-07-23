@@ -93,6 +93,10 @@ export type CredentiallessArchive = {
   bytes: Uint8Array;
 };
 
+export type CloudWorkspacePreparationStage =
+  | "provider_list"
+  | "provider_create";
+
 export type PatchManifest = {
   baseSha: string;
   sha256: string;
@@ -125,6 +129,7 @@ export interface CloudWorkspaceProvider {
     runtime: string;
     lockfileDigest: string;
     limits: WorkspaceLimits;
+    onStage?: (stage: CloudWorkspacePreparationStage) => Promise<void>;
   }): Promise<CloudWorkspace>;
   uploadCredentiallessArchive(workspace: CloudWorkspace, archive: CredentiallessArchive): Promise<void>;
   /**

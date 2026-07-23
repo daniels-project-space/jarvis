@@ -12,6 +12,7 @@ import {
   validateCredentiallessArchive,
   validatePatchManifest,
   validatePortableCheckpointArchive,
+  type CloudWorkspaceProvider,
   type CredentiallessArchive,
   type PatchManifest,
 } from "./cloud-workspace";
@@ -151,6 +152,35 @@ describe("fail-closed cloud workspace boundary", () => {
       attemptKey: "job:1", template: "node", runtime: "node-22", lockfileDigest: "b".repeat(64),
     })).rejects.toMatchObject({ code: "missing_configuration" });
     expect(hydrate).not.toHaveBeenCalled();
+  });
+
+  it("revalidates authority after provider listing and stops before a stale create effect", async () => {
+    const provider = new FakeCloudWorkspaceProvider();
+    Object.defineProperty(provider, "name", { value: "vercel" });
+    const create = provider.createWorkspace.bind(provider);
+    provider.createWorkspace = async (input: Parameters<CloudWorkspaceProvider["createWorkspace"]>[0]) => {
+      await input.onStage?.("provider_list");
+      await input.onStage?.("provider_create");
+      return await create(input);
+    };
+    const phases: string[] = [];
+    const stages: string[] = [];
+    await expect(prepareCloudWorkspaceExecution({
+      providerFactory: () => provider,
+      hydrateArchive: async () => archive([{ name: "safe.txt", data: new TextEncoder().encode("safe") }]),
+      attemptKey: "stale-after-list:1",
+      template: "node",
+      runtime: "node-22",
+      lockfileDigest: LOCK,
+      assertCurrent: async (phase) => {
+        phases.push(phase);
+        return phase !== "provider_create";
+      },
+      onStage: async (stage) => { stages.push(stage); },
+    })).rejects.toMatchObject({ code: "stale_attempt", disposition: "deferred" });
+    expect(phases).toEqual(["source_hydration", "workspace_creation", "provider_list", "provider_create"]);
+    expect(stages).toEqual(["provider_list"]);
+    expect(provider.calls).not.toContain("createWorkspace");
   });
 
   it("runs the controller-owned dependency phase after upload and terminates before an agent boundary when it fails", async () => {

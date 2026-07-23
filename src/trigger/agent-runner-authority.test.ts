@@ -8,6 +8,7 @@ import schema from "../../convex/schema";
 import { testMissionAdmission } from "../../convex/testSourceAdmission";
 import { workGroupAuthority } from "../lib/work-scheduler";
 import { canonicalWorkspaceCheckpoint } from "../lib/workspace-checkpoint";
+import { CloudWorkspaceError } from "./cloud-workspace";
 
 /* eslint-disable @typescript-eslint/no-explicit-any -- the Trigger task registration and convex-test bridge expose dynamic production handler boundaries */
 
@@ -967,6 +968,51 @@ describe("production Trigger worker authority harness", () => {
       expect(state).toMatchObject({ status: "pending", attempt: 2 });
     },
   );
+
+  it("durably checkpoints and requeues a provider startup timeout instead of leaving the attempt running", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-provider-startup-timeout");
+    const bridge = bridgeProductionRunnerToConvex(t);
+    const dependencies = injectedRunnerDependencies();
+    (dependencies.prepareCloudWorkspaceExecution as any).mockImplementation(async (input: any) => {
+      await input.onStage("provider_list");
+      await input.onStage("provider_create");
+      throw new CloudWorkspaceError("vercel", "timeout", "Vercel Sandbox creation exceeded its controller deadline", "deferred");
+    });
+
+    expect(await invokeHarness(reservation, "provider-startup-timeout-run", dependencies))
+      .toEqual({ processed: 1 });
+    const state = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      attempts: await Promise.all([1, 2].map((attempt) => ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", attempt))
+        .first())),
+      runtime: await ctx.db.query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", jobId))
+        .first(),
+    }));
+    expect(state.job).toMatchObject({ status: "pending", attempt: 2 });
+    expect(state.runtime).toMatchObject({ status: "pending", attempt: 2 });
+    expect(state.attempts.find((attempt) => attempt?.attempt === 1)).toMatchObject({
+      status: "checkpointed",
+      workerRunId: "provider-startup-timeout-run",
+    });
+    expect(state.attempts.find((attempt) => attempt?.attempt === 2)).toMatchObject({
+      status: "pending",
+    });
+    expect(String(state.job?.checkpoint)).toContain("Vercel Sandbox creation exceeded its controller deadline");
+    expect(bridge.trace
+      .filter((call) => call.path === "jobs:updateProgress")
+      .map((call) => call.args.stage)).toEqual([
+      "source clone",
+      "checkpoint store",
+      "source archive",
+      "workspace hydrate",
+      "provider list",
+      "provider create",
+    ]);
+  });
 
   it.each([
     {

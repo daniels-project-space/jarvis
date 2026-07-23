@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { describe, expect, it, beforeEach, vi } from "vitest";
 import { createDeterministicTar, DEFAULT_WORKSPACE_LIMITS, sha256Bytes } from "./cloud-workspace";
@@ -14,7 +15,8 @@ const observed: {
   logs: Log[]; createGate?: Promise<void>; waitGate?: Promise<void>; releaseWaitOnKill?: () => void; logCloseGate?: Promise<void>; waitFailure?: unknown; fenceWaitFailure?: unknown; deleteFailure?: unknown;
   exitCode: number; commandExit?: (input: Record<string, unknown>) => number; commandExecutor?: (input: Record<string, unknown>) => CommandOutcome | undefined;
   updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; runCommandHook?: (input: Record<string, unknown>, session: FakeSession) => void; getFailure?: unknown;
-  listed: Array<{ status: string }>; listedPages?: Array<Array<{ status: string }>>; listedPageNext?: Array<string | null>; listInputs: Record<string, unknown>[];
+  listed: Array<{ name?: string; status: string }>; listedPages?: Array<Array<{ name?: string; status: string }>>; listedPageNext?: Array<string | null>; listInputs: Record<string, unknown>[];
+  listGate?: Promise<void>; listPageGate?: Promise<void>; sandboxCreateGate?: Promise<void>;
 } = { commands: [], deletes: [], updates: [], updateSessions: [], kills: [], waits: [], logConsumers: [], logsClosed: 0, files: new Map(), mkdirs: [], reads: [], readSessions: [], writeSessions: [], logs: [], exitCode: 0, listed: [], listInputs: [] };
 
 class FakeCommand {
@@ -69,14 +71,27 @@ class FakeSandbox {
   static current = new FakeSession();
   static async list(input: Record<string, unknown>) {
     observed.listInputs.push(input);
+    if (input.namePrefix && (input.sortBy !== "name" || input.sortOrder !== "asc")) {
+      throw new Error("namePrefix is only valid with deterministic name sorting");
+    }
+    await observed.listGate;
     const pages = observed.listedPages ?? [observed.listed];
     const materialized = pages.map((sandboxes, index) => ({ sandboxes, pagination: { count: sandboxes.length, next: observed.listedPageNext?.[index] ?? (index + 1 < pages.length ? `cursor-${index + 1}` : null) } }));
     return Object.assign(materialized[0]!, {
-      pages: async function* () { yield* materialized; },
+      pages: async function* () {
+        for (let index = 0; index < materialized.length; index += 1) {
+          if (index > 0) await observed.listPageGate;
+          yield materialized[index]!;
+        }
+      },
       [Symbol.asyncIterator]: async function* () { for (const page of materialized) yield* page.sandboxes; },
     });
   }
-  static async create(input: Record<string, unknown>) { observed.create = input; return new FakeSandbox(`jarvis-${"a".repeat(40)}`); }
+  static async create(input: Record<string, unknown>) {
+    observed.create = input;
+    await observed.sandboxCreateGate;
+    return new FakeSandbox(String(input.name ?? `jarvis-${"a".repeat(40)}`));
+  }
   static async get(input: Record<string, unknown>) {
     observed.get = input;
     if (observed.getFailure) throw observed.getFailure;
@@ -126,12 +141,16 @@ beforeEach(() => {
   observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.updateSessions = []; observed.kills = []; observed.waits = []; observed.logConsumers = []; observed.logsClosed = 0;
   observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.readSessions = []; observed.writeSessions = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.releaseWaitOnKill = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.fenceWaitFailure = undefined; observed.deleteFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
   observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.runCommandHook = undefined; observed.commandExecutor = undefined; observed.getFailure = undefined; observed.listed = []; observed.listedPages = undefined; observed.listedPageNext = undefined; observed.listInputs = []; FakeSandbox.current = new FakeSession();
+  observed.listGate = undefined; observed.listPageGate = undefined; observed.sandboxCreateGate = undefined;
 });
 
 describe("VercelCloudWorkspaceProvider", () => {
   it("uses explicit control-plane credentials and a private node22 deny-all session", async () => {
     const { provider, workspace } = await providerAndWorkspace();
-    expect(workspace).toMatchObject({ providerWorkspaceId: `jarvis-${"a".repeat(40)}`, providerSessionId: "vercel-session-a" });
+    expect(workspace).toMatchObject({
+      providerWorkspaceId: `jarvis-${createHash("sha256").update("job:1").digest("hex").slice(0, 40)}`,
+      providerSessionId: "vercel-session-a",
+    });
     expect(observed.create).toMatchObject({ token: "controller-token", teamId: "team_1", projectId: "prj_1", runtime: "node22", env: {}, ports: [], networkPolicy: "deny-all", resources: { vcpus: 2 }, persistent: false });
     expect((observed.create?.timeout as number) <= 44 * 60_000).toBe(true);
     await provider.terminate(workspace);
@@ -575,9 +594,81 @@ describe("VercelCloudWorkspaceProvider", () => {
     const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
     const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
     await provider.createWorkspace({ attemptKey: "later-page", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS });
-    expect(observed.listInputs[0]).toMatchObject({ namePrefix: "jarvis", tags: { owner: "jarvis" }, limit: 50 });
+    expect(observed.listInputs[0]).toMatchObject({
+      namePrefix: "jarvis",
+      sortBy: "name",
+      sortOrder: "asc",
+      tags: { owner: "jarvis" },
+      limit: 50,
+      signal: expect.any(AbortSignal),
+    });
     observed.listedPages = Array.from({ length: 9 }, () => []);
     await expect(provider.createWorkspace({ attemptKey: "too-many-pages", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS })).rejects.toMatchObject({ code: "resource_limit" });
+  });
+
+  it("aborts a stalled paginated list before create and returns a typed resumable timeout", async () => {
+    observed.listedPages = [[], []];
+    observed.listPageGate = new Promise<void>(() => undefined);
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider(
+      "controller-token",
+      "team_1",
+      "prj_1",
+      { listMs: 5, createMs: 50, controlMs: 50 },
+    );
+    await expect(provider.createWorkspace({
+      attemptKey: "stalled-list",
+      template: "node22",
+      runtime: "node-22",
+      lockfileDigest: "a".repeat(64),
+      limits: DEFAULT_WORKSPACE_LIMITS,
+    })).rejects.toMatchObject({ code: "timeout", disposition: "deferred" });
+    expect(observed.listInputs[0]?.signal).toBeInstanceOf(AbortSignal);
+    expect((observed.listInputs[0]?.signal as AbortSignal).aborted).toBe(true);
+    expect(observed.create).toBeUndefined();
+  });
+
+  it("aborts and exact-cleans an uncertain create without changing its immutable name", async () => {
+    let release!: () => void;
+    observed.sandboxCreateGate = new Promise<void>((resolve) => { release = resolve; });
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider(
+      "controller-token",
+      "team_1",
+      "prj_1",
+      { listMs: 50, createMs: 5, controlMs: 50 },
+    );
+    const attemptKey = "stalled-create";
+    const exactName = `jarvis-${createHash("sha256").update(attemptKey).digest("hex").slice(0, 40)}`;
+    await expect(provider.createWorkspace({
+      attemptKey,
+      template: "node22",
+      runtime: "node-22",
+      lockfileDigest: "a".repeat(64),
+      limits: DEFAULT_WORKSPACE_LIMITS,
+    })).rejects.toMatchObject({ code: "timeout", disposition: "deferred" });
+    expect(observed.create).toMatchObject({ name: exactName, signal: expect.any(AbortSignal) });
+    expect((observed.create?.signal as AbortSignal).aborted).toBe(true);
+    expect(observed.deletes).toEqual([exactName]);
+    release();
+    await new Promise((resolve) => setImmediate(resolve));
+  });
+
+  it("reconciles an exact running attempt instead of blindly creating a duplicate", async () => {
+    const attemptKey = "response-lost-create";
+    const exactName = `jarvis-${createHash("sha256").update(attemptKey).digest("hex").slice(0, 40)}`;
+    observed.listed = [{ name: exactName, status: "running" }];
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    await expect(provider.createWorkspace({
+      attemptKey,
+      template: "node22",
+      runtime: "node-22",
+      lockfileDigest: "a".repeat(64),
+      limits: DEFAULT_WORKSPACE_LIMITS,
+    })).resolves.toMatchObject({ providerWorkspaceId: exactName, providerSessionId: "vercel-session-a" });
+    expect(observed.create).toBeUndefined();
+    expect(observed.get).toMatchObject({ name: exactName, resume: false, signal: expect.any(AbortSignal) });
   });
 
   it("excludes the exact controller directory from baseline, checkpoint, replay, and exported patch commands", async () => {

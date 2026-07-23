@@ -11,6 +11,7 @@ import {
   validatePortableCheckpointArchive,
   type CheckpointStore,
   type CloudWorkspace,
+  type CloudWorkspacePreparationStage,
   type CloudWorkspaceProvider,
   type CredentiallessArchive,
   type WorkspaceCheckpoint,
@@ -89,6 +90,7 @@ export async function prepareCloudWorkspaceExecution(input: {
   limits?: WorkspaceLimits;
   bindWorkspace?: (workspace: CloudWorkspace) => Promise<boolean>;
   assertCurrent?: (phase: string) => Promise<boolean>;
+  onStage?: (stage: CloudWorkspacePreparationStage | "source_upload" | "dependency_hydration") => Promise<void>;
 }): Promise<{ provider: CloudWorkspaceProvider; workspace: CloudWorkspace; archive: CredentiallessArchive }> {
   // Provider configuration and capabilities are resolved before the trusted
   // controller runs git or any other host process. This ordering is the
@@ -104,12 +106,20 @@ export async function prepareCloudWorkspaceExecution(input: {
   if (input.assertCurrent && !await input.assertCurrent("workspace_creation")) {
     throw new CloudWorkspaceError(provider.name, "stale_attempt", "attempt fence rejected workspace creation", "deferred");
   }
+  const observeProviderStage = async (stage: CloudWorkspacePreparationStage) => {
+    if (input.assertCurrent && !await input.assertCurrent(stage)) {
+      throw new CloudWorkspaceError(provider.name, "stale_attempt", `attempt fence rejected ${stage}`, "deferred");
+    }
+    await input.onStage?.(stage);
+  };
+  if (provider.name !== "vercel") await observeProviderStage("provider_create");
   const workspace = await provider.createWorkspace({
     attemptKey: input.attemptKey,
     template: input.template,
     runtime: input.runtime,
     lockfileDigest: input.lockfileDigest,
     limits,
+    onStage: observeProviderStage,
   });
   if (input.assertCurrent && !await input.assertCurrent("workspace_binding")) {
     await provider.terminate(workspace, "orphan").catch(() => undefined);
@@ -120,6 +130,7 @@ export async function prepareCloudWorkspaceExecution(input: {
     throw new Error("Convex rejected the provider workspace/session fence");
   }
   try {
+    await input.onStage?.("source_upload");
     if (input.assertCurrent && !await input.assertCurrent("source_upload")) {
       throw new CloudWorkspaceError(provider.name, "stale_attempt", "attempt fence rejected source upload", "deferred");
     }
@@ -127,6 +138,7 @@ export async function prepareCloudWorkspaceExecution(input: {
     // Dependency hydration is a provider-specific, controller-owned phase.
     // It must finish and relock egress before the caller can reach Codex.
     if (provider.hydrateDependencies) {
+      await input.onStage?.("dependency_hydration");
       if (input.assertCurrent && !await input.assertCurrent("dependency_hydration")) {
         throw new CloudWorkspaceError(provider.name, "stale_attempt", "attempt fence rejected dependency hydration", "deferred");
       }

@@ -3,6 +3,7 @@ import { posix as pathPosix } from "node:path";
 import type { Sandbox as E2BSandbox } from "e2b";
 import type { Client as Sandbox0Client, Sandbox as Sandbox0Sandbox } from "sandbox0";
 import type { Command as VercelCommand, Sandbox as VercelSandbox, Session as VercelSession } from "@vercel/sandbox";
+import { runWithDeadline } from "../lib/bounded-json";
 import {
   CloudWorkspaceError,
   DEFAULT_WORKSPACE_LIMITS,
@@ -460,11 +461,20 @@ export const VERCEL_NAME_PREFIX = "jarvis";
 export const VERCEL_HISTORY_PAGE_LIMIT = 50;
 export const VERCEL_HISTORY_PAGE_CEILING = 8;
 export const VERCEL_HISTORY_TOTAL_CEILING = VERCEL_HISTORY_PAGE_LIMIT * VERCEL_HISTORY_PAGE_CEILING;
+const VERCEL_LIST_DEADLINE_MS = 30_000;
+const VERCEL_CREATE_DEADLINE_MS = 60_000;
+const VERCEL_CONTROL_DEADLINE_MS = 30_000;
+
+type VercelControlDeadlines = Readonly<{
+  listMs: number;
+  createMs: number;
+  controlMs: number;
+}>;
 
 function vercelWorkspaceName(attemptKey: string): string {
-  // Vercel names are persisted identities, so never derive one from an
-  // unbounded job string or reuse it after a terminated attempt.
-  return `${VERCEL_NAME_PREFIX}-${createHash("sha256").update(`${attemptKey}:${randomUUID()}`).digest("hex").slice(0, 40)}`;
+  // The exact immutable work attempt owns one provider name. A timed-out
+  // create can therefore be reconciled without allocating a competitor.
+  return `${VERCEL_NAME_PREFIX}-${createHash("sha256").update(attemptKey).digest("hex").slice(0, 40)}`;
 }
 
 function vercelCwd(workspace: CloudWorkspace, cwd: string | undefined): string {
@@ -643,7 +653,17 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     private readonly token: string,
     private readonly teamId: string,
     private readonly projectId: string,
-  ) { super(); }
+    private readonly deadlines: VercelControlDeadlines = {
+      listMs: VERCEL_LIST_DEADLINE_MS,
+      createMs: VERCEL_CREATE_DEADLINE_MS,
+      controlMs: VERCEL_CONTROL_DEADLINE_MS,
+    },
+  ) {
+    super();
+    if (Object.values(deadlines).some((value) => !Number.isSafeInteger(value) || value < 1 || value > 10 * 60_000)) {
+      throw new CloudWorkspaceError("vercel", "invalid_configuration", "Vercel Sandbox control-plane deadlines are invalid", "blocked");
+    }
+  }
 
   protected override pathsFor(workspace: CloudWorkspace) { return fencedVercelPaths(workspace); }
   protected override resetForReplay(paths: ProviderPaths): string[] {
@@ -661,7 +681,10 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     // These are direct session calls: neither can resume a stopped Sandbox.
     // The root is established before it becomes a command cwd, and every
     // subsequent data-plane path is realpath/lstat checked below it.
-    await observed.session.mkDir(workspace.root);
+    await this.controlCall(
+      "workspace root creation",
+      (signal) => observed.session.mkDir(workspace.root, { signal }),
+    );
     observed = await this.observeFreshSession(workspace);
     observed = await this.assertNoSymlink(workspace, observed.sandbox, observed.session, workspace.root, false);
     const result = await this.runSessionCommand(workspace, observed.sandbox, observed.session, {
@@ -674,7 +697,73 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
 
   private credentials() { return { token: this.token, teamId: this.teamId, projectId: this.projectId }; }
 
-  async createWorkspace(input: { attemptKey: string; template: string; runtime: string; lockfileDigest: string; limits: WorkspaceLimits }) {
+  private providerFailure(operation: string, error: unknown): CloudWorkspaceError {
+    if (error instanceof CloudWorkspaceError) return error;
+    const message = String((error as Error | undefined)?.message ?? error);
+    if (/(?:not[_ -]?found|404|already deleted)/i.test(message)) {
+      return new CloudWorkspaceError(this.name, "stale_attempt", "Vercel Sandbox named attempt is absent", "deferred");
+    }
+    const timedOut = /operation deadline exceeded|aborterror|aborted/i.test(message);
+    return new CloudWorkspaceError(
+      this.name,
+      timedOut ? "timeout" : "provider_unavailable",
+      `Vercel Sandbox ${operation} ${timedOut ? "exceeded its controller deadline" : "failed"}`,
+      "deferred",
+    );
+  }
+
+  private async controlCall<T>(
+    operation: string,
+    call: (signal: AbortSignal) => Promise<T>,
+    timeoutMs = this.deadlines.controlMs,
+  ): Promise<T> {
+    try {
+      return await runWithDeadline(timeoutMs, call);
+    } catch (error) {
+      throw this.providerFailure(operation, error);
+    }
+  }
+
+  private async cleanupExactName(
+    Sandbox: typeof import("@vercel/sandbox").Sandbox,
+    name: string,
+  ): Promise<boolean> {
+    let sandbox: VercelSandbox;
+    try {
+      sandbox = await this.controlCall(
+        "uncertain-create observation",
+        (signal) => Sandbox.get({ ...this.credentials(), name, resume: false, signal }),
+      );
+    } catch (error) {
+      if (this.absent(error)) return false;
+      throw new CloudWorkspaceError(this.name, "cleanup_blocked", "could not reconcile the exact timed-out sandbox name", "blocked");
+    }
+    try {
+      await this.controlCall("uncertain-create cleanup", (signal) => sandbox.delete({ signal }));
+      return true;
+    } catch {
+      throw new CloudWorkspaceError(this.name, "cleanup_blocked", "could not delete the exact timed-out sandbox attempt", "blocked");
+    }
+  }
+
+  private workspaceFromSandbox(sandbox: VercelSandbox): CloudWorkspace {
+    const session = sandbox.currentSession();
+    if (session.status !== "running" || sandbox.routes.length || sandbox.runtime !== "node22" || sandbox.vcpus !== 2 || sandbox.memory !== 4096
+      || sandbox.networkPolicy !== "deny-all" || session.networkPolicy !== "deny-all") {
+      throw new CloudWorkspaceError(this.name, "provider_unavailable", "Vercel Sandbox creation did not preserve private bounded deny-all configuration", "blocked");
+    }
+    const workspace = {
+      provider: this.name,
+      providerWorkspaceId: sandbox.name,
+      providerSessionId: session.sessionId,
+      root: this.workspaceRoot,
+      createdAt: Date.now(),
+    } satisfies CloudWorkspace;
+    assertWorkspaceIdentity(workspace);
+    return workspace;
+  }
+
+  async createWorkspace(input: Parameters<CloudWorkspaceProvider["createWorkspace"]>[0]) {
     if (![this.token, this.teamId, this.projectId].every((value) => value.trim().length > 0)) {
       throw new CloudWorkspaceError(this.name, "missing_configuration", "Vercel Sandbox requires controller token, team, and project identifiers", "blocked");
     }
@@ -682,36 +771,47 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox attempt TTL must be a positive safe integer", "rejected");
     }
     const { Sandbox } = await import("@vercel/sandbox");
-    const listed = await Sandbox.list({
-      ...this.credentials(), namePrefix: VERCEL_NAME_PREFIX, tags: { owner: "jarvis" },
-      limit: VERCEL_HISTORY_PAGE_LIMIT,
-    });
+    const exactName = vercelWorkspaceName(input.attemptKey);
     let active = 0;
     let pages = 0;
     let total = 0;
     let complete = false;
-    // Do not use the paginator's item iterator: it silently follows stopped
-    // history forever. The page metadata is the proof that every active
-    // project-scoped Jarvis attempt was counted within the hard ceiling.
-    for await (const page of listed.pages()) {
-      pages += 1;
-      total += page.sandboxes.length;
-      if (pages > VERCEL_HISTORY_PAGE_CEILING || total > VERCEL_HISTORY_TOTAL_CEILING) {
-        throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox history exceeds the bounded controller enumeration ceiling", "deferred");
-      }
-      for (const item of page.sandboxes) {
-        if (["pending", "running", "snapshotting", "stopping"].includes(item.status)) active += 1;
-        if (active >= VERCEL_ACTIVE_SANDBOX_CAP) {
-          throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox controller active-attempt cap is reached", "deferred");
+    let exact: { name: string; status: string } | undefined;
+    await input.onStage?.("provider_list");
+    try {
+      await runWithDeadline(this.deadlines.listMs, async (signal) => {
+        const listed = await Sandbox.list({
+          ...this.credentials(),
+          namePrefix: VERCEL_NAME_PREFIX,
+          sortBy: "name",
+          sortOrder: "asc",
+          tags: { owner: "jarvis" },
+          limit: VERCEL_HISTORY_PAGE_LIMIT,
+          signal,
+        });
+        // Page metadata proves the complete project-scoped active count under
+        // one abort deadline and the hard history ceiling.
+        for await (const page of listed.pages()) {
+          pages += 1;
+          total += page.sandboxes.length;
+          if (pages > VERCEL_HISTORY_PAGE_CEILING || total > VERCEL_HISTORY_TOTAL_CEILING) {
+            throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox history exceeds the bounded controller enumeration ceiling", "deferred");
+          }
+          for (const item of page.sandboxes) {
+            if (item.name === exactName) exact = item;
+            if (["pending", "running", "snapshotting", "stopping"].includes(item.status)) active += 1;
+          }
+          if (page.pagination.next === null) {
+            complete = true;
+            break;
+          }
+          if (pages === VERCEL_HISTORY_PAGE_CEILING) {
+            throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox history completeness cannot be proved within the controller page ceiling", "deferred");
+          }
         }
-      }
-      if (page.pagination.next === null) {
-        complete = true;
-        break;
-      }
-      if (pages === VERCEL_HISTORY_PAGE_CEILING) {
-        throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox history completeness cannot be proved within the controller page ceiling", "deferred");
-      }
+      });
+    } catch (error) {
+      throw this.providerFailure("bounded history enumeration", error);
     }
     // A paginator which simply stops while advertising another cursor is not
     // proof that active attempts were fully counted. Creation is allowed only
@@ -719,30 +819,58 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     if (!complete) {
       throw new CloudWorkspaceError(this.name, "provider_unavailable", "Vercel Sandbox history paginator ended before its advertised terminal page", "deferred");
     }
-    const sandbox = await Sandbox.create({
-      ...this.credentials(),
-      name: vercelWorkspaceName(input.attemptKey),
-      runtime: "node22",
-      // Deliberately no source, ports, or authority-shaped environment.
-      env: {}, ports: [], networkPolicy: "deny-all", resources: { vcpus: 2 },
-      timeout: Math.min(input.limits.ttlMs, VERCEL_SAFE_TTL_MS),
-      persistent: false,
-      tags: {
-        owner: "jarvis",
-        attempt: createHash("sha256").update(input.attemptKey).digest("hex").slice(0, 32),
-        runtime: "node22",
-      },
-    });
-    const session = sandbox.currentSession();
-    if (session.status !== "running" || sandbox.routes.length || sandbox.runtime !== "node22" || sandbox.vcpus !== 2 || sandbox.memory !== 4096
-      || sandbox.networkPolicy !== "deny-all" || session.networkPolicy !== "deny-all") {
-      try { await sandbox.delete(); }
-      catch { throw new CloudWorkspaceError(this.name, "cleanup_blocked", "could not delete the exact misconfigured sandbox attempt", "blocked"); }
-      throw new CloudWorkspaceError(this.name, "provider_unavailable", "Vercel Sandbox creation did not preserve private bounded deny-all configuration", "blocked");
+    if (exact) {
+      if (exact.status === "running") {
+        const reconciled = await this.controlCall(
+          "exact attempt reconciliation",
+          (signal) => Sandbox.get({ ...this.credentials(), name: exactName, resume: false, signal }),
+        );
+        try {
+          return this.workspaceFromSandbox(reconciled);
+        } catch (error) {
+          await this.cleanupExactName(Sandbox, exactName);
+          throw error;
+        }
+      }
+      await this.cleanupExactName(Sandbox, exactName);
+      throw new CloudWorkspaceError(this.name, "provider_unavailable", "prior exact sandbox attempt was reconciled; retry creation after durable requeue", "deferred");
     }
-    const workspace = { provider: this.name, providerWorkspaceId: sandbox.name, providerSessionId: session.sessionId, root: this.workspaceRoot, createdAt: Date.now() } satisfies CloudWorkspace;
-    assertWorkspaceIdentity(workspace);
-    return workspace;
+    if (active >= VERCEL_ACTIVE_SANDBOX_CAP) {
+      throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox controller active-attempt cap is reached", "deferred");
+    }
+    await input.onStage?.("provider_create");
+    let sandbox: VercelSandbox;
+    try {
+      sandbox = await this.controlCall(
+        "creation",
+        (signal) => Sandbox.create({
+          ...this.credentials(),
+          name: exactName,
+          runtime: "node22",
+          // Deliberately no source, ports, or authority-shaped environment.
+          env: {}, ports: [], networkPolicy: "deny-all", resources: { vcpus: 2 },
+          timeout: Math.min(input.limits.ttlMs, VERCEL_SAFE_TTL_MS),
+          persistent: false,
+          tags: {
+            owner: "jarvis",
+            attempt: createHash("sha256").update(input.attemptKey).digest("hex").slice(0, 32),
+            runtime: "node22",
+          },
+          signal,
+        }),
+        this.deadlines.createMs,
+      );
+    } catch (error) {
+      await this.cleanupExactName(Sandbox, exactName);
+      throw this.providerFailure("creation", error);
+    }
+    try {
+      return this.workspaceFromSandbox(sandbox);
+    } catch (error) {
+      try { await this.controlCall("misconfigured-attempt cleanup", (signal) => sandbox.delete({ signal })); }
+      catch { throw new CloudWorkspaceError(this.name, "cleanup_blocked", "could not delete the exact misconfigured sandbox attempt", "blocked"); }
+      throw error;
+    }
   }
 
   override async uploadCredentiallessArchive(workspace: CloudWorkspace, archive: CredentiallessArchive): Promise<void> {
@@ -811,7 +939,10 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     observed = await this.assertNoSymlink(workspace, observed.sandbox, observed.session, absolute, true);
     try {
       // The write must use the Session returned by the realpath observation.
-      await observed.session.writeFiles([{ path: absolute, content: data }]);
+      await this.controlCall(
+        "sandbox file write",
+        (signal) => observed.session.writeFiles([{ path: absolute, content: data }], { signal }),
+      );
       await this.observeFreshSession(workspace);
     } catch (error) {
       if (error instanceof CloudWorkspaceError && error.code === "stale_attempt") {
@@ -899,16 +1030,19 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     this.pathsFor(workspace);
     try {
       const sandbox = await this.get(workspace);
-      // Cleanup owns only the random attempt name. It must never start a
+      // Cleanup owns only the immutable exact-attempt name. It must never start a
       // session, and a substituted/stopped session cannot block deletion.
-      await sandbox.delete();
+      await this.controlCall("sandbox deletion", (signal) => sandbox.delete({ signal }));
     } catch (error) {
       if ((error instanceof CloudWorkspaceError && error.code === "stale_attempt") || this.absent(error)) return;
       throw error;
     } finally { /* deletion is name-scoped; no session cache is retained */ }
   }
 
-  private absent(error: unknown): boolean { return /(?:not[_ -]?found|404|already deleted)/i.test(String(error)); }
+  private absent(error: unknown): boolean {
+    return (error instanceof CloudWorkspaceError && error.code === "stale_attempt")
+      || /(?:not[_ -]?found|404|already deleted)/i.test(String(error));
+  }
   protected override async cleanupOrBlock(workspace: CloudWorkspace, original: unknown, message: string): Promise<never> {
     try { await this.terminate(workspace, "terminal"); }
     catch { throw new CloudWorkspaceError(this.name, "cleanup_blocked", message, "blocked"); }
@@ -921,7 +1055,10 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     // Never trust a stale SDK object here. This is a control-plane read with
     // resume:false, followed by a fence on its freshly observed Session.
     try {
-      return await Sandbox.get({ ...this.credentials(), name: workspace.providerWorkspaceId, resume: false });
+      return await this.controlCall(
+        "sandbox observation",
+        (signal) => Sandbox.get({ ...this.credentials(), name: workspace.providerWorkspaceId, resume: false, signal }),
+      );
     } catch (error) {
       // A missing named attempt is not an invitation to create or resume one.
       // Classify it exactly like a stopped or substituted session before any
