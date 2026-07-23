@@ -1,4 +1,5 @@
-import { mutation, query } from "./_generated/server";
+import { mutation, query, type MutationCtx } from "./_generated/server";
+import type { Doc } from "./_generated/dataModel";
 import { v } from "convex/values";
 import { requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import {
@@ -42,6 +43,30 @@ function canonicalValue(value: any): any {
 async function sha256Hex(value: string) {
   const bytes = new TextEncoder().encode(value);
   return Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function closeIntegrationDispatchReceipt(
+  ctx: MutationCtx,
+  job: Pick<Doc<"jobs">, "dispatchReceiptId" | "dispatchId" | "deliveryRunId" | "dispatchReceiptDigest" | "dispatchPayloadDigest">,
+  reason: string,
+  now = Date.now(),
+) {
+  if (!job?.dispatchReceiptId || !job.dispatchId || !job.deliveryRunId) return false;
+  const receipt = await ctx.db.get(job.dispatchReceiptId);
+  if (!receipt
+    || receipt.status !== "claimed"
+    || receipt.dispatchId !== job.dispatchId
+    || receipt.workerRunId !== job.deliveryRunId
+    || receipt.receiptDigest !== job.dispatchReceiptDigest
+    || receipt.payloadDigest !== job.dispatchPayloadDigest) return false;
+  await ctx.db.patch(receipt._id, {
+    status: "closed",
+    closeReason: reason.slice(0, 180),
+    leaseUntil: undefined,
+    closedAt: now,
+    updatedAt: now,
+  });
+  return true;
 }
 
 export async function integrationEffectManifest(effect: any) {
@@ -944,6 +969,7 @@ async function settleRequestedControlWithoutRef(ctx: any, attempt: any, mission:
       deliveryLeaseOwner: undefined, deliveryLeaseToken: undefined, deliveryLeaseUntil: undefined,
       heartbeatAt: now,
     });
+    await closeIntegrationDispatchReceipt(ctx, job, "integration pause settled after provider reconciliation", now);
     await patchMissionWithRuntime(ctx, mission, {
       activeIntegrationAttemptId: undefined, integrationLeaseOwner: undefined, integrationLeaseToken: undefined,
       integrationLeaseUntil: undefined, updatedAt: now,
@@ -976,6 +1002,7 @@ async function settleRequestedControlWithoutRef(ctx: any, attempt: any, mission:
     integrationState: "cancelled", progress: "cancelled after exact provider reconciliation",
     deliveryLeaseOwner: undefined, deliveryLeaseToken: undefined, deliveryLeaseUntil: undefined,
   });
+  await closeIntegrationDispatchReceipt(ctx, job, `integration ${outcome} terminal receipt persisted`, now);
   await wakeNextIntegration(ctx, attempt);
   await finalizeMissionControlIfSettled(ctx, mission);
   return true;
@@ -1057,6 +1084,7 @@ export const complete = mutation({
       evidenceSummary: `review ${attempt.reviewReceiptDigest.slice(0, 12)} reconciled at ${attempt.preparedIntegrationHeadSha.slice(0, 12)}`,
       progress: requestedControl ? `${requestedControl} preserved after the applied provider ref was reconciled` : "reviewed worker receipt integrated into the mission head",
     });
+    await closeIntegrationDispatchReceipt(ctx, job, `integration ${terminalOutcome} terminal receipt persisted`, now);
     const prior = await ctx.db.query("workReceipts")
       .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", attempt.workAttempt)).first();
     const acceptedResult = String(job.result ?? "").slice(0, 4_000);
@@ -1166,6 +1194,12 @@ export const defer = mutation({
       ...(budget.exhausted ? { status: "needs_input", stage: "integration attention", nextRunAt: undefined }
         : { status: "pending", stage: "delivery", nextRunAt: budget.nextRunAt }),
     });
+    await closeIntegrationDispatchReceipt(
+      ctx,
+      job,
+      budget.exhausted ? "integration reconciliation requires attention" : "integration reconciliation continuation queued",
+      now,
+    );
     await appendEvent(ctx, job, budget.exhausted ? "integration_attention" : "integration_retry_due", args.reason, {
       reasonCode: args.reasonCode.slice(0, 80), retries: budget.retries,
       retryLimit: INTEGRATION_RECONCILIATION_LIMIT,

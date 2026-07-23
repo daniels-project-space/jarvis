@@ -1,4 +1,5 @@
 import { mutation, query } from "./_generated/server";
+import type { Id } from "./_generated/dataModel";
 import { v } from "convex/values";
 import { workApprovalPolicy } from "./workPolicy";
 import { exactTextWorkOrder } from "../src/lib/work-order";
@@ -123,6 +124,25 @@ async function claimedDispatchReceiptForRow(ctx: any, row: any, workerRunId: unk
     && receipt.payloadDigest === row.dispatchPayloadDigest
     ? receipt
     : null;
+}
+
+async function closeClaimedDispatchReceipt(
+  ctx: any,
+  row: any,
+  workerRunId: unknown,
+  closeReason: string,
+  now = Date.now(),
+) {
+  const receipt = await claimedDispatchReceiptForRow(ctx, row, workerRunId);
+  if (!receipt) return false;
+  await ctx.db.patch(receipt._id, {
+    status: "closed",
+    closeReason: closeReason.slice(0, 180),
+    leaseUntil: undefined,
+    closedAt: now,
+    updatedAt: now,
+  });
+  return true;
 }
 
 function dispatchReceiptMatchesRequest(receipt: any, row: any, a: any) {
@@ -1880,6 +1900,13 @@ export const finalize = mutation({
       heartbeatAt: now,
       updatedAt: now,
     });
+    await closeClaimedDispatchReceipt(
+      ctx,
+      row,
+      a.deliveryRunId ?? row.workerRunId,
+      success ? "terminal completion receipt persisted" : "terminal failure receipt persisted",
+      now,
+    );
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (attempt) await ctx.db.patch(attempt._id, {
       status: success ? "done" : "error",
@@ -2419,7 +2446,9 @@ export const releaseIntegrationQueueWait = mutation({
     const delivery: any = await deliveryAttemptFor(ctx, a.jobId, a.sourceWorkAttempt, a.deliveryGeneration);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
       || !await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest)
-      || !delivery || delivery.policy !== "mission_integration" || !hasLiveControllerFence(row, delivery, a)) return false;
+      || !delivery || delivery.policy !== "mission_integration"
+      || !deliveryClaimMatches(row, delivery, a)
+      || !await claimedDispatchReceiptForRow(ctx, row, a.deliveryRunId)) return false;
     const now = Date.now();
     await ctx.db.patch(delivery._id, {
       status: "checkpointed", dispatchId: undefined, deliveryRunId: undefined,
@@ -2432,6 +2461,7 @@ export const releaseIntegrationQueueWait = mutation({
       dispatchId: undefined, dispatchLeaseUntil: undefined, workerRunId: undefined, deliveryRunId: undefined,
       nextRunAt: now, heartbeatAt: now,
     });
+    await closeClaimedDispatchReceipt(ctx, row, a.deliveryRunId, "integration FIFO claim was not available", now);
     return true;
   },
 });
@@ -2504,6 +2534,7 @@ export const checkpointAndRequeue = mutation({
         await appendAttemptEvidence(ctx, row, "queued", `Fresh attempt ${nextAttempt} queued after steering`, {
           stage: "queued", evidenceKind: "intent", eventKey: `intent:${nextAttempt}`, attempt: nextAttempt,
         });
+        await closeClaimedDispatchReceipt(ctx, row, a.workerRunId, "steering checkpoint persisted", now);
         return { requeued: true, exhausted: false, stale: false };
       }
       // The control mutation owns pause/cancel state. A stopping worker may
@@ -2523,6 +2554,7 @@ export const checkpointAndRequeue = mutation({
         });
         const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
         if (attempt) await ctx.db.patch(attempt._id, { status: requestedStatus, completedAt: now, lastEventAt: now });
+        await closeClaimedDispatchReceipt(ctx, row, a.workerRunId, `final ${requestedStatus} checkpoint persisted`, now);
         return { requeued: false, exhausted: false, stale: false };
       }
       return { requeued: false, exhausted: false, stale: true };
@@ -2577,6 +2609,12 @@ export const checkpointAndRequeue = mutation({
       completedAt: Date.now(),
       lastEventAt: Date.now(),
     });
+    await closeClaimedDispatchReceipt(
+      ctx,
+      row,
+      a.deliveryRunId ?? a.workerRunId,
+      requestedStatus === "pending" ? "durable continuation queued" : `job ${requestedStatus}`,
+    );
     await appendAttemptEvidence(ctx, row, exhausted ? "continuation_exhausted" : requestedStatus === "pending" ? "checkpoint" : requestedStatus,
       exhausted
         ? "Continuation budget exhausted"
@@ -3586,7 +3624,7 @@ export const markVerifiedForDelivery = mutation({
     }
     if (!['running', 'pending'].includes(row.status)) return false;
     const sourceDispatchReceipt = sourceAttempt?.dispatchReceiptId
-      ? await ctx.db.get(sourceAttempt.dispatchReceiptId)
+      ? await ctx.db.get(sourceAttempt.dispatchReceiptId as Id<"dispatchReceipts">)
       : null;
     if (!sourceDispatchReceipt
       || sourceDispatchReceipt.status !== "claimed"

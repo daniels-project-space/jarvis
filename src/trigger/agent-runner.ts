@@ -966,6 +966,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         jobId: job.jobId,
         expectedAttempt,
         authorityDigest,
+        workerRunId: options.reservation.workerRunId,
         checkpoint: error,
         result: error,
         branch: job.workerBranch ?? undefined,
@@ -1306,7 +1307,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       };
       const checkpointMutation = deliveryFence
         ? (args: Record<string, unknown>) => deliveryMutation("jobs:checkpointAndRequeue", args)
-        : (args: Record<string, unknown>) => convexMutation("jobs:checkpointAndRequeue", { ...args, authorityDigest });
+        : (args: Record<string, unknown>) => convexMutation("jobs:checkpointAndRequeue", {
+          ...args,
+          authorityDigest,
+          workerRunId: options.reservation.workerRunId,
+        });
       const prepareProviderEffect = async (effect: {
         effectId: string; kind: string; headSha: string; baseSha: string; pullRequestNumber?: number;
       }, options?: { reconcileOnly?: boolean }) => await deliveryMutation("jobs:prepareDeliveryEffect", {
@@ -1438,8 +1443,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               authorityDigest,
             }).catch(() => null);
             if (!claimed) {
-              await deliveryMutation("jobs:releaseIntegrationQueueWait", {
-                jobId: job.jobId, expectedAttempt,
+              await convexMutation("jobs:releaseIntegrationQueueWait", {
+                jobId: job.jobId, expectedAttempt, authorityDigest,
+                ...(deliveryFence ?? {}),
               }).catch(() => null);
               return;
             }
@@ -2890,7 +2896,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         jobId: job.jobId, expectedAttempt, authorityDigest, code: failure.code, reason: checkpoint,
       }).catch(() => false);
       await convexMutation("jobs:checkpointAndRequeue", {
-        jobId: job.jobId, expectedAttempt, authorityDigest, checkpoint,
+        jobId: job.jobId, expectedAttempt, authorityDigest,
+        workerRunId: options.reservation.workerRunId, checkpoint,
         result: checkpoint, branch: job.branch ?? undefined, delayMs: 6 * 60 * 60_000,
       }).catch(() => null);
       return { processed: 1, blocked: true, provider: failure.provider, code: failure.code };

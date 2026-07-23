@@ -918,6 +918,56 @@ describe("production Trigger worker authority harness", () => {
     expect((dependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
   });
 
+  it.each(["prepare", "preflight"] as const)(
+    "does not emit a local subscription acquisition when supervisor %s fails before Codex",
+    async (failurePoint) => {
+      configureFakeControllerAuthority();
+      const t = convexTest(schema, modules);
+      const { jobId, reservation } = await reservedWritableJob(t, `runner-local-${failurePoint}-failure`);
+      bridgeProductionRunnerToConvex(t);
+      const trace: BoundaryTrace[] = [];
+      const dependencies = injectedRunnerDependencies({ boundaries: trace });
+      let prepareCalls = 0;
+      (dependencies.prepareSubscriptionEnv as any).mockImplementation(async () => {
+        prepareCalls += 1;
+        return {
+          env: {
+            PATH: process.env.PATH,
+            CODEX_HOME: `/tmp/jarvis-local-subscription-${failurePoint}-${prepareCalls}`,
+          },
+          ...(failurePoint === "prepare" && prepareCalls === 2
+            ? { error: "local subscription preparation failed" }
+            : {}),
+        };
+      });
+      let preflightCalls = 0;
+      (dependencies.verifyCodexSubscriptionPreflight as any).mockImplementation(() => {
+        preflightCalls += 1;
+        return failurePoint === "preflight" && preflightCalls === 2
+          ? { error: "local subscription preflight failed" }
+          : {};
+      });
+
+      expect(await invokeHarness(reservation, `local-${failurePoint}-failure-run`, dependencies))
+        .toEqual({ processed: 1 });
+      expect((dependencies.prepareSubscriptionEnv as any)).toHaveBeenCalledTimes(2);
+      expect((dependencies.verifyCodexSubscriptionPreflight as any))
+        .toHaveBeenCalledTimes(failurePoint === "prepare" ? 1 : 2);
+      expect((dependencies.runCloudWorkspaceAgent as any)).toHaveBeenCalledTimes(1);
+      expect(trace.filter((item) => item.effect === "subscription_acquire")).toHaveLength(1);
+      expect(trace.map((item) => item.effect)).toEqual([
+        "source_checkout",
+        "provider_create",
+        "subscription_acquire",
+        "codex_process",
+        "checkpoint_persist",
+        "review_receipt",
+      ]);
+      const state = await t.run(async (ctx) => ctx.db.get(jobId));
+      expect(state).toMatchObject({ status: "pending", attempt: 2 });
+    },
+  );
+
   it.each([
     {
       phase: "provider_create",

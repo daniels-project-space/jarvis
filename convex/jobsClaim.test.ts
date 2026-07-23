@@ -215,6 +215,68 @@ describe("real Convex specialist/controller race matrix", () => {
     expect((await rows(f.t)).dispatches).toHaveLength(1);
   });
 
+  it("reissues expired reserved and reconciling ticks byte-identically before one raced continuation generation", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-23T02:30:00Z"));
+    const f = await unclaimedDispatchFixture("dispatch-expiry-and-failure-race");
+
+    vi.advanceTimersByTime(3 * 60_000);
+    const reservedRetries = await Promise.all([
+      f.t.mutation(api.jobs.reserveDispatchBatch, { limit: 1, reason: "reserved-retry-a", workerToken: WORKER }),
+      f.t.mutation(api.jobs.reserveDispatchBatch, { limit: 1, reason: "reserved-retry-b", workerToken: WORKER }),
+    ]);
+    expect(reservedRetries.flatMap((batch) => batch.reservations)).toEqual([f.reservation]);
+    expect(await f.t.mutation(api.jobs.markDispatchLaunchUnknown, {
+      jobId: f.jobId,
+      dispatchId: f.reservation.dispatchId,
+      dispatchGeneration: f.reservation.dispatchGeneration,
+      dispatchPhase: f.reservation.dispatchPhase,
+      dispatchReceiptDigest: f.reservation.dispatchReceiptDigest,
+      dispatchPayloadDigest: f.reservation.dispatchPayloadDigest,
+      reason: "accepted response was lost after the reserved retry",
+      workerToken: WORKER,
+    })).toBe(true);
+
+    vi.advanceTimersByTime(31_000);
+    const reconcilingRetries = await Promise.all([
+      f.t.mutation(api.jobs.reserveDispatchBatch, { limit: 1, reason: "reconcile-a", workerToken: WORKER }),
+      f.t.mutation(api.jobs.reserveDispatchBatch, { limit: 1, reason: "reconcile-b", workerToken: WORKER }),
+    ]);
+    expect(reconcilingRetries.flatMap((batch) => batch.reservations)).toEqual([f.reservation]);
+    const claim = await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: f.jobId,
+      dispatchId: f.reservation.dispatchId,
+      ...triggerClaimAuthority(f.reservation),
+      workerRunId: "expiry-race-run",
+      workerToken: WORKER,
+    });
+    const failures = await Promise.all([
+      f.t.mutation(api.jobs.checkpointAndRequeue, {
+        jobId: f.jobId, expectedAttempt: 1, authorityDigest: claim.authorityDigest,
+        workerRunId: "expiry-race-run", checkpoint: "failure report a", result: "retry", workerToken: WORKER,
+      }),
+      f.t.mutation(api.jobs.checkpointAndRequeue, {
+        jobId: f.jobId, expectedAttempt: 1, authorityDigest: claim.authorityDigest,
+        workerRunId: "expiry-race-run", checkpoint: "failure report b", result: "retry", workerToken: WORKER,
+      }),
+    ]);
+    expect(failures.filter((failure) => failure.requeued)).toHaveLength(1);
+    expect(failures.filter((failure) => failure.stale)).toHaveLength(1);
+
+    const continuation = (await f.t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1, reason: "next-closed-generation", workerToken: WORKER,
+    })).reservations[0];
+    expect(continuation).toMatchObject({
+      expectedAttempt: 2,
+      dispatchGeneration: 2,
+      dispatchPhase: "specialist",
+    });
+    expect((await rows(f.t)).dispatches.map((receipt) => [receipt.generation, receipt.status])).toEqual([
+      [1, "closed"],
+      [2, "reserved"],
+    ]);
+  });
+
   it("supersedes an unclaimed tick only after durable pause/resume control", async () => {
     const f = await unclaimedDispatchFixture("dispatch-control-supersede");
     expect(await f.t.mutation(api.jobs.control, {

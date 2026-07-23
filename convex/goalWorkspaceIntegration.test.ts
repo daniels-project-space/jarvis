@@ -866,6 +866,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const checkpointHead = "a".repeat(40);
     expect(await f.t.mutation(api.jobs.checkpointAndRequeue, {
       jobId: job._id, expectedAttempt: 1, authorityDigest: firstAuthority.authorityDigest,
+      workerRunId: String(first.claim!.workerRunId),
       checkpoint: "first segment committed",
       checkpointHeadSha: checkpointHead, result: "segment one", branch: job.workerBranch, workerToken: TOKEN,
     })).toMatchObject({ requeued: true });
@@ -965,6 +966,67 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const first = integrations[0];
     const second = integrations[1];
     expect(String(controllers[0].reservation.jobId)).toBe(String(first.jobId));
+    const firstJob = byId.get(String(first.jobId))!;
+    const firstAuthority = await jobExecutionAuthority(f.t, firstJob._id, 1);
+    expect(controllers[0].reservation).toMatchObject({
+      dispatchGeneration: 2,
+      dispatchPhase: "integration",
+    });
+    expect(await f.t.mutation(api.jobs.releaseIntegrationQueueWait, {
+      jobId: firstJob._id,
+      expectedAttempt: 1,
+      authorityDigest: firstAuthority.authorityDigest,
+      sourceWorkAttempt: 1,
+      deliveryGeneration: Number(controllers[0].claim!.deliveryGeneration),
+      deliveryRunId: String(controllers[0].claim!.deliveryRunId),
+      deliveryAttemptId: controllers[0].claim!.activeDeliveryAttemptId,
+      workerToken: TOKEN,
+    })).toBe(true);
+    const resumedReservation = (await f.t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1, reason: "fifo-release-continuation", workerToken: TOKEN,
+    })).reservations[0];
+    expect(resumedReservation).toMatchObject({
+      jobId: firstJob._id,
+      expectedAttempt: 1,
+      dispatchGeneration: 3,
+      dispatchPhase: "integration",
+    });
+    expect(await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: firstJob._id,
+      dispatchId: controllers[0].reservation.dispatchId,
+      ...triggerClaimAuthority(controllers[0].reservation),
+      workerRunId: String(controllers[0].claim!.deliveryRunId),
+      workerToken: TOKEN,
+    })).toMatchObject({
+      executable: false,
+      held: true,
+      code: "trigger_launch_authority_held",
+    });
+    expect(await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: firstJob._id,
+      dispatchId: resumedReservation.dispatchId,
+      ...triggerClaimAuthority(resumedReservation),
+      dispatchGeneration: 2,
+      workerRunId: "controller-resumed-for-fifo",
+      workerToken: TOKEN,
+    })).toMatchObject({
+      executable: false,
+      held: true,
+      code: "trigger_launch_authority_held",
+    });
+    const resumedClaim = await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: firstJob._id,
+      dispatchId: resumedReservation.dispatchId,
+      ...triggerClaimAuthority(resumedReservation),
+      workerRunId: "controller-resumed-for-fifo",
+      workerToken: TOKEN,
+    });
+    expect(resumedClaim).toMatchObject({
+      deliveryRunId: "controller-resumed-for-fifo",
+      dispatchGeneration: 3,
+      dispatchPhase: "integration",
+    });
+    controllers[0] = { reservation: resumedReservation, claim: resumedClaim };
     const claimArgs = (row: any, controller: any, suffix: string) => ({
       id: row._id, controllerRunId: String(controller.claim!.deliveryRunId),
       leaseOwner: `owner-${suffix}`, leaseToken: `lease-${suffix}`, workerToken: TOKEN,
@@ -1007,6 +1069,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       integrationRows: await ctx.db.query("integrationAttempts").collect(),
       providerEffects: await ctx.db.query("integrationProviderEffects").collect(),
       terminalReceipts: await ctx.db.query("integrationTerminalReceipts").collect(),
+      dispatchReceipts: await ctx.db.query("dispatchReceipts").collect(),
     }));
     expect((final.mission as any)?.integrationHeadSha).toBe("c".repeat(40));
     expect(final.jobs.filter((job) => job.goalStage === "building").every((job) => job.status === "done" && job.integrationState === "integrated")).toBe(true);
@@ -1017,6 +1080,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(final.providerEffects).toHaveLength(2);
     expect(final.providerEffects.every((row) => row.providerResponseDigest === sha256(String(row.providerResponse)))).toBe(true);
     expect(final.terminalReceipts).toHaveLength(2);
+    expect(final.dispatchReceipts.every((receipt) => ["closed", "superseded"].includes(receipt.status))).toBe(true);
     for (const terminal of final.terminalReceipts) {
       expect(sha256(terminal.receiptJson)).toBe(terminal.receiptDigest);
       const canonical = JSON.parse(terminal.receiptJson);

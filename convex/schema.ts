@@ -1004,6 +1004,10 @@ export default defineSchema({
     payloadJson: v.string(),
     payloadDigest: v.string(),
     receiptDigest: v.string(),
+    // "claimed" is executable only while the jobs projection still names the
+    // same running dispatch. Terminal/continuation writers close it; a
+    // paused/cancelled worker or a response-lost review may remain
+    // historical-claimed solely for its one exact fenced final callback.
     status: v.string(), // reserved | reconciling | claimed | closed | superseded
     workerRunId: v.optional(v.string()),
     leaseUntil: v.optional(v.number()),
