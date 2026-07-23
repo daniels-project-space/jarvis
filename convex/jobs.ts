@@ -1,5 +1,5 @@
-import { mutation, query } from "./_generated/server";
-import type { Id } from "./_generated/dataModel";
+import { mutation, query, type MutationCtx } from "./_generated/server";
+import type { Doc, Id } from "./_generated/dataModel";
 import { v } from "convex/values";
 import { workApprovalPolicy } from "./workPolicy";
 import { exactTextWorkOrder } from "../src/lib/work-order";
@@ -22,6 +22,7 @@ import { claimDisposition, completionReceiptAllowed, isSha256Digest, replayEnvel
 import { canonicalWorkspaceCheckpoint, parseCanonicalWorkspaceCheckpoint } from "../src/lib/workspace-checkpoint";
 import {
   observedTriggerMachineReason,
+  TRIGGER_AGENT_MACHINE_REASONS,
   type TriggerAgentDispatchPhase,
   type TriggerAgentMachinePreset,
   type TriggerAgentMachineReason,
@@ -62,9 +63,16 @@ import {
 import { admissionForRepository } from "./sourceAdmission";
 import { WORK_ORDER_MACHINE_RUNTIME, WORK_ORDER_MACHINE_TEMPLATE } from "../src/lib/work-order-revision";
 import {
+  exactTerminalWorkReceipt,
   insertFreshTerminalWorkReceipt,
   type RecoveryDisposition,
 } from "./workReceiptAuthority";
+import {
+  SUPERVISOR_FLEET_MANIFEST_PROTOCOL_VERSION,
+  canonicalSupervisorControlBatchDigest,
+  validSupervisorFleetManifest,
+  type SupervisorFleetManifestMember,
+} from "../src/lib/supervisor-fleet-manifest";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
 // A live process that cannot produce a causal stage/percentage advance is not
@@ -226,7 +234,69 @@ async function createDispatchReceipt(
     });
   }
   const generation = Number(latest?.generation ?? 0) + 1;
-  const phase = dispatchPhaseForJob(row);
+  const envelope = await dispatchReceiptEnvelope(
+    row,
+    attempt,
+    generation,
+    authority,
+    machine,
+    reason,
+  );
+  const receiptId = await ctx.db.insert("dispatchReceipts", {
+    jobId: row._id,
+    attempt,
+    generation,
+    phase: envelope.phase,
+    dispatchId: envelope.dispatchId,
+    authorityDigest: authority.authorityDigest,
+    workOrderRevisionDigest: authority.workOrderRevisionDigest,
+    triggerMachinePreset: machine.preset,
+    triggerMachineReason: machine.reason,
+    payloadJson: envelope.payloadJson,
+    payloadDigest: envelope.payloadDigest,
+    receiptDigest: envelope.receiptDigest,
+    status: "reserved",
+    leaseUntil: now + DISPATCH_LEASE_MS,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return {
+    receiptId,
+    receipt: {
+      ...envelope.payload,
+      attempt,
+      generation,
+      phase: envelope.phase,
+      receiptDigest: envelope.receiptDigest,
+      payloadDigest: envelope.payloadDigest,
+      dispatchId: envelope.dispatchId,
+    },
+  };
+}
+
+type SupervisorDispatchSource = {
+  controlReceiptId: Id<"missionSupervisorControls">;
+  fleetDigest: string;
+  memberDigest: string;
+};
+
+async function dispatchReceiptEnvelope(
+  row: Doc<"jobs">,
+  attempt: number,
+  generation: number,
+  authority: {
+    authorityDigest: string;
+    workOrderRevisionDigest: string;
+  },
+  machine: {
+    preset: TriggerAgentMachinePreset;
+    reason: TriggerAgentMachineReason;
+  },
+  reason: string,
+  source?: SupervisorDispatchSource,
+  phaseOverride?: TriggerAgentDispatchPhase,
+) {
+  const phase = phaseOverride ?? dispatchPhaseForJob(row);
   const dispatchId = `${String(row._id)}:${attempt}:${generation}:${phase}`;
   const payloadCore = {
     jobId: String(row._id),
@@ -253,31 +323,27 @@ async function createDispatchReceipt(
     triggerMachinePreset: machine.preset,
     triggerMachineReason: machine.reason,
     payloadDigest,
+    ...(source
+      ? {
+        sourceSupervisorControlReceiptId: String(source.controlReceiptId),
+        sourceSupervisorFleetDigest: source.fleetDigest,
+        sourceSupervisorMemberDigest: source.memberDigest,
+      }
+      : {}),
   }));
   const payload = {
     ...payloadCore,
     dispatchReceiptDigest: receiptDigest,
     dispatchPayloadDigest: payloadDigest,
   };
-  const receiptId = await ctx.db.insert("dispatchReceipts", {
-    jobId: row._id,
-    attempt,
-    generation,
+  return {
     phase,
     dispatchId,
-    authorityDigest: authority.authorityDigest,
-    workOrderRevisionDigest: authority.workOrderRevisionDigest,
-    triggerMachinePreset: machine.preset,
-    triggerMachineReason: machine.reason,
+    payload,
     payloadJson: JSON.stringify(payload),
     payloadDigest,
     receiptDigest,
-    status: "reserved",
-    leaseUntil: now + DISPATCH_LEASE_MS,
-    createdAt: now,
-    updatedAt: now,
-  });
-  return { receiptId, receipt: { ...payload, attempt, generation, phase, receiptDigest, payloadDigest, dispatchId } };
+  };
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
@@ -1442,8 +1508,9 @@ export const reserveDispatchBatch = mutation({
       });
       // The append-only dispatch receipt plus the durable job projection are
       // the pre-claim authority. Defer the redundant attempt projection write
-      // until claim so an eight-way batch stays below Convex's 128-document
-      // transaction limit.
+      // until claim to keep reservation transactions smaller, reduce hot-path
+      // contention, and avoid rewriting a projection claim will immediately
+      // replace.
       if (!attempt) await ensureAttempt(ctx, j._id, attemptNumber, "dispatching", now, {
         dispatchId,
         dispatchGeneration: dispatchReceipt.generation,
@@ -1469,6 +1536,1040 @@ export const reserveDispatchBatch = mutation({
   },
 });
 /* eslint-enable @typescript-eslint/no-explicit-any */
+
+type StoredSupervisorFleetMember = NonNullable<
+  Doc<"missionSupervisorControls">["fleetManifest"]
+>[number];
+type ExactAttemptExecutionAuthority = NonNullable<
+  Awaited<ReturnType<typeof readAttemptExecutionAuthority>>
+>;
+type ExactSchedulingAuthority = NonNullable<
+  Awaited<ReturnType<typeof readJobSchedulingAuthority>>
+>;
+type SupervisorFleetMemberPreflight =
+  | {
+      kind: "candidate";
+      member: StoredSupervisorFleetMember;
+      job: Doc<"jobs">;
+      execution: ExactAttemptExecutionAuthority;
+      scheduling: ExactSchedulingAuthority;
+      group: Doc<"workGroupScheduling">;
+      nextDispatchGeneration: number;
+    }
+  | {
+      kind: "reoffer";
+      member: StoredSupervisorFleetMember;
+      job: Doc<"jobs">;
+      receipt: Doc<"dispatchReceipts">;
+    }
+  | {
+      kind: "already_inflight";
+      member: StoredSupervisorFleetMember;
+      job: Doc<"jobs">;
+    }
+  | {
+      kind: "already_advanced";
+      member: StoredSupervisorFleetMember;
+      job: Doc<"jobs">;
+    }
+  | {
+      kind: "fallback_skipped";
+      member: StoredSupervisorFleetMember;
+      job: Doc<"jobs">;
+    };
+
+function exactCanonicalIds(
+  values: readonly Id<"jobs">[] | undefined,
+  expectedCount: number | undefined,
+): Id<"jobs">[] | null {
+  if (
+    !values
+    || !Number.isSafeInteger(expectedCount)
+    || Number(expectedCount) < 0
+    || values.length !== expectedCount
+    || values.length > 24
+  ) {
+    return null;
+  }
+  const sorted = [...values].sort((left, right) =>
+    String(left).localeCompare(String(right))
+  );
+  if (
+    new Set(sorted.map(String)).size !== sorted.length
+    || sorted.some((value, index) => value !== values[index])
+  ) {
+    return null;
+  }
+  return sorted;
+}
+
+async function exactSupervisorControlBatchReceipt(
+  receipt: Doc<"missionSupervisorControls">,
+  action: "pause" | "resume",
+): Promise<Id<"jobs">[] | null> {
+  const affectedJobIds = exactCanonicalIds(
+    receipt.affectedJobIds,
+    receipt.affectedJobCount,
+  );
+  if (
+    receipt.protocolVersion !== 1
+    || receipt.action !== action
+    || !receipt.applied
+    || receipt.noop
+    || receipt.scope !== "supervisor_active_job_batch"
+    || receipt.batchProtocolVersion !== 1
+    || receipt.resultInputRevision === undefined
+    || receipt.resultInputRevision !== receipt.expectedInputRevision + 1
+    || !affectedJobIds
+    || typeof receipt.batchDigest !== "string"
+    || !/^[0-9a-f]{64}$/.test(receipt.batchDigest)
+    || (
+      action === "pause"
+        ? receipt.sourcePauseControlReceiptId !== undefined
+        : receipt.sourcePauseControlReceiptId === undefined
+    )
+  ) {
+    return null;
+  }
+  const digest = await canonicalSupervisorControlBatchDigest({
+    missionId: String(receipt.missionId),
+    action,
+    requestKey: receipt.requestKey,
+    requestDigest: receipt.requestDigest,
+    expectedInputRevision: receipt.expectedInputRevision,
+    resultInputRevision: receipt.resultInputRevision,
+    affectedJobIds: affectedJobIds.map(String),
+    sourcePauseControlReceiptId: receipt.sourcePauseControlReceiptId
+      ? String(receipt.sourcePauseControlReceiptId)
+      : undefined,
+  });
+  return digest === receipt.batchDigest ? affectedJobIds : null;
+}
+
+async function supervisorFleetControlAuthority(
+  ctx: Pick<MutationCtx, "db">,
+  controlReceiptId: Id<"missionSupervisorControls">,
+) {
+  const receipt = await ctx.db.get(controlReceiptId);
+  if (!receipt) return null;
+  const affectedJobIds = await exactSupervisorControlBatchReceipt(
+    receipt,
+    "resume",
+  );
+  if (
+    !affectedJobIds
+    || !receipt.sourcePauseControlReceiptId
+    || receipt.fleetManifestProtocolVersion
+      !== SUPERVISOR_FLEET_MANIFEST_PROTOCOL_VERSION
+    || !receipt.fleetManifest
+    || !Number.isSafeInteger(receipt.fleetManifestCount)
+    || Number(receipt.fleetManifestCount) < 1
+    || receipt.fleetManifest.length !== receipt.fleetManifestCount
+    || typeof receipt.fleetManifestDigest !== "string"
+  ) {
+    return null;
+  }
+  const pauseReceipt = await ctx.db.get(receipt.sourcePauseControlReceiptId);
+  if (
+    !pauseReceipt
+    || pauseReceipt.missionId !== receipt.missionId
+    || pauseReceipt.resultInputRevision !== receipt.expectedInputRevision
+  ) {
+    return null;
+  }
+  const pauseJobIds = await exactSupervisorControlBatchReceipt(
+    pauseReceipt,
+    "pause",
+  );
+  if (!pauseJobIds) return null;
+  const paused = new Set(pauseJobIds.map(String));
+  const affected = new Set(affectedJobIds.map(String));
+  const manifest = receipt.fleetManifest;
+  if (
+    affectedJobIds.some((jobId) => !paused.has(String(jobId)))
+    || manifest.some((member) =>
+      !affected.has(String(member.jobId))
+      || !paused.has(String(member.jobId))
+    )
+    || !await validSupervisorFleetManifest({
+      binding: {
+        missionId: String(receipt.missionId),
+        requestKey: receipt.requestKey,
+        requestDigest: receipt.requestDigest,
+        expectedInputRevision: receipt.expectedInputRevision,
+        resultInputRevision: receipt.resultInputRevision!,
+        sourcePauseControlReceiptId: String(
+          receipt.sourcePauseControlReceiptId,
+        ),
+      },
+      members: manifest as unknown as SupervisorFleetManifestMember[],
+      memberCount: receipt.fleetManifestCount!,
+      fleetDigest: receipt.fleetManifestDigest,
+    })
+  ) {
+    return null;
+  }
+  return {
+    receipt,
+    members: manifest,
+    fleetDigest: receipt.fleetManifestDigest,
+  };
+}
+
+function validSupervisorFleetMachine(
+  receipt: Doc<"dispatchReceipts">,
+): receipt is Doc<"dispatchReceipts"> & {
+  triggerMachinePreset: TriggerAgentMachinePreset;
+  triggerMachineReason: TriggerAgentMachineReason;
+} {
+  return ["medium-1x", "medium-2x"].includes(receipt.triggerMachinePreset)
+    && (TRIGGER_AGENT_MACHINE_REASONS as readonly string[])
+      .includes(receipt.triggerMachineReason);
+}
+
+async function exactProjectedDispatchReceipt(
+  ctx: Pick<MutationCtx, "db">,
+  args: {
+    job: Doc<"jobs">;
+    execution: ExactAttemptExecutionAuthority;
+    receipt: Doc<"dispatchReceipts">;
+    source?: SupervisorDispatchSource;
+    requireJobProjection?: boolean;
+    expectedPhase?: TriggerAgentDispatchPhase;
+  },
+): Promise<boolean> {
+  const { job, execution, receipt, source } = args;
+  const requireJobProjection = args.requireJobProjection ?? true;
+  let payload: { reason?: unknown };
+  try {
+    payload = JSON.parse(receipt.payloadJson) as { reason?: unknown };
+  } catch {
+    return false;
+  }
+  if (
+    typeof payload.reason !== "string"
+    || !validSupervisorFleetMachine(receipt)
+  ) {
+    return false;
+  }
+  const envelope = await dispatchReceiptEnvelope(
+    job,
+    receipt.attempt,
+    receipt.generation,
+    execution,
+    {
+      preset: receipt.triggerMachinePreset,
+      reason: receipt.triggerMachineReason,
+    },
+    payload.reason,
+    source,
+    args.expectedPhase,
+  );
+  return (
+    receipt.jobId === job._id
+    && receipt.attempt === execution.attempt.attempt
+    && receipt.phase === envelope.phase
+    && receipt.dispatchId === envelope.dispatchId
+    && receipt.authorityDigest === execution.authorityDigest
+    && receipt.workOrderRevisionDigest
+      === execution.workOrderRevisionDigest
+    && receipt.payloadJson === envelope.payloadJson
+    && receipt.payloadDigest === envelope.payloadDigest
+    && receipt.receiptDigest === envelope.receiptDigest
+    && receipt.sourceSupervisorControlReceiptId
+      === source?.controlReceiptId
+    && receipt.sourceSupervisorFleetDigest === source?.fleetDigest
+    && receipt.sourceSupervisorMemberDigest === source?.memberDigest
+    && (
+      !requireJobProjection
+      || (
+        job.dispatchReceiptId === receipt._id
+        && job.dispatchId === receipt.dispatchId
+        && job.dispatchGeneration === receipt.generation
+        && job.dispatchPhase === receipt.phase
+        && job.dispatchReceiptDigest === receipt.receiptDigest
+        && job.dispatchPayloadDigest === receipt.payloadDigest
+      )
+    )
+  );
+}
+
+async function exactManifestApproval(
+  ctx: Pick<MutationCtx, "db">,
+  job: Doc<"jobs">,
+  member: StoredSupervisorFleetMember,
+): Promise<boolean> {
+  if (!job.approvalRequired) {
+    return member.approvalId === undefined
+      && member.approvalResolvedAt === undefined;
+  }
+  if (
+    job.approvalStatus !== "approved"
+    || !member.approvalId
+    || !Number.isSafeInteger(member.approvalResolvedAt)
+    || Number(member.approvalResolvedAt) <= 0
+  ) {
+    return false;
+  }
+  const [approval, approved, pending] = await Promise.all([
+    ctx.db.get(member.approvalId),
+    ctx.db
+      .query("approvals")
+      .withIndex("by_job_status", (q) =>
+        q.eq("jobId", String(job._id)).eq("status", "approved")
+      )
+      .take(2),
+    ctx.db
+      .query("approvals")
+      .withIndex("by_job_status", (q) =>
+        q.eq("jobId", String(job._id)).eq("status", "pending")
+      )
+      .take(1),
+  ]);
+  return Boolean(
+    approval
+    && approved.length === 1
+    && approved[0]._id === approval._id
+    && pending.length === 0
+    && approval.jobId === String(job._id)
+    && approval.status === "approved"
+    && approval.resolvedAt === member.approvalResolvedAt,
+  );
+}
+
+async function exactManifestDelivery(
+  ctx: Pick<MutationCtx, "db">,
+  job: Doc<"jobs">,
+  execution: ExactAttemptExecutionAuthority,
+  member: StoredSupervisorFleetMember,
+  state: "pending" | "offered" | "running",
+): Promise<boolean> {
+  if (member.phase === "specialist") {
+    return !job.activeDeliveryAttemptId
+      && !job.reviewReceiptId
+      && !job.reviewReceiptDigest
+      && member.deliveryAttemptId === undefined
+      && member.deliverySourceWorkAttempt === undefined
+      && member.deliveryGeneration === undefined
+      && member.reviewReceiptId === undefined
+      && member.reviewReceiptDigest === undefined
+      && (
+        state === "running"
+          ? execution.attempt.status === "running"
+            && execution.attempt.dispatchId === job.dispatchId
+            && execution.attempt.workerRunId === job.workerRunId
+          : !execution.attempt.dispatchId
+            && !execution.attempt.workerRunId
+            && !execution.attempt.sessionId
+            && !execution.attempt.launchedAt
+            && !execution.attempt.completedAt
+            && ["pending", "queued"].includes(execution.attempt.status)
+      );
+  }
+  if (
+    job.verificationVerdict !== "pass"
+    || !member.deliveryAttemptId
+    || !member.reviewReceiptId
+    || typeof member.reviewReceiptDigest !== "string"
+    || !Number.isSafeInteger(member.deliverySourceWorkAttempt)
+    || !Number.isSafeInteger(member.deliveryGeneration)
+  ) {
+    return false;
+  }
+  if (
+    execution.attempt.status !== "done"
+    || !Number.isSafeInteger(execution.attempt.completedAt)
+    || Number(execution.attempt.completedAt) <= 0
+    || typeof execution.attempt.workerRunId !== "string"
+    || typeof execution.attempt.sessionId !== "string"
+    || typeof execution.attempt.launchedAt !== "number"
+    || typeof execution.attempt.dispatchId !== "string"
+    || execution.attempt.dispatchPhase !== "specialist"
+    || !execution.attempt.dispatchReceiptId
+    || typeof execution.attempt.dispatchReceiptDigest !== "string"
+    || typeof execution.attempt.dispatchPayloadDigest !== "string"
+  ) {
+    return false;
+  }
+  const [delivery, review] = await Promise.all([
+    ctx.db.get(member.deliveryAttemptId),
+    ctx.db.get(member.reviewReceiptId),
+  ]);
+  return Boolean(
+    delivery
+    && review
+    && job.activeDeliveryAttemptId === delivery._id
+    && job.deliveryGeneration === member.deliveryGeneration
+    && job.reviewReceiptId === review._id
+    && job.reviewReceiptDigest === member.reviewReceiptDigest
+    && delivery.jobId === job._id
+    && delivery.sourceWorkAttempt === member.deliverySourceWorkAttempt
+    && delivery.sourceWorkAttempt === member.attempt
+    && delivery.generation === member.deliveryGeneration
+    && (
+      state === "running"
+        ? delivery.status === "running"
+          && delivery.dispatchId === job.dispatchId
+          && delivery.deliveryRunId === job.deliveryRunId
+        : delivery.status === "checkpointed"
+          && !delivery.dispatchId
+          && !delivery.deliveryRunId
+          && !delivery.leaseOwner
+          && !delivery.leaseToken
+          && !delivery.leaseUntil
+    )
+    && delivery.authorityDigest === execution.authorityDigest
+    && delivery.schedulingBindingDigest
+      === execution.schedulingBindingDigest
+    && delivery.workOrderRevisionId === execution.workOrderRevisionId
+    && delivery.workOrderRevision === execution.workOrderRevision
+    && delivery.workOrderRevisionDigest
+      === execution.workOrderRevisionDigest
+    && delivery.reviewReceiptId === review._id
+    && delivery.reviewReceiptDigest === review.receiptDigest
+    && review.jobId === job._id
+    && review.attempt === member.attempt
+    && review.receiptDigest === member.reviewReceiptDigest
+    && review.authorityDigest === execution.authorityDigest
+    && review.schedulingBindingDigest
+      === execution.schedulingBindingDigest
+    && review.workOrderRevisionId === execution.workOrderRevisionId
+    && review.workOrderRevision === execution.workOrderRevision
+    && review.workOrderRevisionDigest
+      === execution.workOrderRevisionDigest,
+  );
+}
+
+async function exactSupervisorFleetMemberAuthority(
+  ctx: Pick<MutationCtx, "db">,
+  args: {
+    controlReceipt: Doc<"missionSupervisorControls">;
+    fleetDigest: string;
+    member: StoredSupervisorFleetMember;
+    now: number;
+  },
+): Promise<SupervisorFleetMemberPreflight | null> {
+  const { controlReceipt, fleetDigest, member, now } = args;
+  const job = await ctx.db.get(member.jobId);
+  if (
+    !job
+    || String(job.missionId ?? "") !== String(controlReceipt.missionId)
+    || member.protocolVersion !== SUPERVISOR_FLEET_MANIFEST_PROTOCOL_VERSION
+  ) {
+    return null;
+  }
+  const [execution, scheduling, sourceReceipts] = await Promise.all([
+    readAttemptExecutionAuthority(ctx, job, member.attempt),
+    readJobSchedulingAuthority(ctx, job),
+    ctx.db
+      .query("dispatchReceipts")
+      .withIndex("by_supervisor_control_member", (q) =>
+        q
+          .eq("sourceSupervisorControlReceiptId", controlReceipt._id)
+          .eq("jobId", member.jobId)
+      )
+      .take(2),
+  ]);
+  if (
+    !execution
+    || !scheduling
+    || sourceReceipts.length > 1
+    || execution.attempt._id !== member.workAttemptId
+    || execution.authorityDigest !== member.authorityDigest
+    || scheduling.admission._id !== member.schedulingAdmissionId
+    || scheduling.digest !== member.schedulingBindingDigest
+    || scheduling.binding.schedulingGroupKey !== member.schedulingGroupKey
+    || execution.schedulingBindingDigest
+      !== member.schedulingBindingDigest
+    || execution.workOrderRevisionId !== member.workOrderRevisionId
+    || execution.workOrderRevision !== member.workOrderRevision
+    || execution.workOrderRevisionDigest
+      !== member.workOrderRevisionDigest
+    || Number(job.priority) !== member.priority
+    || Number(job.createdAt) !== member.createdAt
+    || (writeLineageKey(job) ?? undefined) !== member.writeLineage
+  ) {
+    return null;
+  }
+  const source = {
+    controlReceiptId: controlReceipt._id,
+    fleetDigest,
+    memberDigest: member.memberDigest,
+  };
+  const sourceReceipt = sourceReceipts[0];
+  if (["done", "error", "cancelled", "needs_input"].includes(job.status)) {
+    const terminal = await exactTerminalWorkReceipt(ctx, job);
+    if (
+      !terminal
+      || terminal.receipt.attempt < member.attempt
+    ) {
+      return null;
+    }
+    if (terminal.receipt.attempt > member.attempt) {
+      if (
+        !sourceReceipt
+        || !["closed", "superseded"].includes(sourceReceipt.status)
+        || !await exactProjectedDispatchReceipt(ctx, {
+          job,
+          execution,
+          receipt: sourceReceipt,
+          source,
+          requireJobProjection: false,
+          expectedPhase: member.phase,
+        })
+      ) {
+        return null;
+      }
+      return { kind: "already_advanced", member, job };
+    }
+    if (
+      sourceReceipt
+      && (
+        !["closed", "superseded"].includes(sourceReceipt.status)
+        || !await exactProjectedDispatchReceipt(ctx, {
+          job,
+          execution,
+          receipt: sourceReceipt,
+          source,
+          requireJobProjection: false,
+          expectedPhase: member.phase,
+        })
+      )
+    ) {
+      return null;
+    }
+    if (!sourceReceipt && job.dispatchReceiptId) {
+      const historical = await ctx.db.get(job.dispatchReceiptId);
+      if (
+        !historical
+        || historical.sourceSupervisorControlReceiptId
+        || !["closed", "superseded"].includes(historical.status)
+        || !await exactProjectedDispatchReceipt(ctx, {
+          job,
+          execution,
+          receipt: historical,
+          requireJobProjection: false,
+          expectedPhase: member.phase,
+        })
+      ) {
+        return null;
+      }
+    }
+    return { kind: "already_advanced", member, job };
+  }
+  if (member.attempt !== Number(job.attempt ?? 1)) {
+    if (
+      Number(job.attempt ?? 0) > member.attempt
+      && sourceReceipt
+      && ["closed", "superseded"].includes(sourceReceipt.status)
+      && await exactProjectedDispatchReceipt(ctx, {
+        job,
+        execution,
+        receipt: sourceReceipt,
+        source,
+        requireJobProjection: false,
+        expectedPhase: member.phase,
+      })
+    ) {
+      return { kind: "already_advanced", member, job };
+    }
+    return null;
+  }
+  if (
+    member.phase !== dispatchPhaseForJob(job)
+    || job.integrationAttemptId
+    || !await exactManifestApproval(ctx, job, member)
+  ) {
+    return null;
+  }
+  if (sourceReceipt) {
+    if (
+      !await exactProjectedDispatchReceipt(ctx, {
+        job,
+        execution,
+        receipt: sourceReceipt,
+        source,
+        expectedPhase: member.phase,
+      })
+    ) {
+      return null;
+    }
+    if (
+      job.status === "dispatching"
+      && ["reserved", "reconciling"].includes(sourceReceipt.status)
+    ) {
+      if (!await exactManifestDelivery(
+        ctx,
+        job,
+        execution,
+        member,
+        "offered",
+      )) {
+        return null;
+      }
+      if (
+        !Number.isSafeInteger(sourceReceipt.leaseUntil)
+        || Number(sourceReceipt.leaseUntil) <= now
+      ) {
+        return { kind: "fallback_skipped", member, job };
+      }
+      return { kind: "reoffer", member, job, receipt: sourceReceipt };
+    }
+    if (
+      job.status === "running"
+      && sourceReceipt.status === "claimed"
+      && sourceReceipt.workerRunId === job.workerRunId
+    ) {
+      if (!await exactManifestDelivery(
+        ctx,
+        job,
+        execution,
+        member,
+        "running",
+      )) {
+        return null;
+      }
+      return { kind: "already_inflight", member, job };
+    }
+    return null;
+  }
+
+  if (job.status === "dispatching" || job.status === "running") {
+    const receipt = job.dispatchReceiptId
+      ? await ctx.db.get(job.dispatchReceiptId)
+      : null;
+    if (
+      !receipt
+      || receipt.sourceSupervisorControlReceiptId
+      || !await exactProjectedDispatchReceipt(ctx, {
+        job,
+        execution,
+        receipt,
+        expectedPhase: member.phase,
+      })
+      || (
+        job.status === "dispatching"
+          ? !["reserved", "reconciling"].includes(receipt.status)
+          : receipt.status !== "claimed"
+            || receipt.workerRunId !== job.workerRunId
+      )
+    ) {
+      return null;
+    }
+    if (!await exactManifestDelivery(
+      ctx,
+      job,
+      execution,
+      member,
+      job.status === "running" ? "running" : "offered",
+    )) {
+      return null;
+    }
+    return { kind: "already_inflight", member, job };
+  }
+  if (
+    job.status !== "pending"
+    || job.dispatchReady !== true
+    || job.schedulingBound !== true
+    || job.dispatchId
+    || job.workerRunId
+    || job.deliveryRunId
+    || job.nextRunAt !== member.nextRunAt
+    || member.nextRunAt > now
+    || !await exactManifestDelivery(
+      ctx,
+      job,
+      execution,
+      member,
+      "pending",
+    )
+  ) {
+    return null;
+  }
+  const runtimeRows = await ctx.db
+    .query("jobRuntime")
+    .withIndex("by_job", (q) => q.eq("jobId", job._id))
+    .take(2);
+  if (
+    runtimeRows.length !== 1
+    || runtimeRows[0].status !== "pending"
+    || runtimeRows[0].attempt !== member.attempt
+    || runtimeRows[0].nextRunAt !== member.nextRunAt
+    || !runtimeMatchesSchedulingAuthority(runtimeRows[0], scheduling)
+  ) {
+    return null;
+  }
+  const latest = await ctx.db
+    .query("dispatchReceipts")
+    .withIndex("by_job_generation", (q) => q.eq("jobId", job._id))
+    .order("desc")
+    .take(2);
+  if (
+    latest[0]
+    && (
+      !Number.isSafeInteger(latest[0].generation)
+      || latest[0].generation < 1
+      || !["closed", "superseded"].includes(latest[0].status)
+      || (
+        latest[1]
+        && latest[1].generation === latest[0].generation
+      )
+    )
+  ) {
+    return null;
+  }
+  const groups = await ctx.db
+    .query("workGroupScheduling")
+    .withIndex("by_group", (q) =>
+      q.eq("groupKey", scheduling.binding.schedulingGroupKey)
+    )
+    .take(2);
+  const group = groups[0];
+  const nextDispatchGeneration = Number(latest[0]?.generation ?? 0) + 1;
+  if (
+    groups.length !== 1
+    || !group
+    || group.missionGroupId !== scheduling.binding.missionGroupId
+    || group.projectGroupId !== scheduling.binding.projectGroupId
+    || group.canonicalProjectId
+      !== scheduling.binding.canonicalProjectId
+    || group.projectRepository
+      !== scheduling.binding.projectRepository
+    || !Number.isSafeInteger(nextDispatchGeneration)
+    || nextDispatchGeneration < 1
+  ) {
+    return null;
+  }
+  return {
+    kind: "candidate",
+    member,
+    job,
+    execution,
+    scheduling,
+    group,
+    nextDispatchGeneration,
+  };
+}
+
+async function supervisorFleetActiveCapacity(
+  ctx: Pick<MutationCtx, "db">,
+) {
+  const rows = (await Promise.all(
+    ["dispatching", "running"].map((status) =>
+      ctx.db
+        .query("jobRuntime")
+        .withIndex("by_status_priority", (q) => q.eq("status", status))
+        .take(BACKGROUND_CONCURRENCY_LIMIT + 1)
+    ),
+  )).flat();
+  if (rows.length >= BACKGROUND_CONCURRENCY_LIMIT) {
+    return {
+      available: 0,
+      activeByGroup: new Map<string, number>(),
+      activeWriteLineages: new Set<string>(),
+    };
+  }
+  const activeByGroup = new Map<string, number>();
+  const activeWriteLineages = new Set<string>();
+  const seen = new Set<string>();
+  for (const runtime of rows) {
+    const job = await ctx.db.get(runtime.jobId);
+    const scheduling = job
+      && ["dispatching", "running"].includes(job.status)
+      ? await readJobSchedulingAuthority(ctx, job)
+      : null;
+    if (
+      !job
+      || !scheduling
+      || seen.has(String(job._id))
+      || runtime.status !== job.status
+      || runtime.attempt !== Number(job.attempt ?? 1)
+      || runtime.dispatchId !== job.dispatchId
+      || runtime.workerRunId !== job.workerRunId
+      || !runtimeMatchesSchedulingAuthority(runtime, scheduling)
+    ) {
+      return {
+        available: 0,
+        activeByGroup: new Map<string, number>(),
+        activeWriteLineages: new Set<string>(),
+      };
+    }
+    seen.add(String(job._id));
+    const groupKey = scheduling.binding.schedulingGroupKey;
+    activeByGroup.set(groupKey, (activeByGroup.get(groupKey) ?? 0) + 1);
+    const lineage = writeLineageKey(job);
+    if (lineage) activeWriteLineages.add(lineage);
+  }
+  return {
+    available: Math.max(0, BACKGROUND_CONCURRENCY_LIMIT - rows.length),
+    activeByGroup,
+    activeWriteLineages,
+  };
+}
+
+// A resume route may offer only the exact immutable members sealed into its
+// applied control receipt. It never samples the generic queue or expired
+// dispatch indexes; the minute scheduler remains the eventual fallback.
+export const reserveSupervisorControlDispatchBatchV1 = mutation({
+  args: {
+    controlReceiptId: v.id("missionSupervisorControls"),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const now = Date.now();
+    const control = await supervisorFleetControlAuthority(
+      ctx,
+      args.controlReceiptId,
+    );
+    if (!control) {
+      return {
+        protocolVersion: 1 as const,
+        status: "invalid_manifest" as const,
+        reservations: [],
+      };
+    }
+
+    const preflight: SupervisorFleetMemberPreflight[] = [];
+    for (const member of control.members) {
+      const result = await exactSupervisorFleetMemberAuthority(ctx, {
+        controlReceipt: control.receipt,
+        fleetDigest: control.fleetDigest,
+        member,
+        now,
+      });
+      if (!result) {
+        return {
+          protocolVersion: 1 as const,
+          status: "stale_manifest" as const,
+          reservations: [],
+        };
+      }
+      preflight.push(result);
+    }
+
+    const reoffers = preflight.filter((member) =>
+      member.kind === "reoffer"
+    );
+    const inflight = preflight.filter((member) =>
+      member.kind === "already_inflight"
+    );
+    const advanced = preflight.filter((member) =>
+      member.kind === "already_advanced"
+    );
+    const fallbackSkipped = preflight.filter((member) =>
+      member.kind === "fallback_skipped"
+    );
+    const candidates = preflight.filter((member) =>
+      member.kind === "candidate"
+    );
+    const reservations = reoffers.flatMap((planned) => {
+      if (planned.kind !== "reoffer") return [];
+      const reservation = reservationFromDispatchReceipt(
+        planned.receipt,
+        planned.job,
+      );
+      return reservation ? [reservation] : [];
+    });
+    if (reservations.length !== reoffers.length) {
+      return {
+        protocolVersion: 1 as const,
+        status: "stale_manifest" as const,
+        reservations: [],
+      };
+    }
+    if (!candidates.length) {
+      return {
+        protocolVersion: 1 as const,
+        status: reservations.length
+          ? "reserved" as const
+          : inflight.length
+            ? "already_inflight" as const
+            : advanced.length
+              ? "already_advanced" as const
+              : "fallback_pending" as const,
+        reservations,
+        alreadyInflightCount: inflight.length,
+        alreadyAdvancedCount: advanced.length,
+        fallbackSkippedCount: fallbackSkipped.length,
+        capacityLimitedCount: 0,
+      };
+    }
+
+    const schedulerRows = await ctx.db
+      .query("dispatchSchedulerState")
+      .withIndex("by_key", (q) => q.eq("key", DISPATCH_SCHEDULER_KEY))
+      .take(2);
+    if (schedulerRows.length > 1) {
+      return {
+        protocolVersion: 1 as const,
+        status: "invalid_scheduler_authority" as const,
+        reservations: [],
+      };
+    }
+    const capacity = await supervisorFleetActiveCapacity(ctx);
+    const groupRows = new Map(
+      candidates.flatMap((planned) =>
+        planned.kind === "candidate"
+          ? [[planned.member.schedulingGroupKey, planned.group] as const]
+          : []
+      ),
+    );
+    const groupStates = new Map([...groupRows.entries()].map(
+      ([groupKey, group]) => [
+        groupKey,
+        {
+          activeCount: capacity.activeByGroup.get(groupKey) ?? 0,
+          lastServedSequence: Number(group.lastServedSequence ?? 0),
+        },
+      ],
+    ));
+    const candidateById = new Map(candidates.flatMap((planned) =>
+      planned.kind === "candidate"
+        ? [[String(planned.job._id), planned] as const]
+        : []
+    ));
+    const selected = selectFairWork(
+      candidates.flatMap((planned) =>
+        planned.kind === "candidate"
+          ? [{
+            id: String(planned.job._id),
+            groupKey: planned.member.schedulingGroupKey,
+            priority: planned.member.priority,
+            createdAt: planned.member.createdAt,
+            writeLineage: planned.member.writeLineage ?? null,
+          }]
+          : []
+      ),
+      groupStates,
+      capacity.activeWriteLineages,
+      capacity.available,
+      schedulerRows[0]?.lastGroupKey,
+    ).flatMap((candidate) => {
+      const planned = candidateById.get(candidate.id);
+      return planned ? [planned] : [];
+    });
+
+    const reservedJobs: Doc<"jobs">[] = [];
+    for (const planned of selected) {
+      const source = {
+        controlReceiptId: control.receipt._id,
+        fleetDigest: control.fleetDigest,
+        memberDigest: planned.member.memberDigest,
+      };
+      const machine = {
+        preset: planned.execution.workOrder
+          .triggerMachinePreset as TriggerAgentMachinePreset,
+        reason: planned.execution.workOrder
+          .triggerMachineReason as TriggerAgentMachineReason,
+      };
+      const reason = "supervisor resume immediate wake";
+      const envelope = await dispatchReceiptEnvelope(
+        planned.job,
+        planned.member.attempt,
+        planned.nextDispatchGeneration,
+        planned.execution,
+        machine,
+        reason,
+        source,
+      );
+      const receiptId = await ctx.db.insert("dispatchReceipts", {
+        jobId: planned.job._id,
+        attempt: planned.member.attempt,
+        generation: planned.nextDispatchGeneration,
+        phase: envelope.phase,
+        dispatchId: envelope.dispatchId,
+        authorityDigest: planned.execution.authorityDigest,
+        workOrderRevisionDigest:
+          planned.execution.workOrderRevisionDigest,
+        triggerMachinePreset: machine.preset,
+        triggerMachineReason: machine.reason,
+        payloadJson: envelope.payloadJson,
+        payloadDigest: envelope.payloadDigest,
+        receiptDigest: envelope.receiptDigest,
+        sourceSupervisorControlReceiptId: control.receipt._id,
+        sourceSupervisorFleetDigest: control.fleetDigest,
+        sourceSupervisorMemberDigest: planned.member.memberDigest,
+        status: "reserved",
+        leaseUntil: now + DISPATCH_LEASE_MS,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await patchJobWithRuntimeDeferredQueue(ctx, planned.job, {
+        status: "dispatching",
+        stage: "dispatching",
+        progress: "cloud worker reserved",
+        dispatchId: envelope.dispatchId,
+        dispatchGeneration: planned.nextDispatchGeneration,
+        dispatchPhase: envelope.phase,
+        dispatchReceiptId: receiptId,
+        dispatchReceiptDigest: envelope.receiptDigest,
+        dispatchPayloadDigest: envelope.payloadDigest,
+        dispatchLeaseUntil: now + DISPATCH_LEASE_MS,
+        dispatchReason: reason,
+        workerRunId: undefined,
+        deliveryRunId: undefined,
+        deliveryGeneration: envelope.phase === "delivery"
+          ? Math.max(1, Number(planned.job.deliveryGeneration ?? 1))
+          : planned.job.deliveryGeneration,
+        workerRuntime: "trigger",
+        triggerMachinePreset: machine.preset,
+        triggerMachineReason: machine.reason,
+        triggerObservedMachinePreset: undefined,
+        triggerObservedMachineReason: undefined,
+        triggerPlatformAttempt: undefined,
+        providerRunState: "queued",
+        providerObservedAt: now,
+        heartbeatAt: now,
+      });
+      await appendAttemptEvidence(
+        ctx,
+        planned.job,
+        "dispatched",
+        "Independent Trigger worker reserved by exact supervisor resume",
+        {
+          stage: "dispatching",
+          percent: Math.max(1, planned.job.percent ?? 0),
+          evidenceKind: "dispatch",
+          eventKey:
+            `dispatch:${planned.member.attempt}:${envelope.dispatchId}`,
+        },
+      );
+      const committedReceipt = await ctx.db.get(receiptId);
+      const reservation = committedReceipt
+        ? reservationFromDispatchReceipt(committedReceipt, planned.job)
+        : null;
+      if (!reservation) {
+        throw new Error("Supervisor dispatch receipt payload was not reusable");
+      }
+      reservations.push(reservation);
+      reservedJobs.push(planned.job);
+    }
+    for (const groupKey of new Set(
+      reservedJobs.map((job) => String(job.schedulingGroupKey)),
+    )) {
+      await refreshWorkGroupQueueProjection(ctx, groupKey, now);
+    }
+    await recordSchedulingReservations(
+      ctx,
+      reservedJobs,
+      now,
+      groupRows,
+      schedulerRows[0] ?? null,
+    );
+    return {
+      protocolVersion: 1 as const,
+      status: selected.length
+        ? "reserved" as const
+        : "capacity_limited" as const,
+      reservations,
+      alreadyInflightCount: inflight.length,
+      alreadyAdvancedCount: advanced.length,
+      fallbackSkippedCount: fallbackSkipped.length,
+      capacityLimitedCount: candidates.length - selected.length,
+    };
+  },
+});
 
 // Bind one reserved job to one Trigger run. Late/retried platform deliveries
 // are harmless: only the exact live dispatch id can cross this fence.

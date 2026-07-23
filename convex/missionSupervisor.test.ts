@@ -58,7 +58,14 @@ const jobsApi = {
   reserveDispatchBatch: makeFunctionReference<"mutation">(
     "jobs:reserveDispatchBatch",
   ),
+  reserveSupervisorControlDispatchBatchV1:
+    makeFunctionReference<"mutation">(
+      "jobs:reserveSupervisorControlDispatchBatchV1",
+    ),
   claimDispatched: makeFunctionReference<"mutation">("jobs:claimDispatched"),
+  markDispatchLaunchUnknown: makeFunctionReference<"mutation">(
+    "jobs:markDispatchLaunchUnknown",
+  ),
   checkpointAndRequeue: makeFunctionReference<"mutation">(
     "jobs:checkpointAndRequeue",
   ),
@@ -452,6 +459,108 @@ async function startAndDelegate(
     delegated,
     jobIds: delegated.createdJobIds as Id<"jobs">[],
   };
+}
+
+async function pauseAndResumeFleet(
+  t: SupervisorTest,
+  requestKey: string,
+  workstreams: Array<ReturnType<typeof delegatedWorkstream>>,
+  options: StartOptions = {},
+) {
+  const fixture = await startAndDelegate(
+    t,
+    requestKey,
+    workstreams,
+    options,
+  );
+  const beforePause = await supervisorState(t, fixture.started.missionId);
+  if (!beforePause) throw new Error("Supervisor state is missing");
+  const paused = await control(
+    t,
+    fixture.started.missionId,
+    `${requestKey}-pause`,
+    "pause",
+    beforePause.inputRevision,
+  );
+  if (!paused.applied) throw new Error("Fleet pause was not applied");
+  const resumed = await control(
+    t,
+    fixture.started.missionId,
+    `${requestKey}-resume`,
+    "resume",
+    paused.inputRevision,
+  );
+  if (!resumed.applied || !resumed.fleetWakeTicket) {
+    throw new Error("Fleet resume did not return an exact wake ticket");
+  }
+  return { ...fixture, paused, resumed };
+}
+
+async function reserveSupervisorFleet(
+  t: SupervisorTest,
+  controlReceiptId: Id<"missionSupervisorControls">,
+) {
+  return await t.mutation(
+    jobsApi.reserveSupervisorControlDispatchBatchV1,
+    {
+      controlReceiptId,
+      workerToken: WORKER,
+    },
+  );
+}
+
+async function reserveUnrelatedCapacity(
+  t: SupervisorTest,
+  requestKey: string,
+  count: number,
+) {
+  const jobIds: Id<"jobs">[] = [];
+  let remaining = count;
+  let missionOrdinal = 0;
+  while (remaining > 0) {
+    const batch = Math.min(6, remaining);
+    const fixture = await startAndDelegate(
+      t,
+      `${requestKey}-${missionOrdinal}`,
+      Array.from({ length: batch }, (_, index) =>
+        delegatedWorkstream({
+          task:
+            `Hold unrelated capacity ${missionOrdinal}:${index} without touching the resumed fleet.`,
+          label: `unrelated capacity ${missionOrdinal}:${index}`,
+          readonly: true,
+        })
+      ),
+      { priority: 100 },
+    );
+    jobIds.push(...fixture.jobIds);
+    remaining -= batch;
+    missionOrdinal += 1;
+  }
+  const reserved = await t.mutation(jobsApi.reserveDispatchBatch, {
+    limit: count,
+    reason: `unrelated:${requestKey}`,
+    workerToken: WORKER,
+  });
+  expect(reserved.reservations).toHaveLength(count);
+  expect(new Set(
+    reserved.reservations.map((item: DispatchReservation) =>
+      String(item.jobId)
+    ),
+  )).toEqual(new Set(jobIds.map(String)));
+  return reserved.reservations as DispatchReservation[];
+}
+
+async function fleetWriteSurface(t: SupervisorTest) {
+  return await t.run(async (ctx) => ({
+    jobs: await ctx.db.query("jobs").collect(),
+    runtimes: await ctx.db.query("jobRuntime").collect(),
+    receipts: await ctx.db.query("dispatchReceipts").collect(),
+    deliveries: await ctx.db.query("deliveryAttempts").collect(),
+    reviews: await ctx.db.query("reviewReceipts").collect(),
+    groups: await ctx.db.query("workGroupScheduling").collect(),
+    scheduler: await ctx.db.query("dispatchSchedulerState").collect(),
+    evidence: await ctx.db.query("workEvents").collect(),
+  }));
 }
 
 async function seedVerifiedReceipt(
@@ -1737,10 +1846,25 @@ describe("dormant mission supervisor authority", () => {
       affectedJobIds: expectedCohort,
       affectedJobCount: 2,
       sourcePauseControlReceiptId: paused.controlReceiptId,
+      fleetWakeTicket: {
+        protocolVersion: 1,
+        controlReceiptId: expect.any(String),
+      },
       wakeTicket: {
         expectedInputRevision: 4,
       },
     });
+    expect(resumed.fleetWakeTicket.controlReceiptId)
+      .toBe(resumed.controlReceiptId);
+    const resumeControlReceiptId =
+      resumed.controlReceiptId as Id<"missionSupervisorControls">;
+    expect(await control(
+      t,
+      fixture.started.missionId,
+      "control-active-resume-v1",
+      "resume",
+      3,
+    )).toEqual({ ...resumed, replayed: true });
     const resumedRows = await t.run(async (ctx) => ({
       state: await ctx.db.get(fixture.started.stateId),
       command: await ctx.db
@@ -1753,6 +1877,7 @@ describe("dormant mission supervisor authority", () => {
         fixture.jobIds.map((jobId) => ctx.db.get(jobId)),
       ),
       attempts: await ctx.db.query("workAttempts").collect(),
+      receipt: await ctx.db.get(resumeControlReceiptId),
     }));
     expect(resumedRows.jobs.map((job) => job?.status)).toEqual([
       "pending",
@@ -1761,6 +1886,23 @@ describe("dormant mission supervisor authority", () => {
     ]);
     expect(resumedRows.jobs.map((job) => job?.attempt)).toEqual([1, 1, 1]);
     expect(resumedRows.attempts).toHaveLength(3);
+    expect(resumedRows.receipt).toMatchObject({
+      fleetManifestProtocolVersion: 1,
+      fleetManifestCount: 1,
+      fleetManifestDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      fleetManifest: [{
+        protocolVersion: 1,
+        jobId: queuedId,
+        attempt: 1,
+        phase: "specialist",
+        memberDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      }],
+    });
+    expect(resumedRows.receipt?.fleetManifest?.map((member) => member.jobId))
+      .toEqual([queuedId]);
+    expect(resumedRows.receipt?.fleetManifest?.some(
+      (member) => member.jobId === approvalId,
+    )).toBe(false);
     expect(resumedRows.state).toMatchObject({
       state: "ready",
       inputRevision: 4,
@@ -1772,6 +1914,648 @@ describe("dormant mission supervisor authority", () => {
       nonterminalJobCount: 3,
     });
     expect(resumedRows.command?.pauseCohortProtocolVersion).toBeUndefined();
+  });
+
+  it("reserves only the receipt manifest, replays byte-identically, and remains claim-compatible", async () => {
+    const t = convexTest(schema, modules);
+    const target = await startAndDelegate(
+      t,
+      "fleet-targeted-scope",
+      [delegatedWorkstream({
+        task: "Dispatch only this receipt-bound resumed member.",
+        label: "receipt-bound member",
+      })],
+    );
+    const targetState = await supervisorState(t, target.started.missionId);
+    const paused = await control(
+      t,
+      target.started.missionId,
+      "fleet-targeted-scope-pause",
+      "pause",
+      targetState!.inputRevision,
+    );
+    const unrelated = await startAndDelegate(
+      t,
+      "fleet-unrelated-expired",
+      [delegatedWorkstream({
+        task: "Remain outside the exact resumed fleet.",
+        label: "unrelated expired member",
+        readonly: true,
+      })],
+      { priority: 100 },
+    );
+    const unrelatedReservation = (await t.mutation(
+      jobsApi.reserveDispatchBatch,
+      {
+        limit: 1,
+        reason: "unrelated expired reservation",
+        workerToken: WORKER,
+      },
+    )).reservations[0] as DispatchReservation;
+    expect(unrelatedReservation.jobId).toBe(unrelated.jobIds[0]);
+    await t.run(async (ctx) => {
+      const job = await ctx.db.get(unrelated.jobIds[0]);
+      if (!job?.dispatchReceiptId) {
+        throw new Error("Unrelated dispatch receipt is missing");
+      }
+      const runtime = await ctx.db
+        .query("jobRuntime")
+        .withIndex("by_job", (q) =>
+          q.eq("jobId", unrelated.jobIds[0])
+        )
+        .unique();
+      await ctx.db.patch(job.dispatchReceiptId, {
+        leaseUntil: Date.now() - 1,
+      });
+      await ctx.db.patch(job._id, {
+        dispatchLeaseUntil: Date.now() - 1,
+      });
+      if (runtime) {
+        await ctx.db.patch(runtime._id, {
+          dispatchLeaseUntil: Date.now() - 1,
+        });
+      }
+    });
+
+    const resumed = await control(
+      t,
+      target.started.missionId,
+      "fleet-targeted-scope-resume",
+      "resume",
+      paused.inputRevision,
+    );
+    const first = await reserveSupervisorFleet(
+      t,
+      resumed.controlReceiptId,
+    );
+    expect(first).toMatchObject({
+      protocolVersion: 1,
+      status: "reserved",
+      reservations: [{
+        jobId: target.jobIds[0],
+        attempt: 1,
+        dispatchGeneration: 1,
+        dispatchPhase: "specialist",
+      }],
+    });
+    expect(first.reservations).toHaveLength(1);
+    const replayed = await reserveSupervisorFleet(
+      t,
+      resumed.controlReceiptId,
+    );
+    expect(replayed).toEqual(first);
+
+    const persisted = await t.run(async (ctx) => {
+      const targetJob = await ctx.db.get(target.jobIds[0]);
+      const unrelatedJob = await ctx.db.get(unrelated.jobIds[0]);
+      const sourceReceipts = await ctx.db
+        .query("dispatchReceipts")
+        .withIndex("by_supervisor_control_member", (q) =>
+          q
+            .eq(
+              "sourceSupervisorControlReceiptId",
+              resumed.controlReceiptId,
+            )
+            .eq("jobId", target.jobIds[0])
+        )
+        .collect();
+      return {
+        targetJob,
+        unrelatedJob,
+        sourceReceipts,
+        unrelatedReceipt: unrelatedJob?.dispatchReceiptId
+          ? await ctx.db.get(unrelatedJob.dispatchReceiptId)
+          : null,
+      };
+    });
+    expect(persisted.sourceReceipts).toHaveLength(1);
+    expect(persisted.sourceReceipts[0]).toMatchObject({
+      sourceSupervisorControlReceiptId: resumed.controlReceiptId,
+      sourceSupervisorFleetDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      sourceSupervisorMemberDigest: expect.stringMatching(
+        /^[0-9a-f]{64}$/,
+      ),
+      generation: 1,
+      status: "reserved",
+    });
+    expect(persisted.unrelatedReceipt).toMatchObject({
+      status: "reserved",
+      leaseUntil: START_AT - 1,
+    });
+    expect(persisted.unrelatedReceipt?.sourceSupervisorControlReceiptId)
+      .toBeUndefined();
+    expect(JSON.stringify(first.reservations)).not.toContain(
+      "sourceSupervisor",
+    );
+    expect(persisted.sourceReceipts[0].payloadJson).not.toContain(
+      "sourceSupervisor",
+    );
+    expect(persisted.sourceReceipts[0].payloadJson).not.toContain(
+      String(resumed.controlReceiptId),
+    );
+    expect(persisted.sourceReceipts[0].payloadJson).not.toContain(
+      persisted.sourceReceipts[0].sourceSupervisorFleetDigest!,
+    );
+    expect(persisted.sourceReceipts[0].payloadJson).not.toContain(
+      persisted.sourceReceipts[0].sourceSupervisorMemberDigest!,
+    );
+
+    const reservation = first.reservations[0] as DispatchReservation;
+    expect(await t.mutation(jobsApi.claimDispatched, {
+      jobId: reservation.jobId,
+      dispatchId: reservation.dispatchId,
+      ...triggerClaimAuthority(reservation),
+      workerRunId: "receipt-bound-worker",
+      workerToken: WORKER,
+    })).toMatchObject({
+      workerRunId: "receipt-bound-worker",
+      dispatchGeneration: 1,
+      dispatchPhase: "specialist",
+    });
+  });
+
+  it("skips an expired source offer until the minute fallback reoffers its exact bytes", async () => {
+    const t = convexTest(schema, modules);
+    const fixture = await pauseAndResumeFleet(
+      t,
+      "fleet-expired-source-fallback",
+      [delegatedWorkstream({
+        task: "Preserve exact Trigger loss reconciliation.",
+        label: "expired source offer",
+      })],
+    );
+    const offered = await reserveSupervisorFleet(
+      t,
+      fixture.resumed.controlReceiptId,
+    );
+    const reservation = offered.reservations[0] as DispatchReservation;
+    expect(await t.mutation(jobsApi.markDispatchLaunchUnknown, {
+      jobId: reservation.jobId,
+      dispatchId: reservation.dispatchId,
+      dispatchGeneration: reservation.dispatchGeneration,
+      dispatchPhase: reservation.dispatchPhase,
+      dispatchReceiptDigest: reservation.dispatchReceiptDigest,
+      dispatchPayloadDigest: reservation.dispatchPayloadDigest,
+      reason: "Trigger response was lost after acceptance",
+      workerToken: WORKER,
+    })).toBe(true);
+    vi.advanceTimersByTime(31_000);
+    const beforeTargetedRetry = await fleetWriteSurface(t);
+    expect(await reserveSupervisorFleet(
+      t,
+      fixture.resumed.controlReceiptId,
+    )).toMatchObject({
+      protocolVersion: 1,
+      status: "fallback_pending",
+      reservations: [],
+      fallbackSkippedCount: 1,
+    });
+    expect(await fleetWriteSurface(t)).toEqual(beforeTargetedRetry);
+
+    await t.mutation(jobsApi.reapStale, { workerToken: WORKER });
+    const fallback = await t.mutation(jobsApi.reserveDispatchBatch, {
+      limit: 1,
+      reason: "minute fallback exact retry",
+      workerToken: WORKER,
+    });
+    expect(fallback.reservations).toEqual([reservation]);
+    const rows = await t.run(async (ctx) =>
+      await ctx.db
+        .query("dispatchReceipts")
+        .withIndex("by_supervisor_control_member", (q) =>
+          q
+            .eq(
+              "sourceSupervisorControlReceiptId",
+              fixture.resumed.controlReceiptId,
+            )
+            .eq("jobId", fixture.jobIds[0])
+        )
+        .collect()
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      status: "reserved",
+      generation: reservation.dispatchGeneration,
+      receiptDigest: reservation.dispatchReceiptDigest,
+      payloadDigest: reservation.dispatchPayloadDigest,
+    });
+  });
+
+  it("treats a generic scheduler race as one already-inflight receipt", async () => {
+    const t = convexTest(schema, modules);
+    const fixture = await pauseAndResumeFleet(
+      t,
+      "fleet-generic-race",
+      [delegatedWorkstream({
+        task: "Allow only one dispatch receipt across scheduler races.",
+        label: "generic race member",
+      })],
+    );
+    const generic = await t.mutation(jobsApi.reserveDispatchBatch, {
+      limit: 1,
+      reason: "generic scheduler won",
+      workerToken: WORKER,
+    });
+    expect(generic.reservations).toHaveLength(1);
+    expect(await reserveSupervisorFleet(
+      t,
+      fixture.resumed.controlReceiptId,
+    )).toMatchObject({
+      protocolVersion: 1,
+      status: "already_inflight",
+      reservations: [],
+      alreadyInflightCount: 1,
+    });
+    const receipts = await t.run(async (ctx) =>
+      await ctx.db
+        .query("dispatchReceipts")
+        .withIndex("by_job_generation", (q) =>
+          q.eq("jobId", fixture.jobIds[0])
+        )
+        .collect()
+    );
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0].sourceSupervisorControlReceiptId).toBeUndefined();
+  });
+
+  it("makes corrupt, stale, and duplicate source authority read-only failures", async () => {
+    const corrupt = convexTest(schema, modules);
+    const corruptFixture = await pauseAndResumeFleet(
+      corrupt,
+      "fleet-corrupt-manifest",
+      [delegatedWorkstream()],
+    );
+    await corrupt.run(async (ctx) => {
+      const receipt = await ctx.db.get(
+        corruptFixture.resumed
+          .controlReceiptId as Id<"missionSupervisorControls">,
+      );
+      if (!receipt?.fleetManifest?.[0]) {
+        throw new Error("Corrupt manifest fixture is missing");
+      }
+      await ctx.db.patch(receipt._id, {
+        fleetManifest: [{
+          ...receipt.fleetManifest[0],
+          priority: receipt.fleetManifest[0].priority + 1,
+        }],
+      });
+    });
+    const corruptBefore = await fleetWriteSurface(corrupt);
+    expect(await reserveSupervisorFleet(
+      corrupt,
+      corruptFixture.resumed.controlReceiptId,
+    )).toMatchObject({
+      status: "invalid_manifest",
+      reservations: [],
+    });
+    expect(await fleetWriteSurface(corrupt)).toEqual(corruptBefore);
+
+    const stale = convexTest(schema, modules);
+    const staleFixture = await pauseAndResumeFleet(
+      stale,
+      "fleet-stale-member",
+      [delegatedWorkstream()],
+    );
+    await stale.run(async (ctx) => {
+      await ctx.db.patch(staleFixture.jobIds[0], {
+        nextRunAt: Date.now() + 60_000,
+      });
+    });
+    const staleBefore = await fleetWriteSurface(stale);
+    expect(await reserveSupervisorFleet(
+      stale,
+      staleFixture.resumed.controlReceiptId,
+    )).toMatchObject({
+      status: "stale_manifest",
+      reservations: [],
+    });
+    expect(await fleetWriteSurface(stale)).toEqual(staleBefore);
+
+    const duplicate = convexTest(schema, modules);
+    const duplicateFixture = await pauseAndResumeFleet(
+      duplicate,
+      "fleet-duplicate-source",
+      [delegatedWorkstream()],
+    );
+    await reserveSupervisorFleet(
+      duplicate,
+      duplicateFixture.resumed.controlReceiptId,
+    );
+    await duplicate.run(async (ctx) => {
+      const rows = await ctx.db
+        .query("dispatchReceipts")
+        .withIndex("by_supervisor_control_member", (q) =>
+          q
+            .eq(
+              "sourceSupervisorControlReceiptId",
+              duplicateFixture.resumed.controlReceiptId,
+            )
+            .eq("jobId", duplicateFixture.jobIds[0])
+        )
+        .collect();
+      if (rows.length !== 1) {
+        throw new Error("Duplicate source fixture is missing");
+      }
+      const { _id, _creationTime, ...copy } = rows[0];
+      void _id;
+      void _creationTime;
+      await ctx.db.insert("dispatchReceipts", copy);
+    });
+    const duplicateBefore = await fleetWriteSurface(duplicate);
+    expect(await reserveSupervisorFleet(
+      duplicate,
+      duplicateFixture.resumed.controlReceiptId,
+    )).toMatchObject({
+      status: "stale_manifest",
+      reservations: [],
+    });
+    expect(await fleetWriteSurface(duplicate)).toEqual(duplicateBefore);
+  });
+
+  it("reports capacity-limited when inflight and advanced peers accompany a blocked candidate", async () => {
+    const t = convexTest(schema, modules);
+    const target = await startAndDelegate(
+      t,
+      "fleet-mixed-capacity-status",
+      Array.from({ length: 3 }, (_, index) =>
+        delegatedWorkstream({
+          task: `Preserve mixed capacity member ${index}.`,
+          label: `mixed capacity ${index}`,
+          readonly: true,
+        })
+      ),
+    );
+    const state = await supervisorState(t, target.started.missionId);
+    const paused = await control(
+      t,
+      target.started.missionId,
+      "fleet-mixed-capacity-pause",
+      "pause",
+      state!.inputRevision,
+    );
+    await reserveUnrelatedCapacity(t, "fleet-capacity-holder", 7);
+    const resumed = await control(
+      t,
+      target.started.missionId,
+      "fleet-mixed-capacity-resume",
+      "resume",
+      paused.inputRevision,
+    );
+    const initial = await reserveSupervisorFleet(
+      t,
+      resumed.controlReceiptId,
+    );
+    expect(initial.reservations).toHaveLength(1);
+    const inflightReservation =
+      initial.reservations[0] as DispatchReservation;
+    expect(await t.mutation(jobsApi.claimDispatched, {
+      jobId: inflightReservation.jobId,
+      dispatchId: inflightReservation.dispatchId,
+      ...triggerClaimAuthority(inflightReservation),
+      workerRunId: "mixed-capacity-running",
+      workerToken: WORKER,
+    })).toMatchObject({
+      workerRunId: "mixed-capacity-running",
+    });
+    const remaining = target.jobIds.filter(
+      (jobId) => jobId !== inflightReservation.jobId,
+    );
+    await seedVerifiedReceipt(t, remaining[0]);
+
+    expect(await reserveSupervisorFleet(
+      t,
+      resumed.controlReceiptId,
+    )).toMatchObject({
+      protocolVersion: 1,
+      status: "capacity_limited",
+      reservations: [],
+      alreadyInflightCount: 1,
+      alreadyAdvancedCount: 1,
+      capacityLimitedCount: 1,
+    });
+    const blocked = await t.run(async (ctx) =>
+      await ctx.db.get(remaining[1])
+    );
+    expect(blocked).toMatchObject({
+      status: "pending",
+    });
+    expect(blocked).not.toHaveProperty("dispatchId");
+  });
+
+  it("caps one resumed work group at six and reoffers only those exact receipts", async () => {
+    const t = convexTest(schema, modules);
+    const firstWave = await startAndDelegate(
+      t,
+      "fleet-work-group-cap",
+      Array.from({ length: 6 }, (_, index) =>
+        delegatedWorkstream({
+          task: `Execute bounded same-group member ${index}.`,
+          label: `same group ${index}`,
+          readonly: true,
+        })
+      ),
+    );
+    const waiting = await supervisorState(
+      t,
+      firstWave.started.missionId,
+    );
+    await t.run(async (ctx) => {
+      await ctx.db.patch(firstWave.started.stateId, {
+        state: "ready",
+        nextTickAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    });
+    const secondLease = await claimSuccess(
+      t,
+      firstWave.started.missionId,
+      waiting!.leaseVersion,
+    );
+    const secondWave = await t.mutation(
+      supervisorApi.commitV1,
+      commitInput(
+        firstWave.started.missionId,
+        secondLease,
+        {
+          kind: "delegate",
+          workstreams: [delegatedWorkstream({
+            task: "Execute bounded same-group member six.",
+            label: "same group 6",
+            readonly: true,
+          })],
+        },
+        {
+          ...MODEL_METADATA,
+          triggerRunId: "trigger-fleet-work-group-cap-second-wave",
+        },
+      ),
+    );
+    expect(secondWave).toMatchObject({
+      committed: true,
+      resultState: "waiting",
+    });
+    const allJobIds = [
+      ...firstWave.jobIds,
+      ...(secondWave.createdJobIds as Id<"jobs">[]),
+    ];
+    expect(allJobIds).toHaveLength(7);
+    const beforePause = await supervisorState(
+      t,
+      firstWave.started.missionId,
+    );
+    const paused = await control(
+      t,
+      firstWave.started.missionId,
+      "fleet-work-group-cap-pause",
+      "pause",
+      beforePause!.inputRevision,
+    );
+    const resumed = await control(
+      t,
+      firstWave.started.missionId,
+      "fleet-work-group-cap-resume",
+      "resume",
+      paused.inputRevision,
+    );
+    const first = await reserveSupervisorFleet(
+      t,
+      resumed.controlReceiptId,
+    );
+    expect(first).toMatchObject({
+      protocolVersion: 1,
+      status: "reserved",
+      capacityLimitedCount: 1,
+    });
+    expect(first.reservations).toHaveLength(6);
+
+    const afterFirst = await t.run(async (ctx) => ({
+      jobs: await Promise.all(allJobIds.map((jobId) => ctx.db.get(jobId))),
+      sourceReceipts: await ctx.db
+        .query("dispatchReceipts")
+        .withIndex("by_supervisor_control_member", (q) =>
+          q.eq(
+            "sourceSupervisorControlReceiptId",
+            resumed.controlReceiptId,
+          )
+        )
+        .collect(),
+    }));
+    expect(afterFirst.jobs.filter((job) => job?.status === "dispatching"))
+      .toHaveLength(6);
+    expect(afterFirst.jobs.filter((job) => job?.status === "pending"))
+      .toHaveLength(1);
+    expect(afterFirst.sourceReceipts).toHaveLength(6);
+
+    const replay = await reserveSupervisorFleet(
+      t,
+      resumed.controlReceiptId,
+    );
+    expect(replay).toMatchObject({
+      protocolVersion: 1,
+      status: "capacity_limited",
+      capacityLimitedCount: 1,
+    });
+    expect(replay.reservations).toEqual(first.reservations);
+    const sourceCount = await t.run(async (ctx) =>
+      (
+        await ctx.db
+          .query("dispatchReceipts")
+          .withIndex("by_supervisor_control_member", (q) =>
+            q.eq(
+              "sourceSupervisorControlReceiptId",
+              resumed.controlReceiptId,
+            )
+          )
+          .collect()
+      ).length
+    );
+    expect(sourceCount).toBe(6);
+  });
+
+  it("does not let exact terminal attempt advancement stale a pending sibling", async () => {
+    const t = convexTest(schema, modules);
+    const target = await startAndDelegate(
+      t,
+      "fleet-terminal-attempt-advance",
+      [
+        delegatedWorkstream({
+          task: "Advance through one exact continuation before terminal proof.",
+          label: "advanced terminal member",
+          readonly: true,
+        }),
+        delegatedWorkstream({
+          task: "Remain pending while the advanced peer is validated.",
+          label: "pending sibling",
+          readonly: true,
+        }),
+      ],
+    );
+    const state = await supervisorState(t, target.started.missionId);
+    const paused = await control(
+      t,
+      target.started.missionId,
+      "fleet-terminal-attempt-pause",
+      "pause",
+      state!.inputRevision,
+    );
+    await reserveUnrelatedCapacity(t, "fleet-terminal-capacity", 7);
+    const resumed = await control(
+      t,
+      target.started.missionId,
+      "fleet-terminal-attempt-resume",
+      "resume",
+      paused.inputRevision,
+    );
+    const first = await reserveSupervisorFleet(
+      t,
+      resumed.controlReceiptId,
+    );
+    expect(first.reservations).toHaveLength(1);
+    const advancedReservation =
+      first.reservations[0] as DispatchReservation;
+    const claimed = await t.mutation(jobsApi.claimDispatched, {
+      jobId: advancedReservation.jobId,
+      dispatchId: advancedReservation.dispatchId,
+      ...triggerClaimAuthority(advancedReservation),
+      workerRunId: "advanced-terminal-worker",
+      workerToken: WORKER,
+    });
+    expect(await t.mutation(jobsApi.checkpointAndRequeue, {
+      jobId: advancedReservation.jobId,
+      expectedAttempt: 1,
+      authorityDigest: advancedReservation.authorityDigest,
+      checkpoint: "Exact attempt one completed before continuation.",
+      nextStatus: "pending",
+      workerRunId: "advanced-terminal-worker",
+      workerToken: WORKER,
+    })).toMatchObject({
+      requeued: true,
+      exhausted: false,
+      stale: false,
+    });
+    expect(claimed).toMatchObject({ workerRunId: "advanced-terminal-worker" });
+    await seedVerifiedReceipt(t, advancedReservation.jobId);
+
+    const sibling = target.jobIds.find(
+      (jobId) => jobId !== advancedReservation.jobId,
+    )!;
+    const result = await reserveSupervisorFleet(
+      t,
+      resumed.controlReceiptId,
+    );
+    expect(result).toMatchObject({
+      protocolVersion: 1,
+      status: "reserved",
+      reservations: [{ jobId: sibling }],
+      alreadyAdvancedCount: 1,
+    });
+    const advancedJob = await t.run(async (ctx) =>
+      await ctx.db.get(advancedReservation.jobId)
+    );
+    expect(advancedJob).toMatchObject({
+      status: "done",
+      attempt: 2,
+    });
   });
 
   it("preflights the full ledger before writing any earlier pause member", async () => {
@@ -1989,19 +2773,113 @@ describe("dormant mission supervisor authority", () => {
       effectId: "pr:unresolved-pause",
       observation: "not_applied",
     })).toBe(true);
-    expect(await control(
+    const resolvedPause = await control(
       t,
       fixture.started.missionId,
       "control-resolved-provider-pause",
       "pause",
       beforePause!.inputRevision,
-    )).toMatchObject({
+    );
+    expect(resolvedPause).toMatchObject({
       applied: true,
       reason: "applied",
       state: "paused",
       inputRevision: beforePause!.inputRevision + 1,
       affectedJobCount: 1,
     });
+    const resumed = await control(
+      t,
+      fixture.started.missionId,
+      "control-resolved-provider-resume",
+      "resume",
+      resolvedPause.inputRevision,
+    );
+    expect(resumed).toMatchObject({
+      applied: true,
+      state: "ready",
+      affectedJobIds: [jobId],
+      fleetWakeTicket: {
+        protocolVersion: 1,
+        controlReceiptId: expect.any(String),
+      },
+    });
+    const resumedAuthority = await t.run(async (ctx) => {
+      const receipt = await ctx.db.get(
+        resumed.controlReceiptId as Id<"missionSupervisorControls">,
+      );
+      const job = await ctx.db.get(jobId);
+      return {
+        receipt,
+        job,
+        delivery: job?.activeDeliveryAttemptId
+          ? await ctx.db.get(job.activeDeliveryAttemptId)
+          : null,
+        review: job?.reviewReceiptId
+          ? await ctx.db.get(job.reviewReceiptId)
+          : null,
+      };
+    });
+    expect(resumedAuthority.job).toMatchObject({
+      status: "pending",
+      verificationVerdict: "pass",
+      deliveryGeneration: 2,
+    });
+    expect(resumedAuthority.receipt).toMatchObject({
+      fleetManifestCount: 1,
+      fleetManifest: [{
+        jobId,
+        phase: "delivery",
+        attempt: 1,
+        deliveryAttemptId: resumedAuthority.job?.activeDeliveryAttemptId,
+        deliverySourceWorkAttempt: 1,
+        deliveryGeneration: 2,
+        reviewReceiptId: resumedAuthority.job?.reviewReceiptId,
+        reviewReceiptDigest: resumedAuthority.job?.reviewReceiptDigest,
+      }],
+    });
+    expect(resumedAuthority.delivery).toMatchObject({
+      status: "checkpointed",
+      sourceWorkAttempt: 1,
+      generation: 2,
+      reviewReceiptId: resumedAuthority.review?._id,
+      reviewReceiptDigest: resumedAuthority.review?.receiptDigest,
+    });
+    const deliveryOffer = await reserveSupervisorFleet(
+      t,
+      resumed.controlReceiptId,
+    );
+    expect(deliveryOffer).toMatchObject({
+      protocolVersion: 1,
+      status: "reserved",
+      reservations: [{
+        jobId,
+        expectedAttempt: 1,
+        dispatchPhase: "delivery",
+      }],
+    });
+    expect(deliveryOffer.reservations).toHaveLength(1);
+
+    await t.run(async (ctx) => {
+      const job = await ctx.db.get(jobId);
+      if (!job?.activeDeliveryAttemptId || !job.reviewReceiptId) {
+        throw new Error("Resumed delivery authority is missing");
+      }
+      await ctx.db.patch(job.activeDeliveryAttemptId, {
+        schedulingBindingDigest: "e".repeat(64),
+      });
+      await ctx.db.patch(job.reviewReceiptId, {
+        workOrderRevisionDigest: "f".repeat(64),
+      });
+    });
+    const beforeTamperedReplay = await fleetWriteSurface(t);
+    expect(await reserveSupervisorFleet(
+      t,
+      resumed.controlReceiptId,
+    )).toMatchObject({
+      status: "stale_manifest",
+      reservations: [],
+    });
+    expect(await fleetWriteSurface(t)).toEqual(beforeTamperedReplay);
   });
 
   it("rejects a terminalized cohort member without v2 authority, then skips it once exact", async () => {

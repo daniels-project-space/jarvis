@@ -3,6 +3,10 @@ import { z } from "zod";
 import { controlMutation, controlQuery } from "@/lib/control-session";
 import { wakeAgentFleet } from "@/lib/agent-fleet-dispatch";
 import { dispatchMissionSupervisorWakeTicket } from "@/lib/mission-supervisor-dispatch-server";
+import {
+  dispatchSupervisorFleetWakeTicket,
+  SupervisorFleetReservationTransportError,
+} from "@/lib/supervisor-fleet-dispatch-server";
 import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
 import {
   SUPERVISOR_INPUT_TOO_LARGE_ERROR,
@@ -67,15 +71,22 @@ const supervisorWakeTicketSchema = z.object({
   expectedInputRevision: safeIntegerSchema,
 }).strict();
 
+const supervisorFleetWakeTicketSchema = z.object({
+  protocolVersion: z.literal(1),
+  controlReceiptId: z.string().min(1).max(160),
+}).strict();
+
 const supervisorResultSchema = z.object({
   applied: z.boolean(),
   replayed: z.boolean(),
   noop: z.boolean(),
   reason: z.string(),
   missionId: z.string().min(1).max(160),
+  controlReceiptId: z.string().min(1).max(160),
   action: supervisorActionSchema,
   state: supervisorStateSchema.optional(),
   inputRevision: safeIntegerSchema.optional(),
+  fleetWakeTicket: supervisorFleetWakeTicketSchema.nullable(),
   wakeTicket: supervisorWakeTicketSchema.nullable(),
 });
 
@@ -139,6 +150,20 @@ async function applySupervisorControl(
       "The supervisor returned a wake ticket for another mission. Retry the same request.",
     );
   }
+  if (
+    result.fleetWakeTicket !== null
+    && (
+      request.action !== "resume"
+      || !result.applied
+      || result.noop
+      || result.fleetWakeTicket.controlReceiptId
+        !== result.controlReceiptId
+    )
+  ) {
+    return retryableSupervisorResponse(
+      "The supervisor returned an invalid fleet wake ticket. Retry the same request.",
+    );
+  }
   const ok = result.applied || result.noop;
   if (
     ok
@@ -175,22 +200,36 @@ async function applySupervisorControl(
     }, { status: 409 });
   }
 
-  let dispatched = false;
-  let runId: string | undefined;
-  if (result.wakeTicket !== null) {
-    try {
-      const dispatch = await dispatchMissionSupervisorWakeTicket(
-        result.wakeTicket,
-      );
-      dispatched = dispatch.dispatched;
-      if (dispatch.dispatched) runId = dispatch.runId;
-    } catch {
-      // The control receipt is already durable. Returning 503 preserves its
-      // browser key so a replay dispatches the same exact wake ticket.
-      return retryableSupervisorResponse(
-        "The control was recorded, but its supervisor wake is not yet confirmed. Retry the same request.",
-      );
-    }
+  const [supervisorWake, fleetWake] = await Promise.allSettled([
+    result.wakeTicket === null
+      ? Promise.resolve({ dispatched: false as const })
+      : dispatchMissionSupervisorWakeTicket(result.wakeTicket),
+    result.fleetWakeTicket === null
+      ? Promise.resolve({ status: "held" as const, offeredCount: 0 })
+      : dispatchSupervisorFleetWakeTicket(result.fleetWakeTicket),
+  ]);
+  if (supervisorWake.status === "rejected") {
+    // The control receipt is already durable. Returning 503 preserves its
+    // browser key so a replay dispatches the same exact wake ticket.
+    return retryableSupervisorResponse(
+      "The control was recorded, but its supervisor wake is not yet confirmed. Retry the same request.",
+    );
+  }
+  if (
+    fleetWake.status === "rejected"
+    && (
+      fleetWake.reason instanceof SupervisorFleetReservationTransportError
+      || (
+        typeof fleetWake.reason === "object"
+        && fleetWake.reason !== null
+        && "code" in fleetWake.reason
+        && fleetWake.reason.code === "reservation_transport_unknown"
+      )
+    )
+  ) {
+    return retryableSupervisorResponse(
+      "The control was recorded, but its exact fleet reservation is not yet confirmed. Retry the same request.",
+    );
   }
 
   return Response.json({
@@ -199,8 +238,12 @@ async function applySupervisorControl(
     noop: result.noop,
     state: result.state,
     inputRevision: result.inputRevision,
-    dispatched,
-    ...(runId === undefined ? {} : { runId }),
+    dispatched: supervisorWake.value.dispatched,
+    fleetWake: result.fleetWakeTicket === null
+      ? "not_needed"
+      : fleetWake.status === "fulfilled"
+        ? fleetWake.value.status
+        : "held",
   });
 }
 

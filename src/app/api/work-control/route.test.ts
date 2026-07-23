@@ -16,10 +16,20 @@ vi.mock("@/lib/agent-fleet-dispatch", () => ({
 vi.mock("@/lib/mission-supervisor-dispatch-server", () => ({
   dispatchMissionSupervisorWakeTicket: vi.fn(),
 }));
+vi.mock("@/lib/supervisor-fleet-dispatch-server", () => {
+  class SupervisorFleetReservationTransportError extends Error {
+    readonly code = "reservation_transport_unknown";
+  }
+  return {
+    dispatchSupervisorFleetWakeTicket: vi.fn(),
+    SupervisorFleetReservationTransportError,
+  };
+});
 
 import { wakeAgentFleet } from "@/lib/agent-fleet-dispatch";
 import { controlMutation, controlQuery } from "@/lib/control-session";
 import { dispatchMissionSupervisorWakeTicket } from "@/lib/mission-supervisor-dispatch-server";
+import { dispatchSupervisorFleetWakeTicket } from "@/lib/supervisor-fleet-dispatch-server";
 import { controlActor } from "@/lib/request-auth";
 import { POST } from "./route";
 
@@ -31,6 +41,10 @@ const wakeTicket = {
   expectedEpoch: 2,
   expectedDecisionSequence: 7,
   expectedInputRevision: 8,
+};
+const fleetWakeTicket = {
+  protocolVersion: 1 as const,
+  controlReceiptId: "control-resume-1",
 };
 
 function request(body: unknown) {
@@ -74,6 +88,7 @@ function supervisorReceipt(overrides: Record<string, unknown> = {}) {
     sourcePauseControlReceiptId: "must-not-leak-pause-receipt",
     state: "ready",
     inputRevision: 8,
+    fleetWakeTicket: null,
     wakeTicket,
     ...overrides,
   };
@@ -97,6 +112,10 @@ describe("authenticated work controls", () => {
       },
       payload: wakeTicket,
       idempotencyKey: "must-not-leak",
+    });
+    vi.mocked(dispatchSupervisorFleetWakeTicket).mockResolvedValue({
+      status: "dispatched",
+      offeredCount: 1,
     });
   });
 
@@ -200,7 +219,7 @@ describe("authenticated work controls", () => {
       state: "ready",
       inputRevision: 8,
       dispatched: true,
-      runId: "run-supervisor-1",
+      fleetWake: "not_needed",
     });
     expect(JSON.stringify(payload)).not.toContain("publicAccessToken");
     expect(JSON.stringify(payload)).not.toContain("idempotencyKey");
@@ -212,6 +231,8 @@ describe("authenticated work controls", () => {
     expect(JSON.stringify(payload)).not.toContain(
       "sourcePauseControlReceiptId",
     );
+    expect(JSON.stringify(payload)).not.toContain("run-supervisor-1");
+    expect(dispatchSupervisorFleetWakeTicket).not.toHaveBeenCalled();
   });
 
   it("returns retryable 503 for a receipt bound to another mission or action even without a wake", async () => {
@@ -285,6 +306,7 @@ describe("authenticated work controls", () => {
       state: "terminal",
       inputRevision: 8,
       dispatched: false,
+      fleetWake: "not_needed",
     });
     expect(dispatchMissionSupervisorWakeTicket).not.toHaveBeenCalled();
     expect(wakeAgentFleet).not.toHaveBeenCalled();
@@ -366,7 +388,7 @@ describe("authenticated work controls", () => {
       ok: true,
       replayed: true,
       dispatched: true,
-      runId: "run-reconciled",
+      fleetWake: "not_needed",
     });
     expect(vi.mocked(controlMutation).mock.calls[0])
       .toEqual(vi.mocked(controlMutation).mock.calls[1]);
@@ -375,6 +397,113 @@ describe("authenticated work controls", () => {
     expect(dispatchMissionSupervisorWakeTicket)
       .toHaveBeenNthCalledWith(2, wakeTicket);
     expect(wakeAgentFleet).not.toHaveBeenCalled();
+  });
+
+  it("wakes the exact resumed fleet and supervisor concurrently without exposing private authority", async () => {
+    vi.mocked(controlMutation).mockResolvedValue(supervisorReceipt({
+      action: "resume",
+      reason: "resumed",
+      controlReceiptId: fleetWakeTicket.controlReceiptId,
+      fleetWakeTicket,
+      fleetManifestDigest: "c".repeat(64),
+      fleetManifest: [{
+        jobId: "must-not-leak-job",
+        memberDigest: "d".repeat(64),
+      }],
+    }));
+    const response = await POST(request(supervisorRequest({
+      action: "resume",
+      input: undefined,
+    })));
+    expect(response.status).toBe(200);
+    expect(dispatchMissionSupervisorWakeTicket)
+      .toHaveBeenCalledWith(wakeTicket);
+    expect(dispatchSupervisorFleetWakeTicket)
+      .toHaveBeenCalledWith(fleetWakeTicket);
+    const payload = await response.json();
+    expect(payload).toEqual({
+      ok: true,
+      replayed: false,
+      noop: false,
+      state: "ready",
+      inputRevision: 8,
+      dispatched: true,
+      fleetWake: "dispatched",
+    });
+    const json = JSON.stringify(payload);
+    expect(json).not.toContain("control-resume-1");
+    expect(json).not.toContain("must-not-leak-job");
+    expect(json).not.toContain("c".repeat(64));
+    expect(json).not.toContain("d".repeat(64));
+    expect(json).not.toContain("run-supervisor-1");
+  });
+
+  it("returns exact-key 503 only when the fleet reservation outcome is unknown and still wakes the supervisor", async () => {
+    vi.mocked(controlMutation).mockResolvedValue(supervisorReceipt({
+      action: "resume",
+      reason: "resumed",
+      controlReceiptId: fleetWakeTicket.controlReceiptId,
+      fleetWakeTicket,
+    }));
+    vi.mocked(dispatchSupervisorFleetWakeTicket).mockRejectedValue(
+      Object.assign(new Error("response lost after commit"), {
+        code: "reservation_transport_unknown",
+      }),
+    );
+    const response = await POST(request(supervisorRequest({
+      action: "resume",
+      input: undefined,
+    })));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      ok: false,
+      retryable: true,
+      error: "The control was recorded, but its exact fleet reservation is not yet confirmed. Retry the same request.",
+    });
+    expect(dispatchMissionSupervisorWakeTicket)
+      .toHaveBeenCalledWith(wakeTicket);
+  });
+
+  it("returns a coarse reconciling success when Trigger fleet acceptance is ambiguous", async () => {
+    vi.mocked(controlMutation).mockResolvedValue(supervisorReceipt({
+      action: "resume",
+      reason: "resumed",
+      controlReceiptId: fleetWakeTicket.controlReceiptId,
+      fleetWakeTicket,
+    }));
+    vi.mocked(dispatchSupervisorFleetWakeTicket).mockResolvedValue({
+      status: "reconciling",
+      offeredCount: 1,
+    });
+    const response = await POST(request(supervisorRequest({
+      action: "resume",
+      input: undefined,
+    })));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      replayed: false,
+      noop: false,
+      state: "ready",
+      inputRevision: 8,
+      dispatched: true,
+      fleetWake: "reconciling",
+    });
+  });
+
+  it("fails closed on a fleet ticket not bound to the returned control receipt", async () => {
+    vi.mocked(controlMutation).mockResolvedValue(supervisorReceipt({
+      action: "resume",
+      reason: "resumed",
+      fleetWakeTicket,
+    }));
+    const response = await POST(request(supervisorRequest({
+      action: "resume",
+      input: undefined,
+    })));
+    expect(response.status).toBe(503);
+    expect(dispatchSupervisorFleetWakeTicket).not.toHaveBeenCalled();
+    expect(dispatchMissionSupervisorWakeTicket).not.toHaveBeenCalled();
   });
 
   it("returns 503 when the immutable control receipt may have committed before mutation transport failed", async () => {

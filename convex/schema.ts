@@ -51,6 +51,33 @@ const missionSupervisorControlActionValidator = v.union(
   v.literal("provide_input"),
 );
 
+const supervisorFleetManifestMemberValidator = v.object({
+  protocolVersion: v.literal(1),
+  jobId: v.id("jobs"),
+  workAttemptId: v.id("workAttempts"),
+  attempt: v.number(),
+  phase: v.union(v.literal("specialist"), v.literal("delivery")),
+  authorityDigest: v.string(),
+  schedulingAdmissionId: v.id("jobSchedulingAdmissions"),
+  schedulingBindingDigest: v.string(),
+  schedulingGroupKey: v.string(),
+  workOrderRevisionId: v.id("workOrderRevisions"),
+  workOrderRevision: v.number(),
+  workOrderRevisionDigest: v.string(),
+  nextRunAt: v.number(),
+  priority: v.number(),
+  createdAt: v.number(),
+  writeLineage: v.optional(v.string()),
+  approvalId: v.optional(v.id("approvals")),
+  approvalResolvedAt: v.optional(v.number()),
+  deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
+  deliverySourceWorkAttempt: v.optional(v.number()),
+  deliveryGeneration: v.optional(v.number()),
+  reviewReceiptId: v.optional(v.id("reviewReceipts")),
+  reviewReceiptDigest: v.optional(v.string()),
+  memberDigest: v.string(),
+});
+
 // JARVIS memory index. Full markdown bodies live in R2 (bucket `jarvis`);
 // Convex holds the reactive index for search/recall. Multi-stage consolidation
 // (daily -> weekly -> long-term) is driven by Trigger.dev tasks.
@@ -1038,6 +1065,15 @@ export default defineSchema({
     sourcePauseControlReceiptId: v.optional(
       v.id("missionSupervisorControls"),
     ),
+    // A resume receipt seals only the exact post-transition members that were
+    // immediately executable. The server uses this immutable scope for one
+    // targeted fleet offer; browsers never receive these private pointers.
+    fleetManifestProtocolVersion: v.optional(v.literal(1)),
+    fleetManifest: v.optional(v.array(
+      supervisorFleetManifestMemberValidator,
+    )),
+    fleetManifestCount: v.optional(v.number()),
+    fleetManifestDigest: v.optional(v.string()),
     wakeRequested: v.boolean(),
     ticketLeaseVersion: v.optional(v.number()),
     ticketEpoch: v.optional(v.number()),
@@ -1315,6 +1351,14 @@ export default defineSchema({
     payloadJson: v.string(),
     payloadDigest: v.string(),
     receiptDigest: v.string(),
+    // Present only when a resume receipt, rather than the generic queue scan,
+    // selected this normal dispatch. These fields participate in both receipt
+    // hashing and the exact replay lookup.
+    sourceSupervisorControlReceiptId: v.optional(
+      v.id("missionSupervisorControls"),
+    ),
+    sourceSupervisorFleetDigest: v.optional(v.string()),
+    sourceSupervisorMemberDigest: v.optional(v.string()),
     // "claimed" is executable only while the jobs projection still names the
     // same running dispatch. Terminal/continuation writers close it; a
     // paused/cancelled worker or a response-lost review may remain
@@ -1329,6 +1373,10 @@ export default defineSchema({
   })
     .index("by_job_generation", ["jobId", "generation"])
     .index("by_status_lease", ["status", "leaseUntil"])
+    .index("by_supervisor_control_member", [
+      "sourceSupervisorControlReceiptId",
+      "jobId",
+    ])
     .index("by_digest", ["receiptDigest"]),
 
   // Accepted GoalPlan authority is normalized once. These compact rows map

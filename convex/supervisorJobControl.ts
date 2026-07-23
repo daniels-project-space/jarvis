@@ -1608,6 +1608,8 @@ export async function applySupervisorPauseBatch(
       await ctx.db.patch(planned.deliveryAttempt._id, {
         status: "checkpointed",
         retryReason: "paused by atomic supervisor control",
+        dispatchId: undefined,
+        deliveryRunId: undefined,
         leaseOwner: undefined,
         leaseToken: undefined,
         leaseUntil: undefined,

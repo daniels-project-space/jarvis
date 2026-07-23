@@ -154,4 +154,17 @@ describe("supervisor batch lookup index contract", () => {
     });
     expect(() => assertUniqueFieldTuples(indexes)).not.toThrow();
   });
+
+  it("replays one receipt-bound fleet member through its exact two-field index", () => {
+    const indexes = indexesForTable(
+      schema,
+      "dispatchReceipts",
+      "goalPlanNodes",
+    );
+    expect(indexes).toContainEqual({
+      name: "by_supervisor_control_member",
+      fields: ["sourceSupervisorControlReceiptId", "jobId"],
+    });
+    expect(() => assertUniqueFieldTuples(indexes)).not.toThrow();
+  });
 });

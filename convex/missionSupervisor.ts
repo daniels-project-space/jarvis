@@ -43,6 +43,13 @@ import {
   MISSION_SUPERVISOR_MAX_AUTONOMOUS_RECOVERIES,
   MISSION_SUPERVISOR_MAX_RECOVERY_GENERATION,
 } from "./missionSupervisorProtocol";
+import {
+  canonicalSupervisorControlBatchDigest,
+} from "../src/lib/supervisor-fleet-manifest";
+import {
+  buildSupervisorResumeFleetManifest,
+  type StoredSupervisorFleetManifestMember,
+} from "./supervisorFleetManifest";
 export {
   MISSION_SUPERVISOR_MAX_AUTONOMOUS_RECOVERIES,
   MISSION_SUPERVISOR_MAX_RECOVERY_GENERATION,
@@ -1407,6 +1414,10 @@ type SupervisorControlOutcome = {
   affectedJobCount?: number;
   batchDigest?: string;
   sourcePauseControlReceiptId?: Id<"missionSupervisorControls">;
+  fleetManifestProtocolVersion?: 1;
+  fleetManifest?: StoredSupervisorFleetManifestMember[];
+  fleetManifestCount?: number;
+  fleetManifestDigest?: string;
 };
 
 async function normalizedControlRequest(args: {
@@ -1471,8 +1482,7 @@ async function supervisorControlBatchDigest(args: {
   affectedJobIds: readonly Id<"jobs">[];
   sourcePauseControlReceiptId?: Id<"missionSupervisorControls">;
 }): Promise<string> {
-  return await sha256Hex(canonicalJson({
-    protocolVersion: 1,
+  return await canonicalSupervisorControlBatchDigest({
     missionId: String(args.missionId),
     action: args.action,
     requestKey: args.requestKey,
@@ -1482,9 +1492,9 @@ async function supervisorControlBatchDigest(args: {
     affectedJobIds: canonicalControlJobIds(args.affectedJobIds).map(String),
     sourcePauseControlReceiptId:
       args.sourcePauseControlReceiptId === undefined
-        ? null
+        ? undefined
         : String(args.sourcePauseControlReceiptId),
-  }));
+  });
 }
 
 type PauseCohortAuthority =
@@ -1589,6 +1599,21 @@ function supervisorControlResult(
   receipt: MissionSupervisorControl,
   replayed: boolean,
 ) {
+  const fleetWakeTicket = (
+    receipt.action === "resume"
+    && receipt.applied
+    && !receipt.noop
+    && receipt.fleetManifestProtocolVersion === 1
+    && Number.isSafeInteger(receipt.fleetManifestCount)
+    && Number(receipt.fleetManifestCount) > 0
+    && receipt.fleetManifest?.length === receipt.fleetManifestCount
+    && typeof receipt.fleetManifestDigest === "string"
+  )
+    ? {
+      protocolVersion: 1 as const,
+      controlReceiptId: receipt._id,
+    }
+    : null;
   return {
     applied: receipt.applied,
     replayed,
@@ -1607,6 +1632,7 @@ function supervisorControlResult(
     affectedJobCount: receipt.affectedJobCount,
     batchDigest: receipt.batchDigest,
     sourcePauseControlReceiptId: receipt.sourcePauseControlReceiptId,
+    fleetWakeTicket,
     wakeTicket: wakeTicketFromControlReceipt(receipt),
   };
 }
@@ -1638,6 +1664,10 @@ async function persistSupervisorControl(
     affectedJobCount: outcome.affectedJobCount,
     batchDigest: outcome.batchDigest,
     sourcePauseControlReceiptId: outcome.sourcePauseControlReceiptId,
+    fleetManifestProtocolVersion: outcome.fleetManifestProtocolVersion,
+    fleetManifest: outcome.fleetManifest,
+    fleetManifestCount: outcome.fleetManifestCount,
+    fleetManifestDigest: outcome.fleetManifestDigest,
     wakeRequested: Boolean(ticket),
     ticketLeaseVersion: ticket?.expectedLeaseVersion,
     ticketEpoch: ticket?.expectedEpoch,
@@ -2237,6 +2267,23 @@ export const controlV1 = mutation({
           sourcePauseControlReceiptId,
         })
         : undefined;
+      const fleetManifest = sourcePauseControlReceiptId
+        ? await buildSupervisorResumeFleetManifest(ctx, {
+          missionId: args.missionId,
+          affectedJobIds,
+          binding: {
+            missionId: String(args.missionId),
+            requestKey: request.requestKey,
+            requestDigest: request.requestDigest,
+            expectedInputRevision: request.expectedInputRevision,
+            resultInputRevision: inputRevision,
+            sourcePauseControlReceiptId: String(
+              sourcePauseControlReceiptId,
+            ),
+          },
+          now,
+        })
+        : null;
       const statePatch = {
         state: "ready",
         inputRevision,
@@ -2287,6 +2334,15 @@ export const controlV1 = mutation({
             affectedJobCount: affectedJobIds.length,
             batchDigest,
             sourcePauseControlReceiptId,
+            ...(fleetManifest
+              ? {
+                fleetManifestProtocolVersion:
+                  fleetManifest.protocolVersion,
+                fleetManifest: fleetManifest.members,
+                fleetManifestCount: fleetManifest.memberCount,
+                fleetManifestDigest: fleetManifest.fleetDigest,
+              }
+              : {}),
           }),
         wakeTicket: supervisorWakeTicket(nextState),
       });
