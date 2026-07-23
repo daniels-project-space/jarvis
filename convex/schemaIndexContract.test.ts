@@ -65,7 +65,7 @@ describe("mission supervisor schema index contract", () => {
     const indexes = indexesForTable(
       schema,
       "missionSupervisorDecisions",
-      "controlPlaneMigrations",
+      "missionSupervisorControls",
     );
     expect(indexes).toEqual([
       { name: "by_key", fields: ["decisionKey"] },
@@ -73,6 +73,19 @@ describe("mission supervisor schema index contract", () => {
         name: "by_mission_epoch_sequence",
         fields: ["missionId", "epoch", "sequence"],
       },
+    ]);
+    expect(() => assertUniqueFieldTuples(indexes)).not.toThrow();
+  });
+
+  it("keeps control replay and ordered mission audit on distinct tuples", () => {
+    const indexes = indexesForTable(
+      schema,
+      "missionSupervisorControls",
+      "controlPlaneMigrations",
+    );
+    expect(indexes).toEqual([
+      { name: "by_key", fields: ["requestKey"] },
+      { name: "by_mission_created", fields: ["missionId", "createdAt"] },
     ]);
     expect(() => assertUniqueFieldTuples(indexes)).not.toThrow();
   });
