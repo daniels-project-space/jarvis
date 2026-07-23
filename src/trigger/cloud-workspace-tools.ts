@@ -43,7 +43,7 @@ export const CLOUD_REPOSITORY_TOOLS: CodexDynamicToolSpec[] = [
 
 type ToolBridgeOptions = {
   signal?: AbortSignal;
-  beforeTool?: () => Promise<"running" | "stale" | "cancelled" | "steered">;
+  beforeTool?: (call: CodexDynamicToolCall) => Promise<"running" | "stale" | "cancelled" | "steered">;
 };
 
 function result(text: string, success: boolean): CodexDynamicToolResult {
@@ -67,7 +67,7 @@ export class CloudWorkspaceToolBridge {
       return result("Unknown cloud repository tool.", false);
     }
     try {
-      const state = await this.options.beforeTool?.() ?? "running";
+      const state = await this.options.beforeTool?.(call) ?? "running";
       if (state !== "running") throw new CloudWorkspaceError(this.provider.name, state === "cancelled" ? "cancelled" : "stale_attempt", `attempt is ${state}`, "deferred");
       const args = object(call.arguments);
       if (call.tool === "repository_exec") {

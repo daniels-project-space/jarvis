@@ -7,8 +7,10 @@ import { CAPABILITIES, INFRA_MAP, PERSONA, REMEMBER } from "../lib/persona";
 import { visualInitiativeDirective } from "../lib/visual-initiative";
 import { visibleTurnText } from "../lib/host-context";
 import { buildContext } from "../lib/context";
-import { codexConversationExecPrefix, codexModelFor, pickConversationTier } from "./model-policy";
+import { codexModelFor, codexReviewExecPrefix, pickConversationTier } from "./model-policy";
 import {
+  cleanupSubscriptionHome,
+  consumeSubscriptionAuth,
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
   verifyCodexSubscriptionPreflight,
@@ -24,6 +26,7 @@ import {
   FOREGROUND_PROCESS_EXIT_RESERVE_MS,
   FOREGROUND_QUEUE,
   FOREGROUND_RUNNER_LEASE_MS,
+  FOREGROUND_SESSION_RENEWAL_RESERVE_MS,
   FOREGROUND_TURN_TIMEOUT_MS,
   type ForegroundTurnPayload,
 } from "./foreground-policy";
@@ -31,20 +34,14 @@ import { waitForForegroundLease } from "./foreground-lease";
 import { successorLane, taskForForegroundLane, type ForegroundLane } from "./foreground-lanes";
 import { buildForegroundTiming, type ForegroundTurnTiming } from "./foreground-timing";
 import { CodexAppServer } from "./codex-app-server";
+import { ForegroundSessionOwner } from "./foreground-session";
+import { MEMORY_SUBSCRIPTION_VALIDITY_MS } from "./subscription-validity";
 import {
   AgentToolBridge,
   JARVIS_DYNAMIC_TOOLS,
   JARVIS_TOOL_INSTRUCTIONS,
 } from "./agent-tool-bridge";
 import { StreamPublisher } from "./stream-publisher";
-
-function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = false): string[] {
-  if (provider !== "codex") throw new Error("Jarvis permits only the Codex CLI runtime");
-  const args = codexConversationExecPrefix(tier);
-  if (json) args.push("--json");
-  args.push(prompt);
-  return args;
-}
 
 // Subscription brain: each queued chat turn runs the Codex CLI headlessly,
 // with metered API keys blanked and only the subscription
@@ -225,9 +222,9 @@ async function extractAndSave(
     "Output [] if nothing is worth remembering. No prose, JSON only.\n\n" +
     `User: ${userText}\nAssistant: ${assistantText}`;
   const out = await new Promise<string>((resolve) => {
-    const p = spawn(bin, cliArgs(provider, prompt, "luna"), {
+    const p = spawn(bin, [...codexReviewExecPrefix("luna"), "-"], {
       env,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
     let o = "";
     const timeout = setTimeout(() => p.kill("SIGKILL"), 90_000);
@@ -240,6 +237,7 @@ async function extractAndSave(
       clearTimeout(timeout);
       resolve("");
     });
+    p.stdin.end(prompt, "utf8");
   });
   const m = out.match(/\[[\s\S]*\]/);
   if (!m) return 0;
@@ -278,31 +276,73 @@ async function processChatQueue(
   const provider: AgentProvider = "codex";
   const dispatchToken = process.env.JARVIS_DISPATCH_TOKEN;
   if (!dispatchToken) return { processed: 0, error: "JARVIS_DISPATCH_TOKEN is not configured" };
-  const prepared = prepareSubscriptionEnv(provider);
+  const prepared = await prepareSubscriptionEnv(provider, {
+    scope: `foreground-${lane}`,
+    minimumValidityMs: FOREGROUND_SESSION_RENEWAL_RESERVE_MS,
+  });
   if (prepared.error) return { processed: 0, error: prepared.error };
-  const env = prepared.env;
   const bin = resolveSubscriptionAgentBin(provider);
-  if (!bin) return { processed: 0, error: `${provider} binary not found` };
-  const preflight = verifyCodexSubscriptionPreflight(bin, env);
-  if (preflight.error) return { processed: 0, error: preflight.error };
+  if (!bin) {
+    cleanupSubscriptionHome(prepared.env);
+    return { processed: 0, error: `${provider} binary not found` };
+  }
+  const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
+  if (preflight.error) {
+    cleanupSubscriptionHome(prepared.env);
+    return { processed: 0, error: preflight.error };
+  }
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
-  if (!workerToken) return { processed: 0, error: "JARVIS_WORKER_TOKEN is not configured" };
+  if (!workerToken) {
+    cleanupSubscriptionHome(prepared.env);
+    return { processed: 0, error: "JARVIS_WORKER_TOKEN is not configured" };
+  }
   const runnerId = randomUUID();
   const bridge = new AgentToolBridge(dispatchToken);
-  const server = new CodexAppServer(bin, env, FOREGROUND_TURN_TIMEOUT_MS, {
-    dynamicTools: JARVIS_DYNAMIC_TOOLS,
-    onDynamicToolCall: (call) => bridge.invoke(call),
-  });
+  const createServer = (serverEnv: NodeJS.ProcessEnv) => new CodexAppServer(bin, serverEnv, FOREGROUND_TURN_TIMEOUT_MS, {
+      dynamicTools: JARVIS_DYNAMIC_TOOLS,
+      dynamicToolsOnly: true,
+      onDynamicToolCall: (call) => bridge.invoke(call),
+      onAuthConsumed: () => consumeSubscriptionAuth(serverEnv),
+    });
+  let session: ForegroundSessionOwner<CodexAppServer>;
+  try {
+    session = new ForegroundSessionOwner({
+      initial: prepared,
+      scope: `foreground-${lane}`,
+      createServer,
+      prepare: (input) => prepareSubscriptionEnv(provider, input),
+      preflight: (candidateEnv) => verifyCodexSubscriptionPreflight(bin, candidateEnv).error,
+      cleanup: cleanupSubscriptionHome,
+      onRenewalError: (signal) => {
+        metadata.set("subscriptionSession", { status: "renewal_failed", signal });
+        void metadata.flush().catch(() => undefined);
+      },
+      onRenewalReady: () => {
+        metadata.set("subscriptionSession", { status: "ready" });
+        void metadata.flush().catch(() => undefined);
+      },
+    });
+  } catch (error) {
+    cleanupSubscriptionHome(prepared.env);
+    return { processed: 0, error: error instanceof Error ? error.message : String(error) };
+  }
   const client = new ConvexClient(CONVEX_URL);
   // A handoff candidate pays startup cost inside the bounded overlap, but
   // never takes ownership from a still-serving runner.
-  if (source === "warm-handoff") await server.start();
-  const ownsLease = source === "warm-handoff"
-    ? await waitForRunnerAvailability(client, workerToken, runnerId, FOREGROUND_HANDOFF_OVERLAP_MS + FOREGROUND_RUNNER_LEASE_MS)
-    : await convexMutation("chatQueue:touchRunner", { runnerId }) as boolean;
+  let ownsLease: boolean;
+  try {
+    if (source === "warm-handoff") await session.start();
+    ownsLease = source === "warm-handoff"
+      ? await waitForRunnerAvailability(client, workerToken, runnerId, FOREGROUND_HANDOFF_OVERLAP_MS + FOREGROUND_RUNNER_LEASE_MS)
+      : await convexMutation("chatQueue:touchRunner", { runnerId }) as boolean;
+  } catch (error) {
+    client.close();
+    await session.close();
+    throw error;
+  }
   if (!ownsLease) {
     client.close();
-    server.stop();
+    await session.close();
     return { processed: 0, warmRunner: true };
   }
   let leaseActive = true;
@@ -335,7 +375,7 @@ async function processChatQueue(
   try {
     // Prewarm even when the scheduled recovery task found no message. This is
     // the always-available main Jarvis, separate from durable specialist work.
-    await server.start();
+    await session.start();
   while (leaseActive && Date.now() - started < RUN_BUDGET_MS) {
     // Never claim work we cannot truthfully finish and deliver. Leaving it
     // pending makes it immediately eligible for the prewarmed successor.
@@ -363,8 +403,8 @@ async function processChatQueue(
       const contextReadyAt = Date.now();
       const model = pickConversationTier(visibleUserText);
       const stages: Partial<Record<"codexAck" | "firstDelta" | "firstConvexPaint", number>> = {};
-      const turn = await runTurn(
-        server,
+      const turn = await session.runTurn((activeServer, onStarted) => runTurn(
+        activeServer,
         claim.threadId,
         claim.assistantId,
         claim.userText,
@@ -372,8 +412,11 @@ async function processChatQueue(
         context,
         model,
         Boolean(claim.guest),
-        (stage) => { if (stages[stage] === undefined) stages[stage] = Date.now(); },
-      );
+        (stage) => {
+          if (stage === "codexAck") onStarted();
+          if (stages[stage] === undefined) stages[stage] = Date.now();
+        },
+      ));
       const modelFinishedAt = Date.now();
       const finalText =
         turn.finalText.trim() ||
@@ -436,9 +479,9 @@ async function processChatQueue(
       clearTimeout(handoffTimer);
       if (!handoffStarted && leaseActive) startHandoff();
       await handoffPromise;
-      client.close();
-      server.stop();
       await convexMutation("chatQueue:releaseRunner", { runnerId }).catch(() => {});
+      await session.close();
+      client.close();
     }
   }
 }
@@ -450,12 +493,19 @@ export const chatMemory = task({
   maxDuration: 180,
   run: async (payload: { userText: string; assistantText: string }) => {
     const provider: AgentProvider = "codex";
-    const prepared = prepareSubscriptionEnv(provider);
-    const bin = resolveSubscriptionAgentBin(provider);
-    if (prepared.error || !bin) return { saved: 0, error: prepared.error ?? "Codex binary unavailable" };
-    const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
-    if (preflight.error) return { saved: 0, error: preflight.error };
-    return { saved: await extractAndSave(provider, bin, prepared.env, payload.userText, payload.assistantText) };
+    const prepared = await prepareSubscriptionEnv(provider, {
+      scope: "memory",
+      minimumValidityMs: MEMORY_SUBSCRIPTION_VALIDITY_MS,
+    });
+    try {
+      const bin = resolveSubscriptionAgentBin(provider);
+      if (prepared.error || !bin) return { saved: 0, error: prepared.error ?? "Codex binary unavailable" };
+      const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
+      if (preflight.error) return { saved: 0, error: preflight.error };
+      return { saved: await extractAndSave(provider, bin, prepared.env, payload.userText, payload.assistantText) };
+    } finally {
+      cleanupSubscriptionHome(prepared.env);
+    }
   },
 });
 

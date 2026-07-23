@@ -1,14 +1,24 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createInterface } from "node:readline";
+import { resolve } from "node:path";
 import { codexModelFor } from "./model-policy";
 import { appendAgentMessageDelta } from "./codex-stream";
+import { redactSensitiveText } from "../lib/secret-redaction";
+import { BoundedJsonLineDecoder } from "../lib/bounded-json-lines";
+import { hasExactKeys, isJsonRecord, parseStrictJson } from "../lib/bounded-json";
 
 type JsonObject = Record<string, unknown>;
-type PendingRequest = { resolve: (value: JsonObject) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
+type PendingRequest = {
+  method: string;
+  written: boolean;
+  resolve: (value: JsonObject) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
 type ActiveTurn = {
   turnId: string;
   threadId: string;
   text: string;
+  deltaCount: number;
   itemId?: string;
   onDelta: (delta: string) => void;
   resolve: (result: CodexTurnResult) => void;
@@ -53,7 +63,149 @@ export type CodexAppServerOptions = {
   permissionProfile?: CodexPermissionProfileOptions;
   developerInstructions?: string;
   ephemeral?: boolean;
+  onAuthConsumed?: () => void;
+  dynamicToolsOnly?: boolean;
+  protocolLimits?: Partial<CodexAppServerProtocolLimits>;
 };
+
+const APP_SERVER_MAX_LINE_BYTES = 2 * 1_024 * 1_024;
+const APP_SERVER_STDERR_MAX_BYTES = 1_200;
+export type CodexAppServerProtocolLimits = {
+  stdoutBytes: number;
+  stderrBytes: number;
+  messages: number;
+  pendingRequests: number;
+  threads: number;
+  activeTurns: number;
+  assistantBytesPerTurn: number;
+  deltasPerTurn: number;
+  toolCalls: number;
+  inFlightTools: number;
+  toolOutputBytes: number;
+};
+export const CODEX_APP_SERVER_PROTOCOL_LIMITS: Readonly<CodexAppServerProtocolLimits> = Object.freeze({
+  stdoutBytes: 64 * 1_024 * 1_024,
+  stderrBytes: 4 * 1_024 * 1_024,
+  messages: 200_000,
+  pendingRequests: 32,
+  threads: 256,
+  activeTurns: 4,
+  assistantBytesPerTurn: 2 * 1_024 * 1_024,
+  deltasPerTurn: 16_384,
+  toolCalls: 2_048,
+  inFlightTools: 32,
+  toolOutputBytes: 16 * 1_024 * 1_024,
+});
+const CHATGPT_PLAN_TYPES = new Set([
+  "free", "go", "plus", "pro", "prolite", "team",
+  "self_serve_business_usage_based", "business",
+  "enterprise_cbp_usage_based", "enterprise", "edu", "unknown",
+]);
+
+export class CodexRequestRejectedError extends Error {
+  readonly code = "codex_request_rejected";
+  readonly provenPreStartRejection = true;
+  constructor(readonly method: string, detail: string) {
+    super(`${method} rejected${detail ? `: ${detail}` : ""}`);
+    this.name = "CodexRequestRejectedError";
+  }
+}
+
+export class CodexRequestOutcomeUnknownError extends Error {
+  readonly code = "codex_request_outcome_unknown";
+  readonly replaySafe = false;
+  constructor(readonly method: string) {
+    super(`${method} outcome is unknown after protocol write`);
+    this.name = "CodexRequestOutcomeUnknownError";
+  }
+}
+
+export function verifyCodexInitializeResult(value: unknown, expectedCodexHome: string): void {
+  if (!isJsonRecord(value)
+    || !hasExactKeys(value, ["codexHome", "platformFamily", "platformOs", "userAgent"])
+    || typeof value.codexHome !== "string" || resolve(value.codexHome) !== resolve(expectedCodexHome)
+    || value.platformFamily !== "unix" || value.platformOs !== "linux"
+    || typeof value.userAgent !== "string" || value.userAgent.length > 512
+    || !/0\.144\.5(?:\D|$)/.test(value.userAgent)) {
+    throw new Error("Codex app-server initialize attestation failed");
+  }
+}
+
+export function verifyCodexAccountReadResult(value: unknown): void {
+  if (!isJsonRecord(value)
+    || !hasExactKeys(value, ["account", "requiresOpenaiAuth"])
+    || value.requiresOpenaiAuth !== true || !isJsonRecord(value.account)
+    || !hasExactKeys(value.account, ["type", "email", "planType"])
+    || value.account.type !== "chatgpt"
+    || !(value.account.email === null
+      || (typeof value.account.email === "string" && value.account.email.length <= 320))
+    || typeof value.account.planType !== "string" || !CHATGPT_PLAN_TYPES.has(value.account.planType)) {
+    throw new Error("Codex app-server ChatGPT account attestation failed");
+  }
+}
+
+function validProtocolError(value: unknown): boolean {
+  return isJsonRecord(value)
+    && hasExactKeys(value, ["code", "message"], ["data"])
+    && Number.isSafeInteger(value.code)
+    && typeof value.message === "string"
+    && value.message.length <= 1_024;
+}
+
+function boundedProtocolLimits(
+  overrides: Partial<CodexAppServerProtocolLimits> | undefined,
+): CodexAppServerProtocolLimits {
+  const limits = { ...CODEX_APP_SERVER_PROTOCOL_LIMITS };
+  if (!overrides) return limits;
+  for (const key of Object.keys(limits) as Array<keyof CodexAppServerProtocolLimits>) {
+    const requested = overrides[key];
+    if (requested === undefined) continue;
+    if (!Number.isSafeInteger(requested) || requested < 1) throw new Error(`invalid Codex ${key} limit`);
+    limits[key] = Math.min(limits[key], requested);
+  }
+  return limits;
+}
+
+async function boundedCallback(
+  callback: (() => Promise<void>) | undefined,
+  timeoutMs = 10_000,
+): Promise<void> {
+  if (!callback) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      callback(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("Codex durable callback deadline exceeded")), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function validDynamicToolResult(value: unknown): value is CodexDynamicToolResult {
+  if (!isJsonRecord(value)
+    || !hasExactKeys(value, ["contentItems", "success"])
+    || typeof value.success !== "boolean"
+    || !Array.isArray(value.contentItems)
+    || value.contentItems.length > 32) return false;
+  return value.contentItems.every((item) => {
+    if (!isJsonRecord(item) || typeof item.type !== "string") return false;
+    if (item.type === "inputText") {
+      return hasExactKeys(item, ["type", "text"])
+        && typeof item.text === "string"
+        && Buffer.byteLength(item.text, "utf8") <= 256 * 1_024;
+    }
+    if (item.type === "inputImage") {
+      return hasExactKeys(item, ["type", "imageUrl"])
+        && typeof item.imageUrl === "string"
+        && Buffer.byteLength(item.imageUrl, "utf8") <= 512 * 1_024;
+    }
+    return false;
+  });
+}
 
 export class CodexPermissionAttestationError extends Error {
   readonly code = "permission_attestation_failed";
@@ -87,6 +239,10 @@ export type CodexTurnInput = {
   modelTier: string;
   allowTools?: boolean;
   onDelta: (delta: string) => void;
+  /** Durable receipt written before turn/start may cross the protocol. */
+  beforeTurn?: () => Promise<void>;
+  onTurnRequestWritten?: () => void;
+  onTurnAccepted?: () => Promise<void>;
   onTurnStarted?: () => void;
 };
 
@@ -100,13 +256,24 @@ export class CodexAppServer {
   private threads = new Map<string, string>();
   private stderr = "";
   private ready: Promise<void> | null = null;
+  private authConsumed = false;
+  private stdoutBytes = 0;
+  private stderrBytes = 0;
+  private messageCount = 0;
+  private toolCallCount = 0;
+  private toolOutputBytes = 0;
+  private readonly inFlightTools = new Set<string>();
+  private readonly limits: CodexAppServerProtocolLimits;
+  private protocolFailed = false;
 
   constructor(
     private readonly bin: string,
     private readonly env: NodeJS.ProcessEnv,
     private readonly turnTimeoutMs: number,
     private readonly options: CodexAppServerOptions = {},
-  ) {}
+  ) {
+    this.limits = boundedProtocolLimits(options.protocolLimits);
+  }
 
   async start(): Promise<void> {
     if (!this.ready) this.ready = this.startInner();
@@ -120,21 +287,53 @@ export class CodexAppServer {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.process = child;
-    child.stderr.on("data", (data) => { this.stderr = (this.stderr + data.toString()).slice(-1200); });
+    child.stderr.on("data", (data) => {
+      this.stderrBytes += Buffer.byteLength(data);
+      if (this.stderrBytes > this.limits.stderrBytes) {
+        this.protocolFailure();
+        return;
+      }
+      const tail = data.toString().slice(-APP_SERVER_STDERR_MAX_BYTES);
+      this.stderr = (this.stderr + redactSensitiveText(tail, this.env)).slice(-APP_SERVER_STDERR_MAX_BYTES);
+    });
     child.on("error", (error) => this.failAll(error));
     child.on("close", (code) => this.failAll(new Error(`Codex app-server exited (${code ?? "unknown"})`)));
-    createInterface({ input: child.stdout }).on("line", (line) => this.receive(line));
-    await this.request("initialize", {
+    const decoder = new BoundedJsonLineDecoder(APP_SERVER_MAX_LINE_BYTES);
+    child.stdout.on("data", (data: Buffer) => {
+      this.stdoutBytes += data.byteLength;
+      if (this.stdoutBytes > this.limits.stdoutBytes) {
+        this.protocolFailure();
+        return;
+      }
+      try {
+        for (const message of decoder.push(data)) this.receiveMessage(message);
+      } catch {
+        this.protocolFailure();
+      }
+    });
+    child.stdout.once("end", () => {
+      try { decoder.finish(); } catch { this.protocolFailure(); }
+    });
+    const initialized = await this.request("initialize", {
       clientInfo: { name: "jarvis-trigger", title: "Jarvis", version: "1.0.0" },
       // Dynamic tools are experimental in the pinned 0.144.5 protocol. This
       // capability is required for thread/start.dynamicTools.
       capabilities: { experimentalApi: true },
     }, 20_000);
+    verifyCodexInitializeResult(initialized, String(this.env.CODEX_HOME ?? ""));
     this.notify("initialized", {});
+    const account = await this.request("account/read", { refreshToken: false }, 20_000);
+    verifyCodexAccountReadResult(account);
   }
 
   async runTurn(input: CodexTurnInput): Promise<CodexTurnResult> {
     await this.start();
+    if (this.active.size >= this.limits.activeTurns) {
+      throw new Error("Codex app-server active-turn limit reached");
+    }
+    if (!input.conversationId || input.conversationId.length > 512) {
+      throw new Error("Codex conversation id is invalid");
+    }
     const selection = codexModelFor(input.modelTier);
     let threadId = this.threads.get(input.conversationId);
     const isNewThread = !threadId;
@@ -155,6 +354,23 @@ export class CodexAppServer {
             runtimeWorkspaceRoots: permissionProfile.runtimeWorkspaceRoots,
           } : {
             sandbox: this.options.threadSandbox ?? "danger-full-access",
+            ...(this.options.dynamicToolsOnly ? {
+              config: {
+                web_search: "disabled",
+                shell_environment_policy: { inherit: "none" },
+                features: {
+                  shell_tool: false,
+                  unified_exec: false,
+                  apps: false,
+                  plugins: false,
+                  hooks: false,
+                  browser_use: false,
+                  computer_use: false,
+                  multi_agent: false,
+                },
+              },
+              environments: [],
+            } : {}),
           }),
           ephemeral: this.options.ephemeral ?? false,
           dynamicTools: input.allowTools === false ? [] : this.options.dynamicTools,
@@ -168,7 +384,11 @@ export class CodexAppServer {
       if (permissionProfile) verifyCodexPermissionAttestation(response, permissionProfile.expected);
       const thread = response.thread as JsonObject | undefined;
       threadId = typeof thread?.id === "string" ? thread.id : "";
-      if (!threadId) throw new Error("Codex app-server did not return a thread id");
+      if (!threadId || threadId.length > 512) throw new Error("Codex app-server did not return a thread id");
+      if (this.threads.size >= this.limits.threads) {
+        const oldest = this.threads.keys().next().value;
+        if (typeof oldest === "string") this.threads.delete(oldest);
+      }
       this.threads.set(input.conversationId, threadId);
     }
 
@@ -184,63 +404,146 @@ export class CodexAppServer {
     const text = `${history}Current live context (use only what is relevant):\n${input.contextBlock}\n\n${speaker}: ${cleanText}`;
     const userInput: JsonObject[] = [{ type: "text", text }];
     if (marker?.[1]) userInput.push({ type: "image", url: marker[1].trim(), detail: "high" });
+    if (input.beforeTurn) await boundedCallback(input.beforeTurn);
     const started = await this.request("turn/start", {
       threadId,
       input: userInput,
       model: selection.model,
       effort: selection.effort,
       approvalPolicy: "never",
-    }, 30_000);
+    }, 30_000, input.onTurnRequestWritten);
     const turn = started.turn as JsonObject | undefined;
     const turnId = typeof turn?.id === "string" ? turn.id : "";
-    if (!turnId) throw new Error("Codex app-server did not return a turn id");
-    input.onTurnStarted?.();
-    return new Promise<CodexTurnResult>((resolve, reject) => {
+    if (!turnId || turnId.length > 512) throw new Error("Codex app-server did not return a turn id");
+    const completion = new Promise<CodexTurnResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.notify("turn/interrupt", { threadId, turnId });
         this.active.delete(turnId);
         reject(new Error("Codex conversation turn exceeded its foreground deadline"));
       }, this.turnTimeoutMs);
-      this.active.set(turnId, { turnId, threadId, text: "", onDelta: input.onDelta, resolve, reject, timer });
+      this.active.set(turnId, {
+        turnId,
+        threadId,
+        text: "",
+        deltaCount: 0,
+        onDelta: input.onDelta,
+        resolve,
+        reject,
+        timer,
+      });
     });
+    try {
+      if (input.onTurnAccepted) await boundedCallback(input.onTurnAccepted);
+    } catch (error) {
+      const active = this.active.get(turnId);
+      if (active) {
+        clearTimeout(active.timer);
+        this.active.delete(turnId);
+        this.notify("turn/interrupt", { threadId, turnId });
+      }
+      throw error;
+    }
+    if (!this.authConsumed) {
+      this.authConsumed = true;
+      this.options.onAuthConsumed?.();
+    }
+    input.onTurnStarted?.();
+    return completion;
   }
 
   stop() { this.process?.kill("SIGTERM"); this.process = null; }
 
   private receive(line: string) {
-    let message: JsonObject;
-    try { message = JSON.parse(line) as JsonObject; } catch { return; }
+    const bytes = Buffer.byteLength(line, "utf8");
+    this.stdoutBytes += bytes + 1;
+    if (bytes > APP_SERVER_MAX_LINE_BYTES || this.stdoutBytes > this.limits.stdoutBytes) {
+      this.protocolFailure();
+      return;
+    }
+    try { this.receiveMessage(parseStrictJson(line)); }
+    catch { this.protocolFailure(); }
+  }
+
+  private receiveMessage(value: unknown) {
+    this.messageCount += 1;
+    if (this.messageCount > this.limits.messages) throw new Error("Codex app-server message limit exceeded");
+    if (!isJsonRecord(value)) throw new Error("invalid app-server message");
+    const message = value as JsonObject;
     const method = typeof message.method === "string" ? message.method : "";
     if (
       method === "item/tool/call" &&
       (typeof message.id === "number" || typeof message.id === "string")
     ) {
+      if (!hasExactKeys(message, ["id", "method", "params"]) || !isJsonRecord(message.params)) {
+        throw new Error("invalid tool request envelope");
+      }
+      const params = message.params;
+      if (!hasExactKeys(params, ["threadId", "turnId", "callId", "namespace", "tool", "arguments"])
+        || typeof params.threadId !== "string" || !params.threadId || params.threadId.length > 512
+        || typeof params.turnId !== "string" || !params.turnId || params.turnId.length > 512
+        || typeof params.callId !== "string" || !params.callId || params.callId.length > 512
+        || !(params.namespace === null || (typeof params.namespace === "string" && params.namespace.length <= 256))
+        || typeof params.tool !== "string" || !params.tool || params.tool.length > 256) {
+        throw new Error("invalid tool request params");
+      }
+      const requestKey = `${typeof message.id}:${String(message.id)}`;
+      this.toolCallCount += 1;
+      if (this.toolCallCount > this.limits.toolCalls
+        || this.inFlightTools.size >= this.limits.inFlightTools
+        || this.inFlightTools.has(requestKey)) {
+        throw new Error("Codex app-server tool request limit exceeded");
+      }
+      this.inFlightTools.add(requestKey);
       void this.respondToDynamicToolCall(message);
       return;
     }
     if (typeof message.id === "number") {
+      const responseShape = hasExactKeys(message, ["id", "result"])
+        || hasExactKeys(message, ["id", "error"]);
+      if (!responseShape) throw new Error("invalid response envelope");
+      if (Object.prototype.hasOwnProperty.call(message, "error") && !validProtocolError(message.error)) {
+        throw new Error("invalid response error");
+      }
       const pending = this.pending.get(message.id);
-      if (!pending) return;
+      if (!pending) throw new Error("unexpected app-server response id");
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
-      if (message.error) pending.reject(new Error(this.errorText(message.error)));
-      else pending.resolve((message.result as JsonObject | undefined) ?? {});
+      if (Object.prototype.hasOwnProperty.call(message, "error")) {
+        pending.reject(new CodexRequestRejectedError(pending.method, this.errorText(message.error)));
+      } else if (!isJsonRecord(message.result)) {
+        pending.reject(new Error(`${pending.method} returned an invalid result`));
+      } else pending.resolve(message.result);
       return;
+    }
+    if (!method || method.length > 256
+      || !hasExactKeys(message, ["method", "params"]) || !isJsonRecord(message.params)) {
+      throw new Error("invalid notification envelope");
     }
     const params = (message.params as JsonObject | undefined) ?? {};
     const turn = params.turn as JsonObject | undefined;
     const turnId = typeof params.turnId === "string" ? params.turnId : typeof turn?.id === "string" ? turn.id : "";
     const active = this.active.get(turnId);
     if (!active) return;
-    if (method === "item/agentMessage/delta" && typeof params.delta === "string") {
+    if (method === "item/agentMessage/delta") {
+      if (typeof params.delta !== "string") throw new Error("invalid assistant delta");
+      active.deltaCount += 1;
+      if (active.deltaCount > this.limits.deltasPerTurn) {
+        throw new Error("Codex assistant delta limit exceeded");
+      }
       const itemId = typeof params.itemId === "string" ? params.itemId : undefined;
       const next = appendAgentMessageDelta({ text: active.text, itemId: active.itemId }, params.delta, itemId);
+      if (Buffer.byteLength(next.state.text, "utf8") > this.limits.assistantBytesPerTurn) {
+        throw new Error("Codex assistant output limit exceeded");
+      }
       active.text = next.state.text;
       active.itemId = next.state.itemId;
       active.onDelta(next.emitted);
     } else if (method === "item/completed") {
       const item = params.item as JsonObject | undefined;
       if (!active.text && item?.type === "agentMessage" && typeof item.text === "string") {
+        if (Buffer.byteLength(item.text, "utf8") > this.limits.assistantBytesPerTurn) {
+          throw new Error("Codex assistant output limit exceeded");
+        }
         active.text = item.text;
         active.onDelta(item.text);
       }
@@ -253,60 +556,120 @@ export class CodexAppServer {
   }
 
   private async respondToDynamicToolCall(message: JsonObject) {
+    const requestKey = `${typeof message.id}:${String(message.id)}`;
     const params = (message.params as JsonObject | undefined) ?? {};
     const handler = this.options.onDynamicToolCall;
     let dynamicResult: CodexDynamicToolResult;
-    if (!handler || typeof params.tool !== "string") {
-      dynamicResult = {
-        contentItems: [{ type: "inputText", text: "Jarvis dynamic tool bridge is unavailable." }],
-        success: false,
-      };
-    } else {
-      try {
-        dynamicResult = await handler({
-          threadId: typeof params.threadId === "string" ? params.threadId : "",
-          turnId: typeof params.turnId === "string" ? params.turnId : "",
-          callId: typeof params.callId === "string" ? params.callId : "",
-          namespace: typeof params.namespace === "string" ? params.namespace : null,
-          tool: params.tool,
-          arguments: params.arguments,
-        });
-      } catch {
+    try {
+      if (!handler || typeof params.tool !== "string") {
         dynamicResult = {
-          contentItems: [{ type: "inputText", text: "Jarvis dynamic tool bridge failed inside its host." }],
+          contentItems: [{ type: "inputText", text: "Jarvis dynamic tool bridge is unavailable." }],
+          success: false,
+        };
+      } else {
+        try {
+          dynamicResult = await handler({
+            threadId: typeof params.threadId === "string" ? params.threadId : "",
+            turnId: typeof params.turnId === "string" ? params.turnId : "",
+            callId: typeof params.callId === "string" ? params.callId : "",
+            namespace: typeof params.namespace === "string" ? params.namespace : null,
+            tool: params.tool,
+            arguments: params.arguments,
+          });
+        } catch {
+          dynamicResult = {
+            contentItems: [{ type: "inputText", text: "Jarvis dynamic tool bridge failed inside its host." }],
+            success: false,
+          };
+        }
+      }
+      if (!validDynamicToolResult(dynamicResult)) {
+        dynamicResult = {
+          contentItems: [{ type: "inputText", text: "Jarvis dynamic tool bridge returned an invalid bounded result." }],
           success: false,
         };
       }
-    }
-    try {
-      this.write({ id: message.id, result: dynamicResult });
-    } catch {
-      // The process may have ended while the host request was active.
+      const bytes = Buffer.byteLength(JSON.stringify(dynamicResult), "utf8");
+      this.toolOutputBytes += bytes;
+      if (this.toolOutputBytes > this.limits.toolOutputBytes) {
+        this.protocolFailure();
+        return;
+      }
+      try {
+        this.write({ id: message.id, result: dynamicResult });
+      } catch {
+        // The process may have ended while the host request was active.
+      }
+    } finally {
+      this.inFlightTools.delete(requestKey);
     }
   }
 
-  private request(method: string, params: JsonObject, timeoutMs: number): Promise<JsonObject> {
+  private request(
+    method: string,
+    params: JsonObject,
+    timeoutMs: number,
+    onWritten?: () => void,
+  ): Promise<JsonObject> {
+    if (this.pending.size >= this.limits.pendingRequests || !Number.isSafeInteger(this.nextId)) {
+      return Promise.reject(new Error("Codex app-server pending request limit reached"));
+    }
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`${method} timed out`)); }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
-      this.write({ method, id, params });
+      const pending: PendingRequest = {
+        method,
+        written: false,
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          this.pending.delete(id);
+          reject(pending.written
+            ? new CodexRequestOutcomeUnknownError(method)
+            : new Error(`${method} timed out before protocol write`));
+        }, timeoutMs),
+      };
+      this.pending.set(id, pending);
+      try {
+        this.write({ method, id, params });
+        pending.written = true;
+        onWritten?.();
+      } catch (error) {
+        this.pending.delete(id);
+        clearTimeout(pending.timer);
+        reject(error instanceof Error ? error : new Error(`${method} write failed`));
+      }
     });
   }
   private notify(method: string, params: JsonObject) { this.write({ method, params }); }
   private write(message: JsonObject) {
     if (!this.process?.stdin.writable) throw new Error("Codex app-server is not writable");
-    this.process.stdin.write(`${JSON.stringify(message)}\n`);
+    const encoded = `${JSON.stringify(message)}\n`;
+    if (Buffer.byteLength(encoded, "utf8") > APP_SERVER_MAX_LINE_BYTES) {
+      throw new Error("Codex app-server request is oversized");
+    }
+    this.process.stdin.write(encoded);
   }
   private errorText(value: unknown): string {
-    if (typeof value === "string") return value;
-    try { return JSON.stringify(value).slice(0, 500); } catch { return String(value).slice(0, 500); }
+    if (typeof value === "string") return redactSensitiveText(value, this.env).slice(0, 500);
+    try { return redactSensitiveText(JSON.stringify(value), this.env).slice(0, 500); }
+    catch { return redactSensitiveText(String(value), this.env).slice(0, 500); }
   }
   private failAll(error: Error) {
     const detail = new Error(`${error.message}${this.stderr ? `: ${this.stderr.slice(-400)}` : ""}`);
-    for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(detail); }
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(pending.written ? new CodexRequestOutcomeUnknownError(pending.method) : detail);
+    }
     this.pending.clear();
     for (const active of this.active.values()) { clearTimeout(active.timer); active.reject(detail); }
     this.active.clear();
+    this.inFlightTools.clear();
+  }
+
+  private protocolFailure(): void {
+    if (this.protocolFailed) return;
+    this.protocolFailed = true;
+    this.failAll(new Error("Codex app-server protocol validation failed"));
+    try { this.process?.kill("SIGKILL"); } catch { /* already stopped */ }
   }
 }

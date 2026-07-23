@@ -1,18 +1,16 @@
 import { metadata, schedules, task, timeout } from "@trigger.dev/sdk/v3";
 import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
-import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { sendPush } from "./push-send";
-import { INFRA_MAP } from "../lib/persona";
 import { projectProviderBoundary } from "../lib/project-registry";
 import { routeWork } from "../mastra/routing";
 import { TEAM_BY_SLUG, type AgentSlug } from "../mastra/team";
 import {
-  codexExecPrefix,
   codexModelFor,
+  codexReviewExecPrefix,
   normalizeReasoningEffort,
 } from "./model-policy";
 import { reviewPrompt } from "./codex-review";
@@ -22,14 +20,17 @@ import { canonicalizeRepository } from "../lib/workflow-contract";
 import { buildContinuationCheckpoint, segmentTimeoutMs } from "./continuation";
 import { runWatchSweep } from "./watch-runtime";
 import {
+  cleanupSubscriptionHome,
   missingSubscriptionTools,
   isolateCloudSubscriptionEnv,
   isolateSubscriptionEnv,
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
+  scopedSubscriptionEnv,
   verifyCodexSubscriptionPreflight,
   type AgentProvider,
 } from "./subscription-runtime";
+import { backgroundSubscriptionValidityMs } from "./subscription-validity";
 import {
   GOAL_PLAN_RESULT_MAX_CHARS,
   parseGoalPlan,
@@ -37,7 +38,6 @@ import {
   type GoalPlan,
 } from "../lib/goal-mode";
 import { startAppFactoryGoal, syncExternalGoalRevisions, syncExternalGoalRuns } from "./goal-runtime";
-import { codexMcpConfigArgs, type CodexMcpConfig } from "../lib/codex-mcp";
 import { redactSensitiveText } from "../lib/secret-redaction";
 import {
   cumulativeWorkEvidence,
@@ -75,7 +75,12 @@ import {
 import { repositoryDeliveryReadiness, trustedGitReviewReceiptAuthority, verifyGitReviewReceiptEnvelope } from "./git-review-authority";
 import { integrateReviewedWorker } from "./mission-integration";
 import { createGitHubIntegrationAdapter, GITHUB_REST_API_VERSION } from "./github-integration-adapter";
-import { runCloudWorkspaceAgent } from "./cloud-agent-runner";
+import {
+  CloudCodexPreStartAuthorizationError,
+  CloudCodexReplayUnsafeError,
+  runCloudWorkspaceAgent,
+  type CloudCodexTurnReceipt,
+} from "./cloud-agent-runner";
 import {
   applyValidatedPatchToControllerCheckout,
   createCredentiallessGitArchive,
@@ -94,6 +99,13 @@ import {
   type CloudProviderRuntimeAttestation,
 } from "./cloud-provider-probe-attestation";
 import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, createDeterministicTar, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider, type HistoricalCloudWorkspaceProviderName, type CredentiallessArchive } from "./cloud-workspace";
+import {
+  BoundedProcessError,
+  runBoundedProcess,
+  type BoundedStreamLimits,
+} from "./agent-process-bounds";
+import { BoundedAgentRunnerDecoder, type AgentRunnerEvent } from "./agent-runner-protocol";
+import { isJsonRecord } from "../lib/bounded-json";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent against an isolated cloud workspace through controller-owned dynamic
@@ -102,28 +114,39 @@ import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, createDeterministicTar, 
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
 
-function promptArgs(prompt: string, tier: string, json = false, mcpConfig?: string | null, reasoningEffort?: unknown): string[] {
-  const args = codexExecPrefix(tier, reasoningEffort);
-  if (json) args.push("--json");
-  if (mcpConfig) {
-    try {
-      const cfg = JSON.parse(readFileSync(mcpConfig, "utf8")) as CodexMcpConfig;
-      args.push(...codexMcpConfigArgs(cfg));
-    } catch { /* run without an invalid optional MCP config */ }
-  }
-  args.push(prompt);
-  return args;
-}
+const kib = 1_024;
+const mib = 1_024 * kib;
+const DEFAULT_GIT_PROCESS_TIMEOUT_MS = 2 * 60_000;
+const streamLimits = (
+  maxBytes: number,
+  maxChunks: number,
+  maxLines: number,
+  retain: BoundedStreamLimits["retain"],
+): BoundedStreamLimits => Object.freeze({ maxBytes, maxChunks, maxLines, retain });
+const AGENT_CHILD_LIMITS = Object.freeze({
+  plainStdout: streamLimits(512 * kib, 4_096, 8_192, "all"),
+  plainStderr: streamLimits(256 * kib, 2_048, 8_192, Object.freeze({ tailBytes: 4 * kib })),
+  shellStdout: streamLimits(2 * mib, 32_768, 262_144, "all"),
+  shellStderr: streamLimits(512 * kib, 8_192, 65_536, Object.freeze({ tailBytes: 32 * kib })),
+  gitObjectStdout: streamLimits(DEFAULT_WORKSPACE_LIMITS.maxFileBytes, 16_384, DEFAULT_WORKSPACE_LIMITS.maxFileBytes, "all"),
+  gitObjectStderr: streamLimits(64 * kib, 2_048, 8_192, Object.freeze({ tailBytes: 4 * kib })),
+  agentStdout: streamLimits(64 * mib, 65_536, 200_000, "none"),
+  agentStderr: streamLimits(4 * mib, 32_768, 100_000, Object.freeze({ tailBytes: 4 * kib })),
+});
 
-function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, tier: string, timeoutMs: number): Promise<string> {
-  return new Promise((resolve) => {
-    const p = spawn(bin, promptArgs(prompt, tier), { env, stdio: ["ignore", "pipe", "pipe"] });
-    let output = "";
-    const timer = setTimeout(() => { try { p.kill("SIGKILL"); } catch { /* gone */ } resolve(output); }, timeoutMs);
-    p.stdout.on("data", (d) => (output += d.toString()));
-    p.on("close", () => { clearTimeout(timer); resolve(output); });
-    p.on("error", () => { clearTimeout(timer); resolve(""); });
+async function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, tier: string, timeoutMs: number): Promise<string> {
+  const result = await runBoundedProcess({
+    command: bin,
+    args: [...codexReviewExecPrefix(tier), "-"],
+    env,
+    input: prompt,
+    maxInputBytes: 64 * kib,
+    timeoutMs,
+    stdout: AGENT_CHILD_LIMITS.plainStdout,
+    stderr: AGENT_CHILD_LIMITS.plainStderr,
   });
+  if (result.code !== 0) throw new BoundedProcessError("process_exit");
+  return redactSensitiveText(result.stdout.toString("utf8"), env);
 }
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -186,46 +209,36 @@ async function chatThread(): Promise<string> {
 }
 type BoundedProcess = { signal?: AbortSignal; timeoutMs?: number };
 
-function sh(cmd: string, args: string[], env: NodeJS.ProcessEnv, options: BoundedProcess = {}): Promise<{ code: number | null; out: string }> {
-  return new Promise((res) => {
-    const p = spawn(cmd, args, { env, stdio: ["ignore", "pipe", "pipe"] });
-    let o = "";
-    let settled = false;
-    const finish = (code: number | null) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      options.signal?.removeEventListener("abort", abort);
-      res({ code, out: o });
-    };
-    const abort = () => { try { p.kill("SIGKILL"); } catch { /* already exited */ } };
-    if (options.signal?.aborted) abort();
-    else options.signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(abort, Math.max(1, options.timeoutMs ?? 24 * 60 * 60_000));
-    timer.unref?.();
-    p.stdout.on("data", (d) => (o += d.toString()));
-    p.stderr.on("data", (d) => (o += d.toString()));
-    p.on("close", (code) => finish(code));
-    p.on("error", () => finish(-1));
+async function sh(cmd: string, args: string[], env: NodeJS.ProcessEnv, options: BoundedProcess = {}): Promise<{ code: number | null; out: string }> {
+  const result = await runBoundedProcess({
+    command: cmd,
+    args,
+    env,
+    maxInputBytes: 0,
+    timeoutMs: Math.max(1, options.timeoutMs ?? DEFAULT_GIT_PROCESS_TIMEOUT_MS),
+    signal: options.signal,
+    stdout: AGENT_CHILD_LIMITS.shellStdout,
+    stderr: AGENT_CHILD_LIMITS.shellStderr,
   });
+  return {
+    code: result.code,
+    out: result.stdout.toString("utf8") + result.stderr.toString("utf8"),
+  };
 }
 
-function readGitObject(cwd: string, sha: string, env: NodeJS.ProcessEnv, options: BoundedProcess = {}): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const p = spawn("git", ["-C", cwd, "cat-file", "blob", sha], { env, stdio: ["ignore", "pipe", "pipe"] });
-    const chunks: Buffer[] = [];
-    let error = "";
-    const abort = () => { try { p.kill("SIGKILL"); } catch { /* already exited */ } };
-    if (options.signal?.aborted) abort();
-    else options.signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(abort, Math.max(1, options.timeoutMs ?? 90_000));
-    timer.unref?.();
-    const cleanup = () => { clearTimeout(timer); options.signal?.removeEventListener("abort", abort); };
-    p.stdout.on("data", (data: Buffer) => chunks.push(Buffer.from(data)));
-    p.stderr.on("data", (data) => { error += data.toString(); });
-    p.on("close", (code) => { cleanup(); code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`git cat-file ${sha} failed (${String(code)}): ${error.slice(-500)}`)); });
-    p.on("error", (error) => { cleanup(); reject(error); });
+async function readGitObject(cwd: string, sha: string, env: NodeJS.ProcessEnv, options: BoundedProcess = {}): Promise<Buffer> {
+  const result = await runBoundedProcess({
+    command: "git",
+    args: ["-C", cwd, "cat-file", "blob", sha],
+    env,
+    maxInputBytes: 0,
+    timeoutMs: Math.max(1, options.timeoutMs ?? 90_000),
+    signal: options.signal,
+    stdout: AGENT_CHILD_LIMITS.gitObjectStdout,
+    stderr: AGENT_CHILD_LIMITS.gitObjectStderr,
   });
+  if (result.code !== 0) throw new BoundedProcessError("process_exit");
+  return result.stdout;
 }
 
 // Sub-agent model routing uses the same Codex subscription tiers as the
@@ -306,14 +319,14 @@ async function verifyWork(
   }
 }
 
-function runAgent(
+async function runAgent(
   bin: string,
   cwd: string,
   env: NodeJS.ProcessEnv,
   prompt: string,
   model: string,
   onProgress?: (s: string, log?: string, stage?: string, percent?: number) => void,
-  mcpConfig?: string | null,
+  _mcpConfig?: string | null,
   executionState?: () => Promise<string>,
   timeoutMs = 900_000,
   reasoningEffort?: unknown,
@@ -324,171 +337,179 @@ function runAgent(
   checkpointLog: string;
   commands: GitCommandEvidence[];
 }> {
-  return new Promise((resolve) => {
-    const args = promptArgs(prompt, model, true, mcpConfig, reasoningEffort);
-    const codexSelection = codexModelFor(model);
-    const runtimeLabel = `${codexSelection.model} · ${normalizeReasoningEffort(reasoningEffort, codexSelection.effort)}`;
-    const p = spawn(bin, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
-    let buf = "";
-    let stderr = "";
-    let finalText = "";
-    let latest = "starting up…";
-    let stage = "starting";
-    let percent = 4;
-    let workUnits = 0;
-    let dirty = false;
-    let settled = false;
-    const commands: GitCommandEvidence[] = [];
-    // full session transcript tail — streamed into the job row so the pill's
-    // live view shows the agent actually working, not one opaque line
-    const logLines: string[] = [];
-    const pushLog = (line: string) => {
-      logLines.push(line);
-      if (logLines.length > 120) logLines.shift();
-      dirty = true;
-    };
-    let lastHeartbeat = Date.now();
-    const timer = onProgress
-      ? setInterval(() => {
-          if (dirty || Date.now() - lastHeartbeat >= 30_000) {
-            dirty = false;
-            lastHeartbeat = Date.now();
-            onProgress(latest, logLines.join("\n").slice(-12_000), stage, percent);
-          }
-        }, 1500)
-      : null;
-    const finish = (timedOut: boolean, stopped: "paused" | "cancelled" | "stalled" | "steered" | null = null) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(to);
-      if (timer) clearInterval(timer);
-      if (controlTimer) clearInterval(controlTimer);
-      resolve({
-        text: finalText || (timedOut ? "(agent segment timed out)" : stopped ? `(agent ${stopped})` : "(no output)"),
-        timedOut,
-        stopped,
-        checkpointLog: logLines.join("\n").slice(-12_000),
-        commands,
-      });
-    };
-    const to = setTimeout(() => {
-      try {
-        p.kill("SIGKILL");
-      } catch {
-        /* already gone */
+  // Mission synthesis is controller reasoning, not repository execution. Its
+  // model process has no tools, hooks, or child agents; the bounded protocol
+  // below keeps its access snapshot inside the trusted Codex parent.
+  const args = [...codexReviewExecPrefix(model, reasoningEffort), "--json", "-"];
+  const codexSelection = codexModelFor(model);
+  const runtimeLabel = `${codexSelection.model} · ${normalizeReasoningEffort(reasoningEffort, codexSelection.effort)}`;
+  const protocol = new BoundedAgentRunnerDecoder();
+  const controlAbort = new AbortController();
+  let stopped: "paused" | "cancelled" | "stalled" | "steered" | null = null;
+  let finalText = "";
+  let latest = "starting up…";
+  let stage = "starting";
+  let percent = 4;
+  let workUnits = 0;
+  let dirty = false;
+  const commands: GitCommandEvidence[] = [];
+  const logLines: string[] = [];
+  const pushLog = (line: string) => {
+    const safe = redactSensitiveText(line, env).replace(/\0/g, "").slice(-600);
+    if (!safe) return;
+    logLines.push(safe);
+    if (logLines.length > 120) logLines.shift();
+    dirty = true;
+  };
+  const safeText = (value: string) => redactSensitiveText(value, env);
+  const oneLine = (value: string, maximum: number) => safeText(value).trim().replace(/\s+/g, " ").slice(-maximum);
+  const itemOf = (event: AgentRunnerEvent) => isJsonRecord(event.item) ? event.item : null;
+  const handleEvent = (event: AgentRunnerEvent) => {
+    const item = itemOf(event);
+    if (event.type === "thread.started") {
+      latest = `session started · ${runtimeLabel}`;
+      stage = "understanding";
+      percent = Math.max(percent, 8);
+      pushLog(`▸ ${runtimeLabel} session started`);
+    } else if (event.type === "item.started" && item?.type === "command_execution") {
+      latest = `Running ${oneLine(String(item.command ?? "command"), 120)}`;
+      stage = "executing";
+      workUnits += 1;
+      percent = Math.max(percent, Math.min(78, 14 + workUnits * 5));
+      pushLog(`▸ ${latest}`);
+    } else if (event.type === "item.completed" && item?.type === "command_execution") {
+      const evidence = commandEvidenceFromCodexEvent(event, env);
+      if (evidence) {
+        commands.push(evidence);
+        if (commands.length > 64) commands.shift();
+        const exit = evidence.exitCode === null ? evidence.status : `exit ${evidence.exitCode}`;
+        pushLog(`${evidence.exitCode === 0 ? "✓" : "!"} ${exit} · ${evidence.command.slice(0, 140)}`);
+        if (evidence.output) pushLog(evidence.output.slice(-400));
       }
-      finish(true);
-    }, timeoutMs); // bounded below Trigger's one-hour task ceiling
-    let controlBusy = false;
-    const controlTimer = executionState
-      ? setInterval(async () => {
-          if (controlBusy || settled) return;
-          controlBusy = true;
-          try {
-            const state = await executionState();
-            if (state === "paused" || state === "cancelled" || state === "stalled" || state === "steered") {
-              try {
-                p.kill("SIGTERM");
-                setTimeout(() => {
-                  if (p.exitCode === null) p.kill("SIGKILL");
-                }, 3000);
-              } catch {
-                /* already gone */
-              }
-              finish(false, state);
-            }
-          } finally {
-            controlBusy = false;
-          }
-        }, 12_000)
-      : null;
-    p.stdout.on("data", (d) => {
-      buf += redactSensitiveText(d.toString(), env);
-      let nl: number;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        if (!line) continue;
-        let ev: any;
-        try {
-          ev = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (ev.type === "thread.started") {
-          latest = `session started · ${runtimeLabel}`;
-          stage = "understanding";
-          percent = Math.max(percent, 8);
-          pushLog(`▸ ${runtimeLabel} session started`);
-        } else if (ev.type === "item.started" && ev.item?.type === "command_execution") {
-          latest = `Running ${String(ev.item.command ?? "command").slice(0, 120)}`;
+    } else if (event.type === "item.completed" && item?.type === "agent_message") {
+      if (typeof item.text === "string") {
+        finalText = safeText(item.text);
+        latest = oneLine(item.text, 160);
+        stage = "reviewing";
+        percent = Math.max(percent, 84);
+        pushLog(item.text.trim().slice(0, 400));
+      }
+    } else if (event.type === "assistant" && isJsonRecord(event.message) && Array.isArray(event.message.content)) {
+      for (const block of event.message.content) {
+        if (!isJsonRecord(block)) continue;
+        if (block.type === "tool_use") {
+          const input = isJsonRecord(block.input) ? block.input : {};
+          const name = oneLine(String(block.name ?? "tool"), 80);
+          const detail = input.command
+            ? `: ${oneLine(String(input.command), 80)}`
+            : input.file_path
+              ? `: ${oneLine(String(input.file_path), 120)}`
+              : "";
+          latest = `Using ${name}${detail}`;
           stage = "executing";
           workUnits += 1;
           percent = Math.max(percent, Math.min(78, 14 + workUnits * 5));
           pushLog(`▸ ${latest}`);
-        } else if (ev.type === "item.completed" && ev.item?.type === "command_execution") {
-          const evidence = commandEvidenceFromCodexEvent(ev, env);
-          if (evidence) {
-            commands.push(evidence);
-            if (commands.length > 64) commands.shift();
-            const exit = evidence.exitCode === null ? evidence.status : `exit ${evidence.exitCode}`;
-            pushLog(`${evidence.exitCode === 0 ? "✓" : "!"} ${exit} · ${evidence.command.slice(0, 140)}`);
-            if (evidence.output) pushLog(evidence.output.slice(-400));
-          }
-        } else if (ev.type === "item.completed" && ev.item?.type === "agent_message") {
-          if (typeof ev.item.text === "string") {
-            finalText = ev.item.text;
-            latest = ev.item.text.trim().replace(/\s+/g, " ").slice(-160);
-            stage = "reviewing";
-            percent = Math.max(percent, 84);
-            pushLog(ev.item.text.trim().slice(0, 400));
-          }
-        } else if (ev.type === "assistant" && ev.message?.content) {
-          for (const b of ev.message.content) {
-            if (b.type === "tool_use") {
-              latest = `Using ${b.name}${b.input?.command ? ": " + String(b.input.command).slice(0, 80) : b.input?.file_path ? ": " + b.input.file_path : ""}`;
-              stage = "executing";
-              workUnits += 1;
-              percent = Math.max(percent, Math.min(78, 14 + workUnits * 5));
-              pushLog(`▸ ${b.name}${b.input?.command ? "  $ " + String(b.input.command).slice(0, 140) : b.input?.file_path ? "  " + String(b.input.file_path).slice(0, 140) : ""}`);
-            } else if (b.type === "text" && b.text?.trim()) {
-              latest = b.text.trim().replace(/\s+/g, " ").slice(-160);
-              stage = "reasoning";
-              percent = Math.max(percent, Math.min(80, 18 + workUnits * 5));
-              pushLog(b.text.trim().slice(0, 400));
-            }
-          }
-        } else if (ev.type === "result" && typeof ev.result === "string") {
-          finalText = ev.result;
-          stage = "reviewing";
-          percent = Math.max(percent, 88);
-        } else if (ev.type === "turn.failed" || ev.type === "error") {
-          const message = String(ev.error?.message ?? ev.message ?? ev.error ?? "agent turn failed").slice(0, 2000);
-          finalText = `error: ${message}`;
-          latest = message.slice(-180);
-          stage = "error";
-          pushLog(`! ${message}`);
+        } else if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
+          latest = oneLine(block.text, 160);
+          stage = "reasoning";
+          percent = Math.max(percent, Math.min(80, 18 + workUnits * 5));
+          pushLog(block.text.trim().slice(0, 400));
         }
       }
+    } else if (event.type === "result" && typeof event.result === "string") {
+      finalText = safeText(event.result);
+      stage = "reviewing";
+      percent = Math.max(percent, 88);
+    } else if (event.type === "turn.failed" || event.type === "error") {
+      const error = isJsonRecord(event.error) ? event.error.message : event.error;
+      const message = oneLine(String(error ?? event.message ?? "agent turn failed"), 2_000);
+      finalText = `error: ${message}`;
+      latest = message.slice(-180);
+      stage = "error";
+      pushLog(`! ${message}`);
+    }
+  };
+
+  let lastHeartbeat = Date.now();
+  const progressTimer = onProgress
+    ? setInterval(() => {
+        if (dirty || Date.now() - lastHeartbeat >= 30_000) {
+          dirty = false;
+          lastHeartbeat = Date.now();
+          try { onProgress(latest, logLines.join("\n").slice(-12_000), stage, percent); }
+          catch { /* progress reporting cannot escape the bounded controller */ }
+        }
+      }, 1_500)
+    : undefined;
+  progressTimer?.unref?.();
+
+  let controlBusy = false;
+  const controlTimer = executionState
+    ? setInterval(async () => {
+        if (controlBusy || controlAbort.signal.aborted) return;
+        controlBusy = true;
+        try {
+          const state = await executionState().catch(() => "unknown");
+          if (state === "paused" || state === "cancelled" || state === "stalled" || state === "steered") {
+            stopped = state;
+            controlAbort.abort();
+          }
+        } finally {
+          controlBusy = false;
+        }
+      }, 12_000)
+    : undefined;
+  controlTimer?.unref?.();
+
+  try {
+    const result = await runBoundedProcess({
+      command: bin,
+      args,
+      cwd,
+      env,
+      input: prompt,
+      maxInputBytes: 512 * kib,
+      timeoutMs,
+      signal: controlAbort.signal,
+      stdout: AGENT_CHILD_LIMITS.agentStdout,
+      stderr: AGENT_CHILD_LIMITS.agentStderr,
+      onStdoutChunk: (chunk) => {
+        for (const event of protocol.push(chunk)) handleEvent(event);
+      },
+      onStdoutEnd: () => protocol.finish(),
+      onStderrChunk: (chunk) => {
+        const tail = chunk.subarray(Math.max(0, chunk.byteLength - 4 * kib));
+        const line = oneLine(tail.toString("utf8"), 180);
+        if (line) {
+          latest = line;
+          pushLog(`! ${line}`);
+        }
+      },
     });
-    p.stderr.on("data", (data) => {
-      const safe = redactSensitiveText(data.toString(), env);
-      stderr = (stderr + safe).slice(-4000);
-      const line = safe.trim().replace(/\s+/g, " ").slice(-180);
-      if (line) {
-        latest = line;
-        pushLog(`! ${line}`);
-      }
-    });
-    p.on("close", (code) => {
-      if (code !== 0 && !finalText) finalText = `error: ${stderr.trim() || `agent exited ${code}`}`;
-      finish(false);
-    });
-    p.on("error", (e) => {
-      finalText = "error: " + e.message;
-      finish(false);
-    });
-  });
+    if (result.code !== 0) throw new BoundedProcessError("process_exit");
+    return {
+      text: finalText || "(no output)",
+      timedOut: false,
+      stopped: null,
+      checkpointLog: logLines.join("\n").slice(-12_000),
+      commands,
+    };
+  } catch (error) {
+    if (stopped && error instanceof BoundedProcessError && error.reason === "aborted") {
+      return {
+        text: finalText || `(agent ${stopped})`,
+        timedOut: false,
+        stopped,
+        checkpointLog: logLines.join("\n").slice(-12_000),
+        commands,
+      };
+    }
+    throw error;
+  } finally {
+    if (progressTimer) clearInterval(progressTimer);
+    if (controlTimer) clearInterval(controlTimer);
+  }
 }
 
 // A malformed remote must never reach git. Short product names remain a
@@ -680,33 +701,51 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     const provider: AgentProvider = "codex";
     const bin = resolveSubscriptionAgentBin(provider);
     if (!bin) return rejectReservation(`no ${provider} binary`);
-    const prepared = prepareSubscriptionEnv(provider);
-    if (prepared.error) return rejectReservation(prepared.error);
-    const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
-    if (preflight.error) return rejectReservation(preflight.error);
-    const missingTools = missingSubscriptionTools(prepared.env);
+    // Do not acquire an access snapshot during dispatch, Git hydration, cloud
+    // workspace setup, or checkpoint I/O. Every actual Codex boundary below
+    // acquires its own exact window immediately before local preflight/spawn.
+    const subscriptionEnvs = new Set<NodeJS.ProcessEnv>();
+    const trackSubscriptionEnv = <T extends NodeJS.ProcessEnv>(value: T): T => {
+      subscriptionEnvs.add(value);
+      return value;
+    };
+    const withFreshCodexBoundary = async <T,>(input: {
+      scope: string;
+      validityMs: number;
+      cloud?: boolean;
+      run(env: NodeJS.ProcessEnv): Promise<T>;
+    }): Promise<T> => {
+      const boundary = await prepareSubscriptionEnv(provider, {
+        scope: input.scope,
+        minimumValidityMs: input.validityMs,
+      });
+      subscriptionEnvs.add(boundary.env);
+      if (boundary.error) throw new Error(boundary.error);
+      const receipt = verifyCodexSubscriptionPreflight(bin, boundary.env);
+      if (receipt.error) throw new Error(receipt.error);
+      const isolated = trackSubscriptionEnv((input.cloud ? isolateCloudSubscriptionEnv : isolateSubscriptionEnv)(
+        boundary.env,
+        input.scope,
+      ));
+      try {
+        return await input.run(isolated);
+      } finally {
+        cleanupSubscriptionHome(isolated);
+        cleanupSubscriptionHome(boundary.env);
+      }
+    };
+    try {
+    const hostChildEnv = scopedSubscriptionEnv(process.env, provider);
+    const missingTools = missingSubscriptionTools(hostChildEnv);
     if (missingTools.length) {
       return rejectReservation(`Codex worker toolchain unavailable: missing ${missingTools.join(", ")} on PATH`);
     }
-    const env = prepared.env;
+    let env = hostChildEnv;
+    hostChildEnv.HOME = "/tmp/jarvis-controller-child-home";
+    hostChildEnv.GIT_CONFIG_NOSYSTEM = "1";
+    mkdirSync(hostChildEnv.HOME, { recursive: true, mode: 0o700 });
     mkdirSync("/tmp/work", { recursive: true });
     const token = process.env.GITHUB_TOKEN ?? "";
-
-    // Standing briefing every agent reads from the Codex home:
-    // Daniel's infra map + vault access + repo/deploy conventions = real project access.
-    const briefingPath = join(String(env.CODEX_HOME), "AGENTS.md");
-    writeFileSync(
-      briefingPath,
-      `# You are a scoped JARVIS permanent-team agent working for Daniel.\n\n${INFRA_MAP}\n\n` +
-        `## Capability boundary\n` +
-        `You run inside an isolated worktree with no general secrets-vault access. Use only the repository and explicitly attached MCP capabilities. Fully implement and verify scoped software work; the delivery controller merges verified branches automatically. Never seek credentials, publish publicly, message people, spend money, or perform destructive actions. If one is required, stop with the exact approval needed.\n\n` +
-        `## Conventions\n- The runner supplies the repository when one is in scope; do not clone or push another repository.\n` +
-        `- Toolchain: curl, git, node, npm, npx and gh were verified before this lease. Use them through Codex's shell tool. Live web search is enabled for current information.\n` +
-        `- The repository is already checked out for you. GitHub credentials remain with the delivery controller; use gh only for public/read-only inspection and report if a remote authenticated operation is required.\n` +
-        `- ${SHALLOW_PROVENANCE_RULE} Never replace, reparent, or rewrite a persisted shared branch because a depth-limited checkout hides its parents.\n` +
-        `- Never invent results. If something is inaccessible, say so plainly in your final answer.\n` +
-        `- Final answer style: plain text, the key outcome first, under 300 words.\n`,
-    );
 
     let processed = 0;
     const failureBackoffMs = (attempt: number) =>
@@ -841,7 +880,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               validation.evidence.length ? `## Validation evidence\n${validation.evidence.map((item: string) => `- ${item}`).join("\n")}` : "",
               validation.gaps.length ? `## Remaining notes\n${validation.gaps.map((item: string) => `- ${item}`).join("\n")}` : "",
             ].filter(Boolean).join("\n\n");
-            const spoken = (await weaveLine(bin, env, "LONG-RUNNING GOAL COMPLETED", report)) || "The goal has passed its final Sol validation. The evidence is on your screen.";
+            const spoken = (await withFreshCodexBoundary({
+              scope: `goal-${String(claim.missionId)}-weave`,
+              validityMs: backgroundSubscriptionValidityMs(60_000),
+              run: (boundaryEnv) => weaveLine(bin, boundaryEnv, "LONG-RUNNING GOAL COMPLETED", report),
+            })) || "The goal has passed its final Sol validation. The evidence is on your screen.";
             await convexMutation("chatQueue:postAssistant", { threadId: thread, text: spoken }).catch(() => {});
             await convexMutation("chatQueue:postCard", {
               threadId: thread,
@@ -976,7 +1019,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       };
       try {
         const jobKey = String(job.jobId).replace(/[^a-zA-Z0-9_-]/g, "_");
-        const jobEnv = isolateSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}`);
         const controllerScratch = `/tmp/work/controller-${jobKey}-attempt-${expectedAttempt}`;
         rmSync(controllerScratch, { recursive: true, force: true });
         mkdirSync(controllerScratch, { recursive: true });
@@ -1115,7 +1157,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             const integrationDir = `/tmp/work/integration-${jobKey}-${Number(claimed.generation)}`;
             rmSync(integrationDir, { recursive: true, force: true });
             const remote = githubRepoUrl(repo);
-            const gitEnv = githubGitEnv(env, String(token));
+            const gitEnv = githubGitEnv(hostChildEnv, String(token));
             const cloned = await sh("git", ["clone", "--no-checkout", "--filter=blob:none", remote, integrationDir], gitEnv,
               { signal: integrationAbort.signal, timeoutMs: 90_000 });
             if (cloned.code !== 0) {
@@ -1126,9 +1168,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }
             const runIntegrationGit = (args: string[], commandEnv: NodeJS.ProcessEnv = gitEnv) =>
               sh("git", ["-C", integrationDir, ...args], commandEnv, { signal: integrationAbort.signal, timeoutMs: 90_000 });
-            if ((await runIntegrationGit(["remote", "set-url", "origin", remote], env)).code !== 0
-              || (await runIntegrationGit(["config", "user.email", "jarvis@daniels-project-space.dev"], env)).code !== 0
-              || (await runIntegrationGit(["config", "user.name", "JARVIS integration controller"], env)).code !== 0) {
+            if ((await runIntegrationGit(["remote", "set-url", "origin", remote], hostChildEnv)).code !== 0
+              || (await runIntegrationGit(["config", "user.email", "jarvis@daniels-project-space.dev"], hostChildEnv)).code !== 0
+              || (await runIntegrationGit(["config", "user.name", "JARVIS integration controller"], hostChildEnv)).code !== 0) {
               await convexMutation("goalIntegration:defer", {
                 ...integrationFence, reasonCode: "sandbox_configuration_failed",
                 reason: "bounded integration git configuration failed",
@@ -1354,7 +1396,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           controllerCheckoutPath = dir;
           rmSync(dir, { recursive: true, force: true });
           const url = githubRepoUrl(repo);
-          const gitEnv = githubGitEnv(env, token);
+          const gitEnv = githubGitEnv(hostChildEnv, token);
           let cloneReady = false;
           if (job.branch) {
             const cloned = await sh(
@@ -1383,12 +1425,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           if (cloneReady) {
             // Defense in depth: the subprocess only ever sees a credential-free
             // remote even if Git changes clone credential persistence behavior.
-            await sh("git", ["-C", dir, "remote", "set-url", "origin", url], env);
-            await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
-            await sh("git", ["-C", dir, "config", "user.name", `${profile.name} via JARVIS`], env);
+            await sh("git", ["-C", dir, "remote", "set-url", "origin", url], hostChildEnv);
+            await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], hostChildEnv);
+            await sh("git", ["-C", dir, "config", "user.name", `${profile.name} via JARVIS`], hostChildEnv);
             if (!checkoutSourceBranch) {
               checkoutSourceBranch = (
-                await sh("git", ["-C", dir, "branch", "--show-current"], env)
+                await sh("git", ["-C", dir, "branch", "--show-current"], hostChildEnv)
               ).out.trim();
             }
             const history = await ensureCompleteRepositoryHistory({
@@ -1401,18 +1443,18 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               cloneFailureReason = `${SHALLOW_PROVENANCE_RULE} Safe checkout preparation failed: ${history.note}`;
               context = `${cloneFailureReason} Do not inspect the incomplete checkout or pretend repository work was performed.`;
             } else {
-              baseSha = (await sh("git", ["-C", dir, "rev-parse", "HEAD"], env)).out.trim();
+              baseSha = (await sh("git", ["-C", dir, "rev-parse", "HEAD"], hostChildEnv)).out.trim();
               if (job.sourceHeadSha) {
                 const sourceHeadSha = String(job.sourceHeadSha);
-                let sourceExists = await sh("git", ["-C", dir, "cat-file", "-e", `${sourceHeadSha}^{commit}`], env);
+                let sourceExists = await sh("git", ["-C", dir, "cat-file", "-e", `${sourceHeadSha}^{commit}`], hostChildEnv);
                 if (sourceExists.code !== 0) {
                   const hydratedSource = await sh("git", ["-C", dir, "fetch", "--no-tags", url, sourceHeadSha], gitEnv);
                   sourceExists = hydratedSource.code === 0
-                    ? await sh("git", ["-C", dir, "cat-file", "-e", `${sourceHeadSha}^{commit}`], env)
+                    ? await sh("git", ["-C", dir, "cat-file", "-e", `${sourceHeadSha}^{commit}`], hostChildEnv)
                     : { code: hydratedSource.code, out: hydratedSource.out };
                 }
                 const cumulativeAncestry = sourceExists.code === 0
-                  ? await sh("git", ["-C", dir, "merge-base", "--is-ancestor", sourceHeadSha, baseSha], env)
+                  ? await sh("git", ["-C", dir, "merge-base", "--is-ancestor", sourceHeadSha, baseSha], hostChildEnv)
                   : { code: sourceExists.code, out: sourceExists.out };
                 if (sourceExists.code !== 0 || cumulativeAncestry.code !== 0) {
                   cloneFailed = true;
@@ -1439,7 +1481,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 }
               }
               const checkedOut = branch
-                ? await sh("git", ["-C", dir, "checkout", "-B", branch], env)
+                ? await sh("git", ["-C", dir, "checkout", "-B", branch], hostChildEnv)
                 : { code: 0, out: "" };
               if (!cloneFailed && (!baseSha || checkedOut.code !== 0)) {
                 cloneFailed = true;
@@ -1492,7 +1534,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const checkpointStore = await createR2CheckpointStore();
         const workspaceBaseSha = baseSha || sha256Bytes(String(job.jobId));
         const sourceArchive: CredentiallessArchive = repoDir
-          ? await createCredentiallessGitArchive(repoDir, workspaceBaseSha, env)
+          ? await createCredentiallessGitArchive(repoDir, workspaceBaseSha, hostChildEnv)
           : (() => {
               const bytes = createDeterministicTar([{
                 path: ".jarvis-workspace",
@@ -1587,7 +1629,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const model = normalizeWorkModelTier(
           typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task),
         );
-        const agentEnv = isolateCloudSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}-cloud`);
         let lastHeartbeatAt = 0;
         let lastDurableStage = "";
         let lastDurablePercent = 0;
@@ -1639,26 +1680,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             "blocked",
           );
         }
-        const run = await runCloudWorkspaceAgent({
-          bin,
-          controllerScratch,
-          controllerEnv: agentEnv,
-          provider: cloudProvider,
-          workspace: providerWorkspace,
-          prompt,
-          model,
-          onProgress: reportProgress,
-          executionState: async () => {
-            const state = await executionStatus();
-            return state === "superseded" ? "cancelled" : state;
-          },
-          timeoutMs: segmentTimeoutMs(model),
-        });
-        await durableProgress;
-        let result = run.text;
-        const portable = await persistPortableCheckpoint({
-          provider: cloudProvider,
-          workspace: providerWorkspace,
+        const persistAndRecordCloudCheckpoint = async () => {
+          const portable = await persistPortableCheckpoint({
+            provider: cloudProvider,
+            workspace: providerWorkspace!,
           store: checkpointStore,
           jobId: String(job.jobId),
           attempt: expectedAttempt,
@@ -1671,21 +1696,131 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           attemptKey: `${String(job.jobId)}:${expectedAttempt}`,
           causationId: `${String(job.workerRunId)}:${expectedAttempt}`,
           assertCurrent: assertCurrentWorkspace,
-        });
-        if (!await assertCurrentWorkspace("checkpoint_record")) {
-          throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt fence rejected checkpoint record", "deferred");
+          });
+          if (!await assertCurrentWorkspace("checkpoint_record")) {
+            throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt fence rejected checkpoint record", "deferred");
+          }
+          const checkpointRecorded = await convexMutation("jobs:recordCloudCheckpoint", {
+            jobId: job.jobId, expectedAttempt,
+            providerWorkspaceId: providerWorkspace!.providerWorkspaceId,
+            providerSessionId: providerWorkspace!.providerSessionId,
+            checkpointRef: portable.ref,
+            checkpointDigest: portable.digest,
+            checkpointBytes: portable.byteCount,
+            checkpointManifestDigest: portable.manifestDigest,
+            checkpointManifest: portable.canonicalManifest,
+          }).catch(() => false);
+          if (!checkpointRecorded) throw new Error("Convex rejected the portable checkpoint receipt");
+          return portable;
+        };
+        const prepareTurnReceipt = async (sequence: 1 | 2): Promise<CloudCodexTurnReceipt> => {
+          const receiptId = sha256Bytes([
+            "jarvis-cloud-codex-turn-v1", String(job.jobId), String(expectedAttempt),
+            String(job.workerRunId), providerWorkspace!.providerWorkspaceId,
+            providerWorkspace!.providerSessionId, String(sequence),
+          ].join(":"));
+          const preparedReceipt = await convexMutation("jobs:prepareCloudCodexTurn", {
+            jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
+            providerWorkspaceId: providerWorkspace!.providerWorkspaceId,
+            providerSessionId: providerWorkspace!.providerSessionId,
+            receiptId, sequence,
+          }).catch(() => false);
+          if (!preparedReceipt) throw new Error("Codex turn receipt could not be durably prepared");
+          let writes = Promise.resolve();
+          const advance = (phase: "request_intent" | "accepted" | "effect" | "rejected" | "completed") => {
+            writes = writes.then(async () => {
+              const recorded = await convexMutation("jobs:recordCloudCodexTurnPhase", {
+                jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
+                receiptId, sequence, phase,
+              }).catch(() => false);
+              if (!recorded) throw new Error(`Codex turn ${phase} receipt was rejected`);
+            });
+            return writes;
+          };
+          return {
+            beforeRequest: () => advance("request_intent"),
+            requestWritten: () => undefined,
+            accepted: () => advance("accepted"),
+            effect: () => advance("effect"),
+            rejected: () => advance("rejected"),
+            completed: () => advance("completed"),
+          };
+        };
+        const prepareCloudBoundary = async (sequence: 1 | 2, afterUnauthorizedVersion?: number) => {
+          // The durable receipt precedes auth acquisition; after this point the
+          // only intervening work is bounded local preflight/home isolation.
+          const turnReceipt = await prepareTurnReceipt(sequence);
+          const boundary = await prepareSubscriptionEnv(provider, {
+            scope: `agent-${options.reservation.workerRunId}-execution-${sequence}`,
+            minimumValidityMs: backgroundSubscriptionValidityMs(segmentTimeoutMs(model)),
+            afterUnauthorizedVersion,
+          });
+          subscriptionEnvs.add(boundary.env);
+          if (boundary.error) throw new Error(boundary.error);
+          const boundaryPreflight = verifyCodexSubscriptionPreflight(bin, boundary.env);
+          if (boundaryPreflight.error) throw new Error(boundaryPreflight.error);
+          env = boundary.env;
+          const agentEnv = trackSubscriptionEnv(isolateCloudSubscriptionEnv(
+            boundary.env,
+            `${jobKey}-attempt-${expectedAttempt}-cloud-${sequence}`,
+          ));
+          return { boundary, agentEnv, turnReceipt };
+        };
+        const executeCloudAgent = (boundary: Awaited<ReturnType<typeof prepareCloudBoundary>>) =>
+          runCloudWorkspaceAgent({
+            bin,
+            controllerScratch,
+            controllerEnv: boundary.agentEnv,
+            provider: cloudProvider!,
+            workspace: providerWorkspace!,
+            prompt,
+            model,
+            onProgress: reportProgress,
+            executionState: async () => {
+              const state = await executionStatus();
+              return state === "superseded" ? "cancelled" : state;
+            },
+            timeoutMs: segmentTimeoutMs(model),
+            turnReceipt: boundary.turnReceipt,
+          });
+        const holdUnsafeTurn = async (error: unknown): Promise<boolean> => {
+          if (!(error instanceof CloudCodexReplayUnsafeError)) return false;
+          await durableProgress;
+          const held = await persistAndRecordCloudCheckpoint();
+          const continuation = await checkpointMutation({
+            jobId: job.jobId,
+            expectedAttempt,
+            checkpoint:
+              `Codex crossed the turn/effect boundary and its response was not replay-safe. ` +
+              `Resume only from portable cloud checkpoint ${held.digest}; reconcile existing repository state before issuing a new turn.`,
+            result: "Codex turn held for durable checkpoint reconciliation; no blind replay was attempted.",
+            branch: branch ?? undefined,
+            delayMs: 5_000,
+          }).catch(() => null);
+          if (!continuation) throw new Error("Unsafe Codex turn checkpoint could not be requeued");
+          return true;
+        };
+        let executionBoundary = await prepareCloudBoundary(1);
+        let run: Awaited<ReturnType<typeof runCloudWorkspaceAgent>>;
+        try {
+          run = await executeCloudAgent(executionBoundary);
+        } catch (error) {
+          if (await holdUnsafeTurn(error)) return;
+          if (!(error instanceof CloudCodexPreStartAuthorizationError)
+            || executionBoundary.boundary.snapshotVersion === undefined) throw error;
+          cleanupSubscriptionHome(executionBoundary.agentEnv);
+          cleanupSubscriptionHome(executionBoundary.boundary.env);
+          executionBoundary = await prepareCloudBoundary(2, executionBoundary.boundary.snapshotVersion);
+          try {
+            run = await executeCloudAgent(executionBoundary);
+          } catch (retryError) {
+            if (await holdUnsafeTurn(retryError)) return;
+            throw retryError;
+          }
         }
-        const checkpointRecorded = await convexMutation("jobs:recordCloudCheckpoint", {
-          jobId: job.jobId, expectedAttempt,
-          providerWorkspaceId: providerWorkspace.providerWorkspaceId,
-          providerSessionId: providerWorkspace.providerSessionId,
-          checkpointRef: portable.ref,
-          checkpointDigest: portable.digest,
-          checkpointBytes: portable.byteCount,
-          checkpointManifestDigest: portable.manifestDigest,
-          checkpointManifest: portable.canonicalManifest,
-        }).catch(() => false);
-        if (!checkpointRecorded) throw new Error("Convex rejected the portable checkpoint receipt");
+        await durableProgress;
+        let result = run.text;
+        const portable = await persistAndRecordCloudCheckpoint();
         if (repo) {
           if (!await assertCurrentWorkspace("patch_export")) {
             throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt fence rejected patch export", "deferred");
@@ -1693,28 +1828,28 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           const patch = await cloudProvider.exportPatch(providerWorkspace, baseSha, DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
           if (!controllerCheckoutPath || !token) throw new Error("trusted controller checkout authority is unavailable after specialist exit");
           const url = githubRepoUrl(repo);
-          const gitEnv = githubGitEnv(env, token);
+          const gitEnv = githubGitEnv(hostChildEnv, token);
           rmSync(controllerCheckoutPath, { recursive: true, force: true });
           const cloned = await sh("git", ["clone", "--no-checkout", "--filter=blob:none", url, controllerCheckoutPath], gitEnv, { timeoutMs: 120_000 });
           if (cloned.code !== 0) throw new Error(`trusted controller could not rehydrate exact base: ${cloned.out.slice(-400)}`);
-          let basePresent = await sh("git", ["-C", controllerCheckoutPath, "cat-file", "-e", `${baseSha}^{commit}`], env);
+          let basePresent = await sh("git", ["-C", controllerCheckoutPath, "cat-file", "-e", `${baseSha}^{commit}`], hostChildEnv);
           if (basePresent.code !== 0) {
             const fetched = await sh("git", ["-C", controllerCheckoutPath, "fetch", "--no-tags", url, baseSha], gitEnv, { timeoutMs: 120_000 });
             basePresent = fetched.code === 0
-              ? await sh("git", ["-C", controllerCheckoutPath, "cat-file", "-e", `${baseSha}^{commit}`], env)
+              ? await sh("git", ["-C", controllerCheckoutPath, "cat-file", "-e", `${baseSha}^{commit}`], hostChildEnv)
               : fetched;
           }
           if (basePresent.code !== 0) throw new Error("trusted controller could not prove the exact patch base");
           const checkedOut = branch
-            ? await sh("git", ["-C", controllerCheckoutPath, "checkout", "-B", branch, baseSha], env)
-            : await sh("git", ["-C", controllerCheckoutPath, "checkout", "--detach", baseSha], env);
+            ? await sh("git", ["-C", controllerCheckoutPath, "checkout", "-B", branch, baseSha], hostChildEnv)
+            : await sh("git", ["-C", controllerCheckoutPath, "checkout", "--detach", baseSha], hostChildEnv);
           if (checkedOut.code !== 0) throw new Error("trusted controller could not restore the exact worker branch base");
-          await sh("git", ["-C", controllerCheckoutPath, "remote", "set-url", "origin", url], env);
-          await sh("git", ["-C", controllerCheckoutPath, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
-          await sh("git", ["-C", controllerCheckoutPath, "config", "user.name", `${profile.name} via JARVIS`], env);
+          await sh("git", ["-C", controllerCheckoutPath, "remote", "set-url", "origin", url], hostChildEnv);
+          await sh("git", ["-C", controllerCheckoutPath, "config", "user.email", "jarvis@daniels-project-space.dev"], hostChildEnv);
+          await sh("git", ["-C", controllerCheckoutPath, "config", "user.name", `${profile.name} via JARVIS`], hostChildEnv);
           repoDir = controllerCheckoutPath;
           cwd = controllerCheckoutPath;
-          await applyValidatedPatchToControllerCheckout(repoDir, baseSha, patch, env);
+          await applyValidatedPatchToControllerCheckout(repoDir, baseSha, patch, hostChildEnv);
         }
         result = `${result}\n\nCloud boundary: ${cloudProvider.name} workspace ${providerWorkspace.providerWorkspaceId}; R2 checkpoint ${portable.digest} (${portable.byteCount} bytes).`;
 
@@ -1750,18 +1885,18 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         if (repoDir && token && branch && !job.readonly) {
           const deliveryDir = repoDir;
           const pushUrl = githubRepoUrl(repo);
-          const gitEnv = githubGitEnv(env, token);
+          const gitEnv = githubGitEnv(hostChildEnv, token);
           const runGit = (args: string[]) => sh("git", ["-C", deliveryDir, ...args], gitEnv);
-          await sh("git", ["-C", deliveryDir, "add", "-A"], env);
+          await sh("git", ["-C", deliveryDir, "add", "-A"], hostChildEnv);
           await sh(
             "git",
             ["-C", deliveryDir, "commit", "-m", `chore: ${profile.name.toLowerCase()} — ${job.task.slice(0, 60).replace(/"/g, "'")}`],
-            env,
+            hostChildEnv,
           );
-          let local = (await sh("git", ["-C", deliveryDir, "rev-parse", "HEAD"], env)).out.trim();
+          let local = (await sh("git", ["-C", deliveryDir, "rev-parse", "HEAD"], hostChildEnv)).out.trim();
           checkpointHeadSha = local;
           if ((reviewBaseSha || baseSha) && local && local !== (reviewBaseSha || baseSha)) {
-            deliveryDiffStat = (await sh("git", ["-C", deliveryDir, "diff", "--stat", `${reviewBaseSha || baseSha}..${local}`], env)).out
+            deliveryDiffStat = (await sh("git", ["-C", deliveryDir, "diff", "--stat", `${reviewBaseSha || baseSha}..${local}`], hostChildEnv)).out
               .trim()
               .slice(0, 1_500);
           }
@@ -1943,7 +2078,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           let goalReview: { envelope: GitReviewEnvelope; binding: GitReviewBinding } | undefined;
           if (repoDir) {
             const receipt = await buildGitReviewReceipt({
-              runGit: (args) => sh("git", ["-C", repoDir!, ...args], env), jobId: String(job.jobId), attempt: expectedAttempt,
+              runGit: (args) => sh("git", ["-C", repoDir!, ...args], hostChildEnv), jobId: String(job.jobId), attempt: expectedAttempt,
               repository: repo!, expectedBranch: branch || checkoutSourceBranch, baseSha: reviewBaseSha || baseSha,
               agentEvidence: cumulativeWorkEvidence(job.checkpoint, result), commands: run.commands,
             });
@@ -2010,7 +2145,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         let reviewAuthority = receiptAuthority;
         if (repoDir) {
           const receipt = await buildGitReviewReceipt({
-            runGit: (args) => sh("git", ["-C", repoDir!, ...args], env),
+            runGit: (args) => sh("git", ["-C", repoDir!, ...args], hostChildEnv),
             jobId: String(job.jobId),
             attempt: expectedAttempt,
             repository: repo,
@@ -2068,15 +2203,19 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           stage: "supervisor review",
           percent: 92,
         }).catch(() => {});
-        const verify = await verifyWork(
-          bin,
-          jobEnv,
-          job.task,
-          reviewEvidence,
-          job.goalStage,
-          gitReview,
-          reviewAuthority,
-        ).catch(() => null);
+        const verify = await withFreshCodexBoundary({
+          scope: `${jobKey}-attempt-${expectedAttempt}-supervisor-review`,
+          validityMs: backgroundSubscriptionValidityMs(90_000),
+          run: (reviewEnv) => verifyWork(
+            bin,
+            reviewEnv,
+            job.task,
+            reviewEvidence,
+            job.goalStage,
+            gitReview,
+            reviewAuthority,
+          ),
+        }).catch(() => null);
         if (await stopIfLeaseLost(`Supervisor review interrupted.\n\n${continuationCheckpoint}`, result, branch)) return;
         if (!verify) {
           const continuation = await convexMutation("jobs:checkpointAndRequeue", {
@@ -2243,7 +2382,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         }
 
         let spoken =
-          (await weaveLine(bin, jobEnv, job.task, deliveryResult)) ||
+          (await withFreshCodexBoundary({
+            scope: `${jobKey}-attempt-${expectedAttempt}-weave`,
+            validityMs: backgroundSubscriptionValidityMs(60_000),
+            run: (weaveEnv) => weaveLine(bin, weaveEnv, job.task, deliveryResult),
+          })) ||
           `${profile.name} finished and JARVIS verified the evidence${pullRequestUrl ? "; repository delivery is recorded" : ""}.`;
         spoken += " Supervisor check passed.";
         const findingId = await convexMutation("findings:add", {
@@ -2308,17 +2451,23 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       const body = synth.results
         .map((r: any) => `### ${r.label} [${r.status}]\n${r.result || "(no output)"}`)
         .join("\n\n");
-      const merged = await runAgent(
-        bin,
-        "/tmp/work",
-        env,
+      const synthesisPrompt =
         `You are JARVIS's mission synthesizer. A fleet of agents just finished parallel work on ONE mission. ` +
-          `Merge their results into a single coherent markdown report: start with "## Mission" and a 2-sentence outcome, ` +
-          `then "## Findings" (the substance, deduplicated, agent labels only where they add clarity), then "## Next moves" ` +
-          `(concrete recommended actions). Be direct; flag agents that failed. Under 500 words.\n\n` +
-          `MISSION: ${synth.goal}\n\nAGENT RESULTS:\n${body.slice(0, 24000)}`,
-        "terra",
-      );
+        `Merge their results into a single coherent markdown report: start with "## Mission" and a 2-sentence outcome, ` +
+        `then "## Findings" (the substance, deduplicated, agent labels only where they add clarity), then "## Next moves" ` +
+        `(concrete recommended actions). Be direct; flag agents that failed. Under 500 words.\n\n` +
+        `MISSION: ${synth.goal}\n\nAGENT RESULTS:\n${body.slice(0, 24000)}`;
+      const merged = await withFreshCodexBoundary({
+        scope: `mission-${missionId}-synthesis`,
+        validityMs: backgroundSubscriptionValidityMs(segmentTimeoutMs("terra")),
+        run: (synthesisEnv) => runAgent(
+          bin,
+          "/tmp/work",
+          synthesisEnv,
+          synthesisPrompt,
+          "terra",
+        ),
+      });
       const report = merged.text && !/^error:/.test(merged.text) && merged.text !== "(no output)"
         ? merged.text
         : `## Mission\n${synth.goal}\n\n${body.slice(0, 6000)}`;
@@ -2331,7 +2480,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       if (!finished) return;
       const thread = typeof synth.originThreadId === "string" && synth.originThreadId ? synth.originThreadId : "main";
       const spoken =
-        (await weaveLine(bin, env, `MISSION: ${synth.goal}`, report)) ||
+        (await withFreshCodexBoundary({
+          scope: `mission-${missionId}-weave`,
+          validityMs: backgroundSubscriptionValidityMs(60_000),
+          run: (weaveEnv) => weaveLine(bin, weaveEnv, `MISSION: ${synth.goal}`, report),
+        })) ||
         (failedAll ? "The fleet came back empty-handed, sir — mission report is on your screen." : "Mission complete, sir — the fleet's full report is on your screen.");
       await convexMutation("chatQueue:postAssistant", { threadId: thread, text: spoken });
       await convexMutation("chatQueue:postCard", {
@@ -2391,7 +2544,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       if (!ready) break;
       await synthesizeMissionClaim(ready);
     }
-  return { processed };
+    return { processed };
+    } finally {
+      for (const consumerEnv of [...subscriptionEnvs].reverse()) {
+        if (!cleanupSubscriptionHome(consumerEnv)) cleanupSubscriptionHome(consumerEnv);
+      }
+    }
 }
 
 export const agentWorker = task({

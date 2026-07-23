@@ -4,6 +4,7 @@ import { mkdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { githubGitEnv, githubRepoUrl } from "./git-transport";
 import { redactSecrets, safeMemoryNote } from "../lib/memory-safety";
+import { environmentWithoutSubscriptionController } from "./subscription-source";
 
 // Obsidian memory vault: consolidates JARVIS's memory into a git-backed,
 // categorised, wikilinked Obsidian vault (daniels-project-space/jarvis-memory) —
@@ -64,7 +65,13 @@ export const memoryVault = schedules.task({
     const dir = "/tmp/vault";
     rmSync(dir, { recursive: true, force: true });
     const url = githubRepoUrl(REPO);
-    const env: NodeJS.ProcessEnv = { ...process.env };
+    // Git is unrelated to the trusted Codex parent. Copy host variables only
+    // after rejecting every subscription-controller name, including retired
+    // inputs that may linger while an old Trigger revision drains.
+    const env = environmentWithoutSubscriptionController(process.env);
+    env.HOME = "/tmp/jarvis-memory-controller-home";
+    env.GIT_CONFIG_NOSYSTEM = "1";
+    mkdirSync(env.HOME, { recursive: true, mode: 0o700 });
     const gitEnv = githubGitEnv(env, token);
     await sh("git", ["clone", "--depth", "1", url, dir], gitEnv);
     if (!existsSync(join(dir, ".git"))) return { error: "clone failed" };

@@ -23,7 +23,10 @@ agents to build and repair Daniel's other projects. One personality
 - **Cortex** — background subscription agents on Trigger.dev
   (`src/trigger/agent-runner.ts`, cron every 2 min). The brain enqueues jobs
   (`jobs:enqueue`), each agent gets a briefing with the infra map and repo access, and
-  results are woven back as a single spoken line plus a `findings` row.
+  results are woven back as a single spoken line plus a `findings` row. Managed
+  ChatGPT state has one fenced controller writer and an encrypted private R2
+  snapshot chain; concurrent workers have isolated homes without the reusable
+  refresh token.
 - **Memory** — a Convex `memory` table injected per turn, with post-turn extraction in
   `/api/chat`, consolidated every 6h into the git-backed Obsidian vault `jarvis-memory`
   (`src/trigger/memory-vault.ts`).

@@ -1,3 +1,5 @@
+import { subscriptionValidityForExecutionMs } from "./subscription-validity";
+
 // Foreground conversation has one authoritative warm owner. Durable
 // research/coding belongs to the independent agent fleet; a slow background
 // run must never inherit or monopolise Daniel's foreground voice lane.
@@ -12,6 +14,19 @@ export const FOREGROUND_MAX_DURATION_SECONDS = 4 * 60 * 60;
 // finalized before this runner voluntarily hands over. This is intentionally
 // larger than the model timeout: context and durable delivery are included.
 export const FOREGROUND_ADMISSION_RESERVE_MS = FOREGROUND_TURN_TIMEOUT_MS + 20_000;
+// A replacement snapshot is requested early enough to complete the bounded
+// CLI preflight and app-server initialization while the current process can
+// still admit one complete turn. Consumers never rely on the access token's
+// final minutes for either startup or model execution.
+export const FOREGROUND_SESSION_STARTUP_RESERVE_MS = 2 * 60_000;
+// A turn is admitted only while the token covers the complete delivery bound
+// and remains outside Codex 0.144.5's internal refresh window throughout it.
+export const FOREGROUND_TURN_VALIDITY_RESERVE_MS =
+  subscriptionValidityForExecutionMs(FOREGROUND_ADMISSION_RESERVE_MS);
+export const FOREGROUND_SESSION_RENEWAL_RESERVE_MS =
+  subscriptionValidityForExecutionMs(
+    FOREGROUND_ADMISSION_RESERVE_MS + FOREGROUND_SESSION_STARTUP_RESERVE_MS,
+  );
 // A successor starts and initializes during this bounded overlap, but cannot
 // take the Convex lease until the owner releases it.
 export const FOREGROUND_HANDOFF_OVERLAP_MS = 10 * 60_000;

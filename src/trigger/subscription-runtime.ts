@@ -1,131 +1,52 @@
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { accessSync, chmodSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { delimiter, dirname, join } from "node:path";
+import { accessSync, chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { delimiter, dirname, join, resolve, sep } from "node:path";
+import {
+  canonicalAuthJson,
+  parseChatgptSubscriptionAuthText,
+} from "./subscription-auth";
+import {
+  DEFAULT_MINIMUM_VALIDITY_MS,
+  SubscriptionSessionError,
+  subscriptionOperatorSignal,
+  type AcquiredSubscriptionSession,
+  type ManagedSubscriptionSessionController,
+} from "./subscription-session";
+import { productionSubscriptionSessionController } from "./subscription-session-r2";
+import { requireVaultBrokerSubscriptionSource } from "./subscription-source";
+import { CODEX_CONSUMER_REFRESH_GUARD_MS } from "./subscription-validity";
+
+export { parseChatgptSubscriptionAuth } from "./subscription-auth";
 
 export type AgentProvider = "codex";
 
-const AUTH_OUTER_KEYS = ["auth_mode", "tokens"] as const;
-const AUTH_TOKEN_KEYS = ["access_token", "refresh_token", "id_token", "account_id"] as const;
 export const PINNED_CODEX_VERSION = "codex-cli 0.144.5";
 export const CHATGPT_LOGIN_STATUS_RECEIPT = "Logged in using ChatGPT";
 
-type ChatgptSubscriptionAuth = {
-  auth_mode: "chatgpt";
-  tokens: Record<(typeof AUTH_TOKEN_KEYS)[number], string>;
-};
-
-type JsonObject = Record<string, unknown>;
-
-function isObject(value: unknown): value is JsonObject {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function sameKeys(value: JsonObject, expected: readonly string[]): boolean {
-  const actual = Object.keys(value).sort();
-  return actual.length === expected.length && actual.every((key, index) => key === [...expected].sort()[index]);
-}
-
-// JSON.parse intentionally accepts duplicate object keys (using the last one),
-// which makes a schema check ambiguous. Walk the JSON grammar first so a
-// duplicate credential field cannot be smuggled through that behavior.
-function rejectDuplicateJsonKeys(input: string): void {
-  let index = 0;
-  const whitespace = () => { while (/\s/.test(input[index] ?? "")) index++; };
-  const fail = (): never => { throw new Error("invalid JSON"); };
-  const string = (): string => {
-    if (input[index++] !== '"') fail();
-    const start = index - 1;
-    while (index < input.length) {
-      const char = input[index++];
-      if (char === '"') return JSON.parse(input.slice(start, index)) as string;
-      if (char === "\\") {
-        const escape = input[index++];
-        if (!escape || !'"\\/bfnrtu'.includes(escape)) fail();
-        if (escape === "u") {
-          if (!/^[0-9a-fA-F]{4}$/.test(input.slice(index, index + 4))) fail();
-          index += 4;
-        }
-      } else if (char.charCodeAt(0) < 0x20) fail();
-    }
-    return fail();
-  };
-  const value = (): void => {
-    whitespace();
-    if (input[index] === '"') { string(); return; }
-    if (input[index] === "{") {
-      index++; whitespace();
-      const keys = new Set<string>();
-      if (input[index] === "}") { index++; return; }
-      while (true) {
-        whitespace();
-        const key = string();
-        if (keys.has(key)) throw new Error("duplicate JSON key");
-        keys.add(key);
-        whitespace();
-        if (input[index++] !== ":") fail();
-        value(); whitespace();
-        if (input[index] === "}") { index++; return; }
-        if (input[index++] !== ",") fail();
-      }
-    }
-    if (input[index] === "[") {
-      index++; whitespace();
-      if (input[index] === "]") { index++; return; }
-      while (true) {
-        value(); whitespace();
-        if (input[index] === "]") { index++; return; }
-        if (input[index++] !== ",") fail();
-      }
-    }
-    const start = index;
-    while (index < input.length && !/[\s,}\]]/.test(input[index])) index++;
-    if (start === index) fail();
-    JSON.parse(input.slice(start, index));
-  };
-  value(); whitespace();
-  if (index !== input.length) fail();
-}
-
-function apiKeyShaped(value: string): boolean {
-  return /^(?:sk|rk|pk|api)[_-]/i.test(value) || /(?:^|[_-])api[_-]?key/i.test(value);
-}
-
-function parseChatgptSubscriptionAuthText(json: string): ChatgptSubscriptionAuth {
-  rejectDuplicateJsonKeys(json);
-  const parsed: unknown = JSON.parse(json);
-  if (!isObject(parsed) || !sameKeys(parsed, AUTH_OUTER_KEYS) || parsed.auth_mode !== "chatgpt" || !isObject(parsed.tokens) || !sameKeys(parsed.tokens, AUTH_TOKEN_KEYS)) {
-    throw new Error("invalid Codex ChatGPT subscription auth schema");
-  }
-  const tokens = {} as ChatgptSubscriptionAuth["tokens"];
-  for (const key of AUTH_TOKEN_KEYS) {
-    const value = parsed.tokens[key];
-    if (typeof value !== "string" || !value.trim() || apiKeyShaped(value)) {
-      throw new Error("invalid Codex ChatGPT subscription token");
-    }
-    tokens[key] = value;
-  }
-  return { auth_mode: "chatgpt", tokens };
-}
-
-export function parseChatgptSubscriptionAuth(encoded: string): ChatgptSubscriptionAuth {
-  // Accept only standard, padded base64. Buffer otherwise accepts whitespace,
-  // URL-safe alphabets, and truncated payloads, none of which are canonical.
-  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
-    throw new Error("invalid canonical Codex subscription auth encoding");
-  }
-  const json = Buffer.from(encoded, "base64").toString("utf8");
-  if (Buffer.from(json, "utf8").toString("base64") !== encoded) {
-    throw new Error("invalid canonical Codex subscription auth encoding");
-  }
-  return parseChatgptSubscriptionAuthText(json);
-}
-
-function canonicalAuthJson(auth: ChatgptSubscriptionAuth): string {
-  return JSON.stringify({ auth_mode: auth.auth_mode, tokens: auth.tokens });
-}
-
 const nodeRequire = createRequire(import.meta.url);
+const DEFAULT_CONSUMER_ROOT = "/home/node/.jarvis-codex-consumers";
+const DEFAULT_ISOLATION_ROOT = "/home/node/.jarvis-codex-isolations";
+const ownedSubscriptionHomes = new Map<string, string>();
+
+function directChild(root: string, path: string): boolean {
+  return dirname(path) === root && path.startsWith(`${root}${sep}`);
+}
+
+function registerSubscriptionHome(root: string, home: string): void {
+  const canonicalRoot = realpathSync(root);
+  const absoluteHome = resolve(home);
+  if (!directChild(canonicalRoot, absoluteHome)) throw new Error("unsafe subscription consumer home");
+  ownedSubscriptionHomes.set(absoluteHome, canonicalRoot);
+}
+
+function unsafeConsumerRoot(root: string): boolean {
+  const workspaceRoot = resolve("/tmp/work");
+  const checkoutRoot = resolve(process.cwd());
+  return root === workspaceRoot || root.startsWith(`${workspaceRoot}${sep}`)
+    || root === checkoutRoot || root.startsWith(`${checkoutRoot}${sep}`);
+}
 
 export const REQUIRED_AGENT_TOOLS = ["curl", "git", "node", "npm", "npx", "gh"] as const;
 
@@ -172,38 +93,27 @@ export function resolveSubscriptionAgentBin(provider: AgentProvider): string | n
   }
 }
 
-function scopedSubscriptionEnv(
-  source: NodeJS.ProcessEnv,
+export function scopedSubscriptionEnv(
+  source: Readonly<Record<string, string | undefined>>,
   provider: AgentProvider,
 ): NodeJS.ProcessEnv {
   const allow = [
     "PATH",
-    "HOME",
-    "CODEX_HOME",
     "LANG",
     "LC_ALL",
     "TMPDIR",
-    "NODE_PATH",
-    "NODE_OPTIONS",
     "NODE_EXTRA_CA_CERTS",
+    "CODEX_CA_CERTIFICATE",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "TERM",
     "CI",
-    "SHELL",
-    "USER",
-    "LOGNAME",
-    "XDG_CACHE_HOME",
-    "XDG_CONFIG_HOME",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "NO_PROXY",
     "http_proxy",
     "https_proxy",
     "no_proxy",
-    "NPM_CONFIG_REGISTRY",
-    "npm_config_registry",
-    "JARVIS_AGENT_PROVIDER",
   ];
   const env = {} as NodeJS.ProcessEnv;
   for (const key of allow) if (source[key] !== undefined) env[key] = source[key];
@@ -211,84 +121,110 @@ function scopedSubscriptionEnv(
   env.JARVIS_AGENT_PROVIDER = provider;
   env.GIT_TERMINAL_PROMPT = "0";
   env.GH_PROMPT_DISABLED = "1";
-  // Never let a subscription-backed subprocess silently switch to metered API
-  // billing, and never pass unrelated application/provider secrets to it.
-  env.ANTHROPIC_API_KEY = "";
-  env.OPENAI_API_KEY = "";
-  env.CODEX_API_KEY = "";
+  // No API-key variable is present at all: this process can use only the
+  // controller-provided ChatGPT auth file and cannot switch billing paths.
   return env;
 }
 
-function authFromEnvironment(env: Readonly<NodeJS.ProcessEnv>): ChatgptSubscriptionAuth {
-  // There is deliberately no migration path here. A raw JSON document or
-  // bearer token can silently select a different Codex auth mode, so reject it
-  // before creating a home directory or starting any child process.
-  if (env.CODEX_ACCESS_TOKEN !== undefined || env.CODEX_AUTH_JSON !== undefined) {
-    throw new Error("legacy raw Codex credentials are not accepted");
-  }
-  const encoded = env.CODEX_AUTH_JSON_B64;
-  if (!encoded) throw new Error("Codex ChatGPT subscription auth is not configured");
-  return parseChatgptSubscriptionAuth(encoded);
+function installIsolatedConsumerHome(env: NodeJS.ProcessEnv, home: string): void {
+  const configHome = join(home, "xdg-config");
+  const cacheHome = join(home, "xdg-cache");
+  mkdirSync(configHome, { recursive: true, mode: 0o700 });
+  mkdirSync(cacheHome, { recursive: true, mode: 0o700 });
+  chmodSync(configHome, 0o700);
+  chmodSync(cacheHome, 0o700);
+  env.HOME = home;
+  env.CODEX_HOME = home;
+  env.XDG_CONFIG_HOME = configHome;
+  env.XDG_CACHE_HOME = cacheHome;
 }
 
-function writableCodexHome(): string | null {
-  const candidates = [
-    process.env.JARVIS_CODEX_HOME,
-    process.env.HOME && !process.env.HOME.startsWith("/tmp") ? join(process.env.HOME, ".codex") : undefined,
-    "/home/node/.codex",
-  ].filter((value): value is string => Boolean(value));
-  for (const candidate of [...new Set(candidates)]) {
-    if (candidate.startsWith("/tmp")) continue;
-    try {
-      mkdirSync(candidate, { recursive: true });
-      return candidate;
-    } catch {
-      /* try the next non-temporary home */
-    }
-  }
-  return null;
-}
+type SessionAcquirer = Pick<ManagedSubscriptionSessionController, "acquire">;
 
-export function prepareSubscriptionEnv(
+export type PreparedSubscriptionEnv = {
+  env: NodeJS.ProcessEnv;
+  snapshotVersion?: number;
+  snapshotExpiresAt?: number;
+  snapshotFence?: number;
+  error?: string;
+};
+
+export async function prepareSubscriptionEnv(
   provider: AgentProvider,
-): { env: NodeJS.ProcessEnv; error?: string } {
+  options: {
+    controller?: SessionAcquirer;
+    root?: string;
+    scope?: string;
+    minimumValidityMs?: number;
+    afterUnauthorizedVersion?: number;
+    environment?: Readonly<Record<string, string | undefined>>;
+  } = {},
+): Promise<PreparedSubscriptionEnv> {
+  const environment = options.environment ?? process.env;
   if (provider !== "codex") {
     return { env: {} as NodeJS.ProcessEnv, error: "Jarvis permits only the Codex CLI runtime" };
   }
-  let auth: ChatgptSubscriptionAuth;
+  let consumerHome = "";
   try {
-    // Validate the sole accepted controller input before touching the
-    // filesystem. This is the root boundary for every foreground and durable
-    // Codex caller.
-    auth = authFromEnvironment(process.env);
+    requireVaultBrokerSubscriptionSource(environment);
+  } catch (error) {
+    return {
+      env: scopedSubscriptionEnv(environment, provider),
+      error: subscriptionOperatorSignal(error),
+    };
+  }
+  let snapshot: AcquiredSubscriptionSession;
+  try {
+    const minimumValidityMs = options.minimumValidityMs ?? DEFAULT_MINIMUM_VALIDITY_MS;
+    if (!Number.isSafeInteger(minimumValidityMs)
+      || minimumValidityMs < CODEX_CONSUMER_REFRESH_GUARD_MS
+      || (options.afterUnauthorizedVersion !== undefined
+        && (!Number.isSafeInteger(options.afterUnauthorizedVersion) || options.afterUnauthorizedVersion < 1))) {
+      throw new SubscriptionSessionError("snapshot_stale");
+    }
+    const bin = resolveSubscriptionAgentBin(provider);
+    if (!bin) return { env: scopedSubscriptionEnv(environment, provider), error: "codex binary not found" };
+    const controller = options.controller ?? await productionSubscriptionSessionController(bin, environment);
+    snapshot = await controller.acquire({
+      minimumValidityMs,
+      afterUnauthorizedVersion: options.afterUnauthorizedVersion,
+    });
+  } catch (error) {
+    return {
+      env: scopedSubscriptionEnv(environment, provider),
+      error: subscriptionOperatorSignal(error),
+    };
+  }
+
+  try {
+    const root = resolve(options.root ?? DEFAULT_CONSUMER_ROOT);
+    if (unsafeConsumerRoot(root)) throw new Error("unsafe consumer root");
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    chmodSync(root, 0o700);
+    const canonicalRoot = realpathSync(root);
+    if (unsafeConsumerRoot(canonicalRoot)) throw new Error("unsafe consumer root");
+    const safeScope = (options.scope ?? "runtime").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 60) || "runtime";
+    const home = mkdtempSync(join(canonicalRoot, `${safeScope}-`));
+    consumerHome = home;
+    registerSubscriptionHome(canonicalRoot, home);
+    const authPath = join(home, "auth.json");
+    writeFileSync(authPath, canonicalAuthJson(snapshot.auth), { mode: 0o600 });
+    chmodSync(authPath, 0o600);
+    const env = scopedSubscriptionEnv(environment, provider);
+    installIsolatedConsumerHome(env, home);
+    return {
+      env,
+      snapshotVersion: snapshot.version,
+      snapshotExpiresAt: snapshot.expiresAt,
+      snapshotFence: snapshot.fence,
+    };
   } catch {
+    if (consumerHome) cleanupSubscriptionHome({ CODEX_HOME: consumerHome });
     return {
-      env: scopedSubscriptionEnv(process.env, provider),
-      error: "invalid Codex ChatGPT subscription auth",
+      env: scopedSubscriptionEnv(environment, provider),
+      error: "Codex subscription consumer home is unavailable",
     };
   }
-  const home = writableCodexHome();
-  if (!home) {
-    return {
-      env: scopedSubscriptionEnv(process.env, provider),
-      error: "a writable non-temporary Codex home is unavailable",
-    };
-  }
-
-  const authPath = join(home, "auth.json");
-  writeFileSync(authPath, canonicalAuthJson(auth), { mode: 0o600 });
-  chmodSync(authPath, 0o600);
-
-  return {
-    env: scopedSubscriptionEnv(
-      {
-        ...process.env,
-        HOME: process.env.HOME && !process.env.HOME.startsWith("/tmp") ? process.env.HOME : dirname(home),
-        CODEX_HOME: home,
-      },
-      provider,
-    ),
-  };
 }
 
 export function isolateSubscriptionEnv(
@@ -299,34 +235,91 @@ export function isolateSubscriptionEnv(
 ): NodeJS.ProcessEnv {
   const sourceHome = String(base.CODEX_HOME ?? "");
   const safeScope = scope.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120) || "agent";
-  // Codex deliberately refuses to create helper aliases inside a temporary
-  // CODEX_HOME. Keep each lease isolated beside the non-temporary source home
-  // so its CLI toolchain initializes fully on both GitHub and Trigger workers.
-  const isolationRoot = root ?? (sourceHome ? join(dirname(sourceHome), ".jarvis-codex-homes") : "/tmp/work/codex-homes");
-  const isolatedHome = join(isolationRoot, safeScope);
-  mkdirSync(isolatedHome, { recursive: true });
+  // Each worker uses a non-temporary authority root outside every repository
+  // sandbox. No consumer home is derived from a model-visible checkout path.
+  const isolationRoot = resolve(root ?? DEFAULT_ISOLATION_ROOT);
+  mkdirSync(isolationRoot, { recursive: true, mode: 0o700 });
+  chmodSync(isolationRoot, 0o700);
+  const canonicalIsolationRoot = realpathSync(isolationRoot);
+  if (unsafeConsumerRoot(canonicalIsolationRoot)) throw new Error("unsafe isolation root");
+  const isolatedHome = mkdtempSync(join(canonicalIsolationRoot, `${safeScope}-${randomUUID()}-`));
+  registerSubscriptionHome(canonicalIsolationRoot, isolatedHome);
   // Authentication and Daniel's scoped briefing are read-only inputs. System
   // skills are intentionally not copied: every concurrent Codex process gets
   // its own install directory, removing the shared `skills/` startup race.
-  for (const file of copiedFiles) {
-    const source = join(sourceHome, file);
-    if (!sourceHome || !existsSync(source)) continue;
-    if (file === "auth.json") {
-      // The source home is populated only by prepareSubscriptionEnv. Validate
-      // again at this process boundary so an arbitrary pre-existing auth.json
-      // can never be copied into a specialist home.
-      const auth = parseChatgptSubscriptionAuthText(readFileSync(source, "utf8"));
-      writeFileSync(join(isolatedHome, file), canonicalAuthJson(auth), { mode: 0o600 });
-    } else {
-      copyFileSync(source, join(isolatedHome, file));
+  try {
+    for (const file of copiedFiles) {
+      const source = join(sourceHome, file);
+      if (!sourceHome || !existsSync(source)) continue;
+      if (file === "auth.json") {
+        // The source home is populated only by prepareSubscriptionEnv. Validate
+        // again at this process boundary so an arbitrary pre-existing auth.json
+        // can never be copied into a specialist home.
+        const auth = parseChatgptSubscriptionAuthText(readFileSync(source, "utf8"));
+        writeFileSync(join(isolatedHome, file), canonicalAuthJson(auth), { mode: 0o600 });
+      } else {
+        copyFileSync(source, join(isolatedHome, file));
+      }
     }
+  } catch (error) {
+    cleanupSubscriptionHome({ CODEX_HOME: isolatedHome });
+    throw error;
   }
   const authPath = join(isolatedHome, "auth.json");
   if (existsSync(authPath)) chmodSync(authPath, 0o600);
   // This is the final boundary before spawn(). Do not re-expand the
   // controller environment: it carries receipt, vault, Convex, Trigger and
   // GitHub authority that a Codex specialist must never inherit.
-  return scopedSubscriptionEnv({ ...base, CODEX_HOME: isolatedHome }, "codex");
+  const env = scopedSubscriptionEnv(base, "codex");
+  installIsolatedConsumerHome(env, isolatedHome);
+  return env;
+}
+
+/** Delete the access snapshot once the trusted Codex parent has loaded it. */
+export function consumeSubscriptionAuth(env: Readonly<NodeJS.ProcessEnv>): void {
+  const home = resolve(String(env.CODEX_HOME ?? ""));
+  if (!ownedSubscriptionHomes.has(home)) return;
+  const authPath = join(home, "auth.json");
+  if (!existsSync(authPath)) return;
+  // Validate before deletion so this helper cannot be redirected at an
+  // arbitrary file through a malformed home prepared outside this module.
+  parseChatgptSubscriptionAuthText(readFileSync(authPath, "utf8"));
+  unlinkSync(authPath);
+}
+
+/** Remove only an exact consumer home created by this process. */
+export function cleanupSubscriptionHome(env: Readonly<Record<string, string | undefined>>): boolean {
+  const rawHome = String(env.CODEX_HOME ?? "");
+  if (!rawHome) return false;
+  const home = resolve(rawHome);
+  const root = ownedSubscriptionHomes.get(home);
+  if (!root || !directChild(root, home)) return false;
+  try {
+    let homeStat;
+    try {
+      homeStat = lstatSync(home);
+    } catch {
+      ownedSubscriptionHomes.delete(home);
+      return true;
+    }
+    if (realpathSync(dirname(home)) !== root) return false;
+    if (homeStat.isSymbolicLink()) {
+      unlinkSync(home);
+    } else {
+      const authPath = join(home, "auth.json");
+      if (existsSync(authPath) && !lstatSync(authPath).isDirectory()) unlinkSync(authPath);
+      rmSync(home, { recursive: true, force: true, maxRetries: 2 });
+    }
+    ownedSubscriptionHomes.delete(home);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isCodexUnauthorizedError(error: unknown): boolean {
+  const value = error instanceof Error ? error.message : String(error ?? "");
+  return /(?:\b401\b|unauthori[sz]ed|authentication (?:failed|required)|refresh[_ -]?token[_ -]?reused|login required)/i.test(value);
 }
 
 export function isolateCloudSubscriptionEnv(

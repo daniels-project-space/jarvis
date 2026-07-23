@@ -10,6 +10,7 @@ import {
 } from "../src/trigger/codex-app-server";
 import { buildCloudCodexPermissionProfile } from "../src/trigger/cloud-codex-permissions";
 import {
+  cleanupSubscriptionHome,
   isolateCloudSubscriptionEnv,
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
@@ -24,12 +25,13 @@ type Pending = {
 };
 
 async function main() {
-const prepared = prepareSubscriptionEnv("codex");
+const prepared = await prepareSubscriptionEnv("codex", { scope: "permission-probe" });
 const baseEnv = prepared.env;
 const sourceHome = String(baseEnv.CODEX_HOME ?? "");
 const bin = resolveSubscriptionAgentBin("codex");
 if (!bin || prepared.error || !sourceHome) {
   console.log("BLOCKED: pinned Codex subscription auth is unavailable; external permission probe did not run");
+  cleanupSubscriptionHome(prepared.env);
   process.exit(2);
 }
 
@@ -49,6 +51,8 @@ const profile = buildCloudCodexPermissionProfile({
 const preflight = verifyCodexSubscriptionPreflight(bin, env);
 if (preflight.error) {
   console.log(JSON.stringify({ status: "BLOCKED", reason: preflight.error }));
+  cleanupSubscriptionHome(env);
+  cleanupSubscriptionHome(prepared.env);
   rmSync(root, { recursive: true, force: true });
   process.exit(2);
 }
@@ -204,6 +208,8 @@ try {
   process.exitCode = 1;
 } finally {
   child.kill("SIGTERM");
+  cleanupSubscriptionHome(env);
+  cleanupSubscriptionHome(prepared.env);
   rmSync(root, { recursive: true, force: true });
 }
 }
