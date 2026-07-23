@@ -18,14 +18,29 @@ export const CODEX_CONSUMER_FINALIZATION_RESERVE_MS = 3 * 60_000;
 export const MAX_BACKGROUND_CODEX_SEGMENT_MS = 25 * 60_000;
 export const MEMORY_CODEX_EXECUTION_RESERVE_MS = 90_000;
 
+/**
+ * Convert a caller's complete execution-and-I/O reserve into the total token
+ * validity required at handoff. `minimumValidityMs` everywhere below this
+ * boundary means this total, so the six-minute guard is added exactly once.
+ */
+export function subscriptionValidityForExecutionMs(executionAndReserveMs: number): number {
+  if (!Number.isSafeInteger(executionAndReserveMs) || executionAndReserveMs < 0) {
+    throw new Error("invalid Codex execution validity window");
+  }
+  const total = executionAndReserveMs + CODEX_CONSUMER_REFRESH_GUARD_MS;
+  if (!Number.isSafeInteger(total)) throw new Error("invalid Codex execution validity window");
+  return total;
+}
+
 export function backgroundSubscriptionValidityMs(segmentMs: number): number {
   if (!Number.isSafeInteger(segmentMs) || segmentMs < 1) {
     throw new Error("invalid Codex segment validity window");
   }
-  return CODEX_CONSUMER_REFRESH_GUARD_MS
-    + CODEX_CONSUMER_STARTUP_RESERVE_MS
+  return subscriptionValidityForExecutionMs(
+    CODEX_CONSUMER_STARTUP_RESERVE_MS
     + segmentMs
-    + CODEX_CONSUMER_FINALIZATION_RESERVE_MS;
+    + CODEX_CONSUMER_FINALIZATION_RESERVE_MS,
+  );
 }
 
 export const DEFAULT_SUBSCRIPTION_VALIDITY_MS = backgroundSubscriptionValidityMs(

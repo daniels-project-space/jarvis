@@ -153,3 +153,30 @@ export function assertExactResponseOrigin(response: Response, expectedOrigin: st
   }
   if (origin !== expectedOrigin) throw new Error("response origin rejected");
 }
+
+/** Keep the same abort deadline alive through headers and streamed bodies. */
+export async function runWithDeadline<T>(
+  timeoutMs: number,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 10 * 60_000) {
+    throw new Error("invalid operation deadline");
+  }
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("operation deadline exceeded"));
+    }, timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => operation(controller.signal)),
+      deadline,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}

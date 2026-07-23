@@ -89,8 +89,9 @@ describe("vault client transport boundary", () => {
       }));
     const { vaultService } = await import("./vault-client");
     const pending = vaultService("codex-session");
+    const rejected = expect(pending).rejects.toThrow("Vault request unavailable");
     await vi.advanceTimersByTimeAsync(10_001);
-    await expect(pending).rejects.toThrow("Vault request unavailable");
+    await rejected;
     vi.useRealTimers();
   });
 });

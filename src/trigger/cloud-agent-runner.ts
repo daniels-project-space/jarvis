@@ -20,6 +20,7 @@ export type CloudAgentRun = {
 };
 
 export type CloudCodexTurnReceipt = {
+  beforeRequest(): Promise<void>;
   requestWritten(): void;
   accepted(): Promise<void>;
   effect(): Promise<void>;
@@ -86,9 +87,11 @@ export async function runCloudWorkspaceAgent(input: {
   const abort = new AbortController();
   let stopped: CloudAgentRun["stopped"] = null;
   let log = "";
+  let requestIntent = false;
   let requestWritten = false;
   let accepted = false;
   let effect = false;
+  let rejected = false;
   const bridge = new CloudWorkspaceToolBridge(input.provider, input.workspace, {
     signal: abort.signal,
     beforeTool: async () => {
@@ -136,6 +139,10 @@ export async function runCloudWorkspaceAgent(input: {
       contextBlock: "The durable work item is authoritative; this provider session is disposable transport.",
       preamble: "Complete the scoped repository task using only the controller-owned cloud repository tools.",
       modelTier: input.model,
+      beforeTurn: async () => {
+        await input.turnReceipt?.beforeRequest();
+        requestIntent = true;
+      },
       onTurnRequestWritten: () => {
         requestWritten = true;
         input.turnReceipt?.requestWritten();
@@ -166,7 +173,14 @@ export async function runCloudWorkspaceAgent(input: {
       && !accepted && !effect;
     if (provenPreStartRejection) {
       await input.turnReceipt?.rejected();
+      rejected = true;
       if (isCodexUnauthorizedError(error)) throw new CloudCodexPreStartAuthorizationError();
+    }
+    if (requestIntent && !requestWritten && !accepted && !effect && !rejected) {
+      // A synchronous local write failure happened after durable intent but
+      // before any protocol bytes crossed. Close that intent without treating
+      // the provider outcome as ambiguous.
+      await input.turnReceipt?.rejected();
     }
     if (error instanceof CloudCodexReplayUnsafeError
       || error instanceof CodexRequestOutcomeUnknownError

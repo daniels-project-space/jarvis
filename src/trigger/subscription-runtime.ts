@@ -93,7 +93,7 @@ export function resolveSubscriptionAgentBin(provider: AgentProvider): string | n
   }
 }
 
-function scopedSubscriptionEnv(
+export function scopedSubscriptionEnv(
   source: Readonly<Record<string, string | undefined>>,
   provider: AgentProvider,
 ): NodeJS.ProcessEnv {
@@ -102,27 +102,18 @@ function scopedSubscriptionEnv(
     "LANG",
     "LC_ALL",
     "TMPDIR",
-    "NODE_PATH",
-    "NODE_OPTIONS",
     "NODE_EXTRA_CA_CERTS",
+    "CODEX_CA_CERTIFICATE",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "TERM",
     "CI",
-    "SHELL",
-    "USER",
-    "LOGNAME",
-    "XDG_CACHE_HOME",
-    "XDG_CONFIG_HOME",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "NO_PROXY",
     "http_proxy",
     "https_proxy",
     "no_proxy",
-    "NPM_CONFIG_REGISTRY",
-    "npm_config_registry",
-    "JARVIS_AGENT_PROVIDER",
   ];
   const env = {} as NodeJS.ProcessEnv;
   for (const key of allow) if (source[key] !== undefined) env[key] = source[key];
@@ -133,6 +124,19 @@ function scopedSubscriptionEnv(
   // No API-key variable is present at all: this process can use only the
   // controller-provided ChatGPT auth file and cannot switch billing paths.
   return env;
+}
+
+function installIsolatedConsumerHome(env: NodeJS.ProcessEnv, home: string): void {
+  const configHome = join(home, "xdg-config");
+  const cacheHome = join(home, "xdg-cache");
+  mkdirSync(configHome, { recursive: true, mode: 0o700 });
+  mkdirSync(cacheHome, { recursive: true, mode: 0o700 });
+  chmodSync(configHome, 0o700);
+  chmodSync(cacheHome, 0o700);
+  env.HOME = home;
+  env.CODEX_HOME = home;
+  env.XDG_CONFIG_HOME = configHome;
+  env.XDG_CACHE_HOME = cacheHome;
 }
 
 type SessionAcquirer = Pick<ManagedSubscriptionSessionController, "acquire">;
@@ -207,8 +211,7 @@ export async function prepareSubscriptionEnv(
     writeFileSync(authPath, canonicalAuthJson(snapshot.auth), { mode: 0o600 });
     chmodSync(authPath, 0o600);
     const env = scopedSubscriptionEnv(environment, provider);
-    env.HOME = home;
-    env.CODEX_HOME = home;
+    installIsolatedConsumerHome(env, home);
     return {
       env,
       snapshotVersion: snapshot.version,
@@ -268,8 +271,7 @@ export function isolateSubscriptionEnv(
   // controller environment: it carries receipt, vault, Convex, Trigger and
   // GitHub authority that a Codex specialist must never inherit.
   const env = scopedSubscriptionEnv(base, "codex");
-  env.HOME = isolatedHome;
-  env.CODEX_HOME = isolatedHome;
+  installIsolatedConsumerHome(env, isolatedHome);
   return env;
 }
 

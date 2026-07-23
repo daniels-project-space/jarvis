@@ -7,6 +7,7 @@ import {
   ForegroundSessionOwner,
   type ForegroundSessionServer,
 } from "./foreground-session";
+import { CodexRequestRejectedError } from "./codex-app-server";
 import type { PreparedSubscriptionEnv } from "./subscription-runtime";
 
 const HOUR = 60 * 60_000;
@@ -227,7 +228,7 @@ describe("foreground subscription hot-swap", () => {
     const h = harness();
     await h.owner.start();
     const execute = vi.fn(async (server: FakeServer, onStarted: () => void) => {
-      if (server.version === 1) throw new Error("401 unauthorized");
+      if (server.version === 1) throw new CodexRequestRejectedError("turn/start", "401 unauthorized");
       onStarted();
       return { finalText: "recovered", threadId: "thread", code: 0, stderr: "" };
     });

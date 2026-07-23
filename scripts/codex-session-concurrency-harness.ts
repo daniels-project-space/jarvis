@@ -47,9 +47,12 @@ const controller = new ManagedSubscriptionSessionController({
   store,
   cipher: new AesGcmSessionSnapshotCipher(Buffer.alloc(32, 19)),
   bootstrap: async () => auth(now - 1_000, 1),
-  rotate: async () => {
+  rotate: async (_current, context) => {
     rotations += 1;
     await new Promise((resolve) => setTimeout(resolve, 15));
+    // This is the synthetic provider crossing point. Production marks the
+    // durable effect immediately before writing account/read to Codex stdin.
+    await context.markEffect();
     return auth(now + 60 * 60_000, 2);
   },
 });

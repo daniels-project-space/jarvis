@@ -2058,7 +2058,8 @@ export const recordCloudCodexTurnPhase = mutation({
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
     receiptId: v.string(), sequence: v.number(),
     phase: v.union(
-      v.literal("request_written"), v.literal("accepted"), v.literal("effect"),
+      v.literal("request_intent"), v.literal("request_written"),
+      v.literal("accepted"), v.literal("effect"),
       v.literal("rejected"), v.literal("completed"),
     ),
     workerToken: v.optional(v.string()),
@@ -2074,7 +2075,8 @@ export const recordCloudCodexTurnPhase = mutation({
     const prior = String(attempt.codexTurnReceiptPhase ?? "");
     if (prior === a.phase) return true;
     const allowed: Record<string, readonly string[]> = {
-      prepared: ["request_written", "accepted", "effect", "rejected"],
+      prepared: ["request_intent", "request_written", "accepted", "effect", "rejected"],
+      request_intent: ["accepted", "effect", "rejected"],
       request_written: ["accepted", "effect", "rejected"],
       accepted: ["effect", "completed"],
       effect: ["completed"],

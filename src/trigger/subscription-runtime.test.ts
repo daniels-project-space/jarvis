@@ -80,9 +80,19 @@ describe("subscription subprocess capability scope", () => {
   it("preserves the executable and network runtime without passing application authority", async () => {
     vi.stubEnv("PATH", process.env.PATH ?? "/usr/bin:/bin");
     vi.stubEnv("HTTPS_PROXY", "http://proxy.internal:8080");
+    vi.stubEnv("XDG_CONFIG_HOME", "/host/controller-config");
+    vi.stubEnv("XDG_CACHE_HOME", "/host/controller-cache");
+    vi.stubEnv("NPM_CONFIG_REGISTRY", "https://host-registry.invalid");
+    vi.stubEnv("NODE_OPTIONS", "--require=/host/controller-hook.js");
     const specialist = (await prepare()).env;
     expect(specialist.PATH).toBe(process.env.PATH);
     expect(specialist.HTTPS_PROXY).toBe("http://proxy.internal:8080");
+    expect(specialist.XDG_CONFIG_HOME).toBe(join(String(specialist.CODEX_HOME), "xdg-config"));
+    expect(specialist.XDG_CACHE_HOME).toBe(join(String(specialist.CODEX_HOME), "xdg-cache"));
+    expect(specialist.XDG_CONFIG_HOME).not.toBe("/host/controller-config");
+    expect(specialist.XDG_CACHE_HOME).not.toBe("/host/controller-cache");
+    expect(specialist.NPM_CONFIG_REGISTRY).toBeUndefined();
+    expect(specialist.NODE_OPTIONS).toBeUndefined();
     expect(specialist.GIT_TERMINAL_PROMPT).toBe("0");
     expect(specialist.OPENAI_API_KEY).toBeUndefined();
     expect(specialist.CODEX_API_KEY).toBeUndefined();
@@ -137,6 +147,9 @@ describe("subscription subprocess capability scope", () => {
       const one = isolateSubscriptionEnv({ ...process.env, CODEX_HOME: source }, "job-one", homes);
       const two = isolateSubscriptionEnv({ ...process.env, CODEX_HOME: source }, "job-two", homes);
       expect(one.CODEX_HOME).not.toBe(two.CODEX_HOME);
+      expect(one.XDG_CONFIG_HOME).toBe(join(String(one.CODEX_HOME), "xdg-config"));
+      expect(two.XDG_CACHE_HOME).toBe(join(String(two.CODEX_HOME), "xdg-cache"));
+      expect(one.XDG_CONFIG_HOME).not.toBe(two.XDG_CONFIG_HOME);
       expect(readFileSync(join(String(one.CODEX_HOME), "AGENTS.md"), "utf8")).toBe("scoped briefing");
       expect(readFileSync(join(String(two.CODEX_HOME), "auth.json"), "utf8")).toBe(workerAuthJson);
       expect(readFileSync(join(String(two.CODEX_HOME), "auth.json"), "utf8")).not.toContain("refresh_subscription");
@@ -261,6 +274,8 @@ describe("subscription subprocess capability scope", () => {
   it("never invokes retired credential getters on the real prepare path", async () => {
     const retired = new Set([
       "CODEX_AUTH_JSON_B64", "CODEX_AUTH_JSON", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY",
+      "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "NPM_CONFIG_REGISTRY", "npm_config_registry",
+      "NODE_OPTIONS", "NODE_PATH",
     ]);
     const reads: string[] = [];
     const environment = new Proxy<Record<string, string | undefined>>({

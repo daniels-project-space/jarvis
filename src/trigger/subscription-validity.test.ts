@@ -10,6 +10,7 @@ import {
   MEMORY_SUBSCRIPTION_VALIDITY_MS,
   PINNED_CODEX_INTERNAL_REFRESH_GUARD_MS,
   backgroundSubscriptionValidityMs,
+  subscriptionValidityForExecutionMs,
 } from "./subscription-validity";
 
 describe("Codex subscription validity windows", () => {
@@ -35,5 +36,14 @@ describe("Codex subscription validity windows", () => {
       + CODEX_CONSUMER_FINALIZATION_RESERVE_MS
       + CODEX_CONSUMER_REFRESH_GUARD_MS,
     );
+  });
+
+  it("adds the six-minute guard exactly once to a caller's complete reserve", () => {
+    const executionAndReserve = 25 * 60_000;
+    expect(subscriptionValidityForExecutionMs(executionAndReserve)).toBe(
+      executionAndReserve + CODEX_CONSUMER_REFRESH_GUARD_MS,
+    );
+    expect(subscriptionValidityForExecutionMs(0)).toBe(CODEX_CONSUMER_REFRESH_GUARD_MS);
+    expect(() => subscriptionValidityForExecutionMs(-1)).toThrow("invalid Codex execution validity window");
   });
 });

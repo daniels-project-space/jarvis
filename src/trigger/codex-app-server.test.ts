@@ -11,6 +11,7 @@ type AppServerInternals = {
   process: { stdin: { writable: boolean; write: (chunk: string) => boolean } };
   ready: Promise<void>;
   receive: (line: string) => void;
+  protocolFailed: boolean;
 };
 
 type WrittenMessage = {
@@ -248,5 +249,102 @@ describe("Codex app-server dynamic tools", () => {
     internals.receive(JSON.stringify({ id: writes[0].id, error: { message: "profile unavailable" } }));
     await expect(turn).rejects.toMatchObject({ code: "permission_attestation_failed", disposition: "blocked" });
     expect(writes).toHaveLength(1);
+  });
+
+  it("fails closed when cumulative assistant output exceeds the per-turn bound", async () => {
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000, {
+      protocolLimits: { assistantBytesPerTurn: 4 },
+    });
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = { stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } } };
+    internals.ready = Promise.resolve();
+    const turn = server.runTurn({
+      conversationId: "bounded", userText: "hello", history: [], contextBlock: "",
+      preamble: "test", modelTier: "luna", onDelta: () => {},
+    });
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    internals.receive(JSON.stringify({ id: writes[0].id, result: { thread: { id: "bounded-thread" } } }));
+    await vi.waitFor(() => expect(writes).toHaveLength(2));
+    internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "bounded-turn" } } }));
+    await Promise.resolve();
+    internals.receive(JSON.stringify({
+      method: "item/agentMessage/delta",
+      params: { turnId: "bounded-turn", delta: "12345" },
+    }));
+    await expect(turn).rejects.toThrow("protocol validation failed");
+    expect(internals.protocolFailed).toBe(true);
+  });
+
+  it("bounds pending requests before allocating another protocol id", async () => {
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000, {
+      protocolLimits: { pendingRequests: 1 },
+    });
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = { stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } } };
+    internals.ready = Promise.resolve();
+    const first = server.runTurn({
+      conversationId: "first", userText: "one", history: [], contextBlock: "",
+      preamble: "test", modelTier: "luna", onDelta: () => {},
+    });
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    await expect(server.runTurn({
+      conversationId: "second", userText: "two", history: [], contextBlock: "",
+      preamble: "test", modelTier: "luna", onDelta: () => {},
+    })).rejects.toThrow("pending request limit");
+    internals.receive(JSON.stringify({ id: writes[0].id, result: { thread: { id: "first-thread" } } }));
+    await vi.waitFor(() => expect(writes).toHaveLength(2));
+    internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "first-turn" } } }));
+    await Promise.resolve();
+    internals.receive(JSON.stringify({ method: "turn/completed", params: { turnId: "first-turn", turn: { id: "first-turn", status: "completed" } } }));
+    await expect(first).resolves.toMatchObject({ code: 0 });
+  });
+
+  it("bounds cumulative dynamic-tool output and terminates the accepted turn", async () => {
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000, {
+      protocolLimits: { toolOutputBytes: 8 },
+      onDynamicToolCall: async () => ({
+        contentItems: [{ type: "inputText", text: "bounded result" }],
+        success: true,
+      }),
+    });
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = { stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } } };
+    internals.ready = Promise.resolve();
+    const turn = server.runTurn({
+      conversationId: "tool-bound", userText: "work", history: [], contextBlock: "",
+      preamble: "test", modelTier: "luna", onDelta: () => {},
+    });
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    internals.receive(JSON.stringify({ id: writes[0].id, result: { thread: { id: "tool-thread" } } }));
+    await vi.waitFor(() => expect(writes).toHaveLength(2));
+    internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "tool-turn" } } }));
+    await Promise.resolve();
+    internals.receive(JSON.stringify({
+      id: 99,
+      method: "item/tool/call",
+      params: {
+        threadId: "tool-thread", turnId: "tool-turn", callId: "call-99",
+        namespace: null, tool: "jarvis_call_tool", arguments: {},
+      },
+    }));
+    await expect(turn).rejects.toThrow("protocol validation failed");
+    expect(internals.protocolFailed).toBe(true);
+  });
+
+  it("caps cumulative protocol bytes even when every individual JSON line is small", () => {
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000, {
+      protocolLimits: { stdoutBytes: 90 },
+    });
+    const internals = server as unknown as AppServerInternals;
+    internals.process = { stdin: { writable: true, write: () => true } };
+    internals.ready = Promise.resolve();
+    const notification = JSON.stringify({ method: "account/updated", params: { authMode: "chatgpt" } });
+    internals.receive(notification);
+    expect(internals.protocolFailed).toBe(false);
+    internals.receive(notification);
+    expect(internals.protocolFailed).toBe(true);
   });
 });

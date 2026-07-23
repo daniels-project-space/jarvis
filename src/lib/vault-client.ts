@@ -3,6 +3,7 @@ import {
   hasExactKeys,
   isJsonRecord,
   readBoundedResponseJson,
+  runWithDeadline,
 } from "./bounded-json";
 
 const EXPECTED_VAULT_ORIGIN = "https://fantastic-roadrunner-485.convex.cloud";
@@ -42,27 +43,24 @@ export async function vaultService(service: string): Promise<Record<string, stri
     args: { service, vaultToken },
     format: "json",
   });
-  let response: Response;
-  try {
-    response = await fetch(vaultQueryUrl(), {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "content-length": String(Buffer.byteLength(body, "utf8")),
-      },
-      body,
-      cache: "no-store",
-      redirect: "error",
-      signal: AbortSignal.timeout(VAULT_REQUEST_TIMEOUT_MS),
-    });
-    assertExactResponseOrigin(response, EXPECTED_VAULT_ORIGIN);
-  } catch {
-    throw new Error("Vault request unavailable");
-  }
-  if (!response.ok) throw new Error("Vault request unavailable");
   let payload: unknown;
   try {
-    payload = await readBoundedResponseJson(response, VAULT_RESPONSE_MAX_BYTES);
+    payload = await runWithDeadline(VAULT_REQUEST_TIMEOUT_MS, async (signal) => {
+      const response = await fetch(vaultQueryUrl(), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(Buffer.byteLength(body, "utf8")),
+        },
+        body,
+        cache: "no-store",
+        redirect: "error",
+        signal,
+      });
+      assertExactResponseOrigin(response, EXPECTED_VAULT_ORIGIN);
+      if (!response.ok) throw new Error("Vault request unavailable");
+      return await readBoundedResponseJson(response, VAULT_RESPONSE_MAX_BYTES);
+    });
   } catch {
     throw new Error("Vault request unavailable");
   }

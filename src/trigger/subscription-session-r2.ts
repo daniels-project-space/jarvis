@@ -9,6 +9,7 @@ import {
   isJsonRecord,
   readBoundedResponseBytes,
   readBoundedResponseJson,
+  runWithDeadline,
 } from "../lib/bounded-json";
 import { vaultService } from "../lib/vault-client";
 import { requireVaultBrokerSubscriptionSource } from "./subscription-source";
@@ -42,6 +43,9 @@ const R2_SNAPSHOT_MAX_BYTES = 256 * 1_024;
 const CLOUDFLARE_BROKER_RESPONSE_MAX_BYTES = 64 * 1_024;
 const CLOUDFLARE_API_ORIGIN = "https://api.cloudflare.com";
 const ROTATION_PROTOCOL_MAX_LINE_BYTES = 64 * 1_024;
+const ROTATION_PROTOCOL_MAX_TOTAL_BYTES = 256 * 1_024;
+const ROTATION_PROTOCOL_MAX_MESSAGES = 32;
+const ROTATION_STDERR_MAX_TOTAL_BYTES = 64 * 1_024;
 
 type SessionSecrets = {
   R2_ACCOUNT_ID: string;
@@ -148,20 +152,21 @@ export class R2SessionStateStore implements SessionStateStore {
   }
 
   async readState(): Promise<VersionedSessionState> {
-    const response = await this.request(STATE_KEY, {
+    return await this.request(STATE_KEY, {
       headers: { "cache-control": "no-store" }, redirect: "error",
+    }, async (response) => {
+      if (response.status === 404) return { value: null, etag: null };
+      assertR2Response(response);
+      const etag = response.headers.get("etag");
+      if (!etag) throw new SubscriptionSessionError("snapshot_corrupt");
+      try {
+        const value = await readBoundedResponseJson(response, R2_STATE_MAX_BYTES) as SessionState;
+        validateSessionState(value);
+        return { value, etag };
+      } catch {
+        throw new SubscriptionSessionError("snapshot_corrupt");
+      }
     });
-    if (response.status === 404) return { value: null, etag: null };
-    assertR2Response(response);
-    const etag = response.headers.get("etag");
-    if (!etag) throw new SubscriptionSessionError("snapshot_corrupt");
-    try {
-      const value = await readBoundedResponseJson(response, R2_STATE_MAX_BYTES) as SessionState;
-      validateSessionState(value);
-      return { value, etag };
-    } catch {
-      throw new SubscriptionSessionError("snapshot_corrupt");
-    }
   }
 
   async compareExchangeState(
@@ -170,7 +175,8 @@ export class R2SessionStateStore implements SessionStateStore {
   ): Promise<{ ok: boolean; etag?: string }> {
     const body = Buffer.from(JSON.stringify(value), "utf8");
     if (body.byteLength > R2_STATE_MAX_BYTES) throw new SubscriptionSessionError("snapshot_corrupt");
-    const response = await this.request(STATE_KEY, {
+    validateSessionState(value);
+    return await this.request(STATE_KEY, {
       method: "PUT",
       headers: {
         "content-type": "application/json",
@@ -180,17 +186,18 @@ export class R2SessionStateStore implements SessionStateStore {
       },
       body: body as unknown as BodyInit,
       redirect: "error",
+    }, async (response) => {
+      if (response.status === 409 || response.status === 412) return { ok: false };
+      assertR2Response(response);
+      const etag = response.headers.get("etag");
+      if (!etag) throw new SubscriptionSessionError("snapshot_corrupt");
+      return { ok: true, etag };
     });
-    if (response.status === 409 || response.status === 412) return { ok: false };
-    assertR2Response(response);
-    const etag = response.headers.get("etag");
-    if (!etag) throw new SubscriptionSessionError("snapshot_corrupt");
-    return { ok: true, etag };
   }
 
   async putSnapshotIfAbsent(key: string, value: Uint8Array): Promise<boolean> {
     if (value.byteLength > R2_SNAPSHOT_MAX_BYTES) throw new SubscriptionSessionError("snapshot_corrupt");
-    const response = await this.request(key, {
+    return await this.request(key, {
       method: "PUT",
       headers: {
         "content-type": "application/octet-stream",
@@ -200,40 +207,47 @@ export class R2SessionStateStore implements SessionStateStore {
       },
       body: value as unknown as BodyInit,
       redirect: "error",
+    }, async (response) => {
+      if (response.status === 409 || response.status === 412) return false;
+      assertR2Response(response);
+      return true;
     });
-    if (response.status === 409 || response.status === 412) return false;
-    assertR2Response(response);
-    return true;
   }
 
   async getSnapshot(key: string): Promise<Uint8Array | null> {
-    const response = await this.request(key, {
+    return await this.request(key, {
       headers: { "cache-control": "no-store" },
       redirect: "error",
+    }, async (response) => {
+      if (response.status === 404) return null;
+      assertR2Response(response);
+      try {
+        return await readBoundedResponseBytes(response, R2_SNAPSHOT_MAX_BYTES);
+      } catch {
+        throw new SubscriptionSessionError("snapshot_corrupt");
+      }
     });
-    if (response.status === 404) return null;
-    assertR2Response(response);
-    try {
-      return await readBoundedResponseBytes(response, R2_SNAPSHOT_MAX_BYTES);
-    } catch {
-      throw new SubscriptionSessionError("snapshot_corrupt");
-    }
   }
 
-  private async request(key: string, init: RequestInit): Promise<Response> {
-    let response: Response;
+  private async request<T>(
+    key: string,
+    init: RequestInit,
+    consume: (response: Response) => Promise<T>,
+  ): Promise<T> {
     try {
-      response = await this.aws.fetch(this.url(key), {
-        ...init,
-        redirect: "error",
-        signal: AbortSignal.timeout(this.timeoutMs),
+      return await runWithDeadline(this.timeoutMs, async (signal) => {
+        const response = await this.aws.fetch(this.url(key), {
+          ...init,
+          redirect: "error",
+          signal,
+        });
+        assertExactResponseOrigin(response, this.origin);
+        return await consume(response);
       });
-      assertExactResponseOrigin(response, this.origin);
     } catch (error) {
       if (error instanceof R2SessionCredentialRejectedError || error instanceof SubscriptionSessionError) throw error;
       throw new SubscriptionSessionError("session_store_unavailable");
     }
-    return response;
   }
 }
 
@@ -271,6 +285,16 @@ type MillisecondClock = { now(): number };
 
 function validCredentialPart(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 16_384 && !/[\r\n\0]/.test(value);
+}
+
+function validCloudflareDiagnostics(value: unknown): boolean {
+  if (value === undefined) return true;
+  return Array.isArray(value) && value.length <= 16 && value.every((entry) =>
+    isJsonRecord(entry)
+    && hasExactKeys(entry, ["code", "message"])
+    && Number.isSafeInteger(entry.code)
+    && typeof entry.message === "string"
+    && entry.message.length <= 1_024);
 }
 
 /** Trusted-host Cloudflare broker. Its parent token never enters an AwsClient. */
@@ -317,10 +341,10 @@ export class CloudflareTemporaryR2CredentialBroker implements TemporaryR2Credent
       prefixes: ["managed-codex-session/"],
     });
     let response: Response;
+    let payload: unknown;
     try {
-      response = await this.fetcher(
-        url,
-        {
+      ({ response, payload } = await runWithDeadline(this.timeoutMs, async (signal) => {
+        const boundedResponse = await this.fetcher(url, {
           method: "POST",
           headers: {
             authorization: `Bearer ${this.config.parentApiToken}`,
@@ -330,21 +354,22 @@ export class CloudflareTemporaryR2CredentialBroker implements TemporaryR2Credent
           body,
           cache: "no-store",
           redirect: "error",
-          signal: AbortSignal.timeout(this.timeoutMs),
-        },
-      );
-      assertExactResponseOrigin(response, CLOUDFLARE_API_ORIGIN);
-    } catch {
-      throw new SubscriptionSessionError("credential_broker_unavailable");
-    }
-    let payload: unknown;
-    try {
-      payload = await readBoundedResponseJson(response, CLOUDFLARE_BROKER_RESPONSE_MAX_BYTES);
+          signal,
+        });
+        assertExactResponseOrigin(boundedResponse, CLOUDFLARE_API_ORIGIN);
+        const boundedPayload = await readBoundedResponseJson(
+          boundedResponse,
+          CLOUDFLARE_BROKER_RESPONSE_MAX_BYTES,
+        );
+        return { response: boundedResponse, payload: boundedPayload };
+      }));
     } catch {
       throw new SubscriptionSessionError("credential_broker_unavailable");
     }
     if (!response.ok || !isJsonRecord(payload)
       || !hasExactKeys(payload, ["success", "result"], ["errors", "messages"])
+      || !validCloudflareDiagnostics(payload.errors)
+      || !validCloudflareDiagnostics(payload.messages)
       || payload.success !== true || !isJsonRecord(payload.result)
       || !hasExactKeys(payload.result, ["accessKeyId", "secretAccessKey", "sessionToken"])
       || !validCredentialPart(payload.result.accessKeyId)
@@ -520,7 +545,8 @@ function validateInitializeResult(value: unknown, codexHome: string): void {
     || !hasExactKeys(value, ["codexHome", "platformFamily", "platformOs", "userAgent"])
     || typeof value.codexHome !== "string" || resolve(value.codexHome) !== resolve(codexHome)
     || value.platformFamily !== "unix" || value.platformOs !== "linux"
-    || typeof value.userAgent !== "string" || !value.userAgent || value.userAgent.length > 512) {
+    || typeof value.userAgent !== "string" || value.userAgent.length > 512
+    || !/0\.144\.5(?:\D|$)/.test(value.userAgent)) {
     throw new Error("invalid initialize result");
   }
 }
@@ -538,18 +564,37 @@ function validateAccountReadResult(value: unknown): void {
   }
 }
 
-function responseForId(value: unknown, id: number): { result?: unknown; error?: unknown } | null {
+function validRotationProtocolError(value: unknown): value is { code: number; message: string; data?: unknown } {
+  return isJsonRecord(value)
+    && hasExactKeys(value, ["code", "message"], ["data"])
+    && Number.isSafeInteger(value.code)
+    && typeof value.message === "string"
+    && value.message.length <= 1_024;
+}
+
+function responseForId(
+  value: unknown,
+  id: number,
+): { result?: unknown; error?: { code: number; message: string; data?: unknown } } | null {
   if (!isJsonRecord(value) || value.id !== id) return null;
   if (hasExactKeys(value, ["id", "result"])) return { result: value.result };
-  if (hasExactKeys(value, ["id", "error"])) return { error: value.error };
+  if (hasExactKeys(value, ["id", "error"]) && validRotationProtocolError(value.error)) {
+    return { error: value.error };
+  }
   throw new Error("invalid app-server response envelope");
 }
 
 function validIgnoredRotationNotification(value: unknown): boolean {
-  return isJsonRecord(value)
-    && hasExactKeys(value, ["method", "params"])
-    && typeof value.method === "string"
-    && isJsonRecord(value.params);
+  if (!isJsonRecord(value)
+    || !hasExactKeys(value, ["method", "params"])
+    || value.method !== "account/updated"
+    || !isJsonRecord(value.params)
+    || !hasExactKeys(value.params, [], ["authMode", "planType"])) return false;
+  const authMode = value.params.authMode;
+  const planType = value.params.planType;
+  return (authMode === undefined || authMode === null || authMode === "chatgpt")
+    && (planType === undefined || planType === null
+      || (typeof planType === "string" && CHATGPT_PLAN_TYPES.has(planType)));
 }
 
 function rotationEnv(
@@ -557,7 +602,7 @@ function rotationEnv(
   source: Readonly<Record<string, string | undefined>> = process.env,
 ): NodeJS.ProcessEnv {
   const allow = [
-    "PATH", "LANG", "LC_ALL", "NODE_EXTRA_CA_CERTS",
+    "PATH", "LANG", "LC_ALL", "NODE_EXTRA_CA_CERTS", "CODEX_CA_CERTIFICATE",
     "SSL_CERT_FILE", "SSL_CERT_DIR", "TERM", "CI", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "no_proxy",
   ];
@@ -566,6 +611,10 @@ function rotationEnv(
   env.PATH = source.PATH?.trim() || "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
   env.HOME = codexHome;
   env.CODEX_HOME = codexHome;
+  env.XDG_CONFIG_HOME = join(codexHome, "xdg-config");
+  env.XDG_CACHE_HOME = join(codexHome, "xdg-cache");
+  mkdirSync(env.XDG_CONFIG_HOME, { recursive: true, mode: 0o700 });
+  mkdirSync(env.XDG_CACHE_HOME, { recursive: true, mode: 0o700 });
   env.GIT_TERMINAL_PROMPT = "0";
   env.GH_PROMPT_DISABLED = "1";
   return env;
@@ -586,9 +635,9 @@ export async function rotateManagedSessionWithCodex(
     timeoutMs?: number;
     requiredUntil?: number;
     environment?: Readonly<Record<string, string | undefined>>;
-    markEffect?: () => Promise<void>;
-    clearUnwrittenEffect?: () => Promise<void>;
-  } = {},
+    markEffect: () => Promise<void>;
+    clearUnwrittenEffect: () => Promise<void>;
+  },
 ): Promise<ChatgptSubscriptionAuth> {
   const root = options.root ?? "/home/node/.jarvis-codex-session-controller";
   mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -597,6 +646,8 @@ export async function rotateManagedSessionWithCodex(
   writeFileSync(authPath, canonicalAuthJson(current), { mode: 0o600 });
   const spawnProcess = options.spawnProcess ?? ((command, args, spawnOptions) => spawn(command, args, spawnOptions));
   let refreshTokenReused = false;
+  let protocolRejected = false;
+  let effectMarked = false;
   let diagnosticTail = "";
   const observeDiagnostic = (value: unknown) => {
     const text = `${diagnosticTail}${String(value ?? "").slice(-512)}`;
@@ -616,6 +667,11 @@ export async function rotateManagedSessionWithCodex(
       let handling = Promise.resolve();
       let initialized = false;
       let accountRequested = false;
+      let accountCompleted = false;
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let messageCount = 0;
+      const seenNotifications = new Set<string>();
       const decoder = new BoundedJsonLineDecoder(ROTATION_PROTOCOL_MAX_LINE_BYTES);
       const finish = () => {
         if (settled) return;
@@ -647,26 +703,53 @@ export async function rotateManagedSessionWithCodex(
       timer = setTimeout(() => {
         stop("SIGKILL");
       }, Math.max(1, options.timeoutMs ?? ROTATION_TIMEOUT_MS));
-      child.stderr.on("data", observeDiagnostic);
-      child.stdin.on("error", () => stop("SIGKILL"));
+      child.stderr.on("data", (chunk) => {
+        stderrBytes += Buffer.byteLength(chunk);
+        observeDiagnostic(chunk);
+        if (stderrBytes > ROTATION_STDERR_MAX_TOTAL_BYTES) {
+          protocolRejected = true;
+          stop("SIGKILL");
+        }
+      });
+      child.stdin.on("error", () => {
+        if (!accountRequested) protocolRejected = true;
+        stop("SIGKILL");
+      });
       child.once("error", finishAfterHandling);
       child.once("close", finishAfterHandling);
       child.stdout.on("data", (chunk: Buffer) => {
+        stdoutBytes += chunk.byteLength;
+        if (stdoutBytes > ROTATION_PROTOCOL_MAX_TOTAL_BYTES) {
+          protocolRejected = true;
+          stop("SIGKILL");
+          return;
+        }
         let messages: unknown[];
         try { messages = decoder.push(chunk); }
-        catch { stop("SIGKILL"); return; }
+        catch {
+          protocolRejected = true;
+          stop("SIGKILL");
+          return;
+        }
         for (const message of messages) {
+          messageCount += 1;
+          if (messageCount > ROTATION_PROTOCOL_MAX_MESSAGES) {
+            protocolRejected = true;
+            stop("SIGKILL");
+            return;
+          }
           handling = handling.then(async () => {
             const initialize = responseForId(message, 1);
             if (initialize) {
               if (initialized || accountRequested || initialize.error !== undefined) {
-                if (initialize.error !== undefined) observeDiagnostic(JSON.stringify(initialize.error));
+                if (initialize.error !== undefined) observeDiagnostic(initialize.error.message);
                 throw new Error("initialize rejected");
               }
               validateInitializeResult(initialize.result, home);
               child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
               initialized = true;
-              await (options.markEffect?.() ?? Promise.resolve());
+              await options.markEffect();
+              effectMarked = true;
               try {
                 child.stdin.write(`${JSON.stringify({
                   id: 2,
@@ -675,29 +758,43 @@ export async function rotateManagedSessionWithCodex(
                 })}\n`);
                 accountRequested = true;
               } catch (error) {
-                await (options.clearUnwrittenEffect?.() ?? Promise.resolve());
+                await options.clearUnwrittenEffect();
+                effectMarked = false;
                 throw error;
               }
               return;
             }
             const account = responseForId(message, 2);
             if (account) {
-              if (!initialized || !accountRequested || account.error !== undefined) {
-                if (account.error !== undefined) observeDiagnostic(JSON.stringify(account.error));
+              if (!initialized || !accountRequested || accountCompleted || account.error !== undefined) {
+                if (account.error !== undefined) observeDiagnostic(account.error.message);
                 throw new Error("account/read rejected");
               }
               validateAccountReadResult(account.result);
+              accountCompleted = true;
               // account/read persists managed auth before replying. A lost
               // reply is recovered only by the exact auth-file transition.
               stop("SIGTERM");
               return;
             }
-            if (!validIgnoredRotationNotification(message)) throw new Error("invalid app-server message");
-          }).catch(() => stop("SIGKILL"));
+            if (!initialized || !accountRequested || accountCompleted
+              || !validIgnoredRotationNotification(message)) {
+              throw new Error("invalid app-server message");
+            }
+            const notification = (message as { method: string }).method;
+            if (seenNotifications.has(notification)) throw new Error("duplicate app-server notification");
+            seenNotifications.add(notification);
+          }).catch(() => {
+            protocolRejected = true;
+            stop("SIGKILL");
+          });
         }
       });
       child.stdout.once("end", () => {
-        try { decoder.finish(); } catch { stop("SIGKILL"); }
+        try { decoder.finish(); } catch {
+          protocolRejected = true;
+          stop("SIGKILL");
+        }
       });
       try {
         child.stdin.write(`${JSON.stringify({
@@ -709,6 +806,7 @@ export async function rotateManagedSessionWithCodex(
           },
         })}\n`);
       } catch {
+        protocolRejected = true;
         stop("SIGKILL");
       }
     });
@@ -720,9 +818,10 @@ export async function rotateManagedSessionWithCodex(
     } catch {
       throw new SubscriptionSessionError("rotation_failed");
     }
-    if (refreshTokenReused) {
+    if (refreshTokenReused && effectMarked) {
       throw new SubscriptionSessionError("refresh_token_reused");
     }
+    if (protocolRejected || !effectMarked) throw new SubscriptionSessionError("rotation_failed");
     const requiredUntil = options.requiredUntil
       ?? Math.max(Date.now() + 1, subscriptionAccessTokenExpiresAt(current) + 1);
     if (isUsableManagedSessionRotation(current, updated, requiredUntil)) return updated;

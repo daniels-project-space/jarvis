@@ -3,10 +3,9 @@ import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { sendPush } from "./push-send";
-import { INFRA_MAP } from "../lib/persona";
 import { projectProviderBoundary } from "../lib/project-registry";
 import { routeWork } from "../mastra/routing";
 import { TEAM_BY_SLUG, type AgentSlug } from "../mastra/team";
@@ -28,13 +27,11 @@ import {
   isolateSubscriptionEnv,
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
+  scopedSubscriptionEnv,
   verifyCodexSubscriptionPreflight,
   type AgentProvider,
 } from "./subscription-runtime";
-import {
-  DEFAULT_SUBSCRIPTION_VALIDITY_MS,
-  backgroundSubscriptionValidityMs,
-} from "./subscription-validity";
+import { backgroundSubscriptionValidityMs } from "./subscription-validity";
 import {
   GOAL_PLAN_RESULT_MAX_CHARS,
   parseGoalPlan,
@@ -103,7 +100,6 @@ import {
   type CloudProviderRuntimeAttestation,
 } from "./cloud-provider-probe-attestation";
 import { CloudWorkspaceError, DEFAULT_WORKSPACE_LIMITS, createDeterministicTar, sha256Bytes, type CloudWorkspace, type CloudWorkspaceProvider, type HistoricalCloudWorkspaceProviderName, type CredentiallessArchive } from "./cloud-workspace";
-import { environmentWithoutSubscriptionController } from "./subscription-source";
 
 // Slice D — dispatch. Claims background jobs, runs the routed subscription
 // agent against an isolated cloud workspace through controller-owned dynamic
@@ -682,12 +678,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     const provider: AgentProvider = "codex";
     const bin = resolveSubscriptionAgentBin(provider);
     if (!bin) return rejectReservation(`no ${provider} binary`);
-    const prepared = await prepareSubscriptionEnv(provider, {
-      scope: `agent-${options.reservation.workerRunId}`,
-      minimumValidityMs: DEFAULT_SUBSCRIPTION_VALIDITY_MS,
-    });
-    if (prepared.error) return rejectReservation(prepared.error);
-    const subscriptionEnvs = new Set<NodeJS.ProcessEnv>([prepared.env]);
+    // Do not acquire an access snapshot during dispatch, Git hydration, cloud
+    // workspace setup, or checkpoint I/O. Every actual Codex boundary below
+    // acquires its own exact window immediately before local preflight/spawn.
+    const subscriptionEnvs = new Set<NodeJS.ProcessEnv>();
     const trackSubscriptionEnv = <T extends NodeJS.ProcessEnv>(value: T): T => {
       subscriptionEnvs.add(value);
       return value;
@@ -718,35 +712,17 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       }
     };
     try {
-    const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
-    if (preflight.error) return rejectReservation(preflight.error);
-    const missingTools = missingSubscriptionTools(prepared.env);
+    const hostChildEnv = scopedSubscriptionEnv(process.env, provider);
+    const missingTools = missingSubscriptionTools(hostChildEnv);
     if (missingTools.length) {
       return rejectReservation(`Codex worker toolchain unavailable: missing ${missingTools.join(", ")} on PATH`);
     }
-    let env = prepared.env;
-    const hostChildEnv = environmentWithoutSubscriptionController(env);
+    let env = hostChildEnv;
     hostChildEnv.HOME = "/tmp/jarvis-controller-child-home";
     hostChildEnv.GIT_CONFIG_NOSYSTEM = "1";
     mkdirSync(hostChildEnv.HOME, { recursive: true, mode: 0o700 });
     mkdirSync("/tmp/work", { recursive: true });
     const token = process.env.GITHUB_TOKEN ?? "";
-
-    // Standing briefing every agent reads from the Codex home:
-    // Daniel's infra map + vault access + repo/deploy conventions = real project access.
-    const briefingPath = join(String(env.CODEX_HOME), "AGENTS.md");
-    writeFileSync(
-      briefingPath,
-      `# You are a scoped JARVIS permanent-team agent working for Daniel.\n\n${INFRA_MAP}\n\n` +
-        `## Capability boundary\n` +
-        `You run inside an isolated worktree with no general secrets-vault access. Use only the repository and explicitly attached MCP capabilities. Fully implement and verify scoped software work; the delivery controller merges verified branches automatically. Never seek credentials, publish publicly, message people, spend money, or perform destructive actions. If one is required, stop with the exact approval needed.\n\n` +
-        `## Conventions\n- The runner supplies the repository when one is in scope; do not clone or push another repository.\n` +
-        `- Toolchain: curl, git, node, npm, npx and gh were verified before this lease. Use them through Codex's shell tool. Live web search is enabled for current information.\n` +
-        `- The repository is already checked out for you. GitHub credentials remain with the delivery controller; use gh only for public/read-only inspection and report if a remote authenticated operation is required.\n` +
-        `- ${SHALLOW_PROVENANCE_RULE} Never replace, reparent, or rewrite a persisted shared branch because a depth-limited checkout hides its parents.\n` +
-        `- Never invent results. If something is inaccessible, say so plainly in your final answer.\n` +
-        `- Final answer style: plain text, the key outcome first, under 300 words.\n`,
-    );
 
     let processed = 0;
     const failureBackoffMs = (attempt: number) =>
@@ -1728,7 +1704,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }).catch(() => false);
           if (!preparedReceipt) throw new Error("Codex turn receipt could not be durably prepared");
           let writes = Promise.resolve();
-          const advance = (phase: "request_written" | "accepted" | "effect" | "rejected" | "completed") => {
+          const advance = (phase: "request_intent" | "accepted" | "effect" | "rejected" | "completed") => {
             writes = writes.then(async () => {
               const recorded = await convexMutation("jobs:recordCloudCodexTurnPhase", {
                 jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
@@ -1739,7 +1715,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             return writes;
           };
           return {
-            requestWritten: () => { void advance("request_written").catch(() => undefined); },
+            beforeRequest: () => advance("request_intent"),
+            requestWritten: () => undefined,
             accepted: () => advance("accepted"),
             effect: () => advance("effect"),
             rejected: () => advance("rejected"),
