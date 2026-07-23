@@ -113,6 +113,12 @@ function bridgeProductionRunnerToConvex(
       case "jobs:bindCloudWorkspace":
         value = await t.mutation(api.jobs.bindCloudWorkspace, body.args as any);
         break;
+      case "jobs:prepareCloudCodexTurn":
+        value = await t.mutation(api.jobs.prepareCloudCodexTurn, body.args as any);
+        break;
+      case "jobs:recordCloudCodexTurnPhase":
+        value = await t.mutation(api.jobs.recordCloudCodexTurnPhase, body.args as any);
+        break;
       case "jobs:recordCloudCheckpoint":
         value = await t.mutation(api.jobs.recordCloudCheckpoint, body.args as any);
         break;
@@ -274,7 +280,7 @@ function injectedRunnerDependencies(options: {
       options.boundaries?.push({ effect, authority });
     },
     resolveSubscriptionAgentBin: vi.fn(() => "/fake/subscription/codex"),
-    prepareSubscriptionEnv: vi.fn(() => ({
+    prepareSubscriptionEnv: vi.fn(async () => ({
       env: {
         PATH: process.env.PATH,
         CODEX_HOME: codexHome,
@@ -672,6 +678,7 @@ describe("production Trigger worker authority harness", () => {
       "codex_process",
       "checkpoint_persist",
       "review_receipt",
+      "subscription_acquire",
     ]);
     for (const { authority } of trace) {
       expect(authority).toMatchObject({

@@ -118,43 +118,88 @@ describe("mixed protocol full lifecycle", () => {
     expect(await t.mutation(api.jobs.claimDispatched, {
       jobId, dispatchId: "legacy-dispatch", workerRunId: "legacy-replay", workerToken: WORKER,
     })).toMatchObject({ executable: false, held: true, code: "protocol_v1_admission_held" });
-    const fence = { jobId, expectedAttempt: 1, authorityDigest: DIGEST, workerToken: WORKER };
+    // Every API that existed before protocol v2 must accept the old call
+    // shape during a Convex-first rollout, then fail closed in its handler.
+    // Only the new v2-only authorization boundary requires the digest at the
+    // validator.
+    const legacyFence = { jobId, expectedAttempt: 1, workerToken: WORKER };
+    const fence = { ...legacyFence, authorityDigest: DIGEST };
     expect(await t.mutation(api.jobs.authorizeExecutionBoundary, {
       ...fence, workerRunId: "legacy-worker", phase: "checkpoint",
     })).toBeNull();
     expect(await t.mutation(api.jobs.bindWorkspaceSource, {
-      ...fence, workerRunId: "legacy-worker", sourceBranch: "main", sourceHeadSha: HEAD,
+      ...legacyFence, workerRunId: "legacy-worker", sourceBranch: "main", sourceHeadSha: HEAD,
     })).toBe(false);
     expect(await t.mutation(api.jobs.checkpointAndRequeue, {
-      ...fence, checkpoint: "legacy checkpoint", result: "legacy result",
+      ...legacyFence, checkpoint: "legacy checkpoint", result: "legacy result",
     })).toMatchObject({ stale: true, requeued: false });
     expect(await t.mutation(api.jobs.markVerifiedForDelivery, {
-      ...fence, specialistRunId: "legacy-worker", result: "legacy result", verificationNote: "legacy evidence",
+      ...legacyFence, specialistRunId: "legacy-worker", result: "legacy result", verificationNote: "legacy evidence",
       resultDigest: sha256("legacy result"), evidenceDigest: sha256("legacy evidence"),
     })).toBe(false);
     expect(await t.mutation(api.jobs.linearizeDelivery, {
-      ...fence, sourceWorkAttempt: 1, deliveryGeneration: 1, deliveryRunId: "legacy-delivery",
+      ...legacyFence, sourceWorkAttempt: 1, deliveryGeneration: 1, deliveryRunId: "legacy-delivery",
       deliveryAttemptId: rows.deliveryId, deliveryLeaseOwner: "owner", deliveryLeaseToken: "token",
     })).toBeNull();
     expect(await t.mutation(api.jobs.prepareDeliveryEffect, {
-      ...fence, sourceWorkAttempt: 1, deliveryGeneration: 1, deliveryRunId: "legacy-delivery",
+      ...legacyFence, sourceWorkAttempt: 1, deliveryGeneration: 1, deliveryRunId: "legacy-delivery",
       deliveryAttemptId: rows.deliveryId, deliveryLeaseOwner: "owner", deliveryLeaseToken: "token",
       deliveryLeaseVersion: 1, effectId: "legacy-effect", effectKind: "create_pr",
       reviewedHeadSha: HEAD, reviewedBaseSha: HEAD,
     })).toBeNull();
     expect(await t.mutation(api.jobs.observeDeliveryEffect, {
-      ...fence, sourceWorkAttempt: 1, deliveryGeneration: 1, deliveryRunId: "legacy-delivery",
+      ...legacyFence, sourceWorkAttempt: 1, deliveryGeneration: 1, deliveryRunId: "legacy-delivery",
       deliveryAttemptId: rows.deliveryId, deliveryLeaseOwner: "owner", deliveryLeaseToken: "token",
       deliveryLeaseVersion: 1, effectId: "legacy-effect", observation: "not_applied",
     })).toBe(false);
+    expect(await t.mutation(api.jobs.touchDeliveryHeartbeat, {
+      ...legacyFence, sourceWorkAttempt: 1, deliveryGeneration: 1, deliveryRunId: "legacy-delivery",
+      deliveryAttemptId: rows.deliveryId,
+    })).toBe(false);
+    expect(await t.mutation(api.jobs.releaseIntegrationQueueWait, {
+      ...legacyFence, sourceWorkAttempt: 1, deliveryGeneration: 1, deliveryRunId: "legacy-delivery",
+      deliveryAttemptId: rows.deliveryId,
+    })).toBe(false);
+    expect(await t.mutation(api.jobs.setDelivery, {
+      ...legacyFence, sourceWorkAttempt: 1, deliveryGeneration: 1, deliveryRunId: "legacy-delivery",
+      deliveryAttemptId: rows.deliveryId, deliveryStatus: "blocked",
+    })).toBe(false);
+    expect(await t.mutation(api.jobs.bindCloudWorkspace, {
+      ...legacyFence, workerRunId: "legacy-worker", providerName: "e2b",
+      providerWorkspaceId: "legacy-workspace", providerSessionId: "legacy-session",
+      baseSha: HEAD, runtime: "legacy-runtime", lockfileDigest: DIGEST,
+      template: "legacy-template", sourceArchiveDigest: DIGEST, sourceArchiveBytes: 1,
+    })).toBe(false);
+    expect(await t.mutation(api.jobs.noteCloudWorkspaceBlock, {
+      ...legacyFence, code: "legacy_block", reason: "legacy worker has no v2 authority",
+    })).toBe(false);
+    expect(await t.mutation(api.jobs.prepareCloudCodexTurn, {
+      ...legacyFence, workerRunId: "legacy-worker",
+      providerWorkspaceId: "legacy-workspace", providerSessionId: "legacy-session",
+      receiptId: DIGEST, sequence: 1,
+    })).toBe(false);
+    expect(await t.mutation(api.jobs.recordCloudCodexTurnPhase, {
+      ...legacyFence, workerRunId: "legacy-worker", receiptId: DIGEST,
+      sequence: 1, phase: "request_written",
+    })).toBe(false);
+    expect(await t.mutation(api.jobs.recordCloudCheckpoint, {
+      ...legacyFence, providerWorkspaceId: "legacy-workspace", providerSessionId: "legacy-session",
+      checkpointRef: `sandbox-checkpoints/sha256/${DIGEST}`, checkpointDigest: DIGEST,
+      checkpointBytes: 1, checkpointManifestDigest: DIGEST, checkpointManifest: "{}",
+    })).toBe(false);
+    expect(await t.query(api.jobs.cloudCheckpointForReplay, {
+      ...legacyFence, workerRunId: "legacy-worker", providerName: "e2b",
+      baseSha: HEAD, runtime: "legacy-runtime", lockfileDigest: DIGEST,
+      template: "legacy-template", sourceArchiveDigest: DIGEST, sourceArchiveBytes: 1,
+    })).toMatchObject({ disposition: "reject", reason: "authority_mismatch" });
     expect(await t.mutation(api.jobs.finalize, {
-      ...fence, status: "done", result: "legacy result", verificationVerdict: "pass",
+      ...legacyFence, status: "done", result: "legacy result", verificationVerdict: "pass",
       verificationNote: "legacy evidence", resultDigest: sha256("legacy result"), evidenceDigest: sha256("legacy evidence"),
     })).toBe(false);
 
     const integrationFence = {
       id: rows.integrationId, controllerRunId: "legacy-delivery", leaseOwner: "owner",
-      leaseToken: "token", authorityDigest: DIGEST, workerToken: WORKER,
+      leaseToken: "token", workerToken: WORKER,
     };
     expect(await t.mutation(api.goalIntegration.claim, integrationFence)).toBeNull();
     expect(await t.mutation(api.goalIntegration.prepare, {

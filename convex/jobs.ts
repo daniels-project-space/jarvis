@@ -1373,7 +1373,7 @@ export const finalize = mutation({
   args: {
     jobId: v.id("jobs"),
     expectedAttempt: v.number(),
-    authorityDigest: v.string(),
+    authorityDigest: v.optional(v.string()),
     status: v.union(v.literal("done"), v.literal("error")),
     result: v.optional(v.string()),
     pullRequestUrl: v.optional(v.string()),
@@ -1943,7 +1943,7 @@ export const touchHeartbeat = mutation({
 // without reopening or consuming specialist work.
 export const touchDeliveryHeartbeat = mutation({
   args: {
-    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.string(), sourceWorkAttempt: v.number(),
+    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.optional(v.string()), sourceWorkAttempt: v.number(),
     deliveryGeneration: v.number(), deliveryRunId: v.string(), deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
     deliveryLeaseOwner: v.optional(v.string()), deliveryLeaseToken: v.optional(v.string()), deliveryLeaseVersion: v.optional(v.number()), workerToken: v.optional(v.string()),
   },
@@ -1978,7 +1978,7 @@ export const touchDeliveryHeartbeat = mutation({
 // attempt, delivery generation, provider budget or attention item.
 export const releaseIntegrationQueueWait = mutation({
   args: {
-    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.string(), sourceWorkAttempt: v.number(),
+    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.optional(v.string()), sourceWorkAttempt: v.number(),
     deliveryGeneration: v.number(), deliveryRunId: v.string(), deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
     deliveryLeaseOwner: v.optional(v.string()), deliveryLeaseToken: v.optional(v.string()), deliveryLeaseVersion: v.optional(v.number()),
     workerToken: v.optional(v.string()),
@@ -2010,7 +2010,7 @@ export const checkpointAndRequeue = mutation({
   args: {
     jobId: v.id("jobs"),
     expectedAttempt: v.number(),
-    authorityDigest: v.string(),
+    authorityDigest: v.optional(v.string()),
     checkpoint: v.string(),
     checkpointHeadSha: v.optional(v.string()),
     result: v.optional(v.string()),
@@ -2287,7 +2287,7 @@ export const authorizeExecutionBoundary = mutation({
 export const bindWorkspaceSource = mutation({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
-    authorityDigest: v.string(), sourceBranch: v.string(), sourceHeadSha: v.string(),
+    authorityDigest: v.optional(v.string()), sourceBranch: v.string(), sourceHeadSha: v.string(),
     checkoutHeadSha: v.optional(v.string()), workerToken: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
@@ -2315,7 +2315,7 @@ export const bindWorkspaceSource = mutation({
 export const bindCloudWorkspace = mutation({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
-    authorityDigest: v.string(),
+    authorityDigest: v.optional(v.string()),
     providerName: v.union(v.literal("e2b"), v.literal("sandbox0"), v.literal("vercel"), v.literal("cloudflare")),
     providerWorkspaceId: v.string(), providerSessionId: v.string(), workerToken: v.optional(v.string()),
     baseSha: v.string(), runtime: v.string(), lockfileDigest: v.string(), template: v.string(),
@@ -2370,7 +2370,7 @@ export const bindCloudWorkspace = mutation({
 
 export const noteCloudWorkspaceBlock = mutation({
   args: {
-    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.string(),
+    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.optional(v.string()),
     code: v.string(), reason: v.string(), workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
@@ -2484,7 +2484,7 @@ export const recordCloudCodexTurnPhase = mutation({
 export const recordCloudCheckpoint = mutation({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(),
-    authorityDigest: v.string(),
+    authorityDigest: v.optional(v.string()),
     providerWorkspaceId: v.string(), providerSessionId: v.string(),
     checkpointRef: v.string(), checkpointDigest: v.string(), checkpointBytes: v.number(),
     checkpointManifestDigest: v.string(), checkpointManifest: v.string(), workerToken: v.optional(v.string()),
@@ -2541,7 +2541,7 @@ export const recordCloudCheckpoint = mutation({
 export const cloudCheckpointForReplay = query({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
-    authorityDigest: v.string(),
+    authorityDigest: v.optional(v.string()),
     providerName: v.union(v.literal("e2b"), v.literal("sandbox0"), v.literal("vercel"), v.literal("cloudflare")),
     baseSha: v.string(), runtime: v.string(), lockfileDigest: v.string(), template: v.string(),
     sourceArchiveDigest: v.string(), sourceArchiveBytes: v.number(), workerToken: v.optional(v.string()),
@@ -2826,7 +2826,7 @@ export const provideInput = mutation({
 // cannot replace it with another PR/head/effect identity.
 export const prepareDeliveryEffect = mutation({
   args: {
-    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.string(), deliveryAttemptId: v.id("deliveryAttempts"),
+    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.optional(v.string()), deliveryAttemptId: v.id("deliveryAttempts"),
     sourceWorkAttempt: v.number(), deliveryGeneration: v.number(), deliveryRunId: v.string(),
     deliveryLeaseOwner: v.string(), deliveryLeaseToken: v.string(), deliveryLeaseVersion: v.number(),
     effectId: v.string(), effectKind: v.union(v.literal("create_draft_pr"), v.literal("create_pr"), v.literal("promote_pr"), v.literal("merge_pr")),
@@ -2877,7 +2877,7 @@ export const prepareDeliveryEffect = mutation({
 
 export const observeDeliveryEffect = mutation({
   args: {
-    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.string(), deliveryAttemptId: v.id("deliveryAttempts"),
+    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.optional(v.string()), deliveryAttemptId: v.id("deliveryAttempts"),
     sourceWorkAttempt: v.number(), deliveryGeneration: v.number(), deliveryRunId: v.string(),
     deliveryLeaseOwner: v.string(), deliveryLeaseToken: v.string(), deliveryLeaseVersion: v.number(),
     effectId: v.string(), observation: v.union(v.literal("applied"), v.literal("not_applied"), v.literal("unknown")),
@@ -2938,7 +2938,7 @@ export const setDelivery = mutation({
   args: {
     jobId: v.id("jobs"),
     expectedAttempt: v.number(),
-    authorityDigest: v.string(),
+    authorityDigest: v.optional(v.string()),
     branch: v.optional(v.string()),
     pullRequestUrl: v.optional(v.string()),
     deliveryStatus: v.optional(v.union(
@@ -3032,7 +3032,7 @@ export const setDelivery = mutation({
 // writer rechecks status/attempt and never resurrects the old lease.
 export const linearizeDelivery = mutation({
   args: {
-    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.string(), deliveryLeaseOwner: v.string(), deliveryLeaseToken: v.string(),
+    jobId: v.id("jobs"), expectedAttempt: v.number(), authorityDigest: v.optional(v.string()), deliveryLeaseOwner: v.string(), deliveryLeaseToken: v.string(),
     deliveryLeaseVersion: v.optional(v.number()), workerToken: v.optional(v.string()),
     sourceWorkAttempt: v.optional(v.number()), deliveryGeneration: v.optional(v.number()), deliveryRunId: v.optional(v.string()), deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
   },
@@ -3082,7 +3082,7 @@ export const markVerifiedForDelivery = mutation({
   args: {
     jobId: v.id("jobs"),
     expectedAttempt: v.number(),
-    authorityDigest: v.string(),
+    authorityDigest: v.optional(v.string()),
     result: v.string(),
     verificationNote: v.string(),
     reviewReceiptJson: v.optional(v.string()),

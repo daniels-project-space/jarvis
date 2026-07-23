@@ -628,7 +628,7 @@ export async function queueReviewedIntegration(ctx: any, job: any, review: any, 
 const fenceArgs = {
   id: v.id("integrationAttempts"),
   controllerRunId: v.string(), leaseOwner: v.string(), leaseToken: v.string(), leaseVersion: v.number(),
-  authorityDigest: v.string(),
+  authorityDigest: v.optional(v.string()),
   workerToken: v.optional(v.string()),
 };
 
@@ -637,7 +637,7 @@ const fenceArgs = {
 export const claim = mutation({
   args: {
     id: v.id("integrationAttempts"), controllerRunId: v.string(), leaseOwner: v.string(), leaseToken: v.string(),
-    authorityDigest: v.string(),
+    authorityDigest: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, args) => {

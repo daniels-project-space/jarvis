@@ -979,7 +979,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     mkdirSync("/tmp/work", { recursive: true });
     const token = process.env.GITHUB_TOKEN ?? "";
 
-    let processed = 0;
     const failureBackoffMs = (attempt: number) =>
       Math.min(6 * 60 * 60 * 1000, 60_000 * 2 ** Math.max(0, Math.min(12, attempt - 1)));
 
@@ -2156,7 +2155,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           await sh("git", ["-C", controllerCheckoutPath, "config", "user.email", "jarvis@daniels-project-space.dev"], hostChildEnv);
           await sh("git", ["-C", controllerCheckoutPath, "config", "user.name", `${profile.name} via JARVIS`], hostChildEnv);
           repoDir = controllerCheckoutPath;
-          cwd = controllerCheckoutPath;
           await applyValidatedPatchToControllerCheckout(repoDir, baseSha, patch, hostChildEnv);
         }
         result = `${result}\n\nCloud boundary: ${cloudProvider.name} workspace ${providerWorkspace.providerWorkspaceId}; R2 checkpoint ${portable.digest} (${portable.byteCount} bytes).`;
