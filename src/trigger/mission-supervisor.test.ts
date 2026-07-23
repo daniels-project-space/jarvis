@@ -14,14 +14,17 @@ vi.mock("server-only", () => ({}));
 
 import {
   MISSION_SUPERVISOR_ACTIVE_WAIT_MS,
+  MISSION_SUPERVISOR_CONCURRENCY_LIMIT,
   MISSION_SUPERVISOR_MAX_DUE,
   MISSION_SUPERVISOR_POLICY_MODEL_ID,
+  MISSION_SUPERVISOR_QUEUE,
   MISSION_SUPERVISOR_RECEIPT_WAIT_MS,
   canonicalSupervisorDigest,
   createSupervisorConvexClient,
   missionSupervisorDispatchIdentity,
   missionSupervisorLeaseOwner,
   parseMissionSupervisorTickPayload,
+  runJarvisRecovery,
   runJarvisReceiptSynthesis,
   runMissionSupervisorSweep,
   runMissionSupervisorTick,
@@ -38,6 +41,8 @@ const SHA_A = "a".repeat(64);
 const SHA_B = "b".repeat(64);
 const SHA_C = "c".repeat(64);
 const SOURCE_SHA = "d".repeat(64);
+const SHA_E = "e".repeat(64);
+const SHA_F = "f".repeat(64);
 
 const usage: LanguageModelV2Usage = {
   inputTokens: 1,
@@ -102,12 +107,26 @@ function job(
     receipt: null | {
       jobId: string;
       attempt: number;
+      protocolVersion: 2 | null;
+      receiptDigest: string | null;
+      terminalCode: string | null;
+      recoveryDisposition:
+        | "none"
+        | "retryable"
+        | "remediable"
+        | "needs_input"
+        | "operator_stop"
+        | null;
+      observedInputRevision: number | null;
       status: string;
       verification: string;
       authorityDigest: string | null;
       schedulingBindingDigest: string | null;
+      workOrderRevisionId: string | null;
       workOrderRevision: number | null;
       workOrderRevisionDigest: string | null;
+      canonicalProjectId: string | null;
+      repository: string | null;
       resultDigest: string | null;
       evidenceDigest: string | null;
       acceptanceEvidence: string[];
@@ -133,12 +152,20 @@ function job(
       ? {
           jobId,
           attempt: 1,
+          protocolVersion: 2 as const,
+          receiptDigest: SHA_E,
+          terminalCode: "verified_success",
+          recoveryDisposition: "none" as const,
+          observedInputRevision: 1,
           status: "succeeded",
           verification: "pass",
           authorityDigest,
           schedulingBindingDigest,
+          workOrderRevisionId: "work-order-revision-1",
           workOrderRevision: 1,
           workOrderRevisionDigest,
+          canonicalProjectId: "evidence",
+          repository: null,
           resultDigest,
           evidenceDigest,
           acceptanceEvidence: ["Focused tests passed."],
@@ -199,7 +226,212 @@ function job(
   };
 }
 
-function snapshot(jobs: SnapshotJob[] = []) {
+function recoveryJob(options: {
+  jobId?: string;
+  status?: "error" | "needs_input" | "cancelled";
+  recoveryDisposition:
+    | "retryable"
+    | "remediable"
+    | "needs_input"
+    | "operator_stop";
+  terminalCode?: string;
+  observedInputRevision?: number;
+}): SnapshotJob {
+  const jobId = options.jobId ?? "job-recovery-1";
+  const status = options.status ?? "error";
+  const result = status === "needs_input"
+    ? "Which exact boundary should the recovery use?"
+    : "The bounded workstream reached a terminal failure.";
+  const verificationNote = "Exact terminal failure evidence.";
+  const authorityDigest = sha(`authority:${jobId}`);
+  const schedulingBindingDigest = sha(`scheduling:${jobId}`);
+  const workOrderRevisionDigest = sha(`work-order:${jobId}`);
+  const resultDigest = sha(result);
+  const evidenceDigest = sha(verificationNote);
+  const receiptDigest = sha(`receipt:${jobId}:${status}`);
+  return {
+    ...job({ jobId, status, receipt: null }),
+    authorityDigest,
+    schedulingBindingDigest,
+    workOrderRevision: 1,
+    workOrderRevisionDigest,
+    result,
+    resultDigest,
+    verificationNote,
+    evidenceDigest,
+    completedAt: status === "needs_input" ? null : 1_700_000_050_000,
+    receipt: {
+      jobId,
+      attempt: 1,
+      protocolVersion: 2,
+      receiptDigest,
+      terminalCode: options.terminalCode
+        ?? (status === "needs_input"
+          ? "agent_input_required"
+          : status === "cancelled"
+            ? "operator_cancelled"
+            : "transient_provider_error"),
+      recoveryDisposition: options.recoveryDisposition,
+      observedInputRevision: options.observedInputRevision ?? 1,
+      status: status === "error"
+        ? "failed"
+        : status,
+      verification: status === "needs_input" ? "needs_input" : "unavailable",
+      authorityDigest,
+      schedulingBindingDigest,
+      workOrderRevisionId: `work-order-revision-${jobId}`,
+      workOrderRevision: 1,
+      workOrderRevisionDigest,
+      canonicalProjectId: "evidence",
+      repository: null,
+      resultDigest,
+      evidenceDigest,
+      acceptanceEvidence: [],
+      artifacts: [`convex://jobs/${jobId}/attempt/1/terminal`],
+      reviewReceiptDigest: null,
+    },
+  };
+}
+
+function admittedSuccessor(
+  options: {
+    jobId?: string;
+    status?: "running" | "done";
+    decisionKey?: string;
+    ordinal?: number;
+  } = {},
+): SnapshotJob {
+  const jobId = options.jobId ?? "job-successor-1";
+  const status = options.status ?? "running";
+  const decisionKey = options.decisionKey ?? SHA_F;
+  const schedulingBindingDigest = sha(`successor-scheduling:${jobId}`);
+  const workOrderRevisionDigest = sha(`successor-work-order:${jobId}`);
+  const base = job({ jobId, status });
+  const completed = status === "done"
+    ? {
+        ...base,
+        receipt: {
+          ...base.receipt!,
+          receiptDigest: sha(`successor-receipt:${jobId}`),
+          schedulingBindingDigest,
+          workOrderRevisionId: `successor-work-order-revision-${jobId}`,
+          workOrderRevisionDigest,
+        },
+      }
+    : base;
+  return {
+    ...completed,
+    supervisorDecisionKey: decisionKey,
+    supervisorJobOrdinal: options.ordinal ?? 0,
+    schedulingBindingDigest,
+    workOrderRevision: 1,
+    workOrderRevisionDigest,
+    sourceAdmissionDigest: SOURCE_SHA,
+  };
+}
+
+function supersession(
+  predecessor: SnapshotJob,
+  successor: SnapshotJob,
+  options: {
+    mode?: "retry" | "remediate" | "input_revision";
+    generation?: number;
+    autonomousRecoveryCount?: number;
+    rootJobId?: string;
+    observedInputRevision?: number;
+  } = {},
+) {
+  if (!predecessor.receipt?.receiptDigest) {
+    throw new Error("Supersession predecessor receipt is missing");
+  }
+  if (
+    !successor.schedulingBindingDigest ||
+    !successor.workOrderRevisionDigest
+  ) {
+    throw new Error("Supersession successor authority is missing");
+  }
+  const mode = options.mode ?? "retry";
+  return {
+    supersessionId: `supersession-${predecessor.jobId}-${successor.jobId}`,
+    supersessionKey: sha(`supersession-key:${predecessor.jobId}`),
+    supersessionDigest: sha(`supersession-digest:${predecessor.jobId}`),
+    decisionKey: successor.supervisorDecisionKey!,
+    decisionOrdinal: successor.supervisorJobOrdinal!,
+    mode,
+    rootJobId: options.rootJobId ?? predecessor.jobId,
+    generation: options.generation ?? 1,
+    autonomousRecoveryCount: options.autonomousRecoveryCount
+      ?? (mode === "input_revision" ? 0 : 1),
+    predecessorJobId: predecessor.jobId,
+    predecessorAttempt: predecessor.attempt,
+    predecessorReceiptDigest: predecessor.receipt.receiptDigest,
+    successorJobId: successor.jobId,
+    successorSchedulingBindingDigest: successor.schedulingBindingDigest,
+    successorWorkOrderRevisionId:
+      successor.receipt?.workOrderRevisionId
+      ?? `successor-work-order-revision-${successor.jobId}`,
+    successorWorkOrderRevisionDigest: successor.workOrderRevisionDigest,
+    successorCanonicalProjectId:
+      successor.receipt?.canonicalProjectId ?? "evidence",
+    successorRepository: successor.repo,
+    successorSourceAdmissionDigest: successor.sourceAdmissionDigest!,
+    observedInputRevision: options.observedInputRevision ?? 1,
+    inputControlReceiptId: mode === "input_revision" ? "control-receipt-1" : null,
+    inputControlRequestDigest: mode === "input_revision" ? SHA_A : null,
+    inputControlDigest: mode === "input_revision" ? SHA_B : null,
+  };
+}
+
+function snapshot(
+  jobs: SnapshotJob[] = [],
+  supersessions: Array<{
+    supersessionId: string;
+    supersessionKey: string;
+    supersessionDigest: string;
+    decisionKey: string;
+    decisionOrdinal: number;
+    mode: "retry" | "remediate" | "input_revision";
+    rootJobId: string;
+    generation: number;
+    autonomousRecoveryCount: number;
+    predecessorJobId: string;
+    predecessorAttempt: number;
+    predecessorReceiptDigest: string;
+    successorJobId: string;
+    successorSchedulingBindingDigest: string;
+    successorWorkOrderRevisionId: string;
+    successorWorkOrderRevisionDigest: string;
+    successorCanonicalProjectId: string;
+    successorRepository: string | null;
+    successorSourceAdmissionDigest: string;
+    observedInputRevision: number;
+    inputControlReceiptId: string | null;
+    inputControlRequestDigest: string | null;
+    inputControlDigest: string | null;
+  }> = [],
+  pendingInputAuthority: null | {
+    requestDecisionKey: string;
+    requestObservedInputRevision: number;
+    predecessorJobId: string;
+    predecessorAttempt: number;
+    predecessorReceiptId: string;
+    predecessorReceiptDigest: string;
+    terminalCode: string | null;
+    recoveryDisposition:
+      | "retryable"
+      | "remediable"
+      | "needs_input"
+      | "operator_stop"
+      | null;
+    controlReceiptId: string | null;
+    controlRequestDigest: string | null;
+    controlInputDigest: string | null;
+    controlExpectedInputRevision: number | null;
+    controlResultInputRevision: number | null;
+    steerDigest: string | null;
+    steerDigestMatchesControl: boolean;
+  } = null,
+) {
   const goal = "Build a durable and evidence-bound mission supervisor.";
   const request = requestPayload(goal);
   const requestPayloadJson = JSON.stringify(request);
@@ -219,8 +451,8 @@ function snapshot(jobs: SnapshotJob[] = []) {
       ),
       projectAdmissions: request.projectAdmissions,
       controlRequested: null,
-      steer: null,
-      steerDigest: null,
+      steer: null as string | null,
+      steerDigest: null as string | null,
       steerRevision: 0,
       failureReason: null,
       failureReasonDigest: null,
@@ -238,11 +470,61 @@ function snapshot(jobs: SnapshotJob[] = []) {
       decisionCount: 0,
       maxDecisions: 64,
       deadlineAt: 1_800_000_000_000,
-      lastDecisionKey: null,
-      lastDecisionDigest: null,
+      lastDecisionKey: null as string | null,
+      lastDecisionDigest: null as string | null,
     },
     jobs,
+    pendingInputAuthority,
+    supersessions,
   };
+}
+
+function bindPendingInput(
+  authoritative: Snapshot,
+  target: SnapshotJob,
+  input: string,
+  overrides: Partial<NonNullable<Snapshot["pendingInputAuthority"]>> = {},
+): Snapshot {
+  if (!target.receipt?.receiptDigest || !target.receipt.terminalCode) {
+    throw new Error("Pending input target lacks an exact receipt");
+  }
+  if (
+    !["retryable", "remediable", "needs_input", "operator_stop"].includes(
+      target.receipt.recoveryDisposition ?? "",
+    )
+  ) {
+    throw new Error("Pending input target has no recoverable disposition");
+  }
+  const inputDigest = sha(input);
+  authoritative.mission.steer = input;
+  authoritative.mission.steerDigest = inputDigest;
+  authoritative.mission.steerRevision = 1;
+  authoritative.supervisor.handledInputRevision = 1;
+  authoritative.supervisor.inputRevision = 2;
+  authoritative.supervisor.lastDecisionKey = SHA_F;
+  authoritative.pendingInputAuthority = {
+    requestDecisionKey: SHA_F,
+    requestObservedInputRevision: 1,
+    predecessorJobId: target.jobId,
+    predecessorAttempt: target.attempt,
+    predecessorReceiptId: `receipt-row-${target.jobId}`,
+    predecessorReceiptDigest: target.receipt.receiptDigest,
+    terminalCode: target.receipt.terminalCode,
+    recoveryDisposition: target.receipt.recoveryDisposition as
+      | "retryable"
+      | "remediable"
+      | "needs_input"
+      | "operator_stop",
+    controlReceiptId: `control-row-${target.jobId}`,
+    controlRequestDigest: sha(`control-request:${target.jobId}`),
+    controlInputDigest: inputDigest,
+    controlExpectedInputRevision: 1,
+    controlResultInputRevision: 2,
+    steerDigest: inputDigest,
+    steerDigestMatchesControl: true,
+    ...overrides,
+  };
+  return authoritative;
 }
 
 function tickPayload(
@@ -289,8 +571,11 @@ function commitResult(kind: string) {
     decisionId: `decision-${kind}`,
     decisionKey: SHA_C,
     kind,
-    resultState: kind === "synthesize" ? "terminal" : "waiting",
-    createdJobIds: kind === "delegate" ? ["job-created-1"] : [],
+    resultState: ["synthesize", "fail"].includes(kind) ? "terminal" : "waiting",
+    createdJobIds: ["delegate", "recover"].includes(kind)
+      ? ["job-created-1"]
+      : [],
+    supersessionIds: kind === "recover" ? ["supersession-created-1"] : [],
     chatMessageIds: [],
   };
 }
@@ -303,6 +588,7 @@ function harness(
     commit?: (args: Readonly<Record<string, unknown>>) => unknown | Promise<unknown>;
     release?: (args: Readonly<Record<string, unknown>>) => unknown | Promise<unknown>;
     planning?: MissionSupervisorTickDependencies["runPlanningNetwork"];
+    recovery?: MissionSupervisorTickDependencies["runRecovery"];
     synthesis?: MissionSupervisorTickDependencies["runSynthesis"];
     createModel?: MissionSupervisorTickDependencies["createLanguageModel"];
     schedule?: MissionSupervisorTickDependencies["scheduleHeartbeat"];
@@ -319,9 +605,10 @@ function harness(
         return options.claim ?? {
           claimed: true,
           missionId: MISSION_ID,
-          epoch: 1,
-          nextDecisionSequence: 1,
-          inputRevision: 1,
+          epoch: authoritative.supervisor.epoch,
+          nextDecisionSequence:
+            authoritative.supervisor.nextDecisionSequence,
+          inputRevision: authoritative.supervisor.inputRevision,
           leaseVersion: 1,
           leaseUntil: 1_800_000_000_000,
           snapshot: authoritative,
@@ -334,7 +621,7 @@ function harness(
           renewed: true,
           leaseVersion: 1,
           leaseUntil: 1_800_000_000_000,
-          inputRevision: 1,
+          inputRevision: authoritative.supervisor.inputRevision,
         };
       }
       if (path === "missionSupervisor:commitV1") {
@@ -378,6 +665,9 @@ function harness(
       terminalReason: "desired_proposals_reached",
       networkStatus: "success",
     })),
+    runRecovery: options.recovery ?? (async () => {
+      throw new Error("Unexpected recovery model invocation");
+    }),
     runSynthesis: options.synthesis ?? (async () => ({
       summary: "Every delegated workstream completed with exact verified evidence.",
       evidence: ["Focused tests passed."],
@@ -1109,11 +1399,306 @@ describe("mission supervisor Trigger tick", () => {
       });
   });
 
-  it("turns a terminal error into a deterministic request for Daniel instead of retrying or synthesizing", async () => {
-    const synthesis = vi.fn();
-    const runtime = harness(snapshot([job({ status: "error" })]), {
-      synthesis,
+  it("retries an exact retryable terminal leaf with canonical policy metadata and no model", async () => {
+    const failed = recoveryJob({
+      recoveryDisposition: "retryable",
+      terminalCode: "transient_provider_error",
     });
+    const recovery = vi.fn();
+    const synthesis = vi.fn();
+    const createModel = vi.fn(() => fakeModel("unexpected"));
+    const runtime = harness(snapshot([failed]), {
+      recovery,
+      synthesis,
+      createModel,
+    });
+
+    await expect(runMissionSupervisorTick(
+      tickPayload(),
+      runContext(),
+      runtime.dependencies,
+    )).resolves.toMatchObject({
+      status: "committed",
+      kind: "recover",
+      createdJobIds: ["job-created-1"],
+    });
+    expect(createModel).not.toHaveBeenCalled();
+    expect(recovery).not.toHaveBeenCalled();
+    expect(synthesis).not.toHaveBeenCalled();
+    expect(callFor(runtime.calls, "missionSupervisor:commitV1").args)
+      .toMatchObject({
+        decision: {
+          kind: "recover",
+          recoveries: [{
+            mode: "retry",
+            predecessorJobId: failed.jobId,
+            predecessorReceiptDigest: failed.receipt?.receiptDigest,
+          }],
+        },
+        decisionOrigin: "policy",
+        modelProvider: "deterministic-policy",
+        modelTier: "luna",
+        modelId: MISSION_SUPERVISOR_POLICY_MODEL_ID,
+        reasoningEffort: "none",
+      });
+  });
+
+  it("batches at most four deterministic retries and never mixes model recovery", async () => {
+    const failed = Array.from({ length: 5 }, (_, index) =>
+      recoveryJob({
+        jobId: `job-retry-batch-${index}`,
+        recoveryDisposition: "retryable",
+        terminalCode: "transient_network_error",
+      })
+    );
+    const recovery = vi.fn();
+    const runtime = harness(snapshot(failed), { recovery });
+
+    await expect(runMissionSupervisorTick(
+      tickPayload(),
+      runContext(),
+      runtime.dependencies,
+    )).resolves.toMatchObject({ status: "committed", kind: "recover" });
+    expect(recovery).not.toHaveBeenCalled();
+    const commit = callFor(
+      runtime.calls,
+      "missionSupervisor:commitV1",
+    ).args;
+    expect(commit).toMatchObject({
+      decisionOrigin: "policy",
+      modelProvider: "deterministic-policy",
+      decision: { kind: "recover" },
+    });
+    const decision = commit.decision as {
+      recoveries: Array<{ mode: string; predecessorJobId: string }>;
+    };
+    expect(decision.recoveries).toHaveLength(4);
+    expect(decision.recoveries.every((item) => item.mode === "retry")).toBe(true);
+    expect(decision.recoveries.map((item) => item.predecessorJobId)).toEqual(
+      failed.slice(0, 4).map((item) => item.jobId),
+    );
+  });
+
+  it("uses one fresh Codex subscription model to remediate exact leaves without weakening authority", async () => {
+    const failed = recoveryJob({
+      recoveryDisposition: "remediable",
+      terminalCode: "verification_exhausted",
+    });
+    const created: LanguageModelV2[] = [];
+    const recovery = vi.fn(async (
+      input: Parameters<MissionSupervisorTickDependencies["runRecovery"]>[0],
+      options: Parameters<MissionSupervisorTickDependencies["runRecovery"]>[1],
+    ) => {
+      expect(input.candidates).toHaveLength(1);
+      expect(input.candidates[0]).toMatchObject({
+        mode: "remediate",
+        jobId: failed.jobId,
+        terminalCode: "verification_exhausted",
+        recoveryDisposition: "remediable",
+        model: "sol",
+        agentId: "paul",
+        risk: "low",
+        targetedInput: null,
+      });
+      expect(options.model.modelId).toBe("sol-recovery-0");
+      expect(options.abortSignal.aborted).toBe(false);
+      return {
+        revisions: [{
+          candidateId: input.candidates[0].candidateId,
+          mode: "remediate" as const,
+          task:
+            "Rework the bounded implementation around the failed verification boundary.",
+          label: "Repair verification boundary",
+          model: "sol" as const,
+          agentId: "paul" as const,
+          risk: "low" as const,
+          acceptanceCriteria: failed.acceptanceCriteria,
+        }],
+        rationale:
+          "The revised task directly repairs the exact failed verification boundary.",
+      };
+    });
+    const runtime = harness(snapshot([failed]), {
+      createModel: (tier) => {
+        const model = fakeModel(`${tier}-recovery-${created.length}`);
+        created.push(model);
+        return model;
+      },
+      recovery,
+    });
+
+    await expect(runMissionSupervisorTick(
+      tickPayload(),
+      runContext(),
+      runtime.dependencies,
+    )).resolves.toMatchObject({
+      status: "committed",
+      kind: "recover",
+    });
+    expect(created).toHaveLength(1);
+    expect(recovery).toHaveBeenCalledOnce();
+    expect(callFor(runtime.calls, "missionSupervisor:commitV1").args)
+      .toMatchObject({
+        decision: {
+          kind: "recover",
+          recoveries: [{
+            mode: "remediate",
+            predecessorJobId: failed.jobId,
+            predecessorReceiptDigest: failed.receipt?.receiptDigest,
+            task:
+              "Rework the bounded implementation around the failed verification boundary.",
+            model: "sol",
+            agentId: "paul",
+            risk: "low",
+            acceptanceCriteria: failed.acceptanceCriteria,
+          }],
+        },
+        decisionOrigin: "model",
+        modelProvider: "codex-subscription",
+        modelTier: "sol",
+        modelId: "gpt-5.6-sol",
+        reasoningEffort: "max",
+        supervisorPromptVersion: "jarvis-mission-recovery-v1",
+      });
+  });
+
+  it("rejects a model-authored remediation downgrade before commit", async () => {
+    const failed = recoveryJob({
+      recoveryDisposition: "remediable",
+      terminalCode: "verification_exhausted",
+    });
+    const runtime = harness(snapshot([failed]), {
+      recovery: async (input) => ({
+        revisions: [{
+          candidateId: input.candidates[0].candidateId,
+          mode: "remediate",
+          task: "Attempt a weaker recovery path for the failed boundary.",
+          label: "Weaker recovery",
+          model: "luna",
+          agentId: "paul",
+          risk: "low",
+          acceptanceCriteria: failed.acceptanceCriteria,
+        }],
+        rationale:
+          "This deliberately weak fixture must be rejected before durable commit.",
+      }),
+    });
+
+    await expect(runMissionSupervisorTick(
+      tickPayload(),
+      runContext(),
+      runtime.dependencies,
+    )).resolves.toMatchObject({
+      status: "released",
+      errorCode: "recovery_authority_downgrade",
+    });
+    expect(runtime.calls.some(
+      (call) => call.path === "missionSupervisor:commitV1",
+    )).toBe(false);
+  });
+
+  it("validates supersession lineage first and waits on only the active leaf", async () => {
+    const predecessor = recoveryJob({
+      jobId: "job-predecessor-active",
+      recoveryDisposition: "retryable",
+    });
+    const successor = admittedSuccessor({
+      jobId: "job-active-leaf",
+      status: "running",
+    });
+    const edge = supersession(predecessor, successor);
+    const recovery = vi.fn();
+    const runtime = harness(snapshot(
+      [predecessor, successor],
+      [edge],
+    ), { recovery });
+
+    await expect(runMissionSupervisorTick(
+      tickPayload(),
+      runContext(),
+      runtime.dependencies,
+    )).resolves.toMatchObject({ status: "committed", kind: "wait" });
+    expect(recovery).not.toHaveBeenCalled();
+    expect(callFor(runtime.calls, "missionSupervisor:commitV1").args)
+      .toMatchObject({
+        decision: {
+          kind: "wait",
+          delayMs: MISSION_SUPERVISOR_ACTIVE_WAIT_MS,
+        },
+      });
+  });
+
+  it("fails a forked recovery lineage closed before policy or model decisions", async () => {
+    const predecessor = recoveryJob({
+      jobId: "job-fork-root",
+      recoveryDisposition: "retryable",
+    });
+    const first = admittedSuccessor({ jobId: "job-fork-a" });
+    const second = admittedSuccessor({
+      jobId: "job-fork-b",
+      decisionKey: sha("fork-b-decision"),
+    });
+    const recovery = vi.fn();
+    const runtime = harness(snapshot(
+      [predecessor, first, second],
+      [
+        supersession(predecessor, first),
+        {
+          ...supersession(predecessor, second),
+          supersessionId: "supersession-fork-second",
+          supersessionKey: sha("supersession-fork-second"),
+          supersessionDigest: sha("supersession-fork-second-digest"),
+        },
+      ],
+    ), { recovery });
+
+    await expect(runMissionSupervisorTick(
+      tickPayload(),
+      runContext(),
+      runtime.dependencies,
+    )).resolves.toMatchObject({
+      status: "released",
+      errorCode: "invalid_recovery_lineage",
+    });
+    expect(recovery).not.toHaveBeenCalled();
+    expect(runtime.calls.some(
+      (call) => call.path === "missionSupervisor:commitV1",
+    )).toBe(false);
+  });
+
+  it("requests exact targeted input at the autonomous cap instead of reviving a terminal leaf", async () => {
+    const root = recoveryJob({
+      jobId: "job-cap-root",
+      recoveryDisposition: "retryable",
+    });
+    const middle = {
+      ...recoveryJob({
+        jobId: "job-cap-middle",
+        recoveryDisposition: "retryable",
+      }),
+      supervisorDecisionKey: SHA_F,
+      supervisorJobOrdinal: 0,
+    };
+    const leafDecisionKey = sha("job-cap-leaf-decision");
+    const leaf = {
+      ...recoveryJob({
+        jobId: "job-cap-leaf",
+        recoveryDisposition: "retryable",
+      }),
+      supervisorDecisionKey: leafDecisionKey,
+      supervisorJobOrdinal: 0,
+    };
+    const first = supersession(root, middle);
+    const second = supersession(middle, leaf, {
+      rootJobId: root.jobId,
+      generation: 2,
+      autonomousRecoveryCount: 2,
+    });
+    const recovery = vi.fn();
+    const runtime = harness(snapshot(
+      [root, middle, leaf],
+      [first, second],
+    ), { recovery });
 
     await expect(runMissionSupervisorTick(
       tickPayload(),
@@ -1123,16 +1708,233 @@ describe("mission supervisor Trigger tick", () => {
       status: "committed",
       kind: "request_input",
     });
-    expect(synthesis).not.toHaveBeenCalled();
+    expect(recovery).not.toHaveBeenCalled();
     expect(callFor(runtime.calls, "missionSupervisor:commitV1").args)
       .toMatchObject({
         decision: {
           kind: "request_input",
-          reason: expect.stringContaining("is error"),
+          question: expect.stringContaining("autonomous recovery cap"),
+          target: {
+            predecessorJobId: leaf.jobId,
+            predecessorReceiptDigest: leaf.receipt?.receiptDigest,
+          },
         },
         decisionOrigin: "policy",
-        modelProvider: "deterministic-policy",
-        reasoningEffort: "none",
+      });
+  });
+
+  it("requests answerable input against the exact needs-input receipt", async () => {
+    const blocked = recoveryJob({
+      jobId: "job-needs-input",
+      status: "needs_input",
+      recoveryDisposition: "needs_input",
+      terminalCode: "agent_input_required",
+    });
+    const recovery = vi.fn();
+    const runtime = harness(snapshot([blocked]), { recovery });
+
+    await expect(runMissionSupervisorTick(
+      tickPayload(),
+      runContext(),
+      runtime.dependencies,
+    )).resolves.toMatchObject({
+      status: "committed",
+      kind: "request_input",
+    });
+    expect(recovery).not.toHaveBeenCalled();
+    expect(callFor(runtime.calls, "missionSupervisor:commitV1").args)
+      .toMatchObject({
+        decision: {
+          kind: "request_input",
+          question: expect.stringContaining(blocked.result!),
+          target: {
+            predecessorJobId: blocked.jobId,
+            predecessorReceiptDigest: blocked.receipt?.receiptDigest,
+          },
+        },
+        decisionOrigin: "policy",
+      });
+  });
+
+  it("uses exact pending input authority for one model-authored input revision", async () => {
+    const blocked = recoveryJob({
+      jobId: "job-input-revision",
+      status: "needs_input",
+      recoveryDisposition: "needs_input",
+      terminalCode: "agent_input_required",
+    });
+    const danielInput =
+      "Keep the existing scope, but use the receipt-bound fallback dataset.";
+    const authoritative = bindPendingInput(
+      snapshot([blocked]),
+      blocked,
+      danielInput,
+    );
+    const recovery = vi.fn(async (
+      input: Parameters<MissionSupervisorTickDependencies["runRecovery"]>[0],
+    ) => {
+      expect(input.candidates).toHaveLength(1);
+      expect(input.candidates[0]).toMatchObject({
+        mode: "input_revision",
+        jobId: blocked.jobId,
+        targetedInput: danielInput,
+      });
+      return {
+        revisions: [{
+          candidateId: input.candidates[0].candidateId,
+          mode: "input_revision" as const,
+          task:
+            "Complete the existing scope using Daniel's receipt-bound fallback dataset.",
+          label: "Use fallback dataset",
+          model: "sol" as const,
+          agentId: "paul" as const,
+          risk: "low" as const,
+          acceptanceCriteria: blocked.acceptanceCriteria,
+        }],
+        rationale:
+          "Daniel's exact receipt-bound input resolves the agent's missing dataset decision.",
+      };
+    });
+    const runtime = harness(authoritative, { recovery });
+
+    await expect(runMissionSupervisorTick(
+      tickPayload({ expectedInputRevision: 2 }),
+      runContext(),
+      runtime.dependencies,
+    )).resolves.toMatchObject({
+      status: "committed",
+      kind: "recover",
+    });
+    expect(recovery).toHaveBeenCalledOnce();
+    expect(callFor(runtime.calls, "missionSupervisor:commitV1").args)
+      .toMatchObject({
+        expectedInputRevision: 2,
+        decision: {
+          kind: "recover",
+          recoveries: [{
+            mode: "input_revision",
+            predecessorJobId: blocked.jobId,
+            predecessorReceiptDigest: blocked.receipt?.receiptDigest,
+            task:
+              "Complete the existing scope using Daniel's receipt-bound fallback dataset.",
+          }],
+        },
+        decisionOrigin: "model",
+        modelProvider: "codex-subscription",
+        supervisorPromptVersion: "jarvis-mission-recovery-v1",
+      });
+  });
+
+  it("allows exact Daniel-directed input to supersede an operator-stop error without reviving it", async () => {
+    const stopped = recoveryJob({
+      jobId: "job-operator-stop-revision",
+      status: "error",
+      recoveryDisposition: "operator_stop",
+      terminalCode: "delivery_blocked",
+    });
+    const danielInput =
+      "Create a fresh read-only successor that diagnoses the delivery boundary only.";
+    const authoritative = bindPendingInput(
+      snapshot([stopped]),
+      stopped,
+      danielInput,
+    );
+    const recovery = vi.fn(async (
+      input: Parameters<MissionSupervisorTickDependencies["runRecovery"]>[0],
+    ) => ({
+      revisions: [{
+        candidateId: input.candidates[0].candidateId,
+        mode: "input_revision" as const,
+        task:
+          "Create a fresh read-only diagnosis of the exact blocked delivery boundary.",
+        label: "Diagnose delivery boundary",
+        model: "sol" as const,
+        agentId: "paul" as const,
+        risk: "low" as const,
+        acceptanceCriteria: stopped.acceptanceCriteria,
+      }],
+      rationale:
+        "Daniel explicitly narrowed the operator-stop outcome to a safe read-only diagnosis.",
+    }));
+    const runtime = harness(authoritative, { recovery });
+
+    await expect(runMissionSupervisorTick(
+      tickPayload({ expectedInputRevision: 2 }),
+      runContext(),
+      runtime.dependencies,
+    )).resolves.toMatchObject({
+      status: "committed",
+      kind: "recover",
+      createdJobIds: ["job-created-1"],
+    });
+    expect(recovery).toHaveBeenCalledOnce();
+    expect(callFor(runtime.calls, "missionSupervisor:commitV1").args)
+      .toMatchObject({
+        decision: {
+          kind: "recover",
+          recoveries: [{
+            mode: "input_revision",
+            predecessorJobId: stopped.jobId,
+            predecessorReceiptDigest: stopped.receipt?.receiptDigest,
+          }],
+        },
+      });
+  });
+
+  it("fails closed when pending input revisions do not match the control fence", async () => {
+    const blocked = recoveryJob({
+      jobId: "job-input-mismatch",
+      status: "needs_input",
+      recoveryDisposition: "needs_input",
+    });
+    const authoritative = bindPendingInput(
+      snapshot([blocked]),
+      blocked,
+      "Use the exact bounded fallback.",
+      { controlExpectedInputRevision: 0 },
+    );
+    const recovery = vi.fn();
+    const runtime = harness(authoritative, { recovery });
+
+    await expect(runMissionSupervisorTick(
+      tickPayload({ expectedInputRevision: 2 }),
+      runContext(),
+      runtime.dependencies,
+    )).resolves.toMatchObject({
+      status: "released",
+      errorCode: "invalid_pending_input_authority",
+    });
+    expect(recovery).not.toHaveBeenCalled();
+    expect(runtime.calls.some(
+      (call) => call.path === "missionSupervisor:commitV1",
+    )).toBe(false);
+  });
+
+  it("never revives a cancelled leaf even when it has an operator-stop receipt", async () => {
+    const cancelled = recoveryJob({
+      jobId: "job-cancelled",
+      status: "cancelled",
+      recoveryDisposition: "operator_stop",
+      terminalCode: "operator_cancelled",
+    });
+    const recovery = vi.fn();
+    const runtime = harness(snapshot([cancelled]), { recovery });
+
+    await expect(runMissionSupervisorTick(
+      tickPayload(),
+      runContext(),
+      runtime.dependencies,
+    )).resolves.toMatchObject({
+      status: "committed",
+      kind: "fail",
+    });
+    expect(recovery).not.toHaveBeenCalled();
+    expect(callFor(runtime.calls, "missionSupervisor:commitV1").args)
+      .toMatchObject({
+        decision: {
+          kind: "fail",
+          reason: expect.stringContaining("cancelled"),
+        },
       });
   });
 
@@ -1198,6 +2000,44 @@ describe("mission supervisor Trigger tick", () => {
     expect(commit.decision).not.toHaveProperty("evidence");
   });
 
+  it("synthesizes only verified leaves and excludes superseded failure prose", async () => {
+    const predecessor = recoveryJob({
+      jobId: "job-synthesis-predecessor",
+      recoveryDisposition: "retryable",
+      terminalCode: "transient_network_error",
+    });
+    const successor = admittedSuccessor({
+      jobId: "job-synthesis-leaf",
+      status: "done",
+    });
+    const edge = supersession(predecessor, successor);
+    const synthesis = vi.fn(async (
+      input: Parameters<MissionSupervisorTickDependencies["runSynthesis"]>[0],
+    ) => {
+      expect(input.jobs.map((item) => item.jobId)).toEqual([successor.jobId]);
+      expect(JSON.stringify(input)).not.toContain(predecessor.result);
+      return {
+        summary:
+          "The recovered leaf completed with exact receipt-bound verification evidence.",
+        evidence: ["Focused tests passed."],
+      };
+    });
+    const runtime = harness(snapshot(
+      [predecessor, successor],
+      [edge],
+    ), { synthesis });
+
+    await expect(runMissionSupervisorTick(
+      tickPayload(),
+      runContext(),
+      runtime.dependencies,
+    )).resolves.toMatchObject({
+      status: "committed",
+      kind: "synthesize",
+    });
+    expect(synthesis).toHaveBeenCalledOnce();
+  });
+
   it("waits briefly instead of synthesizing when a done job lacks an exact receipt binding", async () => {
     const unbound = job({ status: "done", receipt: null });
     const synthesis = vi.fn();
@@ -1219,7 +2059,7 @@ describe("mission supervisor Trigger tick", () => {
         decision: {
           kind: "wait",
           delayMs: MISSION_SUPERVISOR_RECEIPT_WAIT_MS,
-          reason: expect.stringContaining("not yet fully bound"),
+          reason: expect.stringContaining("not yet available"),
         },
         decisionOrigin: "policy",
       });
@@ -1429,6 +2269,29 @@ describe("mission supervisor Trigger tick", () => {
 });
 
 describe("tool-less receipt synthesis and Convex transport", () => {
+  it("runs isolated mission supervisors with bounded parallelism outside the foreground queue", () => {
+    expect(MISSION_SUPERVISOR_QUEUE).toBe("jarvis-mission-supervisor");
+    expect(MISSION_SUPERVISOR_CONCURRENCY_LIMIT).toBe(4);
+
+    const supervisorSource = readFileSync(
+      new URL("./mission-supervisor.ts", import.meta.url),
+      "utf8",
+    );
+    expect(supervisorSource).toContain("name: MISSION_SUPERVISOR_QUEUE");
+    expect(supervisorSource).toContain(
+      "concurrencyLimit: MISSION_SUPERVISOR_CONCURRENCY_LIMIT",
+    );
+
+    const foregroundPolicySource = readFileSync(
+      new URL("./foreground-policy.ts", import.meta.url),
+      "utf8",
+    );
+    expect(foregroundPolicySource).toContain(
+      'FOREGROUND_QUEUE = "jarvis-foreground"',
+    );
+    expect(MISSION_SUPERVISOR_QUEUE).not.toBe("jarvis-foreground");
+  });
+
   it("loads the real Trigger module in a fresh Node process without a server-only mock", () => {
     const child = spawnSync(
       process.execPath,
@@ -1526,6 +2389,85 @@ describe("tool-less receipt synthesis and Convex transport", () => {
     expect(output).toEqual({
       summary: "The mission completed with bounded and exact receipt evidence.",
       evidence: ["Focused tests passed."],
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].tools ?? []).toEqual([]);
+    expect(calls[0].toolChoice).toBeUndefined();
+    expect(calls[0].responseFormat?.type).toBe("json");
+  });
+
+  it("uses a real tool-less Mastra recovery Agent with bounded candidate identities", async () => {
+    const calls: LanguageModelV2CallOptions[] = [];
+    const model: LanguageModelV2 = {
+      specificationVersion: "v2",
+      provider: "subscription-test",
+      modelId: "sol-recovery-test",
+      supportedUrls: {},
+      async doGenerate(options) {
+        calls.push(options);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              revisions: [{
+                candidateId: SHA_A,
+                mode: "remediate",
+                task:
+                  "Repair the exact verification boundary with stronger focused checks.",
+                label: "Repair verification",
+                model: "sol",
+                agentId: "paul",
+                risk: "low",
+                acceptanceCriteria: ["Focused checks pass."],
+              }],
+              rationale:
+                "The revised work directly addresses the exact failed verification boundary.",
+            }),
+          }],
+          finishReason: "stop",
+          usage,
+          warnings: [],
+        };
+      },
+      async doStream(options) {
+        calls.push(options);
+        throw new Error("Unexpected recovery stream");
+      },
+    };
+
+    const output = await runJarvisRecovery(
+      {
+        missionId: MISSION_ID,
+        goal: "Recover one exact terminal mission workstream safely.",
+        acceptanceCriteria: ["Every recovery remains receipt-bound."],
+        candidates: [{
+          candidateId: SHA_A,
+          mode: "remediate",
+          jobId: "job-recovery-agent",
+          label: "Failed verification",
+          task: "Implement the exact bounded verification behavior.",
+          repo: null,
+          model: "sol",
+          agentId: "paul",
+          risk: "low",
+          acceptanceCriteria: ["Focused checks pass."],
+          terminalCode: "verification_exhausted",
+          recoveryDisposition: "remediable",
+          result: "Verification failed.",
+          verificationNote: "One exact assertion failed.",
+          evidenceSummary: null,
+          generation: 0,
+          autonomousRecoveryCount: 0,
+          targetedInput: null,
+        }],
+      },
+      { model, abortSignal: new AbortController().signal },
+    );
+
+    expect(output.revisions[0]).toMatchObject({
+      candidateId: SHA_A,
+      mode: "remediate",
+      model: "sol",
     });
     expect(calls).toHaveLength(1);
     expect(calls[0].tools ?? []).toEqual([]);

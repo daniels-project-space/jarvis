@@ -36,6 +36,8 @@ export {
 } from "../lib/mission-supervisor-dispatch";
 
 export const MISSION_SUPERVISOR_SWEEP_TASK_ID = "jarvis-mission-supervisor-sweep";
+export const MISSION_SUPERVISOR_QUEUE = "jarvis-mission-supervisor";
+export const MISSION_SUPERVISOR_CONCURRENCY_LIMIT = 4;
 export const MISSION_SUPERVISOR_MAX_DUE = 8;
 export const MISSION_SUPERVISOR_ACTIVE_WAIT_MS = 15 * 60_000;
 export const MISSION_SUPERVISOR_RECEIPT_WAIT_MS = 30_000;
@@ -43,13 +45,21 @@ export const MISSION_SUPERVISOR_HEARTBEAT_MS = 60_000;
 export const MISSION_SUPERVISOR_MODEL_TIMEOUT_MS = 240_000;
 export const MISSION_SUPERVISOR_PROMPT_VERSION = "jarvis-mission-supervisor-v1";
 export const MISSION_SUPERVISOR_POLICY_MODEL_ID = "jarvis-supervisor-policy-v1";
+export const MISSION_SUPERVISOR_RECOVERY_PROMPT_VERSION =
+  "jarvis-mission-recovery-v1";
 
 const MAX_JOBS = 24;
+const MAX_SUPERSESSIONS = MAX_JOBS - 1;
+const MAX_RECOVERY_BATCH = 4;
+const MAX_RECOVERY_GENERATION = 4;
+const MAX_AUTONOMOUS_RECOVERIES = 2;
 const MAX_SNAPSHOT_BYTES = 96 * 1_024;
 const MAX_REQUEST_BYTES = 16 * 1_024;
+const MAX_RECOVERY_PROMPT_BYTES = 64 * 1_024;
 const MAX_SYNTHESIS_PROMPT_BYTES = 80 * 1_024;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$/;
 const DIGEST = /^[0-9a-f]{64}$/;
+const TERMINAL_CODE = /^[a-z][a-z0-9_:-]{0,79}$/;
 const ACTIVE_JOB_STATUSES = new Set([
   "pending",
   "queued",
@@ -61,19 +71,18 @@ const ACTIVE_JOB_STATUSES = new Set([
   "steered",
   "awaiting_approval",
 ]);
-const ATTENTION_JOB_STATUSES = new Set([
+const TERMINAL_JOB_STATUSES = new Set([
+  "done",
   "error",
-  "failed",
   "cancelled",
   "needs_input",
-  "stalled",
-  "blocked",
 ]);
 
 type JsonRecord = Record<string, unknown>;
 type ConvexKind = "query" | "mutation";
 type SupervisorDecisionKind =
   | "delegate"
+  | "recover"
   | "wait"
   | "request_input"
   | "replan"
@@ -130,8 +139,37 @@ type SupervisorDecision =
         acceptanceCriteria: string[];
       }>;
     }
+  | {
+      kind: "recover";
+      recoveries: Array<
+        | {
+            mode: "retry";
+            predecessorJobId: string;
+            predecessorReceiptDigest: string;
+          }
+        | {
+            mode: "remediate" | "input_revision";
+            predecessorJobId: string;
+            predecessorReceiptDigest: string;
+            task: string;
+            label: string;
+            model: ModelTier;
+            agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
+            risk: "low" | "medium" | "high" | "consequential";
+            acceptanceCriteria: string[];
+          }
+      >;
+    }
   | { kind: "wait"; delayMs: number; reason: string }
-  | { kind: "request_input"; question: string; reason: string }
+  | {
+      kind: "request_input";
+      question: string;
+      reason: string;
+      target?: {
+        predecessorJobId: string;
+        predecessorReceiptDigest: string;
+      };
+    }
   | { kind: "replan"; reason: string }
   | { kind: "synthesize"; summary: string }
   | { kind: "fail"; reason: string };
@@ -154,6 +192,54 @@ type SynthesisInput = {
   jobs: ReceiptReadyJob[];
 };
 
+type RecoveryMode = "remediate" | "input_revision";
+
+type RecoveryCandidate = {
+  candidateId: string;
+  mode: RecoveryMode;
+  jobId: string;
+  label: string;
+  task: string;
+  repo: string | null;
+  model: ModelTier;
+  agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
+  risk: "low" | "medium" | "high" | "consequential";
+  acceptanceCriteria: string[];
+  terminalCode: string;
+  recoveryDisposition:
+    | "retryable"
+    | "remediable"
+    | "needs_input"
+    | "operator_stop";
+  result: string | null;
+  verificationNote: string | null;
+  evidenceSummary: string | null;
+  generation: number;
+  autonomousRecoveryCount: number;
+  targetedInput: string | null;
+};
+
+type RecoveryInput = {
+  missionId: string;
+  goal: string;
+  acceptanceCriteria: string[];
+  candidates: RecoveryCandidate[];
+};
+
+type RecoveryOutput = {
+  revisions: Array<{
+    candidateId: string;
+    mode: RecoveryMode;
+    task: string;
+    label: string;
+    model: ModelTier;
+    agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
+    risk: "low" | "medium" | "high" | "consequential";
+    acceptanceCriteria: string[];
+  }>;
+  rationale: string;
+};
+
 export interface MissionSupervisorTickDependencies {
   convex(
     kind: ConvexKind,
@@ -173,6 +259,10 @@ export interface MissionSupervisorTickDependencies {
     input: SynthesisInput,
     options: { model: LanguageModelV2; abortSignal: AbortSignal },
   ): Promise<SynthesisOutput>;
+  runRecovery(
+    input: RecoveryInput,
+    options: { model: LanguageModelV2; abortSignal: AbortSignal },
+  ): Promise<RecoveryOutput>;
   scheduleHeartbeat(callback: () => void, delayMs: number): unknown;
   cancelHeartbeat(handle: unknown): void;
 }
@@ -257,12 +347,26 @@ const requestPayloadSchema = z.object({
 const workReceiptSchema = z.object({
   jobId: boundedString(160),
   attempt: positiveInteger,
+  protocolVersion: z.literal(2).nullable(),
+  receiptDigest: nullableDigest,
+  terminalCode: z.string().regex(TERMINAL_CODE).nullable(),
+  recoveryDisposition: z.enum([
+    "none",
+    "retryable",
+    "remediable",
+    "needs_input",
+    "operator_stop",
+  ]).nullable(),
+  observedInputRevision: nonNegativeInteger.nullable(),
   status: boundedString(40),
   verification: boundedString(40),
   authorityDigest: nullableDigest,
   schedulingBindingDigest: nullableDigest,
+  workOrderRevisionId: boundedString(160).nullable(),
   workOrderRevision: nonNegativeInteger.nullable(),
   workOrderRevisionDigest: nullableDigest,
+  canonicalProjectId: boundedString(120).nullable(),
+  repository: boundedString(120).nullable(),
   resultDigest: nullableDigest,
   evidenceDigest: nullableDigest,
   acceptanceEvidence: z.array(boundedString(500)).max(8),
@@ -336,6 +440,76 @@ const snapshotJobSchema = z.object({
   receipt: workReceiptSchema.nullable(),
 }).strict();
 
+const supersessionSchema = z.object({
+  supersessionId: boundedString(160),
+  supersessionKey: digest,
+  supersessionDigest: digest,
+  decisionKey: digest,
+  decisionOrdinal: nonNegativeInteger,
+  mode: z.enum(["retry", "remediate", "input_revision"]),
+  rootJobId: boundedString(160),
+  generation: z.number().int().min(1).max(MAX_RECOVERY_GENERATION).safe(),
+  autonomousRecoveryCount: z.number()
+    .int()
+    .min(0)
+    .max(MAX_AUTONOMOUS_RECOVERIES)
+    .safe(),
+  predecessorJobId: boundedString(160),
+  predecessorAttempt: positiveInteger,
+  predecessorReceiptDigest: digest,
+  successorJobId: boundedString(160),
+  successorSchedulingBindingDigest: digest,
+  successorWorkOrderRevisionId: boundedString(160),
+  successorWorkOrderRevisionDigest: digest,
+  successorCanonicalProjectId: boundedString(120),
+  successorRepository: boundedString(120).nullable(),
+  successorSourceAdmissionDigest: digest,
+  observedInputRevision: nonNegativeInteger,
+  inputControlReceiptId: boundedString(160).nullable(),
+  inputControlRequestDigest: nullableDigest,
+  inputControlDigest: nullableDigest,
+}).strict().superRefine((edge, context) => {
+  const inputBindings = [
+    edge.inputControlReceiptId,
+    edge.inputControlRequestDigest,
+    edge.inputControlDigest,
+  ];
+  if (
+    edge.mode === "input_revision"
+      ? inputBindings.some((binding) => binding === null)
+      : inputBindings.some((binding) => binding !== null)
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["inputControlReceiptId"],
+      message: "Supersession input authority does not match its recovery mode",
+    });
+  }
+});
+
+const pendingInputAuthoritySchema = z.object({
+  requestDecisionKey: digest,
+  requestObservedInputRevision: nonNegativeInteger,
+  predecessorJobId: boundedString(160),
+  predecessorAttempt: positiveInteger,
+  predecessorReceiptId: boundedString(160),
+  predecessorReceiptDigest: digest,
+  terminalCode: z.string().regex(TERMINAL_CODE).nullable(),
+  recoveryDisposition: z.enum([
+    "retryable",
+    "remediable",
+    "needs_input",
+    "operator_stop",
+  ]).nullable(),
+  controlReceiptId: boundedString(160).nullable(),
+  controlRequestDigest: nullableDigest,
+  controlInputDigest: nullableDigest,
+  controlExpectedInputRevision: nonNegativeInteger.nullable(),
+  controlResultInputRevision: nonNegativeInteger.nullable(),
+  steerDigest: nullableDigest,
+  steerDigestMatchesControl: z.boolean(),
+}).strict();
+
 const authoritativeSnapshotSchema = z.object({
   protocolVersion: z.literal(1),
   mission: z.object({
@@ -373,10 +547,14 @@ const authoritativeSnapshotSchema = z.object({
     lastDecisionDigest: nullableDigest,
   }).strict(),
   jobs: z.array(snapshotJobSchema).max(MAX_JOBS),
+  pendingInputAuthority: pendingInputAuthoritySchema.nullable(),
+  supersessions: z.array(supersessionSchema).max(MAX_SUPERSESSIONS),
 }).strict();
 
 type AuthoritativeSnapshot = z.infer<typeof authoritativeSnapshotSchema>;
 type SnapshotJob = z.infer<typeof snapshotJobSchema>;
+type SnapshotSupersession = z.infer<typeof supersessionSchema>;
+type PendingInputAuthority = z.infer<typeof pendingInputAuthoritySchema>;
 type RequestPayload = z.infer<typeof requestPayloadSchema>;
 
 type ReceiptReadyJob = SnapshotJob & {
@@ -454,6 +632,7 @@ const commitSuccessSchema = z.object({
   decisionKey: boundedString(240),
   kind: z.enum([
     "delegate",
+    "recover",
     "wait",
     "request_input",
     "replan",
@@ -463,6 +642,7 @@ const commitSuccessSchema = z.object({
   resultState: boundedString(80),
   nextTickAt: positiveInteger.optional(),
   createdJobIds: z.array(boundedString(160)).max(6),
+  supersessionIds: z.array(boundedString(160)).max(MAX_RECOVERY_BATCH),
   attentionItemId: boundedString(160).optional(),
   chatMessageIds: z.array(boundedString(160)).max(4),
 }).strict();
@@ -505,6 +685,22 @@ const planningResultSchema = z.object({
 const synthesisOutputSchema = z.object({
   summary: boundedString(4_000).min(12),
   evidence: z.array(boundedString(500).min(1)).min(1).max(MAX_JOBS),
+}).strict();
+
+const recoveryRevisionSchema = z.object({
+  candidateId: digest,
+  mode: z.enum(["remediate", "input_revision"]),
+  task: boundedString(4_000).min(12),
+  label: boundedString(80).min(3),
+  model: z.enum(["luna", "terra", "sol"]),
+  agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]),
+  risk: z.enum(["low", "medium", "high", "consequential"]),
+  acceptanceCriteria: z.array(boundedString(500).min(1)).min(1).max(8),
+}).strict();
+
+const recoveryOutputSchema = z.object({
+  revisions: z.array(recoveryRevisionSchema).min(1).max(MAX_RECOVERY_BATCH),
+  rationale: boundedString(2_000).min(12),
 }).strict();
 
 function utf8Bytes(value: string): number {
@@ -733,41 +929,286 @@ function exactFence(
   };
 }
 
-function receiptReady(job: SnapshotJob): job is ReceiptReadyJob {
+type ExactTerminalJob = SnapshotJob & {
+  receipt: z.infer<typeof workReceiptSchema> & {
+    protocolVersion: 2;
+    receiptDigest: string;
+    terminalCode: string;
+    recoveryDisposition:
+      | "none"
+      | "retryable"
+      | "remediable"
+      | "needs_input"
+      | "operator_stop";
+    observedInputRevision: number;
+    authorityDigest: string;
+    schedulingBindingDigest: string;
+    workOrderRevisionId: string;
+    workOrderRevision: number;
+    workOrderRevisionDigest: string;
+    canonicalProjectId: string;
+    resultDigest: string;
+    evidenceDigest: string;
+  };
+};
+
+type RecoveryLineageNode = {
+  rootJobId: string;
+  generation: number;
+  autonomousRecoveryCount: number;
+};
+
+type ValidatedRecoveryLineage = {
+  leaves: SnapshotJob[];
+  nodes: Map<string, RecoveryLineageNode>;
+  incoming: Map<string, SnapshotSupersession>;
+  outgoing: Map<string, SnapshotSupersession>;
+};
+
+function invalidLineage(message: string): never {
+  throw new SupervisorRuntimeError("invalid_recovery_lineage", message);
+}
+
+function expectedReceiptStatus(status: SnapshotJob["status"]): string | null {
+  if (status === "done") return "succeeded";
+  if (status === "error") return "failed";
+  if (status === "needs_input") return "needs_input";
+  if (status === "cancelled") return "cancelled";
+  return null;
+}
+
+function terminalDispositionMatches(
+  job: SnapshotJob,
+  receipt: z.infer<typeof workReceiptSchema>,
+): boolean {
+  if (job.status === "done") {
+    return receipt.verification === "pass"
+      && receipt.recoveryDisposition === "none";
+  }
+  if (job.status === "error") {
+    return ["retryable", "remediable", "operator_stop"].includes(
+      String(receipt.recoveryDisposition),
+    );
+  }
+  if (job.status === "needs_input") {
+    return receipt.verification === "needs_input"
+      && receipt.recoveryDisposition === "needs_input";
+  }
+  if (job.status === "cancelled") {
+    return receipt.recoveryDisposition === "operator_stop";
+  }
+  return false;
+}
+
+function exactTerminalReceipt(job: SnapshotJob): job is ExactTerminalJob {
   const receipt = job.receipt;
+  const receiptStatus = expectedReceiptStatus(job.status);
   if (
-    job.status !== "done" ||
-    job.verificationVerdict !== "pass" ||
-    !job.result ||
-    !job.completedAt ||
+    !receiptStatus ||
+    !receipt ||
+    receipt.protocolVersion !== 2 ||
+    !receipt.receiptDigest ||
+    !receipt.terminalCode ||
+    receipt.recoveryDisposition === null ||
+    receipt.observedInputRevision === null ||
     !job.authorityDigest ||
     !job.schedulingBindingDigest ||
     job.workOrderRevision === null ||
     !job.workOrderRevisionDigest ||
-    !job.resultDigest ||
-    !job.evidenceDigest ||
-    !receipt
+    !receipt.authorityDigest ||
+    !receipt.schedulingBindingDigest ||
+    !receipt.workOrderRevisionId ||
+    receipt.workOrderRevision === null ||
+    !receipt.workOrderRevisionDigest ||
+    !receipt.canonicalProjectId ||
+    !receipt.resultDigest ||
+    !receipt.evidenceDigest
   ) {
     return false;
   }
   return receipt.jobId === job.jobId
     && receipt.attempt === job.attempt
-    && receipt.status === "succeeded"
-    && receipt.verification === "pass"
+    && receipt.status === receiptStatus
+    && terminalDispositionMatches(job, receipt)
     && receipt.authorityDigest === job.authorityDigest
     && receipt.schedulingBindingDigest === job.schedulingBindingDigest
     && receipt.workOrderRevision === job.workOrderRevision
     && receipt.workOrderRevisionDigest === job.workOrderRevisionDigest
-    && receipt.resultDigest === job.resultDigest
-    && receipt.evidenceDigest === job.evidenceDigest
-    && receipt.acceptanceEvidence.length > 0
+    && receipt.repository === job.repo
+    && (job.resultDigest === null || receipt.resultDigest === job.resultDigest)
+    && (job.evidenceDigest === null || receipt.evidenceDigest === job.evidenceDigest)
     && receipt.artifacts.length > 0
-    && (job.repo === null
-      ? receipt.reviewReceiptDigest === job.reviewReceiptDigest
-      : Boolean(
-          job.reviewReceiptDigest
-          && receipt.reviewReceiptDigest === job.reviewReceiptDigest
-        ));
+    && (job.status !== "done"
+      || (
+        job.verificationVerdict === "pass"
+        && Boolean(job.result)
+        && Boolean(job.completedAt)
+        && Boolean(job.resultDigest)
+        && Boolean(job.evidenceDigest)
+        && receipt.acceptanceEvidence.length > 0
+        && (job.repo === null
+          ? receipt.reviewReceiptDigest === job.reviewReceiptDigest
+          : Boolean(
+              job.reviewReceiptDigest
+              && receipt.reviewReceiptDigest === job.reviewReceiptDigest
+            ))
+      ));
+}
+
+function receiptReady(job: SnapshotJob): job is ReceiptReadyJob {
+  return exactTerminalReceipt(job) && job.status === "done";
+}
+
+function recoveryModeAllowed(
+  edge: SnapshotSupersession,
+  predecessor: ExactTerminalJob,
+): boolean {
+  const disposition = predecessor.receipt.recoveryDisposition;
+  if (edge.mode === "retry") return disposition === "retryable";
+  if (edge.mode === "remediate") {
+    return disposition === "retryable" || disposition === "remediable";
+  }
+  return [
+    "retryable",
+    "remediable",
+    "needs_input",
+    "operator_stop",
+  ].includes(disposition)
+    && edge.observedInputRevision > predecessor.receipt.observedInputRevision;
+}
+
+function validateRecoveryLineage(
+  snapshot: AuthoritativeSnapshot,
+): ValidatedRecoveryLineage {
+  if (snapshot.supersessions.length > Math.max(0, snapshot.jobs.length - 1)) {
+    invalidLineage("Recovery lineage contains more edges than a bounded forest");
+  }
+  const jobsById = new Map<string, SnapshotJob>();
+  for (const job of snapshot.jobs) {
+    if (
+      jobsById.has(job.jobId)
+      || job.supervisorEpoch === null
+      || job.supervisorDecisionKey === null
+      || !DIGEST.test(job.supervisorDecisionKey)
+      || job.supervisorJobOrdinal === null
+    ) {
+      invalidLineage("Recovery job provenance is missing or ambiguous");
+    }
+    jobsById.set(job.jobId, job);
+  }
+
+  const incoming = new Map<string, SnapshotSupersession>();
+  const outgoing = new Map<string, SnapshotSupersession>();
+  const supersessionIds = new Set<string>();
+  const supersessionKeys = new Set<string>();
+  const rootGenerations = new Set<string>();
+  for (const edge of snapshot.supersessions) {
+    const predecessor = jobsById.get(edge.predecessorJobId);
+    const successor = jobsById.get(edge.successorJobId);
+    const rootGeneration = `${edge.rootJobId}:${edge.generation}`;
+    if (
+      !predecessor ||
+      !successor ||
+      predecessor.jobId === successor.jobId ||
+      supersessionIds.has(edge.supersessionId) ||
+      supersessionKeys.has(edge.supersessionKey) ||
+      rootGenerations.has(rootGeneration) ||
+      incoming.has(successor.jobId) ||
+      outgoing.has(predecessor.jobId) ||
+      edge.observedInputRevision > snapshot.supervisor.inputRevision
+    ) {
+      invalidLineage("Recovery lineage forks, merges, or references invalid jobs");
+    }
+    if (
+      !exactTerminalReceipt(predecessor)
+      || edge.predecessorAttempt !== predecessor.attempt
+      || edge.predecessorReceiptDigest !== predecessor.receipt.receiptDigest
+      || !recoveryModeAllowed(edge, predecessor)
+    ) {
+      invalidLineage("Recovery predecessor is not bound to one exact terminal receipt");
+    }
+    if (
+      successor.supervisorDecisionKey !== edge.decisionKey
+      || successor.supervisorJobOrdinal !== edge.decisionOrdinal
+      || successor.schedulingBindingDigest
+        !== edge.successorSchedulingBindingDigest
+      || successor.workOrderRevisionDigest
+        !== edge.successorWorkOrderRevisionDigest
+      || successor.repo !== edge.successorRepository
+      || successor.sourceAdmissionDigest
+        !== edge.successorSourceAdmissionDigest
+    ) {
+      invalidLineage("Recovery successor authority does not match its lineage edge");
+    }
+    if (
+      successor.receipt !== null
+      && (
+        !exactTerminalReceipt(successor)
+        || successor.receipt.workOrderRevisionId
+          !== edge.successorWorkOrderRevisionId
+        || successor.receipt.canonicalProjectId
+          !== edge.successorCanonicalProjectId
+      )
+    ) {
+      invalidLineage("Terminal recovery successor does not match admitted authority");
+    }
+    supersessionIds.add(edge.supersessionId);
+    supersessionKeys.add(edge.supersessionKey);
+    rootGenerations.add(rootGeneration);
+    incoming.set(successor.jobId, edge);
+    outgoing.set(predecessor.jobId, edge);
+  }
+
+  const nodes = new Map<string, RecoveryLineageNode>();
+  const visiting = new Set<string>();
+  const resolve = (jobId: string): RecoveryLineageNode => {
+    const prior = nodes.get(jobId);
+    if (prior) return prior;
+    if (visiting.has(jobId)) {
+      invalidLineage("Recovery lineage contains a cycle");
+    }
+    visiting.add(jobId);
+    const edge = incoming.get(jobId);
+    let node: RecoveryLineageNode;
+    if (!edge) {
+      node = {
+        rootJobId: jobId,
+        generation: 0,
+        autonomousRecoveryCount: 0,
+      };
+    } else {
+      const parent = resolve(edge.predecessorJobId);
+      node = {
+        rootJobId: parent.rootJobId,
+        generation: parent.generation + 1,
+        autonomousRecoveryCount:
+          parent.autonomousRecoveryCount
+          + (edge.mode === "input_revision" ? 0 : 1),
+      };
+      if (
+        edge.rootJobId !== node.rootJobId
+        || edge.generation !== node.generation
+        || edge.autonomousRecoveryCount !== node.autonomousRecoveryCount
+        || node.generation > MAX_RECOVERY_GENERATION
+        || node.autonomousRecoveryCount > MAX_AUTONOMOUS_RECOVERIES
+      ) {
+        invalidLineage("Recovery lineage resets or exceeds a bounded cap");
+      }
+    }
+    visiting.delete(jobId);
+    nodes.set(jobId, node);
+    return node;
+  };
+  for (const job of snapshot.jobs) resolve(job.jobId);
+
+  return {
+    nodes,
+    incoming,
+    outgoing,
+    leaves: snapshot.jobs
+      .filter((job) => !outgoing.has(job.jobId))
+      .sort((left, right) => left.jobId.localeCompare(right.jobId)),
+  };
 }
 
 function allowedSynthesisEvidence(jobs: readonly ReceiptReadyJob[]): Set<string> {
@@ -845,6 +1286,58 @@ Do not claim work, delivery, or verification that is absent from those receipts.
     );
   }
   return output;
+}
+
+export async function runJarvisRecovery(
+  input: RecoveryInput,
+  options: { model: LanguageModelV2; abortSignal: AbortSignal },
+): Promise<RecoveryOutput> {
+  if (
+    input.candidates.length < 1 ||
+    input.candidates.length > MAX_RECOVERY_BATCH
+  ) {
+    throw new SupervisorRuntimeError(
+      "recovery_invalid",
+      "Recovery model input is outside the bounded candidate count",
+    );
+  }
+  const promptJson = canonicalJson({
+    protocolVersion: 1,
+    missionId: input.missionId,
+    goal: input.goal,
+    missionAcceptanceCriteria: input.acceptanceCriteria,
+    candidates: input.candidates,
+  });
+  if (utf8Bytes(promptJson) > MAX_RECOVERY_PROMPT_BYTES) {
+    throw new SupervisorRuntimeError(
+      "recovery_input_too_large",
+      "Recovery model input is too large",
+    );
+  }
+  const jarvis = new Agent({
+    id: "jarvis-mission-supervisor-recovery",
+    name: TEAM_BY_SLUG.jarvis.name,
+    description: TEAM_BY_SLUG.jarvis.description,
+    instructions: `${TEAM_BY_SLUG.jarvis.instructions}
+
+Revise only the supplied failed recovery candidates. You have no tools.
+Return exactly one revision for every candidateId and preserve its required mode.
+Repair the root cause instead of repeating an unchanged task. Never invent or alter job ids, receipt digests, repositories, source authority, read-only scope, approvals, or recovery lineage.
+Do not lower the supplied model tier, risk, or acceptance criteria. You may strengthen them.
+Use input_revision only when that candidate includes exact targetedInput; otherwise never claim that Daniel supplied an answer.`,
+    model: options.model,
+  });
+  const generated = await jarvis.generate(promptJson, {
+    abortSignal: options.abortSignal,
+    structuredOutput: { schema: recoveryOutputSchema },
+  });
+  if (generated.error) throw generated.error;
+  return parseWithCode(
+    recoveryOutputSchema,
+    generated.object,
+    "recovery_invalid",
+    "Jarvis recovery output is invalid",
+  );
 }
 
 function planningTickId(
@@ -1083,31 +1576,6 @@ async function planEmptyMission(
   };
 }
 
-function attentionDecision(jobs: readonly SnapshotJob[]): PreparedDecision | null {
-  const attention = jobs.find((job) => ATTENTION_JOB_STATUSES.has(job.status));
-  if (!attention) return null;
-  const reason = safeBoundedText(
-    `${attention.label ?? attention.task} is ${attention.status}${attention.stallReason ? `: ${attention.stallReason}` : ""}.`,
-    1_000,
-    "A terminal workstream needs Daniel's input.",
-  );
-  return {
-    decision: {
-      kind: "request_input",
-      question: safeBoundedText(
-        `The workstream "${attention.label ?? attention.task.slice(0, 80)}" ended in ${attention.status}. Should I retry with a revised approach, narrow the scope, or stop it?`,
-        2_000,
-        "A terminal workstream needs a retry, narrower scope, or stop decision.",
-      ),
-      reason,
-    },
-    rationale: reason,
-    metadata: policyMetadata(
-      "Deterministic terminal-status policy; no model was invoked",
-    ),
-  };
-}
-
 function activeDecision(jobs: readonly SnapshotJob[]): PreparedDecision | null {
   const active = jobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status));
   if (active.length === 0) return null;
@@ -1126,8 +1594,7 @@ function activeDecision(jobs: readonly SnapshotJob[]): PreparedDecision | null {
 }
 
 function receiptWaitDecision(jobs: readonly SnapshotJob[]): PreparedDecision {
-  const unready = jobs.filter((job) => !receiptReady(job));
-  const reason = `${unready.length} completed workstream receipt(s) are not yet fully bound to their exact authority and evidence digests.`;
+  const reason = `${jobs.length} terminal workstream receipt(s) are not yet available from immutable authority.`;
   return {
     decision: {
       kind: "wait",
@@ -1137,6 +1604,354 @@ function receiptWaitDecision(jobs: readonly SnapshotJob[]): PreparedDecision {
     rationale: reason,
     metadata: policyMetadata(
       "Deterministic receipt-readiness policy; no model was invoked",
+    ),
+  };
+}
+
+function lineageNode(
+  lineage: ValidatedRecoveryLineage,
+  job: SnapshotJob,
+): RecoveryLineageNode {
+  const node = lineage.nodes.get(job.jobId);
+  if (!node) invalidLineage("Recovery leaf is missing a derived lineage node");
+  return node;
+}
+
+function withinRecoveryCaps(node: RecoveryLineageNode): boolean {
+  return node.generation < MAX_RECOVERY_GENERATION
+    && node.autonomousRecoveryCount < MAX_AUTONOMOUS_RECOVERIES;
+}
+
+function deterministicRetryDecision(
+  leaves: readonly ExactTerminalJob[],
+  lineage: ValidatedRecoveryLineage,
+  availableCapacity: number,
+): PreparedDecision | null {
+  if (availableCapacity < 1) return null;
+  const retryable = leaves
+    .filter((job) =>
+      job.status === "error"
+      && job.receipt.recoveryDisposition === "retryable"
+      && withinRecoveryCaps(lineageNode(lineage, job))
+    )
+    .slice(0, Math.min(MAX_RECOVERY_BATCH, availableCapacity));
+  if (retryable.length === 0) return null;
+  const terminalCodes = retryable
+    .map((job) => job.receipt.terminalCode)
+    .join(", ");
+  const reason = safeBoundedText(
+    `${retryable.length} exact terminal receipt(s) are explicitly retryable within generation and autonomous recovery caps (${terminalCodes}).`,
+    1_000,
+    "Exact retryable terminal receipts remain within bounded recovery caps.",
+  );
+  return {
+    decision: {
+      kind: "recover",
+      recoveries: retryable.map((job) => ({
+        mode: "retry",
+        predecessorJobId: job.jobId,
+        predecessorReceiptDigest: job.receipt.receiptDigest,
+      })),
+    },
+    rationale: reason,
+    metadata: policyMetadata(
+      "Deterministic receipt-classified retry policy; no model was invoked",
+    ),
+  };
+}
+
+const recoveryAuthoritySchema = z.object({
+  model: z.enum(["luna", "terra", "sol"]),
+  agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]),
+  risk: z.enum(["low", "medium", "high", "consequential"]),
+}).strict();
+
+const MODEL_RANK: Record<ModelTier, number> = {
+  luna: 0,
+  terra: 1,
+  sol: 2,
+};
+const RISK_RANK: Record<
+  "low" | "medium" | "high" | "consequential",
+  number
+> = {
+  low: 0,
+  medium: 1,
+  high: 2,
+  consequential: 3,
+};
+
+type ModelRecoveryTarget = {
+  job: ExactTerminalJob;
+  node: RecoveryLineageNode;
+  mode: RecoveryMode;
+  authority: z.infer<typeof recoveryAuthoritySchema>;
+  targetedInput: string | null;
+};
+
+function modelRecoveryCandidate(
+  snapshotDigest: string,
+  target: ModelRecoveryTarget,
+): RecoveryCandidate {
+  const { job, node, mode, authority, targetedInput } = target;
+  return {
+    candidateId: sha256Hex(canonicalJson({
+      protocolVersion: 1,
+      snapshotDigest,
+      mode,
+      predecessorJobId: job.jobId,
+      predecessorReceiptDigest: job.receipt.receiptDigest,
+    })),
+    mode,
+    jobId: job.jobId,
+    label: job.label ?? job.task.slice(0, 80),
+    task: job.task,
+    repo: job.repo,
+    model: authority.model,
+    agentId: authority.agentId,
+    risk: authority.risk,
+    acceptanceCriteria: job.acceptanceCriteria,
+    terminalCode: job.receipt.terminalCode,
+    recoveryDisposition: job.receipt.recoveryDisposition as
+      | "retryable"
+      | "remediable"
+      | "needs_input"
+      | "operator_stop",
+    result: job.result,
+    verificationNote: job.verificationNote,
+    evidenceSummary: job.evidenceSummary,
+    generation: node.generation,
+    autonomousRecoveryCount: node.autonomousRecoveryCount,
+    targetedInput,
+  };
+}
+
+function validateModelRecoveryOutput(
+  output: RecoveryOutput,
+  candidates: readonly RecoveryCandidate[],
+): z.infer<typeof recoveryRevisionSchema>[] {
+  const parsed = parseWithCode(
+    recoveryOutputSchema,
+    output,
+    "recovery_invalid",
+    "Jarvis recovery output is invalid",
+  );
+  if (parsed.revisions.length !== candidates.length) {
+    throw new SupervisorRuntimeError(
+      "recovery_invalid",
+      "Jarvis recovery did not revise every offered candidate exactly once",
+    );
+  }
+  const byCandidate = new Map(
+    parsed.revisions.map((revision) => [revision.candidateId, revision]),
+  );
+  if (
+    byCandidate.size !== parsed.revisions.length
+    || candidates.some((candidate) => !byCandidate.has(candidate.candidateId))
+  ) {
+    throw new SupervisorRuntimeError(
+      "recovery_invalid",
+      "Jarvis recovery substituted or duplicated a candidate identity",
+    );
+  }
+  return candidates.map((candidate) => {
+    const revision = byCandidate.get(candidate.candidateId)!;
+    if (
+      revision.mode !== candidate.mode
+      || MODEL_RANK[revision.model] < MODEL_RANK[candidate.model]
+      || RISK_RANK[revision.risk] < RISK_RANK[candidate.risk]
+      || candidate.acceptanceCriteria.some((criterion) =>
+        !revision.acceptanceCriteria.includes(criterion)
+      )
+      || revision.task.trim() === candidate.task.trim()
+      || (candidate.mode === "input_revision" && !candidate.targetedInput)
+    ) {
+      throw new SupervisorRuntimeError(
+        "recovery_authority_downgrade",
+        "Jarvis recovery changed mode or weakened immutable work authority",
+      );
+    }
+    return revision;
+  });
+}
+
+async function modelRecoveryDecision(
+  snapshotDigest: string,
+  snapshot: AuthoritativeSnapshot,
+  targets: readonly ModelRecoveryTarget[],
+  signal: AbortSignal,
+  dependencies: MissionSupervisorTickDependencies,
+): Promise<PreparedDecision> {
+  const candidates = targets.map((target) =>
+    modelRecoveryCandidate(snapshotDigest, target)
+  );
+  const model = dependencies.createLanguageModel(
+    "sol",
+    MISSION_SUPERVISOR_MODEL_TIMEOUT_MS,
+  );
+  const output = await dependencies.runRecovery(
+    {
+      missionId: snapshot.mission.missionId,
+      goal: snapshot.mission.goal,
+      acceptanceCriteria: snapshot.mission.acceptanceCriteria,
+      candidates,
+    },
+    { model, abortSignal: signal },
+  );
+  const revisions = validateModelRecoveryOutput(output, candidates);
+  return {
+    decision: {
+      kind: "recover",
+      recoveries: revisions.map((revision, index) => ({
+        mode: revision.mode,
+        predecessorJobId: targets[index].job.jobId,
+        predecessorReceiptDigest:
+          targets[index].job.receipt.receiptDigest,
+        task: revision.task,
+        label: revision.label,
+        model: revision.model,
+        agentId: revision.agentId,
+        risk: revision.risk,
+        acceptanceCriteria: revision.acceptanceCriteria,
+      })),
+    },
+    rationale: safeBoundedText(
+      output.rationale,
+      1_000,
+      "Jarvis produced bounded receipt-classified recovery revisions.",
+    ),
+    metadata: modelMetadata(
+      `Sol produced ${targets[0].mode} revisions for ${targets.length} exact terminal receipt(s) without weakening authority`,
+      MISSION_SUPERVISOR_RECOVERY_PROMPT_VERSION,
+    ),
+  };
+}
+
+function manualNewMissionDecision(
+  job: SnapshotJob,
+  detail: string,
+): PreparedDecision {
+  const label = job.label ?? job.task.slice(0, 80);
+  const reason = safeBoundedText(
+    `This supervised mission stopped safely because "${label}" ${detail}. Start a new mission with the required operator decision or revised scope; the terminal job will not be revived in place.`,
+    1_000,
+    "This supervised mission stopped safely. Start a new mission with revised scope.",
+  );
+  return {
+    decision: { kind: "fail", reason },
+    rationale: reason,
+    metadata: policyMetadata(
+      "Deterministic fail-closed recovery boundary; no model was invoked",
+    ),
+  };
+}
+
+function invalidPendingInput(message: string): never {
+  throw new SupervisorRuntimeError("invalid_pending_input_authority", message);
+}
+
+function pendingInputTarget(
+  snapshot: AuthoritativeSnapshot,
+  lineage: ValidatedRecoveryLineage,
+): ModelRecoveryTarget | null {
+  const pending: PendingInputAuthority | null = snapshot.pendingInputAuthority;
+  if (!pending) return null;
+  const job = lineage.leaves.find((candidate) =>
+    candidate.jobId === pending.predecessorJobId
+  );
+  if (
+    !job
+    || !exactTerminalReceipt(job)
+    || pending.predecessorAttempt !== job.attempt
+    || pending.predecessorReceiptDigest !== job.receipt.receiptDigest
+    || pending.terminalCode !== job.receipt.terminalCode
+    || pending.recoveryDisposition !== job.receipt.recoveryDisposition
+  ) {
+    invalidPendingInput(
+      "Pending input does not target one exact terminal recovery leaf",
+    );
+  }
+  const steer = snapshot.mission.steer;
+  const steerDigest = steer ? sha256Hex(steer) : null;
+  if (
+    !pending.controlReceiptId
+    || !pending.controlRequestDigest
+    || !pending.controlInputDigest
+    || pending.controlResultInputRevision === null
+    || !pending.steerDigestMatchesControl
+    || !steer
+    || !steerDigest
+    || pending.requestDecisionKey !== snapshot.supervisor.lastDecisionKey
+    || pending.requestObservedInputRevision
+      !== snapshot.supervisor.handledInputRevision
+    || pending.controlExpectedInputRevision
+      !== snapshot.supervisor.handledInputRevision
+    || pending.controlResultInputRevision !== snapshot.supervisor.inputRevision
+    || snapshot.supervisor.handledInputRevision + 1
+      !== snapshot.supervisor.inputRevision
+    || job.receipt.observedInputRevision
+      !== snapshot.supervisor.handledInputRevision
+    || pending.controlResultInputRevision
+      <= job.receipt.observedInputRevision
+    || pending.steerDigest !== steerDigest
+    || pending.controlInputDigest !== steerDigest
+    || snapshot.mission.steerDigest !== steerDigest
+    || snapshot.mission.steerRevision < 1
+  ) {
+    invalidPendingInput(
+      "Pending input control, revision, and steer digests are not exact",
+    );
+  }
+  const authority = parseWithCode(
+    recoveryAuthoritySchema,
+    {
+      model: job.model,
+      agentId: job.agentId,
+      risk: job.risk,
+    },
+    "recovery_authority_invalid",
+    "Input revision workstream authority is invalid",
+  );
+  return {
+    job,
+    node: lineageNode(lineage, job),
+    mode: "input_revision",
+    authority,
+    targetedInput: steer,
+  };
+}
+
+function targetedInputDecision(
+  job: ExactTerminalJob,
+  detail: string,
+): PreparedDecision {
+  const label = job.label ?? job.task.slice(0, 80);
+  const requested = job.status === "needs_input" && job.result
+    ? ` Answer the agent's exact blocker: ${job.result}`
+    : "";
+  const question = safeBoundedText(
+    `For "${label}", provide one explicit revised instruction or scope that resolves ${detail}.${requested} Your answer will be bound only to receipt ${job.receipt.receiptDigest.slice(0, 16)} and used to create a new successor; the terminal job will not be revived. If no safe revision exists, start a new mission instead.`,
+    1_000,
+    `Provide one explicit revised instruction for "${label}", or start a new mission instead.`,
+  );
+  const reason = safeBoundedText(
+    `${label} requires Daniel-directed input before any new successor can be admitted (${job.receipt.terminalCode}).`,
+    500,
+    "Exact terminal recovery requires Daniel-directed input.",
+  );
+  return {
+    decision: {
+      kind: "request_input",
+      question,
+      reason,
+      target: {
+        predecessorJobId: job.jobId,
+        predecessorReceiptDigest: job.receipt.receiptDigest,
+      },
+    },
+    rationale: reason,
+    metadata: policyMetadata(
+      "Deterministic exact-target input policy; no model was invoked",
     ),
   };
 }
@@ -1210,22 +2025,167 @@ async function decide(
       dependencies,
     );
   }
-  const attention = attentionDecision(snapshot.jobs);
-  if (attention) return attention;
-  const active = activeDecision(snapshot.jobs);
+  const lineage = validateRecoveryLineage(snapshot);
+  const active = activeDecision(lineage.leaves);
   if (active) return active;
-  if (!snapshot.jobs.every((job) => job.status === "done")) {
+
+  const terminalLeaves = lineage.leaves.filter((job) =>
+    TERMINAL_JOB_STATUSES.has(job.status)
+  );
+  const receiptsPending = terminalLeaves.filter((job) => job.receipt === null);
+  if (receiptsPending.length > 0) {
+    return receiptWaitDecision(receiptsPending);
+  }
+  const invalidReceipt = terminalLeaves.find((job) =>
+    !exactTerminalReceipt(job)
+  );
+  if (invalidReceipt) {
     throw new SupervisorRuntimeError(
-      "unknown_job_state",
-      "Mission contains an unsupported job state",
+      "invalid_terminal_receipt",
+      `Terminal workstream ${invalidReceipt.jobId} is not bound to exact v2 receipt authority`,
     );
   }
-  if (!snapshot.jobs.every(receiptReady)) {
-    return receiptWaitDecision(snapshot.jobs);
+  const exactTerminalLeaves = terminalLeaves as ExactTerminalJob[];
+  const availableCapacity = Math.max(
+    0,
+    Math.min(MAX_JOBS, snapshot.supervisor.maxJobs)
+      - snapshot.supervisor.totalJobs,
+  );
+
+  const inputTarget = pendingInputTarget(snapshot, lineage);
+  if (inputTarget) {
+    if (inputTarget.job.status === "cancelled") {
+      return manualNewMissionDecision(
+        inputTarget.job,
+        "was cancelled and cannot be revived by an input revision",
+      );
+    }
+    if (inputTarget.node.generation >= MAX_RECOVERY_GENERATION) {
+      return manualNewMissionDecision(
+        inputTarget.job,
+        `reached the recovery generation limit ${MAX_RECOVERY_GENERATION}`,
+      );
+    }
+    if (availableCapacity < 1) {
+      return manualNewMissionDecision(
+        inputTarget.job,
+        "cannot create an input-revised successor within the mission job cap",
+      );
+    }
+    return await modelRecoveryDecision(
+      snapshotDigest,
+      snapshot,
+      [inputTarget],
+      signal,
+      dependencies,
+    );
+  }
+
+  const retry = deterministicRetryDecision(
+    exactTerminalLeaves,
+    lineage,
+    availableCapacity,
+  );
+  if (retry) return retry;
+
+  if (availableCapacity > 0) {
+    const remediable = exactTerminalLeaves
+      .filter((job) =>
+        job.status === "error"
+        && job.receipt.recoveryDisposition === "remediable"
+        && withinRecoveryCaps(lineageNode(lineage, job))
+      )
+      .slice(0, Math.min(MAX_RECOVERY_BATCH, availableCapacity));
+    if (remediable.length > 0) {
+      const targets = remediable.map((job): ModelRecoveryTarget => {
+        const authority = parseWithCode(
+          recoveryAuthoritySchema,
+          {
+            model: job.model,
+            agentId: job.agentId,
+            risk: job.risk,
+          },
+          "recovery_authority_invalid",
+          "Remediable workstream authority is invalid",
+        );
+        return {
+          job,
+          node: lineageNode(lineage, job),
+          mode: "remediate",
+          authority,
+          targetedInput: null,
+        };
+      });
+      return await modelRecoveryDecision(
+        snapshotDigest,
+        snapshot,
+        targets,
+        signal,
+        dependencies,
+      );
+    }
+  }
+
+  const unresolved = lineage.leaves.find((job) => job.status !== "done");
+  if (unresolved) {
+    if (unresolved.status === "cancelled") {
+      return manualNewMissionDecision(
+        unresolved,
+        "was cancelled under an operator-stop receipt",
+      );
+    }
+    if (
+      (unresolved.status === "error" || unresolved.status === "needs_input")
+      && exactTerminalReceipt(unresolved)
+    ) {
+      const node = lineageNode(lineage, unresolved);
+      if (node.generation >= MAX_RECOVERY_GENERATION) {
+        return manualNewMissionDecision(
+          unresolved,
+          `reached the recovery generation limit ${MAX_RECOVERY_GENERATION}`,
+        );
+      }
+      if (availableCapacity < 1) {
+        return manualNewMissionDecision(
+          unresolved,
+          "cannot create another successor within the mission job cap",
+        );
+      }
+      if (
+        unresolved.status === "needs_input"
+        || node.autonomousRecoveryCount >= MAX_AUTONOMOUS_RECOVERIES
+        || unresolved.receipt.recoveryDisposition === "operator_stop"
+      ) {
+        return targetedInputDecision(
+          unresolved,
+          unresolved.status === "needs_input"
+            ? "the agent's missing decision"
+            : node.autonomousRecoveryCount
+                >= MAX_AUTONOMOUS_RECOVERIES
+              ? `the autonomous recovery cap ${MAX_AUTONOMOUS_RECOVERIES}`
+              : `operator-stop terminal code ${unresolved.receipt.terminalCode}`,
+        );
+      }
+      return manualNewMissionDecision(
+        unresolved,
+        `ended with unsupported recovery disposition ${unresolved.receipt.recoveryDisposition} (${unresolved.receipt.terminalCode})`,
+      );
+    }
+    return manualNewMissionDecision(
+      unresolved,
+      `ended in unsupported state ${unresolved.status}`,
+    );
+  }
+
+  if (!lineage.leaves.every(receiptReady)) {
+    throw new SupervisorRuntimeError(
+      "invalid_terminal_receipt",
+      "Successful recovery leaves are not bound to exact succeeded/pass receipts",
+    );
   }
   return await synthesisDecision(
     snapshot,
-    snapshot.jobs,
+    lineage.leaves,
     signal,
     dependencies,
   );
@@ -1698,6 +2658,7 @@ function productionTickDependencies(): MissionSupervisorTickDependencies {
       }),
     runPlanningNetwork: (input, options) =>
       runSupervisorPlanningNetwork(input, options),
+    runRecovery: runJarvisRecovery,
     runSynthesis: runJarvisReceiptSynthesis,
     scheduleHeartbeat: (callback, delayMs) => {
       const handle = setInterval(callback, delayMs);
@@ -1714,8 +2675,8 @@ export const missionSupervisorTick = task({
   id: MISSION_SUPERVISOR_TICK_TASK_ID,
   machine: "small-1x",
   queue: {
-    name: "jarvis-mission-supervisor",
-    concurrencyLimit: 1,
+    name: MISSION_SUPERVISOR_QUEUE,
+    concurrencyLimit: MISSION_SUPERVISOR_CONCURRENCY_LIMIT,
   },
   retry: { maxAttempts: 1 },
   maxDuration: 1_800,
