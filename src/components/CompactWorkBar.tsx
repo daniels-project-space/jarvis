@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRealtimeRun } from "@trigger.dev/react-hooks";
 import { parseTerminalOutput, type TerminalTone } from "../lib/terminal-output";
 import { viewerFetch } from "../lib/viewer-request";
+import { supervisorInputValidationError } from "../lib/supervisor-control";
 import type {
   CompactJobDetail,
   CompactWorkSnapshot,
@@ -319,6 +320,90 @@ export function supervisorControlPayload(
   };
 }
 
+type SupervisorControlFetcher = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Promise<Response>;
+
+export type SupervisorControlSubmission = {
+  ok: boolean;
+  error: string | null;
+  pendingRequest: PendingSupervisorRequest | null;
+  responseStatus: number | null;
+  submitted: boolean;
+};
+
+export async function submitSupervisorControlRequest({
+  current,
+  request,
+  exactRetry,
+  replayAmbiguous = false,
+  createUuid,
+  fetcher = viewerFetch,
+}: {
+  current: PendingSupervisorRequest | null;
+  request: SupervisorRequestContent;
+  exactRetry?: PendingSupervisorRequest;
+  replayAmbiguous?: boolean;
+  createUuid?: () => string;
+  fetcher?: SupervisorControlFetcher;
+}): Promise<SupervisorControlSubmission> {
+  const effectiveRequest = exactRetry?.request ?? request;
+  const inputError = supervisorInputValidationError(effectiveRequest.input);
+  if (inputError) {
+    return {
+      ok: false,
+      error: inputError,
+      pendingRequest: null,
+      responseStatus: 400,
+      submitted: false,
+    };
+  }
+  const identity = exactRetry ?? supervisorRequestIdentity(
+    current,
+    effectiveRequest,
+    createUuid,
+    replayAmbiguous,
+  );
+  try {
+    const response = await fetcher("/api/work-control", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(
+        supervisorControlPayload(identity.request, identity.requestKey),
+      ),
+    });
+    const payload = await response.json().catch(() => ({}));
+    const ok = response.ok && payload?.ok === true;
+    return {
+      ok,
+      error: ok
+        ? null
+        : String(
+          payload?.error
+            ?? `The controller rejected ${identity.request.action}.`,
+        ),
+      pendingRequest: preserveSupervisorRequestKey(response.status)
+        ? identity
+        : null,
+      responseStatus: response.status,
+      submitted: true,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: String(
+        error instanceof Error
+          ? error.message
+          : "The authenticated controller could not be reached.",
+      ),
+      pendingRequest: identity,
+      responseStatus: null,
+      submitted: true,
+    };
+  }
+}
+
 function Controls({ controls, target, onError }: { controls: FleetControl[]; target: ControlTarget; onError: (value: string) => void }) {
   const [acting, setActing] = useState("");
   const [steering, setSteering] = useState(false);
@@ -345,7 +430,6 @@ function Controls({ controls, target, onError }: { controls: FleetControl[]; tar
       onError("Answer Jarvis before sending this control.");
       return;
     }
-    let body: Record<string, unknown>;
     const supervisor = target.supervisor;
     const supervisorRequest = supervisor !== undefined
       || exactRetry !== undefined;
@@ -365,33 +449,48 @@ function Controls({ controls, target, onError }: { controls: FleetControl[]; tar
         onError("The current supervisor authority has not loaded.");
         return;
       }
-      const identity = exactRetry ?? supervisorRequestIdentity(
-        pendingSupervisorRequest.current,
-        {
-          missionId: target.missionId,
-          action,
-          expectedInputRevision: supervisor!.inputRevision,
-          ...(input === undefined ? {} : { input }),
-        },
-        undefined,
-        retryableSupervisorRequest !== null,
-      );
-      pendingSupervisorRequest.current = identity;
-      if (identity !== retryableSupervisorRequest) {
-        setRetryableSupervisorRequest(null);
-      }
-      body = supervisorControlPayload(identity.request, identity.requestKey);
-    } else {
-      if (action === "provide_input") {
-        onError("Supervisor input requires an exact mission authority.");
-        return;
-      }
-      body = {
-        ...target,
+      const request = exactRetry?.request ?? {
+        missionId: target.missionId,
         action,
-        ...(action === "steer" ? { input } : {}),
+        expectedInputRevision: supervisor!.inputRevision,
+        ...(input === undefined ? {} : { input }),
       };
+      setActing(action);
+      onError("");
+      try {
+        const submission = await submitSupervisorControlRequest({
+          current: pendingSupervisorRequest.current,
+          request,
+          exactRetry,
+          replayAmbiguous: retryableSupervisorRequest !== null,
+        });
+        // A local validation failure and every definitive HTTP response clear
+        // any prior ambiguous key. Only a transport/503 outcome retains it.
+        pendingSupervisorRequest.current = submission.pendingRequest;
+        setRetryableSupervisorRequest(submission.pendingRequest);
+        if (!submission.ok) {
+          onError(
+            submission.error ?? `The controller rejected ${action}.`,
+          );
+        } else {
+          setSteering(false);
+          setSteeringInput("");
+          setAnswerInput("");
+        }
+      } finally {
+        setActing("");
+      }
+      return;
     }
+    if (action === "provide_input") {
+      onError("Supervisor input requires an exact mission authority.");
+      return;
+    }
+    const body = {
+      ...target,
+      action,
+      ...(action === "steer" ? { input } : {}),
+    };
     setActing(action);
     onError("");
     try {
@@ -400,15 +499,6 @@ function Controls({ controls, target, onError }: { controls: FleetControl[]; tar
         body: JSON.stringify(body),
       });
       const payload = await response.json().catch(() => ({}));
-      if (supervisorRequest) {
-        if (preserveSupervisorRequestKey(response.status)) {
-          setRetryableSupervisorRequest(
-            pendingSupervisorRequest.current,
-          );
-        } else {
-          clearPendingSupervisorRequest();
-        }
-      }
       if (!response.ok || payload?.ok !== true) onError(String(payload?.error ?? `The controller rejected ${action}.`));
       else {
         setSteering(false);
@@ -416,11 +506,6 @@ function Controls({ controls, target, onError }: { controls: FleetControl[]; tar
         setAnswerInput("");
       }
     } catch (error) {
-      // A transport failure has an ambiguous outcome. Retain the exact key so
-      // the next click replays the same immutable Convex control receipt.
-      if (supervisorRequest) {
-        setRetryableSupervisorRequest(pendingSupervisorRequest.current);
-      }
       onError(String(error instanceof Error ? error.message : "The authenticated controller could not be reached."));
     } finally { setActing(""); }
   };

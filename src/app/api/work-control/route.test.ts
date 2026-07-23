@@ -63,6 +63,8 @@ function supervisorReceipt(overrides: Record<string, unknown> = {}) {
     noop: false,
     reason: "steered",
     scope: "planning_only_zero_jobs",
+    missionId: "mission-supervised-1",
+    action: "steer",
     requestDigest: "must-not-leak",
     controlReceiptId: "must-not-leak",
     state: "ready",
@@ -138,6 +140,32 @@ describe("authenticated work controls", () => {
     expect(controlMutation).not.toHaveBeenCalled();
   });
 
+  it("accepts the exact UTF-8 boundary and rejects multi-byte overflow before mutation", async () => {
+    vi.mocked(controlMutation).mockResolvedValue(supervisorReceipt({
+      wakeTicket: null,
+    }));
+    const accepted = await POST(request(supervisorRequest({
+      input: "é".repeat(1_000),
+    })));
+    expect(accepted.status).toBe(200);
+    expect(controlMutation).toHaveBeenCalledWith(
+      "missionSupervisor:controlV1",
+      expect.objectContaining({ input: "é".repeat(1_000) }),
+    );
+
+    vi.mocked(controlMutation).mockClear();
+    const rejected = await POST(request(supervisorRequest({
+      input: "é".repeat(1_001),
+    })));
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toEqual({
+      ok: false,
+      error: "Supervisor instructions must be 2,000 UTF-8 bytes or fewer.",
+    });
+    expect(controlMutation).not.toHaveBeenCalled();
+    expect(dispatchMissionSupervisorWakeTicket).not.toHaveBeenCalled();
+  });
+
   it("passes exact owner-fenced arguments and returns only minimal dispatch identity", async () => {
     const response = await POST(
       request(supervisorRequest({
@@ -176,12 +204,62 @@ describe("authenticated work controls", () => {
     expect(JSON.stringify(payload)).not.toContain("controlReceiptId");
   });
 
+  it("returns retryable 503 for a receipt bound to another mission or action even without a wake", async () => {
+    for (const mismatch of [
+      { missionId: "mission-supervised-other", wakeTicket: null },
+      { action: "pause", wakeTicket: null },
+    ]) {
+      vi.mocked(controlMutation).mockResolvedValueOnce(
+        supervisorReceipt(mismatch),
+      );
+      const response = await POST(request(supervisorRequest()));
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual({
+        ok: false,
+        retryable: true,
+        error: "The supervisor returned a receipt for another control. Retry the same request.",
+      });
+    }
+    expect(dispatchMissionSupervisorWakeTicket).not.toHaveBeenCalled();
+  });
+
+  it("returns retryable 503 for incomplete applied or no-op receipts", async () => {
+    const incomplete = [
+      supervisorReceipt({ state: undefined, wakeTicket: null }),
+      supervisorReceipt({ inputRevision: undefined, wakeTicket: null }),
+      supervisorReceipt({
+        applied: false,
+        noop: true,
+        action: "cancel",
+        state: undefined,
+        wakeTicket: null,
+      }),
+    ];
+    const requests = [
+      supervisorRequest(),
+      supervisorRequest(),
+      supervisorRequest({ action: "cancel", input: undefined }),
+    ];
+    for (let index = 0; index < incomplete.length; index += 1) {
+      vi.mocked(controlMutation).mockResolvedValueOnce(incomplete[index]);
+      const response = await POST(request(requests[index]));
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual({
+        ok: false,
+        retryable: true,
+        error: "The supervisor returned an incomplete applied control receipt. Retry the same request.",
+      });
+    }
+    expect(dispatchMissionSupervisorWakeTicket).not.toHaveBeenCalled();
+  });
+
   it("treats an immutable replayed no-op as successful without dispatch", async () => {
     vi.mocked(controlMutation).mockResolvedValue(supervisorReceipt({
       applied: false,
       replayed: true,
       noop: true,
       reason: "terminal_noop",
+      action: "cancel",
       state: "terminal",
       wakeTicket: null,
     }));
@@ -207,6 +285,7 @@ describe("authenticated work controls", () => {
       applied: false,
       noop: false,
       reason: "stale_input_revision",
+      action: "pause",
       state: "paused",
       inputRevision: 11,
       wakeTicket: null,
@@ -232,6 +311,7 @@ describe("authenticated work controls", () => {
       applied: false,
       noop: false,
       reason: "active_jobs_require_batch_control",
+      action: "pause",
       inputRevision: 7,
       wakeTicket: null,
     }));

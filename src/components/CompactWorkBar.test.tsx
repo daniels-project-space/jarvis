@@ -1,13 +1,19 @@
 import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { CompactWorkSnapshot, FleetNode } from "../lib/active-work";
+import {
+  SUPERVISOR_INPUT_TOO_LARGE_ERROR,
+  supervisorInputUtf8Bytes,
+  supervisorInputValidationError,
+} from "../lib/supervisor-control";
 import {
   FleetCommandCenter,
   FleetDag,
   fleetDagLayout,
   fleetNodeStateLabel,
   preserveSupervisorRequestKey,
+  submitSupervisorControlRequest,
   supervisorControlPayload,
   supervisorRequestIdentity,
 } from "./CompactWorkBar";
@@ -315,6 +321,92 @@ describe("FleetCommandCenter", () => {
     expect(preserveSupervisorRequestKey(503)).toBe(true);
     expect(preserveSupervisorRequestKey(200)).toBe(false);
     expect(preserveSupervisorRequestKey(409)).toBe(false);
+  });
+
+  it("uses the UTF-8 byte boundary and refuses overflow before creating a key or calling the network", async () => {
+    expect(supervisorInputUtf8Bytes("a".repeat(2_000))).toBe(2_000);
+    expect(supervisorInputUtf8Bytes("é".repeat(1_000))).toBe(2_000);
+    expect(supervisorInputValidationError("é".repeat(1_000))).toBeNull();
+    expect(supervisorInputValidationError("é".repeat(1_001)))
+      .toBe(SUPERVISOR_INPUT_TOO_LARGE_ERROR);
+
+    const ambiguous = supervisorRequestIdentity(
+      null,
+      {
+        missionId: "mission-supervised-1",
+        action: "steer",
+        expectedInputRevision: 7,
+        input: "Keep the exact retry.",
+      },
+      () => "11111111-1111-4111-8111-111111111111",
+    );
+    const createUuid = vi.fn(
+      () => "22222222-2222-4222-8222-222222222222",
+    );
+    const fetcher = vi.fn();
+    const result = await submitSupervisorControlRequest({
+      current: ambiguous,
+      request: {
+        missionId: "mission-supervised-1",
+        action: "steer",
+        expectedInputRevision: 8,
+        input: "é".repeat(1_001),
+      },
+      replayAmbiguous: true,
+      createUuid,
+      fetcher,
+    });
+    expect(result).toEqual({
+      ok: false,
+      error: SUPERVISOR_INPUT_TOO_LARGE_ERROR,
+      pendingRequest: null,
+      responseStatus: 400,
+      submitted: false,
+    });
+    expect(createUuid).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("retains one exact supervisor key only for ambiguous transport outcomes", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(Response.json(
+        { ok: false, retryable: true, error: "Retry the same request." },
+        { status: 503 },
+      ))
+      .mockResolvedValueOnce(Response.json({ ok: true }));
+    const request = {
+      missionId: "mission-supervised-1",
+      action: "steer" as const,
+      expectedInputRevision: 7,
+      input: "Preserve the exact boundary.",
+    };
+    const first = await submitSupervisorControlRequest({
+      current: null,
+      request,
+      createUuid: () => "11111111-1111-4111-8111-111111111111",
+      fetcher,
+    });
+    expect(first.pendingRequest?.requestKey)
+      .toBe("ui:11111111-1111-4111-8111-111111111111");
+    expect(first.responseStatus).toBe(503);
+    expect(first.submitted).toBe(true);
+
+    const retry = await submitSupervisorControlRequest({
+      current: first.pendingRequest,
+      request,
+      exactRetry: first.pendingRequest ?? undefined,
+      fetcher,
+    });
+    expect(retry).toMatchObject({
+      ok: true,
+      pendingRequest: null,
+      responseStatus: 200,
+      submitted: true,
+    });
+    const sent = vi.mocked(fetcher).mock.calls.map(([, init]) =>
+      JSON.parse(String(init?.body))
+    );
+    expect(sent[0].requestKey).toBe(sent[1].requestKey);
   });
 
   it("does not auto-open a resolved mission from before this browser session", () => {

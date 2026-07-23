@@ -4,6 +4,10 @@ import { controlMutation, controlQuery } from "@/lib/control-session";
 import { wakeAgentFleet } from "@/lib/agent-fleet-dispatch";
 import { dispatchMissionSupervisorWakeTicket } from "@/lib/mission-supervisor-dispatch-server";
 import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
+import {
+  SUPERVISOR_INPUT_TOO_LARGE_ERROR,
+  supervisorInputValidationError,
+} from "@/lib/supervisor-control";
 
 const ACTIONS = new Set(["approve", "decline", "pause", "resume", "cancel", "retry", "answer", "steer"]);
 const MISSION_ACTIONS = new Set(["pause", "resume", "cancel", "steer"]);
@@ -31,7 +35,10 @@ const supervisorRequestSchema = z.object({
   action: supervisorActionSchema,
   requestKey: z.string().regex(/^ui:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
   expectedInputRevision: safeIntegerSchema,
-  input: z.string().trim().min(1).max(2_000).optional(),
+  input: z.string().trim().min(1).max(2_000).refine(
+    (value) => supervisorInputValidationError(value) === null,
+    { message: SUPERVISOR_INPUT_TOO_LARGE_ERROR },
+  ).optional(),
 }).strict().superRefine((request, ctx) => {
   const acceptsInput = request.action === "steer"
     || request.action === "provide_input";
@@ -65,6 +72,8 @@ const supervisorResultSchema = z.object({
   replayed: z.boolean(),
   noop: z.boolean(),
   reason: z.string(),
+  missionId: z.string().min(1).max(160),
+  action: supervisorActionSchema,
   state: supervisorStateSchema.optional(),
   inputRevision: safeIntegerSchema.optional(),
   wakeTicket: supervisorWakeTicketSchema.nullable(),
@@ -115,6 +124,14 @@ async function applySupervisorControl(
   }
   const result = parsedResult.data;
   if (
+    result.missionId !== request.missionId
+    || result.action !== request.action
+  ) {
+    return retryableSupervisorResponse(
+      "The supervisor returned a receipt for another control. Retry the same request.",
+    );
+  }
+  if (
     result.wakeTicket !== null
     && result.wakeTicket.missionId !== request.missionId
   ) {
@@ -123,6 +140,18 @@ async function applySupervisorControl(
     );
   }
   const ok = result.applied || result.noop;
+  if (
+    ok
+    && (
+      result.applied === result.noop
+      || result.state === undefined
+      || result.inputRevision === undefined
+    )
+  ) {
+    return retryableSupervisorResponse(
+      "The supervisor returned an incomplete applied control receipt. Retry the same request.",
+    );
+  }
   if (!ok) {
     if (result.reason === "stale_input_revision") {
       return Response.json({
@@ -293,8 +322,14 @@ export async function POST(req: NextRequest) {
   if (hasProtocol(body)) {
     const parsedRequest = supervisorRequestSchema.safeParse(body);
     if (!parsedRequest.success) {
+      const inputError = supervisorInputValidationError(
+        typeof body.input === "string" ? body.input : undefined,
+      );
       return Response.json(
-        { ok: false, error: "Invalid supervisor control request." },
+        {
+          ok: false,
+          error: inputError ?? "Invalid supervisor control request.",
+        },
         { status: 400 },
       );
     }
