@@ -1733,13 +1733,38 @@ export const checkpointAndRequeue = mutation({
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
-    const row = await ctx.db.get(a.jobId);
+    let row = await ctx.db.get(a.jobId);
     if (!row || (row.attempt ?? 1) !== a.expectedAttempt) {
       return { requeued: false, exhausted: false, stale: true };
     }
     const delivery = a.deliveryGeneration === undefined ? null : await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration));
     if (a.deliveryGeneration !== undefined && (!delivery || !hasLiveControllerFence(row, delivery, a))) {
       return { requeued: false, exhausted: false, stale: true };
+    }
+    // A rolling deployment may leave an already-running legacy row that never
+    // passed through pending-claim backfill. Establish its safety-aware route
+    // before every continuation path, then preserve that exact decision unless
+    // the explicit quality-evidence branch below escalates it.
+    if (!row.model || !row.reasoningEffort || !row.modelReason) {
+      const policy = selectCodexWorkPolicy({
+        task: String(row.task ?? "Agent work"),
+        role: row.agentId,
+        repo: row.repo,
+        readonly: row.readonly,
+        risk: row.risk,
+        tools: row.mcp,
+        requestedModel: row.model,
+        requestedReasoningEffort: row.reasoningEffort,
+      });
+      const routePatch = {
+        model: policy.model,
+        reasoningEffort: policy.reasoningEffort,
+        modelReason: policy.modelReason,
+        modelQualityFailures: Math.max(0, Number(row.modelQualityFailures ?? 0)),
+        modelEscalations: Math.max(0, Number(row.modelEscalations ?? 0)),
+      };
+      await patchJobWithRuntime(ctx, row, routePatch);
+      row = { ...row, ...routePatch };
     }
     const requestedStatus = a.nextStatus ?? "pending";
     const stoppedState = requestedStatus === "paused" || requestedStatus === "cancelled";

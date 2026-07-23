@@ -452,7 +452,7 @@ export function goalBranch(goal: string, missionId: string): string {
 
 export function plannerTask(goal: string, route: GoalRoute, acceptanceCriteria: string[], maxBuildSessions: number): string {
   return [
-    "GOAL MODE — SOL/MAX PLANNING SESSION. Plan only; do not edit, deploy, publish, or start implementation.",
+    "GOAL MODE — ADAPTIVELY ROUTED ARCHITECTURE PLANNING SESSION. Plan only; do not edit, deploy, publish, or start implementation.",
     `Outcome: ${goal}`,
     `Deterministic route: ${route.kind}${route.primaryRepo ? ` · ${route.primaryRepo}` : ""}`,
     `Why: ${route.reason}`,
@@ -483,7 +483,7 @@ export function validatorTask(args: {
     .join("\n")
     .slice(0, maxChars);
   const prompt = [
-    "GOAL MODE — SOL/MAX FINAL VALIDATION SESSION. Be the skeptical owner of the outcome, not a summary writer.",
+    "GOAL MODE — ADAPTIVELY ROUTED FINAL VALIDATION SESSION. Be the skeptical owner of the outcome, not a summary writer.",
     `Outcome: ${args.goal.slice(0, 1_000)}`,
     `Revision wave: ${args.revisionWave}`,
     `Plan summary: ${args.plan.summary.slice(0, 1_500)}`,
@@ -501,7 +501,7 @@ export function validatorTask(args: {
       : "",
     EVIDENCE_INTEGRITY_RULES,
     SAFE_SANDBOX_EXECUTION_RULES,
-    "Inspect the actual branch and current code. Run proportionate deep tests, typecheck/build, end-to-end or browser checks, and exact provider/deployment checks where the goal requires them. A command exit code alone is not proof. Do not merge or deploy yourself; a pass hands the branch to the automatic delivery controller. Do not publish publicly, spend, message or perform destructive actions. If a gap is fixable in the existing scope, return refine with 1-3 precise Terra repair sessions. Use blocked only for a genuine Daniel/external decision. Use pass only when the outcome—not merely each task—is evidenced.",
+    "Inspect the actual branch and current code. Run proportionate deep tests, typecheck/build, end-to-end or browser checks, and exact provider/deployment checks where the goal requires them. A command exit code alone is not proof. Do not merge or deploy yourself; a pass hands the branch to the automatic delivery controller. Do not publish publicly, spend, message or perform destructive actions. If a gap is fixable in the existing scope, return refine with 1-3 precise policy-routed repair sessions. Use blocked only for a genuine Daniel/external decision. Use pass only when the outcome—not merely each task—is evidenced.",
     "End with exactly one compact JSON object after GOAL_VALIDATION_JSON: using:",
     '{"verdict":"pass|refine|blocked","summary":"...","evidence":["exact check/result"],"gaps":["..."],"refinements":[{"id":"...","label":"...","task":"self-contained repair","acceptanceCriteria":["..."]}],"blocker":"only when blocked"}',
     "The JSON is a machine contract. Keep it under 3,500 characters.",

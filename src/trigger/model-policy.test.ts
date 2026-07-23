@@ -6,6 +6,7 @@ import {
   codexExecPrefix,
   codexModelFor,
   codexReviewExecPrefix,
+  memoryExtractionModelPolicy,
   normalizeReasoningEffort,
   pickConversationTier,
 } from "./model-policy";
@@ -84,5 +85,12 @@ describe("subscription model policy", () => {
       expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
       expect(args).not.toContain("gpt-5.6");
     }
+  });
+
+  it("routes the bounded background memory synthesizer through the shared policy", () => {
+    const route = memoryExtractionModelPolicy();
+    expect(route).toMatchObject({ model: "luna", reasoningEffort: "medium", workType: "synthesis" });
+    expect(route.modelReason).toMatch(/Bounded deterministic synthesis/);
+    expect(codexConversationExecPrefix(route.model, route.reasoningEffort)).toContain('model_reasoning_effort="medium"');
   });
 });

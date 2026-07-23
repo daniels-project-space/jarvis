@@ -2,6 +2,7 @@ import { normalizeWorkModelTier, type WorkModelTier } from "../lib/work-models";
 import { visibleTurnText } from "../lib/host-context";
 import {
   normalizeCodexReasoningEffort,
+  selectCodexWorkPolicy,
   type CodexReasoningEffort,
 } from "../lib/codex-work-router";
 
@@ -95,20 +96,35 @@ export function codexReviewExecPrefix(tier: string, effort?: unknown): string[] 
 // general Codex plugin + MCP stack on every short turn while retaining full
 // shell access for Jarvis's private tool endpoint. Durable coding agents keep
 // the broader codexExecPrefix above.
-export function codexConversationExecPrefix(tier: string): string[] {
+export function codexConversationExecPrefix(tier: string, effort?: unknown): string[] {
   const selected = codexModelFor(tier);
+  const reasoningEffort = normalizeReasoningEffort(effort, selected.effort);
   return [
     "exec",
     "--model",
     selected.model,
     "--config",
-    `model_reasoning_effort=\"${selected.effort}\"`,
+    `model_reasoning_effort=\"${reasoningEffort}\"`,
     "--sandbox",
     "danger-full-access",
     "--skip-git-repo-check",
     "--ignore-user-config",
     "--ignore-rules",
   ];
+}
+
+/** The background memory workstream is policy-routed like every other Codex subprocess. */
+export function memoryExtractionModelPolicy() {
+  return selectCodexWorkPolicy({
+    task: "Extract a bounded deterministic set of durable memory facts from one completed conversation",
+    role: "memory-extractor",
+    workType: "synthesis",
+    complexity: "bounded",
+    uncertainty: "low",
+    productionRisk: "medium",
+    expectedDuration: "short",
+    toolBreadth: "narrow",
+  });
 }
 
 export function pickConversationTier(text: string): WorkModelTier {

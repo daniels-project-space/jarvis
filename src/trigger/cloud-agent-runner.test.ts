@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { CodexAppServer, CodexPermissionAttestationError } from "./codex-app-server";
 import { runCloudWorkspaceAgent } from "./cloud-agent-runner";
 import { DEFAULT_WORKSPACE_LIMITS } from "./cloud-workspace";
@@ -18,18 +18,22 @@ describe("cloud Codex runner attestation boundary", () => {
       new CodexPermissionAttestationError("Codex thread did not activate the required permission profile"),
     );
     vi.spyOn(CodexAppServer.prototype, "stop").mockImplementation(() => undefined);
-
-    await expect(runCloudWorkspaceAgent({
-      bin: "unused", controllerScratch: "/tmp/work/controller-job-1",
-      controllerEnv: { NODE_ENV: "test", CODEX_HOME: "/authority/codex-job-1", HOME: "/authority" },
-      provider, workspace, prompt: "work", model: "terra", reasoningEffort: "high", timeoutMs: 2_000,
-    })).rejects.toMatchObject({
-      name: "CloudWorkspaceError", code: "controller_isolation_unproven", disposition: "blocked",
-    });
-    expect(CodexAppServer.prototype.runTurn).toHaveBeenCalledWith(expect.objectContaining({
-      modelTier: "terra",
-      reasoningEffort: "high",
-    }));
+    const scratch = mkdtempSync("/tmp/work/controller-job-1-");
+    try {
+      await expect(runCloudWorkspaceAgent({
+        bin: "unused", controllerScratch: scratch,
+        controllerEnv: { NODE_ENV: "test", CODEX_HOME: "/authority/codex-job-1", HOME: "/authority" },
+        provider, workspace, prompt: "work", model: "terra", reasoningEffort: "high", timeoutMs: 2_000,
+      })).rejects.toMatchObject({
+        name: "CloudWorkspaceError", code: "controller_isolation_unproven", disposition: "blocked",
+      });
+      expect(CodexAppServer.prototype.runTurn).toHaveBeenCalledWith(expect.objectContaining({
+        modelTier: "terra",
+        reasoningEffort: "high",
+      }));
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
   });
 
   it("does not reach a model turn when the isolated CODEX_HOME cannot be attested", async () => {

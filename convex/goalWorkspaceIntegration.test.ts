@@ -179,6 +179,52 @@ async function claimedFirstIntegration(prefix: string) {
 }
 
 describe("real Convex multi-agent workspace and integration races", () => {
+  it("routes Goal planner, research, repair, and refinement producers through one persisted policy", async () => {
+    const f = await goalAwaitingPlan();
+    const planner = await f.t.run(async (ctx) => (await ctx.db.query("jobs")
+      .withIndex("by_mission", (q) => q.eq("missionId", String(f.missionId))).collect())
+      .find((job) => job.goalStage === "planning"));
+    expect(planner).toMatchObject({ model: "sol", reasoningEffort: "max" });
+    expect(planner!.modelReason).toMatch(/Long or high-risk architecture/);
+
+    const plan = {
+      summary: "Adaptive producer route coverage", route: "existing_project", primaryRepo: REPO, assumptions: [],
+      workstreams: [
+        { id: "research", label: "Bounded research", task: "Research the bounded current primary sources and summarize exact evidence.", agentId: "atlas", repo: REPO, readonly: true, dependsOn: [], acceptanceCriteria: ["evidence captured"], mcp: ["context7"] },
+        { id: "repair", label: "Bounded repair", task: "Implement the deterministic bounded known fix in one file.", agentId: "paul", repo: REPO, readonly: false, dependsOn: [], acceptanceCriteria: ["contract passes"], mcp: ["context7"] },
+      ],
+      validation: { criteria: ["integrated"], tests: ["npm test"], liveChecks: [] },
+    };
+    expect(await f.t.mutation(api.goalMode.recordPlan, {
+      id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
+    })).toMatchObject({ advanced: true, jobs: 2 });
+    const builders = await f.t.run(async (ctx) => (await ctx.db.query("jobs")
+      .withIndex("by_mission", (q) => q.eq("missionId", String(f.missionId))).collect())
+      .filter((job) => job.goalStage === "building"));
+    expect(builders.find((job) => job.goalWorkstreamId === "research")).toMatchObject({ model: "luna", reasoningEffort: "medium" });
+    expect(builders.find((job) => job.goalWorkstreamId === "research")?.modelReason).toMatch(/Bounded research specialist/);
+    expect(builders.find((job) => job.goalWorkstreamId === "repair")).toMatchObject({ model: "luna", reasoningEffort: "medium" });
+    expect(builders.find((job) => job.goalWorkstreamId === "repair")?.modelReason).toMatch(/Deterministic bounded implementation/);
+
+    await f.t.run(async (ctx) => {
+      await ctx.db.patch(f.missionId, { phase: "validating", advanceAttempt: 1 });
+    });
+    expect(await f.t.mutation(api.goalMode.recordValidation, {
+      id: f.missionId,
+      expectedAdvanceAttempt: 1,
+      validation: {
+        verdict: "refine", summary: "One bounded gap remains", evidence: [], gaps: ["rename contract"],
+        refinements: [{ id: "refine-rename", label: "Refine rename", task: "Apply the deterministic bounded rename in one file.", acceptanceCriteria: ["exact test passes"] }],
+      },
+      workerToken: TOKEN,
+    })).toMatchObject({ advanced: true, status: "refining", jobs: 1 });
+    const refinement = await f.t.run(async (ctx) => (await ctx.db.query("jobs")
+      .withIndex("by_mission", (q) => q.eq("missionId", String(f.missionId))).collect())
+      .find((job) => job.goalStage === "refining"));
+    expect(refinement).toMatchObject({ model: "luna", reasoningEffort: "medium" });
+    expect(refinement!.modelReason).toMatch(/Deterministic bounded implementation/);
+  });
+
   it("projects all 320 action-scope decisions identically into Goal Mode producers", async () => {
     expect(GENERATED_GATED_ACTION_MATRIX).toHaveLength(320);
     for (const [index, task] of GENERATED_GATED_ACTION_MATRIX.entries()) {
@@ -612,7 +658,8 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(handoffs.every((handoff) => handoff.planDigest === recorded.planDigest && handoff.planGeneration === 1)).toBe(true);
 
     const [validatorRun] = await dispatch(f.t, 8, "dag-validator");
-    expect(validatorRun.claim).toMatchObject({ goalStage: "validating", reasoningEffort: "max", readonly: true, repo: null });
+    expect(validatorRun.claim).toMatchObject({ goalStage: "validating", model: "sol", reasoningEffort: "max", readonly: true, repo: null });
+    expect(validatorRun.claim?.modelReason).toMatch(/Verification workload|Long-running supervised work/);
     const validationResult = `GOAL_VALIDATION_JSON:${JSON.stringify({ verdict: "pass", summary: "Original cross-project goal proved", evidence: ["four generation-bound handoffs"], gaps: [], refinements: [] })}`;
     const validatorJob: any = await f.t.run(async (ctx) => ctx.db.get(validatorRun.reservation.jobId as any));
     await finalizeReadonly(f.t, validatorJob, validationResult, "Parent Sol validator checked original plan, handoffs, child heads, and live checks.");
@@ -1792,7 +1839,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
       integrations: await ctx.db.query("integrationAttempts").collect(), attempts: await ctx.db.query("workAttempts").collect(),
     }));
     const repairJob = rows.jobs.find((job) => job._id === repair!.repairJobId);
-    expect(repairJob).toMatchObject({ parentJobId: String(integration.jobId), sourceBranch: integration.integrationBranch });
+    expect(repairJob).toMatchObject({
+      parentJobId: String(integration.jobId), sourceBranch: integration.integrationBranch,
+      model: "luna", reasoningEffort: "medium",
+    });
+    expect(repairJob?.modelReason).toMatch(/Deterministic bounded implementation/);
     expect(repairJob?.workerBranch).not.toBe(integration.workerBranch);
     expect(rows.jobs.filter((job) => job.goalStage === "building")).toHaveLength(3);
     expect(rows.attempts.filter((attempt) => attempt.workerRunId?.startsWith("specialist"))).toHaveLength(2);

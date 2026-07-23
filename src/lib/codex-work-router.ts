@@ -55,7 +55,7 @@ const EFFORT_RANK: Record<CodexReasoningEffort, number> = { low: 0, medium: 1, h
 
 const RESEARCH = /\b(research|compare|survey|primary sources?|literature|market|competitor|find out|summari[sz]e|analyse|analyze)\b/i;
 const ARCHITECTURE = /\b(architecture|architectural|system design|redesign|platform design|migration plan|technical strategy)\b/i;
-const IMPLEMENTATION = /\b(implement|build|code|fix|repair|refactor|migrat|edit|change|feature|bug|schema|api|database|typescript|react|next\.?js|convex|trigger)\b/i;
+const IMPLEMENTATION = /\b(implement|apply|build|code|fix|repair|refactor|migrat(?:e|ion|ing)?|edit|change|feature|bug|schema|api|database|typescript|react|next\.?js|convex|trigger)\b/i;
 const VERIFICATION = /\b(verify|validate|verification|test|review|audit|check|prove|quality assurance|qa)\b/i;
 const SYNTHESIS = /\b(synthesi[sz]e|synthesis|weave|merge findings|consolidate|roll up|cross-project brief)\b/i;
 const BOUNDED = /\b(bounded|deterministic|one[- ]file|single[- ]file|small|routine|straightforward|exact|known fix|typo|rename|mechanical)\b/i;
@@ -69,6 +69,11 @@ const SECURITY = /\b(security|privacy|authentication|authorization|permissions?|
 const PRODUCTION = /\b(production|live|deploy|release|customer-facing|user data|data loss|outage|incident)\b/i;
 const BROAD_TOOLS = /\b(browser|playwright|provider|production logs?|web search|multiple repositories|cross[- ]project|multi[- ]repo)\b/i;
 const EXPLICIT_MAX_QUALITY = /\b(max(?:imum)? quality|highest quality|best available (?:model|reasoning)|use sol(?:\/max)?|sol\/max|deepest reasoning|think (?:very |really )?hard|do not economi[sz]e)\b/i;
+const EXPLICIT_HIGH_QUALITY = /\b(?:at|with|use|using|choose|select)?\s*high[- ]quality\b/i;
+const EXPLICIT_HIGH_EFFORT = /\bhigh reasoning effort\b|\breasoning effort(?:\s+(?:of|is|at)|\s*[:=])?\s*high\b/i;
+const EXPLICIT_TERRA = /\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+(?:the\s+)?terra(?:\/(?:low|medium|high|max))?\b|\bterra\/(?:low|medium|high|max)\b/i;
+const EXPLICIT_SOL = /\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+(?:the\s+)?sol(?:\/(?:low|medium|high|max))?\b|\bsol\/(?:low|medium|high|max)\b/i;
+const EXPLICIT_LUNA = /\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+(?:the\s+)?luna(?:\/(?:low|medium|high|max))?\b|\bluna\/(?:low|medium|high|max)\b/i;
 const DIFFICULT_ROOT_CAUSE = /\b(?:deep|difficult|recurring|intermittent|unknown|production) root cause\b|\broot cause\b.*\b(?:production|security|privacy|cross[- ]project|multi[- ]repo)\b/i;
 
 function boundedText(value: unknown, max = 120): string {
@@ -97,6 +102,21 @@ function maxEffort(left: CodexReasoningEffort, right: CodexReasoningEffort): Cod
   return EFFORT_RANK[left] >= EFFORT_RANK[right] ? left : right;
 }
 
+function explicitTextModel(task: string): WorkModelTier | null {
+  if (EXPLICIT_MAX_QUALITY.test(task) || EXPLICIT_SOL.test(task)) return "sol";
+  if (EXPLICIT_HIGH_QUALITY.test(task) || EXPLICIT_TERRA.test(task)) return "terra";
+  if (EXPLICIT_LUNA.test(task)) return "luna";
+  return null;
+}
+
+function explicitTextEffort(task: string): CodexReasoningEffort | null {
+  if (EXPLICIT_MAX_QUALITY.test(task) || /\b(?:luna|terra|sol)\/max\b|\bmax(?:imum)? reasoning effort\b/i.test(task)) return "max";
+  if (EXPLICIT_HIGH_QUALITY.test(task) || EXPLICIT_HIGH_EFFORT.test(task) || /\b(?:luna|terra|sol)\/high\b/i.test(task)) return "high";
+  if (/\b(?:luna|terra|sol)\/medium\b|\bmedium reasoning effort\b/i.test(task)) return "medium";
+  if (/\b(?:luna|terra|sol)\/low\b|\blow reasoning effort\b/i.test(task)) return "low";
+  return null;
+}
+
 function inferWorkType(task: string, role: string): CodexWorkType {
   if (/planner|architect/.test(role)) return "architecture";
   if (/validator|verifier|reviewer/.test(role)) return "verification";
@@ -107,7 +127,7 @@ function inferWorkType(task: string, role: string): CodexWorkType {
   if (IMPLEMENTATION.test(task)) return "implementation";
   if (RESEARCH.test(task) || role === "atlas") return "research";
   if (VERIFICATION.test(task) || role === "sentry") return "verification";
-  if (role === "iris") return "implementation";
+  if (role === "iris" || role === "paul") return "implementation";
   return "research";
 }
 
@@ -164,6 +184,7 @@ function selectionLead(input: {
   if (input.workType === "synthesis" && input.crossProject) return "Cross-project synthesis";
   if (input.workType === "architecture" && input.model === "sol") return "Long or high-risk architecture";
   if (input.workType === "research" && input.model === "luna") return "Bounded research specialist";
+  if (input.workType === "synthesis" && input.model === "luna") return "Bounded deterministic synthesis";
   if (input.workType === "implementation" && input.complexity === "bounded") return "Deterministic bounded implementation";
   if (input.workType === "verification" && input.model === "luna") return "Routine deterministic verification";
   if (input.expectedDuration === "long") return "Long-running supervised work";
@@ -191,7 +212,11 @@ export function selectCodexWorkPolicy(input: CodexWorkPolicyInput): CodexWorkSel
   const expectedDuration = input.expectedDuration ?? inferDuration(task, workType, complexity);
   const tools = Array.isArray(input.tools) ? input.tools : [];
   const toolBreadth = input.toolBreadth ?? inferToolBreadth(task, tools, crossProject);
-  const explicitQuality = EXPLICIT_MAX_QUALITY.test(task);
+  const proseModelFloor = explicitTextModel(task);
+  const proseEffortFloor = explicitTextEffort(task);
+  const explicitMaximum = EXPLICIT_MAX_QUALITY.test(task);
+  const explicitQuality = explicitMaximum || EXPLICIT_HIGH_QUALITY.test(task) || EXPLICIT_HIGH_EFFORT.test(task)
+    || proseModelFloor === "sol" || proseModelFloor === "terra";
   const difficultRootCause = DIFFICULT_ROOT_CAUSE.test(task);
 
   let model: WorkModelTier;
@@ -218,15 +243,22 @@ export function selectCodexWorkPolicy(input: CodexWorkPolicyInput): CodexWorkSel
         ? "terra"
         : "luna";
   } else {
-    model = crossProject || complexity === "intense" || expectedDuration === "long" ? "sol" : "terra";
+    model = crossProject || complexity === "intense" || expectedDuration === "long"
+      ? "sol"
+      : complexity === "bounded" && toolBreadth === "narrow"
+        ? "luna"
+        : "terra";
   }
 
   if (productionRisk === "critical" || (SECURITY.test(task) && productionRisk === "high") || difficultRootCause) {
     model = "sol";
   }
-  if (explicitQuality) model = "sol";
+  if (explicitMaximum) model = "sol";
 
-  const requestedModel = parseWorkModelTier(input.requestedModel);
+  const structuredModelFloor = parseWorkModelTier(input.requestedModel);
+  const requestedModel = structuredModelFloor && proseModelFloor
+    ? maxTier(structuredModelFloor, proseModelFloor)
+    : structuredModelFloor ?? proseModelFloor;
   if (requestedModel) model = maxTier(model, requestedModel);
 
   let reasoningEffort: CodexReasoningEffort;
@@ -240,12 +272,15 @@ export function selectCodexWorkPolicy(input: CodexWorkPolicyInput): CodexWorkSel
     reasoningEffort = complexity === "complex" || uncertainty === "high" || productionRisk === "high"
       || workType === "architecture" || toolBreadth === "broad" ? "high" : "medium";
   } else {
-    reasoningEffort = explicitQuality || productionRisk === "critical" || complexity === "intense"
+    reasoningEffort = explicitMaximum || productionRisk === "critical" || complexity === "intense"
       || (workType === "architecture" && expectedDuration === "long") || difficultRootCause
       || (workType === "synthesis" && crossProject) ? "max" : "high";
   }
   if (requestedModel === "sol") reasoningEffort = "max";
-  const requestedEffort = parseCodexReasoningEffort(input.requestedReasoningEffort);
+  const structuredEffortFloor = parseCodexReasoningEffort(input.requestedReasoningEffort);
+  const requestedEffort = structuredEffortFloor && proseEffortFloor
+    ? maxEffort(structuredEffortFloor, proseEffortFloor)
+    : structuredEffortFloor ?? proseEffortFloor;
   if (requestedEffort) reasoningEffort = maxEffort(reasoningEffort, requestedEffort);
 
   const lead = selectionLead({

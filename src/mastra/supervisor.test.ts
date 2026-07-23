@@ -59,4 +59,24 @@ describe("managed mission workflow", () => {
       reasoningEffort: "max",
     });
   });
+
+  it("preserves an explicit effort floor through both Mastra routing passes", async () => {
+    const plan = await planManagedMission("Apply one bounded implementation repair", {
+      repo: "jarvis",
+      workstreams: [{
+        label: "Exact repair",
+        task: "Apply the routine deterministic rename in one file",
+        agentId: "paul",
+        model: "luna",
+        reasoningEffort: "high",
+      }],
+    });
+
+    expect(plan.workstreams[0]).toMatchObject({
+      agentId: "paul",
+      model: "luna",
+      reasoningEffort: "high",
+    });
+    expect(plan.workstreams[0].modelReason).toMatch(/requested Luna\/high floor/);
+  });
 });

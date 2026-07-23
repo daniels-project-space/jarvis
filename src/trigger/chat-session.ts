@@ -7,7 +7,12 @@ import { CAPABILITIES, INFRA_MAP, PERSONA, REMEMBER } from "../lib/persona";
 import { visualInitiativeDirective } from "../lib/visual-initiative";
 import { visibleTurnText } from "../lib/host-context";
 import { buildContext } from "../lib/context";
-import { codexConversationExecPrefix, codexModelFor, pickConversationTier } from "./model-policy";
+import {
+  codexConversationExecPrefix,
+  codexModelFor,
+  memoryExtractionModelPolicy,
+  pickConversationTier,
+} from "./model-policy";
 import {
   prepareSubscriptionEnv,
   resolveSubscriptionAgentBin,
@@ -38,9 +43,9 @@ import {
 } from "./agent-tool-bridge";
 import { StreamPublisher } from "./stream-publisher";
 
-function cliArgs(provider: AgentProvider, prompt: string, tier: string, json = false): string[] {
+function cliArgs(provider: AgentProvider, prompt: string, tier: string, effort?: unknown, json = false): string[] {
   if (provider !== "codex") throw new Error("Jarvis permits only the Codex CLI runtime");
-  const args = codexConversationExecPrefix(tier);
+  const args = codexConversationExecPrefix(tier, effort);
   if (json) args.push("--json");
   args.push(prompt);
   return args;
@@ -224,8 +229,9 @@ async function extractAndSave(
     '{"kind","title","body","tags"} where kind is one of fact|preference|decision|task|project. ' +
     "Output [] if nothing is worth remembering. No prose, JSON only.\n\n" +
     `User: ${userText}\nAssistant: ${assistantText}`;
+  const route = memoryExtractionModelPolicy();
   const out = await new Promise<string>((resolve) => {
-    const p = spawn(bin, cliArgs(provider, prompt, "luna"), {
+    const p = spawn(bin, cliArgs(provider, prompt, route.model, route.reasoningEffort), {
       env,
       stdio: ["ignore", "pipe", "pipe"],
     });

@@ -66,7 +66,7 @@ describe("controller Codex review transport", () => {
     };
     const bin = "/opt/pinned/@openai/codex/0.144.5/bin/codex";
 
-    await expect(reviewPrompt(bin, env, prompt, 90_000, spawnReview)).resolves.toBe(prompt);
+    await expect(reviewPrompt(bin, env, prompt, 90_000, { model: "terra", reasoningEffort: "medium" }, spawnReview)).resolves.toBe(prompt);
 
     expect(invocation).toEqual({
       command: bin,
@@ -124,7 +124,7 @@ describe("controller Codex review transport", () => {
     const child = fakeChild();
     const spawnReview: CodexReviewSpawn = () => child;
     let settlements = 0;
-    const result = reviewPrompt("/missing/codex", { NODE_ENV: "test" }, "receipt", 90_000, spawnReview);
+    const result = reviewPrompt("/missing/codex", { NODE_ENV: "test" }, "receipt", 90_000, { model: "luna", reasoningEffort: "low" }, spawnReview);
     void result.then(() => { settlements += 1; });
 
     child.emit("error", new Error("spawn ENOENT"));
@@ -143,7 +143,7 @@ describe("controller Codex review transport", () => {
     child.kill.mockImplementation(() => { throw new Error("process already gone"); });
     const spawnReview: CodexReviewSpawn = () => child;
     let settlements = 0;
-    const result = reviewPrompt("/pinned/codex", { NODE_ENV: "test" }, "receipt", 90_000, spawnReview);
+    const result = reviewPrompt("/pinned/codex", { NODE_ENV: "test" }, "receipt", 90_000, { model: "sol", reasoningEffort: "max" }, spawnReview);
     void result.then(() => { settlements += 1; });
     child.stdout.write("partial-review");
 

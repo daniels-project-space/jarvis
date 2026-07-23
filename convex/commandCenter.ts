@@ -155,17 +155,74 @@ export function buildFleetSnapshot(input: {
   const primary = relevant[0];
   if (!primary) return { active: null, fleet: null };
 
-  const rawNodes = input.nodes?.length
-    ? [...input.nodes]
-    : (input.activities?.length ? input.activities : relevant).slice(0, FLEET_MAX_NODES).map((row) => ({
-        nodeId: String(row.planNodeId ?? row.jobId), jobId: row.jobId,
-        label: row.label ?? row.task, agentId: row.agentId, repository: row.repo,
-        dependencyCount: Array.isArray(row.dependsOn) ? row.dependsOn.length : 0,
-      }));
-  const rawEdges = input.edges?.length
-    ? [...input.edges]
+  const suppliedNodes = input.nodes?.length ? [...input.nodes] : [];
+  const suppliedEdges = input.edges?.length ? [...input.edges] : [];
+  if (suppliedNodes.length > FLEET_MAX_NODES) throw new Error(`Fleet projection exceeds ${FLEET_MAX_NODES} nodes`);
+  if (suppliedEdges.length > FLEET_MAX_EDGES) throw new Error(`Fleet projection exceeds ${FLEET_MAX_EDGES} edges`);
+
+  const missionId = input.mission ? String(input.mission.missionId ?? input.mission._id ?? "") : "";
+  const belongsToFleet = (row: RuntimeRow) => !missionId
+    || String(row.planParentMissionId ?? "") === missionId
+    || String(row.missionId ?? "") === missionId;
+  const relevantFleetRows = relevant.filter(belongsToFleet);
+  const activities = [...(input.activities ?? [])];
+  const activityJobIds = new Set(activities.map((row) => String(row.jobId)));
+  for (const row of relevantFleetRows) {
+    if (!activityJobIds.has(String(row.jobId))) activities.push(row);
+  }
+  const activityByJob = new Map(activities.map((row) => [String(row.jobId), row]));
+  const runtimeNode = (row: RuntimeRow): PlanNodeRow => ({
+    nodeId: String(row.planNodeId ?? `${row.goalStage ?? "active"}:${row.jobId}`),
+    jobId: row.jobId,
+    label: row.label ?? row.task,
+    agentId: row.agentId,
+    repository: row.repo,
+    dependencyCount: Array.isArray(row.dependsOn) ? row.dependsOn.length : 0,
+  });
+
+  const rawNodes = suppliedNodes.length
+    ? suppliedNodes
+    : [...relevantFleetRows, ...activities.filter((row) => !relevantFleetRows.some((live) => String(live.jobId) === String(row.jobId)))]
+        .slice(0, FLEET_MAX_NODES)
+        .map(runtimeNode);
+
+  // Validators, refinement waves and focused integration repairs are scoped to
+  // the mission but are intentionally not immutable GoalPlan nodes. Keep every
+  // highest-priority live row visible in the same bounded surface. At the cap,
+  // displace a terminal plan node first (or the lowest-priority non-primary
+  // plan row) and prune its edges below; never let a completed build leaf stand
+  // in for the actual active route shown on the minimal tile.
+  const protectedLiveJobs = new Set<string>();
+  for (const row of relevantFleetRows) {
+    const jobId = String(row.jobId);
+    if (rawNodes.some((node) => String(node.jobId) === jobId)) {
+      protectedLiveJobs.add(jobId);
+      continue;
+    }
+    if (rawNodes.length < FLEET_MAX_NODES) {
+      rawNodes.push(runtimeNode(row));
+      protectedLiveJobs.add(jobId);
+      continue;
+    }
+    const removable = rawNodes
+      .map((node, index) => ({ index, row: activityByJob.get(String(node.jobId)) ?? {} }))
+      .filter((candidate) => !protectedLiveJobs.has(String(rawNodes[candidate.index].jobId)))
+      .sort((left, right) => {
+        const leftDone = left.row.status === "done" ? 0 : 1;
+        const rightDone = right.row.status === "done" ? 0 : 1;
+        return leftDone - rightDone || -stableRuntimeOrder(left.row, right.row);
+      });
+    const displaced = removable[0];
+    if (!displaced) break;
+    rawNodes.splice(displaced.index, 1, runtimeNode(row));
+    protectedLiveJobs.add(jobId);
+  }
+
+  const retainedNodeIds = new Set(rawNodes.map((node) => String(node.nodeId)));
+  const rawEdges = suppliedEdges.length
+    ? suppliedEdges.filter((edge) => retainedNodeIds.has(String(edge.sourceNodeId)) && retainedNodeIds.has(String(edge.targetNodeId)))
     : rawNodes.flatMap((node) => {
-        const activity = (input.activities ?? relevant).find((row) => String(row.jobId) === String(node.jobId));
+        const activity = activityByJob.get(String(node.jobId));
         return (Array.isArray(activity?.dependsOn) ? activity.dependsOn : []).map((sourceJobId: string) => ({
           edgeId: `${sourceJobId}->${String(node.jobId)}`,
           sourceNodeId: rawNodes.find((candidate) => String(candidate.jobId) === String(sourceJobId))?.nodeId ?? sourceJobId,
@@ -175,11 +232,6 @@ export function buildFleetSnapshot(input: {
         }));
       }).filter((edge) => rawNodes.some((node) => String(node.nodeId) === String(edge.sourceNodeId)));
 
-  if (rawNodes.length > FLEET_MAX_NODES) throw new Error(`Fleet projection exceeds ${FLEET_MAX_NODES} nodes`);
-  if (rawEdges.length > FLEET_MAX_EDGES) throw new Error(`Fleet projection exceeds ${FLEET_MAX_EDGES} edges`);
-
-  const activities = input.activities?.length ? input.activities : relevant;
-  const activityByJob = new Map(activities.map((row) => [String(row.jobId), row]));
   const validHandoffs = new Set((input.handoffs ?? []).filter((handoff) => {
     const activity = activityByJob.get(String(handoff.sourceJobId));
     return activity
@@ -237,12 +289,12 @@ export function buildFleetSnapshot(input: {
     };
   });
 
-  const missionId = input.mission ? String(input.mission.missionId ?? input.mission._id) : null;
+  const projectedMissionId = missionId || null;
   const liveNodes = projectedNodes.filter((node) => !["done"].includes(node.state));
   const primaryNode = projectedNodes.find((node) => node.jobId === String(primary.jobId)) ?? liveNodes[0] ?? projectedNodes[0];
   const attentionCount = projectedNodes.filter((node) => node.needsDaniel).length;
   const fleet = {
-    id: missionId ?? `work:${String(primary.jobId)}`,
+    id: projectedMissionId ?? `work:${String(primary.jobId)}`,
     goal: String(input.mission?.goal ?? primary.label ?? primary.task ?? "Live work").slice(0, 500),
     mode: String(input.mission?.mode ?? "work"), status: String(input.mission?.status ?? primary.status),
     phase: String(input.mission?.phase ?? primary.stage ?? primary.status),
@@ -255,7 +307,7 @@ export function buildFleetSnapshot(input: {
   };
   return {
     active: primaryNode ? {
-      id: primaryNode.jobId, missionId, label: primaryNode.label, status: primaryNode.state,
+      id: primaryNode.jobId, missionId: projectedMissionId, label: primaryNode.label, status: primaryNode.state,
       stage: primaryNode.stage, percent: primaryNode.percent,
       model: primaryNode.model, reasoningEffort: primaryNode.reasoningEffort,
       modelReason: primaryNode.modelReason,

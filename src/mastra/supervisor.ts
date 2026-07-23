@@ -181,6 +181,7 @@ const enforceMissionPolicyStep = createStep({
         requestedModel: stream.model,
         requestedReasoningEffort: stream.reasoningEffort,
         readonly: stream.readonly,
+        role: stream.agentId,
       });
       const approvalRequired = stream.approvalRequired || route.approvalRequired || stream.risk === "consequential";
       return {

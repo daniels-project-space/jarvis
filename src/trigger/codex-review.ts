@@ -32,11 +32,10 @@ export function reviewPrompt(
   env: NodeJS.ProcessEnv,
   prompt: string,
   timeoutMs: number,
-  routeOrSpawn: CodexReviewRoute | CodexReviewSpawn = { model: "terra" },
+  route: CodexReviewRoute,
+  spawnReview: CodexReviewSpawn = spawnCodexReview,
 ): Promise<string> {
   return new Promise((resolve) => {
-    const spawnReview = typeof routeOrSpawn === "function" ? routeOrSpawn : spawnCodexReview;
-    const route = typeof routeOrSpawn === "function" ? { model: "terra" } : routeOrSpawn;
     const args = [...codexReviewExecPrefix(route.model, route.reasoningEffort), "-"];
     let child: ChildProcessWithoutNullStreams | undefined;
     let output = "";

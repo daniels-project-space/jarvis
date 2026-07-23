@@ -118,6 +118,32 @@ describe("adaptive Codex work policy", () => {
       effort: "max",
       reason: /Cross-project synthesis/,
     },
+    {
+      name: "Paul applying a routine repair is implementation rather than research",
+      input: {
+        task: "Apply the routine deterministic rename in one file",
+        role: "paul",
+      },
+      model: "luna",
+      effort: "medium",
+      reason: /Deterministic bounded implementation/,
+    },
+    {
+      name: "bounded deterministic synthesis uses Luna medium",
+      input: {
+        task: "Consolidate one completed exchange into a bounded deterministic memory record",
+        role: "memory-extractor",
+        workType: "synthesis",
+        complexity: "bounded",
+        uncertainty: "low",
+        productionRisk: "medium",
+        expectedDuration: "short",
+        toolBreadth: "narrow",
+      },
+      model: "luna",
+      effort: "medium",
+      reason: /Bounded deterministic synthesis/,
+    },
   ])("$name", ({ input, model, effort, reason }) => {
     const route = selectCodexWorkPolicy(input);
     expect(route).toMatchObject({ model, reasoningEffort: effort });
@@ -132,6 +158,28 @@ describe("adaptive Codex work policy", () => {
       requestedModel: "terra",
       requestedReasoningEffort: "max",
     })).toMatchObject({ model: "sol", reasoningEffort: "max" });
+  });
+
+  it.each([
+    {
+      task: "Apply the routine deterministic rename with high reasoning effort",
+      model: "luna",
+      reasoningEffort: "high",
+    },
+    {
+      task: "Apply the routine deterministic rename at high quality",
+      model: "terra",
+      reasoningEffort: "high",
+    },
+    {
+      task: "Apply the routine deterministic rename using Terra/high",
+      model: "terra",
+      reasoningEffort: "high",
+    },
+  ])("retains a natural-language quality floor: $task", ({ task, model, reasoningEffort }) => {
+    const route = selectCodexWorkPolicy({ task, role: "paul" });
+    expect(route).toMatchObject({ model, reasoningEffort });
+    expect(route.modelReason).toMatch(/Explicit quality floor retained/);
   });
 });
 

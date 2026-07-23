@@ -31,6 +31,7 @@ export const TOOL_DEFS = [
         task: { type: "string", description: "Clear, self-contained task including all context the agent needs (URLs, video IDs, what to find out)" },
         repo: { type: "string", description: "owner/repo or short name if the task is about a specific repo, else omit" },
         model: { type: "string", enum: ["luna", "terra", "sol"], description: "Optional minimum quality tier; the adaptive router may raise it for complexity or safety and never lowers an explicit quality request" },
+        reasoning_effort: { type: "string", enum: ["low", "medium", "high", "max"], description: "Optional minimum reasoning-effort floor; the adaptive router may raise but never lower it" },
         agent_id: { type: "string", enum: ["paul", "atlas", "iris", "maya", "sentry"], description: "Optional permanent specialist; omit to let JARVIS route it" },
         parent_job_id: { type: "string", description: "Optional earlier job this follow-up extends. The follow-up starts independently and does not wait for the parent." },
         readonly: { type: "boolean", description: "Force a read-only run" },
@@ -61,6 +62,7 @@ export const TOOL_DEFS = [
               task: { type: "string", description: "fully self-contained task incl. all context (agents start blank)" },
               repo: { type: "string", description: "owner/repo if it works on code" },
               model: { type: "string", enum: ["luna", "terra", "sol"] },
+              reasoning_effort: { type: "string", enum: ["low", "medium", "high", "max"], description: "Optional minimum reasoning-effort floor" },
               agent_id: { type: "string", enum: ["paul", "atlas", "iris", "maya", "sentry"] },
               readonly: { type: "boolean" },
               acceptance_criteria: { type: "array", items: { type: "string" } },
@@ -3013,23 +3015,19 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       const task = exactTextWorkOrder(String(args.task ?? ""));
       if (!task.trim()) return "Give me the outcome you want the team to own.";
       const repo = args.repo ? String(args.repo) : undefined;
-      const [{ routeWork, suggestedAcceptanceCriteria }, { TEAM_BY_SLUG }] = await Promise.all([
+      const [{ routeDirectAgentLaunch }, { suggestedAcceptanceCriteria }, { TEAM_BY_SLUG }] = await Promise.all([
+        import("./direct-agent-routing"),
         import("../mastra/routing"),
         import("../mastra/team"),
       ]);
-      const requested = String(args.agent_id ?? "");
-      const requestedAgent = ["paul", "atlas", "iris", "maya", "sentry"].includes(requested)
-        ? (requested as keyof typeof TEAM_BY_SLUG)
-        : undefined;
-      const requestedTools = Array.isArray(args.mcp) ? args.mcp.map(String) : undefined;
-      const route = routeWork(task, {
+      const { route, agentId, requestedTools } = routeDirectAgentLaunch(task, {
         repo,
-        requestedModel: args.model ? String(args.model) : undefined,
-        readonly: typeof args.readonly === "boolean" ? args.readonly : undefined,
-        tools: requestedTools,
-        role: requestedAgent,
+        model: args.model,
+        reasoningEffort: args.reasoning_effort,
+        agentId: args.agent_id,
+        readonly: args.readonly,
+        tools: args.mcp,
       });
-      const agentId = requestedAgent ?? route.agentId;
       const originThreadId = await activeThread();
       const criteria = Array.isArray(args.acceptance_criteria) && args.acceptance_criteria.length
         ? args.acceptance_criteria.map(String).slice(0, 8)
@@ -3136,6 +3134,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
           label: a.label ? String(a.label) : undefined,
           repo: a.repo ? String(a.repo) : undefined,
           model: a.model ? String(a.model) : undefined,
+          reasoningEffort: a.reasoning_effort ? String(a.reasoning_effort) : undefined,
           agentId: a.agent_id ? String(a.agent_id) : undefined,
           readonly: typeof a.readonly === "boolean" ? a.readonly : undefined,
           acceptanceCriteria: Array.isArray(a.acceptance_criteria) ? a.acceptance_criteria.map(String) : undefined,

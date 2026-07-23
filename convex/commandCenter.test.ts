@@ -121,6 +121,35 @@ describe("commandCenter relevance and bounded projection", () => {
     expect(result.fleet?.nodes[1]).not.toHaveProperty("checkpoint");
   });
 
+  it.each([
+    { kind: "validator", goalStage: "validating", model: "sol", effort: "max", reason: "Intense final verification safety route" },
+    { kind: "refinement", goalStage: "refining", model: "luna", effort: "medium", reason: "Deterministic bounded implementation" },
+    { kind: "focused repair", goalStage: "building", model: "luna", effort: "medium", reason: "Deterministic bounded integration repair" },
+  ])("keeps an active mission-scoped $kind route visible outside the immutable plan", ({ kind, goalStage, model, effort, reason }) => {
+    const nodes = planNodes();
+    const edges = completeEdges();
+    const finished = activities().map((row) => ({ ...row, status: "done", stage: "complete", percent: 100 }));
+    const active = runtime({
+      jobId: `${kind.replace(/\s+/g, "-")}-job`, missionId: "mission-1", planNodeId: undefined,
+      label: `JARVIS · ${kind}`, goalStage, status: "running", stage: goalStage,
+      model, reasoningEffort: effort, modelReason: reason, priority: 100,
+    });
+    const result = buildFleetSnapshot({
+      threadId,
+      activeRows: [active],
+      mission: { missionId: "mission-1", goal: "Ship the accepted plan", mode: "goal", status: "running", phase: goalStage, planDigest: "digest", planGeneration: 1 },
+      nodes,
+      edges,
+      activities: finished,
+    });
+
+    expect(result.active).toMatchObject({ id: active.jobId, model, reasoningEffort: effort, modelReason: reason });
+    expect(result.fleet?.nodes).toHaveLength(FLEET_MAX_NODES);
+    expect(result.fleet?.nodes.find((node) => node.jobId === active.jobId)).toMatchObject({ model, reasoningEffort: effort, modelReason: reason });
+    const retained = new Set(result.fleet?.nodes.map((node) => node.id));
+    expect(result.fleet?.edges.every((edge) => retained.has(edge.source) && retained.has(edge.target))).toBe(true);
+  });
+
   it("shows approve/decline only for a persisted consequential gate", () => {
     const result = buildFleetSnapshot({
       threadId, activeRows: [runtime({ status: "awaiting_approval", approvalRequired: true, approvalStatus: "pending", risk: "consequential", deliveryMode: "manual" })],
