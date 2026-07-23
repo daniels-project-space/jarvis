@@ -31,6 +31,7 @@ const DISPATCHER = "mission-supervisor-test-dispatcher";
 const START_AT = Date.parse("2026-07-23T12:00:00Z");
 const supervisorApi = {
   startV1: makeFunctionReference<"mutation">("missionSupervisor:startV1"),
+  controlV1: makeFunctionReference<"mutation">("missionSupervisor:controlV1"),
   dueV1: makeFunctionReference<"query">("missionSupervisor:dueV1"),
   claimV1: makeFunctionReference<"mutation">("missionSupervisor:claimV1"),
   renewV1: makeFunctionReference<"mutation">("missionSupervisor:renewV1"),
@@ -41,12 +42,21 @@ const supervisorApi = {
 };
 
 type SupervisorTest = TestConvex<typeof schema>;
+type WakeTicket = {
+  protocolVersion: 1;
+  missionId: Id<"missions">;
+  expectedLeaseVersion: number;
+  expectedEpoch: number;
+  expectedDecisionSequence: number;
+  expectedInputRevision: number;
+};
 type StartResult = {
   replayed: boolean;
   missionId: Id<"missions">;
   stateId: Id<"missionSupervisorState">;
   requestDigest: string;
   deadlineAt: number;
+  wakeTicket: WakeTicket | null;
 };
 type StartOptions = {
   goal?: string;
@@ -196,6 +206,24 @@ async function supervisorState(
       .withIndex("by_mission", (q) => q.eq("missionId", missionId))
       .unique()
   );
+}
+
+async function control(
+  t: SupervisorTest,
+  missionId: Id<"missions">,
+  requestKey: string,
+  action: "pause" | "resume" | "cancel" | "steer" | "provide_input",
+  expectedInputRevision: number,
+  input?: string,
+) {
+  return await t.mutation(supervisorApi.controlV1, {
+    missionId,
+    requestKey,
+    action,
+    expectedInputRevision,
+    dispatchToken: DISPATCHER,
+    ...(input === undefined ? {} : { input }),
+  });
 }
 
 async function claim(
@@ -388,7 +416,17 @@ describe("dormant mission supervisor authority", () => {
     };
 
     const first = await t.mutation(supervisorApi.startV1, request);
-    expect(first).toMatchObject({ replayed: false });
+    expect(first).toMatchObject({
+      replayed: false,
+      wakeTicket: {
+        protocolVersion: 1,
+        missionId: first.missionId,
+        expectedLeaseVersion: 0,
+        expectedEpoch: 1,
+        expectedDecisionSequence: 1,
+        expectedInputRevision: 1,
+      },
+    });
     const state = await supervisorState(t, first.missionId);
     const persisted = await t.run(async (ctx) => {
       const mission = await ctx.db.get(first.missionId);
@@ -433,6 +471,7 @@ describe("dormant mission supervisor authority", () => {
       missionId: first.missionId,
       stateId: first.stateId,
       requestDigest: first.requestDigest,
+      wakeTicket: first.wakeTicket,
     });
     await expect(t.mutation(supervisorApi.startV1, {
       ...request,
@@ -529,6 +568,452 @@ describe("dormant mission supervisor authority", () => {
       states: 0,
       jobs: 0,
     });
+  });
+
+  it("binds exact wake tickets, invalidates a leased model, and replays controls immutably", async () => {
+    const t = convexTest(schema, modules);
+    const admission = await testProjectSourceAdmission();
+    const started = await start(t, "control-ticket-bindings", {
+      projectAdmissions: [admission],
+    });
+    expect(started.wakeTicket).toEqual({
+      protocolVersion: 1,
+      missionId: started.missionId,
+      expectedLeaseVersion: 0,
+      expectedEpoch: 1,
+      expectedDecisionSequence: 1,
+      expectedInputRevision: 1,
+    });
+
+    const leased = await claimSuccess(t, started.missionId, 0);
+    const replayedStart = await start(t, "control-ticket-bindings", {
+      projectAdmissions: [admission],
+    });
+    expect(replayedStart).toMatchObject({
+      replayed: true,
+      missionId: started.missionId,
+      wakeTicket: null,
+    });
+    await expect(t.mutation(supervisorApi.controlV1, {
+      missionId: started.missionId,
+      requestKey: "worker-cannot-control",
+      action: "pause",
+      expectedInputRevision: 1,
+      dispatchToken: WORKER,
+    })).rejects.toThrow("Authentication required");
+
+    const steered = await control(
+      t,
+      started.missionId,
+      "control-steer-1",
+      "steer",
+      1,
+      "Prioritize the exact control fence before any further planning.",
+    );
+    expect(steered).toMatchObject({
+      applied: true,
+      replayed: false,
+      noop: false,
+      scope: "planning_only_zero_jobs",
+      state: "ready",
+      inputRevision: 2,
+      wakeTicket: {
+        protocolVersion: 1,
+        missionId: started.missionId,
+        expectedLeaseVersion: leased.leaseVersion,
+        expectedEpoch: leased.epoch,
+        expectedDecisionSequence: leased.nextDecisionSequence,
+        expectedInputRevision: 2,
+      },
+    });
+    expect(await t.mutation(supervisorApi.renewV1, {
+      ...exactFence(started.missionId, leased),
+    })).toMatchObject({
+      renewed: false,
+      reason: "fence_mismatch",
+    });
+
+    const replayedSteer = await control(
+      t,
+      started.missionId,
+      "control-steer-1",
+      "steer",
+      1,
+      "Prioritize the exact control fence before any further planning.",
+    );
+    expect(replayedSteer).toMatchObject({
+      applied: true,
+      replayed: true,
+      inputRevision: 2,
+      wakeTicket: steered.wakeTicket,
+    });
+    await expect(control(
+      t,
+      started.missionId,
+      "control-steer-1",
+      "steer",
+      1,
+      "A conflicting instruction must never reuse the same key.",
+    )).rejects.toThrow("conflicts with a different payload");
+
+    const stale = await control(
+      t,
+      started.missionId,
+      "control-stale-1",
+      "pause",
+      1,
+    );
+    expect(stale).toMatchObject({
+      applied: false,
+      replayed: false,
+      noop: false,
+      reason: "stale_input_revision",
+      state: "ready",
+      inputRevision: 2,
+      wakeTicket: null,
+    });
+    const paused = await control(
+      t,
+      started.missionId,
+      "control-pause-1",
+      "pause",
+      2,
+    );
+    expect(paused).toMatchObject({
+      applied: true,
+      state: "paused",
+      inputRevision: 3,
+      wakeTicket: null,
+    });
+    expect(await control(
+      t,
+      started.missionId,
+      "control-stale-1",
+      "pause",
+      1,
+    )).toMatchObject({
+      applied: false,
+      replayed: true,
+      reason: "stale_input_revision",
+      state: "ready",
+      inputRevision: 2,
+    });
+
+    const resumed = await control(
+      t,
+      started.missionId,
+      "control-resume-1",
+      "resume",
+      3,
+    );
+    expect(resumed).toMatchObject({
+      applied: true,
+      state: "ready",
+      inputRevision: 4,
+      wakeTicket: {
+        protocolVersion: 1,
+        missionId: started.missionId,
+        expectedLeaseVersion: leased.leaseVersion,
+        expectedEpoch: leased.epoch,
+        expectedDecisionSequence: leased.nextDecisionSequence,
+        expectedInputRevision: 4,
+      },
+    });
+    expect(await claim(
+      t,
+      started.missionId,
+      resumed.wakeTicket.expectedLeaseVersion,
+      "worker-two",
+      "lease-token-worker-two-0001",
+    )).toMatchObject({
+      claimed: true,
+      leaseVersion: leased.leaseVersion + 1,
+      epoch: resumed.wakeTicket.expectedEpoch,
+      nextDecisionSequence: resumed.wakeTicket.expectedDecisionSequence,
+      inputRevision: resumed.wakeTicket.expectedInputRevision,
+    });
+
+    const persisted = await t.run(async (ctx) => ({
+      state: await ctx.db.get(started.stateId),
+      mission: await ctx.db.get(started.missionId),
+      controls: await ctx.db
+        .query("missionSupervisorControls")
+        .withIndex("by_mission_created", (q) =>
+          q.eq("missionId", started.missionId)
+        )
+        .collect(),
+    }));
+    expect(persisted.state).toMatchObject({
+      state: "leased",
+      inputRevision: 4,
+      leaseVersion: 2,
+    });
+    expect(persisted.mission).toMatchObject({
+      status: "running",
+      steer:
+        "Prioritize the exact control fence before any further planning.",
+      steerRevision: 1,
+    });
+    expect(persisted.controls).toHaveLength(4);
+  });
+
+  it("keeps terminal control replay distinct from a later no-op or rejection", async () => {
+    const t = convexTest(schema, modules);
+    const admission = await testProjectSourceAdmission();
+    const started = await start(t, "terminal-controls", {
+      projectAdmissions: [admission],
+    });
+    const cancelled = await control(
+      t,
+      started.missionId,
+      "control-cancel-1",
+      "cancel",
+      1,
+    );
+    expect(cancelled).toMatchObject({
+      applied: true,
+      replayed: false,
+      state: "terminal",
+      inputRevision: 2,
+      wakeTicket: null,
+    });
+    expect(await control(
+      t,
+      started.missionId,
+      "control-cancel-1",
+      "cancel",
+      1,
+    )).toMatchObject({
+      applied: true,
+      replayed: true,
+      state: "terminal",
+      inputRevision: 2,
+    });
+    expect(await control(
+      t,
+      started.missionId,
+      "control-cancel-terminal-noop",
+      "cancel",
+      2,
+    )).toMatchObject({
+      applied: false,
+      noop: true,
+      reason: "terminal_noop",
+      state: "terminal",
+      inputRevision: 2,
+      wakeTicket: null,
+    });
+    expect(await control(
+      t,
+      started.missionId,
+      "control-pause-terminal-reject",
+      "pause",
+      2,
+    )).toMatchObject({
+      applied: false,
+      noop: false,
+      reason: "terminal_state",
+      state: "terminal",
+      inputRevision: 2,
+      wakeTicket: null,
+    });
+    expect(await start(t, "terminal-controls", {
+      projectAdmissions: [admission],
+    })).toMatchObject({
+      replayed: true,
+      wakeTicket: null,
+    });
+  });
+
+  it("resumes a zero-job planning question with durable input and resolves its attention", async () => {
+    const t = convexTest(schema, modules);
+    const started = await start(t, "provide-planning-input");
+    const leased = await claimSuccess(t, started.missionId, 0);
+    const requested = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      leased,
+      {
+        kind: "request_input",
+        question: "Which deployment boundary should this mission prioritize?",
+        reason: "The admitted planning scope has two safe interpretations.",
+      },
+      {
+        ...MODEL_METADATA,
+        triggerRunId: "trigger-request-input-zero-job",
+      },
+    ));
+    expect(requested).toMatchObject({
+      committed: true,
+      resultState: "needs_input",
+    });
+
+    const provided = await control(
+      t,
+      started.missionId,
+      "control-provide-input-1",
+      "provide_input",
+      1,
+      "Prioritize the isolated Jarvis deployment boundary first.",
+    );
+    expect(provided).toMatchObject({
+      applied: true,
+      replayed: false,
+      scope: "planning_only_zero_jobs",
+      state: "ready",
+      inputRevision: 2,
+      wakeTicket: {
+        protocolVersion: 1,
+        missionId: started.missionId,
+        expectedLeaseVersion: leased.leaseVersion,
+        expectedEpoch: leased.epoch,
+        expectedDecisionSequence: leased.nextDecisionSequence + 1,
+        expectedInputRevision: 2,
+      },
+    });
+    expect(await control(
+      t,
+      started.missionId,
+      "control-provide-input-1",
+      "provide_input",
+      1,
+      "Prioritize the isolated Jarvis deployment boundary first.",
+    )).toMatchObject({
+      applied: true,
+      replayed: true,
+      inputRevision: 2,
+      wakeTicket: provided.wakeTicket,
+    });
+
+    const persisted = await t.run(async (ctx) => ({
+      state: await ctx.db.get(started.stateId),
+      mission: await ctx.db.get(started.missionId),
+      attention: await ctx.db
+        .query("attentionItems")
+        .withIndex("by_fingerprint", (q) =>
+          q.eq(
+            "fingerprint",
+            `mission-supervisor:${String(started.missionId)}:needs-input`,
+          )
+        )
+        .unique(),
+    }));
+    expect(persisted.state).toMatchObject({
+      state: "ready",
+      inputRevision: 2,
+      nextDecisionSequence: 2,
+    });
+    expect(persisted.mission).toMatchObject({
+      status: "running",
+      phase: "planning",
+      steer: "Prioritize the isolated Jarvis deployment boundary first.",
+      steerRevision: 1,
+    });
+    expect(persisted.mission?.failureReason).toBeUndefined();
+    expect(persisted.attention).toMatchObject({
+      authority: "mission-supervisor",
+      status: "resolved",
+    });
+
+    const nextClaim = await claimSuccess(
+      t,
+      started.missionId,
+      provided.wakeTicket.expectedLeaseVersion,
+      "worker-two",
+      "lease-token-worker-two-0001",
+    );
+    expect(nextClaim).toMatchObject({
+      epoch: provided.wakeTicket.expectedEpoch,
+      nextDecisionSequence: provided.wakeTicket.expectedDecisionSequence,
+      inputRevision: provided.wakeTicket.expectedInputRevision,
+    });
+    expect(nextClaim.snapshot).toMatchObject({
+      mission: {
+        steer: "Prioritize the isolated Jarvis deployment boundary first.",
+        steerRevision: 1,
+      },
+    });
+  });
+
+  it("fails mission controls closed while existing work needs a fenced batch primitive", async () => {
+    const t = convexTest(schema, modules);
+    const started = await start(t, "control-active-job-gate");
+    const leased = await claimSuccess(t, started.missionId, 0);
+    const delegated = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      leased,
+      {
+        kind: "delegate",
+        workstreams: [delegatedWorkstream()],
+      },
+      {
+        ...MODEL_METADATA,
+        triggerRunId: "trigger-control-active-job",
+      },
+    ));
+    expect(delegated).toMatchObject({
+      committed: true,
+      resultState: "waiting",
+    });
+    const jobId = delegated.createdJobIds[0] as Id<"jobs">;
+
+    for (const [requestKey, action, input] of [
+      ["control-active-pause", "pause", undefined],
+      [
+        "control-active-steer",
+        "steer",
+        "Revise the live worker even though no batch authority exists.",
+      ],
+      ["control-active-cancel", "cancel", undefined],
+      [
+        "control-active-input",
+        "provide_input",
+        "Do not manufacture a planning-input loop around live work.",
+      ],
+    ] as const) {
+      expect(await control(
+        t,
+        started.missionId,
+        requestKey,
+        action,
+        1,
+        input,
+      )).toMatchObject({
+        applied: false,
+        replayed: false,
+        noop: false,
+        reason: "active_jobs_require_batch_control",
+        state: "waiting",
+        inputRevision: 1,
+        wakeTicket: null,
+      });
+    }
+
+    const persisted = await t.run(async (ctx) => ({
+      state: await ctx.db.get(started.stateId),
+      mission: await ctx.db.get(started.missionId),
+      job: await ctx.db.get(jobId),
+      controls: await ctx.db
+        .query("missionSupervisorControls")
+        .withIndex("by_mission_created", (q) =>
+          q.eq("missionId", started.missionId)
+        )
+        .collect(),
+    }));
+    expect(persisted.state).toMatchObject({
+      state: "waiting",
+      inputRevision: 1,
+      leaseVersion: leased.leaseVersion,
+      nextDecisionSequence: 2,
+    });
+    expect(persisted.mission).toMatchObject({
+      status: "running",
+      phase: "executing",
+    });
+    expect(persisted.job).toMatchObject({
+      status: "pending",
+      steerRevision: 0,
+    });
+    expect(persisted.controls).toHaveLength(4);
   });
 
   it("returns at most eight exact ready, waiting, or expired-lease rows", async () => {

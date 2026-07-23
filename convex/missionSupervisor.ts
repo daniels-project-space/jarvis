@@ -3,7 +3,9 @@ import type { Doc, Id } from "./_generated/dataModel";
 import { v } from "convex/values";
 import {
   dispatcherAuthArgs,
+  ownerDispatcherAuthArgs,
   requireDispatcher,
+  requireOwnerOrDispatcher,
   requireWorker,
 } from "./controlAuth";
 import {
@@ -47,6 +49,7 @@ const FAILURE_BACKOFF_MAX_MS = 15 * 60_000;
 const SAFE_KEY = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$/;
 const SAFE_LEASE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._~:/+=-]{15,239}$/;
 const SAFE_ERROR_CODE = /^[a-z][a-z0-9_:-]{0,79}$/;
+const TERMINAL_JOB_STATUSES = new Set(["done", "error", "cancelled"]);
 
 const profileValidator = v.union(
   v.literal("short_fleet"),
@@ -84,6 +87,13 @@ const decisionOriginValidator = v.union(
 const modelProviderValidator = v.union(
   v.literal("codex-subscription"),
   v.literal("deterministic-policy"),
+);
+const controlActionValidator = v.union(
+  v.literal("pause"),
+  v.literal("resume"),
+  v.literal("cancel"),
+  v.literal("steer"),
+  v.literal("provide_input"),
 );
 const requestedWorkstreamValidator = v.object({
   task: v.string(),
@@ -137,6 +147,7 @@ const supervisorDecisionValidator = v.union(
 );
 
 type MissionSupervisorState = Doc<"missionSupervisorState">;
+type MissionSupervisorControl = Doc<"missionSupervisorControls">;
 type Mission = Doc<"missions">;
 type JsonValue =
   | null
@@ -164,6 +175,20 @@ type WorkRisk = "low" | "medium" | "high" | "consequential";
 type ReasoningEffort = "none" | "low" | "medium" | "high" | "max";
 type DecisionOrigin = "model" | "policy";
 type ModelProvider = "codex-subscription" | "deterministic-policy";
+type SupervisorControlAction =
+  | "pause"
+  | "resume"
+  | "cancel"
+  | "steer"
+  | "provide_input";
+type SupervisorWakeTicket = {
+  protocolVersion: 1;
+  missionId: Id<"missions">;
+  expectedLeaseVersion: number;
+  expectedEpoch: number;
+  expectedDecisionSequence: number;
+  expectedInputRevision: number;
+};
 type DelegatedWorkstreamInput = {
   task: string;
   label: string;
@@ -688,6 +713,26 @@ function clearLease() {
   };
 }
 
+function supervisorWakeTicket(
+  state: Pick<
+    MissionSupervisorState,
+    | "missionId"
+    | "leaseVersion"
+    | "epoch"
+    | "nextDecisionSequence"
+    | "inputRevision"
+  >,
+): SupervisorWakeTicket {
+  return {
+    protocolVersion: 1,
+    missionId: state.missionId,
+    expectedLeaseVersion: state.leaseVersion,
+    expectedEpoch: state.epoch,
+    expectedDecisionSequence: state.nextDecisionSequence,
+    expectedInputRevision: state.inputRevision,
+  };
+}
+
 function isDue(state: MissionSupervisorState, now: number): boolean {
   if (state.state === "ready" || state.state === "waiting") {
     return typeof state.nextTickAt === "number" && state.nextTickAt <= now;
@@ -936,6 +981,40 @@ async function upsertSupervisorAttention(
   return await ctx.db.insert("attentionItems", { ...value, createdAt: now });
 }
 
+async function resolveSupervisorAttention(
+  ctx: Pick<MutationCtx, "db">,
+  missionId: Id<"missions">,
+  now: number,
+  includeTerminalFailure: boolean,
+) {
+  const suffixes = includeTerminalFailure
+    ? ["needs-input", "failed"]
+    : ["needs-input"];
+  for (const suffix of suffixes) {
+    const rows = await ctx.db
+      .query("attentionItems")
+      .withIndex("by_fingerprint", (q) =>
+        q.eq(
+          "fingerprint",
+          `mission-supervisor:${String(missionId)}:${suffix}`,
+        )
+      )
+      .take(2);
+    if (rows.length > 1) {
+      throw new Error("Supervisor attention authority is not unique");
+    }
+    const attention = rows[0];
+    if (
+      attention
+      && attention.authority === "mission-supervisor"
+      && attention.status !== "resolved"
+      && attention.status !== "dismissed"
+    ) {
+      await ctx.db.patch(attention._id, { status: "resolved", updatedAt: now });
+    }
+  }
+}
+
 async function holdMissionForInput(
   ctx: MutationCtx,
   state: MissionSupervisorState,
@@ -969,6 +1048,134 @@ async function holdMissionForInput(
     updatedAt: now,
   });
   return attentionItemId;
+}
+
+type NormalizedControlRequest = {
+  requestKey: string;
+  requestDigest: string;
+  action: SupervisorControlAction;
+  expectedInputRevision: number;
+  input?: string;
+};
+
+type SupervisorControlOutcome = {
+  applied: boolean;
+  noop: boolean;
+  reason: string;
+  scope: string;
+  resultState?: MissionSupervisorState["state"];
+  resultInputRevision?: number;
+  wakeTicket?: SupervisorWakeTicket | null;
+};
+
+async function normalizedControlRequest(args: {
+  missionId: Id<"missions">;
+  requestKey: string;
+  action: SupervisorControlAction;
+  expectedInputRevision: number;
+  input?: string;
+}): Promise<NormalizedControlRequest> {
+  const requestKey = args.requestKey.trim();
+  if (!SAFE_KEY.test(requestKey)) {
+    throw new Error("requestKey has an invalid format");
+  }
+  validFenceInteger(args.expectedInputRevision, "expectedInputRevision");
+  const expectsInput =
+    args.action === "steer" || args.action === "provide_input";
+  const input = expectsInput
+    ? boundedText(args.input ?? "", "input", 1, 2_000)
+    : undefined;
+  if (!expectsInput && typeof args.input === "string" && args.input.trim()) {
+    throw new Error(`${args.action} does not accept input`);
+  }
+  const requestDigest = await sha256Hex(canonicalJson({
+    protocolVersion: 1,
+    missionId: String(args.missionId),
+    action: args.action,
+    expectedInputRevision: args.expectedInputRevision,
+    input: input ?? null,
+  }));
+  return {
+    requestKey,
+    requestDigest,
+    action: args.action,
+    expectedInputRevision: args.expectedInputRevision,
+    input,
+  };
+}
+
+function wakeTicketFromControlReceipt(
+  receipt: MissionSupervisorControl,
+): SupervisorWakeTicket | null {
+  if (!receipt.wakeRequested) return null;
+  if (
+    receipt.ticketLeaseVersion === undefined
+    || receipt.ticketEpoch === undefined
+    || receipt.ticketDecisionSequence === undefined
+    || receipt.ticketInputRevision === undefined
+  ) {
+    throw new Error("Supervisor control receipt has an incomplete wake ticket");
+  }
+  return {
+    protocolVersion: 1,
+    missionId: receipt.missionId,
+    expectedLeaseVersion: receipt.ticketLeaseVersion,
+    expectedEpoch: receipt.ticketEpoch,
+    expectedDecisionSequence: receipt.ticketDecisionSequence,
+    expectedInputRevision: receipt.ticketInputRevision,
+  };
+}
+
+function supervisorControlResult(
+  receipt: MissionSupervisorControl,
+  replayed: boolean,
+) {
+  return {
+    applied: receipt.applied,
+    replayed,
+    noop: receipt.noop,
+    reason: receipt.reason,
+    scope: receipt.scope,
+    missionId: receipt.missionId,
+    action: receipt.action,
+    requestDigest: receipt.requestDigest,
+    state: receipt.resultState,
+    inputRevision: receipt.resultInputRevision,
+    wakeTicket: wakeTicketFromControlReceipt(receipt),
+  };
+}
+
+async function recordSupervisorControl(
+  ctx: Pick<MutationCtx, "db">,
+  missionId: Id<"missions">,
+  request: NormalizedControlRequest,
+  outcome: SupervisorControlOutcome,
+  now: number,
+) {
+  const ticket = outcome.wakeTicket ?? null;
+  const receiptId = await ctx.db.insert("missionSupervisorControls", {
+    protocolVersion: 1,
+    missionId,
+    requestKey: request.requestKey,
+    requestDigest: request.requestDigest,
+    action: request.action,
+    expectedInputRevision: request.expectedInputRevision,
+    applied: outcome.applied,
+    noop: outcome.noop,
+    reason: outcome.reason,
+    scope: outcome.scope,
+    resultState: outcome.resultState,
+    resultInputRevision: outcome.resultInputRevision,
+    wakeRequested: Boolean(ticket),
+    ticketLeaseVersion: ticket?.expectedLeaseVersion,
+    ticketEpoch: ticket?.expectedEpoch,
+    ticketDecisionSequence: ticket?.expectedDecisionSequence,
+    ticketInputRevision: ticket?.expectedInputRevision,
+    createdAt: now,
+  });
+  const receipt = await ctx.db.get(receiptId);
+  if (!receipt) throw new Error("Supervisor control receipt was not persisted");
+  return supervisorControlResult(receipt, false);
 }
 
 export const startV1 = mutation({
@@ -1013,6 +1220,9 @@ export const startV1 = mutation({
         stateId: prior[0]._id,
         requestDigest,
         deadlineAt: prior[0].deadlineAt,
+        wakeTicket: isDue(prior[0], Date.now())
+          ? supervisorWakeTicket(prior[0])
+          : null,
       };
     }
 
@@ -1068,13 +1278,13 @@ export const startV1 = mutation({
       updatedAt: now,
     });
     const deadlineAt = now + normalized.payload.deadlineMs;
-    const stateId = await ctx.db.insert("missionSupervisorState", {
-      protocolVersion: 1,
+    const initialState = {
+      protocolVersion: 1 as const,
       missionId,
       requestKey: normalized.requestKey,
       requestDigest,
       requestPayloadJson: normalized.requestPayloadJson,
-      state: "ready",
+      state: "ready" as const,
       epoch: 1,
       nextDecisionSequence: 1,
       inputRevision: 1,
@@ -1090,14 +1300,356 @@ export const startV1 = mutation({
       consecutiveFailures: 0,
       createdAt: now,
       updatedAt: now,
-    });
+    };
+    const stateId = await ctx.db.insert("missionSupervisorState", initialState);
     return {
       replayed: false,
       missionId,
       stateId,
       requestDigest,
       deadlineAt,
+      wakeTicket: supervisorWakeTicket(initialState),
     };
+  },
+});
+
+export const controlV1 = mutation({
+  args: {
+    missionId: v.id("missions"),
+    requestKey: v.string(),
+    action: controlActionValidator,
+    expectedInputRevision: v.number(),
+    input: v.optional(v.string()),
+    ...ownerDispatcherAuthArgs,
+  },
+  handler: async (ctx, args) => {
+    await requireOwnerOrDispatcher(ctx, args);
+    const request = await normalizedControlRequest(args);
+    const prior = await ctx.db
+      .query("missionSupervisorControls")
+      .withIndex("by_key", (q) => q.eq("requestKey", request.requestKey))
+      .take(2);
+    if (prior.length > 1) {
+      throw new Error("Supervisor control request key is not unique");
+    }
+    if (prior[0]) {
+      if (
+        prior[0].requestDigest !== request.requestDigest
+        || String(prior[0].missionId) !== String(args.missionId)
+        || prior[0].action !== request.action
+      ) {
+        throw new Error(
+          "Supervisor control request key conflicts with a different payload",
+        );
+      }
+      return supervisorControlResult(prior[0], true);
+    }
+
+    const now = Date.now();
+    const [state, mission] = await Promise.all([
+      stateForMission(ctx, args.missionId),
+      ctx.db.get(args.missionId),
+    ]);
+    const record = async (
+      outcome: SupervisorControlOutcome,
+    ) => await recordSupervisorControl(
+      ctx,
+      args.missionId,
+      request,
+      outcome,
+      now,
+    );
+    const reject = async (
+      reason: string,
+      options: {
+        noop?: boolean;
+        state?: MissionSupervisorState;
+      } = {},
+    ) => await record({
+      applied: false,
+      noop: options.noop ?? false,
+      reason,
+      scope: "none",
+      resultState: options.state?.state,
+      resultInputRevision: options.state?.inputRevision,
+      wakeTicket: null,
+    });
+
+    if (!state) return await reject("missing_state");
+    if (
+      !mission
+      || mission.mode !== "supervised"
+      || mission.admissionProtocolVersion !== 2
+    ) {
+      return await reject("invalid_mission", { state });
+    }
+    if (state.inputRevision !== request.expectedInputRevision) {
+      return await reject("stale_input_revision", { state });
+    }
+    const validBounds = [
+      state.leaseVersion,
+      state.epoch,
+      state.nextDecisionSequence,
+      state.inputRevision,
+    ].every((value) =>
+      Number.isSafeInteger(value)
+      && value >= 0
+      && value < Number.MAX_SAFE_INTEGER
+    );
+    if (!validBounds) {
+      return await reject("invalid_state_bounds", { state });
+    }
+
+    const missionMatchesState =
+      state.state === "terminal"
+        ? ["done", "failed", "cancelled"].includes(mission.status)
+        : state.state === "paused"
+          ? mission.status === "paused"
+          : state.state === "needs_input"
+            ? mission.status === "needs_input"
+            : mission.status === "running";
+    if (!missionMatchesState) {
+      return await reject("invalid_mission_state", { state });
+    }
+
+    const jobs = await ctx.db
+      .query("jobs")
+      .withIndex("by_mission", (q) =>
+        q.eq("missionId", String(args.missionId))
+      )
+      .take(MISSION_SUPERVISOR_MAX_JOBS + 1);
+    if (jobs.length > MISSION_SUPERVISOR_MAX_JOBS) {
+      return await reject("supervisor_job_limit", { state });
+    }
+    const activeJobs = jobs.filter((job) =>
+      !TERMINAL_JOB_STATUSES.has(job.status)
+    );
+    if (activeJobs.length > 0) {
+      // A supervisor state transition alone cannot pause, cancel, resume, or
+      // revise an already-running execution/delivery lineage. Until the
+      // existing fenced job control is available as one atomic bounded batch,
+      // fail closed rather than report a half-applied mission control.
+      return await reject("active_jobs_require_batch_control", { state });
+    }
+
+    if (state.state === "terminal") {
+      if (request.action === "cancel" && mission.status === "cancelled") {
+        return await reject("terminal_noop", { noop: true, state });
+      }
+      return await reject("terminal_state", { state });
+    }
+    if (jobs.length !== state.totalJobs) {
+      return await reject("job_ledger_mismatch", { state });
+    }
+    if (
+      (request.action === "steer" || request.action === "provide_input")
+      && jobs.length > 0
+    ) {
+      // Planning input is intentionally limited to the zero-job question
+      // phase. Existing terminal/error work needs a real revision primitive;
+      // waking the current loop would only ask again or fail synthesis.
+      return await reject("active_jobs_require_batch_control", { state });
+    }
+
+    if (request.action === "pause") {
+      if (state.state === "paused") {
+        return await reject("already_paused", { noop: true, state });
+      }
+      if (
+        !["ready", "waiting", "leased"].includes(state.state)
+        || mission.status !== "running"
+      ) {
+        return await reject("invalid_transition", { state });
+      }
+      const inputRevision = state.inputRevision + 1;
+      await ctx.db.patch(state._id, {
+        state: "paused",
+        inputRevision,
+        nextTickAt: undefined,
+        ...clearLease(),
+        updatedAt: now,
+      });
+      await patchMissionWithRuntime(ctx, mission, {
+        status: "paused",
+        pausedPhase: mission.phase ?? "supervising",
+        phase: "paused",
+        controlRequested: undefined,
+        controlRequestedAt: undefined,
+        updatedAt: now,
+      });
+      return await record({
+        applied: true,
+        noop: false,
+        reason: "applied",
+        scope: "supervisor_only_no_active_jobs",
+        resultState: "paused",
+        resultInputRevision: inputRevision,
+        wakeTicket: null,
+      });
+    }
+
+    if (request.action === "resume") {
+      if (
+        (state.state === "ready"
+          || state.state === "waiting"
+          || state.state === "leased")
+        && mission.status === "running"
+      ) {
+        return await reject("already_running", { noop: true, state });
+      }
+      if (state.state !== "paused" || mission.status !== "paused") {
+        return await reject("invalid_transition", { state });
+      }
+      const inputRevision = state.inputRevision + 1;
+      const nextState = {
+        ...state,
+        state: "ready" as const,
+        inputRevision,
+      };
+      await ctx.db.patch(state._id, {
+        state: "ready",
+        inputRevision,
+        nextTickAt: now,
+        ...clearLease(),
+        updatedAt: now,
+      });
+      await patchMissionWithRuntime(ctx, mission, {
+        status: "running",
+        phase: mission.pausedPhase ?? "supervising",
+        pausedPhase: undefined,
+        controlRequested: undefined,
+        controlRequestedAt: undefined,
+        updatedAt: now,
+      });
+      return await record({
+        applied: true,
+        noop: false,
+        reason: "applied",
+        scope: "supervisor_only_no_active_jobs",
+        resultState: "ready",
+        resultInputRevision: inputRevision,
+        wakeTicket: supervisorWakeTicket(nextState),
+      });
+    }
+
+    if (request.action === "cancel") {
+      const inputRevision = state.inputRevision + 1;
+      await ctx.db.patch(state._id, {
+        state: "terminal",
+        inputRevision,
+        nextTickAt: undefined,
+        ...clearLease(),
+        updatedAt: now,
+      });
+      await patchMissionWithRuntime(ctx, mission, {
+        status: "cancelled",
+        phase: "cancelled",
+        pausedPhase: undefined,
+        controlRequested: undefined,
+        controlRequestedAt: undefined,
+        completedAt: now,
+        updatedAt: now,
+      });
+      await resolveSupervisorAttention(ctx, args.missionId, now, true);
+      return await record({
+        applied: true,
+        noop: false,
+        reason: "applied",
+        scope: "supervisor_only_no_active_jobs",
+        resultState: "terminal",
+        resultInputRevision: inputRevision,
+        wakeTicket: null,
+      });
+    }
+
+    if (request.action === "steer") {
+      if (
+        !["ready", "waiting", "leased"].includes(state.state)
+        || mission.status !== "running"
+      ) {
+        return await reject("invalid_transition", { state });
+      }
+      const steerRevision = Number(mission.steerRevision ?? 0) + 1;
+      if (!Number.isSafeInteger(steerRevision)) {
+        return await reject("invalid_state_bounds", { state });
+      }
+      const inputRevision = state.inputRevision + 1;
+      const nextState = {
+        ...state,
+        state: "ready" as const,
+        inputRevision,
+      };
+      await ctx.db.patch(state._id, {
+        state: "ready",
+        inputRevision,
+        dirtyJobIds: [],
+        nextTickAt: now,
+        ...clearLease(),
+        updatedAt: now,
+      });
+      await patchMissionWithRuntime(ctx, mission, {
+        steer: request.input,
+        steerRevision,
+        phase: "planning",
+        failureReason: undefined,
+        updatedAt: now,
+      });
+      return await record({
+        applied: true,
+        noop: false,
+        reason: "applied",
+        scope: "planning_only_zero_jobs",
+        resultState: "ready",
+        resultInputRevision: inputRevision,
+        wakeTicket: supervisorWakeTicket(nextState),
+      });
+    }
+
+    if (
+      state.state !== "needs_input"
+      || mission.status !== "needs_input"
+    ) {
+      return await reject("invalid_transition", { state });
+    }
+    const steerRevision = Number(mission.steerRevision ?? 0) + 1;
+    if (!Number.isSafeInteger(steerRevision)) {
+      return await reject("invalid_state_bounds", { state });
+    }
+    const inputRevision = state.inputRevision + 1;
+    const nextState = {
+      ...state,
+      state: "ready" as const,
+      inputRevision,
+    };
+    await ctx.db.patch(state._id, {
+      state: "ready",
+      inputRevision,
+      dirtyJobIds: [],
+      nextTickAt: now,
+      ...clearLease(),
+      consecutiveFailures: 0,
+      lastErrorCode: undefined,
+      lastErrorAt: undefined,
+      updatedAt: now,
+    });
+    await patchMissionWithRuntime(ctx, mission, {
+      status: "running",
+      phase: "planning",
+      steer: request.input,
+      steerRevision,
+      failureReason: undefined,
+      updatedAt: now,
+    });
+    await resolveSupervisorAttention(ctx, args.missionId, now, false);
+    return await record({
+      applied: true,
+      noop: false,
+      reason: "applied",
+      scope: "planning_only_zero_jobs",
+      resultState: "ready",
+      resultInputRevision: inputRevision,
+      wakeTicket: supervisorWakeTicket(nextState),
+    });
   },
 });
 

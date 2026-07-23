@@ -20,6 +20,14 @@ export const dispatcherAuthArgs = {
   dispatchToken: v.optional(v.string()),
 };
 
+// User-facing control may arrive from Daniel's live admin session or from the
+// trusted server-side dispatcher. Unlike dispatcherAuthArgs, this capability
+// deliberately excludes workers: execution authority is not control authority.
+export const ownerDispatcherAuthArgs = {
+  authTokenHash: v.optional(v.string()),
+  dispatchToken: v.optional(v.string()),
+};
+
 export const viewerAuthArgs = {
   ...dispatcherAuthArgs,
   viewerToken: v.optional(v.string()),
@@ -70,6 +78,15 @@ export async function requireDispatcher(
   const worker = process.env.JARVIS_WORKER_TOKEN;
   const dispatcher = process.env.JARVIS_DISPATCH_TOKEN;
   if (worker && constantTimeEqual(credentials.workerToken, worker)) return;
+  if (dispatcher && constantTimeEqual(credentials.dispatchToken, dispatcher)) return;
+  await requireAdmin(ctx, credentials.authTokenHash);
+}
+
+export async function requireOwnerOrDispatcher(
+  ctx: Parameters<typeof requireAdmin>[0],
+  credentials: { authTokenHash?: string; dispatchToken?: string },
+): Promise<void> {
+  const dispatcher = process.env.JARVIS_DISPATCH_TOKEN;
   if (dispatcher && constantTimeEqual(credentials.dispatchToken, dispatcher)) return;
   await requireAdmin(ctx, credentials.authTokenHash);
 }

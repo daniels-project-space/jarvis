@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isAdminSession, requireAdmin, requireDispatcher, requireViewer, requireWorker } from "../../convex/controlAuth";
+import {
+  isAdminSession,
+  requireAdmin,
+  requireDispatcher,
+  requireOwnerOrDispatcher,
+  requireViewer,
+  requireWorker,
+} from "../../convex/controlAuth";
 
 function authContext(session: { tokenHash: string; expiresAt: number; enrolledAt?: number } | null) {
   return {
@@ -51,6 +58,28 @@ describe("privileged control authentication", () => {
     await expect(requireDispatcher(ctx, { workerToken: "worker-capability" })).resolves.toBeUndefined();
     await expect(requireDispatcher(ctx, { authTokenHash: tokenHash })).resolves.toBeUndefined();
     await expect(requireDispatcher(authContext(null), {})).rejects.toThrow(/Authentication required/);
+  });
+
+  it("does not let execution workers exercise owner controls", async () => {
+    vi.stubEnv("JARVIS_WORKER_TOKEN", "worker-capability");
+    vi.stubEnv("JARVIS_DISPATCH_TOKEN", "dispatch-capability");
+    const tokenHash = "9".repeat(64);
+    const ctx = authContext({
+      tokenHash,
+      enrolledAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    });
+    await expect(
+      requireOwnerOrDispatcher(ctx, { dispatchToken: "dispatch-capability" }),
+    ).resolves.toBeUndefined();
+    await expect(
+      requireOwnerOrDispatcher(ctx, { authTokenHash: tokenHash }),
+    ).resolves.toBeUndefined();
+    await expect(
+      requireOwnerOrDispatcher(authContext(null), {
+        dispatchToken: "worker-capability",
+      }),
+    ).rejects.toThrow(/Authentication required/);
   });
 
   it("accepts a live read-only viewer capability without treating it as admin", async () => {

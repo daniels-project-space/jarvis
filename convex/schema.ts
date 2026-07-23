@@ -42,6 +42,14 @@ const missionSupervisorDecisionOriginValidator = v.union(
   v.literal("policy"),
 );
 
+const missionSupervisorControlActionValidator = v.union(
+  v.literal("pause"),
+  v.literal("resume"),
+  v.literal("cancel"),
+  v.literal("steer"),
+  v.literal("provide_input"),
+);
+
 // JARVIS memory index. Full markdown bodies live in R2 (bucket `jarvis`);
 // Convex holds the reactive index for search/recall. Multi-stage consolidation
 // (daily -> weekly -> long-term) is driven by Trigger.dev tasks.
@@ -912,6 +920,32 @@ export default defineSchema({
   })
     .index("by_key", ["decisionKey"])
     .index("by_mission_epoch_sequence", ["missionId", "epoch", "sequence"]),
+
+  // Immutable user-control receipts make retries safe even after later
+  // supervisor progress. Rejections are receipts too: a stale request key can
+  // never become applicable merely because the mission changes afterwards.
+  missionSupervisorControls: defineTable({
+    protocolVersion: v.literal(1),
+    missionId: v.id("missions"),
+    requestKey: v.string(),
+    requestDigest: v.string(),
+    action: missionSupervisorControlActionValidator,
+    expectedInputRevision: v.number(),
+    applied: v.boolean(),
+    noop: v.boolean(),
+    reason: v.string(),
+    scope: v.string(),
+    resultState: v.optional(missionSupervisorStateValidator),
+    resultInputRevision: v.optional(v.number()),
+    wakeRequested: v.boolean(),
+    ticketLeaseVersion: v.optional(v.number()),
+    ticketEpoch: v.optional(v.number()),
+    ticketDecisionSequence: v.optional(v.number()),
+    ticketInputRevision: v.optional(v.number()),
+    createdAt: v.number(),
+  })
+    .index("by_key", ["requestKey"])
+    .index("by_mission_created", ["missionId", "createdAt"]),
 
   // Resumable cursors make the legacy backfill and policy repairs one-time,
   // bounded work. Once both cursors finish, minute maintenance reads this one
