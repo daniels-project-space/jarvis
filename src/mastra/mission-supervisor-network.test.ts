@@ -13,6 +13,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("server-only", () => ({}));
 
 import {
+  SUPERVISOR_PLANNING_CONTEXT_MAX_BYTES,
   runSupervisorPlanningNetwork,
   type SupervisorNetworkEvent,
   type SupervisorPlanningTickInput,
@@ -592,36 +593,28 @@ describe("runSupervisorPlanningNetwork real Mastra runtime", () => {
   );
 
   it(
-    "clamps a validated desired count to a smaller primitive cap",
+    "rejects a desired count above the primitive cap without model work",
     async () => {
-      const harness = scriptedModel([
-        {
-          primitiveId: "paul",
-          proposal: proposal({
-            task: "Implement the single planning slice allowed by the smaller cap.",
-            label: "Capped slice",
-          }),
-        },
-      ]);
-
-      const result = await runSupervisorPlanningNetwork(
-        {
-          ...validInput,
-          tickId: "tick-clamp",
-          missionId: "mission-clamp",
-          profile: "durable_goal",
-          desiredWorkstreams: 6,
-          maxPrimitives: 1,
-        },
-        { modelFor: () => harness.model },
-      );
-
-      expect(result).toMatchObject({
-        iterations: 1,
-        terminalReason: "desired_proposals_reached",
-      });
-      expect(result.proposals).toHaveLength(1);
-      expect(harness.calls.filter((call) => call.kind === "routing")).toHaveLength(1);
+      let modelCalls = 0;
+      await expect(
+        runSupervisorPlanningNetwork(
+          {
+            ...validInput,
+            tickId: "tick-over-cap",
+            missionId: "mission-over-cap",
+            profile: "durable_goal",
+            desiredWorkstreams: 6,
+            maxPrimitives: 1,
+          },
+          {
+            modelFor: () => {
+              modelCalls += 1;
+              throw new Error("modelFor must not be called");
+            },
+          },
+        ),
+      ).rejects.toThrow("desiredWorkstreams cannot exceed maxPrimitives");
+      expect(modelCalls).toBe(0);
     },
     15_000,
   );
@@ -910,6 +903,46 @@ describe("runSupervisorPlanningNetwork strict input boundary", () => {
         desiredWorkstreams: 1,
       },
       "desiredWorkstreams is invalid",
+    );
+  });
+
+  it("rejects rather than silently reducing desired workstreams below the primitive cap", async () => {
+    await expectRejectedBeforeModel(
+      {
+        ...validInput,
+        desiredWorkstreams: 2,
+        maxPrimitives: 1,
+      },
+      "desiredWorkstreams cannot exceed maxPrimitives",
+    );
+  });
+
+  it("accepts the exact UTF-8 context boundary and rejects one extra multibyte character", async () => {
+    const exactContext = "é".repeat(
+      SUPERVISOR_PLANNING_CONTEXT_MAX_BYTES / 2,
+    );
+    const controller = new AbortController();
+    const reason = new Error("accepted exact byte boundary");
+    controller.abort(reason);
+    let modelCalls = 0;
+
+    await expect(
+      runSupervisorPlanningNetwork(
+        { ...validInput, context: exactContext },
+        {
+          modelFor: () => {
+            modelCalls += 1;
+            throw new Error("modelFor must not be called");
+          },
+          abortSignal: controller.signal,
+        },
+      ),
+    ).rejects.toBe(reason);
+    expect(modelCalls).toBe(0);
+
+    await expectRejectedBeforeModel(
+      { ...validInput, context: `${exactContext}é` },
+      "context is invalid",
     );
   });
 

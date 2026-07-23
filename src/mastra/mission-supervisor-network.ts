@@ -10,7 +10,14 @@ import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
 
 import { TEAM_BY_SLUG, type AgentSlug, type ModelTier } from "./team";
-import { normalizeWorkstream, type ManagedWorkstream } from "./supervisor";
+import {
+  normalizeWorkstream,
+  type ManagedWorkstream,
+} from "./supervisor-routing";
+
+export const SUPERVISOR_PLANNING_CONTEXT_MAX_BYTES = 24 * 1_024;
+export const SUPERVISOR_PLANNING_GOAL_MAX_BYTES = 12 * 1_024;
+export const SUPERVISOR_PLANNING_PROMPT_MAX_BYTES = 40 * 1_024;
 
 const planningInputKeys = [
   "tickId",
@@ -108,6 +115,7 @@ type PlanningRequestContext = {
 
 const safeId = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,159}$/;
 const allowedPlanningInputKeys = new Set<string>(planningInputKeys);
+const utf8Encoder = new TextEncoder();
 const proposalInput = z
   .object({
     task: z.string().trim().min(12).max(4_000),
@@ -123,15 +131,18 @@ const proposalInput = z
 function optionalBoundedString(
   value: unknown,
   key: "context" | "repo",
-  maximum: number,
+  maximumBytes: number,
 ): string | undefined {
   if (value === undefined) {
     return undefined;
   }
-  if (typeof value !== "string" || value.length > maximum) {
+  if (typeof value !== "string") {
     throw new TypeError(`Planning tick input ${key} is invalid`);
   }
   const trimmed = value.trim();
+  if (utf8Encoder.encode(trimmed).byteLength > maximumBytes) {
+    throw new TypeError(`Planning tick input ${key} is invalid`);
+  }
   if (key === "repo" && trimmed.length === 0) {
     throw new TypeError("Planning tick input repo is invalid");
   }
@@ -214,11 +225,14 @@ function copyInput(input: SupervisorPlanningTickInput): CopiedInput {
   if (typeof missionId !== "string" || !safeId.test(missionId)) {
     throw new TypeError("Planning tick input missionId is invalid");
   }
-  if (typeof goalValue !== "string" || goalValue.length > 12_000) {
+  if (typeof goalValue !== "string") {
     throw new TypeError("Planning tick input goal is invalid");
   }
   const goal = goalValue.trim();
-  if (goal.length < 12) {
+  if (
+    goal.length < 12 ||
+    utf8Encoder.encode(goal).byteLength > SUPERVISOR_PLANNING_GOAL_MAX_BYTES
+  ) {
     throw new TypeError("Planning tick input goal is invalid");
   }
   if (profile !== "short_fleet" && profile !== "durable_goal") {
@@ -232,17 +246,44 @@ function copyInput(input: SupervisorPlanningTickInput): CopiedInput {
       profile === "short_fleet" ? 1 : 2,
     ) ?? (profile === "short_fleet" ? 1 : 2);
   const maxPrimitives = boundedInteger(value("maxPrimitives"), "maxPrimitives", 1) ?? 6;
+  if (desiredWorkstreams > maxPrimitives) {
+    throw new TypeError(
+      "Planning tick input desiredWorkstreams cannot exceed maxPrimitives",
+    );
+  }
 
   return {
     tickId,
     missionId,
     goal,
     profile,
-    context: optionalBoundedString(value("context"), "context", 12_000),
+    context: optionalBoundedString(
+      value("context"),
+      "context",
+      SUPERVISOR_PLANNING_CONTEXT_MAX_BYTES,
+    ),
     repo: optionalBoundedString(value("repo"), "repo", 500),
-    desiredWorkstreams: Math.min(desiredWorkstreams, maxPrimitives),
+    desiredWorkstreams,
     maxPrimitives,
   };
+}
+
+function planningPrompt(copied: CopiedInput): string {
+  const prompt = [
+    `Planning goal: ${copied.goal}`,
+    copied.context ? `Context: ${copied.context}` : "",
+    copied.repo ? `Repository hint: ${copied.repo}` : "",
+    `Need ${copied.desiredWorkstreams} independent workstream proposal(s), with a hard cap of ${copied.maxPrimitives} planning primitives.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  if (
+    utf8Encoder.encode(prompt).byteLength >
+    SUPERVISOR_PLANNING_PROMPT_MAX_BYTES
+  ) {
+    throw new TypeError("Planning tick prompt exceeds its byte bound");
+  }
+  return prompt;
 }
 
 function safeRecord(value: unknown): Record<string, unknown> | undefined {
@@ -467,6 +508,7 @@ export async function runSupervisorPlanningNetwork(
   },
 ): Promise<SupervisorPlanningTickResult> {
   const copied = copyInput(input);
+  const prompt = planningPrompt(copied);
   const modelFor = options.modelFor;
   const onEvent = options.onEvent;
   const externalSignal = options.abortSignal;
@@ -640,15 +682,6 @@ and stop once enough independent workstreams have been proposed. You have no exe
       ["missionId", copied.missionId],
       ["profile", copied.profile],
     ]);
-    const prompt = [
-      `Planning goal: ${copied.goal}`,
-      copied.context ? `Context: ${copied.context}` : "",
-      copied.repo ? `Repository hint: ${copied.repo}` : "",
-      `Need ${copied.desiredWorkstreams} independent workstream proposal(s), with a hard cap of ${copied.maxPrimitives} planning primitives.`,
-    ]
-      .filter(Boolean)
-      .join("\n");
-
     const networkOptions: NetworkOptions = {
       maxSteps: Math.max(1, copied.maxPrimitives - 1),
       requestContext,
