@@ -260,25 +260,42 @@ function supervisorAuthority(command: RuntimeRow | null) {
   };
 }
 
-function supervisorControls(command: RuntimeRow | null) {
+const SUPERVISOR_CONTROL_ORDER = [
+  "pause",
+  "resume",
+  "cancel",
+  "steer",
+  "provide_input",
+] as const;
+
+type SupervisorControl = typeof SUPERVISOR_CONTROL_ORDER[number];
+
+const SUPERVISOR_CONTROL_RANK = new Map<string, number>(
+  SUPERVISOR_CONTROL_ORDER.map((action, index) => [action, index]),
+);
+
+function supervisorControls(command: RuntimeRow | null): SupervisorControl[] {
   if (
     !command
     || command.active !== true
     || command.state === "terminal"
+    || command.controlAffordanceProtocolVersion !== 1
+    || !Array.isArray(command.supportedControlActions)
+    || command.supportedControlActions.length > SUPERVISOR_CONTROL_ORDER.length
   ) {
     return [];
   }
-  if (command.state === "needs_input") {
-    return Number(command.totalJobs) === 0 || command.inputTargeted === true
-      ? ["provide_input", "cancel"]
-      : [];
+  const controls: SupervisorControl[] = [];
+  let previousRank = -1;
+  for (const action of command.supportedControlActions) {
+    const rank = typeof action === "string"
+      ? SUPERVISOR_CONTROL_RANK.get(action)
+      : undefined;
+    if (rank === undefined || rank <= previousRank) return [];
+    controls.push(action as SupervisorControl);
+    previousRank = rank;
   }
-  if (Number(command.totalJobs) !== 0) return [];
-  if (command.state === "paused") return ["resume", "cancel"];
-  if (["ready", "waiting", "leased"].includes(String(command.state))) {
-    return ["pause", "cancel", "steer"];
-  }
-  return [];
+  return controls;
 }
 
 function missionControls(
@@ -287,6 +304,7 @@ function missionControls(
 ) {
   if (!mission) return [];
   if (mission.mode === "supervised") return supervisorControls(command);
+  if (mission.mode !== "goal") return [];
   const status = String(mission.status ?? "");
   if (["done", "failed", "cancelled"].includes(status)) return [];
   if (["paused", "needs_input"].includes(status)) return ["resume", "cancel", "steer"];
@@ -664,9 +682,11 @@ export const snapshot = query({
     }
 
     const activities = await ctx.db.query("jobRuntime")
-      .withIndex("by_mission", (q) => q.eq("missionId", String(missionId)))
-      .take(FLEET_MAX_NODES + 1);
-    if (activities.length > FLEET_MAX_NODES) throw new Error("Fleet projection exceeds its 8-node hot bound");
+      .withIndex("by_mission_active_priority", (q) => q
+        .eq("missionId", String(missionId))
+        .eq("active", true))
+      .order("desc")
+      .take(FLEET_MAX_NODES);
     return buildFleetSnapshot({
       threadId,
       activeRows: relevant,

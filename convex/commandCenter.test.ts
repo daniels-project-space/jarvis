@@ -161,6 +161,69 @@ describe("commandCenter relevance and bounded projection", () => {
     });
     expect(result.fleet?.nodes[0].controls).toEqual(expect.arrayContaining(["approve", "decline"]));
   });
+
+  it("uses only an exact canonical supervisor affordance and ignores stale job totals", () => {
+    const base = {
+      threadId,
+      activeRows: [runtime({ missionId: "mission-supervised" })],
+      mission: {
+        missionId: "mission-supervised",
+        goal: "Supervise the live workers",
+        mode: "supervised",
+        status: "running",
+      },
+      supervisorCommand: {
+        active: true,
+        state: "ready",
+        totalJobs: 0,
+        nonterminalJobCount: 24,
+        controlAffordanceProtocolVersion: 1,
+        supportedControlActions: ["pause"],
+      },
+    };
+
+    expect(buildFleetSnapshot(base).fleet?.controls).toEqual(["pause"]);
+    for (const supervisorCommand of [
+      { ...base.supervisorCommand, controlAffordanceProtocolVersion: undefined },
+      { ...base.supervisorCommand, supportedControlActions: ["pause", "pause"] },
+      { ...base.supervisorCommand, supportedControlActions: ["cancel", "pause"] },
+      { ...base.supervisorCommand, supportedControlActions: ["unsupported"] },
+    ]) {
+      expect(buildFleetSnapshot({
+        ...base,
+        supervisorCommand,
+      }).fleet?.controls).toEqual([]);
+    }
+  });
+
+  it("keeps goal controls, hides other mission controls, and preserves worker-job controls", () => {
+    const activeRows = [runtime({ missionId: "mission-one" })];
+    const goal = buildFleetSnapshot({
+      threadId,
+      activeRows,
+      mission: {
+        missionId: "mission-one",
+        goal: "Deliver the goal",
+        mode: "goal",
+        status: "running",
+      },
+    });
+    const nonGoal = buildFleetSnapshot({
+      threadId,
+      activeRows,
+      mission: {
+        missionId: "mission-one",
+        goal: "Legacy fleet mission",
+        mode: "fleet",
+        status: "running",
+      },
+    });
+
+    expect(goal.fleet?.controls).toEqual(["pause", "cancel", "steer"]);
+    expect(nonGoal.fleet?.controls).toEqual([]);
+    expect(nonGoal.fleet?.nodes[0].controls)
+      .toEqual(["pause", "cancel", "steer"]);
+  });
 });
 
 describe("commandCenter.snapshot indexed IO", () => {
@@ -169,6 +232,7 @@ describe("commandCenter.snapshot indexed IO", () => {
     const jobRuntime = schema.slice(schema.indexOf("jobRuntime: defineTable"), schema.indexOf("missions: defineTable"));
     expect(jobRuntime).toContain('.index("by_thread_visibility_active_priority", ["originThreadId", "visibility", "active", "priority", "createdAt"])');
     expect(jobRuntime).toContain('.index("by_plan_parent_generation_node", ["planParentMissionId", "planGeneration", "planNodeId"])');
+    expect(jobRuntime).toMatch(/\.index\("by_mission_active_priority", \[\s*"missionId",\s*"active",\s*"priority",\s*"createdAt",\s*\]\)/);
   });
 
   it("uses seven bounded indexed reads for command authority plus an exact persisted GoalPlan", async () => {
@@ -237,6 +301,96 @@ describe("commandCenter.snapshot indexed IO", () => {
       { table: "jobRuntime", index: "by_plan_parent_generation_node", equalities: { planParentMissionId: "mission-1", planGeneration: 1 }, limit: 9 },
     ]);
     expect(reads.some((read) => ["jobs", "approvals", "attentionItems", "workEvents"].includes(read.table))).toBe(false);
+  });
+
+  it("reads only the top eight active mission rows for a non-plan projection", async () => {
+    const reads: Array<{
+      table: string;
+      index?: string;
+      equalities: Record<string, unknown>;
+      limit?: number;
+      first?: boolean;
+      order?: string;
+    }> = [];
+    const primary = runtime({ missionId: "mission-1" });
+    const ctx = {
+      auth: { getUserIdentity: async () => ({ issuer: "https://jarvis-orcin-six.vercel.app", subject: "daniel-owner" }) },
+      db: {
+        normalizeId: (_table: string, id: string) => id,
+        query: (table: string) => {
+          const read = { table, equalities: {} } as (typeof reads)[number];
+          reads.push(read);
+          const indexQuery = {
+            eq(field: string, value: unknown) {
+              read.equalities[field] = value;
+              return indexQuery;
+            },
+          };
+          const builder = {
+            withIndex(index: string, apply: (q: typeof indexQuery) => unknown) {
+              read.index = index;
+              apply(indexQuery);
+              return builder;
+            },
+            order(order: string) {
+              read.order = order;
+              return builder;
+            },
+            async take(limit: number) {
+              read.limit = limit;
+              if (
+                table === "jobRuntime"
+                && read.index === "by_thread_visibility_active_priority"
+              ) {
+                return [primary];
+              }
+              if (
+                table === "jobRuntime"
+                && read.index === "by_mission_active_priority"
+              ) {
+                return activities();
+              }
+              return [];
+            },
+            async first() {
+              read.first = true;
+              if (table === "missionRuntime") {
+                return {
+                  missionId: "mission-1",
+                  goal: "Ship bounded work",
+                  mode: "goal",
+                  status: "running",
+                  phase: "building",
+                  percent: 20,
+                };
+              }
+              return null;
+            },
+          };
+          return builder;
+        },
+      },
+    };
+    const handler = (snapshot as unknown as {
+      _handler: (
+        context: unknown,
+        args: { threadId?: string },
+      ) => Promise<{ fleet: { nodes: unknown[] } | null }>;
+    })._handler;
+
+    const result = await handler(ctx, { threadId });
+
+    expect(result.fleet?.nodes).toHaveLength(FLEET_MAX_NODES);
+    expect(reads.at(-1)).toEqual({
+      table: "jobRuntime",
+      index: "by_mission_active_priority",
+      equalities: { missionId: "mission-1", active: true },
+      order: "desc",
+      limit: FLEET_MAX_NODES,
+    });
+    expect(reads.some((read) =>
+      read.table === "jobRuntime" && read.index === "by_mission"
+    )).toBe(false);
   });
 
   it("discovers every bounded supervisor command through one thread index without N+1 reads", async () => {

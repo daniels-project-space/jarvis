@@ -168,6 +168,40 @@ describe("FleetCommandCenter", () => {
     expect(expanded).not.toContain("loading exact work detail");
   });
 
+  it("does not invent supervised mission controls and keeps worker controls job-scoped", () => {
+    const snapshot: CompactWorkSnapshot = {
+      ...work,
+      fleet: {
+        ...work.fleet!,
+        mode: "supervised",
+        controls: [],
+        supervisor: {
+          protocolVersion: 1,
+          state: "ready",
+          inputRevision: 4,
+          steerRevision: 2,
+          deadlineAt: 1_800_000_000_000,
+        },
+      },
+    };
+
+    const markup = renderToStaticMarkup(
+      <FleetCommandCenter snapshot={snapshot} initialExpanded />,
+    );
+    const source = readFileSync(
+      new URL("./CompactWorkBar.tsx", import.meta.url),
+      "utf8",
+    );
+
+    expect(markup).toContain('data-supervisor-authority="ready:4"');
+    expect(markup).not.toMatch(/>pause<\/button>/);
+    expect(markup).not.toMatch(/>cancel<\/button>/);
+    expect(markup).not.toMatch(/>steer<\/button>/);
+    expect(source).toMatch(
+      /controls=\{node\.controls\} target=\{\{ jobId: node\.jobId \}\}/,
+    );
+  });
+
   it("renders the supervisor question and answer separately from steering without adding another surface", () => {
     const planning = node({
       id: "supervisor:mission-input",

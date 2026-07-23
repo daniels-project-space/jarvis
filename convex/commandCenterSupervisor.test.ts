@@ -31,6 +31,7 @@ async function seedSupervisedMission(
     question?: string;
     inputTargeted?: boolean;
     totalJobs?: number;
+    nonterminalJobCount?: number;
     priority?: number;
     originThreadId?: string;
   },
@@ -95,6 +96,10 @@ async function seedSupervisedMission(
             leaseVersion: 0,
           }),
       totalJobs: options.totalJobs ?? 0,
+      nonterminalJobCount:
+        options.nonterminalJobCount ?? options.totalJobs ?? 0,
+      activeJobControlProtocolVersion: 1,
+      activeJobControlActions: ["pause", "resume"],
       maxJobs: 24,
       decisionCount: 0,
       maxDecisions: 64,
@@ -226,10 +231,153 @@ describe("supervised mission command-center projection", () => {
         state: "ready",
         inputRevision: 0,
       },
-      controls: [],
+      controls: ["pause"],
     });
     expect(jobs.map((job) => job.jobId)).toEqual([jobId]);
     expect(jobs.some((job) => job.projectionKind === "supervisor_planning")).toBe(false);
+  });
+
+  it("ignores twelve terminal history rows and keeps the live supervised worker", async () => {
+    const t = convexTest(schema, modules);
+    const missionId = await seedSupervisedMission(t, {
+      state: "ready",
+      totalJobs: 13,
+      nonterminalJobCount: 1,
+    });
+    const terminalIds: Array<Id<"jobs">> = [];
+    for (let index = 0; index < 12; index += 1) {
+      terminalIds.push(await seedActiveJob(t, missionId, {
+        status: "done",
+        priority: 100,
+        label: `Historical terminal worker ${index}`,
+        createdAt: 1_000 + index,
+      }));
+    }
+    const liveJobId = await seedActiveJob(t, missionId, {
+      priority: 1,
+      label: "Current supervised worker",
+      createdAt: 2_000,
+    });
+
+    const result = await snapshot(t);
+    const projectedJobIds = result.fleet?.nodes.map((node: {
+      jobId: string;
+    }) => node.jobId);
+
+    expect(projectedJobIds).toEqual([liveJobId]);
+    expect(terminalIds.every((jobId) =>
+      !projectedJobIds?.includes(jobId)
+    )).toBe(true);
+    expect(result.fleet?.controls).toEqual(["pause"]);
+  });
+
+  it.each([9, 24])(
+    "selects the deterministic top eight of %i simultaneous supervised workers",
+    async (jobCount) => {
+      const t = convexTest(schema, modules);
+      const missionId = await seedSupervisedMission(t, {
+        state: "ready",
+        totalJobs: jobCount,
+        nonterminalJobCount: jobCount,
+      });
+      const jobIds: Array<Id<"jobs">> = [];
+      for (let index = 0; index < jobCount; index += 1) {
+        jobIds.push(await seedActiveJob(t, missionId, {
+          priority: 100 - index,
+          label: `Priority worker ${index}`,
+          createdAt: 10_000 + index,
+        }));
+      }
+
+      const first = await snapshot(t);
+      const second = await snapshot(t);
+      const firstIds = first.fleet?.nodes.map((node: {
+        jobId: string;
+      }) => node.jobId) ?? [];
+      const secondIds = second.fleet?.nodes.map((node: {
+        jobId: string;
+      }) => node.jobId) ?? [];
+
+      expect(firstIds).toHaveLength(8);
+      expect(new Set(firstIds)).toEqual(new Set(jobIds.slice(0, 8)));
+      expect(secondIds).toEqual(firstIds);
+      expect(first.fleet?.controls).toEqual(["pause"]);
+    },
+  );
+
+  it.each([
+    {
+      state: "ready" as const,
+      missionStatus: "running",
+      jobStatus: "running",
+      staleTotalJobs: 0,
+      expectedControl: "pause",
+    },
+    {
+      state: "paused" as const,
+      missionStatus: "paused",
+      jobStatus: "paused",
+      staleTotalJobs: 24,
+      expectedControl: "resume",
+    },
+  ])(
+    "uses the projected $expectedControl affordance for active jobs even when totalJobs is stale",
+    async (fixture) => {
+      const t = convexTest(schema, modules);
+      const missionId = await seedSupervisedMission(t, {
+        state: fixture.state,
+        missionStatus: fixture.missionStatus,
+        totalJobs: 1,
+        nonterminalJobCount: 1,
+      });
+      await seedActiveJob(t, missionId, { status: fixture.jobStatus });
+      await t.run(async (ctx) => {
+        const command = await ctx.db
+          .query("missionSupervisorCommand")
+          .withIndex("by_mission", (q) => q.eq("missionId", missionId))
+          .unique();
+        if (!command) throw new Error("Supervisor command fixture missing");
+        await ctx.db.patch(command._id, {
+          totalJobs: fixture.staleTotalJobs,
+        });
+      });
+
+      const result = await snapshot(t);
+
+      expect(result.fleet?.controls).toEqual([fixture.expectedControl]);
+      expect(result.fleet?.controls).not.toContain("cancel");
+      expect(result.fleet?.controls).not.toContain("steer");
+    },
+  );
+
+  it("fails closed for a legacy supervised command without affordance authority", async () => {
+    const t = convexTest(schema, modules);
+    const missionId = await seedSupervisedMission(t, {
+      state: "ready",
+      totalJobs: 0,
+      nonterminalJobCount: 0,
+    });
+    await t.run(async (ctx) => {
+      const command = await ctx.db
+        .query("missionSupervisorCommand")
+        .withIndex("by_mission", (q) => q.eq("missionId", missionId))
+        .unique();
+      if (!command) throw new Error("Supervisor command fixture missing");
+      await ctx.db.patch(command._id, {
+        controlAffordanceProtocolVersion: undefined,
+        supportedControlActions: undefined,
+      });
+    });
+
+    const result = await snapshot(t);
+
+    expect(result.fleet).toMatchObject({
+      controls: [],
+      supervisor: {
+        state: "ready",
+        inputRevision: 0,
+      },
+    });
   });
 
   it.each([
@@ -257,7 +405,7 @@ describe("supervised mission command-center projection", () => {
       state: "needs_input" as const,
       activeStatus: "needs_input",
       stage: "waiting for Daniel",
-      controls: ["provide_input", "cancel"],
+      controls: ["cancel", "provide_input"],
       question: "Choose the exact delivery boundary.",
     },
   ])("shows every nonterminal $state command honestly", async (fixture) => {
@@ -354,7 +502,7 @@ describe("supervised mission command-center projection", () => {
     });
   });
 
-  it("keeps low-priority targeted input authority for a real attention job", async () => {
+  it("keeps low-priority targeted input visible without inventing unsupported active-job controls", async () => {
     const t = convexTest(schema, modules);
     for (let index = 0; index < 9; index += 1) {
       await seedSupervisedMission(t, {
@@ -380,7 +528,7 @@ describe("supervised mission command-center projection", () => {
     expect(result.active?.id).toBe(jobId);
     expect(result.fleet).toMatchObject({
       id: target,
-      controls: ["provide_input", "cancel"],
+      controls: [],
       supervisor: {
         state: "needs_input",
         inputRevision: 0,
