@@ -53,12 +53,6 @@ export async function POST(req: NextRequest) {
   });
   const missionId = String(created?.missionId ?? "");
   if (!missionId) return Response.json({ ok: false, error: "Goal Mode could not create its durable mission." }, { status: 503 });
-  await controlMutation("ui:setPanel", {
-    ...credentials,
-    type: "fleet",
-    value: JSON.stringify({ missionId, mode: "goal" }),
-    title: `goal · ${goal.slice(0, 44)}`,
-  }).catch(() => null);
   const woken = created?.held ? false : await wakeAgentFleet(`goal:${missionId}`).catch(() => false);
   return Response.json({
     ok: true,

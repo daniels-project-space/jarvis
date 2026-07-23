@@ -3,6 +3,7 @@ import { reportIncident } from "@/lib/context";
 import { actorAdminHash, controlActor, isOwnerActor } from "@/lib/request-auth";
 import { TOOL_DEFS, executeTool } from "@/lib/tools";
 import { TOOL_BELTS, slimToolDefinition } from "@/lib/tool-belts";
+import { normalizeToolInvocationContext } from "@/lib/tool-invocation-context";
 
 // The realtime client fetches tool definitions here to register them on the
 // session. ?live=1 returns a SLIMMED belt: paragraph-long descriptions and
@@ -39,9 +40,15 @@ export async function POST(req: NextRequest) {
   if (!isOwnerActor(actor)) return Response.json({ error: "owner enrollment required" }, { status: 403 });
   const authTokenHash = actorAdminHash(actor);
   try {
-    const { name, args } = await req.json();
+    const { name, args, requestId } = await req.json();
     toolName = String(name);
-    const result = await executeTool(toolName, args ?? {}, authTokenHash);
+    const invocationContext = normalizeToolInvocationContext(
+      requestId === undefined ? undefined : { requestId },
+    );
+    const result = await executeTool(toolName, args ?? {}, {
+      authTokenHash,
+      invocationContext,
+    });
     return Response.json({ result });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);

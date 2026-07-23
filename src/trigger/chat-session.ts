@@ -34,7 +34,7 @@ import {
 import { waitForForegroundLease } from "./foreground-lease";
 import { successorLane, taskForForegroundLane, type ForegroundLane } from "./foreground-lanes";
 import { buildForegroundTiming, type ForegroundTurnTiming } from "./foreground-timing";
-import { CodexAppServer } from "./codex-app-server";
+import { CodexAppServer, type CodexTurnInput } from "./codex-app-server";
 import { ForegroundSessionOwner } from "./foreground-session";
 import { MEMORY_SUBSCRIPTION_VALIDITY_MS } from "./subscription-validity";
 import {
@@ -130,6 +130,8 @@ type QueueClaim = {
   threadId: string;
   guest?: boolean;
   userText: string;
+  requestId?: string;
+  userMessageId: string;
   assistantId: string;
   claimToken: string;
   attemptCount: number;
@@ -156,6 +158,7 @@ async function runTurn(
   contextBlock: string,
   model: string,
   guest: boolean,
+  invocationContext: CodexTurnInput["invocationContext"],
   onStage?: (stage: "codexAck" | "firstDelta" | "firstConvexPaint") => void,
 ){
   const publisher = new StreamPublisher(
@@ -177,6 +180,7 @@ async function runTurn(
       preamble: conversationPreamble(guest),
       modelTier: model,
       allowTools: !guest,
+      invocationContext,
       onTurnStarted: () => onStage?.("codexAck"),
       onDelta: (delta) => {
         if (!sawDelta) {
@@ -454,6 +458,10 @@ async function processChatQueue(
         context,
         model,
         Boolean(claim.guest),
+        {
+          requestId: claim.requestId,
+          userMessageId: claim.userMessageId,
+        },
         (stage) => {
           if (stage === "codexAck") onStarted();
           if (stages[stage] === undefined) stages[stage] = Date.now();

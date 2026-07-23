@@ -6,6 +6,10 @@ import { appendAgentMessageDelta } from "./codex-stream";
 import { redactSensitiveText } from "../lib/secret-redaction";
 import { BoundedJsonLineDecoder } from "../lib/bounded-json-lines";
 import { hasExactKeys, isJsonRecord, parseStrictJson } from "../lib/bounded-json";
+import {
+  normalizeToolInvocationContext,
+  type ToolInvocationContext,
+} from "../lib/tool-invocation-context";
 
 type JsonObject = Record<string, unknown>;
 type PendingRequest = {
@@ -18,6 +22,7 @@ type PendingRequest = {
 type ActiveTurn = {
   turnId: string;
   threadId: string;
+  invocationContext?: ToolInvocationContext;
   text: string;
   deltaCount: number;
   itemId?: string;
@@ -38,6 +43,7 @@ export type CodexDynamicToolCall = {
   threadId: string;
   turnId: string;
   callId: string;
+  invocationContext?: ToolInvocationContext;
   namespace: string | null;
   tool: string;
   arguments: unknown;
@@ -324,6 +330,7 @@ export type CodexTurnInput = {
   preamble: string;
   modelTier: string;
   allowTools?: boolean;
+  invocationContext?: ToolInvocationContext;
   outputSchema?: JsonObject;
   onDelta: (delta: string) => void;
   /** Durable receipt written before turn/start may cross the protocol. */
@@ -416,6 +423,9 @@ export class CodexAppServer {
   async runTurn(input: CodexTurnInput): Promise<CodexTurnResult> {
     const outputSchema = input.outputSchema === undefined ? undefined
       : validateCodexOutputSchema(input.outputSchema);
+    const invocationContext = normalizeToolInvocationContext(input.invocationContext, {
+      allowUserMessageId: true,
+    });
     await this.start();
     if (this.active.size >= this.limits.activeTurns) {
       throw new Error("Codex app-server active-turn limit reached");
@@ -514,6 +524,7 @@ export class CodexAppServer {
       this.active.set(turnId, {
         turnId,
         threadId,
+        ...(invocationContext ? { invocationContext } : {}),
         text: "",
         deltaCount: 0,
         onDelta: input.onDelta,
@@ -648,6 +659,10 @@ export class CodexAppServer {
   private async respondToDynamicToolCall(message: JsonObject) {
     const requestKey = `${typeof message.id}:${String(message.id)}`;
     const params = (message.params as JsonObject | undefined) ?? {};
+    const threadId = typeof params.threadId === "string" ? params.threadId : "";
+    const turnId = typeof params.turnId === "string" ? params.turnId : "";
+    const active = this.active.get(turnId);
+    const invocationContext = active?.threadId === threadId ? active.invocationContext : undefined;
     const handler = this.options.onDynamicToolCall;
     let dynamicResult: CodexDynamicToolResult;
     try {
@@ -659,9 +674,10 @@ export class CodexAppServer {
       } else {
         try {
           dynamicResult = await handler({
-            threadId: typeof params.threadId === "string" ? params.threadId : "",
-            turnId: typeof params.turnId === "string" ? params.turnId : "",
+            threadId,
+            turnId,
             callId: typeof params.callId === "string" ? params.callId : "",
+            ...(invocationContext ? { invocationContext } : {}),
             namespace: typeof params.namespace === "string" ? params.namespace : null,
             tool: params.tool,
             arguments: params.arguments,

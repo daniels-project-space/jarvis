@@ -482,6 +482,8 @@ async function claimPending(ctx: { db: any }, pending: any, claimToken: string) 
       threadId: pending.threadId,
       guest: pending.threadId.startsWith("guest:"),
       userText: pending.text,
+      requestId: pending.requestId,
+      userMessageId: pending._id,
       assistantId,
       claimToken,
       attemptCount,

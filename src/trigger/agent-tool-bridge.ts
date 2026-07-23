@@ -3,6 +3,7 @@ import type {
   CodexDynamicToolResult,
   CodexDynamicToolSpec,
 } from "./codex-app-server";
+import type { ToolInvocationContext } from "../lib/tool-invocation-context";
 
 export const JARVIS_AGENT_TOOL_ENDPOINT = "https://jarvis-orcin-six.vercel.app/api/agent-tool";
 
@@ -85,7 +86,7 @@ export class AgentToolBridge {
   async invoke(call: CodexDynamicToolCall): Promise<CodexDynamicToolResult> {
     if (call.namespace !== null) return result("Unknown Jarvis tool namespace.", false);
     if (call.tool === "jarvis_get_tools") return this.getTools(call.arguments);
-    if (call.tool === "jarvis_call_tool") return this.callTool(call.arguments);
+    if (call.tool === "jarvis_call_tool") return this.callTool(call.arguments, call.invocationContext);
     return result("Unknown Jarvis bridge tool.", false);
   }
 
@@ -100,7 +101,10 @@ export class AgentToolBridge {
     return this.request(url, { method: "GET" });
   }
 
-  private async callTool(value: unknown): Promise<CodexDynamicToolResult> {
+  private async callTool(
+    value: unknown,
+    invocationContext?: ToolInvocationContext,
+  ): Promise<CodexDynamicToolResult> {
     const input = record(value);
     const name = input?.name;
     const args = record(input?.args);
@@ -109,7 +113,11 @@ export class AgentToolBridge {
     }
     return this.request(new URL(this.endpoint), {
       method: "POST",
-      body: JSON.stringify({ name: name.trim(), args }),
+      body: JSON.stringify({
+        name: name.trim(),
+        args,
+        ...(invocationContext ? { invocationContext } : {}),
+      }),
     });
   }
 

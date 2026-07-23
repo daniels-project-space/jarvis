@@ -63,6 +63,10 @@ describe("Codex app-server dynamic tools", () => {
       contextBlock: "",
       preamble: "test",
       modelTier: "luna",
+      invocationContext: {
+        requestId: "request-1",
+        userMessageId: "message-1",
+      },
       onDelta: () => {},
     });
 
@@ -94,6 +98,10 @@ describe("Codex app-server dynamic tools", () => {
       threadId: "thread-1",
       turnId: "turn-1",
       callId: "call-1",
+      invocationContext: {
+        requestId: "request-1",
+        userMessageId: "message-1",
+      },
       namespace: null,
       tool: "jarvis_call_tool",
       arguments: { name: "show", args: { panel: "dashboard" } },
@@ -109,6 +117,28 @@ describe("Codex app-server dynamic tools", () => {
       params: { turnId: "turn-1", turn: { id: "turn-1", status: "completed" } },
     }));
     await expect(turnPromise).resolves.toMatchObject({ finalText: "done", threadId: "thread-1", code: 0 });
+  });
+
+  it("rejects unbounded tool invocation metadata before starting a Codex thread", async () => {
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000);
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = {
+      stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } },
+    };
+    internals.ready = Promise.resolve();
+
+    await expect(server.runTurn({
+      conversationId: "conversation-1",
+      userText: "show me the dashboard",
+      history: [],
+      contextBlock: "",
+      preamble: "test",
+      modelTier: "luna",
+      invocationContext: { requestId: "x".repeat(121) },
+      onDelta: () => {},
+    })).rejects.toThrow("requestId is invalid");
+    expect(writes).toEqual([]);
   });
 
   it("preserves the foreground thread/start defaults when no permission profile is supplied", async () => {

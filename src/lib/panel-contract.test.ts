@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { resolvePanelRoute } from "./panel-contract";
 
@@ -33,5 +34,25 @@ describe("semantic panel routing", () => {
 
   it("reserves the full stage only for video playback", () => {
     expect(resolvePanelRoute({ type: "video", value: "https://example.com" }).keepOrbVisible).toBe(false);
+  });
+
+  it("opens the Goal launcher only from the explicit UI action, never mission admission or status", () => {
+    const tools = readFileSync(new URL("./tools.ts", import.meta.url), "utf8");
+    const goalRoute = readFileSync(new URL("../app/api/goal-mode/route.ts", import.meta.url), "utf8");
+    const jarvis = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
+    const goalModeCase = tools.slice(
+      tools.indexOf('case "goal_mode"'),
+      tools.indexOf('case "orchestrate"'),
+    );
+    const orchestrateCase = tools.slice(
+      tools.indexOf('case "orchestrate"'),
+      tools.indexOf('case "work_control"'),
+    );
+
+    expect(goalModeCase).not.toContain('"ui:setPanel"');
+    expect(orchestrateCase).not.toContain('"ui:setPanel"');
+    expect(goalRoute).not.toContain('"ui:setPanel"');
+    expect(jarvis.match(/setPanel\(\{ type: "fleet"/g)).toHaveLength(1);
+    expect(jarvis).toMatch(/onOpenGoals[\s\S]{0,300}setPanel\(\{ type: "fleet"/);
   });
 });

@@ -192,6 +192,29 @@ describe("streaming and paginated history behavior", () => {
     expect(row?.threadId).toBe(`guest:${GUEST_ID}`);
   });
 
+  it("keeps the originating request and user message ids stable across admission replay and claim", async () => {
+    const t = convexTest(schema, modules);
+    const input = {
+      threadId: "main",
+      text: "delegate this durable request",
+      requestId: "stable-chat-request",
+      guestId: GUEST_ID,
+    };
+    const first = await t.mutation(api.chatQueue.sendMessage, input);
+    const replay = await t.mutation(api.chatQueue.sendMessage, input);
+    expect(replay).toBe(first);
+
+    const claim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: first,
+      workerToken: WORKER,
+    });
+    expect(claim).toMatchObject({
+      requestId: input.requestId,
+      userMessageId: first,
+      userText: input.text,
+    });
+  });
+
   it("reconciles proactive ownership through bounded indexed pages despite unrelated rows", async () => {
     const t = convexTest(schema, modules);
     await t.run(async (ctx) => {

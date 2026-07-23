@@ -16,6 +16,10 @@ import type { ProjectSourceAdmission } from "./source-admission";
 import { canonicalizeRepository } from "./workflow-contract";
 import { admissionMutationName, v2AdmissionEnabled } from "./mission-protocol-rollout";
 import {
+  normalizeToolInvocationContext,
+  type ToolExecutionHostContext,
+} from "./tool-invocation-context";
+import {
   VISUAL_BLOCK_KINDS,
   VISUAL_CAPABILITIES,
   mergeVisualScene,
@@ -3127,7 +3131,19 @@ async function creationFiling(args: any, category?: string): Promise<{
   return { category, project, inquiry, threadId: await activeThread() };
 }
 
-export async function executeTool(name: string, args: any, authTokenHash?: string): Promise<string> {
+export async function executeTool(
+  name: string,
+  args: any,
+  hostContext: ToolExecutionHostContext = {},
+): Promise<string> {
+  const authTokenHash = hostContext.authTokenHash;
+  const invocationContext = normalizeToolInvocationContext(hostContext.invocationContext, {
+    allowUserMessageId: true,
+  });
+  const boundedHostContext: ToolExecutionHostContext = {
+    ...(authTokenHash ? { authTokenHash } : {}),
+    ...(invocationContext ? { invocationContext } : {}),
+  };
   return await withAdminSession(authTokenHash, async () => {
     switch (name) {
     case "dispatch_agent": {
@@ -3196,14 +3212,9 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
         const goal = missionId
           ? missions.find((mission) => String(mission._id) === missionId && mission.mode === "goal")
           : missions.find((mission) => mission.mode === "goal" && ["running", "split", "paused", "needs_input"].includes(mission.status));
-        await convexMutation("ui:setPanel", {
-          type: "fleet",
-          value: JSON.stringify(goal ? { missionId: String(goal._id), mode: "goal" } : { mode: "goal" }),
-          title: goal ? `goal · ${String(goal.goal).slice(0, 44)}` : "Goal Mode",
-        }).catch(() => {});
         return goal
           ? `Goal ${goal._id} is ${goal.status}, phase ${goal.phase}, ${goal.percent}% complete${goal.failureReason ? ` — ${goal.failureReason}` : ""}. Its durable sessions and evidence are on screen.`
-          : "There is no active Goal Mode outcome. The Goal Mode command deck is open.";
+          : "There is no active Goal Mode outcome.";
       }
       if (action === "pause" || action === "resume" || action === "cancel" || action === "steer") {
         if (!missionId) return `Choose the Goal Mode outcome to ${action}.`;
@@ -3249,11 +3260,6 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       const id = String(created?.missionId ?? "");
       if (!id) throw new Error("Goal Mode did not create a durable mission");
       if (!created?.held) await wakeAgentFleet(`goal:${id}`).catch(() => false);
-      await convexMutation("ui:setPanel", {
-        type: "fleet",
-        value: JSON.stringify({ missionId: id, mode: "goal" }),
-        title: `goal · ${goal.slice(0, 44)}`,
-      }).catch(() => {});
       return created?.held
         ? `Goal Mode ${id} is durably held while the mission protocol rollout is dormant; no planner or repository workspace was started.`
         : `Goal Mode ${id} is live. Route: ${route.kind}${route.primaryRepo ? ` in ${route.primaryRepo}` : ""} — ${route.reason} One Sol/max planner is working now; it will hand bounded work to Terra/high, preserve checkpoints for days if needed, and only finish after a Sol/max deep validation passes.`;
@@ -3323,7 +3329,6 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       if (plan.workstreams.some((stream) => !stream.approvalRequired)) {
         await wakeAgentFleet(`mission:${String(missionId)}`).catch(() => false);
       }
-      await convexMutation("ui:setPanel", { type: "fleet", value: JSON.stringify({ missionId: String(missionId) }), title: `mission · ${mission.slice(0, 44)}` }).catch(() => {});
       const waiting = plan.workstreams.filter((stream) => stream.approvalRequired).length;
       return `JARVIS planned mission ${missionId} with ${plan.workstreams.length} permanent specialists: ${plan.workstreams.map((stream) => `${stream.label} [${workModelLabel(stream.model)}]`).join(", ")}. ${waiting ? `${waiting} consequential workstream${waiting === 1 ? " is" : "s are"} waiting in Needs you; ` : ""}live stages and checkpoints are on screen, and one reviewed synthesis returns to this conversation.`;
     }
@@ -3385,7 +3390,7 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
             acceptance_criteria: ["Production-ready visual specification", "Editable construction steps and exact generation/drawing prompts"],
           },
         ],
-      }, authTokenHash);
+      }, boundedHostContext);
     }
     case "visual_scene":
       return await visualSceneTool(args);

@@ -9,11 +9,16 @@ import {
 } from "./agent-tool-bridge";
 import type { CodexDynamicToolCall } from "./codex-app-server";
 
-function dynamicCall(tool: string, args: unknown): CodexDynamicToolCall {
+function dynamicCall(
+  tool: string,
+  args: unknown,
+  invocationContext?: CodexDynamicToolCall["invocationContext"],
+): CodexDynamicToolCall {
   return {
     threadId: "thread-1",
     turnId: "turn-1",
     callId: "call-1",
+    ...(invocationContext ? { invocationContext } : {}),
     namespace: null,
     tool,
     arguments: args,
@@ -58,7 +63,12 @@ describe("foreground agent tool bridge", () => {
     try {
       const listed = await bridge.invoke(dynamicCall("jarvis_get_tools", { belt: "core" }));
       const args = { text: `Daniel's "quoted" $HOME; $(touch nope)\nnext line` };
-      const called = await bridge.invoke(dynamicCall("jarvis_call_tool", { name: "show", args }));
+      const invocationContext = { requestId: "request-1", userMessageId: "message-1" };
+      const called = await bridge.invoke(dynamicCall(
+        "jarvis_call_tool",
+        { name: "show", args },
+        invocationContext,
+      ));
 
       expect(listed.success).toBe(true);
       expect(JSON.parse(listed.contentItems[0].type === "inputText" ? listed.contentItems[0].text : "null"))
@@ -76,7 +86,7 @@ describe("foreground agent tool bridge", () => {
         {
           method: "POST",
           authorization: `Bearer ${token}`,
-          body: { name: "show", args },
+          body: { name: "show", args, invocationContext },
           url: "/api/agent-tool",
         },
       ]);
@@ -103,6 +113,38 @@ describe("foreground agent tool bridge", () => {
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
+  });
+
+  it("replays the same authoritative invocation context without placing it in tool arguments", async () => {
+    const bodies: unknown[] = [];
+    const bridge = new AgentToolBridge("dispatch-token", {
+      endpoint: "https://jarvis.test/api/agent-tool",
+      fetchImplementation: async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return Response.json({ result: "accepted" });
+      },
+    });
+    const invocationContext = { requestId: "stable-request", userMessageId: "stable-message" };
+    const call = dynamicCall("jarvis_call_tool", {
+      name: "show",
+      args: { kind: "markdown", value: "hello" },
+    }, invocationContext);
+
+    await bridge.invoke(call);
+    await bridge.invoke(call);
+
+    expect(bodies).toEqual([
+      {
+        name: "show",
+        args: { kind: "markdown", value: "hello" },
+        invocationContext,
+      },
+      {
+        name: "show",
+        args: { kind: "markdown", value: "hello" },
+        invocationContext,
+      },
+    ]);
   });
 
   it("advertises native JSON tools without shell or capability-token instructions", () => {
