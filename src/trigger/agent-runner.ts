@@ -62,6 +62,7 @@ import {
   validatedGoalDeliveryBranch,
 } from "./github-delivery";
 import { wakeAgentFleet } from "../lib/agent-fleet-dispatch";
+import { dispatchMissionSupervisorWakeTicket } from "../lib/mission-supervisor-dispatch-runtime";
 import { BACKGROUND_CONCURRENCY_LIMIT, BACKGROUND_QUEUE } from "../lib/work-scheduler";
 import { admissionMutationName, v2AdmissionEnabled } from "../lib/mission-protocol-rollout";
 import { upstreamEvidencePrompt } from "../lib/upstream-evidence";
@@ -215,6 +216,47 @@ async function convexQuery(path: string, args: unknown) {
   } catch {
     return null;
   }
+}
+
+export interface AgentWorkerCompletionHandoffDependencies {
+  query(path: string, args: unknown): Promise<unknown>;
+  dispatchWakeTicket(value: unknown): Promise<{ dispatched: boolean }>;
+  wakeFleet(reason: string): Promise<boolean>;
+}
+
+/**
+ * Wake the exact supervised mission that owns a completed worker, then retain
+ * the generic fleet wake as a fail-soft fallback. The Convex query returns only
+ * public scheduler fences; worker and Trigger capabilities never enter the
+ * ticket or this result.
+ */
+export async function handoffCompletedAgentWorker(
+  jobId: string,
+  dependencies: AgentWorkerCompletionHandoffDependencies = {
+    query: convexQuery,
+    dispatchWakeTicket: dispatchMissionSupervisorWakeTicket,
+    wakeFleet: wakeAgentFleet,
+  },
+): Promise<{ supervisorContinued: boolean; continued: boolean }> {
+  let supervisorContinued = false;
+  try {
+    const ticket = await dependencies.query(
+      "missionSupervisorHandoff:completionWakeTicketV1",
+      { jobId },
+    );
+    if (ticket !== null) {
+      supervisorContinued = (
+        await dependencies.dispatchWakeTicket(ticket)
+      ).dispatched;
+    }
+  } catch {
+    // The minute supervisor sweep and generic fleet wake remain authoritative
+    // liveness fallbacks for query, network, or ambiguous Trigger failures.
+  }
+  const continued = await dependencies
+    .wakeFleet(`worker-complete:${jobId}`)
+    .catch(() => false);
+  return { supervisorContinued, continued };
 }
 
 // Weaves land wherever Daniel is actually chatting.
@@ -3016,8 +3058,8 @@ export const agentWorker = task({
       .set("stage", deferred ? "queued" : superseded ? "superseded" : "complete")
       .set("percent", result.processed ? 100 : 0);
     await metadata.flush();
-    const continued = await wakeAgentFleet(`worker-complete:${payload.jobId}`).catch(() => false);
-    return { ...result, continued, runtime: "trigger", runId: ctx.run.id };
+    const handoff = await handoffCompletedAgentWorker(payload.jobId);
+    return { ...result, ...handoff, runtime: "trigger", runId: ctx.run.id };
   },
 });
 

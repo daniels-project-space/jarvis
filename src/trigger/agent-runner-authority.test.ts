@@ -156,6 +156,9 @@ function bridgeProductionRunnerToConvex(
       case "jobs:finalize":
         value = await t.mutation(api.jobs.finalize, body.args as any);
         break;
+      case "missionSupervisorHandoff:completionWakeTicketV1":
+        value = null;
+        break;
       case "goalMode:externalPending":
         value = [];
         break;
@@ -525,6 +528,7 @@ describe("production Trigger worker authority harness", () => {
     expect(result).toMatchObject({ processed: 0, stale: true, continued: false, runtime: "trigger" });
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
       "jobs:claimDispatched",
+      "missionSupervisorHandoff:completionWakeTicketV1",
       "jobs:reserveDispatchBatch",
     ]);
     expect(boundaries.resolveSubscriptionAgentBin).not.toHaveBeenCalled();
@@ -565,6 +569,7 @@ describe("production Trigger worker authority harness", () => {
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
       "jobs:claimDispatched",
       "jobs:checkpointAndRequeue",
+      "missionSupervisorHandoff:completionWakeTicketV1",
       "jobs:reserveDispatchBatch",
     ]);
     const claim = bridge.trace[0];
@@ -633,6 +638,7 @@ describe("production Trigger worker authority harness", () => {
     });
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
       "jobs:claimDispatched",
+      "missionSupervisorHandoff:completionWakeTicketV1",
       "jobs:reserveDispatchBatch",
     ]);
     expect(boundaries.resolveSubscriptionAgentBin).not.toHaveBeenCalled();
@@ -656,6 +662,7 @@ describe("production Trigger worker authority harness", () => {
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
       "jobs:claimDispatched",
       "jobs:checkpointAndRequeue",
+      "missionSupervisorHandoff:completionWakeTicketV1",
       "jobs:reserveDispatchBatch",
     ]);
     expect(boundaries.resolveSubscriptionAgentBin).toHaveBeenCalledWith("codex");
