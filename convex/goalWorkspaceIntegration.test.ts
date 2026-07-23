@@ -17,6 +17,7 @@ import { goalWorkApprovalPolicy } from "./workPolicy";
 import { testProjectSourceAdmission } from "./testSourceAdmission";
 import { patchJobWithRuntime } from "./controlPlane";
 import { ensureGoalNodeHandoff, verifiedGoalHandoffsForJob } from "./goalHandoffs";
+import { triggerClaimAuthority } from "../src/lib/trigger-machine";
 
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
@@ -195,6 +196,7 @@ async function dispatch(t: GoalTest, count: number, prefix: string) {
     reservation,
     claim: await t.mutation(api.jobs.claimDispatched, {
       jobId: reservation.jobId as any, dispatchId: reservation.dispatchId,
+      ...triggerClaimAuthority(reservation),
       workerRunId: `${prefix}-run-${index}`, workerToken: TOKEN,
     }),
   })));

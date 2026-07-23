@@ -63,4 +63,41 @@ describe("cloud Codex runner attestation boundary", () => {
       rmSync(scratch, { recursive: true, force: true });
     }
   });
+
+  it("emits the durable request phases in the exact provider callback order once", async () => {
+    const provider = new FakeCloudWorkspaceProvider();
+    const workspace = await provider.createWorkspace({
+      attemptKey: "job:4", template: "node", runtime: "node-22",
+      lockfileDigest: "d".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS,
+    });
+    const scratch = "/tmp/work/controller-job-4";
+    rmSync(scratch, { recursive: true, force: true });
+    mkdirSync(scratch, { recursive: true });
+    const phases: string[] = [];
+    const runTurn = vi.spyOn(CodexAppServer.prototype, "runTurn").mockImplementation(async (turn) => {
+      await turn.beforeTurn();
+      turn.onTurnRequestWritten();
+      await turn.onTurnAccepted();
+      return { code: 0, stdout: "", stderr: "", finalText: "done", threadId: "thread-4" };
+    });
+    vi.spyOn(CodexAppServer.prototype, "stop").mockImplementation(() => undefined);
+
+    const result = await runCloudWorkspaceAgent({
+      bin: "unused", controllerScratch: scratch,
+      controllerEnv: { NODE_ENV: "test", CODEX_HOME: "/authority/codex-job-4", HOME: "/authority" },
+      provider, workspace, prompt: "work", model: "terra", timeoutMs: 2_000,
+      turnReceipt: {
+        beforeRequest: async () => { phases.push("request_intent"); },
+        requestWritten: () => { phases.push("request_written"); },
+        accepted: async () => { phases.push("accepted"); },
+        effect: async () => { phases.push("effect"); },
+        rejected: async () => { phases.push("rejected"); },
+        completed: async () => { phases.push("completed"); },
+      },
+    });
+
+    expect(result.text).toBe("done");
+    expect(runTurn).toHaveBeenCalledTimes(1);
+    expect(phases).toEqual(["request_intent", "request_written", "accepted", "completed"]);
+  });
 });

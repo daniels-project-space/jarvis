@@ -205,6 +205,11 @@ export default defineSchema({
     toolScope: v.optional(v.array(v.string())),
     agentRole: v.optional(v.string()),
     machineClass: v.optional(v.string()),
+    triggerMachinePreset: v.optional(v.string()),
+    triggerMachineReason: v.optional(v.string()),
+    triggerObservedMachinePreset: v.optional(v.string()),
+    triggerObservedMachineReason: v.optional(v.string()),
+    triggerPlatformAttempt: v.optional(v.number()),
     incidentId: v.optional(v.string()), // set on self-repair jobs → resolves the incident on success
     retried: v.optional(v.boolean()), // failed once already — no second retry
     missionId: v.optional(v.string()), // part of an orchestrated fleet
@@ -386,6 +391,11 @@ export default defineSchema({
     modelReason: v.optional(v.string()),
     agentRole: v.optional(v.string()),
     machineClass: v.optional(v.string()),
+    triggerMachinePreset: v.optional(v.string()),
+    triggerMachineReason: v.optional(v.string()),
+    triggerObservedMachinePreset: v.optional(v.string()),
+    triggerObservedMachineReason: v.optional(v.string()),
+    triggerPlatformAttempt: v.optional(v.number()),
     risk: v.optional(v.string()),
     priority: v.number(),
     approvalRequired: v.optional(v.boolean()),
@@ -571,6 +581,10 @@ export default defineSchema({
     minimumModel: v.string(),
     minimumReasoningEffort: v.string(),
     machineClass: v.string(),
+    // Optional only for Convex-first rollout compatibility. Protocol-v2
+    // readers reject historical rows that do not carry both exact bindings.
+    triggerMachinePreset: v.optional(v.string()),
+    triggerMachineReason: v.optional(v.string()),
     revisionDigest: v.string(),
     createdAt: v.number(),
   })
@@ -892,6 +906,11 @@ export default defineSchema({
     sessionId: v.optional(v.string()),
     workerRunId: v.optional(v.string()),
     dispatchId: v.optional(v.string()),
+    triggerMachinePreset: v.optional(v.string()),
+    triggerMachineReason: v.optional(v.string()),
+    triggerObservedMachinePreset: v.optional(v.string()),
+    triggerObservedMachineReason: v.optional(v.string()),
+    triggerPlatformAttempt: v.optional(v.number()),
     parentAttempt: v.optional(v.number()),
     sourceHeadSha: v.optional(v.string()),
     workspaceBaseSha: v.optional(v.string()),

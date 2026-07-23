@@ -11,6 +11,7 @@ import {
   MAX_ACTIVE_PER_WORK_GROUP,
   workGroupAuthority,
 } from "../src/lib/work-scheduler";
+import { triggerClaimAuthority } from "../src/lib/trigger-machine";
 
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
@@ -71,6 +72,84 @@ async function finishReservations(t: SchedulerTest, reservations: Array<{ jobId:
 }
 
 describe("project-group fair reservation authority", () => {
+  it("binds admitted dynamic machines, holds old workers, and records only Trigger OOM escalation", async () => {
+    const t = convexTest(schema, modules);
+    const readId = await enqueue(t, { missionId: "mission-bounded-read" });
+    const writeId = await enqueue(t, {
+      missionId: "mission-hard-build",
+      readonly: false,
+      repo: REPO,
+    });
+    const batch = await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 2,
+      reason: "machine-authority",
+      workerToken: WORKER,
+    });
+    const read = batch.reservations.find((reservation) => reservation.jobId === String(readId))!;
+    const write = batch.reservations.find((reservation) => reservation.jobId === String(writeId))!;
+    expect(read).toMatchObject({
+      triggerMachinePreset: "medium-1x",
+      triggerMachineReason: "admitted_bounded_read",
+      authorityDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      workOrderRevisionDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(write).toMatchObject({
+      triggerMachinePreset: "medium-2x",
+      triggerMachineReason: "admitted_write_or_hard",
+    });
+    expect(await t.mutation(api.jobs.markDispatchLaunchUnknown, {
+      jobId: writeId,
+      dispatchId: write.dispatchId,
+      reason: "Trigger response lost after request write",
+      workerToken: WORKER,
+    })).toBe(true);
+    expect(await t.run(async (ctx) => ctx.db.get(writeId))).toMatchObject({
+      status: "dispatching",
+      dispatchId: write.dispatchId,
+      providerRunState: "reconciling",
+    });
+
+    expect(await t.mutation(api.jobs.claimDispatched, {
+      jobId: readId,
+      dispatchId: read.dispatchId,
+      workerRunId: "old-worker-without-envelope",
+      workerToken: WORKER,
+    })).toMatchObject({ executable: false, held: true, code: "trigger_launch_authority_held" });
+    expect(await t.mutation(api.jobs.claimDispatched, {
+      jobId: readId,
+      dispatchId: read.dispatchId,
+      ...triggerClaimAuthority(read, "medium-2x", 1),
+      workerRunId: "unproven-escalation",
+      workerToken: WORKER,
+    })).toMatchObject({ executable: false, held: true, code: "trigger_launch_authority_held" });
+
+    expect(await t.mutation(api.jobs.claimDispatched, {
+      jobId: readId,
+      dispatchId: read.dispatchId,
+      ...triggerClaimAuthority(read, "medium-2x", 2),
+      workerRunId: "oom-retry-run",
+      workerToken: WORKER,
+    })).toMatchObject({
+      triggerObservedMachinePreset: "medium-2x",
+      triggerObservedMachineReason: "trigger_oom_retry_escalation",
+      triggerPlatformAttempt: 2,
+    });
+    const rows = await t.run(async (ctx) => ({
+      job: await ctx.db.get(readId),
+      runtime: await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", readId)).first(),
+      attempt: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", readId).eq("attempt", 1)).first(),
+    }));
+    for (const row of [rows.job, rows.runtime, rows.attempt]) {
+      expect(row).toMatchObject({
+        triggerMachinePreset: "medium-1x",
+        triggerObservedMachinePreset: "medium-2x",
+        triggerObservedMachineReason: "trigger_oom_retry_escalation",
+        triggerPlatformAttempt: 2,
+      });
+    }
+  });
+
   it("keeps a middle project group visible through more than three legacy sampling windows", async () => {
     const t = convexTest(schema, modules);
     const backlog = DISPATCH_CANDIDATE_WINDOW_MAX * 3 + 1;

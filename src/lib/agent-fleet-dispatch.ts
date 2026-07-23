@@ -1,6 +1,12 @@
-import { tasks } from "@trigger.dev/sdk/v3";
+import { idempotencyKeys, tasks } from "@trigger.dev/sdk/v3";
 import type { agentWorker } from "../trigger/agent-runner";
 import { resolveConvexUrl } from "./convex-url";
+import {
+  TRIGGER_AGENT_IDEMPOTENCY_TTL,
+  triggerAgentIdempotencyMaterial,
+  type TriggerAgentMachinePreset,
+  type TriggerAgentMachineReason,
+} from "./trigger-machine";
 import { BACKGROUND_CONCURRENCY_LIMIT } from "./work-scheduler";
 
 const CONVEX_URL = resolveConvexUrl(process.env.CONVEX_URL, process.env.NEXT_PUBLIC_CONVEX_URL);
@@ -17,6 +23,10 @@ type Reservation = {
   schedulingGroupKey?: string;
   agentId: string | null;
   label: string;
+  authorityDigest: string;
+  workOrderRevisionDigest: string;
+  triggerMachinePreset: TriggerAgentMachinePreset;
+  triggerMachineReason: TriggerAgentMachineReason;
 };
 
 function safeTag(prefix: string, value: string): string {
@@ -55,15 +65,32 @@ export async function wakeAgentFleet(reason: string, fanOut = DEFAULT_FAN_OUT): 
   if (!reservations.length) return false;
 
   try {
+    const launches = await Promise.all(reservations.map(async (reservation) => ({
+      reservation,
+      idempotencyKey: await idempotencyKeys.create(triggerAgentIdempotencyMaterial({
+        jobId: reservation.jobId,
+        attempt: reservation.attempt,
+        authorityDigest: reservation.authorityDigest,
+        workOrderRevisionDigest: reservation.workOrderRevisionDigest,
+      }), { scope: "global" }),
+    })));
     await tasks.batchTrigger<typeof agentWorker>(
       "jarvis-agent-worker",
-      reservations.map((reservation) => ({
+      launches.map(({ reservation, idempotencyKey }) => ({
         payload: {
           jobId: reservation.jobId,
           dispatchId: reservation.dispatchId,
+          expectedAttempt: reservation.attempt,
+          authorityDigest: reservation.authorityDigest,
+          workOrderRevisionDigest: reservation.workOrderRevisionDigest,
+          triggerMachinePreset: reservation.triggerMachinePreset,
+          triggerMachineReason: reservation.triggerMachineReason,
           reason: cleanReason,
         },
         options: {
+          idempotencyKey,
+          idempotencyKeyTTL: TRIGGER_AGENT_IDEMPOTENCY_TTL,
+          machine: reservation.triggerMachinePreset,
           tags: [
             "jarvis-agent",
             safeTag("job", reservation.jobId),
@@ -79,6 +106,10 @@ export async function wakeAgentFleet(reason: string, fanOut = DEFAULT_FAN_OUT): 
             agentId: reservation.agentId,
             label: reservation.label.slice(0, 120),
             reason: cleanReason,
+            authorityDigest: reservation.authorityDigest,
+            workOrderRevisionDigest: reservation.workOrderRevisionDigest,
+            machinePreset: reservation.triggerMachinePreset,
+            machineReason: reservation.triggerMachineReason,
             stage: "dispatching",
             percent: 1,
           },
@@ -88,16 +119,15 @@ export async function wakeAgentFleet(reason: string, fanOut = DEFAULT_FAN_OUT): 
     );
     return true;
   } catch (error) {
-    // A transport error can be ambiguous after a batch is accepted. Do not
-    // immediately make the jobs claimable twice; shorten their reservations
-    // and let the minute supervisor recover any run that truly never arrived.
+    // A transport error can be ambiguous after a batch is accepted. Keep the
+    // reservation reconciling until the lease reaper observes it; a retry uses
+    // the same global immutable-attempt key and cannot create a second run.
     await Promise.all(
       reservations.map((reservation) =>
-        workerMutation("jobs:rejectDispatch", {
+        workerMutation("jobs:markDispatchLaunchUnknown", {
           jobId: reservation.jobId,
           dispatchId: reservation.dispatchId,
           reason: `Trigger launch failed: ${String(error).slice(0, 220)}`,
-          delayMs: 30_000,
         }).catch(() => false),
       ),
     );

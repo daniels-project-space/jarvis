@@ -38,6 +38,7 @@ import {
   WORK_ORDER_REVISION_PROTOCOL_VERSION,
   type WorkOrderRevisionBinding,
 } from "../src/lib/work-order-revision";
+import { admittedTriggerMachine } from "../src/lib/trigger-machine";
 
 function defined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
@@ -66,6 +67,11 @@ export function projectJobRuntime(job: any) {
     modelReason: typeof job.modelReason === "string" ? job.modelReason.slice(0, 300) : undefined,
     agentRole: typeof job.agentRole === "string" ? job.agentRole.slice(0, 120) : undefined,
     machineClass: typeof job.machineClass === "string" ? job.machineClass.slice(0, 160) : undefined,
+    triggerMachinePreset: typeof job.triggerMachinePreset === "string" ? job.triggerMachinePreset.slice(0, 24) : undefined,
+    triggerMachineReason: typeof job.triggerMachineReason === "string" ? job.triggerMachineReason.slice(0, 80) : undefined,
+    triggerObservedMachinePreset: typeof job.triggerObservedMachinePreset === "string" ? job.triggerObservedMachinePreset.slice(0, 24) : undefined,
+    triggerObservedMachineReason: typeof job.triggerObservedMachineReason === "string" ? job.triggerObservedMachineReason.slice(0, 80) : undefined,
+    triggerPlatformAttempt: typeof job.triggerPlatformAttempt === "number" ? job.triggerPlatformAttempt : undefined,
     risk: typeof job.risk === "string" ? job.risk.slice(0, 24) : undefined,
     priority: Math.max(0, Math.min(100, Number(job.priority ?? 50))),
     approvalRequired: typeof job.approvalRequired === "boolean" ? job.approvalRequired : undefined,
@@ -328,6 +334,7 @@ const ACTIVE_WORK_ORDER_FIELDS = [
   "task", "policyTask", "steer", "acceptanceCriteria", "repo", "readonly",
   "model", "reasoningEffort", "mcp", "toolScope", "deliveryMode", "risk",
   "approvalRequired", "approvalReason", "agentId", "agentRole", "machineClass",
+  "triggerMachinePreset", "triggerMachineReason",
   "workOrderProtocolVersion", "workOrderRevision", "workOrderRevisionId", "workOrderRevisionDigest",
 ] as const;
 
@@ -578,19 +585,23 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
   if (!agent) throw new Error("Job requires one canonical permanent-agent role");
   const model = normalizeWorkModelTier(persistedValue.model, agent.defaultModel);
   const readonly = Boolean(persistedValue.readonly || !persistedValue.repo);
+  const reasoningEffort = normalizeMinimumReasoningEffort(persistedValue.reasoningEffort, model);
+  const triggerMachine = admittedTriggerMachine({ readonly, minimumModel: model, minimumReasoningEffort: reasoningEffort });
   const normalized = {
     ...persistedValue,
     task,
     policyTask,
     readonly,
     model,
-    reasoningEffort: normalizeMinimumReasoningEffort(persistedValue.reasoningEffort, model),
+    reasoningEffort,
     mcp: normalizeWorkOrderMcpScope(persistedValue.mcp),
     toolScope: workOrderToolScope(readonly),
     acceptanceCriteria: normalizeWorkOrderAcceptanceCriteria(persistedValue.acceptanceCriteria),
     agentId: agent.agentId,
     agentRole: agent.agentRole,
     machineClass: WORK_ORDER_MACHINE_CLASS,
+    triggerMachinePreset: triggerMachine.preset,
+    triggerMachineReason: triggerMachine.reason,
     risk: String(persistedValue.risk ?? "low"),
     approvalRequired: persistedValue.approvalRequired === true,
     deliveryMode: String(persistedValue.deliveryMode ?? (readonly ? "read_only" : "manual")),
@@ -747,6 +758,8 @@ function activeWorkOrderPatch(
     agentId: binding.agentId,
     agentRole: binding.agentRole,
     machineClass: binding.machineClass,
+    triggerMachinePreset: binding.triggerMachinePreset,
+    triggerMachineReason: binding.triggerMachineReason,
     workOrderProtocolVersion: WORK_ORDER_REVISION_PROTOCOL_VERSION,
     workOrderRevision: binding.revision,
     workOrderRevisionId: revisionId,
@@ -770,6 +783,12 @@ export async function stageJobWorkOrderRevision(
   const agent = workOrderAgent(changes.agentId ?? job.agentId);
   if (!agent) throw new Error("Work-order revision requires one canonical permanent-agent role");
   const model = normalizeWorkModelTier(changes.model ?? job.model, agent.defaultModel);
+  const reasoningEffort = normalizeMinimumReasoningEffort(changes.reasoningEffort ?? job.reasoningEffort, model);
+  const triggerMachine = admittedTriggerMachine({
+    readonly: Boolean(job.readonly || !job.repo),
+    minimumModel: model,
+    minimumReasoningEffort: reasoningEffort,
+  });
   const prospective = {
     ...job,
     ...changes,
@@ -780,12 +799,14 @@ export async function stageJobWorkOrderRevision(
       : changes.steer === undefined ? job.steer : undefined,
     acceptanceCriteria: normalizeWorkOrderAcceptanceCriteria(changes.acceptanceCriteria ?? job.acceptanceCriteria),
     model,
-    reasoningEffort: normalizeMinimumReasoningEffort(changes.reasoningEffort ?? job.reasoningEffort, model),
+    reasoningEffort,
     mcp: normalizeWorkOrderMcpScope(changes.mcp ?? job.mcp),
     toolScope: workOrderToolScope(Boolean(job.readonly || !job.repo)),
     agentId: agent.agentId,
     agentRole: agent.agentRole,
     machineClass: WORK_ORDER_MACHINE_CLASS,
+    triggerMachinePreset: triggerMachine.preset,
+    triggerMachineReason: triggerMachine.reason,
   };
   const binding = workOrderRevisionForJob(prospective, {
     revision: current.binding.revision + 1,

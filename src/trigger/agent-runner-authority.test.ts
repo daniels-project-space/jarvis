@@ -26,6 +26,7 @@ const trigger = vi.hoisted(() => {
     definitions,
     metadata,
     batchTrigger: vi.fn(async () => ({ batchId: "unexpected-batch" })),
+    createIdempotencyKey: vi.fn(async () => "global-test-key"),
   };
 });
 const boundaries = vi.hoisted(() => ({
@@ -48,6 +49,7 @@ vi.mock("@trigger.dev/sdk/v3", () => ({
     },
   },
   tasks: { batchTrigger: trigger.batchTrigger },
+  idempotencyKeys: { create: trigger.createIdempotencyKey },
   timeout: { None: "none" },
 }));
 
@@ -68,6 +70,7 @@ import {
   type AgentRunnerBoundaryObservation,
   type AgentRunnerDependencies,
   type AgentRunnerEffectBoundary,
+  type AgentWorkerPayload,
 } from "./agent-runner";
 
 const modules = import.meta.glob("../../convex/**/*.ts");
@@ -193,17 +196,36 @@ async function invokeProductionWorker(payload: Record<string, unknown>, runId: s
     run: (payload: Record<string, unknown>, context: any) => Promise<Record<string, unknown>>;
   };
   return await definition.run(payload, {
-    ctx: { run: { id: runId }, deployment: { version: "trigger-test-deployment" } },
+    ctx: {
+      run: { id: runId },
+      attempt: { number: 1 },
+      machine: { name: payload.triggerMachinePreset ?? "medium-2x" },
+      deployment: { version: "trigger-test-deployment" },
+    },
   });
 }
 
+function workerPayload(reservation: any): AgentWorkerPayload {
+  return {
+    jobId: String(reservation.jobId),
+    dispatchId: String(reservation.dispatchId),
+    expectedAttempt: Number(reservation.attempt),
+    authorityDigest: String(reservation.authorityDigest),
+    workOrderRevisionDigest: String(reservation.workOrderRevisionDigest),
+    triggerMachinePreset: reservation.triggerMachinePreset,
+    triggerMachineReason: reservation.triggerMachineReason,
+    triggerObservedMachinePreset: reservation.triggerMachinePreset,
+    triggerPlatformAttempt: 1,
+  };
+}
+
 async function invokeHarness(
-  reservation: { jobId: string; dispatchId: string },
+  reservation: any,
   runId: string,
   dependencies: AgentRunnerDependencies,
 ) {
   return await runAgentHarness({
-    reservation: { ...reservation, workerRunId: runId },
+    reservation: { ...workerPayload(reservation), workerRunId: runId },
     runtimeAttestation: { triggerDeploymentVersion: "runner-authority-test" },
     dependencies,
   });
@@ -225,6 +247,7 @@ function injectedRunnerDependencies(options: {
   runProcess?: ReturnType<typeof vi.fn>;
   runGit?: ReturnType<typeof vi.fn>;
   providerFetch?: typeof fetch;
+  cleanupSubscriptionHome?: (env: Readonly<Record<string, string | undefined>>) => boolean;
 } = {}): AgentRunnerDependencies {
   const codexHome = "/tmp/work/jarvis-runner-authority-codex-home";
   mkdirSync(codexHome, { recursive: true });
@@ -265,6 +288,10 @@ function injectedRunnerDependencies(options: {
   const runProcess = options.runProcess ?? vi.fn(async (input: any) => {
     expect(input.controllerEnv.GITHUB_TOKEN).toBeUndefined();
     expect(input.controllerEnv.JARVIS_WORKER_TOKEN).toBeUndefined();
+    await input.turnReceipt.beforeRequest();
+    input.turnReceipt.requestWritten();
+    await input.turnReceipt.accepted();
+    await input.turnReceipt.completed();
     return {
       text: "Production runner completed the bounded fake repository work.",
       timedOut: false,
@@ -287,6 +314,7 @@ function injectedRunnerDependencies(options: {
         CODEX_API_KEY: "must-not-reach-child",
       } as unknown as NodeJS.ProcessEnv,
     })),
+    cleanupSubscriptionHome: options.cleanupSubscriptionHome ?? vi.fn(() => true),
     verifyCodexSubscriptionPreflight: vi.fn(() => ({})),
     missingSubscriptionTools: vi.fn(() => []),
     configuredCloudWorkspaceProvider: vi.fn(() => provider as any),
@@ -483,8 +511,7 @@ describe("production Trigger worker authority harness", () => {
     const bridge = bridgeProductionRunnerToConvex(t);
 
     const result = await invokeProductionWorker({
-      jobId: String(jobId),
-      dispatchId: reservation.dispatchId,
+      ...workerPayload(reservation),
       reason: "same human label",
       repo: "daniels-project-space/dropship-ai",
       branch: "latest",
@@ -515,8 +542,7 @@ describe("production Trigger worker authority harness", () => {
     const bridge = bridgeProductionRunnerToConvex(t);
 
     const result = await invokeProductionWorker({
-      jobId: String(jobId),
-      dispatchId: reservation.dispatchId,
+      ...workerPayload(reservation),
       reason: "identical mutable runner label",
       repo: "daniels-project-space/dropship-ai",
       branch: "latest-selected-branch",
@@ -533,15 +559,21 @@ describe("production Trigger worker authority harness", () => {
     });
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
       "jobs:claimDispatched",
-      "jobs:authorizeExecutionBoundary",
       "jobs:checkpointAndRequeue",
       "jobs:reserveDispatchBatch",
     ]);
     const claim = bridge.trace[0];
-    expect(claim.args).toEqual({
+    expect(claim.args).toMatchObject({
       jobId: String(jobId),
       dispatchId: reservation.dispatchId,
       workerRunId: "trigger-authoritative-run",
+      expectedAttempt: 1,
+      authorityDigest: reservation.authorityDigest,
+      workOrderRevisionDigest: reservation.workOrderRevisionDigest,
+      triggerMachinePreset: "medium-2x",
+      triggerMachineReason: "admitted_write_or_hard",
+      triggerObservedMachinePreset: "medium-2x",
+      triggerPlatformAttempt: 1,
       workerToken: WORKER,
     });
     expect(boundaries.resolveSubscriptionAgentBin).toHaveBeenCalledWith("codex");
@@ -602,31 +634,26 @@ describe("production Trigger worker authority harness", () => {
     expect(boundaries.configuredCloudWorkspaceProvider).not.toHaveBeenCalled();
   });
 
-  it("fences a source-head change between claim and Codex authorization through the production task", async () => {
+  it("does not report subscription acquisition when the production worker has no Codex binary", async () => {
     const t = convexTest(schema, modules);
     const { jobId, reservation } = await reservedWritableJob(t, "runner-source-head-race");
-    let mutated = false;
-    const bridge = bridgeProductionRunnerToConvex(t, async (call) => {
-      if (call.path !== "jobs:authorizeExecutionBoundary" || mutated) return;
-      mutated = true;
-      await t.run(async (ctx) => ctx.db.patch(jobId, { sourceHeadSha: "f".repeat(40) }));
-    });
+    const bridge = bridgeProductionRunnerToConvex(t);
 
     const result = await invokeProductionWorker({
-      jobId: String(jobId), dispatchId: reservation.dispatchId,
+      ...workerPayload(reservation),
     }, "trigger-source-head-race");
 
     expect(result).toMatchObject({
-      processed: 1, stale: true,
-      error: "immutable attempt authority rejected before Codex preflight",
+      processed: 1,
+      error: "no codex binary",
       runtime: "trigger",
     });
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
       "jobs:claimDispatched",
-      "jobs:authorizeExecutionBoundary",
+      "jobs:checkpointAndRequeue",
       "jobs:reserveDispatchBatch",
     ]);
-    expect(boundaries.resolveSubscriptionAgentBin).not.toHaveBeenCalled();
+    expect(boundaries.resolveSubscriptionAgentBin).toHaveBeenCalledWith("codex");
     expect(boundaries.configuredCloudWorkspaceProvider).not.toHaveBeenCalled();
     expect(trigger.batchTrigger).not.toHaveBeenCalled();
     const state = await t.run(async (ctx) => ({
@@ -634,8 +661,8 @@ describe("production Trigger worker authority harness", () => {
       attempt: await ctx.db.query("workAttempts")
         .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1)).first(),
     }));
-    expect(state.job).toMatchObject({ status: "running", workerRunId: "trigger-source-head-race" });
-    expect(state.attempt).toMatchObject({ status: "running", workerRunId: "trigger-source-head-race" });
+    expect(state.job).toMatchObject({ status: "pending", attempt: 2 });
+    expect(state.attempt).toMatchObject({ status: "checkpointed", workerRunId: "trigger-source-head-race" });
   });
 
   it("runs the real specialist and delivery lifecycle with exact server authority and reconciles a lost observation response", async () => {
@@ -644,12 +671,16 @@ describe("production Trigger worker authority harness", () => {
     const { jobId, reservation } = await reservedWritableJob(t, "runner-full-authority-lifecycle");
     const trace: BoundaryTrace[] = [];
     const specialistBridge = bridgeProductionRunnerToConvex(t);
-    const specialistDependencies = injectedRunnerDependencies({ boundaries: trace });
+    const cleanup = vi.fn((consumerEnv: Readonly<Record<string, string | undefined>>) => {
+      void consumerEnv;
+      return true;
+    });
+    const specialistDependencies = injectedRunnerDependencies({
+      boundaries: trace,
+      cleanupSubscriptionHome: cleanup,
+    });
 
-    const specialist = await invokeHarness({
-      jobId: String(jobId),
-      dispatchId: reservation.dispatchId,
-    }, "specialist-authority-run", specialistDependencies);
+    const specialist = await invokeHarness(reservation, "specialist-authority-run", specialistDependencies);
 
     expect(specialist).toEqual({ processed: 1 });
     const sealed = await t.run(async (ctx) => ({
@@ -670,15 +701,29 @@ describe("production Trigger worker authority harness", () => {
       checkpointDigest: CHECKPOINT_SHA,
       providerWorkspaceId: "fake-cloud-workspace",
       providerSessionId: "fake-cloud-session",
+      codexTurnReceiptPhase: "completed",
     });
+    const turnPhases = specialistBridge.trace
+      .filter((call) => call.path === "jobs:recordCloudCodexTurnPhase");
+    expect(turnPhases.map((call) => call.args.phase)).toEqual([
+      "request_intent", "request_written", "accepted", "completed",
+    ]);
+    expect(turnPhases.every((call) =>
+      call.args.authorityDigest === sealed.attempt?.authorityDigest
+      && call.args.workOrderRevisionDigest === sealed.attempt?.workOrderRevisionDigest
+    )).toBe(true);
+    expect(cleanup).toHaveBeenCalled();
+    expect(new Set(cleanup.mock.calls.map(([consumerEnv]) => consumerEnv)).size).toBe(cleanup.mock.calls.length);
     expect(trace.map((item) => item.effect)).toEqual([
-      "subscription_acquire",
       "source_checkout",
       "provider_create",
+      "subscription_acquire",
       "codex_process",
       "checkpoint_persist",
       "review_receipt",
       "subscription_acquire",
+      "subscription_acquire",
+      "codex_process",
     ]);
     for (const { authority } of trace) {
       expect(authority).toMatchObject({
@@ -712,15 +757,13 @@ describe("production Trigger worker authority harness", () => {
       providerFetch,
     });
 
-    expect(await invokeHarness({
-      jobId: String(jobId),
-      dispatchId: firstControllerReservation.dispatchId,
-    }, "delivery-controller-run-1", firstControllerDependencies)).toEqual({ processed: 1 });
+    expect(await invokeHarness(
+      firstControllerReservation,
+      "delivery-controller-run-1",
+      firstControllerDependencies,
+    )).toEqual({ processed: 1 });
     expect(providerEffects).toEqual(["create_pr"]);
-    expect(firstControllerTrace.map((item) => item.effect)).toEqual([
-      "subscription_acquire",
-      "delivery_effect",
-    ]);
+    expect(firstControllerTrace.map((item) => item.effect)).toEqual(["delivery_effect"]);
     expect((firstControllerDependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
     expect(firstControllerBridge.trace.filter((call) => call.path === "jobs:prepareDeliveryEffect")).toHaveLength(1);
     expect(firstControllerBridge.trace.filter((call) => call.path === "jobs:observeDeliveryEffect")).toHaveLength(1);
@@ -733,16 +776,14 @@ describe("production Trigger worker authority harness", () => {
     const replayBridge = bridgeProductionRunnerToConvex(t);
     const replayDependencies = injectedRunnerDependencies({ boundaries: replayTrace, providerFetch });
 
-    expect(await invokeHarness({
-      jobId: String(jobId),
-      dispatchId: replayReservation.dispatchId,
-    }, "delivery-controller-run-2", replayDependencies)).toEqual({ processed: 1 });
+    expect(await invokeHarness(
+      replayReservation,
+      "delivery-controller-run-2",
+      replayDependencies,
+    )).toEqual({ processed: 1 });
     expect(providerEffects).toEqual(["create_pr", "merge_pr"]);
     expect((replayDependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
-    expect(replayTrace.map((item) => item.effect)).toEqual([
-      "subscription_acquire",
-      "delivery_effect",
-    ]);
+    expect(replayTrace.map((item) => item.effect)).toEqual(["delivery_effect"]);
     const finished = await t.run(async (ctx) => ({
       job: await ctx.db.get(jobId),
       attempt: await ctx.db.query("workAttempts")
@@ -792,13 +833,13 @@ describe("production Trigger worker authority harness", () => {
   it("does not start any injected transport when the immutable claim is stale", async () => {
     configureFakeControllerAuthority();
     const t = convexTest(schema, modules);
-    const { jobId, reservation } = await reservedWritableJob(t, "runner-no-effect-before-claim");
+    const { reservation } = await reservedWritableJob(t, "runner-no-effect-before-claim");
     const bridge = bridgeProductionRunnerToConvex(t);
     const boundariesSeen: BoundaryTrace[] = [];
     const dependencies = injectedRunnerDependencies({ boundaries: boundariesSeen });
 
     const result = await invokeHarness({
-      jobId: String(jobId),
+      ...reservation,
       dispatchId: `${reservation.dispatchId}-stale`,
     }, "stale-claim-run", dependencies);
 
@@ -841,11 +882,8 @@ describe("production Trigger worker authority harness", () => {
     const trace: BoundaryTrace[] = [];
     const dependencies = injectedRunnerDependencies({ boundaries: trace });
 
-    expect(await invokeHarness({
-      jobId: String(jobId),
-      dispatchId: reservation.dispatchId,
-    }, "steered-between-boundaries", dependencies)).toEqual({ processed: 1 });
-    expect(trace.map((item) => item.effect)).toEqual(["subscription_acquire"]);
+    expect(await invokeHarness(reservation, "steered-between-boundaries", dependencies)).toEqual({ processed: 1 });
+    expect(trace.map((item) => item.effect)).toEqual([]);
     expect((dependencies.resolveSubscriptionAgentBin as any)).toHaveBeenCalledTimes(1);
     expect((dependencies.runCommand as any)).not.toHaveBeenCalled();
     expect((dependencies.configuredCloudWorkspaceProvider as any)).toHaveBeenCalledTimes(1);
@@ -855,11 +893,28 @@ describe("production Trigger worker authority harness", () => {
     expect(state?.workOrderRevision).toBeGreaterThan(1);
   });
 
+  it("does not observe acquisition or call Codex when subscription preflight fails", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { reservation } = await reservedWritableJob(t, "runner-preflight-failure");
+    bridgeProductionRunnerToConvex(t);
+    const trace: BoundaryTrace[] = [];
+    const dependencies = injectedRunnerDependencies({ boundaries: trace });
+    (dependencies.verifyCodexSubscriptionPreflight as any).mockReturnValue({
+      error: "subscription snapshot was rejected",
+    });
+
+    expect(await invokeHarness(reservation, "preflight-failure-run", dependencies)).toEqual({ processed: 1 });
+    expect(trace.map((item) => item.effect)).toEqual(["source_checkout", "provider_create"]);
+    expect((dependencies.prepareSubscriptionEnv as any)).toHaveBeenCalledTimes(1);
+    expect((dependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
+  });
+
   it.each([
     {
       phase: "provider_create",
       occurrence: 1,
-      effects: ["subscription_acquire", "source_checkout"],
+      effects: ["source_checkout"],
       prepareWorkspace: 0,
       process: 0,
       checkpoint: 0,
@@ -868,7 +923,7 @@ describe("production Trigger worker authority harness", () => {
     {
       phase: "codex_start",
       occurrence: 2,
-      effects: ["subscription_acquire", "source_checkout", "provider_create"],
+      effects: ["source_checkout", "provider_create", "subscription_acquire"],
       prepareWorkspace: 1,
       process: 0,
       checkpoint: 0,
@@ -877,7 +932,7 @@ describe("production Trigger worker authority harness", () => {
     {
       phase: "checkpoint",
       occurrence: 1,
-      effects: ["subscription_acquire", "source_checkout", "provider_create", "codex_process"],
+      effects: ["source_checkout", "provider_create", "subscription_acquire", "codex_process"],
       prepareWorkspace: 1,
       process: 1,
       checkpoint: 0,
@@ -886,7 +941,7 @@ describe("production Trigger worker authority harness", () => {
     {
       phase: "review_receipt",
       occurrence: 1,
-      effects: ["subscription_acquire", "source_checkout", "provider_create", "codex_process", "checkpoint_persist"],
+      effects: ["source_checkout", "provider_create", "subscription_acquire", "codex_process", "checkpoint_persist"],
       prepareWorkspace: 1,
       process: 1,
       checkpoint: 1,
@@ -913,10 +968,7 @@ describe("production Trigger worker authority harness", () => {
     const trace: BoundaryTrace[] = [];
     const dependencies = injectedRunnerDependencies({ boundaries: trace });
 
-    expect(await invokeHarness({
-      jobId: String(jobId),
-      dispatchId: reservation.dispatchId,
-    }, `stale-${fixture.phase}-run`, dependencies)).toEqual({ processed: 1 });
+    expect(await invokeHarness(reservation, `stale-${fixture.phase}-run`, dependencies)).toEqual({ processed: 1 });
     expect(trace.map((item) => item.effect)).toEqual(fixture.effects);
     expect((dependencies.prepareCloudWorkspaceExecution as any)).toHaveBeenCalledTimes(fixture.prepareWorkspace);
     expect((dependencies.runCloudWorkspaceAgent as any)).toHaveBeenCalledTimes(fixture.process);

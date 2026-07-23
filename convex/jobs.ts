@@ -20,6 +20,11 @@ import { ensureGoalNodeHandoff, verifiedGoalHandoffsForJob } from "./goalHandoff
 import { claimDisposition, completionReceiptAllowed, isSha256Digest, replayEnvelope, shouldAdvanceAttempt } from "../src/lib/durable-attempt-protocol";
 import { canonicalWorkspaceCheckpoint, parseCanonicalWorkspaceCheckpoint } from "../src/lib/workspace-checkpoint";
 import {
+  observedTriggerMachineReason,
+  type TriggerAgentMachinePreset,
+  type TriggerAgentMachineReason,
+} from "../src/lib/trigger-machine";
+import {
   ensureWorkAttempt,
   activateStagedJobWorkOrderRevision,
   insertJobWithRuntime,
@@ -986,6 +991,11 @@ async function claimedJob(ctx: any, j: any, upstreamEvidence: readonly any[] = [
     toolScope: [...order.toolScope],
     agentRole: order.agentRole,
     machineClass: order.machineClass,
+    triggerMachinePreset: order.triggerMachinePreset,
+    triggerMachineReason: order.triggerMachineReason,
+    triggerObservedMachinePreset: j.triggerObservedMachinePreset ?? null,
+    triggerObservedMachineReason: j.triggerObservedMachineReason ?? null,
+    triggerPlatformAttempt: j.triggerPlatformAttempt ?? null,
     workOrderRevisionId: attemptAuthority.workOrderRevisionId,
     workOrderRevision: attemptAuthority.workOrderRevision,
     workOrderRevisionDigest: attemptAuthority.workOrderRevisionDigest,
@@ -1102,6 +1112,10 @@ export const reserveDispatchBatch = mutation({
       const j = candidate.job;
       let attemptNumber = j.attempt ?? 1;
       let attempt = candidate.executionAuthority.attempt;
+      const triggerMachine = {
+        preset: candidate.executionAuthority.workOrder.triggerMachinePreset as TriggerAgentMachinePreset,
+        reason: candidate.executionAuthority.workOrder.triggerMachineReason as TriggerAgentMachineReason,
+      };
       // A malformed/legacy pending row may still point at a launched worker.
       // Never overwrite that binding into an unclaimable reservation: close
       // it first, record its terminal lineage, then reserve a fresh attempt.
@@ -1139,12 +1153,26 @@ export const reserveDispatchBatch = mutation({
         // must never allocate a second number for the same controller pass.
         deliveryGeneration: deliveryContinuation ? Math.max(1, Number(j.deliveryGeneration ?? 1)) : j.deliveryGeneration,
         workerRuntime: "trigger",
+        triggerMachinePreset: triggerMachine.preset,
+        triggerMachineReason: triggerMachine.reason,
+        triggerObservedMachinePreset: undefined,
+        triggerObservedMachineReason: undefined,
+        triggerPlatformAttempt: undefined,
         providerRunState: "queued",
         providerObservedAt: now,
         heartbeatAt: now,
       });
-      if (attempt && !attempt.workerRunId) await ctx.db.patch(attempt._id, { status: "dispatching", dispatchId, lastEventAt: now });
-      else if (!attempt) await ensureAttempt(ctx, j._id, attemptNumber, "dispatching", now, { dispatchId });
+      if (attempt && !attempt.workerRunId) await ctx.db.patch(attempt._id, {
+        status: "dispatching", dispatchId,
+        triggerMachinePreset: triggerMachine.preset,
+        triggerMachineReason: triggerMachine.reason,
+        lastEventAt: now,
+      });
+      else if (!attempt) await ensureAttempt(ctx, j._id, attemptNumber, "dispatching", now, {
+        dispatchId,
+        triggerMachinePreset: triggerMachine.preset,
+        triggerMachineReason: triggerMachine.reason,
+      });
       await appendAttemptEvidence(ctx, j, "dispatched", `Independent Trigger worker reserved${a.reason ? ` · ${a.reason.slice(0, 120)}` : ""}`, {
         stage: "dispatching", percent: Math.max(1, j.percent ?? 0), evidenceKind: "dispatch", eventKey: `dispatch:${attemptNumber}:${dispatchId}`,
       });
@@ -1159,6 +1187,10 @@ export const reserveDispatchBatch = mutation({
         schedulingGroupKey: j.schedulingGroupKey,
         agentId: j.agentId ?? null,
         label: j.label ?? j.task.slice(0, 80),
+        authorityDigest: candidate.executionAuthority.authorityDigest,
+        workOrderRevisionDigest: candidate.executionAuthority.workOrderRevisionDigest,
+        triggerMachinePreset: triggerMachine.preset,
+        triggerMachineReason: triggerMachine.reason,
       });
       reservedJobs.push(j);
     }
@@ -1177,6 +1209,13 @@ export const claimDispatched = mutation({
     jobId: v.id("jobs"),
     dispatchId: v.string(),
     workerRunId: v.string(),
+    expectedAttempt: v.optional(v.number()),
+    authorityDigest: v.optional(v.string()),
+    workOrderRevisionDigest: v.optional(v.string()),
+    triggerMachinePreset: v.optional(v.string()),
+    triggerMachineReason: v.optional(v.string()),
+    triggerObservedMachinePreset: v.optional(v.string()),
+    triggerPlatformAttempt: v.optional(v.number()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
@@ -1196,9 +1235,31 @@ export const claimDispatched = mutation({
     const attemptNumber = j?.attempt ?? 1;
     const priorAttempt = j ? await attemptFor(ctx, a.jobId, attemptNumber) : null;
     const executionAuthority = j ? await readAttemptExecutionAuthority(ctx, j, attemptNumber) : null;
+    let triggerObservedReason = a.triggerMachineReason;
     if (j && !executionAuthority) {
       await quarantineJobRuntime(ctx, j);
       return null;
+    }
+    if (j?.triggerMachinePreset) {
+      const observedReason = observedTriggerMachineReason({
+        admittedPreset: j.triggerMachinePreset as TriggerAgentMachinePreset,
+        admittedReason: j.triggerMachineReason as TriggerAgentMachineReason,
+        actualPreset: String(a.triggerObservedMachinePreset ?? ""),
+        triggerAttempt: Number(a.triggerPlatformAttempt),
+      });
+      if (a.expectedAttempt !== attemptNumber
+        || a.authorityDigest !== executionAuthority?.authorityDigest
+        || a.workOrderRevisionDigest !== executionAuthority?.workOrderRevisionDigest
+        || a.triggerMachinePreset !== j.triggerMachinePreset
+        || a.triggerMachineReason !== j.triggerMachineReason
+        || !Number.isSafeInteger(a.triggerPlatformAttempt) || Number(a.triggerPlatformAttempt) < 1
+        || !observedReason) return {
+          executable: false,
+          held: true,
+          code: "trigger_launch_authority_held",
+          jobId: j._id,
+        };
+      triggerObservedReason = observedReason;
     }
     // Trigger can redeliver after Convex committed the claim but before the
     // worker received the response. Recover exactly the already-bound launch;
@@ -1207,11 +1268,28 @@ export const claimDispatched = mutation({
       jobStatus: j?.status ?? "missing", jobDispatchId: j?.dispatchId,
       requestDispatchId: a.dispatchId, requestWorkerRunId: a.workerRunId, attempt: priorAttempt,
     });
+    const observedMachinePatch = j?.triggerMachinePreset ? {
+      triggerObservedMachinePreset: a.triggerObservedMachinePreset,
+      triggerObservedMachineReason: triggerObservedReason,
+      triggerPlatformAttempt: a.triggerPlatformAttempt,
+    } : {};
     // Do not execute a dependency query on a redelivery. The original response
     // may have been lost after commit; this is an immutable replay envelope.
-    if (disposition === "replay") return await claimedJob(ctx, j, priorAttempt?.upstreamEvidence ?? []);
+    if (disposition === "replay") {
+      if (Object.keys(observedMachinePatch).length) {
+        await patchJobWithRuntime(ctx, j, observedMachinePatch);
+        if (priorAttempt) await ctx.db.patch(priorAttempt._id, observedMachinePatch);
+      }
+      return await claimedJob(ctx, { ...j, ...observedMachinePatch }, priorAttempt?.upstreamEvidence ?? []);
+    }
     if (j?.status === "running" && j.dispatchId === a.dispatchId && j.deliveryRunId === a.workerRunId.slice(0, 120)
-      && j.verificationVerdict === "pass" && j.reviewReceiptId) return await claimedJob(ctx, j, priorAttempt?.upstreamEvidence ?? []);
+      && j.verificationVerdict === "pass" && j.reviewReceiptId) {
+      if (Object.keys(observedMachinePatch).length) {
+        await patchJobWithRuntime(ctx, j, observedMachinePatch);
+        if (priorAttempt) await ctx.db.patch(priorAttempt._id, observedMachinePatch);
+      }
+      return await claimedJob(ctx, { ...j, ...observedMachinePatch }, priorAttempt?.upstreamEvidence ?? []);
+    }
     if (
       !j ||
       j.status !== "dispatching" ||
@@ -1261,6 +1339,9 @@ export const claimDispatched = mutation({
         status: "running", stage: "delivery", progress: "resuming verified controller delivery", startedAt: now,
         heartbeatAt: now, nextRunAt: undefined, dispatchLeaseUntil: undefined, dispatchId: a.dispatchId,
         workerRunId: a.workerRunId.slice(0, 120), deliveryRunId: a.workerRunId.slice(0, 120), deliveryGeneration: generation, activeDeliveryAttemptId: deliveryId, workerRuntime: "trigger",
+        triggerObservedMachinePreset: a.triggerObservedMachinePreset,
+        triggerObservedMachineReason: triggerObservedReason,
+        triggerPlatformAttempt: a.triggerPlatformAttempt,
         providerRunState: "executing", providerObservedAt: now,
       });
       await appendAttemptEvidence(ctx, j, "delivery_resumed", "Trusted controller resumed verified delivery without rerunning the specialist", {
@@ -1300,6 +1381,9 @@ export const claimDispatched = mutation({
       workerRunId: a.workerRunId.slice(0, 120),
       dispatchId: a.dispatchId,
       workerRuntime: "trigger",
+      triggerObservedMachinePreset: a.triggerObservedMachinePreset,
+      triggerObservedMachineReason: triggerObservedReason,
+      triggerPlatformAttempt: a.triggerPlatformAttempt,
       providerRunState: "executing",
       providerObservedAt: now,
     });
@@ -1316,6 +1400,9 @@ export const claimDispatched = mutation({
       sessionId: a.workerRunId.slice(0, 120),
       workerRunId: a.workerRunId.slice(0, 120),
       dispatchId: a.dispatchId,
+      triggerObservedMachinePreset: a.triggerObservedMachinePreset,
+      triggerObservedMachineReason: triggerObservedReason,
+      triggerPlatformAttempt: a.triggerPlatformAttempt,
       upstreamEvidence,
       launchedAt: now,
       livenessAt: now,
@@ -1364,6 +1451,39 @@ export const rejectDispatch = mutation({
     });
     await appendAttemptEvidence(ctx, row, "dispatch_released", a.reason.slice(0, 500), {
       stage: "queued", percent: row.percent, evidenceKind: "dispatch", eventKey: `dispatch-release:${row.attempt ?? 1}:${a.dispatchId}`,
+    });
+    return true;
+  },
+});
+
+// A failed Trigger transport can mean "accepted, response lost". Preserve the
+// exact dispatch/attempt identity until the bounded lease reaper observes it;
+// the global Trigger idempotency key makes the later retry a reconciliation,
+// not a second launch.
+export const markDispatchLaunchUnknown = mutation({
+  args: {
+    jobId: v.id("jobs"),
+    dispatchId: v.string(),
+    reason: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.get(a.jobId);
+    if (!row || row.status !== "dispatching" || row.dispatchId !== a.dispatchId) return false;
+    const now = Date.now();
+    await patchJobWithRuntime(ctx, row, {
+      progress: `worker launch outcome unknown · ${a.reason.slice(0, 220)}`,
+      dispatchLeaseUntil: Math.min(Number(row.dispatchLeaseUntil ?? now + 30_000), now + 30_000),
+      providerRunState: "reconciling",
+      providerObservedAt: now,
+      heartbeatAt: now,
+    });
+    await appendAttemptEvidence(ctx, row, "dispatch_launch_unknown", a.reason.slice(0, 500), {
+      stage: "dispatching",
+      percent: row.percent,
+      evidenceKind: "reconcile",
+      eventKey: `dispatch-unknown:${row.attempt ?? 1}:${a.dispatchId}`,
     });
     return true;
   },
@@ -2274,6 +2394,8 @@ export const authorizeExecutionBoundary = mutation({
       retryLineage: authority.retryLineage,
       integrationLineage: authority.integrationLineage,
       machineClass: authority.workOrder.machineClass,
+      triggerMachinePreset: authority.workOrder.triggerMachinePreset,
+      triggerMachineReason: authority.workOrder.triggerMachineReason,
       minimumModel: authority.workOrder.minimumModel,
       minimumReasoningEffort: authority.workOrder.minimumReasoningEffort,
       toolScope: authority.workOrder.toolScope,
@@ -2460,7 +2582,7 @@ export const recordCloudCodexTurnPhase = mutation({
     if (prior === a.phase) return true;
     const allowed: Record<string, readonly string[]> = {
       prepared: ["request_intent", "request_written", "accepted", "effect", "rejected"],
-      request_intent: ["accepted", "effect", "rejected"],
+      request_intent: ["request_written", "accepted", "effect", "rejected"],
       request_written: ["accepted", "effect", "rejected"],
       accepted: ["effect", "completed"],
       effect: ["completed"],

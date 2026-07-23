@@ -4,6 +4,7 @@ import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
 import schema from "./schema";
 import { testMissionAdmission } from "./testSourceAdmission";
+import { triggerClaimAuthority } from "../src/lib/trigger-machine";
 
 declare global {
   interface ImportMeta {
@@ -49,8 +50,9 @@ async function specialistFixture(policy: Policy = "manual", goalStage?: "validat
     limit: 1, reason: "specialist-fixture", workerToken: WORKER,
   });
   expect(batch.reservations).toHaveLength(1);
-  const claim: any = await t.mutation(api.jobs.claimDispatched, {
+  const claim = await t.mutation(api.jobs.claimDispatched, {
     jobId, dispatchId: batch.reservations[0].dispatchId,
+    ...triggerClaimAuthority(batch.reservations[0]),
     workerRunId: "specialist-run", workerToken: WORKER,
   });
   expect(claim).toMatchObject({
@@ -87,7 +89,9 @@ async function committedAndClaimed(policy: Policy = "manual", goalStage?: "valid
   expect(reservations).toHaveLength(1);
   const reservation = reservations[0];
   const claim = await fixture.t.mutation(api.jobs.claimDispatched, {
-    jobId: fixture.jobId, dispatchId: reservation.dispatchId, workerRunId: "controller-run", workerToken: WORKER,
+    jobId: fixture.jobId, dispatchId: reservation.dispatchId,
+    ...triggerClaimAuthority(reservation),
+    workerRunId: "controller-run", workerToken: WORKER,
   });
   expect(claim).toMatchObject({ sourceWorkAttempt: 1, deliveryGeneration: 1, deliveryRunId: "controller-run" });
   const lease = await fixture.t.mutation(api.jobs.linearizeDelivery, {
@@ -162,10 +166,14 @@ describe("real Convex specialist/controller race matrix", () => {
   it("serializes two dispatchers, gives a distinct controller one claim, and replays only that run", async () => {
     const f = await committedAndClaimed();
     const replay = await f.t.mutation(api.jobs.claimDispatched, {
-      jobId: f.jobId, dispatchId: f.reservation.dispatchId, workerRunId: "controller-run", workerToken: WORKER,
+      jobId: f.jobId, dispatchId: f.reservation.dispatchId,
+      ...triggerClaimAuthority(f.reservation),
+      workerRunId: "controller-run", workerToken: WORKER,
     });
     const competing = await f.t.mutation(api.jobs.claimDispatched, {
-      jobId: f.jobId, dispatchId: f.reservation.dispatchId, workerRunId: "controller-two", workerToken: WORKER,
+      jobId: f.jobId, dispatchId: f.reservation.dispatchId,
+      ...triggerClaimAuthority(f.reservation),
+      workerRunId: "controller-two", workerToken: WORKER,
     });
     expect(replay).toEqual(f.claim);
     expect(competing).toBeNull();

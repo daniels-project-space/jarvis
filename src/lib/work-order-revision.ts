@@ -1,7 +1,14 @@
 import { normalizeWorkModelTier, type WorkModelTier } from "./work-models";
 import { SCOPED_TEAM_MANIFEST } from "./workflow-contract";
+import {
+  admittedTriggerMachine,
+  TRIGGER_AGENT_MACHINE_PRESETS,
+  TRIGGER_AGENT_MACHINE_REASONS,
+  type TriggerAgentMachinePreset,
+  type TriggerAgentMachineReason,
+} from "./trigger-machine";
 
-export const WORK_ORDER_REVISION_PROTOCOL_VERSION = 1;
+export const WORK_ORDER_REVISION_PROTOCOL_VERSION = 2;
 export const WORK_ORDER_MACHINE_RUNTIME = "node-22:codex-0.144.5";
 export const WORK_ORDER_MACHINE_TEMPLATE = "node22-codex-0.144.5";
 export const WORK_ORDER_MACHINE_CLASS = `${WORK_ORDER_MACHINE_RUNTIME}/${WORK_ORDER_MACHINE_TEMPLATE}/2cpu-4096mb`;
@@ -49,6 +56,8 @@ export type WorkOrderRevisionBinding = Readonly<{
   minimumModel: WorkModelTier;
   minimumReasoningEffort: "low" | "medium" | "high" | "max";
   machineClass: typeof WORK_ORDER_MACHINE_CLASS;
+  triggerMachinePreset: TriggerAgentMachinePreset;
+  triggerMachineReason: TriggerAgentMachineReason;
 }>;
 
 const effortOrder = ["low", "medium", "high", "max"] as const;
@@ -153,6 +162,8 @@ export function workOrderRevisionForJob(
   if (repository
     ? sourceProvider !== "github" || !sourceBranch || !sourceRef || !sourceHeadSha
     : sourceProvider !== "none" || sourceBranch || sourceRef || sourceHeadSha) return null;
+  const minimumReasoningEffort = normalizeMinimumReasoningEffort(job.reasoningEffort, minimumModel);
+  const triggerMachine = admittedTriggerMachine({ readonly, minimumModel, minimumReasoningEffort });
   return {
     protocolVersion: WORK_ORDER_REVISION_PROTOCOL_VERSION,
     jobId,
@@ -183,8 +194,10 @@ export function workOrderRevisionForJob(
     agentId: agent.agentId,
     agentRole: typeof job.agentRole === "string" && job.agentRole ? job.agentRole : agent.agentRole,
     minimumModel,
-    minimumReasoningEffort: normalizeMinimumReasoningEffort(job.reasoningEffort, minimumModel),
+    minimumReasoningEffort,
     machineClass: WORK_ORDER_MACHINE_CLASS,
+    triggerMachinePreset: triggerMachine.preset,
+    triggerMachineReason: triggerMachine.reason,
   };
 }
 
@@ -221,6 +234,8 @@ export function canonicalWorkOrderRevision(binding: WorkOrderRevisionBinding): s
     minimumModel: binding.minimumModel,
     minimumReasoningEffort: binding.minimumReasoningEffort,
     machineClass: binding.machineClass,
+    triggerMachinePreset: binding.triggerMachinePreset,
+    triggerMachineReason: binding.triggerMachineReason,
   });
 }
 
@@ -258,13 +273,20 @@ export function workOrderRevisionRowBinding(row: Record<string, unknown>): WorkO
     minimumModel: row.minimumModel,
     minimumReasoningEffort: row.minimumReasoningEffort,
     machineClass: row.machineClass,
+    triggerMachinePreset: row.triggerMachinePreset,
+    triggerMachineReason: row.triggerMachineReason,
   } as WorkOrderRevisionBinding;
   if (!Number.isSafeInteger(binding.revision) || binding.revision < 1
     || typeof binding.executableTask !== "string" || typeof binding.policyTask !== "string"
     || !Array.isArray(binding.acceptanceCriteria) || !Array.isArray(binding.toolScope) || !Array.isArray(binding.mcpScope)
     || !workOrderAgent(binding.agentId)
     || !["human_gate_required", "autonomous"].includes(binding.approvalResult)
-    || binding.machineClass !== WORK_ORDER_MACHINE_CLASS) return null;
+    || binding.machineClass !== WORK_ORDER_MACHINE_CLASS
+    || !(TRIGGER_AGENT_MACHINE_PRESETS as readonly unknown[]).includes(binding.triggerMachinePreset)
+    || !(TRIGGER_AGENT_MACHINE_REASONS as readonly unknown[]).includes(binding.triggerMachineReason)
+    || binding.triggerMachineReason === "trigger_oom_retry_escalation"
+    || admittedTriggerMachine(binding).preset !== binding.triggerMachinePreset
+    || admittedTriggerMachine(binding).reason !== binding.triggerMachineReason) return null;
   return binding;
 }
 
@@ -295,5 +317,7 @@ export function workOrderProjectionMatches(job: Record<string, unknown>, binding
     && job.agentRole === binding.agentRole
     && job.model === binding.minimumModel
     && job.reasoningEffort === binding.minimumReasoningEffort
-    && job.machineClass === binding.machineClass;
+    && job.machineClass === binding.machineClass
+    && job.triggerMachinePreset === binding.triggerMachinePreset
+    && job.triggerMachineReason === binding.triggerMachineReason;
 }

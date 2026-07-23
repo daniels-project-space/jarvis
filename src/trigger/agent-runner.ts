@@ -91,6 +91,7 @@ import {
   prepareCloudWorkspaceExecution,
   replayCloudWorkspaceExecution,
 } from "./cloud-workspace-controller";
+import type { TriggerAgentMachinePreset, TriggerAgentMachineReason } from "../lib/trigger-machine";
 import { createR2CheckpointStore } from "./cloud-checkpoint-r2";
 import {
   configuredCloudWorkspaceCleanupProvider,
@@ -582,6 +583,13 @@ async function branchHasChanges(repo: string, branch: string, token: string): Pr
 export type AgentWorkerPayload = {
   jobId: string;
   dispatchId: string;
+  expectedAttempt: number;
+  authorityDigest: string;
+  workOrderRevisionDigest: string;
+  triggerMachinePreset: TriggerAgentMachinePreset;
+  triggerMachineReason: TriggerAgentMachineReason;
+  triggerObservedMachinePreset?: TriggerAgentMachinePreset;
+  triggerPlatformAttempt?: number;
   reason?: string;
 };
 
@@ -614,6 +622,8 @@ export type AgentRunnerBoundaryObservation = Readonly<{
   repository: string | null;
   sourceBranch: string | null;
   sourceHeadSha: string | null;
+  triggerMachinePreset: TriggerAgentMachinePreset;
+  triggerMachineReason: TriggerAgentMachineReason;
 }>;
 
 type ExecutionLeaseControl = Readonly<{
@@ -628,6 +638,7 @@ export type AgentRunnerDependencies = Readonly<{
   ) => void;
   resolveSubscriptionAgentBin: typeof resolveSubscriptionAgentBin;
   prepareSubscriptionEnv: typeof prepareSubscriptionEnv;
+  cleanupSubscriptionHome: typeof cleanupSubscriptionHome;
   verifyCodexSubscriptionPreflight: typeof verifyCodexSubscriptionPreflight;
   missingSubscriptionTools: typeof missingSubscriptionTools;
   configuredCloudWorkspaceProvider: typeof configuredCloudWorkspaceProvider;
@@ -668,6 +679,7 @@ export function createProductionAgentRunnerDependencies(): AgentRunnerDependenci
     onAuthorityBoundary: () => {},
     resolveSubscriptionAgentBin,
     prepareSubscriptionEnv,
+    cleanupSubscriptionHome,
     verifyCodexSubscriptionPreflight,
     missingSubscriptionTools,
     configuredCloudWorkspaceProvider,
@@ -848,6 +860,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     const {
       resolveSubscriptionAgentBin,
       prepareSubscriptionEnv,
+      cleanupSubscriptionHome,
       verifyCodexSubscriptionPreflight,
       missingSubscriptionTools,
       configuredCloudWorkspaceProvider,
@@ -875,6 +888,13 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       jobId: options.reservation.jobId,
       dispatchId: options.reservation.dispatchId,
       workerRunId: options.reservation.workerRunId,
+      expectedAttempt: options.reservation.expectedAttempt,
+      authorityDigest: options.reservation.authorityDigest,
+      workOrderRevisionDigest: options.reservation.workOrderRevisionDigest,
+      triggerMachinePreset: options.reservation.triggerMachinePreset,
+      triggerMachineReason: options.reservation.triggerMachineReason,
+      triggerObservedMachinePreset: options.reservation.triggerObservedMachinePreset,
+      triggerPlatformAttempt: options.reservation.triggerPlatformAttempt,
     }).catch(() => null);
     if (!job) return { processed: 0, stale: true };
     if (job.executable === false || job.held === true) return {
@@ -903,7 +923,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         || boundary.workOrderRevisionDigest !== job.workOrderRevisionDigest
         || boundary.repository !== (job.repo ?? null)
         || boundary.sourceBranch !== (job.sourceBranch ?? null)
-        || boundary.sourceHeadSha !== (job.sourceHeadSha ?? null)) return null;
+        || boundary.sourceHeadSha !== (job.sourceHeadSha ?? null)
+        || boundary.triggerMachinePreset !== job.triggerMachinePreset
+        || boundary.triggerMachineReason !== job.triggerMachineReason) return null;
       // Return the server-authored object itself. Effect observers receive this
       // exact envelope; the runner never re-hashes or reconstructs authority.
       return boundary as AgentRunnerBoundaryObservation;
@@ -920,13 +942,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       }).catch(() => false);
       return { processed: 1, error };
     };
-    const subscriptionAuthority = authorityDigest
-      ? await authorizeBoundary("codex_start")
-      : null;
-    if (!subscriptionAuthority) {
-      return { processed: 1, stale: true, error: "immutable attempt authority rejected before Codex preflight" };
-    }
-    dependencies.onAuthorityBoundary("subscription_acquire", subscriptionAuthority);
     const provider: AgentProvider = "codex";
     const bin = resolveSubscriptionAgentBin(provider);
     if (!bin) return failClaimed(`no ${provider} binary`);
@@ -937,6 +952,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     const trackSubscriptionEnv = <T extends NodeJS.ProcessEnv>(value: T): T => {
       subscriptionEnvs.add(value);
       return value;
+    };
+    const cleanupTrackedSubscriptionEnv = (value: NodeJS.ProcessEnv) => {
+      if (!subscriptionEnvs.delete(value)) return;
+      cleanupSubscriptionHome(value);
     };
     const withFreshCodexBoundary = async <T,>(input: {
       scope: string;
@@ -955,15 +974,19 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       if (boundary.error) throw new Error(boundary.error);
       const receipt = verifyCodexSubscriptionPreflight(bin, boundary.env);
       if (receipt.error) throw new Error(receipt.error);
+      dependencies.onAuthorityBoundary("subscription_acquire", freshAuthority);
       const isolated = trackSubscriptionEnv((input.cloud ? isolateCloudSubscriptionEnv : isolateSubscriptionEnv)(
         boundary.env,
         input.scope,
       ));
       try {
+        const processAuthority = await authorizeBoundary("codex_start");
+        if (!processAuthority) throw new Error("immutable attempt authority rejected at Codex process boundary");
+        dependencies.onAuthorityBoundary("codex_process", processAuthority);
         return await input.run(isolated);
       } finally {
-        cleanupSubscriptionHome(isolated);
-        cleanupSubscriptionHome(boundary.env);
+        cleanupTrackedSubscriptionEnv(isolated);
+        cleanupTrackedSubscriptionEnv(boundary.env);
       }
     };
     try {
@@ -2053,10 +2076,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           if (!codexAuthority) {
             throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt authority rejected Codex execution", "rejected");
           }
-          dependencies.onAuthorityBoundary("codex_process", codexAuthority);
-          // The durable receipt precedes auth acquisition; after this point the
-          // only intervening work is bounded local preflight/home isolation.
-          const turnReceipt = await prepareTurnReceipt(sequence);
           const boundary = await prepareSubscriptionEnv(provider, {
             scope: `agent-${options.reservation.workerRunId}-execution-${sequence}`,
             minimumValidityMs: backgroundSubscriptionValidityMs(segmentTimeoutMs(model)),
@@ -2066,6 +2085,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           if (boundary.error) throw new Error(boundary.error);
           const boundaryPreflight = verifyCodexSubscriptionPreflight(bin, boundary.env);
           if (boundaryPreflight.error) throw new Error(boundaryPreflight.error);
+          dependencies.onAuthorityBoundary("subscription_acquire", codexAuthority);
+          // Persist the exact turn before the final stale check and process
+          // boundary. No provider bytes can be written by preparation itself.
+          const turnReceipt = await prepareTurnReceipt(sequence);
           env = boundary.env;
           const agentEnv = trackSubscriptionEnv(isolateCloudSubscriptionEnv(
             boundary.env,
@@ -2073,8 +2096,13 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           ));
           return { boundary, agentEnv, turnReceipt };
         };
-        const executeCloudAgent = (boundary: Awaited<ReturnType<typeof prepareCloudBoundary>>) =>
-          runCloudWorkspaceAgent({
+        const executeCloudAgent = async (boundary: Awaited<ReturnType<typeof prepareCloudBoundary>>) => {
+          const processAuthority = await authorizeBoundary(expectedAttempt > 1 ? "codex_resume" : "codex_start");
+          if (!processAuthority) {
+            throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt authority rejected at Codex process boundary", "rejected");
+          }
+          dependencies.onAuthorityBoundary("codex_process", processAuthority);
+          return await runCloudWorkspaceAgent({
             bin,
             controllerScratch,
             controllerEnv: boundary.agentEnv,
@@ -2090,6 +2118,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             timeoutMs: segmentTimeoutMs(model),
             turnReceipt: boundary.turnReceipt,
           });
+        };
         const holdUnsafeTurn = async (error: unknown): Promise<boolean> => {
           if (!(error instanceof CloudCodexReplayUnsafeError)) return false;
           await durableProgress;
@@ -2115,8 +2144,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           if (await holdUnsafeTurn(error)) return;
           if (!(error instanceof CloudCodexPreStartAuthorizationError)
             || executionBoundary.boundary.snapshotVersion === undefined) throw error;
-          cleanupSubscriptionHome(executionBoundary.agentEnv);
-          cleanupSubscriptionHome(executionBoundary.boundary.env);
+          cleanupTrackedSubscriptionEnv(executionBoundary.agentEnv);
+          cleanupTrackedSubscriptionEnv(executionBoundary.boundary.env);
           executionBoundary = await prepareCloudBoundary(2, executionBoundary.boundary.snapshotVersion);
           try {
             run = await executeCloudAgent(executionBoundary);
@@ -2853,14 +2882,18 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     return { processed };
     } finally {
       for (const consumerEnv of [...subscriptionEnvs].reverse()) {
-        if (!cleanupSubscriptionHome(consumerEnv)) cleanupSubscriptionHome(consumerEnv);
+        cleanupTrackedSubscriptionEnv(consumerEnv);
       }
     }
 }
 
 export const agentWorker = task({
   id: "jarvis-agent-worker",
-  machine: "medium-2x",
+  machine: "medium-1x",
+  retry: {
+    maxAttempts: 2,
+    outOfMemory: { machine: "medium-2x" },
+  },
   queue: { name: BACKGROUND_QUEUE, concurrencyLimit: BACKGROUND_CONCURRENCY_LIMIT },
   maxDuration: timeout.None,
   run: async (payload: AgentWorkerPayload, { ctx }) => {
@@ -2871,7 +2904,12 @@ export const agentWorker = task({
       .set("jobId", payload.jobId)
       .set("reason", String(payload.reason ?? "work-available").slice(0, 160));
     const result = await runAgentHarness({
-      reservation: { ...payload, workerRunId: ctx.run.id },
+      reservation: {
+        ...payload,
+        workerRunId: ctx.run.id,
+        triggerObservedMachinePreset: ctx.machine.name as TriggerAgentMachinePreset,
+        triggerPlatformAttempt: ctx.attempt.number,
+      },
       runtimeAttestation: { triggerDeploymentVersion: ctx.deployment?.version },
       onProgress: (progress) => {
         metadata

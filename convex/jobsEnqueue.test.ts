@@ -7,6 +7,7 @@ import schema from "./schema";
 import { MAX_TEXT_WORK_ORDER_BYTES, textWorkOrderByteLength } from "../src/lib/work-order";
 import { GENERATED_GATED_ACTION_MATRIX } from "../src/mastra/fixtures/action-scope-regressions";
 import { testMissionAdmission } from "./testSourceAdmission";
+import { triggerClaimAuthority } from "../src/lib/trigger-machine";
 
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
@@ -113,9 +114,23 @@ describe("bounded exact textual work orders", () => {
     const stored = await t.run(async (ctx) => ({
       job: await ctx.db.get(jobId),
       runtime: await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", jobId)).first(),
+      revision: await ctx.db.query("workOrderRevisions")
+        .withIndex("by_job_revision", (q) => q.eq("jobId", jobId).eq("revision", 1)).first(),
     }));
 
-    expect(stored.job).toMatchObject({ task: fixture, approvalRequired: false, status: "pending" });
+    expect(stored.job).toMatchObject({
+      task: fixture,
+      approvalRequired: false,
+      status: "pending",
+      workOrderProtocolVersion: 2,
+      triggerMachinePreset: "medium-2x",
+      triggerMachineReason: "admitted_write_or_hard",
+    });
+    expect(stored.revision).toMatchObject({
+      protocolVersion: 2,
+      triggerMachinePreset: "medium-2x",
+      triggerMachineReason: "admitted_write_or_hard",
+    });
     const durableTask = (stored.job as { task: string } | null)?.task;
     expect(durableTask).toBe(fixture);
     expect(textWorkOrderByteLength(durableTask!)).toBe(7_876);
@@ -131,6 +146,7 @@ describe("bounded exact textual work orders", () => {
     const claim = await t.mutation(api.jobs.claimDispatched, {
       jobId,
       dispatchId: reserved.reservations[0].dispatchId,
+      ...triggerClaimAuthority(reserved.reservations[0]),
       workerRunId: "exact-work-order-run",
       workerToken: WORKER,
     });
