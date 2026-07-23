@@ -1,4 +1,7 @@
-import type { CodexTurnResult } from "./codex-app-server";
+import {
+  CodexRequestRejectedError,
+  type CodexTurnResult,
+} from "./codex-app-server";
 import {
   FOREGROUND_SESSION_RENEWAL_RESERVE_MS,
   FOREGROUND_TURN_VALIDITY_RESERVE_MS,
@@ -130,7 +133,9 @@ export class ForegroundSessionOwner<Server extends ForegroundSessionServer> {
       } catch (error) {
         this.endTurn();
         if (!isCodexUnauthorizedError(error)) throw error;
-        if (started) {
+        const provenPreStartRejection = error instanceof CodexRequestRejectedError
+          && ["thread/start", "turn/start"].includes(error.method);
+        if (started || !provenPreStartRejection) {
           await this.renewAfter(admitted.version, "unauthorized");
           throw error;
         }
@@ -141,12 +146,9 @@ export class ForegroundSessionOwner<Server extends ForegroundSessionServer> {
       }
       this.endTurn();
       if (result.code !== 0 && isCodexUnauthorizedError(result.stderr)) {
-        if (!started && !replayedUnauthorized) {
-          await this.renewAfter(admitted.version, "unauthorized");
-          replayedUnauthorized = true;
-          continue;
-        }
-        if (started) await this.renewAfter(admitted.version, "unauthorized");
+        // A Codex result exists only after turn/start returned an accepted
+        // turn id. Repair the next turn's session, but never replay this one.
+        await this.renewAfter(admitted.version, "unauthorized");
       }
       return result;
     }

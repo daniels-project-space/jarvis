@@ -1,8 +1,15 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { createInterface } from "node:readline";
+import { join, resolve } from "node:path";
 import { AwsClient } from "aws4fetch";
+import { BoundedJsonLineDecoder } from "../lib/bounded-json-lines";
+import {
+  assertExactResponseOrigin,
+  hasExactKeys,
+  isJsonRecord,
+  readBoundedResponseBytes,
+  readBoundedResponseJson,
+} from "../lib/bounded-json";
 import { vaultService } from "../lib/vault-client";
 import { requireVaultBrokerSubscriptionSource } from "./subscription-source";
 import {
@@ -17,6 +24,7 @@ import {
   AesGcmSessionSnapshotCipher,
   ManagedSubscriptionSessionController,
   SubscriptionSessionError,
+  validateSessionState,
   type SessionState,
   type SessionStateStore,
   type VersionedSessionState,
@@ -28,6 +36,12 @@ const ROTATION_TIMEOUT_MS = 90_000;
 export const R2_TEMPORARY_CREDENTIAL_TTL_SECONDS = 6 * 60 * 60;
 export const R2_TEMPORARY_CREDENTIAL_RENEWAL_SKEW_MS = 5 * 60_000;
 const R2_BROKER_TIMEOUT_MS = 10_000;
+const R2_REQUEST_TIMEOUT_MS = 10_000;
+const R2_STATE_MAX_BYTES = 32 * 1_024;
+const R2_SNAPSHOT_MAX_BYTES = 256 * 1_024;
+const CLOUDFLARE_BROKER_RESPONSE_MAX_BYTES = 64 * 1_024;
+const CLOUDFLARE_API_ORIGIN = "https://api.cloudflare.com";
+const ROTATION_PROTOCOL_MAX_LINE_BYTES = 64 * 1_024;
 
 type SessionSecrets = {
   R2_ACCOUNT_ID: string;
@@ -49,7 +63,11 @@ export function parseSessionControllerSecrets(value: Record<string, string>): Se
     "SESSION_ENCRYPTION_KEY_B64",
     "CODEX_AUTH_JSON_B64",
   ] as const;
-  if (keys.some((key) => !value[key])) throw new SubscriptionSessionError("configuration_missing");
+  if (keys.some((key) => !value[key])
+    || Object.keys(value).length !== keys.length
+    || Object.keys(value).some((key) => !(keys as readonly string[]).includes(key))) {
+    throw new SubscriptionSessionError("configuration_missing");
+  }
   // Ambiguous legacy S3 credentials are rejected even when the broker fields
   // are present. The production path must never silently fall back to them.
   if (value.R2_ACCESS_KEY_ID || value.R2_SECRET_ACCESS_KEY || value.R2_SESSION_TOKEN) {
@@ -101,13 +119,28 @@ function canonicalBase64Bytes(value: string, expectedLength: number): Uint8Array
 
 export class R2SessionStateStore implements SessionStateStore {
   private readonly base: string;
+  private readonly origin: string;
+  private readonly timeoutMs: number;
 
   constructor(
     private readonly aws: AwsClient,
     endpoint: string,
     bucket: string,
+    options: { timeoutMs?: number } = {},
   ) {
-    this.base = `${endpoint.replace(/\/$/, "")}/${encodeURIComponent(bucket)}`;
+    let parsed: URL;
+    try { parsed = new URL(endpoint); } catch { throw new SubscriptionSessionError("configuration_missing"); }
+    if (parsed.protocol !== "https:" || parsed.origin !== endpoint.replace(/\/$/, "")
+      || !/^[a-f0-9]{32}\.r2\.cloudflarestorage\.com$/i.test(parsed.hostname)
+      || !/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)) {
+      throw new SubscriptionSessionError("configuration_missing");
+    }
+    this.origin = parsed.origin;
+    this.base = `${this.origin}/${encodeURIComponent(bucket)}`;
+    this.timeoutMs = options.timeoutMs ?? R2_REQUEST_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 60_000) {
+      throw new SubscriptionSessionError("configuration_missing");
+    }
   }
 
   private url(key: string): string {
@@ -115,16 +148,17 @@ export class R2SessionStateStore implements SessionStateStore {
   }
 
   async readState(): Promise<VersionedSessionState> {
-    const response = await this.aws.fetch(this.url(STATE_KEY), {
-      headers: { "cache-control": "no-store" },
-      redirect: "error",
+    const response = await this.request(STATE_KEY, {
+      headers: { "cache-control": "no-store" }, redirect: "error",
     });
     if (response.status === 404) return { value: null, etag: null };
     assertR2Response(response);
     const etag = response.headers.get("etag");
     if (!etag) throw new SubscriptionSessionError("snapshot_corrupt");
     try {
-      return { value: await response.json() as SessionState, etag };
+      const value = await readBoundedResponseJson(response, R2_STATE_MAX_BYTES) as SessionState;
+      validateSessionState(value);
+      return { value, etag };
     } catch {
       throw new SubscriptionSessionError("snapshot_corrupt");
     }
@@ -135,7 +169,8 @@ export class R2SessionStateStore implements SessionStateStore {
     value: SessionState,
   ): Promise<{ ok: boolean; etag?: string }> {
     const body = Buffer.from(JSON.stringify(value), "utf8");
-    const response = await this.aws.fetch(this.url(STATE_KEY), {
+    if (body.byteLength > R2_STATE_MAX_BYTES) throw new SubscriptionSessionError("snapshot_corrupt");
+    const response = await this.request(STATE_KEY, {
       method: "PUT",
       headers: {
         "content-type": "application/json",
@@ -154,7 +189,8 @@ export class R2SessionStateStore implements SessionStateStore {
   }
 
   async putSnapshotIfAbsent(key: string, value: Uint8Array): Promise<boolean> {
-    const response = await this.aws.fetch(this.url(key), {
+    if (value.byteLength > R2_SNAPSHOT_MAX_BYTES) throw new SubscriptionSessionError("snapshot_corrupt");
+    const response = await this.request(key, {
       method: "PUT",
       headers: {
         "content-type": "application/octet-stream",
@@ -171,13 +207,33 @@ export class R2SessionStateStore implements SessionStateStore {
   }
 
   async getSnapshot(key: string): Promise<Uint8Array | null> {
-    const response = await this.aws.fetch(this.url(key), {
+    const response = await this.request(key, {
       headers: { "cache-control": "no-store" },
       redirect: "error",
     });
     if (response.status === 404) return null;
     assertR2Response(response);
-    return new Uint8Array(await response.arrayBuffer());
+    try {
+      return await readBoundedResponseBytes(response, R2_SNAPSHOT_MAX_BYTES);
+    } catch {
+      throw new SubscriptionSessionError("snapshot_corrupt");
+    }
+  }
+
+  private async request(key: string, init: RequestInit): Promise<Response> {
+    let response: Response;
+    try {
+      response = await this.aws.fetch(this.url(key), {
+        ...init,
+        redirect: "error",
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+      assertExactResponseOrigin(response, this.origin);
+    } catch (error) {
+      if (error instanceof R2SessionCredentialRejectedError || error instanceof SubscriptionSessionError) throw error;
+      throw new SubscriptionSessionError("session_store_unavailable");
+    }
+    return response;
   }
 }
 
@@ -242,56 +298,64 @@ export class CloudflareTemporaryR2CredentialBroker implements TemporaryR2Credent
     if (!Number.isSafeInteger(this.ttlSeconds) || this.ttlSeconds < 60 || this.ttlSeconds > 604_800) {
       throw new SubscriptionSessionError("configuration_missing");
     }
+    if (!/^[a-f0-9]{32}$/i.test(config.accountId)
+      || !/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(config.bucket)
+      || !validCredentialPart(config.parentApiToken)
+      || !validCredentialPart(config.parentAccessKeyId)) {
+      throw new SubscriptionSessionError("configuration_missing");
+    }
   }
 
   async issue(): Promise<TemporaryR2Credentials> {
     const issuedAt = this.clock.now();
+    const url = `${CLOUDFLARE_API_ORIGIN}/client/v4/accounts/${encodeURIComponent(this.config.accountId)}/r2/temp-access-credentials`;
+    const body = JSON.stringify({
+      bucket: this.config.bucket,
+      parentAccessKeyId: this.config.parentAccessKeyId,
+      permission: "object-read-write",
+      ttlSeconds: this.ttlSeconds,
+      prefixes: ["managed-codex-session/"],
+    });
     let response: Response;
     try {
       response = await this.fetcher(
-        `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(this.config.accountId)}/r2/temp-access-credentials`,
+        url,
         {
           method: "POST",
           headers: {
             authorization: `Bearer ${this.config.parentApiToken}`,
             "content-type": "application/json",
+            "content-length": String(Buffer.byteLength(body, "utf8")),
           },
-          body: JSON.stringify({
-            bucket: this.config.bucket,
-            parentAccessKeyId: this.config.parentAccessKeyId,
-            permission: "object-read-write",
-            ttlSeconds: this.ttlSeconds,
-            prefixes: ["managed-codex-session/"],
-          }),
+          body,
           cache: "no-store",
           redirect: "error",
           signal: AbortSignal.timeout(this.timeoutMs),
         },
       );
+      assertExactResponseOrigin(response, CLOUDFLARE_API_ORIGIN);
     } catch {
       throw new SubscriptionSessionError("credential_broker_unavailable");
     }
     let payload: unknown;
     try {
-      payload = await response.json();
+      payload = await readBoundedResponseJson(response, CLOUDFLARE_BROKER_RESPONSE_MAX_BYTES);
     } catch {
       throw new SubscriptionSessionError("credential_broker_unavailable");
     }
-    const envelope = payload as {
-      success?: unknown;
-      result?: { accessKeyId?: unknown; secretAccessKey?: unknown; sessionToken?: unknown };
-    } | null;
-    const result = envelope?.result;
-    if (!response.ok || envelope?.success !== true
-      || !validCredentialPart(result?.accessKeyId)
-      || !validCredentialPart(result?.secretAccessKey)
-      || !validCredentialPart(result?.sessionToken)) {
+    if (!response.ok || !isJsonRecord(payload)
+      || !hasExactKeys(payload, ["success", "result"], ["errors", "messages"])
+      || payload.success !== true || !isJsonRecord(payload.result)
+      || !hasExactKeys(payload.result, ["accessKeyId", "secretAccessKey", "sessionToken"])
+      || !validCredentialPart(payload.result.accessKeyId)
+      || !validCredentialPart(payload.result.secretAccessKey)
+      || !validCredentialPart(payload.result.sessionToken)) {
       throw new SubscriptionSessionError("credential_broker_unavailable");
     }
     return {
-      accessKeyId: result.accessKeyId,
-      secretAccessKey: result.secretAccessKey,
-      sessionToken: result.sessionToken,
+      accessKeyId: payload.result.accessKeyId,
+      secretAccessKey: payload.result.secretAccessKey,
+      sessionToken: payload.result.sessionToken,
       // The API response has no expiry field. Measuring from request start is
       // conservative even if Cloudflare begins the TTL before responding.
       expiresAt: issuedAt + this.ttlSeconds * 1_000,
@@ -445,22 +509,65 @@ type RotationSpawn = (
   options: { cwd: string; env: NodeJS.ProcessEnv; stdio: ["pipe", "pipe", "pipe"] },
 ) => ChildProcessWithoutNullStreams;
 
-function rotationEnv(codexHome: string): NodeJS.ProcessEnv {
+const CHATGPT_PLAN_TYPES = new Set([
+  "free", "go", "plus", "pro", "prolite", "team",
+  "self_serve_business_usage_based", "business",
+  "enterprise_cbp_usage_based", "enterprise", "edu", "unknown",
+]);
+
+function validateInitializeResult(value: unknown, codexHome: string): void {
+  if (!isJsonRecord(value)
+    || !hasExactKeys(value, ["codexHome", "platformFamily", "platformOs", "userAgent"])
+    || typeof value.codexHome !== "string" || resolve(value.codexHome) !== resolve(codexHome)
+    || value.platformFamily !== "unix" || value.platformOs !== "linux"
+    || typeof value.userAgent !== "string" || !value.userAgent || value.userAgent.length > 512) {
+    throw new Error("invalid initialize result");
+  }
+}
+
+function validateAccountReadResult(value: unknown): void {
+  if (!isJsonRecord(value)
+    || !hasExactKeys(value, ["account", "requiresOpenaiAuth"])
+    || value.requiresOpenaiAuth !== true || !isJsonRecord(value.account)
+    || !hasExactKeys(value.account, ["type", "email", "planType"])
+    || value.account.type !== "chatgpt"
+    || !(value.account.email === null
+      || (typeof value.account.email === "string" && value.account.email.length <= 320))
+    || typeof value.account.planType !== "string" || !CHATGPT_PLAN_TYPES.has(value.account.planType)) {
+    throw new Error("invalid account/read result");
+  }
+}
+
+function responseForId(value: unknown, id: number): { result?: unknown; error?: unknown } | null {
+  if (!isJsonRecord(value) || value.id !== id) return null;
+  if (hasExactKeys(value, ["id", "result"])) return { result: value.result };
+  if (hasExactKeys(value, ["id", "error"])) return { error: value.error };
+  throw new Error("invalid app-server response envelope");
+}
+
+function validIgnoredRotationNotification(value: unknown): boolean {
+  return isJsonRecord(value)
+    && hasExactKeys(value, ["method", "params"])
+    && typeof value.method === "string"
+    && isJsonRecord(value.params);
+}
+
+function rotationEnv(
+  codexHome: string,
+  source: Readonly<Record<string, string | undefined>> = process.env,
+): NodeJS.ProcessEnv {
   const allow = [
     "PATH", "LANG", "LC_ALL", "NODE_EXTRA_CA_CERTS",
     "SSL_CERT_FILE", "SSL_CERT_DIR", "TERM", "CI", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "no_proxy",
   ];
   const env = {} as NodeJS.ProcessEnv;
-  for (const key of allow) if (process.env[key] !== undefined) env[key] = process.env[key];
-  env.PATH = process.env.PATH?.trim() || "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+  for (const key of allow) if (source[key] !== undefined) env[key] = source[key];
+  env.PATH = source.PATH?.trim() || "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
   env.HOME = codexHome;
   env.CODEX_HOME = codexHome;
   env.GIT_TERMINAL_PROMPT = "0";
   env.GH_PROMPT_DISABLED = "1";
-  env.ANTHROPIC_API_KEY = "";
-  env.OPENAI_API_KEY = "";
-  env.CODEX_API_KEY = "";
   return env;
 }
 
@@ -478,6 +585,9 @@ export async function rotateManagedSessionWithCodex(
     spawnProcess?: RotationSpawn;
     timeoutMs?: number;
     requiredUntil?: number;
+    environment?: Readonly<Record<string, string | undefined>>;
+    markEffect?: () => Promise<void>;
+    clearUnwrittenEffect?: () => Promise<void>;
   } = {},
 ): Promise<ChatgptSubscriptionAuth> {
   const root = options.root ?? "/home/node/.jarvis-codex-session-controller";
@@ -489,7 +599,7 @@ export async function rotateManagedSessionWithCodex(
   let refreshTokenReused = false;
   let diagnosticTail = "";
   const observeDiagnostic = (value: unknown) => {
-    const text = `${diagnosticTail}${String(value ?? "")}`;
+    const text = `${diagnosticTail}${String(value ?? "").slice(-512)}`;
     if (/refresh[_ -]?token[_ -]?reused|refresh token (?:was )?(?:already )?used/i.test(text)) {
       refreshTokenReused = true;
     }
@@ -498,22 +608,27 @@ export async function rotateManagedSessionWithCodex(
     diagnosticTail = text.slice(-80);
   };
   try {
-    await new Promise<void>((resolve) => {
+    await new Promise<void>((resolvePromise) => {
       let settled = false;
       let child: ChildProcessWithoutNullStreams;
       let timer: ReturnType<typeof setTimeout> | null = null;
       let terminationTimer: ReturnType<typeof setTimeout> | null = null;
+      let handling = Promise.resolve();
+      let initialized = false;
+      let accountRequested = false;
+      const decoder = new BoundedJsonLineDecoder(ROTATION_PROTOCOL_MAX_LINE_BYTES);
       const finish = () => {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
         if (terminationTimer) clearTimeout(terminationTimer);
-        resolve();
+        resolvePromise();
       };
+      const finishAfterHandling = () => { void handling.finally(finish); };
       try {
         child = spawnProcess(bin, ["app-server", "--listen", "stdio://"], {
           cwd: home,
-          env: rotationEnv(home),
+          env: rotationEnv(home, options.environment),
           stdio: ["pipe", "pipe", "pipe"],
         });
       } catch {
@@ -531,42 +646,58 @@ export async function rotateManagedSessionWithCodex(
       };
       timer = setTimeout(() => {
         stop("SIGKILL");
-      }, options.timeoutMs ?? ROTATION_TIMEOUT_MS);
+      }, Math.max(1, options.timeoutMs ?? ROTATION_TIMEOUT_MS));
       child.stderr.on("data", observeDiagnostic);
       child.stdin.on("error", () => stop("SIGKILL"));
-      child.once("error", finish);
-      child.once("close", finish);
-      createInterface({ input: child.stdout }).on("line", (line) => {
-        let message: Record<string, unknown>;
-        try {
-          message = JSON.parse(line) as Record<string, unknown>;
-        } catch {
-          return;
+      child.once("error", finishAfterHandling);
+      child.once("close", finishAfterHandling);
+      child.stdout.on("data", (chunk: Buffer) => {
+        let messages: unknown[];
+        try { messages = decoder.push(chunk); }
+        catch { stop("SIGKILL"); return; }
+        for (const message of messages) {
+          handling = handling.then(async () => {
+            const initialize = responseForId(message, 1);
+            if (initialize) {
+              if (initialized || accountRequested || initialize.error !== undefined) {
+                if (initialize.error !== undefined) observeDiagnostic(JSON.stringify(initialize.error));
+                throw new Error("initialize rejected");
+              }
+              validateInitializeResult(initialize.result, home);
+              child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
+              initialized = true;
+              await (options.markEffect?.() ?? Promise.resolve());
+              try {
+                child.stdin.write(`${JSON.stringify({
+                  id: 2,
+                  method: "account/read",
+                  params: { refreshToken: true },
+                })}\n`);
+                accountRequested = true;
+              } catch (error) {
+                await (options.clearUnwrittenEffect?.() ?? Promise.resolve());
+                throw error;
+              }
+              return;
+            }
+            const account = responseForId(message, 2);
+            if (account) {
+              if (!initialized || !accountRequested || account.error !== undefined) {
+                if (account.error !== undefined) observeDiagnostic(JSON.stringify(account.error));
+                throw new Error("account/read rejected");
+              }
+              validateAccountReadResult(account.result);
+              // account/read persists managed auth before replying. A lost
+              // reply is recovered only by the exact auth-file transition.
+              stop("SIGTERM");
+              return;
+            }
+            if (!validIgnoredRotationNotification(message)) throw new Error("invalid app-server message");
+          }).catch(() => stop("SIGKILL"));
         }
-        if (message.id === 1) {
-          if (message.error) {
-            observeDiagnostic(JSON.stringify(message.error));
-            stop("SIGTERM");
-            return;
-          }
-          try {
-            child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
-            child.stdin.write(`${JSON.stringify({
-              id: 2,
-              method: "account/read",
-              params: { refreshToken: true },
-            })}\n`);
-          } catch {
-            stop("SIGKILL");
-          }
-          return;
-        }
-        if (message.id === 2) {
-          if (message.error) observeDiagnostic(JSON.stringify(message.error));
-          // account/read persists managed auth before replying. A lost reply or
-          // crash is also handled below by reading the file unconditionally.
-          stop("SIGTERM");
-        }
+      });
+      child.stdout.once("end", () => {
+        try { decoder.finish(); } catch { stop("SIGKILL"); }
       });
       try {
         child.stdin.write(`${JSON.stringify({
@@ -605,23 +736,18 @@ let controllerPromise: Promise<ManagedSubscriptionSessionController> | null = nu
 
 export function productionSubscriptionSessionController(
   bin: string,
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+  dependencies: { loadSecrets?: (service: string) => Promise<Record<string, string>> } = {},
 ): Promise<ManagedSubscriptionSessionController> {
   // Check on every call, including after the singleton has warmed. A host
   // cannot inherit or reuse this controller unless its deployment explicitly
   // selected the brokered source.
-  requireVaultBrokerSubscriptionSource();
-  if (controllerPromise) return controllerPromise;
-  controllerPromise = (async () => {
-    // Old Trigger deployments may still carry this copied secret. Refuse it:
-    // bootstrap must be fetched only inside the controller boundary.
-    if (process.env.CODEX_AUTH_JSON_B64 !== undefined
-      || process.env.CODEX_AUTH_JSON !== undefined
-      || process.env.CODEX_ACCESS_TOKEN !== undefined) {
-      throw new SubscriptionSessionError("configuration_missing");
-    }
+  requireVaultBrokerSubscriptionSource(environment);
+  if (!dependencies.loadSecrets && controllerPromise) return controllerPromise;
+  const creating = (async () => {
     let values: Record<string, string>;
     try {
-      values = await vaultService(SESSION_SERVICE);
+      values = await (dependencies.loadSecrets ?? vaultService)(SESSION_SERVICE);
     } catch {
       throw new SubscriptionSessionError("configuration_missing");
     }
@@ -647,14 +773,17 @@ export function productionSubscriptionSessionController(
       store,
       cipher: new AesGcmSessionSnapshotCipher(key),
       bootstrap: async () => parseChatgptSubscriptionAuth(secrets.CODEX_AUTH_JSON_B64),
-      rotate: (auth, context) => rotateManagedSessionWithCodex(bin, auth, {
-        requiredUntil: context.requiredUntil,
-      }),
+    rotate: (auth, context) => rotateManagedSessionWithCodex(bin, auth, {
+      requiredUntil: context.requiredUntil,
+      markEffect: context.markEffect,
+      clearUnwrittenEffect: context.clearUnwrittenEffect,
+    }),
     });
   })().catch((error) => {
-    controllerPromise = null;
+    if (!dependencies.loadSecrets) controllerPromise = null;
     if (error instanceof SubscriptionSessionError) throw error;
     throw new SubscriptionSessionError("configuration_missing");
   });
-  return controllerPromise;
+  if (!dependencies.loadSecrets) controllerPromise = creating;
+  return creating;
 }

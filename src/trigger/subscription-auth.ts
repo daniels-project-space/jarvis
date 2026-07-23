@@ -1,4 +1,9 @@
 import { createHash } from "node:crypto";
+import {
+  hasExactKeys,
+  isJsonRecord,
+  parseStrictJson,
+} from "../lib/bounded-json";
 
 const AUTH_OUTER_KEYS = ["OPENAI_API_KEY", "auth_mode", "last_refresh", "tokens"] as const;
 const AUTH_TOKEN_KEYS = ["access_token", "refresh_token", "id_token", "account_id"] as const;
@@ -11,76 +16,6 @@ export type ChatgptSubscriptionAuth = {
 };
 
 type JsonObject = Record<string, unknown>;
-
-function isObject(value: unknown): value is JsonObject {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function sameKeys(value: JsonObject, expected: readonly string[]): boolean {
-  const expectedKeys = [...expected].sort();
-  const actual = Object.keys(value).sort();
-  return actual.length === expectedKeys.length && actual.every((key, index) => key === expectedKeys[index]);
-}
-
-// JSON.parse accepts duplicate object keys using the last value. Reject them
-// before parsing so a credential document has one unambiguous canonical form.
-function rejectDuplicateJsonKeys(input: string): void {
-  let index = 0;
-  const whitespace = () => { while (/\s/.test(input[index] ?? "")) index++; };
-  const fail = (): never => { throw new Error("invalid JSON"); };
-  const string = (): string => {
-    if (input[index++] !== '"') fail();
-    const start = index - 1;
-    while (index < input.length) {
-      const char = input[index++];
-      if (char === '"') return JSON.parse(input.slice(start, index)) as string;
-      if (char === "\\") {
-        const escape = input[index++];
-        if (!escape || !'"\\/bfnrtu'.includes(escape)) fail();
-        if (escape === "u") {
-          if (!/^[0-9a-fA-F]{4}$/.test(input.slice(index, index + 4))) fail();
-          index += 4;
-        }
-      } else if (char.charCodeAt(0) < 0x20) fail();
-    }
-    return fail();
-  };
-  const value = (): void => {
-    whitespace();
-    if (input[index] === '"') { string(); return; }
-    if (input[index] === "{") {
-      index++; whitespace();
-      const keys = new Set<string>();
-      if (input[index] === "}") { index++; return; }
-      while (true) {
-        whitespace();
-        const key = string();
-        if (keys.has(key)) throw new Error("duplicate JSON key");
-        keys.add(key);
-        whitespace();
-        if (input[index++] !== ":") fail();
-        value(); whitespace();
-        if (input[index] === "}") { index++; return; }
-        if (input[index++] !== ",") fail();
-      }
-    }
-    if (input[index] === "[") {
-      index++; whitespace();
-      if (input[index] === "]") { index++; return; }
-      while (true) {
-        value(); whitespace();
-        if (input[index] === "]") { index++; return; }
-        if (input[index++] !== ",") fail();
-      }
-    }
-    const start = index;
-    while (index < input.length && !/[\s,}\]]/.test(input[index])) index++;
-    if (start === index) fail();
-    JSON.parse(input.slice(start, index));
-  };
-  value(); whitespace();
-  if (index !== input.length) fail();
-}
 
 function apiKeyShaped(value: string): boolean {
   return /^(?:sk|rk|pk|api)[_-]/i.test(value) || /(?:^|[_-])api[_-]?key/i.test(value);
@@ -100,13 +35,12 @@ function validLastRefresh(value: unknown): value is string {
 }
 
 export function parseChatgptSubscriptionAuthText(json: string): ChatgptSubscriptionAuth {
-  rejectDuplicateJsonKeys(json);
-  const parsed: unknown = JSON.parse(json);
-  if (!isObject(parsed) || !sameKeys(parsed, AUTH_OUTER_KEYS)
+  const parsed = parseStrictJson(json);
+  if (!isJsonRecord(parsed) || !hasExactKeys(parsed, AUTH_OUTER_KEYS)
     || parsed.OPENAI_API_KEY !== null
     || parsed.auth_mode !== "chatgpt"
     || !validLastRefresh(parsed.last_refresh)
-    || !isObject(parsed.tokens) || !sameKeys(parsed.tokens, AUTH_TOKEN_KEYS)) {
+    || !isJsonRecord(parsed.tokens) || !hasExactKeys(parsed.tokens, AUTH_TOKEN_KEYS)) {
     throw new Error("invalid Codex ChatGPT subscription auth schema");
   }
   const tokens = {} as ChatgptSubscriptionAuth["tokens"];
@@ -157,7 +91,7 @@ function decodeJwtPayload(token: string): JsonObject | null {
   if (pieces.length < 2 || !pieces[1]) return null;
   try {
     const payload = JSON.parse(Buffer.from(pieces[1], "base64url").toString("utf8")) as unknown;
-    return isObject(payload) ? payload : null;
+    return isJsonRecord(payload) ? payload : null;
   } catch {
     return null;
   }

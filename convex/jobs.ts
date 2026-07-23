@@ -2013,6 +2013,88 @@ export const noteCloudWorkspaceBlock = mutation({
   },
 });
 
+export const prepareCloudCodexTurn = mutation({
+  args: {
+    jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
+    providerWorkspaceId: v.string(), providerSessionId: v.string(),
+    receiptId: v.string(), sequence: v.number(), workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.get(a.jobId);
+    const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
+      || row.workerRunId !== a.workerRunId || !attempt || attempt.status !== "running"
+      || attempt.providerWorkspaceId !== a.providerWorkspaceId
+      || attempt.providerSessionId !== a.providerSessionId
+      || !/^[a-f0-9]{64}$/.test(a.receiptId)
+      || !Number.isSafeInteger(a.sequence) || a.sequence < 1 || a.sequence > 2) return false;
+    if (attempt.codexTurnReceiptId) {
+      if (attempt.codexTurnReceiptId === a.receiptId
+        && attempt.codexTurnReceiptSequence === a.sequence
+        && attempt.codexTurnReceiptPhase === "prepared") return true;
+      if (attempt.codexTurnReceiptPhase !== "rejected"
+        || a.sequence !== Number(attempt.codexTurnReceiptSequence ?? 0) + 1) return false;
+    } else if (a.sequence !== 1) return false;
+    const now = Date.now();
+    await ctx.db.patch(attempt._id, {
+      codexTurnReceiptId: a.receiptId,
+      codexTurnReceiptSequence: a.sequence,
+      codexTurnReceiptPhase: "prepared",
+      codexTurnReceiptAt: now,
+      lastEventAt: now,
+    });
+    await appendAttemptEvidence(ctx, row, "cloud_codex_turn_prepared", "Codex turn receipt prepared before protocol execution", {
+      stage: "starting", evidenceKind: "checkpoint",
+      eventKey: `codex-turn:${a.expectedAttempt}:${a.sequence}:prepared`,
+      data: { sequence: a.sequence, phase: "prepared" },
+    });
+    return true;
+  },
+});
+
+export const recordCloudCodexTurnPhase = mutation({
+  args: {
+    jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
+    receiptId: v.string(), sequence: v.number(),
+    phase: v.union(
+      v.literal("request_written"), v.literal("accepted"), v.literal("effect"),
+      v.literal("rejected"), v.literal("completed"),
+    ),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db.get(a.jobId);
+    const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
+      || row.workerRunId !== a.workerRunId || !attempt || attempt.status !== "running"
+      || attempt.codexTurnReceiptId !== a.receiptId
+      || attempt.codexTurnReceiptSequence !== a.sequence) return false;
+    const prior = String(attempt.codexTurnReceiptPhase ?? "");
+    if (prior === a.phase) return true;
+    const allowed: Record<string, readonly string[]> = {
+      prepared: ["request_written", "accepted", "effect", "rejected"],
+      request_written: ["accepted", "effect", "rejected"],
+      accepted: ["effect", "completed"],
+      effect: ["completed"],
+    };
+    if (!allowed[prior]?.includes(a.phase)) return false;
+    const now = Date.now();
+    await ctx.db.patch(attempt._id, {
+      codexTurnReceiptPhase: a.phase,
+      codexTurnReceiptAt: now,
+      lastEventAt: now,
+    });
+    await appendAttemptEvidence(ctx, row, `cloud_codex_turn_${a.phase}`, `Codex turn receipt advanced to ${a.phase}`, {
+      stage: "executing", evidenceKind: "checkpoint",
+      eventKey: `codex-turn:${a.expectedAttempt}:${a.sequence}:${a.phase}`,
+      data: { sequence: a.sequence, phase: a.phase },
+    });
+    return true;
+  },
+});
+
 export const recordCloudCheckpoint = mutation({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(),

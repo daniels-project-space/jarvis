@@ -16,7 +16,7 @@ import {
 } from "./subscription-session";
 import { productionSubscriptionSessionController } from "./subscription-session-r2";
 import { requireVaultBrokerSubscriptionSource } from "./subscription-source";
-import { PINNED_CODEX_INTERNAL_REFRESH_GUARD_MS } from "./subscription-validity";
+import { CODEX_CONSUMER_REFRESH_GUARD_MS } from "./subscription-validity";
 
 export { parseChatgptSubscriptionAuth } from "./subscription-auth";
 
@@ -94,7 +94,7 @@ export function resolveSubscriptionAgentBin(provider: AgentProvider): string | n
 }
 
 function scopedSubscriptionEnv(
-  source: NodeJS.ProcessEnv,
+  source: Readonly<Record<string, string | undefined>>,
   provider: AgentProvider,
 ): NodeJS.ProcessEnv {
   const allow = [
@@ -130,11 +130,8 @@ function scopedSubscriptionEnv(
   env.JARVIS_AGENT_PROVIDER = provider;
   env.GIT_TERMINAL_PROMPT = "0";
   env.GH_PROMPT_DISABLED = "1";
-  // Never let a subscription-backed subprocess silently switch to metered API
-  // billing, and never pass unrelated application/provider secrets to it.
-  env.ANTHROPIC_API_KEY = "";
-  env.OPENAI_API_KEY = "";
-  env.CODEX_API_KEY = "";
+  // No API-key variable is present at all: this process can use only the
+  // controller-provided ChatGPT auth file and cannot switch billing paths.
   return env;
 }
 
@@ -156,45 +153,41 @@ export async function prepareSubscriptionEnv(
     scope?: string;
     minimumValidityMs?: number;
     afterUnauthorizedVersion?: number;
+    environment?: Readonly<Record<string, string | undefined>>;
   } = {},
 ): Promise<PreparedSubscriptionEnv> {
+  const environment = options.environment ?? process.env;
   if (provider !== "codex") {
     return { env: {} as NodeJS.ProcessEnv, error: "Jarvis permits only the Codex CLI runtime" };
   }
   let consumerHome = "";
   try {
-    requireVaultBrokerSubscriptionSource();
+    requireVaultBrokerSubscriptionSource(environment);
   } catch (error) {
     return {
-      env: scopedSubscriptionEnv(process.env, provider),
+      env: scopedSubscriptionEnv(environment, provider),
       error: subscriptionOperatorSignal(error),
-    };
-  }
-  if (process.env.CODEX_AUTH_JSON_B64 !== undefined
-    || process.env.CODEX_AUTH_JSON !== undefined
-    || process.env.CODEX_ACCESS_TOKEN !== undefined) {
-    return {
-      env: scopedSubscriptionEnv(process.env, provider),
-      error: subscriptionOperatorSignal(new SubscriptionSessionError("configuration_missing")),
     };
   }
   let snapshot: AcquiredSubscriptionSession;
   try {
     const minimumValidityMs = options.minimumValidityMs ?? DEFAULT_MINIMUM_VALIDITY_MS;
     if (!Number.isSafeInteger(minimumValidityMs)
-      || minimumValidityMs <= PINNED_CODEX_INTERNAL_REFRESH_GUARD_MS) {
+      || minimumValidityMs < CODEX_CONSUMER_REFRESH_GUARD_MS
+      || (options.afterUnauthorizedVersion !== undefined
+        && (!Number.isSafeInteger(options.afterUnauthorizedVersion) || options.afterUnauthorizedVersion < 1))) {
       throw new SubscriptionSessionError("snapshot_stale");
     }
     const bin = resolveSubscriptionAgentBin(provider);
-    if (!bin) return { env: scopedSubscriptionEnv(process.env, provider), error: "codex binary not found" };
-    const controller = options.controller ?? await productionSubscriptionSessionController(bin);
+    if (!bin) return { env: scopedSubscriptionEnv(environment, provider), error: "codex binary not found" };
+    const controller = options.controller ?? await productionSubscriptionSessionController(bin, environment);
     snapshot = await controller.acquire({
       minimumValidityMs,
       afterUnauthorizedVersion: options.afterUnauthorizedVersion,
     });
   } catch (error) {
     return {
-      env: scopedSubscriptionEnv(process.env, provider),
+      env: scopedSubscriptionEnv(environment, provider),
       error: subscriptionOperatorSignal(error),
     };
   }
@@ -213,7 +206,7 @@ export async function prepareSubscriptionEnv(
     const authPath = join(home, "auth.json");
     writeFileSync(authPath, canonicalAuthJson(snapshot.auth), { mode: 0o600 });
     chmodSync(authPath, 0o600);
-    const env = scopedSubscriptionEnv(process.env, provider);
+    const env = scopedSubscriptionEnv(environment, provider);
     env.HOME = home;
     env.CODEX_HOME = home;
     return {
@@ -225,7 +218,7 @@ export async function prepareSubscriptionEnv(
   } catch {
     if (consumerHome) cleanupSubscriptionHome({ CODEX_HOME: consumerHome });
     return {
-      env: scopedSubscriptionEnv(process.env, provider),
+      env: scopedSubscriptionEnv(environment, provider),
       error: "Codex subscription consumer home is unavailable",
     };
   }

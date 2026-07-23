@@ -711,6 +711,12 @@ export default defineSchema({
     checkpointBytes: v.optional(v.number()),
     checkpointManifestDigest: v.optional(v.string()),
     checkpointManifest: v.optional(v.string()),
+    // No auth material is stored here. This is a replay-safety receipt for
+    // the exact Codex turn boundary and first external tool effect.
+    codexTurnReceiptId: v.optional(v.string()),
+    codexTurnReceiptSequence: v.optional(v.number()),
+    codexTurnReceiptPhase: v.optional(v.string()),
+    codexTurnReceiptAt: v.optional(v.number()),
     // This write-once marker is the replay lookup authority. It is set in
     // the same mutation as the complete immutable receipt so replay never
     // has to scan historical attempts or infer availability from fragments.

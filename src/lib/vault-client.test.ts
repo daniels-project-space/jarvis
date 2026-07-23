@@ -2,6 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const TRUSTED_VAULT = "https://fantastic-roadrunner-485.convex.cloud";
 
+function responseAt(url: string, body?: BodyInit | null, init?: ResponseInit): Response {
+  const response = new Response(body, init);
+  Object.defineProperty(response, "url", { value: url });
+  return response;
+}
+
 describe("vault client transport boundary", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -33,6 +39,7 @@ describe("vault client transport boundary", () => {
     expect(String(url)).toBe(`${TRUSTED_VAULT}/api/query`);
     expect(init?.redirect).toBe("error");
     expect(init?.signal).toBeInstanceOf(AbortSignal);
+    expect(init?.headers).toMatchObject({ "content-length": String(Buffer.byteLength(String(init?.body))) });
   });
 
   it("rejects a hostile configured vault origin before it receives the capability", async () => {
@@ -44,5 +51,46 @@ describe("vault client transport boundary", () => {
 
     await expect(vaultService("codex-session")).rejects.toThrow("Vault request unavailable");
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("accepts only bounded, duplicate-free success envelopes from the exact origin", async () => {
+    vi.stubEnv("VAULT_ACCESS_TOKEN", "vault-capability");
+    const endpoint = `${TRUSTED_VAULT}/api/query`;
+    const fetcher = vi.fn(async () => responseAt(endpoint, JSON.stringify({
+      status: "success",
+      value: [{ keyName: "R2_BUCKET", value: "private-bucket" }],
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetcher);
+    const { vaultService } = await import("./vault-client");
+    await expect(vaultService("codex-session")).resolves.toEqual({ R2_BUCKET: "private-bucket" });
+
+    vi.resetModules();
+    vi.stubGlobal("fetch", async () => responseAt(endpoint,
+      '{"status":"success","status":"error","value":[]}',
+      { status: 200, headers: { "content-type": "application/json" } }));
+    const duplicateClient = await import("./vault-client");
+    await expect(duplicateClient.vaultService("codex-session")).rejects.toThrow("Vault request unavailable");
+
+    vi.resetModules();
+    vi.stubGlobal("fetch", async () => responseAt(endpoint, null, {
+      status: 200,
+      headers: { "content-type": "application/json", "content-length": String(513 * 1_024) },
+    }));
+    const oversizedClient = await import("./vault-client");
+    await expect(oversizedClient.vaultService("codex-session")).rejects.toThrow("Vault request unavailable");
+  });
+
+  it("aborts a stalled vault body instead of holding controller work forever", async () => {
+    vi.useFakeTimers();
+    vi.stubEnv("VAULT_ACCESS_TOKEN", "vault-capability");
+    vi.stubGlobal("fetch", async (_input: string | URL | Request, init?: RequestInit) =>
+      await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      }));
+    const { vaultService } = await import("./vault-client");
+    const pending = vaultService("codex-session");
+    await vi.advanceTimersByTimeAsync(10_001);
+    await expect(pending).rejects.toThrow("Vault request unavailable");
+    vi.useRealTimers();
   });
 });

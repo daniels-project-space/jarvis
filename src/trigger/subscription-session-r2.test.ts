@@ -6,6 +6,7 @@ import {
   R2_TEMPORARY_CREDENTIAL_TTL_SECONDS,
   RenewingR2SessionStateStore,
   parseSessionControllerSecrets,
+  productionSubscriptionSessionController,
   type TemporaryR2CredentialBroker,
   type TemporaryR2Credentials,
 } from "./subscription-session-r2";
@@ -18,6 +19,14 @@ import {
 } from "./subscription-session";
 
 const ACCOUNT_ID = "a".repeat(32);
+const R2_ORIGIN = `https://${ACCOUNT_ID}.r2.cloudflarestorage.com`;
+const CLOUDFLARE_BROKER_URL = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/r2/temp-access-credentials`;
+
+function responseAt(url: string, body?: BodyInit | null, init?: ResponseInit): Response {
+  const response = new Response(body, init);
+  Object.defineProperty(response, "url", { value: url });
+  return response;
+}
 const STATE: SessionState = {
   schema: SESSION_STATE_SCHEMA,
   revision: 1,
@@ -49,7 +58,7 @@ describe("Cloudflare R2 temporary credential broker", () => {
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       void input;
       void init;
-      return new Response(JSON.stringify({
+      return responseAt(CLOUDFLARE_BROKER_URL, JSON.stringify({
         success: true,
         result: {
           accessKeyId: "temporary-access",
@@ -75,6 +84,7 @@ describe("Cloudflare R2 temporary credential broker", () => {
     const [url, init] = fetcher.mock.calls[0];
     expect(String(url)).toBe(`https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/r2/temp-access-credentials`);
     expect(init?.headers).toMatchObject({ authorization: "Bearer parent-api-token-never-forwarded" });
+    expect(init?.headers).toMatchObject({ "content-length": String(Buffer.byteLength(String(init?.body))) });
     expect(init?.redirect).toBe("error");
     expect(JSON.parse(String(init?.body))).toEqual({
       bucket: "jarvis-codex-session-private",
@@ -112,7 +122,7 @@ describe("Cloudflare R2 temporary credential broker", () => {
       parentAccessKeyId: "parent-access-id",
       bucket: "jarvis-codex-session-private",
     }, {
-      fetcher: async () => new Response(JSON.stringify({ success: false, errors: [{ message: leaked }] }), {
+      fetcher: async () => responseAt(CLOUDFLARE_BROKER_URL, JSON.stringify({ success: false, errors: [{ message: leaked }] }), {
         status: 403,
         headers: { "content-type": "application/json" },
       }),
@@ -122,17 +132,55 @@ describe("Cloudflare R2 temporary credential broker", () => {
     expect(error).toMatchObject({ code: "credential_broker_unavailable" });
     expect(String(error)).not.toContain(leaked);
   });
+
+  it("rejects wrong-origin, duplicate, oversized and stalled broker responses", async () => {
+    const config = {
+      accountId: ACCOUNT_ID,
+      parentApiToken: "parent-api-token",
+      parentAccessKeyId: "parent-access-id",
+      bucket: "jarvis-codex-session-private",
+    };
+    const wrongOrigin = new CloudflareTemporaryR2CredentialBroker(config, {
+      fetcher: async () => responseAt("https://hostile.example/credentials", "{}", {
+        status: 200, headers: { "content-type": "application/json" },
+      }),
+    });
+    await expect(wrongOrigin.issue()).rejects.toMatchObject({ code: "credential_broker_unavailable" });
+
+    const duplicate = new CloudflareTemporaryR2CredentialBroker(config, {
+      fetcher: async () => responseAt(CLOUDFLARE_BROKER_URL,
+        '{"success":true,"success":false,"result":{}}',
+        { status: 200, headers: { "content-type": "application/json" } }),
+    });
+    await expect(duplicate.issue()).rejects.toMatchObject({ code: "credential_broker_unavailable" });
+
+    const oversized = new CloudflareTemporaryR2CredentialBroker(config, {
+      fetcher: async () => responseAt(CLOUDFLARE_BROKER_URL, null, {
+        status: 200,
+        headers: { "content-type": "application/json", "content-length": String(65 * 1_024) },
+      }),
+    });
+    await expect(oversized.issue()).rejects.toMatchObject({ code: "credential_broker_unavailable" });
+
+    const stalled = new CloudflareTemporaryR2CredentialBroker(config, {
+      timeoutMs: 5,
+      fetcher: async (_input, init) => await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      }),
+    });
+    await expect(stalled.issue()).rejects.toMatchObject({ code: "credential_broker_unavailable" });
+  });
 });
 
 describe("R2 session request transport", () => {
   it("refuses redirects for every signed state and snapshot request", async () => {
-    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      if (init?.method === "PUT") return new Response(null, { status: 412 });
-      return new Response(null, { status: 404 });
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PUT") return responseAt(String(input), null, { status: 412 });
+      return responseAt(String(input), null, { status: 404 });
     });
     const store = new R2SessionStateStore(
       { fetch: fetcher } as never,
-      `https://${ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      R2_ORIGIN,
       "jarvis-codex-session-private",
     );
 
@@ -143,6 +191,57 @@ describe("R2 session request transport", () => {
 
     expect(fetcher).toHaveBeenCalledTimes(4);
     expect(fetcher.mock.calls.every(([, init]) => init?.redirect === "error")).toBe(true);
+    expect(fetcher.mock.calls.every(([, init]) => init?.signal instanceof AbortSignal)).toBe(true);
+  });
+
+  it("rejects wrong-origin, duplicate, oversized and stalled state responses", async () => {
+    const stateBody = JSON.stringify(STATE);
+    const wrongOrigin = new R2SessionStateStore({ fetch: async () => responseAt(
+      "https://hostile.example/state.json",
+      stateBody,
+      { status: 200, headers: { etag: "one", "content-type": "application/json" } },
+    ) } as never, R2_ORIGIN, "jarvis-codex-session-private");
+    await expect(wrongOrigin.readState()).rejects.toMatchObject({ code: "session_store_unavailable" });
+
+    const duplicate = new R2SessionStateStore({ fetch: async (input: RequestInfo | URL) => responseAt(
+      String(input),
+      stateBody.replace('"revision":1', '"revision":1,"revision":2'),
+      { status: 200, headers: { etag: "two", "content-type": "application/json" } },
+    ) } as never, R2_ORIGIN, "jarvis-codex-session-private");
+    await expect(duplicate.readState()).rejects.toMatchObject({ code: "snapshot_corrupt" });
+
+    const oversized = new R2SessionStateStore({ fetch: async (input: RequestInfo | URL) => responseAt(
+      String(input), null,
+      { status: 200, headers: { etag: "three", "content-type": "application/json", "content-length": String(33 * 1_024) } },
+    ) } as never, R2_ORIGIN, "jarvis-codex-session-private");
+    await expect(oversized.readState()).rejects.toMatchObject({ code: "snapshot_corrupt" });
+
+    const stalled = new R2SessionStateStore({ fetch: async (_input: RequestInfo | URL, init?: RequestInit) =>
+      await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      }) } as never, R2_ORIGIN, "jarvis-codex-session-private", { timeoutMs: 5 });
+    await expect(stalled.readState()).rejects.toMatchObject({ code: "session_store_unavailable" });
+  });
+});
+
+describe("production session source staging", () => {
+  it("does not read retired auth variables on the real controller path", async () => {
+    const retired = new Set(["CODEX_AUTH_JSON_B64", "CODEX_AUTH_JSON", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY"]);
+    const reads: string[] = [];
+    const environment = new Proxy<Record<string, string | undefined>>({
+      JARVIS_CODEX_SESSION_SOURCE: "vault-broker",
+    }, {
+      get(target, property) {
+        const name = String(property);
+        if (retired.has(name)) throw new Error(`retired getter invoked: ${name}`);
+        reads.push(name);
+        return target[name];
+      },
+    });
+    await expect(productionSubscriptionSessionController("/pinned/codex", environment, {
+      loadSecrets: async () => { throw new Error("bounded test stop"); },
+    })).rejects.toMatchObject({ code: "configuration_missing" });
+    expect(reads).toEqual(["JARVIS_CODEX_SESSION_SOURCE"]);
   });
 });
 

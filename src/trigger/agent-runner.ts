@@ -24,7 +24,6 @@ import { runWatchSweep } from "./watch-runtime";
 import {
   cleanupSubscriptionHome,
   missingSubscriptionTools,
-  isCodexUnauthorizedError,
   isolateCloudSubscriptionEnv,
   isolateSubscriptionEnv,
   prepareSubscriptionEnv,
@@ -80,7 +79,12 @@ import {
 import { repositoryDeliveryReadiness, trustedGitReviewReceiptAuthority, verifyGitReviewReceiptEnvelope } from "./git-review-authority";
 import { integrateReviewedWorker } from "./mission-integration";
 import { createGitHubIntegrationAdapter, GITHUB_REST_API_VERSION } from "./github-integration-adapter";
-import { runCloudWorkspaceAgent } from "./cloud-agent-runner";
+import {
+  CloudCodexPreStartAuthorizationError,
+  CloudCodexReplayUnsafeError,
+  runCloudWorkspaceAgent,
+  type CloudCodexTurnReceipt,
+} from "./cloud-agent-runner";
 import {
   applyValidatedPatchToControllerCheckout,
   createCredentiallessGitArchive,
@@ -688,6 +692,31 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       subscriptionEnvs.add(value);
       return value;
     };
+    const withFreshCodexBoundary = async <T,>(input: {
+      scope: string;
+      validityMs: number;
+      cloud?: boolean;
+      run(env: NodeJS.ProcessEnv): Promise<T>;
+    }): Promise<T> => {
+      const boundary = await prepareSubscriptionEnv(provider, {
+        scope: input.scope,
+        minimumValidityMs: input.validityMs,
+      });
+      subscriptionEnvs.add(boundary.env);
+      if (boundary.error) throw new Error(boundary.error);
+      const receipt = verifyCodexSubscriptionPreflight(bin, boundary.env);
+      if (receipt.error) throw new Error(receipt.error);
+      const isolated = trackSubscriptionEnv((input.cloud ? isolateCloudSubscriptionEnv : isolateSubscriptionEnv)(
+        boundary.env,
+        input.scope,
+      ));
+      try {
+        return await input.run(isolated);
+      } finally {
+        cleanupSubscriptionHome(isolated);
+        cleanupSubscriptionHome(boundary.env);
+      }
+    };
     try {
     const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
     if (preflight.error) return rejectReservation(preflight.error);
@@ -852,7 +881,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               validation.evidence.length ? `## Validation evidence\n${validation.evidence.map((item: string) => `- ${item}`).join("\n")}` : "",
               validation.gaps.length ? `## Remaining notes\n${validation.gaps.map((item: string) => `- ${item}`).join("\n")}` : "",
             ].filter(Boolean).join("\n\n");
-            const spoken = (await weaveLine(bin, env, "LONG-RUNNING GOAL COMPLETED", report)) || "The goal has passed its final Sol validation. The evidence is on your screen.";
+            const spoken = (await withFreshCodexBoundary({
+              scope: `goal-${String(claim.missionId)}-weave`,
+              validityMs: backgroundSubscriptionValidityMs(60_000),
+              run: (boundaryEnv) => weaveLine(bin, boundaryEnv, "LONG-RUNNING GOAL COMPLETED", report),
+            })) || "The goal has passed its final Sol validation. The evidence is on your screen.";
             await convexMutation("chatQueue:postAssistant", { threadId: thread, text: spoken }).catch(() => {});
             await convexMutation("chatQueue:postCard", {
               threadId: thread,
@@ -987,7 +1020,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       };
       try {
         const jobKey = String(job.jobId).replace(/[^a-zA-Z0-9_-]/g, "_");
-        let jobEnv = trackSubscriptionEnv(isolateSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}`));
         const controllerScratch = `/tmp/work/controller-${jobKey}-attempt-${expectedAttempt}`;
         rmSync(controllerScratch, { recursive: true, force: true });
         mkdirSync(controllerScratch, { recursive: true });
@@ -1598,23 +1630,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const model = normalizeWorkModelTier(
           typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task),
         );
-        // Setup may consume part of the initial controller window. Reacquire at
-        // the actual process boundary so this exact segment plus verification
-        // and delivery finishes before Codex's internal refresh guard.
-        const executionPrepared = await prepareSubscriptionEnv(provider, {
-          scope: `agent-${options.reservation.workerRunId}-execution`,
-          minimumValidityMs: backgroundSubscriptionValidityMs(segmentTimeoutMs(model)),
-        });
-        subscriptionEnvs.add(executionPrepared.env);
-        if (executionPrepared.error) throw new Error(executionPrepared.error);
-        const executionPreflight = verifyCodexSubscriptionPreflight(bin, executionPrepared.env);
-        if (executionPreflight.error) throw new Error(executionPreflight.error);
-        env = executionPrepared.env;
-        jobEnv = trackSubscriptionEnv(isolateSubscriptionEnv(
-          env,
-          `${jobKey}-attempt-${expectedAttempt}-controller-finalization`,
-        ));
-        let agentEnv = trackSubscriptionEnv(isolateCloudSubscriptionEnv(env, `${jobKey}-attempt-${expectedAttempt}-cloud`));
         let lastHeartbeatAt = 0;
         let lastDurableStage = "";
         let lastDurablePercent = 0;
@@ -1666,51 +1681,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             "blocked",
           );
         }
-        const executeCloudAgent = () => runCloudWorkspaceAgent({
-            bin,
-            controllerScratch,
-            controllerEnv: agentEnv,
-            provider: cloudProvider!,
+        const persistAndRecordCloudCheckpoint = async () => {
+          const portable = await persistPortableCheckpoint({
+            provider: cloudProvider,
             workspace: providerWorkspace!,
-            prompt,
-            model,
-            onProgress: reportProgress,
-            executionState: async () => {
-              const state = await executionStatus();
-              return state === "superseded" ? "cancelled" : state;
-            },
-            timeoutMs: segmentTimeoutMs(model),
-          });
-        let run;
-        try {
-          run = await executeCloudAgent();
-        } catch (error) {
-          if (!isCodexUnauthorizedError(error) || executionPrepared.snapshotVersion === undefined) throw error;
-          const renewed = await prepareSubscriptionEnv(provider, {
-            scope: `agent-${options.reservation.workerRunId}-unauthorized`,
-            minimumValidityMs: backgroundSubscriptionValidityMs(segmentTimeoutMs(model)),
-            afterUnauthorizedVersion: executionPrepared.snapshotVersion,
-          });
-          subscriptionEnvs.add(renewed.env);
-          if (renewed.error) throw new Error(renewed.error);
-          const renewedPreflight = verifyCodexSubscriptionPreflight(bin, renewed.env);
-          if (renewedPreflight.error) throw new Error(renewedPreflight.error);
-          env = renewed.env;
-          jobEnv = trackSubscriptionEnv(isolateSubscriptionEnv(
-            renewed.env,
-            `${jobKey}-attempt-${expectedAttempt}-controller-finalization-unauthorized`,
-          ));
-          agentEnv = trackSubscriptionEnv(isolateCloudSubscriptionEnv(
-            renewed.env,
-            `${jobKey}-attempt-${expectedAttempt}-cloud-unauthorized`,
-          ));
-          run = await executeCloudAgent();
-        }
-        await durableProgress;
-        let result = run.text;
-        const portable = await persistPortableCheckpoint({
-          provider: cloudProvider,
-          workspace: providerWorkspace,
           store: checkpointStore,
           jobId: String(job.jobId),
           attempt: expectedAttempt,
@@ -1723,21 +1697,130 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           attemptKey: `${String(job.jobId)}:${expectedAttempt}`,
           causationId: `${String(job.workerRunId)}:${expectedAttempt}`,
           assertCurrent: assertCurrentWorkspace,
-        });
-        if (!await assertCurrentWorkspace("checkpoint_record")) {
-          throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt fence rejected checkpoint record", "deferred");
+          });
+          if (!await assertCurrentWorkspace("checkpoint_record")) {
+            throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt fence rejected checkpoint record", "deferred");
+          }
+          const checkpointRecorded = await convexMutation("jobs:recordCloudCheckpoint", {
+            jobId: job.jobId, expectedAttempt,
+            providerWorkspaceId: providerWorkspace!.providerWorkspaceId,
+            providerSessionId: providerWorkspace!.providerSessionId,
+            checkpointRef: portable.ref,
+            checkpointDigest: portable.digest,
+            checkpointBytes: portable.byteCount,
+            checkpointManifestDigest: portable.manifestDigest,
+            checkpointManifest: portable.canonicalManifest,
+          }).catch(() => false);
+          if (!checkpointRecorded) throw new Error("Convex rejected the portable checkpoint receipt");
+          return portable;
+        };
+        const prepareTurnReceipt = async (sequence: 1 | 2): Promise<CloudCodexTurnReceipt> => {
+          const receiptId = sha256Bytes([
+            "jarvis-cloud-codex-turn-v1", String(job.jobId), String(expectedAttempt),
+            String(job.workerRunId), providerWorkspace!.providerWorkspaceId,
+            providerWorkspace!.providerSessionId, String(sequence),
+          ].join(":"));
+          const preparedReceipt = await convexMutation("jobs:prepareCloudCodexTurn", {
+            jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
+            providerWorkspaceId: providerWorkspace!.providerWorkspaceId,
+            providerSessionId: providerWorkspace!.providerSessionId,
+            receiptId, sequence,
+          }).catch(() => false);
+          if (!preparedReceipt) throw new Error("Codex turn receipt could not be durably prepared");
+          let writes = Promise.resolve();
+          const advance = (phase: "request_written" | "accepted" | "effect" | "rejected" | "completed") => {
+            writes = writes.then(async () => {
+              const recorded = await convexMutation("jobs:recordCloudCodexTurnPhase", {
+                jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
+                receiptId, sequence, phase,
+              }).catch(() => false);
+              if (!recorded) throw new Error(`Codex turn ${phase} receipt was rejected`);
+            });
+            return writes;
+          };
+          return {
+            requestWritten: () => { void advance("request_written").catch(() => undefined); },
+            accepted: () => advance("accepted"),
+            effect: () => advance("effect"),
+            rejected: () => advance("rejected"),
+            completed: () => advance("completed"),
+          };
+        };
+        const prepareCloudBoundary = async (sequence: 1 | 2, afterUnauthorizedVersion?: number) => {
+          // The durable receipt precedes auth acquisition; after this point the
+          // only intervening work is bounded local preflight/home isolation.
+          const turnReceipt = await prepareTurnReceipt(sequence);
+          const boundary = await prepareSubscriptionEnv(provider, {
+            scope: `agent-${options.reservation.workerRunId}-execution-${sequence}`,
+            minimumValidityMs: backgroundSubscriptionValidityMs(segmentTimeoutMs(model)),
+            afterUnauthorizedVersion,
+          });
+          subscriptionEnvs.add(boundary.env);
+          if (boundary.error) throw new Error(boundary.error);
+          const boundaryPreflight = verifyCodexSubscriptionPreflight(bin, boundary.env);
+          if (boundaryPreflight.error) throw new Error(boundaryPreflight.error);
+          env = boundary.env;
+          const agentEnv = trackSubscriptionEnv(isolateCloudSubscriptionEnv(
+            boundary.env,
+            `${jobKey}-attempt-${expectedAttempt}-cloud-${sequence}`,
+          ));
+          return { boundary, agentEnv, turnReceipt };
+        };
+        const executeCloudAgent = (boundary: Awaited<ReturnType<typeof prepareCloudBoundary>>) =>
+          runCloudWorkspaceAgent({
+            bin,
+            controllerScratch,
+            controllerEnv: boundary.agentEnv,
+            provider: cloudProvider!,
+            workspace: providerWorkspace!,
+            prompt,
+            model,
+            onProgress: reportProgress,
+            executionState: async () => {
+              const state = await executionStatus();
+              return state === "superseded" ? "cancelled" : state;
+            },
+            timeoutMs: segmentTimeoutMs(model),
+            turnReceipt: boundary.turnReceipt,
+          });
+        const holdUnsafeTurn = async (error: unknown): Promise<boolean> => {
+          if (!(error instanceof CloudCodexReplayUnsafeError)) return false;
+          await durableProgress;
+          const held = await persistAndRecordCloudCheckpoint();
+          const continuation = await checkpointMutation({
+            jobId: job.jobId,
+            expectedAttempt,
+            checkpoint:
+              `Codex crossed the turn/effect boundary and its response was not replay-safe. ` +
+              `Resume only from portable cloud checkpoint ${held.digest}; reconcile existing repository state before issuing a new turn.`,
+            result: "Codex turn held for durable checkpoint reconciliation; no blind replay was attempted.",
+            branch: branch ?? undefined,
+            delayMs: 5_000,
+          }).catch(() => null);
+          if (!continuation) throw new Error("Unsafe Codex turn checkpoint could not be requeued");
+          return true;
+        };
+        let executionBoundary = await prepareCloudBoundary(1);
+        let run: Awaited<ReturnType<typeof runCloudWorkspaceAgent>>;
+        try {
+          run = await executeCloudAgent(executionBoundary);
+        } catch (error) {
+          if (await holdUnsafeTurn(error)) return;
+          if (!(error instanceof CloudCodexPreStartAuthorizationError)
+            || executionBoundary.boundary.snapshotVersion === undefined) throw error;
+          cleanupSubscriptionHome(executionBoundary.agentEnv);
+          cleanupSubscriptionHome(executionBoundary.boundary.env);
+          executionBoundary = await prepareCloudBoundary(2, executionBoundary.boundary.snapshotVersion);
+          try {
+            run = await executeCloudAgent(executionBoundary);
+          } catch (retryError) {
+            if (await holdUnsafeTurn(retryError)) return;
+            throw retryError;
+          }
         }
-        const checkpointRecorded = await convexMutation("jobs:recordCloudCheckpoint", {
-          jobId: job.jobId, expectedAttempt,
-          providerWorkspaceId: providerWorkspace.providerWorkspaceId,
-          providerSessionId: providerWorkspace.providerSessionId,
-          checkpointRef: portable.ref,
-          checkpointDigest: portable.digest,
-          checkpointBytes: portable.byteCount,
-          checkpointManifestDigest: portable.manifestDigest,
-          checkpointManifest: portable.canonicalManifest,
-        }).catch(() => false);
-        if (!checkpointRecorded) throw new Error("Convex rejected the portable checkpoint receipt");
+        await durableProgress;
+        let result = run.text;
+        const portable = await persistAndRecordCloudCheckpoint();
         if (repo) {
           if (!await assertCurrentWorkspace("patch_export")) {
             throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt fence rejected patch export", "deferred");
@@ -2120,15 +2203,19 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           stage: "supervisor review",
           percent: 92,
         }).catch(() => {});
-        const verify = await verifyWork(
-          bin,
-          jobEnv,
-          job.task,
-          reviewEvidence,
-          job.goalStage,
-          gitReview,
-          reviewAuthority,
-        ).catch(() => null);
+        const verify = await withFreshCodexBoundary({
+          scope: `${jobKey}-attempt-${expectedAttempt}-supervisor-review`,
+          validityMs: backgroundSubscriptionValidityMs(90_000),
+          run: (reviewEnv) => verifyWork(
+            bin,
+            reviewEnv,
+            job.task,
+            reviewEvidence,
+            job.goalStage,
+            gitReview,
+            reviewAuthority,
+          ),
+        }).catch(() => null);
         if (await stopIfLeaseLost(`Supervisor review interrupted.\n\n${continuationCheckpoint}`, result, branch)) return;
         if (!verify) {
           const continuation = await convexMutation("jobs:checkpointAndRequeue", {
@@ -2295,7 +2382,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         }
 
         let spoken =
-          (await weaveLine(bin, jobEnv, job.task, deliveryResult)) ||
+          (await withFreshCodexBoundary({
+            scope: `${jobKey}-attempt-${expectedAttempt}-weave`,
+            validityMs: backgroundSubscriptionValidityMs(60_000),
+            run: (weaveEnv) => weaveLine(bin, weaveEnv, job.task, deliveryResult),
+          })) ||
           `${profile.name} finished and JARVIS verified the evidence${pullRequestUrl ? "; repository delivery is recorded" : ""}.`;
         spoken += " Supervisor check passed.";
         const findingId = await convexMutation("findings:add", {
@@ -2356,33 +2447,27 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     const synthesizeMissionClaim = async (synth: any): Promise<void> => {
       if (!synth?.id) return;
       const missionId = String(synth.id);
-      const synthesisPrepared = await prepareSubscriptionEnv(provider, {
-        scope: `mission-${missionId}-synthesis`,
-        minimumValidityMs: backgroundSubscriptionValidityMs(segmentTimeoutMs("terra")),
-      });
-      subscriptionEnvs.add(synthesisPrepared.env);
-      if (synthesisPrepared.error) throw new Error(synthesisPrepared.error);
-      const synthesisPreflight = verifyCodexSubscriptionPreflight(bin, synthesisPrepared.env);
-      if (synthesisPreflight.error) throw new Error(synthesisPreflight.error);
-      const synthesisEnv = trackSubscriptionEnv(isolateSubscriptionEnv(
-        synthesisPrepared.env,
-        `mission-${missionId}-synthesis`,
-      ));
       const failedAll = synth.results.every((r: any) => r.status !== "done");
       const body = synth.results
         .map((r: any) => `### ${r.label} [${r.status}]\n${r.result || "(no output)"}`)
         .join("\n\n");
-      const merged = await runAgent(
-        bin,
-        "/tmp/work",
-        synthesisEnv,
+      const synthesisPrompt =
         `You are JARVIS's mission synthesizer. A fleet of agents just finished parallel work on ONE mission. ` +
-          `Merge their results into a single coherent markdown report: start with "## Mission" and a 2-sentence outcome, ` +
-          `then "## Findings" (the substance, deduplicated, agent labels only where they add clarity), then "## Next moves" ` +
-          `(concrete recommended actions). Be direct; flag agents that failed. Under 500 words.\n\n` +
-          `MISSION: ${synth.goal}\n\nAGENT RESULTS:\n${body.slice(0, 24000)}`,
-        "terra",
-      );
+        `Merge their results into a single coherent markdown report: start with "## Mission" and a 2-sentence outcome, ` +
+        `then "## Findings" (the substance, deduplicated, agent labels only where they add clarity), then "## Next moves" ` +
+        `(concrete recommended actions). Be direct; flag agents that failed. Under 500 words.\n\n` +
+        `MISSION: ${synth.goal}\n\nAGENT RESULTS:\n${body.slice(0, 24000)}`;
+      const merged = await withFreshCodexBoundary({
+        scope: `mission-${missionId}-synthesis`,
+        validityMs: backgroundSubscriptionValidityMs(segmentTimeoutMs("terra")),
+        run: (synthesisEnv) => runAgent(
+          bin,
+          "/tmp/work",
+          synthesisEnv,
+          synthesisPrompt,
+          "terra",
+        ),
+      });
       const report = merged.text && !/^error:/.test(merged.text) && merged.text !== "(no output)"
         ? merged.text
         : `## Mission\n${synth.goal}\n\n${body.slice(0, 6000)}`;
@@ -2395,7 +2480,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       if (!finished) return;
       const thread = typeof synth.originThreadId === "string" && synth.originThreadId ? synth.originThreadId : "main";
       const spoken =
-        (await weaveLine(bin, synthesisEnv, `MISSION: ${synth.goal}`, report)) ||
+        (await withFreshCodexBoundary({
+          scope: `mission-${missionId}-weave`,
+          validityMs: backgroundSubscriptionValidityMs(60_000),
+          run: (weaveEnv) => weaveLine(bin, weaveEnv, `MISSION: ${synth.goal}`, report),
+        })) ||
         (failedAll ? "The fleet came back empty-handed, sir — mission report is on your screen." : "Mission complete, sir — the fleet's full report is on your screen.");
       await convexMutation("chatQueue:postAssistant", { threadId: thread, text: spoken });
       await convexMutation("chatQueue:postCard", {

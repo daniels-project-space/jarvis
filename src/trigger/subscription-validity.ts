@@ -2,6 +2,12 @@
 // are within five minutes of expiry. Consumer homes deliberately contain a
 // non-refreshing sentinel, so every process must finish before this boundary.
 export const PINNED_CODEX_INTERNAL_REFRESH_GUARD_MS = 5 * 60_000;
+// Clock skew, scheduler jitter and the final auth-file read must not consume
+// the pinned CLI's five-minute internal refresh window. Every direct consumer
+// request includes at least this additional minute.
+export const CODEX_INTERNAL_REFRESH_SAFETY_MS = 60_000;
+export const CODEX_CONSUMER_REFRESH_GUARD_MS =
+  PINNED_CODEX_INTERNAL_REFRESH_GUARD_MS + CODEX_INTERNAL_REFRESH_SAFETY_MS;
 
 // These bounds cover CLI preflight/process initialization and controller-side
 // result verification/delivery around one durable specialist segment.
@@ -16,7 +22,7 @@ export function backgroundSubscriptionValidityMs(segmentMs: number): number {
   if (!Number.isSafeInteger(segmentMs) || segmentMs < 1) {
     throw new Error("invalid Codex segment validity window");
   }
-  return PINNED_CODEX_INTERNAL_REFRESH_GUARD_MS
+  return CODEX_CONSUMER_REFRESH_GUARD_MS
     + CODEX_CONSUMER_STARTUP_RESERVE_MS
     + segmentMs
     + CODEX_CONSUMER_FINALIZATION_RESERVE_MS;

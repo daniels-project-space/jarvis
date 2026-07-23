@@ -19,7 +19,7 @@ import { CONTROLLER_REFRESH_SENTINEL, canonicalAuthJson, consumerAuth } from "./
 import { CODEX_SESSION_SOURCE, CODEX_SESSION_SOURCE_ENV } from "./subscription-source";
 import {
   DEFAULT_SUBSCRIPTION_VALIDITY_MS,
-  PINNED_CODEX_INTERNAL_REFRESH_GUARD_MS,
+  CODEX_CONSUMER_REFRESH_GUARD_MS,
 } from "./subscription-validity";
 
 const validAuth = {
@@ -84,8 +84,8 @@ describe("subscription subprocess capability scope", () => {
     expect(specialist.PATH).toBe(process.env.PATH);
     expect(specialist.HTTPS_PROXY).toBe("http://proxy.internal:8080");
     expect(specialist.GIT_TERMINAL_PROMPT).toBe("0");
-    expect(specialist.OPENAI_API_KEY).toBe("");
-    expect(specialist.CODEX_API_KEY).toBe("");
+    expect(specialist.OPENAI_API_KEY).toBeUndefined();
+    expect(specialist.CODEX_API_KEY).toBeUndefined();
     expect(specialist.CODEX_ACCESS_TOKEN).toBeUndefined();
   });
 
@@ -119,7 +119,7 @@ describe("subscription subprocess capability scope", () => {
     const rejected = await prepareSubscriptionEnv("codex", {
       controller,
       root: consumerRoot,
-      minimumValidityMs: PINNED_CODEX_INTERNAL_REFRESH_GUARD_MS,
+      minimumValidityMs: CODEX_CONSUMER_REFRESH_GUARD_MS - 1,
     });
     expect(rejected.error).toContain("snapshot_stale");
     expect(controller.acquire).not.toHaveBeenCalled();
@@ -228,7 +228,7 @@ describe("subscription subprocess capability scope", () => {
     }, "spawn-scope", join(consumerRoot, "spawn-homes"));
     const child = spawnSync(process.execPath, ["-e", "process.stdout.write(JSON.stringify({receipt:process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET,keyring:process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING,providerProbeKeyring:process.env.JARVIS_CLOUD_PROVIDER_PROBE_KEYRING,providerProbeReceipt:process.env.JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT,providerToken:process.env.SANDBOX0_TOKEN,convex:process.env.CONVEX_URL,trigger:process.env.TRIGGER_SECRET_KEY,github:process.env.GITHUB_TOKEN,parentApi:process.env.R2_PARENT_API_TOKEN,parentId:process.env.R2_PARENT_ACCESS_KEY_ID,session:process.env.AWS_SESSION_TOKEN,source:process.env.JARVIS_CODEX_SESSION_SOURCE,openai:process.env.OPENAI_API_KEY,codex:process.env.CODEX_API_KEY}))"], { env, encoding: "utf8" });
     expect(child.status).toBe(0);
-    expect(JSON.parse(child.stdout)).toEqual({ openai: "", codex: "" });
+    expect(JSON.parse(child.stdout)).toEqual({});
   });
 
   it("accepts only canonical base64 ChatGPT subscription auth", () => {
@@ -250,13 +250,38 @@ describe("subscription subprocess capability scope", () => {
     expect(() => parseChatgptSubscriptionAuth(Buffer.from(JSON.stringify({ ...validAuth, tokens: { ...validAuth.tokens, access_token: "sk-proj-api-key" } })).toString("base64"))).toThrow();
   });
 
-  it("rejects copied raw credential inputs before a Codex home is prepared", async () => {
+  it("ignores retired raw credential inputs in staged broker mode", async () => {
     vi.stubEnv("CODEX_ACCESS_TOKEN", "raw-access-token");
-    expect((await prepare()).error).toContain("configuration_missing");
-    vi.stubEnv("CODEX_ACCESS_TOKEN", undefined);
     vi.stubEnv("CODEX_AUTH_JSON", validAuthJson);
-    expect((await prepare()).error).toContain("configuration_missing");
-    expect(controller.acquire).not.toHaveBeenCalled();
+    vi.stubEnv("CODEX_AUTH_JSON_B64", validAuthB64);
+    expect((await prepare()).error).toBeUndefined();
+    expect(controller.acquire).toHaveBeenCalledTimes(1);
+  });
+
+  it("never invokes retired credential getters on the real prepare path", async () => {
+    const retired = new Set([
+      "CODEX_AUTH_JSON_B64", "CODEX_AUTH_JSON", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY",
+    ]);
+    const reads: string[] = [];
+    const environment = new Proxy<Record<string, string | undefined>>({
+      [CODEX_SESSION_SOURCE_ENV]: CODEX_SESSION_SOURCE,
+      PATH: process.env.PATH,
+    }, {
+      get(target, property) {
+        const name = String(property);
+        if (retired.has(name)) throw new Error(`retired getter invoked: ${name}`);
+        reads.push(name);
+        return target[name];
+      },
+    });
+    const result = await prepareSubscriptionEnv("codex", {
+      controller,
+      root: consumerRoot,
+      scope: "getter-trap",
+      environment,
+    });
+    expect(result.error).toBeUndefined();
+    expect(reads).not.toEqual(expect.arrayContaining([...retired]));
   });
 
   it("rejects acquisition before the controller when the broker selector is absent", async () => {
