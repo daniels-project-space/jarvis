@@ -13,6 +13,7 @@
     "probe:cloud-workspace-provider": "tsx scripts/probe-cloud-workspace-provider.ts"
   },
   "dependencies": {
+    "@ai-sdk/provider": "2.0.3",
     "@excalidraw/excalidraw": "^0.18.1",
     "@mastra/core": "1.52.0",
     "@openai/codex": "0.144.5",
@@ -21,6 +22,7 @@
     "@trigger.dev/sdk": "^4.5.1",
     "@vercel/sandbox": "2.8.0",
     "@xyflow/react": "^12.11.2",
+    "ajv": "8.20.0",
     "aws4fetch": "^1.0.20",
     "convex": "^1.42.1",
     "e2b": "2.35.0",
