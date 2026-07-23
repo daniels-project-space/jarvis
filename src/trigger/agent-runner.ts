@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any -- this production Trigger runner validates dynamic Convex envelopes at each authority boundary */
 import { metadata, schedules, task, timeout } from "@trigger.dev/sdk/v3";
 import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
