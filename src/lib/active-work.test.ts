@@ -37,8 +37,20 @@ function snapshot(stage = "dispatching"): CompactWorkSnapshot {
 describe("fleet snapshot continuity", () => {
   it("retains the whole same-thread projection through an unresolved refresh and provider handoff", () => {
     const dispatching = snapshot();
+    dispatching.fleet!.supervisor = {
+      protocolVersion: 1,
+      state: "needs_input",
+      inputRevision: 7,
+      question: "Which acceptance boundary should Jarvis use?",
+    };
     let cache: CompactWorkCache = cacheCompactWorkSnapshot(null, "thread-a", dispatching);
     expect(visibleWorkSnapshot(cache, "thread-a", undefined)).toBe(dispatching);
+    expect(visibleWorkSnapshot(cache, "thread-a", undefined).fleet?.supervisor).toEqual({
+      protocolVersion: 1,
+      state: "needs_input",
+      inputRevision: 7,
+      question: "Which acceptance boundary should Jarvis use?",
+    });
 
     const running = snapshot("testing");
     expect(visibleWorkSnapshot(cache, "thread-a", running)).toBe(running);

@@ -2,7 +2,15 @@ import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { CompactWorkSnapshot, FleetNode } from "../lib/active-work";
-import { FleetCommandCenter, FleetDag, fleetDagLayout, fleetNodeStateLabel } from "./CompactWorkBar";
+import {
+  FleetCommandCenter,
+  FleetDag,
+  fleetDagLayout,
+  fleetNodeStateLabel,
+  preserveSupervisorRequestKey,
+  supervisorControlPayload,
+  supervisorRequestIdentity,
+} from "./CompactWorkBar";
 
 const node = (overrides: Partial<FleetNode> = {}): FleetNode => ({
   id: "surface", jobId: "job-1", label: "Unified fleet surface", agent: "paul",
@@ -152,6 +160,159 @@ describe("FleetCommandCenter", () => {
     expect(expanded).toContain("0 active jobs · 1 planning");
     expect(expanded).not.toContain("data-active-job");
     expect(expanded).not.toContain("loading exact work detail");
+  });
+
+  it("renders the supervisor question and answer separately from steering without adding another surface", () => {
+    const planning = node({
+      id: "supervisor:mission-input",
+      jobId: "supervisor:mission-input",
+      label: "Planning · Choose the delivery boundary",
+      agent: "jarvis",
+      state: "needs_input",
+      status: "needs_input",
+      stage: "waiting for Daniel",
+      percent: 0,
+      progress: "",
+      progressAt: null,
+      workerRuntime: null,
+      workerRunId: null,
+      controls: [],
+      projectionKind: "supervisor_planning",
+      needsDaniel: true,
+    });
+    const snapshot: CompactWorkSnapshot = {
+      active: {
+        id: planning.jobId,
+        missionId: "mission-input",
+        label: planning.label,
+        status: "needs_input",
+        stage: planning.stage,
+        percent: 0,
+        extraCount: 0,
+        needsDaniel: true,
+      },
+      fleet: {
+        ...work.fleet!,
+        id: "mission-input",
+        goal: "Choose the delivery boundary",
+        mode: "supervised",
+        phase: "needs input",
+        percent: 0,
+        controls: ["provide_input", "cancel", "steer"],
+        supervisor: {
+          protocolVersion: 1,
+          state: "needs_input",
+          inputRevision: 7,
+          question: "Should Jarvis prepare a draft or a production delivery?",
+        },
+        nodes: [planning],
+        edges: [],
+      },
+      hierarchy: [{
+        id: "mission-input",
+        label: "Choose the delivery boundary",
+        status: "needs_input",
+        phase: "needs input",
+        projects: [{
+          id: "mission-input:planning",
+          canonicalProjectId: "planning",
+          repository: null,
+          jobs: [planning],
+        }],
+      }],
+    };
+
+    const markup = renderToStaticMarkup(
+      <FleetCommandCenter snapshot={snapshot} initialExpanded />,
+    );
+    expect(markup.match(/data-fleet-surface/g)).toHaveLength(1);
+    expect(markup.match(/data-supervisor-planning/g)).toHaveLength(1);
+    expect(markup).toContain('data-supervisor-authority="needs_input:7"');
+    expect(markup).toContain("Should Jarvis prepare a draft or a production delivery?");
+    expect(markup).toContain('data-supervisor-answer="true"');
+    expect(markup).toContain('aria-label="Answer Jarvis"');
+    expect(markup).toContain("send answer");
+    expect(markup).not.toContain('aria-label="Steering instruction"');
+    expect(markup).toMatch(/data-fleet-controls="true" class="[^"]*shrink-0/);
+    expect(markup).not.toContain("data-active-job");
+  });
+
+  it("builds exact supervisor payloads and preserves one key only across ambiguous retries", () => {
+    const request = {
+      missionId: "mission-supervised-1",
+      action: "provide_input" as const,
+      expectedInputRevision: 7,
+      input: "Use a production delivery.",
+    };
+    const first = supervisorRequestIdentity(
+      null,
+      request,
+      () => "11111111-1111-4111-8111-111111111111",
+    );
+    const retry = supervisorRequestIdentity(
+      first,
+      request,
+      () => "22222222-2222-4222-8222-222222222222",
+    );
+    const advancedDuringAmbiguousDispatch = supervisorRequestIdentity(
+      retry,
+      { ...request, expectedInputRevision: 8 },
+      () => "22222222-2222-4222-8222-222222222222",
+      true,
+    );
+    const changed = supervisorRequestIdentity(
+      advancedDuringAmbiguousDispatch,
+      {
+        ...request,
+        expectedInputRevision: 8,
+        input: "Prepare a draft only.",
+      },
+      () => "33333333-3333-4333-8333-333333333333",
+      true,
+    );
+    const changedAction = supervisorRequestIdentity(
+      advancedDuringAmbiguousDispatch,
+      {
+        missionId: request.missionId,
+        action: "cancel",
+        expectedInputRevision: 8,
+      },
+      () => "44444444-4444-4444-8444-444444444444",
+      true,
+    );
+    const changedMission = supervisorRequestIdentity(
+      advancedDuringAmbiguousDispatch,
+      { ...request, missionId: "mission-supervised-2" },
+      () => "55555555-5555-4555-8555-555555555555",
+      true,
+    );
+    expect(first.requestKey)
+      .toBe("ui:11111111-1111-4111-8111-111111111111");
+    expect(retry).toBe(first);
+    expect(advancedDuringAmbiguousDispatch).toBe(first);
+    expect(advancedDuringAmbiguousDispatch.request.expectedInputRevision)
+      .toBe(7);
+    expect(changed.requestKey)
+      .toBe("ui:33333333-3333-4333-8333-333333333333");
+    expect(changedAction.requestKey)
+      .toBe("ui:44444444-4444-4444-8444-444444444444");
+    expect(changedMission.requestKey)
+      .toBe("ui:55555555-5555-4555-8555-555555555555");
+    expect(supervisorControlPayload(
+      advancedDuringAmbiguousDispatch.request,
+      first.requestKey,
+    )).toEqual({
+      protocol: "supervisor_v1",
+      missionId: "mission-supervised-1",
+      action: "provide_input",
+      requestKey: first.requestKey,
+      expectedInputRevision: 7,
+      input: "Use a production delivery.",
+    });
+    expect(preserveSupervisorRequestKey(null)).toBe(true);
+    expect(preserveSupervisorRequestKey(503)).toBe(true);
+    expect(preserveSupervisorRequestKey(200)).toBe(false);
+    expect(preserveSupervisorRequestKey(409)).toBe(false);
   });
 
   it("does not auto-open a resolved mission from before this browser session", () => {

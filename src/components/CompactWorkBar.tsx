@@ -4,7 +4,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRealtimeRun } from "@trigger.dev/react-hooks";
 import { parseTerminalOutput, type TerminalTone } from "../lib/terminal-output";
 import { viewerFetch } from "../lib/viewer-request";
-import type { CompactJobDetail, CompactWorkSnapshot, FleetControl, FleetEdge, FleetNode } from "../lib/active-work";
+import type {
+  CompactJobDetail,
+  CompactWorkSnapshot,
+  FleetControl,
+  FleetEdge,
+  FleetNode,
+  FleetSupervisorAuthority,
+} from "../lib/active-work";
 
 const TONE: Record<TerminalTone, string> = {
   neutral: "text-slate-200/90", muted: "text-slate-500", command: "text-sky-300",
@@ -208,30 +215,227 @@ function LazyWorkerLog({ node }: { node: FleetNode }) {
   </>;
 }
 
-function Controls({ controls, target, onError }: { controls: FleetControl[]; target: { jobId?: string; missionId?: string }; onError: (value: string) => void }) {
+type SupervisorControlAction = Extract<
+  FleetControl,
+  "pause" | "resume" | "cancel" | "steer" | "provide_input"
+>;
+
+type ControlTarget = {
+  jobId?: string;
+  missionId?: string;
+  supervisor?: FleetSupervisorAuthority;
+};
+
+export type PendingSupervisorRequest = {
+  signature: string;
+  contentSignature: string;
+  requestKey: string;
+  request: SupervisorRequestContent;
+};
+
+export type SupervisorRequestContent = {
+  missionId: string;
+  action: SupervisorControlAction;
+  expectedInputRevision: number;
+  input?: string;
+};
+
+const SUPERVISOR_CONTROL_ACTIONS = new Set<FleetControl>([
+  "pause",
+  "resume",
+  "cancel",
+  "steer",
+  "provide_input",
+]);
+
+export function isSupervisorControlAction(
+  action: FleetControl,
+): action is SupervisorControlAction {
+  return SUPERVISOR_CONTROL_ACTIONS.has(action);
+}
+
+function supervisorRequestSignature(request: SupervisorRequestContent) {
+  return JSON.stringify([
+    request.missionId,
+    request.action,
+    request.expectedInputRevision,
+    request.input?.trim() ?? null,
+  ]);
+}
+
+function supervisorRequestContentSignature(request: SupervisorRequestContent) {
+  return JSON.stringify([
+    request.missionId,
+    request.action,
+    request.input?.trim() ?? null,
+  ]);
+}
+
+export function supervisorRequestIdentity(
+  current: PendingSupervisorRequest | null,
+  request: SupervisorRequestContent,
+  createUuid: () => string = () => crypto.randomUUID(),
+  replayAmbiguous = false,
+): PendingSupervisorRequest {
+  const normalized = {
+    ...request,
+    ...(request.input === undefined ? {} : { input: request.input.trim() }),
+  };
+  const signature = supervisorRequestSignature(normalized);
+  const contentSignature = supervisorRequestContentSignature(normalized);
+  return current?.signature === signature
+    || (
+      replayAmbiguous
+      && current?.contentSignature === contentSignature
+    )
+    ? current
+    : {
+      signature,
+      contentSignature,
+      requestKey: `ui:${createUuid()}`,
+      request: normalized,
+    };
+}
+
+export function preserveSupervisorRequestKey(
+  responseStatus: number | null,
+): boolean {
+  return responseStatus === null || responseStatus === 503;
+}
+
+export function supervisorControlPayload(
+  request: SupervisorRequestContent,
+  requestKey: string,
+) {
+  const acceptsInput = request.action === "steer"
+    || request.action === "provide_input";
+  return {
+    protocol: "supervisor_v1" as const,
+    missionId: request.missionId,
+    action: request.action,
+    requestKey,
+    expectedInputRevision: request.expectedInputRevision,
+    ...(acceptsInput ? { input: request.input?.trim() ?? "" } : {}),
+  };
+}
+
+function Controls({ controls, target, onError }: { controls: FleetControl[]; target: ControlTarget; onError: (value: string) => void }) {
   const [acting, setActing] = useState("");
   const [steering, setSteering] = useState(false);
-  const [input, setInput] = useState("");
-  const apply = async (action: FleetControl) => {
-    if (action === "steer" && !input.trim()) { setSteering(true); return; }
+  const [steeringInput, setSteeringInput] = useState("");
+  const [answerInput, setAnswerInput] = useState("");
+  const pendingSupervisorRequest = useRef<PendingSupervisorRequest | null>(null);
+  const [retryableSupervisorRequest, setRetryableSupervisorRequest] =
+    useState<PendingSupervisorRequest | null>(null);
+  const clearPendingSupervisorRequest = () => {
+    pendingSupervisorRequest.current = null;
+    setRetryableSupervisorRequest(null);
+  };
+  const apply = async (
+    action: FleetControl,
+    exactRetry?: PendingSupervisorRequest,
+  ) => {
+    const input = exactRetry?.request.input ?? (action === "steer"
+      ? steeringInput.trim()
+      : action === "provide_input"
+        ? answerInput.trim()
+        : undefined);
+    if (action === "steer" && !input) { setSteering(true); return; }
+    if (action === "provide_input" && !input) {
+      onError("Answer Jarvis before sending this control.");
+      return;
+    }
+    let body: Record<string, unknown>;
+    const supervisor = target.supervisor;
+    const supervisorRequest = supervisor !== undefined
+      || exactRetry !== undefined;
+    if (supervisorRequest) {
+      if (!target.missionId || !isSupervisorControlAction(action)) {
+        onError("This control is outside the supervised mission authority.");
+        return;
+      }
+      if (
+        exactRetry
+        && exactRetry.request.missionId !== target.missionId
+      ) {
+        onError("This retry belongs to a different supervised mission.");
+        return;
+      }
+      if (!exactRetry && !supervisor) {
+        onError("The current supervisor authority has not loaded.");
+        return;
+      }
+      const identity = exactRetry ?? supervisorRequestIdentity(
+        pendingSupervisorRequest.current,
+        {
+          missionId: target.missionId,
+          action,
+          expectedInputRevision: supervisor!.inputRevision,
+          ...(input === undefined ? {} : { input }),
+        },
+        undefined,
+        retryableSupervisorRequest !== null,
+      );
+      pendingSupervisorRequest.current = identity;
+      if (identity !== retryableSupervisorRequest) {
+        setRetryableSupervisorRequest(null);
+      }
+      body = supervisorControlPayload(identity.request, identity.requestKey);
+    } else {
+      if (action === "provide_input") {
+        onError("Supervisor input requires an exact mission authority.");
+        return;
+      }
+      body = {
+        ...target,
+        action,
+        ...(action === "steer" ? { input } : {}),
+      };
+    }
     setActing(action);
     onError("");
     try {
       const response = await viewerFetch("/api/work-control", {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ...target, action, ...(action === "steer" ? { input: input.trim() } : {}) }),
+        body: JSON.stringify(body),
       });
       const payload = await response.json().catch(() => ({}));
+      if (supervisorRequest) {
+        if (preserveSupervisorRequestKey(response.status)) {
+          setRetryableSupervisorRequest(
+            pendingSupervisorRequest.current,
+          );
+        } else {
+          clearPendingSupervisorRequest();
+        }
+      }
       if (!response.ok || payload?.ok !== true) onError(String(payload?.error ?? `The controller rejected ${action}.`));
-      else { setSteering(false); setInput(""); }
+      else {
+        setSteering(false);
+        setSteeringInput("");
+        setAnswerInput("");
+      }
     } catch (error) {
+      // A transport failure has an ambiguous outcome. Retain the exact key so
+      // the next click replays the same immutable Convex control receipt.
+      if (supervisorRequest) {
+        setRetryableSupervisorRequest(pendingSupervisorRequest.current);
+      }
       onError(String(error instanceof Error ? error.message : "The authenticated controller could not be reached."));
     } finally { setActing(""); }
   };
   return <div className="space-y-2">
-    {steering && <div className="flex gap-1"><input aria-label="Steering instruction" value={input} onChange={(event) => setInput(event.target.value)} maxLength={2000} placeholder="Adjust the unfinished boundary…" className="min-w-0 flex-1 rounded-lg border border-white/10 bg-black/25 px-2 py-1 text-[10px] text-ice outline-none focus:border-cyan/40" /><button type="button" disabled={!input.trim() || Boolean(acting)} onClick={() => void apply("steer")} className="rounded-lg border border-cyan/25 px-2 text-[9px] text-cyan disabled:opacity-40">send</button></div>}
+    {retryableSupervisorRequest && <div data-supervisor-retry className="flex items-center gap-2 rounded-lg border border-amber/25 bg-amber/[0.07] px-2 py-1.5 text-[9px] text-amber"><span className="min-w-0 flex-1">The last control may already be recorded.</span><button type="button" disabled={Boolean(acting)} onClick={() => void apply(retryableSupervisorRequest.request.action, retryableSupervisorRequest)} className="shrink-0 rounded-md border border-amber/30 px-2 py-1 disabled:opacity-40">{acting ? "retrying…" : "retry exact control"}</button></div>}
+    {target.supervisor && <div data-supervisor-authority={`${target.supervisor.state}:${target.supervisor.inputRevision}`} className="rounded-lg border border-cyan/15 bg-cyan/[0.035] p-2">
+      <div className="font-mono text-[7px] uppercase tracking-[0.1em] text-cyan/60">supervisor · {target.supervisor.state} · revision {target.supervisor.inputRevision}</div>
+      {controls.includes("provide_input") && <div data-supervisor-answer className="mt-1.5">
+        <div data-supervisor-question className="mb-1 text-[10px] leading-snug text-amber">{target.supervisor.question?.trim() || "Jarvis needs your answer before planning can continue."}</div>
+        <div className="flex gap-1"><input aria-label="Answer Jarvis" value={answerInput} disabled={Boolean(acting)} onChange={(event) => { clearPendingSupervisorRequest(); setAnswerInput(event.target.value); }} maxLength={2000} placeholder="Answer this planning question…" className="min-w-0 flex-1 rounded-lg border border-amber/20 bg-black/25 px-2 py-1 text-[10px] text-ice outline-none focus:border-amber/45 disabled:opacity-50" /><button type="button" disabled={!answerInput.trim() || Boolean(acting)} onClick={() => void apply("provide_input")} className="rounded-lg border border-amber/25 px-2 text-[9px] text-amber disabled:opacity-40">{acting === "provide_input" ? "sending…" : "send answer"}</button></div>
+      </div>}
+    </div>}
+    {steering && <div className="flex gap-1"><input aria-label="Steering instruction" value={steeringInput} disabled={Boolean(acting)} onChange={(event) => { clearPendingSupervisorRequest(); setSteeringInput(event.target.value); }} maxLength={2000} placeholder="Adjust the unfinished boundary…" className="min-w-0 flex-1 rounded-lg border border-white/10 bg-black/25 px-2 py-1 text-[10px] text-ice outline-none focus:border-cyan/40 disabled:opacity-50" /><button type="button" disabled={!steeringInput.trim() || Boolean(acting)} onClick={() => void apply("steer")} className="rounded-lg border border-cyan/25 px-2 text-[9px] text-cyan disabled:opacity-40">send steer</button></div>}
     <div className="flex flex-wrap justify-end gap-1">
-      {controls.map((control) => <button key={control} type="button" disabled={Boolean(acting)} onClick={() => void apply(control)} className={`rounded-lg border px-2 py-1 text-[8px] uppercase tracking-[0.12em] disabled:opacity-40 ${control === "cancel" || control === "decline" ? "border-rose-400/20 text-rose-300" : "border-white/10 text-slate hover:border-cyan/30 hover:text-cyan"}`}>{acting === control ? "working…" : control}</button>)}
+      {controls.filter((control) => control !== "provide_input").map((control) => <button key={control} type="button" disabled={Boolean(acting)} onClick={() => void apply(control)} className={`rounded-lg border px-2 py-1 text-[8px] uppercase tracking-[0.12em] disabled:opacity-40 ${control === "cancel" || control === "decline" ? "border-rose-400/20 text-rose-300" : "border-white/10 text-slate hover:border-cyan/30 hover:text-cyan"}`}>{acting === control ? "working…" : control.replaceAll("_", " ")}</button>)}
     </div>
   </div>;
 }
@@ -249,7 +453,7 @@ function WorkerDetail({ node, onBack }: { node: FleetNode; onBack: () => void })
     {node.attentionReason && <div className="rounded-lg border border-amber/20 bg-amber/[0.06] px-2 py-1 text-[9px] text-amber">Needs Daniel · {node.attentionReason}</div>}
     <LazyWorkerLog node={node} />
     {error && <div role="alert" data-control-error className="rounded-lg border border-rose-400/25 bg-rose-400/[0.07] px-2 py-1 text-[9px] text-rose-300">{error}</div>}
-    <Controls controls={node.controls} target={{ jobId: node.jobId }} onError={setError} />
+    <Controls key={`job:${node.jobId}`} controls={node.controls} target={{ jobId: node.jobId }} onError={setError} />
   </section>;
 }
 
@@ -330,7 +534,7 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
           </section>
         </div>}
       </div>
-      {!selectedId && fleet.controls.length > 0 && <footer className="mt-2 shrink-0 border-t border-white/[0.07] pt-2">{controlError && <div role="alert" data-control-error className="mb-2 rounded-lg border border-rose-400/25 bg-rose-400/[0.07] px-2 py-1 text-[9px] text-rose-300">{controlError}</div>}<Controls controls={fleet.controls} target={fleet.id.startsWith("work:") ? { jobId: active.id } : { missionId: fleet.id }} onError={setControlError} /></footer>}
+      {!selectedId && (fleet.controls.length > 0 || fleet.supervisor) && <footer data-fleet-controls className="mt-2 shrink-0 border-t border-white/[0.07] pt-2">{controlError && <div role="alert" data-control-error className="mb-2 rounded-lg border border-rose-400/25 bg-rose-400/[0.07] px-2 py-1 text-[9px] text-rose-300">{controlError}</div>}<Controls key={fleet.id.startsWith("work:") ? `job:${active.id}` : `mission:${fleet.id}`} controls={fleet.controls} target={fleet.id.startsWith("work:") ? { jobId: active.id } : { missionId: fleet.id, supervisor: fleet.supervisor }} onError={setControlError} /></footer>}
     </aside>
   );
 }

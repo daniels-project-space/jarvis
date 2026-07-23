@@ -10,7 +10,21 @@ export type FleetNodeState =
   | "blocked"
   | "needs_input";
 
-export type FleetControl = "pause" | "resume" | "cancel" | "steer" | "approve" | "decline";
+export type FleetControl =
+  | "pause"
+  | "resume"
+  | "cancel"
+  | "steer"
+  | "provide_input"
+  | "approve"
+  | "decline";
+
+export type FleetSupervisorAuthority = {
+  protocolVersion: 1;
+  state: "ready" | "leased" | "waiting" | "paused" | "needs_input" | "terminal";
+  inputRevision: number;
+  question?: string;
+};
 
 export type CompactWorkItem = {
   id: string;
@@ -76,6 +90,7 @@ export type FleetMission = {
   integrationState: string;
   attentionCount: number;
   controls: FleetControl[];
+  supervisor?: FleetSupervisorAuthority;
   nodes: FleetNode[];
   edges: FleetEdge[];
 };
