@@ -579,6 +579,28 @@ type AgentHarnessOptions = {
   onProgress?: (progress: AgentProgress) => void;
 };
 
+export type AgentRunnerBoundaryObservation = Readonly<{
+  phase: string;
+  authorityDigest: string;
+  workOrderRevisionId: string;
+  workOrderRevision: number;
+  workOrderRevisionDigest: string;
+  schedulingBindingDigest: string;
+  repository: string | null;
+  sourceBranch: string | null;
+  sourceHeadSha: string | null;
+}>;
+
+// Production calls this no-op observer at the exact claim/effect seam. Tests
+// may replace it with an in-memory transport; it receives no credentials and
+// cannot authorize or perform an effect.
+let authorityBoundaryObserver: (observation: AgentRunnerBoundaryObservation) => void = () => {};
+export function setAgentRunnerBoundaryObserverForTest(
+  observer?: (observation: AgentRunnerBoundaryObservation) => void,
+) {
+  authorityBoundaryObserver = observer ?? (() => {});
+}
+
 // Cheap controller duties run once per minute, independently of specialist
 // containers. This keeps reminders, recovery and incident dispatch alive even
 // when no Codex job happens to be running.
@@ -718,19 +740,49 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       workerRunId: options.reservation.workerRunId,
     }).catch(() => null);
     if (!job) return { processed: 0, stale: true };
+    if (job.executable === false || job.held === true) return {
+      processed: 0,
+      executable: false,
+      held: true,
+      code: String(job.code ?? "authority_held"),
+    };
     let processed = 1;
     const expectedAttempt = Number(job.attempt ?? 1);
     const authorityDigest = typeof job.authorityDigest === "string" ? job.authorityDigest : "";
     const authorizeBoundary = async (phase:
       "source_checkout" | "provider_create" | "codex_start" | "codex_resume"
       | "checkpoint" | "review_receipt" | "integration" | "delivery",
-    ) => await convexMutation("jobs:authorizeExecutionBoundary", {
-      jobId: job.jobId,
-      expectedAttempt,
-      workerRunId: options.reservation.workerRunId,
-      authorityDigest,
-      phase,
-    }).catch(() => null);
+    ) => {
+      const boundary: any = await convexMutation("jobs:authorizeExecutionBoundary", {
+        jobId: job.jobId,
+        expectedAttempt,
+        workerRunId: options.reservation.workerRunId,
+        authorityDigest,
+        phase,
+      }).catch(() => null);
+      if (!boundary
+        || boundary.phase !== phase
+        || boundary.authorityDigest !== authorityDigest
+        || boundary.schedulingBindingDigest !== job.schedulingBindingDigest
+        || boundary.workOrderRevisionId !== job.workOrderRevisionId
+        || Number(boundary.workOrderRevision) !== Number(job.workOrderRevision)
+        || boundary.workOrderRevisionDigest !== job.workOrderRevisionDigest
+        || boundary.repository !== (job.repo ?? null)
+        || boundary.sourceBranch !== (job.sourceBranch ?? null)
+        || boundary.sourceHeadSha !== (job.sourceHeadSha ?? null)) return null;
+      authorityBoundaryObserver({
+        phase,
+        authorityDigest: boundary.authorityDigest,
+        schedulingBindingDigest: boundary.schedulingBindingDigest,
+        workOrderRevisionId: String(boundary.workOrderRevisionId),
+        workOrderRevision: Number(boundary.workOrderRevision),
+        workOrderRevisionDigest: boundary.workOrderRevisionDigest,
+        repository: boundary.repository,
+        sourceBranch: boundary.sourceBranch,
+        sourceHeadSha: boundary.sourceHeadSha,
+      });
+      return boundary;
+    };
     const failClaimed = async (error: string) => {
       await convexMutation("jobs:checkpointAndRequeue", {
         jobId: job.jobId,

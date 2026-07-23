@@ -1183,6 +1183,12 @@ export const claimDispatched = mutation({
     requireWorker(a.workerToken);
     const now = Date.now();
     const j: any = await ctx.db.get(a.jobId);
+    if (j && j.admissionProtocolVersion !== 2) return {
+      executable: false,
+      held: true,
+      code: "protocol_v1_admission_held",
+      jobId: j._id,
+    } as any;
     if (j && !await readJobSchedulingAuthority(ctx, j)) {
       await quarantineJobRuntime(ctx, j);
       return null;

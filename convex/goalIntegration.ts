@@ -1059,6 +1059,8 @@ export const complete = mutation({
     });
     const prior = await ctx.db.query("workReceipts")
       .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", attempt.workAttempt)).first();
+    const acceptedResult = String(job.result ?? "").slice(0, 4_000);
+    const acceptedEvidence = String(job.verificationNote ?? "").slice(0, 1_000);
     if (!prior) await ctx.db.insert("workReceipts", {
       jobId: job._id, attempt: attempt.workAttempt, status: terminalOutcome === "integrated" ? "succeeded" : terminalOutcome,
       authorityDigest: attempt.authorityDigest,
@@ -1072,7 +1074,9 @@ export const complete = mutation({
       artifacts: [attempt.workerBranch, attempt.integrationBranch, attempt.preparedIntegrationHeadSha],
       verification: "pass", deliveryOutcome: terminalOutcome === "integrated" ? "mission_integrated" : terminalOutcome,
       terminalEventKey: `integration:${String(attempt._id)}:integrated`,
-      resultDigest: terminal.receiptDigest, evidenceDigest: attempt.reviewReceiptDigest,
+      // The integration receipt has its own exact identity/digest. The work
+      // receipt continues to bind the accepted terminal result and evidence.
+      resultDigest: await sha256Hex(acceptedResult), evidenceDigest: await sha256Hex(acceptedEvidence),
       reviewReceiptSignature: job.reviewReceiptSignature, reviewDiffSha256: attempt.reviewedDiffSha256,
       reviewReceiptId: attempt.reviewReceiptId, reviewReceiptDigest: attempt.reviewReceiptDigest, createdAt: now,
     });

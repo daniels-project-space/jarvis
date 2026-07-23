@@ -706,7 +706,9 @@ async function validatorTaskForMission(ctx: any, mission: any, jobs: any[]): Pro
       Promise.all(mission.splitChildMissionIds.slice(0, GOAL_DAG_MAX_NODES).map((id: any) => ctx.db.get(id))),
     ]);
     if (nodes.length !== mission.planNodeCount || handoffs.length !== nodes.length
-      || nodes.length > GOAL_DAG_MAX_NODES || handoffs.some((row: any) => row.planDigest !== mission.planDigest)) {
+      || nodes.length > GOAL_DAG_MAX_NODES || handoffs.some((row: any) => row.handoffProtocolVersion !== 2
+        || typeof row.handoffPayloadDigest !== "string" || typeof row.workReceiptDigest !== "string"
+        || row.planDigest !== mission.planDigest)) {
       throw new Error("Parent validation requires one current immutable handoff per accepted plan node");
     }
     const byNode = new Map(handoffs.map((row: any) => [row.sourceNodeId, row]));
@@ -714,7 +716,7 @@ async function validatorTaskForMission(ctx: any, mission: any, jobs: any[]): Pro
       const handoff: any = byNode.get(node.nodeId);
       return {
         label: `${node.label} [${node.repository ?? "read-only"}]`, status: "done",
-        result: `${handoff.summary}\nReceipts: review=${handoff.reviewReceiptDigest ?? "n/a"}; integration=${handoff.integrationReceiptDigest ?? "n/a"}; result=${handoff.resultDigest}`,
+        result: `${handoff.summary}\nReceipts: work=${handoff.workReceiptDigest}; review=${handoff.reviewReceiptDigest ?? "n/a"}; integration=${handoff.integrationTerminalReceiptDigest ?? "n/a"}; result=${handoff.acceptedResultDigest}`,
       };
     });
     auditSnapshot = JSON.stringify({
@@ -727,10 +729,10 @@ async function validatorTaskForMission(ctx: any, mission: any, jobs: any[]): Pro
           attempt: (byNode.get(node.nodeId) as any).sourceAttempt,
           steerRevision: (byNode.get(node.nodeId) as any).sourceSteerRevision,
           reviewReceiptDigest: (byNode.get(node.nodeId) as any).reviewReceiptDigest ?? null,
-          integrationReceiptDigest: (byNode.get(node.nodeId) as any).integrationReceiptDigest ?? null,
+          integrationReceiptDigest: (byNode.get(node.nodeId) as any).integrationTerminalReceiptDigest ?? null,
           integrationHeadSha: (byNode.get(node.nodeId) as any).integrationHeadSha ?? null,
           artifacts: (byNode.get(node.nodeId) as any).artifactRefs,
-          resultDigest: (byNode.get(node.nodeId) as any).resultDigest,
+          resultDigest: (byNode.get(node.nodeId) as any).acceptedResultDigest,
         } : null })),
       children: children.filter(Boolean).map((child: any) => ({ id: String(child._id), repository: child.primaryRepo ?? null,
         status: child.status, integrationBranch: child.integrationBranch ?? null, integrationHeadSha: child.integrationHeadSha ?? null })),
@@ -1395,7 +1397,9 @@ export const dagProjection = query({
       .withIndex("by_job", (q: any) => q.eq("jobId", node.jobId)).first()));
     const validHandoffs = new Set(handoffs.filter((handoff: any) => {
       const activity = activities.find((row: any) => row?.jobId === handoff.sourceJobId);
-      return activity && handoff.planDigest === mission.planDigest
+      return activity && handoff.handoffProtocolVersion === 2
+        && typeof handoff.handoffPayloadDigest === "string" && typeof handoff.workReceiptDigest === "string"
+        && handoff.planDigest === mission.planDigest
         && Number(handoff.sourceAttempt) === Number(activity.attempt ?? 1)
         && Number(handoff.sourceSteerRevision) === Number(activity.steerRevision ?? 0);
     }).map((handoff: any) => String(handoff.sourceJobId)));

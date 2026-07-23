@@ -138,7 +138,8 @@ describe("commandCenter relevance and bounded projection", () => {
         runtime({ jobId: "job-a", status: "done", deliveryStatus: "merged", attempt: 2, steerRevision: 1, workerRuntime: "trigger" }),
         runtime({ jobId: "job-b", status: "needs_input", integrationState: "needs_attention", stallReason: "Merge conflict needs a decision", approvalRequired: true, approvalStatus: "pending", risk: "high", task: "x".repeat(1000), log: "private", checkpoint: "private" }),
       ],
-      handoffs: [{ sourceJobId: "job-a", sourceAttempt: 2, sourceSteerRevision: 1, planDigest: "digest" }],
+      handoffs: [{ sourceJobId: "job-a", sourceAttempt: 2, sourceSteerRevision: 1, planDigest: "digest",
+        handoffProtocolVersion: 2, handoffPayloadDigest: "a".repeat(64), workReceiptDigest: "b".repeat(64) }],
     });
     expect(result.active).toMatchObject({ needsDaniel: true, extraCount: 0 });
     expect(result.fleet).toMatchObject({ planDigest: "digest", planGeneration: 3, attentionCount: 1 });

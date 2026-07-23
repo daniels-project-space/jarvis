@@ -880,10 +880,20 @@ export async function promoteCompletedJobDependents(ctx: any, source: any, now =
         .withIndex("by_source_attempt", (q: any) => q.eq("sourceJobId", dependency._id)
           .eq("sourceAttempt", Number(dependency.attempt ?? 1))
           .eq("planGeneration", Number(target.planGeneration))).first();
-      if (!handoff || handoff.parentMissionId !== target.planParentMissionId
+      if (!handoff || handoff.handoffProtocolVersion !== 2
+        || typeof handoff.handoffPayloadDigest !== "string"
+        || typeof handoff.workReceiptId !== "string" || typeof handoff.workReceiptDigest !== "string"
+        || handoff.parentMissionId !== target.planParentMissionId
         || handoff.planDigest !== target.planDigest || handoff.sourceNodeId !== dependency.planNodeId
         || handoff.sourceJobId !== dependency._id
+        || handoff.workOrderRevisionId !== dependency.workOrderRevisionId
+        || Number(handoff.workOrderRevision) !== Number(dependency.workOrderRevision)
         || handoff.workOrderRevisionDigest !== dependency.workOrderRevisionDigest
+        || (dependency.repo && (handoff.reviewReceiptId !== dependency.reviewReceiptId
+          || handoff.reviewReceiptDigest !== dependency.reviewReceiptDigest))
+        || (dependency.repo && !dependency.readonly && (handoff.integrationAttemptId !== dependency.integrationAttemptId
+          || typeof handoff.integrationTerminalReceiptId !== "string"
+          || typeof handoff.integrationTerminalReceiptDigest !== "string"))
         || Number(handoff.sourceSteerRevision) !== Number(dependency.steerRevision ?? 0)) {
         sealed = false;
         break;

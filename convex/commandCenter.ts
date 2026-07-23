@@ -291,6 +291,9 @@ export function buildFleetSnapshot(input: {
   const validHandoffs = new Set((input.handoffs ?? []).filter((handoff) => {
     const activity = activityByJob.get(String(handoff.sourceJobId));
     return activity
+      && handoff.handoffProtocolVersion === 2
+      && typeof handoff.handoffPayloadDigest === "string"
+      && typeof handoff.workReceiptDigest === "string"
       && (!input.mission?.planDigest || handoff.planDigest === input.mission.planDigest)
       && Number(handoff.sourceAttempt) === Number(activity.attempt ?? 1)
       && Number(handoff.sourceSteerRevision) === Number(activity.steerRevision ?? 0);

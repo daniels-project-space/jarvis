@@ -58,7 +58,7 @@ vi.mock("./cloud-workspace-providers", async (importOriginal) => ({
   configuredCloudWorkspaceProvider: boundaries.configuredCloudWorkspaceProvider,
 }));
 
-import { agentWorker } from "./agent-runner";
+import { agentWorker, setAgentRunnerBoundaryObserverForTest } from "./agent-runner";
 
 const modules = import.meta.glob("../../convex/**/*.ts");
 const WORKER = "production-runner-authority-worker";
@@ -67,11 +67,12 @@ type HarnessConvex = TestConvex<typeof schema>;
 
 type MutationTrace = { path: string; args: Record<string, unknown> };
 
-function bridgeProductionRunnerToConvex(t: HarnessConvex) {
+function bridgeProductionRunnerToConvex(t: HarnessConvex, beforeCall?: (call: MutationTrace) => Promise<void>) {
   const trace: MutationTrace[] = [];
   const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body ?? "{}")) as MutationTrace;
     trace.push({ path: body.path, args: body.args });
+    await beforeCall?.(body);
     let value: unknown;
     switch (body.path) {
       case "jobs:claimDispatched":
@@ -131,11 +132,13 @@ beforeEach(() => {
   trigger.batchTrigger.mockClear();
   trigger.metadata.set.mockClear();
   trigger.metadata.flush.mockClear();
+  setAgentRunnerBoundaryObserverForTest();
 });
 
 afterEach(() => {
   delete process.env.JARVIS_WORKER_TOKEN;
   vi.unstubAllGlobals();
+  setAgentRunnerBoundaryObserverForTest();
 });
 
 describe("production Trigger worker authority harness", () => {
@@ -186,6 +189,8 @@ describe("production Trigger worker authority harness", () => {
     const { jobId, reservation } = await reservedWritableJob(t, "runner-payload-forgery");
     const before = await t.run(async (ctx) => ctx.db.get(jobId));
     const bridge = bridgeProductionRunnerToConvex(t);
+    const boundariesSeen: Array<Record<string, unknown>> = [];
+    setAgentRunnerBoundaryObserverForTest((boundary) => boundariesSeen.push(boundary));
 
     const result = await invokeProductionWorker({
       jobId: String(jobId),
@@ -238,7 +243,87 @@ describe("production Trigger worker authority harness", () => {
       workerRunId: "trigger-authoritative-run",
       status: "checkpointed",
     });
+    expect(boundariesSeen).toEqual([{
+      phase: "codex_start",
+      authorityDigest: state.attempts[0]?.authorityDigest,
+      schedulingBindingDigest: state.attempts[0]?.schedulingBindingDigest,
+      workOrderRevisionId: String(state.attempts[0]?.workOrderRevisionId),
+      workOrderRevision: state.attempts[0]?.workOrderRevision,
+      workOrderRevisionDigest: state.attempts[0]?.workOrderRevisionDigest,
+      repository: REPO,
+      sourceBranch: state.attempts[0]?.sourceBranch,
+      sourceHeadSha: state.attempts[0]?.sourceHeadSha,
+    }]);
     expect(state.attempts[1]).toMatchObject({ attempt: 2, status: "pending" });
     expect(state.attempts[1]?.workerRunId).toBeUndefined();
+  });
+
+  it("returns a typed hold for a realistic legacy Trigger delivery before subscription or provider startup", async () => {
+    const t = convexTest(schema, modules);
+    const jobId = await t.mutation(api.jobs.enqueue, {
+      task: "legacy work admitted before protocol v2",
+      repo: REPO,
+      workerToken: WORKER,
+    }) as Id<"jobs">;
+    const dispatchId = "legacy-dispatch-from-old-production";
+    await t.run(async (ctx) => ctx.db.patch(jobId, {
+      status: "dispatching",
+      stage: "dispatching",
+      dispatchId,
+      dispatchLeaseUntil: Date.now() + 60_000,
+    }));
+    const bridge = bridgeProductionRunnerToConvex(t);
+
+    const result = await invokeProductionWorker({ jobId: String(jobId), dispatchId }, "legacy-trigger-replay");
+
+    expect(result).toMatchObject({
+      processed: 0,
+      executable: false,
+      held: true,
+      code: "protocol_v1_admission_held",
+      runtime: "trigger",
+    });
+    expect(bridge.trace.map((entry) => entry.path)).toEqual([
+      "jobs:claimDispatched",
+      "jobs:reserveDispatchBatch",
+    ]);
+    expect(boundaries.resolveSubscriptionAgentBin).not.toHaveBeenCalled();
+    expect(boundaries.configuredCloudWorkspaceProvider).not.toHaveBeenCalled();
+  });
+
+  it("fences a source-head change between claim and Codex authorization through the production task", async () => {
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-source-head-race");
+    let mutated = false;
+    const bridge = bridgeProductionRunnerToConvex(t, async (call) => {
+      if (call.path !== "jobs:authorizeExecutionBoundary" || mutated) return;
+      mutated = true;
+      await t.run(async (ctx) => ctx.db.patch(jobId, { sourceHeadSha: "f".repeat(40) }));
+    });
+
+    const result = await invokeProductionWorker({
+      jobId: String(jobId), dispatchId: reservation.dispatchId,
+    }, "trigger-source-head-race");
+
+    expect(result).toMatchObject({
+      processed: 1, stale: true,
+      error: "immutable attempt authority rejected before Codex preflight",
+      runtime: "trigger",
+    });
+    expect(bridge.trace.map((entry) => entry.path)).toEqual([
+      "jobs:claimDispatched",
+      "jobs:authorizeExecutionBoundary",
+      "jobs:reserveDispatchBatch",
+    ]);
+    expect(boundaries.resolveSubscriptionAgentBin).not.toHaveBeenCalled();
+    expect(boundaries.configuredCloudWorkspaceProvider).not.toHaveBeenCalled();
+    expect(trigger.batchTrigger).not.toHaveBeenCalled();
+    const state = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      attempt: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1)).first(),
+    }));
+    expect(state.job).toMatchObject({ status: "running", workerRunId: "trigger-source-head-race" });
+    expect(state.attempt).toMatchObject({ status: "running", workerRunId: "trigger-source-head-race" });
   });
 });

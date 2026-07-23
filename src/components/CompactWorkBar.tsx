@@ -185,11 +185,9 @@ function SubscribedWorker({ node, accessToken }: { node: FleetNode; accessToken:
 }
 
 function LazyWorkerLog({ node }: { node: FleetNode }) {
-  const [token, setToken] = useState("");
-  const [error, setError] = useState("");
+  const streamKey = `${node.jobId}:${node.workerRunId ?? "durable"}`;
+  const [stream, setStream] = useState({ key: "", token: "", error: "" });
   useEffect(() => {
-    setToken("");
-    setError("");
     if (!node.workerRunId) return;
     const abort = new AbortController();
     void viewerFetch("/api/work-realtime", {
@@ -198,14 +196,15 @@ function LazyWorkerLog({ node }: { node: FleetNode }) {
     }).then(async (response) => {
       const payload = await response.json().catch(() => ({}));
       if (abort.signal.aborted) return;
-      if (!response.ok || typeof payload?.accessToken !== "string") setError("Realtime stream is unavailable; showing the last durable progress.");
-      else setToken(payload.accessToken);
-    }).catch(() => { if (!abort.signal.aborted) setError("Realtime stream is unavailable; showing the last durable progress."); });
+      if (!response.ok || typeof payload?.accessToken !== "string") setStream({ key: streamKey, token: "", error: "Realtime stream is unavailable; showing the last durable progress." });
+      else setStream({ key: streamKey, token: payload.accessToken, error: "" });
+    }).catch(() => { if (!abort.signal.aborted) setStream({ key: streamKey, token: "", error: "Realtime stream is unavailable; showing the last durable progress." }); });
     return () => abort.abort();
-  }, [node.jobId, node.workerRunId]);
+  }, [node.jobId, node.workerRunId, streamKey]);
+  const current = stream.key === streamKey ? stream : { token: "", error: "" };
   return <>
-    {error && <div className="mb-2 rounded-lg border border-amber/20 bg-amber/[0.06] px-2 py-1 text-[9px] text-amber">{error}</div>}
-    {token && node.workerRunId ? <SubscribedWorker node={node} accessToken={token} /> : <LiveLog node={node} />}
+    {current.error && <div className="mb-2 rounded-lg border border-amber/20 bg-amber/[0.06] px-2 py-1 text-[9px] text-amber">{current.error}</div>}
+    {current.token && node.workerRunId ? <SubscribedWorker node={node} accessToken={current.token} /> : <LiveLog node={node} />}
   </>;
 }
 

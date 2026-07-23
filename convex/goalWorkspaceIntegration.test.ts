@@ -16,6 +16,7 @@ import { GENERATED_GATED_ACTION_MATRIX } from "../src/mastra/fixtures/action-sco
 import { goalWorkApprovalPolicy } from "./workPolicy";
 import { testProjectSourceAdmission } from "./testSourceAdmission";
 import { patchJobWithRuntime } from "./controlPlane";
+import { ensureGoalNodeHandoff, verifiedGoalHandoffsForJob } from "./goalHandoffs";
 
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
@@ -598,6 +599,87 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(recorded.planDigest).toMatch(/^[0-9a-f]{64}$/);
   });
 
+  it("binds a readonly handoff to exact terminal bytes and replays only the original immutable receipt", async () => {
+    const f = await goalAwaitingPlan();
+    const plan = {
+      summary: "Exact readonly receipt chain", route: "existing_project", assumptions: [],
+      workstreams: [
+        { id: "source", label: "Source", task: "Produce exact immutable evidence.", agentId: "iris", readonly: true, dependsOn: [], acceptanceCriteria: ["exact evidence"], mcp: [] },
+        { id: "consumer", label: "Consumer", task: "Consume only the exact source receipt.", agentId: "iris", readonly: true, dependsOn: ["source"], acceptanceCriteria: ["bound evidence"], mcp: [] },
+      ], validation: { criteria: ["done"], tests: [], liveChecks: [] },
+    };
+    await recordPlanFixture(f.t, { id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN });
+    const [sourceRun] = await dispatch(f.t, 8, "readonly-binding-source");
+    const source = await f.t.run(async (ctx) => ctx.db.get(sourceRun.reservation.jobId as any));
+    await finalizeReadonly(f.t, source, "accepted exact result", "accepted exact evidence");
+    const sealed = await f.t.run(async (ctx) => ctx.db.query("goalHandoffs").first());
+    if (!source || !sealed) throw new Error("readonly handoff fixture did not seal");
+    expect(sealed).toMatchObject({
+      handoffProtocolVersion: 2,
+      sourceJobId: source._id,
+      workReceiptId: expect.any(String),
+      workReceiptDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      acceptedResultDigest: sha256("accepted exact result"),
+      evidenceDigest: sha256("accepted exact evidence"),
+      acceptedResultProjectionDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      handoffPayloadDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    const replay = await f.t.run(async (ctx) => ensureGoalNodeHandoff(ctx, await ctx.db.get(source._id)));
+    expect(replay?._id).toBe(sealed._id);
+    expect((await f.t.run(async (ctx) => ctx.db.query("goalHandoffs").collect()))).toHaveLength(1);
+
+    await f.t.run(async (ctx) => patchJobWithRuntime(ctx, await ctx.db.get(source._id), {
+      result: "mutated after terminal receipt",
+      progress: "mutable progress fallback must not become terminal evidence",
+    }));
+    expect(await f.t.run(async (ctx) => ensureGoalNodeHandoff(ctx, await ctx.db.get(source._id)))).toBeNull();
+    const consumerJob = await f.t.run(async (ctx) => {
+      const node = await ctx.db.query("goalPlanNodes").withIndex("by_parent_generation", (q) =>
+        q.eq("parentMissionId", f.missionId).eq("planGeneration", 1).eq("nodeId", "consumer")).first();
+      return node ? await ctx.db.get(node.jobId) : null;
+    });
+    if (!consumerJob) throw new Error("readonly consumer fixture missing");
+    expect(await f.t.run(async (ctx) => verifiedGoalHandoffsForJob(ctx, consumerJob))).toBeNull();
+
+    await f.t.run(async (ctx) => patchJobWithRuntime(ctx, await ctx.db.get(source._id), {
+      result: "accepted exact result",
+      progress: "unrelated mutable rollup text",
+    }));
+    const exactReplay = await f.t.run(async (ctx) => ensureGoalNodeHandoff(ctx, await ctx.db.get(source._id)));
+    expect(exactReplay?._id).toBe(sealed._id);
+    const duplicateWorkReceiptId = await f.t.run(async (ctx) => {
+      const receipt = await ctx.db.get(sealed.workReceiptId!);
+      if (!receipt) throw new Error("readonly work receipt fixture missing");
+      const { _id: receiptId, _creationTime: receiptCreatedAt, ...value } = receipt;
+      expect(receiptId).toBe(sealed.workReceiptId);
+      expect(receiptCreatedAt).toBeGreaterThan(0);
+      return await ctx.db.insert("workReceipts", value);
+    });
+    const staleBindings = [
+      { sourceAttempt: 2 },
+      { sourceSteerRevision: 7 },
+      { planGeneration: 2 },
+      { planDigest: "d".repeat(64) },
+      { workOrderRevisionId: consumerJob.workOrderRevisionId },
+      { workOrderRevision: 2 },
+      { workOrderRevisionDigest: "e".repeat(64) },
+      { workReceiptId: duplicateWorkReceiptId },
+      { workReceiptDigest: "f".repeat(64) },
+    ];
+    for (const stale of staleBindings) {
+      await f.t.run(async (ctx) => ctx.db.patch(sealed._id, stale));
+      expect(await f.t.run(async (ctx) => verifiedGoalHandoffsForJob(ctx, consumerJob))).toBeNull();
+      await f.t.run(async (ctx) => ctx.db.replace(sealed._id, sealed));
+    }
+    const [consumer] = await dispatch(f.t, 8, "readonly-binding-released");
+    expect(consumer.claim?.upstreamEvidence?.[0]).toMatchObject({
+      sourceNodeId: "source",
+      result: "accepted exact result",
+      resultDigest: sha256("accepted exact result"),
+      handoffPayloadDigest: sealed.handoffPayloadDigest,
+    });
+  });
+
   it("executes the exact cross-project DAG with typed handoffs and a parent Sol gate", async () => {
     const f = await goalAwaitingPlan();
     const other = "daniels-project-space/jarvis";
@@ -703,6 +785,28 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const handoffs = await f.t.run(async (ctx) => ctx.db.query("goalHandoffs").collect());
     expect(handoffs).toHaveLength(4);
     expect(handoffs.every((handoff) => handoff.planDigest === recorded.planDigest && handoff.planGeneration === 1)).toBe(true);
+    expect(handoffs.filter((handoff) => handoff.repository).every((handoff) =>
+      handoff.reviewReceiptId && handoff.reviewReceiptDigest
+      && handoff.integrationAttemptId && handoff.integrationBindingDigest
+      && handoff.integrationTerminalReceiptId && handoff.integrationTerminalReceiptDigest)).toBe(true);
+    const catalogHandoff = handoffs.find((handoff) => handoff.sourceNodeId === "catalog");
+    const metricsHandoff = handoffs.find((handoff) => handoff.sourceNodeId === "metrics");
+    if (!catalogHandoff || !metricsHandoff) throw new Error("writable handoff fixtures missing");
+    const catalogCurrent = await f.t.run(async (ctx) => ctx.db.get(catalogHandoff.sourceJobId));
+    if (!catalogCurrent) throw new Error("catalog job fixture missing");
+    const staleWritableBindings = [
+      { reviewReceiptId: metricsHandoff.reviewReceiptId },
+      { reviewReceiptDigest: metricsHandoff.reviewReceiptDigest },
+      { integrationAttemptId: metricsHandoff.integrationAttemptId },
+      { integrationGeneration: metricsHandoff.integrationGeneration },
+      { integrationTerminalReceiptId: metricsHandoff.integrationTerminalReceiptId },
+      { integrationTerminalReceiptDigest: metricsHandoff.integrationTerminalReceiptDigest },
+    ];
+    for (const stale of staleWritableBindings) {
+      await f.t.run(async (ctx) => ctx.db.patch(catalogHandoff._id, stale));
+      expect(await f.t.run(async (ctx) => ensureGoalNodeHandoff(ctx, catalogCurrent))).toBeNull();
+      await f.t.run(async (ctx) => ctx.db.replace(catalogHandoff._id, catalogHandoff));
+    }
 
     const [validatorRun] = await dispatch(f.t, 8, "dag-validator");
     expect(validatorRun.claim).toMatchObject({ goalStage: "validating", reasoningEffort: "max", readonly: true, repo: null });
