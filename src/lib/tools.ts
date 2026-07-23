@@ -19,6 +19,7 @@ import {
   normalizeToolInvocationContext,
   type ToolExecutionHostContext,
 } from "./tool-invocation-context";
+import { startSupervisedOrchestrationIfSelected } from "./mission-supervisor-orchestration";
 import {
   VISUAL_BLOCK_KINDS,
   VISUAL_CAPABILITIES,
@@ -3267,12 +3268,61 @@ export async function executeTool(
     case "orchestrate": {
       const mission = String(args.mission ?? "").trim();
       if (!mission) return "Give the supervisor the outcome the mission must achieve.";
-      const supplied = (Array.isArray(args.agents) ? args.agents : []).filter((a: any) => a?.task).slice(0, 6);
+      const supplied = (
+        Array.isArray(args.agents) ? args.agents as unknown[] : []
+      ).filter((candidate): candidate is Record<string, unknown> =>
+        typeof candidate === "object" &&
+        candidate !== null &&
+        !Array.isArray(candidate) &&
+        Boolean((candidate as Record<string, unknown>).task)
+      ).slice(0, 6);
+      const supervised = await startSupervisedOrchestrationIfSelected({
+        mission,
+        primaryRepo: args.repo ? String(args.repo) : undefined,
+        context: args.context ? String(args.context) : undefined,
+        acceptanceCriteria: Array.isArray(args.acceptance_criteria)
+          ? args.acceptance_criteria.map(String).slice(0, 8)
+          : undefined,
+        requestedWorkstreams: supplied.map((candidate) => ({
+          task:
+            String(candidate.task) +
+            (TASK_TEMPLATES[String(candidate.template ?? "")] ?? ""),
+          label: candidate.label ? String(candidate.label) : undefined,
+          repo: candidate.repo ? String(candidate.repo) : undefined,
+          model: candidate.model ? String(candidate.model) : undefined,
+          agentId: candidate.agent_id ? String(candidate.agent_id) : undefined,
+          readonly:
+            typeof candidate.readonly === "boolean"
+              ? candidate.readonly
+              : undefined,
+          acceptanceCriteria: Array.isArray(candidate.acceptance_criteria)
+            ? candidate.acceptance_criteria.map(String)
+            : undefined,
+        })),
+        invocationContext,
+        authTokenHash,
+      }, {
+        getOriginThreadId: activeThread,
+        resolveProjectAdmissions: resolveMissionProjectAdmissions,
+        mutate: convexMutation,
+        dispatchWakeTicket: async (wakeTicket) => {
+          const { dispatchMissionSupervisorWakeTicket } = await import(
+            "./mission-supervisor-dispatch-server"
+          );
+          return await dispatchMissionSupervisorWakeTicket(wakeTicket);
+        },
+      });
+      if (supervised) {
+        const wakeStatus = supervised.wakeDispatched
+          ? "Its durable supervisor wake is confirmed"
+          : "Its durable supervisor is active; this replay did not need an additional wake";
+        return `JARVIS ${supervised.replayed ? "resumed" : "started"} supervised mission ${supervised.missionId}${supervised.requestedWorkstreams ? ` with ${supervised.requestedWorkstreams} routed permanent-specialist workstream${supervised.requestedWorkstreams === 1 ? "" : "s"}` : ""}. ${wakeStatus}, live stages and checkpoints are on screen, and protected external actions still wait in Needs you.`;
+      }
       const { planManagedMission } = await import("../mastra/supervisor");
       const plan: ManagedMission = await planManagedMission(mission, {
         repo: args.repo ? String(args.repo) : undefined,
         context: args.context ? String(args.context) : undefined,
-        workstreams: supplied.map((a: any) => ({
+        workstreams: supplied.map((a) => ({
           task: String(a.task),
           label: a.label ? String(a.label) : undefined,
           repo: a.repo ? String(a.repo) : undefined,
@@ -3305,7 +3355,7 @@ export async function executeTool(
       });
       for (const a of plan.workstreams) {
         const projectAdmission = protocolV2 ? admittedProject(projectAdmissions, a.repo) : undefined;
-        const suppliedAgent = supplied.find((candidate: any) => String(candidate.task) === a.task);
+        const suppliedAgent = supplied.find((candidate) => String(candidate.task) === a.task);
         const scaffold = TASK_TEMPLATES[String(suppliedAgent?.template ?? "")] ?? "";
         const sharedContext = plan.context ? `\n\nShared mission context:\n${plan.context}` : "";
         await convexMutation(admissionMutationName("job"), {
