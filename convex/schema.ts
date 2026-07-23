@@ -37,6 +37,11 @@ const missionSupervisorModelTierValidator = v.union(
   v.literal("sol"),
 );
 
+const missionSupervisorDecisionOriginValidator = v.union(
+  v.literal("model"),
+  v.literal("policy"),
+);
+
 // JARVIS memory index. Full markdown bodies live in R2 (bucket `jarvis`);
 // Convex holds the reactive index for search/recall. Multi-stage consolidation
 // (daily -> weekly -> long-term) is driven by Trigger.dev tasks.
@@ -885,7 +890,11 @@ export default defineSchema({
     payloadJson: v.string(),
     payloadDigest: v.string(),
     rationale: v.string(),
-    modelProvider: v.literal("codex-subscription"),
+    decisionOrigin: missionSupervisorDecisionOriginValidator,
+    modelProvider: v.union(
+      v.literal("codex-subscription"),
+      v.literal("deterministic-policy"),
+    ),
     modelTier: missionSupervisorModelTierValidator,
     modelId: v.string(),
     reasoningEffort: v.string(),

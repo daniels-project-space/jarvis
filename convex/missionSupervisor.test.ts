@@ -6,8 +6,13 @@ import schema from "./schema";
 import { testProjectSourceAdmission } from "./testSourceAdmission";
 import {
   evidenceProjectSourceAdmission,
+  sha256Hex,
   type ProjectSourceAdmission,
 } from "../src/lib/source-admission";
+import {
+  ensureWorkAttempt,
+  readAttemptExecutionAuthority,
+} from "./controlPlane";
 import {
   MISSION_SUPERVISOR_LEASE_MS,
   MISSION_SUPERVISOR_MAX_DUE,
@@ -32,6 +37,7 @@ const supervisorApi = {
   releaseFailureV1: makeFunctionReference<"mutation">(
     "missionSupervisor:releaseFailureV1",
   ),
+  commitV1: makeFunctionReference<"mutation">("missionSupervisor:commitV1"),
 };
 
 type SupervisorTest = TestConvex<typeof schema>;
@@ -65,6 +71,71 @@ type StartOptions = {
   priority?: number;
   risk?: "low" | "medium" | "high" | "consequential";
   deadlineMs?: number;
+};
+type SuccessfulClaim = {
+  claimed: true;
+  missionId: Id<"missions">;
+  epoch: number;
+  nextDecisionSequence: number;
+  inputRevision: number;
+  leaseVersion: number;
+  leaseUntil: number;
+  snapshot: unknown;
+  snapshotDigest: string;
+};
+type CommitMetadata = {
+  decisionOrigin: "model" | "policy";
+  modelProvider: "codex-subscription" | "deterministic-policy";
+  modelTier: "luna" | "terra" | "sol";
+  modelId: string;
+  reasoningEffort: "none" | "low" | "medium" | "high" | "max";
+  tierReason: string;
+  supervisorPromptVersion: string;
+  triggerRunId: string;
+  deploymentVersion?: string;
+};
+type CommitDecision =
+  | {
+      kind: "delegate";
+      workstreams: Array<{
+        task: string;
+        label: string;
+        repo?: string;
+        model: "luna" | "terra" | "sol";
+        agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
+        readonly: boolean;
+        approvalRequired: boolean;
+        risk: "low" | "medium" | "high" | "consequential";
+        acceptanceCriteria: string[];
+      }>;
+    }
+  | { kind: "wait"; delayMs: number; reason: string }
+  | { kind: "request_input"; question: string; reason: string }
+  | { kind: "replan"; reason: string }
+  | { kind: "synthesize"; summary: string }
+  | { kind: "fail"; reason: string };
+
+const MODEL_METADATA: CommitMetadata = {
+  decisionOrigin: "model",
+  modelProvider: "codex-subscription",
+  modelTier: "terra",
+  modelId: "gpt-5.6-terra",
+  reasoningEffort: "high",
+  tierReason: "bounded supervisor judgment",
+  supervisorPromptVersion: "mission-supervisor-v1",
+  triggerRunId: "trigger-model-run-1",
+  deploymentVersion: "test-deployment-1",
+};
+const POLICY_METADATA: CommitMetadata = {
+  decisionOrigin: "policy",
+  modelProvider: "deterministic-policy",
+  modelTier: "luna",
+  modelId: "jarvis-supervisor-policy-v1",
+  reasoningEffort: "none",
+  tierReason: "bounded deterministic supervisor policy",
+  supervisorPromptVersion: "mission-supervisor-policy-v1",
+  triggerRunId: "trigger-policy-run-1",
+  deploymentVersion: "test-deployment-1",
 };
 
 beforeEach(() => {
@@ -164,6 +235,130 @@ function exactFence(
     expectedInputRevision: claimed.inputRevision,
     workerToken: WORKER,
   };
+}
+
+async function claimSuccess(
+  t: SupervisorTest,
+  missionId: Id<"missions">,
+  expectedLeaseVersion: number,
+  leaseOwner = "worker-one",
+  leaseToken = `lease-token-${leaseOwner}-0001`,
+): Promise<SuccessfulClaim> {
+  const result = await claim(
+    t,
+    missionId,
+    expectedLeaseVersion,
+    leaseOwner,
+    leaseToken,
+  );
+  expect(result.claimed).toBe(true);
+  return result as SuccessfulClaim;
+}
+
+function commitInput(
+  missionId: Id<"missions">,
+  claimed: SuccessfulClaim,
+  decision: CommitDecision,
+  metadata: CommitMetadata,
+  rationale = "Commit one bounded supervisor transition.",
+) {
+  return {
+    missionId,
+    leaseOwner: "worker-one",
+    leaseToken: "lease-token-worker-one-0001",
+    leaseVersion: claimed.leaseVersion,
+    expectedEpoch: claimed.epoch,
+    expectedDecisionSequence: claimed.nextDecisionSequence,
+    expectedInputRevision: claimed.inputRevision,
+    expectedSnapshotDigest: claimed.snapshotDigest,
+    decision,
+    rationale,
+    ...metadata,
+    workerToken: WORKER,
+  };
+}
+
+function delegatedWorkstream(
+  overrides: Partial<Extract<CommitDecision, { kind: "delegate" }>["workstreams"][number]> = {},
+): Extract<CommitDecision, { kind: "delegate" }>["workstreams"][number] {
+  return {
+    task: "Implement bounded supervisor authority and verify the exact behavior.",
+    label: "Supervisor authority",
+    model: "terra",
+    agentId: "paul",
+    readonly: false,
+    approvalRequired: false,
+    risk: "low",
+    acceptanceCriteria: ["The exact bounded behavior is verified."],
+    ...overrides,
+  };
+}
+
+async function seedVerifiedReceipt(
+  t: SupervisorTest,
+  jobId: Id<"jobs">,
+  options: {
+    result?: string;
+    note?: string;
+    acceptanceEvidence?: string[];
+    tamperAuthorityDigest?: boolean;
+  } = {},
+) {
+  return await t.run(async (ctx) => {
+    const job = await ctx.db.get(jobId);
+    if (!job) throw new Error("Test job is missing");
+    const attempt = Number(job.attempt ?? 1);
+    await ensureWorkAttempt(ctx, job, attempt, "done", Date.now());
+    const authority = await readAttemptExecutionAuthority(ctx, job, attempt);
+    if (!authority) throw new Error("Test job authority is missing");
+    const result = options.result ?? "Verified bounded supervisor result.";
+    const note = options.note ?? "All acceptance checks passed.";
+    const resultDigest = await sha256Hex(result);
+    const evidenceDigest = await sha256Hex(note);
+    await ctx.db.patch(jobId, {
+      status: "done",
+      result,
+      verificationVerdict: "pass",
+      verificationNote: note,
+      completedAt: Date.now(),
+    });
+    const runtime = await ctx.db
+      .query("jobRuntime")
+      .withIndex("by_job", (q) => q.eq("jobId", jobId))
+      .unique();
+    if (runtime) {
+      await ctx.db.patch(runtime._id, {
+        status: "done",
+        stage: "verified",
+        percent: 100,
+        active: false,
+        completedAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    }
+    const receiptId = await ctx.db.insert("workReceipts", {
+      jobId,
+      attempt,
+      status: "succeeded",
+      authorityDigest: options.tamperAuthorityDigest
+        ? "f".repeat(64)
+        : authority.authorityDigest,
+      schedulingBindingDigest: authority.schedulingBindingDigest,
+      workOrderRevisionId: authority.workOrderRevisionId,
+      workOrderRevision: authority.workOrderRevision,
+      workOrderRevisionDigest: authority.workOrderRevisionDigest,
+      canonicalProjectId: authority.canonicalProjectId,
+      repository: authority.repository,
+      acceptanceEvidence: options.acceptanceEvidence
+        ?? ["All acceptance checks passed."],
+      artifacts: [`convex://jobs/${String(jobId)}/attempt/${attempt}/result`],
+      verification: "pass",
+      resultDigest,
+      evidenceDigest,
+      createdAt: Date.now(),
+    });
+    return { receiptId, authority, resultDigest, evidenceDigest };
+  });
 }
 
 describe("dormant mission supervisor authority", () => {
@@ -683,5 +878,729 @@ describe("dormant mission supervisor authority", () => {
       consecutiveFailures: 1,
       lastErrorCode: "bounded_deadline_failure",
     });
+  });
+
+  it("commits real policy-gated jobs once with zero-based decision provenance and effect-only replay", async () => {
+    const t = convexTest(schema, modules);
+    const admission = await testProjectSourceAdmission(
+      "daniels-project-space/jarvis",
+    );
+    const started = await start(t, "commit-delegate-replay", {
+      repo: "daniels-project-space/jarvis",
+      projectAdmissions: [admission],
+    });
+    const claimed = await claimSuccess(t, started.missionId, 0);
+    const decision: CommitDecision = {
+      kind: "delegate",
+      workstreams: [
+        delegatedWorkstream(),
+        delegatedWorkstream({
+          task: "Send a rental reply to the customer immediately.",
+          label: "Consequential renter reply",
+          model: "luna",
+          agentId: "atlas",
+          risk: "low",
+          acceptanceCriteria: ["The reply remains gated for Daniel."],
+        }),
+      ],
+    };
+    const originalInput = commitInput(
+      started.missionId,
+      claimed,
+      decision,
+      MODEL_METADATA,
+    );
+    const committed = await t.mutation(
+      supervisorApi.commitV1,
+      originalInput,
+    );
+    expect(committed).toMatchObject({
+      committed: true,
+      replayed: false,
+      kind: "delegate",
+      resultState: "waiting",
+    });
+    expect(committed.createdJobIds).toHaveLength(2);
+
+    const persisted = await t.run(async (ctx) => ({
+      jobs: await ctx.db
+        .query("jobs")
+        .withIndex("by_mission", (q) =>
+          q.eq("missionId", String(started.missionId))
+        )
+        .collect(),
+      approvals: await ctx.db.query("approvals").collect(),
+      decisions: await ctx.db
+        .query("missionSupervisorDecisions")
+        .withIndex("by_mission_epoch_sequence", (q) =>
+          q.eq("missionId", started.missionId)
+        )
+        .collect(),
+      state: await ctx.db.get(started.stateId),
+      mission: await ctx.db.get(started.missionId),
+    }));
+    expect(persisted.jobs.map((job) => job.supervisorJobOrdinal)).toEqual([0, 1]);
+    expect(persisted.jobs.every((job) =>
+      job.supervisorEpoch === claimed.epoch
+      && job.supervisorDecisionKey === committed.decisionKey
+      && job.repo === "daniels-project-space/jarvis"
+      && job.schedulingBound === true
+      && job.dispatchReady === true
+      && job.workOrderRevision === 1
+      && Array.isArray(job.dependsOn)
+      && job.dependsOn.length === 0
+    )).toBe(true);
+    expect(persisted.jobs.map((job) => job.status)).toEqual([
+      "pending",
+      "awaiting_approval",
+    ]);
+    expect(persisted.jobs.map((job) => job.approvalRequired)).toEqual([
+      false,
+      true,
+    ]);
+    expect(persisted.approvals).toHaveLength(1);
+    expect(persisted.approvals[0]).toMatchObject({
+      jobId: String(committed.createdJobIds[1]),
+      status: "pending",
+      kind: "consequential-work",
+    });
+    expect(persisted.decisions).toHaveLength(1);
+    expect(persisted.decisions[0]).toMatchObject({
+      decisionOrigin: "model",
+      modelProvider: "codex-subscription",
+      modelId: MODEL_METADATA.modelId,
+      triggerRunId: MODEL_METADATA.triggerRunId,
+      createdJobIds: committed.createdJobIds,
+    });
+    expect(persisted.state).toMatchObject({
+      state: "waiting",
+      totalJobs: 2,
+      decisionCount: 1,
+      nextDecisionSequence: 2,
+      handledInputRevision: claimed.inputRevision,
+    });
+    expect(persisted.mission).toMatchObject({
+      status: "running",
+      phase: "executing",
+      agentCount: 2,
+    });
+
+    const replay = await t.mutation(supervisorApi.commitV1, {
+      ...originalInput,
+      leaseVersion: claimed.leaseVersion + 999,
+      rationale: "A transport retry may carry a different explanation.",
+      triggerRunId: "trigger-model-run-retry",
+      deploymentVersion: "test-deployment-retry",
+      modelId: "gpt-5.6-terra-retry",
+      tierReason: "retry metadata must not change effect identity",
+    });
+    expect(replay).toMatchObject({
+      committed: true,
+      replayed: true,
+      decisionId: committed.decisionId,
+      decisionKey: committed.decisionKey,
+      createdJobIds: committed.createdJobIds,
+    });
+    await expect(t.mutation(supervisorApi.commitV1, {
+      ...originalInput,
+      decision: {
+        ...decision,
+        workstreams: [
+          {
+            ...decision.workstreams[0],
+            label: "Conflicting immutable effect",
+          },
+          decision.workstreams[1],
+        ],
+      },
+    })).rejects.toThrow(
+      "decision slot conflicts with a different immutable decision",
+    );
+    const replayCounts = await t.run(async (ctx) => ({
+      jobs: (await ctx.db
+        .query("jobs")
+        .withIndex("by_mission", (q) =>
+          q.eq("missionId", String(started.missionId))
+        )
+        .collect()).length,
+      decisions: (await ctx.db
+        .query("missionSupervisorDecisions")
+        .withIndex("by_mission_epoch_sequence", (q) =>
+          q.eq("missionId", started.missionId)
+        )
+        .collect()).length,
+      approvals: (await ctx.db.query("approvals").collect()).length,
+    }));
+    expect(replayCounts).toEqual({ jobs: 2, decisions: 1, approvals: 1 });
+  });
+
+  it("rejects every stale commit fence and untruthful authorship without writes", async () => {
+    const t = convexTest(schema, modules);
+    const started = await start(t, "commit-stale-fences");
+    const other = await start(t, "commit-stale-other");
+    const claimed = await claimSuccess(t, started.missionId, 0);
+    const decision: CommitDecision = {
+      kind: "wait",
+      delayMs: 10_000,
+      reason: "No authoritative input changed yet.",
+    };
+    const input = commitInput(
+      started.missionId,
+      claimed,
+      decision,
+      POLICY_METADATA,
+    );
+    const fenceCases = [
+      {
+        patch: { missionId: other.missionId },
+        reason: "fence_mismatch",
+      },
+      {
+        patch: { leaseOwner: "worker-two" },
+        reason: "fence_mismatch",
+      },
+      {
+        patch: { leaseToken: "lease-token-worker-two-0001" },
+        reason: "fence_mismatch",
+      },
+      {
+        patch: { leaseVersion: claimed.leaseVersion + 1 },
+        reason: "fence_mismatch",
+      },
+      {
+        patch: { expectedEpoch: claimed.epoch + 1 },
+        reason: "fence_mismatch",
+      },
+      {
+        patch: {
+          expectedDecisionSequence: claimed.nextDecisionSequence + 1,
+        },
+        reason: "fence_mismatch",
+      },
+      {
+        patch: { expectedInputRevision: claimed.inputRevision + 1 },
+        reason: "input_revision_mismatch",
+      },
+      {
+        patch: { expectedSnapshotDigest: "f".repeat(64) },
+        reason: "snapshot_digest_mismatch",
+      },
+    ];
+    for (const testCase of fenceCases) {
+      expect(await t.mutation(supervisorApi.commitV1, {
+        ...input,
+        ...testCase.patch,
+      })).toMatchObject({
+        committed: false,
+        replayed: false,
+        reason: testCase.reason,
+      });
+    }
+
+    await expect(t.mutation(supervisorApi.commitV1, {
+      ...input,
+      decisionOrigin: "model",
+      modelProvider: "deterministic-policy",
+      reasoningEffort: "high",
+    })).rejects.toThrow("decisionOrigin and modelProvider do not match");
+    await expect(t.mutation(supervisorApi.commitV1, {
+      ...input,
+      ...MODEL_METADATA,
+    })).rejects.toThrow("wait must use deterministic policy authorship");
+    await expect(t.mutation(supervisorApi.commitV1, {
+      ...input,
+      decision: {
+        kind: "delegate",
+        workstreams: [delegatedWorkstream({ readonly: true })],
+      },
+      ...POLICY_METADATA,
+    })).rejects.toThrow("delegate must use Codex subscription authorship");
+
+    vi.setSystemTime(claimed.leaseUntil + 1);
+    expect(await t.mutation(supervisorApi.commitV1, input)).toMatchObject({
+      committed: false,
+      reason: "lease_expired",
+    });
+    const persisted = await t.run(async (ctx) => ({
+      state: await ctx.db.get(started.stateId),
+      decisions: await ctx.db
+        .query("missionSupervisorDecisions")
+        .withIndex("by_mission_epoch_sequence", (q) =>
+          q.eq("missionId", started.missionId)
+        )
+        .collect(),
+      jobs: await ctx.db
+        .query("jobs")
+        .withIndex("by_mission", (q) =>
+          q.eq("missionId", String(started.missionId))
+        )
+        .collect(),
+    }));
+    expect(persisted.state).toMatchObject({
+      state: "leased",
+      leaseVersion: claimed.leaseVersion,
+      decisionCount: 0,
+    });
+    expect(persisted.decisions).toEqual([]);
+    expect(persisted.jobs).toEqual([]);
+  });
+
+  it("rolls back unadmitted, duplicate, and over-cap delegation decisions", async () => {
+    const t = convexTest(schema, modules);
+    const admission = await testProjectSourceAdmission(
+      "daniels-project-space/jarvis",
+    );
+    const started = await start(t, "commit-invalid-delegate", {
+      repo: "daniels-project-space/jarvis",
+      projectAdmissions: [admission],
+    });
+    const firstClaim = await claimSuccess(t, started.missionId, 0);
+    await expect(t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      firstClaim,
+      {
+        kind: "delegate",
+        workstreams: [delegatedWorkstream({
+          repo: "daniels-project-space/rental-manager-v2",
+        })],
+      },
+      MODEL_METADATA,
+    ))).rejects.toThrow("outside the mission project admissions");
+    expect((await supervisorState(t, started.missionId))?.state).toBe("leased");
+
+    const first = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      firstClaim,
+      {
+        kind: "delegate",
+        workstreams: [delegatedWorkstream({
+          task: "Fix  checkout",
+        })],
+      },
+      MODEL_METADATA,
+    ));
+    vi.setSystemTime(first.nextTickAt);
+    const secondClaim = await claimSuccess(t, started.missionId, 1);
+    await expect(t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      secondClaim,
+      {
+        kind: "delegate",
+        workstreams: [delegatedWorkstream({
+          task: "fix checkout",
+          label: "Same work under a different label",
+          acceptanceCriteria: ["A differently worded criterion."],
+        })],
+      },
+      MODEL_METADATA,
+    ))).rejects.toThrow("duplicates existing mission work");
+    const afterDuplicate = await t.run(async (ctx) => ({
+      jobs: await ctx.db
+        .query("jobs")
+        .withIndex("by_mission", (q) =>
+          q.eq("missionId", String(started.missionId))
+        )
+        .collect(),
+      decisions: await ctx.db
+        .query("missionSupervisorDecisions")
+        .withIndex("by_mission_epoch_sequence", (q) =>
+          q.eq("missionId", started.missionId)
+        )
+        .collect(),
+      state: await ctx.db.get(started.stateId),
+    }));
+    expect(afterDuplicate.jobs).toHaveLength(1);
+    expect(afterDuplicate.decisions).toHaveLength(1);
+    expect(afterDuplicate.state).toMatchObject({
+      state: "leased",
+      totalJobs: 1,
+      decisionCount: 1,
+    });
+
+    const capped = await start(t, "commit-job-cap");
+    await t.run(async (ctx) => {
+      for (let index = 0; index < MISSION_SUPERVISOR_MAX_JOBS; index += 1) {
+        await ctx.db.insert("jobs", {
+          task: `Existing bounded cap fixture ${index}`,
+          missionId: String(capped.missionId),
+          agentId: "paul",
+          status: "pending",
+          createdAt: Date.now() + index,
+        });
+      }
+      await ctx.db.patch(capped.stateId, {
+        totalJobs: MISSION_SUPERVISOR_MAX_JOBS,
+      });
+    });
+    const capClaim = await claimSuccess(t, capped.missionId, 0);
+    expect(await t.mutation(supervisorApi.commitV1, commitInput(
+      capped.missionId,
+      capClaim,
+      {
+        kind: "delegate",
+        workstreams: [delegatedWorkstream({ readonly: true })],
+      },
+      MODEL_METADATA,
+    ))).toMatchObject({
+      committed: false,
+      reason: "job_limit_reached",
+    });
+    expect((await supervisorState(t, capped.missionId)?.then((row) =>
+      row?.decisionCount
+    ))).toBe(0);
+  });
+
+  it("commits deterministic wait and replan transitions with bounded release", async () => {
+    const t = convexTest(schema, modules);
+    const started = await start(t, "commit-wait-replan");
+    const firstClaim = await claimSuccess(t, started.missionId, 0);
+    const wait = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      firstClaim,
+      {
+        kind: "wait",
+        delayMs: 45_000,
+        reason: "Wait for the next bounded observation window.",
+      },
+      POLICY_METADATA,
+    ));
+    expect(wait).toMatchObject({
+      committed: true,
+      kind: "wait",
+      resultState: "waiting",
+      nextTickAt: Date.now() + 45_000,
+    });
+    expect(await supervisorState(t, started.missionId)).toMatchObject({
+      state: "waiting",
+      epoch: 1,
+      nextDecisionSequence: 2,
+      decisionCount: 1,
+    });
+
+    vi.setSystemTime(wait.nextTickAt);
+    const secondClaim = await claimSuccess(t, started.missionId, 1);
+    const replan = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      secondClaim,
+      {
+        kind: "replan",
+        reason: "Advance one epoch and derive a fresh bounded plan.",
+      },
+      {
+        ...POLICY_METADATA,
+        triggerRunId: "trigger-policy-run-2",
+      },
+    ));
+    expect(replan).toMatchObject({
+      committed: true,
+      kind: "replan",
+      resultState: "ready",
+      nextTickAt: Date.now(),
+    });
+    const persisted = await t.run(async (ctx) => ({
+      state: await ctx.db.get(started.stateId),
+      mission: await ctx.db.get(started.missionId),
+      decisions: await ctx.db
+        .query("missionSupervisorDecisions")
+        .withIndex("by_mission_epoch_sequence", (q) =>
+          q.eq("missionId", started.missionId)
+        )
+        .collect(),
+    }));
+    expect(persisted.state).toMatchObject({
+      state: "ready",
+      epoch: 2,
+      nextDecisionSequence: 3,
+      decisionCount: 2,
+    });
+    expect(persisted.mission).toMatchObject({
+      status: "running",
+      phase: "planning",
+    });
+    expect(persisted.decisions.map((row) => row.decisionOrigin)).toEqual([
+      "policy",
+      "policy",
+    ]);
+    expect(persisted.decisions.every((row) =>
+      row.modelProvider === "deterministic-policy"
+      && row.modelId === "jarvis-supervisor-policy-v1"
+      && row.reasoningEffort === "none"
+    )).toBe(true);
+  });
+
+  it("deduplicates model request-input attention and background delivery", async () => {
+    const t = convexTest(schema, modules);
+    const started = await start(t, "commit-request-input", {
+      originThreadId: "supervisor-thread",
+    });
+    const claimed = await claimSuccess(t, started.missionId, 0);
+    const input = commitInput(
+      started.missionId,
+      claimed,
+      {
+        kind: "request_input",
+        question: "Which product direction should the specialist prioritize now?",
+        reason: "The planning network returned no safe independent proposal.",
+      },
+      MODEL_METADATA,
+    );
+    const committed = await t.mutation(supervisorApi.commitV1, input);
+    expect(committed).toMatchObject({
+      committed: true,
+      replayed: false,
+      kind: "request_input",
+      resultState: "needs_input",
+    });
+    expect(committed.chatMessageIds).toHaveLength(1);
+    expect(committed.attentionItemId).toBeTruthy();
+    const replay = await t.mutation(supervisorApi.commitV1, {
+      ...input,
+      triggerRunId: "trigger-model-request-retry",
+      rationale: "Retry metadata differs after a lost response.",
+    });
+    expect(replay).toMatchObject({
+      committed: true,
+      replayed: true,
+      decisionId: committed.decisionId,
+      attentionItemId: committed.attentionItemId,
+      chatMessageIds: committed.chatMessageIds,
+    });
+    const persisted = await t.run(async (ctx) => ({
+      state: await ctx.db.get(started.stateId),
+      mission: await ctx.db.get(started.missionId),
+      attention: await ctx.db
+        .query("attentionItems")
+        .withIndex("by_fingerprint", (q) =>
+          q.eq(
+            "fingerprint",
+            `mission-supervisor:${String(started.missionId)}:needs-input`,
+          )
+        )
+        .collect(),
+      notifications: await ctx.db
+        .query("chatMessages")
+        .withIndex("by_thread", (q) => q.eq("threadId", "supervisor-thread"))
+        .collect(),
+    }));
+    expect(persisted.state?.state).toBe("needs_input");
+    expect(persisted.mission?.status).toBe("needs_input");
+    expect(persisted.attention).toHaveLength(1);
+    expect(persisted.notifications).toHaveLength(1);
+    expect(persisted.notifications[0]).toMatchObject({
+      role: "assistant",
+      status: "done",
+      delivery: "notification",
+    });
+  });
+
+  it("terminalizes failure with a redacted reason, attention, and one notification", async () => {
+    const t = convexTest(schema, modules);
+    const started = await start(t, "commit-terminal-fail");
+    const claimed = await claimSuccess(t, started.missionId, 0);
+    const secret = "supersecretvalue";
+    const committed = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      claimed,
+      {
+        kind: "fail",
+        reason: `The safe boundary failed because api_key=${secret} cannot be used.`,
+      },
+      POLICY_METADATA,
+    ));
+    expect(committed).toMatchObject({
+      committed: true,
+      kind: "fail",
+      resultState: "terminal",
+    });
+    const persisted = await t.run(async (ctx) => ({
+      state: await ctx.db.get(started.stateId),
+      mission: await ctx.db.get(started.missionId),
+      decision: await ctx.db.get(committed.decisionId),
+      attention: committed.attentionItemId
+        ? await ctx.db.get(
+            committed.attentionItemId as Id<"attentionItems">,
+          )
+        : null,
+      notification: await ctx.db.get(
+        committed.chatMessageIds[0] as Id<"chatMessages">,
+      ),
+    }));
+    expect(persisted.state?.state).toBe("terminal");
+    expect(persisted.mission).toMatchObject({
+      status: "failed",
+      phase: "failed",
+    });
+    expect(persisted.attention?.severity).toBe("high");
+    expect(persisted.notification?.delivery).toBe("notification");
+    const persistedText = JSON.stringify(persisted);
+    expect(persistedText).not.toContain(secret);
+    expect(persistedText).toContain("[REDACTED]");
+  });
+
+  it("requires exact terminal receipts and always retains receipt-derived synthesis evidence", async () => {
+    const t = convexTest(schema, modules);
+    const started = await start(t, "commit-receipt-synthesis");
+    const firstClaim = await claimSuccess(t, started.missionId, 0);
+    const delegated = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      firstClaim,
+      {
+        kind: "delegate",
+        workstreams: [delegatedWorkstream({
+          task: "Inspect the bounded synthesis receipt and return exact evidence.",
+          label: "Receipt evidence",
+          readonly: true,
+          agentId: "iris",
+        })],
+      },
+      MODEL_METADATA,
+    ));
+    const jobId = delegated.createdJobIds[0] as Id<"jobs">;
+    const tampered = await seedVerifiedReceipt(t, jobId, {
+      acceptanceEvidence: ["Receipt-bound verification evidence."],
+      tamperAuthorityDigest: true,
+    });
+    vi.setSystemTime(delegated.nextTickAt);
+    const tamperedClaim = await claimSuccess(t, started.missionId, 1);
+    const snapshot = tamperedClaim.snapshot as {
+      jobs: Array<{
+        authorityDigest: string | null;
+        evidenceDigest: string | null;
+        resultDigest: string | null;
+        receipt: null | {
+          jobId: string;
+          attempt: number;
+          authorityDigest: string | null;
+          schedulingBindingDigest: string | null;
+          workOrderRevision: number | null;
+          workOrderRevisionDigest: string | null;
+          resultDigest: string | null;
+          evidenceDigest: string | null;
+          acceptanceEvidence: string[];
+          artifacts: string[];
+        };
+      }>;
+    };
+    expect(snapshot.jobs[0]).toMatchObject({
+      authorityDigest: tampered.authority.authorityDigest,
+      evidenceDigest: tampered.evidenceDigest,
+      resultDigest: tampered.resultDigest,
+      receipt: {
+        jobId: String(jobId),
+        attempt: 1,
+        authorityDigest: "f".repeat(64),
+        schedulingBindingDigest: tampered.authority.schedulingBindingDigest,
+        workOrderRevision: 1,
+        workOrderRevisionDigest: tampered.authority.workOrderRevisionDigest,
+        acceptanceEvidence: ["Receipt-bound verification evidence."],
+      },
+    });
+    const synthesize: CommitDecision = {
+      kind: "synthesize",
+      summary: "S".repeat(3_990),
+    };
+    expect(await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      tamperedClaim,
+      synthesize,
+      {
+        ...MODEL_METADATA,
+        triggerRunId: "trigger-model-synthesis-tampered",
+      },
+    ))).toMatchObject({
+      committed: false,
+      reason: "synthesis_receipt_binding_mismatch",
+      jobId,
+    });
+    expect((await supervisorState(t, started.missionId))?.decisionCount).toBe(1);
+
+    await t.run(async (ctx) => {
+      await ctx.db.delete(tampered.receiptId);
+    });
+    const verified = await seedVerifiedReceipt(t, jobId, {
+      acceptanceEvidence: ["Receipt-bound verification evidence."],
+    });
+    await t.run(async (ctx) => {
+      const state = (await ctx.db.get(started.stateId))!;
+      await ctx.db.patch(started.stateId, {
+        inputRevision: state.inputRevision + 1,
+        dirtyJobIds: [jobId],
+        updatedAt: Date.now(),
+      });
+    });
+    expect(await t.mutation(supervisorApi.renewV1, {
+      ...exactFence(started.missionId, tamperedClaim),
+    })).toMatchObject({
+      renewed: false,
+      reason: "input_revision_changed",
+      stale: true,
+      released: true,
+    });
+    const verifiedClaim = await claimSuccess(t, started.missionId, 2);
+    const verifiedSnapshot = verifiedClaim.snapshot as {
+      jobs: Array<{
+        authorityDigest: string | null;
+        receipt: null | {
+          authorityDigest: string | null;
+          resultDigest: string | null;
+          evidenceDigest: string | null;
+        };
+      }>;
+    };
+    expect(verifiedSnapshot.jobs[0]).toMatchObject({
+      authorityDigest: verified.authority.authorityDigest,
+      receipt: {
+        authorityDigest: verified.authority.authorityDigest,
+        resultDigest: verified.resultDigest,
+        evidenceDigest: verified.evidenceDigest,
+      },
+    });
+    const committed = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      verifiedClaim,
+      synthesize,
+      {
+        ...MODEL_METADATA,
+        triggerRunId: "trigger-model-synthesis-verified",
+      },
+    ));
+    expect(committed).toMatchObject({
+      committed: true,
+      kind: "synthesize",
+      resultState: "terminal",
+    });
+    const persisted = await t.run(async (ctx) => ({
+      state: await ctx.db.get(started.stateId),
+      mission: await ctx.db.get(started.missionId),
+      notification: await ctx.db.get(
+        committed.chatMessageIds[0] as Id<"chatMessages">,
+      ),
+      decisions: await ctx.db
+        .query("missionSupervisorDecisions")
+        .withIndex("by_mission_epoch_sequence", (q) =>
+          q.eq("missionId", started.missionId)
+        )
+        .collect(),
+    }));
+    expect(persisted.state).toMatchObject({
+      state: "terminal",
+      decisionCount: 2,
+      nextDecisionSequence: 3,
+      dirtyJobIds: [],
+    });
+    expect(persisted.mission).toMatchObject({
+      status: "done",
+      phase: "done",
+      percent: 100,
+    });
+    expect(new TextEncoder().encode(persisted.mission?.summary ?? "").byteLength)
+      .toBeLessThanOrEqual(4_000);
+    expect(persisted.mission?.summary).toContain("Verified evidence:");
+    expect(persisted.mission?.summary).toContain("receipt ");
+    expect(persisted.mission?.summary).toContain(
+      verified.resultDigest.slice(0, 16),
+    );
+    expect(persisted.notification?.delivery).toBe("notification");
+    expect(persisted.decisions).toHaveLength(2);
   });
 });

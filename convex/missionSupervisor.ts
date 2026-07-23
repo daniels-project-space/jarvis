@@ -7,17 +7,22 @@ import {
   requireWorker,
 } from "./controlAuth";
 import {
+  insertJobWithRuntime,
   insertMissionWithRuntime,
   patchMissionWithRuntime,
+  readAttemptExecutionAuthority,
 } from "./controlPlane";
 import {
+  admissionForRepository,
   projectSourceAdmissionValidator,
   validProjectAdmissions,
 } from "./sourceAdmission";
+import { workApprovalPolicy } from "./workPolicy";
 import {
   sha256Hex,
   type ProjectSourceAdmission,
 } from "../src/lib/source-admission";
+import { redactSensitiveText } from "../src/lib/secret-redaction";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 
 export const MISSION_SUPERVISOR_LEASE_MS = 10 * 60_000;
@@ -26,10 +31,16 @@ export const MISSION_SUPERVISOR_MAX_DECISIONS = 64;
 export const MISSION_SUPERVISOR_MAX_DUE = 8;
 
 const REQUEST_PAYLOAD_MAX_BYTES = 16 * 1024;
+const DECISION_PAYLOAD_MAX_BYTES = 48 * 1024;
 const SNAPSHOT_MAX_BYTES = 96 * 1024;
+const SYNTHESIS_SUMMARY_MAX_BYTES = 4_000;
+const NOTIFICATION_MAX_BYTES = 1_200;
 const DEFAULT_DEADLINE_MS = 7 * 24 * 60 * 60_000;
 const MIN_DEADLINE_MS = 10 * 60_000;
 const MAX_DEADLINE_MS = 30 * 24 * 60 * 60_000;
+const SUPERVISOR_DELEGATE_RECHECK_MS = 30_000;
+const SUPERVISOR_WAIT_MIN_MS = 5_000;
+const SUPERVISOR_WAIT_MAX_MS = 15 * 60_000;
 const FAILURE_ESCALATION_COUNT = 5;
 const FAILURE_BACKOFF_BASE_MS = 30_000;
 const FAILURE_BACKOFF_MAX_MS = 15 * 60_000;
@@ -59,6 +70,21 @@ const riskValidator = v.union(
   v.literal("high"),
   v.literal("consequential"),
 );
+const reasoningEffortValidator = v.union(
+  v.literal("none"),
+  v.literal("low"),
+  v.literal("medium"),
+  v.literal("high"),
+  v.literal("max"),
+);
+const decisionOriginValidator = v.union(
+  v.literal("model"),
+  v.literal("policy"),
+);
+const modelProviderValidator = v.union(
+  v.literal("codex-subscription"),
+  v.literal("deterministic-policy"),
+);
 const requestedWorkstreamValidator = v.object({
   task: v.string(),
   label: v.optional(v.string()),
@@ -70,6 +96,45 @@ const requestedWorkstreamValidator = v.object({
   risk: v.optional(riskValidator),
   acceptanceCriteria: v.optional(v.array(v.string())),
 });
+const delegatedWorkstreamValidator = v.object({
+  task: v.string(),
+  label: v.string(),
+  repo: v.optional(v.string()),
+  model: modelTierValidator,
+  agentId: agentValidator,
+  readonly: v.boolean(),
+  approvalRequired: v.boolean(),
+  risk: riskValidator,
+  acceptanceCriteria: v.array(v.string()),
+});
+const supervisorDecisionValidator = v.union(
+  v.object({
+    kind: v.literal("delegate"),
+    workstreams: v.array(delegatedWorkstreamValidator),
+  }),
+  v.object({
+    kind: v.literal("wait"),
+    delayMs: v.number(),
+    reason: v.string(),
+  }),
+  v.object({
+    kind: v.literal("request_input"),
+    question: v.string(),
+    reason: v.string(),
+  }),
+  v.object({
+    kind: v.literal("replan"),
+    reason: v.string(),
+  }),
+  v.object({
+    kind: v.literal("synthesize"),
+    summary: v.string(),
+  }),
+  v.object({
+    kind: v.literal("fail"),
+    reason: v.string(),
+  }),
+);
 
 type MissionSupervisorState = Doc<"missionSupervisorState">;
 type Mission = Doc<"missions">;
@@ -93,8 +158,57 @@ type RequestedWorkstreamInput = {
   acceptanceCriteria?: string[];
 };
 
+type ModelTier = "luna" | "terra" | "sol";
+type PermanentAgent = "paul" | "atlas" | "iris" | "maya" | "sentry";
+type WorkRisk = "low" | "medium" | "high" | "consequential";
+type ReasoningEffort = "none" | "low" | "medium" | "high" | "max";
+type DecisionOrigin = "model" | "policy";
+type ModelProvider = "codex-subscription" | "deterministic-policy";
+type DelegatedWorkstreamInput = {
+  task: string;
+  label: string;
+  repo?: string;
+  model: ModelTier;
+  agentId: PermanentAgent;
+  readonly: boolean;
+  approvalRequired: boolean;
+  risk: WorkRisk;
+  acceptanceCriteria: string[];
+};
+type SupervisorDecisionInput =
+  | { kind: "delegate"; workstreams: DelegatedWorkstreamInput[] }
+  | { kind: "wait"; delayMs: number; reason: string }
+  | { kind: "request_input"; question: string; reason: string }
+  | { kind: "replan"; reason: string }
+  | { kind: "synthesize"; summary: string }
+  | { kind: "fail"; reason: string };
+type CommitMetadataInput = {
+  decisionOrigin: DecisionOrigin;
+  modelProvider: ModelProvider;
+  modelTier: ModelTier;
+  modelId: string;
+  reasoningEffort: ReasoningEffort;
+  tierReason: string;
+  supervisorPromptVersion: string;
+  triggerRunId: string;
+  deploymentVersion?: string;
+};
+
 function utf8Bytes(value: string): number {
   return new TextEncoder().encode(value).byteLength;
+}
+
+function truncateUtf8(value: string, maximumBytes: number): string {
+  if (utf8Bytes(value) <= maximumBytes) return value;
+  let result = "";
+  let bytes = 0;
+  for (const character of value) {
+    const size = utf8Bytes(character);
+    if (bytes + size > maximumBytes) break;
+    result += character;
+    bytes += size;
+  }
+  return result;
 }
 
 function boundedText(
@@ -109,6 +223,21 @@ function boundedText(
     throw new Error(`${field} must be between ${minimumBytes} and ${maximumBytes} UTF-8 bytes`);
   }
   return normalized;
+}
+
+function redactedBoundedText(
+  value: string,
+  field: string,
+  minimumBytes: number,
+  maximumBytes: number,
+): string {
+  const bounded = boundedText(value, field, minimumBytes, maximumBytes);
+  return boundedText(
+    redactSensitiveText(bounded),
+    field,
+    minimumBytes,
+    maximumBytes,
+  );
 }
 
 function optionalBoundedText(
@@ -216,6 +345,184 @@ function normalizeWorkstreams(
   });
 }
 
+function normalizeDelegatedWorkstreams(
+  workstreams: readonly DelegatedWorkstreamInput[],
+) {
+  if (workstreams.length < 1 || workstreams.length > 6) {
+    throw new Error("delegate.workstreams must contain between 1 and 6 items");
+  }
+  const normalized = workstreams.map((workstream, index) => {
+    const acceptanceCriteria = boundedCriteria(
+      workstream.acceptanceCriteria,
+      `decision.workstreams[${index}].acceptanceCriteria`,
+      8,
+    );
+    if (acceptanceCriteria.length === 0) {
+      throw new Error(
+        `decision.workstreams[${index}].acceptanceCriteria must contain at least 1 item`,
+      );
+    }
+    return {
+      task: boundedText(
+        workstream.task,
+        `decision.workstreams[${index}].task`,
+        12,
+        4_000,
+      ),
+      label: boundedText(
+        workstream.label,
+        `decision.workstreams[${index}].label`,
+        3,
+        80,
+      ),
+      repo: canonicalRepository(
+        workstream.repo,
+        `decision.workstreams[${index}].repo`,
+      ),
+      model: workstream.model,
+      agentId: workstream.agentId,
+      readonly: workstream.readonly,
+      approvalRequired: workstream.approvalRequired,
+      risk: workstream.risk,
+      acceptanceCriteria,
+    };
+  });
+  const fingerprints = normalized.map((workstream) =>
+    delegatedWorkIdentity(workstream)
+  );
+  if (new Set(fingerprints).size !== fingerprints.length) {
+    throw new Error("delegate.workstreams contains duplicate work");
+  }
+  return normalized;
+}
+
+function normalizeSupervisorDecision(
+  decision: SupervisorDecisionInput,
+): SupervisorDecisionInput {
+  switch (decision.kind) {
+    case "delegate":
+      return {
+        kind: "delegate",
+        workstreams: normalizeDelegatedWorkstreams(decision.workstreams),
+      };
+    case "wait":
+      return {
+        kind: "wait",
+        delayMs: boundedInteger(
+          decision.delayMs,
+          "decision.delayMs",
+          SUPERVISOR_WAIT_MIN_MS,
+          SUPERVISOR_WAIT_MAX_MS,
+          decision.delayMs,
+        ),
+        reason: redactedBoundedText(
+          decision.reason,
+          "decision.reason",
+          1,
+          500,
+        ),
+      };
+    case "request_input":
+      return {
+        kind: "request_input",
+        question: redactedBoundedText(
+          decision.question,
+          "decision.question",
+          12,
+          1_000,
+        ),
+        reason: redactedBoundedText(
+          decision.reason,
+          "decision.reason",
+          1,
+          500,
+        ),
+      };
+    case "replan":
+      return {
+        kind: "replan",
+        reason: redactedBoundedText(
+          decision.reason,
+          "decision.reason",
+          12,
+          1_000,
+        ),
+      };
+    case "synthesize":
+      return {
+        kind: "synthesize",
+        summary: redactedBoundedText(
+          decision.summary,
+          "decision.summary",
+          12,
+          SYNTHESIS_SUMMARY_MAX_BYTES,
+        ),
+      };
+    case "fail":
+      return {
+        kind: "fail",
+        reason: redactedBoundedText(
+          decision.reason,
+          "decision.reason",
+          12,
+          1_000,
+        ),
+      };
+  }
+}
+
+function normalizeCommitMetadata(
+  decision: SupervisorDecisionInput,
+  input: CommitMetadataInput,
+) {
+  const metadata = {
+    decisionOrigin: input.decisionOrigin,
+    modelProvider: input.modelProvider,
+    modelTier: input.modelTier,
+    modelId: boundedText(input.modelId, "modelId", 1, 120),
+    reasoningEffort: input.reasoningEffort,
+    tierReason: redactedBoundedText(input.tierReason, "tierReason", 1, 500),
+    supervisorPromptVersion: boundedText(
+      input.supervisorPromptVersion,
+      "supervisorPromptVersion",
+      1,
+      80,
+    ),
+    triggerRunId: boundedText(input.triggerRunId, "triggerRunId", 1, 160),
+    deploymentVersion: optionalBoundedText(
+      input.deploymentVersion,
+      "deploymentVersion",
+      160,
+    ),
+  };
+  const policyKind = ["wait", "replan"].includes(decision.kind);
+  const modelKind = ["delegate", "synthesize"].includes(decision.kind);
+  if (
+    metadata.decisionOrigin === "model"
+      ? metadata.modelProvider !== "codex-subscription"
+      : metadata.modelProvider !== "deterministic-policy"
+  ) {
+    throw new Error("decisionOrigin and modelProvider do not match");
+  }
+  if (policyKind && metadata.decisionOrigin !== "policy") {
+    throw new Error(`${decision.kind} must use deterministic policy authorship`);
+  }
+  if (modelKind && metadata.decisionOrigin !== "model") {
+    throw new Error(`${decision.kind} must use Codex subscription authorship`);
+  }
+  if (metadata.decisionOrigin === "policy" && (
+    metadata.modelTier !== "luna"
+    || metadata.modelId !== "jarvis-supervisor-policy-v1"
+    || metadata.reasoningEffort !== "none"
+  )) {
+    throw new Error("Deterministic policy metadata is not canonical");
+  }
+  if (metadata.decisionOrigin === "model" && metadata.reasoningEffort === "none") {
+    throw new Error("Model-authored decisions require a model reasoning effort");
+  }
+  return metadata;
+}
+
 function sortedAdmissions(
   admissions: readonly ProjectSourceAdmission[],
 ): ProjectSourceAdmission[] {
@@ -262,6 +569,18 @@ function canonicalJson(value: unknown): string {
     throw new Error("Canonical payload contains an unsupported value");
   };
   return encode(value, 0);
+}
+
+function delegatedWorkIdentity(work: {
+  agentId: string | null | undefined;
+  repo: string | null | undefined;
+  task: string;
+}): string {
+  return canonicalJson({
+    agentId: work.agentId ?? null,
+    repo: work.repo ?? null,
+    task: work.task.trim().replace(/\s+/gu, " ").toLowerCase(),
+  });
 }
 
 function normalizedStartRequest(args: {
@@ -382,9 +701,67 @@ function excerpt(value: unknown, maximum: number): string | null {
   return typeof value === "string" ? value.slice(0, maximum) : null;
 }
 
-async function snapshotJob(job: Doc<"jobs">): Promise<JsonValue> {
+function boundedSnapshotList(value: readonly string[], maximumItems = 8): string[] {
+  return value
+    .slice(0, maximumItems)
+    .map((item) => truncateUtf8(redactSensitiveText(String(item)), 500));
+}
+
+async function terminalAuthorityAndReceipt(
+  ctx: Pick<MutationCtx, "db">,
+  job: Doc<"jobs">,
+): Promise<{ authorityDigest: string | null; receipt: JsonValue }> {
+  if (job.status !== "done") {
+    return { authorityDigest: null, receipt: null };
+  }
+  const attempt = Number(job.attempt ?? 1);
+  if (!Number.isSafeInteger(attempt) || attempt < 1) {
+    return { authorityDigest: null, receipt: null };
+  }
+  const [authority, receipts] = await Promise.all([
+    readAttemptExecutionAuthority(ctx, job, attempt),
+    ctx.db
+      .query("workReceipts")
+      .withIndex("by_job_attempt", (q) =>
+        q.eq("jobId", job._id).eq("attempt", attempt)
+      )
+      .take(2),
+  ]);
+  if (receipts.length !== 1) {
+    return {
+      authorityDigest: authority?.authorityDigest ?? null,
+      receipt: null,
+    };
+  }
+  const receipt = receipts[0];
+  return {
+    authorityDigest: authority?.authorityDigest ?? null,
+    receipt: {
+      jobId: String(receipt.jobId),
+      attempt: receipt.attempt,
+      status: receipt.status,
+      verification: receipt.verification,
+      authorityDigest: receipt.authorityDigest ?? null,
+      schedulingBindingDigest: receipt.schedulingBindingDigest ?? null,
+      workOrderRevision: receipt.workOrderRevision ?? null,
+      workOrderRevisionDigest: receipt.workOrderRevisionDigest ?? null,
+      resultDigest: receipt.resultDigest ?? null,
+      evidenceDigest: receipt.evidenceDigest ?? null,
+      acceptanceEvidence: boundedSnapshotList(receipt.acceptanceEvidence),
+      artifacts: boundedSnapshotList(receipt.artifacts),
+      reviewReceiptDigest: receipt.reviewReceiptDigest ?? null,
+    },
+  };
+}
+
+async function snapshotJob(
+  job: Doc<"jobs">,
+  terminal: { authorityDigest: string | null; receipt: JsonValue },
+): Promise<JsonValue> {
   const task = String(job.task ?? "");
   const result = typeof job.result === "string" ? job.result : undefined;
+  const verificationNote =
+    typeof job.verificationNote === "string" ? job.verificationNote : undefined;
   const criteria = Array.isArray(job.acceptanceCriteria)
     ? job.acceptanceCriteria.map(String)
     : [];
@@ -422,6 +799,7 @@ async function snapshotJob(job: Doc<"jobs">): Promise<JsonValue> {
     dependsOnDigest: await sha256Hex(canonicalJson(dependsOn)),
     acceptanceCriteria: criteria.slice(0, 8).map((item) => item.slice(0, 500)),
     acceptanceCriteriaDigest: await sha256Hex(canonicalJson(criteria)),
+    authorityDigest: terminal.authorityDigest,
     workOrderRevision: job.workOrderRevision ?? null,
     workOrderRevisionDigest: excerpt(job.workOrderRevisionDigest, 64),
     schedulingBindingDigest: excerpt(job.schedulingBindingDigest, 64),
@@ -433,17 +811,20 @@ async function snapshotJob(job: Doc<"jobs">): Promise<JsonValue> {
     result: result?.slice(0, 2_000) ?? null,
     resultDigest: result ? await sha256Hex(result) : null,
     verificationVerdict: excerpt(job.verificationVerdict, 32),
-    verificationNote: excerpt(job.verificationNote, 500),
+    verificationNote: verificationNote?.slice(0, 500) ?? null,
+    evidenceDigest: verificationNote ? await sha256Hex(verificationNote) : null,
     evidenceSummary: evidenceSummary?.slice(0, 500) ?? null,
     evidenceSummaryDigest: evidenceSummary
       ? await sha256Hex(evidenceSummary)
       : null,
     stallReason: job.status === "stalled" ? excerpt(job.stallReason, 400) : null,
     completedAt: job.completedAt ?? null,
+    receipt: terminal.receipt,
   };
 }
 
 async function authoritativeSnapshot(
+  ctx: Pick<MutationCtx, "db">,
   mission: Mission,
   state: MissionSupervisorState,
   jobs: Doc<"jobs">[],
@@ -454,10 +835,13 @@ async function authoritativeSnapshot(
   const missionSteer = typeof mission.steer === "string" ? mission.steer : undefined;
   const failureReason =
     typeof mission.failureReason === "string" ? mission.failureReason : undefined;
+  const orderedJobs = [...jobs]
+    .sort((left, right) => String(left._id).localeCompare(String(right._id)));
+  const terminalBindings = await Promise.all(
+    orderedJobs.map((job) => terminalAuthorityAndReceipt(ctx, job)),
+  );
   const jobSnapshots = await Promise.all(
-    [...jobs]
-      .sort((left, right) => String(left._id).localeCompare(String(right._id)))
-      .map(snapshotJob),
+    orderedJobs.map((job, index) => snapshotJob(job, terminalBindings[index])),
   );
   const snapshot: JsonValue = {
     protocolVersion: 1,
@@ -517,8 +901,14 @@ async function upsertSupervisorAttention(
   failures: number,
   detail: string,
   now: number,
+  options: {
+    fingerprintSuffix?: string;
+    titlePrefix?: string;
+    severity?: "medium" | "high";
+  } = {},
 ) {
-  const fingerprint = `mission-supervisor:${String(mission._id)}:needs-input`;
+  const fingerprint =
+    `mission-supervisor:${String(mission._id)}:${options.fingerprintSuffix ?? "needs-input"}`;
   const existing = await ctx.db
     .query("attentionItems")
     .withIndex("by_fingerprint", (q) => q.eq("fingerprint", fingerprint))
@@ -526,10 +916,11 @@ async function upsertSupervisorAttention(
   const value = {
     fingerprint,
     project: mission.primaryRepo,
-    title: `Supervisor needs input · ${mission.goal.slice(0, 96)}`,
+    title: `${options.titlePrefix ?? "Supervisor needs input"} · ${mission.goal.slice(0, 96)}`,
     detail: detail.slice(0, 2_000),
     evidence: [code, `failures:${failures}`],
-    severity: failures >= FAILURE_ESCALATION_COUNT ? "high" : "medium",
+    severity: options.severity
+      ?? (failures >= FAILURE_ESCALATION_COUNT ? "high" : "medium"),
     impact: Math.min(100, 55 + failures * 8),
     urgency: Math.min(100, 50 + failures * 10),
     confidence: 1,
@@ -847,7 +1238,7 @@ export const claimV1 = mutation({
 
     let snapshotResult;
     try {
-      snapshotResult = await authoritativeSnapshot(mission, state, jobs);
+      snapshotResult = await authoritativeSnapshot(ctx, mission, state, jobs);
     } catch (error) {
       if (!(error instanceof Error) || error.message !== "supervisor_snapshot_too_large") {
         throw error;
@@ -1084,5 +1475,697 @@ export const releaseFailureV1 = mutation({
       backoffMs,
       nextTickAt,
     };
+  },
+});
+
+function requireSha256Digest(value: string, field: string): string {
+  if (!/^[0-9a-f]{64}$/.test(value)) {
+    throw new Error(`${field} must be a lower-case SHA-256 digest`);
+  }
+  return value;
+}
+
+async function postSupervisorNotification(
+  ctx: Pick<MutationCtx, "db">,
+  mission: Mission,
+  decisionKey: string,
+  category: string,
+  text: string,
+  model: string,
+  now: number,
+) {
+  const requestId = `supervisor:${decisionKey}:${category}`;
+  return await ctx.db.insert("chatMessages", {
+    threadId: mission.originThreadId ?? "main",
+    role: "assistant",
+    text: truncateUtf8(redactSensitiveText(text), NOTIFICATION_MAX_BYTES),
+    status: "done",
+    model: truncateUtf8(model, 24),
+    requestId: truncateUtf8(requestId, 120),
+    delivery: "notification",
+    createdAt: now,
+  });
+}
+
+type NormalizedCommitEnvelope = {
+  decision: SupervisorDecisionInput;
+  payloadJson: string;
+  payloadDigest: string;
+  decisionKey: string;
+  rationale: string;
+  metadata: ReturnType<typeof normalizeCommitMetadata>;
+};
+
+async function normalizedCommitEnvelope(args: {
+  missionId: Id<"missions">;
+  leaseVersion: number;
+  expectedEpoch: number;
+  expectedDecisionSequence: number;
+  expectedInputRevision: number;
+  expectedSnapshotDigest: string;
+  decision: SupervisorDecisionInput;
+  rationale: string;
+} & CommitMetadataInput): Promise<NormalizedCommitEnvelope> {
+  const decision = normalizeSupervisorDecision(args.decision);
+  const metadata = normalizeCommitMetadata(decision, args);
+  const rationale = redactedBoundedText(
+    args.rationale,
+    "rationale",
+    1,
+    2_000,
+  );
+  const payloadJson = canonicalJson(decision);
+  if (utf8Bytes(payloadJson) > DECISION_PAYLOAD_MAX_BYTES) {
+    throw new Error(
+      `Canonical decision payload exceeds ${DECISION_PAYLOAD_MAX_BYTES} UTF-8 bytes`,
+    );
+  }
+  const payloadDigest = await sha256Hex(payloadJson);
+  const decisionKey = await sha256Hex(canonicalJson({
+    protocolVersion: 1,
+    missionId: String(args.missionId),
+    epoch: args.expectedEpoch,
+    sequence: args.expectedDecisionSequence,
+    observedInputRevision: args.expectedInputRevision,
+    snapshotDigest: args.expectedSnapshotDigest,
+    payloadDigest,
+  }));
+  return {
+    decision,
+    payloadJson,
+    payloadDigest,
+    decisionKey,
+    rationale,
+    metadata,
+  };
+}
+
+function decisionReceiptMatches(
+  receipt: Doc<"missionSupervisorDecisions">,
+  args: {
+    missionId: Id<"missions">;
+    leaseVersion: number;
+    expectedEpoch: number;
+    expectedDecisionSequence: number;
+    expectedInputRevision: number;
+    expectedSnapshotDigest: string;
+  },
+  envelope: NormalizedCommitEnvelope,
+) {
+  return receipt.missionId === args.missionId
+    && receipt.epoch === args.expectedEpoch
+    && receipt.sequence === args.expectedDecisionSequence
+    && receipt.observedInputRevision === args.expectedInputRevision
+    && receipt.snapshotDigest === args.expectedSnapshotDigest
+    && receipt.decisionKey === envelope.decisionKey
+    && receipt.kind === envelope.decision.kind
+    && receipt.payloadJson === envelope.payloadJson
+    && receipt.payloadDigest === envelope.payloadDigest;
+}
+
+function committedDecisionResult(
+  receipt: Doc<"missionSupervisorDecisions">,
+  replayed: boolean,
+) {
+  return {
+    committed: true as const,
+    replayed,
+    decisionId: receipt._id,
+    decisionKey: receipt.decisionKey,
+    kind: receipt.kind,
+    resultState: receipt.resultState,
+    nextTickAt: receipt.nextTickAt,
+    createdJobIds: receipt.createdJobIds,
+    attentionItemId: receipt.attentionItemId,
+    chatMessageIds: receipt.chatMessageIds,
+  };
+}
+
+type SynthesisGate =
+  | { ok: true; evidence: string[] }
+  | { ok: false; reason: string; jobId?: Id<"jobs"> };
+
+async function synthesisEvidence(
+  ctx: Pick<MutationCtx, "db">,
+  jobs: Doc<"jobs">[],
+): Promise<SynthesisGate> {
+  if (jobs.length === 0) {
+    return { ok: false, reason: "synthesis_requires_jobs" };
+  }
+  const evidence: string[] = [];
+  for (const job of jobs) {
+    const attempt = Number(job.attempt ?? 1);
+    if (
+      job.status !== "done"
+      || job.verificationVerdict !== "pass"
+      || !Number.isSafeInteger(attempt)
+      || attempt < 1
+      || !Number.isSafeInteger(job.supervisorEpoch)
+      || typeof job.supervisorDecisionKey !== "string"
+      || !Number.isSafeInteger(job.supervisorJobOrdinal)
+    ) {
+      return {
+        ok: false,
+        reason: "synthesis_job_not_verified",
+        jobId: job._id,
+      };
+    }
+    const [authority, receipts] = await Promise.all([
+      readAttemptExecutionAuthority(ctx, job, attempt),
+      ctx.db
+        .query("workReceipts")
+        .withIndex("by_job_attempt", (q) =>
+          q.eq("jobId", job._id).eq("attempt", attempt)
+        )
+        .take(2),
+    ]);
+    if (!authority || receipts.length !== 1) {
+      return {
+        ok: false,
+        reason: "synthesis_receipt_missing_or_ambiguous",
+        jobId: job._id,
+      };
+    }
+    const receipt = receipts[0];
+    const resultDigest = await sha256Hex(String(job.result ?? ""));
+    const evidenceDigest = await sha256Hex(String(job.verificationNote ?? ""));
+    if (
+      receipt.status !== "succeeded"
+      || receipt.verification !== "pass"
+      || receipt.authorityDigest !== authority.authorityDigest
+      || receipt.schedulingBindingDigest !== authority.schedulingBindingDigest
+      || receipt.workOrderRevisionId !== authority.workOrderRevisionId
+      || receipt.workOrderRevision !== authority.workOrderRevision
+      || receipt.workOrderRevisionDigest !== authority.workOrderRevisionDigest
+      || receipt.canonicalProjectId !== authority.canonicalProjectId
+      || receipt.repository !== authority.repository
+      || receipt.resultDigest !== resultDigest
+      || receipt.evidenceDigest !== evidenceDigest
+      || receipt.acceptanceEvidence.length < 1
+    ) {
+      return {
+        ok: false,
+        reason: "synthesis_receipt_binding_mismatch",
+        jobId: job._id,
+      };
+    }
+    const label = truncateUtf8(job.label ?? job.task, 80);
+    const accepted = truncateUtf8(
+      redactSensitiveText(receipt.acceptanceEvidence[0]),
+      300,
+    );
+    evidence.push(
+      truncateUtf8(
+        `${label} · receipt ${resultDigest.slice(0, 16)} · ${accepted}`,
+        500,
+      ),
+    );
+  }
+  return { ok: true, evidence };
+}
+
+function boundedSynthesisSummary(summary: string, evidence: readonly string[]) {
+  if (evidence.length === 0) {
+    return truncateUtf8(summary, SYNTHESIS_SUMMARY_MAX_BYTES);
+  }
+  const header = "\n\nVerified evidence:\n";
+  const evidenceBudget = 3_000;
+  const itemBudget = Math.max(
+    40,
+    Math.floor(
+      (evidenceBudget - utf8Bytes(header) - evidence.length * 3)
+        / evidence.length,
+    ),
+  );
+  const evidenceBlock = `${header}${evidence
+    .map((item) => `- ${truncateUtf8(item, itemBudget)}`)
+    .join("\n")}`;
+  const summaryBudget = Math.max(
+    0,
+    SYNTHESIS_SUMMARY_MAX_BYTES - utf8Bytes(evidenceBlock),
+  );
+  return `${truncateUtf8(summary, summaryBudget)}${evidenceBlock}`;
+}
+
+export const commitV1 = mutation({
+  args: {
+    missionId: v.id("missions"),
+    leaseOwner: v.string(),
+    leaseToken: v.string(),
+    leaseVersion: v.number(),
+    expectedEpoch: v.number(),
+    expectedDecisionSequence: v.number(),
+    expectedInputRevision: v.number(),
+    expectedSnapshotDigest: v.string(),
+    decision: supervisorDecisionValidator,
+    rationale: v.string(),
+    decisionOrigin: decisionOriginValidator,
+    modelProvider: modelProviderValidator,
+    modelTier: modelTierValidator,
+    modelId: v.string(),
+    reasoningEffort: reasoningEffortValidator,
+    tierReason: v.string(),
+    supervisorPromptVersion: v.string(),
+    triggerRunId: v.string(),
+    deploymentVersion: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    validateLeaseFenceInput(args);
+    requireSha256Digest(args.expectedSnapshotDigest, "expectedSnapshotDigest");
+    const envelope = await normalizedCommitEnvelope(args);
+
+    // Lost-response replay is resolved from append-only authority before any
+    // mutable lease/state read. The original result remains replayable after
+    // the mission has advanced, terminalized, or accepted new input.
+    const [slotRows, keyRows] = await Promise.all([
+      ctx.db
+        .query("missionSupervisorDecisions")
+        .withIndex("by_mission_epoch_sequence", (q) =>
+          q
+            .eq("missionId", args.missionId)
+            .eq("epoch", args.expectedEpoch)
+            .eq("sequence", args.expectedDecisionSequence)
+        )
+        .take(2),
+      ctx.db
+        .query("missionSupervisorDecisions")
+        .withIndex("by_key", (q) =>
+          q.eq("decisionKey", envelope.decisionKey)
+        )
+        .take(2),
+    ]);
+    if (slotRows.length > 1 || keyRows.length > 1) {
+      throw new Error("Supervisor decision authority is not unique");
+    }
+    const prior = slotRows[0] ?? keyRows[0];
+    if (prior) {
+      if (
+        slotRows[0]?._id !== prior._id
+        || keyRows[0]?._id !== prior._id
+        || !decisionReceiptMatches(prior, args, envelope)
+      ) {
+        throw new Error(
+          "Supervisor decision slot conflicts with a different immutable decision",
+        );
+      }
+      return committedDecisionResult(prior, true);
+    }
+
+    const state = await stateForMission(ctx, args.missionId);
+    if (!state) {
+      return {
+        committed: false as const,
+        replayed: false,
+        reason: "missing_state",
+      };
+    }
+    if (!leaseFenceMatches(state, args)) {
+      return {
+        committed: false as const,
+        replayed: false,
+        reason: "fence_mismatch",
+      };
+    }
+    if (state.inputRevision !== args.expectedInputRevision) {
+      return {
+        committed: false as const,
+        replayed: false,
+        reason: "input_revision_mismatch",
+      };
+    }
+    if (state.lastSnapshotDigest !== args.expectedSnapshotDigest) {
+      return {
+        committed: false as const,
+        replayed: false,
+        reason: "snapshot_digest_mismatch",
+      };
+    }
+    const now = Date.now();
+    if ((state.leaseUntil ?? 0) <= now) {
+      return {
+        committed: false as const,
+        replayed: false,
+        reason: "lease_expired",
+      };
+    }
+    if (state.deadlineAt <= now) {
+      return {
+        committed: false as const,
+        replayed: false,
+        reason: "deadline_reached",
+      };
+    }
+    if (
+      state.decisionCount >= state.maxDecisions
+      || state.decisionCount >= MISSION_SUPERVISOR_MAX_DECISIONS
+    ) {
+      return {
+        committed: false as const,
+        replayed: false,
+        reason: "decision_limit_reached",
+      };
+    }
+    const mission = await ctx.db.get(args.missionId);
+    if (
+      !mission
+      || mission.mode !== "supervised"
+      || mission.status !== "running"
+      || mission.admissionProtocolVersion !== 2
+    ) {
+      return {
+        committed: false as const,
+        replayed: false,
+        reason: "invalid_mission",
+      };
+    }
+
+    const createdJobIds: Id<"jobs">[] = [];
+    const chatMessageIds: Id<"chatMessages">[] = [];
+    let attentionItemId: Id<"attentionItems"> | undefined;
+    let nextTickAt: number | undefined;
+    let resultState:
+      | "ready"
+      | "waiting"
+      | "needs_input"
+      | "terminal";
+    let totalJobs = state.totalJobs;
+    let missionPatch: Record<string, unknown> = { updatedAt: now };
+
+    if (envelope.decision.kind === "delegate") {
+      const existingJobs = await ctx.db
+        .query("jobs")
+        .withIndex("by_mission", (q) =>
+          q.eq("missionId", String(args.missionId))
+        )
+        .take(MISSION_SUPERVISOR_MAX_JOBS + 1);
+      if (
+        existingJobs.length > MISSION_SUPERVISOR_MAX_JOBS
+        || existingJobs.length !== state.totalJobs
+      ) {
+        return {
+          committed: false as const,
+          replayed: false,
+          reason: "job_ledger_mismatch",
+        };
+      }
+      if (
+        existingJobs.length + envelope.decision.workstreams.length
+          > Math.min(MISSION_SUPERVISOR_MAX_JOBS, state.maxJobs)
+      ) {
+        return {
+          committed: false as const,
+          replayed: false,
+          reason: "job_limit_reached",
+        };
+      }
+      const admissions = mission.projectAdmissions ?? [];
+      if (!await validProjectAdmissions(admissions)) {
+        throw new Error("Supervisor mission project admission ledger is invalid");
+      }
+      const planned = envelope.decision.workstreams.map((workstream, index) => {
+        const repo = workstream.repo ?? mission.primaryRepo;
+        const projectAdmission = admissionForRepository(admissions, repo);
+        if (!projectAdmission) {
+          throw new Error(
+            `decision.workstreams[${index}] is outside the mission project admissions`,
+          );
+        }
+        const readonly = Boolean(workstream.readonly || !repo);
+        const approval = workApprovalPolicy({
+          task: workstream.task,
+          repo,
+          readonly,
+          risk: workstream.risk,
+          approvalRequired: workstream.approvalRequired,
+        });
+        return {
+          workstream,
+          repo,
+          readonly,
+          approval,
+          projectAdmission,
+          ordinal: index,
+        };
+      });
+      const existingWork = new Set(existingJobs.map((job) =>
+        delegatedWorkIdentity({
+          agentId: job.agentId,
+          repo: job.repo,
+          task: job.task,
+        })
+      ));
+      const plannedWork = planned.map((item) =>
+        delegatedWorkIdentity({
+          agentId: item.workstream.agentId,
+          repo: item.repo,
+          task: item.workstream.task,
+        })
+      );
+      if (
+        new Set(plannedWork).size !== plannedWork.length
+        || plannedWork.some((fingerprint) => existingWork.has(fingerprint))
+      ) {
+        throw new Error(
+          "delegate.workstreams duplicates existing mission work",
+        );
+      }
+      for (const item of planned) {
+        const approvalRequired = item.approval.required;
+        const jobId = await insertJobWithRuntime(ctx, {
+          admissionProtocolVersion: 2,
+          projectAdmission: item.projectAdmission,
+          requireFreshSourceAdmission: false,
+          missionId: String(args.missionId),
+          supervisorEpoch: args.expectedEpoch,
+          supervisorDecisionKey: envelope.decisionKey,
+          supervisorJobOrdinal: item.ordinal,
+          task: item.workstream.task,
+          label: item.workstream.label,
+          repo: item.repo,
+          model: item.workstream.model,
+          agentId: item.workstream.agentId,
+          readonly: item.readonly,
+          approvalRequired,
+          approvalReason: item.approval.reason,
+          approvalStatus: approvalRequired ? "pending" : undefined,
+          deliveryMode: item.approval.deliveryMode,
+          risk: approvalRequired ? "consequential" : item.workstream.risk,
+          priority: mission.priority ?? 50,
+          acceptanceCriteria: item.workstream.acceptanceCriteria,
+          dependsOn: [],
+          dispatchReady: true,
+          originThreadId: mission.originThreadId ?? "main",
+          visibility: "conversation",
+          status: approvalRequired ? "awaiting_approval" : "pending",
+          stage: approvalRequired ? "approval" : "queued",
+          percent: 0,
+          progressAt: now,
+          stallCount: 0,
+          steerRevision: 0,
+          attempt: 1,
+          maxAttempts: 12,
+          nextRunAt: now,
+          createdAt: now,
+        });
+        createdJobIds.push(jobId);
+        if (approvalRequired) {
+          await ctx.db.insert("approvals", {
+            jobId: String(jobId),
+            kind: "consequential-work",
+            summary: item.workstream.label.slice(0, 240),
+            risk: "consequential",
+            payload: {
+              repo: item.repo,
+              agentId: item.workstream.agentId,
+              reason: item.approval.reason,
+            },
+            status: "pending",
+            requestedAt: now,
+          });
+        }
+      }
+      totalJobs = existingJobs.length + createdJobIds.length;
+      nextTickAt = now + SUPERVISOR_DELEGATE_RECHECK_MS;
+      resultState = "waiting";
+      missionPatch = {
+        agentCount: totalJobs,
+        phase: "executing",
+        updatedAt: now,
+      };
+    } else if (envelope.decision.kind === "wait") {
+      nextTickAt = now + envelope.decision.delayMs;
+      resultState = "waiting";
+      missionPatch = { phase: "supervising", updatedAt: now };
+    } else if (envelope.decision.kind === "request_input") {
+      attentionItemId = await upsertSupervisorAttention(
+        ctx,
+        mission,
+        "supervisor_request_input",
+        state.consecutiveFailures,
+        envelope.decision.question,
+        now,
+      );
+      chatMessageIds.push(await postSupervisorNotification(
+        ctx,
+        mission,
+        envelope.decisionKey,
+        "request-input",
+        `JARVIS needs your input · ${envelope.decision.question}`,
+        envelope.metadata.modelId,
+        now,
+      ));
+      resultState = "needs_input";
+      missionPatch = {
+        status: "needs_input",
+        phase: "needs_input",
+        failureReason: envelope.decision.question,
+        updatedAt: now,
+      };
+    } else if (envelope.decision.kind === "replan") {
+      nextTickAt = now;
+      resultState = "ready";
+      missionPatch = {
+        phase: "planning",
+        failureReason: undefined,
+        updatedAt: now,
+      };
+    } else if (envelope.decision.kind === "synthesize") {
+      const jobs = await ctx.db
+        .query("jobs")
+        .withIndex("by_mission", (q) =>
+          q.eq("missionId", String(args.missionId))
+        )
+        .take(MISSION_SUPERVISOR_MAX_JOBS + 1);
+      if (
+        jobs.length > MISSION_SUPERVISOR_MAX_JOBS
+        || jobs.length !== state.totalJobs
+      ) {
+        return {
+          committed: false as const,
+          replayed: false,
+          reason: "job_ledger_mismatch",
+        };
+      }
+      const gate = await synthesisEvidence(ctx, jobs);
+      if (!gate.ok) {
+        return {
+          committed: false as const,
+          replayed: false,
+          reason: gate.reason,
+          jobId: gate.jobId,
+        };
+      }
+      const summary = boundedSynthesisSummary(
+        envelope.decision.summary,
+        gate.evidence,
+      );
+      chatMessageIds.push(await postSupervisorNotification(
+        ctx,
+        mission,
+        envelope.decisionKey,
+        "synthesized",
+        `Mission complete · ${mission.goal}\n${summary}`,
+        envelope.metadata.modelId,
+        now,
+      ));
+      resultState = "terminal";
+      missionPatch = {
+        status: "done",
+        phase: "done",
+        percent: 100,
+        summary,
+        failureReason: undefined,
+        completedAt: now,
+        updatedAt: now,
+      };
+    } else {
+      const reason = envelope.decision.reason;
+      attentionItemId = await upsertSupervisorAttention(
+        ctx,
+        mission,
+        "supervisor_terminal_failure",
+        state.consecutiveFailures,
+        reason,
+        now,
+        {
+          fingerprintSuffix: "failed",
+          titlePrefix: "Supervisor mission failed",
+          severity: "high",
+        },
+      );
+      chatMessageIds.push(await postSupervisorNotification(
+        ctx,
+        mission,
+        envelope.decisionKey,
+        "failed",
+        `Mission stopped safely · ${mission.goal}\n${reason}`,
+        envelope.metadata.modelId,
+        now,
+      ));
+      resultState = "terminal";
+      missionPatch = {
+        status: "failed",
+        phase: "failed",
+        failureReason: reason,
+        completedAt: now,
+        updatedAt: now,
+      };
+    }
+
+    const decisionId = await ctx.db.insert("missionSupervisorDecisions", {
+      protocolVersion: 1,
+      missionId: args.missionId,
+      epoch: args.expectedEpoch,
+      sequence: args.expectedDecisionSequence,
+      decisionKey: envelope.decisionKey,
+      observedInputRevision: args.expectedInputRevision,
+      snapshotDigest: args.expectedSnapshotDigest,
+      kind: envelope.decision.kind,
+      payloadJson: envelope.payloadJson,
+      payloadDigest: envelope.payloadDigest,
+      rationale: envelope.rationale,
+      decisionOrigin: envelope.metadata.decisionOrigin,
+      modelProvider: envelope.metadata.modelProvider,
+      modelTier: envelope.metadata.modelTier,
+      modelId: envelope.metadata.modelId,
+      reasoningEffort: envelope.metadata.reasoningEffort,
+      tierReason: envelope.metadata.tierReason,
+      supervisorPromptVersion: envelope.metadata.supervisorPromptVersion,
+      leaseVersion: args.leaseVersion,
+      triggerRunId: envelope.metadata.triggerRunId,
+      deploymentVersion: envelope.metadata.deploymentVersion,
+      createdJobIds,
+      attentionItemId,
+      chatMessageIds,
+      resultState,
+      nextTickAt,
+      createdAt: now,
+    });
+    await ctx.db.patch(state._id, {
+      state: resultState,
+      epoch: envelope.decision.kind === "replan"
+        ? state.epoch + 1
+        : state.epoch,
+      nextDecisionSequence: state.nextDecisionSequence + 1,
+      handledInputRevision: state.inputRevision,
+      dirtyJobIds: [],
+      nextTickAt,
+      ...clearLease(),
+      totalJobs,
+      decisionCount: state.decisionCount + 1,
+      lastDecisionKey: envelope.decisionKey,
+      lastDecisionDigest: envelope.payloadDigest,
+      lastDecisionAt: now,
+      consecutiveFailures: 0,
+      lastErrorCode: undefined,
+      lastErrorAt: undefined,
+      updatedAt: now,
+    });
+    await patchMissionWithRuntime(ctx, mission, missionPatch);
+    const receipt = await ctx.db.get(decisionId);
+    if (!receipt) throw new Error("Supervisor decision receipt was not persisted");
+    return committedDecisionResult(receipt, false);
   },
 });

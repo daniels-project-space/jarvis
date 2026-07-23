@@ -286,7 +286,7 @@ describe("mission supervisor schema authority", () => {
         ...stateBase,
         requestKey: "request:invalid",
         state: "running",
-      } as any,
+      } as never,
     ))).rejects.toThrow();
 
     const decisionBase = {
@@ -298,6 +298,7 @@ describe("mission supervisor schema authority", () => {
       payloadJson: "{}",
       payloadDigest: "c".repeat(64),
       rationale: "bounded authority test",
+      decisionOrigin: "model" as const,
       modelProvider: "codex-subscription" as const,
       modelTier: "luna" as const,
       modelId: "gpt-5.6-luna",
@@ -328,6 +329,16 @@ describe("mission supervisor schema authority", () => {
           kind,
         });
       }
+      await ctx.db.insert("missionSupervisorDecisions", {
+        ...decisionBase,
+        sequence: 50,
+        decisionKey: "decision:deterministic-policy",
+        kind: "wait",
+        decisionOrigin: "policy",
+        modelProvider: "deterministic-policy",
+        modelId: "jarvis-supervisor-policy-v1",
+        reasoningEffort: "none",
+      });
     });
     await expect(t.run(async (ctx) => await ctx.db.insert(
       "missionSupervisorDecisions",
@@ -336,7 +347,7 @@ describe("mission supervisor schema authority", () => {
         sequence: 99,
         decisionKey: "decision:invalid-kind",
         kind: "approve",
-      } as any,
+      } as never,
     ))).rejects.toThrow();
     await expect(t.run(async (ctx) => await ctx.db.insert(
       "missionSupervisorDecisions",
@@ -346,7 +357,27 @@ describe("mission supervisor schema authority", () => {
         decisionKey: "decision:invalid-model",
         kind: "wait",
         modelTier: "cheap",
-      } as any,
+      } as never,
+    ))).rejects.toThrow();
+    await expect(t.run(async (ctx) => await ctx.db.insert(
+      "missionSupervisorDecisions",
+      {
+        ...decisionBase,
+        sequence: 101,
+        decisionKey: "decision:invalid-origin",
+        kind: "wait",
+        decisionOrigin: "controller",
+      } as never,
+    ))).rejects.toThrow();
+    await expect(t.run(async (ctx) => await ctx.db.insert(
+      "missionSupervisorDecisions",
+      {
+        ...decisionBase,
+        sequence: 102,
+        decisionKey: "decision:invalid-provider",
+        kind: "wait",
+        modelProvider: "openai-api",
+      } as never,
     ))).rejects.toThrow();
   });
 });
