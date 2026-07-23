@@ -12,12 +12,21 @@ type CommandOutcome = { exitCode: number; logs: Log[] };
 const observed: {
   create?: Record<string, unknown>; get?: Record<string, unknown>; commands: Record<string, unknown>[];
   deletes: string[]; updates: unknown[]; updateSessions: string[]; kills: string[]; waits: string[]; logConsumers: string[]; logsClosed: number; files: Map<string, Buffer>; mkdirs: string[]; reads: string[]; readSessions: string[]; writeSessions: string[];
+  readSignals: AbortSignal[]; updateSignals: AbortSignal[]; readAcquireStall?: boolean; readStream?: Readable; updateStall?: (policy: unknown) => boolean;
   logs: Log[]; createGate?: Promise<void>; waitGate?: Promise<void>; releaseWaitOnKill?: () => void; logCloseGate?: Promise<void>; waitFailure?: unknown; fenceWaitFailure?: unknown; deleteFailure?: unknown;
   exitCode: number; commandExit?: (input: Record<string, unknown>) => number; commandExecutor?: (input: Record<string, unknown>) => CommandOutcome | undefined;
   updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; runCommandHook?: (input: Record<string, unknown>, session: FakeSession) => void; getFailure?: unknown;
   listed: Array<{ name?: string; status: string }>; listedPages?: Array<Array<{ name?: string; status: string }>>; listedPageNext?: Array<string | null>; listInputs: Record<string, unknown>[];
   listGate?: Promise<void>; listPageGate?: Promise<void>; sandboxCreateGate?: Promise<void>;
-} = { commands: [], deletes: [], updates: [], updateSessions: [], kills: [], waits: [], logConsumers: [], logsClosed: 0, files: new Map(), mkdirs: [], reads: [], readSessions: [], writeSessions: [], logs: [], exitCode: 0, listed: [], listInputs: [] };
+} = { commands: [], deletes: [], updates: [], updateSessions: [], kills: [], waits: [], logConsumers: [], logsClosed: 0, files: new Map(), mkdirs: [], reads: [], readSessions: [], writeSessions: [], readSignals: [], updateSignals: [], logs: [], exitCode: 0, listed: [], listInputs: [] };
+
+function rejectWhenAborted(signal: AbortSignal | undefined): Promise<never> {
+  if (!signal) return new Promise<never>(() => undefined);
+  if (signal.aborted) return Promise.reject(new DOMException("aborted", "AbortError"));
+  return new Promise<never>((_resolve, reject) => {
+    signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+  });
+}
 
 class FakeCommand {
   readonly cmdId = `cmd-${observed.commands.length}`;
@@ -32,7 +41,8 @@ class FakeCommand {
     return { exitCode: this.exitCode, durationMs: 1 };
   }
   async kill(signal?: string) { observed.kills.push(`${this.cmdId}:${signal}`); this.exitCode = 137; observed.releaseWaitOnKill?.(); }
-  logs(_opts?: { signal?: AbortSignal }) {
+  logs(options?: { signal?: AbortSignal }) {
+    void options;
     observed.logConsumers.push(this.cmdId);
     let closed = false;
     const logs = this.outcome?.logs ?? observed.logs;
@@ -55,13 +65,22 @@ class FakeSession {
     return command;
   }
   async mkDir(path: string) { observed.mkdirs.push(path); }
-  async readFile({ path }: { path: string }) { observed.reads.push(path); observed.readSessions.push(this.sessionId); return observed.files.has(path) ? Readable.from([observed.files.get(path)!]) : null; }
+  async readFile({ path }: { path: string }, options?: { signal?: AbortSignal }) {
+    observed.reads.push(path);
+    observed.readSessions.push(this.sessionId);
+    if (options?.signal) observed.readSignals.push(options.signal);
+    if (observed.readAcquireStall) await rejectWhenAborted(options?.signal);
+    if (observed.readStream) return observed.readStream;
+    return observed.files.has(path) ? Readable.from([observed.files.get(path)!]) : null;
+  }
   async writeFiles(files: Array<{ path: string; content: Uint8Array }>) {
     observed.writeSessions.push(this.sessionId);
     for (const file of files) observed.files.set(file.path, Buffer.from(file.content));
     observed.writeHook?.();
   }
-  async update({ networkPolicy }: { networkPolicy?: unknown }) {
+  async update({ networkPolicy }: { networkPolicy?: unknown }, options?: { signal?: AbortSignal }) {
+    if (options?.signal) observed.updateSignals.push(options.signal);
+    if (observed.updateStall?.(networkPolicy)) await rejectWhenAborted(options?.signal);
     if (observed.updateFailure === networkPolicy) throw new Error("policy transition failed");
     this.networkPolicy = networkPolicy; observed.updates.push(networkPolicy); observed.updateSessions.push(this.sessionId); observed.updateHook?.(networkPolicy);
   }
@@ -110,9 +129,9 @@ class FakeSandbox {
 
 vi.mock("@vercel/sandbox", () => ({ Sandbox: FakeSandbox }));
 
-async function providerAndWorkspace() {
+async function providerAndWorkspace(deadlines?: { listMs: number; createMs: number; controlMs: number }) {
   const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
-  const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+  const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1", deadlines);
   const workspace = await provider.createWorkspace({ attemptKey: "job:1", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS });
   return { provider, workspace };
 }
@@ -140,6 +159,7 @@ function executeExactListingProgram(input: Record<string, unknown>): CommandOutc
 beforeEach(() => {
   observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.updateSessions = []; observed.kills = []; observed.waits = []; observed.logConsumers = []; observed.logsClosed = 0;
   observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.readSessions = []; observed.writeSessions = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.releaseWaitOnKill = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.fenceWaitFailure = undefined; observed.deleteFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
+  observed.readSignals = []; observed.updateSignals = []; observed.readAcquireStall = undefined; observed.readStream = undefined; observed.updateStall = undefined;
   observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.runCommandHook = undefined; observed.commandExecutor = undefined; observed.getFailure = undefined; observed.listed = []; observed.listedPages = undefined; observed.listedPageNext = undefined; observed.listInputs = []; FakeSandbox.current = new FakeSession();
   observed.listGate = undefined; observed.listPageGate = undefined; observed.sandboxCreateGate = undefined;
 });
@@ -271,6 +291,46 @@ describe("VercelCloudWorkspaceProvider", () => {
     await expect(provider.readFile(workspace, "safe.txt", 10)).rejects.toMatchObject({ code: "unsafe_archive" });
   });
 
+  it("aborts stalled file-stream acquisition and exact-cleans dependency hydration", async () => {
+    const { provider, workspace } = await providerAndWorkspace({ listMs: 50, createMs: 50, controlMs: 5 });
+    observed.files.set(`${workspace.root}/package-lock.json`, Buffer.from(JSON.stringify({ lockfileVersion: 3, packages: {} })));
+    observed.readAcquireStall = true;
+
+    await expect(provider.hydrateDependencies(workspace)).rejects.toMatchObject({
+      code: "timeout",
+      disposition: "deferred",
+    });
+    expect(observed.readSignals).toHaveLength(1);
+    expect(observed.readSignals[0]?.aborted).toBe(true);
+    expect(observed.commands.some((command) => String(command.args).includes("npm ci"))).toBe(false);
+    expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
+  });
+
+  it("aborts and destroys a stalled file-stream iteration before exact cleanup", async () => {
+    const { provider, workspace } = await providerAndWorkspace({ listMs: 50, createMs: 50, controlMs: 5 });
+    observed.files.set(`${workspace.root}/package-lock.json`, Buffer.from(JSON.stringify({ lockfileVersion: 3, packages: {} })));
+    let emitted = false;
+    const stream = new Readable({
+      read() {
+        if (!emitted) {
+          emitted = true;
+          this.push(Buffer.from('{"lockfileVersion":3'));
+        }
+      },
+    });
+    observed.readStream = stream;
+
+    await expect(provider.hydrateDependencies(workspace)).rejects.toMatchObject({
+      code: "timeout",
+      disposition: "deferred",
+    });
+    expect(observed.readSignals).toHaveLength(1);
+    expect(observed.readSignals[0]?.aborted).toBe(true);
+    expect(stream.destroyed).toBe(true);
+    expect(observed.commands.some((command) => String(command.args).includes("npm ci"))).toBe(false);
+    expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
+  });
+
   it("creates only the fenced repository root through the exact Session before controller writes", async () => {
     const { provider, workspace } = await providerAndWorkspace();
     const bytes = createDeterministicTar([{ path: "package.json", data: new TextEncoder().encode("{}") }]);
@@ -324,6 +384,33 @@ describe("VercelCloudWorkspaceProvider", () => {
     };
     await expect(provider.hydrateDependencies(workspace)).rejects.toMatchObject({ code: "stale_attempt" });
     expect(observed.commands.some((command) => String(command.args).includes("npm ci"))).toBe(false);
+    expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
+  });
+
+  it.each([
+    {
+      label: "allow-only transition",
+      stalls: (policy: unknown) => typeof policy === "object",
+      npmStarted: false,
+    },
+    {
+      label: "deny-all relock",
+      stalls: (policy: unknown) => policy === "deny-all",
+      npmStarted: true,
+    },
+  ])("aborts a stalled $label and exact-cleans before returning", async ({ stalls, npmStarted }) => {
+    const { provider, workspace } = await providerAndWorkspace({ listMs: 50, createMs: 50, controlMs: 5 });
+    observed.files.set(`${workspace.root}/package-lock.json`, Buffer.from(JSON.stringify({ lockfileVersion: 3, packages: {} })));
+    observed.updateStall = stalls;
+
+    await expect(provider.hydrateDependencies(workspace)).rejects.toMatchObject({
+      code: "timeout",
+      disposition: "deferred",
+    });
+    expect(observed.updateSignals.length).toBeGreaterThan(0);
+    expect(observed.updateSignals.some((signal) => signal.aborted)).toBe(true);
+    expect(observed.commands.some((command) => String(command.args).includes("npm ci"))).toBe(npmStarted);
+    expect(observed.commands.some((command) => String(command.args).includes("fetch("))).toBe(false);
     expect(observed.deletes).toEqual([workspace.providerWorkspaceId]);
   });
 

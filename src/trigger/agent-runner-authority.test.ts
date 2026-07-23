@@ -1015,6 +1015,58 @@ describe("production Trigger worker authority harness", () => {
   });
 
   it.each([
+    "sandbox file read acquisition",
+    "sandbox file read iteration",
+    "sandbox network policy relock",
+  ])("requeues a stalled %s before any Codex boundary", async (operation) => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const suffix = operation.replace(/\s+/g, "-");
+    const { jobId, reservation } = await reservedWritableJob(t, `runner-${suffix}-timeout`);
+    const bridge = bridgeProductionRunnerToConvex(t);
+    const trace: BoundaryTrace[] = [];
+    const dependencies = injectedRunnerDependencies({ boundaries: trace });
+    (dependencies.prepareCloudWorkspaceExecution as any).mockImplementation(async (input: any) => {
+      await input.onStage("provider_list");
+      await input.onStage("provider_create");
+      await input.onStage("source_upload");
+      await input.onStage("dependency_hydration");
+      throw new CloudWorkspaceError("vercel", "timeout", `Vercel Sandbox ${operation} exceeded its controller deadline`, "deferred");
+    });
+
+    expect(await invokeHarness(reservation, `${suffix}-run`, dependencies))
+      .toEqual({ processed: 1 });
+    const state = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      attempts: await Promise.all([1, 2].map((attempt) => ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", attempt))
+        .first())),
+    }));
+    expect(state.job).toMatchObject({ status: "pending", attempt: 2 });
+    expect(state.attempts.find((attempt) => attempt?.attempt === 1)).toMatchObject({
+      status: "checkpointed",
+      workerRunId: `${suffix}-run`,
+    });
+    expect(state.attempts.find((attempt) => attempt?.attempt === 2)).toMatchObject({ status: "pending" });
+    expect(String(state.job?.checkpoint)).toContain(operation);
+    expect((dependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
+    expect((dependencies.prepareSubscriptionEnv as any)).not.toHaveBeenCalled();
+    expect(trace.map((item) => item.effect)).toEqual(["source_checkout", "provider_create"]);
+    expect(bridge.trace
+      .filter((call) => call.path === "jobs:updateProgress")
+      .map((call) => call.args.stage)).toEqual([
+      "source clone",
+      "checkpoint store",
+      "source archive",
+      "workspace hydrate",
+      "provider list",
+      "provider create",
+      "source upload",
+      "dependency hydrate",
+    ]);
+  });
+
+  it.each([
     {
       phase: "provider_create",
       occurrence: 1,

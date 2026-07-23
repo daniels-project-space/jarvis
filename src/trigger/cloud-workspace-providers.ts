@@ -233,8 +233,8 @@ abstract class ProviderBase implements CloudWorkspaceProvider {
   protected get paths() { return providerPaths(this.workspaceRoot); }
   /** Providers with a stricter filesystem fence may derive control paths from
    * the attempt identity. The default preserves the legacy provider layout. */
-  protected pathsFor(_workspace: CloudWorkspace) { return this.paths; }
-  protected async prepareWorkspace(_workspace: CloudWorkspace): Promise<void> {}
+  protected pathsFor(workspace: CloudWorkspace) { void workspace; return this.paths; }
+  protected async prepareWorkspace(workspace: CloudWorkspace): Promise<void> { void workspace; }
   protected async cleanupOrBlock(workspace: CloudWorkspace, original: unknown, message: string): Promise<never> {
     try { await this.terminate(workspace, "terminal"); }
     catch { throw new CloudWorkspaceError(this.name, "cleanup_blocked", message, "blocked"); }
@@ -915,20 +915,41 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     observed = await this.assertNoSymlink(workspace, observed.sandbox, observed.session, absolute, false);
     // Never read through the pre-lstat Session snapshot. The lstat command is
     // itself a substitution boundary and returns this freshly observed one.
-    const stream = await observed.session.readFile({ path: absolute });
-    if (!stream) throw new CloudWorkspaceError(this.name, "provider_unavailable", "sandbox file is missing", "deferred");
-    const chunks: Buffer[] = []; let used = 0;
-    try {
-      for await (const value of stream) {
-        const bytes = typeof value === "string" ? Buffer.byteLength(value) : value.byteLength;
-        if (bytes > maxBytes - used) throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds read limit", "rejected");
-        const chunk = Buffer.isBuffer(value)
-          ? value
-          : Buffer.from(value);
-        chunks.push(chunk); used += chunk.byteLength;
+    // One deadline owns both stream acquisition and complete iteration. The
+    // explicit abort listener also closes a stream whose iterator ignores its
+    // SDK signal, so a stalled body cannot outlive the controller boundary.
+    const bytes = await this.controlCall("sandbox file read", async (signal) => {
+      let stream: (NodeJS.ReadableStream & { destroy?: () => void; close?: () => void }) | null = null;
+      const destroy = () => {
+        if (stream?.destroy) stream.destroy();
+        else stream?.close?.();
+      };
+      try {
+        stream = await observed.session.readFile({ path: absolute }, { signal });
+        if (!stream) throw new CloudWorkspaceError(this.name, "provider_unavailable", "sandbox file is missing", "deferred");
+        if (signal.aborted) {
+          destroy();
+          throw new DOMException("sandbox file read aborted", "AbortError");
+        }
+        signal.addEventListener("abort", destroy, { once: true });
+        const chunks: Buffer[] = [];
+        let used = 0;
+        for await (const value of stream) {
+          const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+          if (chunk.byteLength > maxBytes - used) {
+            throw new CloudWorkspaceError(this.name, "resource_limit", "file exceeds read limit", "rejected");
+          }
+          chunks.push(chunk);
+          used += chunk.byteLength;
+        }
+        return new Uint8Array(Buffer.concat(chunks, used));
+      } finally {
+        signal.removeEventListener("abort", destroy);
+        destroy();
       }
-    } finally { (stream as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.(); }
-    await this.observeFreshSession(workspace); return new Uint8Array(Buffer.concat(chunks, used));
+    });
+    await this.observeFreshSession(workspace);
+    return bytes;
   }
   async writeFile(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) { return this.writeAbsolute(workspace, safeWorkspacePath(workspace, path), data, maxBytes); }
   protected async writeAbsolute(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number) {
@@ -1023,7 +1044,8 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     }
   }
 
-  async terminate(workspace: CloudWorkspace, _reason: "terminal" | "orphan" | "cancelled" = "terminal") {
+  async terminate(workspace: CloudWorkspace, reason: "terminal" | "orphan" | "cancelled" = "terminal") {
+    void reason;
     // Termination is authorized only for the random, attempt-owned name. It
     // deliberately does not read or resume a session, so a stopped/replaced
     // session cannot make cleanup start compute or skip deletion.
@@ -1094,7 +1116,10 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
 
   private async transitionNetworkPolicy(workspace: CloudWorkspace, networkPolicy: "deny-all" | typeof VERCEL_NPM_POLICY): Promise<{ sandbox: VercelSandbox; session: VercelSession }> {
     const observed = await this.observeFreshSession(workspace);
-    await observed.session.update({ networkPolicy });
+    await this.controlCall(
+      "sandbox network policy update",
+      (signal) => observed.session.update({ networkPolicy }, { signal }),
+    );
     // update is a provider-side transition, so preserve a fresh post-boundary
     // observation rather than trusting the object that submitted it.
     return this.observeFreshSession(workspace);
