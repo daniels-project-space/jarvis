@@ -15,7 +15,7 @@ export const TOOL_BELTS: Record<string, Set<string>> = {
     "creations_list", "youtube_search", "youtube_transcript", "music_search", "visual_scene",
   ]),
   travel: new Set([
-    "trip_open", "trip_plan", "trip_update", "trip_finalize", "flight_search", "open_travel_site", "places_near",
+    "trip_open", "trip_plan", "trip_update", "trip_finalize", "bookings_check", "flight_search", "open_travel_site", "places_near",
     "transport_route",
   ]),
   business: new Set([

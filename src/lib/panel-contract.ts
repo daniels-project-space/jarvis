@@ -68,6 +68,7 @@ export function resolvePanelRoute(panel: PanelInput): PanelRoute {
     case "widget:briefing":
     case "widget:briefing2": size = "w-[96%] md:w-[min(980px,calc(100%-250px))] h-[min(700px,90%)]"; break;
     case "widget:calendar":
+    case "widget:bookings":
     case "widget:todos": size = "w-[96%] md:w-[min(900px,calc(100%-250px))] h-[min(680px,88%)]"; break;
     case "widget:net_worth_loading":
     case "widget:stats": size = "w-[96%] h-[min(680px,92%)]"; break;

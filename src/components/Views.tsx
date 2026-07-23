@@ -137,6 +137,49 @@ export function CalendarView({ value }: { value: string }) {
   );
 }
 
+/* --------------------------- booking confirmations -------------------------- */
+
+export function BookingsView({ value }: { value: string }) {
+  let w: { label?: string; calendarAdded?: number; items?: { type?: string; title?: string; provider?: string; when?: string; reference?: string; calendar?: boolean }[] } | null = null;
+  try {
+    w = JSON.parse(value);
+  } catch {
+    /* noop */
+  }
+  if (!w) return <PanelUnavailable label="booking confirmations" />;
+  const icon: Record<string, string> = { flight: "✈", stay: "🏨", activity: "🎟", transport: "🚆", dining: "🍽", reservation: "📌" };
+  const entries = w.items ?? [];
+  return (
+    <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-5">
+      <div className="mx-auto max-w-3xl">
+        <div className="mb-4 flex items-end justify-between gap-3">
+          <div>
+            <div className="hud-label">Gmail · read-only</div>
+            <div className="text-xl font-semibold text-ice">{w.label ?? "Confirmed bookings"}</div>
+          </div>
+          <div className="rounded-lg border border-cyan/25 bg-cyan/10 px-2 py-1 text-[10px] text-cyan">
+            {w.calendarAdded ? `${w.calendarAdded} calendar ${w.calendarAdded === 1 ? "entry" : "entries"} added` : "calendar checked"}
+          </div>
+        </div>
+        {!entries.length && <div className="glass rounded-xl p-7 text-center text-sm text-slate">No confirmed bookings found in this scan.</div>}
+        <div className="space-y-2">
+          {entries.map((entry, index) => (
+            <div key={`${entry.title}-${index}`} className="glass flex items-start gap-3 rounded-xl p-3">
+              <span className="mt-0.5 text-xl">{icon[String(entry.type)] ?? "📌"}</span>
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm font-medium text-ice">{entry.title}</div>
+                <div className="mt-0.5 text-xs text-slate">{entry.when ?? "date not found"}{entry.provider ? ` · ${entry.provider}` : ""}</div>
+                {entry.reference && <div className="mt-1 font-mono text-[10px] text-cyan/80">ref {entry.reference}</div>}
+              </div>
+              {entry.calendar && <span className="rounded border border-white/10 px-1.5 py-0.5 text-[9px] text-slate">calendar</span>}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ---------------------------------- tickable to-dos ---------------------------------- */
 
 export function TodosView({ value }: { value: string }) {

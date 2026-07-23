@@ -30,7 +30,7 @@ import {
   spectrumBandLevel,
   type LiveVadState,
 } from "@/lib/live-vad";
-import { CalendarView, CanvasView, LaunchView, PdfView, CreationsView, StructuredListView, CandlesView, MarketChartLoading, VideoListView, GoalModeLauncherView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView, PanelUnavailable } from "./Views";
+import { BookingsView, CalendarView, CanvasView, LaunchView, PdfView, CreationsView, StructuredListView, CandlesView, MarketChartLoading, VideoListView, GoalModeLauncherView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView, PanelUnavailable } from "./Views";
 import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
 import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate, shouldIgnoreHandsFreeTranscript } from "@/lib/transcript";
@@ -712,6 +712,7 @@ function WidgetView({ value }: { value: string }) {
   if (w?.kind === "mac_action") return <MacShortcutAction w={w} />;
   if (w?.kind === "mac_setup") return <MacSetupWidget />;
   if (w?.kind === "calendar") return <CalendarView value={value} />;
+  if (w?.kind === "bookings") return <BookingsView value={value} />;
   if (w?.kind === "chart_loading") return <MarketChartLoading asset={w.asset ?? "Market"} interval={w.interval ?? "1d"} />;
   if (w?.kind === "net_worth_loading") {
     return (

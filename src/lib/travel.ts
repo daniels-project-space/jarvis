@@ -1,6 +1,7 @@
 import "server-only";
 import { getSecret } from "./vault";
 import { convexMutation, convexQuery } from "./context";
+import type { ConfirmedBooking } from "./booking-email";
 
 // JARVIS travel engine — drives the SAME infrastructure the project-hub travel
 // widget already proved out (its public Convex actions: Google Hotels + Google
@@ -100,6 +101,9 @@ export type TripDoc = {
   searchCompletedAt?: number;
   calendarSyncedAt?: number;
   includeFlights?: boolean;
+  // Read-only Gmail confirmations are distilled into structured trip facts;
+  // raw email bodies and OAuth data never enter the trip document.
+  confirmedBookings?: ConfirmedBooking[];
 };
 
 async function googleKey(): Promise<string> {
@@ -518,6 +522,17 @@ export function buildItinerary(doc: TripDoc): TripDoc["itinerary"] {
   for (let i = 0; i <= nights; i++) {
     const date = addDays(doc.departDate, i);
     const items: NonNullable<TripDoc["itinerary"]>[number]["items"] = [];
+    for (const booking of doc.confirmedBookings ?? []) {
+      if (!booking.start || new Date(booking.start).toISOString().slice(0, 10) !== date) continue;
+      const time = booking.allDay ? "" : new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/London", hour: "2-digit", minute: "2-digit", hour12: false }).format(booking.start);
+      items.push({
+        time,
+        title: booking.title,
+        kind: booking.kind === "stay" ? "hotel" : booking.kind === "activity" ? "activity" : booking.kind,
+        link: booking.sourceUrl,
+        note: `Confirmed${booking.confirmationCode ? ` · ref ${booking.confirmationCode}` : ""}`,
+      });
+    }
     if (i === 0) {
       if (f) items.push({ time: hhmm(f.departTime) || "morning", title: `Flight ${doc.origin} → ${doc.destIata} (${f.airline ?? "flight"})`, kind: "flight", link: f.bookLink, note: f.arriveTime ? `lands ${hhmm(f.arriveTime)}` : undefined });
       if (doc.transfer && s) items.push({ time: "", title: `Transfer to ${s.name}`, kind: "transfer", note: `${doc.transfer.durationText} · ${doc.transfer.distanceText}` });
@@ -551,6 +566,14 @@ export function buildItinerary(doc: TripDoc): TripDoc["itinerary"] {
     days.push({ date, label: dayLabel(date), items });
   }
   return days;
+}
+
+export function mergeConfirmedBookings(doc: TripDoc, bookings: ConfirmedBooking[]): number {
+  const existing = new Map((doc.confirmedBookings ?? []).map((booking) => [booking.marker, booking]));
+  for (const booking of bookings) existing.set(booking.marker, booking);
+  doc.confirmedBookings = [...existing.values()].sort((left, right) => (left.start ?? Number.MAX_SAFE_INTEGER) - (right.start ?? Number.MAX_SAFE_INTEGER));
+  if (doc.departDate && doc.returnDate) doc.itinerary = buildItinerary(doc);
+  return doc.confirmedBookings.length;
 }
 
 export function londonTime(date: string, time?: string): number {

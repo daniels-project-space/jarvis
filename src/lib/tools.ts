@@ -10,6 +10,7 @@ import { workModelLabel, workModelPriority } from "./work-models";
 import { exactTextWorkOrder } from "./work-order";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
 import { createICloudEvent, deleteICloudEvent, findICloudEvents, listICloudEvents } from "./icloud-calendar";
+import { scanGmailBookingConfirmations } from "./booking-email";
 import {
   VISUAL_BLOCK_KINDS,
   VISUAL_CAPABILITIES,
@@ -501,6 +502,19 @@ export const TOOL_DEFS = [
       properties: {
         view: { type: "string", enum: ["day", "week", "month"], description: "default week" },
         date: { type: "string", description: "YYYY-MM-DD anchor, default today" },
+      },
+    },
+  },
+  {
+    name: "bookings_check",
+    description:
+      "Read Daniel's connected Gmail booking-confirmation emails, extract confirmed flights, hotels, attractions and reservations, show the confirmed booking board, and add de-duplicated entries to his live iCloud Calendar. If trip_id is supplied, merge matching confirmations into that trip's itinerary. Use for ANY 'check my bookings / booking confirmations / what's confirmed / import travel emails'. Gmail is read-only; never send, archive, label or delete email.",
+    parameters: {
+      type: "object",
+      properties: {
+        days: { type: "number", description: "How far back to scan, 7-730 days; default 365" },
+        trip_id: { type: "string", description: "Optional visible trip creation id to enrich with matching confirmed bookings" },
+        sync_calendar: { type: "boolean", description: "Default true: create de-duplicated iCloud Calendar entries for confirmed bookings with a date" },
       },
     },
   },
@@ -1933,6 +1947,62 @@ async function calendarView(args: any): Promise<string> {
     (spokenBits.length ? ` Highlights — ${spokenBits.join("; ")}.` : " Nothing scheduled.") +
     " (Speak one short sentence only.)"
   );
+}
+
+async function bookingsCheck(args: any): Promise<string> {
+  const days = Math.max(7, Math.min(730, Math.round(Number(args.days) || 365)));
+  const bookings = await scanGmailBookingConfirmations({ days });
+  const syncCalendar = args.sync_calendar !== false;
+  let created = 0;
+  let calendarProblem = "";
+  if (syncCalendar) {
+    for (const booking of bookings.filter((item) => item.start)) {
+      if (calendarProblem) break;
+      try {
+        const start = Number(booking.start);
+        const nearby = await listICloudEvents(start - 2 * 86_400_000, (booking.end ?? start + 86_400_000) + 2 * 86_400_000);
+        if (nearby.some((event) => String(event.notes ?? "").includes(booking.marker))) continue;
+        await createICloudEvent({
+          title: booking.title,
+          start,
+          end: booking.end,
+          allDay: booking.allDay,
+          location: booking.location,
+          notes: `Confirmed Gmail booking${booking.confirmationCode ? ` · ref ${booking.confirmationCode}` : ""}\n${booking.marker}`,
+        });
+        created += 1;
+      } catch (error: any) {
+        calendarProblem = String(error?.message ?? error).slice(0, 150);
+      }
+    }
+  }
+  let tripNote = "";
+  const tripId = String(args.trip_id ?? "").trim();
+  if (tripId) {
+    const { getTrip, mergeConfirmedBookings, saveTrip } = await import("./travel");
+    const trip = await getTrip(tripId);
+    if (!trip) return `I found ${bookings.length} confirmed booking${bookings.length === 1 ? "" : "s"}, but trip ${tripId} was not found.`;
+    const start = Date.parse(`${trip.doc.departDate}T00:00:00Z`) - 86_400_000;
+    const end = Date.parse(`${trip.doc.returnDate}T23:59:59Z`) + 86_400_000;
+    const matching = bookings.filter((booking) => booking.start && booking.start >= start && booking.start <= end);
+    const total = mergeConfirmedBookings(trip.doc, matching);
+    await saveTrip(trip.id, trip.doc);
+    tripNote = ` ${matching.length} matching confirmation${matching.length === 1 ? "" : "s"} merged into ${trip.doc.title}'s itinerary (${total} saved).`;
+  }
+  await showWidget({
+    kind: "bookings",
+    label: `Confirmed bookings · last ${days} days`,
+    calendarAdded: created,
+    items: bookings.map((booking) => ({
+      type: booking.kind,
+      title: booking.title,
+      provider: booking.provider,
+      when: booking.start ? new Date(booking.start).toLocaleString("en-GB", { timeZone: "Europe/London", weekday: "short", day: "numeric", month: "short", hour: booking.allDay ? undefined : "2-digit", minute: booking.allDay ? undefined : "2-digit" }) : "date not found",
+      reference: booking.confirmationCode,
+      calendar: Boolean(booking.start),
+    })),
+  }, "confirmed bookings");
+  return `Found ${bookings.length} confirmed booking${bookings.length === 1 ? "" : "s"} in Gmail.${syncCalendar ? ` ${created} new calendar entr${created === 1 ? "y" : "ies"} created; duplicates were skipped.` : " Calendar left untouched."}${tripNote}${calendarProblem ? ` Calendar sync needs attention: ${calendarProblem}.` : ""} Speak one short summary and leave the full booking board on screen.`;
 }
 
 async function publishHostAction(action: JarvisHostAction): Promise<void> {
@@ -3375,6 +3445,8 @@ export async function executeTool(name: string, args: any, authTokenHash?: strin
       return await calendarRemove(args);
     case "calendar_view":
       return await calendarView(args);
+    case "bookings_check":
+      return await bookingsCheck(args);
     case "open_app":
       return await openApp(args);
     case "host_ui":
