@@ -5,6 +5,7 @@ import {
   type CodexDynamicToolResult,
   type CodexDynamicToolSpec,
   type CodexPermissionProfileOptions,
+  type CodexTurnInput,
 } from "./codex-app-server";
 
 type AppServerInternals = {
@@ -20,6 +21,10 @@ type WrittenMessage = {
   params?: Record<string, unknown>;
   result?: unknown;
 };
+
+function asOutputSchema(value: unknown): NonNullable<CodexTurnInput["outputSchema"]> {
+  return value as NonNullable<CodexTurnInput["outputSchema"]>;
+}
 
 describe("Codex app-server dynamic tools", () => {
   it("registers a native tool and answers server-initiated calls over JSONL", async () => {
@@ -346,5 +351,126 @@ describe("Codex app-server dynamic tools", () => {
     expect(internals.protocolFailed).toBe(false);
     internals.receive(notification);
     expect(internals.protocolFailed).toBe(true);
+  });
+
+  it("passes a validated output schema verbatim only to turn/start", async () => {
+    const outputSchema = {
+      type: "object",
+      properties: {
+        answer: { type: "string" },
+      },
+      required: ["answer"],
+    } satisfies NonNullable<CodexTurnInput["outputSchema"]>;
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000);
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = { stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } } };
+    internals.ready = Promise.resolve();
+    const turn = server.runTurn({
+      conversationId: "structured", userText: "hello", history: [], contextBlock: "",
+      preamble: "test", modelTier: "luna", outputSchema, onDelta: () => {},
+    });
+
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0].params).not.toHaveProperty("outputSchema");
+    internals.receive(JSON.stringify({ id: writes[0].id, result: { thread: { id: "structured-thread" } } }));
+    await vi.waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes[1].method).toBe("turn/start");
+    expect(writes[1].params?.outputSchema).toEqual(outputSchema);
+    internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "structured-turn" } } }));
+    await Promise.resolve();
+    internals.receive(JSON.stringify({
+      method: "turn/completed",
+      params: { turnId: "structured-turn", turn: { id: "structured-turn", status: "completed" } },
+    }));
+    await expect(turn).resolves.toMatchObject({ code: 0 });
+  });
+
+  it("omits outputSchema from turn/start when it is absent", async () => {
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000);
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = { stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } } };
+    internals.ready = Promise.resolve();
+    const turn = server.runTurn({
+      conversationId: "unstructured", userText: "hello", history: [], contextBlock: "",
+      preamble: "test", modelTier: "luna", onDelta: () => {},
+    });
+
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    internals.receive(JSON.stringify({ id: writes[0].id, result: { thread: { id: "unstructured-thread" } } }));
+    await vi.waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes[1].params).not.toHaveProperty("outputSchema");
+    internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "unstructured-turn" } } }));
+    await Promise.resolve();
+    internals.receive(JSON.stringify({
+      method: "turn/completed",
+      params: { turnId: "unstructured-turn", turn: { id: "unstructured-turn", status: "completed" } },
+    }));
+    await expect(turn).resolves.toMatchObject({ code: 0 });
+  });
+
+  it.each([
+    ["malformed", () => ({ type: undefined })],
+    ["cyclic", () => {
+      const schema: Record<string, unknown> = {};
+      schema.self = schema;
+      return schema;
+    }],
+    ["oversized", () => ({ description: "x".repeat(32 * 1_024) })],
+    ["too deep", () => {
+      const schema: Record<string, unknown> = {};
+      let current = schema;
+      for (let index = 0; index < 16; index += 1) {
+        const next: Record<string, unknown> = {};
+        current.next = next;
+        current = next;
+      }
+      return schema;
+    }],
+    ["root null", () => null],
+    ["root primitive", () => "schema"],
+    ["root array", () => []],
+    ["forbidden __proto__ key", () => {
+      const schema: Record<string, unknown> = {};
+      Object.defineProperty(schema, "__proto__", { value: {}, enumerable: true });
+      return schema;
+    }],
+    ["forbidden prototype key", () => ({ prototype: {} })],
+    ["forbidden constructor key", () => ({ constructor: {} })],
+    ["non-finite number", () => ({ maximum: Number.NaN })],
+    ["symbol", () => {
+      const schema: Record<string, unknown> = {};
+      Object.defineProperty(schema, Symbol("forbidden"), { value: "value", enumerable: true });
+      return schema;
+    }],
+    ["accessor", () => {
+      const schema: Record<string, unknown> = {};
+      Object.defineProperty(schema, "type", { enumerable: true, get: () => "object" });
+      return schema;
+    }],
+    ["non-plain Date", () => new Date()],
+    ["Proxy", () => new Proxy({}, {})],
+    ["sparse array", () => ({ required: Array(1) })],
+    ["custom-prototype array", () => {
+      const values: unknown[] = [];
+      Object.setPrototypeOf(values, {});
+      return { required: values };
+    }],
+  ])("rejects a %s output schema before beforeTurn or protocol writes", async (_label, factory) => {
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000);
+    const writes: WrittenMessage[] = [];
+    const beforeTurn = vi.fn(async () => {});
+    const internals = server as unknown as AppServerInternals;
+    internals.process = { stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } } };
+    internals.ready = Promise.resolve();
+
+    await expect(server.runTurn({
+      conversationId: "invalid-schema", userText: "hello", history: [], contextBlock: "",
+      preamble: "test", modelTier: "luna", outputSchema: asOutputSchema(factory()),
+      beforeTurn, onDelta: () => {},
+    })).rejects.toThrow("Codex output schema is invalid");
+    expect(beforeTurn).not.toHaveBeenCalled();
+    expect(writes).toHaveLength(0);
   });
 });

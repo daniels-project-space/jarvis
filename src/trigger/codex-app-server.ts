@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { resolve } from "node:path";
+import { isProxy } from "node:util/types";
 import { codexModelFor } from "./model-policy";
 import { appendAgentMessageDelta } from "./codex-stream";
 import { redactSensitiveText } from "../lib/secret-redaction";
@@ -101,6 +102,11 @@ const CHATGPT_PLAN_TYPES = new Set([
   "self_serve_business_usage_based", "business",
   "enterprise_cbp_usage_based", "enterprise", "edu", "unknown",
 ]);
+
+const OUTPUT_SCHEMA_MAX_BYTES = 32 * 1_024;
+const OUTPUT_SCHEMA_MAX_DEPTH = 16;
+const OUTPUT_SCHEMA_MAX_NODES = 512;
+const OUTPUT_SCHEMA_MAX_KEY_LENGTH = 256;
 
 export class CodexRequestRejectedError extends Error {
   readonly code = "codex_request_rejected";
@@ -230,6 +236,86 @@ export function verifyCodexPermissionAttestation(
     throw new CodexPermissionAttestationError("Codex thread did not attest the required read-only, network-denied sandbox");
   }
 }
+
+export function validateCodexOutputSchema(outputSchema: JsonObject): JsonObject {
+  let nodes = 0;
+  const ancestors = new Set<object>();
+  const invalid = (): never => {
+    throw new Error("Codex output schema is invalid");
+  };
+  if (outputSchema === null || typeof outputSchema !== "object"
+    || Array.isArray(outputSchema) || isProxy(outputSchema)) invalid();
+  try {
+    const rootPrototype = Object.getPrototypeOf(outputSchema);
+    if (rootPrototype !== Object.prototype && rootPrototype !== null) invalid();
+  } catch (error) {
+    if (error instanceof Error && error.message === "Codex output schema is invalid") throw error;
+    invalid();
+  }
+  const visit = (value: unknown, depth: number): void => {
+    nodes += 1;
+    if (nodes > OUTPUT_SCHEMA_MAX_NODES || depth > OUTPUT_SCHEMA_MAX_DEPTH) invalid();
+    if (value === null || typeof value === "string" || typeof value === "boolean") return;
+    if (typeof value === "number") {
+      if (!Number.isFinite(value)) invalid();
+      return;
+    }
+    if (typeof value !== "object") return invalid();
+    const objectValue = value;
+
+    if (ancestors.has(objectValue)) return invalid();
+    if (isProxy(objectValue)) return invalid();
+    ancestors.add(objectValue);
+    try {
+      if (Object.getOwnPropertySymbols(objectValue).length) return invalid();
+      if (Array.isArray(objectValue)) {
+        if (Object.getPrototypeOf(objectValue) !== Array.prototype) return invalid();
+        const names = Object.getOwnPropertyNames(objectValue);
+        const remainingNodes = OUTPUT_SCHEMA_MAX_NODES - nodes;
+        if (objectValue.length > remainingNodes || names.length > remainingNodes) return invalid();
+        if (names.length !== objectValue.length + 1 || !names.includes("length")) return invalid();
+        for (let index = 0; index < objectValue.length; index += 1) {
+          const key = String(index);
+          const descriptor = Object.getOwnPropertyDescriptor(objectValue, key);
+          if (!descriptor || !("value" in descriptor)) return invalid();
+          const descriptorValue = descriptor.value;
+          visit(descriptorValue, depth + 1);
+        }
+        return;
+      }
+
+      const prototype = Object.getPrototypeOf(objectValue);
+      if (prototype !== Object.prototype && prototype !== null) return invalid();
+      const names = Object.getOwnPropertyNames(objectValue);
+      if (names.length > OUTPUT_SCHEMA_MAX_NODES - nodes) return invalid();
+      for (const key of names) {
+        if (key.length > OUTPUT_SCHEMA_MAX_KEY_LENGTH
+          || key === "__proto__" || key === "prototype" || key === "constructor") return invalid();
+        const descriptor = Object.getOwnPropertyDescriptor(objectValue, key);
+        if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return invalid();
+        const descriptorValue = descriptor.value;
+        visit(descriptorValue, depth + 1);
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message === "Codex output schema is invalid") throw error;
+      invalid();
+    } finally {
+      ancestors.delete(objectValue);
+    }
+  };
+
+  visit(outputSchema, 1);
+  let encoded: string | undefined;
+  try {
+    encoded = JSON.stringify(outputSchema);
+  } catch {
+    return invalid();
+  }
+  if (typeof encoded !== "string") return invalid();
+  if (Buffer.byteLength(encoded, "utf8") > OUTPUT_SCHEMA_MAX_BYTES) invalid();
+  return outputSchema;
+}
+
 export type CodexTurnInput = {
   conversationId: string;
   userText: string;
@@ -238,6 +324,7 @@ export type CodexTurnInput = {
   preamble: string;
   modelTier: string;
   allowTools?: boolean;
+  outputSchema?: JsonObject;
   onDelta: (delta: string) => void;
   /** Durable receipt written before turn/start may cross the protocol. */
   beforeTurn?: () => Promise<void>;
@@ -327,6 +414,8 @@ export class CodexAppServer {
   }
 
   async runTurn(input: CodexTurnInput): Promise<CodexTurnResult> {
+    const outputSchema = input.outputSchema === undefined ? undefined
+      : validateCodexOutputSchema(input.outputSchema);
     await this.start();
     if (this.active.size >= this.limits.activeTurns) {
       throw new Error("Codex app-server active-turn limit reached");
@@ -411,6 +500,7 @@ export class CodexAppServer {
       model: selection.model,
       effort: selection.effort,
       approvalPolicy: "never",
+      ...(outputSchema === undefined ? {} : { outputSchema }),
     }, 30_000, input.onTurnRequestWritten);
     const turn = started.turn as JsonObject | undefined;
     const turnId = typeof turn?.id === "string" ? turn.id : "";
