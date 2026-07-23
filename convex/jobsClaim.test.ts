@@ -18,6 +18,7 @@ const BASE = "b".repeat(40);
 const TREE = "c".repeat(40);
 const DIFF = "d".repeat(64);
 const SIGNATURE = "e".repeat(64);
+const REVIEW_KEY_ID = "current-2026-07";
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 
 type Policy = "manual" | "read_only" | "auto_merge";
@@ -69,7 +70,7 @@ async function specialistFixture(policy: Policy = "manual", goalStage?: "validat
   const commitArgs = {
     jobId, expectedAttempt: 1, authorityDigest: claim.authorityDigest,
     specialistRunId: "specialist-run", result, verificationNote: note,
-    reviewReceiptJson: receipt, reviewReceiptSignature: SIGNATURE, reviewReceiptKeyId: "current-2026-07",
+    reviewReceiptJson: receipt, reviewReceiptSignature: SIGNATURE, reviewReceiptKeyId: REVIEW_KEY_ID,
     reviewDiffSha256: DIFF, resultDigest: sha256(result), evidenceDigest: sha256(note), workerToken: WORKER,
   } as const;
   return { t, jobId, result, note, receipt, authorityDigest: claim.authorityDigest, commitArgs };
@@ -297,13 +298,38 @@ describe("real Convex delivery policy outcomes", () => {
     expect(await f.t.mutation(api.jobs.control, { jobId: f.jobId, action: "pause", workerToken: WORKER })).toBe(true);
     expect(await f.t.mutation(api.jobs.finalize, {
       ...f.fence, status: "done", result: f.result, verificationVerdict: "pass", verificationNote: f.note,
-      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE, reviewDiffSha256: DIFF,
+      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE,
+      reviewReceiptKeyId: REVIEW_KEY_ID, reviewDiffSha256: DIFF,
     })).toBe(false);
     expect(await f.t.mutation(api.jobs.control, { jobId: f.jobId, action: "resume", workerToken: WORKER })).toBe(true);
     const state = await rows(f.t);
     expect(state.deliveries).toHaveLength(2);
     expect(state.deliveries[1]).toMatchObject({ outcome: "read_only_complete", currentStep: "receipt", reviewKeyId: "current-2026-07" });
     expect(state.attempts).toHaveLength(1);
+  });
+
+  it("requires the exact immutable signed review key before repository finalization", async () => {
+    const f = await committedAndClaimed("read_only");
+    expect(await f.t.mutation(api.jobs.setDelivery, {
+      ...f.fence, branch: "jarvis/reviewed", deliveryStatus: "branch",
+      outcome: "read_only_complete", providerCall: false,
+    })).toBe(true);
+    const finalArgs = {
+      ...f.fence, status: "done" as const, result: f.result,
+      verificationVerdict: "pass" as const, verificationNote: f.note,
+      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note),
+      reviewReceiptSignature: SIGNATURE, reviewDiffSha256: DIFF,
+    };
+    expect(await f.t.mutation(api.jobs.finalize, finalArgs)).toBe(false);
+    expect(await f.t.mutation(api.jobs.finalize, {
+      ...finalArgs, reviewReceiptKeyId: "stale-review-key",
+    })).toBe(false);
+    expect((await rows(f.t)).deliveries[0]).toMatchObject({
+      currentStep: "receipt", status: "running", reviewKeyId: REVIEW_KEY_ID,
+    });
+    expect(await f.t.mutation(api.jobs.finalize, {
+      ...finalArgs, reviewReceiptKeyId: REVIEW_KEY_ID,
+    })).toBe(true);
   });
 
   it.each([
@@ -319,7 +345,7 @@ describe("real Convex delivery policy outcomes", () => {
     expect(await f.t.mutation(api.jobs.finalize, {
       ...f.fence, status: "done", result: finalResult, verificationVerdict: "pass", verificationNote: f.note,
       resultDigest: sha256(finalResult), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE,
-      reviewDiffSha256: DIFF,
+      reviewReceiptKeyId: REVIEW_KEY_ID, reviewDiffSha256: DIFF,
     })).toBe(true);
     const state = await rows(f.t);
     expect(state.receipts[0]).toMatchObject({ deliveryOutcome: outcome });
@@ -404,14 +430,16 @@ describe("real Convex delivery policy outcomes", () => {
     expect((await rows(f.t)).jobs[0].status).toBe("running");
     expect(await f.t.mutation(api.jobs.finalize, {
       ...f.fence, status: "done", result: f.result, verificationVerdict: "pass", verificationNote: f.note,
-      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE, reviewDiffSha256: DIFF,
+      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE,
+      reviewReceiptKeyId: REVIEW_KEY_ID, reviewDiffSha256: DIFF,
     })).toBe(false);
     await f.t.mutation(api.jobs.setDelivery, {
       ...f.fence, branch: "jarvis/reviewed", deliveryStatus: "branch", outcome: "read_only_complete", providerCall: false,
     });
     expect(await f.t.mutation(api.jobs.finalize, {
       ...f.fence, status: "done", result: f.result, verificationVerdict: "pass", verificationNote: f.note,
-      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE, reviewDiffSha256: DIFF,
+      resultDigest: sha256(f.result), evidenceDigest: sha256(f.note), reviewReceiptSignature: SIGNATURE,
+      reviewReceiptKeyId: REVIEW_KEY_ID, reviewDiffSha256: DIFF,
     })).toBe(true);
     expect((await rows(f.t)).jobs[0].status).toBe("done");
   });

@@ -2529,7 +2529,10 @@ export const cloudCheckpointForReplay = query({
 export const recordCloudReplayDecision = mutation({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
-    authorityDigest: v.string(),
+    // Optional only for staged compatibility with Trigger workers deployed
+    // before attempt authority was forwarded. Missing/unbound authority is
+    // rejected below before any durable evidence mutation.
+    authorityDigest: v.optional(v.string()),
     disposition: v.union(v.literal("replay"), v.literal("hydrate"), v.literal("reject")),
     reason: v.string(), workerToken: v.optional(v.string()),
   },
@@ -2537,7 +2540,8 @@ export const recordCloudReplayDecision = mutation({
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
-    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
+    if (!row || row.admissionProtocolVersion !== 2
+      || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
       || row.workerRunId !== a.workerRunId || !attempt || attempt.status !== "running"
       || !await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest)
       || !/^[a-z_]{1,80}$/.test(a.reason)) return false;

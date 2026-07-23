@@ -74,6 +74,37 @@ beforeEach(() => { process.env.JARVIS_WORKER_TOKEN = WORKER; });
 afterEach(() => { delete process.env.JARVIS_WORKER_TOKEN; });
 
 describe("durable cloud checkpoint control evidence", () => {
+  it("holds old Trigger replay-decision calls and records only exact v2 authority", async () => {
+    const t = convexTest(schema, modules);
+    const current = await runningFixture(t, {
+      task: "mixed deployment replay decision", attempt: 1, maxAttempts: 3, workerRunId: "run-1",
+    });
+    const oldTriggerArgs = {
+      jobId: current.jobId, expectedAttempt: 1, workerRunId: "run-1",
+      disposition: "hydrate" as const, reason: "no_prior_checkpoint", workerToken: WORKER,
+    };
+    const evidenceCount = async () => await t.run(async (ctx) => (await ctx.db.query("workEvents")
+      .withIndex("by_job", (q) => q.eq("jobId", String(current.jobId))).collect()).length);
+    const before = await evidenceCount();
+
+    // The 20260722.3 argument shape remains validator-safe during rollout, but
+    // has no authority to create evidence.
+    expect(await t.mutation(api.jobs.recordCloudReplayDecision, oldTriggerArgs)).toBe(false);
+    expect(await t.mutation(api.jobs.recordCloudReplayDecision, {
+      ...oldTriggerArgs, authorityDigest: "f".repeat(64),
+    })).toBe(false);
+    expect(await evidenceCount()).toBe(before);
+
+    expect(await t.mutation(api.jobs.recordCloudReplayDecision, {
+      ...oldTriggerArgs, authorityDigest: current.authorityDigest,
+    })).toBe(true);
+    expect(await evidenceCount()).toBe(before + 1);
+    expect(await t.mutation(api.jobs.recordCloudReplayDecision, {
+      ...oldTriggerArgs, authorityDigest: current.authorityDigest,
+    })).toBe(true);
+    expect(await evidenceCount()).toBe(before + 1);
+  });
+
   it("records one canonical bounded manifest idempotently and replays it only through exact bindings", async () => {
     const t = convexTest(schema, modules);
     const now = Date.now();

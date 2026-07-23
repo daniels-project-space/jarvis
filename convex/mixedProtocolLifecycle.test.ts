@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
+import type { Id } from "./_generated/dataModel";
 import schema from "./schema";
 import { testMissionAdmission } from "./testSourceAdmission";
 
@@ -34,6 +35,19 @@ describe("mixed protocol full lifecycle", () => {
     });
     const legacyReceiptJson = JSON.stringify({ version: 1, jobId: String(jobId), head: HEAD });
     const now = Date.now();
+    // Old deployments could already have an attempt-1 row. Reuse it when
+    // present so a rolling fixture never creates a duplicate job/attempt
+    // identity; this checkout's held compatibility admission needs one seed.
+    await t.run(async (ctx) => {
+      const existing = await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1)).first();
+      if (!existing) {
+        await ctx.db.insert("workAttempts", {
+          jobId, attempt: 1, status: "pending",
+          livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now,
+        });
+      }
+    });
     const rows = await t.run(async (ctx) => {
       await ctx.db.patch(jobId, {
         status: "running", stage: "legacy review", progress: "historical v1 work remains visible",
@@ -47,8 +61,12 @@ describe("mixed protocol full lifecycle", () => {
         percent: 72, attempt: 1, workerRunId: "legacy-worker", active: true,
         originThreadId: "mixed-thread", visibility: "conversation", heartbeatAt: now, progressAt: now,
       });
-      const attemptId = await ctx.db.insert("workAttempts", {
-        jobId, attempt: 1, status: "running", workerRunId: "legacy-worker", dispatchId: "legacy-dispatch",
+      const attempts = await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1)).collect();
+      expect(attempts).toHaveLength(1);
+      const attemptId = attempts[0]._id;
+      await ctx.db.patch(attemptId, {
+        status: "running", workerRunId: "legacy-worker", dispatchId: "legacy-dispatch",
         workspaceKey: "legacy-workspace", sourceHeadSha: HEAD,
         livenessAt: now, progressAt: now, lastEventAt: now, createdAt: now,
       });
@@ -85,10 +103,18 @@ describe("mixed protocol full lifecycle", () => {
       return { attemptId, reviewId, workReceiptId, integrationId, deliveryId };
     });
 
-    const projection: any = await t.query(api.commandCenter.snapshot, {
+    const projection = await t.query(api.commandCenter.snapshot, {
       threadId: "mixed-thread", workerToken: WORKER,
     });
     expect(projection.active).toMatchObject({ id: jobId, status: "reviewing", percent: 72 });
+    const legacyEventCount = await t.run(async (ctx) => (await ctx.db.query("workEvents")
+      .withIndex("by_job", (q) => q.eq("jobId", String(jobId))).collect()).length);
+    expect(await t.mutation(api.jobs.recordCloudReplayDecision, {
+      jobId, expectedAttempt: 1, workerRunId: "legacy-worker",
+      disposition: "hydrate", reason: "no_prior_checkpoint", workerToken: WORKER,
+    })).toBe(false);
+    expect(await t.run(async (ctx) => (await ctx.db.query("workEvents")
+      .withIndex("by_job", (q) => q.eq("jobId", String(jobId))).collect()).length)).toBe(legacyEventCount);
     expect(await t.mutation(api.jobs.claimDispatched, {
       jobId, dispatchId: "legacy-dispatch", workerRunId: "legacy-replay", workerToken: WORKER,
     })).toMatchObject({ executable: false, held: true, code: "protocol_v1_admission_held" });
@@ -148,12 +174,15 @@ describe("mixed protocol full lifecycle", () => {
     const persisted = await t.run(async (ctx) => ({
       mission: await ctx.db.get(missionId), job: await ctx.db.get(jobId),
       attempt: await ctx.db.get(rows.attemptId), review: await ctx.db.get(rows.reviewId),
+      attempts: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1)).collect(),
       workReceipt: await ctx.db.get(rows.workReceiptId), integration: await ctx.db.get(rows.integrationId),
       delivery: await ctx.db.get(rows.deliveryId), handoffs: await ctx.db.query("goalHandoffs").collect(),
     }));
     expect(persisted.mission).toMatchObject({ admissionProtocolVersion: 1, protocolHoldReason: "protocol_v1_admission_held" });
     expect(persisted.job).toMatchObject({ admissionProtocolVersion: 1, status: "running" });
     expect(persisted.attempt).toBeTruthy();
+    expect(persisted.attempts).toHaveLength(1);
     expect(persisted.review).toBeTruthy();
     expect(persisted.workReceipt).toBeTruthy();
     expect(persisted.integration).toMatchObject({ status: "queued" });
@@ -165,10 +194,14 @@ describe("mixed protocol full lifecycle", () => {
     });
     const freshJobId = await t.mutation(api.jobs.enqueueV2, {
       task: "fresh v2 re-admission", repo: REPO, missionId: String(fresh.missionId), workerToken: WORKER,
-    });
-    const freshState: any = await t.run(async (ctx) => ({ mission: await ctx.db.get(fresh.missionId), job: await ctx.db.get(freshJobId) }));
+    }) as Id<"jobs">;
+    const freshState = await t.run(async (ctx) => ({
+      mission: await ctx.db.get(fresh.missionId),
+      job: await ctx.db.get(freshJobId),
+    }));
     expect(fresh.missionId).not.toBe(missionId);
     expect(freshJobId).not.toBe(jobId);
+    if (!freshState.job) throw new Error("fresh v2 job fixture missing");
     expect(freshState.mission).toMatchObject({ admissionProtocolVersion: 2 });
     expect(freshState.job).toMatchObject({ admissionProtocolVersion: 2, schedulingBound: true, workOrderRevision: 1 });
     expect(freshState.job.schedulingBindingDigest).not.toBe(DIGEST);
