@@ -10,6 +10,7 @@ import type {
   CompactWorkSnapshot,
   FleetControl,
   FleetEdge,
+  FleetMission,
   FleetNode,
   FleetSupervisorAuthority,
 } from "../lib/active-work";
@@ -525,8 +526,48 @@ function Controls({ controls, target, onError }: { controls: FleetControl[]; tar
   </div>;
 }
 
-function WorkerDetail({ node, onBack }: { node: FleetNode; onBack: () => void }) {
+const SUPERVISED_CHILD_CONTROLS = new Set<FleetControl>([
+  "provide_input",
+  "approve",
+  "decline",
+]);
+
+export function workerDetailControls(
+  controls: readonly FleetControl[],
+  {
+    workerMissionId,
+    mission,
+  }: {
+    workerMissionId: string | null;
+    mission: Pick<FleetMission, "id" | "mode" | "supervisor">;
+  },
+): FleetControl[] {
+  const supervisedMissionChild = workerMissionId === mission.id
+    && (
+      mission.mode === "supervised"
+      || mission.supervisor?.protocolVersion === 1
+    );
+  return supervisedMissionChild
+    ? controls.filter((control) => SUPERVISED_CHILD_CONTROLS.has(control))
+    : [...controls];
+}
+
+export function WorkerDetail({
+  node,
+  onBack,
+  workerMissionId,
+  mission,
+}: {
+  node: FleetNode;
+  onBack: () => void;
+  workerMissionId: string | null;
+  mission: Pick<FleetMission, "id" | "mode" | "supervisor">;
+}) {
   const [error, setError] = useState("");
+  const controls = workerDetailControls(node.controls, {
+    workerMissionId,
+    mission,
+  });
   return <section data-fleet-worker-detail className="flex min-h-0 flex-1 flex-col gap-2 rounded-xl border border-white/[0.08] bg-black/20 p-3">
     <div className="flex min-w-0 items-start gap-2">
       <button type="button" onClick={onBack} className="shrink-0 text-xs text-cyan" aria-label="Back to fleet">←</button>
@@ -538,7 +579,7 @@ function WorkerDetail({ node, onBack }: { node: FleetNode; onBack: () => void })
     {node.attentionReason && <div className="rounded-lg border border-amber/20 bg-amber/[0.06] px-2 py-1 text-[9px] text-amber">Needs Daniel · {node.attentionReason}</div>}
     <LazyWorkerLog node={node} />
     {error && <div role="alert" data-control-error className="rounded-lg border border-rose-400/25 bg-rose-400/[0.07] px-2 py-1 text-[9px] text-rose-300">{error}</div>}
-    <Controls key={`job:${node.jobId}`} controls={node.controls} target={{ jobId: node.jobId }} onError={setError} />
+    <Controls key={`job:${node.jobId}`} controls={controls} target={{ jobId: node.jobId }} onError={setError} />
   </section>;
 }
 
@@ -564,6 +605,15 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
     })),
   }] : [];
   const hierarchyJobs = hierarchy.flatMap((mission) => mission.projects.flatMap((project) => project.jobs));
+  const selectedHierarchyMissionId = selectedId
+    ? hierarchy.find((mission) => mission.projects.some((project) =>
+      project.jobs.some((node) => node.jobId === selectedId)
+    ))?.id ?? null
+    : null;
+  const selectedMissionId = selectedId
+    && fleet?.nodes.some((node) => node.jobId === selectedId)
+    ? fleet.id
+    : selectedHierarchyMissionId;
   const selectedSummary = selectedId ? hierarchyJobs.find((node) => node.jobId === selectedId)
     ?? fleet?.nodes.find((node) => node.jobId === selectedId) ?? null : null;
   const selected = selectedSummary && detail?.jobId === selectedId ? {
@@ -601,7 +651,7 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
         <button type="button" onClick={() => setOpen(false)} className="rounded-lg px-2 py-1 text-[9px] text-slate hover:text-cyan" aria-label="Collapse live fleet">minimize</button>
       </header>
       <div className="mt-2 flex min-h-0 flex-1 gap-2 overflow-hidden">
-        {selectedId ? (selected ? <WorkerDetail node={selected} onBack={() => selectJob(null)} /> : <div data-fleet-detail-loading className="flex flex-1 items-center justify-center text-xs text-cyan">loading exact work detail…</div>) : <div className="scrollbar-thin min-h-0 flex-1 space-y-2 overflow-auto pr-0.5">
+        {selectedId ? (selected ? <WorkerDetail node={selected} workerMissionId={selectedMissionId} mission={fleet} onBack={() => selectJob(null)} /> : <div data-fleet-detail-loading className="flex flex-1 items-center justify-center text-xs text-cyan">loading exact work detail…</div>) : <div className="scrollbar-thin min-h-0 flex-1 space-y-2 overflow-auto pr-0.5">
           <section data-work-hierarchy aria-label="Active mission and project hierarchy" className="space-y-2">
             {hierarchy.map((mission) => <article key={mission.id} data-mission-group={mission.id} className="rounded-xl border border-cyan/15 bg-cyan/[0.025] p-2">
               <header className="flex min-w-0 items-start gap-2"><div className="min-w-0 flex-1"><div className="truncate text-[11px] text-ice">{mission.label}</div><div className="truncate font-mono text-[7px] text-cyan/55" title={mission.id}>mission · {mission.id}</div></div><span className="shrink-0 font-mono text-[8px] uppercase text-slate">{mission.phase}</span></header>

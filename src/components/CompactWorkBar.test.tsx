@@ -10,12 +10,14 @@ import {
 import {
   FleetCommandCenter,
   FleetDag,
+  WorkerDetail,
   fleetDagLayout,
   fleetNodeStateLabel,
   preserveSupervisorRequestKey,
   submitSupervisorControlRequest,
   supervisorControlPayload,
   supervisorRequestIdentity,
+  workerDetailControls,
 } from "./CompactWorkBar";
 
 const node = (overrides: Partial<FleetNode> = {}): FleetNode => ({
@@ -168,7 +170,7 @@ describe("FleetCommandCenter", () => {
     expect(expanded).not.toContain("loading exact work detail");
   });
 
-  it("does not invent supervised mission controls and keeps worker controls job-scoped", () => {
+  it("does not invent supervised mission controls", () => {
     const snapshot: CompactWorkSnapshot = {
       ...work,
       fleet: {
@@ -188,18 +190,82 @@ describe("FleetCommandCenter", () => {
     const markup = renderToStaticMarkup(
       <FleetCommandCenter snapshot={snapshot} initialExpanded />,
     );
-    const source = readFileSync(
-      new URL("./CompactWorkBar.tsx", import.meta.url),
-      "utf8",
-    );
 
     expect(markup).toContain('data-supervisor-authority="ready:4"');
     expect(markup).not.toMatch(/>pause<\/button>/);
     expect(markup).not.toMatch(/>cancel<\/button>/);
     expect(markup).not.toMatch(/>steer<\/button>/);
-    expect(source).toMatch(
-      /controls=\{node\.controls\} target=\{\{ jobId: node\.jobId \}\}/,
+  });
+
+  it("never duplicates supervised mission lifecycle controls in worker detail", () => {
+    const supervisor = {
+      protocolVersion: 1 as const,
+      state: "needs_input" as const,
+      inputRevision: 5,
+      steerRevision: 2,
+      deadlineAt: 1_800_000_000_000,
+      question: "Use the protected delivery?",
+    };
+    const projectedControls: FleetNode["controls"] = [
+      "pause",
+      "resume",
+      "cancel",
+      "steer",
+      "retry" as FleetNode["controls"][number],
+      "provide_input",
+      "approve",
+      "decline",
+    ];
+    const mission = {
+      id: "mission-1",
+      mode: "supervised",
+      supervisor,
+    };
+    const controls = workerDetailControls(projectedControls, {
+      workerMissionId: "mission-1",
+      mission,
+    });
+    const markup = renderToStaticMarkup(
+      <WorkerDetail
+        node={node({ controls: projectedControls })}
+        workerMissionId="mission-1"
+        mission={mission}
+        onBack={() => undefined}
+      />,
     );
+
+    expect(controls).toEqual(["provide_input", "approve", "decline"]);
+    expect(markup).toContain("data-fleet-worker-detail");
+    expect(markup).toMatch(/>approve<\/button>/);
+    expect(markup).toMatch(/>decline<\/button>/);
+    expect(markup).not.toMatch(/>(?:pause|resume|cancel|steer|retry)(?: exact control)?<\/button>/);
+    expect(markup).not.toContain('aria-label="Answer Jarvis"');
+  });
+
+  it("keeps supervised lifecycle controls on the mission authority surface", () => {
+    const snapshot: CompactWorkSnapshot = {
+      ...work,
+      fleet: {
+        ...work.fleet!,
+        mode: "supervised",
+        controls: ["pause", "cancel", "steer"],
+        supervisor: {
+          protocolVersion: 1,
+          state: "ready",
+          inputRevision: 4,
+          steerRevision: 2,
+          deadlineAt: 1_800_000_000_000,
+        },
+      },
+    };
+    const markup = renderToStaticMarkup(
+      <FleetCommandCenter snapshot={snapshot} initialExpanded />,
+    );
+
+    expect(markup).toContain('data-supervisor-authority="ready:4"');
+    expect(markup).toMatch(/>pause<\/button>/);
+    expect(markup).toMatch(/>cancel<\/button>/);
+    expect(markup).toMatch(/>steer<\/button>/);
   });
 
   it("renders the supervisor question and answer separately from steering without adding another surface", () => {
