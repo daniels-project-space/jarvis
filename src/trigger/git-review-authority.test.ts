@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   gitReviewReceiptAuthorityHealth,
@@ -9,15 +10,20 @@ import {
 } from "./git-review-authority";
 import { createGitReviewReceiptKeyring } from "./git-review-receipt";
 
+const workOrderRevisionDigest = createHash("sha256")
+  .update("canonical test work-order revision: rotating review authority")
+  .digest("hex");
 const receipt = {
-  version: 1, jobId: "job", attempt: 1, repository: "daniels-project-space/jarvis", branch: "jarvis/test",
+  version: 2, jobId: "job", attempt: 1, workOrderRevisionDigest,
+  repository: "daniels-project-space/jarvis", branch: "jarvis/test",
   baseSha: "a".repeat(40), baseTreeSha: "b".repeat(40), headSha: "c".repeat(40), headTreeSha: "d".repeat(40),
   parentShas: [], historyComplete: true, baseIsAncestor: true, commitCount: 1, commits: "", clean: true,
   diffStat: "", changedPaths: "", diffPatch: "", diffSha256: "e".repeat(64), diffChars: 0,
   agentEvidenceSha256: "f".repeat(64), commands: [],
 } as const;
 const binding = {
-  jobId: receipt.jobId, attempt: receipt.attempt, repository: receipt.repository, branch: receipt.branch,
+  jobId: receipt.jobId, attempt: receipt.attempt, workOrderRevisionDigest: receipt.workOrderRevisionDigest,
+  repository: receipt.repository, branch: receipt.branch,
   baseSha: receipt.baseSha, headSha: receipt.headSha, agentEvidenceSha256: receipt.agentEvidenceSha256,
 };
 

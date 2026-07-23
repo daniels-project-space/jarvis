@@ -10,6 +10,7 @@ import {
   promoteCompletedJobDependents,
   readAttemptExecutionAuthority,
 } from "./controlPlane";
+import { ensureGoalNodeHandoff } from "./goalHandoffs";
 import { sealProjectSourceAdmission } from "../src/lib/source-admission";
 
 const LEASE_MS = 45_000;
@@ -1076,7 +1077,17 @@ export const complete = mutation({
       reviewReceiptId: attempt.reviewReceiptId, reviewReceiptDigest: attempt.reviewReceiptDigest, createdAt: now,
     });
     if (!requestedControl && terminalOutcome === "integrated") {
-      await promoteCompletedJobDependents(ctx, { ...job, status: "done" }, now);
+      const completed = {
+        ...job,
+        status: "done",
+        stage: "integrated",
+        completedAt: now,
+        integrationState: "integrated",
+        deliveryStatus: "merged",
+        mergeCommitSha: attempt.preparedIntegrationHeadSha,
+      };
+      await ensureGoalNodeHandoff(ctx, completed);
+      await promoteCompletedJobDependents(ctx, completed, now);
     }
     await appendEvent(ctx, job, "integration_completed", `Mission integration advanced once to ${attempt.preparedIntegrationHeadSha}`, {
       integrationBase: attempt.expectedIntegrationBaseSha, integrationHead: attempt.preparedIntegrationHeadSha,

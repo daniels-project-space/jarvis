@@ -7,6 +7,10 @@ import schema from "./schema";
 import { ensureWorkAttempt, patchJobWithRuntime } from "./controlPlane";
 import { testMissionAdmission } from "./testSourceAdmission";
 import { canonicalWorkspaceCheckpoint } from "../src/lib/workspace-checkpoint";
+import {
+  WORK_ORDER_MACHINE_RUNTIME,
+  WORK_ORDER_MACHINE_TEMPLATE,
+} from "../src/lib/work-order-revision";
 
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
@@ -80,7 +84,7 @@ describe("durable cloud checkpoint control evidence", () => {
     const identity = {
       providerName: "cloudflare" as const,
       providerWorkspaceId: "workspace-1", providerSessionId: "session-1",
-      baseSha: BASE, runtime: "node-22", lockfileDigest: LOCK, template: "node-template",
+      baseSha: BASE, runtime: WORK_ORDER_MACHINE_RUNTIME, lockfileDigest: LOCK, template: WORK_ORDER_MACHINE_TEMPLATE,
       sourceArchiveDigest: SOURCE, sourceArchiveBytes: 2_048,
     };
     expect(await t.mutation(api.jobs.bindCloudWorkspace, {
@@ -91,8 +95,8 @@ describe("durable cloud checkpoint control evidence", () => {
       version: 2, jobId: String(jobId), attempt: 1, provider: "cloudflare",
       providerWorkspaceId: identity.providerWorkspaceId, providerSessionId: identity.providerSessionId,
       baseSha: BASE, sourceArchiveSha256: SOURCE, sourceArchiveBytes: 2_048,
-      archiveSha256: ARCHIVE, archiveBytes: 4_096, runtime: "node-22", lockfileDigest: LOCK,
-      template: "node-template", attemptKey: `${String(jobId)}:1`, causationId: "run-1:1", createdAt: now,
+      archiveSha256: ARCHIVE, archiveBytes: 4_096, runtime: WORK_ORDER_MACHINE_RUNTIME, lockfileDigest: LOCK,
+      template: WORK_ORDER_MACHINE_TEMPLATE, attemptKey: `${String(jobId)}:1`, causationId: "run-1:1", createdAt: now,
     });
     const record = {
       jobId, expectedAttempt: 1, authorityDigest: initial.authorityDigest,
@@ -129,7 +133,7 @@ describe("durable cloud checkpoint control evidence", () => {
     const replayArgs = {
       jobId, expectedAttempt: 2, authorityDigest: secondAuthorityDigest,
       workerRunId: "run-2", providerName: "cloudflare" as const,
-      baseSha: BASE, runtime: "node-22", lockfileDigest: LOCK, template: "node-template",
+      baseSha: BASE, runtime: WORK_ORDER_MACHINE_RUNTIME, lockfileDigest: LOCK, template: WORK_ORDER_MACHINE_TEMPLATE,
       sourceArchiveDigest: SOURCE, sourceArchiveBytes: 2_048, workerToken: WORKER,
     };
     const replay = await t.query(api.jobs.cloudCheckpointForReplay, replayArgs);
@@ -172,8 +176,8 @@ describe("durable cloud checkpoint control evidence", () => {
         version: 2, jobId: String(jobId), attempt, provider: "cloudflare",
         providerWorkspaceId, providerSessionId, baseSha: BASE,
         sourceArchiveSha256: SOURCE, sourceArchiveBytes: 2_048,
-        archiveSha256: ARCHIVE, archiveBytes: 4_096, runtime: "node-22", lockfileDigest: LOCK,
-        template: "node-template", attemptKey: `${String(jobId)}:${attempt}`,
+        archiveSha256: ARCHIVE, archiveBytes: 4_096, runtime: WORK_ORDER_MACHINE_RUNTIME, lockfileDigest: LOCK,
+        template: WORK_ORDER_MACHINE_TEMPLATE, attemptKey: `${String(jobId)}:${attempt}`,
         causationId: `run-${attempt}:${attempt}`, createdAt: now,
       });
       await t.run(async (ctx) => {
@@ -181,7 +185,7 @@ describe("durable cloud checkpoint control evidence", () => {
           .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", attempt)).first();
         await ctx.db.patch(row!._id, {
           providerName: "cloudflare", providerWorkspaceId, providerSessionId,
-          workspaceRuntime: "node-22", workspaceLockfileDigest: LOCK, workspaceTemplate: "node-template",
+          workspaceRuntime: WORK_ORDER_MACHINE_RUNTIME, workspaceLockfileDigest: LOCK, workspaceTemplate: WORK_ORDER_MACHINE_TEMPLATE,
           sourceArchiveDigest: SOURCE, sourceArchiveBytes: 2_048,
           checkpointRef: `sandbox-checkpoints/sha256/${ARCHIVE}`, checkpointDigest: ARCHIVE,
           checkpointBytes: 4_096, checkpointManifestDigest: sha256(manifest), checkpointManifest: manifest,
@@ -213,7 +217,7 @@ describe("durable cloud checkpoint control evidence", () => {
     const args = {
       jobId, expectedAttempt: 110, authorityDigest: current.authorityDigest,
       workerRunId: "run-110", providerName: "cloudflare" as const,
-      baseSha: BASE, runtime: "node-22", lockfileDigest: LOCK, template: "node-template",
+      baseSha: BASE, runtime: WORK_ORDER_MACHINE_RUNTIME, lockfileDigest: LOCK, template: WORK_ORDER_MACHINE_TEMPLATE,
       sourceArchiveDigest: SOURCE, sourceArchiveBytes: 2_048, workerToken: WORKER,
     };
     expect(await t.query(api.jobs.cloudCheckpointForReplay, args))
@@ -232,7 +236,7 @@ describe("durable cloud checkpoint control evidence", () => {
     const args = {
       jobId, expectedAttempt: 6, authorityDigest: current.authorityDigest,
       workerRunId: "run-6", providerName: "cloudflare" as const,
-      baseSha: BASE, runtime: "node-22", lockfileDigest: LOCK, template: "node-template",
+      baseSha: BASE, runtime: WORK_ORDER_MACHINE_RUNTIME, lockfileDigest: LOCK, template: WORK_ORDER_MACHINE_TEMPLATE,
       sourceArchiveDigest: SOURCE, sourceArchiveBytes: 2_048, workerToken: WORKER,
     };
     expect(await t.query(api.jobs.cloudCheckpointForReplay, args))
@@ -252,15 +256,15 @@ describe("durable cloud checkpoint control evidence", () => {
       version: 2, jobId: String(jobId), attempt: 5, provider: "cloudflare",
       providerWorkspaceId: "workspace-5", providerSessionId: "session-5", baseSha: BASE,
       sourceArchiveSha256: SOURCE, sourceArchiveBytes: 2_048,
-      archiveSha256: ARCHIVE, archiveBytes: 4_096, runtime: "node-22", lockfileDigest: LOCK,
-      template: "node-template", attemptKey: `${String(jobId)}:5`, causationId: "run-5:5", createdAt: now,
+      archiveSha256: ARCHIVE, archiveBytes: 4_096, runtime: WORK_ORDER_MACHINE_RUNTIME, lockfileDigest: LOCK,
+      template: WORK_ORDER_MACHINE_TEMPLATE, attemptKey: `${String(jobId)}:5`, causationId: "run-5:5", createdAt: now,
     });
     await t.run(async (ctx) => {
       const tampered = await ctx.db.query("workAttempts")
         .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 5)).first();
       await ctx.db.patch(tampered!._id, {
         providerName: "cloudflare", providerWorkspaceId: "workspace-5", providerSessionId: "session-5",
-        workspaceRuntime: "node-22", workspaceLockfileDigest: LOCK, workspaceTemplate: "node-template",
+        workspaceRuntime: WORK_ORDER_MACHINE_RUNTIME, workspaceLockfileDigest: LOCK, workspaceTemplate: WORK_ORDER_MACHINE_TEMPLATE,
         sourceArchiveDigest: SOURCE, sourceArchiveBytes: 2_048, checkpointDigest: ARCHIVE,
         checkpointBytes: 4_096, checkpointManifestDigest: sha256(manifest), checkpointManifest: `${manifest} `,
       });

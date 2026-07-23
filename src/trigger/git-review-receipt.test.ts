@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,9 @@ import type { GitCommandRunner } from "../lib/git-delivery";
 
 const roots: string[] = [];
 const startingDirectory = process.cwd();
+const WORK_ORDER_REVISION_DIGEST = createHash("sha256")
+  .update("canonical test work-order revision: controller Git review")
+  .digest("hex");
 
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -71,6 +75,7 @@ describe("controller Git review receipts", () => {
       runGit: runGit(fixture.checkout),
       jobId: "job-exact",
       attempt: 2,
+      workOrderRevisionDigest: WORK_ORDER_REVISION_DIGEST,
       repository: "daniels-project-space/jarvis",
       expectedBranch: "main",
       baseSha: fixture.baseSha,
@@ -117,6 +122,7 @@ describe("controller Git review receipts", () => {
       runGit: runGit(fixture.checkout),
       jobId,
       attempt: 1,
+      workOrderRevisionDigest: WORK_ORDER_REVISION_DIGEST,
       repository: "daniels-project-space/jarvis",
       expectedBranch: "main",
       baseSha: fixture.baseSha,
@@ -151,6 +157,7 @@ describe("controller Git review receipts", () => {
       runGit: runGit(fixture.checkout),
       jobId: "job-dirty",
       attempt: 1,
+      workOrderRevisionDigest: WORK_ORDER_REVISION_DIGEST,
       repository: "daniels-project-space/jarvis",
       expectedBranch: "main",
       baseSha: fixture.baseSha,
@@ -180,6 +187,7 @@ describe("controller Git review receipts", () => {
       runGit: runGit(shallow),
       jobId: "job-shallow",
       attempt: 1,
+      workOrderRevisionDigest: WORK_ORDER_REVISION_DIGEST,
       repository: "daniels-project-space/jarvis",
       expectedBranch: "main",
       baseSha: fixture.headSha,
@@ -202,6 +210,7 @@ describe("controller Git review receipts", () => {
 
     const built = await buildGitReviewReceipt({
       runGit: runGit(fixture.checkout), jobId: "job-two-attempt", attempt: 2,
+      workOrderRevisionDigest: WORK_ORDER_REVISION_DIGEST,
       repository: "daniels-project-space/jarvis", expectedBranch: "main",
       baseSha: fixture.baseSha, expectedHeadSha: finalHead,
       agentEvidence: "attempt one checkpoint plus attempt two completion",
@@ -224,6 +233,7 @@ describe("controller Git review receipts", () => {
     git(fixture.checkout, ["checkout", "main"]);
     await expect(buildGitReviewReceipt({
       runGit: runGit(fixture.checkout), jobId: "job-two-attempt", attempt: 2,
+      workOrderRevisionDigest: WORK_ORDER_REVISION_DIGEST,
       repository: "daniels-project-space/jarvis", expectedBranch: "main",
       baseSha: movedSource, expectedHeadSha: finalHead, agentEvidence: "forged source",
     })).resolves.toEqual({ ok: false, note: "review checkout head does not descend from its prepared base" });

@@ -493,8 +493,9 @@ export async function ensureWorkAttempt(
   status: string,
   now = Date.now(),
   patch: Record<string, unknown> = {},
+  knownMissing = false,
 ) {
-  const existing = await ctx.db.query("workAttempts")
+  const existing = knownMissing ? null : await ctx.db.query("workAttempts")
     .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", attempt))
     .first();
   if (existing) return existing;
@@ -678,8 +679,6 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
   const runtime = projectJobRuntime(admitted);
   await ctx.db.insert("jobRuntime", runtime);
   await refreshWorkGroupQueueProjection(ctx, runtime.schedulingGroupKey);
-  const attempt = Math.max(1, Number(admitted.attempt ?? 1));
-  await ensureWorkAttempt(ctx, admitted, attempt, String(admitted.status ?? "pending"), Number(admitted.createdAt ?? Date.now()));
   return jobId;
 }
 
@@ -688,6 +687,7 @@ async function patchJobWithRuntimeInternal(
   job: any,
   patch: Record<string, unknown>,
   allowWorkOrderTransition = false,
+  refreshQueue = true,
 ) {
   const prospective = { ...job, ...patch };
   if (job.schedulingBound && IMMUTABLE_JOB_BINDING_FIELDS.some((field) => field in patch && patch[field] !== job[field])) {
@@ -707,13 +707,22 @@ async function patchJobWithRuntimeInternal(
   if (existing) await ctx.db.replace(existing._id, projected);
   else await ctx.db.insert("jobRuntime", projected);
   const queueFields = new Set(["status", "nextRunAt", "dispatchReady", "schedulingBound", "priority"]);
-  if (Object.keys(patch).some((field) => queueFields.has(field))) {
+  if (refreshQueue && Object.keys(patch).some((field) => queueFields.has(field))) {
     await refreshWorkGroupQueueProjection(ctx, projected.schedulingGroupKey);
   }
 }
 
 export async function patchJobWithRuntime(ctx: any, job: any, patch: Record<string, unknown>) {
   await patchJobWithRuntimeInternal(ctx, job, patch);
+}
+
+/**
+ * Update one member of a serialized dispatch batch without rebuilding the
+ * same group head after every row. The caller must refresh each touched group
+ * once before committing the batch.
+ */
+export async function patchJobWithRuntimeDeferredQueue(ctx: any, job: any, patch: Record<string, unknown>) {
+  await patchJobWithRuntimeInternal(ctx, job, patch, false, false);
 }
 
 function activeWorkOrderPatch(
@@ -865,6 +874,22 @@ export async function promoteCompletedJobDependents(ctx: any, source: any, now =
     }));
     if (dependencies.length !== (target.dependsOn ?? []).length
       || dependencies.some((dependency: any) => dependency?.status !== "done")) continue;
+    let sealed = true;
+    for (const dependency of dependencies) {
+      const handoff: any = await ctx.db.query("goalHandoffs")
+        .withIndex("by_source_attempt", (q: any) => q.eq("sourceJobId", dependency._id)
+          .eq("sourceAttempt", Number(dependency.attempt ?? 1))
+          .eq("planGeneration", Number(target.planGeneration))).first();
+      if (!handoff || handoff.parentMissionId !== target.planParentMissionId
+        || handoff.planDigest !== target.planDigest || handoff.sourceNodeId !== dependency.planNodeId
+        || handoff.sourceJobId !== dependency._id
+        || handoff.workOrderRevisionDigest !== dependency.workOrderRevisionDigest
+        || Number(handoff.sourceSteerRevision) !== Number(dependency.steerRevision ?? 0)) {
+        sealed = false;
+        break;
+      }
+    }
+    if (!sealed) continue;
     await patchJobWithRuntime(ctx, target, {
       dispatchReady: true,
       nextRunAt: target.nextRunAt ?? now,

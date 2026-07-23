@@ -16,7 +16,7 @@ import {
 } from "./goalIntegration";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
 import { hasAttemptBudget, isMeaningfulWorkProgress } from "../src/lib/work-attempt";
-import { verifiedGoalHandoffsForJob } from "./goalMode";
+import { ensureGoalNodeHandoff, verifiedGoalHandoffsForJob } from "./goalHandoffs";
 import { claimDisposition, completionReceiptAllowed, isSha256Digest, replayEnvelope, shouldAdvanceAttempt } from "../src/lib/durable-attempt-protocol";
 import { canonicalWorkspaceCheckpoint, parseCanonicalWorkspaceCheckpoint } from "../src/lib/workspace-checkpoint";
 import {
@@ -26,6 +26,7 @@ import {
   jobRuntimeFor,
   patchMissionWithRuntime,
   patchJobWithRuntime,
+  patchJobWithRuntimeDeferredQueue,
   promoteCompletedJobDependents,
   quarantineJobRuntime,
   readAttemptExecutionAuthority,
@@ -458,8 +459,8 @@ export const enqueueV2 = mutation({
       createdAt: now,
     });
     const queued: any = await ctx.db.get(id);
-    // insertJobWithRuntime creates the immutable attempt-one envelope in the
-    // same transaction for every producer (fleet, Goal Mode and repair).
+    // Queue intent is durable immediately; execution authority is allocated
+    // only after every dispatch admission fence passes.
     if (queued) await appendAttemptEvidence(ctx, queued, approvalRequired ? "approval_requested" : "queued",
       approvalRequired ? `Waiting for Daniel's approval${approval.reason ? ` · ${approval.reason}` : ""}` : "Work queued",
       { stage: approvalRequired ? "approval" : "queued", percent: 0, evidenceKind: "intent", eventKey: `intent:${String(id)}` });
@@ -786,10 +787,6 @@ async function validateSelectedDispatchCandidate(ctx: any, runtime: any, now: nu
     await upsertJobRuntime(ctx, job);
     return null;
   }
-  if (!await readAttemptExecutionAuthority(ctx, job, job.attempt ?? 1)) {
-    await quarantineJobRuntime(ctx, job, runtime);
-    return null;
-  }
   if (!await protectedApprovalAllowsExecution(ctx, job) || !immutableLineageIsValid(job)) return null;
   if (job.goalStage && job.missionId) {
     const missionId = ctx.db.normalizeId("missions", job.missionId);
@@ -820,7 +817,21 @@ async function validateSelectedDispatchCandidate(ctx: any, runtime: any, now: nu
     const integration: any = await ctx.db.get(job.integrationAttemptId);
     if (!integration || integration.jobId !== job._id || integration.status !== "queued") return null;
   }
-  return { job, authority };
+  const attemptNumber = Math.max(1, Number(job.attempt ?? 1));
+  const existingAttempt = await ctx.db.query("workAttempts")
+    .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", attemptNumber)).first();
+  if (!existingAttempt) {
+    // Mint execution authority only after approval, mission phase, exact DAG
+    // handoffs and integration admission have all passed. Invalid/stale work
+    // therefore leaves no executable catalog lineage behind.
+    await ensureWorkAttempt(ctx, job, attemptNumber, "pending", now, {}, true);
+  }
+  const executionAuthority = await readAttemptExecutionAuthority(ctx, job, attemptNumber);
+  if (!executionAuthority) {
+    await quarantineJobRuntime(ctx, job, runtime);
+    return null;
+  }
+  return { job, authority, executionAuthority };
 }
 
 async function runnableCandidates(ctx: any, now: number, requestedLimit: number) {
@@ -840,7 +851,7 @@ async function runnableCandidates(ctx: any, now: number, requestedLimit: number)
       && group.projectRepository === binding.projectRepository;
   });
   return {
-    jobs: authorized.map((candidate) => candidate.job),
+    candidates: authorized,
     groupRows,
     scheduler: projected.scheduler,
   };
@@ -1002,13 +1013,10 @@ export const reserveDispatchBatch = mutation({
     const candidates = await runnableCandidates(ctx, now, limit);
     const reservations = [];
     const reservedJobs = [];
-    for (const j of candidates.jobs) {
+    for (const candidate of candidates.candidates) {
+      const j = candidate.job;
       let attemptNumber = j.attempt ?? 1;
-      let attempt = await attemptFor(ctx, j._id, attemptNumber);
-      if (!await readAttemptExecutionAuthority(ctx, j, attemptNumber)) {
-        await quarantineJobRuntime(ctx, j);
-        continue;
-      }
+      let attempt = candidate.executionAuthority.attempt;
       // A malformed/legacy pending row may still point at a launched worker.
       // Never overwrite that binding into an unclaimable reservation: close
       // it first, record its terminal lineage, then reserve a fresh attempt.
@@ -1021,15 +1029,18 @@ export const reserveDispatchBatch = mutation({
         });
         attemptNumber += 1;
         await patchJobWithRuntime(ctx, j, { attempt: attemptNumber, ...invalidateDeliveryLease(j) });
-        await ensureAttempt(ctx, j._id, attemptNumber, "pending", now);
+        attempt = await ensureAttempt(ctx, j._id, attemptNumber, "pending", now);
+        if (!await readAttemptExecutionAuthority(ctx, { ...j, attempt: attemptNumber }, attemptNumber)) {
+          await quarantineJobRuntime(ctx, { ...j, attempt: attemptNumber });
+          continue;
+        }
         await appendAttemptEvidence(ctx, j, "queued", `Fresh attempt ${attemptNumber} queued after reservation repair`, {
           stage: "queued", evidenceKind: "intent", eventKey: `intent:${attemptNumber}`, attempt: attemptNumber,
         });
         j.attempt = attemptNumber;
-        attempt = await attemptFor(ctx, j._id, attemptNumber);
       }
       const dispatchId = `${String(j._id)}:${attemptNumber}:${now}`;
-      await patchJobWithRuntime(ctx, j, {
+      await patchJobWithRuntimeDeferredQueue(ctx, j, {
         status: "dispatching",
         stage: "dispatching",
         progress: "cloud worker reserved",
@@ -1047,7 +1058,6 @@ export const reserveDispatchBatch = mutation({
         providerObservedAt: now,
         heartbeatAt: now,
       });
-      attempt = await attemptFor(ctx, j._id, attemptNumber);
       if (attempt && !attempt.workerRunId) await ctx.db.patch(attempt._id, { status: "dispatching", dispatchId, lastEventAt: now });
       else if (!attempt) await ensureAttempt(ctx, j._id, attemptNumber, "dispatching", now, { dispatchId });
       await appendAttemptEvidence(ctx, j, "dispatched", `Independent Trigger worker reserved${a.reason ? ` · ${a.reason.slice(0, 120)}` : ""}`, {
@@ -1066,6 +1076,9 @@ export const reserveDispatchBatch = mutation({
         label: j.label ?? j.task.slice(0, 80),
       });
       reservedJobs.push(j);
+    }
+    for (const groupKey of new Set(reservedJobs.map((job) => String(job.schedulingGroupKey)))) {
+      await refreshWorkGroupQueueProjection(ctx, groupKey, now);
     }
     await recordSchedulingReservations(ctx, reservedJobs, now, candidates.groupRows, candidates.scheduler);
     return { reservations };
@@ -1395,7 +1408,9 @@ export const finalize = mutation({
         reviewReceiptSignature: a.reviewReceiptSignature, reviewDiffSha256: a.reviewDiffSha256,
         reviewReceiptId: row.reviewReceiptId, reviewReceiptDigest: row.reviewReceiptDigest, createdAt: now,
       });
-      await promoteCompletedJobDependents(ctx, row, now);
+      const completed = { ...row, ...finalPatch };
+      await ensureGoalNodeHandoff(ctx, completed);
+      await promoteCompletedJobDependents(ctx, completed, now);
     }
     if (row.missionId) {
       const missionId = ctx.db.normalizeId("missions", row.missionId);

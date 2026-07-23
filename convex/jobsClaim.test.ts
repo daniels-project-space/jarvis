@@ -24,58 +24,55 @@ type Policy = "manual" | "read_only" | "auto_merge";
 
 async function specialistFixture(policy: Policy = "manual", goalStage?: "validating") {
   const t = convexTest(schema, modules);
-  const now = Date.now();
   const admitted = await testMissionAdmission(t, {
     key: `specialist-${policy}-${goalStage ?? "work"}`,
     workerToken: WORKER,
     repository: "daniels-project-space/jarvis",
     sourceHeadSha: BASE,
   });
+  const task = policy === "manual"
+    ? "Publish verified repository work to the reviewed Git ref"
+    : "verified repository work";
   const jobId = await t.mutation(api.jobs.enqueueV2, {
-    repo: "daniels-project-space/jarvis", task: "verified repository work",
+    repo: "daniels-project-space/jarvis", task,
     readonly: policy === "read_only",
     maxAttempts: 3, goalStage, missionId: String(admitted.missionId),
     workerToken: WORKER,
   });
-  const authority = await t.run(async (ctx) => {
-    const job: any = await ctx.db.get(jobId);
-    if (!job) throw new Error("admitted specialist fixture missing");
-    await ctx.db.patch(jobId, {
-      status: "running", deliveryMode: policy, workerRunId: "specialist-run",
-      dispatchId: "specialist-dispatch", stage: goalStage ?? "building", percent: 90,
-      heartbeatAt: now,
-    });
-    const attempt = await ctx.db.query("workAttempts")
-      .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1)).first();
-    await ctx.db.patch(attempt!._id, {
-      status: "running", workerRunId: "specialist-run", dispatchId: "specialist-dispatch",
-      livenessAt: now, progressAt: now, lastEventAt: now,
-    });
-    const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", jobId)).first();
-    await ctx.db.patch(runtime!._id, {
-      status: "running", active: true, deliveryMode: policy, workerRunId: "specialist-run",
-      dispatchId: "specialist-dispatch", stage: goalStage ?? "building", percent: 90,
-      heartbeatAt: now, progressAt: now, updatedAt: now,
-    });
-    return {
-      branch: String(job.workerBranch ?? job.branch ?? ""),
-      authorityDigest: String(attempt!.authorityDigest),
-    };
+  if (policy === "manual") {
+    expect(await t.mutation(api.approvals.decide, {
+      jobId: String(jobId), decision: "approved", workerToken: WORKER,
+    })).toBe(true);
+  }
+  const batch = await t.mutation(api.jobs.reserveDispatchBatch, {
+    limit: 1, reason: "specialist-fixture", workerToken: WORKER,
+  });
+  expect(batch.reservations).toHaveLength(1);
+  const claim: any = await t.mutation(api.jobs.claimDispatched, {
+    jobId, dispatchId: batch.reservations[0].dispatchId,
+    workerRunId: "specialist-run", workerToken: WORKER,
+  });
+  expect(claim).toMatchObject({
+    jobId, authorityDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    workOrderRevisionDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    deliveryMode: policy,
   });
   const result = "specialist executed once";
   const note = "supervisor pass";
   const receipt = JSON.stringify({
-    version: 1, jobId: String(jobId), attempt: 1, repository: "daniels-project-space/jarvis",
-    branch: authority.branch, baseSha: BASE, baseTreeSha: TREE, headSha: HEAD,
+    version: 2, jobId: String(jobId), attempt: 1,
+    workOrderRevisionDigest: claim.workOrderRevisionDigest,
+    repository: "daniels-project-space/jarvis",
+    branch: String(claim.workerBranch ?? claim.branch ?? ""), baseSha: BASE, baseTreeSha: TREE, headSha: HEAD,
     headTreeSha: TREE, diffSha256: DIFF, agentEvidenceSha256: "f".repeat(64),
   });
   const commitArgs = {
-    jobId, expectedAttempt: 1, authorityDigest: authority.authorityDigest,
+    jobId, expectedAttempt: 1, authorityDigest: claim.authorityDigest,
     specialistRunId: "specialist-run", result, verificationNote: note,
     reviewReceiptJson: receipt, reviewReceiptSignature: SIGNATURE, reviewReceiptKeyId: "current-2026-07",
     reviewDiffSha256: DIFF, resultDigest: sha256(result), evidenceDigest: sha256(note), workerToken: WORKER,
   } as const;
-  return { t, jobId, result, note, receipt, authorityDigest: authority.authorityDigest, commitArgs };
+  return { t, jobId, result, note, receipt, authorityDigest: claim.authorityDigest, commitArgs };
 }
 
 async function committedAndClaimed(policy: Policy = "manual", goalStage?: "validating") {
@@ -128,9 +125,9 @@ describe("real Convex specialist/controller race matrix", () => {
     })).toBe(true);
     expect(await f.t.mutation(api.jobs.markVerifiedForDelivery, f.commitArgs)).toBe(false);
     const state = await rows(f.t);
-    expect(state.jobs[0]).toMatchObject({ status: "pending", attempt: 2, steerRevision: 1 });
+    expect(state.jobs[0]).toMatchObject({ status: "awaiting_approval", attempt: 2, steerRevision: 1 });
     expect(state.attempts).toHaveLength(2);
-    expect(state.attempts.map((attempt) => attempt.status)).toEqual(["steered", "pending"]);
+    expect(state.attempts.map((attempt) => attempt.status)).toEqual(["steered", "awaiting_approval"]);
     expect(state.attempts[1].authorityDigest).not.toBe(state.attempts[0].authorityDigest);
   });
 
