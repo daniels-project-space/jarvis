@@ -28,6 +28,11 @@ describe("Trigger-native agent fleet dispatch", () => {
           jobId: "job-1",
           dispatchId: "job-1:1:123",
           attempt: 1,
+          expectedAttempt: 1,
+          dispatchGeneration: 1,
+          dispatchPhase: "specialist",
+          dispatchReceiptDigest: "e".repeat(64),
+          dispatchPayloadDigest: "f".repeat(64),
           missionId: "mission-1",
           agentId: "paul",
           label: "Paul · launch audit",
@@ -35,6 +40,7 @@ describe("Trigger-native agent fleet dispatch", () => {
           workOrderRevisionDigest: "b".repeat(64),
           triggerMachinePreset: "medium-2x",
           triggerMachineReason: "admitted_write_or_hard",
+          reason: "mission:mission-1",
         }],
       },
     }), { status: 200 }));
@@ -56,6 +62,10 @@ describe("Trigger-native agent fleet dispatch", () => {
           jobId: "job-1",
           dispatchId: "job-1:1:123",
           expectedAttempt: 1,
+          dispatchGeneration: 1,
+          dispatchPhase: "specialist",
+          dispatchReceiptDigest: "e".repeat(64),
+          dispatchPayloadDigest: "f".repeat(64),
           authorityDigest: "a".repeat(64),
           workOrderRevisionDigest: "b".repeat(64),
           triggerMachinePreset: "medium-2x",
@@ -64,14 +74,15 @@ describe("Trigger-native agent fleet dispatch", () => {
         }),
         options: expect.objectContaining({
           machine: "medium-2x",
-          idempotencyKey: expect.stringContaining("global:jarvis-agent-attempt-v2:job-1:1:"),
+          idempotencyKey: expect.stringContaining("global:jarvis-agent-dispatch-v2:job-1:1:1:specialist:"),
           idempotencyKeyTTL: "30d",
           tags: expect.arrayContaining(["jarvis-agent", "job:job-1", "mission:mission-1"]),
         }),
       })],
     );
     expect(createIdempotencyKey).toHaveBeenCalledWith([
-      "jarvis-agent-attempt-v2", "job-1", "1", "a".repeat(64), "b".repeat(64),
+      "jarvis-agent-dispatch-v2", "job-1", "1", "1", "specialist", "e".repeat(64),
+      "a".repeat(64), "b".repeat(64),
     ], { scope: "global" });
   });
 
@@ -86,6 +97,43 @@ describe("Trigger-native agent fleet dispatch", () => {
     expect(batchTrigger).not.toHaveBeenCalled();
   });
 
+  it("keeps a new Trigger worker dormant against an old Convex reservation envelope", async () => {
+    vi.stubEnv("JARVIS_WORKER_TOKEN", "worker-capability");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        value: {
+          reservations: [{
+            jobId: "legacy-job",
+            dispatchId: "legacy-job:1:timestamp",
+            attempt: 1,
+            missionId: null,
+            agentId: null,
+            label: "legacy reservation",
+            authorityDigest: "a".repeat(64),
+            workOrderRevisionDigest: "b".repeat(64),
+            triggerMachinePreset: "medium-1x",
+            triggerMachineReason: "admitted_bounded_read",
+          }],
+        },
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ value: true }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { wakeAgentFleet } = await import("./agent-fleet-dispatch");
+
+    await expect(wakeAgentFleet("mixed-trigger-first")).resolves.toBe(false);
+    expect(batchTrigger).not.toHaveBeenCalled();
+    const release = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect(release).toMatchObject({
+      path: "jobs:rejectDispatch",
+      args: {
+        jobId: "legacy-job",
+        dispatchId: "legacy-job:1:timestamp",
+        reason: "dispatch receipt protocol v2 is not active",
+        workerToken: "worker-capability",
+      },
+    });
+  });
+
   it("keeps an ambiguous launch reconciling under the same immutable global key", async () => {
     vi.stubEnv("JARVIS_WORKER_TOKEN", "worker-capability");
     const fetchMock = vi.fn()
@@ -95,6 +143,11 @@ describe("Trigger-native agent fleet dispatch", () => {
             jobId: "job-read",
             dispatchId: "job-read:2:456",
             attempt: 2,
+            expectedAttempt: 2,
+            dispatchGeneration: 4,
+            dispatchPhase: "delivery",
+            dispatchReceiptDigest: "e".repeat(64),
+            dispatchPayloadDigest: "f".repeat(64),
             missionId: null,
             agentId: "rose",
             label: "bounded audit",
@@ -102,6 +155,7 @@ describe("Trigger-native agent fleet dispatch", () => {
             workOrderRevisionDigest: "d".repeat(64),
             triggerMachinePreset: "medium-1x",
             triggerMachineReason: "admitted_bounded_read",
+            reason: "reconcile",
           }],
         },
       }), { status: 200 }))

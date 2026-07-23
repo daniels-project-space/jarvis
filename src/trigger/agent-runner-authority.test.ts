@@ -210,6 +210,10 @@ function workerPayload(reservation: any): AgentWorkerPayload {
     jobId: String(reservation.jobId),
     dispatchId: String(reservation.dispatchId),
     expectedAttempt: Number(reservation.attempt),
+    dispatchGeneration: Number(reservation.dispatchGeneration),
+    dispatchPhase: reservation.dispatchPhase,
+    dispatchReceiptDigest: String(reservation.dispatchReceiptDigest),
+    dispatchPayloadDigest: String(reservation.dispatchPayloadDigest),
     authorityDigest: String(reservation.authorityDigest),
     workOrderRevisionDigest: String(reservation.workOrderRevisionDigest),
     triggerMachinePreset: reservation.triggerMachinePreset,
@@ -722,7 +726,6 @@ describe("production Trigger worker authority harness", () => {
       "checkpoint_persist",
       "review_receipt",
       "subscription_acquire",
-      "subscription_acquire",
       "codex_process",
     ]);
     for (const { authority } of trace) {
@@ -843,7 +846,12 @@ describe("production Trigger worker authority harness", () => {
       dispatchId: `${reservation.dispatchId}-stale`,
     }, "stale-claim-run", dependencies);
 
-    expect(result).toEqual({ processed: 0, stale: true });
+    expect(result).toEqual({
+      processed: 0,
+      executable: false,
+      held: true,
+      code: "trigger_launch_authority_held",
+    });
     expect(boundariesSeen).toEqual([]);
     expect((dependencies.resolveSubscriptionAgentBin as any)).not.toHaveBeenCalled();
     expect((dependencies.configuredCloudWorkspaceProvider as any)).not.toHaveBeenCalled();

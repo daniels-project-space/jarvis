@@ -91,7 +91,11 @@ import {
   prepareCloudWorkspaceExecution,
   replayCloudWorkspaceExecution,
 } from "./cloud-workspace-controller";
-import type { TriggerAgentMachinePreset, TriggerAgentMachineReason } from "../lib/trigger-machine";
+import type {
+  TriggerAgentDispatchPhase,
+  TriggerAgentMachinePreset,
+  TriggerAgentMachineReason,
+} from "../lib/trigger-machine";
 import { createR2CheckpointStore } from "./cloud-checkpoint-r2";
 import {
   configuredCloudWorkspaceCleanupProvider,
@@ -584,6 +588,10 @@ export type AgentWorkerPayload = {
   jobId: string;
   dispatchId: string;
   expectedAttempt: number;
+  dispatchGeneration: number;
+  dispatchPhase: TriggerAgentDispatchPhase;
+  dispatchReceiptDigest: string;
+  dispatchPayloadDigest: string;
   authorityDigest: string;
   workOrderRevisionDigest: string;
   triggerMachinePreset: TriggerAgentMachinePreset;
@@ -624,6 +632,10 @@ export type AgentRunnerBoundaryObservation = Readonly<{
   sourceHeadSha: string | null;
   triggerMachinePreset: TriggerAgentMachinePreset;
   triggerMachineReason: TriggerAgentMachineReason;
+  dispatchGeneration: number;
+  dispatchPhase: TriggerAgentDispatchPhase;
+  dispatchReceiptDigest: string;
+  dispatchPayloadDigest: string;
 }>;
 
 type ExecutionLeaseControl = Readonly<{
@@ -889,6 +901,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       dispatchId: options.reservation.dispatchId,
       workerRunId: options.reservation.workerRunId,
       expectedAttempt: options.reservation.expectedAttempt,
+      dispatchGeneration: options.reservation.dispatchGeneration,
+      dispatchPhase: options.reservation.dispatchPhase,
+      dispatchReceiptDigest: options.reservation.dispatchReceiptDigest,
+      dispatchPayloadDigest: options.reservation.dispatchPayloadDigest,
       authorityDigest: options.reservation.authorityDigest,
       workOrderRevisionDigest: options.reservation.workOrderRevisionDigest,
       triggerMachinePreset: options.reservation.triggerMachinePreset,
@@ -903,6 +919,13 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       held: true,
       code: String(job.code ?? "authority_held"),
     };
+    if (job.dispatchId !== options.reservation.dispatchId
+      || Number(job.dispatchGeneration) !== options.reservation.dispatchGeneration
+      || job.dispatchPhase !== options.reservation.dispatchPhase
+      || job.dispatchReceiptDigest !== options.reservation.dispatchReceiptDigest
+      || job.dispatchPayloadDigest !== options.reservation.dispatchPayloadDigest) {
+      return { processed: 0, stale: true };
+    }
     const processed = 1;
     const expectedAttempt = Number(job.attempt ?? 1);
     const authorityDigest = typeof job.authorityDigest === "string" ? job.authorityDigest : "";
@@ -912,6 +935,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         expectedAttempt,
         workerRunId: options.reservation.workerRunId,
         authorityDigest,
+        dispatchGeneration: options.reservation.dispatchGeneration,
+        dispatchPhase: options.reservation.dispatchPhase,
+        dispatchReceiptDigest: options.reservation.dispatchReceiptDigest,
+        dispatchPayloadDigest: options.reservation.dispatchPayloadDigest,
         phase,
       }).catch(() => null);
       if (!boundary
@@ -925,7 +952,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         || boundary.sourceBranch !== (job.sourceBranch ?? null)
         || boundary.sourceHeadSha !== (job.sourceHeadSha ?? null)
         || boundary.triggerMachinePreset !== job.triggerMachinePreset
-        || boundary.triggerMachineReason !== job.triggerMachineReason) return null;
+        || boundary.triggerMachineReason !== job.triggerMachineReason
+        || Number(boundary.dispatchGeneration) !== options.reservation.dispatchGeneration
+        || boundary.dispatchPhase !== options.reservation.dispatchPhase
+        || boundary.dispatchReceiptDigest !== options.reservation.dispatchReceiptDigest
+        || boundary.dispatchPayloadDigest !== options.reservation.dispatchPayloadDigest) return null;
       // Return the server-authored object itself. Effect observers receive this
       // exact envelope; the runner never re-hashes or reconstructs authority.
       return boundary as AgentRunnerBoundaryObservation;
@@ -965,7 +996,6 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     }): Promise<T> => {
       const freshAuthority = await authorizeBoundary("codex_start");
       if (!freshAuthority) throw new Error("immutable attempt authority rejected before Codex boundary");
-      dependencies.onAuthorityBoundary("subscription_acquire", freshAuthority);
       const boundary = await prepareSubscriptionEnv(provider, {
         scope: input.scope,
         minimumValidityMs: input.validityMs,
@@ -2040,11 +2070,14 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           const receiptId = sha256Bytes([
             "jarvis-cloud-codex-turn-v1", String(job.jobId), String(expectedAttempt),
             String(job.workerRunId), providerWorkspace!.providerWorkspaceId,
-            providerWorkspace!.providerSessionId, String(sequence),
+            providerWorkspace!.providerSessionId, options.reservation.dispatchReceiptDigest,
+            options.reservation.dispatchPayloadDigest, String(sequence),
           ].join(":"));
           const preparedReceipt = await convexMutation("jobs:prepareCloudCodexTurn", {
             jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
             authorityDigest, workOrderRevisionDigest: String(job.workOrderRevisionDigest ?? ""),
+            dispatchReceiptDigest: options.reservation.dispatchReceiptDigest,
+            dispatchPayloadDigest: options.reservation.dispatchPayloadDigest,
             providerWorkspaceId: providerWorkspace!.providerWorkspaceId,
             providerSessionId: providerWorkspace!.providerSessionId,
             receiptId, sequence,
@@ -2056,6 +2089,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               const recorded = await convexMutation("jobs:recordCloudCodexTurnPhase", {
                 jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId),
                 authorityDigest, workOrderRevisionDigest: String(job.workOrderRevisionDigest ?? ""),
+                dispatchReceiptDigest: options.reservation.dispatchReceiptDigest,
+                dispatchPayloadDigest: options.reservation.dispatchPayloadDigest,
                 receiptId, sequence, phase,
               }).catch(() => false);
               if (!recorded) throw new Error(`Codex turn ${phase} receipt was rejected`);

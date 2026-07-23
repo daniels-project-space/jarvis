@@ -75,9 +75,9 @@ describe("cloud Codex runner attestation boundary", () => {
     mkdirSync(scratch, { recursive: true });
     const phases: string[] = [];
     const runTurn = vi.spyOn(CodexAppServer.prototype, "runTurn").mockImplementation(async (turn) => {
-      await turn.beforeTurn();
-      turn.onTurnRequestWritten();
-      await turn.onTurnAccepted();
+      await turn.beforeTurn?.();
+      turn.onTurnRequestWritten?.();
+      await turn.onTurnAccepted?.();
       return { code: 0, stdout: "", stderr: "", finalText: "done", threadId: "thread-4" };
     });
     vi.spyOn(CodexAppServer.prototype, "stop").mockImplementation(() => undefined);

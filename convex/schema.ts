@@ -247,6 +247,11 @@ export default defineSchema({
     // before its independent cloud run is created; the worker run id then
     // connects Trigger Realtime to the durable Convex work record.
     dispatchId: v.optional(v.string()),
+    dispatchGeneration: v.optional(v.number()),
+    dispatchPhase: v.optional(v.string()),
+    dispatchReceiptId: v.optional(v.id("dispatchReceipts")),
+    dispatchReceiptDigest: v.optional(v.string()),
+    dispatchPayloadDigest: v.optional(v.string()),
     // Snapshot produced by the claim transaction. Exact redelivery returns
     // this immutable envelope rather than re-reading changing upstream work.
     upstreamEvidence: v.optional(v.array(v.object({
@@ -418,6 +423,11 @@ export default defineSchema({
     heartbeatAt: v.number(),
     nextRunAt: v.optional(v.number()),
     dispatchId: v.optional(v.string()),
+    dispatchGeneration: v.optional(v.number()),
+    dispatchPhase: v.optional(v.string()),
+    dispatchReceiptId: v.optional(v.id("dispatchReceipts")),
+    dispatchReceiptDigest: v.optional(v.string()),
+    dispatchPayloadDigest: v.optional(v.string()),
     dispatchLeaseUntil: v.optional(v.number()),
     workerRunId: v.optional(v.string()),
     workerRuntime: v.optional(v.string()),
@@ -906,6 +916,11 @@ export default defineSchema({
     sessionId: v.optional(v.string()),
     workerRunId: v.optional(v.string()),
     dispatchId: v.optional(v.string()),
+    dispatchGeneration: v.optional(v.number()),
+    dispatchPhase: v.optional(v.string()),
+    dispatchReceiptId: v.optional(v.id("dispatchReceipts")),
+    dispatchReceiptDigest: v.optional(v.string()),
+    dispatchPayloadDigest: v.optional(v.string()),
     triggerMachinePreset: v.optional(v.string()),
     triggerMachineReason: v.optional(v.string()),
     triggerObservedMachinePreset: v.optional(v.string()),
@@ -972,6 +987,34 @@ export default defineSchema({
     .index("by_job_attempt", ["jobId", "attempt"])
     .index("by_job_checkpoint_available_attempt", ["jobId", "checkpointAvailable", "attempt"])
     .index("by_status_progress", ["status", "progressAt"]),
+
+  // Convex is the sole authority for one logical Trigger launch. A receipt is
+  // append-only across generations; transport ambiguity only changes its
+  // reconciliation status and lease, never its identity, payload, or machine.
+  dispatchReceipts: defineTable({
+    jobId: v.id("jobs"),
+    attempt: v.number(),
+    generation: v.number(),
+    phase: v.string(),
+    dispatchId: v.string(),
+    authorityDigest: v.string(),
+    workOrderRevisionDigest: v.string(),
+    triggerMachinePreset: v.string(),
+    triggerMachineReason: v.string(),
+    payloadJson: v.string(),
+    payloadDigest: v.string(),
+    receiptDigest: v.string(),
+    status: v.string(), // reserved | reconciling | claimed | closed | superseded
+    workerRunId: v.optional(v.string()),
+    leaseUntil: v.optional(v.number()),
+    closeReason: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+    closedAt: v.optional(v.number()),
+  })
+    .index("by_job_generation", ["jobId", "generation"])
+    .index("by_status_lease", ["status", "leaseUntil"])
+    .index("by_digest", ["receiptDigest"]),
 
   // Accepted GoalPlan authority is normalized once. These compact rows map
   // every original id exactly once to its executable job and repository/evidence

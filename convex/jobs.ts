@@ -21,6 +21,7 @@ import { claimDisposition, completionReceiptAllowed, isSha256Digest, replayEnvel
 import { canonicalWorkspaceCheckpoint, parseCanonicalWorkspaceCheckpoint } from "../src/lib/workspace-checkpoint";
 import {
   observedTriggerMachineReason,
+  type TriggerAgentDispatchPhase,
   type TriggerAgentMachinePreset,
   type TriggerAgentMachineReason,
 } from "../src/lib/trigger-machine";
@@ -86,6 +87,162 @@ async function sha256Hex(value: string) {
   const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
+
+/* eslint-disable @typescript-eslint/no-explicit-any -- Convex documents are validated against the immutable receipt fields before use */
+function dispatchPhaseForJob(row: any): TriggerAgentDispatchPhase {
+  if (row.integrationAttemptId || row.integrationState
+    || (row.goalStage === "validating" && row.deliveryMode === "auto_merge")) return "integration";
+  if (row.verificationVerdict === "pass" && row.reviewReceiptId) return "delivery";
+  return "specialist";
+}
+
+async function latestDispatchReceipt(ctx: any, jobId: any) {
+  return await ctx.db.query("dispatchReceipts")
+    .withIndex("by_job_generation", (q: any) => q.eq("jobId", jobId))
+    .order("desc")
+    .first();
+}
+
+async function dispatchReceiptByDigest(ctx: any, digest: string) {
+  const rows = await ctx.db.query("dispatchReceipts")
+    .withIndex("by_digest", (q: any) => q.eq("receiptDigest", digest))
+    .take(2);
+  return rows.length === 1 ? rows[0] : null;
+}
+
+async function claimedDispatchReceiptForRow(ctx: any, row: any, workerRunId: unknown) {
+  if (typeof workerRunId !== "string" || !row.dispatchReceiptId) return null;
+  const receipt: any = await ctx.db.get(row.dispatchReceiptId);
+  return receipt
+    && receipt.status === "claimed"
+    && receipt.workerRunId === workerRunId
+    && receipt.dispatchId === row.dispatchId
+    && receipt.generation === row.dispatchGeneration
+    && receipt.phase === row.dispatchPhase
+    && receipt.receiptDigest === row.dispatchReceiptDigest
+    && receipt.payloadDigest === row.dispatchPayloadDigest
+    ? receipt
+    : null;
+}
+
+function dispatchReceiptMatchesRequest(receipt: any, row: any, a: any) {
+  return Boolean(receipt
+    && receipt.jobId === row._id
+    && receipt.attempt === a.expectedAttempt
+    && receipt.generation === a.dispatchGeneration
+    && receipt.phase === a.dispatchPhase
+    && receipt.dispatchId === a.dispatchId
+    && receipt.receiptDigest === a.dispatchReceiptDigest
+    && receipt.payloadDigest === a.dispatchPayloadDigest
+    && receipt.authorityDigest === a.authorityDigest
+    && receipt.workOrderRevisionDigest === a.workOrderRevisionDigest
+    && receipt.triggerMachinePreset === a.triggerMachinePreset
+    && receipt.triggerMachineReason === a.triggerMachineReason);
+}
+
+function reservationFromDispatchReceipt(receipt: any, row: any) {
+  let payload: any;
+  try {
+    payload = JSON.parse(receipt.payloadJson);
+  } catch {
+    return null;
+  }
+  return {
+    ...payload,
+    attempt: receipt.attempt,
+    missionId: row.missionId ?? null,
+    missionGroupId: row.missionGroupId,
+    projectGroupId: row.projectGroupId,
+    projectRepository: row.projectRepository ?? null,
+    schedulingGroupKey: row.schedulingGroupKey,
+    agentId: row.agentId ?? null,
+    label: row.label ?? row.task.slice(0, 80),
+  };
+}
+
+async function createDispatchReceipt(
+  ctx: any,
+  row: any,
+  attempt: number,
+  authority: any,
+  machine: { preset: TriggerAgentMachinePreset; reason: TriggerAgentMachineReason },
+  reason: string,
+  now: number,
+) {
+  const latest = await latestDispatchReceipt(ctx, row._id);
+  if (latest && !["closed", "superseded"].includes(latest.status)) {
+    const sameAttempt = Number(latest.attempt) === attempt;
+    const launchStillUnclaimed = ["reserved", "reconciling"].includes(latest.status);
+    if (sameAttempt && launchStillUnclaimed
+      && row.status === "dispatching"
+      && row.dispatchId === latest.dispatchId
+      && row.dispatchReceiptDigest === latest.receiptDigest) return null;
+    const completedContinuation = sameAttempt && latest.status === "claimed";
+    await ctx.db.patch(latest._id, {
+      status: completedContinuation ? "closed" : "superseded",
+      closeReason: completedContinuation
+        ? "durable continuation queued"
+        : "dispatch authority superseded before a new generation",
+      leaseUntil: undefined,
+      closedAt: now,
+      updatedAt: now,
+    });
+  }
+  const generation = Number(latest?.generation ?? 0) + 1;
+  const phase = dispatchPhaseForJob(row);
+  const dispatchId = `${String(row._id)}:${attempt}:${generation}:${phase}`;
+  const payloadCore = {
+    jobId: String(row._id),
+    dispatchId,
+    expectedAttempt: attempt,
+    dispatchGeneration: generation,
+    dispatchPhase: phase,
+    authorityDigest: authority.authorityDigest,
+    workOrderRevisionDigest: authority.workOrderRevisionDigest,
+    triggerMachinePreset: machine.preset,
+    triggerMachineReason: machine.reason,
+    reason,
+  };
+  const payloadDigest = await sha256Hex(JSON.stringify(payloadCore));
+  const receiptDigest = await sha256Hex(JSON.stringify({
+    protocolVersion: 2,
+    jobId: String(row._id),
+    attempt,
+    generation,
+    phase,
+    dispatchId,
+    authorityDigest: authority.authorityDigest,
+    workOrderRevisionDigest: authority.workOrderRevisionDigest,
+    triggerMachinePreset: machine.preset,
+    triggerMachineReason: machine.reason,
+    payloadDigest,
+  }));
+  const payload = {
+    ...payloadCore,
+    dispatchReceiptDigest: receiptDigest,
+    dispatchPayloadDigest: payloadDigest,
+  };
+  const receiptId = await ctx.db.insert("dispatchReceipts", {
+    jobId: row._id,
+    attempt,
+    generation,
+    phase,
+    dispatchId,
+    authorityDigest: authority.authorityDigest,
+    workOrderRevisionDigest: authority.workOrderRevisionDigest,
+    triggerMachinePreset: machine.preset,
+    triggerMachineReason: machine.reason,
+    payloadJson: JSON.stringify(payload),
+    payloadDigest,
+    receiptDigest,
+    status: "reserved",
+    leaseUntil: now + DISPATCH_LEASE_MS,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return { receiptId, receipt: { ...payload, attempt, generation, phase, receiptDigest, payloadDigest, dispatchId } };
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 function invalidateDeliveryLease(row: any) {
   return {
@@ -996,6 +1153,11 @@ async function claimedJob(ctx: any, j: any, upstreamEvidence: readonly any[] = [
     triggerObservedMachinePreset: j.triggerObservedMachinePreset ?? null,
     triggerObservedMachineReason: j.triggerObservedMachineReason ?? null,
     triggerPlatformAttempt: j.triggerPlatformAttempt ?? null,
+    dispatchId: j.dispatchId ?? null,
+    dispatchGeneration: j.dispatchGeneration ?? null,
+    dispatchPhase: j.dispatchPhase ?? null,
+    dispatchReceiptDigest: j.dispatchReceiptDigest ?? null,
+    dispatchPayloadDigest: j.dispatchPayloadDigest ?? null,
     workOrderRevisionId: attemptAuthority.workOrderRevisionId,
     workOrderRevision: attemptAuthority.workOrderRevision,
     workOrderRevisionDigest: attemptAuthority.workOrderRevisionDigest,
@@ -1095,6 +1257,7 @@ async function upstreamEvidenceForClaim(ctx: any, j: any) {
 // Reserve concrete jobs before asking Trigger.dev to create cloud runs. Convex
 // serializes this mutation, so overlapping supervisors receive disjoint work
 // and never need a global "is any runner active?" lock.
+/* eslint-disable @typescript-eslint/no-explicit-any -- bounded scheduler joins validate durable Convex documents before dispatch */
 export const reserveDispatchBatch = mutation({
   args: {
     limit: v.number(),
@@ -1105,8 +1268,61 @@ export const reserveDispatchBatch = mutation({
     requireWorker(a.workerToken);
     const now = Date.now();
     const limit = Math.max(1, Math.min(BACKGROUND_CONCURRENCY_LIMIT, Math.floor(a.limit)));
-    const candidates = await runnableCandidates(ctx, now, limit);
-    const reservations = [];
+    const reason = a.reason?.trim().replace(/\s+/g, " ").slice(0, 160) || "work-available";
+    const reservations: any[] = [];
+    const retryable = [
+      ...await ctx.db.query("dispatchReceipts")
+        .withIndex("by_status_lease", (q: any) => q.eq("status", "reconciling").lte("leaseUntil", now))
+        .take(limit),
+      ...await ctx.db.query("dispatchReceipts")
+        .withIndex("by_status_lease", (q: any) => q.eq("status", "reserved").lte("leaseUntil", now))
+        .take(limit),
+    ].sort((left: any, right: any) => left.createdAt - right.createdAt);
+    const retriedJobs = new Set<string>();
+    for (const receipt of retryable) {
+      if (reservations.length >= limit || retriedJobs.has(String(receipt.jobId))) continue;
+      const row: any = await ctx.db.get(receipt.jobId);
+      const exact = row
+        && row.status === "dispatching"
+        && row.dispatchId === receipt.dispatchId
+        && row.dispatchReceiptDigest === receipt.receiptDigest
+        && row.dispatchPayloadDigest === receipt.payloadDigest
+        && Number(row.dispatchGeneration) === Number(receipt.generation)
+        && row.dispatchPhase === receipt.phase;
+      if (!exact) {
+        await ctx.db.patch(receipt._id, {
+          status: "superseded",
+          closeReason: "durable job authority no longer matches open dispatch",
+          leaseUntil: undefined,
+          closedAt: now,
+          updatedAt: now,
+        });
+        continue;
+      }
+      const reservation = reservationFromDispatchReceipt(receipt, row);
+      if (!reservation) {
+        await ctx.db.patch(receipt._id, {
+          status: "superseded",
+          closeReason: "stored dispatch payload is malformed",
+          leaseUntil: undefined,
+          closedAt: now,
+          updatedAt: now,
+        });
+        continue;
+      }
+      const leaseUntil = now + DISPATCH_LEASE_MS;
+      await ctx.db.patch(receipt._id, { status: "reserved", leaseUntil, updatedAt: now });
+      await patchJobWithRuntime(ctx, row, {
+        dispatchLeaseUntil: leaseUntil,
+        dispatchReason: receipt.status === "reconciling" ? "reconciling exact Trigger launch" : row.dispatchReason,
+        providerRunState: "queued",
+        providerObservedAt: now,
+        heartbeatAt: now,
+      });
+      reservations.push(reservation);
+      retriedJobs.add(String(receipt.jobId));
+    }
+    const candidates = await runnableCandidates(ctx, now, Math.max(0, limit - reservations.length));
     const reservedJobs = [];
     for (const candidate of candidates.candidates) {
       const j = candidate.job;
@@ -1138,14 +1354,31 @@ export const reserveDispatchBatch = mutation({
         });
         j.attempt = attemptNumber;
       }
-      const dispatchId = `${String(j._id)}:${attemptNumber}:${now}`;
+      const createdDispatch = await createDispatchReceipt(
+        ctx,
+        j,
+        attemptNumber,
+        candidate.executionAuthority,
+        triggerMachine,
+        reason,
+        now,
+      );
+      if (!createdDispatch) continue;
+      const dispatchId = createdDispatch.receipt.dispatchId;
+      const dispatchReceipt: any = await ctx.db.get(createdDispatch.receiptId);
+      if (!dispatchReceipt) continue;
       await patchJobWithRuntimeDeferredQueue(ctx, j, {
         status: "dispatching",
         stage: "dispatching",
         progress: "cloud worker reserved",
         dispatchId,
+        dispatchGeneration: dispatchReceipt.generation,
+        dispatchPhase: dispatchReceipt.phase,
+        dispatchReceiptId: createdDispatch.receiptId,
+        dispatchReceiptDigest: dispatchReceipt.receiptDigest,
+        dispatchPayloadDigest: dispatchReceipt.payloadDigest,
         dispatchLeaseUntil: now + DISPATCH_LEASE_MS,
-        dispatchReason: a.reason?.slice(0, 160),
+        dispatchReason: reason,
         workerRunId: undefined,
         deliveryRunId: undefined,
         // Generation one is allocated exactly once with the cold review
@@ -1162,36 +1395,25 @@ export const reserveDispatchBatch = mutation({
         providerObservedAt: now,
         heartbeatAt: now,
       });
-      if (attempt && !attempt.workerRunId) await ctx.db.patch(attempt._id, {
-        status: "dispatching", dispatchId,
-        triggerMachinePreset: triggerMachine.preset,
-        triggerMachineReason: triggerMachine.reason,
-        lastEventAt: now,
-      });
-      else if (!attempt) await ensureAttempt(ctx, j._id, attemptNumber, "dispatching", now, {
+      // The append-only dispatch receipt plus the durable job projection are
+      // the pre-claim authority. Defer the redundant attempt projection write
+      // until claim so an eight-way batch stays below Convex's 128-document
+      // transaction limit.
+      if (!attempt) await ensureAttempt(ctx, j._id, attemptNumber, "dispatching", now, {
         dispatchId,
+        dispatchGeneration: dispatchReceipt.generation,
+        dispatchPhase: dispatchReceipt.phase,
+        dispatchReceiptId: createdDispatch.receiptId,
+        dispatchReceiptDigest: dispatchReceipt.receiptDigest,
+        dispatchPayloadDigest: dispatchReceipt.payloadDigest,
         triggerMachinePreset: triggerMachine.preset,
         triggerMachineReason: triggerMachine.reason,
       });
       await appendAttemptEvidence(ctx, j, "dispatched", `Independent Trigger worker reserved${a.reason ? ` · ${a.reason.slice(0, 120)}` : ""}`, {
         stage: "dispatching", percent: Math.max(1, j.percent ?? 0), evidenceKind: "dispatch", eventKey: `dispatch:${attemptNumber}:${dispatchId}`,
       });
-      reservations.push({
-        jobId: String(j._id),
-        dispatchId,
-        attempt: attemptNumber,
-        missionId: j.missionId ?? null,
-        missionGroupId: j.missionGroupId,
-        projectGroupId: j.projectGroupId,
-        projectRepository: j.projectRepository ?? null,
-        schedulingGroupKey: j.schedulingGroupKey,
-        agentId: j.agentId ?? null,
-        label: j.label ?? j.task.slice(0, 80),
-        authorityDigest: candidate.executionAuthority.authorityDigest,
-        workOrderRevisionDigest: candidate.executionAuthority.workOrderRevisionDigest,
-        triggerMachinePreset: triggerMachine.preset,
-        triggerMachineReason: triggerMachine.reason,
-      });
+      const reservation = reservationFromDispatchReceipt(dispatchReceipt, j);
+      if (reservation) reservations.push(reservation);
       reservedJobs.push(j);
     }
     for (const groupKey of new Set(reservedJobs.map((job) => String(job.schedulingGroupKey)))) {
@@ -1201,6 +1423,7 @@ export const reserveDispatchBatch = mutation({
     return { reservations };
   },
 });
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 // Bind one reserved job to one Trigger run. Late/retried platform deliveries
 // are harmless: only the exact live dispatch id can cross this fence.
@@ -1210,6 +1433,10 @@ export const claimDispatched = mutation({
     dispatchId: v.string(),
     workerRunId: v.string(),
     expectedAttempt: v.optional(v.number()),
+    dispatchGeneration: v.optional(v.number()),
+    dispatchPhase: v.optional(v.string()),
+    dispatchReceiptDigest: v.optional(v.string()),
+    dispatchPayloadDigest: v.optional(v.string()),
     authorityDigest: v.optional(v.string()),
     workOrderRevisionDigest: v.optional(v.string()),
     triggerMachinePreset: v.optional(v.string()),
@@ -1235,6 +1462,9 @@ export const claimDispatched = mutation({
     const attemptNumber = j?.attempt ?? 1;
     const priorAttempt = j ? await attemptFor(ctx, a.jobId, attemptNumber) : null;
     const executionAuthority = j ? await readAttemptExecutionAuthority(ctx, j, attemptNumber) : null;
+    const dispatchReceipt = typeof a.dispatchReceiptDigest === "string"
+      ? await dispatchReceiptByDigest(ctx, a.dispatchReceiptDigest)
+      : null;
     let triggerObservedReason = a.triggerMachineReason;
     if (j && !executionAuthority) {
       await quarantineJobRuntime(ctx, j);
@@ -1252,6 +1482,14 @@ export const claimDispatched = mutation({
         || a.workOrderRevisionDigest !== executionAuthority?.workOrderRevisionDigest
         || a.triggerMachinePreset !== j.triggerMachinePreset
         || a.triggerMachineReason !== j.triggerMachineReason
+        || !dispatchReceiptMatchesRequest(dispatchReceipt, j, a)
+        || j.dispatchReceiptDigest !== dispatchReceipt?.receiptDigest
+        || j.dispatchPayloadDigest !== dispatchReceipt?.payloadDigest
+        || Number(j.dispatchGeneration) !== Number(dispatchReceipt?.generation)
+        || j.dispatchPhase !== dispatchReceipt?.phase
+        || !["reserved", "reconciling", "claimed"].includes(String(dispatchReceipt?.status))
+        || (dispatchReceipt?.status === "claimed"
+          && dispatchReceipt.workerRunId !== a.workerRunId.slice(0, 120))
         || !Number.isSafeInteger(a.triggerPlatformAttempt) || Number(a.triggerPlatformAttempt) < 1
         || !observedReason) return {
           executable: false,
@@ -1276,6 +1514,8 @@ export const claimDispatched = mutation({
     // Do not execute a dependency query on a redelivery. The original response
     // may have been lost after commit; this is an immutable replay envelope.
     if (disposition === "replay") {
+      if (dispatchReceipt?.status !== "claimed"
+        || dispatchReceipt.workerRunId !== a.workerRunId.slice(0, 120)) return null;
       if (Object.keys(observedMachinePatch).length) {
         await patchJobWithRuntime(ctx, j, observedMachinePatch);
         if (priorAttempt) await ctx.db.patch(priorAttempt._id, observedMachinePatch);
@@ -1294,7 +1534,7 @@ export const claimDispatched = mutation({
       !j ||
       j.status !== "dispatching" ||
       j.dispatchId !== a.dispatchId ||
-      (j.dispatchLeaseUntil ?? 0) < now
+      !dispatchReceipt
     ) return null;
     const deliveryContinuation = j.verificationVerdict === "pass" && Boolean(j.reviewReceiptId);
     if (priorAttempt?.workerRunId && deliveryContinuation) {
@@ -1344,6 +1584,12 @@ export const claimDispatched = mutation({
         triggerPlatformAttempt: a.triggerPlatformAttempt,
         providerRunState: "executing", providerObservedAt: now,
       });
+      await ctx.db.patch(dispatchReceipt._id, {
+        status: "claimed",
+        workerRunId: a.workerRunId.slice(0, 120),
+        leaseUntil: undefined,
+        updatedAt: now,
+      });
       await appendAttemptEvidence(ctx, j, "delivery_resumed", "Trusted controller resumed verified delivery without rerunning the specialist", {
         stage: "delivery", evidenceKind: "delivery", eventKey: `delivery-resume:${j.attempt ?? 1}:${a.dispatchId}`,
       });
@@ -1387,6 +1633,12 @@ export const claimDispatched = mutation({
       providerRunState: "executing",
       providerObservedAt: now,
     });
+    await ctx.db.patch(dispatchReceipt._id, {
+      status: "claimed",
+      workerRunId: a.workerRunId.slice(0, 120),
+      leaseUntil: undefined,
+      updatedAt: now,
+    });
     // Bind dispatch, worker identities and the exact upstream snapshot in the
     // same transaction as running. This makes exact lost-response replay
     // reachable while fencing every competing delivery.
@@ -1400,6 +1652,13 @@ export const claimDispatched = mutation({
       sessionId: a.workerRunId.slice(0, 120),
       workerRunId: a.workerRunId.slice(0, 120),
       dispatchId: a.dispatchId,
+      dispatchGeneration: dispatchReceipt.generation,
+      dispatchPhase: dispatchReceipt.phase,
+      dispatchReceiptId: dispatchReceipt._id,
+      dispatchReceiptDigest: dispatchReceipt.receiptDigest,
+      dispatchPayloadDigest: dispatchReceipt.payloadDigest,
+      triggerMachinePreset: dispatchReceipt.triggerMachinePreset,
+      triggerMachineReason: dispatchReceipt.triggerMachineReason,
       triggerObservedMachinePreset: a.triggerObservedMachinePreset,
       triggerObservedMachineReason: triggerObservedReason,
       triggerPlatformAttempt: a.triggerPlatformAttempt,
@@ -1437,6 +1696,10 @@ export const rejectDispatch = mutation({
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "dispatching" || row.dispatchId !== a.dispatchId) return false;
     const now = Date.now();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- schema-validated dispatch receipt
+    const receipt: any = row.dispatchReceiptId ? await ctx.db.get(row.dispatchReceiptId) : null;
+    if (!receipt || receipt.dispatchId !== a.dispatchId
+      || receipt.receiptDigest !== row.dispatchReceiptDigest) return false;
     const delayMs = Math.max(0, Math.min(10 * 60_000, a.delayMs ?? 30_000));
     await patchJobWithRuntime(ctx, row, {
       ...invalidateDeliveryLease(row),
@@ -1448,6 +1711,13 @@ export const rejectDispatch = mutation({
       dispatchLeaseUntil: undefined,
       workerRunId: undefined,
       heartbeatAt: now,
+    });
+    await ctx.db.patch(receipt._id, {
+      status: "superseded",
+      closeReason: `launch explicitly rejected: ${a.reason.slice(0, 180)}`,
+      leaseUntil: undefined,
+      closedAt: now,
+      updatedAt: now,
     });
     await appendAttemptEvidence(ctx, row, "dispatch_released", a.reason.slice(0, 500), {
       stage: "queued", percent: row.percent, evidenceKind: "dispatch", eventKey: `dispatch-release:${row.attempt ?? 1}:${a.dispatchId}`,
@@ -1464,6 +1734,10 @@ export const markDispatchLaunchUnknown = mutation({
   args: {
     jobId: v.id("jobs"),
     dispatchId: v.string(),
+    dispatchGeneration: v.optional(v.number()),
+    dispatchPhase: v.optional(v.string()),
+    dispatchReceiptDigest: v.optional(v.string()),
+    dispatchPayloadDigest: v.optional(v.string()),
     reason: v.string(),
     workerToken: v.optional(v.string()),
   },
@@ -1472,12 +1746,28 @@ export const markDispatchLaunchUnknown = mutation({
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "dispatching" || row.dispatchId !== a.dispatchId) return false;
     const now = Date.now();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- schema-validated dispatch receipt
+    const receipt: any = row.dispatchReceiptId ? await ctx.db.get(row.dispatchReceiptId) : null;
+    if (!receipt || receipt.dispatchId !== a.dispatchId
+      || receipt.receiptDigest !== row.dispatchReceiptDigest
+      || receipt.payloadDigest !== row.dispatchPayloadDigest
+      || (a.dispatchGeneration !== undefined && a.dispatchGeneration !== receipt.generation)
+      || (a.dispatchPhase !== undefined && a.dispatchPhase !== receipt.phase)
+      || (a.dispatchReceiptDigest !== undefined && a.dispatchReceiptDigest !== receipt.receiptDigest)
+      || (a.dispatchPayloadDigest !== undefined && a.dispatchPayloadDigest !== receipt.payloadDigest)
+      || !["reserved", "reconciling"].includes(receipt.status)) return false;
+    const retryAt = now + 30_000;
     await patchJobWithRuntime(ctx, row, {
       progress: `worker launch outcome unknown · ${a.reason.slice(0, 220)}`,
-      dispatchLeaseUntil: Math.min(Number(row.dispatchLeaseUntil ?? now + 30_000), now + 30_000),
+      dispatchLeaseUntil: retryAt,
       providerRunState: "reconciling",
       providerObservedAt: now,
       heartbeatAt: now,
+    });
+    await ctx.db.patch(receipt._id, {
+      status: "reconciling",
+      leaseUntil: retryAt,
+      updatedAt: now,
     });
     await appendAttemptEvidence(ctx, row, "dispatch_launch_unknown", a.reason.slice(0, 500), {
       stage: "dispatching",
@@ -1520,6 +1810,7 @@ export const finalize = mutation({
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
     const executionAuthority = await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest);
     if (!executionAuthority) return false;
+    if (!await claimedDispatchReceiptForRow(ctx, row, a.deliveryRunId ?? row.workerRunId)) return false;
     if (row.repo && !hasLiveDeliveryLease(row, a)) return false;
     const delivery = a.deliveryGeneration === undefined ? null : await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration));
     if (row.repo && (!delivery || !hasLiveControllerFence(row, delivery, a))) return false;
@@ -1823,18 +2114,37 @@ export const reapStale = mutation({
         if (j) await upsertJobRuntime(ctx, j);
         continue;
       }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- schema-validated dispatch receipt
+      const receipt: any = j.dispatchReceiptId ? await ctx.db.get(j.dispatchReceiptId) : null;
+      if (!receipt || receipt.dispatchId !== activity.dispatchId
+        || receipt.receiptDigest !== j.dispatchReceiptDigest
+        || receipt.payloadDigest !== j.dispatchPayloadDigest
+        || !["reserved", "reconciling"].includes(receipt.status)) {
+        // An active v2 projection without its immutable launch receipt cannot
+        // be made executable by timeout recovery. Leave it held for explicit
+        // repair instead of manufacturing a competing Trigger identity.
+        await patchJobWithRuntime(ctx, j, {
+          progress: "worker reservation receipt missing or stale — held",
+          providerRunState: "reconciling",
+          providerObservedAt: now,
+          heartbeatAt: now,
+        });
+        continue;
+      }
       await patchJobWithRuntime(ctx, j, {
-        status: "pending",
-        stage: "queued",
-        progress: "worker reservation expired — redispatch queued",
-        nextRunAt: now,
-        dispatchId: undefined,
-        dispatchLeaseUntil: undefined,
-        workerRunId: undefined,
+        progress: "worker reservation expired — exact launch reconciliation due",
+        dispatchLeaseUntil: now,
+        providerRunState: "reconciling",
+        providerObservedAt: now,
         heartbeatAt: now,
       });
-      await appendAttemptEvidence(ctx, j, "dispatch_recovered", "Expired Trigger worker reservation released", {
-        stage: "queued", percent: j.percent, evidenceKind: "reconcile", eventKey: `dispatch-recovered:${j.attempt ?? 1}:${activity.dispatchId}`,
+      await ctx.db.patch(receipt._id, {
+        status: "reconciling",
+        leaseUntil: now,
+        updatedAt: now,
+      });
+      await appendAttemptEvidence(ctx, j, "dispatch_recovered", "Expired Trigger reservation retained for byte-equivalent reconciliation", {
+        stage: "dispatching", percent: j.percent, evidenceKind: "reconcile", eventKey: `dispatch-recovered:${j.attempt ?? 1}:${activity.dispatchId}`,
       });
       releasedDispatches.push(j.task.slice(0, 80));
     }
@@ -2141,6 +2451,7 @@ export const checkpointAndRequeue = mutation({
     sourceWorkAttempt: v.optional(v.number()),
     deliveryGeneration: v.optional(v.number()),
     deliveryRunId: v.optional(v.string()),
+    workerRunId: v.optional(v.string()),
     deliveryLeaseOwner: v.optional(v.string()),
     deliveryLeaseToken: v.optional(v.string()),
     deliveryLeaseVersion: v.optional(v.number()),
@@ -2153,6 +2464,9 @@ export const checkpointAndRequeue = mutation({
       return { requeued: false, exhausted: false, stale: true };
     }
     if (!await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest)) {
+      return { requeued: false, exhausted: false, stale: true };
+    }
+    if (!await claimedDispatchReceiptForRow(ctx, row, a.deliveryRunId ?? a.workerRunId)) {
       return { requeued: false, exhausted: false, stale: true };
     }
     const delivery = a.deliveryGeneration === undefined ? null : await deliveryAttemptFor(ctx, a.jobId, Number(a.sourceWorkAttempt), Number(a.deliveryGeneration));
@@ -2358,6 +2672,10 @@ export const authorizeExecutionBoundary = mutation({
     expectedAttempt: v.number(),
     workerRunId: v.string(),
     authorityDigest: v.string(),
+    dispatchGeneration: v.optional(v.number()),
+    dispatchPhase: v.optional(v.string()),
+    dispatchReceiptDigest: v.optional(v.string()),
+    dispatchPayloadDigest: v.optional(v.string()),
     phase: v.union(
       v.literal("source_checkout"),
       v.literal("provider_create"),
@@ -2374,7 +2692,24 @@ export const authorizeExecutionBoundary = mutation({
     requireWorker(a.workerToken);
     const row: any = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
-      || row.workerRunId !== a.workerRunId) return null;
+      || row.workerRunId !== a.workerRunId
+      || row.dispatchGeneration !== a.dispatchGeneration
+      || row.dispatchPhase !== a.dispatchPhase
+      || row.dispatchReceiptDigest !== a.dispatchReceiptDigest
+      || row.dispatchPayloadDigest !== a.dispatchPayloadDigest) return null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- schema-validated dispatch receipt
+    const receipt: any = row.dispatchReceiptId ? await ctx.db.get(row.dispatchReceiptId) : null;
+    if (!receipt || receipt.status !== "claimed"
+      || receipt.workerRunId !== a.workerRunId
+      || !dispatchReceiptMatchesRequest(receipt, row, {
+        ...a,
+        dispatchId: row.dispatchId,
+        expectedAttempt: a.expectedAttempt,
+        authorityDigest: a.authorityDigest,
+        workOrderRevisionDigest: row.workOrderRevisionDigest,
+        triggerMachinePreset: row.triggerMachinePreset,
+        triggerMachineReason: row.triggerMachineReason,
+      })) return null;
     const authority = await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest);
     if (!authority) return null;
     return {
@@ -2396,6 +2731,10 @@ export const authorizeExecutionBoundary = mutation({
       machineClass: authority.workOrder.machineClass,
       triggerMachinePreset: authority.workOrder.triggerMachinePreset,
       triggerMachineReason: authority.workOrder.triggerMachineReason,
+      dispatchGeneration: receipt.generation,
+      dispatchPhase: receipt.phase,
+      dispatchReceiptDigest: receipt.receiptDigest,
+      dispatchPayloadDigest: receipt.payloadDigest,
       minimumModel: authority.workOrder.minimumModel,
       minimumReasoningEffort: authority.workOrder.minimumReasoningEffort,
       toolScope: authority.workOrder.toolScope,
@@ -2517,6 +2856,7 @@ export const prepareCloudCodexTurn = mutation({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
     authorityDigest: v.optional(v.string()), workOrderRevisionDigest: v.optional(v.string()),
+    dispatchReceiptDigest: v.optional(v.string()), dispatchPayloadDigest: v.optional(v.string()),
     providerWorkspaceId: v.string(), providerSessionId: v.string(),
     receiptId: v.string(), sequence: v.number(), workerToken: v.optional(v.string()),
   },
@@ -2528,6 +2868,10 @@ export const prepareCloudCodexTurn = mutation({
       || row.workerRunId !== a.workerRunId || !attempt || attempt.status !== "running") return false;
     const authority = await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest);
     if (!authority || authority.workOrderRevisionDigest !== a.workOrderRevisionDigest
+      || row.dispatchReceiptDigest !== a.dispatchReceiptDigest
+      || row.dispatchPayloadDigest !== a.dispatchPayloadDigest
+      || attempt.dispatchReceiptDigest !== a.dispatchReceiptDigest
+      || attempt.dispatchPayloadDigest !== a.dispatchPayloadDigest
       || attempt.providerWorkspaceId !== a.providerWorkspaceId
       || attempt.providerSessionId !== a.providerSessionId
       || !/^[a-f0-9]{64}$/.test(a.receiptId)
@@ -2560,6 +2904,7 @@ export const recordCloudCodexTurnPhase = mutation({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
     authorityDigest: v.optional(v.string()), workOrderRevisionDigest: v.optional(v.string()),
+    dispatchReceiptDigest: v.optional(v.string()), dispatchPayloadDigest: v.optional(v.string()),
     receiptId: v.string(), sequence: v.number(),
     phase: v.union(
       v.literal("request_intent"), v.literal("request_written"),
@@ -2576,6 +2921,10 @@ export const recordCloudCodexTurnPhase = mutation({
       || row.workerRunId !== a.workerRunId || !attempt || attempt.status !== "running") return false;
     const authority = await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest);
     if (!authority || authority.workOrderRevisionDigest !== a.workOrderRevisionDigest
+      || row.dispatchReceiptDigest !== a.dispatchReceiptDigest
+      || row.dispatchPayloadDigest !== a.dispatchPayloadDigest
+      || attempt.dispatchReceiptDigest !== a.dispatchReceiptDigest
+      || attempt.dispatchPayloadDigest !== a.dispatchPayloadDigest
       || attempt.codexTurnReceiptId !== a.receiptId
       || attempt.codexTurnReceiptSequence !== a.sequence) return false;
     const prior = String(attempt.codexTurnReceiptPhase ?? "");
@@ -3236,6 +3585,16 @@ export const markVerifiedForDelivery = mutation({
       if (!(row.status === "pending" && sourceAttempt?.workerRunId === a.specialistRunId && row.reviewReceiptId)) return false;
     }
     if (!['running', 'pending'].includes(row.status)) return false;
+    const sourceDispatchReceipt = sourceAttempt?.dispatchReceiptId
+      ? await ctx.db.get(sourceAttempt.dispatchReceiptId)
+      : null;
+    if (!sourceDispatchReceipt
+      || sourceDispatchReceipt.status !== "claimed"
+      || sourceDispatchReceipt.workerRunId !== a.specialistRunId
+      || sourceDispatchReceipt.dispatchId !== sourceAttempt.dispatchId
+      || sourceDispatchReceipt.receiptDigest !== sourceAttempt.dispatchReceiptDigest
+      || sourceDispatchReceipt.payloadDigest !== sourceAttempt.dispatchPayloadDigest
+      || (row.status === "running" && row.dispatchReceiptId !== sourceAttempt.dispatchReceiptId)) return false;
     if (a.deliveryGeneration !== undefined) return false;
     // A controller review receipt is completion evidence for every scoped
     // repository job. Delivery policy separately decides whether a PR/merge

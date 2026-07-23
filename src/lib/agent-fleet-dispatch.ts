@@ -4,6 +4,7 @@ import { resolveConvexUrl } from "./convex-url";
 import {
   TRIGGER_AGENT_IDEMPOTENCY_TTL,
   triggerAgentIdempotencyMaterial,
+  type TriggerAgentDispatchPhase,
   type TriggerAgentMachinePreset,
   type TriggerAgentMachineReason,
 } from "./trigger-machine";
@@ -16,6 +17,11 @@ type Reservation = {
   jobId: string;
   dispatchId: string;
   attempt: number;
+  expectedAttempt: number;
+  dispatchGeneration: number;
+  dispatchPhase: TriggerAgentDispatchPhase;
+  dispatchReceiptDigest: string;
+  dispatchPayloadDigest: string;
   missionId: string | null;
   missionGroupId?: string;
   projectGroupId?: string;
@@ -27,7 +33,26 @@ type Reservation = {
   workOrderRevisionDigest: string;
   triggerMachinePreset: TriggerAgentMachinePreset;
   triggerMachineReason: TriggerAgentMachineReason;
+  reason: string;
 };
+
+function isDispatchReceiptReservation(value: unknown): value is Reservation {
+  const row = value as Partial<Reservation> | null;
+  return Boolean(row
+    && typeof row.jobId === "string"
+    && typeof row.dispatchId === "string"
+    && Number.isSafeInteger(row.attempt) && Number(row.attempt) > 0
+    && row.expectedAttempt === row.attempt
+    && Number.isSafeInteger(row.dispatchGeneration) && Number(row.dispatchGeneration) > 0
+    && ["specialist", "delivery", "integration"].includes(String(row.dispatchPhase))
+    && /^[0-9a-f]{64}$/.test(String(row.dispatchReceiptDigest ?? ""))
+    && /^[0-9a-f]{64}$/.test(String(row.dispatchPayloadDigest ?? ""))
+    && /^[0-9a-f]{64}$/.test(String(row.authorityDigest ?? ""))
+    && /^[0-9a-f]{64}$/.test(String(row.workOrderRevisionDigest ?? ""))
+    && ["medium-1x", "medium-2x"].includes(String(row.triggerMachinePreset))
+    && typeof row.triggerMachineReason === "string"
+    && typeof row.reason === "string");
+}
 
 function safeTag(prefix: string, value: string): string {
   return `${prefix}:${value}`.replace(/[^a-zA-Z0-9:_-]/g, "-").slice(0, 64);
@@ -57,11 +82,28 @@ async function workerMutation<T>(path: string, args: Record<string, unknown>): P
 export async function wakeAgentFleet(reason: string, fanOut = DEFAULT_FAN_OUT): Promise<boolean> {
   const cleanReason = reason.trim().replace(/\s+/g, " ").slice(0, 160) || "work-available";
   const limit = Math.max(1, Math.min(BACKGROUND_CONCURRENCY_LIMIT, Math.floor(fanOut)));
-  const reserved = await workerMutation<{ reservations?: Reservation[] }>("jobs:reserveDispatchBatch", {
+  const reserved = await workerMutation<{ reservations?: unknown[] }>("jobs:reserveDispatchBatch", {
     limit,
     reason: cleanReason,
   });
-  const reservations = Array.isArray(reserved?.reservations) ? reserved.reservations : [];
+  const offered = Array.isArray(reserved?.reservations) ? reserved.reservations : [];
+  const reservations = offered.filter(isDispatchReceiptReservation);
+  const held = offered.filter((reservation) => !isDispatchReceiptReservation(reservation)) as Array<Record<string, unknown>>;
+  if (held.length) {
+    // Convex-first is safe because old workers are held by claim validation.
+    // Trigger-first must also fail closed: release an old reservation using
+    // only the legacy validator shape, then wait for the receipt schema/code.
+    await Promise.all(held.map((reservation) =>
+      typeof reservation?.jobId === "string" && typeof reservation?.dispatchId === "string"
+        ? workerMutation("jobs:rejectDispatch", {
+          jobId: reservation.jobId,
+          dispatchId: reservation.dispatchId,
+          reason: "dispatch receipt protocol v2 is not active",
+          delayMs: 60_000,
+        }).catch(() => false)
+        : Promise.resolve(false),
+    ));
+  }
   if (!reservations.length) return false;
 
   try {
@@ -70,6 +112,9 @@ export async function wakeAgentFleet(reason: string, fanOut = DEFAULT_FAN_OUT): 
       idempotencyKey: await idempotencyKeys.create(triggerAgentIdempotencyMaterial({
         jobId: reservation.jobId,
         attempt: reservation.attempt,
+        dispatchGeneration: reservation.dispatchGeneration,
+        dispatchPhase: reservation.dispatchPhase,
+        dispatchReceiptDigest: reservation.dispatchReceiptDigest,
         authorityDigest: reservation.authorityDigest,
         workOrderRevisionDigest: reservation.workOrderRevisionDigest,
       }), { scope: "global" }),
@@ -80,12 +125,16 @@ export async function wakeAgentFleet(reason: string, fanOut = DEFAULT_FAN_OUT): 
         payload: {
           jobId: reservation.jobId,
           dispatchId: reservation.dispatchId,
-          expectedAttempt: reservation.attempt,
+          expectedAttempt: reservation.expectedAttempt,
+          dispatchGeneration: reservation.dispatchGeneration,
+          dispatchPhase: reservation.dispatchPhase,
+          dispatchReceiptDigest: reservation.dispatchReceiptDigest,
+          dispatchPayloadDigest: reservation.dispatchPayloadDigest,
           authorityDigest: reservation.authorityDigest,
           workOrderRevisionDigest: reservation.workOrderRevisionDigest,
           triggerMachinePreset: reservation.triggerMachinePreset,
           triggerMachineReason: reservation.triggerMachineReason,
-          reason: cleanReason,
+          reason: reservation.reason,
         },
         options: {
           idempotencyKey,
@@ -105,9 +154,13 @@ export async function wakeAgentFleet(reason: string, fanOut = DEFAULT_FAN_OUT): 
             projectRepository: reservation.projectRepository ?? null,
             agentId: reservation.agentId,
             label: reservation.label.slice(0, 120),
-            reason: cleanReason,
+            reason: reservation.reason,
             authorityDigest: reservation.authorityDigest,
             workOrderRevisionDigest: reservation.workOrderRevisionDigest,
+            dispatchGeneration: reservation.dispatchGeneration,
+            dispatchPhase: reservation.dispatchPhase,
+            dispatchReceiptDigest: reservation.dispatchReceiptDigest,
+            dispatchPayloadDigest: reservation.dispatchPayloadDigest,
             machinePreset: reservation.triggerMachinePreset,
             machineReason: reservation.triggerMachineReason,
             stage: "dispatching",
@@ -127,6 +180,10 @@ export async function wakeAgentFleet(reason: string, fanOut = DEFAULT_FAN_OUT): 
         workerMutation("jobs:markDispatchLaunchUnknown", {
           jobId: reservation.jobId,
           dispatchId: reservation.dispatchId,
+          dispatchGeneration: reservation.dispatchGeneration,
+          dispatchPhase: reservation.dispatchPhase,
+          dispatchReceiptDigest: reservation.dispatchReceiptDigest,
+          dispatchPayloadDigest: reservation.dispatchPayloadDigest,
           reason: `Trigger launch failed: ${String(error).slice(0, 220)}`,
         }).catch(() => false),
       ),

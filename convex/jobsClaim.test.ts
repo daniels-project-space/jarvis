@@ -75,7 +75,10 @@ async function specialistFixture(policy: Policy = "manual", goalStage?: "validat
     reviewReceiptJson: receipt, reviewReceiptSignature: SIGNATURE, reviewReceiptKeyId: REVIEW_KEY_ID,
     reviewDiffSha256: DIFF, resultDigest: sha256(result), evidenceDigest: sha256(note), workerToken: WORKER,
   } as const;
-  return { t, jobId, result, note, receipt, authorityDigest: claim.authorityDigest, commitArgs };
+  return {
+    t, jobId, result, note, receipt, authorityDigest: claim.authorityDigest,
+    reservation: batch.reservations[0], commitArgs,
+  };
 }
 
 async function committedAndClaimed(policy: Policy = "manual", goalStage?: "validating") {
@@ -116,13 +119,199 @@ async function rows(t: ReturnType<typeof convexTest>) {
     jobs: await ctx.db.query("jobs").collect(), attempts: await ctx.db.query("workAttempts").collect(),
     deliveries: await ctx.db.query("deliveryAttempts").collect(), reviews: await ctx.db.query("reviewReceipts").collect(),
     receipts: await ctx.db.query("workReceipts").collect(), attention: await ctx.db.query("attentionItems").collect(),
+    dispatches: await ctx.db.query("dispatchReceipts").collect(),
   }));
+}
+
+async function unclaimedDispatchFixture(key: string) {
+  const t = convexTest(schema, modules);
+  const admitted = await testMissionAdmission(t, {
+    key,
+    workerToken: WORKER,
+    repository: "daniels-project-space/jarvis",
+    sourceHeadSha: BASE,
+  });
+  const jobId = await t.mutation(api.jobs.enqueueV2, {
+    repo: "daniels-project-space/jarvis",
+    task: "Inspect the immutable dispatch lifecycle and report bounded evidence.",
+    readonly: true,
+    missionId: String(admitted.missionId),
+    workerToken: WORKER,
+  });
+  const batch = await t.mutation(api.jobs.reserveDispatchBatch, {
+    limit: 1,
+    reason: "initial-supervisor",
+    workerToken: WORKER,
+  });
+  return { t, jobId, reservation: batch.reservations[0] };
 }
 
 beforeEach(() => { process.env.JARVIS_WORKER_TOKEN = WORKER; vi.useRealTimers(); });
 afterEach(() => { delete process.env.JARVIS_WORKER_TOKEN; vi.useRealTimers(); });
 
 describe("real Convex specialist/controller race matrix", () => {
+  it("retries an accepted-response-lost launch byte-equivalently and accepts one delayed run", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-23T01:00:00Z"));
+    const f = await unclaimedDispatchFixture("dispatch-response-lost");
+    expect(await f.t.mutation(api.jobs.markDispatchLaunchUnknown, {
+      jobId: f.jobId,
+      dispatchId: f.reservation.dispatchId,
+      dispatchGeneration: f.reservation.dispatchGeneration,
+      dispatchPhase: f.reservation.dispatchPhase,
+      dispatchReceiptDigest: f.reservation.dispatchReceiptDigest,
+      dispatchPayloadDigest: f.reservation.dispatchPayloadDigest,
+      reason: "Trigger accepted the request but its response was lost",
+      workerToken: WORKER,
+    })).toBe(true);
+    vi.advanceTimersByTime(31_000);
+    const retry = await f.t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      reason: "different-supervisor-reason-must-not-change-payload",
+      workerToken: WORKER,
+    });
+    expect(retry.reservations).toEqual([f.reservation]);
+    const claim = await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: f.jobId,
+      dispatchId: retry.reservations[0].dispatchId,
+      ...triggerClaimAuthority(retry.reservations[0]),
+      workerRunId: "delayed-accepted-run",
+      workerToken: WORKER,
+    });
+    expect(claim).toMatchObject({
+      workerRunId: "delayed-accepted-run",
+      dispatchGeneration: 1,
+      dispatchPhase: "specialist",
+      dispatchReceiptDigest: f.reservation.dispatchReceiptDigest,
+    });
+    expect(await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: f.jobId,
+      dispatchId: retry.reservations[0].dispatchId,
+      ...triggerClaimAuthority(retry.reservations[0]),
+      workerRunId: "delayed-accepted-run",
+      workerToken: WORKER,
+    })).toEqual(claim);
+    expect((await rows(f.t)).dispatches).toHaveLength(1);
+  });
+
+  it("keeps an expired launch claimable and concurrent supervisors cannot allocate a competitor", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-23T02:00:00Z"));
+    const f = await unclaimedDispatchFixture("dispatch-past-lease");
+    vi.advanceTimersByTime(10 * 60_000);
+    const claim = await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: f.jobId,
+      dispatchId: f.reservation.dispatchId,
+      ...triggerClaimAuthority(f.reservation),
+      workerRunId: "late-trigger-run",
+      workerToken: WORKER,
+    });
+    expect(claim).toMatchObject({ workerRunId: "late-trigger-run", dispatchGeneration: 1 });
+    const batches = await Promise.all([
+      f.t.mutation(api.jobs.reserveDispatchBatch, { limit: 1, reason: "supervisor-a", workerToken: WORKER }),
+      f.t.mutation(api.jobs.reserveDispatchBatch, { limit: 1, reason: "supervisor-b", workerToken: WORKER }),
+    ]);
+    expect(batches.flatMap((batch) => batch.reservations)).toHaveLength(0);
+    expect((await rows(f.t)).dispatches).toHaveLength(1);
+  });
+
+  it("supersedes an unclaimed tick only after durable pause/resume control", async () => {
+    const f = await unclaimedDispatchFixture("dispatch-control-supersede");
+    expect(await f.t.mutation(api.jobs.control, {
+      jobId: f.jobId,
+      action: "pause",
+      workerToken: WORKER,
+    })).toBe(true);
+    expect(await f.t.mutation(api.jobs.control, {
+      jobId: f.jobId,
+      action: "resume",
+      workerToken: WORKER,
+    })).toBe(true);
+    const next = (await f.t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      reason: "post-control",
+      workerToken: WORKER,
+    })).reservations[0];
+    expect(next).toMatchObject({ dispatchGeneration: 2, dispatchPhase: "specialist" });
+    const dispatches = (await rows(f.t)).dispatches;
+    expect(dispatches.map((receipt) => [receipt.generation, receipt.status])).toEqual([
+      [1, "superseded"],
+      [2, "reserved"],
+    ]);
+  });
+
+  it("rejects forged generations, phases, payloads, receipts, and machines before execution", async () => {
+    const f = await unclaimedDispatchFixture("dispatch-forgery");
+    const forgeries = [
+      { dispatchGeneration: f.reservation.dispatchGeneration + 1 },
+      { dispatchPhase: "delivery" },
+      { dispatchPayloadDigest: "0".repeat(64) },
+      { dispatchReceiptDigest: "1".repeat(64) },
+      { triggerMachinePreset: f.reservation.triggerMachinePreset === "medium-2x" ? "medium-1x" : "medium-2x" },
+    ];
+    for (const [index, forged] of forgeries.entries()) {
+      expect(await f.t.mutation(api.jobs.claimDispatched, {
+        jobId: f.jobId,
+        dispatchId: f.reservation.dispatchId,
+        ...triggerClaimAuthority(f.reservation),
+        ...forged,
+        workerRunId: `forged-run-${index}`,
+        workerToken: WORKER,
+      })).toMatchObject({
+        executable: false,
+        held: true,
+        code: "trigger_launch_authority_held",
+      });
+    }
+    expect((await rows(f.t)).jobs[0].status).toBe("dispatching");
+  });
+
+  it("allocates distinct immutable ticks for specialist, delivery, and integration FIFO work", async () => {
+    const specialist = await specialistFixture();
+    expect(specialist.reservation).toMatchObject({ dispatchGeneration: 1, dispatchPhase: "specialist" });
+    expect(await specialist.t.mutation(api.jobs.markVerifiedForDelivery, specialist.commitArgs)).toBe(true);
+    const delivery = (await specialist.t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1, reason: "delivery-one", workerToken: WORKER,
+    })).reservations[0];
+    expect(delivery).toMatchObject({ dispatchGeneration: 2, dispatchPhase: "delivery" });
+    expect(delivery.dispatchReceiptDigest).not.toBe(specialist.reservation.dispatchReceiptDigest);
+
+    const integration = await specialistFixture("auto_merge", "validating");
+    expect(await integration.t.mutation(api.jobs.markVerifiedForDelivery, integration.commitArgs)).toBe(true);
+    const fifo = (await integration.t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1, reason: "integration-fifo", workerToken: WORKER,
+    })).reservations[0];
+    expect(fifo).toMatchObject({ dispatchGeneration: 2, dispatchPhase: "integration" });
+    expect(fifo.dispatchReceiptDigest).not.toBe(integration.reservation.dispatchReceiptDigest);
+  });
+
+  it("closes one delivery tick before allocating a distinct multi-pass continuation", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-23T03:00:00Z"));
+    const f = await committedAndClaimed();
+    expect(f.reservation).toMatchObject({ dispatchGeneration: 2, dispatchPhase: "delivery" });
+    expect(await f.t.mutation(api.jobs.checkpointAndRequeue, {
+      ...f.fence,
+      checkpoint: "provider truth remains unknown; reconcile the same prepared effect",
+      result: f.result,
+      delayMs: 1,
+    })).toMatchObject({ requeued: true, stale: false });
+    vi.advanceTimersByTime(31_000);
+    const continuation = (await f.t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      reason: "delivery-continuation",
+      workerToken: WORKER,
+    })).reservations[0];
+    expect(continuation).toMatchObject({ dispatchGeneration: 3, dispatchPhase: "delivery" });
+    expect(continuation.dispatchReceiptDigest).not.toBe(f.reservation.dispatchReceiptDigest);
+    const dispatches = (await rows(f.t)).dispatches;
+    expect(dispatches.map((receipt) => [receipt.generation, receipt.status])).toEqual([
+      [1, "closed"],
+      [2, "closed"],
+      [3, "reserved"],
+    ]);
+  });
+
   it("fences a steered specialist and allocates a fresh workspace attempt without accepting its late review", async () => {
     const f = await specialistFixture();
     expect(await f.t.mutation(api.jobs.control, {
@@ -176,7 +365,11 @@ describe("real Convex specialist/controller race matrix", () => {
       workerRunId: "controller-two", workerToken: WORKER,
     });
     expect(replay).toEqual(f.claim);
-    expect(competing).toBeNull();
+    expect(competing).toMatchObject({
+      executable: false,
+      held: true,
+      code: "trigger_launch_authority_held",
+    });
     const state = await rows(f.t);
     expect(state.attempts).toHaveLength(1);
     expect(state.deliveries).toHaveLength(1);

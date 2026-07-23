@@ -10,6 +10,13 @@ export type TriggerAgentMachineReason = (typeof TRIGGER_AGENT_MACHINE_REASONS)[n
 
 export const TRIGGER_AGENT_IDEMPOTENCY_TTL = "30d";
 
+export const TRIGGER_AGENT_DISPATCH_PHASES = [
+  "specialist",
+  "delivery",
+  "integration",
+] as const;
+export type TriggerAgentDispatchPhase = (typeof TRIGGER_AGENT_DISPATCH_PHASES)[number];
+
 export function admittedTriggerMachine(order: {
   readonly: boolean;
   minimumModel: string;
@@ -26,13 +33,19 @@ export function admittedTriggerMachine(order: {
 export function triggerAgentIdempotencyMaterial(input: {
   jobId: string;
   attempt: number;
+  dispatchGeneration: number;
+  dispatchPhase: TriggerAgentDispatchPhase;
+  dispatchReceiptDigest: string;
   authorityDigest: string;
   workOrderRevisionDigest: string;
 }): string[] {
   return [
-    "jarvis-agent-attempt-v2",
+    "jarvis-agent-dispatch-v2",
     input.jobId,
     String(input.attempt),
+    String(input.dispatchGeneration),
+    input.dispatchPhase,
+    input.dispatchReceiptDigest,
     input.authorityDigest,
     input.workOrderRevisionDigest,
   ];
@@ -40,6 +53,10 @@ export function triggerAgentIdempotencyMaterial(input: {
 
 export function triggerClaimAuthority(input: {
   attempt: number;
+  dispatchGeneration: number;
+  dispatchPhase: TriggerAgentDispatchPhase;
+  dispatchReceiptDigest: string;
+  dispatchPayloadDigest: string;
   authorityDigest: string;
   workOrderRevisionDigest: string;
   triggerMachinePreset: TriggerAgentMachinePreset;
@@ -47,6 +64,10 @@ export function triggerClaimAuthority(input: {
 }, actualPreset: TriggerAgentMachinePreset = input.triggerMachinePreset, triggerPlatformAttempt = 1) {
   return {
     expectedAttempt: input.attempt,
+    dispatchGeneration: input.dispatchGeneration,
+    dispatchPhase: input.dispatchPhase,
+    dispatchReceiptDigest: input.dispatchReceiptDigest,
+    dispatchPayloadDigest: input.dispatchPayloadDigest,
     authorityDigest: input.authorityDigest,
     workOrderRevisionDigest: input.workOrderRevisionDigest,
     triggerMachinePreset: input.triggerMachinePreset,
