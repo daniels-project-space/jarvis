@@ -2438,7 +2438,7 @@ export const agentWorker = task({
 // never runs Codex itself.
 export const agentFleetSupervisor = schedules.task({
   id: "jarvis-agent-fleet-supervisor",
-  cron: "*/5 * * * *",
+  cron: "*/15 * * * *",
   machine: "micro",
   queue: { concurrencyLimit: 1 },
   maxDuration: 120,

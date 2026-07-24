@@ -57,7 +57,7 @@ async function chatThread(): Promise<string> {
 export const stackPoller = schedules.task({
   id: "jarvis-stack-poller",
   // Deploy state and latest commits do not need minute-level freshness.
-  cron: "0 * * * *",
+  cron: "0 */4 * * *",
   maxDuration: 300,
   run: async () => {
     const token = (await vaultService("vercel")).VERCEL_TOKEN;

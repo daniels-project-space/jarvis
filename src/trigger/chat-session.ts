@@ -484,7 +484,7 @@ export const chatHandoff = task({
 // Trigger, the next five-minute schedule drains the durable Convex queue.
 export const chatDispatcher = schedules.task({
   id: "jarvis-chat-dispatcher",
-  cron: "*/5 * * * *",
+  cron: "*/15 * * * *",
   queue: { name: "jarvis-foreground-recovery", concurrencyLimit: 1 },
   maxDuration: 60,
   run: async () => {

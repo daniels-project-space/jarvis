@@ -15,7 +15,7 @@ import {
 // hourly GitHub schedule remains a final dead-man switch.
 export const goalCoordinator = schedules.task({
   id: "jarvis-goal-coordinator",
-  cron: "*/15 * * * *",
+  cron: "*/30 * * * *",
   maxDuration: 60,
   run: async (_payload, { ctx }) => {
     // Controls precede revisions so a paused mission cannot be reactivated by

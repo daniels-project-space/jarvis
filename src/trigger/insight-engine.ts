@@ -42,7 +42,7 @@ async function chatThread(): Promise<string> {
 export const insightEngine = schedules.task({
   id: "jarvis-insight-engine",
   // Event-driven workers already wake the fleet; this is a recovery sweep.
-  cron: "*/30 * * * *",
+  cron: "0 */2 * * *",
   maxDuration: 60,
   run: async () => {
     // Recovery must not depend on the worker that may itself have disappeared.
