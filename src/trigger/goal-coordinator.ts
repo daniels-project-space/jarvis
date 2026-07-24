@@ -10,12 +10,12 @@ import {
   syncExternalGoalRuns,
 } from "./goal-runtime";
 
-// Cheap five-minute supervision keeps multi-day goals moving without booting a
+// Cheap fifteen-minute supervision keeps multi-day goals moving without booting a
 // full GitHub/Codex workspace merely to poll an external factory record. The
 // hourly GitHub schedule remains a final dead-man switch.
 export const goalCoordinator = schedules.task({
   id: "jarvis-goal-coordinator",
-  cron: "*/5 * * * *",
+  cron: "*/15 * * * *",
   maxDuration: 60,
   run: async (_payload, { ctx }) => {
     // Controls precede revisions so a paused mission cannot be reactivated by

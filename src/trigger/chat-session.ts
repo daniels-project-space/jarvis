@@ -481,10 +481,10 @@ export const chatHandoff = task({
 });
 
 // Recovery lane only: if an immediate trigger is lost between Vercel and
-// Trigger, the next schedule drains the durable Convex queue.
+// Trigger, the next five-minute schedule drains the durable Convex queue.
 export const chatDispatcher = schedules.task({
   id: "jarvis-chat-dispatcher",
-  cron: "*/1 * * * *",
+  cron: "*/5 * * * *",
   queue: { name: "jarvis-foreground-recovery", concurrencyLimit: 1 },
   maxDuration: 60,
   run: async () => {

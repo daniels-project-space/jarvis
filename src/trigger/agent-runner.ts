@@ -2433,12 +2433,12 @@ export const agentWorker = task({
   },
 });
 
-// The fleet controller is intentionally cheap and always available. It never
-// runs Codex itself; it repairs leases, performs bounded housekeeping and fans
-// runnable jobs into independent workers.
+// The fleet controller is intentionally cheap and event-driven workers wake it
+// immediately. This five-minute sweep is only the dead-man recovery lane; it
+// never runs Codex itself.
 export const agentFleetSupervisor = schedules.task({
   id: "jarvis-agent-fleet-supervisor",
-  cron: "* * * * *",
+  cron: "*/5 * * * *",
   machine: "micro",
   queue: { concurrencyLimit: 1 },
   maxDuration: 120,

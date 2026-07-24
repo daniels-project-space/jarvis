@@ -181,7 +181,9 @@ async function pollAds() {
 
 export const businessPoller = schedules.task({
   id: "jarvis-business-poller",
-  cron: "*/30 * * * *",
+  // Rental, music, YouTube and ads metrics are slow-moving; alerting remains
+  // event-driven elsewhere, so this is a four-hourly reconciliation sweep.
+  cron: "0 */4 * * *",
   maxDuration: 120,
   run: async () => {
     await Promise.all([pollRental(), pollMusic(), pollYouTube(), pollAds()]);
