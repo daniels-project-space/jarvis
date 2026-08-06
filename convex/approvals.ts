@@ -63,6 +63,7 @@ export const decide = mutation({
       && Number.isSafeInteger(job.supervisorEpoch)
       && typeof job.supervisorDecisionKey === "string"
       && Number.isSafeInteger(job.supervisorJobOrdinal);
+    const declinedResult = "Daniel declined the protected recovery.";
     if (a.decision === "declined" && supervisorOwned) {
       const attempt = job.attempt ?? 1;
       await ensureWorkAttempt(ctx, job, attempt, "awaiting_approval", now);
@@ -74,13 +75,16 @@ export const decide = mutation({
         artifacts: [`convex://approvals/${String(approval._id)}`],
         verification: "cancelled",
         terminalEventKey: `approval-declined:${attempt}`,
-        result: "Daniel declined the protected recovery.",
+        result: declinedResult,
       }, now);
     }
     await ctx.db.patch(approval._id, { status: a.decision, resolvedAt: now });
     await patchJobWithRuntime(ctx, job, {
       approvalStatus: a.decision,
       status: a.decision === "approved" ? (heldByGoal ? "paused" : "pending") : "cancelled",
+      ...(a.decision === "declined" && supervisorOwned
+        ? { result: declinedResult, verificationNote: "" }
+        : {}),
       completedAt: a.decision === "declined" ? now : undefined,
       progress: a.decision === "approved"
         ? heldByGoal ? "approved — held until Goal Mode resumes" : "approved — queued"

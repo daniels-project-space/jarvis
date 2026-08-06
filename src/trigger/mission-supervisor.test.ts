@@ -2126,6 +2126,30 @@ describe("mission supervisor Trigger tick", () => {
       });
   });
 
+  it("rejects a cancelled projection whose result is not bound to its exact receipt", async () => {
+    const cancelled = recoveryJob({
+      jobId: "job-cancelled-projection-skew",
+      status: "cancelled",
+      recoveryDisposition: "operator_stop",
+      terminalCode: "operator_cancelled",
+    });
+    cancelled.result = "Cloud workspace provider was not configured.";
+    cancelled.resultDigest = sha(cancelled.result);
+    const runtime = harness(snapshot([cancelled]));
+
+    await expect(runMissionSupervisorTick(
+      tickPayload(),
+      runContext(),
+      runtime.dependencies,
+    )).resolves.toMatchObject({
+      status: "released",
+      errorCode: "invalid_terminal_receipt",
+    });
+    expect(runtime.calls.some(
+      (call) => call.path === "missionSupervisor:commitV1",
+    )).toBe(false);
+  });
+
   it("invokes fresh Sol synthesis only when multiple terminal receipts match exact authority", async () => {
     const completed = job({ status: "done" });
     const second = job({ jobId: "job-2", status: "done" });

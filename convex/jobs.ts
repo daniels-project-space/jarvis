@@ -5215,6 +5215,35 @@ export const control = mutation({
     await requireActor(ctx, a);
     const row = await ctx.db.get(a.jobId);
     if (!row) return false;
+    if (
+      a.action === "cancel"
+      && row.status === "cancelled"
+      && isSupervisorOwnedJob(row)
+    ) {
+      // Early protocol-2 operator cancellations sealed a canonical terminal
+      // summary in the append-only receipt but left an older worker result on
+      // the mutable job projection. Repeating the exact control is a bounded,
+      // fail-closed repair: the receipt and execution authority must still be
+      // unique and valid, and its digests must match values derivable from the
+      // existing row. The immutable receipt is never edited.
+      const exact = await exactTerminalWorkReceipt(ctx, row);
+      const result = "Daniel cancelled the work.";
+      const evidence = String(row.checkpoint ?? "").slice(0, 1_000);
+      if (
+        !exact
+        || exact.receipt.terminalCode !== "operator_cancelled"
+        || exact.receipt.recoveryDisposition !== "operator_stop"
+        || exact.receipt.resultDigest !== await sha256Hex(result)
+        || exact.receipt.evidenceDigest !== await sha256Hex(evidence)
+      ) return false;
+      if (row.result !== result || row.verificationNote !== evidence) {
+        await patchJobWithRuntime(ctx, row, {
+          result,
+          verificationNote: evidence,
+        });
+      }
+      return true;
+    }
     const wouldResurrectSupervisorTerminal =
       isSupervisorOwnedJob(row)
       && (
@@ -5342,6 +5371,8 @@ export const control = mutation({
       if (integrationControl?.reconcile) return true;
       if (["running", "steering"].includes(row.status) && !await closeAttempt("cancelled")) return false;
       if (["pending", "dispatching", "paused"].includes(row.status)) await closeAttempt("cancelled");
+      const cancellationResult = "Daniel cancelled the work.";
+      const cancellationEvidence = String(row.checkpoint ?? "").slice(0, 1_000);
       if (isSupervisorOwnedJob(row)) {
         await ensureAttempt(
           ctx,
@@ -5360,14 +5391,20 @@ export const control = mutation({
           ],
           verification: "cancelled",
           terminalEventKey: `operator-cancelled:${row.attempt ?? 1}`,
-          result: "Daniel cancelled the work.",
-          evidence: row.checkpoint,
+          result: cancellationResult,
+          evidence: cancellationEvidence,
         }, now);
       }
       await patchJobWithRuntime(ctx, row, {
         ...invalidateDeliveryLease(row),
         status: "cancelled",
         stage: "cancelled",
+        ...(isSupervisorOwnedJob(row)
+          ? {
+            result: cancellationResult,
+            verificationNote: cancellationEvidence,
+          }
+          : {}),
         completedAt: now,
         progress: "cancelled by Daniel",
         nextRunAt: undefined,

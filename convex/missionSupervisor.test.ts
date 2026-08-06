@@ -5477,25 +5477,71 @@ describe("dormant mission supervisor authority", () => {
       attempt: 1,
     });
 
+    const cancelledCheckpoint =
+      "Cloud workspace blocked before the operator cancelled the fresh attempt.";
+    await t.run(async (ctx) => {
+      await ctx.db.patch(cancelJobId, {
+        result: cancelledCheckpoint,
+        checkpoint: cancelledCheckpoint,
+      });
+    });
     expect(await t.mutation(jobsApi.control, {
       jobId: cancelJobId,
       action: "cancel",
       workerToken: WORKER,
     })).toBe(true);
-    const cancelledReceipt = await t.run(async (ctx) =>
-      await ctx.db
+    const cancelled = await t.run(async (ctx) => ({
+      job: await ctx.db.get(cancelJobId),
+      receipts: await ctx.db
         .query("workReceipts")
         .withIndex("by_job_attempt", (q) =>
           q.eq("jobId", cancelJobId).eq("attempt", 1)
         )
-        .unique()
-    );
-    expect(cancelledReceipt).toMatchObject({
+        .collect(),
+    }));
+    expect(cancelled.receipts).toHaveLength(1);
+    expect(cancelled.receipts[0]).toMatchObject({
       protocolVersion: 2,
       status: "cancelled",
       terminalCode: "operator_cancelled",
       recoveryDisposition: "operator_stop",
+      resultDigest: await sha256Hex("Daniel cancelled the work."),
+      evidenceDigest: await sha256Hex(cancelledCheckpoint),
     });
+    expect(cancelled.job).toMatchObject({
+      status: "cancelled",
+      result: "Daniel cancelled the work.",
+      verificationNote: cancelledCheckpoint,
+    });
+
+    // Reproduce the live protocol-2 projection skew: an older worker result
+    // survived after the exact operator receipt was sealed. Repeating Cancel
+    // repairs only the mutable projection after validating the receipt.
+    await t.run(async (ctx) => {
+      await ctx.db.patch(cancelJobId, {
+        result: "Cloud workspace provider was not configured.",
+        verificationNote: undefined,
+      });
+    });
+    expect(await t.mutation(jobsApi.control, {
+      jobId: cancelJobId,
+      action: "cancel",
+      workerToken: WORKER,
+    })).toBe(true);
+    const repairedCancellation = await t.run(async (ctx) => ({
+      job: await ctx.db.get(cancelJobId),
+      receipts: await ctx.db
+        .query("workReceipts")
+        .withIndex("by_job_attempt", (q) =>
+          q.eq("jobId", cancelJobId).eq("attempt", 1)
+        )
+        .collect(),
+    }));
+    expect(repairedCancellation.job).toMatchObject({
+      result: "Daniel cancelled the work.",
+      verificationNote: cancelledCheckpoint,
+    });
+    expect(repairedCancellation.receipts).toHaveLength(1);
 
     expect(await t.mutation(approvalsApi.decide, {
       jobId: String(approvalJobId),
@@ -5514,6 +5560,8 @@ describe("dormant mission supervisor authority", () => {
     expect(declined.job).toMatchObject({
       status: "cancelled",
       approvalStatus: "declined",
+      result: "Daniel declined the protected recovery.",
+      verificationNote: "",
     });
     expect(declined.receipt).toMatchObject({
       protocolVersion: 2,
@@ -5570,6 +5618,39 @@ describe("dormant mission supervisor authority", () => {
       terminalCode: "stale_runner_budget_exhausted",
       recoveryDisposition: "remediable",
     });
+  });
+
+  it("preserves legacy partial output when cancellation has no receipt projection", async () => {
+    const t = convexTest(schema, modules);
+    const jobId = await t.run(async (ctx) =>
+      await ctx.db.insert("jobs", {
+        task: "Preserve this legacy partial result during cancellation.",
+        status: "pending",
+        result: "Useful partial legacy output.",
+        verificationNote: "Useful partial legacy evidence.",
+        checkpoint: "Legacy checkpoint.",
+        createdAt: Date.now(),
+      })
+    );
+
+    expect(await t.mutation(jobsApi.control, {
+      jobId,
+      action: "cancel",
+      workerToken: WORKER,
+    })).toBe(true);
+    expect(await t.run(async (ctx) => ctx.db.get(jobId))).toMatchObject({
+      status: "cancelled",
+      result: "Useful partial legacy output.",
+      verificationNote: "Useful partial legacy evidence.",
+    });
+    expect(await t.run(async (ctx) =>
+      await ctx.db
+        .query("workReceipts")
+        .withIndex("by_job_attempt", (q) =>
+          q.eq("jobId", jobId).eq("attempt", 1)
+        )
+        .collect()
+    )).toHaveLength(0);
   });
 
   it("rejects corrupt or incomplete recovery lineage before control or synthesis writes", async () => {
