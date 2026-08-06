@@ -4,6 +4,7 @@ import { adminSessionHash, validateAdminSession } from "@/lib/control-session";
 import { canonicalJarvisRedirect } from "@/lib/canonical-origin";
 import { bearerToken } from "@/lib/request-auth";
 import { verifyViewerToken } from "@/lib/viewer-jwt";
+import { isJarvisPublicPath } from "@/lib/public-path";
 
 export async function proxy(req: NextRequest) {
   const canonical = canonicalJarvisRedirect({
@@ -16,12 +17,7 @@ export async function proxy(req: NextRequest) {
 
   const pathname = req.nextUrl.pathname;
   if (pathname === "/login") return NextResponse.redirect(new URL("/", req.url));
-  if (
-    !pathname.startsWith("/api/")
-    || pathname === "/api/auth/viewer"
-    || pathname === "/api/auth/enroll"
-    || pathname === "/api/agent-tool"
-  ) return NextResponse.next();
+  if (isJarvisPublicPath(pathname)) return NextResponse.next();
 
   if (await verifyViewerToken(bearerToken(req.headers.get("authorization")))) return NextResponse.next();
   const tokenHash = await adminSessionHash(req);

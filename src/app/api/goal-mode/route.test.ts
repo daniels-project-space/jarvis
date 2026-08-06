@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NextRequest } from "next/server";
 
 const mock = vi.hoisted(() => ({
@@ -65,7 +65,27 @@ describe("Goal Mode admission UI ownership", () => {
     });
     mock.v2AdmissionEnabled.mockReturnValue(true);
     mock.wakeAgentFleet.mockResolvedValue(true);
+    const now = Date.now();
+    const templateDigest = "e".repeat(64);
+    vi.stubEnv("JARVIS_CLOUD_WORKSPACE_PROVIDER", "sandbox0");
+    vi.stubEnv("JARVIS_CLOUD_WORKSPACE_TEMPLATE", "node22-codex-0.144.5");
+    vi.stubEnv("JARVIS_CLOUD_WORKSPACE_TEMPLATE_DIGEST", templateDigest);
+    vi.stubEnv("JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID", "20260806.9");
+    vi.stubEnv("JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT", JSON.stringify({
+      keyId: "current",
+      signature: "f".repeat(64),
+      receipt: {
+        schemaVersion: 1,
+        provider: "sandbox0",
+        deploymentId: "20260806.9",
+        template: { identity: "node22-codex-0.144.5", digest: templateDigest },
+        probeTime: now - 60_000,
+        expiresAt: now + 60 * 60_000,
+      },
+    }));
   });
+
+  afterEach(() => vi.unstubAllEnvs());
 
   it("creates and wakes the mission without opening a global fleet panel", async () => {
     const response = await POST(request({
@@ -148,5 +168,27 @@ describe("Goal Mode admission UI ownership", () => {
     });
     expect(mock.resolveProjectSourceAdmission).not.toHaveBeenCalled();
     expect(mock.controlMutation).not.toHaveBeenCalled();
+  });
+
+  it("returns a recoverable 503 before source observation, mission creation, or Trigger wake when provider evidence is absent", async () => {
+    vi.stubEnv("JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT", "");
+
+    const response = await POST(request({
+      goal: "Overhaul YouTube Studio from the exact ready branch",
+      sourceBranch: "agent/youtube-autonomy-production",
+    }));
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("60");
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      code: "cloud_provider_not_ready",
+      reason: "missing_receipt",
+      retryable: true,
+    });
+    expect(mock.resolveProjectSourceAdmission).not.toHaveBeenCalled();
+    expect(mock.controlQuery).not.toHaveBeenCalled();
+    expect(mock.controlMutation).not.toHaveBeenCalled();
+    expect(mock.wakeAgentFleet).not.toHaveBeenCalled();
   });
 });
