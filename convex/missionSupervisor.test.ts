@@ -2564,6 +2564,147 @@ describe("dormant mission supervisor authority", () => {
     });
   });
 
+  it("pauses a fresh pending attempt after its predecessor checkpoint closed the old dispatch", async () => {
+    const t = convexTest(schema, modules);
+    const fixture = await startAndDelegate(
+      t,
+      "control-pause-after-checkpoint-requeue",
+      [delegatedWorkstream({
+        task: "Checkpoint once, then remain safely pausable before redispatch.",
+        label: "checkpointed pause member",
+        readonly: true,
+      })],
+    );
+    const reservation = (await t.mutation(jobsApi.reserveDispatchBatch, {
+      limit: 1,
+      reason: "checkpoint before mission pause",
+      workerToken: WORKER,
+    })).reservations[0] as DispatchReservation;
+    const claimed = await t.mutation(jobsApi.claimDispatched, {
+      jobId: reservation.jobId,
+      dispatchId: reservation.dispatchId,
+      ...triggerClaimAuthority(reservation),
+      workerRunId: "checkpoint-before-pause-worker",
+      workerToken: WORKER,
+    });
+    expect(await t.mutation(jobsApi.checkpointAndRequeue, {
+      jobId: reservation.jobId,
+      expectedAttempt: 1,
+      authorityDigest: claimed.authorityDigest,
+      checkpoint: "Attempt one stopped at a durable provider boundary.",
+      result: "The provider is temporarily unavailable.",
+      delayMs: 60_000,
+      workerRunId: "checkpoint-before-pause-worker",
+      workerToken: WORKER,
+    })).toMatchObject({
+      requeued: true,
+      exhausted: false,
+      stale: false,
+    });
+    const pending = await t.run(async (ctx) =>
+      await ctx.db.get(reservation.jobId)
+    );
+    expect(pending).toMatchObject({ status: "pending", attempt: 2 });
+    expect(pending?.dispatchReceiptId).toBeUndefined();
+    expect(pending?.dispatchReceiptDigest).toBeUndefined();
+    expect(pending?.dispatchPayloadDigest).toBeUndefined();
+    expect(pending?.dispatchGeneration).toBeUndefined();
+    expect(pending?.dispatchPhase).toBeUndefined();
+
+    const state = await supervisorState(t, fixture.started.missionId);
+    expect(await control(
+      t,
+      fixture.started.missionId,
+      "control-pause-after-checkpoint-requeue-apply",
+      "pause",
+      state!.inputRevision,
+    )).toMatchObject({
+      applied: true,
+      state: "paused",
+      affectedJobCount: 1,
+      affectedJobIds: [reservation.jobId],
+    });
+    expect(await t.run(async (ctx) =>
+      await ctx.db.get(reservation.jobId)
+    )).toMatchObject({ status: "paused", attempt: 2 });
+  });
+
+  it("holds one claimed supervisor worker for input with an exact terminal receipt and no retry", async () => {
+    const t = convexTest(schema, modules);
+    const fixture = await startAndDelegate(
+      t,
+      "worker-input-hold-exact-dispatch",
+      [delegatedWorkstream({
+        task: "Stop at one durable provider configuration boundary.",
+        label: "provider input hold",
+        readonly: true,
+      })],
+    );
+    const reservation = (await t.mutation(jobsApi.reserveDispatchBatch, {
+      limit: 1,
+      reason: "exact provider input hold",
+      workerToken: WORKER,
+    })).reservations[0] as DispatchReservation;
+    const claimed = await t.mutation(jobsApi.claimDispatched, {
+      jobId: reservation.jobId,
+      dispatchId: reservation.dispatchId,
+      ...triggerClaimAuthority(reservation),
+      workerRunId: "provider-input-hold-worker",
+      workerToken: WORKER,
+    });
+    expect(await t.mutation(jobsApi.requestInput, {
+      jobId: reservation.jobId,
+      expectedAttempt: 1,
+      authorityDigest: claimed.authorityDigest,
+      workerRunId: "provider-input-hold-worker",
+      question: "Configure an attested cloud workspace provider before resuming.",
+      checkpoint: "No repository or specialist process was started.",
+      workerToken: WORKER,
+    })).toBe(true);
+
+    const held = await t.run(async (ctx) => ({
+      job: await ctx.db.get(reservation.jobId),
+      attempts: await ctx.db
+        .query("workAttempts")
+        .withIndex("by_job_attempt", (q) =>
+          q.eq("jobId", reservation.jobId)
+        )
+        .collect(),
+      receipt: await ctx.db
+        .query("workReceipts")
+        .withIndex("by_job_attempt", (q) =>
+          q.eq("jobId", reservation.jobId).eq("attempt", 1)
+        )
+        .unique(),
+      dispatch: await ctx.db
+        .query("dispatchReceipts")
+        .withIndex("by_job_generation", (q) =>
+          q.eq("jobId", reservation.jobId).eq("generation", 1)
+        )
+        .unique(),
+      state: await ctx.db.get(fixture.started.stateId),
+    }));
+    expect(held.job).toMatchObject({ status: "needs_input", attempt: 1 });
+    expect(held.job?.nextRunAt).toBeUndefined();
+    expect(held.attempts).toHaveLength(1);
+    expect(held.attempts[0]).toMatchObject({ status: "needs_input" });
+    expect(held.receipt).toMatchObject({
+      protocolVersion: 2,
+      attempt: 1,
+      status: "needs_input",
+      terminalCode: "agent_input_required",
+      recoveryDisposition: "needs_input",
+      verification: "needs_input",
+      authorityDigest: claimed.authorityDigest,
+    });
+    expect(held.dispatch).toMatchObject({ status: "closed" });
+    expect(held.state).toMatchObject({
+      state: "ready",
+      totalJobs: 1,
+      nonterminalJobCount: 0,
+    });
+  });
+
   it("preflights the full ledger before writing any earlier pause member", async () => {
     const t = convexTest(schema, modules);
     const fixture = await startAndDelegate(t, "control-pause-atomic-reject", [
@@ -3306,6 +3447,25 @@ describe("dormant mission supervisor authority", () => {
     expect(finalRows.dispatches.every((receipt) =>
       receipt.status === "closed"
     )).toBe(true);
+  });
+
+  it.each([
+    `_${"a".repeat(42)}`,
+    `-${"b".repeat(42)}`,
+  ])("accepts a complete base64url lease-token alphabet (%s)", async (leaseToken) => {
+    const t = convexTest(schema, modules);
+    const started = await start(t, `base64url-lease-${leaseToken[0]}`);
+    expect(await claim(
+      t,
+      started.missionId,
+      0,
+      "trigger-base64url-worker",
+      leaseToken,
+    )).toMatchObject({
+      claimed: true,
+      missionId: started.missionId,
+      leaseVersion: 1,
+    });
   });
 
   it("returns at most eight exact ready, waiting, or expired-lease rows", async () => {

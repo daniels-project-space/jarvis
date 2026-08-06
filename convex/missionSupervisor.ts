@@ -77,7 +77,10 @@ const FAILURE_ESCALATION_COUNT = 5;
 const FAILURE_BACKOFF_BASE_MS = 30_000;
 const FAILURE_BACKOFF_MAX_MS = 15 * 60_000;
 const SAFE_KEY = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$/;
-const SAFE_LEASE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._~:/+=-]{15,239}$/;
+// Trigger issues RFC 4648 base64url lease tokens. Both "-" and "_" are
+// valid in every position, including the first character, so the durable
+// authority validator must accept the complete generator alphabet.
+const SAFE_LEASE_TOKEN = /^[A-Za-z0-9_-][A-Za-z0-9._~:/+=-]{15,239}$/;
 const SAFE_ERROR_CODE = /^[a-z][a-z0-9_:-]{0,79}$/;
 const TERMINAL_JOB_STATUSES = new Set([
   "done",

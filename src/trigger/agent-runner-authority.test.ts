@@ -36,6 +36,9 @@ const boundaries = vi.hoisted(() => ({
     throw new Error("cloud provider must not be reached by this authority harness");
   }),
 }));
+const notifications = vi.hoisted(() => ({
+  sendPush: vi.fn(async () => true),
+}));
 
 vi.mock("@trigger.dev/sdk/v3", () => ({
   metadata: trigger.metadata,
@@ -63,6 +66,8 @@ vi.mock("./cloud-workspace-providers", async (importOriginal) => ({
   ...await importOriginal<typeof import("./cloud-workspace-providers")>(),
   configuredCloudWorkspaceProvider: boundaries.configuredCloudWorkspaceProvider,
 }));
+
+vi.mock("./push-send", () => ({ sendPush: notifications.sendPush }));
 
 import {
   agentWorker,
@@ -102,6 +107,12 @@ function bridgeProductionRunnerToConvex(
         break;
       case "jobs:checkpointAndRequeue":
         value = await t.mutation(api.jobs.checkpointAndRequeue, body.args as any);
+        break;
+      case "jobs:noteCloudWorkspaceBlock":
+        value = await t.mutation(api.jobs.noteCloudWorkspaceBlock, body.args as any);
+        break;
+      case "jobs:requestInput":
+        value = await t.mutation(api.jobs.requestInput, body.args as any);
         break;
       case "jobs:reserveDispatchBatch":
         value = await t.mutation(api.jobs.reserveDispatchBatch, body.args as any);
@@ -495,6 +506,7 @@ beforeEach(() => {
   trigger.batchTrigger.mockClear();
   trigger.metadata.set.mockClear();
   trigger.metadata.flush.mockClear();
+  notifications.sendPush.mockClear();
 });
 
 afterEach(() => {
@@ -1035,6 +1047,133 @@ describe("production Trigger worker authority harness", () => {
       expect(state).toMatchObject({ status: "pending", attempt: 2 });
     },
   );
+
+  it.each([
+    { disposition: "blocked" as const, code: "missing_configuration" as const },
+    { disposition: "rejected" as const, code: "checkpoint_tampered" as const },
+  ])(
+    "holds a $disposition cloud authority failure for input without spending another attempt",
+    async ({ disposition, code }) => {
+      configureFakeControllerAuthority();
+      const t = convexTest(schema, modules);
+      const { jobId, reservation } = await reservedWritableJob(
+        t,
+        `runner-provider-${disposition}`,
+      );
+      const bridge = bridgeProductionRunnerToConvex(t);
+      const dependencies = injectedRunnerDependencies();
+      (dependencies.configuredCloudWorkspaceProvider as any).mockImplementation(
+        () => {
+          throw new CloudWorkspaceError(
+            "vercel",
+            code,
+            `Provider ${disposition} requires operator action`,
+            disposition,
+          );
+        },
+      );
+
+      expect(await invokeHarness(
+        reservation,
+        `provider-${disposition}-run`,
+        dependencies,
+      )).toEqual({
+        processed: 1,
+        blocked: true,
+        provider: "vercel",
+        code,
+      });
+      const state = await t.run(async (ctx) => ({
+        job: await ctx.db.get(jobId),
+        attempts: await ctx.db
+          .query("workAttempts")
+          .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId))
+          .collect(),
+        dispatchReceipts: await ctx.db
+          .query("dispatchReceipts")
+          .withIndex("by_job_generation", (q) => q.eq("jobId", jobId))
+          .collect(),
+        runtime: await ctx.db
+          .query("jobRuntime")
+          .withIndex("by_job", (q) => q.eq("jobId", jobId))
+          .unique(),
+        attention: await ctx.db.query("attentionItems").collect(),
+      }));
+      expect(state.job).toMatchObject({
+        status: "needs_input",
+        attempt: 1,
+        providerRunState: "blocked",
+      });
+      expect(state.job?.nextRunAt).toBeUndefined();
+      expect(state.runtime).toMatchObject({
+        status: "needs_input",
+        attempt: 1,
+      });
+      expect(state.attempts).toHaveLength(1);
+      expect(state.attempts[0]).toMatchObject({
+        attempt: 1,
+        status: "needs_input",
+      });
+      expect(state.dispatchReceipts).toHaveLength(1);
+      expect(state.dispatchReceipts[0]).toMatchObject({ status: "closed" });
+      expect(state.attention).toHaveLength(1);
+      expect(bridge.trace.map((call) => call.path)).toContain(
+        "jobs:noteCloudWorkspaceBlock",
+      );
+      expect(bridge.trace.map((call) => call.path)).toContain(
+        "jobs:requestInput",
+      );
+      expect(bridge.trace.map((call) => call.path)).not.toContain(
+        "jobs:checkpointAndRequeue",
+      );
+      expect((dependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
+      expect((dependencies.prepareSubscriptionEnv as any)).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not notify when a verified input hold loses its authority race", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(
+      t,
+      "runner-stale-input-hold",
+    );
+    let retired = false;
+    const bridge = bridgeProductionRunnerToConvex(t, async (call) => {
+      if (call.path !== "jobs:requestInput" || retired) return;
+      retired = true;
+      const result = await t.mutation(api.jobs.checkpointAndRequeue, {
+        jobId,
+        expectedAttempt: Number(call.args.expectedAttempt),
+        authorityDigest: String(call.args.authorityDigest),
+        workerRunId: String(call.args.workerRunId),
+        workerToken: WORKER,
+        checkpoint: "A concurrent controller continuation retired this worker.",
+        result: "The stale worker must not notify.",
+        delayMs: 0,
+      });
+      expect(result).toMatchObject({ requeued: true, stale: false });
+    });
+    const dependencies = injectedRunnerDependencies();
+    (dependencies.verifyWork as any).mockResolvedValue({
+      verdict: "needs_input",
+      note: "Choose the consequential production option.",
+      answer: "",
+    });
+
+    expect(await invokeHarness(
+      reservation,
+      "stale-input-hold-run",
+      dependencies,
+    )).toEqual({ processed: 1 });
+    const state = await t.run(async (ctx) => ctx.db.get(jobId));
+    expect(state).toMatchObject({ status: "pending", attempt: 2 });
+    expect(bridge.trace.map((call) => call.path)).toContain("jobs:requestInput");
+    expect(bridge.trace.map((call) => call.path)).not.toContain(
+      "chatQueue:postAssistant",
+    );
+    expect(notifications.sendPush).not.toHaveBeenCalled();
+  });
 
   it("durably checkpoints and requeues a provider startup timeout instead of leaving the attempt running", async () => {
     configureFakeControllerAuthority();

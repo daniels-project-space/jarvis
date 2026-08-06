@@ -3929,6 +3929,20 @@ export const checkpointAndRequeue = mutation({
       nextRunAt: status === "pending" ? Date.now() + delayMs : undefined,
       dispatchId: undefined,
       dispatchLeaseUntil: undefined,
+      // A fresh specialist attempt has no dispatch authority yet. Keeping the
+      // prior attempt's closed receipt projected on the job makes mission-wide
+      // pause reject the new pending attempt as invalid authority. The
+      // append-only receipt remains in dispatchReceipts and allocates the next
+      // generation when this attempt is actually reserved.
+      ...(status === "pending" && !deliveryContinuation
+        ? {
+          dispatchReceiptId: undefined,
+          dispatchReceiptDigest: undefined,
+          dispatchPayloadDigest: undefined,
+          dispatchGeneration: undefined,
+          dispatchPhase: undefined,
+        }
+        : {}),
       workerRunId: status === "pending" ? undefined : row.workerRunId,
       completedAt: requestedStatus === "cancelled" || exhausted ? Date.now() : undefined,
       progress: exhausted
@@ -4593,6 +4607,8 @@ export const requestInput = mutation({
   args: {
     jobId: v.id("jobs"),
     expectedAttempt: v.number(),
+    authorityDigest: v.optional(v.string()),
+    workerRunId: v.optional(v.string()),
     question: v.string(),
     checkpoint: v.optional(v.string()),
     workerToken: v.optional(v.string()),
@@ -4601,6 +4617,31 @@ export const requestInput = mutation({
     requireWorker(a.workerToken);
     const row = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt) return false;
+    // A live production attempt is bound to one claimed dispatch. Do not let
+    // another shared worker capability stop it or leave its dispatch receipt
+    // permanently claimed. Legacy rows without a worker identity retain the
+    // old migration-compatible path.
+    const liveDispatch = typeof row.workerRunId === "string";
+    const suppliedFence =
+      a.authorityDigest !== undefined || a.workerRunId !== undefined;
+    if (
+      (liveDispatch && !suppliedFence)
+      || (
+        suppliedFence
+        && (
+          typeof a.authorityDigest !== "string"
+          || typeof a.workerRunId !== "string"
+          || a.workerRunId !== row.workerRunId
+          || !await attemptExecutionAuthorityFor(
+            ctx,
+            row,
+            a.expectedAttempt,
+            a.authorityDigest,
+          )
+          || !await claimedDispatchReceiptForRow(ctx, row, a.workerRunId)
+        )
+      )
+    ) return false;
     const now = Date.now();
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (!attempt || attempt.status !== "running") return false;
@@ -4627,6 +4668,18 @@ export const requestInput = mutation({
       checkpoint: a.checkpoint?.slice(0, 6000) ?? row.checkpoint,
       heartbeatAt: now,
     });
+    if (
+      liveDispatch
+      && !await closeClaimedDispatchReceipt(
+        ctx,
+        row,
+        a.workerRunId,
+        "worker requested operator input",
+        now,
+      )
+    ) {
+      throw new Error("Failed to close the exact input-request dispatch receipt");
+    }
     const fingerprint = `job-input:${a.jobId}`;
     const existing = await ctx.db
       .query("attentionItems")

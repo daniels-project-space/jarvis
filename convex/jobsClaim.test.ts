@@ -150,6 +150,61 @@ beforeEach(() => { process.env.JARVIS_WORKER_TOKEN = WORKER; vi.useRealTimers();
 afterEach(() => { delete process.env.JARVIS_WORKER_TOKEN; vi.useRealTimers(); });
 
 describe("real Convex specialist/controller race matrix", () => {
+  it("fences a worker input hold and closes its exact claimed dispatch without retrying", async () => {
+    const f = await specialistFixture("read_only");
+    expect(await f.t.mutation(api.jobs.requestInput, {
+      jobId: f.jobId,
+      expectedAttempt: 1,
+      authorityDigest: "0".repeat(64),
+      workerRunId: "specialist-run",
+      question: "A provider configuration decision is required.",
+      workerToken: WORKER,
+    })).toBe(false);
+    expect(await f.t.mutation(api.jobs.requestInput, {
+      jobId: f.jobId,
+      expectedAttempt: 1,
+      authorityDigest: f.authorityDigest,
+      workerRunId: "different-run",
+      question: "A provider configuration decision is required.",
+      workerToken: WORKER,
+    })).toBe(false);
+    expect(await f.t.mutation(api.jobs.requestInput, {
+      jobId: f.jobId,
+      expectedAttempt: 1,
+      authorityDigest: f.authorityDigest,
+      workerRunId: "specialist-run",
+      question: "A provider configuration decision is required.",
+      checkpoint: "Provider authority is durably blocked.",
+      workerToken: WORKER,
+    })).toBe(true);
+
+    const state = await f.t.run(async (ctx) => ({
+      job: await ctx.db.get(f.jobId),
+      attempts: await ctx.db
+        .query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", f.jobId))
+        .collect(),
+      dispatches: await ctx.db
+        .query("dispatchReceipts")
+        .withIndex("by_job_generation", (q) => q.eq("jobId", f.jobId))
+        .collect(),
+    }));
+    expect(state.job).toMatchObject({ status: "needs_input", attempt: 1 });
+    expect(state.job).not.toHaveProperty("nextRunAt");
+    expect(state.attempts).toHaveLength(1);
+    expect(state.attempts[0]).toMatchObject({
+      attempt: 1,
+      status: "needs_input",
+    });
+    expect(state.dispatches).toHaveLength(1);
+    expect(state.dispatches[0]).toMatchObject({ status: "closed" });
+    expect((await f.t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      reason: "input hold must not redispatch",
+      workerToken: WORKER,
+    })).reservations).toEqual([]);
+  });
+
   it("retries an accepted-response-lost launch byte-equivalently and accepts one delayed run", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-23T01:00:00Z"));

@@ -2783,12 +2783,18 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         }
         if (verify?.verdict === "needs_input") {
           const question = verify?.note || result.slice(-500).trim() || "A personal or consequential decision is required.";
-          await convexMutation("jobs:requestInput", {
+          const heldForInput = await convexMutation("jobs:requestInput", {
             jobId: job.jobId,
             expectedAttempt,
+            authorityDigest,
+            workerRunId: String(job.workerRunId),
             question,
             checkpoint: `Completed evidence:\n${result.slice(0, 4800)}\n\nWaiting on Daniel: ${question}`,
           });
+          // A concurrent retry, pause, cancellation, or steering revision can
+          // retire this worker between verification and the input hold. Only
+          // the worker that actually committed the fenced hold may notify.
+          if (!heldForInput) return;
           await convexMutation("chatQueue:postAssistant", {
             threadId: originThread,
             text: `Quick decision for ${profile.name}: ${question}`,
@@ -2989,6 +2995,35 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       await convexMutation("jobs:noteCloudWorkspaceBlock", {
         jobId: job.jobId, expectedAttempt, authorityDigest, code: failure.code, reason: checkpoint,
       }).catch(() => false);
+      if (failure.disposition !== "deferred") {
+        // Configuration and authority failures cannot improve by repeatedly
+        // renting fresh Trigger runs. Terminalize this exact attempt as a
+        // durable Needs you checkpoint; Daniel can fix the provider and use
+        // the existing recovery route without consuming the retry budget.
+        const heldForInput = await convexMutation("jobs:requestInput", {
+          jobId: job.jobId,
+          expectedAttempt,
+          authorityDigest,
+          workerRunId: options.reservation.workerRunId,
+          question: checkpoint,
+          checkpoint,
+        }).catch(() => false);
+        if (!heldForInput) {
+          return {
+            processed: 0,
+            stale: true,
+            blocked: true,
+            provider: failure.provider,
+            code: failure.code,
+          };
+        }
+        return {
+          processed: 1,
+          blocked: true,
+          provider: failure.provider,
+          code: failure.code,
+        };
+      }
       await convexMutation("jobs:checkpointAndRequeue", {
         jobId: job.jobId, expectedAttempt, authorityDigest,
         workerRunId: options.reservation.workerRunId, checkpoint,
