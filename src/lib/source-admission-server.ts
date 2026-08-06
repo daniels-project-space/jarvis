@@ -16,7 +16,10 @@ export async function resolveProjectSourceAdmission(
   repository?: string | null,
   requestedBranch?: string,
 ): Promise<ProjectSourceAdmission> {
-  if (!repository) return await evidenceProjectSourceAdmission();
+  if (!repository) {
+    if (requestedBranch !== undefined) throw new Error("Explicit source branch requires a repository");
+    return await evidenceProjectSourceAdmission();
+  }
   return await observeGitHubProjectSource({
     repository,
     requestedBranch,

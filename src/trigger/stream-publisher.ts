@@ -14,11 +14,13 @@ export class StreamPublisher {
   private timer: ReturnType<typeof setInterval> | null = null;
   private closed = false;
   private hasPublished = false;
+  private rejected = false;
 
   constructor(
     private readonly publish: (text: string, revision: number) => Promise<unknown>,
     private readonly intervalMs = 350,
     private readonly onFirstPublished?: () => void,
+    private readonly onRejected?: () => void,
   ) {}
 
   start() {
@@ -48,6 +50,9 @@ export class StreamPublisher {
       if (published === true && !this.hasPublished) {
         this.hasPublished = true;
         this.onFirstPublished?.();
+      } else if (published === false && !this.rejected) {
+        this.rejected = true;
+        this.onRejected?.();
       }
     });
     return this.chain;

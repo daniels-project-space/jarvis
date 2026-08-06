@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
+import type { Id } from "../../convex/_generated/dataModel";
 import { CAPABILITIES, INFRA_MAP, PERSONA, REMEMBER } from "../lib/persona";
 import { visualInitiativeDirective } from "../lib/visual-initiative";
 import { visibleTurnText } from "../lib/host-context";
@@ -131,8 +132,8 @@ type QueueClaim = {
   guest?: boolean;
   userText: string;
   requestId?: string;
-  userMessageId: string;
-  assistantId: string;
+  userMessageId: Id<"chatMessages">;
+  assistantId: Id<"chatMessages">;
   claimToken: string;
   attemptCount: number;
   history: Array<{ role: string; text: string }>;
@@ -159,12 +160,14 @@ async function runTurn(
   model: string,
   guest: boolean,
   invocationContext: CodexTurnInput["invocationContext"],
+  cancellationAbort: AbortController,
   onStage?: (stage: "codexAck" | "firstDelta" | "firstConvexPaint") => void,
 ){
   const publisher = new StreamPublisher(
     (text, revision) => convexMutation("chatQueue:updateStream", { messageId: assistantId, claimToken, text, revision }),
     350,
     () => onStage?.("firstConvexPaint"),
+    () => cancellationAbort.abort(),
   );
   publisher.start();
   try {
@@ -181,6 +184,7 @@ async function runTurn(
       modelTier: model,
       allowTools: !guest,
       invocationContext,
+      signal: cancellationAbort.signal,
       onTurnStarted: () => onStage?.("codexAck"),
       onDelta: (delta) => {
         if (!sawDelta) {
@@ -439,6 +443,17 @@ async function processChatQueue(
       continue;
     }
     activeTurn = { messageId: claim.assistantId, claimToken: claim.claimToken };
+    const cancellationAbort = new AbortController();
+    const stopCancellationWatch = client.onUpdate(
+      api.chatQueue.turnCancellationForWorker,
+      {
+        messageId: claim.assistantId,
+        claimToken: claim.claimToken,
+        workerToken,
+      },
+      (cancelled) => { if (cancelled) cancellationAbort.abort(); },
+      () => undefined,
+    );
     try {
       const visibleUserText = visibleTurnText(claim.userText);
       const contextStarted = Date.now();
@@ -462,6 +477,7 @@ async function processChatQueue(
           requestId: claim.requestId,
           userMessageId: claim.userMessageId,
         },
+        cancellationAbort,
         (stage) => {
           if (stage === "codexAck") onStarted();
           if (stages[stage] === undefined) stages[stage] = Date.now();
@@ -514,6 +530,8 @@ async function processChatQueue(
         finalText: `⚠️ ${error instanceof Error ? error.message : String(error)}`,
         claimToken: claim.claimToken,
       }).catch(() => {});
+    } finally {
+      stopCancellationWatch();
     }
     activeTurn = null;
     // After its exact wake-up message, retain this authenticated CLI process

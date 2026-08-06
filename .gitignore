@@ -43,3 +43,9 @@ next-env.d.ts
 .trigger/
 .playwright-mcp/
 *.bundle
+
+# Local agent/navigation state; never ship or review as application source.
+/.agents/
+/.codex/
+/.serena/
+graphify-out/

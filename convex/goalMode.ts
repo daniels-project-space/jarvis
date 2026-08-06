@@ -7,9 +7,12 @@ import {
   goalBranch,
   goalJobRunnableForMission,
   GOAL_VALIDATOR_TASK_MAX_CHARS,
+  GOAL_AUTOMATIC_ATTEMPT_LIMITS,
   plannerTask,
+  selectGoalWorkstreamPolicy,
   summarizeGoalPhase,
   validatorTask,
+  type GoalReasoningEffort,
   type GoalPlan,
   type GoalRefinement,
   type GoalRoute,
@@ -47,6 +50,7 @@ import {
   sealProjectSourceAdmission,
   type ProjectSourceAdmission,
 } from "../src/lib/source-admission";
+import type { WorkModelTier } from "../src/lib/work-models";
 
 const ADVANCE_LEASE_MS = 10 * 60 * 1000;
 const COORDINATOR_RECEIPT_FRESH_MS = 10 * 60 * 1000;
@@ -84,8 +88,8 @@ type GoalJobInput = {
   label: string;
   repo?: string;
   readonly?: boolean;
-  model: "terra" | "sol";
-  reasoningEffort: "high" | "max";
+  model: WorkModelTier;
+  reasoningEffort: GoalReasoningEffort;
   mcp?: string[];
   originThreadId?: string;
   agentId: string;
@@ -567,7 +571,7 @@ export const createV2 = mutation({
         "Keep consequential actions explicitly gated",
       ],
       modelReason: "Goal Mode uses exactly one Sol/max architecture session before implementation",
-      maxAttempts: 16,
+      maxAttempts: GOAL_AUTOMATIC_ATTEMPT_LIMITS.planning,
       goalStage: "planning",
       goalWorkstreamId: "goal-plan",
       goalWave: 0,
@@ -789,7 +793,7 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
     ],
     modelReason: "Goal Mode reserves Sol/max for skeptical end-to-end validation and refinement planning",
     integrationBranch: branch,
-    maxAttempts: 16,
+    maxAttempts: GOAL_AUTOMATIC_ATTEMPT_LIMITS.validating,
     goalStage: "validating",
     goalWorkstreamId: `validation-${Number(mission.revisionWave ?? 0)}`,
     goalWave: Number(mission.revisionWave ?? 0),
@@ -1302,16 +1306,20 @@ export const materializePlanBatch = mutation({
         `Reuse/ownership boundary: ${mission.infrastructureContext ?? "Inspect the current project boundary before editing."}`,
         `This is Terra/high implementation session ${cursor + jobByNode.size + 1} of ${ordered.length}. Preserve completed branch work, stay inside this workstream, and leave a compact evidence-rich checkpoint for the final Sol validator.`,
       ].join("\n\n");
+      const selectedPolicy = selectGoalWorkstreamPolicy({ ...stream, repo: repository });
       const id = await insertGoalJob(ctx, {
         task, policyTask: stream.task, missionId: String(child._id), label: stream.label,
-        repo: repository, readonly: stream.readonly, model: "terra", reasoningEffort: "high", mcp: stream.mcp,
-        originThreadId: mission.originThreadId, agentId: stream.agentId, risk: "high", priority: 92,
+        repo: repository, readonly: stream.readonly,
+        model: selectedPolicy.model, reasoningEffort: selectedPolicy.reasoningEffort, mcp: stream.mcp,
+        originThreadId: mission.originThreadId, agentId: stream.agentId,
+        risk: stream.readonly ? "low" : "high", priority: 92,
         acceptanceCriteria: stream.acceptanceCriteria,
-        modelReason: split
+        modelReason: `${split
           ? "Goal Mode executes the accepted parent DAG node without child replanning"
-          : "Goal Mode builder sessions use Terra/high for maximum implementation per token",
+          : "Goal Mode deterministically routes each accepted DAG node for quality per token"}; ${selectedPolicy.modelReason}`.slice(0, 300),
         dependsOn: dependencies, integrationBranch: repository && !stream.readonly ? child.integrationBranch : undefined,
-        maxAttempts: 24, goalStage: "building", goalWorkstreamId: stream.id, goalWave: 0,
+        maxAttempts: GOAL_AUTOMATIC_ATTEMPT_LIMITS.building,
+        goalStage: "building", goalWorkstreamId: stream.id, goalWave: 0,
         planParentMissionId: mission._id, planDigest: mission.planDigest, planGeneration: 1, planNodeId: stream.id,
         dispatchReady: dependencies.length === 0,
       });
@@ -1362,7 +1370,7 @@ export const materializePlanBatch = mutation({
     await recordMissionEvent(ctx, String(mission._id), splitRequired ? "goal_split" : "goal_plan_ready",
       splitRequired
         ? `Accepted plan ${mission.planDigest.slice(0, 12)} projected without replanning`
-        : `Sol plan accepted; ${ordered.length} Terra/high sessions queued`,
+        : `Sol plan accepted; ${ordered.length} adaptively routed sessions queued`,
       splitRequired ? "split" : "building", 12, {
         planDigest: mission.planDigest, planGeneration: 1, nodeCount: ordered.length,
         edgeCount: plan.workstreams.reduce((sum, stream) => sum + stream.dependsOn.length, 0),
@@ -1562,7 +1570,7 @@ async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefin
       modelReason: "Goal Mode uses a bounded Terra/high repair wave before another Sol validation",
       sourceBranch: integrationBranch,
       integrationBranch,
-      maxAttempts: 20,
+      maxAttempts: GOAL_AUTOMATIC_ATTEMPT_LIMITS.refining,
       goalStage: "refining",
       goalWorkstreamId: refinement.id,
       goalWave: wave,

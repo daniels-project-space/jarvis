@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { foregroundTurnPhase, latestRecoverableForegroundTurn } from "./foreground-recovery";
+import {
+  authoritativeCancellationReceipt,
+  foregroundTurnPhase,
+  latestRecoverableForegroundTurn,
+} from "./foreground-recovery";
 
 const userId = "user-1";
 
@@ -39,5 +43,25 @@ describe("latestRecoverableForegroundTurn", () => {
       { id: "u1", role: "user", status: "error", text: "failed" },
       { id: "a1", role: "assistant", status: "error", text: "failed", parentMessageId: "u1" },
     ])).toBeNull();
+  });
+});
+
+describe("authoritativeCancellationReceipt", () => {
+  it("accepts only the exact turn's committed fence receipt", () => {
+    expect(authoritativeCancellationReceipt({
+      ok: true,
+      cancellation: "cancelled",
+      messageId: userId,
+      fenceReceipt: "receipt-123",
+    }, userId)).toBe("receipt-123");
+  });
+
+  it.each([
+    { ok: false, cancellation: "cancelled", messageId: userId, fenceReceipt: "receipt-123" },
+    { ok: true, cancellation: "pending", messageId: userId, fenceReceipt: "receipt-123" },
+    { ok: true, cancellation: "cancelled", messageId: "another-turn", fenceReceipt: "receipt-123" },
+    { ok: true, cancellation: "cancelled", messageId: userId, fenceReceipt: "" },
+  ])("rejects an ambiguous or mismatched response before retry", (response) => {
+    expect(authoritativeCancellationReceipt(response, userId)).toBeNull();
   });
 });

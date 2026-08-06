@@ -1,4 +1,6 @@
 import { mutation, query } from "./_generated/server";
+import type { MutationCtx } from "./_generated/server";
+import type { Doc } from "./_generated/dataModel";
 import { ConvexError, v } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import {
@@ -19,6 +21,8 @@ export const MAX_CHAT_RECOVERY_WAKES = 3;
 export const CHAT_PENDING_EXPIRY_MS = 15 * 60_000;
 const TERMINAL_RECOVERY_TEXT =
   "I couldn't complete that reply after several recovery attempts. Tap retry to try the request again.";
+const CANCELLED_REPLY_TEXT = "Reply cancelled.";
+const TURN_CANCELLATION_PREFIX = "foregroundTurnCancellation";
 const GUEST_CHAT_BUCKET_CAPACITY = 3;
 const GUEST_CHAT_REFILL_MS = 2 * 60_000;
 const GUEST_CHAT_DAILY_LIMIT = 24;
@@ -267,6 +271,7 @@ async function settleSession(ctx: { db: any }, threadId: string) {
 async function recoverAssistant(ctx: { db: any }, assistant: any) {
   const parent = assistant.parentMessageId ? await ctx.db.get(assistant.parentMessageId) : null;
   const attempts = Number(parent?.attemptCount ?? assistant.attemptCount ?? 1);
+  await sealWorkerCancellationFence(ctx, assistant, `recovery:${Date.now()}`);
   if (!parent || parent.role !== "user" || attempts >= MAX_CHAT_TURN_ATTEMPTS) {
     await ctx.db.patch(assistant._id, {
       status: "error",
@@ -385,6 +390,13 @@ export const requestRecovery = mutation({
     const threadId = scopedConversationThread(identity, a.threadId);
     const user = await ctx.db.get(a.messageId);
     if (!user || user.role !== "user" || user.threadId !== threadId) return { status: "missing" as const };
+    const cancellation = await ctx.db
+      .query("ui")
+      .withIndex("by_key", (q) => q.eq("key", cancellationReceiptKey(String(user._id))))
+      .first();
+    if (cancellation) {
+      return { status: "cancelled" as const, messageId: user._id };
+    }
     if (user.status === "pending") {
       return await issueRecoveryWake(ctx, user, "pending");
     }
@@ -409,6 +421,115 @@ export const requestRecovery = mutation({
       return await issueRecoveryWake(ctx, await ctx.db.get(user._id), "requeued");
     }
     return { status: "failed" as const, attemptCount: Number(user.attemptCount ?? 0) };
+  },
+});
+
+const cancellationReceiptKey = (messageId: string) =>
+  `${TURN_CANCELLATION_PREFIX}:receipt:${messageId}`;
+const cancellationTokenFingerprint = (claimToken: string) => {
+  let hash = 2_166_136_261;
+  for (const char of claimToken.slice(0, 120)) {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return (hash >>> 0).toString(36);
+};
+const workerCancellationKey = (assistantId: string, claimToken: string) =>
+  `${TURN_CANCELLATION_PREFIX}:worker:${assistantId}:${cancellationTokenFingerprint(claimToken)}`;
+
+async function sealWorkerCancellationFence(
+  ctx: Pick<MutationCtx, "db">,
+  assistant: Doc<"chatMessages"> | null | undefined,
+  receipt: string,
+) {
+  if (!assistant?.claimToken) return;
+  const key = workerCancellationKey(String(assistant._id), assistant.claimToken);
+  const existing = await ctx.db
+    .query("ui")
+    .withIndex("by_key", (q) => q.eq("key", key))
+    .first();
+  if (!existing) {
+    await ctx.db.insert("ui", {
+      key,
+      type: "foreground-turn-cancellation-fence",
+      value: receipt,
+      updatedAt: Date.now(),
+    });
+  }
+}
+
+export const cancelTurn = mutation({
+  args: {
+    messageId: v.id("chatMessages"),
+    threadId: v.optional(v.string()),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, a) => {
+    const identity = await conversationIdentity(ctx, a);
+    const threadId = scopedConversationThread(identity, a.threadId);
+    const user = await ctx.db.get(a.messageId);
+    if (!user || user.role !== "user" || user.threadId !== threadId) {
+      return { status: "missing" as const };
+    }
+
+    const assistant = await ctx.db
+      .query("chatMessages")
+      .withIndex("by_parent", (q) => q.eq("parentMessageId", user._id))
+      .order("desc")
+      .first();
+    if (assistant?.status === "done") return { status: "completed" as const };
+
+    const receiptKey = cancellationReceiptKey(String(user._id));
+    const existingReceipt = await ctx.db
+      .query("ui")
+      .withIndex("by_key", (q) => q.eq("key", receiptKey))
+      .first();
+    if (existingReceipt) {
+      return {
+        status: "cancelled" as const,
+        messageId: user._id,
+        fenceReceipt: existingReceipt.value,
+      };
+    }
+
+    const now = Date.now();
+    const fenceReceipt = `${String(user._id)}:${Number(user.dispatchEpoch ?? 0)}:${now}`;
+    await ctx.db.insert("ui", {
+      key: receiptKey,
+      type: "foreground-turn-cancellation-receipt",
+      value: fenceReceipt,
+      updatedAt: now,
+    });
+
+    // The worker-only tombstone is separate from the frequently heartbeated
+    // message row. Its realtime query wakes exactly once when cancellation is
+    // sealed, avoiding both polling and heartbeat-driven subscription churn.
+    await sealWorkerCancellationFence(ctx, assistant, fenceReceipt);
+
+    if (assistant?.status === "streaming") {
+      await ctx.db.patch(assistant._id, {
+        status: "error",
+        text: CANCELLED_REPLY_TEXT,
+        lastProgressAt: now,
+      });
+    } else if (!assistant || assistant.status === "superseded") {
+      await ctx.db.insert("chatMessages", {
+        threadId,
+        role: "assistant",
+        text: CANCELLED_REPLY_TEXT,
+        status: "error",
+        parentMessageId: user._id,
+        delivery: "foreground",
+        lastProgressAt: now,
+        createdAt: now,
+      });
+    }
+    if (user.status === "pending" || user.status === "done") {
+      await ctx.db.patch(user._id, { status: "error", lastProgressAt: now });
+    }
+    await releaseGuestTurn(ctx, user);
+    await settleSession(ctx, threadId);
+    return { status: "cancelled" as const, messageId: user._id, fenceReceipt };
   },
 });
 
@@ -583,6 +704,23 @@ export const runnerLeaseForWorker = query({
     requireWorker(a.workerToken);
     const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY)).first();
     return row ? { runnerId: row.value, updatedAt: row.updatedAt } : null;
+  },
+});
+
+export const turnCancellationForWorker = query({
+  args: {
+    messageId: v.id("chatMessages"),
+    claimToken: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row = await ctx.db
+      .query("ui")
+      .withIndex("by_key", (q) =>
+        q.eq("key", workerCancellationKey(String(a.messageId), a.claimToken)))
+      .first();
+    return Boolean(row);
   },
 });
 

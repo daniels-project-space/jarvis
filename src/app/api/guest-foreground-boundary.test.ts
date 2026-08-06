@@ -37,6 +37,7 @@ vi.mock("@/lib/tool-belts", () => ({ TOOL_BELTS: { core: new Set(["dispatch_agen
 vi.mock("@/lib/r2", () => ({ r2Put: mock.r2Put }));
 
 import { POST as chatPost } from "./chat/route";
+import { POST as cancelChatPost } from "./chat/cancel/route";
 import { POST as recoverChatPost } from "./chat/recover/route";
 import { POST as sttPost } from "./stt/route";
 import { GET as ttsGet } from "./tts/route";
@@ -119,6 +120,40 @@ describe("guest foreground boundary", () => {
       threadId: "main",
       guestId: guest.guestId,
     });
+  });
+
+  it("keeps an authoritative cancellation fence inside the guest partition", async () => {
+    mock.convexMutation.mockResolvedValue({
+      status: "cancelled",
+      messageId: "message-1",
+      fenceReceipt: "message-1:1:1786017600000",
+    });
+    const response = await cancelChatPost(request("/api/chat/cancel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messageId: "message-1", threadId: "main" }),
+    }));
+
+    expect(response.status).toBe(200);
+    expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:cancelTurn", {
+      messageId: "message-1",
+      threadId: "main",
+      guestId: guest.guestId,
+    });
+    expect(mock.trigger).not.toHaveBeenCalled();
+  });
+
+  it("never revives a guest turn after its cancellation fence is committed", async () => {
+    mock.convexMutation.mockResolvedValue({ status: "cancelled", messageId: "message-1" });
+    const response = await recoverChatPost(request("/api/chat/recover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messageId: "message-1", threadId: "main" }),
+    }));
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({ ok: false, recovery: "cancelled" });
+    expect(mock.trigger).not.toHaveBeenCalled();
   });
 
   it("accepts a guest STT and TTS foreground transport", async () => {

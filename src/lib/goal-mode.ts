@@ -1,4 +1,5 @@
 import { PROJECT_REGISTRY, projectProviderBoundary } from "./project-registry";
+import { selectCodexWorkPolicy, type CodexWorkSelection } from "./codex-work-router";
 import { EVIDENCE_INTEGRITY_RULES } from "./work-verification";
 import { SAFE_SANDBOX_EXECUTION_RULES } from "./work-safety";
 import { canonicalizeRepository } from "./workflow-contract";
@@ -8,6 +9,17 @@ export const GOAL_PLAN_MARKER = "GOAL_PLAN_JSON:";
 export const GOAL_VALIDATION_MARKER = "GOAL_VALIDATION_JSON:";
 export const GOAL_PLAN_RESULT_MAX_CHARS = 8_000;
 export const GOAL_VALIDATOR_TASK_MAX_CHARS = 40_000;
+
+// A model segment is already 15 minutes for Luna/Terra and 25 minutes for Sol.
+// These are automatic continuation budgets, not total mission limits: every
+// segment checkpoints durably, and an explicit resume can extend the affected
+// leaf after Daniel fixes an external blocker or deliberately grants more time.
+export const GOAL_AUTOMATIC_ATTEMPT_LIMITS = {
+  planning: 3,
+  building: 4,
+  validating: 3,
+  refining: 3,
+} as const;
 
 export const GOAL_ROUTE_KINDS = [
   "app_factory",
@@ -40,6 +52,35 @@ export type GoalWorkstream = {
   acceptanceCriteria: string[];
   mcp: Array<"playwright" | "context7">;
 };
+
+/**
+ * Keep Goal Mode's final quality gate strong without spending Terra/Sol on a
+ * mechanically bounded evidence read. Writable, production, root-cause,
+ * media-generation and broad-tool nodes retain the adaptive router's
+ * Terra/Sol floor; only low-risk bounded read-only research/verification may
+ * use Luna.
+ */
+export function selectGoalWorkstreamPolicy(
+  workstream: Pick<GoalWorkstream, "task" | "agentId" | "repo" | "readonly" | "mcp">,
+): CodexWorkSelection {
+  const input = {
+    task: workstream.task,
+    role: workstream.agentId,
+    repo: workstream.repo,
+    readonly: workstream.readonly,
+    risk: workstream.readonly ? "low" : "high",
+    tools: workstream.mcp,
+  } as const;
+  const selected = selectCodexWorkPolicy(input);
+  const boundedReadOnlyEvidence = workstream.readonly
+    && selected.complexity === "bounded"
+    && selected.productionRisk === "low"
+    && selected.toolBreadth !== "broad"
+    && (selected.workType === "research" || selected.workType === "verification");
+  return boundedReadOnlyEvidence || selected.model !== "luna"
+    ? selected
+    : selectCodexWorkPolicy({ ...input, requestedModel: "terra" });
+}
 
 export type GoalPlan = {
   summary: string;
@@ -458,7 +499,7 @@ export function plannerTask(goal: string, route: GoalRoute, acceptanceCriteria: 
     `Why: ${route.reason}`,
     `Reuse boundary: ${route.infrastructureContext}`,
     acceptanceCriteria.length ? `Daniel's acceptance criteria:\n${acceptanceCriteria.map((item) => `- ${item}`).join("\n")}` : "",
-    `Inspect the current repository, AGENTS.md, callers, live manifests and relevant primary-source docs. Find existing skills, templates and infrastructure before proposing new code. Break the outcome into 2-${maxBuildSessions} bounded sessions. Express only real ordering requirements as dependsOn edges. Independent writable sessions may run concurrently because every work item receives its own immutable worker branch and sandbox; specialists never share or integrate branches. Agents do not merge or deploy directly: the fenced delivery controller serializes reviewed receipts into the mission integration branch. Actions with public, third-party communication, financial, credential, booking, or destructive consequences remain separately approval-gated.`,
+    `Inspect the current repository, AGENTS.md, callers, live manifests and relevant primary-source docs. Find existing skills, templates and infrastructure before proposing new code. Break the outcome into 2-${maxBuildSessions} bounded sessions. Assign Paul to engineering/integration, Atlas to evidence research, Iris to media/visual quality, Maya to travel/calendar work, and Sentry to reliability/security review. When quality defects are found, fix their generation, render, configuration, or data root cause; detection filters are secondary regression guards and a rejection-only gate does not satisfy the outcome. Express only real ordering requirements as dependsOn edges. Independent writable sessions may run concurrently because every work item receives its own immutable worker branch and sandbox; specialists never share or integrate branches. Agents do not merge or deploy directly: the fenced delivery controller serializes reviewed receipts into the mission integration branch. Actions with public, third-party communication, financial, credential, booking, or destructive consequences remain separately approval-gated.`,
     "End with exactly one compact JSON object after GOAL_PLAN_JSON:. It must use this shape:",
     '{"summary":"...","route":"app_factory|youtube_studio|existing_project|cloud_new|general","primaryRepo":"owner/repo or empty","assumptions":["..."],"workstreams":[{"id":"stable-id","label":"short label","task":"self-contained task","agentId":"paul|atlas|iris|maya|sentry","repo":"owner/repo or empty","readonly":false,"dependsOn":["earlier-id"],"acceptanceCriteria":["observable evidence"],"mcp":["playwright|context7"]}],"validation":{"criteria":["goal-level truth"],"tests":["deep test"],"liveChecks":["deployed/provider check"]},"factory":{"name":"required only for app_factory","slug":"...","brief":"full build brief"}}',
     "The JSON is a machine contract. Keep the whole response and JSON concise enough to fit in 7,500 characters.",

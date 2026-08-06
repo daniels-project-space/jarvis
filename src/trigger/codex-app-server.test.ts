@@ -121,6 +121,71 @@ describe("Codex app-server dynamic tools", () => {
     await expect(turnPromise).resolves.toMatchObject({ finalText: "done", threadId: "thread-1", code: 0 });
   });
 
+  it("interrupts the exact admitted turn and ignores every late event after cancellation", async () => {
+    const onDynamicToolCall = vi.fn(async () => ({
+      contentItems: [{ type: "inputText" as const, text: "must not run" }],
+      success: true,
+    }));
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000, { onDynamicToolCall });
+    const writes: WrittenMessage[] = [];
+    const onDelta = vi.fn();
+    const abort = new AbortController();
+    const internals = server as unknown as AppServerInternals;
+    internals.process = {
+      stdin: {
+        writable: true,
+        write: (chunk) => { writes.push(JSON.parse(chunk) as WrittenMessage); return true; },
+      },
+    };
+    internals.ready = Promise.resolve();
+
+    const turnPromise = server.runTurn({
+      conversationId: "cancelled-conversation",
+      userText: "stop this reply",
+      history: [],
+      contextBlock: "",
+      preamble: "test",
+      modelTier: "luna",
+      signal: abort.signal,
+      onDelta,
+    });
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    internals.receive(JSON.stringify({ id: writes[0].id, result: { thread: { id: "thread-cancel" } } }));
+    await vi.waitFor(() => expect(writes).toHaveLength(2));
+    internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "turn-cancel" } } }));
+    await Promise.resolve();
+
+    abort.abort();
+    await expect(turnPromise).rejects.toThrow("turn was cancelled");
+    await vi.waitFor(() => expect(writes.some((message) =>
+      message.method === "turn/interrupt" && message.params?.turnId === "turn-cancel",
+    )).toBe(true));
+
+    internals.receive(JSON.stringify({
+      method: "item/agentMessage/delta",
+      params: { turnId: "turn-cancel", delta: "late text" },
+    }));
+    internals.receive(JSON.stringify({
+      method: "turn/completed",
+      params: { turnId: "turn-cancel", turn: { id: "turn-cancel", status: "completed" } },
+    }));
+    internals.receive(JSON.stringify({
+      id: 72,
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-cancel",
+        turnId: "turn-cancel",
+        callId: "late-call",
+        namespace: null,
+        tool: "jarvis_call_tool",
+        arguments: { name: "dispatch_agent", args: {} },
+      },
+    }));
+    await Promise.resolve();
+    expect(onDelta).not.toHaveBeenCalled();
+    expect(onDynamicToolCall).not.toHaveBeenCalled();
+  });
+
   it("rejects unbounded tool invocation metadata before starting a Codex thread", async () => {
     const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000);
     const writes: WrittenMessage[] = [];
