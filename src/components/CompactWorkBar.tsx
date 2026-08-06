@@ -896,7 +896,7 @@ function CompactLiveWorkBubbleView({
         onClick={onOpen}
         aria-expanded="false"
         aria-label={`Open live work for ${label}: ${percent}% ${stage}. ${progress}`}
-        className={`work-progress-button glass group relative grid min-h-[76px] w-full grid-cols-[54px_minmax(0,1fr)_auto] items-center gap-2.5 overflow-hidden rounded-2xl bg-[#071019]/94 px-2.5 py-2 pr-3 text-left shadow-[0_10px_36px_rgba(0,0,0,.38)] transition-[border-color,box-shadow,transform] duration-300 ease-out hover:-translate-y-0.5 hover:shadow-[0_14px_42px_rgba(0,0,0,.46)] motion-reduce:transform-none motion-reduce:transition-none ${
+        className={`work-progress-button glass group relative grid min-h-[76px] w-full grid-cols-[54px_minmax(0,1fr)_auto] items-center gap-2.5 overflow-hidden rounded-2xl bg-[#071019]/94 px-2.5 py-2 pr-3 text-left shadow-[0_10px_36px_rgba(0,0,0,.38)] transition-[border-color,box-shadow,transform] duration-300 ease-out hover:-translate-y-0.5 hover:shadow-[0_14px_42px_rgba(0,0,0,.46)] motion-reduce:transform-none motion-reduce:transition-none max-[340px]:grid-cols-[54px_minmax(0,1fr)] ${
           active.needsDaniel ? "!border-amber/35 hover:!border-amber/60" : "!border-cyan/30 hover:!border-cyan/60"
         }`}
       >
@@ -942,7 +942,7 @@ function CompactLiveWorkBubbleView({
           </span>
         </span>
 
-        <span className="flex min-w-[34px] flex-col items-end gap-1" aria-hidden="true">
+        <span className="flex min-w-[34px] flex-col items-end gap-1 max-[340px]:hidden" aria-hidden="true">
           <span className={`max-w-[52px] truncate font-mono text-[8px] uppercase tracking-[0.1em] sm:max-w-[72px] ${active.needsDaniel ? "text-amber" : "text-cyan"}`} title={stage}>{stage}</span>
           <span className="rounded-full border border-white/10 bg-white/[0.025] px-1.5 py-0.5 font-mono text-[8px] text-slate">
             {openWorkCount} open

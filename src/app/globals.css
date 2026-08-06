@@ -378,8 +378,8 @@ body {
 }
 .work-progress-update { animation: work-progress-update .38s cubic-bezier(.22, 1, .36, 1) both; }
 @keyframes work-progress-update {
-  from { opacity: .15; transform: translateY(3px); filter: blur(1px); }
-  to { opacity: 1; transform: translateY(0); filter: blur(0); }
+  from { opacity: .25; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 .work-progress-glint { position: relative; overflow: hidden; }
 .work-progress-glint::after {
