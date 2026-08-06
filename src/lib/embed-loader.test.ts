@@ -203,6 +203,27 @@ describe("Project Hub Jarvis loader", () => {
     expect(harness.messages).toContainEqual({ jarvis: "host-command", text: "open the bitcoin chart" });
   });
 
+  it("closes the mobile overlay immediately when the embedded X requests hide", () => {
+    const harness = createLoader();
+    harness.window.JARVIS.show();
+    expect(harness.window.JARVIS.visible).toBe(true);
+    expect(harness.frame.style.pointerEvents).toBe("auto");
+
+    harness.listeners.get("message")?.[0]?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "hide" },
+    });
+
+    expect(harness.window.JARVIS.visible).toBe(false);
+    expect(harness.frame.style).toMatchObject({
+      opacity: "0",
+      pointerEvents: "none",
+      transform: "translateY(14px)",
+    });
+    expect(harness.messages).toContainEqual({ jarvis: "host-hide" });
+  });
+
   it("proactively sends route-aware host context when the iframe is ready", () => {
     const harness = createLoader();
     harness.listeners.get("message")?.[0]?.({
