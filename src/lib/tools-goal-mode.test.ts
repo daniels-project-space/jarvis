@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
@@ -56,7 +56,27 @@ describe("goal_mode exact source admission", () => {
     mock.resolveProjectSourceAdmission.mockResolvedValue(projectAdmission);
     mock.v2AdmissionEnabled.mockReturnValue(true);
     mock.wakeAgentFleet.mockResolvedValue(true);
+    const now = Date.now();
+    const templateDigest = "e".repeat(64);
+    vi.stubEnv("JARVIS_CLOUD_WORKSPACE_PROVIDER", "sandbox0");
+    vi.stubEnv("JARVIS_CLOUD_WORKSPACE_TEMPLATE", "node22-codex-0.144.5");
+    vi.stubEnv("JARVIS_CLOUD_WORKSPACE_TEMPLATE_DIGEST", templateDigest);
+    vi.stubEnv("JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID", "20260806.9");
+    vi.stubEnv("JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT", JSON.stringify({
+      keyId: "current",
+      signature: "f".repeat(64),
+      receipt: {
+        schemaVersion: 1,
+        provider: "sandbox0",
+        deploymentId: "20260806.9",
+        template: { identity: "node22-codex-0.144.5", digest: templateDigest },
+        probeTime: now - 60_000,
+        expiresAt: now + 60 * 60_000,
+      },
+    }));
   });
+
+  afterEach(() => vi.unstubAllEnvs());
 
   it("exposes the exact branch parameter in the owner tool contract", () => {
     const definition = TOOL_DEFS.find((candidate) => candidate.name === "goal_mode") as unknown as {
@@ -128,6 +148,24 @@ describe("goal_mode exact source admission", () => {
 
     expect(result).toContain("did not create a mission");
     expect(result).toContain("source-ref observation failed (404)");
+    expect(mock.convexMutation).not.toHaveBeenCalled();
+    expect(mock.wakeAgentFleet).not.toHaveBeenCalled();
+  });
+
+  it("refuses v2 admission before source observation or dispatch when provider evidence is absent", async () => {
+    vi.stubEnv("JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT", "");
+
+    const result = await executeTool("goal_mode", {
+      action: "start",
+      goal: "Overhaul YouTube Studio from the exact ready branch",
+      repo: "daniels-project-space/youtube-studio-ai",
+      source_branch: "agent/youtube-autonomy-production",
+    });
+
+    expect(result).toContain("temporarily unavailable");
+    expect(result).toContain("No mission or Trigger worker was started");
+    expect(mock.resolveProjectSourceAdmission).not.toHaveBeenCalled();
+    expect(mock.convexQuery).not.toHaveBeenCalled();
     expect(mock.convexMutation).not.toHaveBeenCalled();
     expect(mock.wakeAgentFleet).not.toHaveBeenCalled();
   });

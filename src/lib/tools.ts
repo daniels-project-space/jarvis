@@ -5,6 +5,7 @@ import { r2Put, r2StoreFromUrl } from "./r2";
 import type { ManagedMission } from "../mastra/supervisor";
 import { withAdminSession } from "./control-context";
 import { wakeAgentFleet } from "./agent-fleet-dispatch";
+import { cloudProviderAdmissionReadiness } from "./cloud-provider-admission";
 import { SHALLOW_PROVENANCE_RULE } from "./git-delivery";
 import { workModelLabel, workModelPriority } from "./work-models";
 import { exactTextWorkOrder } from "./work-order";
@@ -3245,13 +3246,18 @@ export async function executeTool(
       }
       const { routeGoal } = await import("./goal-mode");
       const route = routeGoal(goal, args.repo ? String(args.repo) : undefined);
-      const originThreadId = await activeThread();
       const protocolV2 = v2AdmissionEnabled();
       if (requestedSourceBranch !== undefined && !protocolV2) {
         return "Explicit source branch requires the v2 mission protocol; no mission was created.";
       }
       if (requestedSourceBranch !== undefined && !route.primaryRepo) {
         return "Explicit source branch requires a routed repository; no mission was created.";
+      }
+      if (protocolV2) {
+        const readiness = cloudProviderAdmissionReadiness(process.env);
+        if (!readiness.ready) {
+          return `Goal Mode is temporarily unavailable because secure workspace readiness evidence is ${readiness.code.replaceAll("_", " ")}. No mission or Trigger worker was started; retry after the provider rollout is repaired.`;
+        }
       }
       let projectAdmission: ProjectSourceAdmission | undefined;
       if (protocolV2) {
@@ -3262,6 +3268,7 @@ export async function executeTool(
           return `Goal Mode did not create a mission because exact source admission failed: ${reason.slice(0, 240)}.`;
         }
       }
+      const originThreadId = await activeThread();
       const created = await convexMutation(admissionMutationName("goal"), {
         authTokenHash,
         goal,

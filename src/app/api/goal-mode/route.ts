@@ -1,5 +1,6 @@
 import type { NextRequest } from "next/server";
 import { wakeAgentFleet } from "@/lib/agent-fleet-dispatch";
+import { cloudProviderAdmissionReadiness } from "@/lib/cloud-provider-admission";
 import { controlMutation, controlQuery } from "@/lib/control-session";
 import { routeGoal } from "@/lib/goal-mode";
 import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
@@ -36,6 +37,21 @@ export async function POST(req: NextRequest) {
       ok: false,
       error: "Explicit source branch requires a routed repository.",
     }, { status: 400 });
+  }
+  if (protocolV2) {
+    const readiness = cloudProviderAdmissionReadiness(process.env);
+    if (!readiness.ready) {
+      return Response.json({
+        ok: false,
+        code: "cloud_provider_not_ready",
+        reason: readiness.code,
+        retryable: true,
+        error: "Goal Mode is temporarily unavailable because secure workspace readiness evidence is missing, expired, or does not match the deployed worker. No mission or Trigger worker was started.",
+      }, {
+        status: 503,
+        headers: { "cache-control": "no-store", "retry-after": "60" },
+      });
+    }
   }
   let projectAdmission;
   if (protocolV2) {
