@@ -17,7 +17,7 @@ export class StreamPublisher {
 
   constructor(
     private readonly publish: (text: string, revision: number) => Promise<unknown>,
-    private readonly intervalMs = 120,
+    private readonly intervalMs = 350,
     private readonly onFirstPublished?: () => void,
   ) {}
 
@@ -29,6 +29,10 @@ export class StreamPublisher {
   push(delta: string) {
     if (this.closed || !delta) return;
     this.text += delta;
+    // Paint the first token immediately, then coalesce subsequent snapshots.
+    // This keeps perceived latency low without invalidating Convex subscribers
+    // eight times per second for the rest of the answer.
+    if (this.revision === 0) void this.flush();
   }
 
   flush(): Promise<void> {

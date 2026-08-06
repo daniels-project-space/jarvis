@@ -44,7 +44,12 @@
   var SPEAKER_TAIL_MS = 800;
 
   var f = document.createElement("iframe");
-  f.src = ORIGIN + "/embed" + (release ? "?v=" + encodeURIComponent(release) : "");
+  // Referrer and ancestorOrigins can be absent on mobile/privacy-hardened
+  // browsers. The iframe validates this declared origin against Jarvis's
+  // registered production apps and still checks every MessageEvent.origin.
+  var frameQuery = (release ? "v=" + encodeURIComponent(release) + "&" : "")
+    + "hostOrigin=" + encodeURIComponent(location.origin);
+  f.src = ORIGIN + "/embed?" + frameQuery;
   f.title = "JARVIS";
   f.allow = "microphone; autoplay; clipboard-write; display-capture";
   f.style.cssText =

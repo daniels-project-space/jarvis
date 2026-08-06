@@ -47,6 +47,13 @@ export function startWake(
     if (!wanted) return;
     const r = new SR();
     rec = r;
+    let restartScheduled = false;
+    const restart = () => {
+      if (restartScheduled || !wanted) return;
+      restartScheduled = true;
+      if (rec === r) rec = null;
+      setTimeout(spin, WAKE_RESTART_DELAY_MS);
+    };
     r.lang = "en-GB";
     r.continuous = true;
     r.interimResults = true;
@@ -102,7 +109,7 @@ export function startWake(
         // SpeechRecognition ends its own sessions periodically. Keep the UI
         // logically active across the tiny respawn gap instead of flashing the
         // microphone off/on every few seconds.
-        setTimeout(spin, WAKE_RESTART_DELAY_MS);
+        restart();
         return;
       }
       onState?.(false);
@@ -111,14 +118,23 @@ export function startWake(
       // "not-allowed" = mic permission denied — stop trying
       if (e?.error === "not-allowed" || e?.error === "service-not-allowed") {
         wanted = false;
+        if (rec === r) rec = null;
         onState?.(false);
+        return;
       }
+      // Network/audio recognizer failures are transient. Abort this instance
+      // and replace it once; `restartScheduled` prevents onerror+onend from
+      // spawning two recognizers.
+      try { r.abort?.(); } catch { /* already ended */ }
+      restart();
     };
     try {
       r.start();
       onState?.(true);
     } catch {
-      /* already started */
+      if (rec === r) rec = null;
+      wanted = false;
+      onState?.(false);
     }
   };
   spin();

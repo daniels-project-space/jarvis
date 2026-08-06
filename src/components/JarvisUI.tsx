@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { usePaginatedQuery } from "convex/react";
 import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
+import type { Id } from "../../convex/_generated/dataModel";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
 import { primeMicrophone, readJarvisPermissions, type JarvisPermissionState } from "@/lib/permissions";
@@ -41,12 +42,16 @@ import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent
 import { needsHostContext, visibleTurnText, withHostContext, type JarvisHostContext } from "@/lib/host-context";
 import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actions";
 import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
-import { viewerFetch } from "@/lib/viewer-request";
+import { viewerFetch, viewerFetchWithTimeout } from "@/lib/viewer-request";
 import { normalizeIncidentSignature } from "@/lib/incident-signature";
 import { isForegroundBusy } from "@/lib/foreground-state";
 import { FleetCommandCenter } from "./CompactWorkBar";
 import { isGuestViewerSession, useViewerSession } from "@/lib/viewer-session";
 import { GuestSafeAttachment } from "./GuestSafeAttachment";
+import { FOREGROUND_AUTO_RECOVERY_MS, foregroundTurnPhase, latestRecoverableForegroundTurn } from "@/lib/foreground-recovery";
+import { advanceFinalDelivery, type FinalDeliveryCursor } from "@/lib/final-delivery";
+import { withClientDeadline } from "@/lib/client-deadline";
+import { resolveTrustedJarvisEmbedOrigin } from "@/lib/embed-origin";
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -1107,7 +1112,51 @@ function SpokenCaption({ caption }: { caption: NonNullable<Caption> }) {
 export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const orbMotionRef = useRef<OrbMotionFrame>(createOrbMotionFrame());
   const viewerToken = useViewerSession();
-  const guest = isGuestViewerSession(viewerToken);
+  const [parentOrigin, setParentOrigin] = useState<string | null>(null);
+  const [embedOriginReady, setEmbedOriginReady] = useState(!embedded);
+  useEffect(() => {
+    if (!embedded) {
+      setParentOrigin(null);
+      setEmbedOriginReady(true);
+      return;
+    }
+    setParentOrigin(resolveTrustedJarvisEmbedOrigin({
+      declaredOrigin: new URLSearchParams(window.location.search).get("hostOrigin"),
+      referrer: document.referrer,
+      ancestorOrigin: window.location.ancestorOrigins?.[0] ?? null,
+    }));
+    setEmbedOriginReady(true);
+  }, [embedded]);
+  // An owner cookie must never upgrade an iframe on an arbitrary website.
+  // Untrusted embeds remain a locked guest surface and cannot query private
+  // messages, panels, host actions, or request storage access.
+  const guest = isGuestViewerSession(viewerToken) || (embedded && !parentOrigin);
+  const postToParent = (message: Record<string, unknown>) => {
+    if (!embedded || !parentOrigin || window.parent === window) return;
+    window.parent.postMessage(message, parentOrigin);
+  };
+  const hideEmbedded = () => {
+    if (!embedded || window.parent === window) return;
+    // `hide` carries no owner data. Keeping this one command available even
+    // to a locked/unregistered host ensures its close button cannot trap a
+    // mobile user, while all sensitive traffic still requires a trusted origin.
+    window.parent.postMessage({ jarvis: "hide" }, parentOrigin ?? "*");
+  };
+  const connectEmbeddedOwner = async () => {
+    if (!parentOrigin) return;
+    const storageDocument = document as Document & { requestStorageAccess?: () => Promise<void> };
+    if (!storageDocument.requestStorageAccess) {
+      window.open(window.location.origin, "_blank", "noopener,noreferrer");
+      showCaption({ who: "jarvis", text: "Open Jarvis in the new tab once, then return here to connect owner tools." });
+      return;
+    }
+    try {
+      await storageDocument.requestStorageAccess();
+      window.location.reload();
+    } catch {
+      showCaption({ who: "jarvis", text: "Owner tools are still locked. Open Jarvis directly, sign in, then tap connect again." });
+    }
+  };
   useEffect(() => {
     if (!embedded) return;
     document.documentElement.classList.add("jarvis-embedded-document");
@@ -1156,9 +1205,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     void submit(command);
   }
   const fullMessages = useJarvisQuery(api.chatQueue.listMessages, embedded ? "skip" : { threadId: thread });
-  const embeddedMessages = useJarvisQuery(api.chatQueue.listRecentMessages, embedded ? { threadId: thread } : "skip");
+  const embeddedMessages = useJarvisQuery(
+    api.chatQueue.listRecentMessages,
+    embedded && parentOrigin ? { threadId: thread } : "skip",
+  );
   const messages = ((embedded ? embeddedMessages : fullMessages) ?? []) as Msg[];
-  const remotePanel = useJarvisQuery(api.ui.getPanel, embedded || guest ? "skip" : {}) as
+  const messagesHydrated = (embedded ? embeddedMessages : fullMessages) !== undefined;
+  const remotePanel = useJarvisQuery(api.ui.getPanel, guest ? "skip" : {}) as
     | StagePanel
     | null
     | undefined;
@@ -1188,7 +1241,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const setLiveOn = (args: Record<string, unknown>) => privateMutation<boolean>("ui:setLiveOn", args);
   const voiceRow = useJarvisQuery(api.ui.getVoice, guest ? "skip" : {}) as { value: string; updatedAt: number } | null | undefined;
   const liveOnRow = useJarvisQuery(api.ui.getLiveOn, guest ? "skip" : {}) as { value: string; updatedAt: number } | null | undefined;
-  const hostActionRow = useJarvisQuery(api.ui.getHostAction, embedded ? {} : "skip") as
+  const hostActionRow = useJarvisQuery(api.ui.getHostAction, embedded && !guest ? {} : "skip") as
     | { value: string; updatedAt: number }
     | null
     | undefined;
@@ -1219,8 +1272,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (latest._id === lastHostNotificationId.current) return;
     lastHostNotificationId.current = latest._id;
     if (Date.now() - latest.createdAt > 60_000) return;
-    window.parent.postMessage({ jarvis: "notify", text: sanitizeAssistantText(latest.text).slice(0, 240) }, "*");
-  }, [embedded, messages]);
+    postToParent({ jarvis: "notify", text: sanitizeAssistantText(latest.text).slice(0, 240) });
+  }, [embedded, messages, parentOrigin]);
   const lastRelayedHostAction = useRef<string | null>(null);
   useEffect(() => {
     if (!embedded || !hostActionRow || Date.now() - hostActionRow.updatedAt > 20_000) return;
@@ -1241,8 +1294,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       /* private mode */
     }
     lastRelayedHostAction.current = id;
-    window.parent.postMessage({ jarvis: "host-action", action: { ...action, id } }, "*");
-  }, [embedded, hostActionRow]);
+    postToParent({ jarvis: "host-action", action: { ...action, id } });
+  }, [embedded, hostActionRow, parentOrigin]);
 
   const [input, setInput] = useState("");
   const [speaking, setSpeaking] = useState(false);
@@ -1263,12 +1316,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const [live, setLive] = useState<"off" | "connecting" | "live">("off");
   useEffect(() => {
     if (!embedded || window.parent === window) return;
-    window.parent.postMessage({ jarvis: speaking ? "speech-start" : "speech-end" }, "*");
-  }, [embedded, speaking]);
+    postToParent({ jarvis: speaking ? "speech-start" : "speech-end" });
+  }, [embedded, speaking, parentOrigin]);
   useEffect(() => {
     if (!embedded || window.parent === window) return;
-    window.parent.postMessage({ jarvis: live === "off" ? "live-end" : "live-start" }, "*");
-  }, [embedded, live]);
+    postToParent({ jarvis: live === "off" ? "live-end" : "live-start" });
+  }, [embedded, live, parentOrigin]);
   const [caption, setCaption] = useState<Caption>(null);
   // Soft dismiss: mark the caption `exiting` so it fades out slowly (CSS), then
   // unmount after the fade. A fresh caption cancels a pending fade.
@@ -1362,7 +1415,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }, [panel]);
 
   const endRef = useRef<HTMLDivElement>(null);
-  const lastSpokenId = useRef<string | null>(null);
+  const finalDeliveryCursor = useRef<FinalDeliveryCursor>({ threadId: "", initialized: false, lastMessageId: null });
   const lastSpokenText = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
   const streamingSpeechRef = useRef<StreamingSpeechState>({
     id: "",
@@ -1400,7 +1453,30 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   };
   const lastSent = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
   const durableStartedAt = useRef<number | null>(null);
+  const activeDurableTurn = useRef<{
+    messageId: Id<"chatMessages">;
+    threadId: string;
+    text: string;
+    visibleText: string;
+  } | null>(null);
+  const durableSubmissionInFlight = useRef(false);
+  const lastSubmittedParentId = useRef<string | undefined>(undefined);
+  const durableRecoveryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const durableAutoRecoveries = useRef(0);
+  const [durableRecovery, setDurableRecovery] = useState<
+    "idle" | "waiting" | "delayed" | "recovering" | "failed" | "terminal"
+  >("idle");
+  const [durableTurnEpoch, setDurableTurnEpoch] = useState(0);
+  const activeTurnStatus = useJarvisQuery(
+    api.chatQueue.turnStatus,
+    activeDurableTurn.current
+      ? { messageId: activeDurableTurn.current.messageId, threadId: activeDurableTurn.current.threadId }
+      : "skip",
+  ) as {
+    assistant: { _id: string; status: string; text: string; parentMessageId: string } | null;
+  } | null | undefined;
   const [wake, setWake] = useState(false);
+  const embeddedEndRef = useRef<HTMLDivElement>(null);
   const [panelFull, setPanelFull] = useState(false);
   const panelFullRef = useRef(false);
   useEffect(() => {
@@ -1631,7 +1707,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     unlockSpeechPlayback();
     // Show the Hub overlay and begin the neural voice load immediately, while
     // SpeechRecognition is still collecting a same-breath command.
-    if (embedded) window.parent.postMessage({ jarvis: "wake" }, "*");
+    if (embedded) postToParent({ jarvis: "wake" });
     void import("../lib/tts").then((module) => module.warm());
   };
   const onWake = (transcript: string) => {
@@ -1665,7 +1741,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     import("../lib/wakeword").then((m) => {
       if (!m.wakeSupported()) return;
       m.startWake(onWake, (listening) => setWake(listening), onWakeDetected);
-      setWake(true);
     });
   };
   function toggleWake() {
@@ -1692,7 +1767,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     import("../lib/wakeword").then((m) => {
       if (!m.wakeSupported() || liveRef.current) return;
       m.startWake(onWake, (listening) => setWake(listening), onWakeDetected);
-      setWake(true);
     });
     return () => {
       if (!wakeIsEnabled()) {
@@ -1724,7 +1798,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => {
     if (!embedded || !activeThreadReady) return;
     const receiveHostMessage = (event: MessageEvent) => {
-      if (event.source !== window.parent) return;
+      if (event.source !== window.parent || !parentOrigin || event.origin !== parentOrigin) return;
       const message = event.data ?? {};
       if (message.jarvis === "host-show") setChatMode("off", false);
       if (message.jarvis === "host-hide" && liveRef.current) void toggleLive();
@@ -1761,10 +1835,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       }
     };
     window.addEventListener("message", receiveHostMessage);
-    window.parent.postMessage({ jarvis: "ready" }, "*");
+    postToParent({ jarvis: "ready" });
     return () => window.removeEventListener("message", receiveHostMessage);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeThreadReady, embedded]);
+  }, [activeThreadReady, embedded, parentOrigin]);
 
   useEffect(() => {
     me.current = clientId();
@@ -1864,6 +1938,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }, [messages.length, messages[messages.length - 1]?.text, caption?.text]);
 
   useEffect(() => {
+    if (!embedded) return;
+    embeddedEndRef.current?.scrollIntoView?.({ block: "end", behavior: "smooth" });
+  }, [embedded, messages.length, messages[messages.length - 1]?.text]);
+
+  useEffect(() => {
     void registerSW().then(() => {
       if (typeof Notification !== "undefined" && Notification.permission === "granted") {
         void subscribePush(saveSub).then(() => refreshPermissions());
@@ -1928,7 +2007,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }, []);
 
   // Speak new finalized assistant messages with the one streamed neural voice.
-  const lastSpokenThread = useRef<string>("");
   useEffect(() => {
     const latestAssistant = [...messages].reverse().find((message) => message.role === "assistant" && message.delivery !== "notification");
     if (latestAssistant?.status !== "streaming" || !latestAssistant.text) return;
@@ -1986,19 +2064,81 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }, [messages]);
 
   useEffect(() => {
+    if (!messagesHydrated) return;
+    if (activeDurableTurn.current?.threadId !== thread) {
+      activeDurableTurn.current = null;
+      if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
+      durableRecoveryTimer.current = null;
+      setSending(false);
+      setDurableRecovery("idle");
+    }
+    if (activeDurableTurn.current) return;
+    const recoverable = latestRecoverableForegroundTurn(messages.map((message) => ({
+      id: message._id,
+      role: message.role,
+      status: message.status,
+      text: message.text,
+      parentMessageId: message.parentMessageId,
+    })));
+    if (!recoverable) return;
+    activeDurableTurn.current = {
+      messageId: recoverable.messageId as Id<"chatMessages">,
+      threadId: thread,
+      text: recoverable.text,
+      visibleText: visibleTurnText(recoverable.text),
+    };
+    lastSubmittedParentId.current = recoverable.messageId;
+    durableAutoRecoveries.current = 0;
+    setSending(true);
+    setDurableRecovery("waiting");
+    setDurableTurnEpoch((value) => value + 1);
+    armDurableRecoveryWatchdog();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messagesHydrated, messages, thread]);
+
+  useEffect(() => {
+    const active = activeDurableTurn.current;
+    if (!active || active.threadId !== thread) return;
+    const state = foregroundTurnPhase(
+      activeTurnStatus?.assistant ? [{ ...activeTurnStatus.assistant, role: "assistant" }] : messages,
+      active.messageId,
+    );
+    if (state.phase === "queued") return;
+
+    if (state.phase === "streaming") {
+      if (state.text) setDurableRecovery("waiting");
+      return;
+    }
+
+    durableStartedAt.current = null;
+    if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
+    durableRecoveryTimer.current = null;
+    if (state.phase === "done") {
+      activeDurableTurn.current = null;
+      setDurableRecovery("idle");
+      setSending(false);
+      return;
+    }
+    setSending(true);
+    setDurableRecovery("failed");
+    if (state.text) showCaption({ who: "jarvis", text: state.text, phase: "ready" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTurnStatus, messages, thread, durableTurnEpoch]);
+
+  useEffect(() => () => {
+    if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
+  }, []);
+
+  useEffect(() => {
     const last = [...messages].reverse().find((m) => m.role === "assistant" && m.delivery !== "notification" && m.status === "done" && m.text);
-    // hopping threads must never re-voice that thread's old last reply
-    if (lastSpokenThread.current !== thread) {
-      lastSpokenThread.current = thread;
-      lastSpokenId.current = last?._id ?? null;
-      return;
-    }
-    if (!last || last._id === lastSpokenId.current) return;
-    if (lastSpokenId.current === null) {
-      lastSpokenId.current = last._id; // don't re-speak history on page load
-      return;
-    }
-    lastSpokenId.current = last._id;
+    const delivery = advanceFinalDelivery(finalDeliveryCursor.current, {
+      threadId: thread,
+      hydrated: messagesHydrated,
+      latest: last ? { id: last._id, parentMessageId: last.parentMessageId } : null,
+      activeParentMessageId: lastSubmittedParentId.current,
+    });
+    finalDeliveryCursor.current = delivery.cursor;
+    if (!delivery.deliver || !last) return;
     if (!last.text) return;
     if (isToolGarbage(last.text) && !sanitizeAssistantText(last.text)) return;
     // never say the exact same thing twice in a row (root of "sends results twice")
@@ -2058,7 +2198,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       };
       const timer = window.setTimeout(() => finish(hostContextRef.current), 120);
       window.addEventListener("message", receive);
-      window.parent.postMessage({ jarvis: "context-request", id }, "*");
+      postToParent({ jarvis: "context-request", id });
     });
   }
 
@@ -2081,29 +2221,55 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         window.clearTimeout(timer);
         resolve(result);
       });
-      window.parent.postMessage({ jarvis: "host-action", action: payload }, "*");
+      postToParent({ jarvis: "host-action", action: payload });
     });
   }
 
   async function queueDurableTurn(text: string, visibleText = text) {
+    if (durableSubmissionInFlight.current || activeDurableTurn.current) return;
+    durableSubmissionInFlight.current = true;
     durableStartedAt.current = performance.now();
     setSending(true);
     showCaption({ who: "you", text: visibleText });
     try {
-      const response = await viewerFetch("/api/chat", {
+      const requestId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const request = {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           threadId: threadRef.current,
           text,
-          requestId: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          requestId,
         }),
-      });
+      } satisfies RequestInit;
+      // A single same-ID retry resolves the ambiguous "Convex committed but
+      // the HTTP response was lost" case without creating a duplicate turn.
+      let response: Response;
+      try {
+        response = await viewerFetchWithTimeout("/api/chat", request, 15_000);
+      } catch {
+        response = await viewerFetchWithTimeout("/api/chat", request, 15_000);
+      }
       if (!response.ok) throw new Error(`conversation queue rejected (${response.status})`);
-      // The streaming-message effect owns `sending=false`. Keeping it true
-      // closes the old request/subscription gap where the orb flashed idle.
+      const result = await response.json() as { messageId?: string };
+      if (!result.messageId) throw new Error("conversation queue returned no turn identity");
+      activeDurableTurn.current = {
+        messageId: result.messageId as Id<"chatMessages">,
+        threadId: threadRef.current,
+        text,
+        visibleText,
+      };
+      durableSubmissionInFlight.current = false;
+      lastSubmittedParentId.current = result.messageId;
+      durableAutoRecoveries.current = 0;
+      setDurableTurnEpoch((value) => value + 1);
+      setDurableRecovery("waiting");
+      armDurableRecoveryWatchdog();
+      // The terminal-message effect owns `sending=false`. Serializing the
+      // foreground lane keeps every retry bound to the exact turn it repairs.
       return;
     } catch (error) {
+      durableSubmissionInFlight.current = false;
       durableStartedAt.current = null;
       document.documentElement.dataset.jarvisConversationFailure = String(error).slice(0, 160);
       showCaption({
@@ -2113,6 +2279,74 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       });
       setSending(false);
     }
+  }
+
+  function armDurableRecoveryWatchdog() {
+    if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
+    durableRecoveryTimer.current = null;
+    if (!activeDurableTurn.current) return;
+    if (durableAutoRecoveries.current >= 3) {
+      setDurableRecovery("terminal");
+      setSending(true);
+      return;
+    }
+    durableRecoveryTimer.current = setTimeout(() => {
+      durableRecoveryTimer.current = null;
+      durableAutoRecoveries.current += 1;
+      void requestDurableRecovery(false);
+    }, FOREGROUND_AUTO_RECOVERY_MS);
+  }
+
+  async function requestDurableRecovery(manual: boolean) {
+    const active = activeDurableTurn.current;
+    if (!active) return;
+    if (manual) durableAutoRecoveries.current = 0;
+    setDurableRecovery("recovering");
+    try {
+      const response = await viewerFetchWithTimeout("/api/chat/recover", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ messageId: active.messageId, threadId: active.threadId }),
+      }, 12_000);
+      if (response.status === 409) {
+        if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
+        durableRecoveryTimer.current = null;
+        setDurableRecovery("terminal");
+        setSending(true);
+        return;
+      }
+      if (!response.ok) throw new Error(`conversation recovery rejected (${response.status})`);
+      const result = await response.json() as { recovery?: string };
+      if (result.recovery === "completed") {
+        activeDurableTurn.current = null;
+        if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
+        durableRecoveryTimer.current = null;
+        setDurableRecovery("idle");
+        setSending(false);
+      } else if (result.recovery === "active") {
+        setDurableRecovery("delayed");
+        armDurableRecoveryWatchdog();
+      } else {
+        setDurableRecovery("recovering");
+        setSending(true);
+        armDurableRecoveryWatchdog();
+      }
+    } catch (error) {
+      document.documentElement.dataset.jarvisRecoveryFailure = String(error).slice(0, 160);
+      setDurableRecovery(manual ? "failed" : "delayed");
+      setSending(true);
+      armDurableRecoveryWatchdog();
+    }
+  }
+
+  function retryDurableTurn() {
+    const active = activeDurableTurn.current;
+    if (!active) return;
+    activeDurableTurn.current = null;
+    if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
+    durableRecoveryTimer.current = null;
+    setDurableRecovery("idle");
+    void queueDurableTurn(active.text, active.visibleText);
   }
 
   async function openFastAgentDispatch(intent: FastAgentDispatch, requestedText: string) {
@@ -2268,6 +2502,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   async function submit(text: string) {
     const t = text.trim();
     if (!t) return;
+    if (durableSubmissionInFlight.current || activeDurableTurn.current) {
+      showCaption({ who: "jarvis", text: "I’m finishing the current reply first. You can recover or retry it from the status bar." });
+      return;
+    }
     // Typed/button calls reach this inside a user gesture. Live/STT calls have
     // already been primed by the control that opened the microphone.
     unlockSpeechPlayback();
@@ -2466,6 +2704,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }
 
   function endFreeVoiceSession() {
+    liveSessionEpoch.current += 1;
     freeLoop.current = false;
     cancelFreeRearm();
     if (liveRef.current) {
@@ -2479,6 +2718,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }
 
   async function toggleLive(forceStart = false, captureImmediately = true): Promise<boolean> {
+    const sessionEpoch = ++liveSessionEpoch.current;
     if (!forceStart && (liveRef.current || live !== "off")) {
       freeLoop.current = false;
       cancelFreeRearm();
@@ -2495,24 +2735,50 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // network round-trip. Otherwise the wake mic visibly closes while Convex
     // elects the live owner, then opens again a moment later.
     const { stopWake } = await import("../lib/wakeword");
+    if (sessionEpoch !== liveSessionEpoch.current) return false;
     stopWake();
     setWake(false);
     freeLoop.current = true;
     liveRef.current = true;
     setLive("connecting");
     const microphone = ensurePersistentLiveMic().then(() => true, () => false);
-    const ownership = setLiveOn({ client: me.current, on: true }).catch(() => true);
-    const owned = await ownership;
+    const ownership = setLiveOn({ client: me.current, on: true });
+    let owned = false;
+    try {
+      owned = await withClientDeadline(ownership, 5_000, "live ownership");
+    } catch {
+      // A late successful claim must not leave a ghost live owner after this
+      // UI has already recovered to standby.
+      void ownership.then((claimed) => {
+        if (claimed && !liveRef.current) void setLiveOn({ client: me.current, on: false }).catch(() => {});
+      }, () => undefined);
+    }
+    if (sessionEpoch !== liveSessionEpoch.current || !liveRef.current) {
+      void microphone.then((opened) => { if (opened && !liveRef.current) closePersistentLiveMic(); });
+      if (owned && !liveRef.current) void setLiveOn({ client: me.current, on: false }).catch(() => {});
+      return false;
+    }
     if (owned === false) {
       freeLoop.current = false;
       liveRef.current = false;
       setLive("off");
       closePersistentLiveMic();
-      showCaption({ who: "jarvis", text: "Jarvis is already live on another device." });
+      void microphone.then((opened) => { if (opened && !liveRef.current) closePersistentLiveMic(); });
+      showCaption({ who: "jarvis", text: "I could not start live listening. Check the connection, then tap the mic to retry." });
       rearmWake();
       return false;
     }
-    if (!(await microphone)) {
+    let microphoneReady = false;
+    try {
+      microphoneReady = await withClientDeadline(microphone, 10_000, "microphone startup");
+    } catch {
+      void microphone.then((opened) => { if (opened && !liveRef.current) closePersistentLiveMic(); });
+    }
+    if (sessionEpoch !== liveSessionEpoch.current || !liveRef.current) {
+      if (microphoneReady && !liveRef.current) closePersistentLiveMic();
+      return false;
+    }
+    if (!microphoneReady) {
       freeLoop.current = false;
       liveRef.current = false;
       setLive("off");
@@ -2523,6 +2789,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     void ownVoice();
     import("../lib/tts").then((m) => m.stopSpeaking());
+    if (sessionEpoch !== liveSessionEpoch.current || !liveRef.current) return false;
     setLive("live");
     void refreshPermissions();
     if (liveBeat.current) clearInterval(liveBeat.current);
@@ -2532,6 +2799,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }
 
   useEffect(() => () => {
+    liveSessionEpoch.current += 1;
+    liveRef.current = false;
     cancelFreeRearm();
     closePersistentLiveMic();
   }, []);
@@ -2698,7 +2967,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         const speechSpanMs = evidence.voiceStartedAt
           ? Math.max(0, evidence.lastVoice - evidence.voiceStartedAt)
           : 0;
-        const response = await viewerFetch("/api/stt", {
+        const response = await viewerFetchWithTimeout("/api/stt", {
           method: "POST",
           headers: {
             "content-type": mime,
@@ -2709,7 +2978,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           },
           body: blob,
           signal: controller.signal,
-        });
+        }, 30_000);
         if (!response.ok) throw new Error(`STT failed (${response.status})`);
         const payload = await response.json();
         return String(payload?.text ?? "").trim();
@@ -2884,6 +3153,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       if (!aborted) {
         document.documentElement.dataset.jarvisVoiceRecovery = String(error).slice(0, 160);
         closePersistentLiveMic();
+        showCaption({ who: "jarvis", text: "I could not transcribe that. I’m reopening the microphone—please try again." });
       }
     } finally {
       pendingSttController?.abort();
@@ -2987,52 +3257,165 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const fullBleed = overlayUp && (panelFull || !panelRoute?.keepOrbVisible);
   const compactAside = overlayUp && !fullBleed && panel!.type !== "video";
 
+  if (embedded && !parentOrigin) {
+    return (
+      <div data-jarvis-embed-locked className="relative grid h-dvh w-full place-items-center overflow-hidden bg-[#05070d] p-8 text-center">
+        <button
+          type="button"
+          onClick={hideEmbedded}
+          aria-label="Close Jarvis"
+          className="absolute right-3 top-3 z-20 grid h-9 w-9 place-items-center rounded-full bg-black/35 text-xl text-white/60 ring-1 ring-white/10"
+        >
+          ×
+        </button>
+        <p className="max-w-xs text-sm leading-relaxed text-slate">
+          {embedOriginReady
+            ? "Jarvis owner tools are locked on this host. Open Jarvis from one of Daniel's registered apps."
+            : "Connecting Jarvis…"}
+        </p>
+      </div>
+    );
+  }
+
   if (embedded) {
     return (
       <div
         data-jarvis-embed-surface
         data-voice-state={orbState}
-        className="relative h-dvh w-full overflow-hidden bg-transparent"
+        className="relative flex h-dvh w-full flex-col overflow-hidden bg-[#05070d]"
       >
         <button
           type="button"
           onClick={() => {
             if (liveRef.current) void toggleLive();
-            window.parent.postMessage({ jarvis: "hide" }, "*");
+            hideEmbedded();
           }}
           aria-label="Close Jarvis"
-          className="absolute right-3 top-3 z-40 grid h-8 w-8 place-items-center rounded-full text-lg text-white/35 transition hover:bg-white/[0.06] hover:text-cyan"
+          className="absolute right-3 top-3 z-[70] grid h-9 w-9 place-items-center rounded-full bg-black/35 text-xl text-white/60 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan"
         >
           ×
         </button>
-        <div className="absolute inset-0">
-          <ReactorRing
-            active={live === "live" || orbState === "thinking" || orbState === "listening"}
-            aside={false}
-            hidden={false}
-            motionRef={orbMotionRef}
-            reduceMotion={prefs.reduceMotion}
-          />
-          <ThreeOrb
-            state={orbState}
-            energyRef={energyRef}
-            moodColor={moodColor}
-            motionRef={orbMotionRef}
-            reduceMotion={prefs.reduceMotion}
-          />
+        {guest && (
           <button
             type="button"
-            aria-label={speaking ? "Interrupt Jarvis" : live === "live" ? "Stop Jarvis live listening" : "Start Jarvis live listening"}
-            title={speaking ? "Tap to interrupt" : live === "live" ? "Tap to stop listening" : "Tap to start listening"}
-            onClick={() => speaking ? stopTalking() : void toggleLive()}
-            className="absolute inset-[20%] z-20 rounded-full bg-transparent"
-          />
+            onClick={() => void connectEmbeddedOwner()}
+            className="absolute left-3 top-3 z-[70] rounded-full bg-black/35 px-2.5 py-1 text-[10px] text-slate ring-1 ring-white/10 transition hover:text-cyan"
+            title="Connect your signed-in Jarvis session for private tools and overlays"
+          >
+            connect tools
+          </button>
+        )}
+        <div className="relative min-h-0 flex-[1.15]">
+          {panel && !panelMin ? (
+            <div className="absolute inset-2 z-30 pt-8">
+              <Viewport
+                panel={panel}
+                onClose={closeStage}
+                onMinimize={() => setPanelMin(true)}
+                full={false}
+                onToggleFull={() => setPanelFull((value) => !value)}
+              />
+            </div>
+          ) : (
+            <>
+              <ReactorRing
+                active={live === "live" || orbState === "thinking" || orbState === "listening"}
+                aside={false}
+                hidden={false}
+                motionRef={orbMotionRef}
+                reduceMotion={prefs.reduceMotion}
+              />
+              <ThreeOrb
+                state={orbState}
+                energyRef={energyRef}
+                moodColor={moodColor}
+                motionRef={orbMotionRef}
+                reduceMotion={prefs.reduceMotion}
+              />
+              <button
+                type="button"
+                aria-label={speaking ? "Interrupt Jarvis" : live === "live" ? "Stop Jarvis live listening" : "Start Jarvis live listening"}
+                title={speaking ? "Tap to interrupt" : live === "live" ? "Tap to stop listening" : "Tap to start listening"}
+                onClick={() => speaking ? stopTalking() : void toggleLive()}
+                className="absolute inset-[20%] z-20 rounded-full bg-transparent"
+              />
+            </>
+          )}
           {caption && (
-            <div className="pointer-events-none absolute inset-x-2 top-[67%] z-30 flex justify-center px-3">
+            <div className="pointer-events-none absolute inset-x-2 bottom-2 z-50 flex justify-center px-3">
               <SpokenCaption caption={caption} />
             </div>
           )}
           <span className="sr-only" aria-live="polite">Jarvis is {status}</span>
+        </div>
+
+        <div className="relative z-50 flex min-h-0 flex-1 flex-col border-t border-white/10 bg-black/35 backdrop-blur-md">
+          <div className="scrollbar-thin min-h-0 flex-1 space-y-2 overflow-y-auto px-3 py-2.5">
+            {messages.length === 0 && (
+              <p className="pt-3 text-center text-xs text-slate">Ask Jarvis anything.</p>
+            )}
+            {messages
+              .slice(-8)
+              .map((message) => {
+                if (message.role === "assistant" && message.text && isToolGarbage(message.text)) {
+                  return { ...message, text: sanitizeAssistantText(message.text) };
+                }
+                if (message.role === "user") return { ...message, text: visibleTurnText(message.text) };
+                return message;
+              })
+              .filter((message) => message.text || message.status === "streaming")
+              .map((message) => (
+                <div key={message._id} className={message.role === "user" ? "text-right" : "text-left"}>
+                  <span className={`inline-block max-w-[90%] whitespace-pre-wrap rounded-xl px-3 py-1.5 text-xs leading-relaxed ${
+                    message.role === "user" ? "bg-amber/10 text-amber" : "bg-cyan/[0.08] text-ice"
+                  }`}>
+                    {message.text || (
+                      <span className="typing-dots inline-flex gap-1"><span /><span /><span /></span>
+                    )}
+                  </span>
+                </div>
+              ))}
+            <div ref={embeddedEndRef} aria-hidden="true" />
+          </div>
+          {durableRecovery !== "idle" && durableRecovery !== "waiting" && (
+            <div className="flex items-center justify-between gap-2 border-t border-amber/15 px-3 py-1.5 text-[11px] text-slate">
+              <span>{durableRecovery === "recovering" ? "Reconnecting…" : "Reply delayed or stopped."}</span>
+              <button
+                type="button"
+                onClick={() => durableRecovery === "terminal" ? retryDurableTurn() : void requestDurableRecovery(true)}
+                disabled={durableRecovery === "recovering"}
+                className="rounded border border-amber/30 px-2 py-0.5 text-amber disabled:opacity-40"
+              >
+                {durableRecovery === "terminal" ? "retry" : "recover"}
+              </button>
+            </div>
+          )}
+          <div className="flex gap-2 border-t border-white/10 p-2">
+            <button
+              type="button"
+              onClick={() => speaking ? stopTalking() : void toggleLive()}
+              className={`grid h-9 w-9 shrink-0 place-items-center rounded-xl text-xs ring-1 ${live === "live" ? "bg-cyan/20 text-cyan ring-cyan/40" : "bg-white/5 text-slate ring-white/10"}`}
+              aria-label={live === "live" ? "Stop live listening" : "Start live listening"}
+            >
+              {speaking ? "■" : "●"}
+            </button>
+            <input
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => event.key === "Enter" && submit(input)}
+              placeholder="Message Jarvis…"
+              className="min-w-0 flex-1 rounded-xl bg-black/35 px-3 text-sm text-ice outline-none ring-1 ring-white/10 focus:ring-cyan/50"
+            />
+            <button
+              type="button"
+              onClick={() => void submit(input)}
+              disabled={sending || !input.trim()}
+              className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-cyan/15 text-cyan ring-1 ring-cyan/40 disabled:opacity-40"
+              aria-label="Send message"
+            >
+              ↑
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -3098,7 +3481,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           </button>
           {embedded && (
             <button
-              onClick={() => window.parent.postMessage({ jarvis: "hide" }, "*")}
+              onClick={hideEmbedded}
               title="close Jarvis"
               className="rounded px-1 text-lg leading-none text-slate transition hover:text-cyan"
             >
@@ -3331,6 +3714,28 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             <div ref={endRef} />
           </div>
 
+          {durableRecovery !== "idle" && durableRecovery !== "waiting" && (
+            <div className="flex items-center justify-between gap-3 border-t border-amber/15 bg-amber/[0.04] px-3 py-2 text-xs text-slate">
+              <span>
+                {durableRecovery === "recovering"
+                  ? "Reconnecting this reply…"
+                  : durableRecovery === "terminal"
+                    ? "That reply stopped after recovery attempts."
+                    : durableRecovery === "failed"
+                      ? "That reply stopped before it finished."
+                      : "This reply is taking longer than usual."}
+              </span>
+              <button
+                type="button"
+                onClick={() => durableRecovery === "terminal" ? retryDurableTurn() : void requestDurableRecovery(true)}
+                disabled={durableRecovery === "recovering"}
+                className="shrink-0 rounded-lg border border-amber/30 px-2 py-1 text-amber transition hover:bg-amber/10 disabled:opacity-40"
+              >
+                {durableRecovery === "terminal" ? "retry" : "recover"}
+              </button>
+            </div>
+          )}
+
           {/* composer */}
           <div className="safe-composer flex min-w-0 max-w-full items-stretch gap-1.5 overflow-hidden border-t border-white/5 p-2 sm:gap-2 sm:p-3">
             <button
@@ -3494,6 +3899,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             chatMode === "bar" ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-28 opacity-0"
           }`}
         >
+          {durableRecovery !== "idle" && durableRecovery !== "waiting" && (
+            <div className="mx-auto mb-1 flex w-fit items-center gap-2 rounded-full border border-amber/20 bg-black/75 px-3 py-1 text-[11px] text-slate backdrop-blur">
+              <span>{durableRecovery === "recovering" ? "Reconnecting reply…" : "Reply delayed or stopped."}</span>
+              <button
+                type="button"
+                onClick={() => durableRecovery === "terminal" ? retryDurableTurn() : void requestDurableRecovery(true)}
+                disabled={durableRecovery === "recovering"}
+                className="text-amber disabled:opacity-40"
+              >
+                {durableRecovery === "terminal" ? "retry" : "recover"}
+              </button>
+            </div>
+          )}
           <div className="glass flex min-w-0 max-w-full items-stretch gap-2 overflow-hidden rounded-2xl p-2 shadow-2xl">
             <button
               onClick={() => setChatMode("full")}

@@ -181,7 +181,7 @@ async function pollAds() {
 
 export const businessPoller = schedules.task({
   id: "jarvis-business-poller",
-  cron: "*/30 * * * *",
+  cron: "0 */8 * * *",
   maxDuration: 120,
   run: async () => {
     await Promise.all([pollRental(), pollMusic(), pollYouTube(), pollAds()]);

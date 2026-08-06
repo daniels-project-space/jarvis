@@ -143,19 +143,19 @@ describe("streaming and paginated history behavior", () => {
       }
       await ctx.db.insert("chatMessages", { threadId: "beta", role: "user", text: "beta-only", status: "done", delivery: "foreground", createdAt: 1 });
       const parent = await ctx.db.insert("chatMessages", { threadId: "alpha", role: "user", text: "active", status: "done", delivery: "foreground", createdAt: 100 });
-      const assistant = await ctx.db.insert("chatMessages", { threadId: "alpha", role: "assistant", text: "", status: "streaming", delivery: "foreground", parentMessageId: parent, streamRevision: 0, createdAt: 101 });
+      const assistant = await ctx.db.insert("chatMessages", { threadId: "alpha", role: "assistant", text: "", status: "streaming", delivery: "foreground", parentMessageId: parent, streamRevision: 0, claimToken: "stream-contract", createdAt: 101 });
       await ctx.db.insert("chatMessages", { threadId: "alpha", role: "assistant", text: "", status: "done", delivery: "foreground", parentMessageId: parent, attachment: { type: "image", value: "r2://safe", title: "card" }, createdAt: 102 });
       return { parent, assistant };
     });
 
-    expect(await t.mutation(api.chatQueue.updateStream, { messageId: ids.assistant, text: "partial", revision: 1, workerToken: WORKER })).toBe(true);
+    expect(await t.mutation(api.chatQueue.updateStream, { messageId: ids.assistant, claimToken: "stream-contract", text: "partial", revision: 1, workerToken: WORKER })).toBe(true);
     let live = await viewer.query(api.chatQueue.listMessages, { threadId: "alpha" });
     expect(live).toHaveLength(20);
     expect(live.find((row) => row._id === ids.assistant)?.text).toBe("partial");
     expect(live.some((row) => row.threadId === "beta")).toBe(false);
 
-    expect(await t.mutation(api.chatQueue.finalize, { messageId: ids.assistant, threadId: "alpha", status: "done", finalText: "authoritative final", workerToken: WORKER })).toBe(true);
-    expect(await t.mutation(api.chatQueue.updateStream, { messageId: ids.assistant, text: "late duplicate", revision: 2, workerToken: WORKER })).toBe(false);
+    expect(await t.mutation(api.chatQueue.finalize, { messageId: ids.assistant, threadId: "alpha", claimToken: "stream-contract", status: "done", finalText: "authoritative final", workerToken: WORKER })).toBe(true);
+    expect(await t.mutation(api.chatQueue.updateStream, { messageId: ids.assistant, claimToken: "stream-contract", text: "late duplicate", revision: 2, workerToken: WORKER })).toBe(false);
     live = await viewer.query(api.chatQueue.listMessages, { threadId: "alpha" });
     expect(live.find((row) => row._id === ids.assistant)?.text).toBe("authoritative final");
 

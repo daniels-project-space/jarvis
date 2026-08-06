@@ -10,6 +10,16 @@ import { actorAdminHash, controlActor, controlCredentials, type ControlActor } f
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
+function guestRateLimit(error: unknown): { retryAfterMs: number } | null {
+  const data = error && typeof error === "object" && "data" in error
+    ? (error as { data?: unknown }).data
+    : null;
+  if (data && typeof data === "object" && (data as { code?: unknown }).code === "GUEST_CHAT_RATE_LIMITED") {
+    return { retryAfterMs: Math.max(1_000, Number((data as { retryAfterMs?: unknown }).retryAfterMs ?? 60_000)) };
+  }
+  return String(error).includes("GUEST_CHAT_RATE_LIMITED") ? { retryAfterMs: 60_000 } : null;
+}
+
 async function handlePost(req: NextRequest, actor: ControlActor) {
   let text = "";
   let threadId = "main";
@@ -25,15 +35,27 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
   if (!text) return Response.json({ error: "empty" }, { status: 400 });
 
   const credentials = actor.kind === "guest" ? { guestId: actor.guestId } : controlCredentials(actor);
-  const messageId = await convexMutation("chatQueue:sendMessage", {
-    threadId,
-    text: text.slice(0, 12_000),
-    requestId: requestId || undefined,
-    ...credentials,
-  });
-  const lease = actor.kind === "guest"
-    ? null
-    : await convexQuery("chatQueue:runnerLease", credentials).catch(() => null) as { updatedAt?: number } | null;
+  let messageId: unknown;
+  try {
+    messageId = await convexMutation("chatQueue:sendMessage", {
+      threadId,
+      text: text.slice(0, actor.kind === "guest" ? 2_000 : 12_000),
+      requestId: requestId || undefined,
+      ...credentials,
+    });
+  } catch (error) {
+    const limited = actor.kind === "guest" ? guestRateLimit(error) : null;
+    if (!limited) throw error;
+    return Response.json(
+      { error: "Guest chat is busy. Wait a moment before sending another message." },
+      {
+        status: 429,
+        headers: { "retry-after": String(Math.max(1, Math.ceil(limited.retryAfterMs / 1_000))) },
+      },
+    );
+  }
+  const lease = await convexQuery("chatQueue:runnerLease", credentials)
+    .catch(() => null) as { updatedAt?: number } | null;
   const warm = Boolean(lease?.updatedAt && Date.now() - lease.updatedAt < 25_000);
   const handle = warm ? null : await tasks
     .trigger(
@@ -55,6 +77,7 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
   return Response.json({
     ok: true,
     queued: true,
+    messageId: String(messageId),
     immediate: Boolean(warm || handle),
     model: "codex-adaptive",
   });

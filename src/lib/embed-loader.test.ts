@@ -187,7 +187,7 @@ describe("Project Hub Jarvis loader", () => {
 
   it("captures the wake word in the top-level page and forwards the command", () => {
     const harness = createLoader();
-    expect(harness.frame.src).toBe(`${JARVIS_ORIGIN}/embed?v=test-release`);
+    expect(harness.frame.src).toBe(`${JARVIS_ORIGIN}/embed?v=test-release&hostOrigin=https%3A%2F%2Fproject-hub.test`);
     expect(harness.FakeRecognition.instances).toHaveLength(1);
     harness.listeners.get("message")?.[0]?.({
       origin: JARVIS_ORIGIN,

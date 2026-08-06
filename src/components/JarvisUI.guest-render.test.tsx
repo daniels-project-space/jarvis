@@ -22,6 +22,7 @@ vi.mock("../../convex/_generated/api", () => ({
     chatQueue: {
       listMessages: { _name: "chatQueue:listMessages" }, listRecentMessages: { _name: "chatQueue:listRecentMessages" },
       paginatedMessages: { _name: "chatQueue:paginatedMessages" },
+      turnStatus: { _name: "chatQueue:turnStatus" },
     },
     commandCenter: { snapshot: { _name: "commandCenter:snapshot" } },
     jobs: { detail: { _name: "jobs:detail" } },
@@ -30,7 +31,7 @@ vi.mock("../../convex/_generated/api", () => ({
 
 vi.mock("@/lib/secure-convex", () => ({
   useJarvisQuery: (query: { _name?: string }) => {
-    if (query?._name === "chatQueue:listMessages") return [legacyGuestRow];
+    if (query?._name === "chatQueue:listMessages" || query?._name === "chatQueue:listRecentMessages") return [legacyGuestRow];
     return undefined;
   },
 }));
@@ -46,6 +47,7 @@ vi.mock("next/dynamic", () => ({
 }));
 
 import Home from "../app/page";
+import JarvisUI from "./JarvisUI";
 
 describe("guest Home application render", () => {
   it("keeps text visible while suppressing a legacy persistent card in the actual page tree", () => {
@@ -55,5 +57,13 @@ describe("guest Home application render", () => {
     expect(markup).not.toContain("owner-only legacy card");
     expect(markup).not.toContain("r2://owner-only-frame");
     expect(markup).not.toContain('src="r2://owner-only-frame"');
+  });
+
+  it("server-renders an untrusted embed as locked with a dependable close control", () => {
+    const markup = renderToStaticMarkup(<JarvisUI embedded />);
+
+    expect(markup).toContain("Connecting Jarvis…");
+    expect(markup).toContain('aria-label="Close Jarvis"');
+    expect(markup).not.toContain("This text remains visible to the guest.");
   });
 });

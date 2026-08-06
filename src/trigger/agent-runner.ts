@@ -3026,7 +3026,7 @@ export const agentWorker = task({
 // runnable jobs into independent workers.
 export const agentFleetSupervisor = schedules.task({
   id: "jarvis-agent-fleet-supervisor",
-  cron: "* * * * *",
+  cron: "*/15 * * * *",
   machine: "micro",
   queue: { concurrencyLimit: 1 },
   maxDuration: 120,

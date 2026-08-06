@@ -21,6 +21,7 @@ import {
   FOREGROUND_ADMISSION_RESERVE_MS,
   canClaimForegroundTurn,
   FOREGROUND_HANDOFF_OVERLAP_MS,
+  FOREGROUND_IDLE_TIMEOUT_MS,
   FOREGROUND_LANE_MAX_DURATION_SECONDS,
   FOREGROUND_MAX_DURATION_SECONDS,
   FOREGROUND_PROCESS_EXIT_RESERVE_MS,
@@ -86,6 +87,16 @@ async function convexMutation(path: string, args: unknown) {
   return convexCall("mutation", path, args);
 }
 
+async function failForegroundStartup(message: string): Promise<never> {
+  await convexMutation("incidents:report", {
+    source: "jarvis-chat-turn",
+    app: "jarvis",
+    signature: `foreground-startup:${message.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 100)}`,
+    message: `Foreground Jarvis could not start: ${message}`,
+  }).catch(() => undefined);
+  throw new Error(message);
+}
+
 function waitForPending(
   client: ConvexClient,
   workerToken: string,
@@ -120,6 +131,8 @@ type QueueClaim = {
   guest?: boolean;
   userText: string;
   assistantId: string;
+  claimToken: string;
+  attemptCount: number;
   history: Array<{ role: string; text: string }>;
 };
 
@@ -137,6 +150,7 @@ async function runTurn(
   server: CodexAppServer,
   conversationId: string,
   assistantId: string,
+  claimToken: string,
   userText: string,
   history: { role: string; text: string }[],
   contextBlock: string,
@@ -145,8 +159,8 @@ async function runTurn(
   onStage?: (stage: "codexAck" | "firstDelta" | "firstConvexPaint") => void,
 ){
   const publisher = new StreamPublisher(
-    (text, revision) => convexMutation("chatQueue:updateStream", { messageId: assistantId, text, revision }),
-    120,
+    (text, revision) => convexMutation("chatQueue:updateStream", { messageId: assistantId, claimToken, text, revision }),
+    350,
     () => onStage?.("firstConvexPaint"),
   );
   publisher.start();
@@ -275,26 +289,34 @@ async function processChatQueue(
   // network round trip to every message without changing the selected brain.
   const provider: AgentProvider = "codex";
   const dispatchToken = process.env.JARVIS_DISPATCH_TOKEN;
-  if (!dispatchToken) return { processed: 0, error: "JARVIS_DISPATCH_TOKEN is not configured" };
+  if (!dispatchToken) return await failForegroundStartup("JARVIS_DISPATCH_TOKEN is not configured");
   const prepared = await prepareSubscriptionEnv(provider, {
     scope: `foreground-${lane}`,
     minimumValidityMs: FOREGROUND_SESSION_RENEWAL_RESERVE_MS,
   });
-  if (prepared.error) return { processed: 0, error: prepared.error };
+  if (prepared.error) return await failForegroundStartup(prepared.error);
   const bin = resolveSubscriptionAgentBin(provider);
   if (!bin) {
     cleanupSubscriptionHome(prepared.env);
-    return { processed: 0, error: `${provider} binary not found` };
+    return await failForegroundStartup(`${provider} binary not found`);
   }
   const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
   if (preflight.error) {
     cleanupSubscriptionHome(prepared.env);
-    return { processed: 0, error: preflight.error };
+    return await failForegroundStartup(preflight.error);
   }
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
   if (!workerToken) {
     cleanupSubscriptionHome(prepared.env);
-    return { processed: 0, error: "JARVIS_WORKER_TOKEN is not configured" };
+    return await failForegroundStartup("JARVIS_WORKER_TOKEN is not configured");
+  }
+  if (source !== "warm-handoff") {
+    const existingLease = await convexCall("query", "chatQueue:runnerLeaseForWorker", {})
+      .catch(() => null) as { updatedAt?: number } | null;
+    if (existingLease?.updatedAt && Date.now() - existingLease.updatedAt < 25_000) {
+      cleanupSubscriptionHome(prepared.env);
+      return { processed: 0, warmRunner: true };
+    }
   }
   const runnerId = randomUUID();
   const bridge = new AgentToolBridge(dispatchToken);
@@ -324,14 +346,17 @@ async function processChatQueue(
     });
   } catch (error) {
     cleanupSubscriptionHome(prepared.env);
-    return { processed: 0, error: error instanceof Error ? error.message : String(error) };
+    return await failForegroundStartup(error instanceof Error ? error.message : String(error));
   }
   const client = new ConvexClient(CONVEX_URL);
   // A handoff candidate pays startup cost inside the bounded overlap, but
   // never takes ownership from a still-serving runner.
   let ownsLease: boolean;
   try {
-    if (source === "warm-handoff") await session.start();
+    // A lease means ready-to-claim, not merely "a container exists". Starting
+    // first prevents API admission from trusting a worker stuck in CLI/auth
+    // initialization.
+    await session.start();
     ownsLease = source === "warm-handoff"
       ? await waitForRunnerAvailability(client, workerToken, runnerId, FOREGROUND_HANDOFF_OVERLAP_MS + FOREGROUND_RUNNER_LEASE_MS)
       : await convexMutation("chatQueue:touchRunner", { runnerId }) as boolean;
@@ -346,15 +371,25 @@ async function processChatQueue(
     return { processed: 0, warmRunner: true };
   }
   let leaseActive = true;
+  let leaseClosing = false;
+  let heartbeatPromise: Promise<void> = Promise.resolve();
+  let activeTurn: { messageId: string; claimToken: string } | null = null;
   const leaseAbort = new AbortController();
-  const heartbeat = setInterval(() => void convexMutation("chatQueue:touchRunner", { runnerId })
-    .then((stillOwner) => {
+  const heartbeat = setInterval(() => {
+    if (leaseClosing) return;
+    heartbeatPromise = heartbeatPromise.catch(() => undefined).then(async () => {
+      if (leaseClosing) return;
+      const stillOwner = await convexMutation("chatQueue:touchRunner", {
+        runnerId,
+        activeMessageId: activeTurn?.messageId,
+        claimToken: activeTurn?.claimToken,
+      }).catch(() => true);
       if (stillOwner === false) {
         leaseActive = false;
         leaseAbort.abort();
       }
-    })
-    .catch(() => {}), 10_000);
+    });
+  }, 10_000);
   let handoffStarted = false;
   let handoffPromise: Promise<unknown> | null = null;
   const startHandoff = () => {
@@ -373,9 +408,6 @@ async function processChatQueue(
   const timings: ForegroundTurnTiming[] = [];
   let processed = 0;
   try {
-    // Prewarm even when the scheduled recovery task found no message. This is
-    // the always-available main Jarvis, separate from durable specialist work.
-    await session.start();
   while (leaseActive && Date.now() - started < RUN_BUDGET_MS) {
     // Never claim work we cannot truthfully finish and deliver. Leaving it
     // pending makes it immediately eligible for the prewarmed successor.
@@ -384,16 +416,25 @@ async function processChatQueue(
       break;
     }
     const claimStarted = Date.now();
+    const exactTargetMessageId = targetMessageId;
+    const claimToken = randomUUID();
     const claim = (targetMessageId
-      ? await convexMutation("chatQueue:claimMessage", { messageId: targetMessageId })
-      : await convexMutation("chatQueue:claimNext", {})) as QueueClaim | null;
+      ? await convexMutation("chatQueue:claimMessage", { messageId: targetMessageId, claimToken })
+      : await convexMutation("chatQueue:claimNext", { claimToken })) as QueueClaim | null;
     const claimedAt = Date.now();
     if (!claim) {
       targetMessageId = undefined;
+      if (exactTargetMessageId) break;
       const remaining = RUN_BUDGET_MS - (Date.now() - started) - FOREGROUND_ADMISSION_RESERVE_MS;
-      if (remaining <= 0 || !(await waitForPending(client, workerToken, remaining, leaseAbort.signal))) break;
+      if (remaining <= 0 || !(await waitForPending(
+        client,
+        workerToken,
+        Math.min(remaining, FOREGROUND_IDLE_TIMEOUT_MS),
+        leaseAbort.signal,
+      ))) break;
       continue;
     }
+    activeTurn = { messageId: claim.assistantId, claimToken: claim.claimToken };
     try {
       const visibleUserText = visibleTurnText(claim.userText);
       const contextStarted = Date.now();
@@ -407,6 +448,7 @@ async function processChatQueue(
         activeServer,
         claim.threadId,
         claim.assistantId,
+        claim.claimToken,
         claim.userText,
         claim.history,
         context,
@@ -430,6 +472,7 @@ async function processChatQueue(
         status: turn.finalText.trim() ? "done" : "error",
         finalText,
         model: `codex · ${codexModelFor(model).model}`,
+        claimToken: claim.claimToken,
       });
       const deliveredAt = Date.now();
       // Memory capture is a separate background task. It must never hold the
@@ -461,8 +504,10 @@ async function processChatQueue(
         threadId: claim.threadId,
         status: "error",
         finalText: `⚠️ ${error instanceof Error ? error.message : String(error)}`,
+        claimToken: claim.claimToken,
       }).catch(() => {});
     }
+    activeTurn = null;
     // After its exact wake-up message, retain this authenticated CLI process
     // and drain rapid follow-ups. Duplicate queued wake tasks become no-ops.
     targetMessageId = undefined;
@@ -475,9 +520,10 @@ async function processChatQueue(
       metadata.set("foregroundTiming", buildForegroundTiming(timings, Date.now() - started, lane));
       await metadata.flush();
     } finally {
+      leaseClosing = true;
       clearInterval(heartbeat);
       clearTimeout(handoffTimer);
-      if (!handoffStarted && leaseActive) startHandoff();
+      await heartbeatPromise.catch(() => undefined);
       await handoffPromise;
       await convexMutation("chatQueue:releaseRunner", { runnerId }).catch(() => {});
       await session.close();
@@ -513,6 +559,7 @@ export const chatMemory = task({
 // alternate lane only at the four-hour handoff boundary.
 export const chatTurn = task({
   id: "jarvis-chat-turn",
+  retry: { maxAttempts: 1 },
   queue: { name: FOREGROUND_QUEUE, concurrencyLimit: FOREGROUND_CONCURRENCY },
   machine: "small-1x",
   maxDuration: FOREGROUND_LANE_MAX_DURATION_SECONDS,
@@ -524,6 +571,7 @@ export const chatTurn = task({
 // the primary lane owns the authoritative Convex lease.
 export const chatHandoff = task({
   id: "jarvis-chat-handoff",
+  retry: { maxAttempts: 1 },
   queue: { name: "jarvis-foreground-handoff", concurrencyLimit: 1 },
   machine: "small-1x",
   maxDuration: FOREGROUND_LANE_MAX_DURATION_SECONDS,
@@ -534,21 +582,24 @@ export const chatHandoff = task({
 // Trigger, the next schedule drains the durable Convex queue.
 export const chatDispatcher = schedules.task({
   id: "jarvis-chat-dispatcher",
-  cron: "*/1 * * * *",
+  cron: "*/5 * * * *",
   queue: { name: "jarvis-foreground-recovery", concurrencyLimit: 1 },
   maxDuration: 60,
   run: async () => {
+    const reaped = await convexCall("mutation", "chatQueue:reapStuck", {})
+      .catch(() => ({ requeued: 0, failed: 0 })) as { requeued?: number; failed?: number };
     const [lease, pendingMessageId] = await Promise.all([
       convexCall("query", "chatQueue:runnerLeaseForWorker", {}) as Promise<{ updatedAt?: number } | null>,
       convexCall("query", "chatQueue:pendingSignal", {}) as Promise<string | null>,
     ]);
     const warm = Boolean(lease?.updatedAt && Date.now() - lease.updatedAt < 25_000);
-    if (warm) return { warm: true, pending: Boolean(pendingMessageId) };
+    if (warm) return { warm: true, pending: Boolean(pendingMessageId), reaped };
+    if (!pendingMessageId) return { warm: false, pending: false, reaped };
     const handle = await tasks.trigger(
       "jarvis-chat-turn",
       { source: "recovery", messageId: pendingMessageId ?? undefined },
       { idempotencyKey: `jarvis-recovery-${Math.floor(Date.now() / 60_000)}` },
     );
-    return { warm: false, pending: Boolean(pendingMessageId), runId: handle.id };
+    return { warm: false, pending: Boolean(pendingMessageId), reaped, runId: handle.id };
   },
 });

@@ -33,6 +33,10 @@ export const FOREGROUND_HANDOFF_OVERLAP_MS = 10 * 60_000;
 // Leave headroom below Trigger's hard max for cleanup and lease release.
 export const FOREGROUND_PROCESS_EXIT_RESERVE_MS = 60_000;
 export const FOREGROUND_RUNNER_LEASE_MS = 25_000;
+// Keep the authenticated process warm only across an active conversation.
+// Event-driven wakes start the next session; an idle four-hour worker was
+// effectively permanent Trigger compute with no user-visible benefit.
+export const FOREGROUND_IDLE_TIMEOUT_MS = 8 * 60_000;
 // A successor spends the handoff overlap waiting before it owns its full
 // lifetime. Both alternating task lanes therefore receive the same complete
 // owner budget plus overlap and cleanup headroom.

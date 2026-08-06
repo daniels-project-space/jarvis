@@ -71,4 +71,19 @@ describe("wake command capture", () => {
     expect(state).not.toHaveBeenCalledWith(false);
     expect(state).toHaveBeenLastCalledWith(true);
   });
+
+  it("reports inactive and permits a later retry when recognizer startup throws", () => {
+    class ThrowingSpeechRecognition extends FakeSpeechRecognition {
+      start = vi.fn(() => { throw new Error("audio service unavailable"); });
+    }
+    vi.stubGlobal("window", { webkitSpeechRecognition: ThrowingSpeechRecognition });
+    const state = vi.fn();
+
+    startWake(vi.fn(), state);
+    expect(state).toHaveBeenLastCalledWith(false);
+
+    vi.stubGlobal("window", { webkitSpeechRecognition: FakeSpeechRecognition });
+    startWake(vi.fn(), state);
+    expect(state).toHaveBeenLastCalledWith(true);
+  });
 });

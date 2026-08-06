@@ -48,7 +48,7 @@ export default defineSchema({
     threadId: v.string(),
     role: v.string(), // "user" | "assistant"
     text: v.string(),
-    status: v.string(), // "pending" | "streaming" | "done" | "error"
+    status: v.string(), // "pending" | "streaming" | "done" | "error" | "superseded"
     model: v.optional(v.string()), // Codex model/tier that answered (Luna|Terra|Sol|live)
     // One durable turn identity crosses browser -> Vercel -> Convex -> Trigger.
     // requestId makes client retries idempotent; parentMessageId prevents a
@@ -61,6 +61,14 @@ export default defineSchema({
     // Streaming text is an idempotent snapshot, not an append-only byte pipe.
     // Convex rejects old revisions and all writes after finalization.
     streamRevision: v.optional(v.number()),
+    // Foreground turns use a bounded, fenced recovery protocol. `attemptCount`
+    // lives on both sides of a turn for inspection, while `claimToken` prevents
+    // a timed-out worker from painting or finalizing over its replacement.
+    attemptCount: v.optional(v.number()),
+    dispatchEpoch: v.optional(v.number()),
+    claimToken: v.optional(v.string()),
+    lastProgressAt: v.optional(v.number()),
+    guestSlotReleased: v.optional(v.boolean()),
     // Persistent media card: everything JARVIS shows also lands in the stream
     // so Daniel can always get back to it later.
     attachment: v.optional(
@@ -69,7 +77,9 @@ export default defineSchema({
     createdAt: v.number(),
   })
     .index("by_thread", ["threadId", "createdAt"])
+    .index("by_thread_status", ["threadId", "status", "createdAt"])
     .index("by_status", ["status", "createdAt"])
+    .index("by_parent", ["parentMessageId", "createdAt"])
     .index("by_request", ["requestId"]),
 
   chatSessions: defineTable({
@@ -79,7 +89,18 @@ export default defineSchema({
     // Active workers no longer read or write this value.
     claudeSessionId: v.optional(v.string()),
     lastActiveAt: v.number(),
-  }).index("by_thread", ["threadId"]),
+  })
+    .index("by_thread", ["threadId"])
+    .index("by_status_activity", ["status", "lastActiveAt"]),
+
+  chatGuestLimits: defineTable({
+    guestId: v.string(),
+    tokens: v.number(),
+    refilledAt: v.number(),
+    day: v.string(),
+    dailyCount: v.number(),
+    inFlight: v.number(),
+  }).index("by_guest", ["guestId"]),
 
   // Snapshot of project / cloud-stack state so JARVIS can answer "state of my apps".
   projectState: defineTable({

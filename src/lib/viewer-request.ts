@@ -24,3 +24,19 @@ export function viewerFetch(input: RequestInfo | URL, init: RequestInit = {}): P
   }
   return fetch(input, { ...init, headers });
 }
+
+export function viewerFetchWithTimeout(
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+  timeoutMs = 15_000,
+): Promise<Response> {
+  const controller = new AbortController();
+  const abort = () => controller.abort(init.signal?.reason);
+  if (init.signal?.aborted) abort();
+  else init.signal?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), timeoutMs);
+  return viewerFetch(input, { ...init, signal: controller.signal }).finally(() => {
+    clearTimeout(timer);
+    init.signal?.removeEventListener("abort", abort);
+  });
+}
