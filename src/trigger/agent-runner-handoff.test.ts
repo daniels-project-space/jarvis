@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { IdempotencyKey } from "@trigger.dev/sdk/v3";
 
 const trigger = vi.hoisted(() => {
@@ -44,8 +44,17 @@ const TICKET = {
   expectedDecisionSequence: 4,
   expectedInputRevision: 7,
 };
+const SUPERVISOR_ROLLOUT_ENV = "JARVIS_MISSION_SUPERVISOR_ROLLOUT";
 
 describe("agent worker supervisor completion handoff", () => {
+  beforeEach(() => {
+    vi.stubEnv(SUPERVISOR_ROLLOUT_ENV, "active");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("replays one exact ticket through the same Trigger idempotency identity", async () => {
     let run = 0;
     const triggerTick = vi.fn<
@@ -112,6 +121,47 @@ describe("agent worker supervisor completion handoff", () => {
     );
     expect(wakeFleet).toHaveBeenCalledTimes(2);
   });
+
+  it("preserves exact supervisor handoff in canary rollout", async () => {
+    vi.stubEnv(SUPERVISOR_ROLLOUT_ENV, "canary");
+    const query = vi.fn(async () => TICKET);
+    const dispatchWakeTicket = vi.fn(async () => ({ dispatched: true }));
+    const wakeFleet = vi.fn(async () => true);
+
+    await expect(handoffCompletedAgentWorker(
+      "job-canary-handoff",
+      { query, dispatchWakeTicket, wakeFleet },
+    )).resolves.toEqual({
+      supervisorContinued: true,
+      continued: true,
+    });
+    expect(query).toHaveBeenCalledOnce();
+    expect(dispatchWakeTicket).toHaveBeenCalledWith(TICKET);
+    expect(wakeFleet).toHaveBeenCalledOnce();
+  });
+
+  it.each(["dormant", "rollback"])(
+    "skips the supervisor query while %s but preserves the fleet wake",
+    async (rollout) => {
+      vi.stubEnv(SUPERVISOR_ROLLOUT_ENV, rollout);
+      const query = vi.fn(async () => TICKET);
+      const dispatchWakeTicket = vi.fn(async () => ({ dispatched: true }));
+      const wakeFleet = vi.fn(async () => true);
+
+      await expect(handoffCompletedAgentWorker(
+        "job-rollout-disabled",
+        { query, dispatchWakeTicket, wakeFleet },
+      )).resolves.toEqual({
+        supervisorContinued: false,
+        continued: true,
+      });
+      expect(query).not.toHaveBeenCalled();
+      expect(dispatchWakeTicket).not.toHaveBeenCalled();
+      expect(wakeFleet).toHaveBeenCalledWith(
+        "worker-complete:job-rollout-disabled",
+      );
+    },
+  );
 
   it("retains the generic fleet wake when direct dispatch fails ambiguously", async () => {
     const query = vi.fn(async () => TICKET);

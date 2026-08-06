@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { routeWork, suggestedAcceptanceCriteria } from "./routing";
+import { selectCodexWorkPolicy } from "../lib/codex-work-router";
 import {
   TEAM_BY_SLUG,
   type AgentSlug,
@@ -14,6 +15,8 @@ export const workstreamSchema = z.object({
   agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]),
   repo: z.string().nullable(),
   model: z.enum(["luna", "terra", "sol"]),
+  reasoningEffort: z.enum(["low", "medium", "high", "max"]),
+  modelReason: z.string().min(1).max(300),
   readonly: z.boolean(),
   approvalRequired: z.boolean(),
   risk: z.enum(["low", "medium", "high", "consequential"]),
@@ -27,6 +30,7 @@ export function normalizeWorkstream(input: {
   label?: string;
   repo?: string;
   model?: string;
+  reasoningEffort?: string;
   agentId?: string;
   readonly?: boolean;
   approvalRequired?: boolean;
@@ -56,6 +60,15 @@ export function normalizeWorkstream(input: {
     : input.risk && ["low", "medium", "high"].includes(input.risk)
       ? input.risk
       : route.risk) as WorkRisk;
+  const modelPolicy = selectCodexWorkPolicy({
+    task: input.task,
+    role: agentId,
+    repo: input.repo,
+    readonly: input.readonly === true || approvalRequired,
+    risk,
+    requestedModel: input.model,
+    requestedReasoningEffort: input.reasoningEffort,
+  });
   return {
     label: (
       input.label ||
@@ -64,8 +77,10 @@ export function normalizeWorkstream(input: {
     task: input.task.slice(0, 4000),
     agentId,
     repo: input.repo ?? null,
-    model: route.model as ModelTier,
-    readonly: input.readonly ?? route.readonly,
+    model: modelPolicy.model as ModelTier,
+    reasoningEffort: modelPolicy.reasoningEffort,
+    modelReason: modelPolicy.modelReason,
+    readonly: input.readonly === true || route.readonly || approvalRequired || risk === "consequential",
     approvalRequired,
     risk,
     acceptanceCriteria: input.acceptanceCriteria?.length

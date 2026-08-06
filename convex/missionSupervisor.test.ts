@@ -114,6 +114,8 @@ type StartOptions = {
     label?: string;
     repo?: string;
     model?: "luna" | "terra" | "sol";
+    reasoningEffort?: "low" | "medium" | "high" | "max";
+    modelReason?: string;
     agentId?: "paul" | "atlas" | "iris" | "maya" | "sentry";
     readonly?: boolean;
     approvalRequired?: boolean;
@@ -161,6 +163,8 @@ type CommitDecision =
         label: string;
         repo?: string;
         model: "luna" | "terra" | "sol";
+        reasoningEffort: "low" | "medium" | "high" | "max";
+        modelReason: string;
         agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
         readonly: boolean;
         approvalRequired: boolean;
@@ -420,6 +424,8 @@ function delegatedWorkstream(
     task: "Implement bounded supervisor authority and verify the exact behavior.",
     label: "Supervisor authority",
     model: "terra",
+    reasoningEffort: "high",
+    modelReason: "Test adaptive route",
     agentId: "paul",
     readonly: false,
     approvalRequired: false,
@@ -3664,7 +3670,11 @@ describe("dormant mission supervisor authority", () => {
     const decision: CommitDecision = {
       kind: "delegate",
       workstreams: [
-        delegatedWorkstream(),
+        delegatedWorkstream({
+          model: "terra",
+          reasoningEffort: "max",
+          modelReason: "Adaptive test route retained end to end",
+        }),
         delegatedWorkstream({
           task: "Send a rental reply to the customer immediately.",
           label: "Consequential renter reply",
@@ -3700,6 +3710,8 @@ describe("dormant mission supervisor authority", () => {
           q.eq("missionId", String(started.missionId))
         )
         .collect(),
+      runtime: await ctx.db.query("jobRuntime").collect(),
+      workOrders: await ctx.db.query("workOrderRevisions").collect(),
       approvals: await ctx.db.query("approvals").collect(),
       decisions: await ctx.db
         .query("missionSupervisorDecisions")
@@ -3711,6 +3723,24 @@ describe("dormant mission supervisor authority", () => {
       mission: await ctx.db.get(started.missionId),
     }));
     expect(persisted.jobs.map((job) => job.supervisorJobOrdinal)).toEqual([0, 1]);
+    expect(persisted.jobs[0]).toMatchObject({
+      model: "terra",
+      reasoningEffort: "max",
+      modelReason: "Adaptive test route retained end to end",
+    });
+    expect(persisted.runtime.find((row) =>
+      row.jobId === persisted.jobs[0]._id
+    )).toMatchObject({
+      model: "terra",
+      reasoningEffort: "max",
+      modelReason: "Adaptive test route retained end to end",
+    });
+    expect(persisted.workOrders.find((row) =>
+      row.jobId === persisted.jobs[0]._id
+    )).toMatchObject({
+      minimumModel: "terra",
+      minimumReasoningEffort: "max",
+    });
     expect(persisted.jobs.every((job) =>
       job.supervisorEpoch === claimed.epoch
       && job.supervisorDecisionKey === committed.decisionKey
@@ -3885,7 +3915,7 @@ describe("dormant mission supervisor authority", () => {
         workstreams: [delegatedWorkstream({ readonly: true })],
       },
       ...POLICY_METADATA,
-    })).rejects.toThrow("delegate must use Codex subscription authorship");
+    })).rejects.toThrow("Deterministic policy delegation does not match the admitted request");
 
     vi.setSystemTime(claimed.leaseUntil + 1);
     expect(await t.mutation(supervisorApi.commitV1, input)).toMatchObject({
@@ -3914,6 +3944,42 @@ describe("dormant mission supervisor authority", () => {
     });
     expect(persisted.decisions).toEqual([]);
     expect(persisted.jobs).toEqual([]);
+  });
+
+  it("rejects deterministic delegation that lowers an admitted effort floor", async () => {
+    const t = convexTest(schema, modules);
+    const task = "Implement the exact admitted high-effort supervisor boundary.";
+    const criterion = "The high-effort floor remains immutable.";
+    const started = await start(t, "policy-effort-floor", {
+      desiredWorkstreams: 1,
+      requestedWorkstreams: [{
+        task,
+        reasoningEffort: "max",
+        acceptanceCriteria: [criterion],
+      }],
+    });
+    const claimed = await claimSuccess(t, started.missionId, 0);
+
+    await expect(t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      claimed,
+      {
+        kind: "delegate",
+        workstreams: [delegatedWorkstream({
+          task,
+          reasoningEffort: "high",
+          acceptanceCriteria: [criterion],
+        })],
+      },
+      POLICY_METADATA,
+    ))).rejects.toThrow(
+      "Deterministic policy delegation does not match the admitted request",
+    );
+    expect(await t.run(async (ctx) =>
+      ctx.db.query("jobs").withIndex("by_mission", (q) =>
+        q.eq("missionId", String(started.missionId))
+      ).collect()
+    )).toEqual([]);
   });
 
   it("rolls back unadmitted, duplicate, and over-cap delegation decisions", async () => {
@@ -4511,6 +4577,7 @@ describe("dormant mission supervisor authority", () => {
       agentId: firstPersisted.root?.agentId,
       model: firstPersisted.root?.model,
       reasoningEffort: firstPersisted.root?.reasoningEffort,
+      modelReason: firstPersisted.root?.modelReason,
       acceptanceCriteria: firstPersisted.root?.acceptanceCriteria,
       maxAttempts: 4,
       attempt: 1,
@@ -4562,6 +4629,18 @@ describe("dormant mission supervisor authority", () => {
       generation: 2,
       autonomousRecoveryCount: 2,
     });
+    const secondPersisted = await t.run(async (ctx) => ({
+      predecessor: await ctx.db.get(firstSuccessorId),
+      successor: await ctx.db.get(secondSuccessorId),
+    }));
+    expect(secondPersisted.successor).toMatchObject({
+      model: secondPersisted.predecessor?.model,
+      reasoningEffort: secondPersisted.predecessor?.reasoningEffort,
+      modelReason: secondPersisted.predecessor?.modelReason,
+    });
+    expect(secondPersisted.successor?.modelReason).not.toContain(
+      "evidenced quality failures",
+    );
 
     const secondSuccessorTerminal = await seedRecoveryTerminal(
       t,
@@ -4603,7 +4682,153 @@ describe("dormant mission supervisor authority", () => {
     expect(counts).toEqual({ jobs: 3, edges: 2 });
   });
 
-  it("requires criteria-preserving model remediation, creates fresh approval, and synthesizes only the verified leaf", async () => {
+  it("escalates only repeated exact verification failures and preserves the recovery route audit", async () => {
+    const t = convexTest(schema, modules);
+    const admission = await testProjectSourceAdmission(
+      "daniels-project-space/jarvis",
+    );
+    const criterion = "The exact verification boundary passes before completion.";
+    const initialReason = "Luna medium is sufficient until repeated exact quality evidence exists";
+    const started = await start(t, "recover-quality-route", {
+      repo: admission.repository,
+      projectAdmissions: [admission],
+    });
+    const firstClaim = await claimSuccess(t, started.missionId, 0);
+    const delegated = await t.mutation(supervisorApi.commitV1, commitInput(
+      started.missionId,
+      firstClaim,
+      {
+        kind: "delegate",
+        workstreams: [delegatedWorkstream({
+          repo: admission.repository,
+          model: "luna",
+          reasoningEffort: "medium",
+          modelReason: initialReason,
+          acceptanceCriteria: [criterion],
+        })],
+      },
+      MODEL_METADATA,
+    ));
+    const rootJobId = delegated.createdJobIds[0] as Id<"jobs">;
+    const firstTerminal = await seedRecoveryTerminal(t, rootJobId, {
+      terminalCode: "verification_exhausted",
+      recoveryDisposition: "remediable",
+    });
+
+    vi.setSystemTime(delegated.nextTickAt);
+    const secondClaim = await claimSuccess(t, started.missionId, 1);
+    const firstRecovery = await t.mutation(
+      supervisorApi.commitV1,
+      commitInput(
+        started.missionId,
+        secondClaim,
+        {
+          kind: "recover",
+          recoveries: [{
+            mode: "remediate",
+            predecessorJobId: rootJobId,
+            predecessorReceiptDigest: firstTerminal.receiptDigest,
+            task: "Repair the first exact verification failure without broadening scope.",
+            label: "Repair first verification failure",
+            model: "luna",
+            agentId: "paul",
+            risk: "low",
+            acceptanceCriteria: [criterion],
+          }],
+        },
+        MODEL_METADATA,
+      ),
+    );
+    const firstSuccessorId = firstRecovery.createdJobIds[0] as Id<"jobs">;
+    const firstRoute = await t.run(async (ctx) => ({
+      job: await ctx.db.get(firstSuccessorId),
+      runtime: await ctx.db
+        .query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", firstSuccessorId))
+        .unique(),
+      order: await ctx.db
+        .query("workOrderRevisions")
+        .withIndex("by_job_revision", (q) =>
+          q.eq("jobId", firstSuccessorId).eq("revision", 1)
+        )
+        .unique(),
+    }));
+    expect(firstRoute.job).toMatchObject({
+      model: "luna",
+      reasoningEffort: "medium",
+      modelReason: initialReason,
+    });
+    expect(firstRoute.runtime).toMatchObject({
+      model: "luna",
+      reasoningEffort: "medium",
+      modelReason: initialReason,
+    });
+    expect(firstRoute.order).toMatchObject({
+      minimumModel: "luna",
+      minimumReasoningEffort: "medium",
+    });
+
+    const secondTerminal = await seedRecoveryTerminal(t, firstSuccessorId, {
+      terminalCode: "verification_exhausted",
+      recoveryDisposition: "remediable",
+    });
+    vi.setSystemTime(firstRecovery.nextTickAt);
+    const thirdClaim = await claimSuccess(t, started.missionId, 2);
+    const secondRecovery = await t.mutation(
+      supervisorApi.commitV1,
+      commitInput(
+        started.missionId,
+        thirdClaim,
+        {
+          kind: "recover",
+          recoveries: [{
+            mode: "remediate",
+            predecessorJobId: firstSuccessorId,
+            predecessorReceiptDigest: secondTerminal.receiptDigest,
+            task: "Repair the repeated exact verification failure with stronger reasoning.",
+            label: "Repair repeated verification failure",
+            model: "luna",
+            agentId: "paul",
+            risk: "low",
+            acceptanceCriteria: [criterion],
+          }],
+        },
+        MODEL_METADATA,
+      ),
+    );
+    const secondSuccessorId = secondRecovery.createdJobIds[0] as Id<"jobs">;
+    const escalatedRoute = await t.run(async (ctx) => ({
+      job: await ctx.db.get(secondSuccessorId),
+      runtime: await ctx.db
+        .query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", secondSuccessorId))
+        .unique(),
+      order: await ctx.db
+        .query("workOrderRevisions")
+        .withIndex("by_job_revision", (q) =>
+          q.eq("jobId", secondSuccessorId).eq("revision", 1)
+        )
+        .unique(),
+    }));
+    expect(escalatedRoute.job).toMatchObject({
+      model: "terra",
+      reasoningEffort: "high",
+      modelReason: expect.stringContaining(
+        "after 2 evidenced quality failures",
+      ),
+    });
+    expect(escalatedRoute.runtime).toMatchObject({
+      model: "terra",
+      reasoningEffort: "high",
+      modelReason: escalatedRoute.job?.modelReason,
+    });
+    expect(escalatedRoute.order).toMatchObject({
+      minimumModel: "terra",
+      minimumReasoningEffort: "high",
+    });
+  });
+
+  it("requires criteria-preserving model remediation, creates fresh approval, and policy-synthesizes the recovered leaf", async () => {
     const t = convexTest(schema, modules);
     const admission = await testProjectSourceAdmission(
       "daniels-project-space/jarvis",
@@ -4716,8 +4941,8 @@ describe("dormant mission supervisor authority", () => {
         summary: "The recovered workstream completed under exact authority.",
       },
       {
-        ...MODEL_METADATA,
-        triggerRunId: "model-recovered-synthesis",
+        ...POLICY_METADATA,
+        triggerRunId: "policy-recovered-synthesis",
       },
     ));
     expect(synthesized).toMatchObject({

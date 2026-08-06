@@ -26,13 +26,43 @@ import {
   parseMissionSupervisorTickPayload,
   runJarvisRecovery,
   runJarvisReceiptSynthesis,
+  runMissionSupervisorDeadmanSweep,
   runMissionSupervisorSweep,
   runMissionSupervisorTick,
+  runMissionSupervisorTickForRollout,
   type MissionSupervisorRunContext,
   type MissionSupervisorSweepDependencies,
   type MissionSupervisorTickDependencies,
   type MissionSupervisorTickPayload,
 } from "./mission-supervisor";
+
+describe("mission supervisor rollout runtime gates", () => {
+  it.each(["dormant", "rollback"])("does no dependency work for %s queued ticks", async (mode) => {
+    const prior = process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT;
+    process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT = mode;
+    const dependenciesFactory = vi.fn(() => { throw new Error("must not construct dependencies"); });
+    try {
+      await expect(runMissionSupervisorTickForRollout(
+        {
+          protocolVersion: 1,
+          missionId: "mission-gated",
+          expectedLeaseVersion: 0,
+          expectedEpoch: 0,
+          expectedDecisionSequence: 0,
+          expectedInputRevision: 0,
+        },
+        { runId: "run-gated", signal: new AbortController().signal },
+        dependenciesFactory,
+      )).resolves.toMatchObject({ status: "disabled", mode, missionId: "mission-gated" });
+      await expect(runMissionSupervisorDeadmanSweep(dependenciesFactory as never))
+        .resolves.toMatchObject({ skipped: true, mode, due: 0 });
+      expect(dependenciesFactory).not.toHaveBeenCalled();
+    } finally {
+      if (prior === undefined) delete process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT;
+      else process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT = prior;
+    }
+  });
+});
 
 const MISSION_ID = "mission-supervisor-1";
 const RUN_ID = "run_supervisor_123";
@@ -479,6 +509,17 @@ function snapshot(
   };
 }
 
+function withRequestPatch(
+  source: ReturnType<typeof snapshot>,
+  patch: Record<string, unknown>,
+) {
+  const request = JSON.parse(source.supervisor.requestPayloadJson) as Record<string, unknown>;
+  Object.assign(request, patch);
+  source.supervisor.requestPayloadJson = JSON.stringify(request);
+  source.supervisor.requestDigest = sha(source.supervisor.requestPayloadJson);
+  return source;
+}
+
 function bindPendingInput(
   authoritative: Snapshot,
   target: SnapshotJob,
@@ -654,6 +695,8 @@ function harness(
         label: "Build Trigger supervisor",
         repo: null,
         model: "sol",
+        reasoningEffort: "max",
+        modelReason: "Test supervisor route",
         agentId: "paul",
         readonly: true,
         approvalRequired: false,
@@ -824,10 +867,10 @@ describe("mission supervisor Trigger tick", () => {
     ]);
   });
 
-  it("commits a genuine network delegation with exact fences, actual Sol metadata, and fresh model instances", async () => {
+  it("uses the genuine network only for a multi-workstream delegation and commits exact model metadata", async () => {
     const created: Array<{ tier: string; model: LanguageModelV2 }> = [];
     const seenModels: LanguageModelV2[] = [];
-    const source = snapshot();
+    const source = withRequestPatch(snapshot(), { desiredWorkstreams: 2 });
     const runtime = harness(source, {
       createModel: (tier) => {
         const model = fakeModel(`${tier}-${created.length}`);
@@ -844,19 +887,36 @@ describe("mission supervisor Trigger tick", () => {
           kind: "ready_to_commit",
           tickId: input.tickId,
           missionId: input.missionId,
-          proposals: [{
-            task: "Implement the exact Trigger durable re-entry contract.",
-            label: "Durable Trigger re-entry",
-            repo: null,
-            model: "sol",
-            agentId: "paul",
-            readonly: true,
-            approvalRequired: false,
-            risk: "low",
-            acceptanceCriteria: ["The focused runtime suite passes."],
-          }],
+          proposals: [
+            {
+              task: "Implement the exact Trigger durable re-entry contract.",
+              label: "Durable Trigger re-entry",
+              repo: null,
+              model: "sol",
+              reasoningEffort: "max",
+              modelReason: "Test supervisor route",
+              agentId: "paul",
+              readonly: true,
+              approvalRequired: false,
+              risk: "low",
+              acceptanceCriteria: ["The focused runtime suite passes."],
+            },
+            {
+              task: "Verify the independent durable recovery contract.",
+              label: "Recovery verification",
+              repo: null,
+              model: "terra",
+              reasoningEffort: "high",
+              modelReason: "Test supervisor route",
+              agentId: "sentry",
+              readonly: true,
+              approvalRequired: false,
+              risk: "low",
+              acceptanceCriteria: ["The recovery contract is independently verified."],
+            },
+          ],
           iterations: 2,
-          selectedAgents: ["paul"],
+          selectedAgents: ["paul", "sentry"],
           terminalReason: "desired_proposals_reached",
           networkStatus: "success",
         };
@@ -904,16 +964,32 @@ describe("mission supervisor Trigger tick", () => {
       deploymentVersion: "20260723.1",
       decision: {
         kind: "delegate",
-        workstreams: [{
-          task: "Implement the exact Trigger durable re-entry contract.",
-          label: "Durable Trigger re-entry",
-          model: "sol",
-          agentId: "paul",
-          readonly: true,
-          approvalRequired: false,
-          risk: "low",
-          acceptanceCriteria: ["The focused runtime suite passes."],
-        }],
+        workstreams: [
+          {
+            task: "Implement the exact Trigger durable re-entry contract.",
+            label: "Durable Trigger re-entry",
+            model: "sol",
+            reasoningEffort: "max",
+            modelReason: "Test supervisor route",
+            agentId: "paul",
+            readonly: true,
+            approvalRequired: false,
+            risk: "low",
+            acceptanceCriteria: ["The focused runtime suite passes."],
+          },
+          {
+            task: "Verify the independent durable recovery contract.",
+            label: "Recovery verification",
+            model: "terra",
+            reasoningEffort: "high",
+            modelReason: "Test supervisor route",
+            agentId: "sentry",
+            readonly: true,
+            approvalRequired: false,
+            risk: "low",
+            acceptanceCriteria: ["The recovery contract is independently verified."],
+          },
+        ],
       },
     });
     expect(runtime.calls.some(
@@ -991,6 +1067,8 @@ describe("mission supervisor Trigger tick", () => {
             label: "Exact foreground slice",
             repo: null,
             model: "terra",
+            reasoningEffort: "high",
+            modelReason: "Test supervisor route",
             agentId: "atlas",
             readonly: true,
             approvalRequired: false,
@@ -1055,6 +1133,8 @@ describe("mission supervisor Trigger tick", () => {
           label: "Draft guarded rental reply",
           repo: null,
           model: "sol",
+          reasoningEffort: "max",
+          modelReason: "Test supervisor route",
           agentId: "paul",
           readonly: true,
           approvalRequired: true,
@@ -1094,7 +1174,7 @@ describe("mission supervisor Trigger tick", () => {
       });
   });
 
-  it("rejects any safety or model-quality weakening of an explicit workstream", async () => {
+  it("preserves explicit safety and quality floors without paying for a planning model", async () => {
     const source = snapshot();
     const task =
       "Prepare a high-confidence readonly audit of the durable supervisor.";
@@ -1115,8 +1195,9 @@ describe("mission supervisor Trigger tick", () => {
     source.supervisor.requestDigest = sha(
       source.supervisor.requestPayloadJson,
     );
-    const runtime = harness(source, {
-      planning: async (input) => ({
+    const planning = vi.fn<MissionSupervisorTickDependencies["runPlanningNetwork"]>(async (
+      input,
+    ) => ({
         kind: "ready_to_commit",
         tickId: input.tickId,
         missionId: input.missionId,
@@ -1125,6 +1206,8 @@ describe("mission supervisor Trigger tick", () => {
           label: "Readonly supervisor audit",
           repo: null,
           model: "luna",
+          reasoningEffort: "low",
+          modelReason: "Test supervisor route",
           agentId: "sentry",
           readonly: false,
           approvalRequired: false,
@@ -1137,20 +1220,31 @@ describe("mission supervisor Trigger tick", () => {
         selectedAgents: ["sentry"],
         terminalReason: "desired_proposals_reached",
         networkStatus: "success",
-      }),
-    });
+      }));
+    const runtime = harness(source, { planning });
 
     await expect(runMissionSupervisorTick(
       tickPayload(),
       runContext(),
       runtime.dependencies,
-    )).resolves.toMatchObject({
-      status: "released",
-      errorCode: "planning_replaced_requested_work",
-    });
-    expect(runtime.calls.some(
-      (call) => call.path === "missionSupervisor:commitV1",
-    )).toBe(false);
+    )).resolves.toMatchObject({ status: "committed", kind: "delegate" });
+    expect(planning).not.toHaveBeenCalled();
+    expect(callFor(runtime.calls, "missionSupervisor:commitV1").args)
+      .toMatchObject({
+        decisionOrigin: "policy",
+        modelProvider: "deterministic-policy",
+        decision: {
+          kind: "delegate",
+          workstreams: [{
+            task,
+            model: "sol",
+            reasoningEffort: "max",
+            readonly: true,
+            approvalRequired: true,
+            risk: "consequential",
+          }],
+        },
+      });
   });
 
   it("fails closed when explicit slices or model proposals exceed desiredWorkstreams", async () => {
@@ -1184,7 +1278,9 @@ describe("mission supervisor Trigger tick", () => {
       errorCode: "invalid_snapshot",
     });
 
-    const excessiveProposalsRuntime = harness(snapshot(), {
+    const excessiveProposalsRuntime = harness(
+      withRequestPatch(snapshot(), { desiredWorkstreams: 2 }),
+      {
       planning: async (input) => ({
         kind: "ready_to_commit",
         tickId: input.tickId,
@@ -1195,6 +1291,8 @@ describe("mission supervisor Trigger tick", () => {
             label: "First bounded proposal",
             repo: null,
             model: "sol",
+            reasoningEffort: "max",
+            modelReason: "Test supervisor route",
             agentId: "paul",
             readonly: true,
             approvalRequired: false,
@@ -1206,15 +1304,30 @@ describe("mission supervisor Trigger tick", () => {
             label: "Second bounded proposal",
             repo: null,
             model: "sol",
+            reasoningEffort: "max",
+            modelReason: "Test supervisor route",
             agentId: "atlas",
             readonly: true,
             approvalRequired: false,
             risk: "low",
             acceptanceCriteria: ["The second focused test passes."],
           },
+          {
+            task: "Verify a third bounded supervisor proposal safely.",
+            label: "Third bounded proposal",
+            repo: null,
+            model: "terra",
+            reasoningEffort: "high",
+            modelReason: "Test supervisor route",
+            agentId: "sentry",
+            readonly: true,
+            approvalRequired: false,
+            risk: "low",
+            acceptanceCriteria: ["The third focused test passes."],
+          },
         ],
-        iterations: 2,
-        selectedAgents: ["paul", "atlas"],
+        iterations: 3,
+        selectedAgents: ["paul", "atlas", "sentry"],
         terminalReason: "desired_proposals_reached",
         networkStatus: "success",
       }),
@@ -1234,24 +1347,41 @@ describe("mission supervisor Trigger tick", () => {
   });
 
   it("releases rather than committing a network proposal outside the full admitted project set", async () => {
-    const runtime = harness(snapshot(), {
+    const runtime = harness(withRequestPatch(snapshot(), { desiredWorkstreams: 2 }), {
       planning: async (input) => ({
         kind: "ready_to_commit",
         tickId: input.tickId,
         missionId: input.missionId,
-        proposals: [{
-          task: "Mutate a repository that was never admitted to this mission.",
-          label: "Unadmitted mutation",
-          repo: "daniels-project-space/not-admitted",
-          model: "sol",
-          agentId: "paul",
-          readonly: false,
-          approvalRequired: false,
-          risk: "low",
-          acceptanceCriteria: ["The unadmitted repository changes."],
-        }],
-        iterations: 1,
-        selectedAgents: ["paul"],
+        proposals: [
+          {
+            task: "Mutate a repository that was never admitted to this mission.",
+            label: "Unadmitted mutation",
+            repo: "daniels-project-space/not-admitted",
+            model: "sol",
+            reasoningEffort: "max",
+            modelReason: "Test supervisor route",
+            agentId: "paul",
+            readonly: false,
+            approvalRequired: false,
+            risk: "low",
+            acceptanceCriteria: ["The unadmitted repository changes."],
+          },
+          {
+            task: "Verify the admitted evidence-only mission boundary.",
+            label: "Admitted boundary verification",
+            repo: null,
+            model: "terra",
+            reasoningEffort: "high",
+            modelReason: "Test supervisor route",
+            agentId: "sentry",
+            readonly: true,
+            approvalRequired: false,
+            risk: "low",
+            acceptanceCriteria: ["The admitted boundary remains intact."],
+          },
+        ],
+        iterations: 2,
+        selectedAgents: ["paul", "sentry"],
         terminalReason: "desired_proposals_reached",
         networkStatus: "success",
       }),
@@ -1271,7 +1401,7 @@ describe("mission supervisor Trigger tick", () => {
   });
 
   it("commits network no-proposals as a truthful model-authored request for input", async () => {
-    const runtime = harness(snapshot(), {
+    const runtime = harness(withRequestPatch(snapshot(), { desiredWorkstreams: 2 }), {
       planning: async (input, options) => {
         options.modelFor("sol");
         return {
@@ -1330,6 +1460,8 @@ describe("mission supervisor Trigger tick", () => {
           label: "First partial slice",
           repo: null,
           model: "sol",
+          reasoningEffort: "max",
+          modelReason: "Test supervisor route",
           agentId: "paul",
           readonly: true,
           approvalRequired: false,
@@ -1938,13 +2070,15 @@ describe("mission supervisor Trigger tick", () => {
       });
   });
 
-  it("invokes fresh Sol receipt synthesis only when every terminal receipt matches exact authority", async () => {
+  it("invokes fresh Sol synthesis only when multiple terminal receipts match exact authority", async () => {
     const completed = job({ status: "done" });
+    const second = job({ jobId: "job-2", status: "done" });
+    second.supervisorJobOrdinal = 1;
     const synthesis = vi.fn(async (
       input: Parameters<MissionSupervisorTickDependencies["runSynthesis"]>[0],
       options: Parameters<MissionSupervisorTickDependencies["runSynthesis"]>[1],
     ) => {
-      expect(input.jobs).toHaveLength(1);
+      expect(input.jobs).toHaveLength(2);
       expect(input.jobs[0].receipt).toMatchObject({
         jobId: completed.jobId,
         status: "succeeded",
@@ -1964,7 +2098,7 @@ describe("mission supervisor Trigger tick", () => {
       };
     });
     const created: LanguageModelV2[] = [];
-    const runtime = harness(snapshot([completed]), {
+    const runtime = harness(snapshot([completed, second]), {
       createModel: (tier) => {
         const model = fakeModel(`${tier}-fresh-${created.length}`);
         created.push(model);
@@ -2000,7 +2134,7 @@ describe("mission supervisor Trigger tick", () => {
     expect(commit.decision).not.toHaveProperty("evidence");
   });
 
-  it("synthesizes only verified leaves and excludes superseded failure prose", async () => {
+  it("projects one verified leaf deterministically and excludes superseded failure prose", async () => {
     const predecessor = recoveryJob({
       jobId: "job-synthesis-predecessor",
       recoveryDisposition: "retryable",
@@ -2011,21 +2145,12 @@ describe("mission supervisor Trigger tick", () => {
       status: "done",
     });
     const edge = supersession(predecessor, successor);
-    const synthesis = vi.fn(async (
-      input: Parameters<MissionSupervisorTickDependencies["runSynthesis"]>[0],
-    ) => {
-      expect(input.jobs.map((item) => item.jobId)).toEqual([successor.jobId]);
-      expect(JSON.stringify(input)).not.toContain(predecessor.result);
-      return {
-        summary:
-          "The recovered leaf completed with exact receipt-bound verification evidence.",
-        evidence: ["Focused tests passed."],
-      };
-    });
+    const synthesis = vi.fn();
+    const createModel = vi.fn(() => fakeModel("unexpected"));
     const runtime = harness(snapshot(
       [predecessor, successor],
       [edge],
-    ), { synthesis });
+    ), { synthesis, createModel });
 
     await expect(runMissionSupervisorTick(
       tickPayload(),
@@ -2035,7 +2160,20 @@ describe("mission supervisor Trigger tick", () => {
       status: "committed",
       kind: "synthesize",
     });
-    expect(synthesis).toHaveBeenCalledOnce();
+    expect(synthesis).not.toHaveBeenCalled();
+    expect(createModel).not.toHaveBeenCalled();
+    expect(callFor(runtime.calls, "missionSupervisor:commitV1").args)
+      .toMatchObject({
+        decisionOrigin: "policy",
+        modelProvider: "deterministic-policy",
+        decision: {
+          kind: "synthesize",
+          summary: expect.stringContaining(String(successor.result)),
+        },
+      });
+    expect(JSON.stringify(
+      callFor(runtime.calls, "missionSupervisor:commitV1").args.decision,
+    )).not.toContain(String(predecessor.result));
   });
 
   it("waits briefly instead of synthesizing when a done job lacks an exact receipt binding", async () => {
@@ -2069,7 +2207,7 @@ describe("mission supervisor Trigger tick", () => {
     let heartbeatCallback: (() => void) | undefined;
     const cancel = vi.fn();
     let observedSignal: AbortSignal | undefined;
-    const runtime = harness(snapshot(), {
+    const runtime = harness(withRequestPatch(snapshot(), { desiredWorkstreams: 2 }), {
       renew: (count) => count === 1
         ? {
             renewed: true,
@@ -2137,7 +2275,7 @@ describe("mission supervisor Trigger tick", () => {
     const modelStarted = new Promise<void>((resolve) => {
       started = resolve;
     });
-    const runtime = harness(snapshot(), {
+    const runtime = harness(withRequestPatch(snapshot(), { desiredWorkstreams: 2 }), {
       cancel,
       planning: async (_input, options) => {
         started?.();
@@ -2302,7 +2440,7 @@ describe("tool-less receipt synthesis and Convex transport", () => {
         [
           "import('./src/trigger/mission-supervisor.ts').then((loaded) => {",
           "const module = loaded.default ?? loaded;",
-          "if (!module.missionSupervisorTick || !module.missionSupervisorSweep) process.exit(2);",
+          "if (!module.missionSupervisorTick || !module.runMissionSupervisorDeadmanSweep) process.exit(2);",
           "process.stdout.write('loaded');",
           "})",
         ].join(""),

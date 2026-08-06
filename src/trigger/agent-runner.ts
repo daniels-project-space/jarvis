@@ -62,7 +62,11 @@ import {
   validatedGoalDeliveryBranch,
 } from "./github-delivery";
 import { wakeAgentFleet } from "../lib/agent-fleet-dispatch";
-import { dispatchMissionSupervisorWakeTicket } from "../lib/mission-supervisor-dispatch-runtime";
+import {
+  dispatchMissionSupervisorWakeTicket,
+  missionSupervisorDispatchEnabled,
+} from "../lib/mission-supervisor-dispatch-runtime";
+import { runMissionSupervisorDeadmanSweep } from "./mission-supervisor";
 import { BACKGROUND_CONCURRENCY_LIMIT, BACKGROUND_QUEUE } from "../lib/work-scheduler";
 import { admissionMutationName, v2AdmissionEnabled } from "../lib/mission-protocol-rollout";
 import { upstreamEvidencePrompt } from "../lib/upstream-evidence";
@@ -226,9 +230,10 @@ export interface AgentWorkerCompletionHandoffDependencies {
 
 /**
  * Wake the exact supervised mission that owns a completed worker, then retain
- * the generic fleet wake as a fail-soft fallback. The Convex query returns only
- * public scheduler fences; worker and Trigger capabilities never enter the
- * ticket or this result.
+ * the generic fleet wake as a fail-soft fallback. Dormant and rollback releases
+ * skip the supervisor Convex query entirely. The query returns only public
+ * scheduler fences; worker and Trigger capabilities never enter the ticket or
+ * this result.
  */
 export async function handoffCompletedAgentWorker(
   jobId: string,
@@ -239,19 +244,21 @@ export async function handoffCompletedAgentWorker(
   },
 ): Promise<{ supervisorContinued: boolean; continued: boolean }> {
   let supervisorContinued = false;
-  try {
-    const ticket = await dependencies.query(
-      "missionSupervisorHandoff:completionWakeTicketV1",
-      { jobId },
-    );
-    if (ticket !== null) {
-      supervisorContinued = (
-        await dependencies.dispatchWakeTicket(ticket)
-      ).dispatched;
+  if (missionSupervisorDispatchEnabled()) {
+    try {
+      const ticket = await dependencies.query(
+        "missionSupervisorHandoff:completionWakeTicketV1",
+        { jobId },
+      );
+      if (ticket !== null) {
+        supervisorContinued = (
+          await dependencies.dispatchWakeTicket(ticket)
+        ).dispatched;
+      }
+    } catch {
+      // The periodic supervisor sweep and generic fleet wake remain authoritative
+      // liveness fallbacks for query, network, or ambiguous Trigger failures.
     }
-  } catch {
-    // The minute supervisor sweep and generic fleet wake remain authoritative
-    // liveness fallbacks for query, network, or ambiguous Trigger failures.
   }
   const continued = await dependencies
     .wakeFleet(`worker-complete:${jobId}`)
@@ -778,7 +785,7 @@ export function createProductionAgentRunnerDependencies(): AgentRunnerDependenci
   };
 }
 
-// Cheap controller duties run once per minute, independently of specialist
+// Cheap controller duties run on the shared fleet cadence, independently of specialist
 // containers. This keeps reminders, recovery and incident dispatch alive even
 // when no Codex job happens to be running.
 export async function runAgentMaintenance() {
@@ -2237,6 +2244,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             workspace: providerWorkspace!,
             prompt,
             model,
+            reasoningEffort: job.reasoningEffort,
             onProgress: reportProgress,
             executionState: async () => {
               const state = await executionStatus();
@@ -3074,7 +3082,9 @@ export const agentFleetSupervisor = schedules.task({
   maxDuration: 120,
   run: async () => {
     const maintenance = await runAgentMaintenance();
+    const supervisor = await runMissionSupervisorDeadmanSweep()
+      .catch(() => ({ skipped: false, due: 0, dispatched: 0, failed: 1, launches: [] }));
     const dispatched = await wakeAgentFleet("fleet-supervisor").catch(() => false);
-    return { maintenance, dispatched, runtime: "trigger-fleet" };
+    return { maintenance, supervisor, dispatched, runtime: "trigger-fleet" };
   },
 });

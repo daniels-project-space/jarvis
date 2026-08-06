@@ -10,6 +10,7 @@ import {
   type ManagedWorkstream,
 } from "../mastra/supervisor-routing";
 import { routeWork } from "../mastra/routing";
+import { selectCodexWorkPolicy } from "./codex-work-router";
 
 export const MISSION_SUPERVISOR_ROLLOUT_ENV =
   "JARVIS_MISSION_SUPERVISOR_ROLLOUT";
@@ -32,6 +33,7 @@ export type MissionSupervisorRequestedWorkstream = Readonly<{
   label?: string;
   repo?: string;
   model?: string;
+  reasoningEffort?: string;
   agentId?: string;
   readonly?: boolean;
   approvalRequired?: boolean;
@@ -52,6 +54,8 @@ export type MissionSupervisorStartPayload = Readonly<{
     label: string;
     repo?: string;
     model: "luna" | "terra" | "sol";
+    reasoningEffort: "low" | "medium" | "high" | "max";
+    modelReason: string;
     agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
     readonly: boolean;
     approvalRequired: boolean;
@@ -286,6 +290,8 @@ function requestedWorkstreamPayload(
     label: workstream.label,
     ...(workstream.repo ? { repo: workstream.repo } : {}),
     model: workstream.model,
+    reasoningEffort: workstream.reasoningEffort,
+    modelReason: workstream.modelReason,
     agentId: workstream.agentId,
     readonly:
       workstream.readonly ||
@@ -322,6 +328,7 @@ function routedWorkstreams(
       label: boundedText(candidate.label, 80),
       repo,
       model: candidate.model,
+      reasoningEffort: candidate.reasoningEffort,
       agentId: candidate.agentId,
       readonly: candidate.readonly,
       approvalRequired: candidate.approvalRequired,
@@ -432,6 +439,20 @@ export async function startSupervisedOrchestrationIfSelected(
     admissionScopes,
   );
   const missionRoute = routeWork(goal, { repo: primaryRepo });
+  const missionPolicy = selectCodexWorkPolicy({
+    task: goal,
+    role: "jarvis",
+    repo: primaryRepo,
+    risk: missionRoute.risk,
+    requestedModel: missionRoute.model,
+  });
+  const desiredWorkstreams = requestedWorkstreams.length || (
+    missionPolicy.crossProject
+    || missionPolicy.complexity === "intense"
+    || missionPolicy.toolBreadth === "broad"
+      ? 2
+      : 1
+  );
   const priority = requestedWorkstreams.length
     ? Math.max(...requestedWorkstreams.map((workstream) =>
         routeWork(workstream.task, {
@@ -450,7 +471,7 @@ export async function startSupervisedOrchestrationIfSelected(
       ? { context: boundedText(input.context, 8_000) }
       : {}),
     ...(primaryRepo ? { repo: primaryRepo } : {}),
-    desiredWorkstreams: requestedWorkstreams.length || 2,
+    desiredWorkstreams,
     requestedWorkstreams,
     acceptanceCriteria: boundedCriteria(input.acceptanceCriteria),
     projectAdmissions,

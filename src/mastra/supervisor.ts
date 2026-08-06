@@ -27,6 +27,7 @@ const candidateSchema = z.object({
   label: z.string().optional(),
   repo: z.string().optional(),
   model: z.string().optional(),
+  reasoningEffort: z.string().optional(),
   agentId: z.string().optional(),
   readonly: z.boolean().optional(),
   approvalRequired: z.boolean().optional(),
@@ -55,17 +56,17 @@ function deterministicPlan(goal: string, repo?: string, context?: string): Manag
     context: context?.trim().slice(0, 4000) || null,
     rationale: route.reason,
     workstreams: [
-      {
-        label: `${TEAM_BY_SLUG[route.agentId].name} · ${TEAM_BY_SLUG[route.agentId].role}`.slice(0, 80),
+      normalizeWorkstream({
         task: goal.slice(0, 4000),
-        agentId: route.agentId === "jarvis" ? "atlas" : route.agentId,
-        repo: repo ?? null,
+        label: `${TEAM_BY_SLUG[route.agentId].name} · ${TEAM_BY_SLUG[route.agentId].role}`.slice(0, 80),
+        agentId: route.agentId,
+        repo,
         model: route.model,
         readonly: route.readonly,
         approvalRequired: route.approvalRequired,
         risk: route.risk,
         acceptanceCriteria: suggestedAcceptanceCriteria(goal, route),
-      },
+      }),
     ],
     plannedBy: "deterministic",
   };

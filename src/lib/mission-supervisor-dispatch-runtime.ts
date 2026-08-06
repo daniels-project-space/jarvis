@@ -10,6 +10,7 @@ import {
   parseMissionSupervisorWakeTicket,
   type MissionSupervisorTickPayload,
 } from "./mission-supervisor-dispatch";
+import { missionSupervisorRolloutMode } from "./mission-supervisor-orchestration";
 
 type MissionSupervisorTriggerOptions = {
   idempotencyKey: IdempotencyKey;
@@ -39,7 +40,7 @@ export interface MissionSupervisorServerDispatchDependencies {
 export type MissionSupervisorWakeDispatchResult =
   | {
       dispatched: false;
-      reason: "no_wake_ticket";
+      reason: "no_wake_ticket" | "supervisor_rollout_disabled";
     }
   | {
       dispatched: true;
@@ -77,12 +78,18 @@ function productionDependencies(): MissionSupervisorServerDispatchDependencies {
   };
 }
 
+export function missionSupervisorDispatchEnabled(): boolean {
+  const mode = missionSupervisorRolloutMode();
+  return mode === "active" || mode === "canary";
+}
+
 /**
  * Dispatch an exact wake ticket through a stable one-minute Trigger identity.
  *
  * This implementation is shared by Next server routes and Trigger workers.
- * `null` means Convex deliberately requested no immediate wake. Any malformed
- * value throws before Trigger is touched.
+ * `null` means Convex deliberately requested no immediate wake. Dormant and
+ * rollback releases return before ticket validation or Trigger setup; malformed
+ * values throw before Trigger is touched only when the rollout is enabled.
  */
 export async function dispatchMissionSupervisorWakeTicket(
   value: unknown,
@@ -91,6 +98,9 @@ export async function dispatchMissionSupervisorWakeTicket(
 ): Promise<MissionSupervisorWakeDispatchResult> {
   if (value === null) {
     return { dispatched: false, reason: "no_wake_ticket" };
+  }
+  if (!missionSupervisorDispatchEnabled()) {
+    return { dispatched: false, reason: "supervisor_rollout_disabled" };
   }
   const payload = parseMissionSupervisorWakeTicket(value);
   if (!dependencies.isConfigured()) {

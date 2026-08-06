@@ -63,6 +63,7 @@ describe("Codex app-server dynamic tools", () => {
       contextBlock: "",
       preamble: "test",
       modelTier: "luna",
+      reasoningEffort: "high",
       invocationContext: {
         requestId: "request-1",
         userMessageId: "message-1",
@@ -77,6 +78,7 @@ describe("Codex app-server dynamic tools", () => {
 
     await vi.waitFor(() => expect(writes).toHaveLength(2));
     expect(writes[1].method).toBe("turn/start");
+    expect(writes[1].params).toMatchObject({ model: "gpt-5.6-luna", effort: "high" });
     internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "turn-1" } } }));
     await Promise.resolve();
 
@@ -164,6 +166,7 @@ describe("Codex app-server dynamic tools", () => {
     });
     internals.receive(JSON.stringify({ id: writes[0].id, result: { thread: { id: "foreground-thread" } } }));
     await vi.waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes[1].params).toMatchObject({ model: "gpt-5.6-luna", effort: "low" });
     internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "foreground-turn" } } }));
     await Promise.resolve();
     internals.receive(JSON.stringify({ method: "turn/completed", params: { turnId: "foreground-turn", turn: { id: "foreground-turn", status: "completed" } } }));

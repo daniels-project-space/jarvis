@@ -28,6 +28,8 @@ import {
 } from "../src/lib/source-admission";
 import { redactSensitiveText } from "../src/lib/secret-redaction";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
+import { selectCodexRetryPolicy } from "../src/lib/codex-work-router";
+import { normalizeMinimumReasoningEffort } from "../src/lib/work-order-revision";
 import {
   exactTerminalWorkReceipt,
   terminalWorkReceiptDigest,
@@ -113,6 +115,12 @@ const reasoningEffortValidator = v.union(
   v.literal("high"),
   v.literal("max"),
 );
+const workerReasoningEffortValidator = v.union(
+  v.literal("low"),
+  v.literal("medium"),
+  v.literal("high"),
+  v.literal("max"),
+);
 const decisionOriginValidator = v.union(
   v.literal("model"),
   v.literal("policy"),
@@ -133,6 +141,8 @@ const requestedWorkstreamValidator = v.object({
   label: v.optional(v.string()),
   repo: v.optional(v.string()),
   model: v.optional(modelTierValidator),
+  reasoningEffort: v.optional(workerReasoningEffortValidator),
+  modelReason: v.optional(v.string()),
   agentId: v.optional(agentValidator),
   readonly: v.optional(v.boolean()),
   approvalRequired: v.optional(v.boolean()),
@@ -144,6 +154,8 @@ const delegatedWorkstreamValidator = v.object({
   label: v.string(),
   repo: v.optional(v.string()),
   model: modelTierValidator,
+  reasoningEffort: workerReasoningEffortValidator,
+  modelReason: v.string(),
   agentId: agentValidator,
   readonly: v.boolean(),
   approvalRequired: v.boolean(),
@@ -231,6 +243,8 @@ type RequestedWorkstreamInput = {
   label?: string;
   repo?: string;
   model?: "luna" | "terra" | "sol";
+  reasoningEffort?: WorkerReasoningEffort;
+  modelReason?: string;
   agentId?: "paul" | "atlas" | "iris" | "maya" | "sentry";
   readonly?: boolean;
   approvalRequired?: boolean;
@@ -242,6 +256,7 @@ type ModelTier = "luna" | "terra" | "sol";
 type PermanentAgent = "paul" | "atlas" | "iris" | "maya" | "sentry";
 type WorkRisk = "low" | "medium" | "high" | "consequential";
 type ReasoningEffort = "none" | "low" | "medium" | "high" | "max";
+type WorkerReasoningEffort = Exclude<ReasoningEffort, "none">;
 type DecisionOrigin = "model" | "policy";
 type ModelProvider = "codex-subscription" | "deterministic-policy";
 type SupervisorControlAction =
@@ -263,6 +278,8 @@ type DelegatedWorkstreamInput = {
   label: string;
   repo?: string;
   model: ModelTier;
+  reasoningEffort: WorkerReasoningEffort;
+  modelReason: string;
   agentId: PermanentAgent;
   readonly: boolean;
   approvalRequired: boolean;
@@ -417,6 +434,8 @@ function normalizeWorkstreams(
   label?: string;
   repo?: string;
   model?: "luna" | "terra" | "sol";
+  reasoningEffort?: WorkerReasoningEffort;
+  modelReason?: string;
   agentId?: "paul" | "atlas" | "iris" | "maya" | "sentry";
   readonly?: boolean;
   approvalRequired?: boolean;
@@ -456,6 +475,12 @@ function normalizeWorkstreams(
         `requestedWorkstreams[${index}].repo`,
       ),
       model: workstream.model,
+      reasoningEffort: workstream.reasoningEffort,
+      modelReason: optionalBoundedText(
+        workstream.modelReason,
+        `requestedWorkstreams[${index}].modelReason`,
+        300,
+      ),
       agentId: workstream.agentId,
       readonly: workstream.readonly,
       approvalRequired: workstream.approvalRequired,
@@ -500,6 +525,13 @@ function normalizeDelegatedWorkstreams(
         `decision.workstreams[${index}].repo`,
       ),
       model: workstream.model,
+      reasoningEffort: workstream.reasoningEffort,
+      modelReason: boundedText(
+        workstream.modelReason,
+        `decision.workstreams[${index}].modelReason`,
+        1,
+        300,
+      ),
       agentId: workstream.agentId,
       readonly: workstream.readonly,
       approvalRequired: workstream.approvalRequired,
@@ -514,6 +546,79 @@ function normalizeDelegatedWorkstreams(
     throw new Error("delegate.workstreams contains duplicate work");
   }
   return normalized;
+}
+
+function jsonRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function workerEffortRank(value: unknown): number {
+  return ["low", "medium", "high", "max"].indexOf(String(value));
+}
+
+function policyDelegationMatchesRequest(
+  decision: Extract<SupervisorDecisionInput, { kind: "delegate" }>,
+  requestPayloadJson: string,
+  missionGoal: string,
+): boolean {
+  let request: Record<string, unknown> | null = null;
+  try {
+    request = jsonRecord(JSON.parse(requestPayloadJson));
+  } catch {
+    return false;
+  }
+  if (!request) return false;
+  const desiredWorkstreams = Number(request.desiredWorkstreams);
+  const requested = Array.isArray(request.requestedWorkstreams)
+    ? request.requestedWorkstreams.map(jsonRecord).filter((item): item is Record<string, unknown> => item !== null)
+    : [];
+  if (
+    !Number.isSafeInteger(desiredWorkstreams)
+    || desiredWorkstreams < 1
+    || decision.workstreams.length !== desiredWorkstreams
+  ) return false;
+
+  const requestRepo = typeof request.repo === "string" ? request.repo : undefined;
+  const requestCriteria = Array.isArray(request.acceptanceCriteria)
+    ? request.acceptanceCriteria.filter((item): item is string => typeof item === "string")
+    : [];
+  const preserves = (
+    workstream: DelegatedWorkstreamInput,
+    source: Record<string, unknown>,
+    fallbackTask?: string,
+  ) => {
+    const sourceTask = typeof source.task === "string" ? source.task : fallbackTask;
+    const sourceRepo = typeof source.repo === "string" ? source.repo : requestRepo;
+    const sourceCriteria = Array.isArray(source.acceptanceCriteria)
+      ? source.acceptanceCriteria.filter((item): item is string => typeof item === "string")
+      : requestCriteria;
+    if (!sourceTask || workstream.task !== sourceTask || workstream.repo !== sourceRepo) return false;
+    if (typeof source.agentId === "string" && workstream.agentId !== source.agentId) return false;
+    if (typeof source.model === "string" && modelRank(workstream.model) < modelRank(source.model)) return false;
+    if (
+      typeof source.reasoningEffort === "string"
+      && workerEffortRank(workstream.reasoningEffort) < workerEffortRank(source.reasoningEffort)
+    ) return false;
+    if (source.readonly === true && workstream.readonly !== true) return false;
+    if (source.approvalRequired === true && workstream.approvalRequired !== true) return false;
+    if (typeof source.risk === "string" && riskRank(workstream.risk) < riskRank(source.risk)) return false;
+    return sourceCriteria.every((criterion) => workstream.acceptanceCriteria.includes(criterion));
+  };
+
+  if (requested.length === 0) {
+    return desiredWorkstreams === 1
+      && preserves(decision.workstreams[0], { ...request, task: missionGoal }, missionGoal);
+  }
+  if (requested.length !== desiredWorkstreams) return false;
+  const unmatched = [...decision.workstreams];
+  for (const source of requested) {
+    const match = unmatched.findIndex((workstream) => preserves(workstream, source));
+    if (match < 0) return false;
+    unmatched.splice(match, 1);
+  }
+  return unmatched.length === 0;
 }
 
 function normalizeRecoveries(
@@ -697,9 +802,8 @@ function normalizeCommitMetadata(
   const policyKind = ["wait", "replan"].includes(decision.kind)
     || (decision.kind === "recover"
       && decision.recoveries.every((recovery) => recovery.mode === "retry"));
-  const modelKind = ["delegate", "synthesize"].includes(decision.kind)
-    || (decision.kind === "recover"
-      && decision.recoveries.every((recovery) => recovery.mode !== "retry"));
+  const modelOnlyKind = decision.kind === "recover"
+    && decision.recoveries.every((recovery) => recovery.mode !== "retry");
   if (
     metadata.decisionOrigin === "model"
       ? metadata.modelProvider !== "codex-subscription"
@@ -710,7 +814,7 @@ function normalizeCommitMetadata(
   if (policyKind && metadata.decisionOrigin !== "policy") {
     throw new Error(`${decision.kind} must use deterministic policy authorship`);
   }
-  if (modelKind && metadata.decisionOrigin !== "model") {
+  if (modelOnlyKind && metadata.decisionOrigin !== "model") {
     throw new Error(`${decision.kind} must use Codex subscription authorship`);
   }
   if (metadata.decisionOrigin === "policy" && (
@@ -3075,6 +3179,34 @@ function riskRank(risk: unknown): number {
   return ["low", "medium", "high", "consequential"].indexOf(String(risk));
 }
 
+function exactQualityFailureCount(
+  predecessorJobId: Id<"jobs">,
+  currentTerminal: NonNullable<
+    Awaited<ReturnType<typeof exactTerminalWorkReceipt>>
+  >,
+  ledger: RecoveryLedger,
+): number {
+  let jobKey = String(predecessorJobId);
+  let terminal: Awaited<ReturnType<typeof exactTerminalWorkReceipt>> =
+    currentTerminal;
+  let failures = 0;
+  const visited = new Set<string>();
+  while (terminal && !visited.has(jobKey)) {
+    visited.add(jobKey);
+    if (
+      terminal.receipt.terminalCode === "verification_exhausted"
+      && terminal.receipt.recoveryDisposition === "remediable"
+    ) {
+      failures += 1;
+    }
+    const incoming = ledger.incoming.get(jobKey);
+    if (!incoming) break;
+    jobKey = String(incoming.predecessorJobId);
+    terminal = ledger.terminalReceipts.get(jobKey) ?? null;
+  }
+  return failures;
+}
+
 function supersessionDigestPayload(
   row: Omit<
     Doc<"missionSupervisorSupersessions">,
@@ -3468,7 +3600,7 @@ async function validateRecoveryLedger(
 }
 
 type SynthesisGate =
-  | { ok: true; evidence: string[] }
+  | { ok: true; evidence: string[]; leafCount: number }
   | { ok: false; reason: string; jobId?: Id<"jobs"> };
 
 async function synthesisEvidence(
@@ -3590,7 +3722,7 @@ async function synthesisEvidence(
       500,
     ));
   }
-  return { ok: true, evidence };
+  return { ok: true, evidence, leafCount: leaves.length };
 }
 
 function boundedSynthesisSummary(summary: string, evidence: readonly string[]) {
@@ -3749,6 +3881,17 @@ export const commitV1 = mutation({
         reason: "invalid_mission",
       };
     }
+    if (
+      envelope.metadata.decisionOrigin === "policy"
+      && envelope.decision.kind === "delegate"
+      && !policyDelegationMatchesRequest(
+        envelope.decision,
+        state.requestPayloadJson,
+        mission.goal,
+      )
+    ) {
+      throw new Error("Deterministic policy delegation does not match the admitted request");
+    }
 
     const createdJobIds: Id<"jobs">[] = [];
     const supersessionIds: Id<"missionSupervisorSupersessions">[] = [];
@@ -3858,6 +4001,8 @@ export const commitV1 = mutation({
           label: item.workstream.label,
           repo: item.repo,
           model: item.workstream.model,
+          reasoningEffort: item.workstream.reasoningEffort,
+          modelReason: item.workstream.modelReason,
           agentId: item.workstream.agentId,
           readonly: item.readonly,
           approvalRequired,
@@ -4109,7 +4254,43 @@ export const commitV1 = mutation({
         const label = revised?.label
           ?? predecessor.label
           ?? truncateUtf8(predecessorOrder.executableTask, 80);
-        const model = revised?.model ?? predecessorOrder.minimumModel;
+        const predecessorModelReason =
+          typeof predecessor.modelReason === "string"
+          && predecessor.modelReason.trim().length > 0
+            ? truncateUtf8(predecessor.modelReason, 300)
+            : undefined;
+        const adaptiveRoute = revised
+          ? selectCodexRetryPolicy({
+              model: predecessorOrder.minimumModel,
+              reasoningEffort: predecessorOrder.minimumReasoningEffort,
+              modelReason: predecessorModelReason,
+              qualityFailureCount: exactQualityFailureCount(
+                predecessor._id,
+                terminal,
+                lineage.ledger,
+              ),
+              evidence: terminal.receipt.terminalCode,
+            })
+          : null;
+        const model = revised && adaptiveRoute
+          ? modelRank(revised.model) > modelRank(adaptiveRoute.model)
+            ? revised.model
+            : adaptiveRoute.model
+          : predecessorOrder.minimumModel;
+        const reasoningEffort = adaptiveRoute
+          ? normalizeMinimumReasoningEffort(
+              adaptiveRoute.reasoningEffort,
+              model,
+            )
+          : predecessorOrder.minimumReasoningEffort;
+        const modelReason = revised && adaptiveRoute
+          ? modelRank(revised.model) > modelRank(adaptiveRoute.model)
+            ? truncateUtf8(
+                `Supervisor ${recovery.mode} strengthened ${adaptiveRoute.model} to ${revised.model} after exact ${terminal.receipt.terminalCode}. Prior: ${adaptiveRoute.modelReason}`,
+                300,
+              )
+            : adaptiveRoute.modelReason
+          : predecessorModelReason;
         const agentId = revised?.agentId ?? predecessorOrder.agentId;
         const risk = revised?.risk as WorkRisk | undefined
           ?? predecessorOrder.risk as WorkRisk;
@@ -4140,7 +4321,8 @@ export const commitV1 = mutation({
           label,
           repo: predecessorOrder.repository,
           model,
-          reasoningEffort: predecessorOrder.minimumReasoningEffort,
+          reasoningEffort,
+          ...(modelReason === undefined ? {} : { modelReason }),
           mcp: [...predecessorOrder.mcpScope],
           agentId,
           readonly: predecessorOrder.readonly,
@@ -4460,6 +4642,12 @@ export const commitV1 = mutation({
           reason: gate.reason,
           jobId: gate.jobId,
         };
+      }
+      if (
+        envelope.metadata.decisionOrigin === "policy"
+        && gate.leafCount !== 1
+      ) {
+        throw new Error("Deterministic policy synthesis requires exactly one receipt-bound leaf");
       }
       nonterminalJobCount = jobs.filter((job) =>
         !TERMINAL_JOB_STATUSES.has(job.status)

@@ -54,6 +54,7 @@ export async function runCloudWorkspaceAgent(input: {
   workspace: CloudWorkspace;
   prompt: string;
   model: string;
+  reasoningEffort?: unknown;
   timeoutMs: number;
   executionState?: () => Promise<string>;
   onProgress?: (line: string, log?: string, stage?: string, percent?: number) => void;
@@ -139,6 +140,7 @@ export async function runCloudWorkspaceAgent(input: {
       contextBlock: "The durable work item is authoritative; this provider session is disposable transport.",
       preamble: "Complete the scoped repository task using only the controller-owned cloud repository tools.",
       modelTier: input.model,
+      reasoningEffort: input.reasoningEffort,
       beforeTurn: async () => {
         await input.turnReceipt?.beforeRequest();
         requestIntent = true;

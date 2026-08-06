@@ -1,5 +1,5 @@
 import type { IdempotencyKey } from "@trigger.dev/sdk/v3";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
@@ -25,6 +25,7 @@ const ticket: MissionSupervisorWakeTicket = {
 };
 const globalKey =
   "global:mission-supervisor-test-key" as IdempotencyKey;
+const SUPERVISOR_ROLLOUT_ENV = "JARVIS_MISSION_SUPERVISOR_ROLLOUT";
 
 function harness(options: {
   configured?: boolean;
@@ -53,6 +54,14 @@ function harness(options: {
 }
 
 describe("mission supervisor Next server dispatch", () => {
+  beforeEach(() => {
+    vi.stubEnv(SUPERVISOR_ROLLOUT_ENV, "active");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("treats a null wake ticket as an intentional no-op", async () => {
     const runtime = harness();
     await expect(dispatchMissionSupervisorWakeTicket(
@@ -66,6 +75,25 @@ describe("mission supervisor Next server dispatch", () => {
     expect(runtime.createIdempotencyKey).not.toHaveBeenCalled();
     expect(runtime.triggerTick).not.toHaveBeenCalled();
   });
+
+  it.each(["dormant", "rollback"])(
+    "does no ticket, Trigger config, or idempotency work while %s",
+    async (rollout) => {
+      vi.stubEnv(SUPERVISOR_ROLLOUT_ENV, rollout);
+      const runtime = harness({ configured: false });
+
+      await expect(dispatchMissionSupervisorWakeTicket(
+        undefined,
+        runtime.dependencies,
+      )).resolves.toEqual({
+        dispatched: false,
+        reason: "supervisor_rollout_disabled",
+      });
+      expect(runtime.isConfigured).not.toHaveBeenCalled();
+      expect(runtime.createIdempotencyKey).not.toHaveBeenCalled();
+      expect(runtime.triggerTick).not.toHaveBeenCalled();
+    },
+  );
 
   it("fails before Trigger on malformed tickets or missing configuration", async () => {
     const malformed = harness();
@@ -120,6 +148,22 @@ describe("mission supervisor Next server dispatch", () => {
       payload: ticket,
       idempotencyKey: identity.idempotencyKey,
     });
+  });
+
+  it("preserves exact dispatch in canary rollout", async () => {
+    vi.stubEnv(SUPERVISOR_ROLLOUT_ENV, "canary");
+    const runtime = harness();
+
+    await expect(dispatchMissionSupervisorWakeTicket(
+      ticket,
+      runtime.dependencies,
+    )).resolves.toMatchObject({
+      dispatched: true,
+      runId: "run-immediate-wake-1",
+    });
+    expect(runtime.isConfigured).toHaveBeenCalledOnce();
+    expect(runtime.createIdempotencyKey).toHaveBeenCalledOnce();
+    expect(runtime.triggerTick).toHaveBeenCalledOnce();
   });
 
   it("surfaces an ambiguous launch failure and reuses the same retry identity", async () => {

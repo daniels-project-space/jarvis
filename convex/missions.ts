@@ -2,17 +2,31 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { normalizeWorkModelTier } from "../src/lib/work-models";
-import { insertMissionWithRuntime, patchMissionWithRuntime, runtimeMission } from "./controlPlane";
+import {
+  insertMissionWithRuntime,
+  patchMissionWithRuntime,
+  projectMissionRuntime,
+  runtimeMission,
+} from "./controlPlane";
 import { classifyFleetHealth } from "../src/lib/fleet-health";
 import { projectSourceAdmissionValidator, validProjectAdmissions } from "./sourceAdmission";
 
 const SYNTHESIS_LEASE_MS = 20 * 60 * 1000;
+const LEGACY_ADMISSION_TIMEOUT_MS = 15 * 60 * 1000;
+const LEGACY_ADMISSION_INTERRUPTED = "Legacy mission admission was interrupted before any canonical jobs were created";
 
 // Legacy fleet synthesis is an explicit allowlist. Goal Mode and every future
 // supervisor protocol own their own leases, receipts, and terminal delivery;
 // they must never enter this historical raw-result synthesizer by omission.
 export function isLegacySynthesisMode(mode: unknown): mode is undefined | "fleet" | "single" {
   return mode === undefined || mode === "fleet" || mode === "single";
+}
+
+function missionProjectionDiffers(runtime: Record<string, unknown>, projected: Record<string, unknown>) {
+  const runtimeKeys = Object.keys(runtime).filter((key) => key !== "_id" && key !== "_creationTime");
+  const projectedKeys = Object.keys(projected);
+  if (runtimeKeys.length !== projectedKeys.length) return true;
+  return projectedKeys.some((key) => JSON.stringify(runtime[key]) !== JSON.stringify(projected[key]));
 }
 
 function synthesisPayload(mission: any, jobs: any[], attempt: number) {
@@ -314,14 +328,36 @@ export const claimReady = mutation({
       .order("asc")
       .take(30);
     for (const activity of synthesizing) {
-      if (!isLegacySynthesisMode(activity.mode) || activity.updatedAt + SYNTHESIS_LEASE_MS > now) continue;
       const mission = await ctx.db.get(activity.missionId);
-      if (!mission || mission.status !== "synthesizing" || !isLegacySynthesisMode(mission.mode)
+      if (!mission) {
+        if (isLegacySynthesisMode(activity.mode)) await ctx.db.delete(activity._id);
+        continue;
+      }
+      if (!isLegacySynthesisMode(mission.mode)) continue;
+      const projectedMission = projectMissionRuntime(mission);
+      if (missionProjectionDiffers(activity, projectedMission)) {
+        await ctx.db.replace(activity._id, projectedMission);
+      }
+      if (mission.status !== "synthesizing"
         || (mission.synthesisLeaseUntil ?? mission.updatedAt + SYNTHESIS_LEASE_MS) > now) continue;
       const jobs = await ctx.db
         .query("jobs")
         .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
         .take(100);
+      if (!jobs.length) {
+        if (mission.createdAt + LEGACY_ADMISSION_TIMEOUT_MS > now) continue;
+        await patchMissionWithRuntime(ctx, mission, {
+          status: "failed",
+          phase: "failed",
+          percent: 100,
+          failureReason: LEGACY_ADMISSION_INTERRUPTED,
+          completedAt: now,
+          synthesisLeaseUntil: undefined,
+          updatedAt: now,
+        });
+        continue;
+      }
+      if (jobs.some((job) => !["done", "error", "cancelled"].includes(job.status))) continue;
       const synthesisAttempt = (mission.synthesisAttempt ?? 0) + 1;
       await patchMissionWithRuntime(ctx, mission, {
         synthesisAttempt,
@@ -336,19 +372,44 @@ export const claimReady = mutation({
       .order("asc")
       .take(30);
     for (const activity of missions) {
-      if (!isLegacySynthesisMode(activity.mode)) continue;
-      const projectedJobs = await ctx.db
-        .query("jobRuntime")
-        .withIndex("by_mission", (q: any) => q.eq("missionId", String(activity.missionId)))
-        .take(100);
-      if (!projectedJobs.length || projectedJobs.some((job: any) => !["done", "error", "cancelled"].includes(job.status))) continue;
       const mission = await ctx.db.get(activity.missionId);
-      if (!mission || mission.status !== "running" || !isLegacySynthesisMode(mission.mode)) continue;
+      if (!mission) {
+        // A projection cannot prove what a deleted mission's protocol was. Only
+        // remove rows that positively identify themselves as legacy.
+        if (isLegacySynthesisMode(activity.mode)) await ctx.db.delete(activity._id);
+        continue;
+      }
+      // The canonical mission owns protocol and lifecycle authority. Goal and
+      // supervised missions are deliberately outside this legacy reconciler.
+      if (!isLegacySynthesisMode(mission.mode)) continue;
+
+      const projectedMission = projectMissionRuntime(mission);
+      if (missionProjectionDiffers(activity, projectedMission)) {
+        await ctx.db.replace(activity._id, projectedMission);
+      }
+      if (mission.status !== "running") continue;
+
+      // Canonical jobs are the only completion authority. A missing or stale
+      // jobRuntime projection must never suppress a valid synthesis claim, and
+      // a terminal projection must never fabricate one.
       const jobs = await ctx.db
         .query("jobs")
         .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
         .take(100);
-      if (!jobs.length || jobs.some((job: any) => !["done", "error", "cancelled"].includes(job.status))) continue;
+      if (!jobs.length) {
+        if (mission.createdAt + LEGACY_ADMISSION_TIMEOUT_MS > now) continue;
+        await patchMissionWithRuntime(ctx, mission, {
+          status: "failed",
+          phase: "failed",
+          percent: 100,
+          failureReason: LEGACY_ADMISSION_INTERRUPTED,
+          completedAt: now,
+          synthesisLeaseUntil: undefined,
+          updatedAt: now,
+        });
+        continue;
+      }
+      if (jobs.some((job) => !["done", "error", "cancelled"].includes(job.status))) continue;
       const synthesisAttempt = (mission.synthesisAttempt ?? 0) + 1;
       await patchMissionWithRuntime(ctx, mission, {
         status: "synthesizing",

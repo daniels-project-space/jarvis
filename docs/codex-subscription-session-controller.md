@@ -71,6 +71,15 @@ are withheld from Codex and unrelated Git children. Static `R2_ACCESS_KEY_ID`,
 `R2_SECRET_ACCESS_KEY`, and `R2_SESSION_TOKEN` values are rejected by the
 session controller. Session objects are never written to Convex, Trigger
 metadata, checkpoints, application APIs, Git, or the public artifacts bucket.
+
+If the controller reports `refresh_token_reused`, re-enrol it from a separate,
+currently valid Codex login that no other process will use again. Replace the
+single vaulted `CODEX_AUTH_JSON_B64` bootstrap, remove only
+`managed-codex-session/state.json`, acquire and verify a fresh managed snapshot
+twice, then retire the source `auth.json`. Never seed the controller from an
+actively used developer login: refresh tokens are one-time authority and two
+independent refreshers will eventually strand one another.
+
 The vault client accepts only the canonical HTTPS
 `fantastic-roadrunner-485.convex.cloud` origin, rejects redirects, and applies a
 bounded request timeout before placing the vault capability in a POST body.

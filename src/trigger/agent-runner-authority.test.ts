@@ -67,6 +67,7 @@ vi.mock("./cloud-workspace-providers", async (importOriginal) => ({
 import {
   agentWorker,
   createProductionAgentRunnerDependencies,
+  handoffCompletedAgentWorker,
   runAgentHarness,
   type AgentRunnerBoundaryObservation,
   type AgentRunnerDependencies,
@@ -179,12 +180,13 @@ function bridgeProductionRunnerToConvex(
   return { trace, fetchMock };
 }
 
-async function reservedWritableJob(t: HarnessConvex, key: string) {
+async function reservedWritableJob(t: HarnessConvex, key: string, reasoningEffort?: string) {
   const mission = await testMissionAdmission(t, { key, workerToken: WORKER, repository: REPO });
   const jobId = await t.mutation(api.jobs.enqueueV2, {
     task: "Implement the exact production runner authority fixture and stop before any untrusted checkout.",
     repo: REPO,
     readonly: false,
+    reasoningEffort,
     missionId: String(mission.missionId),
     label: "identical mutable runner label",
     workerToken: WORKER,
@@ -486,6 +488,7 @@ function fakeGitHubDeliveryTransport(providerEffects: string[]) {
 
 beforeEach(() => {
   process.env.JARVIS_WORKER_TOKEN = WORKER;
+  process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT = "dormant";
   boundaries.resolveSubscriptionAgentBin.mockReset();
   boundaries.resolveSubscriptionAgentBin.mockReturnValue(null);
   boundaries.configuredCloudWorkspaceProvider.mockClear();
@@ -496,12 +499,65 @@ beforeEach(() => {
 
 afterEach(() => {
   delete process.env.JARVIS_WORKER_TOKEN;
+  delete process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT;
   delete process.env.GITHUB_TOKEN;
   delete process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING;
   vi.unstubAllGlobals();
 });
 
 describe("production Trigger worker authority harness", () => {
+  it.each(["dormant", "rollback"] as const)(
+    "does not read supervisor authority during %s completion handoff",
+    async (mode) => {
+      process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT = mode;
+      const query = vi.fn(async () => null);
+      const dispatchWakeTicket = vi.fn(async () => ({ dispatched: true }));
+      const wakeFleet = vi.fn(async () => true);
+
+      await expect(handoffCompletedAgentWorker(`job-${mode}`, {
+        query,
+        dispatchWakeTicket,
+        wakeFleet,
+      })).resolves.toEqual({ supervisorContinued: false, continued: true });
+
+      expect(query).not.toHaveBeenCalled();
+      expect(dispatchWakeTicket).not.toHaveBeenCalled();
+      expect(wakeFleet).toHaveBeenCalledWith(`worker-complete:job-${mode}`);
+    },
+  );
+
+  it.each(["active", "canary"] as const)(
+    "dispatches the exact completion wake ticket during %s rollout",
+    async (mode) => {
+      process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT = mode;
+      const jobId = `job-${mode}`;
+      const ticket = {
+        protocolVersion: 1,
+        missionId: `mission-${mode}`,
+        expectedLeaseVersion: 2,
+        expectedEpoch: 3,
+        expectedDecisionSequence: 4,
+        expectedInputRevision: 5,
+      };
+      const query = vi.fn(async () => ticket);
+      const dispatchWakeTicket = vi.fn(async () => ({ dispatched: true }));
+      const wakeFleet = vi.fn(async () => true);
+
+      await expect(handoffCompletedAgentWorker(jobId, {
+        query,
+        dispatchWakeTicket,
+        wakeFleet,
+      })).resolves.toEqual({ supervisorContinued: true, continued: true });
+
+      expect(query).toHaveBeenCalledWith(
+        "missionSupervisorHandoff:completionWakeTicketV1",
+        { jobId },
+      );
+      expect(dispatchWakeTicket).toHaveBeenCalledWith(ticket);
+      expect(wakeFleet).toHaveBeenCalledWith(`worker-complete:${jobId}`);
+    },
+  );
+
   it("fails a wrong-repository ledger injection before subscription, provider, clone, or tools", async () => {
     const t = convexTest(schema, modules);
     const { jobId, reservation } = await reservedWritableJob(t, "runner-wrong-repository");
@@ -528,7 +584,6 @@ describe("production Trigger worker authority harness", () => {
     expect(result).toMatchObject({ processed: 0, stale: true, continued: false, runtime: "trigger" });
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
       "jobs:claimDispatched",
-      "missionSupervisorHandoff:completionWakeTicketV1",
       "jobs:reserveDispatchBatch",
     ]);
     expect(boundaries.resolveSubscriptionAgentBin).not.toHaveBeenCalled();
@@ -569,7 +624,6 @@ describe("production Trigger worker authority harness", () => {
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
       "jobs:claimDispatched",
       "jobs:checkpointAndRequeue",
-      "missionSupervisorHandoff:completionWakeTicketV1",
       "jobs:reserveDispatchBatch",
     ]);
     const claim = bridge.trace[0];
@@ -638,7 +692,6 @@ describe("production Trigger worker authority harness", () => {
     });
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
       "jobs:claimDispatched",
-      "missionSupervisorHandoff:completionWakeTicketV1",
       "jobs:reserveDispatchBatch",
     ]);
     expect(boundaries.resolveSubscriptionAgentBin).not.toHaveBeenCalled();
@@ -662,7 +715,6 @@ describe("production Trigger worker authority harness", () => {
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
       "jobs:claimDispatched",
       "jobs:checkpointAndRequeue",
-      "missionSupervisorHandoff:completionWakeTicketV1",
       "jobs:reserveDispatchBatch",
     ]);
     expect(boundaries.resolveSubscriptionAgentBin).toHaveBeenCalledWith("codex");
@@ -680,7 +732,11 @@ describe("production Trigger worker authority harness", () => {
   it("runs the real specialist and delivery lifecycle with exact server authority and reconciles a lost observation response", async () => {
     configureFakeControllerAuthority();
     const t = convexTest(schema, modules);
-    const { jobId, reservation } = await reservedWritableJob(t, "runner-full-authority-lifecycle");
+    const { jobId, reservation } = await reservedWritableJob(
+      t,
+      "runner-full-authority-lifecycle",
+      "max",
+    );
     const trace: BoundaryTrace[] = [];
     const specialistBridge = bridgeProductionRunnerToConvex(t);
     const cleanup = vi.fn((consumerEnv: Readonly<Record<string, string | undefined>>) => {
@@ -695,6 +751,9 @@ describe("production Trigger worker authority harness", () => {
     const specialist = await invokeHarness(reservation, "specialist-authority-run", specialistDependencies);
 
     expect(specialist).toEqual({ processed: 1 });
+    expect(specialistDependencies.runCloudWorkspaceAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ reasoningEffort: "max" }),
+    );
     const sealed = await t.run(async (ctx) => ({
       job: await ctx.db.get(jobId),
       attempt: await ctx.db.query("workAttempts")
@@ -704,6 +763,7 @@ describe("production Trigger worker authority harness", () => {
     }));
     expect(sealed.job).toMatchObject({
       status: "pending",
+      reasoningEffort: "max",
       verificationVerdict: "pass",
       reviewReceiptId: sealed.reviews[0]?._id,
       reviewReceiptDigest: sealed.reviews[0]?.receiptDigest,

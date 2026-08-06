@@ -204,14 +204,17 @@ describe("streaming and paginated history behavior", () => {
     const replay = await t.mutation(api.chatQueue.sendMessage, input);
     expect(replay).toBe(first);
 
+    const claimToken = "stable-chat-claim";
     const claim = await t.mutation(api.chatQueue.claimMessage, {
       messageId: first,
+      claimToken,
       workerToken: WORKER,
     });
     expect(claim).toMatchObject({
       requestId: input.requestId,
       userMessageId: first,
       userText: input.text,
+      claimToken,
     });
   });
 

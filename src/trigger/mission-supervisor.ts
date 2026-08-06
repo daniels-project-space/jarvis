@@ -4,7 +4,6 @@ import type { LanguageModelV2 } from "@ai-sdk/provider";
 import { Agent } from "@mastra/core/agent";
 import {
   idempotencyKeys,
-  schedules,
   task,
   tasks,
 } from "@trigger.dev/sdk/v3";
@@ -25,6 +24,8 @@ import {
 } from "../mastra/mission-supervisor-network";
 import { createCodexSubscriptionLanguageModel } from "../mastra/codex-subscription-model";
 import { TEAM_BY_SLUG, type ModelTier } from "../mastra/team";
+import { normalizeWorkstream } from "../mastra/supervisor-routing";
+import { missionSupervisorRolloutMode } from "../lib/mission-supervisor-orchestration";
 import { codexModelFor } from "./model-policy";
 
 export {
@@ -132,6 +133,8 @@ type SupervisorDecision =
         label: string;
         repo?: string;
         model: ModelTier;
+        reasoningEffort: "low" | "medium" | "high" | "max";
+        modelReason: string;
         agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
         readonly: boolean;
         approvalRequired: boolean;
@@ -312,6 +315,8 @@ const requestedWorkstreamSchema = z.object({
   label: boundedString(80).optional(),
   repo: boundedString(120).optional(),
   model: z.enum(["luna", "terra", "sol"]).optional(),
+  reasoningEffort: z.enum(["low", "medium", "high", "max"]).optional(),
+  modelReason: boundedString(300).optional(),
   agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]).optional(),
   readonly: z.boolean().optional(),
   approvalRequired: z.boolean().optional(),
@@ -659,6 +664,8 @@ const planningWorkstreamSchema = z.object({
   label: boundedString(80).min(3),
   repo: boundedString(120).nullable(),
   model: z.enum(["luna", "terra", "sol"]),
+  reasoningEffort: z.enum(["low", "medium", "high", "max"]),
+  modelReason: boundedString(300).min(1),
   agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]),
   readonly: z.boolean(),
   approvalRequired: z.boolean(),
@@ -1363,6 +1370,8 @@ function delegateDecision(
       label: proposal.label,
       ...(proposal.repo === null ? {} : { repo: proposal.repo }),
       model: proposal.model,
+      reasoningEffort: proposal.reasoningEffort,
+      modelReason: proposal.modelReason,
       agentId: proposal.agentId,
       readonly: proposal.readonly,
       approvalRequired: proposal.approvalRequired,
@@ -1411,6 +1420,7 @@ function assertPlanningAuthority(
   request: RequestPayload,
 ): void {
   const modelRank = { luna: 0, terra: 1, sol: 2 } as const;
+  const effortRank = { low: 0, medium: 1, high: 2, max: 3 } as const;
   const riskRank = {
     low: 0,
     medium: 1,
@@ -1449,6 +1459,9 @@ function assertPlanningAuthority(
       && (requested.label === undefined || proposal.label === requested.label)
       && (requested.model === undefined
         || modelRank[proposal.model] >= modelRank[requested.model])
+      && (requested.reasoningEffort === undefined
+        || effortRank[proposal.reasoningEffort]
+          >= effortRank[requested.reasoningEffort])
       && (requested.agentId === undefined || proposal.agentId === requested.agentId)
       && (requested.readonly !== true || proposal.readonly === true)
       && (requested.approvalRequired === undefined
@@ -1479,6 +1492,53 @@ async function planEmptyMission(
   dependencies: MissionSupervisorTickDependencies,
 ): Promise<PreparedDecision> {
   const tickId = planningTickId(payload, snapshotDigest);
+  const deterministicInputs = request.requestedWorkstreams.length === request.desiredWorkstreams
+    ? request.requestedWorkstreams
+    : request.requestedWorkstreams.length === 0 && request.desiredWorkstreams === 1
+      ? [{
+          task: snapshot.mission.goal,
+          label: "Mission outcome",
+          repo: request.repo,
+          readonly: request.risk === "consequential",
+          approvalRequired: request.risk === "consequential",
+          risk: request.risk,
+          acceptanceCriteria: request.acceptanceCriteria,
+        }]
+      : null;
+  if (deterministicInputs) {
+    const proposals = deterministicInputs.map((workstream) => normalizeWorkstream({
+      task: workstream.task,
+      label: workstream.label,
+      repo: workstream.repo ?? request.repo,
+      model: workstream.model,
+      reasoningEffort: workstream.reasoningEffort,
+      agentId: workstream.agentId,
+      readonly: workstream.readonly,
+      approvalRequired: workstream.approvalRequired,
+      risk: workstream.risk,
+      acceptanceCriteria: workstream.acceptanceCriteria,
+    }));
+    const result = planningResultSchema.parse({
+      kind: "ready_to_commit",
+      tickId,
+      missionId: payload.missionId,
+      proposals,
+      iterations: 1,
+      selectedAgents: [...new Set(proposals.map((proposal) => proposal.agentId))],
+      terminalReason: "desired_proposals_reached",
+      networkStatus: "success",
+    });
+    assertPlanningAuthority(result, request);
+    return {
+      decision: delegateDecision(result),
+      rationale: `Deterministic policy preserved ${proposals.length} exact workstream(s) without a supervisor model call.`,
+      metadata: policyMetadata(
+        request.requestedWorkstreams.length
+          ? "Explicit workstreams already satisfy the requested fleet"
+          : "A single bounded mission needs one adaptively routed specialist",
+      ),
+    };
+  }
   const raw = await dependencies.runPlanningNetwork(
     {
       tickId,
@@ -1962,6 +2022,20 @@ async function synthesisDecision(
   signal: AbortSignal,
   dependencies: MissionSupervisorTickDependencies,
 ): Promise<PreparedDecision> {
+  if (jobs.length === 1) {
+    const job = jobs[0];
+    const result = safeBoundedText(
+      job.result ?? job.evidenceSummary ?? job.verificationNote ?? "The workstream completed with an exact verified receipt.",
+      3_500,
+      "The workstream completed with an exact verified receipt.",
+    );
+    const label = safeBoundedText(job.label ?? "Mission outcome", 120, "Mission outcome");
+    return {
+      decision: { kind: "synthesize", summary: `${label}: ${result}` },
+      rationale: "A single exact succeeded/pass receipt was projected deterministically; no synthesis model was needed.",
+      metadata: policyMetadata("Single receipt-bound outcome needs no model synthesis"),
+    };
+  }
   const model = dependencies.createLanguageModel(
     "sol",
     MISSION_SUPERVISOR_MODEL_TIMEOUT_MS,
@@ -2671,6 +2745,18 @@ function productionTickDependencies(): MissionSupervisorTickDependencies {
   };
 }
 
+export async function runMissionSupervisorTickForRollout(
+  payload: MissionSupervisorTickPayload,
+  runContext: MissionSupervisorRunContext,
+  dependenciesFactory: () => MissionSupervisorTickDependencies = productionTickDependencies,
+) {
+  const mode = missionSupervisorRolloutMode();
+  if (mode === "dormant" || mode === "rollback") {
+    return { status: "disabled" as const, mode, missionId: payload.missionId };
+  }
+  return runMissionSupervisorTick(payload, runContext, dependenciesFactory());
+}
+
 export const missionSupervisorTick = task({
   id: MISSION_SUPERVISOR_TICK_TASK_ID,
   machine: "small-1x",
@@ -2680,16 +2766,16 @@ export const missionSupervisorTick = task({
   },
   retry: { maxAttempts: 1 },
   maxDuration: 1_800,
-  run: async (payload: MissionSupervisorTickPayload, { ctx, signal }) =>
-    runMissionSupervisorTick(
+  run: async (payload: MissionSupervisorTickPayload, { ctx, signal }) => {
+    return runMissionSupervisorTickForRollout(
       payload,
       {
         runId: ctx.run.id,
         deploymentVersion: ctx.deployment?.version,
         signal,
       },
-      productionTickDependencies(),
-    ),
+    );
+  },
 });
 
 function productionSweepDependencies(): MissionSupervisorSweepDependencies {
@@ -2717,15 +2803,12 @@ function productionSweepDependencies(): MissionSupervisorSweepDependencies {
   };
 }
 
-export const missionSupervisorSweep = schedules.task({
-  id: MISSION_SUPERVISOR_SWEEP_TASK_ID,
-  cron: "* * * * *",
-  machine: "micro",
-  queue: {
-    name: "jarvis-mission-supervisor-sweep",
-    concurrencyLimit: 1,
-  },
-  retry: { maxAttempts: 1 },
-  maxDuration: 60,
-  run: async () => runMissionSupervisorSweep(productionSweepDependencies()),
-});
+export async function runMissionSupervisorDeadmanSweep(
+  dependenciesFactory: () => MissionSupervisorSweepDependencies = productionSweepDependencies,
+) {
+  const mode = missionSupervisorRolloutMode();
+  if (mode === "dormant" || mode === "rollback") {
+    return { mode, skipped: true, due: 0, dispatched: 0, failed: 0, launches: [] };
+  }
+  return { mode, skipped: false, ...(await runMissionSupervisorSweep(dependenciesFactory())) };
+}

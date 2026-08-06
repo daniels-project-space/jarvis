@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { resolve } from "node:path";
 import { isProxy } from "node:util/types";
-import { codexModelFor } from "./model-policy";
+import { codexModelFor, normalizeReasoningEffort } from "./model-policy";
 import { appendAgentMessageDelta } from "./codex-stream";
 import { redactSensitiveText } from "../lib/secret-redaction";
 import { BoundedJsonLineDecoder } from "../lib/bounded-json-lines";
@@ -329,6 +329,7 @@ export type CodexTurnInput = {
   contextBlock: string;
   preamble: string;
   modelTier: string;
+  reasoningEffort?: unknown;
   allowTools?: boolean;
   invocationContext?: ToolInvocationContext;
   outputSchema?: JsonObject;
@@ -508,7 +509,7 @@ export class CodexAppServer {
       threadId,
       input: userInput,
       model: selection.model,
-      effort: selection.effort,
+      effort: normalizeReasoningEffort(input.reasoningEffort, selection.effort),
       approvalPolicy: "never",
       ...(outputSchema === undefined ? {} : { outputSchema }),
     }, 30_000, input.onTurnRequestWritten);

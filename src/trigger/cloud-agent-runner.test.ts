@@ -85,7 +85,7 @@ describe("cloud Codex runner attestation boundary", () => {
     const result = await runCloudWorkspaceAgent({
       bin: "unused", controllerScratch: scratch,
       controllerEnv: { NODE_ENV: "test", CODEX_HOME: "/authority/codex-job-4", HOME: "/authority" },
-      provider, workspace, prompt: "work", model: "terra", timeoutMs: 2_000,
+      provider, workspace, prompt: "work", model: "terra", reasoningEffort: "high", timeoutMs: 2_000,
       turnReceipt: {
         beforeRequest: async () => { phases.push("request_intent"); },
         requestWritten: () => { phases.push("request_written"); },
@@ -98,6 +98,7 @@ describe("cloud Codex runner attestation boundary", () => {
 
     expect(result.text).toBe("done");
     expect(runTurn).toHaveBeenCalledTimes(1);
+    expect(runTurn).toHaveBeenCalledWith(expect.objectContaining({ reasoningEffort: "high" }));
     expect(phases).toEqual(["request_intent", "request_written", "accepted", "completed"]);
   });
 });

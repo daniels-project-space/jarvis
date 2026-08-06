@@ -31,6 +31,9 @@ async function seedMission(
     mode: MissionMode;
     status?: MissionStatus;
     jobStatus?: string;
+    runtimeJobStatus?: string;
+    includeJob?: boolean;
+    includeJobRuntime?: boolean;
     createdAt?: number;
     updatedAt?: number;
   },
@@ -64,23 +67,32 @@ async function seedMission(
       projectMissionRuntime({ ...mission, _id: missionId }),
     );
 
-    const job = {
-      task: `${args.mode ?? "undefined"} completed specialist`,
-      missionId: String(missionId),
-      label: `${args.mode ?? "undefined"} specialist`,
-      status: args.jobStatus ?? "done",
-      priority: 50,
-      stage: "complete",
-      percent: 100,
-      attempt: 1,
-      maxAttempts: 1,
-      heartbeatAt: updatedAt,
-      progressAt: updatedAt,
-      createdAt,
-      completedAt: updatedAt,
-    };
-    const jobId = await ctx.db.insert("jobs", job);
-    await ctx.db.insert("jobRuntime", projectJobRuntime({ ...job, _id: jobId }));
+    let jobId: Id<"jobs"> | undefined;
+    if (args.includeJob !== false) {
+      const job = {
+        task: `${args.mode ?? "undefined"} completed specialist`,
+        missionId: String(missionId),
+        label: `${args.mode ?? "undefined"} specialist`,
+        status: args.jobStatus ?? "done",
+        priority: 50,
+        stage: "complete",
+        percent: 100,
+        attempt: 1,
+        maxAttempts: 1,
+        heartbeatAt: updatedAt,
+        progressAt: updatedAt,
+        createdAt,
+        completedAt: updatedAt,
+      };
+      jobId = await ctx.db.insert("jobs", job);
+      if (args.includeJobRuntime !== false) {
+        await ctx.db.insert("jobRuntime", projectJobRuntime({
+          ...job,
+          status: args.runtimeJobStatus ?? job.status,
+          _id: jobId,
+        }));
+      }
+    }
     return { missionId, jobId };
   });
 }
@@ -200,6 +212,200 @@ describe("legacy mission synthesis authority", () => {
     }));
     expect(attempts).toEqual({ supervised: 1, goal: 1, single: 2 });
   });
+
+  it("claims terminal canonical jobs when their runtime projection is missing", async () => {
+    const t = convexTest(schema, modules);
+    const seeded = await seedMission(t, {
+      mode: "fleet",
+      includeJobRuntime: false,
+    });
+
+    const claim = await t.mutation(api.missions.claimReady, {
+      workerToken: WORKER,
+    });
+
+    expect(claim).toMatchObject({ id: seeded.missionId, synthesisAttempt: 1 });
+    expect(await missionStatus(t, seeded.missionId)).toBe("synthesizing");
+  });
+
+  it("never synthesizes from a terminal projection when the canonical job is active", async () => {
+    const t = convexTest(schema, modules);
+    const seeded = await seedMission(t, {
+      mode: "single",
+      jobStatus: "running",
+      runtimeJobStatus: "done",
+    });
+
+    expect(await t.mutation(api.missions.claimReady, {
+      workerToken: WORKER,
+    })).toBeNull();
+    expect(await missionStatus(t, seeded.missionId)).toBe("running");
+  });
+
+  it("keeps a fresh zero-job admission open and atomically fails an interrupted old admission", async () => {
+    const t = convexTest(schema, modules);
+    const now = Date.now();
+    const old = await seedMission(t, {
+      mode: "fleet",
+      includeJob: false,
+      createdAt: now - 16 * 60_000,
+      updatedAt: now - 16 * 60_000,
+    });
+    const fresh = await seedMission(t, {
+      mode: "single",
+      includeJob: false,
+      createdAt: now - 14 * 60_000,
+      updatedAt: now - 14 * 60_000,
+    });
+
+    expect(await t.mutation(api.missions.claimReady, {
+      workerToken: WORKER,
+    })).toBeNull();
+
+    const state = await t.run(async (ctx) => {
+      const oldMission = await ctx.db.get(old.missionId);
+      const freshMission = await ctx.db.get(fresh.missionId);
+      const oldRuntime = await ctx.db
+        .query("missionRuntime")
+        .withIndex("by_mission", (q) => q.eq("missionId", old.missionId))
+        .first();
+      const freshRuntime = await ctx.db
+        .query("missionRuntime")
+        .withIndex("by_mission", (q) => q.eq("missionId", fresh.missionId))
+        .first();
+      return { oldMission, freshMission, oldRuntime, freshRuntime };
+    });
+    expect(state.oldMission).toMatchObject({
+      status: "failed",
+      phase: "failed",
+      percent: 100,
+      failureReason: "Legacy mission admission was interrupted before any canonical jobs were created",
+    });
+    expect(state.oldMission?.completedAt).toEqual(expect.any(Number));
+    expect(state.oldRuntime).toMatchObject({
+      status: "failed",
+      phase: "failed",
+      percent: 100,
+      failureReason: "Legacy mission admission was interrupted before any canonical jobs were created",
+      completedAt: state.oldMission?.completedAt,
+    });
+    expect(state.freshMission?.status).toBe("running");
+    expect(state.freshRuntime?.status).toBe("running");
+  });
+
+  it("fails an expired zero-job synthesis lease instead of synthesizing an empty result", async () => {
+    const t = convexTest(schema, modules);
+    const old = Date.now() - 40 * 60_000;
+    const seeded = await seedMission(t, {
+      mode: "single",
+      status: "synthesizing",
+      includeJob: false,
+      createdAt: old,
+      updatedAt: old,
+    });
+
+    expect(await t.mutation(api.missions.claimReady, {
+      workerToken: WORKER,
+    })).toBeNull();
+    const state = await t.run(async (ctx) => {
+      const mission = await ctx.db.get(seeded.missionId);
+      const runtime = await ctx.db
+        .query("missionRuntime")
+        .withIndex("by_mission", (q) => q.eq("missionId", seeded.missionId))
+        .first();
+      return { mission, runtime };
+    });
+    expect(state.mission).toMatchObject({
+      status: "failed",
+      failureReason: "Legacy mission admission was interrupted before any canonical jobs were created",
+    });
+    expect(state.runtime).toMatchObject({
+      status: "failed",
+      completedAt: state.mission?.completedAt,
+    });
+  });
+
+  it.each(["running", "synthesizing"] as const)(
+    "deletes an orphaned legacy %s runtime row",
+    async (status) => {
+      const t = convexTest(schema, modules);
+      const seeded = await seedMission(t, {
+        mode: "fleet",
+        status,
+        includeJob: false,
+      });
+      await t.run(async (ctx) => ctx.db.delete(seeded.missionId));
+
+      expect(await t.mutation(api.missions.claimReady, {
+        workerToken: WORKER,
+      })).toBeNull();
+      expect(await t.run(async (ctx) => ctx.db
+        .query("missionRuntime")
+        .withIndex("by_mission", (q) => q.eq("missionId", seeded.missionId))
+        .first())).toBeNull();
+    },
+  );
+
+  it("repairs a legacy runtime projection from canonical mission state", async () => {
+    const t = convexTest(schema, modules);
+    const seeded = await seedMission(t, {
+      mode: "single",
+      includeJob: false,
+    });
+    const completedAt = Date.now();
+    await t.run(async (ctx) => ctx.db.patch(seeded.missionId, {
+      status: "done",
+      phase: "complete",
+      percent: 100,
+      completedAt,
+      updatedAt: completedAt,
+    }));
+
+    expect(await t.mutation(api.missions.claimReady, {
+      workerToken: WORKER,
+    })).toBeNull();
+    const runtime = await t.run(async (ctx) => ctx.db
+      .query("missionRuntime")
+      .withIndex("by_mission", (q) => q.eq("missionId", seeded.missionId))
+      .first());
+    expect(runtime).toMatchObject({
+      status: "done",
+      phase: "complete",
+      percent: 100,
+      completedAt,
+      updatedAt: completedAt,
+    });
+  });
+
+  it.each(["goal", "supervised"] as const)(
+    "does not reconcile an old zero-job %s mission",
+    async (mode) => {
+      const t = convexTest(schema, modules);
+      const old = Date.now() - 60 * 60_000;
+      const seeded = await seedMission(t, {
+        mode,
+        includeJob: false,
+        createdAt: old,
+        updatedAt: old,
+      });
+
+      expect(await t.mutation(api.missions.claimReady, {
+        workerToken: WORKER,
+      })).toBeNull();
+      const state = await t.run(async (ctx) => {
+        const mission = await ctx.db.get(seeded.missionId);
+        const runtime = await ctx.db
+          .query("missionRuntime")
+          .withIndex("by_mission", (q) => q.eq("missionId", seeded.missionId))
+          .first();
+        return { mission, runtime };
+      });
+      expect(state.mission).toMatchObject({ status: "running", mode });
+      expect(state.runtime).toMatchObject({ status: "running", mode });
+      expect(state.mission?.completedAt).toBeUndefined();
+      expect(state.runtime?.completedAt).toBeUndefined();
+    },
+  );
 
   it("rejects legacy finish for supervised and Goal missions while preserving fleet finish", async () => {
     const t = convexTest(schema, modules);
