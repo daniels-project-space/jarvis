@@ -20,11 +20,17 @@ import type * as controlPlane from "../controlPlane.js";
 import type * as creationFiling from "../creationFiling.js";
 import type * as creations from "../creations.js";
 import type * as findings from "../findings.js";
-import type * as goalMode from "../goalMode.js";
+import type * as goalHandoffs from "../goalHandoffs.js";
 import type * as goalIntegration from "../goalIntegration.js";
+import type * as goalMode from "../goalMode.js";
 import type * as incidents from "../incidents.js";
 import type * as jobs from "../jobs.js";
 import type * as memory from "../memory.js";
+import type * as missionSupervisor from "../missionSupervisor.js";
+import type * as missionSupervisorCommand from "../missionSupervisorCommand.js";
+import type * as missionSupervisorHandoff from "../missionSupervisorHandoff.js";
+import type * as missionSupervisorProtocol from "../missionSupervisorProtocol.js";
+import type * as missionSupervisorWake from "../missionSupervisorWake.js";
 import type * as missions from "../missions.js";
 import type * as proactive from "../proactive.js";
 import type * as proactivePolicy from "../proactivePolicy.js";
@@ -33,12 +39,17 @@ import type * as projectState from "../projectState.js";
 import type * as push from "../push.js";
 import type * as reflexContext from "../reflexContext.js";
 import type * as reminders from "../reminders.js";
+import type * as sourceAdmission from "../sourceAdmission.js";
+import type * as supervisorFleetManifest from "../supervisorFleetManifest.js";
+import type * as supervisorJobControl from "../supervisorJobControl.js";
+import type * as testSourceAdmission from "../testSourceAdmission.js";
 import type * as ui from "../ui.js";
 import type * as visualContext from "../visualContext.js";
 import type * as watchPolicy from "../watchPolicy.js";
 import type * as watchRules from "../watchRules.js";
 import type * as workEvents from "../workEvents.js";
 import type * as workPolicy from "../workPolicy.js";
+import type * as workReceiptAuthority from "../workReceiptAuthority.js";
 
 import type {
   ApiFromModules,
@@ -59,11 +70,17 @@ declare const fullApi: ApiFromModules<{
   creationFiling: typeof creationFiling;
   creations: typeof creations;
   findings: typeof findings;
-  goalMode: typeof goalMode;
+  goalHandoffs: typeof goalHandoffs;
   goalIntegration: typeof goalIntegration;
+  goalMode: typeof goalMode;
   incidents: typeof incidents;
   jobs: typeof jobs;
   memory: typeof memory;
+  missionSupervisor: typeof missionSupervisor;
+  missionSupervisorCommand: typeof missionSupervisorCommand;
+  missionSupervisorHandoff: typeof missionSupervisorHandoff;
+  missionSupervisorProtocol: typeof missionSupervisorProtocol;
+  missionSupervisorWake: typeof missionSupervisorWake;
   missions: typeof missions;
   proactive: typeof proactive;
   proactivePolicy: typeof proactivePolicy;
@@ -72,12 +89,17 @@ declare const fullApi: ApiFromModules<{
   push: typeof push;
   reflexContext: typeof reflexContext;
   reminders: typeof reminders;
+  sourceAdmission: typeof sourceAdmission;
+  supervisorFleetManifest: typeof supervisorFleetManifest;
+  supervisorJobControl: typeof supervisorJobControl;
+  testSourceAdmission: typeof testSourceAdmission;
   ui: typeof ui;
   visualContext: typeof visualContext;
   watchPolicy: typeof watchPolicy;
   watchRules: typeof watchRules;
   workEvents: typeof workEvents;
   workPolicy: typeof workPolicy;
+  workReceiptAuthority: typeof workReceiptAuthority;
 }>;
 
 /**

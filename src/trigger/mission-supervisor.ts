@@ -26,6 +26,7 @@ import { createCodexSubscriptionLanguageModel } from "../mastra/codex-subscripti
 import { TEAM_BY_SLUG, type ModelTier } from "../mastra/team";
 import { normalizeWorkstream } from "../mastra/supervisor-routing";
 import { missionSupervisorRolloutMode } from "../lib/mission-supervisor-orchestration";
+import { wakeAgentFleet } from "../lib/agent-fleet-dispatch";
 import { codexModelFor } from "./model-policy";
 
 export {
@@ -2754,7 +2755,26 @@ export async function runMissionSupervisorTickForRollout(
   if (mode === "dormant" || mode === "rollback") {
     return { status: "disabled" as const, mode, missionId: payload.missionId };
   }
-  return runMissionSupervisorTick(payload, runContext, dependenciesFactory());
+  const result = await runMissionSupervisorTick(
+    payload,
+    runContext,
+    dependenciesFactory(),
+  );
+  return handoffCreatedSupervisorJobs(result);
+}
+
+export async function handoffCreatedSupervisorJobs(
+  result: Awaited<ReturnType<typeof runMissionSupervisorTick>>,
+  wakeFleet: (reason: string, fanOut?: number) => Promise<boolean> = wakeAgentFleet,
+) {
+  if (result.status !== "committed" || result.createdJobIds.length === 0) {
+    return result;
+  }
+  const fleetWoken = await wakeFleet(
+    `mission-supervisor:${result.missionId}`,
+    result.createdJobIds.length,
+  ).catch(() => false);
+  return { ...result, fleetWoken };
 }
 
 export const missionSupervisorTick = task({

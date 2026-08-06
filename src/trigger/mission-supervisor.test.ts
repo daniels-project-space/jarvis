@@ -21,6 +21,7 @@ import {
   MISSION_SUPERVISOR_RECEIPT_WAIT_MS,
   canonicalSupervisorDigest,
   createSupervisorConvexClient,
+  handoffCreatedSupervisorJobs,
   missionSupervisorDispatchIdentity,
   missionSupervisorLeaseOwner,
   parseMissionSupervisorTickPayload,
@@ -61,6 +62,61 @@ describe("mission supervisor rollout runtime gates", () => {
       if (prior === undefined) delete process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT;
       else process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT = prior;
     }
+  });
+});
+
+describe("mission supervisor worker handoff", () => {
+  it("immediately wakes the bounded specialist fan-out after a committed delegation", async () => {
+    const wakeFleet = vi.fn().mockResolvedValue(true);
+    await expect(handoffCreatedSupervisorJobs({
+      status: "committed",
+      missionId: "mission-immediate",
+      kind: "delegate",
+      replayed: false,
+      decisionId: "decision-1",
+      decisionKey: "decision-key-1",
+      resultState: "waiting",
+      createdJobIds: ["job-1", "job-2"],
+    }, wakeFleet)).resolves.toMatchObject({
+      status: "committed",
+      fleetWoken: true,
+    });
+    expect(wakeFleet).toHaveBeenCalledOnce();
+    expect(wakeFleet).toHaveBeenCalledWith(
+      "mission-supervisor:mission-immediate",
+      2,
+    );
+  });
+
+  it("keeps the deadman fallback authoritative when an immediate wake is ambiguous", async () => {
+    const wakeFleet = vi.fn().mockRejectedValue(new Error("transport ambiguous"));
+    await expect(handoffCreatedSupervisorJobs({
+      status: "committed",
+      missionId: "mission-fallback",
+      kind: "delegate",
+      replayed: true,
+      decisionId: "decision-2",
+      decisionKey: "decision-key-2",
+      resultState: "waiting",
+      createdJobIds: ["job-3"],
+    }, wakeFleet)).resolves.toMatchObject({
+      status: "committed",
+      fleetWoken: false,
+    });
+  });
+
+  it("does not touch the fleet when no runnable jobs were created", async () => {
+    const wakeFleet = vi.fn();
+    await expect(handoffCreatedSupervisorJobs({
+      status: "not_claimed",
+      missionId: "mission-stale",
+      reason: "lease_not_due",
+    }, wakeFleet)).resolves.toEqual({
+      status: "not_claimed",
+      missionId: "mission-stale",
+      reason: "lease_not_due",
+    });
+    expect(wakeFleet).not.toHaveBeenCalled();
   });
 });
 
