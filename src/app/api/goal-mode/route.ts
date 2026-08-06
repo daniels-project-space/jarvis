@@ -3,6 +3,7 @@ import { wakeAgentFleet } from "@/lib/agent-fleet-dispatch";
 import { controlMutation, controlQuery } from "@/lib/control-session";
 import { routeGoal } from "@/lib/goal-mode";
 import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
+import { isSafeSourceBranch } from "@/lib/source-admission";
 import { resolveProjectSourceAdmission } from "@/lib/source-admission-server";
 import { admissionMutationName, v2AdmissionEnabled } from "@/lib/mission-protocol-rollout";
 
@@ -17,13 +18,29 @@ export async function POST(req: NextRequest) {
   if (goal.length < 12) {
     return Response.json({ ok: false, error: "Describe the concrete outcome in at least 12 characters." }, { status: 400 });
   }
+  const requestedSourceBranch = body?.sourceBranch;
+  if (requestedSourceBranch !== undefined && !isSafeSourceBranch(requestedSourceBranch)) {
+    return Response.json({ ok: false, error: "Explicit source branch is invalid." }, { status: 400 });
+  }
   const credentials = controlCredentials(actor);
   const route = routeGoal(goal, body?.repo ? String(body.repo) : undefined);
   const protocolV2 = v2AdmissionEnabled();
+  if (requestedSourceBranch !== undefined && !protocolV2) {
+    return Response.json({
+      ok: false,
+      error: "Explicit source branch requires the v2 mission protocol.",
+    }, { status: 409 });
+  }
+  if (requestedSourceBranch !== undefined && !route.primaryRepo) {
+    return Response.json({
+      ok: false,
+      error: "Explicit source branch requires a routed repository.",
+    }, { status: 400 });
+  }
   let projectAdmission;
   if (protocolV2) {
     try {
-      projectAdmission = await resolveProjectSourceAdmission(route.primaryRepo);
+      projectAdmission = await resolveProjectSourceAdmission(route.primaryRepo, requestedSourceBranch);
     } catch (error) {
       return Response.json({
         ok: false,
@@ -34,7 +51,7 @@ export async function POST(req: NextRequest) {
   const originThreadId = String(
     await controlQuery("ui:getActiveThread", credentials).catch(() => "main"),
   ) || "main";
-  const created: any = await controlMutation(admissionMutationName("goal"), {
+  const created = await controlMutation(admissionMutationName("goal"), {
     ...credentials,
     goal,
     route: route.kind,
@@ -50,7 +67,7 @@ export async function POST(req: NextRequest) {
       : undefined,
     maxBuildSessions: Number(body?.maxBuildSessions) || 6,
     maxRevisionWaves: Number(body?.maxRevisionWaves) || 2,
-  });
+  }) as { missionId?: unknown; held?: boolean; reason?: unknown } | null;
   const missionId = String(created?.missionId ?? "");
   if (!missionId) return Response.json({ ok: false, error: "Goal Mode could not create its durable mission." }, { status: 503 });
   const woken = created?.held ? false : await wakeAgentFleet(`goal:${missionId}`).catch(() => false);

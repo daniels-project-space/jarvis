@@ -34,6 +34,101 @@ async function createTurn(t: ReturnType<typeof convexTest>, requestId: string) {
 }
 
 describe("durable foreground chat recovery", () => {
+  it("seals an authoritative cancellation fence before retry and rejects every late worker write", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await createTurn(t, "cancel-fence");
+    const claim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: userId,
+      claimToken: "cancelled-claim",
+      workerToken: WORKER,
+    });
+    expect(claim).not.toBeNull();
+    expect(await t.mutation(api.chatQueue.updateStream, {
+      messageId: claim!.assistantId,
+      claimToken: "cancelled-claim",
+      text: "partial answer",
+      revision: 1,
+      workerToken: WORKER,
+    })).toBe(true);
+
+    const cancellation = await t.mutation(api.chatQueue.cancelTurn, {
+      messageId: userId,
+      threadId: "main",
+      workerToken: WORKER,
+    });
+    expect(cancellation).toMatchObject({ status: "cancelled", messageId: userId });
+    expect(cancellation.status === "cancelled" ? cancellation.fenceReceipt : "").toMatch(/^.+:\d+:\d+$/);
+    expect(await t.query(api.chatQueue.turnCancellationForWorker, {
+      messageId: claim!.assistantId,
+      claimToken: "cancelled-claim",
+      workerToken: WORKER,
+    })).toBe(true);
+    expect(await t.mutation(api.chatQueue.cancelTurn, {
+      messageId: userId,
+      threadId: "main",
+      workerToken: WORKER,
+    })).toEqual(cancellation);
+    expect(await t.mutation(api.chatQueue.requestRecovery, {
+      messageId: userId,
+      threadId: "main",
+      workerToken: WORKER,
+    })).toMatchObject({ status: "cancelled", messageId: userId });
+
+    const cancelledRows = await t.query(api.chatQueue.listMessages, {
+      threadId: "main",
+      workerToken: WORKER,
+    });
+    const cancelledAssistant = cancelledRows.find((row) => row._id === claim!.assistantId)!;
+    expect(cancelledAssistant).toMatchObject({
+      status: "error",
+      text: "Reply cancelled.",
+      delivery: "foreground",
+    });
+    expect(cancelledRows.find((row) => row._id === userId)?.status).toBe("error");
+
+    vi.advanceTimersByTime(10_000);
+    await t.mutation(api.chatQueue.touchRunner, {
+      runnerId: "late-runner",
+      activeMessageId: claim!.assistantId,
+      claimToken: "cancelled-claim",
+      workerToken: WORKER,
+    });
+    expect(await t.mutation(api.chatQueue.updateStream, {
+      messageId: claim!.assistantId,
+      claimToken: "cancelled-claim",
+      text: "late output",
+      revision: 2,
+      workerToken: WORKER,
+    })).toBe(false);
+    expect(await t.mutation(api.chatQueue.finalize, {
+      messageId: claim!.assistantId,
+      threadId: "main",
+      claimToken: "cancelled-claim",
+      status: "done",
+      finalText: "late final",
+      model: "late model",
+      workerToken: WORKER,
+    })).toBe(false);
+    expect(await t.mutation(api.chatQueue.claimMessage, {
+      messageId: userId,
+      claimToken: "late-reclaim",
+      workerToken: WORKER,
+    })).toBeNull();
+
+    const fencedRows = await t.query(api.chatQueue.listMessages, {
+      threadId: "main",
+      workerToken: WORKER,
+    });
+    const fencedAssistant = fencedRows.find((row) => row._id === claim!.assistantId)!;
+    expect(fencedAssistant).toMatchObject({
+      status: "error",
+      text: "Reply cancelled.",
+      delivery: "foreground",
+      lastProgressAt: cancelledAssistant.lastProgressAt,
+    });
+    expect(fencedAssistant.model).toBe(cancelledAssistant.model);
+  });
+
   it("keeps a heartbeating attempt active and requeues only after its progress expires", async () => {
     const t = convexTest(schema, modules);
     const userId = await createTurn(t, "stale-fence");
@@ -70,6 +165,11 @@ describe("durable foreground chat recovery", () => {
       threadId: "main",
       workerToken: WORKER,
     })).toMatchObject({ status: "requeued", attemptCount: 1 });
+    expect(await t.query(api.chatQueue.turnCancellationForWorker, {
+      messageId: first!.assistantId,
+      claimToken: "claim-1",
+      workerToken: WORKER,
+    })).toBe(true);
 
     expect(await t.mutation(api.chatQueue.updateStream, {
       messageId: first!.assistantId,

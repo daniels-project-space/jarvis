@@ -12,7 +12,7 @@ import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from ".
 import { createICloudEvent, deleteICloudEvent, findICloudEvents, listICloudEvents } from "./icloud-calendar";
 import { scanGmailBookingConfirmations } from "./booking-email";
 import { resolveProjectSourceAdmission } from "./source-admission-server";
-import type { ProjectSourceAdmission } from "./source-admission";
+import { isSafeSourceBranch, type ProjectSourceAdmission } from "./source-admission";
 import { canonicalizeRepository } from "./workflow-contract";
 import { admissionMutationName, v2AdmissionEnabled } from "./mission-protocol-rollout";
 import {
@@ -96,6 +96,7 @@ export const TOOL_DEFS = [
         mission_id: { type: "string", description: "Goal Mode mission id; required for pause/resume/cancel and optional for status" },
         input: { type: "string", description: "Steering instruction when action=steer; preserves accepted node scope and creates fresh execution generations" },
         repo: { type: "string", description: "Known owner/repo only when the goal explicitly belongs there" },
+        source_branch: { type: "string", description: "Exact existing GitHub branch to seal as the v2 mission source; start only" },
         acceptance_criteria: { type: "array", items: { type: "string" }, description: "Observable goal-level truths the final Sol validator must prove" },
         build_sessions: { type: "number", description: "Maximum bounded Terra/high implementation sessions, 2-8; default 6" },
         revision_waves: { type: "number", description: "Maximum automatic Terra repair waves after final validation, 1-4; default 2" },
@@ -3238,11 +3239,29 @@ export async function executeTool(
       if (action !== "start") return "Unknown Goal Mode action.";
       const goal = String(args.goal ?? "").trim();
       if (goal.length < 12) return "Tell me the concrete outcome Goal Mode must achieve.";
+      const requestedSourceBranch = args.source_branch;
+      if (requestedSourceBranch !== undefined && !isSafeSourceBranch(requestedSourceBranch)) {
+        return "Explicit source branch is invalid; use an exact Git-safe branch name.";
+      }
       const { routeGoal } = await import("./goal-mode");
       const route = routeGoal(goal, args.repo ? String(args.repo) : undefined);
       const originThreadId = await activeThread();
       const protocolV2 = v2AdmissionEnabled();
-      const [projectAdmission] = protocolV2 ? await resolveMissionProjectAdmissions([route.primaryRepo]) : [undefined];
+      if (requestedSourceBranch !== undefined && !protocolV2) {
+        return "Explicit source branch requires the v2 mission protocol; no mission was created.";
+      }
+      if (requestedSourceBranch !== undefined && !route.primaryRepo) {
+        return "Explicit source branch requires a routed repository; no mission was created.";
+      }
+      let projectAdmission: ProjectSourceAdmission | undefined;
+      if (protocolV2) {
+        try {
+          projectAdmission = await resolveProjectSourceAdmission(route.primaryRepo, requestedSourceBranch);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : "Project source admission failed";
+          return `Goal Mode did not create a mission because exact source admission failed: ${reason.slice(0, 240)}.`;
+        }
+      }
       const created = await convexMutation(admissionMutationName("goal"), {
         authTokenHash,
         goal,
@@ -3263,7 +3282,7 @@ export async function executeTool(
       if (!created?.held) await wakeAgentFleet(`goal:${id}`).catch(() => false);
       return created?.held
         ? `Goal Mode ${id} is durably held while the mission protocol rollout is dormant; no planner or repository workspace was started.`
-        : `Goal Mode ${id} is live. Route: ${route.kind}${route.primaryRepo ? ` in ${route.primaryRepo}` : ""} — ${route.reason} One Sol/max planner is working now; it will hand bounded work to Terra/high, preserve checkpoints for days if needed, and only finish after a Sol/max deep validation passes.`;
+        : `Goal Mode ${id} is live. Route: ${route.kind}${route.primaryRepo ? ` in ${route.primaryRepo}` : ""} — ${route.reason} One Sol/max planner is working now; it will route bounded work to the least expensive model that preserves its quality floor, save a durable checkpoint before every continuation, and only finish after a Sol/max deep validation passes.`;
     }
     case "orchestrate": {
       const mission = String(args.mission ?? "").trim();

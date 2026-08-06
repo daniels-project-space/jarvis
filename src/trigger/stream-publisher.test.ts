@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { StreamPublisher } from "./stream-publisher";
 
 describe("StreamPublisher", () => {
@@ -51,5 +51,24 @@ describe("StreamPublisher", () => {
     publisher.push(" two");
     await publisher.flush();
     expect(painted).toBe(1);
+  });
+
+  it("interrupts once on an authoritative rejected fence but not on transport ambiguity", async () => {
+    const outcomes: unknown[] = [undefined, false, false];
+    const rejected = vi.fn();
+    const publisher = new StreamPublisher(
+      async () => outcomes.shift(),
+      120,
+      undefined,
+      rejected,
+    );
+    publisher.push("One");
+    await publisher.flush();
+    expect(rejected).not.toHaveBeenCalled();
+    publisher.push(" two");
+    await publisher.flush();
+    publisher.push(" three");
+    await publisher.flush();
+    expect(rejected).toHaveBeenCalledTimes(1);
   });
 });

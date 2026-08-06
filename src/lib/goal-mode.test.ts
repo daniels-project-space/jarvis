@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  GOAL_AUTOMATIC_ATTEMPT_LIMITS,
   GOAL_PLAN_MARKER,
   GOAL_PLAN_RESULT_MAX_CHARS,
   GOAL_VALIDATION_MARKER,
@@ -11,11 +12,62 @@ import {
   parseGoalValidation,
   plannerTask,
   routeGoal,
+  selectGoalWorkstreamPolicy,
   summarizeGoalPhase,
   validatorTask,
 } from "./goal-mode";
 
 describe("Goal Mode contracts", () => {
+  it("keeps automatic continuation budgets stage-bounded and explicitly resumable", () => {
+    expect(GOAL_AUTOMATIC_ATTEMPT_LIMITS).toEqual({
+      planning: 3,
+      building: 4,
+      validating: 3,
+      refining: 3,
+    });
+  });
+
+  it("uses Luna only for bounded low-risk evidence and preserves stronger quality floors", () => {
+    const evidence = selectGoalWorkstreamPolicy({
+      task: "Run a bounded deterministic read-only audit and verify the exact configuration evidence.",
+      agentId: "atlas",
+      repo: "daniels-project-space/youtube-studio-ai",
+      readonly: true,
+      mcp: [],
+    });
+    expect(evidence).toMatchObject({
+      model: "luna",
+      reasoningEffort: "medium",
+      workType: "research",
+      complexity: "bounded",
+      productionRisk: "low",
+    });
+
+    const protectedTasks = [
+      {
+        task: "Fix the recurring production root cause across the media generation pipeline.",
+        readonly: false,
+      },
+      {
+        task: "Implement reliable thumbnail media generation with real render validation.",
+        readonly: false,
+      },
+      {
+        task: "Verify the production deployment and provider surfaces end to end.",
+        readonly: true,
+      },
+    ] as const;
+    for (const candidate of protectedTasks) {
+      const selection = selectGoalWorkstreamPolicy({
+        ...candidate,
+        agentId: candidate.readonly ? "sentry" : "paul",
+        repo: "daniels-project-space/youtube-studio-ai",
+        mcp: ["context7"],
+      });
+      expect(selection.model).not.toBe("luna");
+    }
+  });
+
   it("routes new apps into App Factory and video work into YouTube Studio", () => {
     expect(routeGoal("Build a new app for comparing rental insurance").kind).toBe("app_factory");
     expect(routeGoal("Refine the pacing and thumbnail for my next YouTube video").kind).toBe("youtube_studio");
@@ -105,6 +157,8 @@ describe("Goal Mode contracts", () => {
     );
     expect(GOAL_PLAN_RESULT_MAX_CHARS).toBeGreaterThanOrEqual(8_000);
     expect(prompt).toContain("7,500 characters");
+    expect(prompt).toContain("fix their generation, render, configuration, or data root cause");
+    expect(prompt).toContain("a rejection-only gate does not satisfy the outcome");
   });
 
   it("rejects cyclic plans", () => {

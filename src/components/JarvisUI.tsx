@@ -48,7 +48,12 @@ import { isForegroundBusy } from "@/lib/foreground-state";
 import { FleetCommandCenter } from "./CompactWorkBar";
 import { isGuestViewerSession, useViewerSession } from "@/lib/viewer-session";
 import { GuestSafeAttachment } from "./GuestSafeAttachment";
-import { FOREGROUND_AUTO_RECOVERY_MS, foregroundTurnPhase, latestRecoverableForegroundTurn } from "@/lib/foreground-recovery";
+import {
+  authoritativeCancellationReceipt,
+  FOREGROUND_AUTO_RECOVERY_MS,
+  foregroundTurnPhase,
+  latestRecoverableForegroundTurn,
+} from "@/lib/foreground-recovery";
 import { advanceFinalDelivery, type FinalDeliveryCursor } from "@/lib/final-delivery";
 import { withClientDeadline } from "@/lib/client-deadline";
 import { resolveTrustedJarvisEmbedOrigin } from "@/lib/embed-origin";
@@ -1463,9 +1468,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const lastSubmittedParentId = useRef<string | undefined>(undefined);
   const durableRecoveryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const durableAutoRecoveries = useRef(0);
+  const durableCancellationFence = useRef<{
+    messageId: string;
+    forRetry: boolean;
+    receipt?: string;
+  } | null>(null);
   const [durableRecovery, setDurableRecovery] = useState<
-    "idle" | "waiting" | "delayed" | "recovering" | "failed" | "terminal"
+    "idle" | "waiting" | "delayed" | "recovering" | "failed" | "terminal" | "cancelling" | "retry-ready"
   >("idle");
+  const durableRetryReady = durableRecovery === "retry-ready" && Boolean(
+    activeDurableTurn.current &&
+    durableCancellationFence.current?.messageId === activeDurableTurn.current.messageId &&
+    durableCancellationFence.current.receipt,
+  );
   const [durableTurnEpoch, setDurableTurnEpoch] = useState(0);
   const activeTurnStatus = useJarvisQuery(
     api.chatQueue.turnStatus,
@@ -2067,6 +2082,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (!messagesHydrated) return;
     if (activeDurableTurn.current?.threadId !== thread) {
       activeDurableTurn.current = null;
+      durableCancellationFence.current = null;
       if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
       durableRecoveryTimer.current = null;
       setSending(false);
@@ -2103,6 +2119,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       activeTurnStatus?.assistant ? [{ ...activeTurnStatus.assistant, role: "assistant" }] : messages,
       active.messageId,
     );
+    if (durableCancellationFence.current?.messageId === active.messageId) return;
     if (state.phase === "queued") return;
 
     if (state.phase === "streaming") {
@@ -2115,6 +2132,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     durableRecoveryTimer.current = null;
     if (state.phase === "done") {
       activeDurableTurn.current = null;
+      durableCancellationFence.current = null;
       setDurableRecovery("idle");
       setSending(false);
       return;
@@ -2284,10 +2302,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   function armDurableRecoveryWatchdog() {
     if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
     durableRecoveryTimer.current = null;
-    if (!activeDurableTurn.current) return;
+    if (!activeDurableTurn.current || durableCancellationFence.current) return;
     if (durableAutoRecoveries.current >= 3) {
-      setDurableRecovery("terminal");
-      setSending(true);
+      void prepareDurableRetry();
       return;
     }
     durableRecoveryTimer.current = setTimeout(() => {
@@ -2308,11 +2325,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ messageId: active.messageId, threadId: active.threadId }),
       }, 12_000);
+      if (activeDurableTurn.current?.messageId !== active.messageId) return;
+      if (durableCancellationFence.current?.messageId === active.messageId) return;
       if (response.status === 409) {
         if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
         durableRecoveryTimer.current = null;
-        setDurableRecovery("terminal");
-        setSending(true);
+        void prepareDurableRetry();
         return;
       }
       if (!response.ok) throw new Error(`conversation recovery rejected (${response.status})`);
@@ -2332,6 +2350,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         armDurableRecoveryWatchdog();
       }
     } catch (error) {
+      if (activeDurableTurn.current?.messageId !== active.messageId) return;
+      if (durableCancellationFence.current?.messageId === active.messageId) return;
       document.documentElement.dataset.jarvisRecoveryFailure = String(error).slice(0, 160);
       setDurableRecovery(manual ? "failed" : "delayed");
       setSending(true);
@@ -2339,10 +2359,76 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
   }
 
-  function retryDurableTurn() {
+  async function cancelDurableTurn(forRetry: boolean) {
     const active = activeDurableTurn.current;
     if (!active) return;
+    const existingFence = durableCancellationFence.current;
+    if (existingFence?.messageId === active.messageId) return;
+    durableCancellationFence.current = { messageId: active.messageId, forRetry };
+    if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
+    durableRecoveryTimer.current = null;
+    setDurableRecovery("cancelling");
+    setSending(true);
+    try {
+      const response = await viewerFetchWithTimeout("/api/chat/cancel", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ messageId: active.messageId, threadId: active.threadId }),
+      }, 12_000);
+      const result = await response.json().catch(() => ({})) as {
+        ok?: unknown;
+        cancellation?: unknown;
+        messageId?: unknown;
+        fenceReceipt?: unknown;
+      };
+      if (response.status === 409 && result.cancellation === "completed") {
+        durableCancellationFence.current = null;
+        activeDurableTurn.current = null;
+        setDurableRecovery("idle");
+        setSending(false);
+        return;
+      }
+      if (!response.ok) throw new Error(`conversation cancellation rejected (${response.status})`);
+      const receipt = authoritativeCancellationReceipt(result, active.messageId);
+      if (!receipt) throw new Error("conversation cancellation returned no authoritative fence");
+      if (activeDurableTurn.current?.messageId !== active.messageId) return;
+      durableCancellationFence.current = { messageId: active.messageId, forRetry, receipt };
+      if (forRetry) {
+        setDurableRecovery("retry-ready");
+      } else {
+        activeDurableTurn.current = null;
+        durableCancellationFence.current = null;
+        setDurableRecovery("idle");
+        setSending(false);
+      }
+    } catch (error) {
+      if (activeDurableTurn.current?.messageId !== active.messageId) return;
+      durableCancellationFence.current = null;
+      document.documentElement.dataset.jarvisCancellationFailure = String(error).slice(0, 160);
+      setDurableRecovery(forRetry ? "terminal" : "failed");
+      setSending(true);
+    }
+  }
+
+  function prepareDurableRetry() {
+    const active = activeDurableTurn.current;
+    if (!active) return;
+    setDurableRecovery("terminal");
+    setSending(true);
+    void cancelDurableTurn(true);
+  }
+
+  function retryDurableTurn() {
+    const active = activeDurableTurn.current;
+    const fence = durableCancellationFence.current;
+    if (
+      !durableRetryReady ||
+      !active ||
+      fence?.messageId !== active.messageId ||
+      !fence.receipt
+    ) return;
     activeDurableTurn.current = null;
+    durableCancellationFence.current = null;
     if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
     durableRecoveryTimer.current = null;
     setDurableRecovery("idle");
@@ -3379,15 +3465,33 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           </div>
           {durableRecovery !== "idle" && durableRecovery !== "waiting" && (
             <div className="flex items-center justify-between gap-2 border-t border-amber/15 px-3 py-1.5 text-[11px] text-slate">
-              <span>{durableRecovery === "recovering" ? "Reconnecting…" : "Reply delayed or stopped."}</span>
-              <button
-                type="button"
-                onClick={() => durableRecovery === "terminal" ? retryDurableTurn() : void requestDurableRecovery(true)}
-                disabled={durableRecovery === "recovering"}
-                className="rounded border border-amber/30 px-2 py-0.5 text-amber disabled:opacity-40"
-              >
-                {durableRecovery === "terminal" ? "retry" : "recover"}
-              </button>
+              <span>{durableRecovery === "cancelling"
+                ? "Securing this turn…"
+                : durableRecovery === "retry-ready"
+                  ? "Reply stopped safely."
+                  : durableRecovery === "recovering" ? "Reconnecting…" : "Reply delayed or stopped."}</span>
+              <div className="flex items-center gap-2">
+                {!durableRetryReady && (
+                  <button
+                    type="button"
+                    onClick={() => void cancelDurableTurn(false)}
+                    disabled={durableRecovery === "cancelling"}
+                    className="text-slate disabled:opacity-40"
+                  >
+                    cancel
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => durableRetryReady
+                    ? retryDurableTurn()
+                    : durableRecovery === "terminal" ? prepareDurableRetry() : void requestDurableRecovery(true)}
+                  disabled={durableRecovery === "recovering" || durableRecovery === "cancelling" || (durableRecovery === "retry-ready" && !durableRetryReady)}
+                  className="rounded border border-amber/30 px-2 py-0.5 text-amber disabled:opacity-40"
+                >
+                  {durableRetryReady ? "retry" : durableRecovery === "terminal" || durableRecovery === "retry-ready" ? "secure retry" : "recover"}
+                </button>
+              </div>
             </div>
           )}
           <div className="flex gap-2 border-t border-white/10 p-2">
@@ -3717,7 +3821,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           {durableRecovery !== "idle" && durableRecovery !== "waiting" && (
             <div className="flex items-center justify-between gap-3 border-t border-amber/15 bg-amber/[0.04] px-3 py-2 text-xs text-slate">
               <span>
-                {durableRecovery === "recovering"
+                {durableRecovery === "cancelling"
+                  ? "Stopping and securing this exact reply…"
+                  : durableRecovery === "retry-ready"
+                    ? "That reply is safely stopped. Retry is ready."
+                    : durableRecovery === "recovering"
                   ? "Reconnecting this reply…"
                   : durableRecovery === "terminal"
                     ? "That reply stopped after recovery attempts."
@@ -3725,14 +3833,28 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                       ? "That reply stopped before it finished."
                       : "This reply is taking longer than usual."}
               </span>
-              <button
-                type="button"
-                onClick={() => durableRecovery === "terminal" ? retryDurableTurn() : void requestDurableRecovery(true)}
-                disabled={durableRecovery === "recovering"}
-                className="shrink-0 rounded-lg border border-amber/30 px-2 py-1 text-amber transition hover:bg-amber/10 disabled:opacity-40"
-              >
-                {durableRecovery === "terminal" ? "retry" : "recover"}
-              </button>
+              <div className="flex shrink-0 items-center gap-2">
+                {!durableRetryReady && (
+                  <button
+                    type="button"
+                    onClick={() => void cancelDurableTurn(false)}
+                    disabled={durableRecovery === "cancelling"}
+                    className="rounded-lg px-2 py-1 text-slate transition hover:bg-white/5 disabled:opacity-40"
+                  >
+                    cancel
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => durableRetryReady
+                    ? retryDurableTurn()
+                    : durableRecovery === "terminal" ? prepareDurableRetry() : void requestDurableRecovery(true)}
+                  disabled={durableRecovery === "recovering" || durableRecovery === "cancelling" || (durableRecovery === "retry-ready" && !durableRetryReady)}
+                  className="rounded-lg border border-amber/30 px-2 py-1 text-amber transition hover:bg-amber/10 disabled:opacity-40"
+                >
+                  {durableRetryReady ? "retry" : durableRecovery === "terminal" || durableRecovery === "retry-ready" ? "secure retry" : "recover"}
+                </button>
+              </div>
             </div>
           )}
 
@@ -3901,14 +4023,28 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         >
           {durableRecovery !== "idle" && durableRecovery !== "waiting" && (
             <div className="mx-auto mb-1 flex w-fit items-center gap-2 rounded-full border border-amber/20 bg-black/75 px-3 py-1 text-[11px] text-slate backdrop-blur">
-              <span>{durableRecovery === "recovering" ? "Reconnecting reply…" : "Reply delayed or stopped."}</span>
+              <span>{durableRecovery === "cancelling"
+                ? "Securing reply…"
+                : durableRecovery === "retry-ready" ? "Reply safely stopped." : durableRecovery === "recovering" ? "Reconnecting reply…" : "Reply delayed or stopped."}</span>
+              {!durableRetryReady && (
+                <button
+                  type="button"
+                  onClick={() => void cancelDurableTurn(false)}
+                  disabled={durableRecovery === "cancelling"}
+                  className="text-slate disabled:opacity-40"
+                >
+                  cancel
+                </button>
+              )}
               <button
                 type="button"
-                onClick={() => durableRecovery === "terminal" ? retryDurableTurn() : void requestDurableRecovery(true)}
-                disabled={durableRecovery === "recovering"}
+                onClick={() => durableRetryReady
+                  ? retryDurableTurn()
+                  : durableRecovery === "terminal" ? prepareDurableRetry() : void requestDurableRecovery(true)}
+                disabled={durableRecovery === "recovering" || durableRecovery === "cancelling" || (durableRecovery === "retry-ready" && !durableRetryReady)}
                 className="text-amber disabled:opacity-40"
               >
-                {durableRecovery === "terminal" ? "retry" : "recover"}
+                {durableRetryReady ? "retry" : durableRecovery === "terminal" || durableRecovery === "retry-ready" ? "secure retry" : "recover"}
               </button>
             </div>
           )}

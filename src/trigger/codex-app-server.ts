@@ -30,6 +30,7 @@ type ActiveTurn = {
   resolve: (result: CodexTurnResult) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  abortCleanup?: () => void;
 };
 
 export type CodexTurnResult = { finalText: string; threadId: string; code: number; stderr: string };
@@ -334,6 +335,8 @@ export type CodexTurnInput = {
   invocationContext?: ToolInvocationContext;
   outputSchema?: JsonObject;
   onDelta: (delta: string) => void;
+  /** Cancels an admitted turn and interrupts the exact app-server turn id. */
+  signal?: AbortSignal;
   /** Durable receipt written before turn/start may cross the protocol. */
   beforeTurn?: () => Promise<void>;
   onTurnRequestWritten?: () => void;
@@ -427,6 +430,7 @@ export class CodexAppServer {
     const invocationContext = normalizeToolInvocationContext(input.invocationContext, {
       allowUserMessageId: true,
     });
+    if (input.signal?.aborted) throw new Error("Codex conversation turn was cancelled");
     await this.start();
     if (this.active.size >= this.limits.activeTurns) {
       throw new Error("Codex app-server active-turn limit reached");
@@ -492,6 +496,8 @@ export class CodexAppServer {
       this.threads.set(input.conversationId, threadId);
     }
 
+    if (input.signal?.aborted) throw new Error("Codex conversation turn was cancelled");
+
     const speaker = input.allowTools === false ? "Guest" : "Daniel";
     const history = isNewThread && input.history.length
       ? `Recent conversation:\n${input.history.map((item) => `${item.role === "user" ? speaker : "Jarvis"}: ${item.text}`).join("\n")}\n\n`
@@ -505,6 +511,7 @@ export class CodexAppServer {
     const userInput: JsonObject[] = [{ type: "text", text }];
     if (marker?.[1]) userInput.push({ type: "image", url: marker[1].trim(), detail: "high" });
     if (input.beforeTurn) await boundedCallback(input.beforeTurn);
+    if (input.signal?.aborted) throw new Error("Codex conversation turn was cancelled");
     const started = await this.request("turn/start", {
       threadId,
       input: userInput,
@@ -516,8 +523,17 @@ export class CodexAppServer {
     const turn = started.turn as JsonObject | undefined;
     const turnId = typeof turn?.id === "string" ? turn.id : "";
     if (!turnId || turnId.length > 512) throw new Error("Codex app-server did not return a turn id");
+    if (input.signal?.aborted) {
+      this.notify("turn/interrupt", { threadId, turnId });
+      throw new Error("Codex conversation turn was cancelled");
+    }
     const completion = new Promise<CodexTurnResult>((resolve, reject) => {
+      let abortHandler: (() => void) | undefined;
+      const abortCleanup = () => {
+        if (abortHandler) input.signal?.removeEventListener("abort", abortHandler);
+      };
       const timer = setTimeout(() => {
+        abortCleanup();
         this.notify("turn/interrupt", { threadId, turnId });
         this.active.delete(turnId);
         reject(new Error("Codex conversation turn exceeded its foreground deadline"));
@@ -532,7 +548,21 @@ export class CodexAppServer {
         resolve,
         reject,
         timer,
+        abortCleanup,
       });
+      if (input.signal) {
+        abortHandler = () => {
+          const active = this.active.get(turnId);
+          if (!active) return;
+          clearTimeout(active.timer);
+          active.abortCleanup?.();
+          this.active.delete(turnId);
+          this.notify("turn/interrupt", { threadId, turnId });
+          reject(new Error("Codex conversation turn was cancelled"));
+        };
+        input.signal.addEventListener("abort", abortHandler, { once: true });
+        if (input.signal.aborted) abortHandler();
+      }
     });
     try {
       if (input.onTurnAccepted) await boundedCallback(input.onTurnAccepted);
@@ -540,11 +570,13 @@ export class CodexAppServer {
       const active = this.active.get(turnId);
       if (active) {
         clearTimeout(active.timer);
+        active.abortCleanup?.();
         this.active.delete(turnId);
         this.notify("turn/interrupt", { threadId, turnId });
       }
       throw error;
     }
+    if (input.signal?.aborted) return completion;
     if (!this.authConsumed) {
       this.authConsumed = true;
       this.options.onAuthConsumed?.();
@@ -652,6 +684,7 @@ export class CodexAppServer {
     } else if (method === "turn/completed") {
       const status = typeof turn?.status === "string" ? turn.status : "failed";
       clearTimeout(active.timer);
+      active.abortCleanup?.();
       this.active.delete(turnId);
       active.resolve({ finalText: active.text, threadId: active.threadId, code: status === "completed" ? 0 : -1, stderr: status === "completed" ? "" : this.errorText(turn?.error ?? status) });
     }
@@ -663,11 +696,12 @@ export class CodexAppServer {
     const threadId = typeof params.threadId === "string" ? params.threadId : "";
     const turnId = typeof params.turnId === "string" ? params.turnId : "";
     const active = this.active.get(turnId);
-    const invocationContext = active?.threadId === threadId ? active.invocationContext : undefined;
+    const exactActiveTurn = Boolean(active && active.threadId === threadId);
+    const invocationContext = exactActiveTurn ? active?.invocationContext : undefined;
     const handler = this.options.onDynamicToolCall;
     let dynamicResult: CodexDynamicToolResult;
     try {
-      if (!handler || typeof params.tool !== "string") {
+      if (!exactActiveTurn || !handler || typeof params.tool !== "string") {
         dynamicResult = {
           contentItems: [{ type: "inputText", text: "Jarvis dynamic tool bridge is unavailable." }],
           success: false,
@@ -768,7 +802,11 @@ export class CodexAppServer {
       pending.reject(pending.written ? new CodexRequestOutcomeUnknownError(pending.method) : detail);
     }
     this.pending.clear();
-    for (const active of this.active.values()) { clearTimeout(active.timer); active.reject(detail); }
+    for (const active of this.active.values()) {
+      clearTimeout(active.timer);
+      active.abortCleanup?.();
+      active.reject(detail);
+    }
     this.active.clear();
     this.inFlightTools.clear();
   }

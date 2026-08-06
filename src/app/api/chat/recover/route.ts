@@ -29,6 +29,9 @@ export async function POST(req: NextRequest) {
   }) as { status: string; messageId?: string; attemptCount?: number; dispatchEpoch?: number };
 
   if (recovery.status === "missing") return Response.json({ error: "turn not found" }, { status: 404 });
+  if (recovery.status === "cancelled") {
+    return Response.json({ ok: false, recovery: "cancelled" }, { status: 409 });
+  }
   if (recovery.status === "failed") {
     return Response.json({ ok: false, recovery: "failed", attemptCount: recovery.attemptCount }, { status: 409 });
   }

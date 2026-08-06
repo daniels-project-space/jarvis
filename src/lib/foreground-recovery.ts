@@ -14,6 +14,27 @@ export type RecoverableForegroundTurn = {
   text: string;
 };
 
+export type ForegroundCancellationResponse = {
+  ok?: unknown;
+  cancellation?: unknown;
+  messageId?: unknown;
+  fenceReceipt?: unknown;
+};
+
+export function authoritativeCancellationReceipt(
+  response: ForegroundCancellationResponse,
+  expectedMessageId: string,
+): string | null {
+  if (
+    response.ok !== true ||
+    response.cancellation !== "cancelled" ||
+    response.messageId !== expectedMessageId ||
+    typeof response.fenceReceipt !== "string"
+  ) return null;
+  const receipt = response.fenceReceipt.trim();
+  return receipt.length >= 8 && receipt.length <= 512 ? receipt : null;
+}
+
 export function foregroundTurnPhase(
   messages: ForegroundMessageState[],
   parentMessageId: string,
