@@ -57,9 +57,14 @@ const snapshot: CompactWorkSnapshot = {
   }],
 };
 
-export default function FleetVisualPage() {
+export default async function FleetVisualPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ compact?: string }>;
+}) {
+  const compact = (await searchParams).compact === "1";
   return <main className="relative h-dvh overflow-hidden bg-[#030912]">
     <div className="pointer-events-none absolute inset-y-0 left-[61%] right-0 hidden md:block"><ThreeOrb aside reduceMotion /></div>
-    <FleetCommandCenter snapshot={snapshot} initialExpanded />
+    <FleetCommandCenter snapshot={snapshot} initialExpanded={!compact} />
   </main>;
 }

@@ -364,16 +364,50 @@ body {
   50% { background: rgba(56,230,164,.11); box-shadow: inset 0 0 24px rgba(56,230,164,.09), 0 0 18px rgba(56,230,164,.08); }
 }
 
+/* Live work stays visibly alive between backend checkpoints. These are purely
+   presentational; Convex remains the only source of progress truth. */
+.work-progress-ring,
+.work-progress-meter {
+  transition-property: stroke-dashoffset, width;
+  transition-duration: 700ms;
+  transition-timing-function: cubic-bezier(.22, 1, .36, 1);
+}
+.work-live-pulse { animation: work-live-pulse 2.2s ease-in-out infinite; }
+@keyframes work-live-pulse {
+  50% { opacity: .38; transform: scale(1.12); box-shadow: 0 0 18px rgba(0, 231, 255, .2); }
+}
+.work-progress-update { animation: work-progress-update .38s cubic-bezier(.22, 1, .36, 1) both; }
+@keyframes work-progress-update {
+  from { opacity: .15; transform: translateY(3px); filter: blur(1px); }
+  to { opacity: 1; transform: translateY(0); filter: blur(0); }
+}
+.work-progress-glint { position: relative; overflow: hidden; }
+.work-progress-glint::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 32%;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.8), transparent);
+  transform: translateX(-140%);
+  animation: work-progress-glint 2.8s ease-in-out infinite;
+}
+@keyframes work-progress-glint {
+  60%, 100% { transform: translateX(420%); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .materialize, .materialize::after, .rise, .breathe, .cap-bloom,
   .brackets::before, .brackets::after, .brackets > .bk::before, .brackets > .bk::after,
   .scene-block, .scene-metric, .scene-progress, .scene-bar, .scene-gantt,
   .scene-funnel, .scene-line, .scene-donut, .scene-gauge, .scene-candle,
-  .scene-gallery, .scene-focus, .scene-live-dot, .scene-signal-glow {
+  .scene-gallery, .scene-focus, .scene-live-dot, .scene-signal-glow,
+  .work-live-pulse, .work-progress-update, .work-progress-glint::after {
     animation: none !important;
     opacity: 1;
     clip-path: none;
   }
+  .work-progress-ring, .work-progress-meter { transition-duration: 0.01ms !important; }
+  .work-progress-button, .work-progress-arrow { transform: none !important; transition-duration: 0.01ms !important; }
 }
 
 /* The in-app accessibility preference is independent of the operating-system
@@ -398,7 +432,14 @@ html.jarvis-reduce-motion .scene-candle,
 html.jarvis-reduce-motion .scene-gallery,
 html.jarvis-reduce-motion .scene-focus,
 html.jarvis-reduce-motion .scene-live-dot,
-html.jarvis-reduce-motion .scene-signal-glow {
+html.jarvis-reduce-motion .scene-signal-glow,
+html.jarvis-reduce-motion .work-live-pulse,
+html.jarvis-reduce-motion .work-progress-update,
+html.jarvis-reduce-motion .work-progress-glint::after,
+html.jarvis-reduce-motion .work-progress-ring,
+html.jarvis-reduce-motion .work-progress-meter,
+html.jarvis-reduce-motion .work-progress-button,
+html.jarvis-reduce-motion .work-progress-arrow {
   animation: none !important;
   opacity: 1;
   clip-path: none;

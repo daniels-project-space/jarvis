@@ -1,18 +1,19 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRealtimeRun } from "@trigger.dev/react-hooks";
 import { parseTerminalOutput, type TerminalTone } from "../lib/terminal-output";
 import { viewerFetch } from "../lib/viewer-request";
 import { supervisorInputValidationError } from "../lib/supervisor-control";
-import type {
-  CompactJobDetail,
-  CompactWorkSnapshot,
-  FleetControl,
-  FleetEdge,
-  FleetMission,
-  FleetNode,
-  FleetSupervisorAuthority,
+import {
+  retainedFleetSelection,
+  type CompactJobDetail,
+  type CompactWorkSnapshot,
+  type FleetControl,
+  type FleetEdge,
+  type FleetMission,
+  type FleetNode,
+  type FleetSupervisorAuthority,
 } from "../lib/active-work";
 
 const TONE: Record<TerminalTone, string> = {
@@ -188,32 +189,27 @@ function LiveLog({ node, metadata }: { node: FleetNode; metadata?: Record<string
   );
 }
 
-function SubscribedWorker({ node, accessToken }: { node: FleetNode; accessToken: string }) {
-  const { run } = useRealtimeRun(node.workerRunId ?? "", { accessToken });
-  return <LiveLog node={node} metadata={(run?.metadata ?? {}) as Record<string, unknown>} />;
+function SubscribedWorker({ node, accessToken, runId, onHealthy, onFailed }: { node: FleetNode; accessToken: string; runId: string; onHealthy: () => void; onFailed: () => void }) {
+  const { run, error } = useRealtimeRun(runId, { accessToken });
+  const metadata = (run?.metadata ?? {}) as Record<string, unknown>;
+  const valid = !error && metadata.jobId === node.jobId;
+  useEffect(() => {
+    if (error) onFailed();
+    else if (valid) onHealthy();
+  }, [error, onFailed, onHealthy, valid]);
+  return <>
+    {error && <div className="mb-2 rounded-lg border border-amber/20 bg-amber/[0.06] px-2 py-1 text-[9px] text-amber">Live stream disconnected; reconnecting with durable progress preserved.</div>}
+    <LiveLog node={mergeRealtimeWorkNode(node, valid ? metadata : null)} metadata={valid ? metadata : undefined} />
+  </>;
 }
 
 function LazyWorkerLog({ node }: { node: FleetNode }) {
-  const streamKey = `${node.jobId}:${node.workerRunId ?? "durable"}`;
-  const [stream, setStream] = useState({ key: "", token: "", error: "" });
-  useEffect(() => {
-    if (!node.workerRunId) return;
-    const abort = new AbortController();
-    void viewerFetch("/api/work-realtime", {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jobId: node.jobId }), signal: abort.signal,
-    }).then(async (response) => {
-      const payload = await response.json().catch(() => ({}));
-      if (abort.signal.aborted) return;
-      if (!response.ok || typeof payload?.accessToken !== "string") setStream({ key: streamKey, token: "", error: "Realtime stream is unavailable; showing the last durable progress." });
-      else setStream({ key: streamKey, token: payload.accessToken, error: "" });
-    }).catch(() => { if (!abort.signal.aborted) setStream({ key: streamKey, token: "", error: "Realtime stream is unavailable; showing the last durable progress." }); });
-    return () => abort.abort();
-  }, [node.jobId, node.workerRunId, streamKey]);
-  const current = stream.key === streamKey ? stream : { token: "", error: "" };
+  const visible = useDocumentVisible();
+  const recovery = useRealtimeStreamRecovery(`${node.jobId}:${node.workerRunId ?? "durable"}`);
+  const stream = useWorkRealtimeTicket(node, visible, recovery.revision);
   return <>
-    {current.error && <div className="mb-2 rounded-lg border border-amber/20 bg-amber/[0.06] px-2 py-1 text-[9px] text-amber">{current.error}</div>}
-    {current.token && node.workerRunId ? <SubscribedWorker node={node} accessToken={current.token} /> : <LiveLog node={node} />}
+    {stream.state === "durable" && <div className="mb-2 rounded-lg border border-amber/20 bg-amber/[0.06] px-2 py-1 text-[9px] text-amber">Realtime stream is unavailable; showing the last durable progress.</div>}
+    {stream.accessToken && stream.runId ? <SubscribedWorker key={`${stream.runId}:${recovery.revision}`} node={node} accessToken={stream.accessToken} runId={stream.runId} onHealthy={recovery.healthy} onFailed={recovery.failed} /> : <LiveLog node={node} />}
   </>;
 }
 
@@ -583,9 +579,442 @@ export function WorkerDetail({
   </section>;
 }
 
+function liveWorkNodes(snapshot: CompactWorkSnapshot) {
+  const hierarchyNodes = snapshot.hierarchy.flatMap((mission) =>
+    mission.projects.flatMap((project) => project.jobs)
+  );
+  return hierarchyNodes.length ? hierarchyNodes : snapshot.fleet?.nodes ?? [];
+}
+
+export function liveWorkSignalNode(snapshot: CompactWorkSnapshot) {
+  const nodes = liveWorkNodes(snapshot);
+  const candidates = nodes.filter((node) =>
+    node.state !== "done" && node.projectionKind !== "supervisor_planning"
+  );
+  const attentionNode = snapshot.active?.needsDaniel
+    ? [...candidates].filter((node) => node.needsDaniel).sort((left, right) =>
+        (right.progressAt ?? 0) - (left.progressAt ?? 0)
+      )[0] ?? null
+    : null;
+  const executingStates = new Set<FleetNode["state"]>(["dispatching", "running", "reviewing", "integrating"]);
+  const executing = candidates.filter((node) => executingStates.has(node.state));
+  const freshestExecuting = [...executing].sort((left, right) =>
+    Number(Boolean(right.workerRunId)) - Number(Boolean(left.workerRunId))
+      || (right.progressAt ?? 0) - (left.progressAt ?? 0)
+  )[0] ?? null;
+  const activeNode = candidates.find((node) => node.jobId === snapshot.active?.id)
+    ?? nodes.find((node) => node.jobId === snapshot.active?.id)
+    ?? null;
+  const freshestFallback = [...candidates].sort((left, right) =>
+    (right.progressAt ?? 0) - (left.progressAt ?? 0)
+  )[0] ?? null;
+  return attentionNode ?? freshestExecuting ?? activeNode ?? freshestFallback ?? nodes[0] ?? null;
+}
+
+export function liveWorkFreshnessLabel(progressAt: number | null, now: number | null) {
+  if (!progressAt) return "waiting for signal";
+  if (now === null) return "live signal";
+  const ageMs = Math.max(0, now - progressAt);
+  if (ageMs < 20_000) return "live now";
+  if (ageMs < 60_000) return `updated ${Math.max(1, Math.floor(ageMs / 1_000))}s ago`;
+  if (ageMs < 3_600_000) return `updated ${Math.floor(ageMs / 60_000)}m ago`;
+  return `updated ${Math.floor(ageMs / 3_600_000)}h ago`;
+}
+
+export function mergeRealtimeWorkNode(
+  node: FleetNode,
+  metadata: Record<string, unknown> | null | undefined,
+  observedAt: number | null = null,
+) {
+  if (!metadata || metadata.jobId !== node.jobId) return node;
+  const realtimePercent = typeof metadata.percent === "number" && Number.isFinite(metadata.percent)
+    ? Math.max(0, Math.min(100, metadata.percent))
+    : node.percent;
+  const realtimeStage = typeof metadata.stage === "string" && metadata.stage.trim()
+    ? metadata.stage.trim().slice(0, 80)
+    : node.stage;
+  const realtimeProgress = typeof metadata.progress === "string" && metadata.progress.trim()
+    ? metadata.progress.trim().slice(0, 400)
+    : node.progress;
+  return {
+    ...node,
+    percent: realtimePercent,
+    stage: realtimeStage,
+    progress: realtimeProgress,
+    progressAt: observedAt ?? node.progressAt,
+  };
+}
+
+export function realtimeWorkSignalState(
+  jobId: string,
+  metadata: Record<string, unknown> | null | undefined,
+  options: { hasError?: boolean; finished?: boolean } = {},
+): "connecting" | "realtime" | "durable" {
+  if (options.hasError || metadata?.jobId !== jobId) return "connecting";
+  return options.finished ? "durable" : "realtime";
+}
+
+type WorkRealtimeTicket = {
+  key: string;
+  runId: string;
+  accessToken: string;
+  state: "idle" | "connecting" | "connected" | "durable";
+};
+
+const EMPTY_REALTIME_TICKET: WorkRealtimeTicket = { key: "", runId: "", accessToken: "", state: "idle" };
+const WORK_REALTIME_TOKEN_REUSE_MS = 48 * 60_000;
+const WORK_REALTIME_TOKEN_REFRESH_MS = 50 * 60_000;
+const WORK_REALTIME_TOKEN_VALID_MS = 59 * 60_000;
+const WORK_REALTIME_RETRY_MS = [2_000, 6_000, 15_000] as const;
+const WORK_REALTIME_RECOVERY_MS = 60_000;
+const workRealtimeTicketCache = new Map<string, WorkRealtimeTicket & { acquiredAt: number }>();
+
+type WorkRealtimeFetchResult =
+  | { kind: "connected"; runId: string; accessToken: string }
+  | { kind: "retryable" }
+  | { kind: "forbidden" };
+
+type WorkRealtimeFetcher = (input: string, init: RequestInit) => Promise<Response>;
+
+export async function fetchWorkRealtimeTicket(
+  jobId: string,
+  signal: AbortSignal,
+  fetcher: WorkRealtimeFetcher = viewerFetch,
+): Promise<WorkRealtimeFetchResult> {
+  try {
+    const response = await fetcher("/api/work-realtime", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jobId }),
+      signal,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if ([400, 403].includes(response.status)) return { kind: "forbidden" };
+    if (!response.ok || typeof payload?.accessToken !== "string" || typeof payload?.runId !== "string") {
+      return { kind: "retryable" };
+    }
+    return { kind: "connected", runId: payload.runId, accessToken: payload.accessToken };
+  } catch {
+    return { kind: "retryable" };
+  }
+}
+
+export function workRealtimeRetryDelay(attempt: number) {
+  return WORK_REALTIME_RETRY_MS[attempt] ?? WORK_REALTIME_RECOVERY_MS;
+}
+
+export function shouldRemintWorkRealtimeTicket(consecutiveFailures: number) {
+  return consecutiveFailures >= WORK_REALTIME_RETRY_MS.length;
+}
+
+function rememberWorkRealtimeTicket(key: string, ticket: WorkRealtimeTicket & { acquiredAt: number }) {
+  const now = Date.now();
+  for (const [cachedKey, cached] of workRealtimeTicketCache) {
+    if (now - cached.acquiredAt >= WORK_REALTIME_TOKEN_VALID_MS) workRealtimeTicketCache.delete(cachedKey);
+  }
+  if (!workRealtimeTicketCache.has(key) && workRealtimeTicketCache.size >= 12) {
+    const oldest = [...workRealtimeTicketCache.entries()].sort((left, right) => left[1].acquiredAt - right[1].acquiredAt)[0];
+    if (oldest) workRealtimeTicketCache.delete(oldest[0]);
+  }
+  workRealtimeTicketCache.set(key, ticket);
+}
+
+function useDocumentVisible() {
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    const refresh = () => setVisible(document.visibilityState === "visible");
+    refresh();
+    document.addEventListener("visibilitychange", refresh);
+    return () => document.removeEventListener("visibilitychange", refresh);
+  }, []);
+  return visible;
+}
+
+function useRealtimeStreamRecovery(key: string) {
+  const [revision, setRevision] = useState(0);
+  const failures = useRef(0);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stableTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const healthy = useCallback(() => {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = null;
+    if (!stableTimer.current) {
+      stableTimer.current = setTimeout(() => {
+        failures.current = 0;
+        stableTimer.current = null;
+      }, 30_000);
+    }
+  }, []);
+  const failed = useCallback(() => {
+    if (timer.current) return;
+    if (stableTimer.current) clearTimeout(stableTimer.current);
+    stableTimer.current = null;
+    const delay = workRealtimeRetryDelay(failures.current);
+    failures.current += 1;
+    timer.current = setTimeout(() => {
+      timer.current = null;
+      if (shouldRemintWorkRealtimeTicket(failures.current)) workRealtimeTicketCache.delete(key);
+      setRevision((value) => value + 1);
+    }, delay);
+  }, [key]);
+  useEffect(() => () => {
+    if (timer.current) clearTimeout(timer.current);
+    if (stableTimer.current) clearTimeout(stableTimer.current);
+    timer.current = null;
+    stableTimer.current = null;
+    failures.current = 0;
+  }, [key]);
+  return { revision, healthy, failed };
+}
+
+function useWorkRealtimeTicket(node: Pick<FleetNode, "jobId" | "workerRunId">, enabled: boolean, recoveryRevision = 0) {
+  const key = `${node.jobId}:${node.workerRunId ?? "durable"}`;
+  const [ticket, setTicket] = useState<WorkRealtimeTicket>(EMPTY_REALTIME_TICKET);
+  useEffect(() => {
+    if (!enabled || !node.workerRunId) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let controller: AbortController | null = null;
+
+    const scheduleRefresh = (delayMs: number) => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        void acquire(0, true);
+      }, Math.max(1_000, delayMs));
+    };
+    const acquire = async (attempt: number, force = false): Promise<void> => {
+      if (stopped) return;
+      const cached = workRealtimeTicketCache.get(key);
+      const age = cached ? Date.now() - cached.acquiredAt : Number.POSITIVE_INFINITY;
+      if (!force && cached && age < WORK_REALTIME_TOKEN_REUSE_MS) {
+        setTicket(cached);
+        scheduleRefresh(WORK_REALTIME_TOKEN_REFRESH_MS - age);
+        return;
+      }
+      if (!cached || age >= WORK_REALTIME_TOKEN_VALID_MS) {
+        workRealtimeTicketCache.delete(key);
+        setTicket({ key, runId: "", accessToken: "", state: "connecting" });
+      }
+      controller?.abort();
+      controller = new AbortController();
+      const result = await fetchWorkRealtimeTicket(node.jobId, controller.signal);
+      if (stopped || controller.signal.aborted) return;
+      if (result.kind === "forbidden") {
+        workRealtimeTicketCache.delete(key);
+        setTicket({ key, runId: "", accessToken: "", state: "durable" });
+        return;
+      }
+      if (result.kind === "connected") {
+        const next = {
+          key,
+          runId: result.runId,
+          accessToken: result.accessToken,
+          state: "connected" as const,
+          acquiredAt: Date.now(),
+        };
+        rememberWorkRealtimeTicket(key, next);
+        setTicket(next);
+        scheduleRefresh(WORK_REALTIME_TOKEN_REFRESH_MS);
+        return;
+      }
+      const retained = workRealtimeTicketCache.get(key);
+      const retainedAge = retained ? Date.now() - retained.acquiredAt : Number.POSITIVE_INFINITY;
+      if (retained && retainedAge < WORK_REALTIME_TOKEN_VALID_MS) setTicket(retained);
+      else setTicket({ key, runId: "", accessToken: "", state: "durable" });
+      const delay = workRealtimeRetryDelay(attempt);
+      const nextAttempt = attempt < WORK_REALTIME_RETRY_MS.length ? attempt + 1 : attempt;
+      timer = setTimeout(() => void acquire(nextAttempt, true), delay);
+    };
+
+    void acquire(0);
+    return () => {
+      stopped = true;
+      controller?.abort();
+      if (timer) clearTimeout(timer);
+    };
+  }, [enabled, key, node.jobId, node.workerRunId, recoveryRevision]);
+  return enabled && ticket.key === key ? ticket : EMPTY_REALTIME_TICKET;
+}
+
+function LiveWorkFreshness({ progressAt, realtime }: { progressAt: number | null; realtime: boolean }) {
+  // This is a local display clock, not polling. Convex still pushes every real
+  // work update; the timer only tells Daniel how fresh the last signal is.
+  const [now, setNow] = useState<number | null>(null);
+  useEffect(() => {
+    if (realtime) return;
+    const refresh = () => setNow(Date.now());
+    refresh();
+    if (!progressAt) return;
+    const timer = window.setInterval(refresh, 15_000);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [progressAt, realtime]);
+  if (realtime) return <span aria-hidden="true" data-work-signal-freshness>connected</span>;
+  const freshness = liveWorkFreshnessLabel(progressAt, now);
+  return <span aria-hidden="true" data-work-signal-freshness>{freshness.replace("waiting for signal", "waiting for checkpoint").replace("live signal", "last checkpoint").replace("live now", "checkpoint now").replace("updated ", "checkpoint ")}</span>;
+}
+
+function CompactLiveWorkBubbleView({
+  snapshot,
+  signalNode,
+  realtimeState,
+  onOpen,
+}: {
+  snapshot: CompactWorkSnapshot;
+  signalNode: FleetNode | null;
+  realtimeState: "durable" | "connecting" | "realtime";
+  onOpen: () => void;
+}) {
+  const active = snapshot.active!;
+  const nodes = liveWorkNodes(snapshot);
+  const activeAgents = nodes.filter((node) =>
+    node.state !== "done" && node.projectionKind !== "supervisor_planning"
+  );
+  const openWorkCount = Math.max(1, activeAgents.length, active.extraCount + 1);
+  const percent = Math.max(0, Math.min(100, signalNode?.percent ?? active.percent));
+  const announcedPercent = Math.floor(percent / 10) * 10;
+  const label = signalNode?.label || active.label;
+  const progress = signalNode?.progress.trim() || signalNode?.stage || active.stage;
+  const stage = signalNode?.stage || active.stage;
+  const signalKey = `${signalNode?.jobId ?? active.id}:${signalNode?.progressAt ?? 0}:${progress}`;
+  const circumference = 100;
+
+  return (
+    <aside
+      data-fleet-surface="collapsed"
+      data-work-id={active.id}
+      data-work-progress={percent}
+      data-work-realtime={realtimeState}
+      aria-live="off"
+      className="absolute left-2 top-2 z-30 w-[min(400px,calc(100%-16px))] sm:left-3 sm:top-3"
+    >
+      <button
+        type="button"
+        onClick={onOpen}
+        aria-expanded="false"
+        aria-label={`Open live work for ${label}: ${percent}% ${stage}. ${progress}`}
+        className={`work-progress-button glass group relative grid min-h-[76px] w-full grid-cols-[54px_minmax(0,1fr)_auto] items-center gap-2.5 overflow-hidden rounded-2xl bg-[#071019]/94 px-2.5 py-2 pr-3 text-left shadow-[0_10px_36px_rgba(0,0,0,.38)] transition-[border-color,box-shadow,transform] duration-300 ease-out hover:-translate-y-0.5 hover:shadow-[0_14px_42px_rgba(0,0,0,.46)] motion-reduce:transform-none motion-reduce:transition-none ${
+          active.needsDaniel ? "!border-amber/35 hover:!border-amber/60" : "!border-cyan/30 hover:!border-cyan/60"
+        }`}
+      >
+        <span className="relative grid h-[50px] w-[50px] shrink-0 place-items-center" role="progressbar" aria-label={`${label} progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}>
+          <svg aria-hidden="true" viewBox="0 0 40 40" className="absolute inset-0 h-full w-full -rotate-90 overflow-visible">
+            <circle cx="20" cy="20" r="16" fill="rgba(3,10,16,.82)" stroke="rgba(255,255,255,.09)" strokeWidth="2.5" />
+            <circle
+              data-work-progress-ring
+              className={`work-progress-ring ${active.needsDaniel ? "stroke-amber" : "stroke-cyan"}`}
+              cx="20"
+              cy="20"
+              r="16"
+              fill="none"
+              pathLength={circumference}
+              strokeDasharray={circumference}
+              strokeDashoffset={circumference - percent}
+              strokeLinecap="round"
+              strokeWidth="2.5"
+            />
+          </svg>
+          <span className={`work-live-pulse absolute inset-[11px] rounded-full ${active.needsDaniel ? "bg-amber/10" : "bg-cyan/10"}`} />
+          <span className={`relative font-mono text-[10px] font-semibold ${active.needsDaniel ? "text-amber" : "text-cyan"}`}>{percent}<span className="text-[7px]">%</span></span>
+          <span className={`absolute right-0.5 top-0.5 h-2 w-2 rounded-full border-2 border-[#071019] ${active.needsDaniel ? "bg-amber" : "bg-cyan"}`} />
+        </span>
+
+        <span className="min-w-0 self-center">
+          <span className={`flex min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap font-mono text-[7px] uppercase tracking-[0.12em] ${active.needsDaniel ? "text-amber" : "text-cyan/75"}`}>
+            <span className="shrink-0">{active.needsDaniel ? "needs Daniel" : "Jarvis working"}</span>
+            <span aria-hidden="true" className="text-white/15">·</span>
+            <span className="shrink-0">{realtimeState === "realtime" ? "live" : realtimeState === "connecting" ? "syncing" : "checkpoint"}</span>
+            <span aria-hidden="true" className="hidden text-white/15 sm:inline">·</span>
+            <span className="hidden min-w-0 truncate sm:inline"><LiveWorkFreshness progressAt={signalNode?.progressAt ?? null} realtime={realtimeState === "realtime"} /></span>
+          </span>
+          <span className="mt-0.5 block truncate text-[11px] font-medium text-ice" title={label}>{label}</span>
+          <span
+            key={signalKey}
+            data-work-progress-update
+            className="work-progress-update mt-0.5 block truncate text-[9px] text-slate"
+            title={`${signalNode ? agentName(signalNode.agent) : "JARVIS"} · ${progress}`}
+          >
+            <span className={active.needsDaniel ? "text-amber/90" : "text-cyan/80"}>{signalNode ? agentName(signalNode.agent) : "JARVIS"}</span>
+            <span className="text-white/20"> · </span>{progress}
+          </span>
+        </span>
+
+        <span className="flex min-w-[34px] flex-col items-end gap-1" aria-hidden="true">
+          <span className={`max-w-[52px] truncate font-mono text-[8px] uppercase tracking-[0.1em] sm:max-w-[72px] ${active.needsDaniel ? "text-amber" : "text-cyan"}`} title={stage}>{stage}</span>
+          <span className="rounded-full border border-white/10 bg-white/[0.025] px-1.5 py-0.5 font-mono text-[8px] text-slate">
+            {openWorkCount} open
+          </span>
+          <span className={`work-progress-arrow text-[12px] transition-transform duration-300 group-hover:translate-x-0.5 motion-reduce:transform-none motion-reduce:transition-none ${active.needsDaniel ? "text-amber/65" : "text-cyan/55"}`}>›</span>
+        </span>
+
+        <span className="absolute inset-x-2.5 bottom-0.5 h-px overflow-hidden rounded-full bg-white/[0.06]" aria-hidden="true">
+          <span
+            data-work-progress-meter
+            className={`work-progress-meter work-progress-glint block h-full rounded-full ${active.needsDaniel ? "bg-amber" : "bg-cyan"}`}
+            style={{ width: `${percent}%` }}
+          />
+        </span>
+        <span className="sr-only" aria-live="polite" aria-atomic="true">Jarvis work state: {active.needsDaniel ? "needs Daniel" : stage}, {announcedPercent}%.</span>
+        <span className="sr-only">{openWorkCount} open workstreams. Latest progress from {signalNode ? agentName(signalNode.agent) : "Jarvis"}.</span>
+      </button>
+    </aside>
+  );
+}
+
+function SubscribedLiveWorkBubble({
+  snapshot,
+  node,
+  ticket,
+  onHealthy,
+  onFailed,
+  onOpen,
+}: {
+  snapshot: CompactWorkSnapshot;
+  node: FleetNode;
+  ticket: WorkRealtimeTicket;
+  onHealthy: () => void;
+  onFailed: () => void;
+  onOpen: () => void;
+}) {
+  const { run, error } = useRealtimeRun(ticket.runId, { accessToken: ticket.accessToken });
+  const metadata = (run?.metadata ?? {}) as Record<string, unknown>;
+  const realtimeState = realtimeWorkSignalState(node.jobId, metadata, {
+    hasError: Boolean(error),
+    finished: Boolean(run?.finishedAt),
+  });
+  const valid = realtimeState !== "connecting";
+  useEffect(() => {
+    if (error) onFailed();
+    else if (valid) onHealthy();
+  }, [error, onFailed, onHealthy, valid]);
+  const signalNode = mergeRealtimeWorkNode(node, valid ? metadata : null);
+  return <CompactLiveWorkBubbleView snapshot={snapshot} signalNode={signalNode} realtimeState={realtimeState} onOpen={onOpen} />;
+}
+
+function CompactLiveWorkBubble({ snapshot, onOpen }: { snapshot: CompactWorkSnapshot; onOpen: () => void }) {
+  const signalNode = liveWorkSignalNode(snapshot);
+  const visible = useDocumentVisible();
+  const streamKey = `${signalNode?.jobId ?? ""}:${signalNode?.workerRunId ?? "durable"}`;
+  const recovery = useRealtimeStreamRecovery(streamKey);
+  const ticket = useWorkRealtimeTicket(signalNode ?? { jobId: "", workerRunId: null }, visible, recovery.revision);
+  if (signalNode && ticket.accessToken && ticket.runId) {
+    return <SubscribedLiveWorkBubble key={`${ticket.runId}:${recovery.revision}`} snapshot={snapshot} node={signalNode} ticket={ticket} onHealthy={recovery.healthy} onFailed={recovery.failed} onOpen={onOpen} />;
+  }
+  return <CompactLiveWorkBubbleView
+    snapshot={snapshot}
+    signalNode={signalNode}
+    realtimeState={ticket.state === "connecting" ? "connecting" : "durable"}
+    onOpen={onOpen}
+  />;
+}
+
 export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpandedChange, onSelectedJobChange, initialExpanded = false }: { snapshot: CompactWorkSnapshot; detail?: CompactJobDetail | null; hidden?: boolean; onExpandedChange?: (expanded: boolean) => void; onSelectedJobChange?: (jobId: string | null) => void; initialExpanded?: boolean }) {
   const [expanded, setExpanded] = useState(initialExpanded);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const retainedSelectedId = retainedFleetSelection(selectedId, snapshot);
   const [controlError, setControlError] = useState("");
   const active = snapshot.active;
   const fleet = snapshot.fleet;
@@ -605,18 +1034,18 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
     })),
   }] : [];
   const hierarchyJobs = hierarchy.flatMap((mission) => mission.projects.flatMap((project) => project.jobs));
-  const selectedHierarchyMissionId = selectedId
+  const selectedHierarchyMissionId = retainedSelectedId
     ? hierarchy.find((mission) => mission.projects.some((project) =>
-      project.jobs.some((node) => node.jobId === selectedId)
+      project.jobs.some((node) => node.jobId === retainedSelectedId)
     ))?.id ?? null
     : null;
-  const selectedMissionId = selectedId
-    && fleet?.nodes.some((node) => node.jobId === selectedId)
+  const selectedMissionId = retainedSelectedId
+    && fleet?.nodes.some((node) => node.jobId === retainedSelectedId)
     ? fleet.id
     : selectedHierarchyMissionId;
-  const selectedSummary = selectedId ? hierarchyJobs.find((node) => node.jobId === selectedId)
-    ?? fleet?.nodes.find((node) => node.jobId === selectedId) ?? null : null;
-  const selected = selectedSummary && detail?.jobId === selectedId ? {
+  const selectedSummary = retainedSelectedId ? hierarchyJobs.find((node) => node.jobId === retainedSelectedId)
+    ?? fleet?.nodes.find((node) => node.jobId === retainedSelectedId) ?? null : null;
+  const selected = selectedSummary && detail?.jobId === retainedSelectedId ? {
     ...selectedSummary,
     jobId: detail.jobId, label: detail.label, agent: detail.agentId ?? selectedSummary.agent,
     repository: detail.repo, status: detail.status, stage: detail.stage, percent: detail.percent,
@@ -630,16 +1059,16 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
   } : null;
   const selectJob = (jobId: string | null) => { setSelectedId(jobId); onSelectedJobChange?.(jobId); };
   const setOpen = (next: boolean) => { setExpanded(next); if (!next) selectJob(null); onExpandedChange?.(next); };
+  useEffect(() => {
+    if (!selectedId || retainedSelectedId) return;
+    const timer = setTimeout(() => {
+      setSelectedId(null);
+      onSelectedJobChange?.(null);
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [onSelectedJobChange, retainedSelectedId, selectedId]);
   if (!active || !fleet || hidden) return null;
-  if (!expanded) return (
-    <aside data-fleet-surface="collapsed" data-work-id={active.id} aria-live="polite" className="absolute left-2 top-2 z-30 w-[min(350px,calc(100%-16px))] sm:left-3">
-      <button type="button" onClick={() => setOpen(true)} aria-expanded="false" aria-label={`Open live fleet for ${active.label}`} className="glass group grid h-11 w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 overflow-hidden rounded-xl !border-cyan/25 bg-[#071019]/92 px-3 text-left shadow-[0_8px_30px_rgba(0,0,0,.32)] hover:!border-cyan/45">
-        <span aria-hidden="true" className={`h-1.5 w-1.5 rounded-full ${active.needsDaniel ? "bg-amber" : "bg-cyan animate-pulse"}`} />
-        <span className="min-w-0"><span className="block truncate text-[11px] text-ice">{active.label}</span><span className="block truncate font-mono text-[8px] uppercase tracking-[0.12em] text-cyan/65">{active.needsDaniel ? "Needs Daniel" : active.stage}</span></span>
-        <span className="flex items-center gap-1 font-mono text-[9px] text-cyan"><span>{active.percent}%</span>{active.extraCount > 0 && <span className="rounded-full border border-white/10 px-1.5 py-0.5 text-slate">+{active.extraCount}</span>}</span>
-      </button>
-    </aside>
-  );
+  if (!expanded) return <CompactLiveWorkBubble snapshot={snapshot} onOpen={() => setOpen(true)} />;
 
   const projectCount = hierarchy.reduce((count, mission) => count + mission.projects.length, 0);
   const planningCount = hierarchyJobs.filter((node) => node.projectionKind === "supervisor_planning").length;
@@ -651,7 +1080,7 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
         <button type="button" onClick={() => setOpen(false)} className="rounded-lg px-2 py-1 text-[9px] text-slate hover:text-cyan" aria-label="Collapse live fleet">minimize</button>
       </header>
       <div className="mt-2 flex min-h-0 flex-1 gap-2 overflow-hidden">
-        {selectedId ? (selected ? <WorkerDetail node={selected} workerMissionId={selectedMissionId} mission={fleet} onBack={() => selectJob(null)} /> : <div data-fleet-detail-loading className="flex flex-1 items-center justify-center text-xs text-cyan">loading exact work detail…</div>) : <div className="scrollbar-thin min-h-0 flex-1 space-y-2 overflow-auto pr-0.5">
+        {retainedSelectedId ? (selected ? <WorkerDetail node={selected} workerMissionId={selectedMissionId} mission={fleet} onBack={() => selectJob(null)} /> : <div data-fleet-detail-loading className="flex flex-1 items-center justify-center text-xs text-cyan">loading exact work detail…</div>) : <div className="scrollbar-thin min-h-0 flex-1 space-y-2 overflow-auto pr-0.5">
           <section data-work-hierarchy aria-label="Active mission and project hierarchy" className="space-y-2">
             {hierarchy.map((mission) => <article key={mission.id} data-mission-group={mission.id} className="rounded-xl border border-cyan/15 bg-cyan/[0.025] p-2">
               <header className="flex min-w-0 items-start gap-2"><div className="min-w-0 flex-1"><div className="truncate text-[11px] text-ice">{mission.label}</div><div className="truncate font-mono text-[7px] text-cyan/55" title={mission.id}>mission · {mission.id}</div></div><span className="shrink-0 font-mono text-[8px] uppercase text-slate">{mission.phase}</span></header>
@@ -669,7 +1098,7 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
           </section>
         </div>}
       </div>
-      {!selectedId && (fleet.controls.length > 0 || fleet.supervisor) && <footer data-fleet-controls className="mt-2 shrink-0 border-t border-white/[0.07] pt-2">{controlError && <div role="alert" data-control-error className="mb-2 rounded-lg border border-rose-400/25 bg-rose-400/[0.07] px-2 py-1 text-[9px] text-rose-300">{controlError}</div>}<Controls key={fleet.id.startsWith("work:") ? `job:${active.id}` : `mission:${fleet.id}`} controls={fleet.controls} target={fleet.id.startsWith("work:") ? { jobId: active.id } : { missionId: fleet.id, supervisor: fleet.supervisor }} onError={setControlError} /></footer>}
+      {!retainedSelectedId && (fleet.controls.length > 0 || fleet.supervisor) && <footer data-fleet-controls className="mt-2 shrink-0 border-t border-white/[0.07] pt-2">{controlError && <div role="alert" data-control-error className="mb-2 rounded-lg border border-rose-400/25 bg-rose-400/[0.07] px-2 py-1 text-[9px] text-rose-300">{controlError}</div>}<Controls key={fleet.id.startsWith("work:") ? `job:${active.id}` : `mission:${fleet.id}`} controls={fleet.controls} target={fleet.id.startsWith("work:") ? { jobId: active.id } : { missionId: fleet.id, supervisor: fleet.supervisor }} onError={setControlError} /></footer>}
     </aside>
   );
 }

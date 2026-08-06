@@ -11,12 +11,19 @@ import {
   FleetCommandCenter,
   FleetDag,
   WorkerDetail,
+  fetchWorkRealtimeTicket,
   fleetDagLayout,
   fleetNodeStateLabel,
+  liveWorkFreshnessLabel,
+  liveWorkSignalNode,
+  mergeRealtimeWorkNode,
   preserveSupervisorRequestKey,
+  realtimeWorkSignalState,
+  shouldRemintWorkRealtimeTicket,
   submitSupervisorControlRequest,
   supervisorControlPayload,
   supervisorRequestIdentity,
+  workRealtimeRetryDelay,
   workerDetailControls,
 } from "./CompactWorkBar";
 
@@ -97,9 +104,179 @@ describe("FleetCommandCenter", () => {
     expect(markup).toContain('data-fleet-surface="collapsed"');
     expect(markup).toContain('data-work-id="job-1"');
     expect(markup).toContain("Unified fleet surface");
-    expect(markup).toContain("+2");
+    expect(markup).toContain('data-work-progress="64"');
+    expect(markup).toContain('data-work-realtime="durable"');
+    expect(markup).toContain("Running focused tests");
+    expect(markup).toContain("checkpoint");
+    expect(markup).toContain("last checkpoint");
+    expect(markup).toContain("data-work-progress-ring");
+    expect(markup).toContain("data-work-progress-meter");
+    expect(markup).toContain("stroke-dashoffset=\"36\"");
+    expect(markup).toContain('style="width:64%"');
+    expect(markup).toContain("3 open");
     expect(markup).not.toContain("data-fleet-worker-detail");
     expect(markup).not.toContain("live work terminal");
+  });
+
+  it("merges only exact-job realtime progress and clamps untrusted metadata", () => {
+    const durable = node({ percent: 35, stage: "building", progress: "Durable checkpoint", progressAt: 100 });
+    const merged = mergeRealtimeWorkNode(durable, {
+      jobId: "job-1",
+      percent: 127,
+      stage: "  validating production  ",
+      progress: "  Inspecting the deployed widget  ",
+    }, 500);
+    expect(merged).toMatchObject({
+      percent: 100,
+      stage: "validating production",
+      progress: "Inspecting the deployed widget",
+      progressAt: 500,
+    });
+    expect(mergeRealtimeWorkNode(durable, {
+      jobId: "stale-job",
+      percent: 99,
+      progress: "Wrong worker",
+    }, 900)).toBe(durable);
+    expect(mergeRealtimeWorkNode(durable, {
+      jobId: "job-1",
+      percent: Number.NaN,
+      stage: "",
+      progress: "",
+    })).toMatchObject({ percent: 35, stage: "building", progress: "Durable checkpoint", progressAt: 100 });
+  });
+
+  it("never labels mismatched, failed, or completed realtime metadata as live", () => {
+    const metadata = { jobId: "job-1", percent: 80 };
+    expect(realtimeWorkSignalState("job-1", metadata)).toBe("realtime");
+    expect(realtimeWorkSignalState("job-2", metadata)).toBe("connecting");
+    expect(realtimeWorkSignalState("job-1", metadata, { hasError: true })).toBe("connecting");
+    expect(realtimeWorkSignalState("job-1", metadata, { finished: true })).toBe("durable");
+  });
+
+  it("shows attention before a fresher parallel worker and otherwise follows the freshest signal", () => {
+    const attention = node({ jobId: "job-attention", label: "Approval gate", needsDaniel: true, state: "needs_input", progress: "Choose the production cap", progressAt: 20 });
+    const freshest = node({ id: "parallel", jobId: "job-parallel", label: "Parallel validation", progress: "Running mobile checks", progressAt: 90 });
+    const snapshot: CompactWorkSnapshot = {
+      ...work,
+      active: { ...work.active!, needsDaniel: true },
+      fleet: { ...work.fleet!, attentionCount: 1, nodes: [attention, freshest] },
+      hierarchy: [{ ...work.hierarchy[0], projects: [{ ...work.hierarchy[0].projects[0], jobs: [attention, freshest] }] }],
+    };
+    expect(liveWorkSignalNode(snapshot)?.jobId).toBe("job-attention");
+    expect(liveWorkSignalNode({ ...snapshot, active: { ...snapshot.active!, needsDaniel: false } })?.jobId).toBe("job-parallel");
+
+    const markup = renderToStaticMarkup(<FleetCommandCenter snapshot={snapshot} />);
+    expect(markup).toContain('data-work-progress="64"');
+    expect(markup).toContain("Approval gate");
+    expect(markup).toContain("Choose the production cap");
+    expect(markup).toContain("needs Daniel");
+    expect(markup).not.toContain("Running mobile checks");
+  });
+
+  it("keeps actively executing streamable work ahead of newer dormant work", () => {
+    const running = node({ jobId: "job-running", label: "Active implementation", progressAt: 20 });
+    const queued = node({
+      id: "queued",
+      jobId: "job-queued",
+      label: "Future dependency",
+      state: "dependency_held",
+      status: "dependency_held",
+      progressAt: 100,
+      workerRunId: null,
+    });
+    const snapshot: CompactWorkSnapshot = {
+      ...work,
+      active: { ...work.active!, id: queued.jobId },
+      fleet: { ...work.fleet!, nodes: [queued, running] },
+      hierarchy: [{ ...work.hierarchy[0], projects: [{ ...work.hierarchy[0].projects[0], jobs: [queued, running] }] }],
+    };
+    expect(liveWorkSignalNode(snapshot)?.jobId).toBe("job-running");
+  });
+
+  it("renders one coherent bubble through real work lifecycle updates", () => {
+    const lifecycle: Array<{ state: FleetNode["state"]; stage: string; percent: number; progress: string; needsDaniel?: boolean }> = [
+      { state: "dispatching", stage: "dispatching", percent: 8, progress: "Assigning the specialist" },
+      { state: "running", stage: "implementing", percent: 47, progress: "Building the progress surface" },
+      { state: "reviewing", stage: "validating", percent: 82, progress: "Running behavioral tests" },
+      { state: "needs_input", stage: "awaiting decision", percent: 82, progress: "Choose the production cap", needsDaniel: true },
+    ];
+    for (const phase of lifecycle) {
+      const currentNode = node({
+        state: phase.state,
+        stage: phase.stage,
+        percent: phase.percent,
+        progress: phase.progress,
+        progressAt: phase.percent,
+        needsDaniel: phase.needsDaniel ?? false,
+      });
+      const snapshot: CompactWorkSnapshot = {
+        active: { ...work.active!, status: phase.state, stage: phase.stage, percent: phase.percent, needsDaniel: phase.needsDaniel ?? false },
+        fleet: { ...work.fleet!, phase: phase.stage, percent: phase.percent, attentionCount: phase.needsDaniel ? 1 : 0, nodes: [currentNode] },
+        hierarchy: [{ ...work.hierarchy[0], phase: phase.stage, projects: [{ ...work.hierarchy[0].projects[0], jobs: [currentNode] }] }],
+      };
+      const markup = renderToStaticMarkup(<FleetCommandCenter snapshot={snapshot} />);
+      expect(markup).toContain(`data-work-progress="${phase.percent}"`);
+      expect(markup).toContain(phase.stage);
+      expect(markup).toContain(phase.progress);
+      expect(markup).toContain(`stroke-dashoffset="${100 - phase.percent}"`);
+      expect(markup).toContain(`style="width:${phase.percent}%"`);
+    }
+  });
+
+  it("describes signal freshness without inventing backend progress", () => {
+    expect(liveWorkFreshnessLabel(null, 1_000)).toBe("waiting for signal");
+    expect(liveWorkFreshnessLabel(1_000, null)).toBe("live signal");
+    expect(liveWorkFreshnessLabel(1_000, 15_000)).toBe("live now");
+    expect(liveWorkFreshnessLabel(1_000, 42_000)).toBe("updated 41s ago");
+    expect(liveWorkFreshnessLabel(1_000, 181_000)).toBe("updated 3m ago");
+    expect(liveWorkFreshnessLabel(1_000, 7_201_000)).toBe("updated 2h ago");
+  });
+
+  it("requests one exact realtime run and uses the authoritative run id", async () => {
+    const controller = new AbortController();
+    const fetcher = vi.fn(async () => new Response(
+      JSON.stringify({ runId: "run-authoritative", accessToken: "token-exact" }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+
+    await expect(fetchWorkRealtimeTicket("job-1", controller.signal, fetcher)).resolves.toEqual({
+      kind: "connected",
+      runId: "run-authoritative",
+      accessToken: "token-exact",
+    });
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledWith("/api/work-realtime", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ jobId: "job-1" }),
+      signal: controller.signal,
+    }));
+  });
+
+  it("separates forbidden realtime access from recoverable route and network failures", async () => {
+    const signal = new AbortController().signal;
+    const response = (status: number) => async () => new Response("{}", {
+      status,
+      headers: { "content-type": "application/json" },
+    });
+    const offline = async (): Promise<Response> => {
+      throw new TypeError("offline");
+    };
+
+    await expect(fetchWorkRealtimeTicket("job-1", signal, response(403))).resolves.toEqual({ kind: "forbidden" });
+    await expect(fetchWorkRealtimeTicket("job-1", signal, response(404))).resolves.toEqual({ kind: "retryable" });
+    await expect(fetchWorkRealtimeTicket("job-1", signal, offline)).resolves.toEqual({ kind: "retryable" });
+  });
+
+  it("backs off quickly before settling into low-cost recovery", () => {
+    expect([0, 1, 2, 3, 20].map(workRealtimeRetryDelay)).toEqual([
+      2_000,
+      6_000,
+      15_000,
+      60_000,
+      60_000,
+    ]);
+    expect([0, 1, 2].map(shouldRemintWorkRealtimeTicket)).toEqual([false, false, false]);
+    expect(shouldRemintWorkRealtimeTicket(3)).toBe(true);
   });
 
   it("renders supervised planning in the same one surface without a fake selectable job", () => {

@@ -15,10 +15,10 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({}));
   const jobId = String(body?.jobId ?? "");
   if (!jobId) return Response.json({ ok: false }, { status: 400 });
-  const worker: any = await controlQuery("jobs:detail", {
+  const worker = await controlQuery("jobs:detail", {
     jobId,
     ...controlCredentials(actor),
-  }).catch(() => null);
+  }).catch(() => null) as { workerRunId?: unknown } | null;
   const runId = typeof worker?.workerRunId === "string" ? worker.workerRunId : "";
   if (!runId) return Response.json({ ok: false, pending: true }, { status: 404 });
   const accessToken = await auth.createPublicToken({
