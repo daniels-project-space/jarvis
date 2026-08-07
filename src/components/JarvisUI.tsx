@@ -71,6 +71,7 @@ import {
   type EmbeddedThreadContext,
 } from "@/lib/embed-command-handoff";
 import { ChatFilePicker } from "./chat-files/ChatFilePicker";
+import { GuestChatFileAccess } from "./chat-files/GuestChatFileAccess";
 import { ChatFilePendingMonitor, type ChatFileNotice } from "./chat-files/ChatFilePendingMonitor";
 import type { ChatFileManifest } from "@/lib/chat-files";
 
@@ -3752,17 +3753,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           )}
           <div className="border-t border-white/10 p-2">
             <div className="flex gap-2">
-            {!guest && (
-              <ChatFilePicker
-                threadId={thread}
-                selectedFileIds={selectedFileIds}
-                pendingFileIds={pendingFileIds}
-                onSelectionChange={setSelectedFileIds}
-                onPendingChange={setPendingFileIds}
-                notice={fileNotice}
-                onNotice={setFileNotice}
-              />
-            )}
+              {guest ? (
+                <GuestChatFileAccess embedded onRequestOwnerAccess={() => void connectEmbeddedOwner()} />
+              ) : (
+                <ChatFilePicker
+                  threadId={thread}
+                  selectedFileIds={selectedFileIds}
+                  pendingFileIds={pendingFileIds}
+                  onSelectionChange={setSelectedFileIds}
+                  onPendingChange={setPendingFileIds}
+                  notice={fileNotice}
+                  onNotice={setFileNotice}
+                />
+              )}
             <button
               type="button"
               onClick={() => speaking ? stopTalking() : void toggleLive()}
@@ -4141,17 +4144,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           {/* composer */}
           <div className="safe-composer relative min-w-0 max-w-full border-t border-white/5 p-2 sm:p-3">
             <div className="flex min-w-0 max-w-full items-stretch gap-1.5 sm:gap-2">
-            {!guest && chatMode === "full" && (
-              <ChatFilePicker
-                threadId={thread}
-                selectedFileIds={selectedFileIds}
-                pendingFileIds={pendingFileIds}
-                onSelectionChange={setSelectedFileIds}
-                onPendingChange={setPendingFileIds}
-                notice={fileNotice}
-                onNotice={setFileNotice}
-              />
-            )}
+              {chatMode === "full" && (guest ? (
+                <GuestChatFileAccess embedded={false} onRequestOwnerAccess={() => window.location.reload()} />
+              ) : (
+                <ChatFilePicker
+                  threadId={thread}
+                  selectedFileIds={selectedFileIds}
+                  pendingFileIds={pendingFileIds}
+                  onSelectionChange={setSelectedFileIds}
+                  onPendingChange={setPendingFileIds}
+                  notice={fileNotice}
+                  onNotice={setFileNotice}
+                />
+              ))}
             <button
               onClick={() => void toggleLive()}
               title="live conversation"
@@ -4350,7 +4355,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             >
               ▲
             </button>
-            {!guest && (
+            {guest && chatMode === "bar" ? (
+              <GuestChatFileAccess embedded={false} onRequestOwnerAccess={() => window.location.reload()} />
+            ) : !guest && (
               <button
                 type="button"
                 onClick={() => setChatMode("full")}

@@ -13,8 +13,11 @@ describe("Jarvis attachment composer contract", () => {
     expect(jarvis).toContain("if (!guest && pendingFileIds.length)");
     expect(jarvis.match(/disabled=\{sending \|\| Boolean\(pendingFileIds\.length\)/g)).toHaveLength(3);
     expect(jarvis.match(/pendingFileIds=\{pendingFileIds\}/g)).toHaveLength(4);
-    expect(jarvis).toContain('<div className="flex gap-2">\n            {!guest && (\n              <ChatFilePicker');
-    expect(jarvis).toContain('<div className="flex min-w-0 max-w-full items-stretch gap-1.5 sm:gap-2">\n            {!guest && chatMode === "full" && (\n              <ChatFilePicker');
+    expect(jarvis.match(/<GuestChatFileAccess/g)).toHaveLength(3);
+    expect(jarvis).toContain('<GuestChatFileAccess embedded onRequestOwnerAccess={() => void connectEmbeddedOwner()} />');
+    expect(jarvis).toContain('<GuestChatFileAccess embedded={false} onRequestOwnerAccess={() => window.location.reload()} />');
+    expect(jarvis).toContain('{chatMode === "full" && (guest ? (');
+    expect(jarvis).toContain('{guest && chatMode === "bar" ? (');
   });
 
   it("uses bounded upload transport and exposes explicit cancellation", () => {
@@ -30,5 +33,17 @@ describe("Jarvis attachment composer contract", () => {
     expect(picker).toContain("Files & images");
     expect(picker).toContain("Saved files");
     expect(picker).toContain('role="progressbar"');
+  });
+
+  it("keeps the public attachment affordance actionable without mounting private inputs", () => {
+    const gate = source("src/components/chat-files/GuestChatFileAccess.tsx");
+
+    expect(gate).toContain('aria-label="Attach files — connect owner tools"');
+    expect(gate).toContain('data-jarvis-attachment-access="guest-locked"');
+    expect(gate).toContain('"connect owner tools"');
+    expect(gate).toContain('"check owner access"');
+    expect(gate).toContain("Guest sessions never receive file inputs");
+    expect(gate).not.toContain('type="file"');
+    expect(gate).not.toContain("ChatFileLibraryDropdown");
   });
 });
