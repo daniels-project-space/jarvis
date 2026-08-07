@@ -33,7 +33,10 @@ type FakeElement = {
   attributes: Record<string, string>;
   appendChild: (child: FakeElement) => FakeElement;
   children: FakeElement[];
-  contentWindow?: { postMessage: ReturnType<typeof vi.fn> };
+  contentWindow?: {
+    location: { origin: string };
+    postMessage: ReturnType<typeof vi.fn>;
+  };
   dataset: Record<string, string>;
   isConnected: boolean;
   onclick?: (() => void) | null;
@@ -47,10 +50,16 @@ type FakeElement = {
   type?: string;
 };
 
-function createLoader(options: { denyFirstRecognition?: boolean } = {}) {
+function createLoader(options: {
+  denyFirstRecognition?: boolean;
+  frameOrigin?: string;
+} = {}) {
   const messages: unknown[] = [];
   const listeners = new Map<string, LoaderListener[]>();
-  const frameWindow = { postMessage: vi.fn((message: unknown) => messages.push(message)) };
+  const frameWindow = {
+    location: { origin: options.frameOrigin ?? JARVIS_ORIGIN },
+    postMessage: vi.fn((message: unknown) => messages.push(message)),
+  };
   const createdElements: FakeElement[] = [];
   const fakeElement = (): FakeElement => {
     const attributes: Record<string, string> = {};
@@ -172,6 +181,27 @@ afterEach(() => {
 });
 
 describe("Project Hub Jarvis loader", () => {
+  it("waits for the iframe to leave inherited about:blank before posting", () => {
+    vi.useFakeTimers();
+    const harness = createLoader({ frameOrigin: "https://project-hub.test" });
+    harness.frameWindow.postMessage.mockClear();
+    harness.messages.splice(0);
+
+    // Browsers may report an initial same-origin about:blank load after the
+    // iframe is attached. It cannot receive a Jarvis-targeted message.
+    harness.frame.onload?.();
+    vi.advanceTimersByTime(500);
+    expect(harness.frameWindow.postMessage).not.toHaveBeenCalled();
+
+    harness.frameWindow.location.origin = JARVIS_ORIGIN;
+    harness.frame.onload?.();
+
+    expect(harness.frameWindow.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ jarvis: "host-ready-probe" }),
+      JARVIS_ORIGIN,
+    );
+  });
+
   it("bounds pre-ready commands and discards them after the handoff TTL", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-07T12:00:00Z"));

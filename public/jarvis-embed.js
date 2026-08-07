@@ -161,8 +161,23 @@
     startEditMode("");
   };
 
+  function frameIsAtJarvisOrigin() {
+    if (!f.contentWindow) return false;
+    try {
+      // A newly-attached iframe starts as same-origin about:blank. Posting to
+      // the Jarvis target origin during that short window emits a browser
+      // security warning and cannot deliver anything. Once the frame reaches
+      // Jarvis, this read either matches ORIGIN or throws because it is now
+      // cross-origin; both states are safe for a targeted postMessage.
+      return f.contentWindow.location.origin === ORIGIN;
+    } catch {
+      return true;
+    }
+  }
+
   function post(message) {
-    if (f.contentWindow) f.contentWindow.postMessage(message, ORIGIN);
+    if (!frameIsAtJarvisOrigin()) return;
+    f.contentWindow.postMessage(message, ORIGIN);
   }
 
   function probeFreshReady(probe, attempt) {
@@ -174,6 +189,7 @@
   }
 
   f.onload = function () {
+    if (!frameIsAtJarvisOrigin()) return;
     ready = false;
     requiredReadyProbe = ++readyProbe;
     if (readyProbeTimer) clearTimeout(readyProbeTimer);
