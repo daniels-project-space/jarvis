@@ -54,6 +54,11 @@ describe("guest Home application render", () => {
     const markup = renderToStaticMarkup(<Home />);
 
     expect(markup).toContain("This text remains visible to the guest.");
+    expect(markup).toContain('id="jarvis-attachment-trigger"');
+    expect(markup).toContain('aria-label="Attach files — connect owner tools"');
+    expect(markup).toContain('data-jarvis-attachment-access="guest-locked"');
+    expect(markup).not.toContain('type="file"');
+    expect(markup).not.toContain("Saved files");
     expect(markup).not.toContain("owner-only legacy card");
     expect(markup).not.toContain("r2://owner-only-frame");
     expect(markup).not.toContain('src="r2://owner-only-frame"');
