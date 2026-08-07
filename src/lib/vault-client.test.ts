@@ -28,11 +28,12 @@ describe("vault client transport boundary", () => {
       });
     });
     vi.stubGlobal("fetch", fetcher);
-    const { vaultService } = await import("./vault-client");
+    const { vaultFailureStage, vaultService } = await import("./vault-client");
 
     let error: unknown;
     try { await vaultService("codex-session"); } catch (caught) { error = caught; }
     expect(String(error)).toBe("Error: Vault request unavailable");
+    expect(vaultFailureStage(error)).toBe("origin");
     expect(String(error)).not.toContain(capability);
     expect(fetcher).toHaveBeenCalledTimes(1);
     const [url, init] = fetcher.mock.calls[0];
