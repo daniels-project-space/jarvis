@@ -1,6 +1,7 @@
 import "server-only";
 import { AwsClient } from "aws4fetch";
 import { getServiceSecrets } from "./vault";
+import { vaultFailureStage, type VaultFailureStage } from "./vault-client";
 import { CHAT_FILE_LIMITS, normalizeUploadMime, normalizeUploadSha256 } from "./chat-files";
 
 const REQUIRED_PRIVATE_BUCKET = "jarvis-private-files";
@@ -9,6 +10,7 @@ export type PrivateR2ConfigurationCode =
   | "bucket_missing"
   | "bucket_mismatch"
   | "vault_unavailable"
+  | `vault_${VaultFailureStage}`
   | "credentials_unavailable"
   | "unknown";
 
@@ -79,9 +81,10 @@ function encodedKey(value: string): string {
 async function client(): Promise<PrivateR2Client> {
   if (cached) return cached;
   const bucket = assertPrivateBucketName(process.env.JARVIS_PRIVATE_R2_BUCKET);
-  const secrets = await getServiceSecrets("cloudflare").catch(() => {
+  const secrets = await getServiceSecrets("cloudflare").catch((error) => {
+    const stage = vaultFailureStage(error);
     throw new PrivateR2ConfigurationError(
-      "vault_unavailable",
+      stage === "unknown" ? "vault_unavailable" : `vault_${stage}`,
       "private R2 vault capability is unavailable",
     );
   });
