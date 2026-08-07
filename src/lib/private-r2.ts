@@ -143,14 +143,23 @@ export async function privateR2Head(key: string): Promise<PrivateR2Head | null> 
   };
 }
 
-export async function privateR2Get(key: string, range?: string): Promise<Response> {
+export async function privateR2Get(
+  key: string,
+  range?: string,
+  signal?: AbortSignal,
+): Promise<Response> {
   const config = await client();
   const headers = new Headers();
   if (range) {
     if (!/^bytes=\d*-\d*$/.test(range) || range.length > 80) throw new Error("invalid byte range");
     headers.set("range", range);
   }
-  return await config.aws.fetch(await objectUrl(key), { method: "GET", headers, cache: "no-store" });
+  return await config.aws.fetch(await objectUrl(key), {
+    method: "GET",
+    headers,
+    cache: "no-store",
+    signal,
+  });
 }
 
 export async function privateR2Put(
