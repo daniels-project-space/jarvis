@@ -95,6 +95,12 @@ export async function readBoundedResponseBytes(
   maximumBytes: number,
 ): Promise<Uint8Array> {
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) throw new Error("invalid response limit");
+  // Server fetch implementations transparently decode gzip/br bodies while
+  // retaining the upstream Content-Length, which describes the encoded bytes.
+  // Keep bounding both the declared transfer and the decoded stream, but only
+  // require exact equality when the representation is identity encoded.
+  const contentEncoding = response.headers.get("content-encoding")?.trim().toLowerCase();
+  const encodedRepresentation = Boolean(contentEncoding && contentEncoding !== "identity");
   const declared = response.headers.get("content-length");
   let declaredLength: number | null = null;
   if (declared !== null) {
@@ -104,7 +110,9 @@ export async function readBoundedResponseBytes(
     declaredLength = length;
   }
   if (!response.body) {
-    if (declaredLength !== null && declaredLength !== 0) throw new Error("response length mismatch");
+    if (!encodedRepresentation && declaredLength !== null && declaredLength !== 0) {
+      throw new Error("response length mismatch");
+    }
     return new Uint8Array();
   }
   const reader = response.body.getReader();
@@ -130,7 +138,9 @@ export async function readBoundedResponseBytes(
     output.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  if (declaredLength !== null && declaredLength !== received) throw new Error("response length mismatch");
+  if (!encodedRepresentation && declaredLength !== null && declaredLength !== received) {
+    throw new Error("response length mismatch");
+  }
   return output;
 }
 
