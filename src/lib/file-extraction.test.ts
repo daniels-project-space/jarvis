@@ -36,6 +36,10 @@ describe("deterministic private file extraction", () => {
   });
 
   it("extracts text and page provenance from a real two-page PDF", async () => {
+    // Reproduce the missing filesystem worker path used by serverless bundles.
+    // extractPrivateFile must replace it with pdf-parse's inline worker.
+    const { PDFParse } = await import("pdf-parse");
+    PDFParse.setWorker("file:///app/pdf.worker.mjs");
     const pdf = await PDFDocument.create();
     const font = await pdf.embedFont(StandardFonts.Helvetica);
     pdf.addPage().drawText("June rental revenue 1840 euros", { x: 40, y: 720, font });
