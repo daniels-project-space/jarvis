@@ -4,6 +4,7 @@ import { useMemo, useRef, useState } from "react";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
+import { CreationSourceFiles, type CreationSourceFile } from "./CreationSourceFiles";
 import ReactGridLayout, { useContainerWidth, verticalCompactor, type Layout } from "react-grid-layout";
 import "react-grid-layout/css/styles.css";
 import {
@@ -560,7 +561,10 @@ function buildLayout(blocks: VisualBlock[], mobile: boolean): Layout {
 export default function VisualSceneView({ value }: { value: string }) {
   let reference: { creationId?: string; scene?: unknown } = {};
   try { reference = JSON.parse(value); } catch { reference = {}; }
-  const creation = useJarvisQuery(api.creations.get, reference.creationId ? ({ id: reference.creationId } as any) : "skip") as any;
+  const creation = useJarvisQuery(api.creations.get, reference.creationId ? ({ id: reference.creationId } as any) : "skip") as
+    | { data?: string; title?: string; sourceFiles?: CreationSourceFile[] }
+    | null
+    | undefined;
   const raw = creation?.data ?? (reference.scene ? JSON.stringify(reference.scene) : value);
   const scene: VisualScene = useMemo(
     () => materializeCapability(parseVisualSceneJson(raw, creation?.title)),
@@ -601,6 +605,7 @@ export default function VisualSceneView({ value }: { value: string }) {
           <div className="hud-label !text-[8px] !text-cyan-dim">visual intelligence · {scene.blocks.length} live modules</div>
           <h1 className="mt-1 font-display text-xl font-semibold tracking-wide text-ice sm:text-2xl">{scene.title}</h1>
           {scene.subtitle && <p className="mt-1 max-w-3xl text-[10px] leading-relaxed text-slate sm:text-xs">{scene.subtitle}</p>}
+          <CreationSourceFiles files={creation?.sourceFiles} className="mt-2" />
         </div>
         <div className="flex min-w-[240px] flex-wrap items-center justify-end gap-2">
           <label className="flex min-w-[220px] flex-1 items-center gap-2 rounded-xl border border-white/10 bg-black/20 px-3 py-2">

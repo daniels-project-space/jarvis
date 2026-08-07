@@ -13,7 +13,7 @@ type SpeechBatch = {
   onStart?: () => void;
   onEnd?: () => void;
   settled: boolean;
-  resolve: () => void;
+  resolve: (played: boolean) => void;
 };
 
 type AudioResult = { audio: ArrayBuffer };
@@ -267,7 +267,10 @@ async function synthesize(text: string, expectedGeneration: number): Promise<Aud
 async function playAudio(result: AudioResult, expectedGeneration: number, onEnergy: (energy: number) => void) {
   if (expectedGeneration !== generation) return false;
   const context = ensureAudioContext();
-  if (context.state === "suspended") await context.resume();
+  if (context.state === "suspended") {
+    await context.resume();
+    if (context.state === "suspended") throw new Error("Audio playback is blocked until the next user gesture");
+  }
   const buffer = await context.decodeAudioData(result.audio.slice(0));
   if (expectedGeneration !== generation) return false;
   if (typeof document !== "undefined") document.documentElement.dataset.jarvisTtsFirstPlayableMs = String(Math.round(performance.now()));
@@ -291,6 +294,7 @@ async function playAudio(result: AudioResult, expectedGeneration: number, onEner
       if (settled) return;
       settled = true;
       clearInterval(energyTimer);
+      clearTimeout(playbackTimer);
       onEnergy(0);
       if (currentSource === source) currentSource = null;
       if (finishCurrentPlayback === stop) finishCurrentPlayback = null;
@@ -299,17 +303,21 @@ async function playAudio(result: AudioResult, expectedGeneration: number, onEner
       resolve(played);
     };
     const stop = () => finish(false);
+    const playbackTimer = window.setTimeout(
+      () => finish(false),
+      Math.max(2_500, Math.ceil(Number(buffer.duration || 0) * 1_000) + 2_000),
+    );
     finishCurrentPlayback = stop;
     source.onended = () => finish(true);
     source.start();
   });
 }
 
-function settle(batch: SpeechBatch, callEnd: boolean) {
+function settle(batch: SpeechBatch, callEnd: boolean, played: boolean) {
   if (batch.settled) return;
   batch.settled = true;
   if (callEnd) batch.onEnd?.();
-  batch.resolve();
+  batch.resolve(played);
 }
 
 export function stopSpeaking() {
@@ -321,8 +329,8 @@ export function stopSpeaking() {
   synthesisInFlight.clear();
   const abandoned = queue;
   queue = [];
-  for (const batch of abandoned) settle(batch, false);
-  if (activeBatch) settle(activeBatch, false);
+  for (const batch of abandoned) settle(batch, false, false);
+  if (activeBatch) settle(activeBatch, false, false);
   try { currentSource?.stop(); } catch { /* already ended */ }
   finishCurrentPlayback?.();
   currentSource = null;
@@ -340,14 +348,14 @@ export async function speak(
   onEnergy: (energy: number) => void,
   onStart?: () => void,
   onEnd?: () => void,
-): Promise<void> {
+): Promise<boolean> {
   const speech = normalizeSpeechText(text);
   if (typeof window === "undefined" || !speech) {
     onEnd?.();
-    return;
+    return false;
   }
   trackUtterance(speech, Math.min(90_000, speech.length * 70));
-  const done = new Promise<void>((resolve) => {
+  const done = new Promise<boolean>((resolve) => {
     queue.push({
       generation,
       text: speech,
@@ -360,7 +368,7 @@ export async function speak(
     });
   });
   void drainSpeechQueue();
-  await done;
+  return await done;
 }
 
 async function drainSpeechQueue(): Promise<void> {
@@ -387,6 +395,7 @@ async function drainSpeechQueue(): Promise<void> {
             batch.onStart?.();
           }
           const played = await playAudio(audio, batch.generation, batch.onEnergy);
+          if (!played && batch.generation === generation) throw new Error("Audio playback ended before completion");
           if (!played || batch.generation !== generation) break;
           const pause = index + 1 < batch.segments.length
             ? speechPauseMs(batch.segments[index])
@@ -395,16 +404,16 @@ async function drainSpeechQueue(): Promise<void> {
         }
         if (batch.generation === generation) {
           setTtsStatus("ready");
-          settle(batch, true);
+          settle(batch, true, true);
         } else {
-          settle(batch, false);
+          settle(batch, false, false);
         }
       } catch (error) {
         if (batch.generation === generation) {
           reportFailure(error);
-          settle(batch, true);
+          settle(batch, true, false);
         } else {
-          settle(batch, false);
+          settle(batch, false, false);
         }
       } finally {
         activeBatch = null;

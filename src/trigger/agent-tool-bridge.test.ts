@@ -147,8 +147,56 @@ describe("foreground agent tool bridge", () => {
     ]);
   });
 
+  it("scopes local file search to the trusted invoking message", async () => {
+    const searchAttachedFiles = vi.fn(async () => ({
+      mode: "read",
+      results: [{ fileId: "attached-1", ordinal: 3, text: "bounded evidence" }],
+      nextOrdinal: 3,
+      hasMore: false,
+    }));
+    const bridge = new AgentToolBridge("dispatch-token", { searchAttachedFiles });
+    const response = await bridge.invoke(dynamicCall(
+      "jarvis_search_attached_files",
+      { mode: "read", fileId: "attached-1", afterOrdinal: 1 },
+      { requestId: "request-1", userMessageId: "trusted-message-1" },
+    ));
+    expect(response.success).toBe(true);
+    expect(searchAttachedFiles).toHaveBeenCalledWith("trusted-message-1", {
+      mode: "read",
+      fileId: "attached-1",
+      afterOrdinal: 1,
+    });
+    expect(response.contentItems[0]).toMatchObject({ type: "inputText" });
+  });
+
+  it("fails closed before the external bridge when original-message authorization is absent", async () => {
+    const fetchImplementation = vi.fn(async () => Response.json({ result: "must not run" }));
+    const authorizeTool = vi.fn(async () => ({ allowed: false, reason: "file_turn_action_not_requested" }));
+    const bridge = new AgentToolBridge("dispatch-token", {
+      fetchImplementation,
+      authorizeTool,
+      endpoint: "https://jarvis.test/api/agent-tool",
+    });
+    const denied = await bridge.invoke(dynamicCall(
+      "jarvis_call_tool",
+      { name: "web_search", args: { query: "private excerpt" } },
+      { requestId: "request-2", userMessageId: "trusted-message-2" },
+    ));
+    expect(denied.success).toBe(false);
+    expect(authorizeTool).toHaveBeenCalledWith("trusted-message-2", "web_search");
+    expect(fetchImplementation).not.toHaveBeenCalled();
+
+    const missingProvenance = await bridge.invoke(dynamicCall(
+      "jarvis_call_tool",
+      { name: "web_search", args: { query: "private excerpt" } },
+    ));
+    expect(missingProvenance.success).toBe(false);
+    expect(fetchImplementation).not.toHaveBeenCalled();
+  });
+
   it("advertises native JSON tools without shell or capability-token instructions", () => {
     expect(JARVIS_DYNAMIC_TOOLS.map((tool) => tool.name)).toEqual([
+      "jarvis_search_attached_files",
       "jarvis_get_tools",
       "jarvis_call_tool",
     ]);

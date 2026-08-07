@@ -34,6 +34,42 @@ async function createTurn(t: ReturnType<typeof convexTest>, requestId: string) {
 }
 
 describe("durable foreground chat recovery", () => {
+  it("returns the completed assistant payload so reconnect recovery can deliver it", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await createTurn(t, "completed-delivery");
+    const claim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: userId,
+      claimToken: "completed-claim",
+      workerToken: WORKER,
+    });
+    expect(await t.mutation(api.chatQueue.finalize, {
+      messageId: claim!.assistantId,
+      threadId: "main",
+      claimToken: "completed-claim",
+      status: "done",
+      finalText: "delivered after reconnect",
+      model: "test-model",
+      workerToken: WORKER,
+    })).toBe(true);
+
+    expect(await t.mutation(api.chatQueue.requestRecovery, {
+      messageId: userId,
+      threadId: "main",
+      workerToken: WORKER,
+    })).toMatchObject({
+      status: "completed",
+      assistant: {
+        _id: claim!.assistantId,
+        role: "assistant",
+        status: "done",
+        text: "delivered after reconnect",
+        model: "test-model",
+        delivery: "foreground",
+        parentMessageId: userId,
+      },
+    });
+  });
+
   it("seals an authoritative cancellation fence before retry and rejects every late worker write", async () => {
     const t = convexTest(schema, modules);
     const userId = await createTurn(t, "cancel-fence");
@@ -376,5 +412,75 @@ describe("chat session reconciliation", () => {
       .withIndex("by_thread", (q) => q.eq("threadId", "main"))
       .first())?.status);
     expect(status).toBe("idle");
+  });
+});
+
+describe("chat history deletion", () => {
+  it("deletes bounded message provenance without deleting reusable source files", async () => {
+    const t = convexTest(schema, modules);
+    const messageId = await createTurn(t, "clear-file-provenance");
+    const otherMessageId = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "other-thread",
+      text: "keep me",
+      requestId: "keep-file-provenance",
+      workerToken: WORKER,
+    });
+    const fileId = await t.run(async (ctx) => {
+      const now = Date.now();
+      const id = await ctx.db.insert("files", {
+        originalName: "evidence.txt",
+        relativePath: "evidence.txt",
+        mimeType: "text/plain",
+        sizeBytes: 8,
+        expectedSha256: "a".repeat(64),
+        r2Key: "owners/daniel/files/test/v1/original",
+        status: "ready",
+        ingestVersion: 1,
+        ingestAttempt: 1,
+        searchText: "evidence",
+        libraryVisible: true,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await ctx.db.insert("messageFiles", {
+        messageId,
+        threadId: "main",
+        fileId: id,
+        position: 0,
+        createdAt: now,
+      });
+      await ctx.db.insert("messageFiles", {
+        messageId: otherMessageId,
+        threadId: "other-thread",
+        fileId: id,
+        position: 0,
+        createdAt: now,
+      });
+      return id;
+    });
+
+    expect(await t.mutation(api.chatQueue.clearThread, {
+      threadId: "main",
+      workerToken: WORKER,
+    })).toBe(1);
+
+    const durable = await t.run(async (ctx) => ({
+      file: await ctx.db.get(fileId),
+      clearedMessage: await ctx.db.get(messageId),
+      keptMessage: await ctx.db.get(otherMessageId),
+      clearedLinks: await ctx.db
+        .query("messageFiles")
+        .withIndex("by_message", (q) => q.eq("messageId", messageId))
+        .collect(),
+      keptLinks: await ctx.db
+        .query("messageFiles")
+        .withIndex("by_message", (q) => q.eq("messageId", otherMessageId))
+        .collect(),
+    }));
+    expect(durable.file?._id).toBe(fileId);
+    expect(durable.clearedMessage).toBeNull();
+    expect(durable.keptMessage?._id).toBe(otherMessageId);
+    expect(durable.clearedLinks).toHaveLength(0);
+    expect(durable.keptLinks).toHaveLength(1);
   });
 });

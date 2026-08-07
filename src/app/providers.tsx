@@ -13,6 +13,7 @@ import {
 import { resolveConvexUrl } from "@/lib/convex-url";
 import { ViewerSessionProvider } from "@/lib/viewer-session";
 import { setViewerRequestToken } from "@/lib/viewer-request";
+import { ConvexAuthGate } from "./ConvexAuthGate";
 
 const convex = new ConvexReactClient(resolveConvexUrl(process.env.NEXT_PUBLIC_CONVEX_URL), {
   // The viewer JWT is already fresh when this provider mounts. Reusing it lets
@@ -160,7 +161,7 @@ export default function Providers({ children }: { children: ReactNode }) {
     <ViewerAuthContext.Provider value={auth}>
       <ViewerSessionProvider token={viewerToken}>
         <ConvexProviderWithAuth client={convex} useAuth={useJarvisConvexAuth}>
-          {children}
+          <ConvexAuthGate>{children}</ConvexAuthGate>
         </ConvexProviderWithAuth>
       </ViewerSessionProvider>
     </ViewerAuthContext.Provider>

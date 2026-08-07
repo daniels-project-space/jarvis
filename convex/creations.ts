@@ -2,6 +2,7 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 import { inferCreationFiling } from "./creationFiling";
+import { linkMessageFilesToCreation } from "./fileHelpers";
 
 // JARVIS's atelier — everything he makes (mind maps, charts, images, PDFs,
 // docs) is saved here so nothing he creates is ever lost. The UI lists it
@@ -90,12 +91,13 @@ export const create = mutation({
     project: v.optional(v.string()),
     inquiry: v.optional(v.string()),
     threadId: v.optional(v.string()),
+    sourceMessageId: v.optional(v.id("chatMessages")),
     ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     const filing = inferCreationFiling(a);
-    return await ctx.db.insert("creations", {
+    const creationId = await ctx.db.insert("creations", {
       kind: a.kind,
       title: a.title.slice(0, 120),
       data: a.data,
@@ -106,6 +108,8 @@ export const create = mutation({
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
+    await linkMessageFilesToCreation(ctx, creationId, a.sourceMessageId);
+    return creationId;
   },
 });
 
@@ -121,6 +125,7 @@ export const update = mutation({
     project: v.optional(v.string()),
     inquiry: v.optional(v.string()),
     threadId: v.optional(v.string()),
+    sourceMessageId: v.optional(v.id("chatMessages")),
     ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
@@ -136,6 +141,7 @@ export const update = mutation({
     if (a.inquiry !== undefined) patch.inquiry = a.inquiry.slice(0, 80);
     if (a.threadId !== undefined) patch.threadId = a.threadId.slice(0, 120);
     await ctx.db.patch(a.id, patch);
+    await linkMessageFilesToCreation(ctx, a.id, a.sourceMessageId);
     return a.id;
   },
 });
@@ -149,6 +155,7 @@ export const updateScene = mutation({
     expectedUpdatedAt: v.number(),
     title: v.string(),
     data: v.string(),
+    sourceMessageId: v.optional(v.id("chatMessages")),
     ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
@@ -159,6 +166,7 @@ export const updateScene = mutation({
       return { ok: false as const, reason: "conflict" as const, data: row.data, title: row.title, updatedAt: row.updatedAt };
     const updatedAt = Date.now();
     await ctx.db.patch(a.id, { title: a.title.slice(0, 120), data: a.data, updatedAt });
+    await linkMessageFilesToCreation(ctx, a.id, a.sourceMessageId);
     return { ok: true as const, updatedAt };
   },
 });
@@ -342,6 +350,8 @@ export const remove = mutation({
   args: { id: v.id("creations"), ...actorAuthArgs },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
+    const refs = await ctx.db.query("creationFileRefs").withIndex("by_creation", (q) => q.eq("creationId", a.id)).collect();
+    for (const ref of refs) await ctx.db.delete(ref._id);
     await ctx.db.delete(a.id);
   },
 });

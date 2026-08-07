@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   authoritativeCancellationReceipt,
+  foregroundRecoveryBudgetAfterSignal,
+  foregroundRecoveryWatchdogDisposition,
   foregroundTurnPhase,
   latestRecoverableForegroundTurn,
+  mergeRecoveredAssistant,
 } from "./foreground-recovery";
 
 const userId = "user-1";
@@ -63,5 +66,37 @@ describe("authoritativeCancellationReceipt", () => {
     { ok: true, cancellation: "cancelled", messageId: userId, fenceReceipt: "" },
   ])("rejects an ambiguous or mismatched response before retry", (response) => {
     expect(authoritativeCancellationReceipt(response, userId)).toBeNull();
+  });
+});
+
+describe("mergeRecoveredAssistant", () => {
+  it("delivers a completed recovery once, then yields to the reactive row", () => {
+    const recovered = { _id: "a2", createdAt: 3, text: "recovered" };
+    const initial = [{ _id: "u2", createdAt: 2, text: "question" }];
+
+    expect(mergeRecoveredAssistant(initial, recovered)).toEqual([...initial, recovered]);
+    const reactive = [...initial, { ...recovered, text: "authoritative" }];
+    expect(mergeRecoveredAssistant(reactive, recovered)).toBe(reactive);
+  });
+});
+
+describe("foreground recovery watchdog races", () => {
+  it("does not spend retry budget while a healthy stream remains active", () => {
+    let attempts = 0;
+    for (let heartbeat = 0; heartbeat < 12; heartbeat += 1) {
+      attempts += 1;
+      attempts = foregroundRecoveryBudgetAfterSignal(attempts, "active");
+      expect(foregroundRecoveryWatchdogDisposition(attempts)).toBe("arm");
+    }
+    expect(attempts).toBe(0);
+  });
+
+  it("pauses automatic recovery without authorizing cancellation after bounded failures", () => {
+    let attempts = 0;
+    for (let failure = 0; failure < 3; failure += 1) {
+      attempts += 1;
+      attempts = foregroundRecoveryBudgetAfterSignal(attempts, "failed");
+    }
+    expect(foregroundRecoveryWatchdogDisposition(attempts)).toBe("pause");
   });
 });

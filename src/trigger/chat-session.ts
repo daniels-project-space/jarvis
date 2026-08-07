@@ -8,6 +8,14 @@ import { CAPABILITIES, INFRA_MAP, PERSONA, REMEMBER } from "../lib/persona";
 import { visualInitiativeDirective } from "../lib/visual-initiative";
 import { visibleTurnText } from "../lib/host-context";
 import { buildContext } from "../lib/context";
+import {
+  CHAT_FILE_LIMITS,
+  buildBoundedFileContext,
+  buildBoundedThreadFileCatalog,
+  type ChatFileManifest,
+  type ChatThreadFileCatalogItem,
+} from "../lib/chat-files";
+import { privateR2PresignGet } from "../lib/private-r2";
 import { codexModelFor, codexReviewExecPrefix, pickConversationTier } from "./model-policy";
 import {
   cleanupSubscriptionHome,
@@ -137,6 +145,8 @@ type QueueClaim = {
   claimToken: string;
   attemptCount: number;
   history: Array<{ role: string; text: string }>;
+  attachments: Array<ChatFileManifest & { r2Key: string }>;
+  fileCatalog: ChatThreadFileCatalogItem[];
 };
 
 function conversationPreamble(guest = false) {
@@ -157,8 +167,10 @@ async function runTurn(
   userText: string,
   history: { role: string; text: string }[],
   contextBlock: string,
+  imageUrls: string[],
   model: string,
   guest: boolean,
+  hasPrivateFiles: boolean,
   invocationContext: CodexTurnInput["invocationContext"],
   cancellationAbort: AbortController,
   onStage?: (stage: "codexAck" | "firstDelta" | "firstConvexPaint") => void,
@@ -180,6 +192,7 @@ async function runTurn(
       userText,
       history,
       contextBlock: freshContext,
+      imageUrls,
       preamble: conversationPreamble(guest),
       modelTier: model,
       allowTools: !guest,
@@ -199,6 +212,7 @@ async function runTurn(
     // This is the decisive ordering barrier: no stream mutation remains alive
     // when processChatQueue writes the final answer.
     await publisher.close();
+    if (hasPrivateFiles) server.forgetConversation(conversationId);
   }
 }
 
@@ -327,10 +341,24 @@ async function processChatQueue(
     }
   }
   const runnerId = randomUUID();
-  const bridge = new AgentToolBridge(dispatchToken);
+  const bridge = new AgentToolBridge(dispatchToken, {
+    searchAttachedFiles: async (messageId, request) => await convexCall("query", "files:searchAttachedFiles", {
+      messageId,
+      mode: request.mode,
+      text: request.query,
+      fileId: request.fileId,
+      afterOrdinal: request.afterOrdinal,
+      limit: 6,
+    }),
+    authorizeTool: async (messageId, toolName) => await convexCall("query", "files:authorizeFileTool", {
+      messageId,
+      toolName,
+    }) as { allowed: boolean; reason?: string },
+  });
   const createServer = (serverEnv: NodeJS.ProcessEnv) => new CodexAppServer(bin, serverEnv, FOREGROUND_TURN_TIMEOUT_MS, {
       dynamicTools: JARVIS_DYNAMIC_TOOLS,
       dynamicToolsOnly: true,
+      ephemeral: true,
       onDynamicToolCall: (call) => bridge.invoke(call),
       onAuthConsumed: () => consumeSubscriptionAuth(serverEnv),
     });
@@ -457,9 +485,18 @@ async function processChatQueue(
     try {
       const visibleUserText = visibleTurnText(claim.userText);
       const contextStarted = Date.now();
-      const context = claim.guest
+      const baseContext = claim.guest
         ? "No private context is available for a guest conversation."
         : await buildContext(visibleUserText);
+      const fileContext = claim.guest ? "" : buildBoundedFileContext(claim.attachments);
+      const fileCatalog = claim.guest ? "" : buildBoundedThreadFileCatalog(claim.fileCatalog);
+      const context = [baseContext, fileCatalog, fileContext].filter(Boolean).join("\n\n");
+      const imageUrls = claim.guest ? [] : (await Promise.all(
+        claim.attachments
+          .filter((file) => ["image/jpeg", "image/png", "image/webp"].includes(file.mimeType))
+          .slice(0, CHAT_FILE_LIMITS.maxImageInputsPerTurn)
+          .map((file) => privateR2PresignGet(file.r2Key, 90).catch(() => null)),
+      )).filter((url): url is string => Boolean(url));
       const contextReadyAt = Date.now();
       const model = pickConversationTier(visibleUserText);
       const stages: Partial<Record<"codexAck" | "firstDelta" | "firstConvexPaint", number>> = {};
@@ -471,8 +508,10 @@ async function processChatQueue(
         claim.userText,
         claim.history,
         context,
+        imageUrls,
         model,
         Boolean(claim.guest),
+        claim.attachments.length > 0,
         {
           requestId: claim.requestId,
           userMessageId: claim.userMessageId,

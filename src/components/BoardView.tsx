@@ -4,6 +4,7 @@ import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
+import { CreationSourceFiles, type CreationSourceFile } from "./CreationSourceFiles";
 import "@excalidraw/excalidraw/index.css";
 import {
   Background,
@@ -107,7 +108,10 @@ export default function BoardView({ value }: { value: string }) {
   } catch {
     /* noop */
   }
-  const row = useJarvisQuery(api.creations.get, creationId ? { id: creationId as never } : "skip") as { data?: string } | null | undefined;
+  const row = useJarvisQuery(api.creations.get, creationId ? { id: creationId as never } : "skip") as
+    | { data?: string; sourceFiles?: CreationSourceFile[] }
+    | null
+    | undefined;
   const boardSave = (args: Record<string, unknown>) => clientMutation("creations:boardSave", args);
   const apiRef = useRef<any>(null);
   const flowApiRef = useRef<ReactFlowInstance<Node<SemanticFlowData>, Edge> | null>(null);
@@ -434,6 +438,7 @@ export default function BoardView({ value }: { value: string }) {
             fit overview
           </button>
         </div>
+        <CreationSourceFiles files={row?.sourceFiles} className="pointer-events-auto mt-2" />
         {latestConcepts.length > 0 && (
           <div className="scrollbar-thin pointer-events-auto mt-2 flex gap-2 overflow-x-auto pb-1" aria-label="Latest extracted concepts">
             {latestConcepts.map((node) => (

@@ -4,6 +4,23 @@ export type FinalDeliveryCursor = {
   lastMessageId: string | null;
 };
 
+export type FinalNarrationFence = {
+  generation: number;
+  threadId: string;
+  messageId: string;
+  parentMessageId?: string;
+};
+
+export function finalNarrationStillCurrent(
+  fence: FinalNarrationFence,
+  current: FinalNarrationFence,
+): boolean {
+  return fence.generation === current.generation
+    && fence.threadId === current.threadId
+    && fence.messageId === current.messageId
+    && fence.parentMessageId === current.parentMessageId;
+}
+
 export type FinalDeliveryCandidate = {
   id: string;
   parentMessageId?: string;

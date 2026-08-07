@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server";
 import { tasks } from "@trigger.dev/sdk/v3";
 import { convexMutation, convexQuery, reportIncident } from "@/lib/context";
 import { actorAdminHash, controlActor, controlCredentials, type ControlActor } from "@/lib/request-auth";
+import { CHAT_FILE_LIMITS } from "@/lib/chat-files";
 
 // Conversation transport only. The durable answer is produced by a trusted
 // Trigger worker running Codex with Daniel's subscription; neither the browser
@@ -24,15 +25,25 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
   let text = "";
   let threadId = "main";
   let requestId = "";
+  let fileIds: string[] = [];
   try {
     const body = await req.json();
     text = String(body?.text ?? "").trim();
     threadId = String(body?.threadId ?? "main").trim() || "main";
     requestId = String(body?.requestId ?? "").trim().slice(0, 120);
+    if (body?.fileIds !== undefined && !Array.isArray(body.fileIds)) {
+      return Response.json({ error: "invalid file selection" }, { status: 400 });
+    }
+    fileIds = (body?.fileIds ?? []).map((fileId: unknown) => String(fileId).trim()).filter(Boolean);
   } catch {
     return Response.json({ error: "bad request" }, { status: 400 });
   }
-  if (!text) return Response.json({ error: "empty" }, { status: 400 });
+  if (fileIds.length > CHAT_FILE_LIMITS.maxFilesPerMessage || new Set(fileIds).size !== fileIds.length) {
+    return Response.json({ error: "invalid file selection" }, { status: 400 });
+  }
+  if (actor.kind === "guest" && fileIds.length) return Response.json({ error: "private files require owner access" }, { status: 403 });
+  if (!text && !fileIds.length) return Response.json({ error: "empty" }, { status: 400 });
+  if (!text) text = "Please analyze the attached files.";
 
   const credentials = actor.kind === "guest" ? { guestId: actor.guestId } : controlCredentials(actor);
   let messageId: unknown;
@@ -41,6 +52,7 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
       threadId,
       text: text.slice(0, actor.kind === "guest" ? 2_000 : 12_000),
       requestId: requestId || undefined,
+      fileIds: fileIds.length ? fileIds : undefined,
       ...credentials,
     });
   } catch (error) {

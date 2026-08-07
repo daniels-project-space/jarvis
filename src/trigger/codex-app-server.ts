@@ -328,6 +328,8 @@ export type CodexTurnInput = {
   userText: string;
   history: Array<{ role: string; text: string }>;
   contextBlock: string;
+  /** Ephemeral server-resolved private image URLs. Never persist or log. */
+  imageUrls?: string[];
   preamble: string;
   modelTier: string;
   reasoningEffort?: unknown;
@@ -509,7 +511,13 @@ export class CodexAppServer {
     // not pay for the same snapshot in both protocol fields.
     const text = `${history}Current live context (use only what is relevant):\n${input.contextBlock}\n\n${speaker}: ${cleanText}`;
     const userInput: JsonObject[] = [{ type: "text", text }];
-    if (marker?.[1]) userInput.push({ type: "image", url: marker[1].trim(), detail: "high" });
+    const imageUrls = [
+      ...(marker?.[1] ? [marker[1].trim()] : []),
+      ...(input.imageUrls ?? []),
+    ]
+      .filter((url, index, all) => /^https:\/\//.test(url) && url.length <= 4_096 && all.indexOf(url) === index)
+      .slice(0, 4);
+    for (const url of imageUrls) userInput.push({ type: "image", url, detail: "high" });
     if (input.beforeTurn) await boundedCallback(input.beforeTurn);
     if (input.signal?.aborted) throw new Error("Codex conversation turn was cancelled");
     const started = await this.request("turn/start", {
@@ -583,6 +591,11 @@ export class CodexAppServer {
     }
     input.onTurnStarted?.();
     return completion;
+  }
+
+  /** Drop the warm routing handle after a turn containing private file data. */
+  forgetConversation(conversationId: string): boolean {
+    return this.threads.delete(conversationId);
   }
 
   stop() { this.process?.kill("SIGTERM"); this.process = null; }

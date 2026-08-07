@@ -7,6 +7,7 @@ const JARVIS_ORIGIN = "https://jarvis-orcin-six.vercel.app";
 
 type LoaderListener = (event: unknown) => void;
 type JarvisApi = {
+  ask: (text: string) => void;
   show: () => void;
   interrupt: () => void;
   visible: boolean;
@@ -36,6 +37,7 @@ type FakeElement = {
   dataset: Record<string, string>;
   isConnected: boolean;
   onclick?: (() => void) | null;
+  onload?: (() => void) | null;
   remove: ReturnType<typeof vi.fn>;
   setAttribute: ReturnType<typeof vi.fn>;
   src?: string;
@@ -153,6 +155,7 @@ function createLoader(options: { denyFirstRecognition?: boolean } = {}) {
     CustomEvent: class { constructor(public type: string, public init: unknown) {} },
     URL,
     clearTimeout,
+    Date,
     document,
     history: windowObject.history,
     location: windowObject.location,
@@ -169,6 +172,68 @@ afterEach(() => {
 });
 
 describe("Project Hub Jarvis loader", () => {
+  it("bounds pre-ready commands and discards them after the handoff TTL", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-07T12:00:00Z"));
+    const harness = createLoader();
+    for (let index = 1; index <= 6; index += 1) harness.window.JARVIS.ask(`command ${index}`);
+    const receive = harness.listeners.get("message")?.[0];
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "ready" } });
+    expect(harness.messages.filter((message) => (
+      message as { jarvis?: string }
+    ).jarvis === "host-command")).toEqual([
+      { jarvis: "host-command", text: "command 3" },
+      { jarvis: "host-command", text: "command 4" },
+      { jarvis: "host-command", text: "command 5" },
+      { jarvis: "host-command", text: "command 6" },
+    ]);
+
+    const staleHarness = createLoader();
+    staleHarness.window.JARVIS.ask("stale command");
+    vi.advanceTimersByTime(30_001);
+    staleHarness.listeners.get("message")?.[0]?.({
+      origin: JARVIS_ORIGIN,
+      source: staleHarness.frameWindow,
+      data: { jarvis: "ready" },
+    });
+    expect(staleHarness.messages).not.toContainEqual({ jarvis: "host-command", text: "stale command" });
+  });
+
+  it("holds commands across an iframe reload until that document acknowledges a fresh probe", () => {
+    vi.useFakeTimers();
+    const harness = createLoader();
+    const receive = harness.listeners.get("message")?.[0];
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "ready" } });
+    harness.messages.splice(0);
+
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "unloading" } });
+    harness.window.JARVIS.ask("command during reload");
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "ready" } });
+    expect(harness.messages).not.toContainEqual({ jarvis: "host-command", text: "command during reload" });
+
+    harness.frame.onload?.();
+    const probe = harness.messages.find((message) => (
+      message as { jarvis?: string }
+    ).jarvis === "host-ready-probe") as { jarvis: string; probe: number } | undefined;
+    expect(probe?.probe).toBeTypeOf("number");
+
+    expect(harness.messages).not.toContainEqual({ jarvis: "host-command", text: "command during reload" });
+
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "ready" } });
+    expect(harness.messages).not.toContainEqual({ jarvis: "host-command", text: "command during reload" });
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "ready", probe: probe?.probe },
+    });
+    expect(harness.messages.filter((message) => (
+      message as { jarvis?: string }
+    ).jarvis === "host-command")).toEqual([
+      { jarvis: "host-command", text: "command during reload" },
+    ]);
+  });
+
   it("mounts one universal Jarvis control with the visual selector beside it", () => {
     const harness = createLoader();
     const controls = harness.createdElements.find((element) => "data-jarvis-universal-controls" in element.attributes);
@@ -183,6 +248,42 @@ describe("Project Hub Jarvis loader", () => {
     controls?.children[1].onclick?.();
     const editCard = harness.createdElements.find((element) => element.dataset.jarvisEditUi === "card");
     expect(editCard?.style.cssText).toContain("bottom:72px");
+  });
+
+  it("shows bounded realtime work stages in the collapsed host control", () => {
+    const harness = createLoader();
+    const controls = harness.createdElements.find((element) => "data-jarvis-universal-controls" in element.attributes);
+    const button = controls?.children[0];
+    const label = button?.children[1];
+    const track = button?.children[2];
+    const fill = track?.children[0];
+
+    harness.listeners.get("message")?.[0]?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "status", phase: "thinking", progress: 0.32 },
+    });
+    expect(button?.attributes["aria-label"]).toBe("Jarvis is thinking");
+    expect(label?.textContent).toBe("THINKING");
+    expect(track?.style.opacity).toBe("1");
+    expect(fill?.style.transform).toBe("scaleX(0.32)");
+
+    harness.listeners.get("message")?.[0]?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "status", phase: "responding", progress: 0.72 },
+    });
+    expect(label?.textContent).toBe("RESPONDING");
+    expect(fill?.style.transform).toBe("scaleX(0.72)");
+
+    harness.listeners.get("message")?.[0]?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "status", phase: "online", progress: 1 },
+    });
+    expect(label?.textContent).toBe("JARVIS");
+    expect(track?.style.opacity).toBe("0");
+    expect(fill?.style.transform).toBe("scaleX(0)");
   });
 
   it("captures the wake word in the top-level page and forwards the command", () => {

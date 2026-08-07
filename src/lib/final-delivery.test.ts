@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { advanceFinalDelivery, type FinalDeliveryCursor } from "./final-delivery";
+import {
+  advanceFinalDelivery,
+  finalNarrationStillCurrent,
+  type FinalDeliveryCursor,
+  type FinalNarrationFence,
+} from "./final-delivery";
 
 const empty: FinalDeliveryCursor = { threadId: "", initialized: false, lastMessageId: null };
 
@@ -41,5 +46,32 @@ describe("advanceFinalDelivery", () => {
       latest: { id: "reply", parentMessageId: "active-user" },
       activeParentMessageId: "active-user",
     }).deliver).toBe(false);
+  });
+});
+
+describe("final narration race fence", () => {
+  it("rejects an old final after its streaming chain resolves into a newer turn", async () => {
+    let release!: () => void;
+    const streamingChain = new Promise<void>((resolve) => { release = resolve; });
+    const fence: FinalNarrationFence = {
+      generation: 4,
+      threadId: "main",
+      messageId: "assistant-old",
+      parentMessageId: "user-old",
+    };
+    let current = { ...fence };
+    const result = (async () => {
+      await streamingChain;
+      return finalNarrationStillCurrent(fence, current);
+    })();
+
+    current = {
+      generation: 5,
+      threadId: "main",
+      messageId: "assistant-new",
+      parentMessageId: "user-new",
+    };
+    release();
+    await expect(result).resolves.toBe(false);
   });
 });
