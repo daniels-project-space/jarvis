@@ -3751,6 +3751,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             </div>
           )}
           <div className="border-t border-white/10 p-2">
+            <div className="flex gap-2">
             {!guest && (
               <ChatFilePicker
                 threadId={thread}
@@ -3762,7 +3763,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 onNotice={setFileNotice}
               />
             )}
-            <div className={`${!guest ? "mt-2" : ""} flex gap-2`}>
             <button
               type="button"
               onClick={() => speaking ? stopTalking() : void toggleLive()}
@@ -4140,6 +4140,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
 
           {/* composer */}
           <div className="safe-composer relative min-w-0 max-w-full border-t border-white/5 p-2 sm:p-3">
+            <div className="flex min-w-0 max-w-full items-stretch gap-1.5 sm:gap-2">
             {!guest && chatMode === "full" && (
               <ChatFilePicker
                 threadId={thread}
@@ -4151,7 +4152,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 onNotice={setFileNotice}
               />
             )}
-            <div className={`${!guest ? "mt-2" : ""} flex min-w-0 max-w-full items-stretch gap-1.5 overflow-hidden sm:gap-2`}>
             <button
               onClick={() => void toggleLive()}
               title="live conversation"
