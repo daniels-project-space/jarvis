@@ -3,6 +3,7 @@ import type { MutationCtx } from "./_generated/server";
 import type { Doc } from "./_generated/dataModel";
 import { ConvexError, v } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
+import { CHAT_FILE_LIMITS, FILE_READY_STATUSES } from "../src/lib/chat-files";
 import {
   actorAuthArgs,
   conversationIdentity,
@@ -12,6 +13,17 @@ import {
   scopedConversationThread,
   viewerAuthArgs,
 } from "./controlAuth";
+import {
+  isDeterministicFileFollowUp,
+  isLikelyFileReference,
+  attachFileBadgesToMessages,
+  linkFilesToMessage,
+  messageFileManifests,
+  namedThreadFileManifest,
+  recentThreadFileManifest,
+  threadFileCatalog,
+  validateReadyMessageFiles,
+} from "./fileHelpers";
 
 const HOST_CONTEXT_BLOCK = /\s*\[JARVIS_HOST_CONTEXT\][\s\S]*?\[\/JARVIS_HOST_CONTEXT\]\s*/g;
 const visibleTurnText = (text: string) => text.replace(HOST_CONTEXT_BLOCK, " ").replace(/\s{2,}/g, " ").trim();
@@ -114,6 +126,7 @@ export const sendMessage = mutation({
     threadId: v.optional(v.string()),
     text: v.string(),
     requestId: v.optional(v.string()),
+    fileIds: v.optional(v.array(v.id("files"))),
     ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
@@ -124,8 +137,22 @@ export const sendMessage = mutation({
         .query("chatMessages")
         .withIndex("by_request", (q: any) => q.eq("requestId", a.requestId))
         .first();
-      if (prior?.role === "user" && prior.threadId === threadId) return prior._id;
+      if (prior?.role === "user" && prior.threadId === threadId) {
+        const links = await ctx.db
+          .query("messageFiles")
+          .withIndex("by_message", (q: any) => q.eq("messageId", prior._id))
+          .take(9);
+        const priorIds = links
+          .sort((left: any, right: any) => left.position - right.position)
+          .map((link: any) => String(link.fileId));
+        const requestedIds = (a.fileIds ?? []).map(String);
+        if (priorIds.length !== requestedIds.length || priorIds.some((fileId: string, index: number) => fileId !== requestedIds[index])) {
+          throw new ConvexError({ code: "CHAT_REQUEST_CONFLICT", message: "Chat request identity was reused with different files" });
+        }
+        return prior._id;
+      }
     }
+    const files = await validateReadyMessageFiles(ctx, threadId, a.fileIds, identity.kind === "guest");
     if (identity.kind === "guest") await admitGuestTurn(ctx, identity.guestId, Date.now());
     const session = await ensureSession(ctx, threadId);
     // Stable turn slots keep concurrent replies beside the user message that
@@ -144,6 +171,7 @@ export const sendMessage = mutation({
       guestSlotReleased: identity.kind === "guest" ? false : undefined,
       createdAt,
     });
+    await linkFilesToMessage(ctx, id, threadId, files, createdAt);
     if (session) await ctx.db.patch(session._id, { lastActiveAt: createdAt });
     return id;
   },
@@ -161,7 +189,7 @@ export const listMessages = query({
       // The always-mounted foreground surface needs only the newest visible
       // turns. A streamed token therefore re-reads at most twenty rows.
       .take(20);
-    return rows.reverse();
+    return await attachFileBadgesToMessages(ctx, threadId, rows.reverse());
   },
 });
 
@@ -174,9 +202,10 @@ export const paginatedMessages = query({
   args: { threadId: v.optional(v.string()), paginationOpts: paginationOptsValidator, ...viewerAuthArgs },
   handler: async (ctx, a) => {
     const identity = await conversationViewerIdentity(ctx, a);
-    return await ctx.db
+    const threadId = scopedConversationThread(identity, a.threadId);
+    const result = await ctx.db
       .query("chatMessages")
-      .withIndex("by_thread", (q: any) => q.eq("threadId", scopedConversationThread(identity, a.threadId)))
+      .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
       .order("desc")
       .paginate({
         ...a.paginationOpts,
@@ -184,6 +213,7 @@ export const paginatedMessages = query({
         maximumRowsRead: HISTORY_PAGE_MAX,
         maximumBytesRead: 256 * 1024,
       });
+    return { ...result, page: await attachFileBadgesToMessages(ctx, threadId, result.page) };
   },
 });
 
@@ -194,12 +224,13 @@ export const listRecentMessages = query({
   args: { threadId: v.optional(v.string()), ...viewerAuthArgs },
   handler: async (ctx, a) => {
     const identity = await conversationViewerIdentity(ctx, a);
+    const threadId = scopedConversationThread(identity, a.threadId);
     const rows = await ctx.db
       .query("chatMessages")
-      .withIndex("by_thread", (q: any) => q.eq("threadId", scopedConversationThread(identity, a.threadId)))
+      .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
       .order("desc")
       .take(8);
-    return rows.reverse();
+    return await attachFileBadgesToMessages(ctx, threadId, rows.reverse());
   },
 });
 
@@ -406,7 +437,24 @@ export const requestRecovery = mutation({
       .order("desc")
       .first();
     if (!assistant) return { status: user.status === "done" ? "completed" as const : "missing" as const };
-    if (assistant.status === "done") return { status: "completed" as const };
+    if (assistant.status === "done") {
+      // Recovery is also a delivery path. A browser can miss the reactive
+      // transition while reconnecting, so return the finished assistant row
+      // instead of merely saying that it exists.
+      return {
+        status: "completed" as const,
+        assistant: {
+          _id: assistant._id,
+          role: assistant.role,
+          text: assistant.text,
+          status: assistant.status,
+          model: assistant.model,
+          delivery: assistant.delivery,
+          parentMessageId: assistant.parentMessageId,
+          createdAt: assistant.createdAt,
+        },
+      };
+    }
     if (assistant.status === "streaming") {
       if (Date.now() - Number(assistant.lastProgressAt ?? assistant.createdAt) < CHAT_TURN_STALE_MS) {
         return { status: "active" as const, attemptCount: Number(user.attemptCount ?? 1) };
@@ -598,6 +646,34 @@ async function claimPending(ctx: { db: any }, pending: any, claimToken: string) 
       .sort((a: any, b: any) => a.createdAt - b.createdAt)
       .slice(-12)
       .map((m: any) => ({ role: m.role, text: m.role === "user" ? visibleTurnText(m.text) : m.text }));
+    // Attachment scope is intentionally the exact claimed user row. Thread
+    // library files and files on any earlier/later message never enter this
+    // turn implicitly.
+    const messageAttachments = await messageFileManifests(ctx, pending._id, pending.text);
+    const fileRelevant = messageAttachments.length > 0 || isLikelyFileReference(pending.text);
+    const namedReference = !messageAttachments.length && fileRelevant
+      ? await namedThreadFileManifest(ctx, pending.threadId, pending.text)
+      : null;
+    const recentFallback = !messageAttachments.length && !namedReference && isDeterministicFileFollowUp(pending.text)
+      ? await recentThreadFileManifest(ctx, pending.threadId)
+      : null;
+    const resolvedFallback = namedReference ?? recentFallback;
+    if (resolvedFallback) {
+      const file = await ctx.db.get(resolvedFallback.fileId);
+      if (file && FILE_READY_STATUSES.has(String(file.status))) {
+        // Persist deterministic named/recent resolution on the invoking turn
+        // before any model/tool runs. Retries now see the same exact source,
+        // history shows it, and creations can cite it durably.
+        await linkFilesToMessage(ctx, pending._id, pending.threadId, [file], pending.createdAt);
+      }
+    }
+    const attachments = resolvedFallback
+      ? (await messageFileManifests(ctx, pending._id, pending.text)).map((file) => ({
+          ...file,
+          ...(file.fileId === resolvedFallback.fileId ? { selection: resolvedFallback.selection } : {}),
+        }))
+      : messageAttachments;
+    const fileCatalog = fileRelevant && !attachments.length ? await threadFileCatalog(ctx, pending.threadId) : [];
 
     return {
       threadId: pending.threadId,
@@ -609,6 +685,8 @@ async function claimPending(ctx: { db: any }, pending: any, claimToken: string) 
       claimToken,
       attemptCount,
       history,
+      attachments,
+      fileCatalog,
     };
 }
 
@@ -844,7 +922,17 @@ export const clearThread = mutation({
       .query("chatMessages")
       .withIndex("by_thread", (q: any) => q.eq("threadId", a.threadId ?? "main"))
       .collect();
-    for (const r of rows) await ctx.db.delete(r._id);
+    for (const r of rows) {
+      const provenance = await ctx.db
+        .query("messageFiles")
+        .withIndex("by_message", (q: any) => q.eq("messageId", r._id))
+        .take(CHAT_FILE_LIMITS.maxFilesPerMessage + 1);
+      if (provenance.length > CHAT_FILE_LIMITS.maxFilesPerMessage) {
+        throw new Error("message file cleanup bound exceeded");
+      }
+      for (const link of provenance) await ctx.db.delete(link._id);
+      await ctx.db.delete(r._id);
+    }
     return rows.length;
   },
 });

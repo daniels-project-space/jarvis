@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { nextVoiceLoopAction } from "./voice-loop";
+import { nextVoiceLoopAction, shouldMaintainLiveHeartbeat } from "./voice-loop";
 
 describe("nextVoiceLoopAction", () => {
   it.each(["silence", "empty", "echo"] as const)(
@@ -34,5 +34,14 @@ describe("nextVoiceLoopAction", () => {
     expect(
       nextVoiceLoopAction({ outcome: "silence", persistentLive: true, loopRequested: false }),
     ).toBe("stop");
+  });
+});
+
+describe("shouldMaintainLiveHeartbeat", () => {
+  it("writes ownership only for a visible authenticated live session", () => {
+    expect(shouldMaintainLiveHeartbeat({ guest: false, visible: true, live: true })).toBe(true);
+    expect(shouldMaintainLiveHeartbeat({ guest: true, visible: true, live: true })).toBe(false);
+    expect(shouldMaintainLiveHeartbeat({ guest: false, visible: false, live: true })).toBe(false);
+    expect(shouldMaintainLiveHeartbeat({ guest: false, visible: true, live: false })).toBe(false);
   });
 });

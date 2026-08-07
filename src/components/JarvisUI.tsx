@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { usePaginatedQuery } from "convex/react";
 import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
@@ -20,7 +20,7 @@ import {
 import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
 import { isPanelFollowUp } from "@/lib/panel-relevance";
-import { nextVoiceLoopAction, type VoiceCaptureOutcome } from "@/lib/voice-loop";
+import { nextVoiceLoopAction, shouldMaintainLiveHeartbeat, type VoiceCaptureOutcome } from "@/lib/voice-loop";
 import {
   LIVE_SPEAKER_TAIL_MS,
   advanceLiveVad,
@@ -51,12 +51,31 @@ import { GuestSafeAttachment } from "./GuestSafeAttachment";
 import {
   authoritativeCancellationReceipt,
   FOREGROUND_AUTO_RECOVERY_MS,
+  foregroundRecoveryBudgetAfterSignal,
+  foregroundRecoveryWatchdogDisposition,
   foregroundTurnPhase,
   latestRecoverableForegroundTurn,
+  mergeRecoveredAssistant,
 } from "@/lib/foreground-recovery";
-import { advanceFinalDelivery, type FinalDeliveryCursor } from "@/lib/final-delivery";
+import {
+  advanceFinalDelivery,
+  finalNarrationStillCurrent,
+  type FinalDeliveryCursor,
+} from "@/lib/final-delivery";
 import { withClientDeadline } from "@/lib/client-deadline";
 import { resolveTrustedJarvisEmbedOrigin } from "@/lib/embed-origin";
+import { transcribeRecordedAudio } from "@/lib/stt-client";
+import {
+  reconcileEmbeddedThreadReadiness,
+  stableEmbeddedActorKey,
+  type EmbeddedThreadContext,
+} from "@/lib/embed-command-handoff";
+import { ChatFilePicker } from "./chat-files/ChatFilePicker";
+import { ChatFilePendingMonitor, type ChatFileNotice } from "./chat-files/ChatFilePendingMonitor";
+import type { ChatFileManifest } from "@/lib/chat-files";
+
+const EMBED_COMMAND_TTL_MS = 30_000;
+const MAX_PENDING_EMBED_COMMANDS = 4;
 
 const ThreeOrb = dynamic(() => import("./ThreeOrb"), { ssr: false });
 
@@ -84,6 +103,7 @@ type Msg = {
   delivery?: "foreground" | "notification";
   parentMessageId?: string;
   attachment?: Attachment;
+  files?: ChatFileManifest[];
   createdAt: number;
 };
 type Caption = {
@@ -102,6 +122,23 @@ type StreamingSpeechState = {
   pendingPrefix: string;
   pendingCaption: string;
 };
+
+function MessageFileBadges({ files, align = "left" }: { files?: ChatFileManifest[]; align?: "left" | "right" }) {
+  if (!files?.length) return null;
+  return (
+    <div className={`mt-1 flex flex-wrap gap-1 ${align === "right" ? "justify-end" : "justify-start"}`} aria-label="Files used by this message">
+      {files.map((file) => {
+        const ready = file.status === "ready" || file.status === "stored_only";
+        const label = <><span aria-hidden="true">{file.mimeType.startsWith("image/") ? "▧" : "▤"}</span> <span className="max-w-40 truncate">{file.name}</span>{!ready && <span className="text-amber-300"> · {file.status}</span>}</>;
+        return ready ? (
+          <a key={file.fileId} href={`/api/files/${encodeURIComponent(file.fileId)}`} target="_blank" rel="noreferrer" className="inline-flex max-w-52 items-center gap-1 rounded-full border border-cyan/20 bg-cyan/[0.05] px-2 py-1 text-[10px] text-cyan/80 hover:border-cyan/45 hover:text-cyan" title={file.relativePath || file.name}>{label}</a>
+        ) : (
+          <span key={file.fileId} className="inline-flex max-w-52 items-center gap-1 rounded-full border border-white/10 bg-white/[0.025] px-2 py-1 text-[10px] text-slate-400" title={file.relativePath || file.name}>{label}</span>
+        );
+      })}
+    </div>
+  );
+}
 
 function ChatHistoryArchive({ threadId }: { threadId: string }) {
   const viewerToken = useViewerSession();
@@ -124,6 +161,7 @@ function ChatHistoryArchive({ threadId }: { threadId: string }) {
         >
           <div className="line-clamp-3 whitespace-pre-wrap text-ice/85">{message.role === "user" ? visibleTurnText(message.text) : sanitizeAssistantText(message.text)}</div>
         </GuestSafeAttachment>
+        {message.role === "user" && <MessageFileBadges files={message.files} />}
       </li>)}
     </ol>
     {status === "CanLoadMore" && <button type="button" onClick={() => loadMore(20)} className="mx-2 mt-2 w-[calc(100%-16px)] rounded-lg border border-cyan/20 px-2 py-1 text-[9px] text-cyan">load older messages</button>}
@@ -1191,20 +1229,44 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     });
   const threadRef = useRef("main");
   const threadReadyRef = useRef(false);
-  const pendingEntryCommands = useRef<string[]>([]);
+  const embeddedThreadContextRef = useRef<EmbeddedThreadContext | null>(null);
+  const pendingEntryCommands = useRef<Array<{ text: string; at: number }>>([]);
   const hostContextRef = useRef<JarvisHostContext | null>(null);
   const hostActionWaiters = useRef(new Map<string, (result: HostActionResult) => void>());
-  useEffect(() => {
+  const embeddedActorKey = stableEmbeddedActorKey(parentOrigin, viewerToken);
+  const embeddedThreadHydrated = activeThreadReady && (!embedded || Boolean(parentOrigin));
+  useLayoutEffect(() => {
+    const nextContext: EmbeddedThreadContext = {
+      actorKey: embeddedActorKey,
+      threadId: embeddedThreadHydrated ? thread : null,
+      hydrated: embeddedThreadHydrated,
+    };
+    const transition = reconcileEmbeddedThreadReadiness(
+      embeddedThreadContextRef.current,
+      nextContext,
+      threadReadyRef.current,
+    );
+    embeddedThreadContextRef.current = nextContext;
+    threadReadyRef.current = transition.ready;
+    if (transition.discardPending) pendingEntryCommands.current = [];
     threadRef.current = thread;
-    if (!activeThreadReady) return;
+    if (!embeddedThreadHydrated) return;
     threadReadyRef.current = true;
-    const queued = pendingEntryCommands.current.splice(0);
-    for (const command of queued) void submit(command);
+    const now = Date.now();
+    const queued = pendingEntryCommands.current.splice(0)
+      .filter((command) => now - command.at <= EMBED_COMMAND_TTL_MS);
+    for (const command of queued) void submit(command.text);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeThreadReady, thread]);
+  }, [embeddedActorKey, embeddedThreadHydrated, thread]);
   function submitEntryCommand(command: string) {
     if (!threadReadyRef.current) {
-      pendingEntryCommands.current.push(command);
+      pendingEntryCommands.current.push({ text: command, at: Date.now() });
+      if (pendingEntryCommands.current.length > MAX_PENDING_EMBED_COMMANDS) {
+        pendingEntryCommands.current.splice(
+          0,
+          pendingEntryCommands.current.length - MAX_PENDING_EMBED_COMMANDS,
+        );
+      }
       return;
     }
     void submit(command);
@@ -1214,7 +1276,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     api.chatQueue.listRecentMessages,
     embedded && parentOrigin ? { threadId: thread } : "skip",
   );
-  const messages = ((embedded ? embeddedMessages : fullMessages) ?? []) as Msg[];
+  const remoteMessages = ((embedded ? embeddedMessages : fullMessages) ?? []) as Msg[];
+  const [recoveredAssistant, setRecoveredAssistant] = useState<(Msg & { threadId: string }) | null>(null);
+  const recoveredForThread = recoveredAssistant?.threadId === thread ? recoveredAssistant : null;
+  const messages = mergeRecoveredAssistant(remoteMessages, recoveredForThread);
   const messagesHydrated = (embedded ? embeddedMessages : fullMessages) !== undefined;
   const remotePanel = useJarvisQuery(api.ui.getPanel, guest ? "skip" : {}) as
     | StagePanel
@@ -1303,6 +1368,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }, [embedded, hostActionRow, parentOrigin]);
 
   const [input, setInput] = useState("");
+  const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
+  const [pendingFileIds, setPendingFileIds] = useState<string[]>([]);
+  const [fileNotice, setFileNotice] = useState<ChatFileNotice>(null);
+  useEffect(() => {
+    setSelectedFileIds([]);
+    setPendingFileIds([]);
+    setFileNotice(null);
+  }, [thread]);
   const [speaking, setSpeaking] = useState(false);
   const speakingRef = useRef(false);
   const wasSpeakingRef = useRef(false);
@@ -1421,6 +1494,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
 
   const endRef = useRef<HTMLDivElement>(null);
   const finalDeliveryCursor = useRef<FinalDeliveryCursor>({ threadId: "", initialized: false, lastMessageId: null });
+  const finalNarrationGenerationRef = useRef(0);
+  const finalNarrationMessageRef = useRef("");
   const lastSpokenText = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
   const streamingSpeechRef = useRef<StreamingSpeechState>({
     id: "",
@@ -1463,6 +1538,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     threadId: string;
     text: string;
     visibleText: string;
+    fileIds: string[];
   } | null>(null);
   const durableSubmissionInFlight = useRef(false);
   const lastSubmittedParentId = useRef<string | undefined>(undefined);
@@ -1753,6 +1829,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // Project Hub owns recognition at the top level and sends commands here.
     if (wakeOwnedByHost()) return;
     if (!wakeIsEnabled()) return;
+    if (document.hidden) return;
     import("../lib/wakeword").then((m) => {
       if (!m.wakeSupported()) return;
       m.startWake(onWake, (listening) => setWake(listening), onWakeDetected);
@@ -1796,7 +1873,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     rearmWake(); // resume standby across reloads if Daniel left it on
     // release the live lock instantly if the tab closes mid-session
     const bye = () => {
-      if (!liveRef.current) return;
+      if (guest || !liveRef.current) return;
       const body = JSON.stringify({ path: "ui:setLiveOn", args: { client: me.current, on: false } });
       void viewerFetch("/api/client-mutation", {
         method: "POST",
@@ -1808,10 +1885,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     window.addEventListener("pagehide", bye);
     return () => window.removeEventListener("pagehide", bye);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [guest]);
 
   useEffect(() => {
-    if (!embedded || !activeThreadReady) return;
+    if (!embedded || !parentOrigin) return;
     const receiveHostMessage = (event: MessageEvent) => {
       if (event.source !== window.parent || !parentOrigin || event.origin !== parentOrigin) return;
       const message = event.data ?? {};
@@ -1827,6 +1904,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           hostActionWaiters.current.delete(message.id);
           finish({ ok: message.ok === true, detail: typeof message.detail === "string" ? message.detail : undefined });
         }
+      }
+      if (message.jarvis === "host-ready-probe" && typeof message.probe === "number") {
+        postToParent({ jarvis: "ready", probe: message.probe });
       }
       if (message.jarvis === "host-interrupt") stopTalking();
       if (message.jarvis === "host-wake-detected") {
@@ -1850,10 +1930,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       }
     };
     window.addEventListener("message", receiveHostMessage);
+    const notifyUnloading = () => postToParent({ jarvis: "unloading" });
+    window.addEventListener("pagehide", notifyUnloading);
     postToParent({ jarvis: "ready" });
-    return () => window.removeEventListener("message", receiveHostMessage);
+    return () => {
+      window.removeEventListener("message", receiveHostMessage);
+      window.removeEventListener("pagehide", notifyUnloading);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeThreadReady, embedded, parentOrigin]);
+  }, [embedded, parentOrigin]);
 
   useEffect(() => {
     me.current = clientId();
@@ -1882,7 +1967,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   };
   // The instant a live session starts anywhere, cut any local speech mid-word.
   useEffect(() => {
-    if (liveOnRow && Date.now() - liveOnRow.updatedAt < 45_000 && !liveRef.current) {
+    const localNarrationOwner = Date.now() < localVoiceLeaseUntilRef.current
+      || voiceRef.current?.value === me.current;
+    if (liveOnRow && Date.now() - liveOnRow.updatedAt < 45_000 && !liveRef.current && !localNarrationOwner) {
       import("../lib/tts").then((m) => m.stopSpeaking());
       setSpeaking(false);
     }
@@ -1917,12 +2004,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       fadeCaption(captionText, 3_200);
       finishOneShotVoiceTurn();
     };
-    if (document.hidden || (liveAnywhere() && !liveRef.current) || !(await ensureVoice())) {
+    const localNarrationOwner = Date.now() < localVoiceLeaseUntilRef.current
+      || voiceRef.current?.value === me.current;
+    if (document.hidden || (liveAnywhere() && !liveRef.current && !localNarrationOwner) || !(await ensureVoice())) {
       finishWithoutSpeech();
       return false;
     }
     const { speak } = await import("../lib/tts");
-    await speak(
+    const played = await speak(
       text,
       (energy) => (energyRef.current = energy),
       () => {
@@ -1939,6 +2028,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         }
       },
     );
+    if (!played) {
+      setSpeaking(false);
+      showCaption({
+        who: "jarvis",
+        text: `Voice playback failed. The reply is still available in chat: ${captionText}`,
+        phase: "ready",
+      });
+      return false;
+    }
     return true;
   }
 
@@ -2102,6 +2200,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       threadId: thread,
       text: recoverable.text,
       visibleText: visibleTurnText(recoverable.text),
+      fileIds: messages.find((message) => message._id === recoverable.messageId)?.files?.map((file) => file.fileId) ?? [],
     };
     lastSubmittedParentId.current = recoverable.messageId;
     durableAutoRecoveries.current = 0;
@@ -2123,7 +2222,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (state.phase === "queued") return;
 
     if (state.phase === "streaming") {
+      durableAutoRecoveries.current = foregroundRecoveryBudgetAfterSignal(
+        durableAutoRecoveries.current,
+        "streaming",
+      );
       if (state.text) setDurableRecovery("waiting");
+      armDurableRecoveryWatchdog();
       return;
     }
 
@@ -2162,6 +2266,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // never say the exact same thing twice in a row (root of "sends results twice")
     if (last.text === lastSpokenText.current.text && Date.now() - lastSpokenText.current.ts < 20_000) return;
     lastSpokenText.current = { text: last.text, ts: Date.now() };
+    const generation = finalNarrationGenerationRef.current + 1;
+    finalNarrationGenerationRef.current = generation;
+    finalNarrationMessageRef.current = last._id;
+    const narrationFence = {
+      generation,
+      threadId: thread,
+      messageId: last._id,
+      parentMessageId: last.parentMessageId,
+    };
     // Background findings never interrupt an active voice exchange. Normal
     // Codex replies do speak, then the turn-taking microphone re-arms.
     const spokenText = isToolGarbage(last.text) ? sanitizeAssistantText(last.text) : last.text;
@@ -2178,6 +2291,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         streamed.pendingPrefix = "";
       }
       if (streamed) await streamed.chain;
+      if (!finalNarrationStillCurrent(narrationFence, {
+        generation: finalNarrationGenerationRef.current,
+        threadId: threadRef.current,
+        messageId: finalNarrationMessageRef.current,
+        parentMessageId: lastSubmittedParentId.current,
+      })) return;
       const from = streamed?.queuedChars ?? 0;
       const unsaidText = spokenText.slice(from).trim();
       if (!unsaidText) {
@@ -2243,7 +2362,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     });
   }
 
-  async function queueDurableTurn(text: string, visibleText = text) {
+  async function queueDurableTurn(text: string, visibleText = text, fileIds: string[] = []) {
     if (durableSubmissionInFlight.current || activeDurableTurn.current) return;
     durableSubmissionInFlight.current = true;
     durableStartedAt.current = performance.now();
@@ -2258,6 +2377,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           threadId: threadRef.current,
           text,
           requestId,
+          fileIds,
         }),
       } satisfies RequestInit;
       // A single same-ID retry resolves the ambiguous "Convex committed but
@@ -2276,7 +2396,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         threadId: threadRef.current,
         text,
         visibleText,
+        fileIds: [...fileIds],
       };
+      if (fileIds.length) {
+        setSelectedFileIds((current) => current.filter((fileId) => !fileIds.includes(fileId)));
+        setFileNotice(null);
+      }
       durableSubmissionInFlight.current = false;
       lastSubmittedParentId.current = result.messageId;
       durableAutoRecoveries.current = 0;
@@ -2303,8 +2428,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
     durableRecoveryTimer.current = null;
     if (!activeDurableTurn.current || durableCancellationFence.current) return;
-    if (durableAutoRecoveries.current >= 3) {
-      void prepareDurableRetry();
+    if (foregroundRecoveryWatchdogDisposition(durableAutoRecoveries.current) === "pause") {
+      setDurableRecovery("terminal");
+      setSending(true);
       return;
     }
     durableRecoveryTimer.current = setTimeout(() => {
@@ -2334,14 +2460,31 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         return;
       }
       if (!response.ok) throw new Error(`conversation recovery rejected (${response.status})`);
-      const result = await response.json() as { recovery?: string };
+      const result = await response.json() as { recovery?: string; assistant?: Msg };
       if (result.recovery === "completed") {
+        const assistant = result.assistant;
+        if (
+          !assistant
+          || assistant.role !== "assistant"
+          || assistant.status !== "done"
+          || assistant.parentMessageId !== active.messageId
+          || !assistant.text.trim()
+        ) throw new Error("completed turn did not include its reply");
+        durableAutoRecoveries.current = foregroundRecoveryBudgetAfterSignal(
+          durableAutoRecoveries.current,
+          "completed",
+        );
+        setRecoveredAssistant({ ...assistant, threadId: active.threadId });
         activeDurableTurn.current = null;
         if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
         durableRecoveryTimer.current = null;
         setDurableRecovery("idle");
         setSending(false);
       } else if (result.recovery === "active") {
+        durableAutoRecoveries.current = foregroundRecoveryBudgetAfterSignal(
+          durableAutoRecoveries.current,
+          "active",
+        );
         setDurableRecovery("delayed");
         armDurableRecoveryWatchdog();
       } else {
@@ -2432,7 +2575,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
     durableRecoveryTimer.current = null;
     setDurableRecovery("idle");
-    void queueDurableTurn(active.text, active.visibleText);
+    void queueDurableTurn(active.text, active.visibleText, active.fileIds);
   }
 
   async function openFastAgentDispatch(intent: FastAgentDispatch, requestedText: string) {
@@ -2587,7 +2730,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
 
   async function submit(text: string) {
     const t = text.trim();
-    if (!t) return;
+    const fileIds = guest ? [] : [...selectedFileIds];
+    if (!guest && pendingFileIds.length) {
+      showCaption({
+        who: "jarvis",
+        text: `I’m still indexing ${pendingFileIds.length} file${pendingFileIds.length === 1 ? "" : "s"}. I’ll keep them with this message and enable send when they’re ready.`,
+        phase: "ready",
+      });
+      return;
+    }
+    if (!t && !fileIds.length) return;
+    const visibleText = t || "Analyze the attached files.";
     if (durableSubmissionInFlight.current || activeDurableTurn.current) {
       showCaption({ who: "jarvis", text: "I’m finishing the current reply first. You can recover or retry it from the status bar." });
       return;
@@ -2596,8 +2749,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // already been primed by the control that opened the microphone.
     unlockSpeechPlayback();
     // double-tap / Enter+click within 2.5s = one send, not two
-    if (t === lastSent.current.text && Date.now() - lastSent.current.ts < 2500) return;
-    lastSent.current = { text: t, ts: Date.now() };
+    const sendFingerprint = `${visibleText}\u0000${fileIds.join(",")}`;
+    if (sendFingerprint === lastSent.current.text && Date.now() - lastSent.current.ts < 2500) return;
+    lastSent.current = { text: sendFingerprint, ts: Date.now() };
+    finalNarrationGenerationRef.current += 1;
+    finalNarrationMessageRef.current = "";
     if (streamingSpeechRef.current.timer) clearTimeout(streamingSpeechRef.current.timer);
     streamingSpeechRef.current = {
       id: "",
@@ -2607,7 +2763,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       pendingPrefix: "",
       pendingCaption: "",
     };
-    updateConversationMood(t);
+    updateConversationMood(visibleText);
     void ownVoice();
     // A new request is an immediate barge-in. Cancel queued/playback state
     // before doing anything else; worker inference may finish in the
@@ -2618,7 +2774,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     });
     setSpeaking(false);
     setInput("");
-    const embeddedHostIntent = embedded ? parseEmbeddedHostIntent(t) : null;
+    const embeddedHostIntent = embedded && !fileIds.length ? parseEmbeddedHostIntent(t) : null;
     if (embeddedHostIntent) {
       showCaption({ who: "you", text: t });
       const result = await sendHostAction(embeddedHostIntent.action);
@@ -2645,7 +2801,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // follow-up keeps the current visual; a topic switch clears it immediately
     // instead of leaving a stale chart/widget behind while the next turn runs.
     if (panel?.type === "video") setVideoPip(true);
-    else if (!guest && panel && !isPanelFollowUp(t, panel)) {
+    else if (!guest && panel && !isPanelFollowUp(visibleText, panel)) {
       closedPanelRef.current = {
         key: `${panel.title ?? ""}|${panel.value.slice(0, 160)}`,
         ts: Date.now(),
@@ -2655,22 +2811,22 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       setPanelMin(true); // hide locally during the authenticated clear round-trip
       void clearPanel({});
     }
-    const fastDispatch = guest ? null : parseFastAgentDispatch(t);
+    const fastDispatch = guest || fileIds.length ? null : parseFastAgentDispatch(t);
     if (fastDispatch) {
       void openFastAgentDispatch(fastDispatch, t);
       return;
     }
-    const fastChart = !guest && !liveRef.current ? parseFastChartIntent(t) : null;
+    const fastChart = !guest && !fileIds.length && !liveRef.current ? parseFastChartIntent(t) : null;
     if (fastChart) {
       void openFastChart(fastChart, t);
       return;
     }
-    const fastNetWorth = guest ? null : parseFastNetWorthIntent(t);
+    const fastNetWorth = guest || fileIds.length ? null : parseFastNetWorthIntent(t);
     if (fastNetWorth) {
       void openFastNetWorth(fastNetWorth, t);
       return;
     }
-    const instant = instantSocialReply(t);
+    const instant = fileIds.length ? null : instantSocialReply(t);
     if (instant) {
       document.documentElement.dataset.jarvisFirstTokenMs = "0";
       lastSpokenText.current = { text: instant, ts: Date.now() };
@@ -2690,20 +2846,22 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       })();
       return;
     }
-    let modelText = t;
+    let modelText = visibleText;
     if (embedded) {
       const context = await requestHostContext();
       if (context) {
-        const bounded = needsHostContext(t)
+        const bounded = needsHostContext(visibleText)
           ? context
           : { ...context, selection: undefined, text: undefined };
-        modelText = withHostContext(t, bounded);
+        modelText = withHostContext(visibleText, bounded);
       }
     }
-    await queueDurableTurn(modelText, t);
+    await queueDurableTurn(modelText, visibleText, fileIds);
   }
 
   function stopTalking() {
+    finalNarrationGenerationRef.current += 1;
+    finalNarrationMessageRef.current = "";
     import("../lib/tts").then((m) => m.stopSpeaking());
     setSpeaking(false);
     ttsQuietUntilRef.current = Date.now() + 120;
@@ -2786,7 +2944,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (liveBeat.current) clearInterval(liveBeat.current);
     liveBeat.current = null;
     captionRef.current = null;
-    void setLiveOn({ client: me.current, on: false }).catch(() => {});
+    if (!guest) void setLiveOn({ client: me.current, on: false }).catch(() => {});
   }
 
   function endFreeVoiceSession() {
@@ -2828,7 +2986,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     liveRef.current = true;
     setLive("connecting");
     const microphone = ensurePersistentLiveMic().then(() => true, () => false);
-    const ownership = setLiveOn({ client: me.current, on: true });
+    const ownership = guest
+      ? Promise.resolve(true)
+      : setLiveOn({ client: me.current, on: true });
     let owned = false;
     try {
       owned = await withClientDeadline(ownership, 5_000, "live ownership");
@@ -2836,12 +2996,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       // A late successful claim must not leave a ghost live owner after this
       // UI has already recovered to standby.
       void ownership.then((claimed) => {
-        if (claimed && !liveRef.current) void setLiveOn({ client: me.current, on: false }).catch(() => {});
+        if (!guest && claimed && !liveRef.current) void setLiveOn({ client: me.current, on: false }).catch(() => {});
       }, () => undefined);
     }
     if (sessionEpoch !== liveSessionEpoch.current || !liveRef.current) {
       void microphone.then((opened) => { if (opened && !liveRef.current) closePersistentLiveMic(); });
-      if (owned && !liveRef.current) void setLiveOn({ client: me.current, on: false }).catch(() => {});
+      if (!guest && owned && !liveRef.current) void setLiveOn({ client: me.current, on: false }).catch(() => {});
       return false;
     }
     if (owned === false) {
@@ -2879,7 +3039,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     setLive("live");
     void refreshPermissions();
     if (liveBeat.current) clearInterval(liveBeat.current);
-    liveBeat.current = setInterval(() => void setLiveOn({ client: me.current, on: true }).catch(() => {}), 20_000);
+    if (shouldMaintainLiveHeartbeat({ guest, visible: !document.hidden, live: liveRef.current })) {
+      liveBeat.current = setInterval(() => {
+        if (!shouldMaintainLiveHeartbeat({ guest, visible: !document.hidden, live: liveRef.current })) return;
+        void setLiveOn({ client: me.current, on: true }).catch(() => {});
+      }, 20_000);
+    }
     if (captureImmediately) void freeVoiceTurn();
     return true;
   }
@@ -2889,6 +3054,21 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     liveRef.current = false;
     cancelFreeRearm();
     closePersistentLiveMic();
+  }, []);
+
+  useEffect(() => {
+    const releaseHiddenLiveSession = () => {
+      if (!document.hidden) {
+        rearmWake();
+        return;
+      }
+      if (!liveRef.current) return;
+      endFreeVoiceSession();
+    };
+    document.addEventListener("visibilitychange", releaseHiddenLiveSession);
+    return () => document.removeEventListener("visibilitychange", releaseHiddenLiveSession);
+    // Voice/session state is ref-backed so this listener remains stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function enableDevicePermissions() {
@@ -3283,32 +3463,74 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
     const rec = new MediaRecorder(stream, { mimeType: mime });
     const chunks: Blob[] = [];
+    const startedAt = performance.now();
+    let context: AudioContext | null = null;
+    let vadTimer: number | null = null;
+    try {
+      const captureContext = new AudioContext({ latencyHint: "interactive" });
+      context = captureContext;
+      if (captureContext.state === "suspended") void captureContext.resume().catch(() => {});
+      const analyser = captureContext.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.35;
+      captureContext.createMediaStreamSource(stream).connect(analyser);
+      const spectrum = new Uint8Array(analyser.frequencyBinCount);
+      let vad = createLiveVadState(startedAt);
+      vadTimer = window.setInterval(() => {
+        if (rec.state !== "recording") return;
+        analyser.getByteFrequencyData(spectrum);
+        const now = performance.now();
+        vad = advanceLiveVad(vad, {
+          level: spectrumBandLevel(spectrum, captureContext.sampleRate, 85, 1_500),
+          voiceLevel: spectrumBandLevel(spectrum, captureContext.sampleRate, 85, 1_500),
+          highFrequencyLevel: spectrumBandLevel(spectrum, captureContext.sampleRate, 3_200, 7_500),
+          now,
+          startedAt,
+          quietUntil: 0,
+          ttsActive: false,
+        }).state;
+        if (shouldCloseLiveUtterance(vad, now)) rec.stop();
+      }, 72);
+    } catch {
+      // Recording and the bounded hard stop still work when Web Audio is not
+      // available; only silence auto-close is omitted on that browser.
+    }
+    const hardStopTimer = window.setTimeout(() => rec.state === "recording" && rec.stop(), 20_000);
     rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
     rec.onstop = async () => {
+      if (vadTimer !== null) window.clearInterval(vadTimer);
+      window.clearTimeout(hardStopTimer);
       stream.getTracks().forEach((t) => t.stop());
+      void context?.close().catch(() => {});
       setRecording(false);
       const blob = new Blob(chunks, { type: mime });
-      if (blob.size < 2000) return;
+      if (blob.size < 2000) {
+        showCaption({ who: "jarvis", text: "I did not catch enough speech. Tap the microphone and try again.", phase: "ready" });
+        return;
+      }
       try {
-        const r = await viewerFetch("/api/stt", { method: "POST", headers: { "content-type": mime }, body: blob });
-        const { text } = await r.json();
-        if (isMeaningfulSpeechTranscript(text?.trim() ?? "")) {
+        showCaption({ who: "you", text: "Processing…" });
+        const text = await transcribeRecordedAudio(blob, mime);
+        if (isMeaningfulSpeechTranscript(text)) {
           const { isEchoOfTts } = await import("../lib/tts");
           if (isEchoOfTts(text)) return; // that was JARVIS's own voice leaking in
-          const cleaned = text.trim();
+          const cleaned = text;
           const previousVoice = lastVoiceInput.current;
           if (isRecentVoiceDuplicate(cleaned, previousVoice)) return;
           lastVoiceInput.current = { text: cleaned, at: Date.now() };
+          showCaption({ who: "you", text: cleaned });
           void submit(cleaned);
+        } else {
+          showCaption({ who: "jarvis", text: "I could not make out that request. Tap the microphone and try again.", phase: "ready" });
         }
-      } catch {
-        /* ignore */
+      } catch (error) {
+        document.documentElement.dataset.jarvisSttFailure = String(error).slice(0, 160);
+        showCaption({ who: "jarvis", text: "Speech recognition failed. Tap the microphone to retry.", phase: "ready" });
       }
     };
     recRef.current = rec;
     setRecording(true);
     rec.start();
-    setTimeout(() => rec.state === "recording" && rec.stop(), 20_000);
   }
 
   const status =
@@ -3323,6 +3545,29 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             : recording
               ? "listening"
               : "online";
+  const hostAssistant = [...messages]
+    .reverse()
+    .find((message) => message.role === "assistant" && message.delivery !== "notification");
+  const hostPhase = status === "thinking" && hostAssistant?.status === "streaming" && hostAssistant.text
+    ? "responding"
+    : status;
+  const hostProgress = hostPhase === "online"
+    ? 0
+    : hostPhase === "connecting"
+      ? 0.08
+      : hostPhase === "listening"
+        ? 0.16
+        : hostPhase === "thinking"
+          ? 0.32
+          : hostPhase === "responding"
+            ? Math.min(0.84, 0.48 + Math.floor((hostAssistant?.text.length ?? 0) / 160) * 0.04)
+            : 0.92;
+  useEffect(() => {
+    if (!embedded || !parentOrigin || window.parent === window) return;
+    postToParent({ jarvis: "status", phase: hostPhase, progress: hostProgress });
+    // Stream length is intentionally reduced to a bounded progress bucket;
+    // no private transcript text crosses into the surrounding app.
+  }, [embedded, parentOrigin, hostPhase, hostProgress]);
   const orbState =
     speaking || (live === "live" && caption?.who === "jarvis")
       ? "speaking"
@@ -3370,6 +3615,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         data-voice-state={orbState}
         className="relative flex h-dvh w-full flex-col overflow-hidden bg-[#05070d]"
       >
+        {!guest && (
+          <ChatFilePendingMonitor
+            threadId={thread}
+            pendingFileIds={pendingFileIds}
+            selectedFileIds={selectedFileIds}
+            onPendingChange={setPendingFileIds}
+            onSelectionChange={setSelectedFileIds}
+            onNotice={setFileNotice}
+          />
+        )}
         <button
           type="button"
           onClick={() => {
@@ -3459,6 +3714,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                       <span className="typing-dots inline-flex gap-1"><span /><span /><span /></span>
                     )}
                   </span>
+                  {message.role === "user" && <MessageFileBadges files={message.files} align="right" />}
                 </div>
               ))}
             <div ref={embeddedEndRef} aria-hidden="true" />
@@ -3494,7 +3750,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               </div>
             </div>
           )}
-          <div className="flex gap-2 border-t border-white/10 p-2">
+          <div className="border-t border-white/10 p-2">
+            {!guest && (
+              <ChatFilePicker
+                threadId={thread}
+                selectedFileIds={selectedFileIds}
+                pendingFileIds={pendingFileIds}
+                onSelectionChange={setSelectedFileIds}
+                onPendingChange={setPendingFileIds}
+                notice={fileNotice}
+                onNotice={setFileNotice}
+              />
+            )}
+            <div className={`${!guest ? "mt-2" : ""} flex gap-2`}>
             <button
               type="button"
               onClick={() => speaking ? stopTalking() : void toggleLive()}
@@ -3507,18 +3775,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={(event) => event.key === "Enter" && submit(input)}
-              placeholder="Message Jarvis…"
+              placeholder={pendingFileIds.length ? "Indexing files before send…" : "Message Jarvis…"}
               className="min-w-0 flex-1 rounded-xl bg-black/35 px-3 text-sm text-ice outline-none ring-1 ring-white/10 focus:ring-cyan/50"
             />
             <button
               type="button"
               onClick={() => void submit(input)}
-              disabled={sending || !input.trim()}
+              disabled={sending || Boolean(pendingFileIds.length) || (!input.trim() && !selectedFileIds.length)}
               className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-cyan/15 text-cyan ring-1 ring-cyan/40 disabled:opacity-40"
-              aria-label="Send message"
+              aria-label={pendingFileIds.length ? "Send waits for file indexing" : "Send message"}
             >
               ↑
             </button>
+            </div>
           </div>
         </div>
       </div>
@@ -3527,6 +3796,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
 
   return (
     <div className="flex h-dvh flex-col overflow-hidden">
+      {!guest && (
+        <ChatFilePendingMonitor
+          threadId={thread}
+          pendingFileIds={pendingFileIds}
+          selectedFileIds={selectedFileIds}
+          onPendingChange={setPendingFileIds}
+          onSelectionChange={setSelectedFileIds}
+          onNotice={setFileNotice}
+        />
+      )}
       {/* top HUD strip */}
       <header className="flex items-center justify-between gap-2 px-3 pb-2 pt-3 sm:px-5 sm:pt-4">
         <div className="flex min-w-0 items-baseline gap-2 sm:gap-3">
@@ -3808,6 +4087,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                       ))}
                   </span>
                 </GuestSafeAttachment>
+                {m.role === "user" && <MessageFileBadges files={m.files} align="right" />}
                 {m.role === "assistant" && m.model && (
                   <div className="mt-0.5 pl-1">
                     <ModelBadge model={m.model} />
@@ -3859,7 +4139,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           )}
 
           {/* composer */}
-          <div className="safe-composer flex min-w-0 max-w-full items-stretch gap-1.5 overflow-hidden border-t border-white/5 p-2 sm:gap-2 sm:p-3">
+          <div className="safe-composer relative min-w-0 max-w-full border-t border-white/5 p-2 sm:p-3">
+            {!guest && chatMode === "full" && (
+              <ChatFilePicker
+                threadId={thread}
+                selectedFileIds={selectedFileIds}
+                pendingFileIds={pendingFileIds}
+                onSelectionChange={setSelectedFileIds}
+                onPendingChange={setPendingFileIds}
+                notice={fileNotice}
+                onNotice={setFileNotice}
+              />
+            )}
+            <div className={`${!guest ? "mt-2" : ""} flex min-w-0 max-w-full items-stretch gap-1.5 overflow-hidden sm:gap-2`}>
             <button
               onClick={() => void toggleLive()}
               title="live conversation"
@@ -3917,16 +4209,18 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit(input)}
-              placeholder={busy ? "Ask another thing while I work…" : "Talk to me…"}
+              placeholder={pendingFileIds.length ? "Indexing files before send…" : busy ? "Ask another thing while I work…" : "Talk to me…"}
               className="w-0 min-w-0 flex-1 rounded-xl bg-black/30 px-3 py-2.5 text-sm text-ice outline-none ring-1 ring-white/10 transition focus:ring-cyan/50 sm:w-auto sm:px-4"
             />
             <button
               onClick={() => submit(input)}
-              disabled={sending || !input.trim()}
+              disabled={sending || Boolean(pendingFileIds.length) || (!input.trim() && !selectedFileIds.length)}
+              aria-label={pendingFileIds.length ? "Send waits for file indexing" : "Send message"}
               className="grid w-10 shrink-0 place-items-center rounded-xl bg-cyan/15 px-0 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40 sm:w-auto sm:px-4"
             >
               <span className="sm:hidden">↑</span><span className="max-sm:hidden">send</span>
             </button>
+            </div>
           </div>
         </div>
         </div>
@@ -4056,6 +4350,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             >
               ▲
             </button>
+            {!guest && (
+              <button
+                type="button"
+                onClick={() => setChatMode("full")}
+                title={pendingFileIds.length ? `indexing ${pendingFileIds.length} private files` : "add or review private files"}
+                aria-label={pendingFileIds.length ? `Review ${pendingFileIds.length} files still indexing` : "Add or review private files"}
+                className={`shrink-0 rounded-xl px-2 text-xs ${pendingFileIds.length ? "bg-amber/15 text-amber ring-1 ring-amber/30" : selectedFileIds.length ? "bg-cyan/15 text-cyan ring-1 ring-cyan/30" : "text-slate hover:text-cyan"}`}
+              >
+                ▤{selectedFileIds.length + pendingFileIds.length ? ` ${selectedFileIds.length + pendingFileIds.length}` : ""}
+              </button>
+            )}
             <button
               onClick={() => void toggleLive()}
               title="live conversation"
@@ -4083,12 +4388,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit(input)}
-              placeholder={busy ? "Ask another thing while I work…" : "Talk to me…"}
+              placeholder={pendingFileIds.length ? "Indexing files before send…" : busy ? "Ask another thing while I work…" : "Talk to me…"}
               className="w-0 min-w-0 flex-1 rounded-xl bg-black/30 px-3 py-2 text-sm text-ice outline-none ring-1 ring-white/10 transition focus:ring-cyan/50 sm:w-auto sm:px-4"
             />
             <button
               onClick={() => submit(input)}
-              disabled={sending || !input.trim()}
+              disabled={sending || Boolean(pendingFileIds.length) || (!input.trim() && !selectedFileIds.length)}
+              aria-label={pendingFileIds.length ? "Send waits for file indexing" : "Send message"}
               className="grid w-10 shrink-0 place-items-center rounded-xl bg-cyan/15 px-0 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40 sm:w-auto sm:px-3.5"
             >
               <span className="sm:hidden">↑</span><span className="max-sm:hidden">send</span>

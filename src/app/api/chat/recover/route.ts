@@ -26,7 +26,22 @@ export async function POST(req: NextRequest) {
     messageId,
     threadId,
     ...credentials,
-  }) as { status: string; messageId?: string; attemptCount?: number; dispatchEpoch?: number };
+  }) as {
+    status: string;
+    messageId?: string;
+    attemptCount?: number;
+    dispatchEpoch?: number;
+    assistant?: {
+      _id: string;
+      role: string;
+      text: string;
+      status: string;
+      model?: string;
+      delivery?: "foreground" | "notification";
+      parentMessageId?: string;
+      createdAt: number;
+    };
+  };
 
   if (recovery.status === "missing") return Response.json({ error: "turn not found" }, { status: 404 });
   if (recovery.status === "cancelled") {
@@ -69,6 +84,7 @@ export async function POST(req: NextRequest) {
     recovery: recovery.status,
     attemptCount: recovery.attemptCount,
     dispatchEpoch: recovery.dispatchEpoch,
+    assistant: recovery.status === "completed" ? recovery.assistant : undefined,
     immediate: Boolean(handle) || recovery.status === "active" || recovery.status === "completed",
   });
 }

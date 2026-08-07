@@ -15,10 +15,11 @@ export default defineConfig({
   build: {
     // Subscription CLIs read their bundled Linux binary from disk. Pin exact
     // versions so a new upstream release cannot silently change a live runner.
-    external: ["@openai/codex", "e2b", "sandbox0", "@vercel/sandbox", "web-push"],
+    external: ["@openai/codex", "@napi-rs/canvas", "e2b", "sandbox0", "@vercel/sandbox", "web-push"],
     extensions: [
       additionalPackages({ packages: [
         "@openai/codex@0.144.5",
+        "@napi-rs/canvas@0.1.80",
         "e2b@2.35.0",
         "sandbox0@0.9.3",
         "@vercel/sandbox@2.8.0",
@@ -34,6 +35,7 @@ export default defineConfig({
             // codex-session vault service and persisted encrypted in its
             // private R2 bucket. Never fan auth.json into Trigger containers.
             "CONVEX_URL", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN", "GITHUB_TOKEN", "VAULT_ACCESS_TOKEN",
+            "JARVIS_PRIVATE_R2_BUCKET",
             "JARVIS_CODEX_SESSION_SOURCE",
             "JARVIS_MISSION_PROTOCOL_ROLLOUT",
             "JARVIS_MISSION_SUPERVISOR_ROLLOUT",

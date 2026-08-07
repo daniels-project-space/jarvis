@@ -19,6 +19,7 @@ import { admissionMutationName, v2AdmissionEnabled } from "./mission-protocol-ro
 import {
   normalizeToolInvocationContext,
   type ToolExecutionHostContext,
+  type ToolInvocationContext,
 } from "./tool-invocation-context";
 import { startSupervisedOrchestrationIfSelected } from "./mission-supervisor-orchestration";
 import {
@@ -2275,7 +2276,7 @@ async function boardTool(args: any): Promise<string> {
 }
 
 // Live mind map: create/update re-render on Daniel's screen as you talk.
-async function mindMap(args: any): Promise<string> {
+async function mindMap(args: any, invocationContext?: ToolInvocationContext): Promise<string> {
   const action = ["create", "update", "show"].includes(String(args.action)) ? String(args.action) : "create";
   const cleanNodes = (Array.isArray(args.nodes) ? args.nodes : [])
     .filter((n: any) => n?.id && n?.label)
@@ -2339,6 +2340,7 @@ async function mindMap(args: any): Promise<string> {
       kind: "canvas",
       title,
       data: JSON.stringify(doc),
+      ...(invocationContext?.userMessageId ? { sourceMessageId: invocationContext.userMessageId } : {}),
       ...(await creationFiling(args, "mind maps")),
     });
     await convexMutation("ui:setPanel", { type: "canvas", value: JSON.stringify({ ...doc, creationId: String(id) }), title: `map · ${title}` });
@@ -2369,7 +2371,12 @@ async function mindMap(args: any): Promise<string> {
       .filter((e: any, i: number, a: any[]) => a.findIndex((x) => x.from === e.from && x.to === e.to) === i)
       .slice(0, 100);
     if (args.title) doc.title = String(args.title).slice(0, 80);
-    await convexMutation("creations:update", { id: existing._id, title: doc.title, data: JSON.stringify(doc) });
+    await convexMutation("creations:update", {
+      id: existing._id,
+      title: doc.title,
+      data: JSON.stringify(doc),
+      ...(invocationContext?.userMessageId ? { sourceMessageId: invocationContext.userMessageId } : {}),
+    });
   }
   await convexMutation("ui:setPanel", {
     type: "canvas",
@@ -2381,7 +2388,7 @@ async function mindMap(args: any): Promise<string> {
     : `Mind map "${doc.title}" is back on screen. Node ids: ${doc.nodes.map((n: any) => n.id).join(", ")}.`;
 }
 
-async function visualSceneTool(args: any): Promise<string> {
+async function visualSceneTool(args: any, invocationContext?: ToolInvocationContext): Promise<string> {
   const action = ["create", "update", "show", "focus"].includes(String(args.action)) ? String(args.action) : "create";
   let existing: any = null;
   let sceneId = args.scene_id ? String(args.scene_id) : "";
@@ -2417,7 +2424,13 @@ async function visualSceneTool(args: any): Promise<string> {
 
   if (action === "create") {
     const filing = await creationFiling(args, "visual workspaces");
-    sceneId = String(await convexMutation("creations:create", { kind: "scene", title: scene.title, data: JSON.stringify(scene), ...filing }));
+    sceneId = String(await convexMutation("creations:create", {
+      kind: "scene",
+      title: scene.title,
+      data: JSON.stringify(scene),
+      ...filing,
+      ...(invocationContext?.userMessageId ? { sourceMessageId: invocationContext.userMessageId } : {}),
+    }));
     await convexMutation("chatQueue:postCard", {
       threadId: filing.threadId,
       type: "scene",
@@ -2430,6 +2443,7 @@ async function visualSceneTool(args: any): Promise<string> {
       expectedUpdatedAt: existing.updatedAt,
       title: scene.title,
       data: JSON.stringify(scene),
+      ...(invocationContext?.userMessageId ? { sourceMessageId: invocationContext.userMessageId } : {}),
     });
     if (!write?.ok && write?.reason === "conflict" && write.data) {
       // Another agent landed first. Rebase the same stable-id patch once; do
@@ -2440,6 +2454,7 @@ async function visualSceneTool(args: any): Promise<string> {
         expectedUpdatedAt: write.updatedAt,
         title: scene.title,
         data: JSON.stringify(scene),
+        ...(invocationContext?.userMessageId ? { sourceMessageId: invocationContext.userMessageId } : {}),
       });
     }
     if (!write?.ok) return "TOOL DID NOTHING: the visual workspace changed concurrently; show it and retry the patch.";
@@ -2495,7 +2510,7 @@ async function projectGoalTool(args: any): Promise<string> {
   return `Project outcome ${id} ${existing ? "updated" : "created"}: ${project} · ${existing?.title ?? title} is ${status}${action === "achieve" ? " with evidence recorded" : ""}.`;
 }
 
-async function chartTool(args: any): Promise<string> {
+async function chartTool(args: any, invocationContext?: ToolInvocationContext): Promise<string> {
   const title = String(args.title ?? "Chart").slice(0, 80);
   const widget: Record<string, any> = {
     kind: "stats",
@@ -2513,7 +2528,13 @@ async function chartTool(args: any): Promise<string> {
   };
   if (!widget.kpis.length && !widget.series.length && !widget.bars.length) return "Give me some numbers to chart (kpis, series or bars).";
   await showWidget(widget, title);
-  await convexMutation("creations:create", { kind: "chart", title, data: JSON.stringify(widget), ...(await creationFiling(args, "charts")) }).catch(() => {});
+  await convexMutation("creations:create", {
+    kind: "chart",
+    title,
+    data: JSON.stringify(widget),
+    ...(await creationFiling(args, "charts")),
+    ...(invocationContext?.userMessageId ? { sourceMessageId: invocationContext.userMessageId } : {}),
+  });
   return `Chart "${title}" is on screen and saved in the creations library. Speak one takeaway.`;
 }
 
@@ -3469,7 +3490,7 @@ export async function executeTool(
       }, boundedHostContext);
     }
     case "visual_scene":
-      return await visualSceneTool(args);
+      return await visualSceneTool(args, invocationContext);
     case "show": {
       let { kind, value, title } = args as { kind?: string; value: string; title?: string };
       value = String(value ?? "").trim();
@@ -3605,9 +3626,9 @@ export async function executeTool(
     case "board":
       return await boardTool(args);
     case "mind_map":
-      return await mindMap(args);
+      return await mindMap(args, invocationContext);
     case "chart":
-      return await chartTool(args);
+      return await chartTool(args, invocationContext);
     case "price_chart":
       return await priceChartTool(args);
     case "market_analysis":

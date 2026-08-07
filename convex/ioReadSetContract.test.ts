@@ -125,7 +125,9 @@ describe("deterministic Convex IO/read-set contract", () => {
     expect(page.page).toHaveLength(HISTORY_PAGE_MAX);
     expect(reads).toEqual([
       { table: "chatMessages", index: "by_thread", order: "desc", limit: 20 },
+      { table: "messageFiles", index: "by_thread_created", limit: 161 },
       { table: "chatMessages", index: "by_thread", order: "desc", options: { cursor: null, numItems: 20, maximumRowsRead: 20, maximumBytesRead: 262144 } },
+      { table: "messageFiles", index: "by_thread_created", limit: 161 },
     ]);
   });
 });

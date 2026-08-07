@@ -167,6 +167,124 @@ export default defineSchema({
     inFlight: v.number(),
   }).index("by_guest", ["guestId"]),
 
+  // Private user-provided source files. Original and derived bytes live in the
+  // non-public `jarvis-private-files` R2 bucket; Convex owns only durable,
+  // reactive metadata and bounded extracted chunks. This is deliberately
+  // separate from `creations`, whose historical URLs may be public.
+  files: defineTable({
+    originalName: v.string(),
+    relativePath: v.string(),
+    mimeType: v.string(),
+    detectedMimeType: v.optional(v.string()),
+    sizeBytes: v.number(),
+    expectedSha256: v.string(),
+    sha256: v.optional(v.string()),
+    uploadEtag: v.optional(v.string()),
+    uploadClaimToken: v.optional(v.string()),
+    uploadClaimExpiresAt: v.optional(v.number()),
+    cancelRequestedAt: v.optional(v.number()),
+    r2Key: v.string(),
+    extractedTextR2Key: v.optional(v.string()),
+    previewR2Key: v.optional(v.string()),
+    status: v.string(), // reserved | uploading | uploaded | processing | ready | stored_only | quarantined | error | deleting | deleted
+    ingestVersion: v.number(),
+    ingestAttempt: v.number(),
+    ingestClaimToken: v.optional(v.string()),
+    lastProgressAt: v.optional(v.number()),
+    summary: v.optional(v.string()),
+    searchText: v.string(),
+    extractedChars: v.optional(v.number()),
+    chunkCount: v.optional(v.number()),
+    pageCount: v.optional(v.number()),
+    sheetNames: v.optional(v.array(v.string())),
+    errorCode: v.optional(v.string()),
+    libraryVisible: v.optional(v.boolean()),
+    deletePreviousStatus: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_status_updated", ["status", "updatedAt"])
+    .index("by_library_updated", ["libraryVisible", "updatedAt"])
+    .index("by_sha256", ["sha256"])
+    .index("by_updatedAt", ["updatedAt"])
+    .searchIndex("search_metadata", { searchField: "searchText", filterFields: ["status", "libraryVisible"] }),
+
+  // One browser reservation covers a bounded multi-file or folder upload.
+  // requestId and its returned fileIds make retries idempotent before any R2
+  // bytes are accepted.
+  uploadBatches: defineTable({
+    requestId: v.string(),
+    threadId: v.string(),
+    status: v.string(), // reserved | uploading | complete | expired | cancelled
+    fileIds: v.array(v.id("files")),
+    fileCount: v.number(),
+    totalBytes: v.number(),
+    expiresAt: v.number(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_request", ["requestId"])
+    .index("by_createdAt", ["createdAt"])
+    .index("by_expiry", ["status", "expiresAt"]),
+
+  // A file is reusable across chats without duplicating R2 bytes. Removing it
+  // from one chat deletes this link, not the globally durable source file.
+  threadFiles: defineTable({
+    threadId: v.string(),
+    fileId: v.id("files"),
+    pinned: v.boolean(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_thread_file", ["threadId", "fileId"])
+    .index("by_thread_updated", ["threadId", "updatedAt"])
+    .index("by_file", ["fileId", "threadId"]),
+
+  // Immutable turn provenance. Assistant media cards continue to use the
+  // legacy singular `chatMessages.attachment`; user files use this join.
+  messageFiles: defineTable({
+    messageId: v.id("chatMessages"),
+    threadId: v.string(),
+    fileId: v.id("files"),
+    position: v.number(),
+    createdAt: v.number(),
+  })
+    .index("by_message", ["messageId", "position"])
+    .index("by_message_file", ["messageId", "fileId"])
+    .index("by_thread_created", ["threadId", "createdAt"])
+    .index("by_file", ["fileId", "createdAt"]),
+
+  // Small search documents keep prompt retrieval bounded. Full deterministic
+  // extraction remains in private R2 and is never placed in a chat row.
+  fileChunks: defineTable({
+    fileId: v.id("files"),
+    fileKey: v.string(),
+    ordinal: v.number(),
+    text: v.string(),
+    page: v.optional(v.number()),
+    sheet: v.optional(v.string()),
+    cellRange: v.optional(v.string()),
+    chars: v.number(),
+    createdAt: v.number(),
+  })
+    .index("by_file_ordinal", ["fileId", "ordinal"])
+    .searchIndex("search_text", { searchField: "text", filterFields: ["fileKey"] }),
+
+  // Stable citations let maps/charts/boards show where a value came from and
+  // prevent permanent deletion while a saved creation still depends on it.
+  creationFileRefs: defineTable({
+    creationId: v.id("creations"),
+    fileId: v.id("files"),
+    chunkId: v.optional(v.id("fileChunks")),
+    blockId: v.optional(v.string()),
+    nodeId: v.optional(v.string()),
+    role: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_creation", ["creationId", "createdAt"])
+    .index("by_creation_file", ["creationId", "fileId"])
+    .index("by_file", ["fileId", "createdAt"]),
+
   // Snapshot of project / cloud-stack state so JARVIS can answer "state of my apps".
   projectState: defineTable({
     slug: v.string(),
@@ -1900,6 +2018,7 @@ export default defineSchema({
     project: v.optional(v.string()),
     inquiry: v.optional(v.string()),
     threadId: v.optional(v.string()), // conversation that produced the creation
+    sourceFiles: v.optional(v.array(v.object({ fileId: v.id("files"), name: v.string() }))),
     createdAt: v.number(),
     updatedAt: v.number(),
   })

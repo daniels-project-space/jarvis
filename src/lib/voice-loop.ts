@@ -18,3 +18,11 @@ export function nextVoiceLoopAction(args: {
   if (args.persistentLive) return "listen";
   return "stop";
 }
+
+export function shouldMaintainLiveHeartbeat(args: {
+  guest: boolean;
+  visible: boolean;
+  live: boolean;
+}): boolean {
+  return !args.guest && args.visible && args.live;
+}

@@ -19,6 +19,8 @@ import type * as controlAuth from "../controlAuth.js";
 import type * as controlPlane from "../controlPlane.js";
 import type * as creationFiling from "../creationFiling.js";
 import type * as creations from "../creations.js";
+import type * as fileHelpers from "../fileHelpers.js";
+import type * as files from "../files.js";
 import type * as findings from "../findings.js";
 import type * as goalHandoffs from "../goalHandoffs.js";
 import type * as goalIntegration from "../goalIntegration.js";
@@ -69,6 +71,8 @@ declare const fullApi: ApiFromModules<{
   controlPlane: typeof controlPlane;
   creationFiling: typeof creationFiling;
   creations: typeof creations;
+  fileHelpers: typeof fileHelpers;
+  files: typeof files;
   findings: typeof findings;
   goalHandoffs: typeof goalHandoffs;
   goalIntegration: typeof goalIntegration;

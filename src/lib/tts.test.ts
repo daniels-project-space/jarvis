@@ -192,7 +192,9 @@ describe("single Edge neural speech queue", () => {
     const reply = speak("Surface the single request failure.", () => {});
     await vi.waitFor(() => expect(synthesisCount).toBe(1));
     expect(FakeSource.instances).toHaveLength(0);
-    await reply;
+    await expect(reply).resolves.toBe(false);
+    expect(document.documentElement.dataset.jarvisTts).toBe("unavailable");
+    expect(document.documentElement.dataset.jarvisTtsFailure).toMatch(/transient service error/i);
   });
 
   it("cancels the one in-flight neural request without a fallback attempt", async () => {

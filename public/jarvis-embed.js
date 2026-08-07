@@ -19,7 +19,12 @@
 
   var visible = false;
   var ready = false;
+  var readyProbe = 0;
+  var requiredReadyProbe = 0;
+  var readyProbeTimer = null;
   var pendingCommands = [];
+  var COMMAND_TTL_MS = 30000;
+  var MAX_PENDING_COMMANDS = 4;
   var speechBlocked = false;
   var liveBlocked = false;
   var recognition = null;
@@ -72,7 +77,7 @@
   jarvisButton.type = "button";
   jarvisButton.setAttribute("aria-label", "Open Jarvis; wake word is always listening");
   jarvisButton.style.cssText =
-    "all:unset;box-sizing:border-box;display:flex;align-items:center;gap:8px;height:38px;padding:0 12px;border-radius:13px;" +
+    "all:unset;box-sizing:border-box;position:relative;overflow:hidden;display:flex;align-items:center;gap:8px;height:38px;padding:0 12px;border-radius:13px;" +
     "cursor:pointer;color:#dff9ff;background:rgba(64,208,255,.08);font:700 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;" +
     "letter-spacing:.14em;transition:background .18s ease,color .18s ease,box-shadow .18s ease;";
   var wakeDot = document.createElement("span");
@@ -82,9 +87,20 @@
     "box-shadow:0 0 0 4px rgba(103,232,249,.1),0 0 16px rgba(103,232,249,.7);";
   var jarvisLabel = document.createElement("span");
   jarvisLabel.textContent = "JARVIS";
-  jarvisLabel.style.cssText = "all:initial;color:inherit;font:inherit;letter-spacing:inherit";
+  jarvisLabel.style.cssText = "all:initial;color:inherit;font:inherit;letter-spacing:inherit;transition:opacity .16s ease";
+  var progressTrack = document.createElement("span");
+  progressTrack.setAttribute("aria-hidden", "true");
+  progressTrack.style.cssText =
+    "all:initial;position:absolute;left:11px;right:11px;bottom:3px;height:1px;border-radius:9px;overflow:hidden;" +
+    "background:rgba(148,222,255,.12);opacity:0;transition:opacity .22s ease;";
+  var progressFill = document.createElement("span");
+  progressFill.style.cssText =
+    "all:initial;display:block;width:100%;height:100%;border-radius:inherit;background:#67e8f9;transform:scaleX(0);" +
+    "transform-origin:left center;transition:transform .42s cubic-bezier(.22,1,.36,1),background .2s ease;";
+  progressTrack.appendChild(progressFill);
   jarvisButton.appendChild(wakeDot);
   jarvisButton.appendChild(jarvisLabel);
+  jarvisButton.appendChild(progressTrack);
   var selectorButton = document.createElement("button");
   selectorButton.type = "button";
   selectorButton.setAttribute("aria-label", "Select an element for Jarvis to inspect or change");
@@ -97,16 +113,39 @@
   controls.appendChild(jarvisButton);
   controls.appendChild(selectorButton);
 
+  var framePhase = "online";
+  var frameProgress = 0;
+
   function paintUniversalControls() {
     var awake = Boolean(recognition) && !speechBlocked && !liveBlocked;
+    var active = framePhase !== "online";
+    var phaseColors = {
+      connecting: "#fbbf24",
+      listening: "#34d399",
+      thinking: "#fbbf24",
+      responding: "#67e8f9",
+      speaking: "#a78bfa",
+    };
+    var activeColor = phaseColors[framePhase] || "#67e8f9";
     jarvisButton.setAttribute("aria-pressed", visible ? "true" : "false");
-    jarvisButton.title = awake
-      ? "Jarvis is always listening — say ‘Hey Jarvis’ or tap to open"
-      : "Open Jarvis and enable the wake word";
-    jarvisButton.style.background = visible ? "rgba(34,211,238,.18)" : "rgba(64,208,255,.08)";
-    jarvisButton.style.boxShadow = visible ? "inset 0 0 0 1px rgba(103,232,249,.35)" : "none";
-    wakeDot.style.background = awake ? "#67e8f9" : recognitionNeedsGesture ? "#fbbf24" : "#64748b";
-    wakeDot.style.boxShadow = awake
+    jarvisButton.setAttribute("aria-label", active ? "Jarvis is " + framePhase : "Open Jarvis; wake word is always listening");
+    jarvisButton.title = active
+      ? "Jarvis is " + framePhase
+      : awake
+        ? "Jarvis is always listening — say ‘Hey Jarvis’ or tap to open"
+        : "Open Jarvis and enable the wake word";
+    jarvisButton.style.background = active || visible ? "rgba(34,211,238,.18)" : "rgba(64,208,255,.08)";
+    jarvisButton.style.boxShadow = active || visible ? "inset 0 0 0 1px rgba(103,232,249,.35)" : "none";
+    jarvisLabel.textContent = active ? framePhase.toUpperCase() : "JARVIS";
+    progressTrack.style.opacity = active ? "1" : "0";
+    progressFill.style.background = activeColor;
+    progressFill.style.transform = "scaleX(" + (active ? frameProgress : 0) + ")";
+    wakeDot.style.background = active ? activeColor : awake ? "#67e8f9" : recognitionNeedsGesture ? "#fbbf24" : "#64748b";
+    wakeDot.style.transform = active ? "scale(1.22)" : "scale(1)";
+    wakeDot.style.transition = "background .2s ease,box-shadow .2s ease,transform .2s ease";
+    wakeDot.style.boxShadow = active
+      ? "0 0 0 4px rgba(103,232,249,.12),0 0 18px " + activeColor
+      : awake
       ? "0 0 0 4px rgba(103,232,249,.1),0 0 16px rgba(103,232,249,.7)"
       : "0 0 0 4px rgba(148,163,184,.08)";
   }
@@ -125,6 +164,22 @@
   function post(message) {
     if (f.contentWindow) f.contentWindow.postMessage(message, ORIGIN);
   }
+
+  function probeFreshReady(probe, attempt) {
+    if (ready || requiredReadyProbe !== probe) return;
+    post({ jarvis: "host-ready-probe", probe: probe });
+    readyProbeTimer = setTimeout(function () {
+      probeFreshReady(probe, attempt + 1);
+    }, Math.min(2000, 100 * Math.pow(2, Math.min(attempt, 4))));
+  }
+
+  f.onload = function () {
+    ready = false;
+    requiredReadyProbe = ++readyProbe;
+    if (readyProbeTimer) clearTimeout(readyProbeTimer);
+    readyProbeTimer = null;
+    probeFreshReady(requiredReadyProbe, 0);
+  };
 
   function compact(value, max) {
     return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
@@ -311,16 +366,23 @@
   }
 
   function flushCommands() {
+    var now = Date.now();
+    pendingCommands = pendingCommands.filter(function (item) {
+      return now - item.at <= COMMAND_TTL_MS;
+    });
     if (!ready || !f.contentWindow) return;
     while (pendingCommands.length) {
-      post({ jarvis: "host-command", text: pendingCommands.shift() });
+      post({ jarvis: "host-command", text: pendingCommands.shift().text });
     }
   }
 
   function ask(text) {
     var command = String(text || "").trim().slice(0, 4000);
     if (!command) return;
-    pendingCommands.push(command);
+    pendingCommands.push({ text: command, at: Date.now() });
+    if (pendingCommands.length > MAX_PENDING_COMMANDS) {
+      pendingCommands.splice(0, pendingCommands.length - MAX_PENDING_COMMANDS);
+    }
     show();
     flushCommands();
   }
@@ -751,10 +813,36 @@
     if (event.origin !== ORIGIN || event.source !== f.contentWindow) return;
     var data = event.data || {};
     if (data.jarvis === "ready") {
+      if (requiredReadyProbe && data.probe !== requiredReadyProbe) return;
       ready = true;
+      framePhase = "online";
+      frameProgress = 0;
+      requiredReadyProbe = 0;
+      if (readyProbeTimer) clearTimeout(readyProbeTimer);
+      readyProbeTimer = null;
       flushCommands();
       wakeState(Boolean(recognition), recognitionNeedsGesture ? "permission" : null);
       postHostContext();
+      paintUniversalControls();
+    } else if (data.jarvis === "unloading") {
+      ready = false;
+      framePhase = "connecting";
+      frameProgress = 0.08;
+      requiredReadyProbe = ++readyProbe;
+      if (readyProbeTimer) clearTimeout(readyProbeTimer);
+      readyProbeTimer = null;
+      paintUniversalControls();
+    } else if (data.jarvis === "status") {
+      var allowedPhases = ["online", "connecting", "listening", "thinking", "responding", "speaking"];
+      var nextPhase = typeof data.phase === "string" && allowedPhases.indexOf(data.phase) !== -1
+        ? data.phase
+        : "online";
+      var nextProgress = Number(data.progress);
+      framePhase = nextPhase;
+      frameProgress = nextPhase === "online"
+        ? 0
+        : Math.max(0.04, Math.min(0.96, Number.isFinite(nextProgress) ? nextProgress : 0.12));
+      paintUniversalControls();
     } else if (data.jarvis === "wake" || data.jarvis === "notify") {
       show();
     } else if (data.jarvis === "hide") {

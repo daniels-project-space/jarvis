@@ -1,4 +1,4 @@
-export const FOREGROUND_AUTO_RECOVERY_MS = 50_000;
+export const FOREGROUND_AUTO_RECOVERY_MS = 15_000;
 
 export type ForegroundMessageState = {
   role: string;
@@ -20,6 +20,38 @@ export type ForegroundCancellationResponse = {
   messageId?: unknown;
   fenceReceipt?: unknown;
 };
+
+export type ForegroundRecoverySignal =
+  | "active"
+  | "streaming"
+  | "completed"
+  | "pending"
+  | "requeued"
+  | "failed";
+
+export function foregroundRecoveryBudgetAfterSignal(
+  attempts: number,
+  signal: ForegroundRecoverySignal,
+): number {
+  return signal === "active" || signal === "streaming" || signal === "completed"
+    ? 0
+    : Math.max(0, attempts);
+}
+
+export function foregroundRecoveryWatchdogDisposition(
+  attempts: number,
+  maxAttempts = 3,
+): "arm" | "pause" {
+  return attempts >= maxAttempts ? "pause" : "arm";
+}
+
+export function mergeRecoveredAssistant<T extends { _id: string; createdAt: number }>(
+  messages: T[],
+  recovered: T | null,
+): T[] {
+  if (!recovered || messages.some((message) => message._id === recovered._id)) return messages;
+  return [...messages, recovered].sort((left, right) => left.createdAt - right.createdAt);
+}
 
 export function authoritativeCancellationReceipt(
   response: ForegroundCancellationResponse,

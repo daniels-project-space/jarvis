@@ -4,6 +4,7 @@ import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
 import { viewerFetch } from "@/lib/viewer-request";
+import { CreationSourceFiles, type CreationSourceFile } from "./CreationSourceFiles";
 
 // The richer panel views: frosted-glass calendar, live mind-map canvas,
 // app launcher, PDF viewer, creations library.
@@ -1503,13 +1504,19 @@ function layout(nodes: CNode[], _edges: CEdge[]) {
   return { pos, W, width: maxX + 24, height: maxY + 24, children };
 }
 
+type CanvasDocument = { title: string; nodes: CNode[]; edges?: CEdge[]; creationId?: string };
+
 export function CanvasView({ value }: { value: string }) {
-  let doc: { title: string; nodes: CNode[]; edges?: CEdge[] } | null = null;
-  try {
-    doc = JSON.parse(value);
-  } catch {
-    /* noop */
-  }
+  const reference = useMemo(() => {
+    try { return JSON.parse(value) as CanvasDocument; } catch { return null; }
+  }, [value]);
+  const creation = useJarvisQuery(
+    api.creations.get,
+    reference?.creationId ? ({ id: reference.creationId } as never) : "skip",
+  ) as { data?: string; sourceFiles?: CreationSourceFile[] } | null | undefined;
+  const doc = useMemo(() => {
+    try { return JSON.parse(creation?.data ?? value) as CanvasDocument; } catch { return null; }
+  }, [creation?.data, value]);
   const nodes = useMemo(() => doc?.nodes ?? [], [doc?.nodes]);
   const edges = useMemo(() => doc?.edges ?? [], [doc?.edges]);
   const { pos, W, width, height } = useMemo(() => layout(nodes, edges), [nodes, edges]);
@@ -1529,8 +1536,10 @@ export function CanvasView({ value }: { value: string }) {
   };
 
   return (
-    <div className="scrollbar-thin min-h-0 flex-1 overflow-auto">
-      <svg width={Math.max(width, 400)} height={Math.max(height, 240)} className="block">
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <CreationSourceFiles files={creation?.sourceFiles} className="shrink-0 border-b border-white/5 px-3 py-2 sm:px-4" />
+      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto">
+        <svg width={Math.max(width, 400)} height={Math.max(height, 240)} className="block">
         {/* tree connectors */}
         {treeLinks.map((l, i) => {
           const a = pos.get(l.from),
@@ -1600,7 +1609,8 @@ export function CanvasView({ value }: { value: string }) {
             </foreignObject>
           );
         })}
-      </svg>
+        </svg>
+      </div>
     </div>
   );
 }
@@ -1750,6 +1760,7 @@ type CreationRow = {
   folder: string;
   project?: string;
   inquiry?: string;
+  sourceFiles?: CreationSourceFile[];
   updatedAt: number;
 };
 
@@ -1799,7 +1810,16 @@ export function CreationsView({ value }: { value: string }) {
   const open = (r: CreationRow) => {
     if (r.kind === "image" && r.url) void setPanel({ type: "image", value: r.url, title: r.title });
     else if (r.kind === "pdf" && r.url) void setPanel({ type: "pdf", value: r.url, title: r.title });
-    else if (r.kind === "canvas" && r.data) void setPanel({ type: "canvas", value: r.data, title: `map · ${r.title}` });
+    else if (r.kind === "canvas" && r.data) {
+      let value = r.data;
+      try {
+        const parsed = JSON.parse(r.data);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) value = JSON.stringify({ ...parsed, creationId: r._id });
+      } catch {
+        /* CanvasView will show its safe unavailable state. */
+      }
+      void setPanel({ type: "canvas", value, title: `map · ${r.title}` });
+    }
     else if (r.kind === "board") void setPanel({ type: "board", value: JSON.stringify({ creationId: r._id }), title: `board · ${r.title}` });
     else if (r.kind === "trip") void setPanel({ type: "trip", value: JSON.stringify({ creationId: r._id }), title: `trip · ${r.title}` });
     else if (r.kind === "scene") void setPanel({ type: "scene", value: JSON.stringify({ creationId: r._id }), title: `visual · ${r.title}` });
@@ -1875,6 +1895,7 @@ export function CreationsView({ value }: { value: string }) {
                           <div className="mt-1 truncate text-[9px] uppercase tracking-[0.12em] text-slate">{r.category} · {new Date(r.updatedAt).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}</div>
                         </div>
                       </button>
+                      <CreationSourceFiles files={r.sourceFiles} maxVisible={2} className="px-2.5 pb-2" />
                       <div className="flex items-center justify-between gap-1 border-t border-white/5 px-2.5 py-1.5">
                         <button onClick={() => open(r)} className="text-[9px] uppercase tracking-wider text-cyan-dim hover:text-cyan">open / edit</button>
                         <button
