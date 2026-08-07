@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   assertProductionRuntimeConfig,
@@ -12,6 +13,7 @@ const completeProductionEnvironment = {
   JARVIS_VIEWER_SIGNING_JWK_B64: "jwk",
   TRIGGER_SECRET_KEY: "trigger",
   VAULT_ACCESS_TOKEN: "vault",
+  JARVIS_VAULT_CAPABILITY_SHA256: createHash("sha256").update("vault").digest("hex"),
   JARVIS_PRIVATE_R2_BUCKET: "jarvis-private-files",
 };
 
@@ -40,5 +42,12 @@ describe("production runtime configuration", () => {
   it("does not require production-only secrets in local or preview builds", () => {
     expect(missingProductionRuntimeConfig({ VERCEL_ENV: "preview" })).toEqual([]);
     expect(missingProductionRuntimeConfig({ NODE_ENV: "production" })).toEqual([]);
+  });
+
+  it("rejects a production vault capability that does not match its fingerprint", () => {
+    expect(() => assertProductionRuntimeConfig({
+      ...completeProductionEnvironment,
+      VAULT_ACCESS_TOKEN: "different-vault-capability",
+    })).toThrow("does not match its configured capability fingerprint");
   });
 });

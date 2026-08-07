@@ -6,6 +6,7 @@ const mock = vi.hoisted(() => ({
   controlMutation: vi.fn(),
   assertPrivateBucketName: vi.fn(),
   assertPrivateR2Configured: vi.fn(),
+  privateR2ConfigurationCode: vi.fn(),
   privateR2Delete: vi.fn(),
 }));
 
@@ -21,6 +22,7 @@ vi.mock("@/lib/control-session", () => ({
 vi.mock("@/lib/private-r2", () => ({
   assertPrivateBucketName: mock.assertPrivateBucketName,
   assertPrivateR2Configured: mock.assertPrivateR2Configured,
+  privateR2ConfigurationCode: mock.privateR2ConfigurationCode,
   privateR2Delete: mock.privateR2Delete,
 }));
 
@@ -32,6 +34,7 @@ describe("private upload reservations", () => {
     mock.controlActor.mockResolvedValue({ kind: "owner" });
     mock.assertPrivateBucketName.mockReturnValue("jarvis-private-files");
     mock.assertPrivateR2Configured.mockResolvedValue(undefined);
+    mock.privateR2ConfigurationCode.mockReturnValue("vault_unavailable");
     mock.controlMutation.mockImplementation(async (path: string) => path === "files:cleanupExpiredReservations" ? [] : ({
       batchId: "batch-1",
       expiresAt: Date.now() + 60_000,
@@ -72,7 +75,12 @@ describe("private upload reservations", () => {
       headers: { "content-type": "application/json", origin: "https://jarvis.example" },
       body: JSON.stringify({ requestId: "upload:request-2", files: [] }),
     });
-    expect((await POST(request)).status).toBe(503);
+    const response = await POST(request);
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: "private file storage is unavailable",
+      code: "vault_unavailable",
+    });
     expect(mock.controlMutation).not.toHaveBeenCalled();
   });
 });
