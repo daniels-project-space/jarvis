@@ -120,9 +120,12 @@ function csvChunks(text: string, sheet: string): ExtractedChunk[] {
 }
 
 async function extractPdf(bytes: Uint8Array, sha256: string): Promise<FileExtractionResult> {
-  // pdf-parse initializes PDF.js canvas shims when its module loads. Keep that
-  // native path out of Trigger's task indexer and out of non-PDF ingest jobs.
+  // Serverless task bundles do not preserve pdf.js' default filesystem worker
+  // path. Load the package's self-contained worker only on the PDF path so the
+  // extractor stays portable without adding work to non-PDF ingestion.
+  const { getData } = await import("pdf-parse/worker");
   const { PDFParse } = await import("pdf-parse");
+  PDFParse.setWorker(getData());
   const parser = new PDFParse({ data: bytes });
   try {
     const result = await parser.getText({ first: MAX_PDF_PAGES });
