@@ -1,7 +1,7 @@
 import type { NextRequest } from "next/server";
 import { controlMutation, isSameOriginRequest } from "@/lib/control-session";
 import { CHAT_FILE_LIMITS, type UploadFileDescriptor } from "@/lib/chat-files";
-import { assertPrivateR2Configured } from "@/lib/private-r2";
+import { assertPrivateR2Configured, privateR2ConfigurationCode } from "@/lib/private-r2";
 import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
 
 export const runtime = "nodejs";
@@ -73,8 +73,11 @@ export async function POST(req: NextRequest) {
   // private destination.
   try {
     await assertPrivateR2Configured();
-  } catch {
-    return Response.json({ error: "private file storage is unavailable" }, { status: 503 });
+  } catch (error) {
+    return Response.json({
+      error: "private file storage is unavailable",
+      code: privateR2ConfigurationCode(error),
+    }, { status: 503 });
   }
 
   const declaredLength = Number(req.headers.get("content-length") ?? 0);

@@ -5,6 +5,24 @@ import { CHAT_FILE_LIMITS, normalizeUploadMime, normalizeUploadSha256 } from "./
 
 const REQUIRED_PRIVATE_BUCKET = "jarvis-private-files";
 
+export type PrivateR2ConfigurationCode =
+  | "bucket_missing"
+  | "bucket_mismatch"
+  | "vault_unavailable"
+  | "credentials_unavailable"
+  | "unknown";
+
+class PrivateR2ConfigurationError extends Error {
+  constructor(readonly code: Exclude<PrivateR2ConfigurationCode, "unknown">, message: string) {
+    super(message);
+    this.name = "PrivateR2ConfigurationError";
+  }
+}
+
+export function privateR2ConfigurationCode(error: unknown): PrivateR2ConfigurationCode {
+  return error instanceof PrivateR2ConfigurationError ? error.code : "unknown";
+}
+
 type PrivateR2Client = {
   aws: AwsClient;
   endpoint: string;
@@ -22,9 +40,14 @@ let cached: PrivateR2Client | null = null;
 
 export function assertPrivateBucketName(value: string | undefined): string {
   const bucket = value?.trim();
-  if (!bucket) throw new Error("JARVIS_PRIVATE_R2_BUCKET is not configured");
+  if (!bucket) {
+    throw new PrivateR2ConfigurationError("bucket_missing", "JARVIS_PRIVATE_R2_BUCKET is not configured");
+  }
   if (bucket !== REQUIRED_PRIVATE_BUCKET) {
-    throw new Error(`JARVIS_PRIVATE_R2_BUCKET must be ${REQUIRED_PRIVATE_BUCKET}`);
+    throw new PrivateR2ConfigurationError(
+      "bucket_mismatch",
+      `JARVIS_PRIVATE_R2_BUCKET must be ${REQUIRED_PRIVATE_BUCKET}`,
+    );
   }
   return bucket;
 }
@@ -56,9 +79,17 @@ function encodedKey(value: string): string {
 async function client(): Promise<PrivateR2Client> {
   if (cached) return cached;
   const bucket = assertPrivateBucketName(process.env.JARVIS_PRIVATE_R2_BUCKET);
-  const secrets = await getServiceSecrets("cloudflare");
+  const secrets = await getServiceSecrets("cloudflare").catch(() => {
+    throw new PrivateR2ConfigurationError(
+      "vault_unavailable",
+      "private R2 vault capability is unavailable",
+    );
+  });
   if (!secrets.R2_ACCESS_KEY_ID || !secrets.R2_SECRET_ACCESS_KEY || !secrets.R2_ENDPOINT) {
-    throw new Error("private R2 credentials are unavailable");
+    throw new PrivateR2ConfigurationError(
+      "credentials_unavailable",
+      "private R2 credentials are unavailable",
+    );
   }
   cached = {
     aws: new AwsClient({
