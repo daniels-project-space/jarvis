@@ -23,11 +23,13 @@ import { isPanelFollowUp } from "@/lib/panel-relevance";
 import { nextVoiceLoopAction, shouldMaintainLiveHeartbeat, type VoiceCaptureOutcome } from "@/lib/voice-loop";
 import {
   LIVE_SPEAKER_TAIL_MS,
+  LIVE_BARGE_SAMPLE_MS,
   advanceLiveVad,
   createLiveVadState,
   shouldCloseLiveUtterance,
   shouldDeferLiveCapture,
   shouldPrefetchLiveTranscript,
+  shouldStartLiveResearchPreview,
   spectrumBandLevel,
   type LiveVadState,
 } from "@/lib/live-vad";
@@ -74,6 +76,7 @@ import { ChatFilePicker } from "./chat-files/ChatFilePicker";
 import { GuestChatFileAccess } from "./chat-files/GuestChatFileAccess";
 import { ChatFilePendingMonitor, type ChatFileNotice } from "./chat-files/ChatFilePendingMonitor";
 import type { ChatFileManifest } from "@/lib/chat-files";
+import { buildSpeculativeResearchQuery } from "@/lib/speculative-research";
 
 const EMBED_COMMAND_TTL_MS = 30_000;
 const MAX_PENDING_EMBED_COMMANDS = 4;
@@ -122,6 +125,21 @@ type StreamingSpeechState = {
   timer: ReturnType<typeof setTimeout> | null;
   pendingPrefix: string;
   pendingCaption: string;
+};
+type SubmitOptions = {
+  requestId?: string;
+  researchReceipt?: string;
+  interruptCurrent?: boolean;
+};
+type LiveResearchResponse = {
+  receipt: string;
+  query: string;
+  sources: Array<{ title: string; url: string }>;
+  expiresAt: number;
+};
+type LiveResearchState = {
+  phase: "idle" | "researching" | "ready";
+  sourceCount: number;
 };
 
 function MessageFileBadges({ files, align = "left" }: { files?: ChatFileManifest[]; align?: "left" | "right" }) {
@@ -1153,6 +1171,23 @@ function SpokenCaption({ caption }: { caption: NonNullable<Caption> }) {
   );
 }
 
+function LiveResearchIndicator({ state }: { state: LiveResearchState }) {
+  if (state.phase === "idle") return null;
+  const ready = state.phase === "ready";
+  return (
+    <div
+      data-jarvis-live-research={state.phase}
+      className="glass flex items-center gap-2 rounded-full border border-cyan/20 px-3 py-1.5 font-mono text-[9px] uppercase tracking-[0.12em] text-cyan shadow-[0_0_28px_rgba(34,211,238,0.12)]"
+      aria-live="polite"
+    >
+      <span className={`h-1.5 w-1.5 rounded-full ${ready ? "bg-emerald-300" : "animate-pulse bg-cyan"}`} aria-hidden="true" />
+      {ready
+        ? `${state.sourceCount} source${state.sourceCount === 1 ? "" : "s"} ready`
+        : "checking sources while you finish"}
+    </div>
+  );
+}
+
 export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const orbMotionRef = useRef<OrbMotionFrame>(createOrbMotionFrame());
   const viewerToken = useViewerSession();
@@ -1378,21 +1413,36 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     setFileNotice(null);
   }, [thread]);
   const [speaking, setSpeaking] = useState(false);
+  const [ttsRuntimeStatus, setTtsRuntimeStatus] = useState<"ready" | "buffering" | "speaking" | "unavailable">("ready");
+  useEffect(() => {
+    const receive = (event: Event) => {
+      const status = (event as CustomEvent<{ status?: string }>).detail?.status;
+      if (status === "ready" || status === "buffering" || status === "speaking" || status === "unavailable") {
+        setTtsRuntimeStatus(status);
+      }
+    };
+    window.addEventListener("jarvis:tts-status", receive);
+    return () => window.removeEventListener("jarvis:tts-status", receive);
+  }, []);
   const speakingRef = useRef(false);
   const wasSpeakingRef = useRef(false);
+  const confirmedBargeAtRef = useRef(0);
   const ttsQuietUntilRef = useRef(0);
   const keyboardQuietUntilRef = useRef(0);
   const lastKeyboardActivityRef = useRef(0);
   useEffect(() => {
     speakingRef.current = speaking;
     if (wasSpeakingRef.current && !speaking) {
-      ttsQuietUntilRef.current = Math.max(ttsQuietUntilRef.current, Date.now() + LIVE_SPEAKER_TAIL_MS);
+      const now = Date.now();
+      const tailMs = now - confirmedBargeAtRef.current < 1_000 ? 120 : LIVE_SPEAKER_TAIL_MS;
+      ttsQuietUntilRef.current = Math.max(ttsQuietUntilRef.current, now + tailMs);
     }
     wasSpeakingRef.current = speaking;
   }, [speaking]);
   const [sending, setSending] = useState(false);
   const [recording, setRecording] = useState(false);
   const [live, setLive] = useState<"off" | "connecting" | "live">("off");
+  const [liveResearch, setLiveResearch] = useState<LiveResearchState>({ phase: "idle", sourceCount: 0 });
   useEffect(() => {
     if (!embedded || window.parent === window) return;
     postToParent({ jarvis: speaking ? "speech-start" : "speech-end" });
@@ -1507,11 +1557,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     pendingCaption: "",
   });
   const narrationLedgerRef = useRef(new NarrationLedger());
+  const mutedNarrationParentsRef = useRef(new Set<string>());
   const captionRef = useRef<Caption>(null);
   const energyRef = useRef(0);
   const recRef = useRef<MediaRecorder | null>(null);
-  const liveMicRef = useRef<{ stream: MediaStream; context: AudioContext; analyser: AnalyserNode } | null>(null);
+  const liveMicRef = useRef<{
+    stream: MediaStream;
+    context: AudioContext;
+    analyser: AnalyserNode;
+    aecEnabled: boolean;
+  } | null>(null);
   const liveSessionEpoch = useRef(0);
+  const liveInterruptionEpoch = useRef(0);
+  const voiceInterruptionPendingRef = useRef(false);
   const sttAbortRef = useRef<AbortController | null>(null);
   const lastVoiceInput = useRef<{ text: string; at: number } | null>(null);
   const liveRef = useRef(false);
@@ -2130,6 +2188,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       setSending(false);
     }
     showCaption({ who: "jarvis", text: latestAssistant.text, phase: "streaming" });
+    if (
+      latestAssistant.parentMessageId &&
+      mutedNarrationParentsRef.current.has(latestAssistant.parentMessageId)
+    ) return;
     const stablePrefix = completeSpeechPrefix(latestAssistant.text);
     if (!stablePrefix) return;
     let streamState = streamingSpeechRef.current;
@@ -2284,6 +2346,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // vanishes during the TTS handoff or when this tab is not the speaker.
     showCaption({ who: "jarvis", text: spokenText, phase: "ready" });
     document.documentElement.dataset.jarvisFinalDeliveryMs = String(Math.round(performance.now()));
+    if (last.parentMessageId && mutedNarrationParentsRef.current.has(last.parentMessageId)) {
+      mutedNarrationParentsRef.current.delete(last.parentMessageId);
+      setSpeaking(false);
+      return;
+    }
     (async () => {
       const streamed = streamingSpeechRef.current.id === last._id ? streamingSpeechRef.current : null;
       if (streamed?.timer) {
@@ -2363,14 +2430,21 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     });
   }
 
-  async function queueDurableTurn(text: string, visibleText = text, fileIds: string[] = []) {
+  async function queueDurableTurn(
+    text: string,
+    visibleText = text,
+    fileIds: string[] = [],
+    options: Pick<SubmitOptions, "requestId" | "researchReceipt"> = {},
+  ) {
     if (durableSubmissionInFlight.current || activeDurableTurn.current) return;
     durableSubmissionInFlight.current = true;
     durableStartedAt.current = performance.now();
     setSending(true);
     showCaption({ who: "you", text: visibleText });
     try {
-      const requestId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const requestId = options.requestId
+        ?? globalThis.crypto?.randomUUID?.()
+        ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const request = {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -2379,6 +2453,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           text,
           requestId,
           fileIds,
+          researchReceipt: options.researchReceipt,
         }),
       } satisfies RequestInit;
       // A single same-ID retry resolves the ambiguous "Convex committed but
@@ -2390,8 +2465,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         response = await viewerFetchWithTimeout("/api/chat", request, 15_000);
       }
       if (!response.ok) throw new Error(`conversation queue rejected (${response.status})`);
-      const result = await response.json() as { messageId?: string };
+      const result = await response.json() as { messageId?: string; researchPrefetchAccepted?: boolean };
       if (!result.messageId) throw new Error("conversation queue returned no turn identity");
+      if (options.researchReceipt) {
+        document.documentElement.dataset.jarvisResearchPrefetch = result.researchPrefetchAccepted
+          ? "promoted"
+          : "discarded";
+      }
       activeDurableTurn.current = {
         messageId: result.messageId as Id<"chatMessages">,
         threadId: threadRef.current,
@@ -2399,6 +2479,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         visibleText,
         fileIds: [...fileIds],
       };
+      mutedNarrationParentsRef.current.delete(String(result.messageId));
       if (fileIds.length) {
         setSelectedFileIds((current) => current.filter((fileId) => !fileIds.includes(fileId)));
         setFileNotice(null);
@@ -2503,11 +2584,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
   }
 
-  async function cancelDurableTurn(forRetry: boolean) {
+  async function cancelDurableTurn(forRetry: boolean): Promise<boolean> {
     const active = activeDurableTurn.current;
-    if (!active) return;
+    if (!active) return true;
     const existingFence = durableCancellationFence.current;
-    if (existingFence?.messageId === active.messageId) return;
+    if (existingFence?.messageId === active.messageId) return false;
     durableCancellationFence.current = { messageId: active.messageId, forRetry };
     if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
     durableRecoveryTimer.current = null;
@@ -2530,12 +2611,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         activeDurableTurn.current = null;
         setDurableRecovery("idle");
         setSending(false);
-        return;
+        return true;
       }
       if (!response.ok) throw new Error(`conversation cancellation rejected (${response.status})`);
       const receipt = authoritativeCancellationReceipt(result, active.messageId);
       if (!receipt) throw new Error("conversation cancellation returned no authoritative fence");
-      if (activeDurableTurn.current?.messageId !== active.messageId) return;
+      if (activeDurableTurn.current?.messageId !== active.messageId) return activeDurableTurn.current === null;
       durableCancellationFence.current = { messageId: active.messageId, forRetry, receipt };
       if (forRetry) {
         setDurableRecovery("retry-ready");
@@ -2545,12 +2626,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         setDurableRecovery("idle");
         setSending(false);
       }
+      return true;
     } catch (error) {
-      if (activeDurableTurn.current?.messageId !== active.messageId) return;
+      if (activeDurableTurn.current?.messageId !== active.messageId) return false;
       durableCancellationFence.current = null;
       document.documentElement.dataset.jarvisCancellationFailure = String(error).slice(0, 160);
       setDurableRecovery(forRetry ? "terminal" : "failed");
       setSending(true);
+      return false;
     }
   }
 
@@ -2729,7 +2812,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
   }
 
-  async function submit(text: string) {
+  async function submit(text: string, options: SubmitOptions = {}) {
     const t = text.trim();
     const fileIds = guest ? [] : [...selectedFileIds];
     if (!guest && pendingFileIds.length) {
@@ -2743,8 +2826,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (!t && !fileIds.length) return;
     const visibleText = t || "Analyze the attached files.";
     if (durableSubmissionInFlight.current || activeDurableTurn.current) {
-      showCaption({ who: "jarvis", text: "I’m finishing the current reply first. You can recover or retry it from the status bar." });
-      return;
+      if (!options.interruptCurrent || durableSubmissionInFlight.current || !activeDurableTurn.current) {
+        showCaption({ who: "jarvis", text: "I’m finishing the current reply first. You can recover or retry it from the status bar." });
+        return;
+      }
+      mutedNarrationParentsRef.current.add(String(activeDurableTurn.current.messageId));
+      finalNarrationGenerationRef.current += 1;
+      const cancelled = await cancelDurableTurn(false);
+      if (!cancelled) {
+        showCaption({ who: "jarvis", text: "I heard the interruption, but the previous turn has not stopped safely yet." });
+        return;
+      }
     }
     // Typed/button calls reach this inside a user gesture. Live/STT calls have
     // already been primed by the control that opened the microphone.
@@ -2857,12 +2949,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         modelText = withHostContext(visibleText, bounded);
       }
     }
-    await queueDurableTurn(modelText, visibleText, fileIds);
+    await queueDurableTurn(modelText, visibleText, fileIds, options);
   }
 
   function stopTalking() {
     finalNarrationGenerationRef.current += 1;
     finalNarrationMessageRef.current = "";
+    if (lastSubmittedParentId.current) mutedNarrationParentsRef.current.add(lastSubmittedParentId.current);
     import("../lib/tts").then((m) => m.stopSpeaking());
     setSpeaking(false);
     ttsQuietUntilRef.current = Date.now() + 120;
@@ -2914,10 +3007,56 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     analyser.fftSize = 512;
     analyser.smoothingTimeConstant = 0.35;
     context.createMediaStreamSource(stream).connect(analyser);
-    const resources = { stream, context, analyser };
+    const aecEnabled = stream.getAudioTracks().some((track) => track.getSettings().echoCancellation === true);
+    const resources = { stream, context, analyser, aecEnabled };
     liveMicRef.current = resources;
     return resources;
   }
+
+  // A live session keeps its AEC microphone open while Jarvis speaks. This
+  // monitor never records or submits speaker audio; it only looks for a
+  // conservative sustained near-field interruption, then hushes the current
+  // narration and lets the normal authenticated capture path collect the new
+  // turn. Browsers that cannot confirm AEC retain the explicit hush control.
+  useEffect(() => {
+    if (live !== "live" || !speaking) return;
+    const epoch = ++liveInterruptionEpoch.current;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    void ensurePersistentLiveMic().then(({ context, analyser, aecEnabled }) => {
+      if (!aecEnabled || epoch !== liveInterruptionEpoch.current || live !== "live" || !speakingRef.current) return;
+      const spectrum = new Uint8Array(analyser.frequencyBinCount);
+      const startedAt = Date.now();
+      let vad = createLiveVadState(startedAt);
+      timer = setInterval(() => {
+        if (epoch !== liveInterruptionEpoch.current || !speakingRef.current) return;
+        analyser.getByteFrequencyData(spectrum);
+        const level = spectrum.reduce((sum, value) => sum + value, 0) / Math.max(1, spectrum.length);
+        const result = advanceLiveVad(vad, {
+          level,
+          voiceLevel: spectrumBandLevel(spectrum, context.sampleRate, 90, 3_800),
+          highFrequencyLevel: spectrumBandLevel(spectrum, context.sampleRate, 4_500, 10_000),
+          now: Date.now(),
+          startedAt,
+          ttsActive: true,
+          quietUntil: 0,
+          aecEnabled: true,
+        });
+        vad = result.state;
+        if (!result.bargeIn) return;
+        document.documentElement.dataset.jarvisBargeDetectedMs = String(Math.round(performance.now()));
+        confirmedBargeAtRef.current = Date.now();
+        voiceInterruptionPendingRef.current = true;
+        stopTalking();
+      }, LIVE_BARGE_SAMPLE_MS);
+    }).catch(() => undefined);
+    return () => {
+      liveInterruptionEpoch.current += 1;
+      if (timer) clearInterval(timer);
+    };
+    // `stopTalking` and `ensurePersistentLiveMic` are stable component
+    // declarations; only live/speaking transitions own this monitor.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [live, speaking]);
   function closePersistentLiveMic() {
     liveSessionEpoch.current += 1;
     sttAbortRef.current?.abort();
@@ -3213,8 +3352,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     freeBusy.current = true;
     const sessionEpoch = liveSessionEpoch.current;
+    const voiceRequestId = globalThis.crypto?.randomUUID?.()
+      ?? `voice-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     let outcome: VoiceCaptureOutcome = "failure";
     let pendingSttController: AbortController | null = null;
+    const researchState: {
+      controller: AbortController | null;
+      promise: Promise<LiveResearchResponse | null> | null;
+    } = { controller: null, promise: null };
+    let researchStarted = false;
+    setLiveResearch({ phase: "idle", sourceCount: 0 });
     try {
       void ownVoice();
       const { stream, context, analyser } = await ensurePersistentLiveMic();
@@ -3250,12 +3397,54 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         const payload = await response.json();
         return String(payload?.text ?? "").trim();
       };
+      const startLiveResearch = (currentPartial: string, previousPartial: string) => {
+        if (researchStarted || !buildSpeculativeResearchQuery(currentPartial)) return;
+        if (!shouldStartLiveResearchPreview({
+          authoritativePartialTranscript: currentPartial,
+          previousAuthoritativePartialTranscript: previousPartial,
+          alreadyStarted: researchStarted,
+        })) return;
+        researchStarted = true;
+        const controller = new AbortController();
+        researchState.controller = controller;
+        const startedAt = performance.now();
+        document.documentElement.dataset.jarvisResearchPrefetch = "researching";
+        setLiveResearch({ phase: "researching", sourceCount: 0 });
+        researchState.promise = viewerFetchWithTimeout("/api/chat/prefetch", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            partialText: currentPartial,
+            threadId: threadRef.current,
+            requestId: voiceRequestId,
+          }),
+          signal: controller.signal,
+        }, 6_000).then(async (response) => {
+          if (!response.ok) return null;
+          const payload = await response.json() as Partial<LiveResearchResponse>;
+          if (
+            typeof payload.receipt !== "string" || !payload.receipt ||
+            typeof payload.query !== "string" ||
+            !Array.isArray(payload.sources) ||
+            typeof payload.expiresAt !== "number"
+          ) return null;
+          const result = payload as LiveResearchResponse;
+          if (!freeLoop.current || sessionEpoch !== liveSessionEpoch.current) return null;
+          document.documentElement.dataset.jarvisResearchPrefetch = "ready";
+          document.documentElement.dataset.jarvisResearchPrefetchMs = String(Math.round(performance.now() - startedAt));
+          document.documentElement.dataset.jarvisResearchPrefetchSources = String(result.sources.length);
+          setLiveResearch({ phase: "ready", sourceCount: result.sources.length });
+          return result;
+        }).catch(() => null);
+      };
       recRef.current = rec;
       const t0 = Date.now();
       let vad = createLiveVadState(t0);
       const prefetch = {
         lastVoice: -1,
         promise: null as Promise<{ text: string; lastVoice: number } | null> | null,
+        authoritativeText: "",
+        previousAuthoritativeText: "",
       };
       let listeningCaptionShown = false;
       let ttsWasActive = speakingRef.current || isTtsActuallySpeaking();
@@ -3330,7 +3519,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             sttAbortRef.current?.abort();
             sttAbortRef.current = controller;
             prefetch.promise = requestTranscript(partial, controller, { ...vad })
-              .then((text) => ({ text, lastVoice }), () => null)
+              .then((text) => {
+                if (text && text !== prefetch.authoritativeText) {
+                  prefetch.previousAuthoritativeText = prefetch.authoritativeText;
+                  prefetch.authoritativeText = text;
+                  startLiveResearch(text, prefetch.previousAuthoritativeText);
+                }
+                return { text, lastVoice };
+              }, () => null)
               .finally(() => {
                 if (sttAbortRef.current === controller) sttAbortRef.current = null;
                 if (pendingSttController === controller) pendingSttController = null;
@@ -3341,7 +3537,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           void import("../lib/tts").then((m) => m.stopSpeaking());
           setSpeaking(false);
         }
-        if (shouldCloseLiveUtterance(vad, now) || (!vad.spoke && now - t0 > 8000) || now - t0 > 25_000) {
+        if (
+          shouldCloseLiveUtterance(vad, now, prefetch.authoritativeText)
+          || (!vad.spoke && now - t0 > 8000)
+          || now - t0 > 25_000
+        ) {
           clearInterval(poll);
           if (rec.state === "recording") rec.stop();
         }
@@ -3411,9 +3611,32 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       }
       lastVoiceInput.current = { text: cleanedText, at: Date.now() };
       document.documentElement.dataset.jarvisTranscriptionMs = String(Math.round(performance.now() - speechClosedAt));
+      let researchResult: LiveResearchResponse | null = null;
+      const pendingResearch = researchState.promise;
+      if (pendingResearch) {
+        let reuseTimer: ReturnType<typeof setTimeout> | null = null;
+        researchResult = await Promise.race([
+          pendingResearch,
+          new Promise<null>((resolve) => {
+            reuseTimer = setTimeout(() => resolve(null), 180);
+          }),
+        ]);
+        if (reuseTimer) clearTimeout(reuseTimer);
+        if (!researchResult) {
+          researchState.controller?.abort();
+          document.documentElement.dataset.jarvisResearchPrefetch = "late-or-discarded";
+        }
+      }
       showCaption({ who: "you", text: cleanedText });
       outcome = "speech";
-      void submit(cleanedText);
+      const interruptCurrent = voiceInterruptionPendingRef.current;
+      voiceInterruptionPendingRef.current = false;
+      setLiveResearch({ phase: "idle", sourceCount: 0 });
+      void submit(cleanedText, {
+        requestId: voiceRequestId,
+        researchReceipt: researchResult?.receipt,
+        interruptCurrent,
+      });
     } catch (error) {
       const aborted = error instanceof DOMException && error.name === "AbortError";
       outcome = aborted ? "empty" : "failure";
@@ -3424,6 +3647,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       }
     } finally {
       pendingSttController?.abort();
+      researchState.controller?.abort();
+      if (outcome !== "speech") voiceInterruptionPendingRef.current = false;
+      setLiveResearch({ phase: "idle", sourceCount: 0 });
       recRef.current = null;
       energyRef.current = 0;
       freeBusy.current = false;
@@ -3534,30 +3760,36 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     rec.start();
   }
 
-  const status =
-    live === "connecting"
-      ? "connecting"
-      : live === "live"
-        ? "live"
-        : speaking
-          ? "speaking"
-          : busy
-            ? "thinking"
-            : recording
-              ? "listening"
-              : "online";
   const hostAssistant = [...messages]
     .reverse()
     .find((message) => message.role === "assistant" && message.delivery !== "notification");
-  const hostPhase = status === "thinking" && hostAssistant?.status === "streaming" && hostAssistant.text
-    ? "responding"
-    : status;
+  const status =
+    live === "connecting"
+      ? "connecting"
+      : speaking || ttsRuntimeStatus === "speaking"
+        ? "speaking"
+        : ttsRuntimeStatus === "buffering"
+          ? "buffering"
+          : hostAssistant?.status === "streaming" && Boolean(hostAssistant.text)
+            ? "responding"
+            : busy
+              ? "thinking"
+              : liveResearch.phase !== "idle"
+                ? "researching"
+                : recording || live === "live"
+                  ? "listening"
+                  : "online";
+  const hostPhase = status;
   const hostProgress = hostPhase === "online"
     ? 0
     : hostPhase === "connecting"
       ? 0.08
       : hostPhase === "listening"
         ? 0.16
+        : hostPhase === "researching"
+          ? liveResearch.phase === "ready" ? 0.3 : 0.24
+        : hostPhase === "buffering"
+          ? 0.86
         : hostPhase === "thinking"
           ? 0.32
           : hostPhase === "responding"
@@ -3570,9 +3802,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // no private transcript text crosses into the surrounding app.
   }, [embedded, parentOrigin, hostPhase, hostProgress]);
   const orbState =
-    speaking || (live === "live" && caption?.who === "jarvis")
+    speaking || ttsRuntimeStatus === "speaking"
       ? "speaking"
-      : busy
+      : busy || liveResearch.phase !== "idle"
         ? "thinking"
         : recording || live === "live"
           ? "listening"
@@ -3682,6 +3914,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 className="absolute inset-[20%] z-20 rounded-full bg-transparent"
               />
             </>
+          )}
+          {liveResearch.phase !== "idle" && (
+            <div className="pointer-events-none absolute inset-x-2 top-3 z-50 flex justify-center px-3">
+              <LiveResearchIndicator state={liveResearch} />
+            </div>
           )}
           {caption && (
             <div className="pointer-events-none absolute inset-x-2 bottom-2 z-50 flex justify-center px-3">
@@ -4001,6 +4238,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 ? "absolute bottom-[25%] left-[69%] right-[3%] top-[25%] z-20 hidden rounded-full bg-transparent md:block"
                 : "absolute inset-[28%] z-20 rounded-full bg-transparent"}
             />
+          )}
+          {liveResearch.phase !== "idle" && !fullBleed && (
+            <div className="pointer-events-none absolute inset-x-0 top-[45%] z-30 flex justify-center px-6">
+              <LiveResearchIndicator state={liveResearch} />
+            </div>
           )}
           {/* THE ONE caption — one persistent node throughout token streaming,
               finalization and narration. Compact overlays keep it beside their

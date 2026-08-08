@@ -21,8 +21,11 @@ type AudioResult = { audio: ArrayBuffer };
 const ECHO_GUARD_TAIL_MS = 45_000;
 const REQUEST_TIMEOUT_MS = 4_000;
 // Edge handles sentence rhythm better than a browser-side chain of tiny MP3s.
-// Keep ordinary replies in one request and split only genuinely long speech.
-// The old 56-character ceiling created a network/decode seam every few words.
+// Keep ordinary replies in one request. For genuinely long speech, make only
+// the first clause smaller so audio can begin while the larger continuation is
+// synthesized in parallel; this preserves cadence without waiting for a whole
+// long MP3 before the first sound.
+const FIRST_SPEECH_CHUNK_CHARS = 120;
 const TARGET_SPEECH_CHUNK_CHARS = 170;
 const MAX_SPEECH_CHUNK_CHARS = 240;
 const MAX_MEMORY_AUDIO_SEGMENTS = 12;
@@ -49,6 +52,13 @@ function setTtsStatus(status: "loading" | "ready" | "buffering" | "speaking" | "
   document.documentElement.dataset.jarvisTts = status;
   document.documentElement.dataset.jarvisTtsEngine = ttsEngine;
   if (status !== "unavailable") delete document.documentElement.dataset.jarvisTtsFailure;
+  if (
+    typeof window !== "undefined" &&
+    typeof window.dispatchEvent === "function" &&
+    typeof CustomEvent !== "undefined"
+  ) {
+    window.dispatchEvent(new CustomEvent("jarvis:tts-status", { detail: { status } }));
+  }
 }
 
 function reportFailure(error: unknown) {
@@ -165,12 +175,16 @@ export function sentences(text: string): string[] {
 
   const appendBounded = (value: string) => {
     let remaining = value.trim();
-    while (remaining.length > MAX_SPEECH_CHUNK_CHARS) {
-      const window = remaining.slice(0, MAX_SPEECH_CHUNK_CHARS + 1);
+    const nextLimit = () => result.length === 0 && remaining.length >= TARGET_SPEECH_CHUNK_CHARS
+      ? FIRST_SPEECH_CHUNK_CHARS
+      : MAX_SPEECH_CHUNK_CHARS;
+    while (remaining.length > nextLimit()) {
+      const limit = nextLimit();
+      const window = remaining.slice(0, limit + 1);
       const boundary = window.lastIndexOf(" ");
-      const cut = boundary >= Math.floor(MAX_SPEECH_CHUNK_CHARS * 0.58)
+      const cut = boundary >= Math.floor(limit * 0.58)
         ? boundary
-        : MAX_SPEECH_CHUNK_CHARS;
+        : limit;
       result.push(remaining.slice(0, cut).trim());
       remaining = remaining.slice(cut).trim();
     }

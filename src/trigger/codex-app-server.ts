@@ -28,6 +28,10 @@ type ActiveTurn = {
   turnId: string;
   threadId: string;
   invocationContext?: ToolInvocationContext;
+  toolAbortController: AbortController;
+  toolCallCount: number;
+  toolOutputBytes: number;
+  inFlightTools: Set<string>;
   text: string;
   deltaCount: number;
   itemId?: string;
@@ -50,6 +54,8 @@ export type CodexDynamicToolCall = {
   turnId: string;
   callId: string;
   invocationContext?: ToolInvocationContext;
+  /** Aborts when the exact admitted turn is cancelled or retired. */
+  signal?: AbortSignal;
   namespace: string | null;
   tool: string;
   arguments: unknown;
@@ -109,6 +115,19 @@ export const CODEX_APP_SERVER_PROTOCOL_LIMITS: Readonly<CodexAppServerProtocolLi
   inFlightTools: 32,
   toolOutputBytes: 16 * 1_024 * 1_024,
 });
+
+/**
+ * Process-lifetime ceilings remain deliberately non-configurable. Per-turn
+ * limits reset with each ActiveTurn; these larger bounds still stop a hostile
+ * or corrupted warm app-server from consuming resources indefinitely.
+ */
+export const CODEX_APP_SERVER_GLOBAL_DYNAMIC_TOOL_LIMITS = Object.freeze({
+  toolCalls: CODEX_APP_SERVER_PROTOCOL_LIMITS.messages,
+  inFlightTools: CODEX_APP_SERVER_PROTOCOL_LIMITS.activeTurns
+    * CODEX_APP_SERVER_PROTOCOL_LIMITS.inFlightTools,
+  toolOutputBytes: CODEX_APP_SERVER_PROTOCOL_LIMITS.stdoutBytes,
+});
+
 const CHATGPT_PLAN_TYPES = new Set([
   "free", "go", "plus", "pro", "prolite", "team",
   "self_serve_business_usage_based", "business",
@@ -365,8 +384,8 @@ export class CodexAppServer {
   private stdoutBytes = 0;
   private stderrBytes = 0;
   private messageCount = 0;
-  private toolCallCount = 0;
-  private toolOutputBytes = 0;
+  private globalToolCallCount = 0;
+  private globalToolOutputBytes = 0;
   private readonly inFlightTools = new Set<string>();
   private readonly limits: CodexAppServerProtocolLimits;
   private protocolFailed = false;
@@ -547,6 +566,7 @@ export class CodexAppServer {
       this.notify("turn/interrupt", { threadId, turnId });
       throw new Error("Codex conversation turn was cancelled");
     }
+    const toolAbortController = new AbortController();
     const completion = new Promise<CodexTurnResult>((resolve, reject) => {
       let abortHandler: (() => void) | undefined;
       const abortCleanup = () => {
@@ -555,13 +575,19 @@ export class CodexAppServer {
       const timer = setTimeout(() => {
         abortCleanup();
         this.notify("turn/interrupt", { threadId, turnId });
-        this.active.delete(turnId);
+        const active = this.active.get(turnId);
+        active?.toolAbortController.abort();
+        if (active) this.active.delete(turnId);
         reject(new Error("Codex conversation turn exceeded its foreground deadline"));
       }, this.turnTimeoutMs);
       this.active.set(turnId, {
         turnId,
         threadId,
         ...(invocationContext ? { invocationContext } : {}),
+        toolAbortController,
+        toolCallCount: 0,
+        toolOutputBytes: 0,
+        inFlightTools: new Set(),
         text: "",
         deltaCount: 0,
         onDelta: input.onDelta,
@@ -576,6 +602,7 @@ export class CodexAppServer {
           if (!active) return;
           clearTimeout(active.timer);
           active.abortCleanup?.();
+          active.toolAbortController.abort();
           this.active.delete(turnId);
           this.notify("turn/interrupt", { threadId, turnId });
           reject(new Error("Codex conversation turn was cancelled"));
@@ -591,6 +618,7 @@ export class CodexAppServer {
       if (active) {
         clearTimeout(active.timer);
         active.abortCleanup?.();
+        active.toolAbortController.abort();
         this.active.delete(turnId);
         this.notify("turn/interrupt", { threadId, turnId });
       }
@@ -646,13 +674,21 @@ export class CodexAppServer {
         throw new Error("invalid tool request params");
       }
       const requestKey = `${typeof message.id}:${String(message.id)}`;
-      this.toolCallCount += 1;
-      if (this.toolCallCount > this.limits.toolCalls
-        || this.inFlightTools.size >= this.limits.inFlightTools
-        || this.inFlightTools.has(requestKey)) {
+      const active = this.active.get(params.turnId);
+      const exactActiveTurn = active?.threadId === params.threadId ? active : undefined;
+      this.globalToolCallCount += 1;
+      if (exactActiveTurn) exactActiveTurn.toolCallCount += 1;
+      if (this.globalToolCallCount > CODEX_APP_SERVER_GLOBAL_DYNAMIC_TOOL_LIMITS.toolCalls
+        || this.inFlightTools.size >= CODEX_APP_SERVER_GLOBAL_DYNAMIC_TOOL_LIMITS.inFlightTools
+        || this.inFlightTools.has(requestKey)
+        || (exactActiveTurn && (
+          exactActiveTurn.toolCallCount > this.limits.toolCalls
+          || exactActiveTurn.inFlightTools.size >= this.limits.inFlightTools
+        ))) {
         throw new Error("Codex app-server tool request limit exceeded");
       }
       this.inFlightTools.add(requestKey);
+      exactActiveTurn?.inFlightTools.add(requestKey);
       void this.respondToDynamicToolCall(message);
       return;
     }
@@ -710,6 +746,7 @@ export class CodexAppServer {
       const status = typeof turn?.status === "string" ? turn.status : "failed";
       clearTimeout(active.timer);
       active.abortCleanup?.();
+      active.toolAbortController.abort();
       this.active.delete(turnId);
       active.resolve({ finalText: active.text, threadId: active.threadId, code: status === "completed" ? 0 : -1, stderr: status === "completed" ? "" : this.errorText(turn?.error ?? status) });
     }
@@ -722,6 +759,7 @@ export class CodexAppServer {
     const turnId = typeof params.turnId === "string" ? params.turnId : "";
     const active = this.active.get(turnId);
     const exactActiveTurn = Boolean(active && active.threadId === threadId);
+    const admittedActiveTurn = exactActiveTurn ? active : undefined;
     const invocationContext = exactActiveTurn ? active?.invocationContext : undefined;
     const handler = this.options.onDynamicToolCall;
     let dynamicResult: CodexDynamicToolResult;
@@ -738,6 +776,7 @@ export class CodexAppServer {
             turnId,
             callId: typeof params.callId === "string" ? params.callId : "",
             ...(invocationContext ? { invocationContext } : {}),
+            ...(admittedActiveTurn ? { signal: admittedActiveTurn.toolAbortController.signal } : {}),
             namespace: typeof params.namespace === "string" ? params.namespace : null,
             tool: params.tool,
             arguments: params.arguments,
@@ -755,9 +794,17 @@ export class CodexAppServer {
           success: false,
         };
       }
+      // A handler may ignore cancellation or resolve after the turn was
+      // retired. Never let that stale result re-enter the protocol.
+      if (admittedActiveTurn && (
+        admittedActiveTurn.toolAbortController.signal.aborted
+        || this.active.get(turnId) !== admittedActiveTurn
+      )) return;
       const bytes = Buffer.byteLength(JSON.stringify(dynamicResult), "utf8");
-      this.toolOutputBytes += bytes;
-      if (this.toolOutputBytes > this.limits.toolOutputBytes) {
+      if (admittedActiveTurn) admittedActiveTurn.toolOutputBytes += bytes;
+      this.globalToolOutputBytes += bytes;
+      if ((admittedActiveTurn && admittedActiveTurn.toolOutputBytes > this.limits.toolOutputBytes)
+        || this.globalToolOutputBytes > CODEX_APP_SERVER_GLOBAL_DYNAMIC_TOOL_LIMITS.toolOutputBytes) {
         this.protocolFailure();
         return;
       }
@@ -768,6 +815,7 @@ export class CodexAppServer {
       }
     } finally {
       this.inFlightTools.delete(requestKey);
+      admittedActiveTurn?.inFlightTools.delete(requestKey);
     }
   }
 
@@ -830,6 +878,7 @@ export class CodexAppServer {
     for (const active of this.active.values()) {
       clearTimeout(active.timer);
       active.abortCleanup?.();
+      active.toolAbortController.abort();
       active.reject(detail);
     }
     this.active.clear();

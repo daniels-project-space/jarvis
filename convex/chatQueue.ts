@@ -31,6 +31,9 @@ export const CHAT_TURN_STALE_MS = 45_000;
 export const MAX_CHAT_TURN_ATTEMPTS = 3;
 export const MAX_CHAT_RECOVERY_WAKES = 3;
 export const CHAT_PENDING_EXPIRY_MS = 15 * 60_000;
+const RESEARCH_PREFETCH_BASIS_MAX_CHARS = 720;
+const RESEARCH_PREFETCH_CONTEXT_MAX_CHARS = 3_600;
+const RESEARCH_PREFETCH_MAX_LIFETIME_MS = 60_000;
 const TERMINAL_RECOVERY_TEXT =
   "I couldn't complete that reply after several recovery attempts. Tap retry to try the request again.";
 const CANCELLED_REPLY_TEXT = "Reply cancelled.";
@@ -57,6 +60,14 @@ async function ensureSession(ctx: { db: any }, threadId: string) {
     lastActiveAt: Date.now(),
   });
   return await ctx.db.get(id);
+}
+
+async function deleteTurnPrefetch(ctx: { db: any }, messageId: string) {
+  const rows = await ctx.db
+    .query("chatTurnPrefetches")
+    .withIndex("by_message", (q: any) => q.eq("messageId", messageId))
+    .take(4);
+  for (const row of rows) await ctx.db.delete(row._id);
 }
 
 const utcDay = (now: number) => new Date(now).toISOString().slice(0, 10);
@@ -127,17 +138,33 @@ export const sendMessage = mutation({
     text: v.string(),
     requestId: v.optional(v.string()),
     fileIds: v.optional(v.array(v.id("files"))),
+    researchPrefetch: v.optional(v.object({
+      basis: v.string(),
+      context: v.string(),
+      expiresAt: v.number(),
+    })),
     ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
     const identity = await conversationIdentity(ctx, a);
     const threadId = scopedConversationThread(identity, a.threadId);
-    if (a.requestId) {
+    const submittedText = identity.kind === "guest" ? a.text.slice(0, 2_000) : a.text;
+    const requestId = a.requestId?.slice(0, 120);
+    if (a.researchPrefetch && identity.kind !== "owner") {
+      throw new ConvexError({ code: "OWNER_REQUIRED", message: "Speculative research requires owner access" });
+    }
+    if (requestId) {
       const prior = await ctx.db
         .query("chatMessages")
-        .withIndex("by_request", (q: any) => q.eq("requestId", a.requestId))
+        .withIndex("by_request", (q: any) => q.eq("requestId", requestId))
         .first();
-      if (prior?.role === "user" && prior.threadId === threadId) {
+      if (prior?.role === "user") {
+        if (prior.threadId !== threadId || prior.text !== submittedText) {
+          throw new ConvexError({
+            code: "CHAT_REQUEST_CONFLICT",
+            message: "Chat request identity was reused with different text or thread",
+          });
+        }
         const links = await ctx.db
           .query("messageFiles")
           .withIndex("by_message", (q: any) => q.eq("messageId", prior._id))
@@ -161,9 +188,9 @@ export const sendMessage = mutation({
     const id = await ctx.db.insert("chatMessages", {
       threadId,
       role: "user",
-      text: identity.kind === "guest" ? a.text.slice(0, 2_000) : a.text,
+      text: submittedText,
       status: "pending",
-      requestId: a.requestId?.slice(0, 120),
+      requestId,
       delivery: "foreground",
       attemptCount: 0,
       dispatchEpoch: 0,
@@ -172,6 +199,25 @@ export const sendMessage = mutation({
       createdAt,
     });
     await linkFilesToMessage(ctx, id, threadId, files, createdAt);
+    if (a.researchPrefetch) {
+      const prefetch = a.researchPrefetch;
+      const validPrefetch =
+        prefetch.basis.length >= 24 && prefetch.basis.length <= RESEARCH_PREFETCH_BASIS_MAX_CHARS &&
+        prefetch.context.length >= 40 && prefetch.context.length <= RESEARCH_PREFETCH_CONTEXT_MAX_CHARS &&
+        prefetch.expiresAt > createdAt && prefetch.expiresAt <= createdAt + RESEARCH_PREFETCH_MAX_LIFETIME_MS;
+      // Research is an optional latency optimization. A stale or drifted
+      // envelope must never reject the authoritative user turn.
+      if (validPrefetch) {
+        await ctx.db.insert("chatTurnPrefetches", {
+          messageId: id,
+          threadId,
+          basis: prefetch.basis,
+          context: prefetch.context,
+          expiresAt: prefetch.expiresAt,
+          createdAt,
+        });
+      }
+    }
     if (session) await ctx.db.patch(session._id, { lastActiveAt: createdAt });
     return id;
   },
@@ -312,6 +358,7 @@ async function recoverAssistant(ctx: { db: any }, assistant: any) {
     if (parent?.role === "user") {
       await ctx.db.patch(parent._id, { status: "error", lastProgressAt: Date.now() });
       await releaseGuestTurn(ctx, parent);
+      await deleteTurnPrefetch(ctx, parent._id);
     }
     await settleSession(ctx, assistant.threadId);
     return { status: "failed" as const, messageId: parent?._id ?? null, attemptCount: attempts };
@@ -372,6 +419,7 @@ async function expirePending(ctx: { db: any }, user: any) {
     createdAt: user.createdAt + 1,
   });
   await releaseGuestTurn(ctx, user);
+  await deleteTurnPrefetch(ctx, user._id);
   await settleSession(ctx, user.threadId);
 }
 
@@ -525,7 +573,10 @@ export const cancelTurn = mutation({
       .withIndex("by_parent", (q) => q.eq("parentMessageId", user._id))
       .order("desc")
       .first();
-    if (assistant?.status === "done") return { status: "completed" as const };
+    if (assistant?.status === "done") {
+      await deleteTurnPrefetch(ctx, user._id);
+      return { status: "completed" as const };
+    }
 
     const receiptKey = cancellationReceiptKey(String(user._id));
     const existingReceipt = await ctx.db
@@ -533,6 +584,7 @@ export const cancelTurn = mutation({
       .withIndex("by_key", (q) => q.eq("key", receiptKey))
       .first();
     if (existingReceipt) {
+      await deleteTurnPrefetch(ctx, user._id);
       return {
         status: "cancelled" as const,
         messageId: user._id,
@@ -576,6 +628,7 @@ export const cancelTurn = mutation({
       await ctx.db.patch(user._id, { status: "error", lastProgressAt: now });
     }
     await releaseGuestTurn(ctx, user);
+    await deleteTurnPrefetch(ctx, user._id);
     await settleSession(ctx, threadId);
     return { status: "cancelled" as const, messageId: user._id, fenceReceipt };
   },
@@ -646,6 +699,18 @@ async function claimPending(ctx: { db: any }, pending: any, claimToken: string) 
       .sort((a: any, b: any) => a.createdAt - b.createdAt)
       .slice(-12)
       .map((m: any) => ({ role: m.role, text: m.role === "user" ? visibleTurnText(m.text) : m.text }));
+    const prefetchRow = await ctx.db
+      .query("chatTurnPrefetches")
+      .withIndex("by_message", (q: any) => q.eq("messageId", pending._id))
+      .first();
+    const researchPrefetch = prefetchRow && prefetchRow.expiresAt > now
+      ? {
+          basis: prefetchRow.basis,
+          context: prefetchRow.context,
+          expiresAt: prefetchRow.expiresAt,
+        }
+      : undefined;
+    if (prefetchRow && !researchPrefetch) await ctx.db.delete(prefetchRow._id);
     // Attachment scope is intentionally the exact claimed user row. Thread
     // library files and files on any earlier/later message never enter this
     // turn implicitly.
@@ -685,6 +750,7 @@ async function claimPending(ctx: { db: any }, pending: any, claimToken: string) 
       claimToken,
       attemptCount,
       history,
+      researchPrefetch,
       attachments,
       fileCatalog,
     };
@@ -864,6 +930,7 @@ export const finalize = mutation({
       if (parent?.role === "user") {
         await ctx.db.patch(parent._id, { status: a.status, lastProgressAt: Date.now() });
         await releaseGuestTurn(ctx, parent);
+        await deleteTurnPrefetch(ctx, parent._id);
       }
     }
     await settleSession(ctx, a.threadId);
@@ -931,6 +998,7 @@ export const clearThread = mutation({
         throw new Error("message file cleanup bound exceeded");
       }
       for (const link of provenance) await ctx.db.delete(link._id);
+      await deleteTurnPrefetch(ctx, r._id);
       await ctx.db.delete(r._id);
     }
     return rows.length;

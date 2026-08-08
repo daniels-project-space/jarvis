@@ -301,10 +301,26 @@ describe("Project Hub Jarvis loader", () => {
     harness.listeners.get("message")?.[0]?.({
       origin: JARVIS_ORIGIN,
       source: harness.frameWindow,
+      data: { jarvis: "status", phase: "researching", progress: 0.24 },
+    });
+    expect(label?.textContent).toBe("RESEARCHING");
+    expect(fill?.style.transform).toBe("scaleX(0.24)");
+
+    harness.listeners.get("message")?.[0]?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
       data: { jarvis: "status", phase: "responding", progress: 0.72 },
     });
     expect(label?.textContent).toBe("RESPONDING");
     expect(fill?.style.transform).toBe("scaleX(0.72)");
+
+    harness.listeners.get("message")?.[0]?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "status", phase: "buffering", progress: 0.86 },
+    });
+    expect(label?.textContent).toBe("BUFFERING");
+    expect(fill?.style.transform).toBe("scaleX(0.86)");
 
     harness.listeners.get("message")?.[0]?.({
       origin: JARVIS_ORIGIN,
