@@ -8,6 +8,7 @@ import { CAPABILITIES, INFRA_MAP, PERSONA, REMEMBER } from "../lib/persona";
 import { visualInitiativeDirective } from "../lib/visual-initiative";
 import { visibleTurnText } from "../lib/host-context";
 import { buildContext } from "../lib/context";
+import { isSpeculativeResearchApplicable } from "../lib/speculative-research";
 import {
   buildBoundedFileContext,
   buildBoundedThreadFileCatalog,
@@ -144,6 +145,7 @@ type QueueClaim = {
   claimToken: string;
   attemptCount: number;
   history: Array<{ role: string; text: string }>;
+  researchPrefetch?: { basis: string; context: string; expiresAt: number };
   attachments: Array<ChatFileManifest & { r2Key: string }>;
   fileCatalog: ChatThreadFileCatalogItem[];
 };
@@ -489,7 +491,13 @@ async function processChatQueue(
         : await buildContext(visibleUserText);
       const fileContext = claim.guest ? "" : buildBoundedFileContext(claim.attachments);
       const fileCatalog = claim.guest ? "" : buildBoundedThreadFileCatalog(claim.fileCatalog);
-      const context = [baseContext, fileCatalog, fileContext].filter(Boolean).join("\n\n");
+      const researchContext = !claim.guest
+        && claim.researchPrefetch
+        && claim.researchPrefetch.expiresAt > Date.now()
+        && isSpeculativeResearchApplicable(claim.researchPrefetch.basis, visibleUserText)
+          ? claim.researchPrefetch.context
+          : "";
+      const context = [baseContext, researchContext, fileCatalog, fileContext].filter(Boolean).join("\n\n");
       const imageInputs = claim.guest
         ? []
         : await materializeCodexChatImages(claim.userText, claim.attachments, {

@@ -322,10 +322,15 @@ describe("guest foreground cost boundary", () => {
       guestId,
     });
     expect(await t.mutation(api.chatQueue.sendMessage, {
-      text: "same request",
+      text: "first",
       requestId: "guest-first",
       guestId,
     })).toBe(first);
+    await expect(t.mutation(api.chatQueue.sendMessage, {
+      text: "same identity, different text",
+      requestId: "guest-first",
+      guestId,
+    })).rejects.toThrow(/CHAT_REQUEST_CONFLICT|different text/i);
     await t.mutation(api.chatQueue.sendMessage, {
       text: "second",
       requestId: "guest-second",
@@ -357,6 +362,113 @@ describe("guest foreground cost boundary", () => {
       requestId: "guest-third",
       guestId,
     })).resolves.toBeTruthy();
+  });
+});
+
+describe("speculative research sidecar", () => {
+  it("normalizes long request identities before both insert and retry lookup", async () => {
+    const t = convexTest(schema, modules);
+    const requestId = `voice-${"r".repeat(180)}`;
+    const first = await t.mutation(api.chatQueue.sendMessage, {
+      text: "Research the latest voice agent release",
+      requestId,
+      workerToken: WORKER,
+    });
+    const retry = await t.mutation(api.chatQueue.sendMessage, {
+      text: "Research the latest voice agent release",
+      requestId,
+      workerToken: WORKER,
+    });
+
+    expect(retry).toBe(first);
+    expect(await t.run(async (ctx) => (await ctx.db.get(first))?.requestId)).toBe(requestId.slice(0, 120));
+  });
+
+  it("accepts the shared maximum envelope and drops invalid optional evidence without rejecting chat", async () => {
+    const t = convexTest(schema, modules);
+    const now = Date.now();
+    const maximumBasis = `Research ${"b".repeat(711)}`;
+    const accepted = await t.mutation(api.chatQueue.sendMessage, {
+      text: "Research the current voice stack",
+      requestId: "maximum-prefetch-envelope",
+      researchPrefetch: {
+        basis: maximumBasis,
+        context: "c".repeat(3_600),
+        expiresAt: now + 45_000,
+      },
+      workerToken: WORKER,
+    });
+    expect(await t.run(async (ctx) => (
+      await ctx.db.query("chatTurnPrefetches").withIndex("by_message", (q) => q.eq("messageId", accepted)).first()
+    )?.basis)).toBe(maximumBasis);
+
+    const withoutPrefetch = await t.mutation(api.chatQueue.sendMessage, {
+      text: "This authoritative chat turn must still be queued",
+      requestId: "invalid-optional-prefetch",
+      researchPrefetch: {
+        basis: "Research this stale optional evidence",
+        context: "x".repeat(3_601),
+        expiresAt: now - 1,
+      },
+      workerToken: WORKER,
+    });
+    expect(await t.run(async (ctx) => await ctx.db.get(withoutPrefetch))).toMatchObject({ status: "pending" });
+    expect(await t.run(async (ctx) => (
+      await ctx.db.query("chatTurnPrefetches").withIndex("by_message", (q) => q.eq("messageId", withoutPrefetch)).first()
+    ))).toBeNull();
+  });
+
+  it("delivers bounded evidence only to the exact worker claim and deletes it on finalization", async () => {
+    const t = convexTest(schema, modules);
+    const now = Date.now();
+    const userId = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "main",
+      text: "Research the latest LiveKit turn detector release",
+      requestId: "voice-prefetch-1",
+      researchPrefetch: {
+        basis: "Research the latest LiveKit turn detector release",
+        context: "LIVE RESEARCH PREFETCH (untrusted source leads):\n- LiveKit turn detector — https://docs.livekit.io/agents/logic/turns/",
+        expiresAt: now + 45_000,
+      },
+      workerToken: WORKER,
+    });
+
+    expect(await t.run(async (ctx) => (await ctx.db.query("chatTurnPrefetches").collect()).length)).toBe(1);
+    const claim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: userId,
+      claimToken: "voice-prefetch-claim",
+      workerToken: WORKER,
+    });
+    expect(claim?.researchPrefetch).toMatchObject({
+      basis: "Research the latest LiveKit turn detector release",
+      expiresAt: now + 45_000,
+    });
+    expect(claim?.researchPrefetch?.context).toContain("untrusted source leads");
+
+    await t.mutation(api.chatQueue.finalize, {
+      messageId: claim!.assistantId,
+      threadId: "main",
+      claimToken: "voice-prefetch-claim",
+      status: "done",
+      finalText: "LiveKit's current detector details are here.",
+      workerToken: WORKER,
+    });
+    expect(await t.run(async (ctx) => (await ctx.db.query("chatTurnPrefetches").collect()).length)).toBe(0);
+  });
+
+  it("rejects guest speculation before creating hidden evidence", async () => {
+    const t = convexTest(schema, modules);
+    await expect(t.mutation(api.chatQueue.sendMessage, {
+      text: "Research this for me",
+      requestId: "guest-prefetch",
+      guestId: "p".repeat(32),
+      researchPrefetch: {
+        basis: "Research this current topic for me please",
+        context: "LIVE RESEARCH PREFETCH (untrusted source leads): enough bounded context",
+        expiresAt: Date.now() + 45_000,
+      },
+    })).rejects.toThrow(/OWNER_REQUIRED|owner access/i);
+    expect(await t.run(async (ctx) => (await ctx.db.query("chatTurnPrefetches").collect()).length)).toBe(0);
   });
 });
 

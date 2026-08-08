@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   CodexAppServer,
+  CODEX_APP_SERVER_GLOBAL_DYNAMIC_TOOL_LIMITS,
   CodexPermissionAttestationError,
+  type CodexDynamicToolCall,
   type CodexDynamicToolResult,
   type CodexDynamicToolSpec,
   type CodexPermissionProfileOptions,
@@ -13,6 +15,7 @@ type AppServerInternals = {
   ready: Promise<void>;
   receive: (line: string) => void;
   protocolFailed: boolean;
+  globalToolCallCount: number;
 };
 
 type WrittenMessage = {
@@ -24,6 +27,60 @@ type WrittenMessage = {
 
 function asOutputSchema(value: unknown): NonNullable<CodexTurnInput["outputSchema"]> {
   return value as NonNullable<CodexTurnInput["outputSchema"]>;
+}
+
+async function admitTurn(
+  server: CodexAppServer,
+  internals: AppServerInternals,
+  writes: WrittenMessage[],
+  input: { conversationId: string; threadId: string; turnId: string; signal?: AbortSignal },
+) {
+  const startIndex = writes.length;
+  const completion = server.runTurn({
+    conversationId: input.conversationId,
+    userText: "work",
+    history: [],
+    contextBlock: "",
+    preamble: "test",
+    modelTier: "luna",
+    ...(input.signal ? { signal: input.signal } : {}),
+    onDelta: () => {},
+  });
+  await vi.waitFor(() => expect(writes.length).toBeGreaterThan(startIndex));
+  let turnStartIndex = startIndex;
+  if (writes[startIndex].method === "thread/start") {
+    internals.receive(JSON.stringify({
+      id: writes[startIndex].id,
+      result: { thread: { id: input.threadId } },
+    }));
+    turnStartIndex += 1;
+    await vi.waitFor(() => expect(writes.length).toBeGreaterThan(turnStartIndex));
+  }
+  expect(writes[turnStartIndex].method).toBe("turn/start");
+  internals.receive(JSON.stringify({
+    id: writes[turnStartIndex].id,
+    result: { turn: { id: input.turnId } },
+  }));
+  await Promise.resolve();
+  return { completion };
+}
+
+function emitToolCall(
+  internals: AppServerInternals,
+  input: { id: number; threadId: string; turnId: string; callId?: string },
+) {
+  internals.receive(JSON.stringify({
+    id: input.id,
+    method: "item/tool/call",
+    params: {
+      threadId: input.threadId,
+      turnId: input.turnId,
+      callId: input.callId ?? `call-${input.id}`,
+      namespace: null,
+      tool: "jarvis_call_tool",
+      arguments: { name: "show", args: {} },
+    },
+  }));
 }
 
 describe("Codex app-server dynamic tools", () => {
@@ -104,6 +161,7 @@ describe("Codex app-server dynamic tools", () => {
         requestId: "request-1",
         userMessageId: "message-1",
       },
+      signal: expect.any(AbortSignal),
       namespace: null,
       tool: "jarvis_call_tool",
       arguments: { name: "show", args: { panel: "dashboard" } },
@@ -512,6 +570,161 @@ describe("Codex app-server dynamic tools", () => {
     }));
     await expect(turn).rejects.toThrow("protocol validation failed");
     expect(internals.protocolFailed).toBe(true);
+  });
+
+  it("resets dynamic-tool call and output budgets for each admitted turn", async () => {
+    const toolResult: CodexDynamicToolResult = {
+      contentItems: [{ type: "inputText", text: "one bounded result" }],
+      success: true,
+    };
+    const onDynamicToolCall = vi.fn(async () => toolResult);
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000, {
+      protocolLimits: {
+        toolCalls: 1,
+        inFlightTools: 1,
+        toolOutputBytes: Buffer.byteLength(JSON.stringify(toolResult), "utf8"),
+      },
+      onDynamicToolCall,
+    });
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = {
+      stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } },
+    };
+    internals.ready = Promise.resolve();
+
+    const first = await admitTurn(server, internals, writes, {
+      conversationId: "budget-reset",
+      threadId: "budget-thread",
+      turnId: "budget-turn-1",
+    });
+    emitToolCall(internals, { id: 201, threadId: "budget-thread", turnId: "budget-turn-1" });
+    await vi.waitFor(() => expect(writes.some((message) => message.id === 201 && message.result)).toBe(true));
+    internals.receive(JSON.stringify({
+      method: "turn/completed",
+      params: { turnId: "budget-turn-1", turn: { id: "budget-turn-1", status: "completed" } },
+    }));
+    await expect(first.completion).resolves.toMatchObject({ code: 0 });
+
+    const second = await admitTurn(server, internals, writes, {
+      conversationId: "budget-reset",
+      threadId: "budget-thread",
+      turnId: "budget-turn-2",
+    });
+    emitToolCall(internals, { id: 202, threadId: "budget-thread", turnId: "budget-turn-2" });
+    await vi.waitFor(() => expect(writes.some((message) => message.id === 202 && message.result)).toBe(true));
+    internals.receive(JSON.stringify({
+      method: "turn/completed",
+      params: { turnId: "budget-turn-2", turn: { id: "budget-turn-2", status: "completed" } },
+    }));
+    await expect(second.completion).resolves.toMatchObject({ code: 0 });
+    expect(onDynamicToolCall).toHaveBeenCalledTimes(2);
+    expect(internals.protocolFailed).toBe(false);
+  });
+
+  it("scopes the in-flight dynamic-tool budget to each active turn", async () => {
+    const resolvers: Array<(value: CodexDynamicToolResult) => void> = [];
+    const onDynamicToolCall = vi.fn((call: CodexDynamicToolCall) => {
+      void call;
+      return new Promise<CodexDynamicToolResult>((resolve) => { resolvers.push(resolve); });
+    });
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000, {
+      protocolLimits: { activeTurns: 2, inFlightTools: 1 },
+      onDynamicToolCall,
+    });
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = {
+      stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } },
+    };
+    internals.ready = Promise.resolve();
+    const first = await admitTurn(server, internals, writes, {
+      conversationId: "parallel-budget-1",
+      threadId: "parallel-thread-1",
+      turnId: "parallel-turn-1",
+    });
+    const second = await admitTurn(server, internals, writes, {
+      conversationId: "parallel-budget-2",
+      threadId: "parallel-thread-2",
+      turnId: "parallel-turn-2",
+    });
+
+    emitToolCall(internals, { id: 211, threadId: "parallel-thread-1", turnId: "parallel-turn-1" });
+    emitToolCall(internals, { id: 212, threadId: "parallel-thread-2", turnId: "parallel-turn-2" });
+    await vi.waitFor(() => expect(onDynamicToolCall).toHaveBeenCalledTimes(2));
+    expect(internals.protocolFailed).toBe(false);
+    for (const resolve of resolvers) resolve({
+      contentItems: [{ type: "inputText", text: "done" }],
+      success: true,
+    });
+    await vi.waitFor(() => expect(
+      writes.filter((message) => (message.id === 211 || message.id === 212) && message.result),
+    ).toHaveLength(2));
+    for (const turnId of ["parallel-turn-1", "parallel-turn-2"]) {
+      internals.receive(JSON.stringify({
+        method: "turn/completed",
+        params: { turnId, turn: { id: turnId, status: "completed" } },
+      }));
+    }
+    await expect(Promise.all([first.completion, second.completion])).resolves.toHaveLength(2);
+  });
+
+  it("aborts the admitted tool signal and rejects a late result after turn cancellation", async () => {
+    let resolveTool!: (value: CodexDynamicToolResult) => void;
+    const onDynamicToolCall = vi.fn((call: CodexDynamicToolCall) => {
+      void call;
+      return new Promise<CodexDynamicToolResult>((resolve) => { resolveTool = resolve; });
+    });
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000, { onDynamicToolCall });
+    const writes: WrittenMessage[] = [];
+    const abort = new AbortController();
+    const internals = server as unknown as AppServerInternals;
+    internals.process = {
+      stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } },
+    };
+    internals.ready = Promise.resolve();
+    const admitted = await admitTurn(server, internals, writes, {
+      conversationId: "cancel-tool",
+      threadId: "cancel-tool-thread",
+      turnId: "cancel-tool-turn",
+      signal: abort.signal,
+    });
+    emitToolCall(internals, { id: 221, threadId: "cancel-tool-thread", turnId: "cancel-tool-turn" });
+    await vi.waitFor(() => expect(onDynamicToolCall).toHaveBeenCalledTimes(1));
+    const toolSignal = onDynamicToolCall.mock.calls[0][0].signal;
+    expect(toolSignal?.aborted).toBe(false);
+
+    abort.abort();
+    await expect(admitted.completion).rejects.toThrow("turn was cancelled");
+    expect(toolSignal?.aborted).toBe(true);
+    resolveTool({ contentItems: [{ type: "inputText", text: "late" }], success: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(writes.some((message) => message.id === 221 && message.result)).toBe(false);
+  });
+
+  it("retains a process-lifetime hard ceiling above the resettable turn budgets", async () => {
+    const onDynamicToolCall = vi.fn(async () => ({
+      contentItems: [{ type: "inputText" as const, text: "must not run" }],
+      success: true,
+    }));
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000, { onDynamicToolCall });
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = {
+      stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } },
+    };
+    internals.ready = Promise.resolve();
+    const admitted = await admitTurn(server, internals, writes, {
+      conversationId: "global-budget",
+      threadId: "global-budget-thread",
+      turnId: "global-budget-turn",
+    });
+    internals.globalToolCallCount = CODEX_APP_SERVER_GLOBAL_DYNAMIC_TOOL_LIMITS.toolCalls;
+    emitToolCall(internals, { id: 231, threadId: "global-budget-thread", turnId: "global-budget-turn" });
+
+    await expect(admitted.completion).rejects.toThrow("protocol validation failed");
+    expect(internals.protocolFailed).toBe(true);
+    expect(onDynamicToolCall).not.toHaveBeenCalled();
   });
 
   it("caps cumulative protocol bytes even when every individual JSON line is small", () => {

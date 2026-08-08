@@ -1,34 +1,47 @@
 import { describe, expect, it } from "vitest";
 import {
+  LIVE_BARGE_CALIBRATION_FRAMES,
+  LIVE_BARGE_SAMPLE_MS,
+  LIVE_BARGE_SPEECH_FRAMES,
+  LIVE_COMPLETE_QUESTION_END_SILENCE_MS,
   LIVE_END_SILENCE_MS,
   LIVE_STT_PREFETCH_SILENCE_MS,
   LIVE_SPEAKER_TAIL_MS,
+  LIVE_UNFINISHED_END_SILENCE_MS,
   advanceLiveVad,
   createLiveVadState,
+  liveEndpointSilenceMs,
   shouldDeferLiveCapture,
   shouldCloseLiveUtterance,
   shouldPrefetchLiveTranscript,
+  shouldStartLiveResearchPreview,
   spectrumBandLevel,
 } from "./live-vad";
 
-function frames(levels: number[], options: { ttsActive: boolean; quietUntil?: number; highFrequencyLevel?: number }) {
+function frames(levels: number[], options: {
+  ttsActive: boolean;
+  quietUntil?: number;
+  highFrequencyLevel?: number;
+  aecEnabled?: boolean;
+}) {
   const startedAt = 1_000;
   let state = createLiveVadState(startedAt);
-  let barged = false;
+  let bargeCount = 0;
   levels.forEach((level, index) => {
     const result = advanceLiveVad(state, {
       level,
       voiceLevel: level,
       highFrequencyLevel: options.highFrequencyLevel,
-      now: startedAt + index * 90,
+      now: startedAt + index * LIVE_BARGE_SAMPLE_MS,
       startedAt,
       ttsActive: options.ttsActive,
       quietUntil: options.quietUntil ?? 0,
+      aecEnabled: options.aecEnabled,
     });
     state = result.state;
-    barged ||= result.bargeIn;
+    if (result.bargeIn) bargeCount += 1;
   });
-  return { state, barged };
+  return { state, barged: bargeCount > 0, bargeCount };
 }
 
 describe("live full-duplex voice gate", () => {
@@ -40,15 +53,55 @@ describe("live full-duplex voice gate", () => {
   });
 
   it("never treats ordinary speaker leakage as user speech", () => {
-    const result = frames(Array(20).fill(35), { ttsActive: true });
+    const result = frames(Array(20).fill(35), {
+      ttsActive: true,
+      aecEnabled: true,
+      highFrequencyLevel: 8,
+    });
+    expect(result.state.spoke).toBe(false);
+    expect(result.barged).toBe(false);
+    expect(result.state.speakerLeakFloor).toBeCloseTo(35);
+  });
+
+  it("calibrates a changing speaker baseline and rejects short loud passages", () => {
+    const result = frames([
+      22, 24, 28, 30, 32, 34,
+      55, 55, 55, 55,
+      33, 32,
+      56, 56, 56, 56,
+      31,
+    ], { ttsActive: true, aecEnabled: true, highFrequencyLevel: 8 });
     expect(result.state.spoke).toBe(false);
     expect(result.barged).toBe(false);
   });
 
-  it("never accepts loud speaker output as a barge-in", () => {
-    const result = frames(Array(5).fill(70), { ttsActive: true });
+  it("emits one conservative barge candidate after calibration and sustained speech", () => {
+    const result = frames([
+      ...Array(LIVE_BARGE_CALIBRATION_FRAMES).fill(24),
+      ...Array(LIVE_BARGE_SPEECH_FRAMES + 4).fill(62),
+    ], { ttsActive: true, aecEnabled: true, highFrequencyLevel: 8 });
     expect(result.state.spoke).toBe(false);
+    expect(result.barged).toBe(true);
+    expect(result.bargeCount).toBe(1);
+    expect(result.state.bargeFrames).toBe(LIVE_BARGE_SPEECH_FRAMES + 4);
+  });
+
+  it("does not emit a barge candidate without confirmed browser AEC", () => {
+    const speechOverOutput = [
+      ...Array(LIVE_BARGE_CALIBRATION_FRAMES).fill(24),
+      ...Array(12).fill(70),
+    ];
+    expect(frames(speechOverOutput, { ttsActive: true, highFrequencyLevel: 8 }).barged).toBe(false);
+    expect(frames(speechOverOutput, { ttsActive: true, aecEnabled: false, highFrequencyLevel: 8 }).barged).toBe(false);
+  });
+
+  it("rejects broadband noise over TTS even when it is sustained and loud", () => {
+    const result = frames([
+      ...Array(LIVE_BARGE_CALIBRATION_FRAMES).fill(24),
+      ...Array(12).fill(70),
+    ], { ttsActive: true, aecEnabled: true, highFrequencyLevel: 68 });
     expect(result.barged).toBe(false);
+    expect(result.state.spoke).toBe(false);
   });
 
   it("rejects the speaker tail after TTS ends", () => {
@@ -85,6 +138,39 @@ describe("live full-duplex voice gate", () => {
     expect(shouldCloseLiveUtterance(state, state.lastVoice + LIVE_END_SILENCE_MS + 1)).toBe(true);
   });
 
+  it("shortens endpointing only for a clear complete question", () => {
+    const state = { ...createLiveVadState(1_000), spoke: true, lastVoice: 2_000 };
+    const question = "How does Sesame train its voice agent?";
+    expect(liveEndpointSilenceMs(question)).toBe(LIVE_COMPLETE_QUESTION_END_SILENCE_MS);
+    expect(shouldCloseLiveUtterance(state, 2_000 + LIVE_COMPLETE_QUESTION_END_SILENCE_MS, question)).toBe(false);
+    expect(shouldCloseLiveUtterance(state, 2_000 + LIVE_COMPLETE_QUESTION_END_SILENCE_MS + 1, question)).toBe(true);
+
+    const statement = "I want to understand how its voice agent works";
+    expect(liveEndpointSilenceMs(statement)).toBe(LIVE_END_SILENCE_MS);
+    expect(shouldCloseLiveUtterance(state, 2_000 + LIVE_COMPLETE_QUESTION_END_SILENCE_MS + 1, statement)).toBe(false);
+  });
+
+  it("extends endpointing for an unfinished connective and a self-correction", () => {
+    const state = { ...createLiveVadState(1_000), spoke: true, lastVoice: 2_000 };
+    for (const partial of [
+      "How does Sesame train its agent and",
+      "Compare the voice architecture with",
+      "Research the voice model, I mean",
+      "Explain their approach —",
+    ]) {
+      expect(liveEndpointSilenceMs(partial)).toBe(LIVE_UNFINISHED_END_SILENCE_MS);
+      expect(shouldCloseLiveUtterance(state, 2_000 + LIVE_END_SILENCE_MS + 200, partial)).toBe(false);
+      expect(shouldCloseLiveUtterance(state, 2_000 + LIVE_UNFINISHED_END_SILENCE_MS + 1, partial)).toBe(true);
+    }
+  });
+
+  it("keeps a natural unpunctuated pause on the proven default boundary", () => {
+    const partial = "I have been thinking about their voice architecture";
+    expect(liveEndpointSilenceMs(partial)).toBe(LIVE_END_SILENCE_MS);
+    const state = { ...createLiveVadState(1_000), spoke: true, lastVoice: 2_000 };
+    expect(shouldCloseLiveUtterance(state, 3_100, partial)).toBe(false);
+  });
+
   it("prefetches STT once during silence without closing a natural pause", () => {
     const state = { ...createLiveVadState(1_000), spoke: true, lastVoice: 2_000 };
     expect(shouldPrefetchLiveTranscript(state, 2_000 + LIVE_STT_PREFETCH_SILENCE_MS - 1, -1)).toBe(false);
@@ -100,5 +186,45 @@ describe("live full-duplex voice gate", () => {
     spectrum.fill(10, 48, 107);
     expect(spectrumBandLevel(spectrum, 48_000, 90, 3_800)).toBeGreaterThan(35);
     expect(spectrumBandLevel(spectrum, 48_000, 4_500, 10_000)).toBeLessThan(15);
+  });
+});
+
+describe("live research preview admission", () => {
+  const stable = {
+    authoritativePartialTranscript: "Research how Sesame builds agent intelligence for natural voice",
+    previousAuthoritativePartialTranscript: "Research how Sesame builds agent intelligence",
+    alreadyStarted: false,
+  };
+
+  it("admits one read-only preview after two stable authoritative revisions", () => {
+    expect(shouldStartLiveResearchPreview(stable)).toBe(true);
+    expect(shouldStartLiveResearchPreview({ ...stable, alreadyStarted: true })).toBe(false);
+  });
+
+  it("rejects unstable topics and self-corrections", () => {
+    expect(shouldStartLiveResearchPreview({
+      ...stable,
+      authoritativePartialTranscript: "Research how Perplexity builds agent intelligence for natural voice",
+    })).toBe(false);
+    expect(shouldStartLiveResearchPreview({
+      ...stable,
+      authoritativePartialTranscript: "Research how Sesame builds agent intelligence, no wait",
+    })).toBe(false);
+    expect(shouldStartLiveResearchPreview({
+      ...stable,
+      previousAuthoritativePartialTranscript: "Research how Sesame builds agent intelligence for natural voice",
+      authoritativePartialTranscript: "Research how Sesame builds agent intelligence for expressive video",
+    })).toBe(false);
+  });
+
+  it("rejects mutating requests and insufficient partial evidence", () => {
+    expect(shouldStartLiveResearchPreview({
+      ...stable,
+      authoritativePartialTranscript: "Research how Sesame works and then deploy the change",
+    })).toBe(false);
+    expect(shouldStartLiveResearchPreview({
+      ...stable,
+      authoritativePartialTranscript: "Research Sesame voice",
+    })).toBe(false);
   });
 });

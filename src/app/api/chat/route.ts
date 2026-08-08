@@ -3,6 +3,9 @@ import { tasks } from "@trigger.dev/sdk/v3";
 import { convexMutation, convexQuery, reportIncident } from "@/lib/context";
 import { actorAdminHash, controlActor, controlCredentials, type ControlActor } from "@/lib/request-auth";
 import { CHAT_FILE_LIMITS } from "@/lib/chat-files";
+import { visibleTurnText } from "@/lib/host-context";
+import { promoteSpeculativeResearchReceipt } from "@/lib/speculative-research-receipt.server";
+import { SPECULATIVE_RESEARCH_LIMITS } from "@/lib/speculative-research";
 
 // Conversation transport only. The durable answer is produced by a trusted
 // Trigger worker running Codex with Daniel's subscription; neither the browser
@@ -26,11 +29,19 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
   let threadId = "main";
   let requestId = "";
   let fileIds: string[] = [];
+  let researchReceipt: unknown;
   try {
     const body = await req.json();
     text = String(body?.text ?? "").trim();
     threadId = String(body?.threadId ?? "main").trim() || "main";
     requestId = String(body?.requestId ?? "").trim().slice(0, 120);
+    researchReceipt = body?.researchReceipt;
+    if (
+      researchReceipt !== undefined &&
+      (typeof researchReceipt !== "string" || researchReceipt.length > SPECULATIVE_RESEARCH_LIMITS.receiptChars)
+    ) {
+      return Response.json({ error: "invalid research receipt" }, { status: 400 });
+    }
     if (body?.fileIds !== undefined && !Array.isArray(body.fileIds)) {
       return Response.json({ error: "invalid file selection" }, { status: 400 });
     }
@@ -42,8 +53,20 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
     return Response.json({ error: "invalid file selection" }, { status: 400 });
   }
   if (actor.kind === "guest" && fileIds.length) return Response.json({ error: "private files require owner access" }, { status: 403 });
+  if (actor.kind === "guest" && researchReceipt) return Response.json({ error: "private research requires owner access" }, { status: 403 });
   if (!text && !fileIds.length) return Response.json({ error: "empty" }, { status: 400 });
   if (!text) text = "Please analyze the attached files.";
+
+  const adminHash = actorAdminHash(actor);
+  const researchPrefetch = researchReceipt && adminHash && requestId
+    ? promoteSpeculativeResearchReceipt(
+        researchReceipt,
+        adminHash,
+        threadId,
+        requestId,
+        visibleTurnText(text),
+      )
+    : null;
 
   const credentials = actor.kind === "guest" ? { guestId: actor.guestId } : controlCredentials(actor);
   let messageId: unknown;
@@ -53,6 +76,7 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
       text: text.slice(0, actor.kind === "guest" ? 2_000 : 12_000),
       requestId: requestId || undefined,
       fileIds: fileIds.length ? fileIds : undefined,
+      researchPrefetch: researchPrefetch ?? undefined,
       ...credentials,
     });
   } catch (error) {
@@ -91,6 +115,7 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
     queued: true,
     messageId: String(messageId),
     immediate: Boolean(warm || handle),
+    researchPrefetchAccepted: Boolean(researchPrefetch),
     model: "codex-adaptive",
   });
 }

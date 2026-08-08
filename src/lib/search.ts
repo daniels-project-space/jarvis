@@ -1,5 +1,4 @@
 import "server-only";
-import { getSecret, getServiceSecrets } from "./vault";
 
 // Unified search layer. Primary provider is Serper.dev (google.serper.dev) —
 // 2,500 free credits on signup then ~$0.30–1.00 / 1,000 searches, roughly an
@@ -9,8 +8,15 @@ import { getSecret, getServiceSecrets } from "./vault";
 // Add the key to the vault as service "serper", key SERPER_API_KEY, and every
 // call site below switches over with zero further changes.
 
-type WebResult = { title: string; link: string; snippet: string };
-type WebOut = { answer?: string; results: WebResult[] } | null;
+export type WebResult = { title: string; link: string; snippet: string };
+export type WebOut = { answer?: string; results: WebResult[] } | null;
+export type SearchWebOptions = Readonly<{
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  providerOrder?: "paid-first" | "keyless-first";
+  maxPaidAttempts?: 0 | 1 | 2;
+  cacheTtlMs?: number;
+}>;
 export type ShopResult = {
   title: string;
   price: string;
@@ -34,31 +40,58 @@ function priceNum(p: any): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-async function serperKey(): Promise<string> {
-  return process.env.SERPER_API_KEY ?? (await getServiceSecrets("serper").then((s) => s.SERPER_API_KEY ?? "").catch(() => ""));
+async function vaultServiceSecrets(service: string): Promise<Record<string, string>> {
+  const { getServiceSecrets } = await import("./vault");
+  return await getServiceSecrets(service);
 }
-async function serper(path: string, body: Record<string, unknown>): Promise<any | null> {
-  const key = await serperKey();
-  if (!key) return null;
+
+async function vaultSecret(service: string, key: string): Promise<string> {
+  const { getSecret } = await import("./vault");
+  return await getSecret(service, key);
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new DOMException("The operation was aborted", "AbortError");
+}
+
+function providerSignal(parent: AbortSignal, timeoutMs: number): AbortSignal {
+  return AbortSignal.any([parent, AbortSignal.timeout(timeoutMs)]);
+}
+
+async function serperKey(): Promise<string> {
+  return process.env.SERPER_API_KEY ?? (await vaultServiceSecrets("serper").then((s) => s.SERPER_API_KEY ?? "").catch(() => ""));
+}
+async function serper(path: string, body: Record<string, unknown>, parentSignal = new AbortController().signal): Promise<any | null> {
+  const signal = providerSignal(parentSignal, 10_000);
   try {
+    throwIfAborted(signal);
+    const key = await serperKey();
+    throwIfAborted(signal);
+    if (!key) return null;
     const r = await fetch(`https://google.serper.dev/${path}`, {
       method: "POST",
       headers: { "X-API-KEY": key, "content-type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(10000),
+      signal,
     });
     if (!r.ok) return null;
     return await r.json();
   } catch {
+    throwIfAborted(parentSignal);
     return null;
   }
 }
-async function serpapi(params: Record<string, string>): Promise<any | null> {
-  const key = process.env.SERPAPI_KEY ?? (await getSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
-  if (!key) return null;
+async function serpapi(params: Record<string, string>, parentSignal = new AbortController().signal): Promise<any | null> {
+  const signal = providerSignal(parentSignal, 10_000);
   try {
+    throwIfAborted(signal);
+    const key = process.env.SERPAPI_KEY ?? (await vaultSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
+    throwIfAborted(signal);
+    if (!key) return null;
     const qs = new URLSearchParams({ ...params, api_key: key });
-    const r = await fetch(`https://serpapi.com/search.json?${qs}`, { signal: AbortSignal.timeout(10000) });
+    const r = await fetch(`https://serpapi.com/search.json?${qs}`, { signal });
     if (!r.ok) return null;
     const j = await r.json();
     // SerpAPI signals "out of searches" / other faults as a 200 with an error
@@ -67,30 +100,156 @@ async function serpapi(params: Record<string, string>): Promise<any | null> {
     if (j?.error) return null;
     return j;
   } catch {
+    throwIfAborted(parentSignal);
     return null;
   }
 }
 
 // ---- web ----
-export async function searchWeb(query: string, num = 8, gl = "us"): Promise<WebOut> {
-  const s = await serper("search", { q: query, num, gl: gl === "uk" ? "gb" : gl });
-  if (s?.organic) {
-    return {
-      answer: s.answerBox?.answer ?? s.answerBox?.snippet ?? s.knowledgeGraph?.description,
-      results: (s.organic as any[]).slice(0, num).map((r) => ({ title: String(r.title ?? ""), link: String(r.link ?? ""), snippet: String(r.snippet ?? "") })),
-    };
-  }
-  const j = await serpapi({ engine: "google", q: query, num: String(num) });
-  const organic = (j?.organic_results ?? []).slice(0, num);
+const WEB_SEARCH_CACHE_MAX = 64;
+const WEB_SEARCH_CACHE_TTL_MS = 45_000;
+const webSearchCache = new Map<string, { value: Exclude<WebOut, null>; expiresAt: number }>();
+type InflightWebSearch = {
+  controller: AbortController;
+  promise: Promise<WebOut>;
+  consumers: number;
+  settled: boolean;
+};
+const inflightWebSearches = new Map<string, InflightWebSearch>();
+
+function cloneWebOut(value: WebOut): WebOut {
+  return value ? { answer: value.answer, results: value.results.map((result) => ({ ...result })) } : null;
+}
+
+function providerRecord(value: unknown): Record<string, unknown> | null {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function providerText(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function webResult(value: unknown): WebResult {
+  const row = providerRecord(value) ?? {};
+  return { title: String(row.title ?? ""), link: String(row.link ?? ""), snippet: String(row.snippet ?? "") };
+}
+
+function webResultsFromSerper(value: unknown, num: number): WebOut {
+  const s = providerRecord(value);
+  const organic = Array.isArray(s?.organic) ? s.organic : [];
   if (organic.length) {
+    const answerBox = providerRecord(s?.answerBox);
+    const knowledgeGraph = providerRecord(s?.knowledgeGraph);
     return {
-      answer: j.answer_box?.answer ?? j.answer_box?.snippet,
-      results: organic.map((r: any) => ({ title: String(r.title ?? ""), link: String(r.link ?? ""), snippet: String(r.snippet ?? "") })),
+      answer: providerText(answerBox?.answer) ?? providerText(answerBox?.snippet) ?? providerText(knowledgeGraph?.description),
+      results: organic.slice(0, num).map(webResult),
     };
   }
-  // Last resort: keyless DuckDuckGo HTML scrape — keeps general search alive
-  // with no provider/quota at all (shopping/news still need a real provider).
-  return await ddgHtml(query, num);
+  return null;
+}
+
+function webResultsFromSerpApi(value: unknown, num: number): WebOut {
+  const j = providerRecord(value);
+  const organic = (Array.isArray(j?.organic_results) ? j.organic_results : []).slice(0, num);
+  if (organic.length) {
+    const answerBox = providerRecord(j?.answer_box);
+    return {
+      answer: providerText(answerBox?.answer) ?? providerText(answerBox?.snippet),
+      results: organic.map(webResult),
+    };
+  }
+  return null;
+}
+
+async function runWebSearch(query: string, num: number, gl: string, order: "paid-first" | "keyless-first", maxPaidAttempts: number, signal: AbortSignal): Promise<WebOut> {
+  const keyless = () => ddgHtml(query, num, signal);
+  const serperSearch = async () => webResultsFromSerper(await serper("search", { q: query, num, gl: gl === "uk" ? "gb" : gl }, signal), num);
+  const serpApiSearch = async () => webResultsFromSerpApi(await serpapi({ engine: "google", q: query, num: String(num) }, signal), num);
+  const paid = [serperSearch, serpApiSearch].slice(0, maxPaidAttempts);
+  const providers = order === "keyless-first" ? [keyless, ...paid] : [...paid, keyless];
+  for (const provider of providers) {
+    throwIfAborted(signal);
+    const result = await provider();
+    if (result?.results.length) return result;
+  }
+  return null;
+}
+
+function pruneWebSearchCache(now: number): void {
+  for (const [key, entry] of webSearchCache) {
+    if (entry.expiresAt <= now) webSearchCache.delete(key);
+  }
+  while (webSearchCache.size >= WEB_SEARCH_CACHE_MAX) {
+    const oldest = webSearchCache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    webSearchCache.delete(oldest);
+  }
+}
+
+function callerSignal(parent: AbortSignal | undefined, timeoutMs: number | undefined): AbortSignal | undefined {
+  const boundedTimeout = Number.isFinite(timeoutMs) ? Math.max(1, Math.min(30_000, Math.floor(timeoutMs!))) : undefined;
+  if (parent && boundedTimeout) return AbortSignal.any([parent, AbortSignal.timeout(boundedTimeout)]);
+  if (parent) return parent;
+  return boundedTimeout ? AbortSignal.timeout(boundedTimeout) : undefined;
+}
+
+function awaitInflight(entry: InflightWebSearch, signal?: AbortSignal): Promise<WebOut> {
+  if (signal?.aborted) {
+    if (signal.reason instanceof Error) return Promise.reject(signal.reason);
+    return Promise.reject(new DOMException("The operation was aborted", "AbortError"));
+  }
+  entry.consumers += 1;
+  return new Promise<WebOut>((resolve, reject) => {
+    let finished = false;
+    const finish = (callback: () => void) => {
+      if (finished) return;
+      finished = true;
+      signal?.removeEventListener("abort", onAbort);
+      entry.consumers = Math.max(0, entry.consumers - 1);
+      callback();
+      if (entry.consumers === 0 && !entry.settled) entry.controller.abort(new DOMException("No active search consumers", "AbortError"));
+    };
+    const onAbort = () => finish(() => reject(signal?.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted", "AbortError")));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    entry.promise.then(
+      (value) => finish(() => resolve(cloneWebOut(value))),
+      (error) => finish(() => reject(error)),
+    );
+  });
+}
+
+export async function searchWeb(query: string, num = 8, gl = "us", options: SearchWebOptions = {}): Promise<WebOut> {
+  const normalizedQuery = String(query).replace(/\s+/g, " ").trim();
+  if (!normalizedQuery) return null;
+  const resultCount = Number.isFinite(num) ? Math.max(1, Math.min(12, Math.floor(num))) : 8;
+  const order = options.providerOrder === "keyless-first" ? "keyless-first" : "paid-first";
+  const maxPaidAttempts = options.maxPaidAttempts === 0 || options.maxPaidAttempts === 1 ? options.maxPaidAttempts : 2;
+  const ttl = Number.isFinite(options.cacheTtlMs) ? Math.max(0, Math.min(60_000, Math.floor(options.cacheTtlMs!))) : WEB_SEARCH_CACHE_TTL_MS;
+  const signal = callerSignal(options.signal, options.timeoutMs);
+  if (signal?.aborted) throwIfAborted(signal);
+  const cacheKey = `${order}|${maxPaidAttempts}|${ttl}|${resultCount}|${gl.toLocaleLowerCase("en-US")}|${normalizedQuery.toLocaleLowerCase("en-US")}`;
+  const now = Date.now();
+  pruneWebSearchCache(now);
+  const cached = webSearchCache.get(cacheKey);
+  if (cached?.expiresAt && cached.expiresAt > now) return cloneWebOut(cached.value);
+
+  let entry = inflightWebSearches.get(cacheKey);
+  if (!entry) {
+    const controller = new AbortController();
+    entry = { controller, consumers: 0, settled: false, promise: Promise.resolve(null) };
+    const activeEntry = entry;
+    activeEntry.promise = runWebSearch(normalizedQuery, resultCount, gl, order, maxPaidAttempts, controller.signal)
+      .then((value) => {
+        if (value && ttl > 0) webSearchCache.set(cacheKey, { value: cloneWebOut(value)!, expiresAt: Date.now() + ttl });
+        return value;
+      })
+      .finally(() => {
+        activeEntry.settled = true;
+        if (inflightWebSearches.get(cacheKey) === activeEntry) inflightWebSearches.delete(cacheKey);
+      });
+    inflightWebSearches.set(cacheKey, activeEntry);
+  }
+  return await awaitInflight(entry, signal);
 }
 
 // Keyless web search that works from serverless: DuckDuckGo blocks datacenter
@@ -98,14 +257,54 @@ export async function searchWeb(query: string, num = 8, gl = "us"): Promise<WebO
 // fetches from its own infra, unblocked, and returns markdown). We parse the
 // "## [title](ddg-redirect)" result headings and decode the real target,
 // skipping sponsored (Bing/y.js) links.
-async function ddgHtml(query: string, num: number): Promise<WebOut> {
+async function boundedResponseText(response: Response, maxBytes: number, signal: AbortSignal): Promise<string | null> {
+  const declared = Number(response.headers.get("content-length") ?? 0);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await response.body?.cancel().catch(() => undefined);
+    return null;
+  }
+  if (!response.body) {
+    const text = await response.text();
+    return new TextEncoder().encode(text).byteLength <= maxBytes ? text : null;
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
   try {
+    while (true) {
+      throwIfAborted(signal);
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
+}
+
+async function ddgHtml(query: string, num: number, parentSignal = new AbortController().signal): Promise<WebOut> {
+  const signal = providerSignal(parentSignal, 15_000);
+  try {
+    throwIfAborted(signal);
     const r = await fetch(`https://r.jina.ai/https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
       headers: { "user-agent": "Mozilla/5.0", "x-return-format": "markdown", "accept-language": "en" },
-      signal: AbortSignal.timeout(15000),
+      signal,
     });
     if (!r.ok) return null;
-    const md = await r.text();
+    const md = await boundedResponseText(r, 512_000, signal);
+    if (!md) return null;
     const results: WebResult[] = [];
     const seen = new Set<string>();
     const re = /#{2,3}\s+\[([^\]]+)\]\((https:\/\/duckduckgo\.com\/l\/\?uddg=[^)\s]+)\)/g;
@@ -134,6 +333,7 @@ async function ddgHtml(query: string, num: number): Promise<WebOut> {
     }
     return results.length ? { results } : null;
   } catch {
+    throwIfAborted(parentSignal);
     return null;
   }
 }
@@ -144,7 +344,7 @@ async function ddgHtml(query: string, num: number): Promise<WebOut> {
 let ebayTok: { value: string; until: number } | null = null;
 async function ebayToken(): Promise<string> {
   if (ebayTok && ebayTok.until > Date.now()) return ebayTok.value;
-  const c = await getServiceSecrets("ebay").catch(() => ({}) as Record<string, string>);
+  const c = await vaultServiceSecrets("ebay").catch(() => ({}) as Record<string, string>);
   const id = c.EBAY_CLIENT_ID ?? process.env.EBAY_CLIENT_ID;
   const secret = c.EBAY_CLIENT_SECRET ?? process.env.EBAY_CLIENT_SECRET;
   if (!id || !secret) return "";
@@ -467,7 +667,7 @@ async function ytJinaScrape(query: string): Promise<VideoResult[]> {
 // report "kelkoo" as that floor rather than "none" — search is never offline.
 export async function activeSearchProvider(): Promise<"serper" | "serpapi" | "kelkoo" | "none"> {
   if (await serperKey()) return "serper";
-  const serp = process.env.SERPAPI_KEY ?? (await getSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
+  const serp = process.env.SERPAPI_KEY ?? (await vaultSecret("serpapi", "SERPAPI_KEY").catch(() => ""));
   if (serp) return "serpapi";
   return "kelkoo";
 }

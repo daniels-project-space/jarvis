@@ -147,6 +147,22 @@ export default defineSchema({
     .index("by_parent", ["parentMessageId", "createdAt"])
     .index("by_request", ["requestId"]),
 
+  // Short-lived, non-reactive evidence gathered while an owner is still
+  // speaking. Keeping this beside (rather than on) chatMessages prevents a
+  // few KB of search context from being resent to every browser on each
+  // 350 ms assistant-stream update. It is read only by the claimed worker and
+  // deleted on every terminal turn path.
+  chatTurnPrefetches: defineTable({
+    messageId: v.id("chatMessages"),
+    threadId: v.string(),
+    basis: v.string(),
+    context: v.string(),
+    expiresAt: v.number(),
+    createdAt: v.number(),
+  })
+    .index("by_message", ["messageId"])
+    .index("by_thread", ["threadId"]),
+
   chatSessions: defineTable({
     threadId: v.string(),
     status: v.string(), // "idle" | "working"

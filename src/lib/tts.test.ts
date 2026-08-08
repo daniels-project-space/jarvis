@@ -101,6 +101,7 @@ describe("single Edge neural speech queue", () => {
     const chunks = sentences(input);
     expect(Math.max(...chunks.map((chunk) => chunk.length))).toBeLessThanOrEqual(240);
     expect(chunks.length).toBeLessThanOrEqual(2);
+    expect(chunks[0].length).toBeLessThanOrEqual(120);
     expect(chunks.join(" ")).toBe(normalizeSpeechText(input));
   });
 

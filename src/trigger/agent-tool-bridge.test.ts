@@ -13,12 +13,14 @@ function dynamicCall(
   tool: string,
   args: unknown,
   invocationContext?: CodexDynamicToolCall["invocationContext"],
+  signal?: AbortSignal,
 ): CodexDynamicToolCall {
   return {
     threadId: "thread-1",
     turnId: "turn-1",
     callId: "call-1",
     ...(invocationContext ? { invocationContext } : {}),
+    ...(signal ? { signal } : {}),
     namespace: null,
     tool,
     arguments: args,
@@ -145,6 +147,68 @@ describe("foreground agent tool bridge", () => {
         invocationContext,
       },
     ]);
+  });
+
+  it("propagates turn cancellation into HTTP fetch and rejects a late response", async () => {
+    let resolveFetch!: (response: Response) => void;
+    let forwardedSignal: AbortSignal | undefined;
+    const fetchImplementation = vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+      forwardedSignal = init?.signal ?? undefined;
+      return new Promise<Response>((resolve) => { resolveFetch = resolve; });
+    });
+    const bridge = new AgentToolBridge("dispatch-token", {
+      endpoint: "https://jarvis.test/api/agent-tool",
+      fetchImplementation,
+      timeoutMs: 10_000,
+    });
+    const abort = new AbortController();
+    const pending = bridge.invoke(dynamicCall(
+      "jarvis_get_tools",
+      { belt: "core" },
+      undefined,
+      abort.signal,
+    ));
+    await vi.waitFor(() => expect(fetchImplementation).toHaveBeenCalledTimes(1));
+
+    abort.abort();
+    const response = await pending;
+    expect(forwardedSignal?.aborted).toBe(true);
+    expect(response.success).toBe(false);
+    expect(response.contentItems[0]).toMatchObject({
+      type: "inputText",
+      text: expect.stringContaining("cancelled"),
+    });
+
+    resolveFetch(Response.json({ result: "late" }));
+    await Promise.resolve();
+    expect(response.success).toBe(false);
+  });
+
+  it("passes the turn signal to attached-file search and fences its late result", async () => {
+    let resolveSearch!: (value: unknown) => void;
+    let forwardedSignal: AbortSignal | undefined;
+    const searchAttachedFiles = vi.fn((_messageId: string, request: { signal?: AbortSignal }) => {
+      forwardedSignal = request.signal;
+      return new Promise<unknown>((resolve) => { resolveSearch = resolve; });
+    });
+    const bridge = new AgentToolBridge("dispatch-token", { searchAttachedFiles });
+    const abort = new AbortController();
+    const pending = bridge.invoke(dynamicCall(
+      "jarvis_search_attached_files",
+      { mode: "search", query: "invoice" },
+      { requestId: "request-search", userMessageId: "message-search" },
+      abort.signal,
+    ));
+    await vi.waitFor(() => expect(searchAttachedFiles).toHaveBeenCalledTimes(1));
+
+    abort.abort();
+    const response = await pending;
+    expect(forwardedSignal).toBe(abort.signal);
+    expect(forwardedSignal?.aborted).toBe(true);
+    expect(response.success).toBe(false);
+    resolveSearch([{ fileId: "late-file" }]);
+    await Promise.resolve();
+    expect(response.success).toBe(false);
   });
 
   it("scopes local file search to the trusted invoking message", async () => {

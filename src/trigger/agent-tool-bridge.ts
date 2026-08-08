@@ -81,6 +81,7 @@ type AgentToolBridgeOptions = {
     query?: string;
     fileId?: string;
     afterOrdinal?: number;
+    signal?: AbortSignal;
   }) => Promise<unknown>;
   authorizeTool?: (messageId: string, toolName: string) => Promise<{ allowed: boolean; reason?: string }>;
 };
@@ -93,6 +94,28 @@ function record(value: unknown): Record<string, unknown> | null {
 
 function result(text: string, success: boolean): CodexDynamicToolResult {
   return { contentItems: [{ type: "inputText", text }], success };
+}
+
+function cancelledResult(): CodexDynamicToolResult {
+  return result("Jarvis tool bridge request was cancelled with its turn.", false);
+}
+
+function abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return operation;
+  if (signal.aborted) return Promise.reject(new Error("turn cancelled"));
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      cleanup();
+      reject(new Error("turn cancelled"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => { cleanup(); resolve(value); },
+      (error) => { cleanup(); reject(error); },
+    );
+    if (signal.aborted) onAbort();
+  });
 }
 
 // Authentication stays in this Node host. The Codex child sees only two
@@ -114,18 +137,22 @@ export class AgentToolBridge {
   }
 
   async invoke(call: CodexDynamicToolCall): Promise<CodexDynamicToolResult> {
+    if (call.signal?.aborted) return cancelledResult();
     if (call.namespace !== null) return result("Unknown Jarvis tool namespace.", false);
     if (call.tool === "jarvis_search_attached_files") {
-      return this.searchFiles(call.arguments, call.invocationContext);
+      return this.searchFiles(call.arguments, call.invocationContext, call.signal);
     }
-    if (call.tool === "jarvis_get_tools") return this.getTools(call.arguments);
-    if (call.tool === "jarvis_call_tool") return this.callTool(call.arguments, call.invocationContext);
+    if (call.tool === "jarvis_get_tools") return this.getTools(call.arguments, call.signal);
+    if (call.tool === "jarvis_call_tool") {
+      return this.callTool(call.arguments, call.invocationContext, call.signal);
+    }
     return result("Unknown Jarvis bridge tool.", false);
   }
 
   private async searchFiles(
     value: unknown,
     invocationContext?: ToolInvocationContext,
+    signal?: AbortSignal,
   ): Promise<CodexDynamicToolResult> {
     const args = record(value);
     const mode = args?.mode === "read" ? "read" : args?.mode === "search" ? "search" : null;
@@ -138,20 +165,25 @@ export class AgentToolBridge {
     if (!mode || (mode === "search" && !query) || (mode === "read" && !fileId) || !messageId || !this.searchAttachedFiles) {
       return result("Attached-file search is unavailable for this turn.", false);
     }
+    if (signal?.aborted) return cancelledResult();
     try {
-      const found = await this.searchAttachedFiles(messageId, {
+      const found = await abortable(this.searchAttachedFiles(messageId, {
         mode,
         ...(query ? { query } : {}),
         ...(fileId ? { fileId } : {}),
         ...(afterOrdinal !== undefined ? { afterOrdinal } : {}),
-      });
+        ...(signal ? { signal } : {}),
+      }), signal);
+      if (signal?.aborted) return cancelledResult();
       return result(JSON.stringify(found).slice(0, 16_000) || "[]", true);
     } catch {
-      return result("Attached-file search failed safely.", false);
+      return signal?.aborted
+        ? cancelledResult()
+        : result("Attached-file search failed safely.", false);
     }
   }
 
-  private async getTools(value: unknown): Promise<CodexDynamicToolResult> {
+  private async getTools(value: unknown, signal?: AbortSignal): Promise<CodexDynamicToolResult> {
     const args = record(value);
     const belt = args?.belt;
     if (typeof belt !== "string" || !TOOL_BELTS.includes(belt as (typeof TOOL_BELTS)[number])) {
@@ -159,12 +191,13 @@ export class AgentToolBridge {
     }
     const url = new URL(this.endpoint);
     url.searchParams.set("belt", belt);
-    return this.request(url, { method: "GET" });
+    return this.request(url, { method: "GET" }, signal);
   }
 
   private async callTool(
     value: unknown,
     invocationContext?: ToolInvocationContext,
+    signal?: AbortSignal,
   ): Promise<CodexDynamicToolResult> {
     const input = record(value);
     const name = input?.name;
@@ -173,15 +206,18 @@ export class AgentToolBridge {
       return result("Invalid Jarvis tool call.", false);
     }
     const toolName = name.trim();
+    if (signal?.aborted) return cancelledResult();
     if (this.authorizeTool) {
       const messageId = invocationContext?.userMessageId;
       if (!messageId) return result("This tool call has no trusted user-message provenance.", false);
       try {
-        const authorization = await this.authorizeTool(messageId, toolName);
+        const authorization = await abortable(this.authorizeTool(messageId, toolName), signal);
+        if (signal?.aborted) return cancelledResult();
         if (!authorization.allowed) {
           return result("The original user message did not authorize this action.", false);
         }
       } catch {
+        if (signal?.aborted) return cancelledResult();
         return result("Jarvis could not verify tool authorization, so the action was not run.", false);
       }
     }
@@ -192,38 +228,55 @@ export class AgentToolBridge {
         args,
         ...(invocationContext ? { invocationContext } : {}),
       }),
-    });
+    }, signal);
   }
 
-  private async request(url: URL, init: { method: "GET" | "POST"; body?: string }): Promise<CodexDynamicToolResult> {
+  private async request(
+    url: URL,
+    init: { method: "GET" | "POST"; body?: string },
+    turnSignal?: AbortSignal,
+  ): Promise<CodexDynamicToolResult> {
+    if (turnSignal?.aborted) return cancelledResult();
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    let timedOut = false;
+    const abortFromTurn = () => controller.abort();
+    turnSignal?.addEventListener("abort", abortFromTurn, { once: true });
+    if (turnSignal?.aborted) abortFromTurn();
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, this.timeoutMs);
     try {
       const headers: Record<string, string> = {
         accept: "application/json",
         authorization: `Bearer ${this.token}`,
       };
       if (init.body !== undefined) headers["content-type"] = "application/json";
-      const response = await this.fetchImplementation(url, {
+      const response = await abortable(this.fetchImplementation(url, {
         ...init,
         headers,
         signal: controller.signal,
-      });
+      }), controller.signal);
+      if (turnSignal?.aborted) return cancelledResult();
       if (!response.ok) {
         // Never reflect an error body: a proxy must not echo authorization
         // material into the model transcript.
         return result(`Jarvis tool bridge rejected the request (HTTP ${response.status}).`, false);
       }
-      return result((await response.text()) || "null", true);
+      const text = await abortable(response.text(), controller.signal);
+      if (turnSignal?.aborted) return cancelledResult();
+      return result(text || "null", true);
     } catch {
+      if (turnSignal?.aborted) return cancelledResult();
       return result(
-        controller.signal.aborted
+        timedOut
           ? "Jarvis tool bridge request timed out."
           : "Jarvis tool bridge network request failed.",
         false,
       );
     } finally {
       clearTimeout(timeout);
+      turnSignal?.removeEventListener("abort", abortFromTurn);
     }
   }
 }

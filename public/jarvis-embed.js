@@ -122,8 +122,10 @@
     var phaseColors = {
       connecting: "#fbbf24",
       listening: "#34d399",
+      researching: "#38bdf8",
       thinking: "#fbbf24",
       responding: "#67e8f9",
+      buffering: "#c084fc",
       speaking: "#a78bfa",
     };
     var activeColor = phaseColors[framePhase] || "#67e8f9";
@@ -849,7 +851,7 @@
       readyProbeTimer = null;
       paintUniversalControls();
     } else if (data.jarvis === "status") {
-      var allowedPhases = ["online", "connecting", "listening", "thinking", "responding", "speaking"];
+      var allowedPhases = ["online", "connecting", "listening", "researching", "thinking", "responding", "buffering", "speaking"];
       var nextPhase = typeof data.phase === "string" && allowedPhases.indexOf(data.phase) !== -1
         ? data.phase
         : "online";

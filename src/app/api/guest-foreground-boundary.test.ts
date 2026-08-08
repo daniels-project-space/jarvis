@@ -1,8 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { NextRequest } from "next/server";
+
+vi.mock("server-only", () => ({}));
 
 const mock = vi.hoisted(() => ({
   controlActor: vi.fn(),
   controlCredentials: vi.fn(),
+  actorAdminHash: vi.fn(),
   convexMutation: vi.fn(),
   convexQuery: vi.fn(),
   trigger: vi.fn(),
@@ -14,7 +18,7 @@ const mock = vi.hoisted(() => ({
 vi.mock("@/lib/request-auth", () => ({
   controlActor: mock.controlActor,
   controlCredentials: mock.controlCredentials,
-  actorAdminHash: vi.fn(),
+  actorAdminHash: mock.actorAdminHash,
   isOwnerActor: (actor: { kind?: string }) => actor.kind === "owner",
 }));
 vi.mock("@/lib/context", () => ({
@@ -43,11 +47,12 @@ import { POST as sttPost } from "./stt/route";
 import { GET as ttsGet } from "./tts/route";
 import { GET as toolsGet, POST as toolsPost } from "./tools/route";
 import { POST as seePost } from "./see/route";
+import { issueSpeculativeResearchReceipt } from "@/lib/speculative-research-receipt.server";
 
 const guest = { kind: "guest" as const, guestId: "g".repeat(32) };
 
 function request(path: string, init: RequestInit = {}) {
-  return new Request(`https://jarvis.test${path}`, init) as any;
+  return new Request(`https://jarvis.test${path}`, init) as unknown as NextRequest;
 }
 
 describe("guest foreground boundary", () => {
@@ -71,6 +76,72 @@ describe("guest foreground boundary", () => {
       guestId: guest.guestId, threadId: "main", text: "Hello",
     }));
     expect(mock.convexQuery).toHaveBeenCalledWith("chatQueue:runnerLease", { guestId: guest.guestId });
+  });
+
+  it("rejects speculative research receipts at the guest foreground boundary", async () => {
+    const response = await chatPost(request("/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        text: "Research the latest satellite launch",
+        requestId: "guest-research",
+        researchReceipt: "sr1.not-a-real-receipt.signature",
+      }),
+    }));
+
+    expect(response.status).toBe(403);
+    expect(mock.convexMutation).not.toHaveBeenCalled();
+    expect(mock.trigger).not.toHaveBeenCalled();
+  });
+
+  it("promotes a fresh owner-bound research receipt into the durable turn", async () => {
+    const ownerHash = "a".repeat(64);
+    const priorSecret = process.env.JARVIS_SPECULATIVE_RESEARCH_RECEIPT_SECRET;
+    process.env.JARVIS_SPECULATIVE_RESEARCH_RECEIPT_SECRET = "jarvis-test-receipt-secret-material-123456789";
+    mock.controlActor.mockResolvedValue({ kind: "owner", authTokenHash: ownerHash });
+    mock.actorAdminHash.mockReturnValue(ownerHash);
+    mock.controlCredentials.mockReturnValue({ adminHash: ownerHash });
+    const basis = "Look up the latest OpenAI voice research announcements";
+    const largeSources = Array.from({ length: 5 }, (_, index) => ({
+      title: `Source ${index + 1} ${"voice research ".repeat(14)}`,
+      url: `https://example.com/${index}/${"u".repeat(570)}`,
+      snippet: "Recent evidence about natural conversational voice systems. ".repeat(9),
+    }));
+    const issued = issueSpeculativeResearchReceipt({
+      actorAuthHash: ownerHash,
+      threadId: "main",
+      requestId: "owner-live-research",
+      basis,
+      sources: largeSources,
+    });
+    expect(issued.receipt.length).toBeGreaterThan(8_000);
+
+    try {
+      const response = await chatPost(request("/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          text: `${basis} and summarize them`,
+          threadId: "main",
+          requestId: "owner-live-research",
+          researchReceipt: issued.receipt,
+        }),
+      }));
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ researchPrefetchAccepted: true });
+      expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:sendMessage", expect.objectContaining({
+        adminHash: ownerHash,
+        researchPrefetch: expect.objectContaining({
+          basis,
+          context: expect.stringContaining("UNTRUSTED WEB RESEARCH PREFETCH"),
+          expiresAt: issued.expiresAt,
+        }),
+      }));
+    } finally {
+      if (priorSecret === undefined) delete process.env.JARVIS_SPECULATIVE_RESEARCH_RECEIPT_SECRET;
+      else process.env.JARVIS_SPECULATIVE_RESEARCH_RECEIPT_SECRET = priorSecret;
+    }
   });
 
   it("does not dispatch a duplicate guest worker while the shared runner is warm", async () => {
