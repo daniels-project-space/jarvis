@@ -40,7 +40,7 @@ import {
   FOREGROUND_TURN_TIMEOUT_MS,
   type ForegroundTurnPayload,
 } from "./foreground-policy";
-import { waitForForegroundLease } from "./foreground-lease";
+import { abortForegroundLeaseWork, waitForForegroundLease } from "./foreground-lease";
 import { successorLane, taskForForegroundLane, type ForegroundLane } from "./foreground-lanes";
 import { buildForegroundTiming, type ForegroundTurnTiming } from "./foreground-timing";
 import { CodexAppServer, type CodexTurnInput } from "./codex-app-server";
@@ -212,7 +212,9 @@ async function runTurn(
   } finally {
     // This is the decisive ordering barrier: no stream mutation remains alive
     // when processChatQueue writes the final answer.
-    await publisher.close();
+    // Finalize writes the authoritative complete answer. Drain paints already
+    // in flight, but do not serialize a redundant final snapshot before it.
+    await publisher.close({ flushFinal: false });
     if (hasPrivateFiles) server.forgetConversation(conversationId);
   }
 }
@@ -313,6 +315,18 @@ async function processChatQueue(
   const provider: AgentProvider = "codex";
   const dispatchToken = process.env.JARVIS_DISPATCH_TOKEN;
   if (!dispatchToken) return await failForegroundStartup("JARVIS_DISPATCH_TOKEN is not configured");
+  const workerToken = process.env.JARVIS_WORKER_TOKEN;
+  if (!workerToken) return await failForegroundStartup("JARVIS_WORKER_TOKEN is not configured");
+  // Duplicate wake tasks should exit before downloading credentials, cloning a
+  // subscription home, or spawning the two subscription preflight commands.
+  // The authoritative warm runner observes the durable queue via realtime.
+  if (source !== "warm-handoff") {
+    const existingLease = await convexCall("query", "chatQueue:runnerLeaseForWorker", {})
+      .catch(() => null) as { updatedAt?: number } | null;
+    if (existingLease?.updatedAt && Date.now() - existingLease.updatedAt < 25_000) {
+      return { processed: 0, warmRunner: true };
+    }
+  }
   const prepared = await prepareSubscriptionEnv(provider, {
     scope: `foreground-${lane}`,
     minimumValidityMs: FOREGROUND_SESSION_RENEWAL_RESERVE_MS,
@@ -327,19 +341,6 @@ async function processChatQueue(
   if (preflight.error) {
     cleanupSubscriptionHome(prepared.env);
     return await failForegroundStartup(preflight.error);
-  }
-  const workerToken = process.env.JARVIS_WORKER_TOKEN;
-  if (!workerToken) {
-    cleanupSubscriptionHome(prepared.env);
-    return await failForegroundStartup("JARVIS_WORKER_TOKEN is not configured");
-  }
-  if (source !== "warm-handoff") {
-    const existingLease = await convexCall("query", "chatQueue:runnerLeaseForWorker", {})
-      .catch(() => null) as { updatedAt?: number } | null;
-    if (existingLease?.updatedAt && Date.now() - existingLease.updatedAt < 25_000) {
-      cleanupSubscriptionHome(prepared.env);
-      return { processed: 0, warmRunner: true };
-    }
   }
   const runnerId = randomUUID();
   const bridge = new AgentToolBridge(dispatchToken, {
@@ -411,6 +412,7 @@ async function processChatQueue(
   let leaseClosing = false;
   let heartbeatPromise: Promise<void> = Promise.resolve();
   let activeTurn: { messageId: string; claimToken: string } | null = null;
+  let activeTurnAbort: AbortController | null = null;
   const leaseAbort = new AbortController();
   const heartbeat = setInterval(() => {
     if (leaseClosing) return;
@@ -423,7 +425,7 @@ async function processChatQueue(
       }).catch(() => true);
       if (stillOwner === false) {
         leaseActive = false;
-        leaseAbort.abort();
+        abortForegroundLeaseWork(leaseAbort, activeTurnAbort);
       }
     });
   }, 10_000);
@@ -473,6 +475,7 @@ async function processChatQueue(
     }
     activeTurn = { messageId: claim.assistantId, claimToken: claim.claimToken };
     const cancellationAbort = new AbortController();
+    activeTurnAbort = cancellationAbort;
     const stopCancellationWatch = client.onUpdate(
       api.chatQueue.turnCancellationForWorker,
       {
@@ -486,9 +489,17 @@ async function processChatQueue(
     try {
       const visibleUserText = visibleTurnText(claim.userText);
       const contextStarted = Date.now();
-      const baseContext = claim.guest
-        ? "No private context is available for a guest conversation."
-        : await buildContext(visibleUserText);
+      const contextPromise = claim.guest
+        ? Promise.resolve("No private context is available for a guest conversation.")
+        : buildContext(visibleUserText);
+      const imageInputsPromise = claim.guest
+        ? Promise.resolve([])
+        : materializeCodexChatImages(claim.userText, claim.attachments, {
+          signal: cancellationAbort.signal,
+        });
+      // Context snapshots and private image reads are independent. Image turns
+      // should pay the slower branch, not the sum of both branches.
+      const [baseContext, imageInputs] = await Promise.all([contextPromise, imageInputsPromise]);
       const fileContext = claim.guest ? "" : buildBoundedFileContext(claim.attachments);
       const fileCatalog = claim.guest ? "" : buildBoundedThreadFileCatalog(claim.fileCatalog);
       const researchContext = !claim.guest
@@ -498,11 +509,6 @@ async function processChatQueue(
           ? claim.researchPrefetch.context
           : "";
       const context = [baseContext, researchContext, fileCatalog, fileContext].filter(Boolean).join("\n\n");
-      const imageInputs = claim.guest
-        ? []
-        : await materializeCodexChatImages(claim.userText, claim.attachments, {
-          signal: cancellationAbort.signal,
-        });
       const contextReadyAt = Date.now();
       const model = pickConversationTier(visibleUserText);
       const stages: Partial<Record<"codexAck" | "firstDelta" | "firstConvexPaint", number>> = {};
@@ -577,6 +583,7 @@ async function processChatQueue(
       }).catch(() => {});
     } finally {
       stopCancellationWatch();
+      if (activeTurnAbort === cancellationAbort) activeTurnAbort = null;
     }
     activeTurn = null;
     // After its exact wake-up message, retain this authenticated CLI process
@@ -592,11 +599,27 @@ async function processChatQueue(
       await metadata.flush();
     } finally {
       leaseClosing = true;
+      abortForegroundLeaseWork(
+        leaseAbort,
+        activeTurnAbort,
+        new Error("foreground runner retiring"),
+      );
       clearInterval(heartbeat);
       clearTimeout(handoffTimer);
       await heartbeatPromise.catch(() => undefined);
       await handoffPromise;
-      await convexMutation("chatQueue:releaseRunner", { runnerId }).catch(() => {});
+      const retirement = await convexMutation("chatQueue:releaseRunner", { runnerId })
+        .catch(() => null) as { released?: boolean; pendingMessageId?: string | null } | null;
+      if (retirement?.released && retirement.pendingMessageId) {
+        // Admission raced the realtime listener's final timeout. The atomic
+        // retirement receipt transfers responsibility to one replacement wake;
+        // this path is exceptional and adds no task to ordinary warm turns.
+        await tasks.trigger(
+          taskForForegroundLane(lane),
+          { messageId: retirement.pendingMessageId, source: "runner-retirement" },
+          { idempotencyKey: `jarvis-retire-${retirement.pendingMessageId}` },
+        ).catch(() => null);
+      }
       await session.close();
       client.close();
     }
@@ -624,7 +647,7 @@ export const chatMemory = task({
       cleanupSubscriptionHome(prepared.env);
     }
   },
-});
+});;
 
 // Initial and recovery turns enter the primary lane. Its owner prewarms the
 // alternate lane only at the four-hour handoff boundary.

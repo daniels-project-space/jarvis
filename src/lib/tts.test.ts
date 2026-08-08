@@ -101,6 +101,16 @@ describe("single Edge neural speech queue", () => {
     const chunks = sentences(input);
     expect(Math.max(...chunks.map((chunk) => chunk.length))).toBeLessThanOrEqual(240);
     expect(chunks.length).toBeLessThanOrEqual(2);
+    expect(chunks[0].length).toBeLessThanOrEqual(88);
+    expect(chunks.join(" ")).toBe(normalizeSpeechText(input));
+  });
+
+  it("does not add a third request for replies that fit the previous two-request budget", () => {
+    const input = Array.from({ length: 52 }, (_, index) => `word${index}`).join(" ");
+    const chunks = sentences(input);
+    expect(normalizeSpeechText(input).length).toBeGreaterThan(328);
+    expect(normalizeSpeechText(input).length).toBeLessThanOrEqual(360);
+    expect(chunks).toHaveLength(2);
     expect(chunks[0].length).toBeLessThanOrEqual(120);
     expect(chunks.join(" ")).toBe(normalizeSpeechText(input));
   });
@@ -129,6 +139,8 @@ describe("single Edge neural speech queue", () => {
   it("exposes only stable complete sentences during token streaming", () => {
     expect(completeSpeechPrefix("I have the first answer. The second is still"))
       .toBe("I have the first answer.");
+    expect(completeSpeechPrefix("Two things matter: the rest is still streaming"))
+      .toBe("Two things matter:");
     expect(completeSpeechPrefix("Still thinking")).toBe("");
   });
 

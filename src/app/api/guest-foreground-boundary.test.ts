@@ -72,7 +72,7 @@ describe("guest foreground boundary", () => {
     }));
 
     expect(response.status).toBe(200);
-    expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:sendMessage", expect.objectContaining({
+    expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:sendMessageWithRunnerLease", expect.objectContaining({
       guestId: guest.guestId, threadId: "main", text: "Hello",
     }));
     expect(mock.convexQuery).toHaveBeenCalledWith("chatQueue:runnerLease", { guestId: guest.guestId });
@@ -130,7 +130,7 @@ describe("guest foreground boundary", () => {
 
       expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({ researchPrefetchAccepted: true });
-      expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:sendMessage", expect.objectContaining({
+      expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:sendMessageWithRunnerLease", expect.objectContaining({
         adminHash: ownerHash,
         researchPrefetch: expect.objectContaining({
           basis,
@@ -153,6 +153,24 @@ describe("guest foreground boundary", () => {
     }));
 
     expect(response.status).toBe(200);
+    expect(mock.trigger).not.toHaveBeenCalled();
+  });
+
+  it("uses the combined admission receipt without a second Convex lease read", async () => {
+    mock.convexMutation.mockResolvedValue({ messageId: "message-fast", warmRunner: true });
+    const response = await chatPost(request("/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "fast follow up", requestId: "guest-combined-admission" }),
+    }));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ messageId: "message-fast", immediate: true });
+    expect(mock.convexMutation).toHaveBeenCalledWith(
+      "chatQueue:sendMessageWithRunnerLease",
+      expect.objectContaining({ requestId: "guest-combined-admission" }),
+    );
+    expect(mock.convexQuery).not.toHaveBeenCalled();
     expect(mock.trigger).not.toHaveBeenCalled();
   });
 

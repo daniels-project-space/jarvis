@@ -147,14 +147,30 @@ export async function materializeCodexChatImages(
     });
   }
 
-  const startedAt = Date.now();
+  // Private R2 objects and the trusted capture are independent. Fetch their
+  // bounded byte payloads concurrently, then preserve deterministic ordering
+  // and transport-budget allocation while normalising them below.
+  const sourceBytes = await Promise.all(sources.map(async (source) => {
+    try {
+      return await withImageReadDeadline(
+        async (readSignal) => {
+          const response = await source.read(readSignal);
+          return await responseImageBytes(response, source.maximumBytes);
+        },
+        signal,
+        Math.min(CODEX_IMAGE_LIMITS.fetchTimeoutMs, CODEX_IMAGE_LIMITS.batchTimeoutMs),
+      );
+    } catch {
+      if (signal?.aborted) throw abortError(signal, "image materialization cancelled");
+      return null;
+    }
+  }));
   const output: CodexImageInput[] = [];
   let usedTransportBytes = 0;
   for (let index = 0; index < sources.length; index += 1) {
     if (signal?.aborted) throw abortError(signal, "image materialization cancelled");
     const source = sources[index];
     const remainingSources = sources.length - index;
-    const remainingBatchMs = CODEX_IMAGE_LIMITS.batchTimeoutMs - (Date.now() - startedAt);
     const labelReserveBytes = remainingSources * 512;
     const fairDataUrlBytes = Math.floor(
       (CODEX_IMAGE_LIMITS.maxTransportBytes - usedTransportBytes - labelReserveBytes) / remainingSources,
@@ -165,14 +181,8 @@ export async function materializeCodexChatImages(
     );
     let result: CodexImageInput;
     try {
-      const bytes = await withImageReadDeadline(
-        async (readSignal) => {
-          const response = await source.read(readSignal);
-          return await responseImageBytes(response, source.maximumBytes);
-        },
-        signal,
-        Math.min(CODEX_IMAGE_LIMITS.fetchTimeoutMs, remainingBatchMs),
-      );
+      const bytes = sourceBytes[index];
+      if (!bytes) throw new Error("image source unavailable");
       const dataUrl = await codexInlineImageFromBytes(bytes, maximumDataUrlBytes);
       if (signal?.aborted) throw abortError(signal, "image materialization cancelled");
       result = { status: "ready", label: source.label, dataUrl };

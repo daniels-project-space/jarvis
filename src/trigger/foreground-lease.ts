@@ -12,6 +12,20 @@ export type ForegroundLeaseWaitOptions = {
 };
 
 /**
+ * End every local activity that depended on a foreground lease as soon as the
+ * durable owner changes. The lease wait and the active Codex turn use separate
+ * controllers, so both must be fenced together.
+ */
+export function abortForegroundLeaseWork(
+  leaseController: AbortController,
+  activeTurnController: AbortController | null,
+  reason = new Error("foreground runner lease lost"),
+) {
+  activeTurnController?.abort(reason);
+  leaseController.abort(reason);
+}
+
+/**
  * Wait for a single Convex lease release (or its one stale deadline). This is
  * deliberately subscription-driven: a failed claim never creates a poll loop.
  */

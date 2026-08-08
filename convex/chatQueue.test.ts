@@ -34,6 +34,50 @@ async function createTurn(t: ReturnType<typeof convexTest>, requestId: string) {
 }
 
 describe("durable foreground chat recovery", () => {
+  it("folds the warm-runner receipt into admission and marks empty side tables", async () => {
+    const t = convexTest(schema, modules);
+    await t.mutation(api.chatQueue.touchRunner, {
+      runnerId: "warm-runner",
+      workerToken: WORKER,
+    });
+    const admission = await t.mutation(api.chatQueue.sendMessageWithRunnerLease, {
+      threadId: "main",
+      text: "plain text turn",
+      requestId: "combined-admission",
+      workerToken: WORKER,
+    });
+
+    expect(admission).toMatchObject({ warmRunner: true });
+    const messageId = admission.messageId;
+    const rows = await t.query(api.chatQueue.listMessages, { threadId: "main", workerToken: WORKER });
+    expect(rows.find((row) => row._id === messageId)).toMatchObject({
+      hasLinkedFiles: false,
+      hasResearchPrefetch: false,
+    });
+  });
+
+  it("atomically transfers a pending turn when a warm runner retires", async () => {
+    const t = convexTest(schema, modules);
+    await t.mutation(api.chatQueue.touchRunner, {
+      runnerId: "retiring-runner",
+      workerToken: WORKER,
+    });
+    const messageId = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "main",
+      text: "arrived on the final realtime boundary",
+      requestId: "runner-retirement-race",
+      workerToken: WORKER,
+    });
+
+    await expect(t.mutation(api.chatQueue.releaseRunner, {
+      runnerId: "retiring-runner",
+      workerToken: WORKER,
+    })).resolves.toEqual({ released: true, pendingMessageId: messageId });
+    await expect(t.query(api.chatQueue.runnerLeaseForWorker, {
+      workerToken: WORKER,
+    })).resolves.toBeNull();
+  });
+
   it("returns the completed assistant payload so reconnect recovery can deliver it", async () => {
     const t = convexTest(schema, modules);
     const userId = await createTurn(t, "completed-delivery");

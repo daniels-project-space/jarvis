@@ -58,10 +58,22 @@
   f.title = "JARVIS";
   f.allow = "microphone; autoplay; clipboard-write; display-capture";
   f.style.cssText =
-    "position:fixed;bottom:66px;right:8px;width:min(460px,calc(100vw - 16px));height:min(520px,calc(100vh - 82px));border:0;" +
+    "position:fixed;bottom:66px;right:8px;width:min(320px,calc(100vw - 16px));height:min(190px,calc(100vh - 82px));border:0;" +
     "border-radius:28px;z-index:2147483000;background:#05070d;color-scheme:dark;" +
-    "box-shadow:none;transition:opacity .2s ease,transform .28s cubic-bezier(.22,1,.36,1);" +
+    "box-shadow:none;transition:opacity .2s ease,transform .28s cubic-bezier(.22,1,.36,1),width .24s cubic-bezier(.22,1,.36,1),height .24s cubic-bezier(.22,1,.36,1);" +
     "opacity:0;transform:translateY(14px);pointer-events:none;";
+
+  // The trusted Jarvis frame may request only a semantic layout state. The
+  // host owns the actual dimensions so postMessage can never inject arbitrary
+  // CSS or restore the large invisible click-blocking rectangle when collapsed.
+  function setFrameLayout(expanded) {
+    f.style.width = expanded
+      ? "min(460px,calc(100vw - 16px))"
+      : "min(320px,calc(100vw - 16px))";
+    f.style.height = expanded
+      ? "min(520px,calc(100vh - 82px))"
+      : "min(190px,calc(100vh - 82px))";
+  }
 
   // One host-owned control in every app. Individual products no longer need
   // to reinvent a Jarvis button or remember to expose the element selector.
@@ -861,6 +873,8 @@
         ? 0
         : Math.max(0.04, Math.min(0.96, Number.isFinite(nextProgress) ? nextProgress : 0.12));
       paintUniversalControls();
+    } else if (data.jarvis === "layout" && typeof data.expanded === "boolean") {
+      setFrameLayout(data.expanded);
     } else if (data.jarvis === "wake" || data.jarvis === "notify") {
       show();
     } else if (data.jarvis === "hide") {
@@ -877,6 +891,16 @@
     } else if (data.jarvis === "live-start") {
       liveBlocked = true;
       pauseRecognition("live");
+    } else if (data.jarvis === "preview-claim") {
+      var previewSessionId = typeof data.sessionId === "string" ? data.sessionId : "";
+      if (!/^[A-Za-z0-9._:-]{8,160}$/.test(previewSessionId)) return;
+      // Explicitly transfer recognition ownership to the authenticated Jarvis
+      // iframe. This handler already enforces the exact frame source + origin,
+      // and pausing before the grant prevents simultaneous host/iframe speech
+      // recognizers even when React's live-start effect arrives a tick later.
+      liveBlocked = true;
+      pauseRecognition("live-preview");
+      post({ jarvis: "host-preview-grant", sessionId: previewSessionId });
     } else if (data.jarvis === "live-end") {
       if (!liveBlocked) return;
       liveBlocked = false;
