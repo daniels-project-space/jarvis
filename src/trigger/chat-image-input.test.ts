@@ -108,6 +108,30 @@ describe("bounded Codex image materialization", () => {
     expect(getPrivate.mock.calls.map(([key]) => key)).toEqual(["bad-key", "good-key"]);
   });
 
+  it("starts independent private image reads concurrently", async () => {
+    const releases = new Map<string, () => void>();
+    const getPrivate = vi.fn((key: string) => new Promise<Response>((resolve) => {
+      releases.set(key, () => resolve(new Response(png, {
+        status: 200,
+        headers: { "content-length": String(png.byteLength), "content-type": "image/png" },
+      })));
+    }));
+    const result = materializeCodexChatImages(
+      "compare both",
+      [attachment("file-a", "first-key"), attachment("file-b", "second-key")],
+      { getPrivate },
+    );
+
+    await vi.waitFor(() => expect(getPrivate).toHaveBeenCalledTimes(2));
+    releases.get("first-key")?.();
+    releases.get("second-key")?.();
+
+    await expect(result).resolves.toMatchObject([
+      { status: "ready", label: expect.stringContaining("file-a") },
+      { status: "ready", label: expect.stringContaining("file-b") },
+    ]);
+  });
+
   it("times out a stalled private read instead of blocking the chat turn", async () => {
     vi.useFakeTimers();
     try {

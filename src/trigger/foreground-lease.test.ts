@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { waitForForegroundLease, type ForegroundLease } from "./foreground-lease";
+import {
+  abortForegroundLeaseWork,
+  waitForForegroundLease,
+  type ForegroundLease,
+} from "./foreground-lease";
 
 const LEASE_MS = 1_000;
 const TIMEOUT_MS = 5_000;
@@ -32,6 +36,19 @@ function waiter(
 }
 
 describe("foreground handoff lease", () => {
+  it("cancels idle admission and the active turn together on ownership loss", () => {
+    const lease = new AbortController();
+    const activeTurn = new AbortController();
+    const reason = new Error("replacement owns the lease");
+
+    abortForegroundLeaseWork(lease, activeTurn, reason);
+
+    expect(lease.signal.aborted).toBe(true);
+    expect(lease.signal.reason).toBe(reason);
+    expect(activeTurn.signal.aborted).toBe(true);
+    expect(activeTurn.signal.reason).toBe(reason);
+  });
+
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(10_000);

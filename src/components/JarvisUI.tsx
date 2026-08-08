@@ -28,7 +28,6 @@ import {
   createLiveVadState,
   shouldCloseLiveUtterance,
   shouldDeferLiveCapture,
-  shouldPrefetchLiveTranscript,
   shouldStartLiveResearchPreview,
   spectrumBandLevel,
   type LiveVadState,
@@ -77,6 +76,11 @@ import { GuestChatFileAccess } from "./chat-files/GuestChatFileAccess";
 import { ChatFilePendingMonitor, type ChatFileNotice } from "./chat-files/ChatFilePendingMonitor";
 import type { ChatFileManifest } from "@/lib/chat-files";
 import { buildSpeculativeResearchQuery } from "@/lib/speculative-research";
+import {
+  chooseLiveTranscriptSource,
+  isStableBrowserSpeechRevision,
+  type BrowserSpeechPreview,
+} from "@/lib/browser-speech-preview";
 
 const EMBED_COMMAND_TTL_MS = 30_000;
 const MAX_PENDING_EMBED_COMMANDS = 4;
@@ -118,6 +122,31 @@ type Caption = {
 } | null;
 type StagePanel = { type: string; value: string; title?: string; updatedAt: number };
 type HostActionResult = { ok: boolean; detail?: string };
+type BrowserSpeechRecognitionAlternative = { transcript?: string; confidence?: number };
+type BrowserSpeechRecognitionResult = {
+  readonly length: number;
+  readonly isFinal?: boolean;
+  readonly [index: number]: BrowserSpeechRecognitionAlternative;
+};
+type BrowserSpeechRecognitionEvent = {
+  readonly resultIndex?: number;
+  readonly results: {
+    readonly length: number;
+    readonly [index: number]: BrowserSpeechRecognitionResult;
+  };
+};
+type BrowserSpeechRecognizer = {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  maxAlternatives: number;
+  onresult: ((event: BrowserSpeechRecognitionEvent) => void) | null;
+  onerror: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort?: () => void;
+};
+type BrowserSpeechRecognizerConstructor = new () => BrowserSpeechRecognizer;
 type StreamingSpeechState = {
   id: string;
   queuedChars: number;
@@ -130,6 +159,7 @@ type SubmitOptions = {
   requestId?: string;
   researchReceipt?: string;
   interruptCurrent?: boolean;
+  hostContext?: JarvisHostContext | null;
 };
 type LiveResearchResponse = {
   receipt: string;
@@ -141,6 +171,25 @@ type LiveResearchState = {
   phase: "idle" | "researching" | "ready";
   sourceCount: number;
 };
+
+const EMBEDDED_OPERATIONAL_LOG_LINE = /^\s*(?:[⚠️🚨❌]\s*)?(?:error(?:\[[^\]]+\])?:|(?:type|reference|syntax|range|network|abort)error\b|traceback\b|npm err!|(?:stdout|stderr)\s*:|at\s+\S.*\([^)]*:\d+:\d+\)|.*:\s*error\s+TS\d+\b|\{["']?(?:error|stack|code)["']?\s*:|\[(?:error|debug|warn|info)\])/i;
+
+/** Keep implementation diagnostics in telemetry, never in the compact host UI. */
+export function safeEmbeddedMessageText(args: {
+  role: string;
+  text: string;
+  status?: string;
+}): string {
+  if (args.role === "user") return visibleTurnText(args.text);
+  const sanitized = sanitizeAssistantText(args.text);
+  const lines = sanitized.split(/\r?\n/);
+  const logLine = lines.findIndex((line) => EMBEDDED_OPERATIONAL_LOG_LINE.test(line));
+  const summary = (logLine >= 0 ? lines.slice(0, logLine) : lines).join("\n").trim();
+  if (args.status === "error" || args.status === "failed" || logLine === 0 || !summary) {
+    return "That reply hit a technical problem. Use recover or retry.";
+  }
+  return summary;
+}
 
 function MessageFileBadges({ files, align = "left" }: { files?: ChatFileManifest[]; align?: "left" | "right" }) {
   if (!files?.length) return null;
@@ -1404,6 +1453,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }, [embedded, hostActionRow, parentOrigin]);
 
   const [input, setInput] = useState("");
+  const [embeddedExpanded, setEmbeddedExpanded] = useState(false);
+  useEffect(() => {
+    if (!embedded || !parentOrigin || window.parent === window) return;
+    // The trusted host owns the iframe dimensions. Send only semantic state so
+    // every host applies the same audited desktop/mobile sizing policy.
+    window.parent.postMessage({ jarvis: "layout", expanded: embeddedExpanded }, parentOrigin);
+  }, [embedded, embeddedExpanded, parentOrigin]);
   const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
   const [pendingFileIds, setPendingFileIds] = useState<string[]>([]);
   const [fileNotice, setFileNotice] = useState<ChatFileNotice>(null);
@@ -1951,7 +2007,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     const receiveHostMessage = (event: MessageEvent) => {
       if (event.source !== window.parent || !parentOrigin || event.origin !== parentOrigin) return;
       const message = event.data ?? {};
-      if (message.jarvis === "host-show") setChatMode("off", false);
+      if (message.jarvis === "host-show") {
+        setChatMode("off", false);
+        setEmbeddedExpanded(false);
+      }
       if (message.jarvis === "host-hide" && liveRef.current) void toggleLive();
       if (message.jarvis === "host-wake-state") setWake(message.listening === true);
       if ((message.jarvis === "host-context" || message.jarvis === "context-response") && message.context) {
@@ -2065,11 +2124,21 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     };
     const localNarrationOwner = Date.now() < localVoiceLeaseUntilRef.current
       || voiceRef.current?.value === me.current;
-    if (document.hidden || (liveAnywhere() && !liveRef.current && !localNarrationOwner) || !(await ensureVoice())) {
+    if (document.hidden || (liveAnywhere() && !liveRef.current && !localNarrationOwner)) {
       finishWithoutSpeech();
       return false;
     }
-    const { speak } = await import("../lib/tts");
+    // Voice ownership and the cached TTS chunk load are independent. On a
+    // recovered/stale lease, overlap both waits instead of placing the module
+    // fetch after the Convex election round trip.
+    const [voiceGranted, { speak }] = await Promise.all([
+      ensureVoice(),
+      import("../lib/tts"),
+    ]);
+    if (!voiceGranted) {
+      finishWithoutSpeech();
+      return false;
+    }
     const played = await speak(
       text,
       (energy) => (energyRef.current = energy),
@@ -2306,7 +2375,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     setSending(true);
     setDurableRecovery("failed");
-    if (state.text) showCaption({ who: "jarvis", text: state.text, phase: "ready" });
+    if (state.text) showCaption({
+      who: "jarvis",
+      text: embedded
+        ? safeEmbeddedMessageText({ role: "assistant", status: "error", text: state.text })
+        : state.text,
+      phase: "ready",
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTurnStatus, messages, thread, durableTurnEpoch]);
 
@@ -2386,7 +2461,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }, []);
 
   async function requestHostContext(): Promise<JarvisHostContext | null> {
-    if (!embedded || window.parent === window) return null;
+    if (!embedded || !parentOrigin || window.parent === window) return null;
     const id = `jarvis-context-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     return new Promise((resolve) => {
       const finish = (context: JarvisHostContext | null) => {
@@ -2396,7 +2471,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         resolve(context);
       };
       const receive = (event: MessageEvent) => {
-        if (event.source !== window.parent) return;
+        if (event.source !== window.parent || event.origin !== parentOrigin) return;
         const message = event.data ?? {};
         if (message.jarvis !== "context-response" || message.id !== id) return;
         finish(message.context as JarvisHostContext);
@@ -2404,6 +2479,26 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const timer = window.setTimeout(() => finish(hostContextRef.current), 120);
       window.addEventListener("message", receive);
       postToParent({ jarvis: "context-request", id });
+    });
+  }
+
+  async function claimEmbeddedBrowserPreview(sessionId: string): Promise<boolean> {
+    if (!embedded || !parentOrigin || window.parent === window) return false;
+    return new Promise((resolve) => {
+      const finish = (granted: boolean) => {
+        window.removeEventListener("message", receive);
+        window.clearTimeout(timer);
+        resolve(granted);
+      };
+      const receive = (event: MessageEvent) => {
+        if (event.source !== window.parent || event.origin !== parentOrigin) return;
+        const message = event.data ?? {};
+        if (message.jarvis !== "host-preview-grant" || message.sessionId !== sessionId) return;
+        finish(true);
+      };
+      const timer = window.setTimeout(() => finish(false), 220);
+      window.addEventListener("message", receive);
+      postToParent({ jarvis: "preview-claim", sessionId });
     });
   }
 
@@ -2941,7 +3036,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     let modelText = visibleText;
     if (embedded) {
-      const context = await requestHostContext();
+      // Voice turns prewarm this read-only host snapshot while the user is
+      // speaking. Typed turns retain the same bounded on-demand fallback.
+      const context = options.hostContext !== undefined
+        ? options.hostContext
+        : await requestHostContext();
       if (context) {
         const bounded = needsHostContext(visibleText)
           ? context
@@ -3356,11 +3455,21 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       ?? `voice-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     let outcome: VoiceCaptureOutcome = "failure";
     let pendingSttController: AbortController | null = null;
+    let browserPreview: BrowserSpeechPreview | null = null;
+    let previousBrowserPreview: BrowserSpeechPreview | null = null;
+    let previewRecognizer: BrowserSpeechRecognizer | null = null;
+    let browserPreviewCaptureOpen = false;
     const researchState: {
       controller: AbortController | null;
       promise: Promise<LiveResearchResponse | null> | null;
-    } = { controller: null, promise: null };
+      result: LiveResearchResponse | null;
+    } = { controller: null, promise: null, result: null };
     let researchStarted = false;
+    // Embedded context is cheap, local and read-only. Starting this bounded
+    // parent handshake now removes its former 120ms post-transcription stall.
+    const hostContextPromise = embedded
+      ? requestHostContext()
+      : Promise.resolve<JarvisHostContext | null>(null);
     setLiveResearch({ phase: "idle", sourceCount: 0 });
     try {
       void ownVoice();
@@ -3434,18 +3543,94 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           document.documentElement.dataset.jarvisResearchPrefetchMs = String(Math.round(performance.now() - startedAt));
           document.documentElement.dataset.jarvisResearchPrefetchSources = String(result.sources.length);
           setLiveResearch({ phase: "ready", sourceCount: result.sources.length });
+          researchState.result = result;
           return result;
         }).catch(() => null);
       };
       recRef.current = rec;
       const t0 = Date.now();
       let vad = createLiveVadState(t0);
-      const prefetch = {
-        lastVoice: -1,
-        promise: null as Promise<{ text: string; lastVoice: number } | null> | null,
-        authoritativeText: "",
-        previousAuthoritativeText: "",
+      browserPreviewCaptureOpen = true;
+      // Wake recognition is already stopped for a standalone live session.
+      // An embedded live session explicitly asks its trusted host to stop its
+      // recognizer before this iframe starts one, preventing dual ownership.
+      const startBrowserPreview = () => {
+        if (
+          previewRecognizer
+          || !browserPreviewCaptureOpen
+          || !freeLoop.current
+          || sessionEpoch !== liveSessionEpoch.current
+        ) return;
+        const speechWindow = window as typeof window & {
+          SpeechRecognition?: BrowserSpeechRecognizerConstructor;
+          webkitSpeechRecognition?: BrowserSpeechRecognizerConstructor;
+        };
+        const BrowserRecognizer = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
+        if (BrowserRecognizer) {
+          try {
+            const recognizer = new BrowserRecognizer();
+            previewRecognizer = recognizer;
+            recognizer.lang = "en-GB";
+            recognizer.continuous = true;
+            recognizer.interimResults = true;
+            recognizer.maxAlternatives = 1;
+            recognizer.onresult = (event) => {
+              if (!freeLoop.current || sessionEpoch !== liveSessionEpoch.current) return;
+              const segments: string[] = [];
+              let allFinal = event.results.length > 0;
+              let finalConfidence = 1;
+              for (let index = 0; index < event.results.length; index += 1) {
+                const result = event.results[index];
+                const alternative = result?.[0];
+                const segment = String(alternative?.transcript ?? "").trim();
+                if (segment) segments.push(segment);
+                allFinal = allFinal && result?.isFinal === true;
+                if (result?.isFinal) {
+                  const confidence = Number(alternative?.confidence ?? 0);
+                  finalConfidence = Number.isFinite(confidence) && confidence > 0
+                    ? Math.min(finalConfidence, confidence)
+                    : 0;
+                }
+              }
+              const text = segments.join(" ").trim();
+              if (!text) return;
+              const candidate: BrowserSpeechPreview = {
+                sessionId: voiceRequestId,
+                text,
+                isFinal: allFinal,
+                confidence: allFinal ? finalConfidence : 0,
+                observedVoiceAt: vad.lastVoice,
+              };
+              const previous = browserPreview;
+              if (
+                previous?.text === candidate.text
+                && previous.isFinal === candidate.isFinal
+                && previous.confidence === candidate.confidence
+              ) return;
+              previousBrowserPreview = previous;
+              browserPreview = candidate;
+              document.documentElement.dataset.jarvisBrowserSpeechPreview = allFinal ? "final" : "interim";
+              if (isStableBrowserSpeechRevision(previousBrowserPreview, candidate)) {
+                startLiveResearch(candidate.text, previousBrowserPreview?.text ?? "");
+              }
+            };
+            recognizer.onerror = () => {
+              document.documentElement.dataset.jarvisBrowserSpeechPreview = "unavailable";
+            };
+            recognizer.start();
+          } catch {
+            previewRecognizer = null;
+            document.documentElement.dataset.jarvisBrowserSpeechPreview = "unavailable";
+          }
+        }
       };
+      if (wakeOwnedByHost()) {
+        void claimEmbeddedBrowserPreview(voiceRequestId).then((granted) => {
+          if (granted) startBrowserPreview();
+        });
+      } else {
+        startBrowserPreview();
+      }
       let listeningCaptionShown = false;
       let ttsWasActive = speakingRef.current || isTtsActuallySpeaking();
       let contaminatedByOutput = false;
@@ -3478,67 +3663,18 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         });
         vad = result.state;
         if (result.acceptedSpeech) {
-          if (prefetch.lastVoice >= 0 && vad.lastVoice !== prefetch.lastVoice) {
-            pendingSttController?.abort();
-            pendingSttController = null;
-            prefetch.promise = null;
-            prefetch.lastVoice = -1;
-          }
           energyRef.current = Math.min(1, level / 90);
           if (!listeningCaptionShown) {
             listeningCaptionShown = true;
             showCaption({ who: "you", text: "Listening…" });
           }
         }
-        if (shouldPrefetchLiveTranscript(vad, now, prefetch.lastVoice)) {
-          const lastVoice = vad.lastVoice;
-          prefetch.lastVoice = lastVoice;
-          const flushRecorder = new Promise<void>((resolve) => {
-            let settled = false;
-            const finish = () => {
-              if (settled) return;
-              settled = true;
-              rec.removeEventListener("dataavailable", finish);
-              resolve();
-            };
-            rec.addEventListener("dataavailable", finish, { once: true });
-            try { rec.requestData(); } catch { finish(); }
-            window.setTimeout(finish, 120);
-          });
-          void flushRecorder.then(() => {
-            if (
-              rec.state !== "recording"
-              || !freeLoop.current
-              || sessionEpoch !== liveSessionEpoch.current
-              || vad.lastVoice !== lastVoice
-            ) return;
-            const partial = new Blob([...chunks], { type: mime });
-            if (partial.size < 2000) return;
-            const controller = new AbortController();
-            pendingSttController = controller;
-            sttAbortRef.current?.abort();
-            sttAbortRef.current = controller;
-            prefetch.promise = requestTranscript(partial, controller, { ...vad })
-              .then((text) => {
-                if (text && text !== prefetch.authoritativeText) {
-                  prefetch.previousAuthoritativeText = prefetch.authoritativeText;
-                  prefetch.authoritativeText = text;
-                  startLiveResearch(text, prefetch.previousAuthoritativeText);
-                }
-                return { text, lastVoice };
-              }, () => null)
-              .finally(() => {
-                if (sttAbortRef.current === controller) sttAbortRef.current = null;
-                if (pendingSttController === controller) pendingSttController = null;
-              });
-          });
-        }
         if (result.bargeIn) {
           void import("../lib/tts").then((m) => m.stopSpeaking());
           setSpeaking(false);
         }
         if (
-          shouldCloseLiveUtterance(vad, now, prefetch.authoritativeText)
+          shouldCloseLiveUtterance(vad, now, browserPreview?.text)
           || (!vad.spoke && now - t0 > 8000)
           || now - t0 > 25_000
         ) {
@@ -3547,7 +3683,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         }
       }, 90);
       await new Promise<void>((resolve) => {
-        rec.onstop = () => resolve();
+        rec.onstop = () => {
+          browserPreviewCaptureOpen = false;
+          try { previewRecognizer?.stop(); } catch { /* browser preview already ended */ }
+          resolve();
+        };
         rec.start(250);
       });
       clearInterval(poll);
@@ -3568,17 +3708,22 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const speechClosedAt = performance.now();
       document.documentElement.dataset.jarvisSpeechClosedMs = String(Math.round(speechClosedAt));
       showCaption({ who: "you", text: "Processing…" });
-      const pendingPrefetch = prefetch.promise;
-      const prefetched = pendingPrefetch && prefetch.lastVoice === vad.lastVoice
-        ? await pendingPrefetch
-        : null;
-      let text = prefetched?.text ?? "";
-      if (!text) {
+      const transcriptSource = chooseLiveTranscriptSource({
+        preview: browserPreview,
+        sessionId: voiceRequestId,
+        currentVoiceAt: vad.lastVoice,
+        sessionActive: freeLoop.current && sessionEpoch === liveSessionEpoch.current,
+      });
+      let text: string;
+      if (transcriptSource.source === "browser-final") {
+        text = transcriptSource.text;
+        document.documentElement.dataset.jarvisAuthoritativeStt = "browser-final";
+      } else {
         const controller = new AbortController();
         pendingSttController = controller;
-        sttAbortRef.current?.abort();
         sttAbortRef.current = controller;
         text = await requestTranscript(blob, controller, { ...vad });
+        document.documentElement.dataset.jarvisAuthoritativeStt = "server";
         if (sttAbortRef.current === controller) sttAbortRef.current = null;
         if (pendingSttController === controller) pendingSttController = null;
       }
@@ -3611,22 +3756,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       }
       lastVoiceInput.current = { text: cleanedText, at: Date.now() };
       document.documentElement.dataset.jarvisTranscriptionMs = String(Math.round(performance.now() - speechClosedAt));
-      let researchResult: LiveResearchResponse | null = null;
-      const pendingResearch = researchState.promise;
-      if (pendingResearch) {
-        let reuseTimer: ReturnType<typeof setTimeout> | null = null;
-        researchResult = await Promise.race([
-          pendingResearch,
-          new Promise<null>((resolve) => {
-            reuseTimer = setTimeout(() => resolve(null), 180);
-          }),
-        ]);
-        if (reuseTimer) clearTimeout(reuseTimer);
-        if (!researchResult) {
-          researchState.controller?.abort();
-          document.documentElement.dataset.jarvisResearchPrefetch = "late-or-discarded";
-        }
+      const researchResult = researchState.result;
+      if (researchState.promise && !researchResult) {
+        // The rolling checkpoints give preview research seconds of useful
+        // overlap. Never add a fixed tail wait after the final transcript; a
+        // late optional preview is discarded and the authoritative turn starts.
+        researchState.controller?.abort();
+        document.documentElement.dataset.jarvisResearchPrefetch = "late-or-discarded";
       }
+      const prewarmedHostContext = embedded ? await hostContextPromise : undefined;
       showCaption({ who: "you", text: cleanedText });
       outcome = "speech";
       const interruptCurrent = voiceInterruptionPendingRef.current;
@@ -3636,6 +3774,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         requestId: voiceRequestId,
         researchReceipt: researchResult?.receipt,
         interruptCurrent,
+        hostContext: prewarmedHostContext,
       });
     } catch (error) {
       const aborted = error instanceof DOMException && error.name === "AbortError";
@@ -3646,6 +3785,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         showCaption({ who: "jarvis", text: "I could not transcribe that. I’m reopening the microphone—please try again." });
       }
     } finally {
+      // Also fences a delayed embedded ownership grant after cancellation.
+      browserPreviewCaptureOpen = false;
+      try { (previewRecognizer as BrowserSpeechRecognizer | null)?.abort?.(); } catch { /* preview already stopped */ }
       pendingSttController?.abort();
       researchState.controller?.abort();
       if (outcome !== "speech") voiceInterruptionPendingRef.current = false;
@@ -3841,10 +3983,88 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     );
   }
 
+  if (embedded && !embeddedExpanded) {
+    const compactAssistantText = hostAssistant
+      ? safeEmbeddedMessageText(hostAssistant).slice(0, 150)
+      : "Ready when you are.";
+    return (
+      <div
+        data-jarvis-embed-surface
+        data-jarvis-embed-expanded="false"
+        data-voice-state={orbState}
+        className="relative flex h-dvh w-full flex-col justify-between overflow-hidden rounded-2xl border border-white/10 bg-[#05070d]/95 p-3 shadow-2xl backdrop-blur-xl"
+      >
+        <div className="flex min-w-0 items-start gap-2 pr-16">
+          <button
+            type="button"
+            onClick={() => speaking ? stopTalking() : void toggleLive()}
+            aria-label={speaking ? "Interrupt Jarvis" : live === "live" ? "Stop Jarvis live listening" : "Start Jarvis live listening"}
+            className={`mt-0.5 grid h-9 w-9 shrink-0 place-items-center rounded-full ring-1 ${
+              live === "live" || orbState === "listening"
+                ? "bg-cyan/20 text-cyan ring-cyan/50"
+                : orbState === "thinking"
+                  ? "bg-amber/15 text-amber ring-amber/40"
+                  : "bg-cyan/10 text-cyan ring-cyan/25"
+            }`}
+          >
+            <span className={`h-2.5 w-2.5 rounded-full bg-current ${orbState === "idle" ? "" : "animate-pulse"}`} />
+          </button>
+          <div className="min-w-0 flex-1">
+            <div className="hud-label flex items-center gap-2 text-cyan">
+              <span>JARVIS</span>
+              <span className="truncate text-slate">{status}</span>
+            </div>
+            <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-ice/80">{compactAssistantText}</p>
+          </div>
+        </div>
+        <div className="absolute right-2 top-2 flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => setEmbeddedExpanded(true)}
+            aria-label="Open Jarvis chat"
+            title="Open chat"
+            className="grid h-8 w-8 place-items-center rounded-full text-sm text-slate ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan"
+          >
+            ↗
+          </button>
+          <button
+            type="button"
+            onClick={hideEmbedded}
+            aria-label="Close Jarvis"
+            className="grid h-8 w-8 place-items-center rounded-full text-lg text-slate ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan"
+          >
+            ×
+          </button>
+        </div>
+        {liveResearch.phase !== "idle" && <LiveResearchIndicator state={liveResearch} />}
+        <div className="flex min-w-0 gap-2">
+          <input
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            onKeyDown={(event) => event.key === "Enter" && submit(input)}
+            placeholder={busy ? "Jarvis is working…" : "Message Jarvis…"}
+            className="min-w-0 flex-1 rounded-xl bg-black/35 px-3 py-2 text-xs text-ice outline-none ring-1 ring-white/10 focus:ring-cyan/50"
+          />
+          <button
+            type="button"
+            onClick={() => void submit(input)}
+            disabled={sending || !input.trim()}
+            aria-label="Send message"
+            className="grid w-9 shrink-0 place-items-center rounded-xl bg-cyan/15 text-cyan ring-1 ring-cyan/40 disabled:opacity-40"
+          >
+            ↑
+          </button>
+        </div>
+        <span className="sr-only" aria-live="polite">Jarvis is {status}</span>
+      </div>
+    );
+  }
+
   if (embedded) {
     return (
       <div
         data-jarvis-embed-surface
+        data-jarvis-embed-expanded="true"
         data-voice-state={orbState}
         className="relative flex h-dvh w-full flex-col overflow-hidden bg-[#05070d]"
       >
@@ -3868,6 +4088,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           className="absolute right-3 top-3 z-[70] grid h-9 w-9 place-items-center rounded-full bg-black/35 text-xl text-white/60 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan"
         >
           ×
+        </button>
+        <button
+          type="button"
+          onClick={() => setEmbeddedExpanded(false)}
+          aria-label="Collapse Jarvis"
+          title="Collapse to the quick launcher"
+          className="absolute right-14 top-3 z-[70] grid h-9 w-9 place-items-center rounded-full bg-black/35 text-sm text-white/60 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan"
+        >
+          ↙
         </button>
         {guest && (
           <button
@@ -3936,11 +4165,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             {messages
               .slice(-8)
               .map((message) => {
-                if (message.role === "assistant" && message.text && isToolGarbage(message.text)) {
-                  return { ...message, text: sanitizeAssistantText(message.text) };
-                }
-                if (message.role === "user") return { ...message, text: visibleTurnText(message.text) };
-                return message;
+                return message.text
+                  ? { ...message, text: safeEmbeddedMessageText(message) }
+                  : message;
               })
               .filter((message) => message.text || message.status === "streaming")
               .map((message) => (

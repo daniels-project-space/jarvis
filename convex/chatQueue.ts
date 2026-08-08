@@ -1,6 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import type { MutationCtx } from "./_generated/server";
-import type { Doc } from "./_generated/dataModel";
+import type { Doc, Id } from "./_generated/dataModel";
 import { ConvexError, v } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import { CHAT_FILE_LIMITS, FILE_READY_STATUSES } from "../src/lib/chat-files";
@@ -25,8 +25,13 @@ import {
   validateReadyMessageFiles,
 } from "./fileHelpers";
 
-const HOST_CONTEXT_BLOCK = /\s*\[JARVIS_HOST_CONTEXT\][\s\S]*?\[\/JARVIS_HOST_CONTEXT\]\s*/g;
-const visibleTurnText = (text: string) => text.replace(HOST_CONTEXT_BLOCK, " ").replace(/\s{2,}/g, " ").trim();
+const HOST_CONTEXT_BLOCK =
+  /\s*\[JARVIS_HOST_CONTEXT\][\s\S]*?\[\/JARVIS_HOST_CONTEXT\]\s*/g;
+const visibleTurnText = (text: string) =>
+  text
+    .replace(HOST_CONTEXT_BLOCK, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 export const CHAT_TURN_STALE_MS = 45_000;
 export const MAX_CHAT_TURN_ATTEMPTS = 3;
 export const MAX_CHAT_RECOVERY_WAKES = 3;
@@ -81,21 +86,31 @@ async function admitGuestTurn(ctx: { db: any }, guestId: string, now: number) {
   const dayChanged = existing?.day !== day;
   const tokens = Math.min(
     GUEST_CHAT_BUCKET_CAPACITY,
-    Number(existing?.tokens ?? GUEST_CHAT_BUCKET_CAPACITY)
-      + Math.max(0, now - Number(existing?.refilledAt ?? now)) / GUEST_CHAT_REFILL_MS,
+    Number(existing?.tokens ?? GUEST_CHAT_BUCKET_CAPACITY) +
+      Math.max(0, now - Number(existing?.refilledAt ?? now)) /
+        GUEST_CHAT_REFILL_MS,
   );
   const dailyCount = dayChanged ? 0 : Number(existing?.dailyCount ?? 0);
   const inFlight = Number(existing?.inFlight ?? 0);
-  const retryAfterMs = Math.max(1_000, Math.ceil((1 - tokens) * GUEST_CHAT_REFILL_MS));
-  if (inFlight >= GUEST_CHAT_MAX_IN_FLIGHT || tokens < 1 || dailyCount >= GUEST_CHAT_DAILY_LIMIT) {
+  const retryAfterMs = Math.max(
+    1_000,
+    Math.ceil((1 - tokens) * GUEST_CHAT_REFILL_MS),
+  );
+  if (
+    inFlight >= GUEST_CHAT_MAX_IN_FLIGHT ||
+    tokens < 1 ||
+    dailyCount >= GUEST_CHAT_DAILY_LIMIT
+  ) {
     throw new ConvexError({
       code: "GUEST_CHAT_RATE_LIMITED",
-      reason: inFlight >= GUEST_CHAT_MAX_IN_FLIGHT
-        ? "too_many_active_turns"
-        : dailyCount >= GUEST_CHAT_DAILY_LIMIT
-          ? "daily_limit"
-          : "token_bucket",
-      retryAfterMs: dailyCount >= GUEST_CHAT_DAILY_LIMIT ? 60 * 60_000 : retryAfterMs,
+      reason:
+        inFlight >= GUEST_CHAT_MAX_IN_FLIGHT
+          ? "too_many_active_turns"
+          : dailyCount >= GUEST_CHAT_DAILY_LIMIT
+            ? "daily_limit"
+            : "token_bucket",
+      retryAfterMs:
+        dailyCount >= GUEST_CHAT_DAILY_LIMIT ? 60 * 60_000 : retryAfterMs,
     });
   }
   const next = {
@@ -111,14 +126,23 @@ async function admitGuestTurn(ctx: { db: any }, guestId: string, now: number) {
 }
 
 async function releaseGuestTurn(ctx: { db: any }, user: any) {
-  if (!user || user.role !== "user" || user.guestSlotReleased || !user.threadId.startsWith("guest:")) return;
+  if (
+    !user ||
+    user.role !== "user" ||
+    user.guestSlotReleased ||
+    !user.threadId.startsWith("guest:")
+  )
+    return;
   const guestId = user.threadId.slice("guest:".length);
   const limit = await ctx.db
     .query("chatGuestLimits")
     .withIndex("by_guest", (q: any) => q.eq("guestId", guestId))
     .first();
   await ctx.db.patch(user._id, { guestSlotReleased: true });
-  if (limit) await ctx.db.patch(limit._id, { inFlight: Math.max(0, Number(limit.inFlight ?? 0) - 1) });
+  if (limit)
+    await ctx.db.patch(limit._id, {
+      inFlight: Math.max(0, Number(limit.inFlight ?? 0) - 1),
+    });
 }
 
 async function reacquireGuestTurn(ctx: { db: any }, user: any) {
@@ -129,97 +153,169 @@ async function reacquireGuestTurn(ctx: { db: any }, user: any) {
     .withIndex("by_guest", (q: any) => q.eq("guestId", guestId))
     .first();
   await ctx.db.patch(user._id, { guestSlotReleased: false });
-  if (limit) await ctx.db.patch(limit._id, { inFlight: Number(limit.inFlight ?? 0) + 1 });
+  if (limit)
+    await ctx.db.patch(limit._id, {
+      inFlight: Number(limit.inFlight ?? 0) + 1,
+    });
 }
 
-export const sendMessage = mutation({
-  args: {
-    threadId: v.optional(v.string()),
-    text: v.string(),
-    requestId: v.optional(v.string()),
-    fileIds: v.optional(v.array(v.id("files"))),
-    researchPrefetch: v.optional(v.object({
+const sendMessageArgs = {
+  threadId: v.optional(v.string()),
+  text: v.string(),
+  requestId: v.optional(v.string()),
+  fileIds: v.optional(v.array(v.id("files"))),
+  researchPrefetch: v.optional(
+    v.object({
       basis: v.string(),
       context: v.string(),
       expiresAt: v.number(),
-    })),
-    ...actorAuthArgs,
-  },
-  handler: async (ctx, a) => {
-    const identity = await conversationIdentity(ctx, a);
-    const threadId = scopedConversationThread(identity, a.threadId);
-    const submittedText = identity.kind === "guest" ? a.text.slice(0, 2_000) : a.text;
-    const requestId = a.requestId?.slice(0, 120);
-    if (a.researchPrefetch && identity.kind !== "owner") {
-      throw new ConvexError({ code: "OWNER_REQUIRED", message: "Speculative research requires owner access" });
-    }
-    if (requestId) {
-      const prior = await ctx.db
-        .query("chatMessages")
-        .withIndex("by_request", (q: any) => q.eq("requestId", requestId))
-        .first();
-      if (prior?.role === "user") {
-        if (prior.threadId !== threadId || prior.text !== submittedText) {
-          throw new ConvexError({
-            code: "CHAT_REQUEST_CONFLICT",
-            message: "Chat request identity was reused with different text or thread",
-          });
-        }
-        const links = await ctx.db
-          .query("messageFiles")
-          .withIndex("by_message", (q: any) => q.eq("messageId", prior._id))
-          .take(9);
-        const priorIds = links
-          .sort((left: any, right: any) => left.position - right.position)
-          .map((link: any) => String(link.fileId));
-        const requestedIds = (a.fileIds ?? []).map(String);
-        if (priorIds.length !== requestedIds.length || priorIds.some((fileId: string, index: number) => fileId !== requestedIds[index])) {
-          throw new ConvexError({ code: "CHAT_REQUEST_CONFLICT", message: "Chat request identity was reused with different files" });
-        }
-        return prior._id;
-      }
-    }
-    const files = await validateReadyMessageFiles(ctx, threadId, a.fileIds, identity.kind === "guest");
-    if (identity.kind === "guest") await admitGuestTurn(ctx, identity.guestId, Date.now());
-    const session = await ensureSession(ctx, threadId);
-    // Stable turn slots keep concurrent replies beside the user message that
-    // caused them, even when a later fast turn finishes before an earlier one.
-    const createdAt = Math.max(Date.now(), Number(session?.lastActiveAt ?? 0) + 2);
-    const id = await ctx.db.insert("chatMessages", {
-      threadId,
-      role: "user",
-      text: submittedText,
-      status: "pending",
-      requestId,
-      delivery: "foreground",
-      attemptCount: 0,
-      dispatchEpoch: 0,
-      lastProgressAt: createdAt,
-      guestSlotReleased: identity.kind === "guest" ? false : undefined,
-      createdAt,
+    }),
+  ),
+  ...actorAuthArgs,
+};
+
+type SendMessageArgs = {
+  threadId?: string;
+  text: string;
+  requestId?: string;
+  fileIds?: Id<"files">[];
+  researchPrefetch?: { basis: string; context: string; expiresAt: number };
+  authTokenHash?: string;
+  workerToken?: string;
+  guestId?: string;
+};
+
+async function admitMessage(
+  ctx: MutationCtx,
+  a: SendMessageArgs,
+): Promise<Id<"chatMessages">> {
+  const identity = await conversationIdentity(ctx, a);
+  const threadId = scopedConversationThread(identity, a.threadId);
+  const submittedText =
+    identity.kind === "guest" ? a.text.slice(0, 2_000) : a.text;
+  const requestId = a.requestId?.slice(0, 120);
+  if (a.researchPrefetch && identity.kind !== "owner") {
+    throw new ConvexError({
+      code: "OWNER_REQUIRED",
+      message: "Speculative research requires owner access",
     });
-    await linkFilesToMessage(ctx, id, threadId, files, createdAt);
-    if (a.researchPrefetch) {
-      const prefetch = a.researchPrefetch;
-      const validPrefetch =
-        prefetch.basis.length >= 24 && prefetch.basis.length <= RESEARCH_PREFETCH_BASIS_MAX_CHARS &&
-        prefetch.context.length >= 40 && prefetch.context.length <= RESEARCH_PREFETCH_CONTEXT_MAX_CHARS &&
-        prefetch.expiresAt > createdAt && prefetch.expiresAt <= createdAt + RESEARCH_PREFETCH_MAX_LIFETIME_MS;
-      // Research is an optional latency optimization. A stale or drifted
-      // envelope must never reject the authoritative user turn.
-      if (validPrefetch) {
-        await ctx.db.insert("chatTurnPrefetches", {
-          messageId: id,
-          threadId,
-          basis: prefetch.basis,
-          context: prefetch.context,
-          expiresAt: prefetch.expiresAt,
-          createdAt,
+  }
+  if (requestId) {
+    const prior = await ctx.db
+      .query("chatMessages")
+      .withIndex("by_request", (q: any) => q.eq("requestId", requestId))
+      .first();
+    if (prior?.role === "user") {
+      if (prior.threadId !== threadId || prior.text !== submittedText) {
+        throw new ConvexError({
+          code: "CHAT_REQUEST_CONFLICT",
+          message:
+            "Chat request identity was reused with different text or thread",
         });
       }
+      const requestedIds = (a.fileIds ?? []).map(String);
+      const links =
+        prior.hasLinkedFiles === false && requestedIds.length === 0
+          ? []
+          : await ctx.db
+              .query("messageFiles")
+              .withIndex("by_message", (q: any) => q.eq("messageId", prior._id))
+              .take(9);
+      const priorIds = links
+        .sort((left: any, right: any) => left.position - right.position)
+        .map((link: any) => String(link.fileId));
+      if (
+        priorIds.length !== requestedIds.length ||
+        priorIds.some(
+          (fileId: string, index: number) => fileId !== requestedIds[index],
+        )
+      ) {
+        throw new ConvexError({
+          code: "CHAT_REQUEST_CONFLICT",
+          message: "Chat request identity was reused with different files",
+        });
+      }
+      return prior._id;
     }
-    if (session) await ctx.db.patch(session._id, { lastActiveAt: createdAt });
-    return id;
+  }
+  const files = await validateReadyMessageFiles(
+    ctx,
+    threadId,
+    a.fileIds,
+    identity.kind === "guest",
+  );
+  if (identity.kind === "guest")
+    await admitGuestTurn(ctx, identity.guestId, Date.now());
+  const session = await ensureSession(ctx, threadId);
+  // Stable turn slots keep concurrent replies beside the user message that
+  // caused them, even when a later fast turn finishes before an earlier one.
+  const createdAt = Math.max(
+    Date.now(),
+    Number(session?.lastActiveAt ?? 0) + 2,
+  );
+  const prefetch = a.researchPrefetch;
+  const validPrefetch = Boolean(
+    prefetch &&
+    prefetch.basis.length >= 24 &&
+    prefetch.basis.length <= RESEARCH_PREFETCH_BASIS_MAX_CHARS &&
+    prefetch.context.length >= 40 &&
+    prefetch.context.length <= RESEARCH_PREFETCH_CONTEXT_MAX_CHARS &&
+    prefetch.expiresAt > createdAt &&
+    prefetch.expiresAt <= createdAt + RESEARCH_PREFETCH_MAX_LIFETIME_MS,
+  );
+  const id = await ctx.db.insert("chatMessages", {
+    threadId,
+    role: "user",
+    text: submittedText,
+    status: "pending",
+    requestId,
+    delivery: "foreground",
+    attemptCount: 0,
+    dispatchEpoch: 0,
+    lastProgressAt: createdAt,
+    guestSlotReleased: identity.kind === "guest" ? false : undefined,
+    hasLinkedFiles: files.length > 0,
+    hasResearchPrefetch: validPrefetch,
+    createdAt,
+  });
+  await linkFilesToMessage(ctx, id, threadId, files, createdAt);
+  if (prefetch) {
+    // Research is an optional latency optimization. A stale or drifted
+    // envelope must never reject the authoritative user turn.
+    if (validPrefetch) {
+      await ctx.db.insert("chatTurnPrefetches", {
+        messageId: id,
+        threadId,
+        basis: prefetch.basis,
+        context: prefetch.context,
+        expiresAt: prefetch.expiresAt,
+        createdAt,
+      });
+    }
+  }
+  if (session) await ctx.db.patch(session._id, { lastActiveAt: createdAt });
+  return id;
+}
+
+export const sendMessage = mutation({
+  args: sendMessageArgs,
+  handler: admitMessage,
+});
+
+export const sendMessageWithRunnerLease = mutation({
+  args: sendMessageArgs,
+  handler: async (ctx, a) => {
+    const messageId = await admitMessage(ctx, a);
+    const runner = await ctx.db
+      .query("ui")
+      .withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY))
+      .first();
+    return {
+      messageId,
+      warmRunner: Boolean(
+        runner?.updatedAt && Date.now() - runner.updatedAt < 25_000,
+      ),
+    };
   },
 });
 
@@ -245,7 +341,11 @@ export const HISTORY_PAGE_MAX = 20;
 // every cursor request server-side: pagination's numItems is advisory for a
 // reactive query, while maximumRowsRead is the actual database read ceiling.
 export const paginatedMessages = query({
-  args: { threadId: v.optional(v.string()), paginationOpts: paginationOptsValidator, ...viewerAuthArgs },
+  args: {
+    threadId: v.optional(v.string()),
+    paginationOpts: paginationOptsValidator,
+    ...viewerAuthArgs,
+  },
   handler: async (ctx, a) => {
     const identity = await conversationViewerIdentity(ctx, a);
     const threadId = scopedConversationThread(identity, a.threadId);
@@ -255,11 +355,20 @@ export const paginatedMessages = query({
       .order("desc")
       .paginate({
         ...a.paginationOpts,
-        numItems: Math.min(HISTORY_PAGE_MAX, Math.max(1, Math.floor(a.paginationOpts.numItems || HISTORY_PAGE_MAX))),
+        numItems: Math.min(
+          HISTORY_PAGE_MAX,
+          Math.max(
+            1,
+            Math.floor(a.paginationOpts.numItems || HISTORY_PAGE_MAX),
+          ),
+        ),
         maximumRowsRead: HISTORY_PAGE_MAX,
         maximumBytesRead: 256 * 1024,
       });
-    return { ...result, page: await attachFileBadgesToMessages(ctx, threadId, result.page) };
+    return {
+      ...result,
+      page: await attachFileBadgesToMessages(ctx, threadId, result.page),
+    };
   },
 });
 
@@ -305,7 +414,8 @@ export const turnStatus = query({
     const identity = await conversationViewerIdentity(ctx, a);
     const threadId = scopedConversationThread(identity, a.threadId);
     const user = await ctx.db.get(a.messageId);
-    if (!user || user.role !== "user" || user.threadId !== threadId) return null;
+    if (!user || user.role !== "user" || user.threadId !== threadId)
+      return null;
     const assistant = await ctx.db
       .query("chatMessages")
       .withIndex("by_parent", (q: any) => q.eq("parentMessageId", user._id))
@@ -316,7 +426,12 @@ export const turnStatus = query({
       status: user.status,
       attemptCount: Number(user.attemptCount ?? 0),
       assistant: assistant
-        ? { _id: assistant._id, status: assistant.status, text: assistant.text, parentMessageId: user._id }
+        ? {
+            _id: assistant._id,
+            status: assistant.status,
+            text: assistant.text,
+            parentMessageId: user._id,
+          }
         : null,
     };
   },
@@ -331,11 +446,15 @@ async function settleSession(ctx: { db: any }, threadId: string) {
   const [pending, streaming] = await Promise.all([
     ctx.db
       .query("chatMessages")
-      .withIndex("by_thread_status", (q: any) => q.eq("threadId", threadId).eq("status", "pending"))
+      .withIndex("by_thread_status", (q: any) =>
+        q.eq("threadId", threadId).eq("status", "pending"),
+      )
       .first(),
     ctx.db
       .query("chatMessages")
-      .withIndex("by_thread_status", (q: any) => q.eq("threadId", threadId).eq("status", "streaming"))
+      .withIndex("by_thread_status", (q: any) =>
+        q.eq("threadId", threadId).eq("status", "streaming"),
+      )
       .first(),
   ]);
   const stillWorking = Boolean(pending || streaming);
@@ -346,7 +465,9 @@ async function settleSession(ctx: { db: any }, threadId: string) {
 }
 
 async function recoverAssistant(ctx: { db: any }, assistant: any) {
-  const parent = assistant.parentMessageId ? await ctx.db.get(assistant.parentMessageId) : null;
+  const parent = assistant.parentMessageId
+    ? await ctx.db.get(assistant.parentMessageId)
+    : null;
   const attempts = Number(parent?.attemptCount ?? assistant.attemptCount ?? 1);
   await sealWorkerCancellationFence(ctx, assistant, `recovery:${Date.now()}`);
   if (!parent || parent.role !== "user" || attempts >= MAX_CHAT_TURN_ATTEMPTS) {
@@ -356,22 +477,40 @@ async function recoverAssistant(ctx: { db: any }, assistant: any) {
       lastProgressAt: Date.now(),
     });
     if (parent?.role === "user") {
-      await ctx.db.patch(parent._id, { status: "error", lastProgressAt: Date.now() });
+      await ctx.db.patch(parent._id, {
+        status: "error",
+        lastProgressAt: Date.now(),
+      });
       await releaseGuestTurn(ctx, parent);
       await deleteTurnPrefetch(ctx, parent._id);
     }
     await settleSession(ctx, assistant.threadId);
-    return { status: "failed" as const, messageId: parent?._id ?? null, attemptCount: attempts };
+    return {
+      status: "failed" as const,
+      messageId: parent?._id ?? null,
+      attemptCount: attempts,
+    };
   }
   await ctx.db.patch(assistant._id, {
     status: "superseded",
     text: "",
     lastProgressAt: Date.now(),
   });
-  await ctx.db.patch(parent._id, { status: "pending", lastProgressAt: Date.now() });
+  await ctx.db.patch(parent._id, {
+    status: "pending",
+    lastProgressAt: Date.now(),
+  });
   const session = await ensureSession(ctx, assistant.threadId);
-  if (session) await ctx.db.patch(session._id, { status: "working", lastActiveAt: Date.now() });
-  return { status: "requeued" as const, messageId: parent._id, attemptCount: attempts };
+  if (session)
+    await ctx.db.patch(session._id, {
+      status: "working",
+      lastActiveAt: Date.now(),
+    });
+  return {
+    status: "requeued" as const,
+    messageId: parent._id,
+    attemptCount: attempts,
+  };
 }
 
 async function issueRecoveryWake(
@@ -381,7 +520,11 @@ async function issueRecoveryWake(
 ) {
   const dispatchEpoch = Number(user.dispatchEpoch ?? 0) + 1;
   if (dispatchEpoch > MAX_CHAT_RECOVERY_WAKES) {
-    await ctx.db.patch(user._id, { status: "error", dispatchEpoch, lastProgressAt: Date.now() });
+    await ctx.db.patch(user._id, {
+      status: "error",
+      dispatchEpoch,
+      lastProgressAt: Date.now(),
+    });
     await ctx.db.insert("chatMessages", {
       threadId: user.threadId,
       role: "assistant",
@@ -396,15 +539,25 @@ async function issueRecoveryWake(
     });
     await releaseGuestTurn(ctx, user);
     await settleSession(ctx, user.threadId);
-    return { status: "failed" as const, attemptCount: Number(user.attemptCount ?? 0), dispatchEpoch };
+    return {
+      status: "failed" as const,
+      attemptCount: Number(user.attemptCount ?? 0),
+      dispatchEpoch,
+    };
   }
   await reacquireGuestTurn(ctx, user);
   await ctx.db.patch(user._id, { dispatchEpoch, lastProgressAt: Date.now() });
-  return { status, messageId: user._id, attemptCount: Number(user.attemptCount ?? 0), dispatchEpoch };
+  return {
+    status,
+    messageId: user._id,
+    attemptCount: Number(user.attemptCount ?? 0),
+    dispatchEpoch,
+  };
 }
 
 async function expirePending(ctx: { db: any }, user: any) {
-  const text = "This request expired while Jarvis was unavailable. Tap retry to send it again.";
+  const text =
+    "This request expired while Jarvis was unavailable. Tap retry to send it again.";
   await ctx.db.patch(user._id, { status: "error", lastProgressAt: Date.now() });
   await ctx.db.insert("chatMessages", {
     threadId: user.threadId,
@@ -446,7 +599,9 @@ export const reapStuck = mutation({
     }
     const staleSessions = await ctx.db
       .query("chatSessions")
-      .withIndex("by_status_activity", (q: any) => q.eq("status", "working").lt("lastActiveAt", cutoff))
+      .withIndex("by_status_activity", (q: any) =>
+        q.eq("status", "working").lt("lastActiveAt", cutoff),
+      )
       .take(100);
     for (const session of staleSessions) {
       await settleSession(ctx, session.threadId);
@@ -468,10 +623,13 @@ export const requestRecovery = mutation({
     const identity = await conversationIdentity(ctx, a);
     const threadId = scopedConversationThread(identity, a.threadId);
     const user = await ctx.db.get(a.messageId);
-    if (!user || user.role !== "user" || user.threadId !== threadId) return { status: "missing" as const };
+    if (!user || user.role !== "user" || user.threadId !== threadId)
+      return { status: "missing" as const };
     const cancellation = await ctx.db
       .query("ui")
-      .withIndex("by_key", (q) => q.eq("key", cancellationReceiptKey(String(user._id))))
+      .withIndex("by_key", (q) =>
+        q.eq("key", cancellationReceiptKey(String(user._id))),
+      )
       .first();
     if (cancellation) {
       return { status: "cancelled" as const, messageId: user._id };
@@ -484,7 +642,13 @@ export const requestRecovery = mutation({
       .withIndex("by_parent", (q: any) => q.eq("parentMessageId", user._id))
       .order("desc")
       .first();
-    if (!assistant) return { status: user.status === "done" ? "completed" as const : "missing" as const };
+    if (!assistant)
+      return {
+        status:
+          user.status === "done"
+            ? ("completed" as const)
+            : ("missing" as const),
+      };
     if (assistant.status === "done") {
       // Recovery is also a delivery path. A browser can miss the reactive
       // transition while reconnecting, so return the finished assistant row
@@ -504,19 +668,39 @@ export const requestRecovery = mutation({
       };
     }
     if (assistant.status === "streaming") {
-      if (Date.now() - Number(assistant.lastProgressAt ?? assistant.createdAt) < CHAT_TURN_STALE_MS) {
-        return { status: "active" as const, attemptCount: Number(user.attemptCount ?? 1) };
+      if (
+        Date.now() - Number(assistant.lastProgressAt ?? assistant.createdAt) <
+        CHAT_TURN_STALE_MS
+      ) {
+        return {
+          status: "active" as const,
+          attemptCount: Number(user.attemptCount ?? 1),
+        };
       }
       const recovered = await recoverAssistant(ctx, assistant);
       if (recovered.status !== "requeued") return recovered;
-      return await issueRecoveryWake(ctx, await ctx.db.get(user._id), "requeued");
+      return await issueRecoveryWake(
+        ctx,
+        await ctx.db.get(user._id),
+        "requeued",
+      );
     }
-    if (assistant.status === "error" && Number(user.attemptCount ?? 0) < MAX_CHAT_TURN_ATTEMPTS) {
+    if (
+      assistant.status === "error" &&
+      Number(user.attemptCount ?? 0) < MAX_CHAT_TURN_ATTEMPTS
+    ) {
       const recovered = await recoverAssistant(ctx, assistant);
       if (recovered.status !== "requeued") return recovered;
-      return await issueRecoveryWake(ctx, await ctx.db.get(user._id), "requeued");
+      return await issueRecoveryWake(
+        ctx,
+        await ctx.db.get(user._id),
+        "requeued",
+      );
     }
-    return { status: "failed" as const, attemptCount: Number(user.attemptCount ?? 0) };
+    return {
+      status: "failed" as const,
+      attemptCount: Number(user.attemptCount ?? 0),
+    };
   },
 });
 
@@ -539,7 +723,10 @@ async function sealWorkerCancellationFence(
   receipt: string,
 ) {
   if (!assistant?.claimToken) return;
-  const key = workerCancellationKey(String(assistant._id), assistant.claimToken);
+  const key = workerCancellationKey(
+    String(assistant._id),
+    assistant.claimToken,
+  );
   const existing = await ctx.db
     .query("ui")
     .withIndex("by_key", (q) => q.eq("key", key))
@@ -657,114 +844,163 @@ export const logTurn = mutation({
   },
 });
 
-async function claimPending(ctx: { db: any }, pending: any, claimToken: string) {
-    const attemptCount = Number(pending.attemptCount ?? 0) + 1;
-    const now = Date.now();
-    await ctx.db.patch(pending._id, { status: "done", attemptCount, lastProgressAt: now });
+async function claimPending(
+  ctx: { db: any },
+  pending: any,
+  claimToken: string,
+) {
+  const attemptCount = Number(pending.attemptCount ?? 0) + 1;
+  const now = Date.now();
+  await ctx.db.patch(pending._id, {
+    status: "done",
+    attemptCount,
+    lastProgressAt: now,
+  });
 
-    const session = await ctx.db
-      .query("chatSessions")
-      .withIndex("by_thread", (q: any) => q.eq("threadId", pending.threadId))
-      .first();
-    if (session) await ctx.db.patch(session._id, { status: "working", lastActiveAt: Date.now() });
-
-    const assistantId = await ctx.db.insert("chatMessages", {
-      threadId: pending.threadId,
-      role: "assistant",
-      text: "",
-      status: "streaming",
-      parentMessageId: pending._id,
-      delivery: "foreground",
-      streamRevision: 0,
-      attemptCount,
-      claimToken,
-      lastProgressAt: now,
-      createdAt: pending.createdAt + 1,
+  const session = await ctx.db
+    .query("chatSessions")
+    .withIndex("by_thread", (q: any) => q.eq("threadId", pending.threadId))
+    .first();
+  if (session)
+    await ctx.db.patch(session._id, {
+      status: "working",
+      lastActiveAt: Date.now(),
     });
 
-    const all = await ctx.db
-      .query("chatMessages")
-      .withIndex("by_thread", (q: any) => q.eq("threadId", pending.threadId))
-      .order("desc")
-      .take(40);
-    const history = all
-      .filter(
-        (m: any) =>
-          m._id !== assistantId &&
-          m._id !== pending._id &&
-          m.status === "done" &&
-          m.delivery !== "notification" &&
-          m.createdAt < pending.createdAt,
-      )
-      .sort((a: any, b: any) => a.createdAt - b.createdAt)
-      .slice(-12)
-      .map((m: any) => ({ role: m.role, text: m.role === "user" ? visibleTurnText(m.text) : m.text }));
-    const prefetchRow = await ctx.db
-      .query("chatTurnPrefetches")
-      .withIndex("by_message", (q: any) => q.eq("messageId", pending._id))
-      .first();
-    const researchPrefetch = prefetchRow && prefetchRow.expiresAt > now
+  const assistantId = await ctx.db.insert("chatMessages", {
+    threadId: pending.threadId,
+    role: "assistant",
+    text: "",
+    status: "streaming",
+    parentMessageId: pending._id,
+    delivery: "foreground",
+    streamRevision: 0,
+    attemptCount,
+    claimToken,
+    lastProgressAt: now,
+    createdAt: pending.createdAt + 1,
+  });
+
+  const all = await ctx.db
+    .query("chatMessages")
+    .withIndex("by_thread", (q: any) => q.eq("threadId", pending.threadId))
+    .order("desc")
+    .take(40);
+  const history = all
+    .filter(
+      (m: any) =>
+        m._id !== assistantId &&
+        m._id !== pending._id &&
+        m.status === "done" &&
+        m.delivery !== "notification" &&
+        m.createdAt < pending.createdAt,
+    )
+    .sort((a: any, b: any) => a.createdAt - b.createdAt)
+    .slice(-12)
+    .map((m: any) => ({
+      role: m.role,
+      text: m.role === "user" ? visibleTurnText(m.text) : m.text,
+    }));
+  const prefetchRow =
+    pending.hasResearchPrefetch === false
+      ? null
+      : await ctx.db
+          .query("chatTurnPrefetches")
+          .withIndex("by_message", (q: any) => q.eq("messageId", pending._id))
+          .first();
+  const researchPrefetch =
+    prefetchRow && prefetchRow.expiresAt > now
       ? {
           basis: prefetchRow.basis,
           context: prefetchRow.context,
           expiresAt: prefetchRow.expiresAt,
         }
       : undefined;
-    if (prefetchRow && !researchPrefetch) await ctx.db.delete(prefetchRow._id);
-    // Attachment scope is intentionally the exact claimed user row. Thread
-    // library files and files on any earlier/later message never enter this
-    // turn implicitly.
-    const messageAttachments = await messageFileManifests(ctx, pending._id, pending.text);
-    const fileRelevant = messageAttachments.length > 0 || isLikelyFileReference(pending.text);
-    const namedReference = !messageAttachments.length && fileRelevant
+  if (prefetchRow && !researchPrefetch) await ctx.db.delete(prefetchRow._id);
+  // Attachment scope is intentionally the exact claimed user row. Thread
+  // library files and files on any earlier/later message never enter this
+  // turn implicitly.
+  const messageAttachments =
+    pending.hasLinkedFiles === false
+      ? []
+      : await messageFileManifests(ctx, pending._id, pending.text);
+  const fileRelevant =
+    messageAttachments.length > 0 || isLikelyFileReference(pending.text);
+  const namedReference =
+    !messageAttachments.length && fileRelevant
       ? await namedThreadFileManifest(ctx, pending.threadId, pending.text)
       : null;
-    const recentFallback = !messageAttachments.length && !namedReference && isDeterministicFileFollowUp(pending.text)
+  const recentFallback =
+    !messageAttachments.length &&
+    !namedReference &&
+    isDeterministicFileFollowUp(pending.text)
       ? await recentThreadFileManifest(ctx, pending.threadId)
       : null;
-    const resolvedFallback = namedReference ?? recentFallback;
-    if (resolvedFallback) {
-      const file = await ctx.db.get(resolvedFallback.fileId);
-      if (file && FILE_READY_STATUSES.has(String(file.status))) {
-        // Persist deterministic named/recent resolution on the invoking turn
-        // before any model/tool runs. Retries now see the same exact source,
-        // history shows it, and creations can cite it durably.
-        await linkFilesToMessage(ctx, pending._id, pending.threadId, [file], pending.createdAt);
-      }
+  const resolvedFallback = namedReference ?? recentFallback;
+  if (resolvedFallback) {
+    const file = await ctx.db.get(resolvedFallback.fileId);
+    if (file && FILE_READY_STATUSES.has(String(file.status))) {
+      // Persist deterministic named/recent resolution on the invoking turn
+      // before any model/tool runs. Retries now see the same exact source,
+      // history shows it, and creations can cite it durably.
+      await linkFilesToMessage(
+        ctx,
+        pending._id,
+        pending.threadId,
+        [file],
+        pending.createdAt,
+      );
+      await ctx.db.patch(pending._id, { hasLinkedFiles: true });
     }
-    const attachments = resolvedFallback
-      ? (await messageFileManifests(ctx, pending._id, pending.text)).map((file) => ({
+  }
+  const attachments = resolvedFallback
+    ? (await messageFileManifests(ctx, pending._id, pending.text)).map(
+        (file) => ({
           ...file,
-          ...(file.fileId === resolvedFallback.fileId ? { selection: resolvedFallback.selection } : {}),
-        }))
-      : messageAttachments;
-    const fileCatalog = fileRelevant && !attachments.length ? await threadFileCatalog(ctx, pending.threadId) : [];
+          ...(file.fileId === resolvedFallback.fileId
+            ? { selection: resolvedFallback.selection }
+            : {}),
+        }),
+      )
+    : messageAttachments;
+  const fileCatalog =
+    fileRelevant && !attachments.length
+      ? await threadFileCatalog(ctx, pending.threadId)
+      : [];
 
-    return {
-      threadId: pending.threadId,
-      guest: pending.threadId.startsWith("guest:"),
-      userText: pending.text,
-      requestId: pending.requestId,
-      userMessageId: pending._id,
-      assistantId,
-      claimToken,
-      attemptCount,
-      history,
-      researchPrefetch,
-      attachments,
-      fileCatalog,
-    };
+  return {
+    threadId: pending.threadId,
+    guest: pending.threadId.startsWith("guest:"),
+    userText: pending.text,
+    requestId: pending.requestId,
+    userMessageId: pending._id,
+    assistantId,
+    claimToken,
+    attemptCount,
+    history,
+    researchPrefetch,
+    attachments,
+    fileCatalog,
+  };
 }
 
 // Immediate Trigger runs claim exactly the message that woke it. The one
 // foreground lease then prevents duplicate workers from racing a shared drain.
 export const claimMessage = mutation({
-  args: { messageId: v.id("chatMessages"), claimToken: v.string(), workerToken: v.optional(v.string()) },
+  args: {
+    messageId: v.id("chatMessages"),
+    claimToken: v.string(),
+    workerToken: v.optional(v.string()),
+  },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const pending = await ctx.db.get(a.messageId);
-    if (!pending || pending.role !== "user" || pending.status !== "pending") return null;
-    if (Date.now() - Number(pending.lastProgressAt ?? pending.createdAt) >= CHAT_PENDING_EXPIRY_MS) {
+    if (!pending || pending.role !== "user" || pending.status !== "pending")
+      return null;
+    if (
+      Date.now() - Number(pending.lastProgressAt ?? pending.createdAt) >=
+      CHAT_PENDING_EXPIRY_MS
+    ) {
       await expirePending(ctx, pending);
       return null;
     }
@@ -782,7 +1018,10 @@ export const claimNext = mutation({
       .withIndex("by_status", (q: any) => q.eq("status", "pending"))
       .take(100);
     for (const pending of pendingRows) {
-      if (Date.now() - Number(pending.lastProgressAt ?? pending.createdAt) >= CHAT_PENDING_EXPIRY_MS) {
+      if (
+        Date.now() - Number(pending.lastProgressAt ?? pending.createdAt) >=
+        CHAT_PENDING_EXPIRY_MS
+      ) {
         await expirePending(ctx, pending);
         continue;
       }
@@ -808,15 +1047,34 @@ export const touchRunner = mutation({
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
-    const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY)).first();
-    const validHandoff = Boolean(a.takeoverFrom && row?.value === a.takeoverFrom);
-    if (row && row.value !== a.runnerId && !validHandoff && Date.now() - row.updatedAt < RUNNER_LEASE_MS) return false;
-    const doc = { key: RUNNER_KEY, type: "lease", value: a.runnerId, updatedAt: Date.now() };
+    const row = await ctx.db
+      .query("ui")
+      .withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY))
+      .first();
+    const validHandoff = Boolean(
+      a.takeoverFrom && row?.value === a.takeoverFrom,
+    );
+    if (
+      row &&
+      row.value !== a.runnerId &&
+      !validHandoff &&
+      Date.now() - row.updatedAt < RUNNER_LEASE_MS
+    )
+      return false;
+    const doc = {
+      key: RUNNER_KEY,
+      type: "lease",
+      value: a.runnerId,
+      updatedAt: Date.now(),
+    };
     if (row) await ctx.db.patch(row._id, doc);
     else await ctx.db.insert("ui", doc);
     if (a.activeMessageId && a.claimToken) {
       const active = await ctx.db.get(a.activeMessageId);
-      if (active?.status === "streaming" && active.claimToken === a.claimToken) {
+      if (
+        active?.status === "streaming" &&
+        active.claimToken === a.claimToken
+      ) {
         await ctx.db.patch(active._id, { lastProgressAt: Date.now() });
       }
     }
@@ -828,8 +1086,21 @@ export const releaseRunner = mutation({
   args: { runnerId: v.string(), workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
-    const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY)).first();
-    if (row?.value === a.runnerId) await ctx.db.delete(row._id);
+    const row = await ctx.db
+      .query("ui")
+      .withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY))
+      .first();
+    if (row?.value !== a.runnerId) return { released: false, pendingMessageId: null };
+    // Lease retirement and the pending check must be one transaction. If a
+    // message was admitted before this delete, the retiring worker launches a
+    // replacement; if admission happens after it, Vercel observes no runner
+    // and launches one itself. There is no warm-snapshot gap where neither acts.
+    await ctx.db.delete(row._id);
+    const pending = await ctx.db
+      .query("chatMessages")
+      .withIndex("by_status", (q: any) => q.eq("status", "pending"))
+      .first();
+    return { released: true, pendingMessageId: pending?._id ?? null };
   },
 });
 
@@ -837,7 +1108,10 @@ export const runnerLease = query({
   args: { ...actorAuthArgs },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
-    const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY)).first();
+    const row = await ctx.db
+      .query("ui")
+      .withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY))
+      .first();
     return row ? { runnerId: row.value, updatedAt: row.updatedAt } : null;
   },
 });
@@ -846,7 +1120,10 @@ export const runnerLeaseForWorker = query({
   args: { workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
-    const row = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY)).first();
+    const row = await ctx.db
+      .query("ui")
+      .withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY))
+      .first();
     return row ? { runnerId: row.value, updatedAt: row.updatedAt } : null;
   },
 });
@@ -862,7 +1139,8 @@ export const turnCancellationForWorker = query({
     const row = await ctx.db
       .query("ui")
       .withIndex("by_key", (q) =>
-        q.eq("key", workerCancellationKey(String(a.messageId), a.claimToken)))
+        q.eq("key", workerCancellationKey(String(a.messageId), a.claimToken)),
+      )
       .first();
     return Boolean(row);
   },
@@ -872,7 +1150,10 @@ export const pendingSignal = query({
   args: { workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
-    const pending = await ctx.db.query("chatMessages").withIndex("by_status", (q: any) => q.eq("status", "pending")).first();
+    const pending = await ctx.db
+      .query("chatMessages")
+      .withIndex("by_status", (q: any) => q.eq("status", "pending"))
+      .first();
     return pending?._id ?? null;
   },
 });
@@ -919,16 +1200,26 @@ export const finalize = mutation({
     const ex = await ctx.db.get(a.messageId);
     if (!ex || ex.role !== "assistant") return false;
     if (ex.claimToken && a.claimToken !== ex.claimToken) return false;
-    if (ex.status === "done") return a.status === "done" && (a.finalText === undefined || a.finalText === ex.text);
+    if (ex.status === "done")
+      return (
+        a.status === "done" &&
+        (a.finalText === undefined || a.finalText === ex.text)
+      );
     if (ex.status !== "streaming") return false;
-    const patch: Record<string, unknown> = { status: a.status, lastProgressAt: Date.now() };
+    const patch: Record<string, unknown> = {
+      status: a.status,
+      lastProgressAt: Date.now(),
+    };
     if (a.finalText !== undefined) patch.text = a.finalText;
     if (a.model) patch.model = a.model;
     await ctx.db.patch(a.messageId, patch);
     if (ex.parentMessageId) {
       const parent = await ctx.db.get(ex.parentMessageId);
       if (parent?.role === "user") {
-        await ctx.db.patch(parent._id, { status: a.status, lastProgressAt: Date.now() });
+        await ctx.db.patch(parent._id, {
+          status: a.status,
+          lastProgressAt: Date.now(),
+        });
         await releaseGuestTurn(ctx, parent);
         await deleteTurnPrefetch(ctx, parent._id);
       }
@@ -942,7 +1233,11 @@ export const finalize = mutation({
 // visible/findable, but the browser must never confuse one with the foreground
 // answer to Daniel's current turn or speak it minutes later.
 export const postAssistant = mutation({
-  args: { threadId: v.string(), text: v.string(), workerToken: v.optional(v.string()) },
+  args: {
+    threadId: v.string(),
+    text: v.string(),
+    workerToken: v.optional(v.string()),
+  },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     await ctx.db.insert("chatMessages", {
@@ -987,7 +1282,9 @@ export const clearThread = mutation({
     await requireActor(ctx, a);
     const rows = await ctx.db
       .query("chatMessages")
-      .withIndex("by_thread", (q: any) => q.eq("threadId", a.threadId ?? "main"))
+      .withIndex("by_thread", (q: any) =>
+        q.eq("threadId", a.threadId ?? "main"),
+      )
       .collect();
     for (const r of rows) {
       const provenance = await ctx.db

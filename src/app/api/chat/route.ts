@@ -24,6 +24,12 @@ function guestRateLimit(error: unknown): { retryAfterMs: number } | null {
   return String(error).includes("GUEST_CHAT_RATE_LIMITED") ? { retryAfterMs: 60_000 } : null;
 }
 
+function missingCombinedAdmission(error: unknown): boolean {
+  const message = String(error).toLowerCase();
+  return message.includes("sendmessagewithrunnerlease") &&
+    (message.includes("could not find") || message.includes("function not found") || message.includes("not a function"));
+}
+
 async function handlePost(req: NextRequest, actor: ControlActor) {
   let text = "";
   let threadId = "main";
@@ -70,15 +76,33 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
 
   const credentials = actor.kind === "guest" ? { guestId: actor.guestId } : controlCredentials(actor);
   let messageId: unknown;
+  let warm: boolean | undefined;
   try {
-    messageId = await convexMutation("chatQueue:sendMessage", {
+    const admissionArgs = {
       threadId,
       text: text.slice(0, actor.kind === "guest" ? 2_000 : 12_000),
       requestId: requestId || undefined,
       fileIds: fileIds.length ? fileIds : undefined,
       researchPrefetch: researchPrefetch ?? undefined,
       ...credentials,
-    });
+    };
+    const admission = await convexMutation("chatQueue:sendMessageWithRunnerLease", admissionArgs)
+      .catch(async (error) => {
+        // Convex is deployed before Vercel normally. During an out-of-order
+        // rolling deploy, fall back only when the new function is provably
+        // absent; never replay an ambiguous failed admission.
+        if (!missingCombinedAdmission(error)) throw error;
+        return await convexMutation("chatQueue:sendMessage", admissionArgs);
+      });
+    if (admission && typeof admission === "object" && "messageId" in admission) {
+      messageId = (admission as { messageId: unknown }).messageId;
+      const warmRunner = (admission as { warmRunner?: unknown }).warmRunner;
+      if (typeof warmRunner === "boolean") warm = warmRunner;
+    } else {
+      // Rolling-deploy compatibility: an older Convex function returns only
+      // the message Id, so retain the old read until both sides converge.
+      messageId = admission;
+    }
   } catch (error) {
     const limited = actor.kind === "guest" ? guestRateLimit(error) : null;
     if (!limited) throw error;
@@ -90,9 +114,11 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
       },
     );
   }
-  const lease = await convexQuery("chatQueue:runnerLease", credentials)
-    .catch(() => null) as { updatedAt?: number } | null;
-  const warm = Boolean(lease?.updatedAt && Date.now() - lease.updatedAt < 25_000);
+  if (warm === undefined) {
+    const lease = await convexQuery("chatQueue:runnerLease", credentials)
+      .catch(() => null) as { updatedAt?: number } | null;
+    warm = Boolean(lease?.updatedAt && Date.now() - lease.updatedAt < 25_000);
+  }
   const handle = warm ? null : await tasks
     .trigger(
       "jarvis-chat-turn",

@@ -280,6 +280,37 @@ describe("Project Hub Jarvis loader", () => {
     expect(editCard?.style.cssText).toContain("bottom:72px");
   });
 
+  it("defaults to a compact iframe and accepts only trusted semantic layout requests", () => {
+    const harness = createLoader();
+    const receive = harness.listeners.get("message")?.[0];
+
+    expect(harness.frame.style.cssText).toContain("width:min(320px,calc(100vw - 16px))");
+    expect(harness.frame.style.cssText).toContain("height:min(190px,calc(100vh - 82px))");
+
+    receive?.({
+      origin: "https://hostile.example",
+      source: harness.frameWindow,
+      data: { jarvis: "layout", expanded: true },
+    });
+    expect(harness.frame.style.width).toBeUndefined();
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "layout", expanded: true, width: "100vw" },
+    });
+    expect(harness.frame.style.width).toBe("min(460px,calc(100vw - 16px))");
+    expect(harness.frame.style.height).toBe("min(520px,calc(100vh - 82px))");
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "layout", expanded: false },
+    });
+    expect(harness.frame.style.width).toBe("min(320px,calc(100vw - 16px))");
+    expect(harness.frame.style.height).toBe("min(190px,calc(100vh - 82px))");
+  });
+
   it("shows bounded realtime work stages in the collapsed host control", () => {
     const harness = createLoader();
     const controls = harness.createdElements.find((element) => "data-jarvis-universal-controls" in element.attributes);
@@ -453,6 +484,39 @@ describe("Project Hub Jarvis loader", () => {
     vi.advanceTimersByTime(1);
     expect(harness.FakeRecognition.instances).toHaveLength(2);
     expect(harness.window.JARVIS.wake.listening).toBe(true);
+  });
+
+  it("atomically transfers live preview recognition to the trusted iframe", () => {
+    const harness = createLoader();
+    const receive = harness.listeners.get("message")?.[0];
+    const sessionId = "voice-session-123";
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "preview-claim", sessionId },
+    });
+
+    expect(harness.FakeRecognition.instances[0].abort).toHaveBeenCalledOnce();
+    expect(harness.window.JARVIS.wake.listening).toBe(false);
+    expect(harness.messages).toContainEqual({ jarvis: "host-preview-grant", sessionId });
+
+    const grantCount = harness.messages.filter(
+      (message) => (message as { jarvis?: string }).jarvis === "host-preview-grant",
+    ).length;
+    receive?.({
+      origin: "https://untrusted.example",
+      source: harness.frameWindow,
+      data: { jarvis: "preview-claim", sessionId: "voice-session-evil" },
+    });
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "preview-claim", sessionId: "bad id" },
+    });
+    expect(harness.messages.filter(
+      (message) => (message as { jarvis?: string }).jarvis === "host-preview-grant",
+    )).toHaveLength(grantCount);
   });
 
   it("does not forward an invented ambient thank-you after Jarvis speaks", () => {

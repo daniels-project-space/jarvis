@@ -47,7 +47,7 @@ vi.mock("next/dynamic", () => ({
 }));
 
 import Home from "../app/page";
-import JarvisUI from "./JarvisUI";
+import JarvisUI, { safeEmbeddedMessageText } from "./JarvisUI";
 
 describe("guest Home application render", () => {
   it("keeps text visible while suppressing a legacy persistent card in the actual page tree", () => {
@@ -70,5 +70,25 @@ describe("guest Home application render", () => {
     expect(markup).toContain("Connecting Jarvis…");
     expect(markup).toContain('aria-label="Close Jarvis"');
     expect(markup).not.toContain("This text remains visible to the guest.");
+  });
+
+  it("replaces raw operational logs with a concise recoverable embed message", () => {
+    expect(safeEmbeddedMessageText({
+      role: "assistant",
+      status: "error",
+      text: "⚠️ TypeError: upstream timed out\n    at worker (/srv/agent.ts:42:7)\nstderr: request failed",
+    })).toBe("That reply hit a technical problem. Use recover or retry.");
+
+    expect(safeEmbeddedMessageText({
+      role: "assistant",
+      status: "streaming",
+      text: "src/worker.ts(42,7): error TS2322: internal compiler detail",
+    })).toBe("That reply hit a technical problem. Use recover or retry.");
+
+    expect(safeEmbeddedMessageText({
+      role: "assistant",
+      status: "done",
+      text: "I saved the useful result.\nstderr: noisy implementation detail",
+    })).toBe("I saved the useful result.");
   });
 });

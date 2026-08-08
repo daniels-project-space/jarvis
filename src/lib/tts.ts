@@ -25,7 +25,12 @@ const REQUEST_TIMEOUT_MS = 4_000;
 // the first clause smaller so audio can begin while the larger continuation is
 // synthesized in parallel; this preserves cadence without waiting for a whole
 // long MP3 before the first sound.
-const FIRST_SPEECH_CHUNK_CHARS = 120;
+// The browser decodes an Edge MP3 after the segment completes, so first-audio
+// latency scales with the first segment's length. Keep only the first segment
+// short; continuation segments stay large and are synthesized during playback,
+// preserving voice quality, the same total spoken content, and bounded calls.
+const FIRST_SPEECH_CHUNK_CHARS = 88;
+const PREVIOUS_FIRST_SPEECH_CHUNK_CHARS = 120;
 const TARGET_SPEECH_CHUNK_CHARS = 170;
 const MAX_SPEECH_CHUNK_CHARS = 240;
 const MAX_MEMORY_AUDIO_SEGMENTS = 12;
@@ -131,7 +136,10 @@ export function isEchoOfTts(input: string): boolean {
 }
 
 export function completeSpeechPrefix(input: string): string {
-  const matches = [...input.matchAll(/[.!?](?:[”"')\]]+)?(?=\s|$)|\n\s*\n/g)];
+  // Colons and semicolons are stable spoken clause boundaries too. Accepting
+  // them lets TTS synthesize the opening clause while later model tokens keep
+  // streaming instead of waiting for the first full stop.
+  const matches = [...input.matchAll(/[.!?;:](?:[”"')\]]+)?(?=\s|$)|\n\s*\n/g)];
   const last = matches.at(-1);
   if (!last || last.index == null) return "";
   const prefix = input.slice(0, last.index + last[0].length);
@@ -180,6 +188,22 @@ export function sentences(text: string): string[] {
       : MAX_SPEECH_CHUNK_CHARS;
     while (remaining.length > nextLimit()) {
       const limit = nextLimit();
+      // Preserve the old two-request ceiling for replies that previously fit
+      // in 120 + 240 characters. Start at 88 when possible, but move the cut
+      // just far enough forward to keep the remainder in one continuation.
+      const minimumTwoChunkCut = remaining.length - MAX_SPEECH_CHUNK_CHARS;
+      if (
+        result.length === 0
+        && remaining.length <= PREVIOUS_FIRST_SPEECH_CHUNK_CHARS + MAX_SPEECH_CHUNK_CHARS
+        && minimumTwoChunkCut > limit
+      ) {
+        const forwardBoundary = remaining.indexOf(" ", minimumTwoChunkCut);
+        if (forwardBoundary > 0 && forwardBoundary <= PREVIOUS_FIRST_SPEECH_CHUNK_CHARS) {
+          result.push(remaining.slice(0, forwardBoundary).trim());
+          remaining = remaining.slice(forwardBoundary).trim();
+          continue;
+        }
+      }
       const window = remaining.slice(0, limit + 1);
       const boundary = window.lastIndexOf(" ");
       const cut = boundary >= Math.floor(limit * 0.58)

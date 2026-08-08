@@ -25,10 +25,9 @@ export type LiveVadFrame = {
 };
 
 // 1.15s preserves the tested 1.1s mid-sentence pause while removing 650ms
-// from the former turn boundary. STT begins speculatively during the tail, so
-// the network request is normally complete by the time this safe gate closes.
+// from the former turn boundary. A zero-Jarvis-billing browser transcript may
+// inform this boundary, but authoritative server STT never runs before it.
 export const LIVE_END_SILENCE_MS = 1_150;
-export const LIVE_STT_PREFETCH_SILENCE_MS = 700;
 export const LIVE_COMPLETE_QUESTION_END_SILENCE_MS = 720;
 export const LIVE_UNFINISHED_END_SILENCE_MS = 1_550;
 // Do not merely ask VAD to ignore Jarvis's loudspeaker. Do not open an
@@ -128,16 +127,6 @@ export function shouldCloseLiveUtterance(
 ): boolean {
   return state.spoke
     && now - state.lastVoice > liveEndpointSilenceMs(authoritativePartialTranscript);
-}
-
-export function shouldPrefetchLiveTranscript(
-  state: LiveVadState,
-  now: number,
-  lastPrefetchedVoice: number,
-): boolean {
-  return state.spoke
-    && state.lastVoice !== lastPrefetchedVoice
-    && now - state.lastVoice >= LIVE_STT_PREFETCH_SILENCE_MS;
 }
 
 const READ_ONLY_RESEARCH_INTENT = /\b(?:research|look up|find out|investigate|compare|explain|tell me about|what|why|how|who|where|when|which)\b/i;

@@ -43,6 +43,21 @@ describe("StreamPublisher", () => {
     expect(publisher.value).toBe("One");
   });
 
+  it("drains prior paints without adding a redundant write before authoritative finalization", async () => {
+    const writes: Array<{ text: string; revision: number }> = [];
+    const publisher = new StreamPublisher(async (text, revision) => {
+      writes.push({ text, revision });
+    });
+    publisher.push("First");
+    await publisher.flush();
+    publisher.push(" final");
+
+    await publisher.close({ flushFinal: false });
+
+    expect(writes).toEqual([{ text: "First", revision: 1 }]);
+    expect(publisher.value).toBe("First final");
+  });
+
   it("records only the first durable Convex paint", async () => {
     let painted = 0;
     const publisher = new StreamPublisher(async () => true, 120, () => { painted += 1; });

@@ -58,12 +58,14 @@ export class StreamPublisher {
     return this.chain;
   }
 
-  async close(): Promise<void> {
+  async close(options: { flushFinal?: boolean } = {}): Promise<void> {
     if (this.closed) return this.chain;
     this.closed = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    await this.flush();
+    // A caller with a stronger authoritative final write only needs the
+    // ordering barrier; enqueueing another full snapshot adds a round trip.
+    if (options.flushFinal !== false) await this.flush();
     await this.chain;
   }
 

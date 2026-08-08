@@ -134,6 +134,10 @@ export default defineSchema({
     claimToken: v.optional(v.string()),
     lastProgressAt: v.optional(v.number()),
     guestSlotReleased: v.optional(v.boolean()),
+    // Cheap presence bits let the worker skip side-table reads for the common
+    // text-only turn. Undefined preserves compatibility with older rows.
+    hasLinkedFiles: v.optional(v.boolean()),
+    hasResearchPrefetch: v.optional(v.boolean()),
     // Persistent media card: everything JARVIS shows also lands in the stream
     // so Daniel can always get back to it later.
     attachment: v.optional(
