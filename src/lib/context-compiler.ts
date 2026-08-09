@@ -3,6 +3,7 @@ export type ContextProfile = "reflex" | "focused" | "operational" | "strategic";
 type ContextRow = Record<string, unknown>;
 
 type BrainContext = {
+  currentState?: ContextRow[];
   memory?: ContextRow[];
   projects?: ContextRow[];
   goals?: ContextRow[];
@@ -46,7 +47,7 @@ const ARTIFACT = /\b(?:draft|document|board|image|video|chart|scene|mind map|can
 const FOLLOW_UP = /\b(?:this|that|it|there|second|third|previous|above|on screen|shown)\b/i;
 const TRAVEL = /\b(?:trip|travel|flight|hotel|stay|airport|transfer|destination|itinerary)\b/i;
 const DRAFT_EDIT = /\b(?:draft|document|write|writing|rewrite|edit|longer|shorter|warmer|tone|wording)\b/i;
-const LOCATION = /\b(?:near me|nearby|local|location|directions?|restaurant|weather)\b/i;
+const LOCATION = /\b(?:near me|nearby|local|location|directions?|routes?|maps?|places?|attractions?|city|restaurant|weather)\b/i;
 const TEAM = /\b(?:agent|team|delegate|mission|goal|working|progress|status)\b/i;
 
 const text = (value: unknown, max: number) =>
@@ -60,7 +61,9 @@ const rowLine = (row: ContextRow, max = 520) => {
   const confidence = typeof row?.confidence === "number"
     ? ` · ${Math.round(Math.max(0, Math.min(1, row.confidence)) * 100)}%`
     : "";
-  return `- ${text(row?.title, 110)} [${text(row?.kind, 24)}${source}${confidence}]: ${text(row?.body, max)}`;
+  const sourceCount = Array.isArray(row?.sourceMessageIds) ? row.sourceMessageIds.length : 0;
+  const provenance = sourceCount ? ` · ${sourceCount} source turn${sourceCount === 1 ? "" : "s"}` : "";
+  return `- ${text(row?.title, 110)} [${text(row?.kind, 24)}${source}${confidence}${provenance}]: ${text(row?.body, max)}`;
 };
 
 export function classifyContextProfile(userText?: string): ContextProfile {
@@ -87,6 +90,7 @@ function panelSummary(value: unknown) {
     try {
       const widget = asRow(JSON.parse(String(panel.value)));
       title = text(widget.title ?? widget.kind, 160) || title;
+      const activeTool = text(widget.activeTool, 100);
       if (widget.kind === "ranking" && Array.isArray(widget.items)) {
         const items = widget.items
           .slice(0, 10)
@@ -97,6 +101,9 @@ function panelSummary(value: unknown) {
         if (items) {
           return `ON SCREEN: ranking “${title}” — ${items}. Resolve number/name follow-ups against this list and keep the current overlay.`;
         }
+      }
+      if (activeTool) {
+        return `ON SCREEN: ${title} (widget). Active tool: ${activeTool}. For a follow-up, call jarvis_get_tools with activeTool=${activeTool} and update the same overlay.`;
       }
     } catch {
       // The panel description is supplemental context. A malformed old panel
@@ -158,6 +165,16 @@ export function compileContext(input: ContextCompilerInput): string {
     add(
       "RELEVANT MEMORY",
       memories.slice(0, memoryLimit).map((row) => rowLine(row, profile === "strategic" ? 480 : 300)).join("\n"),
+    );
+  }
+
+  const currentState = Array.isArray(brain.currentState) ? brain.currentState : [];
+  const currentLocation = currentState.find((row) => row.key === "profile.current_location");
+  if (currentLocation?.value && (LOCATION.test(userText) || TRAVEL.test(userText) || FOLLOW_UP.test(userText))) {
+    add(
+      "CURRENT SITUATION",
+      `Daniel's current location is ${text(currentLocation.value, 120)} (observed ${new Date(Number(currentLocation.observedAt ?? 0)).toISOString()}). Use it as the default map, weather, route, and nearby-search origin until superseded.`,
+      true,
     );
   }
 

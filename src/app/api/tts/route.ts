@@ -19,9 +19,14 @@ export function escapeSpeechXml(value: string): string {
 }
 
 function speechRate(value: unknown): string {
-  const speed = Math.min(1.25, Math.max(0.85, Number(value) || 1.1));
+  const speed = Math.min(1.12, Math.max(0.96, Number(value) || 1.06));
   const percent = Math.round((speed - 1) * 100);
   return `${percent >= 0 ? "+" : ""}${percent}%`;
+}
+
+function speechPitch(value: unknown): string {
+  const pitch = Math.min(5, Math.max(1, Number(value) || 3));
+  return `+${Math.round(pitch)}Hz`;
 }
 
 async function authorized(req: NextRequest): Promise<boolean> {
@@ -43,7 +48,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   if (!(await authorized(req))) return Response.json({ error: "unauthorized" }, { status: 401 });
 
-  const payload = await req.json().catch(() => null) as { text?: unknown; speed?: unknown } | null;
+  const payload = await req.json().catch(() => null) as { text?: unknown; speed?: unknown; pitchHz?: unknown } | null;
   const text = String(payload?.text ?? "").trim();
   if (!text || text.length > 800) {
     return Response.json({ error: "Speech text must contain 1–800 characters" }, { status: 400 });
@@ -57,7 +62,7 @@ export async function POST(req: NextRequest) {
     await tts.setMetadata(JARVIS_TTS_VOICE, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
     const { audioStream } = tts.toStream(escapeSpeechXml(text), {
       rate: speechRate(payload?.speed),
-      pitch: "+3Hz",
+      pitch: speechPitch(payload?.pitchHz),
       volume: 100,
     });
     let closed = false;

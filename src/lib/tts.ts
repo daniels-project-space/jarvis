@@ -1,6 +1,7 @@
 "use client";
 
 import { viewerFetch } from "./viewer-request";
+import { planVoiceDelivery, voiceDeliveryCacheKey } from "./voice-delivery";
 
 // One speech route and one queue: free streamed en-GB-RyanNeural. The browser
 // only decodes audio; it never loads a model or falls back to SpeechSynthesis.
@@ -15,6 +16,15 @@ type SpeechBatch = {
   settled: boolean;
   resolve: (played: boolean) => void;
 };
+
+export type TtsRuntimeStatus = "loading" | "ready" | "buffering" | "speaking" | "blocked" | "unavailable";
+
+class SpeechPlaybackBlockedError extends Error {
+  constructor() {
+    super("Audio playback is blocked until the next user gesture");
+    this.name = "SpeechPlaybackBlockedError";
+  }
+}
 
 type AudioResult = { audio: ArrayBuffer };
 
@@ -42,6 +52,8 @@ let currentSource: AudioBufferSourceNode | null = null;
 let finishCurrentPlayback: (() => void) | null = null;
 let draining = false;
 let activeBatch: SpeechBatch | null = null;
+let blockedBatch: SpeechBatch | null = null;
+let runtimeStatus: TtsRuntimeStatus = "ready";
 let queue: SpeechBatch[] = [];
 const pendingRequests = new Set<AbortController>();
 const audioCache = new Map<string, AudioResult>();
@@ -52,7 +64,8 @@ let recentUtterances: Recent[] = [];
 const words = (text: string) =>
   text.toLowerCase().replace(/[^a-z0-9\s']/g, " ").split(/\s+/).filter((word) => word.length > 1);
 
-function setTtsStatus(status: "loading" | "ready" | "buffering" | "speaking" | "unavailable") {
+function setTtsStatus(status: TtsRuntimeStatus) {
+  runtimeStatus = status;
   if (typeof document === "undefined") return;
   document.documentElement.dataset.jarvisTts = status;
   document.documentElement.dataset.jarvisTtsEngine = ttsEngine;
@@ -64,6 +77,13 @@ function setTtsStatus(status: "loading" | "ready" | "buffering" | "speaking" | "
   ) {
     window.dispatchEvent(new CustomEvent("jarvis:tts-status", { detail: { status } }));
   }
+}
+
+function isPlaybackBlocked(error: unknown): boolean {
+  if (error instanceof SpeechPlaybackBlockedError) return true;
+  const name = String((error as { name?: unknown })?.name ?? "");
+  const message = String((error as { message?: unknown })?.message ?? error ?? "");
+  return name === "NotAllowedError" || /user gesture|not allowed|autoplay/i.test(message);
 }
 
 function reportFailure(error: unknown) {
@@ -96,9 +116,42 @@ export function unlockSpeechPlayback(): void {
   if (typeof window === "undefined") return;
   try {
     const context = ensureAudioContext();
-    if (context.state === "suspended") void context.resume().catch(reportFailure);
+    const finishUnlock = () => {
+      if (context.state === "suspended") {
+        setTtsStatus("blocked");
+        return;
+      }
+      // Some iOS/Safari versions resolve resume() before accepting a later
+      // source. Prime a silent frame while this genuine gesture is active.
+      try {
+        if (typeof context.createBuffer === "function") {
+          const source = context.createBufferSource();
+          source.buffer = context.createBuffer(1, 1, context.sampleRate || 44_100);
+          source.connect(context.destination);
+          source.start(0);
+          source.disconnect();
+        }
+      } catch {
+        // A running context is sufficient; the silent primer is best effort.
+      }
+      if (runtimeStatus === "blocked") setTtsStatus("ready");
+      const batch = blockedBatch;
+      if (!batch) return;
+      blockedBatch = null;
+      queue.unshift(batch);
+      void drainSpeechQueue();
+    };
+    if (context.state === "suspended") {
+      void context.resume().then(finishUnlock).catch((error) => {
+        if (isPlaybackBlocked(error)) setTtsStatus("blocked");
+        else reportFailure(error);
+      });
+    } else {
+      finishUnlock();
+    }
   } catch (error) {
-    reportFailure(error);
+    if (isPlaybackBlocked(error)) setTtsStatus("blocked");
+    else reportFailure(error);
   }
 }
 
@@ -239,14 +292,6 @@ export function speechPauseMs(text: string): number {
   return 0;
 }
 
-function speechSpeed(text: string): number {
-  const tone = text.toLowerCase();
-  if (/\b(urgent|careful|risk|serious|honestly|weak plan)\b/.test(tone)) return 1.03;
-  if (/\b(sorry|rough|tired|stressed|gentle)\b/.test(tone)) return 0.98;
-  if (/\b(ha|haha|brilliant|let's go|excited|love it)\b/.test(tone)) return 1.16;
-  return 1.1;
-}
-
 async function requestAudio(text: string, expectedGeneration: number): Promise<AudioResult> {
   if (expectedGeneration !== generation) throw new Error("speech cancelled");
   const controller = new AbortController();
@@ -254,10 +299,11 @@ async function requestAudio(text: string, expectedGeneration: number): Promise<A
   if (typeof document !== "undefined") document.documentElement.dataset.jarvisTtsRequestMs = String(Math.round(performance.now()));
   const timeout = window.setTimeout(() => controller.abort("TTS timed out"), REQUEST_TIMEOUT_MS);
   try {
+    const delivery = planVoiceDelivery(text);
     const response = await viewerFetch("/api/tts", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text, speed: speechSpeed(text) }),
+      body: JSON.stringify({ text, speed: delivery.rate, pitchHz: delivery.pitchHz }),
       cache: "no-store",
       signal: controller.signal,
     });
@@ -288,7 +334,7 @@ function rememberAudio(key: string, result: AudioResult): AudioResult {
 }
 
 async function synthesize(text: string, expectedGeneration: number): Promise<AudioResult> {
-  const key = `${ttsEngine}:${speechSpeed(text)}:${text}`;
+  const key = `${ttsEngine}:${voiceDeliveryCacheKey(planVoiceDelivery(text))}:${text}`;
   const cached = audioCache.get(key);
   if (cached) return cached;
   const existing = synthesisInFlight.get(key);
@@ -302,12 +348,22 @@ async function synthesize(text: string, expectedGeneration: number): Promise<Aud
   }
 }
 
-async function playAudio(result: AudioResult, expectedGeneration: number, onEnergy: (energy: number) => void) {
+async function playAudio(
+  result: AudioResult,
+  expectedGeneration: number,
+  onEnergy: (energy: number) => void,
+  onStart?: () => void,
+) {
   if (expectedGeneration !== generation) return false;
   const context = ensureAudioContext();
   if (context.state === "suspended") {
-    await context.resume();
-    if (context.state === "suspended") throw new Error("Audio playback is blocked until the next user gesture");
+    try {
+      await context.resume();
+    } catch (error) {
+      if (isPlaybackBlocked(error)) throw new SpeechPlaybackBlockedError();
+      throw error;
+    }
+    if (context.state === "suspended") throw new SpeechPlaybackBlockedError();
   }
   const buffer = await context.decodeAudioData(result.audio.slice(0));
   if (expectedGeneration !== generation) return false;
@@ -318,9 +374,7 @@ async function playAudio(result: AudioResult, expectedGeneration: number, onEner
   source.buffer = buffer;
   source.connect(analyser);
   analyser.connect(context.destination);
-  currentSource = source;
-  setTtsStatus("speaking");
-  return new Promise<boolean>((resolve) => {
+  return new Promise<boolean>((resolve, reject) => {
     let settled = false;
     const levels = new Uint8Array(analyser.frequencyBinCount);
     const energyTimer = setInterval(() => {
@@ -347,7 +401,21 @@ async function playAudio(result: AudioResult, expectedGeneration: number, onEner
     );
     finishCurrentPlayback = stop;
     source.onended = () => finish(true);
-    source.start();
+    try {
+      source.start();
+    } catch (error) {
+      settled = true;
+      clearInterval(energyTimer);
+      clearTimeout(playbackTimer);
+      onEnergy(0);
+      source.disconnect();
+      analyser.disconnect();
+      reject(isPlaybackBlocked(error) ? new SpeechPlaybackBlockedError() : error);
+      return;
+    }
+    currentSource = source;
+    setTtsStatus("speaking");
+    onStart?.();
   });
 }
 
@@ -368,6 +436,8 @@ export function stopSpeaking() {
   const abandoned = queue;
   queue = [];
   for (const batch of abandoned) settle(batch, false, false);
+  if (blockedBatch) settle(blockedBatch, false, false);
+  blockedBatch = null;
   if (activeBatch) settle(activeBatch, false, false);
   try { currentSource?.stop(); } catch { /* already ended */ }
   finishCurrentPlayback?.();
@@ -392,7 +462,6 @@ export async function speak(
     onEnd?.();
     return false;
   }
-  trackUtterance(speech, Math.min(90_000, speech.length * 70));
   const done = new Promise<boolean>((resolve) => {
     queue.push({
       generation,
@@ -410,7 +479,7 @@ export async function speak(
 }
 
 async function drainSpeechQueue(): Promise<void> {
-  if (draining) return;
+  if (draining || blockedBatch) return;
   draining = true;
   try {
     while (queue.length) {
@@ -428,11 +497,18 @@ async function drainSpeechQueue(): Promise<void> {
           next = batch.segments[index + 1]
             ? synthesize(batch.segments[index + 1], batch.generation)
             : null;
-          if (!started) {
-            started = true;
-            batch.onStart?.();
-          }
-          const played = await playAudio(audio, batch.generation, batch.onEnergy);
+          const played = await playAudio(
+            audio,
+            batch.generation,
+            batch.onEnergy,
+            !started
+              ? () => {
+                  started = true;
+                  trackUtterance(batch.text, Math.min(90_000, batch.text.length * 70));
+                  batch.onStart?.();
+                }
+              : undefined,
+          );
           if (!played && batch.generation === generation) throw new Error("Audio playback ended before completion");
           if (!played || batch.generation !== generation) break;
           const pause = index + 1 < batch.segments.length
@@ -448,6 +524,11 @@ async function drainSpeechQueue(): Promise<void> {
         }
       } catch (error) {
         if (batch.generation === generation) {
+          if (isPlaybackBlocked(error)) {
+            blockedBatch = batch;
+            setTtsStatus("blocked");
+            break;
+          }
           reportFailure(error);
           settle(batch, true, false);
         } else {
@@ -466,6 +547,6 @@ async function drainSpeechQueue(): Promise<void> {
         }
       }, 900);
     }
-    if (queue.length) void drainSpeechQueue();
+    if (queue.length && !blockedBatch) void drainSpeechQueue();
   }
 }

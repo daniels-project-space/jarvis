@@ -11,7 +11,7 @@ export const snapshot = query({
     await requireViewer(ctx, a);
     const text = a.userText?.trim().slice(0, 240);
     const activeStatuses = ["running", "pending", "awaiting_approval", "paused", "needs_input"];
-    const [memHit, memRecent, business, projects, activeGroups, findings, trip, draft, location, panel, creations, agents, attentionGroups, approvals, goalGroups, missionGoals] =
+    const [memHit, memRecent, currentState, business, projects, activeGroups, findings, trip, draft, location, panel, creations, agents, attentionGroups, approvals, goalGroups, missionGoals] =
       await Promise.all([
         text
           ? ctx.db
@@ -20,6 +20,7 @@ export const snapshot = query({
               .take(8)
           : Promise.resolve([]),
         ctx.db.query("memory").withIndex("by_createdAt").order("desc").take(6),
+        ctx.db.query("currentState").collect(),
         ctx.db.query("businessState").collect(),
         ctx.db.query("projectState").collect(),
         Promise.all(
@@ -87,10 +88,15 @@ export const snapshot = query({
         activeJobCount: owned.length,
       };
     });
+    const now = Date.now();
+    const usableMemory = [...memHit, ...memRecent].filter(
+      (row: any, index: number, all: any[]) =>
+        (row.expiresAt === undefined || row.expiresAt > now)
+        && all.findIndex((candidate: any) => candidate._id === row._id) === index,
+    );
     return {
-      memory: [...memHit, ...memRecent].filter(
-        (row: any, index: number, all: any[]) => all.findIndex((candidate: any) => candidate._id === row._id) === index,
-      ).slice(0, 10),
+      currentState: currentState.filter((row) => row.expiresAt > Date.now()),
+      memory: usableMemory.slice(0, 10),
       business,
       projects,
       goals: goalGroups.flat().sort((left: any, right: any) => right.priority - left.priority).slice(0, 24),

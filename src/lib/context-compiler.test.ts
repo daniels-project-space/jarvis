@@ -12,6 +12,7 @@ const input = {
     { slug: "finance-engine-v2", name: "Finance Engine", vision: "A research-first trading lab." },
   ],
   brain: {
+    currentState: [{ key: "profile.current_location", value: "Sevilla", observedAt: Date.now(), confidence: 0.99 }],
     memory: [
       { kind: "preference", title: "Reply style", body: "Keep spoken replies concise.", source: "chat", confidence: 1 },
       { kind: "decision", title: "Safety", body: "External actions need approval.", source: "obsidian", confidence: 0.95 },
@@ -84,6 +85,16 @@ describe("context compiler", () => {
       .toContain("LIVE LOCATION");
     expect(compileContext({ ...input, userText: "Explain the Jarvis architecture" }))
       .not.toContain("TRIP IN PROGRESS");
+  });
+
+  it("grounds the exact real-world Sevilla map request in current state", () => {
+    const result = compileContext({
+      ...input,
+      userText: "I'm in Sevilla right now, can you show me a map with some attractions in the city?",
+    });
+    expect(result).toContain("CURRENT SITUATION");
+    expect(result).toContain("current location is Sevilla");
+    expect(result).toContain("default map, weather, route, and nearby-search origin");
   });
 
   it("preserves ranking identities for on-screen number follow-ups", () => {

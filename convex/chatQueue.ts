@@ -24,6 +24,7 @@ import {
   threadFileCatalog,
   validateReadyMessageFiles,
 } from "./fileHelpers";
+import { captureCurrentState } from "./currentState";
 
 const HOST_CONTEXT_BLOCK =
   /\s*\[JARVIS_HOST_CONTEXT\][\s\S]*?\[\/JARVIS_HOST_CONTEXT\]\s*/g;
@@ -191,15 +192,8 @@ async function admitMessage(
 ): Promise<Id<"chatMessages">> {
   const identity = await conversationIdentity(ctx, a);
   const threadId = scopedConversationThread(identity, a.threadId);
-  const submittedText =
-    identity.kind === "guest" ? a.text.slice(0, 2_000) : a.text;
+  const submittedText = a.text;
   const requestId = a.requestId?.slice(0, 120);
-  if (a.researchPrefetch && identity.kind !== "owner") {
-    throw new ConvexError({
-      code: "OWNER_REQUIRED",
-      message: "Speculative research requires owner access",
-    });
-  }
   if (requestId) {
     const prior = await ctx.db
       .query("chatMessages")
@@ -242,10 +236,8 @@ async function admitMessage(
     ctx,
     threadId,
     a.fileIds,
-    identity.kind === "guest",
+    false,
   );
-  if (identity.kind === "guest")
-    await admitGuestTurn(ctx, identity.guestId, Date.now());
   const session = await ensureSession(ctx, threadId);
   // Stable turn slots keep concurrent replies beside the user message that
   // caused them, even when a later fast turn finishes before an earlier one.
@@ -273,10 +265,14 @@ async function admitMessage(
     attemptCount: 0,
     dispatchEpoch: 0,
     lastProgressAt: createdAt,
-    guestSlotReleased: identity.kind === "guest" ? false : undefined,
     hasLinkedFiles: files.length > 0,
     hasResearchPrefetch: validPrefetch,
     createdAt,
+  });
+  await captureCurrentState(ctx, {
+    text: visibleTurnText(submittedText),
+    messageId: String(id),
+    observedAt: createdAt,
   });
   await linkFilesToMessage(ctx, id, threadId, files, createdAt);
   if (prefetch) {

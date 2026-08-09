@@ -21,4 +21,73 @@ describe("booking confirmation parsing", () => {
     })).toMatchObject({ kind: "stay", allDay: true, confirmationCode: "HOTEL-42" });
     expect(parseBookingEmail({ id: "message-3", from: "x@y.com", subject: "Booking cancelled", body: "Your reservation has been cancelled." })).toBeNull();
   });
+
+  it("parses a Booking.com-style HTML confirmation with address and local timezone", () => {
+    const booking = parseBookingEmail({
+      id: "booking-sevilla-html",
+      from: "Booking.com <customer.service@booking.com>",
+      subject: "Booking confirmation: Hotel Casa 1800 Sevilla",
+      sentAt: Date.UTC(2026, 7, 1),
+      body: `
+        <h1>Your booking is confirmed</h1>
+        <p>Property: Hotel Casa 1800 Sevilla</p>
+        <p>Property address:</p>
+        <div>Rodrigo Caro, 6</div><div>41004 Sevilla</div><div>Spain</div>
+        <p>Check-in: Sunday 9 August 2026 from 15:00</p>
+        <p>Check-out: Wednesday 12 August 2026 until 11:00</p>
+        <p>Timezone: Europe/Madrid</p>
+        <p>Booking number: 491827364</p>
+      `,
+    });
+    expect(booking).toMatchObject({
+      kind: "stay",
+      bookingName: "Hotel Casa 1800 Sevilla",
+      location: "Rodrigo Caro, 6, 41004 Sevilla, Spain",
+      timeZone: "Europe/Madrid",
+      confirmationCode: "491827364",
+      allDay: false,
+    });
+    expect(booking?.start).toBe(Date.UTC(2026, 7, 9, 13, 0));
+    expect(booking?.end).toBe(Date.UTC(2026, 7, 12, 9, 0));
+  });
+
+  it("prefers deterministic JSON-LD reservation details over surrounding email copy", () => {
+    const booking = parseBookingEmail({
+      id: "booking-sevilla-jsonld",
+      from: "Booking.com <customer.service@booking.com>",
+      subject: "Your Booking.com reservation is confirmed",
+      body: `
+        <p>Confirmed — see your stay below.</p>
+        <script type="application/ld+json">
+        {
+          "@context": "https://schema.org",
+          "@type": "LodgingReservation",
+          "reservationNumber": "BKG-SEV-42",
+          "checkinTime": "2026-08-09T15:00:00+02:00",
+          "checkoutTime": "2026-08-12T11:00:00+02:00",
+          "timeZone": "Europe/Madrid",
+          "reservationFor": {
+            "@type": "LodgingBusiness",
+            "name": "Palacio Villapanés",
+            "address": {
+              "@type": "PostalAddress",
+              "streetAddress": "Calle Santiago, 31",
+              "postalCode": "41003",
+              "addressLocality": "Sevilla",
+              "addressCountry": "Spain"
+            }
+          }
+        }
+        </script>
+      `,
+    });
+    expect(booking).toMatchObject({
+      kind: "stay",
+      bookingName: "Palacio Villapanés",
+      location: "Calle Santiago, 31, 41003, Sevilla, Spain",
+      confirmationCode: "BKG-SEV-42",
+      start: Date.UTC(2026, 7, 9, 13, 0),
+      end: Date.UTC(2026, 7, 12, 9, 0),
+    });
+  });
 });

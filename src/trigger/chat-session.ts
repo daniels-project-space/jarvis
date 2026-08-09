@@ -6,6 +6,8 @@ import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
 import { CAPABILITIES, INFRA_MAP, PERSONA, REMEMBER } from "../lib/persona";
 import { visualInitiativeDirective } from "../lib/visual-initiative";
+import { shouldCaptureDurableMemory } from "../lib/current-state";
+import { memoryConfidence } from "../lib/memory-governance";
 import { visibleTurnText } from "../lib/host-context";
 import { buildContext } from "../lib/context";
 import { isSpeculativeResearchApplicable } from "../lib/speculative-research";
@@ -150,14 +152,11 @@ type QueueClaim = {
   fileCatalog: ChatThreadFileCatalogItem[];
 };
 
-function conversationPreamble(guest = false) {
-  if (guest) {
-    return `${PERSONA}\n\nYou are speaking with an unpaired guest. Keep this conversation isolated: do not access or mention Daniel's memory, projects, work, files, panels, capabilities, or other conversations. Do not call tools, create artifacts, or perform actions. Give a helpful conversational answer only.`;
-  }
+function conversationPreamble() {
   return PERSONA +
     `\n\n${CAPABILITIES}\n\n${INFRA_MAP}\n\n${REMEMBER}\n\n` +
     JARVIS_TOOL_INSTRUCTIONS + " " +
-    `Answer first and keep the default spoken reply to one concise sentence. Never narrate context, memory, shell commands, or tool plumbing.`;
+    `When Daniel's request implies a supported visual or live-data capability, execute the most specific safe tool before the final reply; never claim that you cannot show a map, chart, weather, search result, briefing, planner, or document when its tool is available. Then keep the default spoken reply to one concise sentence. Never narrate context, memory, shell commands, or tool plumbing.`;
 }
 
 async function runTurn(
@@ -170,7 +169,6 @@ async function runTurn(
   contextBlock: string,
   imageInputs: NonNullable<CodexTurnInput["imageInputs"]>,
   model: string,
-  guest: boolean,
   hasPrivateFiles: boolean,
   invocationContext: CodexTurnInput["invocationContext"],
   cancellationAbort: AbortController,
@@ -184,7 +182,7 @@ async function runTurn(
   );
   publisher.start();
   try {
-    const visualDirective = guest ? "" : visualInitiativeDirective(visibleTurnText(userText));
+    const visualDirective = visualInitiativeDirective(visibleTurnText(userText));
     const freshContext = `${contextBlock}\n\nCurrent date: ${new Date().toDateString()}.` +
       (visualDirective ? `\n\n${visualDirective}` : "");
     let sawDelta = false;
@@ -194,9 +192,9 @@ async function runTurn(
       history,
       contextBlock: freshContext,
       imageInputs,
-      preamble: conversationPreamble(guest),
+      preamble: conversationPreamble(),
       modelTier: model,
-      allowTools: !guest,
+      allowTools: true,
       invocationContext,
       signal: cancellationAbort.signal,
       onTurnStarted: () => onStage?.("codexAck"),
@@ -253,11 +251,12 @@ async function extractAndSave(
   env: NodeJS.ProcessEnv,
   userText: string,
   assistantText: string,
+  sourceMessageId?: string,
 ): Promise<number> {
   const prompt =
     "From the exchange below, extract ONLY durable facts, preferences, decisions, or tasks worth " +
     "remembering long-term about Daniel or his projects. Output STRICT JSON: an array of " +
-    '{"kind","title","body","tags"} where kind is one of fact|preference|decision|task|project. ' +
+    '{"kind","title","body","tags","confidence"} where kind is one of fact|preference|decision|task|project and confidence is 0 to 1. ' +
     "Output [] if nothing is worth remembering. No prose, JSON only.\n\n" +
     `User: ${userText}\nAssistant: ${assistantText}`;
   const out = await new Promise<string>((resolve) => {
@@ -297,6 +296,8 @@ async function extractAndSave(
       title: String(it.title).slice(0, 120),
       body: String(it.body).slice(0, 1200),
       tags: Array.isArray(it.tags) ? it.tags.map(String).slice(0, 6) : [],
+      confidence: memoryConfidence(it.confidence, 0.7),
+      sourceMessageId,
     }).catch(() => {});
     n++;
   }
@@ -473,6 +474,17 @@ async function processChatQueue(
       ))) break;
       continue;
     }
+    if (claim.guest) {
+      await convexMutation("chatQueue:finalize", {
+        messageId: claim.assistantId,
+        threadId: claim.threadId,
+        status: "error",
+        finalText: "This private Jarvis workspace requires owner pairing.",
+        claimToken: claim.claimToken,
+      }).catch(() => {});
+      targetMessageId = undefined;
+      continue;
+    }
     activeTurn = { messageId: claim.assistantId, claimToken: claim.claimToken };
     const cancellationAbort = new AbortController();
     activeTurnAbort = cancellationAbort;
@@ -489,21 +501,16 @@ async function processChatQueue(
     try {
       const visibleUserText = visibleTurnText(claim.userText);
       const contextStarted = Date.now();
-      const contextPromise = claim.guest
-        ? Promise.resolve("No private context is available for a guest conversation.")
-        : buildContext(visibleUserText);
-      const imageInputsPromise = claim.guest
-        ? Promise.resolve([])
-        : materializeCodexChatImages(claim.userText, claim.attachments, {
-          signal: cancellationAbort.signal,
-        });
+      const contextPromise = buildContext(visibleUserText);
+      const imageInputsPromise = materializeCodexChatImages(claim.userText, claim.attachments, {
+        signal: cancellationAbort.signal,
+      });
       // Context snapshots and private image reads are independent. Image turns
       // should pay the slower branch, not the sum of both branches.
       const [baseContext, imageInputs] = await Promise.all([contextPromise, imageInputsPromise]);
-      const fileContext = claim.guest ? "" : buildBoundedFileContext(claim.attachments);
-      const fileCatalog = claim.guest ? "" : buildBoundedThreadFileCatalog(claim.fileCatalog);
-      const researchContext = !claim.guest
-        && claim.researchPrefetch
+      const fileContext = buildBoundedFileContext(claim.attachments);
+      const fileCatalog = buildBoundedThreadFileCatalog(claim.fileCatalog);
+      const researchContext = claim.researchPrefetch
         && claim.researchPrefetch.expiresAt > Date.now()
         && isSpeculativeResearchApplicable(claim.researchPrefetch.basis, visibleUserText)
           ? claim.researchPrefetch.context
@@ -522,7 +529,6 @@ async function processChatQueue(
         context,
         imageInputs,
         model,
-        Boolean(claim.guest),
         claim.attachments.length > 0,
         {
           requestId: claim.requestId,
@@ -552,9 +558,10 @@ async function processChatQueue(
       const deliveredAt = Date.now();
       // Memory capture is a separate background task. It must never hold the
       // warm conversational worker hostage after Daniel already has a reply.
-      if (!claim.guest && turn.finalText.trim()) void tasks.trigger("jarvis-chat-memory", {
+      if (turn.finalText.trim() && shouldCaptureDurableMemory(visibleUserText)) void tasks.trigger("jarvis-chat-memory", {
         userText: visibleUserText,
         assistantText: turn.finalText,
+        sourceMessageId: targetMessageId ? String(targetMessageId) : undefined,
       }).catch(() => {});
       timings.push({
         claimMs: claimedAt - claimStarted,
@@ -631,7 +638,7 @@ export const chatMemory = task({
   queue: { name: "jarvis-memory", concurrencyLimit: 2 },
   machine: "small-1x",
   maxDuration: 180,
-  run: async (payload: { userText: string; assistantText: string }) => {
+  run: async (payload: { userText: string; assistantText: string; sourceMessageId?: string }) => {
     const provider: AgentProvider = "codex";
     const prepared = await prepareSubscriptionEnv(provider, {
       scope: "memory",
@@ -642,7 +649,7 @@ export const chatMemory = task({
       if (prepared.error || !bin) return { saved: 0, error: prepared.error ?? "Codex binary unavailable" };
       const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
       if (preflight.error) return { saved: 0, error: preflight.error };
-      return { saved: await extractAndSave(provider, bin, prepared.env, payload.userText, payload.assistantText) };
+      return { saved: await extractAndSave(provider, bin, prepared.env, payload.userText, payload.assistantText, payload.sourceMessageId) };
     } finally {
       cleanupSubscriptionHome(prepared.env);
     }

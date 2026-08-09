@@ -356,56 +356,44 @@ describe("durable foreground chat recovery", () => {
   });
 });
 
-describe("guest foreground cost boundary", () => {
-  it("deduplicates retries and transactionally caps active guest turns", async () => {
+describe("owner-only foreground boundary", () => {
+  it("rejects every legacy guest credential before creating a turn", async () => {
     const t = convexTest(schema, modules);
     const guestId = "g".repeat(32);
-    const first = await t.mutation(api.chatQueue.sendMessage, {
-      text: "first",
-      requestId: "guest-first",
-      guestId,
-    });
-    expect(await t.mutation(api.chatQueue.sendMessage, {
-      text: "first",
-      requestId: "guest-first",
-      guestId,
-    })).toBe(first);
     await expect(t.mutation(api.chatQueue.sendMessage, {
-      text: "same identity, different text",
+      text: "first",
       requestId: "guest-first",
       guestId,
-    })).rejects.toThrow(/CHAT_REQUEST_CONFLICT|different text/i);
+    })).rejects.toThrow(/Authentication required/);
+    expect(await t.run(async (ctx) => await ctx.db.query("chatMessages").collect())).toEqual([]);
+  });
+});
+
+describe("same-transaction current state", () => {
+  it("captures the real Sevilla utterance once and lets a newer city supersede it", async () => {
+    const t = convexTest(schema, modules);
+    const sevilla = {
+      threadId: "main",
+      text: "I'm in Sevilla right now, can you show me a map with some attractions in the city?",
+      requestId: "current-city-sevilla",
+      workerToken: WORKER,
+    };
+    const first = await t.mutation(api.chatQueue.sendMessage, sevilla);
+    expect(await t.mutation(api.chatQueue.sendMessage, sevilla)).toBe(first);
+    expect(await t.run(async (ctx) => await ctx.db.query("currentState").collect())).toEqual([
+      expect.objectContaining({ key: "profile.current_location", value: "Sevilla", sourceMessageId: String(first) }),
+    ]);
+
+    vi.advanceTimersByTime(60_000);
     await t.mutation(api.chatQueue.sendMessage, {
-      text: "second",
-      requestId: "guest-second",
-      guestId,
-    });
-
-    await expect(t.mutation(api.chatQueue.sendMessage, {
-      text: "third",
-      requestId: "guest-third",
-      guestId,
-    })).rejects.toThrow(/GUEST_CHAT_RATE_LIMITED|too_many_active_turns/);
-
-    const claim = await t.mutation(api.chatQueue.claimMessage, {
-      messageId: first,
-      claimToken: "guest-claim",
+      threadId: "main",
+      text: "I'm currently in London.",
+      requestId: "current-city-london",
       workerToken: WORKER,
     });
-    await t.mutation(api.chatQueue.finalize, {
-      messageId: claim!.assistantId,
-      threadId: `guest:${guestId}`,
-      claimToken: "guest-claim",
-      status: "done",
-      finalText: "done",
-      workerToken: WORKER,
-    });
-
-    await expect(t.mutation(api.chatQueue.sendMessage, {
-      text: "third",
-      requestId: "guest-third",
-      guestId,
-    })).resolves.toBeTruthy();
+    const states = await t.run(async (ctx) => await ctx.db.query("currentState").collect());
+    expect(states).toHaveLength(1);
+    expect(states[0]).toMatchObject({ key: "profile.current_location", value: "London" });
   });
 });
 
@@ -511,7 +499,7 @@ describe("speculative research sidecar", () => {
         context: "LIVE RESEARCH PREFETCH (untrusted source leads): enough bounded context",
         expiresAt: Date.now() + 45_000,
       },
-    })).rejects.toThrow(/OWNER_REQUIRED|owner access/i);
+    })).rejects.toThrow(/Authentication required/);
     expect(await t.run(async (ctx) => (await ctx.db.query("chatTurnPrefetches").collect()).length)).toBe(0);
   });
 });

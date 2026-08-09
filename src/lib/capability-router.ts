@@ -1,0 +1,202 @@
+import {
+  SUBSCRIPTION_TOOL_NAMES,
+  TOOL_BELT_NAMES,
+  TOOL_BELTS,
+  type ToolBeltName,
+} from "./tool-belts";
+
+export type CapabilityCandidate = {
+  belt: ToolBeltName;
+  tool: string;
+  score: number;
+  visual: boolean;
+  reason: string;
+};
+
+export type CapabilityRanking = {
+  candidates: CapabilityCandidate[];
+  explicitVisual: boolean;
+};
+
+export type CapabilityRoutingOptions = {
+  activeTool?: string;
+  limit?: number;
+};
+
+type CapabilityRule = {
+  belt: ToolBeltName;
+  tools: readonly string[];
+  score: number;
+  visual: boolean;
+  reason: string;
+  matches: (normalized: string, original: string) => boolean;
+};
+
+const EXPLICIT_VISUAL_RE = /\b(?:show|display|open|visuali[sz]e|map|chart|graph|plot|dashboard|widget|calendar|board|canvas|diagram|timeline)\b/i;
+const CONTINUATION_RE = /\b(?:more|other|another|instead|niche|less touristy|nearby|around there|add|remove|replace|change)\b/i;
+const PLACE_ROUTE_RE = /^\s*[\p{L}\p{M}'’.-]+(?:\s+[\p{L}\p{M}'’.-]+){0,2}\s+(?:to|→)\s+[\p{L}\p{M}'’.-]+(?:\s+[\p{L}\p{M}'’.-]+){0,2}\s*$/iu;
+
+const includesAny = (value: string, patterns: readonly RegExp[]) => patterns.some((pattern) => pattern.test(value));
+
+function looksLikePlaceToPlaceRoute(original: string): boolean {
+  if (!PLACE_ROUTE_RE.test(original)) return false;
+  const nonPlaceWords = /\b(?:how|what|when|where|why|who|i|we|you|they|draft|write|email|message|make|show|display|need|want|like|something|anything|everything|consider|do|go|get|set|add|change|reply|respond|talk|say)\b/i;
+  return !nonPlaceWords.test(original);
+}
+
+const RULES: readonly CapabilityRule[] = [
+  {
+    belt: "business",
+    tools: ["price_chart", "market_analysis", "market"],
+    score: 180,
+    visual: true,
+    reason: "crypto_or_market_chart",
+    matches: (value) => /\b(?:bitcoin|btc|ethereum|ether|eth|solana|sol|crypto(?:currency)?|token|coin|candles?|ohlc)\b/i.test(value),
+  },
+  {
+    belt: "travel",
+    tools: ["travel_map", "places_near", "transport_route"],
+    score: 175,
+    visual: true,
+    reason: "travel_map_or_itinerary",
+    matches: (value, original) => (!/\b(?:mind|concept)[ -]?map\b/i.test(value) && includesAny(value, [
+      /\b(?:map|attractions?|sightseeing|waypoints?|points? of interest|touristy|niche places?|niche spots?|things to do|places to (?:see|visit)|around the city)\b/i,
+      /\b(?:best route|walking route|driving route|directions?|city itinerary|day itinerary)\b/i,
+    ])) || looksLikePlaceToPlaceRoute(original),
+  },
+  {
+    belt: "core",
+    tools: ["weather"],
+    score: 170,
+    visual: true,
+    reason: "weather",
+    matches: (value) => /\b(?:weather|forecast|temperature|rain(?:ing|y)?|snow(?:ing|y)?|wind(?:y)?|sunny|umbrella)\b/i.test(value),
+  },
+  {
+    belt: "core",
+    tools: ["briefing"],
+    score: 165,
+    visual: true,
+    reason: "briefing",
+    matches: (value) => /\b(?:(?:morning|daily|today'?s|evening) briefing|brief me|daily overview|morning overview)\b/i.test(value),
+  },
+  {
+    belt: "creative",
+    tools: ["mind_map", "board"],
+    score: 160,
+    visual: true,
+    reason: "mind_map_or_board",
+    matches: (value) => /\b(?:mind[ -]?map|concept map|brainstorm board|kanban|mood ?board|planning board|project board)\b/i.test(value),
+  },
+  {
+    belt: "creative",
+    tools: ["chart"],
+    score: 150,
+    visual: true,
+    reason: "general_chart",
+    matches: (value) => /\b(?:chart|graph|plot|visuali[sz]e (?:these|this|the) data|data visuali[sz]ation)\b/i.test(value),
+  },
+  {
+    belt: "core",
+    tools: ["web_search"],
+    score: 145,
+    visual: true,
+    reason: "web_search",
+    matches: (value) => /\b(?:search (?:the )?(?:web|internet|online)|look (?:it|this|that)?\s*up|find (?:me )?(?:online|current|latest)|search results?|google)\b/i.test(value),
+  },
+  {
+    belt: "work",
+    tools: ["research", "web_search"],
+    score: 138,
+    visual: true,
+    reason: "research",
+    matches: (value) => /\b(?:research|investigate|compare sources?|source this|fact[ -]?check)\b/i.test(value),
+  },
+  {
+    belt: "creative",
+    tools: ["draft"],
+    score: 135,
+    visual: true,
+    reason: "writing",
+    matches: (value) => /\b(?:draft|write|rewrite|edit|compose)\b[\s\S]{0,40}\b(?:email|message|reply|response|letter|document|article|report|essay|story|caption|description|copy|post|script|outline|proposal|note)\b|\b(?:email|letter|copy|script|article|report)\b[\s\S]{0,24}\b(?:draft|rewrite)\b/i.test(value),
+  },
+  {
+    belt: "work",
+    tools: ["plan_my_day", "show", "calendar_view", "todo_list"],
+    score: 130,
+    visual: true,
+    reason: "day_planning",
+    matches: (value) => /\b(?:plan (?:my )?(?:day|today|tomorrow|week)|organize my day|schedule my day|day plan|daily plan|today'?s plan|prioriti[sz]e my (?:day|tasks))\b/i.test(value),
+  },
+  {
+    belt: "core",
+    tools: ["calendar_view"],
+    score: 125,
+    visual: true,
+    reason: "calendar_view",
+    matches: (value) => /\b(?:show|open|view|display|what(?:'s| is) on)\b[\s\S]{0,24}\b(?:calendar|schedule|agenda)\b/i.test(value),
+  },
+  {
+    belt: "travel",
+    tools: ["bookings_lookup", "bookings_check", "trip_open", "trip_plan", "flight_search"],
+    score: 120,
+    visual: true,
+    reason: "travel",
+    matches: (value) => /\b(?:trip|travel|flight|hotel|booking|reservation|airport|train|journey|destination|check[ -]?in|check[ -]?out)\b/i.test(value),
+  },
+];
+
+export function beltsForTool(toolName: string): ToolBeltName[] {
+  return TOOL_BELT_NAMES.filter((belt) => TOOL_BELTS[belt].has(toolName));
+}
+
+export function rankCapabilities(
+  intent: string,
+  options: CapabilityRoutingOptions = {},
+): CapabilityRanking {
+  const original = String(intent ?? "").trim().slice(0, 2_000);
+  const normalized = original.replace(/\s+/g, " ").toLowerCase();
+  const explicitVisual = EXPLICIT_VISUAL_RE.test(normalized);
+  const ranked = new Map<string, CapabilityCandidate>();
+
+  const add = (candidate: CapabilityCandidate) => {
+    if (!TOOL_BELTS[candidate.belt].has(candidate.tool) || !SUBSCRIPTION_TOOL_NAMES.has(candidate.tool)) return;
+    const previous = ranked.get(candidate.tool);
+    if (!previous || candidate.score > previous.score) ranked.set(candidate.tool, candidate);
+  };
+
+  for (const rule of RULES) {
+    if (!rule.matches(normalized, original)) continue;
+    rule.tools.forEach((tool, index) => add({
+      belt: rule.belt,
+      tool,
+      score: rule.score - index * 3,
+      visual: rule.visual,
+      reason: rule.reason,
+    }));
+  }
+
+  const activeTool = String(options.activeTool ?? "").trim();
+  if (activeTool && CONTINUATION_RE.test(normalized)) {
+    const activeBelt = beltsForTool(activeTool)[0];
+    if (activeBelt) add({
+      belt: activeBelt,
+      tool: activeTool,
+      score: 190,
+      visual: true,
+      reason: "active_visual_follow_up",
+    });
+  }
+
+  // "Show/display" must never collapse to an unknown capability. The generic
+  // renderer is a last resort beneath every specialised visual route.
+  if (explicitVisual && ![...ranked.values()].some((candidate) => candidate.visual)) {
+    add({ belt: "core", tool: "show", score: 40, visual: true, reason: "explicit_visual_fallback" });
+  }
+
+  const limit = Math.max(1, Math.min(8, Math.trunc(options.limit ?? 5)));
+  const candidates = [...ranked.values()]
+    .sort((left, right) => right.score - left.score || left.tool.localeCompare(right.tool))
+    .slice(0, limit);
+  return { candidates, explicitVisual };
+}

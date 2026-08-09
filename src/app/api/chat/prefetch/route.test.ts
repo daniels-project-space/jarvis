@@ -70,7 +70,7 @@ describe("POST /api/chat/prefetch", () => {
     expect(mock.searchWeb).not.toHaveBeenCalled();
   });
 
-  it("performs one bounded keyless search and returns the stable receipt contract", async () => {
+  it("fans out across three bounded keyless evidence lanes and returns the stable receipt contract", async () => {
     const response = await POST(request({ partialText: PARTIAL, threadId: "main", requestId: "voice:1" }));
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({
@@ -80,14 +80,20 @@ describe("POST /api/chat/prefetch", () => {
       expiresAt: 123_456,
     });
     expect(response.headers.get("cache-control")).toContain("no-store");
-    expect(mock.searchWeb).toHaveBeenCalledTimes(1);
-    expect(mock.searchWeb).toHaveBeenCalledWith(PARTIAL, 5, "us", expect.objectContaining({
+    expect(mock.searchWeb).toHaveBeenCalledTimes(3);
+    expect(mock.searchWeb).toHaveBeenCalledWith(PARTIAL, 4, "us", expect.objectContaining({
       signal: expect.any(AbortSignal),
       timeoutMs: 6_000,
       providerOrder: "keyless-first",
       maxPaidAttempts: 0,
       cacheTtlMs: 45_000,
     }));
+    expect(mock.searchWeb).toHaveBeenCalledWith(
+      `${PARTIAL} official documentation primary source`,
+      4,
+      "us",
+      expect.objectContaining({ maxPaidAttempts: 0 }),
+    );
     expect(mock.issueReceipt).toHaveBeenCalledWith(expect.objectContaining({
       actorAuthHash: "a".repeat(64),
       threadId: "main",

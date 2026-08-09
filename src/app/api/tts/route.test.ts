@@ -40,7 +40,7 @@ import { GET, JARVIS_TTS_ENGINE, JARVIS_TTS_VOICE, POST } from "./route";
 const request = (text = "A <safe> phrase") => new Request("https://jarvis.test/api/tts", {
   method: "POST",
   headers: { "content-type": "application/json" },
-  body: JSON.stringify({ text, speed: 1.1 }),
+  body: JSON.stringify({ text, speed: 1.1, pitchHz: 4 }),
 });
 
 describe("Ryan Neural route", () => {
@@ -58,7 +58,7 @@ describe("Ryan Neural route", () => {
     expect(mock.instances).toHaveLength(before + 1);
     expect(tts.setMetadata).toHaveBeenCalledWith(JARVIS_TTS_VOICE, "mp3");
     expect(tts.toStream).toHaveBeenCalledWith("A &lt;safe&gt; phrase", {
-      rate: "+10%", pitch: "+3Hz", volume: 100,
+      rate: "+10%", pitch: "+4Hz", volume: 100,
     });
     expect(response.headers.get("x-jarvis-tts-engine")).toBe(JARVIS_TTS_ENGINE);
     expect(response.headers.get("x-jarvis-tts-voice")).toBe(JARVIS_TTS_VOICE);

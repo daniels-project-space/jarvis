@@ -32,12 +32,13 @@ describe("viewer bootstrap boundary", () => {
     mock.adminSessionStatus.mockResolvedValue({ valid: false });
   });
 
-  it("opens an anonymous guest partition without minting an owner session", async () => {
+  it("fails closed without minting an anonymous identity or conversation", async () => {
     const response = await POST(request());
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ok: true, actor: "guest", viewerToken: "signed" });
-    expect(mock.issueViewerToken).toHaveBeenCalledWith(expect.objectContaining({ kind: "guest" }));
-    expect(response.headers.get("set-cookie")).toMatch(new RegExp(`${GUEST_COOKIE}=[A-Za-z0-9_-]{32}`));
+    expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({ ok: false, error: "owner_pairing_required" });
+    expect(mock.issueViewerToken).not.toHaveBeenCalled();
+    expect(response.headers.get("set-cookie")).toContain(`${GUEST_COOKIE}=;`);
+    expect(response.headers.get("set-cookie")).toContain("Max-Age=0");
   });
 
   it("uses an enrolled owner cookie only after server-side validation", async () => {

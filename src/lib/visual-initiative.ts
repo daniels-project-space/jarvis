@@ -22,6 +22,15 @@ export function visualInitiativeDirective(userText: string): string {
       "anything merely implied as inferred. One sentence may produce several nodes; never flatten it into one note or invent facts."
     );
   }
+  const routedVisual = rankCapabilities(text, { limit: 4 }).candidates.find(
+    (candidate) => candidate.visual && candidate.tool !== "show" && candidate.tool !== "visual_scene",
+  );
+  if (routedVisual) {
+    return (
+      `SPECIALISED CAPABILITY FOR THIS TURN: route with jarvis_get_tools(intent=<the current request>) and use ${routedVisual.tool}. ` +
+      "Execute that real data/interactive capability before replying; do not substitute a decorative visual_scene, generic show card, or prose-only refusal."
+    );
+  }
   if (VISUAL_STRUCTURE.test(text)) {
     return (
       "VISUAL INITIATIVE FOR THIS TURN: the topic has structure that is clearer on screen. Proactively create or update " +
@@ -30,3 +39,4 @@ export function visualInitiativeDirective(userText: string): string {
   }
   return "";
 }
+import { rankCapabilities } from "./capability-router";

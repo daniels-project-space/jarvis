@@ -7,6 +7,7 @@ import {
   JARVIS_DYNAMIC_TOOLS,
   JARVIS_TOOL_INSTRUCTIONS,
 } from "./agent-tool-bridge";
+import { TOOL_BELT_NAMES } from "../lib/tool-belts";
 import type { CodexDynamicToolCall } from "./codex-app-server";
 
 function dynamicCall(
@@ -115,6 +116,108 @@ describe("foreground agent tool bridge", () => {
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
+  });
+
+  it("marks an HTTP 200 tool failure as typed failure and emits safe telemetry", async () => {
+    const events: Array<{ success: boolean; code: string; target: string; status?: number }> = [];
+    const secret = "dispatch-token-that-must-stay-private";
+    const bridge = new AgentToolBridge(secret, {
+      endpoint: "https://jarvis.test/api/agent-tool",
+      fetchImplementation: async () => Response.json({ result: `Tool failed: leaked ${secret}` }),
+      onEvent: (event) => events.push(event),
+    });
+
+    const response = await bridge.invoke(dynamicCall("jarvis_call_tool", {
+      name: "weather",
+      args: { city: "Seville" },
+    }));
+    const text = response.contentItems[0].type === "inputText" ? response.contentItems[0].text : "";
+
+    expect(response.success).toBe(false);
+    expect(JSON.parse(text)).toMatchObject({
+      ok: false,
+      error: { code: "upstream_failure" },
+    });
+    expect(text).not.toContain(secret);
+    expect(events).toEqual([expect.objectContaining({
+      success: false,
+      code: "upstream_failure",
+      target: "weather",
+      status: 200,
+    })]);
+  });
+
+  it.each([
+    "Maps key unavailable.",
+    "Search unavailable right now.",
+    "Weather lookup failed: upstream timed out.",
+    "Travel map lookup failed: places API returned 503.",
+  ])("treats a scoped provider failure as failure even behind HTTP 200: %s", async (result) => {
+    const bridge = new AgentToolBridge("dispatch-token", {
+      endpoint: "https://jarvis.test/api/agent-tool",
+      fetchImplementation: async () => Response.json({ result }),
+    });
+
+    const response = await bridge.invoke(dynamicCall("jarvis_call_tool", {
+      name: "travel_map",
+      args: { location: "Sevilla" },
+    }));
+
+    expect(response.success).toBe(false);
+    const text = response.contentItems[0].type === "inputText" ? response.contentItems[0].text : "";
+    expect(JSON.parse(text)).toMatchObject({ ok: false, error: { code: "upstream_failure" } });
+  });
+
+  it("routes natural visual intent locally and returns only relevant definitions", async () => {
+    const requests: string[] = [];
+    const bridge = new AgentToolBridge("dispatch-token", {
+      endpoint: "https://jarvis.test/api/agent-tool",
+      fetchImplementation: async (input) => {
+        requests.push(String(input));
+        return Response.json([
+          { name: "travel_map", description: "Render a real travel map." },
+          { name: "places_near", description: "Find places." },
+          { name: "transport_route", description: "Build a route." },
+          { name: "trip_plan", description: "Plan a full trip." },
+        ]);
+      },
+    });
+
+    const response = await bridge.invoke(dynamicCall("jarvis_get_tools", {
+      intent: "I'm in Sevilla right now, can you show me a map with some attractions in the city?",
+    }));
+    const text = response.contentItems[0].type === "inputText" ? response.contentItems[0].text : "null";
+    const routed = JSON.parse(text);
+
+    expect(response.success).toBe(true);
+    expect(new URL(requests[0]).searchParams.get("belt")).toBe("travel");
+    expect(routed).toMatchObject({ belt: "travel", mustRender: true });
+    expect(routed.tools.map((tool: { name: string }) => tool.name)).toEqual([
+      "travel_map",
+      "places_near",
+      "transport_route",
+    ]);
+  });
+
+  it("discovers both the day planner and its real rendering tool in one request", async () => {
+    const bridge = new AgentToolBridge("dispatch-token", {
+      endpoint: "https://jarvis.test/api/agent-tool",
+      fetchImplementation: async () => Response.json([
+        { name: "show", description: "Render the completed plan." },
+        { name: "research", description: "Unrelated work tool." },
+        { name: "plan_my_day", description: "Build the live plan facts." },
+      ]),
+    });
+
+    const response = await bridge.invoke(dynamicCall("jarvis_get_tools", {
+      intent: "Plan my day around my calendar",
+    }));
+    const text = response.contentItems[0].type === "inputText" ? response.contentItems[0].text : "null";
+    const routed = JSON.parse(text);
+
+    expect(response.success).toBe(true);
+    expect(routed).toMatchObject({ belt: "work", mustRender: true });
+    expect(routed.tools.map((tool: { name: string }) => tool.name)).toEqual(["plan_my_day", "show"]);
   });
 
   it("replays the same authoritative invocation context without placing it in tool arguments", async () => {
@@ -264,6 +367,9 @@ describe("foreground agent tool bridge", () => {
       "jarvis_get_tools",
       "jarvis_call_tool",
     ]);
+    const getTools = JARVIS_DYNAMIC_TOOLS.find((tool) => tool.name === "jarvis_get_tools");
+    const properties = getTools?.inputSchema.properties as Record<string, Record<string, unknown>>;
+    expect(properties.belt.enum).toEqual(TOOL_BELT_NAMES);
     expect(JARVIS_TOOL_INSTRUCTIONS).not.toMatch(/curl|python3|JARVIS_DISPATCH_TOKEN/i);
   });
 });

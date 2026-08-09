@@ -5,6 +5,7 @@ import { canonicalJarvisRedirect } from "@/lib/canonical-origin";
 import { bearerToken } from "@/lib/request-auth";
 import { verifyViewerToken } from "@/lib/viewer-jwt";
 import { isJarvisPublicPath } from "@/lib/public-path";
+import { resolveTrustedJarvisEmbedOrigin } from "@/lib/embed-origin";
 
 export async function proxy(req: NextRequest) {
   const canonical = canonicalJarvisRedirect({
@@ -17,6 +18,17 @@ export async function proxy(req: NextRequest) {
 
   const pathname = req.nextUrl.pathname;
   if (pathname === "/login") return NextResponse.redirect(new URL("/", req.url));
+  if (pathname === "/embed") {
+    const hostOrigin = resolveTrustedJarvisEmbedOrigin({
+      declaredOrigin: req.nextUrl.searchParams.get("hostOrigin"),
+      referrer: req.headers.get("referer"),
+    });
+    if (!hostOrigin) return NextResponse.json({ error: "Untrusted Jarvis embed host" }, { status: 403 });
+    const response = NextResponse.next();
+    response.headers.set("content-security-policy", `frame-ancestors ${hostOrigin}`);
+    response.headers.set("referrer-policy", "no-referrer");
+    return response;
+  }
   if (isJarvisPublicPath(pathname)) return NextResponse.next();
 
   if (await verifyViewerToken(bearerToken(req.headers.get("authorization")))) return NextResponse.next();

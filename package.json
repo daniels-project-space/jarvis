@@ -11,7 +11,8 @@
     "deploy:trigger": "npx --yes trigger.dev@4.5.1 deploy",
     "harness:codex-session": "tsx scripts/codex-session-concurrency-harness.ts",
     "probe:codex-cloud-permissions": "tsx scripts/probe-codex-cloud-permissions.ts",
-    "probe:cloud-workspace-provider": "tsx scripts/probe-cloud-workspace-provider.ts"
+    "probe:cloud-workspace-provider": "tsx scripts/probe-cloud-workspace-provider.ts",
+    "owner:pair": "tsx scripts/create-owner-pairing-link.ts"
   },
   "dependencies": {
     "@ai-sdk/provider": "2.0.3",

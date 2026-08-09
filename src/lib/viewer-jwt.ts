@@ -5,11 +5,8 @@ export const VIEWER_ISSUER = "https://jarvis-orcin-six.vercel.app";
 export const VIEWER_AUDIENCE = "jarvis-convex";
 export const VIEWER_SUBJECT = "daniel-owner";
 export const VIEWER_TOKEN_SECONDS = 6 * 60 * 60;
-export const GUEST_SUBJECT_PREFIX = "jarvis-guest:";
 
-export type BrowserIdentity =
-  | { kind: "owner" }
-  | { kind: "guest"; guestId: string };
+export type BrowserIdentity = { kind: "owner" };
 
 let signingKey: Promise<CryptoKey> | null = null;
 let verificationKey: Promise<CryptoKey> | null = null;
@@ -53,12 +50,11 @@ export async function issueViewerToken(
   const issuedAt = Math.floor(nowMs / 1000);
   const expiresAtSeconds = issuedAt + VIEWER_TOKEN_SECONDS;
   const jwk = configuredJwk();
-  const subject = identity.kind === "owner" ? VIEWER_SUBJECT : `${GUEST_SUBJECT_PREFIX}${identity.guestId}`;
-  const token = await new SignJWT({ role: identity.kind, project: "jarvis" })
+  const token = await new SignJWT({ role: "owner", project: "jarvis" })
     .setProtectedHeader({ alg: "ES256", typ: "JWT", kid: String(jwk.kid ?? "jarvis-viewer") })
     .setIssuer(VIEWER_ISSUER)
     .setAudience(VIEWER_AUDIENCE)
-    .setSubject(subject)
+    .setSubject(VIEWER_SUBJECT)
     .setIssuedAt(issuedAt)
     .setExpirationTime(expiresAtSeconds)
     .sign(await getSigningKey());
@@ -82,14 +78,6 @@ export async function verifyViewerToken(token: string | null | undefined, nowMs 
     });
     if (payload.project !== "jarvis") return null;
     if (payload.role === "owner" && payload.sub === VIEWER_SUBJECT) return { kind: "owner" };
-    if (
-      payload.role === "guest"
-      && typeof payload.sub === "string"
-      && payload.sub.startsWith(GUEST_SUBJECT_PREFIX)
-    ) {
-      const guestId = payload.sub.slice(GUEST_SUBJECT_PREFIX.length);
-      if (/^[A-Za-z0-9_-]{32,128}$/.test(guestId)) return { kind: "guest", guestId };
-    }
     return null;
   } catch {
     return null;

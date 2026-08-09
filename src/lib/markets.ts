@@ -26,6 +26,22 @@ const CRYPTO: Record<string, { sym: string; label: string; profile: string }> = 
   ada: { sym: "ADAUSDT", label: "Cardano", profile: "ADA: retail-heavy, long accumulation ranges." },
   link: { sym: "LINKUSDT", label: "Chainlink", profile: "LINK: infra token with long Wyckoff re-accumulation history." },
   avax: { sym: "AVAXUSDT", label: "Avalanche", profile: "AVAX: high-beta alt." },
+  dot: { sym: "DOTUSDT", label: "Polkadot", profile: "DOT: ecosystem alt; confirm breakouts with volume and BTC regime." },
+  sui: { sym: "SUIUSDT", label: "Sui", profile: "SUI: high-beta layer-one; unlocks, ecosystem flows, and BTC regime matter." },
+  apt: { sym: "APTUSDT", label: "Aptos", profile: "APT: high-beta layer-one; watch token unlocks and volume confirmation." },
+  near: { sym: "NEARUSDT", label: "NEAR", profile: "NEAR: high-beta smart-contract asset; ecosystem narrative and BTC regime dominate." },
+  ton: { sym: "TONUSDT", label: "Toncoin", profile: "TON: ecosystem and platform-news driven; demand volume confirmation." },
+  arb: { sym: "ARBUSDT", label: "Arbitrum", profile: "ARB: layer-two governance token; unlocks and Ethereum activity matter." },
+  op: { sym: "OPUSDT", label: "Optimism", profile: "OP: layer-two governance token; unlocks and Ethereum activity matter." },
+  atom: { sym: "ATOMUSDT", label: "Cosmos", profile: "ATOM: ecosystem alt with long ranges; confirm relative strength against BTC." },
+  uni: { sym: "UNIUSDT", label: "Uniswap", profile: "UNI: DeFi governance asset; protocol and regulatory news can override technicals." },
+  ltc: { sym: "LTCUSDT", label: "Litecoin", profile: "LTC: mature high-beta payment asset; relative strength and halving cycles matter." },
+  bch: { sym: "BCHUSDT", label: "Bitcoin Cash", profile: "BCH: high-volatility Bitcoin fork; liquidity and headline spikes fade quickly." },
+  trx: { sym: "TRXUSDT", label: "TRON", profile: "TRX: ecosystem and stablecoin-flow driven; tends to move differently from high-beta alts." },
+  xlm: { sym: "XLMUSDT", label: "Stellar", profile: "XLM: payments asset often correlated with XRP; weight news and relative strength." },
+  hbar: { sym: "HBARUSDT", label: "Hedera", profile: "HBAR: enterprise-narrative alt; verify participation with volume." },
+  shib: { sym: "SHIBUSDT", label: "Shiba Inu", profile: "SHIB: meme asset; social momentum and liquidity dominate fundamentals." },
+  pepe: { sym: "PEPEUSDT", label: "Pepe", profile: "PEPE: meme asset; extreme reflexivity and liquidity risk require volume confirmation." },
 };
 const INDEX: Record<string, { sym: string; label: string; profile: string }> = {
   spx: { sym: "^GSPC", label: "S&P 500", profile: "S&P 500: read WITH the VIX regime (see VIX data); breadth matters — a rally on falling volume + rising VIX is distribution; 50/200-day SMA golden/death crosses carry real flows here." },
@@ -44,11 +60,14 @@ export function resolveAsset(name: string): AssetRef | null {
   const n = name.toLowerCase().trim().replace(/[^a-z0-9^=. -]/g, "");
   const alias: Record<string, string> = {
     bitcoin: "btc", ethereum: "eth", solana: "sol", ripple: "xrp", dogecoin: "doge", cardano: "ada",
-    chainlink: "link", avalanche: "avax", "s&p": "spx", "s&p 500": "spx", sp500: "spx", "es": "spx",
+    chainlink: "link", avalanche: "avax", polkadot: "dot", toncoin: "ton", aptos: "apt", cosmos: "atom",
+    arbitrum: "arb", optimism: "op", uniswap: "uni", litecoin: "ltc", "bitcoin cash": "bch", tron: "trx",
+    stellar: "xlm", hedera: "hbar", "shiba inu": "shib", "shiba": "shib", "s&p": "spx", "s&p 500": "spx", sp500: "spx", "es": "spx",
     nasdaq: "ndx", dow: "dji", "dow jones": "dji", "the vix": "vix", crude: "oil", "wti": "oil",
     dollar: "dxy", "dollar index": "dxy",
   };
-  const key = alias[n] ?? n;
+  const pairBase = n.endsWith("usdt") ? n.slice(0, -4) : n;
+  const key = alias[pairBase] ?? pairBase;
   if (CRYPTO[key]) return { kind: "crypto", label: CRYPTO[key].label, binance: CRYPTO[key].sym, profile: CRYPTO[key].profile };
   if (INDEX[key]) return { kind: "index", label: INDEX[key].label, yahoo: INDEX[key].sym, profile: INDEX[key].profile };
   if (COMMODITY[key]) return { kind: "commodity", label: COMMODITY[key].label, yahoo: COMMODITY[key].sym, profile: COMMODITY[key].profile };

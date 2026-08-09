@@ -1,9 +1,10 @@
 import type { NextRequest } from "next/server";
 import { isSameOriginRequest } from "@/lib/control-session";
 import { controlActor, isOwnerActor } from "@/lib/request-auth";
-import { prepareSpeculativeResearchRequest, sanitizeSpeculativeResearchSources } from "@/lib/speculative-research";
+import { prepareSpeculativeResearchRequest } from "@/lib/speculative-research";
 import { issueSpeculativeResearchReceipt } from "@/lib/speculative-research-receipt.server";
 import { searchWeb } from "@/lib/search";
+import { buildResearchLanes, rankResearchSources } from "@/lib/research-fabric";
 
 export const runtime = "nodejs";
 export const maxDuration = 8;
@@ -31,16 +32,21 @@ export async function POST(req: NextRequest) {
   if (!prepared) return json({ error: "ineligible or malformed research prefetch" }, 400);
 
   try {
-    // Fixed read-only path: a single keyless search, no model, tool router,
-    // Trigger task, Convex mutation, or paid search-provider lookup.
-    const result = await searchWeb(prepared.query, 5, "us", {
-      signal: req.signal,
-      timeoutMs: SEARCH_DEADLINE_MS,
-      providerOrder: "keyless-first",
-      maxPaidAttempts: 0,
-      cacheTtlMs: 45_000,
-    });
-    const sources = sanitizeSpeculativeResearchSources(result?.results ?? []);
+    // Fixed read-only fan-out: three keyless lanes overlap while the user is
+    // still speaking. No model, tool router, task, durable mutation, or paid
+    // search-provider lookup is permitted on this speculative path.
+    const lanes = buildResearchLanes(prepared.query);
+    const results = await Promise.all(lanes.map(async (lane) => ({
+      lane,
+      results: (await searchWeb(lane.query, 4, "us", {
+        signal: req.signal,
+        timeoutMs: SEARCH_DEADLINE_MS,
+        providerOrder: "keyless-first",
+        maxPaidAttempts: 0,
+        cacheTtlMs: 45_000,
+      }))?.results ?? [],
+    })));
+    const sources = rankResearchSources(results).map(({ title, url, snippet }) => ({ title, url, snippet }));
     if (sources.length === 0) return json({ error: "research prefetch unavailable" }, 503, { "retry-after": "5" });
     const issued = issueSpeculativeResearchReceipt({
       actorAuthHash: actor.authTokenHash,

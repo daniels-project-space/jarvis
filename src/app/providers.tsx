@@ -11,6 +11,7 @@ import {
   type ReactNode,
 } from "react";
 import { resolveConvexUrl } from "@/lib/convex-url";
+import { resolveTrustedJarvisEmbedOrigin } from "@/lib/embed-origin";
 import { ViewerSessionProvider } from "@/lib/viewer-session";
 import { setViewerRequestToken } from "@/lib/viewer-request";
 import { ConvexAuthGate } from "./ConvexAuthGate";
@@ -31,6 +32,48 @@ class ViewerTokenError extends Error {
   constructor(readonly status?: number) {
     super(status ? `viewer capability rejected (${status})` : "viewer capability unavailable");
   }
+}
+
+type AuthFailure = "locked" | "offline";
+type StoredEmbedGrant = { hostOrigin: string; controlToken: string; expiresAt: number };
+const EMBED_GRANT_KEY = "jarvis_owner_embed_grant_v1";
+
+function currentEmbedHostOrigin(): string | null {
+  if (typeof window === "undefined" || (window.location.pathname !== "/embed" && window.self === window.top)) return null;
+  return resolveTrustedJarvisEmbedOrigin({
+    declaredOrigin: new URLSearchParams(window.location.search).get("hostOrigin"),
+    referrer: document.referrer,
+    ancestorOrigin: window.location.ancestorOrigins?.[0] ?? null,
+  });
+}
+
+function storedEmbedGrant(hostOrigin: string): StoredEmbedGrant | null {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(EMBED_GRANT_KEY) ?? "null") as StoredEmbedGrant | null;
+    return value
+      && value.hostOrigin === hostOrigin
+      && /^[A-Za-z0-9_-]{40,128}$/.test(value.controlToken)
+      && value.expiresAt > Date.now()
+      ? value
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function requestEmbedViewer(controlToken: string, hostOrigin: string): Promise<string> {
+  const response = await fetch("/api/auth/embed-viewer", {
+    method: "POST",
+    cache: "no-store",
+    headers: {
+      authorization: `Bearer ${controlToken}`,
+      "x-jarvis-embed-origin": hostOrigin,
+    },
+  });
+  if (!response.ok) throw new ViewerTokenError(response.status);
+  const payload = await response.json();
+  if (typeof payload.viewerToken !== "string") throw new Error("viewer capability missing");
+  return payload.viewerToken;
 }
 
 async function requestViewerToken(): Promise<string> {
@@ -69,24 +112,26 @@ export default function Providers({ children }: { children: ReactNode }) {
   const [viewerToken, setViewerToken] = useState<string | null>(null);
   const viewerTokenRef = useRef<string | null>(null);
   const refreshPromiseRef = useRef<Promise<string> | null>(null);
-  const [error, setError] = useState(false);
+  const [error, setError] = useState<AuthFailure | null>(null);
   const [retryNonce, setRetryNonce] = useState(0);
   const retryViewerToken = useCallback(() => {
-    setError(false);
+    setError(null);
     setRetryNonce((value) => value + 1);
   }, []);
 
-  const acceptViewerToken = useCallback((token: string) => {
+  const acceptViewerToken = useCallback((token: string, apiToken?: string, embedOrigin?: string) => {
     viewerTokenRef.current = token;
-    setViewerRequestToken(token);
+    setViewerRequestToken(apiToken ?? null, embedOrigin ?? null);
     setViewerToken((current) => (current === token ? current : token));
   }, []);
 
   const refreshViewerToken = useCallback(async () => {
     if (refreshPromiseRef.current) return refreshPromiseRef.current;
-    const request = requestViewerToken()
+    const hostOrigin = currentEmbedHostOrigin();
+    const grant = hostOrigin ? storedEmbedGrant(hostOrigin) : null;
+    const request = (grant ? requestEmbedViewer(grant.controlToken, hostOrigin!) : requestViewerToken())
       .then((token) => {
-        acceptViewerToken(token);
+        acceptViewerToken(token, grant?.controlToken, grant?.hostOrigin);
         return token;
       })
       .finally(() => {
@@ -118,14 +163,26 @@ export default function Providers({ children }: { children: ReactNode }) {
   useEffect(() => {
     let active = true;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
-    void requestViewerToken()
-      .then((token) => {
-        if (active) acceptViewerToken(token);
-      })
-      .catch(() => {
+    const hostOrigin = currentEmbedHostOrigin();
+    const load = async () => {
+      const grant = hostOrigin ? storedEmbedGrant(hostOrigin) : null;
+      if (grant && hostOrigin) {
+        try {
+          const token = await requestEmbedViewer(grant.controlToken, hostOrigin);
+          if (active) acceptViewerToken(token, grant.controlToken, hostOrigin);
+          return;
+        } catch {
+          sessionStorage.removeItem(EMBED_GRANT_KEY);
+        }
+      }
+      const token = await requestViewerToken();
+      if (active) acceptViewerToken(token);
+    };
+    void load().catch((cause) => {
         if (!active) return;
-        setError(true);
-        retryTimer = setTimeout(retryViewerToken, 2_000);
+        const locked = cause instanceof ViewerTokenError && (cause.status === 401 || cause.status === 403);
+        setError(locked ? "locked" : "offline");
+        if (!locked) retryTimer = setTimeout(retryViewerToken, 2_000);
       });
     return () => {
       active = false;
@@ -133,24 +190,68 @@ export default function Providers({ children }: { children: ReactNode }) {
     };
   }, [acceptViewerToken, retryNonce, retryViewerToken]);
 
+  const connectEmbeddedOwner = useCallback(() => {
+    const hostOrigin = currentEmbedHostOrigin();
+    if (!hostOrigin) {
+      retryViewerToken();
+      return;
+    }
+    const state = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
+    const url = new URL("/api/auth/embed-connect", window.location.origin);
+    url.searchParams.set("hostOrigin", hostOrigin);
+    url.searchParams.set("state", state);
+    const popup = window.open(url, "jarvis-owner-connect", "popup,width=520,height=540");
+    if (!popup) {
+      setError("locked");
+      return;
+    }
+    const timeout = window.setTimeout(() => window.removeEventListener("message", receive), 90_000);
+    function receive(event: MessageEvent) {
+      const payload = event.data as Partial<StoredEmbedGrant> & { jarvis?: string; state?: string; viewerToken?: string };
+      if (
+        event.source !== popup
+        || event.origin !== window.location.origin
+        || payload.jarvis !== "owner-embed-grant"
+        || payload.state !== state
+        || payload.hostOrigin !== hostOrigin
+        || typeof payload.viewerToken !== "string"
+        || typeof payload.controlToken !== "string"
+        || typeof payload.expiresAt !== "number"
+      ) return;
+      window.clearTimeout(timeout);
+      window.removeEventListener("message", receive);
+      const grant = { hostOrigin, controlToken: payload.controlToken, expiresAt: payload.expiresAt };
+      sessionStorage.setItem(EMBED_GRANT_KEY, JSON.stringify(grant));
+      setError(null);
+      acceptViewerToken(payload.viewerToken, payload.controlToken, hostOrigin);
+    }
+    window.addEventListener("message", receive);
+  }, [acceptViewerToken, retryViewerToken]);
+
   if (error) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-[#050506] px-6 text-[#f4f2ed]">
         <section className="w-full max-w-lg overflow-hidden rounded-[28px] border border-white/10 bg-[radial-gradient(circle_at_top,rgba(245,166,35,0.13),transparent_45%),rgba(14,14,16,0.96)] p-7 shadow-[0_30px_100px_rgba(0,0,0,0.6)] sm:p-9">
           <div className="mb-5 flex items-center gap-3 font-mono text-[10px] uppercase tracking-[0.22em] text-amber">
             <span className="h-2 w-2 animate-pulse rounded-full bg-amber shadow-[0_0_18px_rgba(245,166,35,0.8)]" />
-            Reconnecting
+            {error === "locked" ? "Private owner workspace" : "Reconnecting"}
           </div>
-          <h1 className="text-2xl font-semibold tracking-[-0.03em] sm:text-3xl">Jarvis is coming back online.</h1>
+          <h1 className="text-2xl font-semibold tracking-[-0.03em] sm:text-3xl">
+            {error === "locked" ? "Jarvis is locked to Daniel." : "Jarvis is coming back online."}
+          </h1>
           <p className="mt-3 text-sm leading-6 text-white/55">
-            This workspace opens automatically. Jarvis will keep retrying in the background.
+            {error === "locked"
+              ? (currentEmbedHostOrigin()
+                ? "Connect this trusted overlay to your paired Jarvis browser. No guest conversation will be created."
+                : "Open your short-lived, single-use owner pairing link in this browser, then retry.")
+              : "Jarvis will keep retrying in the background."}
           </p>
           <button
             type="button"
-            onClick={retryViewerToken}
+            onClick={error === "locked" && currentEmbedHostOrigin() ? connectEmbeddedOwner : retryViewerToken}
             className="mt-5 font-mono text-[10px] uppercase tracking-[0.18em] text-white/40 transition hover:text-white/75"
           >
-            Retry now
+            {error === "locked" && currentEmbedHostOrigin() ? "Connect owner workspace" : "Retry now"}
           </button>
         </section>
       </main>
