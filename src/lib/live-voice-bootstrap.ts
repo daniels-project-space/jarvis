@@ -21,6 +21,23 @@ export function liveVoiceRetryDelay(attempt: number): number | null {
   return Math.min(12_000, 1_500 * (2 ** (attempt - 1)));
 }
 
+export function scheduleAutoLiveBootstrap(
+  attempt: () => void | Promise<void>,
+  setAttempted: (attempted: boolean) => void,
+  delayMs = 450,
+): () => void {
+  let cancelled = false;
+  setAttempted(true);
+  const timer = globalThis.setTimeout(() => {
+    if (!cancelled) void attempt();
+  }, delayMs);
+  return () => {
+    cancelled = true;
+    globalThis.clearTimeout(timer);
+    setAttempted(false);
+  };
+}
+
 export function speechServiceRetryDelay(attempt: number, requestedDelayMs = 0): number {
   const boundedAttempt = Math.max(1, Math.min(6, Math.floor(attempt) || 1));
   const exponential = Math.min(30_000, 2_000 * (2 ** (boundedAttempt - 1)));

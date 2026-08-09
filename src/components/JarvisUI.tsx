@@ -27,7 +27,12 @@ import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversa
 import { instantSocialReply } from "@/lib/quick-replies";
 import { isPanelFollowUp } from "@/lib/panel-relevance";
 import { nextVoiceLoopAction, shouldMaintainLiveHeartbeat, type VoiceCaptureOutcome } from "@/lib/voice-loop";
-import { liveVoiceRetryDelay, shouldAutoStartLiveVoice, speechServiceRetryDelay } from "@/lib/live-voice-bootstrap";
+import {
+  liveVoiceRetryDelay,
+  scheduleAutoLiveBootstrap,
+  shouldAutoStartLiveVoice,
+  speechServiceRetryDelay,
+} from "@/lib/live-voice-bootstrap";
 import {
   LIVE_SPEAKER_TAIL_MS,
   LIVE_BARGE_SAMPLE_MS,
@@ -3599,15 +3604,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       attempted: liveAutoStarted.current,
       manuallyStopped: liveManuallyStopped.current,
     })) return;
-    liveAutoStarted.current = true;
+    let disposed = false;
     const attempt = async () => {
-      if (liveRef.current || liveManuallyStopped.current || document.hidden) return;
+      if (disposed || liveRef.current || liveManuallyStopped.current || document.hidden) return;
       const started = await toggleLive(true);
+      if (disposed) return;
       if (started) {
         liveAutoRetryCount.current = 0;
         return;
       }
       const current = await readJarvisPermissions();
+      if (disposed) return;
       setPermissions(current);
       if (current.microphone === "denied" || current.microphone === "unsupported" || liveManuallyStopped.current) return;
       liveAutoRetryCount.current += 1;
@@ -3615,9 +3622,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       if (delay == null) return;
       liveAutoRetryTimer.current = window.setTimeout(() => void attempt(), delay);
     };
-    const timer = window.setTimeout(() => void attempt(), 450);
+    const cancelBootstrap = scheduleAutoLiveBootstrap(
+      attempt,
+      (attempted) => { liveAutoStarted.current = attempted; },
+    );
     return () => {
-      window.clearTimeout(timer);
+      disposed = true;
+      cancelBootstrap();
       if (liveAutoRetryTimer.current) window.clearTimeout(liveAutoRetryTimer.current);
       liveAutoRetryTimer.current = null;
     };
