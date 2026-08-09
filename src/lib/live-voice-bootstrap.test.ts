@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
-import { liveVoiceRetryDelay, shouldAutoStartLiveVoice, speechServiceRetryDelay } from "./live-voice-bootstrap";
+import {
+  liveVoiceRetryDelay,
+  scheduleAutoLiveBootstrap,
+  shouldAutoStartLiveVoice,
+  speechServiceRetryDelay,
+} from "./live-voice-bootstrap";
 
 describe("live voice bootstrap policy", () => {
   it.each(["prompt", "granted"] as const)("starts the main site when microphone permission is %s", (permission) => {
@@ -28,6 +33,37 @@ describe("live voice bootstrap policy", () => {
     expect(speechServiceRetryDelay(5)).toBe(30_000);
     expect(speechServiceRetryDelay(2, 20_000)).toBe(20_000);
     expect(speechServiceRetryDelay(2, 90_000)).toBe(30_000);
+  });
+
+  it("releases the bootstrap fence when a remembered grant arrives before the startup timer", async () => {
+    vi.useFakeTimers();
+    try {
+      let attempted = false;
+      let starts = 0;
+      const setAttempted = (value: boolean) => { attempted = value; };
+
+      const cancelPromptBootstrap = scheduleAutoLiveBootstrap(() => { starts += 1; }, setAttempted);
+      expect(attempted).toBe(true);
+
+      // A prompt -> granted permission refresh tears down the old effect before 450 ms.
+      cancelPromptBootstrap();
+      expect(attempted).toBe(false);
+      expect(shouldAutoStartLiveVoice({
+        embedded: false,
+        visible: true,
+        liveDefault: true,
+        permission: "granted",
+        attempted,
+        manuallyStopped: false,
+      })).toBe(true);
+
+      const cancelGrantedBootstrap = scheduleAutoLiveBootstrap(() => { starts += 1; }, setAttempted);
+      await vi.advanceTimersByTimeAsync(450);
+      expect(starts).toBe(1);
+      cancelGrantedBootstrap();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps one browser-owned microphone request pending instead of timing out into overlapping streams", () => {
