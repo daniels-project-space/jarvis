@@ -10,7 +10,7 @@ describe("PlacesView travel presentation", () => {
       query: "niche attractions",
       preferences: "local and non-touristy",
       locationLabel: "Sevilla",
-      center: { lat: 37.3891, lng: -5.9845, label: "Sevilla", detail: "Sevilla, Spain", source: "google_places" },
+      center: { lat: 37.3891, lng: -5.9845, label: "Sevilla", detail: "Sevilla, Spain", source: "openstreetmap" },
       base: {
         lat: 37.386,
         lng: -5.9902,
@@ -20,10 +20,10 @@ describe("PlacesView travel presentation", () => {
       },
       route: {
         label: "Suggested walking order · straight map connector",
-        note: "The line shows stop order, not street geometry; open Google directions for the navigable route.",
+        note: "The line shows stop order, not street geometry; use the route link for navigation.",
         mode: "walking",
         coordinates: [[-5.9902, 37.386], [-6.006, 37.3855]],
-        googleMapsUrl: "https://www.google.com/maps/dir/?api=1&origin=37.386,-5.9902&destination=37.3855,-6.006&travelmode=walking",
+        directionsUrl: "https://www.openstreetmap.org/directions?engine=fossgis_osrm_foot&route=37.386%2C-5.9902%3B37.3855%2C-6.006",
       },
       items: [{
         name: "Centro Cerámica Triana",
@@ -31,13 +31,14 @@ describe("PlacesView travel presentation", () => {
         lat: 37.3855,
         lng: -6.006,
         dist: 1.5,
-        mapsUri: "https://maps.google.com/?q=Centro+Ceramica+Triana",
+        mapsUri: "https://www.openstreetmap.org/?mlat=37.3855&mlon=-6.006",
       }],
     });
 
     const html = renderToStaticMarkup(<PlacesView value={value} />);
     expect(html).toContain("map centre");
     expect(html).toContain("Sevilla, Spain");
+    expect(html).toContain("OpenStreetMap contributors");
     expect(html).toContain("Read-only Gmail booking");
     expect(html).toContain("Hotel Casa 1800 Sevilla");
     expect(html).toContain("straight map connector");

@@ -9,8 +9,8 @@ import {
 } from "@/lib/transcript";
 import { controlActor } from "@/lib/request-auth";
 
-// Speech-to-text utility only: free/fast Groq Whisper. Conversation intelligence
-// remains exclusively in the authenticated Codex subscription CLI worker.
+// Daniel's authenticated self-hosted faster-whisper service is the only speech
+// processor. Conversation intelligence remains in the Codex subscription worker.
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
@@ -35,12 +35,52 @@ function buildForm(model: string, buf: Buffer, mime: string, ext: string): FormD
 }
 
 type TranscriptionResult = { text: string; confidentSpeech: boolean };
+type SttRuntimeConfig = {
+  local: { endpoint: string; sharedSecret: string } | null;
+};
 
-async function transcribe(url: string, key: string, form: FormData, timeoutMs: number): Promise<TranscriptionResult | null> {
+let sttConfigCache: { value: SttRuntimeConfig; expiresAt: number } | null = null;
+
+function localTranscriptionEndpoint(rawUrl: string): string | null {
   try {
-    const r = await fetch(url, {
+    const base = new URL(rawUrl.trim());
+    if (!/^https?:$/.test(base.protocol)) return null;
+    const path = base.pathname.replace(/\/$/, "");
+    if (!path.endsWith("/v1/audio/transcriptions")) base.pathname = `${path}/v1/audio/transcriptions`.replace(/^([^/])/, "/$1");
+    return base.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function sttRuntimeConfig(): Promise<SttRuntimeConfig> {
+  if (process.env.NODE_ENV !== "test" && sttConfigCache && sttConfigCache.expiresAt > Date.now()) return sttConfigCache.value;
+  const configuredUrl = process.env.LOCAL_STT_URL?.trim()
+    ? process.env.LOCAL_STT_URL.trim()
+    : await getSecret("local-stt", "LOCAL_STT_URL").catch(() => "");
+  const endpoint = localTranscriptionEndpoint(configuredUrl);
+  const sharedSecret = endpoint
+    ? process.env.LOCAL_STT_SHARED_SECRET?.trim()
+      || await getSecret("local-stt", "LOCAL_STT_SHARED_SECRET").catch(() => "")
+    : "";
+  const value: SttRuntimeConfig = {
+    // Never send private speech to an unauthenticated custom endpoint.
+    local: endpoint && sharedSecret ? { endpoint, sharedSecret } : null,
+  };
+  if (process.env.NODE_ENV !== "test") sttConfigCache = { value, expiresAt: Date.now() + 5 * 60_000 };
+  return value;
+}
+
+async function transcribe(
+  endpoint: string,
+  bearerToken: string,
+  form: FormData,
+  timeoutMs: number,
+): Promise<TranscriptionResult | null> {
+  try {
+    const r = await fetch(endpoint, {
       method: "POST",
-      headers: { Authorization: `Bearer ${key}` },
+      headers: { Authorization: `Bearer ${bearerToken}` },
       body: form,
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -62,16 +102,14 @@ export async function POST(req: NextRequest) {
   const mime = (req.headers.get("content-type") ?? "audio/wav").split(";")[0];
   const ext = EXT[mime] ?? "wav";
 
-  const groqKey = process.env.GROQ_API_KEY ?? (await getSecret("groq", "GROQ_API_KEY").catch(() => ""));
-
-  let transcription: TranscriptionResult | null = null;
-  if (groqKey)
-    transcription = await transcribe(
-      "https://api.groq.com/openai/v1/audio/transcriptions",
-      groqKey,
-      buildForm("whisper-large-v3-turbo", inBuf, mime, ext),
-      10000,
-    );
+  const config = await sttRuntimeConfig();
+  if (!config.local) return new Response(JSON.stringify({ error: "local speech recognition is not configured" }), { status: 503 });
+  const transcription = await transcribe(
+    config.local.endpoint,
+    config.local.sharedSecret,
+    buildForm("turbo", inBuf, mime, ext),
+    25_000,
+  );
   if (transcription === null) return new Response(JSON.stringify({ error: "stt unavailable" }), { status: 502 });
   let text = transcription.confidentSpeech ? cleanSpeechTranscript(transcription.text) : "";
 
@@ -93,6 +131,6 @@ export async function POST(req: NextRequest) {
   if (text && latin / text.length < 0.7) text = "";
   if (!isMeaningfulSpeechTranscript(text)) text = "";
   return new Response(JSON.stringify({ text }), {
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", "x-jarvis-stt-provider": "local-faster-whisper" },
   });
 }

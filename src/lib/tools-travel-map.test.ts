@@ -31,21 +31,13 @@ vi.mock("./icloud-calendar", () => ({
 
 import { executeTool, TOOL_DEFS } from "./tools";
 
-function place(name: string, address: string, lat: number, lng: number) {
-  return {
-    displayName: { text: name },
-    formattedAddress: address,
-    location: { latitude: lat, longitude: lng },
-    rating: 4.7,
-    userRatingCount: 120,
-    googleMapsUri: `https://maps.google.com/?q=${encodeURIComponent(name)}`,
-  };
+function osmPlace(name: string, address: string, lat: number, lng: number) {
+  return { name, display_name: address, lat: String(lat), lon: String(lng), type: "attraction" };
 }
 
 describe("travel_map tool", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mock.getSecret.mockResolvedValue("places-key");
     mock.convexQuery.mockImplementation(async (path: string) =>
       path === "currentState:getActive" ? { value: "Sevilla" } : "thread-1",
     );
@@ -60,19 +52,19 @@ describe("travel_map tool", () => {
       allDay: false,
       marker: "jarvis-gmail-booking:gmail-booking-1",
     }]);
-    vi.stubGlobal("fetch", vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body ?? "{}"));
-      if (body.textQuery === "Sevilla") {
-        return new Response(JSON.stringify({ places: [place("Sevilla", "Sevilla, Spain", 37.3891, -5.9845)] }), { status: 200 });
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const query = new URL(String(url)).searchParams.get("q") ?? "";
+      if (query === "Sevilla") {
+        return new Response(JSON.stringify([osmPlace("Sevilla", "Sevilla, Spain", 37.3891, -5.9845)]), { status: 200 });
       }
-      if (body.textQuery.includes("Rodrigo Caro")) {
-        return new Response(JSON.stringify({ places: [place("Hotel Casa 1800 Sevilla", "Rodrigo Caro, 6, Sevilla", 37.386, -5.9902)] }), { status: 200 });
+      if (query.includes("Rodrigo Caro")) {
+        return new Response(JSON.stringify([osmPlace("Hotel Casa 1800 Sevilla", "Rodrigo Caro, 6, Sevilla", 37.386, -5.9902)]), { status: 200 });
       }
-      return new Response(JSON.stringify({ places: [
-        place("Centro Cerámica Triana", "Calle Callao, Sevilla", 37.3855, -6.006),
-        place("Caótica", "Calle José Gestoso, Sevilla", 37.394, -5.993),
-        place("Espacio Santa Clara", "Calle Becas, Sevilla", 37.401, -5.997),
-      ] }), { status: 200 });
+      return new Response(JSON.stringify([
+        osmPlace("Centro Cerámica Triana", "Calle Callao, Sevilla", 37.3855, -6.006),
+        osmPlace("Caótica", "Calle José Gestoso, Sevilla", 37.394, -5.993),
+        osmPlace("Espacio Santa Clara", "Calle Becas, Sevilla", 37.401, -5.997),
+      ]), { status: 200 });
     }));
   });
 
@@ -87,11 +79,12 @@ describe("travel_map tool", () => {
       travel_mode: "walking",
     });
 
-    expect(result).toContain("Interactive map opened for Sevilla");
+    expect(result).toContain("Interactive OpenStreetMap opened for Sevilla");
+    expect(result).toContain("Opening hours and ratings are unverified");
     expect(result).toContain("read-only Gmail booking base");
     expect(mock.lookupBookings).toHaveBeenCalledWith({ days: 730, maxResults: 24 });
-    const requestBodies = vi.mocked(fetch).mock.calls.map(([, init]) => JSON.parse(String(init?.body ?? "{}")));
-    expect(requestBodies.every((body) => !("regionCode" in body))).toBe(true);
+    const requests = vi.mocked(fetch).mock.calls.map(([url]) => new URL(String(url)));
+    expect(requests.every((url) => url.hostname === "nominatim.openstreetmap.org")).toBe(true);
 
     const panelCall = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
     expect(panelCall).toBeTruthy();
@@ -99,14 +92,15 @@ describe("travel_map tool", () => {
     expect(panel).toMatchObject({
       kind: "places",
       locationLabel: "Sevilla",
-      center: { label: "Sevilla", source: "google_places" },
+      provider: "openstreetmap",
+      center: { label: "Sevilla", source: "openstreetmap" },
       base: { label: "Hotel Casa 1800 Sevilla", source: "Read-only Gmail booking" },
       booking: { requested: true, status: "matched" },
       route: { mode: "walking" },
     });
     expect(panel.items).toHaveLength(3);
     expect(panel.route.coordinates).toHaveLength(4);
-    expect(panel.route.googleMapsUrl).toContain("google.com/maps/dir/");
+    expect(panel.route.directionsUrl).toContain("openstreetmap.org/directions");
   });
 
   it("keeps proactive booking lookup read-only", async () => {
@@ -122,7 +116,7 @@ describe("travel_map tool", () => {
       preferences: "I'm not looking for touristy stuff; give me something more niche",
     });
 
-    expect(result).toContain("Interactive map opened for Sevilla");
+    expect(result).toContain("Interactive OpenStreetMap opened for Sevilla");
     expect(mock.convexQuery).toHaveBeenCalledWith("currentState:getActive", {
       key: "profile.current_location",
     });
@@ -159,4 +153,20 @@ describe("travel_map tool", () => {
     });
     expect(panel.base).toBeUndefined();
   });
+
+  it("uses rate-limited OpenStreetMap without a paid-provider fallback", async () => {
+    const result = await executeTool("travel_map", {
+      location: "Sevilla",
+      query: "niche local places",
+    });
+
+    expect(result).toContain("Interactive OpenStreetMap opened for Sevilla");
+    const panelCall = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
+    const panel = JSON.parse(String(panelCall?.[1]?.value));
+    expect(panel.provider).toBe("openstreetmap");
+    expect(panel.center).toMatchObject({ source: "openstreetmap" });
+    expect(panel.items).toContainEqual(expect.objectContaining({ provider: "openstreetmap" }));
+  });
+
+
 });

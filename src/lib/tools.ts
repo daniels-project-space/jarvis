@@ -30,13 +30,17 @@ import {
   type VisualScene,
 } from "./visual-scene";
 import {
-  googleDirectionsUrl,
-  googlePlacesSearchBody,
-  googlePlacesTextQuery,
   normalizeTravelMapRequest,
   orderTravelMapPoints,
+  placeSearchTextQuery,
   type TravelMapPoint,
 } from "./travel-map";
+import {
+  openStreetMapDistanceKm,
+  openStreetMapDirectionsUrl,
+  searchOpenStreetMapPlaces,
+  type OpenStreetMapPlace,
+} from "./openstreetmap";
 
 // JARVIS's tool belt — one portable JSON-schema definition list executed by
 // the foreground Codex supervisor and the realtime client bridge.
@@ -834,7 +838,7 @@ export const TOOL_DEFS = [
   {
     name: "trip_plan",
     description:
-      "Full travel scout — ONE call searches real flights (Google Flights), real hotels with amenities/total prices (Google Hotels), and top activities (Google Places) in parallel, then opens the interactive globe trip planner on screen. BUDGET IS REQUIRED: if Daniel hasn't given one, ASK HIM FIRST instead of calling this. Use for any 'plan a trip / find me a holiday / getaway to X'.",
+      "Full travel scout — ONE call searches flights, hotels, and OpenStreetMap activities, then opens the interactive globe trip planner. BUDGET IS REQUIRED: if Daniel hasn't given one, ASK HIM FIRST instead of calling this. OpenStreetMap activity data does not include dependable ratings, opening hours, or photos.",
     parameters: {
       type: "object",
       properties: {
@@ -1020,7 +1024,7 @@ export const TOOL_DEFS = [
   {
     name: "travel_map",
     description:
-      "Show a real interactive city/local MapLibre map whenever Daniel asks to see places, attractions, waypoints, a route, or an itinerary. Works for an explicit location anywhere in the world or his saved current location; never assume the UK. Pass his exact taste in preferences (including niche/non-touristy follow-ups) instead of reducing it to a fixed category. For route/itinerary requests, include_bookings defaults on so a matching read-only Gmail hotel booking can become the labelled starting base; no Calendar or Gmail state is changed. The panel shows honest centre/base labels, numbered live Google Places pins, an optional suggested stop order, and Google street-directions links.",
+      "Show a real interactive city/local MapLibre map whenever Daniel asks to see places, attractions, waypoints, a route, or an itinerary. Works for an explicit location anywhere in the world or his saved current location; never assume the UK. Pass his exact taste in preferences (including niche/non-touristy follow-ups) instead of reducing it to a fixed category. For route/itinerary requests, include_bookings defaults on so a matching read-only Gmail hotel booking can become the labelled starting base; no Calendar or Gmail state is changed. The panel shows honest centre/base labels, numbered live place pins, and an optional suggested stop order with open route links.",
     parameters: {
       type: "object",
       properties: {
@@ -1036,7 +1040,7 @@ export const TOOL_DEFS = [
   {
     name: "places_near",
     description:
-      "Find real places NEAR Daniel (uses his live location): 'nearest Pizza Express', 'coffee near me', 'where's the closest pharmacy'. Also for a SPECIFIC local place and its opening hours: 'when does the Royal Mail down the street close', 'is the Tesco open now'. Shows a dark interactive map of his area with the places pinned, each with rating, open/closed + today's hours, distance, and one-tap walk/drive/transit directions. Speak the single best answer (nearest, or the closing time he asked for).",
+      "Find real places NEAR Daniel (uses his live location): 'nearest Pizza Express', 'coffee near me', 'where's the closest pharmacy'. Shows a dark OpenStreetMap map. Opening hours and ratings are unverified unless separately sourced; never invent them.",
     parameters: {
       type: "object",
       properties: {
@@ -1048,7 +1052,7 @@ export const TOOL_DEFS = [
   {
     name: "transport_route",
     description:
-      "Show a LIVE interactive Google Map with directions between two places (transit/driving/walking) — routes, times and options, embedded on screen. Use for 'how do I get from X to Y', airport transfers, trip transport questions.",
+      "Show an interactive route between two places on screen. Uses live Google directions, including transit, when configured and a keyless OpenStreetMap walking/driving/cycling fallback otherwise. Never invent public-transit times when only the fallback is available.",
     parameters: {
       type: "object",
       properties: {
@@ -2697,68 +2701,27 @@ async function musicSearch(args: any): Promise<string> {
   }
 }
 
-// Live Google Maps directions embedded on screen.
-// Places near Daniel: Google Places (New) Text Search biased to his live
-// location, rendered as a dark map + cards with hours/rating/distance.
-function haversine(a: [number, number], b: [number, number]): number {
-  const R = 6371, dLat = ((b[0] - a[0]) * Math.PI) / 180, dLng = ((b[1] - a[1]) * Math.PI) / 180;
-  const lat1 = (a[0] * Math.PI) / 180, lat2 = (b[0] * Math.PI) / 180;
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
-  return R * 2 * Math.asin(Math.sqrt(h));
-}
-type TravelPlace = TravelMapPoint & {
-  name: string;
-  address: string;
-  rating?: number;
-  reviews?: number;
-  openNow?: boolean;
-  hoursToday?: string;
-  type?: string;
-  dist: number | null;
-  mapsUri: string;
+// Owner-scale OpenStreetMap requests are rate-limited and cached by the adapter.
+type TravelProvider = "openstreetmap";
+type TravelPlace = OpenStreetMapPlace & {
+  provider: TravelProvider;
 };
 
-const GOOGLE_TRAVEL_PLACE_FIELDS = "places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.currentOpeningHours,places.regularOpeningHours,places.googleMapsUri,places.primaryTypeDisplayName";
+type TravelSearchOptions = {
+  center?: TravelMapPoint;
+  radiusMetres?: number;
+  maxResults?: number;
+};
 
 async function searchTravelPlaces(
-  key: string,
   textQuery: string,
-  options: { center?: TravelMapPoint; radiusMetres?: number; maxResults?: number } = {},
-): Promise<TravelPlace[]> {
-  const response = await fetch("https://places.googleapis.com/v1/places:searchText", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "X-Goog-Api-Key": key,
-      "X-Goog-FieldMask": GOOGLE_TRAVEL_PLACE_FIELDS,
-    },
-    body: JSON.stringify(googlePlacesSearchBody(textQuery, options)),
-    signal: AbortSignal.timeout(9_000),
-  });
-  if (!response.ok) throw new Error(`Places lookup failed (${response.status})`);
-  const payload = await response.json();
-  const dayIndex = (new Date().getDay() + 6) % 7;
-  return (Array.isArray(payload.places) ? payload.places : []).map((place: any) => {
-    const lat = Number(place.location?.latitude);
-    const lng = Number(place.location?.longitude);
-    const opening = place.currentOpeningHours ?? place.regularOpeningHours;
-    const todayLine = (opening?.weekdayDescriptions ?? [])[dayIndex] ?? "";
-    return {
-      name: String(place.displayName?.text ?? "").slice(0, 80),
-      address: String(place.formattedAddress ?? "").slice(0, 180),
-      rating: Number.isFinite(Number(place.rating)) ? Number(place.rating) : undefined,
-      reviews: Number.isFinite(Number(place.userRatingCount)) ? Number(place.userRatingCount) : undefined,
-      openNow: typeof opening?.openNow === "boolean" ? opening.openNow : undefined,
-      hoursToday: String(todayLine).replace(/^[^:]+:\s*/, "").slice(0, 80),
-      type: String(place.primaryTypeDisplayName?.text ?? "").slice(0, 60),
-      lat,
-      lng,
-      dist: options.center && Number.isFinite(lat) && Number.isFinite(lng)
-        ? Math.round(haversine([options.center.lat, options.center.lng], [lat, lng]) * 10) / 10
-        : null,
-      mapsUri: String(place.googleMapsUri ?? ""),
-    };
-  }).filter((place: TravelPlace) => Number.isFinite(place.lat) && Number.isFinite(place.lng) && Boolean(place.name));
+  options: TravelSearchOptions = {},
+): Promise<{ places: TravelPlace[]; provider: TravelProvider }> {
+  const places = (await searchOpenStreetMapPlaces(textQuery, options)).map((place) => ({
+    ...place,
+    provider: "openstreetmap" as const,
+  }));
+  return { places, provider: "openstreetmap" };
 }
 
 function chooseTravelBooking(bookings: ConfirmedBooking[], location?: string): ConfirmedBooking | undefined {
@@ -2778,8 +2741,6 @@ function chooseTravelBooking(bookings: ConfirmedBooking[], location?: string): C
 
 async function travelMap(args: any): Promise<string> {
   const request = normalizeTravelMapRequest(args ?? {});
-  const key = await getSecret("google", "GOOGLE_PLACES_API_KEY").catch(() => "");
-  if (!key) return "Maps key unavailable.";
   try {
     const bookingsPromise: Promise<{ bookings: ConfirmedBooking[]; unavailable: boolean }> = request.includeBookings
       // Search confirmation mail broadly, then validate the selected stay
@@ -2789,16 +2750,17 @@ async function travelMap(args: any): Promise<string> {
         .then((bookings) => ({ bookings, unavailable: false }))
         .catch(() => ({ bookings: [] as ConfirmedBooking[], unavailable: true }))
       : Promise.resolve({ bookings: [] as ConfirmedBooking[], unavailable: false });
-    let center: (TravelMapPoint & { label: string; detail?: string; source: "saved_location" | "current_state" | "google_places" }) | null = null;
+    let center: (TravelMapPoint & { label: string; detail?: string; source: "saved_location" | "current_state" | TravelProvider }) | null = null;
     if (request.location) {
-      const locationMatch = (await searchTravelPlaces(key, request.location, { maxResults: 1 }))[0];
+      const locationLookup = await searchTravelPlaces(request.location, { maxResults: 1 });
+      const locationMatch = locationLookup.places[0];
       if (!locationMatch) return `I couldn't locate ${request.location} on the map.`;
       center = {
         lat: locationMatch.lat,
         lng: locationMatch.lng,
         label: request.location,
         detail: locationMatch.address || locationMatch.name,
-        source: "google_places",
+        source: locationLookup.provider,
       };
     } else {
       const [currentState, saved] = await Promise.all([
@@ -2807,7 +2769,7 @@ async function travelMap(args: any): Promise<string> {
       ]);
       const currentPlace = currentState?.value?.trim();
       if (currentPlace) {
-        const locationMatch = (await searchTravelPlaces(key, currentPlace, { maxResults: 1 }))[0];
+        const locationMatch = (await searchTravelPlaces(currentPlace, { maxResults: 1 })).places[0];
         if (locationMatch) {
           center = {
             lat: locationMatch.lat,
@@ -2828,19 +2790,21 @@ async function travelMap(args: any): Promise<string> {
 
     const bookingLookup = await bookingsPromise;
     const bookingCandidate = chooseTravelBooking(bookingLookup.bookings, request.location ?? center.label);
-    const [found, candidateGeocode] = await Promise.all([
-      searchTravelPlaces(key, googlePlacesTextQuery(request), { center, radiusMetres: 14_000, maxResults: 10 }),
-      bookingCandidate?.location
-        ? searchTravelPlaces(key, bookingCandidate.location, { center, radiusMetres: 30_000, maxResults: 1 }).then((rows) => rows[0]).catch(() => undefined)
-        : Promise.resolve(undefined),
-    ]);
-    if (!found.length) return `I couldn't find places matching “${googlePlacesTextQuery(request)}”.`;
+    // Do not parallelise public Nominatim requests: the shared adapter keeps
+    // owner-scale usage within its rate limit.
+    const foundLookup = await searchTravelPlaces(placeSearchTextQuery(request), { center, radiusMetres: 14_000, maxResults: 10 });
+    const candidateLookup = bookingCandidate?.location
+      ? await searchTravelPlaces(bookingCandidate.location, { center, radiusMetres: 30_000, maxResults: 1 }).catch(() => undefined)
+      : undefined;
+    const found = foundLookup.places;
+    const candidateGeocode = candidateLookup?.places[0];
+    if (!found.length) return `I couldn't find places matching “${placeSearchTextQuery(request)}”.`;
 
     // A booking is allowed to become the route origin only after its address
     // geocodes near the requested city. This prevents a future stay in another
     // country from silently becoming today's route base.
     const bookingDistanceKm = candidateGeocode
-      ? haversine([center.lat, center.lng], [candidateGeocode.lat, candidateGeocode.lng])
+      ? openStreetMapDistanceKm(center, candidateGeocode)
       : Number.POSITIVE_INFINITY;
     const booking = bookingCandidate && candidateGeocode && bookingDistanceKm <= 80
       ? bookingCandidate
@@ -2858,19 +2822,19 @@ async function travelMap(args: any): Promise<string> {
 
     const basePoint = bookingGeocode ? { lat: bookingGeocode.lat, lng: bookingGeocode.lng } : center;
     const selected = found
-      .map((place) => ({ ...place, dist: Math.round(haversine([basePoint.lat, basePoint.lng], [place.lat, place.lng]) * 10) / 10 }))
+      .map((place) => ({ ...place, dist: Math.round(openStreetMapDistanceKm(basePoint, place) * 10) / 10 }))
       .sort((left, right) => (left.dist ?? 99) - (right.dist ?? 99))
       .slice(0, request.route ? 8 : 10);
     const places = request.route ? orderTravelMapPoints(basePoint, selected) : selected;
-    const routeUrl = request.route
-      ? googleDirectionsUrl({ origin: basePoint, stops: places, mode: request.travelMode })
+    const routeUrl = request.route && places.length
+      ? openStreetMapDirectionsUrl({ origin: basePoint, destination: places.at(-1)!, mode: request.travelMode })
       : undefined;
     const route = request.route ? {
       label: `Suggested ${request.travelMode} order · straight map connector`,
-      note: "The line shows stop order, not street geometry; open Google directions for the navigable route.",
+      note: "The line shows stop order, not street geometry. The directions link opens the final stop; use each place's controls for a specific route.",
       mode: request.travelMode,
       coordinates: [basePoint, ...places].map((point) => [point.lng, point.lat]),
-      googleMapsUrl: routeUrl,
+      directionsUrl: routeUrl,
       order: places.map((place) => place.name),
     } : undefined;
     const base = booking ? {
@@ -2903,6 +2867,7 @@ async function travelMap(args: any): Promise<string> {
                 : undefined,
       },
       route,
+      provider: foundLookup.provider,
       items: places,
     }, `map · ${locationLabel.slice(0, 32)}`);
     const bookingResult = base
@@ -2910,7 +2875,7 @@ async function travelMap(args: any): Promise<string> {
       : request.includeBookings
         ? `${bookingStatus === "unavailable" ? "Gmail booking lookup was unavailable" : "No confirmed Gmail stay near this map was verified"}; the route starts from the map centre. Do not claim or imply that a booking address was used.`
         : "No booking base was requested.";
-    return `Interactive map opened for ${locationLabel} with ${places.length} real place pin${places.length === 1 ? "" : "s"}${routeUrl ? ` in a suggested ${request.travelMode} order with a Google directions link` : ""}. ${bookingResult} Keep the map visible and answer with a short, preference-aware summary.`;
+    return `Interactive OpenStreetMap opened for ${locationLabel} with ${places.length} place pin${places.length === 1 ? "" : "s"}. Opening hours and ratings are unverified${routeUrl ? `; the suggested ${request.travelMode} route link opens the final stop` : ""}. ${bookingResult} Keep the map visible and answer with a short, preference-aware summary.`;
   } catch (error: any) {
     return `Travel map lookup failed: ${String(error?.message ?? error).slice(0, 120)}.`;
   }
@@ -2922,47 +2887,24 @@ async function placesNear(args: any): Promise<string> {
   const loc: any = await convexQuery("ui:getLocation", {}).catch(() => null);
   if (!loc?.value) return "I don't have your location yet, sir — tap the location toggle in the options panel (⚙) once and it stays on.";
   const [lat, lng] = String(loc.value).split(",").map(Number);
-  const key = await getSecret("google", "GOOGLE_PLACES_API_KEY").catch(() => "");
-  if (!key) return "Maps key unavailable.";
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return "Your saved location is invalid. Update it in options and try again.";
   try {
-    const r = await fetch("https://places.googleapis.com/v1/places:searchText", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "X-Goog-Api-Key": key,
-        "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.currentOpeningHours,places.regularOpeningHours,places.googleMapsUri,places.primaryTypeDisplayName",
-      },
-      body: JSON.stringify(googlePlacesSearchBody(query, { center: { lat, lng }, radiusMetres: 8_000, maxResults: 10 })),
-      signal: AbortSignal.timeout(9000),
+    const lookup = await searchTravelPlaces(query, {
+      center: { lat, lng },
+      radiusMetres: 8_000,
+      maxResults: 10,
     });
-    if (!r.ok) return `Places lookup failed (${r.status}).`;
-    const j = await r.json();
-    const dayIdx = (new Date().getDay() + 6) % 7; // Google weekday arrays start Monday
-    const places = (j.places ?? []).map((p: any) => {
-      const plat = p.location?.latitude, plng = p.location?.longitude;
-      const oh = p.currentOpeningHours ?? p.regularOpeningHours;
-      const todayLine = (oh?.weekdayDescriptions ?? [])[dayIdx] ?? "";
-      return {
-        name: String(p.displayName?.text ?? "").slice(0, 60),
-        address: String(p.formattedAddress ?? "").slice(0, 80),
-        rating: p.rating,
-        reviews: p.userRatingCount,
-        openNow: oh?.openNow,
-        hoursToday: todayLine.replace(/^[A-Za-z]+:\s*/, ""),
-        type: String(p.primaryTypeDisplayName?.text ?? ""),
-        lat: plat, lng: plng,
-        dist: plat != null ? Math.round(haversine([lat, lng], [plat, plng]) * 10) / 10 : null,
-        mapsUri: String(p.googleMapsUri ?? ""),
-      };
-    }).filter((p: any) => p.lat != null).sort((a: any, b: any) => (a.dist ?? 99) - (b.dist ?? 99));
+    const places = lookup.places;
     if (!places.length) return `Couldn't find "${query}" near you.`;
-    await showWidget({ kind: "places", query, center: { lat, lng }, items: places.slice(0, 10) }, `near you · ${query.slice(0, 24)}`);
+    await showWidget({
+      kind: "places",
+      query,
+      provider: lookup.provider,
+      center: { lat, lng, source: "saved_location" },
+      items: places.slice(0, 10),
+    }, `near you · ${query.slice(0, 24)}`);
     const nearest = places[0];
-    return (
-      `PLACES on a dark map on screen (${places.length} pins near Daniel, tap-through directions). ` +
-      `Nearest: ${nearest.name}, ${nearest.dist}km, ${nearest.openNow === false ? "closed now" : nearest.openNow ? "open now" : ""}${nearest.hoursToday ? ` (today ${nearest.hoursToday})` : ""}. ` +
-      `Answer his exact question in one line — if he asked closing time, give THAT place's closing time from hoursToday.`
-    );
+    return `OPENSTREETMAP on screen (${places.length} pins near Daniel). Nearest: ${nearest.name}, ${nearest.dist}km. Opening hours and ratings are unverified; do not guess them.`;
   } catch (e: any) {
     return `Places lookup error: ${String(e?.message ?? e).slice(0, 100)}`;
   }
@@ -2972,18 +2914,47 @@ async function transportRoute(args: any): Promise<string> {
   const from = String(args.from ?? "").trim();
   const to = String(args.to ?? "").trim();
   if (!from || !to) return "From where to where?";
-  const mode = ["transit", "driving", "walking", "bicycling"].includes(String(args.mode)) ? String(args.mode) : "transit";
-  const key = await getSecret("google", "GOOGLE_PLACES_API_KEY").catch(() => "");
-  if (!key) return "Maps key unavailable.";
-  const url = `https://www.google.com/maps/embed/v1/directions?key=${key}&origin=${encodeURIComponent(from)}&destination=${encodeURIComponent(to)}&mode=${mode}`;
-  await convexMutation("ui:setPanel", { type: "url", value: url, title: `route · ${from.slice(0, 20)} → ${to.slice(0, 20)}` });
-  await convexMutation("chatQueue:postCard", {
-    threadId: await activeThread(),
-    type: "url",
-    value: `https://www.google.com/maps/dir/${encodeURIComponent(from)}/${encodeURIComponent(to)}`,
-    title: `route ${from.slice(0, 18)} → ${to.slice(0, 18)} ↗`,
-  }).catch(() => {});
-  return `Live ${mode} directions ${from} → ${to} are on screen (interactive map — he can pan and switch routes). Speak the gist if you know it; the map has the times.`;
+  const mode = (["transit", "driving", "walking", "bicycling"].includes(String(args.mode)) ? String(args.mode) : "walking") as "transit" | "driving" | "walking" | "bicycling";
+  try {
+    // Deliberately sequential: public Nominatim is rate limited by the shared adapter.
+    const origin = (await searchTravelPlaces(from, { maxResults: 1 })).places[0];
+    const destination = (await searchTravelPlaces(to, { maxResults: 1 })).places[0];
+    if (!origin || !destination) return "I couldn't locate one of those places well enough to create a route.";
+    const fallbackMode = mode === "transit" ? "walking" : mode;
+    const url = openStreetMapDirectionsUrl({ origin, destination, mode: fallbackMode });
+    await showWidget({
+      kind: "places",
+      activeTool: "transport_route",
+      provider: "openstreetmap",
+      locationLabel: `${from} → ${to}`,
+      center: { lat: origin.lat, lng: origin.lng, label: from, detail: origin.address, source: "openstreetmap" },
+      route: {
+        label: `${fallbackMode} route · OpenStreetMap fallback`,
+        note: mode === "transit"
+          ? "Live transit timing is unavailable from the fallback; this line shows a walking alternative."
+          : "Open the route link for street-by-street navigation.",
+        mode: fallbackMode,
+        coordinates: [[origin.lng, origin.lat], [destination.lng, destination.lat]],
+        directionsUrl: url,
+        order: [destination.name],
+      },
+      items: [{
+        ...destination,
+        dist: Math.round(openStreetMapDistanceKm(origin, destination) * 10) / 10,
+      }],
+    }, `route · ${from.slice(0, 20)} → ${to.slice(0, 20)}`);
+    await convexMutation("chatQueue:postCard", {
+      threadId: await activeThread(),
+      type: "url",
+      value: url,
+      title: `route ${from.slice(0, 18)} → ${to.slice(0, 18)} ↗`,
+    }).catch(() => {});
+    return mode === "transit"
+      ? `A walking OpenStreetMap fallback for ${from} → ${to} is on screen. Live public-transit times are unavailable, so say that clearly and do not invent them.`
+      : `OpenStreetMap ${mode} route ${from} → ${to} is on screen. Speak only what the map confirms.`;
+  } catch (error: any) {
+    return `Route lookup failed: ${String(error?.message ?? error).slice(0, 100)}.`;
+  }
 }
 
 // The Obsidian mind, visualised: memory rows clustered by kind on the canvas.

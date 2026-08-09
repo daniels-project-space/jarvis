@@ -16,15 +16,18 @@ describe("intelligence provider boundary", () => {
     expect(config).toMatch(/^\s*runtime:\s*"node-22",\s*$/m);
   });
 
-  it("keeps Groq limited to speech transcription transport", () => {
+  it("removes direct Groq and Google Maps/Places billing paths", () => {
     const root = join(process.cwd(), "src");
-    const stt = join(root, "app/api/stt/route.ts");
     const violations = runtimeFiles(root)
-      .filter((path) => path !== stt)
-      .filter((path) => /api\.groq\.com\/openai\/v1\/chat|llama-[\d.]|gpt-oss/i.test(readFileSync(path, "utf8")))
+      .filter((path) => /api\.groq\.com|GROQ_API_KEY|places\.googleapis\.com|maps\.googleapis\.com|GOOGLE_PLACES_API_KEY/i.test(readFileSync(path, "utf8")))
       .map((path) => relative(process.cwd(), path));
     expect(violations).toEqual([]);
+    const stt = join(root, "app/api/stt/route.ts");
     expect(readFileSync(stt, "utf8")).toContain("/audio/transcriptions");
+    expect(readFileSync(stt, "utf8")).toContain("LOCAL_STT_URL");
+    expect(readFileSync(stt, "utf8")).toContain("local-faster-whisper");
+    const tools = readFileSync(join(root, "lib/tools.ts"), "utf8");
+    expect(tools).toContain("searchOpenStreetMapPlaces");
   });
 
   it("ships Trigger workers with the pinned Codex subscription boundary", () => {

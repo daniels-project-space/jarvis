@@ -732,7 +732,8 @@ type PlacesWidget = {
   query: string;
   preferences?: string;
   locationLabel?: string;
-  center: { lat: number; lng: number; label?: string; detail?: string; source?: "saved_location" | "current_state" | "google_places" };
+  provider?: "openstreetmap";
+  center: { lat: number; lng: number; label?: string; detail?: string; source?: "saved_location" | "current_state" | "openstreetmap" };
   base?: { lat?: number; lng?: number; label: string; address?: string; source?: string };
   booking?: {
     requested: boolean;
@@ -741,7 +742,7 @@ type PlacesWidget = {
   };
   route?: {
     label?: string; note?: string; mode?: string; coordinates?: [number, number][];
-    googleMapsUrl?: string; order?: string[];
+    directionsUrl?: string; order?: string[];
   };
   items: Place[];
 };
@@ -846,8 +847,13 @@ export function PlacesView({ value }: { value: string }) {
   const origin = Number.isFinite(base?.lat) && Number.isFinite(base?.lng)
     ? { lat: base!.lat!, lng: base!.lng! }
     : center;
-  const dir = (p: Place, mode: string) =>
-    `https://www.google.com/maps/dir/?api=1&origin=${origin.lat},${origin.lng}&destination=${p.lat},${p.lng}&travelmode=${mode}`;
+  const dir = (p: Place, mode: string) => {
+    const engine = mode === "walking" || mode === "transit"
+      ? "fossgis_osrm_foot"
+      : "fossgis_osrm_car";
+    return `https://www.openstreetmap.org/directions?engine=${engine}&route=${origin.lat}%2C${origin.lng}%3B${p.lat}%2C${p.lng}`;
+  };
+  const routeUrl = route?.directionsUrl;
   return (
     <div className="flex min-h-0 flex-1 flex-col md:flex-row">
       <div className="relative h-56 w-full shrink-0 overflow-hidden bg-[#071018] md:h-auto md:flex-1">
@@ -861,6 +867,7 @@ export function PlacesView({ value }: { value: string }) {
       </div>
       <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3 md:w-[380px] md:flex-none">
         <div className="hud-label">{w.locationLabel ?? center.label ?? "map"} · {w.query}</div>
+        {center.source === "openstreetmap" && <div className="mt-1 text-[10px] text-slate">Place data © OpenStreetMap contributors</div>}
         {w.preferences && <div className="mb-2 mt-1 text-[11px] leading-relaxed text-slate">Taste: {w.preferences}</div>}
         {base && (
           <div className="mb-2.5 rounded-xl border border-amber/25 bg-amber/[0.07] p-2.5">
@@ -878,8 +885,8 @@ export function PlacesView({ value }: { value: string }) {
           <div className="mb-2.5 rounded-xl border border-amber/20 bg-white/[0.035] p-2.5">
             <div className="text-[11px] font-medium text-amber">{route.label ?? "Suggested stop order"}</div>
             {route.note && <div className="mt-0.5 text-[10px] leading-relaxed text-slate">{route.note}</div>}
-            {route.googleMapsUrl && (
-              <a href={route.googleMapsUrl} target="_blank" rel="noopener noreferrer" className="mt-2 inline-flex rounded-lg border border-amber/25 bg-amber/10 px-2 py-1 text-[10px] text-amber transition hover:bg-amber/15">
+            {routeUrl && (
+              <a href={routeUrl} target="_blank" rel="noopener noreferrer" className="mt-2 inline-flex rounded-lg border border-amber/25 bg-amber/10 px-2 py-1 text-[10px] text-amber transition hover:bg-amber/15">
                 open navigable route ↗
               </a>
             )}

@@ -1,11 +1,11 @@
 import "server-only";
-import { getSecret } from "./vault";
 import { convexMutation, convexQuery } from "./context";
 import type { ConfirmedBooking } from "./booking-email";
+import { searchOpenStreetMapPlaces } from "./openstreetmap";
 
 // JARVIS travel engine — drives the SAME infrastructure the project-hub travel
-// widget already proved out (its public Convex actions: Google Hotels + Google
-// Flights via SerpAPI, Google Directions) plus Google Places for activities.
+// widget already proved out (its public Convex actions: hotel and flight search)
+// plus an owner-scale OpenStreetMap place-search adapter.
 // One orchestrated scout call fans out to every provider in parallel; the trip
 // lives as a `creations` row (kind "trip") that the interactive globe panel
 // reads reactively and the brain edits with trip_update / trip_finalize.
@@ -106,65 +106,36 @@ export type TripDoc = {
   confirmedBookings?: ConfirmedBooking[];
 };
 
-async function googleKey(): Promise<string> {
-  return await getSecret("google", "GOOGLE_PLACES_API_KEY");
-}
-
-// Activities/attractions with coordinates, ratings, photos, maps links.
 export async function placesActivities(destination: string, vibe?: string, limit = 14): Promise<TripActivity[]> {
-  const key = await googleKey().catch(() => "");
-  if (!key) return [];
-  const queries = [`top attractions in ${destination}`];
-  if (vibe) queries.push(`best ${vibe} in ${destination}`);
-  const results = await Promise.all(
-    queries.map(async (q) => {
-      try {
-        return await (
-          await fetch(`https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(q)}&key=${key}`)
-        ).json();
-      } catch {
-        return { results: [] };
-      }
-    }),
-  );
+  // The adapter serialises public Nominatim requests and never invents the
+  // ratings, hours, or photos its public data source does not provide.
+  const queries = [`attractions in ${destination}`];
+  if (vibe) queries.push(`${vibe} in ${destination}`);
   const seen = new Set<string>();
   const out: TripActivity[] = [];
-  for (const j of results as any[]) {
-      for (const r of (j.results ?? []).slice(0, limit)) {
-        if (seen.has(r.place_id)) continue;
-        seen.add(r.place_id);
-        out.push({
-          name: String(r.name).slice(0, 70),
-          rating: r.rating,
-          ratings: r.user_ratings_total,
-          lat: r.geometry?.location?.lat,
-          lng: r.geometry?.location?.lng,
-          address: r.formatted_address ? String(r.formatted_address).slice(0, 100) : undefined,
-          mapsLink: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(r.name + " " + destination)}`,
-          photo: r.photos?.[0]?.photo_reference
-            ? `https://maps.googleapis.com/maps/api/place/photo?maxwidth=480&photo_reference=${r.photos[0].photo_reference}&key=${key}`
-            : undefined,
-        });
+  for (const query of queries) {
+    // The provider serialises public Nominatim requests to respect its policy.
+    const places = await searchOpenStreetMapPlaces(query, { maxResults: Math.min(10, limit) }).catch(() => []);
+    for (const place of places) {
+      const identity = `${place.name}\u0000${place.lat}\u0000${place.lng}`;
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      out.push({
+        name: place.name.slice(0, 70),
+        lat: place.lat,
+        lng: place.lng,
+        address: place.address.slice(0, 100) || undefined,
+        mapsLink: place.mapsUri,
+      });
+      if (out.length >= limit) return out;
     }
   }
-  return out.sort((a, b) => (b.rating ?? 0) * Math.log10((b.ratings ?? 1) + 1) - (a.rating ?? 0) * Math.log10((a.ratings ?? 1) + 1)).slice(0, limit);
+  return out;
 }
 
 async function findAirport(destIata: string, destination: string): Promise<TripDoc["airport"]> {
-  const key = await googleKey().catch(() => "");
-  if (!key) return undefined;
-  try {
-    const j: any = await (
-      await fetch(
-        `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(`${destIata} airport ${destination}`)}&key=${key}`,
-      )
-    ).json();
-    const r = j.results?.[0];
-    if (!r) return undefined;
-    return { name: String(r.name).slice(0, 60), lat: r.geometry?.location?.lat, lng: r.geometry?.location?.lng };
-  } catch {
-    return undefined;
-  }
+  const place = (await searchOpenStreetMapPlaces(`${destIata} airport ${destination}`, { maxResults: 1 }).catch(() => []))[0];
+  return place ? { name: place.name.slice(0, 60), lat: place.lat, lng: place.lng } : undefined;
 }
 
 export function tripTotals(doc: TripDoc): TripDoc["totals"] {
@@ -243,8 +214,8 @@ export async function openTrip(a: { destination: string; destIata?: string }): P
     providers: {
       flights: { status: "queued", source: "Google Flights" },
       stays: { status: "queued", source: "Google Hotels" },
-      activities: { status: "queued", source: "Google Places" },
-      airport: { status: airport ? "ready" : "queued", source: "Google Places", count: airport ? 1 : 0, checkedAt: airport ? Date.now() : undefined },
+      activities: { status: "queued", source: "Google Places + OpenStreetMap fallback" },
+      airport: { status: airport ? "ready" : "queued", source: "Google Places + OpenStreetMap fallback", count: airport ? 1 : 0, checkedAt: airport ? Date.now() : undefined },
     },
   };
   const id = await convexMutation("creations:create", { kind: "trip", title: doc.title, data: JSON.stringify(doc) });
@@ -315,8 +286,8 @@ export async function scoutTrip(a: {
     providers: {
       flights: { status: a.includeFlights === false ? "skipped" : "searching", source: "Google Flights", checkedAt: a.includeFlights === false ? Date.now() : undefined },
       stays: { status: "searching", source: "Google Hotels" },
-      activities: { status: "searching", source: "Google Places" },
-      airport: { status: "searching", source: "Google Places" },
+      activities: { status: "searching", source: "Google Places + OpenStreetMap fallback" },
+      airport: { status: "searching", source: "Google Places + OpenStreetMap fallback" },
     },
   };
   doc.totals = tripTotals(doc);
@@ -423,8 +394,8 @@ export async function scoutTrip(a: {
 
   const work: Promise<void>[] = [
     searchStaysProgressively(),
-    updateProvider("activities", "Google Places", () => placesActivities(a.destination, a.vibe), (result) => result ?? []),
-    updateProvider("airport", "Google Places", () => findAirport(destIata, a.destination), (result) => result),
+    updateProvider("activities", "Google Places + OpenStreetMap fallback", () => placesActivities(a.destination, a.vibe), (result) => result ?? []),
+    updateProvider("airport", "Google Places + OpenStreetMap fallback", () => findAirport(destIata, a.destination), (result) => result),
   ];
   if (a.includeFlights !== false)
     work.push(
