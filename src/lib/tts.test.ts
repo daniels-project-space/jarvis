@@ -14,6 +14,7 @@ import {
 let failNextSynthesis = false;
 let synthesisCount = 0;
 let warmCount = 0;
+let resumeAllowed = true;
 
 class FakeSource {
   static instances: FakeSource[] = [];
@@ -39,12 +40,18 @@ class FakeAnalyser {
 }
 
 class FakeAudioContext {
+  static instances: FakeAudioContext[] = [];
   state = "running";
   destination = {};
-  resume = vi.fn(async () => { this.state = "running"; });
+  sampleRate = 48_000;
+  resume = vi.fn(async () => { this.state = resumeAllowed ? "running" : "suspended"; });
   decodeAudioData = vi.fn(async () => ({ duration: 1.2 }));
   createBufferSource() { return new FakeSource(); }
   createAnalyser() { return new FakeAnalyser(); }
+
+  constructor() {
+    FakeAudioContext.instances.push(this);
+  }
 }
 
 describe("single Edge neural speech queue", () => {
@@ -53,6 +60,9 @@ describe("single Edge neural speech queue", () => {
     failNextSynthesis = false;
     synthesisCount = 0;
     warmCount = 0;
+    resumeAllowed = true;
+    const existingContext = FakeAudioContext.instances.at(-1);
+    if (existingContext) existingContext.state = "running";
     vi.stubGlobal("window", {
       AudioContext: FakeAudioContext,
       location: { origin: "https://jarvis.test" },
@@ -198,6 +208,33 @@ describe("single Edge neural speech queue", () => {
     expect(browserSpeak).not.toHaveBeenCalled();
     FakeSource.instances[0].onended?.();
     await reply;
+  });
+
+  it("keeps an autoplay-blocked reply queued and resumes it on the next gesture", async () => {
+    unlockSpeechPlayback();
+    await Promise.resolve();
+    const context = FakeAudioContext.instances.at(-1)!;
+    context.state = "suspended";
+    resumeAllowed = false;
+
+    let settled = false;
+    const reply = speak("This reply must survive browser autoplay blocking.", () => {})
+      .then((played) => {
+        settled = true;
+        return played;
+      });
+
+    await vi.waitFor(() => expect(document.documentElement.dataset.jarvisTts).toBe("blocked"));
+    expect(FakeSource.instances).toHaveLength(0);
+    expect(settled).toBe(false);
+
+    resumeAllowed = true;
+    unlockSpeechPlayback();
+    await vi.waitFor(() => expect(FakeSource.instances).toHaveLength(1));
+    FakeSource.instances[0].onended?.();
+
+    await expect(reply).resolves.toBe(true);
+    expect(document.documentElement.dataset.jarvisTts).toBe("ready");
   });
 
   it("makes one bounded neural generation attempt on a transport failure", async () => {

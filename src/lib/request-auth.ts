@@ -25,10 +25,12 @@ export async function controlActor(req: NextRequest): Promise<ControlActor | nul
   }
   const bearer = bearerToken(req.headers.get("authorization"));
   const hostOrigin = req.headers.get("x-jarvis-embed-origin");
-  if (bearer && hostOrigin && isTrustedJarvisEmbedOrigin(hostOrigin) && /^[A-Za-z0-9_-]{40,128}$/.test(bearer)) {
+  const workerToken = process.env.JARVIS_WORKER_TOKEN;
+  if (bearer && workerToken && hostOrigin && isTrustedJarvisEmbedOrigin(hostOrigin) && /^[A-Za-z0-9_-]{40,128}$/.test(bearer)) {
     const status = await controlQuery("controlAuth:embedControlSessionStatus", {
       tokenHash: await sha256Hex(bearer),
       hostOrigin,
+      workerToken,
     }).catch(() => null) as { valid?: boolean; authTokenHash?: string } | null;
     if (status?.valid && typeof status.authTokenHash === "string") {
       return { kind: "owner", authTokenHash: status.authTokenHash };

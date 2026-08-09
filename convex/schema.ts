@@ -88,11 +88,20 @@ export default defineSchema({
     body: v.string(), // short/distilled body; full text in R2 via r2Key
     tags: v.array(v.string()),
     r2Key: v.optional(v.string()),
+    // Canonical-memory metadata. Source identifiers are opaque message IDs;
+    // raw conversation is never duplicated into provenance fields.
+    dedupeKey: v.optional(v.string()),
+    confidence: v.optional(v.number()),
+    sourceMessageIds: v.optional(v.array(v.string())),
+    revision: v.optional(v.number()),
+    lastConfirmedAt: v.optional(v.number()),
+    expiresAt: v.optional(v.number()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_kind", ["kind"])
     .index("by_createdAt", ["createdAt"])
+    .index("by_dedupeKey", ["dedupeKey"])
     .searchIndex("search_body", { searchField: "body", filterFields: ["kind"] }),
 
   // Small, superseding facts needed on the very next turn (for example the
@@ -109,6 +118,22 @@ export default defineSchema({
   })
     .index("by_key", ["key"])
     .index("by_expiry", ["expiresAt"]),
+
+  // Performance counters only: no transcript, source URLs, device fingerprint,
+  // or wall-clock activity history is retained with a voice turn.
+  voiceTurnMetrics: defineTable({
+    turnId: v.string(),
+    transcriptSource: v.union(v.literal("browser-final"), v.literal("server")),
+    researchState: v.union(v.literal("none"), v.literal("ready"), v.literal("discarded"), v.literal("promoted")),
+    researchSourceCount: v.number(),
+    outcome: v.union(v.literal("queued"), v.literal("audible"), v.literal("failed")),
+    captureToSpeechClosedMs: v.optional(v.number()),
+    speechClosedToTranscriptMs: v.optional(v.number()),
+    transcriptToQueuedMs: v.optional(v.number()),
+    queuedToFirstAudioMs: v.optional(v.number()),
+    captureToFirstAudioMs: v.optional(v.number()),
+    updatedAt: v.number(),
+  }).index("by_turn", ["turnId"]),
 
   // Storage-only archive from the pre-streaming chat transport (6 rows on the
   // canonical deployment at retirement). No runtime function reads/writes it;

@@ -22,9 +22,10 @@ export async function POST(req: NextRequest) {
   }
 
   const ownerToken = randomBytes(32).toString("base64url");
+  const ownerTokenHash = await sha256Hex(ownerToken);
   const created = await controlMutation("controlAuth:consumeOwnerPairingTicket", {
     tokenHash: await sha256Hex(ticket),
-    ownerTokenHash: await sha256Hex(ownerToken),
+    ownerTokenHash,
     userAgent: req.headers.get("user-agent") ?? undefined,
   }).catch(() => null) as { expiresAt?: number } | null;
   if (!created?.expiresAt) {
@@ -32,6 +33,14 @@ export async function POST(req: NextRequest) {
       { ok: false, error: "invalid_or_expired_pairing" },
       { status: 401, headers: { "cache-control": "no-store" } },
     );
+  }
+
+  const legacyGuestId = req.cookies.get(GUEST_COOKIE)?.value;
+  if (legacyGuestId && /^[A-Za-z0-9_-]{32,128}$/.test(legacyGuestId)) {
+    await controlMutation("guestMigration:recoverGuestConversation", {
+      authTokenHash: ownerTokenHash,
+      guestId: legacyGuestId,
+    }).catch(() => null);
   }
 
   const response = NextResponse.json({ ok: true }, { headers: { "cache-control": "no-store" } });

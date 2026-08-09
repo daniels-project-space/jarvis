@@ -88,11 +88,15 @@ export const snapshot = query({
         activeJobCount: owned.length,
       };
     });
+    const now = Date.now();
+    const usableMemory = [...memHit, ...memRecent].filter(
+      (row: any, index: number, all: any[]) =>
+        (row.expiresAt === undefined || row.expiresAt > now)
+        && all.findIndex((candidate: any) => candidate._id === row._id) === index,
+    );
     return {
       currentState: currentState.filter((row) => row.expiresAt > Date.now()),
-      memory: [...memHit, ...memRecent].filter(
-        (row: any, index: number, all: any[]) => all.findIndex((candidate: any) => candidate._id === row._id) === index,
-      ).slice(0, 10),
+      memory: usableMemory.slice(0, 10),
       business,
       projects,
       goals: goalGroups.flat().sort((left: any, right: any) => right.priority - left.priority).slice(0, 24),

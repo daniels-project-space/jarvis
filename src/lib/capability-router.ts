@@ -122,7 +122,7 @@ const RULES: readonly CapabilityRule[] = [
   },
   {
     belt: "work",
-    tools: ["plan_my_day", "calendar_view", "todo_list"],
+    tools: ["plan_my_day", "show", "calendar_view", "todo_list"],
     score: 130,
     visual: true,
     reason: "day_planning",

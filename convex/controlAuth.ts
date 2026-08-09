@@ -7,13 +7,12 @@ const MAX_EMBED_SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const VIEWER_LIFETIME_MS = 6 * 60 * 60 * 1000;
 const VIEWER_ISSUER = "https://jarvis-orcin-six.vercel.app";
 const VIEWER_SUBJECT = "daniel-owner";
-const GUEST_SUBJECT_PREFIX = "jarvis-guest:";
 
 export const actorAuthArgs = {
   authTokenHash: v.optional(v.string()),
   workerToken: v.optional(v.string()),
-  // An opaque, non-privileged browser partition. It is accepted only by the
-  // conversation transport, which derives the actual thread from this value.
+  // Kept temporarily as an input-compatibility field while old clients age
+  // out. It grants no identity or access; requireActor always ignores it.
   guestId: v.optional(v.string()),
 };
 
@@ -329,8 +328,14 @@ export const createEmbedControlSession = mutation({
 });
 
 export const embedControlSessionStatus = query({
-  args: { tokenHash: v.string(), hostOrigin: v.string() },
+  args: { tokenHash: v.string(), hostOrigin: v.string(), workerToken: v.string() },
   handler: async (ctx, args) => {
+    // This resolver returns the backing admin-session hash so the trusted
+    // Next.js boundary can translate a host-bound embed capability into the
+    // existing Convex credential shape. Never expose that credential through
+    // an anonymously callable status query: the embed token must remain
+    // scoped, revocable, and non-exchangeable.
+    requireWorker(args.workerToken);
     if (!/^[a-f0-9]{64}$/i.test(args.tokenHash)) return { valid: false };
     const session = await ctx.db
       .query("embedControlSessions")

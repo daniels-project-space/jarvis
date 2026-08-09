@@ -61,7 +61,9 @@ const rowLine = (row: ContextRow, max = 520) => {
   const confidence = typeof row?.confidence === "number"
     ? ` · ${Math.round(Math.max(0, Math.min(1, row.confidence)) * 100)}%`
     : "";
-  return `- ${text(row?.title, 110)} [${text(row?.kind, 24)}${source}${confidence}]: ${text(row?.body, max)}`;
+  const sourceCount = Array.isArray(row?.sourceMessageIds) ? row.sourceMessageIds.length : 0;
+  const provenance = sourceCount ? ` · ${sourceCount} source turn${sourceCount === 1 ? "" : "s"}` : "";
+  return `- ${text(row?.title, 110)} [${text(row?.kind, 24)}${source}${confidence}${provenance}]: ${text(row?.body, max)}`;
 };
 
 export function classifyContextProfile(userText?: string): ContextProfile {
@@ -88,6 +90,7 @@ function panelSummary(value: unknown) {
     try {
       const widget = asRow(JSON.parse(String(panel.value)));
       title = text(widget.title ?? widget.kind, 160) || title;
+      const activeTool = text(widget.activeTool, 100);
       if (widget.kind === "ranking" && Array.isArray(widget.items)) {
         const items = widget.items
           .slice(0, 10)
@@ -98,6 +101,9 @@ function panelSummary(value: unknown) {
         if (items) {
           return `ON SCREEN: ranking “${title}” — ${items}. Resolve number/name follow-ups against this list and keep the current overlay.`;
         }
+      }
+      if (activeTool) {
+        return `ON SCREEN: ${title} (widget). Active tool: ${activeTool}. For a follow-up, call jarvis_get_tools with activeTool=${activeTool} and update the same overlay.`;
       }
     } catch {
       // The panel description is supplemental context. A malformed old panel

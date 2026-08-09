@@ -7,6 +7,7 @@ import type { Id } from "../../convex/_generated/dataModel";
 import { CAPABILITIES, INFRA_MAP, PERSONA, REMEMBER } from "../lib/persona";
 import { visualInitiativeDirective } from "../lib/visual-initiative";
 import { shouldCaptureDurableMemory } from "../lib/current-state";
+import { memoryConfidence } from "../lib/memory-governance";
 import { visibleTurnText } from "../lib/host-context";
 import { buildContext } from "../lib/context";
 import { isSpeculativeResearchApplicable } from "../lib/speculative-research";
@@ -250,11 +251,12 @@ async function extractAndSave(
   env: NodeJS.ProcessEnv,
   userText: string,
   assistantText: string,
+  sourceMessageId?: string,
 ): Promise<number> {
   const prompt =
     "From the exchange below, extract ONLY durable facts, preferences, decisions, or tasks worth " +
     "remembering long-term about Daniel or his projects. Output STRICT JSON: an array of " +
-    '{"kind","title","body","tags"} where kind is one of fact|preference|decision|task|project. ' +
+    '{"kind","title","body","tags","confidence"} where kind is one of fact|preference|decision|task|project and confidence is 0 to 1. ' +
     "Output [] if nothing is worth remembering. No prose, JSON only.\n\n" +
     `User: ${userText}\nAssistant: ${assistantText}`;
   const out = await new Promise<string>((resolve) => {
@@ -294,6 +296,8 @@ async function extractAndSave(
       title: String(it.title).slice(0, 120),
       body: String(it.body).slice(0, 1200),
       tags: Array.isArray(it.tags) ? it.tags.map(String).slice(0, 6) : [],
+      confidence: memoryConfidence(it.confidence, 0.7),
+      sourceMessageId,
     }).catch(() => {});
     n++;
   }
@@ -557,6 +561,7 @@ async function processChatQueue(
       if (turn.finalText.trim() && shouldCaptureDurableMemory(visibleUserText)) void tasks.trigger("jarvis-chat-memory", {
         userText: visibleUserText,
         assistantText: turn.finalText,
+        sourceMessageId: targetMessageId ? String(targetMessageId) : undefined,
       }).catch(() => {});
       timings.push({
         claimMs: claimedAt - claimStarted,
@@ -633,7 +638,7 @@ export const chatMemory = task({
   queue: { name: "jarvis-memory", concurrencyLimit: 2 },
   machine: "small-1x",
   maxDuration: 180,
-  run: async (payload: { userText: string; assistantText: string }) => {
+  run: async (payload: { userText: string; assistantText: string; sourceMessageId?: string }) => {
     const provider: AgentProvider = "codex";
     const prepared = await prepareSubscriptionEnv(provider, {
       scope: "memory",
@@ -644,7 +649,7 @@ export const chatMemory = task({
       if (prepared.error || !bin) return { saved: 0, error: prepared.error ?? "Codex binary unavailable" };
       const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
       if (preflight.error) return { saved: 0, error: preflight.error };
-      return { saved: await extractAndSave(provider, bin, prepared.env, payload.userText, payload.assistantText) };
+      return { saved: await extractAndSave(provider, bin, prepared.env, payload.userText, payload.assistantText, payload.sourceMessageId) };
     } finally {
       cleanupSubscriptionHome(prepared.env);
     }

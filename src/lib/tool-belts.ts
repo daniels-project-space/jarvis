@@ -5,7 +5,7 @@ const TOOL_BELT_REGISTRY = {
     "open_app", "host_ui", "mac_shortcut", "current_time", "calculate", "orb_mood",
   ]),
   work: new Set([
-    "orchestrate", "goal_mode", "self_repair", "self_improve", "research", "plan_my_day", "net_worth", "memory_map",
+    "orchestrate", "goal_mode", "self_repair", "self_improve", "research", "plan_my_day", "show", "net_worth", "memory_map",
     "rental_availability", "rental_stats", "rentals_calendar", "clear_chat", "new_chat", "visual_scene", "project_goal",
     "work_control", "read_url", "remember", "memory_search", "agent_status", "reminder_cancel", "todo_remove",
     "calendar_remove", "deliberate",

@@ -36,7 +36,12 @@ import { BookingsView, CalendarView, CanvasView, LaunchView, PdfView, CreationsV
 import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
 import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate, shouldIgnoreHandsFreeTranscript } from "@/lib/transcript";
-import { completeSpeechPrefix, isSpeaking as isTtsActuallySpeaking, unlockSpeechPlayback } from "@/lib/tts";
+import {
+  completeSpeechPrefix,
+  isSpeaking as isTtsActuallySpeaking,
+  unlockSpeechPlayback,
+  type TtsRuntimeStatus,
+} from "@/lib/tts";
 import { NarrationLedger, narrationClaim } from "@/lib/narration";
 import { resolvePanelRoute } from "@/lib/panel-contract";
 import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
@@ -81,6 +86,17 @@ import {
   isStableBrowserSpeechRevision,
   type BrowserSpeechPreview,
 } from "@/lib/browser-speech-preview";
+import {
+  compactChatFeedback,
+  foregroundUiProgress,
+  shouldOfferForegroundRecovery,
+  type CompactFeedbackPhase,
+} from "@/lib/chat-ui-feedback";
+import {
+  buildVoiceTurnMetric,
+  shouldRecordVoiceTurnMetric,
+  type VoiceTurnTrace,
+} from "@/lib/voice-turn-metrics";
 
 const EMBED_COMMAND_TTL_MS = 30_000;
 const MAX_PENDING_EMBED_COMMANDS = 4;
@@ -149,7 +165,9 @@ type BrowserSpeechRecognizer = {
 type BrowserSpeechRecognizerConstructor = new () => BrowserSpeechRecognizer;
 type StreamingSpeechState = {
   id: string;
-  queuedChars: number;
+  scheduledChars: number;
+  spokenChars: number;
+  failed: boolean;
   chain: Promise<void>;
   timer: ReturnType<typeof setTimeout> | null;
   pendingPrefix: string;
@@ -160,6 +178,7 @@ type SubmitOptions = {
   researchReceipt?: string;
   interruptCurrent?: boolean;
   hostContext?: JarvisHostContext | null;
+  voiceTrace?: VoiceTurnTrace;
 };
 type LiveResearchResponse = {
   receipt: string;
@@ -172,7 +191,7 @@ type LiveResearchState = {
   sourceCount: number;
 };
 
-const EMBEDDED_OPERATIONAL_LOG_LINE = /^\s*(?:[⚠️🚨❌]\s*)?(?:error(?:\[[^\]]+\])?:|(?:type|reference|syntax|range|network|abort)error\b|traceback\b|npm err!|(?:stdout|stderr)\s*:|at\s+\S.*\([^)]*:\d+:\d+\)|.*:\s*error\s+TS\d+\b|\{["']?(?:error|stack|code)["']?\s*:|\[(?:error|debug|warn|info)\])/i;
+const EMBEDDED_OPERATIONAL_LOG_LINE = /^\s*(?:```(?:json|text|log)?\s*)?(?:[⚠️🚨❌]\s*)?(?:error(?:\[[^\]]+\])?:|(?:type|reference|syntax|range|network|abort|tool)[_ ]?error\b|traceback\b|npm err!|(?:stdout|stderr)\s*:|at\s+\S.*\([^)]*:\d+:\d+\)|.*:\s*error\s+TS\d+\b|\{\s*["']?(?:error|stack|code)["']?\s*:|\{\s*["']?type["']?\s*:\s*["']error["']|\[(?:error|debug|warn|info|tool)\])/i;
 
 /** Keep implementation diagnostics in telemetry, never in the compact host UI. */
 export function safeEmbeddedMessageText(args: {
@@ -1454,12 +1473,28 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
 
   const [input, setInput] = useState("");
   const [embeddedExpanded, setEmbeddedExpanded] = useState(false);
+  const [openAttachmentAfterExpand, setOpenAttachmentAfterExpand] = useState(false);
   useEffect(() => {
     if (!embedded || !parentOrigin || window.parent === window) return;
     // The trusted host owns the iframe dimensions. Send only semantic state so
     // every host applies the same audited desktop/mobile sizing policy.
     window.parent.postMessage({ jarvis: "layout", expanded: embeddedExpanded }, parentOrigin);
   }, [embedded, embeddedExpanded, parentOrigin]);
+  useEffect(() => {
+    if (!embedded || !embeddedExpanded || !openAttachmentAfterExpand || guest) return;
+    const frame = window.requestAnimationFrame(() => {
+      const trigger = document.getElementById("jarvis-attachment-trigger") as HTMLButtonElement | null;
+      trigger?.click();
+      trigger?.focus();
+      setOpenAttachmentAfterExpand(false);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [embedded, embeddedExpanded, guest, openAttachmentAfterExpand]);
+  const openCompactAttachmentComposer = () => {
+    unlockSpeechPlayback();
+    setOpenAttachmentAfterExpand(true);
+    setEmbeddedExpanded(true);
+  };
   const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
   const [pendingFileIds, setPendingFileIds] = useState<string[]>([]);
   const [fileNotice, setFileNotice] = useState<ChatFileNotice>(null);
@@ -1469,17 +1504,30 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     setFileNotice(null);
   }, [thread]);
   const [speaking, setSpeaking] = useState(false);
-  const [ttsRuntimeStatus, setTtsRuntimeStatus] = useState<"ready" | "buffering" | "speaking" | "unavailable">("ready");
+  const [ttsRuntimeStatus, setTtsRuntimeStatus] = useState<TtsRuntimeStatus>("ready");
   useEffect(() => {
     const receive = (event: Event) => {
       const status = (event as CustomEvent<{ status?: string }>).detail?.status;
-      if (status === "ready" || status === "buffering" || status === "speaking" || status === "unavailable") {
+      if (
+        status === "loading" || status === "ready" || status === "buffering"
+        || status === "speaking" || status === "blocked" || status === "unavailable"
+      ) {
         setTtsRuntimeStatus(status);
       }
     };
     window.addEventListener("jarvis:tts-status", receive);
     return () => window.removeEventListener("jarvis:tts-status", receive);
   }, []);
+  useEffect(() => {
+    if (ttsRuntimeStatus !== "blocked") return;
+    const resume = () => unlockSpeechPlayback();
+    window.addEventListener("pointerdown", resume, { capture: true });
+    window.addEventListener("keydown", resume, { capture: true });
+    return () => {
+      window.removeEventListener("pointerdown", resume, { capture: true });
+      window.removeEventListener("keydown", resume, { capture: true });
+    };
+  }, [ttsRuntimeStatus]);
   const speakingRef = useRef(false);
   const wasSpeakingRef = useRef(false);
   const confirmedBargeAtRef = useRef(0);
@@ -1606,13 +1654,23 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const lastSpokenText = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
   const streamingSpeechRef = useRef<StreamingSpeechState>({
     id: "",
-    queuedChars: 0,
+    scheduledChars: 0,
+    spokenChars: 0,
+    failed: false,
     chain: Promise.resolve(),
     timer: null,
     pendingPrefix: "",
     pendingCaption: "",
   });
   const narrationLedgerRef = useRef(new NarrationLedger());
+  const activeVoiceTraceRef = useRef<VoiceTurnTrace | null>(null);
+  const voiceReplayRef = useRef<{
+    text: string;
+    captionText: string;
+    final: boolean;
+    claim: string;
+  } | null>(null);
+  const [voiceReplayReady, setVoiceReplayReady] = useState(false);
   const mutedNarrationParentsRef = useRef(new Set<string>());
   const captionRef = useRef<Caption>(null);
   const energyRef = useRef(0);
@@ -1656,6 +1714,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     fileIds: string[];
   } | null>(null);
   const durableSubmissionInFlight = useRef(false);
+  const failedSubmissionRef = useRef<{
+    text: string;
+    visibleText: string;
+    fileIds: string[];
+    options: Pick<SubmitOptions, "requestId" | "researchReceipt" | "voiceTrace">;
+  } | null>(null);
+  const [submissionRetryReady, setSubmissionRetryReady] = useState(false);
   const lastSubmittedParentId = useRef<string | undefined>(undefined);
   const durableRecoveryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const durableAutoRecoveries = useRef(0);
@@ -2139,10 +2204,24 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       finishWithoutSpeech();
       return false;
     }
+    const replay = {
+      text,
+      captionText,
+      final,
+      claim: args.claim,
+    };
+    voiceReplayRef.current = replay;
+    setVoiceReplayReady(false);
     const played = await speak(
       text,
       (energy) => (energyRef.current = energy),
       () => {
+        const trace = activeVoiceTraceRef.current;
+        if (trace && !trace.firstAudioAt) {
+          trace.firstAudioAt = performance.now();
+          recordVoiceMetric(trace, "audible");
+          activeVoiceTraceRef.current = null;
+        }
         setSpeaking(true);
         setCaption((current) => current?.who === "jarvis" && current.text.length >= captionText.length
           ? { ...current, phase: "speaking", exiting: false }
@@ -2156,19 +2235,73 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         }
       },
     );
+    if (voiceReplayRef.current?.claim !== replay.claim) return played;
+    if (played) {
+      voiceReplayRef.current = null;
+      setVoiceReplayReady(false);
+      return true;
+    }
     if (!played) {
+      const trace = activeVoiceTraceRef.current;
+      if (trace) recordVoiceMetric(trace, "failed");
       setSpeaking(false);
+      setVoiceReplayReady(true);
       showCaption({
         who: "jarvis",
-        text: `Voice playback failed. The reply is still available in chat: ${captionText}`,
+        text: "The reply is ready in chat. Tap the speaker to retry voice playback.",
         phase: "ready",
       });
       return false;
     }
-    return true;
+    return played;
+  }
+
+  function recordVoiceMetric(trace: VoiceTurnTrace, outcome: "queued" | "audible" | "failed") {
+    const metric = buildVoiceTurnMetric(trace, outcome);
+    if (!metric || !shouldRecordVoiceTurnMetric(metric)) return;
+    // Diagnostics must never delay a reply. The endpoint also rejects arbitrary
+    // fields, so only this no-transcript metric shape can be persisted.
+    void viewerFetchWithTimeout("/api/voice/metrics", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(metric),
+    }, 4_000).catch(() => undefined);
+  }
+
+  function retryVoicePlayback() {
+    // Keep the first resume call synchronous with the pointer/key gesture.
+    unlockSpeechPlayback();
+    if (ttsRuntimeStatus === "blocked") return;
+    const replay = voiceReplayRef.current;
+    if (!replay) return;
+    setVoiceReplayReady(false);
+    void import("../lib/tts").then(async (module) => {
+      module.stopSpeaking();
+      unlockSpeechPlayback();
+      await narrateText({
+        text: replay.text,
+        captionText: replay.captionText,
+        final: replay.final,
+        claim: `${replay.claim}:manual-retry:${Date.now()}`,
+      });
+    });
   }
 
   const busy = sending || isForegroundBusy(messages);
+  const foregroundProgressStartedAt = useRef<number | null>(null);
+  const [foregroundProgressClock, setForegroundProgressClock] = useState(() => Date.now());
+  useEffect(() => {
+    if (!busy) {
+      foregroundProgressStartedAt.current = null;
+      return;
+    }
+    if (foregroundProgressStartedAt.current === null) foregroundProgressStartedAt.current = Date.now();
+    const timer = window.setInterval(() => setForegroundProgressClock(Date.now()), 400);
+    return () => window.clearInterval(timer);
+  }, [busy]);
+  const foregroundElapsedMs = foregroundProgressStartedAt.current === null
+    ? 0
+    : Math.max(0, foregroundProgressClock - foregroundProgressStartedAt.current);
 
   useEffect(() => {
     // scroll the message CONTAINER only — scrollIntoView reaches into the
@@ -2268,7 +2401,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       if (streamState.timer) clearTimeout(streamState.timer);
       streamState = {
         id: latestAssistant._id,
-        queuedChars: 0,
+        scheduledChars: 0,
+        spokenChars: 0,
+        failed: false,
         chain: Promise.resolve(),
         timer: null,
         pendingPrefix: "",
@@ -2276,7 +2411,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       };
       streamingSpeechRef.current = streamState;
     }
-    if (stablePrefix.length <= Math.max(streamState.queuedChars, streamState.pendingPrefix.length)) return;
+    if (streamState.failed) return;
+    if (stablePrefix.length <= Math.max(streamState.scheduledChars, streamState.pendingPrefix.length)) return;
     streamState.pendingPrefix = stablePrefix;
     streamState.pendingCaption = latestAssistant.text;
     if (streamState.timer) clearTimeout(streamState.timer);
@@ -2289,20 +2425,26 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       if (current.id !== latestAssistant._id) return;
       current.timer = null;
       const prefix = current.pendingPrefix;
-      const from = current.queuedChars;
+      const from = current.scheduledChars;
       if (prefix.length <= from) return;
       const speechChunk = prefix.slice(from).trim();
       current.pendingPrefix = "";
-      current.queuedChars = prefix.length;
-      if (!speechChunk) return;
+      current.scheduledChars = prefix.length;
+      if (!speechChunk) {
+        current.spokenChars = Math.max(current.spokenChars, prefix.length);
+        return;
+      }
       current.chain = current.chain.then(async () => {
         if (streamingSpeechRef.current.id !== latestAssistant._id) return;
-        await narrateText({
+        const played = await narrateText({
           text: speechChunk,
           claim: narrationClaim(`turn:${latestAssistant._id}`, prefix, from, prefix.length),
           captionText: current.pendingCaption,
           final: false,
         });
+        if (streamingSpeechRef.current.id !== latestAssistant._id) return;
+        if (played && current.spokenChars === from) current.spokenChars = prefix.length;
+        else if (!played) current.failed = true;
       });
     }, 220);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2440,7 +2582,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         messageId: finalNarrationMessageRef.current,
         parentMessageId: lastSubmittedParentId.current,
       })) return;
-      const from = streamed?.queuedChars ?? 0;
+      const from = streamed?.spokenChars ?? 0;
       const unsaidText = spokenText.slice(from).trim();
       if (!unsaidText) {
         setSpeaking(false);
@@ -2529,17 +2671,20 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     text: string,
     visibleText = text,
     fileIds: string[] = [],
-    options: Pick<SubmitOptions, "requestId" | "researchReceipt"> = {},
+    options: Pick<SubmitOptions, "requestId" | "researchReceipt" | "voiceTrace"> = {},
   ) {
     if (durableSubmissionInFlight.current || activeDurableTurn.current) return;
+    const requestId = options.requestId
+      ?? globalThis.crypto?.randomUUID?.()
+      ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const retryOptions = { requestId, researchReceipt: options.researchReceipt, voiceTrace: options.voiceTrace };
     durableSubmissionInFlight.current = true;
+    failedSubmissionRef.current = null;
+    setSubmissionRetryReady(false);
     durableStartedAt.current = performance.now();
     setSending(true);
     showCaption({ who: "you", text: visibleText });
     try {
-      const requestId = options.requestId
-        ?? globalThis.crypto?.randomUUID?.()
-        ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const request = {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -2567,6 +2712,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           ? "promoted"
           : "discarded";
       }
+      if (options.voiceTrace) {
+        options.voiceTrace.queuedAt = performance.now();
+        options.voiceTrace.researchState = options.researchReceipt
+          ? (result.researchPrefetchAccepted ? "promoted" : "discarded")
+          : (options.voiceTrace.researchState ?? "none");
+        activeVoiceTraceRef.current = options.voiceTrace;
+        recordVoiceMetric(options.voiceTrace, "queued");
+      }
       activeDurableTurn.current = {
         messageId: result.messageId as Id<"chatMessages">,
         threadId: threadRef.current,
@@ -2574,6 +2727,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         visibleText,
         fileIds: [...fileIds],
       };
+      failedSubmissionRef.current = null;
+      setSubmissionRetryReady(false);
       mutedNarrationParentsRef.current.delete(String(result.messageId));
       if (fileIds.length) {
         setSelectedFileIds((current) => current.filter((fileId) => !fileIds.includes(fileId)));
@@ -2589,16 +2744,36 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       // foreground lane keeps every retry bound to the exact turn it repairs.
       return;
     } catch (error) {
+      if (options.voiceTrace) recordVoiceMetric(options.voiceTrace, "failed");
       durableSubmissionInFlight.current = false;
       durableStartedAt.current = null;
+      failedSubmissionRef.current = {
+        text,
+        visibleText,
+        fileIds: [...fileIds],
+        options: retryOptions,
+      };
+      setSubmissionRetryReady(true);
       document.documentElement.dataset.jarvisConversationFailure = String(error).slice(0, 160);
       showCaption({
         who: "jarvis",
-        text: "I heard you, but the conversation line failed. Please say that once more.",
+        text: "I heard you, but the conversation line failed before it confirmed. Tap retry send—your request ID is preserved.",
         phase: "ready",
       });
       setSending(false);
     }
+  }
+
+  function retryFailedSubmission() {
+    const retry = failedSubmissionRef.current;
+    if (!retry || durableSubmissionInFlight.current || activeDurableTurn.current) return;
+    setSubmissionRetryReady(false);
+    void queueDurableTurn(
+      retry.text,
+      retry.visibleText,
+      retry.fileIds,
+      retry.options,
+    );
   }
 
   function armDurableRecoveryWatchdog() {
@@ -2942,10 +3117,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     lastSent.current = { text: sendFingerprint, ts: Date.now() };
     finalNarrationGenerationRef.current += 1;
     finalNarrationMessageRef.current = "";
+    voiceReplayRef.current = null;
+    setVoiceReplayReady(false);
     if (streamingSpeechRef.current.timer) clearTimeout(streamingSpeechRef.current.timer);
     streamingSpeechRef.current = {
       id: "",
-      queuedChars: 0,
+      scheduledChars: 0,
+      spokenChars: 0,
+      failed: false,
       chain: Promise.resolve(),
       timer: null,
       pendingPrefix: "",
@@ -3214,6 +3393,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       return false;
     }
     if (liveRef.current) return true;
+    unlockSpeechPlayback();
     // Stop the browser wake recognizer and open the persistent stream before a
     // network round-trip. Otherwise the wake mic visibly closes while Convex
     // elects the live owner, then opens again a moment later.
@@ -3453,6 +3633,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     const sessionEpoch = liveSessionEpoch.current;
     const voiceRequestId = globalThis.crypto?.randomUUID?.()
       ?? `voice-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const voiceTrace: VoiceTurnTrace = { turnId: voiceRequestId, startedAt: performance.now() };
     let outcome: VoiceCaptureOutcome = "failure";
     let pendingSttController: AbortController | null = null;
     let browserPreview: BrowserSpeechPreview | null = null;
@@ -3543,6 +3724,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           document.documentElement.dataset.jarvisResearchPrefetchMs = String(Math.round(performance.now() - startedAt));
           document.documentElement.dataset.jarvisResearchPrefetchSources = String(result.sources.length);
           setLiveResearch({ phase: "ready", sourceCount: result.sources.length });
+          voiceTrace.researchState = "ready";
+          voiceTrace.researchSourceCount = result.sources.length;
           researchState.result = result;
           return result;
         }).catch(() => null);
@@ -3706,6 +3889,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         return;
       }
       const speechClosedAt = performance.now();
+      voiceTrace.speechClosedAt = speechClosedAt;
       document.documentElement.dataset.jarvisSpeechClosedMs = String(Math.round(speechClosedAt));
       showCaption({ who: "you", text: "Processing…" });
       const transcriptSource = chooseLiveTranscriptSource({
@@ -3717,12 +3901,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       let text: string;
       if (transcriptSource.source === "browser-final") {
         text = transcriptSource.text;
+        voiceTrace.transcriptSource = "browser-final";
         document.documentElement.dataset.jarvisAuthoritativeStt = "browser-final";
       } else {
         const controller = new AbortController();
         pendingSttController = controller;
         sttAbortRef.current = controller;
         text = await requestTranscript(blob, controller, { ...vad });
+        voiceTrace.transcriptSource = "server";
         document.documentElement.dataset.jarvisAuthoritativeStt = "server";
         if (sttAbortRef.current === controller) sttAbortRef.current = null;
         if (pendingSttController === controller) pendingSttController = null;
@@ -3755,6 +3941,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         return;
       }
       lastVoiceInput.current = { text: cleanedText, at: Date.now() };
+      voiceTrace.transcriptReadyAt = performance.now();
       document.documentElement.dataset.jarvisTranscriptionMs = String(Math.round(performance.now() - speechClosedAt));
       const researchResult = researchState.result;
       if (researchState.promise && !researchResult) {
@@ -3762,6 +3949,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         // overlap. Never add a fixed tail wait after the final transcript; a
         // late optional preview is discarded and the authoritative turn starts.
         researchState.controller?.abort();
+        voiceTrace.researchState = "discarded";
         document.documentElement.dataset.jarvisResearchPrefetch = "late-or-discarded";
       }
       const prewarmedHostContext = embedded ? await hostContextPromise : undefined;
@@ -3775,6 +3963,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         researchReceipt: researchResult?.receipt,
         interruptCurrent,
         hostContext: prewarmedHostContext,
+        voiceTrace,
       });
     } catch (error) {
       const aborted = error instanceof DOMException && error.name === "AbortError";
@@ -3813,11 +4002,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       recRef.current?.stop();
       return;
     }
+    unlockSpeechPlayback();
     // barge-in: JARVIS shuts up the moment Daniel reaches for the mic, so the
     // recording can't capture his voice as input
     import("../lib/tts").then((m) => m.stopSpeaking());
     setSpeaking(false);
     void ownVoice();
+    const voiceRequestId = globalThis.crypto?.randomUUID?.()
+      ?? `voice-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const voiceTrace: VoiceTurnTrace = { turnId: voiceRequestId, startedAt: performance.now() };
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
@@ -3872,6 +4065,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       stream.getTracks().forEach((t) => t.stop());
       void context?.close().catch(() => {});
       setRecording(false);
+      voiceTrace.speechClosedAt = performance.now();
       const blob = new Blob(chunks, { type: mime });
       if (blob.size < 2000) {
         showCaption({ who: "jarvis", text: "I did not catch enough speech. Tap the microphone and try again.", phase: "ready" });
@@ -3880,6 +4074,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       try {
         showCaption({ who: "you", text: "Processing…" });
         const text = await transcribeRecordedAudio(blob, mime);
+        voiceTrace.transcriptSource = "server";
         if (isMeaningfulSpeechTranscript(text)) {
           const { isEchoOfTts } = await import("../lib/tts");
           if (isEchoOfTts(text)) return; // that was JARVIS's own voice leaking in
@@ -3887,8 +4082,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           const previousVoice = lastVoiceInput.current;
           if (isRecentVoiceDuplicate(cleaned, previousVoice)) return;
           lastVoiceInput.current = { text: cleaned, at: Date.now() };
+          voiceTrace.transcriptReadyAt = performance.now();
           showCaption({ who: "you", text: cleaned });
-          void submit(cleaned);
+          void submit(cleaned, { requestId: voiceRequestId, voiceTrace });
         } else {
           showCaption({ who: "jarvis", text: "I could not make out that request. Tap the microphone and try again.", phase: "ready" });
         }
@@ -3905,13 +4101,20 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const hostAssistant = [...messages]
     .reverse()
     .find((message) => message.role === "assistant" && message.delivery !== "notification");
-  const status =
+  const latestUserMessage = [...messages]
+    .reverse()
+    .find((message) => message.role === "user" && message.delivery !== "notification");
+  const status: CompactFeedbackPhase =
     live === "connecting"
       ? "connecting"
       : speaking || ttsRuntimeStatus === "speaking"
         ? "speaking"
         : ttsRuntimeStatus === "buffering"
           ? "buffering"
+          : ttsRuntimeStatus === "blocked"
+            ? "voice paused"
+            : ttsRuntimeStatus === "unavailable" && voiceReplayReady
+              ? "voice unavailable"
           : hostAssistant?.status === "streaming" && Boolean(hostAssistant.text)
             ? "responding"
             : busy
@@ -3922,21 +4125,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                   ? "listening"
                   : "online";
   const hostPhase = status;
-  const hostProgress = hostPhase === "online"
-    ? 0
-    : hostPhase === "connecting"
-      ? 0.08
-      : hostPhase === "listening"
-        ? 0.16
-        : hostPhase === "researching"
-          ? liveResearch.phase === "ready" ? 0.3 : 0.24
-        : hostPhase === "buffering"
-          ? 0.86
-        : hostPhase === "thinking"
-          ? 0.32
-          : hostPhase === "responding"
-            ? Math.min(0.84, 0.48 + Math.floor((hostAssistant?.text.length ?? 0) / 160) * 0.04)
-            : 0.92;
+  const hostProgress = foregroundUiProgress({
+    phase: hostPhase,
+    elapsedMs: foregroundElapsedMs,
+    streamedChars: hostAssistant?.status === "streaming" ? hostAssistant.text.length : 0,
+    researchReady: liveResearch.phase === "ready",
+    recovery: durableRecovery,
+  });
   useEffect(() => {
     if (!embedded || !parentOrigin || window.parent === window) return;
     postToParent({ jarvis: "status", phase: hostPhase, progress: hostProgress });
@@ -3951,6 +4146,51 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         : recording || live === "live"
           ? "listening"
           : "idle";
+  const compactFeedbackText = compactChatFeedback({
+    phase: hostPhase,
+    caption: caption ? { who: caption.who, text: caption.text } : null,
+    latestUser: latestUserMessage?.text ? visibleTurnText(latestUserMessage.text) : undefined,
+    latestAssistant: hostAssistant?.text ? safeEmbeddedMessageText(hostAssistant) : undefined,
+    assistantStreaming: hostAssistant?.status === "streaming",
+  });
+  const foregroundRecoveryVisible = submissionRetryReady || shouldOfferForegroundRecovery({
+    elapsedMs: foregroundElapsedMs,
+    hasActiveTurn: Boolean(activeDurableTurn.current),
+    recovery: durableRecovery,
+  });
+  const foregroundRecoveryMessage = submissionRetryReady
+    ? "Send was not confirmed. Retry keeps the same request ID."
+    : durableRecovery === "waiting"
+      ? "Still working on this reply."
+      : durableRecovery === "cancelling"
+        ? "Stopping and securing this exact reply…"
+        : durableRecovery === "retry-ready"
+          ? "That reply is safely stopped. Retry is ready."
+          : durableRecovery === "recovering"
+            ? "Reconnecting this reply…"
+            : durableRecovery === "terminal"
+              ? "That reply stopped after recovery attempts."
+              : "That reply stopped before it finished.";
+  const foregroundRecoveryAction = submissionRetryReady
+    ? retryFailedSubmission
+    : durableRetryReady
+      ? retryDurableTurn
+      : durableRecovery === "terminal"
+        ? prepareDurableRetry
+        : () => void requestDurableRecovery(true);
+  const foregroundRecoveryActionLabel = submissionRetryReady
+    ? "retry send"
+    : durableRetryReady
+      ? "retry"
+      : durableRecovery === "waiting"
+        ? "check"
+        : durableRecovery === "terminal" || durableRecovery === "retry-ready"
+          ? "secure retry"
+          : "recover";
+  const foregroundRecoveryActionDisabled = durableRecovery === "recovering"
+    || durableRecovery === "cancelling"
+    || (durableRecovery === "retry-ready" && !durableRetryReady);
+  const voiceRecoveryVisible = ttsRuntimeStatus === "blocked" || voiceReplayReady;
 
   // How the stage shares with an overlay:
   //  • compactAside — a sized widget (weather/shop/places/ranking/…): the panel
@@ -3984,15 +4224,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }
 
   if (embedded && !embeddedExpanded) {
-    const compactAssistantText = hostAssistant
-      ? safeEmbeddedMessageText(hostAssistant).slice(0, 150)
-      : "Ready when you are.";
     return (
       <div
         data-jarvis-embed-surface
         data-jarvis-embed-expanded="false"
         data-voice-state={orbState}
-        className="relative flex h-dvh w-full flex-col justify-between overflow-hidden rounded-2xl border border-white/10 bg-[#05070d]/95 p-3 shadow-2xl backdrop-blur-xl"
+        className="relative flex h-dvh w-full flex-col justify-between gap-2 overflow-hidden rounded-2xl border border-white/10 bg-[#05070d]/95 p-2.5 shadow-2xl backdrop-blur-xl"
       >
         <div className="flex min-w-0 items-start gap-2 pr-16">
           <button
@@ -4014,7 +4251,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               <span>JARVIS</span>
               <span className="truncate text-slate">{status}</span>
             </div>
-            <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-ice/80">{compactAssistantText}</p>
+            <p className="mt-1 line-clamp-1 text-xs leading-relaxed text-ice/80">{compactFeedbackText}</p>
           </div>
         </div>
         <div className="absolute right-2 top-2 flex items-center gap-1">
@@ -4036,8 +4273,61 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             ×
           </button>
         </div>
+        {hostProgress > 0 && (
+          <div
+            role="progressbar"
+            aria-label={`Jarvis ${status} progress`}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(hostProgress * 100)}
+            className="h-1 overflow-hidden rounded-full bg-white/8"
+          >
+            <span
+              className="block h-full rounded-full bg-gradient-to-r from-cyan/70 to-amber/80 transition-[width] duration-300 ease-out"
+              style={{ width: `${Math.round(hostProgress * 100)}%` }}
+            />
+          </div>
+        )}
         {liveResearch.phase !== "idle" && <LiveResearchIndicator state={liveResearch} />}
+        {foregroundRecoveryVisible && (
+          <div className="flex items-center justify-between gap-2 rounded-lg bg-amber/[0.06] px-2 py-1 text-[10px] text-slate ring-1 ring-amber/20">
+            <span className="min-w-0 truncate">{foregroundRecoveryMessage}</span>
+            <button
+              type="button"
+              onClick={foregroundRecoveryAction}
+              disabled={foregroundRecoveryActionDisabled}
+              className="shrink-0 text-amber disabled:opacity-40"
+            >
+              {foregroundRecoveryActionLabel}
+            </button>
+          </div>
+        )}
         <div className="flex min-w-0 gap-2">
+          {!guest && (
+            <button
+              type="button"
+              data-jarvis-compact-attachment
+              onClick={openCompactAttachmentComposer}
+              aria-label="Attach files, images, documents, or folders"
+              title="Attach files or open saved private files"
+              className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-sm text-slate ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan"
+            >
+              <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="m20.5 11.5-8.9 8.9a6 6 0 0 1-8.5-8.5l9.6-9.6a4 4 0 0 1 5.7 5.7l-9.7 9.7a2 2 0 0 1-2.8-2.8l9-9" />
+              </svg>
+            </button>
+          )}
+          {voiceRecoveryVisible && (
+            <button
+              type="button"
+              onClick={retryVoicePlayback}
+              aria-label="Resume Jarvis voice playback"
+              title="Resume voice"
+              className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-amber/10 text-amber ring-1 ring-amber/30"
+            >
+              ◖
+            </button>
+          )}
           <input
             value={input}
             onChange={(event) => setInput(event.target.value)}
@@ -4184,15 +4474,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               ))}
             <div ref={embeddedEndRef} aria-hidden="true" />
           </div>
-          {durableRecovery !== "idle" && durableRecovery !== "waiting" && (
+          {foregroundRecoveryVisible && (
             <div className="flex items-center justify-between gap-2 border-t border-amber/15 px-3 py-1.5 text-[11px] text-slate">
-              <span>{durableRecovery === "cancelling"
-                ? "Securing this turn…"
-                : durableRecovery === "retry-ready"
-                  ? "Reply stopped safely."
-                  : durableRecovery === "recovering" ? "Reconnecting…" : "Reply delayed or stopped."}</span>
+              <span>{foregroundRecoveryMessage}</span>
               <div className="flex items-center gap-2">
-                {!durableRetryReady && (
+                {!submissionRetryReady && !durableRetryReady && (
                   <button
                     type="button"
                     onClick={() => void cancelDurableTurn(false)}
@@ -4204,13 +4490,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 )}
                 <button
                   type="button"
-                  onClick={() => durableRetryReady
-                    ? retryDurableTurn()
-                    : durableRecovery === "terminal" ? prepareDurableRetry() : void requestDurableRecovery(true)}
-                  disabled={durableRecovery === "recovering" || durableRecovery === "cancelling" || (durableRecovery === "retry-ready" && !durableRetryReady)}
+                  onClick={foregroundRecoveryAction}
+                  disabled={foregroundRecoveryActionDisabled}
                   className="rounded border border-amber/30 px-2 py-0.5 text-amber disabled:opacity-40"
                 >
-                  {durableRetryReady ? "retry" : durableRecovery === "terminal" || durableRecovery === "retry-ready" ? "secure retry" : "recover"}
+                  {foregroundRecoveryActionLabel}
                 </button>
               </div>
             </div>
@@ -4230,6 +4514,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                   onNotice={setFileNotice}
                 />
               )}
+            {voiceRecoveryVisible && (
+              <button
+                type="button"
+                onClick={retryVoicePlayback}
+                aria-label="Resume Jarvis voice playback"
+                title="Resume voice"
+                className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-amber/10 text-amber ring-1 ring-amber/30"
+              >
+                ◖
+              </button>
+            )}
             <button
               type="button"
               onClick={() => speaking ? stopTalking() : void toggleLive()}
@@ -4570,23 +4865,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             <div ref={endRef} />
           </div>
 
-          {durableRecovery !== "idle" && durableRecovery !== "waiting" && (
+          {foregroundRecoveryVisible && (
             <div className="flex items-center justify-between gap-3 border-t border-amber/15 bg-amber/[0.04] px-3 py-2 text-xs text-slate">
-              <span>
-                {durableRecovery === "cancelling"
-                  ? "Stopping and securing this exact reply…"
-                  : durableRecovery === "retry-ready"
-                    ? "That reply is safely stopped. Retry is ready."
-                    : durableRecovery === "recovering"
-                  ? "Reconnecting this reply…"
-                  : durableRecovery === "terminal"
-                    ? "That reply stopped after recovery attempts."
-                    : durableRecovery === "failed"
-                      ? "That reply stopped before it finished."
-                      : "This reply is taking longer than usual."}
-              </span>
+              <span>{foregroundRecoveryMessage}</span>
               <div className="flex shrink-0 items-center gap-2">
-                {!durableRetryReady && (
+                {!submissionRetryReady && !durableRetryReady && (
                   <button
                     type="button"
                     onClick={() => void cancelDurableTurn(false)}
@@ -4598,13 +4881,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 )}
                 <button
                   type="button"
-                  onClick={() => durableRetryReady
-                    ? retryDurableTurn()
-                    : durableRecovery === "terminal" ? prepareDurableRetry() : void requestDurableRecovery(true)}
-                  disabled={durableRecovery === "recovering" || durableRecovery === "cancelling" || (durableRecovery === "retry-ready" && !durableRetryReady)}
+                  onClick={foregroundRecoveryAction}
+                  disabled={foregroundRecoveryActionDisabled}
                   className="rounded-lg border border-amber/30 px-2 py-1 text-amber transition hover:bg-amber/10 disabled:opacity-40"
                 >
-                  {durableRetryReady ? "retry" : durableRecovery === "terminal" || durableRecovery === "retry-ready" ? "secure retry" : "recover"}
+                  {foregroundRecoveryActionLabel}
                 </button>
               </div>
             </div>
@@ -4626,6 +4907,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                   onNotice={setFileNotice}
                 />
               ))}
+            {voiceRecoveryVisible && (
+              <button
+                type="button"
+                onClick={retryVoicePlayback}
+                aria-label="Resume Jarvis voice playback"
+                className="shrink-0 rounded-xl bg-amber/10 px-2 text-amber ring-1 ring-amber/30 sm:px-3"
+              >
+                ◖
+              </button>
+            )}
             <button
               onClick={() => void toggleLive()}
               title="live conversation"
@@ -4789,12 +5080,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             chatMode === "bar" ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-28 opacity-0"
           }`}
         >
-          {durableRecovery !== "idle" && durableRecovery !== "waiting" && (
+          {foregroundRecoveryVisible && (
             <div className="mx-auto mb-1 flex w-fit items-center gap-2 rounded-full border border-amber/20 bg-black/75 px-3 py-1 text-[11px] text-slate backdrop-blur">
-              <span>{durableRecovery === "cancelling"
-                ? "Securing reply…"
-                : durableRecovery === "retry-ready" ? "Reply safely stopped." : durableRecovery === "recovering" ? "Reconnecting reply…" : "Reply delayed or stopped."}</span>
-              {!durableRetryReady && (
+              <span>{foregroundRecoveryMessage}</span>
+              {!submissionRetryReady && !durableRetryReady && (
                 <button
                   type="button"
                   onClick={() => void cancelDurableTurn(false)}
@@ -4806,13 +5095,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               )}
               <button
                 type="button"
-                onClick={() => durableRetryReady
-                  ? retryDurableTurn()
-                  : durableRecovery === "terminal" ? prepareDurableRetry() : void requestDurableRecovery(true)}
-                disabled={durableRecovery === "recovering" || durableRecovery === "cancelling" || (durableRecovery === "retry-ready" && !durableRetryReady)}
+                onClick={foregroundRecoveryAction}
+                disabled={foregroundRecoveryActionDisabled}
                 className="text-amber disabled:opacity-40"
               >
-                {durableRetryReady ? "retry" : durableRecovery === "terminal" || durableRecovery === "retry-ready" ? "secure retry" : "recover"}
+                {foregroundRecoveryActionLabel}
               </button>
             </div>
           )}
@@ -4835,6 +5122,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 className={`shrink-0 rounded-xl px-2 text-xs ${pendingFileIds.length ? "bg-amber/15 text-amber ring-1 ring-amber/30" : selectedFileIds.length ? "bg-cyan/15 text-cyan ring-1 ring-cyan/30" : "text-slate hover:text-cyan"}`}
               >
                 ▤{selectedFileIds.length + pendingFileIds.length ? ` ${selectedFileIds.length + pendingFileIds.length}` : ""}
+              </button>
+            )}
+            {voiceRecoveryVisible && (
+              <button
+                type="button"
+                onClick={retryVoicePlayback}
+                aria-label="Resume Jarvis voice playback"
+                className="shrink-0 rounded-xl bg-amber/10 px-2.5 text-amber ring-1 ring-amber/30"
+              >
+                ◖
               </button>
             )}
             <button

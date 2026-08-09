@@ -46,7 +46,9 @@ describe("travel_map tool", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mock.getSecret.mockResolvedValue("places-key");
-    mock.convexQuery.mockResolvedValue("thread-1");
+    mock.convexQuery.mockImplementation(async (path: string) =>
+      path === "currentState:getActive" ? { value: "Sevilla" } : "thread-1",
+    );
     mock.convexMutation.mockResolvedValue(undefined);
     mock.lookupBookings.mockResolvedValue([{
       id: "gmail-booking-1",
@@ -111,5 +113,26 @@ describe("travel_map tool", () => {
     expect(result).toContain("Calendar and trip data were left untouched");
     expect(mock.createICloudEvent).not.toHaveBeenCalled();
     expect(mock.convexMutation.mock.calls.every(([path]) => path === "ui:setPanel" || path === "chatQueue:postCard")).toBe(true);
+  });
+
+  it("keeps the exact niche follow-up on Sevilla without requiring the model to repeat the city", async () => {
+    const result = await executeTool("travel_map", {
+      query: "attractions in the city",
+      preferences: "I'm not looking for touristy stuff; give me something more niche",
+    });
+
+    expect(result).toContain("Interactive map opened for Sevilla");
+    expect(mock.convexQuery).toHaveBeenCalledWith("currentState:getActive", {
+      key: "profile.current_location",
+    });
+    const panelCall = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
+    const panel = JSON.parse(String(panelCall?.[1]?.value));
+    expect(panel).toMatchObject({
+      kind: "places",
+      activeTool: "travel_map",
+      locationLabel: "Sevilla",
+      center: { label: "Sevilla", source: "current_state" },
+      preferences: "I'm not looking for touristy stuff; give me something more niche",
+    });
   });
 });

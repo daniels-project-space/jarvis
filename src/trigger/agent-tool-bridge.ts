@@ -162,7 +162,7 @@ function responseSignalsFailure(payload: unknown): boolean {
     : typeof value.message === "string"
       ? value.message
       : "";
-  return /^(?:tool\s+(?:failed|unavailable)|error|failed)(?:\s*:|\b)/i.test(message.trim());
+  return /^(?:(?:tool|search|maps? key)\s+(?:failed|unavailable)|(?:travel map|weather)\s+lookup\s+failed|error|failed)(?:\s*:|\b)/i.test(message.trim());
 }
 
 function abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -288,18 +288,17 @@ export class AgentToolBridge {
       return failureResult("invalid_response", "Jarvis tool discovery returned an invalid definition list.");
     }
 
-    const rankedNames = new Set(
-      ranking.candidates
-        .filter((candidate) => candidate.belt === belt)
-        .map((candidate) => candidate.tool),
-    );
-    const routedDefinitions = rankedNames.size > 0
-      ? definitions.filter((definition) => {
-        const candidate = record(definition);
-        return typeof candidate?.name === "string" && rankedNames.has(candidate.name);
-      })
+    const rankedNames = ranking.candidates
+      .filter((candidate) => candidate.belt === belt)
+      .map((candidate) => candidate.tool);
+    const definitionsByName = new Map(definitions.flatMap((definition) => {
+      const candidate = record(definition);
+      return typeof candidate?.name === "string" ? [[candidate.name, definition] as const] : [];
+    }));
+    const routedDefinitions = rankedNames.length > 0
+      ? rankedNames.flatMap((name) => definitionsByName.has(name) ? [definitionsByName.get(name)] : [])
       : definitions;
-    if (rankedNames.size > 0 && routedDefinitions.length === 0) {
+    if (rankedNames.length > 0 && routedDefinitions.length === 0) {
       return failureResult("invalid_response", "The routed Jarvis capability is not present in the discovered belt.");
     }
 

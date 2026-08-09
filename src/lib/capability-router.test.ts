@@ -30,6 +30,14 @@ describe("capability router", () => {
     });
   });
 
+  it("routes the day planner with the existing renderer it needs to finish", () => {
+    const ranking = rankCapabilities("Plan my day around my calendar");
+    expect(ranking.candidates.slice(0, 2).map(({ belt, tool }) => ({ belt, tool }))).toEqual([
+      { belt: "work", tool: "plan_my_day" },
+      { belt: "work", tool: "show" },
+    ]);
+  });
+
   it("never treats an explicit visual request as unknown", () => {
     const ranking = rankCapabilities("Show me that visually");
     expect(ranking.explicitVisual).toBe(true);

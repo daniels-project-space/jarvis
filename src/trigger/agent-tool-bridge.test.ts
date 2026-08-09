@@ -147,6 +147,27 @@ describe("foreground agent tool bridge", () => {
     })]);
   });
 
+  it.each([
+    "Maps key unavailable.",
+    "Search unavailable right now.",
+    "Weather lookup failed: upstream timed out.",
+    "Travel map lookup failed: places API returned 503.",
+  ])("treats a scoped provider failure as failure even behind HTTP 200: %s", async (result) => {
+    const bridge = new AgentToolBridge("dispatch-token", {
+      endpoint: "https://jarvis.test/api/agent-tool",
+      fetchImplementation: async () => Response.json({ result }),
+    });
+
+    const response = await bridge.invoke(dynamicCall("jarvis_call_tool", {
+      name: "travel_map",
+      args: { location: "Sevilla" },
+    }));
+
+    expect(response.success).toBe(false);
+    const text = response.contentItems[0].type === "inputText" ? response.contentItems[0].text : "";
+    expect(JSON.parse(text)).toMatchObject({ ok: false, error: { code: "upstream_failure" } });
+  });
+
   it("routes natural visual intent locally and returns only relevant definitions", async () => {
     const requests: string[] = [];
     const bridge = new AgentToolBridge("dispatch-token", {
@@ -176,6 +197,27 @@ describe("foreground agent tool bridge", () => {
       "places_near",
       "transport_route",
     ]);
+  });
+
+  it("discovers both the day planner and its real rendering tool in one request", async () => {
+    const bridge = new AgentToolBridge("dispatch-token", {
+      endpoint: "https://jarvis.test/api/agent-tool",
+      fetchImplementation: async () => Response.json([
+        { name: "show", description: "Render the completed plan." },
+        { name: "research", description: "Unrelated work tool." },
+        { name: "plan_my_day", description: "Build the live plan facts." },
+      ]),
+    });
+
+    const response = await bridge.invoke(dynamicCall("jarvis_get_tools", {
+      intent: "Plan my day around my calendar",
+    }));
+    const text = response.contentItems[0].type === "inputText" ? response.contentItems[0].text : "null";
+    const routed = JSON.parse(text);
+
+    expect(response.success).toBe(true);
+    expect(routed).toMatchObject({ belt: "work", mustRender: true });
+    expect(routed.tools.map((tool: { name: string }) => tool.name)).toEqual(["plan_my_day", "show"]);
   });
 
   it("replays the same authoritative invocation context without placing it in tool arguments", async () => {
