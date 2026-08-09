@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { resolvePanelRoute } from "./panel-contract";
+import { resolveEmbedLayoutMode, resolvePanelRoute } from "./panel-contract";
 
 describe("semantic panel routing", () => {
   it.each([
@@ -15,25 +15,38 @@ describe("semantic panel routing", () => {
     const briefing = resolvePanelRoute({ type: "widget", value: JSON.stringify({ kind: "briefing2" }) });
     expect(chart.semanticKind).toBe("widget:candles");
     expect(chart.size).not.toBe(briefing.size);
-    expect(chart.keepOrbVisible).toBe(true);
-    expect(briefing.keepOrbVisible).toBe(true);
+    expect(chart.presentation).toBe("wide");
+    expect(briefing.presentation).toBe("wide");
+    expect(chart.keepOrbVisible).toBe(false);
+    expect(briefing.keepOrbVisible).toBe(false);
   });
 
   it("falls unknown content back to safe markdown instead of raw JSON", () => {
     const route = resolvePanelRoute({ type: "future", value: "hello" });
     expect(route.renderer).toBe("markdown");
-    expect(route.keepOrbVisible).toBe(true);
+    expect(route.presentation).toBe("wide");
+    expect(route.keepOrbVisible).toBe(false);
   });
 
-  it.each(["trip", "fleet", "pdf", "site", "url", "code", "markdown"])(
-    "keeps Jarvis visible beside %s",
+  it.each(["trip", "fleet", "pdf", "site", "url"])(
+    "gives %s the complete workspace instead of a squeezed side stage",
     (type) => {
-      expect(resolvePanelRoute({ type, value: "" }).keepOrbVisible).toBe(true);
+      expect(resolvePanelRoute({ type, value: "" }).presentation).toBe("workspace");
+      expect(resolvePanelRoute({ type, value: "" }).keepOrbVisible).toBe(false);
     },
   );
 
-  it("reserves the full stage only for video playback", () => {
-    expect(resolvePanelRoute({ type: "video", value: "https://example.com" }).keepOrbVisible).toBe(false);
+  it("keeps only genuinely compact tools beside the orb", () => {
+    expect(resolvePanelRoute({ type: "widget", value: JSON.stringify({ kind: "timer" }) }).keepOrbVisible).toBe(true);
+    expect(resolvePanelRoute({ type: "widget", value: JSON.stringify({ kind: "calendar" }) }).keepOrbVisible).toBe(false);
+  });
+
+  it("expands ordinary wide and workspace panels at the embed host boundary", () => {
+    expect(resolveEmbedLayoutMode({ expanded: false, panelVisible: true, panelFull: true, presentation: "workspace" })).toBe("compact");
+    expect(resolveEmbedLayoutMode({ expanded: true, panelVisible: false, panelFull: false })).toBe("chat");
+    expect(resolveEmbedLayoutMode({ expanded: true, panelVisible: true, panelFull: false, presentation: "compact" })).toBe("chat");
+    expect(resolveEmbedLayoutMode({ expanded: true, panelVisible: true, panelFull: false, presentation: "wide" })).toBe("workspace");
+    expect(resolveEmbedLayoutMode({ expanded: true, panelVisible: true, panelFull: false, presentation: "workspace" })).toBe("workspace");
   });
 
   it("opens the Goal launcher only from the explicit UI action, never mission admission or status", () => {

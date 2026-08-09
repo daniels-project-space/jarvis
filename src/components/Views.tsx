@@ -34,11 +34,12 @@ const KIND_STYLE: Record<string, string> = {
 function EventPill({ e, small }: { e: CalEvent; small?: boolean }) {
   return (
     <div
-      className={`truncate rounded-md border px-1.5 ${small ? "py-0 text-[9px]" : "py-0.5 text-[11px]"} ${KIND_STYLE[e.kind] ?? KIND_STYLE.event}`}
+      className={`min-w-0 rounded-md border px-1.5 leading-tight ${small ? "min-h-7 py-1 text-[9px]" : "min-h-8 py-1 text-[11px]"} ${KIND_STYLE[e.kind] ?? KIND_STYLE.event}`}
       title={`${e.time ? e.time + " · " : ""}${e.title}${e.location ? " · " + e.location : ""}`}
+      aria-label={`${e.time || "Time not set"}: ${e.title}`}
     >
-      {e.time && <span className="mr-1 opacity-70">{e.time}</span>}
-      {e.title}
+      <span className="block font-mono opacity-75">{e.time || "time not set"}</span>
+      <span className="line-clamp-2 break-words">{e.title}</span>
     </div>
   );
 }
@@ -60,7 +61,7 @@ export function CalendarView({ value }: { value: string }) {
           <div className="text-lg font-semibold text-ice">{w.label}</div>
           <div className="hud-label">month</div>
         </div>
-        <div className="grid grid-cols-7 gap-1 pb-1">
+        <div className="grid min-w-[700px] grid-cols-7 gap-1 pb-1">
           {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d) => (
             <div key={d} className="hud-label !text-[9px] pb-1 text-center">
               {d}
@@ -94,7 +95,7 @@ export function CalendarView({ value }: { value: string }) {
           <div className="text-lg font-semibold text-ice">{w.label}</div>
           <div className="hud-label">week</div>
         </div>
-        <div className="grid gap-2 md:grid-cols-7">
+        <div className="grid gap-2 @min-[760px]:grid-cols-7">
           {w.days.map((d) => (
             <div key={d.date} className={`${glass} p-2 ${d.today ? "ring-1 ring-cyan/60" : ""}`}>
               <div className="mb-2 flex items-baseline justify-between">
@@ -328,7 +329,7 @@ export function Briefing2View({ value }: { value: string }) {
           </div>
         </div>
 
-        <div className="grid gap-4 md:grid-cols-2">
+        <div className="grid gap-4 @min-[620px]:grid-cols-2">
           <div className="tile rise p-4" style={{ animationDelay: "60ms" }}>
             <div className="hud-label mb-2">picked for today</div>
             <div className="space-y-2">
@@ -547,7 +548,7 @@ export function FeedView({ value }: { value: string }) {
             </button>
           </div>
         </div>
-        <div className="grid flex-1 grid-cols-1 content-center gap-4 md:grid-cols-3">
+        <div className="grid flex-1 grid-cols-1 content-center gap-4 @min-[720px]:grid-cols-3">
           {slice.map((it, i) => {
             const n = cur * per + i + 1;
             return (
@@ -604,7 +605,7 @@ export function FeedView({ value }: { value: string }) {
         <span className="hud-label">{w.label}</span>
         <button onClick={() => { setIdx(0); setPhase("hero"); }} className="hud-label rounded px-1.5 hover:text-cyan">▶ replay</button>
       </div>
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 @min-[620px]:grid-cols-3 @min-[900px]:grid-cols-4">
         {items.map((it, i) => (
           <button key={i} onClick={() => open(it)} className="card-lift glass rise overflow-hidden rounded-xl text-left" style={{ animationDelay: `${i * 45}ms` }}>
             <div className={`relative bg-[radial-gradient(120%_100%_at_50%_0%,rgba(19,32,51,0.9),rgba(6,10,18,0.98))] ${w!.mode === "music" ? "aspect-square" : "aspect-video"}`}>
@@ -855,8 +856,8 @@ export function PlacesView({ value }: { value: string }) {
   };
   const routeUrl = route?.directionsUrl;
   return (
-    <div className="flex min-h-0 flex-1 flex-col md:flex-row">
-      <div className="relative h-56 w-full shrink-0 overflow-hidden bg-[#071018] md:h-auto md:flex-1">
+    <div className="flex min-h-0 flex-1 flex-col @min-[760px]:flex-row">
+      <div className="relative h-56 w-full shrink-0 overflow-hidden bg-[#071018] @min-[760px]:h-auto @min-[760px]:flex-1">
         <div ref={mapEl} className="absolute inset-0" />
         {mapError && <div className="absolute inset-x-3 bottom-3 rounded-lg border border-amber/25 bg-[#071018]/90 p-2 text-[11px] text-amber backdrop-blur">{mapError}</div>}
         <div className="pointer-events-none absolute left-3 top-3 max-w-[75%] rounded-lg border border-white/10 bg-[#071018]/80 px-2.5 py-2 backdrop-blur">
@@ -865,7 +866,7 @@ export function PlacesView({ value }: { value: string }) {
           {center.detail && <div className="truncate text-[10px] text-slate">{center.detail}</div>}
         </div>
       </div>
-      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3 md:w-[380px] md:flex-none">
+      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3 @min-[760px]:w-[min(380px,38%)] @min-[760px]:flex-none">
         <div className="hud-label">{w.locationLabel ?? center.label ?? "map"} · {w.query}</div>
         {center.source === "openstreetmap" && <div className="mt-1 text-[10px] text-slate">Place data © OpenStreetMap contributors</div>}
         {w.preferences && <div className="mb-2 mt-1 text-[11px] leading-relaxed text-slate">Taste: {w.preferences}</div>}
@@ -971,7 +972,7 @@ export function WebResultsView({ value }: { value: string }) {
           <span className="hud-label mr-2 !text-cyan">answer</span>{w.answer}
         </div>
       )}
-      <div className="grid flex-1 grid-cols-1 content-start gap-4 md:grid-cols-3">
+      <div className="grid flex-1 grid-cols-1 content-start gap-4 @min-[760px]:grid-cols-3">
         {slice.map((it, i) => (
           <a
             key={cur * per + i}
@@ -1048,7 +1049,7 @@ export function ShopView({ value }: { value: string }) {
           </button>
         </div>
       </div>
-      <div className="grid flex-1 grid-cols-1 content-center gap-5 md:grid-cols-3">
+      <div className="grid flex-1 grid-cols-1 content-center gap-5 @min-[760px]:grid-cols-3">
         {slice.map((it, i) => {
           const n = cur * per + i + 1;
           const fast = it.delivery && /same.day|next.day|tomorrow|\b1 day|\b1-2 day|24 ?h/i.test(it.delivery);
@@ -1930,7 +1931,7 @@ export function CreationsView({ value }: { value: string }) {
 
   return (
     <div className="relative flex min-h-0 flex-1 overflow-hidden">
-      <aside className="hidden w-60 shrink-0 flex-col border-r border-white/7 bg-black/10 md:flex">
+      <aside className="hidden w-60 shrink-0 flex-col border-r border-white/7 bg-black/10 @min-[760px]:flex">
         <div className="border-b border-white/7 px-4 py-4">
           <div className="hud-label !text-cyan">saved work</div>
           <div className="mt-1 text-[11px] leading-relaxed text-slate">Automatically filed by project, inquiry and format.</div>
@@ -1954,7 +1955,7 @@ export function CreationsView({ value }: { value: string }) {
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="border-b border-white/7 px-3 py-3 sm:px-4">
           <div className="flex flex-wrap items-center gap-2">
-            <select value={folder ?? ""} onChange={(event) => setFolder(event.target.value || null)} className="max-w-[48%] rounded-lg border border-white/10 bg-[#0c1524] px-2 py-1.5 text-xs text-ice outline-none md:hidden">
+            <select value={folder ?? ""} onChange={(event) => setFolder(event.target.value || null)} className="max-w-[48%] rounded-lg border border-white/10 bg-[#0c1524] px-2 py-1.5 text-xs text-ice outline-none @min-[760px]:hidden">
               <option value="">All files</option>
               {folders.map(([name, count]) => <option key={name} value={name}>{name} ({count})</option>)}
             </select>
@@ -1976,7 +1977,7 @@ export function CreationsView({ value }: { value: string }) {
             {groups.map(([name, items]) => (
               <section key={name}>
                 <div className="mb-2 flex items-center gap-2"><span className="hud-label !text-cyan-dim">{name}</span><span className="h-px flex-1 bg-white/5" /></div>
-                <div className="grid grid-cols-2 gap-2 2xl:grid-cols-3">
+                <div className="grid grid-cols-1 gap-2 @min-[420px]:grid-cols-2 @min-[980px]:grid-cols-3">
                   {items.map((r) => (
                     <div key={r._id} className="card-lift glass group relative flex min-w-0 flex-col overflow-hidden rounded-xl">
                       <button onClick={() => open(r)} className="min-w-0 text-left" title={`Open ${r.title}`}>

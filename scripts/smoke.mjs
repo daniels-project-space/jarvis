@@ -117,13 +117,40 @@ async function tool(name, args) {
 await authenticate();
 
 // ---------------------------------------------------------------------------
-await test("Hub bearer transport works without a cookie", async () => {
+await test("live voice round-trips a deterministic spoken phrase", async () => {
+  const phrase = "Jarvis speech check number seven";
+  // Use Jarvis's real production voice so this remains a text-only, portable
+  // smoke fixture. The phrase is deliberately short: one free TTS request and
+  // one bounded STT request validate the full audio path without repeated cost.
+  const speech = await fetch(`${BASE}/api/tts`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${VIEWER_TOKEN}`,
+      origin: BASE,
+    },
+    body: JSON.stringify({ text: phrase }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  assert(speech.status === 200, `TTS fixture returned ${speech.status}`);
+  const audio = Buffer.from(await speech.arrayBuffer());
+  assert(audio.length > 2_000, `TTS fixture was unexpectedly short (${audio.length} bytes)`);
+  const mime = (speech.headers.get("content-type") ?? "audio/mpeg").split(";")[0];
   const r = await fetch(`${BASE}/api/stt`, {
     method: "POST",
-    headers: { "content-type": "audio/webm", authorization: `Bearer ${VIEWER_TOKEN}` },
-    body: new Uint8Array([0]),
+    headers: { "content-type": mime, authorization: `Bearer ${VIEWER_TOKEN}` },
+    body: audio,
+    signal: AbortSignal.timeout(18_000),
   });
-  assert(r.status === 200, `bearer-only STT transport returned ${r.status}`);
+  const payload = await r.json().catch(() => null);
+  assert(r.status === 200, `STT provider/config probe returned ${r.status}: ${JSON.stringify(payload)}`);
+  assert(["local-faster-whisper", "groq-whisper"].includes(r.headers.get("x-jarvis-stt-provider")),
+    "STT returned 200 without reaching a configured provider");
+  const transcript = String(payload?.text ?? "").toLowerCase();
+  const concepts = [/\bjarvis\b/, /\b(speech|voice)\b/, /\b(check|verify|verification)\b/, /\b(seven|7)\b/];
+  const matched = concepts.filter((pattern) => pattern.test(transcript)).length;
+  assert(matched >= 3 && concepts[0].test(transcript),
+    `STT transcript did not match spoken fixture: ${JSON.stringify(payload?.text ?? "")}`);
 });
 
 await test("chat answers, clean text", async () => {

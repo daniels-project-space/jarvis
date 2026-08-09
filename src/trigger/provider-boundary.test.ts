@@ -16,16 +16,23 @@ describe("intelligence provider boundary", () => {
     expect(config).toMatch(/^\s*runtime:\s*"node-22",\s*$/m);
   });
 
-  it("removes direct Groq and Google Maps/Places billing paths", () => {
+  it("limits paid provider access to the explicit resilient STT fallback", () => {
     const root = join(process.cwd(), "src");
+    const stt = join(root, "app/api/stt/route.ts");
     const violations = runtimeFiles(root)
-      .filter((path) => /api\.groq\.com|GROQ_API_KEY|places\.googleapis\.com|maps\.googleapis\.com|GOOGLE_PLACES_API_KEY/i.test(readFileSync(path, "utf8")))
+      .filter((path) => {
+        const source = readFileSync(path, "utf8");
+        if (/places\.googleapis\.com|maps\.googleapis\.com|GOOGLE_PLACES_API_KEY/i.test(source)) return true;
+        return path !== stt && /api\.groq\.com|GROQ_API_KEY/i.test(source);
+      })
       .map((path) => relative(process.cwd(), path));
     expect(violations).toEqual([]);
-    const stt = join(root, "app/api/stt/route.ts");
-    expect(readFileSync(stt, "utf8")).toContain("/audio/transcriptions");
-    expect(readFileSync(stt, "utf8")).toContain("LOCAL_STT_URL");
-    expect(readFileSync(stt, "utf8")).toContain("local-faster-whisper");
+    const sttSource = readFileSync(stt, "utf8");
+    expect(sttSource).toContain("/audio/transcriptions");
+    expect(sttSource).toContain("LOCAL_STT_URL");
+    expect(sttSource).toContain("local-faster-whisper");
+    expect(sttSource).toContain("whisper-large-v3-turbo");
+    expect(sttSource.indexOf("config.local")).toBeLessThan(sttSource.indexOf("config.groqKey"));
     const tools = readFileSync(join(root, "lib/tools.ts"), "utf8");
     expect(tools).toContain("searchOpenStreetMapPlaces");
   });

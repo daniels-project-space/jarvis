@@ -21,9 +21,23 @@ export type PanelRenderer =
 export type PanelRoute = {
   renderer: PanelRenderer;
   semanticKind: string;
+  presentation: "compact" | "wide" | "workspace";
   size: string;
   keepOrbVisible: boolean;
 };
+
+export type JarvisEmbedLayoutMode = "compact" | "chat" | "workspace";
+
+export function resolveEmbedLayoutMode(args: {
+  expanded: boolean;
+  panelVisible: boolean;
+  panelFull: boolean;
+  presentation?: PanelRoute["presentation"];
+}): JarvisEmbedLayoutMode {
+  if (!args.expanded) return "compact";
+  if (args.panelFull || (args.panelVisible && args.presentation !== "compact")) return "workspace";
+  return "chat";
+}
 
 function widgetKind(value: string): string {
   try {
@@ -54,47 +68,52 @@ export function resolvePanelRoute(panel: PanelInput): PanelRoute {
                                 : panel.type === "list" ? "list"
                                   : "markdown";
 
-  let size = "h-full w-full";
+  let presentation: PanelRoute["presentation"] = "wide";
+  let size = "h-[min(760px,96%)] w-[min(980px,98%)]";
   switch (semanticKind) {
-    case "launch": size = "w-[min(560px,94%)] h-[400px]"; break;
-    case "widget:timer": size = "w-[min(500px,94%)] h-[460px]"; break;
-    case "widget:mac_action": size = "w-[min(620px,94%)] h-[480px]"; break;
-    case "widget:mac_setup": size = "w-[min(720px,96%)] h-[min(680px,92%)]"; break;
-    case "widget:weather": size = "w-[min(880px,80%)] h-[min(640px,90%)]"; break;
-    case "widget:market": size = "w-[96%] md:w-[min(880px,calc(100%-250px))] h-[min(540px,86%)]"; break;
-    case "image": size = "w-[min(1100px,97%)] h-[min(760px,97%)]"; break;
+    case "launch": presentation = "compact"; size = "h-[400px] w-[min(560px,96%)]"; break;
+    case "widget:timer": presentation = "compact"; size = "h-[min(460px,92%)] w-[min(500px,96%)]"; break;
+    case "widget:mac_action": presentation = "compact"; size = "h-[min(480px,92%)] w-[min(620px,96%)]"; break;
+    case "widget:mac_setup": presentation = "compact"; size = "h-[min(680px,94%)] w-[min(720px,97%)]"; break;
+    case "widget:weather": presentation = "compact"; size = "h-[min(640px,94%)] w-[min(880px,98%)]"; break;
+    case "widget:market": size = "h-[min(560px,92%)] w-[min(920px,98%)]"; break;
+    case "image": size = "h-[min(800px,98%)] w-[min(1200px,99%)]"; break;
     case "widget:candles":
-    case "widget:chart_loading": size = "w-[96%] md:w-[min(1040px,calc(100%-250px))] h-[min(680px,88%)]"; break;
+    case "widget:chart_loading": size = "h-[min(700px,96%)] w-[min(1100px,99%)]"; break;
     case "widget:briefing":
-    case "widget:briefing2": size = "w-[96%] md:w-[min(980px,calc(100%-250px))] h-[min(700px,90%)]"; break;
+    case "widget:briefing2": size = "h-[min(720px,96%)] w-[min(1040px,99%)]"; break;
     case "widget:calendar":
     case "widget:bookings":
-    case "widget:todos": size = "w-[96%] md:w-[min(900px,calc(100%-250px))] h-[min(680px,88%)]"; break;
+    case "widget:todos": size = "h-[min(720px,96%)] w-[min(1040px,99%)]"; break;
     case "widget:net_worth_loading":
-    case "widget:stats": size = "w-[96%] h-[min(680px,92%)]"; break;
+    case "widget:stats": size = "h-[min(700px,96%)] w-[min(1080px,99%)]"; break;
     case "widget:videos":
-    case "widget:feed": size = "w-[min(1340px,82%)] h-[min(740px,92%)]"; break;
-    case "widget:shop": size = "w-[min(1340px,82%)] h-[min(700px,92%)]"; break;
-    case "widget:webresults": size = "w-[min(1340px,84%)] h-[min(720px,92%)]"; break;
-    case "widget:places": size = "w-[min(1200px,90%)] h-[min(760px,94%)]"; break;
-    case "widget:ranking": size = "w-[min(1180px,88%)] h-[min(780px,94%)]"; break;
-    case "widget:calc": size = "w-[min(560px,94%)] h-[min(360px,80%)]"; break;
-    case "scene": size = "w-[min(1440px,98%)] h-[min(820px,97%)]"; break;
+    case "widget:feed": size = "h-[min(760px,97%)] w-[min(1340px,99%)]"; break;
+    case "widget:shop": size = "h-[min(740px,97%)] w-[min(1340px,99%)]"; break;
+    case "widget:webresults": size = "h-[min(760px,97%)] w-[min(1340px,99%)]"; break;
+    case "widget:places": size = "h-[min(800px,98%)] w-[min(1260px,99%)]"; break;
+    case "widget:ranking": size = "h-[min(800px,98%)] w-[min(1220px,99%)]"; break;
+    case "widget:calc": presentation = "compact"; size = "h-[min(360px,80%)] w-[min(560px,96%)]"; break;
+    case "scene": presentation = "workspace"; size = "h-full w-full"; break;
     case "board":
-    case "canvas": size = "w-[97%] md:w-full h-[min(820px,96%)]"; break;
-    case "markdown": size = "w-[min(980px,97%)] h-full"; break;
-    case "list": size = "w-[96%] md:w-[min(920px,calc(100%-250px))] h-[min(720px,92%)]"; break;
-    case "doc": size = "w-[min(880px,80%)] h-[min(800px,94%)]"; break;
-    case "creations": size = "w-[96%] md:w-full md:max-w-[1200px] h-[min(780px,94%)]"; break;
-    case "trip": size = "w-[97%] md:w-full h-[min(820px,96%)]"; break;
-    case "fleet": size = "w-[96%] md:w-full md:max-w-[1120px] h-[min(760px,92%)]"; break;
-    case "pdf": size = "w-[96%] md:w-full md:max-w-[1020px] h-[min(800px,94%)]"; break;
+    case "canvas": presentation = "workspace"; size = "h-full w-full"; break;
+    case "markdown": size = "h-[min(780px,98%)] w-[min(1040px,99%)]"; break;
+    case "list": size = "h-[min(760px,97%)] w-[min(1040px,99%)]"; break;
+    case "doc": size = "h-[min(820px,98%)] w-[min(940px,99%)]"; break;
+    case "creations": presentation = "workspace"; size = "h-full w-full"; break;
+    case "trip": presentation = "workspace"; size = "h-full w-full"; break;
+    case "fleet": presentation = "workspace"; size = "h-full w-full"; break;
+    case "pdf": presentation = "workspace"; size = "h-full w-full"; break;
     case "site":
-    case "url": size = "w-[97%] md:w-full h-[min(800px,94%)]"; break;
-    case "code": size = "w-[96%] md:w-full md:max-w-[980px] h-[min(760px,92%)]"; break;
+    case "url": presentation = "workspace"; size = "h-full w-full"; break;
+    case "video": presentation = "workspace"; size = "h-full w-full"; break;
+    case "code": size = "h-[min(800px,98%)] w-[min(1040px,99%)]"; break;
   }
-  // Unknown future panel types intentionally use the markdown renderer. Give
-  // that safe fallback the same side-stage geometry instead of hiding Jarvis.
-  if (size === "h-full w-full" && renderer === "markdown") size = "w-[min(980px,97%)] h-[min(760px,94%)]";
-  return { renderer, semanticKind, size, keepOrbVisible: size !== "h-full w-full" && panel.type !== "video" };
+  return {
+    renderer,
+    semanticKind,
+    presentation,
+    size,
+    keepOrbVisible: presentation === "compact" && panel.type !== "video",
+  };
 }
