@@ -31,7 +31,7 @@ export async function controlActor(req: NextRequest): Promise<ControlActor | nul
       tokenHash: await sha256Hex(bearer),
       hostOrigin,
       workerToken,
-    }).catch(() => null) as { valid?: boolean; authTokenHash?: string } | null;
+    }) as { valid?: boolean; authTokenHash?: string } | null;
     if (status?.valid && typeof status.authTokenHash === "string") {
       return { kind: "owner", authTokenHash: status.authTokenHash };
     }

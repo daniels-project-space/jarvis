@@ -9,7 +9,9 @@ async function main(): Promise<void> {
 
   const ticket = randomBytes(32).toString("base64url");
   const tokenHash = createHash("sha256").update(ticket).digest("hex");
-  const expiresAt = Date.now() + 10 * 60_000;
+  // Single-use still prevents replay, while a full day avoids Daniel finding a
+  // freshly issued link expired by the time he returns to the owner browser.
+  const expiresAt = Date.now() + 24 * 60 * 60_000;
   const response = await fetch(`${convexUrl}/api/mutation`, {
     method: "POST",
     headers: { "content-type": "application/json" },

@@ -69,4 +69,10 @@ describe("owner control actor", () => {
     expect(mock.controlQuery).not.toHaveBeenCalled();
     expect(mock.verifyViewerToken).toHaveBeenCalledWith(CONTROL_TOKEN);
   });
+
+  it("preserves a trusted embed grant across a temporary control-plane outage", async () => {
+    mock.controlQuery.mockRejectedValueOnce(new Error("Convex unavailable"));
+    await expect(controlActor(request())).rejects.toThrow("Convex unavailable");
+    expect(mock.verifyViewerToken).not.toHaveBeenCalled();
+  });
 });

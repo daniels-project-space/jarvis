@@ -5,7 +5,7 @@ import { isTrustedJarvisEmbedOrigin } from "@/lib/embed-origin";
 import { issueViewerToken } from "@/lib/viewer-jwt";
 
 export const runtime = "nodejs";
-const EMBED_SESSION_MS = 30 * 24 * 60 * 60 * 1000;
+const EMBED_SESSION_MS = 365 * 24 * 60 * 60 * 1000;
 
 function html(body: string, status = 200, nonce?: string) {
   return new Response(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><body style="margin:0;background:#050506;color:#f4f2ed;font:14px system-ui;padding:32px">${body}</body>`, {
