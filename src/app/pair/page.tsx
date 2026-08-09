@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { ownerPairingTicketFromLocation } from "@/lib/owner-pairing-link";
 
 export default function PairJarvisPage() {
   const [status, setStatus] = useState<"pairing" | "unavailable" | "invalid" | "storage">("pairing");
@@ -10,10 +11,12 @@ export default function PairJarvisPage() {
   useEffect(() => {
     let active = true;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
-    const hashTicket = window.location.hash.slice(1);
-    if (hashTicket) {
-      ticketRef.current = hashTicket;
-      try { sessionStorage.setItem("jarvis_owner_pairing_ticket", hashTicket); } catch { /* in-memory fallback */ }
+    const incomingTicket = ownerPairingTicketFromLocation(window.location.hash, window.location.search);
+    if (incomingTicket) {
+      ticketRef.current = incomingTicket;
+      try { sessionStorage.setItem("jarvis_owner_pairing_ticket", incomingTicket); } catch { /* in-memory fallback */ }
+      // Remove either transport from the visible URL before any subsequent
+      // browser request can copy it into history or a referrer.
       history.replaceState(null, "", "/pair");
     }
     if (!ticketRef.current) {
@@ -110,7 +113,7 @@ export default function PairJarvisPage() {
               ? "Allow cookies for Jarvis in this browser, then open a fresh owner link."
               : status === "unavailable"
                 ? "Your link is safe. Jarvis will retry automatically."
-                : "The pairing code is single-use and never appears in the request URL."}
+                : "The pairing code is single-use and is removed from the address immediately."}
         </p>
         {status === "unavailable" && (
           <button

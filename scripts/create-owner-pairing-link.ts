@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { ownerPairingUrl } from "../src/lib/owner-pairing-link";
 
 async function main(): Promise<void> {
   const convexUrl = process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL;
@@ -26,9 +27,10 @@ async function main(): Promise<void> {
     throw new Error("Jarvis rejected the pairing ticket");
   }
 
-  // The fragment is never sent in the HTTP request. /pair consumes it from the
-  // browser and POSTs it once; Convex stores only the hash.
-  process.stdout.write(`${publicUrl}/pair#${ticket}\n`);
+  // The ticket remains single-use and Convex stores only its hash. A query
+  // transport survives in-app link handlers that strip URL fragments; /pair
+  // removes it from browser history before POSTing it once.
+  process.stdout.write(`${ownerPairingUrl(publicUrl, ticket)}\n`);
 }
 
 void main().catch((error) => {
