@@ -1260,11 +1260,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const orbMotionRef = useRef<OrbMotionFrame>(createOrbMotionFrame());
   const viewerToken = useViewerSession();
   const [parentOrigin, setParentOrigin] = useState<string | null>(null);
-  const [embedOriginReady, setEmbedOriginReady] = useState(!embedded);
   useEffect(() => {
     if (!embedded) {
       setParentOrigin(null);
-      setEmbedOriginReady(true);
       return;
     }
     setParentOrigin(resolveTrustedJarvisEmbedOrigin({
@@ -1272,37 +1270,25 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       referrer: document.referrer,
       ancestorOrigin: window.location.ancestorOrigins?.[0] ?? null,
     }));
-    setEmbedOriginReady(true);
   }, [embedded]);
-  // An owner cookie must never upgrade an iframe on an arbitrary website.
-  // Untrusted embeds remain a locked guest surface and cannot query private
-  // messages, panels, host actions, or request storage access.
-  const guest = isGuestViewerSession(viewerToken) || (embedded && !parentOrigin);
+  // Embed host resolution scopes postMessage traffic only. It must not demote
+  // the signed owner session or hide Jarvis when referrer metadata is blocked.
+  const guest = isGuestViewerSession(viewerToken);
   const postToParent = (message: Record<string, unknown>) => {
     if (!embedded || !parentOrigin || window.parent === window) return;
     window.parent.postMessage(message, parentOrigin);
   };
   const hideEmbedded = () => {
     if (!embedded || window.parent === window) return;
-    // `hide` carries no owner data. Keeping this one command available even
-    // to a locked/unregistered host ensures its close button cannot trap a
-    // mobile user, while all sensitive traffic still requires a trusted origin.
+    // `hide` carries no owner data, so it remains available even when the
+    // browser withholds referrer metadata and no reply origin can be resolved.
     window.parent.postMessage({ jarvis: "hide" }, parentOrigin ?? "*");
   };
   const connectEmbeddedOwner = async () => {
-    if (!parentOrigin) return;
-    const storageDocument = document as Document & { requestStorageAccess?: () => Promise<void> };
-    if (!storageDocument.requestStorageAccess) {
-      window.open(window.location.origin, "_blank", "noopener,noreferrer");
-      showCaption({ who: "jarvis", text: "Open Jarvis in the new tab once, then return here to connect owner tools." });
-      return;
-    }
-    try {
-      await storageDocument.requestStorageAccess();
-      window.location.reload();
-    } catch {
-      showCaption({ who: "jarvis", text: "Owner tools are still locked. Open Jarvis directly, sign in, then tap connect again." });
-    }
+    // Guest issuance has been retired. A stale pre-migration viewer can recover
+    // by reloading into the automatic owner bootstrap; no storage-access prompt
+    // or pairing popup is required.
+    window.location.reload();
   };
   useEffect(() => {
     if (!embedded) return;
@@ -1338,7 +1324,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const hostContextRef = useRef<JarvisHostContext | null>(null);
   const hostActionWaiters = useRef(new Map<string, (result: HostActionResult) => void>());
   const embeddedActorKey = stableEmbeddedActorKey(parentOrigin, viewerToken);
-  const embeddedThreadHydrated = activeThreadReady && (!embedded || Boolean(parentOrigin));
+  // The signed viewer session is sufficient to hydrate chat. Parent origin is
+  // only a postMessage destination and may legitimately be unavailable when a
+  // privacy-focused browser strips referrer/ancestor metadata.
+  const embeddedThreadHydrated = activeThreadReady;
   useLayoutEffect(() => {
     const nextContext: EmbeddedThreadContext = {
       actorKey: embeddedActorKey,
@@ -1378,7 +1367,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const fullMessages = useJarvisQuery(api.chatQueue.listMessages, embedded ? "skip" : { threadId: thread });
   const embeddedMessages = useJarvisQuery(
     api.chatQueue.listRecentMessages,
-    embedded && parentOrigin ? { threadId: thread } : "skip",
+    embedded ? { threadId: thread } : "skip",
   );
   const remoteMessages = ((embedded ? embeddedMessages : fullMessages) ?? []) as Msg[];
   const [recoveredAssistant, setRecoveredAssistant] = useState<(Msg & { threadId: string }) | null>(null);
@@ -4202,26 +4191,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const overlayUp = !!panel && !panelMin;
   const fullBleed = overlayUp && (panelFull || !panelRoute?.keepOrbVisible);
   const compactAside = overlayUp && !fullBleed && panel!.type !== "video";
-
-  if (embedded && !parentOrigin) {
-    return (
-      <div data-jarvis-embed-locked className="relative grid h-dvh w-full place-items-center overflow-hidden bg-[#05070d] p-8 text-center">
-        <button
-          type="button"
-          onClick={hideEmbedded}
-          aria-label="Close Jarvis"
-          className="absolute right-3 top-3 z-20 grid h-9 w-9 place-items-center rounded-full bg-black/35 text-xl text-white/60 ring-1 ring-white/10"
-        >
-          ×
-        </button>
-        <p className="max-w-xs text-sm leading-relaxed text-slate">
-          {embedOriginReady
-            ? "Jarvis owner tools are locked on this host. Open Jarvis from one of Daniel's registered apps."
-            : "Connecting Jarvis…"}
-        </p>
-      </div>
-    );
-  }
 
   if (embedded && !embeddedExpanded) {
     return (

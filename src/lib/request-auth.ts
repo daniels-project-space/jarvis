@@ -2,6 +2,7 @@ import "server-only";
 import type { NextRequest } from "next/server";
 import { adminSessionHash, controlQuery, sha256Hex, validateAdminSession } from "./control-session";
 import { isTrustedJarvisEmbedOrigin } from "./embed-origin";
+import { openOwnerSessionToken } from "./open-owner-session";
 import { verifyViewerToken } from "./viewer-jwt";
 
 export type ControlActor =
@@ -37,9 +38,17 @@ export async function controlActor(req: NextRequest): Promise<ControlActor | nul
     }
   }
 
-  // The in-memory viewer JWT intentionally remains read-only. It is never
-  // elevated into API control authority, and old guest JWTs are rejected.
-  await verifyViewerToken(bearer);
+  // With the front-door gate intentionally removed, the signed six-hour owner
+  // viewer capability is the efficient recovery path for browsers and
+  // third-party-cookie-blocked overlays alike. It maps back to the same stable
+  // server-only admin session; no secret or durable credential reaches the UI.
+  const viewer = await verifyViewerToken(bearer);
+  if (viewer?.kind === "owner" && workerToken) {
+    const openSessionHash = await sha256Hex(openOwnerSessionToken(workerToken));
+    if (await validateAdminSession(openSessionHash)) {
+      return { kind: "owner", authTokenHash: openSessionHash };
+    }
+  }
   return null;
 }
 

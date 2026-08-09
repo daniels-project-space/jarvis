@@ -479,7 +479,7 @@ async function processChatQueue(
         messageId: claim.assistantId,
         threadId: claim.threadId,
         status: "error",
-        finalText: "This private Jarvis workspace requires owner pairing.",
+        finalText: "This expired browser session is no longer available. Reload Jarvis and resend.",
         claimToken: claim.claimToken,
       }).catch(() => {});
       targetMessageId = undefined;

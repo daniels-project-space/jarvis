@@ -3,11 +3,14 @@ import { NextResponse } from "next/server";
 import {
   ADMIN_COOKIE,
   ADMIN_SESSION_SECONDS,
+  type AdminSessionStatus,
   adminSessionHash,
   adminSessionStatus,
   controlMutation,
   isSameOriginRequest,
+  sha256Hex,
 } from "@/lib/control-session";
+import { openOwnerSessionToken } from "@/lib/open-owner-session";
 import { issueViewerToken } from "@/lib/viewer-jwt";
 
 export const runtime = "nodejs";
@@ -19,9 +22,9 @@ export async function POST(req: NextRequest) {
     return Response.json({ ok: false }, { status: 403 });
   }
 
-  const ownerToken = req.cookies.get(ADMIN_COOKIE)?.value;
-  const ownerTokenHash = ownerToken ? await adminSessionHash(req) : null;
-  const ownerSession = ownerTokenHash
+  let ownerToken = req.cookies.get(ADMIN_COOKIE)?.value;
+  let ownerTokenHash = ownerToken ? await adminSessionHash(req) : null;
+  let ownerSession: AdminSessionStatus = ownerTokenHash
     ? await adminSessionStatus(ownerTokenHash)
     : { valid: false, unavailable: false } as const;
   if (!ownerSession.valid) {
@@ -31,12 +34,37 @@ export async function POST(req: NextRequest) {
         { status: 503, headers: { "cache-control": "no-store" } },
       );
     }
-    const response = NextResponse.json(
-      { ok: false, error: "owner_pairing_required" },
-      { status: 401, headers: { "cache-control": "no-store" } },
-    );
-    response.cookies.set(GUEST_COOKIE, "", { httpOnly: true, path: "/", maxAge: 0 });
-    return response;
+    const workerToken = process.env.JARVIS_WORKER_TOKEN;
+    if (!workerToken) {
+      return Response.json(
+        { ok: false, error: "owner_session_temporarily_unavailable" },
+        { status: 503, headers: { "cache-control": "no-store" } },
+      );
+    }
+
+    ownerToken = openOwnerSessionToken(workerToken);
+    ownerTokenHash = await sha256Hex(ownerToken);
+    ownerSession = await adminSessionStatus(ownerTokenHash);
+    if (!ownerSession.valid) {
+      if (ownerSession.unavailable) {
+        return Response.json(
+          { ok: false, error: "owner_session_temporarily_unavailable" },
+          { status: 503, headers: { "cache-control": "no-store" } },
+        );
+      }
+      const created = await controlMutation("controlAuth:createOpenSession", {
+        ownerTokenHash,
+        userAgent: req.headers.get("user-agent") ?? undefined,
+        workerToken,
+      }).catch(() => null) as { expiresAt?: number } | null;
+      if (!created?.expiresAt) {
+        return Response.json(
+          { ok: false, error: "owner_session_temporarily_unavailable" },
+          { status: 503, headers: { "cache-control": "no-store" } },
+        );
+      }
+      ownerSession = { valid: true, expiresAt: created.expiresAt };
+    }
   }
 
   const issued = await issueViewerToken({ kind: "owner" }).catch(() => null);
@@ -61,5 +89,6 @@ export async function POST(req: NextRequest) {
     path: "/",
     maxAge: ADMIN_SESSION_SECONDS,
   });
+  response.cookies.set(GUEST_COOKIE, "", { httpOnly: true, path: "/", maxAge: 0 });
   return response;
 }

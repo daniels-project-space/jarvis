@@ -10,6 +10,9 @@ const legacyGuestRow = {
   createdAt: 1,
   attachment: { type: "image", value: "r2://owner-only-frame", title: "owner-only legacy card" },
 };
+const queryTrace = vi.hoisted(() => ({
+  calls: [] as Array<{ name?: string; args: unknown }>,
+}));
 
 vi.mock("../../convex/_generated/api", () => ({
   api: {
@@ -30,7 +33,8 @@ vi.mock("../../convex/_generated/api", () => ({
 }));
 
 vi.mock("@/lib/secure-convex", () => ({
-  useJarvisQuery: (query: { _name?: string }) => {
+  useJarvisQuery: (query: { _name?: string }, args: unknown) => {
+    queryTrace.calls.push({ name: query?._name, args });
     if (query?._name === "chatQueue:listMessages" || query?._name === "chatQueue:listRecentMessages") return [legacyGuestRow];
     return undefined;
   },
@@ -64,12 +68,18 @@ describe("guest Home application render", () => {
     expect(markup).not.toContain('src="r2://owner-only-frame"');
   });
 
-  it("server-renders an untrusted embed as locked with a dependable close control", () => {
+  it("server-renders an unresolved embed as a usable compact surface with a dependable close control", () => {
+    queryTrace.calls = [];
     const markup = renderToStaticMarkup(<JarvisUI embedded />);
 
-    expect(markup).toContain("Connecting Jarvis…");
+    expect(markup).toContain("data-jarvis-embed-surface");
     expect(markup).toContain('aria-label="Close Jarvis"');
-    expect(markup).not.toContain("This text remains visible to the guest.");
+    expect(markup).toContain("This text remains visible to the guest.");
+    expect(markup).not.toMatch(/locked|pairing/i);
+    expect(queryTrace.calls).toContainEqual({
+      name: "chatQueue:listRecentMessages",
+      args: { threadId: "main" },
+    });
   });
 
   it("replaces raw operational logs with a concise recoverable embed message", () => {
