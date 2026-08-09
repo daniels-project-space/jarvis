@@ -6,7 +6,13 @@ import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
-import { primeMicrophone, readJarvisPermissions, type JarvisPermissionState } from "@/lib/permissions";
+import {
+  forgetMicrophoneGrant,
+  readJarvisPermissions,
+  rememberMicrophoneGrant,
+  watchMicrophonePermission,
+  type JarvisPermissionState,
+} from "@/lib/permissions";
 import { registerSW, subscribePush } from "@/lib/push";
 import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
 import { createOrbMotionFrame, deriveOrbVisual, type OrbMotionFrame } from "@/lib/orb-motion";
@@ -21,6 +27,7 @@ import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversa
 import { instantSocialReply } from "@/lib/quick-replies";
 import { isPanelFollowUp } from "@/lib/panel-relevance";
 import { nextVoiceLoopAction, shouldMaintainLiveHeartbeat, type VoiceCaptureOutcome } from "@/lib/voice-loop";
+import { liveVoiceRetryDelay, shouldAutoStartLiveVoice, speechServiceRetryDelay } from "@/lib/live-voice-bootstrap";
 import {
   LIVE_SPEAKER_TAIL_MS,
   LIVE_BARGE_SAMPLE_MS,
@@ -43,7 +50,7 @@ import {
   type TtsRuntimeStatus,
 } from "@/lib/tts";
 import { NarrationLedger, narrationClaim } from "@/lib/narration";
-import { resolvePanelRoute } from "@/lib/panel-contract";
+import { resolveEmbedLayoutMode, resolvePanelRoute } from "@/lib/panel-contract";
 import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
 import { needsHostContext, visibleTurnText, withHostContext, type JarvisHostContext } from "@/lib/host-context";
 import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actions";
@@ -70,7 +77,11 @@ import {
 } from "@/lib/final-delivery";
 import { withClientDeadline } from "@/lib/client-deadline";
 import { resolveTrustedJarvisEmbedOrigin } from "@/lib/embed-origin";
-import { transcribeRecordedAudio } from "@/lib/stt-client";
+import {
+  SpeechRecognitionRequestError,
+  transcriptFromSttResponse,
+  transcribeRecordedAudio,
+} from "@/lib/stt-client";
 import {
   reconcileEmbeddedThreadReadiness,
   stableEmbeddedActorKey,
@@ -84,6 +95,7 @@ import { buildSpeculativeResearchQuery } from "@/lib/speculative-research";
 import {
   chooseLiveTranscriptSource,
   isStableBrowserSpeechRevision,
+  recoverLiveTranscriptFromBrowser,
   type BrowserSpeechPreview,
 } from "@/lib/browser-speech-preview";
 import {
@@ -118,6 +130,12 @@ const VisualSceneView = dynamic(() => import("./VisualSceneView"), {
 
 type Attachment = { type: string; value: string; title?: string };
 type JarvisPrefs = { reduceMotion: boolean; liveDefault: boolean };
+type LiveMicrophoneResources = {
+  stream: MediaStream;
+  context: AudioContext;
+  analyser: AnalyserNode;
+  aecEnabled: boolean;
+};
 type Msg = {
   _id: string;
   role: string;
@@ -408,13 +426,13 @@ const OPTION_MOODS: { k: string; c: string }[] = [
   { k: "curious", c: "#33e0d0" }, { k: "serious", c: "#8fa3bd" }, { k: "excited", c: "#ff5470" },
 ];
 function OptionsPanel({
-  prefs, setPref, permissions, permissionBusy, onEnablePermissions, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary, onOpenGoals, onMacSetup,
+  prefs, setPref, permissions, permissionBusy, onEnableMicrophone, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary, onOpenGoals, onMacSetup,
 }: {
   prefs: JarvisPrefs;
   setPref: (k: keyof JarvisPrefs, v: string | boolean) => void;
   permissions: JarvisPermissionState;
   permissionBusy: boolean;
-  onEnablePermissions: () => void;
+  onEnableMicrophone: () => void;
   live: string;
   locOn: boolean;
   onLocation: () => void;
@@ -452,17 +470,14 @@ function OptionsPanel({
           <Row label="Voice" hint="private neural speech · free no-silence fallback">
             <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 text-[11px] text-cyan">Jarvis · private neural</span>
           </Row>
-          <Row
-            label="Voice & alerts"
-            hint={`microphone ${permissionText(permissions.microphone)} · notifications ${permissionText(permissions.notifications)}`}
-          >
+          <Row label="Live microphone" hint={`microphone ${permissionText(permissions.microphone)} · remembered by this browser`}>
             <button
               type="button"
-              disabled={permissionBusy || (permissions.microphone === "granted" && permissions.notifications === "granted")}
-              onClick={onEnablePermissions}
-              className={`rounded-lg px-3 py-1 text-[11px] transition disabled:opacity-70 ${permissions.microphone === "granted" && permissions.notifications === "granted" ? "bg-emerald-400/10 text-emerald-300 ring-1 ring-emerald-400/30" : "border border-cyan/30 text-cyan hover:bg-cyan/10"}`}
+              disabled={permissionBusy || permissions.microphone === "granted"}
+              onClick={onEnableMicrophone}
+              className={`rounded-lg px-3 py-1 text-[11px] transition disabled:opacity-70 ${permissions.microphone === "granted" ? "bg-emerald-400/10 text-emerald-300 ring-1 ring-emerald-400/30" : "border border-cyan/30 text-cyan hover:bg-cyan/10"}`}
             >
-              {permissionBusy ? "enabling…" : permissions.microphone === "granted" && permissions.notifications === "granted" ? "ready ✓" : "enable once"}
+              {permissionBusy ? "enabling…" : permissions.microphone === "granted" ? "ready ✓" : permissions.microphone === "denied" ? "browser settings" : "enable once"}
             </button>
           </Row>
           <Row label="Speaking voice" hint="Free streamed en-GB-RyanNeural">
@@ -488,7 +503,7 @@ function OptionsPanel({
               {live === "connecting" ? "…" : live !== "off" ? "stop" : "start"}
             </button>
           </Row>
-          <Row label="Live by default" hint="starts on load once this browser has microphone permission">
+          <Row label="Live by default" hint="asks once on first use, then starts automatically with this browser's saved permission">
             <button onClick={() => setPref("liveDefault", !prefs.liveDefault)} className={`h-5 w-9 rounded-full p-0.5 transition ${prefs.liveDefault ? "bg-cyan/60" : "bg-white/15"}`}>
               <span className={`block h-4 w-4 rounded-full bg-white transition-transform ${prefs.liveDefault ? "translate-x-4" : ""}`} />
             </button>
@@ -1057,7 +1072,11 @@ function Viewport({
 }) {
   const route = resolvePanelRoute(panel);
   return (
-    <div className="materialize frost-shell relative flex h-full flex-col overflow-hidden rounded-2xl">
+    <div
+      data-jarvis-panel-frame
+      data-panel-presentation={route.presentation}
+      className="@container materialize frost-shell relative flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden rounded-2xl"
+    >
       <div className="flex items-center justify-between border-b border-white/8 px-3 py-2">
         <span className="hud-label truncate !text-cyan-dim">{panel.title ?? panel.type}</span>
         <span className="flex shrink-0 gap-1">
@@ -1104,7 +1123,7 @@ function Viewport({
           />
         </div>
       ) : route.renderer === "image" ? (
-        <img src={panel.value} alt={panel.title ?? ""} className="min-h-0 flex-1 object-contain" />
+        <img src={panel.value} alt={panel.title ?? ""} className="h-full min-h-0 w-full max-w-full flex-1 object-contain" />
       ) : route.renderer === "code" ? (
         <pre className="scrollbar-thin min-h-0 flex-1 overflow-auto whitespace-pre p-4 font-mono text-xs leading-relaxed text-cyan/90">
           {panel.value}
@@ -1462,13 +1481,27 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
 
   const [input, setInput] = useState("");
   const [embeddedExpanded, setEmbeddedExpanded] = useState(false);
+  const [panelFull, setPanelFull] = useState(false);
+  // Start folded: the first Convex snapshot may be hours old. Only content
+  // created during this browser session is allowed to expand itself.
+  const [panelMin, setPanelMin] = useState(true);
+  const panelFullRef = useRef(false);
+  useEffect(() => {
+    panelFullRef.current = panelFull;
+  }, [panelFull]);
   const [openAttachmentAfterExpand, setOpenAttachmentAfterExpand] = useState(false);
   useEffect(() => {
     if (!embedded || !parentOrigin || window.parent === window) return;
     // The trusted host owns the iframe dimensions. Send only semantic state so
     // every host applies the same audited desktop/mobile sizing policy.
-    window.parent.postMessage({ jarvis: "layout", expanded: embeddedExpanded }, parentOrigin);
-  }, [embedded, embeddedExpanded, parentOrigin]);
+    const mode = resolveEmbedLayoutMode({
+      expanded: embeddedExpanded,
+      panelVisible: Boolean(panel && !panelMin),
+      panelFull,
+      presentation: panelRoute?.presentation,
+    });
+    window.parent.postMessage({ jarvis: "layout", mode, expanded: mode !== "compact" }, parentOrigin);
+  }, [embedded, embeddedExpanded, panel, panelFull, panelMin, panelRoute?.presentation, parentOrigin]);
   useEffect(() => {
     if (!embedded || !embeddedExpanded || !openAttachmentAfterExpand || guest) return;
     const frame = window.requestAnimationFrame(() => {
@@ -1584,9 +1617,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const [commandExpanded, setCommandExpanded] = useState(false);
   // Viewport minimize: keep talking and the panel folds into a pill; the orb
   // comes back. Fresh panel content pops it open again.
-  // Start folded: the first Convex snapshot may be hours old. Only content
-  // created during this browser session is allowed to expand itself.
-  const [panelMin, setPanelMin] = useState(true);
   const lastPanelAt = useRef(0);
   // Daniel closed it = it stays closed. If the exact same panel content comes
   // back within 30s of an explicit close (a live-session loop re-showing the
@@ -1664,12 +1694,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const captionRef = useRef<Caption>(null);
   const energyRef = useRef(0);
   const recRef = useRef<MediaRecorder | null>(null);
-  const liveMicRef = useRef<{
-    stream: MediaStream;
-    context: AudioContext;
-    analyser: AnalyserNode;
-    aecEnabled: boolean;
-  } | null>(null);
+  const liveMicRef = useRef<LiveMicrophoneResources | null>(null);
+  const liveMicOpeningRef = useRef<Promise<LiveMicrophoneResources> | null>(null);
   const liveSessionEpoch = useRef(0);
   const liveInterruptionEpoch = useRef(0);
   const voiceInterruptionPendingRef = useRef(false);
@@ -1737,12 +1763,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   } | null | undefined;
   const [wake, setWake] = useState(false);
   const embeddedEndRef = useRef<HTMLDivElement>(null);
-  const [panelFull, setPanelFull] = useState(false);
-  const panelFullRef = useRef(false);
-  useEffect(() => {
-    panelFullRef.current = panelFull;
-  }, [panelFull]);
-
   // The colour changes locally on the first keystroke/word, rather than
   // waiting for a streamed model reply or a Convex write. A deliberate manual
   // choice remains authoritative until Daniel returns it to automatic mode.
@@ -1766,6 +1786,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const [permissions, setPermissions] = useState<JarvisPermissionState>({ microphone: "prompt", notifications: "prompt" });
   const [permissionBusy, setPermissionBusy] = useState(false);
   const liveAutoStarted = useRef(false);
+  const liveAutoRetryCount = useRef(0);
+  const liveAutoRetryTimer = useRef<number | null>(null);
+  const liveManuallyStopped = useRef(false);
+  const resumeLiveWhenVisible = useRef(false);
+  const sttFailureStreak = useRef(0);
   useEffect(() => {
     // Settings left by the superseded speech engines made different browsers
     // silently select different Jarvis voices.
@@ -1828,9 +1853,21 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => {
     void refreshPermissions();
     const refresh = () => void refreshPermissions();
+    let disposed = false;
+    let stopWatching: () => void = () => undefined;
+    void watchMicrophonePermission((microphone) => {
+      setPermissions((current) => ({ ...current, microphone }));
+      if (microphone === "denied" && liveRef.current) endFreeVoiceSession();
+      if (microphone === "granted") liveAutoStarted.current = false;
+    }).then((stop) => {
+      if (disposed) stop();
+      else stopWatching = stop;
+    });
     window.addEventListener("focus", refresh);
     document.addEventListener("visibilitychange", refresh);
     return () => {
+      disposed = true;
+      stopWatching();
       window.removeEventListener("focus", refresh);
       document.removeEventListener("visibilitychange", refresh);
     };
@@ -3253,31 +3290,56 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     closePersistentLiveMic();
     window.setTimeout(rearmWake, 650);
   }
-  async function ensurePersistentLiveMic() {
+  async function ensurePersistentLiveMic(): Promise<LiveMicrophoneResources> {
     const current = liveMicRef.current;
     if (current && current.stream.getAudioTracks().some((track) => track.readyState === "live")) return current;
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        // AGC amplifies residual loudspeaker echo and turns it into false VAD.
-        autoGainControl: false,
-        channelCount: 1,
-      },
-    });
-    // Wake-word/live sessions can begin without a fresh click. Once capture
-    // is active browsers permit media playback, so prime the neural player
-    // here and keep the later response out of the autoplay dead end.
-    unlockSpeechPlayback();
-    const context = new AudioContext({ latencyHint: "interactive" });
-    const analyser = context.createAnalyser();
-    analyser.fftSize = 512;
-    analyser.smoothingTimeConstant = 0.35;
-    context.createMediaStreamSource(stream).connect(analyser);
-    const aecEnabled = stream.getAudioTracks().some((track) => track.getSettings().echoCancellation === true);
-    const resources = { stream, context, analyser, aecEnabled };
-    liveMicRef.current = resources;
-    return resources;
+    // Browsers may leave getUserMedia unresolved while their native permission
+    // prompt is open. Share that single request across every caller so an
+    // auto-start retry can never create or leak a second capture stream.
+    if (liveMicOpeningRef.current) return liveMicOpeningRef.current;
+    const opening = (async (): Promise<LiveMicrophoneResources> => {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          // AGC amplifies residual loudspeaker echo and turns it into false VAD.
+          autoGainControl: false,
+          channelCount: 1,
+        },
+      });
+      rememberMicrophoneGrant();
+      // Wake-word/live sessions can begin without a fresh click. Once capture
+      // is active browsers permit media playback, so prime the neural player
+      // here and keep the later response out of the autoplay dead end.
+      unlockSpeechPlayback();
+      const context = new AudioContext({ latencyHint: "interactive" });
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.35;
+      context.createMediaStreamSource(stream).connect(analyser);
+      const aecEnabled = stream.getAudioTracks().some((track) => track.getSettings().echoCancellation === true);
+      const resources = { stream, context, analyser, aecEnabled };
+      liveMicRef.current = resources;
+      stream.getAudioTracks().forEach((track) => {
+        track.addEventListener?.("ended", () => {
+          if (liveMicRef.current !== resources) return;
+          liveMicRef.current = null;
+          forgetMicrophoneGrant();
+          if (liveRef.current) {
+            endFreeVoiceSession();
+            showCaption({ who: "jarvis", text: "Microphone access ended. Re-enable it once to resume live voice." });
+          }
+          void refreshPermissions();
+        }, { once: true });
+      });
+      return resources;
+    })();
+    liveMicOpeningRef.current = opening;
+    try {
+      return await opening;
+    } finally {
+      if (liveMicOpeningRef.current === opening) liveMicOpeningRef.current = null;
+    }
   }
 
   // A live session keeps its AEC microphone open while Jarvis speaks. This
@@ -3371,6 +3433,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   async function toggleLive(forceStart = false, captureImmediately = true): Promise<boolean> {
     const sessionEpoch = ++liveSessionEpoch.current;
     if (!forceStart && (liveRef.current || live !== "off")) {
+      liveManuallyStopped.current = true;
+      resumeLiveWhenVisible.current = false;
       freeLoop.current = false;
       cancelFreeRearm();
       if (recRef.current?.state === "recording") recRef.current.stop();
@@ -3382,6 +3446,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       return false;
     }
     if (liveRef.current) return true;
+    liveManuallyStopped.current = false;
     unlockSpeechPlayback();
     // Stop the browser wake recognizer and open the persistent stream before a
     // network round-trip. Otherwise the wake mic visibly closes while Convex
@@ -3393,7 +3458,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     freeLoop.current = true;
     liveRef.current = true;
     setLive("connecting");
-    const microphone = ensurePersistentLiveMic().then(() => true, () => false);
+    let microphoneError: unknown = null;
+    const microphone = ensurePersistentLiveMic().then(
+      () => true,
+      (error) => {
+        microphoneError = error;
+        const name = String((error as DOMException | undefined)?.name ?? "");
+        if (/NotAllowed|Security/i.test(name)) forgetMicrophoneGrant();
+        return false;
+      },
+    );
     const ownership = guest
       ? Promise.resolve(true)
       : setLiveOn({ client: me.current, on: true });
@@ -3422,12 +3496,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       rearmWake();
       return false;
     }
-    let microphoneReady = false;
-    try {
-      microphoneReady = await withClientDeadline(microphone, 10_000, "microphone startup");
-    } catch {
-      void microphone.then((opened) => { if (opened && !liveRef.current) closePersistentLiveMic(); });
-    }
+    // Do not time out a browser-owned permission prompt. A timeout cannot
+    // cancel getUserMedia and previously caused auto-start to issue overlapping
+    // capture requests. Manual Stop still advances the session epoch and the
+    // late stream is closed by the guard below.
+    const microphoneReady = await microphone;
     if (sessionEpoch !== liveSessionEpoch.current || !liveRef.current) {
       if (microphoneReady && !liveRef.current) closePersistentLiveMic();
       return false;
@@ -3437,7 +3510,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       liveRef.current = false;
       setLive("off");
       releaseLive();
-      showCaption({ who: "jarvis", text: "I could not open this microphone. Check its browser permission." });
+      const errorName = String((microphoneError as DOMException | undefined)?.name ?? "");
+      showCaption({
+        who: "jarvis",
+        text: /NotAllowed|Security/i.test(errorName)
+          ? "Microphone access is blocked. Allow it once in this site's browser settings, then tap Enable live voice."
+          : "I could not open the microphone yet. Tap Enable live voice to retry.",
+      });
+      void refreshPermissions();
       rearmWake();
       return false;
     }
@@ -3468,9 +3548,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     const releaseHiddenLiveSession = () => {
       if (!document.hidden) {
         rearmWake();
+        if (resumeLiveWhenVisible.current && !liveManuallyStopped.current) {
+          resumeLiveWhenVisible.current = false;
+          liveAutoStarted.current = true;
+          void toggleLive(true).then((started) => {
+            if (!started) liveAutoStarted.current = false;
+          });
+        }
         return;
       }
       if (!liveRef.current) return;
+      resumeLiveWhenVisible.current = !liveManuallyStopped.current;
       endFreeVoiceSession();
     };
     document.addEventListener("visibilitychange", releaseHiddenLiveSession);
@@ -3479,37 +3567,60 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function enableDevicePermissions() {
+  async function enableMicrophone() {
     if (permissionBusy) return;
+    if (permissions.microphone === "denied") {
+      alert("Microphone access is blocked. Open this site's browser settings, set Microphone to Allow, then return here.");
+      return;
+    }
     setPermissionBusy(true);
-    // Both permission-gated calls begin in the same click. The browser owns
-    // the durable decision; Jarvis only records and displays the real state.
-    const [microphone, push] = await Promise.all([
-      primeMicrophone().catch(() => "prompt" as const),
-      subscribePush(saveSub).catch(() => "failed"),
-    ]).finally(() => setPermissionBusy(false));
-    await refreshPermissions().catch(() => undefined);
-    if (microphone === "granted") {
+    unlockSpeechPlayback();
+    liveAutoStarted.current = true;
+    const started = await toggleLive(true).catch(() => false).finally(() => setPermissionBusy(false));
+    const current = await readJarvisPermissions().catch(() => permissions);
+    setPermissions(current);
+    if (started) {
       setPref("liveDefault", true);
       liveAutoStarted.current = true;
-      if (!liveRef.current && live === "off") void toggleLive(true);
+    } else {
+      liveAutoStarted.current = false;
     }
-    if (microphone === "denied" || push === "denied") {
-      alert("One permission is blocked. Open this site's browser settings to re-enable microphone or notifications.");
-    } else if (push === "unsupported") {
-      alert("Voice is ready. For notifications on iPhone, add JARVIS to the Home Screen and open it there once.");
-    } else if (push === "failed" || push === "no-key") {
-      alert("Voice is ready, but browser alerts could not be configured yet.");
+    if (!started && current.microphone === "denied") {
+      alert("Microphone access is blocked. Open this site's browser settings and allow it once.");
     }
   }
 
   useEffect(() => {
-    if (embedded || !prefs.liveDefault || permissions.microphone !== "granted" || liveAutoStarted.current) return;
+    if (!shouldAutoStartLiveVoice({
+      embedded,
+      visible: !document.hidden,
+      liveDefault: prefs.liveDefault,
+      permission: permissions.microphone,
+      attempted: liveAutoStarted.current,
+      manuallyStopped: liveManuallyStopped.current,
+    })) return;
     liveAutoStarted.current = true;
-    const timer = window.setTimeout(() => {
-      if (!liveRef.current) void toggleLive(true);
-    }, 450);
-    return () => window.clearTimeout(timer);
+    const attempt = async () => {
+      if (liveRef.current || liveManuallyStopped.current || document.hidden) return;
+      const started = await toggleLive(true);
+      if (started) {
+        liveAutoRetryCount.current = 0;
+        return;
+      }
+      const current = await readJarvisPermissions();
+      setPermissions(current);
+      if (current.microphone === "denied" || current.microphone === "unsupported" || liveManuallyStopped.current) return;
+      liveAutoRetryCount.current += 1;
+      const delay = liveVoiceRetryDelay(liveAutoRetryCount.current);
+      if (delay == null) return;
+      liveAutoRetryTimer.current = window.setTimeout(() => void attempt(), delay);
+    };
+    const timer = window.setTimeout(() => void attempt(), 450);
+    return () => {
+      window.clearTimeout(timer);
+      if (liveAutoRetryTimer.current) window.clearTimeout(liveAutoRetryTimer.current);
+      liveAutoRetryTimer.current = null;
+    };
     // This is intentionally a once-per-load boot. Stopping live mode manually
     // must not cause the next render to reopen the microphone.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3624,6 +3735,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       ?? `voice-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const voiceTrace: VoiceTurnTrace = { turnId: voiceRequestId, startedAt: performance.now() };
     let outcome: VoiceCaptureOutcome = "failure";
+    let recoveryDelayMs = 900;
     let pendingSttController: AbortController | null = null;
     let browserPreview: BrowserSpeechPreview | null = null;
     let previousBrowserPreview: BrowserSpeechPreview | null = null;
@@ -3660,21 +3772,68 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         const speechSpanMs = evidence.voiceStartedAt
           ? Math.max(0, evidence.lastVoice - evidence.voiceStartedAt)
           : 0;
-        const response = await viewerFetchWithTimeout("/api/stt", {
-          method: "POST",
-          headers: {
-            "content-type": mime,
-            "x-jarvis-continuous-live": "1",
-            "x-jarvis-voice-frames": String(evidence.acceptedFrames),
-            "x-jarvis-speech-span-ms": String(Math.round(speechSpanMs)),
-            "x-jarvis-peak-voice-margin": String(Math.round(evidence.peakVoiceMargin * 10) / 10),
-          },
-          body: blob,
-          signal: controller.signal,
-        }, 30_000);
-        if (!response.ok) throw new Error(`STT failed (${response.status})`);
-        const payload = await response.json();
-        return String(payload?.text ?? "").trim();
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          let failure: SpeechRecognitionRequestError | null = null;
+          try {
+            const response = await viewerFetchWithTimeout("/api/stt", {
+              method: "POST",
+              headers: {
+                "content-type": mime,
+                "x-jarvis-continuous-live": "1",
+                "x-jarvis-stt-attempt": String(attempt + 1),
+                "x-jarvis-voice-frames": String(evidence.acceptedFrames),
+                "x-jarvis-speech-span-ms": String(Math.round(speechSpanMs)),
+                "x-jarvis-peak-voice-margin": String(Math.round(evidence.peakVoiceMargin * 10) / 10),
+              },
+              body: blob,
+              signal: controller.signal,
+            }, 30_000);
+            const transcript = await transcriptFromSttResponse(response);
+            sttFailureStreak.current = 0;
+            return transcript;
+          } catch (error) {
+            if (error instanceof DOMException && error.name === "AbortError") throw error;
+            failure = error instanceof SpeechRecognitionRequestError
+              ? error
+              : new SpeechRecognitionRequestError("Speech recognition connection failed", {
+                status: 0,
+                code: "stt_network_error",
+              });
+          }
+          if (!failure.retryable || attempt === 1) throw failure;
+
+          const browserRecovery = recoverLiveTranscriptFromBrowser({
+            previous: previousBrowserPreview,
+            preview: browserPreview,
+            sessionId: voiceRequestId,
+            currentVoiceAt: evidence.lastVoice,
+            sessionActive: freeLoop.current && sessionEpoch === liveSessionEpoch.current,
+          });
+          if (browserRecovery) {
+            voiceTrace.transcriptSource = "browser-final";
+            document.documentElement.dataset.jarvisAuthoritativeStt = "browser-recovery";
+            return browserRecovery;
+          }
+
+          recoveryDelayMs = speechServiceRetryDelay(sttFailureStreak.current + 1, failure.retryAfterMs);
+          showCaption({
+            who: "jarvis",
+            text: `I kept your recording. Speech recognition is reconnecting and will retry it in ${Math.ceil(recoveryDelayMs / 1_000)} seconds.`,
+          });
+          await new Promise<void>((resolve, reject) => {
+            const timer = window.setTimeout(resolve, recoveryDelayMs);
+            const abort = () => {
+              window.clearTimeout(timer);
+              reject(new DOMException("Voice session ended", "AbortError"));
+            };
+            if (controller.signal.aborted) abort();
+            else controller.signal.addEventListener("abort", abort, { once: true });
+          });
+        }
+        throw new SpeechRecognitionRequestError("Speech recognition retry exhausted", {
+          status: 502,
+          code: "stt_retry_exhausted",
+        });
       };
       const startLiveResearch = (currentPartial: string, previousPartial: string) => {
         if (researchStarted || !buildSpeculativeResearchQuery(currentPartial)) return;
@@ -3897,8 +4056,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         pendingSttController = controller;
         sttAbortRef.current = controller;
         text = await requestTranscript(blob, controller, { ...vad });
-        voiceTrace.transcriptSource = "server";
-        document.documentElement.dataset.jarvisAuthoritativeStt = "server";
+        if (!voiceTrace.transcriptSource) {
+          voiceTrace.transcriptSource = "server";
+          document.documentElement.dataset.jarvisAuthoritativeStt = "server";
+        }
         if (sttAbortRef.current === controller) sttAbortRef.current = null;
         if (pendingSttController === controller) pendingSttController = null;
       }
@@ -3910,6 +4071,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const cleanedText = text.trim();
       if (!isMeaningfulSpeechTranscript(cleanedText)) {
         outcome = "empty";
+        showCaption({ who: "you", text: "Listening…" });
         return;
       }
       if (shouldIgnoreHandsFreeTranscript(cleanedText, {
@@ -3959,8 +4121,32 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       outcome = aborted ? "empty" : "failure";
       if (!aborted) {
         document.documentElement.dataset.jarvisVoiceRecovery = String(error).slice(0, 160);
-        closePersistentLiveMic();
-        showCaption({ who: "jarvis", text: "I could not transcribe that. I’m reopening the microphone—please try again." });
+        if (error instanceof SpeechRecognitionRequestError) {
+          if (error.retryable) {
+            sttFailureStreak.current += 1;
+            recoveryDelayMs = speechServiceRetryDelay(sttFailureStreak.current, error.retryAfterMs);
+            document.documentElement.dataset.jarvisSttRecoveryDelayMs = String(recoveryDelayMs);
+            showCaption({
+              who: "jarvis",
+              text: `I could not recover that recording. Speech recognition will reconnect in ${Math.ceil(recoveryDelayMs / 1_000)} seconds; then I’m listening again.`,
+            });
+          } else {
+            outcome = "empty";
+            endFreeVoiceSession();
+            if (error.status === 401 || error.status === 403) {
+              showCaption({ who: "jarvis", text: "The voice session expired. I’m refreshing it now." });
+              window.setTimeout(() => window.location.reload(), 600);
+            } else {
+              showCaption({
+                who: "jarvis",
+                text: "Speech recognition is not configured right now. Live listening has stopped instead of retrying in a loop.",
+              });
+            }
+          }
+        } else {
+          closePersistentLiveMic();
+          showCaption({ who: "jarvis", text: "The microphone capture stopped unexpectedly. I’m reopening it now." });
+        }
       }
     } finally {
       // Also fences a delayed embedded ownership grant after cancellation.
@@ -3978,7 +4164,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         persistentLive: liveRef.current,
         loopRequested: freeLoop.current,
       });
-      if (action === "listen") scheduleFreeVoiceTurn(outcome === "speech" ? 90 : outcome === "failure" ? 900 : 180);
+      if (action === "listen") scheduleFreeVoiceTurn(outcome === "speech" ? 90 : outcome === "failure" ? recoveryDelayMs : 180);
       else if (action === "stop") endFreeVoiceSession();
     }
   }
@@ -4079,7 +4265,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         }
       } catch (error) {
         document.documentElement.dataset.jarvisSttFailure = String(error).slice(0, 160);
-        showCaption({ who: "jarvis", text: "Speech recognition failed. Tap the microphone to retry.", phase: "ready" });
+        showCaption({
+          who: "jarvis",
+          text: error instanceof SpeechRecognitionRequestError
+            ? error.retryable
+              ? "Speech recognition is temporarily unavailable. Tap the microphone to retry."
+              : error.status === 401 || error.status === 403
+                ? "The voice session expired. Refresh Jarvis once, then try again."
+                : "Speech recognition is not configured right now."
+            : "The recording could not be processed. Tap the microphone to retry.",
+          phase: "ready",
+        });
       }
     };
     recRef.current = rec;
@@ -4191,6 +4387,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const overlayUp = !!panel && !panelMin;
   const fullBleed = overlayUp && (panelFull || !panelRoute?.keepOrbVisible);
   const compactAside = overlayUp && !fullBleed && panel!.type !== "video";
+  const embeddedWorkspacePanel = embedded
+    && overlayUp
+    && (panelFull || panelRoute?.presentation !== "compact");
 
   if (embedded && !embeddedExpanded) {
     return (
@@ -4341,6 +4540,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           type="button"
           onClick={() => {
             if (liveRef.current) void toggleLive();
+            setPanelFull(false);
             hideEmbedded();
           }}
           aria-label="Close Jarvis"
@@ -4350,7 +4550,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         </button>
         <button
           type="button"
-          onClick={() => setEmbeddedExpanded(false)}
+          onClick={() => {
+            setPanelFull(false);
+            setEmbeddedExpanded(false);
+          }}
           aria-label="Collapse Jarvis"
           title="Collapse to the quick launcher"
           className="absolute right-14 top-3 z-[70] grid h-9 w-9 place-items-center rounded-full bg-black/35 text-sm text-white/60 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan"
@@ -4367,14 +4570,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             connect tools
           </button>
         )}
-        <div className="relative min-h-0 flex-[1.15]">
+        <div className={`relative min-h-0 ${embeddedWorkspacePanel ? "flex-1" : "flex-[1.15]"}`}>
           {panel && !panelMin ? (
-            <div className="absolute inset-2 z-30 pt-8">
+            <div className={`absolute z-30 ${embeddedWorkspacePanel ? "inset-1 pt-10 sm:inset-2" : "inset-2 pt-8"}`}>
               <Viewport
                 panel={panel}
                 onClose={closeStage}
-                onMinimize={() => setPanelMin(true)}
-                full={false}
+                onMinimize={() => {
+                  setPanelFull(false);
+                  setPanelMin(true);
+                }}
+                full={panelFull}
                 onToggleFull={() => setPanelFull((value) => !value)}
               />
             </div>
@@ -4416,7 +4622,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           <span className="sr-only" aria-live="polite">Jarvis is {status}</span>
         </div>
 
-        <div className="relative z-50 flex min-h-0 flex-1 flex-col border-t border-white/10 bg-black/35 backdrop-blur-md">
+        {!embeddedWorkspacePanel && <div className="relative z-50 flex min-h-0 flex-1 flex-col border-t border-white/10 bg-black/35 backdrop-blur-md">
           <div className="scrollbar-thin min-h-0 flex-1 space-y-2 overflow-y-auto px-3 py-2.5">
             {messages.length === 0 && (
               <p className="pt-3 text-center text-xs text-slate">Ask Jarvis anything.</p>
@@ -4520,7 +4726,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             </button>
             </div>
           </div>
-        </div>
+        </div>}
       </div>
     );
   }
@@ -4610,7 +4816,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           setPref={setPref}
           permissions={permissions}
           permissionBusy={permissionBusy}
-          onEnablePermissions={() => void enableDevicePermissions()}
+          onEnableMicrophone={() => void enableMicrophone()}
           live={live}
           locOn={locOn}
           onLocation={() => void captureLocation(true)}
@@ -4639,10 +4845,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         />
       )}
 
-      <div className={`relative mx-auto flex w-full max-w-[1720px] flex-1 flex-col overflow-clip p-4 pt-2 ${chatMode === "bar" ? "pb-24" : ""}`}>
+      <div className={`relative mx-auto flex w-full flex-1 flex-col overflow-clip p-3 pt-2 sm:p-4 ${chatMode === "bar" ? "pb-24" : ""}`}>
         {/* the stage is ALWAYS full-bleed; the chat floats over it and slides
             away on pure transforms — compositor-only, 120fps-smooth */}
-        <div ref={stageRef} className={`brackets relative min-h-0 flex-1 transition-[margin] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${chatMode === "full" ? "md:mr-[416px]" : ""}`}>
+        <div ref={stageRef} className={`brackets relative min-h-0 flex-1 transition-[margin] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${chatMode === "full" ? "xl:mr-[416px]" : ""}`}>
           <span className="bk" />
           {/* orbit bubbles — demoted panels bobbing beside the orb */}
           {bubbles.length > 0 && (!panel || panelMin) && (
@@ -4682,8 +4888,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             onSelectedJobChange={setWorkDetailJobId}
           />
           {panel && panel.type !== "video" && !panelMin && !panelFull ? (
-            <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex items-center p-1 ${stagePanelSize !== "h-full w-full" ? "justify-center md:justify-start md:pl-10 md:pr-[36%] lg:pl-16" : "justify-center"}`}>
-              <div className={`will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${stagePanelSize}`}>
+            <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex min-h-0 min-w-0 items-center p-1 ${panelRoute?.presentation === "compact" ? "justify-center xl:justify-start xl:pl-10 xl:pr-[28%]" : "justify-center"}`}>
+              <div className={`min-h-0 min-w-0 max-h-full max-w-full will-change-transform transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${panelRoute?.presentation === "compact" ? "xl:max-w-[72%]" : ""} ${stagePanelSize}`}>
                 <Viewport
                   panel={panel}
                   onClose={closeStage}
@@ -4719,6 +4925,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               reduceMotion={prefs.reduceMotion}
             />
           </div>
+          {!overlayUp && live === "off" && prefs.liveDefault && permissions.microphone !== "granted" && permissions.microphone !== "unsupported" && (
+            <button
+              type="button"
+              data-jarvis-enable-live-voice
+              onClick={() => void enableMicrophone()}
+              disabled={permissionBusy}
+              className="glass absolute bottom-[16%] left-1/2 z-30 -translate-x-1/2 rounded-full border-cyan/30 px-4 py-2 text-xs text-cyan shadow-[0_0_28px_rgba(103,232,249,.12)] transition hover:border-cyan/60 hover:bg-cyan/10 disabled:opacity-60"
+            >
+              {permissionBusy ? "enabling live voice…" : permissions.microphone === "denied" ? "allow microphone in site settings" : "enable live voice once"}
+            </button>
+          )}
           {speaking && !fullBleed && (
             <button
               type="button"
@@ -4749,10 +4966,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             above it, keyboard pushes it up naturally); on desktop it floats over
             the stage's right edge. Both slide on pure transforms. */}
         <div
-          className={`absolute inset-x-1 bottom-1 top-[34dvh] z-30 will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] md:inset-x-auto md:bottom-2 md:right-4 md:top-2 md:w-[min(400px,45vw)] ${
+          className={`absolute inset-x-1 bottom-1 top-[34dvh] z-30 will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] xl:inset-x-auto xl:bottom-2 xl:right-4 xl:top-2 xl:w-[min(400px,45vw)] ${overlayUp ? "max-xl:pointer-events-none max-xl:translate-y-[calc(100%+24px)] max-xl:opacity-0" : ""} ${
             chatMode === "full"
               ? "translate-x-0 translate-y-0 opacity-100"
-              : "pointer-events-none translate-y-[calc(100%+24px)] opacity-0 md:translate-x-[calc(100%+32px)] md:translate-y-0"
+              : "pointer-events-none translate-y-[calc(100%+24px)] opacity-0 xl:translate-x-[calc(100%+32px)] xl:translate-y-0"
           }`}
         >
         <div className="glass flex h-full w-full flex-col overflow-hidden rounded-2xl">
@@ -5159,7 +5376,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
 
       {/* full-screen viewport — keeps a floating composer so Daniel can still talk */}
       {panel && panelFull && (
-        <div className="fixed inset-y-0 left-0 right-0 z-50 flex flex-col bg-black/80 p-3 backdrop-blur-sm md:right-[236px] md:p-6 md:pr-3">
+        <div className="fixed inset-0 z-50 flex min-h-0 min-w-0 flex-col bg-black/80 p-2 backdrop-blur-sm sm:p-4 lg:p-6">
           <div className="min-h-0 flex-1">
             <Viewport
               panel={panel}

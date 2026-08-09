@@ -58,7 +58,7 @@
   f.title = "JARVIS";
   f.allow = "microphone; autoplay; clipboard-write; display-capture";
   f.style.cssText =
-    "position:fixed;bottom:66px;right:8px;width:min(320px,calc(100vw - 16px));height:min(190px,calc(100vh - 82px));border:0;" +
+    "position:fixed;bottom:66px;right:8px;width:min(320px,calc(100vw - 16px));height:min(190px,calc(100dvh - 82px));max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px);border:0;" +
     "border-radius:28px;z-index:2147483000;background:#05070d;color-scheme:dark;" +
     "box-shadow:none;transition:opacity .2s ease,transform .28s cubic-bezier(.22,1,.36,1),width .24s cubic-bezier(.22,1,.36,1),height .24s cubic-bezier(.22,1,.36,1);" +
     "opacity:0;transform:translateY(14px);pointer-events:none;";
@@ -66,13 +66,21 @@
   // The trusted Jarvis frame may request only a semantic layout state. The
   // host owns the actual dimensions so postMessage can never inject arbitrary
   // CSS or restore the large invisible click-blocking rectangle when collapsed.
-  function setFrameLayout(expanded) {
-    f.style.width = expanded
-      ? "min(460px,calc(100vw - 16px))"
-      : "min(320px,calc(100vw - 16px))";
-    f.style.height = expanded
-      ? "min(520px,calc(100vh - 82px))"
-      : "min(190px,calc(100vh - 82px))";
+  function setFrameLayout(mode) {
+    var layout = mode === "workspace" ? "workspace" : mode === "chat" || mode === true ? "chat" : "compact";
+    f.dataset.jarvisLayout = layout;
+    f.style.right = layout === "workspace" ? "8px" : "8px";
+    f.style.bottom = layout === "workspace" ? "8px" : "66px";
+    f.style.width = layout === "workspace"
+      ? "min(1180px,calc(100vw - 16px))"
+      : layout === "chat"
+        ? "min(460px,calc(100vw - 16px))"
+        : "min(320px,calc(100vw - 16px))";
+    f.style.height = layout === "workspace"
+      ? "calc(100dvh - 16px)"
+      : layout === "chat"
+        ? "min(620px,calc(100dvh - 82px))"
+        : "min(190px,calc(100dvh - 82px))";
   }
 
   // One host-owned control in every app. Individual products no longer need
@@ -87,7 +95,7 @@
     "box-shadow:0 14px 48px rgba(0,0,0,.42),inset 0 1px rgba(255,255,255,.06);backdrop-filter:blur(18px);";
   var jarvisButton = document.createElement("button");
   jarvisButton.type = "button";
-  jarvisButton.setAttribute("aria-label", "Open Jarvis; wake word is always listening");
+  jarvisButton.setAttribute("aria-label", "Open Jarvis; tap once if wake listening needs microphone permission");
   jarvisButton.style.cssText =
     "all:unset;box-sizing:border-box;position:relative;overflow:hidden;display:flex;align-items:center;gap:8px;height:38px;padding:0 12px;border-radius:13px;" +
     "cursor:pointer;color:#dff9ff;background:rgba(64,208,255,.08);font:700 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;" +
@@ -142,7 +150,14 @@
     };
     var activeColor = phaseColors[framePhase] || "#67e8f9";
     jarvisButton.setAttribute("aria-pressed", visible ? "true" : "false");
-    jarvisButton.setAttribute("aria-label", active ? "Jarvis is " + framePhase : "Open Jarvis; wake word is always listening");
+    jarvisButton.setAttribute(
+      "aria-label",
+      active
+        ? "Jarvis is " + framePhase
+        : awake
+          ? "Open Jarvis; wake listening is active"
+          : "Open Jarvis; tap once to enable wake listening",
+    );
     jarvisButton.title = active
       ? "Jarvis is " + framePhase
       : awake
@@ -873,8 +888,11 @@
         ? 0
         : Math.max(0.04, Math.min(0.96, Number.isFinite(nextProgress) ? nextProgress : 0.12));
       paintUniversalControls();
-    } else if (data.jarvis === "layout" && typeof data.expanded === "boolean") {
-      setFrameLayout(data.expanded);
+    } else if (data.jarvis === "layout") {
+      var requestedLayout = data.mode === "workspace" || data.mode === "chat" || data.mode === "compact"
+        ? data.mode
+        : data.expanded === true ? "chat" : "compact";
+      setFrameLayout(requestedLayout);
     } else if (data.jarvis === "wake" || data.jarvis === "notify") {
       show();
     } else if (data.jarvis === "hide") {

@@ -302,9 +302,9 @@ export default function TripView({ value }: { value: string }) {
 
   const glass = "rounded-xl border border-white/10 bg-white/[0.045] backdrop-blur-xl";
   return (
-    <div className="flex min-h-0 flex-1 flex-col md:flex-row">
+    <div className="flex min-h-0 flex-1 flex-col @min-[760px]:flex-row">
       {/* the map */}
-      <div className="relative h-[30dvh] shrink-0 border-b border-white/5 md:h-auto md:w-[44%] md:border-b-0 md:border-r">
+      <div className="relative h-[30dvh] shrink-0 border-b border-white/5 @min-[760px]:h-auto @min-[760px]:w-[44%] @min-[760px]:border-b-0 @min-[760px]:border-r">
         <MapView center={doc.center ?? { lat: 51.5074, lng: -0.1278 }} markers={markers} links={links} selected={selected} onSelect={onMapSelect} />
         <div className="pointer-events-none absolute left-3 top-3 rounded-lg bg-black/50 px-2 py-1 backdrop-blur">
           <div className="text-sm font-semibold text-ice">{doc.destination}</div>

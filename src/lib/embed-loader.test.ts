@@ -271,7 +271,7 @@ describe("Project Hub Jarvis loader", () => {
     expect(controls).toBeDefined();
     expect(controls?.attributes["data-jarvis-edit-ui"]).toBe("controls");
     expect(controls?.children).toHaveLength(2);
-    expect(controls?.children[0].attributes["aria-label"]).toContain("always listening");
+    expect(controls?.children[0].attributes["aria-label"]).toContain("wake listening");
     expect(controls?.children[1].attributes["aria-label"]).toContain("Select an element");
     expect(controls?.children[1].onclick).toBeTypeOf("function");
 
@@ -285,7 +285,7 @@ describe("Project Hub Jarvis loader", () => {
     const receive = harness.listeners.get("message")?.[0];
 
     expect(harness.frame.style.cssText).toContain("width:min(320px,calc(100vw - 16px))");
-    expect(harness.frame.style.cssText).toContain("height:min(190px,calc(100vh - 82px))");
+    expect(harness.frame.style.cssText).toContain("height:min(190px,calc(100dvh - 82px))");
 
     receive?.({
       origin: "https://hostile.example",
@@ -297,10 +297,19 @@ describe("Project Hub Jarvis loader", () => {
     receive?.({
       origin: JARVIS_ORIGIN,
       source: harness.frameWindow,
-      data: { jarvis: "layout", expanded: true, width: "100vw" },
+      data: { jarvis: "layout", mode: "chat", width: "100vw" },
     });
     expect(harness.frame.style.width).toBe("min(460px,calc(100vw - 16px))");
-    expect(harness.frame.style.height).toBe("min(520px,calc(100vh - 82px))");
+    expect(harness.frame.style.height).toBe("min(620px,calc(100dvh - 82px))");
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "layout", mode: "workspace", width: "100vw", height: "100vh" },
+    });
+    expect(harness.frame.style.width).toBe("min(1180px,calc(100vw - 16px))");
+    expect(harness.frame.style.height).toBe("calc(100dvh - 16px)");
+    expect(harness.frame.style.bottom).toBe("8px");
 
     receive?.({
       origin: JARVIS_ORIGIN,
@@ -308,7 +317,8 @@ describe("Project Hub Jarvis loader", () => {
       data: { jarvis: "layout", expanded: false },
     });
     expect(harness.frame.style.width).toBe("min(320px,calc(100vw - 16px))");
-    expect(harness.frame.style.height).toBe("min(190px,calc(100vh - 82px))");
+    expect(harness.frame.style.height).toBe("min(190px,calc(100dvh - 82px))");
+    expect(harness.frame.style.bottom).toBe("66px");
   });
 
   it("shows bounded realtime work stages in the collapsed host control", () => {
@@ -457,6 +467,8 @@ describe("Project Hub Jarvis loader", () => {
   it("uses the Hub button gesture to recover from an initial permission denial", async () => {
     const harness = createLoader({ denyFirstRecognition: true });
     expect(harness.window.JARVIS.wake.needsPermission).toBe(true);
+    const controls = harness.createdElements.find((element) => "data-jarvis-universal-controls" in element.attributes);
+    expect(controls?.children[0].attributes["aria-label"]).toContain("tap once");
 
     harness.navigator.userActivation.isActive = true;
     harness.window.JARVIS.show();

@@ -41,6 +41,34 @@ export function isStableBrowserSpeechRevision(
 }
 
 /**
+ * If both server recognizers are temporarily unavailable, a fenced browser
+ * preview may rescue the already-recorded utterance instead of asking the user
+ * to repeat it. This recovery threshold is intentionally stricter for an
+ * interim result: it must have survived an exact longer revision.
+ */
+export function recoverLiveTranscriptFromBrowser(args: {
+  previous: BrowserSpeechPreview | null;
+  preview: BrowserSpeechPreview | null;
+  sessionId: string;
+  currentVoiceAt: number;
+  sessionActive: boolean;
+}): string {
+  const preview = args.preview;
+  const text = normalized(preview?.text ?? "");
+  if (
+    !args.sessionActive
+    || !preview
+    || preview.sessionId !== args.sessionId
+    || preview.observedVoiceAt !== args.currentVoiceAt
+    || !text
+  ) return "";
+  const usableFinal = preview.isFinal
+    && Number.isFinite(preview.confidence)
+    && preview.confidence >= 0.55;
+  return usableFinal || isStableBrowserSpeechRevision(args.previous, preview) ? text : "";
+}
+
+/**
  * Server STT is the default. A browser transcript can replace the one allowed
  * server request only when it is final, strongly confident, tied to this exact
  * live session, and no VAD-accepted speech occurred after that final result.
