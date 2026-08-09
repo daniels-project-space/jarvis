@@ -2,6 +2,8 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 
 const SESSION_LIFETIME_MS = 365 * 24 * 60 * 60 * 1000;
+const MAX_PAIRING_LIFETIME_MS = 15 * 60 * 1000;
+const MAX_EMBED_SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const VIEWER_LIFETIME_MS = 6 * 60 * 60 * 1000;
 const VIEWER_ISSUER = "https://jarvis-orcin-six.vercel.app";
 const VIEWER_SUBJECT = "daniel-owner";
@@ -122,7 +124,6 @@ export function validGuestId(value: string | undefined): value is string {
 }
 
 export async function conversationIdentity(ctx: any, credentials: { guestId?: string; authTokenHash?: string; workerToken?: string }) {
-  if (validGuestId(credentials.guestId)) return { kind: "guest" as const, guestId: credentials.guestId };
   await requireActor(ctx, credentials);
   return { kind: "owner" as const };
 }
@@ -130,10 +131,6 @@ export async function conversationIdentity(ctx: any, credentials: { guestId?: st
 export async function conversationViewerIdentity(ctx: any, credentials: { authTokenHash?: string; workerToken?: string }) {
   const identity = await ctx.auth?.getUserIdentity?.();
   if (identity?.issuer === VIEWER_ISSUER && identity?.subject === VIEWER_SUBJECT) return { kind: "owner" as const };
-  if (identity?.issuer === VIEWER_ISSUER && typeof identity?.subject === "string" && identity.subject.startsWith(GUEST_SUBJECT_PREFIX)) {
-    const guestId = identity.subject.slice(GUEST_SUBJECT_PREFIX.length);
-    if (validGuestId(guestId)) return { kind: "guest" as const, guestId };
-  }
   if (await isAdminSession(ctx, credentials.authTokenHash)) return { kind: "owner" as const };
   const worker = process.env.JARVIS_WORKER_TOKEN;
   if (worker && constantTimeEqual(credentials.workerToken, worker)) return { kind: "owner" as const };
@@ -209,6 +206,144 @@ export const createOpenSession = mutation({
       });
     }
     return { expiresAt };
+  },
+});
+
+export const createOwnerPairingTicket = mutation({
+  args: {
+    tokenHash: v.string(),
+    expiresAt: v.number(),
+    workerToken: v.string(),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const now = Date.now();
+    if (!/^[a-f0-9]{64}$/i.test(args.tokenHash)) throw new Error("Invalid pairing ticket");
+    if (args.expiresAt <= now || args.expiresAt > now + MAX_PAIRING_LIFETIME_MS) {
+      throw new Error("Invalid pairing expiry");
+    }
+    const tokenHash = args.tokenHash.toLowerCase();
+    const existing = await ctx.db
+      .query("ownerPairingTickets")
+      .withIndex("by_token", (q: any) => q.eq("tokenHash", tokenHash))
+      .first();
+    if (existing) throw new Error("Pairing ticket already exists");
+    const expired = await ctx.db
+      .query("ownerPairingTickets")
+      .withIndex("by_expiry", (q: any) => q.lt("expiresAt", now))
+      .take(100);
+    for (const ticket of expired) await ctx.db.delete(ticket._id);
+    await ctx.db.insert("ownerPairingTickets", { tokenHash, createdAt: now, expiresAt: args.expiresAt });
+    return { expiresAt: args.expiresAt };
+  },
+});
+
+export const consumeOwnerPairingTicket = mutation({
+  args: {
+    tokenHash: v.string(),
+    ownerTokenHash: v.string(),
+    userAgent: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    if (!/^[a-f0-9]{64}$/i.test(args.tokenHash) || !/^[a-f0-9]{64}$/i.test(args.ownerTokenHash)) {
+      return false;
+    }
+    const now = Date.now();
+    const ticket = await ctx.db
+      .query("ownerPairingTickets")
+      .withIndex("by_token", (q: any) => q.eq("tokenHash", args.tokenHash.toLowerCase()))
+      .first();
+    if (!ticket || ticket.consumedAt || ticket.expiresAt <= now) return false;
+
+    // Convex mutations are serializable, so consuming the ticket and creating
+    // the owner session is one atomic transition. A replay cannot enroll a
+    // second browser even if two requests arrive together.
+    await ctx.db.patch(ticket._id, { consumedAt: now });
+    const ownerTokenHash = args.ownerTokenHash.toLowerCase();
+    const existingSession = await ctx.db
+      .query("adminSessions")
+      .withIndex("by_token", (q: any) => q.eq("tokenHash", ownerTokenHash))
+      .first();
+    const expiresAt = now + SESSION_LIFETIME_MS;
+    if (existingSession) {
+      await ctx.db.patch(existingSession._id, {
+        userAgent: args.userAgent?.slice(0, 240),
+        enrolledAt: now,
+        expiresAt,
+      });
+    } else {
+      await ctx.db.insert("adminSessions", {
+        tokenHash: ownerTokenHash,
+        userAgent: args.userAgent?.slice(0, 240),
+        createdAt: now,
+        enrolledAt: now,
+        expiresAt,
+      });
+    }
+    return { expiresAt };
+  },
+});
+
+export const createEmbedControlSession = mutation({
+  args: {
+    authTokenHash: v.string(),
+    tokenHash: v.string(),
+    hostOrigin: v.string(),
+    expiresAt: v.number(),
+  },
+  handler: async (ctx, args) => {
+    await requireAdmin(ctx, args.authTokenHash);
+    const now = Date.now();
+    if (!/^[a-f0-9]{64}$/i.test(args.tokenHash)) throw new Error("Invalid embed capability");
+    if (args.expiresAt <= now || args.expiresAt > now + MAX_EMBED_SESSION_LIFETIME_MS) {
+      throw new Error("Invalid embed expiry");
+    }
+    let hostOrigin: string;
+    try {
+      const parsed = new URL(args.hostOrigin);
+      if (parsed.origin !== args.hostOrigin || parsed.protocol !== "https:") throw new Error();
+      hostOrigin = parsed.origin;
+    } catch {
+      throw new Error("Invalid embed origin");
+    }
+    const tokenHash = args.tokenHash.toLowerCase();
+    const existing = await ctx.db
+      .query("embedControlSessions")
+      .withIndex("by_token", (q: any) => q.eq("tokenHash", tokenHash))
+      .first();
+    if (existing) throw new Error("Embed capability already exists");
+    const expired = await ctx.db
+      .query("embedControlSessions")
+      .withIndex("by_expiry", (q: any) => q.lt("expiresAt", now))
+      .take(100);
+    for (const session of expired) await ctx.db.delete(session._id);
+    await ctx.db.insert("embedControlSessions", {
+      tokenHash,
+      adminTokenHash: args.authTokenHash.toLowerCase(),
+      hostOrigin,
+      createdAt: now,
+      expiresAt: args.expiresAt,
+    });
+    return { expiresAt: args.expiresAt };
+  },
+});
+
+export const embedControlSessionStatus = query({
+  args: { tokenHash: v.string(), hostOrigin: v.string() },
+  handler: async (ctx, args) => {
+    if (!/^[a-f0-9]{64}$/i.test(args.tokenHash)) return { valid: false };
+    const session = await ctx.db
+      .query("embedControlSessions")
+      .withIndex("by_token", (q: any) => q.eq("tokenHash", args.tokenHash.toLowerCase()))
+      .first();
+    if (
+      !session
+      || session.revokedAt
+      || session.expiresAt <= Date.now()
+      || session.hostOrigin !== args.hostOrigin
+      || !(await isAdminSession(ctx, session.adminTokenHash))
+    ) return { valid: false };
+    return { valid: true, authTokenHash: session.adminTokenHash, expiresAt: session.expiresAt };
   },
 });
 

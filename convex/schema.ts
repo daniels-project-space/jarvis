@@ -95,6 +95,21 @@ export default defineSchema({
     .index("by_createdAt", ["createdAt"])
     .searchIndex("search_body", { searchField: "body", filterFields: ["kind"] }),
 
+  // Small, superseding facts needed on the very next turn (for example the
+  // city Daniel is currently in). Raw chat stays private in chatMessages;
+  // this table stores only a bounded value and its provenance receipt.
+  currentState: defineTable({
+    key: v.string(),
+    value: v.string(),
+    confidence: v.number(),
+    sourceMessageId: v.string(),
+    observedAt: v.number(),
+    expiresAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_key", ["key"])
+    .index("by_expiry", ["expiresAt"]),
+
   // Storage-only archive from the pre-streaming chat transport (6 rows on the
   // canonical deployment at retirement). No runtime function reads/writes it;
   // chatMessages is the sole conversation source. Keep the archive until
@@ -1307,6 +1322,33 @@ export default defineSchema({
     expiresAt: v.number(),
   })
     .index("by_token", ["tokenHash"])
+    .index("by_expiry", ["expiresAt"]),
+
+  // One-time owner pairing capabilities. Only a trusted worker can create a
+  // ticket; possession of the high-entropy plaintext ticket can consume it
+  // exactly once to enroll Daniel's browser. The plaintext is never stored.
+  ownerPairingTickets: defineTable({
+    tokenHash: v.string(),
+    createdAt: v.number(),
+    expiresAt: v.number(),
+    consumedAt: v.optional(v.number()),
+  })
+    .index("by_token", ["tokenHash"])
+    .index("by_expiry", ["expiresAt"]),
+
+  // Revocable owner-control capabilities for an explicitly trusted embedded
+  // host. They avoid third-party cookies without ever promoting the read-only
+  // Convex viewer JWT into a control credential.
+  embedControlSessions: defineTable({
+    tokenHash: v.string(),
+    adminTokenHash: v.string(),
+    hostOrigin: v.string(),
+    createdAt: v.number(),
+    expiresAt: v.number(),
+    revokedAt: v.optional(v.number()),
+  })
+    .index("by_token", ["tokenHash"])
+    .index("by_admin", ["adminTokenHash"])
     .index("by_expiry", ["expiresAt"]),
 
   // Short-lived, read-only capabilities issued only after an HttpOnly admin

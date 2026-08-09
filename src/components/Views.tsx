@@ -287,7 +287,7 @@ export function Briefing2View({ value }: { value: string }) {
               <span className="text-4xl">{w.weather.icon}</span>
               <div>
                 <div className="text-2xl font-semibold text-ice">{w.weather.temp}°</div>
-                <div className="text-[10px] text-slate">{w.weather.desc}</div>
+                <div className="text-[10px] text-slate">{w.weather.location ? `${w.weather.location} · ` : ""}{w.weather.desc}</div>
               </div>
               <div className="ml-2 hidden gap-1 sm:flex">
                 {(w.weather.hours ?? []).map((h: any, i: number) => (
@@ -728,11 +728,23 @@ type Place = {
   hoursToday?: string; type?: string; lat: number; lng: number; dist: number | null; mapsUri: string;
 };
 
-// A dark interactive map of Daniel's area with the found places pinned, plus a
-// scrollable list of place cards — hours, rating, distance, and one-tap
-// walk/drive/transit directions from his location.
+type PlacesWidget = {
+  query: string;
+  preferences?: string;
+  locationLabel?: string;
+  center: { lat: number; lng: number; label?: string; detail?: string; source?: "saved_location" | "google_places" };
+  base?: { lat?: number; lng?: number; label: string; address?: string; source?: string };
+  route?: {
+    label?: string; note?: string; mode?: string; coordinates?: [number, number][];
+    googleMapsUrl?: string; order?: string[];
+  };
+  items: Place[];
+};
+
+// One panel contract powers both live "near me" results and explicit city maps.
+// Centre, booking base and route geometry are labelled independently.
 export function PlacesView({ value }: { value: string }) {
-  let w: { query: string; center: { lat: number; lng: number }; items: Place[] } | null = null;
+  let w: PlacesWidget | null = null;
   try {
     w = JSON.parse(value);
   } catch {
@@ -741,41 +753,81 @@ export function PlacesView({ value }: { value: string }) {
   const mapEl = useRef<HTMLDivElement>(null);
   const mapObj = useRef<any>(null);
   const [sel, setSel] = useState(0);
+  const [mapError, setMapError] = useState("");
   const items = w?.items ?? [];
   const center = w?.center;
+  const base = w?.base;
+  const route = w?.route;
 
   useEffect(() => {
-    if (!mapEl.current || !center || mapObj.current) return;
+    if (!mapEl.current || !center || !Number.isFinite(center.lat) || !Number.isFinite(center.lng) || mapObj.current) return;
     let cancelled = false;
     (async () => {
-      const maplibregl = (await import("maplibre-gl")).default;
-      await import("maplibre-gl/dist/maplibre-gl.css");
-      if (cancelled || !mapEl.current) return;
-      const map = new maplibregl.Map({
-        container: mapEl.current,
-        style: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
-        center: [center.lng, center.lat],
-        zoom: 13,
-        attributionControl: false,
-      });
-      mapObj.current = map;
-      map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
-      map.on("load", () => {
-        // Daniel's location — pulsing cyan dot
-        const you = document.createElement("div");
-        you.style.cssText = "width:16px;height:16px;border-radius:9999px;background:#00ff88;box-shadow:0 0 0 6px rgba(0,255,136,0.25),0 0 14px rgba(0,255,136,0.8);";
-        new maplibregl.Marker({ element: you }).setLngLat([center.lng, center.lat]).addTo(map);
-        const bounds = new maplibregl.LngLatBounds([center.lng, center.lat], [center.lng, center.lat]);
-        items.forEach((p, i) => {
-          const el = document.createElement("div");
-          el.style.cssText = "display:grid;place-items:center;width:26px;height:26px;border-radius:9999px 9999px 9999px 2px;transform:rotate(45deg);background:#0b1220;border:2px solid #00ff88;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,0.6);";
-          el.innerHTML = `<span style="transform:rotate(-45deg);color:#00ff88;font:600 11px system-ui;">${i + 1}</span>`;
-          el.onclick = () => setSel(i);
-          new maplibregl.Marker({ element: el, anchor: "bottom" }).setLngLat([p.lng, p.lat]).addTo(map);
-          bounds.extend([p.lng, p.lat]);
+      try {
+        const maplibregl = (await import("maplibre-gl")).default;
+        await import("maplibre-gl/dist/maplibre-gl.css");
+        if (cancelled || !mapEl.current) return;
+        const map = new maplibregl.Map({
+          container: mapEl.current,
+          style: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+          center: [center.lng, center.lat],
+          zoom: 13,
+          attributionControl: { compact: true },
         });
-        map.fitBounds(bounds, { padding: 70, maxZoom: 15, duration: 600 });
-      });
+        mapObj.current = map;
+        map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
+        map.on("load", () => {
+          if (cancelled) return;
+          const routeCoordinates = (route?.coordinates ?? []).filter((point) =>
+            Array.isArray(point) && point.length === 2 && Number.isFinite(point[0]) && Number.isFinite(point[1]),
+          );
+          if (routeCoordinates.length > 1) {
+            map.addSource("jarvis-travel-order", {
+              type: "geojson",
+              data: { type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: routeCoordinates } },
+            });
+            map.addLayer({
+              id: "jarvis-travel-order", type: "line", source: "jarvis-travel-order",
+              layout: { "line-cap": "round", "line-join": "round" },
+              paint: { "line-color": "#fbbf24", "line-width": 3, "line-opacity": 0.72, "line-dasharray": [1.5, 2] },
+            });
+          }
+
+          const centerMarker = document.createElement("div");
+          centerMarker.title = center.label ?? "Map centre";
+          centerMarker.setAttribute("aria-label", centerMarker.title);
+          centerMarker.style.cssText = center.source === "saved_location"
+            ? "width:15px;height:15px;border-radius:9999px;background:#00ff88;border:2px solid #071018;box-shadow:0 0 0 6px rgba(0,255,136,.22),0 0 14px rgba(0,255,136,.72);"
+            : "width:12px;height:12px;border-radius:9999px;background:#67e8f9;border:3px solid #071018;box-shadow:0 0 0 2px rgba(103,232,249,.55);";
+          new maplibregl.Marker({ element: centerMarker }).setLngLat([center.lng, center.lat]).addTo(map);
+
+          const bounds = new maplibregl.LngLatBounds([center.lng, center.lat], [center.lng, center.lat]);
+          if (Number.isFinite(base?.lat) && Number.isFinite(base?.lng)) {
+            const baseMarker = document.createElement("div");
+            baseMarker.title = `${base?.label ?? "Booking base"}${base?.address ? ` · ${base.address}` : ""}`;
+            baseMarker.setAttribute("aria-label", baseMarker.title);
+            baseMarker.textContent = "⌂";
+            baseMarker.style.cssText = "display:grid;place-items:center;width:30px;height:30px;border-radius:10px;background:#fbbf24;color:#111827;border:2px solid #111827;font:800 16px system-ui;box-shadow:0 3px 14px rgba(0,0,0,.65);";
+            new maplibregl.Marker({ element: baseMarker, anchor: "bottom" }).setLngLat([base!.lng!, base!.lat!]).addTo(map);
+            bounds.extend([base!.lng!, base!.lat!]);
+          }
+          items.forEach((place, index) => {
+            if (!Number.isFinite(place.lat) || !Number.isFinite(place.lng)) return;
+            const marker = document.createElement("button");
+            marker.type = "button";
+            marker.title = `${index + 1}. ${place.name}`;
+            marker.setAttribute("aria-label", marker.title);
+            marker.style.cssText = "display:grid;place-items:center;width:27px;height:27px;border-radius:9999px 9999px 9999px 2px;transform:rotate(45deg);background:#0b1220;border:2px solid #00ff88;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.6);";
+            marker.innerHTML = `<span style="transform:rotate(-45deg);color:#00ff88;font:600 11px system-ui;">${index + 1}</span>`;
+            marker.onclick = () => setSel(index);
+            new maplibregl.Marker({ element: marker, anchor: "bottom" }).setLngLat([place.lng, place.lat]).addTo(map);
+            bounds.extend([place.lng, place.lat]);
+          });
+          map.fitBounds(bounds, { padding: 70, maxZoom: 15, duration: 600 });
+        });
+      } catch {
+        if (!cancelled) setMapError("The interactive basemap could not load. Place details and directions remain available.");
+      }
     })();
     return () => {
       cancelled = true;
@@ -785,14 +837,44 @@ export function PlacesView({ value }: { value: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value]);
 
-  if (!w || !items.length) return <div className="flex flex-1 items-center justify-center text-sm text-slate">nothing near you</div>;
+  if (!w || !center || !items.length) return <div className="flex flex-1 items-center justify-center text-sm text-slate">No mapped places matched this request.</div>;
+  const origin = Number.isFinite(base?.lat) && Number.isFinite(base?.lng)
+    ? { lat: base!.lat!, lng: base!.lng! }
+    : center;
   const dir = (p: Place, mode: string) =>
-    `https://www.google.com/maps/dir/?api=1&origin=${center!.lat},${center!.lng}&destination=${p.lat},${p.lng}&travelmode=${mode}`;
+    `https://www.google.com/maps/dir/?api=1&origin=${origin.lat},${origin.lng}&destination=${p.lat},${p.lng}&travelmode=${mode}`;
   return (
     <div className="flex min-h-0 flex-1 flex-col md:flex-row">
-      <div ref={mapEl} className="h-52 w-full shrink-0 md:h-auto md:flex-1" />
+      <div className="relative h-56 w-full shrink-0 overflow-hidden bg-[#071018] md:h-auto md:flex-1">
+        <div ref={mapEl} className="absolute inset-0" />
+        {mapError && <div className="absolute inset-x-3 bottom-3 rounded-lg border border-amber/25 bg-[#071018]/90 p-2 text-[11px] text-amber backdrop-blur">{mapError}</div>}
+        <div className="pointer-events-none absolute left-3 top-3 max-w-[75%] rounded-lg border border-white/10 bg-[#071018]/80 px-2.5 py-2 backdrop-blur">
+          <div className="text-[10px] uppercase tracking-[.14em] text-cyan/75">map centre</div>
+          <div className="truncate text-xs font-medium text-ice">{center.label ?? w.locationLabel ?? "Selected area"}</div>
+          {center.detail && <div className="truncate text-[10px] text-slate">{center.detail}</div>}
+        </div>
+      </div>
       <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3 md:w-[380px] md:flex-none">
-        <div className="hud-label mb-2">near you · {w.query}</div>
+        <div className="hud-label">{w.locationLabel ?? center.label ?? "map"} · {w.query}</div>
+        {w.preferences && <div className="mb-2 mt-1 text-[11px] leading-relaxed text-slate">Taste: {w.preferences}</div>}
+        {base && (
+          <div className="mb-2.5 rounded-xl border border-amber/25 bg-amber/[0.07] p-2.5">
+            <div className="text-[9px] uppercase tracking-[.14em] text-amber/75">starting base · {base.source ?? "booking"}</div>
+            <div className="mt-0.5 text-sm font-medium text-ice">{base.label}</div>
+            {base.address && <div className="text-[10px] leading-relaxed text-slate">{base.address}</div>}
+          </div>
+        )}
+        {route && (
+          <div className="mb-2.5 rounded-xl border border-amber/20 bg-white/[0.035] p-2.5">
+            <div className="text-[11px] font-medium text-amber">{route.label ?? "Suggested stop order"}</div>
+            {route.note && <div className="mt-0.5 text-[10px] leading-relaxed text-slate">{route.note}</div>}
+            {route.googleMapsUrl && (
+              <a href={route.googleMapsUrl} target="_blank" rel="noopener noreferrer" className="mt-2 inline-flex rounded-lg border border-amber/25 bg-amber/10 px-2 py-1 text-[10px] text-amber transition hover:bg-amber/15">
+                open navigable route ↗
+              </a>
+            )}
+          </div>
+        )}
         <div className="space-y-2.5">
           {items.map((p, i) => (
             <div

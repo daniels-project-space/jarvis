@@ -1,9 +1,11 @@
 "use client";
 
 let viewerToken: string | null = null;
+let viewerEmbedOrigin: string | null = null;
 
-export function setViewerRequestToken(token: string | null) {
+export function setViewerRequestToken(token: string | null, embedOrigin: string | null = null) {
   viewerToken = token;
+  viewerEmbedOrigin = embedOrigin;
 }
 
 function isLocalApi(input: RequestInfo | URL): boolean {
@@ -21,6 +23,9 @@ export function viewerFetch(input: RequestInfo | URL, init: RequestInit = {}): P
   const headers = new Headers(init.headers);
   if (viewerToken && isLocalApi(input) && !headers.has("authorization")) {
     headers.set("authorization", `Bearer ${viewerToken}`);
+  }
+  if (viewerToken && viewerEmbedOrigin && isLocalApi(input) && !headers.has("x-jarvis-embed-origin")) {
+    headers.set("x-jarvis-embed-origin", viewerEmbedOrigin);
   }
   return fetch(input, { ...init, headers });
 }

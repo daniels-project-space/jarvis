@@ -2,7 +2,9 @@
 export function isJarvisPublicPath(pathname: string): boolean {
   return !pathname.startsWith("/api/")
     || pathname === "/api/auth/viewer"
-    || pathname === "/api/auth/enroll"
+    || pathname === "/api/auth/pair"
+    || pathname === "/api/auth/embed-connect"
+    || pathname === "/api/auth/embed-viewer"
     || pathname === "/api/agent-tool"
     || pathname === "/api/health";
 }

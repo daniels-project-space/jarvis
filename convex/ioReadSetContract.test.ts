@@ -177,21 +177,19 @@ describe("streaming and paginated history behavior", () => {
     expect(fetched.some((row) => row.threadId === "beta")).toBe(false);
   });
 
-  it("partitions a guest conversation even when it asks for Daniel's thread", async () => {
+  it("rejects legacy guest identities and credentials everywhere", async () => {
     const t = convexTest(schema, modules);
     await t.run(async (ctx) => {
       await ctx.db.insert("chatMessages", { threadId: "main", role: "assistant", text: "owner-only", status: "done", delivery: "foreground", createdAt: 1 });
       await ctx.db.insert("chatMessages", { threadId: `guest:${GUEST_ID}`, role: "assistant", text: "guest-only", status: "done", delivery: "foreground", createdAt: 2 });
     });
     const guest = t.withIdentity(GUEST);
-    const visible = await guest.query(api.chatQueue.listMessages, { threadId: "main" });
-    expect(visible.map((row) => row.text)).toEqual(["guest-only"]);
+    await expect(guest.query(api.chatQueue.listMessages, { threadId: "main" }))
+      .rejects.toThrow(/Authentication required/);
 
-    const id = await t.mutation(api.chatQueue.sendMessage, {
+    await expect(t.mutation(api.chatQueue.sendMessage, {
       threadId: "main", text: "hello", requestId: "guest-request", guestId: GUEST_ID,
-    });
-    const row = await t.run(async (ctx) => await ctx.db.get(id));
-    expect(row?.threadId).toBe(`guest:${GUEST_ID}`);
+    })).rejects.toThrow(/Authentication required/);
   });
 
   it("keeps the originating request and user message ids stable across admission replay and claim", async () => {
@@ -200,7 +198,7 @@ describe("streaming and paginated history behavior", () => {
       threadId: "main",
       text: "delegate this durable request",
       requestId: "stable-chat-request",
-      guestId: GUEST_ID,
+      workerToken: WORKER,
     };
     const first = await t.mutation(api.chatQueue.sendMessage, input);
     const replay = await t.mutation(api.chatQueue.sendMessage, input);

@@ -1,10 +1,13 @@
 import "server-only";
 import type { NextRequest } from "next/server";
-import { adminSessionHash, validateAdminSession } from "./control-session";
+import { adminSessionHash, controlQuery, sha256Hex, validateAdminSession } from "./control-session";
+import { isTrustedJarvisEmbedOrigin } from "./embed-origin";
 import { verifyViewerToken } from "./viewer-jwt";
 
 export type ControlActor =
   | { kind: "owner"; authTokenHash: string }
+  // Retained temporarily as a compile-time migration shape only. The request
+  // boundary below never returns it and Convex rejects all guest credentials.
   | { kind: "guest"; guestId: string };
 
 export function bearerToken(header: string | null): string | null {
@@ -20,8 +23,21 @@ export async function controlActor(req: NextRequest): Promise<ControlActor | nul
   if (authTokenHash && await validateAdminSession(authTokenHash)) {
     return { kind: "owner", authTokenHash };
   }
-  const identity = await verifyViewerToken(bearerToken(req.headers.get("authorization")));
-  if (identity?.kind === "guest") return identity;
+  const bearer = bearerToken(req.headers.get("authorization"));
+  const hostOrigin = req.headers.get("x-jarvis-embed-origin");
+  if (bearer && hostOrigin && isTrustedJarvisEmbedOrigin(hostOrigin) && /^[A-Za-z0-9_-]{40,128}$/.test(bearer)) {
+    const status = await controlQuery("controlAuth:embedControlSessionStatus", {
+      tokenHash: await sha256Hex(bearer),
+      hostOrigin,
+    }).catch(() => null) as { valid?: boolean; authTokenHash?: string } | null;
+    if (status?.valid && typeof status.authTokenHash === "string") {
+      return { kind: "owner", authTokenHash: status.authTokenHash };
+    }
+  }
+
+  // The in-memory viewer JWT intentionally remains read-only. It is never
+  // elevated into API control authority, and old guest JWTs are rejected.
+  await verifyViewerToken(bearer);
   return null;
 }
 

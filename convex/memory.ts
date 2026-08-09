@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { safeMemoryNote } from "../src/lib/memory-safety";
 
 // Write a memory row. Full/long bodies live in R2 (r2Key); this row is the
 // reactive index + a short/distilled body for quick recall.
@@ -15,13 +16,15 @@ export const write = mutation({
   },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
+    const note = safeMemoryNote(a.title, a.body);
+    if (!note) throw new Error("Memory rejected by secret-safety policy");
     const now = Date.now();
     return await ctx.db.insert("memory", {
-      kind: a.kind,
-      title: a.title,
-      body: a.body,
-      tags: a.tags ?? [],
-      r2Key: a.r2Key,
+      kind: a.kind.slice(0, 40),
+      title: note.title.slice(0, 180),
+      body: note.body.slice(0, 4_000),
+      tags: (a.tags ?? []).slice(0, 12).map((tag) => tag.slice(0, 48)),
+      r2Key: a.r2Key?.slice(0, 300),
       createdAt: now,
       updatedAt: now,
     });

@@ -3,6 +3,7 @@ export type ContextProfile = "reflex" | "focused" | "operational" | "strategic";
 type ContextRow = Record<string, unknown>;
 
 type BrainContext = {
+  currentState?: ContextRow[];
   memory?: ContextRow[];
   projects?: ContextRow[];
   goals?: ContextRow[];
@@ -46,7 +47,7 @@ const ARTIFACT = /\b(?:draft|document|board|image|video|chart|scene|mind map|can
 const FOLLOW_UP = /\b(?:this|that|it|there|second|third|previous|above|on screen|shown)\b/i;
 const TRAVEL = /\b(?:trip|travel|flight|hotel|stay|airport|transfer|destination|itinerary)\b/i;
 const DRAFT_EDIT = /\b(?:draft|document|write|writing|rewrite|edit|longer|shorter|warmer|tone|wording)\b/i;
-const LOCATION = /\b(?:near me|nearby|local|location|directions?|restaurant|weather)\b/i;
+const LOCATION = /\b(?:near me|nearby|local|location|directions?|routes?|maps?|places?|attractions?|city|restaurant|weather)\b/i;
 const TEAM = /\b(?:agent|team|delegate|mission|goal|working|progress|status)\b/i;
 
 const text = (value: unknown, max: number) =>
@@ -158,6 +159,16 @@ export function compileContext(input: ContextCompilerInput): string {
     add(
       "RELEVANT MEMORY",
       memories.slice(0, memoryLimit).map((row) => rowLine(row, profile === "strategic" ? 480 : 300)).join("\n"),
+    );
+  }
+
+  const currentState = Array.isArray(brain.currentState) ? brain.currentState : [];
+  const currentLocation = currentState.find((row) => row.key === "profile.current_location");
+  if (currentLocation?.value && (LOCATION.test(userText) || TRAVEL.test(userText) || FOLLOW_UP.test(userText))) {
+    add(
+      "CURRENT SITUATION",
+      `Daniel's current location is ${text(currentLocation.value, 120)} (observed ${new Date(Number(currentLocation.observedAt ?? 0)).toISOString()}). Use it as the default map, weather, route, and nearby-search origin until superseded.`,
+      true,
     );
   }
 

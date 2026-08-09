@@ -57,7 +57,7 @@ const clean = (s: unknown) => redactSecrets(s).replace(/[*#`_>]/g, "").trim();
 
 export const memoryVault = schedules.task({
   id: "jarvis-memory-vault",
-  cron: "17 */6 * * *", // every 6h
+  cron: "17 4 * * 1", // weekly, Monday 04:17 UTC
   maxDuration: 180,
   run: async () => {
     const token = process.env.GITHUB_TOKEN;
