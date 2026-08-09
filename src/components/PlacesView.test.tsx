@@ -45,6 +45,26 @@ describe("PlacesView travel presentation", () => {
     expect(html).toContain("open navigable route");
     expect(html).toContain("Centro Cerámica Triana");
   });
+
+  it("shows an explicit city-centre fallback when no Gmail stay was verified", () => {
+    const html = renderToStaticMarkup(<PlacesView value={JSON.stringify({
+      kind: "places",
+      query: "niche places",
+      locationLabel: "Sevilla",
+      center: { lat: 37.3891, lng: -5.9845, label: "Sevilla", source: "current_state" },
+      booking: {
+        requested: true,
+        status: "unavailable",
+        message: "Gmail booking lookup is currently unavailable; the route starts from the map centre.",
+      },
+      route: { label: "Suggested walking order", mode: "walking", coordinates: [] },
+      items: [{ name: "Casa de Pilatos", address: "Sevilla", lat: 37.39, lng: -5.988 }],
+    })} />);
+
+    expect(html).toContain("Gmail booking lookup is currently unavailable");
+    expect(html).toContain("route starts from the map centre");
+    expect(html).not.toContain("starting base");
+  });
 });
 
 describe("restored live-data view contracts", () => {
