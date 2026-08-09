@@ -10,6 +10,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { usePathname } from "next/navigation";
 import { resolveConvexUrl } from "@/lib/convex-url";
 import { resolveTrustedJarvisEmbedOrigin } from "@/lib/embed-origin";
 import { ViewerSessionProvider } from "@/lib/viewer-session";
@@ -48,16 +49,45 @@ function currentEmbedHostOrigin(): string | null {
 }
 
 function storedEmbedGrant(hostOrigin: string): StoredEmbedGrant | null {
+  let serialized: string | null = null;
+  try { serialized = localStorage.getItem(EMBED_GRANT_KEY); } catch { /* use the tab fallback */ }
+  if (!serialized) {
+    try { serialized = sessionStorage.getItem(EMBED_GRANT_KEY); } catch { return null; }
+  }
   try {
-    const value = JSON.parse(sessionStorage.getItem(EMBED_GRANT_KEY) ?? "null") as StoredEmbedGrant | null;
-    return value
+    const value = JSON.parse(serialized ?? "null") as StoredEmbedGrant | null;
+    const valid = value
       && value.hostOrigin === hostOrigin
       && /^[A-Za-z0-9_-]{40,128}$/.test(value.controlToken)
-      && value.expiresAt > Date.now()
-      ? value
-      : null;
+      && value.expiresAt > Date.now();
+    if (!valid) {
+      clearStoredEmbedGrant();
+      return null;
+    }
+    // Migrate the original tab-scoped grant so the trusted Project Hub overlay
+    // stays connected after a browser restart instead of showing a false lock.
+    persistEmbedGrant(value);
+    return value;
   } catch {
     return null;
+  }
+}
+
+function clearStoredEmbedGrant() {
+  try { localStorage.removeItem(EMBED_GRANT_KEY); } catch { /* storage can be partition-blocked */ }
+  try { sessionStorage.removeItem(EMBED_GRANT_KEY); } catch { /* keep the owner flow recoverable */ }
+}
+
+function persistEmbedGrant(grant: StoredEmbedGrant) {
+  const serialized = JSON.stringify(grant);
+  try {
+    localStorage.setItem(EMBED_GRANT_KEY, serialized);
+    try { sessionStorage.removeItem(EMBED_GRANT_KEY); } catch { /* persistent copy is enough */ }
+    return;
+  } catch {
+    // Some embedded browsers deny persistent storage. Preserve the existing
+    // tab-scoped fallback rather than breaking a successful owner connection.
+    try { sessionStorage.setItem(EMBED_GRANT_KEY, serialized); } catch { /* current in-memory token still works */ }
   }
 }
 
@@ -99,6 +129,25 @@ async function requestViewerToken(): Promise<string> {
   throw lastError instanceof Error ? lastError : new Error("viewer capability unavailable");
 }
 
+async function requestOwnerViewer(hostOrigin: string | null): Promise<{
+  token: string;
+  grant: StoredEmbedGrant | null;
+}> {
+  const grant = hostOrigin ? storedEmbedGrant(hostOrigin) : null;
+  if (grant && hostOrigin) {
+    try {
+      return { token: await requestEmbedViewer(grant.controlToken, hostOrigin), grant };
+    } catch (error) {
+      // A 401/403 definitively revokes this capability. Network and 5xx errors
+      // keep it intact so the next retry reconnects without another popup.
+      const revoked = error instanceof ViewerTokenError && (error.status === 401 || error.status === 403);
+      if (!revoked) throw error;
+      clearStoredEmbedGrant();
+    }
+  }
+  return { token: await requestViewerToken(), grant: null };
+}
+
 function useJarvisConvexAuth() {
   const auth = useContext(ViewerAuthContext);
   return useMemo(() => ({
@@ -109,6 +158,15 @@ function useJarvisConvexAuth() {
 }
 
 export default function Providers({ children }: { children: ReactNode }) {
+  const pathname = usePathname();
+  // Pairing must render before viewer authentication exists. Wrapping /pair in
+  // the owner gate made every fresh owner link impossible to consume: Daniel
+  // saw the lock screen instead of the page that creates his durable cookie.
+  if (pathname === "/pair") return <>{children}</>;
+  return <OwnerProviders>{children}</OwnerProviders>;
+}
+
+function OwnerProviders({ children }: { children: ReactNode }) {
   const [viewerToken, setViewerToken] = useState<string | null>(null);
   const viewerTokenRef = useRef<string | null>(null);
   const refreshPromiseRef = useRef<Promise<string> | null>(null);
@@ -128,9 +186,8 @@ export default function Providers({ children }: { children: ReactNode }) {
   const refreshViewerToken = useCallback(async () => {
     if (refreshPromiseRef.current) return refreshPromiseRef.current;
     const hostOrigin = currentEmbedHostOrigin();
-    const grant = hostOrigin ? storedEmbedGrant(hostOrigin) : null;
-    const request = (grant ? requestEmbedViewer(grant.controlToken, hostOrigin!) : requestViewerToken())
-      .then((token) => {
+    const request = requestOwnerViewer(hostOrigin)
+      .then(({ token, grant }) => {
         acceptViewerToken(token, grant?.controlToken, grant?.hostOrigin);
         return token;
       })
@@ -165,18 +222,8 @@ export default function Providers({ children }: { children: ReactNode }) {
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     const hostOrigin = currentEmbedHostOrigin();
     const load = async () => {
-      const grant = hostOrigin ? storedEmbedGrant(hostOrigin) : null;
-      if (grant && hostOrigin) {
-        try {
-          const token = await requestEmbedViewer(grant.controlToken, hostOrigin);
-          if (active) acceptViewerToken(token, grant.controlToken, hostOrigin);
-          return;
-        } catch {
-          sessionStorage.removeItem(EMBED_GRANT_KEY);
-        }
-      }
-      const token = await requestViewerToken();
-      if (active) acceptViewerToken(token);
+      const { token, grant } = await requestOwnerViewer(hostOrigin);
+      if (active) acceptViewerToken(token, grant?.controlToken, grant?.hostOrigin);
     };
     void load().catch((cause) => {
         if (!active) return;
@@ -221,7 +268,7 @@ export default function Providers({ children }: { children: ReactNode }) {
       window.clearTimeout(timeout);
       window.removeEventListener("message", receive);
       const grant = { hostOrigin, controlToken: payload.controlToken, expiresAt: payload.expiresAt };
-      sessionStorage.setItem(EMBED_GRANT_KEY, JSON.stringify(grant));
+      persistEmbedGrant(grant);
       setError(null);
       acceptViewerToken(payload.viewerToken, payload.controlToken, hostOrigin);
     }

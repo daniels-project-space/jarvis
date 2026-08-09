@@ -23,11 +23,19 @@ export async function POST(req: NextRequest) {
 
   const ownerToken = randomBytes(32).toString("base64url");
   const ownerTokenHash = await sha256Hex(ownerToken);
-  const created = await controlMutation("controlAuth:consumeOwnerPairingTicket", {
-    tokenHash: await sha256Hex(ticket),
-    ownerTokenHash,
-    userAgent: req.headers.get("user-agent") ?? undefined,
-  }).catch(() => null) as { expiresAt?: number } | null;
+  let created: { expiresAt?: number } | null;
+  try {
+    created = await controlMutation("controlAuth:consumeOwnerPairingTicket", {
+      tokenHash: await sha256Hex(ticket),
+      ownerTokenHash,
+      userAgent: req.headers.get("user-agent") ?? undefined,
+    }) as { expiresAt?: number } | null;
+  } catch {
+    return Response.json(
+      { ok: false, error: "pairing_service_temporarily_unavailable" },
+      { status: 503, headers: { "cache-control": "no-store" } },
+    );
+  }
   if (!created?.expiresAt) {
     return Response.json(
       { ok: false, error: "invalid_or_expired_pairing" },

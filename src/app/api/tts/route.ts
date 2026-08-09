@@ -2,14 +2,12 @@ import type { NextRequest } from "next/server";
 import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 import { isSameOriginRequest } from "@/lib/control-session";
 import { controlActor } from "@/lib/request-auth";
+import { JARVIS_TTS_ENGINE, JARVIS_TTS_VOICE } from "@/lib/tts-config";
 
 export const runtime = "nodejs";
 export const maxDuration = 15;
 
-export const JARVIS_TTS_VOICE = "en-GB-RyanNeural";
-export const JARVIS_TTS_ENGINE = "edge-neural-ryan-gb";
-
-export function escapeSpeechXml(value: string): string {
+function escapeSpeechXml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")

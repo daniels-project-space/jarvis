@@ -56,4 +56,12 @@ describe("single-use owner pairing", () => {
     expect(replay.status).toBe(401);
     expect(replay.headers.getSetCookie()).toEqual([]);
   });
+
+  it("keeps a temporary control-plane outage retryable instead of calling the link expired", async () => {
+    mock.controlMutation.mockRejectedValueOnce(new Error("Convex unavailable"));
+    const response = await POST(request("y".repeat(43)));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: "pairing_service_temporarily_unavailable" });
+    expect(response.headers.getSetCookie()).toEqual([]);
+  });
 });

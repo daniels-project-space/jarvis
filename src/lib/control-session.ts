@@ -5,6 +5,11 @@ export const ADMIN_COOKIE = "__Host-jarvis_admin";
 export const LEGACY_ADMIN_COOKIE = "jarvis_admin";
 export const ADMIN_SESSION_SECONDS = 365 * 24 * 60 * 60;
 
+export type AdminSessionStatus =
+  | { valid: true; expiresAt: number }
+  | { valid: false; unavailable?: false }
+  | { valid: false; unavailable: true };
+
 const CONVEX_URL = resolveConvexUrl(process.env.CONVEX_URL, process.env.NEXT_PUBLIC_CONVEX_URL);
 
 export async function sha256Hex(value: string): Promise<string> {
@@ -42,7 +47,7 @@ export async function validateAdminSession(tokenHash: string | null): Promise<bo
 
 export async function adminSessionStatus(
   tokenHash: string | null,
-): Promise<{ valid: boolean; expiresAt?: number }> {
+): Promise<AdminSessionStatus> {
   if (!tokenHash) return { valid: false };
   try {
     const response = await fetch(`${CONVEX_URL}/api/query`, {
@@ -52,12 +57,15 @@ export async function adminSessionStatus(
       cache: "no-store",
     });
     const payload = await response.json();
+    if (!response.ok || payload?.status === "error") return { valid: false, unavailable: true };
     const value = payload?.value;
     return response.ok && value?.valid === true
       ? { valid: true, expiresAt: Number(value.expiresAt) }
       : { valid: false };
   } catch {
-    return { valid: false };
+    // A temporary Convex/network outage is not evidence that Daniel's device
+    // lost enrollment. Let the client retry instead of rendering a lock screen.
+    return { valid: false, unavailable: true };
   }
 }
 

@@ -35,7 +35,8 @@ vi.mock("msedge-tts", () => ({
 vi.mock("@/lib/control-session", () => ({ isSameOriginRequest: vi.fn(() => true) }));
 vi.mock("@/lib/request-auth", () => ({ controlActor: vi.fn(async () => ({ id: "viewer" })) }));
 
-import { GET, JARVIS_TTS_ENGINE, JARVIS_TTS_VOICE, POST } from "./route";
+import { JARVIS_TTS_ENGINE, JARVIS_TTS_VOICE } from "@/lib/tts-config";
+import { GET, POST } from "./route";
 
 const request = (text = "A <safe> phrase") => new Request("https://jarvis.test/api/tts", {
   method: "POST",

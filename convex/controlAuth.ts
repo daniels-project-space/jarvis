@@ -2,8 +2,8 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 
 const SESSION_LIFETIME_MS = 365 * 24 * 60 * 60 * 1000;
-const MAX_PAIRING_LIFETIME_MS = 15 * 60 * 1000;
-const MAX_EMBED_SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_PAIRING_LIFETIME_MS = 24 * 60 * 60 * 1000;
+const MAX_EMBED_SESSION_LIFETIME_MS = SESSION_LIFETIME_MS;
 const VIEWER_LIFETIME_MS = 6 * 60 * 60 * 1000;
 const VIEWER_ISSUER = "https://jarvis-orcin-six.vercel.app";
 const VIEWER_SUBJECT = "daniel-owner";
