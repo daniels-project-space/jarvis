@@ -2510,6 +2510,9 @@ describe("tool-less receipt synthesis and Convex transport", () => {
     expect(MISSION_SUPERVISOR_QUEUE).not.toBe("jarvis-foreground");
   });
 
+  // A cold tsx child import takes ~4.5s in isolation and can cross Vitest's 5s
+  // default while the full 200-file suite is compiling in parallel. Keep this
+  // real-process regression bounded without making the suite resource-flaky.
   it("loads the real Trigger module in a fresh Node process without a server-only mock", () => {
     const child = spawnSync(
       process.execPath,
@@ -2535,7 +2538,7 @@ describe("tool-less receipt synthesis and Convex transport", () => {
     expect(child.status, child.stderr).toBe(0);
     expect(child.stdout).toBe("loaded");
     expect(child.stderr).not.toContain("server-only");
-  });
+  }, 15_000);
 
   it("uses a real tool-less Mastra Agent with bounded structured output and exact offered evidence", async () => {
     const completed = job({ status: "done" });

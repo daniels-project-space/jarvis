@@ -6,6 +6,8 @@ const mock = vi.hoisted(() => ({
   adminSessionHash: vi.fn(),
   adminSessionStatus: vi.fn(),
   controlMutation: vi.fn(),
+  sha256Hex: vi.fn(),
+  openOwnerSessionToken: vi.fn(),
 }));
 
 vi.mock("@/lib/control-session", () => ({
@@ -15,7 +17,9 @@ vi.mock("@/lib/control-session", () => ({
   adminSessionStatus: mock.adminSessionStatus,
   controlMutation: mock.controlMutation,
   isSameOriginRequest: vi.fn(() => true),
+  sha256Hex: mock.sha256Hex,
 }));
+vi.mock("@/lib/open-owner-session", () => ({ openOwnerSessionToken: mock.openOwnerSessionToken }));
 vi.mock("@/lib/viewer-jwt", () => ({ issueViewerToken: mock.issueViewerToken }));
 
 import { POST } from "./route";
@@ -36,15 +40,40 @@ describe("viewer bootstrap boundary", () => {
     mock.adminSessionHash.mockResolvedValue("a".repeat(64));
     mock.adminSessionStatus.mockResolvedValue({ valid: false });
     mock.controlMutation.mockResolvedValue(null);
+    mock.sha256Hex.mockResolvedValue("b".repeat(64));
+    mock.openOwnerSessionToken.mockReturnValue("open-owner-token");
+    vi.stubEnv("JARVIS_WORKER_TOKEN", "worker-secret");
   });
 
-  it("fails closed without minting an anonymous identity or conversation", async () => {
+  it("opens the direct URL as the owner and creates the shared session once", async () => {
+    mock.controlMutation.mockResolvedValue({ expiresAt: Date.now() + 365 * 24 * 60 * 60_000 });
     const response = await POST(request());
-    expect(response.status).toBe(401);
-    expect(await response.json()).toMatchObject({ ok: false, error: "owner_pairing_required" });
-    expect(mock.issueViewerToken).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, actor: "owner" });
+    expect(mock.openOwnerSessionToken).toHaveBeenCalledWith("worker-secret");
+    expect(mock.sha256Hex).toHaveBeenCalledWith("open-owner-token");
+    expect(mock.controlMutation).toHaveBeenCalledWith("controlAuth:createOpenSession", {
+      ownerTokenHash: "b".repeat(64),
+      userAgent: undefined,
+      workerToken: "worker-secret",
+    });
+    expect(mock.issueViewerToken).toHaveBeenCalledWith({ kind: "owner" });
+    expect(response.headers.get("set-cookie")).toContain("jarvis_admin=open-owner-token");
+    expect(response.headers.get("set-cookie")).toContain("HttpOnly");
+    expect(response.headers.get("set-cookie")).toContain("Secure");
     expect(response.headers.get("set-cookie")).toContain(`${GUEST_COOKIE}=;`);
     expect(response.headers.get("set-cookie")).toContain("Max-Age=0");
+  });
+
+  it("reuses the shared open session without another Convex mutation", async () => {
+    mock.adminSessionStatus.mockResolvedValue({
+      valid: true,
+      expiresAt: Date.now() + 90 * 24 * 60 * 60_000,
+    });
+    const response = await POST(request());
+    expect(response.status).toBe(200);
+    expect(mock.controlMutation).not.toHaveBeenCalled();
+    expect(response.headers.get("set-cookie")).toContain("jarvis_admin=open-owner-token");
   });
 
   it("uses an enrolled owner cookie only after server-side validation", async () => {
@@ -63,6 +92,13 @@ describe("viewer bootstrap boundary", () => {
   it("retries temporary session validation failures instead of falsely locking the owner", async () => {
     mock.adminSessionStatus.mockResolvedValue({ valid: false, unavailable: true });
     const response = await POST(request("jarvis_admin=owner-cookie"));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ ok: false, error: "owner_session_temporarily_unavailable" });
+    expect(mock.issueViewerToken).not.toHaveBeenCalled();
+  });
+
+  it("keeps retrying when the shared open session cannot be created", async () => {
+    const response = await POST(request());
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({ ok: false, error: "owner_session_temporarily_unavailable" });
     expect(mock.issueViewerToken).not.toHaveBeenCalled();

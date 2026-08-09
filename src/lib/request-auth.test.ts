@@ -7,6 +7,7 @@ const mock = vi.hoisted(() => ({
   sha256Hex: vi.fn(),
   validateAdminSession: vi.fn(),
   isTrustedJarvisEmbedOrigin: vi.fn(),
+  openOwnerSessionToken: vi.fn(),
   verifyViewerToken: vi.fn(),
 }));
 
@@ -20,6 +21,9 @@ vi.mock("./control-session", () => ({
 vi.mock("./embed-origin", () => ({
   isTrustedJarvisEmbedOrigin: mock.isTrustedJarvisEmbedOrigin,
 }));
+vi.mock("./open-owner-session", () => ({
+  openOwnerSessionToken: mock.openOwnerSessionToken,
+}));
 vi.mock("./viewer-jwt", () => ({
   verifyViewerToken: mock.verifyViewerToken,
 }));
@@ -29,6 +33,7 @@ import { controlActor } from "./request-auth";
 const CONTROL_TOKEN = "c".repeat(43);
 const CONTROL_HASH = "d".repeat(64);
 const ADMIN_HASH = "a".repeat(64);
+const OPEN_HASH = "b".repeat(64);
 const HOST_ORIGIN = "https://project-hub-olive-pi.vercel.app";
 
 function request(): NextRequest {
@@ -48,6 +53,7 @@ describe("owner control actor", () => {
     mock.validateAdminSession.mockResolvedValue(false);
     mock.sha256Hex.mockResolvedValue(CONTROL_HASH);
     mock.isTrustedJarvisEmbedOrigin.mockReturnValue(true);
+    mock.openOwnerSessionToken.mockReturnValue("open-owner-token");
     mock.verifyViewerToken.mockResolvedValue(null);
     mock.controlQuery.mockResolvedValue({ valid: true, authTokenHash: ADMIN_HASH });
   });
@@ -68,6 +74,22 @@ describe("owner control actor", () => {
     await expect(controlActor(request())).resolves.toBeNull();
     expect(mock.controlQuery).not.toHaveBeenCalled();
     expect(mock.verifyViewerToken).toHaveBeenCalledWith(CONTROL_TOKEN);
+  });
+
+  it("uses a signed owner viewer capability for a fresh cookie-blocked overlay", async () => {
+    const viewerToken = "v".repeat(160);
+    mock.verifyViewerToken.mockResolvedValue({ kind: "owner" });
+    mock.sha256Hex.mockResolvedValue(OPEN_HASH);
+    mock.validateAdminSession.mockResolvedValue(true);
+    const req = new Request("https://jarvis-orcin-six.vercel.app/api/chat", {
+      headers: { authorization: `Bearer ${viewerToken}` },
+    }) as unknown as NextRequest;
+
+    await expect(controlActor(req)).resolves.toEqual({ kind: "owner", authTokenHash: OPEN_HASH });
+    expect(mock.openOwnerSessionToken).toHaveBeenCalledWith("worker-secret");
+    expect(mock.verifyViewerToken).toHaveBeenCalledWith(viewerToken);
+    expect(mock.validateAdminSession).toHaveBeenCalledWith(OPEN_HASH);
+    expect(mock.controlQuery).not.toHaveBeenCalled();
   });
 
   it("preserves a trusted embed grant across a temporary control-plane outage", async () => {
