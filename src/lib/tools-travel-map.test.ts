@@ -89,7 +89,7 @@ describe("travel_map tool", () => {
 
     expect(result).toContain("Interactive map opened for Sevilla");
     expect(result).toContain("read-only Gmail booking base");
-    expect(mock.lookupBookings).toHaveBeenCalledWith(expect.objectContaining({ search: "Sevilla" }));
+    expect(mock.lookupBookings).toHaveBeenCalledWith({ days: 730, maxResults: 24 });
     const requestBodies = vi.mocked(fetch).mock.calls.map(([, init]) => JSON.parse(String(init?.body ?? "{}")));
     expect(requestBodies.every((body) => !("regionCode" in body))).toBe(true);
 
@@ -101,6 +101,7 @@ describe("travel_map tool", () => {
       locationLabel: "Sevilla",
       center: { label: "Sevilla", source: "google_places" },
       base: { label: "Hotel Casa 1800 Sevilla", source: "Read-only Gmail booking" },
+      booking: { requested: true, status: "matched" },
       route: { mode: "walking" },
     });
     expect(panel.items).toHaveLength(3);
@@ -134,5 +135,28 @@ describe("travel_map tool", () => {
       center: { label: "Sevilla", source: "current_state" },
       preferences: "I'm not looking for touristy stuff; give me something more niche",
     });
+  });
+
+  it("never claims a Gmail booking base when booking lookup is unavailable", async () => {
+    mock.lookupBookings.mockRejectedValueOnce(new Error("oauth unavailable"));
+
+    const result = await executeTool("travel_map", {
+      location: "Sevilla",
+      query: "niche local places",
+      route: true,
+      include_bookings: true,
+      travel_mode: "walking",
+    });
+
+    expect(result).toContain("Gmail booking lookup was unavailable");
+    expect(result).toContain("Do not claim or imply that a booking address was used");
+    const panelCall = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
+    const panel = JSON.parse(String(panelCall?.[1]?.value));
+    expect(panel).toMatchObject({
+      kind: "places",
+      booking: { requested: true, status: "unavailable" },
+      route: { mode: "walking" },
+    });
+    expect(panel.base).toBeUndefined();
   });
 });

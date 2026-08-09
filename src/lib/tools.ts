@@ -2781,9 +2781,14 @@ async function travelMap(args: any): Promise<string> {
   const key = await getSecret("google", "GOOGLE_PLACES_API_KEY").catch(() => "");
   if (!key) return "Maps key unavailable.";
   try {
-    const bookingsPromise = request.includeBookings
-      ? lookupGmailBookingsReadOnly({ days: 730, maxResults: 12, search: request.location }).catch(() => [] as ConfirmedBooking[])
-      : Promise.resolve([] as ConfirmedBooking[]);
+    const bookingsPromise: Promise<{ bookings: ConfirmedBooking[]; unavailable: boolean }> = request.includeBookings
+      // Search confirmation mail broadly, then validate the selected stay
+      // against the mapped city. Exact Gmail text such as "Sevilla" misses
+      // legitimate confirmations that use "Seville" or only a street address.
+      ? lookupGmailBookingsReadOnly({ days: 730, maxResults: 24 })
+        .then((bookings) => ({ bookings, unavailable: false }))
+        .catch(() => ({ bookings: [] as ConfirmedBooking[], unavailable: true }))
+      : Promise.resolve({ bookings: [] as ConfirmedBooking[], unavailable: false });
     let center: (TravelMapPoint & { label: string; detail?: string; source: "saved_location" | "current_state" | "google_places" }) | null = null;
     if (request.location) {
       const locationMatch = (await searchTravelPlaces(key, request.location, { maxResults: 1 }))[0];
@@ -2821,15 +2826,35 @@ async function travelMap(args: any): Promise<string> {
     }
     if (!center) return "I don't have a usable map location yet.";
 
-    const bookings = await bookingsPromise;
-    const booking = chooseTravelBooking(bookings, request.location ?? center.label);
-    const [found, bookingGeocode] = await Promise.all([
+    const bookingLookup = await bookingsPromise;
+    const bookingCandidate = chooseTravelBooking(bookingLookup.bookings, request.location ?? center.label);
+    const [found, candidateGeocode] = await Promise.all([
       searchTravelPlaces(key, googlePlacesTextQuery(request), { center, radiusMetres: 14_000, maxResults: 10 }),
-      booking?.location
-        ? searchTravelPlaces(key, booking.location, { center, radiusMetres: 30_000, maxResults: 1 }).then((rows) => rows[0]).catch(() => undefined)
+      bookingCandidate?.location
+        ? searchTravelPlaces(key, bookingCandidate.location, { center, radiusMetres: 30_000, maxResults: 1 }).then((rows) => rows[0]).catch(() => undefined)
         : Promise.resolve(undefined),
     ]);
     if (!found.length) return `I couldn't find places matching “${googlePlacesTextQuery(request)}”.`;
+
+    // A booking is allowed to become the route origin only after its address
+    // geocodes near the requested city. This prevents a future stay in another
+    // country from silently becoming today's route base.
+    const bookingDistanceKm = candidateGeocode
+      ? haversine([center.lat, center.lng], [candidateGeocode.lat, candidateGeocode.lng])
+      : Number.POSITIVE_INFINITY;
+    const booking = bookingCandidate && candidateGeocode && bookingDistanceKm <= 80
+      ? bookingCandidate
+      : undefined;
+    const bookingGeocode = booking ? candidateGeocode : undefined;
+    const bookingStatus = !request.includeBookings
+      ? "not_requested"
+      : booking
+        ? "matched"
+        : bookingLookup.unavailable
+          ? "unavailable"
+          : bookingLookup.bookings.length
+            ? "no_local_match"
+            : "not_found";
 
     const basePoint = bookingGeocode ? { lat: bookingGeocode.lat, lng: bookingGeocode.lng } : center;
     const selected = found
@@ -2864,10 +2889,28 @@ async function travelMap(args: any): Promise<string> {
       locationLabel,
       center,
       base,
+      booking: {
+        requested: request.includeBookings,
+        status: bookingStatus,
+        message: bookingStatus === "matched"
+          ? "Confirmed Gmail stay verified near this map."
+          : bookingStatus === "unavailable"
+            ? "Gmail booking lookup is currently unavailable; the route starts from the map centre."
+            : bookingStatus === "no_local_match"
+              ? "Confirmed stays were found, but none could be verified near this map; the route starts from the map centre."
+              : bookingStatus === "not_found"
+                ? "No confirmed Gmail stay was found; the route starts from the map centre."
+                : undefined,
+      },
       route,
       items: places,
     }, `map · ${locationLabel.slice(0, 32)}`);
-    return `Interactive map opened for ${locationLabel} with ${places.length} real place pin${places.length === 1 ? "" : "s"}${base ? ` and ${base.label} marked as the read-only Gmail booking base` : ""}${routeUrl ? ` in a suggested ${request.travelMode} order with a Google directions link` : ""}. Keep the map visible and answer with a short, preference-aware summary.`;
+    const bookingResult = base
+      ? `${base.label} is verified near ${locationLabel} and marked as the read-only Gmail booking base.`
+      : request.includeBookings
+        ? `${bookingStatus === "unavailable" ? "Gmail booking lookup was unavailable" : "No confirmed Gmail stay near this map was verified"}; the route starts from the map centre. Do not claim or imply that a booking address was used.`
+        : "No booking base was requested.";
+    return `Interactive map opened for ${locationLabel} with ${places.length} real place pin${places.length === 1 ? "" : "s"}${routeUrl ? ` in a suggested ${request.travelMode} order with a Google directions link` : ""}. ${bookingResult} Keep the map visible and answer with a short, preference-aware summary.`;
   } catch (error: any) {
     return `Travel map lookup failed: ${String(error?.message ?? error).slice(0, 120)}.`;
   }

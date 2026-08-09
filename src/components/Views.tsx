@@ -732,8 +732,13 @@ type PlacesWidget = {
   query: string;
   preferences?: string;
   locationLabel?: string;
-  center: { lat: number; lng: number; label?: string; detail?: string; source?: "saved_location" | "google_places" };
+  center: { lat: number; lng: number; label?: string; detail?: string; source?: "saved_location" | "current_state" | "google_places" };
   base?: { lat?: number; lng?: number; label: string; address?: string; source?: string };
+  booking?: {
+    requested: boolean;
+    status: "not_requested" | "matched" | "unavailable" | "no_local_match" | "not_found";
+    message?: string;
+  };
   route?: {
     label?: string; note?: string; mode?: string; coordinates?: [number, number][];
     googleMapsUrl?: string; order?: string[];
@@ -862,6 +867,11 @@ export function PlacesView({ value }: { value: string }) {
             <div className="text-[9px] uppercase tracking-[.14em] text-amber/75">starting base · {base.source ?? "booking"}</div>
             <div className="mt-0.5 text-sm font-medium text-ice">{base.label}</div>
             {base.address && <div className="text-[10px] leading-relaxed text-slate">{base.address}</div>}
+          </div>
+        )}
+        {w.booking?.requested && w.booking.status !== "matched" && w.booking.message && (
+          <div className="mb-2.5 rounded-xl border border-amber/25 bg-amber/[0.07] p-2.5 text-[11px] leading-relaxed text-amber">
+            {w.booking.message}
           </div>
         )}
         {route && (
