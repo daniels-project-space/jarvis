@@ -96,8 +96,8 @@ describe("shared orb motion", () => {
     expect(second.rotationX).toBeGreaterThan(first.rotationX);
     expect(second.rotationZ).toBeGreaterThan(first.rotationZ);
     expect(second).toMatchObject({
-      translateXPercent: 32,
-      scale: 0.78,
+      translateXPercent: 24,
+      scale: 0.88,
       color: "#123456",
       accent: "#abcdef",
       intensity: 0.73,
@@ -112,5 +112,6 @@ describe("shared orb motion", () => {
     expect(reduced.phase).toBe(4.2);
     expect(reduced.elapsedSeconds).toBe(12.1);
     expect(deriveOrbVisual(reduced, true).rotation).toBe(0);
+    expect(deriveOrbVisual(reduced, true)).toMatchObject({ translateXPercent: 0, scale: 1 });
   });
 });

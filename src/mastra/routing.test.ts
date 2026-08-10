@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { routeWork, suggestedAcceptanceCriteria } from "./routing";
+import { normalizeWorkstream } from "./supervisor-routing";
 
 describe("routeWork", () => {
   it("routes complex engineering to Paul at the deep tier", () => {
@@ -58,6 +59,14 @@ describe("routeWork", () => {
   it("uses the permanent creative and travel specialists", () => {
     expect(routeWork("Illustrate a storyboard for the launch").agentId).toBe("iris");
     expect(routeWork("Plan a visual trip with flights and hotels").agentId).toBe("maya");
+  });
+
+  it("corrects a planner that sends specialised visual work to Paul", () => {
+    expect(normalizeWorkstream({
+      task: "Redesign the compact task cards and improve their visual hierarchy",
+      repo: "daniels-project-space/jarvis",
+      agentId: "paul",
+    })).toMatchObject({ agentId: "iris", model: "terra", reasoningEffort: "high" });
   });
 
   it("does not honour a cheap override for hard work", () => {

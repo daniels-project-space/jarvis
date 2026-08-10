@@ -43,14 +43,18 @@ export function normalizeWorkstream(input: {
     readonly: input.readonly,
   });
   const requestedAgent = input.agentId as AgentSlug | undefined;
-  const agentId =
-    requestedAgent &&
+  const deterministicSpecialist = ["iris", "maya", "sentry"].includes(route.agentId)
+    ? route.agentId
+    : null;
+  const agentId = (
+    deterministicSpecialist ?? (requestedAgent &&
     requestedAgent !== "jarvis" &&
     TEAM_BY_SLUG[requestedAgent]
       ? requestedAgent
       : route.agentId === "jarvis"
         ? "atlas"
-        : route.agentId;
+        : route.agentId)
+  ) as Exclude<AgentSlug, "jarvis">;
   const approvalRequired =
     input.approvalRequired === true ||
     route.approvalRequired ||

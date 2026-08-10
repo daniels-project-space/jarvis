@@ -217,10 +217,30 @@ function needsAttention(row: RuntimeRow): boolean {
     || /\b(?:blocked|failed|conflict)\b/i.test(`${row.stage ?? ""} ${row.stallReason ?? ""}`);
 }
 
+function attentionKind(row: RuntimeRow): "approval" | "input" | "system" | "recovery" | null {
+  const status = String(row.status ?? "");
+  const consequentialApproval = row.approvalRequired === true
+    && row.approvalStatus === "pending"
+    && (row.risk === "consequential" || row.deliveryMode === "manual");
+  if (consequentialApproval || status === "awaiting_approval") return "approval";
+  if (row.providerRunState === "blocked") return "system";
+  if (status === "needs_input") return "input";
+  return needsAttention(row) ? "recovery" : null;
+}
+
+function attentionLabel(kind: ReturnType<typeof attentionKind>): string | null {
+  if (kind === "approval") return "Approval needed";
+  if (kind === "input") return "Your input is needed";
+  if (kind === "system") return "Secure worker setup";
+  if (kind === "recovery") return "Jarvis is recovering";
+  return null;
+}
+
 function nodeState(row: RuntimeRow, dependencyCount: number, dependenciesReady: number) {
   const status = String(row.status ?? "missing");
   const integration = String(row.integrationState ?? "");
   const stage = String(row.stage ?? status);
+  if (row.providerRunState === "blocked") return "blocked";
   if (status === "needs_input" || status === "awaiting_approval") return "needs_input";
   if (status === "stalled" || status === "error" || /\b(?:blocked|failed|conflict)\b/i.test(`${stage} ${integration}`)) return "blocked";
   if (status === "done") return "done";
@@ -236,6 +256,9 @@ function nodeState(row: RuntimeRow, dependencyCount: number, dependenciesReady: 
 function controlsFor(row: RuntimeRow) {
   const status = String(row.status ?? "");
   const controls: string[] = [];
+  // A provider admission failure is a system hold. Offering resume/steer makes
+  // the operator look responsible and only creates another doomed dispatch.
+  if (row.providerRunState === "blocked") return ["cancel"];
   const consequentialApproval = row.approvalRequired === true
     && row.approvalStatus === "pending"
     && (row.risk === "consequential" || row.deliveryMode === "manual");
@@ -358,7 +381,8 @@ function runtimeRepository(row: RuntimeRow): string | null {
 }
 
 function hierarchyRuntimeNode(row: RuntimeRow) {
-  const attention = needsAttention(row);
+  const attention = attentionKind(row);
+  const needsDaniel = attention === "approval" || attention === "input";
   const planningProjection = row.projectionKind === SUPERVISOR_PLANNING_PROJECTION;
   return {
     id: String(row.planNodeId ?? row.jobId),
@@ -386,7 +410,9 @@ function hierarchyRuntimeNode(row: RuntimeRow) {
     deliveryStatus: row.deliveryStatus ?? null,
     mergeState: mergeState(row),
     recoverySummary: recoverySummary(row),
-    needsDaniel: attention,
+    needsDaniel,
+    attentionKind: attention,
+    attentionLabel: attentionLabel(attention),
     attentionReason: attention ? String(row.stallReason ?? row.progress ?? row.stage ?? row.status).slice(0, 180) : null,
     controls: planningProjection ? [] : controlsFor(row),
     startedAt: typeof row.startedAt === "number" ? row.startedAt : null,
@@ -536,7 +562,8 @@ export function buildFleetSnapshot(input: {
     const row = activityByJob.get(jobId) ?? {};
     const incoming = rawEdges.filter((edge) => String(edge.targetNodeId) === String(node.nodeId));
     const dependenciesReady = incoming.filter((edge) => validHandoffs.has(String(edge.sourceJobId))).length;
-    const attention = needsAttention(row);
+    const attention = attentionKind(row);
+    const needsDaniel = attention === "approval" || attention === "input";
     return {
       id: String(node.nodeId), jobId,
       label: String(node.label ?? row.label ?? row.task ?? "Agent work").slice(0, 120),
@@ -555,7 +582,8 @@ export function buildFleetSnapshot(input: {
       dependencyCount: Number(node.dependencyCount ?? incoming.length), dependenciesReady,
       integrationState: String(row.integrationState ?? "not_applicable"),
       deliveryStatus: row.deliveryStatus ?? null, mergeState: mergeState(row),
-      recoverySummary: recoverySummary(row), needsDaniel: attention,
+      recoverySummary: recoverySummary(row), needsDaniel,
+      attentionKind: attention, attentionLabel: attentionLabel(attention),
       attentionReason: attention ? String(row.stallReason ?? row.progress ?? row.stage ?? row.status).slice(0, 180) : null,
       controls: controlsFor(row), startedAt: typeof row.startedAt === "number" ? row.startedAt : null,
       ...((node.projectionKind ?? row.projectionKind) === SUPERVISOR_PLANNING_PROJECTION

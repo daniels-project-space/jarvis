@@ -49,7 +49,7 @@ export const TOOL_DEFS = [
   {
     name: "dispatch_agent",
     description:
-      "Delegate durable work to JARVIS's permanent team. The same specialist can own multiple concurrent jobs, so dispatch a follow-up without pausing earlier work and link it with parent_job_id when known. The manager chooses Paul (development), Atlas (research/strategy), Iris (creative), Maya (travel), or Sentry (reliability), selects Luna/Terra/Sol intelligence, binds it to this conversation, and returns immediately. Work can checkpoint and continue for hours or days. Verified code changes in Daniel's repositories are merged automatically by the delivery controller; only protected external actions wait for Daniel. Do not delegate quick lookups.",
+      "Delegate a clear durable work order to JARVIS's permanent team. Do not call this while Daniel is still exploring an idea or while a missing directional choice would materially change the result; take a position and ask pointed questions in chat first. The same specialist can own multiple concurrent jobs, so dispatch a follow-up without pausing earlier work and link it with parent_job_id when known. The manager chooses Paul (development), Atlas (research/strategy), Iris (creative), Maya (travel), or Sentry (reliability), selects Luna/Terra/Sol intelligence, binds it to this conversation, and returns immediately. Work can checkpoint and continue for hours or days. Verified code changes in Daniel's repositories are merged automatically by the delivery controller; only protected external actions wait for Daniel. Do not delegate quick lookups.",
     parameters: {
       type: "object",
       properties: {
@@ -68,7 +68,7 @@ export const TOOL_DEFS = [
   {
     name: "orchestrate",
     description:
-      "Ask the Mastra JARVIS supervisor to plan and run a durable mission with the permanent team. You may supply 2-6 genuinely independent workstreams, or omit them and let the supervisor consult specialists and decompose the goal. Independent Trigger workers run pinned subscription Codex CLI sessions with repository-scoped tools; Trigger Realtime streams activity while Convex preserves checkpoints, automatic delivery and protected external decisions. One coherent reviewed result returns to the originating conversation.",
+      "Plan and run a durable mission only after the outcome and success criteria are clear. If Daniel is still debating direction or a missing choice could produce materially different work, discuss and ask pointed questions before calling this tool. You may supply 2-6 genuinely independent workstreams, or omit them and let the supervisor consult specialists and decompose the goal. Independent Trigger workers run pinned subscription Codex CLI sessions with repository-scoped tools; Trigger Realtime streams activity while Convex preserves checkpoints, automatic delivery and protected external decisions. One coherent reviewed result returns to the originating conversation.",
     parameters: {
       type: "object",
       properties: {
@@ -101,7 +101,7 @@ export const TOOL_DEFS = [
   {
     name: "goal_mode",
     description:
-      "Start or control one durable long-running outcome. Goal Mode uses one Sol/max architecture session, 2-8 dependency-aware Terra/high build sessions with persistent checkpoints, then Sol/max deep validation and bounded repair waves. It routes new apps through App Factory, video work through YouTube Studio AI, existing products into their own repo, and genuinely new infrastructure through Daniel's isolated cloud standard. Use for outcomes that may take hours or days; use orchestrate for a short parallel fleet.",
+      "Start or control one durable long-running outcome after direction and observable success criteria are clear; do not start Goal Mode for an exploratory conversation. Goal Mode uses a deep architecture session, 2-8 dependency-aware build sessions with persistent checkpoints, then deep validation and bounded repair waves, with adaptive model effort at each stage. It routes new apps through App Factory, video work through YouTube Studio AI, existing products into their own repo, and genuinely new infrastructure through Daniel's isolated cloud standard. Use for outcomes that may take hours or days; use orchestrate for a short parallel fleet.",
     parameters: {
       type: "object",
       properties: {

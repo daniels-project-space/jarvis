@@ -89,7 +89,7 @@ describe("orb side-mode layout contracts", () => {
     const center = viewportWidth / 2 + viewportWidth * visual.translateXPercent / 100;
     const rightStripStart = viewportWidth * 0.62;
 
-    expect(diameter).toBeCloseTo(280.8, 5);
+    expect(diameter).toBeCloseTo(316.8, 5);
     expect(center - diameter / 2).toBeGreaterThan(rightStripStart);
     expect(center + diameter / 2).toBeLessThan(viewportWidth);
     expect(jarvisSource).toContain('"top-[70%] hidden md:flex md:left-[62%] md:right-0"');

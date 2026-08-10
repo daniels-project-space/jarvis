@@ -8,6 +8,7 @@ import {
   REQUIRED_CLOUD_WORKSPACE_CAPABILITIES,
   type CloudWorkspaceProviderName,
 } from "./cloud-workspace";
+import { configuredCloudWorkspaceProviderName } from "../lib/cloud-provider-selection";
 
 export const CLOUD_PROVIDER_PROBE_SCHEMA_VERSION = 1;
 export const CLOUD_PROVIDER_PROBE_MAX_AGE_MS = 24 * 60 * 60_000;
@@ -116,9 +117,9 @@ export function cloudProviderRuntimeDigest(runtimeIdentity: string, templateDige
 }
 
 function selectedProvider(env: Readonly<Record<string, string | undefined>>): CloudWorkspaceProviderName {
-  const value = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
-  if (value === "e2b" || value === "sandbox0" || value === "vercel" || value === "cloudflare") return value;
-  throw new CloudWorkspaceError("cloudflare", "missing_configuration", "JARVIS_CLOUD_WORKSPACE_PROVIDER must select e2b, sandbox0, vercel, or cloudflare");
+  const value = configuredCloudWorkspaceProviderName(env);
+  if (value) return value;
+  throw new CloudWorkspaceError("cloudflare", "missing_configuration", "No complete managed cloud workspace configuration is available");
 }
 
 function nonemptySafe(value: string | undefined, label: string, provider: CloudWorkspaceProviderName): string {

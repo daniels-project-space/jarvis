@@ -29,10 +29,10 @@ export type OrbVisualFrame = {
 };
 
 const CYCLES: Record<OrbState, number> = {
-  idle: 28,
-  listening: 20,
-  thinking: 10,
-  speaking: 16,
+  idle: 32,
+  listening: 24,
+  thinking: 14,
+  speaking: 20,
 };
 
 const INTENSITIES: Record<OrbState, number> = {
@@ -129,7 +129,7 @@ export function advanceOrbMotionFrame(
     color,
     accent: mixHex(color, "#ffffff", 0.34),
     intensity: frame.intensity + (targetIntensity - frame.intensity) * frameDamping(1.22, easingSeconds),
-    aside: frame.aside + ((aside ? 1 : 0) - frame.aside) * frameDamping(3.08, easingSeconds),
+    aside: frame.aside + ((aside ? 1 : 0) - frame.aside) * frameDamping(2.1, easingSeconds),
   };
 }
 
@@ -139,10 +139,10 @@ export function deriveOrbVisual(frame: OrbMotionFrame, reduceMotion = false): Or
   return {
     aside: frame.aside,
     rotation: reduceMotion ? 0 : frame.phase,
-    rotationX: reduceMotion ? 0 : frame.phase * 0.17,
-    rotationZ: reduceMotion ? 0 : frame.phase * 0.09,
-    translateXPercent: 32 * frame.aside,
-    scale: 1 - 0.22 * frame.aside,
+    rotationX: reduceMotion ? 0 : frame.phase * 0.12,
+    rotationZ: reduceMotion ? 0 : frame.phase * 0.06,
+    translateXPercent: reduceMotion ? 0 : 24 * frame.aside,
+    scale: reduceMotion ? 1 : 1 - 0.12 * frame.aside,
     color: frame.color,
     accent: frame.accent,
     intensity: frame.intensity,

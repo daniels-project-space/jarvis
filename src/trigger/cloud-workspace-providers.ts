@@ -4,6 +4,7 @@ import type { Sandbox as E2BSandbox } from "e2b";
 import type { Client as Sandbox0Client, Sandbox as Sandbox0Sandbox } from "sandbox0";
 import type { Command as VercelCommand, Sandbox as VercelSandbox, Session as VercelSession } from "@vercel/sandbox";
 import { runWithDeadline } from "../lib/bounded-json";
+import { configuredCloudWorkspaceProviderName } from "../lib/cloud-provider-selection";
 import {
   CloudWorkspaceError,
   DEFAULT_WORKSPACE_LIMITS,
@@ -1334,11 +1335,11 @@ function configuredProviderAdapterForName(
 }
 
 function configuredProviderAdapter(env: Readonly<Record<string, string | undefined>>): CloudWorkspaceProvider {
-  const name = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
-  if (!["e2b", "sandbox0", "vercel", "cloudflare"].includes(name)) {
-    throw new CloudWorkspaceError("cloudflare", "missing_configuration", "JARVIS_CLOUD_WORKSPACE_PROVIDER must select e2b, sandbox0, vercel, or cloudflare");
+  const name = configuredCloudWorkspaceProviderName(env);
+  if (!name) {
+    throw new CloudWorkspaceError("cloudflare", "missing_configuration", "No complete managed cloud workspace configuration is available");
   }
-  return configuredProviderAdapterForName(env, name as CloudWorkspaceProviderName);
+  return configuredProviderAdapterForName(env, name);
 }
 
 export function configuredCloudWorkspaceProvider(
