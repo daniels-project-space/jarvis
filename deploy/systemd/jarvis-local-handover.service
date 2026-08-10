@@ -10,6 +10,10 @@ Group=root
 WorkingDirectory=/home/ubuntu/jarvis
 Environment=JARVIS_CODEX_BIN=/root/.local/bin/codex
 Environment=JARVIS_CLAUDE_BIN=/usr/bin/claude
+# Every supervisor-created Claude continuation registers with the user's
+# Claude Code session list, so the work remains visible and steerable after a
+# quota-triggered or manual handover.
+Environment=JARVIS_CLAUDE_REMOTE_CONTROL=1
 Environment=JARVIS_HANDOVER_STATE_DIR=/var/lib/jarvis-handover
 EnvironmentFile=/etc/jarvis-local-handover/runner.env
 StateDirectory=jarvis-handover

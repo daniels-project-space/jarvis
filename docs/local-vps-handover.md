@@ -14,7 +14,10 @@ Claude login, exposes an inbound port, or falls back to billed API access.
 3. when a verified weekly Codex bucket has one percent remaining, changes the
    persisted target from Codex to Claude and prepares a fresh Claude
    continuation for every registered managed session; and
-4. publishes only compact health/count/quota facts back to the Project Hub.
+4. starts that Claude continuation with Remote Control, so it appears in the
+   user's Claude Code session list as `Jarvis VPS handover <session-id>` and
+   can be opened and steered while the process continues on the VPS; and
+5. publishes only compact health/count/quota facts back to the Project Hub.
 
 If an original managed tmux session is still running, its replacement waits
 until that session exits. This prevents two agents from editing the same
@@ -83,6 +86,13 @@ The root-owned supervisor starts Claude with project/local settings and
 Claude's supported `auto` permission mode. This avoids a user-level
 `bypassPermissions` default, which Claude deliberately refuses under root,
 while retaining the normal authenticated Claude session.
+
+Every supervisor-started Claude continuation also uses Claude Remote Control.
+It uses the existing Claude subscription rather than an API key or a new
+inbound VPS port. Claude Code synchronizes that session's conversation and
+tool activity through Anthropic so the user can open the live VPS session from
+their Claude Code account; the Project Hub still receives no prompts,
+transcripts, or credentials.
 
 You can register an existing tmux workflow explicitly:
 
