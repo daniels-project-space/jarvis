@@ -76,7 +76,7 @@ function signedEnvironment(env = baseEnvironment(), value = receipt(env)): NodeJ
 
 describe("deployment-bound cloud provider probe authority", () => {
   it("reads the actually installed provider SDK version in the CommonJS live-probe runtime", () => {
-    expect(installedCloudProviderSdkVersion("vercel")).toBe("2.8.0");
+    expect(installedCloudProviderSdkVersion("vercel")).toBe("3.0.0");
   });
 
   it("keeps SANDBOX0_TOKEN alone blocked before adapter construction, hydration, or model execution", async () => {

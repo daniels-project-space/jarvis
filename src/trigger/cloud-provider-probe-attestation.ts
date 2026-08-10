@@ -19,7 +19,7 @@ export const DEFAULT_CLOUD_WORKSPACE_TEMPLATE = "node22-codex-0.144.5";
 export const CLOUD_PROVIDER_SDKS = Object.freeze({
   e2b: { package: "e2b", version: "2.35.0" },
   sandbox0: { package: "sandbox0", version: "0.9.3" },
-  vercel: { package: "@vercel/sandbox", version: "2.8.0" },
+  vercel: { package: "@vercel/sandbox", version: "3.0.0" },
   cloudflare: { package: "cloudflare-sandbox-compatible", version: "unconfigured" },
 } as const satisfies Record<CloudWorkspaceProviderName, { package: string; version: string }>);
 
