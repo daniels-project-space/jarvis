@@ -1,6 +1,7 @@
 import type { NextRequest } from "next/server";
 import { z } from "zod";
 import { controlMutation, controlQuery } from "@/lib/control-session";
+import { LOCAL_HANDOVER_REMAINING_PERCENT, localCodingRuntime } from "@/lib/local-handover-protocol";
 import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
 
 export const runtime = "nodejs";
@@ -10,6 +11,21 @@ const requestSchema = z.object({ provider: providerSchema }).strict();
 const statusSchema = z.object({
   provider: providerSchema,
   updatedAt: z.number().finite().nonnegative(),
+  handoverRevision: z.number().int().nonnegative().optional(),
+  automatic: z.object({
+    codexWeeklyRemainingPercent: z.number().int().min(1).max(100),
+  }).optional(),
+  runner: z.object({
+    connected: z.boolean(),
+    lastHeartbeatAt: z.number().finite().positive().optional(),
+    version: z.string().min(1).max(80).optional(),
+    policyRevision: z.number().int().nonnegative().optional(),
+    managedSessions: z.number().int().nonnegative().optional(),
+    deferredSessions: z.number().int().nonnegative().optional(),
+    quotaState: z.enum(["available", "threshold", "unavailable"]).optional(),
+    remainingPercent: z.number().finite().min(0).max(100).optional(),
+    resetsAt: z.number().int().positive().optional(),
+  }).optional(),
 });
 type OwnerAccess =
   | { ok: true; credentials: { authTokenHash: string } }
@@ -28,8 +44,14 @@ function safeStatus(value: unknown) {
   const provider = parsed.data.provider;
   return {
     provider,
-    targetRuntime: provider === "claude" ? "vps_claude" : "vps_codex",
+    targetRuntime: localCodingRuntime(provider),
     updatedAt: parsed.data.updatedAt,
+    handoverRevision: parsed.data.handoverRevision ?? 0,
+    automatic: {
+      codexWeeklyRemainingPercent: parsed.data.automatic?.codexWeeklyRemainingPercent
+        ?? LOCAL_HANDOVER_REMAINING_PERCENT,
+    },
+    runner: parsed.data.runner ?? { connected: false },
   };
 }
 

@@ -214,10 +214,23 @@ type LiveResearchState = {
   sourceCount: number;
 };
 type CodingProvider = "codex" | "claude";
+type LocalCodingRunnerStatus = {
+  connected: boolean;
+  lastHeartbeatAt?: number;
+  version?: string;
+  policyRevision?: number;
+  managedSessions?: number;
+  deferredSessions?: number;
+  quotaState?: "available" | "threshold" | "unavailable";
+  remainingPercent?: number;
+};
 type LocalCodingProviderStatus = {
   provider: CodingProvider;
   targetRuntime: "vps_codex" | "vps_claude";
   updatedAt: number;
+  handoverRevision: number;
+  automatic: { codexWeeklyRemainingPercent: number };
+  runner: LocalCodingRunnerStatus;
 };
 
 function parseLocalCodingProviderStatus(value: unknown): LocalCodingProviderStatus | null {
@@ -228,10 +241,54 @@ function parseLocalCodingProviderStatus(value: unknown): LocalCodingProviderStat
   const updatedAt = typeof record.updatedAt === "number" && Number.isFinite(record.updatedAt)
     ? Math.max(0, record.updatedAt)
     : 0;
+  const handoverRevision = typeof record.handoverRevision === "number"
+    && Number.isSafeInteger(record.handoverRevision)
+    && record.handoverRevision >= 0
+    ? record.handoverRevision
+    : 0;
+  const automaticRecord = record.automatic && typeof record.automatic === "object"
+    ? record.automatic as Record<string, unknown>
+    : null;
+  const threshold = typeof automaticRecord?.codexWeeklyRemainingPercent === "number"
+    && Number.isSafeInteger(automaticRecord.codexWeeklyRemainingPercent)
+    && automaticRecord.codexWeeklyRemainingPercent >= 1
+    && automaticRecord.codexWeeklyRemainingPercent <= 100
+    ? automaticRecord.codexWeeklyRemainingPercent
+    : 1;
+  const runnerRecord = record.runner && typeof record.runner === "object"
+    ? record.runner as Record<string, unknown>
+    : null;
+  const runner: LocalCodingRunnerStatus = {
+    connected: runnerRecord?.connected === true,
+    ...(typeof runnerRecord?.lastHeartbeatAt === "number" && Number.isFinite(runnerRecord.lastHeartbeatAt)
+      ? { lastHeartbeatAt: runnerRecord.lastHeartbeatAt }
+      : {}),
+    ...(typeof runnerRecord?.version === "string" && runnerRecord.version.length <= 80
+      ? { version: runnerRecord.version }
+      : {}),
+    ...(typeof runnerRecord?.policyRevision === "number" && Number.isSafeInteger(runnerRecord.policyRevision)
+      ? { policyRevision: runnerRecord.policyRevision }
+      : {}),
+    ...(typeof runnerRecord?.managedSessions === "number" && Number.isSafeInteger(runnerRecord.managedSessions)
+      ? { managedSessions: runnerRecord.managedSessions }
+      : {}),
+    ...(typeof runnerRecord?.deferredSessions === "number" && Number.isSafeInteger(runnerRecord.deferredSessions)
+      ? { deferredSessions: runnerRecord.deferredSessions }
+      : {}),
+    ...(runnerRecord?.quotaState === "available" || runnerRecord?.quotaState === "threshold" || runnerRecord?.quotaState === "unavailable"
+      ? { quotaState: runnerRecord.quotaState }
+      : {}),
+    ...(typeof runnerRecord?.remainingPercent === "number" && Number.isFinite(runnerRecord.remainingPercent)
+      ? { remainingPercent: runnerRecord.remainingPercent }
+      : {}),
+  };
   return {
     provider,
     targetRuntime: provider === "claude" ? "vps_claude" : "vps_codex",
     updatedAt,
+    handoverRevision,
+    automatic: { codexWeeklyRemainingPercent: threshold },
+    runner,
   };
 }
 

@@ -1,0 +1,34 @@
+[Unit]
+Description=Jarvis local VPS provider handover supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/home/ubuntu/jarvis
+Environment=JARVIS_CODEX_BIN=/root/.local/bin/codex
+Environment=JARVIS_CLAUDE_BIN=/usr/bin/claude
+Environment=JARVIS_HANDOVER_STATE_DIR=/var/lib/jarvis-handover
+EnvironmentFile=/etc/jarvis-local-handover/runner.env
+ExecStart=/home/ubuntu/jarvis/node_modules/.bin/tsx scripts/local-handover-supervisor.ts run
+Restart=always
+RestartSec=10
+TimeoutStartSec=30
+TimeoutStopSec=20
+# Do not terminate managed tmux/CLI work when only the lightweight supervisor
+# restarts. Their durable registry lets the next supervisor instance recover.
+KillMode=process
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+# Managed Codex and Claude sessions must be able to write their own provider
+# state and the explicitly selected VPS checkout. Keep the unit outbound-only
+# and root-owned instead of making its home tree read-only and nonfunctional.
+ProtectHome=false
+ReadWritePaths=/var/lib/jarvis-handover
+
+[Install]
+WantedBy=multi-user.target

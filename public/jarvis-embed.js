@@ -225,11 +225,39 @@
     var provider = data.provider;
     if (provider !== "codex" && provider !== "claude") return null;
     var updatedAt = Number(data.updatedAt);
-    return {
+    var handoverRevision = Number(data.handoverRevision);
+    var automatic = data.automatic && typeof data.automatic === "object" ? data.automatic : null;
+    var threshold = automatic ? Number(automatic.codexWeeklyRemainingPercent) : 1;
+    var sourceRunner = data.runner && typeof data.runner === "object" ? data.runner : null;
+    var runner = { connected: Boolean(sourceRunner && sourceRunner.connected === true) };
+    if (sourceRunner) {
+      var lastHeartbeatAt = Number(sourceRunner.lastHeartbeatAt);
+      var policyRevision = Number(sourceRunner.policyRevision);
+      var managedSessions = Number(sourceRunner.managedSessions);
+      var deferredSessions = Number(sourceRunner.deferredSessions);
+      var remainingPercent = Number(sourceRunner.remainingPercent);
+      if (Number.isFinite(lastHeartbeatAt) && lastHeartbeatAt > 0) runner.lastHeartbeatAt = lastHeartbeatAt;
+      if (Number.isInteger(policyRevision) && policyRevision >= 0) runner.policyRevision = policyRevision;
+      if (Number.isInteger(managedSessions) && managedSessions >= 0) runner.managedSessions = managedSessions;
+      if (Number.isInteger(deferredSessions) && deferredSessions >= 0) runner.deferredSessions = deferredSessions;
+      if (sourceRunner.quotaState === "available" || sourceRunner.quotaState === "threshold" || sourceRunner.quotaState === "unavailable") runner.quotaState = sourceRunner.quotaState;
+      if (Number.isFinite(remainingPercent) && remainingPercent >= 0 && remainingPercent <= 100) runner.remainingPercent = remainingPercent;
+      if (typeof sourceRunner.version === "string" && sourceRunner.version.length <= 80) runner.version = sourceRunner.version;
+    }
+    var result = {
       provider: provider,
       targetRuntime: provider === "claude" ? "vps_claude" : "vps_codex",
       updatedAt: Number.isFinite(updatedAt) && updatedAt >= 0 ? updatedAt : 0,
     };
+    // Keep the original bridge result shape for older hosts. Newer Jarvis
+    // responses carry the following compact runner fields as an additive
+    // extension; no raw terminal/session data crosses the iframe boundary.
+    if (Number.isInteger(handoverRevision) && handoverRevision >= 0) result.handoverRevision = handoverRevision;
+    if (automatic && Number.isInteger(threshold) && threshold >= 1 && threshold <= 100) {
+      result.automatic = { codexWeeklyRemainingPercent: threshold };
+    }
+    if (sourceRunner) result.runner = runner;
+    return result;
   }
 
   function codingProviderRequestId() {

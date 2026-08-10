@@ -48,12 +48,15 @@ describe("local VPS handover API", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("private, no-store");
-    expect(await response.json()).toEqual({
+    expect(await response.json()).toMatchObject({
       ok: true,
       status: {
         provider: "codex",
         targetRuntime: "vps_codex",
         updatedAt: 1_800_000_000_000,
+        handoverRevision: 0,
+        automatic: { codexWeeklyRemainingPercent: 1 },
+        runner: { connected: false },
       },
     });
     expect(mock.controlQuery).toHaveBeenCalledWith("ui:getLocalCodingProvider", { authTokenHash: "owner-hash" });
