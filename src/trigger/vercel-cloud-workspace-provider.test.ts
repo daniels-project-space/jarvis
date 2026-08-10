@@ -157,6 +157,10 @@ function executeExactListingProgram(input: Record<string, unknown>): CommandOutc
 }
 
 beforeEach(() => {
+  vi.stubGlobal("fetch", vi.fn(async () => ({
+    ok: true,
+    json: async () => ({ id: "team_1", billing: { plan: "hobby", status: "active" } }),
+  })));
   observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.updateSessions = []; observed.kills = []; observed.waits = []; observed.logConsumers = []; observed.logsClosed = 0;
   observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.readSessions = []; observed.writeSessions = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.releaseWaitOnKill = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.fenceWaitFailure = undefined; observed.deleteFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
   observed.readSignals = []; observed.updateSignals = []; observed.readAcquireStall = undefined; observed.readStream = undefined; observed.updateStall = undefined;
@@ -165,6 +169,29 @@ beforeEach(() => {
 });
 
 describe("VercelCloudWorkspaceProvider", () => {
+  it("fails closed before listing or creation unless the configured team is active zero-overage Hobby", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "team_1", billing: { plan: "pro", status: "active" } }),
+    } as Response);
+    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
+    await expect(provider.createWorkspace({
+      attemptKey: "job:paid-plan", template: "node22", runtime: "node-22",
+      lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS,
+    })).rejects.toMatchObject({ code: "invalid_configuration", disposition: "blocked" });
+    expect(observed.listInputs).toEqual([]);
+    expect(observed.create).toBeUndefined();
+
+    vi.mocked(fetch).mockRejectedValueOnce(new Error("billing endpoint unavailable"));
+    await expect(provider.createWorkspace({
+      attemptKey: "job:unknown-plan", template: "node22", runtime: "node-22",
+      lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS,
+    })).rejects.toMatchObject({ code: "provider_unavailable", disposition: "deferred" });
+    expect(observed.listInputs).toEqual([]);
+    expect(observed.create).toBeUndefined();
+  });
+
   it("uses explicit control-plane credentials and a private node22 deny-all session", async () => {
     const { provider, workspace } = await providerAndWorkspace();
     expect(workspace).toMatchObject({
@@ -562,6 +589,8 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(String(install?.args)).toContain(`${workspace.root}/.jarvis-controller-${workspace.providerWorkspaceId}/npm-cache`);
     expect(String(install?.args)).not.toContain("/vercel/sandbox/.jarvis-npm-cache");
     expect(String(install?.args)).toContain("git clean -ffd -e node_modules");
+    expect(String(install?.args)).toContain(`-e '.jarvis-controller-${workspace.providerWorkspaceId}/'`);
+    expect(String(install?.args)).toContain(`-e '.jarvis-controller-${workspace.providerWorkspaceId}/**'`);
     expect(observed.updates).toEqual([{ allow: ["registry.npmjs.org"] }, "deny-all"]);
   });
 
@@ -583,12 +612,12 @@ describe("VercelCloudWorkspaceProvider", () => {
   });
 
   it("enforces the project-scoped active-attempt controller cap before create", async () => {
-    observed.listed = Array.from({ length: 8 }, () => ({ status: "running" }));
-    const { VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    const { VERCEL_ACTIVE_SANDBOX_CAP, VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
+    observed.listed = Array.from({ length: VERCEL_ACTIVE_SANDBOX_CAP }, () => ({ status: "running" }));
     const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
     await expect(provider.createWorkspace({ attemptKey: "job:cap", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS })).rejects.toMatchObject({ code: "resource_limit" });
     expect(observed.create).toBeUndefined();
-    observed.listed = Array.from({ length: 8 }, () => ({ status: "snapshotting" }));
+    observed.listed = Array.from({ length: VERCEL_ACTIVE_SANDBOX_CAP }, () => ({ status: "snapshotting" }));
     await expect(provider.createWorkspace({ attemptKey: "job:snapshot-cap", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS })).rejects.toMatchObject({ code: "resource_limit" });
     expect(observed.create).toBeUndefined();
   });

@@ -455,8 +455,17 @@ class Sandbox0CloudWorkspaceProvider extends ProviderBase {
 
 const VERCEL_SAFE_TTL_MS = 44 * 60_000;
 const VERCEL_NPM_POLICY = Object.freeze({ allow: ["registry.npmjs.org"] });
-/** Must never exceed the durable Trigger agent-worker fleet concurrency (8). */
-export const VERCEL_ACTIVE_SANDBOX_CAP = 8;
+/** Jarvis may use at most four of the Hobby account's ten concurrent sessions. */
+export const VERCEL_ACTIVE_SANDBOX_CAP = 4;
+export const VERCEL_CLOUD_WORKSPACE_TEMPLATE_PROVENANCE = Object.freeze({
+  runtime: "node22",
+  vcpus: 2,
+  memoryMb: 4_096,
+  networkPolicy: "deny-all",
+  persistent: false,
+  portCount: 0,
+  ttlMs: VERCEL_SAFE_TTL_MS,
+});
 const VERCEL_MAX_LIST_ENTRIES = 10_000;
 export const VERCEL_NAME_PREFIX = "jarvis";
 export const VERCEL_HISTORY_PAGE_LIMIT = 50;
@@ -476,6 +485,54 @@ function vercelWorkspaceName(attemptKey: string): string {
   // The exact immutable work attempt owns one provider name. A timed-out
   // create can therefore be reconciled without allocating a competitor.
   return `${VERCEL_NAME_PREFIX}-${createHash("sha256").update(attemptKey).digest("hex").slice(0, 40)}`;
+}
+
+type VercelTeamBilling = Readonly<{ plan?: unknown; status?: unknown }>;
+
+/**
+ * Proves that Vercel cannot bill Jarvis for overage before each new sandbox.
+ * Hobby has no additional-usage purchasing or paid overage; any other or
+ * unrecognised plan fails closed until a separately attested spend cap exists.
+ */
+export async function assertVercelZeroOveragePlan(
+  token: string,
+  teamId: string,
+  signal?: AbortSignal,
+): Promise<Readonly<{ teamId: string; plan: "hobby"; status: "active"; paidOverageUsd: 0 }>> {
+  let response: Response;
+  try {
+    response = await fetch(`https://api.vercel.com/v2/teams/${encodeURIComponent(teamId)}`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+      signal,
+    });
+  } catch {
+    throw new CloudWorkspaceError("vercel", "provider_unavailable", "Vercel zero-overage plan observation failed", "deferred");
+  }
+  if (!response.ok) {
+    throw new CloudWorkspaceError("vercel", "provider_unavailable", "Vercel zero-overage plan observation was unavailable", "deferred");
+  }
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new CloudWorkspaceError("vercel", "provider_unavailable", "Vercel zero-overage plan response was malformed", "deferred");
+  }
+  const team = body && typeof body === "object" && !Array.isArray(body)
+    ? body as { id?: unknown; billing?: VercelTeamBilling }
+    : undefined;
+  if (team?.id !== teamId) {
+    throw new CloudWorkspaceError("vercel", "invalid_configuration", "Vercel zero-overage observation did not match the configured team", "blocked");
+  }
+  if (team.billing?.status !== "active" || team.billing.plan !== "hobby") {
+    throw new CloudWorkspaceError(
+      "vercel",
+      "invalid_configuration",
+      "Vercel cloud work requires an active Hobby zero-overage plan or a separately attested paid-plan spend cap",
+      "blocked",
+    );
+  }
+  return { teamId, plan: "hobby", status: "active", paidOverageUsd: 0 };
 }
 
 function vercelCwd(workspace: CloudWorkspace, cwd: string | undefined): string {
@@ -771,6 +828,10 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     if (!Number.isSafeInteger(input.limits.ttlMs) || input.limits.ttlMs < 1) {
       throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox attempt TTL must be a positive safe integer", "rejected");
     }
+    await this.controlCall(
+      "zero-overage plan observation",
+      (signal) => assertVercelZeroOveragePlan(this.token, this.teamId, signal),
+    );
     const { Sandbox } = await import("@vercel/sandbox");
     const exactName = vercelWorkspaceName(input.attemptKey);
     let active = 0;
@@ -847,15 +908,16 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
         (signal) => Sandbox.create({
           ...this.credentials(),
           name: exactName,
-          runtime: "node22",
+          runtime: VERCEL_CLOUD_WORKSPACE_TEMPLATE_PROVENANCE.runtime,
           // Deliberately no source, ports, or authority-shaped environment.
-          env: {}, ports: [], networkPolicy: "deny-all", resources: { vcpus: 2 },
-          timeout: Math.min(input.limits.ttlMs, VERCEL_SAFE_TTL_MS),
-          persistent: false,
+          env: {}, ports: [], networkPolicy: VERCEL_CLOUD_WORKSPACE_TEMPLATE_PROVENANCE.networkPolicy,
+          resources: { vcpus: VERCEL_CLOUD_WORKSPACE_TEMPLATE_PROVENANCE.vcpus },
+          timeout: Math.min(input.limits.ttlMs, VERCEL_CLOUD_WORKSPACE_TEMPLATE_PROVENANCE.ttlMs),
+          persistent: VERCEL_CLOUD_WORKSPACE_TEMPLATE_PROVENANCE.persistent,
           tags: {
             owner: "jarvis",
             attempt: createHash("sha256").update(input.attemptKey).digest("hex").slice(0, 32),
-            runtime: "node22",
+            runtime: VERCEL_CLOUD_WORKSPACE_TEMPLATE_PROVENANCE.runtime,
           },
           signal,
         }),
@@ -996,6 +1058,8 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
         const lockPath = `${this.workspaceRoot}/package-lock.json`;
         const paths = this.pathsFor(workspace);
         const cachePath = `${paths.controlDir}/npm-cache`;
+        const controlRelative = paths.controlDir.slice(this.workspaceRoot.length + 1);
+        const controlCleanExcludes = `-e ${shellQuote(`${controlRelative}/`)} -e ${shellQuote(`${controlRelative}/**`)}`;
         // A missing lock means no egress. It still proceeds through the
         // tracked deny-all update and behavioral probe below; an early return
         // here could accidentally make a future policy regression invisible.
@@ -1025,8 +1089,8 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
               "git reset --hard refs/jarvis/controller-base",
               // Preserve only dependencies and the controller-owned control
               // directory while removing install-created source mutations.
-              `git clean -ffdX -e node_modules -e ${shellQuote(paths.controlDir.slice(this.workspaceRoot.length + 1))}`,
-              `git clean -ffd -e node_modules -e ${shellQuote(paths.controlDir.slice(this.workspaceRoot.length + 1))}`,
+              `git clean -ffdX -e node_modules ${controlCleanExcludes}`,
+              `git clean -ffd -e node_modules ${controlCleanExcludes}`,
               `rm -rf -- ${shellQuote(cachePath)}`,
             ].join(" && "),
             cwd: this.workspaceRoot, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs, maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes,

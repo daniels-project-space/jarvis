@@ -8,6 +8,7 @@ import {
   canonicalProviderProbeJson,
   configuredCloudProviderProbeBinding,
   createCloudProviderProbeKeyring,
+  installedCloudProviderSdkVersion,
   type CloudProviderProbeEnvelope,
   type CloudProviderProbeReceipt,
   type CloudProviderRuntimeAttestation,
@@ -74,6 +75,10 @@ function signedEnvironment(env = baseEnvironment(), value = receipt(env)): NodeJ
 }
 
 describe("deployment-bound cloud provider probe authority", () => {
+  it("reads the actually installed provider SDK version in the CommonJS live-probe runtime", () => {
+    expect(installedCloudProviderSdkVersion("vercel")).toBe("2.8.0");
+  });
+
   it("keeps SANDBOX0_TOKEN alone blocked before adapter construction, hydration, or model execution", async () => {
     const env = baseEnvironment();
     env.JARVIS_CLOUD_PROVIDER_PROBE = "live";
@@ -142,6 +147,29 @@ describe("deployment-bound cloud provider probe authority", () => {
         code: "provider_probe_attestation_failed", disposition: "blocked",
       }));
     }
+  });
+
+  it("accepts a 30-day Vercel receipt only for the exact deployment-bound zero-overage adapter tuple", () => {
+    const env: NodeJS.ProcessEnv = {
+      ...baseEnvironment(),
+      JARVIS_CLOUD_WORKSPACE_PROVIDER: "vercel",
+      JARVIS_CLOUD_WORKSPACE_TEMPLATE: "node22",
+      VERCEL_TOKEN: "synthetic-vercel-token",
+      VERCEL_TEAM_ID: "team_test",
+      VERCEL_PROJECT_ID: "prj_test",
+      SANDBOX0_TOKEN: undefined,
+    };
+    const valid = signedEnvironment(env, receipt(env, {
+      expiresAt: NOW + 30 * 24 * 60 * 60_000,
+    }));
+    expect(configuredCloudWorkspaceProvider(valid, RUNTIME_ATTESTATION).name).toBe("vercel");
+
+    const tooLong = signedEnvironment(env, receipt(env, {
+      expiresAt: NOW + 30 * 24 * 60 * 60_000 + 1,
+    }));
+    expect(() => configuredCloudWorkspaceProvider(tooLong, RUNTIME_ATTESTATION)).toThrow(expect.objectContaining({
+      code: "provider_probe_attestation_failed", disposition: "blocked",
+    }));
   });
 
   it("rejects an otherwise valid signed receipt after the actual Trigger deployment version changes", () => {
