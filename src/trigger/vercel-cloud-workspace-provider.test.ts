@@ -309,6 +309,11 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.kills.some((value) => value.endsWith(":SIGKILL"))).toBe(true);
     expect(observed.logsClosed).toBeGreaterThan(0);
     expect(observed.kills).toHaveLength(1);
+    observed.logs = [];
+    const activeCancellation = new AbortController();
+    await expect(provider.exec(workspace, { command: "printf signal", timeoutMs: 1_000, maxOutputBytes: 1_000, signal: activeCancellation.signal })).resolves.toMatchObject({ exitCode: 0 });
+    const requested = observed.commands.find((command) => String(command.args).includes("printf signal"));
+    expect(requested?.signal).toBe(activeCancellation.signal);
   });
 
   it("applies one cumulative byte budget across stdout and stderr", async () => {

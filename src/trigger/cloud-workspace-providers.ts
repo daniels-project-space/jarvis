@@ -1295,11 +1295,10 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       // Do not pass stdout/stderr: SDK 2.8 starts an unowned log iterator for
       // detached commands when those conveniences are supplied.
       this.assertSession(workspace, sandbox);
-      // Sandbox.runCommand is the v3 command boundary: unlike the lower-level
-      // Session method it owns detached-process lifecycle and accepts the
-      // cancellation signal end-to-end. We still attest the exact Session
-      // immediately before and after the call below.
-      const creating = sandbox.runCommand({
+      // Stay on the already-attested exact Session: Sandbox.runCommand may
+      // auto-resume a stopped workspace, while Session.runCommand preserves
+      // the no-resume fence. The v3 SDK still receives cancellation directly.
+      const creating = session.runCommand({
         cmd: "sh", args: ["-lc", request.command], cwd: request.cwd, env: {},
         detached: true, timeoutMs: request.timeoutMs, signal: request.signal,
       });
