@@ -17,6 +17,15 @@ describe("agent output secret redaction", () => {
     expect(redactSensitiveText("tests 25/25 · production HTTP 200")).toBe("tests 25/25 · production HTTP 200");
   });
 
+  it("redacts authorization values and private-key material without leaving the credential behind", () => {
+    const output = redactSensitiveText(
+      "Authorization: Bearer handover-token-123456\n-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----",
+    );
+    expect(output).toContain("Authorization: Bearer [REDACTED]");
+    expect(output).toContain("[REDACTED_PRIVATE_KEY]");
+    expect(output).not.toContain("handover-token-123456");
+  });
+
   it("redacts managed-session JWTs and refresh-token assignments", () => {
     const jwt = "eyJhbGciOiJub25lIn0.eyJleHAiOjE4MDAwMDAwMDB9.signature123";
     const refresh = "managed-refresh-value-123456";

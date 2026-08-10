@@ -46,24 +46,54 @@ tmux attach -t jarvis-handover-my-work-r<revision>
 ```
 
 When the Project Hub toggle changes provider, the supervisor writes a
-mode-0600, local-only bundle with the task, Git head/status/diff stat, optional
+mode-0600, local-only bundle with the registered task, initial user prompt,
+latest submitted user instruction, Git head/status/diff stat, optional
 checkpoint, and a bounded redacted terminal tail. It starts the new native
 Codex or Claude tmux session with that bundle only after the old managed tmux
 session exits. The old session is never killed automatically, so there is no
 unsafe concurrent editing or silent loss of the last terminal state.
+
+### Prompt continuation
+
+For a session that the supervisor starts, prompt capture is deliberate and
+provider-specific:
+
+- Codex is bound to the exact launched thread through a non-secret correlation
+  marker. The supervisor reads only canonical `userMessage` items through the
+  local Codex app-server `thread/read` API; it never selects the "latest"
+  account chat or parses raw rollout files.
+- Claude is started with a supervisor-generated `--session-id` and a
+  session-specific `UserPromptSubmit` hook. The hook records only the bounded,
+  redacted submitted text for that exact session in the local state directory.
+
+When a source session is awaiting closure, the supervisor refreshes this prompt
+context again immediately before it starts the replacement. A final instruction
+typed after the toggle but before the old tmux session closes is therefore
+included in the target's handover bundle. Prompt text, transcripts, and
+credentials never reach the Project Hub, runner endpoint, heartbeat, Convex,
+or command-line arguments for the target session.
 
 You can register an existing tmux workflow explicitly:
 
 ```bash
 npx --no-install tsx scripts/local-handover-supervisor.ts adopt \
   --id existing-work --cwd /home/ubuntu/my-project --task "Describe the task" \
-  --provider codex --tmux-session my-existing-session
+  --provider codex --tmux-session my-existing-session \
+  --codex-thread-id <the-exact-codex-thread-uuid>
 ```
 
 An arbitrary existing Codex/Claude terminal cannot be safely converted without
 an explicit adoption: it has no supervisor registry, portable checkpoint, or
 controlled PTY. The supervisor intentionally leaves all unregistered processes
 untouched.
+
+For a legacy Codex session, `--codex-thread-id` is optional but enables the
+same exact-thread initial/latest-prompt import. An adopted session without that
+verified binding still hands over its registered task, checkpoint, Git state,
+and terminal tail; it does not guess from another chat in the same directory.
+An already-running Claude session cannot be retrospectively bound without a
+preinstalled session hook, so it uses the same safe fallback. All new
+supervisor-started Claude sessions are bound automatically.
 
 ## Service pairing
 
