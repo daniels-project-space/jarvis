@@ -215,6 +215,35 @@ describe("FleetCommandCenter", () => {
     expect(expanded).not.toContain("needs Daniel");
   });
 
+  it("keeps deliberately paused history out of the realtime card stack", () => {
+    const paused = node({
+      jobId: "job-paused-history",
+      label: "Old paused maintenance",
+      state: "paused",
+      status: "paused",
+      progress: "paused by Daniel",
+    });
+    const recovering = node({
+      jobId: "job-paused-recovery",
+      label: "Recover secure worker",
+      state: "paused",
+      status: "paused",
+      attentionKind: "system",
+      attentionLabel: "Secure worker setup",
+    });
+    const snapshot: CompactWorkSnapshot = {
+      ...work,
+      active: { ...work.active!, id: paused.jobId },
+      fleet: { ...work.fleet!, nodes: [paused, recovering] },
+      hierarchy: [{ ...work.hierarchy[0], projects: [{ ...work.hierarchy[0].projects[0], jobs: [paused, recovering] }] }],
+    };
+    const markup = renderToStaticMarkup(<FleetCommandCenter snapshot={snapshot} />);
+    expect(markup).not.toContain("Old paused maintenance");
+    expect(markup).toContain("Recover secure worker");
+    expect(markup.match(/data-work-card=/g)).toHaveLength(1);
+    expect(liveWorkSignalNode(snapshot)?.jobId).toBe(recovering.jobId);
+  });
+
   it("keeps actively executing streamable work ahead of newer dormant work", () => {
     const running = node({ jobId: "job-running", label: "Active implementation", progressAt: 20 });
     const queued = node({

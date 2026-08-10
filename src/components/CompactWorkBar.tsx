@@ -627,11 +627,16 @@ function liveWorkNodes(snapshot: CompactWorkSnapshot) {
   return hierarchyNodes.length ? hierarchyNodes : snapshot.fleet?.nodes ?? [];
 }
 
+function isLiveWorkCardNode(node: FleetNode) {
+  if (node.state === "done" || node.projectionKind === "supervisor_planning") return false;
+  // A deliberate pause is history, not realtime work. Keep it visible only
+  // when the pause represents an actual operator or system attention item.
+  return node.state !== "paused" || node.needsDaniel || Boolean(node.attentionKind);
+}
+
 export function liveWorkSignalNode(snapshot: CompactWorkSnapshot) {
   const nodes = liveWorkNodes(snapshot);
-  const candidates = nodes.filter((node) =>
-    node.state !== "done" && node.projectionKind !== "supervisor_planning"
-  );
+  const candidates = nodes.filter(isLiveWorkCardNode);
   const attentionNode = snapshot.active?.needsDaniel
     ? [...candidates].filter((node) => node.needsDaniel).sort((left, right) =>
         (right.progressAt ?? 0) - (left.progressAt ?? 0)
@@ -643,13 +648,11 @@ export function liveWorkSignalNode(snapshot: CompactWorkSnapshot) {
     Number(Boolean(right.workerRunId)) - Number(Boolean(left.workerRunId))
       || (right.progressAt ?? 0) - (left.progressAt ?? 0)
   )[0] ?? null;
-  const activeNode = candidates.find((node) => node.jobId === snapshot.active?.id)
-    ?? nodes.find((node) => node.jobId === snapshot.active?.id)
-    ?? null;
+  const activeNode = candidates.find((node) => node.jobId === snapshot.active?.id) ?? null;
   const freshestFallback = [...candidates].sort((left, right) =>
     (right.progressAt ?? 0) - (left.progressAt ?? 0)
   )[0] ?? null;
-  return attentionNode ?? freshestExecuting ?? activeNode ?? freshestFallback ?? nodes[0] ?? null;
+  return attentionNode ?? freshestExecuting ?? activeNode ?? freshestFallback;
 }
 
 export function liveWorkFreshnessLabel(progressAt: number | null, now: number | null) {
@@ -911,14 +914,13 @@ function CompactLiveWorkBubbleView({
 }) {
   const active = snapshot.active!;
   const nodes = liveWorkNodes(snapshot);
-  const activeAgents = nodes.filter((node) =>
-    node.state !== "done" && node.projectionKind !== "supervisor_planning"
-  );
-  const openNodes = activeAgents.length
-    ? activeAgents
-    : nodes.filter((node) => node.state !== "done");
-  const cards = openNodes.length ? openNodes : signalNode ? [signalNode] : [];
+  const liveCards = nodes.filter(isLiveWorkCardNode);
+  const cards = liveCards.length
+    ? liveCards
+    : nodes.filter((node) => node.state !== "done" && node.projectionKind === "supervisor_planning");
   const circumference = 100;
+
+  if (!cards.length) return null;
 
   return (
     <aside
@@ -927,7 +929,7 @@ function CompactLiveWorkBubbleView({
       data-work-realtime={realtimeState}
       aria-live="off"
       aria-label={`${cards.length || 1} active Jarvis task${cards.length === 1 ? "" : "s"}`}
-      className="scrollbar-thin absolute left-2 top-2 z-30 max-h-[42vh] w-[min(360px,calc(100%-16px))] overflow-y-auto pr-0.5 sm:left-3 sm:top-3 sm:max-h-[calc(100vh-24px)]"
+      className="scrollbar-thin absolute left-2 top-2 z-30 max-h-[42vh] w-[min(360px,calc(100%-16px))] overflow-y-auto pr-0.5 sm:left-3 sm:top-3 sm:max-h-[calc(100vh-96px)]"
     >
       <div className="space-y-1.5">{cards.map((durableNode) => {
         const node = signalNode?.jobId === durableNode.jobId ? signalNode : durableNode;
