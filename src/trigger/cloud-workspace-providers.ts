@@ -489,16 +489,21 @@ function vercelWorkspaceName(attemptKey: string): string {
 
 type VercelTeamBilling = Readonly<{ plan?: unknown; status?: unknown }>;
 
+export function isVercelProSpendApproved(value: string | undefined): boolean {
+  return value === "true";
+}
+
 /**
- * Proves that Vercel cannot bill Jarvis for overage before each new sandbox.
- * Hobby has no additional-usage purchasing or paid overage; any other or
- * unrecognised plan fails closed until a separately attested spend cap exists.
+ * Proves that the configured Vercel team is active and that paid usage has
+ * been deliberately approved. Hobby has no paid overage; Pro remains blocked
+ * unless the deployment carries an explicit production approval.
  */
-export async function assertVercelZeroOveragePlan(
+export async function assertVercelPlanAuthorized(
   token: string,
   teamId: string,
+  proSpendApproved: boolean,
   signal?: AbortSignal,
-): Promise<Readonly<{ teamId: string; plan: "hobby"; status: "active"; paidOverageUsd: 0 }>> {
+): Promise<Readonly<{ teamId: string; plan: "hobby" | "pro"; status: "active" }>> {
   let response: Response;
   try {
     response = await fetch(`https://api.vercel.com/v2/teams/${encodeURIComponent(teamId)}`, {
@@ -507,32 +512,40 @@ export async function assertVercelZeroOveragePlan(
       signal,
     });
   } catch {
-    throw new CloudWorkspaceError("vercel", "provider_unavailable", "Vercel zero-overage plan observation failed", "deferred");
+    throw new CloudWorkspaceError("vercel", "provider_unavailable", "Vercel plan observation failed", "deferred");
   }
   if (!response.ok) {
-    throw new CloudWorkspaceError("vercel", "provider_unavailable", "Vercel zero-overage plan observation was unavailable", "deferred");
+    throw new CloudWorkspaceError("vercel", "provider_unavailable", "Vercel plan observation was unavailable", "deferred");
   }
   let body: unknown;
   try {
     body = await response.json();
   } catch {
-    throw new CloudWorkspaceError("vercel", "provider_unavailable", "Vercel zero-overage plan response was malformed", "deferred");
+    throw new CloudWorkspaceError("vercel", "provider_unavailable", "Vercel plan response was malformed", "deferred");
   }
   const team = body && typeof body === "object" && !Array.isArray(body)
     ? body as { id?: unknown; billing?: VercelTeamBilling }
     : undefined;
   if (team?.id !== teamId) {
-    throw new CloudWorkspaceError("vercel", "invalid_configuration", "Vercel zero-overage observation did not match the configured team", "blocked");
+    throw new CloudWorkspaceError("vercel", "invalid_configuration", "Vercel plan observation did not match the configured team", "blocked");
   }
-  if (team.billing?.status !== "active" || team.billing.plan !== "hobby") {
+  if (team.billing?.status !== "active" || (team.billing.plan !== "hobby" && team.billing.plan !== "pro")) {
     throw new CloudWorkspaceError(
       "vercel",
       "invalid_configuration",
-      "Vercel cloud work requires an active Hobby zero-overage plan or a separately attested paid-plan spend cap",
+      "Vercel cloud work requires an active Hobby or Pro plan",
       "blocked",
     );
   }
-  return { teamId, plan: "hobby", status: "active", paidOverageUsd: 0 };
+  if (team.billing.plan === "pro" && !proSpendApproved) {
+    throw new CloudWorkspaceError(
+      "vercel",
+      "invalid_configuration",
+      "Vercel Pro sandbox usage requires JARVIS_VERCEL_PRO_SPEND_APPROVED=true",
+      "blocked",
+    );
+  }
+  return { teamId, plan: team.billing.plan, status: "active" };
 }
 
 function vercelCwd(workspace: CloudWorkspace, cwd: string | undefined): string {
@@ -716,6 +729,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       createMs: VERCEL_CREATE_DEADLINE_MS,
       controlMs: VERCEL_CONTROL_DEADLINE_MS,
     },
+    private readonly proSpendApproved = false,
   ) {
     super();
     if (Object.values(deadlines).some((value) => !Number.isSafeInteger(value) || value < 1 || value > 10 * 60_000)) {
@@ -829,8 +843,8 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox attempt TTL must be a positive safe integer", "rejected");
     }
     await this.controlCall(
-      "zero-overage plan observation",
-      (signal) => assertVercelZeroOveragePlan(this.token, this.teamId, signal),
+      "plan authorization observation",
+      (signal) => assertVercelPlanAuthorized(this.token, this.teamId, this.proSpendApproved, signal),
     );
     const { Sandbox } = await import("@vercel/sandbox");
     const exactName = vercelWorkspaceName(input.attemptKey);
@@ -1390,7 +1404,13 @@ function configuredProviderAdapterForName(
     if (!env.VERCEL_TOKEN || !env.VERCEL_TEAM_ID || !env.VERCEL_PROJECT_ID) {
       throw new CloudWorkspaceError("vercel", "missing_configuration", "VERCEL_TOKEN, VERCEL_TEAM_ID, and VERCEL_PROJECT_ID are all required");
     }
-    return new VercelCloudWorkspaceProvider(env.VERCEL_TOKEN, env.VERCEL_TEAM_ID, env.VERCEL_PROJECT_ID);
+    return new VercelCloudWorkspaceProvider(
+      env.VERCEL_TOKEN,
+      env.VERCEL_TEAM_ID,
+      env.VERCEL_PROJECT_ID,
+      undefined,
+      isVercelProSpendApproved(env.JARVIS_VERCEL_PRO_SPEND_APPROVED),
+    );
   }
   if (name === "cloudflare") {
     throw new CloudWorkspaceError("cloudflare", "missing_configuration", "Cloudflare Sandbox-compatible client is not configured");

@@ -17,8 +17,9 @@ import {
   type CloudWorkspace,
 } from "../src/trigger/cloud-workspace";
 import {
-  assertVercelZeroOveragePlan,
+  assertVercelPlanAuthorized,
   configuredCloudWorkspaceProviderForLiveProbe,
+  isVercelProSpendApproved,
   VERCEL_ACTIVE_SANDBOX_CAP,
   VERCEL_CLOUD_WORKSPACE_TEMPLATE_PROVENANCE,
   VERCEL_HISTORY_PAGE_CEILING,
@@ -318,13 +319,14 @@ async function main() {
     await provider.terminate(recreated, "terminal");
     recreated = null;
 
-    // Re-observe the account after the full lifecycle so the receipt records
-    // authoritative zero-overage state, not merely the pre-create check.
+    // Re-observe the active plan and deliberate paid-plan authorization after
+    // the full lifecycle, rather than relying on a pre-create observation.
     if (binding.provider === "vercel") {
-      probeStage = "final zero-overage plan observation";
-      await runWithDeadline(30_000, (signal) => assertVercelZeroOveragePlan(
+      probeStage = "final plan authorization observation";
+      await runWithDeadline(30_000, (signal) => assertVercelPlanAuthorized(
         process.env.VERCEL_TOKEN!,
         process.env.VERCEL_TEAM_ID!,
+        isVercelProSpendApproved(process.env.JARVIS_VERCEL_PRO_SPEND_APPROVED),
         signal,
       ));
     }

@@ -169,7 +169,7 @@ beforeEach(() => {
 });
 
 describe("VercelCloudWorkspaceProvider", () => {
-  it("fails closed before listing or creation unless the configured team is active zero-overage Hobby", async () => {
+  it("requires explicit approval before a Pro team can create a sandbox", async () => {
     vi.mocked(fetch).mockResolvedValueOnce({
       ok: true,
       json: async () => ({ id: "team_1", billing: { plan: "pro", status: "active" } }),
@@ -183,6 +183,19 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.listInputs).toEqual([]);
     expect(observed.create).toBeUndefined();
 
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "team_1", billing: { plan: "pro", status: "active" } }),
+    } as Response);
+    const approvedProvider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1", undefined, true);
+    await expect(approvedProvider.createWorkspace({
+      attemptKey: "job:approved-paid-plan", template: "node22", runtime: "node-22",
+      lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS,
+    })).resolves.toMatchObject({ provider: "vercel" });
+    expect(observed.create).toBeDefined();
+
+    observed.listInputs = [];
+    observed.create = undefined;
     vi.mocked(fetch).mockRejectedValueOnce(new Error("billing endpoint unavailable"));
     await expect(provider.createWorkspace({
       attemptKey: "job:unknown-plan", template: "node22", runtime: "node-22",
