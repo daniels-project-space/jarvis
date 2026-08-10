@@ -12,6 +12,8 @@ Environment=JARVIS_CODEX_BIN=/root/.local/bin/codex
 Environment=JARVIS_CLAUDE_BIN=/usr/bin/claude
 Environment=JARVIS_HANDOVER_STATE_DIR=/var/lib/jarvis-handover
 EnvironmentFile=/etc/jarvis-local-handover/runner.env
+StateDirectory=jarvis-handover
+StateDirectoryMode=0700
 ExecStart=/home/ubuntu/jarvis/node_modules/.bin/tsx scripts/local-handover-supervisor.ts run
 Restart=always
 RestartSec=10
