@@ -24,6 +24,9 @@ import {
   supervisorControlPayload,
   supervisorRequestIdentity,
   workRealtimeRetryDelay,
+  workModelLabel,
+  workStatusLabel,
+  workTaskTitle,
   workerDetailControls,
 } from "./CompactWorkBar";
 
@@ -89,20 +92,21 @@ describe("FleetCommandCenter", () => {
     expect(markup).toContain('data-mission-group="mission-group-2"');
     expect(markup).toContain('data-project-group="project-group-1"');
     expect(markup).toContain('data-project-group="project-group-2"');
-    expect(markup).toContain("terra/high");
+    expect(markup).toContain("Terra · high effort");
     expect(markup).toContain("Terra/high for bounded implementation and validation");
-    expect(markup).toContain("sol/max");
+    expect(markup).toContain("Sol · max effort");
     expect(markup).toContain("Sol/max for integration authority review");
     expect(markup).not.toContain("Legacy completed tile");
     expect(markup).not.toContain("Live fleet dependency graph");
     expect(markup).not.toContain("Fleet workstreams");
   });
 
-  it("starts as exactly one compact ownership surface with the extra-worker count", () => {
+  it("starts as a compact card stack with one clear card per active task", () => {
     const markup = renderToStaticMarkup(<FleetCommandCenter snapshot={work} />);
     expect(markup.match(/data-fleet-surface/g)).toHaveLength(1);
     expect(markup).toContain('data-fleet-surface="collapsed"');
     expect(markup).toContain('data-work-id="job-1"');
+    expect(markup).toContain('data-work-card="job-1"');
     expect(markup).toContain("Unified fleet surface");
     expect(markup).toContain('data-work-progress="64"');
     expect(markup).toContain('data-work-realtime="durable"');
@@ -113,7 +117,7 @@ describe("FleetCommandCenter", () => {
     expect(markup).toContain("data-work-progress-meter");
     expect(markup).toContain("stroke-dashoffset=\"36\"");
     expect(markup).toContain('style="width:64%"');
-    expect(markup).toContain("3 open");
+    expect(markup).toContain("Terra · high effort");
     expect(markup).not.toContain("data-fleet-worker-detail");
     expect(markup).not.toContain("live work terminal");
   });
@@ -153,7 +157,7 @@ describe("FleetCommandCenter", () => {
     expect(realtimeWorkSignalState("job-1", metadata, { finished: true })).toBe("durable");
   });
 
-  it("shows attention before a fresher parallel worker and otherwise follows the freshest signal", () => {
+  it("streams the attention task first while keeping every parallel task visible", () => {
     const attention = node({ jobId: "job-attention", label: "Approval gate", needsDaniel: true, state: "needs_input", progress: "Choose the production cap", progressAt: 20 });
     const freshest = node({ id: "parallel", jobId: "job-parallel", label: "Parallel validation", progress: "Running mobile checks", progressAt: 90 });
     const snapshot: CompactWorkSnapshot = {
@@ -169,8 +173,46 @@ describe("FleetCommandCenter", () => {
     expect(markup).toContain('data-work-progress="64"');
     expect(markup).toContain("Approval gate");
     expect(markup).toContain("Choose the production cap");
-    expect(markup).toContain("needs Daniel");
-    expect(markup).not.toContain("Running mobile checks");
+    expect(markup).toContain("Your input is needed");
+    expect(markup).toContain("Running mobile checks");
+    expect(markup.match(/data-work-card=/g)).toHaveLength(2);
+  });
+
+  it("uses plain-English task, model, and recoverable system labels", () => {
+    expect(workTaskTitle("Paul · In daniels-project-space/jarvis: fix random code labels"))
+      .toBe("fix random code labels");
+    expect(workModelLabel("terra", "high")).toBe("Terra · high effort");
+    expect(workStatusLabel(node({
+      state: "blocked",
+      needsDaniel: false,
+      attentionKind: "system",
+      attentionLabel: "Secure worker setup",
+    }))).toBe("Secure worker setup");
+
+    const systemNode = node({
+      jobId: "job-system",
+      label: "Paul · In daniels-project-space/jarvis: continue provider work",
+      state: "blocked",
+      status: "paused",
+      stage: "needs Daniel",
+      attentionKind: "system",
+      attentionLabel: "Secure worker setup",
+      attentionReason: "No complete managed worker configuration is available",
+      needsDaniel: false,
+    });
+    const snapshot: CompactWorkSnapshot = {
+      ...work,
+      active: { ...work.active!, id: systemNode.jobId, needsDaniel: false },
+      fleet: { ...work.fleet!, phase: "needs Daniel", nodes: [systemNode] },
+      hierarchy: [{ ...work.hierarchy[0], phase: "needs Daniel", projects: [{ ...work.hierarchy[0].projects[0], jobs: [systemNode] }] }],
+    };
+    const markup = renderToStaticMarkup(<FleetCommandCenter snapshot={snapshot} />);
+    expect(markup).toContain("continue provider work");
+    expect(markup).toContain("Secure worker setup");
+    expect(markup).not.toContain("Needs Daniel");
+    const expanded = renderToStaticMarkup(<FleetCommandCenter snapshot={snapshot} initialExpanded />);
+    expect(expanded).toContain("Secure worker recovery");
+    expect(expanded).not.toContain("needs Daniel");
   });
 
   it("keeps actively executing streamable work ahead of newer dormant work", () => {
@@ -216,7 +258,7 @@ describe("FleetCommandCenter", () => {
       };
       const markup = renderToStaticMarkup(<FleetCommandCenter snapshot={snapshot} />);
       expect(markup).toContain(`data-work-progress="${phase.percent}"`);
-      expect(markup).toContain(phase.stage);
+      expect(markup).toContain(workStatusLabel(currentNode));
       expect(markup).toContain(phase.progress);
       expect(markup).toContain(`stroke-dashoffset="${100 - phase.percent}"`);
       expect(markup).toContain(`style="width:${phase.percent}%"`);
@@ -342,7 +384,7 @@ describe("FleetCommandCenter", () => {
     expect(collapsed).toContain("Planning · Upgrade Jarvis");
     expect(expanded.match(/data-fleet-surface/g)).toHaveLength(1);
     expect(expanded.match(/data-supervisor-planning/g)).toHaveLength(1);
-    expect(expanded).toContain("0 active jobs · 1 planning");
+    expect(expanded).toContain("0 active tasks · 1 planning");
     expect(expanded).not.toContain("data-active-job");
     expect(expanded).not.toContain("loading exact work detail");
   });
@@ -767,7 +809,7 @@ describe("FleetCommandCenter", () => {
   it("keeps the one work surface in the compact top-left or expanded side slot and yields to explicit panels", () => {
     const workBar = readFileSync(new URL("./CompactWorkBar.tsx", import.meta.url), "utf8");
     const jarvis = readFileSync(new URL("./JarvisUI.tsx", import.meta.url), "utf8");
-    expect(workBar).toMatch(/data-fleet-surface="collapsed"[\s\S]{0,180}absolute left-2 top-2/);
+    expect(workBar).toMatch(/data-fleet-surface="collapsed"[\s\S]{0,520}absolute left-2 top-2/);
     expect(workBar).toMatch(/data-fleet-surface="expanded"[\s\S]{0,260}md:left-2 md:right-auto/);
     expect(jarvis).toMatch(/<FleetCommandCenter[\s\S]{0,220}hidden=\{overlayUp\}/);
     expect(jarvis.match(/setPanel\(\{ type: "fleet"/g)).toHaveLength(1);

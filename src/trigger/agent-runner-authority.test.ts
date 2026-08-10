@@ -1052,7 +1052,7 @@ describe("production Trigger worker authority harness", () => {
     { disposition: "blocked" as const, code: "missing_configuration" as const },
     { disposition: "rejected" as const, code: "checkpoint_tampered" as const },
   ])(
-    "holds a $disposition cloud authority failure for input without spending another attempt",
+    "holds a $disposition cloud authority failure for automatic system recovery without spending another attempt",
     async ({ disposition, code }) => {
       configureFakeControllerAuthority();
       const t = convexTest(schema, modules);
@@ -1100,34 +1100,46 @@ describe("production Trigger worker authority harness", () => {
         attention: await ctx.db.query("attentionItems").collect(),
       }));
       expect(state.job).toMatchObject({
-        status: "needs_input",
+        status: "paused",
         attempt: 1,
         providerRunState: "blocked",
       });
       expect(state.job?.nextRunAt).toBeUndefined();
       expect(state.runtime).toMatchObject({
-        status: "needs_input",
+        status: "paused",
         attempt: 1,
       });
       expect(state.attempts).toHaveLength(1);
       expect(state.attempts[0]).toMatchObject({
         attempt: 1,
-        status: "needs_input",
+        status: "paused",
       });
       expect(state.dispatchReceipts).toHaveLength(1);
       expect(state.dispatchReceipts[0]).toMatchObject({ status: "closed" });
-      expect(state.attention).toHaveLength(1);
+      expect(state.attention).toHaveLength(0);
       expect(bridge.trace.map((call) => call.path)).toContain(
         "jobs:noteCloudWorkspaceBlock",
       );
-      expect(bridge.trace.map((call) => call.path)).toContain(
+      expect(bridge.trace.map((call) => call.path)).not.toContain(
         "jobs:requestInput",
       );
-      expect(bridge.trace.map((call) => call.path)).not.toContain(
+      expect(bridge.trace.map((call) => call.path)).toContain(
         "jobs:checkpointAndRequeue",
       );
       expect((dependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
       expect((dependencies.prepareSubscriptionEnv as any)).not.toHaveBeenCalled();
+
+      expect(await t.mutation(api.jobs.resumeCloudWorkspaceBlocks, {
+        limit: 8,
+        workerToken: WORKER,
+      })).toEqual({ resumed: [String(jobId)] });
+      const resumed = await t.run(async (ctx) => ctx.db.get(jobId));
+      expect(resumed).toMatchObject({
+        status: "pending",
+        attempt: 2,
+        providerRunState: "queued",
+        progress: "Secure worker ready · continuing automatically",
+      });
     },
   );
 

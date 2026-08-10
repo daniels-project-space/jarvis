@@ -92,7 +92,6 @@ describe("cloud provider Goal Mode admission readiness", () => {
   });
 
   it.each([
-    "JARVIS_CLOUD_WORKSPACE_PROVIDER",
     "JARVIS_CLOUD_WORKSPACE_TEMPLATE",
     "JARVIS_CLOUD_WORKSPACE_TEMPLATE_DIGEST",
     "JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID",
@@ -101,6 +100,12 @@ describe("cloud provider Goal Mode admission readiness", () => {
       ready: false,
       code: "missing_configuration",
     });
+  });
+
+  it("recovers a missing provider selector from the bound receipt", () => {
+    expect(cloudProviderAdmissionReadiness(environment({
+      JARVIS_CLOUD_WORKSPACE_PROVIDER: undefined,
+    }), NOW)).toEqual({ ready: true });
   });
 
   it("distinguishes a missing receipt from malformed evidence", () => {

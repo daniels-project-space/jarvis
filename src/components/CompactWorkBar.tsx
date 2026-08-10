@@ -44,6 +44,47 @@ function agentName(id: string) {
     ?? id.charAt(0).toUpperCase() + id.slice(1);
 }
 
+export function workTaskTitle(label: string): string {
+  const cleaned = String(label || "Jarvis task")
+    .replace(/^(?:jarvis|paul|atlas|iris|maya|sentry)\s*[·:—-]\s*/i, "")
+    .replace(/^planning\s*[·:—-]\s*/i, "")
+    .replace(/^(?:in|for)\s+(?:daniels-project-space\/)?[a-z0-9._-]+\s*[·:—-]\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || "Jarvis task";
+}
+
+export function workModelLabel(model: string | null, effort: string | null): string {
+  const tier = model ? `${model.charAt(0).toUpperCase()}${model.slice(1)}` : "Auto";
+  return `${tier} · ${effort || "adaptive"} effort`;
+}
+
+export function workStatusLabel(node: Pick<FleetNode, "state" | "stage" | "needsDaniel" | "attentionKind" | "attentionLabel">): string {
+  if (node.attentionLabel) return node.attentionLabel;
+  if (node.needsDaniel) return "Your input is needed";
+  if (node.attentionKind === "system") return "Waiting for secure worker";
+  if (node.attentionKind === "recovery") return "Jarvis is recovering";
+  return ({
+    queued: "Queued",
+    dependency_held: "Waiting for earlier work",
+    dispatching: "Preparing the specialist",
+    running: "Working",
+    reviewing: "Checking the result",
+    integrating: "Delivering changes",
+    paused: "Paused",
+    done: "Complete",
+    blocked: "Recovery in progress",
+    needs_input: "Your input is needed",
+  } as Record<string, string>)[node.state] ?? node.stage.replace(/[_-]+/g, " ");
+}
+
+function workPhaseLabel(phase: string, nodes: readonly FleetNode[]): string {
+  if (nodes.some((node) => node.needsDaniel)) return phase;
+  if (nodes.some((node) => node.attentionKind === "system")) return "Secure worker recovery";
+  if (/needs\s+daniel/i.test(phase)) return "Jarvis recovery";
+  return phase;
+}
+
 function progressStamp(value: number | null) {
   return value ? new Date(value).toISOString().replace("T", " ").slice(0, 19) + "Z" : "not recorded";
 }
@@ -567,12 +608,12 @@ export function WorkerDetail({
   return <section data-fleet-worker-detail className="flex min-h-0 flex-1 flex-col gap-2 rounded-xl border border-white/[0.08] bg-black/20 p-3">
     <div className="flex min-w-0 items-start gap-2">
       <button type="button" onClick={onBack} className="shrink-0 text-xs text-cyan" aria-label="Back to fleet">←</button>
-      <div className="min-w-0 flex-1"><div className="truncate text-xs text-ice">{agentName(node.agent)} · {node.label}</div><div className="mt-0.5 truncate font-mono text-[8px] uppercase tracking-[0.12em] text-slate">{node.model ?? "auto"}/{node.reasoningEffort ?? "default"} · gen {node.generation} · attempt {node.attempt}/{node.maxAttempts}</div>{node.modelReason && <div className="mt-1 text-[9px] leading-snug text-slate">route · {node.modelReason}</div>}</div>
+      <div className="min-w-0 flex-1"><div className="truncate text-xs text-ice">{workTaskTitle(node.label)}</div><div className="mt-0.5 truncate font-mono text-[8px] uppercase tracking-[0.12em] text-slate">{agentName(node.agent)} · {workModelLabel(node.model, node.reasoningEffort)} · attempt {node.attempt}/{node.maxAttempts}</div>{node.modelReason && <div className="mt-1 text-[9px] leading-snug text-slate">Why this model · {node.modelReason}</div>}</div>
       <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[8px] ${STATE_STYLE[node.state]}`}>{node.state.replace("_", " ")}</span>
     </div>
-    <div className="grid grid-cols-2 gap-1 text-[9px] text-slate"><div className="truncate">stage · <span className="text-ice">{node.stage}</span></div><div className="truncate">merge · <span className="text-ice">{node.mergeState}</span></div><div className="truncate">handoffs · <span className="text-ice">{node.dependenciesReady}/{node.dependencyCount}</span></div><div className="truncate">runtime · <span className="text-ice">{node.workerRuntime ?? "not assigned"}</span></div><div className="col-span-2 truncate">last meaningful progress · <span className="font-mono text-ice">{progressStamp(node.progressAt)}</span></div></div>
-    {node.recoverySummary && <div className="rounded-lg border border-blue-400/15 bg-blue-400/[0.05] px-2 py-1 text-[9px] text-blue-200">recovery · {node.recoverySummary}</div>}
-    {node.attentionReason && <div className="rounded-lg border border-amber/20 bg-amber/[0.06] px-2 py-1 text-[9px] text-amber">Needs Daniel · {node.attentionReason}</div>}
+    <div className="grid grid-cols-2 gap-1 text-[9px] text-slate"><div className="truncate">status · <span className="text-ice">{workStatusLabel(node)}</span></div><div className="truncate">merge · <span className="text-ice">{node.mergeState}</span></div><div className="truncate">handoffs · <span className="text-ice">{node.dependenciesReady}/{node.dependencyCount}</span></div><div className="truncate">runtime · <span className="text-ice">{node.workerRuntime ?? "not assigned"}</span></div><div className="col-span-2 truncate">last meaningful progress · <span className="font-mono text-ice">{progressStamp(node.progressAt)}</span></div></div>
+    {node.recoverySummary && <div className="rounded-lg border border-blue-400/15 bg-blue-400/[0.05] px-2 py-1 text-[9px] text-blue-200">Recovery · {node.recoverySummary}</div>}
+    {node.attentionReason && <div className={`rounded-lg border px-2 py-1 text-[9px] ${node.needsDaniel ? "border-amber/20 bg-amber/[0.06] text-amber" : "border-sky-400/20 bg-sky-400/[0.06] text-sky-200"}`}>{node.attentionLabel ?? (node.needsDaniel ? "Your input is needed" : "Jarvis is recovering")} · {node.attentionReason}</div>}
     <LazyWorkerLog node={node} />
     {error && <div role="alert" data-control-error className="rounded-lg border border-rose-400/25 bg-rose-400/[0.07] px-2 py-1 text-[9px] text-rose-300">{error}</div>}
     <Controls key={`job:${node.jobId}`} controls={controls} target={{ jobId: node.jobId }} onError={setError} />
@@ -866,100 +907,73 @@ function CompactLiveWorkBubbleView({
   snapshot: CompactWorkSnapshot;
   signalNode: FleetNode | null;
   realtimeState: "durable" | "connecting" | "realtime";
-  onOpen: () => void;
+  onOpen: (jobId?: string) => void;
 }) {
   const active = snapshot.active!;
   const nodes = liveWorkNodes(snapshot);
   const activeAgents = nodes.filter((node) =>
     node.state !== "done" && node.projectionKind !== "supervisor_planning"
   );
-  const openWorkCount = Math.max(1, activeAgents.length, active.extraCount + 1);
-  const percent = Math.max(0, Math.min(100, signalNode?.percent ?? active.percent));
-  const announcedPercent = Math.floor(percent / 10) * 10;
-  const label = signalNode?.label || active.label;
-  const progress = signalNode?.progress.trim() || signalNode?.stage || active.stage;
-  const stage = signalNode?.stage || active.stage;
-  const signalKey = `${signalNode?.jobId ?? active.id}:${signalNode?.progressAt ?? 0}:${progress}`;
+  const openNodes = activeAgents.length
+    ? activeAgents
+    : nodes.filter((node) => node.state !== "done");
+  const cards = openNodes.length ? openNodes : signalNode ? [signalNode] : [];
   const circumference = 100;
 
   return (
     <aside
       data-fleet-surface="collapsed"
       data-work-id={active.id}
-      data-work-progress={percent}
       data-work-realtime={realtimeState}
       aria-live="off"
-      className="absolute left-2 top-2 z-30 w-[min(400px,calc(100%-16px))] sm:left-3 sm:top-3"
+      aria-label={`${cards.length || 1} active Jarvis task${cards.length === 1 ? "" : "s"}`}
+      className="scrollbar-thin absolute left-2 top-2 z-30 max-h-[42vh] w-[min(360px,calc(100%-16px))] overflow-y-auto pr-0.5 sm:left-3 sm:top-3 sm:max-h-[calc(100vh-24px)]"
     >
-      <button
-        type="button"
-        onClick={onOpen}
-        aria-expanded="false"
-        aria-label={`Open live work for ${label}: ${percent}% ${stage}. ${progress}`}
-        className={`work-progress-button glass group relative grid min-h-[76px] w-full grid-cols-[54px_minmax(0,1fr)_auto] items-center gap-2.5 overflow-hidden rounded-2xl bg-[#071019]/94 px-2.5 py-2 pr-3 text-left shadow-[0_10px_36px_rgba(0,0,0,.38)] transition-[border-color,box-shadow,transform] duration-300 ease-out hover:-translate-y-0.5 hover:shadow-[0_14px_42px_rgba(0,0,0,.46)] motion-reduce:transform-none motion-reduce:transition-none max-[340px]:grid-cols-[54px_minmax(0,1fr)] ${
-          active.needsDaniel ? "!border-amber/35 hover:!border-amber/60" : "!border-cyan/30 hover:!border-cyan/60"
-        }`}
-      >
-        <span className="relative grid h-[50px] w-[50px] shrink-0 place-items-center" role="progressbar" aria-label={`${label} progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}>
-          <svg aria-hidden="true" viewBox="0 0 40 40" className="absolute inset-0 h-full w-full -rotate-90 overflow-visible">
-            <circle cx="20" cy="20" r="16" fill="rgba(3,10,16,.82)" stroke="rgba(255,255,255,.09)" strokeWidth="2.5" />
-            <circle
-              data-work-progress-ring
-              className={`work-progress-ring ${active.needsDaniel ? "stroke-amber" : "stroke-cyan"}`}
-              cx="20"
-              cy="20"
-              r="16"
-              fill="none"
-              pathLength={circumference}
-              strokeDasharray={circumference}
-              strokeDashoffset={circumference - percent}
-              strokeLinecap="round"
-              strokeWidth="2.5"
-            />
-          </svg>
-          <span className={`work-live-pulse absolute inset-[11px] rounded-full ${active.needsDaniel ? "bg-amber/10" : "bg-cyan/10"}`} />
-          <span className={`relative font-mono text-[10px] font-semibold ${active.needsDaniel ? "text-amber" : "text-cyan"}`}>{percent}<span className="text-[7px]">%</span></span>
-          <span className={`absolute right-0.5 top-0.5 h-2 w-2 rounded-full border-2 border-[#071019] ${active.needsDaniel ? "bg-amber" : "bg-cyan"}`} />
-        </span>
-
-        <span className="min-w-0 self-center">
-          <span className={`flex min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap font-mono text-[7px] uppercase tracking-[0.12em] ${active.needsDaniel ? "text-amber" : "text-cyan/75"}`}>
-            <span className="shrink-0">{active.needsDaniel ? "needs Daniel" : "Jarvis working"}</span>
-            <span aria-hidden="true" className="text-white/15">·</span>
-            <span className="shrink-0">{realtimeState === "realtime" ? "live" : realtimeState === "connecting" ? "syncing" : "checkpoint"}</span>
-            <span aria-hidden="true" className="hidden text-white/15 sm:inline">·</span>
-            <span className="hidden min-w-0 truncate sm:inline"><LiveWorkFreshness progressAt={signalNode?.progressAt ?? null} realtime={realtimeState === "realtime"} /></span>
+      <div className="space-y-1.5">{cards.map((durableNode) => {
+        const node = signalNode?.jobId === durableNode.jobId ? signalNode : durableNode;
+        const percent = Math.max(0, Math.min(100, node.percent));
+        const progress = node.progress.trim() || node.stage;
+        const title = workTaskTitle(node.label);
+        const status = workStatusLabel(node);
+        const personal = node.needsDaniel;
+        const system = node.attentionKind === "system" || node.attentionKind === "recovery";
+        const ringClass = personal ? "stroke-amber" : system ? "stroke-sky-400" : "stroke-cyan";
+        const textClass = personal ? "text-amber" : system ? "text-sky-300" : "text-cyan";
+        const meterClass = personal ? "bg-amber" : system ? "bg-sky-400" : "bg-cyan";
+        const cardRealtime = signalNode?.jobId === node.jobId ? realtimeState : "durable";
+        return <button
+          key={node.jobId}
+          type="button"
+          data-work-card={node.jobId}
+          data-work-progress={percent}
+          onClick={() => onOpen(node.projectionKind === "supervisor_planning" ? undefined : node.jobId)}
+          aria-expanded="false"
+          aria-label={`Open ${title}: ${percent}% ${status}. ${progress}`}
+          className={`work-progress-button glass group relative grid min-h-[68px] w-full grid-cols-[44px_minmax(0,1fr)_auto] items-center gap-2 overflow-hidden rounded-xl bg-[#071019]/94 px-2 py-1.5 pr-2.5 text-left shadow-[0_8px_28px_rgba(0,0,0,.34)] transition-[border-color,box-shadow,transform] duration-200 ease-out hover:-translate-y-px hover:shadow-[0_10px_32px_rgba(0,0,0,.4)] motion-reduce:transform-none motion-reduce:transition-none ${
+            personal ? "!border-amber/35 hover:!border-amber/60" : system ? "!border-sky-400/30 hover:!border-sky-400/55" : "!border-cyan/25 hover:!border-cyan/50"
+          }`}
+        >
+          <span className="relative grid h-10 w-10 shrink-0 place-items-center" role="progressbar" aria-label={`${title} progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}>
+            <svg aria-hidden="true" viewBox="0 0 40 40" className="absolute inset-0 h-full w-full -rotate-90 overflow-visible">
+              <circle cx="20" cy="20" r="16" fill="rgba(3,10,16,.82)" stroke="rgba(255,255,255,.09)" strokeWidth="2.5" />
+              <circle data-work-progress-ring className={`work-progress-ring ${ringClass}`} cx="20" cy="20" r="16" fill="none" pathLength={circumference} strokeDasharray={circumference} strokeDashoffset={circumference - percent} strokeLinecap="round" strokeWidth="2.5" />
+            </svg>
+            <span className={`relative font-mono text-[9px] font-semibold ${textClass}`}>{percent}<span className="text-[6px]">%</span></span>
           </span>
-          <span className="mt-0.5 block truncate text-[11px] font-medium text-ice" title={label}>{label}</span>
-          <span
-            key={signalKey}
-            data-work-progress-update
-            className="work-progress-update mt-0.5 block truncate text-[9px] text-slate"
-            title={`${signalNode ? agentName(signalNode.agent) : "JARVIS"} · ${progress}`}
-          >
-            <span className={active.needsDaniel ? "text-amber/90" : "text-cyan/80"}>{signalNode ? agentName(signalNode.agent) : "JARVIS"}</span>
-            <span className="text-white/20"> · </span>{progress}
+          <span className="min-w-0 self-center">
+            <span className={`flex items-center gap-1 truncate font-mono text-[7px] uppercase tracking-[0.1em] ${textClass}`}><span>{agentName(node.agent)}</span><span className="text-white/20">·</span><span>{status}</span></span>
+            <span className="mt-0.5 block truncate text-[11px] font-medium text-ice" title={node.label}>{title}</span>
+            <span key={`${node.jobId}:${node.progressAt ?? 0}:${progress}`} data-work-progress-update className="work-progress-update mt-0.5 block truncate text-[8px] text-slate" title={progress}>{progress}</span>
           </span>
-        </span>
-
-        <span className="flex min-w-[34px] flex-col items-end gap-1 max-[340px]:hidden" aria-hidden="true">
-          <span className={`max-w-[52px] truncate font-mono text-[8px] uppercase tracking-[0.1em] sm:max-w-[72px] ${active.needsDaniel ? "text-amber" : "text-cyan"}`} title={stage}>{stage}</span>
-          <span className="rounded-full border border-white/10 bg-white/[0.025] px-1.5 py-0.5 font-mono text-[8px] text-slate">
-            {openWorkCount} open
+          <span className="flex max-w-[90px] flex-col items-end gap-1" aria-hidden="true">
+            <span className="truncate font-mono text-[7px] uppercase tracking-[0.08em] text-slate">{workModelLabel(node.model, node.reasoningEffort)}</span>
+            <span className={`font-mono text-[7px] ${textClass}`}>{cardRealtime === "realtime" ? "live" : cardRealtime === "connecting" ? "syncing" : <LiveWorkFreshness progressAt={node.progressAt} realtime={false} />}</span>
+            <span className="work-progress-arrow text-[11px] text-cyan/50 transition-transform duration-200 group-hover:translate-x-px motion-reduce:transform-none">›</span>
           </span>
-          <span className={`work-progress-arrow text-[12px] transition-transform duration-300 group-hover:translate-x-0.5 motion-reduce:transform-none motion-reduce:transition-none ${active.needsDaniel ? "text-amber/65" : "text-cyan/55"}`}>›</span>
-        </span>
-
-        <span className="absolute inset-x-2.5 bottom-0.5 h-px overflow-hidden rounded-full bg-white/[0.06]" aria-hidden="true">
-          <span
-            data-work-progress-meter
-            className={`work-progress-meter work-progress-glint block h-full rounded-full ${active.needsDaniel ? "bg-amber" : "bg-cyan"}`}
-            style={{ width: `${percent}%` }}
-          />
-        </span>
-        <span className="sr-only" aria-live="polite" aria-atomic="true">Jarvis work state: {active.needsDaniel ? "needs Daniel" : stage}, {announcedPercent}%.</span>
-        <span className="sr-only">{openWorkCount} open workstreams. Latest progress from {signalNode ? agentName(signalNode.agent) : "Jarvis"}.</span>
-      </button>
+          <span className="absolute inset-x-2 bottom-0 h-px overflow-hidden rounded-full bg-white/[0.06]" aria-hidden="true"><span data-work-progress-meter className={`work-progress-meter block h-full rounded-full ${meterClass}`} style={{ width: `${percent}%` }} /></span>
+        </button>;
+      })}</div>
+      <span className="sr-only" aria-live="polite" aria-atomic="true">{cards.length} active tasks. Latest progress is shown on each card.</span>
     </aside>
   );
 }
@@ -977,7 +991,7 @@ function SubscribedLiveWorkBubble({
   ticket: WorkRealtimeTicket;
   onHealthy: () => void;
   onFailed: () => void;
-  onOpen: () => void;
+  onOpen: (jobId?: string) => void;
 }) {
   const { run, error } = useRealtimeRun(ticket.runId, { accessToken: ticket.accessToken });
   const metadata = (run?.metadata ?? {}) as Record<string, unknown>;
@@ -994,7 +1008,7 @@ function SubscribedLiveWorkBubble({
   return <CompactLiveWorkBubbleView snapshot={snapshot} signalNode={signalNode} realtimeState={realtimeState} onOpen={onOpen} />;
 }
 
-function CompactLiveWorkBubble({ snapshot, onOpen }: { snapshot: CompactWorkSnapshot; onOpen: () => void }) {
+function CompactLiveWorkBubble({ snapshot, onOpen }: { snapshot: CompactWorkSnapshot; onOpen: (jobId?: string) => void }) {
   const signalNode = liveWorkSignalNode(snapshot);
   const visible = useDocumentVisible();
   const streamKey = `${signalNode?.jobId ?? ""}:${signalNode?.workerRunId ?? "durable"}`;
@@ -1068,27 +1082,28 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
     return () => clearTimeout(timer);
   }, [onSelectedJobChange, retainedSelectedId, selectedId]);
   if (!active || !fleet || hidden) return null;
-  if (!expanded) return <CompactLiveWorkBubble snapshot={snapshot} onOpen={() => setOpen(true)} />;
+  if (!expanded) return <CompactLiveWorkBubble snapshot={snapshot} onOpen={(jobId) => { if (jobId) selectJob(jobId); setOpen(true); }} />;
 
   const projectCount = hierarchy.reduce((count, mission) => count + mission.projects.length, 0);
   const planningCount = hierarchyJobs.filter((node) => node.projectionKind === "supervisor_planning").length;
   const activeJobCount = hierarchyJobs.length - planningCount;
+  const fleetPhase = workPhaseLabel(fleet.phase, hierarchyJobs);
   return (
     <aside data-fleet-surface="expanded" aria-label="Live Jarvis fleet" className="materialize glass absolute inset-x-1 bottom-1 z-40 flex h-[min(78vh,680px)] min-h-0 flex-col overflow-hidden rounded-2xl !border-cyan/25 bg-[#071019]/96 p-3 shadow-2xl md:inset-y-2 md:left-2 md:right-auto md:h-auto md:w-[min(760px,62%)]">
       <header className="flex min-w-0 shrink-0 items-start gap-2 border-b border-white/[0.07] pb-2">
-        <div className="min-w-0 flex-1"><div className="hud-label text-cyan">live work · immutable groups</div><h2 className="mt-0.5 truncate text-sm text-ice">{fleet.goal}</h2><div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[8px] uppercase tracking-[0.1em] text-slate"><span>{fleet.phase} · {fleet.percent}%</span><span>{hierarchy.length} missions · {projectCount} projects · {activeJobCount} active jobs{planningCount > 0 ? ` · ${planningCount} planning` : ""}</span></div></div>
+        <div className="min-w-0 flex-1"><div className="hud-label text-cyan">Jarvis live work</div><h2 className="mt-0.5 truncate text-sm text-ice">{workTaskTitle(fleet.goal)}</h2><div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[8px] uppercase tracking-[0.1em] text-slate"><span>{fleetPhase} · {fleet.percent}%</span><span>{hierarchy.length} missions · {projectCount} projects · {activeJobCount} active tasks{planningCount > 0 ? ` · ${planningCount} planning` : ""}</span></div></div>
         <button type="button" onClick={() => setOpen(false)} className="rounded-lg px-2 py-1 text-[9px] text-slate hover:text-cyan" aria-label="Collapse live fleet">minimize</button>
       </header>
       <div className="mt-2 flex min-h-0 flex-1 gap-2 overflow-hidden">
         {retainedSelectedId ? (selected ? <WorkerDetail node={selected} workerMissionId={selectedMissionId} mission={fleet} onBack={() => selectJob(null)} /> : <div data-fleet-detail-loading className="flex flex-1 items-center justify-center text-xs text-cyan">loading exact work detail…</div>) : <div className="scrollbar-thin min-h-0 flex-1 space-y-2 overflow-auto pr-0.5">
           <section data-work-hierarchy aria-label="Active mission and project hierarchy" className="space-y-2">
             {hierarchy.map((mission) => <article key={mission.id} data-mission-group={mission.id} className="rounded-xl border border-cyan/15 bg-cyan/[0.025] p-2">
-              <header className="flex min-w-0 items-start gap-2"><div className="min-w-0 flex-1"><div className="truncate text-[11px] text-ice">{mission.label}</div><div className="truncate font-mono text-[7px] text-cyan/55" title={mission.id}>mission · {mission.id}</div></div><span className="shrink-0 font-mono text-[8px] uppercase text-slate">{mission.phase}</span></header>
+              <header className="flex min-w-0 items-start gap-2"><div className="min-w-0 flex-1"><div className="truncate text-[11px] text-ice">{workTaskTitle(mission.label)}</div><div className="truncate font-mono text-[7px] text-cyan/55">Mission progress</div></div><span className="shrink-0 font-mono text-[8px] uppercase text-slate">{workPhaseLabel(mission.phase, mission.projects.flatMap((project) => project.jobs))}</span></header>
               <div className="mt-2 space-y-1.5">{mission.projects.map((project) => <section key={project.id} data-project-group={project.id} className="rounded-lg border border-white/[0.07] bg-black/20 p-1.5">
-                <header className="flex min-w-0 items-center gap-2 px-0.5"><div className="min-w-0 flex-1 truncate font-mono text-[8px] text-sky-200">{project.repository ?? "read-only evidence"}</div><span className="shrink-0 font-mono text-[7px] text-slate">{project.canonicalProjectId} · {project.jobs.length}</span></header>
+                <header className="flex min-w-0 items-center gap-2 px-0.5"><div className="min-w-0 flex-1 truncate font-mono text-[8px] text-sky-200">{project.repository?.replace(/^daniels-project-space\//, "") ?? "Read-only evidence"}</div><span className="shrink-0 font-mono text-[7px] text-slate">{project.jobs.length} task{project.jobs.length === 1 ? "" : "s"}</span></header>
                 <div className="mt-1 grid gap-1 sm:grid-cols-2">{project.jobs.map((node) => {
                   const planning = node.projectionKind === "supervisor_planning";
-                  const content = <><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{agentName(node.agent)} · {node.label}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.08em] opacity-75">{node.stage} · {node.model ?? "auto"}/{node.reasoningEffort ?? "default"}</div><div className="mt-1 truncate text-[8px] text-slate" title={node.modelReason ?? (planning ? "Supervisor authority" : "Policy route")}>{planning ? "authority" : "route"} · {node.modelReason ?? (planning ? "durable supervisor state" : "policy default")}</div>{node.needsDaniel && <div className="mt-1 text-[8px] text-amber">Needs Daniel</div>}</>;
+                  const content = <><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{workTaskTitle(node.label)}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.08em] opacity-75">{agentName(node.agent)} · {workStatusLabel(node)}</div><div className="mt-1 truncate text-[8px] text-slate" title={node.modelReason ?? (planning ? "Supervisor authority" : "Policy route")}>{workModelLabel(node.model, node.reasoningEffort)}</div>{node.needsDaniel && <div className="mt-1 text-[8px] text-amber">{node.attentionLabel ?? "Your input is needed"}</div>}{!node.needsDaniel && node.attentionLabel && <div className="mt-1 text-[8px] text-sky-300">{node.attentionLabel}</div>}</>;
                   return planning
                     ? <div key={node.jobId} data-supervisor-planning={node.jobId} role="status" className={`min-w-0 rounded-lg border p-2 text-left ${STATE_STYLE[node.state]}`} aria-label={`${agentName(node.agent)} planning ${node.label}`}>{content}</div>
                     : <button type="button" key={node.jobId} data-active-job={node.jobId} onClick={() => selectJob(node.jobId)} className={`min-w-0 rounded-lg border p-2 text-left transition hover:border-cyan/40 ${STATE_STYLE[node.state]}`} aria-label={`Open ${agentName(node.agent)} detail for ${node.label}`}>{content}</button>;

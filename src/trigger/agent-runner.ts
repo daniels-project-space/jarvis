@@ -788,13 +788,26 @@ export function createProductionAgentRunnerDependencies(): AgentRunnerDependenci
 // Cheap controller duties run on the shared fleet cadence, independently of specialist
 // containers. This keeps reminders, recovery and incident dispatch alive even
 // when no Codex job happens to be running.
-export async function runAgentMaintenance() {
+export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRuntimeAttestation) {
   const migration = await drainControlPlaneMigration(
     () => convexMutation("jobs:migrateControlPlane", {}),
   ).catch(() => ({ steps: 0, complete: false, phase: null }));
   let recovered = 0;
   let abandoned = 0;
   let repairs = 0;
+  let cloudWorkspaceResumed = 0;
+  if (runtimeAttestation) {
+    try {
+      // Construction validates the exact deployment-bound probe receipt but
+      // does not create a paid workspace. Only after that proof is fresh may
+      // system-held jobs return to the dispatch queue.
+      configuredCloudWorkspaceProvider(process.env, runtimeAttestation);
+      const resumed = await convexMutation("jobs:resumeCloudWorkspaceBlocks", { limit: 8 });
+      cloudWorkspaceResumed = Number(resumed?.resumed?.length ?? 0);
+    } catch {
+      /* an unavailable provider remains one system hold, never a retry loop */
+    }
+  }
   try {
     await convexMutation("chatQueue:reapStuck", {}).catch(() => {});
     const reaped: any = await convexMutation("jobs:reapStale", {});
@@ -908,7 +921,7 @@ export async function runAgentMaintenance() {
     /* reminders must never block fleet dispatch */
   }
   await runWatchSweep().catch(() => {});
-  return { recovered, abandoned, repairs, migration };
+  return { recovered, abandoned, repairs, cloudWorkspaceResumed, migration };
 }
 
 // One Trigger run owns one exact durable job and one isolated Codex process.
@@ -2997,18 +3010,20 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       }).catch(() => false);
       if (failure.disposition !== "deferred") {
         // Configuration and authority failures cannot improve by repeatedly
-        // renting fresh Trigger runs. Terminalize this exact attempt as a
-        // durable Needs you checkpoint; Daniel can fix the provider and use
-        // the existing recovery route without consuming the retry budget.
-        const heldForInput = await convexMutation("jobs:requestInput", {
+        // renting fresh Trigger runs. Hold the exact attempt as a system pause;
+        // the maintenance supervisor resumes it automatically only after a
+        // deployment-bound provider receipt verifies successfully.
+        const heldForSystem = await convexMutation("jobs:checkpointAndRequeue", {
           jobId: job.jobId,
           expectedAttempt,
           authorityDigest,
           workerRunId: options.reservation.workerRunId,
-          question: checkpoint,
           checkpoint,
+          result: checkpoint,
+          branch: job.branch ?? undefined,
+          nextStatus: "paused",
         }).catch(() => false);
-        if (!heldForInput) {
+        if (!heldForSystem) {
           return {
             processed: 0,
             stale: true,
@@ -3115,8 +3130,8 @@ export const agentFleetSupervisor = schedules.task({
   machine: "micro",
   queue: { concurrencyLimit: 1 },
   maxDuration: 120,
-  run: async () => {
-    const maintenance = await runAgentMaintenance();
+  run: async (_payload, { ctx }) => {
+    const maintenance = await runAgentMaintenance({ triggerDeploymentVersion: ctx.deployment?.version });
     const supervisor = await runMissionSupervisorDeadmanSweep()
       .catch(() => ({ skipped: false, due: 0, dispatched: 0, failed: 1, launches: [] }));
     const dispatched = await wakeAgentFleet("fleet-supervisor").catch(() => false);

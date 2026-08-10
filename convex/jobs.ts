@@ -4253,6 +4253,65 @@ export const noteCloudWorkspaceBlock = mutation({
   },
 });
 
+/** Resume only system-held work after the Trigger worker has verified a fresh
+ * provider receipt. This is deliberately separate from operator controls: no
+ * human approval or input is manufactured for an infrastructure recovery. */
+export const resumeCloudWorkspaceBlocks = mutation({
+  args: { limit: v.optional(v.number()), workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const now = Date.now();
+    const limit = Math.max(1, Math.min(16, Math.floor(a.limit ?? 8)));
+    const candidates = await ctx.db.query("jobs")
+      .withIndex("by_status", (q) => q.eq("status", "paused"))
+      .order("desc")
+      .take(limit * 2);
+    const resumed: string[] = [];
+    for (const row of candidates) {
+      if (resumed.length >= limit || row.providerRunState !== "blocked") continue;
+      const previous = await attemptFor(ctx, row._id, row.attempt ?? 1);
+      if (!previous || previous.status !== "paused" || !previous.completedAt) continue;
+      const nextAttempt = (row.attempt ?? 1) + (shouldAdvanceAttempt(Boolean(previous.workerRunId)) ? 1 : 0);
+      if (!hasAttemptBudget(nextAttempt, row.maxAttempts ?? 12)) continue;
+      await patchJobWithRuntime(ctx, row, {
+        ...invalidateDeliveryLease(row),
+        status: "pending",
+        stage: "queued",
+        progress: "Secure worker ready · continuing automatically",
+        attempt: nextAttempt,
+        startedAt: undefined,
+        heartbeatAt: now,
+        progressAt: now,
+        stalledAt: undefined,
+        stallReason: undefined,
+        nextRunAt: now,
+        dispatchId: undefined,
+        dispatchLeaseUntil: undefined,
+        workerRunId: undefined,
+        workerRuntime: undefined,
+        providerRunState: "queued",
+        providerObservedAt: now,
+      });
+      if (nextAttempt === (row.attempt ?? 1)) {
+        await ctx.db.patch(previous._id, {
+          status: "queued", dispatchId: undefined, completedAt: undefined, lastEventAt: now,
+        });
+      } else {
+        await ensureAttempt(ctx, row._id, nextAttempt, "pending", now, {
+          parentAttempt: row.attempt ?? 1,
+          sourceHeadSha: row.sourceHeadSha,
+          parentCheckpointHeadSha: previous.checkpointHeadSha,
+        });
+      }
+      await appendAttemptEvidence(ctx, row, "system_recovered", "Secure cloud worker verified; work resumed automatically", {
+        stage: "queued", evidenceKind: "recovery", eventKey: `system-recovered:${nextAttempt}`, attempt: nextAttempt,
+      });
+      resumed.push(String(row._id));
+    }
+    return { resumed };
+  },
+});
+
 export const prepareCloudCodexTurn = mutation({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),

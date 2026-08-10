@@ -162,6 +162,26 @@ describe("commandCenter relevance and bounded projection", () => {
     expect(result.fleet?.nodes[0].controls).toEqual(expect.arrayContaining(["approve", "decline"]));
   });
 
+  it("shows provider failures as recoverable system work instead of asking Daniel", () => {
+    const result = buildFleetSnapshot({
+      threadId,
+      activeRows: [runtime({
+        status: "needs_input",
+        stage: "needs Daniel",
+        providerRunState: "blocked",
+        progress: "cloud workspace blocked · missing_configuration",
+      })],
+    });
+    expect(result.active).toMatchObject({ needsDaniel: false, status: "blocked" });
+    expect(result.fleet?.nodes[0]).toMatchObject({
+      state: "blocked",
+      needsDaniel: false,
+      attentionKind: "system",
+      attentionLabel: "Secure worker setup",
+      controls: ["cancel"],
+    });
+  });
+
   it("uses only an exact canonical supervisor affordance and ignores stale job totals", () => {
     const base = {
       threadId,

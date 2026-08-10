@@ -10,6 +10,8 @@ export type FleetNodeState =
   | "blocked"
   | "needs_input";
 
+export type FleetAttentionKind = "approval" | "input" | "system" | "recovery";
+
 export type FleetControl =
   | "pause"
   | "resume"
@@ -73,6 +75,8 @@ export type FleetNode = {
   mergeState: string;
   recoverySummary: string | null;
   needsDaniel: boolean;
+  attentionKind?: FleetAttentionKind | null;
+  attentionLabel?: string | null;
   attentionReason: string | null;
   controls: FleetControl[];
   startedAt: number | null;

@@ -1,3 +1,5 @@
+import { configuredCloudWorkspaceProviderName } from "./cloud-provider-selection";
+
 const PROVIDERS = new Set(["e2b", "sandbox0", "vercel", "cloudflare"]);
 const SHA256 = /^[0-9a-f]{64}$/;
 const SAFE_ID = /^[a-zA-Z0-9._:/-]{1,200}$/;
@@ -33,7 +35,7 @@ export function cloudProviderAdmissionReadiness(
   env: Readonly<Record<string, string | undefined>>,
   now = Date.now(),
 ): CloudProviderAdmissionReadiness {
-  const provider = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
+  const provider = configuredCloudWorkspaceProviderName(env) ?? "";
   const templateIdentity = String(env.JARVIS_CLOUD_WORKSPACE_TEMPLATE ?? "").trim();
   const templateDigest = String(env.JARVIS_CLOUD_WORKSPACE_TEMPLATE_DIGEST ?? "").trim().toLowerCase();
   const deploymentId = String(env.JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID ?? "").trim();

@@ -120,13 +120,14 @@ function inferWorkType(task: string, role: string): CodexWorkType {
   if (/planner|architect/.test(role)) return "architecture";
   if (/validator|verifier|reviewer/.test(role)) return "verification";
   if (/synthesi[sz]er/.test(role)) return "synthesis";
+  if (role === "iris") return "implementation";
   if (/^(?:research|compare|survey|find|summari[sz]e|analyse|analyze)\b/i.test(task.trim())) return "research";
   if (SYNTHESIS.test(task)) return "synthesis";
   if (ARCHITECTURE.test(task)) return "architecture";
   if (IMPLEMENTATION.test(task)) return "implementation";
   if (RESEARCH.test(task) || role === "atlas") return "research";
   if (VERIFICATION.test(task) || role === "sentry") return "verification";
-  if (role === "iris" || role === "paul") return "implementation";
+  if (role === "paul") return "implementation";
   return "research";
 }
 
@@ -249,8 +250,13 @@ export function selectCodexWorkPolicy(input: CodexWorkPolicyInput): CodexWorkSel
         : "terra";
   }
 
-  if (productionRisk === "critical" || (SECURITY.test(task) && productionRisk === "high") || difficultRootCause) {
+  if (productionRisk === "critical" || (SECURITY.test(task) && productionRisk === "high")) {
     model = "sol";
+  } else if (difficultRootCause && model === "luna") {
+    // Root-cause language is common in ordinary repair prompts. It warrants a
+    // deeper reasoning pass, but does not by itself justify the most expensive
+    // tier for a bounded, reversible change in one owned repository.
+    model = "terra";
   }
   if (explicitMaximum) model = "sol";
 
@@ -269,13 +275,12 @@ export function selectCodexWorkPolicy(input: CodexWorkPolicyInput): CodexWorkSel
         : "medium";
   } else if (model === "terra") {
     reasoningEffort = complexity === "complex" || uncertainty === "high" || productionRisk === "high"
-      || workType === "architecture" || toolBreadth === "broad" ? "high" : "medium";
+      || workType === "architecture" || toolBreadth === "broad" || difficultRootCause ? "high" : "medium";
   } else {
     reasoningEffort = explicitMaximum || productionRisk === "critical" || complexity === "intense"
-      || (workType === "architecture" && expectedDuration === "long") || difficultRootCause
+      || (workType === "architecture" && expectedDuration === "long")
       || (workType === "synthesis" && crossProject) ? "max" : "high";
   }
-  if (requestedModel === "sol") reasoningEffort = "max";
   const structuredEffortFloor = parseCodexReasoningEffort(input.requestedReasoningEffort);
   const requestedEffort = structuredEffortFloor && proseEffortFloor
     ? maxEffort(structuredEffortFloor, proseEffortFloor)
