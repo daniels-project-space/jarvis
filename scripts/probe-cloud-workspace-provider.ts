@@ -360,6 +360,14 @@ async function main() {
   } catch (error) {
     if (!safeFailureDetail && error instanceof CloudWorkspaceError) {
       safeFailureDetail = ` (${error.code}/${error.disposition}: ${error.message})`;
+    } else if (!safeFailureDetail && error instanceof Error && [
+      "exact remote command cancellation was not independently observed",
+      "cloud provider probe receipt is malformed or partial",
+      "remote cancellation probe cleanup failed",
+    ].includes(error.message)) {
+      // These are static protocol failures, safe to surface for an operator;
+      // provider responses and credentials must remain undisclosed.
+      safeFailureDetail = ` (${error.message})`;
     }
     if (recreated) await provider.terminate(recreated, "orphan").catch(() => undefined);
     if (first) await provider.terminate(first, "orphan").catch(() => undefined);
