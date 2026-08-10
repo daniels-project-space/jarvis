@@ -73,6 +73,17 @@ included in the target's handover bundle. Prompt text, transcripts, and
 credentials never reach the Project Hub, runner endpoint, heartbeat, Convex,
 or command-line arguments for the target session.
 
+The **Initial user prompt** and **Latest user instruction** sections are
+verified local captures from the bound session; the latest instruction
+supersedes the initial one when they conflict. Git state, checkpoint paths, and
+the terminal tail remain context to verify, not instructions to execute
+blindly.
+
+The root-owned supervisor starts Claude with project/local settings and
+Claude's supported `auto` permission mode. This avoids a user-level
+`bypassPermissions` default, which Claude deliberately refuses under root,
+while retaining the normal authenticated Claude session.
+
 You can register an existing tmux workflow explicitly:
 
 ```bash
