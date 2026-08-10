@@ -1104,9 +1104,12 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
             command: [
               `npm ci --ignore-scripts --no-audit --no-fund --cache ${shellQuote(cachePath)}`,
               "git reset --hard refs/jarvis/controller-base",
-              // Preserve only dependencies and the controller-owned control
-              // directory while removing install-created source mutations.
-              `git clean -ffdX -e node_modules ${controlCleanExcludes}`,
+              // `-X` is deliberately forbidden: a valid repository can
+              // ignore dot-directories, which would make it delete our
+              // controller-owned source archive before checkpointing.
+              // npm ci is scriptless and writes only node_modules plus the
+              // fenced cache, so reset plus ordinary untracked cleanup is the
+              // bounded cleanup required here.
               `git clean -ffd -e node_modules ${controlCleanExcludes}`,
               `rm -rf -- ${shellQuote(cachePath)}`,
             ].join(" && "),
