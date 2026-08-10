@@ -73,9 +73,11 @@ export async function probeExactRemoteCancellation(
   runId: string,
   options: CancellationProbeOptions = {},
 ): Promise<RemoteCancellationEvidence> {
-  const markerDelayMs = options.markerDelayMs ?? 8_000;
+  // Cold microVM command scheduling can take several seconds. Leave enough
+  // time to observe a real PID before the post-cancellation marker is due.
+  const markerDelayMs = options.markerDelayMs ?? 15_000;
   const observationMarginMs = options.observationMarginMs ?? 750;
-  const startupPolls = options.startupPolls ?? 12;
+  const startupPolls = options.startupPolls ?? 40;
   const startupPollMs = options.startupPollMs ?? 250;
   const wait = options.wait ?? delay;
   const id = createHash("sha256").update(runId).digest("hex").slice(0, 24);
@@ -116,7 +118,10 @@ export async function probeExactRemoteCancellation(
 
   try {
     pending = remote.exec({
-      command: nodeCommand(launcher, [directory, pidPath, markerPath, processToken, String(markerDelayMs)]),
+      // The command adapter may use a shell for general-purpose user commands.
+      // Exec the probe child so a provider-side kill targets the independently
+      // observed process rather than only that shell wrapper.
+      command: `exec ${nodeCommand(launcher, [directory, pidPath, markerPath, processToken, String(markerDelayMs)])}`,
       timeoutMs: markerDelayMs + 5_000,
       maxOutputBytes: 4_000,
       signal: abort.signal,

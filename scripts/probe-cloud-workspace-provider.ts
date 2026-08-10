@@ -277,6 +277,11 @@ async function main() {
       cloudWorkspaceCancellationProbeRemote(provider, first),
       runId,
     );
+    if (!cancellationEvidence.adapterCancelled || !cancellationEvidence.pidGone
+      || !cancellationEvidence.processGone || !cancellationEvidence.markerAbsent) {
+      safeFailureDetail = ` (adapterCancelled=${cancellationEvidence.adapterCancelled}, pidGone=${cancellationEvidence.pidGone}, processGone=${cancellationEvidence.processGone}, markerAbsent=${cancellationEvidence.markerAbsent})`;
+      throw new Error("exact remote command cancellation was not independently observed");
+    }
 
     probeStage = "checkpoint marker write";
     await provider.writeFile(first, "probe-identity.txt", new TextEncoder().encode(runId), 4_000);
