@@ -602,6 +602,7 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(String(install?.args)).toContain(`${workspace.root}/.jarvis-controller-${workspace.providerWorkspaceId}/npm-cache`);
     expect(String(install?.args)).not.toContain("/vercel/sandbox/.jarvis-npm-cache");
     expect(String(install?.args)).toContain("git clean -ffd -e node_modules");
+    expect(String(install?.args)).toContain(`-e '.jarvis-controller-${workspace.providerWorkspaceId}'`);
     expect(String(install?.args)).toContain(`-e '.jarvis-controller-${workspace.providerWorkspaceId}/'`);
     expect(String(install?.args)).toContain(`-e '.jarvis-controller-${workspace.providerWorkspaceId}/**'`);
     expect(observed.updates).toEqual([{ allow: ["registry.npmjs.org"] }, "deny-all"]);

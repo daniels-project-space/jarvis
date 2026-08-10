@@ -1073,7 +1073,10 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
         const paths = this.pathsFor(workspace);
         const cachePath = `${paths.controlDir}/npm-cache`;
         const controlRelative = paths.controlDir.slice(this.workspaceRoot.length + 1);
-        const controlCleanExcludes = `-e ${shellQuote(`${controlRelative}/`)} -e ${shellQuote(`${controlRelative}/**`)}`;
+        // Exclude both the control directory itself and its descendants. Git
+        // clean otherwise removes the untracked directory as a whole before
+        // its descendant exclusions can preserve controller artifacts.
+        const controlCleanExcludes = `-e ${shellQuote(controlRelative)} -e ${shellQuote(`${controlRelative}/`)} -e ${shellQuote(`${controlRelative}/**`)}`;
         // A missing lock means no egress. It still proceeds through the
         // tracked deny-all update and behavioral probe below; an early return
         // here could accidentally make a future policy regression invisible.
