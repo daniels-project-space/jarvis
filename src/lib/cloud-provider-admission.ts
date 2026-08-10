@@ -1,4 +1,5 @@
 import { configuredCloudWorkspaceProviderName } from "./cloud-provider-selection";
+import { cloudProviderProbeMaxAgeMs } from "./cloud-provider-probe-policy";
 
 const PROVIDERS = new Set(["e2b", "sandbox0", "vercel", "cloudflare"]);
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -6,7 +7,6 @@ const SAFE_ID = /^[a-zA-Z0-9._:/-]{1,200}$/;
 const KEY_ID = /^[a-zA-Z0-9._-]{1,64}$/;
 const SIGNATURE = /^[0-9a-f]{64}$/;
 const MAX_FUTURE_SKEW_MS = 60_000;
-const MAX_RECEIPT_LIFETIME_MS = 24 * 60 * 60_000;
 
 type AdmissionFailureCode =
   | "missing_configuration"
@@ -87,7 +87,7 @@ export function cloudProviderAdmissionReadiness(
     || probeTime > now + MAX_FUTURE_SKEW_MS
     || expiresAt <= now
     || expiresAt <= probeTime
-    || expiresAt - probeTime > MAX_RECEIPT_LIFETIME_MS) {
+    || expiresAt - probeTime > cloudProviderProbeMaxAgeMs(String(receipt.provider))) {
     return { ready: false, code: "stale_receipt" };
   }
 

@@ -1,7 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   CloudWorkspaceError,
   DEFAULT_WORKSPACE_LIMITS,
@@ -9,9 +9,10 @@ import {
   type CloudWorkspaceProviderName,
 } from "./cloud-workspace";
 import { configuredCloudWorkspaceProviderName } from "../lib/cloud-provider-selection";
+import { cloudProviderProbeMaxAgeMs } from "../lib/cloud-provider-probe-policy";
 
 export const CLOUD_PROVIDER_PROBE_SCHEMA_VERSION = 1;
-export const CLOUD_PROVIDER_PROBE_MAX_AGE_MS = 24 * 60 * 60_000;
+export { CLOUD_PROVIDER_PROBE_MAX_AGE_MS } from "../lib/cloud-provider-probe-policy";
 export const CLOUD_WORKSPACE_RUNTIME_IDENTITY = "node-22:codex-0.144.5";
 export const DEFAULT_CLOUD_WORKSPACE_TEMPLATE = "node22-codex-0.144.5";
 
@@ -271,7 +272,8 @@ export function createCloudProviderProbeKeyring(current: CloudProviderProbeKey, 
       if (!KEY_ID.test(String(envelope.keyId)) || !/^[0-9a-f]{64}$/.test(String(envelope.signature))) return false;
       if (!isStrictReceipt(envelope.receipt) || !matchesBinding(envelope.receipt, expected) || !fullyExercised(envelope.receipt)) return false;
       if (envelope.receipt.probeTime > now + 60_000 || envelope.receipt.expiresAt <= now) return false;
-      if (envelope.receipt.expiresAt <= envelope.receipt.probeTime || envelope.receipt.expiresAt - envelope.receipt.probeTime > CLOUD_PROVIDER_PROBE_MAX_AGE_MS) return false;
+      if (envelope.receipt.expiresAt <= envelope.receipt.probeTime
+        || envelope.receipt.expiresAt - envelope.receipt.probeTime > cloudProviderProbeMaxAgeMs(envelope.receipt.provider)) return false;
       const key = keys.get(envelope.keyId);
       if (!key) return false;
       const actual = Buffer.from(envelope.signature, "hex");
@@ -302,7 +304,17 @@ export function installedCloudProviderSdkVersion(provider: CloudWorkspaceProvide
   try {
     const packageName = provider === "e2b" ? "e2b" : provider === "sandbox0" ? "sandbox0" : provider === "vercel" ? "@vercel/sandbox" : null;
     if (!packageName) return null;
-    let directory = dirname(fileURLToPath(import.meta.resolve(packageName)));
+    // Trigger builds and the local live probe can execute this module through
+    // different ESM/CommonJS transforms. Read the pinned top-level dependency
+    // first because ESM-only packages may intentionally expose no CJS entry.
+    const directPackageJson = join(process.cwd(), "node_modules", packageName, "package.json");
+    if (existsSync(directPackageJson)) {
+      const parsed = JSON.parse(readFileSync(directPackageJson, "utf8")) as { name?: unknown; version?: unknown };
+      if (parsed.name === packageName) return String(parsed.version ?? "");
+    }
+    // The resolver fallback covers hoisted/nonstandard layouts while still
+    // proving the package that this deployment will load.
+    let directory = dirname(createRequire(join(process.cwd(), "package.json")).resolve(packageName));
     for (let depth = 0; depth < 5; depth += 1) {
       const packageJson = join(directory, "package.json");
       if (existsSync(packageJson)) {

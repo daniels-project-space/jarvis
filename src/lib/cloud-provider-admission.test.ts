@@ -91,6 +91,22 @@ describe("cloud provider Goal Mode admission readiness", () => {
     expect(cloudProviderAdmissionReadiness(environment(), NOW)).toEqual({ ready: true });
   });
 
+  it("allows a deployment-bound Vercel receipt for 30 days but keeps the default provider window at 24 hours", () => {
+    const vercel = withReceipt((receipt) => {
+      receipt.provider = "vercel";
+      receipt.probeTime = NOW - 60_000;
+      receipt.expiresAt = receipt.probeTime + 30 * 24 * 60 * 60_000;
+    }, { JARVIS_CLOUD_WORKSPACE_PROVIDER: "vercel" });
+    expect(cloudProviderAdmissionReadiness(vercel, NOW)).toEqual({ ready: true });
+
+    const tooLong = withReceipt((receipt) => {
+      receipt.provider = "vercel";
+      receipt.probeTime = NOW - 60_000;
+      receipt.expiresAt = receipt.probeTime + 30 * 24 * 60 * 60_000 + 1;
+    }, { JARVIS_CLOUD_WORKSPACE_PROVIDER: "vercel" });
+    expect(cloudProviderAdmissionReadiness(tooLong, NOW)).toEqual({ ready: false, code: "stale_receipt" });
+  });
+
   it.each([
     "JARVIS_CLOUD_WORKSPACE_TEMPLATE",
     "JARVIS_CLOUD_WORKSPACE_TEMPLATE_DIGEST",
