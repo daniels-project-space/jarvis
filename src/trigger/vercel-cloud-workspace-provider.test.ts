@@ -11,14 +11,14 @@ type Log = { stream: "stdout" | "stderr"; data: string };
 type CommandOutcome = { exitCode: number; logs: Log[] };
 const observed: {
   create?: Record<string, unknown>; get?: Record<string, unknown>; commands: Record<string, unknown>[];
-  deletes: string[]; updates: unknown[]; updateSessions: string[]; kills: string[]; waits: string[]; logConsumers: string[]; logsClosed: number; files: Map<string, Buffer>; mkdirs: string[]; reads: string[]; readSessions: string[]; writeSessions: string[];
+  deletes: string[]; updates: unknown[]; updateSessions: string[]; kills: string[]; waits: string[]; logConsumers: string[]; logSignals: Array<AbortSignal | undefined>; logsClosed: number; files: Map<string, Buffer>; mkdirs: string[]; reads: string[]; readSessions: string[]; writeSessions: string[];
   readSignals: AbortSignal[]; updateSignals: AbortSignal[]; readAcquireStall?: boolean; readStream?: Readable; updateStall?: (policy: unknown) => boolean;
-  logs: Log[]; createGate?: Promise<void>; waitGate?: Promise<void>; releaseWaitOnKill?: () => void; logCloseGate?: Promise<void>; waitFailure?: unknown; fenceWaitFailure?: unknown; deleteFailure?: unknown;
+  logs: Log[]; createGate?: Promise<void>; waitGate?: Promise<void>; releaseWaitOnKill?: () => void; logCloseGate?: Promise<void>; waitFailure?: unknown; fenceWaitFailure?: unknown; killFailure?: unknown; deleteFailure?: unknown;
   exitCode: number; commandExit?: (input: Record<string, unknown>) => number; commandExecutor?: (input: Record<string, unknown>) => CommandOutcome | undefined;
   updateFailure?: unknown; updateHook?: (policy: unknown) => void; writeHook?: () => void; runCommandHook?: (input: Record<string, unknown>, session: FakeSession) => void; getFailure?: unknown;
   listed: Array<{ name?: string; status: string }>; listedPages?: Array<Array<{ name?: string; status: string }>>; listedPageNext?: Array<string | null>; listInputs: Record<string, unknown>[];
   listGate?: Promise<void>; listPageGate?: Promise<void>; sandboxCreateGate?: Promise<void>;
-} = { commands: [], deletes: [], updates: [], updateSessions: [], kills: [], waits: [], logConsumers: [], logsClosed: 0, files: new Map(), mkdirs: [], reads: [], readSessions: [], writeSessions: [], readSignals: [], updateSignals: [], logs: [], exitCode: 0, listed: [], listInputs: [] };
+} = { commands: [], deletes: [], updates: [], updateSessions: [], kills: [], waits: [], logConsumers: [], logSignals: [], logsClosed: 0, files: new Map(), mkdirs: [], reads: [], readSessions: [], writeSessions: [], readSignals: [], updateSignals: [], logs: [], exitCode: 0, listed: [], listInputs: [] };
 
 function rejectWhenAborted(signal: AbortSignal | undefined): Promise<never> {
   if (!signal) return new Promise<never>(() => undefined);
@@ -40,9 +40,9 @@ class FakeCommand {
     this.exitCode = this.exitCode ?? this.outcome?.exitCode ?? observed.commandExit?.(this.input) ?? observed.exitCode;
     return { exitCode: this.exitCode, durationMs: 1 };
   }
-  async kill(signal?: string) { observed.kills.push(`${this.cmdId}:${signal}`); this.exitCode = 137; observed.releaseWaitOnKill?.(); }
+  async kill(signal?: string) { observed.kills.push(`${this.cmdId}:${signal}`); this.exitCode = 137; observed.releaseWaitOnKill?.(); if (observed.killFailure) throw observed.killFailure; }
   logs(options?: { signal?: AbortSignal }) {
-    void options;
+    observed.logSignals.push(options?.signal);
     observed.logConsumers.push(this.cmdId);
     let closed = false;
     const logs = this.outcome?.logs ?? observed.logs;
@@ -162,8 +162,8 @@ beforeEach(() => {
     ok: true,
     json: async () => ({ id: "team_1", billing: { plan: "hobby", status: "active" } }),
   })));
-  observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.updateSessions = []; observed.kills = []; observed.waits = []; observed.logConsumers = []; observed.logsClosed = 0;
-  observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.readSessions = []; observed.writeSessions = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.releaseWaitOnKill = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.fenceWaitFailure = undefined; observed.deleteFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
+  observed.create = undefined; observed.get = undefined; observed.commands = []; observed.deletes = []; observed.updates = []; observed.updateSessions = []; observed.kills = []; observed.waits = []; observed.logConsumers = []; observed.logSignals = []; observed.logsClosed = 0;
+  observed.files = new Map(); observed.mkdirs = []; observed.reads = []; observed.readSessions = []; observed.writeSessions = []; observed.logs = []; observed.createGate = undefined; observed.waitGate = undefined; observed.releaseWaitOnKill = undefined; observed.logCloseGate = undefined; observed.waitFailure = undefined; observed.fenceWaitFailure = undefined; observed.killFailure = undefined; observed.deleteFailure = undefined; observed.exitCode = 0; observed.commandExit = undefined;
   observed.readSignals = []; observed.updateSignals = []; observed.readAcquireStall = undefined; observed.readStream = undefined; observed.updateStall = undefined;
   observed.updateFailure = undefined; observed.updateHook = undefined; observed.writeHook = undefined; observed.runCommandHook = undefined; observed.commandExecutor = undefined; observed.getFailure = undefined; observed.listed = []; observed.listedPages = undefined; observed.listedPageNext = undefined; observed.listInputs = []; FakeSandbox.current = new FakeSession();
   observed.listGate = undefined; observed.listPageGate = undefined; observed.sandboxCreateGate = undefined;
@@ -221,6 +221,7 @@ describe("VercelCloudWorkspaceProvider", () => {
   it("binds command execution to the exact Session, owns its logs, and uses empty-env detached sh", async () => {
     observed.logs = [{ stream: "stdout", data: "safe-out" }, { stream: "stderr", data: "safe-err" }];
     const { provider, workspace } = await providerAndWorkspace();
+    observed.logSignals = [];
     const result = await provider.exec(workspace, { command: "printf safe", cwd: workspace.root, timeoutMs: 1_000, maxOutputBytes: 1_000 });
     expect(result).toMatchObject({ exitCode: 0, stdout: "safe-out", stderr: "safe-err", providerSessionId: "vercel-session-a" });
     expect(observed.get).toMatchObject({ name: workspace.providerWorkspaceId, resume: false, token: "controller-token", teamId: "team_1", projectId: "prj_1" });
@@ -230,6 +231,7 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.logsClosed).toBe(2);
     expect(observed.waits).toHaveLength(2);
     expect(observed.logConsumers).toHaveLength(2);
+    expect(observed.logSignals).toEqual([undefined, undefined]);
   });
 
   it("fails stale before data-plane work and cleanup still deletes the exact named attempt", async () => {
@@ -510,6 +512,27 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.kills).toHaveLength(1);
     expect(observed.waits).toHaveLength(2);
     expect(observed.logConsumers).toHaveLength(2);
+  });
+
+  it("treats Vercel's already-exited kill response as terminal after the exact wait", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    let release!: () => void;
+    observed.runCommandHook = (input) => {
+      if (String(input.args).includes("sleep terminal")) {
+        observed.waitGate = new Promise<void>((resolve) => { release = resolve; });
+        observed.releaseWaitOnKill = release;
+      }
+    };
+    observed.killFailure = Object.assign(new Error("command exited"), {
+      json: { error: { code: "command_not_found_or_exited" } },
+    });
+    const controller = new AbortController();
+    const running = provider.exec(workspace, { command: "sleep terminal", cwd: workspace.root, timeoutMs: 1_000, maxOutputBytes: 1_000, signal: controller.signal });
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+    await expect(running).rejects.toMatchObject({ code: "cancelled" });
+    expect(observed.kills).toHaveLength(1);
+    expect(observed.waits).toHaveLength(2);
   });
 
   it("runs the exact listing program against real byte-named directories and preserves exit classifications", async () => {

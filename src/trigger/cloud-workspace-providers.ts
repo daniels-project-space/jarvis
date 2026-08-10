@@ -474,6 +474,9 @@ export const VERCEL_HISTORY_TOTAL_CEILING = VERCEL_HISTORY_PAGE_LIMIT * VERCEL_H
 const VERCEL_LIST_DEADLINE_MS = 30_000;
 const VERCEL_CREATE_DEADLINE_MS = 60_000;
 const VERCEL_CONTROL_DEADLINE_MS = 30_000;
+// Cold Vercel Sessions can take longer than a short shell probe to complete
+// their exact-session observation. This remains far below the attempt TTL.
+const VERCEL_GUARD_COMMAND_TIMEOUT_MS = 60_000;
 
 type VercelControlDeadlines = Readonly<{
   listMs: number;
@@ -666,6 +669,15 @@ function assertVercelCommandBounds(timeoutMs: number, maxOutputBytes: number): v
   }
 }
 
+/** Vercel returns this explicit code when a racing kill reaches an already-terminal command. */
+function vercelCommandAlreadyTerminal(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const payload = (error as { json?: unknown }).json;
+  if (!payload || typeof payload !== "object") return false;
+  const detail = (payload as { error?: unknown }).error;
+  return Boolean(detail && typeof detail === "object" && (detail as { code?: unknown }).code === "command_not_found_or_exited");
+}
+
 function assertVercelFileBound(maxBytes: number): void {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > DEFAULT_WORKSPACE_LIMITS.maxFileBytes) {
     throw new CloudWorkspaceError("vercel", "resource_limit", "file byte limit is outside the controller bound", "rejected");
@@ -761,7 +773,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     observed = await this.assertNoSymlink(workspace, observed.sandbox, observed.session, workspace.root, false);
     const result = await this.runSessionCommand(workspace, observed.sandbox, observed.session, {
       command: `mkdir -- ${shellQuote(paths.controlDir)} && [ "$(realpath -e -- ${shellQuote(paths.controlDir)})" = ${shellQuote(paths.controlDir)} ] && [ ! -L ${shellQuote(paths.controlDir)} ]`,
-      cwd: workspace.root, timeoutMs: 10_000, maxOutputBytes: 4_000,
+      cwd: workspace.root, timeoutMs: VERCEL_GUARD_COMMAND_TIMEOUT_MS, maxOutputBytes: 4_000,
     });
     if (result.exitCode !== 0) throw new CloudWorkspaceError(this.name, "unsafe_archive", "could not establish a fenced sandbox control directory", "rejected");
     await this.observeFreshSession(workspace);
@@ -1081,7 +1093,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
         // tracked deny-all update and behavioral probe below; an early return
         // here could accidentally make a future policy regression invisible.
         observed = await this.assertNoSymlink(workspace, observed.sandbox, observed.session, lockPath, true);
-        const exists = await this.runSessionCommand(workspace, observed.sandbox, observed.session, { command: `test -f ${shellQuote(lockPath)}`, cwd: this.workspaceRoot, timeoutMs: 10_000, maxOutputBytes: 4_000 });
+        const exists = await this.runSessionCommand(workspace, observed.sandbox, observed.session, { command: `test -f ${shellQuote(lockPath)}`, cwd: this.workspaceRoot, timeoutMs: VERCEL_GUARD_COMMAND_TIMEOUT_MS, maxOutputBytes: 4_000 });
         if (exists.exitCode !== 1) {
           if (exists.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "could not inspect committed package lock", "deferred");
           // The source working tree must be byte-for-byte the controller base
@@ -1091,7 +1103,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
           observed = await this.observeFreshSession(workspace);
           const committed = await this.runSessionCommand(workspace, observed.sandbox, observed.session, {
             command: "git ls-files --error-unmatch -- package-lock.json >/dev/null && git diff --quiet refs/jarvis/controller-base -- package-lock.json && git diff --cached --quiet refs/jarvis/controller-base -- package-lock.json",
-            cwd: this.workspaceRoot, timeoutMs: 10_000, maxOutputBytes: 4_000,
+            cwd: this.workspaceRoot, timeoutMs: VERCEL_GUARD_COMMAND_TIMEOUT_MS, maxOutputBytes: 4_000,
           });
           if (committed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "unsafe_archive", "package lock is not the committed controller baseline", "rejected");
           const lock = await this.readAbsolute(workspace, lockPath, DEFAULT_WORKSPACE_LIMITS.maxFileBytes);
@@ -1216,7 +1228,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     const check = writing
       ? `[ "$(realpath -e -- ${shellQuote(parent)})" = ${shellQuote(parent)} ] && { [ ! -e ${shellQuote(path)} ] || [ ! -L ${shellQuote(path)} ]; }`
       : `[ "$(realpath -e -- ${shellQuote(path)})" = ${shellQuote(path)} ] && [ ! -L ${shellQuote(path)} ]`;
-    const result = await this.runSessionCommand(workspace, sandbox, session, { command: check, cwd: workspace.root, timeoutMs: 10_000, maxOutputBytes: 4_000 });
+    const result = await this.runSessionCommand(workspace, sandbox, session, { command: check, cwd: workspace.root, timeoutMs: VERCEL_GUARD_COMMAND_TIMEOUT_MS, maxOutputBytes: 4_000 });
     if (result.exitCode !== 0) throw new CloudWorkspaceError(this.name, "unsafe_archive", "sandbox path is missing, symlinked, or escapes the workspace root", "rejected");
     return this.observeFreshSession(workspace);
   }
@@ -1233,7 +1245,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     // is safe only here: this exact fresh Session is establishing the fence.
     const observed = await this.runSessionCommand(workspace, sandbox, session, {
       command: `[ "$(realpath -e -- ${shellQuote(cwd)})" = ${shellQuote(cwd)} ] && [ ! -L ${shellQuote(cwd)} ]`,
-      cwd: workspace.root, timeoutMs: 10_000, maxOutputBytes: 4_000,
+      cwd: workspace.root, timeoutMs: VERCEL_GUARD_COMMAND_TIMEOUT_MS, maxOutputBytes: 4_000,
     }, true);
     if (observed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "unsafe_archive", "command cwd is missing, symlinked, or escapes the workspace root", "rejected");
     const freshSandbox = await this.get(workspace);
@@ -1254,7 +1266,8 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     let logPromise: Promise<void> | undefined;
     let reason: "cancelled" | "timeout" | "resource_limit" | undefined;
     let termination: Promise<void> | undefined;
-    const logAbort = new AbortController();
+    let closeLogs: (() => Promise<void>) | undefined;
+    const closeLogsSafely = () => { void closeLogs?.().catch(() => undefined); };
     const stdout: Buffer[] = []; const stderr: Buffer[] = []; let bytes = 0; let stdoutBytes = 0; let stderrBytes = 0;
     const append = (stream: "stdout" | "stderr", data: string) => {
       const chunkBytes = Buffer.byteLength(data); const remaining = request.maxOutputBytes - bytes;
@@ -1273,21 +1286,29 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     };
     const killAndObserve = (): Promise<void> => {
       if (!command || !waitPromise) return Promise.resolve();
-      termination ??= (async () => { await command!.kill("SIGKILL"); await waitPromise!; })();
+      termination ??= (async () => {
+        try { await command!.kill("SIGKILL"); }
+        catch (error) {
+          // A terminal response cannot leave this exact command running. Its
+          // owned wait remains mandatory before the cancellation is reported.
+          if (!vercelCommandAlreadyTerminal(error)) throw error;
+        }
+        await waitPromise!;
+      })();
       return termination;
     };
     let interruptCreation: (() => void) | undefined;
     const creationInterrupted = new Promise<"interrupted">((resolve) => { interruptCreation = () => resolve("interrupted"); });
     const cancel = () => {
       if (!reason) reason = "cancelled";
-      logAbort.abort();
+      closeLogsSafely();
       interruptCreation?.();
       if (command) termination = killAndObserve();
     };
     request.signal?.addEventListener("abort", cancel, { once: true });
     const timeout = setTimeout(() => {
       if (!reason) reason = "timeout";
-      logAbort.abort();
+      closeLogsSafely();
       interruptCreation?.();
       if (command) termination = killAndObserve();
     }, Math.max(1, request.timeoutMs));
@@ -1327,16 +1348,29 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       // the exact name has been re-read with resume:false and its Session is
       // still the identity recorded in the workspace.
       ({ sandbox, session } = await this.observeFreshSession(workspace));
-      if (reason) termination = killAndObserve();
-      const iterator = command.logs({ signal: logAbort.signal });
+      if (reason) {
+        termination = killAndObserve();
+        await termination;
+        if (reason === "timeout") throw new CloudWorkspaceError(this.name, "timeout", "sandbox command timed out", "deferred");
+        if (reason === "resource_limit") throw new CloudWorkspaceError(this.name, "resource_limit", "sandbox command output exceeded its byte limit", "rejected");
+        throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
+      }
+      // The SDK's merged external log signal can self-abort while a command
+      // is completing. Own the iterator's close method instead; it closes the
+      // exact stream on every terminal path without sharing abort state.
+      const iterator = command.logs();
+      let closePromise: Promise<void> | undefined;
+      closeLogs = () => closePromise ??= Promise.resolve()
+        .then(() => iterator.close())
+        .then(() => undefined);
       logPromise = (async () => {
         try {
           for await (const log of iterator) {
             append(log.stream, log.data);
-            if (reason === "resource_limit") { logAbort.abort(); termination = killAndObserve(); await termination; break; }
+            if (reason === "resource_limit") { closeLogsSafely(); termination = killAndObserve(); await termination; break; }
           }
         } catch (error) { throw error; }
-        finally { await Promise.resolve(iterator.close()); }
+        finally { await closeLogs(); closeLogs = undefined; }
       })();
       const raced = await Promise.race([
         waitPromise.then((value) => ({ kind: "wait" as const, value })),
@@ -1350,7 +1384,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       return { exitCode: finished.exitCode, stdout: Buffer.concat(stdout, stdoutBytes), stderr: Buffer.concat(stderr, stderrBytes), durationMs: Date.now() - startedAt };
     } catch (error) {
       if (command) {
-        logAbort.abort();
+        closeLogsSafely();
         try {
           await logPromise?.catch(() => undefined);
           await killAndObserve();
@@ -1366,10 +1400,19 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
           await this.cleanupOrBlock(workspace, error, "could not delete the exact sandbox after uncertain command termination");
         }
       }
+      if (reason === "timeout" && !(error instanceof CloudWorkspaceError)) {
+        throw new CloudWorkspaceError(this.name, "timeout", "sandbox command timed out", "deferred");
+      }
+      if (reason === "resource_limit" && !(error instanceof CloudWorkspaceError)) {
+        throw new CloudWorkspaceError(this.name, "resource_limit", "sandbox command output exceeded its byte limit", "rejected");
+      }
+      if (reason === "cancelled" && !(error instanceof CloudWorkspaceError)) {
+        throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
+      }
       if (request.signal?.aborted && !(error instanceof CloudWorkspaceError)) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");
       throw error;
     } finally {
-      clearTimeout(timeout); interruptCreation = undefined; logAbort.abort(); request.signal?.removeEventListener("abort", cancel);
+      clearTimeout(timeout); interruptCreation = undefined; closeLogsSafely(); request.signal?.removeEventListener("abort", cancel);
     }
   }
 }

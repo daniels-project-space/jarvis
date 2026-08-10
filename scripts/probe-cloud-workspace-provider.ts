@@ -75,9 +75,9 @@ function parseBounds(stdout: string): { cpu: number; memoryMb: number } {
   return { cpu: cpuCount, memoryMb };
 }
 
-async function probeVercelNativeCancellation(provider: ReturnType<typeof configuredCloudWorkspaceProviderForLiveProbe>, workspace: CloudWorkspace, runId: string) {
+async function probeVercelNativeCancellation(workspace: CloudWorkspace, runId: string) {
   const { Sandbox } = await import("@vercel/sandbox");
-  const markerDelayMs = 4_500;
+  const markerDelayMs = 15_000;
   const id = randomBytes(12).toString("hex");
   const directory = `.jarvis-provider-probe/${id}`;
   const pidPath = `${directory}/process.pid`;
@@ -93,26 +93,36 @@ async function probeVercelNativeCancellation(provider: ReturnType<typeof configu
     token: process.env.VERCEL_TOKEN!, teamId: process.env.VERCEL_TEAM_ID!, projectId: process.env.VERCEL_PROJECT_ID!,
     name: workspace.providerWorkspaceId, resume: false,
   });
-  const session = sandbox.currentSession() as { sessionId?: string };
+  const session = sandbox.currentSession();
   if (sandbox.name !== workspace.providerWorkspaceId || session.sessionId !== workspace.providerSessionId) {
     throw new Error("Vercel cancellation proof saw a substituted sandbox session");
   }
-  const command = await sandbox.runCommand({
+  // The direct native proof deliberately stays on this exact existing Session:
+  // Sandbox.runCommand can resume a workspace, which would weaken the fence.
+  const command = await session.runCommand({
     cmd: "node", args: ["-e", source, directory, pidPath, markerPath, String(markerDelayMs)],
     cwd: workspace.root, env: {}, detached: true, timeoutMs: markerDelayMs + 10_000,
   });
-  const pid = new TextDecoder().decode(await provider.readFile(workspace, pidPath, 64)).trim();
+  // Poll the provider's exact Session directly: the child can start just after
+  // detached command creation, while the guarded adapter deliberately incurs
+  // additional fresh-session checks that are irrelevant to this native proof.
+  const pidDeadline = Date.now() + 5_000;
+  let pid = "";
+  while (Date.now() < pidDeadline) {
+    const value = await session.readFileToBuffer({ path: pidPath, cwd: workspace.root });
+    if (value) {
+      pid = new TextDecoder().decode(value).trim();
+      break;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+  }
   if (!/^[1-9]\d{0,11}$/.test(pid)) throw new Error("Vercel native cancellation command did not reach its PID checkpoint");
   await command.kill("SIGKILL");
   const stopped = await command.wait();
   if (stopped.exitCode === 0) throw new Error("Vercel native cancellation command did not report a killed terminal state");
   await new Promise<void>((resolve) => setTimeout(resolve, markerDelayMs + 300));
-  try {
-    await provider.readFile(workspace, markerPath, 128);
-    throw new Error("Vercel native cancellation marker appeared after SIGKILL");
-  } catch (error) {
-    if (error instanceof Error && /marker appeared/.test(error.message)) throw error;
-  }
+  const marker = await session.readFileToBuffer({ path: markerPath, cwd: workspace.root });
+  if (marker) throw new Error("Vercel native cancellation marker appeared after SIGKILL");
   const refreshed = await Sandbox.get({
     token: process.env.VERCEL_TOKEN!, teamId: process.env.VERCEL_TEAM_ID!, projectId: process.env.VERCEL_PROJECT_ID!,
     name: workspace.providerWorkspaceId, resume: false,
@@ -323,7 +333,7 @@ async function main() {
 
     probeStage = "exact cancellation observation";
     const cancellationEvidence = binding.provider === "vercel"
-      ? await probeVercelNativeCancellation(provider, first, runId)
+      ? await probeVercelNativeCancellation(first, runId)
       : await probeExactRemoteCancellation(cloudWorkspaceCancellationProbeRemote(provider, first), runId);
     if (!cancellationEvidence.adapterCancelled || !cancellationEvidence.pidGone
       || !cancellationEvidence.processGone || !cancellationEvidence.markerAbsent) {
