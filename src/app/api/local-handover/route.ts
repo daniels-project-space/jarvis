@@ -11,6 +11,9 @@ const statusSchema = z.object({
   provider: providerSchema,
   updatedAt: z.number().finite().nonnegative(),
 });
+type OwnerAccess =
+  | { ok: true; credentials: { authTokenHash: string } }
+  | { ok: false; response: Response };
 
 function noStore(body: Record<string, unknown>, status = 200) {
   return Response.json(body, {
@@ -21,48 +24,51 @@ function noStore(body: Record<string, unknown>, status = 200) {
 
 function safeStatus(value: unknown) {
   const parsed = statusSchema.safeParse(value);
-  const provider = parsed.success ? parsed.data.provider : "codex";
+  if (!parsed.success) return null;
+  const provider = parsed.data.provider;
   return {
     provider,
     targetRuntime: provider === "claude" ? "vps_claude" : "vps_codex",
-    updatedAt: parsed.success ? parsed.data.updatedAt : 0,
+    updatedAt: parsed.data.updatedAt,
   };
 }
 
-async function ownerCredentials(req: NextRequest) {
+async function ownerCredentials(req: NextRequest): Promise<OwnerAccess> {
   const actor = await controlActor(req);
-  if (!actor) return { response: noStore({ ok: false }, 401) };
+  if (!actor) return { ok: false, response: noStore({ ok: false }, 401) };
   if (!isOwnerActor(actor)) {
-    return { response: noStore({ ok: false, error: "owner enrollment required" }, 403) };
+    return { ok: false, response: noStore({ ok: false, error: "owner enrollment required" }, 403) };
   }
-  return { credentials: controlCredentials(actor) };
+  return { ok: true, credentials: controlCredentials(actor) };
 }
 
-export async function GET(req: NextRequest) {
+export async function GET(req: NextRequest): Promise<Response> {
   const access = await ownerCredentials(req);
-  if ("response" in access) return access.response;
+  if (!access.ok) return access.response;
   try {
-    const status = await controlQuery("ui:getLocalCodingProvider", access.credentials);
-    return noStore({ ok: true, status: safeStatus(status) });
+    const status = safeStatus(await controlQuery("ui:getLocalCodingProvider", access.credentials));
+    if (!status) throw new Error("invalid handover status");
+    return noStore({ ok: true, status });
   } catch {
     return noStore({ ok: false, error: "handover status is temporarily unavailable" }, 503);
   }
 }
 
-export async function POST(req: NextRequest) {
+export async function POST(req: NextRequest): Promise<Response> {
   const access = await ownerCredentials(req);
-  if ("response" in access) return access.response;
+  if (!access.ok) return access.response;
   const body = await req.json().catch(() => null);
   const parsed = requestSchema.safeParse(body);
   if (!parsed.success) {
     return noStore({ ok: false, error: "provider must be codex or claude" }, 400);
   }
   try {
-    const status = await controlMutation("ui:setLocalCodingProvider", {
+    const status = safeStatus(await controlMutation("ui:setLocalCodingProvider", {
       ...access.credentials,
       provider: parsed.data.provider,
-    });
-    return noStore({ ok: true, status: safeStatus(status) });
+    }));
+    if (!status) throw new Error("invalid handover status");
+    return noStore({ ok: true, status });
   } catch {
     return noStore({ ok: false, error: "handover target could not be saved" }, 503);
   }
