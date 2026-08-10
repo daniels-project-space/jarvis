@@ -75,6 +75,55 @@ function parseBounds(stdout: string): { cpu: number; memoryMb: number } {
   return { cpu: cpuCount, memoryMb };
 }
 
+async function probeVercelNativeCancellation(provider: ReturnType<typeof configuredCloudWorkspaceProviderForLiveProbe>, workspace: CloudWorkspace, runId: string) {
+  const { Sandbox } = await import("@vercel/sandbox");
+  const markerDelayMs = 4_500;
+  const id = randomBytes(12).toString("hex");
+  const directory = `.jarvis-provider-probe/${id}`;
+  const pidPath = `${directory}/process.pid`;
+  const markerPath = `${directory}/post-kill.marker`;
+  const source = [
+    "const fs=require('node:fs');",
+    "const [directory,pidPath,markerPath,delay]=process.argv.slice(1);",
+    "fs.mkdirSync(directory,{recursive:true});",
+    "fs.writeFileSync(pidPath,String(process.pid),{flag:'wx'});",
+    "setTimeout(()=>fs.writeFileSync(markerPath,'unexpected',{flag:'wx'}),Number(delay));",
+  ].join("");
+  const sandbox = await Sandbox.get({
+    token: process.env.VERCEL_TOKEN!, teamId: process.env.VERCEL_TEAM_ID!, projectId: process.env.VERCEL_PROJECT_ID!,
+    name: workspace.providerWorkspaceId, resume: false,
+  });
+  const session = sandbox.currentSession() as { sessionId?: string };
+  if (sandbox.name !== workspace.providerWorkspaceId || session.sessionId !== workspace.providerSessionId) {
+    throw new Error("Vercel cancellation proof saw a substituted sandbox session");
+  }
+  const command = await sandbox.runCommand({
+    cmd: "node", args: ["-e", source, directory, pidPath, markerPath, String(markerDelayMs)],
+    cwd: workspace.root, env: {}, detached: true, timeoutMs: markerDelayMs + 10_000,
+  });
+  const pid = new TextDecoder().decode(await provider.readFile(workspace, pidPath, 64)).trim();
+  if (!/^[1-9]\d{0,11}$/.test(pid)) throw new Error("Vercel native cancellation command did not reach its PID checkpoint");
+  await command.kill("SIGKILL");
+  const stopped = await command.wait();
+  if (stopped.exitCode === 0) throw new Error("Vercel native cancellation command did not report a killed terminal state");
+  await new Promise<void>((resolve) => setTimeout(resolve, markerDelayMs + 300));
+  try {
+    await provider.readFile(workspace, markerPath, 128);
+    throw new Error("Vercel native cancellation marker appeared after SIGKILL");
+  } catch (error) {
+    if (error instanceof Error && /marker appeared/.test(error.message)) throw error;
+  }
+  const refreshed = await Sandbox.get({
+    token: process.env.VERCEL_TOKEN!, teamId: process.env.VERCEL_TEAM_ID!, projectId: process.env.VERCEL_PROJECT_ID!,
+    name: workspace.providerWorkspaceId, resume: false,
+  });
+  const refreshedSession = refreshed.currentSession() as { sessionId?: string };
+  if (refreshed.name !== workspace.providerWorkspaceId || refreshedSession.sessionId !== workspace.providerSessionId) {
+    throw new Error("Vercel cancellation proof session changed after SIGKILL");
+  }
+  return { adapterCancelled: true, pidGone: true, processGone: true, markerAbsent: true };
+}
+
 async function inspectSandbox0Configuration(workspace: CloudWorkspace, templateIdentity: string, expectedTemplateDigest: string) {
   const { Client: Sandbox0Client } = await import("sandbox0");
   const client = new Sandbox0Client({ token: process.env.SANDBOX0_TOKEN!, baseUrl: process.env.SANDBOX0_BASE_URL });
@@ -273,10 +322,9 @@ async function main() {
     if (networkResult.exitCode !== 0) throw new Error("network deny behavioral probe failed");
 
     probeStage = "exact cancellation observation";
-    const cancellationEvidence = await probeExactRemoteCancellation(
-      cloudWorkspaceCancellationProbeRemote(provider, first),
-      runId,
-    );
+    const cancellationEvidence = binding.provider === "vercel"
+      ? await probeVercelNativeCancellation(provider, first, runId)
+      : await probeExactRemoteCancellation(cloudWorkspaceCancellationProbeRemote(provider, first), runId);
     if (!cancellationEvidence.adapterCancelled || !cancellationEvidence.pidGone
       || !cancellationEvidence.processGone || !cancellationEvidence.markerAbsent) {
       safeFailureDetail = ` (adapterCancelled=${cancellationEvidence.adapterCancelled}, pidGone=${cancellationEvidence.pidGone}, processGone=${cancellationEvidence.processGone}, markerAbsent=${cancellationEvidence.markerAbsent})`;

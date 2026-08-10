@@ -124,6 +124,7 @@ class FakeSandbox {
   private readonly snapshot = FakeSandbox.current;
   constructor(readonly name: string) {}
   currentSession() { return this.snapshot; }
+  runCommand(input: Parameters<FakeSession["runCommand"]>[0]) { return this.snapshot.runCommand(input); }
   async delete() { observed.deletes.push(this.name); if (observed.deleteFailure) throw observed.deleteFailure; }
 }
 
