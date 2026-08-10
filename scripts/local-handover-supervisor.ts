@@ -683,14 +683,34 @@ async function launchTmuxSession(
   const bin = provider === "codex"
     ? process.env.JARVIS_CODEX_BIN ?? "codex"
     : process.env.JARVIS_CLAUDE_BIN ?? "claude";
+  // Remote Control is the supported bridge from a CLI session running on the
+  // VPS to the user's Claude Code surfaces. It requires a separate claude.ai
+  // subscription login, so do not change an existing gateway-backed runner
+  // until that one-time setup has explicitly enabled it.
+  const claudeRemoteControlEnabled = provider === "claude"
+    && process.env.JARVIS_CLAUDE_REMOTE_CONTROL === "1";
+  // The runner itself may use a gateway endpoint, but Remote Control requires
+  // the normal claude.ai subscription endpoint and feature-flag traffic.
+  // Scope that adjustment to this child process only; it must not change the
+  // runner or other tools.
+  const claudeRemoteControlEnvironment = { ...process.env };
+  for (const key of [
+    "ANTHROPIC_BASE_URL",
+    "DISABLE_TELEMETRY",
+    "DO_NOT_TRACK",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    "DISABLE_GROWTHBOOK",
+  ]) delete claudeRemoteControlEnvironment[key];
   const command = provider === "codex"
     ? [bin, "--no-alt-screen", "-C", session.cwd, "--add-dir", bundleDirectory, prompt]
     // Claude's variadic --add-dir option needs the equals form so the prompt
     // remains the positional user message rather than another directory.
     : [
       bin,
-      "--name",
-      tmuxSession,
+      // The deterministic name is what the user sees in their Claude Code
+      // session list after a manual or quota-driven handover.
+      "--name", claudeRemoteControlEnabled ? `Jarvis VPS handover ${session.id}` : tmuxSession,
+      ...(claudeRemoteControlEnabled ? ["--remote-control"] : []),
       "--session-id",
       nativePrompt.claudeSessionId!,
       // A root-owned service cannot start Claude with a user-level
@@ -707,6 +727,7 @@ async function launchTmuxSession(
     ];
   await new Promise<void>((resolveLaunch, rejectLaunch) => {
     const child = spawn("tmux", ["new-session", "-d", "-s", tmuxSession, "-c", session.cwd, ...command], {
+      env: claudeRemoteControlEnabled ? claudeRemoteControlEnvironment : process.env,
       stdio: ["ignore", "ignore", "pipe"],
       windowsHide: true,
     });
