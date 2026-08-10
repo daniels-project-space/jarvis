@@ -6,10 +6,18 @@ const loaderSource = readFileSync(new URL("../../public/jarvis-embed.js", import
 const JARVIS_ORIGIN = "https://jarvis-orcin-six.vercel.app";
 
 type LoaderListener = (event: unknown) => void;
+type CodingProvider = "codex" | "claude";
+type LocalCodingProviderStatus = {
+  provider: CodingProvider;
+  targetRuntime: "vps_codex" | "vps_claude";
+  updatedAt: number;
+};
 type JarvisApi = {
   ask: (text: string) => void;
   show: () => void;
   interrupt: () => void;
+  getCodingProviderStatus: () => Promise<LocalCodingProviderStatus>;
+  setCodingProvider: (provider: CodingProvider) => Promise<LocalCodingProviderStatus>;
   visible: boolean;
   wake: { listening: boolean; needsPermission: boolean };
 };
@@ -227,6 +235,104 @@ describe("Project Hub Jarvis loader", () => {
       data: { jarvis: "ready" },
     });
     expect(staleHarness.messages).not.toContainEqual({ jarvis: "host-command", text: "stale command" });
+  });
+
+  it("queues provider requests until ready and confirms both Claude and Codex through the trusted iframe only", async () => {
+    const harness = createLoader();
+    const receive = harness.listeners.get("message")?.[0];
+    const statusPromise = harness.window.JARVIS.getCodingProviderStatus();
+
+    expect(harness.messages).not.toContainEqual(expect.objectContaining({ jarvis: "host-coding-provider-status" }));
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "ready" } });
+
+    const statusRequest = harness.messages.find((message) => (
+      message as { jarvis?: string }
+    ).jarvis === "host-coding-provider-status") as { jarvis: string; id: string } | undefined;
+    expect(statusRequest?.id).toMatch(/^cp_/);
+
+    // An otherwise valid result from an untrusted origin cannot resolve the request.
+    receive?.({
+      origin: "https://untrusted.example",
+      source: harness.frameWindow,
+      data: {
+        jarvis: "coding-provider-result",
+        id: statusRequest?.id,
+        ok: true,
+        status: { provider: "claude", updatedAt: 1 },
+      },
+    });
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: {
+        jarvis: "coding-provider-result",
+        id: statusRequest?.id,
+        ok: true,
+        status: { provider: "codex", updatedAt: 2 },
+      },
+    });
+    await expect(statusPromise).resolves.toEqual({
+      provider: "codex",
+      targetRuntime: "vps_codex",
+      updatedAt: 2,
+    });
+
+    const toClaude = harness.window.JARVIS.setCodingProvider("claude");
+    const claudeRequest = harness.messages.filter((message) => (
+      message as { jarvis?: string }
+    ).jarvis === "host-coding-provider-set").at(-1) as { jarvis: string; id: string; provider: string } | undefined;
+    expect(claudeRequest).toMatchObject({ provider: "claude" });
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: {
+        jarvis: "coding-provider-result",
+        id: claudeRequest?.id,
+        ok: true,
+        status: { provider: "claude", updatedAt: 3 },
+      },
+    });
+    await expect(toClaude).resolves.toEqual({
+      provider: "claude",
+      targetRuntime: "vps_claude",
+      updatedAt: 3,
+    });
+
+    const toCodex = harness.window.JARVIS.setCodingProvider("codex");
+    const codexRequest = harness.messages.filter((message) => (
+      message as { jarvis?: string }
+    ).jarvis === "host-coding-provider-set").at(-1) as { jarvis: string; id: string; provider: string } | undefined;
+    expect(codexRequest).toMatchObject({ provider: "codex" });
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: {
+        jarvis: "coding-provider-result",
+        id: codexRequest?.id,
+        ok: true,
+        status: { provider: "codex", updatedAt: 4 },
+      },
+    });
+    await expect(toCodex).resolves.toEqual({
+      provider: "codex",
+      targetRuntime: "vps_codex",
+      updatedAt: 4,
+    });
+  });
+
+  it("rejects an in-flight provider change when the trusted iframe reloads instead of replaying it", async () => {
+    const harness = createLoader();
+    const receive = harness.listeners.get("message")?.[0];
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "ready" } });
+
+    const change = harness.window.JARVIS.setCodingProvider("claude");
+    expect(harness.messages).toContainEqual(expect.objectContaining({
+      jarvis: "host-coding-provider-set",
+      provider: "claude",
+    }));
+    receive?.({ origin: JARVIS_ORIGIN, source: harness.frameWindow, data: { jarvis: "unloading" } });
+
+    await expect(change).rejects.toThrow("reloaded before confirming");
   });
 
   it("holds commands across an iframe reload until that document acknowledges a fresh probe", () => {

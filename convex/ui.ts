@@ -3,9 +3,11 @@ import { v } from "convex/values";
 import {
   actorAuthArgs,
   dispatcherAuthArgs,
+  ownerDispatcherAuthArgs,
   requireActor,
   requireAdmin,
   requireDispatcher,
+  requireOwnerOrDispatcher,
   requireViewer,
   viewerAuthArgs,
 } from "./controlAuth";
@@ -99,6 +101,64 @@ export const getAgentProvider = query({
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
     return "codex";
+  },
+});
+
+// Separate from the durable Trigger/Codex execution plane above. This is the
+// owner's persisted target for a future handover to the local VPS runner; it
+// never promotes a browser/guest capability into worker authority.
+export const setLocalCodingProvider = mutation({
+  args: {
+    provider: v.union(v.literal("codex"), v.literal("claude")),
+    ...ownerDispatcherAuthArgs,
+  },
+  handler: async (ctx, a) => {
+    await requireOwnerOrDispatcher(ctx, a);
+    const existing = await ctx.db
+      .query("ui")
+      .withIndex(
+        "by_key",
+        // Convex's generated index callback is currently untyped in this module.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (q: any) => q.eq("key", "localCodingProvider"),
+      )
+      .first();
+    const updatedAt = Date.now();
+    const doc = {
+      key: "localCodingProvider",
+      type: "local-coding-provider",
+      value: a.provider,
+      updatedAt,
+    };
+    if (existing) await ctx.db.patch(existing._id, doc);
+    else await ctx.db.insert("ui", doc);
+    return {
+      provider: a.provider,
+      targetRuntime: a.provider === "claude" ? "vps_claude" : "vps_codex",
+      updatedAt,
+    };
+  },
+});
+
+export const getLocalCodingProvider = query({
+  args: { ...ownerDispatcherAuthArgs },
+  handler: async (ctx, a) => {
+    await requireOwnerOrDispatcher(ctx, a);
+    const existing = await ctx.db
+      .query("ui")
+      .withIndex(
+        "by_key",
+        // Convex's generated index callback is currently untyped in this module.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (q: any) => q.eq("key", "localCodingProvider"),
+      )
+      .first();
+    const provider = existing?.value === "claude" ? "claude" : "codex";
+    return {
+      provider,
+      targetRuntime: provider === "claude" ? "vps_claude" : "vps_codex",
+      updatedAt: existing?.updatedAt ?? 0,
+    };
   },
 });
 
