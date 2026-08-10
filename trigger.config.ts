@@ -22,7 +22,7 @@ export default defineConfig({
         "@napi-rs/canvas@0.1.80",
         "e2b@2.35.0",
         "sandbox0@0.9.3",
-        "@vercel/sandbox@2.8.0",
+        "@vercel/sandbox@3.0.0",
       ] }),
       // Git and archive utilities are controller-only. The pinned protocol's
       // live permission attestation disables built-in host tools, so cloud

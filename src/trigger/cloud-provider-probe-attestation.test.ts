@@ -79,6 +79,11 @@ describe("deployment-bound cloud provider probe authority", () => {
     expect(installedCloudProviderSdkVersion("vercel")).toBe("3.0.0");
   });
 
+  it("pins the Trigger build image to the attested Vercel Sandbox SDK", () => {
+    const triggerConfig = readFileSync(join(process.cwd(), "trigger.config.ts"), "utf8");
+    expect(triggerConfig).toContain('"@vercel/sandbox@3.0.0"');
+  });
+
   it("keeps SANDBOX0_TOKEN alone blocked before adapter construction, hydration, or model execution", async () => {
     const env = baseEnvironment();
     env.JARVIS_CLOUD_PROVIDER_PROBE = "live";
