@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../../convex/_generated/api";
 import type { ChatFileManifest } from "@/lib/chat-files";
-import { filesFromDrop, uploadPrivateChatFiles, type UploadProgress } from "@/lib/chat-file-upload";
+import { filesFromDrop, uploadFilesForChat, type UploadProgress } from "@/lib/chat-file-upload";
 import { useJarvisQuery } from "@/lib/secure-convex";
 import { ChatFileChip } from "./ChatFileChip";
 import { ChatFileLibraryDropdown } from "./ChatFileLibraryDropdown";
@@ -20,6 +20,7 @@ export function ChatFilePicker({
   notice,
   onNotice,
   disabled = false,
+  onDropUpload,
 }: {
   threadId: string;
   selectedFileIds: string[];
@@ -29,6 +30,8 @@ export function ChatFilePicker({
   notice: ChatFileNotice;
   onNotice: (notice: ChatFileNotice) => void;
   disabled?: boolean;
+  /** Called with the fileIds from a drag-and-drop upload only (not the file/folder pickers), so callers can tell drop-triggered batches apart from deliberate picks. */
+  onDropUpload?: (fileIds: string[]) => void;
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -44,24 +47,24 @@ export function ChatFilePicker({
   const threadFiles = useJarvisQuery(api.files.listForThread, { threadId, limit: 100 }) as ChatFileManifest[] | undefined;
   const byId = useMemo(() => new Map((threadFiles ?? []).map((file) => [file.fileId, file])), [threadFiles]);
 
-  const upload = async (files: File[]) => {
+  const upload = async (files: File[], fromDrop = false) => {
     if (!files.length || disabled || progress) return;
     setActionsOpen(true);
     setError("");
     onNotice(null);
     const controller = new AbortController();
     uploadAbortRef.current = controller;
-    try {
-      const fileIds = await uploadPrivateChatFiles(files, threadId, setProgress, controller.signal);
-      onPendingChange((current) => [...new Set([...current, ...fileIds])]);
-    } catch (caught) {
-      const aborted = controller.signal.aborted || (caught instanceof DOMException && caught.name === "AbortError");
-      if (aborted) onNotice({ tone: "status", text: "Upload cancelled. Any reserved private storage is being cleaned up." });
-      else setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      if (uploadAbortRef.current === controller) uploadAbortRef.current = null;
-      setProgress(null);
-    }
+    await uploadFilesForChat(files, threadId, {
+      onPendingChange,
+      onProgress: setProgress,
+      signal: controller.signal,
+      onUploaded: fromDrop ? onDropUpload : undefined,
+      onOutcome: (outcome) => {
+        if (outcome.kind === "cancelled") onNotice({ tone: "status", text: "Upload cancelled. Any reserved private storage is being cleaned up." });
+        else setError(outcome.message);
+      },
+    });
+    if (uploadAbortRef.current === controller) uploadAbortRef.current = null;
   };
 
   const selectedFiles = selectedFileIds.map((fileId) => byId.get(fileId)).filter((file): file is ChatFileManifest => Boolean(file));
@@ -103,13 +106,14 @@ export function ChatFilePicker({
     <div
       ref={rootRef}
       className={`relative shrink-0 self-stretch ${dragging ? "rounded-xl ring-1 ring-cyan/60" : ""}`}
-      onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
-      onDragOver={(event) => event.preventDefault()}
-      onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false); }}
+      onDragEnter={(event) => { event.preventDefault(); event.stopPropagation(); setDragging(true); }}
+      onDragOver={(event) => { event.preventDefault(); event.stopPropagation(); }}
+      onDragLeave={(event) => { event.stopPropagation(); if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false); }}
       onDrop={(event) => {
         event.preventDefault();
+        event.stopPropagation();
         setDragging(false);
-        void filesFromDrop(event.dataTransfer).then(upload).catch((caught) => setError(String(caught)));
+        void filesFromDrop(event.dataTransfer).then((files) => upload(files, true)).catch((caught) => setError(String(caught)));
       }}
     >
       <input ref={inputRef} hidden multiple type="file" onChange={(event) => { void upload(Array.from(event.target.files ?? [])); event.target.value = ""; }} />

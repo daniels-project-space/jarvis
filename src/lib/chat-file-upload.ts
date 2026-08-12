@@ -222,6 +222,45 @@ export async function uploadPrivateChatFiles(
   return uploadedIds;
 }
 
+export type ChatFileUploadOutcome =
+  | { kind: "error"; message: string }
+  | { kind: "cancelled" };
+
+/**
+ * Shared drop/pick -> upload -> pending-merge path. Every surface that can add
+ * files to a chat (ChatFilePicker's own drop zone and file inputs, the wider
+ * composer drop zones in JarvisUI, the collapsed embed widget) funnels through
+ * this so there is exactly one place that calls uploadPrivateChatFiles and
+ * merges the results into pendingFileIds.
+ */
+export async function uploadFilesForChat(
+  files: File[],
+  threadId: string,
+  handlers: {
+    onPendingChange: (update: string[] | ((current: string[]) => string[])) => void;
+    onOutcome: (outcome: ChatFileUploadOutcome) => void;
+    onProgress?: (progress: UploadProgress | null) => void;
+    onUploaded?: (fileIds: string[]) => void;
+    signal?: AbortSignal;
+  },
+): Promise<void> {
+  if (!files.length) return;
+  try {
+    const fileIds = await uploadPrivateChatFiles(files, threadId, handlers.onProgress, handlers.signal);
+    handlers.onUploaded?.(fileIds);
+    handlers.onPendingChange((current) => [...new Set([...current, ...fileIds])]);
+  } catch (caught) {
+    const aborted = handlers.signal?.aborted || (caught instanceof DOMException && caught.name === "AbortError");
+    handlers.onOutcome(
+      aborted
+        ? { kind: "cancelled" }
+        : { kind: "error", message: caught instanceof Error ? caught.message : String(caught) },
+    );
+  } finally {
+    handlers.onProgress?.(null);
+  }
+}
+
 type FileSystemFileHandleLike = { kind: "file"; name: string; getFile(): Promise<File> };
 type FileSystemDirectoryHandleLike = { kind: "directory"; name: string; values(): AsyncIterable<FileSystemFileHandleLike | FileSystemDirectoryHandleLike> };
 type LegacyFileEntryLike = {

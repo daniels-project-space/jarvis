@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { usePaginatedQuery } from "convex/react";
 import dynamic from "next/dynamic";
 import { api } from "../../convex/_generated/api";
@@ -95,6 +95,7 @@ import {
 import { ChatFilePicker } from "./chat-files/ChatFilePicker";
 import { GuestChatFileAccess } from "./chat-files/GuestChatFileAccess";
 import { ChatFilePendingMonitor, type ChatFileNotice } from "./chat-files/ChatFilePendingMonitor";
+import { useChatFileDropZone } from "./chat-files/useChatFileDropZone";
 import type { ChatFileManifest } from "@/lib/chat-files";
 import { buildSpeculativeResearchQuery } from "@/lib/speculative-research";
 import {
@@ -421,6 +422,21 @@ function MediaCard({ a, onShow }: { a: Attachment; onShow: (a: Attachment) => vo
       /* generic icon */
     }
   }
+  // Freshly created docs/boards carry their creationId inside `value` (see
+  // ui:setPanel calls in src/lib/tools.ts + src/lib/board.ts) — that's enough
+  // to offer a one-click download straight from the chat bubble, no need to
+  // open the panel first. Docs default to PDF; boards to the editable
+  // .excalidraw bundle (PNG/SVG need the live canvas — see BoardView's own
+  // "export image" once opened).
+  let downloadHref = "";
+  if (a.type === "doc" || a.type === "board") {
+    try {
+      const creationId = JSON.parse(a.value)?.creationId;
+      if (creationId) downloadHref = `/api/creation-download?id=${encodeURIComponent(creationId)}${a.type === "doc" ? "&format=pdf" : ""}`;
+    } catch {
+      /* no creationId — no download link */
+    }
+  }
   return (
     <span className="glass card-lift inline-flex max-w-[88%] items-center gap-2 overflow-hidden rounded-xl p-1.5 pr-2 text-left">
       <button onClick={() => onShow(a)} className="flex min-w-0 items-center gap-2" title="show on screen">
@@ -455,6 +471,11 @@ function MediaCard({ a, onShow }: { a: Attachment; onShow: (a: Attachment) => vo
       {(a.type === "url" || a.type === "video" || a.type === "image") && (
         <a href={ext} target="_blank" rel="noreferrer" className="shrink-0 text-xs text-slate hover:text-cyan" title="open in tab">
           ↗
+        </a>
+      )}
+      {downloadHref && (
+        <a href={downloadHref} className="shrink-0 text-xs text-slate hover:text-cyan" title={a.type === "doc" ? "download as PDF" : "download board file"}>
+          ⬇
         </a>
       )}
     </span>
@@ -1607,10 +1628,28 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
   const [pendingFileIds, setPendingFileIds] = useState<string[]>([]);
   const [fileNotice, setFileNotice] = useState<ChatFileNotice>(null);
+  // fileIds uploaded via any drag-and-drop zone (ChatFilePicker's own small
+  // zone or the wider composer zones below). ChatFilePendingMonitor consumes
+  // this to decide which newly-attached batches are eligible to auto-send —
+  // files picked deliberately via the file/folder buttons or Library never
+  // land in this set, so they never trigger an auto-send.
+  const autoSubmitFileIdsRef = useRef<Set<string>>(new Set());
+  const markAutoSubmitEligible = useCallback((fileIds: string[]) => {
+    for (const id of fileIds) autoSubmitFileIdsRef.current.add(id);
+  }, []);
+  const { dragging: composerDragActive, dropHandlers: composerDropHandlers } = useChatFileDropZone({
+    threadId: thread,
+    disabled: guest,
+    onPendingChange: setPendingFileIds,
+    onNotice: setFileNotice,
+    onTextDrop: (text) => setInput((current) => (current ? `${current} ${text}` : text)),
+    onUploaded: markAutoSubmitEligible,
+  });
   useEffect(() => {
     setSelectedFileIds([]);
     setPendingFileIds([]);
     setFileNotice(null);
+    autoSubmitFileIdsRef.current.clear();
   }, [thread]);
   const [speaking, setSpeaking] = useState(false);
   const [ttsRuntimeStatus, setTtsRuntimeStatus] = useState<TtsRuntimeStatus>("ready");
@@ -4526,7 +4565,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         data-jarvis-embed-surface
         data-jarvis-embed-expanded="false"
         data-voice-state={orbState}
-        className="relative flex h-dvh w-full flex-col justify-between gap-2 overflow-hidden rounded-2xl border border-white/10 bg-[#05070d]/95 p-2.5 shadow-2xl backdrop-blur-xl"
+        className={`relative flex h-dvh w-full flex-col justify-between gap-2 overflow-hidden rounded-2xl border border-white/10 bg-[#05070d]/95 p-2.5 shadow-2xl backdrop-blur-xl transition ${composerDragActive ? "ring-1 ring-inset ring-cyan/60" : ""}`}
+        onDragEnter={composerDropHandlers.onDragEnter}
+        onDragOver={composerDropHandlers.onDragOver}
+        onDragLeave={composerDropHandlers.onDragLeave}
+        onDrop={(event) => {
+          // Files need the full chat (progress, pending chip, auto-send) to
+          // be mounted; text drops can stay collapsed since the mini composer
+          // is already visible here.
+          if (event.dataTransfer.files.length > 0) setEmbeddedExpanded(true);
+          composerDropHandlers.onDrop(event);
+        }}
       >
         <div className="flex min-w-0 items-start gap-2 pr-16">
           <button
@@ -4653,7 +4702,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         data-jarvis-embed-surface
         data-jarvis-embed-expanded="true"
         data-voice-state={orbState}
-        className="relative flex h-dvh w-full flex-col overflow-hidden bg-[#05070d]"
+        className={`relative flex h-dvh w-full flex-col overflow-hidden bg-[#05070d] transition ${composerDragActive ? "ring-1 ring-inset ring-cyan/60" : ""}`}
+        {...composerDropHandlers}
       >
         {!guest && (
           <ChatFilePendingMonitor
@@ -4663,6 +4713,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             onPendingChange={setPendingFileIds}
             onSelectionChange={setSelectedFileIds}
             onNotice={setFileNotice}
+            autoSubmitFileIdsRef={autoSubmitFileIdsRef}
+            onAutoSubmit={() => { if (!input.trim() && !sending) void submit(""); }}
           />
         )}
         <button
@@ -4816,6 +4868,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                   onPendingChange={setPendingFileIds}
                   notice={fileNotice}
                   onNotice={setFileNotice}
+                  onDropUpload={markAutoSubmitEligible}
                 />
               )}
             {voiceRecoveryVisible && (
@@ -4861,7 +4914,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   }
 
   return (
-    <div className="flex h-dvh flex-col overflow-hidden">
+    <div
+      className={`flex h-dvh flex-col overflow-hidden transition ${composerDragActive ? "ring-1 ring-inset ring-cyan/60" : ""}`}
+      {...composerDropHandlers}
+    >
       {!guest && (
         <ChatFilePendingMonitor
           threadId={thread}
@@ -4870,6 +4926,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           onPendingChange={setPendingFileIds}
           onSelectionChange={setSelectedFileIds}
           onNotice={setFileNotice}
+          autoSubmitFileIdsRef={autoSubmitFileIdsRef}
+          onAutoSubmit={() => { if (!input.trim() && !sending) void submit(""); }}
         />
       )}
       {/* top HUD strip */}
@@ -5220,6 +5278,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                   onPendingChange={setPendingFileIds}
                   notice={fileNotice}
                   onNotice={setFileNotice}
+                  onDropUpload={markAutoSubmitEligible}
                 />
               ))}
             {voiceRecoveryVisible && (

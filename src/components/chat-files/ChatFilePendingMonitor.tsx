@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, type RefObject } from "react";
 import { api } from "../../../convex/_generated/api";
 import type { ChatFileManifest } from "@/lib/chat-files";
 import { useJarvisQuery } from "@/lib/secure-convex";
@@ -15,6 +15,8 @@ export function ChatFilePendingMonitor({
   onPendingChange,
   onSelectionChange,
   onNotice,
+  autoSubmitFileIdsRef,
+  onAutoSubmit,
 }: {
   threadId: string;
   pendingFileIds: string[];
@@ -22,6 +24,10 @@ export function ChatFilePendingMonitor({
   onPendingChange: (fileIds: string[]) => void;
   onSelectionChange: (fileIds: string[]) => void;
   onNotice: (notice: ChatFileNotice) => void;
+  /** fileIds that came from a drag-and-drop upload, eligible for auto-submit once they attach. */
+  autoSubmitFileIdsRef?: RefObject<Set<string>>;
+  /** Called when a drop-triggered batch just attached and it's safe to send automatically. */
+  onAutoSubmit?: () => void;
 }) {
   const rows = useJarvisQuery(
     api.files.listForThread,
@@ -52,7 +58,19 @@ export function ChatFilePendingMonitor({
     } else {
       onNotice(null);
     }
-  }, [onNotice, onPendingChange, onSelectionChange, resolution]);
+
+    // Auto-context delivery: only for batches that came from a drop (tracked
+    // via autoSubmitFileIdsRef, populated by useChatFileDropZone/ChatFilePicker's
+    // own drop zone). Deliberate picks via the file/folder buttons or Library
+    // never end up in that set, so they never auto-send. Ids are consumed here
+    // regardless of outcome so a batch can only ever trigger this once.
+    const dropSet = autoSubmitFileIdsRef?.current;
+    if (dropSet && resolution.attached.length) {
+      const eligible = resolution.attached.some((file) => dropSet.has(file.fileId));
+      for (const file of resolution.attached) dropSet.delete(file.fileId);
+      if (eligible) onAutoSubmit?.();
+    }
+  }, [autoSubmitFileIdsRef, onAutoSubmit, onNotice, onPendingChange, onSelectionChange, resolution]);
 
   return null;
 }
