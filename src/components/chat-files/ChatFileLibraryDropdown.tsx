@@ -4,11 +4,23 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { usePaginatedQuery } from "convex/react";
 import { api } from "../../../convex/_generated/api";
 import { CHAT_FILE_LIMITS, type ChatFileManifest } from "@/lib/chat-files";
+import { clientMutation } from "@/lib/client-mutation";
 import { useViewerSession } from "@/lib/viewer-session";
 import { viewerFetchWithTimeout } from "@/lib/viewer-request";
 
 type LibraryFile = ChatFileManifest & { pinned?: boolean; updatedAt?: number };
 type FileIdSetter = (update: string[] | ((current: string[]) => string[])) => void;
+const READY_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+
+export function readyPrivateImagePanel(file: Pick<ChatFileManifest, "fileId" | "name" | "relativePath" | "mimeType" | "status">) {
+  const mimeType = String(file.mimeType ?? "").trim().toLowerCase();
+  if (file.status !== "ready" || !READY_IMAGE_MIME_TYPES.has(mimeType)) return null;
+  return {
+    type: "image" as const,
+    value: `/api/files/${encodeURIComponent(file.fileId)}`,
+    title: (file.relativePath || file.name).slice(0, 120),
+  };
+}
 
 function fileSize(bytes: number): string {
   return bytes >= 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.ceil(bytes / 1024))} KB`;
@@ -188,6 +200,23 @@ export function ChatFileLibraryDropdown({
     }
   };
 
+  const showImage = async (file: LibraryFile) => {
+    const panel = readyPrivateImagePanel(file);
+    if (!panel || busyRef.current) return;
+    busyRef.current = true;
+    setBusyId(file.fileId);
+    setError("");
+    try {
+      await clientMutation("ui:setPanel", panel);
+      onClose();
+    } catch {
+      setError(`${file.name} could not be shown in Jarvis.`);
+    } finally {
+      busyRef.current = false;
+      setBusyId("");
+    }
+  };
+
   const loadingFirstPage = activePage.status === "LoadingFirstPage";
   const loadingMore = activePage.status === "LoadingMore";
 
@@ -224,6 +253,7 @@ export function ChatFileLibraryDropdown({
         )}
         {files.map((file) => {
           const ready = file.status === "ready" || file.status === "stored_only";
+          const showableImage = Boolean(readyPrivateImagePanel(file));
           const retryable = file.status === "error";
           return (
             <div key={file.fileId} className="group flex min-h-14 items-center gap-2 rounded-xl px-2 py-2 hover:bg-white/[0.045] sm:gap-3 sm:px-3">
@@ -243,6 +273,9 @@ export function ChatFileLibraryDropdown({
               </button>
               {ready && (
                 <a href={`/api/files/${encodeURIComponent(file.fileId)}`} target="_blank" rel="noreferrer" aria-label={`Open ${file.name}`} className="grid size-10 shrink-0 place-items-center rounded-lg text-sm text-slate-400 hover:bg-white/8 hover:text-cyan">↗</a>
+              )}
+              {showableImage && (
+                <button type="button" disabled={actionBusy} onClick={() => void showImage(file)} aria-label={`Show ${file.name} in Jarvis`} title="Show in Jarvis" className="grid size-10 shrink-0 place-items-center rounded-lg text-sm text-slate-400 hover:bg-cyan/10 hover:text-cyan disabled:opacity-40">▧</button>
               )}
               {retryable && (
                 <button type="button" disabled={actionBusy} onClick={() => void retry(file)} aria-label={`Retry ${file.name}`} className="min-h-10 rounded-lg px-2 text-[10px] text-amber-300 hover:bg-amber-300/10 disabled:opacity-40">retry</button>
