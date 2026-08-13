@@ -55,4 +55,9 @@ describe("tool belt registry", () => {
     expect(SUBSCRIPTION_TOOL_NAMES.has("google_calendar_list")).toBe(false);
     expect(SUBSCRIPTION_TOOL_NAMES.has("google_calendar_create")).toBe(false);
   });
+
+  it("keeps uploaded-image display in the foreground owner lane", () => {
+    expect(TOOL_BELTS.core.has("show_uploaded_image")).toBe(true);
+    expect(SUBSCRIPTION_TOOL_NAMES.has("show_uploaded_image")).toBe(false);
+  });
 });

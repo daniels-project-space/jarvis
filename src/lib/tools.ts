@@ -1156,6 +1156,19 @@ export const TOOL_DEFS = [
       required: ["file_id"],
     },
   },
+  {
+    name: "show_uploaded_image",
+    description:
+      "Show one already-uploaded JPEG, PNG, or WebP image on the live panel and attach an owner-authenticated download card. Use only when Daniel explicitly asks to show, display, or open a particular uploaded image; pass its exact file_id. It refuses files that are deleted, still processing, stored-only, or not a safely detected image.",
+    parameters: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "the exact id of the ready uploaded image" },
+        title: { type: "string", description: "optional short label for the panel and download card" },
+      },
+      required: ["file_id"],
+    },
+  },
   // Gmail supports search, reading, subscription discovery, and draft creation.
   // Destructive inbox actions are intentionally not tool definitions: a model-
   // supplied `confirmed: true` is not an owner approval receipt.
@@ -3676,6 +3689,55 @@ async function openFileAsDoc(args: any): Promise<string> {
   return `Opened "${title}" as an editable doc (${words} words, creation_id ${id}) from ${file.originalName}. It updates LIVE on screen — discuss it briefly, don't read it out. To revise it, call draft with creation_id "${id}" and the full new text.`;
 }
 
+const READY_UPLOADED_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+
+async function showUploadedImage(args: any): Promise<string> {
+  const fileId = String(args.file_id ?? "").trim();
+  if (!fileId) return "TOOL DID NOTHING: no file_id passed.";
+  const file: any = await convexQuery("files:getForOwner", { fileId }).catch(() => null);
+  if (!file || file.status === "deleted") return "TOOL DID NOTHING: the selected file is not available.";
+  if (file.status === "stored_only") {
+    return "TOOL DID NOTHING: the selected file is stored-only, so it cannot be shown as a ready image or given an image download card.";
+  }
+  if (file.status !== "ready") {
+    return `TOOL DID NOTHING: the selected file is not ready for image display yet (status: ${String(file.status ?? "unknown").slice(0, 40)}).`;
+  }
+  const detectedMimeType = String(file.detectedMimeType ?? "").trim().toLowerCase();
+  if (!READY_UPLOADED_IMAGE_MIME_TYPES.has(detectedMimeType)) {
+    return "TOOL DID NOTHING: the selected ready file is not a safely detected JPEG, PNG, or WebP image.";
+  }
+
+  const safeFileId = encodeURIComponent(String(file._id ?? fileId));
+  const fileUrl = `/api/files/${safeFileId}`;
+  const downloadUrl = `${fileUrl}?download=1`;
+  const fallbackTitle = String(file.originalName ?? "Uploaded image").trim().slice(0, 120) || "Uploaded image";
+  const requestedTitle = String(args.title ?? "").trim().replace(/\s+/g, " ").slice(0, 120);
+  const title = requestedTitle || fallbackTitle;
+  const threadId = await activeThread();
+  let panelShown = true;
+  try {
+    await convexMutation("ui:setPanel", { type: "image", value: fileUrl, title });
+  } catch {
+    panelShown = false;
+  }
+  let cardPosted = true;
+  try {
+    await convexMutation("chatQueue:postCard", {
+      threadId,
+      type: "image",
+      value: fileUrl,
+      title,
+      downloadUrl,
+    });
+  } catch {
+    cardPosted = false;
+  }
+  if (!panelShown || !cardPosted) {
+    return `The selected ready image stayed private${panelShown ? "" : ", but could not be shown on screen"}${cardPosted ? "" : ", and its authenticated download card could not be posted"}.`;
+  }
+  return "Opened the selected ready image on screen and attached an owner-authenticated download card.";
+}
+
 export async function executeTool(
   name: string,
   args: any,
@@ -4532,6 +4594,8 @@ export async function executeTool(
     }
     case "open_file_as_doc":
       return await openFileAsDoc(args);
+    case "show_uploaded_image":
+      return await showUploadedImage(args);
     case "gmail_search": {
       const query = typeof args.query === "string" ? args.query : undefined;
       const maxResults = Number(args.max_results) || 20;

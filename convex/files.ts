@@ -924,7 +924,7 @@ const FILE_TURN_READ_ONLY_TOOLS = new Set([
 ]);
 
 const FILE_TURN_VISUAL_TOOLS = new Set([
-  "show", "show_ranking", "visual_scene", "board", "mind_map", "chart", "memory_map", "draft",
+  "show", "show_ranking", "visual_scene", "board", "mind_map", "chart", "memory_map", "draft", "show_uploaded_image",
 ]);
 
 /**

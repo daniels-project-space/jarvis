@@ -3,7 +3,7 @@ const TOOL_BELT_REGISTRY = {
     "dispatch_agent", "show", "show_ranking", "rank_focus", "video_control", "hide", "web_search", "weather",
     "timer", "briefing", "remind_at", "todo_add", "todo_done", "todo_list", "calendar_view",
     "google_calendar_list", "google_calendar_create",
-    "open_app", "host_ui", "mac_shortcut", "current_time", "calculate", "orb_mood",
+    "open_app", "host_ui", "mac_shortcut", "current_time", "calculate", "orb_mood", "show_uploaded_image",
   ]),
   work: new Set([
     "orchestrate", "goal_mode", "self_repair", "self_improve", "research", "plan_my_day", "show", "net_worth", "memory_map",
@@ -54,6 +54,9 @@ for (const name of [
   "gmail_read",
   "gmail_draft_reply",
   "gmail_list_subscriptions",
+  // Uploaded files are private owner data. The foreground owner lane may show
+  // a selected image; background subscription workers must never browse it.
+  "show_uploaded_image",
   // Google Calendar is foreground-only. It must never become an implicit
   // side effect of a subscription worker, and its iCloud counterpart remains
   // the default calendar lane.

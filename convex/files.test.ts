@@ -437,7 +437,7 @@ describe("durable private chat files", () => {
       fileIds: [ready.fileId as any],
       workerToken: WORKER,
     });
-    for (const toolName of ["open_app", "clear_chat", "web_search", "chart", "market_analysis"]) {
+    for (const toolName of ["open_app", "clear_chat", "web_search", "chart", "market_analysis", "show_uploaded_image"]) {
       expect(await t.query(api.files.authorizeFileTool, {
         messageId: passive,
         toolName,
@@ -452,7 +452,7 @@ describe("durable private chat files", () => {
       fileIds: [ready.fileId as any],
       workerToken: WORKER,
     });
-    for (const toolName of ["chart", "web_search"]) {
+    for (const toolName of ["chart", "web_search", "show_uploaded_image"]) {
       expect(await t.query(api.files.authorizeFileTool, {
         messageId: explicit,
         toolName,

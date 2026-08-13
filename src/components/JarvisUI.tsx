@@ -521,7 +521,7 @@ function MediaCard({ a, onShow }: { a: Attachment; onShow: (a: Attachment) => vo
         </a>
       )}
       {downloadHref && (
-        <a href={downloadHref} className="shrink-0 text-xs text-slate hover:text-cyan" title={a.type === "doc" ? "download as PDF" : "download board file"}>
+        <a href={downloadHref} download className="shrink-0 text-xs text-slate hover:text-cyan" title={a.type === "doc" ? "download as PDF" : a.type === "board" ? "download board file" : "download file"}>
           ⬇
         </a>
       )}
