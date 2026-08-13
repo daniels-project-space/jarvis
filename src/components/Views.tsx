@@ -742,11 +742,11 @@ type PlacesWidget = {
   preferences?: string;
   locationLabel?: string;
   provider?: "openstreetmap";
-  center: { lat: number; lng: number; label?: string; detail?: string; source?: "saved_location" | "current_state" | "openstreetmap" };
+  center: { lat: number; lng: number; label?: string; detail?: string; source?: "saved_location" | "current_state" | "gmail_current_stay" | "openstreetmap" };
   base?: { lat?: number; lng?: number; label: string; address?: string; source?: string };
   booking?: {
     requested: boolean;
-    status: "not_requested" | "matched" | "unavailable" | "no_local_match" | "not_found";
+    status: "not_requested" | "current_stay" | "matched" | "unavailable" | "no_local_match" | "not_found";
     message?: string;
   };
   route?: {

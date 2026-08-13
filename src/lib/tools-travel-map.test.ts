@@ -131,6 +131,79 @@ describe("travel_map tool", () => {
     });
   });
 
+  it("derives a map centre and scoped POI search only from a confirmed active Gmail stay", async () => {
+    mock.convexQuery.mockImplementation(async (path: string) => {
+      if (path === "currentState:getActive" || path === "ui:getLocation") return null;
+      return "thread-1";
+    });
+    const now = Date.now();
+    mock.lookupBookings.mockResolvedValue([{
+      id: "gmail-active-stay",
+      kind: "stay",
+      title: "🏨 Hotel Current · confirmed",
+      provider: "Booking",
+      bookingName: "Hotel Current",
+      location: "Calle Active 12, Sevilla, Spain",
+      start: now - 60 * 60_000,
+      end: now + 60 * 60_000,
+      allDay: false,
+      marker: "jarvis-gmail-booking:gmail-active-stay",
+    }]);
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const query = new URL(String(url)).searchParams.get("q") ?? "";
+      if (query.includes("Calle Active")) {
+        return new Response(JSON.stringify([osmPlace("Hotel Current", "Calle Active 12, Sevilla", 37.386, -5.9902)]), { status: 200 });
+      }
+      return new Response(JSON.stringify([
+        osmPlace("Galería Local", "Sevilla, Spain", 37.3855, -6.006),
+        osmPlace("Sala Pequeña", "Sevilla, Spain", 37.394, -5.993),
+      ]), { status: 200 });
+    }));
+
+    const result = await executeTool("travel_map", {
+      query: "quiet galleries",
+      include_bookings: true,
+      route: true,
+    });
+
+    expect(result).toContain("confirmed active Gmail stay");
+    const requests = vi.mocked(fetch).mock.calls.map(([url]) => new URL(String(url)).searchParams.get("q") ?? "");
+    expect(requests).toContain("Calle Active 12, Sevilla, Spain");
+    expect(requests.some((query) => query.includes("quiet galleries") && query.includes("Calle Active 12"))).toBe(true);
+    const panelCall = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
+    const panel = JSON.parse(String(panelCall?.[1]?.value));
+    expect(panel).toMatchObject({
+      center: { label: "Hotel Current", source: "gmail_current_stay" },
+      base: { label: "Hotel Current", source: "Read-only Gmail current stay" },
+      booking: { requested: true, status: "current_stay" },
+    });
+  });
+
+  it("never derives location from future or expired Gmail stays", async () => {
+    mock.convexQuery.mockImplementation(async (path: string) => {
+      if (path === "currentState:getActive" || path === "ui:getLocation") return null;
+      return "thread-1";
+    });
+    const now = Date.now();
+    mock.lookupBookings.mockResolvedValue([
+      {
+        id: "gmail-future-stay", kind: "stay", title: "🏨 Future · confirmed", provider: "Booking",
+        location: "Future Road 1, Sevilla", start: now + 60 * 60_000, end: now + 2 * 60 * 60_000, allDay: false,
+        marker: "jarvis-gmail-booking:gmail-future-stay",
+      },
+      {
+        id: "gmail-expired-stay", kind: "stay", title: "🏨 Past · confirmed", provider: "Booking",
+        location: "Past Road 1, Sevilla", start: now - 3 * 60 * 60_000, end: now - 60 * 60_000, allDay: false,
+        marker: "jarvis-gmail-booking:gmail-expired-stay",
+      },
+    ]);
+
+    const result = await executeTool("travel_map", { query: "attractions", include_bookings: true });
+
+    expect(result).toContain("I don't have a usable current location yet");
+    expect(mock.convexMutation).not.toHaveBeenCalledWith("ui:setPanel", expect.anything());
+  });
+
   it("never claims a Gmail booking base when booking lookup is unavailable", async () => {
     mock.lookupBookings.mockRejectedValueOnce(new Error("oauth unavailable"));
 
@@ -152,6 +225,17 @@ describe("travel_map tool", () => {
       route: { mode: "walking" },
     });
     expect(panel.base).toBeUndefined();
+  });
+
+  it("keeps booking imports read-only even when a calendar sync is explicitly requested", async () => {
+    const result = await executeTool("bookings_check", { sync_calendar: true });
+
+    expect(result).toContain("no events were created");
+    expect(result).toContain("protected owner-approval flow");
+    expect(mock.createICloudEvent).not.toHaveBeenCalled();
+    const panelCall = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
+    const panel = JSON.parse(String(panelCall?.[1]?.value));
+    expect(panel.calendarAdded).toBe(0);
   });
 
   it("uses rate-limited OpenStreetMap without a paid-provider fallback", async () => {

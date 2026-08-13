@@ -585,13 +585,13 @@ export const TOOL_DEFS = [
   {
     name: "bookings_check",
     description:
-      "Compatibility path for explicitly importing confirmed Gmail bookings into Daniel's iCloud Calendar or an existing trip. This can write calendar/trip data and defaults to calendar sync for backward compatibility. For checking bookings, finding his hotel/address, or proactive travel planning without writes, use bookings_lookup instead. Gmail itself is always read-only.",
+      "Check confirmed Gmail bookings and optionally merge matching confirmations into an existing Jarvis trip. It never creates Calendar events: calendar imports require a protected owner-approval flow that is not available through this tool. For checking bookings, finding a hotel/address, or proactive travel planning without writes, use bookings_lookup instead. Gmail itself is always read-only.",
     parameters: {
       type: "object",
       properties: {
         days: { type: "number", description: "How far back to scan, 7-730 days; default 365" },
         trip_id: { type: "string", description: "Optional visible trip creation id to enrich with matching confirmed bookings" },
-        sync_calendar: { type: "boolean", description: "Default true: create de-duplicated iCloud Calendar entries for confirmed bookings with a date" },
+        sync_calendar: { type: "boolean", description: "Request a Calendar import. This tool will not write events; it returns an owner-approval-required result until a protected import flow exists." },
       },
     },
   },
@@ -2272,30 +2272,7 @@ async function bookingsLookup(args: any): Promise<string> {
 async function bookingsCheck(args: any): Promise<string> {
   const days = Math.max(7, Math.min(730, Math.round(Number(args.days) || 365)));
   const bookings = await scanGmailBookingConfirmations({ days });
-  const syncCalendar = args.sync_calendar !== false;
-  let created = 0;
-  let calendarProblem = "";
-  if (syncCalendar) {
-    for (const booking of bookings.filter((item) => item.start)) {
-      if (calendarProblem) break;
-      try {
-        const start = Number(booking.start);
-        const nearby = await listICloudEvents(start - 2 * 86_400_000, (booking.end ?? start + 86_400_000) + 2 * 86_400_000);
-        if (nearby.some((event) => String(event.notes ?? "").includes(booking.marker))) continue;
-        await createICloudEvent({
-          title: booking.title,
-          start,
-          end: booking.end,
-          allDay: booking.allDay,
-          location: booking.location,
-          notes: `Confirmed Gmail booking${booking.confirmationCode ? ` · ref ${booking.confirmationCode}` : ""}\n${booking.marker}`,
-        });
-        created += 1;
-      } catch (error: any) {
-        calendarProblem = String(error?.message ?? error).slice(0, 150);
-      }
-    }
-  }
+  const syncCalendar = args.sync_calendar === true;
   let tripNote = "";
   const tripId = String(args.trip_id ?? "").trim();
   if (tripId) {
@@ -2312,10 +2289,14 @@ async function bookingsCheck(args: any): Promise<string> {
   await showWidget({
     kind: "bookings",
     label: `Confirmed bookings · last ${days} days`,
-    calendarAdded: created,
+    calendarAdded: 0,
+    readOnly: !tripId,
     items: bookings.map(bookingBoardItem),
   }, "confirmed bookings");
-  return `Found ${bookings.length} confirmed booking${bookings.length === 1 ? "" : "s"} in Gmail.${syncCalendar ? ` ${created} new calendar entr${created === 1 ? "y" : "ies"} created; duplicates were skipped.` : " Calendar left untouched."}${tripNote}${calendarProblem ? ` Calendar sync needs attention: ${calendarProblem}.` : ""} Speak one short summary and leave the full booking board on screen.`;
+  const calendarNote = syncCalendar
+    ? " Calendar import was requested, but no events were created: it needs a protected owner-approval flow and this tool cannot accept a model-supplied confirmation."
+    : " Calendar left untouched.";
+  return `Found ${bookings.length} confirmed booking${bookings.length === 1 ? "" : "s"} in Gmail.${calendarNote}${tripNote} Speak one short summary and leave the full booking board on screen.`;
 }
 
 async function publishHostAction(action: JarvisHostAction): Promise<void> {
@@ -2952,6 +2933,19 @@ function chooseTravelBooking(bookings: ConfirmedBooking[], location?: string): C
     })[0];
 }
 
+function currentAddressBearingStay(bookings: ConfirmedBooking[], now = Date.now()): ConfirmedBooking | undefined {
+  // Booking timestamps are already normalized through the confirmation's stated
+  // timezone in booking-email.ts. Do not guess from a future or expired stay.
+  return [...bookings]
+    .filter((booking) => booking.kind === "stay" && Boolean(booking.location))
+    .filter((booking) => {
+      const start = Number(booking.start);
+      const end = Number(booking.end ?? booking.start);
+      return Number.isFinite(start) && Number.isFinite(end) && end >= start && start <= now && now <= end;
+    })
+    .sort((left, right) => Number(right.start) - Number(left.start))[0];
+}
+
 async function travelMap(args: any): Promise<string> {
   const request = normalizeTravelMapRequest(args ?? {});
   try {
@@ -2963,7 +2957,9 @@ async function travelMap(args: any): Promise<string> {
         .then((bookings) => ({ bookings, unavailable: false }))
         .catch(() => ({ bookings: [] as ConfirmedBooking[], unavailable: true }))
       : Promise.resolve({ bookings: [] as ConfirmedBooking[], unavailable: false });
-    let center: (TravelMapPoint & { label: string; detail?: string; source: "saved_location" | "current_state" | TravelProvider }) | null = null;
+    let center: (TravelMapPoint & { label: string; detail?: string; source: "saved_location" | "current_state" | "gmail_current_stay" | TravelProvider }) | null = null;
+    let bookingLookup: { bookings: ConfirmedBooking[]; unavailable: boolean } | undefined;
+    let currentStay: ConfirmedBooking | undefined;
     if (request.location) {
       const locationLookup = await searchTravelPlaces(request.location, { maxResults: 1 });
       const locationMatch = locationLookup.places[0];
@@ -2994,24 +2990,49 @@ async function travelMap(args: any): Promise<string> {
         }
       }
       const [lat, lng] = String(saved?.value ?? "").split(",").map(Number);
-      if (!center && (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180)) {
-        return "I don't have a usable current location yet — share a city/address or enable location once in options.";
+      if (!center && Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
+        center = { lat, lng, label: "Saved current location", source: "saved_location" };
       }
-      if (!center) center = { lat, lng, label: "Saved current location", source: "saved_location" };
+      // Only an active, address-bearing confirmed stay may establish location.
+      // This is a fallback after explicit profile/browser location, never a
+      // guess from an upcoming or finished reservation.
+      if (!center && request.includeBookings) {
+        bookingLookup = await bookingsPromise;
+        currentStay = currentAddressBearingStay(bookingLookup.bookings);
+        if (currentStay?.location) {
+          const stayLookup = await searchTravelPlaces(currentStay.location, { maxResults: 1 }).catch(() => undefined);
+          const stay = stayLookup?.places[0];
+          if (stay) {
+            center = {
+              lat: stay.lat,
+              lng: stay.lng,
+              label: currentStay.bookingName ?? stay.name,
+              detail: currentStay.location,
+              source: "gmail_current_stay",
+            };
+          } else {
+            currentStay = undefined;
+          }
+        }
+      }
+      if (!center) return "I don't have a usable current location yet — share a city/address or enable location once in options.";
     }
     if (!center) return "I don't have a usable map location yet.";
 
-    const bookingLookup = await bookingsPromise;
-    const bookingCandidate = chooseTravelBooking(bookingLookup.bookings, request.location ?? center.label);
+    bookingLookup ??= await bookingsPromise;
+    const bookingCandidate = currentStay ?? chooseTravelBooking(bookingLookup.bookings, request.location ?? center.label);
+    const placeQuery = currentStay?.location
+      ? placeSearchTextQuery({ ...request, location: currentStay.location })
+      : placeSearchTextQuery(request);
     // Do not parallelise public Nominatim requests: the shared adapter keeps
     // owner-scale usage within its rate limit.
-    const foundLookup = await searchTravelPlaces(placeSearchTextQuery(request), { center, radiusMetres: 14_000, maxResults: 10 });
-    const candidateLookup = bookingCandidate?.location
+    const foundLookup = await searchTravelPlaces(placeQuery, { center, radiusMetres: 14_000, maxResults: 10 });
+    const candidateLookup = !currentStay && bookingCandidate?.location
       ? await searchTravelPlaces(bookingCandidate.location, { center, radiusMetres: 30_000, maxResults: 1 }).catch(() => undefined)
       : undefined;
     const found = foundLookup.places;
     const candidateGeocode = candidateLookup?.places[0];
-    if (!found.length) return `I couldn't find places matching “${placeSearchTextQuery(request)}”.`;
+    if (!found.length) return `I couldn't find places matching “${placeQuery}”.`;
 
     // A booking is allowed to become the route origin only after its address
     // geocodes near the requested city. This prevents a future stay in another
@@ -3019,12 +3040,14 @@ async function travelMap(args: any): Promise<string> {
     const bookingDistanceKm = candidateGeocode
       ? openStreetMapDistanceKm(center, candidateGeocode)
       : Number.POSITIVE_INFINITY;
-    const booking = bookingCandidate && candidateGeocode && bookingDistanceKm <= 80
+    const booking = currentStay ?? (bookingCandidate && candidateGeocode && bookingDistanceKm <= 80
       ? bookingCandidate
-      : undefined;
-    const bookingGeocode = booking ? candidateGeocode : undefined;
+      : undefined);
+    const bookingGeocode = currentStay ? center : booking ? candidateGeocode : undefined;
     const bookingStatus = !request.includeBookings
       ? "not_requested"
+      : currentStay
+        ? "current_stay"
       : booking
         ? "matched"
         : bookingLookup.unavailable
@@ -3053,7 +3076,7 @@ async function travelMap(args: any): Promise<string> {
     const base = booking ? {
       label: booking.bookingName ?? booking.provider,
       address: booking.location,
-      source: "Read-only Gmail booking",
+      source: currentStay ? "Read-only Gmail current stay" : "Read-only Gmail booking",
       lat: bookingGeocode?.lat,
       lng: bookingGeocode?.lng,
     } : undefined;
@@ -3069,7 +3092,9 @@ async function travelMap(args: any): Promise<string> {
       booking: {
         requested: request.includeBookings,
         status: bookingStatus,
-        message: bookingStatus === "matched"
+        message: bookingStatus === "current_stay"
+          ? "Confirmed active Gmail stay set the map centre and route base."
+          : bookingStatus === "matched"
           ? "Confirmed Gmail stay verified near this map."
           : bookingStatus === "unavailable"
             ? "Gmail booking lookup is currently unavailable; the route starts from the map centre."
@@ -3084,7 +3109,9 @@ async function travelMap(args: any): Promise<string> {
       items: places,
     }, `map · ${locationLabel.slice(0, 32)}`);
     const bookingResult = base
-      ? `${base.label} is verified near ${locationLabel} and marked as the read-only Gmail booking base.`
+      ? currentStay
+        ? `${base.label} is the confirmed active Gmail stay and set this map's centre and read-only booking base.`
+        : `${base.label} is verified near ${locationLabel} and marked as the read-only Gmail booking base.`
       : request.includeBookings
         ? `${bookingStatus === "unavailable" ? "Gmail booking lookup was unavailable" : "No confirmed Gmail stay near this map was verified"}; the route starts from the map centre. Do not claim or imply that a booking address was used.`
         : "No booking base was requested.";
