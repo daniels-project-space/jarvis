@@ -655,7 +655,11 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
   }
   const task = exactTextWorkOrder(String(persistedValue.task ?? ""));
   const policyTask = exactTextWorkOrder(String(persistedValue.policyTask ?? task));
-  const routed = routeWork(task, {
+  // Route from the canonical policy task, not the enriched execution text.
+  // Goal Mode adds outcome/checkpoint scaffolding such as "overhaul" and
+  // "Sol validator" to `task`; treating that scaffolding as user work silently
+  // escalates every bounded evidence node to the most expensive tier.
+  const routed = routeWork(policyTask, {
     repo: persistedValue.repo,
     requestedModel: persistedValue.model,
     readonly: persistedValue.readonly,
