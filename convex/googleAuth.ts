@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireAdmin, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
+import { googleCapabilities } from "../src/lib/google-scopes";
 
 // Feature 4a: Gmail OAuth connect infrastructure.
 //
@@ -66,7 +67,10 @@ export const getConnectionStatus = query({
     return {
       connected: true as const,
       email: existing.email,
-      scope: existing.scope,
+      // A connected account can pre-date an added OAuth scope. Surface the
+      // granted capabilities rather than raw OAuth scope strings so the client
+      // can ask for a reconnect without learning more credential metadata.
+      capabilities: googleCapabilities(existing.scope),
       connectedAt: existing.connectedAt,
       updatedAt: existing.updatedAt,
     };

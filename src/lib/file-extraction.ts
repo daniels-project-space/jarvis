@@ -192,7 +192,7 @@ async function extractImage(bytes: Uint8Array, detectedMimeType: string, sha256:
       sha256,
       detectedMimeType,
       status: "ready",
-      summary: `Image · ${metadata.width} × ${metadata.height} · ${metadata.format ?? detectedMimeType.split("/")[1]}`,
+      summary: `Image · ${metadata.width} × ${metadata.height} · ${metadata.format ?? detectedMimeType.split("/")[1]} · ready for visual analysis in chat`,
       text: "",
       chunks: [],
       preview: { bytes: preview, contentType: "image/webp" },
@@ -200,6 +200,16 @@ async function extractImage(bytes: Uint8Array, detectedMimeType: string, sha256:
   } catch (error) {
     throw new FileExtractionError(`image_decode_failed:${String(error).slice(0, 80)}`, true);
   }
+}
+
+function storedOnlySummary(mimeType: string): string {
+  if (mimeType.startsWith("audio/")) {
+    return "Audio saved privately · no transcript is available, so Jarvis cannot inspect its contents.";
+  }
+  if (mimeType.startsWith("video/")) {
+    return "Video saved privately · no transcript or frame analysis is available, so Jarvis cannot inspect its contents.";
+  }
+  return "Stored privately · deterministic text extraction is not available for this format";
 }
 
 export async function extractPrivateFile(input: {
@@ -245,7 +255,7 @@ export async function extractPrivateFile(input: {
     sha256,
     detectedMimeType: signatureMime ?? declaredMime,
     status: "stored_only",
-    summary: "Stored privately · deterministic text extraction is not available for this format",
+    summary: storedOnlySummary(signatureMime ?? declaredMime),
     text: "",
     chunks: [],
   };

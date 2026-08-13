@@ -12,7 +12,8 @@ import { workModelLabel, workModelPriority } from "./work-models";
 import { exactTextWorkOrder } from "./work-order";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
 import { createICloudEvent, deleteICloudEvent, findICloudEvents, listICloudEvents } from "./icloud-calendar";
-import { createGooglePrimaryCalendarEvent, listGooglePrimaryCalendarEvents } from "./google-calendar";
+import { listGooglePrimaryCalendarEvents } from "./google-calendar";
+import { googleCalendarApprovalMarker, issueGoogleCalendarApproval } from "./google-calendar-approval.server";
 import { lookupGmailBookingsReadOnly, scanGmailBookingConfirmations, type ConfirmedBooking } from "./booking-email";
 import {
   gmailSearch,
@@ -555,7 +556,7 @@ export const TOOL_DEFS = [
   {
     name: "google_calendar_create",
     description:
-      "Create exactly one event on Daniel's explicitly connected Google Calendar primary calendar. Use only when he specifically names Google Calendar — never as a fallback for iCloud. This cannot add attendees, Google Meet links, attachments, or send invitations/updates; duplicate retries are safely deduplicated.",
+      "Prepare exactly one event on Daniel's explicitly connected Google Calendar primary calendar. Use only when he specifically names Google Calendar — never as a fallback for iCloud. It cannot add attendees, Google Meet links, attachments, or send invitations/updates. It only renders an owner-only approval button; the event is not written until Daniel clicks that protected button.",
     parameters: {
       type: "object",
       properties: {
@@ -1302,7 +1303,7 @@ const TASK_TEMPLATES: Record<string, string> = {
 };
 
 const YT_ID = (s: string) => {
-  const m = String(s).match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([\w-]{11})/) ?? String(s).match(/^([\w-]{11})$/);
+  const m = String(s).match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/|live\/)|youtu\.be\/)([\w-]{11})/) ?? String(s).match(/^([\w-]{11})$/);
   return m ? m[1] : null;
 };
 
@@ -1382,6 +1383,11 @@ async function youtubeSearch(query: string): Promise<string> {
 async function youtubeTranscript(video: string): Promise<string> {
   const id = YT_ID(video);
   if (!id) return "Couldn't parse a YouTube video ID from that.";
+  await convexMutation("ui:setPanel", {
+    type: "video",
+    value: `https://www.youtube.com/embed/${id}?enablejsapi=1&rel=0`,
+    title: "YouTube video",
+  });
   try {
     const r = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
       method: "POST",
@@ -2061,8 +2067,30 @@ function addDateDays(date: string, days: number): string {
   return new Date(Date.UTC(year, month - 1, day + days)).toISOString().slice(0, 10);
 }
 
+function isCalendarDate(date: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+  const parsed = new Date(`${date}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === date;
+}
+
+function isExactLondonDateTime(epochMs: number, date: string, time: string): boolean {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/London",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(epochMs).map((part) => [part.type, part.value]));
+  const hour = parts.hour === "24" ? "00" : parts.hour;
+  return `${parts.year}-${parts.month}-${parts.day}` === date && `${hour}:${parts.minute}` === time;
+}
+
 async function googleCalendarList(args: any): Promise<string> {
-  const date = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date ?? "")) ? String(args.date) : londonDateStr(Date.now());
+  const requestedDate = args.date == null ? "" : String(args.date);
+  if (requestedDate && !isCalendarDate(requestedDate)) return "I need a real Google Calendar start date as YYYY-MM-DD.";
+  const date = requestedDate || londonDateStr(Date.now());
   const days = args.days == null ? 7 : Number(args.days);
   const maxResults = args.max_results == null ? 20 : Number(args.max_results);
   if (!Number.isInteger(days) || days < 1 || days > 31) return "Google Calendar reads are limited to 1-31 days.";
@@ -2090,22 +2118,35 @@ async function googleCalendarList(args: any): Promise<string> {
 async function googleCalendarCreate(args: any): Promise<string> {
   const title = String(args.title ?? "").trim();
   const date = String(args.date ?? "");
-  if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return "I need a title and a date (YYYY-MM-DD).";
+  if (!title || !isCalendarDate(date)) return "I need a title and a real date (YYYY-MM-DD).";
   if (args.time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(args.time))) return "I need the start time as HH:MM (24-hour).";
   if (args.end_time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(args.end_time))) return "I need the end time as HH:MM (24-hour).";
   const allDay = !args.time;
   const start = allDay ? londonMs(date, "00:00") : londonMs(date, String(args.time));
-  let end = allDay
-    ? londonMs(addDateDays(date, 1), "00:00")
-    : args.end_time
-      ? londonMs(date, String(args.end_time))
-      : start + 60 * 60_000;
-  if (!allDay && end <= start) end += 86_400_000;
+  if (!allDay && !isExactLondonDateTime(start, date, String(args.time))) {
+    return "That local time does not exist in Europe/London because of the daylight-saving change. Choose another time.";
+  }
+  let end: number;
+  if (allDay) {
+    end = londonMs(addDateDays(date, 1), "00:00");
+  } else if (args.end_time) {
+    let endDate = date;
+    end = londonMs(endDate, String(args.end_time));
+    if (end <= start) {
+      endDate = addDateDays(date, 1);
+      end = londonMs(endDate, String(args.end_time));
+    }
+    if (!isExactLondonDateTime(end, endDate, String(args.end_time))) {
+      return "That local end time does not exist in Europe/London because of the daylight-saving change. Choose another time.";
+    }
+  } else {
+    end = start + 60 * 60_000;
+  }
   const reminderMinutesBefore = args.reminder_minutes_before == null ? undefined : Number(args.reminder_minutes_before);
   if (reminderMinutesBefore != null && (!Number.isInteger(reminderMinutesBefore) || reminderMinutesBefore < 1 || reminderMinutesBefore > 40_320)) {
     return "The Google Calendar popup reminder must be a whole number from 1 to 40320 minutes before the event.";
   }
-  const result = await createGooglePrimaryCalendarEvent({
+  const event = {
     title: title.slice(0, 140),
     start,
     end,
@@ -2113,9 +2154,12 @@ async function googleCalendarCreate(args: any): Promise<string> {
     location: args.location ? String(args.location).slice(0, 140) : undefined,
     notes: args.notes ? String(args.notes).slice(0, 500) : undefined,
     reminderMinutesBefore,
-  });
-  const action = result.created ? "Added" : "Already present";
-  return `${action} in Google Calendar: "${result.event.title}" on ${date}${args.time ? ` at ${args.time}` : " (all day)"}. No invitations or updates were sent.`;
+  };
+  // A model can prepare an event, but cannot infer an owner click from a
+  // page, email, or file. The route behind the rendered button verifies this
+  // short-lived signed receipt before it writes to Google's API.
+  const approval = issueGoogleCalendarApproval(event);
+  return `Ready for your approval: Google Calendar event "${event.title}" on ${date}${args.time ? ` at ${args.time}` : " (all day)"}. Nothing has been added yet; use the protected Approve event button below within 10 minutes. No invitations or updates will be sent.\n${googleCalendarApprovalMarker(approval)}`;
 }
 
 async function calendarRemove(args: any): Promise<string> {

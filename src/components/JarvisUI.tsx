@@ -14,7 +14,7 @@ import {
   type JarvisPermissionState,
 } from "@/lib/permissions";
 import { registerSW, subscribePush } from "@/lib/push";
-import { isToolGarbage, sanitizeAssistantText } from "../lib/sanitize";
+import { extractGoogleCalendarApproval, isToolGarbage, sanitizeAssistantText, stripGoogleCalendarApproval } from "../lib/sanitize";
 import { createOrbMotionFrame, deriveOrbVisual, type OrbMotionFrame } from "@/lib/orb-motion";
 import {
   cacheCompactWorkSnapshot,
@@ -362,6 +362,53 @@ function ChatHistoryArchive({ threadId }: { threadId: string }) {
   </section>;
 }
 
+function GoogleCalendarApprovalCard({ token }: { token: string }) {
+  const [state, setState] = useState<"ready" | "approving" | "added" | "error">("ready");
+  const [detail, setDetail] = useState("");
+
+  const approve = async () => {
+    if (state !== "ready") return;
+    setState("approving");
+    setDetail("");
+    try {
+      const response = await viewerFetch("/api/google-calendar/approve", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+      const payload = await response.json().catch(() => ({})) as { ok?: unknown; created?: unknown; error?: unknown };
+      if (!response.ok || payload.ok !== true) throw new Error(String(payload.error ?? "Calendar approval was rejected."));
+      setState("added");
+      setDetail(payload.created === false ? "Already present in Google Calendar." : "Added to Google Calendar.");
+    } catch (error) {
+      setState("error");
+      setDetail(String(error instanceof Error ? error.message : "Calendar approval was rejected."));
+    }
+  };
+
+  return (
+    <div data-google-calendar-approval className="mt-1.5 inline-flex max-w-[88%] items-center gap-2 rounded-xl border border-cyan/30 bg-cyan/[0.06] px-3 py-2 text-xs text-ice">
+      {state === "added" ? (
+        <span aria-live="polite">{detail}</span>
+      ) : (
+        <>
+          <button
+            type="button"
+            onClick={() => void approve()}
+            disabled={state === "approving"}
+            className="rounded-lg border border-cyan/40 bg-cyan/10 px-2 py-1 font-medium text-cyan transition hover:bg-cyan/20 disabled:opacity-50"
+          >
+            {state === "approving" ? "adding…" : "Approve event"}
+          </button>
+          <span aria-live="polite" className={state === "error" ? "text-amber" : "text-slate"}>
+            {state === "error" ? detail : "Nothing is added until you click."}
+          </span>
+        </>
+      )}
+    </div>
+  );
+}
+
 const ytId = (s: string) => {
   const m = String(s).match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([\w-]{11})/);
   return m ? m[1] : null;
@@ -569,6 +616,9 @@ function OptionsPanel({
   const googleStatus = useJarvisQuery(api.googleAuth.getConnectionStatus, {});
   const googleConnected = googleStatus && googleStatus.connected === true;
   const googleEmail = googleStatus && googleStatus.connected ? googleStatus.email : undefined;
+  const googleCalendarConnected = googleStatus && googleStatus.connected ? googleStatus.capabilities?.calendar === true : false;
+  const googleGmailConnected = googleStatus && googleStatus.connected ? googleStatus.capabilities?.gmail === true : false;
+  const googleNeedsReconnect = googleConnected && (!googleCalendarConnected || !googleGmailConnected);
   return (
     <>
       <div className="fixed inset-0 z-[55]" onClick={onClose} />
@@ -612,12 +662,12 @@ function OptionsPanel({
               set up
             </button>
           </Row>
-          <Row label="Google account" hint={googleConnected ? `connected${googleEmail ? ` · ${googleEmail}` : ""}` : "Gmail read/draft/unsubscribe — connect to enable"}>
-            {googleConnected ? (
+          <Row label="Google account" hint={googleConnected ? `connected${googleEmail ? ` · ${googleEmail}` : ""}${googleNeedsReconnect ? " · reconnect to enable Gmail + Google Calendar" : " · Gmail + Google Calendar ready"}` : "Gmail read/draft and opt-in Google Calendar — connect to enable"}>
+            {googleConnected && !googleNeedsReconnect ? (
               <span className="rounded-lg border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-[11px] text-emerald-300">connected ✓</span>
             ) : (
               <a href="/api/auth/google/start" className="rounded-lg border border-cyan/30 px-3 py-1 text-[11px] text-cyan transition hover:bg-cyan/10">
-                connect
+                {googleConnected ? "reconnect" : "connect"}
               </a>
             )}
           </Row>
@@ -2711,12 +2761,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       durableStartedAt.current = null;
       setSending(false);
     }
-    showCaption({ who: "jarvis", text: latestAssistant.text, phase: "streaming" });
+    const visibleAssistantText = stripGoogleCalendarApproval(latestAssistant.text);
+    showCaption({ who: "jarvis", text: visibleAssistantText, phase: "streaming" });
     if (
       latestAssistant.parentMessageId &&
       mutedNarrationParentsRef.current.has(latestAssistant.parentMessageId)
     ) return;
-    const stablePrefix = completeSpeechPrefix(latestAssistant.text);
+    const stablePrefix = completeSpeechPrefix(visibleAssistantText);
     if (!stablePrefix) return;
     let streamState = streamingSpeechRef.current;
     if (streamState.id !== latestAssistant._id) {
@@ -2736,7 +2787,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (streamState.failed) return;
     if (stablePrefix.length <= Math.max(streamState.scheduledChars, streamState.pendingPrefix.length)) return;
     streamState.pendingPrefix = stablePrefix;
-    streamState.pendingCaption = latestAssistant.text;
+    streamState.pendingCaption = visibleAssistantText;
     if (streamState.timer) clearTimeout(streamState.timer);
     // Give a concise answer a fraction of a second to finalise. Most replies
     // then become one natural neural request rather than sentence-sized MP3s
@@ -2879,7 +2930,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     };
     // Background findings never interrupt an active voice exchange. Normal
     // Codex replies do speak, then the turn-taking microphone re-arms.
-    const spokenText = isToolGarbage(last.text) ? sanitizeAssistantText(last.text) : last.text;
+    const spokenText = stripGoogleCalendarApproval(isToolGarbage(last.text) ? sanitizeAssistantText(last.text) : last.text);
     // Streaming and finalization use the same stable caption node. Put the
     // finished text there before voice ownership/model generation, so it never
     // vanishes during the TTS handoff or when this tab is not the speaker.
@@ -5325,9 +5376,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             {messages
               .slice(-20)
               .map((m) => {
-                if (m.role === "assistant" && m.text && isToolGarbage(m.text)) return { ...m, text: sanitizeAssistantText(m.text) };
-                if (m.role === "user" && m.text) return { ...m, text: visibleTurnText(m.text) };
-                return m;
+                if (m.role === "assistant" && m.text) {
+                  const calendarApprovalToken = extractGoogleCalendarApproval(m.text);
+                  const visibleText = isToolGarbage(m.text) ? sanitizeAssistantText(m.text) : stripGoogleCalendarApproval(m.text);
+                  return { ...m, text: visibleText, calendarApprovalToken };
+                }
+                if (m.role === "user" && m.text) return { ...m, text: visibleTurnText(m.text), calendarApprovalToken: null };
+                return { ...m, calendarApprovalToken: null };
               })
               // A guest never receives a card through the normal worker path,
               // but do not materialize one if a legacy row is ever present.
@@ -5366,6 +5421,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                       ))}
                   </span>
                 </GuestSafeAttachment>
+                {m.role === "assistant" && !guest && m.calendarApprovalToken && (
+                  <GoogleCalendarApprovalCard token={m.calendarApprovalToken} />
+                )}
                 {m.role === "user" && <MessageFileBadges files={m.files} align="right" />}
                 {m.role === "assistant" && m.model && (
                   <div className="mt-0.5 pl-1">

@@ -65,8 +65,27 @@ describe("deterministic private file extraction", () => {
     const bytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
     const result = await extractPrivateFile({ bytes, name: "proof.png", mimeType: "image/png" });
     expect(result.summary).toContain("1 × 1");
+    expect(result.summary).toContain("ready for visual analysis in chat");
     expect(result.preview?.contentType).toBe("image/webp");
     expect(result.preview?.bytes.byteLength).toBeGreaterThan(0);
+  });
+
+  it.each([
+    [
+      "voice-note.wav",
+      "audio/wav",
+      Buffer.from("524946462400000057415645666d74201000000001000100401f0000803e0000020010006461746100000000", "hex"),
+      "Audio saved privately · no transcript is available, so Jarvis cannot inspect its contents.",
+    ],
+    [
+      "clip.mp4",
+      "video/mp4",
+      Buffer.from("000000186674797069736f6d0000020069736f6d69736f3261766331", "hex"),
+      "Video saved privately · no transcript or frame analysis is available, so Jarvis cannot inspect its contents.",
+    ],
+  ])("keeps %s available while making media-analysis limits explicit", async (name, mimeType, bytes, summary) => {
+    const result = await extractPrivateFile({ bytes, name, mimeType });
+    expect(result).toMatchObject({ status: "stored_only", summary, text: "", chunks: [] });
   });
 
   it("quarantines declared formats whose signatures do not match", async () => {

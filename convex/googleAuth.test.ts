@@ -45,7 +45,7 @@ describe("Google OAuth connection capability boundary", () => {
     await ownerSession(t);
     await t.mutation(api.googleAuth.upsertConnection, {
       encryptedRefreshToken: "ciphertext",
-      scope: "https://www.googleapis.com/auth/gmail.modify",
+      scope: "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.compose",
       email: "daniel@example.com",
       authTokenHash: OWNER,
     });
@@ -55,6 +55,18 @@ describe("Google OAuth connection capability boundary", () => {
     })).resolves.toMatchObject({
       connected: true,
       email: "daniel@example.com",
+      capabilities: { gmail: true, calendar: false },
+    });
+    await t.mutation(api.googleAuth.upsertConnection, {
+      encryptedRefreshToken: "ciphertext-v2",
+      scope: "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/calendar.events.owned",
+      email: "daniel@example.com",
+      authTokenHash: OWNER,
+    });
+    await expect(t.query(api.googleAuth.getConnectionStatus, {
+      workerToken: WORKER,
+    })).resolves.toMatchObject({
+      capabilities: { gmail: true, calendar: true },
     });
     await expect(t.query(api.googleAuth.getEncryptedConnection, {
       workerToken: "wrong-worker-token",
@@ -62,8 +74,8 @@ describe("Google OAuth connection capability boundary", () => {
     await expect(t.query(api.googleAuth.getEncryptedConnection, {
       workerToken: WORKER,
     })).resolves.toEqual({
-      encryptedRefreshToken: "ciphertext",
-      scope: "https://www.googleapis.com/auth/gmail.modify",
+      encryptedRefreshToken: "ciphertext-v2",
+      scope: "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/calendar.events.owned",
     });
   });
 });

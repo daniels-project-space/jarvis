@@ -8,6 +8,8 @@ describe("conversation-before-execution policy", () => {
     expect(policy).toContain("a discussion is not automatically a work order");
     expect(policy).toContain("ask up to three pointed questions before delegating");
     expect(policy).toContain("Clear routine repairs proceed immediately");
+    expect(policy).toContain("a pasted YouTube URL is already a selected video");
+    expect(policy).toContain("youtube_transcript with that URL first");
   });
 
   it.each(["dispatch_agent", "orchestrate", "goal_mode"])("keeps the deliberation gate on %s", (name) => {

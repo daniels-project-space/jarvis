@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 import { randomBytes } from "node:crypto";
 import { adminSessionHash, validateAdminSession } from "@/lib/control-session";
+import { GOOGLE_OAUTH_SCOPES } from "@/lib/google-scopes";
 
 // Feature 4a: begins the Google OAuth connect flow. Owner/admin-gated the
 // same way src/app/api/creation-download/route.ts gates downloads — only a
@@ -14,9 +15,9 @@ export const runtime = "nodejs";
 const STATE_COOKIE = "__Host-jarvis_google_oauth_state";
 const STATE_MAX_AGE_SECONDS = 600; // 10 minutes — plenty for a consent-screen round trip.
 
-// Exact scopes required by the (separate, later) Gmail read/draft/
-// unsubscribe task: modify (read + label/trash) and compose (create drafts).
-const GOOGLE_OAUTH_SCOPES = "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.compose";
+// Exact scopes for the Gmail foreground lane and the separately named,
+// primary-calendar-only Google Calendar lane. Calendar access is never a
+// replacement for iCloud's default calendar actions.
 
 export async function GET(req: NextRequest) {
   const authTokenHash = await adminSessionHash(req);
@@ -44,6 +45,9 @@ export async function GET(req: NextRequest) {
   // consent before — without this, a reconnect can silently return no
   // refresh_token and the callback would have nothing to store.
   authorizeUrl.searchParams.set("prompt", "consent");
+  // Preserve earlier grants while requesting the one additional, narrowly
+  // scoped Calendar capability on reconnect.
+  authorizeUrl.searchParams.set("include_granted_scopes", "true");
   authorizeUrl.searchParams.set("scope", GOOGLE_OAUTH_SCOPES);
   authorizeUrl.searchParams.set("state", state);
 

@@ -13,6 +13,8 @@ describe("capability router", () => {
     ["Draft an email to Leo about tomorrow", "creative", "draft"],
     ["Plan my day around my calendar", "work", "plan_my_day"],
     ["Make a mind map for the launch", "creative", "mind_map"],
+    ["Summarise https://youtu.be/abcDEF12345", "creative", "youtube_transcript"],
+    ["Find me a YouTube video about camera lighting", "creative", "youtube_search"],
   ])("routes %s to %s/%s", (intent, belt, tool) => {
     const ranking = rankCapabilities(intent);
     expect(ranking.candidates[0]).toMatchObject({ belt, tool });
@@ -46,5 +48,10 @@ describe("capability router", () => {
 
   it("does not force a tool for ordinary conversation", () => {
     expect(rankCapabilities("What do you think about that?").candidates).toEqual([]);
+  });
+
+  it("does not divert YouTube Studio work into public video discovery", () => {
+    expect(rankCapabilities("Open YouTube Studio and show the latest upload").candidates.map(({ tool }) => tool))
+      .not.toContain("youtube_search");
   });
 });

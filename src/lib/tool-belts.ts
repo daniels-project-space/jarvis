@@ -2,6 +2,7 @@ const TOOL_BELT_REGISTRY = {
   core: new Set([
     "dispatch_agent", "show", "show_ranking", "rank_focus", "video_control", "hide", "web_search", "weather",
     "timer", "briefing", "remind_at", "todo_add", "todo_done", "todo_list", "calendar_add", "calendar_view",
+    "google_calendar_list", "google_calendar_create",
     "open_app", "host_ui", "mac_shortcut", "current_time", "calculate", "orb_mood",
   ]),
   work: new Set([
@@ -55,6 +56,11 @@ for (const name of [
   "gmail_list_subscriptions",
   "gmail_unsubscribe",
   "gmail_mark_spam",
+  // Google Calendar is foreground-only. It must never become an implicit
+  // side effect of a subscription worker, and its iCloud counterpart remains
+  // the default calendar lane.
+  "google_calendar_list",
+  "google_calendar_create",
 ]) SUBSCRIPTION_TOOL_NAMES.delete(name);
 // The subscription model already supplies the reasoning. These legacy tools
 // invoke metered text models and would duplicate both latency and intelligence.

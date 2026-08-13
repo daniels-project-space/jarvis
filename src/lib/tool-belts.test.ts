@@ -50,4 +50,9 @@ describe("tool belt registry", () => {
       "gmail_mark_spam",
     ]) expect(SUBSCRIPTION_TOOL_NAMES.has(name)).toBe(false);
   });
+
+  it("keeps the explicitly named Google Calendar lane out of background workers", () => {
+    expect(SUBSCRIPTION_TOOL_NAMES.has("google_calendar_list")).toBe(false);
+    expect(SUBSCRIPTION_TOOL_NAMES.has("google_calendar_create")).toBe(false);
+  });
 });

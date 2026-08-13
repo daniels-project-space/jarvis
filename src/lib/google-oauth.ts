@@ -1,26 +1,26 @@
 import "server-only";
 
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { controlQuery } from "./control-session";
+import { hasGoogleScopes } from "./google-scopes";
 
-// Feature 4a: Gmail OAuth connect infrastructure — shared access-token
-// helper. This file owns:
+// Google OAuth connect infrastructure — shared access-token helper. This file
+// owns:
 //   1. The AES-256-GCM envelope used to store Daniel's Google refresh token
 //      at rest in Convex (mirrors AesGcmSessionSnapshotCipher in
 //      src/trigger/subscription-session.ts: schema byte + 12-byte nonce +
 //      16-byte GCM tag + ciphertext, AAD-bound, base64-encoded for the
 //      JSON-over-HTTP Convex API).
-//   2. getGoogleAccessToken(): the single place anything in this app should
-//      call to get a live Gmail-scoped bearer token. It reads the
+//   2. the token refresh boundary for the Gmail foreground lane and the
+//      separately scoped Google Calendar primary-calendar lane. It reads the
 //      connection from Convex first, and falls back to the legacy
 //      GMAIL_BOOKINGS_* env vars (the same triplet src/lib/booking-email.ts
 //      reads today) so nothing regresses if those ever get populated
 //      before the Convex-backed connection exists.
 //
-// Out of scope here (by design, per the task split): no Gmail read/search/
-// draft/unsubscribe logic, no UI. booking-email.ts is not modified by this
-// file; a later task wires it to call getGoogleAccessToken() instead of
-// reading process.env directly.
+// This module deliberately has no Gmail/Calendar UI logic. Calendar callers
+// must use getGoogleAccessTokenForScopes(), which refuses legacy Gmail-only
+// credentials unless the encrypted connection explicitly grants the scope.
 
 export class GoogleOAuthError extends Error {}
 
@@ -94,7 +94,7 @@ function isEncryptedConnection(value: unknown): value is { encryptedRefreshToken
   );
 }
 
-type Credentials = { clientId: string; clientSecret: string; refreshToken: string };
+type Credentials = { clientId: string; clientSecret: string; refreshToken: string; scope?: string };
 
 async function loadCredentials(): Promise<Credentials> {
   // Convex is treated as best-effort here: a transient outage falls through
@@ -120,7 +120,12 @@ async function loadCredentials(): Promise<Credentials> {
         "A Google account is connected but GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET are not set; cannot refresh its access token.",
       );
     }
-    return { clientId, clientSecret, refreshToken: decryptGoogleRefreshToken(stored.encryptedRefreshToken) };
+    return {
+      clientId,
+      clientSecret,
+      refreshToken: decryptGoogleRefreshToken(stored.encryptedRefreshToken),
+      scope: stored.scope,
+    };
   }
 
   const legacyClientId = process.env.GMAIL_BOOKINGS_CLIENT_ID;
@@ -135,18 +140,21 @@ async function loadCredentials(): Promise<Credentials> {
   );
 }
 
-let tokenCache: { value: string; expiresAt: number } | null = null;
+let tokenCache: { value: string; expiresAt: number; credentialKey: string; scope?: string } | null = null;
 
-/**
- * Returns a live Gmail-scoped OAuth access token, refreshing it from the
- * stored (or legacy) refresh token when the cached one is near expiry.
- * Mirrors the token-exchange shape and the ~45s safety margin already used
- * by accessToken() in src/lib/booking-email.ts.
- */
-export async function getGoogleAccessToken(): Promise<string> {
-  if (tokenCache && tokenCache.expiresAt > Date.now()) return tokenCache.value;
+function credentialCacheKey(credentials: Credentials): string {
+  // Do not retain the refresh token itself in the cache key. This only makes
+  // an in-process cache safe to invalidate when Daniel reconnects another
+  // Google account or grants an additional scope.
+  return createHash("sha256")
+    .update(credentials.clientId)
+    .update("\0")
+    .update(credentials.refreshToken)
+    .digest("hex");
+}
 
-  const { clientId, clientSecret, refreshToken } = await loadCredentials();
+async function refreshGoogleAccessToken(credentials: Credentials): Promise<string> {
+  const { clientId, clientSecret, refreshToken } = credentials;
   const response = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -165,6 +173,50 @@ export async function getGoogleAccessToken(): Promise<string> {
   tokenCache = {
     value: payload.access_token,
     expiresAt: Date.now() + Math.max(60, Number(payload.expires_in ?? 300) - 45) * 1000,
+    credentialKey: credentialCacheKey(credentials),
+    scope: credentials.scope,
   };
   return tokenCache.value;
+}
+
+/**
+ * Returns a live OAuth access token for Gmail-compatible callers, refreshing
+ * it from the stored (or legacy) refresh token when the cached one is near
+ * expiry.
+ * Mirrors the token-exchange shape and the ~45s safety margin already used
+ * by accessToken() in src/lib/booking-email.ts.
+ */
+export async function getGoogleAccessToken(): Promise<string> {
+  // Reload the connection before trusting the in-memory token. A reconnect
+  // can replace Daniel's Google account or its grants while this process is
+  // warm; serving the old bearer token until expiry would cross that boundary.
+  const credentials = await loadCredentials();
+  const key = credentialCacheKey(credentials);
+  if (tokenCache && tokenCache.expiresAt > Date.now() && tokenCache.credentialKey === key) return tokenCache.value;
+  return await refreshGoogleAccessToken(credentials);
+}
+
+/**
+ * Returns a token only when the encrypted OAuth connection explicitly holds
+ * every required scope. Unlike the Gmail-compatible helper above, this never
+ * falls back to legacy `GMAIL_BOOKINGS_*` credentials because those have no
+ * trustworthy Calendar-scope record.
+ */
+export async function getGoogleAccessTokenForScopes(requiredScopes: readonly string[]): Promise<string> {
+  const credentials = await loadCredentials();
+  if (!credentials.scope || !hasGoogleScopes(credentials.scope, requiredScopes)) {
+    throw new GoogleOAuthError(
+      "Google Calendar is not connected with the required limited calendar scope. Reconnect Google from Options to grant Calendar access.",
+    );
+  }
+  const key = credentialCacheKey(credentials);
+  if (
+    tokenCache &&
+    tokenCache.expiresAt > Date.now() &&
+    tokenCache.credentialKey === key &&
+    tokenCache.scope === credentials.scope
+  ) {
+    return tokenCache.value;
+  }
+  return await refreshGoogleAccessToken(credentials);
 }

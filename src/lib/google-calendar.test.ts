@@ -1,0 +1,129 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const mock = vi.hoisted(() => ({
+  accessToken: vi.fn(async () => "calendar-test-token"),
+}));
+
+vi.mock("server-only", () => ({}));
+vi.mock("./google-oauth", () => ({ getGoogleAccessTokenForScopes: mock.accessToken }));
+
+import {
+  createGooglePrimaryCalendarEvent,
+  deleteManagedGooglePrimaryCalendarEvent,
+  listGooglePrimaryCalendarEvents,
+} from "./google-calendar";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  mock.accessToken.mockClear();
+});
+
+const start = Date.UTC(2026, 7, 20, 9, 0);
+const end = Date.UTC(2026, 7, 20, 10, 0);
+
+function remoteEvent(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "jarvisabcdef0123456789",
+    summary: "Planning session",
+    start: { dateTime: new Date(start).toISOString() },
+    end: { dateTime: new Date(end).toISOString() },
+    status: "confirmed",
+    ...overrides,
+  };
+}
+
+describe("Google Calendar primary-calendar boundary", () => {
+  it("bounds reads before loading an OAuth token", async () => {
+    await expect(listGooglePrimaryCalendarEvents({
+      start,
+      end: start + 32 * 86_400_000,
+    })).rejects.toThrow(/31-day window/i);
+    expect(mock.accessToken).not.toHaveBeenCalled();
+  });
+
+  it("lists only the primary calendar with a bounded selected response", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ items: [remoteEvent()] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(listGooglePrimaryCalendarEvents({ start, end, maxResults: 2 })).resolves.toEqual([
+      expect.objectContaining({ id: "jarvisabcdef0123456789", title: "Planning session", allDay: false }),
+    ]);
+
+    const [input] = fetchMock.mock.calls[0] as unknown as [URL];
+    const url = new URL(String(input));
+    expect(url.pathname).toBe("/calendar/v3/calendars/primary/events");
+    expect(url.searchParams.get("maxResults")).toBe("2");
+    expect(url.searchParams.get("singleEvents")).toBe("true");
+    expect(url.searchParams.get("fields")).toContain("items(id,summary,start,end");
+  });
+
+  it("creates a deterministic, non-inviting primary event without sending updates", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(remoteEvent()), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await createGooglePrimaryCalendarEvent({
+      title: "Planning session",
+      start,
+      end,
+      allDay: false,
+      location: "Studio",
+      notes: "Discuss launch plans",
+      reminderMinutesBefore: 15,
+    });
+
+    expect(result.created).toBe(true);
+    const [input, init] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
+    const url = new URL(String(input));
+    expect(url.pathname).toBe("/calendar/v3/calendars/primary/events");
+    expect(url.searchParams.get("sendUpdates")).toBe("none");
+    expect(url.searchParams.get("conferenceDataVersion")).toBe("0");
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    expect(body.id).toMatch(/^jarvis[a-v0-9]{64}$/);
+    expect(body.attendees).toBeUndefined();
+    expect(body.conferenceData).toBeUndefined();
+    expect(body.extendedProperties).toMatchObject({ private: { jarvisManaged: "jarvis-google-calendar-v1" } });
+  });
+
+  it("turns a post-commit retry into a verified idempotent result", async () => {
+    let createdBody: Record<string, unknown> | undefined;
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        createdBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return new Response(null, { status: 409 });
+      }
+      return new Response(JSON.stringify({
+        ...remoteEvent({ id: createdBody!.id }),
+        extendedProperties: createdBody!.extendedProperties,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(createGooglePrimaryCalendarEvent({
+      title: "Planning session",
+      start,
+      end,
+      allDay: false,
+    })).resolves.toMatchObject({ created: false, event: { id: expect.stringMatching(/^jarvis/) } });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses to delete an event without Jarvis's private management marker", async () => {
+    const eventId = "jarvisabcdef0123456789";
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(remoteEvent({ id: eventId })), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(deleteManagedGooglePrimaryCalendarEvent(eventId)).rejects.toThrow(/managed Google Calendar event/i);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(mock.accessToken).toHaveBeenCalledTimes(1);
+  });
+});

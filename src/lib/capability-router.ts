@@ -35,6 +35,7 @@ type CapabilityRule = {
 const EXPLICIT_VISUAL_RE = /\b(?:show|display|open|visuali[sz]e|map|chart|graph|plot|dashboard|widget|calendar|board|canvas|diagram|timeline)\b/i;
 const CONTINUATION_RE = /\b(?:more|other|another|instead|niche|less touristy|nearby|around there|add|remove|replace|change)\b/i;
 const PLACE_ROUTE_RE = /^\s*[\p{L}\p{M}'’.-]+(?:\s+[\p{L}\p{M}'’.-]+){0,2}\s+(?:to|→)\s+[\p{L}\p{M}'’.-]+(?:\s+[\p{L}\p{M}'’.-]+){0,2}\s*$/iu;
+const YOUTUBE_URL_RE = /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/|live\/)|youtu\.be\/)[\w-]{11}/i;
 
 const includesAny = (value: string, patterns: readonly RegExp[]) => patterns.some((pattern) => pattern.test(value));
 
@@ -95,6 +96,25 @@ const RULES: readonly CapabilityRule[] = [
     visual: true,
     reason: "general_chart",
     matches: (value) => /\b(?:chart|graph|plot|visuali[sz]e (?:these|this|the) data|data visuali[sz]ation)\b/i.test(value),
+  },
+  {
+    belt: "creative",
+    tools: ["youtube_transcript"],
+    score: 149,
+    visual: true,
+    reason: "youtube_url_transcript",
+    matches: (_value, original) => YOUTUBE_URL_RE.test(original),
+  },
+  {
+    belt: "creative",
+    tools: ["youtube_search"],
+    score: 148,
+    visual: true,
+    reason: "youtube_video_discovery",
+    matches: (value, original) => !YOUTUBE_URL_RE.test(original)
+      && !/\byoutube\s+studio\b/i.test(value)
+      && /\b(?:youtube|yt)\b/i.test(value)
+      && /\b(?:find|search|watch|video|videos|creator|channel|clip|playlist|transcript|summari[sz]e)\b/i.test(value),
   },
   {
     belt: "core",

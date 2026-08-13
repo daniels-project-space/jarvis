@@ -199,6 +199,32 @@ describe("foreground agent tool bridge", () => {
     ]);
   });
 
+  it("routes a pasted YouTube URL to the transcript tool and creative belt", async () => {
+    const requests: string[] = [];
+    const bridge = new AgentToolBridge("dispatch-token", {
+      endpoint: "https://jarvis.test/api/agent-tool",
+      fetchImplementation: async (input) => {
+        requests.push(String(input));
+        return Response.json([
+          { name: "youtube_search", description: "Find YouTube videos." },
+          { name: "youtube_transcript", description: "Fetch captions and open the video panel." },
+          { name: "draft", description: "Unrelated creative tool." },
+        ]);
+      },
+    });
+
+    const response = await bridge.invoke(dynamicCall("jarvis_get_tools", {
+      intent: "Summarise https://www.youtube.com/watch?v=abcDEF12345",
+    }));
+    const text = response.contentItems[0].type === "inputText" ? response.contentItems[0].text : "null";
+    const routed = JSON.parse(text);
+
+    expect(response.success).toBe(true);
+    expect(new URL(requests[0]).searchParams.get("belt")).toBe("creative");
+    expect(routed).toMatchObject({ belt: "creative", mustRender: true });
+    expect(routed.tools.map((tool: { name: string }) => tool.name)).toEqual(["youtube_transcript"]);
+  });
+
   it("discovers both the day planner and its real rendering tool in one request", async () => {
     const bridge = new AgentToolBridge("dispatch-token", {
       endpoint: "https://jarvis.test/api/agent-tool",
