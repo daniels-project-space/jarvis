@@ -12,6 +12,7 @@ import { workModelLabel, workModelPriority } from "./work-models";
 import { exactTextWorkOrder } from "./work-order";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
 import { createICloudEvent, deleteICloudEvent, findICloudEvents, listICloudEvents } from "./icloud-calendar";
+import { createGooglePrimaryCalendarEvent, listGooglePrimaryCalendarEvents } from "./google-calendar";
 import { lookupGmailBookingsReadOnly, scanGmailBookingConfirmations, type ConfirmedBooking } from "./booking-email";
 import {
   gmailSearch,
@@ -536,6 +537,37 @@ export const TOOL_DEFS = [
         view: { type: "string", enum: ["day", "week", "month"], description: "default week" },
         date: { type: "string", description: "YYYY-MM-DD anchor, default today" },
       },
+    },
+  },
+  {
+    name: "google_calendar_list",
+    description:
+      "Read the explicitly connected Google Calendar primary calendar only. This is read-only and never replaces the default iCloud Calendar tools: use it only when Daniel specifically asks about Google Calendar. The window is capped at 31 days and 50 events.",
+    parameters: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: "YYYY-MM-DD start date in Europe/London; default today" },
+        days: { type: "number", description: "Window length, 1-31 days; default 7" },
+        max_results: { type: "number", description: "Maximum events, 1-50; default 20" },
+      },
+    },
+  },
+  {
+    name: "google_calendar_create",
+    description:
+      "Create exactly one event on Daniel's explicitly connected Google Calendar primary calendar. Use only when he specifically names Google Calendar — never as a fallback for iCloud. This cannot add attendees, Google Meet links, attachments, or send invitations/updates; duplicate retries are safely deduplicated.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        date: { type: "string", description: "YYYY-MM-DD" },
+        time: { type: "string", description: "HH:MM 24h; omit for an all-day event" },
+        end_time: { type: "string", description: "HH:MM 24h; default one hour after a timed event" },
+        location: { type: "string" },
+        notes: { type: "string" },
+        reminder_minutes_before: { type: "number", description: "Optional popup reminder, 1-40320 minutes before" },
+      },
+      required: ["title", "date"],
     },
   },
   {
@@ -2022,6 +2054,68 @@ async function calendarAdd(args: any): Promise<string> {
     reminderMinutesBefore: reminderMinutesBefore || undefined,
   });
   return `In iCloud Calendar: "${title}" on ${date}${args.time ? ` at ${args.time}` : " (all day)"}${reminderMinutesBefore ? `, with an alert ${Math.round(reminderMinutesBefore)} minutes before` : ""}. It is live in the overlay and briefings. Confirm casually in one line.`;
+}
+
+function addDateDays(date: string, days: number): string {
+  const [year, month, day] = date.split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day + days)).toISOString().slice(0, 10);
+}
+
+async function googleCalendarList(args: any): Promise<string> {
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date ?? "")) ? String(args.date) : londonDateStr(Date.now());
+  const days = args.days == null ? 7 : Number(args.days);
+  const maxResults = args.max_results == null ? 20 : Number(args.max_results);
+  if (!Number.isInteger(days) || days < 1 || days > 31) return "Google Calendar reads are limited to 1-31 days.";
+  if (!Number.isInteger(maxResults) || maxResults < 1 || maxResults > 50) return "Google Calendar reads are limited to 1-50 events.";
+  const start = londonMs(date, "00:00");
+  const end = londonMs(addDateDays(date, days), "00:00");
+  const events = await listGooglePrimaryCalendarEvents({ start, end, maxResults });
+  if (!events.length) return `Google Calendar has nothing scheduled from ${date} for the next ${days} day${days === 1 ? "" : "s"}.`;
+  const when = (event: (typeof events)[number]) =>
+    event.allDay
+      ? event.start
+      : new Intl.DateTimeFormat("en-GB", {
+          timeZone: "Europe/London",
+          weekday: "short",
+          day: "numeric",
+          month: "short",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+        }).format(new Date(event.start));
+  const lines = events.map((event) => `- ${when(event)} · ${event.title}${event.location ? ` @ ${event.location}` : ""}`);
+  return `Google Calendar primary (${date}, ${days} day${days === 1 ? "" : "s"}):\n${lines.join("\n")}`;
+}
+
+async function googleCalendarCreate(args: any): Promise<string> {
+  const title = String(args.title ?? "").trim();
+  const date = String(args.date ?? "");
+  if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return "I need a title and a date (YYYY-MM-DD).";
+  if (args.time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(args.time))) return "I need the start time as HH:MM (24-hour).";
+  if (args.end_time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(args.end_time))) return "I need the end time as HH:MM (24-hour).";
+  const allDay = !args.time;
+  const start = allDay ? londonMs(date, "00:00") : londonMs(date, String(args.time));
+  let end = allDay
+    ? londonMs(addDateDays(date, 1), "00:00")
+    : args.end_time
+      ? londonMs(date, String(args.end_time))
+      : start + 60 * 60_000;
+  if (!allDay && end <= start) end += 86_400_000;
+  const reminderMinutesBefore = args.reminder_minutes_before == null ? undefined : Number(args.reminder_minutes_before);
+  if (reminderMinutesBefore != null && (!Number.isInteger(reminderMinutesBefore) || reminderMinutesBefore < 1 || reminderMinutesBefore > 40_320)) {
+    return "The Google Calendar popup reminder must be a whole number from 1 to 40320 minutes before the event.";
+  }
+  const result = await createGooglePrimaryCalendarEvent({
+    title: title.slice(0, 140),
+    start,
+    end,
+    allDay,
+    location: args.location ? String(args.location).slice(0, 140) : undefined,
+    notes: args.notes ? String(args.notes).slice(0, 500) : undefined,
+    reminderMinutesBefore,
+  });
+  const action = result.created ? "Added" : "Already present";
+  return `${action} in Google Calendar: "${result.event.title}" on ${date}${args.time ? ` at ${args.time}` : " (all day)"}. No invitations or updates were sent.`;
 }
 
 async function calendarRemove(args: any): Promise<string> {
@@ -4008,6 +4102,10 @@ export async function executeTool(
       return await calendarRemove(args);
     case "calendar_view":
       return await calendarView(args);
+    case "google_calendar_list":
+      return await googleCalendarList(args);
+    case "google_calendar_create":
+      return await googleCalendarCreate(args);
     case "bookings_lookup":
       return await bookingsLookup(args);
     case "bookings_check":
@@ -4239,8 +4337,16 @@ export async function executeTool(
         tags: [...(Array.isArray(args.tags) ? args.tags.map(String) : []), ...(project ? [project] : [])].slice(0, 6),
       });
       const { vaultWrite } = await import("./obsidian");
-      await vaultWrite(String(args.kind ?? "fact"), note.title, note.body, project);
-      return project ? `Saved to memory (filed under project ${project}).` : "Saved to memory.";
+      const mirrored = await vaultWrite(String(args.kind ?? "fact"), note.title, note.body, project);
+      if (!mirrored) {
+        // Convex is the durable canonical memory here; do not pretend the
+        // optional Git-backed Obsidian mirror succeeded when its credentials
+        // or transport are unavailable.
+        return project
+          ? `Saved to Jarvis memory under project ${project}, but the Obsidian mirror did not sync yet.`
+          : "Saved to Jarvis memory, but the Obsidian mirror did not sync yet.";
+      }
+      return project ? `Saved to memory and synced to Obsidian under project ${project}.` : "Saved to memory and synced to Obsidian.";
     }
     case "project_goal":
       return await projectGoalTool(args);
