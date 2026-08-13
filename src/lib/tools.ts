@@ -1,7 +1,7 @@
 import "server-only";
 import { convexMutation, convexQuery } from "./context";
 import { getSecret, getServiceSecrets } from "./vault";
-import { r2Put, r2StoreFromUrl } from "./r2";
+import { r2DeleteFreshCreation, r2Put, r2StoreFromUrl } from "./r2";
 import { privateR2Get } from "./private-r2";
 import type { ManagedMission } from "../mastra/supervisor";
 import { withAdminSession } from "./control-context";
@@ -11,7 +11,7 @@ import { SHALLOW_PROVENANCE_RULE } from "./git-delivery";
 import { workModelLabel, workModelPriority } from "./work-models";
 import { exactTextWorkOrder } from "./work-order";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
-import { createICloudEvent, deleteICloudEvent, findICloudEvents, listICloudEvents } from "./icloud-calendar";
+import { listICloudEvents } from "./icloud-calendar";
 import { listGooglePrimaryCalendarEvents } from "./google-calendar";
 import { googleCalendarApprovalMarker, issueGoogleCalendarApproval } from "./google-calendar-approval.server";
 import { lookupGmailBookingsReadOnly, scanGmailBookingConfirmations, type ConfirmedBooking } from "./booking-email";
@@ -504,29 +504,6 @@ export const TOOL_DEFS = [
     parameters: { type: "object", properties: { match: { type: "string" } }, required: ["match"] },
   },
   {
-    name: "calendar_add",
-    description:
-      "ACTUALLY add an event, schedule or calendar reminder to Daniel's live iCloud Calendar. Use for ANY 'put X in my calendar / schedule / I have a meeting'. Never claim an event was added without calling this. Times are Europe/London.",
-    parameters: {
-      type: "object",
-      properties: {
-        title: { type: "string" },
-        date: { type: "string", description: "YYYY-MM-DD" },
-        time: { type: "string", description: "HH:MM 24h; omit for an all-day event" },
-        end_time: { type: "string", description: "HH:MM if he gave one" },
-        location: { type: "string" },
-        notes: { type: "string" },
-        reminder_minutes_before: { type: "number", description: "Optional iCloud Calendar alert, in minutes before the event" },
-      },
-      required: ["title", "date"],
-    },
-  },
-  {
-    name: "calendar_remove",
-    description: "Delete an event from Daniel's live iCloud Calendar. Pass a few words from its title.",
-    parameters: { type: "object", properties: { match: { type: "string" } }, required: ["match"] },
-  },
-  {
     name: "calendar_view",
     description:
       "Read Daniel's live iCloud Calendar and show it as a beautiful visual widget, merged with legacy hub events and rental pickups/returns, as a day plan, week, or month view. Use for 'what's my day/week/month look like', 'show my calendar', 'what's on Friday'.",
@@ -920,14 +897,13 @@ export const TOOL_DEFS = [
   {
     name: "trip_finalize",
     description:
-      "Lock the reviewed plan in: builds the day-by-day itinerary (flight, airport transfer with real drive time, check-in, activities), optionally syncs it to Daniel's calendar only after an explicit choice, and saves the trip as an interactive connected-node map. Never infer calendar consent.",
+      "Lock the reviewed plan in: builds the day-by-day itinerary (flight, airport transfer with real drive time, check-in, activities) and saves the trip as an interactive connected-node map. This tool always leaves calendars untouched.",
     parameters: {
       type: "object",
       properties: {
         trip_id: { type: "string", description: "exact trip creation id" },
-        add_to_calendar: { type: "boolean", description: "explicit choice; true syncs idempotently, false leaves Daniel's calendar untouched" },
       },
-      required: ["trip_id", "add_to_calendar"],
+      required: ["trip_id"],
     },
   },
   {
@@ -2001,29 +1977,8 @@ async function todoRemove(args: any): Promise<string> {
   return `Removed from the list: "${hit.text}".`;
 }
 
-async function calendarAdd(args: any): Promise<string> {
-  const title = String(args.title ?? "").trim();
-  const date = String(args.date ?? "");
-  if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return "I need a title and a date (YYYY-MM-DD).";
-  if (args.time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(args.time))) return "I need the start time as HH:MM (24-hour).";
-  if (args.end_time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(args.end_time))) return "I need the end time as HH:MM (24-hour).";
-  const allDay = !args.time;
-  const start = londonMs(date, args.time ? String(args.time) : "09:00");
-  let end = args.end_time ? londonMs(date, String(args.end_time)) : undefined;
-  if (end && end <= start) end += 86_400_000;
-  const reminderMinutesBefore = Number(args.reminder_minutes_before);
-  if (args.reminder_minutes_before != null && (!Number.isFinite(reminderMinutesBefore) || reminderMinutesBefore <= 0))
-    return "The calendar alert needs to be a positive number of minutes before the event.";
-  await createICloudEvent({
-    title: title.slice(0, 140),
-    start,
-    end,
-    allDay,
-    location: args.location ? String(args.location).slice(0, 140) : undefined,
-    notes: args.notes ? String(args.notes).slice(0, 500) : undefined,
-    reminderMinutesBefore: reminderMinutesBefore || undefined,
-  });
-  return `In iCloud Calendar: "${title}" on ${date}${args.time ? ` at ${args.time}` : " (all day)"}${reminderMinutesBefore ? `, with an alert ${Math.round(reminderMinutesBefore)} minutes before` : ""}. It is live in the overlay and briefings. Confirm casually in one line.`;
+async function calendarAdd(_args: any): Promise<string> {
+  return "Calendar changes require protected owner approval, which is unavailable from this tool. Nothing was added.";
 }
 
 function addDateDays(date: string, days: number): string {
@@ -2126,25 +2081,8 @@ async function googleCalendarCreate(args: any): Promise<string> {
   return `Ready for your approval: Google Calendar event "${event.title}" on ${date}${args.time ? ` at ${args.time}` : " (all day)"}. Nothing has been added yet; use the protected Approve event button below within 10 minutes. No invitations or updates will be sent.\n${googleCalendarApprovalMarker(approval)}`;
 }
 
-async function calendarRemove(args: any): Promise<string> {
-  const m = String(args.match ?? "").toLowerCase().trim();
-  if (!m) return "Which calendar event should I remove?";
-  const [iCloudEvents, legacyEvents] = await Promise.all([
-    findICloudEvents(m, Date.now() - 86_400_000, Date.now() + 366 * 86_400_000),
-    q_hub("events:list"),
-  ]);
-  const hits = [
-    ...iCloudEvents.map((event) => ({ ...event, storage: "icloud" as const })),
-    ...(Array.isArray(legacyEvents) ? legacyEvents : [])
-      .filter((event: any) => String(event.title).toLowerCase().includes(m))
-      .map((event: any) => ({ ...event, storage: "hub" as const })),
-  ];
-  if (hits.length === 0) return `No event matches "${args.match}".`;
-  if (hits.length > 1)
-    return `Several events match: ${hits.slice(0, 5).map((e: any) => `"${e.title}" (${londonDateStr(e.start)})`).join(", ")} — ask which.`;
-  if (hits[0].storage === "icloud") await deleteICloudEvent(hits[0].eventUrl);
-  else await m_hub("events:remove", { id: hits[0]._id });
-  return `Deleted "${hits[0].title}" from ${hits[0].storage === "icloud" ? "iCloud Calendar" : "the legacy hub calendar"}.`;
+async function calendarRemove(_args: any): Promise<string> {
+  return "Calendar changes require protected owner approval, which is unavailable from this tool. Nothing was deleted.";
 }
 
 // The frosted-glass calendar widget: live iCloud events + legacy hub events +
@@ -2430,23 +2368,51 @@ async function createImage(args: any): Promise<string> {
   }
   if (!imageUrl) return "Image generation timed out after 30s — try again.";
   const title = String(args.title ?? prompt.slice(0, 60));
-  let finalUrl = imageUrl;
+  let finalUrl: string;
   try {
     finalUrl = (await r2StoreFromUrl(title, imageUrl)).url;
   } catch (e: any) {
-    // fall back to the (48h) provider url — but surface the breakage so the
-    // healer fixes it instead of it rotting silently
+    // A provider URL is short-lived and must never be passed off as a saved
+    // Jarvis creation. Keep the incident signal, but fail the durable flow.
     await convexMutation("incidents:report", {
       source: "tools",
       signature: "r2:create-image-store",
       message: `R2 re-home of generated image failed: ${String(e?.message ?? e).slice(0, 200)}`,
     }).catch(() => {});
+    return "Image generation completed, but durable storage failed. It was not saved to the creations library and no download card was posted.";
   }
   const filing = await creationFiling(args);
-  await convexMutation("creations:create", { kind: "image", title, url: finalUrl, thumb: finalUrl, data: prompt, ...filing }).catch(() => {});
-  await convexMutation("ui:setPanel", { type: "image", value: finalUrl, title });
-  await convexMutation("chatQueue:postCard", { threadId: filing.threadId, type: "image", value: finalUrl, title }).catch(() => {});
-  return `Image generated and on screen (saved to the creations library). URL: ${finalUrl}`;
+  let creationId: unknown;
+  try {
+    creationId = await convexMutation("creations:create", {
+      kind: "image", title, url: finalUrl, thumb: finalUrl, data: prompt, ...filing,
+    });
+    if (typeof creationId !== "string" || !creationId) throw new Error("creation persistence returned no id");
+  } catch {
+    // Only delete the fresh R2 object we just created. Without a library row,
+    // it is undiscoverable and must not become a false "saved" artifact.
+    await r2DeleteFreshCreation(finalUrl).catch(() => undefined);
+    return "Image generated, but its creations-library record could not be saved. The fresh storage object was cleaned up and no download card was posted.";
+  }
+  const downloadUrl = `/api/creation-download?id=${encodeURIComponent(creationId)}`;
+  let panelShown = true;
+  try {
+    await convexMutation("ui:setPanel", { type: "image", value: finalUrl, title });
+  } catch {
+    panelShown = false;
+  }
+  let cardPosted = true;
+  try {
+    await convexMutation("chatQueue:postCard", {
+      threadId: filing.threadId, type: "image", value: finalUrl, title, downloadUrl,
+    });
+  } catch {
+    cardPosted = false;
+  }
+  if (!panelShown || !cardPosted) {
+    return `Image saved to the creations library${panelShown ? "" : ", but it could not be shown on screen"}${cardPosted ? "" : ", and its download card could not be posted"}.`;
+  }
+  return `Image generated, shown on screen, saved to the creations library, and attached with a secure download card. URL: ${finalUrl}`;
 }
 
 async function storeImage(args: any): Promise<string> {
@@ -2473,10 +2439,35 @@ async function createPdf(args: any): Promise<string> {
     const bytes = await markdownToPdf(title, md.slice(0, 30_000));
     const url = await r2Put(title, bytes, "application/pdf");
     const filing = await creationFiling(args);
-    await convexMutation("creations:create", { kind: "pdf", title, url, data: md.slice(0, 20_000), ...filing }).catch(() => {});
-    await convexMutation("ui:setPanel", { type: "pdf", value: url, title });
-    await convexMutation("chatQueue:postCard", { threadId: filing.threadId, type: "pdf", value: url, title: `${title}.pdf` }).catch(() => {});
-    return `PDF ready and on screen — download link: ${url} (also saved in the creations library).`;
+    let creationId: unknown;
+    try {
+      creationId = await convexMutation("creations:create", {
+        kind: "pdf", title, url, data: md.slice(0, 20_000), ...filing,
+      });
+      if (typeof creationId !== "string" || !creationId) throw new Error("creation persistence returned no id");
+    } catch {
+      await r2DeleteFreshCreation(url).catch(() => undefined);
+      return "PDF was rendered, but its creations-library record could not be saved. The fresh storage object was cleaned up and no download card was posted.";
+    }
+    const downloadUrl = `/api/creation-download?id=${encodeURIComponent(creationId)}`;
+    let panelShown = true;
+    try {
+      await convexMutation("ui:setPanel", { type: "pdf", value: url, title });
+    } catch {
+      panelShown = false;
+    }
+    let cardPosted = true;
+    try {
+      await convexMutation("chatQueue:postCard", {
+        threadId: filing.threadId, type: "pdf", value: url, title: `${title}.pdf`, downloadUrl,
+      });
+    } catch {
+      cardPosted = false;
+    }
+    if (!panelShown || !cardPosted) {
+      return `PDF saved to the creations library${panelShown ? "" : ", but it could not be shown on screen"}${cardPosted ? "" : ", and its download card could not be posted"}.`;
+    }
+    return `PDF is shown on screen, saved to the creations library, and attached with a secure download card. URL: ${url}`;
   } catch (e: any) {
     return `PDF creation failed: ${e?.message ?? e}`;
   }
@@ -3314,7 +3305,7 @@ async function planMyDay(args: any): Promise<string> {
   return (
     `LIVE DAY DATA. Build the plan yourself with your current Codex subscription reasoning; do not call another model. ` +
     `Use at most three meaningful priorities, respect fixed events and rentals, include realistic breaks and an honest skip-today list. ` +
-    `Then call show with kind=list, ordered=true and one complete item per time block (use groups such as fixed, focus, break and skip); speak only the top priority and first block. Offer calendar_add only after Daniel approves.\n\n${facts}`
+    `Then call show with kind=list, ordered=true and one complete item per time block (use groups such as fixed, focus, break and skip); speak only the top priority and first block. Do not claim or attempt a calendar edit: calendar approval is unavailable through tools.\n\n${facts}`
   );
 }
 
@@ -3578,10 +3569,9 @@ async function tripUpdateTool(args: any): Promise<string> {
 }
 
 async function tripFinalizeTool(args: any): Promise<string> {
-  const { getTrip, saveTrip, computeTransfer, buildItinerary, tripToCalendar, tripToMindmap } = await import("./travel");
+  const { getTrip, saveTrip, computeTransfer, buildItinerary, tripToMindmap } = await import("./travel");
   const tripId = String(args.trip_id ?? "").trim();
   if (!tripId) return "TRIP ID MISSING — finalize the exact visible trip, never whichever draft happens to be newest.";
-  if (typeof args.add_to_calendar !== "boolean") return "CALENDAR CHOICE MISSING — ask Daniel whether to sync the reviewed itinerary to his calendar.";
   const t = await getTrip(tripId);
   if (!t) return `Trip ${tripId} was not found.`;
   const { doc } = t;
@@ -3590,17 +3580,9 @@ async function tripFinalizeTool(args: any): Promise<string> {
   if (!doc.locked.stay) return "Lock a hotel first (trip_update lock_stay) — the itinerary and transfer hang off it.";
   if (!doc.transfer) doc.transfer = await computeTransfer(doc);
   doc.itinerary = buildItinerary(doc);
-  let calNote = "";
-  if (args.add_to_calendar === true) {
-    try {
-      const n = await tripToCalendar(doc, t.id);
-      doc.calendarSyncedAt = Date.now();
-      calNote = ` ${n} calendar items synchronized idempotently (GMT/BST aware).`;
-    } catch (error: any) {
-      await saveTrip(t.id, doc);
-      throw new Error(`Trip itinerary was saved, but calendar sync failed and was not marked complete: ${String(error?.message ?? error).slice(0, 200)}`);
-    }
-  }
+  const calNote = args.add_to_calendar === true
+    ? " Calendar sync was requested, but no calendar items were created: protected owner approval is unavailable from this tool."
+    : "";
   doc.status = "planned";
   await saveTrip(t.id, doc);
   const mapId = await tripToMindmap(doc, t.id).catch(() => "");

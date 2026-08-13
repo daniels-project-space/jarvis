@@ -1,7 +1,7 @@
 const TOOL_BELT_REGISTRY = {
   core: new Set([
     "dispatch_agent", "show", "show_ranking", "rank_focus", "video_control", "hide", "web_search", "weather",
-    "timer", "briefing", "remind_at", "todo_add", "todo_done", "todo_list", "calendar_add", "calendar_view",
+    "timer", "briefing", "remind_at", "todo_add", "todo_done", "todo_list", "calendar_view",
     "google_calendar_list", "google_calendar_create",
     "open_app", "host_ui", "mac_shortcut", "current_time", "calculate", "orb_mood",
   ]),
@@ -9,7 +9,7 @@ const TOOL_BELT_REGISTRY = {
     "orchestrate", "goal_mode", "self_repair", "self_improve", "research", "plan_my_day", "show", "net_worth", "memory_map",
     "rental_availability", "rental_stats", "rentals_calendar", "clear_chat", "new_chat", "visual_scene", "project_goal",
     "work_control", "read_url", "remember", "memory_search", "agent_status", "reminder_cancel", "todo_remove",
-    "calendar_remove", "deliberate", "open_file_as_doc", "gmail_search", "gmail_read", "gmail_draft_reply",
+    "deliberate", "open_file_as_doc", "gmail_search", "gmail_read", "gmail_draft_reply",
     "gmail_list_subscriptions",
   ]),
   creative: new Set([

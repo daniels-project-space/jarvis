@@ -216,7 +216,6 @@ export default function TripView({ value }: { value: string }) {
   const [sortBy, setSortBy] = useState<"value" | "price" | "rating">("value");
   const [busy, setBusy] = useState("");
   const [actionError, setActionError] = useState("");
-  const [syncCalendar, setSyncCalendar] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
   const markers: Marker[] = useMemo(() => {
@@ -609,17 +608,14 @@ export default function TripView({ value }: { value: string }) {
                 </div>
                 {doc.status !== "planned" && (
                   <>
-                    <label className="mt-2 flex cursor-pointer items-center gap-2 rounded-lg border border-white/8 bg-black/15 px-2.5 py-2 text-[11px] text-slate">
-                      <input type="checkbox" checked={syncCalendar} onChange={(event) => setSyncCalendar(event.target.checked)} className="accent-cyan" />
-                      Sync the reviewed itinerary to my calendar
-                    </label>
                     <button
-                      onClick={() => void act("finalizing", "finalize", { add_to_calendar: syncCalendar })}
+                      onClick={() => void act("finalizing", "finalize")}
                       disabled={Boolean(busy) || !doc.locked?.stay || (doc.includeFlights !== false && (doc.flights ?? []).length > 0 && !doc.locked?.flight)}
                       className="mt-2 w-full rounded-lg bg-cyan/15 py-2 text-[13px] font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40"
                     >
-                      finalize reviewed plan{syncCalendar ? " + sync calendar" : " · calendar untouched"}
+                      finalize reviewed plan · calendar untouched
                     </button>
+                    <div className="mt-1 text-center text-[10px] text-slate">Individual Google Calendar events can be prepared separately for protected approval.</div>
                     {doc.includeFlights !== false && (doc.flights ?? []).length > 0 && !doc.locked?.flight && (
                       <div className="mt-1 text-center text-[10px] text-amber">Lock a specific flight before finalizing.</div>
                     )}
