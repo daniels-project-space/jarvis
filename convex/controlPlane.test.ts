@@ -42,6 +42,26 @@ describe("compact control-plane projections", () => {
     expect(projected).not.toHaveProperty("acceptanceCriteria");
   });
 
+  it("keeps a provider configuration hold out of live capacity while preserving its recovery state", () => {
+    const projected = projectJobRuntime({
+      _id: "job-held",
+      task: "Wait for verified secure worker setup",
+      status: "paused",
+      providerRunState: "blocked",
+      providerObservedAt: 200,
+      cloudWorkspaceBlockCode: "missing_configuration",
+      stage: "cloud blocked",
+      createdAt: 100,
+    });
+
+    expect(projected).toMatchObject({
+      status: "paused",
+      active: false,
+      providerRunState: "blocked",
+      cloudWorkspaceBlockCode: "missing_configuration",
+    });
+  });
+
   it("preserves newer activity across unrelated durable authority writes", () => {
     const durable = {
       _id: "job-1",

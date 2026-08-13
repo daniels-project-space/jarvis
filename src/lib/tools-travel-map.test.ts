@@ -80,7 +80,8 @@ describe("travel_map tool", () => {
     });
 
     expect(result).toContain("Interactive OpenStreetMap opened for Sevilla");
-    expect(result).toContain("Opening hours and ratings are unverified");
+    expect(result).toContain("Opening hours are shown only when OpenStreetMap tags them");
+    expect(result).toContain("admission prices are not claimed");
     expect(result).toContain("read-only Gmail booking base");
     expect(mock.lookupBookings).toHaveBeenCalledWith({ days: 730, maxResults: 24 });
     const requests = vi.mocked(fetch).mock.calls.map(([url]) => new URL(String(url)));
@@ -101,6 +102,73 @@ describe("travel_map tool", () => {
     expect(panel.items).toHaveLength(3);
     expect(panel.route.coordinates).toHaveLength(4);
     expect(panel.route.directionsUrl).toContain("openstreetmap.org/directions");
+  });
+
+  it("carries only exact OpenStreetMap-backed attraction sources into the map card", async () => {
+    const city = "Jarvis Source City 204";
+    const exactArticle = "Real Alcázar de Sevilla";
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.hostname === "nominatim.openstreetmap.org") {
+        if (url.searchParams.get("q") === city) {
+          return new Response(JSON.stringify([osmPlace(city, `${city}, Spain`, 37.3891, -5.9845)]), { status: 200 });
+        }
+        return new Response(JSON.stringify([{
+          ...osmPlace("Real Alcázar de Sevilla", "Plaza del Triunfo, Sevilla", 37.383, -5.99),
+          extratags: {
+            wikipedia: `es:${exactArticle}`,
+            opening_hours: "Oct-Mar: 09:30-17:00; Apr-Sep: 09:30-19:00",
+            website: "https://www.alcazarsevilla.org/",
+            charge: "18 EUR",
+          },
+        }]), { status: 200 });
+      }
+      if (url.hostname === "es.wikipedia.org") {
+        expect(url.pathname).toBe("/w/api.php");
+        expect(url.searchParams.get("action")).toBe("query");
+        expect(url.searchParams.get("titles")).toBe(exactArticle);
+        expect(url.searchParams.get("list")).toBeNull();
+        expect(url.searchParams.get("generator")).toBeNull();
+        return new Response(JSON.stringify({
+          query: {
+            pages: [{
+              title: exactArticle,
+              fullurl: "https://es.wikipedia.org/wiki/Real_Alc%C3%A1zar_de_Sevilla",
+              thumbnail: { source: "https://upload.wikimedia.org/example/alcazar.jpg" },
+            }],
+          },
+        }), { status: 200 });
+      }
+      throw new Error(`unexpected public source: ${url.hostname}`);
+    }));
+
+    const result = await executeTool("travel_map", {
+      location: city,
+      query: "historic attractions",
+    });
+
+    expect(result).toContain("admission prices are not claimed");
+    const panelCall = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
+    const panel = JSON.parse(String(panelCall?.[1]?.value));
+    expect(panel.items[0]).toMatchObject({
+      openingHours: "Oct-Mar: 09:30-17:00; Apr-Sep: 09:30-19:00",
+      websiteUrl: "https://www.alcazarsevilla.org/",
+      wikipedia: {
+        language: "es",
+        title: exactArticle,
+        articleUrl: "https://es.wikipedia.org/wiki/Real_Alc%C3%A1zar_de_Sevilla",
+      },
+      wikipediaArticle: {
+        title: exactArticle,
+        articleUrl: "https://es.wikipedia.org/wiki/Real_Alc%C3%A1zar_de_Sevilla",
+        thumbnailUrl: "https://upload.wikimedia.org/example/alcazar.jpg",
+        attribution: "Wikipedia (es) · image via Wikimedia",
+      },
+    });
+    expect(panel.items[0]).not.toHaveProperty("charge");
+    expect(JSON.stringify(panel)).not.toContain("18 EUR");
+    const sources = vi.mocked(fetch).mock.calls.map(([url]) => new URL(String(url)).hostname);
+    expect(sources.filter((hostname) => hostname === "es.wikipedia.org")).toHaveLength(1);
   });
 
   it("keeps proactive booking lookup read-only", async () => {

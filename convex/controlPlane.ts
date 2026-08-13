@@ -48,7 +48,6 @@ function defined<T extends Record<string, unknown>>(value: T): T {
 
 export function projectJobRuntime(job: any) {
   const createdAt = Number(job.createdAt ?? job._creationTime ?? Date.now());
-  const active = ["running", "dispatching", "pending", "awaiting_approval", "paused", "stalled", "needs_input", "steering"].includes(String(job.status));
   const pauseCheckpointPending = (
     job.status === "paused"
     && job.dispatchPhase === "specialist"
@@ -58,6 +57,16 @@ export function projectJobRuntime(job: any) {
     && typeof job.dispatchReceiptDigest === "string"
     && typeof job.dispatchPayloadDigest === "string"
   ) ? true : undefined;
+  // A paused cloud-workspace hold has already closed its exact dispatch
+  // receipt.  It is resumable when a verified provider becomes available,
+  // but it is not a live worker and must not occupy the conversation strip.
+  const systemHeldCloudWorkspacePause = (
+    job.status === "paused"
+    && job.providerRunState === "blocked"
+    && job.nextRunAt === undefined
+  );
+  const active = ["running", "dispatching", "pending", "awaiting_approval", "paused", "stalled", "needs_input", "steering"].includes(String(job.status))
+    && !systemHeldCloudWorkspacePause;
   return defined({
     jobId: job._id,
     admissionProtocolVersion: typeof job.admissionProtocolVersion === "number" ? job.admissionProtocolVersion : undefined,
@@ -112,6 +121,7 @@ export function projectJobRuntime(job: any) {
     workerRuntime: typeof job.workerRuntime === "string" ? job.workerRuntime.slice(0, 40) : undefined,
     providerRunState: typeof job.providerRunState === "string" ? job.providerRunState.slice(0, 40) : undefined,
     providerObservedAt: typeof job.providerObservedAt === "number" ? job.providerObservedAt : undefined,
+    cloudWorkspaceBlockCode: typeof job.cloudWorkspaceBlockCode === "string" ? job.cloudWorkspaceBlockCode.slice(0, 80) : undefined,
     readonly: typeof job.readonly === "boolean" ? job.readonly : undefined,
     parentJobId: typeof job.parentJobId === "string" ? job.parentJobId.slice(0, 120) : undefined,
     dependsOn: Array.isArray(job.dependsOn) ? job.dependsOn.slice(0, 16).map((id: unknown) => String(id).slice(0, 120)) : undefined,

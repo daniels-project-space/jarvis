@@ -549,6 +549,10 @@ export default defineSchema({
     workerRuntime: v.optional(v.string()),
     providerRunState: v.optional(v.string()),
     providerObservedAt: v.optional(v.number()),
+    // Exact reason for a system-held cloud setup pause. It is deliberately
+    // separate from human-readable progress so bounded cleanup never parses
+    // broad failure text.
+    cloudWorkspaceBlockCode: v.optional(v.string()),
     checkpoint: v.optional(v.string()),
     attempt: v.optional(v.number()),
     maxAttempts: v.optional(v.number()),
@@ -714,6 +718,7 @@ export default defineSchema({
     workerRuntime: v.optional(v.string()),
     providerRunState: v.optional(v.string()),
     providerObservedAt: v.optional(v.number()),
+    cloudWorkspaceBlockCode: v.optional(v.string()),
     readonly: v.optional(v.boolean()),
     parentJobId: v.optional(v.string()),
     dependsOn: v.optional(v.array(v.string())),
@@ -773,6 +778,7 @@ export default defineSchema({
     .index("by_group_dispatch_ready", ["schedulingGroupKey", "status", "schedulingBound", "dispatchReady", "nextRunAt", "createdAt"])
     .index("by_status_scheduling_bound", ["status", "schedulingBound", "priority", "createdAt"])
     .index("by_status_heartbeat", ["status", "heartbeatAt"])
+    .index("by_status_provider_observed", ["status", "providerRunState", "providerObservedAt"])
     .index("by_pause_checkpoint_heartbeat", [
       "status",
       "pauseCheckpointPending",

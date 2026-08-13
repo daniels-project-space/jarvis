@@ -734,7 +734,9 @@ export function DocView({ value }: { value: string }) {
 
 type Place = {
   name: string; address: string; rating?: number; reviews?: number; openNow?: boolean;
-  hoursToday?: string; type?: string; lat: number; lng: number; dist: number | null; mapsUri: string;
+  hoursToday?: string; openingHours?: string; websiteUrl?: string; type?: string; lat: number; lng: number; dist: number | null; mapsUri: string;
+  wikipedia?: { language: string; title: string; articleUrl: string };
+  wikipediaArticle?: { title: string; articleUrl: string; thumbnailUrl?: string; attribution: string };
 };
 
 type PlacesWidget = {
@@ -876,7 +878,7 @@ export function PlacesView({ value }: { value: string }) {
       </div>
       <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3 @min-[760px]:w-[min(380px,38%)] @min-[760px]:flex-none">
         <div className="hud-label">{w.locationLabel ?? center.label ?? "map"} · {w.query}</div>
-        {center.source === "openstreetmap" && <div className="mt-1 text-[10px] text-slate">Place data © OpenStreetMap contributors</div>}
+        {w.provider === "openstreetmap" && <div className="mt-1 text-[10px] text-slate">Place data © OpenStreetMap contributors</div>}
         {w.preferences && <div className="mb-2 mt-1 text-[11px] leading-relaxed text-slate">Taste: {w.preferences}</div>}
         {base && (
           <div className="mb-2.5 rounded-xl border border-amber/25 bg-amber/[0.07] p-2.5">
@@ -913,6 +915,26 @@ export function PlacesView({ value }: { value: string }) {
             >
               <div className="flex items-start gap-2">
                 <span className="mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-full bg-cyan/15 font-mono text-[11px] text-cyan ring-1 ring-cyan/40">{i + 1}</span>
+                {p.wikipediaArticle?.thumbnailUrl && (
+                  <a
+                    href={p.wikipediaArticle.articleUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => e.stopPropagation()}
+                    title={`Open ${p.wikipediaArticle.title} on Wikipedia`}
+                    className="mt-0.5 h-14 w-16 shrink-0 overflow-hidden rounded-md bg-white/5 ring-1 ring-white/10 transition hover:ring-cyan/45"
+                  >
+                    {/* External, source-attributed Wikimedia thumbnail: do not proxy it through paid image optimisation. */}
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={p.wikipediaArticle.thumbnailUrl}
+                      alt={p.wikipediaArticle.title}
+                      loading="lazy"
+                      referrerPolicy="no-referrer"
+                      className="h-full w-full object-cover"
+                    />
+                  </a>
+                )}
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-[14px] font-medium text-ice">{p.name}</div>
                   <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px]">
@@ -921,7 +943,23 @@ export function PlacesView({ value }: { value: string }) {
                     {p.openNow != null && <span className={p.openNow ? "text-emerald-400" : "text-red-400"}>{p.openNow ? "open now" : "closed"}</span>}
                   </div>
                   {p.hoursToday && <div className="mt-0.5 text-[11px] text-slate">Today: {p.hoursToday}</div>}
+                  {p.openingHours && <div className="mt-0.5 text-[11px] text-slate">Hours (OpenStreetMap): {p.openingHours}</div>}
                   <div className="truncate text-[10px] text-slate">{p.address}</div>
+                  {(p.websiteUrl || p.wikipedia?.articleUrl || p.wikipediaArticle?.articleUrl) && (
+                    <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 text-[10px]">
+                      {p.websiteUrl && (
+                        <a href={p.websiteUrl} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()} className="text-cyan/70 transition hover:text-cyan">
+                          site (OSM) ↗
+                        </a>
+                      )}
+                      {(p.wikipediaArticle?.articleUrl ?? p.wikipedia?.articleUrl) && (
+                        <a href={p.wikipediaArticle?.articleUrl ?? p.wikipedia!.articleUrl} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()} className="text-cyan/70 transition hover:text-cyan">
+                          Wikipedia ↗
+                        </a>
+                      )}
+                    </div>
+                  )}
+                  {p.wikipediaArticle?.thumbnailUrl && <div className="mt-0.5 text-[9px] text-slate">{p.wikipediaArticle.attribution}</div>}
                   <div className="mt-2 flex gap-1.5">
                     {[["walking", "🚶"], ["driving", "🚗"], ["transit", "🚆"]].map(([m, ic]) => (
                       <a key={m} href={dir(p, m)} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()} title={m} className="rounded-lg bg-white/5 px-2 py-1 text-xs ring-1 ring-white/10 transition hover:bg-cyan/15 hover:ring-cyan/40">

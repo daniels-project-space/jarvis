@@ -8,6 +8,7 @@ describe("PlacesView travel presentation", () => {
     const value = JSON.stringify({
       kind: "places",
       query: "niche attractions",
+      provider: "openstreetmap",
       preferences: "local and non-touristy",
       locationLabel: "Sevilla",
       center: { lat: 37.3891, lng: -5.9845, label: "Sevilla", detail: "Sevilla, Spain", source: "openstreetmap" },
@@ -65,6 +66,45 @@ describe("PlacesView travel presentation", () => {
     expect(html).toContain("Gmail booking lookup is currently unavailable");
     expect(html).toContain("route starts from the map centre");
     expect(html).not.toContain("starting base");
+  });
+
+  it("attributes source-backed travel data even when a saved location sets the map centre", () => {
+    const html = renderToStaticMarkup(<PlacesView value={JSON.stringify({
+      kind: "places",
+      query: "historic places",
+      provider: "openstreetmap",
+      locationLabel: "Sevilla",
+      center: { lat: 37.3891, lng: -5.9845, label: "Saved current location", source: "saved_location" },
+      items: [{
+        name: "Real Alcázar de Sevilla",
+        address: "Plaza del Triunfo, Sevilla",
+        lat: 37.383,
+        lng: -5.99,
+        dist: 0.8,
+        mapsUri: "https://www.openstreetmap.org/?mlat=37.383&mlon=-5.99",
+        openingHours: "Oct-Mar: 09:30-17:00",
+        websiteUrl: "https://www.alcazarsevilla.org/",
+        wikipedia: {
+          language: "es",
+          title: "Real Alcázar de Sevilla",
+          articleUrl: "https://es.wikipedia.org/wiki/Real_Alc%C3%A1zar_de_Sevilla",
+        },
+        wikipediaArticle: {
+          title: "Real Alcázar de Sevilla",
+          articleUrl: "https://es.wikipedia.org/wiki/Real_Alc%C3%A1zar_de_Sevilla",
+          thumbnailUrl: "https://upload.wikimedia.org/example/alcazar.jpg",
+          attribution: "Wikipedia (es) · image via Wikimedia",
+        },
+      }],
+    })} />);
+
+    expect(html).toContain("Place data © OpenStreetMap contributors");
+    expect(html).toContain("Hours (OpenStreetMap): Oct-Mar: 09:30-17:00");
+    expect(html).toContain("site (OSM) ↗");
+    expect(html).toContain("Wikipedia ↗");
+    expect(html).toContain("Wikipedia (es) · image via Wikimedia");
+    expect(html).toContain("https://upload.wikimedia.org/example/alcazar.jpg");
+    expect(html).toContain("https://es.wikipedia.org/wiki/Real_Alc%C3%A1zar_de_Sevilla");
   });
 });
 

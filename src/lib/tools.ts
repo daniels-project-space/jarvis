@@ -45,6 +45,7 @@ import {
   type TravelMapPoint,
 } from "./travel-map";
 import {
+  enrichOpenStreetMapPlacesWithWikimedia,
   openStreetMapDistanceKm,
   openStreetMapDirectionsUrl,
   searchOpenStreetMapPlaces,
@@ -3021,7 +3022,7 @@ async function travelMap(args: any): Promise<string> {
     const candidateLookup = !currentStay && bookingCandidate?.location
       ? await searchTravelPlaces(bookingCandidate.location, { center, radiusMetres: 30_000, maxResults: 1 }).catch(() => undefined)
       : undefined;
-    const found = foundLookup.places;
+    const found = await enrichOpenStreetMapPlacesWithWikimedia(foundLookup.places);
     const candidateGeocode = candidateLookup?.places[0];
     if (!found.length) return `I couldn't find places matching “${placeQuery}”.`;
 
@@ -3106,7 +3107,7 @@ async function travelMap(args: any): Promise<string> {
       : request.includeBookings
         ? `${bookingStatus === "unavailable" ? "Gmail booking lookup was unavailable" : "No confirmed Gmail stay near this map was verified"}; the route starts from the map centre. Do not claim or imply that a booking address was used.`
         : "No booking base was requested.";
-    return `Interactive OpenStreetMap opened for ${locationLabel} with ${places.length} place pin${places.length === 1 ? "" : "s"}. Opening hours and ratings are unverified${routeUrl ? `; the suggested ${request.travelMode} route link opens the final stop` : ""}. ${bookingResult} Keep the map visible and answer with a short, preference-aware summary.`;
+    return `Interactive OpenStreetMap opened for ${locationLabel} with ${places.length} place pin${places.length === 1 ? "" : "s"}. Opening hours are shown only when OpenStreetMap tags them; ratings and admission prices are not claimed. Linked Wikipedia images and articles appear only for exact OpenStreetMap Wikipedia tags${routeUrl ? `; the suggested ${request.travelMode} route link opens the final stop` : ""}. ${bookingResult} Keep the map visible and answer with a short, preference-aware summary.`;
   } catch (error: any) {
     return `Travel map lookup failed: ${String(error?.message ?? error).slice(0, 120)}.`;
   }

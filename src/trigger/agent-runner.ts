@@ -809,6 +809,7 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
   let abandoned = 0;
   let repairs = 0;
   let cloudWorkspaceResumed = 0;
+  let expiredCloudWorkspaceHolds = 0;
   if (runtimeAttestation) {
     try {
       // Construction validates the exact deployment-bound probe receipt but
@@ -826,6 +827,7 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
     const reaped: any = await convexMutation("jobs:reapStale", {});
     recovered = Number(reaped?.requeued?.length ?? 0) + Number(reaped?.releasedDispatches?.length ?? 0);
     abandoned = Number(reaped?.abandoned?.length ?? 0);
+    expiredCloudWorkspaceHolds = Number(reaped?.expiredCloudWorkspaceHolds?.length ?? 0);
     for (const title of reaped?.abandoned ?? [])
       await convexMutation("chatQueue:postAssistant", {
         threadId: await chatThread(),
@@ -934,7 +936,7 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
     /* reminders must never block fleet dispatch */
   }
   await runWatchSweep().catch(() => {});
-  return { recovered, abandoned, repairs, cloudWorkspaceResumed, migration };
+  return { recovered, abandoned, repairs, cloudWorkspaceResumed, expiredCloudWorkspaceHolds, migration };
 }
 
 // One Trigger run owns one exact durable job and one isolated Codex process.

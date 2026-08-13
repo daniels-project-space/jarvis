@@ -1155,6 +1155,7 @@ describe("production Trigger worker authority harness", () => {
         status: "paused",
         attempt: 1,
         providerRunState: "blocked",
+        cloudWorkspaceBlockCode: code,
       });
       expect(state.job?.nextRunAt).toBeUndefined();
       expect(state.runtime).toMatchObject({
@@ -1194,6 +1195,94 @@ describe("production Trigger worker authority harness", () => {
       });
     },
   );
+
+  it("expires only a verified stale missing-configuration hold after no workspace was created", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-expired-cloud-config");
+    const bridge = bridgeProductionRunnerToConvex(t);
+    const dependencies = injectedRunnerDependencies();
+    (dependencies.configuredCloudWorkspaceProvider as any).mockImplementation(() => {
+      throw new CloudWorkspaceError(
+        "vercel",
+        "missing_configuration",
+        "Provider setup is incomplete",
+        "blocked",
+      );
+    });
+
+    await invokeHarness(reservation, "expired-cloud-config-run", dependencies);
+    await t.run(async (ctx) => {
+      const job: any = await ctx.db.get(jobId);
+      const runtime: any = await ctx.db.query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", jobId))
+        .unique();
+      const observedAt = Date.now() - 61 * 60_000;
+      // Production already has historical holds created before the exact
+      // reason field existed. Their signed checkpoint is the only permitted
+      // compatibility selector; broad progress text is never parsed.
+      await ctx.db.patch(jobId, { providerObservedAt: observedAt, cloudWorkspaceBlockCode: undefined });
+      await ctx.db.patch(runtime._id, { providerObservedAt: observedAt, cloudWorkspaceBlockCode: undefined });
+    });
+
+    expect(await t.mutation(api.jobs.reapStale, { workerToken: WORKER }))
+      .toMatchObject({ expiredCloudWorkspaceHolds: [expect.any(String)] });
+    const state = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      runtime: await ctx.db.query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", jobId))
+        .unique(),
+      attempt: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1))
+        .unique(),
+    }));
+    expect(state.job).toMatchObject({
+      status: "error",
+      stage: "configuration error",
+      providerRunState: "expired",
+    });
+    expect(state.runtime).toMatchObject({ status: "error", active: false });
+    expect(state.attempt).toMatchObject({ status: "error" });
+    expect((dependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
+    expect(bridge.trace.map((call) => call.path)).not.toContain("jobs:bindCloudWorkspace");
+
+    expect(await t.mutation(api.jobs.reapStale, { workerToken: WORKER }))
+      .toMatchObject({ expiredCloudWorkspaceHolds: [] });
+  });
+
+  it("does not expire a configuration hold that resumed before the reaper reads it", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-resumed-cloud-config");
+    bridgeProductionRunnerToConvex(t);
+    const dependencies = injectedRunnerDependencies();
+    (dependencies.configuredCloudWorkspaceProvider as any).mockImplementation(() => {
+      throw new CloudWorkspaceError(
+        "vercel",
+        "missing_configuration",
+        "Provider setup is incomplete",
+        "blocked",
+      );
+    });
+
+    await invokeHarness(reservation, "resumed-cloud-config-run", dependencies);
+    await t.run(async (ctx) => {
+      const runtime: any = await ctx.db.query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", jobId))
+        .unique();
+      const observedAt = Date.now() - 61 * 60_000;
+      await ctx.db.patch(jobId, { providerObservedAt: observedAt });
+      await ctx.db.patch(runtime._id, { providerObservedAt: observedAt });
+    });
+    expect(await t.mutation(api.jobs.resumeCloudWorkspaceBlocks, {
+      limit: 1,
+      workerToken: WORKER,
+    })).toEqual({ resumed: [String(jobId)] });
+    expect(await t.mutation(api.jobs.reapStale, { workerToken: WORKER }))
+      .toMatchObject({ expiredCloudWorkspaceHolds: [] });
+    expect(await t.run(async (ctx) => ctx.db.get(jobId)))
+      .toMatchObject({ status: "pending", providerRunState: "queued" });
+  });
 
   it("does not notify when a verified input hold loses its authority race", async () => {
     configureFakeControllerAuthority();

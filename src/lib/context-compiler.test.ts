@@ -27,6 +27,12 @@ const input = {
     approvals: [{ jobId: "job-1", summary: "Publish a deployment" }],
     jobs: [{ agentId: "Atlas", label: "Verify context compiler", stage: "running", percent: 30 }],
     agents: [{ name: "Atlas", status: "working", activeJobCount: 1, role: "Verification" }],
+    business: [
+      { domain: "youtube", headline: "YouTube: 1 channel, 12,345 subscribers, 678,900 total views.", detail: "2 recent uploads; 1 active pipeline run." },
+      { domain: "ads", headline: "Ads: £320 spent this month, 14 qualified leads.", detail: "Media Engine campaign is running." },
+      { domain: "rental", headline: "Rentals: £4,500 earned this month.", detail: "3 active rentals." },
+      { domain: "music", headline: "Music (DistroKid): £120 balance, 44,000 total streams." },
+    ],
     creations: [{ id: "canvas-1", kind: "board", title: "Portfolio map" }],
     panel: { type: "widget", title: "Portfolio map" },
     trip: {
@@ -70,6 +76,27 @@ describe("context compiler", () => {
     const result = compileContext({ ...input, userText: "Fix the Jarvis voice interruption" });
     expect(result).not.toContain("WEALTH");
     expect(result).not.toContain("CALENDAR");
+    expect(result).not.toContain("BUSINESS STATE");
+  });
+
+  it("routes natural YouTube and media campaign questions to only their relevant business pulse", () => {
+    const subscribers = compileContext({ ...input, userText: "How many YouTube subscribers do we have?" });
+    expect(subscribers).toContain("BUSINESS STATE");
+    expect(subscribers).toContain("12,345 subscribers");
+    expect(subscribers).not.toContain("£4,500 earned");
+    expect(subscribers).not.toContain("WEALTH");
+
+    const campaign = compileContext({ ...input, userText: "How is the Media Engine advertising campaign doing?" });
+    expect(campaign).toContain("12,345 subscribers");
+    expect(campaign).toContain("£320 spent this month");
+    expect(campaign).not.toContain("£4,500 earned");
+    expect(campaign).not.toContain("WEALTH");
+  });
+
+  it("does not treat a media-file implementation request as a business pulse request", () => {
+    const result = compileContext({ ...input, userText: "Fix the media file upload flow" });
+    expect(result).not.toContain("BUSINESS STATE");
+    expect(result).not.toContain("WEALTH");
   });
 
   it("keeps active work, trip, draft, and location only when the turn needs them", () => {

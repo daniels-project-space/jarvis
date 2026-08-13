@@ -68,6 +68,17 @@ describe("commandCenter relevance and bounded projection", () => {
     expect(isUserRelevantWork(runtime({ status }), threadId)).toBe(true);
   });
 
+  it("keeps a paused provider configuration hold out of the foreground snapshot", () => {
+    const held = runtime({
+      status: "paused",
+      providerRunState: "blocked",
+      nextRunAt: undefined,
+      progress: "cloud workspace blocked · missing_configuration",
+    });
+    expect(isUserRelevantWork(held, threadId)).toBe(false);
+    expect(buildFleetSnapshot({ threadId, activeRows: [held] }).active).toBeNull();
+  });
+
   it("prioritizes Daniel attention before runtime priority", () => {
     const rows = selectRelevantWork([
       runtime({ jobId: "running", priority: 100 }),

@@ -75,6 +75,11 @@ import {
 } from "../src/lib/supervisor-fleet-manifest";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
+// A configuration hold can resolve automatically after a verified provider
+// deploy, but old intent must not be resurrected indefinitely.  Before this
+// horizon it remains a silent, resumable system hold; afterwards it receives
+// one explicit terminal record and requires a fresh user request.
+const STALE_CLOUD_WORKSPACE_HOLD_MS = 60 * 60 * 1000;
 // A live process that cannot produce a causal stage/percentage advance is not
 // healthy work. Keep this comfortably above a normal Codex tool segment while
 // still surfacing a genuinely stuck attempt before its lease disappears.
@@ -3362,6 +3367,106 @@ export const reapStale = mutation({
           .lte("heartbeatAt", now - STALE_RUNNER_MS)
       )
       .take(100);
+    // A blocked cloud setup with its dispatch receipt already closed has no
+    // running process. It should be eligible for automatic recovery if the
+    // provider becomes verified shortly afterwards, but stale intent cannot
+    // occupy active work forever. Limit this terminalization to the exact
+    // missing-configuration code and prove that no provider workspace was
+    // ever persisted before changing durable state.
+    const staleCloudWorkspaceHolds = await ctx.db
+      .query("jobRuntime")
+      .withIndex("by_status_provider_observed", (q: any) =>
+        q
+          .eq("status", "paused")
+          .eq("providerRunState", "blocked")
+          .lte("providerObservedAt", now - STALE_CLOUD_WORKSPACE_HOLD_MS)
+      )
+      .take(100);
+    const expiredCloudWorkspaceHolds: string[] = [];
+    for (const activity of staleCloudWorkspaceHolds) {
+      const job = await ctx.db.get(activity.jobId);
+      if (
+        !job
+        || job.status !== "paused"
+        || job.providerRunState !== "blocked"
+        || job.nextRunAt !== undefined
+        || typeof job.dispatchId === "string"
+        || typeof job.dispatchLeaseUntil === "number"
+        || Number(job.providerObservedAt ?? 0) !== Number(activity.providerObservedAt ?? 0)
+        || Number(job.providerObservedAt ?? 0) > now - STALE_CLOUD_WORKSPACE_HOLD_MS
+      ) continue;
+      // `cloudWorkspaceBlockCode` is the forward-safe selector. The strict
+      // checkpoint fallback exists solely to drain holds created before that
+      // field was introduced.
+      const code = String(job.cloudWorkspaceBlockCode ?? "");
+      const legacyMissingConfiguration = code.length === 0
+        && /^Cloud workspace blocked \[[a-z0-9_-]+\/missing_configuration\]:/im.test(
+          String(job.checkpoint ?? ""),
+        );
+      if (code !== "missing_configuration" && !legacyMissingConfiguration) continue;
+      const attempt = await attemptFor(ctx, job._id, job.attempt ?? 1);
+      // A persisted provider identity is an external resource; leave it to
+      // the orphan cleaner rather than assuming this no-process cleanup path.
+      if (
+        !attempt
+        || attempt.status !== "paused"
+        || !attempt.completedAt
+        || attempt.providerWorkspaceId
+        || attempt.providerSessionId
+      ) continue;
+      const receipt = job.dispatchReceiptId ? await ctx.db.get(job.dispatchReceiptId) : null;
+      if (job.dispatchReceiptId && (!receipt || receipt.status !== "closed")) continue;
+      if (isSupervisorOwnedJob(job)) {
+        await insertFreshTerminalWorkReceipt(ctx, job, job.attempt ?? 1, {
+          status: "failed",
+          terminalCode: "cloud_workspace_hold_expired",
+          recoveryDisposition: "remediable",
+          acceptanceEvidence: [],
+          artifacts: [
+            `convex://jobs/${String(job._id)}/attempt/${job.attempt ?? 1}/cloud-workspace`,
+          ],
+          verification: "unavailable",
+          terminalEventKey: `cloud-workspace-hold-expired:${job.attempt ?? 1}:${job.providerObservedAt}`,
+          result: "No cloud workspace or repository process was created before the configuration hold expired.",
+          evidence: job.checkpoint ?? job.progress,
+        }, now);
+      }
+      await ctx.db.patch(attempt._id, {
+        status: "error",
+        completedAt: now,
+        lastEventAt: now,
+      });
+      await patchJobWithRuntime(ctx, job, {
+        ...invalidateDeliveryLease(job),
+        status: "error",
+        stage: "configuration error",
+        progress: "cloud workspace configuration stayed unavailable for 60m — attempt stopped safely",
+        result: "No cloud workspace or repository process was created. Complete secure worker setup, then submit a fresh job.",
+        completedAt: now,
+        heartbeatAt: now,
+        nextRunAt: undefined,
+        dispatchId: undefined,
+        dispatchLeaseUntil: undefined,
+        workerRunId: undefined,
+        workerRuntime: undefined,
+        providerRunState: "expired",
+        providerObservedAt: now,
+      });
+      await appendAttemptEvidence(
+        ctx,
+        job,
+        "cloud_workspace_hold_expired",
+        "Cloud workspace configuration remained unavailable for 60 minutes; no provider workspace was created and the attempt was stopped.",
+        {
+          stage: "configuration error",
+          percent: job.percent,
+          evidenceKind: "watchdog",
+          eventKey: `cloud-workspace-hold-expired:${job.attempt ?? 1}:${job.providerObservedAt}`,
+          attempt: job.attempt ?? 1,
+        },
+      );
+      expiredCloudWorkspaceHolds.push(job.task.slice(0, 80));
+    }
     const reconciledPausedClaims: string[] = [];
     for (const activity of paused) {
       const job = await ctx.db.get(activity.jobId);
@@ -3598,6 +3703,7 @@ export const reapStale = mutation({
       releasedDispatches,
       expiredControllers,
       reconciledPausedClaims,
+      expiredCloudWorkspaceHolds,
     };
   },
 });
@@ -4243,6 +4349,7 @@ export const noteCloudWorkspaceBlock = mutation({
     const now = Date.now();
     await patchJobWithRuntime(ctx, row, {
       providerRunState: "blocked", providerObservedAt: now,
+      cloudWorkspaceBlockCode: a.code.slice(0, 80),
       stage: "cloud blocked", progress: `cloud workspace blocked · ${a.code.slice(0, 80)}`,
     });
     await appendAttemptEvidence(ctx, row, "cloud_workspace_blocked", a.reason.slice(0, 500), {
@@ -4291,6 +4398,7 @@ export const resumeCloudWorkspaceBlocks = mutation({
         workerRuntime: undefined,
         providerRunState: "queued",
         providerObservedAt: now,
+        cloudWorkspaceBlockCode: undefined,
       });
       if (nextAttempt === (row.attempt ?? 1)) {
         await ctx.db.patch(previous._id, {

@@ -42,6 +42,9 @@ const STRATEGIC = /\b(?:architecture|strategy|portfolio|roadmap|trade-?offs?|com
 const FOCUSED = /\b(?:weather|time|calendar|schedule|todo|remind|price|price of|play|pause|open|show|where|when|who|what is|what's)\b/i;
 const PLANNING = /\b(?:plan|build|create|fix|investigate|research|analyse|analyze|recommend|implement|ship|delegate|agent|mission|goal|project)\b/i;
 const MONEY = /\b(?:money|wealth|finance|crypto|stock|price|rental|revenue|budget|cost)\b/i;
+// Keep the business pulse opt-in and domain-scoped. In particular, media and
+// campaign questions should not cause a personal wealth snapshot to be added.
+const BUSINESS_PULSE = /\b(?:money|wealth|finance|crypto|stock|price|rental|revenue|budget|cost|you\s*tube|subscriber(?:s|ship)?|channel\s+(?:metrics?|analytics|views?|subscribers?)|(?:video|upload)\s+(?:performance|analytics|pipeline|views?|status|metrics?)|media\b(?!\s+(?:file|upload|asset|library|folder|picker|attachment))|campaigns?|ads?|advertis(?:e|ing|ement|ements)|marketing|distrokid|streams?)\b/i;
 const TIME = /\b(?:calendar|schedule|today|tomorrow|week|appointment|remind|todo|to-do)\b/i;
 const ARTIFACT = /\b(?:draft|document|board|image|video|chart|scene|mind map|canvas|that one|this one|update it|rework)\b/i;
 const FOLLOW_UP = /\b(?:this|that|it|there|second|third|previous|above|on screen|shown)\b/i;
@@ -80,6 +83,29 @@ function projectMatches(project: unknown, userText: string) {
   const haystack = `${row.slug ?? ""} ${row.name ?? ""} ${row.summary ?? ""} ${data.purpose ?? ""}`.toLowerCase();
   const terms = userText.toLowerCase().split(/[^a-z0-9]+/).filter((part) => part.length >= 4);
   return terms.some((term) => haystack.includes(term));
+}
+
+function relevantBusinessState(business: ContextRow[], userText: string): ContextRow[] {
+  const value = userText.toLowerCase();
+  const domains = new Set<string>();
+  const isYouTube = /\b(?:you\s*tube|subscriber(?:s|ship)?|channel\s+(?:metrics?|analytics|views?|subscribers?)|(?:video|upload)\s+(?:performance|analytics|pipeline|views?|status|metrics?))\b/i.test(value);
+  const isMusic = /\b(?:music|distrokid|streams?)\b/i.test(value);
+  const isRental = /\b(?:rental|inventory|utili[sz]ation)\b/i.test(value);
+  const isMedia = /\bmedia\b(?!\s+(?:file|upload|asset|library|folder|picker|attachment))/i.test(value);
+  const isCampaign = /\b(?:campaigns?|ads?|advertis(?:e|ing|ement|ements)|marketing)\b/i.test(value);
+
+  if (isYouTube) domains.add("youtube");
+  if (isMusic) domains.add("music");
+  if (isRental) domains.add("rental");
+  // Campaign and media work is reported through the video and ads snapshots.
+  if (isMedia || isCampaign) {
+    domains.add("youtube");
+    domains.add("ads");
+  }
+
+  return domains.size
+    ? business.filter((item) => domains.has(text(item.domain, 48).toLowerCase()))
+    : business;
 }
 
 function panelSummary(value: unknown) {
@@ -274,11 +300,14 @@ export function compileContext(input: ContextCompilerInput): string {
     ).join("\n"));
   }
 
-  if (MONEY.test(userText)) {
+  if (BUSINESS_PULSE.test(userText)) {
     const business = Array.isArray(brain.business) ? brain.business : [];
-    if (business.length) add("BUSINESS STATE", business.slice(0, 5).map((item) =>
+    const relevantBusiness = relevantBusinessState(business, userText);
+    if (relevantBusiness.length) add("BUSINESS STATE", relevantBusiness.slice(0, 5).map((item) =>
       `- ${text(item.headline, 150)}${item.detail ? ` — ${text(item.detail, 260)}` : ""}`,
     ).join("\n"));
+  }
+  if (MONEY.test(userText)) {
     if (typeof hub.wealth?.currentTotalGBP === "number") {
       add("WEALTH", `Latest connected net worth: about £${Math.round(hub.wealth.currentTotalGBP).toLocaleString("en-GB")}.`);
     }

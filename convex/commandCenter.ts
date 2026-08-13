@@ -180,6 +180,10 @@ async function supervisorCommandPlanningRows(
 export function isUserRelevantWork(row: RuntimeRow, threadId: string): boolean {
   if (!RELEVANT.has(String(row.status ?? ""))) return false;
   if (row.visibility !== "conversation" || row.originThreadId !== threadId) return false;
+  // A provider configuration hold has no queued retry or running workspace.
+  // Keep it in durable history until the verified maintenance path resumes or
+  // expires it; do not present it as foreground work.
+  if (row.status === "paused" && row.providerRunState === "blocked" && row.nextRunAt === undefined) return false;
   // A pending child with prerequisites is represented inside its parent's DAG
   // as dependency-held. It has no lease and must not make the foreground read
   // "busy" merely because historical plan leaves still exist.
@@ -240,11 +244,11 @@ function nodeState(row: RuntimeRow, dependencyCount: number, dependenciesReady: 
   const status = String(row.status ?? "missing");
   const integration = String(row.integrationState ?? "");
   const stage = String(row.stage ?? status);
+  if (status === "paused") return "paused";
   if (row.providerRunState === "blocked") return "blocked";
   if (status === "needs_input" || status === "awaiting_approval") return "needs_input";
   if (status === "stalled" || status === "error" || /\b(?:blocked|failed|conflict)\b/i.test(`${stage} ${integration}`)) return "blocked";
   if (status === "done") return "done";
-  if (status === "paused") return "paused";
   if (/integrat|merge|deliver/i.test(`${integration} ${stage}`)) return "integrating";
   if (/review|validat|verify/i.test(stage)) return "reviewing";
   if (status === "running" || status === "steering") return "running";
