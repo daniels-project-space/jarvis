@@ -3374,7 +3374,7 @@ export const reapStale = mutation({
     // missing-configuration code and prove that no provider workspace was
     // ever persisted before changing durable state.
     const staleCloudWorkspaceHolds = await ctx.db
-      .query("jobRuntime")
+      .query("jobs")
       .withIndex("by_status_provider_observed", (q: any) =>
         q
           .eq("status", "paused")
@@ -3383,8 +3383,8 @@ export const reapStale = mutation({
       )
       .take(100);
     const expiredCloudWorkspaceHolds: string[] = [];
-    for (const activity of staleCloudWorkspaceHolds) {
-      const job = await ctx.db.get(activity.jobId);
+    for (const candidate of staleCloudWorkspaceHolds) {
+      const job = await ctx.db.get(candidate._id);
       if (
         !job
         || job.status !== "paused"
@@ -3392,7 +3392,7 @@ export const reapStale = mutation({
         || job.nextRunAt !== undefined
         || typeof job.dispatchId === "string"
         || typeof job.dispatchLeaseUntil === "number"
-        || Number(job.providerObservedAt ?? 0) !== Number(activity.providerObservedAt ?? 0)
+        || Number(job.providerObservedAt ?? 0) !== Number(candidate.providerObservedAt ?? 0)
         || Number(job.providerObservedAt ?? 0) > now - STALE_CLOUD_WORKSPACE_HOLD_MS
       ) continue;
       // `cloudWorkspaceBlockCode` is the forward-safe selector. The strict

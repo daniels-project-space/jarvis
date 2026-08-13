@@ -653,7 +653,8 @@ export default defineSchema({
     .index("by_mission", ["missionId"])
     .index("by_createdAt", ["createdAt"])
     .index("by_agent", ["agentId", "createdAt"])
-    .index("by_visibility_status", ["visibility", "status", "createdAt"]),
+    .index("by_visibility_status", ["visibility", "status", "createdAt"])
+    .index("by_status_provider_observed", ["status", "providerRunState", "providerObservedAt"]),
 
   // Compact control-plane read model. Live subscriptions, scheduler polls and
   // execution lease checks use this table instead of materialising the much
@@ -778,7 +779,6 @@ export default defineSchema({
     .index("by_group_dispatch_ready", ["schedulingGroupKey", "status", "schedulingBound", "dispatchReady", "nextRunAt", "createdAt"])
     .index("by_status_scheduling_bound", ["status", "schedulingBound", "priority", "createdAt"])
     .index("by_status_heartbeat", ["status", "heartbeatAt"])
-    .index("by_status_provider_observed", ["status", "providerRunState", "providerObservedAt"])
     .index("by_pause_checkpoint_heartbeat", [
       "status",
       "pauseCheckpointPending",
